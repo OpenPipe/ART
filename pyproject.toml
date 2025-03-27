@@ -19,6 +19,7 @@ dependencies = [
     "openpipe>=4.49.0",
     "torchtune==0.5.0",
     "typer>=0.15.2",
+    "trl==0.15.2",
 ]
 
 [project.scripts]

@@ -3,14 +3,13 @@ from datasets import Dataset
 import nest_asyncio
 import os
 from peft.peft_model import PeftModel
-import shutil
 import torch
 from transformers import PreTrainedTokenizerBase
+from trl import GRPOConfig, GRPOTrainer
 from typing import cast
 
 from .grpo import GRPO
 from .pack import PackedTensors
-from .UnslothGRPOTrainer import UnslothGRPOConfig, UnslothGRPOTrainer
 
 nest_asyncio.apply()
 
@@ -18,15 +17,12 @@ nest_asyncio.apply()
 def get_trainer(
     model: PeftModel,
     tokenizer: PreTrainedTokenizerBase,
-    args: UnslothGRPOConfig,
+    args: GRPOConfig,
     packed_tensors_queue: asyncio.Queue[PackedTensors],
-) -> UnslothGRPOTrainer:
-    def reward_func(*_, **__) -> float:
-        return 0.0
-
-    trainer = UnslothGRPOTrainer(
-        model=model,
-        reward_funcs=reward_func,
+) -> GRPOTrainer:
+    trainer = GRPOTrainer(
+        model=model,  # type: ignore
+        reward_funcs=[],
         args=args,
         train_dataset=Dataset.from_list([{"prompt": ""} for _ in range(100_000)]),
         processing_class=tokenizer,
@@ -45,7 +41,7 @@ def get_trainer(
 
 
 async def train(
-    trainer: UnslothGRPOTrainer, packed_tensors_queue: asyncio.Queue[PackedTensors]
+    trainer: GRPOTrainer, packed_tensors_queue: asyncio.Queue[PackedTensors]
 ) -> None:
     loss_fn = GRPO()
     loss_fn._forward_chunk = torch.compile(
@@ -88,16 +84,17 @@ async def train(
 
             # Unsloth code
             if not hasattr(trainer, "_autocast_dtype"):
-                trainer._autocast_dtype = (
+                dtype = (
                     torch.float16
                     if os.environ.get("ACCELERATE_MIXED_PRECISION", "fp16") == "fp16"
                     else torch.bfloat16
                 )
                 if os.environ.get("UNSLOTH_FORCE_FLOAT32", "0") == "1":
-                    trainer._autocast_dtype = torch.float16
+                    dtype = torch.float16
+                setattr(trainer, "_autocast_dtype", dtype)
 
             with torch.amp.autocast_mode.autocast(
-                device_type="cuda", dtype=trainer._autocast_dtype
+                device_type="cuda", dtype=getattr(trainer, "_autocast_dtype")
             ):
                 logits = model(input_ids=inputs["tokens"], causal_mask=attn_bias).logits
                 logits = logits[:, :-1, :]

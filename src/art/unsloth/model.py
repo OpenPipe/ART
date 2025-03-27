@@ -19,8 +19,6 @@ def get_model_and_tokenizer(
         enable_prefix_caching=True,
         gpu_memory_utilization=0.62,  # Reduce if out of memory
         max_lora_rank=lora_rank,
-        # max_num_seqs=1024,
-        # enforce_eager=True,
         num_scheduler_steps=16,
         use_async=True,
     )

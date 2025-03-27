@@ -38,14 +38,14 @@ async def gather_groups(
 ) -> list[list[Trajectory]]: ...
 
 
-@deprecated("Use gather_trajectories directly instead")
+@deprecated("Use gather_trajectories instead")
 async def gather_groups(
     *args: Any,
     **kwargs: Any,
 ) -> list[list[Trajectory | BaseException]] | list[list[Trajectory]]:
     warnings.warn(
         "gather_groups is deprecated and will be removed in a future version. "
-        "Use gather_trajectories directly instead.",
+        "Use gather_trajectories instead.",
         DeprecationWarning,
         stacklevel=2,
     )

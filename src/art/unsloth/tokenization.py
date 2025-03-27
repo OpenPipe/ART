@@ -66,7 +66,7 @@ def tokenize_trajectory_groups(
             if advantage == 0:
                 continue
             results.append(
-                _tokenize_trajectory(
+                tokenize_trajectory(
                     tokenizer,
                     trajectory,
                     advantage,
@@ -93,7 +93,7 @@ def tokenize_trajectory_groups(
         yield from results
 
 
-def _tokenize_trajectory(
+def tokenize_trajectory(
     tokenizer: PreTrainedTokenizerBase,
     trajectory: Trajectory,
     advantage: float,

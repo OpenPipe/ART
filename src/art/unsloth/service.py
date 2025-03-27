@@ -13,14 +13,11 @@ import sys
 import traceback
 from transformers import PreTrainedTokenizerBase
 import uvicorn
-from typing import TYPE_CHECKING, TypeVar, Callable, ParamSpec, Awaitable, cast, Union
+from trl import GRPOTrainer
+from typing import TypeVar, Callable, ParamSpec, Awaitable, cast
 
 from art import types
 from art.unsloth.pack import DiskPackedTensors, PackedTensors
-
-
-if TYPE_CHECKING:
-    from .UnslothGRPOTrainer import UnslothGRPOTrainer
 
 T = TypeVar("T")
 P = ParamSpec("P")
@@ -62,7 +59,7 @@ class Service(BaseModel):
     _openai_server_task: asyncio.Task | None = None
     _packed_tensors_queue: asyncio.Queue["PackedTensors"] | None = None
     _train_task: asyncio.Task | None = None
-    _trainer: "UnslothGRPOTrainer | None" = None
+    _trainer: GRPOTrainer | None = None
 
     class Config:
         arbitrary_types_allowed = True
@@ -218,9 +215,9 @@ class Service(BaseModel):
             self._packed_tensors_queue = asyncio.Queue()
         return self._packed_tensors_queue
 
-    def _get_trainer(self) -> "UnslothGRPOTrainer":
+    def _get_trainer(self) -> GRPOTrainer:
+        from trl import GRPOConfig
         from art.unsloth.train import get_trainer
-        from art.unsloth.UnslothGRPOTrainer import UnslothGRPOConfig
 
         if self._trainer:
             return self._trainer
@@ -228,7 +225,7 @@ class Service(BaseModel):
         self._trainer = get_trainer(
             model=peft_model,
             tokenizer=tokenizer,
-            args=UnslothGRPOConfig(
+            args=GRPOConfig(
                 learning_rate=5e-6,
                 adam_beta1=0.9,
                 adam_beta2=0.99,
