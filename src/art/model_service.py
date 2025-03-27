@@ -10,14 +10,19 @@ import os
 from peft.peft_model import PeftModel
 from pydantic import BaseModel
 import sys
+import torch
 import traceback
 from transformers import PreTrainedTokenizerBase
 import uvicorn
-from trl import GRPOTrainer
-from typing import TypeVar, Callable, ParamSpec, Awaitable, cast
+from trl import GRPOConfig, GRPOTrainer
+from typing import Awaitable, Callable, cast, ParamSpec, TypeVar
 
 from art import types
-from art.unsloth.pack import DiskPackedTensors, PackedTensors
+from art.unsloth.checkpoints import get_iteration, get_last_iteration_dir
+from art.unsloth.model import get_model_and_tokenizer
+from art.unsloth.pack import DiskPackedTensors, packed_tensors_from_dir, PackedTensors
+from art.unsloth.train import get_trainer, train
+from art.unsloth.vllm import openai_server_task, set_vllm_log_file
 
 T = TypeVar("T")
 P = ParamSpec("P")
@@ -28,7 +33,6 @@ def catch_and_print_errors(
 ) -> Callable[P, Awaitable[T]]:
     """
     Decorator that catches, prints, and reraises any errors that occur in the wrapped function.
-    Works with both synchronous and asynchronous functions.
     """
 
     @functools.wraps(func)
@@ -48,41 +52,35 @@ class StartOpenaiServer(BaseModel):
     tool_use: bool
 
 
-class Service(BaseModel):
+class ModelService(BaseModel):
     host: str
     port: int
     model_name: str
     base_model: "types.BaseModel"
     output_dir: str
     process: asyncio.subprocess.Process | None = None
-    _model_and_tokenizer: tuple["PeftModel", "PreTrainedTokenizerBase"] | None = None
     _openai_server_task: asyncio.Task | None = None
-    _packed_tensors_queue: asyncio.Queue["PackedTensors"] | None = None
     _train_task: asyncio.Task | None = None
-    _trainer: GRPOTrainer | None = None
 
     class Config:
         arbitrary_types_allowed = True
         exclude = {
-            "process",
-            "_model_and_tokenizer",
-            "_openai_server_task",
-            "_trainer",
-            "_train_task",
+            "process",  # asyncio.subprocess.Process can't be serialized
+            "_openai_server_task",  # asyncio.Task can't be serialized
+            "_train_task",  # asyncio.Task can't be serialized
+            "model_and_tokenizer",  # cached property
+            "packed_tensors_queue",  # cached property
+            "trainer",  # cached property
         }
         extra = "allow"
 
     @catch_and_print_errors
     async def start_openai_server(self, request: StartOpenaiServer) -> None:
-        from art.unsloth.checkpoints import get_last_iteration_dir
-        from art.unsloth.vllm_utils import openai_server_task
-
-        peft_model, _ = self._get_model_and_tokenizer()
+        peft_model, _ = self.model_and_tokenizer
         lora_path = get_last_iteration_dir(self.output_dir)
         if lora_path is None:
-            trainer = self._get_trainer()
             lora_path = f"{self.output_dir}/0000"
-            trainer.save_model(lora_path)
+            self.trainer.save_model(lora_path)
         await self.stop_openai_server()
         self._openai_server_task = openai_server_task(
             model=peft_model,
@@ -103,19 +101,14 @@ class Service(BaseModel):
 
     @catch_and_print_errors
     async def tune(self, disk_packed_tensors: "DiskPackedTensors") -> None:
-        import torch
         from unsloth_zoo.training_utils import set_training, unset_training  # type: ignore
 
-        from art.unsloth.checkpoints import get_iteration
-        from art.unsloth.pack import packed_tensors_from_dir
-        from art.unsloth.train import train
-
         packed_tensors = packed_tensors_from_dir(**disk_packed_tensors)
-        queue = self._get_packed_tensors_queue()
+        queue = self.packed_tensors_queue
         await queue.join()
-        model, _ = self._get_model_and_tokenizer()
+        model, _ = self.model_and_tokenizer
         set_training(model)
-        trainer = self._get_trainer()
+        trainer = self.trainer
         for i in range(packed_tensors["tokens"].shape[0]):
             queue.put_nowait(
                 PackedTensors(
@@ -148,7 +141,7 @@ class Service(BaseModel):
         model.vllm_engine.engine.remove_lora(1)
         model.vllm_engine.engine.add_lora(lora_request)
 
-    async def serve(self) -> "Service":
+    async def serve(self) -> "ModelService":
         # Ensure logs directory exists
         os.makedirs("./logs", exist_ok=True)
 
@@ -203,25 +196,17 @@ class Service(BaseModel):
         print(f"Started service on {self.host}:{self.port} (PID: {self.process.pid})")
         return self
 
-    def _get_model_and_tokenizer(self) -> tuple["PeftModel", "PreTrainedTokenizerBase"]:
-        from art.unsloth.model import get_model_and_tokenizer
+    @functools.cached_property
+    def model_and_tokenizer(self) -> tuple["PeftModel", "PreTrainedTokenizerBase"]:
+        return get_model_and_tokenizer(self.base_model)
 
-        if self._model_and_tokenizer is None:
-            self._model_and_tokenizer = get_model_and_tokenizer(self.base_model)
-        return self._model_and_tokenizer
+    @functools.cached_property
+    def packed_tensors_queue(self) -> asyncio.Queue["PackedTensors"]:
+        return asyncio.Queue()
 
-    def _get_packed_tensors_queue(self) -> asyncio.Queue["PackedTensors"]:
-        if self._packed_tensors_queue is None:
-            self._packed_tensors_queue = asyncio.Queue()
-        return self._packed_tensors_queue
-
-    def _get_trainer(self) -> GRPOTrainer:
-        from trl import GRPOConfig
-        from art.unsloth.train import get_trainer
-
-        if self._trainer:
-            return self._trainer
-        peft_model, tokenizer = self._get_model_and_tokenizer()
+    @functools.cached_property
+    def trainer(self) -> GRPOTrainer:
+        peft_model, tokenizer = self.model_and_tokenizer
         self._trainer = get_trainer(
             model=peft_model,
             tokenizer=tokenizer,
@@ -237,25 +222,20 @@ class Service(BaseModel):
                 per_device_train_batch_size=4,
                 gradient_accumulation_steps=1,  # Increase to 4 for smoother training
                 num_generations=4,  # Decrease if out of memory
-                # max_prompt_length=2048,
-                # max_completion_length=8192 - 2048,
-                # num_train_epochs = 1, # Set to 1 for a full training run
+                save_strategy="no",
                 # max_steps=1_000_000,
                 # save_steps=1_000_000,
                 # max_grad_norm=10.0,
                 # report_to="none",  # Can use Weights & Biases
-                output_dir="outputs",
-                # use_vllm=False,
+                output_dir=self.output_dir,
             ),
-            packed_tensors_queue=self._get_packed_tensors_queue(),
+            packed_tensors_queue=self.packed_tensors_queue,
         )
         return self._trainer
 
 
 if __name__ == "__main__":
-    from art.unsloth.vllm_utils import set_vllm_log_file
-
-    service = Service.model_validate_json(sys.argv[1])
+    service = ModelService.model_validate_json(sys.argv[1])
     app = FastAPI()
     app.get("/health")(lambda: "OK")
     app.post("/start_openai_server")(service.start_openai_server)

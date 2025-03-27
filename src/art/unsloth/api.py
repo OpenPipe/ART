@@ -24,13 +24,13 @@ from .pack import (
     PackedTensors,
     plot_packed_tensors,
 )
-from .service import Service, StartOpenaiServer
+from ..model_service import ModelService, StartOpenaiServer
 from .tokenization import tokenize_trajectory_groups
 from .checkpoints import (
     clear_iteration_dirs,
     get_iteration,
 )
-from .vllm_utils import max_concurrent_tokens
+from .vllm import max_concurrent_tokens
 
 
 class UnslothAPI(API):
@@ -63,7 +63,7 @@ class UnslothAPI(API):
         self._wandb_project = wandb_project
 
         # Other initialization
-        self._services: dict[str, Service] = {}
+        self._services: dict[str, ModelService] = {}
         self._tokenizers: dict[str, "PreTrainedTokenizerBase"] = {}
         self._wandb_runs: dict[str, Run] = {}
 
@@ -82,9 +82,9 @@ class UnslothAPI(API):
         os.makedirs(self._get_output_dir(name), exist_ok=True)
         return Model(api=self, name=name, base_model=base_model)
 
-    async def _get_service(self, model: Model) -> Service:
+    async def _get_service(self, model: Model) -> ModelService:
         if model.name not in self._services:
-            self._services[model.name] = Service(
+            self._services[model.name] = ModelService(
                 host="localhost",
                 port=8089 + len(self._services),
                 model_name=model.name,
