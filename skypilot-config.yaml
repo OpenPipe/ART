@@ -382,7 +382,7 @@
 
 workdir: .
 resources:
-  accelerators: ["H100:1", "A100-80GB:1"]
+  accelerators: ["H100-SXM:1", "H100:1", "A100-80GB:1"]
 envs:
   GIT_USER_NAME: "Your Name"
   GIT_USER_EMAIL: "your.email@example.com"
