@@ -100,7 +100,9 @@ class ModelService(BaseModel):
             self._openai_server_task = None
 
     @catch_and_print_errors
-    async def tune(self, disk_packed_tensors: "DiskPackedTensors") -> None:
+    async def tune(
+        self, disk_packed_tensors: DiskPackedTensors, config: types.TuneConfig
+    ) -> None:
         from unsloth_zoo.training_utils import set_training, unset_training  # type: ignore
 
         packed_tensors = packed_tensors_from_dir(**disk_packed_tensors)
@@ -175,9 +177,13 @@ class ModelService(BaseModel):
             response = await client.post("/stop_openai_server")
             response.raise_for_status()
 
-        async def tune(disk_packed_tensors: "DiskPackedTensors") -> None:
+        async def tune(
+            disk_packed_tensors: "DiskPackedTensors", config: types.TuneConfig
+        ) -> None:
             response = await client.post(
-                "/tune", json=disk_packed_tensors, timeout=httpx.Timeout(None)
+                "/tune",
+                json={"disk_packed_tensors": disk_packed_tensors, "config": config},
+                timeout=httpx.Timeout(None),
             )
             response.raise_for_status()
 
@@ -211,7 +217,7 @@ class ModelService(BaseModel):
             model=peft_model,
             tokenizer=tokenizer,
             args=GRPOConfig(
-                learning_rate=5e-6,
+                learning_rate=5e-4,
                 adam_beta1=0.9,
                 adam_beta2=0.99,
                 weight_decay=0.1,

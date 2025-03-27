@@ -43,11 +43,11 @@ def get_trainer(
 async def train(
     trainer: GRPOTrainer, packed_tensors_queue: asyncio.Queue[PackedTensors]
 ) -> None:
-    loss_fn = GRPO()
-    loss_fn._forward_chunk = torch.compile(
-        loss_fn._forward_chunk,
-        backend=os.environ.get("TORCH_COMPILE_BACKEND", "inductor"),
-    )
+    # loss_fn = GRPO()
+    # loss_fn._forward_chunk = torch.compile(
+    #     loss_fn._forward_chunk,
+    #     backend=os.environ.get("TORCH_COMPILE_BACKEND", "inductor"),
+    # )
 
     def compute_loss(
         model: PeftModel,
