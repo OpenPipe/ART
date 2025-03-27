@@ -145,9 +145,7 @@ def packed_tensors_from_dir(**kwargs: Unpack[DiskPackedTensors]) -> PackedTensor
             * kwargs["sequence_length"]
             * (kwargs["sequence_length"] if key == "mask" else 1),
             dtype=dtype,
-        )
-        .view(kwargs["num_sequences"], kwargs["sequence_length"], -1)
-        .squeeze()
+        ).view(kwargs["num_sequences"], kwargs["sequence_length"])
         for key, dtype in {
             "tokens": torch.long,
             "group_ids": torch.long,
