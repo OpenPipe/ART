@@ -195,7 +195,7 @@ class UnslothAPI(API):
                 http_client=DefaultAsyncHttpxClient(
                     timeout=httpx.Timeout(timeout=1200, connect=5.0),
                     limits=httpx.Limits(
-                        max_connections=2048, max_keepalive_connections=2048
+                        max_connections=16384, max_keepalive_connections=16384
                     ),
                 ),
             ),

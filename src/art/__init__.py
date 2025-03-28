@@ -32,6 +32,7 @@ from .local import LocalAPI
 from .model import Model
 from .types import Messages, MessagesAndChoices, ToolCall, Tools, Trajectory, TuneConfig
 from .unsloth import UnslothAPI
+from .utils import retry
 
 __all__ = [
     "API",
@@ -46,4 +47,5 @@ __all__ = [
     "Trajectory",
     "TuneConfig",
     "UnslothAPI",
+    "retry",
 ]
