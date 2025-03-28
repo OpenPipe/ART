@@ -134,7 +134,8 @@ async def train(
             prob_ratio = torch.exp(diff)
             policy_loss = -torch.min(
                 prob_ratio * advantages,
-                torch.clip(prob_ratio, 1 - 0.2, 1 + 0.2) * advantages,
+                torch.clip(prob_ratio, 1 - config.clip_epsilon, 1 + config.clip_epsilon)
+                * advantages,
             )
             del new_logprobs, old_logprobs, diff, prob_ratio, advantages
             return policy_loss.mean()
