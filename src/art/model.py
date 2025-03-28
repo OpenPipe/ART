@@ -1,7 +1,7 @@
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from openai import AsyncOpenAI
-from typing import AsyncGenerator, TYPE_CHECKING
+from typing import AsyncGenerator, Iterable, TYPE_CHECKING
 
 from .openai import patch_openai
 from .types import BaseModel, Trajectory, TuneConfig, Verbosity
@@ -76,7 +76,7 @@ class Model:
 
     async def log(
         self,
-        trajectory_groups: list[list[Trajectory | BaseException]],
+        trajectory_groups: Iterable[Iterable[Trajectory | BaseException]],
         name: str = "val",
     ) -> None:
         """
@@ -86,11 +86,11 @@ class Model:
             trajectory_groups: A batch of trajectory groups.
             name: The evaluation's name. Defaults to "val".
         """
-        await self.api._log(self, trajectory_groups, name)
+        await self.api._log(self, [list(group) for group in trajectory_groups], name)
 
     async def tune(
         self,
-        trajectory_groups: list[list[Trajectory | BaseException]],
+        trajectory_groups: Iterable[Iterable[Trajectory | BaseException]],
         config: TuneConfig = TuneConfig(),
     ) -> None:
         """
@@ -101,4 +101,6 @@ class Model:
             config: Fine-tuning specific configuration with options for the optimizer,
                 loss, other hyperparameters, logging, etc.
         """
-        await self.api._tune_model(self, trajectory_groups, config)
+        await self.api._tune_model(
+            self, [list(group) for group in trajectory_groups], config
+        )

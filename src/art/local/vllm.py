@@ -7,6 +7,7 @@ import socket
 import subprocess
 import sys
 import re
+import time
 from typing import Any, IO, Optional
 
 from ..types import Verbosity
@@ -145,11 +146,12 @@ async def start_vllm(
 
 def kill_vllm_workers() -> None:
     try:
-        # check if vllm is running
+        # kill any processes that contain vllm in the name
         result = subprocess.run(["pgrep", "-f", "vllm"], capture_output=True, text=True)
         if result.returncode == 0:
             subprocess.run(["pkill", "-9", "vllm"], check=True)
-            
+
+        # kill any multiprocessing workers
         result = subprocess.run(["ps", "aux"], capture_output=True, text=True)
         pids = [
             line.split()[1]
@@ -159,6 +161,43 @@ def kill_vllm_workers() -> None:
         ]
         for pid in pids:
             subprocess.run(["kill", "-9", pid], check=True)
+
+        # Instead of a fixed sleep, wait until GPU memory is mostly freed.
+        # We'll poll nvidia-smi until all GPUs show memory usage below a threshold.
+        threshold_mb = 100  # memory threshold in MB
+        poll_interval = 2  # check every 2 seconds
+        max_wait = 60  # maximum wait time in seconds
+        start_time = time.time()
+
+        while True:
+            try:
+                gpu_query = subprocess.run(
+                    [
+                        "nvidia-smi",
+                        "--query-gpu=memory.used",
+                        "--format=csv,noheader,nounits",
+                    ],
+                    capture_output=True,
+                    text=True,
+                    check=True,
+                )
+                usage_values = [
+                    int(line.strip())
+                    for line in gpu_query.stdout.strip().splitlines()
+                    if line.strip().isdigit()
+                ]
+                # If GPU memory usage is below the threshold on all devices, break out of the loop.
+                if usage_values and all(usage < threshold_mb for usage in usage_values):
+                    break
+            except Exception as gpu_err:
+                print(f"Error checking GPU memory: {gpu_err}")
+                break
+
+            if time.time() - start_time > max_wait:
+                print("Timeout waiting for GPU memory to be freed.")
+                break
+
+            time.sleep(poll_interval)
     except Exception as e:
         print(f"Error killing vLLM workers: {e}")
         print(type(e))
