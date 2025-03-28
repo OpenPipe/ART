@@ -3,12 +3,14 @@ if __name__ == "__main__":
 
 
 import asyncio
+import atexit
 import httpx
 from fastapi import FastAPI
 import functools
 import os
 from peft.peft_model import PeftModel
 from pydantic import BaseModel
+import signal
 import sys
 import torch
 import traceback
@@ -165,6 +167,19 @@ class ModelService(BaseModel):
             stdout=log_file,
             stderr=log_file,
         )
+
+        # Register cleanup handlers for process termination
+        def cleanup_process():
+            if self.process is not None and self.process.returncode is None:
+                try:
+                    self.process.terminate()
+                except ProcessLookupError:
+                    pass  # Process already gone
+
+        atexit.register(cleanup_process)
+
+        for sig in (signal.SIGINT, signal.SIGTERM):
+            signal.signal(sig, lambda signum, frame: cleanup_process())
 
         # Create a client for the service
         client = httpx.AsyncClient(base_url=f"http://{self.host}:{self.port}")
