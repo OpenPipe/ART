@@ -61,6 +61,15 @@ async def train(
         try:
             config: TuneConfig = inputs.pop("config")  # type: ignore
 
+            if optimizer := trainer.optimizer:
+                optimizer = getattr(optimizer, "optimizer", optimizer)
+                if param_groups := getattr(optimizer, "param_groups"):
+                    for param_group in param_groups:
+                        param_group["lr"] = config.lr
+                        param_group["betas"] = config.betas
+                        if param_group.get("weight_decay"):
+                            param_group["weight_decay"] = config.weight_decay
+
             # Move tensors to the correct device
             inputs = {key: tensor.to(trainer.accelerator.device) for key, tensor in inputs.items()}  # type: ignore
 

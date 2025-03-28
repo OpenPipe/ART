@@ -203,7 +203,7 @@ class ModelService(BaseModel):
                 "/tune",
                 json={
                     "disk_packed_tensors": disk_packed_tensors,
-                    "config": config.model_dump_json(),
+                    "config": config.model_dump(),
                 },
                 timeout=httpx.Timeout(None),
             )
@@ -239,7 +239,7 @@ class ModelService(BaseModel):
             model=peft_model,
             tokenizer=tokenizer,
             args=GRPOConfig(
-                learning_rate=5e-4,
+                learning_rate=5e-6,
                 adam_beta1=0.9,
                 adam_beta2=0.99,
                 weight_decay=0.1,
