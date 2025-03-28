@@ -6,10 +6,13 @@ from peft.peft_model import PeftModel
 import torch
 from transformers import PreTrainedTokenizerBase
 from trl import GRPOConfig, GRPOTrainer
-from typing import cast
+from typing import cast, TYPE_CHECKING
 
 from .grpo import GRPO
-from .pack import PackedTensors
+from ..types import TuneConfig
+
+if TYPE_CHECKING:
+    from ..model_service import TuneInputs
 
 nest_asyncio.apply()
 
@@ -18,7 +21,7 @@ def get_trainer(
     model: PeftModel,
     tokenizer: PreTrainedTokenizerBase,
     args: GRPOConfig,
-    packed_tensors_queue: asyncio.Queue[PackedTensors],
+    inputs_queue: asyncio.Queue["TuneInputs"],
 ) -> GRPOTrainer:
     trainer = GRPOTrainer(
         model=model,  # type: ignore
@@ -29,19 +32,19 @@ def get_trainer(
     )
 
     def _async_prepare_inputs(*_, **__) -> dict[str, torch.Tensor]:
-        async def get_packed_tensors() -> PackedTensors:
-            return await packed_tensors_queue.get()
+        async def get_inputs() -> "TuneInputs":
+            return await inputs_queue.get()
 
-        packed_tensors = asyncio.run(get_packed_tensors())
+        inputs = asyncio.run(get_inputs())
 
-        return cast(dict[str, torch.Tensor], packed_tensors)
+        return cast(dict[str, torch.Tensor], inputs)
 
     trainer._prepare_inputs = _async_prepare_inputs
     return trainer
 
 
 async def train(
-    trainer: GRPOTrainer, packed_tensors_queue: asyncio.Queue[PackedTensors]
+    trainer: GRPOTrainer, inputs_queue: asyncio.Queue["TuneInputs"]
 ) -> None:
     # loss_fn = GRPO()
     # loss_fn._forward_chunk = torch.compile(
@@ -51,11 +54,13 @@ async def train(
 
     def compute_loss(
         model: PeftModel,
-        inputs: PackedTensors,
+        inputs: "TuneInputs",
         return_outputs: bool = False,
         num_items_in_batch: int | None = None,
     ) -> torch.Tensor:
         try:
+            config: TuneConfig = inputs.pop("config")  # type: ignore
+
             # Move tensors to the correct device
             inputs = {key: tensor.to(trainer.accelerator.device) for key, tensor in inputs.items()}  # type: ignore
 
@@ -128,7 +133,7 @@ async def train(
             for tensor in inputs.values():
                 tensor.to("cpu")  # type: ignore
             torch.cuda.empty_cache()
-            packed_tensors_queue.task_done()
+            inputs_queue.task_done()
 
     _compute_loss = trainer.compute_loss
     trainer.compute_loss = compute_loss

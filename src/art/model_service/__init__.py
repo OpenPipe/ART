@@ -52,6 +52,10 @@ class StartOpenaiServer(BaseModel):
     tool_use: bool
 
 
+class TuneInputs(PackedTensors):
+    config: types.TuneConfig
+
+
 class ModelService(BaseModel):
     host: str
     port: int
@@ -106,25 +110,25 @@ class ModelService(BaseModel):
         from unsloth_zoo.training_utils import set_training, unset_training  # type: ignore
 
         packed_tensors = packed_tensors_from_dir(**disk_packed_tensors)
-        queue = self.packed_tensors_queue
-        await queue.join()
+        await self.inputs_queue.join()
         model, _ = self.model_and_tokenizer
         set_training(model)
         trainer = self.trainer
         for i in range(packed_tensors["tokens"].shape[0]):
-            queue.put_nowait(
-                PackedTensors(
+            self.inputs_queue.put_nowait(
+                TuneInputs(
                     **{
                         k: v[i : i + 1]
                         for k, v in packed_tensors.items()
                         if isinstance(v, torch.Tensor)
-                    }
+                    },
+                    config=config,
                 )
             )
         if self._train_task is None:
-            self._train_task = asyncio.create_task(train(trainer, queue))
+            self._train_task = asyncio.create_task(train(trainer, self.inputs_queue))
         (done,), _ = await asyncio.wait(
-            [self._train_task, asyncio.create_task(queue.join())],
+            [self._train_task, asyncio.create_task(self.inputs_queue.join())],
             return_when=asyncio.FIRST_COMPLETED,
         )
         # unset_training(peft_model)
@@ -182,7 +186,10 @@ class ModelService(BaseModel):
         ) -> None:
             response = await client.post(
                 "/tune",
-                json={"disk_packed_tensors": disk_packed_tensors, "config": config},
+                json={
+                    "disk_packed_tensors": disk_packed_tensors,
+                    "config": config.model_dump_json(),
+                },
                 timeout=httpx.Timeout(None),
             )
             response.raise_for_status()
@@ -207,7 +214,7 @@ class ModelService(BaseModel):
         return get_model_and_tokenizer(self.base_model)
 
     @functools.cached_property
-    def packed_tensors_queue(self) -> asyncio.Queue["PackedTensors"]:
+    def inputs_queue(self) -> asyncio.Queue[TuneInputs]:
         return asyncio.Queue()
 
     @functools.cached_property
@@ -235,7 +242,7 @@ class ModelService(BaseModel):
                 # report_to="none",  # Can use Weights & Biases
                 output_dir=self.output_dir,
             ),
-            packed_tensors_queue=self.packed_tensors_queue,
+            inputs_queue=self.inputs_queue,
         )
         return self._trainer
 
