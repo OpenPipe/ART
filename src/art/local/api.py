@@ -166,7 +166,7 @@ class LocalAPI(API):
     async def _close_openai_client(self, client: AsyncOpenAI) -> None:
         await client.close()
         if self._vllm:
-            self._vllm.process.terminate()
+            self._vllm.process.kill()
             kill_vllm_workers()
 
     async def _log(

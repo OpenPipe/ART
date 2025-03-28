@@ -144,12 +144,21 @@ async def start_vllm(
 
 
 def kill_vllm_workers() -> None:
-    result = subprocess.run(["ps", "aux"], capture_output=True, text=True)
-    pids = [
-        line.split()[1]
-        for line in result.stdout.splitlines()
-        if "from multiprocessing.spawn import spawn_main; spawn_main(tracker_fd="
-        in line
-    ]
-    for pid in pids:
-        subprocess.run(["sudo", "kill", "-9", pid], check=True)
+    try:
+        # check if vllm is running
+        result = subprocess.run(["pgrep", "-f", "vllm"], capture_output=True, text=True)
+        if result.returncode == 0:
+            subprocess.run(["pkill", "-9", "vllm"], check=True)
+            
+        result = subprocess.run(["ps", "aux"], capture_output=True, text=True)
+        pids = [
+            line.split()[1]
+            for line in result.stdout.splitlines()
+            if "from multiprocessing.spawn import spawn_main; spawn_main(tracker_fd="
+            in line
+        ]
+        for pid in pids:
+            subprocess.run(["kill", "-9", pid], check=True)
+    except Exception as e:
+        print(f"Error killing vLLM workers: {e}")
+        print(type(e))
