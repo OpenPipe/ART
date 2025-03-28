@@ -19,11 +19,11 @@ if os.path.exists(vllm_log_path):
     open(vllm_log_path, "w").close()
 
 # Import unsloth before transformers
-try:
-    import unsloth  # type: ignore
-except ImportError:
-    # unsloth may not be available on all platforms
-    pass
+# try:
+#     import unsloth  # type: ignore
+# except ImportError:
+#     # unsloth may not be available on all platforms
+#     pass
 
 from .api import API
 from .gather_groups import gather_groups

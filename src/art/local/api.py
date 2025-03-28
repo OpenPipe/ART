@@ -131,7 +131,7 @@ class LocalAPI(API):
                 gpu_memory_utilization=0.95,
                 max_num_seqs=2048,
                 max_num_batched_tokens=16384,
-                num_scheduler_steps=8,
+                num_scheduler_steps=1,
                 preemption_mode="swap",
                 return_tokens_as_token_ids=True,
                 swap_space=80,
