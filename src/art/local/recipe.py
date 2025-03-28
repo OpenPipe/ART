@@ -36,7 +36,7 @@ from typing import (
 )
 from warnings import warn
 
-from .pack import PackedTensors
+from .pack import PackedDataset, PackedTensors
 from .grpo import GRPO, GRPOResult, shift_tensor
 
 log = utils.get_logger("DEBUG")
@@ -114,7 +114,7 @@ class TuneRecipeConfig(DictConfig):
         metric_logger: ComponentConfig[MetricLoggerInterface] = PLACEHOLDER,
         model: ComponentConfig[TransformerDecoder] = PLACEHOLDER,
         loss: ComponentConfig[GRPO] = ComponentConfig(GRPO),
-        dataset: ComponentConfig[Dataset[PackedTensors]] = PLACEHOLDER,
+        dataset: ComponentConfig[PackedDataset] = PLACEHOLDER,
         shuffle: bool = False,
         batch_size: int = 1,
         fsdp_cpu_offload: Optional[bool] = None,
@@ -817,7 +817,7 @@ class TuneRecipe(FTRecipeInterface):
 
     def _setup_data(
         self,
-        cfg_dataset: ComponentConfig[Dataset[PackedTensors]],
+        cfg_dataset: ComponentConfig[PackedDataset],
         shuffle: bool,
         batch_size: int,
     ) -> Tuple[DistributedSampler, TypedDataLoader[PackedTensors]]:
@@ -838,7 +838,7 @@ class TuneRecipe(FTRecipeInterface):
             batch_size=batch_size,
             sampler=sampler,
             # dropping last avoids shape issues with compile + flex attention
-            drop_last=True,
+            drop_last=len(ds) > 1,
         )
 
         if self._is_rank_zero:
