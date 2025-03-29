@@ -66,7 +66,7 @@ def tokenize_trajectory_groups(
             if advantage == 0:
                 continue
             results.append(
-                _tokenize_trajectory(
+                tokenize_trajectory(
                     tokenizer,
                     trajectory,
                     advantage,
@@ -75,6 +75,9 @@ def tokenize_trajectory_groups(
         # Choose a random prompt id
         prompt_id = random.randint(-(2**63), 2**63 - 1)
         # Find the longest shared prefix
+        # TODO: Potentially support multiple prompts per group
+        # Initial thought is to sort the results by token_ids and then
+        # successively group prompts with the same prefix.
         prompt_length = len(
             list(
                 takewhile(
@@ -88,12 +91,14 @@ def tokenize_trajectory_groups(
             result.prompt_id = prompt_id
             result.prompt_length = prompt_length
             # zero out assistant prompt tokens
+            # TODO: If we support multiple prompts per group,
+            # this may be harmful.
             result.assistant_mask[:prompt_length] = [0] * prompt_length
         random.shuffle(results)
         yield from results
 
 
-def _tokenize_trajectory(
+def tokenize_trajectory(
     tokenizer: PreTrainedTokenizerBase,
     trajectory: Trajectory,
     advantage: float,
@@ -118,6 +123,8 @@ def _tokenize_trajectory(
         for message_or_choice in trajectory.messages_and_choices
     ]
     # Update the chat template to add generation tags for assistant token masking.
+    # TODO: Improve the way we get chat templates, potentially just use the default
+    # chat template and identify the assistant tokens a different way.
     chat_template = _updated_chat_template(
         tokenizer.get_chat_template("tool_use" if trajectory.tools else None)
     )
@@ -233,6 +240,9 @@ def _updated_chat_template(chat_template: str) -> str:
     """
     Returns an updated chat template that adds generation tags for assistant token masking.
     """
+    # TODO: This is a mess. We should either just use the default chat template and find
+    # the assistant tokens a different way or store full chat templates somewhere for
+    # each model.
     return (
         chat_template
         # Remove template logic that strips reasoning content from the chat messages

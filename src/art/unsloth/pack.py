@@ -45,6 +45,7 @@ def packed_tensors_from_tokenized_results(
     truncate_long_results: bool = True,
     verbosity: Verbosity = 1,
 ) -> PackedTensors:
+    # TODO: This function could potentially be optimized with vectorized operations
     token_ids: list[list[int]] = [[]]
     group_ids: list[list[int]] = [[]]
     parent_ids: list[list[int]] = [[]]

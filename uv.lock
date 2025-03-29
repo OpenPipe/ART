@@ -231,6 +231,7 @@ dependencies = [
     { name = "torch" },
     { name = "torchao" },
     { name = "torchtune" },
+    { name = "trl" },
     { name = "typer" },
     { name = "unsloth", marker = "sys_platform == 'linux'" },
     { name = "unsloth-zoo", marker = "sys_platform == 'linux'" },
@@ -257,6 +258,7 @@ requires-dist = [
     { name = "torch", specifier = ">=2.5.1" },
     { name = "torchao", specifier = ">=0.9.0" },
     { name = "torchtune", specifier = "==0.5.0" },
+    { name = "trl", specifier = "==0.15.2" },
     { name = "typer", specifier = ">=0.15.2" },
     { name = "unsloth", marker = "sys_platform == 'linux'", git = "https://github.com/bradhilton/unsloth" },
     { name = "unsloth-zoo", marker = "sys_platform == 'linux'", git = "https://github.com/bradhilton/unsloth-zoo" },
@@ -4340,10 +4342,10 @@ name = "trl"
 version = "0.15.2"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
-    { name = "accelerate", marker = "sys_platform == 'linux'" },
-    { name = "datasets", marker = "sys_platform == 'linux'" },
-    { name = "rich", marker = "sys_platform == 'linux'" },
-    { name = "transformers", marker = "sys_platform == 'linux'" },
+    { name = "accelerate" },
+    { name = "datasets" },
+    { name = "rich" },
+    { name = "transformers" },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/95/fe/ae0d782c48eef56d0ec125ebd05998539ede7cbf0e307a48f9323998b9e7/trl-0.15.2.tar.gz", hash = "sha256:0f82190a058a0a194dbcfae1fe9548b68a0a05b2f4d1824f8db1ae7d949cdd47", size = 333962 }
 wheels = [
