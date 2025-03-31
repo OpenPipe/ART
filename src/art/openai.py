@@ -17,6 +17,7 @@ from openai.types.chat.chat_completion_message_tool_call import (
 from typing import (
     Any,
     Callable,
+    Coroutine,
 )
 
 from .gather_trajectories import get_groups_context
@@ -24,7 +25,9 @@ from .utils import format_message
 
 
 def patch_openai(
-    client: openai.AsyncOpenAI, semaphore: asyncio.Semaphore
+    client: openai.AsyncOpenAI,
+    semaphore: asyncio.Semaphore,
+    close: Callable[[openai.AsyncOpenAI], Coroutine[None, None, None]],
 ) -> openai.AsyncOpenAI:
     create = client.chat.completions.create
 
@@ -91,6 +94,12 @@ def patch_openai(
         return chat_completion
 
     client.chat.completions.create = create_patched  # type: ignore
+
+    async def _close() -> None:
+        await client.close()
+        await close(client)
+
+    client.close = _close
     return client
 
 
