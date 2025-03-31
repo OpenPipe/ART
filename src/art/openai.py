@@ -94,12 +94,13 @@ def patch_openai(
         return chat_completion
 
     client.chat.completions.create = create_patched  # type: ignore
+    _close = client.close
 
-    async def _close() -> None:
-        await client.close()
+    async def __close() -> None:
+        await _close()
         await close(client)
 
-    client.close = _close
+    client.close = __close
     return client
 
 

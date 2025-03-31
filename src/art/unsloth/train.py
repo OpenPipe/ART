@@ -12,7 +12,7 @@ if TYPE_CHECKING:
     from peft.peft_model import PeftModel
     from transformers import PreTrainedTokenizerBase
     from trl import GRPOConfig, GRPOTrainer
-    from ..model_service import TuneInputs
+    from .service import TuneInputs
 
 nest_asyncio.apply()
 

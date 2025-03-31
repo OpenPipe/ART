@@ -64,6 +64,7 @@ def get_model_config(
         num_generations=2,  # Decrease if out of memory
         save_strategy="no",
         output_dir=output_dir,
+        disable_tqdm=True,
     )
     train_args.update(**config.get("train_args", {}))
     # TODO: Add base model conditional configuration
