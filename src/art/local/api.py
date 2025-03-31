@@ -285,8 +285,6 @@ class LocalAPI(API):
                 loss=ComponentConfig(
                     GRPO,
                     clip_epsilon=config.clip_epsilon,
-                    entropy_coef=config.entropy_coef,
-                    kl_coef=config.kl_coef,
                 ),
                 shuffle=True,
                 batch_size=32768 // config.sequence_length,
