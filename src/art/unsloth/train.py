@@ -97,6 +97,7 @@ async def train(
             ].unsqueeze(1)
             mask = causal_mask & (group_mask | parent_mask)
             attn_bias = torch.where(mask, 0.0, float("-inf"))
+            del mask
 
             # Unsloth code
             if not hasattr(trainer, "_autocast_dtype"):
@@ -116,12 +117,13 @@ async def train(
                 hidden_states = model(
                     input_ids=inputs["tokens"], causal_mask=attn_bias
                 ).logits
+                del attn_bias
                 hidden_states = hidden_states[:, :-1, :]
 
             lm_head_t = (
                 trainer.model.get_output_embeddings().weight.t().to(hidden_states.dtype)
             )
-            num_chunks = 4
+            num_chunks = 2
             policy_loss_sum = 0.0
             policy_loss_tokens = 0
             for hidden_states, mask, tokens, logprobs, advantages in zip(
@@ -145,7 +147,7 @@ async def train(
                     .to(torch.float32)
                 )
                 new_logprobs = selected_logits - torch.logsumexp(logits, dim=-1)
-                del logits
+                del hidden_states, logits, selected_logits
                 old_logprobs = logprobs[mask]
                 old_logprobs = torch.where(
                     torch.isnan(old_logprobs), new_logprobs, old_logprobs
@@ -160,9 +162,9 @@ async def train(
                     )
                     * advantages,
                 )
-                del new_logprobs, old_logprobs, diff, prob_ratio, advantages
                 policy_loss_sum += policy_loss.sum()
                 policy_loss_tokens += num_tokens
+                del new_logprobs, old_logprobs, diff, prob_ratio, advantages
             return policy_loss_sum / policy_loss_tokens  # type: ignore
         finally:
             for tensor in inputs.values():

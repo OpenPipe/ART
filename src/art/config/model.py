@@ -87,13 +87,15 @@ def get_model_config(
 def get_base_model_config(base_model: "types.BaseModel") -> "ModelConfig":
     if base_model == "Qwen/Qwen2.5-7B-Instruct":
         return ModelConfig(
-            init_args=InitArgs(max_seq_length=32768, max_lora_rank=8),
+            init_args=InitArgs(
+                max_seq_length=32768, gpu_memory_utilization=0.65, max_lora_rank=8
+            ),
             peft_args=PeftArgs(r=8, lora_alpha=16),
         )
     elif base_model == "Qwen/Qwen2.5-14B-Instruct":
         return ModelConfig(
-            init_args=InitArgs(max_seq_length=8192, max_lora_rank=32),
-            peft_args=PeftArgs(r=32, lora_alpha=32),
+            init_args=InitArgs(max_seq_length=8192, max_lora_rank=8),
+            peft_args=PeftArgs(r=8, lora_alpha=16),
         )
     else:
         raise RuntimeError(
