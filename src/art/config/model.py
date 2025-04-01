@@ -126,7 +126,7 @@ class PeftArgs(TypedDict, total=False):
     bias: str
     layers_to_transform: list[int] | None
     layers_pattern: str | None
-    use_gradient_checkpointing: bool | str
+    use_gradient_checkpointing: bool
     random_state: int
     max_seq_length: int  # not used anymore
     use_rslora: bool

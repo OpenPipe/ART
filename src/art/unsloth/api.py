@@ -228,7 +228,7 @@ class UnslothAPI(API):
             asyncio.Semaphore(226),
         )
 
-    async def _close_openai_client(self, client: AsyncOpenAI) -> None: ...
+    async def _close_openai_client(self, _: AsyncOpenAI) -> None: ...
 
     async def _log(
         self,
