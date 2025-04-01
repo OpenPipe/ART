@@ -109,38 +109,61 @@ async def train(
                     dtype = torch.float16
                 setattr(trainer, "_autocast_dtype", dtype)
 
+            os.environ["UNSLOTH_RETURN_HIDDEN_STATES"] = "1"
             with torch.amp.autocast_mode.autocast(
                 device_type="cuda", dtype=getattr(trainer, "_autocast_dtype")
             ):
-                logits = model(input_ids=inputs["tokens"], causal_mask=attn_bias).logits
-                logits = logits[:, :-1, :]
+                hidden_states = model(
+                    input_ids=inputs["tokens"], causal_mask=attn_bias
+                ).logits
+                hidden_states = hidden_states[:, :-1, :]
 
-            mask = inputs["assistant_mask"][:, 1:]
-            logits = logits[mask]
-
-            selected_logits = (
-                torch.gather(
-                    logits, dim=-1, index=inputs["tokens"][:, 1:][mask].unsqueeze(-1)
+            lm_head_t = (
+                trainer.model.get_output_embeddings().weight.t().to(hidden_states.dtype)
+            )
+            num_chunks = 4
+            policy_loss_sum = 0.0
+            policy_loss_tokens = 0
+            for hidden_states, mask, tokens, logprobs, advantages in zip(
+                torch.chunk(hidden_states, num_chunks, dim=1),
+                torch.chunk(inputs["assistant_mask"][:, 1:], num_chunks, dim=1),
+                torch.chunk(inputs["tokens"][:, 1:], num_chunks, dim=1),
+                torch.chunk(inputs["logprobs"][:, 1:], num_chunks, dim=1),
+                torch.chunk(inputs["advantages"][:, 1:], num_chunks, dim=1),
+            ):
+                num_tokens = mask.sum()
+                if num_tokens == 0:
+                    continue
+                logits = torch.matmul(hidden_states, lm_head_t)[mask]
+                selected_logits = (
+                    torch.gather(
+                        logits,
+                        dim=-1,
+                        index=tokens[mask].unsqueeze(-1),
+                    )
+                    .squeeze(-1)
+                    .to(torch.float32)
                 )
-                .squeeze(-1)
-                .to(torch.float32)
-            )
-            new_logprobs = selected_logits - torch.logsumexp(logits, dim=-1)
-            del logits
-            old_logprobs = inputs["logprobs"][:, 1:][mask]
-            old_logprobs = torch.where(
-                torch.isnan(old_logprobs), new_logprobs, old_logprobs
-            )
-            advantages = inputs["advantages"][:, 1:][mask]
-            diff = new_logprobs - old_logprobs
-            prob_ratio = torch.exp(diff)
-            policy_loss = -torch.min(
-                prob_ratio * advantages,
-                torch.clip(prob_ratio, 1 - config.clip_epsilon, 1 + config.clip_epsilon)
-                * advantages,
-            )
-            del new_logprobs, old_logprobs, diff, prob_ratio, advantages
-            return policy_loss.mean()
+                new_logprobs = selected_logits - torch.logsumexp(logits, dim=-1)
+                del logits
+                old_logprobs = logprobs[mask]
+                old_logprobs = torch.where(
+                    torch.isnan(old_logprobs), new_logprobs, old_logprobs
+                )
+                advantages = advantages[mask]
+                diff = new_logprobs - old_logprobs
+                prob_ratio = torch.exp(diff)
+                policy_loss = -torch.min(
+                    prob_ratio * advantages,
+                    torch.clip(
+                        prob_ratio, 1 - config.clip_epsilon, 1 + config.clip_epsilon
+                    )
+                    * advantages,
+                )
+                del new_logprobs, old_logprobs, diff, prob_ratio, advantages
+                policy_loss_sum += policy_loss.sum()
+                policy_loss_tokens += num_tokens
+            return policy_loss_sum / policy_loss_tokens  # type: ignore
         finally:
             for tensor in inputs.values():
                 tensor.to("cpu")  # type: ignore

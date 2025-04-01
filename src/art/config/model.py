@@ -22,10 +22,10 @@ def get_model_config(
 
     if config is None:
         config = ModelConfig()
-    lora_path = get_last_iteration_dir(output_dir)
+    base_model_config = get_base_model_config(base_model=base_model)
     init_args = InitArgs(
-        model_name=lora_path or base_model,
-        max_seq_length=8192,
+        model_name=base_model,
+        max_seq_length=32768,
         load_in_4bit=True,  # False for LoRA 16bit
         fast_inference=True,  # Enable vLLM fast inference
         # vLLM args
@@ -33,13 +33,16 @@ def get_model_config(
         disable_log_stats=False,
         enable_prefix_caching=True,
         gpu_memory_utilization=0.62,  # Reduce if out of memory
-        max_lora_rank=32,
+        max_lora_rank=8,
         num_scheduler_steps=16,
         use_async=True,
     )
+    init_args.update(base_model_config.get("init_args", {}))
     init_args.update(config.get("init_args", {}))
+    if lora_path := get_last_iteration_dir(output_dir):
+        init_args["model_name"] = lora_path
     peft_args = PeftArgs(
-        r=32,  # Choose any number > 0 ! Suggested 8, 16, 32, 64, 128
+        r=8,  # Choose any number > 0 ! Suggested 8, 16, 32, 64, 128
         target_modules=[
             "q_proj",
             "k_proj",
@@ -49,11 +52,12 @@ def get_model_config(
             "up_proj",
             "down_proj",
         ],  # Remove QKVO if out of memory
-        lora_alpha=32,
+        lora_alpha=16,
         # Enable long context finetuning
         use_gradient_checkpointing="unsloth",  # type: ignore
         random_state=3407,
     )
+    peft_args.update(base_model_config.get("peft_args", {}))
     peft_args.update(config.get("peft_args", {}))
     train_args = TrainArgs(
         learning_rate=5e-6,
@@ -70,13 +74,31 @@ def get_model_config(
         output_dir=output_dir,
         disable_tqdm=True,
     )
-    train_args.update(**config.get("train_args", {}))
+    train_args.update(base_model_config.get("train_args", {}))
+    train_args.update(config.get("train_args", {}))
     # TODO: Add base model conditional configuration
     return ModelConfig(
         init_args=init_args,
         peft_args=peft_args,
         train_args=train_args,
     )
+
+
+def get_base_model_config(base_model: "types.BaseModel") -> "ModelConfig":
+    if base_model == "Qwen/Qwen2.5-7B-Instruct":
+        return ModelConfig(
+            init_args=InitArgs(max_seq_length=32768, max_lora_rank=8),
+            peft_args=PeftArgs(r=8, lora_alpha=16),
+        )
+    elif base_model == "Qwen/Qwen2.5-14B-Instruct":
+        return ModelConfig(
+            init_args=InitArgs(max_seq_length=8192, max_lora_rank=32),
+            peft_args=PeftArgs(r=32, lora_alpha=32),
+        )
+    else:
+        raise RuntimeError(
+            f"{base_model} is not supported by the Unsloth backend at this time"
+        )
 
 
 class ModelConfig(TypedDict, total=False):

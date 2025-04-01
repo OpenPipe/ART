@@ -71,7 +71,6 @@ class ModelService:
         packed_tensors = packed_tensors_from_dir(**disk_packed_tensors)
         inputs_queue = self.state.inputs_queue
         await inputs_queue.join()
-        peft_model = self.state.peft_model
         trainer = self.state.trainer
         for i in range(packed_tensors["tokens"].shape[0]):
             inputs_queue.put_nowait(
@@ -86,12 +85,12 @@ class ModelService:
             )
         if self._train_task is None:
             self._train_task = asyncio.create_task(train(trainer, inputs_queue))
-        (done,), _ = await asyncio.wait(
+        done, _ = await asyncio.wait(
             [self._train_task, asyncio.create_task(inputs_queue.join())],
             return_when=asyncio.FIRST_COMPLETED,
         )
-        if exception := done.exception():
-            raise exception
+        for task in done:
+            task.result()
         # Save the new lora
         iteration_dir = f"{self.output_dir}/{get_iteration(self.output_dir) + 1:04d}"
         trainer.save_model(iteration_dir)

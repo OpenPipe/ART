@@ -30,6 +30,18 @@ class ModelConfig:
         ), f"{self.base_model} requires at least {self.min_gpus} GPUs"
 
 
+def qwen_7b() -> ModelConfig:
+    """deepseek-ai/DeepSeek-R1-Distill-Qwen-7B model config."""
+    return ModelConfig(
+        base_model="Qwen/Qwen2.5-7B-Instruct",
+        min_gpus=1,
+        tune_model_type="QWEN2",
+        tune_model=qwen2_5_7b_base,
+        tune_num_output_chunks=8,
+        vllm_tool_call_parser=None,
+    )
+
+
 def distilled_qwen_7b() -> ModelConfig:
     """deepseek-ai/DeepSeek-R1-Distill-Qwen-7B model config."""
     return ModelConfig(
@@ -163,6 +175,7 @@ def qwen_72b() -> ModelConfig:
 
 
 model_configs = {
+    "Qwen/Qwen2.5-7B-Instruct": qwen_7b,
     "deepseek-ai/DeepSeek-R1-Distill-Qwen-7B": distilled_qwen_7b,
     "unsloth/Meta-Llama-3.1-8B-Instruct": llama_8b,
     "NousResearch/Hermes-2-Theta-Llama-3-8B": theta_8b,

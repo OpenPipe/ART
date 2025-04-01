@@ -8,6 +8,7 @@ import pydantic
 from typing import Iterable, Literal
 
 BaseModel = Literal[
+    "Qwen/Qwen2.5-7B-Instruct",
     "deepseek-ai/DeepSeek-R1-Distill-Qwen-7B",
     "NousResearch/Hermes-2-Theta-Llama-3-8B",
     "NousResearch/Hermes-3-Llama-3.1-8B",
