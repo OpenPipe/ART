@@ -4,6 +4,7 @@ from contextlib import asynccontextmanager
 from functools import partial
 import logging
 import multiprocessing
+from openai import AsyncOpenAI
 import os
 from typing import AsyncIterator, Coroutine, Any
 from vllm.engine.arg_utils import AsyncEngineArgs
@@ -21,7 +22,6 @@ from .async_multiprocessing_engine import MQAsyncLLMEngine
 from ..config.openai_server import OpenAIServerConfig
 
 if TYPE_CHECKING:
-    from peft.peft_model import PeftModel
     from .state import vLLMState
 
 # Unsloth expects these attributes to be present
@@ -29,7 +29,7 @@ LoRARequest.lora_tensors = {}  # type: ignore
 LoRARequest.lora_embeddings = {}  # type: ignore
 
 
-def openai_server_task(
+async def openai_server_task(
     state: "vLLMState",
     config: OpenAIServerConfig,
 ) -> asyncio.Task[None]:
@@ -45,8 +45,39 @@ def openai_server_task(
         yield state.async_engine
 
     api_server.build_async_engine_client = build_async_engine_client
+    openai_server_task = asyncio.create_task(_openai_server_coroutine(config))
+    server_args = config.get("server_args", {})
+    client = AsyncOpenAI(
+        api_key=server_args.get("api_key"),
+        base_url=f"http://{server_args.get('host', '0.0.0.0')}:{server_args.get('port', 8000)}/v1",
+    )
 
-    return asyncio.create_task(_openai_server_coroutine(config))
+    async def test_client() -> None:
+        while True:
+            try:
+                async for model in client.models.list():
+                    return
+            except:
+                pass
+
+    try:
+        test_client_task = asyncio.create_task(test_client())
+
+        done, _ = await asyncio.wait(
+            [openai_server_task, test_client_task],
+            timeout=10.0,
+            return_when="FIRST_COMPLETED",
+        )
+        if not done:
+            raise TimeoutError("Unable to reach OpenAI-compatible server in time.")
+        for task in done:
+            task.result()
+
+        return openai_server_task
+    except Exception as e:
+        openai_server_task.cancel()
+        test_client_task.cancel()
+        raise
 
 
 def _openai_server_coroutine(
