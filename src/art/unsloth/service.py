@@ -99,7 +99,6 @@ class ModelService:
         lora_request.lora_int_id = 1
         lora_request.lora_name = self.model_name
         self.state.vllm.async_engine.engine.remove_lora(1)
-        print(lora_request)
         self.state.vllm.async_engine.engine.add_lora(lora_request)  # type: ignore
 
     @functools.cached_property

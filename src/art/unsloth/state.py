@@ -7,14 +7,15 @@ import torch
 import transformers
 from trl import GRPOConfig, GRPOTrainer
 from typing import cast
-import vllm
-from vllm.worker.worker_base import WorkerWrapperBase
-from vllm.worker.multi_step_model_runner import MultiStepModelRunner
 from typing import TYPE_CHECKING
 
 from ..config.model import ModelConfig
 
 if TYPE_CHECKING:
+    import vllm
+    from vllm.worker.worker_base import WorkerWrapperBase
+    from vllm.worker.multi_step_model_runner import MultiStepModelRunner
+
     from .service import TuneInputs
 
 nest_asyncio.apply()
@@ -29,7 +30,7 @@ class ModelState:
             tuple[CausallLM, transformers.PreTrainedTokenizerBase],
             unsloth.FastLanguageModel.from_pretrained(**config.get("init_args", {})),
         )
-        self.vllm = vLLMState(cast(vllm.AsyncLLMEngine, self.model.vllm_engine))
+        self.vllm = vLLMState(cast("vllm.AsyncLLMEngine", self.model.vllm_engine))
         self.peft_model = cast(
             peft.peft_model.PeftModelForCausalLM,
             unsloth.FastLanguageModel.get_peft_model(
@@ -61,12 +62,12 @@ class ModelState:
 
 
 class vLLMState:
-    def __init__(self, async_engine: vllm.AsyncLLMEngine) -> None:
+    def __init__(self, async_engine: "vllm.AsyncLLMEngine") -> None:
         self.async_engine = async_engine
         self.driver_worker = cast(
-            WorkerWrapperBase,
+            "WorkerWrapperBase",
             getattr(self.async_engine.engine.model_executor, "driver_worker"),
         )
-        self.multi_step_model_runner: MultiStepModelRunner = (
+        self.multi_step_model_runner: "MultiStepModelRunner" = (
             self.driver_worker.model_runner
         )
