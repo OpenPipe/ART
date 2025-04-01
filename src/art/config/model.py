@@ -1,5 +1,6 @@
 from typing import TYPE_CHECKING, TypedDict
 
+
 if TYPE_CHECKING:
     from transformers.training_args import (
         DebugOption,
@@ -17,10 +18,13 @@ if TYPE_CHECKING:
 def get_model_config(
     base_model: "types.BaseModel", output_dir: str, config: "ModelConfig | None"
 ) -> "ModelConfig":
+    from ..unsloth.checkpoints import get_last_iteration_dir
+
     if config is None:
         config = ModelConfig()
+    lora_path = get_last_iteration_dir(output_dir)
     init_args = InitArgs(
-        model_name=base_model,
+        model_name=lora_path or base_model,
         max_seq_length=8192,
         load_in_4bit=True,  # False for LoRA 16bit
         fast_inference=True,  # Enable vLLM fast inference
