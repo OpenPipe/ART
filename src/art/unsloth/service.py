@@ -13,6 +13,8 @@ from .train import train
 from .vllm import openai_server_task
 
 if TYPE_CHECKING:
+    from unsloth_zoo.vllm_lora_request import LoRARequest
+
     from .state import ModelState
 
 
@@ -40,7 +42,7 @@ class ModelService:
             self.state.trainer.save_model(lora_path)
         await self.stop_openai_server()
         self._openai_server_task = openai_server_task(
-            model=self.state.peft_model,
+            state=self.state.vllm,
             config=get_openai_server_config(
                 model_name=self.model_name,
                 base_model=self.base_model,
@@ -90,17 +92,18 @@ class ModelService:
         iteration_dir = f"{self.output_dir}/{get_iteration(self.output_dir) + 1:04d}"
         trainer.save_model(iteration_dir)
         # Swap in the new lora
-        lora_request = peft_model.load_lora(
+        lora_request: "LoRARequest" = peft_model.load_lora(
             iteration_dir,
             load_tensors=True,
         )
         lora_request.lora_int_id = 1
         lora_request.lora_name = self.model_name
         self.state.vllm.async_engine.engine.remove_lora(1)
-        self.state.vllm.async_engine.engine.add_lora(lora_request)
+        print(lora_request)
+        self.state.vllm.async_engine.engine.add_lora(lora_request)  # type: ignore
 
     @functools.cached_property
-    def state(self) -> ModelState:
+    def state(self) -> "ModelState":
         from .state import ModelState
 
         return ModelState(self.config)

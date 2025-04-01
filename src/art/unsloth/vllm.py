@@ -22,6 +22,7 @@ from ..config.openai_server import OpenAIServerConfig
 
 if TYPE_CHECKING:
     from peft.peft_model import PeftModel
+    from .state import vLLMState
 
 # Unsloth expects these attributes to be present
 LoRARequest.lora_tensors = {}  # type: ignore
@@ -29,19 +30,19 @@ LoRARequest.lora_embeddings = {}  # type: ignore
 
 
 def openai_server_task(
-    model: "PeftModel",
+    state: "vLLMState",
     config: OpenAIServerConfig,
 ) -> asyncio.Task[None]:
     patch_get_lora_tokenizer_async()
     patch_listen_for_disconnect()
-    patch_multi_step_model_runner(model)
+    patch_multi_step_model_runner(state)
     set_vllm_log_file(config.get("log_file", "vllm.log"))
 
     @asynccontextmanager
     async def build_async_engine_client(
         _: Namespace,
     ) -> AsyncIterator[EngineClient]:
-        yield getattr(model, "vllm_engine")
+        yield state.async_engine
 
     api_server.build_async_engine_client = build_async_engine_client
 
@@ -104,11 +105,11 @@ def patch_listen_for_disconnect() -> None:
     vllm.entrypoints.utils.listen_for_disconnect = patched_listen_for_disconnect
 
 
-def patch_multi_step_model_runner(model: "PeftModel") -> None:
+def patch_multi_step_model_runner(state: "vLLMState") -> None:
     """
     Patches the vLLM multi-step model runner to support LoRA adapters.
     """
-    model_runner = model.vllm_engine.engine.model_executor.driver_worker.model_runner  # type: ignore
+    model_runner = state.multi_step_model_runner  # type: ignore
     if not hasattr(model_runner, "_base_model_runner"):
         return
     base_model_runner = model_runner._base_model_runner
@@ -167,11 +168,11 @@ def set_vllm_log_file(path: str) -> None:
 
 
 def mp_openai_server_task(
-    model: "PeftModel",
+    state: "vLLMState",
     config: OpenAIServerConfig,
 ) -> asyncio.Task[None]:
     patch_get_lora_tokenizer_async()
-    patch_multi_step_model_runner(model)
+    patch_multi_step_model_runner(state)
 
     # Select random path for IPC.
     ipc_path = get_open_zmq_ipc_path()
@@ -179,7 +180,7 @@ def mp_openai_server_task(
 
     engine = MQAsyncLLMEngine(
         ipc_path=ipc_path,
-        async_engine=model.vllm_engine,
+        async_engine=state.async_engine,
     )
 
     # Start client in separate process (provides the OpenAI API server).
