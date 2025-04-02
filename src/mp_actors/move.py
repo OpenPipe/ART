@@ -50,6 +50,7 @@ class Request:
     method_name: str
     args: tuple[Any, ...]
     kwargs: dict[str, Any]
+    send_value: Any = None
 
 
 @dataclass
@@ -93,8 +94,13 @@ class Proxy:
                 f"{type(self._obj).__name__} has no attribute '{name}'"
             )
 
-        async def get_response(args: tuple[Any, ...], kwargs: dict[str, Any]) -> Any:
-            request = Request(str(uuid.uuid4()), name, args, kwargs)
+        async def get_response(
+            args: tuple[Any, ...],
+            kwargs: dict[str, Any],
+            id: uuid.UUID | None = None,
+            send_value: Any | None = None,
+        ) -> Any:
+            request = Request(str(id or uuid.uuid4()), name, args, kwargs, send_value)
             self._futures[request.id] = asyncio.Future()
             self._requests.put_nowait(request)
             return await self._futures[request.id]
@@ -106,10 +112,12 @@ class Proxy:
             @streamline_tracebacks()
             async def async_gen_wrapper(
                 *args: Any, **kwargs: Any
-            ) -> AsyncGenerator[Any, None]:
-                result: AsyncGeneratorProxy = await get_response(args, kwargs)
-                async for item in result:
-                    yield item
+            ) -> AsyncGenerator[Any, Any]:
+                id = uuid.uuid4()
+                send_value = None
+                while True:
+                    send_value = yield await get_response(args, kwargs, id, send_value)
+                    args, kwargs = (), {}
 
             return async_gen_wrapper
         elif asyncio.iscoroutinefunction(attr):
@@ -155,23 +163,31 @@ def _target(
 async def _handle_requests(
     obj: object, requests: mp.Queue, responses: mp.Queue
 ) -> None:
+    generators: dict[str, AsyncGenerator[Any, Any]] = {}
     while True:
         request: Request = await asyncio.get_event_loop().run_in_executor(
             None, requests.get
         )
-        asyncio.create_task(_handle_request(obj, request, responses))
+        asyncio.create_task(_handle_request(obj, request, responses, generators))
 
 
-async def _handle_request(obj: object, request: Request, responses: mp.Queue) -> None:
+async def _handle_request(
+    obj: object,
+    request: Request,
+    responses: mp.Queue,
+    generators: dict[str, AsyncGenerator[Any, Any]],
+) -> None:
     try:
         result_or_callable = getattr(obj, request.method_name)
-        if callable(result_or_callable):
+        if inspect.isasyncgenfunction(result_or_callable):
+            if not request.id in generators:
+                generators[request.id] = result_or_callable(
+                    *request.args, **request.kwargs
+                )
+            result = await generators[request.id].asend(request.send_value)
+        elif callable(result_or_callable):
             result_or_coro = result_or_callable(*request.args, **request.kwargs)
-            if inspect.isasyncgen(result_or_coro):
-                queue = mp.Queue()
-                asyncio.create_task(_handle_async_generator(result_or_coro, queue))
-                result = AsyncGeneratorProxy(queue)
-            elif asyncio.iscoroutine(result_or_coro):
+            if asyncio.iscoroutine(result_or_coro):
                 result = await result_or_coro
             else:
                 result = result_or_coro
@@ -182,27 +198,3 @@ async def _handle_request(obj: object, request: Request, responses: mp.Queue) ->
         pickling_support.install(e)
         response = Response(request.id, None, e)
     responses.put_nowait(response)
-
-
-async def _handle_async_generator(
-    async_gen: AsyncGenerator[Any, None], queue: mp.Queue
-) -> None:
-    try:
-        async for item in async_gen:
-            queue.put_nowait(item)
-        queue.put_nowait(StopAsyncIteration())
-    except Exception as e:
-        pickling_support.install(e)
-        queue.put_nowait(e)
-
-
-class AsyncGeneratorProxy:
-    def __init__(self, queue: mp.Queue) -> None:
-        self._queue = queue
-
-    async def __aiter__(self) -> AsyncGenerator[Any, None]:
-        while True:
-            item = await asyncio.get_event_loop().run_in_executor(None, self._queue.get)
-            if item is StopAsyncIteration:
-                break
-            yield item
