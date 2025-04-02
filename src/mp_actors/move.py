@@ -113,11 +113,16 @@ class Proxy:
             async def async_gen_wrapper(
                 *args: Any, **kwargs: Any
             ) -> AsyncGenerator[Any, Any]:
-                id = uuid.uuid4()
-                send_value = None
-                while True:
-                    send_value = yield await get_response(args, kwargs, id, send_value)
-                    args, kwargs = (), {}
+                try:
+                    id = uuid.uuid4()
+                    send_value = None
+                    while True:
+                        send_value = yield await get_response(
+                            args, kwargs, id, send_value
+                        )
+                        args, kwargs = (), {}
+                except StopAsyncIteration:
+                    return
 
             return async_gen_wrapper
         elif asyncio.iscoroutinefunction(attr):
