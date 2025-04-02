@@ -10,10 +10,10 @@ from ..config.model import ModelConfig
 from ..config.openai_server import get_openai_server_config, OpenAIServerConfig
 from .pack import DiskPackedTensors, packed_tensors_from_dir, PackedTensors
 from .train import train
-from .vllm import openai_server_task, set_vllm_log_file
+from .vllm import openai_server_task
 
 if TYPE_CHECKING:
-    from unsloth_zoo.vllm_lora_request import LoRARequest
+    from unsloth_zoo.vllm_lora_request import LoRARequest  # type: ignore
 
     from .state import ModelState
 
@@ -70,8 +70,9 @@ class ModelService:
     ) -> None:
         packed_tensors = packed_tensors_from_dir(**disk_packed_tensors)
         inputs_queue = self.state.inputs_queue
+        # Wait for existing batches to finish
         await inputs_queue.join()
-        trainer = self.state.trainer
+        # Currently limit batch size to 1
         for i in range(packed_tensors["tokens"].shape[0]):
             inputs_queue.put_nowait(
                 TuneInputs(
@@ -83,20 +84,27 @@ class ModelService:
                     config=config,
                 )
             )
+        # If we haven't already started, start the training task
         if self._train_task is None:
-            self._train_task = asyncio.create_task(train(trainer, inputs_queue))
+            self._train_task = asyncio.create_task(
+                train(self.state.trainer, inputs_queue)
+            )
+        # Wait for the training task to finish or the inputs queue to join
         done, _ = await asyncio.wait(
             [self._train_task, asyncio.create_task(inputs_queue.join())],
             return_when=asyncio.FIRST_COMPLETED,
         )
+        # Raise any exceptions from the tasks
         for task in done:
             task.result()
-        # Save the new lora
+        # Save the new LoRA adapter
         iteration_dir = f"{self.output_dir}/{get_iteration(self.output_dir) + 1:04d}"
-        trainer.save_model(iteration_dir)
+        self.state.trainer.save_model(iteration_dir)
+        # Set the new LoRA adapter
         self._set_lora(iteration_dir)
 
     def _set_lora(self, lora_path: str) -> None:
+        """Sets the LoRA adapter with ID 1 for the VLLM engine."""
         lora_request: "LoRARequest" = self.state.peft_model.load_lora(
             lora_path,
             load_tensors=True,

@@ -4,7 +4,7 @@ import gc
 import nest_asyncio
 import os
 import torch
-from typing import TYPE_CHECKING
+from typing import Callable, TYPE_CHECKING
 
 from ..types import TuneConfig
 
@@ -19,7 +19,17 @@ nest_asyncio.apply()
 async def train(
     trainer: "GRPOTrainer", inputs_queue: asyncio.Queue["TuneInputs"]
 ) -> None:
+    _compute_loss = trainer.compute_loss
+    trainer.compute_loss = get_compute_loss_fn(trainer, inputs_queue)
+    try:
+        trainer.train()
+    finally:
+        trainer.compute_loss = _compute_loss
 
+
+def get_compute_loss_fn(
+    trainer: "GRPOTrainer", inputs_queue: asyncio.Queue["TuneInputs"]
+) -> Callable[..., torch.Tensor]:
     def compute_loss(
         model: "PeftModel",
         inputs: "TuneInputs",
@@ -151,12 +161,14 @@ async def train(
             free_memory()
             inputs_queue.task_done()
 
-    _compute_loss = trainer.compute_loss
-    trainer.compute_loss = compute_loss
-    try:
-        trainer.train()
-    finally:
-        trainer.compute_loss = _compute_loss
+    return compute_loss
+
+
+def get_log_fn(trainer: "GRPOTrainer") -> Callable[..., None]:
+    def log(logs: dict[str, float], start_time: float | None = None) -> None:
+        pass
+
+    return log
 
 
 def calculate_log_probs(
