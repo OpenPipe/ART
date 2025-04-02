@@ -89,7 +89,7 @@ def get_base_model_config(base_model: "types.BaseModel") -> "ModelConfig":
     if base_model == "Qwen/Qwen2.5-7B-Instruct":
         return ModelConfig(
             init_args=InitArgs(
-                max_seq_length=32768, gpu_memory_utilization=0.65, max_lora_rank=8
+                max_seq_length=32768, gpu_memory_utilization=0.55, max_lora_rank=8
             ),
             peft_args=PeftArgs(r=8, lora_alpha=16),
         )

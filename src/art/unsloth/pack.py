@@ -108,6 +108,17 @@ def packed_tensors_from_tokenized_results(
             advantages[-1] = advantages[-1][:seq_len]
             weights[-1] = weights[-1][:seq_len]
 
+    permutation = list(range(len(token_ids)))
+    random.shuffle(permutation)
+    token_ids = [token_ids[i] for i in permutation]
+    group_ids = [group_ids[i] for i in permutation]
+    parent_ids = [parent_ids[i] for i in permutation]
+    input_pos = [input_pos[i] for i in permutation]
+    assistant_mask = [assistant_mask[i] for i in permutation]
+    logprobs = [logprobs[i] for i in permutation]
+    advantages = [advantages[i] for i in permutation]
+    weights = [weights[i] for i in permutation]
+
     def pad(values: list[list], pad_value) -> list[list]:
         max_len = seq_len
         for value in values:

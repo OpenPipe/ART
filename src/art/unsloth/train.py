@@ -17,19 +17,20 @@ nest_asyncio.apply()
 
 
 async def train(
-    trainer: "GRPOTrainer", inputs_queue: asyncio.Queue["TuneInputs"]
+    trainer: "GRPOTrainer", results_queue: asyncio.Queue[dict[str, float]]
 ) -> None:
     _compute_loss = trainer.compute_loss
-    trainer.compute_loss = get_compute_loss_fn(trainer, inputs_queue)
+    _log = trainer.log
+    trainer.compute_loss = get_compute_loss_fn(trainer)
+    trainer.log = get_log_fn(trainer, results_queue)
     try:
         trainer.train()
     finally:
         trainer.compute_loss = _compute_loss
+        trainer.log = _log
 
 
-def get_compute_loss_fn(
-    trainer: "GRPOTrainer", inputs_queue: asyncio.Queue["TuneInputs"]
-) -> Callable[..., torch.Tensor]:
+def get_compute_loss_fn(trainer: "GRPOTrainer") -> Callable[..., torch.Tensor]:
     def compute_loss(
         model: "PeftModel",
         inputs: "TuneInputs",
@@ -126,6 +127,7 @@ def get_compute_loss_fn(
             else:
                 reference_logprobs = None
             del attn_bias
+            free_memory()
 
             # Calculate policy loss
             old_logprobs = inputs["logprobs"][:, 1:][assistant_mask]
@@ -159,14 +161,26 @@ def get_compute_loss_fn(
             for tensor in inputs.values():
                 tensor.to("cpu")  # type: ignore
             free_memory()
-            inputs_queue.task_done()
 
     return compute_loss
 
 
-def get_log_fn(trainer: "GRPOTrainer") -> Callable[..., None]:
+def get_log_fn(
+    trainer: "GRPOTrainer", results_queue: asyncio.Queue[dict[str, float]]
+) -> Callable[..., None]:
     def log(logs: dict[str, float], start_time: float | None = None) -> None:
-        pass
+        metrics = {
+            key: sum(val) / len(val) for key, val in trainer._metrics.items()
+        }  # average the metrics
+
+        # This method can be called both in training and evaluation. When called in evaluation, the keys in `logs`
+        # start with "eval_". We need to add the prefix "eval_" to the keys in `metrics` to match the format.
+        if next(iter(logs.keys())).startswith("eval_"):
+            metrics = {f"eval_{key}": val for key, val in metrics.items()}
+
+        logs = {**logs, **metrics}
+        results_queue.put_nowait(logs)
+        trainer._metrics.clear()
 
     return log
 
@@ -197,70 +211,77 @@ def calculate_log_probs(
         hidden_states = trainer.model(
             input_ids=input_ids, causal_mask=causal_mask
         ).logits
-        lm_head_t = lm_head_t.to(hidden_states.dtype)
+    lm_head_t = lm_head_t.to(hidden_states.dtype)
 
-        # Prepare tensors for masking (align dimensions)
-        hidden_states = hidden_states[:, :-1, :]  # Shape: [B, S-1, H]
-        next_tokens = input_ids[:, 1:]  # Shape: [B, S-1]
+    # Prepare tensors for masking (align dimensions)
+    hidden_states = hidden_states[:, :-1, :]  # Shape: [B, S-1, H]
+    next_tokens = input_ids[:, 1:]  # Shape: [B, S-1]
 
-        # Apply mask first - flattens batch and sequence dimensions
-        masked_hidden_states = hidden_states[assistant_mask]  # Shape: [N, H]
-        masked_next_tokens = next_tokens[assistant_mask]  # Shape: [N]
+    # Apply mask first - flattens batch and sequence dimensions
+    hidden_states = hidden_states[assistant_mask]  # Shape: [N, H]
+    next_tokens = next_tokens[assistant_mask]  # Shape: [N]
 
-        # N is the total number of assistant tokens across the batch
-        N = masked_hidden_states.shape[0]
-        if N == 0:
-            # Handle cases with no assistant tokens if necessary
-            return torch.tensor(
-                [], device=hidden_states.device, dtype=hidden_states.dtype
-            )  # Or appropriate dtype
+    # N is the total number of assistant tokens across the batch
+    N = hidden_states.shape[0]
+    if N == 0:
+        # Handle cases with no assistant tokens if necessary
+        return torch.tensor(
+            [], device=hidden_states.device, dtype=hidden_states.dtype
+        )  # Or appropriate dtype
 
-        log_probs_chunks = []
-        chunk_size = max_tokens  # Use max_tokens as the chunk size for the N dimension
+    log_probs_chunks = []
+    chunk_size = max_tokens  # Use max_tokens as the chunk size for the N dimension
 
-        # Chunk the flattened tensors along the N dimension (dim=0)
-        for i in range(0, N, chunk_size):
-            # Get chunks of the masked hidden states and corresponding next tokens
-            chunk_hs = masked_hidden_states[
-                i : i + chunk_size
-            ]  # Shape: [current_chunk_size, H]
-            chunk_nt = masked_next_tokens[
-                i : i + chunk_size
-            ]  # Shape: [current_chunk_size]
+    # Chunk the flattened tensors along the N dimension (dim=0)
+    for i in range(0, N, chunk_size):
+        # Get chunks of the masked hidden states and corresponding next tokens
+        chunk_hs = hidden_states[i : i + chunk_size]  # Shape: [current_chunk_size, H]
+        chunk_nt = next_tokens[i : i + chunk_size]  # Shape: [current_chunk_size]
 
-            if chunk_nt.numel() == 0:
-                continue  # Should not happen if N > 0, but safety check
+        if chunk_nt.numel() == 0:
+            continue  # Should not happen if N > 0, but safety check
 
-            # Calculate logits for this chunk
-            chunk_logits = torch.matmul(
-                chunk_hs, lm_head_t
-            )  # Shape: [current_chunk_size, V]
+        # Calculate logits for this chunk
+        chunk_logits = torch.matmul(
+            chunk_hs, lm_head_t
+        )  # Shape: [current_chunk_size, V]
 
-            # Select logits by token indices (gather operation)
-            selected_logits = torch.gather(
-                chunk_logits, dim=-1, index=chunk_nt.unsqueeze(-1)
-            ).squeeze(
-                -1
-            )  # Shape: [current_chunk_size]
+        # Select logits by token indices (gather operation)
+        selected_logits = torch.gather(
+            chunk_logits, dim=-1, index=chunk_nt.unsqueeze(-1)
+        ).squeeze(
+            -1
+        )  # Shape: [current_chunk_size]
 
-            # Calculate log_softmax manually: selected_logits - logsumexp
-            logsumexp_values = torch.logsumexp(
-                chunk_logits, dim=-1
-            )  # Shape: [current_chunk_size]
-            chunk_log_probs = (
-                selected_logits - logsumexp_values
-            )  # Shape: [current_chunk_size]
+        # Calculate log_softmax manually: selected_logits - logsumexp
+        logsumexp_values = torch.logsumexp(
+            chunk_logits, dim=-1
+        )  # Shape: [current_chunk_size]
+        chunk_log_probs = (
+            selected_logits - logsumexp_values
+        )  # Shape: [current_chunk_size]
 
-            log_probs_chunks.append(chunk_log_probs)
+        log_probs_chunks.append(chunk_log_probs)
 
-        # Concatenate all chunks along the N dimension
-        log_probs = (
-            torch.cat(log_probs_chunks, dim=0)
-            if log_probs_chunks
-            else torch.tensor([], device=masked_hidden_states.device)
-        )  # Shape: [N]
+        del (
+            chunk_hs,
+            chunk_nt,
+            chunk_logits,
+            selected_logits,
+            logsumexp_values,
+            chunk_log_probs,
+        )
 
-        return log_probs
+    # Concatenate all chunks along the N dimension
+    log_probs = (
+        torch.cat(log_probs_chunks, dim=0)
+        if log_probs_chunks
+        else torch.tensor([], device=hidden_states.device)
+    )  # Shape: [N]
+
+    del log_probs_chunks, hidden_states
+
+    return log_probs
 
 
 def free_memory() -> None:

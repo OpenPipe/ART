@@ -2,7 +2,7 @@ import asyncio
 from dataclasses import dataclass
 import functools
 import torch
-from typing import TYPE_CHECKING
+from typing import AsyncIterator, TYPE_CHECKING
 
 from .. import types
 from .checkpoints import get_iteration, get_last_iteration_dir
@@ -39,6 +39,10 @@ class ModelService:
 
         return ModelState(self.config)
 
+    @functools.cached_property
+    def results_queue(self) -> asyncio.Queue[dict[str, float]]:
+        return asyncio.Queue()
+
     async def start_openai_server(
         self, tool_use: bool, config: OpenAIServerConfig | None
     ) -> None:
@@ -67,14 +71,18 @@ class ModelService:
 
     async def tune(
         self, disk_packed_tensors: DiskPackedTensors, config: types.TuneConfig
-    ) -> None:
+    ) -> AsyncIterator[dict[str, float]]:
         packed_tensors = packed_tensors_from_dir(**disk_packed_tensors)
-        inputs_queue = self.state.inputs_queue
         # Wait for existing batches to finish
-        await inputs_queue.join()
+        await self.results_queue.join()
+        # If we haven't already started, start the training task
+        if self._train_task is None:
+            self._train_task = asyncio.create_task(
+                train(self.state.trainer, self.results_queue)
+            )
         # Currently limit batch size to 1
         for i in range(packed_tensors["tokens"].shape[0]):
-            inputs_queue.put_nowait(
+            self.state.inputs_queue.put_nowait(
                 TuneInputs(
                     **{
                         k: v[i : i + 1]
@@ -84,19 +92,16 @@ class ModelService:
                     config=config,
                 )
             )
-        # If we haven't already started, start the training task
-        if self._train_task is None:
-            self._train_task = asyncio.create_task(
-                train(self.state.trainer, inputs_queue)
+            # Wait for a result from the queue or the training task to, presumably, raise an exception
+            done, _ = await asyncio.wait(
+                [asyncio.create_task(self.results_queue.get()), self._train_task],
+                return_when=asyncio.FIRST_COMPLETED,
             )
-        # Wait for the training task to finish or the inputs queue to join
-        done, _ = await asyncio.wait(
-            [self._train_task, asyncio.create_task(inputs_queue.join())],
-            return_when=asyncio.FIRST_COMPLETED,
-        )
-        # Raise any exceptions from the tasks
-        for task in done:
-            task.result()
+            for task in done:
+                result = task.result()
+                assert result is not None, "The training task should never finish."
+                yield result
+                self.results_queue.task_done()
         # Save the new LoRA adapter
         iteration_dir = f"{self.output_dir}/{get_iteration(self.output_dir) + 1:04d}"
         self.state.trainer.save_model(iteration_dir)
