@@ -1,12 +1,13 @@
 import asyncio
 from dataclasses import dataclass
+import inspect
 import multiprocessing as mp
 import nest_asyncio
 import os
 import setproctitle
 import sys
 from tblib import pickling_support
-from typing import Any, cast, TypeVar
+from typing import Any, AsyncGenerator, cast, TypeVar
 import uuid
 
 from .traceback import streamline_tracebacks
@@ -100,7 +101,18 @@ class Proxy:
 
         # Check if it's a method or property
         attr = getattr(self._obj, name)
-        if asyncio.iscoroutinefunction(attr):
+        if inspect.isasyncgenfunction(attr):
+            # Return an async generator wrapper function
+            @streamline_tracebacks()
+            async def async_gen_wrapper(
+                *args: Any, **kwargs: Any
+            ) -> AsyncGenerator[Any, None]:
+                result: AsyncGeneratorProxy = await get_response(args, kwargs)
+                async for item in result:
+                    yield item
+
+            return async_gen_wrapper
+        elif asyncio.iscoroutinefunction(attr):
             # Return an async wrapper function
             @streamline_tracebacks()
             async def async_method_wrapper(*args: Any, **kwargs: Any) -> Any:
@@ -155,7 +167,11 @@ async def _handle_request(obj: object, request: Request, responses: mp.Queue) ->
         result_or_callable = getattr(obj, request.method_name)
         if callable(result_or_callable):
             result_or_coro = result_or_callable(*request.args, **request.kwargs)
-            if asyncio.iscoroutine(result_or_coro):
+            if inspect.isasyncgen(result_or_coro):
+                queue = mp.Queue()
+                asyncio.create_task(_handle_async_generator(result_or_coro, queue))
+                result = AsyncGeneratorProxy(queue)
+            elif asyncio.iscoroutine(result_or_coro):
                 result = await result_or_coro
             else:
                 result = result_or_coro
@@ -166,3 +182,27 @@ async def _handle_request(obj: object, request: Request, responses: mp.Queue) ->
         pickling_support.install(e)
         response = Response(request.id, None, e)
     responses.put_nowait(response)
+
+
+async def _handle_async_generator(
+    async_gen: AsyncGenerator[Any, None], queue: mp.Queue
+) -> None:
+    try:
+        async for item in async_gen:
+            queue.put_nowait(item)
+        queue.put_nowait(StopAsyncIteration())
+    except Exception as e:
+        pickling_support.install(e)
+        queue.put_nowait(e)
+
+
+class AsyncGeneratorProxy:
+    def __init__(self, queue: mp.Queue) -> None:
+        self._queue = queue
+
+    async def __aiter__(self) -> AsyncGenerator[Any, None]:
+        while True:
+            item = await asyncio.get_event_loop().run_in_executor(None, self._queue.get)
+            if item is StopAsyncIteration:
+                break
+            yield item
