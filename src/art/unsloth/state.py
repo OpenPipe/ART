@@ -26,6 +26,10 @@ class CausallLM(transformers.PreTrainedModel, transformers.GenerationMixin): ...
 
 class ModelState:
     def __init__(self, config: ModelConfig) -> None:
+        import os
+
+        os.environ["VLLM_USE_V1"] = "0"
+        os.environ["PYTORCH_CUDA_ALLOC_CONF"] = ""
         # Initialize Unsloth model
         self.model, self.tokenizer = cast(
             tuple[CausallLM, transformers.PreTrainedTokenizerBase],

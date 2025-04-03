@@ -19,8 +19,8 @@ if os.path.exists(vllm_log_path):
     open(vllm_log_path, "w").close()
 
 # Import unsloth before transformers
-if os.environ.get("IMPORT_UNSLOTH", "0") == "1":
-    import unsloth  # type: ignore
+# if os.environ.get("IMPORT_UNSLOTH", "0") == "1":
+#     import unsloth  # type: ignore
 
 from .api import API
 from .gather_trajectories import gather_trajectories
