@@ -34,14 +34,17 @@ class ModelState:
         # Sticking with V0 engine for now
         os.environ["VLLM_USE_V1"] = "0"
         # We can't use expandable segments with sleep mode
-        if config.get("init_args", {}).get("enable_sleep_mode", False):
+        enable_sleep_mode = config.get("init_args", {}).get("enable_sleep_mode", False)
+        if enable_sleep_mode:
             os.environ["PYTORCH_CUDA_ALLOC_CONF"] = ""
         # Initialize Unsloth model
         self.model, self.tokenizer = cast(
             tuple[CausallLM, transformers.PreTrainedTokenizerBase],
             unsloth.FastLanguageModel.from_pretrained(**config.get("init_args", {})),
         )
-        self.vllm = vLLMState(cast("vllm.AsyncLLMEngine", self.model.vllm_engine))
+        self.vllm = vLLMState(
+            cast("vllm.AsyncLLMEngine", self.model.vllm_engine), enable_sleep_mode
+        )
         # Initialize PEFT model
         self.peft_model = cast(
             peft.peft_model.PeftModelForCausalLM,
@@ -75,10 +78,13 @@ class ModelState:
 
 
 class vLLMState:
-    def __init__(self, async_engine: "vllm.AsyncLLMEngine") -> None:
+    def __init__(
+        self, async_engine: "vllm.AsyncLLMEngine", enable_sleep_mode: bool
+    ) -> None:
         from .vllm import create_engine_pause_and_resume_functions, patch_allocator
 
-        patch_allocator()
+        if enable_sleep_mode:
+            patch_allocator()
         self.async_engine = async_engine
         self.pause_engine, self.resume_engine = (
             create_engine_pause_and_resume_functions(self.async_engine)

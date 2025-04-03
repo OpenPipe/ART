@@ -113,27 +113,22 @@ def create_engine_pause_and_resume_functions(
     Callable[[], Coroutine[Any, Any, None]], Callable[[], Coroutine[Any, Any, None]]
 ]:
     _engine_step = engine.engine_step
-
-    should_pause = False
-    pause_event = asyncio.Event()
     resume_event = asyncio.Event()
+    resume_event.set()
+    engine_step_event = asyncio.Event()
 
     async def engine_step(virtual_engine: int) -> bool:
-        global should_pause
-        if should_pause:
-            pause_event.set()
-            should_pause = False
-            await resume_event.wait()
-            resume_event.clear()
+        engine_step_event.set()
+        await resume_event.wait()
         return await _engine_step(virtual_engine)
 
     engine.engine_step = engine_step
 
     async def pause_engine() -> None:
-        global should_pause
-        should_pause = True
-        await pause_event.wait()
-        pause_event.clear()
+        resume_event.clear()
+        if engine.engine.has_unfinished_requests():
+            engine_step_event.clear()
+            await engine_step_event.wait()
 
     async def resume_engine() -> None:
         resume_event.set()
@@ -173,10 +168,9 @@ def patch_allocator(offload_to: Literal["cpu", "disk", "none"] = "cpu") -> None:
         for ptr, data in allocator.pointer_to_data.items():
             if data.tag != "kv_cache":
                 continue
+            handle = data.handle
+            size_in_bytes = handle[1]
             if offload_to != "none":
-                handle = data.handle
-                size_in_bytes = handle[1]
-
                 if offload_to == "disk":
                     cpu_backup_tensor = torch.from_file(
                         f"/tmp/kv-cache-{ptr}.pt",
@@ -192,7 +186,6 @@ def patch_allocator(offload_to: Literal["cpu", "disk", "none"] = "cpu") -> None:
                         device="cpu",
                         pin_memory=is_pin_memory_available(),
                     )
-
                 cpu_ptr = cpu_backup_tensor.data_ptr()
                 libcudart.cudaMemcpy(
                     ctypes.c_void_p(cpu_ptr), ctypes.c_void_p(ptr), size_in_bytes
