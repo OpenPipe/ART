@@ -146,6 +146,7 @@ class InitArgs(TypedDict, total=False):
     disable_log_stats: bool
     enable_prefix_caching: bool
     num_scheduler_steps: int
+    enable_sleep_mode: bool
     use_async: bool
 
 
