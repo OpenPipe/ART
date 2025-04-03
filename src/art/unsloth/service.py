@@ -9,7 +9,7 @@ from .checkpoints import get_iteration, get_last_iteration_dir
 from ..config.model import ModelConfig
 from ..config.openai_server import get_openai_server_config, OpenAIServerConfig
 from .pack import DiskPackedTensors, packed_tensors_from_dir, PackedTensors
-from .train import train
+from .train import free_memory, train
 from .vllm import openai_server_task
 
 if TYPE_CHECKING:
@@ -80,6 +80,12 @@ class ModelService:
             self._train_task = asyncio.create_task(
                 train(self.state.trainer, self.results_queue)
             )
+        enable_sleep_mode = self.config.get("init_args", {}).get(
+            "enable_sleep_mode", False
+        )
+        if enable_sleep_mode:
+            await self.state.vllm.pause_engine()
+            await self.state.vllm.async_engine.sleep()
         # Currently limit batch size to 1
         for i in range(packed_tensors["tokens"].shape[0]):
             self.state.inputs_queue.put_nowait(
@@ -102,6 +108,10 @@ class ModelService:
                 assert result is not None, "The training task should never finish."
                 yield result
                 self.results_queue.task_done()
+        if enable_sleep_mode:
+            free_memory()
+            await self.state.vllm.async_engine.wake_up()
+            await self.state.vllm.resume_engine()
         # Save the new LoRA adapter
         iteration_dir = f"{self.output_dir}/{get_iteration(self.output_dir) + 1:04d}"
         self.state.trainer.save_model(iteration_dir)
@@ -113,7 +123,7 @@ class ModelService:
         lora_request: "LoRARequest" = self.state.peft_model.load_lora(
             lora_path,
             load_tensors=True,
-        )
+        )  # type: ignore
         lora_request.lora_int_id = 1
         lora_request.lora_name = self.model_name
         self.state.vllm.async_engine.engine.remove_lora(1)

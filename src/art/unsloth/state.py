@@ -2,6 +2,7 @@ import asyncio
 import unsloth
 from datasets import Dataset
 import nest_asyncio
+import os
 import peft
 import torch
 import transformers
@@ -26,10 +27,15 @@ class CausallLM(transformers.PreTrainedModel, transformers.GenerationMixin): ...
 
 class ModelState:
     def __init__(self, config: ModelConfig) -> None:
-        import os
+        from vllm.engine import async_llm_engine
 
+        # Set effectively unlimited timeout to support engine pausing & resumption
+        async_llm_engine.ENGINE_ITERATION_TIMEOUT_S = 2**31 - 1
+        # Sticking with V0 engine for now
         os.environ["VLLM_USE_V1"] = "0"
-        os.environ["PYTORCH_CUDA_ALLOC_CONF"] = ""
+        # We can't use expandable segments with sleep mode
+        if config.get("init_args", {}).get("enable_sleep_mode", False):
+            os.environ["PYTORCH_CUDA_ALLOC_CONF"] = ""
         # Initialize Unsloth model
         self.model, self.tokenizer = cast(
             tuple[CausallLM, transformers.PreTrainedTokenizerBase],
@@ -70,7 +76,13 @@ class ModelState:
 
 class vLLMState:
     def __init__(self, async_engine: "vllm.AsyncLLMEngine") -> None:
+        from .vllm import create_engine_pause_and_resume_functions, patch_allocator
+
+        patch_allocator()
         self.async_engine = async_engine
+        self.pause_engine, self.resume_engine = (
+            create_engine_pause_and_resume_functions(self.async_engine)
+        )
         self.driver_worker = cast(
             "WorkerWrapperBase",
             getattr(self.async_engine.engine.model_executor, "driver_worker"),

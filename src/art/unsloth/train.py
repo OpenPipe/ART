@@ -4,7 +4,7 @@ import gc
 import nest_asyncio
 import os
 import torch
-from typing import Callable, TYPE_CHECKING
+from typing import cast, Callable, TYPE_CHECKING
 
 from ..types import TuneConfig
 
@@ -101,7 +101,9 @@ def get_compute_loss_fn(trainer: "GRPOTrainer") -> Callable[..., torch.Tensor]:
             del mask
 
             # Calculate log probabilities
-            lm_head_t = trainer.model.get_output_embeddings().weight.t()
+            lm_head_t = cast(
+                torch.Tensor, trainer.model.get_output_embeddings().weight.t()  # type: ignore
+            )
             assistant_mask = inputs["assistant_mask"][:, 1:]
             max_tokens = 1024
             new_logprobs = calculate_log_probs(

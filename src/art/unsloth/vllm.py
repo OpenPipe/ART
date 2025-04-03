@@ -1,13 +1,16 @@
 from argparse import Namespace
 import asyncio
 from contextlib import asynccontextmanager
+import ctypes
 from functools import partial
 import logging
 import multiprocessing
 from openai import AsyncOpenAI
 import os
-from typing import AsyncIterator, Coroutine, Any
+import torch
+from typing import Any, AsyncIterator, Callable, Coroutine, Literal, TYPE_CHECKING
 from vllm.engine.arg_utils import AsyncEngineArgs
+from vllm.engine.async_llm_engine import AsyncLLMEngine
 from vllm.engine.multiprocessing.client import MQLLMEngineClient
 from vllm.engine.protocol import EngineClient
 from vllm.entrypoints.openai import api_server
@@ -15,7 +18,6 @@ from vllm.entrypoints.openai.cli_args import make_arg_parser, validate_parsed_se
 from vllm.entrypoints.openai.serving_models import LoRARequest  # type: ignore
 from vllm.logger import _DATE_FORMAT, _FORMAT
 from vllm.utils import get_open_zmq_ipc_path, FlexibleArgumentParser
-from typing import TYPE_CHECKING
 from uvicorn.config import LOGGING_CONFIG
 
 from .async_multiprocessing_engine import MQAsyncLLMEngine
@@ -103,6 +105,125 @@ def _openai_server_coroutine(
         namespace,
         log_config=get_uvicorn_logging_config(config.get("log_file", "vllm.log")),
     )
+
+
+def create_engine_pause_and_resume_functions(
+    engine: AsyncLLMEngine,
+) -> tuple[
+    Callable[[], Coroutine[Any, Any, None]], Callable[[], Coroutine[Any, Any, None]]
+]:
+    _engine_step = engine.engine_step
+
+    should_pause = False
+    pause_event = asyncio.Event()
+    resume_event = asyncio.Event()
+
+    async def engine_step(virtual_engine: int) -> bool:
+        global should_pause
+        if should_pause:
+            pause_event.set()
+            should_pause = False
+            await resume_event.wait()
+            resume_event.clear()
+        return await _engine_step(virtual_engine)
+
+    engine.engine_step = engine_step
+
+    async def pause_engine() -> None:
+        global should_pause
+        should_pause = True
+        await pause_event.wait()
+        pause_event.clear()
+
+    async def resume_engine() -> None:
+        resume_event.set()
+
+    return pause_engine, resume_engine
+
+
+def patch_allocator(offload_to: Literal["cpu", "disk", "none"] = "cpu") -> None:
+    from vllm.device_allocator.cumem import (
+        create_and_map,
+        CuMemAllocator,
+        libcudart,
+        unmap_and_release,
+    )
+    from vllm.utils import is_pin_memory_available
+
+    allocator = CuMemAllocator.get_instance()
+
+    def sleep(offload_tags: tuple[str, ...] | str | None = None) -> None:
+        """
+        Put the allocator in sleep mode.
+        All data in the memory allocation with the specified tag will be
+        offloaded to CPU memory, and others will be discarded.
+
+        :param offload_tags: The tags of the memory allocation that will be
+            offloaded. The rest of the memory allocation will be discarded.
+        """
+        if offload_tags is None:
+            # by default, allocated tensors are offloaded
+            # when the allocator sleeps
+            offload_tags = (CuMemAllocator.default_tag,)
+        elif isinstance(offload_tags, str):
+            offload_tags = (offload_tags,)
+
+        assert isinstance(offload_tags, tuple)
+
+        for ptr, data in allocator.pointer_to_data.items():
+            if data.tag != "kv_cache":
+                continue
+            if offload_to != "none":
+                handle = data.handle
+                size_in_bytes = handle[1]
+
+                if offload_to == "disk":
+                    cpu_backup_tensor = torch.from_file(
+                        f"/tmp/kv-cache-{ptr}.pt",
+                        size=size_in_bytes,
+                        dtype=torch.uint8,
+                        device="cpu",
+                        shared=True,
+                    )
+                else:
+                    cpu_backup_tensor = torch.empty(
+                        size_in_bytes,
+                        dtype=torch.uint8,
+                        device="cpu",
+                        pin_memory=is_pin_memory_available(),
+                    )
+
+                cpu_ptr = cpu_backup_tensor.data_ptr()
+                libcudart.cudaMemcpy(
+                    ctypes.c_void_p(cpu_ptr), ctypes.c_void_p(ptr), size_in_bytes
+                )
+                data.cpu_backup_tensor = cpu_backup_tensor
+            unmap_and_release(handle)
+
+    def wake_up() -> None:
+        """
+        Wake up the allocator from sleep mode.
+        All data that is previously offloaded will be loaded back to GPU
+        memory, and the rest of the data will have empty memory."""
+        for ptr, data in allocator.pointer_to_data.items():
+            if data.tag != "kv_cache":
+                continue
+            handle = data.handle
+            create_and_map(handle)
+            if data.cpu_backup_tensor is not None:
+                cpu_backup_tensor = data.cpu_backup_tensor
+                if cpu_backup_tensor is not None:
+                    size_in_bytes = (
+                        cpu_backup_tensor.numel() * cpu_backup_tensor.element_size()
+                    )
+                    cpu_ptr = cpu_backup_tensor.data_ptr()
+                    libcudart.cudaMemcpy(
+                        ctypes.c_void_p(ptr), ctypes.c_void_p(cpu_ptr), size_in_bytes
+                    )
+                    data.cpu_backup_tensor = None
+
+    allocator.sleep = sleep
+    allocator.wake_up = wake_up
 
 
 def patch_get_lora_tokenizer_async() -> None:

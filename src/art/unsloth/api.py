@@ -103,21 +103,24 @@ class UnslothAPI(API):
 
     async def _get_service(self, model: Model) -> ModelService:
         if model.name not in self._services:
+            config = get_model_config(
+                base_model=model.base_model,
+                output_dir=self._get_output_dir(model.name),
+                config=model._config,
+            )
             self._services[model.name] = ModelService(
                 host="localhost",
                 port=8089 + len(self._services),
                 model_name=model.name,
                 base_model=model.base_model,
-                config=get_model_config(
-                    base_model=model.base_model,
-                    output_dir=self._get_output_dir(model.name),
-                    config=model._config,
-                ),
+                config=config,
                 output_dir=self._get_output_dir(model.name),
             )
             if not self._in_process:
                 # Kill all "model-service" processes to free up GPU memory
                 subprocess.run(["pkill", "-9", "model-service"])
+                if config.get("init_args", {}).get("enable_sleep_mode", False):
+                    os.environ["IMPORT_PEFT"] = "1"
                 os.environ["IMPORT_UNSLOTH"] = "1"
                 self._services[model.name] = move_to_child_process(
                     self._services[model.name],
