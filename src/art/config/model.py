@@ -22,7 +22,10 @@ def get_model_config(
 
     if config is None:
         config = ModelConfig()
-    base_model_config = get_base_model_config(base_model=base_model)
+    base_model_config = get_base_model_config(
+        base_model=base_model,
+        enable_sleep_mode=config.get("init_args", {}).get("enable_sleep_mode", False),
+    )
     init_args = InitArgs(
         model_name=base_model,
         max_seq_length=32768,
@@ -85,18 +88,24 @@ def get_model_config(
     )
 
 
-def get_base_model_config(base_model: "types.BaseModel") -> "ModelConfig":
+def get_base_model_config(
+    base_model: "types.BaseModel", enable_sleep_mode: bool
+) -> "ModelConfig":
     if base_model == "Qwen/Qwen2.5-7B-Instruct":
         return ModelConfig(
             init_args=InitArgs(
-                max_seq_length=32768, gpu_memory_utilization=0.55, max_lora_rank=8
+                max_seq_length=32768,
+                gpu_memory_utilization=0.8 if enable_sleep_mode else 0.55,
+                max_lora_rank=8,
             ),
             peft_args=PeftArgs(r=8, lora_alpha=16),
         )
     elif base_model == "Qwen/Qwen2.5-14B-Instruct":
         return ModelConfig(
             init_args=InitArgs(
-                max_seq_length=8192, gpu_memory_utilization=0.55, max_lora_rank=8
+                max_seq_length=8192,
+                gpu_memory_utilization=0.8 if enable_sleep_mode else 0.55,
+                max_lora_rank=8,
             ),
             peft_args=PeftArgs(r=8, lora_alpha=16),
         )
