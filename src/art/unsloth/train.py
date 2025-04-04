@@ -53,15 +53,13 @@ def get_compute_loss_fn(trainer: "GRPOTrainer") -> Callable[..., torch.Tensor]:
             inputs = {key: tensor.to(trainer.accelerator.device) for key, tensor in inputs.items()}  # type: ignore
 
             # Unsloth code
-            if not hasattr(trainer, "_autocast_dtype"):
-                dtype = (
-                    torch.float16
-                    if os.environ.get("ACCELERATE_MIXED_PRECISION", "fp16") == "fp16"
-                    else torch.bfloat16
-                )
-                if os.environ.get("UNSLOTH_FORCE_FLOAT32", "0") == "1":
-                    dtype = torch.float16
-                setattr(trainer, "_autocast_dtype", dtype)
+            autocast_dtype = (
+                torch.float16
+                if os.environ.get("ACCELERATE_MIXED_PRECISION", "fp16") == "fp16"
+                else torch.bfloat16
+            )
+            if os.environ.get("UNSLOTH_FORCE_FLOAT32", "0") == "1":
+                autocast_dtype = torch.float16
 
             # Create grouped causal mask
             batch_size, seq_len = inputs["tokens"].size()
@@ -89,12 +87,12 @@ def get_compute_loss_fn(trainer: "GRPOTrainer") -> Callable[..., torch.Tensor]:
                 mask,
                 torch.tensor(
                     0.0,
-                    dtype=getattr(trainer, "_autocast_dtype"),
+                    dtype=autocast_dtype,
                     device=trainer.accelerator.device,
                 ),
                 torch.tensor(
                     float("-inf"),
-                    dtype=getattr(trainer, "_autocast_dtype"),
+                    dtype=autocast_dtype,
                     device=trainer.accelerator.device,
                 ),
             )
@@ -107,6 +105,7 @@ def get_compute_loss_fn(trainer: "GRPOTrainer") -> Callable[..., torch.Tensor]:
             assistant_mask = inputs["assistant_mask"][:, 1:]
             max_tokens = 1024
             new_logprobs = calculate_log_probs(
+                autocast_dtype,
                 trainer,
                 inputs["tokens"],
                 attn_bias,
@@ -115,9 +114,10 @@ def get_compute_loss_fn(trainer: "GRPOTrainer") -> Callable[..., torch.Tensor]:
                 max_tokens=max_tokens,
                 reference_logprobs=False,
             )
-            if config.kl_coef > 0.0:
+            if config.beta > 0.0 or config.kl_coef > 0.0:
                 free_memory()
                 reference_logprobs = calculate_log_probs(
+                    autocast_dtype,
                     trainer,
                     inputs["tokens"],
                     attn_bias,
@@ -157,9 +157,11 @@ def get_compute_loss_fn(trainer: "GRPOTrainer") -> Callable[..., torch.Tensor]:
             mean_kl_divergence = reverse_kl_divergence.mean()
             trainer._metrics["lr"].append(config.lr)
             trainer._metrics["policy_loss"].append(mean_policy_loss.item())
-            if config.kl_coef > 0.0:
+            if config.beta > 0.0 or config.kl_coef > 0.0:
                 trainer._metrics["kl_divergence"].append(mean_kl_divergence.item())
-            return mean_policy_loss + config.kl_coef * mean_kl_divergence
+            return (
+                mean_policy_loss + (config.beta or config.kl_coef) * mean_kl_divergence
+            )
         finally:
             for tensor in inputs.values():
                 tensor.to("cpu")  # type: ignore
@@ -190,6 +192,7 @@ def get_log_fn(
 
 
 def calculate_log_probs(
+    autocast_dtype: torch.dtype,
     trainer: "GRPOTrainer",
     input_ids: torch.Tensor,
     causal_mask: torch.Tensor,
@@ -200,9 +203,7 @@ def calculate_log_probs(
 ) -> torch.Tensor:
     os.environ["UNSLOTH_RETURN_HIDDEN_STATES"] = "1"
     with (
-        torch.amp.autocast_mode.autocast(
-            device_type="cuda", dtype=getattr(trainer, "_autocast_dtype")
-        ),
+        torch.amp.autocast_mode.autocast(device_type="cuda", dtype=autocast_dtype),
         torch.inference_mode() if reference_logprobs else nullcontext(),
         (
             trainer.accelerator.unwrap_model(

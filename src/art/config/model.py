@@ -80,7 +80,6 @@ def get_model_config(
     )
     train_args.update(base_model_config.get("train_args", {}))
     train_args.update(config.get("train_args", {}))
-    # TODO: Add base model conditional configuration
     return ModelConfig(
         init_args=init_args,
         peft_args=peft_args,
@@ -103,16 +102,14 @@ def get_base_model_config(
     elif base_model == "Qwen/Qwen2.5-14B-Instruct":
         return ModelConfig(
             init_args=InitArgs(
-                max_seq_length=8192,
+                max_seq_length=32768,
                 gpu_memory_utilization=0.8 if enable_sleep_mode else 0.55,
                 max_lora_rank=8,
             ),
             peft_args=PeftArgs(r=8, lora_alpha=16),
         )
     else:
-        raise RuntimeError(
-            f"{base_model} is not supported by the Unsloth backend at this time"
-        )
+        raise RuntimeError(f"{base_model} is not supported at this time")
 
 
 class ModelConfig(TypedDict, total=False):
