@@ -1,4 +1,5 @@
 import asyncio
+from contextlib import asynccontextmanager
 import unsloth
 from datasets import Dataset
 import nest_asyncio
@@ -7,8 +8,7 @@ import peft
 import torch
 import transformers
 from trl import GRPOConfig, GRPOTrainer
-from typing import cast
-from typing import TYPE_CHECKING
+from typing import AsyncGenerator, cast, TYPE_CHECKING
 
 from ..config.model import ModelConfig
 
@@ -38,10 +38,14 @@ class ModelState:
         if enable_sleep_mode:
             os.environ["PYTORCH_CUDA_ALLOC_CONF"] = ""
         # Initialize Unsloth model
+        _empty_cache = torch.cuda.empty_cache
+        torch.cuda.empty_cache = lambda: None
         self.model, self.tokenizer = cast(
             tuple[CausallLM, transformers.PreTrainedTokenizerBase],
             unsloth.FastLanguageModel.from_pretrained(**config.get("init_args", {})),
         )
+        torch.cuda.empty_cache = _empty_cache
+        torch.cuda.empty_cache()
         self.vllm = vLLMState(
             cast("vllm.AsyncLLMEngine", self.model.vllm_engine), enable_sleep_mode
         )
@@ -86,9 +90,11 @@ class vLLMState:
         if enable_sleep_mode:
             patch_allocator()
         self.async_engine = async_engine
-        self.pause_engine, self.resume_engine = (
-            create_engine_pause_and_resume_functions(self.async_engine)
-        )
+        if enable_sleep_mode:
+            self.pause_engine, self.resume_engine = (
+                create_engine_pause_and_resume_functions(self.async_engine)
+            )
+        self.enable_sleep_mode = enable_sleep_mode
         self.driver_worker = cast(
             "WorkerWrapperBase",
             getattr(self.async_engine.engine.model_executor, "driver_worker"),
@@ -96,3 +102,17 @@ class vLLMState:
         self.multi_step_model_runner: "MultiStepModelRunner" = (
             self.driver_worker.model_runner
         )
+
+    @asynccontextmanager
+    async def train_mode(self) -> AsyncGenerator[None, None]:
+        if not self.enable_sleep_mode:
+            yield
+            return
+        try:
+            await self.pause_engine()
+            try:
+                yield await self.async_engine.sleep()
+            finally:
+                await self.async_engine.wake_up()
+        finally:
+            await self.resume_engine()

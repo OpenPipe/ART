@@ -10,7 +10,7 @@ from ..config.model import ModelConfig
 from ..config.openai_server import get_openai_server_config, OpenAIServerConfig
 from .pack import DiskPackedTensors, packed_tensors_from_dir, PackedTensors
 from .train import free_memory, train
-from .vllm import openai_server_task
+from .vllm import openai_server_task, mp_openai_server_task
 
 if TYPE_CHECKING:
     from unsloth_zoo.vllm_lora_request import LoRARequest  # type: ignore
@@ -80,43 +80,38 @@ class ModelService:
             self._train_task = asyncio.create_task(
                 train(self.state.trainer, self.results_queue)
             )
-        enable_sleep_mode = self.config.get("init_args", {}).get(
-            "enable_sleep_mode", False
-        )
-        if enable_sleep_mode:
-            await self.state.vllm.pause_engine()
-            await self.state.vllm.async_engine.sleep()
-        # Currently limit batch size to 1
-        for i in range(packed_tensors["tokens"].shape[0]):
-            self.state.inputs_queue.put_nowait(
-                TuneInputs(
-                    **{
-                        k: v[i : i + 1]
-                        for k, v in packed_tensors.items()
-                        if isinstance(v, torch.Tensor)
-                    },
-                    config=config,
-                )
-            )
-            # Wait for a result from the queue or the training task to, presumably, raise an exception
-            done, _ = await asyncio.wait(
-                [asyncio.create_task(self.results_queue.get()), self._train_task],
-                return_when=asyncio.FIRST_COMPLETED,
-            )
-            for task in done:
-                result = task.result()
-                assert result is not None, "The training task should never finish."
-                yield result
-                self.results_queue.task_done()
-        if enable_sleep_mode:
+        async with self.state.vllm.train_mode():
             free_memory()
-            await self.state.vllm.async_engine.wake_up()
-            await self.state.vllm.resume_engine()
-        # Save the new LoRA adapter
-        iteration_dir = f"{self.output_dir}/{get_iteration(self.output_dir) + 1:04d}"
-        self.state.trainer.save_model(iteration_dir)
-        # Set the new LoRA adapter
-        self._set_lora(iteration_dir)
+            # Currently limit batch size to 1
+            for i in range(packed_tensors["tokens"].shape[0]):
+                self.state.inputs_queue.put_nowait(
+                    TuneInputs(
+                        **{
+                            k: v[i : i + 1]
+                            for k, v in packed_tensors.items()
+                            if isinstance(v, torch.Tensor)
+                        },
+                        config=config,
+                    )
+                )
+                # Wait for a result from the queue or the training task to, presumably, raise an exception
+                done, _ = await asyncio.wait(
+                    [asyncio.create_task(self.results_queue.get()), self._train_task],
+                    return_when=asyncio.FIRST_COMPLETED,
+                )
+                for task in done:
+                    result = task.result()
+                    assert result is not None, "The training task should never finish."
+                    yield result
+                    self.results_queue.task_done()
+            # Save the new LoRA adapter
+            iteration_dir = (
+                f"{self.output_dir}/{get_iteration(self.output_dir) + 1:04d}"
+            )
+            self.state.trainer.save_model(iteration_dir)
+            # Set the new LoRA adapter
+            self._set_lora(iteration_dir)
+        free_memory()
 
     def _set_lora(self, lora_path: str) -> None:
         """Sets the LoRA adapter with ID 1 for the VLLM engine."""
