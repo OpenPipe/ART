@@ -81,7 +81,6 @@ class ModelService:
                 train(self.state.trainer, self.results_queue)
             )
         async with self.state.vllm.train_mode():
-            free_memory()
             # Currently limit batch size to 1
             for i in range(packed_tensors["tokens"].shape[0]):
                 self.state.inputs_queue.put_nowait(
@@ -111,7 +110,6 @@ class ModelService:
             self.state.trainer.save_model(iteration_dir)
             # Set the new LoRA adapter
             self._set_lora(iteration_dir)
-        free_memory()
 
     def _set_lora(self, lora_path: str) -> None:
         """Sets the LoRA adapter with ID 1 for the VLLM engine."""

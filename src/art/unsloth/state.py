@@ -11,6 +11,7 @@ from trl import GRPOConfig, GRPOTrainer
 from typing import AsyncGenerator, cast, TYPE_CHECKING
 
 from ..config.model import ModelConfig
+from .train import free_memory
 
 if TYPE_CHECKING:
     import vllm
@@ -111,8 +112,10 @@ class vLLMState:
         try:
             await self.pause_engine()
             try:
-                yield await self.async_engine.sleep()
+                await self.async_engine.sleep()
+                yield free_memory()
             finally:
+                free_memory()
                 await self.async_engine.wake_up()
         finally:
             await self.resume_engine()
