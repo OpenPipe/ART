@@ -80,10 +80,13 @@ def get_model_config(
     )
     train_args.update(base_model_config.get("train_args", {}))
     train_args.update(config.get("train_args", {}))
+    seq_len_tune_args = base_model_config.get("seq_len_tune_args", {})
+    seq_len_tune_args.update(config.get("seq_len_tune_args", {}))
     return ModelConfig(
         init_args=init_args,
         peft_args=peft_args,
         train_args=train_args,
+        seq_len_tune_args=seq_len_tune_args,
     )
 
 
