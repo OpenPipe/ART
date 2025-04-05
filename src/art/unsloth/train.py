@@ -6,6 +6,7 @@ import os
 import torch
 from typing import cast, Callable, TYPE_CHECKING
 
+from ..config.model import ModelConfig
 from ..types import TuneConfig
 
 if TYPE_CHECKING:
@@ -17,11 +18,13 @@ nest_asyncio.apply()
 
 
 async def train(
-    trainer: "GRPOTrainer", results_queue: asyncio.Queue[dict[str, float]]
+    trainer: "GRPOTrainer",
+    model_config: ModelConfig,
+    results_queue: asyncio.Queue[dict[str, float]],
 ) -> None:
     _compute_loss = trainer.compute_loss
     _log = trainer.log
-    trainer.compute_loss = get_compute_loss_fn(trainer)
+    trainer.compute_loss = get_compute_loss_fn(trainer, model_config)
     trainer.log = get_log_fn(trainer, results_queue)
     try:
         trainer.train()
@@ -30,7 +33,9 @@ async def train(
         trainer.log = _log
 
 
-def get_compute_loss_fn(trainer: "GRPOTrainer") -> Callable[..., torch.Tensor]:
+def get_compute_loss_fn(
+    trainer: "GRPOTrainer", model_config: ModelConfig
+) -> Callable[..., torch.Tensor]:
     def compute_loss(
         model: "PeftModel",
         inputs: "TuneInputs",
@@ -103,27 +108,34 @@ def get_compute_loss_fn(trainer: "GRPOTrainer") -> Callable[..., torch.Tensor]:
                 torch.Tensor, trainer.model.get_output_embeddings().weight.t()  # type: ignore
             )
             assistant_mask = inputs["assistant_mask"][:, 1:]
-            max_tokens = 1024
-            new_logprobs = calculate_log_probs(
+            chunk_size = (
+                model_config.get("seq_len_tune_args", {})
+                .get(
+                    inputs["tokens"].size(1),  # type: ignore
+                    {},
+                )
+                .get("logprob_calculation_chunk_size", 1024)
+            )
+            new_logprobs = calculate_logprobs(
                 autocast_dtype,
                 trainer,
                 inputs["tokens"],
                 attn_bias,
                 lm_head_t,
                 assistant_mask,
-                max_tokens=max_tokens,
+                chunk_size=chunk_size,
                 reference_logprobs=False,
             )
             if config.beta > 0.0 or config.kl_coef > 0.0:
                 free_memory()
-                reference_logprobs = calculate_log_probs(
+                reference_logprobs = calculate_logprobs(
                     autocast_dtype,
                     trainer,
                     inputs["tokens"],
                     attn_bias,
                     lm_head_t,
                     assistant_mask,
-                    max_tokens=max_tokens,
+                    chunk_size=chunk_size,
                     reference_logprobs=True,
                 )
             else:
@@ -191,14 +203,14 @@ def get_log_fn(
     return log
 
 
-def calculate_log_probs(
+def calculate_logprobs(
     autocast_dtype: torch.dtype,
     trainer: "GRPOTrainer",
     input_ids: torch.Tensor,
     causal_mask: torch.Tensor,
     lm_head_t: torch.Tensor,
     assistant_mask: torch.Tensor,
-    max_tokens: int,
+    chunk_size: int,
     reference_logprobs: bool,
 ) -> torch.Tensor:
     os.environ["UNSLOTH_RETURN_HIDDEN_STATES"] = "1"
@@ -235,7 +247,6 @@ def calculate_log_probs(
         )  # Or appropriate dtype
 
     log_probs_chunks = []
-    chunk_size = max_tokens  # Use max_tokens as the chunk size for the N dimension
 
     # Chunk the flattened tensors along the N dimension (dim=0)
     for i in range(0, N, chunk_size):

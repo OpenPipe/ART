@@ -123,7 +123,7 @@ class UnslothAPI(API):
             if not self._in_process:
                 # Kill all "model-service" processes to free up GPU memory
                 subprocess.run(["pkill", "-9", "model-service"])
-                # To enable sleep mode import peft before unsloth
+                # To enable sleep mode, import peft before unsloth
                 # Unsloth will issue warnings, but everything appears to be okay
                 if config.get("init_args", {}).get("enable_sleep_mode", False):
                     os.environ["IMPORT_PEFT"] = "1"

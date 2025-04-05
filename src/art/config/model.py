@@ -1,4 +1,4 @@
-from typing import TYPE_CHECKING, TypedDict
+from typing import Literal, TYPE_CHECKING, TypedDict
 
 
 if TYPE_CHECKING:
@@ -98,6 +98,17 @@ def get_base_model_config(
                 max_lora_rank=8,
             ),
             peft_args=PeftArgs(r=8, lora_alpha=16),
+            seq_len_tune_args={
+                8192: SequenceLengthTuneArgs(
+                    batch_size=4, logprob_calculation_chunk_size=4096
+                ),
+                16384: SequenceLengthTuneArgs(
+                    batch_size=2, logprob_calculation_chunk_size=2048
+                ),
+                32768: SequenceLengthTuneArgs(
+                    batch_size=1, logprob_calculation_chunk_size=1024
+                ),
+            },
         )
     elif base_model == "Qwen/Qwen2.5-14B-Instruct":
         return ModelConfig(
@@ -107,6 +118,17 @@ def get_base_model_config(
                 max_lora_rank=8,
             ),
             peft_args=PeftArgs(r=8, lora_alpha=16),
+            seq_len_tune_args={
+                8192: SequenceLengthTuneArgs(
+                    batch_size=4, logprob_calculation_chunk_size=4096
+                ),
+                16384: SequenceLengthTuneArgs(
+                    batch_size=2, logprob_calculation_chunk_size=2048
+                ),
+                32768: SequenceLengthTuneArgs(
+                    batch_size=1, logprob_calculation_chunk_size=1024
+                ),
+            },
         )
     else:
         raise RuntimeError(f"{base_model} is not supported at this time")
@@ -120,11 +142,13 @@ class ModelConfig(TypedDict, total=False):
         init: Arguments for initializing an Unsloth FastLanguageModel.
         peft: Arguments for creating an Unsloth PEFT model wrapper.
         train: Arguments for the GRPO trainer.
+        seq_len_tune_args: Tune arguments for different sequence lengths.
     """
 
     init_args: "InitArgs"
     peft_args: "PeftArgs"
     train_args: "TrainArgs"
+    seq_len_tune_args: dict[Literal[8192, 16384, 32768], "SequenceLengthTuneArgs"]
 
 
 class InitArgs(TypedDict, total=False):
@@ -323,3 +347,8 @@ class TrainArgs(TypedDict, total=False):
     ref_model_mixup_alpha: float
     ref_model_sync_steps: int
     log_completions: bool
+
+
+class SequenceLengthTuneArgs(TypedDict):
+    batch_size: int
+    logprob_calculation_chunk_size: int
