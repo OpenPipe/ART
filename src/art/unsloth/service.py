@@ -2,7 +2,7 @@ import asyncio
 from dataclasses import dataclass
 import functools
 import torch
-from typing import AsyncIterator, TYPE_CHECKING
+from typing import AsyncIterator, TYPE_CHECKING, TypedDict
 
 from .. import types
 from .checkpoints import get_iteration, get_last_iteration_dir
@@ -18,8 +18,13 @@ if TYPE_CHECKING:
     from .state import ModelState
 
 
+class PrivateConfig(TypedDict, total=False):
+    compile_calculate_logprobs: bool
+
+
 class TuneInputs(PackedTensors):
     config: types.TuneConfig
+    _config: PrivateConfig
 
 
 @dataclass
@@ -100,6 +105,7 @@ class ModelService:
                             if isinstance(v, torch.Tensor)
                         },
                         config=config,
+                        _config={},
                     )
                 )
                 # Wait for a result from the queue or for the training task to,

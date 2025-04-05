@@ -13,7 +13,7 @@ from ..local.grpo import shift_tensor
 if TYPE_CHECKING:
     from peft.peft_model import PeftModel
     from trl import GRPOTrainer
-    from .service import TuneInputs
+    from .service import PrivateConfig, TuneInputs
 
 nest_asyncio.apply()
 
@@ -43,86 +43,107 @@ def get_compute_loss_fn(
         return_outputs: bool = False,
         num_items_in_batch: int | None = None,
     ) -> torch.Tensor:
-        try:
-            config: TuneConfig = inputs.pop("config")  # type: ignore
+        config: TuneConfig = inputs.pop("config")  # type: ignore
+        _config: PrivateConfig = inputs.pop("_config")  # type: ignore
 
-            if optimizer := trainer.optimizer:
-                optimizer = getattr(optimizer, "optimizer", optimizer)
-                if param_groups := getattr(optimizer, "param_groups"):
-                    for param_group in param_groups:
-                        param_group["lr"] = config.lr
-                        param_group["betas"] = config.betas
-                        if param_group.get("weight_decay"):
-                            param_group["weight_decay"] = config.weight_decay
+        if optimizer := trainer.optimizer:
+            optimizer = getattr(optimizer, "optimizer", optimizer)
+            if param_groups := getattr(optimizer, "param_groups"):
+                for param_group in param_groups:
+                    param_group["lr"] = config.lr
+                    param_group["betas"] = config.betas
+                    if param_group.get("weight_decay"):
+                        param_group["weight_decay"] = config.weight_decay
 
-            # Move tensors to the correct device
-            inputs = {key: tensor.to(trainer.accelerator.device) for key, tensor in inputs.items()}  # type: ignore
+        # Move tensors to the correct device
+        inputs = {key: tensor.to(trainer.accelerator.device) for key, tensor in inputs.items()}  # type: ignore
 
-            # Unsloth code
-            autocast_dtype = (
-                torch.float16
-                if os.environ.get("ACCELERATE_MIXED_PRECISION", "fp16") == "fp16"
-                else torch.bfloat16
-            )
-            if os.environ.get("UNSLOTH_FORCE_FLOAT32", "0") == "1":
-                autocast_dtype = torch.float16
+        # Unsloth code
+        autocast_dtype = (
+            torch.float16
+            if os.environ.get("ACCELERATE_MIXED_PRECISION", "fp16") == "fp16"
+            else torch.bfloat16
+        )
+        if os.environ.get("UNSLOTH_FORCE_FLOAT32", "0") == "1":
+            autocast_dtype = torch.float16
 
-            # Create grouped causal mask
-            batch_size, seq_len = inputs["tokens"].size()
-            causal_mask = (
-                torch.tril(
-                    torch.ones(
-                        seq_len,
-                        seq_len,
-                        dtype=torch.bool,
-                        device=trainer.accelerator.device,
-                    )
-                )
-                .unsqueeze(0)
-                .expand(batch_size, seq_len, seq_len)
-            )
-            group_mask = inputs["group_ids"].unsqueeze(2) == inputs[
-                "group_ids"
-            ].unsqueeze(1)
-            parent_mask = inputs["parent_ids"].unsqueeze(2) == inputs[
-                "group_ids"
-            ].unsqueeze(1)
-            mask = causal_mask & (group_mask | parent_mask)
-            # Use the same dtype as autocast to save memory and avoid dtype conversions
-            attn_bias = torch.where(
-                mask,
-                torch.tensor(
-                    0.0,
-                    dtype=autocast_dtype,
-                    device=trainer.accelerator.device,
-                ),
-                torch.tensor(
-                    float("-inf"),
-                    dtype=autocast_dtype,
-                    device=trainer.accelerator.device,
-                ),
-            )
-            del mask
+        # Create grouped causal mask
+        # batch_size, seq_len = inputs["tokens"].size()
+        # causal_mask = (
+        #     torch.tril(
+        #         torch.ones(
+        #             seq_len,
+        #             seq_len,
+        #             dtype=torch.bool,
+        #             device=trainer.accelerator.device,
+        #         )
+        #     )
+        #     .unsqueeze(0)
+        #     .expand(batch_size, seq_len, seq_len)
+        # )
+        # group_mask = inputs["group_ids"].unsqueeze(2) == inputs["group_ids"].unsqueeze(
+        #     1
+        # )
+        # parent_mask = inputs["parent_ids"].unsqueeze(2) == inputs[
+        #     "group_ids"
+        # ].unsqueeze(1)
+        # mask = causal_mask & (group_mask | parent_mask)
+        # # Use the same dtype as autocast to save memory and avoid dtype conversions
+        # attn_bias = torch.where(
+        #     mask,
+        #     torch.tensor(
+        #         0.0,
+        #         dtype=autocast_dtype,
+        #         device=trainer.accelerator.device,
+        #     ),
+        #     torch.tensor(
+        #         float("-inf"),
+        #         dtype=autocast_dtype,
+        #         device=trainer.accelerator.device,
+        #     ),
+        # )
+        # del mask
+        batch_size, seq_len = inputs["tokens"].size()
+        attn_bias = calculate_attn_bias(
+            batch_size,
+            seq_len,
+            trainer.accelerator.device,
+            inputs["group_ids"],
+            inputs["parent_ids"],
+            autocast_dtype,
+        )
 
-            # Calculate log probabilities
-            lm_head_t = cast(
-                torch.Tensor, trainer.model.get_output_embeddings().weight.t()  # type: ignore
+        # Calculate log probabilities
+        lm_head_t = cast(
+            torch.Tensor, trainer.model.get_output_embeddings().weight.t()  # type: ignore
+        )
+        next_input_ids = shift_tensor(inputs["tokens"], 0)
+        chunk_size = (
+            model_config.get("seq_len_tune_args", {})
+            .get(
+                inputs["tokens"].size(1),  # type: ignore
+                {},
             )
-            next_input_ids = shift_tensor(inputs["tokens"], 0)
-            chunk_size = (
-                model_config.get("seq_len_tune_args", {})
-                .get(
-                    inputs["tokens"].size(1),  # type: ignore
-                    {},
-                )
-                .get("logprob_calculation_chunk_size", 1024)
-            )
-            # Assert that sequence length is evenly divisible by the chunk size
-            assert (
-                seq_len % chunk_size == 0
-            ), f"Sequence length ({seq_len}) must be evenly divisible by chunk size ({chunk_size})"
-            os.environ["UNSLOTH_RETURN_HIDDEN_STATES"] = "1"
-            new_logprobs = calculate_logprobs(
+            .get("logprob_calculation_chunk_size", 1024)
+        )
+        # Assert that sequence length is evenly divisible by the chunk size
+        assert (
+            seq_len % chunk_size == 0
+        ), f"Sequence length ({seq_len}) must be evenly divisible by chunk size ({chunk_size})"
+        os.environ["UNSLOTH_RETURN_HIDDEN_STATES"] = "1"
+        new_logprobs = calculate_logprobs(
+            autocast_dtype,
+            trainer,
+            inputs["tokens"],
+            attn_bias,
+            next_input_ids,
+            lm_head_t,
+            chunk_size=chunk_size,
+            reference_logprobs=False,
+            compile=_config.get("compile_calculate_logprobs", False),
+        )
+        if config.beta > 0.0 or config.kl_coef > 0.0:
+            ref_logprobs = calculate_logprobs(
                 autocast_dtype,
                 trainer,
                 inputs["tokens"],
@@ -130,64 +151,49 @@ def get_compute_loss_fn(
                 next_input_ids,
                 lm_head_t,
                 chunk_size=chunk_size,
-                reference_logprobs=False,
+                reference_logprobs=True,
             )
-            if config.beta > 0.0 or config.kl_coef > 0.0:
-                ref_logprobs = calculate_logprobs(
-                    autocast_dtype,
-                    trainer,
-                    inputs["tokens"],
-                    attn_bias,
-                    next_input_ids,
-                    lm_head_t,
-                    chunk_size=chunk_size,
-                    reference_logprobs=True,
-                )
-            else:
-                ref_logprobs = None
-            del attn_bias
+        else:
+            ref_logprobs = None
+        del attn_bias
 
-            # Shift inputs for loss calculation
-            old_logprobs = shift_tensor(inputs["logprobs"], 0.0)
-            advantages = shift_tensor(inputs["advantages"], 0.0)
-            assistant_mask = shift_tensor(inputs["assistant_mask"], False).to(
-                new_logprobs.dtype
+        # Shift inputs for loss calculation
+        old_logprobs = shift_tensor(inputs["logprobs"], 0.0)
+        advantages = shift_tensor(inputs["advantages"], 0.0)
+        assistant_mask = shift_tensor(inputs["assistant_mask"], False).to(
+            new_logprobs.dtype
+        )
+        # Assume missing old logprobs were sampled under the current policy
+        old_logprobs = torch.where(
+            torch.isnan(old_logprobs),
+            new_logprobs,
+            old_logprobs,
+        )
+        prob_ratio = torch.exp(new_logprobs - old_logprobs)
+        policy_loss = -torch.min(
+            prob_ratio * advantages,
+            torch.clip(prob_ratio, 1 - config.clip_epsilon, 1 + config.clip_epsilon)
+            * advantages,
+        )
+        if ref_logprobs is not None:
+            kl_div = (
+                torch.exp(ref_logprobs - new_logprobs)
+                - (ref_logprobs - new_logprobs)
+                - 1.0
             )
-            # Assume missing old logprobs were sampled under the current policy
-            old_logprobs = torch.where(
-                torch.isnan(old_logprobs),
-                new_logprobs,
-                old_logprobs,
-            )
-            prob_ratio = torch.exp(new_logprobs - old_logprobs)
-            policy_loss = -torch.min(
-                prob_ratio * advantages,
-                torch.clip(prob_ratio, 1 - config.clip_epsilon, 1 + config.clip_epsilon)
-                * advantages,
-            )
-            if ref_logprobs is not None:
-                kl_div = (
-                    torch.exp(ref_logprobs - new_logprobs)
-                    - (ref_logprobs - new_logprobs)
-                    - 1.0
-                )
-            else:
-                kl_div = torch.zeros_like(policy_loss)
+        else:
+            kl_div = torch.zeros_like(policy_loss)
 
-            policy_loss = policy_loss * assistant_mask
-            kl_div = kl_div * assistant_mask
-            mean_policy_loss = policy_loss.sum() / assistant_mask.sum()
-            mean_kl = kl_div.sum() / assistant_mask.sum()
+        policy_loss = policy_loss * assistant_mask
+        kl_div = kl_div * assistant_mask
+        mean_policy_loss = policy_loss.sum() / assistant_mask.sum()
+        mean_kl = kl_div.sum() / assistant_mask.sum()
 
-            trainer._metrics["lr"].append(config.lr)
-            trainer._metrics["policy_loss"].append(mean_policy_loss.item())
-            if config.beta > 0.0 or config.kl_coef > 0.0:
-                trainer._metrics["kl_div"].append(mean_kl.item())
-            return mean_policy_loss + (config.beta or config.kl_coef) * mean_kl
-        finally:
-            for tensor in inputs.values():
-                tensor.to("cpu")  # type: ignore
-            free_memory()
+        trainer._metrics["lr"].append(config.lr)
+        trainer._metrics["policy_loss"].append(mean_policy_loss.item())
+        if config.beta > 0.0 or config.kl_coef > 0.0:
+            trainer._metrics["kl_div"].append(mean_kl.item())
+        return mean_policy_loss + (config.beta or config.kl_coef) * mean_kl
 
     return compute_loss
 
@@ -213,6 +219,58 @@ def get_log_fn(
     return log
 
 
+# @torch.compile(
+#     dynamic=True,
+#     fullgraph=True,
+#     options={
+#         "epilogue_fusion": True,
+#         "max_autotune": False,
+#         "shape_padding": True,
+#         "trace.enabled": False,
+#         "triton.cudagraphs": False,
+#     },
+# )
+def calculate_attn_bias(
+    batch_size: int,
+    seq_len: int,
+    device: torch.device,
+    group_ids: torch.Tensor,
+    parent_ids: torch.Tensor,
+    autocast_dtype: torch.dtype,
+) -> torch.Tensor:
+    causal_mask = (
+        torch.tril(
+            torch.ones(
+                seq_len,
+                seq_len,
+                dtype=torch.bool,
+                device=device,
+            )
+        )
+        .unsqueeze(0)
+        .expand(batch_size, seq_len, seq_len)
+    )
+    group_mask = group_ids.unsqueeze(2) == group_ids.unsqueeze(1)
+    parent_mask = parent_ids.unsqueeze(2) == group_ids.unsqueeze(1)
+    mask = causal_mask & (group_mask | parent_mask)
+    # Use the same dtype as autocast to save memory and avoid dtype conversions
+    attn_bias = torch.where(
+        mask,
+        torch.tensor(
+            0.0,
+            dtype=autocast_dtype,
+            device=device,
+        ),
+        torch.tensor(
+            float("-inf"),
+            dtype=autocast_dtype,
+            device=device,
+        ),
+    )
+    del mask
+    return attn_bias
+
+
 def calculate_logprobs(
     autocast_dtype: torch.dtype,
     trainer: "GRPOTrainer",
@@ -222,6 +280,7 @@ def calculate_logprobs(
     lm_head_t: torch.Tensor,
     chunk_size: int,
     reference_logprobs: bool,
+    compile: bool = False,
 ) -> torch.Tensor:  # Returns shape [B, S]
     with (
         torch.amp.autocast_mode.autocast(device_type="cuda", dtype=autocast_dtype),
@@ -237,15 +296,9 @@ def calculate_logprobs(
         hidden_states = trainer.model(
             input_ids=input_ids, causal_mask=causal_mask
         ).logits  # Shape [B, S, H]
-
     return _calculate_logprobs(lm_head_t, hidden_states, next_input_ids, chunk_size)
 
 
-# torch._dynamo.config.capture_dynamic_output_shape_ops = True  # type: ignore
-
-
-# Remove the compile decorator for now during refactoring
-# @torch.compile(...)
 def _calculate_logprobs(
     lm_head_t: torch.Tensor,
     hidden_states: torch.Tensor,  # Shape [B, S, H]
@@ -262,8 +315,8 @@ def _calculate_logprobs(
     # Ensure lm_head_t is in the same dtype as hidden_states
     lm_head_t = lm_head_t.to(hidden_states.dtype)
 
-    # Chunk over sequence length S
-    for i in torch.arange(0, seq_len, chunk_size, device=hidden_states.device):
+    # Chunk over sequence length S using Python range
+    for i in range(0, seq_len, chunk_size):
         chunk_hs = hidden_states[:, i : i + chunk_size, :]  # [B, chunk_size, H]
         chunk_input_ids = next_input_ids[:, i : i + chunk_size]  # [B, chunk_size]
         chunk_logits = torch.matmul(chunk_hs, lm_head_t)  # [B, chunk_size, V]
