@@ -3,6 +3,7 @@ from contextlib import nullcontext
 import gc
 import nest_asyncio
 import os
+import time
 import torch
 from typing import cast, Callable, TYPE_CHECKING
 
@@ -67,42 +68,7 @@ def get_compute_loss_fn(
         if os.environ.get("UNSLOTH_FORCE_FLOAT32", "0") == "1":
             autocast_dtype = torch.float16
 
-        # Create grouped causal mask
-        # batch_size, seq_len = inputs["tokens"].size()
-        # causal_mask = (
-        #     torch.tril(
-        #         torch.ones(
-        #             seq_len,
-        #             seq_len,
-        #             dtype=torch.bool,
-        #             device=trainer.accelerator.device,
-        #         )
-        #     )
-        #     .unsqueeze(0)
-        #     .expand(batch_size, seq_len, seq_len)
-        # )
-        # group_mask = inputs["group_ids"].unsqueeze(2) == inputs["group_ids"].unsqueeze(
-        #     1
-        # )
-        # parent_mask = inputs["parent_ids"].unsqueeze(2) == inputs[
-        #     "group_ids"
-        # ].unsqueeze(1)
-        # mask = causal_mask & (group_mask | parent_mask)
-        # # Use the same dtype as autocast to save memory and avoid dtype conversions
-        # attn_bias = torch.where(
-        #     mask,
-        #     torch.tensor(
-        #         0.0,
-        #         dtype=autocast_dtype,
-        #         device=trainer.accelerator.device,
-        #     ),
-        #     torch.tensor(
-        #         float("-inf"),
-        #         dtype=autocast_dtype,
-        #         device=trainer.accelerator.device,
-        #     ),
-        # )
-        # del mask
+        start = time.time()
         batch_size, seq_len = inputs["tokens"].size()
         attn_bias = calculate_attn_bias(
             batch_size,
@@ -112,8 +78,10 @@ def get_compute_loss_fn(
             inputs["parent_ids"],
             autocast_dtype,
         )
+        print(f"calculate_attn_bias: {time.time() - start}")
 
         # Calculate log probabilities
+        start = time.time()
         lm_head_t = cast(
             torch.Tensor, trainer.model.get_output_embeddings().weight.t()  # type: ignore
         )
@@ -156,8 +124,10 @@ def get_compute_loss_fn(
         else:
             ref_logprobs = None
         del attn_bias
+        print(f"calculate_logprobs: {time.time() - start}")
 
         # Shift inputs for loss calculation
+        start = time.time()
         old_logprobs = shift_tensor(inputs["logprobs"], 0.0)
         advantages = shift_tensor(inputs["advantages"], 0.0)
         assistant_mask = shift_tensor(inputs["assistant_mask"], False).to(
@@ -188,6 +158,7 @@ def get_compute_loss_fn(
         kl_div = kl_div * assistant_mask
         mean_policy_loss = policy_loss.sum() / assistant_mask.sum()
         mean_kl = kl_div.sum() / assistant_mask.sum()
+        print(f"calculate_loss: {time.time() - start}")
 
         trainer._metrics["lr"].append(config.lr)
         trainer._metrics["policy_loss"].append(mean_policy_loss.item())
@@ -271,6 +242,40 @@ def calculate_attn_bias(
     return attn_bias
 
 
+def simple_calculate_logprobs(
+    autocast_dtype: torch.dtype,
+    trainer: "GRPOTrainer",
+    input_ids: torch.Tensor,
+    causal_mask: torch.Tensor,
+    next_input_ids: torch.Tensor,
+    lm_head_t: torch.Tensor,
+    chunk_size: int,
+    reference_logprobs: bool,
+    compile: bool = False,
+) -> torch.Tensor:  # Returns shape [B, S]
+    with (
+        torch.amp.autocast_mode.autocast(device_type="cuda", dtype=autocast_dtype),
+        torch.inference_mode() if reference_logprobs else nullcontext(),
+        (
+            trainer.accelerator.unwrap_model(
+                trainer.model, keep_fp32_wrapper=False
+            ).disable_adapter()
+            if reference_logprobs
+            else nullcontext()
+        ),
+    ):
+        logits = trainer.model(
+            input_ids=input_ids, causal_mask=causal_mask
+        ).logits  # Shape [B, S, H]
+    selected_logits = torch.gather(
+        logits, dim=-1, index=next_input_ids.unsqueeze(-1)
+    ).squeeze(
+        -1
+    )  # Shape [B, S]
+    logsumexp = torch.logsumexp(logits, dim=-1)  # Shape [B, S]
+    return selected_logits - logsumexp
+
+
 def calculate_logprobs(
     autocast_dtype: torch.dtype,
     trainer: "GRPOTrainer",
@@ -300,7 +305,7 @@ def calculate_logprobs(
 
 
 def _calculate_logprobs(
-    lm_head_t: torch.Tensor,
+    lm_head_t: torch.Tensor,  # Shape [H, V]
     hidden_states: torch.Tensor,  # Shape [B, S, H]
     next_input_ids: torch.Tensor,  # Shape [B, S]
     chunk_size: int,
