@@ -1,3 +1,4 @@
+import torch
 from typing import Literal, TYPE_CHECKING, TypedDict
 
 
@@ -37,7 +38,9 @@ def get_model_config(
         enable_prefix_caching=True,
         gpu_memory_utilization=0.6,  # Reduce if out of memory
         max_lora_rank=8,
-        num_scheduler_steps=16,
+        # Multi-step processing is not supported for the Xformers attention backend
+        # which is the fallback for devices with compute capability < 8.0
+        num_scheduler_steps=16 if torch.cuda.get_device_capability()[0] >= 8 else 1,
         use_async=True,
     )
     init_args.update(base_model_config.get("init_args", {}))
@@ -153,6 +156,26 @@ def get_base_model_config(
                 ),
             },
         )
+    elif base_model == "Qwen/Qwen2.5-72B-Instruct":
+        return ModelConfig(
+            init_args=InitArgs(
+                max_seq_length=32768,
+                gpu_memory_utilization=0.8 if enable_sleep_mode else 0.55,
+                max_lora_rank=8,
+            ),
+            peft_args=PeftArgs(r=8, lora_alpha=16),
+            seq_len_tune_args={
+                8192: SequenceLengthTuneArgs(
+                    batch_size=4, logprob_calculation_chunk_size=4096
+                ),
+                16384: SequenceLengthTuneArgs(
+                    batch_size=2, logprob_calculation_chunk_size=2048
+                ),
+                32768: SequenceLengthTuneArgs(
+                    batch_size=1, logprob_calculation_chunk_size=1024
+                ),
+            },
+        )
     else:
         raise RuntimeError(f"{base_model} is not supported at this time")
 
@@ -198,6 +221,7 @@ class InitArgs(TypedDict, total=False):
     disable_log_requests: bool
     disable_log_stats: bool
     enable_prefix_caching: bool
+    enforce_eager: bool
     num_scheduler_steps: int
     enable_sleep_mode: bool
     use_async: bool
