@@ -6,7 +6,6 @@ from openai.types.chat.chat_completion_message_tool_call_param import (
 from openai.types.chat.chat_completion_tool_param import ChatCompletionToolParam
 import pydantic
 from typing import Iterable, Literal
-import warnings
 
 BaseModel = Literal[
     "Qwen/Qwen2.5-7B-Instruct",
@@ -20,6 +19,7 @@ BaseModel = Literal[
     "Qwen/Qwen2.5-32B-Instruct",
     "deepseek-ai/DeepSeek-R1-Distill-Qwen-32B",
     "unsloth/Llama-3.3-70B-Instruct",
+    "Qwen/Qwen2.5-72B-Instruct",
 ]
 
 Message = ChatCompletionMessageParam
@@ -57,8 +57,8 @@ class TuneConfig(pydantic.BaseModel):
     weight_decay: float = 0.1
 
     # Tensor packing params
-    sequence_length: int = pydantic.Field(
-        default=16_384,
+    sequence_length: int | None = pydantic.Field(
+        default=None,
         deprecated="Sequence length is now automatically determined from trajectory data.",
     )
 

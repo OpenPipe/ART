@@ -3,18 +3,16 @@ from contextlib import nullcontext
 import gc
 import nest_asyncio
 import os
-import time
 import torch
 from typing import cast, Callable, TYPE_CHECKING
 
 from ..config.model import ModelConfig
 from ..types import TuneConfig
-from ..local.grpo import shift_tensor
 
 if TYPE_CHECKING:
     from peft.peft_model import PeftModel
     from trl import GRPOTrainer
-    from .service import PrivateConfig, TuneInputs
+    from .service import TuneInputs
 
 nest_asyncio.apply()
 
@@ -45,7 +43,6 @@ def get_compute_loss_fn(
         num_items_in_batch: int | None = None,
     ) -> torch.Tensor:
         config: TuneConfig = inputs.pop("config")  # type: ignore
-        _config: PrivateConfig = inputs.pop("_config")  # type: ignore
 
         if optimizer := trainer.optimizer:
             optimizer = getattr(optimizer, "optimizer", optimizer)
@@ -83,14 +80,7 @@ def get_compute_loss_fn(
             torch.Tensor, trainer.model.get_output_embeddings().weight.t()  # type: ignore
         )
         next_input_ids = shift_tensor(inputs["tokens"], 0)
-        chunk_size = (
-            model_config.get("seq_len_tune_args", {})
-            .get(
-                inputs["tokens"].size(1),  # type: ignore
-                {},
-            )
-            .get("logprob_calculation_chunk_size", 1024)
-        )
+        chunk_size = 1024
         # Assert that sequence length is evenly divisible by the chunk size
         assert (
             seq_len % chunk_size == 0
@@ -105,7 +95,6 @@ def get_compute_loss_fn(
             lm_head_t,
             chunk_size=chunk_size,
             reference_logprobs=False,
-            compile=_config.get("compile_calculate_logprobs", False),
         )
         if config.beta > 0.0 or config.kl_coef > 0.0:
             ref_logprobs = calculate_logprobs(
@@ -184,17 +173,6 @@ def get_log_fn(
     return log
 
 
-# @torch.compile(
-#     dynamic=True,
-#     fullgraph=True,
-#     options={
-#         "epilogue_fusion": True,
-#         "max_autotune": False,
-#         "shape_padding": True,
-#         "trace.enabled": False,
-#         "triton.cudagraphs": False,
-#     },
-# )
 def calculate_attn_bias(
     batch_size: int,
     seq_len: int,
@@ -245,7 +223,6 @@ def simple_calculate_logprobs(
     lm_head_t: torch.Tensor,
     chunk_size: int,
     reference_logprobs: bool,
-    compile: bool = False,
 ) -> torch.Tensor:  # Returns shape [B, S]
     with (
         torch.amp.autocast_mode.autocast(device_type="cuda", dtype=autocast_dtype),
@@ -279,7 +256,6 @@ def calculate_logprobs(
     lm_head_t: torch.Tensor,
     chunk_size: int,
     reference_logprobs: bool,
-    compile: bool = False,
 ) -> torch.Tensor:  # Returns shape [B, S]
     with (
         torch.amp.autocast_mode.autocast(device_type="cuda", dtype=autocast_dtype),
@@ -335,6 +311,10 @@ def _calculate_logprobs(
         )
     del hidden_states
     return log_probs
+
+
+def shift_tensor(tensor: torch.Tensor, pad: int | float | bool) -> torch.Tensor:
+    return torch.nn.functional.pad(tensor[..., 1:, ...], (0, 0, 0, 1), value=pad)
 
 
 def free_memory() -> None:

@@ -24,10 +24,6 @@ def get_model_config(
     if config is None:
         config = ModelConfig()
     enable_sleep_mode = config.get("init_args", {}).get("enable_sleep_mode", True)
-    base_model_config = get_base_model_config(
-        base_model=base_model,
-        enable_sleep_mode=enable_sleep_mode,
-    )
     init_args = InitArgs(
         model_name=base_model,
         max_seq_length=32768,
@@ -37,7 +33,9 @@ def get_model_config(
         disable_log_requests=True,
         disable_log_stats=False,
         enable_prefix_caching=True,
-        gpu_memory_utilization=0.6,  # Reduce if out of memory
+        gpu_memory_utilization=(
+            0.79 if enable_sleep_mode else 0.55
+        ),  # Reduce if out of memory
         max_lora_rank=8,
         # Multi-step processing is not supported for the Xformers attention backend
         # which is the fallback for devices with compute capability < 8.0
@@ -45,7 +43,6 @@ def get_model_config(
         enable_sleep_mode=enable_sleep_mode,
         use_async=True,
     )
-    init_args.update(base_model_config.get("init_args", {}))
     init_args.update(config.get("init_args", {}))
     if lora_path := get_last_iteration_dir(output_dir):
         init_args["model_name"] = lora_path
@@ -65,7 +62,6 @@ def get_model_config(
         use_gradient_checkpointing="unsloth",  # type: ignore
         random_state=3407,
     )
-    peft_args.update(base_model_config.get("peft_args", {}))
     peft_args.update(config.get("peft_args", {}))
     train_args = TrainArgs(
         learning_rate=5e-6,
@@ -83,103 +79,8 @@ def get_model_config(
         disable_tqdm=True,
         report_to="none",
     )
-    train_args.update(base_model_config.get("train_args", {}))
     train_args.update(config.get("train_args", {}))
-    seq_len_tune_args = base_model_config.get("seq_len_tune_args", {})
-    seq_len_tune_args.update(config.get("seq_len_tune_args", {}))
-    return ModelConfig(
-        init_args=init_args,
-        peft_args=peft_args,
-        train_args=train_args,
-        seq_len_tune_args=seq_len_tune_args,
-    )
-
-
-def get_base_model_config(
-    base_model: "types.BaseModel", enable_sleep_mode: bool
-) -> "ModelConfig":
-    if base_model == "Qwen/Qwen2.5-7B-Instruct":
-        return ModelConfig(
-            init_args=InitArgs(
-                max_seq_length=32768,
-                gpu_memory_utilization=0.8 if enable_sleep_mode else 0.55,
-                max_lora_rank=8,
-            ),
-            peft_args=PeftArgs(r=8, lora_alpha=16),
-            seq_len_tune_args={
-                8192: SequenceLengthTuneArgs(
-                    batch_size=4, logprob_calculation_chunk_size=4096
-                ),
-                16384: SequenceLengthTuneArgs(
-                    batch_size=2, logprob_calculation_chunk_size=2048
-                ),
-                32768: SequenceLengthTuneArgs(
-                    batch_size=1, logprob_calculation_chunk_size=1024
-                ),
-            },
-        )
-    elif base_model == "Qwen/Qwen2.5-14B-Instruct":
-        return ModelConfig(
-            init_args=InitArgs(
-                max_seq_length=32768,
-                gpu_memory_utilization=0.8 if enable_sleep_mode else 0.55,
-                max_lora_rank=8,
-            ),
-            peft_args=PeftArgs(r=8, lora_alpha=16),
-            seq_len_tune_args={
-                8192: SequenceLengthTuneArgs(
-                    batch_size=4, logprob_calculation_chunk_size=4096
-                ),
-                16384: SequenceLengthTuneArgs(
-                    batch_size=2, logprob_calculation_chunk_size=2048
-                ),
-                32768: SequenceLengthTuneArgs(
-                    batch_size=1, logprob_calculation_chunk_size=1024
-                ),
-            },
-        )
-    elif base_model == "Qwen/Qwen2.5-32B-Instruct":
-        return ModelConfig(
-            init_args=InitArgs(
-                max_seq_length=32768,
-                gpu_memory_utilization=0.8 if enable_sleep_mode else 0.55,
-                max_lora_rank=8,
-            ),
-            peft_args=PeftArgs(r=8, lora_alpha=16),
-            seq_len_tune_args={
-                8192: SequenceLengthTuneArgs(
-                    batch_size=4, logprob_calculation_chunk_size=4096
-                ),
-                16384: SequenceLengthTuneArgs(
-                    batch_size=2, logprob_calculation_chunk_size=2048
-                ),
-                32768: SequenceLengthTuneArgs(
-                    batch_size=1, logprob_calculation_chunk_size=1024
-                ),
-            },
-        )
-    elif base_model == "Qwen/Qwen2.5-72B-Instruct":
-        return ModelConfig(
-            init_args=InitArgs(
-                max_seq_length=32768,
-                gpu_memory_utilization=0.8 if enable_sleep_mode else 0.55,
-                max_lora_rank=8,
-            ),
-            peft_args=PeftArgs(r=8, lora_alpha=16),
-            seq_len_tune_args={
-                8192: SequenceLengthTuneArgs(
-                    batch_size=4, logprob_calculation_chunk_size=4096
-                ),
-                16384: SequenceLengthTuneArgs(
-                    batch_size=2, logprob_calculation_chunk_size=2048
-                ),
-                32768: SequenceLengthTuneArgs(
-                    batch_size=1, logprob_calculation_chunk_size=1024
-                ),
-            },
-        )
-    else:
-        raise RuntimeError(f"{base_model} is not supported at this time")
+    return ModelConfig(init_args=init_args, peft_args=peft_args, train_args=train_args)
 
 
 class ModelConfig(TypedDict, total=False):
@@ -190,13 +91,11 @@ class ModelConfig(TypedDict, total=False):
         init: Arguments for initializing an Unsloth FastLanguageModel.
         peft: Arguments for creating an Unsloth PEFT model wrapper.
         train: Arguments for the GRPO trainer.
-        seq_len_tune_args: Tune arguments for different sequence lengths.
     """
 
     init_args: "InitArgs"
     peft_args: "PeftArgs"
     train_args: "TrainArgs"
-    seq_len_tune_args: dict[Literal[8192, 16384, 32768], "SequenceLengthTuneArgs"]
 
 
 class InitArgs(TypedDict, total=False):
@@ -396,8 +295,3 @@ class TrainArgs(TypedDict, total=False):
     ref_model_mixup_alpha: float
     ref_model_sync_steps: int
     log_completions: bool
-
-
-class SequenceLengthTuneArgs(TypedDict):
-    batch_size: int
-    logprob_calculation_chunk_size: int

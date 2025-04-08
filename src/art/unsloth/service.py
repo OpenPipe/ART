@@ -2,15 +2,15 @@ import asyncio
 from dataclasses import dataclass
 import functools
 import torch
-from typing import AsyncIterator, TYPE_CHECKING, TypedDict
+from typing import AsyncIterator, TYPE_CHECKING
 
 from .. import types
 from .checkpoints import get_iteration, get_last_iteration_dir
 from ..config.model import ModelConfig
 from ..config.openai_server import get_openai_server_config, OpenAIServerConfig
 from .pack import DiskPackedTensors, packed_tensors_from_dir, PackedTensors
-from .train import free_memory, train
-from .vllm import openai_server_task, mp_openai_server_task
+from .train import train
+from .vllm import openai_server_task
 
 if TYPE_CHECKING:
     from unsloth_zoo.vllm_lora_request import LoRARequest  # type: ignore
@@ -18,13 +18,8 @@ if TYPE_CHECKING:
     from .state import ModelState
 
 
-class PrivateConfig(TypedDict, total=False):
-    compile_calculate_logprobs: bool
-
-
 class TuneInputs(PackedTensors):
     config: types.TuneConfig
-    _config: PrivateConfig
 
 
 @dataclass
@@ -115,7 +110,6 @@ class ModelService:
                                 if warmup
                                 else config
                             ),
-                            _config={},
                         )
                     )
                     # Wait for a result from the queue or for the training task to,
