@@ -136,7 +136,7 @@ def create_engine_pause_and_resume_functions(
     return pause_engine, resume_engine
 
 
-def patch_allocator(offload_to: Literal["cpu", "disk", "none"] = "cpu") -> None:
+def patch_allocator() -> None:
     from vllm.device_allocator.cumem import (
         create_and_map,
         CuMemAllocator,
@@ -148,22 +148,18 @@ def patch_allocator(offload_to: Literal["cpu", "disk", "none"] = "cpu") -> None:
     allocator = CuMemAllocator.get_instance()
 
     def sleep(offload_tags: tuple[str, ...] | str | None = None) -> None:
-        """
-        Put the allocator in sleep mode.
-        All data in the memory allocation with the specified tag will be
-        offloaded to CPU memory, and others will be discarded.
-
-        :param offload_tags: The tags of the memory allocation that will be
-            offloaded. The rest of the memory allocation will be discarded.
-        """
-        if offload_tags is None:
-            # by default, allocated tensors are offloaded
-            # when the allocator sleeps
-            offload_tags = (CuMemAllocator.default_tag,)
-        elif isinstance(offload_tags, str):
-            offload_tags = (offload_tags,)
-
-        assert isinstance(offload_tags, tuple)
+        # In this version of vLLM (0.7.3) one tag is provided for sleep level 1
+        # and no tags are provided for sleep level 2, so we can reverse-engineer
+        # the sleep level from the tags
+        sleep_level = 1 if offload_tags else 2
+        # We reinterpret the sleep levels as follows:
+        # Sleep level 1: offload kv cache to CPU memory (or disk)
+        if sleep_level == 1:
+            offload_to = "cpu"
+            # TODO: Check if there is sufficient CPU memory, otherwise offload to disk
+        # Sleep level 2: discard kv cache
+        else:
+            offload_to = "none"
 
         for ptr, data in allocator.pointer_to_data.items():
             if data.tag != "kv_cache":
@@ -201,8 +197,7 @@ def patch_allocator(offload_to: Literal["cpu", "disk", "none"] = "cpu") -> None:
         for ptr, data in allocator.pointer_to_data.items():
             if data.tag != "kv_cache":
                 continue
-            handle = data.handle
-            create_and_map(handle)
+            create_and_map(data.handle)
             if data.cpu_backup_tensor is not None:
                 cpu_backup_tensor = data.cpu_backup_tensor
                 if cpu_backup_tensor is not None:

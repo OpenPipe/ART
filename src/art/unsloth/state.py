@@ -112,8 +112,15 @@ class vLLMState:
         try:
             await self.pause_engine()
             try:
-                await self.async_engine.sleep()
-                yield free_memory()
+                if self.async_engine.engine.has_unfinished_requests():
+                    # Offload KV cache to CPU memory (or disk)
+                    await self.async_engine.sleep(level=1)
+                else:
+                    # Reset prefix cached and discard KV cache
+                    await self.async_engine.reset_prefix_cache()
+                    await self.async_engine.sleep(level=2)
+                free_memory()
+                yield
             finally:
                 free_memory()
                 await self.async_engine.wake_up()
