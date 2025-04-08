@@ -314,7 +314,7 @@ def _calculate_logprobs(
 
 
 def shift_tensor(tensor: torch.Tensor, pad: int | float | bool) -> torch.Tensor:
-    return torch.nn.functional.pad(tensor[:, 1:], (0, 0, 0, 1), value=pad)
+    return torch.nn.functional.pad(tensor[:, 1:], (0, 1), value=pad)
 
 
 def free_memory() -> None:
