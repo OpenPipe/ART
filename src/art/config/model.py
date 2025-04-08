@@ -23,9 +23,10 @@ def get_model_config(
 
     if config is None:
         config = ModelConfig()
+    enable_sleep_mode = config.get("init_args", {}).get("enable_sleep_mode", True)
     base_model_config = get_base_model_config(
         base_model=base_model,
-        enable_sleep_mode=config.get("init_args", {}).get("enable_sleep_mode", False),
+        enable_sleep_mode=enable_sleep_mode,
     )
     init_args = InitArgs(
         model_name=base_model,
@@ -41,6 +42,7 @@ def get_model_config(
         # Multi-step processing is not supported for the Xformers attention backend
         # which is the fallback for devices with compute capability < 8.0
         num_scheduler_steps=16 if torch.cuda.get_device_capability()[0] >= 8 else 1,
+        enable_sleep_mode=enable_sleep_mode,
         use_async=True,
     )
     init_args.update(base_model_config.get("init_args", {}))

@@ -90,36 +90,54 @@ class ModelService:
                     results_queue=self.results_queue,
                 )
             )
+            warmup = True
+        else:
+            warmup = False
+        # Enter training mode
         async with self.state.vllm.train_mode():
-            batch_size = (
-                self.config.get("seq_len_tune_args", {})
-                .get(disk_packed_tensors["sequence_length"], {})  # type: ignore
-                .get("batch_size", 1)
-            )
-            for offset in range(0, packed_tensors["tokens"].shape[0], batch_size):
-                self.state.inputs_queue.put_nowait(
-                    TuneInputs(
-                        **{
-                            k: v[offset : offset + batch_size]
-                            for k, v in packed_tensors.items()
-                            if isinstance(v, torch.Tensor)
-                        },
-                        config=config,
-                        _config={},
+            for offset in range(0, packed_tensors["tokens"].shape[0]):
+                for _ in range(2 if warmup else 1):
+                    self.state.inputs_queue.put_nowait(
+                        TuneInputs(
+                            **{
+                                k: (
+                                    v[offset : offset + 1, :1024]
+                                    if warmup and v.dim() > 1
+                                    else v[offset : offset + 1]
+                                )
+                                for k, v in packed_tensors.items()
+                                if isinstance(v, torch.Tensor)
+                            },
+                            config=(
+                                config.model_copy(
+                                    update={"lr": 1e-9, "beta": 0.0, "kl_coef": 0.0}
+                                )
+                                if warmup
+                                else config
+                            ),
+                            _config={},
+                        )
                     )
-                )
-                # Wait for a result from the queue or for the training task to,
-                # presumably, raise an exception
-                done, _ = await asyncio.wait(
-                    [asyncio.create_task(self.results_queue.get()), self._train_task],
-                    return_when=asyncio.FIRST_COMPLETED,
-                )
-                for task in done:
-                    result = task.result()
-                    # If `result` is `None`, the training task finished somehow.
-                    assert result is not None, "The training task should never finish."
-                    self.results_queue.task_done()
-                    yield result
+                    # Wait for a result from the queue or for the training task to,
+                    # presumably, raise an exception
+                    done, _ = await asyncio.wait(
+                        [
+                            asyncio.create_task(self.results_queue.get()),
+                            self._train_task,
+                        ],
+                        return_when=asyncio.FIRST_COMPLETED,
+                    )
+                    for task in done:
+                        result = task.result()
+                        # If `result` is `None`, the training task finished somehow.
+                        assert (
+                            result is not None
+                        ), "The training task should never finish."
+                        self.results_queue.task_done()
+                        if warmup:
+                            warmup = False
+                        else:
+                            yield result
             # Save the new LoRA adapter
             iteration_dir = (
                 f"{self.output_dir}/{get_iteration(self.output_dir) + 1:04d}"

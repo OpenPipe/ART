@@ -68,7 +68,6 @@ def get_compute_loss_fn(
         if os.environ.get("UNSLOTH_FORCE_FLOAT32", "0") == "1":
             autocast_dtype = torch.float16
 
-        start = time.time()
         batch_size, seq_len = inputs["tokens"].size()
         attn_bias = calculate_attn_bias(
             batch_size,
@@ -78,10 +77,8 @@ def get_compute_loss_fn(
             inputs["parent_ids"],
             autocast_dtype,
         )
-        print(f"calculate_attn_bias: {time.time() - start}")
 
         # Calculate log probabilities
-        start = time.time()
         lm_head_t = cast(
             torch.Tensor, trainer.model.get_output_embeddings().weight.t()  # type: ignore
         )
@@ -124,10 +121,8 @@ def get_compute_loss_fn(
         else:
             ref_logprobs = None
         del attn_bias
-        print(f"calculate_logprobs: {time.time() - start}")
 
         # Shift inputs for loss calculation
-        start = time.time()
         old_logprobs = shift_tensor(inputs["logprobs"], 0.0)
         advantages = shift_tensor(inputs["advantages"], 0.0)
         assistant_mask = shift_tensor(inputs["assistant_mask"], False).to(
@@ -156,9 +151,8 @@ def get_compute_loss_fn(
 
         policy_loss = policy_loss * assistant_mask
         kl_div = kl_div * assistant_mask
-        mean_policy_loss = policy_loss.sum() / assistant_mask.sum()
-        mean_kl = kl_div.sum() / assistant_mask.sum()
-        print(f"calculate_loss: {time.time() - start}")
+        mean_policy_loss = policy_loss.sum() / (assistant_mask.sum() + 1e-6)
+        mean_kl = kl_div.sum() / (assistant_mask.sum() + 1e-6)
 
         trainer._metrics["lr"].append(config.lr)
         trainer._metrics["policy_loss"].append(mean_policy_loss.item())
