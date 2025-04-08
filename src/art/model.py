@@ -135,16 +135,16 @@ class Model:
     async def log(
         self,
         trajectory_groups: Iterable[Iterable[Trajectory | BaseException]],
-        name: str = "val",
+        split: str = "val",
     ) -> None:
         """
         Log the model's performance for an evaluation batch of trajectory groups.
 
         Args:
             trajectory_groups: A batch of trajectory groups.
-            name: The evaluation's name. Defaults to "val".
+            split: The evaluation's split. Defaults to "val".
         """
-        await self.api._log(self, [list(group) for group in trajectory_groups], name)
+        await self.api._log(self, [list(group) for group in trajectory_groups], split)
 
     async def tune(
         self,

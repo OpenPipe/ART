@@ -174,14 +174,14 @@ class LocalAPI(API):
         self,
         model: Model,
         trajectory_groups: list[list[Trajectory | BaseException]],
-        name: str = "val",
+        split: str = "val",
     ) -> None:
         # Save logs for each trajectory
         for i, group in enumerate(trajectory_groups):
             for j, trajectory in enumerate(group):
                 if isinstance(trajectory, BaseException):
                     continue
-                directory = f"{self._get_output_dir(model.name)}/trajectories/{name}/{self.__get_iteration(model):04d}"
+                directory = f"{self._get_output_dir(model.name)}/trajectories/{split}/{self.__get_iteration(model):04d}"
                 os.makedirs(directory, exist_ok=True)
                 i_digits = len(str(len(trajectory_groups) - 1))
                 j_digits = len(str(len(group) - 1))
@@ -215,7 +215,7 @@ class LocalAPI(API):
             if len(values) > 0:
                 averages[metric] = sum(values) / len(values)
 
-        self._log_wandb_data(model, averages, name)
+        self._log_wandb_data(model, averages, split)
 
     def _trajectory_log(self, trajectory: Trajectory) -> str:
         """Format a trajectory into a readable log string."""
