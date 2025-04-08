@@ -18,7 +18,6 @@ def shift_tensor(
         )
 
     # Create a tensor of ignore labels every time if we are compiling, otherwise cache it
-    # if torch.compiler.is_compiling():
     if torch.compiler.is_compiling():
         ignore_labels = torch.full(
             (labels.shape[0], 1), ignore_label, dtype=labels.dtype, device=labels.device

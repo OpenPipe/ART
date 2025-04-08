@@ -39,13 +39,15 @@ class ModelState:
         if enable_sleep_mode:
             os.environ["PYTORCH_CUDA_ALLOC_CONF"] = ""
         # Initialize Unsloth model
-        _empty_cache = torch.cuda.empty_cache
+        # NOTE: We have to patch empty_cache with a no-op during model initialization
+        # to avoid an allocator error.
+        empty_cache = torch.cuda.empty_cache
         torch.cuda.empty_cache = lambda: None
         self.model, self.tokenizer = cast(
             tuple[CausallLM, transformers.PreTrainedTokenizerBase],
             unsloth.FastLanguageModel.from_pretrained(**config.get("init_args", {})),
         )
-        torch.cuda.empty_cache = _empty_cache
+        torch.cuda.empty_cache = empty_cache
         torch.cuda.empty_cache()
         self.vllm = vLLMState(
             cast("vllm.AsyncLLMEngine", self.model.vllm_engine), enable_sleep_mode
@@ -106,6 +108,9 @@ class vLLMState:
 
     @asynccontextmanager
     async def train_mode(self) -> AsyncGenerator[None, None]:
+        """
+        A context manager pauses the vLLM engine and frees memory for training.
+        """
         if not self.enable_sleep_mode:
             yield
             return

@@ -35,6 +35,17 @@ async def openai_server_task(
     state: "vLLMState",
     config: OpenAIServerConfig,
 ) -> asyncio.Task[None]:
+    """
+    Starts an asyncio task that runs an OpenAI-compatible server.
+
+    Args:
+        state: The state of the vLLM engine.
+        config: The configuration for the OpenAI-compatible server.
+
+    Returns:
+        A running asyncio task for the OpenAI-compatible server. Cancel the task
+        to stop the server.
+    """
     patch_get_lora_tokenizer_async()
     patch_listen_for_disconnect()
     patch_multi_step_model_runner(state)
@@ -112,6 +123,10 @@ def create_engine_pause_and_resume_functions(
 ) -> tuple[
     Callable[[], Coroutine[Any, Any, None]], Callable[[], Coroutine[Any, Any, None]]
 ]:
+    """
+    Patches the vLLM engine and returns a pair of functions for pausing and resuming
+    request processing respectively.
+    """
     _engine_step = engine.engine_step
     resume_event = asyncio.Event()
     resume_event.set()
@@ -137,6 +152,10 @@ def create_engine_pause_and_resume_functions(
 
 
 def patch_allocator() -> None:
+    """
+    Patch the vLLM CuMemAllocator to specifically focus on offloading/discarding
+    the KV cache.
+    """
     from vllm.device_allocator.cumem import (
         create_and_map,
         CuMemAllocator,
@@ -193,7 +212,8 @@ def patch_allocator() -> None:
         """
         Wake up the allocator from sleep mode.
         All data that is previously offloaded will be loaded back to GPU
-        memory, and the rest of the data will have empty memory."""
+        memory, and the rest of the data will have empty memory.
+        """
         for ptr, data in allocator.pointer_to_data.items():
             if data.tag != "kv_cache":
                 continue

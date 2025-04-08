@@ -78,7 +78,7 @@ def get_compute_loss_fn(
         # Calculate log probabilities
         lm_head_t = cast(
             torch.Tensor, trainer.model.get_output_embeddings().weight.t()  # type: ignore
-        )
+        )  # Shape [H, V]
         next_input_ids = shift_tensor(inputs["tokens"], 0)
         chunk_size = 1024
         # Assert that sequence length is evenly divisible by the chunk size
@@ -314,7 +314,7 @@ def _calculate_logprobs(
 
 
 def shift_tensor(tensor: torch.Tensor, pad: int | float | bool) -> torch.Tensor:
-    return torch.nn.functional.pad(tensor[..., 1:, ...], (0, 0, 0, 1), value=pad)
+    return torch.nn.functional.pad(tensor[:, 1:], (0, 0, 0, 1), value=pad)
 
 
 def free_memory() -> None:
