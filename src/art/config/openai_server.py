@@ -8,7 +8,6 @@ def get_openai_server_config(
     base_model: types.BaseModel,
     log_file: str,
     lora_path: str,
-    tool_use: bool,
     config: "OpenAIServerConfig | None" = None,
 ) -> "OpenAIServerConfig":
     if config is None:
@@ -18,10 +17,9 @@ def get_openai_server_config(
         api_key="default",
         lora_modules=[f'{{"name": "{model_name}", "path": "{lora_path}"}}'],
         return_tokens_as_token_ids=True,
+        enable_auto_tool_choice=True,
+        tool_call_parser="hermes",
     )
-    if tool_use:
-        server_args["enable_auto_tool_choice"] = True
-        server_args["tool_call_parser"] = "hermes"
     server_args.update(config.get("server_args", {}))
     engine_args = EngineArgs(
         model=base_model,

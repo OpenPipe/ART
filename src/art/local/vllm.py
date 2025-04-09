@@ -11,7 +11,7 @@ from vllm.engine.async_llm_engine import AsyncLLMEngine
 from vllm.engine.protocol import EngineClient
 from vllm.entrypoints.openai import api_server
 from vllm.entrypoints.openai.cli_args import make_arg_parser, validate_parsed_serve_args
-from vllm.entrypoints.openai.serving_models import LoRARequest  # type: ignore
+from vllm.lora.request import LoRARequest
 from vllm.logger import _DATE_FORMAT, _FORMAT
 from vllm.utils import FlexibleArgumentParser
 from uvicorn.config import LOGGING_CONFIG
@@ -20,10 +20,6 @@ from ..config.openai_server import OpenAIServerConfig
 
 if TYPE_CHECKING:
     from .state import vLLMState
-
-# Unsloth expects these attributes to be present
-LoRARequest.lora_tensors = {}  # type: ignore
-LoRARequest.lora_embeddings = {}  # type: ignore
 
 
 async def openai_server_task(
@@ -41,6 +37,7 @@ async def openai_server_task(
         A running asyncio task for the OpenAI-compatible server. Cancel the task
         to stop the server.
     """
+    patch_lora_request()
     patch_get_lora_tokenizer_async()
     patch_listen_for_disconnect()
     patch_multi_step_model_runner(state)
@@ -227,6 +224,14 @@ def patch_allocator() -> None:
 
     allocator.sleep = sleep
     allocator.wake_up = wake_up
+
+
+def patch_lora_request() -> None:
+    """
+    Patches the vLLM LoRARequest type to have attributes Unsloth expects.
+    """
+    LoRARequest.lora_tensors = {}  # type: ignore
+    LoRARequest.lora_embeddings = {}  # type: ignore
 
 
 def patch_get_lora_tokenizer_async() -> None:

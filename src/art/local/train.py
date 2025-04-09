@@ -7,7 +7,6 @@ import torch
 from trl import GRPOTrainer
 from typing import cast, Callable, TYPE_CHECKING
 
-from ..config.model import ModelConfig
 from ..types import TuneConfig
 
 if TYPE_CHECKING:
@@ -18,12 +17,11 @@ nest_asyncio.apply()
 
 async def train(
     trainer: "GRPOTrainer",
-    model_config: ModelConfig,
     results_queue: asyncio.Queue[dict[str, float]],
 ) -> None:
     _compute_loss = trainer.compute_loss
     _log = trainer.log
-    trainer.compute_loss = get_compute_loss_fn(trainer, model_config)
+    trainer.compute_loss = get_compute_loss_fn(trainer)
     trainer.log = get_log_fn(trainer, results_queue)
     try:
         trainer.train()
@@ -32,9 +30,7 @@ async def train(
         trainer.log = _log
 
 
-def get_compute_loss_fn(
-    trainer: "GRPOTrainer", model_config: ModelConfig
-) -> Callable[..., torch.Tensor]:
+def get_compute_loss_fn(trainer: "GRPOTrainer") -> Callable[..., torch.Tensor]:
     def compute_loss(
         model: "PeftModel",
         inputs: "TuneInputs",
@@ -47,7 +43,7 @@ def get_compute_loss_fn(
             optimizer = getattr(optimizer, "optimizer", optimizer)
             if param_groups := getattr(optimizer, "param_groups"):
                 for param_group in param_groups:
-                    param_group["lr"] = config.lr
+                    param_group["lr"] = 5e-6 * config.learning_rate_multiplier
                     param_group["betas"] = config.betas
                     if param_group.get("weight_decay"):
                         param_group["weight_decay"] = config.weight_decay

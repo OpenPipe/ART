@@ -9,7 +9,6 @@ if os.environ.get("IMPORT_PEFT", "0") == "1":
 if os.environ.get("IMPORT_UNSLOTH", "0") == "1":
     import unsloth  # type: ignore
 
-from .api import API
 from .gather_trajectories import gather_trajectories
 from .model import Model
 from .types import Messages, MessagesAndChoices, ToolCall, Tools, Trajectory, TuneConfig
@@ -19,7 +18,6 @@ from .utils import retry
 UnslothAPI = LocalAPI
 
 __all__ = [
-    "API",
     "gather_trajectories",
     "LocalAPI",
     "Messages",

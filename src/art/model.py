@@ -1,7 +1,6 @@
 from dataclasses import dataclass
 from openai import AsyncOpenAI
-from types import TracebackType
-from typing import Any, Callable, Coroutine, Generator, Iterable, TYPE_CHECKING
+from typing import Iterable, TYPE_CHECKING
 
 from .config.model import ModelConfig
 from .config.openai_server import OpenAIServerConfig
@@ -10,101 +9,41 @@ from .types import BaseModel, Trajectory, TuneConfig, Verbosity
 
 
 if TYPE_CHECKING:
-    from .api import API
-
-
-@dataclass
-class ClientWrapper:
-    get_client: Callable[[], Coroutine[None, None, AsyncOpenAI]]
-    client: AsyncOpenAI | None = None
-
-    async def __aenter__(self) -> AsyncOpenAI:
-        self.client = await self.get_client()
-        return self.client
-
-    async def __aexit__(
-        self,
-        exc_type: type[BaseException] | None,
-        exc_value: BaseException | None,
-        traceback: TracebackType | None,
-    ) -> None:
-        if self.client is not None:
-            await self.client.close()
-
-    def __await__(self) -> Generator[Any, Any, AsyncOpenAI]:
-        return self.get_client().__await__()
+    from .local.api import LocalAPI
 
 
 @dataclass
 class Model:
-    api: "API"
+    api: "LocalAPI"
     name: str
     base_model: BaseModel
     _config: ModelConfig | None = None
 
-    def openai_client(
-        self,
-        estimated_completion_tokens: int = 1024,
-        tool_use: bool = False,
-        verbosity: Verbosity = 1,
-    ) -> ClientWrapper:
+    async def openai_client(self) -> AsyncOpenAI:
         """
-        Context manager for an OpenAI client to a managed inference service.
+        OpenAI client to a managed inference service.
 
-        Args:
-            estimated_completion_tokens: Estimated completion tokens per request.
-            tool_use: Whether to enable tool use.
-            verbosity: Verbosity level.
-
-        Yields:
-            AsyncOpenAI: An asynchronous OpenAI client.
-
-        Example:
-            async with model.openai_client() as client:
-                chat_completion = await client.chat.completions.create(
-                    model=model.name,
-                    messages=[{"role": "user", "content": "Hello, world!"}],
-                )
+        Returns:
+            An asynchronous OpenAI client.
         """
-        return self._openai_client(
-            estimated_completion_tokens, tool_use, verbosity, _config=None
-        )
+        return await self._openai_client(_config=None)
 
-    def _openai_client(
+    async def _openai_client(
         self,
-        estimated_completion_tokens: int = 1024,
-        tool_use: bool = False,
-        verbosity: Verbosity = 1,
         _config: OpenAIServerConfig | None = None,
-    ) -> ClientWrapper:
+    ) -> AsyncOpenAI:
         """
-        Private method for the context manager for an OpenAI client to a managed inference service.
+        Private method for an OpenAI client to a managed inference service.
 
         Args:
-            estimated_completion_tokens: Estimated completion tokens per request.
-            tool_use: Whether to enable tool use.
-            verbosity: Verbosity level.
             _config: An OpenAIServerConfig object. May be subject to breaking changes at any time.
                 Use at your own risk.
 
-        Yields:
-            AsyncOpenAI: An asynchronous OpenAI client.
-
-        Example:
-            async with model.openai_client() as client:
-                chat_completion = await client.chat.completions.create(
-                    model=model.name,
-                    messages=[{"role": "user", "content": "Hello, world!"}],
-                )
+        Returns:
+            An asynchronous OpenAI client.
         """
-
-        async def get_client() -> AsyncOpenAI:
-            client, semaphore = await self.api._get_openai_client(
-                self, estimated_completion_tokens, tool_use, verbosity, _config
-            )
-            return patch_openai(client, semaphore, self.api._close_openai_client)
-
-        return ClientWrapper(get_client=get_client)
+        client = await self.api._get_openai_client(self, _config)
+        return patch_openai(client)
 
     async def get_iteration(self) -> int:
         """

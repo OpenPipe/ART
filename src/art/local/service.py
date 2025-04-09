@@ -10,7 +10,6 @@ from ..config.model import ModelConfig
 from ..config.openai_server import get_openai_server_config, OpenAIServerConfig
 from .pack import DiskPackedTensors, packed_tensors_from_dir, PackedTensors
 from .train import train
-from .vllm import openai_server_task
 
 if TYPE_CHECKING:
     from unsloth_zoo.vllm_lora_request import LoRARequest  # type: ignore
@@ -43,9 +42,9 @@ class ModelService:
     def results_queue(self) -> asyncio.Queue[dict[str, float]]:
         return asyncio.Queue()
 
-    async def start_openai_server(
-        self, tool_use: bool, config: OpenAIServerConfig | None
-    ) -> None:
+    async def start_openai_server(self, config: OpenAIServerConfig | None) -> None:
+        from .vllm import openai_server_task
+
         lora_path = get_last_iteration_dir(self.output_dir)
         if lora_path is None:
             lora_path = f"{self.output_dir}/0000"
@@ -58,7 +57,6 @@ class ModelService:
                 base_model=self.base_model,
                 log_file=f"{self.output_dir}/logs/vllm.log",
                 lora_path=lora_path,
-                tool_use=tool_use,
                 config=config,
             ),
         )
@@ -81,7 +79,6 @@ class ModelService:
             self._train_task = asyncio.create_task(
                 train(
                     trainer=self.state.trainer,
-                    model_config=self.config,
                     results_queue=self.results_queue,
                 )
             )
@@ -148,6 +145,5 @@ class ModelService:
         )  # type: ignore
         lora_request.lora_int_id = 1
         lora_request.lora_name = self.model_name
-        lora_request.lora_path = lora_path
         self.state.vllm.async_engine.engine.remove_lora(1)
         self.state.vllm.async_engine.engine.add_lora(lora_request)  # type: ignore

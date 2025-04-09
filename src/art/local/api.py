@@ -1,4 +1,3 @@
-import asyncio
 import httpx
 import math
 from mp_actors import move_to_child_process
@@ -15,7 +14,6 @@ from typing import cast
 import wandb
 from wandb.sdk.wandb_run import Run
 
-from ..api import API
 from ..config.model import get_model_config, ModelConfig
 from ..config.openai_server import OpenAIServerConfig
 from ..model import Model
@@ -35,8 +33,7 @@ from .checkpoints import (
 )
 
 
-class LocalAPI(API):
-
+class LocalAPI:
     def __init__(
         self,
         *,
@@ -53,7 +50,7 @@ class LocalAPI(API):
             If you don't have a W&B account, you can create one at https://wandb.ai.
 
         Args:
-            in_process: Whether to run the Unsloth service in-process.
+            in_process: Whether to run the local service in-process.
             path: The path to the local directory. Defaults to "./.art".
             wandb_entity: The preferred Weights & Biases entity.
             wandb_project: The preferred Weights & Biases project.
@@ -225,29 +222,21 @@ class LocalAPI(API):
     async def _get_openai_client(
         self,
         model: Model,
-        estimated_completion_tokens: int,
-        tool_use: bool,
-        verbosity: Verbosity,
         config: OpenAIServerConfig | None,
-    ) -> tuple[AsyncOpenAI, asyncio.Semaphore]:
+    ) -> AsyncOpenAI:
         service = await self._get_service(model)
-        await service.start_openai_server(tool_use=tool_use, config=config)
+        await service.start_openai_server(config=config)
         server_args = (config or {}).get("server_args", {})
-        return (
-            AsyncOpenAI(
-                base_url=f"http://{server_args.get('host', '0.0.0.0')}:{server_args.get('port', 8000)}/v1",
-                api_key=server_args.get("api_key", "default"),
-                http_client=DefaultAsyncHttpxClient(
-                    timeout=httpx.Timeout(timeout=1200, connect=5.0),
-                    limits=httpx.Limits(
-                        max_connections=100_000, max_keepalive_connections=100_000
-                    ),
+        return AsyncOpenAI(
+            base_url=f"http://{server_args.get('host', '0.0.0.0')}:{server_args.get('port', 8000)}/v1",
+            api_key=server_args.get("api_key", "default"),
+            http_client=DefaultAsyncHttpxClient(
+                timeout=httpx.Timeout(timeout=1200, connect=5.0),
+                limits=httpx.Limits(
+                    max_connections=100_000, max_keepalive_connections=100_000
                 ),
             ),
-            asyncio.Semaphore(1024),
         )
-
-    async def _close_openai_client(self, _: AsyncOpenAI) -> None: ...
 
     async def _log(
         self,
