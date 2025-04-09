@@ -9,7 +9,7 @@ from .types import BaseModel, Trajectory, TuneConfig, Verbosity
 
 
 if TYPE_CHECKING:
-    from .local.api import LocalAPI
+    from .unsloth.api import LocalAPI
 
 
 @dataclass
