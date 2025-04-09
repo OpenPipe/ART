@@ -13,19 +13,22 @@ from .api import API
 from .gather_trajectories import gather_trajectories
 from .model import Model
 from .types import Messages, MessagesAndChoices, ToolCall, Tools, Trajectory, TuneConfig
-from .unsloth import UnslothAPI
+from .local import LocalAPI
 from .utils import retry
+
+UnslothAPI = LocalAPI
 
 __all__ = [
     "API",
     "gather_trajectories",
+    "LocalAPI",
     "Messages",
     "MessagesAndChoices",
     "Model",
+    "retry",
     "ToolCall",
     "Tools",
     "Trajectory",
     "TuneConfig",
     "UnslothAPI",
-    "retry",
 ]

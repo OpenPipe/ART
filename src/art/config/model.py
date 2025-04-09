@@ -1,25 +1,24 @@
 import torch
+from transformers.debug_utils import DebugOption
+from transformers.training_args import OptimizerNames
+from transformers.trainer_utils import (
+    FSDPOption,
+    HubStrategy,
+    IntervalStrategy,
+    SaveStrategy,
+    SchedulerType,
+)
 from typing import TYPE_CHECKING, TypedDict
 
 
 if TYPE_CHECKING:
-    from transformers.training_args import (
-        DebugOption,
-        FSDPOption,
-        HubStrategy,
-        IntervalStrategy,
-        OptimizerNames,
-        SaveStrategy,
-        SchedulerType,
-    )
-
     from .. import types
 
 
 def get_model_config(
     base_model: "types.BaseModel", output_dir: str, config: "ModelConfig | None"
 ) -> "ModelConfig":
-    from ..unsloth.checkpoints import get_last_iteration_dir
+    from ..local.checkpoints import get_last_iteration_dir
 
     if config is None:
         config = ModelConfig()

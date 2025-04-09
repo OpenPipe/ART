@@ -9,7 +9,9 @@ from openai import (
 )
 import os
 import subprocess
-from typing import cast, TYPE_CHECKING
+from transformers.tokenization_utils_base import PreTrainedTokenizerBase
+from tqdm import auto as tqdm
+from typing import cast
 import wandb
 from wandb.sdk.wandb_run import Run
 
@@ -18,7 +20,6 @@ from ..config.model import get_model_config, ModelConfig
 from ..config.openai_server import OpenAIServerConfig
 from ..model import Model
 from .service import ModelService
-from ..tqdm import tqdm
 from ..types import BaseModel, Message, Trajectory, TuneConfig, Verbosity
 from ..utils import format_message
 from .pack import (
@@ -33,11 +34,8 @@ from .checkpoints import (
     get_iteration,
 )
 
-if TYPE_CHECKING:
-    from transformers import PreTrainedTokenizerBase
 
-
-class UnslothAPI(API):
+class LocalAPI(API):
 
     def __init__(
         self,
@@ -143,7 +141,7 @@ class UnslothAPI(API):
         verbosity: Verbosity,
         plot_tensors: bool,
     ) -> PackedTensors | None:
-        from transformers import AutoTokenizer
+        from transformers.models.auto.tokenization_auto import AutoTokenizer
 
         if not model.base_model in self._tokenizers:
             self._tokenizers[model.base_model] = AutoTokenizer.from_pretrained(

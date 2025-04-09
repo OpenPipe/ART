@@ -3,7 +3,6 @@ from dataclasses import dataclass
 import functools
 import torch
 from typing import AsyncIterator, TYPE_CHECKING
-from unsloth_zoo.vllm_lora_request import LoRARequest  # type: ignore
 
 from .. import types
 from .checkpoints import get_iteration, get_last_iteration_dir
@@ -14,6 +13,8 @@ from .train import train
 from .vllm import openai_server_task
 
 if TYPE_CHECKING:
+    from unsloth_zoo.vllm_lora_request import LoRARequest  # type: ignore
+
     from .state import ModelState
 
 
@@ -147,5 +148,6 @@ class ModelService:
         )  # type: ignore
         lora_request.lora_int_id = 1
         lora_request.lora_name = self.model_name
+        lora_request.lora_path = lora_path
         self.state.vllm.async_engine.engine.remove_lora(1)
         self.state.vllm.async_engine.engine.add_lora(lora_request)  # type: ignore

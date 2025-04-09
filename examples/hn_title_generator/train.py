@@ -5,7 +5,7 @@ from openai.types.chat import ChatCompletionMessageParam
 import os
 from dotenv import load_dotenv
 from datasets import Dataset
-from transformers import AutoTokenizer
+from transformers.models.auto.tokenization_auto import AutoTokenizer
 from typing import List, Dict, Any, Iterable
 from openpipe import AsyncOpenPipe
 from datetime import datetime
@@ -231,7 +231,7 @@ async def rollout(
 # --- Main Training Loop ---
 async def main():
     # Initialize ART API and Model
-    api = art.UnslothAPI(wandb_project=WANDB_PROJECT)
+    api = art.LocalAPI(wandb_project=WANDB_PROJECT)
     model = await api._get_or_create_model(
         name=RUN_NAME,
         base_model=BASE_MODEL,
