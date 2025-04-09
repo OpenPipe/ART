@@ -11,7 +11,6 @@ import shutil
 from tqdm import auto as tqdm
 from typing import Any, Coroutine, Iterable, Iterator, Literal, overload
 
-# from .tqdm import tqdm
 from .types import Trajectory
 
 

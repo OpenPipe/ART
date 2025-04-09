@@ -2,12 +2,10 @@ from dataclasses import dataclass
 from itertools import takewhile
 import math
 import random
-from typing import cast, Generator, TYPE_CHECKING, TypedDict
+from transformers.tokenization_utils_base import PreTrainedTokenizerBase
+from typing import cast, Generator, TypedDict
 
 from ..types import Trajectory
-
-if TYPE_CHECKING:
-    from transformers import PreTrainedTokenizerBase
 
 
 @dataclass

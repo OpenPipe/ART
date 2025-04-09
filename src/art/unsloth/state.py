@@ -14,14 +14,13 @@ from transformers.utils.dummy_pt_objects import (
 )
 from trl import GRPOConfig, GRPOTrainer
 from typing import AsyncGenerator, cast, TYPE_CHECKING
+import vllm
+from vllm.worker.worker_base import WorkerWrapperBase
+from vllm.worker.multi_step_model_runner import MultiStepModelRunner
 
 from ..config.model import ModelConfig
 
 if TYPE_CHECKING:
-    import vllm
-    from vllm.worker.worker_base import WorkerWrapperBase
-    from vllm.worker.multi_step_model_runner import MultiStepModelRunner
-
     from .service import TuneInputs
 
 nest_asyncio.apply()

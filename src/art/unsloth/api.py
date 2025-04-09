@@ -8,6 +8,7 @@ from openai import (
 )
 import os
 import subprocess
+from transformers.models.auto.tokenization_auto import AutoTokenizer
 from transformers.tokenization_utils_base import PreTrainedTokenizerBase
 from tqdm import auto as tqdm
 from typing import cast
@@ -138,8 +139,6 @@ class LocalAPI:
         verbosity: Verbosity,
         plot_tensors: bool,
     ) -> PackedTensors | None:
-        from transformers.models.auto.tokenization_auto import AutoTokenizer
-
         if not model.base_model in self._tokenizers:
             self._tokenizers[model.base_model] = AutoTokenizer.from_pretrained(
                 model.base_model

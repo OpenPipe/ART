@@ -145,5 +145,6 @@ class ModelService:
         )  # type: ignore
         lora_request.lora_int_id = 1
         lora_request.lora_name = self.model_name
+        lora_request.lora_path = lora_path
         self.state.vllm.async_engine.engine.remove_lora(1)
         self.state.vllm.async_engine.engine.add_lora(lora_request)  # type: ignore
