@@ -1,6 +1,7 @@
 import asyncio
 from contextlib import asynccontextmanager
-import unsloth
+import gc
+import unsloth  # type: ignore
 from datasets import Dataset
 import nest_asyncio
 import os
@@ -9,15 +10,13 @@ import torch
 import transformers
 from trl import GRPOConfig, GRPOTrainer
 from typing import AsyncGenerator, cast, TYPE_CHECKING
+import vllm
+from vllm.worker.worker_base import WorkerWrapperBase
+from vllm.worker.multi_step_model_runner import MultiStepModelRunner
 
 from ..config.model import ModelConfig
-from .train import free_memory
 
 if TYPE_CHECKING:
-    import vllm
-    from vllm.worker.worker_base import WorkerWrapperBase
-    from vllm.worker.multi_step_model_runner import MultiStepModelRunner
-
     from .service import TuneInputs
 
 nest_asyncio.apply()
@@ -27,6 +26,10 @@ class CausallLM(transformers.PreTrainedModel, transformers.GenerationMixin): ...
 
 
 class ModelState:
+    """
+    A class responsible for initializing and holding references to the model and related state.
+    """
+
     def __init__(self, config: ModelConfig) -> None:
         from vllm.engine import async_llm_engine
 
@@ -131,3 +134,9 @@ class vLLMState:
                 await self.async_engine.wake_up()
         finally:
             await self.resume_engine()
+
+
+def free_memory() -> None:
+    for _ in range(3):
+        gc.collect()
+        torch.cuda.empty_cache()

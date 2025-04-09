@@ -3,6 +3,7 @@ from dataclasses import dataclass
 import functools
 import torch
 from typing import AsyncIterator, TYPE_CHECKING
+from unsloth_zoo.vllm_lora_request import LoRARequest  # type: ignore
 
 from .. import types
 from .checkpoints import get_iteration, get_last_iteration_dir
@@ -13,8 +14,6 @@ from .train import train
 from .vllm import openai_server_task
 
 if TYPE_CHECKING:
-    from unsloth_zoo.vllm_lora_request import LoRARequest  # type: ignore
-
     from .state import ModelState
 
 

@@ -2,25 +2,20 @@ from argparse import Namespace
 import asyncio
 from contextlib import asynccontextmanager
 import ctypes
-from functools import partial
 import logging
-import multiprocessing
 from openai import AsyncOpenAI
 import os
 import torch
-from typing import Any, AsyncIterator, Callable, Coroutine, Literal, TYPE_CHECKING
-from vllm.engine.arg_utils import AsyncEngineArgs
+from typing import Any, AsyncIterator, Callable, Coroutine, TYPE_CHECKING
 from vllm.engine.async_llm_engine import AsyncLLMEngine
-from vllm.engine.multiprocessing.client import MQLLMEngineClient
 from vllm.engine.protocol import EngineClient
 from vllm.entrypoints.openai import api_server
 from vllm.entrypoints.openai.cli_args import make_arg_parser, validate_parsed_serve_args
 from vllm.entrypoints.openai.serving_models import LoRARequest  # type: ignore
 from vllm.logger import _DATE_FORMAT, _FORMAT
-from vllm.utils import get_open_zmq_ipc_path, FlexibleArgumentParser
+from vllm.utils import FlexibleArgumentParser
 from uvicorn.config import LOGGING_CONFIG
 
-from .async_multiprocessing_engine import MQAsyncLLMEngine
 from ..config.openai_server import OpenAIServerConfig
 
 if TYPE_CHECKING:
@@ -280,6 +275,9 @@ def patch_multi_step_model_runner(state: "vLLMState") -> None:
 
 
 def get_uvicorn_logging_config(path: str) -> dict[str, Any]:
+    """
+    Returns a Uvicorn logging config that writes to the given path.
+    """
     return {
         **LOGGING_CONFIG,
         "handlers": {
@@ -324,108 +322,3 @@ def set_vllm_log_file(path: str) -> None:
 
     # Set log level to filter out DEBUG messages
     vllm_logger.setLevel(logging.INFO)
-
-
-async def mp_openai_server_task(
-    state: "vLLMState",
-    config: OpenAIServerConfig,
-) -> asyncio.Task[None]:
-    patch_get_lora_tokenizer_async()
-    patch_multi_step_model_runner(state)
-    set_vllm_log_file(config.get("log_file", "vllm.log"))
-
-    # Select random path for IPC.
-    ipc_path = get_open_zmq_ipc_path()
-    print("Multiprocessing frontend to use %s for IPC Path.", ipc_path)
-
-    engine = MQAsyncLLMEngine(
-        ipc_path=ipc_path,
-        async_engine=state.async_engine,
-    )
-
-    # Start client in separate process (provides the OpenAI API server).
-    # the current process might have CUDA context,
-    # so maybe we need to spawn a new process
-    # context = multiprocessing.get_context("spawn")
-
-    client_process = multiprocessing.Process(
-        target=openai_server_target,
-        args=(ipc_path, os.getpid(), config),
-    )
-
-    async def openai_server_task() -> None:
-        engine_task = asyncio.create_task(engine.run())
-        try:
-            client_process.start()
-            await engine_task
-        finally:
-            engine_task.cancel()
-            client_process.terminate()
-
-    task = asyncio.create_task(openai_server_task())
-    server_args = config.get("server_args", {})
-    client = AsyncOpenAI(
-        api_key=server_args.get("api_key"),
-        base_url=f"http://{server_args.get('host', '0.0.0.0')}:{server_args.get('port', 8000)}/v1",
-    )
-
-    async def test_client() -> None:
-        while True:
-            try:
-                async for _ in client.models.list():
-                    return
-            except:
-                pass
-
-    test_client_task = asyncio.create_task(test_client())
-    try:
-        done, _ = await asyncio.wait(
-            [task, test_client_task],
-            timeout=30.0,
-            return_when="FIRST_COMPLETED",
-        )
-        if not done:
-            raise TimeoutError("Unable to reach OpenAI-compatible server in time.")
-        for task in done:
-            task.result()
-        return task
-    except Exception:
-        if exception := task.exception():
-            raise exception
-        raise
-
-
-def openai_server_target(
-    ipc_path: str,
-    engine_pid: int,
-    config: OpenAIServerConfig,
-) -> None:
-    patch_listen_for_disconnect()
-
-    @asynccontextmanager
-    async def build_async_engine_client(
-        _: Namespace,
-    ) -> AsyncIterator[EngineClient]:
-        # Build RPCClient, which conforms to EngineClient Protocol.
-        engine_config = AsyncEngineArgs(
-            **config.get("engine_args", {})
-        ).create_engine_config()
-        build_client = partial(MQLLMEngineClient, ipc_path, engine_config, engine_pid)
-        mq_engine_client = await asyncio.get_running_loop().run_in_executor(
-            None, build_client
-        )
-        try:
-            while True:
-                try:
-                    await mq_engine_client.setup()
-                    break
-                except TimeoutError:
-                    pass
-
-            yield mq_engine_client  # type: ignore[misc]
-        finally:
-            # Close all open connections to the backend
-            mq_engine_client.close()
-
-    api_server.build_async_engine_client = build_async_engine_client
-    asyncio.run(_openai_server_coroutine(config))

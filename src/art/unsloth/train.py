@@ -1,17 +1,16 @@
 import asyncio
 from contextlib import nullcontext
-import gc
 import nest_asyncio
 import os
+from peft.peft_model import PeftModel
 import torch
+from trl import GRPOTrainer
 from typing import cast, Callable, TYPE_CHECKING
 
 from ..config.model import ModelConfig
 from ..types import TuneConfig
 
 if TYPE_CHECKING:
-    from peft.peft_model import PeftModel
-    from trl import GRPOTrainer
     from .service import TuneInputs
 
 nest_asyncio.apply()
@@ -215,39 +214,6 @@ def calculate_attn_bias(
     return attn_bias
 
 
-def simple_calculate_logprobs(
-    autocast_dtype: torch.dtype,
-    trainer: "GRPOTrainer",
-    input_ids: torch.Tensor,
-    causal_mask: torch.Tensor,
-    next_input_ids: torch.Tensor,
-    lm_head_t: torch.Tensor,
-    chunk_size: int,
-    reference_logprobs: bool,
-) -> torch.Tensor:  # Returns shape [B, S]
-    with (
-        torch.amp.autocast_mode.autocast(device_type="cuda", dtype=autocast_dtype),
-        torch.inference_mode() if reference_logprobs else nullcontext(),
-        (
-            trainer.accelerator.unwrap_model(
-                trainer.model, keep_fp32_wrapper=False
-            ).disable_adapter()
-            if reference_logprobs
-            else nullcontext()
-        ),
-    ):
-        logits = trainer.model(
-            input_ids=input_ids, causal_mask=causal_mask
-        ).logits  # Shape [B, S, H]
-    selected_logits = torch.gather(
-        logits, dim=-1, index=next_input_ids.unsqueeze(-1)
-    ).squeeze(
-        -1
-    )  # Shape [B, S]
-    logsumexp = torch.logsumexp(logits, dim=-1)  # Shape [B, S]
-    return selected_logits - logsumexp
-
-
 def calculate_logprobs(
     autocast_dtype: torch.dtype,
     trainer: "GRPOTrainer",
@@ -316,9 +282,3 @@ def _calculate_logprobs(
 
 def shift_tensor(tensor: torch.Tensor, pad: int | float | bool) -> torch.Tensor:
     return torch.nn.functional.pad(tensor[:, 1:], (0, 1), value=pad)
-
-
-def free_memory() -> None:
-    for _ in range(3):
-        gc.collect()
-        torch.cuda.empty_cache()
