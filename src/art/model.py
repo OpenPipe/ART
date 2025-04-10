@@ -19,14 +19,21 @@ class Model:
     base_model: BaseModel
     _config: ModelConfig | None = None
 
-    async def openai_client(self) -> AsyncOpenAI:
+    async def openai_client(
+        self,
+        _config: OpenAIServerConfig | None = None,
+    ) -> AsyncOpenAI:
         """
         OpenAI client to a managed inference service.
+
+        Args:
+            _config: An OpenAIServerConfig object. May be subject to breaking changes at any time.
+                Use at your own risk.
 
         Returns:
             An asynchronous OpenAI client.
         """
-        return await self._openai_client(_config=None)
+        return await self._openai_client(_config=_config)
 
     async def _openai_client(
         self,
@@ -58,23 +65,16 @@ class Model:
         return await self.api._get_step(self)
 
     async def delete_checkpoints(
-        self,
-        benchmark: str = "val/reward",
-        benchmark_smoothing: float = 1.0,
-        verbosity: Verbosity = 1,  # REMOVE?
+        self, best_checkpoint_metric: str = "val/reward"
     ) -> None:
         """
         Delete all but the latest and best checkpoints.
 
         Args:
-            benchmark: The benchmark to use to determine the best checkpoint.
-            benchmark_smoothing: Smoothing factor (0-1) that controls how much to reduce
-                variance when determining the best checkpoint. Defaults to 1.0 (no smoothing).
-            verbosity: Verbosity level.
+            best_checkpoint_metric: The metric to use to determine the best checkpoint.
+                Defaults to "val/reward".
         """
-        await self.api._delete_checkpoints(
-            self, benchmark, benchmark_smoothing, verbosity
-        )
+        await self.api._delete_checkpoints(self, best_checkpoint_metric)
 
     async def clear_iterations(
         self,
@@ -91,9 +91,7 @@ class Model:
                 variance when determining the best iteration. Defaults to 1.0 (no smoothing).
             verbosity: Verbosity level.
         """
-        await self.api._delete_checkpoints(
-            self, benchmark, benchmark_smoothing, verbosity
-        )
+        await self.api._delete_checkpoints(self, benchmark, benchmark_smoothing)
 
     async def log(
         self,

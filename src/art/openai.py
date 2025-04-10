@@ -1,5 +1,3 @@
-import contextlib
-import datetime
 import openai
 from openai import AsyncStream
 from openai._streaming import AsyncStream
@@ -32,8 +30,7 @@ def patch_openai(client: openai.AsyncOpenAI) -> openai.AsyncOpenAI:
         kwargs["logprobs"] = True
         return_stream = kwargs.get("stream", False)
         context = get_groups_context()
-        should_stream = next(context.should_stream)
-        if context.pbar_total_completion_tokens or should_stream:
+        if context.pbar_total_completion_tokens:
             kwargs["stream"] = True
             kwargs["stream_options"] = {"include_usage": True}
         return_value = await create(*args, **kwargs)
@@ -44,40 +41,18 @@ def patch_openai(client: openai.AsyncOpenAI) -> openai.AsyncOpenAI:
         if return_stream:
             return return_value
 
-        with (
-            open(
-                f"{context.streaming_chat_completions_dir}/{datetime.datetime.now().isoformat()}.log",
-                "a",
-            )
-            if should_stream
-            else contextlib.nullcontext()
-        ) as log_file:
-            if log_file:
-                log_file.write(
-                    f"\n".join(
-                        format_message(message) for message in kwargs["messages"]
-                    )
-                    + "\nAssistant:\n"
+        def on_chunk(chunk: ChatCompletionChunk, _: ChatCompletion) -> None:
+            context = get_groups_context()
+            if context.pbar_total_completion_tokens:
+                context.metric_sums["total_completion_tokens"] += sum(
+                    len(choice.logprobs.content or choice.logprobs.refusal or [])
+                    for choice in chunk.choices
+                    if choice.logprobs
+                    and (choice.logprobs.content or choice.logprobs.refusal)
                 )
-                log_file.flush()
+                context.update_pbar(n=0)
 
-            def on_chunk(chunk: ChatCompletionChunk, _: ChatCompletion) -> None:
-                context = get_groups_context()
-                if context.pbar_total_completion_tokens:
-                    context.metric_sums["total_completion_tokens"] += sum(
-                        len(choice.logprobs.content or choice.logprobs.refusal or [])
-                        for choice in chunk.choices
-                        if choice.logprobs
-                        and (choice.logprobs.content or choice.logprobs.refusal)
-                    )
-                    context.update_pbar(n=0)
-                if log_file and chunk.choices:
-                    log_file.write(chunk.choices[0].delta.content or "")
-                    log_file.flush()
-
-            chat_completion = await consume_chat_completion_stream(
-                return_value, on_chunk
-            )
+        chat_completion = await consume_chat_completion_stream(return_value, on_chunk)
         report_usage(chat_completion)
         return chat_completion
 

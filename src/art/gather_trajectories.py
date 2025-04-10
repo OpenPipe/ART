@@ -3,15 +3,59 @@ import contextvars
 import contextlib
 from collections import Counter
 from dataclasses import dataclass, field
-from itertools import cycle
 from openai.types.chat.chat_completion import Choice
-import os
-import random
-import shutil
 from tqdm import auto as tqdm
-from typing import Any, Coroutine, Iterable, Iterator, Literal, overload
+from typing import (
+    Any,
+    Awaitable,
+    cast,
+    Coroutine,
+    Iterable,
+    Iterator,
+    Literal,
+    overload,
+)
 
 from .types import Trajectory
+
+
+class TrajectoryGroup:
+    @overload
+    def __new__(cls, trajectories: Iterable[Trajectory]) -> "TrajectoryGroup": ...
+
+    @overload
+    def __new__(
+        cls, trajectories: Iterable[Awaitable[Trajectory]]
+    ) -> Awaitable["TrajectoryGroup"]: ...
+
+    def __new__(
+        cls,
+        trajectories: Iterable[Trajectory] | Iterable[Awaitable[Trajectory]],
+    ) -> "TrajectoryGroup | Awaitable[TrajectoryGroup]":
+        ts = list(trajectories)
+        if all(isinstance(t, Trajectory) for t in ts):
+            group = super().__new__(cls)
+            group.__init__(cast(Iterable[Trajectory], ts))
+            return group
+        else:
+            ts = cast(Iterable[Awaitable[Trajectory]], ts)
+
+            async def _():
+                return TrajectoryGroup(
+                    await asyncio.gather(*cast(Iterable[Awaitable[Trajectory]], ts))
+                )
+
+            return _()
+
+    def __init__(self, trajectories: Iterable[Trajectory]) -> None:
+        self.trajectories = list(trajectories)
+
+
+async def rollout() -> Trajectory: ...
+
+
+async def trajectory_group() -> TrajectoryGroup:
+    return await TrajectoryGroup(rollout() for _ in range(10))
 
 
 @overload
@@ -24,9 +68,6 @@ async def gather_trajectories(
     pbar_desc: str | None = None,
     pbar_total_completion_tokens: bool = True,  # REMOVE?
     return_exceptions: Literal[False] = False,
-    stream_chat_completions: bool | int | float = False,  # REMOVE?
-    streaming_chat_completions_dir: str = "./streaming-chat-completions",  # REMOVE?
-    clear_streaming_chat_completions_dir: bool = True,  # REMOVE?
 ) -> list[list[Trajectory]]: ...
 
 
@@ -40,9 +81,6 @@ async def gather_trajectories(
     pbar_desc: str | None = None,
     pbar_total_completion_tokens: bool = True,
     return_exceptions: Literal[True],
-    stream_chat_completions: bool | int | float = False,
-    streaming_chat_completions_dir: str = "./streaming-chat-completions",
-    clear_streaming_chat_completions_dir: bool = True,
 ) -> list[list[Trajectory | BaseException]]: ...
 
 
@@ -55,31 +93,12 @@ async def gather_trajectories(
     pbar_desc: str | None = None,
     pbar_total_completion_tokens: bool = True,
     return_exceptions: bool = False,
-    stream_chat_completions: bool | int | float = False,
-    streaming_chat_completions_dir: str = "./streaming-chat-completions",
-    clear_streaming_chat_completions_dir: bool = True,
 ) -> list[list[Trajectory | BaseException]] | list[list[Trajectory]]:
     groups = [list([g] if isinstance(g, Coroutine) else g) for g in groups]
     total = sum(len(g) for g in groups)
-    if stream_chat_completions:
-        if clear_streaming_chat_completions_dir:
-            shutil.rmtree(streaming_chat_completions_dir, ignore_errors=True)
-        os.makedirs(streaming_chat_completions_dir, exist_ok=True)
-        if isinstance(stream_chat_completions, bool):
-            true_count = total
-        elif isinstance(stream_chat_completions, int):
-            true_count = min(stream_chat_completions, total)
-        elif isinstance(stream_chat_completions, float):
-            true_count = min(int(round(total * stream_chat_completions)), total)
-        should_stream = [True] * true_count + [False] * (total - true_count)
-        random.shuffle(should_stream)
-    else:
-        should_stream = [False]
     context = GroupsContext(
         pbar=tqdm.tqdm(desc=pbar_desc, total=total),
         pbar_total_completion_tokens=pbar_total_completion_tokens,
-        should_stream=iter(cycle(should_stream)),
-        streaming_chat_completions_dir=streaming_chat_completions_dir,
     )
     with set_groups_context(context):
         result_groups = await asyncio.gather(
@@ -156,8 +175,6 @@ class GroupsContext:
     metric_sums: Counter[str] = field(default_factory=Counter)
     metric_divisors: Counter[str] = field(default_factory=Counter)
     pbar_total_completion_tokens: bool = False
-    should_stream: Iterator[bool] = field(default_factory=lambda: iter(cycle([False])))
-    streaming_chat_completions_dir: str = "./streaming-chat-completions"
 
     def update_pbar(self, n: int) -> None:
         if self.pbar is not None:

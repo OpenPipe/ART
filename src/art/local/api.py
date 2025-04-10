@@ -67,18 +67,25 @@ class LocalAPI:
         self._tokenizers: dict[str, "PreTrainedTokenizerBase"] = {}
         self._wandb_runs: dict[str, Run] = {}
 
-    async def get_or_create_model(self, name: str, base_model: BaseModel) -> Model:
+    async def get_or_create_model(
+        self,
+        name: str,
+        base_model: BaseModel,
+        _config: ModelConfig | None = None,
+    ) -> Model:
         """
         Retrieve an existing model or create a new one.
 
         Args:
             name: A unique identifier for the model.
             base_model: The base model to start training from.
+            _config: A ModelConfig object. May be subject to breaking changes at any time.
+                Use at your own risk.
 
         Returns:
             Model: A model instance.
         """
-        return await self._get_or_create_model(name, base_model, None)
+        return await self._get_or_create_model(name, base_model, _config)
 
     async def _get_or_create_model(
         self,
@@ -188,11 +195,7 @@ class LocalAPI:
         return get_step(self._get_output_dir(model.name))
 
     async def _delete_checkpoints(
-        self,
-        model: Model,
-        benchmark: str,
-        benchmark_smoothing: float = 1.0,
-        verbosity: Verbosity = 1,
+        self, model: Model, benchmark: str, benchmark_smoothing: float = 1.0
     ) -> None:
         run = self._get_wandb_run(model)
         output_dir = self._get_output_dir(model.name)
@@ -214,8 +217,7 @@ class LocalAPI:
             )
             steps_to_keep.append(best_step)
         except KeyError:
-            if verbosity > 1:
-                print(f'No "{benchmark}" metric found in history')
+            print(f'No "{benchmark}" metric found in history')
         delete_checkpoints(output_dir, steps_to_keep)
 
     async def _get_openai_client(
