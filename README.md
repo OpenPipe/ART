@@ -1,6 +1,5 @@
 <div align="center">
 
-
   <a href="https://openpipe.ai"><picture>
     <img alt="ART header" src="https://github.com/user-attachments/assets/d5441604-59fe-415d-a90a-9e9e2cbd5c2c" width="100%">
   </picture></a>
@@ -11,7 +10,7 @@
 
 ### Train free-range RL agents with minimal code changes and maximal performance!
 
-![](https://github.com/user-attachments/assets/8296d076-508e-4689-ab13-f55599baced3)
+![](https://github.com/user-attachments/assets/13eae0af-a7bf-4fd3-9e13-20847438cd66)
 
 </div>
 
