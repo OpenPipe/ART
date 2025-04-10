@@ -3,7 +3,7 @@
 
 
   <a href="https://openpipe.ai"><picture>
-    <img alt="ART header" src="https://github.com/user-attachments/assets/9c469dd7-2541-4541-977b-58265bd95baa" height="400" style="max-width: 100%;">
+    <img alt="ART header" src="https://github.com/user-attachments/assets/6da7a213-c783-4a59-809c-681781957c58" width="100%">
   </picture></a>
 
 <a href="https://colab.research.google.com/github/OpenPipe/ART/blob/main/examples/tic_tac_toe/tic-tac-toe.ipynb"><img src="https://github.com/user-attachments/assets/8d655cbd-6498-4ef0-a4bb-c6c353c63c0e" height="48"></a>
