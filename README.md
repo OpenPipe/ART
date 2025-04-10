@@ -17,7 +17,27 @@
 
 # The OpenPipe Agent Reinforcement Trainer (ART)
 
-An open-source reinforcement training library for LLMs and agentic workflows
+ART is an open-source reinforcement training library for improving LLM performance in agentic workflows. Unlike existing RL libraries, ART allows you to execute agent runs **in your existing codebase** while offloading all the complexity of the RL training loop to the ART backend. Read the [architecture overview](#brief-architecture-overview) to learn more. Then try out one of the notebooks below!
+
+## Notebooks
+
+TODO: Add notebooks
+
+## Brief Architecture Overview
+
+ART's functionality is divided into two parts, a client and a server. The OpenAI-compatible client is responsible for interfacing between ART and your codebase. Using the client, you can pass messages and get completions from your LLM as it improves. The server can run separately on any machine with a GPU. It abstracts away the complexity of the inference and training portions of the RL loop while allowing for some custom configuration. An outline of the training loop is shown below:
+
+1. Your code uses the ART client to execute agentic workflows (usually several in parallel).
+   1. As the agent executes and the LLM generates completions, each `system`, `user`, and `assistant` message is stored in a Trajectory.
+   2. Completion requests are routed to the ART server, which runs the most recently trained LoRA on vLLM.
+   3. After a run finishes, your code assigns a `reward` to the Trajectory, which indicates the overall performance of the LLM during that run.
+
+2. After a batch of runs completes, Trajectories are grouped together and sent to server. Inference is blocked while training executes.
+   1. The server uses GRPO to train your model, starting from the most recently trained checkpoint (or an empty LoRA on the first iteration).
+   2. The server saves the LoRA in a local directory to be read from on the next training run.
+   3. Inference is unblocked and the loop resumes at step 1.
+  
+This training loop runs until a specified number of inference and training steps have been completed.
 
 ## Getting Started
 
