@@ -16,7 +16,7 @@
 
 # The OpenPipe Agent Reinforcement Trainer (ART)
 
-ART is an open-source reinforcement training library for improving LLM performance in agentic workflows. Unlike existing RL libraries, ART allows you to execute agent runs **in your existing codebase** while offloading all the complexity of the RL training loop to the ART backend. Read the [architecture overview](#brief-architecture-overview) to learn more. Then try out one of the notebooks below!
+ART is an open-source reinforcement training library for improving LLM performance in agentic workflows. Unlike existing RL libraries, ART allows you to execute agent runs **in your existing codebase** while offloading all the complexity of the RL training loop to the ART backend. Read the [architecture overview](#architecture-overview) to learn more. Then try out one of the notebooks below!
 
 ## Notebooks
 
