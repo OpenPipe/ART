@@ -23,7 +23,7 @@ ART is an open-source reinforcement training library for improving LLM performan
 
 TODO: Add notebooks
 
-## Brief Architecture Overview
+## Architecture Overview
 
 ART's functionality is divided into two parts, a client and a server. The OpenAI-compatible client is responsible for interfacing between ART and your codebase. Using the client, you can pass messages and get completions from your LLM as it improves. The server can run separately on any machine with a GPU. It abstracts away the complexity of the inference and training portions of the RL loop while allowing for some custom configuration. An outline of the training loop is shown below:
 
