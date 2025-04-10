@@ -26,17 +26,19 @@ TODO: Add notebooks
 
 ART's functionality is divided into a **client** and a **server**. The OpenAI-compatible client is responsible for interfacing between ART and your codebase. Using the client, you can pass messages and get completions from your LLM as it improves. The server runs independently on any machine with a GPU. It abstracts away the complexity of the inference and training portions of the RL loop while allowing for some custom configuration. An outline of the training loop is shown below:
 
-1. Your code uses an ART client to perform agentic workflows (usually several in parallel).
-   1. As the agent executes and the LLM generates completions, each `system`, `user`, and `assistant` message is stored in a Trajectory.
-   2. Completion requests are routed to the ART server, which runs the most recently trained LoRA on vLLM and returns responses to the client.
-   3. After a run finishes, your code assigns a `reward` to the Trajectory, which should indicate the overall performance of the LLM during that run.
+1. **Inference**
+   1. Your code uses the ART client to perform an agentic workflow (usually executing several times in parallel to gather data faster).
+   2. Completion requests are routed to the ART server, which runs the model's latest LoRA in vLLM.
+   3. As the agent executes, each `system`, `user`, and `assistant` message is stored in a Trajectory.
+   4. When a run finishes, your code assigns a `reward` to its Trajectory, indicating the performance of the LLM during that run.
 
-2. Once a batch of runs has completed, the Trajectories are grouped together and sent to server. Inference is blocked while training executes.
-   1. The server uses GRPO to train your model, starting from the most recently saved checkpoint (or an empty LoRA on the first iteration).
-   2. The server saves the newly trained LoRA in a local directory to be read from on the next training run. The new LoRA is also loaded into vLLM.
-   3. Inference is unblocked and the loop resumes at step 1.
+3. **Training**
+   1. After all runs have finished, Trajectories are grouped together and sent to the server. Inference is blocked while training executes.
+   2. The server trains your model using GRPO, initializing from the latest checkpoint (or an empty LoRA on the first iteration).
+   3. The server saves the newly trained LoRA to a local directory and loads it into vLLM.
+   4. Inference is unblocked and the loop resumes at step 1.
   
-This training loop runs until a specified number of inference and training iterations have been completed.
+This training loop runs until a specified number of inference and training iterations have completed.
 
 ## Getting Started
 
