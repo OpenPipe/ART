@@ -1,5 +1,6 @@
 import httpx
 import math
+from ..trajectories import Trajectory, TrajectoryGroup
 from mp_actors import move_to_child_process
 import numpy as np
 from openai import (
@@ -19,7 +20,7 @@ from ..config.model import get_model_config, ModelConfig
 from ..config.openai_server import OpenAIServerConfig
 from ..model import Model
 from .service import ModelService
-from ..types import BaseModel, Message, Trajectory, TuneConfig, Verbosity
+from ..types import BaseModel, Message, TrainConfig
 from ..utils import format_message
 from .pack import (
     packed_tensors_from_tokenized_results,
@@ -142,8 +143,7 @@ class LocalAPI:
     def _get_packed_tensors(
         self,
         model: Model,
-        trajectory_groups: list[list[Trajectory | BaseException]],
-        verbosity: Verbosity,
+        trajectory_groups: list[TrajectoryGroup],
         plot_tensors: bool,
     ) -> PackedTensors | None:
         if not model.base_model in self._tokenizers:
@@ -170,16 +170,16 @@ class LocalAPI:
             tokenized_results,
             sequence_length,
             pad_token_id=tokenizer.eos_token_id,  # type: ignore
-            verbosity=verbosity,
         )
         # If all logprobs are NaN then there is no suitable data for tuning
         if np.isnan(packed_tensors["logprobs"]).all():
-            if verbosity > 0:
-                print("All log probabilities are NaN.")
+            print(
+                "There are no assistant logprobs to train on. Did you forget to include at least one Choice in Trajectory.messages_and_choices?"
+            )
             return None
         if plot_tensors:
             plot_packed_tensors(packed_tensors)
-        elif verbosity > 0:
+        else:
             print(
                 f"Packed {len(tokenized_results)} trajectories into {packed_tensors['tokens'].shape[0]} sequences of length {packed_tensors['tokens'].shape[1]}"
             )
@@ -242,18 +242,18 @@ class LocalAPI:
     async def _log(
         self,
         model: Model,
-        trajectory_groups: list[list[Trajectory | BaseException]],
+        trajectory_groups: list[TrajectoryGroup],
         split: str = "val",
     ) -> None:
         # Save logs for each trajectory
         for i, group in enumerate(trajectory_groups):
-            for j, trajectory in enumerate(group):
+            for j, trajectory in enumerate(group.trajectories):
                 if isinstance(trajectory, BaseException):
                     continue
                 directory = f"{self._get_output_dir(model.name)}/trajectories/{split}/{self.__get_step(model):04d}"
                 os.makedirs(directory, exist_ok=True)
                 i_digits = len(str(len(trajectory_groups) - 1))
-                j_digits = len(str(len(group) - 1))
+                j_digits = len(str(len(group.trajectories) - 1))
                 with open(
                     f"{directory}/{i:0{i_digits}d}-{j:0{j_digits}d}.log", "w"
                 ) as f:
@@ -265,7 +265,7 @@ class LocalAPI:
 
         for group in trajectory_groups:
             group_reward_values = []
-            for trajectory in group:
+            for trajectory in group.trajectories:
                 if isinstance(trajectory, BaseException):
                     all_metrics["exception_rate"].append(1)
                     continue
@@ -321,30 +321,30 @@ class LocalAPI:
             formatted_messages.append(format_message(message))
         return header + "\n".join(formatted_messages)
 
-    async def _tune_model(
+    async def _train_model(
         self,
         model: Model,
-        trajectory_groups: list[list[Trajectory | BaseException]],
-        config: TuneConfig,
+        trajectory_groups: list[TrajectoryGroup],
+        config: TrainConfig,
     ) -> None:
         service = await self._get_service(model)
         await self._log(model, trajectory_groups, "train")
         packed_tensors = self._get_packed_tensors(
-            model,
-            trajectory_groups,
-            config.verbosity,
-            config.plot_tensors,
+            model, trajectory_groups, plot_tensors=False
         )
         if packed_tensors is None:
-            if config.verbosity > 0:
-                print("Skipping tuning as there is no suitable data.")
+            print(
+                "Skipping tuning as there is no suitable data. "
+                "This can happen when all the trajectories in the same group "
+                "have the same reward and thus no advantage to train on."
+            )
             return
         disk_packed_tensors = packed_tensors_to_dir(
             packed_tensors, f"{self._get_output_dir(model.name)}/tensors"
         )
         results: list[dict[str, float]] = []
         pbar = tqdm.tqdm(total=disk_packed_tensors["num_sequences"], desc="tune")
-        async for result in service.tune(disk_packed_tensors, config):
+        async for result in service.train(disk_packed_tensors, config):
             results.append(result)
             pbar.update(1)
             pbar.set_postfix(result)

@@ -17,8 +17,8 @@ if TYPE_CHECKING:
     from .state import ModelState
 
 
-class TuneInputs(PackedTensors):
-    config: types.TuneConfig
+class TrainInputs(PackedTensors):
+    config: types.TrainConfig
 
 
 @dataclass
@@ -67,8 +67,8 @@ class ModelService:
             self._openai_server_task.cancel()
             self._openai_server_task = None
 
-    async def tune(
-        self, disk_packed_tensors: DiskPackedTensors, config: types.TuneConfig
+    async def train(
+        self, disk_packed_tensors: DiskPackedTensors, config: types.TrainConfig
     ) -> AsyncIterator[dict[str, float]]:
         # Get the packed tensors from disk
         packed_tensors = packed_tensors_from_dir(**disk_packed_tensors)
@@ -90,7 +90,7 @@ class ModelService:
             for offset in range(0, packed_tensors["tokens"].shape[0]):
                 for _ in range(2 if warmup else 1):
                     self.state.inputs_queue.put_nowait(
-                        TuneInputs(
+                        TrainInputs(
                             **{
                                 k: (
                                     v[offset : offset + 1, :1024]

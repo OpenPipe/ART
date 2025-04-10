@@ -5,7 +5,7 @@ import random
 from transformers.tokenization_utils_base import PreTrainedTokenizerBase
 from typing import cast, Generator, TypedDict
 
-from ..types import Trajectory
+from ..trajectories import Trajectory
 
 
 @dataclass

@@ -1,4 +1,5 @@
-from ..types import Messages, Trajectory
+from ..trajectories import Trajectory
+from ..types import Messages
 
 
 def get_trajectory_messages(trajectory: Trajectory) -> Messages:

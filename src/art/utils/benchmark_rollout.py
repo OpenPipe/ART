@@ -1,7 +1,7 @@
 from typing import Callable, Coroutine, Any
 
 import art
-from art.types import Trajectory
+from art.trajectories import Trajectory
 from openai import AsyncOpenAI
 
 
@@ -15,7 +15,7 @@ async def benchmark_rollout(
         (rollout(client, model, i, False) for i in range(num_rollouts)),
         pbar_desc="Benchmarking rollout",
     )
-    
+
     trajectory_group_rewards = []
 
     for group in trajectory_groups:

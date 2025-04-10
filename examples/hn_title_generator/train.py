@@ -9,6 +9,7 @@ from transformers.models.auto.tokenization_auto import AutoTokenizer
 from typing import List, Dict, Any, Iterable
 from openpipe import AsyncOpenPipe
 from datetime import datetime
+import art.trajectories
 from utils import score_title, pull_data, cache, prompt_for_title
 from art.utils import iterate_dataset, limit_concurrency
 
@@ -274,7 +275,7 @@ async def main():
     print(f"Training data size: {len(train_data_list)}")
     print(f"Validation data size: {len(val_data_list)}")
 
-    # Get OpenAI Client from ART Model
+    # Get OpenAI Client for the ART Model
     openai_client = await model.openai_client()
 
     # Training Loop
@@ -320,13 +321,9 @@ async def main():
             )
             continue
 
-        await model.tune(
+        await model.train(
             valid_train_groups,
-            config=art.TuneConfig(
-                lr=LEARNING_RATE,
-                sequence_length=MAX_PROMPT_LENGTH + MAX_COMPLETION_LENGTH,
-                clip_epsilon=9001,
-            ),
+            config=art.TrainConfig(learning_rate=LEARNING_RATE),
         )
 
         if global_iteration > 0 and global_iteration % EVAL_STEPS == 0:

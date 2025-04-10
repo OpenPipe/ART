@@ -7,10 +7,10 @@ import torch
 from trl import GRPOTrainer
 from typing import cast, Callable, TYPE_CHECKING
 
-from ..types import TuneConfig
+from ..types import TrainConfig
 
 if TYPE_CHECKING:
-    from .service import TuneInputs
+    from .service import TrainInputs
 
 nest_asyncio.apply()
 
@@ -33,20 +33,20 @@ async def train(
 def get_compute_loss_fn(trainer: "GRPOTrainer") -> Callable[..., torch.Tensor]:
     def compute_loss(
         model: "PeftModel",
-        inputs: "TuneInputs",
+        inputs: "TrainInputs",
         return_outputs: bool = False,
         num_items_in_batch: int | None = None,
     ) -> torch.Tensor:
-        config: TuneConfig = inputs.pop("config")  # type: ignore
+        config: TrainConfig = inputs.pop("config")  # type: ignore
 
         if optimizer := trainer.optimizer:
             optimizer = getattr(optimizer, "optimizer", optimizer)
             if param_groups := getattr(optimizer, "param_groups"):
                 for param_group in param_groups:
-                    param_group["lr"] = config.lr * config.learning_rate_multiplier
-                    param_group["betas"] = config.betas
-                    if param_group.get("weight_decay"):
-                        param_group["weight_decay"] = config.weight_decay
+                    param_group["lr"] = config.learning_rate
+                    # param_group["betas"] = config.betas
+                    # if param_group.get("weight_decay"):
+                    #     param_group["weight_decay"] = config.weight_decay
 
         # Move tensors to the correct device
         inputs = {key: tensor.to(trainer.accelerator.device) for key, tensor in inputs.items()}  # type: ignore
@@ -91,7 +91,7 @@ def get_compute_loss_fn(trainer: "GRPOTrainer") -> Callable[..., torch.Tensor]:
             chunk_size=chunk_size,
             reference_logprobs=False,
         )
-        if config.beta > 0.0 or config.kl_coef > 0.0:
+        if config.beta > 0.0:
             ref_logprobs = calculate_logprobs(
                 autocast_dtype,
                 trainer,
@@ -122,8 +122,7 @@ def get_compute_loss_fn(trainer: "GRPOTrainer") -> Callable[..., torch.Tensor]:
         prob_ratio = torch.exp(new_logprobs - old_logprobs)
         policy_loss = -torch.min(
             prob_ratio * advantages,
-            torch.clip(prob_ratio, 1 - config.clip_epsilon, 1 + config.clip_epsilon)
-            * advantages,
+            torch.clip(prob_ratio, 1 - 0.2, 1 + 0.2) * advantages,
         )
         if ref_logprobs is not None:
             kl_div = (
@@ -139,11 +138,11 @@ def get_compute_loss_fn(trainer: "GRPOTrainer") -> Callable[..., torch.Tensor]:
         mean_policy_loss = policy_loss.sum() / (assistant_mask.sum() + 1e-6)
         mean_kl = kl_div.sum() / (assistant_mask.sum() + 1e-6)
 
-        trainer._metrics["lr"].append(config.lr)
+        trainer._metrics["learning_rate"].append(config.learning_rate)
         trainer._metrics["policy_loss"].append(mean_policy_loss.item())
-        if config.beta > 0.0 or config.kl_coef > 0.0:
+        if config.beta > 0.0:
             trainer._metrics["kl_div"].append(mean_kl.item())
-        return mean_policy_loss + (config.beta or config.kl_coef) * mean_kl
+        return mean_policy_loss + config.beta * mean_kl
 
     return compute_loss
 

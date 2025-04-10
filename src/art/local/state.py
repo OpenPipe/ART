@@ -21,7 +21,7 @@ from vllm.worker.multi_step_model_runner import MultiStepModelRunner
 from ..config.model import ModelConfig
 
 if TYPE_CHECKING:
-    from .service import TuneInputs
+    from .service import TrainInputs
 
 nest_asyncio.apply()
 
@@ -74,11 +74,11 @@ class ModelState:
             train_dataset=Dataset.from_list([{"prompt": ""} for _ in range(100_000)]),
             processing_class=self.tokenizer,
         )
-        self.inputs_queue = asyncio.Queue["TuneInputs"]()
+        self.inputs_queue = asyncio.Queue["TrainInputs"]()
 
         # Patch trainer _prepare_inputs()
         def _async_prepare_inputs(*_, **__) -> dict[str, torch.Tensor]:
-            async def get_inputs() -> "TuneInputs":
+            async def get_inputs() -> "TrainInputs":
                 return await self.inputs_queue.get()
 
             # Force otherwise synchronous _prepare_inputs() to yield
