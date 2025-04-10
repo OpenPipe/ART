@@ -17,14 +17,17 @@ async def gather_trajectory_groups(
     pbar_total_completion_tokens: bool = True,
     max_exceptions: int | float = 0,
 ) -> list[TrajectoryGroup]:
-    total = sum(getattr(g, "_num_trajectories", 1) for g in groups)
+    groups = list(groups)
     context = GatherContext(
-        pbar=tqdm.tqdm(desc=pbar_desc, total=total),
+        pbar=None,
         pbar_total_completion_tokens=pbar_total_completion_tokens,
         max_exceptions=max_exceptions,
     )
     with set_gather_context(context):
-        result_groups = await asyncio.gather(*[wrap_group_awaitable(g) for g in groups])
+        future = asyncio.gather(*[wrap_group_awaitable(g) for g in groups])
+        total = sum(getattr(g, "_num_trajectories", 1) for g in groups)
+        context.pbar = tqdm.tqdm(desc=pbar_desc, total=total)
+        result_groups = await future
     if context.pbar is not None:
         context.pbar.close()
     return [g for g in result_groups if g is not None]

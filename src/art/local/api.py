@@ -340,7 +340,7 @@ class LocalAPI:
             packed_tensors, f"{self._get_output_dir(model.name)}/tensors"
         )
         results: list[dict[str, float]] = []
-        pbar = tqdm.tqdm(total=disk_packed_tensors["num_sequences"], desc="tune")
+        pbar = tqdm.tqdm(total=disk_packed_tensors["num_sequences"], desc="train")
         async for result in service.train(disk_packed_tensors, config):
             results.append(result)
             pbar.update(1)

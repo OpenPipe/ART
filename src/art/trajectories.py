@@ -1,11 +1,18 @@
 import asyncio
 import pydantic
+import traceback
 from typing import Awaitable, cast, Iterable, Iterator, overload
 
 from .types import MessagesAndChoices
 
 
 MetadataValue = float | int | str | bool | None
+
+
+class PydanticException(pydantic.BaseModel):
+    type: str
+    message: str
+    traceback: str
 
 
 class Trajectory(pydantic.BaseModel):
@@ -18,7 +25,7 @@ class Trajectory(pydantic.BaseModel):
 class TrajectoryGroup(pydantic.BaseModel):
     trajectories: list[Trajectory]
     metadata: dict[str, MetadataValue] = {}
-    exceptions: list[BaseException] = []
+    exceptions: list[PydanticException] = []
 
     def __init__(
         self,
@@ -30,7 +37,16 @@ class TrajectoryGroup(pydantic.BaseModel):
         super().__init__(
             trajectories=list(trajectories),
             metadata=metadata,
-            exceptions=exceptions,
+            exceptions=[
+                PydanticException(
+                    type=str(type(e)),
+                    message=str(e),
+                    traceback="\n".join(
+                        traceback.format_exception(type(e), e, e.__traceback__)
+                    ),
+                )
+                for e in exceptions
+            ],
         )
 
     def __iter__(self) -> Iterator[Trajectory]:
@@ -69,8 +85,8 @@ class TrajectoryGroup(pydantic.BaseModel):
             group = super().__new__(cls)
             group.__init__(
                 trajectories=cast(list[Trajectory], ts),
-                exceptions=exceptions,
                 metadata=metadata,
+                exceptions=exceptions,
             )
             return group
         else:
@@ -100,6 +116,13 @@ class TrajectoryGroup(pydantic.BaseModel):
                     metadata=metadata,
                 )
 
+            class CoroutineWithMetadata:
+                def __init__(self, coro, num_trajectories):
+                    self.coro = coro
+                    self._num_trajectories = num_trajectories
+
+                def __await__(self):
+                    return self.coro.__await__()
+
             coro = _(exceptions.copy())
-            setattr(coro, "_num_trajectories", len(ts))
-            return coro
+            return CoroutineWithMetadata(coro, len(ts))
