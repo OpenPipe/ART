@@ -1,4 +1,4 @@
-from art.types import Message
+from ..types import Message
 
 
 def format_message(message: Message) -> str:

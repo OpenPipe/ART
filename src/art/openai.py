@@ -13,7 +13,7 @@ from openai.types.chat.chat_completion_message_tool_call import (
 )
 from typing import Any, Callable
 
-from .gather_trajectories import get_groups_context
+from .gather import get_gather_context
 from .utils import format_message
 
 
@@ -21,7 +21,7 @@ def patch_openai(client: openai.AsyncOpenAI) -> openai.AsyncOpenAI:
     create = client.chat.completions.create
 
     def report_usage(chat_completion: ChatCompletion) -> None:
-        context = get_groups_context()
+        context = get_gather_context()
         if chat_completion.usage is not None:
             context.metric_sums["prompt_tokens"] += chat_completion.usage.prompt_tokens
             context.metric_divisors["prompt_tokens"] += 1
@@ -29,7 +29,7 @@ def patch_openai(client: openai.AsyncOpenAI) -> openai.AsyncOpenAI:
     async def create_patched(*args: Any, **kwargs: Any) -> ChatCompletion | AsyncStream:
         kwargs["logprobs"] = True
         return_stream = kwargs.get("stream", False)
-        context = get_groups_context()
+        context = get_gather_context()
         if context.pbar_total_completion_tokens:
             kwargs["stream"] = True
             kwargs["stream_options"] = {"include_usage": True}
@@ -42,7 +42,7 @@ def patch_openai(client: openai.AsyncOpenAI) -> openai.AsyncOpenAI:
             return return_value
 
         def on_chunk(chunk: ChatCompletionChunk, _: ChatCompletion) -> None:
-            context = get_groups_context()
+            context = get_gather_context()
             if context.pbar_total_completion_tokens:
                 context.metric_sums["total_completion_tokens"] += sum(
                     len(choice.logprobs.content or choice.logprobs.refusal or [])

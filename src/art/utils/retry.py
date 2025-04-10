@@ -4,12 +4,12 @@ import functools
 import logging
 import inspect
 from typing import (
+    Any,
     Callable,
+    Coroutine,
     TypeVar,
     Optional,
-    Any,
     Union,
-    Coroutine,
 )
 
 T = TypeVar("T")
@@ -102,4 +102,3 @@ def retry(
         return async_wrapper if is_coroutine else sync_wrapper
 
     return decorator
-

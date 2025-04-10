@@ -1,6 +1,5 @@
 import httpx
 import math
-from ..trajectories import Trajectory, TrajectoryGroup
 from mp_actors import move_to_child_process
 import numpy as np
 from openai import (
@@ -20,6 +19,7 @@ from ..config.model import get_model_config, ModelConfig
 from ..config.openai_server import OpenAIServerConfig
 from ..model import Model
 from .service import ModelService
+from ..trajectories import Trajectory, TrajectoryGroup
 from ..types import BaseModel, Message, TrainConfig
 from ..utils import format_message
 from .pack import (
@@ -154,10 +154,7 @@ class LocalAPI:
         tokenized_results = list(
             tokenize_trajectory_groups(
                 tokenizer,
-                [
-                    [t for t in g if isinstance(t, Trajectory)]
-                    for g in trajectory_groups
-                ],
+                trajectory_groups,
             )
         )
         if not tokenized_results:
@@ -247,13 +244,13 @@ class LocalAPI:
     ) -> None:
         # Save logs for each trajectory
         for i, group in enumerate(trajectory_groups):
-            for j, trajectory in enumerate(group.trajectories):
+            for j, trajectory in enumerate(group):
                 if isinstance(trajectory, BaseException):
                     continue
                 directory = f"{self._get_output_dir(model.name)}/trajectories/{split}/{self.__get_step(model):04d}"
                 os.makedirs(directory, exist_ok=True)
                 i_digits = len(str(len(trajectory_groups) - 1))
-                j_digits = len(str(len(group.trajectories) - 1))
+                j_digits = len(str(len(group) - 1))
                 with open(
                     f"{directory}/{i:0{i_digits}d}-{j:0{j_digits}d}.log", "w"
                 ) as f:
@@ -265,7 +262,7 @@ class LocalAPI:
 
         for group in trajectory_groups:
             group_reward_values = []
-            for trajectory in group.trajectories:
+            for trajectory in group:
                 if isinstance(trajectory, BaseException):
                     all_metrics["exception_rate"].append(1)
                     continue

@@ -5,12 +5,12 @@ from collections import Counter
 from dataclasses import dataclass, field
 from openai.types.chat.chat_completion import Choice
 from tqdm import auto as tqdm
-from typing import Awaitable, Iterable, Iterator
+from typing import Awaitable, Iterable, Iterator, Literal, overload
 
 from .trajectories import Trajectory, TrajectoryGroup
 
 
-async def gather_trajectories(
+async def gather_trajectory_groups(
     groups: Iterable[Awaitable[TrajectoryGroup]],
     *,
     pbar_desc: str | None = None,
@@ -18,30 +18,69 @@ async def gather_trajectories(
     max_exceptions: int | float = 0,
 ) -> list[TrajectoryGroup]:
     total = sum(getattr(g, "_num_trajectories", 1) for g in groups)
-    context = GroupsContext(
+    context = GatherContext(
         pbar=tqdm.tqdm(desc=pbar_desc, total=total),
         pbar_total_completion_tokens=pbar_total_completion_tokens,
         max_exceptions=max_exceptions,
     )
-    with set_groups_context(context):
-        result_groups = await asyncio.gather(*[wrap_awaitable(g) for g in groups])
+    with set_gather_context(context):
+        result_groups = await asyncio.gather(*[wrap_group_awaitable(g) for g in groups])
     if context.pbar is not None:
         context.pbar.close()
     return [g for g in result_groups if g is not None]
 
 
-async def wrap_awaitable(
+@overload
+async def gather_trajectories(
+    trajectories: Iterable[Awaitable[Trajectory]],
+    *,
+    pbar_desc: str | None = None,
+    pbar_total_completion_tokens: bool = True,
+    max_exceptions: Literal[0] = 0,
+) -> list[Trajectory]: ...
+
+
+@overload
+async def gather_trajectories(
+    trajectories: Iterable[Awaitable[Trajectory]],
+    *,
+    pbar_desc: str | None = None,
+    pbar_total_completion_tokens: bool = True,
+    max_exceptions: int | float,
+) -> list[Trajectory | BaseException]: ...
+
+
+async def gather_trajectories(
+    trajectories: Iterable[Awaitable[Trajectory]],
+    *,
+    pbar_desc: str | None = None,
+    pbar_total_completion_tokens: bool = True,
+    max_exceptions: int | float = 0,
+) -> list[Trajectory] | list[Trajectory | BaseException]:
+    trajectories = list(trajectories)
+    context = GatherContext(
+        pbar=tqdm.tqdm(desc=pbar_desc, total=len(trajectories)),
+        pbar_total_completion_tokens=pbar_total_completion_tokens,
+        max_exceptions=max_exceptions,
+    )
+    with set_gather_context(context):
+        return await asyncio.gather(
+            *[wrap_trajectory_awaitable(t) for t in trajectories]
+        )
+
+
+async def wrap_group_awaitable(
     awaitable: Awaitable[TrajectoryGroup],
 ) -> TrajectoryGroup | None:
     if hasattr(awaitable, "_num_trajectories"):
         return await awaitable
-    context = get_groups_context()
+    context = get_gather_context()
     try:
-        result = await awaitable
-        for trajectory in result.trajectories:
+        group = await awaitable
+        for trajectory in group:
             record_metrics(context, trajectory)
-        context.update_pbar(n=len(result.trajectories))
-        return result
+        context.update_pbar(n=len(group))
+        return group
     except BaseException:
         context.metric_sums["exceptions"] += 1
         context.update_pbar(n=0)
@@ -49,7 +88,25 @@ async def wrap_awaitable(
             raise
 
 
-def record_metrics(context: "GroupsContext", trajectory: Trajectory) -> None:
+async def wrap_trajectory_awaitable(
+    awaitable: Awaitable[Trajectory],
+) -> Trajectory | BaseException:
+    context = get_gather_context()
+    try:
+        result = await awaitable
+        record_metrics(context, result)
+        context.update_pbar(n=1)
+        return result
+    except BaseException as e:
+        context.metric_sums["exceptions"] += 1
+        context.update_pbar(n=0)
+        if context.too_many_exceptions():
+            raise
+        else:
+            return e
+
+
+def record_metrics(context: "GatherContext", trajectory: Trajectory) -> None:
     logprobs = [
         message_or_choice.logprobs
         for message_or_choice in trajectory.messages_and_choices
@@ -67,7 +124,7 @@ def record_metrics(context: "GroupsContext", trajectory: Trajectory) -> None:
 
 
 @dataclass
-class GroupsContext:
+class GatherContext:
     pbar: tqdm.tqdm | None = None
     metric_sums: Counter[str] = field(default_factory=Counter)
     metric_divisors: Counter[str] = field(default_factory=Counter)
@@ -104,17 +161,17 @@ class GroupsContext:
         return True
 
 
-groups_context_var = contextvars.ContextVar("groups_context", default=GroupsContext())
+gather_context_var = contextvars.ContextVar("gather_context", default=GatherContext())
 
 
 @contextlib.contextmanager
-def set_groups_context(context: GroupsContext) -> Iterator[None]:
-    token = groups_context_var.set(context)
+def set_gather_context(context: GatherContext) -> Iterator[None]:
+    token = gather_context_var.set(context)
     try:
         yield
     finally:
-        groups_context_var.reset(token)
+        gather_context_var.reset(token)
 
 
-def get_groups_context() -> GroupsContext:
-    return groups_context_var.get()
+def get_gather_context() -> GatherContext:
+    return gather_context_var.get()

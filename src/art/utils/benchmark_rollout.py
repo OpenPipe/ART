@@ -1,8 +1,8 @@
-from typing import Callable, Coroutine, Any
-
-import art
-from art.trajectories import Trajectory
 from openai import AsyncOpenAI
+from typing import Any, Callable, Coroutine
+
+from ..gather import gather_trajectory_groups
+from ..trajectories import Trajectory
 
 
 async def benchmark_rollout(
@@ -11,7 +11,7 @@ async def benchmark_rollout(
     num_rollouts: int,
     rollout: Callable[[AsyncOpenAI, int, bool], Coroutine[Any, Any, Trajectory]],
 ) -> float:
-    trajectory_groups = await art.gather_trajectories(
+    trajectory_groups = await gather_trajectory_groups(
         (rollout(client, model, i, False) for i in range(num_rollouts)),
         pbar_desc="Benchmarking rollout",
     )

@@ -1,6 +1,6 @@
 from dataclasses import dataclass
 from openai import AsyncOpenAI
-from typing import Iterable, TYPE_CHECKING
+from typing import cast, Iterable, TYPE_CHECKING
 
 from .config.model import ModelConfig
 from .config.openai_server import OpenAIServerConfig
@@ -67,9 +67,15 @@ class Model:
             trajectories: A batch of trajectories or trajectory groups.
             split: The evaluation's split. Defaults to "val".
         """
+        if any(isinstance(t, Trajectory) for t in trajectories):
+            trajectory_groups = [
+                TrajectoryGroup(cast(Iterable[Trajectory], trajectories))
+            ]
+        else:
+            trajectory_groups = cast(list[TrajectoryGroup], list(trajectories))
         await self.api._log(
             self,
-            list(trajectories),
+            trajectory_groups,
             split,
         )
 

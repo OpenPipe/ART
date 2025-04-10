@@ -1,6 +1,6 @@
 import asyncio
 import pydantic
-from typing import Awaitable, cast, Iterable, overload
+from typing import Awaitable, cast, Iterable, Iterator, overload
 
 from .types import MessagesAndChoices
 
@@ -32,6 +32,12 @@ class TrajectoryGroup(pydantic.BaseModel):
             metadata=metadata,
             exceptions=exceptions,
         )
+
+    def __iter__(self) -> Iterator[Trajectory]:
+        return iter(self.trajectories)
+
+    def __len__(self) -> int:
+        return len(self.trajectories)
 
     @overload
     def __new__(
@@ -70,9 +76,9 @@ class TrajectoryGroup(pydantic.BaseModel):
         else:
 
             async def _(exceptions: list[BaseException]):
-                from .gather_trajectories import get_groups_context, record_metrics
+                from .gather import get_gather_context, record_metrics
 
-                context = get_groups_context()
+                context = get_gather_context()
                 trajectories = []
                 for future in asyncio.as_completed(
                     cast(list[Awaitable[Trajectory]], ts)

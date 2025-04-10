@@ -5,7 +5,7 @@ import random
 from transformers.tokenization_utils_base import PreTrainedTokenizerBase
 from typing import cast, Generator, TypedDict
 
-from ..trajectories import Trajectory
+from ..trajectories import Trajectory, TrajectoryGroup
 
 
 @dataclass
@@ -47,7 +47,7 @@ class TokenizedResultDict(TypedDict):
 
 def tokenize_trajectory_groups(
     tokenizer: "PreTrainedTokenizerBase",
-    trajectory_groups: list[list[Trajectory]],
+    trajectory_groups: list[TrajectoryGroup],
 ) -> Generator["TokenizedResult", None, None]:
     for group in trajectory_groups:
         if not group:

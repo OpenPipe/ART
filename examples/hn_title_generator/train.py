@@ -9,7 +9,6 @@ from transformers.models.auto.tokenization_auto import AutoTokenizer
 from typing import List, Dict, Any, Iterable
 from openpipe import AsyncOpenPipe
 from datetime import datetime
-import art.trajectories
 from utils import score_title, pull_data, cache, prompt_for_title
 from art.utils import iterate_dataset, limit_concurrency
 
@@ -291,9 +290,9 @@ async def main():
     )
 
     for batch_inputs, epoch, global_iteration, epoch_iteration in data_iterator:
-        train_groups = await art.gather_trajectories(
+        train_groups = await art.gather_trajectory_groups(
             (
-                (
+                art.TrajectoryGroup(
                     rollout(
                         openai_client,
                         op_client,
@@ -331,21 +330,19 @@ async def main():
 
             print(f"Running validation rollouts on {len(val_data_list)} samples...")
             val_trajectories = await art.gather_trajectories(
-                [
-                    [
-                        rollout(
-                            openai_client,
-                            op_client,
-                            RUN_NAME,
-                            item["prompt"],
-                            item["row"],
-                            global_iteration,
-                            epoch,
-                        )
-                        for _ in range(1)
-                    ]
+                (
+                    rollout(
+                        openai_client,
+                        op_client,
+                        RUN_NAME,
+                        item["prompt"],
+                        item["row"],
+                        global_iteration,
+                        epoch,
+                    )
                     for item in val_data_list
-                ]
+                ),
+                pbar_desc="val",
             )
 
             await model.log(val_trajectories)
