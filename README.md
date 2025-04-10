@@ -1,9 +1,8 @@
-
 <div align="center">
 
 
   <a href="https://openpipe.ai"><picture>
-    <img alt="ART header" src="https://github.com/user-attachments/assets/6da7a213-c783-4a59-809c-681781957c58" width="100%">
+    <img alt="ART header" src="https://github.com/user-attachments/assets/d5441604-59fe-415d-a90a-9e9e2cbd5c2c" width="100%">
   </picture></a>
 
 <a href="https://colab.research.google.com/github/OpenPipe/ART/blob/main/examples/tic_tac_toe/tic-tac-toe.ipynb"><img src="https://github.com/user-attachments/assets/8d655cbd-6498-4ef0-a4bb-c6c353c63c0e" height="48"></a>
