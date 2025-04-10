@@ -1,7 +1,8 @@
 from typing import Callable, Coroutine, Any
 
 import art
-from art.types import Trajectory
+
+from ..trajectories import Trajectory, TrajectoryGroup
 
 
 async def benchmark_rollout(
@@ -9,8 +10,8 @@ async def benchmark_rollout(
     num_rollouts: int,
     rollout: Callable[[str, int, bool], Coroutine[Any, Any, Trajectory]],
 ) -> float:
-    trajectory_groups = await art.gather_trajectories(
-        (rollout(model, i, False) for i in range(num_rollouts)),
+    trajectory_groups = await art.gather_trajectory_groups(
+        [TrajectoryGroup(rollout(model, i, False) for i in range(num_rollouts))],
         pbar_desc="Benchmarking rollout",
     )
 
