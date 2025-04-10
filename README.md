@@ -1,4 +1,20 @@
-![image](https://github.com/user-attachments/assets/9c469dd7-2541-4541-977b-58265bd95baa)
+
+<div align="center">
+
+
+  <a href="https://openpipe.ai"><picture>
+    <img alt="ART header" src="https://github.com/user-attachments/assets/9c469dd7-2541-4541-977b-58265bd95baa" height="400" style="max-width: 100%;">
+  </picture></a>
+
+<a href="https://colab.research.google.com/github/OpenPipe/ART/blob/main/examples/tic_tac_toe/tic-tac-toe.ipynb"><img src="https://github.com/user-attachments/assets/8d655cbd-6498-4ef0-a4bb-c6c353c63c0e" height="48"></a>
+<a href="https://discord.gg/F6MxpujP"><img src="https://github.com/user-attachments/assets/9d257702-a4a5-4824-901a-5155aa032a27" height="48"></a>
+<a href="https://docs.openpipe.ai"><img src="https://github.com/user-attachments/assets/33acfb02-6920-4636-b66f-38dacdbe59ca" height="48"></a>
+
+### Train free-range RL agents with minimal code changes and maximal performance!
+
+![](https://github.com/user-attachments/assets/8296d076-508e-4689-ab13-f55599baced3)
+
+</div>
 
 # The OpenPipe Agent Reinforcement Trainer (ART)
 
