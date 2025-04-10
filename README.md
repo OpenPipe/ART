@@ -33,7 +33,7 @@ ART's functionality is divided into a **client** and a **server**. The OpenAI-co
    4. When a rollout finishes, your code assigns a `reward` to its Trajectory, indicating the performance of the LLM.
 
 3. **Training**
-   1. When each rollouts has finished, Trajectories are grouped together and sent to the server. Inference is blocked while training executes.
+   1. When each rollout has finished, Trajectories are grouped and sent to the server. Inference is blocked while training executes.
    2. The server trains your model using GRPO, initializing from the latest checkpoint (or an empty LoRA on the first iteration).
    3. The server saves the newly trained LoRA to a local directory and loads it into vLLM.
    4. Inference is unblocked and the loop resumes at step 1.
