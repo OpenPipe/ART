@@ -1,0 +1,21 @@
+---
+title: "🔁 ART Training Loop"
+sidebarTitle: "🔁 Training Loop"
+---
+
+ART's functionality is divided into a **client** and a **server**. The OpenAI-compatible client is responsible for interfacing between ART and your codebase. Using the client, you can pass messages and get completions from your LLM as it improves. The server runs independently on any machine with a GPU. It abstracts away the complexity of the inference and training portions of the RL loop while allowing for some custom configuration. An outline of the training loop is shown below:
+
+1. **Inference**
+
+   1. Your code uses the ART client to perform an agentic workflow (usually executing several rollouts in parallel to gather data faster).
+   2. Completion requests are routed to the ART server, which runs the model's latest LoRA in vLLM.
+   3. As the agent executes, each `system`, `user`, and `assistant` message is stored in a Trajectory.
+   4. When a rollout finishes, your code assigns a `reward` to its Trajectory, indicating the performance of the LLM.
+
+2. **Training**
+   1. When each rollout has finished, Trajectories are grouped and sent to the server. Inference is blocked while training executes.
+   2. The server trains your model using GRPO, initializing from the latest checkpoint (or an empty LoRA on the first iteration).
+   3. The server saves the newly trained LoRA to a local directory and loads it into vLLM.
+   4. Inference is unblocked and the loop resumes at step 1.
+
+This training loop runs until a specified number of inference and training iterations have completed.

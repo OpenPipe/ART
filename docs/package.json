@@ -1,0 +1,17 @@
+{
+  "name": "docs",
+  "version": "1.0.0",
+  "description": "",
+  "main": "index.js",
+  "scripts": {
+    "dev": "mintlify dev --port 3001",
+    "build": "mintlify build",
+    "generate:routes": "npx @mintlify/scraping@latest openapi-file ./openapi.json --outDir ./api-reference"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "dependencies": {
+    "mintlify": "^4.0.433"
+  }
+}

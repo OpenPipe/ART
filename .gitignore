@@ -8,3 +8,4 @@ shared_cache.db
 streaming-chat-completions/
 unsloth_compiled_cache/
 wandb/
+docs/node_modules/

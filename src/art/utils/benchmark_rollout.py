@@ -2,17 +2,15 @@ from typing import Callable, Coroutine, Any
 
 import art
 from art.types import Trajectory
-from openai import AsyncOpenAI
 
 
 async def benchmark_rollout(
-    client: AsyncOpenAI,
     model: str,
     num_rollouts: int,
-    rollout: Callable[[AsyncOpenAI, str, int, bool], Coroutine[Any, Any, Trajectory]],
+    rollout: Callable[[str, int, bool], Coroutine[Any, Any, Trajectory]],
 ) -> float:
     trajectory_groups = await art.gather_trajectories(
-        (rollout(client, model, i, False) for i in range(num_rollouts)),
+        (rollout(model, i, False) for i in range(num_rollouts)),
         pbar_desc="Benchmarking rollout",
     )
 

@@ -1,0 +1,51 @@
+{
+  "name": "ART",
+  "description": "Train LLMs to be better agents using RL",
+  "theme": "maple",
+  "logo": {
+    "light": "/images/site-assets/logo/light.svg",
+    "dark": "/images/site-assets/logo/dark.svg"
+  },
+  "favicon": "/images/site-assets/favicon.webp",
+  "colors": {
+    "primary": "#FF5733",
+    "light": "#FF5733",
+    "dark": "#FF5733"
+  },
+  "modeToggle": {
+    "default": "light"
+  },
+  "topbarCtaButton": {
+    "name": "Subscribe",
+    "url": "https://openpipe.ai"
+  },
+  "anchors": [],
+  "navigation": {
+    "pages": [
+      {
+        "group": "Getting Started",
+        "pages": [
+          "getting-started/introduction",
+          "getting-started/overview",
+          "getting-started/notebooks",
+          "getting-started/quick-start"
+        ]
+      },
+      {
+        "group": "Fundamentals",
+        "pages": [
+          "fundamentals/training-loop",
+          "fundamentals/art-client",
+          "fundamentals/art-server"
+        ]
+      }
+    ]
+  },
+  "topbarLinks": [],
+  "footerSocials": {
+    "twitter": "https://twitter.com/OpenPipeAI",
+    "linkedin": "https://www.linkedin.com/company/openpipe/about/",
+    "bluesky": "https://bsky.app/profile/openpipe.bsky.social",
+    "github": "https://github.com/openpipe/ART"
+  }
+}

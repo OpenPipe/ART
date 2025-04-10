@@ -1,0 +1,64 @@
+---
+title: "⚡️ Quick Start"
+description: "Get started with OpenPipe in a few quick steps."
+---
+
+## Step 1: Create Your OpenPipe Account
+
+If you don't already have one, create an account with OpenPipe at https://app.openpipe.ai/. You can sign up with GitHub, so you don't need to remember an extra password.
+
+## Step 2: Find Your Project API Key
+
+In order to capture your calls and fine-tune a model on them, we need an API key to authenticate you and determine which project to store your logs under.
+
+<Note>
+  When you created your account, a project was automatically configured for you
+  as well. Find its API key at https://app.openpipe.ai/settings.
+</Note>
+
+## Step 3: Record Training Data (Optional)
+
+If you don't have any training data, you can record it by integrating the OpenPipe SDK or using the OpenPipe Proxy. If you already have a dataset, you can skip this step!
+
+<CardGroup cols={2}>
+  <Card
+    title="Installing the SDK"
+    icon="code"
+    iconType="duotone"
+    href="/getting-started/openpipe-sdk"
+  ></Card>
+  <Card
+    title="Using the OpenPipe Proxy"
+    icon="layer-group"
+    href="/features/request-logs/logging-requests#proxy"
+  ></Card>
+</CardGroup>
+
+## Step 4: Prepare a Dataset
+
+Datasets are the core of OpenPipe. They store your training data, and allow you to fine-tune and evaluate models on it. To learn more about datasets, check out the [Datasets](/features/datasets/overview) page.
+
+Datasets can be populated in two ways:
+
+1. [Uploading external data](/features/datasets/uploading-data)
+2. [Importing request logs](/features/datasets/importing-logs)
+
+If you already have a dataset, we recommend uploading it as a starting point. Otherwise, make sure you set up request logging in step 3!
+
+## Step 5: Fine Tune a Model
+
+Once your dataset has been created and populated, you can fine-tune models on it. Follow the [fine-tuning quickstart](/features/fine-tuning/quick-start) guide to kick off your first fine-tuning run.
+
+<Frame>![](/images/features/fine-tuning/fine-tune-modal.png)</Frame>
+
+We recommend training several models of varying sizes and configurations to determine the best one for your use case. If you have questions on this step, please reach out to us at [support@openpipe.ai](mailto:support@openpipe.ai)!
+
+## Step 6: Evaluate Your Model
+
+Once your model (or models) have been fine-tuned, you can evaluate them. To learn more about evaluating models, check out the [Evaluations](/features/evaluations/overview) page.
+
+## Step 7: Deploy Your Model
+
+By default, your model will be automatically hosted on OpenPipe's cloud infrastructure. Additionally, you can export and deploy any of our open-weight models on your own cloud.
+
+Good luck! If you have any questions, don't hesitate to reach out!
