@@ -25,19 +25,19 @@ TODO: Add notebooks
 
 ## Architecture Overview
 
-ART's functionality is divided into two parts, a client and a server. The OpenAI-compatible client is responsible for interfacing between ART and your codebase. Using the client, you can pass messages and get completions from your LLM as it improves. The server can run separately on any machine with a GPU. It abstracts away the complexity of the inference and training portions of the RL loop while allowing for some custom configuration. An outline of the training loop is shown below:
+ART's functionality is divided into a **client** and a **server**. The OpenAI-compatible client is responsible for interfacing between ART and your codebase. Using the client, you can pass messages and get completions from your LLM as it improves. The server runs independently on any machine with a GPU. It abstracts away the complexity of the inference and training portions of the RL loop while allowing for some custom configuration. An outline of the training loop is shown below:
 
-1. Your code uses the ART client to execute agentic workflows (usually several in parallel).
+1. Your code uses an ART client to perform agentic workflows (usually several in parallel).
    1. As the agent executes and the LLM generates completions, each `system`, `user`, and `assistant` message is stored in a Trajectory.
-   2. Completion requests are routed to the ART server, which runs the most recently trained LoRA on vLLM.
-   3. After a run finishes, your code assigns a `reward` to the Trajectory, which indicates the overall performance of the LLM during that run.
+   2. Completion requests are routed to the ART server, which runs the most recently trained LoRA on vLLM and returns responses to the client.
+   3. After a run finishes, your code assigns a `reward` to the Trajectory, which should indicate the overall performance of the LLM during that run.
 
-2. After a batch of runs completes, Trajectories are grouped together and sent to server. Inference is blocked while training executes.
-   1. The server uses GRPO to train your model, starting from the most recently trained checkpoint (or an empty LoRA on the first iteration).
-   2. The server saves the LoRA in a local directory to be read from on the next training run.
+2. Once a batch of runs has completed, the Trajectories are grouped together and sent to server. Inference is blocked while training executes.
+   1. The server uses GRPO to train your model, starting from the most recently saved checkpoint (or an empty LoRA on the first iteration).
+   2. The server saves the newly trained LoRA in a local directory to be read from on the next training run. The new LoRA is also loaded into vLLM.
    3. Inference is unblocked and the loop resumes at step 1.
   
-This training loop runs until a specified number of inference and training steps have been completed.
+This training loop runs until a specified number of inference and training iterations have been completed.
 
 ## Getting Started
 
