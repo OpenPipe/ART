@@ -67,11 +67,12 @@ class ModelState:
         )
         self.lora_model = cast(peft.tuners.lora.LoraModel, self.peft_model.base_model)
         # Initialize trainer
+        data = {"prompt": ""}
         self.trainer = GRPOTrainer(
             model=self.peft_model,  # type: ignore
             reward_funcs=[],
             args=GRPOConfig(**config.get("trainer_args", {})),
-            train_dataset=Dataset.from_list([{"prompt": ""} for _ in range(100_000)]),
+            train_dataset=Dataset.from_list([data for _ in range(10_000_000)]),
             processing_class=self.tokenizer,
         )
         self.inputs_queue = asyncio.Queue["TrainInputs"]()

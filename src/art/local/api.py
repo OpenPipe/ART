@@ -351,7 +351,7 @@ class LocalAPI:
             run = wandb.init(
                 project=model.project,
                 name=model.id,
-                id=f"{model.project}/{model.id}",
+                id=model.id,
                 resume="allow",
             )
             self._wandb_runs[model.id] = run
