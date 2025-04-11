@@ -4,7 +4,7 @@ from .. import types
 
 
 def get_openai_server_config(
-    model_id: str,
+    model_name: str,
     base_model: types.BaseModel,
     log_file: str,
     lora_path: str,
@@ -15,7 +15,7 @@ def get_openai_server_config(
     log_file = config.get("log_file", log_file)
     server_args = ServerArgs(
         api_key="default",
-        lora_modules=[f'{{"name": "{model_id}", "path": "{lora_path}"}}'],
+        lora_modules=[f'{{"name": "{model_name}", "path": "{lora_path}"}}'],
         return_tokens_as_token_ids=True,
         enable_auto_tool_choice=True,
         tool_call_parser="hermes",

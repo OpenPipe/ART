@@ -25,7 +25,7 @@ class TrainInputs(PackedTensors):
 class ModelService:
     host: str
     port: int
-    model_id: str
+    model_name: str
     base_model: types.BaseModel
     config: ModelConfig
     output_dir: str
@@ -53,7 +53,7 @@ class ModelService:
         self._openai_server_task = await openai_server_task(
             state=self.state.vllm,
             config=get_openai_server_config(
-                model_id=self.model_id,
+                model_name=self.model_name,
                 base_model=self.base_model,
                 log_file=f"{self.output_dir}/logs/vllm.log",
                 lora_path=lora_path,
@@ -142,7 +142,7 @@ class ModelService:
             load_tensors=True,
         )  # type: ignore
         lora_request.lora_int_id = 1
-        lora_request.lora_name = self.model_id
+        lora_request.lora_name = self.model_name
         lora_request.lora_path = lora_path
         self.state.vllm.async_engine.engine.remove_lora(1)
         self.state.vllm.async_engine.engine.add_lora(lora_request)  # type: ignore

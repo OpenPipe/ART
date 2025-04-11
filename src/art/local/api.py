@@ -60,7 +60,7 @@ class LocalAPI:
 
     async def get_or_create_model(
         self,
-        id: str,
+        name: str,
         project: str,
         base_model: BaseModel,
         _config: ModelConfig | None = None,
@@ -69,7 +69,7 @@ class LocalAPI:
         Retrieve an existing model or create a new one.
 
         Args:
-            id: A project-unique identifier for the model.
+            name: A project-unique identifier for the model.
             project: The project to save the model to.
             base_model: The base model to start training from.
             _config: A ModelConfig object. May be subject to breaking changes at any time.
@@ -78,25 +78,30 @@ class LocalAPI:
         Returns:
             Model: A model instance.
         """
-        os.makedirs(self._get_output_dir(id), exist_ok=True)
-        return Model(
-            id=id, project=project, base_model=base_model, _api=self, _config=_config
+        model = Model(
+            name=name,
+            project=project,
+            base_model=base_model,
+            _api=self,
+            _config=_config,
         )
+        os.makedirs(self._get_output_dir(model), exist_ok=True)
+        return model
 
     async def _get_service(self, model: Model) -> ModelService:
-        if model.id not in self._services:
+        if model.name not in self._services:
             config = get_model_config(
                 base_model=model.base_model,
-                output_dir=self._get_output_dir(model.id),
+                output_dir=self._get_output_dir(model),
                 config=model._config,
             )
-            self._services[model.id] = ModelService(
+            self._services[model.name] = ModelService(
                 host="localhost",
                 port=8089 + len(self._services),
-                model_id=model.id,
+                model_name=model.name,
                 base_model=model.base_model,
                 config=config,
-                output_dir=self._get_output_dir(model.id),
+                output_dir=self._get_output_dir(model),
             )
             if not self._in_process:
                 # Kill all "model-service" processes to free up GPU memory
@@ -108,11 +113,11 @@ class LocalAPI:
                 # When moving the service to a child process, import unsloth
                 # early to maximize optimizations
                 os.environ["IMPORT_UNSLOTH"] = "1"
-                self._services[model.id] = move_to_child_process(
-                    self._services[model.id],
+                self._services[model.name] = move_to_child_process(
+                    self._services[model.name],
                     process_name="model-service",
                 )
-        return self._services[model.id]
+        return self._services[model.name]
 
     def _get_packed_tensors(
         self,
@@ -156,20 +161,20 @@ class LocalAPI:
             )
         return packed_tensors
 
-    def _get_output_dir(self, model_id: str) -> str:
-        return f"{self._path}/models/{model_id}"
+    def _get_output_dir(self, model: Model) -> str:
+        return f"{self._path}/{model.project}/models/{model.name}"
 
     async def _get_step(self, model: Model) -> int:
         return self.__get_step(model)
 
     def __get_step(self, model: Model) -> int:
-        return get_step(self._get_output_dir(model.id))
+        return get_step(self._get_output_dir(model))
 
     async def _delete_checkpoints(
         self, model: Model, benchmark: str, benchmark_smoothing: float = 1.0
     ) -> None:
         run = self._get_wandb_run(model)
-        output_dir = self._get_output_dir(model.id)
+        output_dir = self._get_output_dir(model)
         # Keep the latest step
         steps_to_keep = [get_step(output_dir)]
         try:
@@ -221,7 +226,7 @@ class LocalAPI:
             for j, trajectory in enumerate(group):
                 if isinstance(trajectory, BaseException):
                     continue
-                directory = f"{self._get_output_dir(model.id)}/trajectories/{split}/{self.__get_step(model):04d}"
+                directory = f"{self._get_output_dir(model)}/trajectories/{split}/{self.__get_step(model):04d}"
                 os.makedirs(directory, exist_ok=True)
                 i_digits = len(str(len(trajectory_groups) - 1))
                 j_digits = len(str(len(group) - 1))
@@ -311,7 +316,7 @@ class LocalAPI:
             )
             return
         disk_packed_tensors = packed_tensors_to_dir(
-            packed_tensors, f"{self._get_output_dir(model.id)}/tensors"
+            packed_tensors, f"{self._get_output_dir(model)}/tensors"
         )
         results: list[dict[str, float]] = []
         pbar = tqdm.tqdm(total=disk_packed_tensors["num_sequences"], desc="train")
@@ -347,12 +352,12 @@ class LocalAPI:
         )
 
     def _get_wandb_run(self, model: Model) -> Run:
-        if model.id not in self._wandb_runs:
+        if model.name not in self._wandb_runs:
             run = wandb.init(
                 project=model.project,
-                name=model.id,
-                id=model.id,
+                name=model.name,
+                id=model.name,
                 resume="allow",
             )
-            self._wandb_runs[model.id] = run
-        return self._wandb_runs[model.id]
+            self._wandb_runs[model.name] = run
+        return self._wandb_runs[model.name]

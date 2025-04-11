@@ -14,7 +14,7 @@ from art.utils import iterate_dataset, limit_concurrency
 
 load_dotenv()
 
-MODEL_ID = "001"
+MODEL_NAME = "001"
 BASE_MODEL = "Qwen/Qwen2.5-7B-Instruct"
 MAX_COMPLETION_LENGTH = 100
 MAX_PROMPT_LENGTH = 8192 - MAX_COMPLETION_LENGTH
@@ -156,7 +156,7 @@ async def check_title_matches_body(
 async def rollout(
     client: openai.AsyncOpenAI,
     op_client: AsyncOpenPipe,
-    model_id: str,
+    model_name: str,
     prompt: Iterable[ChatCompletionMessageParam],
     row: Dict[str, Any],
     global_iteration: int,
@@ -168,7 +168,7 @@ async def rollout(
     # 1. Generate Title
     chat_completion = await client.chat.completions.create(
         messages=prompt,
-        model=model_id,
+        model=model_name,
         max_tokens=MAX_COMPLETION_LENGTH,
         temperature=1,
         logprobs=True,
@@ -204,7 +204,7 @@ async def rollout(
         requested_at=requested_at.timestamp(),
         received_at=received_at.timestamp(),
         req_payload={
-            "model": model_id,
+            "model": model_name,
             "messages": prompt,
             "metadata": {
                 "type": "art_rollout",
@@ -233,7 +233,7 @@ async def main():
     # Initialize ART API and Model
     api = art.LocalAPI()
     model = await api.get_or_create_model(
-        id=MODEL_ID,
+        name=MODEL_NAME,
         project=PROJECT,
         base_model=BASE_MODEL,
         _config={
@@ -297,7 +297,7 @@ async def main():
                     rollout(
                         openai_client,
                         op_client,
-                        MODEL_ID,
+                        MODEL_NAME,
                         bi["prompt"],
                         bi["row"],
                         global_iteration,
@@ -335,7 +335,7 @@ async def main():
                     rollout(
                         openai_client,
                         op_client,
-                        MODEL_ID,
+                        MODEL_NAME,
                         item["prompt"],
                         item["row"],
                         global_iteration,

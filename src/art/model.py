@@ -15,7 +15,7 @@ if TYPE_CHECKING:
 
 @dataclass
 class Model:
-    id: str
+    name: str
     project: str
     base_model: BaseModel
     _api: "LocalAPI"
