@@ -14,7 +14,7 @@ from art.utils import iterate_dataset, limit_concurrency
 
 load_dotenv()
 
-RUN_NAME = "011"
+MODEL_ID = "001"
 BASE_MODEL = "Qwen/Qwen2.5-7B-Instruct"
 MAX_COMPLETION_LENGTH = 100
 MAX_PROMPT_LENGTH = 8192 - MAX_COMPLETION_LENGTH
@@ -23,7 +23,7 @@ ENTRIES_PER_ITERATION = 1
 EVAL_STEPS = 50
 VAL_SET_SIZE = 100
 TRAINING_DATASET_SIZE = 5000
-WANDB_PROJECT = "hn_title_generation"
+PROJECT = "hn_title_generation"
 NUM_EPOCHS = 1
 NUM_GENERATIONS = 6
 
@@ -156,7 +156,7 @@ async def check_title_matches_body(
 async def rollout(
     client: openai.AsyncOpenAI,
     op_client: AsyncOpenPipe,
-    model_name: str,
+    model_id: str,
     prompt: Iterable[ChatCompletionMessageParam],
     row: Dict[str, Any],
     global_iteration: int,
@@ -168,7 +168,7 @@ async def rollout(
     # 1. Generate Title
     chat_completion = await client.chat.completions.create(
         messages=prompt,
-        model=model_name,
+        model=model_id,
         max_tokens=MAX_COMPLETION_LENGTH,
         temperature=1,
         logprobs=True,
@@ -204,7 +204,7 @@ async def rollout(
         requested_at=requested_at.timestamp(),
         received_at=received_at.timestamp(),
         req_payload={
-            "model": model_name,
+            "model": model_id,
             "messages": prompt,
             "metadata": {
                 "type": "art_rollout",
@@ -231,9 +231,10 @@ async def rollout(
 # --- Main Training Loop ---
 async def main():
     # Initialize ART API and Model
-    api = art.LocalAPI(wandb_project=WANDB_PROJECT)
-    model = await api._get_or_create_model(
-        name=RUN_NAME,
+    api = art.LocalAPI()
+    model = await api.get_or_create_model(
+        id=MODEL_ID,
+        project=PROJECT,
         base_model=BASE_MODEL,
         _config={
             "init_args": {
@@ -296,7 +297,7 @@ async def main():
                     rollout(
                         openai_client,
                         op_client,
-                        RUN_NAME,
+                        MODEL_ID,
                         bi["prompt"],
                         bi["row"],
                         global_iteration,
@@ -334,7 +335,7 @@ async def main():
                     rollout(
                         openai_client,
                         op_client,
-                        RUN_NAME,
+                        MODEL_ID,
                         item["prompt"],
                         item["row"],
                         global_iteration,

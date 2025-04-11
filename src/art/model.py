@@ -15,9 +15,10 @@ if TYPE_CHECKING:
 
 @dataclass
 class Model:
-    api: "LocalAPI"
-    name: str
+    id: str
+    project: str
     base_model: BaseModel
+    _api: "LocalAPI"
     _config: ModelConfig | None = None
 
     async def openai_client(
@@ -34,14 +35,14 @@ class Model:
         Returns:
             An asynchronous OpenAI client.
         """
-        client = await self.api._get_openai_client(self, _config)
+        client = await self._api._get_openai_client(self, _config)
         return patch_openai(client)
 
     async def get_step(self) -> int:
         """
         Get the model's current training step.
         """
-        return await self.api._get_step(self)
+        return await self._api._get_step(self)
 
     async def delete_checkpoints(
         self, best_checkpoint_metric: str = "val/reward"
@@ -53,7 +54,7 @@ class Model:
             best_checkpoint_metric: The metric to use to determine the best checkpoint.
                 Defaults to "val/reward".
         """
-        await self.api._delete_checkpoints(self, best_checkpoint_metric)
+        await self._api._delete_checkpoints(self, best_checkpoint_metric)
 
     async def log(
         self,
@@ -73,7 +74,7 @@ class Model:
             ]
         else:
             trajectory_groups = cast(list[TrajectoryGroup], list(trajectories))
-        await self.api._log(
+        await self._api._log(
             self,
             trajectory_groups,
             split,
@@ -91,4 +92,4 @@ class Model:
             trajectory_groups: A batch of trajectory groups.
             config: Fine-tuning specific configuration
         """
-        await self.api._train_model(self, list(trajectory_groups), config)
+        await self._api._train_model(self, list(trajectory_groups), config)
