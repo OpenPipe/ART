@@ -4,7 +4,7 @@
 <img alt="ART header" src="https://github.com/openpipe/art/raw/main/assets/ART_header.png" width="100%">
 </picture></a>
 
-<a href="https://colab.research.google.com/github/openpipe/art/blob/notebooks/examples/2048/2048.ipynb"><img src="https://github.com/openpipe/art/raw/main/assets/Train_pill.png" height="48"></a>
+<a href="https://colab.research.google.com/github/openpipe/art/blob/main/examples/2048/2048.ipynb"><img src="https://github.com/openpipe/art/raw/main/assets/Train_pill.png" height="48"></a>
 <a href="https://discord.com/invite/dnseNZuQ"><img src="https://github.com/openpipe/art/raw/main/assets/Discord_pill.png" height="48"></a>
 <a href="https://openpipe.ai/blog/art-trainer-a-new-rl-trainer-for-agents"><img src="https://github.com/openpipe/art/raw/main/assets/Launch_pill.png" height="48"></a>
 
@@ -20,9 +20,9 @@ ART is an open-source reinforcement training library for improving LLM performan
 
 ## 📒 Notebooks
 
-| Agent Task | Example Notebook                                                                                                     | Description                     | Comparative Performance |
-| ---------- | -------------------------------------------------------------------------------------------------------------------- | ------------------------------- | ----------------------- |
-| **2048**   | [🏋️ Train your agent](https://colab.research.google.com/github/openpipe/art/blob/notebooks/examples/2048/2048.ipynb) | Qwen 2.5 7B learns to play 2048 | [Link coming soon]      |
+| Agent Task | Example Notebook                                                                                                | Description                     | Comparative Performance |
+| ---------- | --------------------------------------------------------------------------------------------------------------- | ------------------------------- | ----------------------- |
+| **2048**   | [🏋️ Train your agent](https://colab.research.google.com/github/openpipe/art/blob/main/examples/2048/2048.ipynb) | Qwen 2.5 7B learns to play 2048 | [Link coming soon]      |
 
 ## 🔁 Training Loop Overview
 
