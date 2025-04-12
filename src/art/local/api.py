@@ -179,19 +179,20 @@ class LocalAPI:
         # Keep the latest step
         steps_to_keep = [get_step(output_dir)]
         try:
-            history_df = (
-                pl.read_jsonl(f"{output_dir}/history.jsonl")
-                .dropna(subset=[benchmark])
-                .groupby("_step")
-                .mean()
-                .sort_index()
-            )
-            # Keep the best step so far, potentially smoothing to account for variance
             best_step = (
-                history_df[benchmark].ewm(alpha=benchmark_smoothing).mean().idxmax()
+                pl.read_ndjson(f"{output_dir}/history.jsonl")
+                .drop_nulls(subset=[benchmark])
+                .group_by("step")
+                .mean()
+                .with_columns(pl.col(benchmark).ewm_mean(alpha=benchmark_smoothing))
+                .sort(benchmark)
+                .select(pl.col("step").last())
+                .item()
             )
             steps_to_keep.append(best_step)
-        except KeyError:
+        except FileNotFoundError:
+            pass
+        except pl.exceptions.ColumnNotFoundError:
             print(f'No "{benchmark}" metric found in history')
         delete_checkpoints(output_dir, steps_to_keep)
 
