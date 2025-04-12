@@ -1,4 +1,5 @@
 import httpx
+import json
 import math
 from mp_actors import move_to_child_process
 import numpy as np
@@ -7,6 +8,7 @@ from openai import (
     DefaultAsyncHttpxClient,
 )
 import os
+import polars as pl
 import subprocess
 from transformers.models.auto.tokenization_auto import AutoTokenizer
 from transformers.tokenization_utils_base import PreTrainedTokenizerBase
@@ -173,15 +175,12 @@ class LocalAPI:
     async def _delete_checkpoints(
         self, model: Model, benchmark: str, benchmark_smoothing: float = 1.0
     ) -> None:
-        run = self._get_wandb_run(model)
         output_dir = self._get_output_dir(model)
         # Keep the latest step
         steps_to_keep = [get_step(output_dir)]
         try:
             history_df = (
-                wandb.Api()
-                .run(f"{run.entity}/{run.project}/{run.id}")
-                .history()
+                pl.read_jsonl(f"{output_dir}/history.jsonl")
                 .dropna(subset=[benchmark])
                 .groupby("_step")
                 .mean()
@@ -283,7 +282,7 @@ class LocalAPI:
             if group_std_devs:
                 averages["reward_std_dev"] = sum(group_std_devs) / len(group_std_devs)
 
-        self._log_wandb_data(model, averages, split)
+        self._log_data(model, averages, split)
 
     def _trajectory_log(self, trajectory: Trajectory) -> str:
         """Format a trajectory into a readable log string."""
@@ -329,9 +328,9 @@ class LocalAPI:
             k: sum(d.get(k, 0) for d in results) / sum(1 for d in results if k in d)
             for k in {k for d in results for k in d}
         }
-        self._log_wandb_data(model, data, "train")
+        self._log_data(model, data, "train", step_offset=-1)
 
-    def _log_wandb_data(
+    def _log_data(
         self,
         model: Model,
         data: dict[str, float],
@@ -344,14 +343,22 @@ class LocalAPI:
             if namespace
             else data
         )
+        step = self.__get_step(model) + step_offset
 
-        # Log the data
-        self._get_wandb_run(model).log(
-            data,
-            step=self.__get_step(model) + step_offset,
-        )
+        # Log the data to history.jsonl
+        with open(f"{self._get_output_dir(model)}/history.jsonl", "a") as f:
+            f.write(json.dumps({**data, "step": step}) + "\n")
 
-    def _get_wandb_run(self, model: Model) -> Run:
+        # If we have a W&B run, log the data there as well
+        if run := self._get_wandb_run(model):
+            run.log(
+                data,
+                step=step,
+            )
+
+    def _get_wandb_run(self, model: Model) -> Run | None:
+        if "WANDB_API_KEY" not in os.environ:
+            return None
         if model.name not in self._wandb_runs:
             run = wandb.init(
                 project=model.project,
