@@ -183,7 +183,7 @@ class LocalAPI:
                 .run(f"{run.entity}/{run.project}/{run.id}")
                 .history()
                 .dropna(subset=[benchmark])
-                .groupby("step")
+                .groupby("_step")
                 .mean()
                 .sort_index()
             )
