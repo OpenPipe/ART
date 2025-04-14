@@ -77,7 +77,7 @@ def get_compute_loss_fn(trainer: "GRPOTrainer") -> Callable[..., torch.Tensor]:
             torch.Tensor, trainer.model.get_output_embeddings().weight.t()  # type: ignore
         )  # Shape [H, V]
         next_input_ids = shift_tensor(inputs["tokens"], 0)
-        chunk_size = _config.get("logprob_calculation_chunk_size", 512)
+        chunk_size = _config.get("logprob_calculation_chunk_size", 1024)
         # Assert that sequence length is evenly divisible by the chunk size
         assert (
             seq_len % chunk_size == 0
