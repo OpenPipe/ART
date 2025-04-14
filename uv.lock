@@ -24,8 +24,8 @@ resolution-markers = [
 [manifest]
 overrides = [
     { name = "bitsandbytes", marker = "sys_platform == 'linux'" },
-    { name = "unsloth", marker = "sys_platform == 'linux'", git = "https://github.com/bradhilton/unsloth" },
-    { name = "unsloth-zoo", marker = "sys_platform == 'linux'", git = "https://github.com/bradhilton/unsloth-zoo" },
+    { name = "unsloth", marker = "sys_platform == 'linux'" },
+    { name = "unsloth-zoo", marker = "sys_platform == 'linux'" },
     { name = "xformers", marker = "sys_platform == 'linux'" },
 ]
 
@@ -1153,6 +1153,25 @@ dependencies = [
 sdist = { url = "https://files.pythonhosted.org/packages/f9/ee/43a4cbba615abfc1eb2e5ff5eed3f80f38d58645b4d13d0ea06b9ca1909d/depyf-0.18.0.tar.gz", hash = "sha256:b99f0c383be949ae45d5d606fe444c71f375b55a57b8d6b20e7856670d52130d", size = 43050 }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/e7/d8/efc291d5c69a9905515055d23977643dd0d482ebfeb0dbabef1947ee75d8/depyf-0.18.0-py3-none-any.whl", hash = "sha256:007294d5bac19a38a0767d747be0f49b9ffdcea0394a822644142df22b33a3e1", size = 38839 },
+]
+
+[[package]]
+name = "diffusers"
+version = "0.33.1"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "filelock", marker = "sys_platform == 'linux'" },
+    { name = "huggingface-hub", marker = "sys_platform == 'linux'" },
+    { name = "importlib-metadata", marker = "sys_platform == 'linux'" },
+    { name = "numpy", marker = "sys_platform == 'linux'" },
+    { name = "pillow", marker = "sys_platform == 'linux'" },
+    { name = "regex", marker = "sys_platform == 'linux'" },
+    { name = "requests", marker = "sys_platform == 'linux'" },
+    { name = "safetensors", marker = "sys_platform == 'linux'" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/82/cc/1ef6bdc99d3864f6d1ee11bdbe3708b9d33ce35e7671557f641897480956/diffusers-0.33.1.tar.gz", hash = "sha256:fc7f140295d2ec82b1e7474b77bb7057fc0686c14eadc54ca0e52a66527e18a2", size = 2896103 }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/e7/7a/f08f610cea8a3395ad3b4f586db23bedb43c68db6c3261145a15e7b63126/diffusers-0.33.1-py3-none-any.whl", hash = "sha256:027469e74f289338eb24127409f8d60d840b1b7ce4b27ffcd3134fd3b8431567", size = 3554612 },
 ]
 
 [[package]]
@@ -3245,7 +3264,7 @@ wheels = [
 
 [[package]]
 name = "openpipe-art"
-version = "0.1.18"
+version = "0.1.19"
 source = { editable = "." }
 dependencies = [
     { name = "bitsandbytes", marker = "sys_platform == 'linux'" },
@@ -3292,8 +3311,8 @@ requires-dist = [
     { name = "torchao", specifier = ">=0.9.0" },
     { name = "trl", specifier = "==0.15.2" },
     { name = "typer", specifier = ">=0.15.2" },
-    { name = "unsloth", marker = "sys_platform == 'linux'", git = "https://github.com/bradhilton/unsloth" },
-    { name = "unsloth-zoo", marker = "sys_platform == 'linux'", git = "https://github.com/bradhilton/unsloth-zoo" },
+    { name = "unsloth", marker = "sys_platform == 'linux'" },
+    { name = "unsloth-zoo", marker = "sys_platform == 'linux'" },
     { name = "vllm", specifier = "==0.7.3" },
     { name = "wandb", specifier = ">=0.19.8" },
 ]
@@ -5069,11 +5088,11 @@ wheels = [
 
 [[package]]
 name = "shtab"
-version = "1.7.1"
+version = "1.7.2"
 source = { registry = "https://pypi.org/simple" }
-sdist = { url = "https://files.pythonhosted.org/packages/a9/e4/13bf30c7c30ab86a7bc4104b1c943ff2f56c1a07c6d82a71ad034bcef1dc/shtab-1.7.1.tar.gz", hash = "sha256:4e4bcb02eeb82ec45920a5d0add92eac9c9b63b2804c9196c1f1fdc2d039243c", size = 45410 }
+sdist = { url = "https://files.pythonhosted.org/packages/5a/3e/837067b970c1d2ffa936c72f384a63fdec4e186b74da781e921354a94024/shtab-1.7.2.tar.gz", hash = "sha256:8c16673ade76a2d42417f03e57acf239bfb5968e842204c17990cae357d07d6f", size = 45751 }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/e2/d1/a1d3189e7873408b9dc396aef0d7926c198b0df2aa3ddb5b539d3e89a70f/shtab-1.7.1-py3-none-any.whl", hash = "sha256:32d3d2ff9022d4c77a62492b6ec875527883891e33c6b479ba4d41a51e259983", size = 14095 },
+    { url = "https://files.pythonhosted.org/packages/74/03/3271b7bb470fbab4adf5bd30b0d32143909d96f3608d815b447357f47f2b/shtab-1.7.2-py3-none-any.whl", hash = "sha256:858a5805f6c137bb0cda4f282d27d08fd44ca487ab4a6a36d2a400263cd0b5c1", size = 14214 },
 ]
 
 [[package]]
@@ -5763,12 +5782,40 @@ wheels = [
 [[package]]
 name = "unsloth"
 version = "2025.3.19"
-source = { git = "https://github.com/bradhilton/unsloth#a06caf1d206488e040575dae0a73921d39ff0d74" }
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "accelerate", marker = "sys_platform == 'linux'" },
+    { name = "bitsandbytes", marker = "sys_platform == 'linux'" },
+    { name = "datasets", marker = "sys_platform == 'linux'" },
+    { name = "diffusers", marker = "sys_platform == 'linux'" },
+    { name = "hf-transfer", marker = "sys_platform == 'linux'" },
+    { name = "huggingface-hub", marker = "sys_platform == 'linux'" },
+    { name = "numpy", marker = "sys_platform == 'linux'" },
+    { name = "packaging", marker = "sys_platform == 'linux'" },
+    { name = "peft", marker = "sys_platform == 'linux'" },
+    { name = "protobuf", marker = "sys_platform == 'linux'" },
+    { name = "psutil", marker = "sys_platform == 'linux'" },
+    { name = "sentencepiece", marker = "sys_platform == 'linux'" },
+    { name = "torch", marker = "sys_platform == 'linux'" },
+    { name = "torchvision", marker = "sys_platform == 'linux'" },
+    { name = "tqdm", marker = "sys_platform == 'linux'" },
+    { name = "transformers", marker = "sys_platform == 'linux'" },
+    { name = "triton", marker = "sys_platform == 'linux'" },
+    { name = "trl", marker = "sys_platform == 'linux'" },
+    { name = "tyro", marker = "sys_platform == 'linux'" },
+    { name = "unsloth-zoo", marker = "sys_platform == 'linux'" },
+    { name = "wheel", marker = "sys_platform == 'linux'" },
+    { name = "xformers", marker = "sys_platform == 'linux'" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/ea/7d/135174e1d0832e67d6f31021f91075e8bfbd8f98c16c96a6bc5a1b7e18cc/unsloth-2025.3.19.tar.gz", hash = "sha256:7413a417946b14c36d2a331cdde459388be7db37e15e734b7a8b794b446bb1ef", size = 174458 }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/56/f6/1554487bb6d8c6ad6cb7d068068a5f531f7c93d17c4f0df2b10ee33c003b/unsloth-2025.3.19-py3-none-any.whl", hash = "sha256:3f450c2dcbc40ba5fdc82afb43164c175fabb10ed2d7ccbab8b11c12ff87777e", size = 192666 },
+]
 
 [[package]]
 name = "unsloth-zoo"
 version = "2025.3.17"
-source = { git = "https://github.com/bradhilton/unsloth-zoo#00120c435344f3d7c70f2f0d39c6071e25418a5c" }
+source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "accelerate", marker = "sys_platform == 'linux'" },
     { name = "cut-cross-entropy", marker = "sys_platform == 'linux'" },
@@ -5790,6 +5837,10 @@ dependencies = [
     { name = "trl", marker = "sys_platform == 'linux'" },
     { name = "tyro", marker = "sys_platform == 'linux'" },
     { name = "wheel", marker = "sys_platform == 'linux'" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/40/18/bee4d2e93a567fcbd30719a8b2a627eb451f8125db195b5de0f822263888/unsloth_zoo-2025.3.17.tar.gz", hash = "sha256:6296b0e617577fb6ad9d4a852ef73c66171cee625618a86479bda0ab409ad660", size = 114217 }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/e0/40/2152e8824f6915f659f69b1a0e9604eab0e645567a8429a34b3215114c2b/unsloth_zoo-2025.3.17-py3-none-any.whl", hash = "sha256:6ffffe77de166858eecd3f541dedf2847a8b4efa4ad45324f7b6438789936e2f", size = 127820 },
 ]
 
 [[package]]
