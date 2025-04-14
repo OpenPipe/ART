@@ -17,8 +17,7 @@ from typing import cast
 import wandb
 from wandb.sdk.wandb_run import Run
 
-from ..config.model import get_model_config, ModelConfig
-from ..config.openai_server import OpenAIServerConfig
+from .. import dev
 from ..model import Model
 from .service import ModelService
 from ..trajectories import Trajectory, TrajectoryGroup
@@ -65,7 +64,7 @@ class LocalAPI:
         name: str,
         project: str,
         base_model: BaseModel,
-        _config: ModelConfig | None = None,
+        _config: dev.ModelConfig | None = None,
     ) -> Model:
         """
         Retrieve an existing model or create a new one.
@@ -92,7 +91,7 @@ class LocalAPI:
 
     async def _get_service(self, model: Model) -> ModelService:
         if model.name not in self._services:
-            config = get_model_config(
+            config = dev.get_model_config(
                 base_model=model.base_model,
                 output_dir=self._get_output_dir(model),
                 config=model._config,
@@ -141,9 +140,8 @@ class LocalAPI:
         if not tokenized_results:
             return None
         max_tokens = max(len(result.tokens) for result in tokenized_results)
-        # Round up max_tokens to the nearest power of 2
-        max_tokens = 2 ** math.ceil(math.log2(max_tokens))
-        sequence_length = max(4096, max_tokens)
+        # Round up max_tokens to the nearest multiple of 2048
+        sequence_length = math.ceil(max_tokens / 2048) * 2048
         packed_tensors = packed_tensors_from_tokenized_results(
             tokenized_results,
             sequence_length,
@@ -199,7 +197,7 @@ class LocalAPI:
     async def _get_openai_client(
         self,
         model: Model,
-        config: OpenAIServerConfig | None,
+        config: dev.OpenAIServerConfig | None,
     ) -> AsyncOpenAI:
         service = await self._get_service(model)
         await service.start_openai_server(config=config)
@@ -302,6 +300,7 @@ class LocalAPI:
         model: Model,
         trajectory_groups: list[TrajectoryGroup],
         config: TrainConfig,
+        _config: dev.TrainConfig,
     ) -> None:
         service = await self._get_service(model)
         await self._log(model, trajectory_groups, "train")
@@ -320,7 +319,7 @@ class LocalAPI:
         )
         results: list[dict[str, float]] = []
         pbar = tqdm.tqdm(total=disk_packed_tensors["num_sequences"], desc="train")
-        async for result in service.train(disk_packed_tensors, config):
+        async for result in service.train(disk_packed_tensors, config, _config):
             results.append(result)
             pbar.update(1)
             pbar.set_postfix(result)

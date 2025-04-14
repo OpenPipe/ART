@@ -9,7 +9,7 @@ if os.environ.get("IMPORT_PEFT", "0") == "1":
 if os.environ.get("IMPORT_UNSLOTH", "0") == "1":
     import unsloth  # type: ignore
 
-from . import config
+from . import dev
 from .gather import gather_trajectories, gather_trajectory_groups
 from .model import Model
 from .trajectories import Trajectory, TrajectoryGroup
@@ -18,7 +18,7 @@ from .local import LocalAPI
 from .utils import retry
 
 __all__ = [
-    "config",
+    "dev",
     "gather_trajectories",
     "gather_trajectory_groups",
     "LocalAPI",

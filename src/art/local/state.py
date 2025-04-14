@@ -20,7 +20,7 @@ from vllm.engine.arg_utils import AsyncEngineArgs
 from vllm.worker.worker_base import WorkerWrapperBase
 from vllm.worker.multi_step_model_runner import MultiStepModelRunner
 
-from ..config.model import ModelConfig
+from ..dev.model import ModelConfig
 
 if TYPE_CHECKING:
     from .service import TrainInputs

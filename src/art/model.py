@@ -2,8 +2,7 @@ from dataclasses import dataclass
 from openai import AsyncOpenAI
 from typing import cast, Iterable, TYPE_CHECKING
 
-from .config.model import ModelConfig
-from .config.openai_server import OpenAIServerConfig
+from . import dev
 from .openai import patch_openai
 from .trajectories import Trajectory, TrajectoryGroup
 from .types import BaseModel, TrainConfig
@@ -19,11 +18,11 @@ class Model:
     project: str
     base_model: BaseModel
     _api: "LocalAPI"
-    _config: ModelConfig | None = None
+    _config: dev.ModelConfig | None = None
 
     async def openai_client(
         self,
-        _config: OpenAIServerConfig | None = None,
+        _config: dev.OpenAIServerConfig | None = None,
     ) -> AsyncOpenAI:
         """
         Get a client to an OpenAI-compatible inference service for this model.
@@ -84,6 +83,7 @@ class Model:
         self,
         trajectory_groups: Iterable[TrajectoryGroup],
         config: TrainConfig = TrainConfig(),
+        _config: dev.TrainConfig | None = None,
     ) -> None:
         """
         Reinforce fine-tune the model with a batch of trajectory groups.
@@ -91,5 +91,9 @@ class Model:
         Args:
             trajectory_groups: A batch of trajectory groups.
             config: Fine-tuning specific configuration
+            _config: Additional configuration that is subject to change and
+                not yet part of the public API. Use at your own risk.
         """
-        await self._api._train_model(self, list(trajectory_groups), config)
+        await self._api._train_model(
+            self, list(trajectory_groups), config, _config or {}
+        )
