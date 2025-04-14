@@ -39,6 +39,13 @@ class ModelState:
 
     def __init__(self, config: ModelConfig) -> None:
         from vllm.engine import async_llm_engine
+        from vllm.worker.multi_step_model_runner import MultiStepModelRunner
+
+        # Patch MultiStepModelRunner for Unsloth compatibility
+        if not hasattr(MultiStepModelRunner, "model"):
+            MultiStepModelRunner.model = property(  # type: ignore
+                lambda self: self._base_model_runner.model
+            )
 
         # Set effectively unlimited timeout to support engine pausing & resumption
         async_llm_engine.ENGINE_ITERATION_TIMEOUT_S = 2**31 - 1
