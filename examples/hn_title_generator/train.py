@@ -248,7 +248,7 @@ async def main():
             ),
         ),
     )
-    await model.register_for_training(api)
+    await model.register(api)
     op_client = AsyncOpenPipe(api_key=os.getenv("OPENPIPE_API_KEY"))
 
     # Load Data

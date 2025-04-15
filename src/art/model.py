@@ -6,6 +6,11 @@ from .openai import patch_openai
 from .trajectories import Trajectory, TrajectoryGroup
 from .types import TrainableModelName, TrainConfig
 from pydantic import BaseModel
+from openai import (
+    AsyncOpenAI,
+    DefaultAsyncHttpxClient,
+)
+import httpx
 
 if TYPE_CHECKING:
     from .local.api import LocalAPI
@@ -26,21 +31,14 @@ class Model(BaseModel):
     trainable: bool = False
     _api: Optional["LocalAPI"] = None
 
+    def api(self) -> "LocalAPI":
+        if self._api is None:
+            raise ValueError(
+                "Model is not registered with the API. You must call `model.register()` first."
+            )
+        return self._api
 
-class TrainableModel(Model):
-    base_model: TrainableModelName
-    trainable: bool = True
-
-    # The fields within `_internal_config` are unstable and subject to change.
-    # Use at your own risk.
-    _internal_config: dev.InternalModelConfig | None = None
-    _openai_client: AsyncOpenAI | None = None
-
-    async def register_for_training(
-        self,
-        api: "LocalAPI",
-        _openai_client_config: dev.OpenAIServerConfig | None = None,
-    ) -> None:
+    async def register(self, api: "LocalAPI") -> None:
         if self.config is not None:
             try:
                 self.config.model_dump_json()
@@ -50,47 +48,7 @@ class TrainableModel(Model):
                 ) from e
 
         self._api = api
-        await self._api.register_for_training(self)
-        openai_client = await api._get_openai_client(self, _openai_client_config)
-        patch_openai(openai_client)
-        self._openai_client = openai_client
-        self.base_url = str(openai_client.base_url)
-        self.api_key = openai_client.api_key
-
-    def api(self) -> "LocalAPI":
-        if self._api is None:
-            raise ValueError(
-                "Model is not registered with the API. You must call `model.register_for_training()` first."
-            )
-        return self._api
-
-    def openai_client(
-        self,
-    ) -> AsyncOpenAI:
-        self.api()
-        if self._openai_client is None:
-            raise ValueError(
-                "OpenAI client not yet initialized. You must call `model.register_for_training()` first."
-            )
-        return self._openai_client
-
-    async def get_step(self) -> int:
-        """
-        Get the model's current training step.
-        """
-        return await self.api()._get_step(self)
-
-    async def delete_checkpoints(
-        self, best_checkpoint_metric: str = "val/reward"
-    ) -> None:
-        """
-        Delete all but the latest and best checkpoints.
-
-        Args:
-            best_checkpoint_metric: The metric to use to determine the best checkpoint.
-                Defaults to "val/reward".
-        """
-        await self.api()._delete_checkpoints(self, best_checkpoint_metric)
+        await self._api.register(self)
 
     async def log(
         self,
@@ -115,6 +73,65 @@ class TrainableModel(Model):
             trajectory_groups,
             split,
         )
+
+
+class TrainableModel(Model):
+    base_model: TrainableModelName
+    trainable: bool = True
+
+    # The fields within `_internal_config` are unstable and subject to change.
+    # Use at your own risk.
+    _internal_config: dev.InternalModelConfig | None = None
+
+    async def register(
+        self,
+        api: "LocalAPI",
+        _openai_client_config: dev.OpenAIServerConfig | None = None,
+    ) -> None:
+        await super().register(api)
+        base_url, api_key = await api._prepare_backend_for_training(
+            self, _openai_client_config
+        )
+        self.base_url = base_url
+        self.api_key = api_key
+
+    def openai_client(
+        self,
+    ) -> AsyncOpenAI:
+        if self.base_url is None or self.api_key is None:
+            raise ValueError(
+                "OpenAI client not yet available. You must call `model.register()` first."
+            )
+        openai_client = AsyncOpenAI(
+            base_url=self.base_url,
+            api_key=self.api_key,
+            http_client=DefaultAsyncHttpxClient(
+                timeout=httpx.Timeout(timeout=1200, connect=5.0),
+                limits=httpx.Limits(
+                    max_connections=100_000, max_keepalive_connections=100_000
+                ),
+            ),
+        )
+        patch_openai(openai_client)
+        return openai_client
+
+    async def get_step(self) -> int:
+        """
+        Get the model's current training step.
+        """
+        return await self.api()._get_step(self)
+
+    async def delete_checkpoints(
+        self, best_checkpoint_metric: str = "val/reward"
+    ) -> None:
+        """
+        Delete all but the latest and best checkpoints.
+
+        Args:
+            best_checkpoint_metric: The metric to use to determine the best checkpoint.
+                Defaults to "val/reward".
+        """
+        await self.api()._delete_checkpoints(self, best_checkpoint_metric)
 
     async def train(
         self,
