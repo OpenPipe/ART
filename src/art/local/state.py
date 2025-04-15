@@ -20,7 +20,7 @@ from vllm.engine.arg_utils import AsyncEngineArgs
 from vllm.worker.worker_base import WorkerWrapperBase
 from vllm.worker.multi_step_model_runner import MultiStepModelRunner
 
-from ..config.model import ModelConfig
+from ..dev.model import ModelConfig
 
 if TYPE_CHECKING:
     from .service import TrainInputs
@@ -39,13 +39,22 @@ class ModelState:
 
     def __init__(self, config: ModelConfig) -> None:
         from vllm.engine import async_llm_engine
+        from vllm.worker.multi_step_model_runner import MultiStepModelRunner
+
+        # Patch MultiStepModelRunner for Unsloth compatibility
+        if not hasattr(MultiStepModelRunner, "model"):
+            MultiStepModelRunner.model = property(  # type: ignore
+                lambda self: self._base_model_runner.model
+            )
 
         # Set effectively unlimited timeout to support engine pausing & resumption
         async_llm_engine.ENGINE_ITERATION_TIMEOUT_S = 2**31 - 1
         # Sticking with V0 engine for now
         os.environ["VLLM_USE_V1"] = "0"
         # We can't use expandable segments with sleep mode
-        enable_sleep_mode = config.get("init_args", {}).get("enable_sleep_mode", False)
+        enable_sleep_mode = config.get("engine_args", {}).get(
+            "enable_sleep_mode", False
+        )
         if enable_sleep_mode:
             os.environ["PYTORCH_CUDA_ALLOC_CONF"] = ""
         # Initialize Unsloth model
@@ -149,6 +158,7 @@ class vLLMState:
                 yield
             finally:
                 free_memory()
+                await asyncio.sleep(0.1)
                 await self.async_engine.wake_up()
         finally:
             await self.resume_engine()

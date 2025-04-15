@@ -1,8 +1,8 @@
 import asyncio
 import pydantic
 import traceback
-from typing import Awaitable, cast, Iterable, Iterator, overload
-
+from typing import Awaitable, Any, cast, Iterable, Iterator, overload
+from openai.types.chat.chat_completion import Choice
 from .types import MessagesAndChoices
 
 
@@ -20,6 +20,26 @@ class Trajectory(pydantic.BaseModel):
     reward: float
     metrics: dict[str, float] = {}
     metadata: dict[str, MetadataValue] = {}
+    logs: list[str] = []
+
+    def __str__(self) -> str:
+        return f"Trajectory(reward={self.reward}, metrics={self.metrics}, metadata={self.metadata})"
+
+    def for_logging(self) -> dict[str, Any]:
+        loggable_dict = {
+            "reward": self.reward,
+            "metrics": self.metrics,
+            "metadata": self.metadata,
+            "messages": [],
+            "logs": self.logs,
+        }
+        for message_or_choice in self.messages_and_choices:
+            trainable = isinstance(message_or_choice, Choice)
+            message = (
+                message_or_choice.message.to_dict() if trainable else message_or_choice
+            )
+            loggable_dict["messages"].append({**message, "trainable": trainable})
+        return loggable_dict
 
 
 class TrajectoryGroup(pydantic.BaseModel):

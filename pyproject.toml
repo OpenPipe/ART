@@ -1,6 +1,6 @@
 [project]
 name = "openpipe-art"
-version = "0.1.10"
+version = "0.1.19"
 description = "The OpenPipe Agent Reinforcement Training (ART) library"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -11,15 +11,16 @@ dependencies = [
     "seaborn>=0.13.2",
     "torch>=2.5.1",
     "torchao>=0.9.0",
-    "unsloth ; sys_platform == 'linux'",
-    "unsloth-zoo ; sys_platform == 'linux'",
+    "unsloth==2025.3.19 ; sys_platform == 'linux'",
+    "unsloth-zoo==2025.3.17 ; sys_platform == 'linux'",
     "vllm==0.7.3",
     "wandb>=0.19.8",
     "peft>=0.14.0",
     "typer>=0.15.2",
     "trl==0.15.2",
     "tblib>=3.0.0",
-    "litellm>=1.63.0"
+    "litellm>=1.63.0",
+    "polars>=1.26.0",
 ]
 
 [build-system]
@@ -54,6 +55,4 @@ override-dependencies = [
 ]
 
 [tool.uv.sources]
-unsloth = { git = "https://github.com/bradhilton/unsloth" }
-unsloth-zoo = { git = "https://github.com/bradhilton/unsloth-zoo" }
 panza = { git = "https://github.com/corbt/panza.git" }

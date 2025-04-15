@@ -7,6 +7,7 @@ import torch
 from trl import GRPOTrainer
 from typing import cast, Callable, TYPE_CHECKING
 
+from .. import dev
 from ..types import TrainConfig
 
 if TYPE_CHECKING:
@@ -38,6 +39,7 @@ def get_compute_loss_fn(trainer: "GRPOTrainer") -> Callable[..., torch.Tensor]:
         num_items_in_batch: int | None = None,
     ) -> torch.Tensor:
         config: TrainConfig = inputs.pop("config")  # type: ignore
+        _config: dev.TrainConfig = inputs.pop("_config")  # type: ignore
 
         if optimizer := trainer.optimizer:
             optimizer = getattr(optimizer, "optimizer", optimizer)
@@ -75,7 +77,7 @@ def get_compute_loss_fn(trainer: "GRPOTrainer") -> Callable[..., torch.Tensor]:
             torch.Tensor, trainer.model.get_output_embeddings().weight.t()  # type: ignore
         )  # Shape [H, V]
         next_input_ids = shift_tensor(inputs["tokens"], 0)
-        chunk_size = 512
+        chunk_size = _config.get("logprob_calculation_chunk_size", 1024)
         # Assert that sequence length is evenly divisible by the chunk size
         assert (
             seq_len % chunk_size == 0

@@ -4,7 +4,8 @@ import random
 import seaborn as sns
 import torch
 from torch.utils.data import Dataset
-from typing import TypedDict, Unpack
+from typing import TypedDict
+from typing_extensions import Unpack
 
 from .tokenize import TokenizedResult
 from ..types import Verbosity

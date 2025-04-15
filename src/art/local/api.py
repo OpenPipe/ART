@@ -1,4 +1,5 @@
 import httpx
+import json
 import math
 from mp_actors import move_to_child_process
 import numpy as np
@@ -7,6 +8,7 @@ from openai import (
     DefaultAsyncHttpxClient,
 )
 import os
+import polars as pl
 import subprocess
 from transformers.models.auto.tokenization_auto import AutoTokenizer
 from transformers.tokenization_utils_base import PreTrainedTokenizerBase
@@ -15,8 +17,7 @@ from typing import cast
 import wandb
 from wandb.sdk.wandb_run import Run
 
-from ..config.model import get_model_config, ModelConfig
-from ..config.openai_server import OpenAIServerConfig
+from .. import dev
 from ..model import Model
 from .service import ModelService
 from ..trajectories import Trajectory, TrajectoryGroup
@@ -63,7 +64,7 @@ class LocalAPI:
         name: str,
         project: str,
         base_model: BaseModel,
-        _config: ModelConfig | None = None,
+        _config: dev.ModelConfig | None = None,
     ) -> Model:
         """
         Retrieve an existing model or create a new one.
@@ -90,7 +91,7 @@ class LocalAPI:
 
     async def _get_service(self, model: Model) -> ModelService:
         if model.name not in self._services:
-            config = get_model_config(
+            config = dev.get_model_config(
                 base_model=model.base_model,
                 output_dir=self._get_output_dir(model),
                 config=model._config,
@@ -108,7 +109,7 @@ class LocalAPI:
                 subprocess.run(["pkill", "-9", "model-service"])
                 # To enable sleep mode, import peft before unsloth
                 # Unsloth will issue warnings, but everything appears to be okay
-                if config.get("init_args", {}).get("enable_sleep_mode", False):
+                if config.get("engine_args", {}).get("enable_sleep_mode", False):
                     os.environ["IMPORT_PEFT"] = "1"
                 # When moving the service to a child process, import unsloth
                 # early to maximize optimizations
@@ -139,9 +140,8 @@ class LocalAPI:
         if not tokenized_results:
             return None
         max_tokens = max(len(result.tokens) for result in tokenized_results)
-        # Round up max_tokens to the nearest power of 2
-        max_tokens = 2 ** math.ceil(math.log2(max_tokens))
-        sequence_length = max(4096, max_tokens)
+        # Round up max_tokens to the nearest multiple of 2048
+        sequence_length = math.ceil(max_tokens / 2048) * 2048
         packed_tensors = packed_tensors_from_tokenized_results(
             tokenized_results,
             sequence_length,
@@ -173,33 +173,31 @@ class LocalAPI:
     async def _delete_checkpoints(
         self, model: Model, benchmark: str, benchmark_smoothing: float = 1.0
     ) -> None:
-        run = self._get_wandb_run(model)
         output_dir = self._get_output_dir(model)
         # Keep the latest step
         steps_to_keep = [get_step(output_dir)]
         try:
-            history_df = (
-                wandb.Api()
-                .run(f"{run.entity}/{run.project}/{run.id}")
-                .history()
-                .dropna(subset=[benchmark])
-                .groupby("step")
-                .mean()
-                .sort_index()
-            )
-            # Keep the best step so far, potentially smoothing to account for variance
             best_step = (
-                history_df[benchmark].ewm(alpha=benchmark_smoothing).mean().idxmax()
+                pl.read_ndjson(f"{output_dir}/history.jsonl")
+                .drop_nulls(subset=[benchmark])
+                .group_by("step")
+                .mean()
+                .with_columns(pl.col(benchmark).ewm_mean(alpha=benchmark_smoothing))
+                .sort(benchmark)
+                .select(pl.col("step").last())
+                .item()
             )
             steps_to_keep.append(best_step)
-        except KeyError:
+        except FileNotFoundError:
+            pass
+        except pl.exceptions.ColumnNotFoundError:
             print(f'No "{benchmark}" metric found in history')
         delete_checkpoints(output_dir, steps_to_keep)
 
     async def _get_openai_client(
         self,
         model: Model,
-        config: OpenAIServerConfig | None,
+        config: dev.OpenAIServerConfig | None,
     ) -> AsyncOpenAI:
         service = await self._get_service(model)
         await service.start_openai_server(config=config)
@@ -283,7 +281,7 @@ class LocalAPI:
             if group_std_devs:
                 averages["reward_std_dev"] = sum(group_std_devs) / len(group_std_devs)
 
-        self._log_wandb_data(model, averages, split)
+        self._log_data(model, averages, split)
 
     def _trajectory_log(self, trajectory: Trajectory) -> str:
         """Format a trajectory into a readable log string."""
@@ -302,6 +300,7 @@ class LocalAPI:
         model: Model,
         trajectory_groups: list[TrajectoryGroup],
         config: TrainConfig,
+        _config: dev.TrainConfig,
     ) -> None:
         service = await self._get_service(model)
         await self._log(model, trajectory_groups, "train")
@@ -320,7 +319,7 @@ class LocalAPI:
         )
         results: list[dict[str, float]] = []
         pbar = tqdm.tqdm(total=disk_packed_tensors["num_sequences"], desc="train")
-        async for result in service.train(disk_packed_tensors, config):
+        async for result in service.train(disk_packed_tensors, config, _config):
             results.append(result)
             pbar.update(1)
             pbar.set_postfix(result)
@@ -329,9 +328,9 @@ class LocalAPI:
             k: sum(d.get(k, 0) for d in results) / sum(1 for d in results if k in d)
             for k in {k for d in results for k in d}
         }
-        self._log_wandb_data(model, data, "train")
+        self._log_data(model, data, "train", step_offset=-1)
 
-    def _log_wandb_data(
+    def _log_data(
         self,
         model: Model,
         data: dict[str, float],
@@ -344,14 +343,22 @@ class LocalAPI:
             if namespace
             else data
         )
+        step = self.__get_step(model) + step_offset
 
-        # Log the data
-        self._get_wandb_run(model).log(
-            data,
-            step=self.__get_step(model) + step_offset,
-        )
+        # Log the data to history.jsonl
+        with open(f"{self._get_output_dir(model)}/history.jsonl", "a") as f:
+            f.write(json.dumps({**data, "step": step}) + "\n")
 
-    def _get_wandb_run(self, model: Model) -> Run:
+        # If we have a W&B run, log the data there as well
+        if run := self._get_wandb_run(model):
+            run.log(
+                data,
+                step=step,
+            )
+
+    def _get_wandb_run(self, model: Model) -> Run | None:
+        if "WANDB_API_KEY" not in os.environ:
+            return None
         if model.name not in self._wandb_runs:
             run = wandb.init(
                 project=model.project,

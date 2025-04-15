@@ -70,5 +70,6 @@ ART stands on the shoulders of giants. While we owe many of the ideas and early 
 - [Unsloth](https://github.com/unslothai/unsloth)
 - [vLLM](https://github.com/vllm-project/vllm)
 - [trl](https://github.com/huggingface/trl)
+- [SkyPilot](https://github.com/skypilot-org/skypilot)
 
 Finally, thank you to our partners who've helped us test ART in the wild! We're excited to see what you all build with it.

@@ -4,6 +4,9 @@ __pycache__/
 .venv/
 grpo_trainer_lora_model/
 logs/
+shared_cache.db
 streaming-chat-completions/
 unsloth_compiled_cache/
 wandb/
+docs/node_modules/
+dist/

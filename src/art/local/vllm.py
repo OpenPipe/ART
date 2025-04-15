@@ -15,7 +15,7 @@ from vllm.logger import _DATE_FORMAT, _FORMAT
 from vllm.utils import FlexibleArgumentParser
 from uvicorn.config import LOGGING_CONFIG
 
-from ..config.openai_server import OpenAIServerConfig
+from ..dev.openai_server import OpenAIServerConfig
 
 if TYPE_CHECKING:
     from .state import vLLMState
