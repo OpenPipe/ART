@@ -49,23 +49,38 @@ class TrajectoryGroup(pydantic.BaseModel):
 
     def __init__(
         self,
-        trajectories: Iterable[Trajectory] | Iterable[Awaitable[Trajectory]],
+        trajectories: (
+            Iterable[Trajectory | BaseException] | Iterable[Awaitable[Trajectory]]
+        ),
         *,
         metadata: dict[str, MetadataValue] = {},
         exceptions: list[BaseException] = [],
     ) -> None:
         super().__init__(
-            trajectories=list(trajectories),
+            trajectories=[
+                trajectory
+                for trajectory in trajectories
+                if isinstance(trajectory, Trajectory)
+            ],
             metadata=metadata,
             exceptions=[
                 PydanticException(
-                    type=str(type(e)),
-                    message=str(e),
+                    type=str(type(exception)),
+                    message=str(exception),
                     traceback="\n".join(
-                        traceback.format_exception(type(e), e, e.__traceback__)
+                        traceback.format_exception(
+                            type(exception), exception, exception.__traceback__
+                        )
                     ),
                 )
-                for e in exceptions
+                for exception in (
+                    [
+                        exception
+                        for exception in trajectories
+                        if isinstance(exception, BaseException)
+                    ]
+                    + exceptions
+                )
             ],
         )
 
@@ -78,7 +93,7 @@ class TrajectoryGroup(pydantic.BaseModel):
     @overload
     def __new__(
         cls,
-        trajectories: Iterable[Trajectory],
+        trajectories: Iterable[Trajectory | BaseException],
         *,
         metadata: dict[str, MetadataValue] = {},
         exceptions: list[BaseException] = [],
@@ -95,7 +110,9 @@ class TrajectoryGroup(pydantic.BaseModel):
 
     def __new__(
         cls,
-        trajectories: Iterable[Trajectory] | Iterable[Awaitable[Trajectory]],
+        trajectories: (
+            Iterable[Trajectory | BaseException] | Iterable[Awaitable[Trajectory]]
+        ),
         *,
         metadata: dict[str, MetadataValue] = {},
         exceptions: list[BaseException] = [],
@@ -104,7 +121,7 @@ class TrajectoryGroup(pydantic.BaseModel):
         if all(isinstance(t, Trajectory) for t in ts):
             group = super().__new__(cls)
             group.__init__(
-                trajectories=cast(list[Trajectory], ts),
+                trajectories=cast(list[Trajectory | BaseException], ts),
                 metadata=metadata,
                 exceptions=exceptions,
             )
