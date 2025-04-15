@@ -5,7 +5,7 @@ from collections import Counter
 from dataclasses import dataclass, field
 from openai.types.chat.chat_completion import Choice
 from tqdm import auto as tqdm
-from typing import Awaitable, Iterable, Iterator, Literal, overload, Sequence
+from typing import Awaitable, Iterable, Iterator, Literal, overload
 
 from .trajectories import Trajectory, TrajectoryGroup
 
@@ -35,7 +35,7 @@ async def gather_trajectory_groups(
 
 @overload
 async def gather_trajectories(
-    trajectories: Iterable[Awaitable[Trajectory] | Awaitable[Iterable[Trajectory]]],
+    trajectories: Iterable[Awaitable[Trajectory]],
     *,
     pbar_desc: str | None = "gather",
     pbar_total_completion_tokens: bool = True,
@@ -45,7 +45,7 @@ async def gather_trajectories(
 
 @overload
 async def gather_trajectories(
-    trajectories: Iterable[Awaitable[Trajectory] | Awaitable[Iterable[Trajectory]]],
+    trajectories: Iterable[Awaitable[Trajectory]],
     *,
     pbar_desc: str | None = "gather",
     pbar_total_completion_tokens: bool = True,
@@ -53,27 +53,53 @@ async def gather_trajectories(
 ) -> list[Trajectory | BaseException]: ...
 
 
+@overload
 async def gather_trajectories(
-    trajectories: Iterable[Awaitable[Trajectory] | Awaitable[Iterable[Trajectory]]],
+    trajectories: Iterable[Awaitable[Iterable[Trajectory]]],
+    *,
+    pbar_desc: str | None = "gather",
+    pbar_total_completion_tokens: bool = True,
+    max_exceptions: Literal[0] = 0,
+) -> list[list[Trajectory]]: ...
+
+
+@overload
+async def gather_trajectories(
+    trajectories: Iterable[Awaitable[Iterable[Trajectory]]],
+    *,
+    pbar_desc: str | None = "gather",
+    pbar_total_completion_tokens: bool = True,
+    max_exceptions: int | float,
+) -> list[list[Trajectory] | BaseException]: ...
+
+
+async def gather_trajectories(
+    trajectories: (
+        Iterable[Awaitable[Trajectory]] | Iterable[Awaitable[Iterable[Trajectory]]]
+    ),
     *,
     pbar_desc: str | None = "gather",
     pbar_total_completion_tokens: bool = True,
     max_exceptions: int | float = 0,
-) -> list[Trajectory] | list[Trajectory | BaseException]:
-    trajectories = list(trajectories)
+) -> (
+    list[Trajectory]
+    | list[Trajectory | BaseException]
+    | list[list[Trajectory]]
+    | list[list[Trajectory] | BaseException]
+):
+    trajectories_list = list(trajectories)
     context = GatherContext(
-        pbar=tqdm.tqdm(desc=pbar_desc, total=len(trajectories)),
+        pbar=tqdm.tqdm(desc=pbar_desc, total=len(trajectories_list)),
         pbar_total_completion_tokens=pbar_total_completion_tokens,
         max_exceptions=max_exceptions,
     )
     with set_gather_context(context):
-        return [
-            trajectory
-            for trajectories in await asyncio.gather(
-                *[wrap_trajectories_awaitable(t) for t in trajectories]
-            )
-            for trajectory in trajectories
-        ]
+        results = await asyncio.gather(
+            *[wrap_trajectories_awaitable(t) for t in trajectories_list]
+        )
+    if context.pbar is not None:
+        context.pbar.close()
+    return results  # type: ignore
 
 
 async def wrap_group_awaitable(
@@ -97,14 +123,15 @@ async def wrap_group_awaitable(
 
 async def wrap_trajectories_awaitable(
     awaitable: Awaitable[Trajectory] | Awaitable[Iterable[Trajectory]],
-) -> Sequence[Trajectory | BaseException]:
+) -> Trajectory | list[Trajectory] | BaseException:
     context = get_gather_context()
     try:
         result = await awaitable
         if isinstance(result, Trajectory):
-            result = [result]
-        else:
-            result = list(result)
+            record_metrics(context, result)
+            context.update_pbar(n=1)
+            return result
+        result = list(result)
         for trajectory in result:
             record_metrics(context, trajectory)
         context.update_pbar(n=1)
@@ -115,7 +142,7 @@ async def wrap_trajectories_awaitable(
         if context.too_many_exceptions():
             raise
         else:
-            return [e]
+            return e
 
 
 def record_metrics(context: "GatherContext", trajectory: Trajectory) -> None:
