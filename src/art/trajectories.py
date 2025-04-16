@@ -16,8 +16,8 @@ class PydanticException(pydantic.BaseModel):
 
 
 class Trajectory(pydantic.BaseModel):
-    messages_and_choices: MessagesAndChoices = []
-    reward: float = -float("inf")
+    messages_and_choices: MessagesAndChoices
+    reward: float
     metrics: dict[str, float] = {}
     metadata: dict[str, MetadataValue] = {}
     logs: list[str] = []
