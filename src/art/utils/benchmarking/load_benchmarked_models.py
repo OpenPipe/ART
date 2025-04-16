@@ -1,7 +1,7 @@
 import os
 import copy
 
-from art.utils.benchmarking.types import BenchmarkedModelIteration, BenchmarkedModelKey, BenchmarkedModel
+from art.utils.benchmarking.types import BenchmarkedModelStep, BenchmarkedModelKey, BenchmarkedModel
 from art.utils.output_dirs import get_output_dir_from_model_properties, get_trajectories_split_dir
 from art.utils.trajectory_logging import deserialize_trajectory_groups
 
@@ -23,24 +23,24 @@ def load_benchmarked_models(
         split_dir = get_trajectories_split_dir(model_output_dir, benchmark_key.split)
 
         # get last file name in split_dir
-        max_iteration_index = -1
+        max_step_index = -1
 
         try:
-            max_iteration_index = int(os.listdir(split_dir)[-1].split(".")[0])
+            max_step_index = int(os.listdir(split_dir)[-1].split(".")[0])
         except Exception as e:
             print(f"Error getting max iteration index for {benchmark_key}")
             raise e
 
-        if benchmark_key.iteration_indices is None:
+        if benchmark_key.step_indices is None:
             # load all iterations
-            benchmark_key.iteration_indices = list(range(max_iteration_index + 1))
+            benchmark_key.step_indices = list(range(max_step_index + 1))
 
-        # allow users to count backward from max_iteration_index using negative indices
-        benchmark_key.iteration_indices = [index - 1 + max_iteration_index if index < 0 else index for index in benchmark_key.iteration_indices]
+        # allow users to count backward from max_step_index using negative indices
+        benchmark_key.step_indices = [index - 1 + max_step_index if index < 0 else index for index in benchmark_key.step_indices]
 
-        for index in benchmark_key.iteration_indices:
+        for index in benchmark_key.step_indices:
 
-            iteration = BenchmarkedModelIteration(index)
+            step = BenchmarkedModelStep(index)
 
             file_path = os.path.join(split_dir, f"{index:04d}.yaml")
 
@@ -63,9 +63,9 @@ def load_benchmarked_models(
                     group_averages.append(average)
                 if len(group_averages) == 0:
                     continue
-                iteration.metrics[metric] = sum(group_averages) / len(group_averages)
+                step.metrics[metric] = sum(group_averages) / len(group_averages)
 
-            benchmarked_model.iterations.append(iteration)
+            benchmarked_model.steps.append(step)
 
         benchmarked_models.append(benchmarked_model)
 

@@ -3,24 +3,24 @@
 class BenchmarkedModelKey:
     model: str
     split: str
-    iteration_indices: list[int] | None = None
+    step_indices: list[int] | None = None
 
-    def __init__(self, model: str, split: str, iteration_indices: list[int] | None = None):
+    def __init__(self, model: str, split: str, step_indices: list[int] | None = None):
         self.model = model
         self.split = split
-        self.iteration_indices = iteration_indices
+        self.step_indices = step_indices
 
 
     def __str__(self):
-        iterations_str = ""
-        if self.iteration_indices is not None:
-            if len(self.iteration_indices) == 1:
-                iterations_str = f"{self.iteration_indices[0]}"
+        steps_str = ""
+        if self.step_indices is not None:
+            if len(self.step_indices) == 1:
+                steps_str = f"{self.step_indices[0]}"
             else:
-                iterations_str = f"{self.iteration_indices[0]}-{self.iteration_indices[-1]}"
-        return f"{self.model} {self.split} {iterations_str} "
+                steps_str = f"{self.step_indices[0]}-{self.step_indices[-1]}"
+        return f"{self.model} {self.split} {steps_str}"
 
-class BenchmarkedModelIteration:
+class BenchmarkedModelStep:
     index: int
     metrics: dict[str, float] = {}
 
@@ -33,12 +33,12 @@ class BenchmarkedModelIteration:
 
 class BenchmarkedModel:
     model_key: BenchmarkedModelKey
-    iterations: list[BenchmarkedModelIteration] = []
+    steps: list[BenchmarkedModelStep] = []
 
-    def __init__(self, model_key: BenchmarkedModelKey, iterations: list[BenchmarkedModelIteration] | None = None):
+    def __init__(self, model_key: BenchmarkedModelKey, steps: list[BenchmarkedModelStep] | None = None):
         self.model_key = model_key
-        self.iterations = iterations if iterations is not None else []
+        self.steps = steps if steps is not None else []
 
     def __str__(self):
-        iterations_str = '\n'.join([str(iteration) for iteration in self.iterations])
-        return f"{self.model_key}\n{iterations_str}"
+        steps_str = '\n'.join([str(step) for step in self.steps])
+        return f"{self.model_key}\n{steps_str}"
