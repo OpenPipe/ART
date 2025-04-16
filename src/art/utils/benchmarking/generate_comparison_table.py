@@ -14,13 +14,14 @@ def generate_comparison_table(
     rows = []
 
     for benchmarked_model in benchmarked_models:
-        row = {
-            "Model": benchmarked_model.model_key.model,
-            "Split": benchmarked_model.model_key.split,
-            "Iteration": f"{benchmarked_model.model_key.iteration:04d}"
-        }
-        for metric in metrics:
-            row[metric] = benchmarked_model.metrics.get(metric, "N/A")
-        rows.append(row)
+        for iteration in benchmarked_model.iterations:
+            row = {
+                "Model": benchmarked_model.model_key.model,
+                "Split": benchmarked_model.model_key.split,
+                "Iteration": f"{iteration.index:04d}"
+            }
+            for metric in metrics:
+                row[metric] = iteration.metrics.get(metric, "N/A")
+            rows.append(row)
 
     return pd.DataFrame(rows, columns=["Model", "Split", "Iteration"] + metrics)
