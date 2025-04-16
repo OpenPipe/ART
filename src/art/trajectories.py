@@ -25,6 +25,7 @@ class Trajectory(pydantic.BaseModel):
     def __str__(self) -> str:
         return f"Trajectory(reward={self.reward}, metrics={self.metrics}, metadata={self.metadata})"
 
+    # Used for logging to console
     def for_logging(self) -> dict[str, Any]:
         loggable_dict = {
             "reward": self.reward,
