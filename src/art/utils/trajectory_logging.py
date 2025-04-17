@@ -39,14 +39,13 @@ def trajectory_to_dict(trajectory: Trajectory) -> dict[str, Any]:
 def message_or_choice_to_dict(message_or_choice: Message | Choice) -> dict[str, Any]:
     # messages are sometimes stored as dicts, so we need to handle both cases
     item_dict = message_or_choice if isinstance(message_or_choice, dict) else message_or_choice.to_dict()
-
-    if "message" in item_dict:
-        # item is a choice, remove the logprobs
+    
+    if "logprobs" in item_dict:
+        # item is a choice with logprobs, remove the logprobs
         item_dict.pop("logprobs")
-        return item_dict
-    else:
-        # item is a message, return the item as is
-        return item_dict
+
+    return item_dict
+
 
 def deserialize_trajectory_groups(serialized: str) -> list[TrajectoryGroup]:
     loaded_groups = yaml.load(serialized, Loader=yaml.SafeLoader)
