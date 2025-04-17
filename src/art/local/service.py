@@ -26,7 +26,7 @@ class ModelService:
     host: str
     port: int
     model_name: str
-    base_model: types.TrainableModelName
+    base_model: str
     config: dev.InternalModelConfig
     output_dir: str
     _openai_server_task: asyncio.Task[None] | None = None

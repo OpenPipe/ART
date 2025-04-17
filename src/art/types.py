@@ -3,16 +3,6 @@ from openai.types.chat.chat_completion_message_param import ChatCompletionMessag
 import pydantic
 from typing import Literal
 
-TrainableModelName = Literal[
-    "Qwen/Qwen2.5-0.5B-Instruct",
-    "Qwen/Qwen2.5-1.5B-Instruct",
-    "Qwen/Qwen2.5-3B-Instruct",
-    "Qwen/Qwen2.5-7B-Instruct",
-    "Qwen/Qwen2.5-14B-Instruct",
-    "Qwen/Qwen2.5-32B-Instruct",
-    "Qwen/Qwen2.5-72B-Instruct",
-]
-
 Message = ChatCompletionMessageParam
 MessageOrChoice = Message | Choice
 Messages = list[Message]

@@ -45,15 +45,7 @@ This training loop runs until a specified number of inference and training itera
 
 ## Supported Models
 
-ART currently supports the following models, and we plan to add more soon!
-
-- [`Qwen/Qwen2.5-0.5B-Instruct`](https://huggingface.co/Qwen/Qwen2.5-0.5B-Instruct)
-- [`Qwen/Qwen2.5-1.5B-Instruct`](https://huggingface.co/Qwen/Qwen2.5-1.5B-Instruct)
-- [`Qwen/Qwen2.5-3B-Instruct`](https://huggingface.co/Qwen/Qwen2.5-3B-Instruct)
-- [`Qwen/Qwen2.5-7B-Instruct`](https://huggingface.co/Qwen/Qwen2.5-7B-Instruct)
-- [`Qwen/Qwen2.5-14B-Instruct`](https://huggingface.co/Qwen/Qwen2.5-14B-Instruct)
-- [`Qwen/Qwen2.5-32B-Instruct`](https://huggingface.co/Qwen/Qwen2.5-32B-Instruct)
-- [`Qwen/Qwen2.5-72B-Instruct`](https://huggingface.co/Qwen/Qwen2.5-72B-Instruct)
+ART should work with any vLLM/HuggingFace-transformers compatible causal language model, or at least the ones supported by [Unsloth](https://docs.unsloth.ai/get-started/all-our-models). If a model isn't working for you, please let us know on [Discord](https://discord.com/invite/dnseNZuQ) or open an issue on [GitHub](https://github.com/openpipe/art/issues)!
 
 ## ⚠️ Disclaimer
 

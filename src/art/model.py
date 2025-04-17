@@ -4,7 +4,7 @@ from typing import cast, Iterable, TYPE_CHECKING, Optional
 from . import dev
 from .openai import patch_openai
 from .trajectories import Trajectory, TrajectoryGroup
-from .types import TrainableModelName, TrainConfig
+from .types import TrainConfig
 from pydantic import BaseModel
 from openai import (
     AsyncOpenAI,
@@ -76,7 +76,7 @@ class Model(BaseModel):
 
 
 class TrainableModel(Model):
-    base_model: TrainableModelName
+    base_model: str
     trainable: bool = True
 
     # The fields within `_internal_config` are unstable and subject to change.

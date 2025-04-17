@@ -8,16 +8,13 @@ from transformers.trainer_utils import (
     SaveStrategy,
     SchedulerType,
 )
-from typing import TYPE_CHECKING, TypedDict
+from typing import TypedDict
 
 from .engine import EngineArgs
 
-if TYPE_CHECKING:
-    from .. import types
-
 
 def get_model_config(
-    base_model: "types.TrainableModelName",
+    base_model: str,
     output_dir: str,
     config: "InternalModelConfig | None",
 ) -> "InternalModelConfig":
