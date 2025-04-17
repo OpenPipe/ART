@@ -15,14 +15,14 @@ def trajectory_group_to_dict(trajectory_group: TrajectoryGroup) -> dict[str, Any
 
     trajectory_dicts = []
     for trajectory in trajectory_group.trajectories:
-        if isinstance(trajectory, BaseException):
+        if not isinstance(trajectory, Trajectory):
+            # remove exceptions
             continue
         trajectory_dicts.append(trajectory_to_dict(trajectory))
 
     return {
         "trajectories": trajectory_dicts,
         "metadata": trajectory_group.metadata,
-        "exceptions": trajectory_group.exceptions,
     }
 
 def trajectory_to_dict(trajectory: Trajectory) -> dict[str, Any]:
