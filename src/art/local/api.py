@@ -341,7 +341,7 @@ class LocalAPI:
     def _get_wandb_run(self, model: TrainableModel) -> Run | None:
         if "WANDB_API_KEY" not in os.environ:
             return None
-        if model.name not in self._wandb_runs:
+        if model.name not in self._wandb_runs or self._wandb_runs[model.name]._is_finished:
             run = wandb.init(
                 project=model.project,
                 name=model.name,
