@@ -106,41 +106,51 @@ def tokenize_trajectory(
     """
     Tokenizes a trajectory and returns a TokenizedResult.
     """
-    # Convert Choice objects to dicts for compatibility with the tokenizer.
-    conversation: list = [
-        (
-            message_or_choice
-            if isinstance(message_or_choice, dict)
-            else {
-                "role": "assistant",
-                "content": message_or_choice.message.content or "",
-            }
-        )
-        for message_or_choice in trajectory.messages_and_choices
-    ]
     # Update the chat template to add generation tags for assistant token masking.
     # TODO: Improve the way we get chat templates, potentially just use the default
     # chat template and identify the assistant tokens a different way.
-    chat_template = _updated_chat_template(tokenizer.get_chat_template())
+    # chat_template = _updated_chat_template(tokenizer.get_chat_template())
     # Apply the chat template to the conversation to get a string representation.
     chat = cast(
         str,
         tokenizer.apply_chat_template(
-            conversation,
-            chat_template=chat_template,
+            cast(list[dict], trajectory.messages),
             tokenize=False,
         ),
     )
-    # Tokenize the conversation and get the tokenized result and assistant mask.
-    tokenized_result = cast(
-        TokenizedResultDict,
+    original_token_ids = cast(
+        list[int], tokenizer.apply_chat_template(cast(list[dict], trajectory.messages))
+    )
+    sentinal_token_id = max(
+        set(range(cast(int, tokenizer.vocab_size))) - set(original_token_ids)
+    )
+    sentinal_token = tokenizer.decode(sentinal_token_id)
+    token_ids = cast(
+        list[int],
         tokenizer.apply_chat_template(
-            conversation,
-            chat_template=chat_template,
-            return_dict=True,
-            return_assistant_tokens_mask=True,
+            cast(
+                list[dict],
+                [
+                    (
+                        message_or_choice
+                        if isinstance(message_or_choice, dict)
+                        else {
+                            "role": "assistant",
+                            "content": sentinal_token,
+                        }
+                    )
+                    for message_or_choice in trajectory.messages_and_choices
+                ],
+            ),
+            tokenize=False,
         ),
     )
+    # Initialize logprobs with NaNs.
+    logprobs = [float("nan")] * len(token_ids)
+    for message_or_choice in trajectory.messages_and_choices:
+        if isinstance(message_or_choice, dict):
+            continue
+        choice = message_or_choice
     # Initialize logprobs with NaNs.
     logprobs = [float("nan")] * len(tokenized_result["input_ids"])
     # Update the tokenized result and logprobs with the logprobs from the chat completion choices.

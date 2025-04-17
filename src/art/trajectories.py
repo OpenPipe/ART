@@ -3,7 +3,7 @@ import pydantic
 import traceback
 from typing import Awaitable, Any, cast, Iterable, Iterator, overload
 from openai.types.chat.chat_completion import Choice
-from .types import MessagesAndChoices
+from .types import Messages, MessagesAndChoices
 
 
 MetadataValue = float | int | str | bool | None
@@ -24,6 +24,17 @@ class Trajectory(pydantic.BaseModel):
 
     def __str__(self) -> str:
         return f"Trajectory(reward={self.reward}, metrics={self.metrics}, metadata={self.metadata})"
+
+    @property
+    def messages(self) -> Messages:
+        return [
+            (
+                {"role": "assistant", "content": message_or_choice.message.content}
+                if isinstance(message_or_choice, Choice)
+                else message_or_choice
+            )
+            for message_or_choice in self.messages_and_choices
+        ]
 
     # Used for logging to console
     def for_logging(self) -> dict[str, Any]:
