@@ -8,3 +8,4 @@ def display_image_grid(image_paths: list[str], images_per_row: int = 2):
         html += f"<img src='{path}' style='max-width: 100%; height: auto;'>"
     html += "</div>"
     display(HTML(html))
+    
