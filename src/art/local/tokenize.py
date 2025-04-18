@@ -97,12 +97,16 @@ def tokenize_trajectory(
         str,
         tokenizer.apply_chat_template(
             cast(list[dict], trajectory.messages()),
+            tools=trajectory.tools,  # type: ignore
             tokenize=False,
         ),
     )
     original_token_ids = cast(
         list[int],
-        tokenizer.apply_chat_template(cast(list[dict], trajectory.messages())),
+        tokenizer.apply_chat_template(
+            cast(list[dict], trajectory.messages()),
+            tools=trajectory.tools,  # type: ignore
+        ),
     )
     sentinal_token_id = max(
         set(range(cast(int, tokenizer.vocab_size))) - set(original_token_ids)
@@ -124,7 +128,8 @@ def tokenize_trajectory(
                     )
                     for message_or_choice in trajectory.messages_and_choices
                 ],
-            )
+            ),
+            tools=trajectory.tools,  # type: ignore
         ),
     )
     logprobs = [float("nan")] * len(token_ids)

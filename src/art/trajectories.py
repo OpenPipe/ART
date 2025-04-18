@@ -3,7 +3,10 @@ import pydantic
 import traceback
 from typing import Awaitable, Any, cast, Iterable, Iterator, overload
 from openai.types.chat.chat_completion import Choice
-from .types import Messages, MessagesAndChoices
+from openai.types.chat.chat_completion_message_tool_call_param import (
+    ChatCompletionMessageToolCallParam,
+)
+from .types import Messages, MessagesAndChoices, Tools
 
 
 MetadataValue = float | int | str | bool | None
@@ -17,6 +20,7 @@ class PydanticException(pydantic.BaseModel):
 
 class Trajectory(pydantic.BaseModel):
     messages_and_choices: MessagesAndChoices
+    tools: Tools | None = None
     reward: float
     metrics: dict[str, float] = {}
     metadata: dict[str, MetadataValue] = {}
@@ -28,7 +32,27 @@ class Trajectory(pydantic.BaseModel):
     def messages(self) -> Messages:
         return [
             (
-                {"role": "assistant", "content": message_or_choice.message.content}
+                {
+                    "role": "assistant",
+                    "content": message_or_choice.message.content,
+                    **(
+                        {
+                            "tool_calls": [
+                                {
+                                    "id": tool_call.id,
+                                    "type": tool_call.type,
+                                    "function": {
+                                        "name": tool_call.function.name,
+                                        "arguments": tool_call.function.arguments,
+                                    },
+                                }
+                                for tool_call in message_or_choice.message.tool_calls
+                            ]
+                        }
+                        if message_or_choice.message.tool_calls
+                        else {}
+                    ),  # type: ignore
+                }
                 if isinstance(message_or_choice, Choice)
                 else message_or_choice
             )
@@ -42,6 +66,7 @@ class Trajectory(pydantic.BaseModel):
             "metrics": self.metrics,
             "metadata": self.metadata,
             "messages": [],
+            "tools": self.tools,
             "logs": self.logs,
         }
         for message_or_choice in self.messages_and_choices:
