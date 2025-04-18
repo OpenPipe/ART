@@ -96,12 +96,13 @@ def tokenize_trajectory(
     chat = cast(
         str,
         tokenizer.apply_chat_template(
-            cast(list[dict], trajectory.messages),
+            cast(list[dict], trajectory.messages()),
             tokenize=False,
         ),
     )
     original_token_ids = cast(
-        list[int], tokenizer.apply_chat_template(cast(list[dict], trajectory.messages))
+        list[int],
+        tokenizer.apply_chat_template(cast(list[dict], trajectory.messages())),
     )
     sentinal_token_id = max(
         set(range(cast(int, tokenizer.vocab_size))) - set(original_token_ids)

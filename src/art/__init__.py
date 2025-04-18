@@ -13,7 +13,7 @@ from . import dev
 from .gather import gather_trajectories, gather_trajectory_groups
 from .model import Model, TrainableModel
 from .trajectories import Trajectory, TrajectoryGroup
-from .types import Messages, MessagesAndChoices, TrainConfig
+from .types import Messages, MessagesAndChoices, Tools, TrainConfig
 from .local import LocalAPI
 from .utils import retry
 
@@ -24,6 +24,7 @@ __all__ = [
     "LocalAPI",
     "Messages",
     "MessagesAndChoices",
+    "Tools",
     "Model",
     "TrainableModel",
     "retry",

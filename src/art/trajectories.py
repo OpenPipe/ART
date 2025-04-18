@@ -25,7 +25,6 @@ class Trajectory(pydantic.BaseModel):
     def __str__(self) -> str:
         return f"Trajectory(reward={self.reward}, metrics={self.metrics}, metadata={self.metadata})"
 
-    @property
     def messages(self) -> Messages:
         return [
             (
