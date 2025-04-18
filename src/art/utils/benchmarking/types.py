@@ -1,4 +1,4 @@
-
+from datetime import datetime
 
 class BenchmarkedModelKey:
     model: str
@@ -22,6 +22,7 @@ class BenchmarkedModelKey:
 
 class BenchmarkedModelStep:
     index: int
+    recorded_at: datetime | None = None
     metrics: dict[str, float] = {}
 
     def __init__(self, index: int, metrics: dict[str, float] | None = None):

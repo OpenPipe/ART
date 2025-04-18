@@ -1,7 +1,7 @@
-import pandas as pd
 import os
 from datetime import datetime
 import matplotlib.pyplot as plt
+from typing import Literal
 
 from .load_benchmarked_models import load_benchmarked_models
 from .types import BenchmarkedModelKey
@@ -13,36 +13,48 @@ def generate_line_graphs(
     line_graph_keys: list[BenchmarkedModelKey],
     comparison_keys: list[BenchmarkedModelKey],
     metrics: list[str] = ["reward"],
+    x_axis_metric: Literal["step", "time"] = "step",
     api_path: str = "./.art"
 ) -> list[str]:
     benchmarks_dir = get_benchmarks_dir(project, api_path)
     os.makedirs(benchmarks_dir, exist_ok=True)
 
     line_graph_models = load_benchmarked_models(project, line_graph_keys, metrics, api_path)
+
+    if x_axis_metric == "time":
+        def has_all_recorded(model):
+            for step in model.steps:
+                if step.recorded_at is None:
+                    print(f"WARNING: Model {model.model_key} is missing a recorded_at time for step {step.index}, removing from line graph models")
+                    return False
+            return True
+
+        line_graph_models = [model for model in line_graph_models if has_all_recorded(model)]
+
     comparison_models = load_benchmarked_models(project, comparison_keys, metrics, api_path)
     image_paths = []
 
     for metric in metrics:
         plt.figure()  # Create a new figure for each metric
         for model in line_graph_models:
-            steps = [step.index for step in model.steps]
+            x_values = [step.recorded_at if x_axis_metric == "time" else step.index for step in model.steps]
             values = [step.metrics.get(metric, float('nan')) for step in model.steps]
             label = f"{model.model_key.model} {model.model_key.split}"
-            plt.plot(steps, values, label=label)
+            plt.plot(x_values, values, label=label)
 
             # Add a dot only at the last point
-            if steps and values:
-                plt.scatter(steps[-1], values[-1], s=10)
+            if x_values and values:
+                plt.scatter(x_values[-1], values[-1], s=10)
 
         for model in comparison_models:
             last_step = model.steps[-1]
             # draw horizontal black dashed line at the last step's value
             plt.axhline(y=last_step.metrics[metric], color='black', linestyle='--')
-            plt.text(steps[-1], last_step.metrics[metric], f"{model.model_key.model} {model.model_key.split}",
+            plt.text(x_values[-1], last_step.metrics[metric], f"{model.model_key.model} {model.model_key.split}",
                      ha='right', va='bottom', fontsize=8, color='black')
 
         plt.title(metric)
-        plt.xlabel("Step")
+        plt.xlabel(x_axis_metric)
         plt.ylabel(metric)
         plt.legend()
         plt.grid(axis='y', color='lightgray', linestyle='--', linewidth=0.25)

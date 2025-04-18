@@ -1,6 +1,8 @@
 import os
 import copy
+import json
 
+from art.utils.benchmarking.calculate_step_metrics import calculate_step_std_dev
 from art.utils.benchmarking.types import BenchmarkedModelStep, BenchmarkedModelKey, BenchmarkedModel
 from art.utils.output_dirs import get_output_dir_from_model_properties, get_trajectories_split_dir
 from art.utils.trajectory_logging import deserialize_trajectory_groups
@@ -22,6 +24,16 @@ def load_benchmarked_models(
         model_output_dir = get_output_dir_from_model_properties(project, benchmark_key.model, api_path)
         split_dir = get_trajectories_split_dir(model_output_dir, benchmark_key.split)
 
+        history_logs = []
+
+        with open(os.path.join(model_output_dir, "history.jsonl"), "r") as f:
+            for line in f:
+                # only include logs that have a recorded_at value
+                log = json.loads(line)
+                if "recorded_at" in log:
+                    history_logs.append(log)
+                    
+
         # get last file name in split_dir
         max_step_index = -1
 
@@ -41,6 +53,13 @@ def load_benchmarked_models(
         for index in benchmark_key.step_indices:
 
             step = BenchmarkedModelStep(index)
+
+            # find the most recent log that has a step value equal to index
+            for log in reversed(history_logs):
+                if log["step"] == index:
+                    step.recorded_at = log["recorded_at"]
+                    break
+            
 
             file_path = os.path.join(split_dir, f"{index:04d}.yaml")
 
@@ -64,6 +83,8 @@ def load_benchmarked_models(
                 if len(group_averages) == 0:
                     continue
                 step.metrics[metric] = sum(group_averages) / len(group_averages)
+
+            step.metrics["reward_std_dev"] = calculate_step_std_dev(trajectory_groups)
 
             benchmarked_model.steps.append(step)
 

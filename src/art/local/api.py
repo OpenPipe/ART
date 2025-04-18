@@ -1,5 +1,7 @@
+from datetime import datetime
 import json
 import math
+from art.utils.benchmarking.calculate_step_metrics import calculate_step_std_dev
 from art.utils.output_dirs import get_output_dir_from_model, get_trajectories_split_dir
 from art.utils.trajectory_logging import serialize_trajectory_groups
 from mp_actors import move_to_child_process
@@ -211,10 +213,8 @@ class LocalAPI:
 
         # Collect all metrics (including reward) across all trajectories
         all_metrics: dict[str, list[float]] = {"reward": [], "exception_rate": []}
-        group_rewards = []
 
         for group in trajectory_groups:
-            group_reward_values = []
             for trajectory in group:
                 if isinstance(trajectory, BaseException):
                     all_metrics["exception_rate"].append(1)
@@ -223,18 +223,12 @@ class LocalAPI:
                     all_metrics["exception_rate"].append(0)
                 # Add reward metric
                 all_metrics["reward"].append(trajectory.reward)
-                if not isinstance(trajectory, BaseException):
-                    group_reward_values.append(trajectory.reward)
 
                 # Collect other custom metrics
                 for metric, value in trajectory.metrics.items():
                     if metric not in all_metrics:
                         all_metrics[metric] = []
                     all_metrics[metric].append(value)
-
-            # Store rewards for each group for standard deviation calculation
-            if group_reward_values:
-                group_rewards.append(group_reward_values)
 
         # Calculate averages for all metrics
         averages = {}
@@ -243,19 +237,7 @@ class LocalAPI:
                 averages[metric] = sum(values) / len(values)
 
         # Calculate average standard deviation of rewards within groups
-        if group_rewards:
-            # Calculate standard deviation within each group
-            group_std_devs = []
-            for rewards in group_rewards:
-                if len(rewards) > 1:  # Need at least 2 values for std dev
-                    mean = sum(rewards) / len(rewards)
-                    variance = sum((r - mean) ** 2 for r in rewards) / len(rewards)
-                    std_dev = variance**0.5
-                    group_std_devs.append(std_dev)
-
-            # Calculate average of the standard deviations
-            if group_std_devs:
-                averages["reward_std_dev"] = sum(group_std_devs) / len(group_std_devs)
+        averages["reward_std_dev"] = calculate_step_std_dev(trajectory_groups)
 
         self._log_data(model, averages, split)
 
@@ -326,7 +308,7 @@ class LocalAPI:
             f.write(
                 json.dumps(
                     {k: v for k, v in data.items() if v == v}  # Filter out NaN values
-                    | {"step": step}
+                    | {"step": step, "recorded_at": datetime.now().isoformat()}
                 )
                 + "\n"
             )
