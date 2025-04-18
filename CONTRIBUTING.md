@@ -37,6 +37,8 @@ Launch a cluster:
 ./scripts/launch-cluster.sh # you can pass any sky launch arguments here
 ```
 
+Make sure you are on a machine with at least one H100 or A100-80GB GPU. Machines equipped with lower-end GPUs may work, but training will be slower.
+
 You can now SSH into the `art` cluster, using either VSCode or the command line.
 
 ### Connecting via Command Line
@@ -77,19 +79,9 @@ ssh art
 5. **Run a notebook**
    - Find `2048.ipynb` and run it!
 
-### Cleaning Up
+### "2048" example
 
-When you're done, you can tear down the cluster with:
-
-```bash
-uv run sky down art
-```
-
-Make sure you are on a machine with at least one H100 or A100-80GB GPU. Machines equipped with lower-end GPUs may work, but training will be slower.
-
-### "Temporal Clue" example
-
-Now you can run the "Temporal Clue" example in `/examples/temporal-clue.ipynb`.
+Now you can run the "2048" example in `/examples/2048/2048.ipynb`.
 
 It has been tested with the `Qwen/Qwen2.5-14B-Instruct` model on a 1xH100 instance.
 
@@ -98,3 +90,11 @@ You can monitor training progress with Weights & Biases at https://wandb.ai/your
 You should see immediate improvement in `val/reward` after one step.
 
 If you run into any issues, the training output is set to maximum verbosity. Copying the outputs such as the vLLM or torchtune logs, or copying/screenshotting the plotted packed tensors, may help me debug the issue.
+
+### Cleaning Up
+
+When you're done, you can tear down the cluster with:
+
+```bash
+uv run sky down art
+```
