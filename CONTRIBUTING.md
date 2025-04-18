@@ -77,6 +77,8 @@ ssh art
 5. **Run a notebook**
    - Find `2048.ipynb` and run it!
 
+### Cleaning Up
+
 When you're done, you can tear down the cluster with:
 
 ```bash
