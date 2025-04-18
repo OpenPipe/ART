@@ -34,14 +34,49 @@ uv run sky check
 Launch a cluster:
 
 ```bash
-./launch-cluster.sh # you can pass any sky launch arguments here
+./scripts/launch-cluster.sh # you can pass any sky launch arguments here
 ```
 
-SSH into the `art` cluster with VSCode or from the command line:
+You can now SSH into the `art` cluster, using either VSCode or the command line.
+
+### Connecting via Command Line
+
+Simply run:
 
 ```bash
 ssh art
 ```
+
+### Connecting via VSCode
+
+1. Install the Remote-SSH extension on your local machine
+
+- Open the extensions view by clicking on the Extensions icon in the Activity Bar on the left.
+- Search for "Remote-SSH" and install it.
+
+2. Configure default extensions for your remote host
+
+- In your VSCode settings, find "Remote.SSH: **Default Extensions**"
+- Add the following extensions:
+  - `ms-python.python`
+  - `ms-toolsai.jupyter`
+  - `eamodio.gitlens`
+  - `charliermarsh.ruff`
+
+3. Connect to the host
+
+- Open the command palette and run "**Remote-SSH: Connect to Host...**"
+- Select `art`
+
+4. Set up the host
+
+- Click "**Open Folder**"
+- Select "**sky_workdir**"
+- Click **OK**
+
+5. Run a notebook
+
+- Find `2048.ipynb` and run it!
 
 When you're done, you can tear down the cluster with:
 
