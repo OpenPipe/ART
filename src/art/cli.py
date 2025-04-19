@@ -19,6 +19,7 @@ app = typer.Typer()
 def run(host: str = "0.0.0.0", port: int = 2218) -> None:
     """Run the ART CLI."""
 
+    # Reset the custom __new__ and __init__ methods for TrajectoryGroup
     def __new__(cls, *args: Any, **kwargs: Any) -> TrajectoryGroup:
         return pydantic.BaseModel.__new__(cls)
 
