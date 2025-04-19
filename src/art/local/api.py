@@ -17,6 +17,7 @@ import wandb
 from wandb.sdk.wandb_run import Run
 
 from .. import dev
+from ..api import API
 from ..model import Model, TrainableModel
 from .service import ModelService
 from ..trajectories import Trajectory, TrajectoryGroup
@@ -35,7 +36,7 @@ from .checkpoints import (
 )
 
 
-class LocalAPI:
+class LocalAPI(API):
     def __init__(self, *, in_process: bool = False, path: str = "./.art") -> None:
         """
         Initializes a local, directory-based API interface at the given path.
@@ -47,7 +48,6 @@ class LocalAPI:
         Args:
             in_process: Whether to run the local service in-process.
             path: The path to the local directory. Defaults to "./.art".
-            wandb_project: The preferred Weights & Biases project.
         """
         self._in_process = in_process
         self._path = path
@@ -61,7 +61,7 @@ class LocalAPI:
     async def register(
         self,
         model: Model,
-    ):
+    ) -> None:
         """
         Registers a model with the local API for logging and/or training.
 
@@ -323,7 +323,10 @@ class LocalAPI:
     def _get_wandb_run(self, model: TrainableModel) -> Run | None:
         if "WANDB_API_KEY" not in os.environ:
             return None
-        if model.name not in self._wandb_runs or self._wandb_runs[model.name]._is_finished:
+        if (
+            model.name not in self._wandb_runs
+            or self._wandb_runs[model.name]._is_finished
+        ):
             run = wandb.init(
                 project=model.project,
                 name=model.name,

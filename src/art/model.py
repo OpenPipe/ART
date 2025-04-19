@@ -2,6 +2,7 @@ from openai import AsyncOpenAI
 from typing import cast, Iterable, TYPE_CHECKING, Optional
 
 from . import dev
+from .api import API
 from .openai import patch_openai
 from .trajectories import Trajectory, TrajectoryGroup
 from .types import TrainConfig
@@ -13,7 +14,7 @@ from openai import (
 import httpx
 
 if TYPE_CHECKING:
-    from .local.api import LocalAPI
+    from .api import API
 
 
 class Model(BaseModel):
@@ -29,16 +30,16 @@ class Model(BaseModel):
     api_key: str | None = None
 
     trainable: bool = False
-    _api: Optional["LocalAPI"] = None
+    _api: Optional["API"] = None
 
-    def api(self) -> "LocalAPI":
+    def api(self) -> "API":
         if self._api is None:
             raise ValueError(
                 "Model is not registered with the API. You must call `model.register()` first."
             )
         return self._api
 
-    async def register(self, api: "LocalAPI") -> None:
+    async def register(self, api: "API") -> None:
         if self.config is not None:
             try:
                 self.config.model_dump_json()
@@ -85,7 +86,7 @@ class TrainableModel(Model):
 
     async def register(
         self,
-        api: "LocalAPI",
+        api: "API",
         _openai_client_config: dev.OpenAIServerConfig | None = None,
     ) -> None:
         await super().register(api)
