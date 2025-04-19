@@ -21,6 +21,7 @@ dependencies = [
     "tblib>=3.0.0",
     "litellm>=1.63.0",
     "polars>=1.26.0",
+    "awscli>=1.38.1",
 ]
 
 [build-system]

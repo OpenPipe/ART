@@ -30,6 +30,8 @@ class Model(BaseModel):
 
     trainable: bool = False
     _api: Optional["LocalAPI"] = None
+    _s3_bucket: str | None = None
+    _s3_prefix: str | None = None
 
     def api(self) -> "LocalAPI":
         if self._api is None:
@@ -73,6 +75,53 @@ class Model(BaseModel):
             trajectory_groups,
             split,
         )
+
+    async def pull_from_s3(
+        self,
+        s3_bucket: str,
+        *,
+        prefix: str | None = None,
+        verbose: bool = False,
+    ) -> None:
+        """Sync the model directory from S3 into the local output directory.
+
+        Args:
+            s3_bucket: The name of the S3 bucket (without the ``s3://`` scheme).
+            prefix: Optional key prefix inside the bucket. Do **not** include leading or trailing slashes.
+            verbose: When *True*, stream `aws` output; otherwise, suppress it.
+        """
+        await self.api()._pull_from_s3(
+            self, s3_bucket=s3_bucket, prefix=prefix, verbose=verbose
+        )
+        # Cache for later pushes.
+        self._s3_bucket, self._s3_prefix = s3_bucket, prefix
+
+    async def push_to_s3(
+        self,
+        s3_bucket: str | None = None,
+        *,
+        prefix: str | None = None,
+        verbose: bool = False,
+    ) -> None:
+        """Sync the local model directory **to** S3.
+
+        Args:
+            s3_bucket: The bucket to upload to. If omitted, the bucket from the most recent pull/push is reused.
+            prefix: Optional prefix; if omitted, reuse the stored prefix from the last pull/push.
+            verbose: When *True*, stream `aws` output; otherwise, suppress it.
+        """
+        s3_bucket = s3_bucket or self._s3_bucket
+        if s3_bucket is None:
+            raise ValueError(
+                "No S3 bucket specified — pass `s3_bucket=` explicitly or call `pull_from_s3` first."
+            )
+        prefix = prefix if prefix is not None else self._s3_prefix
+
+        await self.api()._push_to_s3(
+            self, s3_bucket=s3_bucket, prefix=prefix, verbose=verbose
+        )
+        # Remember for next time.
+        self._s3_bucket, self._s3_prefix = s3_bucket, prefix
 
 
 class TrainableModel(Model):

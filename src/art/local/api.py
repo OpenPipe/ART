@@ -33,6 +33,7 @@ from .checkpoints import (
     delete_checkpoints,
     get_step,
 )
+from .s3_sync import s3_sync
 
 
 class LocalAPI:
@@ -198,7 +199,6 @@ class LocalAPI:
         trajectory_groups: list[TrajectoryGroup],
         split: str = "val",
     ) -> None:
-
         # Save logs for trajectory groups
         parent_dir = get_trajectories_split_dir(get_output_dir_from_model(model), split)
         os.makedirs(parent_dir, exist_ok=True)
@@ -239,7 +239,8 @@ class LocalAPI:
         # Calculate average standard deviation of rewards within groups
         averages["reward_std_dev"] = calculate_step_std_dev(trajectory_groups)
 
-        self._log_data(model, averages, split)
+        if isinstance(model, TrainableModel):
+            self._log_metrics(model, averages, split)
 
     def _trajectory_log(self, trajectory: Trajectory) -> str:
         """Format a trajectory into a readable log string."""
@@ -286,28 +287,32 @@ class LocalAPI:
             k: sum(d.get(k, 0) for d in results) / sum(1 for d in results if k in d)
             for k in {k for d in results for k in d}
         }
-        self._log_data(model, data, "train", step_offset=-1)
+        self._log_metrics(model, data, "train", step_offset=-1)
 
-    def _log_data(
+    def _log_metrics(
         self,
         model: TrainableModel,
-        data: dict[str, float],
-        namespace: str,
+        metrics: dict[str, float],
+        split: str,
         step_offset: int = 0,
     ) -> None:
         # Add namespacing if needed
-        data = (
-            {f"{namespace}/{metric}": value for metric, value in data.items()}
-            if namespace
-            else data
+        metrics = (
+            {f"{split}/{metric}": value for metric, value in metrics.items()}
+            if split
+            else metrics
         )
-        step = self.__get_step(model) + step_offset
+        step = (
+            self.__get_step(model) if isinstance(model, TrainableModel) else 0
+        ) + step_offset
 
         # Log the data to history.jsonl
         with open(f"{get_output_dir_from_model(model)}/history.jsonl", "a") as f:
             f.write(
                 json.dumps(
-                    {k: v for k, v in data.items() if v == v}  # Filter out NaN values
+                    {
+                        k: v for k, v in metrics.items() if v == v
+                    }  # Filter out NaN values
                     | {"step": step, "recorded_at": datetime.now().isoformat()}
                 )
                 + "\n"
@@ -316,14 +321,17 @@ class LocalAPI:
         # If we have a W&B run, log the data there as well
         if run := self._get_wandb_run(model):
             run.log(
-                data,
+                metrics,
                 step=step,
             )
 
     def _get_wandb_run(self, model: TrainableModel) -> Run | None:
         if "WANDB_API_KEY" not in os.environ:
             return None
-        if model.name not in self._wandb_runs or self._wandb_runs[model.name]._is_finished:
+        if (
+            model.name not in self._wandb_runs
+            or self._wandb_runs[model.name]._is_finished
+        ):
             run = wandb.init(
                 project=model.project,
                 name=model.name,
@@ -332,3 +340,56 @@ class LocalAPI:
             )
             self._wandb_runs[model.name] = run
         return self._wandb_runs[model.name]
+
+    # ------------------------------------------------------------------
+    # Internal helpers
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _build_s3_path(
+        *,
+        s3_bucket: str,
+        prefix: str | None,
+        project: str,
+        model: str,
+    ) -> str:
+        """Return the fully-qualified S3 URI for this model directory."""
+        prefix_part = f"{prefix.strip('/')}/" if prefix else ""
+        return f"s3://{s3_bucket}/{prefix_part}{project}/models/{model}"
+
+    async def _pull_from_s3(
+        self,
+        model: Model,
+        *,
+        s3_bucket: str,
+        prefix: str | None = None,
+        verbose: bool = False,
+    ) -> None:
+        """Download the model directory from S3 into local API storage."""
+        local_dir = get_output_dir_from_model(model)
+        os.makedirs(local_dir, exist_ok=True)
+        s3_path = self._build_s3_path(
+            s3_bucket=s3_bucket,
+            prefix=prefix,
+            project=model.project,
+            model=model.name,
+        )
+        await s3_sync(s3_path, local_dir, verbose=verbose)
+
+    async def _push_to_s3(
+        self,
+        model: Model,
+        *,
+        s3_bucket: str,
+        prefix: str | None = None,
+        verbose: bool = False,
+    ) -> None:
+        """Upload the model directory from local storage to S3."""
+        local_dir = get_output_dir_from_model(model)
+        s3_path = self._build_s3_path(
+            s3_bucket=s3_bucket,
+            prefix=prefix,
+            project=model.project,
+            model=model.name,
+        )
+        await s3_sync(local_dir, s3_path, verbose=verbose)
