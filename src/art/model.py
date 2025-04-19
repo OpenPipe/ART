@@ -132,7 +132,9 @@ class TrainableModel(Model):
             best_checkpoint_metric: The metric to use to determine the best checkpoint.
                 Defaults to "val/reward".
         """
-        await self.api()._delete_checkpoints(self, best_checkpoint_metric)
+        await self.api()._delete_checkpoints(
+            self, best_checkpoint_metric, benchmark_smoothing=1.0
+        )
 
     async def train(
         self,

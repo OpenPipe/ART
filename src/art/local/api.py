@@ -155,7 +155,7 @@ class LocalAPI(API):
         self,
         model: TrainableModel,
         benchmark: str,
-        benchmark_smoothing: float = 1.0,
+        benchmark_smoothing: float,
     ) -> None:
         output_dir = get_model_dir(self._path, model)
         # Keep the latest step

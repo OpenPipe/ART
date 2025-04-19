@@ -38,15 +38,12 @@ class API:
         self,
         model: "TrainableModel",
         benchmark: str,
-        benchmark_smoothing: float = 1.0,
+        benchmark_smoothing: float,
     ) -> None:
         response = await self._client.post(
             "/_delete_checkpoints",
-            json={
-                "model": model.model_dump(),
-                "benchmark": benchmark,
-                "benchmark_smoothing": benchmark_smoothing,
-            },
+            json=model.model_dump(),
+            params={"benchmark": benchmark, "benchmark_smoothing": benchmark_smoothing},
         )
         response.raise_for_status()
 
