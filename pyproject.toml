@@ -23,6 +23,9 @@ dependencies = [
     "polars>=1.26.0",
 ]
 
+[project.scripts]
+art = "art.cli:app"
+
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"
