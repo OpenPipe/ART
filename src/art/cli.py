@@ -49,6 +49,6 @@ def run(host: str = "0.0.0.0", port: int = 2218) -> None:
             ):
                 yield json.dumps(result) + "\n"
 
-        return StreamingResponse(stream(), media_type="application/json")
+        return StreamingResponse(stream())
 
     uvicorn.run(app, host=host, port=port)
