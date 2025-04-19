@@ -155,15 +155,7 @@ class TrajectoryGroup(pydantic.BaseModel):
         exceptions: list[BaseException] = [],
     ) -> "TrajectoryGroup | Awaitable[TrajectoryGroup]":
         ts = list(trajectories)
-        if all(isinstance(t, Trajectory) or isinstance(t, BaseException) for t in ts):
-            group = super().__new__(cls)
-            group.__init__(
-                trajectories=cast(list[Trajectory | BaseException], ts),
-                metadata=metadata,
-                exceptions=exceptions,
-            )
-            return group
-        else:
+        if any(hasattr(t, "__await__") for t in ts):
 
             async def _(exceptions: list[BaseException]):
                 from .gather import get_gather_context, record_metrics
@@ -200,3 +192,11 @@ class TrajectoryGroup(pydantic.BaseModel):
 
             coro = _(exceptions.copy())
             return CoroutineWithMetadata(coro, len(ts))
+        else:
+            group = super().__new__(cls)
+            group.__init__(
+                trajectories=cast(list[Trajectory | BaseException], ts),
+                metadata=metadata,
+                exceptions=exceptions,
+            )
+            return group

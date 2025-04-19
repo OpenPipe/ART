@@ -2,7 +2,7 @@ from datetime import datetime
 import json
 import math
 from art.utils.benchmarking.calculate_step_metrics import calculate_step_std_dev
-from art.utils.output_dirs import get_output_dir_from_model, get_trajectories_split_dir
+from art.utils.output_dirs import get_model_dir, get_trajectories_split_dir
 from art.utils.trajectory_logging import serialize_trajectory_groups
 from mp_actors import move_to_child_process
 import numpy as np
@@ -12,7 +12,7 @@ import subprocess
 from transformers.models.auto.tokenization_auto import AutoTokenizer
 from transformers.tokenization_utils_base import PreTrainedTokenizerBase
 from tqdm import auto as tqdm
-from typing import cast
+from typing import AsyncIterator, cast
 import wandb
 from wandb.sdk.wandb_run import Run
 
@@ -68,7 +68,7 @@ class LocalAPI(API):
         Args:
             model: An art.Model instance.
         """
-        output_dir = get_output_dir_from_model(model)
+        output_dir = get_model_dir(self._path, model)
         os.makedirs(output_dir, exist_ok=True)
         with open(f"{output_dir}/model.json", "w") as f:
             json.dump(model.model_dump(), f)
@@ -77,7 +77,7 @@ class LocalAPI(API):
         if model.name not in self._services:
             config = dev.get_model_config(
                 base_model=model.base_model,
-                output_dir=get_output_dir_from_model(model),
+                output_dir=get_model_dir(self._path, model),
                 config=model._internal_config,
             )
             self._services[model.name] = ModelService(
@@ -86,7 +86,7 @@ class LocalAPI(API):
                 model_name=model.name,
                 base_model=model.base_model,
                 config=config,
-                output_dir=get_output_dir_from_model(model),
+                output_dir=get_model_dir(self._path, model),
             )
             if not self._in_process:
                 # Kill all "model-service" processes to free up GPU memory
@@ -149,7 +149,7 @@ class LocalAPI(API):
         return self.__get_step(model)
 
     def __get_step(self, model: TrainableModel) -> int:
-        return get_step(get_output_dir_from_model(model))
+        return get_step(get_model_dir(self._path, model))
 
     async def _delete_checkpoints(
         self,
@@ -157,7 +157,7 @@ class LocalAPI(API):
         benchmark: str,
         benchmark_smoothing: float = 1.0,
     ) -> None:
-        output_dir = get_output_dir_from_model(model)
+        output_dir = get_model_dir(self._path, model)
         # Keep the latest step
         steps_to_keep = [get_step(output_dir)]
         try:
@@ -181,7 +181,7 @@ class LocalAPI(API):
     async def _prepare_backend_for_training(
         self,
         model: TrainableModel,
-        config: dev.OpenAIServerConfig | None,
+        config: dev.OpenAIServerConfig | None = None,
     ) -> tuple[str, str]:
         service = await self._get_service(model)
         await service.start_openai_server(config=config)
@@ -200,7 +200,7 @@ class LocalAPI(API):
     ) -> None:
 
         # Save logs for trajectory groups
-        parent_dir = get_trajectories_split_dir(get_output_dir_from_model(model), split)
+        parent_dir = get_trajectories_split_dir(get_model_dir(self._path, model), split)
         os.makedirs(parent_dir, exist_ok=True)
 
         # Get the file name for the current iteration, or default to 0 for non-trainable models
@@ -258,8 +258,8 @@ class LocalAPI(API):
         model: TrainableModel,
         trajectory_groups: list[TrajectoryGroup],
         config: TrainConfig,
-        _config: dev.TrainConfig,
-    ) -> None:
+        dev_config: dev.TrainConfig,
+    ) -> AsyncIterator[dict[str, float]]:
         service = await self._get_service(model)
         await self._log(model, trajectory_groups, "train")
         packed_tensors = self._get_packed_tensors(
@@ -273,12 +273,14 @@ class LocalAPI(API):
             )
             return
         disk_packed_tensors = packed_tensors_to_dir(
-            packed_tensors, f"{get_output_dir_from_model(model)}/tensors"
+            packed_tensors, f"{get_model_dir(self._path, model)}/tensors"
         )
         results: list[dict[str, float]] = []
-        pbar = tqdm.tqdm(total=disk_packed_tensors["num_sequences"], desc="train")
-        async for result in service.train(disk_packed_tensors, config, _config):
+        num_steps = disk_packed_tensors["num_sequences"]
+        pbar = tqdm.tqdm(total=num_steps, desc="train")
+        async for result in service.train(disk_packed_tensors, config, dev_config):
             results.append(result)
+            yield {**result, "num_steps": num_steps}
             pbar.update(1)
             pbar.set_postfix(result)
         pbar.close()
@@ -304,7 +306,7 @@ class LocalAPI(API):
         step = self.__get_step(model) + step_offset
 
         # Log the data to history.jsonl
-        with open(f"{get_output_dir_from_model(model)}/history.jsonl", "a") as f:
+        with open(f"{get_model_dir(self._path, model)}/history.jsonl", "a") as f:
             f.write(
                 json.dumps(
                     {k: v for k, v in data.items() if v == v}  # Filter out NaN values

@@ -149,6 +149,7 @@ class TrainableModel(Model):
             _config: Additional configuration that is subject to change and
                 not yet part of the public API. Use at your own risk.
         """
-        await self.api()._train_model(
+        async for _ in self.api()._train_model(
             self, list(trajectory_groups), config, _config or {}
-        )
+        ):
+            pass

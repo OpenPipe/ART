@@ -1,9 +1,9 @@
 import art
 import json
-import random
-from typing import TypedDict
-from typing import Literal
 from pydantic import BaseModel
+import random
+from typing import Literal
+from typing_extensions import TypedDict
 
 
 class TicTacToeGame(TypedDict):

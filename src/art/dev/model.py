@@ -8,7 +8,7 @@ from transformers.trainer_utils import (
     SaveStrategy,
     SchedulerType,
 )
-from typing import TypedDict
+from typing_extensions import TypedDict
 
 from .engine import EngineArgs
 
