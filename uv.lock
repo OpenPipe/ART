@@ -3267,6 +3267,7 @@ name = "openpipe-art"
 version = "0.1.25"
 source = { editable = "." }
 dependencies = [
+    { name = "awscli" },
     { name = "bitsandbytes", marker = "sys_platform == 'linux'" },
     { name = "litellm" },
     { name = "matplotlib" },
@@ -3299,6 +3300,7 @@ dev = [
 
 [package.metadata]
 requires-dist = [
+    { name = "awscli", specifier = ">=1.38.1" },
     { name = "bitsandbytes", marker = "sys_platform == 'linux'", specifier = ">=0.45.2" },
     { name = "litellm", specifier = ">=1.63.0" },
     { name = "matplotlib", specifier = ">=3.10.1" },

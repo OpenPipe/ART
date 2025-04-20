@@ -31,6 +31,8 @@ class Model(BaseModel):
 
     trainable: bool = False
     _api: Optional["API"] = None
+    _s3_bucket: str | None = None
+    _s3_prefix: str | None = None
 
     def api(self) -> "API":
         if self._api is None:

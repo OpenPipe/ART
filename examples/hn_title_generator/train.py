@@ -19,7 +19,7 @@ BASE_MODEL = "Qwen/Qwen2.5-7B-Instruct"
 MAX_COMPLETION_LENGTH = 100
 MAX_PROMPT_LENGTH = 8192 - MAX_COMPLETION_LENGTH
 LEARNING_RATE = 1.2e-5
-ENTRIES_PER_STEP = 1
+GROUPS_PER_STEP = 1
 EVAL_STEPS = 50
 VAL_SET_SIZE = 100
 TRAINING_DATASET_SIZE = 5000
@@ -285,7 +285,7 @@ async def main():
 
     data_iterator = iterate_dataset(
         dataset=train_data_list,
-        batch_size=ENTRIES_PER_STEP,
+        groups_per_step=GROUPS_PER_STEP,
         num_epochs=NUM_EPOCHS,
         initial_step=start_step,
         use_tqdm=True,

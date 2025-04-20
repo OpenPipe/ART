@@ -8,7 +8,7 @@ T = TypeVar("T")
 
 def iterate_dataset(
     dataset: List[T],
-    batch_size: int = 1,
+    groups_per_step: int = 1,
     num_epochs: int = 1,
     initial_step: int = 0,
     use_tqdm: bool = True,
@@ -18,7 +18,7 @@ def iterate_dataset(
 
     Args:
         dataset: The list of data items.
-        batch_size: The size of each batch. Defaults to 1.
+        groups_per_step: The size of each batch. Defaults to 1.
         num_epochs: The number of times to iterate over the dataset. Defaults to 1.
         initial_step: The global step number to start from. Defaults to 0.
                            Useful for resuming training.
@@ -35,7 +35,7 @@ def iterate_dataset(
     if dataset_size == 0:
         return
 
-    steps_per_epoch = math.ceil(dataset_size / batch_size)
+    steps_per_epoch = math.ceil(dataset_size / groups_per_step)
     total_steps = steps_per_epoch * num_epochs
 
     progress_bar = None
@@ -53,8 +53,8 @@ def iterate_dataset(
         random.seed(epoch)  # Ensure shuffling is the same for a given epoch
         random.shuffle(indices)
 
-        for i in range(0, dataset_size, batch_size):
-            epoch_step = i // batch_size
+        for i in range(0, dataset_size, groups_per_step):
+            epoch_step = i // groups_per_step
             # Calculate global step number before skipping
             global_step = epoch * steps_per_epoch + epoch_step
 
@@ -68,7 +68,7 @@ def iterate_dataset(
                     pass  # tqdm handles the initial value
                 continue
 
-            batch_indices = indices[i : i + batch_size]
+            batch_indices = indices[i : i + groups_per_step]
             batch = [dataset[idx] for idx in batch_indices]
             yield batch, epoch, global_step, epoch_step
 
