@@ -1,4 +1,5 @@
 import os
+import sys
 
 # Import peft (and transformers by extension) before unsloth to enable sleep mode
 if os.environ.get("IMPORT_PEFT", "0") == "1":
@@ -15,7 +16,6 @@ from .gather import gather_trajectories, gather_trajectory_groups
 from .model import Model, TrainableModel
 from .trajectories import Trajectory, TrajectoryGroup
 from .types import Messages, MessagesAndChoices, Tools, TrainConfig
-from .local import LocalAPI
 from .utils import retry
 
 __all__ = [
@@ -23,7 +23,6 @@ __all__ = [
     "gather_trajectories",
     "gather_trajectory_groups",
     "API",
-    "LocalAPI",
     "Messages",
     "MessagesAndChoices",
     "Tools",
@@ -34,3 +33,10 @@ __all__ = [
     "Trajectory",
     "TrajectoryGroup",
 ]
+
+# Avoid importing LocalAPI on client machines
+if sys.platform.startswith("linux"):
+    from .local import LocalAPI
+
+    __all__.append("LocalAPI")
+    setattr(sys.modules[__name__], "LocalAPI", LocalAPI)
