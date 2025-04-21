@@ -62,7 +62,7 @@ def packed_tensors_from_tokenized_results(
                 print("Result is too long, skipping")
             continue
         result_without_prompt = result.without_prompt()
-        if sum(result.assistant_mask) == 0:
+        if sum(result_without_prompt.assistant_mask) == 0:
             if verbosity > 1:
                 print("Result has no unique completion tokens, skipping")
             continue
