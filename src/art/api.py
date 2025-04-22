@@ -21,7 +21,6 @@ class API:
         *,
         base_url: str = "http://0.0.0.0:7999",
         cluster_name: str | None = None,
-        detach_run: bool | None = True,
     ) -> None:
         if cluster_name:
             self._cluster_name = cluster_name
@@ -50,7 +49,7 @@ class API:
                 sky.exec(
                     task=art_server_task,
                     cluster_name=cluster_name,
-                    detach_run=detach_run,
+                    detach_run=True,
                 )
                 print("Task launched, waiting for it to start...")
                 wait_for_task_to_start(
