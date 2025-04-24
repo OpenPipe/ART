@@ -86,6 +86,8 @@ class TrainableModel(Model):
     # Use at your own risk.
     _internal_config: dev.InternalModelConfig | None = None
 
+    _openai_client: AsyncOpenAI | None = None
+
     async def register(
         self,
         api: "API",
@@ -100,23 +102,28 @@ class TrainableModel(Model):
 
     def openai_client(
         self,
+        force_recreate: bool = False,
     ) -> AsyncOpenAI:
         if self.base_url is None or self.api_key is None:
             raise ValueError(
                 "OpenAI client not yet available. You must call `model.register()` first."
             )
-        openai_client = AsyncOpenAI(
-            base_url=self.base_url,
-            api_key=self.api_key,
-            http_client=DefaultAsyncHttpxClient(
-                timeout=httpx.Timeout(timeout=1200, connect=5.0),
-                limits=httpx.Limits(
-                    max_connections=100_000, max_keepalive_connections=100_000
+
+        if self._openai_client is None or force_recreate:
+            openai_client = AsyncOpenAI(
+                base_url=self.base_url,
+                api_key=self.api_key,
+                http_client=DefaultAsyncHttpxClient(
+                    timeout=httpx.Timeout(timeout=1200, connect=5.0),
+                    limits=httpx.Limits(
+                        max_connections=100_000, max_keepalive_connections=100_000
+                    ),
                 ),
-            ),
-        )
-        patch_openai(openai_client)
-        return openai_client
+            )
+            patch_openai(openai_client)
+            self._openai_client = openai_client
+
+        return self._openai_client
 
     async def get_step(self) -> int:
         """

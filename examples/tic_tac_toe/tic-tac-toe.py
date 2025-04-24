@@ -10,10 +10,8 @@ from openpipe.client import OpenPipe
 
 import openai
 import time
-from litellm import acompletion
 import math
 
-from art.utils.litellm import convert_litellm_choice_to_openai
 
 from utils import (
     generate_game,
@@ -69,15 +67,9 @@ async def rollout(
         messages = trajectory.messages()
 
         try:
-            model_id = (
-                model.config.litellm_model_name
-                if isinstance(model.config, CustomConfig)
-                else f"hosted_vllm/{model.name}"
-            )
-            chat_completion = await acompletion(
-                base_url=model.base_url,
-                api_key=model.api_key,
-                model=model_id,
+            client = model.openai_client()
+            chat_completion = await client.chat.completions.create(
+                model=model.name,
                 messages=messages,
                 max_completion_tokens=128,
             )
@@ -96,7 +88,6 @@ async def rollout(
                 requested_at=requested_at,
                 received_at=int(time.time() * 1000),
                 req_payload={
-                    "model": model.name,
                     "messages": messages,
                     "metadata": {
                         "notebook-id": "tic-tac-toe",
@@ -111,7 +102,7 @@ async def rollout(
         except Exception as e:
             print(f"Error reporting to OpenPipe: {e}")
 
-        choice = convert_litellm_choice_to_openai(chat_completion.choices[0])
+        choice = chat_completion.choices[0]
         content = choice.message.content
         assert isinstance(content, str)
         trajectory.messages_and_choices.append(choice)
