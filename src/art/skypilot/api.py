@@ -187,7 +187,7 @@ class SkypilotAPI(API):
         response = await self._client.post(
             "/_prepare_backend_for_training",
             json={"model": model.model_dump(), "config": config},
-            timeout=600,
+            timeout=1200,
         )
         response.raise_for_status()
         [_, api_key] = tuple(response.json())
