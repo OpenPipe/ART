@@ -162,6 +162,9 @@ async def rollout(
     return trajectory
 
 
+DESTROY_AFTER_RUN = False
+
+
 async def main():
     model = art.TrainableModel(
         name="005", project="tic-tac-toe", base_model="Qwen/Qwen2.5-3B-Instruct"
@@ -180,6 +183,9 @@ async def main():
         )
         await model.delete_checkpoints()
         await model.train(train_groups, config=art.TrainConfig(learning_rate=1e-4))
+
+    if DESTROY_AFTER_RUN:
+        await api.down()
 
 
 if __name__ == "__main__":
