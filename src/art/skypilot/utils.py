@@ -28,8 +28,8 @@ def is_task_created(cluster_name: str, task_name: str) -> bool:
 def wait_for_task_to_start(cluster_name: str, task_name: str) -> None:
     task_status = get_task_status(cluster_name, task_name)
 
-    num_checks = 12
-    while num_checks > 0:
+    num_checks = 0
+    while num_checks < 12:
         task_status = get_task_status(cluster_name, task_name)
         if task_status is None:
             raise ValueError(f"Task {task_name} not found in cluster {cluster_name}")
@@ -38,7 +38,7 @@ def wait_for_task_to_start(cluster_name: str, task_name: str) -> None:
             time.sleep(10)
             return
         time.sleep(5)
-        num_checks -= 1
+        num_checks += 1
 
     raise ValueError(
         f"Task {task_name} in cluster {cluster_name} failed to start within 60s"

@@ -50,6 +50,7 @@ dev-dependencies = [
     "polars>=1.26.0",
     "skypilot[aws,cudo,do,fluidstack,gcp,lambda,paperspace,runpod]>=0.8.0",
     "hatch>=1.14.1",
+    "semver>=3.0.4",
 ]
 override-dependencies = [
     "bitsandbytes; sys_platform == 'linux'",
