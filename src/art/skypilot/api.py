@@ -5,7 +5,7 @@ import os
 import semver
 
 from art.skypilot.load_env_file import load_env_file
-from .utils import is_task_created, wait_for_task_to_start
+from .utils import is_task_created, wait_for_task_to_start, to_thread_typed
 
 from .. import dev
 from ..api import API
@@ -21,12 +21,16 @@ class SkypilotAPI(API):
         self,
         *,
         cluster_name: str = "art",
+    ) -> None:
+        self._cluster_name = cluster_name
+
+    async def initialize_cluster(
+        self,
+        *,
         resources: sky.Resources | None = None,
         art_version: str | None = None,
         env_path: str | None = None,
     ) -> None:
-        self._cluster_name = cluster_name
-
         if resources is None:
             resources = sky.Resources(
                 cloud=sky.clouds.RunPod(),
@@ -43,43 +47,54 @@ class SkypilotAPI(API):
         resources = resources.copy(ports=updated_ports)
 
         # check if cluster already exists
-        cluster_status = sky.status(cluster_names=[cluster_name])
+        cluster_status = await to_thread_typed(
+            lambda: sky.status(cluster_names=[self._cluster_name])
+        )
         if (
             len(cluster_status) == 0
             or cluster_status[0]["status"] != sky.ClusterStatus.UP
         ):
-            self._launch_cluster(cluster_name, resources, art_version, env_path)
+            await self._launch_cluster(resources, art_version, env_path)
         else:
-            print(f"Cluster {cluster_name} exists, using it...")
+            print(f"Cluster {self._cluster_name} exists, using it...")
 
-        if is_task_created(cluster_name=cluster_name, task_name="art_server"):
+        if await is_task_created(
+            cluster_name=self._cluster_name, task_name="art_server"
+        ):
             print("Art server task already running, using it...")
         else:
             art_server_task = sky.Task(name="art_server", run="uv run art")
-            resources = sky.status(cluster_names=["art"])[0][
-                "handle"
-            ].launched_resources
+            resources = await to_thread_typed(
+                lambda: sky.status(cluster_names=["art"])[0][
+                    "handle"
+                ].launched_resources
+            )
             art_server_task.set_resources(resources)
 
             # run art server task
-            sky.exec(
-                task=art_server_task,
-                cluster_name=cluster_name,
-                detach_run=True,
+            await to_thread_typed(
+                lambda: sky.exec(
+                    task=art_server_task,
+                    cluster_name=self._cluster_name,
+                    detach_run=True,
+                )
             )
             print("Task launched, waiting for it to start...")
-            wait_for_task_to_start(cluster_name=cluster_name, task_name="art_server")
+            await wait_for_task_to_start(
+                cluster_name=self._cluster_name, task_name="art_server"
+            )
             print("Art server task started")
 
-        art_endpoint = endpoints(cluster=cluster_name, port=7999)[7999]
+        art_endpoint = await to_thread_typed(
+            lambda: endpoints(cluster=self._cluster_name, port=7999)[7999]
+        )
         base_url = f"http://{art_endpoint}"
         print(f"Using base_url: {base_url}")
 
         super().__init__(base_url=base_url)
 
-    def _launch_cluster(
+    async def _launch_cluster(
         self,
-        cluster_name: str,
         resources: sky.Resources,
         art_version: str | None = None,
         env_path: str | None = None,
@@ -87,7 +102,7 @@ class SkypilotAPI(API):
         print("Launching cluster...")
 
         task = sky.Task(
-            name=cluster_name,
+            name=self._cluster_name,
         )
         task.set_resources(resources)
 
@@ -141,7 +156,9 @@ class SkypilotAPI(API):
         print(task)
 
         try:
-            sky.launch(task=task, cluster_name=cluster_name)
+            await to_thread_typed(
+                lambda: sky.launch(task=task, cluster_name=self._cluster_name)
+            )
         except Exception as e:
             print(f"Error launching cluster: {e}")
             print()
@@ -175,10 +192,12 @@ class SkypilotAPI(API):
         response.raise_for_status()
         [_, api_key] = tuple(response.json())
 
-        vllm_endpoint = endpoints(cluster=self._cluster_name, port=8000)[8000]
+        vllm_endpoint = await to_thread_typed(
+            lambda: endpoints(cluster=self._cluster_name, port=8000)[8000]
+        )
         base_url = f"http://{vllm_endpoint}/v1"
 
         return [base_url, api_key]
 
-    def down(self) -> None:
-        sky.down(cluster_name=self._cluster_name)
+    async def down(self) -> None:
+        await to_thread_typed(lambda: sky.down(cluster_name=self._cluster_name))

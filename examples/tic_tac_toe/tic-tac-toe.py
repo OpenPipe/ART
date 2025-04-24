@@ -31,9 +31,6 @@ print("OpenPipe client initialized")
 
 random.seed(42)
 
-# run from the root of the repo
-api = art.SkypilotAPI(cluster_name="art4", art_version=".", env_path=".env")
-
 
 class CustomConfig(BaseModel):
     litellm_model_name: str | None = None
@@ -166,6 +163,10 @@ DESTROY_AFTER_RUN = False
 
 
 async def main():
+    # run from the root of the repo
+    api = art.SkypilotAPI(cluster_name="art5")
+    await api.initialize_cluster(art_version=".", env_path=".env")
+
     model = art.TrainableModel(
         name="005", project="tic-tac-toe", base_model="Qwen/Qwen2.5-3B-Instruct"
     )
