@@ -5,15 +5,13 @@ import os
 import semver
 
 from art.skypilot.load_env_file import load_env_file
-from art import Model
-
 from .utils import is_task_created, wait_for_task_to_start
 
 from .. import dev
 from ..api import API
 
 if TYPE_CHECKING:
-    from ..model import TrainableModel
+    from ..model import Model, TrainableModel
 
 
 class SkypilotAPI(API):

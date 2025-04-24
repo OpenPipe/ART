@@ -35,7 +35,7 @@ def wait_for_task_to_start(cluster_name: str, task_name: str) -> None:
             raise ValueError(f"Task {task_name} not found in cluster {cluster_name}")
         if task_status == sky.JobStatus.RUNNING:
             # Waiting for our server to start up
-            time.sleep(10)
+            time.sleep(30)
             return
         time.sleep(5)
         num_checks += 1
