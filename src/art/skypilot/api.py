@@ -177,7 +177,6 @@ class SkypilotAPI(API):
             json={"model": model.model_dump(), "config": config},
             timeout=600,
         )
-
         response.raise_for_status()
         [base_url, api_key] = tuple(response.json())
 
