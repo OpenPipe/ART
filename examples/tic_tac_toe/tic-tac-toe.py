@@ -32,7 +32,7 @@ print("OpenPipe client initialized")
 random.seed(42)
 
 # run from the root of the repo
-api = art.SkypilotAPI(cluster_name="art3", art_version=".", env_path=".env")
+api = art.SkypilotAPI(cluster_name="art4", art_version=".", env_path=".env")
 
 
 class CustomConfig(BaseModel):

@@ -15,6 +15,8 @@ if TYPE_CHECKING:
 
 
 class SkypilotAPI(API):
+    _cluster_name: str
+
     def __init__(
         self,
         *,
@@ -23,6 +25,8 @@ class SkypilotAPI(API):
         art_version: str | None = None,
         env_path: str | None = None,
     ) -> None:
+        self._cluster_name = cluster_name
+
         if resources is None:
             resources = sky.Resources(
                 cloud=sky.clouds.RunPod(),
@@ -38,45 +42,38 @@ class SkypilotAPI(API):
         updated_ports += ["7999", "8000"]
         resources = resources.copy(ports=updated_ports)
 
-        if cluster_name:
-            self._cluster_name = cluster_name
+        # check if cluster already exists
+        cluster_status = sky.status(cluster_names=[cluster_name])
+        if (
+            len(cluster_status) == 0
+            or cluster_status[0]["status"] != sky.ClusterStatus.UP
+        ):
+            self._launch_cluster(cluster_name, resources, art_version, env_path)
+        else:
+            print(f"Cluster {cluster_name} exists, using it...")
 
-            # check if cluster already exists
-            cluster_status = sky.status(cluster_names=[cluster_name])
-            if (
-                len(cluster_status) == 0
-                or cluster_status[0]["status"] != sky.ClusterStatus.UP
-            ):
-                self._launch_cluster(cluster_name, resources, art_version, env_path)
-                # raise ValueError(f"Cluster {cluster_name} does not exist or is not up")
-            else:
-                print(f"Cluster {cluster_name} exists, using it...")
+        if is_task_created(cluster_name=cluster_name, task_name="art_server"):
+            print("Art server task already running, using it...")
+        else:
+            art_server_task = sky.Task(name="art_server", run="uv run art")
+            resources = sky.status(cluster_names=["art"])[0][
+                "handle"
+            ].launched_resources
+            art_server_task.set_resources(resources)
 
-            if is_task_created(cluster_name=cluster_name, task_name="art_server"):
-                print("Art server task already running, using it...")
-            else:
-                art_server_task = sky.Task(name="art_server", run="uv run art")
-                resources = sky.status(cluster_names=["art"])[0][
-                    "handle"
-                ].launched_resources
-                art_server_task.set_resources(resources)
+            # run art server task
+            sky.exec(
+                task=art_server_task,
+                cluster_name=cluster_name,
+                detach_run=True,
+            )
+            print("Task launched, waiting for it to start...")
+            wait_for_task_to_start(cluster_name=cluster_name, task_name="art_server")
+            print("Art server task started")
 
-                # run art server task
-                sky.exec(
-                    task=art_server_task,
-                    cluster_name=cluster_name,
-                    detach_run=True,
-                )
-                print("Task launched, waiting for it to start...")
-                wait_for_task_to_start(
-                    cluster_name=cluster_name, task_name="art_server"
-                )
-                print("Art server task started")
-
-            art_endpoint = endpoints(cluster=cluster_name, port=7999)[7999]
-            # override base_url if one is provided
-            base_url = f"http://{art_endpoint}"
-            print(f"Using base_url: {base_url}")
+        art_endpoint = endpoints(cluster=cluster_name, port=7999)[7999]
+        base_url = f"http://{art_endpoint}"
+        print(f"Using base_url: {base_url}")
 
         super().__init__(base_url=base_url)
 
@@ -176,9 +173,8 @@ class SkypilotAPI(API):
             timeout=600,
         )
         response.raise_for_status()
-        [base_url, api_key] = tuple(response.json())
+        [_, api_key] = tuple(response.json())
 
-        # override base_url if one is provided
         vllm_endpoint = endpoints(cluster=self._cluster_name, port=8000)[8000]
         base_url = f"http://{vllm_endpoint}/v1"
 
