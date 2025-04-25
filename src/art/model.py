@@ -59,7 +59,9 @@ class Model(BaseModel):
         self,
         force_recreate: bool = False,
     ) -> AsyncOpenAI:
-        if self.base_url is None or self.api_key is None:
+        if isinstance(self, TrainableModel) and (
+            self.base_url is None or self.api_key is None
+        ):
             raise ValueError(
                 "OpenAI client not yet available. You must call `model.register()` first."
             )
