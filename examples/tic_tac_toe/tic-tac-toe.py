@@ -155,7 +155,7 @@ DESTROY_AFTER_RUN = False
 
 async def main():
     # run from the root of the repo
-    api = art.SkypilotAPI(cluster_name="art5")
+    api = art.SkypilotAPI(cluster_name="art6")
     await api.initialize_cluster(art_version=".", env_path=".env")
 
     model = art.TrainableModel(

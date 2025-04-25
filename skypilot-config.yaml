@@ -384,7 +384,6 @@ workdir: .
 resources:
   accelerators: ["H100:1", "A100-80GB:1"]
   ports:
-    - 8080
     - 7999 # main ART server
     - 8000 # vLLM server
 envs:

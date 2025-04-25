@@ -36,7 +36,7 @@ class SkypilotAPI(API):
                 cloud=sky.clouds.RunPod(),
                 # region="US",
                 accelerators={"H100": 1},
-                ports=["8080"],
+                ports=[],
             )
 
         # ensure ports 7999 and 8000 are open
@@ -65,7 +65,7 @@ class SkypilotAPI(API):
         else:
             art_server_task = sky.Task(name="art_server", run="uv run art")
             resources = await to_thread_typed(
-                lambda: sky.status(cluster_names=["art"])[0][
+                lambda: sky.status(cluster_names=[self._cluster_name])[0][
                     "handle"
                 ].launched_resources
             )
