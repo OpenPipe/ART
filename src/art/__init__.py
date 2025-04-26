@@ -12,7 +12,7 @@ if os.environ.get("IMPORT_UNSLOTH", "0") == "1":
 
 from . import dev
 from .api import API
-from .skypilot import SkypilotAPI
+from .skypilot import SkyPilotAPI
 from .gather import gather_trajectories, gather_trajectory_groups
 from .model import Model, TrainableModel
 from .trajectories import Trajectory, TrajectoryGroup
@@ -24,7 +24,7 @@ __all__ = [
     "gather_trajectories",
     "gather_trajectory_groups",
     "API",
-    "SkypilotAPI",
+    "SkyPilotAPI",
     "Messages",
     "MessagesAndChoices",
     "Tools",

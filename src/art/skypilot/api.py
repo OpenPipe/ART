@@ -14,7 +14,7 @@ if TYPE_CHECKING:
     from ..model import Model, TrainableModel
 
 
-class SkypilotAPI(API):
+class SkyPilotAPI(API):
     _cluster_name: str
 
     def __init__(
