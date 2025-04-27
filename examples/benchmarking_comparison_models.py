@@ -1,4 +1,5 @@
 import art
+from art.local import LocalAPI
 import asyncio
 from pydantic import BaseModel
 import re
@@ -190,7 +191,7 @@ async def main():
 
     # We need to register all our models with the local API so they're
     # available for training and logging.
-    api = art.LocalAPI()
+    api = LocalAPI()
     await asyncio.gather(
         *[model.register(api) for model in train_models + prompted_models]
     )

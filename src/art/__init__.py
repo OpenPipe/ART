@@ -33,10 +33,3 @@ __all__ = [
     "Trajectory",
     "TrajectoryGroup",
 ]
-
-# Avoid importing LocalAPI on client machines
-if sys.platform.startswith("linux"):
-    from .local import LocalAPI
-
-    __all__.append("LocalAPI")
-    setattr(sys.modules[__name__], "LocalAPI", LocalAPI)
