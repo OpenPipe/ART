@@ -45,7 +45,7 @@ This training loop runs until a specified number of inference and training itera
 
 ## Supported Models
 
-ART should work with any vLLM/HuggingFace-transformers compatible causal language model, or at least the ones supported by [Unsloth](https://docs.unsloth.ai/get-started/all-our-models). If a model isn't working for you, please let us know on [Discord](https://discord.com/invite/EceeVdhpxD) or open an issue on [GitHub](https://github.com/openpipe/art/issues)!
+ART should work with most vLLM/HuggingFace-transformers compatible causal language models, or at least the ones supported by [Unsloth](https://docs.unsloth.ai/get-started/all-our-models). Gemma 3 does not appear to be supported for the time being. If any other model isn't working for you, please let us know on [Discord](https://discord.com/invite/EceeVdhpxD) or open an issue on [GitHub](https://github.com/openpipe/art/issues)!
 
 ## ⚠️ Disclaimer
 
