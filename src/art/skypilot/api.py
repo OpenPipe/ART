@@ -142,7 +142,6 @@ class SkyPilotAPI(API):
     source $HOME/.local/bin/env
 
     {art_installation_command}
-    uv add awscli
     uv sync
     """
 

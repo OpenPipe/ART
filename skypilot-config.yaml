@@ -403,7 +403,5 @@ setup: |
   sudo snap install --classic astral-uv
   # Install tmux
   apt install tmux -y
-  # install awscli
-  uv add awscli
   # Sync the dependencies
   uv sync
