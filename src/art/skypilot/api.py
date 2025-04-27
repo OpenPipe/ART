@@ -3,8 +3,8 @@ import sky
 from sky.core import endpoints
 import os
 import semver
+from dotenv import dotenv_values
 
-from art.skypilot.load_env_file import load_env_file
 from .utils import is_task_created, wait_for_task_to_start, to_thread_typed
 
 from .. import dev
@@ -17,20 +17,18 @@ if TYPE_CHECKING:
 class SkyPilotAPI(API):
     _cluster_name: str
 
-    def __init__(
-        self,
+    @classmethod
+    async def initialize_cluster(
+        cls,
         *,
         cluster_name: str = "art",
-    ) -> None:
-        self._cluster_name = cluster_name
-
-    async def initialize_cluster(
-        self,
-        *,
         resources: sky.Resources | None = None,
         art_version: str | None = None,
         env_path: str | None = None,
     ) -> None:
+        self = cls.__new__(cls)
+        self._cluster_name = cluster_name
+
         if resources is None:
             resources = sky.Resources(
                 cloud=sky.clouds.RunPod(),
@@ -91,7 +89,10 @@ class SkyPilotAPI(API):
         base_url = f"http://{art_endpoint}"
         print(f"Using base_url: {base_url}")
 
-        super().__init__(base_url=base_url)
+        # Manually call the real __init__ now that base_url is ready
+        super(SkyPilotAPI, self).__init__(base_url=base_url)
+
+        return self
 
     async def _launch_cluster(
         self,
@@ -148,7 +149,7 @@ class SkyPilotAPI(API):
         task.setup = setup_script
 
         if env_path is not None:
-            envs = load_env_file(env_path)
+            envs = dotenv_values(env_path)
             print(f"Loading envs from {env_path}")
             print(f"{len(envs)} environment variables found")
             task.update_envs(envs)
