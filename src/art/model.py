@@ -18,21 +18,55 @@ if TYPE_CHECKING:
 
 
 class Model(BaseModel):
+    """
+    A model is an object that can be passed to your `rollout` function, and used
+    to log completions. Additionally, a `TrainableModel`, which is a subclass of
+    `Model`, can be used to train a model.
+
+    The `Model` abstraction is useful for comparing prompted model performance
+    to the performance of your trained models.
+
+    You can instantiate a prompted model like so:
+
+    ```python model = art.Model(
+        name="gpt-4.1", project="my-project",
+        inference_api_key=os.getenv("OPENAI_API_KEY"),
+        inference_base_url="https://api.openai.com/v1/",
+    )
+    ```
+
+    Or, if you're pointing at OpenRouter:
+
+    ```python model = art.Model(
+        name="gemini-2.5-pro", project="my-project",
+        inference_api_key=os.getenv("OPENROUTER_API_KEY"),
+        inference_base_url="https://openrouter.ai/api/v1",
+        inference_model_name="google/gemini-2.5-pro-preview-03-25",
+    )
+    ```
+
+    For trainable (`art.TrainableModel`) models the inference values will be
+    populated automatically by `model.register(api)` so you generally don't need
+    to think about them.
+    """
+
     name: str
     project: str
 
     config: BaseModel | None = None
 
-    # These are generally only used on trainable models, but are included on the
-    # base because they're sometimes useful for prompted models that you'd like
-    # to call via an OpenAI-compatible API as well.
-    base_url: str | None = None
-    api_key: str | None = None
+    # --- Inference connection information (populated automatically for
+    #     TrainableModel or set manually for prompted / comparison models) ---
+    inference_api_key: str | None = None
+    inference_base_url: str | None = None
+    # If set, this will be used instead of `self.name` when calling the
+    # inference endpoint.
+    inference_model_name: str | None = None
 
-    trainable: bool = False
     _api: Optional["API"] = None
     _s3_bucket: str | None = None
     _s3_prefix: str | None = None
+    _openai_client: AsyncOpenAI | None = None
 
     def api(self) -> "API":
         if self._api is None:
@@ -52,6 +86,48 @@ class Model(BaseModel):
 
         self._api = api
         await self._api.register(self)
+
+    def openai_client(
+        self,
+    ) -> AsyncOpenAI:
+        if self._openai_client is not None:
+            return self._openai_client
+
+        if self.inference_api_key is None or self.inference_base_url is None:
+            if isinstance(self, TrainableModel):
+                raise ValueError(
+                    "OpenAI client not yet available on this trainable model. You must call `model.register()` first."
+                )
+            else:
+                raise ValueError(
+                    "In order to create an OpenAI client you must provide an `inference_api_key` and `inference_base_url`."
+                )
+        openai_client = AsyncOpenAI(
+            base_url=self.inference_base_url,
+            api_key=self.inference_api_key,
+            http_client=DefaultAsyncHttpxClient(
+                timeout=httpx.Timeout(timeout=1200, connect=5.0),
+                limits=httpx.Limits(
+                    max_connections=100_000, max_keepalive_connections=100_000
+                ),
+            ),
+        )
+        patch_openai(openai_client)
+        self._openai_client = openai_client
+
+        return self._openai_client
+
+    # ------------------------------------------------------------------
+    # Inference name helpers
+    # ------------------------------------------------------------------
+
+    def get_inference_name(self) -> str:
+        """Return the name that should be sent to the inference endpoint.
+
+        If ``inference_model_name`` is provided we use that, otherwise we fall
+        back to the model's own ``name``.
+        """
+        return self.inference_model_name or self.name
 
     async def log(
         self,
@@ -78,6 +154,11 @@ class Model(BaseModel):
         )
 
 
+# ---------------------------------------------------------------------------
+# Trainable models
+# ---------------------------------------------------------------------------
+
+
 class TrainableModel(Model):
     base_model: str
     trainable: bool = True
@@ -95,28 +176,12 @@ class TrainableModel(Model):
         base_url, api_key = await api._prepare_backend_for_training(
             self, _openai_client_config
         )
-        self.base_url = base_url
-        self.api_key = api_key
 
-    def openai_client(
-        self,
-    ) -> AsyncOpenAI:
-        if self.base_url is None or self.api_key is None:
-            raise ValueError(
-                "OpenAI client not yet available. You must call `model.register()` first."
-            )
-        openai_client = AsyncOpenAI(
-            base_url=self.base_url,
-            api_key=self.api_key,
-            http_client=DefaultAsyncHttpxClient(
-                timeout=httpx.Timeout(timeout=1200, connect=5.0),
-                limits=httpx.Limits(
-                    max_connections=100_000, max_keepalive_connections=100_000
-                ),
-            ),
-        )
-        patch_openai(openai_client)
-        return openai_client
+        # Populate the new top-level inference fields so that the rest of the
+        # code (and any user code) can create an OpenAI client immediately.
+        self.inference_base_url = base_url
+        self.inference_api_key = api_key
+        self.inference_model_name = self.name
 
     async def get_step(self) -> int:
         """
