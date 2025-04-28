@@ -5,7 +5,7 @@
 </picture></a>
 
 <a href="https://colab.research.google.com/github/openpipe/art/blob/main/examples/2048/2048.ipynb"><img src="https://github.com/openpipe/art/raw/main/assets/Train_pill.png" height="48"></a>
-<a href="https://discord.com/invite/EceeVdhpxD"><img src="https://github.com/openpipe/art/raw/main/assets/Discord_pill.png" height="48"></a>
+<a href="https://discord.gg/zbBHRUpwf4"><img src="https://github.com/openpipe/art/raw/main/assets/Discord_pill.png" height="48"></a>
 <a href="https://openpipe.ai/blog/art-trainer-a-new-rl-trainer-for-agents"><img src="https://github.com/openpipe/art/raw/main/assets/Launch_pill.png" height="48"></a>
 
 ### Train free-range RL agents with minimal code changes and maximal performance!
@@ -45,11 +45,11 @@ This training loop runs until a specified number of inference and training itera
 
 ## Supported Models
 
-ART should work with most vLLM/HuggingFace-transformers compatible causal language models, or at least the ones supported by [Unsloth](https://docs.unsloth.ai/get-started/all-our-models). Gemma 3 does not appear to be supported for the time being. If any other model isn't working for you, please let us know on [Discord](https://discord.com/invite/EceeVdhpxD) or open an issue on [GitHub](https://github.com/openpipe/art/issues)!
+ART should work with most vLLM/HuggingFace-transformers compatible causal language models, or at least the ones supported by [Unsloth](https://docs.unsloth.ai/get-started/all-our-models). Gemma 3 does not appear to be supported for the time being. If any other model isn't working for you, please let us know on [Discord](https://discord.gg/zbBHRUpwf4) or open an issue on [GitHub](https://github.com/openpipe/art/issues)!
 
 ## ⚠️ Disclaimer
 
-ART is currently in alpha and has only been tested on a few projects in the wild! We're working hard to make it work for everyone, but if you run into any issues, please let us know on [Discord](https://discord.com/invite/EceeVdhpxD) or open an issue on [GitHub](https://github.com/openpipe/art/issues)!
+ART is currently in alpha and has only been tested on a few projects in the wild! We're working hard to make it work for everyone, but if you run into any issues, please let us know on [Discord](https://discord.gg/zbBHRUpwf4) or open an issue on [GitHub](https://github.com/openpipe/art/issues)!
 
 ## 🤝 Contributing
 
