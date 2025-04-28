@@ -1,11 +1,16 @@
 from typing import TYPE_CHECKING
 import sky
-from sky.core import endpoints
 import os
 import semver
 from dotenv import dotenv_values
 
-from .utils import is_task_created, wait_for_task_to_start, to_thread_typed
+from .utils import (
+    is_task_created,
+    to_thread_typed,
+    wait_for_art_server_to_start,
+    get_art_server_base_url,
+    get_vllm_base_url,
+)
 
 from .. import dev
 from ..api import API
@@ -78,15 +83,12 @@ class SkyPilotAPI(API):
                 )
             )
             print("Task launched, waiting for it to start...")
-            await wait_for_task_to_start(
+            await wait_for_art_server_to_start(
                 cluster_name=self._cluster_name, task_name="art_server"
             )
             print("Art server task started")
 
-        art_endpoint = await to_thread_typed(
-            lambda: endpoints(cluster=self._cluster_name, port=7999)[7999]
-        )
-        base_url = f"http://{art_endpoint}"
+        base_url = await get_art_server_base_url(self._cluster_name)
         print(f"Using base_url: {base_url}")
 
         # Manually call the real __init__ now that base_url is ready
@@ -192,12 +194,9 @@ class SkyPilotAPI(API):
         response.raise_for_status()
         [_, api_key] = tuple(response.json())
 
-        vllm_endpoint = await to_thread_typed(
-            lambda: endpoints(cluster=self._cluster_name, port=8000)[8000]
-        )
-        base_url = f"http://{vllm_endpoint}/v1"
+        vllm_base_url = await get_vllm_base_url(self._cluster_name)
 
-        return [base_url, api_key]
+        return [vllm_base_url, api_key]
 
     async def down(self) -> None:
         await to_thread_typed(lambda: sky.down(cluster_name=self._cluster_name))

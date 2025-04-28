@@ -1,6 +1,8 @@
 import sky
 import asyncio
 from typing import Callable, TypeVar
+from sky.core import endpoints
+import httpx
 
 T = TypeVar("T")
 
@@ -41,8 +43,6 @@ async def wait_for_task_to_start(cluster_name: str, task_name: str) -> None:
         if task_status is None:
             raise ValueError(f"Task {task_name} not found in cluster {cluster_name}")
         if task_status == sky.JobStatus.RUNNING:
-            # Waiting for our server to start up
-            await asyncio.sleep(30)
             return
         await asyncio.sleep(5)
         num_checks += 1
@@ -50,3 +50,37 @@ async def wait_for_task_to_start(cluster_name: str, task_name: str) -> None:
     raise ValueError(
         f"Task {task_name} in cluster {cluster_name} failed to start within 60s"
     )
+
+
+async def wait_for_art_server_to_start(cluster_name: str) -> None:
+    await wait_for_task_to_start(cluster_name, "art_server")
+
+    base_url = await get_art_server_base_url(cluster_name)
+
+    num_checks = 0
+    client = httpx.AsyncClient(
+        base_url=base_url,
+        timeout=10,
+    )
+    while num_checks < 12:
+        response = await client.get("/healthcheck")
+        if response.status_code == 200:
+            return
+        await asyncio.sleep(5)
+        num_checks += 1
+
+    return base_url
+
+
+async def get_art_server_base_url(cluster_name: str) -> str:
+    art_endpoint = await to_thread_typed(
+        lambda: endpoints(cluster=cluster_name, port=7999)[7999]
+    )
+    return f"http://{art_endpoint}"
+
+
+async def get_vllm_base_url(cluster_name: str) -> str:
+    vllm_endpoint = await to_thread_typed(
+        lambda: endpoints(cluster=cluster_name, port=8000)[8000]
+    )
+    return f"http://{vllm_endpoint}/v1"
