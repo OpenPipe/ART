@@ -147,6 +147,8 @@ class SkyPilotAPI(API):
 
     source $HOME/.local/bin/env
 
+    git config --global --add safe.directory /root/sky_workdir
+
     {art_installation_command}
     uv sync
     """
