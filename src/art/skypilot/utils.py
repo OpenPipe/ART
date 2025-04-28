@@ -53,7 +53,11 @@ async def wait_for_task_to_start(cluster_name: str, task_name: str) -> None:
 
 
 async def wait_for_art_server_to_start(cluster_name: str) -> None:
+    print(f"Waiting for art server task to start on cluster {cluster_name}...")
     await wait_for_task_to_start(cluster_name, "art_server")
+    print(
+        f"Art server started on cluster {cluster_name}. Waiting for it to be ready..."
+    )
 
     base_url = await get_art_server_base_url(cluster_name)
 
@@ -63,9 +67,12 @@ async def wait_for_art_server_to_start(cluster_name: str) -> None:
         timeout=10,
     )
     while num_checks < 12:
-        response = await client.get("/healthcheck")
-        if response.status_code == 200:
-            return
+        try:
+            response = await client.get("/healthcheck")
+            if response.status_code == 200:
+                return
+        except Exception:
+            pass
         await asyncio.sleep(5)
         num_checks += 1
 

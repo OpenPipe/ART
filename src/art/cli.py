@@ -43,7 +43,7 @@ def run(host: str = "0.0.0.0", port: int = 7999) -> None:
 
     api = LocalAPI()
     app = FastAPI()
-    app.post("/healthcheck")(lambda: {"status": "ok"})
+    app.get("/healthcheck")(lambda: {"status": "ok"})
     app.post("/register")(api.register)
     app.post("/_log")(api._log)
     app.post("/_prepare_backend_for_training")(api._prepare_backend_for_training)

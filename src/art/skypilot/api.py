@@ -27,6 +27,7 @@ class SkyPilotAPI(API):
         cls,
         *,
         cluster_name: str = "art",
+        gpu: str | None = None,
         resources: sky.Resources | None = None,
         art_version: str | None = None,
         env_path: str | None = None,
@@ -34,13 +35,18 @@ class SkyPilotAPI(API):
         self = cls.__new__(cls)
         self._cluster_name = cluster_name
 
+        if gpu is None and resources is None:
+            raise ValueError("Either gpu or resources must be provided")
+
         if resources is None:
             resources = sky.Resources(
                 cloud=sky.clouds.RunPod(),
-                # region="US",
                 accelerators={"H100": 1},
                 ports=[],
             )
+
+        if gpu is not None:
+            resources = resources.copy(accelerators={gpu: 1})
 
         # ensure ports 7999 and 8000 are open
         updated_ports = resources.ports
@@ -83,9 +89,7 @@ class SkyPilotAPI(API):
                 )
             )
             print("Task launched, waiting for it to start...")
-            await wait_for_art_server_to_start(
-                cluster_name=self._cluster_name, task_name="art_server"
-            )
+            await wait_for_art_server_to_start(cluster_name=self._cluster_name)
             print("Art server task started")
 
         base_url = await get_art_server_base_url(self._cluster_name)
