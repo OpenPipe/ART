@@ -278,11 +278,11 @@ class LocalAPI(API):
             packed_tensors, f"{get_model_dir(self._path, model)}/tensors"
         )
         results: list[dict[str, float]] = []
-        num_steps = disk_packed_tensors["num_sequences"]
-        pbar = tqdm.tqdm(total=num_steps, desc="train")
+        num_gradient_steps = disk_packed_tensors["num_sequences"]
+        pbar = tqdm.tqdm(total=num_gradient_steps, desc="train")
         async for result in service.train(disk_packed_tensors, config, dev_config):
             results.append(result)
-            yield {**result, "num_steps": num_steps}
+            yield {**result, "num_gradient_steps": num_gradient_steps}
             pbar.update(1)
             pbar.set_postfix(result)
         pbar.close()

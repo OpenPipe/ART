@@ -105,9 +105,9 @@ class API:
             async for line in response.aiter_lines():
                 result = json.loads(line)
                 yield result
-                num_steps = result.pop("num_steps")
+                num_gradient_steps = result.pop("num_gradient_steps")
                 if pbar is None:
-                    pbar = tqdm.tqdm(total=num_steps, desc="train")
+                    pbar = tqdm.tqdm(total=num_gradient_steps, desc="train")
                 pbar.update(1)
                 pbar.set_postfix(result)
             if pbar is not None:
