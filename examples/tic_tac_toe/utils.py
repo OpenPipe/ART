@@ -1,9 +1,7 @@
-import art
-import json
-from pydantic import BaseModel
 import random
+from typing import TypedDict
 from typing import Literal
-from typing_extensions import TypedDict
+import xml.etree.ElementTree as ET
 
 
 class TicTacToeGame(TypedDict):
@@ -47,15 +45,14 @@ def get_opponent_move(game: TicTacToeGame) -> tuple[int, int]:
     return random.choice(empty_cells)
 
 
-class AgentMove(BaseModel):
-    reason: str
-    square: str
-
-
 def apply_agent_move(game: TicTacToeGame, move: str) -> None:
     board_length = len(game["board"])
-    json_move = json.loads(move)
-    square = json_move["square"]
+
+    try:
+        root = ET.fromstring(move)
+        square = root.text
+    except Exception as e:
+        raise ValueError("Invalid xml")
 
     try:
         row_index = ord(square[0]) - 65
@@ -114,21 +111,3 @@ def check_winner(board: list[list[str]]) -> Literal["x", "o", "draw", None]:
     if all(cell != "_" for row in board for cell in row):
         return "draw"
     return None
-
-
-def get_trajectory_messages(trajectory: art.Trajectory) -> art.Messages:
-    messages: art.Messages = []
-    for item in trajectory.messages_and_choices:
-        # if item is not a dict, convert it to a dict
-        if not isinstance(item, dict):
-            item = item.to_dict()
-
-        # check if item is a choice
-        if "message" in item:
-            messages.append(
-                {"role": "assistant", "content": item["message"]["content"]}
-            )
-        else:
-            # otherwise it's a message
-            messages.append(item)
-    return messages

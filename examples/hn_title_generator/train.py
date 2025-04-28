@@ -1,4 +1,5 @@
 import art
+from art.local import LocalAPI
 import asyncio
 import openai
 from openai.types.chat import ChatCompletionMessageParam
@@ -231,7 +232,7 @@ async def rollout(
 # --- Main Training Loop ---
 async def main():
     # Initialize ART API and Model
-    api = art.LocalAPI()
+    api = LocalAPI()
     model = art.TrainableModel(
         name=MODEL_NAME,
         project=PROJECT,

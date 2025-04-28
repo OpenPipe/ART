@@ -12,7 +12,11 @@ if TYPE_CHECKING:
 
 
 class API:
-    def __init__(self, *, base_url: str = "http://0.0.0.0:2218") -> None:
+    def __init__(
+        self,
+        *,
+        base_url: str = "http://0.0.0.0:7999",
+    ) -> None:
         self._base_url = base_url
         self._client = httpx.AsyncClient(base_url=base_url)
 
@@ -58,7 +62,9 @@ class API:
             timeout=600,
         )
         response.raise_for_status()
-        return tuple(response.json())
+        [base_url, api_key] = tuple(response.json())
+
+        return [base_url, api_key]
 
     async def _log(
         self,

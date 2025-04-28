@@ -2,6 +2,7 @@ from fastapi import FastAPI
 from fastapi.responses import StreamingResponse
 import json
 import pydantic
+import socket
 import typer
 from typing import Any, AsyncIterator
 import uvicorn
@@ -16,8 +17,19 @@ app = typer.Typer()
 
 
 @app.command()
-def run(host: str = "0.0.0.0", port: int = 2218) -> None:
+def run(host: str = "0.0.0.0", port: int = 7999) -> None:
     """Run the ART CLI."""
+
+    # check if port is available
+    def is_port_available(port: int) -> bool:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            return s.connect_ex(("localhost", port)) != 0
+
+    if not is_port_available(port):
+        print(
+            f"Port {port} is already in use, possibly because the ART server is already running."
+        )
+        return
 
     # Reset the custom __new__ and __init__ methods for TrajectoryGroup
     def __new__(cls, *args: Any, **kwargs: Any) -> TrajectoryGroup:
@@ -31,6 +43,7 @@ def run(host: str = "0.0.0.0", port: int = 2218) -> None:
 
     api = LocalAPI()
     app = FastAPI()
+    app.get("/healthcheck")(lambda: {"status": "ok"})
     app.post("/register")(api.register)
     app.post("/_log")(api._log)
     app.post("/_prepare_backend_for_training")(api._prepare_backend_for_training)
