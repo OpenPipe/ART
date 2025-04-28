@@ -116,7 +116,7 @@ class SkyPilotAPI(API):
         # TODO: TEST VERSIONED INSTALLATION ONCE WE'VE PUBLISHED A NEW VERSION OF ART WITH THE 'art' CLI SCRIPT
 
         # default to installing latest version of art
-        art_installation_command = "uv pip install art"
+        art_installation_command = "uv pip install openpipe-art"
         if art_version is not None:
             art_version_is_semver = False
             # check if art_version is valid semver
@@ -128,7 +128,7 @@ class SkyPilotAPI(API):
                     pass
 
             if art_version_is_semver:
-                art_installation_command = f"uv pip install art=={art_version}"
+                art_installation_command = f"uv pip install openpipe-art=={art_version}"
             elif os.path.exists(art_version):
                 # copy the contents of the art_path onto the new machine
                 task.set_file_mounts(
@@ -136,7 +136,7 @@ class SkyPilotAPI(API):
                         "~/sky_workdir": art_version,
                     }
                 )
-                art_installation_command = ""
+                art_installation_command = "uv sync"
             else:
                 raise ValueError(
                     f"Invalid art_version: {art_version}. Must be a semver or a path to a local directory."
@@ -150,7 +150,6 @@ class SkyPilotAPI(API):
     git config --global --add safe.directory /root/sky_workdir
 
     {art_installation_command}
-    uv sync
     """
 
         task.setup = setup_script
