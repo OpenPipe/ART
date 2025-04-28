@@ -383,6 +383,9 @@
 workdir: .
 resources:
   accelerators: ["H100:1", "A100-80GB:1"]
+  ports:
+    - 7999 # main ART server
+    - 8000 # vLLM server
 envs:
   GIT_USER_NAME: "Your Name"
   GIT_USER_EMAIL: "your.email@example.com"
@@ -398,5 +401,7 @@ setup: |
   git clean -fd
   # Install astral-uv
   sudo snap install --classic astral-uv
+  # Install tmux
+  apt install tmux -y
   # Sync the dependencies
   uv sync
