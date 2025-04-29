@@ -28,7 +28,7 @@ def load_benchmarked_models(
     for benchmark_key in benchmark_keys_copy:
         benchmarked_model = BenchmarkedModel(benchmark_key)
         model_output_dir = get_output_dir_from_model_properties(
-            project, benchmark_key.model, api_path
+            project=project, name=benchmark_key.model, art_path=api_path
         )
         split_dir = get_trajectories_split_dir(model_output_dir, benchmark_key.split)
 

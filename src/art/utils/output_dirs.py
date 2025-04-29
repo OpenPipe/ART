@@ -1,18 +1,32 @@
+import os
+
 from art.model import Model
+from art.utils.get_repo_root_path import get_repo_root_path
 
 
-def get_models_dir(art_path: str, project_name: str) -> str:
+def get_default_art_path() -> str:
+    root_path = get_repo_root_path()
+    return os.path.join(root_path, ".art")
+
+
+def get_models_dir(project_name: str, art_path: str | None = None) -> str:
+    if art_path is None:
+        art_path = get_default_art_path()
     return f"{art_path}/{project_name}/models"
 
 
-def get_model_dir(art_path: str, model: Model) -> str:
+def get_model_dir(model: Model, art_path: str | None = None) -> str:
+    if art_path is None:
+        art_path = get_default_art_path()
     return f"{art_path}/{model.project}/models/{model.name}"
 
 
 def get_output_dir_from_model_properties(
-    project: str, name: str, path: str = "./.art"
+    project: str, name: str, art_path: str | None = None
 ) -> str:
-    return f"{path}/{project}/models/{name}"
+    if art_path is None:
+        art_path = get_default_art_path()
+    return f"{art_path}/{project}/models/{name}"
 
 
 def get_trajectories_dir(model_output_dir: str) -> str:
@@ -21,7 +35,3 @@ def get_trajectories_dir(model_output_dir: str) -> str:
 
 def get_trajectories_split_dir(model_output_dir: str, split: str) -> str:
     return f"{model_output_dir}/trajectories/{split}"
-
-
-def get_benchmarks_dir(project: str, path: str = "./.art") -> str:
-    return f"{path}/{project}/benchmarks"

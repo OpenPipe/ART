@@ -5,7 +5,7 @@ from typing import Literal
 
 from .load_benchmarked_models import load_benchmarked_models
 from .types import BenchmarkedModelKey
-from ..output_dirs import get_benchmarks_dir
+from ..output_dirs import get_default_art_path
 
 # returns an array of paths to image files, one for each metric
 def generate_line_graphs(
@@ -16,7 +16,7 @@ def generate_line_graphs(
     x_axis_metric: Literal["step", "time"] = "step",
     api_path: str = "./.art"
 ) -> list[str]:
-    benchmarks_dir = get_benchmarks_dir(project, api_path)
+    benchmarks_dir = f"{get_default_art_path()}/{project}/benchmarks"
     os.makedirs(benchmarks_dir, exist_ok=True)
 
     line_graph_models = load_benchmarked_models(project, line_graph_keys, metrics, api_path)
