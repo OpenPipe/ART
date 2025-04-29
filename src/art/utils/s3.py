@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import boto3
 from botocore.exceptions import ClientError
 import asyncio
@@ -17,12 +18,15 @@ class S3SyncError(RuntimeError):
 
 def build_s3_path(
     *,
-    s3_bucket: str,
-    prefix: str | None,
-    project: str,
     model: str,
+    project: str,
+    s3_bucket: str | None = None,
+    prefix: str | None,
 ) -> str:
     """Return the fully-qualified S3 URI for this model directory."""
+    if s3_bucket is None:
+        s3_bucket = os.environ["BACKUP_BUCKET"]
+
     prefix_part = f"{prefix.strip('/')}/" if prefix else ""
     return f"s3://{s3_bucket}/{prefix_part}{project}/models/{model}"
 
@@ -75,11 +79,14 @@ async def s3_sync(
         raise S3SyncError(f"{' '.join(cmd)} exited with status {return_code}")
 
 
-async def ensure_bucket_exists(s3_bucket: str) -> None:
+async def ensure_bucket_exists(s3_bucket: str | None = None) -> None:
     """Ensure that the S3 bucket exists.
 
     If it doesn't exist, create it.
     """
+    if s3_bucket is None:
+        s3_bucket = os.environ["BACKUP_BUCKET"]
+
     s3 = boto3.client("s3")
     try:
         s3.head_bucket(Bucket=s3_bucket)

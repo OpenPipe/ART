@@ -13,7 +13,7 @@ random.seed(42)
 
 # Declare the model
 model = art.TrainableModel(
-    name="001",
+    name="003",
     project="2048",
     base_model="Qwen/Qwen2.5-7B-Instruct",
 )
@@ -37,7 +37,6 @@ async def main():
     print(f"Pulling from S3 bucket: `{os.environ['BACKUP_BUCKET']}`")
     await api._experimental_pull_from_s3(
         model,
-        s3_bucket=os.environ["BACKUP_BUCKET"],
         verbose=True,
     )
 

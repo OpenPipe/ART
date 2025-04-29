@@ -340,7 +340,7 @@ class LocalAPI(API):
         self,
         model: Model,
         *,
-        s3_bucket: str,
+        s3_bucket: str | None = None,
         prefix: str | None = None,
         verbose: bool = False,
         delete: bool = False,
@@ -350,10 +350,10 @@ class LocalAPI(API):
         os.makedirs(local_dir, exist_ok=True)
 
         s3_path = build_s3_path(
+            model=model.name,
+            project=model.project,
             s3_bucket=s3_bucket,
             prefix=prefix,
-            project=model.project,
-            model=model.name,
         )
         await ensure_bucket_exists(s3_bucket)
         await s3_sync(s3_path, local_dir, verbose=verbose, delete=delete)
@@ -368,7 +368,7 @@ class LocalAPI(API):
         self,
         model: Model,
         *,
-        s3_bucket: str,
+        s3_bucket: str | None = None,
         prefix: str | None = None,
         verbose: bool = False,
         delete: bool = False,
@@ -376,9 +376,9 @@ class LocalAPI(API):
         """Upload the model directory from local storage to S3."""
         local_dir = get_model_dir(self._path, model)
         s3_path = build_s3_path(
+            model=model.name,
+            project=model.project,
             s3_bucket=s3_bucket,
             prefix=prefix,
-            project=model.project,
-            model=model.name,
         )
         await s3_sync(local_dir, s3_path, verbose=verbose, delete=delete)
