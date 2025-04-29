@@ -21,7 +21,7 @@ def build_s3_path(
     model: str,
     project: str,
     s3_bucket: str | None = None,
-    prefix: str | None,
+    prefix: str | None = None,
 ) -> str:
     """Return the fully-qualified S3 URI for this model directory."""
     if s3_bucket is None:
