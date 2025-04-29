@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+import boto3
+from botocore.exceptions import ClientError
 import asyncio
 from asyncio.subprocess import DEVNULL
 from typing import Optional, Sequence
+
 from ..utils import limit_concurrency
 
 __all__: Sequence[str] = ("s3_sync",)
@@ -10,6 +13,18 @@ __all__: Sequence[str] = ("s3_sync",)
 
 class S3SyncError(RuntimeError):
     """Raised when the underlying *aws s3 sync* command exits with a non‑zero status."""
+
+
+def build_s3_path(
+    *,
+    s3_bucket: str,
+    prefix: str | None,
+    project: str,
+    model: str,
+) -> str:
+    """Return the fully-qualified S3 URI for this model directory."""
+    prefix_part = f"{prefix.strip('/')}/" if prefix else ""
+    return f"s3://{s3_bucket}/{prefix_part}{project}/models/{model}"
 
 
 @limit_concurrency(1)
@@ -58,3 +73,26 @@ async def s3_sync(
 
     if return_code != 0:
         raise S3SyncError(f"{' '.join(cmd)} exited with status {return_code}")
+
+
+async def ensure_bucket_exists(s3_bucket: str) -> None:
+    """Ensure that the S3 bucket exists.
+
+    If it doesn't exist, create it.
+    """
+    s3 = boto3.client("s3")
+    try:
+        s3.head_bucket(Bucket=s3_bucket)
+        print(f"S3 bucket {s3_bucket} exists.")
+    except ClientError as e:
+        error_code = int(e.response["Error"]["Code"])
+        if error_code == 404:
+            print(f"S3 bucket {s3_bucket} does not exist, creating it")
+            s3.create_bucket(Bucket=s3_bucket)
+        elif error_code == 403:
+            print(
+                f"S3 bucket {s3_bucket} is not accessible or already owned by another account. Choose a new bucket name."
+            )
+            raise
+        else:
+            raise

@@ -1,8 +1,10 @@
 import asyncio
-import art
-from art.skypilot import SkyPilotAPI
+import os
 from dotenv import load_dotenv
 import random
+
+import art
+from art.local import LocalAPI
 from rollout import rollout
 
 load_dotenv()
@@ -30,8 +32,13 @@ model._internal_config = art.dev.InternalModelConfig(
 
 async def main():
     # Initialize the server
-    api = await SkyPilotAPI.initialize_cluster(
-        cluster_name="art", gpu="H100", art_version=".", env_path=".env"
+    api = LocalAPI()
+
+    print(f"Pulling from S3 bucket: `{os.environ['BACKUP_BUCKET']}`")
+    await api._experimental_pull_from_s3(
+        model,
+        s3_bucket=os.environ["BACKUP_BUCKET"],
+        verbose=True,
     )
 
     # Register the model with the local API (sets up logging, inference, and training)
@@ -49,6 +56,10 @@ async def main():
             max_exceptions=10,
         )
         await model.delete_checkpoints()
+        await api._experimental_push_to_s3(
+            model,
+            s3_bucket=os.environ["BACKUP_BUCKET"],
+        )
         await model.train(
             train_groups,
             config=art.TrainConfig(learning_rate=3e-5),

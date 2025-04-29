@@ -35,7 +35,7 @@ from .checkpoints import (
     get_step,
     get_last_checkpoint_dir,
 )
-from .s3_sync import s3_sync
+from art.utils.s3 import build_s3_path, ensure_bucket_exists, s3_sync
 
 
 class LocalAPI(API):
@@ -336,18 +336,6 @@ class LocalAPI(API):
     # Internal helpers
     # ------------------------------------------------------------------
 
-    @staticmethod
-    def _build_s3_path(
-        *,
-        s3_bucket: str,
-        prefix: str | None,
-        project: str,
-        model: str,
-    ) -> str:
-        """Return the fully-qualified S3 URI for this model directory."""
-        prefix_part = f"{prefix.strip('/')}/" if prefix else ""
-        return f"s3://{s3_bucket}/{prefix_part}{project}/models/{model}"
-
     async def _experimental_pull_from_s3(
         self,
         model: Model,
@@ -360,12 +348,14 @@ class LocalAPI(API):
         """Download the model directory from S3 into local API storage. Right now this can be used to pull trajectory logs for processing."""
         local_dir = get_model_dir(self._path, model)
         os.makedirs(local_dir, exist_ok=True)
-        s3_path = self._build_s3_path(
+
+        s3_path = build_s3_path(
             s3_bucket=s3_bucket,
             prefix=prefix,
             project=model.project,
             model=model.name,
         )
+        await ensure_bucket_exists(s3_bucket)
         await s3_sync(s3_path, local_dir, verbose=verbose, delete=delete)
 
         if isinstance(model, TrainableModel):
@@ -385,7 +375,7 @@ class LocalAPI(API):
     ) -> None:
         """Upload the model directory from local storage to S3."""
         local_dir = get_model_dir(self._path, model)
-        s3_path = self._build_s3_path(
+        s3_path = build_s3_path(
             s3_bucket=s3_bucket,
             prefix=prefix,
             project=model.project,
