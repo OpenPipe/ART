@@ -11,7 +11,7 @@ if os.environ.get("IMPORT_UNSLOTH", "0") == "1":
     import unsloth  # type: ignore
 
 from . import dev
-from .api import API
+from .backend import Backend
 from .gather import gather_trajectories, gather_trajectory_groups
 from .model import Model, TrainableModel
 from .trajectories import Trajectory, TrajectoryGroup
@@ -22,7 +22,7 @@ __all__ = [
     "dev",
     "gather_trajectories",
     "gather_trajectory_groups",
-    "API",
+    "Backend",
     "Messages",
     "MessagesAndChoices",
     "Tools",

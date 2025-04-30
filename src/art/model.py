@@ -2,7 +2,7 @@ from openai import AsyncOpenAI
 from typing import cast, Iterable, TYPE_CHECKING, Optional
 
 from . import dev
-from .api import API
+from .backend import Backend
 from .openai import patch_openai
 from .trajectories import Trajectory, TrajectoryGroup
 from .types import TrainConfig
@@ -14,7 +14,7 @@ from openai import (
 import httpx
 
 if TYPE_CHECKING:
-    from .api import API
+    from .backend import Backend
 
 
 class Model(BaseModel):
@@ -63,19 +63,19 @@ class Model(BaseModel):
     # inference endpoint.
     inference_model_name: str | None = None
 
-    _api: Optional["API"] = None
+    _backend: Optional["Backend"] = None
     _s3_bucket: str | None = None
     _s3_prefix: str | None = None
     _openai_client: AsyncOpenAI | None = None
 
-    def api(self) -> "API":
-        if self._api is None:
+    def backend(self) -> "Backend":
+        if self._backend is None:
             raise ValueError(
-                "Model is not registered with the API. You must call `model.register()` first."
+                "Model is not registered with the Backend. You must call `model.register()` first."
             )
-        return self._api
+        return self._backend
 
-    async def register(self, api: "API") -> None:
+    async def register(self, backend: "Backend") -> None:
         if self.config is not None:
             try:
                 self.config.model_dump_json()
@@ -84,8 +84,8 @@ class Model(BaseModel):
                     "The model config cannot be serialized to JSON. Please ensure that all fields are JSON serializable and try again."
                 ) from e
 
-        self._api = api
-        await self._api.register(self)
+        self._backend = backend
+        await self._backend.register(self)
 
     def openai_client(
         self,
@@ -147,7 +147,7 @@ class Model(BaseModel):
             ]
         else:
             trajectory_groups = cast(list[TrajectoryGroup], list(trajectories))
-        await self.api()._log(
+        await self.backend()._log(
             self,
             trajectory_groups,
             split,
@@ -169,11 +169,11 @@ class TrainableModel(Model):
 
     async def register(
         self,
-        api: "API",
+        backend: "Backend",
         _openai_client_config: dev.OpenAIServerConfig | None = None,
     ) -> None:
-        await super().register(api)
-        base_url, api_key = await api._prepare_backend_for_training(
+        await super().register(backend)
+        base_url, api_key = await backend._prepare_backend_for_training(
             self, _openai_client_config
         )
 
@@ -187,7 +187,7 @@ class TrainableModel(Model):
         """
         Get the model's current training step.
         """
-        return await self.api()._get_step(self)
+        return await self.backend()._get_step(self)
 
     async def delete_checkpoints(
         self, best_checkpoint_metric: str = "val/reward"
@@ -199,7 +199,7 @@ class TrainableModel(Model):
             best_checkpoint_metric: The metric to use to determine the best checkpoint.
                 Defaults to "val/reward".
         """
-        await self.api()._delete_checkpoints(
+        await self.backend()._delete_checkpoints(
             self, best_checkpoint_metric, benchmark_smoothing=1.0
         )
 
@@ -218,7 +218,7 @@ class TrainableModel(Model):
             _config: Additional configuration that is subject to change and
                 not yet part of the public API. Use at your own risk.
         """
-        async for _ in self.api()._train_model(
+        async for _ in self.backend()._train_model(
             self, list(trajectory_groups), config, _config or {}
         ):
             pass

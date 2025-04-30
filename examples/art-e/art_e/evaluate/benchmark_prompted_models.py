@@ -27,7 +27,7 @@ TEST_SET_ENTRIES = 100
 
 
 async def main():
-    api = art.LocalAPI()
+    backend = art.LocalBackend()
     models = []
     for model_name, model_id, use_tools in MODELS_TO_BENCHMARK:
         model = art.Model(
@@ -37,7 +37,7 @@ async def main():
                 litellm_model_name=model_id, use_tools=use_tools
             ),
         )
-        await model.register(api)
+        await model.register(backend)
         models.append(model)
 
     results = await asyncio.gather(
@@ -47,7 +47,7 @@ async def main():
         ]
     )
     for model in models:
-        await api._experimental_push_to_s3(
+        await backend._experimental_push_to_s3(
             model,
             s3_bucket=os.environ["BACKUP_BUCKET"],
         )

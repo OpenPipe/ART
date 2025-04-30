@@ -16,7 +16,7 @@ async def benchmark_model(
 
     valid_trajectories = [t for t in val_trajectories if isinstance(t, art.Trajectory)]
 
-    if model._api is not None:
+    if model._backend is not None:
         await model.log(valid_trajectories)
 
     metrics = pl.DataFrame(

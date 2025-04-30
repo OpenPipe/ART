@@ -13,7 +13,7 @@ import time
 import math
 
 
-from art.skypilot.api import SkyPilotAPI
+from art.skypilot.backend import SkyPilotBackend
 from utils import (
     generate_game,
     get_opponent_move,
@@ -156,14 +156,14 @@ DESTROY_AFTER_RUN = False
 
 async def main():
     # run from the root of the repo
-    api = await SkyPilotAPI.initialize_cluster(
+    backend = await SkyPilotBackend.initialize_cluster(
         cluster_name="art6", art_version=".", env_path=".env", gpu="H100"
     )
 
     model = art.TrainableModel(
         name="005", project="tic-tac-toe", base_model="Qwen/Qwen2.5-3B-Instruct"
     )
-    await model.register(api)
+    await model.register(backend)
 
     for i in range(await model.get_step(), 3):
         train_groups = await art.gather_trajectory_groups(
@@ -179,7 +179,7 @@ async def main():
         await model.train(train_groups, config=art.TrainConfig(learning_rate=1e-4))
 
     if DESTROY_AFTER_RUN:
-        await api.down()
+        await backend.down()
 
 
 if __name__ == "__main__":

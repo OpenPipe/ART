@@ -1,3 +1,3 @@
-from .api import LocalAPI
+from .backend import LocalBackend
 
-__all__ = ["LocalAPI"]
+__all__ = ["LocalBackend"]

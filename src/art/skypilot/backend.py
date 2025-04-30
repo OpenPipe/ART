@@ -13,13 +13,13 @@ from .utils import (
 )
 
 from .. import dev
-from ..api import API
+from ..backend import Backend
 
 if TYPE_CHECKING:
     from ..model import Model, TrainableModel
 
 
-class SkyPilotAPI(API):
+class SkyPilotBackend(Backend):
     _cluster_name: str
 
     @classmethod
@@ -96,7 +96,7 @@ class SkyPilotAPI(API):
         print(f"Using base_url: {base_url}")
 
         # Manually call the real __init__ now that base_url is ready
-        super(SkyPilotAPI, self).__init__(base_url=base_url)
+        super(SkyPilotBackend, self).__init__(base_url=base_url)
 
         return self
 
@@ -176,7 +176,7 @@ class SkyPilotAPI(API):
         model: "Model",
     ) -> None:
         """
-        Registers a model with the API for logging and/or training.
+        Registers a model with the Backend for logging and/or training.
 
         Args:
             model: An art.Model instance.

@@ -8,7 +8,7 @@ from typing import Any, AsyncIterator
 import uvicorn
 
 from . import dev
-from .local import LocalAPI
+from .local import LocalBackend
 from .model import TrainableModel
 from .trajectories import TrajectoryGroup
 from .types import TrainConfig
@@ -41,14 +41,14 @@ def run(host: str = "0.0.0.0", port: int = 7999) -> None:
     TrajectoryGroup.__new__ = __new__  # type: ignore
     TrajectoryGroup.__init__ = __init__
 
-    api = LocalAPI()
+    backend = LocalBackend()
     app = FastAPI()
     app.get("/healthcheck")(lambda: {"status": "ok"})
-    app.post("/register")(api.register)
-    app.post("/_log")(api._log)
-    app.post("/_prepare_backend_for_training")(api._prepare_backend_for_training)
-    app.post("/_get_step")(api._get_step)
-    app.post("/_delete_checkpoints")(api._delete_checkpoints)
+    app.post("/register")(backend.register)
+    app.post("/_log")(backend._log)
+    app.post("/_prepare_backend_for_training")(backend._prepare_backend_for_training)
+    app.post("/_get_step")(backend._get_step)
+    app.post("/_delete_checkpoints")(backend._delete_checkpoints)
 
     @app.post("/_train_model")
     async def _train_model(
@@ -58,7 +58,7 @@ def run(host: str = "0.0.0.0", port: int = 7999) -> None:
         dev_config: dev.TrainConfig,
     ) -> StreamingResponse:
         async def stream() -> AsyncIterator[str]:
-            async for result in api._train_model(
+            async for result in backend._train_model(
                 model, trajectory_groups, config, dev_config
             ):
                 yield json.dumps(result) + "\n"

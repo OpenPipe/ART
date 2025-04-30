@@ -1,5 +1,5 @@
 import art
-from art.local import LocalAPI
+from art.local import LocalBackend
 import asyncio
 import openai
 from openai.types.chat import ChatCompletionMessageParam
@@ -231,8 +231,8 @@ async def rollout(
 
 # --- Main Training Loop ---
 async def main():
-    # Initialize ART API and Model
-    api = LocalAPI()
+    # Initialize ART Backend and Model
+    backend = LocalBackend()
     model = art.TrainableModel(
         name=MODEL_NAME,
         project=PROJECT,
@@ -249,7 +249,7 @@ async def main():
             ),
         ),
     )
-    await model.register(api)
+    await model.register(backend)
     op_client = AsyncOpenPipe(api_key=os.getenv("OPENPIPE_API_KEY"))
 
     # Load Data

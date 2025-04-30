@@ -21,7 +21,7 @@ import wandb
 from wandb.sdk.wandb_run import Run
 
 from .. import dev
-from ..api import API
+from ..backend import Backend
 from ..model import Model, TrainableModel
 from .service import ModelService
 from ..trajectories import Trajectory, TrajectoryGroup
@@ -42,13 +42,13 @@ from .checkpoints import (
 from art.utils.s3 import pull_model_from_s3, push_model_to_s3
 
 
-class LocalAPI(API):
+class LocalBackend(Backend):
     def __init__(self, *, in_process: bool = False, path: str | None = None) -> None:
         """
-        Initializes a local, directory-based API interface at the given path.
+        Initializes a local, directory-based Backend interface at the given path.
 
         Note:
-            The local API uses Weights & Biases for training monitoring.
+            The local Backend uses Weights & Biases for training monitoring.
             If you don't have a W&B account, you can create one at https://wandb.ai.
 
         Args:
@@ -69,7 +69,7 @@ class LocalAPI(API):
         model: Model,
     ) -> None:
         """
-        Registers a model with the local API for logging and/or training.
+        Registers a model with the local Backend for logging and/or training.
 
         Args:
             model: An art.Model instance.
@@ -351,7 +351,7 @@ class LocalAPI(API):
         verbose: bool = False,
         delete: bool = False,
     ) -> None:
-        """Download the model directory from S3 into local API storage. Right now this can be used to pull trajectory logs for processing."""
+        """Download the model directory from S3 into local Backend storage. Right now this can be used to pull trajectory logs for processing."""
         await pull_model_from_s3(
             model_name=model.name,
             project=model.project,

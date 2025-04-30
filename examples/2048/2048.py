@@ -4,7 +4,7 @@ from dotenv import load_dotenv
 import random
 
 import art
-from art.local import LocalAPI
+from art.local import LocalBackend
 from rollout import rollout
 
 load_dotenv()
@@ -32,16 +32,16 @@ model._internal_config = art.dev.InternalModelConfig(
 
 async def main():
     # Initialize the server
-    api = LocalAPI()
+    backend = LocalBackend()
 
     print(f"Pulling from S3 bucket: `{os.environ['BACKUP_BUCKET']}`")
-    await api._experimental_pull_from_s3(
+    await backend._experimental_pull_from_s3(
         model,
         verbose=True,
     )
 
-    # Register the model with the local API (sets up logging, inference, and training)
-    await model.register(api)
+    # Register the model with the local backend (sets up logging, inference, and training)
+    await model.register(backend)
 
     for i in range(await model.get_step(), 100):
         train_groups = await art.gather_trajectory_groups(
@@ -55,7 +55,7 @@ async def main():
             max_exceptions=10,
         )
         await model.delete_checkpoints()
-        await api._experimental_push_to_s3(
+        await backend._experimental_push_to_s3(
             model,
         )
         await model.train(

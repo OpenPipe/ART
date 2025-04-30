@@ -11,7 +11,7 @@ if TYPE_CHECKING:
     from .model import Model, TrainableModel
 
 
-class API:
+class Backend:
     def __init__(
         self,
         *,
@@ -25,7 +25,7 @@ class API:
         model: "Model",
     ) -> None:
         """
-        Registers a model with the API for logging and/or training.
+        Registers a model with the Backend for logging and/or training.
 
         Args:
             model: An art.Model instance.

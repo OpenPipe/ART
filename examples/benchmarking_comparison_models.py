@@ -1,5 +1,5 @@
 import art
-from art.local import LocalAPI
+from art.local import LocalBackend
 import asyncio
 from pydantic import BaseModel
 import re
@@ -189,11 +189,11 @@ async def main():
         qwen_thinking,
     ]
 
-    # We need to register all our models with the local API so they're
+    # We need to register all our models with the local Backend so they're
     # available for training and logging.
-    api = LocalAPI()
+    backend = LocalBackend()
     await asyncio.gather(
-        *[model.register(api) for model in train_models + prompted_models]
+        *[model.register(backend) for model in train_models + prompted_models]
     )
 
     # For prompted models, we can benchmark them right away.

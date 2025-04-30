@@ -4,7 +4,7 @@ from dotenv import load_dotenv
 
 import art
 from rollout import rollout
-from art.local.api import LocalAPI
+from art.local.backend import LocalBackend
 
 
 load_dotenv()
@@ -16,14 +16,14 @@ DESTROY_AFTER_RUN = False
 
 async def main():
     # run from the root of the repo
-    api = LocalAPI(path="examples/tic_tac_toe/.art")
+    backend = LocalBackend(path="examples/tic_tac_toe/.art")
 
     model = art.TrainableModel(
         name="001-script",
         project="tic-tac-toe-local",
         base_model="Qwen/Qwen2.5-3B-Instruct",
     )
-    await model.register(api)
+    await model.register(backend)
 
     for i in range(await model.get_step(), 100):
         train_groups = await art.gather_trajectory_groups(
@@ -39,7 +39,7 @@ async def main():
         await model.train(train_groups, config=art.TrainConfig(learning_rate=1e-4))
 
     if DESTROY_AFTER_RUN:
-        await api.down()
+        await backend.down()
 
 
 if __name__ == "__main__":

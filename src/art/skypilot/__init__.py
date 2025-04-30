@@ -1,3 +1,3 @@
-from .api import SkyPilotAPI
+from .backend import SkyPilotBackend
 
-__all__ = ["SkyPilotAPI"]
+__all__ = ["SkyPilotBackend"]
