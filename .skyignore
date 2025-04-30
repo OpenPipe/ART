@@ -11,4 +11,3 @@ wandb/
 docs/node_modules/
 dist/
 examples/art-e/data/
-.git/
