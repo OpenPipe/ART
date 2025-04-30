@@ -158,11 +158,27 @@ async def push_model_to_s3(
     delete: bool = False,
     art_path: str | None = None,
 ) -> None:
+    """Push a model to S3.
+
+    Args:
+        model_name: The name of the model to push.
+        project: The project name.
+        s3_bucket: The S3 bucket to push to.
+        prefix: The prefix to push to.
+        verbose: When *True*, the output of the AWS CLI is streamed to the
+            calling process; otherwise it is suppressed.
+        delete: When *True*, delete the local model directory if it exists.
+        art_path: The path to the ART directory.
+    """
     local_model_dir = get_output_dir_from_model_properties(
         project=project,
         name=model_name,
         art_path=art_path,
     )
+    if not os.path.exists(local_model_dir):
+        raise FileNotFoundError(
+            f"Local model directory {local_model_dir} does not exist."
+        )
     s3_path = build_s3_path(
         model=model_name,
         project=project,
