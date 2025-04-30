@@ -352,7 +352,7 @@ class LocalAPI(API):
         delete: bool = False,
     ) -> None:
         """Download the model directory from S3 into local API storage. Right now this can be used to pull trajectory logs for processing."""
-        local_model_dir = await pull_model_from_s3(
+        await pull_model_from_s3(
             model_name=model.name,
             project=model.project,
             s3_bucket=s3_bucket,
@@ -361,12 +361,6 @@ class LocalAPI(API):
             delete=delete,
             art_path=self._path,
         )
-
-        if isinstance(model, TrainableModel):
-            service = await self._get_service(model)
-            lora_path = get_last_checkpoint_dir(local_model_dir)
-            if lora_path is not None:
-                service._set_lora(lora_path)
 
     async def _experimental_push_to_s3(
         self,
