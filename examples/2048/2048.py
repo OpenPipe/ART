@@ -57,7 +57,6 @@ async def main():
         await model.delete_checkpoints()
         await api._experimental_push_to_s3(
             model,
-            s3_bucket=os.environ["BACKUP_BUCKET"],
         )
         await model.train(
             train_groups,
