@@ -2,7 +2,11 @@ from datetime import datetime
 import json
 import math
 from art.utils.old_benchmarking.calculate_step_metrics import calculate_step_std_dev
-from art.utils.output_dirs import get_model_dir, get_trajectories_split_dir
+from art.utils.output_dirs import (
+    get_default_art_path,
+    get_model_dir,
+    get_trajectories_split_dir,
+)
 from art.utils.trajectory_logging import serialize_trajectory_groups
 from mp_actors import move_to_child_process
 import numpy as np
@@ -35,11 +39,11 @@ from .checkpoints import (
     get_step,
     get_last_checkpoint_dir,
 )
-from art.utils.s3 import build_s3_path, ensure_bucket_exists, s3_sync
+from art.utils.s3 import pull_model_from_s3, push_model_to_s3
 
 
 class LocalAPI(API):
-    def __init__(self, *, in_process: bool = False, path: str = "./.art") -> None:
+    def __init__(self, *, in_process: bool = False, path: str | None = None) -> None:
         """
         Initializes a local, directory-based API interface at the given path.
 
@@ -49,10 +53,10 @@ class LocalAPI(API):
 
         Args:
             in_process: Whether to run the local service in-process.
-            path: The path to the local directory. Defaults to "./.art".
+            path: The path to the local directory. Defaults to "{repo_root}/.art".
         """
         self._in_process = in_process
-        self._path = path
+        self._path = path or get_default_art_path()
         os.makedirs(self._path, exist_ok=True)
 
         # Other initialization
@@ -70,7 +74,7 @@ class LocalAPI(API):
         Args:
             model: An art.Model instance.
         """
-        output_dir = get_model_dir(self._path, model)
+        output_dir = get_model_dir(model=model, art_path=self._path)
         os.makedirs(output_dir, exist_ok=True)
         with open(f"{output_dir}/model.json", "w") as f:
             json.dump(model.model_dump(), f)
@@ -79,7 +83,7 @@ class LocalAPI(API):
         if model.name not in self._services:
             config = dev.get_model_config(
                 base_model=model.base_model,
-                output_dir=get_model_dir(self._path, model),
+                output_dir=get_model_dir(model=model, art_path=self._path),
                 config=model._internal_config,
             )
             self._services[model.name] = ModelService(
@@ -88,7 +92,7 @@ class LocalAPI(API):
                 model_name=model.name,
                 base_model=model.base_model,
                 config=config,
-                output_dir=get_model_dir(self._path, model),
+                output_dir=get_model_dir(model=model, art_path=self._path),
             )
             if not self._in_process:
                 # Kill all "model-service" processes to free up GPU memory
@@ -151,7 +155,7 @@ class LocalAPI(API):
         return self.__get_step(model)
 
     def __get_step(self, model: TrainableModel) -> int:
-        return get_step(get_model_dir(self._path, model))
+        return get_step(get_model_dir(model=model, art_path=self._path))
 
     async def _delete_checkpoints(
         self,
@@ -159,7 +163,7 @@ class LocalAPI(API):
         benchmark: str,
         benchmark_smoothing: float,
     ) -> None:
-        output_dir = get_model_dir(self._path, model)
+        output_dir = get_model_dir(model=model, art_path=self._path)
         # Keep the latest step
         steps_to_keep = [get_step(output_dir)]
         try:
@@ -201,7 +205,9 @@ class LocalAPI(API):
         split: str = "val",
     ) -> None:
         # Save logs for trajectory groups
-        parent_dir = get_trajectories_split_dir(get_model_dir(self._path, model), split)
+        parent_dir = get_trajectories_split_dir(
+            get_model_dir(model=model, art_path=self._path), split
+        )
         os.makedirs(parent_dir, exist_ok=True)
 
         # Get the file name for the current iteration, or default to 0 for non-trainable models
@@ -275,7 +281,7 @@ class LocalAPI(API):
             )
             return
         disk_packed_tensors = packed_tensors_to_dir(
-            packed_tensors, f"{get_model_dir(self._path, model)}/tensors"
+            packed_tensors, f"{get_model_dir(model=model, art_path=self._path)}/tensors"
         )
         results: list[dict[str, float]] = []
         num_gradient_steps = disk_packed_tensors["num_sequences"]
@@ -346,21 +352,19 @@ class LocalAPI(API):
         delete: bool = False,
     ) -> None:
         """Download the model directory from S3 into local API storage. Right now this can be used to pull trajectory logs for processing."""
-        local_dir = get_model_dir(self._path, model)
-        os.makedirs(local_dir, exist_ok=True)
-
-        s3_path = build_s3_path(
-            model=model.name,
+        local_model_dir = await pull_model_from_s3(
+            model_name=model.name,
             project=model.project,
             s3_bucket=s3_bucket,
             prefix=prefix,
+            verbose=verbose,
+            delete=delete,
+            art_path=self._path,
         )
-        await ensure_bucket_exists(s3_bucket)
-        await s3_sync(s3_path, local_dir, verbose=verbose, delete=delete)
 
         if isinstance(model, TrainableModel):
             service = await self._get_service(model)
-            lora_path = get_last_checkpoint_dir(local_dir)
+            lora_path = get_last_checkpoint_dir(local_model_dir)
             if lora_path is not None:
                 service._set_lora(lora_path)
 
@@ -374,11 +378,12 @@ class LocalAPI(API):
         delete: bool = False,
     ) -> None:
         """Upload the model directory from local storage to S3."""
-        local_dir = get_model_dir(self._path, model)
-        s3_path = build_s3_path(
-            model=model.name,
+        await push_model_to_s3(
+            model_name=model.name,
             project=model.project,
             s3_bucket=s3_bucket,
             prefix=prefix,
+            verbose=verbose,
+            delete=delete,
+            art_path=self._path,
         )
-        await s3_sync(local_dir, s3_path, verbose=verbose, delete=delete)

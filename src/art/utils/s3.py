@@ -7,6 +7,8 @@ import asyncio
 from asyncio.subprocess import DEVNULL
 from typing import Optional, Sequence
 
+from art.utils.output_dirs import get_output_dir_from_model_properties
+
 from ..utils import limit_concurrency
 
 __all__: Sequence[str] = ("s3_sync",)
@@ -103,3 +105,69 @@ async def ensure_bucket_exists(s3_bucket: str | None = None) -> None:
             raise
         else:
             raise
+
+
+async def pull_model_from_s3(
+    model_name: str,
+    project: str,
+    s3_bucket: str | None = None,
+    prefix: str | None = None,
+    verbose: bool = False,
+    delete: bool = False,
+    art_path: str | None = None,
+) -> str:
+    """Pull a model from S3 to the local directory.
+
+    Args:
+        model_name: The name of the model to pull.
+        project: The project name.
+        s3_bucket: The S3 bucket to pull from.
+        prefix: The prefix to pull from.
+        verbose: When *True*, the output of the AWS CLI is streamed to the
+            calling process; otherwise it is suppressed.
+        delete: When *True*, delete the local model directory if it exists.
+        art_path: The path to the ART directory.
+
+    Returns:
+        The local directory path.
+    """
+    local_model_dir = get_output_dir_from_model_properties(
+        project=project,
+        name=model_name,
+        art_path=art_path,
+    )
+    os.makedirs(local_model_dir, exist_ok=True)
+
+    s3_path = build_s3_path(
+        model=model_name,
+        project=project,
+        s3_bucket=s3_bucket,
+        prefix=prefix,
+    )
+    await ensure_bucket_exists(s3_bucket)
+    await s3_sync(s3_path, local_model_dir, verbose=verbose, delete=delete)
+
+    return local_model_dir
+
+
+async def push_model_to_s3(
+    model_name: str,
+    project: str,
+    s3_bucket: str | None = None,
+    prefix: str | None = None,
+    verbose: bool = False,
+    delete: bool = False,
+    art_path: str | None = None,
+) -> None:
+    local_model_dir = get_output_dir_from_model_properties(
+        project=project,
+        name=model_name,
+        art_path=art_path,
+    )
+    s3_path = build_s3_path(
+        model=model_name,
+        project=project,
+        s3_bucket=s3_bucket,
+        prefix=prefix,
+    )
+    await s3_sync(local_model_dir, s3_path, verbose=verbose, delete=delete)

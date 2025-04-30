@@ -80,7 +80,7 @@ async def load_trajectories(
     metric_cols: set[str] = set()
     metadata_cols: set[str] = set()
 
-    root = Path(get_models_dir(api_path, project_name))
+    root = Path(get_models_dir(project_name=project_name, art_path=api_path))
     group_number = 0
 
     # Normalize the optional *models* argument for quick membership tests
