@@ -92,7 +92,6 @@ async def ensure_bucket_exists(s3_bucket: str | None = None) -> None:
     s3 = boto3.client("s3")
     try:
         s3.head_bucket(Bucket=s3_bucket)
-        print(f"S3 bucket {s3_bucket} exists.")
     except ClientError as e:
         error_code = int(e.response["Error"]["Code"])
         if error_code == 404:

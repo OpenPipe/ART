@@ -4,7 +4,11 @@ from pathlib import Path
 from panza import SQLiteCache
 
 from art.utils.get_repo_root_path import get_repo_root_path
-from art.utils.output_dirs import get_models_dir, get_trajectories_dir
+from art.utils.output_dirs import (
+    get_default_art_path,
+    get_models_dir,
+    get_trajectories_dir,
+)
 
 cache_path = Path(get_repo_root_path()) / "data" / "cache.db"
 cache_path.parent.mkdir(parents=True, exist_ok=True)
@@ -13,10 +17,10 @@ cache = SQLiteCache(str(cache_path))
 
 @cache.cache()
 async def load_trajectories(
-    api_path: str,
     project_name: str,
     models: list[str] | None = None,
     debug: bool = False,
+    art_path: str | None = None,
 ) -> pl.DataFrame:
     """
       Load and flatten trajectory YAML files into a Polars DataFrame.
@@ -80,7 +84,10 @@ async def load_trajectories(
     metric_cols: set[str] = set()
     metadata_cols: set[str] = set()
 
-    root = Path(get_models_dir(project_name=project_name, art_path=api_path))
+    if art_path is None:
+        art_path = get_default_art_path()
+
+    root = Path(get_models_dir(project_name=project_name, art_path=art_path))
     group_number = 0
 
     # Normalize the optional *models* argument for quick membership tests
