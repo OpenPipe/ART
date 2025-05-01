@@ -17,22 +17,10 @@ from training_helpers import (
     run_final_inference_and_report_metrics,
     MandT,
     get_dataset,
+    RunConfig,
+    get_s3_model_path,
 )
 import s3fs
-from pydantic import BaseModel
-
-
-class RunConfig(BaseModel):
-    run_name: str
-    num_epochs: int = 1
-    batch_size: int = 4
-    gradient_accumulation_steps: int = 4
-    learning_rate: float = 2e-4
-    max_length: int = 4096
-    train_size: int = 100000
-    val_size: int = 500
-    base_model: str = "Qwen/Qwen2.5-0.5B"
-    accelerator: str = "H100-SXM:1"
 
 
 def train(config: RunConfig):
@@ -78,34 +66,32 @@ def train(config: RunConfig):
     del base_model
 
     logging.info("Preparing datasets...")
-    # Request the desired total size
-    requested_total_size = config.train_size + config.val_size
+    # Load the full training dataset
     train_jokes = get_dataset(
         "train",
         tokenizer,
         config.max_length,
-        requested_total_size,  # Ask for the sum initially
     )
 
     total_jokes_loaded = len(train_jokes)
     print(f"Loaded {total_jokes_loaded} jokes from the 'train' split.")
 
-    # Determine actual validation and training sizes based on loaded data
+    # Determine actual validation size based on loaded data
     # Ensure at least 1 training example if possible, unless dataset is truly tiny
     actual_val_size = min(config.val_size, max(0, total_jokes_loaded - 1))
     actual_train_size = total_jokes_loaded - actual_val_size
 
-    if actual_train_size < config.train_size or actual_val_size < config.val_size:
+    if actual_val_size < config.val_size:
         logging.warning(
-            f"Requested train_size={config.train_size}, val_size={config.val_size}. "
+            f"Requested val_size={config.val_size}. "
             f"Dataset only has {total_jokes_loaded} examples. "
-            f"Using actual_train_size={actual_train_size}, actual_val_size={actual_val_size}."
+            f"Using actual_val_size={actual_val_size}."
         )
 
     test_jokes = get_dataset("test", tokenizer, config.max_length)
     print(f"Test jokes: {len(test_jokes)}")
 
-    # Split train_jokes into train and validation sets using actual sizes
+    # Split train_jokes into validation and training sets using actual sizes
     val_jokes = train_jokes.select(range(actual_val_size))
     train_jokes = train_jokes.select(range(actual_val_size, total_jokes_loaded))
 
@@ -155,13 +141,12 @@ def train(config: RunConfig):
     )
 
     s3 = s3fs.S3FileSystem()
+    s3_path = get_s3_model_path(config.run_name)
 
-    logging.info(
-        f"Uploading model to S3 at path s3://{os.getenv('REMOTE_BUCKET')}/roflbot_rm/models/{config.run_name}"
-    )
+    logging.info(f"Uploading model to S3 at path {s3_path}")
     s3.put(
         output_dir,
-        f"s3://{os.getenv('REMOTE_BUCKET')}/roflbot_rm/models/{config.run_name}",
+        s3_path,
         recursive=True,
         maxdepth=1,
     )

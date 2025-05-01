@@ -3,7 +3,6 @@ import torch  # type: ignore
 import polars as pl  # type: ignore
 from scipy.stats import pearsonr  # type: ignore
 from sklearn.metrics import root_mean_squared_error  # type: ignore
-import wandb  # type: ignore
 from inference import run_inference_transformers, ModelOrPath, MandT, load_model
 import math
 import logging
@@ -11,6 +10,8 @@ from datetime import datetime
 from datasets import Dataset, load_dataset
 from transformers.tokenization_utils import PreTrainedTokenizer
 import os
+from pydantic import BaseModel
+
 
 logging.basicConfig(
     level=logging.INFO,
@@ -40,6 +41,8 @@ def compute_metrics(eval_pred):
 def run_final_inference_and_report_metrics(
     model_or_path: ModelOrPath, dataset: Dataset, output_dir: Optional[str] = None
 ):
+    import wandb
+
     if output_dir is None:
         if not isinstance(model_or_path, str):
             raise ValueError(
@@ -68,7 +71,7 @@ def run_final_inference_and_report_metrics(
         # If we're working with a PEFT wrapper, merge before running inference for speed
         if hasattr(model, "merge_and_unload"):
             print("Merging PEFT model with base model...")
-            model = model.merge_and_unload()
+            model = model.merge_and_unload()  # type: ignore
 
         predictions = run_inference_transformers(df["text"].to_list(), mandt)
         df = df.with_columns(pl.Series(name="predictions", values=predictions))
@@ -193,3 +196,23 @@ def get_dataset(
         ds = ds.select(range(max_rows))
 
     return ds
+
+
+class RunConfig(BaseModel):
+    run_name: str
+    num_epochs: int = 1
+    batch_size: int = 4
+    gradient_accumulation_steps: int = 4
+    learning_rate: float = 2e-4
+    max_length: int = 4096
+    val_size: int = 500
+    base_model: str = "Qwen/Qwen2.5-0.5B"
+    accelerator: str = "H100-SXM:1"
+
+
+def get_s3_model_path(run_name: str) -> str:
+    """Constructs the S3 path for storing/retrieving model artifacts."""
+    remote_bucket = os.getenv("REMOTE_BUCKET")
+    if not remote_bucket:
+        raise ValueError("Environment variable REMOTE_BUCKET is not set.")
+    return f"s3://{remote_bucket}/roflbot_rm/models/{run_name}"

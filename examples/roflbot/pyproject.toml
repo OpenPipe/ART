@@ -27,6 +27,9 @@ dependencies = [
     "wandb>=0.19.10",
     "zstandard>=0.23.0",
     "scikit-learn>=1.6.1",
+    "hf-transfer>=0.1.9",
+    "modal>=0.74.40",
+    "fastapi>=0.115.12",
 ]
 
 [tool.uv]
@@ -35,3 +38,6 @@ override-dependencies = [
     "xformers; sys_platform == 'linux'",
     "triton; sys_platform == 'linux'",
 ]
+
+[tool.uv.sources]
+peft = { git = "https://github.com/huggingface/peft.git" }
