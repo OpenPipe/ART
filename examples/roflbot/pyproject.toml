@@ -1,0 +1,37 @@
+[project]
+name = "roflbot"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "datasets>=3.5.1",
+    "ipykernel>=6.29.5",
+    "liger-kernel>=0.5.8",
+    "litellm>=1.67.5",
+    "matplotlib>=3.10.1",
+    "numpy>=2.2.5",
+    "orjson>=3.10.18",
+    "panza>=0.1.0",
+    "peft>=0.15.2",
+    "pip>=25.1",
+    "polars>=1.28.1",
+    "pyarrow>=20.0.0",
+    "python-dotenv>=1.1.0",
+    "s3fs>=2025.3.0",
+    "skypilot[lambda,runpod]>=0.9",
+    "omegaconf>=2.4.0.dev3",
+    "torch>=2.7.0",
+    "tqdm>=4.67.1",
+    "transformers>=4.51.3",
+    "wandb>=0.19.10",
+    "zstandard>=0.23.0",
+    "scikit-learn>=1.6.1",
+]
+
+[tool.uv]
+override-dependencies = [
+    "bitsandbytes; sys_platform == 'linux'",
+    "xformers; sys_platform == 'linux'",
+    "triton; sys_platform == 'linux'",
+]
