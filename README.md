@@ -49,10 +49,6 @@ This training loop runs until a specified number of inference and training itera
 
 ART should work with most vLLM/HuggingFace-transformers compatible causal language models, or at least the ones supported by [Unsloth](https://docs.unsloth.ai/get-started/all-our-models). Gemma 3 does not appear to be supported for the time being. If any other model isn't working for you, please let us know on [Discord](https://discord.gg/zbBHRUpwf4) or open an issue on [GitHub](https://github.com/openpipe/art/issues)!
 
-## ⚠️ Disclaimer
-
-ART is currently in alpha and has only been tested on a few projects in the wild! We're working hard to make it work for everyone, but if you run into any issues, please let us know on [Discord](https://discord.gg/zbBHRUpwf4) or open an issue on [GitHub](https://github.com/openpipe/art/issues)!
-
 ## 🤝 Contributing
 
 ART is in very active development, and contributions are most welcome! Please see the [CONTRIBUTING.md](CONTRIBUTING.md) file for more information.
@@ -67,3 +63,20 @@ ART stands on the shoulders of giants. While we owe many of the ideas and early 
 - [SkyPilot](https://github.com/skypilot-org/skypilot)
 
 Finally, thank you to our partners who've helped us test ART in the wild! We're excited to see what you all build with it.
+
+## Citation
+
+```bibtex
+@misc{hilton2025art,
+  author = {Brad Hilton and Kyle Corbitt and David Corbitt and Saumya Gandhi and Bohdan Kovalenskyi and Angky William and Andie Jones},
+  title = {ART: Agent Reinforcement Trainer},
+  year = {2025},
+  publisher = {GitHub},
+  journal = {GitHub repository},
+  howpublished = {\url{https://github.com/openpipe/art}}
+}
+```
+
+## License
+
+This repository's source code is available under the [Apache-2.0 License](LICENSE).
