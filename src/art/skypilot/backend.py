@@ -1,4 +1,4 @@
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, cast
 import sky
 import os
 import semver
@@ -31,7 +31,7 @@ class SkyPilotBackend(Backend):
         resources: sky.Resources | None = None,
         art_version: str | None = None,
         env_path: str | None = None,
-    ) -> None:
+    ) -> "SkyPilotBackend":
         self = cls.__new__(cls)
         self._cluster_name = cluster_name
 
@@ -78,7 +78,7 @@ class SkyPilotBackend(Backend):
                     "handle"
                 ].launched_resources
             )
-            art_server_task.set_resources(resources)
+            art_server_task.set_resources(cast(sky.Resources, resources))
 
             # run art server task
             await to_thread_typed(
@@ -201,7 +201,7 @@ class SkyPilotBackend(Backend):
 
         vllm_base_url = await get_vllm_base_url(self._cluster_name)
 
-        return [vllm_base_url, api_key]
+        return (vllm_base_url, api_key)
 
     async def down(self) -> None:
         await to_thread_typed(lambda: sky.down(cluster_name=self._cluster_name))
