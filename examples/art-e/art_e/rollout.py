@@ -248,10 +248,10 @@ async def rollout(
 
         llm_response = await acompletion(
             model=litellm_model_name,
-            base_url=model.base_url,
+            base_url=model.inference_base_url,
             messages=traj.messages(),
             caching=not model.trainable,
-            api_key=model.api_key,
+            api_key=model.inference_api_key,
             max_completion_tokens=model.config.max_tokens,
             tools=tools if model.config.use_tools else None,
             tool_choice="required"

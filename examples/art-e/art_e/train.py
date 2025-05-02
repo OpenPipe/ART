@@ -1,4 +1,5 @@
 import art
+from art.local import LocalBackend
 import asyncio
 from dotenv import load_dotenv
 from typing import List
@@ -91,7 +92,7 @@ async def run_training(model: art.TrainableModel):
     assert isinstance(model.config, ProjectPolicyConfig)
     if model.config.training_config is None:
         raise ValueError("Training config is not set")
-    backend = art.LocalBackend()
+    backend = LocalBackend()
     await model.register(backend)
     print(f"Pulling from S3 bucket: `{os.environ['BACKUP_BUCKET']}`")
     await backend._experimental_pull_from_s3(
