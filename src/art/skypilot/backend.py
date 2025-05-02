@@ -152,15 +152,15 @@ class SkyPilotBackend(Backend):
     {art_installation_command}
     """
 
-        task.setup = setup_script
-
         if env_path is not None:
             envs = dotenv_values(env_path)
             print(f"Loading envs from {env_path}")
             print(f"{len(envs)} environment variables found")
             task.update_envs(envs)
+            for key, value in envs.items():
+                setup_script += f"\nexport {key}={value}"
 
-        print(task)
+        task.setup = setup_script
 
         try:
             await to_thread_typed(
