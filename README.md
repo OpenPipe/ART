@@ -47,7 +47,7 @@ This training loop runs until a specified number of inference and training itera
 
 ## 🤖 ART•E Agent
 
-Curious about how to use ART for a real-world task? Check out our [ART•E Agent](https://openpipe.ai/blog/art-e-agent) blog post, where we detail how we trained Qwen 2.5 14B to beat o3 at email retrieval!
+Curious about how to use ART for a real-world task? Check out the [ART•E Agent](https://openpipe.ai/blog/art-e-mail-agent) blog post, where we detail how we trained Qwen 2.5 14B to beat o3 at email retrieval!
 
 ## 🧩 Supported Models
 
