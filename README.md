@@ -6,7 +6,7 @@
 
 <a href="https://colab.research.google.com/github/openpipe/art/blob/main/examples/2048/2048.ipynb"><img src="https://github.com/openpipe/art/raw/main/assets/Train_pill.png" height="48"></a>
 <a href="https://discord.gg/zbBHRUpwf4"><img src="https://github.com/openpipe/art/raw/main/assets/Discord_pill.png" height="48"></a>
-<a href="https://openpipe.ai/blog/art-trainer-a-new-rl-trainer-for-agents"><img src="https://github.com/openpipe/art/raw/main/assets/Launch_pill.png" height="48"></a>
+<a href="https://openpipe.ai/blog/art-trainer-a-new-rl-trainer-for-agents"><img src="https://github.com/openpipe/art/raw/link-art-3/assets/ART_E_pill.png" height="48"></a>
 
 ### Train GRPO-powered RL agents with minimal code changes and maximal performance!
 
@@ -44,6 +44,10 @@ ART's functionality is divided into a **client** and a **server**. The OpenAI-co
    4. Inference is unblocked and the loop resumes at step 1.
 
 This training loop runs until a specified number of inference and training iterations have completed.
+
+## 🤖 ART•E Agent
+
+Curious about how to use ART for a real-world task? Check out our [ART•E Agent](https://openpipe.ai/blog/art-e-agent) blog post, where we detail how we trained Qwen 2.5 14B to beat o3 at email retrieval!
 
 ## 🧩 Supported Models
 
