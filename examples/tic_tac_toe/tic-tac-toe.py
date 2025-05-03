@@ -3,7 +3,6 @@ import asyncio
 
 import art
 from dotenv import load_dotenv
-import random
 from pydantic import BaseModel
 
 from openpipe.client import OpenPipe
@@ -31,14 +30,12 @@ print("OpenPipe client initialized")
 random.seed(42)
 
 
-class CustomConfig(BaseModel):
-    litellm_model_name: str | None = None
+class TicTacToeScenario(BaseModel):
+    iteration: int
 
 
 @art.retry(exceptions=(openai.LengthFinishReasonError,))
-async def rollout(
-    model: art.Model, iteration: int, is_validation: bool
-) -> art.Trajectory:
+async def rollout(model: art.Model, scenario: TicTacToeScenario) -> art.Trajectory:
     game = generate_game()
 
     trajectory = art.Trajectory(
@@ -92,8 +89,7 @@ async def rollout(
                     "messages": messages,
                     "metadata": {
                         "notebook-id": "tic-tac-toe",
-                        "iteration": str(iteration),
-                        "validation": str(is_validation),
+                        "iteration": str(scenario.iteration),
                         "move_number": str(move_number),
                     },
                 },
@@ -163,13 +159,16 @@ async def main():
     model = art.TrainableModel(
         name="005", project="tic-tac-toe", base_model="Qwen/Qwen2.5-3B-Instruct"
     )
+    await backend._experimental_pull_from_s3(
+        model, s3_bucket="art-logs", prefix="tic-tac-toe/005", verbose=True
+    )
     await model.register(backend)
 
     for i in range(await model.get_step(), 3):
         train_groups = await art.gather_trajectory_groups(
             (
                 art.TrajectoryGroup(
-                    rollout(model, i, is_validation=False) for _ in range(48)
+                    rollout(model, TicTacToeScenario(iteration=i)) for _ in range(48)
                 )
                 for _ in range(1)
             ),

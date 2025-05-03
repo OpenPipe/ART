@@ -112,3 +112,51 @@ class Backend:
                 pbar.set_postfix(result)
             if pbar is not None:
                 pbar.close()
+
+    # ------------------------------------------------------------------
+    # Experimental support for S3
+    # ------------------------------------------------------------------
+
+    async def _experimental_pull_from_s3(
+        self,
+        model: "Model",
+        *,
+        s3_bucket: str | None = None,
+        prefix: str | None = None,
+        verbose: bool = False,
+        delete: bool = False,
+    ) -> None:
+        """Download the model directory from S3 into file system where the LocalBackend is running. Right now this can be used to pull trajectory logs for processing or model checkpoints."""
+        response = await self._client.post(
+            "/_experimental_pull_from_s3",
+            json={
+                "model": model.model_dump(),
+                "s3_bucket": s3_bucket,
+                "prefix": prefix,
+                "verbose": verbose,
+                "delete": delete,
+            },
+        )
+        response.raise_for_status()
+
+    async def _experimental_push_to_s3(
+        self,
+        model: "Model",
+        *,
+        s3_bucket: str | None = None,
+        prefix: str | None = None,
+        verbose: bool = False,
+        delete: bool = False,
+    ) -> None:
+        """Upload the model directory from the file system where the LocalBackend is running to S3."""
+        response = await self._client.post(
+            "/_experimental_push_to_s3",
+            json={
+                "model": model.model_dump(),
+                "s3_bucket": s3_bucket,
+                "prefix": prefix,
+                "verbose": verbose,
+                "delete": delete,
+            },
+        )
+        response.raise_for_status()

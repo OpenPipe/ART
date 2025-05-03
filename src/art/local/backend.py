@@ -339,7 +339,7 @@ class LocalBackend(Backend):
         return self._wandb_runs[model.name]
 
     # ------------------------------------------------------------------
-    # Internal helpers
+    # Experimental support for S3
     # ------------------------------------------------------------------
 
     async def _experimental_pull_from_s3(
@@ -351,7 +351,7 @@ class LocalBackend(Backend):
         verbose: bool = False,
         delete: bool = False,
     ) -> None:
-        """Download the model directory from S3 into local Backend storage. Right now this can be used to pull trajectory logs for processing."""
+        """Download the model directory from S3 into local Backend storage. Right now this can be used to pull trajectory logs for processing or model checkpoints."""
         await pull_model_from_s3(
             model_name=model.name,
             project=model.project,
