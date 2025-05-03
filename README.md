@@ -26,6 +26,12 @@ ART is an open-source reinforcement training library for improving LLM performan
 | **Temporal Clue** | [🏋️ Train agent](https://colab.research.google.com/github/openpipe/art/blob/main/examples/temporal_clue/temporal-clue.ipynb) | Qwen 2.5 7B learns to solve Temporal Clue | [Link coming soon]                                                                                                                                                                                                                           |
 | **Tic Tac Toe**   | [🏋️ Train agent](https://colab.research.google.com/github/openpipe/art/blob/main/examples/tic_tac_toe/tic-tac-toe.ipynb)     | Qwen 2.5 3B learns to play Tic Tac Toe    | <img src="https://github.com/openpipe/art/raw/main/assets/benchmarks/tic-tac-toe-local/accuracy-training-progress.svg" height="72"> [benchmarks](https://github.com/openpipe/art/blob/main/examples/tic_tac_toe/benchmark_tic_tac_toe.ipynb) |
 
+## 🤖 ART•E Agent
+
+Curious about how to use ART for a real-world task? Check out the [ART•E Agent](https://openpipe.ai/blog/art-e-mail-agent) blog post, where we detail how we trained Qwen 2.5 14B to beat o3 at email retrieval!
+
+<img src="https://github.com/openpipe/art/raw/art-e-graph/assets/ART_E_Correctness_graph.svg" height="48">
+
 ## 🔁 Training Loop Overview
 
 ART's functionality is divided into a **client** and a **server**. The OpenAI-compatible client is responsible for interfacing between ART and your codebase. Using the client, you can pass messages and get completions from your LLM as it improves. The server runs independently on any machine with a GPU. It abstracts away the complexity of the inference and training portions of the RL loop while allowing for some custom configuration. An outline of the training loop is shown below:
@@ -44,10 +50,6 @@ ART's functionality is divided into a **client** and a **server**. The OpenAI-co
    4. Inference is unblocked and the loop resumes at step 1.
 
 This training loop runs until a specified number of inference and training iterations have completed.
-
-## 🤖 ART•E Agent
-
-Curious about how to use ART for a real-world task? Check out the [ART•E Agent](https://openpipe.ai/blog/art-e-mail-agent) blog post, where we detail how we trained Qwen 2.5 14B to beat o3 at email retrieval!
 
 ## 🧩 Supported Models
 
