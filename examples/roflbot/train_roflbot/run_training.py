@@ -21,6 +21,7 @@ models = {
             max_turns=1,
             max_tokens=8192,
             thinking_char_budget=5000,
+            log_to_openpipe=True,
             training_config=TrainingConfig(
                 trajectories_per_group=6,
                 groups_per_step=8,
@@ -35,11 +36,12 @@ models = {
     "004": art.TrainableModel(
         name="roflbot-004",
         project="roflbot",
-        base_model="Qwen/Qwen3-32B",
+        base_model="Qwen/Qwen2.5-32B-Instruct",
         config=PolicyConfig(
             max_turns=1,
             max_tokens=8192,
             thinking_char_budget=5000,
+            log_to_openpipe=True,
             training_config=TrainingConfig(
                 trajectories_per_group=6,
                 groups_per_step=8,
@@ -101,6 +103,7 @@ def launch_model(model_key: str):
     setup_script = textwrap.dedent(
         """
             echo 'Setting up environment...'
+            apt install -y nvtop
             curl -LsSf https://astral.sh/uv/install.sh | sh
             source $HOME/.local/bin/env
 

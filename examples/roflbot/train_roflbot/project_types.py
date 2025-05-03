@@ -16,5 +16,6 @@ class PolicyConfig(BaseModel):
     max_turns: int = 10
     max_tokens: int = 2048
     thinking_char_budget: int = 100
+    log_to_openpipe: bool = False
 
     training_config: TrainingConfig | None = None

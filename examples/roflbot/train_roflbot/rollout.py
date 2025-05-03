@@ -17,8 +17,16 @@ from dataset import RedditJoke
 import re
 from score_joke import score_joke
 import math
+import os
+from openpipe import AsyncOpenPipe
 
 litellm.cache = Cache(type=LiteLLMCacheType.DISK)
+
+# Initialize OpenPipe client (ensure OPENPIPE_API_KEY is in your .env)
+if os.getenv("OPENPIPE_API_KEY"):
+    op_client = AsyncOpenPipe()
+else:
+    op_client = None
 
 
 @dataclass
@@ -100,7 +108,6 @@ async def determine_if_completion_matches_prefix(joke: str, prefix: str) -> bool
         temperature=0,
         caching=True,
     )
-    print(response.choices[0])
 
     return response.choices[0].message.content.strip().lower().startswith("t")  # type: ignore
 
@@ -133,7 +140,7 @@ async def rollout(
         You are a joke generator, and your goal is to generate hilarious jokes. As a starting point, you will be given a joke prefix. Your job is to generate a continuation of the joke, maximizing humor.
                                     
         You should take some time to think about the best way to complete the joke. You can think for up to {model.config.thinking_char_budget} characters. If you take longer than that to think, your response will be penalized. Do not repeat the joke prefix in your response, only return the continuation.
-                                    
+
         You should respond in the following format:
         <think>some thoughts</think>
         <joke_continuation>the joke continuation</joke_continuation>
@@ -175,10 +182,36 @@ async def rollout(
     trajectory.messages_and_choices.append(convert_litellm_choice_to_openai(choice))
 
     content = choice.message.content
+    rollout_end_time = (
+        datetime.now()
+    )  # Record end time here before potential early exit
 
     if content is None:
         rubric.no_content = True
-        return await finish_trajectory(trajectory, rubric, rollout_start_time)
+        finished_traj = await finish_trajectory(trajectory, rubric, rollout_start_time)
+        if model.config.log_to_openpipe and op_client is not None:
+            try:
+                await op_client.report(
+                    requested_at=rollout_start_time.timestamp() * 1000,
+                    received_at=rollout_end_time.timestamp() * 1000,
+                    req_payload={
+                        "model": model.name,
+                        "messages": finished_traj.messages()[
+                            :-1
+                        ],  # Exclude final assistant message
+                        "metadata": {
+                            "type": "roflbot_rollout_final",
+                            "reward": str(finished_traj.reward),
+                            **{k: str(v) for k, v in finished_traj.metrics.items()},
+                            **{k: str(v) for k, v in finished_traj.metadata.items()},
+                        },
+                    },
+                    resp_payload=llm_response,
+                    status_code=200,
+                )
+            except Exception as e:
+                print(f"Error reporting to OpenPipe: {e}")  # Add error handling
+        return finished_traj
     else:
         rubric.no_content = False
 
@@ -195,7 +228,30 @@ async def rollout(
 
     if joke_continuation is None:
         rubric.successfully_parsed_joke = False
-        return await finish_trajectory(trajectory, rubric, rollout_start_time)
+        finished_traj = await finish_trajectory(trajectory, rubric, rollout_start_time)
+        if model.config.log_to_openpipe and op_client is not None:
+            try:
+                await op_client.report(
+                    requested_at=rollout_start_time.timestamp() * 1000,
+                    received_at=rollout_end_time.timestamp() * 1000,
+                    req_payload={
+                        "model": model.name,
+                        "messages": finished_traj.messages()[
+                            :-1
+                        ],  # Exclude final assistant message
+                        "metadata": {
+                            "type": "roflbot_rollout_final",
+                            "reward": str(finished_traj.reward),
+                            **{k: str(v) for k, v in finished_traj.metrics.items()},
+                            **{k: str(v) for k, v in finished_traj.metadata.items()},
+                        },
+                    },
+                    resp_payload=llm_response,
+                    status_code=200,
+                )
+            except Exception as e:
+                print(f"Error reporting to OpenPipe: {e}")  # Add error handling
+        return finished_traj
     else:
         rubric.successfully_parsed_joke = True
         rubric.joke_length = len(joke_continuation.group(1).strip())
@@ -214,7 +270,36 @@ async def rollout(
 
     trajectory.reward = calculate_reward(model.config, rubric, trajectory)
 
-    return await finish_trajectory(trajectory, rubric, rollout_start_time)
+    finished_traj = await finish_trajectory(trajectory, rubric, rollout_start_time)
+
+    # Compute duration in seconds and add to metrics
+    duration_seconds = (rollout_end_time - rollout_start_time).total_seconds()
+    finished_traj.metrics["duration"] = duration_seconds
+
+    if model.config.log_to_openpipe and op_client is not None:
+        try:
+            await op_client.report(
+                requested_at=rollout_start_time.timestamp() * 1000,
+                received_at=rollout_end_time.timestamp() * 1000,
+                req_payload={
+                    "model": model.name,
+                    "messages": finished_traj.messages()[
+                        :-1
+                    ],  # Exclude final assistant message
+                    "metadata": {
+                        "type": "roflbot_rollout_final",
+                        "reward": str(finished_traj.reward),
+                        **{k: str(v) for k, v in finished_traj.metrics.items()},
+                        **{k: str(v) for k, v in finished_traj.metadata.items()},
+                    },
+                },
+                resp_payload=llm_response,
+                status_code=200,
+            )
+        except Exception as e:
+            print(f"Error reporting to OpenPipe: {e}")  # Add error handling
+
+    return finished_traj
 
 
 if __name__ == "__main__":
@@ -232,7 +317,7 @@ if __name__ == "__main__":
                 name="gpt-4o",
                 project="email_agent",
                 inference_model_name="gemini/gemini-2.5-pro-preview-03-25",
-                config=PolicyConfig(),
+                config=PolicyConfig(log_to_openpipe=True),
             ),
             test_joke,
         )
