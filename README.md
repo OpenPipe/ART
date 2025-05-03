@@ -6,7 +6,7 @@
 
 <a href="https://colab.research.google.com/github/openpipe/art/blob/main/examples/2048/2048.ipynb"><img src="https://github.com/openpipe/art/raw/main/assets/Train_pill.png" height="48"></a>
 <a href="https://discord.gg/zbBHRUpwf4"><img src="https://github.com/openpipe/art/raw/main/assets/Discord_pill.png" height="48"></a>
-<a href="https://openpipe.ai/blog/art-e-mail-agent"><img src="https://github.com/openpipe/art/raw/link-art-3/assets/ART_E_pill.png" height="48"></a>
+<a href="https://openpipe.ai/blog/art-e-mail-agent"><img src="https://github.com/openpipe/art/raw/main/assets/ART_E_pill.png" height="48"></a>
 
 ### Train GRPO-powered RL agents with minimal code changes and maximal performance!
 
