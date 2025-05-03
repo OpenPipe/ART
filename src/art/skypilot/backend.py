@@ -21,6 +21,7 @@ if TYPE_CHECKING:
 
 class SkyPilotBackend(Backend):
     _cluster_name: str
+    _envs: dict[str, str]
 
     @classmethod
     async def initialize_cluster(
@@ -34,6 +35,12 @@ class SkyPilotBackend(Backend):
     ) -> "SkyPilotBackend":
         self = cls.__new__(cls)
         self._cluster_name = cluster_name
+        self._envs = {}
+
+        if env_path is not None:
+            self._envs = dotenv_values(env_path)
+            print(f"Loading envs from {env_path}")
+            print(f"{len(self._envs)} environment variables found")
 
         if gpu is None and resources is None:
             raise ValueError("Either gpu or resources must be provided")
@@ -63,7 +70,7 @@ class SkyPilotBackend(Backend):
             len(cluster_status) == 0
             or cluster_status[0]["status"] != sky.ClusterStatus.UP
         ):
-            await self._launch_cluster(resources, art_version, env_path)
+            await self._launch_cluster(resources, art_version)
         else:
             print(f"Cluster {self._cluster_name} exists, using it...")
 
@@ -79,6 +86,7 @@ class SkyPilotBackend(Backend):
                 ].launched_resources
             )
             art_server_task.set_resources(cast(sky.Resources, resources))
+            art_server_task.update_envs(self._envs)
 
             # run art server task
             await to_thread_typed(
@@ -104,7 +112,6 @@ class SkyPilotBackend(Backend):
         self,
         resources: sky.Resources,
         art_version: str | None = None,
-        env_path: str | None = None,
     ) -> None:
         print("Launching cluster...")
 
@@ -112,8 +119,7 @@ class SkyPilotBackend(Backend):
             name=self._cluster_name,
         )
         task.set_resources(resources)
-
-        # TODO: TEST VERSIONED INSTALLATION ONCE WE'VE PUBLISHED A NEW VERSION OF ART WITH THE 'art' CLI SCRIPT
+        task.update_envs(self._envs)
 
         # default to installing latest version of art
         art_installation_command = "uv pip install openpipe-art"
@@ -151,15 +157,6 @@ class SkyPilotBackend(Backend):
 
     {art_installation_command}
     """
-
-        if env_path is not None:
-            envs = dotenv_values(env_path)
-            print(f"Loading envs from {env_path}")
-            print(f"{len(envs)} environment variables found")
-            task.update_envs(envs)
-            for key, value in envs.items():
-                setup_script += f"\nexport {key}={value}"
-
         task.setup = setup_script
 
         try:
