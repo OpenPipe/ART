@@ -65,4 +65,7 @@ def run(host: str = "0.0.0.0", port: int = 7999) -> None:
 
         return StreamingResponse(stream())
 
+    app.post("/_experimental_pull_from_s3")(backend._experimental_pull_from_s3)
+    app.post("/_experimental_push_to_s3")(backend._experimental_push_to_s3)
+
     uvicorn.run(app, host=host, port=port)
