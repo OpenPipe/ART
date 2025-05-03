@@ -10,7 +10,6 @@ dependencies = [
     "liger-kernel>=0.5.8",
     "litellm>=1.67.5",
     "matplotlib>=3.10.1",
-    "numpy>=2.2.5",
     "orjson>=3.10.18",
     "panza>=0.1.0",
     "peft>=0.15.2",
@@ -21,7 +20,6 @@ dependencies = [
     "s3fs>=2025.3.0",
     "skypilot[lambda,runpod]>=0.9",
     "omegaconf>=2.4.0.dev3",
-    "torch>=2.7.0",
     "tqdm>=4.67.1",
     "transformers>=4.51.3",
     "wandb>=0.19.10",
@@ -30,14 +28,20 @@ dependencies = [
     "hf-transfer>=0.1.9",
     "modal>=0.74.40",
     "fastapi>=0.115.12",
+    "pytest>=8.3.5",
+    "tenacity>=9.1.2",
+    "pytest-asyncio>=0.26.0",
+    "openpipe>=4.50.0",
+    "openpipe-art",
 ]
 
 [tool.uv]
 override-dependencies = [
     "bitsandbytes; sys_platform == 'linux'",
     "xformers; sys_platform == 'linux'",
-    "triton; sys_platform == 'linux'",
+    "triton==3.1.0; sys_platform == 'linux'",
 ]
 
 [tool.uv.sources]
 peft = { git = "https://github.com/huggingface/peft.git" }
+openpipe-art = { path = "../../", editable = true }
