@@ -30,10 +30,7 @@ ART is an open-source reinforcement training library for improving LLM performan
 
 Curious about how to use ART for a real-world task? Check out the [ART•E Agent](https://openpipe.ai/blog/art-e-mail-agent) blog post, where we detail how we trained Qwen 2.5 14B to beat o3 at email retrieval!
 
-<div style="display: flex; justify-content: center;">
-    <img src="https://github.com/openpipe/art/raw/art-e-graph/assets/ART_E_Correctness_graph.svg" height="220">
-    <img src="https://github.com/openpipe/art/raw/art-e-graph/assets/ART_E_Latency_Cost_graphs.svg" height="220">
-</div>
+<img src="https://github.com/openpipe/art/raw/art-e-graph/assets/ART_E_graphs.png" height="220">
 
 ## 🔁 Training Loop Overview
 
