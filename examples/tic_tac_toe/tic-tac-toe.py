@@ -168,7 +168,7 @@ async def main():
         train_groups = await art.gather_trajectory_groups(
             (
                 art.TrajectoryGroup(
-                    rollout(model, TicTacToeScenario(iteration=i)) for _ in range(48)
+                    rollout(model, TicTacToeScenario(step=i)) for _ in range(48)
                 )
                 for _ in range(1)
             ),
