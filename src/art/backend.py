@@ -3,6 +3,8 @@ import json
 from tqdm import auto as tqdm
 from typing import AsyncIterator, TYPE_CHECKING
 
+from art.utils import log_http_errors
+
 from . import dev
 from .trajectories import TrajectoryGroup
 from .types import TrainConfig
@@ -117,6 +119,7 @@ class Backend:
     # Experimental support for S3
     # ------------------------------------------------------------------
 
+    @log_http_errors
     async def _experimental_pull_from_s3(
         self,
         model: "Model",
@@ -139,6 +142,7 @@ class Backend:
         )
         response.raise_for_status()
 
+    @log_http_errors
     async def _experimental_push_to_s3(
         self,
         model: "Model",
