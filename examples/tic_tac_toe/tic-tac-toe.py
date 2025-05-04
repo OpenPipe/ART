@@ -31,7 +31,7 @@ random.seed(42)
 
 
 class TicTacToeScenario(BaseModel):
-    iteration: int
+    step: int
 
 
 @art.retry(exceptions=(openai.LengthFinishReasonError,))
@@ -89,7 +89,7 @@ async def rollout(model: art.Model, scenario: TicTacToeScenario) -> art.Trajecto
                     "messages": messages,
                     "metadata": {
                         "notebook-id": "tic-tac-toe",
-                        "iteration": str(scenario.iteration),
+                        "step": str(scenario.step),
                         "move_number": str(move_number),
                     },
                 },
@@ -153,7 +153,7 @@ DESTROY_AFTER_RUN = False
 async def main():
     # run from the root of the repo
     backend = await SkyPilotBackend.initialize_cluster(
-        cluster_name="art6", art_version=".", env_path=".env", gpu="H100"
+        cluster_name="art7", art_version=".", env_path=".env", gpu="H100"
     )
 
     model = art.TrainableModel(
@@ -164,7 +164,7 @@ async def main():
     )
     await model.register(backend)
 
-    for i in range(await model.get_step(), 3):
+    for i in range(await model.get_step(), 4):
         train_groups = await art.gather_trajectory_groups(
             (
                 art.TrajectoryGroup(
