@@ -37,7 +37,6 @@ from .tokenize import tokenize_trajectory_groups
 from .checkpoints import (
     delete_checkpoints,
     get_step,
-    get_last_checkpoint_dir,
 )
 from art.utils.s3 import pull_model_from_s3, push_model_to_s3
 
@@ -344,8 +343,7 @@ class LocalBackend(Backend):
 
     async def _experimental_pull_from_s3(
         self,
-        model: Model,
-        *,
+        model: TrainableModel,
         s3_bucket: str | None = None,
         prefix: str | None = None,
         verbose: bool = False,
@@ -364,8 +362,7 @@ class LocalBackend(Backend):
 
     async def _experimental_push_to_s3(
         self,
-        model: Model,
-        *,
+        model: TrainableModel,
         s3_bucket: str | None = None,
         prefix: str | None = None,
         verbose: bool = False,

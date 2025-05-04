@@ -5,6 +5,7 @@ import asyncio
 from asyncio.subprocess import DEVNULL
 from typing import Optional, Sequence
 
+from art.errors import ForbiddenBucketCreationError
 from art.utils.output_dirs import get_output_dir_from_model_properties
 
 from ..utils import limit_concurrency
@@ -108,8 +109,8 @@ async def ensure_bucket_exists(
     return_code = await result.wait()
 
     if return_code != 0:
-        raise RuntimeError(
-            f"Failed to create bucket {s3_bucket}. It may already exist and belong to another user, or your credentials may be insufficient to create an S3 bucket."
+        raise ForbiddenBucketCreationError(
+            message=f"Failed to create bucket {s3_bucket}. It may already exist and belong to another user, or your credentials may be insufficient to create an S3 bucket."
         )
 
 

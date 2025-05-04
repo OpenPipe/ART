@@ -1,4 +1,4 @@
-from fastapi import FastAPI
+from fastapi import FastAPI, Body
 from fastapi.responses import StreamingResponse
 import json
 import pydantic
@@ -65,7 +65,38 @@ def run(host: str = "0.0.0.0", port: int = 7999) -> None:
 
         return StreamingResponse(stream())
 
-    app.post("/_experimental_pull_from_s3")(backend._experimental_pull_from_s3)
-    app.post("/_experimental_push_to_s3")(backend._experimental_push_to_s3)
+    # Wrap in function with Body(...) to ensure FastAPI correctly interprets
+    # all parameters as body parameters
+    @app.post("/_experimental_pull_from_s3")
+    async def _experimental_pull_from_s3(
+        model: TrainableModel = Body(...),
+        s3_bucket: str | None = Body(None),
+        prefix: str | None = Body(None),
+        verbose: bool = Body(False),
+        delete: bool = Body(False),
+    ):
+        await backend._experimental_pull_from_s3(
+            model=model,
+            s3_bucket=s3_bucket,
+            prefix=prefix,
+            verbose=verbose,
+            delete=delete,
+        )
+
+    @app.post("/_experimental_push_to_s3")
+    async def _experimental_push_to_s3(
+        model: TrainableModel = Body(...),
+        s3_bucket: str | None = Body(None),
+        prefix: str | None = Body(None),
+        verbose: bool = Body(False),
+        delete: bool = Body(False),
+    ):
+        await backend._experimental_push_to_s3(
+            model=model,
+            s3_bucket=s3_bucket,
+            prefix=prefix,
+            verbose=verbose,
+            delete=delete,
+        )
 
     uvicorn.run(app, host=host, port=port)
