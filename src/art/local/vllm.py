@@ -268,7 +268,10 @@ def patch_get_lora_tokenizer_async() -> None:
     async def _return_nothing(*_, **__) -> None:
         return None
 
-    vllm.transformers_utils.tokenizer_group.tokenizer_group.get_lora_tokenizer_async = (
+    vllm.transformers_utils.tokenizer_group.BaseTokenizerGroup.get_lora_tokenizer_async = (
+        _return_nothing  # type: ignore
+    )
+    vllm.transformers_utils.tokenizer_group.tokenizer_group.TokenizerGroup.get_lora_tokenizer_async = (
         _return_nothing  # type: ignore
     )
 
