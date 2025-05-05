@@ -157,7 +157,7 @@ async def main():
     )
 
     model = art.TrainableModel(
-        name="005", project="tic-tac-toe", base_model="Qwen/Qwen2.5-3B-Instruct"
+        name="006", project="tic-tac-toe", base_model="Qwen/Qwen2.5-3B-Instruct"
     )
     await backend._experimental_pull_from_s3(model)
     await model.register(backend)
@@ -172,9 +172,9 @@ async def main():
             ),
             pbar_desc="gather",
         )
-        await backend._experimental_push_to_s3(model)
         await model.delete_checkpoints()
         await model.train(train_groups, config=art.TrainConfig(learning_rate=1e-4))
+        await backend._experimental_push_to_s3(model)
 
     if DESTROY_AFTER_RUN:
         await backend.down()

@@ -139,6 +139,7 @@ class Backend:
                 "verbose": verbose,
                 "delete": delete,
             },
+            timeout=600,
         )
         response.raise_for_status()
 
@@ -162,5 +163,6 @@ class Backend:
                 "verbose": verbose,
                 "delete": delete,
             },
+            timeout=600,
         )
         response.raise_for_status()
