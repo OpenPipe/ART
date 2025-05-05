@@ -1,6 +1,6 @@
 [project]
 name = "openpipe-art"
-version = "0.3.4"
+version = "0.3.5"
 description = "The OpenPipe Agent Reinforcement Training (ART) library"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -23,6 +23,7 @@ dependencies = [
     "polars>=1.26.0",
     "awscli>=1.38.1",
     "hf-xet>=1.1.0",
+    "panza",
 ]
 
 [project.scripts]
@@ -47,8 +48,6 @@ dev-dependencies = [
     "ipykernel>=6.29.5",
     "ipywidgets>=8.1.5",
     "openpipe>=4.49.0",
-    "panza",
-    "polars>=1.26.0",
     "skypilot[aws,cudo,do,fluidstack,gcp,lambda,paperspace,runpod]>=0.8.0",
     "hatch>=1.14.1",
     "semver>=3.0.4",
