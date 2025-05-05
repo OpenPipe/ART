@@ -153,15 +153,13 @@ DESTROY_AFTER_RUN = False
 async def main():
     # run from the root of the repo
     backend = await SkyPilotBackend.initialize_cluster(
-        cluster_name="art7", art_version=".", env_path=".env", gpu="H100"
+        cluster_name="art6", art_version=".", env_path=".env", gpu="H100"
     )
 
     model = art.TrainableModel(
         name="005", project="tic-tac-toe", base_model="Qwen/Qwen2.5-3B-Instruct"
     )
-    await backend._experimental_pull_from_s3(
-        model, prefix="tic-tac-toe/005", verbose=True
-    )
+    await backend._experimental_pull_from_s3(model)
     await model.register(backend)
 
     for i in range(await model.get_step(), 4):
