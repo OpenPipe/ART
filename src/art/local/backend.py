@@ -335,6 +335,7 @@ class LocalBackend(Backend):
                 resume="allow",
             )
             self._wandb_runs[model.name] = run
+            print(f"Wandb run initialized! You can view it at {run.url}")
         return self._wandb_runs[model.name]
 
     # ------------------------------------------------------------------
@@ -343,7 +344,7 @@ class LocalBackend(Backend):
 
     async def _experimental_pull_from_s3(
         self,
-        model: TrainableModel,
+        model: Model,
         s3_bucket: str | None = None,
         prefix: str | None = None,
         verbose: bool = False,
@@ -362,7 +363,7 @@ class LocalBackend(Backend):
 
     async def _experimental_push_to_s3(
         self,
-        model: TrainableModel,
+        model: Model,
         s3_bucket: str | None = None,
         prefix: str | None = None,
         verbose: bool = False,

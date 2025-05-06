@@ -9,7 +9,7 @@ import uvicorn
 
 from . import dev
 from .local import LocalBackend
-from .model import TrainableModel
+from .model import Model, TrainableModel
 from .trajectories import TrajectoryGroup
 from .types import TrainConfig
 
@@ -69,7 +69,7 @@ def run(host: str = "0.0.0.0", port: int = 7999) -> None:
     # all parameters as body parameters
     @app.post("/_experimental_pull_from_s3")
     async def _experimental_pull_from_s3(
-        model: TrainableModel = Body(...),
+        model: Model = Body(...),
         s3_bucket: str | None = Body(None),
         prefix: str | None = Body(None),
         verbose: bool = Body(False),
@@ -85,7 +85,7 @@ def run(host: str = "0.0.0.0", port: int = 7999) -> None:
 
     @app.post("/_experimental_push_to_s3")
     async def _experimental_push_to_s3(
-        model: TrainableModel = Body(...),
+        model: Model = Body(...),
         s3_bucket: str | None = Body(None),
         prefix: str | None = Body(None),
         verbose: bool = Body(False),
