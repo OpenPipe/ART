@@ -153,7 +153,7 @@ DESTROY_AFTER_RUN = False
 async def main():
     # run from the root of the repo
     backend = await SkyPilotBackend.initialize_cluster(
-        cluster_name="art6", art_version=".", env_path=".env", gpu="H100"
+        cluster_name="art", art_version=".", env_path=".env", gpu="H100"
     )
 
     model = art.TrainableModel(
