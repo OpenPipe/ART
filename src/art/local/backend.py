@@ -1,7 +1,7 @@
 import json
 import math
 
-import aiohttp
+from art.utils.deploy_model import deploy_together
 from art.utils.old_benchmarking.calculate_step_metrics import calculate_step_std_dev
 from art.utils.output_dirs import (
     get_default_art_path,
@@ -418,34 +418,9 @@ class LocalBackend(Backend):
             verbose=verbose,
         )
 
-        payload = {
-            "model_name": f"{model.project}-{model.name}-{step}",
-            "model_source": presigned_url,
-            "model_type": "adapter",
-            "base_model": model.base_model,
-            "description": f"Deployed from ART. Project: {model.project}. Model: {model.name}. Step: {step}",
-        }
-        async with aiohttp.ClientSession() as session:
-            if "TOGETHER_API_KEY" not in os.environ:
-                raise ValueError(
-                    "TOGETHER_API_KEY is not set, cannot deploy LoRA to Together"
-                )
-            session.headers.update(
-                {
-                    "Authorization": f"Bearer {os.environ['TOGETHER_API_KEY']}",
-                    "Content-Type": "application/json",
-                }
-            )
-
-            async with session.post(
-                url="https://api.together.xyz/v0/models", json=payload
-            ) as response:
-                if response.status != 200:
-                    print("Error uploading to Together:", await response.text())
-                response.raise_for_status()
-                result = await response.json()
-                if verbose:
-                    print(f"Successfully uploaded to Together: {result}")
-                return result
-
-        return presigned_url
+        return await deploy_together(
+            model=model,
+            presigned_url=presigned_url,
+            step=step,
+            verbose=verbose,
+        )
