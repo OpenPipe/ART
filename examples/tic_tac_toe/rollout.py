@@ -4,7 +4,7 @@ import time
 import math
 import os
 from dotenv import load_dotenv
-
+from pydantic import BaseModel
 from openpipe.client import OpenPipe
 
 from utils import (
@@ -24,10 +24,12 @@ print("OpenPipe client initialized")
 op_client = OpenPipe(api_key=os.getenv("OPENPIPE_API_KEY"))
 
 
+class TicTacToeScenario(BaseModel):
+    step: int
+
+
 @art.retry(exceptions=(openai.LengthFinishReasonError,))
-async def rollout(
-    model: art.Model, iteration: int, is_validation: bool
-) -> art.Trajectory:
+async def rollout(model: art.Model, scenario: TicTacToeScenario) -> art.Trajectory:
     game = generate_game()
 
     trajectory = art.Trajectory(
@@ -73,26 +75,6 @@ async def rollout(
             failing_trajectory = trajectory
             raise e
 
-        try:
-            op_client.report(
-                requested_at=requested_at,
-                received_at=int(time.time() * 1000),
-                req_payload={
-                    "model": model.name,
-                    "messages": messages,
-                    "metadata": {
-                        "notebook-id": "tic-tac-toe",
-                        "iteration": str(iteration),
-                        "validation": str(is_validation),
-                        "move_number": str(move_number),
-                    },
-                },
-                resp_payload=chat_completion,
-                status_code=200,
-            )
-        except Exception as e:
-            print(f"Error reporting to OpenPipe: {e}")
-
         choice = chat_completion.choices[0]
         content = choice.message.content
         assert isinstance(content, str)
@@ -125,22 +107,29 @@ async def rollout(
 
     trajectory.metrics["num_moves"] = move_number
 
-    try:
-        op_client.update_log_metadata(
-            filters=[
-                {
-                    "field": "completionId",
-                    "equals": last_completion.id,
-                }
-            ],
-            metadata={
-                "reward": str(trajectory.reward),
-                "reward_assigned": "true",
-            },
-        )
-    except Exception as e:
-        print(f"Error updating log metadata: {e}")
-
-        print(trajectory.reward)
+    if op_client.api_key:
+        try:
+            reported_win = (
+                trajectory.metrics["win"] if "win" in trajectory.metrics else -1
+            )
+            op_client.report(
+                requested_at=requested_at,
+                received_at=int(time.time() * 1000),
+                req_payload={
+                    "model": model.name,
+                    "messages": messages,
+                    "metadata": {
+                        "notebook-id": "tic-tac-toe",
+                        "step": str(scenario.step),
+                        "num_moves": str(move_number),
+                        "win": str(reported_win),
+                        "reward": str(trajectory.reward),
+                    },
+                },
+                resp_payload=chat_completion,
+                status_code=200,
+            )
+        except Exception as e:
+            print(f"Error reporting to OpenPipe: {e}")
 
     return trajectory
