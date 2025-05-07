@@ -1,6 +1,7 @@
-from datetime import datetime
 import json
 import math
+
+import aiohttp
 from art.utils.old_benchmarking.calculate_step_metrics import calculate_step_std_dev
 from art.utils.output_dirs import (
     get_default_art_path,
@@ -38,7 +39,11 @@ from .checkpoints import (
     delete_checkpoints,
     get_step,
 )
-from art.utils.s3 import get_step_presigned_url, pull_model_from_s3, push_model_to_s3
+from art.utils.s3 import (
+    archive_and_presign_step_url,
+    pull_model_from_s3,
+    push_model_to_s3,
+)
 
 
 class LocalBackend(Backend):
@@ -382,32 +387,29 @@ class LocalBackend(Backend):
 
     async def _experimental_deploy(
         self,
-        model: Model,
+        model: TrainableModel,
         step: int | None = None,
         s3_bucket: str | None = None,
         prefix: str | None = None,
         verbose: bool = False,
+        pull_s3: bool = True,
     ) -> str:
         """
         Deploy the model's latest checkpoint to a hosted inference endpoint.
         """
-        await self._experimental_push_to_s3(
-            model,
-            s3_bucket=s3_bucket,
-            prefix=prefix,
-            verbose=verbose,
-        )
-        if step is None:
-            # get the latest step from S3
+        if pull_s3:
+            # pull the latest step from S3
             await self._experimental_pull_from_s3(
                 model,
                 s3_bucket=s3_bucket,
                 prefix=prefix,
                 verbose=verbose,
             )
+
+        if step is None:
             step = self.__get_step(model)
 
-        presigned_url = await get_step_presigned_url(
+        presigned_url = await archive_and_presign_step_url(
             model_name=model.name,
             project=model.project,
             step=step,
@@ -415,5 +417,35 @@ class LocalBackend(Backend):
             prefix=prefix,
             verbose=verbose,
         )
+
+        payload = {
+            "model_name": f"{model.project}-{model.name}-{step}",
+            "model_source": presigned_url,
+            "model_type": "adapter",
+            "base_model": model.base_model,
+            "description": f"Deployed from ART. Project: {model.project}. Model: {model.name}. Step: {step}",
+        }
+        async with aiohttp.ClientSession() as session:
+            if "TOGETHER_API_KEY" not in os.environ:
+                raise ValueError(
+                    "TOGETHER_API_KEY is not set, cannot deploy LoRA to Together"
+                )
+            session.headers.update(
+                {
+                    "Authorization": f"Bearer {os.environ['TOGETHER_API_KEY']}",
+                    "Content-Type": "application/json",
+                }
+            )
+
+            async with session.post(
+                url="https://api.together.xyz/v0/models", json=payload
+            ) as response:
+                if response.status != 200:
+                    print("Error uploading to Together:", await response.text())
+                response.raise_for_status()
+                result = await response.json()
+                if verbose:
+                    print(f"Successfully uploaded to Together: {result}")
+                return result
 
         return presigned_url

@@ -229,6 +229,7 @@ class TrainableModel(Model):
         s3_bucket: str | None = None,
         prefix: str | None = None,
         verbose: bool = False,
+        pull_s3: bool = True,
     ) -> str:
         return await self.backend()._experimental_deploy(
             model=self,
@@ -236,4 +237,5 @@ class TrainableModel(Model):
             s3_bucket=s3_bucket,
             prefix=prefix,
             verbose=verbose,
+            pull_s3=pull_s3,
         )

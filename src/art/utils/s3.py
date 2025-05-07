@@ -3,10 +3,15 @@ from __future__ import annotations
 import os
 import asyncio
 from asyncio.subprocess import DEVNULL
+import tempfile
 from typing import Optional, Sequence
+import zipfile
 
 from art.errors import ForbiddenBucketCreationError
-from art.utils.output_dirs import get_output_dir_from_model_properties
+from art.utils.output_dirs import (
+    get_output_dir_from_model_properties,
+    get_step_checkpoint_dir,
+)
 
 from ..utils import limit_concurrency
 
@@ -21,22 +26,34 @@ def build_s3_path(
     *,
     model_name: str,
     project: str,
-    step: int | None = None,
     s3_bucket: str | None = None,
     prefix: str | None = None,
 ) -> str:
-    """Return the fully-qualified S3 URI for this model directory.
-
-    If *step* is provided, the path will be to a specific step in the model directory.
-    """
+    """Return the fully-qualified S3 URI for this model directory."""
     if s3_bucket is None:
         s3_bucket = os.environ["BACKUP_BUCKET"]
 
     prefix_part = f"{prefix.strip('/')}/" if prefix else ""
     path = f"s3://{s3_bucket}/{prefix_part}{project}/models/{model_name}"
-    if step is not None:
-        path += f"/{step}"
     return path
+
+
+def build_s3_zipped_step_path(
+    *,
+    model_name: str,
+    project: str,
+    step: int,
+    s3_bucket: str | None = None,
+    prefix: str | None = None,
+) -> str:
+    """Return the fully-qualified S3 URI for a zipped step in a model directory."""
+    base_path = build_s3_path(
+        model_name=model_name,
+        project=project,
+        s3_bucket=s3_bucket,
+        prefix=prefix,
+    )
+    return f"{base_path}/zipped-steps/{step:04d}.zip"
 
 
 @limit_concurrency(1)
@@ -71,7 +88,13 @@ async def s3_sync(
     if profile:
         cmd += ["--profile", profile]
 
-    cmd += ["s3", "sync"]
+    cmd += ["s3"]
+    # us cp for files, sync for directories
+    if os.path.isfile(source):
+        cmd += ["cp"]
+    else:
+        cmd += ["sync"]
+
     if delete:
         cmd.append("--delete")
     cmd += [source, destination]
@@ -203,22 +226,48 @@ async def push_model_to_s3(
     await s3_sync(local_model_dir, s3_path, verbose=verbose, delete=delete)
 
 
-async def get_step_presigned_url(
+async def archive_and_presign_step_url(
     model_name: str,
     project: str,
     step: int,
     s3_bucket: str | None = None,
     prefix: str | None = None,
     verbose: bool = False,
+    delete: bool = False,
+    art_path: str | None = None,
 ) -> str:
     """Get a presigned URL for a step in a model."""
-    s3_step_path = build_s3_path(
+    model_output_dir = get_output_dir_from_model_properties(
+        project=project,
+        name=model_name,
+        art_path=art_path,
+    )
+    local_step_dir = get_step_checkpoint_dir(model_output_dir, step)
+    if not os.path.exists(local_step_dir):
+        raise ValueError(f"Local step directory does not exist: {local_step_dir}")
+
+    s3_step_path = build_s3_zipped_step_path(
         model_name=model_name,
         project=project,
         step=step,
         s3_bucket=s3_bucket,
         prefix=prefix,
     )
+
+    # Create temporary directory for the zip file
+    with tempfile.TemporaryDirectory() as temp_dir:
+        # Create zip archive
+        archive_path = os.path.join(temp_dir, "model.zip")
+        with zipfile.ZipFile(archive_path, "w", zipfile.ZIP_DEFLATED) as zipf:
+            for root, _, files in os.walk(local_step_dir):
+                for file in files:
+                    file_path = os.path.join(root, file)
+                    # Add file to zip with relative path
+                    arcname = os.path.relpath(file_path, local_step_dir)
+                    zipf.write(file_path, arcname)
+
+        await ensure_bucket_exists(s3_bucket)
+        await s3_sync(archive_path, s3_step_path, verbose=verbose, delete=delete)
 
     # Remove the s3:// prefix to get the key
     s3_key = s3_step_path.removeprefix("s3://")

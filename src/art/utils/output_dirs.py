@@ -29,6 +29,10 @@ def get_output_dir_from_model_properties(
     return f"{art_path}/{project}/models/{name}"
 
 
+def get_step_checkpoint_dir(model_output_dir: str, step: int) -> str:
+    return f"{model_output_dir}/{step:04d}"
+
+
 def get_trajectories_dir(model_output_dir: str) -> str:
     return f"{model_output_dir}/trajectories"
 
