@@ -153,7 +153,7 @@ async def pull_model_from_s3(
     os.makedirs(local_model_dir, exist_ok=True)
 
     s3_path = build_s3_path(
-        model=model_name,
+        model_name=model_name,
         project=project,
         s3_bucket=s3_bucket,
         prefix=prefix,
@@ -195,7 +195,7 @@ async def push_model_to_s3(
             f"Local model directory {local_model_dir} does not exist."
         )
     s3_path = build_s3_path(
-        model=model_name,
+        model_name=model_name,
         project=project,
         s3_bucket=s3_bucket,
         prefix=prefix,

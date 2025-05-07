@@ -397,6 +397,15 @@ class LocalBackend(Backend):
             prefix=prefix,
             verbose=verbose,
         )
+        if step is None:
+            # get the latest step from S3
+            await self._experimental_pull_from_s3(
+                model,
+                s3_bucket=s3_bucket,
+                prefix=prefix,
+                verbose=verbose,
+            )
+            step = self.__get_step(model)
 
         presigned_url = await get_step_presigned_url(
             model_name=model.name,
