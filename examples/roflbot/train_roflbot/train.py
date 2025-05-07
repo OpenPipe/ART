@@ -28,6 +28,7 @@ async def run_training(model: art.TrainableModel):
         await backend._experimental_pull_from_s3(
             model,
             s3_bucket=backup_bucket,
+            prefix="roflbot",
             verbose=True,
         )
     await model.register(backend)
