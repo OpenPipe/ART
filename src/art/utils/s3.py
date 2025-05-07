@@ -19,17 +19,24 @@ class S3SyncError(RuntimeError):
 
 def build_s3_path(
     *,
-    model: str,
+    model_name: str,
     project: str,
+    step: int | None = None,
     s3_bucket: str | None = None,
     prefix: str | None = None,
 ) -> str:
-    """Return the fully-qualified S3 URI for this model directory."""
+    """Return the fully-qualified S3 URI for this model directory.
+
+    If *step* is provided, the path will be to a specific step in the model directory.
+    """
     if s3_bucket is None:
         s3_bucket = os.environ["BACKUP_BUCKET"]
 
     prefix_part = f"{prefix.strip('/')}/" if prefix else ""
-    return f"s3://{s3_bucket}/{prefix_part}{project}/models/{model}"
+    path = f"s3://{s3_bucket}/{prefix_part}{project}/models/{model_name}"
+    if step is not None:
+        path += f"/{step}"
+    return path
 
 
 @limit_concurrency(1)
@@ -194,3 +201,40 @@ async def push_model_to_s3(
         prefix=prefix,
     )
     await s3_sync(local_model_dir, s3_path, verbose=verbose, delete=delete)
+
+
+async def get_step_presigned_url(
+    model_name: str,
+    project: str,
+    step: int,
+    s3_bucket: str | None = None,
+    prefix: str | None = None,
+    verbose: bool = False,
+) -> str:
+    """Get a presigned URL for a step in a model."""
+    s3_step_path = build_s3_path(
+        model_name=model_name,
+        project=project,
+        step=step,
+        s3_bucket=s3_bucket,
+        prefix=prefix,
+    )
+
+    # Remove the s3:// prefix to get the key
+    s3_key = s3_step_path.removeprefix("s3://")
+
+    # Generate presigned URL with 1 hour expiration
+    cmd = ["aws", "s3", "presign", s3_key, "--expires-in", "3600"]
+
+    process = await asyncio.create_subprocess_exec(
+        *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
+    )
+    stdout, stderr = await process.communicate()
+
+    if process.returncode != 0:
+        raise RuntimeError(f"Failed to generate presigned URL: {stderr.decode()}")
+
+    presigned_url = stdout.decode().strip()
+    if verbose:
+        print("presigned_url", presigned_url)
+    return presigned_url

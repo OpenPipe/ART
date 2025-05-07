@@ -166,3 +166,26 @@ class Backend:
             timeout=600,
         )
         response.raise_for_status()
+
+    @log_http_errors
+    async def _experimental_deploy(
+        self,
+        model: "Model",
+        step: int | None = None,
+        s3_bucket: str | None = None,
+        prefix: str | None = None,
+        verbose: bool = False,
+    ) -> str:
+        response = await self._client.post(
+            "/_experimental_deploy",
+            json={
+                "model": model.model_dump(),
+                "step": step,
+                "s3_bucket": s3_bucket,
+                "prefix": prefix,
+                "verbose": verbose,
+            },
+            timeout=600,
+        )
+        response.raise_for_status()
+        return response.json()["inference_id"]

@@ -38,7 +38,7 @@ from .checkpoints import (
     delete_checkpoints,
     get_step,
 )
-from art.utils.s3 import pull_model_from_s3, push_model_to_s3
+from art.utils.s3 import get_step_presigned_url, pull_model_from_s3, push_model_to_s3
 
 
 class LocalBackend(Backend):
@@ -379,3 +379,32 @@ class LocalBackend(Backend):
             delete=delete,
             art_path=self._path,
         )
+
+    async def _experimental_deploy(
+        self,
+        model: Model,
+        step: int | None = None,
+        s3_bucket: str | None = None,
+        prefix: str | None = None,
+        verbose: bool = False,
+    ) -> str:
+        """
+        Deploy the model's latest checkpoint to a hosted inference endpoint.
+        """
+        await self._experimental_push_to_s3(
+            model,
+            s3_bucket=s3_bucket,
+            prefix=prefix,
+            verbose=verbose,
+        )
+
+        presigned_url = await get_step_presigned_url(
+            model_name=model.name,
+            project=model.project,
+            step=step,
+            s3_bucket=s3_bucket,
+            prefix=prefix,
+            verbose=verbose,
+        )
+
+        return presigned_url
