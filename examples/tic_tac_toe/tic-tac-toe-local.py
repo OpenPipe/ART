@@ -1,9 +1,14 @@
+import os
 import random
 import asyncio
 from dotenv import load_dotenv
 
 import art
-from rollout import rollout
+from art.utils.deploy_model import (
+    previously_deployed_model_id,
+    wait_for_together_job,
+)
+from rollout import rollout, TicTacToeScenario
 from art.local.backend import LocalBackend
 
 
@@ -19,18 +24,22 @@ async def main():
     backend = LocalBackend()
 
     model = art.TrainableModel(
-        name="agent-001",
-        project="tic-tac-toe-agent",
-        base_model="Qwen/Qwen2.5-3B-Instruct",
+        name="llama-8b-001",
+        project="tic-tac-toe",
+        base_model="meta-llama/Meta-Llama-3.1-8B-Instruct",
     )
+    print("pulling from s3")
     await backend._experimental_pull_from_s3(model)
+
+    print("registering")
     await model.register(backend)
 
-    for i in range(await model.get_step(), 101):
+    print("training")
+    for i in range(await model.get_step(), 41):
         train_groups = await art.gather_trajectory_groups(
             (
                 art.TrajectoryGroup(
-                    rollout(model, i, is_validation=False) for _ in range(200)
+                    rollout(model, TicTacToeScenario(step=i)) for _ in range(48)
                 )
                 for _ in range(1)
             ),
@@ -40,8 +49,32 @@ async def main():
         await model.train(train_groups, config=art.TrainConfig(learning_rate=1e-4))
         await backend._experimental_push_to_s3(model)
 
-    res = await backend._experimental_deploy(model=model, verbose=True)
-    print(res)
+    deployed_model_id = await previously_deployed_model_id(model)
+
+    if deployed_model_id:
+        print(f"skipping deployment because model {deployed_model_id} already exists")
+    else:
+        deployment_result = await backend._experimental_deploy(
+            model=model, verbose=True, pull_s3=False
+        )
+        job_id = deployment_result["data"]["job_id"]
+
+        completed_job_status = await wait_for_together_job(job_id, verbose=True)
+
+        deployed_model_id = completed_job_status["args"]["modelName"]
+
+    lora_model = art.Model(
+        name=deployed_model_id,
+        project="tic-tac-toe",
+        inference_api_key=os.environ["TOGETHER_API_KEY"],
+        inference_base_url="https://api.together.xyz/v1",
+        inference_model_name=deployed_model_id,
+    )
+
+    print("Starting a rollout using the deployed model!")
+    traj = await rollout(lora_model, TicTacToeScenario(step=0))
+
+    print(traj)
 
     if DESTROY_AFTER_RUN:
         await backend.down()

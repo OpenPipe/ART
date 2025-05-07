@@ -86,9 +86,9 @@ async def rollout(model: art.Model, scenario: TicTacToeScenario) -> art.Trajecto
             trajectory.reward = -1 + (math.log(move_number + 1) / math.log(100))
             break
 
+        move_number += 1
         if check_winner(game["board"]) is not None:
             break
-        move_number += 1
 
         opponent_move = get_opponent_move(game)
         game["board"][opponent_move[0]][opponent_move[1]] = game["opponent_symbol"]
