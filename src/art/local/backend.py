@@ -1,7 +1,13 @@
 import json
 import math
 
-from art.utils.deploy_model import deploy_together
+from art.utils.deploy_model import (
+    LoRADeploymentJobStatusBody,
+    LoRADeploymentProvider,
+    check_together_job_status,
+    deploy_together,
+    wait_for_together_job,
+)
 from art.utils.old_benchmarking.calculate_step_metrics import calculate_step_std_dev
 from art.utils.output_dirs import (
     get_default_art_path,
@@ -387,15 +393,20 @@ class LocalBackend(Backend):
 
     async def _experimental_deploy(
         self,
+        deploy_to: LoRADeploymentProvider,
         model: TrainableModel,
         step: int | None = None,
         s3_bucket: str | None = None,
         prefix: str | None = None,
         verbose: bool = False,
         pull_s3: bool = True,
-    ) -> str:
+        wait_for_completion: bool = True,
+    ) -> LoRADeploymentJobStatusBody:
         """
         Deploy the model's latest checkpoint to a hosted inference endpoint.
+
+        Together is currently the only supported provider. See link for supported base models:
+        https://docs.together.ai/docs/lora-inference#supported-base-models
         """
         if pull_s3:
             # pull the latest step from S3
@@ -418,9 +429,18 @@ class LocalBackend(Backend):
             verbose=verbose,
         )
 
-        return await deploy_together(
-            model=model,
-            presigned_url=presigned_url,
-            step=step,
-            verbose=verbose,
-        )
+        if deploy_to == LoRADeploymentProvider.TOGETHER:
+            deployment_result = await deploy_together(
+                model=model,
+                presigned_url=presigned_url,
+                step=step,
+                verbose=verbose,
+            )
+            job_id = deployment_result["data"]["job_id"]
+
+            if wait_for_completion:
+                return await wait_for_together_job(job_id, verbose=verbose)
+            else:
+                return await check_together_job_status(job_id, verbose=verbose)
+
+        raise ValueError(f"Unsupported deployment option: {deploy_to}")

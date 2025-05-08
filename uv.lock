@@ -3292,6 +3292,7 @@ dependencies = [
     { name = "peft" },
     { name = "polars" },
     { name = "seaborn" },
+    { name = "semver" },
     { name = "tblib" },
     { name = "torch" },
     { name = "torchao" },
@@ -3310,7 +3311,6 @@ dev = [
     { name = "ipykernel" },
     { name = "ipywidgets" },
     { name = "openpipe" },
-    { name = "semver" },
     { name = "skypilot", extra = ["aws", "cudo", "do", "gcp", "lambda", "runpod"] },
 ]
 
@@ -3326,6 +3326,7 @@ requires-dist = [
     { name = "peft", specifier = ">=0.14.0" },
     { name = "polars", specifier = ">=1.26.0" },
     { name = "seaborn", specifier = ">=0.13.2" },
+    { name = "semver", specifier = ">=3.0.4" },
     { name = "tblib", specifier = ">=3.0.0" },
     { name = "torch", specifier = ">=2.5.1" },
     { name = "torchao", specifier = ">=0.9.0" },
@@ -3344,7 +3345,6 @@ dev = [
     { name = "ipykernel", specifier = ">=6.29.5" },
     { name = "ipywidgets", specifier = ">=8.1.5" },
     { name = "openpipe", specifier = ">=4.49.0" },
-    { name = "semver", specifier = ">=3.0.4" },
     { name = "skypilot", extras = ["aws", "cudo", "do", "fluidstack", "gcp", "lambda", "paperspace", "runpod"], specifier = ">=0.8.0" },
 ]
 

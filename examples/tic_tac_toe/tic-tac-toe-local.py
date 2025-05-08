@@ -4,10 +4,7 @@ import asyncio
 from dotenv import load_dotenv
 
 import art
-from art.utils.deploy_model import (
-    previously_deployed_model_id,
-    wait_for_together_job,
-)
+from art.utils.deploy_model import previously_deployed_model_name
 from rollout import rollout, TicTacToeScenario
 from art.local.backend import LocalBackend
 
@@ -35,7 +32,7 @@ async def main():
     await model.register(backend)
 
     print("training")
-    for i in range(await model.get_step(), 42):
+    for i in range(await model.get_step(), 44):
         train_groups = await art.gather_trajectory_groups(
             (
                 art.TrajectoryGroup(
@@ -49,26 +46,26 @@ async def main():
         await model.train(train_groups, config=art.TrainConfig(learning_rate=1e-4))
         await backend._experimental_push_to_s3(model)
 
-    deployed_model_id = await previously_deployed_model_id(model, 42)
+    deployed_model_name = await previously_deployed_model_name(model, 44)
 
-    if deployed_model_id:
-        print(f"skipping deployment because model {deployed_model_id} already exists")
+    if deployed_model_name:
+        print(f"skipping deployment because model {deployed_model_name} already exists")
     else:
         deployment_result = await backend._experimental_deploy(
-            model=model, verbose=True, pull_s3=False
+            deploy_to="together",
+            model=model,
+            verbose=True,
+            pull_s3=False,
+            wait_for_completion=True,
         )
-        job_id = deployment_result["data"]["job_id"]
-
-        completed_job_status = await wait_for_together_job(job_id, verbose=True)
-
-        deployed_model_id = completed_job_status["args"]["modelName"]
+        deployed_model_name = deployment_result.model_name
 
     lora_model = art.Model(
-        name=deployed_model_id,
+        name=deployed_model_name,
         project="tic-tac-toe",
         inference_api_key=os.environ["TOGETHER_API_KEY"],
         inference_base_url="https://api.together.xyz/v1",
-        inference_model_name=deployed_model_id,
+        inference_model_name=deployed_model_name,
     )
 
     print("Starting a rollout using the deployed model!")

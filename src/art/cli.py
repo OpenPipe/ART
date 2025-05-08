@@ -99,4 +99,6 @@ def run(host: str = "0.0.0.0", port: int = 7999) -> None:
             delete=delete,
         )
 
+    app.post("/_experimental_deploy")(backend._experimental_deploy)
+
     uvicorn.run(app, host=host, port=port)

@@ -11,6 +11,7 @@ from .types import TrainConfig
 
 if TYPE_CHECKING:
     from .model import Model, TrainableModel
+    from art.utils.deploy_model import LoRADeploymentProvider
 
 
 class Backend:
@@ -170,20 +171,30 @@ class Backend:
     @log_http_errors
     async def _experimental_deploy(
         self,
+        deploy_to: "LoRADeploymentProvider",
         model: "Model",
         step: int | None = None,
         s3_bucket: str | None = None,
         prefix: str | None = None,
         verbose: bool = False,
+        pull_s3: bool = True,
     ) -> str:
+        """
+        Deploy the model's latest checkpoint to a hosted inference endpoint.
+
+        Together is currently the only supported provider. See link for supported base models:
+        https://docs.together.ai/docs/lora-inference#supported-base-models
+        """
         response = await self._client.post(
             "/_experimental_deploy",
             json={
                 "model": model.model_dump(),
+                "deploy_to": deploy_to,
                 "step": step,
                 "s3_bucket": s3_bucket,
                 "prefix": prefix,
                 "verbose": verbose,
+                "pull_s3": pull_s3,
             },
             timeout=600,
         )

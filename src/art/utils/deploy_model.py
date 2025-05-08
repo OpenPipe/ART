@@ -3,7 +3,28 @@ import json
 import os
 import time
 import aiohttp
+from enum import Enum
+from art.errors import LoRADeploymentTimedOutError, UnsupportedBaseModelDeploymentError
 from art.model import TrainableModel
+from pydantic import BaseModel
+
+
+class LoRADeploymentProvider(str, Enum):
+    TOGETHER = "together"
+
+
+class LoRADeploymentJobStatus(str, Enum):
+    QUEUED = "Queued"
+    RUNNING = "Running"
+    COMPLETE = "Complete"
+    FAILED = "Failed"
+
+
+class LoRADeploymentJobStatusBody(BaseModel):
+    status: LoRADeploymentJobStatus
+    job_id: str
+    model_name: str
+    failure_reason: str | None
 
 
 def init_together_session() -> aiohttp.ClientSession:
@@ -29,7 +50,9 @@ def model_checkpoint_id(model: TrainableModel, step: int) -> str:
     return f"{model.project}-{model.name}-{step}"
 
 
-async def previously_deployed_model_id(model: TrainableModel, step: int) -> str | None:
+async def previously_deployed_model_name(
+    model: TrainableModel, step: int
+) -> str | None:
     """
     Checks if a model with the same name has already been deployed to Together.
     If so, returns the model ID.
@@ -48,6 +71,14 @@ async def previously_deployed_model_id(model: TrainableModel, step: int) -> str 
             return None
 
 
+TOGETHER_SUPPORTED_BASE_MODELS = [
+    "meta-llama/Meta-Llama-3.1-8B-Instruct",
+    "meta-llama/Meta-Llama-3.1-70B-Instruct",
+    "Qwen/Qwen2.5-14B-Instruct",
+    "Qwen/Qwen2.5-72B-Instruct",
+]
+
+
 async def deploy_together(
     model: TrainableModel,
     presigned_url: str,
@@ -55,8 +86,19 @@ async def deploy_together(
     verbose: bool = False,
 ) -> None:
     """
-    Deploys a model to Together.
+    Deploys a model to Together. Supported base models:
+
+    * meta-llama/Meta-Llama-3.1-8B-Instruct
+    * meta-llama/Meta-Llama-3.1-70B-Instruct
+    * Qwen/Qwen2.5-14B-Instruct
+    * Qwen/Qwen2.5-72B-Instruct
     """
+    # check if base model is supported for serverless LoRA deployment by Together
+    if model.base_model not in TOGETHER_SUPPORTED_BASE_MODELS:
+        raise UnsupportedBaseModelDeploymentError(
+            message=f"Base model {model.base_model} is not supported for serverless LoRA deployment by Together. Supported models: {TOGETHER_SUPPORTED_BASE_MODELS}"
+        )
+
     async with init_together_session() as session:
         session.headers.update(
             {
@@ -84,7 +126,9 @@ async def deploy_together(
             return result
 
 
-async def check_together_job_status(job_id: str, verbose: bool = False) -> None:
+async def check_together_job_status(
+    job_id: str, verbose: bool = False
+) -> LoRADeploymentJobStatusBody:
     """
     Checks the status of a model deployment job in Together.
     """
@@ -96,10 +140,23 @@ async def check_together_job_status(job_id: str, verbose: bool = False) -> None:
             result = await response.json()
             if verbose:
                 print(f"Job status: {json.dumps(result, indent=4)}")
-            return result
+
+            status_body = LoRADeploymentJobStatusBody(
+                status=LoRADeploymentJobStatus(result["status"]),
+                job_id=job_id,
+                model_name=result["args"]["modelName"],
+                failure_reason=result.get("failure_reason"),
+            )
+
+            if status_body.status == LoRADeploymentJobStatus.FAILED:
+                last_update = result["status_updates"][-1]
+                status_body.failure_reason = last_update.get("message")
+            return status_body
 
 
-async def wait_for_together_job(job_id: str, verbose: bool = False) -> dict:
+async def wait_for_together_job(
+    job_id: str, verbose: bool = False
+) -> LoRADeploymentJobStatusBody:
     """
     Waits for a model deployment job to complete in Together.
 
@@ -111,6 +168,10 @@ async def wait_for_together_job(job_id: str, verbose: bool = False) -> dict:
     while time.time() < max_time:
         job_status = await check_together_job_status(job_id, verbose)
         print(f"job status: {job_status['status']}")
-        if job_status["status"] == "Complete":
+        if job_status.status == "Complete":
             return job_status
         await asyncio.sleep(15)
+
+    raise LoRADeploymentTimedOutError(
+        message=f"LoRA deployment timed out after 5 minutes. Job ID: {job_id}"
+    )
