@@ -126,6 +126,12 @@ async def deploy_together(
             return result
 
 
+def convert_together_job_status(status: str) -> LoRADeploymentJobStatus:
+    if status == "Bad":
+        return LoRADeploymentJobStatus.FAILED
+    return LoRADeploymentJobStatus(status)
+
+
 async def check_together_job_status(
     job_id: str, verbose: bool = False
 ) -> LoRADeploymentJobStatusBody:
@@ -142,7 +148,7 @@ async def check_together_job_status(
                 print(f"Job status: {json.dumps(result, indent=4)}")
 
             status_body = LoRADeploymentJobStatusBody(
-                status=LoRADeploymentJobStatus(result["status"]),
+                status=convert_together_job_status(result["status"]),
                 job_id=job_id,
                 model_name=result["args"]["modelName"],
                 failure_reason=result.get("failure_reason"),
@@ -167,8 +173,7 @@ async def wait_for_together_job(
     max_time = start_time + 300
     while time.time() < max_time:
         job_status = await check_together_job_status(job_id, verbose)
-        print(f"job status: {job_status['status']}")
-        if job_status.status == "Complete":
+        if job_status.status == "Complete" or job_status.status == "Failed":
             return job_status
         await asyncio.sleep(15)
 
