@@ -222,20 +222,3 @@ class TrainableModel(Model):
             self, list(trajectory_groups), config, _config or {}
         ):
             pass
-
-    async def _experimental_deploy(
-        self,
-        step: int | None = None,
-        s3_bucket: str | None = None,
-        prefix: str | None = None,
-        verbose: bool = False,
-        pull_s3: bool = True,
-    ) -> str:
-        return await self.backend()._experimental_deploy(
-            model=self,
-            step=step,
-            s3_bucket=s3_bucket,
-            prefix=prefix,
-            verbose=verbose,
-            pull_s3=pull_s3,
-        )
