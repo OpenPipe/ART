@@ -29,19 +29,20 @@ def model_checkpoint_id(model: TrainableModel, step: int) -> str:
     return f"{model.project}-{model.name}-{step}"
 
 
-async def previously_deployed_model_id(model: TrainableModel) -> str | None:
+async def previously_deployed_model_id(model: TrainableModel, step: int) -> str | None:
     """
     Checks if a model with the same name has already been deployed to Together.
     If so, returns the model ID.
     """
+    checkpoint_id = model_checkpoint_id(model, step)
     async with init_together_session() as session:
         async with session.get(url="https://api.together.xyz/v1/models") as response:
             response.raise_for_status()
             result = await response.json()
 
-            # find a model with an "id" that contains the model.name
+            # find a model with an "id" that contains the checkpoint_id
             for deployed_model in result:
-                if model.name in deployed_model["id"]:
+                if checkpoint_id in deployed_model["id"]:
                     return deployed_model["id"]
 
             return None

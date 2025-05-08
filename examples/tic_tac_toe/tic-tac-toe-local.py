@@ -35,7 +35,7 @@ async def main():
     await model.register(backend)
 
     print("training")
-    for i in range(await model.get_step(), 41):
+    for i in range(await model.get_step(), 42):
         train_groups = await art.gather_trajectory_groups(
             (
                 art.TrajectoryGroup(
@@ -49,7 +49,7 @@ async def main():
         await model.train(train_groups, config=art.TrainConfig(learning_rate=1e-4))
         await backend._experimental_push_to_s3(model)
 
-    deployed_model_id = await previously_deployed_model_id(model)
+    deployed_model_id = await previously_deployed_model_id(model, 42)
 
     if deployed_model_id:
         print(f"skipping deployment because model {deployed_model_id} already exists")
