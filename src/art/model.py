@@ -168,6 +168,14 @@ class TrainableModel(Model):
     # Use at your own risk.
     _internal_config: dev.InternalModelConfig | None = None
 
+    def __init__(self, **data):
+        # Pop any internal config provided at construction and assign it
+        internal_cfg = data.pop("_internal_config", None)
+        super().__init__(**data)
+        if internal_cfg is not None:
+            # Bypass BaseModel __setattr__ to allow setting private attr
+            object.__setattr__(self, "_internal_config", internal_cfg)
+
     async def register(
         self,
         backend: "Backend",
