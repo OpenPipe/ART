@@ -109,8 +109,10 @@ async def deploy_together(
 
 
 def convert_together_job_status(status: str) -> LoRADeploymentJobStatus:
-    if status == "Bad":
+    if status == "Bad" or status == "Error":
         return LoRADeploymentJobStatus.FAILED
+    if status == "Retry Queued":
+        return LoRADeploymentJobStatus.QUEUED
     return LoRADeploymentJobStatus(status)
 
 

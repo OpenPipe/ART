@@ -13,7 +13,7 @@ load_dotenv()
 random.seed(42)
 
 DESTROY_AFTER_RUN = False
-STEP = 34
+STEP = 36
 
 
 async def main():
