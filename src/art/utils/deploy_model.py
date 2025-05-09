@@ -2,14 +2,17 @@ import asyncio
 import json
 import os
 import time
+from typing import TYPE_CHECKING
 import aiohttp
 from enum import Enum
 from art.errors import (
     LoRADeploymentTimedOutError,
     UnsupportedBaseModelDeploymentError,
 )
-from art.model import TrainableModel
 from pydantic import BaseModel
+
+if TYPE_CHECKING:
+    from art.model import TrainableModel
 
 
 class LoRADeploymentProvider(str, Enum):
@@ -46,7 +49,7 @@ def init_together_session() -> aiohttp.ClientSession:
     return session
 
 
-def model_checkpoint_id(model: TrainableModel, step: int) -> str:
+def model_checkpoint_id(model: "TrainableModel", step: int) -> str:
     """
     Generates a unique ID for a model checkpoint.
     """
@@ -62,7 +65,7 @@ TOGETHER_SUPPORTED_BASE_MODELS = [
 
 
 async def deploy_together(
-    model: TrainableModel,
+    model: "TrainableModel",
     presigned_url: str,
     step: int,
     verbose: bool = False,
@@ -122,7 +125,7 @@ def convert_together_job_status(
 
 
 async def find_existing_together_job_id(
-    model: TrainableModel,
+    model: "TrainableModel",
     step: int,
 ) -> str | None:
     """
