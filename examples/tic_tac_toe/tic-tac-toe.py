@@ -1,168 +1,40 @@
+import os
 import random
 import asyncio
+from dotenv import load_dotenv
 
 import art
-from dotenv import load_dotenv
-from pydantic import BaseModel
-
-from openpipe.client import OpenPipe
-
-import openai
-import time
-import math
-
-
 from art.skypilot.backend import SkyPilotBackend
-from utils import (
-    generate_game,
-    get_opponent_move,
-    apply_agent_move,
-    check_winner,
-    render_board,
-)
+from rollout import rollout, TicTacToeScenario
 
 
 load_dotenv()
 
-op_client = OpenPipe()
-print("OpenPipe client initialized")
-
 random.seed(42)
 
-
-class TicTacToeScenario(BaseModel):
-    step: int
-
-
-@art.retry(exceptions=(openai.LengthFinishReasonError,))
-async def rollout(model: art.Model, scenario: TicTacToeScenario) -> art.Trajectory:
-    game = generate_game()
-
-    trajectory = art.Trajectory(
-        messages_and_choices=[
-            {
-                "role": "system",
-                "content": f"You are a tic-tac-toe player. You are playing against an opponent. Always choose the move most likely to lead to an eventual win. Return your move as an XML object with a single property 'move', like so: <move>A1</move>. Optional moves are 'A1', 'B3', 'C2', etc. You are the {game['agent_symbol']} symbol.",
-            }
-        ],
-        reward=0,
-    )
-
-    move_number = 0
-
-    if game["agent_symbol"] == "o":
-        starting_opponent_move = get_opponent_move(game)
-        game["board"][starting_opponent_move[0]][starting_opponent_move[1]] = game[
-            "opponent_symbol"
-        ]
-
-    while check_winner(game["board"]) is None:
-        trajectory.messages_and_choices.append(
-            {"role": "user", "content": render_board(game)}
-        )
-
-        requested_at = int(time.time() * 1000)
-        messages = trajectory.messages()
-
-        try:
-            client = model.openai_client()
-            chat_completion = await client.chat.completions.create(
-                model=model.name,
-                messages=messages,
-                max_completion_tokens=128,
-            )
-            last_completion = chat_completion
-        except openai.LengthFinishReasonError as e:
-            raise e
-        except Exception as e:
-            print("caught exception generating chat completion")
-            print(e)
-            global failing_trajectory
-            failing_trajectory = trajectory
-            raise e
-
-        try:
-            op_client.report(
-                requested_at=requested_at,
-                received_at=int(time.time() * 1000),
-                req_payload={
-                    "messages": messages,
-                    "metadata": {
-                        "notebook-id": "tic-tac-toe",
-                        "step": str(scenario.step),
-                        "move_number": str(move_number),
-                    },
-                },
-                resp_payload=chat_completion,
-                status_code=200,
-            )
-        except Exception as e:
-            print(f"Error reporting to OpenPipe: {e}")
-
-        choice = chat_completion.choices[0]
-        content = choice.message.content
-        assert isinstance(content, str)
-        trajectory.messages_and_choices.append(choice)
-
-        try:
-            apply_agent_move(game, content)
-        except ValueError as e:
-            trajectory.reward = -1 + (math.log(move_number + 1) / math.log(100))
-            break
-
-        if check_winner(game["board"]) is not None:
-            break
-        move_number += 1
-
-        opponent_move = get_opponent_move(game)
-        game["board"][opponent_move[0]][opponent_move[1]] = game["opponent_symbol"]
-
-    winner = check_winner(game["board"])
-
-    if winner == game["agent_symbol"]:
-        trajectory.reward = 1
-    elif winner == game["opponent_symbol"]:
-        trajectory.reward = 0
-    elif winner == "draw":
-        trajectory.reward = 0.5
-
-    try:
-        op_client.update_log_metadata(
-            filters=[
-                {
-                    "field": "completionId",
-                    "equals": last_completion.id,
-                }
-            ],
-            metadata={
-                "reward": str(trajectory.reward),
-                "reward_assigned": "true",
-            },
-        )
-    except Exception as e:
-        print(f"Error updating log metadata: {e}")
-
-        print(trajectory.reward)
-
-    return trajectory
-
-
 DESTROY_AFTER_RUN = False
+STEP = 36
 
 
 async def main():
     # run from the root of the repo
     backend = await SkyPilotBackend.initialize_cluster(
-        cluster_name="art", art_version=".", env_path=".env", gpu="H100"
+        cluster_name="art2", art_version=".", env_path=".env", gpu="H100"
     )
 
     model = art.TrainableModel(
-        name="006", project="tic-tac-toe", base_model="Qwen/Qwen2.5-3B-Instruct"
+        name="llama-8b-001",
+        project="tic-tac-toe",
+        base_model="meta-llama/Meta-Llama-3.1-8B-Instruct",
     )
+    print("pulling from s3")
     await backend._experimental_pull_from_s3(model)
+
+    print("registering")
     await model.register(backend)
 
-    for i in range(await model.get_step(), 4):
+    print("training")
+    for i in range(await model.get_step(), STEP):
         train_groups = await art.gather_trajectory_groups(
             (
                 art.TrajectoryGroup(
@@ -175,6 +47,32 @@ async def main():
         await model.delete_checkpoints()
         await model.train(train_groups, config=art.TrainConfig(learning_rate=1e-4))
         await backend._experimental_push_to_s3(model)
+
+    deployment_result = await backend._experimental_deploy(
+        deploy_to="together",
+        model=model,
+        step=STEP,
+        verbose=True,
+        pull_s3=False,
+        wait_for_completion=True,
+    )
+    if deployment_result.status == "Failed":
+        raise Exception(f"Deployment failed: {deployment_result.failure_reason}")
+
+    deployed_model_name = deployment_result.model_name
+
+    lora_model = art.Model(
+        name=deployed_model_name,
+        project="tic-tac-toe",
+        inference_api_key=os.environ["TOGETHER_API_KEY"],
+        inference_base_url="https://api.together.xyz/v1",
+        inference_model_name=deployed_model_name,
+    )
+
+    print("Starting a rollout using the deployed model!")
+    traj = await rollout(lora_model, TicTacToeScenario(step=0))
+
+    print(traj)
 
     if DESTROY_AFTER_RUN:
         await backend.down()
