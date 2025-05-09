@@ -23,6 +23,20 @@ class ForbiddenBucketCreationError(HTTPException):
         )
 
 
+class UnsupportedLoRADeploymentProviderError(HTTPException):
+    """An error raised when the user attempts to deploy a model to a provider that does not support
+    serverless LoRA deployment.
+
+    Status code: 400
+    """
+
+    def __init__(self, message: str):
+        super().__init__(
+            status_code=400,
+            detail=message,
+        )
+
+
 class UnsupportedBaseModelDeploymentError(HTTPException):
     """An error raised when the user attempts to deploy a model to a provider that does not support
     it for serverless LoRA deployment.

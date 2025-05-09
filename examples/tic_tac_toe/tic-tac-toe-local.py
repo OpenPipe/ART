@@ -4,7 +4,6 @@ import asyncio
 from dotenv import load_dotenv
 
 import art
-from art.utils.deploy_model import previously_deployed_model_name
 from rollout import rollout, TicTacToeScenario
 from art.local.backend import LocalBackend
 
@@ -14,7 +13,7 @@ load_dotenv()
 random.seed(42)
 
 DESTROY_AFTER_RUN = False
-STEP = 35
+STEP = 34
 
 
 async def main():
@@ -47,23 +46,18 @@ async def main():
         await model.train(train_groups, config=art.TrainConfig(learning_rate=1e-4))
         await backend._experimental_push_to_s3(model)
 
-    deployed_model_name = await previously_deployed_model_name(model, STEP)
+    deployment_result = await backend._experimental_deploy(
+        deploy_to="together",
+        model=model,
+        step=STEP,
+        verbose=True,
+        pull_s3=False,
+        wait_for_completion=True,
+    )
+    if deployment_result.status == "Failed":
+        raise Exception(f"Deployment failed: {deployment_result.failure_reason}")
 
-    if deployed_model_name:
-        print(f"skipping deployment because model {deployed_model_name} already exists")
-    else:
-        deployment_result = await backend._experimental_deploy(
-            deploy_to="together",
-            model=model,
-            step=STEP,
-            verbose=True,
-            pull_s3=False,
-            wait_for_completion=True,
-        )
-        if deployment_result.status == "Failed":
-            raise Exception(f"Deployment failed: {deployment_result.failure_reason}")
-
-        deployed_model_name = deployment_result.model_name
+    deployed_model_name = deployment_result.model_name
 
     lora_model = art.Model(
         name=deployed_model_name,

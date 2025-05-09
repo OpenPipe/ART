@@ -1,11 +1,13 @@
 import json
 import math
 
+from art.errors import UnsupportedLoRADeploymentProviderError
 from art.utils.deploy_model import (
-    LoRADeploymentJobStatusBody,
+    LoRADeploymentJob,
     LoRADeploymentProvider,
     check_together_job_status,
     deploy_together,
+    find_existing_together_job_id,
     wait_for_together_job,
 )
 from art.utils.old_benchmarking.calculate_step_metrics import calculate_step_std_dev
@@ -401,7 +403,7 @@ class LocalBackend(Backend):
         verbose: bool = False,
         pull_s3: bool = True,
         wait_for_completion: bool = True,
-    ) -> LoRADeploymentJobStatusBody:
+    ) -> LoRADeploymentJob:
         """
         Deploy the model's latest checkpoint to a hosted inference endpoint.
 
@@ -430,17 +432,32 @@ class LocalBackend(Backend):
         )
 
         if deploy_to == LoRADeploymentProvider.TOGETHER:
-            deployment_result = await deploy_together(
-                model=model,
-                presigned_url=presigned_url,
-                step=step,
-                verbose=verbose,
-            )
-            job_id = deployment_result["data"]["job_id"]
+            existing_job_id = await find_existing_together_job_id(model, step)
+            existing_job = None
+            if existing_job_id is not None:
+                existing_job = await check_together_job_status(
+                    existing_job_id, verbose=verbose
+                )
+
+            if not existing_job or existing_job.status == "Failed":
+                deployment_result = await deploy_together(
+                    model=model,
+                    presigned_url=presigned_url,
+                    step=step,
+                    verbose=verbose,
+                )
+                job_id = deployment_result["data"]["job_id"]
+            else:
+                job_id = existing_job_id
+                print(
+                    f"Previous deployment for {model.name} at step {step} has status '{existing_job.status}', skipping redployment"
+                )
 
             if wait_for_completion:
                 return await wait_for_together_job(job_id, verbose=verbose)
             else:
                 return await check_together_job_status(job_id, verbose=verbose)
 
-        raise ValueError(f"Unsupported deployment option: {deploy_to}")
+        raise UnsupportedLoRADeploymentProviderError(
+            f"Unsupported deployment option: {deploy_to}"
+        )

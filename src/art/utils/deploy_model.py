@@ -4,7 +4,10 @@ import os
 import time
 import aiohttp
 from enum import Enum
-from art.errors import LoRADeploymentTimedOutError, UnsupportedBaseModelDeploymentError
+from art.errors import (
+    LoRADeploymentTimedOutError,
+    UnsupportedBaseModelDeploymentError,
+)
 from art.model import TrainableModel
 from pydantic import BaseModel
 
@@ -20,7 +23,7 @@ class LoRADeploymentJobStatus(str, Enum):
     FAILED = "Failed"
 
 
-class LoRADeploymentJobStatusBody(BaseModel):
+class LoRADeploymentJob(BaseModel):
     status: LoRADeploymentJobStatus
     job_id: str
     model_name: str
@@ -48,27 +51,6 @@ def model_checkpoint_id(model: TrainableModel, step: int) -> str:
     Generates a unique ID for a model checkpoint.
     """
     return f"{model.project}-{model.name}-{step}"
-
-
-async def previously_deployed_model_name(
-    model: TrainableModel, step: int
-) -> str | None:
-    """
-    Checks if a model with the same name has already been deployed to Together.
-    If so, returns the model ID.
-    """
-    checkpoint_id = model_checkpoint_id(model, step)
-    async with init_together_session() as session:
-        async with session.get(url="https://api.together.xyz/v1/models") as response:
-            response.raise_for_status()
-            result = await response.json()
-
-            # find a model with an "id" that contains the checkpoint_id
-            for deployed_model in result:
-                if checkpoint_id in deployed_model["id"]:
-                    return deployed_model["id"]
-
-            return None
 
 
 TOGETHER_SUPPORTED_BASE_MODELS = [
@@ -132,9 +114,30 @@ def convert_together_job_status(status: str) -> LoRADeploymentJobStatus:
     return LoRADeploymentJobStatus(status)
 
 
+async def find_existing_together_job_id(
+    model: TrainableModel,
+    step: int,
+) -> str | None:
+    """
+    Finds an existing model deployment job in Together.
+    """
+    checkpoint_id = model_checkpoint_id(model, step)
+    async with init_together_session() as session:
+        async with session.get(url="https://api.together.xyz/v1/jobs") as response:
+            response.raise_for_status()
+            result = await response.json()
+            jobs = result["data"]
+            # ensure we get the most recent job
+            jobs.sort(key=lambda x: x["updated_at"], reverse=True)
+            for job in jobs:
+                if checkpoint_id in job["args"]["modelName"]:
+                    return job["job_id"]
+            return None
+
+
 async def check_together_job_status(
     job_id: str, verbose: bool = False
-) -> LoRADeploymentJobStatusBody:
+) -> LoRADeploymentJob:
     """
     Checks the status of a model deployment job in Together.
     """
@@ -147,7 +150,7 @@ async def check_together_job_status(
             if verbose:
                 print(f"Job status: {json.dumps(result, indent=4)}")
 
-            status_body = LoRADeploymentJobStatusBody(
+            status_body = LoRADeploymentJob(
                 status=convert_together_job_status(result["status"]),
                 job_id=job_id,
                 model_name=result["args"]["modelName"],
@@ -162,7 +165,7 @@ async def check_together_job_status(
 
 async def wait_for_together_job(
     job_id: str, verbose: bool = False
-) -> LoRADeploymentJobStatusBody:
+) -> LoRADeploymentJob:
     """
     Waits for a model deployment job to complete in Together.
 
