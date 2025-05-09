@@ -1,10 +1,10 @@
 import os
 import random
 import asyncio
+import argparse
 from dotenv import load_dotenv
 
 import art
-from art.skypilot.backend import SkyPilotBackend
 from rollout import rollout, TicTacToeScenario
 
 
@@ -17,16 +17,33 @@ STEP = 36
 
 
 async def main():
-    # run from the root of the repo
-    backend = await SkyPilotBackend.initialize_cluster(
-        cluster_name="art2", art_version=".", env_path=".env", gpu="H100"
+    parser = argparse.ArgumentParser(description="Train a model to play Tic-Tac-Toe")
+    parser.add_argument(
+        "--backend",
+        choices=["skypilot", "local"],
+        default="local",
+        help="Backend to use for training (default: local)",
     )
+    args = parser.parse_args()
+
+    # Avoid import unnecessary backend dependencies
+    if args.backend == "skypilot":
+        from art.skypilot.backend import SkyPilotBackend
+
+        backend = await SkyPilotBackend.initialize_cluster(
+            cluster_name="art3", art_version=".", env_path=".env", gpu="H100"
+        )
+    else:
+        from art.local.backend import LocalBackend
+
+        backend = LocalBackend()
 
     model = art.TrainableModel(
         name="llama-8b-001",
         project="tic-tac-toe",
         base_model="meta-llama/Meta-Llama-3.1-8B-Instruct",
     )
+
     print("pulling from s3")
     await backend._experimental_pull_from_s3(model)
 
