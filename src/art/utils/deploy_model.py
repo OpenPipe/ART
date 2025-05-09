@@ -108,7 +108,12 @@ async def deploy_together(
             return result
 
 
-def convert_together_job_status(status: str) -> LoRADeploymentJobStatus:
+def convert_together_job_status(
+    status: str, message: str | None = None
+) -> LoRADeploymentJobStatus:
+    MODEL_ALREADY_EXISTS_ERROR_MESSAGE = "409 Client Error: Conflict for url: https://api.together.ai/api/admin/entity/Model"
+    if status == "Error" and MODEL_ALREADY_EXISTS_ERROR_MESSAGE in message:
+        return LoRADeploymentJobStatus.COMPLETE
     if status == "Bad" or status == "Error":
         return LoRADeploymentJobStatus.FAILED
     if status == "Retry Queued":
@@ -152,15 +157,17 @@ async def check_together_job_status(
             if verbose:
                 print(f"Job status: {json.dumps(result, indent=4)}")
 
+            last_update = result["status_updates"][-1]
             status_body = LoRADeploymentJob(
-                status=convert_together_job_status(result["status"]),
+                status=convert_together_job_status(
+                    result["status"], last_update.get("message")
+                ),
                 job_id=job_id,
                 model_name=result["args"]["modelName"],
                 failure_reason=result.get("failure_reason"),
             )
 
             if status_body.status == LoRADeploymentJobStatus.FAILED:
-                last_update = result["status_updates"][-1]
                 status_body.failure_reason = last_update.get("message")
             return status_body
 
