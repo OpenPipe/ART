@@ -4,6 +4,7 @@ from tqdm import auto as tqdm
 from typing import AsyncIterator, TYPE_CHECKING
 
 from art.utils import log_http_errors
+from art.utils.deploy_model import LoRADeploymentJob
 
 from . import dev
 from .trajectories import TrajectoryGroup
@@ -179,7 +180,7 @@ class Backend:
         verbose: bool = False,
         pull_s3: bool = True,
         wait_for_completion: bool = True,
-    ) -> str:
+    ) -> LoRADeploymentJob:
         """
         Deploy the model's latest checkpoint to a hosted inference endpoint.
 
@@ -201,4 +202,4 @@ class Backend:
             timeout=600,
         )
         response.raise_for_status()
-        return response.json()["inference_id"]
+        return LoRADeploymentJob(**response.json())

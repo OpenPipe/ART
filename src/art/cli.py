@@ -111,7 +111,7 @@ def run(host: str = "0.0.0.0", port: int = 7999) -> None:
         pull_s3: bool = Body(True),
         wait_for_completion: bool = Body(True),
     ):
-        await backend._experimental_deploy(
+        return await backend._experimental_deploy(
             deploy_to=deploy_to,
             model=model,
             step=step,
