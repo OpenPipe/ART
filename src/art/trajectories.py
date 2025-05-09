@@ -3,10 +3,11 @@ import pydantic
 import traceback
 from typing import Awaitable, Any, cast, Iterable, Iterator, overload
 from openai.types.chat.chat_completion import Choice
-from openai.types.chat.chat_completion_message_tool_call_param import (
-    ChatCompletionMessageToolCallParam,
-)
 from .types import Messages, MessagesAndChoices, Tools
+import time
+from contextlib import asynccontextmanager
+from typing import AsyncGenerator
+from datetime import datetime
 
 
 MetadataValue = float | int | str | bool | None
@@ -22,9 +23,29 @@ class Trajectory(pydantic.BaseModel):
     messages_and_choices: MessagesAndChoices
     tools: Tools | None = None
     reward: float
-    metrics: dict[str, float] = {}
+    metrics: dict[str, float | int | bool] = {}
     metadata: dict[str, MetadataValue] = {}
     logs: list[str] = []
+    start_time: datetime = pydantic.Field(default_factory=datetime.now, exclude=True)
+
+    def __init__(self, **data: Any):
+        super().__init__(**data)
+        self.start_time = datetime.now()
+
+    def finish(self) -> "Trajectory":
+        duration = (datetime.now() - self.start_time).total_seconds()
+        self.metrics["duration"] = duration
+        return self
+
+    @asynccontextmanager
+    async def track_duration(self, metric_name: str) -> AsyncGenerator[None, None]:
+        start_time = time.monotonic()
+        try:
+            yield
+        finally:
+            duration = time.monotonic() - start_time
+            metric_key = f"{metric_name}_duration"
+            self.metrics[metric_key] = self.metrics.get(metric_key, 0.0) + duration
 
     def __str__(self) -> str:
         return f"Trajectory(reward={self.reward}, metrics={self.metrics}, metadata={self.metadata})"

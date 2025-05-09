@@ -247,7 +247,7 @@ class LocalBackend(Backend):
                 for metric, value in trajectory.metrics.items():
                     if metric not in all_metrics:
                         all_metrics[metric] = []
-                    all_metrics[metric].append(value)
+                    all_metrics[metric].append(float(value))
 
         # Calculate averages for all metrics
         averages = {}

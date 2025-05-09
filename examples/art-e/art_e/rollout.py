@@ -246,18 +246,19 @@ async def rollout(
         if litellm_model_name is None:
             litellm_model_name = f"hosted_vllm/{model.name}"
 
-        llm_response = await acompletion(
-            model=litellm_model_name,
-            base_url=model.inference_base_url,
-            messages=traj.messages(),
-            caching=not model.trainable,
-            api_key=model.inference_api_key,
-            max_completion_tokens=model.config.max_tokens,
-            tools=tools if model.config.use_tools else None,
-            tool_choice="required"
-            if model.config.use_tools and not model.trainable
-            else None,
-        )  # type: ignore
+        async with traj.track_duration("llm_completion"):
+            llm_response = await acompletion(
+                model=litellm_model_name,
+                base_url=model.inference_base_url,
+                messages=traj.messages(),
+                caching=not model.trainable,
+                api_key=model.inference_api_key,
+                max_completion_tokens=model.config.max_tokens,
+                tools=tools if model.config.use_tools else None,
+                tool_choice="required"
+                if model.config.use_tools and not model.trainable
+                else None,
+            )  # type: ignore
 
         assert isinstance(llm_response, ModelResponse)
         rubric.prompt_tokens += llm_response.usage.prompt_tokens  # type: ignore
@@ -368,9 +369,10 @@ async def rollout(
                     rubric.returned_i_dont_know = True
                 else:
                     rubric.attempted_answer = True
-                    rubric.answer_correct = await determine_if_answer_is_correct(
-                        final_answer, scenario
-                    )
+                    async with traj.track_duration("determine_if_answer_is_correct"):
+                        rubric.answer_correct = await determine_if_answer_is_correct(
+                            final_answer, scenario
+                        )
                     rubric.sources_correct = scenario.message_ids[0] in final_sources
                 break
             case _:
@@ -406,7 +408,7 @@ async def rollout(
         except Exception as e:
             print(f"Error reporting to OpenPipe: {e}")
 
-    return traj
+    return traj.finish()
 
 
 if __name__ == "__main__":

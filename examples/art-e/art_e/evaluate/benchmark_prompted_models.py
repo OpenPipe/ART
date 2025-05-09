@@ -4,6 +4,7 @@
 import art
 import asyncio
 import polars as pl
+from art.local import LocalBackend
 from dotenv import load_dotenv
 from art_e.data.local_email_db import generate_database
 from art_e.project_types import ProjectPolicyConfig
@@ -27,7 +28,7 @@ TEST_SET_ENTRIES = 100
 
 
 async def main():
-    backend = art.LocalBackend()
+    backend = LocalBackend()
     models = []
     for model_name, model_id, use_tools in MODELS_TO_BENCHMARK:
         model = art.Model(

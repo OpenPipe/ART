@@ -93,13 +93,13 @@ async def run_training(model: art.TrainableModel):
     if model.config.training_config is None:
         raise ValueError("Training config is not set")
     backend = LocalBackend()
-    await model.register(backend)
     print(f"Pulling from S3 bucket: `{os.environ['BACKUP_BUCKET']}`")
     await backend._experimental_pull_from_s3(
         model,
         s3_bucket=os.environ["BACKUP_BUCKET"],
         verbose=True,
     )
+    await model.register(backend)
 
     print("Loading training data...")
     train_scenarios: List[SyntheticQuery] = load_synthetic_queries(

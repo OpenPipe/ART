@@ -177,10 +177,7 @@ class GatherContext:
             for metric in self.metric_sums:
                 sum = self.metric_sums[metric]
                 divisor = max(1, self.metric_divisors[metric])
-                if isinstance(sum, int):
-                    postfix[metric] = int(sum / divisor)
-                else:
-                    postfix[metric] = sum / divisor
+                postfix[metric] = sum / divisor
             for key in (
                 "prompt_tokens",
                 "completion_tokens",

@@ -5,7 +5,7 @@ from art_e.evaluate.load_trajectories import load_trajectories
 from art_e.evaluate.display_run_html import display_run_html
 from art_e.data.query_iterators import load_synthetic_queries
 
-df = await load_trajectories(".art/email_agent")  # type: ignore
+df = await load_trajectories(".art/email_agent", models=["o3"])  # type: ignore
 scenarios = load_synthetic_queries(
     split="test", limit=100, exclude_known_bad_queries=False
 )

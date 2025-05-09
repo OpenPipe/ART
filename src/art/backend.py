@@ -66,9 +66,8 @@ class Backend:
             timeout=600,
         )
         response.raise_for_status()
-        [base_url, api_key] = tuple(response.json())
-
-        return [base_url, api_key]
+        base_url, api_key = tuple(response.json())
+        return base_url, api_key
 
     async def _log(
         self,
@@ -83,6 +82,7 @@ class Backend:
                 "trajectory_groups": [tg.model_dump() for tg in trajectory_groups],
                 "split": split,
             },
+            timeout=None,
         )
         response.raise_for_status()
 
