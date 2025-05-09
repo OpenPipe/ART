@@ -12,6 +12,7 @@ from .local import LocalBackend
 from .model import Model, TrainableModel
 from .trajectories import TrajectoryGroup
 from .types import TrainConfig
+from .utils.deploy_model import LoRADeploymentProvider
 
 app = typer.Typer()
 
@@ -99,6 +100,26 @@ def run(host: str = "0.0.0.0", port: int = 7999) -> None:
             delete=delete,
         )
 
-    app.post("/_experimental_deploy")(backend._experimental_deploy)
+    @app.post("/_experimental_deploy")
+    async def _experimental_deploy(
+        deploy_to: LoRADeploymentProvider = Body(...),
+        model: TrainableModel = Body(...),
+        step: int | None = Body(None),
+        s3_bucket: str | None = Body(None),
+        prefix: str | None = Body(None),
+        verbose: bool = Body(False),
+        pull_s3: bool = Body(True),
+        wait_for_completion: bool = Body(True),
+    ):
+        await backend._experimental_deploy(
+            deploy_to=deploy_to,
+            model=model,
+            step=step,
+            s3_bucket=s3_bucket,
+            prefix=prefix,
+            verbose=verbose,
+            pull_s3=pull_s3,
+            wait_for_completion=wait_for_completion,
+        )
 
     uvicorn.run(app, host=host, port=port)

@@ -178,6 +178,7 @@ class Backend:
         prefix: str | None = None,
         verbose: bool = False,
         pull_s3: bool = True,
+        wait_for_completion: bool = True,
     ) -> str:
         """
         Deploy the model's latest checkpoint to a hosted inference endpoint.
@@ -188,13 +189,14 @@ class Backend:
         response = await self._client.post(
             "/_experimental_deploy",
             json={
-                "model": model.model_dump(),
                 "deploy_to": deploy_to,
+                "model": model.model_dump(),
                 "step": step,
                 "s3_bucket": s3_bucket,
                 "prefix": prefix,
                 "verbose": verbose,
                 "pull_s3": pull_s3,
+                "wait_for_completion": wait_for_completion,
             },
             timeout=600,
         )
