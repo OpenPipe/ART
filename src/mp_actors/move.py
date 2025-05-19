@@ -9,12 +9,10 @@ import sys
 from tblib import pickling_support
 from typing import Any, AsyncGenerator, cast, TypeVar
 import uuid
-import logging
 from concurrent.futures import ThreadPoolExecutor
 
 from .traceback import streamline_tracebacks
 
-# Ensure "spawn" is the start method for multiprocessing
 if mp.get_start_method(allow_none=True) != "spawn":
     mp.set_start_method("spawn", force=True)
 
@@ -104,7 +102,9 @@ class Proxy:
     def __getattr__(self, name: str) -> Any:
         # For attributes that aren't methods, get them directly
         if not hasattr(self._obj, name):
-            raise AttributeError(f"{type(self._obj).__name__} has no attribute '{name}'")
+            raise AttributeError(
+                f"{type(self._obj).__name__} has no attribute '{name}'"
+            )
 
         async def get_response(
             args: tuple[Any, ...],
@@ -113,8 +113,7 @@ class Proxy:
             send_value: Any | None = None,
         ) -> Any:
             request = Request(str(id or uuid.uuid4()), name, args, kwargs, send_value)
-            future = asyncio.Future()
-            self._futures[request.id] = future
+            self._futures[request.id] = asyncio.Future()
             self._requests.put_nowait(request)
             return await self._futures[request.id]
 
@@ -123,12 +122,16 @@ class Proxy:
         if inspect.isasyncgenfunction(attr):
             # Return an async generator wrapper function
             @streamline_tracebacks()
-            async def async_gen_wrapper(*args: Any, **kwargs: Any) -> AsyncGenerator[Any, Any]:
+            async def async_gen_wrapper(
+                *args: Any, **kwargs: Any
+            ) -> AsyncGenerator[Any, Any]:
                 try:
                     id = uuid.uuid4()
                     send_value = None
                     while True:
-                        send_value = yield await get_response(args, kwargs, id, send_value)
+                        send_value = yield await get_response(
+                            args, kwargs, id, send_value
+                        )
                         args, kwargs = (), {}
                 except StopAsyncIteration:
                     return
@@ -212,9 +215,10 @@ async def _handle_requests(
     obj: object, requests: mp.Queue, responses: mp.Queue
 ) -> None:
     generators: dict[str, AsyncGenerator[Any, Any]] = {}
-    loop = asyncio.get_event_loop()
     while True:
-        request: Request = await loop.run_in_executor(None, requests.get)
+        request: Request = await asyncio.get_event_loop().run_in_executor(
+            None, requests.get
+        )
         asyncio.create_task(_handle_request(obj, request, responses, generators))
 
 
@@ -228,7 +232,9 @@ async def _handle_request(
         result_or_callable = getattr(obj, request.method_name)
         if inspect.isasyncgenfunction(result_or_callable):
             if request.id not in generators:
-                generators[request.id] = result_or_callable(*request.args, **request.kwargs)
+                generators[request.id] = result_or_callable(
+                    *request.args, **request.kwargs
+                )
             result = await generators[request.id].asend(request.send_value)
         elif callable(result_or_callable):
             result_or_coro = result_or_callable(*request.args, **request.kwargs)
