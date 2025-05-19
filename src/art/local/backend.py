@@ -67,8 +67,13 @@ class LocalBackend(Backend):
         return self
 
     async def __aexit__(self, *excinfo):
-        for name, service in self._services.items():
-            service.close()
+        self.close()
+    
+    def close(self):
+        for _, service in self._services.items():
+            close_method = getattr(service, "close", None)
+            if callable(close_method):
+                close_method()
 
     async def register(
         self,
