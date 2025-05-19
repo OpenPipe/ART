@@ -231,7 +231,7 @@ async def _handle_request(
     try:
         result_or_callable = getattr(obj, request.method_name)
         if inspect.isasyncgenfunction(result_or_callable):
-            if request.id not in generators:
+            if not request.id in generators:
                 generators[request.id] = result_or_callable(
                     *request.args, **request.kwargs
                 )
