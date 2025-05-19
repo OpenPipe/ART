@@ -63,10 +63,10 @@ class LocalBackend(Backend):
         self._tokenizers: dict[str, "PreTrainedTokenizerBase"] = {}
         self._wandb_runs: dict[str, Run] = {}
 
-    async def __aenter__(self):
+    def __aenter__(self):
         return self
 
-    async def __aexit__(self, *excinfo):
+    def __aexit__(self, *excinfo):
         self.close()
     
     def close(self):
