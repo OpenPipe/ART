@@ -24,7 +24,7 @@ async def stop_server() -> None:
     if len(cluster_status) == 0 or cluster_status[0]["status"] != sky.ClusterStatus.UP:
         raise ValueError(f"Cluster {args.cluster} is not running")
 
-    if not is_task_created(cluster_name=args.cluster, task_name="art_server"):
+    if not await is_task_created(cluster_name=args.cluster, task_name="art_server"):
         raise ValueError(f"Art server task for cluster {args.cluster} is not running")
 
     backend = await SkyPilotBackend.initialize_cluster(
