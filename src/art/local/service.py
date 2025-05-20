@@ -72,6 +72,7 @@ class ModelService:
         disk_packed_tensors: DiskPackedTensors,
         config: types.TrainConfig,
         _config: dev.TrainConfig,
+        verbose: bool = False,
     ) -> AsyncIterator[dict[str, float]]:
         # Get the packed tensors from disk
         packed_tensors = packed_tensors_from_dir(**disk_packed_tensors)
@@ -122,6 +123,10 @@ class ModelService:
                         ],
                         return_when=asyncio.FIRST_COMPLETED,
                     )
+                    if verbose:
+                        print(
+                            "Done waiting for a result from the queue or for the training task to, presumably, raise an exception"
+                        )
                     for task in done:
                         result = task.result()
                         # If `result` is `None`, the training task finished somehow.
@@ -137,11 +142,20 @@ class ModelService:
                             warmup = False
                         else:
                             yield result
+            if verbose:
+                print("Saving new LoRA adapter...")
             # Save the new LoRA adapter
             checkpoint_dir = f"{self.output_dir}/{get_step(self.output_dir) + 1:04d}"
             self.state.trainer.save_model(checkpoint_dir)
+            if verbose:
+                print("Setting new LoRA adapter...")
             # Set the new LoRA adapter
             self._set_lora(checkpoint_dir)
+            if verbose:
+                print("New LoRA adapter set")
+
+        if verbose:
+            print("ModelService.train complete")
 
     def _set_lora(self, lora_path: str) -> None:
         """Sets the LoRA adapter with ID 1 in the vLLM engine."""
