@@ -28,7 +28,7 @@ class Backend:
         """
         If running vLLM in a separate process, this will kill that process and close the communication threads.
         """
-        response = await self._client.post("/close")
+        response = await self._client.post("/close", timeout=None)
         response.raise_for_status()
 
     async def register(
