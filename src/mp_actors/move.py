@@ -9,6 +9,7 @@ import sys
 from tblib import pickling_support
 from typing import Any, AsyncGenerator, cast, TypeVar
 import uuid
+from concurrent.futures import ThreadPoolExecutor
 
 from .traceback import streamline_tracebacks
 
@@ -20,6 +21,8 @@ nest_asyncio.apply()
 
 T = TypeVar("T")
 
+# Special ID to signal shutdown
+_SHUTDOWN_ID = "__shutdown__"
 
 def move_to_child_process(
     obj: T, log_file: str | None = None, process_name: str | None = None
@@ -72,15 +75,24 @@ class Proxy:
             args=(obj, self._requests, self._responses, log_file, process_name),
         )
         self._process.start()
+        # dedicated executor for queue.get calls
+        self._executor = ThreadPoolExecutor()
         self._futures: dict[str, asyncio.Future] = {}
         self._handle_responses_task = asyncio.create_task(self._handle_responses())
 
     async def _handle_responses(self) -> None:
+        loop = asyncio.get_event_loop()
         while True:
-            response: Response = await asyncio.get_event_loop().run_in_executor(
-                None, self._responses.get
+            response: Response = await loop.run_in_executor(
+                self._executor, self._responses.get
             )
-            future = self._futures.pop(response.id)
+            # check for shutdown signal
+            if response.id == _SHUTDOWN_ID:
+                break
+            # normal processing
+            future = self._futures.pop(response.id, None)
+            if future is None:
+                continue
             if response.exception:
                 future.set_exception(response.exception)
             else:
@@ -136,18 +148,52 @@ class Proxy:
             # Return a regular function wrapper
             @streamline_tracebacks()
             def method_wrapper(*args: Any, **kwargs: Any) -> Any:
-                return asyncio.run(get_response(args, kwargs))
+                loop = asyncio.get_event_loop()
+                if loop.is_running():
+                    fut = asyncio.run_coroutine_threadsafe(get_response(args, kwargs), loop)
+                    return fut.result()
+                else:
+                    return asyncio.run(get_response(args, kwargs))
 
             return method_wrapper
         else:
-            # For non-callable attributes, get them directly
-            return asyncio.run(get_response(tuple(), dict()))
+            return asyncio.run(get_response(tuple(), {}))
 
-    def __del__(self) -> None:
-        self._handle_responses_task.cancel()
-        self._process.terminate()
+    def close(self):
+        # signal the response loop to exit
+        self._responses.put_nowait(Response(_SHUTDOWN_ID, None, None))
+        # wait for the handler to finish
+        if hasattr(self, "_handle_responses_task"):
+            # give it a moment to break
+            try:
+                asyncio.get_event_loop().run_until_complete(self._handle_responses_task)
+            except Exception:
+                pass
+
+        # terminate child process and force kill if needed
+        if hasattr(self, "_process"):
+            self._process.terminate()
+            try:
+                self._process.join(timeout=1)
+            except Exception:
+                pass
+            if self._process.is_alive():
+                # Python 3.7+: force kill
+                try:
+                    self._process.kill()
+                except AttributeError:
+                    # fallback: os.kill
+                    os.kill(self._process.pid, 9)
+                self._process.join()
+
+        # shutdown executor cleanly
+        self._executor.shutdown(wait=True)
+
+        # close and cancel queue feeder threads
         self._responses.close()
+        self._responses.cancel_join_thread()
         self._requests.close()
+        self._requests.cancel_join_thread()
 
 
 def _target(
@@ -199,6 +245,9 @@ async def _handle_request(
         else:
             result = result_or_callable
         response = Response(request.id, result, None)
+    except StopAsyncIteration:
+        generators.pop(request.id, None)
+        return
     except Exception as e:
         pickling_support.install(e)
         response = Response(request.id, None, e)
