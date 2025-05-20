@@ -249,8 +249,6 @@ async def _handle_request(
         generators.pop(request.id, None)
         return
     except Exception as e:
-        import traceback
-        traceback.print_exc()
-        pickling_support.install()
+        pickling_support.install(e)
         response = Response(request.id, None, e)
     responses.put_nowait(response)
