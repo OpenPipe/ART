@@ -294,9 +294,16 @@ class LocalBackend(Backend):
         trajectory_groups: list[TrajectoryGroup],
         config: TrainConfig,
         dev_config: dev.TrainConfig,
+        verbose: bool = False,
     ) -> AsyncIterator[dict[str, float]]:
+        if verbose:
+            print("Starting _train_model")
         service = await self._get_service(model)
+        if verbose:
+            print("Logging training data to disk...")
         await self._log(model, trajectory_groups, "train")
+        if verbose:
+            print("Packing tensors...")
         packed_tensors = self._get_packed_tensors(
             model, trajectory_groups, plot_tensors=False
         )
@@ -313,17 +320,25 @@ class LocalBackend(Backend):
         results: list[dict[str, float]] = []
         num_gradient_steps = disk_packed_tensors["num_sequences"]
         pbar = tqdm.tqdm(total=num_gradient_steps, desc="train")
-        async for result in service.train(disk_packed_tensors, config, dev_config):
+        async for result in service.train(
+            disk_packed_tensors, config, dev_config, verbose
+        ):
             results.append(result)
             yield {**result, "num_gradient_steps": num_gradient_steps}
             pbar.update(1)
             pbar.set_postfix(result)
+        print("pbar.close()")
         pbar.close()
+
+        if verbose:
+            print("Logging metrics...")
         data = {
             k: sum(d.get(k, 0) for d in results) / sum(1 for d in results if k in d)
             for k in {k for d in results for k in d}
         }
         self._log_metrics(model, data, "train", step_offset=-1)
+        if verbose:
+            print("_train_model complete")
 
     def _log_metrics(
         self,

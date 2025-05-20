@@ -58,10 +58,11 @@ def run(host: str = "0.0.0.0", port: int = 7999) -> None:
         trajectory_groups: list[TrajectoryGroup],
         config: TrainConfig,
         dev_config: dev.TrainConfig,
+        verbose: bool = Body(False),
     ) -> StreamingResponse:
         async def stream() -> AsyncIterator[str]:
             async for result in backend._train_model(
-                model, trajectory_groups, config, dev_config
+                model, trajectory_groups, config, dev_config, verbose
             ):
                 yield json.dumps(result) + "\n"
 
