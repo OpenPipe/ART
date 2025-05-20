@@ -81,8 +81,11 @@ class LocalBackend(Backend):
 
     def __exit__(self, *excinfo):
         self.close()
-    
+
     def close(self):
+        """
+        If running vLLM in a separate process, this will kill that process and close the communication threads.
+        """
         for _, service in self._services.items():
             close_method = getattr(service, "close", None)
             if callable(close_method):
