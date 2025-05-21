@@ -46,7 +46,7 @@ async def get_agent_move(
         completion = await client.chat.completions.create(
             model=model.get_inference_name(),
             messages=messages,
-            max_completion_tokens=128,
+            max_completion_tokens=100,
             temperature=1.0,
         )
     except openai.LengthFinishReasonError as e:
@@ -78,12 +78,20 @@ async def rollout(
 
     player_states = {
         "x": PlayerState(
-            trajectory=art.Trajectory(messages_and_choices=[], reward=0),
+            trajectory=art.Trajectory(
+                messages_and_choices=[],
+                reward=0,
+                metadata={"model_name": x_model.name},
+            ),
             last_completion=None,
             invalid_move=False,
         ),
         "o": PlayerState(
-            trajectory=art.Trajectory(messages_and_choices=[], reward=0),
+            trajectory=art.Trajectory(
+                messages_and_choices=[],
+                reward=0,
+                metadata={"model_name": y_model.name},
+            ),
             last_completion=None,
             invalid_move=False,
         ),
@@ -109,11 +117,10 @@ async def rollout(
         for symbol in ["x", "o"]:
             player_state = player_states[symbol]
 
-            move = await get_agent_move(
-                game=game, model=x_model, player_state=player_state
-            )
-
             try:
+                move = await get_agent_move(
+                    game=game, model=x_model, player_state=player_state
+                )
                 apply_agent_move(game=game, move=move, symbol=symbol)
             except ValueError:
                 player_state.invalid_move = True
