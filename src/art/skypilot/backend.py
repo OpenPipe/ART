@@ -1,3 +1,4 @@
+import asyncio
 from typing import TYPE_CHECKING, cast
 import sky
 import os
@@ -84,6 +85,8 @@ class SkyPilotBackend(Backend):
             await to_thread_typed(
                 lambda: sky.cancel(cluster_name=self._cluster_name, all=True)
             )
+            # wait 5 seconds to ensure the server finishes winding down
+            await asyncio.sleep(5)
             art_server_running = False
 
         if art_server_running:
@@ -95,13 +98,14 @@ class SkyPilotBackend(Backend):
                     "handle"
                 ].launched_resources
             )
-            art_server_task.set_resources(cast(sky.Resources, resources))
-            art_server_task.update_envs(self._envs)
 
             # If a local path was provided for art_version, ensure it is mounted so the latest
             # code is synced to the remote cluster every time we (re)launch the art_server task.
             if art_version is not None and os.path.exists(art_version):
-                art_server_task.set_file_mounts({"~/sky_workdir": art_version})
+                art_server_task.workdir = art_version
+
+            art_server_task.set_resources(cast(sky.Resources, resources))
+            art_server_task.update_envs(self._envs)
 
             # run art server task
             await to_thread_typed(
@@ -152,11 +156,7 @@ class SkyPilotBackend(Backend):
                 art_installation_command = f"uv pip install openpipe-art=={art_version}"
             elif os.path.exists(art_version):
                 # copy the contents of the art_path onto the new machine
-                task.set_file_mounts(
-                    {
-                        "~/sky_workdir": art_version,
-                    }
-                )
+                task.workdir = art_version
                 art_installation_command = "uv sync"
             else:
                 raise ValueError(
