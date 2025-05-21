@@ -148,16 +148,12 @@ class Proxy:
             # Return a regular function wrapper
             @streamline_tracebacks()
             def method_wrapper(*args: Any, **kwargs: Any) -> Any:
-                loop = asyncio.get_event_loop()
-                if loop.is_running():
-                    fut = asyncio.run_coroutine_threadsafe(get_response(args, kwargs), loop)
-                    return fut.result()
-                else:
-                    return asyncio.run(get_response(args, kwargs))
+                return asyncio.run(get_response(args, kwargs))
 
             return method_wrapper
         else:
-            return asyncio.run(get_response(tuple(), {}))
+            # For non-callable attributes, get them directly
+            return asyncio.run(get_response(tuple(), dict()))
 
     def close(self):
         # signal the response loop to exit
@@ -245,9 +241,6 @@ async def _handle_request(
         else:
             result = result_or_callable
         response = Response(request.id, result, None)
-    except StopAsyncIteration:
-        generators.pop(request.id, None)
-        return
     except Exception as e:
         pickling_support.install(e)
         response = Response(request.id, None, e)
