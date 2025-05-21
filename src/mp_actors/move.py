@@ -241,9 +241,6 @@ async def _handle_request(
         else:
             result = result_or_callable
         response = Response(request.id, result, None)
-    except StopAsyncIteration:
-        generators.pop(request.id, None)
-        return
     except Exception as e:
         pickling_support.install(e)
         response = Response(request.id, None, e)
