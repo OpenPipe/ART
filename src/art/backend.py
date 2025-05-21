@@ -99,6 +99,7 @@ class Backend:
         trajectory_groups: list[TrajectoryGroup],
         config: TrainConfig,
         dev_config: dev.TrainConfig,
+        verbose: bool = False,
     ) -> AsyncIterator[dict[str, float]]:
         async with self._client.stream(
             "POST",
@@ -108,6 +109,7 @@ class Backend:
                 "trajectory_groups": [tg.model_dump() for tg in trajectory_groups],
                 "config": config.model_dump(),
                 "dev_config": dev_config,
+                "verbose": verbose,
             },
             timeout=None,
         ) as response:

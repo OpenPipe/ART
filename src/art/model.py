@@ -217,6 +217,7 @@ class TrainableModel(Model):
         trajectory_groups: Iterable[TrajectoryGroup],
         config: TrainConfig = TrainConfig(),
         _config: dev.TrainConfig | None = None,
+        verbose: bool = False,
     ) -> None:
         """
         Reinforce fine-tune the model with a batch of trajectory groups.
@@ -228,6 +229,6 @@ class TrainableModel(Model):
                 not yet part of the public API. Use at your own risk.
         """
         async for _ in self.backend()._train_model(
-            self, list(trajectory_groups), config, _config or {}
+            self, list(trajectory_groups), config, _config or {}, verbose
         ):
             pass

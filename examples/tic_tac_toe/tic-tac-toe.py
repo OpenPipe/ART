@@ -5,6 +5,7 @@ import argparse
 from dotenv import load_dotenv
 
 import art
+from gather_trajectory_groups_by_index import gather_trajectory_groups_by_index
 from rollout import rollout, TicTacToeScenario
 
 
@@ -17,6 +18,9 @@ STEP = 50
 DEPLOY_MODEL = False
 GENERATE_BENCHMARKS = False
 DESTROY_AFTER_RUN = False
+
+CLUSTER_NAME = "art4"
+MODEL_NAME = "llama-8b-self-play-004"
 
 parser = argparse.ArgumentParser(description="Train a model to play Tic-Tac-Toe")
 parser.add_argument(
@@ -34,7 +38,7 @@ async def main():
         from art.skypilot.backend import SkyPilotBackend
 
         backend = await SkyPilotBackend.initialize_cluster(
-            cluster_name="art3", art_version=".", env_path=".env", gpu="H100"
+            cluster_name=CLUSTER_NAME, art_version=".", env_path=".env", gpu="H100"
         )
     else:
         from art.local.backend import LocalBackend
@@ -42,7 +46,7 @@ async def main():
         backend = LocalBackend()
 
     model = art.TrainableModel(
-        name="llama-8b-007",
+        name=MODEL_NAME,
         project="tic-tac-toe",
         base_model="meta-llama/Meta-Llama-3.1-8B-Instruct",
     )
@@ -54,19 +58,29 @@ async def main():
     print("registering")
     await model.register(backend)
 
-    print("training")
+    print("commencing run")
     for i in range(await model.get_step(), STEP):
-        train_groups = await art.gather_trajectory_groups(
-            (
-                art.TrajectoryGroup(
-                    rollout(model, TicTacToeScenario(step=i)) for _ in range(96)
+        (
+            x_trajectory_group,
+            y_trajectory_group,
+        ) = await gather_trajectory_groups_by_index(
+            [
+                rollout(
+                    x_model=model, y_model=model, scenario=TicTacToeScenario(step=i)
                 )
-                for _ in range(1)
-            ),
+                for _ in range(96)
+            ],
             pbar_desc="gather",
+            trajectories_per_rollout=2,
         )
+
         await model.delete_checkpoints()
-        await model.train(train_groups, config=art.TrainConfig(learning_rate=5e-5))
+        await model.train(
+            trajectory_groups=[x_trajectory_group, y_trajectory_group],
+            config=art.TrainConfig(learning_rate=5e-5),
+            verbose=True,
+        )
+        print("pushing to s3")
         await backend._experimental_push_to_s3(model)
 
     if DEPLOY_MODEL:
