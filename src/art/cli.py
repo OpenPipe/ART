@@ -47,10 +47,17 @@ def run(host: str = "0.0.0.0", port: int = 7999) -> None:
     app.get("/healthcheck")(lambda: {"status": "ok"})
     app.post("/close")(backend.close)
     app.post("/register")(backend.register)
-    app.post("/_log")(backend._log)
     app.post("/_prepare_backend_for_training")(backend._prepare_backend_for_training)
     app.post("/_get_step")(backend._get_step)
     app.post("/_delete_checkpoints")(backend._delete_checkpoints)
+
+    @app.post("/_log")
+    async def _log(
+        model: Model,
+        trajectory_groups: list[TrajectoryGroup],
+        split: str = Body("val"),
+    ):
+        await backend._log(model, trajectory_groups, split)
 
     @app.post("/_train_model")
     async def _train_model(
