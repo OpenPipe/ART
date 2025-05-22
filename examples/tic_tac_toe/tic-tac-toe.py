@@ -94,8 +94,7 @@ async def main():
             trajectories_per_rollout=2,
         )
 
-        if i % 10 == 0 or True:
-            print("gathering val")
+        if i % 10 == 0:
             x_val, y_val = await gather_trajectory_groups_by_index(
                 [
                     rollout(
