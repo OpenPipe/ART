@@ -95,7 +95,7 @@ class Model(BaseModel):
             return self._openai_client
 
         if self.inference_api_key is None or self.inference_base_url is None:
-            if isinstance(self, TrainableModel):
+            if self.trainable:
                 raise ValueError(
                     "OpenAI client not yet available on this trainable model. You must call `model.register()` first."
                 )

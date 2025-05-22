@@ -238,7 +238,7 @@ class LocalBackend(Backend):
         os.makedirs(parent_dir, exist_ok=True)
 
         # Get the file name for the current iteration, or default to 0 for non-trainable models
-        iteration = self.__get_step(model) if isinstance(model, TrainableModel) else 0
+        iteration = self.__get_step(model) if model.trainable else 0
         file_name = f"{iteration:04d}.yaml"
 
         # Write the logs to the file
@@ -273,7 +273,7 @@ class LocalBackend(Backend):
         # Calculate average standard deviation of rewards within groups
         averages["reward_std_dev"] = calculate_step_std_dev(trajectory_groups)
 
-        if isinstance(model, TrainableModel):
+        if model.trainable:
             self._log_metrics(model, averages, split)
 
     def _trajectory_log(self, trajectory: Trajectory) -> str:
@@ -338,9 +338,7 @@ class LocalBackend(Backend):
             if split
             else metrics
         )
-        step = (
-            self.__get_step(model) if isinstance(model, TrainableModel) else 0
-        ) + step_offset
+        step = (self.__get_step(model) if model.trainable else 0) + step_offset
 
         # If we have a W&B run, log the data there
         if run := self._get_wandb_run(model):
