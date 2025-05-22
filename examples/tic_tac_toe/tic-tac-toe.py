@@ -21,7 +21,7 @@ GENERATE_BENCHMARKS = False
 DESTROY_AFTER_RUN = False
 
 CLUSTER_NAME = "art4"
-MODEL_NAME = "llama-8b-self-play-006"
+MODEL_NAME = "llama-8b-self-play-010"
 
 parser = argparse.ArgumentParser(description="Train a model to play Tic-Tac-Toe")
 parser.add_argument(
@@ -84,7 +84,9 @@ async def main():
         ) = await gather_trajectory_groups_by_index(
             [
                 rollout(
-                    x_model=model, y_model=model, scenario=TicTacToeScenario(step=i)
+                    x_model=model,
+                    y_model=model,
+                    scenario=TicTacToeScenario(step=i, split="train"),
                 )
                 for _ in range(96)
             ],
@@ -92,40 +94,31 @@ async def main():
             trajectories_per_rollout=2,
         )
 
-        # if i % 10 == 0 or True:
-        #     x_val, y_val = await gather_trajectory_groups_by_index(
-        #         [
-        #             rollout(
-        #                 x_model=o4_mini if j % 2 == 0 else model,
-        #                 y_model=model if j % 2 == 0 else o4_mini,
-        #                 scenario=TicTacToeScenario(step=i),
-        #             )
-        #             for j in range(2)
-        #         ],
-        #         pbar_desc="val",
-        #         trajectories_per_rollout=2,
-        #     )
+        if i % 10 == 0 or True:
+            print("gathering val")
+            x_val, y_val = await gather_trajectory_groups_by_index(
+                [
+                    rollout(
+                        x_model=o4_mini if j % 2 == 0 else model,
+                        y_model=model if j % 2 == 0 else o4_mini,
+                        scenario=TicTacToeScenario(step=i, split="val"),
+                    )
+                    for j in range(4)
+                ],
+                pbar_desc="val",
+                trajectories_per_rollout=2,
+            )
 
-        #     model_trajectories = list(
-        #         filter(
-        #             lambda t: t.metadata["model_name"] == model.name,
-        #             x_val.trajectories + y_val.trajectories,
-        #         )
-        #     )
-        #     print(len(model_trajectories))
-        #     group = TrajectoryGroup(trajectories=model_trajectories)
+            model_trajectories = list(
+                filter(
+                    lambda t: t.metadata["model_name"] == model.name,
+                    x_val.trajectories + y_val.trajectories,
+                )
+            )
 
-        #     await backend._log(
-        #         model, [x_trajectory_group, y_trajectory_group], split="val"
-        #     )
-        #     print("logged to wandb?")
-        #     # await model.log([x_val, y_val], split="val")
+            await model.log(model_trajectories, split="val")
 
         await model.delete_checkpoints()
-        print("logging to wandb")
-        await model.log(
-            trajectories=[x_trajectory_group, y_trajectory_group], split="train"
-        )
         await model.train(
             trajectory_groups=[x_trajectory_group, y_trajectory_group],
             config=art.TrainConfig(learning_rate=5e-5),

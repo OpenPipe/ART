@@ -46,7 +46,7 @@ async def get_agent_move(
         completion = await client.chat.completions.create(
             model=model.get_inference_name(),
             messages=messages,
-            max_completion_tokens=100,
+            max_completion_tokens=1000,
             temperature=1.0,
         )
     except openai.LengthFinishReasonError as e:
@@ -56,18 +56,20 @@ async def get_agent_move(
         print(e)
         raise e
 
+    player_state.last_completion = completion
+
     choice = completion.choices[0]
     move = choice.message.content
     if move is None:
         raise ValueError("No move returned")
 
     player_state.trajectory.messages_and_choices.append(choice)
-    player_state.last_completion = completion
     return move
 
 
 class TicTacToeScenario(BaseModel):
     step: int
+    split: str
 
 
 @art.retry(exceptions=(openai.LengthFinishReasonError,))
@@ -115,11 +117,12 @@ async def rollout(
         and not player_states["o"].invalid_move
     ):
         for symbol in ["x", "o"]:
+            model = x_model if symbol == "x" else y_model
             player_state = player_states[symbol]
 
             try:
                 move = await get_agent_move(
-                    game=game, model=x_model, player_state=player_state
+                    game=game, model=model, player_state=player_state
                 )
                 apply_agent_move(game=game, move=move, symbol=symbol)
             except ValueError:
@@ -177,6 +180,7 @@ async def rollout(
                         "messages": messages,
                         "metadata": {
                             "notebook-id": "tic-tac-toe",
+                            "split": scenario.split,
                             "step": str(scenario.step),
                             "num_moves": str(move_number),
                             "win": str(reported_win),
