@@ -327,7 +327,6 @@ class LocalBackend(Backend):
             yield {**result, "num_gradient_steps": num_gradient_steps}
             pbar.update(1)
             pbar.set_postfix(result)
-        print("pbar.close()")
         pbar.close()
 
         if verbose:
