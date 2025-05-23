@@ -176,7 +176,9 @@ class SkyPilotBackend(Backend):
 
         try:
             await to_thread_typed(
-                lambda: sky.launch(task=task, cluster_name=self._cluster_name)
+                lambda: sky.launch(
+                    task=task, cluster_name=self._cluster_name, retry_until_up=True
+                )
             )
         except Exception as e:
             print(f"Error launching cluster: {e}")

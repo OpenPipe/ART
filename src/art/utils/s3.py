@@ -26,6 +26,7 @@ def build_s3_path(
     *,
     model_name: str,
     project: str,
+    step: int | None = None,
     s3_bucket: str | None = None,
     prefix: str | None = None,
 ) -> str:
@@ -35,6 +36,8 @@ def build_s3_path(
 
     prefix_part = f"{prefix.strip('/')}/" if prefix else ""
     path = f"s3://{s3_bucket}/{prefix_part}{project}/models/{model_name}"
+    if step is not None:
+        path += f"/{step:04d}"
     return path
 
 
@@ -147,6 +150,7 @@ async def ensure_bucket_exists(
 async def pull_model_from_s3(
     model_name: str,
     project: str,
+    step: int | None = None,
     s3_bucket: str | None = None,
     prefix: str | None = None,
     verbose: bool = False,
@@ -158,6 +162,7 @@ async def pull_model_from_s3(
     Args:
         model_name: The name of the model to pull.
         project: The project name.
+        step: A specific step to pull from S3. If None, all steps will be pulled.
         s3_bucket: The S3 bucket to pull from.
         prefix: The prefix to pull from.
         verbose: When *True*, the output of the AWS CLI is streamed to the
@@ -174,15 +179,21 @@ async def pull_model_from_s3(
         art_path=art_path,
     )
     os.makedirs(local_model_dir, exist_ok=True)
+    local_dir = local_model_dir
+    if step is not None:
+        local_step_dir = get_step_checkpoint_dir(local_model_dir, step)
+        os.makedirs(local_step_dir, exist_ok=True)
+        local_dir = local_step_dir
 
     s3_path = build_s3_path(
         model_name=model_name,
         project=project,
+        step=step,
         s3_bucket=s3_bucket,
         prefix=prefix,
     )
     await ensure_bucket_exists(s3_bucket)
-    await s3_sync(s3_path, local_model_dir, verbose=verbose, delete=delete)
+    await s3_sync(s3_path, local_dir, verbose=verbose, delete=delete)
 
     return local_model_dir
 
