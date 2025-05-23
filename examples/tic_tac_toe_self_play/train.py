@@ -15,7 +15,6 @@ random.seed(42)
 
 PULL_FROM_S3 = False
 STEP = 300
-GENERATE_BENCHMARKS = False
 DESTROY_AFTER_RUN = False
 
 CLUSTER_NAME = "art4"
@@ -93,12 +92,12 @@ async def main():
             [
                 rollout(
                     x_model=model,
-                    y_model=model,
+                    o_model=model,
                     scenario=TicTacToeScenario(
                         step=i,
                         split="train",
                         x_shadowmaster=o4_mini if j % 4 == 0 else None,
-                        y_shadowmaster=o4_mini if j % 4 == 1 else None,
+                        o_shadowmaster=o4_mini if j % 4 == 1 else None,
                         # ensure we learn how to play against all 9 possible opening moves
                         initial_move=possible_moves[j % 9] if j < 63 else None,
                     ),
@@ -114,7 +113,7 @@ async def main():
                 [
                     rollout(
                         x_model=o4_mini if j % 2 == 0 else model,
-                        y_model=model if j % 2 == 0 else o4_mini,
+                        o_model=model if j % 2 == 0 else o4_mini,
                         scenario=TicTacToeScenario(
                             step=i,
                             split="val",
@@ -145,45 +144,6 @@ async def main():
 
     if DESTROY_AFTER_RUN:
         await backend.down()
-
-    if GENERATE_BENCHMARKS:
-        gpt_4o_mini = art.Model(
-            name="gpt-4o-mini",
-            project="tic-tac-toe",
-            inference_model_name="gpt-4o-mini",
-            inference_api_key=os.getenv("OPENAI_API_KEY"),
-            inference_base_url="https://api.openai.com/v1",
-        )
-        await gpt_4o_mini.register(backend)
-
-        gpt_4o = art.Model(
-            name="gpt-4o",
-            project="tic-tac-toe",
-            inference_model_name="gpt-4o",
-            inference_api_key=os.getenv("OPENAI_API_KEY"),
-            inference_base_url="https://api.openai.com/v1",
-        )
-        await gpt_4o.register(backend)
-
-        async def benchmark_comparison_model(comparison_model: art.Model):
-            trajectories = await art.gather_trajectory_groups(
-                (
-                    art.TrajectoryGroup(
-                        rollout(comparison_model, TicTacToeScenario(step=0))
-                        for _ in range(12)
-                    )
-                    for _ in range(1)
-                ),
-                pbar_desc=f"gather {comparison_model.name}",
-                max_exceptions=1,
-            )
-            await comparison_model.log(
-                trajectories,
-                split="val",
-            )
-
-        await benchmark_comparison_model(gpt_4o_mini)
-        await benchmark_comparison_model(gpt_4o)
 
 
 if __name__ == "__main__":

@@ -1,4 +1,3 @@
-import random
 from typing import TypedDict
 from typing import Literal
 import xml.etree.ElementTree as ET
@@ -6,19 +5,26 @@ import xml.etree.ElementTree as ET
 
 class TicTacToeGame(TypedDict):
     board: list[list[str]]
-    agent_symbol: Literal["x", "o"]
-    opponent_symbol: Literal["x", "o"]
 
 
 def generate_game(board_length: int = 3) -> TicTacToeGame:
     board = [["_" for _ in range(board_length)] for _ in range(board_length)]
-    agent_symbol = random.choice(["x", "o"])
-    opponent_symbol = "x" if agent_symbol == "o" else "o"
-    return {
-        "board": board,
-        "agent_symbol": agent_symbol,
-        "opponent_symbol": opponent_symbol,
-    }
+    return TicTacToeGame(
+        board=board,
+    )
+
+
+possible_moves = [
+    "<move>A1</move>",
+    "<move>A2</move>",
+    "<move>A3</move>",
+    "<move>B1</move>",
+    "<move>B2</move>",
+    "<move>B3</move>",
+    "<move>C1</move>",
+    "<move>C2</move>",
+    "<move>C3</move>",
+]
 
 
 def render_board(game: TicTacToeGame) -> str:
@@ -37,22 +43,18 @@ def render_board(game: TicTacToeGame) -> str:
     return board_str
 
 
-def get_opponent_move(game: TicTacToeGame) -> tuple[int, int]:
-    # get a random empty cell
-    empty_cells = [
-        (i, j) for i in range(3) for j in range(3) if game["board"][i][j] == "_"
-    ]
-    return random.choice(empty_cells)
-
-
-def apply_agent_move(game: TicTacToeGame, move: str) -> None:
-    board_length = len(game["board"])
-
+def unwrap_move(move: str) -> str:
     try:
         root = ET.fromstring(move)
-        square = root.text
-    except Exception as e:
+        return root.text
+    except Exception:
         raise ValueError("Invalid xml")
+
+
+def apply_agent_move(
+    game: TicTacToeGame, square: str, symbol: Literal["x", "o"]
+) -> None:
+    board_length = len(game["board"])
 
     try:
         row_index = ord(square[0]) - 65
@@ -75,7 +77,7 @@ def apply_agent_move(game: TicTacToeGame, move: str) -> None:
     if game["board"][row_index][col_index] != "_":
         raise ValueError("Square already occupied")
 
-    game["board"][row_index][col_index] = game["agent_symbol"]
+    game["board"][row_index][col_index] = symbol
 
 
 def check_winner(board: list[list[str]]) -> Literal["x", "o", "draw", None]:
