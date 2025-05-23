@@ -14,6 +14,7 @@ from game_utils import (
     apply_agent_move,
     check_winner,
     render_board,
+    unwrap_move,
 )
 
 load_dotenv()
@@ -31,11 +32,16 @@ class PlayerState(BaseModel):
     invalid_move: bool
 
 
+class ModelConfig(BaseModel):
+    requires_reasoning: bool = False
+
+
 async def get_agent_move(
     game: TicTacToeGame,
     model: art.Model,
     player_state: PlayerState,
 ) -> str:
+    assert isinstance(model.config, ModelConfig)
     player_state.trajectory.messages_and_choices.append(
         {"role": "user", "content": render_board(game)}
     )
@@ -46,7 +52,8 @@ async def get_agent_move(
         completion = await client.chat.completions.create(
             model=model.get_inference_name(),
             messages=messages,
-            max_completion_tokens=1000,
+            max_completion_tokens=2000 if model.config.requires_reasoning else 100,
+            reasoning_effort="low" if model.config.requires_reasoning else None,
             temperature=1.0,
         )
     except openai.LengthFinishReasonError as e:
@@ -59,12 +66,20 @@ async def get_agent_move(
     player_state.last_completion = completion
 
     choice = completion.choices[0]
-    move = choice.message.content
-    if move is None:
+    move_xml = choice.message.content
+    if move_xml is None:
         raise ValueError("No move returned")
 
     player_state.trajectory.messages_and_choices.append(choice)
-    return move
+
+    return unwrap_move(move_xml)
+
+
+def record_first_move_metrics(trajectory: art.Trajectory, square: str) -> None:
+    for row in ["A", "B", "C"]:
+        for col in ["1", "2", "3"]:
+            board_square = f"{row}{col}"
+            trajectory.metrics[board_square] = 1 if board_square == square else 0
 
 
 class TicTacToeScenario(BaseModel):
@@ -103,7 +118,7 @@ async def rollout(
         player_states[symbol].trajectory.messages_and_choices.append(
             {
                 "role": "system",
-                "content": f"You are a tic-tac-toe player. You are playing against an opponent. Always choose the move most likely to lead to an eventual win. Return your move as an XML object with a single property 'move', like so: <move>A1</move>. Optional moves are 'A1', 'B3', 'C2', etc. You are the {symbol} symbol.",
+                "content": f"You are a tic-tac-toe player. You are playing against an opponent. Always choose the move most likely to lead to an eventual win. Return your move as an XML object with a single property 'move', like so: <move>A1</move>. Optional moves are 'A1', 'B2', 'C3', etc. You are the {symbol} symbol.",
             }
         )
 
@@ -121,13 +136,15 @@ async def rollout(
             player_state = player_states[symbol]
 
             try:
-                move = await get_agent_move(
+                square = await get_agent_move(
                     game=game, model=model, player_state=player_state
                 )
-                apply_agent_move(game=game, move=move, symbol=symbol)
+                if move_number == 0:
+                    record_first_move_metrics(player_state.trajectory, square)
+                apply_agent_move(game=game, square=square, symbol=symbol)
             except ValueError:
                 player_state.invalid_move = True
-                player_state.trajectory.reward = -10 + (
+                player_state.trajectory.reward = -2 + (
                     math.log(move_number + 1) / math.log(10)
                 )
                 break
@@ -142,9 +159,9 @@ async def rollout(
         winner_state = player_states[winner]
         loser_state = player_states["x" if winner == "o" else "o"]
 
-        winner_state.trajectory.reward = 1
+        winner_state.trajectory.reward = 1 - move_number / 40
         winner_state.trajectory.metrics["win"] = 1
-        loser_state.trajectory.reward = 0
+        loser_state.trajectory.reward = 0 + move_number / 40
         loser_state.trajectory.metrics["win"] = 0
     elif winner == "draw":
         for symbol in ["x", "o"]:

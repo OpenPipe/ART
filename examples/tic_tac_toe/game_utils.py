@@ -30,14 +30,18 @@ def render_board(game: TicTacToeGame) -> str:
     return board_str
 
 
-def apply_agent_move(game: TicTacToeGame, move: str, symbol: Literal["x", "o"]) -> None:
-    board_length = len(game["board"])
-
+def unwrap_move(move: str) -> str:
     try:
         root = ET.fromstring(move)
-        square = root.text
-    except Exception as e:
+        return root.text
+    except Exception:
         raise ValueError("Invalid xml")
+
+
+def apply_agent_move(
+    game: TicTacToeGame, square: str, symbol: Literal["x", "o"]
+) -> None:
+    board_length = len(game["board"])
 
     try:
         row_index = ord(square[0]) - 65

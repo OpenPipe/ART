@@ -5,9 +5,9 @@ import argparse
 from dotenv import load_dotenv
 
 import art
-from art.trajectories import TrajectoryGroup
+from penalize_collapse import penalize_collapse
 from gather_trajectory_groups_by_index import gather_trajectory_groups_by_index
-from rollout import rollout, TicTacToeScenario
+from rollout import ModelConfig, rollout, TicTacToeScenario
 
 
 load_dotenv()
@@ -15,13 +15,13 @@ load_dotenv()
 random.seed(42)
 
 PULL_FROM_S3 = False
-STEP = 100
+STEP = 200
 DEPLOY_MODEL = False
 GENERATE_BENCHMARKS = False
 DESTROY_AFTER_RUN = False
 
 CLUSTER_NAME = "art4"
-MODEL_NAME = "llama-8b-self-play-010"
+MODEL_NAME = "llama-8b-self-play-018"
 
 parser = argparse.ArgumentParser(description="Train a model to play Tic-Tac-Toe")
 parser.add_argument(
@@ -59,6 +59,7 @@ async def main():
         name=MODEL_NAME,
         project="tic-tac-toe",
         base_model="meta-llama/Meta-Llama-3.1-8B-Instruct",
+        config=ModelConfig(),
     )
     o4_mini = art.Model(
         name="o4-mini",
@@ -66,6 +67,7 @@ async def main():
         inference_model_name="o4-mini",
         inference_api_key=os.environ["OPENAI_API_KEY"],
         inference_base_url="https://api.openai.com/v1",
+        config=ModelConfig(requires_reasoning=True),
     )
 
     if PULL_FROM_S3:
@@ -94,7 +96,9 @@ async def main():
             trajectories_per_rollout=2,
         )
 
-        if i % 10 == 0:
+        penalize_collapse(x_trajectory_group, -3)
+
+        if i % 4 == 0:
             x_val, y_val = await gather_trajectory_groups_by_index(
                 [
                     rollout(
@@ -120,10 +124,9 @@ async def main():
         await model.delete_checkpoints()
         await model.train(
             trajectory_groups=[x_trajectory_group, y_trajectory_group],
-            config=art.TrainConfig(learning_rate=5e-5),
+            config=art.TrainConfig(learning_rate=2e-5),
             verbose=True,
         )
-        print("pushing to s3")
         await backend._experimental_push_to_s3(model)
 
     if DEPLOY_MODEL:
