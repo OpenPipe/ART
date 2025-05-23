@@ -70,6 +70,7 @@ async def main():
         await backend._experimental_push_to_s3(model)
 
     if DEPLOY_MODEL:
+        print("deploying")
         deployment_result = await backend._experimental_deploy(
             deploy_to="together",
             model=model,

@@ -393,7 +393,6 @@ class LocalBackend(Backend):
         delete: bool = False,
     ) -> None:
         """Download the model directory from S3 into local Backend storage. Right now this can be used to pull trajectory logs for processing or model checkpoints.
-
         Args:
             model: The model to pull from S3.
             step: A specific step to pull from S3. If None, all steps will be pulled.
