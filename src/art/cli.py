@@ -47,9 +47,15 @@ def run(host: str = "0.0.0.0", port: int = 7999) -> None:
     app.get("/healthcheck")(lambda: {"status": "ok"})
     app.post("/close")(backend.close)
     app.post("/register")(backend.register)
-    app.post("/_prepare_backend_for_training")(backend._prepare_backend_for_training)
     app.post("/_get_step")(backend._get_step)
     app.post("/_delete_checkpoints")(backend._delete_checkpoints)
+
+    @app.post("/_prepare_backend_for_training")
+    async def _prepare_backend_for_training(
+        model: TrainableModel,
+        config: dev.OpenAIServerConfig | None = Body(None),
+    ):
+        return await backend._prepare_backend_for_training(model, config)
 
     @app.post("/_log")
     async def _log(

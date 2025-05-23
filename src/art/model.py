@@ -176,6 +176,11 @@ class TrainableModel(Model):
             # Bypass BaseModel __setattr__ to allow setting private attr
             object.__setattr__(self, "_internal_config", internal_cfg)
 
+    def model_dump(self, *args, **kwargs) -> dict:
+        data = super().model_dump(*args, **kwargs)
+        data["_internal_config"] = self._internal_config
+        return data
+
     async def register(
         self,
         backend: "Backend",
