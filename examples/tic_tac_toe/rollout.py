@@ -19,10 +19,6 @@ from game_utils import (
 
 load_dotenv()
 
-op_client = OpenPipe()
-print("OpenPipe client initialized")
-
-
 op_client = OpenPipe(api_key=os.getenv("OPENPIPE_API_KEY"))
 
 
@@ -38,8 +34,10 @@ class ModelConfig(BaseModel):
 
 async def get_agent_move(
     game: TicTacToeGame,
-    model: art.Model,
     player_state: PlayerState,
+    model: art.Model,
+    shadowmaster: art.Model | None = None,
+    predestined_move: str | None = None,
 ) -> str:
     assert isinstance(model.config, ModelConfig)
     player_state.trajectory.messages_and_choices.append(
@@ -48,6 +46,22 @@ async def get_agent_move(
 
     messages = player_state.trajectory.messages()
     try:
+        if shadowmaster and not predestined_move:
+            assert isinstance(shadowmaster.config, ModelConfig)
+            shadowmaster_client = shadowmaster.openai_client()
+            shadowmaster_completion = await shadowmaster_client.chat.completions.create(
+                model=shadowmaster.get_inference_name(),
+                messages=messages,
+                max_completion_tokens=2000
+                if shadowmaster.config.requires_reasoning
+                else 100,
+                reasoning_effort="low"
+                if shadowmaster.config.requires_reasoning
+                else None,
+                temperature=1.0,
+            )
+            predestined_move = shadowmaster_completion.choices[0].message.content
+
         client = model.openai_client()
         completion = await client.chat.completions.create(
             model=model.get_inference_name(),
@@ -55,6 +69,9 @@ async def get_agent_move(
             max_completion_tokens=2000 if model.config.requires_reasoning else 100,
             reasoning_effort="low" if model.config.requires_reasoning else None,
             temperature=1.0,
+            extra_body={"guided_choice": [predestined_move]}
+            if predestined_move and model.trainable
+            else None,
         )
     except openai.LengthFinishReasonError as e:
         raise e
@@ -85,6 +102,9 @@ def record_first_move_metrics(trajectory: art.Trajectory, square: str) -> None:
 class TicTacToeScenario(BaseModel):
     step: int
     split: str
+    x_shadowmaster: art.Model | None = None
+    y_shadowmaster: art.Model | None = None
+    initial_move: str | None = None
 
 
 @art.retry(exceptions=(openai.LengthFinishReasonError,))
@@ -134,10 +154,19 @@ async def rollout(
         for symbol in ["x", "o"]:
             model = x_model if symbol == "x" else y_model
             player_state = player_states[symbol]
+            shadowmaster = (
+                scenario.x_shadowmaster if symbol == "x" else scenario.y_shadowmaster
+            )
 
             try:
                 square = await get_agent_move(
-                    game=game, model=model, player_state=player_state
+                    game=game,
+                    player_state=player_state,
+                    model=model,
+                    shadowmaster=shadowmaster,
+                    predestined_move=scenario.initial_move
+                    if move_number == 0
+                    else None,
                 )
                 if move_number == 0:
                     record_first_move_metrics(player_state.trajectory, square)
@@ -185,6 +214,9 @@ async def rollout(
                 messages = messages[:-1]
 
             model = x_model if symbol == "x" else y_model
+            shadowmaster = (
+                scenario.x_shadowmaster if symbol == "x" else scenario.y_shadowmaster
+            )
             try:
                 reported_win = (
                     trajectory.metrics["win"] if "win" in trajectory.metrics else -1
@@ -196,7 +228,7 @@ async def rollout(
                         "model": model.name,
                         "messages": messages,
                         "metadata": {
-                            "notebook-id": "tic-tac-toe",
+                            "project": "tic-tac-toe",
                             "split": scenario.split,
                             "step": str(scenario.step),
                             "num_moves": str(move_number),
@@ -204,6 +236,10 @@ async def rollout(
                             "reward": str(trajectory.reward),
                             "invalid_move": str(player_state.invalid_move),
                             "symbol": symbol,
+                            "shadowmaster": shadowmaster.name if shadowmaster else "",
+                            "initial_move": unwrap_move(scenario.initial_move)
+                            if scenario.initial_move
+                            else "",
                         },
                     },
                     resp_payload=player_state.last_completion,

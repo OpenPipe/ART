@@ -386,15 +386,26 @@ class LocalBackend(Backend):
     async def _experimental_pull_from_s3(
         self,
         model: Model,
+        step: int | None = None,
         s3_bucket: str | None = None,
         prefix: str | None = None,
         verbose: bool = False,
         delete: bool = False,
     ) -> None:
-        """Download the model directory from S3 into local Backend storage. Right now this can be used to pull trajectory logs for processing or model checkpoints."""
+        """Download the model directory from S3 into local Backend storage. Right now this can be used to pull trajectory logs for processing or model checkpoints.
+
+        Args:
+            model: The model to pull from S3.
+            step: A specific step to pull from S3. If None, all steps will be pulled.
+            s3_bucket: The S3 bucket to pull from. If None, the default bucket will be used.
+            prefix: The prefix to pull from S3. If None, the model name will be used.
+            verbose: Whether to print verbose output.
+            delete: Whether to delete the local model directory.
+        """
         await pull_model_from_s3(
             model_name=model.name,
             project=model.project,
+            step=step,
             s3_bucket=s3_bucket,
             prefix=prefix,
             verbose=verbose,
@@ -442,6 +453,7 @@ class LocalBackend(Backend):
             # pull the latest step from S3
             await self._experimental_pull_from_s3(
                 model,
+                step=step,
                 s3_bucket=s3_bucket,
                 prefix=prefix,
                 verbose=verbose,

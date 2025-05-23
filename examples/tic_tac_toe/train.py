@@ -5,40 +5,40 @@ import argparse
 from dotenv import load_dotenv
 
 import art
-from penalize_collapse import penalize_collapse
 from gather_trajectory_groups_by_index import gather_trajectory_groups_by_index
 from rollout import ModelConfig, rollout, TicTacToeScenario
-
+from game_utils import possible_moves
 
 load_dotenv()
 
 random.seed(42)
 
 PULL_FROM_S3 = False
-STEP = 200
-DEPLOY_MODEL = False
+STEP = 300
 GENERATE_BENCHMARKS = False
 DESTROY_AFTER_RUN = False
 
 CLUSTER_NAME = "art4"
-MODEL_NAME = "llama-8b-self-play-018"
-
-parser = argparse.ArgumentParser(description="Train a model to play Tic-Tac-Toe")
-parser.add_argument(
-    "--backend",
-    choices=["skypilot", "local"],
-    default="local",
-    help="Backend to use for training (default: local)",
-)
-parser.add_argument(
-    "--restart",
-    action="store_true",
-    help="Restart the ART server",
-)
-args = parser.parse_args()
+PROJECT_NAME = "tic-tac-toe"
+BASE_MODEL = "meta-llama/Meta-Llama-3.1-8B-Instruct"
+MODEL_NAME = "llama-8b-shadowmaster-001"
 
 
 async def main():
+    parser = argparse.ArgumentParser(description="Train a model to play Tic-Tac-Toe")
+    parser.add_argument(
+        "--backend",
+        choices=["skypilot", "local"],
+        default="local",
+        help="Backend to use for training (default: local)",
+    )
+    parser.add_argument(
+        "--restart",
+        action="store_true",
+        help="Restart the ART server",
+    )
+    args = parser.parse_args()
+
     # Avoid import unnecessary backend dependencies
     if args.backend == "skypilot":
         from art.skypilot.backend import SkyPilotBackend
@@ -57,10 +57,16 @@ async def main():
 
     model = art.TrainableModel(
         name=MODEL_NAME,
-        project="tic-tac-toe",
-        base_model="meta-llama/Meta-Llama-3.1-8B-Instruct",
+        project=PROJECT_NAME,
+        base_model=BASE_MODEL,
         config=ModelConfig(),
+        _internal_config=art.dev.InternalModelConfig(
+            engine_args=art.dev.EngineArgs(
+                num_scheduler_steps=1,
+            ),
+        ),
     )
+
     o4_mini = art.Model(
         name="o4-mini",
         project="tic-tac-toe",
@@ -82,31 +88,39 @@ async def main():
     for i in range(await model.get_step(), STEP):
         (
             x_trajectory_group,
-            y_trajectory_group,
+            o_trajectory_group,
         ) = await gather_trajectory_groups_by_index(
             [
                 rollout(
                     x_model=model,
                     y_model=model,
-                    scenario=TicTacToeScenario(step=i, split="train"),
+                    scenario=TicTacToeScenario(
+                        step=i,
+                        split="train",
+                        x_shadowmaster=o4_mini if j % 4 == 0 else None,
+                        y_shadowmaster=o4_mini if j % 4 == 1 else None,
+                        # ensure we learn how to play against all 9 possible opening moves
+                        initial_move=possible_moves[j % 9] if j < 63 else None,
+                    ),
                 )
-                for _ in range(96)
+                for j in range(96)
             ],
             pbar_desc="gather",
             trajectories_per_rollout=2,
         )
 
-        penalize_collapse(x_trajectory_group, -3)
-
         if i % 4 == 0:
-            x_val, y_val = await gather_trajectory_groups_by_index(
+            x_val, o_val = await gather_trajectory_groups_by_index(
                 [
                     rollout(
                         x_model=o4_mini if j % 2 == 0 else model,
                         y_model=model if j % 2 == 0 else o4_mini,
-                        scenario=TicTacToeScenario(step=i, split="val"),
+                        scenario=TicTacToeScenario(
+                            step=i,
+                            split="val",
+                        ),
                     )
-                    for j in range(4)
+                    for j in range(10)
                 ],
                 pbar_desc="val",
                 trajectories_per_rollout=2,
@@ -115,46 +129,19 @@ async def main():
             model_trajectories = list(
                 filter(
                     lambda t: t.metadata["model_name"] == model.name,
-                    x_val.trajectories + y_val.trajectories,
+                    x_val.trajectories + o_val.trajectories,
                 )
             )
 
             await model.log(model_trajectories, split="val")
 
-        await model.delete_checkpoints()
+        # await model.delete_checkpoints()
         await model.train(
-            trajectory_groups=[x_trajectory_group, y_trajectory_group],
+            trajectory_groups=[x_trajectory_group, o_trajectory_group],
             config=art.TrainConfig(learning_rate=2e-5),
             verbose=True,
         )
         await backend._experimental_push_to_s3(model)
-
-    if DEPLOY_MODEL:
-        deployment_result = await backend._experimental_deploy(
-            deploy_to="together",
-            model=model,
-            step=STEP,
-            verbose=True,
-            pull_s3=False,
-            wait_for_completion=True,
-        )
-        if deployment_result.status == "Failed":
-            raise Exception(f"Deployment failed: {deployment_result.failure_reason}")
-
-        deployed_model_name = deployment_result.model_name
-
-        lora_model = art.Model(
-            name=deployed_model_name,
-            project="tic-tac-toe",
-            inference_api_key=os.environ["TOGETHER_API_KEY"],
-            inference_base_url="https://api.together.xyz/v1",
-            inference_model_name=deployed_model_name,
-        )
-
-        print("Starting a rollout using the deployed model!")
-        traj = await rollout(lora_model, TicTacToeScenario(step=0))
-
-        print(traj)
 
     if DESTROY_AFTER_RUN:
         await backend.down()

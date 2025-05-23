@@ -14,6 +14,19 @@ def generate_game(board_length: int = 3) -> TicTacToeGame:
     )
 
 
+possible_moves = [
+    "<move>A1</move>",
+    "<move>A2</move>",
+    "<move>A3</move>",
+    "<move>B1</move>",
+    "<move>B2</move>",
+    "<move>B3</move>",
+    "<move>C1</move>",
+    "<move>C2</move>",
+    "<move>C3</move>",
+]
+
+
 def render_board(game: TicTacToeGame) -> str:
     board = game["board"]
     board_length = len(board)
