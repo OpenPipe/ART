@@ -27,6 +27,13 @@ dependencies = [
     "semver>=3.0.4",
 ]
 
+[project.optional-dependencies]
+swebench = [
+    "modal>=1.0.1",
+    "sweagent",
+    "swebench[modal]>=4.0.3",
+]
+
 [project.scripts]
 art = "art.cli:app"
 stop-server = "art.skypilot.stop_server:main"
@@ -60,3 +67,4 @@ override-dependencies = [
 
 [tool.uv.sources]
 panza = { git = "https://github.com/corbt/panza.git" }
+sweagent = { git = "https://github.com/bradhilton/SWE-agent.git" }

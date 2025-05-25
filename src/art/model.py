@@ -1,23 +1,22 @@
-from openai import AsyncOpenAI
-from typing import cast, Iterable, TYPE_CHECKING, Optional
+import httpx
+from openai import AsyncOpenAI, DefaultAsyncHttpxClient
+from pydantic import BaseModel
+from typing import cast, Generic, Iterable, Optional, TypeVar
 
 from . import dev
 from .backend import Backend
 from .openai import patch_openai
 from .trajectories import Trajectory, TrajectoryGroup
 from .types import TrainConfig
-from pydantic import BaseModel
-from openai import (
-    AsyncOpenAI,
-    DefaultAsyncHttpxClient,
-)
-import httpx
-
-if TYPE_CHECKING:
-    from .backend import Backend
 
 
-class Model(BaseModel):
+ModelConfig = TypeVar("ModelConfig", bound=BaseModel | None)
+
+
+class Model(
+    BaseModel,
+    Generic[ModelConfig],
+):
     """
     A model is an object that can be passed to your `rollout` function, and used
     to log completions. Additionally, a `TrainableModel`, which is a subclass of
@@ -53,8 +52,7 @@ class Model(BaseModel):
     name: str
     project: str
 
-    config: BaseModel | None = None
-    trainable: bool = False
+    config: ModelConfig = None  # type: ignore
 
     # --- Inference connection information (populated automatically for
     #     TrainableModel or set manually for prompted / comparison models) ---
@@ -68,6 +66,10 @@ class Model(BaseModel):
     _s3_bucket: str | None = None
     _s3_prefix: str | None = None
     _openai_client: AsyncOpenAI | None = None
+
+    @property
+    def trainable(self) -> bool:
+        return False
 
     def backend(self) -> "Backend":
         if self._backend is None:
@@ -132,7 +134,7 @@ class Model(BaseModel):
 
     async def log(
         self,
-        trajectories: Iterable[Trajectory] | Iterable[TrajectoryGroup],
+        trajectories: Iterable[Trajectory | BaseException] | Iterable[TrajectoryGroup],
         split: str = "val",
     ) -> None:
         """
@@ -142,9 +144,13 @@ class Model(BaseModel):
             trajectories: A batch of trajectories or trajectory groups.
             split: The evaluation's split. Defaults to "val".
         """
-        if any(isinstance(t, Trajectory) for t in trajectories):
+        if any(isinstance(t, Trajectory) for t in trajectories) or any(
+            isinstance(t, BaseException) for t in trajectories
+        ):
             trajectory_groups = [
-                TrajectoryGroup(cast(Iterable[Trajectory], trajectories))
+                TrajectoryGroup(
+                    cast(Iterable[Trajectory | BaseException], trajectories)
+                )
             ]
         else:
             trajectory_groups = cast(list[TrajectoryGroup], list(trajectories))
@@ -160,26 +166,41 @@ class Model(BaseModel):
 # ---------------------------------------------------------------------------
 
 
-class TrainableModel(Model):
+class TrainableModel(Model[ModelConfig], Generic[ModelConfig]):
     base_model: str
-    trainable: bool = True
 
     # The fields within `_internal_config` are unstable and subject to change.
     # Use at your own risk.
     _internal_config: dev.InternalModelConfig | None = None
 
-    def __init__(self, **data):
-        # Pop any internal config provided at construction and assign it
-        internal_cfg = data.pop("_internal_config", None)
-        super().__init__(**data)
-        if internal_cfg is not None:
+    def __init__(
+        self,
+        *,
+        name: str,
+        project: str,
+        config: ModelConfig | None = None,
+        base_model: str,
+        _internal_config: dev.InternalModelConfig | None = None,
+    ) -> None:
+        super().__init__(
+            name=name,
+            project=project,
+            config=config,
+            base_model=base_model,  # type: ignore
+        )
+        self.base_model = base_model
+        if _internal_config is not None:
             # Bypass BaseModel __setattr__ to allow setting private attr
-            object.__setattr__(self, "_internal_config", internal_cfg)
+            object.__setattr__(self, "_internal_config", _internal_config)
 
     def model_dump(self, *args, **kwargs) -> dict:
         data = super().model_dump(*args, **kwargs)
         data["_internal_config"] = self._internal_config
         return data
+
+    @property
+    def trainable(self) -> bool:
+        return True
 
     async def register(
         self,

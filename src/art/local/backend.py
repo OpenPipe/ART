@@ -273,7 +273,7 @@ class LocalBackend(Backend):
         # Calculate average standard deviation of rewards within groups
         averages["reward_std_dev"] = calculate_step_std_dev(trajectory_groups)
 
-        if model.trainable:
+        if isinstance(model, TrainableModel):
             self._log_metrics(model, averages, split)
 
     def _trajectory_log(self, trajectory: Trajectory) -> str:

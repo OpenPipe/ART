@@ -35,11 +35,10 @@ class ModelConfig(BaseModel):
 async def get_agent_move(
     game: TicTacToeGame,
     player_state: PlayerState,
-    model: art.Model,
-    shadowmaster: art.Model | None = None,
+    model: art.Model[ModelConfig],
+    shadowmaster: art.Model[ModelConfig] | None = None,
     predestined_move: str | None = None,
 ) -> str:
-    assert isinstance(model.config, ModelConfig)
     player_state.trajectory.messages_and_choices.append(
         {"role": "user", "content": render_board(game)}
     )
@@ -47,17 +46,16 @@ async def get_agent_move(
     messages = player_state.trajectory.messages()
     try:
         if shadowmaster and not predestined_move:
-            assert isinstance(shadowmaster.config, ModelConfig)
             shadowmaster_client = shadowmaster.openai_client()
             shadowmaster_completion = await shadowmaster_client.chat.completions.create(
                 model=shadowmaster.get_inference_name(),
                 messages=messages,
-                max_completion_tokens=2000
-                if shadowmaster.config.requires_reasoning
-                else 100,
-                reasoning_effort="low"
-                if shadowmaster.config.requires_reasoning
-                else None,
+                max_completion_tokens=(
+                    2000 if shadowmaster.config.requires_reasoning else 100
+                ),
+                reasoning_effort=(
+                    "low" if shadowmaster.config.requires_reasoning else None
+                ),
                 temperature=1.0,
             )
             predestined_move = shadowmaster_completion.choices[0].message.content
@@ -69,9 +67,11 @@ async def get_agent_move(
             max_completion_tokens=2000 if model.config.requires_reasoning else 100,
             reasoning_effort="low" if model.config.requires_reasoning else None,
             temperature=1.0,
-            extra_body={"guided_choice": [predestined_move]}
-            if predestined_move and model.trainable
-            else None,
+            extra_body=(
+                {"guided_choice": [predestined_move]}
+                if predestined_move and model.trainable
+                else None
+            ),
         )
     except openai.LengthFinishReasonError as e:
         raise e
@@ -164,9 +164,9 @@ async def rollout(
                     player_state=player_state,
                     model=model,
                     shadowmaster=shadowmaster,
-                    predestined_move=scenario.initial_move
-                    if move_number == 0
-                    else None,
+                    predestined_move=(
+                        scenario.initial_move if move_number == 0 else None
+                    ),
                 )
                 if move_number == 0:
                     record_first_move_metrics(player_state.trajectory, square)
@@ -237,9 +237,11 @@ async def rollout(
                             "invalid_move": str(player_state.invalid_move),
                             "symbol": symbol,
                             "shadowmaster": shadowmaster.name if shadowmaster else "",
-                            "initial_move": unwrap_move(scenario.initial_move)
-                            if scenario.initial_move
-                            else "",
+                            "initial_move": (
+                                unwrap_move(scenario.initial_move)
+                                if scenario.initial_move
+                                else ""
+                            ),
                         },
                     },
                     resp_payload=player_state.last_completion,
