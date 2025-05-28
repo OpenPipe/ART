@@ -16,12 +16,14 @@ async def gather_trajectory_groups(
     pbar_desc: str | None = "gather",
     pbar_total_completion_tokens: bool = True,
     max_exceptions: int | float = 0,
+    max_metrics: int | None = None,
 ) -> list[TrajectoryGroup]:
     groups = list(groups)
     context = GatherContext(
         pbar=None,
         pbar_total_completion_tokens=pbar_total_completion_tokens,
         max_exceptions=max_exceptions,
+        max_metrics=max_metrics,
     )
     with set_gather_context(context):
         future = asyncio.gather(*[wrap_group_awaitable(g) for g in groups])
@@ -167,6 +169,7 @@ class GatherContext:
     pbar: tqdm.tqdm | None = None
     metric_sums: Counter[str] = field(default_factory=Counter)
     metric_divisors: Counter[str] = field(default_factory=Counter)
+    max_metrics: int | None = None
     pbar_total_completion_tokens: bool = False
     max_exceptions: int | float = 0
 
@@ -174,7 +177,10 @@ class GatherContext:
         if self.pbar is not None:
             self.pbar.update(n)
             postfix = {}
-            for metric in self.metric_sums:
+            included_metrics = self.metric_sums.keys()
+            if self.max_metrics is not None:
+                included_metrics = list(self.metric_sums.keys())[: self.max_metrics]
+            for metric in included_metrics:
                 sum = self.metric_sums[metric]
                 divisor = max(1, self.metric_divisors[metric])
                 postfix[metric] = sum / divisor
