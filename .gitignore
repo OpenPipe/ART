@@ -13,3 +13,4 @@ dist/
 data/
 replays/
 trajectories/
+.DS_Store
