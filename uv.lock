@@ -2647,6 +2647,25 @@ wheels = [
 ]
 
 [[package]]
+name = "langfuse"
+version = "2.60.7"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "anyio" },
+    { name = "backoff" },
+    { name = "httpx" },
+    { name = "idna" },
+    { name = "packaging" },
+    { name = "pydantic" },
+    { name = "requests" },
+    { name = "wrapt" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/e4/f6/536ac1159e90d6ed16da10fd27225d523c01727e55e557c07b7c5ec5b201/langfuse-2.60.7.tar.gz", hash = "sha256:440783af444cc74efabfcd5c018d3da6080deaea2c9fb3ed3e40c47454250ede", size = 152436 }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/57/e6/62091c18531bd2024d28851ca6eb79668f1835c5376769ce4b0b285d6838/langfuse-2.60.7-py3-none-any.whl", hash = "sha256:9434cd2a8858b6a656ea0de9ad0b469dc5211d6e32a0d5e27aff56034f8d0e41", size = 275447 },
+]
+
+[[package]]
 name = "lark"
 version = "1.2.2"
 source = { registry = "https://pypi.org/simple" }
@@ -3525,7 +3544,6 @@ dependencies = [
     { name = "polars" },
     { name = "seaborn" },
     { name = "semver" },
-    { name = "skypilot", extra = ["aws", "cudo", "do", "gcp", "kubernetes", "runpod"] },
     { name = "tblib" },
     { name = "torch" },
     { name = "torchao" },
@@ -3539,6 +3557,7 @@ dependencies = [
 
 [package.optional-dependencies]
 swebench = [
+    { name = "langfuse" },
     { name = "modal" },
     { name = "sweagent" },
     { name = "swebench" },
@@ -3559,6 +3578,7 @@ requires-dist = [
     { name = "awscli", specifier = ">=1.38.1" },
     { name = "bitsandbytes", marker = "sys_platform == 'linux'", specifier = ">=0.45.2" },
     { name = "hf-xet", specifier = ">=1.1.0" },
+    { name = "langfuse", marker = "extra == 'swebench'", specifier = ">=2.60.7" },
     { name = "litellm", specifier = ">=1.63.0" },
     { name = "matplotlib", specifier = ">=3.10.1" },
     { name = "modal", marker = "extra == 'swebench'", specifier = ">=1.0.1" },
@@ -3568,7 +3588,6 @@ requires-dist = [
     { name = "polars", specifier = ">=1.26.0" },
     { name = "seaborn", specifier = ">=0.13.2" },
     { name = "semver", specifier = ">=3.0.4" },
-    { name = "skypilot", extras = ["aws", "cudo", "do", "fluidstack", "gcp", "kubernetes", "lambda", "paperspace", "runpod"], git = "https://github.com/bradhilton/skypilot.git?rev=c0a40e6c" },
     { name = "sweagent", marker = "extra == 'swebench'", git = "https://github.com/bradhilton/SWE-agent.git" },
     { name = "swebench", extras = ["modal"], marker = "extra == 'swebench'", specifier = ">=4.0.3" },
     { name = "tblib", specifier = ">=3.0.0" },

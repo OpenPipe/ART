@@ -1,7 +1,12 @@
 import art
+from langfuse.decorators import langfuse_context
 from pathlib import Path
 from pydantic import SecretStr
 from sweagent.agent.agents import DefaultAgentConfig, TemplateConfig
+from sweagent.agent.history_processors import (
+    CacheControlHistoryProcessor,
+    DefaultHistoryProcessor,
+)
 from sweagent.agent.models import GenericAPIModelConfig
 from sweagent.agent.problem_statement import TextProblemStatement
 from sweagent.environment.repo import PreExistingRepoConfig
@@ -11,7 +16,7 @@ from sweagent.tools.bundle import Bundle
 from sweagent.tools.parsing import FunctionCallingParser, XMLFunctionCallingParser
 from sweagent.tools.tools import ToolConfig
 from swerex.deployment.config import ModalDeploymentConfig
-from typing import TYPE_CHECKING
+from typing import Any, TYPE_CHECKING
 
 from instances import Instance
 
@@ -139,7 +144,21 @@ Here is a list of all of your changes:
 """.strip()
 
 
-def get_config(model: "art.Model[ModelConfig]", instance: Instance) -> RunSingleConfig:
+def get_config(
+    model: "art.Model[ModelConfig]",
+    instance: Instance,
+    completion_kwargs: dict[str, Any] | None = None,
+) -> RunSingleConfig:
+    if completion_kwargs is None:
+        completion_kwargs = {}
+    completion_kwargs.update(model.config.completion_kwargs.copy())
+    if model.trainable and model.config.xml_function_calling:
+        completion_kwargs["stop"] = "</function>"
+        completion_kwargs["include_stop_str_in_output"] = True
+    completion_kwargs["metadata"] = {
+        "trace_id": langfuse_context.get_current_trace_id(),
+        "parent_observation_id": langfuse_context.get_current_observation_id(),
+    }
     return RunSingleConfig(
         env=EnvironmentConfig(
             deployment=ModalDeploymentConfig(image=instance["image_name"]),
@@ -178,11 +197,7 @@ def get_config(model: "art.Model[ModelConfig]", instance: Instance) -> RunSingle
                 name=f"{'openai/' if model.inference_base_url else ''}{model.get_inference_name()}",
                 max_input_tokens=model.config.max_input_tokens,
                 temperature=1.0,
-                completion_kwargs=(
-                    {"stop": "</function>", "include_stop_str_in_output": True}
-                    if model.config.xml_function_calling
-                    else {}
-                ),
+                completion_kwargs=completion_kwargs,
                 api_base=model.inference_base_url,
                 api_key=(
                     SecretStr(model.inference_api_key)
@@ -190,6 +205,20 @@ def get_config(model: "art.Model[ModelConfig]", instance: Instance) -> RunSingle
                     else None
                 ),
                 per_instance_cost_limit=model.config.per_instance_cost_limit,
+            ),
+            history_processors=(
+                [CacheControlHistoryProcessor()]
+                if any(
+                    claude_keyword in model.name.lower()
+                    for claude_keyword in [
+                        "claude",
+                        "anthropic",
+                        "haiku",
+                        "sonnet",
+                        "opus",
+                    ]
+                )
+                else [DefaultHistoryProcessor()]
             ),
         ),
         problem_statement=TextProblemStatement(text=instance["problem_statement"]),
