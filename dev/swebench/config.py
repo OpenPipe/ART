@@ -172,7 +172,8 @@ def get_config(
                     XML_SYSTEM_TEMPLATE
                     if model.config.xml_function_calling
                     else SYSTEM_TEMPLATE
-                ),
+                )
+                + model.config.system_prompt_suffix,
                 instance_template=INSTANCE_TEMPLATE,
                 next_step_template=NEXT_STEP_TEMPLATE,
                 next_step_no_output_template=NEXT_STEP_NO_OUTPUT_TEMPLATE,

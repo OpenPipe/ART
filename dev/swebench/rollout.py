@@ -28,7 +28,9 @@ class ModelConfig(BaseModel):
     completion_kwargs: dict[str, Any] = {}
     max_input_tokens: int | None = None
     per_instance_cost_limit: float = 0.0
+    system_prompt_suffix: str = ""
     xml_function_calling: bool = False
+
 
 @overload
 async def rollout(
@@ -38,8 +40,7 @@ async def rollout(
     replay_trajectory_path: Path | None = None,
     return_run_single: Literal[False] = False,
     run_in_thread: bool = True,
-) -> art.Trajectory:
-    ...
+) -> art.Trajectory: ...
 
 
 @overload
@@ -51,8 +52,7 @@ async def rollout(
     replay_trajectory_path: Path | None = None,
     return_run_single: Literal[True],
     run_in_thread: bool = True,
-) -> tuple[art.Trajectory, RunSingle]:
-    ...
+) -> tuple[art.Trajectory, RunSingle]: ...
 
 
 @observe(capture_output=False)
