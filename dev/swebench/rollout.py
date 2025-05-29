@@ -14,7 +14,7 @@ from sweagent.types import AgentRunResult
 from swebench.harness.modal_eval.run_evaluation_modal import app, run_instance_modal
 from swebench.harness.test_spec.test_spec import make_test_spec
 from swerex.runtime.abstract import BashAction
-from typing import Any
+from typing import Any, Literal, overload
 
 from config import get_config
 from instances import Instance
@@ -30,6 +30,30 @@ class ModelConfig(BaseModel):
     per_instance_cost_limit: float = 0.0
     xml_function_calling: bool = False
 
+@overload
+async def rollout(
+    model: art.Model[ModelConfig],
+    instance: Instance,
+    completion_kwargs: dict[str, Any] | None = None,
+    replay_trajectory_path: Path | None = None,
+    return_run_single: Literal[False] = False,
+    run_in_thread: bool = True,
+) -> art.Trajectory:
+    ...
+
+
+@overload
+async def rollout(
+    model: art.Model[ModelConfig],
+    instance: Instance,
+    *,
+    completion_kwargs: dict[str, Any] | None = None,
+    replay_trajectory_path: Path | None = None,
+    return_run_single: Literal[True],
+    run_in_thread: bool = True,
+) -> tuple[art.Trajectory, RunSingle]:
+    ...
+
 
 @observe(capture_output=False)
 async def rollout(
@@ -37,8 +61,9 @@ async def rollout(
     instance: Instance,
     completion_kwargs: dict[str, Any] | None = None,
     replay_trajectory_path: Path | None = None,
+    return_run_single: bool = False,
     run_in_thread: bool = True,
-) -> tuple[art.Trajectory, RunSingle]:
+) -> art.Trajectory | tuple[art.Trajectory, RunSingle]:
     trajectory = art.Trajectory(messages_and_choices=[], reward=0.0)
     config = get_config(model, instance, completion_kwargs)
     if run_in_thread:
@@ -75,7 +100,10 @@ async def rollout(
         )
     assert isinstance(run_single.agent, DefaultAgent)
     trajectory.messages_and_choices = run_single.agent.history
-    return trajectory, run_single
+    if return_run_single:
+        return trajectory, run_single
+    else:
+        return trajectory
 
 
 class RewardRunHook(RunHook):
