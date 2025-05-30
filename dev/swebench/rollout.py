@@ -5,6 +5,7 @@ from langfuse import Langfuse
 from langfuse.decorators import langfuse_context, observe
 from langfuse.types import SpanLevel
 import litellm
+import logging
 from logging import Handler, LogRecord
 from pathlib import Path
 from pydantic import BaseModel
@@ -29,6 +30,9 @@ from instances import Instance
 # Add Langfuse callbacks for SWE-agent litellm calls
 litellm.success_callback.append("langfuse")
 litellm.failure_callback.append("langfuse")
+
+# Suppress urllib3 retry warnings
+logging.getLogger("urllib3.connectionpool").setLevel(logging.ERROR)
 
 # Disable printing the patch message to reduce log noise
 SaveApplyPatchHook._print_patch_message = lambda *args, **kwargs: None
