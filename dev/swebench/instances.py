@@ -14,6 +14,7 @@ class Instance(TypedDict):
     image_name: str
     base_commit: str
     problem_statement: str
+    use_swebench_modal_harness: bool
     test_patch: NotRequired[str]
     hints_text: NotRequired[str]
     version: NotRequired[str]
@@ -33,6 +34,7 @@ def get_filtered_swe_smith_instances_df() -> pl.DataFrame:
         base_commit=pl.col("instance_id"),
         image_name="jyangballin/"
         + pl.col("image_name").cast(pl.Utf8).str.replace("__", "_1776_"),
+        use_swebench_modal_harness=False,
     )
 
 
@@ -43,4 +45,5 @@ def get_swe_bench_verified_instances_df() -> pl.DataFrame:
         created_at=pl.col("created_at").str.strptime(pl.Datetime),
         image_name="swebench/sweb.eval.x86_64."
         + pl.col("instance_id").str.replace("__", "_1776_"),
+        use_swebench_modal_harness=True,
     )
