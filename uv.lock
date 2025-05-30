@@ -5100,14 +5100,14 @@ wheels = [
 
 [[package]]
 name = "rich-argparse"
-version = "1.7.0"
+version = "1.7.1"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "rich" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/aa/b9/ff53663ee7fa6a4195fa96d91da499f2e00ca067541e016d345cce1c9ad2/rich_argparse-1.7.0.tar.gz", hash = "sha256:f31d809c465ee43f367d599ccaf88b73bc2c4d75d74ed43f2d538838c53544ba", size = 38009 }
+sdist = { url = "https://files.pythonhosted.org/packages/71/a6/34460d81e5534f6d2fc8e8d91ff99a5835fdca53578eac89e4f37b3a7c6d/rich_argparse-1.7.1.tar.gz", hash = "sha256:d7a493cde94043e41ea68fb43a74405fa178de981bf7b800f7a3bd02ac5c27be", size = 38094 }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/bb/9c/dc7cbeb99a7b7422392ed7f327efdbb958bc0faf424aef5f130309320bda/rich_argparse-1.7.0-py3-none-any.whl", hash = "sha256:b8ec8943588e9731967f4f97b735b03dc127c416f480a083060433a97baf2fd3", size = 25339 },
+    { url = "https://files.pythonhosted.org/packages/31/f6/5fc0574af5379606ffd57a4b68ed88f9b415eb222047fe023aefcc00a648/rich_argparse-1.7.1-py3-none-any.whl", hash = "sha256:a8650b42e4a4ff72127837632fba6b7da40784842f08d7395eb67a9cbd7b4bf9", size = 25357 },
 ]
 
 [[package]]
@@ -5758,7 +5758,7 @@ wheels = [
 [[package]]
 name = "sweagent"
 version = "1.1.0"
-source = { git = "https://github.com/bradhilton/SWE-agent.git#d2290d564eb72f555d53e0aa197b8f95d5d5c44f" }
+source = { git = "https://github.com/bradhilton/SWE-agent.git#c6fef776583117261e3ab87724f68352c911ce27" }
 dependencies = [
     { name = "datasets" },
     { name = "flask" },

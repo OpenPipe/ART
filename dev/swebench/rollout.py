@@ -9,6 +9,8 @@ from logging import Handler, LogRecord
 from pathlib import Path
 from pydantic import BaseModel
 import re
+import requests
+from requests import adapters as requests_adapters
 from sweagent.agent.agents import DefaultAgent, DefaultAgentConfig
 from sweagent.run.hooks.abstract import RunHook
 from sweagent.run.hooks.apply_patch import SaveApplyPatchHook
@@ -17,6 +19,7 @@ from sweagent.run.run_single import RunSingle, RunSingleConfig
 from sweagent.types import AgentRunResult
 from swebench.harness.modal_eval.run_evaluation_modal import app, run_instance_modal
 from swebench.harness.test_spec.test_spec import make_test_spec
+from swerex.deployment.modal import ModalDeployment
 from swerex.runtime.abstract import BashAction
 from typing import Any, Literal, overload
 
@@ -82,6 +85,7 @@ async def rollout(
     run_single.agent.logger.addHandler(
         LangfuseHandler(langfuse_context.get_current_trace_id() or "")
     )
+    patch_get_model_requery_history(run_single.agent)
     if replay_trajectory_path:
         run_replay = RunReplay(
             traj_path=replay_trajectory_path,
@@ -99,6 +103,8 @@ async def rollout(
     trajectory = art.Trajectory(
         messages_and_choices=[], reward=0.0, tools=config.agent.tools.tools
     )
+    if isinstance(run_single.env.deployment, ModalDeployment):
+        run_single.add_hook(PatchRuntimeRunHook(run_single.env.deployment))
     if not instance["use_swebench_modal_harness"]:
         run_single.add_hook(RewardRunHook(instance, trajectory, run_single))
     if run_in_thread:
@@ -141,6 +147,55 @@ class LangfuseHandler(Handler):
             level=levels[record.levelname],
             status_message=record.getMessage(),
         )
+        self.langfuse.flush()
+
+
+def patch_get_model_requery_history(agent: DefaultAgent) -> None:
+    get_model_requery_history = agent.get_model_requery_history
+
+    def _get_model_requery_history(
+        error_template: str, *, output: str, **kwargs: str | int | float | bool | None
+    ) -> list[dict[str, str]]:
+        history = get_model_requery_history(error_template, output=output, **kwargs)
+        agent.history = history
+        return history
+
+    agent.get_model_requery_history = _get_model_requery_history
+
+
+class PatchRuntimeRunHook(RunHook):
+    """
+    Custom run hook to patch the runtime of the deployment
+    """
+
+    def __init__(self, deployment: ModalDeployment) -> None:
+        self.deployment = deployment
+
+    def on_instance_start(self, *args: Any, **kwargs: Any) -> None:
+        runtime = self.deployment.runtime
+        session = requests.Session()
+        retry = requests_adapters.Retry(
+            total=3,
+            backoff_factor=0.1,  # type: ignore
+            status_forcelist=[500, 502, 503, 504],
+            allowed_methods=["POST"],
+        )
+        adapter = requests_adapters.HTTPAdapter(max_retries=retry)
+        session.mount("http://", adapter)
+        session.mount("https://", adapter)
+
+        def _request(
+            endpoint: str, request: BaseModel | None, output_class: Any
+        ) -> Any:
+            response = session.post(
+                f"{runtime._api_url}/{endpoint}",
+                json=request.model_dump() if request else None,
+                headers=runtime._headers,
+            )
+            runtime._handle_response_errors(response)
+            return output_class(**response.json())
+
+        runtime._request = _request
 
 
 class RewardRunHook(RunHook):

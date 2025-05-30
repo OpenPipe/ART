@@ -194,19 +194,6 @@ def get_config(
                     "SUBMIT_REVIEW_MESSAGES": [SUBMIT_REVIEW_MESSAGE],
                 },
             ),
-            model=GenericAPIModelConfig(
-                name=f"{'openai/' if model.inference_base_url else ''}{model.get_inference_name()}",
-                max_input_tokens=model.config.max_input_tokens,
-                temperature=1.0,
-                completion_kwargs=completion_kwargs,
-                api_base=model.inference_base_url,
-                api_key=(
-                    SecretStr(model.inference_api_key)
-                    if model.inference_api_key
-                    else None
-                ),
-                per_instance_cost_limit=model.config.per_instance_cost_limit,
-            ),
             history_processors=(
                 [CacheControlHistoryProcessor()]
                 if any(
@@ -221,6 +208,20 @@ def get_config(
                 )
                 else [DefaultHistoryProcessor()]
             ),
+            model=GenericAPIModelConfig(
+                name=f"{'openai/' if model.inference_base_url else ''}{model.get_inference_name()}",
+                max_input_tokens=model.config.max_input_tokens,
+                temperature=1.0,
+                completion_kwargs=completion_kwargs,
+                api_base=model.inference_base_url,
+                api_key=(
+                    SecretStr(model.inference_api_key)
+                    if model.inference_api_key
+                    else None
+                ),
+                per_instance_cost_limit=model.config.per_instance_cost_limit,
+            ),
+            max_requeries=2,
         ),
         problem_statement=TextProblemStatement(text=instance["problem_statement"]),
     )
