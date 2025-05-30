@@ -11,6 +11,7 @@ from .utils import (
     wait_for_art_server_to_start,
     get_art_server_base_url,
     get_vllm_base_url,
+    get_task_job_id,
 )
 
 from .. import dev
@@ -38,6 +39,7 @@ class SkyPilotBackend(Backend):
         self = cls.__new__(cls)
         self._cluster_name = cluster_name
         self._envs = {}
+        self._art_server_job_id = None
 
         if env_path is not None:
             self._envs = dotenv_values(env_path)
@@ -66,13 +68,14 @@ class SkyPilotBackend(Backend):
 
         # check if cluster already exists
         cluster_status = await to_thread_typed(
-            lambda: sky.status(cluster_names=[self._cluster_name])
+            lambda: sky.stream_and_get(sky.status(cluster_names=[self._cluster_name]))
         )
         if (
             len(cluster_status) == 0
             or cluster_status[0]["status"] != sky.ClusterStatus.UP
         ):
             await self._launch_cluster(resources, art_version)
+
         else:
             print(f"Cluster {self._cluster_name} exists, using it...")
 
@@ -90,31 +93,43 @@ class SkyPilotBackend(Backend):
             art_server_running = False
 
         if art_server_running:
+            self._art_server_job_id = await get_task_job_id(
+                cluster_name=self._cluster_name, task_name="art_server"
+            )
             print("Art server task already running, using it…")
         else:
             art_server_task = sky.Task(name="art_server", run="uv run art")
-            resources = await to_thread_typed(
-                lambda: sky.status(cluster_names=[self._cluster_name])[0][
-                    "handle"
-                ].launched_resources
+
+            clusters = await to_thread_typed(
+                lambda: sky.stream_and_get(
+                    sky.status(cluster_names=[self._cluster_name])
+                )
             )
+            resources = clusters[0]["handle"].launched_resources
+
+            # For some reason, skypilot doesn't support the region and zone set
+            resources = resources.copy(region=None, zone=None)
 
             # If a local path was provided for art_version, ensure it is mounted so the latest
             # code is synced to the remote cluster every time we (re)launch the art_server task.
             if art_version is not None and os.path.exists(art_version):
                 art_server_task.workdir = art_version
 
+            # print(clusters[0]["handle"].launched_resources)
             art_server_task.set_resources(cast(sky.Resources, resources))
             art_server_task.update_envs(self._envs)
 
             # run art server task
-            await to_thread_typed(
-                lambda: sky.exec(
-                    task=art_server_task,
-                    cluster_name=self._cluster_name,
-                    detach_run=True,
+            job_id, _ = await to_thread_typed(
+                lambda: sky.stream_and_get(
+                    sky.exec(
+                        task=art_server_task,
+                        cluster_name=self._cluster_name,
+                    )
                 )
             )
+            self._art_server_job_id = job_id
+
             print("Task launched, waiting for it to start...")
             await wait_for_art_server_to_start(cluster_name=self._cluster_name)
             print("Art server task started")
@@ -123,8 +138,17 @@ class SkyPilotBackend(Backend):
         print(f"Using base_url: {base_url}")
 
         # Manually call the real __init__ now that base_url is ready
-        super(SkyPilotBackend, self).__init__(base_url=base_url)
+        super(cls, self).__init__(base_url=base_url)
 
+        if self._art_server_job_id is not None:
+            asyncio.create_task(
+                asyncio.to_thread(
+                    sky.tail_logs,
+                    cluster_name=self._cluster_name,
+                    job_id=self._art_server_job_id,
+                    follow=True,
+                )
+            )
         return self
 
     async def _launch_cluster(
@@ -175,13 +199,22 @@ class SkyPilotBackend(Backend):
         task.setup = setup_script
 
         try:
-            await to_thread_typed(
-                lambda: sky.launch(
-                    task=task,
-                    cluster_name=self._cluster_name,
-                    retry_until_up=True,
+            job_id, _ = await to_thread_typed(
+                lambda: sky.stream_and_get(
+                    sky.launch(
+                        task=task, cluster_name=self._cluster_name, retry_until_up=True
+                    )
                 )
             )
+
+            await to_thread_typed(
+                lambda: sky.tail_logs(
+                    cluster_name=self._cluster_name,
+                    job_id=job_id,
+                    follow=True,
+                )
+            )
+
         except Exception as e:
             print(f"Error launching cluster: {e}")
             print()
@@ -220,4 +253,6 @@ class SkyPilotBackend(Backend):
         return (vllm_base_url, api_key)
 
     async def down(self) -> None:
-        await to_thread_typed(lambda: sky.down(cluster_name=self._cluster_name))
+        await to_thread_typed(
+            lambda: sky.stream_and_get(sky.down(cluster_name=self._cluster_name))
+        )
