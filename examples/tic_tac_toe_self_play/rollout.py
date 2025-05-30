@@ -16,6 +16,7 @@ from game_utils import (
     render_board,
     unwrap_move,
 )
+from art.guided_completion import get_guided_completion_params
 
 load_dotenv()
 
@@ -46,6 +47,7 @@ async def get_agent_move(
 
     messages = player_state.trajectory.messages()
     try:
+        guided_choice = None
         if shadowmaster and not predestined_move:
             assert isinstance(shadowmaster.config, ModelConfig)
             shadowmaster_client = shadowmaster.openai_client()
@@ -60,7 +62,7 @@ async def get_agent_move(
                 else None,
                 temperature=1.0,
             )
-            predestined_move = shadowmaster_completion.choices[0].message.content
+            guided_choice, _, _ = get_guided_completion_params(shadowmaster_completion)
 
         client = model.openai_client()
         completion = await client.chat.completions.create(
@@ -69,7 +71,7 @@ async def get_agent_move(
             max_completion_tokens=2000 if model.config.requires_reasoning else 100,
             reasoning_effort="low" if model.config.requires_reasoning else None,
             temperature=1.0,
-            extra_body={"guided_choice": [predestined_move]}
+            extra_body={"guided_choice": guided_choice}
             if predestined_move and model.trainable
             else None,
         )
