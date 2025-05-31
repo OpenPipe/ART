@@ -200,6 +200,19 @@ class PatchRuntimeRunHook(RunHook):
             return output_class(**response.json())
 
         runtime._request = _request
+        
+        # Patch the runtime to use longer default timeouts for commands
+        original_run_in_session = runtime.run_in_session
+        
+        def patched_run_in_session(action):
+            # If it's a BashAction without explicit timeout, add a longer one
+            if hasattr(action, 'timeout') and action.timeout is None:
+                action.timeout = 300.0  # 5 minutes default
+            elif hasattr(action, 'timeout') and action.timeout == 30.0:
+                action.timeout = 300.0  # Override the default 30s timeout
+            return original_run_in_session(action)
+        
+        runtime.run_in_session = patched_run_in_session
 
 
 class RewardRunHook(RunHook):
@@ -239,6 +252,7 @@ class RewardRunHook(RunHook):
                 BashAction(
                     command=f"cd /testbed && python -m pytest {' '.join(tests)}",
                     check="silent",
+                    timeout=300.0,  # Increase timeout to 5 minutes
                 )
             )
         )

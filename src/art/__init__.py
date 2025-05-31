@@ -12,6 +12,7 @@ if os.environ.get("IMPORT_UNSLOTH", "0") == "1":
 
 from . import dev
 from .backend import Backend
+from .batches import trajectory_group_batches
 from .gather import gather_trajectories, gather_trajectory_groups
 from .model import Model, TrainableModel
 from .trajectories import Trajectory, TrajectoryGroup
@@ -22,6 +23,7 @@ __all__ = [
     "dev",
     "gather_trajectories",
     "gather_trajectory_groups",
+    "trajectory_group_batches",
     "Backend",
     "Messages",
     "MessagesAndChoices",

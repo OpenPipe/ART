@@ -196,6 +196,13 @@ class GatherContext:
             return False
         return True
 
+    def reset(self) -> None:
+        self.pbar = None
+        self.metric_sums = Counter()
+        self.metric_divisors = Counter()
+        self.pbar_total_completion_tokens = False
+        self.max_exceptions = 0
+
 
 gather_context_var = contextvars.ContextVar("gather_context", default=GatherContext())
 
