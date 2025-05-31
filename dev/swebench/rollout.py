@@ -265,21 +265,32 @@ class RewardRunHook(RunHook):
         )
 
     def _get_test_results(self, tests: list[str]) -> tuple[int, int]:
-        observation = asyncio.run(
-            self.run_single.env.deployment.runtime.run_in_session(
-                BashAction(
-                    command=f"cd /testbed && python -m pytest {' '.join(shlex.quote(test) for test in tests)}",
-                    check="silent",
-                    timeout=1200.0,
-                )
-            )
-        )
-        summary_line = observation.output.splitlines()[-1]
-        failed_match = re.search(r"(\d+)\s+failed", summary_line)
-        passed_match = re.search(r"(\d+)\s+passed", summary_line)
-        num_failed = int(failed_match.group(1)) if failed_match else 0
-        num_passed = int(passed_match.group(1)) if passed_match else 0
-        return num_failed, num_passed
+        if not tests:
+            return 0, 0
+        
+        base_cmd = "cd /testbed && python -m pytest "
+        max_len = 16384
+        results = []
+        batch, batch_len = [], 0
+        for test in tests + [None]:  # Sentinel to trigger final batch
+            if test is None or (batch and batch_len + len(shlex.quote(test or '')) + 1 > max_len):
+                if batch:
+                    command = f"{base_cmd}{' '.join(map(shlex.quote, batch))}"
+                    output = asyncio.run(self.run_single.env.deployment.runtime.run_in_session(
+                        BashAction(command=command, 
+                                    check="silent", timeout=1200.0)
+                    )).output
+                    if lines := output.splitlines():
+                        s = lines[-1]
+                        failed = int(m.group(1)) if (m := re.search(r"(\d+)\s+failed", s)) else 0
+                        passed = int(m.group(1)) if (m := re.search(r"(\d+)\s+passed", s)) else 0
+                        results.append((failed, passed))
+                    batch, batch_len = [], 0
+            if test:
+                batch.append(test)
+                batch_len += len(shlex.quote(test)) + 1
+        
+        return (sum(f for f, _ in results), sum(p for _, p in results)) if results else (0, 0)
 
 
 async def update_trajectory_with_swebench_modal_harness(
