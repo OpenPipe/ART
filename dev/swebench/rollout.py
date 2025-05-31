@@ -12,6 +12,7 @@ from pydantic import BaseModel
 import re
 import requests
 from requests import adapters as requests_adapters
+import shlex
 from sweagent.agent.agents import DefaultAgent, DefaultAgentConfig
 from sweagent.run.hooks.abstract import RunHook
 from sweagent.run.hooks.apply_patch import SaveApplyPatchHook
@@ -267,7 +268,7 @@ class RewardRunHook(RunHook):
         observation = asyncio.run(
             self.run_single.env.deployment.runtime.run_in_session(
                 BashAction(
-                    command=f"cd /testbed && python -m pytest {' '.join(tests)}",
+                    command=f"cd /testbed && python -m pytest {' '.join(shlex.quote(test) for test in tests)}",
                     check="silent",
                     timeout=1200.0,
                 )
