@@ -34,6 +34,25 @@ litellm.failure_callback.append("langfuse")
 # Suppress urllib3 retry warnings
 logging.getLogger("urllib3.connectionpool").setLevel(logging.ERROR)
 
+# Custom filter to suppress swerex and rex-deploy related critical logs
+class SuppressSwerexLogsFilter(logging.Filter):
+    def filter(self, record):
+        # Suppress logs from rex-deploy loggers
+        if record.name.startswith('rex-deploy'):
+            return False
+        # Suppress swerex exception logs
+        if 'swerex.exceptions' in record.getMessage() or 'swerex.exceptions' in str(record.exc_info):
+            return False
+        # Suppress CommandTimeoutError and BashIncorrectSyntaxError logs
+        if any(error in record.getMessage() for error in [
+            'CommandTimeoutError', 'BashIncorrectSyntaxError', 'pexpect.exceptions.TIMEOUT'
+        ]):
+            return False
+        return True
+
+# Apply the filter to the root logger to catch all logs
+logging.getLogger().addFilter(SuppressSwerexLogsFilter())
+
 # Disable printing the patch message to reduce log noise
 SaveApplyPatchHook._print_patch_message = lambda *args, **kwargs: None
 
@@ -86,6 +105,7 @@ async def rollout(
         run_single = RunSingle.from_config(config)
     assert isinstance(run_single.agent, DefaultAgent)
     run_single.agent.logger.propagate = False
+    run_single.agent.logger.handlers = []
     run_single.agent.logger.addHandler(
         LangfuseHandler(langfuse_context.get_current_trace_id() or "")
     )
@@ -138,9 +158,9 @@ class LangfuseHandler(Handler):
         super().__init__()
 
     def emit(self, record: LogRecord) -> None:
+        if record.levelname in ["DEBUG", "INFO"]:
+            return
         levels: dict[str, SpanLevel] = {
-            "DEBUG": "DEBUG",
-            "INFO": "DEFAULT",
             "WARNING": "WARNING",
             "ERROR": "ERROR",
             "CRITICAL": "ERROR",
@@ -205,11 +225,8 @@ class PatchRuntimeRunHook(RunHook):
         original_run_in_session = runtime.run_in_session
         
         def patched_run_in_session(action):
-            # If it's a BashAction without explicit timeout, add a longer one
-            if hasattr(action, 'timeout') and action.timeout is None:
-                action.timeout = 300.0  # 5 minutes default
-            elif hasattr(action, 'timeout') and action.timeout == 30.0:
-                action.timeout = 300.0  # Override the default 30s timeout
+            if hasattr(action, 'timeout') and action.timeout == 30.0:
+                action.timeout = 120.0
             return original_run_in_session(action)
         
         runtime.run_in_session = patched_run_in_session
@@ -252,7 +269,7 @@ class RewardRunHook(RunHook):
                 BashAction(
                     command=f"cd /testbed && python -m pytest {' '.join(tests)}",
                     check="silent",
-                    timeout=300.0,  # Increase timeout to 5 minutes
+                    timeout=1200.0,
                 )
             )
         )
