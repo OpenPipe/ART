@@ -35,21 +35,30 @@ litellm.failure_callback.append("langfuse")
 # Suppress urllib3 retry warnings
 logging.getLogger("urllib3.connectionpool").setLevel(logging.ERROR)
 
+
 # Custom filter to suppress swerex and rex-deploy related critical logs
 class SuppressSwerexLogsFilter(logging.Filter):
     def filter(self, record):
         # Suppress logs from rex-deploy loggers
-        if record.name.startswith('rex-deploy'):
+        if record.name.startswith("rex-deploy"):
             return False
         # Suppress swerex exception logs
-        if 'swerex.exceptions' in record.getMessage() or 'swerex.exceptions' in str(record.exc_info):
+        if "swerex.exceptions" in record.getMessage() or "swerex.exceptions" in str(
+            record.exc_info
+        ):
             return False
         # Suppress CommandTimeoutError and BashIncorrectSyntaxError logs
-        if any(error in record.getMessage() for error in [
-            'CommandTimeoutError', 'BashIncorrectSyntaxError', 'pexpect.exceptions.TIMEOUT'
-        ]):
+        if any(
+            error in record.getMessage()
+            for error in [
+                "CommandTimeoutError",
+                "BashIncorrectSyntaxError",
+                "pexpect.exceptions.TIMEOUT",
+            ]
+        ):
             return False
         return True
+
 
 # Apply the filter to the root logger to catch all logs
 logging.getLogger().addFilter(SuppressSwerexLogsFilter())
@@ -221,15 +230,15 @@ class PatchRuntimeRunHook(RunHook):
             return output_class(**response.json())
 
         runtime._request = _request
-        
+
         # Patch the runtime to use longer default timeouts for commands
         original_run_in_session = runtime.run_in_session
-        
+
         def patched_run_in_session(action):
-            if hasattr(action, 'timeout') and action.timeout == 30.0:
+            if hasattr(action, "timeout") and action.timeout == 30.0:
                 action.timeout = 120.0
             return original_run_in_session(action)
-        
+
         runtime.run_in_session = patched_run_in_session
 
 
@@ -267,30 +276,45 @@ class RewardRunHook(RunHook):
     def _get_test_results(self, tests: list[str]) -> tuple[int, int]:
         if not tests:
             return 0, 0
-        
+
         base_cmd = "cd /testbed && python -m pytest "
         max_len = 16384
         results = []
         batch, batch_len = [], 0
         for test in tests + [None]:  # Sentinel to trigger final batch
-            if test is None or (batch and batch_len + len(shlex.quote(test or '')) + 1 > max_len):
+            if test is None or (
+                batch and batch_len + len(shlex.quote(test or "")) + 1 > max_len
+            ):
                 if batch:
                     command = f"{base_cmd}{' '.join(map(shlex.quote, batch))}"
-                    output = asyncio.run(self.run_single.env.deployment.runtime.run_in_session(
-                        BashAction(command=command, 
-                                    check="silent", timeout=1200.0)
-                    )).output
+                    output = asyncio.run(
+                        self.run_single.env.deployment.runtime.run_in_session(
+                            BashAction(command=command, check="silent", timeout=1200.0)
+                        )
+                    ).output
                     if lines := output.splitlines():
                         s = lines[-1]
-                        failed = int(m.group(1)) if (m := re.search(r"(\d+)\s+failed", s)) else 0
-                        passed = int(m.group(1)) if (m := re.search(r"(\d+)\s+passed", s)) else 0
+                        failed = (
+                            int(m.group(1))
+                            if (m := re.search(r"(\d+)\s+failed", s))
+                            else 0
+                        )
+                        passed = (
+                            int(m.group(1))
+                            if (m := re.search(r"(\d+)\s+passed", s))
+                            else 0
+                        )
                         results.append((failed, passed))
                     batch, batch_len = [], 0
             if test:
                 batch.append(test)
                 batch_len += len(shlex.quote(test)) + 1
-        
-        return (sum(f for f, _ in results), sum(p for _, p in results)) if results else (0, 0)
+
+        return (
+            (sum(f for f, _ in results), sum(p for _, p in results))
+            if results
+            else (0, 0)
+        )
 
 
 async def update_trajectory_with_swebench_modal_harness(
