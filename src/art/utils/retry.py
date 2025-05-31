@@ -6,14 +6,14 @@ import inspect
 from typing import (
     Any,
     Callable,
-    Coroutine,
     TypeVar,
     Optional,
-    Union,
+    ParamSpec,
 )
 
-T = TypeVar("T")
+P = ParamSpec("P")
 R = TypeVar("R")
+T = TypeVar("T")
 
 
 def retry(
@@ -23,8 +23,8 @@ def retry(
     exceptions: tuple = (Exception,),
     on_retry: Optional[Callable[[Exception, int], None]] = None,
 ) -> Callable[
-    [Callable[..., Union[T, Coroutine[Any, Any, R]]]],
-    Callable[..., Union[T, Coroutine[Any, Any, R]]],
+    [Callable[P, R]],
+    Callable[P, R],
 ]:
     """
     Retry decorator with exponential backoff for both synchronous and asynchronous functions.
@@ -40,65 +40,68 @@ def retry(
         Decorated function that will retry on specified exceptions
     """
 
-    def decorator(func):
-        is_coroutine = inspect.iscoroutinefunction(func)
+    def decorator(func: Callable[P, R]) -> Callable[P, R]:
+        if inspect.iscoroutinefunction(func):
 
-        @functools.wraps(func)
-        def sync_wrapper(*args: Any, **kwargs: Any) -> T:
-            last_exception = None
-            current_delay = delay
+            @functools.wraps(func)
+            async def async_wrapper(*args: P.args, **kwargs: P.kwargs) -> Any:
+                last_exception = None
+                current_delay = delay
 
-            for attempt in range(1, max_attempts + 1):
-                try:
-                    return func(*args, **kwargs)
-                except exceptions as e:
-                    last_exception = e
+                for attempt in range(1, max_attempts + 1):
+                    try:
+                        return await func(*args, **kwargs)
+                    except exceptions as e:
+                        last_exception = e
 
-                    if attempt == max_attempts:
-                        raise
+                        if attempt == max_attempts:
+                            raise
 
-                    if on_retry:
-                        on_retry(e, attempt)
-                    else:
-                        logging.warning(
-                            f"Retry {attempt}/{max_attempts} for {func.__name__} "
-                            f"after error: {str(e)}"
-                        )
+                        if on_retry:
+                            on_retry(e, attempt)
+                        else:
+                            logging.warning(
+                                f"Retry {attempt}/{max_attempts} for {func.__name__} "
+                                f"after error: {str(e)}"
+                            )
 
-                    time.sleep(current_delay)
-                    current_delay *= backoff_factor
+                        await asyncio.sleep(current_delay)
+                        current_delay *= backoff_factor
 
-            assert last_exception is not None
-            raise last_exception
+                assert last_exception is not None
+                raise last_exception
 
-        @functools.wraps(func)
-        async def async_wrapper(*args: Any, **kwargs: Any) -> R:
-            last_exception = None
-            current_delay = delay
+            return async_wrapper  # type: ignore
+        else:
 
-            for attempt in range(1, max_attempts + 1):
-                try:
-                    return await func(*args, **kwargs)
-                except exceptions as e:
-                    last_exception = e
+            @functools.wraps(func)
+            def sync_wrapper(*args: P.args, **kwargs: P.kwargs) -> R:
+                last_exception = None
+                current_delay = delay
 
-                    if attempt == max_attempts:
-                        raise
+                for attempt in range(1, max_attempts + 1):
+                    try:
+                        return func(*args, **kwargs)
+                    except exceptions as e:
+                        last_exception = e
 
-                    if on_retry:
-                        on_retry(e, attempt)
-                    else:
-                        logging.warning(
-                            f"Retry {attempt}/{max_attempts} for {func.__name__} "
-                            f"after error: {str(e)}"
-                        )
+                        if attempt == max_attempts:
+                            raise
 
-                    await asyncio.sleep(current_delay)
-                    current_delay *= backoff_factor
+                        if on_retry:
+                            on_retry(e, attempt)
+                        else:
+                            logging.warning(
+                                f"Retry {attempt}/{max_attempts} for {func.__name__} "
+                                f"after error: {str(e)}"
+                            )
 
-            assert last_exception is not None
-            raise last_exception
+                        time.sleep(current_delay)
+                        current_delay *= backoff_factor
 
-        return async_wrapper if is_coroutine else sync_wrapper
+                assert last_exception is not None
+                raise last_exception
+
+            return sync_wrapper
 
     return decorator
