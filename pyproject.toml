@@ -60,6 +60,8 @@ dev-dependencies = [
     "openpipe>=4.49.0",
     "skypilot[aws,cudo,do,fluidstack,gcp,kubernetes,lambda,paperspace,runpod]",
     "hatch>=1.14.1",
+    "rich>=14.0.0",
+    "requests>=2.32.3",
 ]
 override-dependencies = [
     "bitsandbytes; sys_platform == 'linux'",

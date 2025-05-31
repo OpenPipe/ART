@@ -12,7 +12,6 @@ from pydantic import BaseModel
 import re
 import requests
 from requests import adapters as requests_adapters
-from requests.exceptions import ConnectTimeout, SSLError
 import shlex
 from sweagent.agent.agents import DefaultAgent, DefaultAgentConfig
 from sweagent.run.hooks.abstract import RunHook
@@ -100,7 +99,6 @@ async def rollout(
 
 
 @observe(capture_output=False)
-@art.retry(max_attempts=2, exceptions=(ConnectTimeout, SSLError))
 async def rollout(
     model: art.Model[ModelConfig],
     instance: Instance,
@@ -294,6 +292,7 @@ class RewardRunHook(RunHook):
         if not tests:
             return 0, 0
 
+        # We batch tests to avoid exceeding the max command length
         base_cmd = "cd /testbed && python -m pytest "
         max_len = 16384
         results = []
@@ -394,5 +393,5 @@ def update_trajectory(
     trajectory.reward = (
         (net_change / len(instance["FAIL_TO_PASS"])) ** reward_power
         if net_change > 0
-        else net_change / len(instance["PASS_TO_PASS"])
+        else net_change / max(len(instance["PASS_TO_PASS"]), 1)
     )
