@@ -16,6 +16,7 @@ from game_utils import (
     render_board,
     unwrap_move,
 )
+from art.guided_completion import get_guided_completion_params
 
 load_dotenv()
 
@@ -36,7 +37,7 @@ async def get_agent_move(
     game: TicTacToeGame,
     player_state: PlayerState,
     model: art.Model[ModelConfig],
-    shadowmaster: art.Model[ModelConfig] | None = None,
+    teacher: art.Model[ModelConfig] | None = None,
     predestined_move: str | None = None,
 ) -> str:
     player_state.trajectory.messages_and_choices.append(
@@ -45,20 +46,20 @@ async def get_agent_move(
 
     messages = player_state.trajectory.messages()
     try:
-        if shadowmaster and not predestined_move:
-            shadowmaster_client = shadowmaster.openai_client()
-            shadowmaster_completion = await shadowmaster_client.chat.completions.create(
-                model=shadowmaster.get_inference_name(),
+        guided_choice = None
+        if teacher and not predestined_move:
+            assert isinstance(teacher.config, ModelConfig)
+            teacher_client = teacher.openai_client()
+            teacher_completion = await teacher_client.chat.completions.create(
+                model=teacher.get_inference_name(),
                 messages=messages,
                 max_completion_tokens=(
-                    2000 if shadowmaster.config.requires_reasoning else 100
+                    2000 if teacher.config.requires_reasoning else 100
                 ),
-                reasoning_effort=(
-                    "low" if shadowmaster.config.requires_reasoning else None
-                ),
+                reasoning_effort="low" if teacher.config.requires_reasoning else None,
                 temperature=1.0,
             )
-            predestined_move = shadowmaster_completion.choices[0].message.content
+            guided_choice, _, _ = get_guided_completion_params(teacher_completion)
 
         client = model.openai_client()
         completion = await client.chat.completions.create(
@@ -68,7 +69,7 @@ async def get_agent_move(
             reasoning_effort="low" if model.config.requires_reasoning else None,
             temperature=1.0,
             extra_body=(
-                {"guided_choice": [predestined_move]}
+                {"guided_choice": guided_choice}
                 if predestined_move and model.trainable
                 else None
             ),
@@ -102,8 +103,8 @@ def record_first_move_metrics(trajectory: art.Trajectory, square: str) -> None:
 class TicTacToeScenario(BaseModel):
     step: int
     split: str
-    x_shadowmaster: art.Model | None = None
-    o_shadowmaster: art.Model | None = None
+    x_teacher: art.Model | None = None
+    o_teacher: art.Model | None = None
     initial_move: str | None = None
 
 
@@ -154,16 +155,14 @@ async def rollout(
         for symbol in ["x", "o"]:
             model = x_model if symbol == "x" else o_model
             player_state = player_states[symbol]
-            shadowmaster = (
-                scenario.x_shadowmaster if symbol == "x" else scenario.o_shadowmaster
-            )
+            teacher = scenario.x_teacher if symbol == "x" else scenario.o_teacher
 
             try:
                 square = await get_agent_move(
                     game=game,
                     player_state=player_state,
                     model=model,
-                    shadowmaster=shadowmaster,
+                    teacher=teacher,
                     predestined_move=(
                         scenario.initial_move if move_number == 0 else None
                     ),
@@ -214,9 +213,7 @@ async def rollout(
                 messages = messages[:-1]
 
             model = x_model if symbol == "x" else o_model
-            shadowmaster = (
-                scenario.x_shadowmaster if symbol == "x" else scenario.o_shadowmaster
-            )
+            teacher = scenario.x_teacher if symbol == "x" else scenario.o_teacher
             try:
                 reported_win = (
                     trajectory.metrics["win"] if "win" in trajectory.metrics else -1
@@ -236,7 +233,7 @@ async def rollout(
                             "reward": str(trajectory.reward),
                             "invalid_move": str(player_state.invalid_move),
                             "symbol": symbol,
-                            "shadowmaster": shadowmaster.name if shadowmaster else "",
+                            "teacher": teacher.name if teacher else "",
                             "initial_move": (
                                 unwrap_move(scenario.initial_move)
                                 if scenario.initial_move
