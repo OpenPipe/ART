@@ -12,6 +12,7 @@ from pydantic import BaseModel
 import re
 import requests
 from requests import adapters as requests_adapters
+from requests.exceptions import ConnectTimeout, SSLError
 import shlex
 from sweagent.agent.agents import DefaultAgent, DefaultAgentConfig
 from sweagent.run.hooks.abstract import RunHook
@@ -36,32 +37,32 @@ litellm.failure_callback.append("langfuse")
 logging.getLogger("urllib3.connectionpool").setLevel(logging.ERROR)
 
 
-# Custom filter to suppress swerex and rex-deploy related critical logs
-class SuppressSwerexLogsFilter(logging.Filter):
-    def filter(self, record):
-        # Suppress logs from rex-deploy loggers
-        if record.name.startswith("rex-deploy"):
-            return False
-        # Suppress swerex exception logs
-        if "swerex.exceptions" in record.getMessage() or "swerex.exceptions" in str(
-            record.exc_info
-        ):
-            return False
-        # Suppress CommandTimeoutError and BashIncorrectSyntaxError logs
-        if any(
-            error in record.getMessage()
-            for error in [
-                "CommandTimeoutError",
-                "BashIncorrectSyntaxError",
-                "pexpect.exceptions.TIMEOUT",
-            ]
-        ):
-            return False
-        return True
+# # Custom filter to suppress swerex and rex-deploy related critical logs
+# class SuppressSwerexLogsFilter(logging.Filter):
+#     def filter(self, record):
+#         # Suppress logs from rex-deploy loggers
+#         if record.name.startswith("rex-deploy"):
+#             return False
+#         # Suppress swerex exception logs
+#         if "swerex.exceptions" in record.getMessage() or "swerex.exceptions" in str(
+#             record.exc_info
+#         ):
+#             return False
+#         # Suppress CommandTimeoutError and BashIncorrectSyntaxError logs
+#         if any(
+#             error in record.getMessage()
+#             for error in [
+#                 "CommandTimeoutError",
+#                 "BashIncorrectSyntaxError",
+#                 "pexpect.exceptions.TIMEOUT",
+#             ]
+#         ):
+#             return False
+#         return True
 
 
-# Apply the filter to the root logger to catch all logs
-logging.getLogger().addFilter(SuppressSwerexLogsFilter())
+# # Apply the filter to the root logger to catch all logs
+# logging.getLogger().addFilter(SuppressSwerexLogsFilter())
 
 # Disable printing the patch message to reduce log noise
 SaveApplyPatchHook._print_patch_message = lambda *args, **kwargs: None
@@ -99,12 +100,14 @@ async def rollout(
 
 
 @observe(capture_output=False)
+@art.retry(max_attempts=2, exceptions=(ConnectTimeout, SSLError))
 async def rollout(
     model: art.Model[ModelConfig],
     instance: Instance,
     completion_kwargs: dict[str, Any] | None = None,
     replay_trajectory_path: Path | None = None,
     return_run_single: bool = False,
+    reward_power: float = 1.0,
     run_in_thread: bool = True,
 ) -> art.Trajectory | tuple[art.Trajectory, RunSingle]:
     trajectory = art.Trajectory(messages_and_choices=[], reward=0.0)
@@ -140,14 +143,16 @@ async def rollout(
     if isinstance(run_single.env.deployment, ModalDeployment):
         run_single.add_hook(PatchRuntimeRunHook(run_single.env.deployment))
     if not instance["use_swebench_modal_harness"]:
-        run_single.add_hook(RewardRunHook(instance, trajectory, run_single))
+        run_single.add_hook(
+            RewardRunHook(instance, trajectory, run_single, reward_power)
+        )
     if run_in_thread:
         await asyncio.to_thread(run_single.run)
     else:
         run_single.run()
     if instance["use_swebench_modal_harness"]:
         await update_trajectory_with_swebench_modal_harness(
-            instance, trajectory, run_single
+            instance, trajectory, run_single, reward_power
         )
     assert isinstance(run_single.agent, DefaultAgent)
     trajectory.messages_and_choices = run_single.agent.history
@@ -209,12 +214,18 @@ class PatchRuntimeRunHook(RunHook):
         runtime = self.deployment.runtime
         session = requests.Session()
         retry = requests_adapters.Retry(
-            total=3,
-            backoff_factor=0.1,  # type: ignore
+            total=5,  # Increased from 3
+            backoff_factor=1,  # Increased from 0.1, using int instead of float
             status_forcelist=[500, 502, 503, 504],
             allowed_methods=["POST"],
+            # Also retry on SSL errors
+            raise_on_status=False,
         )
-        adapter = requests_adapters.HTTPAdapter(max_retries=retry)
+        adapter = requests_adapters.HTTPAdapter(
+            max_retries=retry,
+            pool_connections=10,
+            pool_maxsize=10,
+        )
         session.mount("http://", adapter)
         session.mount("https://", adapter)
 
@@ -231,15 +242,15 @@ class PatchRuntimeRunHook(RunHook):
 
         runtime._request = _request
 
-        # Patch the runtime to use longer default timeouts for commands
-        original_run_in_session = runtime.run_in_session
+        # # Patch the runtime to use longer default timeouts for commands
+        # original_run_in_session = runtime.run_in_session
 
-        def patched_run_in_session(action):
-            if hasattr(action, "timeout") and action.timeout == 30.0:
-                action.timeout = 120.0
-            return original_run_in_session(action)
+        # def patched_run_in_session(action):
+        #     if hasattr(action, "timeout") and action.timeout == 30.0:
+        #         action.timeout = 120.0
+        #     return original_run_in_session(action)
 
-        runtime.run_in_session = patched_run_in_session
+        # runtime.run_in_session = patched_run_in_session
 
 
 class RewardRunHook(RunHook):
@@ -248,11 +259,16 @@ class RewardRunHook(RunHook):
     """
 
     def __init__(
-        self, instance: Instance, trajectory: art.Trajectory, run_single: RunSingle
+        self,
+        instance: Instance,
+        trajectory: art.Trajectory,
+        run_single: RunSingle,
+        reward_power: float,
     ) -> None:
         self.instance = instance
         self.trajectory = trajectory
         self.run_single = run_single
+        self.reward_power = reward_power
 
     def on_instance_completed(self, *, result: AgentRunResult) -> None:
         # TODO: Address potential reward hacking
@@ -267,6 +283,7 @@ class RewardRunHook(RunHook):
         update_trajectory(
             self.trajectory,
             self.instance,
+            self.reward_power,
             num_failed_f2p,
             num_passed_f2p,
             num_failed_p2p,
@@ -318,7 +335,10 @@ class RewardRunHook(RunHook):
 
 
 async def update_trajectory_with_swebench_modal_harness(
-    instance: Instance, trajectory: art.Trajectory, run_single: RunSingle
+    instance: Instance,
+    trajectory: art.Trajectory,
+    run_single: RunSingle,
+    reward_power: float,
 ) -> None:
     """
     Update a trajectory with test results from the SWE-bench modal harness
@@ -340,6 +360,7 @@ async def update_trajectory_with_swebench_modal_harness(
     update_trajectory(
         trajectory,
         instance,
+        reward_power,
         num_failed_f2p=len(tests_status["FAIL_TO_PASS"]["failure"]),
         num_passed_f2p=len(tests_status["FAIL_TO_PASS"]["success"]),
         num_failed_p2p=len(tests_status["PASS_TO_PASS"]["failure"]),
@@ -350,6 +371,7 @@ async def update_trajectory_with_swebench_modal_harness(
 def update_trajectory(
     trajectory: art.Trajectory,
     instance: Instance,
+    reward_power: float,
     num_failed_f2p: int,
     num_passed_f2p: int,
     num_failed_p2p: int,
@@ -368,6 +390,9 @@ def update_trajectory(
     # Max reward (1.0) occurs when all failing tests pass, no passing tests regress, and no tests are missing or errored.
     # A zero reward (0.0) reflects the status quo with no net change in test outcomes.
     # Negative rewards indicate more tests fail after the rollout than before.
-    trajectory.reward = (num_passed_f2p - num_failed_p2p - num_missing) / len(
-        instance["FAIL_TO_PASS"]
+    net_change = num_passed_f2p - num_failed_p2p - num_missing
+    trajectory.reward = (
+        (net_change / len(instance["FAIL_TO_PASS"])) ** reward_power
+        if net_change > 0
+        else net_change / len(instance["PASS_TO_PASS"])
     )
