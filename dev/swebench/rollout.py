@@ -1,74 +1,27 @@
 import art
 import asyncio
 import json
-from langfuse import Langfuse
-from langfuse.decorators import langfuse_context, observe
-from langfuse.types import SpanLevel
-import litellm
-import logging
-from logging import Handler, LogRecord
+from langfuse.decorators import observe
 import modal
 from pathlib import Path
 from pydantic import BaseModel
-import re
 import requests
 from requests import adapters as requests_adapters
 from requests.exceptions import SSLError
-import shlex
 from sweagent.agent.agents import DefaultAgent, DefaultAgentConfig
 from sweagent.run.hooks.abstract import RunHook
-from sweagent.run.hooks.apply_patch import SaveApplyPatchHook
 from sweagent.run.run_replay import RunReplay
 from sweagent.run.run_single import RunSingle, RunSingleConfig
 from sweagent.types import AgentRunResult
 from swebench.harness.modal_eval.run_evaluation_modal import app, run_instance_modal
 from swebench.harness.test_spec.test_spec import make_test_spec
 from swerex.deployment.modal import ModalDeployment
-from swerex.exceptions import CommandTimeoutError
-from swerex.runtime.abstract import BashAction
 from typing import Any, Literal, overload
 
 from config import get_config
 from eval import eval_instance
+from logs import setup_agent_logger
 from instances import Instance
-
-# Add Langfuse callbacks for SWE-agent litellm calls
-litellm.success_callback.append("langfuse")
-litellm.failure_callback.append("langfuse")
-
-# Suppress urllib3 retry warnings
-logging.getLogger("urllib3.connectionpool").setLevel(logging.ERROR)
-
-
-# # Custom filter to suppress swerex and rex-deploy related critical logs
-# class SuppressSwerexLogsFilter(logging.Filter):
-#     def filter(self, record):
-#         # Suppress logs from rex-deploy loggers
-#         if record.name.startswith("rex-deploy"):
-#             return False
-#         # Suppress swerex exception logs
-#         if "swerex.exceptions" in record.getMessage() or "swerex.exceptions" in str(
-#             record.exc_info
-#         ):
-#             return False
-#         # Suppress CommandTimeoutError and BashIncorrectSyntaxError logs
-#         if any(
-#             error in record.getMessage()
-#             for error in [
-#                 "CommandTimeoutError",
-#                 "BashIncorrectSyntaxError",
-#                 "pexpect.exceptions.TIMEOUT",
-#             ]
-#         ):
-#             return False
-#         return True
-
-
-# # Apply the filter to the root logger to catch all logs
-# logging.getLogger().addFilter(SuppressSwerexLogsFilter())
-
-# Disable printing the patch message to reduce log noise
-SaveApplyPatchHook._print_patch_message = lambda *args, **kwargs: None
 
 
 class ModelConfig(BaseModel):
@@ -120,11 +73,7 @@ async def rollout(
     else:
         run_single = RunSingle.from_config(config)
     assert isinstance(run_single.agent, DefaultAgent)
-    run_single.agent.logger.propagate = False
-    run_single.agent.logger.handlers = []
-    run_single.agent.logger.addHandler(
-        LangfuseHandler(langfuse_context.get_current_trace_id() or "")
-    )
+    setup_agent_logger(run_single.agent)
     patch_get_model_requery_history(run_single.agent)
     if replay_trajectory_path:
         run_replay = RunReplay(
@@ -176,33 +125,6 @@ async def rollout(
         return trajectory, run_single
     else:
         return trajectory
-
-
-class LangfuseHandler(Handler):
-    """
-    Custom handler to forward logs to Langfuse
-    """
-
-    def __init__(self, trace_id: str) -> None:
-        self.langfuse = Langfuse()
-        self.trace_id = trace_id
-        super().__init__()
-
-    def emit(self, record: LogRecord) -> None:
-        if record.levelname in ["DEBUG", "INFO"]:
-            return
-        levels: dict[str, SpanLevel] = {
-            "WARNING": "WARNING",
-            "ERROR": "ERROR",
-            "CRITICAL": "ERROR",
-        }
-        self.langfuse.event(
-            trace_id=self.trace_id,
-            name="agent-logger",
-            level=levels[record.levelname],
-            status_message=record.getMessage(),
-        )
-        self.langfuse.flush()
 
 
 def patch_get_model_requery_history(agent: DefaultAgent) -> None:
@@ -314,15 +236,6 @@ class RewardRunHook(RunHook):
             print(
                 f"eval_result: {eval_result}, instance_id: {self.instance['instance_id']}"
             )
-        # if (
-        #     eval_result["num_failed_f2p"] != len(self.instance["FAIL_TO_PASS"])
-        #     or eval_result["num_passed_f2p"] != 0
-        #     or eval_result["num_failed_p2p"] != 0
-        #     or eval_result["num_passed_p2p"] != len(self.instance["PASS_TO_PASS"])
-        # ):
-        #     print(
-        #         f"eval_result: {eval_result}, instance_id: {self.instance['instance_id']}"
-        #     )
 
     def on_instance_completed(self, *, result: AgentRunResult) -> None:
         # TODO: Address potential reward hacking
