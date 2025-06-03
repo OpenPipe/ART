@@ -68,7 +68,7 @@ async def openai_server_task(
                 async for _ in client.models.list():
                     return
             except:
-                pass
+                await asyncio.sleep(0.1)
 
     test_client_task = asyncio.create_task(test_client())
     try:
