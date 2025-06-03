@@ -28,13 +28,21 @@ def as_instances_iter(df: pl.DataFrame) -> Iterator[Instance]:
 
 
 def get_filtered_swe_smith_instances_df() -> pl.DataFrame:
-    return pl.read_parquet(
-        "hf://datasets/bradhiltonendercorp/SWE-smith-filtered/instances.parquet"
-    ).with_columns(
-        base_commit=pl.col("instance_id"),
-        image_name="jyangballin/"
-        + pl.col("image_name").cast(pl.Utf8).str.replace("__", "_1776_"),
-        use_swebench_modal_harness=False,
+    return (
+        pl.read_parquet(
+            "hf://datasets/bradhiltonendercorp/SWE-smith-filtered/instances.parquet"
+        )
+        .filter(
+            ~pl.col("repo")
+            .cast(pl.Utf8)
+            .is_in(["swesmith/pydantic__pydantic.acb0f10f"])
+        )
+        .with_columns(
+            base_commit=pl.col("instance_id"),
+            image_name="jyangballin/"
+            + pl.col("image_name").cast(pl.Utf8).str.replace("__", "_1776_"),
+            use_swebench_modal_harness=False,
+        )
     )
 
 

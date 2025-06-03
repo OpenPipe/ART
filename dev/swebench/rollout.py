@@ -300,6 +300,29 @@ class RewardRunHook(RunHook):
         self.run_single = run_single
         self.reward_power = reward_power
 
+    def on_instance_start(self, *args: Any, **kwargs: Any) -> None:
+        eval_result = asyncio.run(
+            eval_instance(self.instance, self.run_single.env.deployment.runtime)
+        )
+        if (
+            eval_result["num_failed_f2p"] == 0
+            and eval_result["num_passed_f2p"] == 0
+            and eval_result["num_failed_p2p"] == 0
+            and eval_result["num_passed_p2p"] == 0
+        ):
+            print(
+                f"eval_result: {eval_result}, instance_id: {self.instance['instance_id']}"
+            )
+        # if (
+        #     eval_result["num_failed_f2p"] != len(self.instance["FAIL_TO_PASS"])
+        #     or eval_result["num_passed_f2p"] != 0
+        #     or eval_result["num_failed_p2p"] != 0
+        #     or eval_result["num_passed_p2p"] != len(self.instance["PASS_TO_PASS"])
+        # ):
+        #     print(
+        #         f"eval_result: {eval_result}, instance_id: {self.instance['instance_id']}"
+        #     )
+
     def on_instance_completed(self, *, result: AgentRunResult) -> None:
         # TODO: Address potential reward hacking
         # An agent could potentially modify the tests to pass
@@ -368,11 +391,18 @@ def update_trajectory(
         0,
     )
     # Max reward (1.0) occurs when all failing tests pass, no passing tests regress, and no tests are missing or errored.
-    # A zero reward (0.0) reflects the status quo with no net change in test outcomes.
-    # Negative rewards indicate more tests fail after the rollout than before.
+    # A reward of 0.5 (roughly) reflects the status quo with no net change in test outcomes.
+    # Less than 0.5 reward indicates more tests fail after the rollout than before.
+    # A reward of 0.0 indicates that all tests fail after the rollout.
     net_change = num_passed_f2p - num_failed_p2p - num_missing
     trajectory.reward = (
         (net_change / len(instance["FAIL_TO_PASS"])) ** reward_power
         if net_change > 0
         else net_change / max(len(instance["PASS_TO_PASS"]), 1)
+    ) * 0.5 + 0.5
+    trajectory.metrics["resolved"] = (
+        num_failed_f2p == 0
+        and num_passed_f2p == len(instance["FAIL_TO_PASS"])
+        and num_failed_p2p == 0
+        and num_passed_p2p == len(instance["PASS_TO_PASS"])
     )
