@@ -74,6 +74,7 @@ SaveApplyPatchHook._print_patch_message = lambda *args, **kwargs: None
 class ModelConfig(BaseModel):
     completion_kwargs: dict[str, Any] = {}
     max_input_tokens: int | None = None
+    per_instance_call_limit: int = 0
     per_instance_cost_limit: float = 0.0
     system_prompt_suffix: str = ""
     xml_function_calling: bool = False

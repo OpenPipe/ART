@@ -221,6 +221,7 @@ def get_config(
                     if model.inference_api_key
                     else None
                 ),
+                per_instance_call_limit=model.config.per_instance_call_limit,
                 per_instance_cost_limit=model.config.per_instance_cost_limit,
             ),
             max_requeries=2,

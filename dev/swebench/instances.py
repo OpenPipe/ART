@@ -35,7 +35,12 @@ def get_filtered_swe_smith_instances_df() -> pl.DataFrame:
         .filter(
             ~pl.col("repo")
             .cast(pl.Utf8)
-            .is_in(["swesmith/pydantic__pydantic.acb0f10f"])
+            .is_in(
+                [
+                    "swesmith/pydantic__pydantic.acb0f10f",
+                    "swesmith/facebookresearch__hydra.0f03eb60",
+                ]
+            )
         )
         .with_columns(
             base_commit=pl.col("instance_id"),
