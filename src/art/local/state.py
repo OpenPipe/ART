@@ -151,7 +151,7 @@ class vLLMState:
                     # Offload KV cache to CPU memory (or disk)
                     await self.async_engine.sleep(level=1)
                 else:
-                    # Reset prefix cached and discard KV cache
+                    # Reset prefix cache and discard KV cache
                     await self.async_engine.reset_prefix_cache()
                     await self.async_engine.sleep(level=2)
                 free_memory()
