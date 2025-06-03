@@ -14,3 +14,4 @@ data/
 replays/
 trajectories/
 .DS_Store
+.local/
