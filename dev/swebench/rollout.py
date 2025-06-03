@@ -7,11 +7,13 @@ from langfuse.types import SpanLevel
 import litellm
 import logging
 from logging import Handler, LogRecord
+import modal
 from pathlib import Path
 from pydantic import BaseModel
 import re
 import requests
 from requests import adapters as requests_adapters
+from requests.exceptions import SSLError
 import shlex
 from sweagent.agent.agents import DefaultAgent, DefaultAgentConfig
 from sweagent.run.hooks.abstract import RunHook
@@ -22,10 +24,12 @@ from sweagent.types import AgentRunResult
 from swebench.harness.modal_eval.run_evaluation_modal import app, run_instance_modal
 from swebench.harness.test_spec.test_spec import make_test_spec
 from swerex.deployment.modal import ModalDeployment
+from swerex.exceptions import CommandTimeoutError
 from swerex.runtime.abstract import BashAction
 from typing import Any, Literal, overload
 
 from config import get_config
+from eval import eval_instance
 from instances import Instance
 
 # Add Langfuse callbacks for SWE-agent litellm calls
@@ -98,7 +102,7 @@ async def rollout(
 ) -> tuple[art.Trajectory, RunSingle]: ...
 
 
-@observe(capture_output=False)
+@observe(capture_input=False, capture_output=False)
 async def rollout(
     model: art.Model[ModelConfig],
     instance: Instance,
@@ -144,10 +148,23 @@ async def rollout(
         run_single.add_hook(
             RewardRunHook(instance, trajectory, run_single, reward_power)
         )
-    if run_in_thread:
-        await asyncio.to_thread(run_single.run)
-    else:
-        run_single.run()
+    try:
+        if run_in_thread:
+            await asyncio.to_thread(run_single.run)
+        else:
+            run_single.run()
+    except RuntimeError as e:
+        if not "Container process terminated" in str(e):
+            raise e
+        print(e)
+    except SSLError as ssl_error:
+        print(ssl_error)
+    finally:
+        try:
+            if isinstance(run_single.env.deployment, ModalDeployment):
+                await run_single.env.deployment.stop()
+        except:
+            pass
     if instance["use_swebench_modal_harness"]:
         await update_trajectory_with_swebench_modal_harness(
             instance, trajectory, run_single, reward_power
@@ -240,6 +257,21 @@ class PatchRuntimeRunHook(RunHook):
 
         runtime._request = _request
 
+        stop = self.deployment.stop
+
+        async def _stop() -> None:
+            if self.deployment._sandbox is not None:
+                sandbox_id = self.deployment._sandbox.object_id
+            await stop()
+            if sandbox_id:
+                try:
+                    sandbox = await modal.Sandbox.from_id.aio(sandbox_id)
+                    await sandbox.terminate.aio()
+                except Exception as e:
+                    print(e)
+
+        self.deployment.stop = _stop
+
         # # Patch the runtime to use longer default timeouts for commands
         # original_run_in_session = runtime.run_in_session
 
@@ -272,64 +304,13 @@ class RewardRunHook(RunHook):
         # TODO: Address potential reward hacking
         # An agent could potentially modify the tests to pass
         # without actually addressing the issue.
-        num_failed_f2p, num_passed_f2p = self._get_test_results(
-            self.instance["FAIL_TO_PASS"]
-        )
-        num_failed_p2p, num_passed_p2p = self._get_test_results(
-            self.instance["PASS_TO_PASS"]
-        )
         update_trajectory(
             self.trajectory,
             self.instance,
             self.reward_power,
-            num_failed_f2p,
-            num_passed_f2p,
-            num_failed_p2p,
-            num_passed_p2p,
-        )
-
-    def _get_test_results(self, tests: list[str]) -> tuple[int, int]:
-        if not tests:
-            return 0, 0
-
-        # We batch tests to avoid exceeding the max command length
-        base_cmd = "cd /testbed && python -m pytest "
-        max_len = 16384
-        results = []
-        batch, batch_len = [], 0
-        for test in tests + [None]:  # Sentinel to trigger final batch
-            if test is None or (
-                batch and batch_len + len(shlex.quote(test or "")) + 1 > max_len
-            ):
-                if batch:
-                    command = f"{base_cmd}{' '.join(map(shlex.quote, batch))}"
-                    output = asyncio.run(
-                        self.run_single.env.deployment.runtime.run_in_session(
-                            BashAction(command=command, check="silent", timeout=1200.0)
-                        )
-                    ).output
-                    if lines := output.splitlines():
-                        s = lines[-1]
-                        failed = (
-                            int(m.group(1))
-                            if (m := re.search(r"(\d+)\s+failed", s))
-                            else 0
-                        )
-                        passed = (
-                            int(m.group(1))
-                            if (m := re.search(r"(\d+)\s+passed", s))
-                            else 0
-                        )
-                        results.append((failed, passed))
-                    batch, batch_len = [], 0
-            if test:
-                batch.append(test)
-                batch_len += len(shlex.quote(test)) + 1
-
-        return (
-            (sum(f for f, _ in results), sum(p for _, p in results))
-            if results
-            else (0, 0)
+            **asyncio.run(
+                eval_instance(self.instance, self.run_single.env.deployment.runtime)
+            ),
         )
 
 
@@ -351,7 +332,7 @@ async def update_trajectory_with_swebench_modal_harness(
                 "instance_id": instance["instance_id"],
             },
             run_id="run_id",
-            timeout=1200,
+            timeout=1800,
         )
     tests_status = json.loads(output.report_json_str)[instance["instance_id"]][
         "tests_status"
