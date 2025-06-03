@@ -1,7 +1,7 @@
 import httpx
 from openai import AsyncOpenAI, DefaultAsyncHttpxClient
 from pydantic import BaseModel
-from typing import cast, Generic, Iterable, Optional, TypeVar
+from typing import cast, Generic, Iterable, Optional, overload, TypeVar
 
 from . import dev
 from .backend import Backend
@@ -51,8 +51,7 @@ class Model(
 
     name: str
     project: str
-
-    config: ModelConfig = None  # type: ignore
+    config: ModelConfig
 
     # --- Inference connection information (populated automatically for
     #     TrainableModel or set manually for prompted / comparison models) ---
@@ -66,6 +65,35 @@ class Model(
     _s3_bucket: str | None = None
     _s3_prefix: str | None = None
     _openai_client: AsyncOpenAI | None = None
+
+    @overload
+    def __new__(
+        cls,
+        *,
+        name: str,
+        project: str,
+        config: None = None,
+        inference_api_key: str | None = None,
+        inference_base_url: str | None = None,
+    ) -> "Model[None]": ...
+
+    @overload
+    def __new__(
+        cls,
+        *,
+        name: str,
+        project: str,
+        config: ModelConfig,
+        inference_api_key: str | None = None,
+        inference_base_url: str | None = None,
+    ) -> "Model[ModelConfig]": ...
+
+    def __new__(
+        cls,
+        *args,
+        **kwargs,
+    ) -> "Model[ModelConfig] | Model[None]":
+        return super().__new__(cls)
 
     @property
     def trainable(self) -> bool:
@@ -192,6 +220,35 @@ class TrainableModel(Model[ModelConfig], Generic[ModelConfig]):
         if _internal_config is not None:
             # Bypass BaseModel __setattr__ to allow setting private attr
             object.__setattr__(self, "_internal_config", _internal_config)
+
+    @overload
+    def __new__(
+        cls,
+        *,
+        name: str,
+        project: str,
+        config: None = None,
+        base_model: str,
+        _internal_config: dev.InternalModelConfig | None = None,
+    ) -> "TrainableModel[None]": ...
+
+    @overload
+    def __new__(
+        cls,
+        *,
+        name: str,
+        project: str,
+        config: ModelConfig,
+        base_model: str,
+        _internal_config: dev.InternalModelConfig | None = None,
+    ) -> "TrainableModel[ModelConfig]": ...
+
+    def __new__(
+        cls,
+        *args,
+        **kwargs,
+    ) -> "TrainableModel[ModelConfig] | TrainableModel[None]":
+        return super().__new__(cls)
 
     def model_dump(self, *args, **kwargs) -> dict:
         data = super().model_dump(*args, **kwargs)
