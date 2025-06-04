@@ -312,7 +312,7 @@ class LocalBackend(Backend):
             enable_assistant_message_training=dev_config.get(
                 "enable_assistant_message_training", False
             ),
-            plot_tensors=True,
+            plot_tensors=False,
         )
         if packed_tensors is None:
             print(
