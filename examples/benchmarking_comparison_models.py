@@ -79,9 +79,7 @@ async def benchmark_model(model: art.Model):
 
 # In this case we have a very simple rollout function, but you can see how we're
 # using the `use_thinking` flag to change the prompt slightly.
-async def rollout(model: art.Model, scenario: MyTask) -> art.Trajectory:
-    assert isinstance(model.config, MyConfig)
-
+async def rollout(model: art.Model[MyConfig], scenario: MyTask) -> art.Trajectory:
     openai_client = model.openai_client()
     messages = []
     if model.config.use_thinking:
@@ -145,6 +143,7 @@ async def main():
     gpt_4_1 = art.Model(
         name="gpt-4.1",
         project=PROJECT_NAME,
+        config=MyConfig(),
         inference_base_url="https://api.openai.com/v1/",
         inference_api_key=os.getenv("OPENAI_API_KEY"),
     )
@@ -152,7 +151,6 @@ async def main():
     # We'll create a second GPT-4.1 variant that uses CoT reasoning
     gpt_4_1_thinking = gpt_4_1.model_copy(deep=True)
     gpt_4_1_thinking.name = "gpt-4.1-thinking"
-    assert isinstance(gpt_4_1_thinking.config, MyConfig)
     gpt_4_1_thinking.config.use_thinking = True
 
     gemini_flash = gpt_4_1.model_copy(deep=True)
@@ -163,10 +161,9 @@ async def main():
 
     gemini_flash_thinking = gemini_flash.model_copy(deep=True)
     gemini_flash_thinking.name = "gemini-flash-2.5-thinking"
-    assert isinstance(gemini_flash_thinking.config, MyConfig)
     gemini_flash_thinking.config.use_thinking = True
 
-    prompted_models: list[art.Model] = [
+    prompted_models = [
         gpt_4_1,
         gpt_4_1_thinking,
         gemini_flash,
@@ -181,10 +178,9 @@ async def main():
         config=MyConfig(),
     )
     qwen_thinking = qwen.model_copy(deep=True)
-    assert isinstance(qwen_thinking.config, MyConfig)
     qwen_thinking.name = "qwen-2.5-14b-instruct-thinking"
 
-    train_models: list[art.TrainableModel] = [
+    train_models = [
         qwen,
         qwen_thinking,
     ]

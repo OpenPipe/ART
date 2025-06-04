@@ -38,12 +38,10 @@ agent_002 = art.TrainableModel(
 
 # While running experiments,
 agent_004 = agent_002.model_copy(deep=True)
-assert isinstance(agent_004.config, ProjectPolicyConfig)
 agent_004.name = "email-agent-004"
 agent_004.config.max_turns = 30
 
 agent_005 = agent_002.model_copy(deep=True)
-assert isinstance(agent_005.config, ProjectPolicyConfig)
 agent_005.name = "email-agent-005"
 
 agent_006 = agent_005.model_copy(deep=True)
@@ -51,12 +49,10 @@ agent_006.name = "email-agent-006"
 
 agent_007 = agent_005.model_copy(deep=True)
 agent_007.name = "email-agent-007"
-assert isinstance(agent_007.config, ProjectPolicyConfig)
 agent_007.config.use_tools = True
 
 agent_008 = agent_005.model_copy(deep=True)
 agent_008.name = "email-agent-008"
-assert isinstance(agent_008.config, ProjectPolicyConfig)
 assert agent_008.config.training_config is not None
 agent_008.config.use_tools = True
 agent_008.config.training_config.trajectories_per_group = 4
@@ -65,7 +61,6 @@ agent_008.config.training_config.num_epochs = 3
 
 agent_011 = agent_008.model_copy(deep=True)
 agent_011.name = "email-agent-011"
-assert isinstance(agent_011.config, ProjectPolicyConfig)
 assert agent_011.config.training_config is not None
 agent_011.config.training_config.num_epochs = 4
 
@@ -74,7 +69,6 @@ agent_012.name = "email-agent-012"
 
 agent_013 = agent_002.model_copy(deep=True)
 agent_013.name = "email-agent-013"
-assert isinstance(agent_013.config, ProjectPolicyConfig)
 assert agent_013.config.training_config is not None
 agent_013.config.training_config.num_epochs = 4
 agent_013.config.training_config.trajectories_per_group = 4
@@ -82,14 +76,12 @@ agent_013.config.training_config.groups_per_step = 24
 
 agent_014 = agent_008.model_copy(deep=True)
 agent_014.name = "email-agent-014"
-assert isinstance(agent_014.config, ProjectPolicyConfig)
 agent_014.config.stupid_simple_reward_fn = True
 
 
-async def run_training(model: art.TrainableModel):
+async def run_training(model: art.TrainableModel[ProjectPolicyConfig]):
     generate_database()
 
-    assert isinstance(model.config, ProjectPolicyConfig)
     if model.config.training_config is None:
         raise ValueError("Training config is not set")
     backend = LocalBackend()

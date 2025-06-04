@@ -387,21 +387,9 @@ resources:
     - 7999 # main ART server
     - 8000 # vLLM server
 envs:
+  ALL_EXTRAS: "false"
   GIT_USER_NAME: "Your Name"
   GIT_USER_EMAIL: "your.email@example.com"
   GITHUB_TOKEN: ""
 setup: |
-  # Configure git user name and email
-  git config --global user.name "${GIT_USER_NAME}"
-  git config --global user.email "${GIT_USER_EMAIL}"
-  git config --global --add safe.directory /root/sky_workdir
-  # Reset any uncommitted changes to the last commit
-  git reset --hard HEAD
-  # Remove all untracked files and directories
-  git clean -fd
-  # Install astral-uv
-  sudo snap install --classic astral-uv
-  # Install tmux
-  apt install tmux -y
-  # Sync the dependencies
-  uv sync
+  ./scripts/setup.sh

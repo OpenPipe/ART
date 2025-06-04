@@ -2,7 +2,7 @@ import asyncio
 import json
 import os
 import time
-from typing import TYPE_CHECKING
+from typing import Any, TYPE_CHECKING
 import aiohttp
 from enum import Enum
 from art.errors import (
@@ -69,7 +69,7 @@ async def deploy_together(
     presigned_url: str,
     step: int,
     verbose: bool = False,
-) -> None:
+) -> dict[str, Any]:
     """
     Deploys a model to Together. Supported base models:
 
