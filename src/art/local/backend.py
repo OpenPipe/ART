@@ -141,6 +141,7 @@ class LocalBackend(Backend):
         self,
         model: TrainableModel,
         trajectory_groups: list[TrajectoryGroup],
+        enable_assistant_message_training: bool,
         plot_tensors: bool,
     ) -> PackedTensors | None:
         if not model.base_model in self._tokenizers:
@@ -152,6 +153,7 @@ class LocalBackend(Backend):
             tokenize_trajectory_groups(
                 tokenizer,
                 trajectory_groups,
+                enable_assistant_message_training,
             )
         )
         if not tokenized_results:
@@ -164,12 +166,12 @@ class LocalBackend(Backend):
             sequence_length,
             pad_token_id=tokenizer.eos_token_id,  # type: ignore
         )
-        # If all logprobs are NaN then there is no suitable data for tuning
-        if np.isnan(packed_tensors["logprobs"]).all():
-            print(
-                "There are no assistant logprobs to train on. Did you forget to include at least one Choice in Trajectory.messages_and_choices?"
-            )
-            return None
+        # # If all logprobs are NaN then there is no suitable data for tuning
+        # if np.isnan(packed_tensors["logprobs"]).all():
+        #     print(
+        #         "There are no assistant logprobs to train on. Did you forget to include at least one Choice in Trajectory.messages_and_choices?"
+        #     )
+        #     return None
         if plot_tensors:
             plot_packed_tensors(packed_tensors)
         else:
@@ -305,7 +307,12 @@ class LocalBackend(Backend):
         if verbose:
             print("Packing tensors...")
         packed_tensors = self._get_packed_tensors(
-            model, trajectory_groups, plot_tensors=False
+            model,
+            trajectory_groups,
+            enable_assistant_message_training=dev_config.get(
+                "enable_assistant_message_training", False
+            ),
+            plot_tensors=True,
         )
         if packed_tensors is None:
             print(

@@ -39,6 +39,7 @@ class TokenizedResult:
 def tokenize_trajectory_groups(
     tokenizer: "PreTrainedTokenizerBase",
     trajectory_groups: list[TrajectoryGroup],
+    enable_assistant_message_training: bool,
 ) -> Generator["TokenizedResult", None, None]:
     for group in trajectory_groups:
         if not group:
@@ -61,6 +62,7 @@ def tokenize_trajectory_groups(
                     tokenizer,
                     trajectory,
                     advantage,
+                    enable_assistant_message_training,
                 )
             )
         # Choose a random prompt id
@@ -89,6 +91,7 @@ def tokenize_trajectory(
     tokenizer: "PreTrainedTokenizerBase",
     trajectory: Trajectory,
     advantage: float,
+    enable_assistant_message_training: bool,
 ) -> TokenizedResult:
     """
     Tokenizes a trajectory and returns a TokenizedResult.
@@ -112,8 +115,8 @@ def tokenize_trajectory(
         set(range(cast(int, tokenizer.vocab_size))) - set(original_token_ids)
     )
     sentinal_token = tokenizer.decode(sentinal_token_id)
-    token_ids = cast(
-        list[int],
+    result = cast(
+        dict,
         tokenizer.apply_chat_template(
             cast(
                 list[dict],
@@ -130,10 +133,17 @@ def tokenize_trajectory(
                 ],
             ),
             tools=trajectory.tools,  # type: ignore
+            return_dict=True,
+            return_assistant_token_mask=enable_assistant_message_training,
         ),
     )
+    token_ids: list[int] = result["input_ids"]
+    assistant_mask: list[int] = (
+        result["attention_mask"]
+        if enable_assistant_message_training
+        else [0] * len(token_ids)
+    )
     logprobs = [float("nan")] * len(token_ids)
-    assistant_mask = [0] * len(token_ids)
     for message_or_choice in trajectory.messages_and_choices:
         if isinstance(message_or_choice, dict):
             continue

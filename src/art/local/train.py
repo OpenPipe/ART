@@ -118,7 +118,7 @@ def get_compute_loss_fn(trainer: "GRPOTrainer") -> Callable[..., torch.Tensor]:
         # Assume missing old logprobs were sampled under the current policy
         old_logprobs = torch.where(
             torch.isnan(old_logprobs),
-            new_logprobs,
+            new_logprobs.detach(),
             old_logprobs,
         )
         prob_ratio = torch.exp(new_logprobs - old_logprobs)
