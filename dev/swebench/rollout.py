@@ -23,6 +23,7 @@ from config import get_config
 from eval import eval_instance
 from logs import setup_agent_logger
 from instances import Instance
+from run import run
 
 
 class ModelConfig(BaseModel):
@@ -69,10 +70,7 @@ async def rollout(
 ) -> art.Trajectory | tuple[art.Trajectory, RunSingle]:
     trajectory = art.Trajectory(messages_and_choices=[], reward=0.0)
     config = get_config(model, instance, completion_kwargs)
-    if run_in_thread:
-        run_single = await asyncio.to_thread(RunSingle.from_config, config)
-    else:
-        run_single = RunSingle.from_config(config)
+    run_single = await run(RunSingle.from_config, run_in_thread, config)
     assert isinstance(run_single.agent, DefaultAgent)
     setup_agent_logger(run_single.agent)
     patch_get_model_requery_history(run_single.agent)
@@ -100,10 +98,7 @@ async def rollout(
             RewardRunHook(instance, trajectory, run_single, reward_power)
         )
     try:
-        if run_in_thread:
-            await asyncio.to_thread(run_single.run)
-        else:
-            run_single.run()
+        await run(run_single.run, run_in_thread)
     except ConnectionError as e:
         print(e)
     except CommandTimeoutError as e:
