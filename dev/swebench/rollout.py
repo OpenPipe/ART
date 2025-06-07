@@ -16,6 +16,7 @@ from sweagent.types import AgentRunResult
 from swebench.harness.modal_eval.run_evaluation_modal import app, run_instance_modal
 from swebench.harness.test_spec.test_spec import make_test_spec
 from swerex.deployment.modal import ModalDeployment
+from swerex.exceptions import CommandTimeoutError
 from typing import Any, Literal, overload
 
 from config import get_config
@@ -103,12 +104,18 @@ async def rollout(
             await asyncio.to_thread(run_single.run)
         else:
             run_single.run()
+    except CommandTimeoutError as e:
+        print(e)
     except RuntimeError as e:
         if not "Container process terminated" in str(e):
             raise e
         print(e)
     except SSLError as ssl_error:
         print(ssl_error)
+    except TimeoutError as e:
+        if not "Runtime did not start within" in str(e):
+            raise e
+        print(e)
     finally:
         try:
             if isinstance(run_single.env.deployment, ModalDeployment):
@@ -185,6 +192,8 @@ class PatchRuntimeRunHook(RunHook):
         async def _stop() -> None:
             if self.deployment._sandbox is not None:
                 sandbox_id = self.deployment._sandbox.object_id
+            else:
+                sandbox_id = None
             await stop()
             if sandbox_id:
                 try:

@@ -224,7 +224,7 @@ def get_config(
                 per_instance_call_limit=model.config.per_instance_call_limit,
                 per_instance_cost_limit=model.config.per_instance_cost_limit,
             ),
-            max_requeries=2,
+            max_requeries=1,
         ),
         problem_statement=TextProblemStatement(text=instance["problem_statement"]),
     )

@@ -96,6 +96,23 @@ def tokenize_trajectory(
     """
     Tokenizes a trajectory and returns a TokenizedResult.
     """
+    last_assistant_idx = -1
+    for i, msg_or_choice in enumerate(trajectory.messages_and_choices):
+        if (
+            isinstance(msg_or_choice, dict)
+            and msg_or_choice["role"] == "assistant"
+            and enable_assistant_message_training
+        ):
+            last_assistant_idx = i
+        elif not isinstance(msg_or_choice, dict):
+            last_assistant_idx = i
+    trajectory = trajectory.model_copy(
+        update={
+            "messages_and_choices": trajectory.messages_and_choices[
+                : last_assistant_idx + 1
+            ]
+        }
+    )
     chat = cast(
         str,
         tokenizer.apply_chat_template(
