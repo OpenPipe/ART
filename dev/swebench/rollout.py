@@ -59,6 +59,7 @@ async def rollout(
 
 
 @observe(capture_input=False, capture_output=False)
+@art.retry(max_attempts=2, exceptions=(modal.exception.SandboxTimeoutError,))
 async def rollout(
     model: art.Model[ModelConfig],
     instance: Instance,
