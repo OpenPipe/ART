@@ -161,6 +161,13 @@ class LocalBackend(Backend):
         max_tokens = max(len(result.tokens) for result in tokenized_results)
         # Round up max_tokens to the nearest multiple of 2048
         sequence_length = math.ceil(max_tokens / 2048) * 2048
+        # Cap sequence length at the model's max sequence length
+        sequence_length = min(
+            sequence_length,
+            (model._internal_config or dev.InternalModelConfig())
+            .get("init_args", {})
+            .get("max_seq_length", 32_768),
+        )
         packed_tensors = packed_tensors_from_tokenized_results(
             tokenized_results,
             sequence_length,

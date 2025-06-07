@@ -104,6 +104,8 @@ async def rollout(
             await asyncio.to_thread(run_single.run)
         else:
             run_single.run()
+    except ConnectionError as e:
+        print(e)
     except CommandTimeoutError as e:
         print(e)
     except RuntimeError as e:
