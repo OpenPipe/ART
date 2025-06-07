@@ -79,6 +79,9 @@ async def eval_tests(
                         results.append((failed, passed))
                 except CommandTimeoutError:
                     results.append((len(batch), 0))
+                except Exception as e:
+                    print(f"Error running tests: {e}")
+                    results.append((len(batch), 0))
                 batch, batch_len = [], 0
         if test:
             batch.append(test)

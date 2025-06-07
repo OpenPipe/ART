@@ -38,6 +38,7 @@ def get_filtered_swe_smith_instances_df() -> pl.DataFrame:
             .is_in(
                 [
                     "swesmith/facebookresearch__hydra.0f03eb60",
+                    "swesmith/marshmallow-code__marshmallow.9716fc62",
                     "swesmith/mido__mido.a0158ff9",
                     "swesmith/pydantic__pydantic.acb0f10f",
                 ]
