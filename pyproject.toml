@@ -33,7 +33,8 @@ swebench = [
     "langfuse>=2.60.7",
     "modal>=1.0.1",
     "sweagent",
-    "swebench[modal]>=4.0.3"
+    "swebench>=4.0.3",
+    "weave>=0.51.51",
 ]
 
 [project.scripts]
