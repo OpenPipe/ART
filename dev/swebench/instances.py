@@ -39,9 +39,13 @@ def get_filtered_swe_smith_instances_df() -> pl.DataFrame:
                 [
                     "swesmith/conan-io__conan.86f29e13",
                     "swesmith/facebookresearch__hydra.0f03eb60",
+                    "swesmith/iterative__dvc.1d6ea681",
+                    "swesmith/joke2k__faker.8b401a7d",
                     "swesmith/marshmallow-code__marshmallow.9716fc62",
                     "swesmith/mido__mido.a0158ff9",
                     "swesmith/pydantic__pydantic.acb0f10f",
+                    "swesmith/scrapy__scrapy.35212ec5",
+                    "swesmith/tornadoweb__tornado.d5ac65c1",
                 ]
             )
         )
