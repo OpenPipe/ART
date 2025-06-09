@@ -141,7 +141,7 @@ class LocalBackend(Backend):
         self,
         model: TrainableModel,
         trajectory_groups: list[TrajectoryGroup],
-        enable_assistant_message_training: bool,
+        allow_training_without_logprobs: bool,
         plot_tensors: bool,
     ) -> PackedTensors | None:
         if not model.base_model in self._tokenizers:
@@ -153,7 +153,7 @@ class LocalBackend(Backend):
             tokenize_trajectory_groups(
                 tokenizer,
                 trajectory_groups,
-                enable_assistant_message_training,
+                allow_training_without_logprobs,
             )
         )
         if not tokenized_results:
@@ -173,12 +173,14 @@ class LocalBackend(Backend):
             sequence_length,
             pad_token_id=tokenizer.eos_token_id,  # type: ignore
         )
-        # # If all logprobs are NaN then there is no suitable data for tuning
-        # if np.isnan(packed_tensors["logprobs"]).all():
-        #     print(
-        #         "There are no assistant logprobs to train on. Did you forget to include at least one Choice in Trajectory.messages_and_choices?"
-        #     )
-        #     return None
+        if (
+            not allow_training_without_logprobs
+            and np.isnan(packed_tensors["logprobs"]).all()
+        ):
+            print(
+                "There are no assistant logprobs to train on. Did you forget to include at least one Choice in Trajectory.messages_and_choices?"
+            )
+            return None
         if plot_tensors:
             plot_packed_tensors(packed_tensors)
         else:
@@ -247,7 +249,7 @@ class LocalBackend(Backend):
         os.makedirs(parent_dir, exist_ok=True)
 
         # Get the file name for the current iteration, or default to 0 for non-trainable models
-        iteration = self.__get_step(model) if model.trainable else 0
+        iteration = self.__get_step(model) if isinstance(model, TrainableModel) else 0
         file_name = f"{iteration:04d}.yaml"
 
         # Write the logs to the file
@@ -282,8 +284,7 @@ class LocalBackend(Backend):
         # Calculate average standard deviation of rewards within groups
         averages["reward_std_dev"] = calculate_step_std_dev(trajectory_groups)
 
-        if isinstance(model, TrainableModel):
-            self._log_metrics(model, averages, split)
+        self._log_metrics(model, averages, split)
 
     def _trajectory_log(self, trajectory: Trajectory) -> str:
         """Format a trajectory into a readable log string."""
@@ -316,8 +317,8 @@ class LocalBackend(Backend):
         packed_tensors = self._get_packed_tensors(
             model,
             trajectory_groups,
-            enable_assistant_message_training=dev_config.get(
-                "enable_assistant_message_training", False
+            allow_training_without_logprobs=dev_config.get(
+                "allow_training_without_logprobs", False
             ),
             plot_tensors=False,
         )
@@ -355,7 +356,7 @@ class LocalBackend(Backend):
 
     def _log_metrics(
         self,
-        model: TrainableModel,
+        model: Model,
         metrics: dict[str, float],
         split: str,
         step_offset: int = 0,
@@ -366,7 +367,9 @@ class LocalBackend(Backend):
             if split
             else metrics
         )
-        step = (self.__get_step(model) if model.trainable else 0) + step_offset
+        step = (
+            self.__get_step(model) if isinstance(model, TrainableModel) else 0
+        ) + step_offset
 
         # If we have a W&B run, log the data there
         if run := self._get_wandb_run(model):
@@ -375,7 +378,7 @@ class LocalBackend(Backend):
                 step=step,
             )
 
-    def _get_wandb_run(self, model: TrainableModel) -> Run | None:
+    def _get_wandb_run(self, model: Model) -> Run | None:
         if "WANDB_API_KEY" not in os.environ:
             return None
         if (

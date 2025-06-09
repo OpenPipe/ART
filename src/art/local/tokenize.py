@@ -39,7 +39,7 @@ class TokenizedResult:
 def tokenize_trajectory_groups(
     tokenizer: "PreTrainedTokenizerBase",
     trajectory_groups: list[TrajectoryGroup],
-    enable_assistant_message_training: bool,
+    allow_training_without_logprobs: bool,
 ) -> Generator["TokenizedResult", None, None]:
     for group in trajectory_groups:
         if not group:
@@ -62,7 +62,7 @@ def tokenize_trajectory_groups(
                     tokenizer,
                     trajectory,
                     advantage,
-                    enable_assistant_message_training,
+                    allow_training_without_logprobs,
                 )
             )
         # Choose a random prompt id
@@ -91,7 +91,7 @@ def tokenize_trajectory(
     tokenizer: "PreTrainedTokenizerBase",
     trajectory: Trajectory,
     advantage: float,
-    enable_assistant_message_training: bool,
+    allow_training_without_logprobs: bool,
 ) -> TokenizedResult:
     """
     Tokenizes a trajectory and returns a TokenizedResult.
@@ -101,7 +101,7 @@ def tokenize_trajectory(
         if (
             isinstance(msg_or_choice, dict)
             and msg_or_choice["role"] == "assistant"
-            and enable_assistant_message_training
+            and allow_training_without_logprobs
         ):
             last_assistant_idx = i
         elif not isinstance(msg_or_choice, dict):
@@ -151,13 +151,13 @@ def tokenize_trajectory(
             ),
             tools=trajectory.tools,  # type: ignore
             return_dict=True,
-            return_assistant_token_mask=enable_assistant_message_training,
+            return_assistant_token_mask=allow_training_without_logprobs,
         ),
     )
     token_ids: list[int] = result["input_ids"]
     assistant_mask: list[int] = (
         result["attention_mask"]
-        if enable_assistant_message_training
+        if allow_training_without_logprobs
         else [0] * len(token_ids)
     )
     logprobs = [float("nan")] * len(token_ids)
