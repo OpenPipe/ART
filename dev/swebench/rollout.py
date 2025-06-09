@@ -59,7 +59,10 @@ async def rollout(
 
 
 @observe(capture_input=False, capture_output=False)
-@art.retry(max_attempts=2, exceptions=(modal.exception.SandboxTimeoutError,))
+@art.retry(
+    max_attempts=2,
+    exceptions=(modal.exception.SandboxTimeoutError,),
+)
 async def rollout(
     model: art.Model[ModelConfig],
     instance: Instance,
@@ -100,6 +103,9 @@ async def rollout(
         )
     try:
         await run(run_single.run, run_in_thread)
+    except modal.exception.RemoteError as e:
+        print(instance["instance_id"])
+        print(e)
     except ConnectionError as e:
         print(e)
     except CommandTimeoutError as e:

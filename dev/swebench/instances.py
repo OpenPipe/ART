@@ -37,6 +37,7 @@ def get_filtered_swe_smith_instances_df() -> pl.DataFrame:
             .cast(pl.Utf8)
             .is_in(
                 [
+                    "swesmith/conan-io__conan.86f29e13",
                     "swesmith/facebookresearch__hydra.0f03eb60",
                     "swesmith/marshmallow-code__marshmallow.9716fc62",
                     "swesmith/mido__mido.a0158ff9",

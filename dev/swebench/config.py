@@ -162,7 +162,8 @@ def get_config(
     return RunSingleConfig(
         env=EnvironmentConfig(
             deployment=ModalDeploymentConfig(
-                image=instance["image_name"], deployment_timeout=3600.0
+                image=instance["image_name"],
+                deployment_timeout=60.0 * 60 * 2,
             ),
             repo=PreExistingRepoConfig(
                 repo_name="testbed", base_commit=instance["base_commit"]
