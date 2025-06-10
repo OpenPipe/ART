@@ -34,6 +34,7 @@ class SkyPilotBackend(Backend):
         art_version: str | None = None,
         env_path: str | None = None,
         force_restart: bool = False,
+        path: str | None = None,
     ) -> "SkyPilotBackend":
         self = cls.__new__(cls)
         self._cluster_name = cluster_name
@@ -123,7 +124,7 @@ class SkyPilotBackend(Backend):
         print(f"Using base_url: {base_url}")
 
         # Manually call the real __init__ now that base_url is ready
-        super(SkyPilotBackend, self).__init__(base_url=base_url)
+        super(SkyPilotBackend, self).__init__(base_url=base_url, path=path)
 
         return self
 
