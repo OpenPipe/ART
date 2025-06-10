@@ -6,7 +6,6 @@ from dotenv import load_dotenv
 import art
 from art.backend import Backend
 from art.utils.get_model_step import get_model_step
-from art.utils.output_dirs import get_default_art_path
 from art.utils.s3 import pull_model_from_s3
 
 
