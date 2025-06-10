@@ -319,8 +319,10 @@ def update_trajectory(
     # regression of passing tests
     progress = clamp(num_passed_f2p / len(instance["FAIL_TO_PASS"]), 0.0, 1.0)
     failure = clamp(num_failed_f2p / len(instance["FAIL_TO_PASS"]), 0.0, 1.0)
-    maintenance = clamp(num_passed_p2p / len(instance["PASS_TO_PASS"]), 0.0, 1.0)
-    regression = clamp(num_failed_p2p / len(instance["PASS_TO_PASS"]), 0.0, 1.0)
+    maintenance = clamp(
+        num_passed_p2p / max(len(instance["PASS_TO_PASS"]), 1), 0.0, 1.0
+    )
+    regression = clamp(num_failed_p2p / max(len(instance["PASS_TO_PASS"]), 1), 0.0, 1.0)
     # reconcile metrics pessimistically
     progress, failure = min(progress, 1 - failure), max(failure, 1 - progress)
     maintenance, regression = (
