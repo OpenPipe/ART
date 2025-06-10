@@ -312,28 +312,36 @@ def update_trajectory(
     """
     Update a trajectory with instance test results
     """
-    # Penalize missing or errored tests
-    num_missing = max(
-        len(instance["FAIL_TO_PASS"])
-        + len(instance["PASS_TO_PASS"])
-        - (num_failed_f2p + num_passed_f2p + num_failed_p2p + num_passed_p2p),
-        0,
+    # calculate the following (clamped) metrics:
+    # progress towards fixing failing tests
+    # failure to fix failing tests
+    # maintenance of passing tests
+    # regression of passing tests
+    progress = clamp(num_passed_f2p / len(instance["FAIL_TO_PASS"]), 0.0, 1.0)
+    failure = clamp(num_failed_f2p / len(instance["FAIL_TO_PASS"]), 0.0, 1.0)
+    maintenance = clamp(num_passed_p2p / len(instance["PASS_TO_PASS"]), 0.0, 1.0)
+    regression = clamp(num_failed_p2p / len(instance["PASS_TO_PASS"]), 0.0, 1.0)
+    # reconcile metrics pessimistically
+    progress, failure = min(progress, 1 - failure), max(failure, 1 - progress)
+    maintenance, regression = (
+        min(maintenance, 1 - regression),
+        max(regression, 1 - maintenance),
     )
-    # Max reward (1.0) occurs when all failing tests pass, no passing tests regress, and no tests are missing or errored.
-    # A reward of 0.5 (roughly) reflects the status quo with no net change in test outcomes.
-    # Less than 0.5 reward indicates more tests fail after the rollout than before.
-    # A reward of 0.0 indicates that all tests fail after the rollout.
-    net_change = num_passed_f2p - num_failed_p2p - num_missing
-    reward = (
-        (net_change / len(instance["FAIL_TO_PASS"])) ** reward_power
-        if net_change > 0
-        else net_change / max(len(instance["PASS_TO_PASS"]), 1)
-    ) * 0.5 + 0.5
-    # Clamp reward to [0, 1] range
-    trajectory.reward = max(0.0, min(1.0, reward))
-    trajectory.metrics["resolved"] = (
+    # determine if the instance was successfully resolved
+    resolved = (
         num_failed_f2p == 0
         and num_passed_f2p == len(instance["FAIL_TO_PASS"])
         and num_failed_p2p == 0
         and num_passed_p2p == len(instance["PASS_TO_PASS"])
     )
+    # calculate reward and save metrics
+    trajectory.reward = (
+        0.45 * maintenance + 0.45 * progress**reward_power + 0.1 * resolved
+    )
+    trajectory.metrics["progress"] = progress
+    trajectory.metrics["maintenance"] = maintenance
+    trajectory.metrics["resolved"] = resolved
+
+
+def clamp(value: float, min_value: float, max_value: float) -> float:
+    return max(min_value, min(value, max_value))
