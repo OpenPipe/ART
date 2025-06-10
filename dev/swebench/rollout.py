@@ -214,16 +214,6 @@ class PatchRuntimeRunHook(RunHook):
 
         self.deployment.stop = _stop
 
-        # # Patch the runtime to use longer default timeouts for commands
-        # original_run_in_session = runtime.run_in_session
-
-        # def patched_run_in_session(action):
-        #     if hasattr(action, "timeout") and action.timeout == 30.0:
-        #         action.timeout = 120.0
-        #     return original_run_in_session(action)
-
-        # runtime.run_in_session = patched_run_in_session
-
 
 class RewardRunHook(RunHook):
     """

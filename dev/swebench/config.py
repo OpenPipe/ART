@@ -128,7 +128,7 @@ Your command ran successfully and did not produce any output.
 SUBMIT_REVIEW_MESSAGE = """
 Thank you for your work on this issue. Please carefully follow the steps below to help review your changes.
 
-1. If you made any changes to your code after runnin''''' k,k,k,                                                ,,,,,j[[`g the reproduction script, please run the reproduction script again.
+1. If you made any changes to your code after running the reproduction script, please run the reproduction script again.
 If the reproduction script is failing, please revisit your changes and make sure they are correct.
 If you have already removed your reproduction script, please ignore this step.
 2. Remove your reproduction script (if you haven't done so already).
