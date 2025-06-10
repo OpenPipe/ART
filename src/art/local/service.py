@@ -4,9 +4,11 @@ import functools
 import torch
 from typing import AsyncIterator, TYPE_CHECKING
 
+from art.utils.get_model_step import get_step_from_dir
+
 from .. import dev
 from .. import types
-from .checkpoints import get_step, get_last_checkpoint_dir
+from .checkpoints import get_last_checkpoint_dir
 from .pack import DiskPackedTensors, packed_tensors_from_dir, PackedTensors
 from .train import train
 
@@ -145,7 +147,9 @@ class ModelService:
             if verbose:
                 print("Saving new LoRA adapter...")
             # Save the new LoRA adapter
-            checkpoint_dir = f"{self.output_dir}/{get_step(self.output_dir) + 1:04d}"
+            checkpoint_dir = (
+                f"{self.output_dir}/{get_step_from_dir(self.output_dir) + 1:04d}"
+            )
             self.state.trainer.save_model(checkpoint_dir)
             if verbose:
                 print("Setting new LoRA adapter...")

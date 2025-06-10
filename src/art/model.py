@@ -1,13 +1,15 @@
 import httpx
 from openai import AsyncOpenAI, DefaultAsyncHttpxClient
 from pydantic import BaseModel
-from typing import cast, Generic, Iterable, Optional, overload, TypeVar
+from typing import cast, Generic, Iterable, Optional, overload, TypeVar, TYPE_CHECKING
 
 from . import dev
-from .backend import Backend
 from .openai import patch_openai
 from .trajectories import Trajectory, TrajectoryGroup
 from .types import TrainConfig
+
+if TYPE_CHECKING:
+    from art.backend import Backend
 
 
 ModelConfig = TypeVar("ModelConfig", bound=BaseModel | None)
