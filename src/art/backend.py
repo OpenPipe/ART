@@ -7,6 +7,7 @@ import os
 from art.errors import UnsupportedLoRADeploymentProviderError
 from art.utils import get_model_step, log_http_errors
 from art.utils.deploy_model import (
+    LoRADeploymentProvider,
     LoRADeploymentJob,
     check_together_job_status,
     deploy_together,
@@ -22,7 +23,6 @@ from .types import TrainConfig
 
 if TYPE_CHECKING:
     from .model import Model, TrainableModel
-    from art.utils.deploy_model import LoRADeploymentProvider
 
 
 class Backend:
@@ -194,7 +194,7 @@ class Backend:
     @log_http_errors
     async def _experimental_deploy_remote(
         self,
-        deploy_to: "LoRADeploymentProvider",
+        deploy_to: LoRADeploymentProvider,
         model: "Model",
         step: int | None = None,
         s3_bucket: str | None = None,
@@ -229,7 +229,7 @@ class Backend:
     # shared between LocalBackend and remote backends
     async def _experimental_deploy(
         self,
-        deploy_to: "LoRADeploymentProvider",
+        deploy_to: LoRADeploymentProvider,
         model: "TrainableModel",
         step: int | None = None,
         s3_bucket: str | None = None,
