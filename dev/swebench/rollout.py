@@ -93,7 +93,11 @@ async def rollout(
         )
     assert isinstance(config.agent, DefaultAgentConfig)
     trajectory = art.Trajectory(
-        messages_and_choices=[], reward=0.0, tools=config.agent.tools.tools
+        messages_and_choices=[],
+        reward=0.0,
+        tools=(
+            config.agent.tools.tools if not model.config.xml_function_calling else None
+        ),
     )
     if isinstance(run_single.env.deployment, ModalDeployment):
         run_single.add_hook(PatchRuntimeRunHook(run_single.env.deployment))
