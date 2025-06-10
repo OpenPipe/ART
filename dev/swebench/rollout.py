@@ -7,7 +7,7 @@ from pathlib import Path
 from pydantic import BaseModel
 import requests
 from requests import adapters as requests_adapters
-from requests.exceptions import SSLError
+from requests.exceptions import ConnectTimeout, SSLError
 from sweagent.agent.agents import DefaultAgent, DefaultAgentConfig
 from sweagent.run.hooks.abstract import RunHook
 from sweagent.run.run_replay import RunReplay
@@ -107,6 +107,8 @@ async def rollout(
         print(instance["instance_id"])
         print(e)
     except ConnectionError as e:
+        print(e)
+    except ConnectTimeout as e:
         print(e)
     except CommandTimeoutError as e:
         print(e)
@@ -322,11 +324,13 @@ def update_trajectory(
     # Less than 0.5 reward indicates more tests fail after the rollout than before.
     # A reward of 0.0 indicates that all tests fail after the rollout.
     net_change = num_passed_f2p - num_failed_p2p - num_missing
-    trajectory.reward = (
+    reward = (
         (net_change / len(instance["FAIL_TO_PASS"])) ** reward_power
         if net_change > 0
         else net_change / max(len(instance["PASS_TO_PASS"]), 1)
     ) * 0.5 + 0.5
+    # Clamp reward to [0, 1] range
+    trajectory.reward = max(0.0, min(1.0, reward))
     trajectory.metrics["resolved"] = (
         num_failed_f2p == 0
         and num_passed_f2p == len(instance["FAIL_TO_PASS"])

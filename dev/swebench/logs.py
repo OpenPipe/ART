@@ -16,32 +16,91 @@ litellm.failure_callback.append("langfuse")
 logging.getLogger("urllib3.connectionpool").setLevel(logging.ERROR)
 
 
-# # Custom filter to suppress swerex and rex-deploy related critical logs
-# class SuppressSwerexLogsFilter(logging.Filter):
-#     def filter(self, record):
-#         # Suppress logs from rex-deploy loggers
-#         if record.name.startswith("rex-deploy"):
-#             return False
-#         # Suppress swerex exception logs
-#         if "swerex.exceptions" in record.getMessage() or "swerex.exceptions" in str(
-#             record.exc_info
-#         ):
-#             return False
-#         # Suppress CommandTimeoutError and BashIncorrectSyntaxError logs
-#         if any(
-#             error in record.getMessage()
-#             for error in [
-#                 "CommandTimeoutError",
-#                 "BashIncorrectSyntaxError",
-#                 "pexpect.exceptions.TIMEOUT",
-#             ]
-#         ):
-#             return False
-#         return True
+# Configuration for log suppression
+SUPPRESS_CONFIG = {
+    # Logger names to completely suppress
+    "suppress_loggers": [
+        "rex-deploy",  # All rex-deploy-ThreadPoolExecutor logs
+        "swea-lm",  # All swea-lm-ThreadPoolExecutor logs
+    ],
+    # Exception types to suppress (will check exception class name)
+    "suppress_exceptions": [
+        "CommandTimeoutError",
+        "BashIncorrectSyntaxError",
+        "NonZeroExitCodeError",
+        "FileNotFoundError",
+        "TIMEOUT",  # pexpect.exceptions.TIMEOUT
+    ],
+    # Specific strings in messages to suppress
+    "suppress_message_contains": [
+        "swerex.exceptions",
+        "pexpect.exceptions",
+        "Retrying LM query",
+        "APITimeoutError",
+        "Request timed out",
+    ],
+    # Module/package prefixes to suppress
+    "suppress_modules": [
+        "swerex.",
+        "pexpect.",
+    ],
+}
 
 
-# # Apply the filter to the root logger to catch all logs
-# logging.getLogger().addFilter(SuppressSwerexLogsFilter())
+class ComprehensiveLogFilter(logging.Filter):
+    """
+    Comprehensive filter to suppress unwanted logs based on multiple criteria.
+    """
+
+    def __init__(self, config=None):
+        super().__init__()
+        self.config = config or SUPPRESS_CONFIG
+
+    def filter(self, record: LogRecord) -> bool:
+        # Check logger name prefixes
+        for logger_prefix in self.config.get("suppress_loggers", []):
+            if record.name.startswith(logger_prefix):
+                return False
+
+        # Check module name
+        if hasattr(record, "module"):
+            for module_prefix in self.config.get("suppress_modules", []):
+                if record.module.startswith(module_prefix):
+                    return False
+
+        # Check message content
+        message = record.getMessage()
+        for substring in self.config.get("suppress_message_contains", []):
+            if substring in message:
+                return False
+
+        # Check exception info
+        if record.exc_info:
+            exc_type, exc_value, exc_tb = record.exc_info
+            if exc_type:
+                exc_name = exc_type.__name__
+                # Check against suppressed exception types
+                for exc_pattern in self.config.get("suppress_exceptions", []):
+                    if exc_pattern in exc_name:
+                        return False
+
+                # Also check the full module path of the exception
+                exc_module = exc_type.__module__
+                for module_prefix in self.config.get("suppress_modules", []):
+                    if exc_module.startswith(module_prefix):
+                        return False
+
+        return True
+
+
+# Apply the comprehensive filter to root logger
+logging.getLogger().addFilter(ComprehensiveLogFilter())
+
+# Additionally, you can set specific loggers to higher levels
+# to avoid processing their logs at all
+for logger_name in SUPPRESS_CONFIG.get("suppress_loggers", []):
+    logging.getLogger(logger_name).setLevel(logging.CRITICAL + 1)
+
 
 # Disable printing the patch message to reduce log noise
 SaveApplyPatchHook._print_patch_message = lambda *args, **kwargs: None
