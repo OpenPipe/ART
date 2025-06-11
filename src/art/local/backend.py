@@ -184,6 +184,9 @@ class LocalBackend(Backend):
         return packed_tensors
 
     async def _get_step(self, model: TrainableModel) -> int:
+        return self.__get_step(model)
+
+    def __get_step(self, model: TrainableModel) -> int:
         return get_model_step(model, self._path)
 
     async def _delete_checkpoints(
