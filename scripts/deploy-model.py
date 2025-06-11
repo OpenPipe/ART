@@ -21,8 +21,9 @@ def parse_args() -> argparse.Namespace:
         description="Deploy a model checkpoint using ART & SkyPilot"
     )
 
-    parser.add_argument("--model", required=True, help="Name of the model to deploy")
     parser.add_argument("--project", required=True, help="ART project name")
+    parser.add_argument("--model", required=True, help="Name of the model to deploy")
+    parser.add_argument("--base-model", required=True, help="Base model to use")
 
     # Optional arguments
     parser.add_argument(
@@ -55,8 +56,7 @@ async def deploy() -> None:
     model = art.TrainableModel(
         name=args.model,
         project=args.project,
-        # base model is not used for deployment, but is required for model init
-        base_model="meta-llama/Meta-Llama-3.1-8B-Instruct",
+        base_model=args.base_model,
     )
 
     if args.step == "latest":
