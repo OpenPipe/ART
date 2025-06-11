@@ -4,7 +4,7 @@ import os
 from dotenv import load_dotenv
 
 import art
-from art.backend import Backend
+from art.utils.deploy_model import deploy_model
 from art.utils.get_model_step import get_model_step
 from art.utils.s3 import pull_model_from_s3
 
@@ -47,7 +47,7 @@ def parse_args() -> argparse.Namespace:
 # ---------------------------------------------------------------------------
 
 
-async def deploy_model() -> None:
+async def deploy() -> None:
     args = parse_args()
 
     backup_bucket = args.backup_bucket or os.environ["BACKUP_BUCKET"]
@@ -106,4 +106,4 @@ async def deploy_model() -> None:
 
 
 if __name__ == "__main__":
-    asyncio.run(deploy_model())
+    asyncio.run(deploy())
