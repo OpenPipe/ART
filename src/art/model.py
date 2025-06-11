@@ -1,7 +1,8 @@
 import httpx
 from openai import AsyncOpenAI, DefaultAsyncHttpxClient
 from pydantic import BaseModel
-from typing import cast, Generic, Iterable, Optional, overload, TypeVar, TYPE_CHECKING
+from typing import TYPE_CHECKING, cast, Generic, Iterable, Optional, overload, TypeVar
+from typing_extensions import Never
 
 from . import dev
 from .openai import patch_openai
@@ -68,6 +69,27 @@ class Model(
     _s3_prefix: str | None = None
     _openai_client: AsyncOpenAI | None = None
 
+    def __init__(
+        self,
+        *,
+        name: str,
+        project: str,
+        config: ModelConfig | None = None,
+        inference_api_key: str | None = None,
+        inference_base_url: str | None = None,
+        inference_model_name: str | None = None,
+        **kwargs: Never,
+    ) -> None:
+        super().__init__(
+            name=name,
+            project=project,
+            config=config,
+            inference_api_key=inference_api_key,
+            inference_base_url=inference_base_url,
+            inference_model_name=inference_model_name,
+            **kwargs,
+        )
+
     @overload
     def __new__(
         cls,
@@ -77,6 +99,7 @@ class Model(
         config: None = None,
         inference_api_key: str | None = None,
         inference_base_url: str | None = None,
+        inference_model_name: str | None = None,
     ) -> "Model[None]": ...
 
     @overload
@@ -88,6 +111,7 @@ class Model(
         config: ModelConfig,
         inference_api_key: str | None = None,
         inference_base_url: str | None = None,
+        inference_model_name: str | None = None,
     ) -> "Model[ModelConfig]": ...
 
     def __new__(
@@ -211,14 +235,15 @@ class TrainableModel(Model[ModelConfig], Generic[ModelConfig]):
         config: ModelConfig | None = None,
         base_model: str,
         _internal_config: dev.InternalModelConfig | None = None,
+        **kwargs: Never,
     ) -> None:
         super().__init__(
             name=name,
             project=project,
             config=config,
             base_model=base_model,  # type: ignore
+            **kwargs,
         )
-        self.base_model = base_model
         if _internal_config is not None:
             # Bypass BaseModel __setattr__ to allow setting private attr
             object.__setattr__(self, "_internal_config", _internal_config)
@@ -250,7 +275,7 @@ class TrainableModel(Model[ModelConfig], Generic[ModelConfig]):
         *args,
         **kwargs,
     ) -> "TrainableModel[ModelConfig] | TrainableModel[None]":
-        return super().__new__(cls)
+        return super().__new__(cls)  # type: ignore
 
     def model_dump(self, *args, **kwargs) -> dict:
         data = super().model_dump(*args, **kwargs)
