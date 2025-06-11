@@ -8,8 +8,13 @@ from enum import Enum
 from art.errors import (
     LoRADeploymentTimedOutError,
     UnsupportedBaseModelDeploymentError,
+    UnsupportedLoRADeploymentProviderError,
 )
 from pydantic import BaseModel
+
+from art.utils.get_model_step import get_model_step
+from art.utils.output_dirs import get_default_art_path
+from art.utils.s3 import archive_and_presign_step_url, pull_model_from_s3
 
 if TYPE_CHECKING:
     from art.model import TrainableModel
@@ -194,4 +199,80 @@ async def wait_for_together_job(
 
     raise LoRADeploymentTimedOutError(
         message=f"LoRA deployment timed out after 5 minutes. Job ID: {job_id}"
+    )
+
+
+async def deploy_model(
+    deploy_to: LoRADeploymentProvider,
+    model: "TrainableModel",
+    step: int | None = None,
+    s3_bucket: str | None = None,
+    prefix: str | None = None,
+    verbose: bool = False,
+    pull_s3: bool = True,
+    wait_for_completion: bool = True,
+    art_path: str | None = get_default_art_path(),
+) -> LoRADeploymentJob:
+    """
+    Deploy the model's latest checkpoint to a hosted inference endpoint.
+
+    Together is currently the only supported provider. See link for supported base models:
+    https://docs.together.ai/docs/lora-inference#supported-base-models
+    """
+
+    os.makedirs(art_path, exist_ok=True)
+    if pull_s3:
+        # pull the latest step from S3
+        await pull_model_from_s3(
+            model_name=model.name,
+            project=model.project,
+            step=step,
+            s3_bucket=s3_bucket,
+            prefix=prefix,
+            verbose=verbose,
+            art_path=art_path,
+        )
+
+    if step is None:
+        step = get_model_step(model, art_path)
+
+    presigned_url = await archive_and_presign_step_url(
+        model_name=model.name,
+        project=model.project,
+        step=step,
+        s3_bucket=s3_bucket,
+        prefix=prefix,
+        verbose=verbose,
+        art_path=art_path,
+    )
+
+    if deploy_to == LoRADeploymentProvider.TOGETHER:
+        existing_job_id = await find_existing_together_job_id(model, step)
+        existing_job = None
+        if existing_job_id is not None:
+            existing_job = await check_together_job_status(
+                existing_job_id, verbose=verbose
+            )
+
+        if not existing_job or existing_job.status == "Failed":
+            deployment_result = await deploy_together(
+                model=model,
+                presigned_url=presigned_url,
+                step=step,
+                verbose=verbose,
+            )
+            job_id = deployment_result["data"]["job_id"]
+        else:
+            job_id = existing_job_id
+            print(
+                f"Previous deployment for {model.name} at step {step} has status '{existing_job.status}', skipping redployment"
+            )
+
+        if wait_for_completion:
+            return await wait_for_together_job(job_id, verbose=verbose)
+        else:
+            return await check_together_job_status(job_id, verbose=verbose)
+
+    raise UnsupportedLoRADeploymentProviderError(
+        f"Unsupported deployment option: {deploy_to}"
     )

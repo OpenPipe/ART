@@ -52,8 +52,6 @@ async def deploy_model() -> None:
 
     backup_bucket = args.backup_bucket or os.environ["BACKUP_BUCKET"]
 
-    backend = Backend()
-
     model = art.TrainableModel(
         name=args.model,
         project=args.project,
@@ -88,13 +86,14 @@ async def deploy_model() -> None:
         f"using checkpoints from s3://{backup_bucket}…"
     )
 
-    deployment_result = await backend._experimental_deploy(
+    deployment_result = await deploy_model(
         deploy_to="together",
         model=model,
         step=step,
         verbose=True,
         pull_s3=False,
         wait_for_completion=True,
+        art_path=args.art_path,
     )
 
     if deployment_result.status == "Failed":

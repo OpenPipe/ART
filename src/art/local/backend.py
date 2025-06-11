@@ -1,6 +1,11 @@
 import json
 import math
 
+from art.utils.deploy_model import (
+    LoRADeploymentJob,
+    LoRADeploymentProvider,
+    deploy_model,
+)
 from art.utils.old_benchmarking.calculate_step_metrics import calculate_step_std_dev
 from art.utils.output_dirs import (
     get_default_art_path,
@@ -430,5 +435,34 @@ class LocalBackend(Backend):
             prefix=prefix,
             verbose=verbose,
             delete=delete,
+            art_path=self._path,
+        )
+
+    async def _experimental_deploy(
+        self,
+        deploy_to: LoRADeploymentProvider,
+        model: "TrainableModel",
+        step: int | None = None,
+        s3_bucket: str | None = None,
+        prefix: str | None = None,
+        verbose: bool = False,
+        pull_s3: bool = True,
+        wait_for_completion: bool = True,
+    ) -> LoRADeploymentJob:
+        """
+        Deploy the model's latest checkpoint to a hosted inference endpoint.
+
+        Together is currently the only supported provider. See link for supported base models:
+        https://docs.together.ai/docs/lora-inference#supported-base-models
+        """
+        return await deploy_model(
+            deploy_to=deploy_to,
+            model=model,
+            step=step,
+            s3_bucket=s3_bucket,
+            prefix=prefix,
+            verbose=verbose,
+            pull_s3=pull_s3,
+            wait_for_completion=wait_for_completion,
             art_path=self._path,
         )
