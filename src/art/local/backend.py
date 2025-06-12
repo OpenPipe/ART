@@ -105,6 +105,15 @@ class LocalBackend(Backend):
         os.makedirs(output_dir, exist_ok=True)
         with open(f"{output_dir}/model.json", "w") as f:
             json.dump(model.model_dump(), f)
+        
+        # Initialize wandb and weave early if this is a trainable model
+        if isinstance(model, TrainableModel) and "WANDB_API_KEY" in os.environ:
+            # This will initialize wandb early
+            run = self._get_wandb_run(model)
+            if run:
+                # Initialize weave with the same project
+                from art.utils.weave_integration import init_weave_with_wandb
+                init_weave_with_wandb(model.project)
 
     async def _get_service(self, model: TrainableModel) -> ModelService:
         if model.name not in self._services:
