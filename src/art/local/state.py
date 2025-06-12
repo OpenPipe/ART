@@ -39,7 +39,6 @@ class ModelState:
 
     def __init__(self, config: InternalModelConfig) -> None:
         from vllm.engine import async_llm_engine
-        from vllm.worker.multi_step_model_runner import MultiStepModelRunner
 
         # Patch MultiStepModelRunner for Unsloth compatibility
         if not hasattr(MultiStepModelRunner, "model"):
@@ -118,7 +117,11 @@ class ModelState:
 
 class vLLMState:
     def __init__(self, async_engine: AsyncLLMEngine, enable_sleep_mode: bool) -> None:
-        from .vllm import create_engine_pause_and_resume_functions, patch_allocator
+        from .vllm import (
+            create_engine_pause_and_resume_functions,
+            patch_allocator,
+            patch_multi_step_model_runner,
+        )
 
         if enable_sleep_mode:
             patch_allocator()
@@ -132,9 +135,8 @@ class vLLMState:
             "WorkerWrapperBase",
             getattr(self.async_engine.engine.model_executor, "driver_worker"),
         )
-        self.multi_step_model_runner: "MultiStepModelRunner" = (
-            self.driver_worker.model_runner
-        )
+        if isinstance(self.driver_worker.model_runner, MultiStepModelRunner):
+            patch_multi_step_model_runner(self.driver_worker.model_runner)
 
     @asynccontextmanager
     async def train_mode(self) -> AsyncGenerator[None, None]:

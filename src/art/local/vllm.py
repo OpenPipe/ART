@@ -6,23 +6,21 @@ import logging
 from openai import AsyncOpenAI
 import os
 import torch
-from typing import Any, AsyncIterator, Callable, Coroutine, TYPE_CHECKING, Optional
+from typing import Any, AsyncIterator, Callable, Coroutine, Optional
+from uvicorn.config import LOGGING_CONFIG
 from vllm.engine.async_llm_engine import AsyncLLMEngine
 from vllm.engine.protocol import EngineClient
 from vllm.entrypoints.openai.cli_args import make_arg_parser, validate_parsed_serve_args
 from vllm.lora.request import LoRARequest
 from vllm.logger import _DATE_FORMAT, _FORMAT
 from vllm.utils import FlexibleArgumentParser
-from uvicorn.config import LOGGING_CONFIG
+from vllm.worker.multi_step_model_runner import MultiStepModelRunner
 
 from ..dev.openai_server import OpenAIServerConfig
 
-if TYPE_CHECKING:
-    from .state import vLLMState
-
 
 async def openai_server_task(
-    state: "vLLMState",
+    engine: EngineClient,
     config: OpenAIServerConfig,
 ) -> asyncio.Task[None]:
     """
@@ -45,14 +43,13 @@ async def openai_server_task(
     patch_get_lora_tokenizer_async()
     patch_listen_for_disconnect()
     patch_tool_parser_manager()
-    patch_multi_step_model_runner(state)
     set_vllm_log_file(config.get("log_file", "vllm.log"))
 
     @asynccontextmanager
     async def build_async_engine_client(
         _: Namespace,
     ) -> AsyncIterator[EngineClient]:
-        yield state.async_engine
+        yield engine
 
     api_server.build_async_engine_client = build_async_engine_client
     openai_server_task = asyncio.create_task(_openai_server_coroutine(config))
@@ -226,7 +223,9 @@ def patch_allocator() -> None:
                         )
                         cpu_ptr = cpu_backup_tensor.data_ptr()
                         libcudart.cudaMemcpy(
-                            ctypes.c_void_p(ptr), ctypes.c_void_p(cpu_ptr), size_in_bytes
+                            ctypes.c_void_p(ptr),
+                            ctypes.c_void_p(cpu_ptr),
+                            size_in_bytes,
                         )
                         data.cpu_backup_tensor = None
 
@@ -269,13 +268,13 @@ def patch_get_lora_tokenizer_async() -> None:
 
     async def _return_nothing(*_, **__) -> None:
         return None
-    
+
     async def get_self_lora_tokenizer_async(self, *args, **kwargs):
         return self.tokenizer
 
     vllm.transformers_utils.tokenizer.get_lora_tokenizer_async = _return_nothing  # type: ignore
-    vllm.transformers_utils.tokenizer_group.get_lora_tokenizer_async = (
-        _return_nothing  # type: ignore
+    vllm.transformers_utils.tokenizer_group.get_lora_tokenizer_async = (  # type: ignore
+        _return_nothing
     )
     vllm.transformers_utils.tokenizer_group.TokenizerGroup.get_lora_tokenizer_async = get_self_lora_tokenizer_async  # type: ignore
 
@@ -323,19 +322,16 @@ def patch_tool_parser_manager() -> None:
     ToolParserManager.get_tool_parser = patched_get_tool_parser
 
 
-def patch_multi_step_model_runner(state: "vLLMState") -> None:
+def patch_multi_step_model_runner(runner: MultiStepModelRunner) -> None:
     """
-    Patches the vLLM multi-step model runner to support LoRA adapters.
+    Patches a MultiStepModelRunner to support LoRA adapters.
     """
-    model_runner = state.multi_step_model_runner  # type: ignore
-    if not hasattr(model_runner, "_base_model_runner"):
-        return
-    base_model_runner = model_runner._base_model_runner
-    model_runner.set_active_loras = base_model_runner.set_active_loras
-    model_runner.add_lora = base_model_runner.add_lora
-    model_runner.remove_lora = base_model_runner.remove_lora
-    model_runner.pin_lora = base_model_runner.pin_lora
-    model_runner.list_loras = base_model_runner.list_loras
+    base_runner = runner._base_model_runner
+    runner.set_active_loras = base_runner.set_active_loras
+    runner.add_lora = base_runner.add_lora
+    runner.remove_lora = base_runner.remove_lora
+    runner.pin_lora = base_runner.pin_lora
+    runner.list_loras = base_runner.list_loras
 
 
 def get_uvicorn_logging_config(path: str) -> dict[str, Any]:

@@ -53,7 +53,7 @@ class ModelService:
             self.state.trainer.save_model(lora_path)
         await self.stop_openai_server()
         self._openai_server_task = await openai_server_task(
-            state=self.state.vllm,
+            engine=self.state.vllm.async_engine,
             config=dev.get_openai_server_config(
                 model_name=self.model_name,
                 base_model=self.base_model,
@@ -132,9 +132,9 @@ class ModelService:
                     for task in done:
                         result = task.result()
                         # If `result` is `None`, the training task finished somehow.
-                        assert result is not None, (
-                            "The training task should never finish."
-                        )
+                        assert (
+                            result is not None
+                        ), "The training task should never finish."
                         self.results_queue.task_done()
                         if warmup:
                             from .state import free_memory
