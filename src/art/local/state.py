@@ -120,11 +120,16 @@ class vLLMState:
         from .vllm import (
             create_engine_pause_and_resume_functions,
             patch_allocator,
+            patch_lora_request,
+            patch_get_lora_tokenizer_async,
             patch_multi_step_model_runner,
         )
 
         if enable_sleep_mode:
             patch_allocator()
+        # Unsloth patches
+        patch_lora_request()
+        patch_get_lora_tokenizer_async()
         self.async_engine = async_engine
         if enable_sleep_mode:
             self.pause_engine, self.resume_engine = (

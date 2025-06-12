@@ -39,8 +39,6 @@ async def openai_server_task(
     subclass_chat_completion_request()
     from vllm.entrypoints.openai import api_server
 
-    patch_lora_request()
-    patch_get_lora_tokenizer_async()
     patch_listen_for_disconnect()
     patch_tool_parser_manager()
     set_vllm_log_file(config.get("log_file", "vllm.log"))
