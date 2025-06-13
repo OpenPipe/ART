@@ -1,11 +1,13 @@
 import asyncio
 import cloudpickle
+import contextvars
 import ctypes
 from dataclasses import replace
 import torch
-from typing import Any, Callable, ParamSpec, TypeVar
+from typing import Any, Callable, cast, ParamSpec, TypeVar
 import vllm
 from vllm.v1.engine.async_llm import AsyncLLM
+from vllm.v1.worker.gpu_worker import Worker
 
 
 async def get_llm(args: vllm.AsyncEngineArgs) -> AsyncLLM:
@@ -128,7 +130,20 @@ async def run_on_workers(
     )
 
 
+# Context variable to hold the current worker
+_worker: contextvars.ContextVar[Worker] = contextvars.ContextVar("worker")
+
+
+def get_worker() -> Worker:
+    """Get the current worker instance"""
+    return _worker.get()
+
+
 class WorkerExtension:
     def run(self, pickled_func: bytes, *args: Any, **kwargs: Any) -> Any:
         func = cloudpickle.loads(pickled_func)
-        return func(*args, **kwargs)
+        token = _worker.set(cast(Worker, self))
+        try:
+            return func(*args, **kwargs)
+        finally:
+            _worker.reset(token)
