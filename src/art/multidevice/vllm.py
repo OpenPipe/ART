@@ -27,7 +27,7 @@ async def get_llm(args: vllm.AsyncEngineArgs) -> AsyncLLM:
         )
     )
     await run_on_workers(llm, patch_allocator)
-    await run_on_workers(llm, patch_worker_sleep)
+    # await run_on_workers(llm, patch_worker_sleep)
     return llm
 
 
