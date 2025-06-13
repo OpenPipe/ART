@@ -140,6 +140,44 @@ def patch_worker_sleep() -> None:
     worker.sleep = sleep
 
 
+def patch_executor_get_class() -> None:
+    """
+    Patch the vLLM Executor.get_class static method to customize executor selection.
+    """
+    from vllm.v1.executor.abstract import Executor
+    from vllm.config import VllmConfig
+
+    # Store the original method
+    _original_get_class = Executor.get_class
+
+    @staticmethod
+    def get_class(vllm_config: VllmConfig) -> type[Executor]:
+        """
+        Patched version of Executor.get_class that creates a custom subclass of the executor.
+        """
+        # Get the original executor class
+        base_executor_class = _original_get_class(vllm_config)
+
+        # Create a custom subclass dynamically
+        class CustomExecutor(base_executor_class):
+            """
+            Custom executor that extends the base executor with additional functionality.
+            """
+
+            def sleep(self, level: int = 1) -> None:
+                super().sleep(level)
+                self.is_sleeping = False
+
+        # Set a meaningful name for the custom class
+        CustomExecutor.__name__ = f"Custom{base_executor_class.__name__}"
+        CustomExecutor.__qualname__ = f"patch_executor_get_class.<locals>.get_class.<locals>.Custom{base_executor_class.__name__}"
+
+        return CustomExecutor
+
+    # Replace the static method
+    Executor.get_class = get_class
+
+
 P = ParamSpec("P")
 R = TypeVar("R")
 
