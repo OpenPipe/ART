@@ -89,8 +89,8 @@ def patch_allocator() -> None:
                 data.cpu_backup_tensor = cpu_backup_tensor
             unmap_and_release(handle)
 
-        gc.collect()
-        torch.cuda.empty_cache()
+        # gc.collect()
+        # torch.cuda.empty_cache()
 
     def wake_up(tags: list[str] | None = None) -> None:
         """
@@ -122,12 +122,19 @@ def patch_allocator() -> None:
 
 
 def patch_worker_sleep() -> None:
+    import gc
+    import time
+
     worker = get_worker()
     _sleep = worker.sleep
 
     def sleep(level: int = 1) -> None:
         _sleep(level)
+        time.sleep(0.1)
         os.kill(os.getpid(), signal.SIGSTOP)
+        # gc.collect()
+        # torch.cuda.empty_cache()
+        time.sleep(2.0)
         worker.wake_up()
 
     worker.sleep = sleep
