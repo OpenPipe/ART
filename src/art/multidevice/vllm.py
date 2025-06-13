@@ -124,20 +124,13 @@ def patch_allocator() -> None:
 def patch_worker_sleep() -> None:
     worker = get_worker()
     _sleep = worker.sleep
-    _execute_model = worker.execute_model
 
     def sleep(level: int = 1) -> None:
         _sleep(level)
-        setattr(worker, "_is_sleeping", True)
         os.kill(os.getpid(), signal.SIGSTOP)
-
-    def execute_model(*args: Any, **kwargs: Any) -> Any:
-        if getattr(worker, "_is_sleeping", False):
-            worker.wake_up()
-        return _execute_model(*args, **kwargs)
+        worker.wake_up()
 
     worker.sleep = sleep
-    worker.execute_model = execute_model
 
 
 P = ParamSpec("P")
