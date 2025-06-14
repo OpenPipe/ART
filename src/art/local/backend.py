@@ -102,12 +102,7 @@ class LocalBackend(Backend):
         
         # Initialize wandb and weave early if this is a trainable model
         if isinstance(model, TrainableModel) and "WANDB_API_KEY" in os.environ:
-            # This will initialize wandb early
-            run = self._get_wandb_run(model)
-            if run:
-                # Initialize weave with the same project
-                from art.utils.weave_integration import init_weave_with_wandb
-                init_weave_with_wandb(model.project)
+            _ = self._get_wandb_run(model)
 
     async def _get_service(self, model: TrainableModel) -> ModelService:
         if model.name not in self._services:
