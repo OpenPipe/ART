@@ -13,8 +13,8 @@ random.seed(42)
 
 # Declare the model
 model = art.TrainableModel(
-    name="qwen25-7b-instruct",
-    project="2048-2",
+    name="001",
+    project="2048",
     base_model="Qwen/Qwen2.5-7B-Instruct",
 )
 # To run on a T4, we need to override some config defaults.
@@ -35,10 +35,10 @@ async def main():
     backend = LocalBackend()
 
     # print(f"Pulling from S3 bucket: `{os.environ['BACKUP_BUCKET']}`")
-    # await backend._experimental_pull_from_s3(
-    #     model,
-    #     verbose=True,
-    # )
+    await backend._experimental_pull_from_s3(
+        model,
+        verbose=True,
+    )
 
     # Register the model with the local backend (sets up logging, inference, and training)
     await model.register(backend)
@@ -55,9 +55,9 @@ async def main():
             max_exceptions=10,
         )
         await model.delete_checkpoints()
-        # await backend._experimental_push_to_s3(
-        #     model,
-        # )
+        await backend._experimental_push_to_s3(
+            model,
+        )
         await model.train(
             train_groups,
             config=art.TrainConfig(learning_rate=3e-5),
