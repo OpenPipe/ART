@@ -11,8 +11,7 @@ from openai.types.chat.chat_completion_message_tool_call import (
     ChatCompletionMessageToolCall,
     Function,
 )
-from typing import Any, Callable
-import weave
+from typing import Any, AsyncIterator, Callable, cast
 
 from .gather import get_gather_context
 
@@ -29,14 +28,14 @@ def patch_openai(client: openai.AsyncOpenAI) -> openai.AsyncOpenAI:
     async def create_patched(*args: Any, **kwargs: Any) -> ChatCompletion | AsyncStream:
         return_stream = kwargs.get("stream", False)
         context = get_gather_context()
-        if context.pbar_total_completion_tokens and weave.get_current_call() is None:
+        if context.pbar_total_completion_tokens:
             kwargs["stream"] = True
             kwargs["stream_options"] = {"include_usage": True}
         return_value = await create(*args, **kwargs)
-        if isinstance(return_value, ChatCompletion) or weave.get_current_call() is not None:
+        if not isinstance(return_value, AsyncIterator):
             report_usage(return_value)
             return return_value
-        assert isinstance(return_value, AsyncStream)
+        return_value = cast(AsyncStream[ChatCompletionChunk], return_value)
         if return_stream:
             return return_value
 
