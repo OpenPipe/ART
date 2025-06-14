@@ -13,7 +13,7 @@ random.seed(42)
 
 # Declare the model
 model = art.TrainableModel(
-    name="001",
+    name="003",
     project="2048",
     base_model="Qwen/Qwen2.5-7B-Instruct",
 )
@@ -34,7 +34,7 @@ async def main():
     # Initialize the server
     backend = LocalBackend()
 
-    # print(f"Pulling from S3 bucket: `{os.environ['BACKUP_BUCKET']}`")
+    print(f"Pulling from S3 bucket: `{os.environ['BACKUP_BUCKET']}`")
     await backend._experimental_pull_from_s3(
         model,
         verbose=True,
