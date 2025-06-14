@@ -1,4 +1,3 @@
-import os
 import openai
 from openai import AsyncStream
 from openai._streaming import AsyncStream
@@ -13,6 +12,7 @@ from openai.types.chat.chat_completion_message_tool_call import (
     Function,
 )
 from typing import Any, Callable
+import weave
 
 from .gather import get_gather_context
 
@@ -29,29 +29,14 @@ def patch_openai(client: openai.AsyncOpenAI) -> openai.AsyncOpenAI:
     async def create_patched(*args: Any, **kwargs: Any) -> ChatCompletion | AsyncStream:
         return_stream = kwargs.get("stream", False)
         context = get_gather_context()
-
-        # Check if weave is active by looking for its environment variables or imports
-        # This code didn't work.
-        weave_is_active = False
-        try:
-            import weave
-
-            # Check if weave has been initialized
-            weave_is_active = hasattr(weave, "_client") and weave._client is not None
-        except ImportError:
-            pass
-
-        # Only force streaming if weave is not active
-        # Just turn off streaming for now, it breaks the Weave integration somehow.
-        # if context.pbar_total_completion_tokens and not weave_is_active:
-        #     kwargs["stream"] = True
-        #     kwargs["stream_options"] = {"include_usage": True}
+        if context.pbar_total_completion_tokens and weave.get_current_call() is None:
+            kwargs["stream"] = True
+            kwargs["stream_options"] = {"include_usage": True}
         return_value = await create(*args, **kwargs)
-        if isinstance(return_value, ChatCompletion):
+        if isinstance(return_value, ChatCompletion) or weave.get_current_call() is not None:
             report_usage(return_value)
             return return_value
-        # Remove assertion - weave and other instrumentation may wrap the response
-        # assert isinstance(return_value, AsyncStream)
+        assert isinstance(return_value, AsyncStream)
         if return_stream:
             return return_value
 
