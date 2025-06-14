@@ -5,6 +5,7 @@ from .iterate_dataset import iterate_dataset
 from .limit_concurrency import limit_concurrency
 from .log_http_errors import log_http_errors
 from .weave_integration import init_weave_with_wandb
+from .get_model_step import get_model_step
 
 __all__ = [
     "format_message",
@@ -13,4 +14,5 @@ __all__ = [
     "limit_concurrency",
     "log_http_errors",
     "init_weave_with_wandb",
+    "get_model_step",
 ]

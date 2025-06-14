@@ -4,7 +4,7 @@ from tqdm import auto as tqdm
 from typing import AsyncIterator, TYPE_CHECKING
 
 from art.utils import log_http_errors
-from art.utils.deploy_model import LoRADeploymentJob
+from art.utils.deploy_model import LoRADeploymentJob, LoRADeploymentProvider
 
 from . import dev
 from .trajectories import TrajectoryGroup
@@ -12,7 +12,6 @@ from .types import TrainConfig
 
 if TYPE_CHECKING:
     from .model import Model, TrainableModel
-    from art.utils.deploy_model import LoRADeploymentProvider
 
 
 class Backend:
@@ -181,7 +180,7 @@ class Backend:
     @log_http_errors
     async def _experimental_deploy(
         self,
-        deploy_to: "LoRADeploymentProvider",
+        deploy_to: LoRADeploymentProvider,
         model: "Model",
         step: int | None = None,
         s3_bucket: str | None = None,

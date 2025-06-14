@@ -92,7 +92,7 @@ async def s3_sync(
         cmd += ["--profile", profile]
 
     cmd += ["s3"]
-    # us cp for files, sync for directories
+    # use cp for files, sync for directories
     if os.path.isfile(source):
         cmd += ["cp"]
     else:

@@ -20,7 +20,7 @@ DESTROY_AFTER_RUN = False
 CLUSTER_NAME = "art4"
 PROJECT_NAME = "tic-tac-toe"
 BASE_MODEL = "meta-llama/Meta-Llama-3.1-8B-Instruct"
-MODEL_NAME = "llama-8b-shadowmaster-001"
+MODEL_NAME = "llama-8b-student-001"
 
 
 async def main():
@@ -96,8 +96,8 @@ async def main():
                     scenario=TicTacToeScenario(
                         step=i,
                         split="train",
-                        x_shadowmaster=o4_mini if j % 4 == 0 else None,
-                        o_shadowmaster=o4_mini if j % 4 == 1 else None,
+                        x_teacher=o4_mini if j % 4 == 0 else None,
+                        o_teacher=o4_mini if j % 4 == 1 else None,
                         # ensure we learn how to play against all 9 possible opening moves
                         initial_move=possible_moves[j % 9] if j < 63 else None,
                     ),

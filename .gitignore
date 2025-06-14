@@ -11,3 +11,7 @@ wandb/
 docs/node_modules/
 dist/
 data/
+replays/
+trajectories/
+.DS_Store
+.local/

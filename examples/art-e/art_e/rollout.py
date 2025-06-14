@@ -188,7 +188,7 @@ async def determine_if_answer_is_correct(answer: str, query: SyntheticQuery) -> 
 # @retry(stop=stop_after_attempt(3))
 @limit_concurrency(10, derive_key=lambda model, scenario, **kwargs: model.name)
 async def rollout(
-    model: art.Model,
+    model: art.Model[ProjectPolicyConfig],
     scenario: SyntheticQuery,
 ) -> Trajectory:
     rollout_start_time = datetime.now()
@@ -198,19 +198,21 @@ async def rollout(
         reward=0,
         metadata={"email_inbox": scenario.inbox_address, "scenario_id": scenario.id},
     )
-    assert isinstance(model.config, ProjectPolicyConfig)
 
-    system_prompt = textwrap.dedent(f"""\
+    system_prompt = textwrap.dedent(
+        f"""\
         You are an email search agent. You are given a user query and a list of tools you can use to search the user's email. Use the tools to search the user's emails and find the answer to the user's query. You may take up to {model.config.max_turns} turns to find the answer, so if your first seach doesn't find the answer, you can try with different keywords.
 
         User's email address is {scenario.inbox_address}
         Today's date is {scenario.query_date}
-    """)
+    """
+    )
 
     if model.config.use_tools:
         traj.tools = tools
     else:
-        system_prompt += textwrap.dedent(f"""\
+        system_prompt += textwrap.dedent(
+            f"""\
             
             Here are the tools you can use:
             {tools}
@@ -226,7 +228,8 @@ async def rollout(
                     "message_id": "<12635597.1075855702772.JavaMail.evans@thyme>"
                 }}
             }}
-        """)
+        """
+        )
 
     traj.messages_and_choices = [
         {"role": "system", "content": system_prompt},
@@ -255,9 +258,11 @@ async def rollout(
                 api_key=model.inference_api_key,
                 max_completion_tokens=model.config.max_tokens,
                 tools=tools if model.config.use_tools else None,
-                tool_choice="required"
-                if model.config.use_tools and not model.trainable
-                else None,
+                tool_choice=(
+                    "required"
+                    if model.config.use_tools and not model.trainable
+                    else None
+                ),
             )  # type: ignore
 
         assert isinstance(llm_response, ModelResponse)

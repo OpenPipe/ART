@@ -172,26 +172,30 @@ class GatherContext:
     max_metrics: int | None = None
     pbar_total_completion_tokens: bool = False
     max_exceptions: int | float = 0
+    increment_pbar: bool = True
 
     def update_pbar(self, n: int) -> None:
-        if self.pbar is not None:
+        if self.pbar is None:
+            return
+        if self.increment_pbar:
             self.pbar.update(n)
-            postfix = {}
-            included_metrics = self.metric_sums.keys()
-            if self.max_metrics is not None:
-                included_metrics = list(self.metric_sums.keys())[: self.max_metrics]
-            for metric in included_metrics:
-                sum = self.metric_sums[metric]
-                divisor = max(1, self.metric_divisors[metric])
-                postfix[metric] = sum / divisor
-            for key in (
-                "prompt_tokens",
-                "completion_tokens",
-                "total_completion_tokens",
-            ):
-                if key in postfix:
-                    postfix[key] = postfix.pop(key)
-            self.pbar.set_postfix(postfix)
+        postfix = {}
+        included_metrics = self.metric_sums.keys()
+        if self.max_metrics is not None:
+            included_metrics = list(self.metric_sums.keys())[: self.max_metrics]
+        for metric in included_metrics:
+            sum = self.metric_sums[metric]
+            divisor = max(1, self.metric_divisors[metric])
+            postfix[metric] = sum / divisor
+        # move token metrics to the end
+        for key in (
+            "prompt_tokens",
+            "completion_tokens",
+            "total_completion_tokens",
+        ):
+            if key in postfix:
+                postfix[key] = postfix.pop(key)
+        self.pbar.set_postfix(postfix)
 
     def too_many_exceptions(self) -> bool:
         if (
@@ -201,6 +205,13 @@ class GatherContext:
         ) or self.metric_sums["exceptions"] <= self.max_exceptions:
             return False
         return True
+
+    def reset(self) -> None:
+        self.pbar = None
+        self.metric_sums = Counter()
+        self.metric_divisors = Counter()
+        self.pbar_total_completion_tokens = False
+        self.max_exceptions = 0
 
 
 gather_context_var = contextvars.ContextVar("gather_context", default=GatherContext())

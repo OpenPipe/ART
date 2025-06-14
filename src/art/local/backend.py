@@ -1,14 +1,10 @@
 import json
 import math
 
-from art.errors import UnsupportedLoRADeploymentProviderError
 from art.utils.deploy_model import (
     LoRADeploymentJob,
     LoRADeploymentProvider,
-    check_together_job_status,
-    deploy_together,
-    find_existing_together_job_id,
-    wait_for_together_job,
+    deploy_model,
 )
 from art.utils.old_benchmarking.calculate_step_metrics import calculate_step_std_dev
 from art.utils.output_dirs import (
@@ -35,7 +31,7 @@ from ..model import Model, TrainableModel
 from .service import ModelService
 from ..trajectories import Trajectory, TrajectoryGroup
 from ..types import Message, TrainConfig
-from ..utils import format_message
+from ..utils import format_message, get_model_step
 from .pack import (
     packed_tensors_from_tokenized_results,
     packed_tensors_to_dir,
@@ -45,10 +41,8 @@ from .pack import (
 from .tokenize import tokenize_trajectory_groups
 from .checkpoints import (
     delete_checkpoints,
-    get_step,
 )
 from art.utils.s3 import (
-    archive_and_presign_step_url,
     pull_model_from_s3,
     push_model_to_s3,
 )
@@ -150,6 +144,7 @@ class LocalBackend(Backend):
         self,
         model: TrainableModel,
         trajectory_groups: list[TrajectoryGroup],
+        allow_training_without_logprobs: bool,
         plot_tensors: bool,
     ) -> PackedTensors | None:
         if not model.base_model in self._tokenizers:
@@ -161,6 +156,7 @@ class LocalBackend(Backend):
             tokenize_trajectory_groups(
                 tokenizer,
                 trajectory_groups,
+                allow_training_without_logprobs,
             )
         )
         if not tokenized_results:
@@ -168,13 +164,22 @@ class LocalBackend(Backend):
         max_tokens = max(len(result.tokens) for result in tokenized_results)
         # Round up max_tokens to the nearest multiple of 2048
         sequence_length = math.ceil(max_tokens / 2048) * 2048
+        # Cap sequence length at the model's max sequence length
+        sequence_length = min(
+            sequence_length,
+            (model._internal_config or dev.InternalModelConfig())
+            .get("init_args", {})
+            .get("max_seq_length", 32_768),
+        )
         packed_tensors = packed_tensors_from_tokenized_results(
             tokenized_results,
             sequence_length,
             pad_token_id=tokenizer.eos_token_id,  # type: ignore
         )
-        # If all logprobs are NaN then there is no suitable data for tuning
-        if np.isnan(packed_tensors["logprobs"]).all():
+        if (
+            not allow_training_without_logprobs
+            and np.isnan(packed_tensors["logprobs"]).all()
+        ):
             print(
                 "There are no assistant logprobs to train on. Did you forget to include at least one Choice in Trajectory.messages_and_choices?"
             )
@@ -191,7 +196,7 @@ class LocalBackend(Backend):
         return self.__get_step(model)
 
     def __get_step(self, model: TrainableModel) -> int:
-        return get_step(get_model_dir(model=model, art_path=self._path))
+        return get_model_step(model, self._path)
 
     async def _delete_checkpoints(
         self,
@@ -201,7 +206,7 @@ class LocalBackend(Backend):
     ) -> None:
         output_dir = get_model_dir(model=model, art_path=self._path)
         # Keep the latest step
-        steps_to_keep = [get_step(output_dir)]
+        steps_to_keep = [get_model_step(model, self._path)]
         try:
             best_step = (
                 pl.read_ndjson(f"{output_dir}/history.jsonl")
@@ -247,7 +252,7 @@ class LocalBackend(Backend):
         os.makedirs(parent_dir, exist_ok=True)
 
         # Get the file name for the current iteration, or default to 0 for non-trainable models
-        iteration = self.__get_step(model) if model.trainable else 0
+        iteration = self.__get_step(model) if isinstance(model, TrainableModel) else 0
         file_name = f"{iteration:04d}.yaml"
 
         # Write the logs to the file
@@ -282,8 +287,7 @@ class LocalBackend(Backend):
         # Calculate average standard deviation of rewards within groups
         averages["reward_std_dev"] = calculate_step_std_dev(trajectory_groups)
 
-        if model.trainable:
-            self._log_metrics(model, averages, split)
+        self._log_metrics(model, averages, split)
 
     def _trajectory_log(self, trajectory: Trajectory) -> str:
         """Format a trajectory into a readable log string."""
@@ -314,7 +318,12 @@ class LocalBackend(Backend):
         if verbose:
             print("Packing tensors...")
         packed_tensors = self._get_packed_tensors(
-            model, trajectory_groups, plot_tensors=False
+            model,
+            trajectory_groups,
+            allow_training_without_logprobs=dev_config.get(
+                "allow_training_without_logprobs", False
+            ),
+            plot_tensors=False,
         )
         if packed_tensors is None:
             print(
@@ -350,7 +359,7 @@ class LocalBackend(Backend):
 
     def _log_metrics(
         self,
-        model: TrainableModel,
+        model: Model,
         metrics: dict[str, float],
         split: str,
         step_offset: int = 0,
@@ -361,7 +370,9 @@ class LocalBackend(Backend):
             if split
             else metrics
         )
-        step = (self.__get_step(model) if model.trainable else 0) + step_offset
+        step = (
+            self.__get_step(model) if isinstance(model, TrainableModel) else 0
+        ) + step_offset
 
         # If we have a W&B run, log the data there
         if run := self._get_wandb_run(model):
@@ -370,7 +381,7 @@ class LocalBackend(Backend):
                 step=step,
             )
 
-    def _get_wandb_run(self, model: TrainableModel) -> Run | None:
+    def _get_wandb_run(self, model: Model) -> Run | None:
         if "WANDB_API_KEY" not in os.environ:
             return None
         if (
@@ -442,7 +453,7 @@ class LocalBackend(Backend):
     async def _experimental_deploy(
         self,
         deploy_to: LoRADeploymentProvider,
-        model: TrainableModel,
+        model: "TrainableModel",
         step: int | None = None,
         s3_bucket: str | None = None,
         prefix: str | None = None,
@@ -456,55 +467,14 @@ class LocalBackend(Backend):
         Together is currently the only supported provider. See link for supported base models:
         https://docs.together.ai/docs/lora-inference#supported-base-models
         """
-        if pull_s3:
-            # pull the latest step from S3
-            await self._experimental_pull_from_s3(
-                model,
-                step=step,
-                s3_bucket=s3_bucket,
-                prefix=prefix,
-                verbose=verbose,
-            )
-
-        if step is None:
-            step = self.__get_step(model)
-
-        presigned_url = await archive_and_presign_step_url(
-            model_name=model.name,
-            project=model.project,
+        return await deploy_model(
+            deploy_to=deploy_to,
+            model=model,
             step=step,
             s3_bucket=s3_bucket,
             prefix=prefix,
             verbose=verbose,
-        )
-
-        if deploy_to == LoRADeploymentProvider.TOGETHER:
-            existing_job_id = await find_existing_together_job_id(model, step)
-            existing_job = None
-            if existing_job_id is not None:
-                existing_job = await check_together_job_status(
-                    existing_job_id, verbose=verbose
-                )
-
-            if not existing_job or existing_job.status == "Failed":
-                deployment_result = await deploy_together(
-                    model=model,
-                    presigned_url=presigned_url,
-                    step=step,
-                    verbose=verbose,
-                )
-                job_id = deployment_result["data"]["job_id"]
-            else:
-                job_id = existing_job_id
-                print(
-                    f"Previous deployment for {model.name} at step {step} has status '{existing_job.status}', skipping redployment"
-                )
-
-            if wait_for_completion:
-                return await wait_for_together_job(job_id, verbose=verbose)
-            else:
-                return await check_together_job_status(job_id, verbose=verbose)
-
-        raise UnsupportedLoRADeploymentProviderError(
-            f"Unsupported deployment option: {deploy_to}"
+            pull_s3=pull_s3,
+            wait_for_completion=wait_for_completion,
+            art_path=self._path,
         )

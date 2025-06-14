@@ -39,6 +39,7 @@ class TokenizedResult:
 def tokenize_trajectory_groups(
     tokenizer: "PreTrainedTokenizerBase",
     trajectory_groups: list[TrajectoryGroup],
+    allow_training_without_logprobs: bool,
 ) -> Generator["TokenizedResult", None, None]:
     for group in trajectory_groups:
         if not group:
@@ -56,13 +57,13 @@ def tokenize_trajectory_groups(
             # Skip trajectories with no advantage
             if advantage == 0:
                 continue
-            results.append(
-                tokenize_trajectory(
-                    tokenizer,
-                    trajectory,
-                    advantage,
-                )
-            )
+            if result := tokenize_trajectory(
+                tokenizer,
+                trajectory,
+                advantage,
+                allow_training_without_logprobs,
+            ):
+                results.append(result)
         # Choose a random prompt id
         prompt_id = random.randint(-(2**63), 2**63 - 1)
         # Find the longest shared prefix
@@ -89,10 +90,34 @@ def tokenize_trajectory(
     tokenizer: "PreTrainedTokenizerBase",
     trajectory: Trajectory,
     advantage: float,
-) -> TokenizedResult:
+    allow_training_without_logprobs: bool,
+) -> TokenizedResult | None:
     """
     Tokenizes a trajectory and returns a TokenizedResult.
     """
+    # Find the index of the last assistant message
+    last_assistant_index = -1
+    for i, message_or_choice in enumerate(trajectory.messages_and_choices):
+        if (
+            isinstance(message_or_choice, dict)
+            and message_or_choice["role"] == "assistant"
+            and allow_training_without_logprobs
+        ):
+            last_assistant_index = i
+        elif not isinstance(message_or_choice, dict) and (
+            message_or_choice.logprobs or allow_training_without_logprobs
+        ):
+            last_assistant_index = i
+    # If there are no trainable assistant messages, return None
+    if last_assistant_index == -1:
+        return None
+    trajectory = trajectory.model_copy(
+        update={
+            "messages_and_choices": trajectory.messages_and_choices[
+                : last_assistant_index + 1
+            ]
+        }
+    )
     chat = cast(
         str,
         tokenizer.apply_chat_template(
@@ -112,8 +137,8 @@ def tokenize_trajectory(
         set(range(cast(int, tokenizer.vocab_size))) - set(original_token_ids)
     )
     sentinal_token = tokenizer.decode(sentinal_token_id)
-    token_ids = cast(
-        list[int],
+    result = cast(
+        dict,
         tokenizer.apply_chat_template(
             cast(
                 list[dict],
@@ -130,15 +155,26 @@ def tokenize_trajectory(
                 ],
             ),
             tools=trajectory.tools,  # type: ignore
+            return_dict=True,
+            return_assistant_token_mask=allow_training_without_logprobs,
         ),
     )
+    token_ids: list[int] = result["input_ids"]
+    assistant_mask: list[int] = (
+        result["attention_mask"]
+        if allow_training_without_logprobs
+        else [0] * len(token_ids)
+    )
     logprobs = [float("nan")] * len(token_ids)
-    assistant_mask = [0] * len(token_ids)
     for message_or_choice in trajectory.messages_and_choices:
         if isinstance(message_or_choice, dict):
             continue
         choice = message_or_choice
-        assert choice.logprobs, "Chat completion choices must have logprobs"
+        assert (
+            choice.logprobs or allow_training_without_logprobs
+        ), "Chat completion choices must have logprobs"
+        if not choice.logprobs:
+            continue
         token_logprobs = choice.logprobs.content or choice.logprobs.refusal or []
         sentinal_index = token_ids.index(sentinal_token_id)
         token_ids[sentinal_index : sentinal_index + 1] = (
