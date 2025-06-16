@@ -11,6 +11,7 @@ from transformers.trainer_utils import (
 from typing_extensions import TypedDict
 
 from .engine import EngineArgs
+from .torchtune import TorchtuneArgs
 
 
 def get_model_config(
@@ -84,11 +85,17 @@ def get_model_config(
         report_to="none",
     )
     trainer_args.update(config.get("trainer_args", {}))
+    if config.get("torchtune_args"):
+        torchtune_args = TorchtuneArgs()
+        torchtune_args.update(config.get("torchtune_args", {}) or {})
+    else:
+        torchtune_args = None
     return InternalModelConfig(
         init_args=init_args,
         engine_args=engine_args,
         peft_args=peft_args,
         trainer_args=trainer_args,
+        torchtune_args=torchtune_args,
     )
 
 
@@ -106,6 +113,7 @@ class InternalModelConfig(TypedDict, total=False):
     engine_args: "EngineArgs"
     peft_args: "PeftArgs"
     trainer_args: "TrainerArgs"
+    torchtune_args: TorchtuneArgs | None
 
 
 class InitArgs(TypedDict, total=False):

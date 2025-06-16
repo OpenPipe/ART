@@ -29,8 +29,10 @@ from .. import dev
 from ..backend import Backend
 from ..model import Model, TrainableModel
 from .service import ModelService
+from ..torchtune.service import TorchtuneService
 from ..trajectories import Trajectory, TrajectoryGroup
 from ..types import Message, TrainConfig
+from ..unsloth.service import UnslothService
 from ..utils import format_message, get_model_step
 from .pack import (
     packed_tensors_from_tokenized_results,
@@ -107,9 +109,9 @@ class LocalBackend(Backend):
                 output_dir=get_model_dir(model=model, art_path=self._path),
                 config=model._internal_config,
             )
-            self._services[model.name] = ModelService(
-                host="localhost",
-                port=8089 + len(self._services),
+            self._services[model.name] = (
+                TorchtuneService if config.get("torchtune_args") else UnslothService
+            )(
                 model_name=model.name,
                 base_model=model.base_model,
                 config=config,
@@ -118,13 +120,14 @@ class LocalBackend(Backend):
             if not self._in_process:
                 # Kill all "model-service" processes to free up GPU memory
                 subprocess.run(["pkill", "-9", "model-service"])
-                # To enable sleep mode, import peft before unsloth
-                # Unsloth will issue warnings, but everything appears to be okay
-                if config.get("engine_args", {}).get("enable_sleep_mode", False):
-                    os.environ["IMPORT_PEFT"] = "1"
-                # When moving the service to a child process, import unsloth
-                # early to maximize optimizations
-                os.environ["IMPORT_UNSLOTH"] = "1"
+                if isinstance(self._services[model.name], UnslothService):
+                    # To enable sleep mode, import peft before unsloth
+                    # Unsloth will issue warnings, but everything appears to be okay
+                    if config.get("engine_args", {}).get("enable_sleep_mode", False):
+                        os.environ["IMPORT_PEFT"] = "1"
+                    # When moving the service to a child process, import unsloth
+                    # early to maximize optimizations
+                    os.environ["IMPORT_UNSLOTH"] = "1"
                 self._services[model.name] = move_to_child_process(
                     self._services[model.name],
                     process_name="model-service",
