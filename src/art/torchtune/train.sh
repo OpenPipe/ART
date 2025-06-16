@@ -11,3 +11,4 @@ uv run $TORCHTUNE_DIR/_cli/tune.py run \
     checkpointer.checkpoint_dir=$MODEL_DIR \
     checkpointer.checkpoint_files="[$(ls $MODEL_DIR/*.safetensors | xargs -n1 basename | sed 's/^/"/;s/$/",/' | tr '\n' ' ' | sed 's/, $//' )]" \
     model._component_=torchtune.models.qwen3.qwen3_32b
+    
