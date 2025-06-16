@@ -1,7 +1,8 @@
 #!/bin/bash
 
-export MODEL_DIR=$(HF_HUB_ENABLE_HF_TRANSFER=1 huggingface-cli download Qwen/Qwen3-32B | tail -n 1)
-uv run tune run \
+export MODEL_DIR=$(HF_HUB_ENABLE_HF_TRANSFER=1 uv run huggingface-cli download Qwen/Qwen3-32B | tail -n 1)
+export TORCHTUNE_DIR=$(uv run python -c "import torchtune; import os; print(os.path.dirname(torchtune.__file__))")
+uv run $TORCHTUNE_DIR/_cli/tune.py run \
     --nproc-per-node 8 \
     src/art/torchtune/recipe.py \
     --config ./src/art/torchtune/config.yaml \
