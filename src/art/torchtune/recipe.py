@@ -20,6 +20,7 @@ from pydantic import BaseModel, Field, field_validator, ConfigDict
 import torch
 from torch import nn
 from torch.distributed import destroy_process_group, init_process_group
+from torch.distributed.fsdp import FSDPModule
 from torch.distributed.tensor import DTensor
 from torch.distributed.tensor.parallel import parallelize_module
 from torch.optim import Optimizer
@@ -30,6 +31,7 @@ from torchtune import config, modules, training, utils
 from torchtune.config._utils import _get_component_from_path
 from torchtune.data import padded_collate_packed
 from torchtune.datasets import ConcatDataset
+from torchtune.modules import TransformerDecoder
 from torchtune.modules.embedding_utils import resize_token_embeddings
 from torchtune.modules.loss import SFTLoss
 from torchtune.modules.moe import utils as moe_utils
@@ -43,6 +45,7 @@ from torchtune.training.checkpointing._checkpoint_client import (
     CheckpointClient,
     TrainingProgress,
 )
+from torchtune.training.memory import OptimizerInBackwardWrapper
 from torchtune.training.lr_schedulers import get_lr
 from torchtune.training.quantization import (
     convert_to_float8_training,
@@ -451,7 +454,7 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
         )
         self.epochs_run = 0
         self.total_epochs = cfg.epochs
-        self.max_steps_per_epoch = cfg.max_steps_per_epoch
+        self.max_steps_per_epoch = cfg.max_steps_per_epoch or 0
         self.global_step = 0
 
     def _update_recipe_state(self, ckpt_dict: dict[str, Any]) -> None:
@@ -477,7 +480,7 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
                         f"using the checkpoint value: {ckpt_dict[training.MAX_STEPS_KEY]}"
                     )
                 )
-                self.max_steps_per_epoch = ckpt_dict[training.MAX_STEPS_KEY]
+                self.max_steps_per_epoch = int(ckpt_dict[training.MAX_STEPS_KEY])
 
             # on mismatch, warn the user but allow the override
             if self.total_epochs != ckpt_dict[training.TOTAL_EPOCHS_KEY]:
@@ -528,8 +531,10 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
             self._compile_optimizer_step = compile.optimizer_step
             self._compile_scale_grads = compile.scale_grads
         if self._compile_model:
+            from torch._dynamo import config as dynamo_config
+
             # Capture scalar outputs is required to compile MoE
-            torch._dynamo.config.capture_scalar_outputs = True
+            dynamo_config.capture_scalar_outputs = True
 
         # This indirection is needed to apply torch.compile to scale_grads step.
         self._grad_scaler = training.scale_grads_
@@ -569,6 +574,7 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
                 raise ValueError(
                     "optimizer_in_bwd not supported with compiling the optimizer step"
                 )
+            assert self._optimizer is not None
             self._optimizer.step = torch.compile(
                 self._optimizer.step,
                 backend=self._compile_backend,
@@ -584,11 +590,7 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
                     checkpoint_dict = (
                         self._checkpoint_client.load_distributed_checkpoint(
                             self._model,
-                            (
-                                self._optim_ckpt_wrapper
-                                if self._optimizer_in_bwd
-                                else self._optimizer
-                            ),
+                            self._optimizer_or_optim_ckpt_wrapper,
                         )
                     )
                 except Exception as e:
@@ -605,6 +607,7 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
             self._loss_fn.set_model_output(self._model)
 
         if self._compile_loss:
+            assert isinstance(self._loss_fn, nn.Module)
             training.compile_loss(self._loss_fn, verbose=self._is_rank_zero)
 
         utils.log_rank_zero(self._logger, "Loss is initialized.")
@@ -643,7 +646,7 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
             len(self._dataloader) // self._gradient_accumulation_steps
         )
         if (
-            self.max_steps_per_epoch is not None
+            self.max_steps_per_epoch
             and self.max_steps_per_epoch < self._steps_per_epoch
         ):
             self._steps_per_epoch = self.max_steps_per_epoch
@@ -685,17 +688,10 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
                 )
             return None
 
-        if self._optimizer_in_bwd:
-            # Use the first optimizer from the wrapper to represent the learning rate
-            optimizer = next(iter(self._optim_ckpt_wrapper.optim_map.values()))
-        else:
-            # Standard case: use the single optimizer
-            optimizer = self._optimizer
-
         # Instantiate the learning rate scheduler
         lr_scheduler = config.instantiate(
             cfg_lr_scheduler.model_dump(by_alias=True),
-            optimizer,
+            self._optimizer_or_optim_ckpt_wrapper,
             num_training_steps=num_training_steps,
             last_epoch=last_epoch,
         )
@@ -747,7 +743,7 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
         custom_sharded_layers: Optional[list[str]] = None,
         ac_mode: Optional[str] = None,
         ac_option: Optional[int] = None,
-    ) -> nn.Module:
+    ) -> TransformerDecoder:
         """
         Model initialization has some important considerations:
            a. To minimize GPU peak memory, we initialize the model on meta device with
@@ -804,6 +800,8 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
                 parallelize_plan=self.tp_plan,
             )
 
+        assert isinstance(model, TransformerDecoder)
+
         # We currently have two versions of activation checkpointing in this recipe
         # for testing and BC purposes. ``enable_activation_checkpointing`` controls
         # the older version of AC and this behavior is unchanged
@@ -856,7 +854,9 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
             for m in model.modules():
                 # RoPE is not covered in state dict
                 if hasattr(m, "rope_init"):
-                    m.rope_init()
+                    m.rope_init()  # type: ignore
+
+        assert isinstance(model, FSDPModule)
 
         # This method will convert the full model state dict into a sharded state
         # dict and load into the model
@@ -896,6 +896,7 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
         optimizer_in_bwd: bool = False,
         opt_state_dict: Optional[dict[str, Any]] = None,
     ) -> Optional[Optimizer]:
+        assert isinstance(self._model, FSDPModule)
         if optimizer_in_bwd:
             # Maintain a dict of optims for every parameter.
             optim_dict = {
@@ -947,6 +948,16 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
             utils.log_rank_zero(self._logger, "Optimizer is initialized.")
             return optimizer
 
+    @property
+    def _optimizer_or_optim_ckpt_wrapper(
+        self,
+    ) -> Optimizer | OptimizerInBackwardWrapper:
+        if self._optimizer_in_bwd:
+            return self._optim_ckpt_wrapper
+        else:
+            assert self._optimizer is not None
+            return self._optimizer
+
     def _setup_data(
         self,
         cfg_dataset: Union[DatasetConfig, List[DatasetConfig]],
@@ -989,7 +1000,7 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
             sampler=sampler,
             collate_fn=(
                 partial(
-                    collate_fn,
+                    collate_fn,  # type: ignore
                     padding_idx=self._tokenizer.pad_id,
                     ignore_idx=self._loss_fn.ignore_index,
                     pad_to_multiple_of=self.parallel_dims.min_seq_len_divisor,
@@ -1018,7 +1029,7 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
                 outputs = outputs.full_tensor()
 
         # Compute loss
-        loss = self._loss_fn(outputs, labels)
+        loss = self._loss_fn(outputs, labels)  # type: ignore
 
         # free logits otherwise it peaks backward memory
         del outputs
@@ -1034,7 +1045,7 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
         total_val_tokens = torch.tensor(0.0, device=self._device)
 
         with torch.no_grad():
-            for batch_idx, batch in enumerate(self._val_dataloader):
+            for batch_idx, batch in enumerate(self._val_dataloader):  # type: ignore
                 utils.batch_to_device(batch, self._device)
 
                 # Count tokens excluding padding
@@ -1078,6 +1089,7 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
 
         # zero out the gradients before starting training
         if not self._optimizer_in_bwd:
+            assert self._optimizer is not None
             self._optimizer.zero_grad()
         else:
             for opt in self._optim_ckpt_wrapper.optim_map.values():
@@ -1092,7 +1104,7 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
         # self.epochs_run should be non-zero when we're resuming from a checkpoint
         for curr_epoch in range(self.epochs_run, self.total_epochs):
             pbar = tqdm(total=self._steps_per_epoch, disable=not self._is_rank_zero)
-            self._dataloader.sampler.set_epoch(curr_epoch)
+            self._dataloader.sampler.set_epoch(curr_epoch)  # type: ignore
             for idx, batch in enumerate(self._dataloader):
                 # Start tracking CUDA memory for active steps for just the first epoch
                 if (
@@ -1115,7 +1127,7 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
 
                 # Loss is normalized by default so we multiply by the number of tokens
                 # This way we can normalize by the total number of tokens if we're accumulating gradients
-                with self.context_parallel_manager(list(batch.values())):
+                with self.context_parallel_manager(list(batch.values())):  # type: ignore
                     current_loss = self._loss_step(batch) * current_num_tokens
                     running_loss += current_loss
                     # For optimizer in backward, we need to normalize before calling backward
@@ -1149,6 +1161,7 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
                             # If sharded, collect the DTensor here
                             if isinstance(grad_norm, DTensor):
                                 grad_norm = grad_norm.full_tensor()
+                        assert self._optimizer is not None
                         self._optimizer.step()
                         self._optimizer.zero_grad(set_to_none=True)
 
@@ -1183,13 +1196,7 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
                         time_per_step = time.perf_counter() - t0
                         log_dict = {
                             "loss": loss_to_log,
-                            "lr": get_lr(
-                                (
-                                    self._optimizer
-                                    if not self._optimizer_in_bwd
-                                    else self._optim_ckpt_wrapper
-                                ),
-                            ),
+                            "lr": get_lr(self._optimizer_or_optim_ckpt_wrapper),
                             "tokens_per_second_per_gpu": (
                                 num_tokens / self.parallel_dims.non_data_parallel_size
                             )
@@ -1238,18 +1245,16 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
                         self.validate()
 
                 if (
-                    (idx + 1) // self._gradient_accumulation_steps
-                ) == self.max_steps_per_epoch:
+                    self.max_steps_per_epoch
+                    and (idx + 1) // self._gradient_accumulation_steps
+                    == self.max_steps_per_epoch
+                ):
                     break
 
             self.epochs_run += 1
             self._checkpoint_client.save_checkpoint(
                 model=self._model,
-                optimizer=(
-                    self._optimizer
-                    if not self._optimizer_in_bwd
-                    else self._optim_ckpt_wrapper
-                ),
+                optimizer=self._optimizer_or_optim_ckpt_wrapper,
                 training_progress=TrainingProgress(
                     seed=self.seed,
                     epochs_run=self.epochs_run,
@@ -1284,9 +1289,9 @@ def recipe_main(cfg: DictConfig) -> None:
         raise ValueError("Config must be a dictionary")
 
     # Create the RecipeConfig - Pydantic handles nested conversions automatically
-    recipe_cfg = RecipeConfig(**cfg_dict)
+    recipe_cfg = RecipeConfig(**cfg_dict)  # type: ignore
 
-    recipe = FullFinetuneRecipeDistributed(cfg=recipe_cfg)
+    recipe = FullFinetuneRecipeDistributed(cfg=recipe_cfg)  # type: ignore
     recipe.setup(cfg=recipe_cfg)
     recipe.train()
     recipe.cleanup()
