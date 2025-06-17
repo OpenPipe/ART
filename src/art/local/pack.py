@@ -3,7 +3,6 @@ import os
 import random
 import seaborn as sns
 import torch
-from torch.utils.data import Dataset
 from typing_extensions import TypedDict, Unpack
 
 from .tokenize import TokenizedResult
@@ -25,17 +24,6 @@ class DiskPackedTensors(TypedDict):
     dir: str
     num_sequences: int
     sequence_length: int
-
-
-class PackedDataset(Dataset[PackedTensors]):
-    def __init__(self, **kwargs: Unpack[DiskPackedTensors]) -> None:
-        self.tensors = packed_tensors_from_dir(**kwargs)
-
-    def __len__(self) -> int:
-        return self.tensors["tokens"].shape[0]
-
-    def __getitem__(self, index: int) -> PackedTensors:
-        return {key: tensor[index] for key, tensor in self.tensors.items()}  # type: ignore
 
 
 def packed_tensors_from_tokenized_results(

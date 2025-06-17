@@ -29,10 +29,8 @@ from .. import dev
 from ..backend import Backend
 from ..model import Model, TrainableModel
 from .service import ModelService
-from ..torchtune.service import TorchtuneService
 from ..trajectories import Trajectory, TrajectoryGroup
 from ..types import Message, TrainConfig
-from ..unsloth.service import UnslothService
 from ..utils import format_message, get_model_step
 from .pack import (
     packed_tensors_from_tokenized_results,
@@ -103,6 +101,9 @@ class LocalBackend(Backend):
             json.dump(model.model_dump(), f)
 
     async def _get_service(self, model: TrainableModel) -> ModelService:
+        from ..torchtune.service import TorchtuneService
+        from ..unsloth.service import UnslothService
+
         if model.name not in self._services:
             config = dev.get_model_config(
                 base_model=model.base_model,

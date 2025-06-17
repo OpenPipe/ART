@@ -24,7 +24,7 @@ class TorchtuneService:
             log_file=self.output_dir,
             config=config,
         )
-        # TODO: Update the types for EngineArgs
+        # TODO: Update the types for EngineArgs so this type error goes away
         llm = await get_llm(AsyncEngineArgs(**config.get("engine_args", {})))  # type: ignore
         await openai_server_task(
             engine=llm,
@@ -38,5 +38,6 @@ class TorchtuneService:
         _config: dev.TrainConfig,
         verbose: bool = False,
     ) -> AsyncIterator[dict[str, float]]:
+        print(f"Training {self.model_name} with {config}")
         await asyncio.sleep(1)
         yield {"loss": 0.0}
