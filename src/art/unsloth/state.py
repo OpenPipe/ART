@@ -117,7 +117,7 @@ class ModelState:
 
 class vLLMState:
     def __init__(self, async_engine: AsyncLLMEngine, enable_sleep_mode: bool) -> None:
-        from .vllm import (
+        from ..vllm import (
             create_engine_pause_and_resume_functions,
             patch_allocator,
             patch_lora_request,

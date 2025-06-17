@@ -43,7 +43,7 @@ class UnslothService:
         return asyncio.Queue()
 
     async def start_openai_server(self, config: dev.OpenAIServerConfig | None) -> None:
-        from .vllm import openai_server_task
+        from ..vllm import openai_server_task
 
         lora_path = get_last_checkpoint_dir(self.output_dir)
         if lora_path is None:
