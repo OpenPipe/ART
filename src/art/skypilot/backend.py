@@ -40,7 +40,7 @@ class SkyPilotBackend(Backend):
         self._envs = {}
 
         if env_path is not None:
-            self._envs = dotenv_values(env_path)
+            self._envs = {k: v for k, v in dotenv_values(env_path).items() if v is not None}
             print(f"Loading envs from {env_path}")
             print(f"{len(self._envs)} environment variables found")
 

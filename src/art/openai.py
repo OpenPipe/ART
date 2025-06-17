@@ -1,6 +1,5 @@
 import openai
 from openai import AsyncStream
-from openai._streaming import AsyncStream
 from openai.types.chat.chat_completion import ChatCompletion, Choice, ChoiceLogprobs
 from openai.types.chat.chat_completion_chunk import ChatCompletionChunk
 from openai.types.chat.chat_completion_message import (
