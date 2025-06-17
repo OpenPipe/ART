@@ -2,6 +2,7 @@ import asyncio
 from dataclasses import dataclass
 from typing import AsyncIterator
 from vllm import AsyncEngineArgs
+from vllm.v1.engine.async_llm import AsyncLLM
 
 from .. import dev
 from ..local.pack import DiskPackedTensors
@@ -16,19 +17,23 @@ class TorchtuneService:
     config: dev.InternalModelConfig
     output_dir: str
 
-    async def start_openai_server(self, config: dev.OpenAIServerConfig | None) -> None:
-        config = dev.openai_server.get_openai_server_config(
-            self.model_name,
-            # TODO: Choose the base model to be the latest version of the model
-            base_model=self.base_model,
-            log_file=self.output_dir,
-            config=config,
+    @property
+    def llm_task(self) -> asyncio.Task[AsyncLLM]:
+        print(self.config.get("engine_args", {}))
+        return asyncio.create_task(
+            get_llm(AsyncEngineArgs(**self.config.get("engine_args", {})))  # type: ignore
         )
-        # TODO: Update the types for EngineArgs so this type error goes away
-        llm = await get_llm(AsyncEngineArgs(**config.get("engine_args", {})))  # type: ignore
+
+    async def start_openai_server(self, config: dev.OpenAIServerConfig | None) -> None:
         await openai_server_task(
-            engine=llm,
-            config=config,
+            engine=await self.llm_task,
+            config=dev.get_openai_server_config(
+                model_name=self.model_name,
+                # TODO: Choose the base model to be the latest version of the model
+                base_model=self.base_model,
+                log_file=f"{self.output_dir}/logs/vllm.log",
+                config=config,
+            ),
         )
 
     async def train(

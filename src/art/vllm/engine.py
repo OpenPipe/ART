@@ -16,10 +16,10 @@ from .patches import patch_allocator
 async def get_llm(args: vllm.AsyncEngineArgs) -> AsyncLLM:
     """
     Create an AsyncLLM engine with model download and patches applied.
-    
+
     Args:
         args: The engine arguments including model name and configuration.
-        
+
     Returns:
         A configured AsyncLLM instance.
     """
@@ -28,6 +28,10 @@ async def get_llm(args: vllm.AsyncEngineArgs) -> AsyncLLM:
         f"HF_HUB_ENABLE_HF_TRANSFER=1 huggingface-cli download {args.model}"
     )
     await process.wait()
+    # Make sure we are using the v1 engine
+    import vllm.envs as envs
+
+    envs.VLLM_USE_V1 = "1"
     # Create engine
     llm = AsyncLLM.from_engine_args(
         replace(
@@ -48,10 +52,10 @@ def create_engine_pause_and_resume_functions(
     """
     Patches the vLLM engine and returns a pair of functions for pausing and resuming
     request processing respectively.
-    
+
     Args:
         engine: The AsyncLLMEngine to patch.
-        
+
     Returns:
         A tuple of (pause_engine, resume_engine) async functions.
     """
@@ -88,13 +92,13 @@ async def run_on_workers(
 ) -> list[R]:
     """
     Run a function on all workers in a distributed setup.
-    
+
     Args:
         llm: The AsyncLLM instance with workers.
         func: The function to run on each worker.
         *args: Positional arguments for the function.
         **kwargs: Keyword arguments for the function.
-        
+
     Returns:
         List of results from each worker.
     """
@@ -114,11 +118,11 @@ def get_worker() -> Worker:
 
 class WorkerExtension:
     """Extension for running arbitrary functions on vLLM workers."""
-    
+
     def run(self, pickled_func: bytes, *args: Any, **kwargs: Any) -> Any:
         func = cloudpickle.loads(pickled_func)
         token = _worker.set(cast(Worker, self))
         try:
             return func(*args, **kwargs)
         finally:
-            _worker.reset(token) 
+            _worker.reset(token)

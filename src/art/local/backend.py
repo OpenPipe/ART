@@ -111,7 +111,9 @@ class LocalBackend(Backend):
                 config=model._internal_config,
             )
             self._services[model.name] = (
-                TorchtuneService if config.get("torchtune_args") else UnslothService
+                TorchtuneService
+                if config.get("torchtune_args") is not None
+                else UnslothService
             )(
                 model_name=model.name,
                 base_model=model.base_model,

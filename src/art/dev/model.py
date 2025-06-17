@@ -42,10 +42,17 @@ def get_model_config(
         disable_log_requests=True,
         # Multi-step processing is not supported for the Xformers attention backend
         # which is the fallback for devices with compute capability < 8.0
-        num_scheduler_steps=16 if torch.cuda.get_device_capability()[0] >= 8 else 1,
+        num_scheduler_steps=(
+            16
+            if torch.cuda.get_device_capability()[0] >= 8
+            and config.get("torchtune_args") is None
+            else 1
+        ),
         enable_sleep_mode=enable_sleep_mode,
         generation_config="vllm",
     )
+    if config.get("torchtune_args") is not None:
+        engine_args["model"] = base_model
     engine_args.update(config.get("engine_args", {}))
     init_args.update(config.get("init_args", {}))
     if lora_path := get_last_checkpoint_dir(output_dir):
@@ -85,7 +92,7 @@ def get_model_config(
         report_to="none",
     )
     trainer_args.update(config.get("trainer_args", {}))
-    if config.get("torchtune_args"):
+    if config.get("torchtune_args") is not None:
         torchtune_args = TorchtuneArgs()
         torchtune_args.update(config.get("torchtune_args", {}) or {})
     else:
