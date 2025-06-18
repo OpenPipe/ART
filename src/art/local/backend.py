@@ -371,6 +371,9 @@ class LocalBackend(Backend):
             self.__get_step(model) if isinstance(model, TrainableModel) else 0
         ) + step_offset
 
+        # Ensure we never log at negative steps
+        step = max(0, step)
+
         # If we have a W&B run, log the data there
         if run := self._get_wandb_run(model):
             run.log(
