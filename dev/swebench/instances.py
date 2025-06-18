@@ -42,6 +42,8 @@ def get_filtered_swe_smith_instances_df() -> pl.DataFrame:
                     "swesmith/marshmallow-code__marshmallow.9716fc62",
                     "swesmith/mido__mido.a0158ff9",
                     "swesmith/pydantic__pydantic.acb0f10f",
+                    "swesmith/tox-dev__pipdeptree.c31b6418",
+                    "swesmith/un33k__python-slugify.872b3750",
                 ]
             )
         )
