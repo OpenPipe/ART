@@ -8,7 +8,7 @@ from pathlib import Path
 from pydantic import BaseModel
 import requests
 from requests import adapters as requests_adapters
-from requests.exceptions import ConnectTimeout, SSLError
+from requests.exceptions import ConnectTimeout, ConnectionError, SSLError
 from sweagent.agent.agents import DefaultAgent, DefaultAgentConfig
 from sweagent.run.hooks.abstract import RunHook
 from sweagent.run.run_replay import RunReplay

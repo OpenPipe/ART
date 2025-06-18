@@ -52,7 +52,10 @@ from torchtune.training.quantization import (
     is_fp8_tensorwise_scaling,
 )
 from tqdm import tqdm
-from typing import List, Literal
+from typing import cast, List, Literal
+
+
+from ..local.pack import DiskPackedTensors, PackedTensors, packed_tensors_from_dir
 
 
 # Pydantic Configuration Models
@@ -310,7 +313,7 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
 
     def __init__(self, cfg: RecipeConfig) -> None:
         device_type = cfg.device
-        self._device = utils.get_device(device=device_type)
+        self._device = self._current_device = utils.get_device(device=device_type)
         self._dtype = training.get_dtype(cfg.dtype, device=self._device)
 
         if self._dtype == torch.float16:
@@ -1103,17 +1106,10 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
         self._profiler.start()
         # self.epochs_run should be non-zero when we're resuming from a checkpoint
         for curr_epoch in range(self.epochs_run, self.total_epochs):
-            pbar = tqdm(total=self._steps_per_epoch, disable=not self._is_rank_zero)
-            self._dataloader.sampler.set_epoch(curr_epoch)  # type: ignore
-            for idx, batch in enumerate(self._dataloader):
-                # TESTING
-                if idx != 0 and idx % 3 == 0:
-                    self._move_to(torch.device("cpu"))
-                    from time import sleep
-
-                    sleep(30)
-                    self._move_to(self._device)
-
+            batches = self._batches()
+            pbar = tqdm(total=len(batches), disable=not self._is_rank_zero)
+            # self._dataloader.sampler.set_epoch(curr_epoch)  # type: ignore
+            for idx, batch in enumerate(batches):
                 # Start tracking CUDA memory for active steps for just the first epoch
                 if (
                     self._is_rank_zero
@@ -1124,7 +1120,7 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
                 ):
                     torch.cuda.memory._record_memory_history()
 
-                utils.batch_to_device(batch, self._device)
+                utils.batch_to_device(batch, self._device)  # type: ignore
 
                 # Calculate the number of unmasked tokens in the current batch
                 # and increment the total number of tokens seen in the step
@@ -1274,6 +1270,43 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
             )
 
         self._profiler.stop()
+
+    def _batches(self) -> list[PackedTensors]:
+        import fileinput
+        import json
+        import math
+        import time
+
+        while True:
+            with fileinput.input("data.jsonl", inplace=True) as f:
+                first_line = next(f, None)
+                if first_line:  # Only rewrite if we got a line
+                    for line in f:
+                        print(line, end="")  # Rewrite remaining lines
+                else:
+                    if self._current_device == self._device:
+                        self._move_to(torch.device("cpu"))
+                    time.sleep(1)
+                    continue
+            disk_packed_tensors: DiskPackedTensors = json.loads(first_line.strip())
+            packed_tensors = packed_tensors_from_dir(**disk_packed_tensors)
+            if self._current_device != self._device:
+                self._move_to(self._device)
+            return [
+                cast(
+                    PackedTensors,
+                    {
+                        k: cast(torch.Tensor, v)[i : i + 1]
+                        for k, v in packed_tensors.items()
+                    },
+                )
+                for i in range(
+                    self.dp_rank,
+                    math.ceil(disk_packed_tensors["num_sequences"] / self.dp_degree)
+                    * self.dp_degree,
+                    self.dp_degree,
+                )
+            ]
 
     def _move_to(self, device: torch.device) -> None:
         """
