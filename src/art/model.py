@@ -5,6 +5,7 @@ from . import dev
 from .backend import Backend
 from .openai import patch_openai
 from .trajectories import Trajectory, TrajectoryGroup
+from .temperature import LinearTemperatureAnnealer
 from .types import TrainConfig
 from pydantic import BaseModel
 from openai import (
@@ -167,6 +168,7 @@ class TrainableModel(Model):
     # The fields within `_internal_config` are unstable and subject to change.
     # Use at your own risk.
     _internal_config: dev.InternalModelConfig | None = None
+    _temperature_annealer: LinearTemperatureAnnealer | None = None
 
     def __init__(self, **data):
         # Pop any internal config provided at construction and assign it
@@ -180,6 +182,12 @@ class TrainableModel(Model):
         data = super().model_dump(*args, **kwargs)
         data["_internal_config"] = self._internal_config
         return data
+
+    def set_temperature_annealer(
+        self, annealer: LinearTemperatureAnnealer | None
+    ) -> None:
+        """Attach a temperature annealer to this model."""
+        object.__setattr__(self, "_temperature_annealer", annealer)
 
     async def register(
         self,
@@ -233,6 +241,9 @@ class TrainableModel(Model):
             _config: Additional configuration that is subject to change and
                 not yet part of the public API. Use at your own risk.
         """
+        if self._temperature_annealer is not None:
+            temp = self._temperature_annealer.step()
+            await self.backend()._set_temperature(self, temp)
         async for _ in self.backend()._train_model(
             self, list(trajectory_groups), config, _config or {}, verbose
         ):

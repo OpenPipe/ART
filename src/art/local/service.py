@@ -168,3 +168,15 @@ class ModelService:
         lora_request.lora_path = lora_path
         self.state.vllm.async_engine.engine.remove_lora(1)
         self.state.vllm.async_engine.engine.add_lora(lora_request)  # type: ignore
+
+    async def set_temperature(self, temperature: float) -> None:
+        self.config.setdefault("trainer_args", {})["temperature"] = temperature
+        self.state.trainer.args.temperature = temperature  # type: ignore
+        await self.start_openai_server(
+            dev.OpenAIServerConfig(
+                engine_args=dev.EngineArgs(
+                    override_generation_config={"temperature": temperature}
+                )
+            )
+        )
+

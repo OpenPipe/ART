@@ -15,6 +15,7 @@ from .backend import Backend
 from .gather import gather_trajectories, gather_trajectory_groups
 from .model import Model, TrainableModel
 from .trajectories import Trajectory, TrajectoryGroup
+from .temperature import LinearTemperatureAnnealer
 from .types import Messages, MessagesAndChoices, Tools, TrainConfig
 from .utils import retry
 
@@ -32,4 +33,5 @@ __all__ = [
     "TrainConfig",
     "Trajectory",
     "TrajectoryGroup",
+    "LinearTemperatureAnnealer",
 ]

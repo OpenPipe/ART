@@ -52,6 +52,41 @@ ART's functionality is divided into a **client** and a **server**. The OpenAI-co
 
 This training loop runs until a specified number of inference and training iterations have completed.
 
+## 🛰 Remote Server Usage
+
+ART's server can run on any machine with a GPU. Start it on the remote host:
+
+```bash
+uv run art --host 0.0.0.0 --port 7999
+```
+
+From your local machine, create a `Backend` that points at this server and
+register your model with it:
+
+```python
+backend = art.Backend(base_url="http://<server-ip>:7999")
+await model.register(backend)
+```
+
+`model.openai_client()` will now send completions to the remote server and all
+calls to `model.train()` execute there as well. See
+`examples/remote_backend/remote_2048.py` for a full example.
+
+## 🔥 Temperature Annealing
+
+You can linearly anneal the sampling temperature between training calls. Create
+a `LinearTemperatureAnnealer` and attach it to your `TrainableModel`:
+
+```python
+annealer = art.LinearTemperatureAnnealer(start=1.0, end=0.1, steps=10)
+model.set_temperature_annealer(annealer)
+```
+
+Each call to `model.train()` will advance the schedule and restart the
+OpenAI-compatible server with the new default temperature. Explicit temperatures
+passed to `model.openai_client().chat.completions.create()` still override the
+current default.
+
 ## 🧩 Supported Models
 
 ART should work with most vLLM/HuggingFace-transformers compatible causal language models, or at least the ones supported by [Unsloth](https://docs.unsloth.ai/get-started/all-our-models). Gemma 3 does not appear to be supported for the time being. If any other model isn't working for you, please let us know on [Discord](https://discord.gg/zbBHRUpwf4) or open an issue on [GitHub](https://github.com/openpipe/art/issues)!
