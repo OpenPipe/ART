@@ -1124,9 +1124,7 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
 
                 # Calculate the number of unmasked tokens in the current batch
                 # and increment the total number of tokens seen in the step
-                current_num_tokens = (
-                    batch["labels"] != self._loss_fn.ignore_index
-                ).sum()
+                current_num_tokens = batch["assistant_mask"].sum()
                 num_tokens += current_num_tokens
 
                 # Loss is normalized by default so we multiply by the number of tokens
