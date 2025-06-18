@@ -1017,16 +1017,32 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
 
         return dataloader
 
-    def _loss_step(self, batch: dict[str, torch.Tensor]) -> torch.Tensor:
+    def _loss_step(self, batch: PackedTensors) -> torch.Tensor:
+        from ..unsloth.train import calculate_mask
+
         # Shape [b, s], needed for the loss not the model
-        labels = batch.pop("labels")
+        # labels = batch.pop("labels")
+
+        mask = calculate_mask(
+            batch_size=batch["tokens"].shape[0],
+            seq_len=batch["tokens"].shape[1],
+            device=self._device,
+            group_ids=batch["group_ids"],
+            parent_ids=batch["parent_ids"],
+        )
 
         with self.activations_handling_ctx:
-            outputs = self._model(**batch)
+            outputs = self._model.forward(
+                tokens=batch["tokens"], mask=mask, input_pos=batch["input_pos"]
+            )
+
+        print(type(outputs), print(outputs.shape))
+
+        del mask
 
         # post process for third party loss functions
         if not isinstance(self._loss_fn, SFTLoss):
-            labels = labels.reshape(-1)
+            # labels = labels.reshape(-1)
             outputs = outputs.reshape(-1, outputs.size(-1))
             if isinstance(outputs, DTensor):
                 outputs = outputs.full_tensor()

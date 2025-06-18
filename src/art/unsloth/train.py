@@ -182,21 +182,7 @@ def calculate_attn_bias(
     parent_ids: torch.Tensor,
     autocast_dtype: torch.dtype,
 ) -> torch.Tensor:
-    causal_mask = (
-        torch.tril(
-            torch.ones(
-                seq_len,
-                seq_len,
-                dtype=torch.bool,
-                device=device,
-            )
-        )
-        .unsqueeze(0)
-        .expand(batch_size, seq_len, seq_len)
-    )
-    group_mask = group_ids.unsqueeze(2) == group_ids.unsqueeze(1)
-    parent_mask = parent_ids.unsqueeze(2) == group_ids.unsqueeze(1)
-    mask = causal_mask & (group_mask | parent_mask)
+    mask = calculate_mask(batch_size, seq_len, device, group_ids, parent_ids)
     # Use the same dtype as autocast to save memory and avoid dtype conversions
     attn_bias = torch.where(
         mask,
@@ -213,6 +199,31 @@ def calculate_attn_bias(
     )
     del mask
     return attn_bias
+
+
+def calculate_mask(
+    batch_size: int,
+    seq_len: int,
+    device: torch.device,
+    group_ids: torch.Tensor,
+    parent_ids: torch.Tensor,
+) -> torch.Tensor:
+    causal_mask = (
+        torch.tril(
+            torch.ones(
+                seq_len,
+                seq_len,
+                dtype=torch.bool,
+                device=device,
+            )
+        )
+        .unsqueeze(0)
+        .expand(batch_size, seq_len, seq_len)
+    )
+    group_mask = group_ids.unsqueeze(2) == group_ids.unsqueeze(1)
+    parent_mask = parent_ids.unsqueeze(2) == group_ids.unsqueeze(1)
+    mask = causal_mask & (group_mask | parent_mask)
+    return mask
 
 
 def calculate_logprobs(
