@@ -184,6 +184,12 @@ class LocalBackend(Backend):
     def __get_step(self, model: TrainableModel) -> int:
         return get_step(get_model_dir(model=model, art_path=self._path))
 
+    async def _set_temperature(
+        self, model: TrainableModel, temperature: float
+    ) -> None:
+        service = await self._get_service(model)
+        await service.set_temperature(temperature)
+
     async def _delete_checkpoints(
         self,
         model: TrainableModel,

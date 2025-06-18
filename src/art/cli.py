@@ -58,6 +58,12 @@ def run(
     app.post("/_get_step")(backend._get_step)
     app.post("/_delete_checkpoints")(backend._delete_checkpoints)
 
+    @app.post("/_set_temperature")
+    async def _set_temperature(
+        model: TrainableModel = Body(...), temperature: float = Body(...)
+    ) -> None:
+        await backend._set_temperature(model, temperature)
+
     @app.post("/_prepare_backend_for_training")
     async def _prepare_backend_for_training(
         model: TrainableModel,

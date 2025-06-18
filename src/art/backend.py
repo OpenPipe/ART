@@ -49,6 +49,15 @@ class Backend:
         response.raise_for_status()
         return response.json()
 
+    async def _set_temperature(
+        self, model: "TrainableModel", temperature: float
+    ) -> None:
+        response = await self._client.post(
+            "/_set_temperature",
+            json={"model": model.model_dump(), "temperature": temperature},
+        )
+        response.raise_for_status()
+
     async def _delete_checkpoints(
         self,
         model: "TrainableModel",
