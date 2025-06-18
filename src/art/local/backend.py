@@ -55,7 +55,13 @@ from art.utils.s3 import (
 
 
 class LocalBackend(Backend):
-    def __init__(self, *, in_process: bool = False, path: str | None = None) -> None:
+    def __init__(
+        self,
+        *,
+        in_process: bool = False,
+        path: str | None = None,
+        openai_port: int = 8000,
+    ) -> None:
         """
         Initializes a local, directory-based Backend interface at the given path.
 
@@ -66,8 +72,10 @@ class LocalBackend(Backend):
         Args:
             in_process: Whether to run the local service in-process.
             path: The path to the local directory. Defaults to "{repo_root}/.art".
+            openai_port: Default port for the OpenAI-compatible endpoint.
         """
         self._in_process = in_process
+        self._openai_port = openai_port
         self._path = path or get_default_art_path()
         os.makedirs(self._path, exist_ok=True)
 
@@ -184,6 +192,12 @@ class LocalBackend(Backend):
     def __get_step(self, model: TrainableModel) -> int:
         return get_step(get_model_dir(model=model, art_path=self._path))
 
+    async def _set_temperature(
+        self, model: TrainableModel, temperature: float
+    ) -> None:
+        service = await self._get_service(model)
+        await service.set_temperature(temperature)
+
     async def _delete_checkpoints(
         self,
         model: TrainableModel,
@@ -217,10 +231,15 @@ class LocalBackend(Backend):
         config: dev.OpenAIServerConfig | None = None,
     ) -> tuple[str, str]:
         service = await self._get_service(model)
-        await service.start_openai_server(config=config)
-        server_args = (config or {}).get("server_args", {})
 
-        base_url = f"http://{server_args.get('host', '0.0.0.0')}:{server_args.get('port', 8000)}/v1"
+        cfg = dict(config or {})
+        server_args = dict(cfg.get("server_args", {}))
+        server_args.setdefault("port", self._openai_port)
+        cfg["server_args"] = server_args
+
+        await service.start_openai_server(config=cfg)
+
+        base_url = f"http://{server_args.get('host', '0.0.0.0')}:{server_args['port']}/v1"
         api_key = server_args.get("api_key", None) or "default"
 
         return base_url, api_key

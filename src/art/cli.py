@@ -18,8 +18,14 @@ app = typer.Typer()
 
 
 @app.command()
-def run(host: str = "0.0.0.0", port: int = 7999) -> None:
-    """Run the ART CLI."""
+def run(host: str = "0.0.0.0", port: int = 7999, openai_port: int = 8000) -> None:
+    """Run the ART CLI.
+
+    Args:
+        host: Address for the training backend.
+        port: Port for the training backend.
+        openai_port: Port for the OpenAI-compatible inference server.
+    """
 
     # check if port is available
     def is_port_available(port: int) -> bool:
@@ -42,13 +48,19 @@ def run(host: str = "0.0.0.0", port: int = 7999) -> None:
     TrajectoryGroup.__new__ = __new__  # type: ignore
     TrajectoryGroup.__init__ = __init__
 
-    backend = LocalBackend()
+    backend = LocalBackend(openai_port=openai_port)
     app = FastAPI()
     app.get("/healthcheck")(lambda: {"status": "ok"})
     app.post("/close")(backend.close)
     app.post("/register")(backend.register)
     app.post("/_get_step")(backend._get_step)
     app.post("/_delete_checkpoints")(backend._delete_checkpoints)
+
+    @app.post("/_set_temperature")
+    async def _set_temperature(
+        model: TrainableModel = Body(...), temperature: float = Body(...)
+    ) -> None:
+        await backend._set_temperature(model, temperature)
 
     @app.post("/_prepare_backend_for_training")
     async def _prepare_backend_for_training(
