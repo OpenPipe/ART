@@ -534,7 +534,7 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
             from torch._dynamo import config as dynamo_config
 
             # Capture scalar outputs is required to compile MoE
-            dynamo_config.capture_scalar_outputs = True
+            dynamo_config.capture_scalar_outputs = True  # type: ignore
 
         # This indirection is needed to apply torch.compile to scale_grads step.
         self._grad_scaler = training.scale_grads_
@@ -1106,6 +1106,14 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
             pbar = tqdm(total=self._steps_per_epoch, disable=not self._is_rank_zero)
             self._dataloader.sampler.set_epoch(curr_epoch)  # type: ignore
             for idx, batch in enumerate(self._dataloader):
+                # TESTING
+                if idx != 0 and idx % 3 == 0:
+                    self._move_to(torch.device("cpu"))
+                    from time import sleep
+
+                    sleep(30)
+                    self._move_to(self._device)
+
                 # Start tracking CUDA memory for active steps for just the first epoch
                 if (
                     self._is_rank_zero
@@ -1266,6 +1274,102 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
             )
 
         self._profiler.stop()
+
+    def _move_to(self, device: torch.device) -> None:
+        """
+        Move the model and optimizer to the given device.
+        """
+        print(f"Moving model to {device}")
+
+        # For FSDP models, we need to handle device movement carefully
+        # FSDP models can't be moved with simple .to() calls
+
+        # Clear GPU cache before moving
+        if device.type == "cuda":
+            torch.cuda.empty_cache()
+
+        # Method 1: Try to move parameters individually for FSDP compatibility
+        try:
+            # Move model parameters one by one
+            with torch.no_grad():
+                for name, param in self._model.named_parameters():
+                    if param.device != device:
+                        param_data = param.data.to(device)
+                        param.data = param_data
+                        print(f"Moved parameter {name} to {device}")
+
+                # Move model buffers one by one
+                for name, buffer in self._model.named_buffers():
+                    if buffer.device != device:
+                        buffer_data = buffer.data.to(device)
+                        buffer.data = buffer_data
+                        print(f"Moved buffer {name} to {device}")
+
+            print(f"Successfully moved model parameters and buffers to {device}")
+
+        except Exception as e:
+            print(f"Failed to move model parameters individually: {e}")
+            # Fallback: try the standard .to() method
+            try:
+                self._model.to(device)
+                print(f"Fallback: moved model using .to() method")
+            except Exception as e2:
+                print(f"Both methods failed: {e2}")
+                return
+
+        # Move loss function if it's a nn.Module
+        if hasattr(self._loss_fn, "to"):
+            try:
+                self._loss_fn.to(device)
+                print(f"Moved loss function to {device}")
+            except Exception as e:
+                print(f"Failed to move loss function: {e}")
+
+        # Move optimizer states to device
+        if hasattr(self, "_optimizer") and self._optimizer is not None:
+            try:
+                print(f"Moving optimizer states to {device}")
+                for param_group in self._optimizer.param_groups:
+                    for param in param_group["params"]:
+                        if param in self._optimizer.state:
+                            state = self._optimizer.state[param]
+                            for key, value in state.items():
+                                if (
+                                    isinstance(value, torch.Tensor)
+                                    and value.device != device
+                                ):
+                                    state[key] = value.to(device)
+                print(f"Successfully moved optimizer states to {device}")
+            except Exception as e:
+                print(f"Failed to move optimizer states: {e}")
+
+        # Handle optimizer-in-backward case
+        if hasattr(self, "_optim_ckpt_wrapper") and self._optimizer_in_bwd:
+            try:
+                print(f"Moving optimizer-in-backward states to {device}")
+                for param, optimizer in self._optim_ckpt_wrapper.optim_map.items():
+                    for param_group in optimizer.param_groups:
+                        for p in param_group["params"]:
+                            if p in optimizer.state:
+                                state = optimizer.state[p]
+                                for key, value in state.items():
+                                    if (
+                                        isinstance(value, torch.Tensor)
+                                        and value.device != device
+                                    ):
+                                        state[key] = value.to(device)
+                print(f"Successfully moved optimizer-in-backward states to {device}")
+            except Exception as e:
+                print(f"Failed to move optimizer-in-backward states: {e}")
+
+        # Force garbage collection and clear cache after moving
+        import gc
+
+        for _ in range(3):
+            gc.collect()
+            torch.cuda.empty_cache()
+
+        print(f"Completed move to {device}")
 
     def cleanup(self) -> None:
         if self._is_rank_zero:
