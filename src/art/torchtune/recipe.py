@@ -1032,11 +1032,12 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
         )
 
         with self.activations_handling_ctx:
-            outputs = self._model.forward(
+            outputs = self._model(
                 tokens=batch["tokens"], mask=mask, input_pos=batch["input_pos"]
             )
 
-        print(type(outputs), print(outputs.shape))
+        print(type(outputs))
+        print(outputs.shape)
 
         del mask
 
@@ -1122,7 +1123,7 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
         self._profiler.start()
         # self.epochs_run should be non-zero when we're resuming from a checkpoint
         for curr_epoch in range(self.epochs_run, self.total_epochs):
-            batches = self._batches()
+            batches = self._batches(curr_epoch)
             pbar = tqdm(total=len(batches), disable=not self._is_rank_zero)
             # self._dataloader.sampler.set_epoch(curr_epoch)  # type: ignore
             for idx, batch in enumerate(batches):
@@ -1285,39 +1286,47 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
 
         self._profiler.stop()
 
-    def _batches(self) -> list[PackedTensors]:
+    def _batches(self, curr_epoch: int) -> list[PackedTensors]:
         import fileinput
         import json
         import math
         import time
 
         while True:
-            with fileinput.input("data.jsonl", inplace=True) as f:
-                first_line = next(f, None)
-                if first_line:  # Only rewrite if we got a line
-                    for line in f:
-                        print(line, end="")  # Rewrite remaining lines
-                else:
+            with open("data.jsonl", "r") as f:
+                try:
+                    line = f.readlines()[curr_epoch]
+                except IndexError:
                     if self._current_device == self._device:
                         self._move_to(torch.device("cpu"))
                     time.sleep(1)
                     continue
-            disk_packed_tensors: DiskPackedTensors = json.loads(first_line.strip())
+            # with fileinput.input("data.jsonl", inplace=True) as f:
+            #     first_line = next(f, None)
+            #     if first_line:  # Only rewrite if we got a line
+            #         for line in f:
+            #             print(line, end="")  # Rewrite remaining lines
+            #     else:
+            #         if self._current_device == self._device:
+            #             self._move_to(torch.device("cpu"))
+            #         time.sleep(1)
+            #         continue
+            disk_packed_tensors: DiskPackedTensors = json.loads(line.strip())
             packed_tensors = packed_tensors_from_dir(**disk_packed_tensors)
             if self._current_device != self._device:
                 self._move_to(self._device)
+            n = disk_packed_tensors["num_sequences"]
             return [
                 cast(
                     PackedTensors,
                     {
-                        k: cast(torch.Tensor, v)[i : i + 1]
+                        k: cast(torch.Tensor, v)[i % n : i % n + 1]
                         for k, v in packed_tensors.items()
                     },
                 )
                 for i in range(
                     self.dp_rank,
-                    math.ceil(disk_packed_tensors["num_sequences"] / self.dp_degree)
-                    * self.dp_degree,
+                    math.ceil(n / self.dp_degree) * self.dp_degree,
                     self.dp_degree,
                 )
             ]
@@ -1400,6 +1409,8 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
         for _ in range(3):
             gc.collect()
             torch.cuda.empty_cache()
+
+        self._current_device = device
 
         print(f"Completed move to {device}")
 
