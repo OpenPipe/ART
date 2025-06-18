@@ -12,6 +12,25 @@ from sweagent.run.hooks.apply_patch import SaveApplyPatchHook
 litellm.success_callback.append("langfuse")
 litellm.failure_callback.append("langfuse")
 
+
+# Suppress the "dictionary changed size during iteration" errors from Langfuse
+class LangfuseErrorFilter(logging.Filter):
+    """Filter out specific Langfuse errors that occur due to concurrent access"""
+
+    def filter(self, record: LogRecord) -> bool:
+        # Return False to suppress the log message
+        if (
+            record.name == "LiteLLM"
+            and "dictionary changed size during iteration" in record.getMessage()
+        ):
+            return False
+        return True
+
+
+# Add the filter to the LiteLLM logger
+litellm_logger = logging.getLogger("LiteLLM")
+litellm_logger.addFilter(LangfuseErrorFilter())
+
 # Suppress urllib3 retry warnings
 logging.getLogger("urllib3.connectionpool").setLevel(logging.ERROR)
 
