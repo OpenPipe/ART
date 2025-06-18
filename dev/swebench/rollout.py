@@ -1,5 +1,6 @@
 import art
 import asyncio
+from http.client import RemoteDisconnected
 import json
 from langfuse.decorators import observe
 import modal
@@ -18,6 +19,7 @@ from swebench.harness.test_spec.test_spec import make_test_spec
 from swerex.deployment.modal import ModalDeployment
 from swerex.exceptions import CommandTimeoutError
 from typing import Any, Literal, overload
+from urllib3.exceptions import ProtocolError
 
 from config import get_config
 from eval import eval_instance
@@ -107,25 +109,20 @@ async def rollout(
         )
     try:
         await run(run_single.run, run_in_thread)
-    except modal.exception.RemoteError as e:
+    except modal.exception.RemoteError as error:
         print(instance["instance_id"])
-        print(e)
-    except ConnectionError as e:
-        print(e)
-    except ConnectTimeout as e:
-        print(e)
-    except CommandTimeoutError as e:
-        print(e)
-    except RuntimeError as e:
-        if not "Container process terminated" in str(e):
-            raise e
-        print(e)
-    except SSLError as ssl_error:
-        print(ssl_error)
-    except TimeoutError as e:
-        if not "Runtime did not start within" in str(e):
-            raise e
-        print(e)
+        print(error)
+    except (
+        ProtocolError,
+        RemoteDisconnected,
+        ConnectionError,
+        ConnectTimeout,
+        CommandTimeoutError,
+        SSLError,
+        RuntimeError,
+        TimeoutError,
+    ) as error:
+        print(error)
     finally:
         try:
             if isinstance(run_single.env.deployment, ModalDeployment):

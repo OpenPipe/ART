@@ -1,12 +1,14 @@
 import asyncio
 from dataclasses import dataclass
 import math
+import os
 import torch
 from typing import AsyncIterator
 from vllm import AsyncEngineArgs
 from vllm.v1.engine.async_llm import AsyncLLM
 
 from .. import dev
+from ..local.checkpoints import get_step_from_dir
 from ..local.pack import DiskPackedTensors
 from .. import types
 from ..vllm import get_llm, openai_server_task
@@ -49,3 +51,7 @@ class TorchtuneService:
         )
         for _ in range(num_steps):
             yield {"loss": 0.0}
+        os.makedirs(
+            f"{self.output_dir}/{get_step_from_dir(self.output_dir)+1:04d}",
+            exist_ok=True,
+        )
