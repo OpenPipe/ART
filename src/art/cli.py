@@ -18,7 +18,15 @@ app = typer.Typer()
 
 
 @app.command()
-def run(host: str = "0.0.0.0", port: int = 7999) -> None:
+def run(
+    host: str = "0.0.0.0",
+    port: int = 7999,
+    path: str | None = typer.Option(
+        None,
+        "--path",
+        help="Directory for model weights and artifacts",
+    ),
+) -> None:
     """Run the ART CLI."""
 
     # check if port is available
@@ -42,7 +50,7 @@ def run(host: str = "0.0.0.0", port: int = 7999) -> None:
     TrajectoryGroup.__new__ = __new__  # type: ignore
     TrajectoryGroup.__init__ = __init__
 
-    backend = LocalBackend()
+    backend = LocalBackend(path=path)
     app = FastAPI()
     app.get("/healthcheck")(lambda: {"status": "ok"})
     app.post("/close")(backend.close)

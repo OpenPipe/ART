@@ -91,6 +91,14 @@ current default.
 
 ART should work with most vLLM/HuggingFace-transformers compatible causal language models, or at least the ones supported by [Unsloth](https://docs.unsloth.ai/get-started/all-our-models). Gemma 3 does not appear to be supported for the time being. If any other model isn't working for you, please let us know on [Discord](https://discord.gg/zbBHRUpwf4) or open an issue on [GitHub](https://github.com/openpipe/art/issues)!
 
+## Remote Server Usage
+
+When launching a remote server with `art run`, you can specify `--path` to control where the server stores model weights and training artifacts. This is helpful if you need the data on a particular volume or want to keep multiple projects separate.
+
+```bash
+art run --path /data/art
+```
+
 ## 🤝 Contributing
 
 ART is in active development, and contributions are most welcome! Please see the [CONTRIBUTING.md](CONTRIBUTING.md) file for more information.
