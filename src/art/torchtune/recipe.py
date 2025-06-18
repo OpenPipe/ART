@@ -1036,8 +1036,8 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
                 tokens=batch["tokens"], mask=mask, input_pos=batch["input_pos"]
             )
 
-        print(type(outputs))
-        print(outputs.shape)
+        print("type(outputs)", type(outputs))
+        print("outputs.shape", outputs.shape)
 
         del mask
 
@@ -1049,7 +1049,7 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
                 outputs = outputs.full_tensor()
 
         # Compute loss
-        loss = self._loss_fn(outputs, labels)  # type: ignore
+        loss = self._loss_fn(outputs, batch["tokens"])  # type: ignore
 
         # free logits otherwise it peaks backward memory
         del outputs
