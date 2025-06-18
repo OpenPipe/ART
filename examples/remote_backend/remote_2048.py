@@ -14,6 +14,8 @@ load_dotenv()
 random.seed(42)
 
 # URL of the remote ART server (e.g. "http://123.45.67.89:7999")
+# The inference server port is determined by the remote host when it was started
+# using the ``--openai-port`` flag.
 REMOTE_URL = os.getenv("ART_SERVER_URL", "http://localhost:7999")
 backend = art.Backend(base_url=REMOTE_URL)
 

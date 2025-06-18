@@ -18,9 +18,15 @@ app = typer.Typer()
 
 
 @app.command()
-def run(
-    host: str = "0.0.0.0",
-    port: int = 7999,
+def run(host: str = "0.0.0.0", port: int = 7999, openai_port: int = 8000) -> None:
+    """Run the ART CLI.
+
+    Args:
+        host: Address for the training backend.
+        port: Port for the training backend.
+        openai_port: Port for the OpenAI-compatible inference server.
+    """
+    backend = LocalBackend(openai_port=openai_port)
     path: str | None = typer.Option(
         None,
         "--path",
