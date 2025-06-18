@@ -1,5 +1,7 @@
 import asyncio
 from dataclasses import dataclass
+import math
+import torch
 from typing import AsyncIterator
 from vllm import AsyncEngineArgs
 from vllm.v1.engine.async_llm import AsyncLLM
@@ -19,7 +21,6 @@ class TorchtuneService:
 
     @property
     def llm_task(self) -> asyncio.Task[AsyncLLM]:
-        print(self.config.get("engine_args", {}))
         return asyncio.create_task(
             get_llm(AsyncEngineArgs(**self.config.get("engine_args", {})))  # type: ignore
         )
@@ -43,6 +44,8 @@ class TorchtuneService:
         _config: dev.TrainConfig,
         verbose: bool = False,
     ) -> AsyncIterator[dict[str, float]]:
-        print(f"Training {self.model_name} with {config}")
-        await asyncio.sleep(1)
-        yield {"loss": 0.0}
+        num_steps = math.ceil(
+            disk_packed_tensors["num_sequences"] / torch.cuda.device_count()
+        )
+        for _ in range(num_steps):
+            yield {"loss": 0.0}
