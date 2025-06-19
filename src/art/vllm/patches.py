@@ -36,8 +36,9 @@ def patch_allocator() -> None:
         else:
             offload_to = "none"
 
+        override_tags = getattr(allocator, "_override_tags", {"kv_cache"})
         for ptr, data in allocator.pointer_to_data.items():
-            if data.tag != "kv_cache":
+            if data.tag not in override_tags:
                 continue
             handle = data.handle
             size_in_bytes = handle[1]
@@ -64,30 +65,30 @@ def patch_allocator() -> None:
                 data.cpu_backup_tensor = cpu_backup_tensor
             unmap_and_release(handle)
 
-    def wake_up(tags: Optional[list[str]] = None) -> None:
+    def wake_up(tags: list[str] | None = None) -> None:
         """
         Wake up the allocator from sleep mode.
         All data that is previously offloaded will be loaded back to GPU
         memory, and the rest of the data will have empty memory.
         """
+        override_tags = getattr(allocator, "_override_tags", {"kv_cache"})
         for ptr, data in allocator.pointer_to_data.items():
-            if data.tag != "kv_cache":
+            if data.tag not in override_tags:
                 continue
-            if tags is None or data.tag in tags:
-                create_and_map(data.handle)
-                if data.cpu_backup_tensor is not None:
-                    cpu_backup_tensor = data.cpu_backup_tensor
-                    if cpu_backup_tensor is not None:
-                        size_in_bytes = (
-                            cpu_backup_tensor.numel() * cpu_backup_tensor.element_size()
-                        )
-                        cpu_ptr = cpu_backup_tensor.data_ptr()
-                        libcudart.cudaMemcpy(
-                            ctypes.c_void_p(ptr),
-                            ctypes.c_void_p(cpu_ptr),
-                            size_in_bytes,
-                        )
-                        data.cpu_backup_tensor = None
+            create_and_map(data.handle)
+            if data.cpu_backup_tensor is not None:
+                cpu_backup_tensor = data.cpu_backup_tensor
+                if cpu_backup_tensor is not None:
+                    size_in_bytes = (
+                        cpu_backup_tensor.numel() * cpu_backup_tensor.element_size()
+                    )
+                    cpu_ptr = cpu_backup_tensor.data_ptr()
+                    libcudart.cudaMemcpy(
+                        ctypes.c_void_p(ptr),
+                        ctypes.c_void_p(cpu_ptr),
+                        size_in_bytes,
+                    )
+                    data.cpu_backup_tensor = None
 
     allocator.sleep = sleep
     allocator.wake_up = wake_up
@@ -191,4 +192,4 @@ def patch_multi_step_model_runner(runner: MultiStepModelRunner) -> None:
     runner.add_lora = base_runner.add_lora
     runner.remove_lora = base_runner.remove_lora
     runner.pin_lora = base_runner.pin_lora
-    runner.list_loras = base_runner.list_loras 
+    runner.list_loras = base_runner.list_loras

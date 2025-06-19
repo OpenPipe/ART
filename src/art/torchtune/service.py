@@ -1,7 +1,9 @@
 import asyncio
+from collections import Counter
 from dataclasses import dataclass
 import math
 import os
+import signal
 import torch
 from typing import AsyncIterator
 from vllm import AsyncEngineArgs
@@ -11,7 +13,7 @@ from .. import dev
 from ..local.checkpoints import get_step_from_dir
 from ..local.pack import DiskPackedTensors
 from .. import types
-from ..vllm import get_llm, openai_server_task
+from ..vllm import get_llm, get_worker, openai_server_task, run_on_workers
 
 
 @dataclass
@@ -46,6 +48,33 @@ class TorchtuneService:
         _config: dev.TrainConfig,
         verbose: bool = False,
     ) -> AsyncIterator[dict[str, float]]:
+        llm = await self.llm_task
+        pids_path = f"{self.output_dir}/pids.txt"
+        with open(pids_path, "w") as f:
+            f.write("")
+
+        def sleep() -> None:
+            from vllm.device_allocator.cumem import CuMemAllocator
+
+            with open(pids_path, "a") as f:
+                f.write(f"{os.getpid()}\n")
+            worker = get_worker()
+            allocator = CuMemAllocator.get_instance()
+            setattr(allocator, "_override_tags", {"weights", "kv_cache"})
+            worker.sleep()
+            with open(pids_path, "a") as f:
+                f.write(f"{os.getpid()}\n")
+            os.kill(os.getpid(), signal.SIGSTOP)
+            worker.wake_up()
+            delattr(allocator, "_override_tags")
+
+        sleep_task = asyncio.create_task(run_on_workers(llm, sleep))
+        while True:
+            pids = Counter(open(pids_path).read().splitlines())
+            if set(pids.values()) == {2}:
+                break
+            await asyncio.sleep(0.25)
+
         num_steps = math.ceil(
             disk_packed_tensors["num_sequences"] / torch.cuda.device_count()
         )
