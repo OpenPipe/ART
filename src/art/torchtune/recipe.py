@@ -1018,28 +1018,74 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
         return dataloader
 
     def _loss_step(self, batch: PackedTensors) -> torch.Tensor:
-        from ..unsloth.train import calculate_mask
+        from ..unsloth.train import calculate_mask, shift_tensor
 
         # Shape [b, s], needed for the loss not the model
         # labels = batch.pop("labels")
 
-        mask = calculate_mask(
-            batch_size=batch["tokens"].shape[0],
-            seq_len=batch["tokens"].shape[1],
-            device=self._device,
+        import torch
+        from torch.nn.attention.flex_attention import create_block_mask, BlockMask
+
+        def make_block_mask(
+            group_ids: torch.Tensor,  # [B, S]  int32/64
+            parent_ids: torch.Tensor,  # [B, S]  int32/64
+            block_size: int = 16,
+        ) -> BlockMask:
+            """
+            FlexAttention equivalent of
+
+                causal_mask & (group_ids[q]==group_ids[kv]  |  parent_ids[kv]==group_ids[q])
+
+            * group_ids : id shared by all tokens of the same sampled trajectory
+            * parent_ids: id identifying the prompt that produced each token
+            """
+            B, S = group_ids.shape  # batch, sequence length
+
+            # the closure captures the two id tensors; that’s fine for torch.compile
+            def mask_mod(b, h, q_idx, kv_idx):
+                # causal constraint
+                causal = kv_idx <= q_idx
+
+                same_group = group_ids[b, q_idx] == group_ids[b, kv_idx]
+                prompt_link = parent_ids[b, kv_idx] == group_ids[b, q_idx]
+
+                return causal & (same_group | prompt_link)
+
+            return create_block_mask(
+                mask_mod,
+                B=B,
+                H=None,
+                Q_LEN=S,
+                KV_LEN=S,
+                # BLOCK_SIZE=block_size,
+            )
+
+        # mask = calculate_mask(
+        #     batch_size=batch["tokens"].shape[0],
+        #     seq_len=batch["tokens"].shape[1],
+        #     device=self._device,
+        #     group_ids=batch["group_ids"],
+        #     parent_ids=batch["parent_ids"],
+        # )
+
+        block_mask = make_block_mask(
             group_ids=batch["group_ids"],
             parent_ids=batch["parent_ids"],
         )
 
         with self.activations_handling_ctx:
             outputs = self._model(
-                tokens=batch["tokens"], mask=mask, input_pos=batch["input_pos"]
+                tokens=batch["tokens"],
+                # mask=mask,
+                mask=block_mask,
+                input_pos=batch["input_pos"],
             )
 
         print("type(outputs)", type(outputs))
         print("outputs.shape", outputs.shape)
 
-        del mask
+        # del mask
+        del block_mask
 
         # post process for third party loss functions
         if not isinstance(self._loss_fn, SFTLoss):
@@ -1049,7 +1095,14 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
                 outputs = outputs.full_tensor()
 
         # Compute loss
-        loss = self._loss_fn(outputs, batch["tokens"])  # type: ignore
+        loss = self._loss_fn(
+            outputs,
+            shift_tensor(
+                torch.where(batch["assistant_mask"], batch["tokens"], -100), -100
+            ),
+        )  # type: ignore
+
+        print("loss", loss)
 
         # free logits otherwise it peaks backward memory
         del outputs
@@ -1156,6 +1209,7 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
                         torch.distributed.all_reduce(running_loss)
                         current_loss = current_loss * (self.dp_degree / num_tokens)
                     current_loss.backward()
+                    print("current_loss", current_loss)
 
                 # Optimizer step (if not fused in backward call)
                 if (idx + 1) % self._gradient_accumulation_steps == 0:
@@ -1182,7 +1236,9 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
                                 grad_norm = grad_norm.full_tensor()
                         assert self._optimizer is not None
                         self._optimizer.step()
+                        print("self._optimizer.step()")
                         self._optimizer.zero_grad(set_to_none=True)
+                        print("self._optimizer.zero_grad(set_to_none=True)")
 
                     # Update the number of steps when the weights are updated
                     self.global_step += 1
@@ -1271,18 +1327,18 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
                     break
 
             self.epochs_run += 1
-            self._checkpoint_client.save_checkpoint(
-                model=self._model,
-                optimizer=self._optimizer_or_optim_ckpt_wrapper,
-                training_progress=TrainingProgress(
-                    seed=self.seed,
-                    epochs_run=self.epochs_run,
-                    total_epochs=self.total_epochs,
-                    max_steps_per_epoch=self.max_steps_per_epoch,
-                    dataloader_state_dict=self._dataloader.state_dict(),
-                ),
-                epoch=curr_epoch,
-            )
+            # self._checkpoint_client.save_checkpoint(
+            #     model=self._model,
+            #     optimizer=self._optimizer_or_optim_ckpt_wrapper,
+            #     training_progress=TrainingProgress(
+            #         seed=self.seed,
+            #         epochs_run=self.epochs_run,
+            #         total_epochs=self.total_epochs,
+            #         max_steps_per_epoch=self.max_steps_per_epoch,
+            #         dataloader_state_dict=self._dataloader.state_dict(),
+            #     ),
+            #     epoch=curr_epoch,
+            # )
 
         self._profiler.stop()
 
