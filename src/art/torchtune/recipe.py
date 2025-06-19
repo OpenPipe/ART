@@ -1029,7 +1029,7 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
         def make_block_mask(
             group_ids: torch.Tensor,  # [B, S]  int32/64
             parent_ids: torch.Tensor,  # [B, S]  int32/64
-            block_size: int = 16,
+            block_size: int = 128,
         ) -> BlockMask:
             """
             FlexAttention equivalent of
@@ -1047,7 +1047,7 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
                 causal = kv_idx <= q_idx
 
                 same_group = group_ids[b, q_idx] == group_ids[b, kv_idx]
-                prompt_link = parent_ids[b, kv_idx] == group_ids[b, q_idx]
+                prompt_link = parent_ids[b, q_idx] == group_ids[b, kv_idx]
 
                 return causal & (same_group | prompt_link)
 
@@ -1057,7 +1057,7 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
                 H=None,
                 Q_LEN=S,
                 KV_LEN=S,
-                # BLOCK_SIZE=block_size,
+                BLOCK_SIZE=block_size,
             )
 
         # mask = calculate_mask(
@@ -1073,6 +1073,58 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
             parent_ids=batch["parent_ids"],
         )
 
+        import torch
+        from torch.nn.functional import pad
+
+        def dense_to_block(dense_mask: torch.Tensor, block_size: int) -> torch.Tensor:
+            """
+            Compress [B, S, S] token mask into [B, Q_blk, KV_blk] block mask
+            where each tile is True iff *any* token pair inside it is visible.
+            """
+            B, S, _ = dense_mask.shape
+            pad_len = (-S) % block_size  # make S divisible by block_size
+            if pad_len:
+                dense_mask = pad(dense_mask, (0, pad_len, 0, pad_len))
+
+            S_pad = S + pad_len
+            q_blk = S_pad // block_size
+            kv_blk = q_blk
+
+            dense_mask = dense_mask.view(
+                B, q_blk, block_size, kv_blk, block_size
+            )  # [B,Qb,Bs,Kb,Bs]
+            return dense_mask.any(-1).any(-2)  # [B,Qb,Kb]
+
+        def explain_block_diffs(
+            dense_mask: torch.Tensor,  # [B,S,S] token-level
+            block_mask,  # flex_attention.BlockMask
+            block_size: int = 128,
+            max_print: int = 20,
+        ):
+            dense_blk = dense_to_block(dense_mask, block_size)  # [B,Qb,Kb]
+            bm_blk = block_mask.to_dense().squeeze(1).bool()  # [B,Qb,Kb]
+
+            diff = dense_blk ^ bm_blk
+            idx = diff.nonzero(as_tuple=False)
+            if idx.numel() == 0:
+                print("✅  token mask and BlockMask agree at block granularity.")
+                return
+
+            print(f"⚠️  {idx.size(0)} block mismatches (showing first {max_print})")
+            print("b  q_blk  kv_blk | dense  block")
+            for b, q, kv in idx[:max_print]:
+                print(
+                    f"{b:2d} {q:6d} {kv:7d} |   {int(dense_blk[b,q,kv])}      {int(bm_blk[b,q,kv])}"
+                )
+            if idx.size(0) > max_print:
+                print(f"... (+{idx.size(0)-max_print} more)")
+
+        # ---------------------------------------------------------------------
+        # EXAMPLE USAGE inside your training loop -----------------------------
+        # explain_block_diffs(mask, block_mask, block_size=128, max_print=20)
+
+        # assert torch.equal(mask, block_mask.to_dense()), "masks differ"
+
         with self.activations_handling_ctx:
             outputs = self._model(
                 tokens=batch["tokens"],
@@ -1081,8 +1133,8 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
                 input_pos=batch["input_pos"],
             )
 
-        print("type(outputs)", type(outputs))
-        print("outputs.shape", outputs.shape)
+        if self._is_rank_zero:
+            print("outputs.shape", outputs.shape)
 
         # del mask
         del block_mask
@@ -1102,7 +1154,8 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
             ),
         )  # type: ignore
 
-        print("loss", loss)
+        if self._is_rank_zero:
+            print("loss", loss)
 
         # free logits otherwise it peaks backward memory
         del outputs
@@ -1209,7 +1262,8 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
                         torch.distributed.all_reduce(running_loss)
                         current_loss = current_loss * (self.dp_degree / num_tokens)
                     current_loss.backward()
-                    print("current_loss", current_loss)
+                    if self._is_rank_zero:
+                        print("current_loss", current_loss)
 
                 # Optimizer step (if not fused in backward call)
                 if (idx + 1) % self._gradient_accumulation_steps == 0:
@@ -1236,9 +1290,9 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
                                 grad_norm = grad_norm.full_tensor()
                         assert self._optimizer is not None
                         self._optimizer.step()
-                        print("self._optimizer.step()")
+                        if self._is_rank_zero:
+                            print("self._optimizer.step()")
                         self._optimizer.zero_grad(set_to_none=True)
-                        print("self._optimizer.zero_grad(set_to_none=True)")
 
                     # Update the number of steps when the weights are updated
                     self.global_step += 1
