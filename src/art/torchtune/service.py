@@ -128,6 +128,8 @@ class TorchtuneService:
         return asyncio.create_task(self.get_train_process())
 
     async def get_train_process(self) -> asyncio.subprocess.Process:
+        if os.path.exists(f"{self.output_dir}/batches.jsonl"):
+            os.remove(f"{self.output_dir}/batches.jsonl")
         checkpoint_dir = await self.get_checkpoint_dir()
         assert "torchtune_args" in self.config
         torchtune_config = self.config["torchtune_args"]

@@ -16,7 +16,7 @@ from typing import Any, Optional, Union
 from warnings import warn
 
 from omegaconf import DictConfig, OmegaConf
-from pydantic import BaseModel, Field, field_validator, ConfigDict
+from pydantic import BaseModel, ConfigDict, Field, field_validator, ValidationError
 import torch
 from torch import nn
 from torch.distributed import destroy_process_group, init_process_group
@@ -55,7 +55,8 @@ from tqdm import tqdm
 from typing import cast, List, Literal
 
 
-from ..local.pack import DiskPackedTensors, PackedTensors, packed_tensors_from_dir
+from .batch import Batch
+from ..local.pack import PackedTensors, packed_tensors_from_dir
 
 
 # Pydantic Configuration Models
@@ -1229,10 +1230,10 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
         self._profiler.start()
         # self.epochs_run should be non-zero when we're resuming from a checkpoint
         for curr_epoch in range(self.epochs_run, self.total_epochs):
-            batches = self._batches(curr_epoch)
-            pbar = tqdm(total=len(batches), disable=not self._is_rank_zero)
+            micro_batches = self._get_micro_batches(curr_epoch)
+            pbar = tqdm(total=len(micro_batches), disable=not self._is_rank_zero)
             # self._dataloader.sampler.set_epoch(curr_epoch)  # type: ignore
-            for idx, batch in enumerate(batches):
+            for idx, batch in enumerate(micro_batches):
                 # Start tracking CUDA memory for active steps for just the first epoch
                 if (
                     self._is_rank_zero
@@ -1396,36 +1397,23 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
 
         self._profiler.stop()
 
-    def _batches(self, curr_epoch: int) -> list[PackedTensors]:
-        import fileinput
-        import json
+    def _get_micro_batches(self, curr_epoch: int) -> list[PackedTensors]:
         import math
         import time
 
         while True:
-            with open("data.jsonl", "r") as f:
+            with open(f"{self._output_dir}/batches.jsonl", "r") as f:
                 try:
-                    line = f.readlines()[curr_epoch]
-                except IndexError:
+                    batch = Batch.model_validate_json(f.readlines()[curr_epoch].strip())
+                except (IndexError, ValidationError):
                     if self._current_device == self._device:
                         self._move_to(torch.device("cpu"))
-                    time.sleep(1)
+                    time.sleep(0.5)
                     continue
-            # with fileinput.input("data.jsonl", inplace=True) as f:
-            #     first_line = next(f, None)
-            #     if first_line:  # Only rewrite if we got a line
-            #         for line in f:
-            #             print(line, end="")  # Rewrite remaining lines
-            #     else:
-            #         if self._current_device == self._device:
-            #             self._move_to(torch.device("cpu"))
-            #         time.sleep(1)
-            #         continue
-            disk_packed_tensors: DiskPackedTensors = json.loads(line.strip())
-            packed_tensors = packed_tensors_from_dir(**disk_packed_tensors)
+            packed_tensors = packed_tensors_from_dir(**batch.disk_packed_tensors)
             if self._current_device != self._device:
                 self._move_to(self._device)
-            n = disk_packed_tensors["num_sequences"]
+            n = batch.disk_packed_tensors["num_sequences"]
             return [
                 cast(
                     PackedTensors,
