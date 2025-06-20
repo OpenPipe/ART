@@ -6,6 +6,7 @@ import math
 import os
 import signal
 import torch
+import torchtune
 from typing import AsyncIterator
 from vllm import AsyncEngineArgs
 from vllm.v1.engine.async_llm import AsyncLLM
@@ -25,45 +26,12 @@ class TorchtuneService:
     config: dev.InternalModelConfig
     output_dir: str
 
-    @lru_cache(maxsize=1)
-    def llm(self) -> asyncio.Task[AsyncLLM]:
-        return asyncio.create_task(
-            get_llm(AsyncEngineArgs(**self.config.get("engine_args", {})))  # type: ignore
-        )
-
-    @lru_cache(maxsize=1)
-    def train_process(self) -> asyncio.Task[asyncio.subprocess.Process]:
-        import torchtune
-
-        program_and_args = [
-            f"{os.path.dirname(torchtune.__file__)}/_cli/tune.py",
-            "run",
-            "--nproc-per-node",
-            str(torch.cuda.device_count()),
-            f"{os.path.dirname(__file__)}/recipe.py",
-            "--config",
-            f"{os.path.dirname(__file__)}/config.yaml",
-            "metric_logger._component_=torchtune.training.metric_logging.StdoutLogger",
-            "metric_logger.log_dir=null",
-        ]
-
-        print(program_and_args)
-
-        return asyncio.create_task(
-            asyncio.subprocess.create_subprocess_exec(
-                *program_and_args,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-            )
-        )
-
     async def start_openai_server(self, config: dev.OpenAIServerConfig | None) -> None:
         await openai_server_task(
             engine=await self.llm(),
             config=dev.get_openai_server_config(
                 model_name=self.model_name,
-                # TODO: Choose the base model to be the latest version of the model
-                base_model=self.base_model,
+                base_model=self.get_last_checkpoint_dir() or self.base_model,
                 log_file=f"{self.output_dir}/logs/vllm.log",
                 config=config,
             ),
@@ -148,3 +116,64 @@ class TorchtuneService:
                     break
 
         await sleep_task
+
+    @lru_cache(maxsize=1)
+    def llm(self) -> asyncio.Task[AsyncLLM]:
+        return asyncio.create_task(
+            get_llm(AsyncEngineArgs(**self.config.get("engine_args", {})))  # type: ignore
+        )
+
+    @lru_cache(maxsize=1)
+    def train_process(self) -> asyncio.Task[asyncio.subprocess.Process]:
+        return asyncio.create_task(self.get_train_process())
+
+    async def get_train_process(self) -> asyncio.subprocess.Process:
+        checkpoint_dir = await self.get_checkpoint_dir()
+        assert "torchtune_args" in self.config
+        torchtune_config = self.config["torchtune_args"]
+        assert torchtune_config is not None
+        program_and_args = [
+            f"{os.path.dirname(torchtune.__file__)}/_cli/tune.py",
+            "run",
+            "--nproc-per-node",
+            str(torch.cuda.device_count()),
+            f"{os.path.dirname(__file__)}/recipe.py",
+            "--config",
+            f"{os.path.dirname(__file__)}/config.yaml",
+            f"tokenizer.path={checkpoint_dir}/vocab.json",
+            f"tokenizer.merges_file={checkpoint_dir}/merges.txt",
+            f"checkpointer.checkpoint_dir={checkpoint_dir}",
+            f'checkpointer.checkpoint_files=[$(ls {checkpoint_dir}/*.safetensors | xargs -n1 basename | sed \'s/^/"/;s/$/"/;s/ /", /g;s/\n/ /g;s/,$//\' )]',
+            f"model._component_={torchtune_config['model']}",
+            "metric_logger._component_=torchtune.training.metric_logging.StdoutLogger",
+            "metric_logger.log_dir=null",
+            f"output_dir={self.output_dir}",
+        ]
+        print(program_and_args)
+        return await asyncio.subprocess.create_subprocess_exec(
+            *program_and_args,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+
+    async def get_checkpoint_dir(self) -> str:
+        # Use the last of any existing checkpoints to resume training
+        if last_checkpoint_dir := self.get_last_checkpoint_dir():
+            return last_checkpoint_dir
+        # Assume the self.base_model is a checkpoint directory if it exists
+        if os.path.isdir(self.base_model):
+            return self.base_model
+        # Otherwise, assume it's a HuggingFace model id and download it
+        process = await asyncio.subprocess.create_subprocess_exec(
+            "huggingface-cli",
+            "download",
+            self.base_model,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        stdout, _ = await process.communicate()
+        return stdout.decode("utf-8").splitlines()[-1].strip()
+
+    def get_last_checkpoint_dir(self) -> str | None:
+        dir = f"{self.output_dir}/{get_step_from_dir(self.output_dir):04d}"
+        return dir if os.path.isdir(dir) else None
