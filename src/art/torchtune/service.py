@@ -50,7 +50,21 @@ class TorchtuneService:
         pids_path = f"{self.output_dir}/pids.txt"
         with open(pids_path, "w") as f:
             f.write("")
-        os.remove("/dev/shm/state_dict.safetensors")
+        if os.path.exists("/dev/shm/state_dict.safetensors"):
+            os.remove("/dev/shm/state_dict.safetensors")
+
+        print(
+            "params",
+            (
+                await run_on_workers(
+                    llm,
+                    lambda: [
+                        name
+                        for name, _ in get_worker().model_runner.model.named_parameters()
+                    ],
+                )
+            )[0],
+        )
 
         def sleep() -> None:
             from vllm.device_allocator.cumem import CuMemAllocator
@@ -69,6 +83,10 @@ class TorchtuneService:
                     state_dict = load_file("/dev/shm/state_dict.safetensors")
                     break
                 except FileNotFoundError:
+                    time.sleep(0.25)
+                    continue
+                except Exception as e:
+                    print(type(e), e)
                     time.sleep(0.25)
                     continue
             worker.wake_up(tags=["weights"])
