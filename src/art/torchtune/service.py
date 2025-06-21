@@ -1,7 +1,7 @@
 import asyncio
 from collections import Counter
 from dataclasses import dataclass
-from functools import lru_cache
+from functools import cached_property
 import math
 import os
 import signal
@@ -28,7 +28,7 @@ class TorchtuneService:
 
     async def start_openai_server(self, config: dev.OpenAIServerConfig | None) -> None:
         await openai_server_task(
-            engine=await self.llm(),
+            engine=await self.llm,
             config=dev.get_openai_server_config(
                 model_name=self.model_name,
                 base_model=self.get_last_checkpoint_dir() or self.base_model,
@@ -44,7 +44,7 @@ class TorchtuneService:
         _config: dev.TrainConfig,
         verbose: bool = False,
     ) -> AsyncIterator[dict[str, float]]:
-        llm = await self.llm()
+        llm = await self.llm
         pids_path = f"{self.output_dir}/pids.txt"
         with open(pids_path, "w") as f:
             f.write("")
@@ -81,49 +81,36 @@ class TorchtuneService:
                 + "\n"
             )
 
-        train_process = await self.train_process()
-        assert train_process.stdout is not None
+        train_process = await self.train_process
+        train_queue = await self.train_queue
         num_steps = math.ceil(
             disk_packed_tensors["num_sequences"] / torch.cuda.device_count()
         )
-        async for line in train_process.stdout:
-            line_str = line.decode("utf-8")
-            with open(f"{self.output_dir}/logs/train.log", "a") as f:
-                f.write(line_str)
-            line_str = line_str.strip()
-
-            # Look for lines in format: "Step {step} | {name}:{value} {name}:{value} ..."
-            if line_str.startswith("Step ") and " | " in line_str:
-                parts = line_str.split(" | ", 1)
-                step = int(parts[0].split()[1])
-
-                metrics: dict[str, float] = {"step": float(step)}
-
-                # Parse metrics from the second part
-                if len(parts) > 1:
-                    for metric in parts[1].split():
-                        if ":" in metric:
-                            name, value = metric.split(":", 1)
-                            try:
-                                metrics[name] = float(value)
-                            except ValueError:
-                                # Skip non-numeric values to match the return type
-                                pass
-
-                yield metrics
-                num_steps -= 1
-                if num_steps == 0:
-                    break
-
+        for _ in range(num_steps):
+            done, _ = await asyncio.wait(
+                [train_queue.get(), train_process.wait()],
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            for task in done:
+                result = task.result()
+                if isinstance(result, dict):
+                    yield result
+                else:
+                    _, stderr = await train_process.communicate()
+                    raise RuntimeError(stderr.decode("utf-8"))
         await sleep_task
 
-    @lru_cache(maxsize=1)
+    @cached_property
     def llm(self) -> asyncio.Task[AsyncLLM]:
         return asyncio.create_task(
             get_llm(AsyncEngineArgs(**self.config.get("engine_args", {})))  # type: ignore
         )
 
-    @lru_cache(maxsize=1)
+    @cached_property
+    def train_queue(self) -> asyncio.Task[asyncio.Queue[dict[str, float]]]:
+        return asyncio.create_task(self.get_train_queue())
+
+    @cached_property
     def train_process(self) -> asyncio.Task[asyncio.subprocess.Process]:
         return asyncio.create_task(self.get_train_process())
 
@@ -134,18 +121,28 @@ class TorchtuneService:
         assert "torchtune_args" in self.config
         torchtune_config = self.config["torchtune_args"]
         assert torchtune_config is not None
+
+        # Get the list of safetensor files
+        import glob
+
+        safetensor_files = glob.glob(f"{checkpoint_dir}/*.safetensors")
+        checkpoint_files = [os.path.basename(f) for f in safetensor_files]
+        checkpoint_files_str = "[" + ", ".join(f'"{f}"' for f in checkpoint_files) + "]"
+
         program_and_args = [
+            "python",  # Use Python interpreter
             f"{os.path.dirname(torchtune.__file__)}/_cli/tune.py",
             "run",
             "--nproc-per-node",
             str(torch.cuda.device_count()),
-            f"{os.path.dirname(__file__)}/recipe.py",
+            # f"{os.path.dirname(__file__)}/recipe.py",
+            "art.torchtune.recipe",
             "--config",
             f"{os.path.dirname(__file__)}/config.yaml",
             f"tokenizer.path={checkpoint_dir}/vocab.json",
             f"tokenizer.merges_file={checkpoint_dir}/merges.txt",
             f"checkpointer.checkpoint_dir={checkpoint_dir}",
-            f'checkpointer.checkpoint_files=[$(ls {checkpoint_dir}/*.safetensors | xargs -n1 basename | sed \'s/^/"/;s/$/"/;s/ /", /g;s/\n/ /g;s/,$//\' )]',
+            f"checkpointer.checkpoint_files={checkpoint_files_str}",
             f"model._component_={torchtune_config['model']}",
             "metric_logger._component_=torchtune.training.metric_logging.StdoutLogger",
             "metric_logger.log_dir=null",
@@ -157,6 +154,36 @@ class TorchtuneService:
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )
+
+    async def get_train_queue(self) -> asyncio.Queue[dict[str, float]]:
+        process = await self.train_process
+        queue = asyncio.Queue()
+
+        async def read(reader: asyncio.StreamReader) -> None:
+            async for line in reader:
+                line_str = line.decode("utf-8")
+                with open(f"{self.output_dir}/logs/train.log", "a") as f:
+                    f.write(line_str)
+                line_str = line_str.strip()
+                if line_str.startswith("Step ") and " | " in line_str:
+                    parts = line_str.split(" | ", 1)
+                    step = int(parts[0].split()[1])
+                    metrics: dict[str, float] = {"step": float(step)}
+                    if len(parts) > 1:
+                        for metric in parts[1].split():
+                            if ":" in metric:
+                                name, value = metric.split(":", 1)
+                                try:
+                                    metrics[name] = float(value)
+                                except ValueError:
+                                    # Skip non-numeric values to match the return type
+                                    pass
+                    await queue.put(metrics)
+
+        assert process.stdout and process.stderr
+        asyncio.create_task(read(process.stdout))
+        asyncio.create_task(read(process.stderr))
+        return queue
 
     async def get_checkpoint_dir(self) -> str:
         # Use the last of any existing checkpoints to resume training

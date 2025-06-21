@@ -1,6 +1,5 @@
 """OpenAI-compatible server functionality for vLLM."""
 
-from argparse import Namespace
 import asyncio
 from contextlib import asynccontextmanager
 import logging
@@ -35,9 +34,9 @@ async def openai_server_task(
     from .patches import (
         subclass_chat_completion_request,
         patch_listen_for_disconnect,
-        patch_tool_parser_manager
+        patch_tool_parser_manager,
     )
-    
+
     # We must subclass ChatCompletionRequest before importing api_server
     # or logprobs will not always be returned
     subclass_chat_completion_request()
@@ -49,7 +48,8 @@ async def openai_server_task(
 
     @asynccontextmanager
     async def build_async_engine_client(
-        _: Namespace,
+        *args: Any,
+        **kwargs: Any,
     ) -> AsyncIterator[EngineClient]:
         yield engine
 
@@ -109,6 +109,7 @@ def _openai_server_coroutine(
         ],
     ]
     namespace = parser.parse_args(args)
+    assert namespace is not None
     validate_parsed_serve_args(namespace)
     return api_server.run_server(
         namespace,
@@ -163,4 +164,4 @@ def set_vllm_log_file(path: str) -> None:
     vllm_logger.addHandler(file_handler)
 
     # Set log level to filter out DEBUG messages
-    vllm_logger.setLevel(logging.INFO) 
+    vllm_logger.setLevel(logging.INFO)
