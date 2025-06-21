@@ -13,9 +13,9 @@ from vllm.v1.engine.async_llm import AsyncLLM
 
 from .batch import Batch
 from .. import dev
-from ..local.checkpoints import get_step_from_dir
 from ..local.pack import DiskPackedTensors
 from .. import types
+from ..utils.get_model_step import get_step_from_dir
 from ..vllm import get_llm, get_worker, openai_server_task, run_on_workers
 
 

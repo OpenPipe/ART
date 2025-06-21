@@ -45,6 +45,7 @@ from torchtune.training.checkpointing._checkpoint_client import (
     CheckpointClient,
     TrainingProgress,
 )
+from torchtune.training import FullModelHFCheckpointer
 from torchtune.training.memory import OptimizerInBackwardWrapper
 from torchtune.training.lr_schedulers import get_lr
 from torchtune.training.quantization import (
@@ -57,6 +58,7 @@ from typing import cast, List, Literal
 
 from .batch import Batch
 from ..local.pack import PackedTensors, packed_tensors_from_dir
+from ..utils.get_model_step import get_step_from_dir
 
 
 # Pydantic Configuration Models
@@ -1382,23 +1384,12 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
                     break
 
             self.epochs_run += 1
-            # self._checkpoint_client.save_checkpoint(
-            #     model=self._model,
-            #     optimizer=self._optimizer_or_optim_ckpt_wrapper,
-            #     training_progress=TrainingProgress(
-            #         seed=self.seed,
-            #         epochs_run=self.epochs_run,
-            #         total_epochs=self.total_epochs,
-            #         max_steps_per_epoch=self.max_steps_per_epoch,
-            #         dataloader_state_dict=self._dataloader.state_dict(),
-            #     ),
-            #     epoch=curr_epoch,
-            # )
 
         self._profiler.stop()
 
     def _get_micro_batches(self, curr_epoch: int) -> list[PackedTensors]:
         import math
+        from safetensors.torch import save_file
         import time
 
         while True:
@@ -1407,7 +1398,39 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
                     batch = Batch.model_validate_json(f.readlines()[curr_epoch].strip())
                 except (IndexError, ValidationError):
                     if self._current_device == self._device:
-                        self._move_to(torch.device("cpu"))
+                        checkpoint_dir = f"{self._output_dir}/{get_step_from_dir(self._output_dir)+1:04d}"
+                        os.makedirs(checkpoint_dir, exist_ok=True)
+                        gather_cpu_state_dict = training.gather_cpu_state_dict
+
+                        def _gather_cpu_state_dict(
+                            model: FSDPModule,
+                            is_rank_zero: bool,
+                            device: torch.device | None = None,
+                            adapter_weights_only: bool = False,
+                        ) -> dict[str, Any]:
+                            state_dict = gather_cpu_state_dict(
+                                model, is_rank_zero, device, adapter_weights_only
+                            )
+                            training.gather_cpu_state_dict = gather_cpu_state_dict
+                            self._move_to(torch.device("cpu"))
+                            if state_dict:
+                                save_file(state_dict, "/dev/shm/state_dict.safetensors")
+                            return state_dict
+
+                        training.gather_cpu_state_dict = _gather_cpu_state_dict
+                        self._checkpoint_client.save_checkpoint(
+                            model=self._model,
+                            optimizer=self._optimizer_or_optim_ckpt_wrapper,
+                            training_progress=TrainingProgress(
+                                seed=self.seed,
+                                epochs_run=self.epochs_run,
+                                total_epochs=self.total_epochs,
+                                max_steps_per_epoch=self.max_steps_per_epoch,
+                                dataloader_state_dict=self._dataloader.state_dict(),
+                            ),
+                            epoch=curr_epoch,
+                        )
+                        # TODO: Move the contents of the checkpoint client's checkpoint dir to our checkpoint dir
                     time.sleep(0.5)
                     continue
             packed_tensors = packed_tensors_from_dir(**batch.disk_packed_tensors)
