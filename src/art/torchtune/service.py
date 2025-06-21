@@ -71,6 +71,8 @@ class TorchtuneService:
                 break
             await asyncio.sleep(0.25)
 
+        train_process = await self.train_process
+        train_queue = await self.train_queue
         with open(f"{self.output_dir}/batches.jsonl", "a") as f:
             f.write(
                 Batch(
@@ -80,9 +82,6 @@ class TorchtuneService:
                 ).model_dump_json()
                 + "\n"
             )
-
-        train_process = await self.train_process
-        train_queue = await self.train_queue
         num_steps = math.ceil(
             disk_packed_tensors["num_sequences"] / torch.cuda.device_count()
         )
