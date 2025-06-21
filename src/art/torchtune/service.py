@@ -4,7 +4,9 @@ from dataclasses import dataclass
 from functools import cached_property
 import math
 import os
+from safetensors.torch import load_file
 import signal
+import time
 import torch
 import torchtune
 from typing import AsyncIterator
@@ -48,6 +50,7 @@ class TorchtuneService:
         pids_path = f"{self.output_dir}/pids.txt"
         with open(pids_path, "w") as f:
             f.write("")
+        os.remove("/dev/shm/state_dict.safetensors")
 
         def sleep() -> None:
             from vllm.device_allocator.cumem import CuMemAllocator
@@ -58,11 +61,19 @@ class TorchtuneService:
             allocator = CuMemAllocator.get_instance()
             setattr(allocator, "_override_tags", {"weights", "kv_cache"})
             worker.sleep()
+            delattr(allocator, "_override_tags")
             with open(pids_path, "a") as f:
                 f.write(f"{os.getpid()}\n")
-            os.kill(os.getpid(), signal.SIGSTOP)
-            worker.wake_up()
-            delattr(allocator, "_override_tags")
+            while True:
+                try:
+                    state_dict = load_file("/dev/shm/state_dict.safetensors")
+                    break
+                except FileNotFoundError:
+                    time.sleep(0.25)
+                    continue
+            worker.wake_up(tags=["weights"])
+            worker.model_runner.model.load_weights(state_dict.items())  # type: ignore
+            allocator.wake_up(tags=["kv_cache"])
 
         sleep_task = asyncio.create_task(run_on_workers(llm, sleep))
         while True:
@@ -98,6 +109,8 @@ class TorchtuneService:
                     _, stderr = await train_process.communicate()
                     raise RuntimeError(stderr.decode("utf-8"))
         await sleep_task
+        os.remove(pids_path)
+        os.remove("/dev/shm/state_dict.safetensors")
 
     @cached_property
     def llm(self) -> asyncio.Task[AsyncLLM]:
