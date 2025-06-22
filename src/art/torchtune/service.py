@@ -5,11 +5,12 @@ from functools import cached_property
 import math
 import os
 from safetensors.torch import load_file
+from safetensors import SafetensorError
 import signal
 import time
 import torch
 import torchtune
-from typing import AsyncIterator
+from typing import AsyncIterator, Iterable
 from vllm import AsyncEngineArgs
 from vllm.v1.engine.async_llm import AsyncLLM
 
@@ -80,18 +81,21 @@ class TorchtuneService:
                 f.write(f"{os.getpid()}\n")
             while True:
                 try:
+                    worker.model_runner.device
                     state_dict = load_file("/dev/shm/state_dict.safetensors")
                     break
-                except FileNotFoundError:
+                except (FileNotFoundError, SafetensorError):
                     time.sleep(0.25)
                     continue
-                except Exception as e:
-                    print(type(e), e)
-                    time.sleep(0.25)
-                    continue
-            worker.wake_up(tags=["weights"])
-            worker.model_runner.model.load_weights(state_dict.items())  # type: ignore
-            allocator.wake_up(tags=["kv_cache"])
+            worker.wake_up()
+
+            def weights() -> Iterable[tuple[str, torch.Tensor]]:
+                for name, param in state_dict.items():
+                    param = param.to(worker.model_runner.device)
+                    yield name, param
+                    del param
+
+            worker.model_runner.model.load_weights(weights())  # type: ignore
 
         sleep_task = asyncio.create_task(run_on_workers(llm, sleep))
         while True:
