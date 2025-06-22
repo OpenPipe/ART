@@ -1400,8 +1400,8 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
                 except (IndexError, ValidationError):
                     if self._current_device == self._device:
                         checkpoint_dir = f"{self._output_dir}/{get_step_from_dir(self._output_dir)+1:04d}"
-                        if self._is_rank_zero:
-                            os.makedirs(checkpoint_dir, exist_ok=True)
+                        # if self._is_rank_zero:
+                        #     os.makedirs(checkpoint_dir, exist_ok=True)
                         gather_cpu_state_dict = training.gather_cpu_state_dict
 
                         def _gather_cpu_state_dict(
@@ -1469,14 +1469,15 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
                             epoch=0,
                         )
                         if self._is_rank_zero:
-                            shutil.copytree(
-                                # f"{self._output_dir}/epoch_{curr_epoch}",
-                                f"{self._output_dir}/epoch_0",
-                                checkpoint_dir,
-                                dirs_exist_ok=True,
-                            )
+                            os.rename(f"{self._output_dir}/epoch_0", checkpoint_dir)
+                            # shutil.copytree(
+                            #     # f"{self._output_dir}/epoch_{curr_epoch}",
+                            #     f"{self._output_dir}/epoch_0",
+                            #     checkpoint_dir,
+                            #     dirs_exist_ok=True,
+                            # )
                             # os.remove(f"{self._output_dir}/epoch_{curr_epoch}")
-                            os.rmdir(f"{self._output_dir}/epoch_0")
+                            # shutil.rmtree(f"{self._output_dir}/epoch_0")
                     time.sleep(0.5)
                     continue
             packed_tensors = packed_tensors_from_dir(**batch.disk_packed_tensors)

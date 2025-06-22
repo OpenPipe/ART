@@ -84,9 +84,17 @@ class TorchtuneService:
                     worker.model_runner.device
                     state_dict = load_file("/dev/shm/state_dict.safetensors")
                     break
-                except (FileNotFoundError, SafetensorError):
+                except FileNotFoundError:
                     time.sleep(0.25)
                     continue
+                except Exception as e:
+                    if (
+                        "Error while deserializing header: MetadataIncompleteBuffer"
+                        in str(e)
+                    ):
+                        time.sleep(0.25)
+                        continue
+                    raise e
             worker.wake_up()
 
             def weights() -> Iterable[tuple[str, torch.Tensor]]:
