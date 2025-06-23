@@ -33,7 +33,7 @@ from torchtune.data import padded_collate_packed
 from torchtune.datasets import ConcatDataset
 from torchtune.modules import TransformerDecoder
 from torchtune.modules.embedding_utils import resize_token_embeddings
-from torchtune.modules.loss import SFTLoss
+from torchtune.modules.loss import SFTLoss, LinearCrossEntropyLoss
 from torchtune.modules.moe import utils as moe_utils
 from torchtune.recipe_interfaces import FTRecipeInterface
 from torchtune.training import (
@@ -1383,7 +1383,6 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
     def _get_micro_batches(self, curr_epoch: int) -> list[PackedTensors]:
         import math
         from safetensors.torch import save_file
-        import shutil
         import time
 
         while True:
@@ -1392,9 +1391,7 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
                     batch = Batch.model_validate_json(f.readlines()[curr_epoch].strip())
                 except (IndexError, ValidationError):
                     if self._current_device == self._device:
-                        checkpoint_dir = f"{self._output_dir}/{get_step_from_dir(self._output_dir)+1:04d}"
-                        # if self._is_rank_zero:
-                        #     os.makedirs(checkpoint_dir, exist_ok=True)
+
                         gather_cpu_state_dict = training.gather_cpu_state_dict
 
                         def _gather_cpu_state_dict(
@@ -1403,11 +1400,11 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
                             device: torch.device | None = None,
                             adapter_weights_only: bool = False,
                         ) -> dict[str, Any]:
+                            self._move_to(torch.device("cpu"))
                             state_dict = gather_cpu_state_dict(
                                 model, is_rank_zero, device, adapter_weights_only
                             )
                             training.gather_cpu_state_dict = gather_cpu_state_dict
-                            self._move_to(torch.device("cpu"))
                             return state_dict
 
                         training.gather_cpu_state_dict = _gather_cpu_state_dict
@@ -1426,6 +1423,8 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
                             step: int | None = None,
                         ) -> None:
 
+                            logger = self._logger
+
                             class DictWrapper(dict):
                                 def __init__(self, original_dict: dict) -> None:
                                     super().__init__(original_dict)
@@ -1437,7 +1436,7 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
                                             value, "/dev/shm/state_dict.safetensors"
                                         )
                                         end_time = time.perf_counter()
-                                        print(
+                                        logger.info(
                                             f"Saving state dict took {end_time - start_time:.2f} seconds"
                                         )
                                     super().__setitem__(key, value)
@@ -1461,13 +1460,15 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
                                 # total_epochs=self.total_epochs,
                                 total_epochs=1,
                                 max_steps_per_epoch=self.max_steps_per_epoch,
-                                dataloader_state_dict=self._dataloader.state_dict(),
                             ),
                             # epoch=curr_epoch,
                             epoch=0,
                         )
                         if self._is_rank_zero:
-                            os.rename(f"{self._output_dir}/epoch_0", checkpoint_dir)
+                            os.rename(
+                                f"{self._output_dir}/epoch_0",
+                                f"{self._output_dir}/{get_step_from_dir(self._output_dir)+1:04d}",
+                            )
                     time.sleep(0.5)
                     continue
             packed_tensors = packed_tensors_from_dir(**batch.disk_packed_tensors)
@@ -1523,12 +1524,14 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
                 print(f"Both methods failed: {e2}")
                 return
 
-        # Move loss function if it's a nn.Module
-        if hasattr(self._loss_fn, "to"):
-            try:
-                self._loss_fn.to(device)
-            except Exception as e:
-                print(f"Failed to move loss function: {e}")
+        # # Move loss function if it's a nn.Module
+        # if hasattr(self._loss_fn, "to"):
+        #     try:
+        #         self._loss_fn.to(device)
+        #     except Exception as e:
+        #         print(f"Failed to move loss function: {e}")
+
+        self._loss_fn = self._loss_fn.linear_projection.to(device)
 
         # Move optimizer states to device
         if hasattr(self, "_optimizer") and self._optimizer is not None:
@@ -1572,164 +1575,11 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
 
         self._current_device = device
 
-        if self._is_rank_zero:
-            move_time = time.perf_counter() - move_start
-            print(f"Completed move to {device} in {move_time:.2f} seconds")
-
-    def _move_to_fast(self, device: torch.device) -> None:
-        """
-        Optimized version of _move_to for fast CPU<->GPU transfers.
-        """
-        if self._current_device == device:
-            return  # Already on target device
-
-        move_start = time.perf_counter()
-
-        # Setup CUDA stream for async transfers (if moving to GPU)
-        stream = None
-        if device.type == "cuda":
-            stream = torch.cuda.Stream(device=device)
-
-        # Cache for pinned memory buffers (only for CPU->GPU transfers)
-        if not hasattr(self, "_pinned_buffers"):
-            self._pinned_buffers = {}
-
-        try:
-            with torch.no_grad():
-                # Batch collect all tensors that need moving
-                tensors_to_move = []
-                tensor_refs = []
-
-                # Collect model parameters
-                for param in self._model.parameters():
-                    if param.device != device:
-                        tensors_to_move.append(param.data)
-                        tensor_refs.append(("param", param))
-
-                # Collect model buffers
-                for name, buffer in self._model.named_buffers():
-                    if buffer.device != device:
-                        tensors_to_move.append(buffer)
-                        tensor_refs.append(("buffer", name))
-
-                # Collect optimizer states
-                if hasattr(self, "_optimizer") and self._optimizer is not None:
-                    for param_group in self._optimizer.param_groups:
-                        for param in param_group["params"]:
-                            if param in self._optimizer.state:
-                                state = self._optimizer.state[param]
-                                for key, value in state.items():
-                                    if (
-                                        isinstance(value, torch.Tensor)
-                                        and value.device != device
-                                    ):
-                                        tensors_to_move.append(value)
-                                        tensor_refs.append(("opt_state", (param, key)))
-
-                # Handle optimizer-in-backward case
-                if hasattr(self, "_optim_ckpt_wrapper") and self._optimizer_in_bwd:
-                    for param, optimizer in self._optim_ckpt_wrapper.optim_map.items():
-                        for param_group in optimizer.param_groups:
-                            for p in param_group["params"]:
-                                if p in optimizer.state:
-                                    state = optimizer.state[p]
-                                    for key, value in state.items():
-                                        if (
-                                            isinstance(value, torch.Tensor)
-                                            and value.device != device
-                                        ):
-                                            tensors_to_move.append(value)
-                                            tensor_refs.append(
-                                                (
-                                                    "opt_in_bwd_state",
-                                                    (param, optimizer, p, key),
-                                                )
-                                            )
-
-                # Move tensors efficiently
-                moved_tensors = []
-
-                if stream is not None:
-                    with torch.cuda.stream(stream):
-                        # For CPU->GPU transfers, use pinned memory if available
-                        if self._current_device.type == "cpu" and device.type == "cuda":
-                            for i, tensor in enumerate(tensors_to_move):
-                                # Try to get or create pinned buffer
-                                key = (tensor.shape, tensor.dtype)
-                                if key not in self._pinned_buffers:
-                                    try:
-                                        self._pinned_buffers[key] = torch.empty(
-                                            tensor.shape,
-                                            dtype=tensor.dtype,
-                                            pin_memory=True,
-                                        )
-                                    except:
-                                        # Fallback to regular transfer if pinned memory allocation fails
-                                        moved_tensors.append(
-                                            tensor.to(device, non_blocking=True)
-                                        )
-                                        continue
-
-                                # Copy to pinned buffer then to GPU
-                                pinned = self._pinned_buffers[key]
-                                pinned.copy_(tensor)
-                                moved_tensors.append(
-                                    pinned.to(device, non_blocking=True)
-                                )
-                        else:
-                            # For GPU->CPU or GPU->GPU transfers
-                            for tensor in tensors_to_move:
-                                moved_tensors.append(
-                                    tensor.to(device, non_blocking=True)
-                                )
-                else:
-                    # No stream available (CPU target)
-                    for tensor in tensors_to_move:
-                        moved_tensors.append(tensor.to(device))
-
-                # Update references with moved tensors
-                for (ref_type, ref), moved_tensor in zip(tensor_refs, moved_tensors):
-                    if ref_type == "param":
-                        ref.data = moved_tensor
-                    elif ref_type == "buffer":
-                        # Find buffer by name and update
-                        for name, buffer in self._model.named_buffers():
-                            if name == ref:
-                                buffer.data = moved_tensor
-                                break
-                    elif ref_type == "opt_state":
-                        param, key = ref
-                        self._optimizer.state[param][key] = moved_tensor
-                    elif ref_type == "opt_in_bwd_state":
-                        param, optimizer, p, key = ref
-                        optimizer.state[p][key] = moved_tensor
-
-                # Move loss function if it's a nn.Module
-                if hasattr(self._loss_fn, "to"):
-                    self._loss_fn.to(device)
-
-                # Synchronize stream if used
-                if stream is not None:
-                    stream.synchronize()
-
-        except Exception as e:
-            self._logger.error(f"Fast move failed, falling back to slow move: {e}")
-            # Fallback to original method
-            self._move_to(device)
-            return
-
-        # Clean up old device memory
-        if self._current_device.type == "cuda":
-            torch.cuda.empty_cache()
-
-        # Update current device
-        self._current_device = device
-
-        if self._is_rank_zero:
-            move_time = time.perf_counter() - move_start
-            self._logger.info(
-                f"Fast move to {device} completed in {move_time:.2f} seconds"
-            )
+        move_time = time.perf_counter() - move_start
+        utils.log_rank_zero(
+            self._logger,
+            f"Completed move to {device} in {move_time:.2f} seconds",
+        )
 
     def cleanup(self) -> None:
         if self._is_rank_zero:
