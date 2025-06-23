@@ -93,7 +93,7 @@ class TorchtuneService:
                         "Error while deserializing header: MetadataIncompleteBuffer"
                         in str(e)
                     ):
-                        time.sleep(0.25)
+                        time.sleep(2)
                         continue
                     raise e
             start_time = time.perf_counter()

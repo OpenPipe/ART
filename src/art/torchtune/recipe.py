@@ -1427,7 +1427,7 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
                         ) -> None:
 
                             class DictWrapper(dict):
-                                def __init__(self, original_dict):
+                                def __init__(self, original_dict: dict) -> None:
                                     super().__init__(original_dict)
 
                                 def __setitem__(self, key: str, value: Any) -> None:
