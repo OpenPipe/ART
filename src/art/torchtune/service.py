@@ -54,29 +54,25 @@ class TorchtuneService:
         if os.path.exists("/dev/shm/state_dict.safetensors"):
             os.remove("/dev/shm/state_dict.safetensors")
 
-        print(
-            "params",
-            (
-                await run_on_workers(
-                    llm,
-                    lambda: [
-                        name
-                        for name, _ in get_worker().model_runner.model.named_parameters()
-                    ],
-                )
-            )[0],
-        )
-
         def sleep() -> None:
             from vllm.device_allocator.cumem import CuMemAllocator
 
             with open(pids_path, "a") as f:
                 f.write(f"{os.getpid()}\n")
+            with open(pids_path, "r") as f:
+                pids = f.read().splitlines()
+                if pids[0] == str(os.getpid()):
+                    is_worker_0 = True
+                else:
+                    is_worker_0 = False
             worker = get_worker()
             allocator = CuMemAllocator.get_instance()
             setattr(allocator, "_override_tags", {"weights", "kv_cache"})
+            start_time = time.perf_counter()
             worker.sleep()
-            delattr(allocator, "_override_tags")
+            end_time = time.perf_counter()
+            if is_worker_0:
+                print(f"Time taken to sleep: {end_time - start_time} seconds")
             with open(pids_path, "a") as f:
                 f.write(f"{os.getpid()}\n")
             while True:
@@ -95,15 +91,23 @@ class TorchtuneService:
                         time.sleep(0.25)
                         continue
                     raise e
+            start_time = time.perf_counter()
             worker.wake_up()
+            end_time = time.perf_counter()
+            if is_worker_0:
+                print(f"Time taken to wake up: {end_time - start_time} seconds")
+            delattr(allocator, "_override_tags")
 
-            def weights() -> Iterable[tuple[str, torch.Tensor]]:
-                for name, param in state_dict.items():
-                    param = param.to(worker.model_runner.device)
-                    yield name, param
-                    del param
-
-            worker.model_runner.model.load_weights(weights())  # type: ignore
+            # def weights() -> Iterable[tuple[str, torch.Tensor]]:
+            #     for name, param in state_dict.items():
+            #         param = param.to(worker.model_runner.device)
+            #         yield name, param
+            #         del param
+            start_time = time.perf_counter()
+            worker.model_runner.model.load_weights(state_dict.items())  # type: ignore
+            end_time = time.perf_counter()
+            if is_worker_0:
+                print(f"Time taken to load weights: {end_time - start_time} seconds")
 
         sleep_task = asyncio.create_task(run_on_workers(llm, sleep))
         while True:
@@ -189,7 +193,6 @@ class TorchtuneService:
             "metric_logger.log_dir=null",
             f"output_dir={self.output_dir}",
         ]
-        print(program_and_args)
         return await asyncio.subprocess.create_subprocess_exec(
             *program_and_args,
             stdout=asyncio.subprocess.PIPE,
