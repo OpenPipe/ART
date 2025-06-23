@@ -1330,6 +1330,9 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
                             )
                         if self._clip_grad_norm is not None:
                             log_dict.update({"grad_norm": grad_norm})
+                        log_dict["num_gradient_steps"] = (
+                            len(micro_batches) // self._gradient_accumulation_steps
+                        )
                         self._metric_logger.log_dict(
                             log_dict,
                             step=self.global_step,
@@ -1404,7 +1407,7 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
                                 model, is_rank_zero, device, adapter_weights_only
                             )
                             training.gather_cpu_state_dict = gather_cpu_state_dict
-                            self._move_to_fast(torch.device("cpu"))
+                            self._move_to(torch.device("cpu"))
                             return state_dict
 
                         training.gather_cpu_state_dict = _gather_cpu_state_dict
@@ -1429,8 +1432,13 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
 
                                 def __setitem__(self, key: str, value: Any) -> None:
                                     if key == training.MODEL_KEY:
+                                        start_time = time.perf_counter()
                                         save_file(
                                             value, "/dev/shm/state_dict.safetensors"
+                                        )
+                                        end_time = time.perf_counter()
+                                        print(
+                                            f"Saveing state dict took {end_time - start_time:.2f} seconds"
                                         )
                                     super().__setitem__(key, value)
 
@@ -1464,7 +1472,7 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
                     continue
             packed_tensors = packed_tensors_from_dir(**batch.disk_packed_tensors)
             if self._current_device != self._device:
-                self._move_to_fast(self._device)
+                self._move_to(self._device)
             n = batch.disk_packed_tensors["num_sequences"]
             return [
                 cast(

@@ -333,16 +333,21 @@ class LocalBackend(Backend):
             packed_tensors, f"{get_model_dir(model=model, art_path=self._path)}/tensors"
         )
         results: list[dict[str, float]] = []
-        num_gradient_steps = disk_packed_tensors["num_sequences"]
-        pbar = tqdm.tqdm(total=num_gradient_steps, desc="train")
+        pbar: tqdm.tqdm | None = None
         async for result in service.train(
             disk_packed_tensors, config, dev_config, verbose
         ):
+            num_gradient_steps = result.pop(
+                "num_gradient_steps", disk_packed_tensors["num_sequences"]
+            )
             results.append(result)
             yield {**result, "num_gradient_steps": num_gradient_steps}
+            if pbar is None:
+                pbar = tqdm.tqdm(total=num_gradient_steps, desc="train")
             pbar.update(1)
             pbar.set_postfix(result)
-        pbar.close()
+        if pbar is not None:
+            pbar.close()
 
         if verbose:
             print("Logging metrics...")
