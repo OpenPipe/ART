@@ -77,8 +77,13 @@ class TorchtuneService:
                 f.write(f"{os.getpid()}\n")
             while True:
                 try:
-                    worker.model_runner.device
+                    start_time = time.perf_counter()
                     state_dict = load_file("/dev/shm/state_dict.safetensors")
+                    end_time = time.perf_counter()
+                    if is_worker_0:
+                        print(
+                            f"Time taken to load state dict: {end_time - start_time} seconds"
+                        )
                     break
                 except FileNotFoundError:
                     time.sleep(0.25)

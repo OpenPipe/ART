@@ -1438,7 +1438,7 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
                                         )
                                         end_time = time.perf_counter()
                                         print(
-                                            f"Saveing state dict took {end_time - start_time:.2f} seconds"
+                                            f"Saving state dict took {end_time - start_time:.2f} seconds"
                                         )
                                     super().__setitem__(key, value)
 
