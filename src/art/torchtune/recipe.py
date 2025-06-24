@@ -1531,7 +1531,7 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
         #     except Exception as e:
         #         print(f"Failed to move loss function: {e}")
 
-        self._loss_fn = self._loss_fn.linear_projection.to(device)
+        # self._loss_fn = self._loss_fn.linear_projection.to(device)
 
         # Move optimizer states to device
         if hasattr(self, "_optimizer") and self._optimizer is not None:

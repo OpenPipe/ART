@@ -58,19 +58,13 @@ class TorchtuneService:
 
             with open(pids_path, "a") as f:
                 f.write(f"{os.getpid()}\n")
-            with open(pids_path, "r") as f:
-                pids = f.read().splitlines()
-                if pids[0] == str(os.getpid()):
-                    is_worker_0 = True
-                else:
-                    is_worker_0 = False
             worker = get_worker()
             allocator = CuMemAllocator.get_instance()
             setattr(allocator, "_override_tags", {"weights", "kv_cache"})
             start_time = time.perf_counter()
             worker.sleep()
             end_time = time.perf_counter()
-            if is_worker_0:
+            if worker.rank == 0:
                 print(f"Time taken to sleep: {end_time - start_time} seconds")
             with open(pids_path, "a") as f:
                 f.write(f"{os.getpid()}\n")
@@ -79,7 +73,7 @@ class TorchtuneService:
                     start_time = time.perf_counter()
                     state_dict = load_file(state_dict_path)
                     end_time = time.perf_counter()
-                    if is_worker_0:
+                    if worker.rank == 0:
                         print(
                             f"Time taken to load state dict: {end_time - start_time} seconds"
                         )
@@ -98,13 +92,13 @@ class TorchtuneService:
             start_time = time.perf_counter()
             worker.wake_up()
             end_time = time.perf_counter()
-            if is_worker_0:
+            if worker.rank == 0:
                 print(f"Time taken to wake up: {end_time - start_time} seconds")
             delattr(allocator, "_override_tags")
             start_time = time.perf_counter()
             worker.model_runner.model.load_weights(state_dict.items())  # type: ignore
             end_time = time.perf_counter()
-            if is_worker_0:
+            if worker.rank == 0:
                 print(f"Time taken to load weights: {end_time - start_time} seconds")
 
         sleep_task = asyncio.create_task(run_on_workers(llm, sleep))
