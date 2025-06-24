@@ -1014,20 +1014,14 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
             return (policy_loss * weights).sum()
 
         loss = torch.tensor(0.0, device=self._device)
-        for chunk_start, chunk_end in zip(
-            range(0, hidden_states.size(0), chunk_size),
-            range(
-                chunk_size,
-                hidden_states.size(0),
-                chunk_size,
-            ),
-        ):
+        for i in range(0, hidden_states.size(0), chunk_size):
+            chunk_end = min(i + chunk_size, hidden_states.size(0))
             loss += calculate_loss(
-                hidden_states[chunk_start:chunk_end, :],
-                next_token_ids[chunk_start:chunk_end],
-                old_logprobs[chunk_start:chunk_end],
-                advantages[chunk_start:chunk_end],
-                weights[chunk_start:chunk_end],
+                hidden_states[i:chunk_end, :],
+                next_token_ids[i:chunk_end],
+                old_logprobs[i:chunk_end],
+                advantages[i:chunk_end],
+                weights[i:chunk_end],
             )
 
         # # post process for third party loss functions
