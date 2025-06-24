@@ -87,10 +87,9 @@ class TorchtuneService:
                     time.sleep(0.25)
                     continue
                 except Exception as e:
-                    if (
-                        "Error while deserializing header: MetadataIncompleteBuffer"
-                        in str(e)
-                    ):
+                    if "MetadataIncompleteBuffer" in str(
+                        e
+                    ) or "InvalidHeaderLength" in str(e):
                         time.sleep(2)
                         continue
                     raise e
