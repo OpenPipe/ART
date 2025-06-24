@@ -378,7 +378,6 @@ class LocalBackend(Backend):
             if step is not None
             else (self.__get_step(model) if isinstance(model, TrainableModel) else 0)
         )
-        print(f"Logging metrics for step {step}")
 
         # Ensure we never log at negative steps
         step = max(0, step)
