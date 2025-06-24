@@ -47,7 +47,7 @@ class TorchtuneService:
     ) -> AsyncIterator[dict[str, float]]:
         llm = await self.llm
         pids_path = f"{self.output_dir}/pids.txt"
-        state_dict_path = f"{self.output_dir}/state_dict.safetensors"
+        state_dict_path = "/dev/shm/state_dict.safetensors"
         with open(pids_path, "w") as f:
             f.write("")
         if os.path.exists(state_dict_path):
@@ -205,8 +205,7 @@ class TorchtuneService:
                 line_str = line_str.strip()
                 if line_str.startswith("Step ") and " | " in line_str:
                     parts = line_str.split(" | ", 1)
-                    step = int(parts[0].split()[1])
-                    metrics: dict[str, float] = {"step": float(step)}
+                    metrics: dict[str, float] = {}
                     if len(parts) > 1:
                         for metric in parts[1].split():
                             if ":" in metric:

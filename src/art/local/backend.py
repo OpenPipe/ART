@@ -343,7 +343,7 @@ class LocalBackend(Backend):
             results.append(result)
             yield {**result, "num_gradient_steps": num_gradient_steps}
             if pbar is None:
-                pbar = tqdm.tqdm(total=num_gradient_steps, desc="train")
+                pbar = tqdm.tqdm(total=int(num_gradient_steps), desc="train")
             pbar.update(1)
             pbar.set_postfix(result)
         if pbar is not None:
