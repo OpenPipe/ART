@@ -2,7 +2,7 @@ import asyncio
 from collections import Counter
 from dataclasses import dataclass
 from functools import cached_property
-import math
+import glob
 import os
 from safetensors.torch import load_file
 import time
@@ -64,8 +64,8 @@ class TorchtuneService:
             start_time = time.perf_counter()
             worker.sleep()
             end_time = time.perf_counter()
-            if worker.rank == 0:
-                print(f"Time taken to sleep: {end_time - start_time} seconds")
+            if verbose and worker.rank == 0:
+                print(f"Time taken to sleep: {end_time - start_time:.2f} seconds")
             with open(pids_path, "a") as f:
                 f.write(f"{os.getpid()}\n")
             while True:
@@ -73,9 +73,9 @@ class TorchtuneService:
                     start_time = time.perf_counter()
                     state_dict = load_file(state_dict_path)
                     end_time = time.perf_counter()
-                    if worker.rank == 0:
+                    if verbose and worker.rank == 0:
                         print(
-                            f"Time taken to load state dict: {end_time - start_time} seconds"
+                            f"Time taken to load state dict: {end_time - start_time:.2f} seconds"
                         )
                     break
                 except FileNotFoundError:
@@ -92,14 +92,16 @@ class TorchtuneService:
             start_time = time.perf_counter()
             worker.wake_up()
             end_time = time.perf_counter()
-            if worker.rank == 0:
-                print(f"Time taken to wake up: {end_time - start_time} seconds")
+            if verbose and worker.rank == 0:
+                print(f"Time taken to wake up: {end_time - start_time:.2f} seconds")
             delattr(allocator, "_override_tags")
             start_time = time.perf_counter()
             worker.model_runner.model.load_weights(state_dict.items())  # type: ignore
             end_time = time.perf_counter()
-            if worker.rank == 0:
-                print(f"Time taken to load weights: {end_time - start_time} seconds")
+            if verbose and worker.rank == 0:
+                print(
+                    f"Time taken to load weights: {end_time - start_time:.2f} seconds"
+                )
 
         sleep_task = asyncio.create_task(run_on_workers(llm, sleep))
         while True:
@@ -163,8 +165,6 @@ class TorchtuneService:
         assert torchtune_config is not None
 
         # Get the list of safetensor files
-        import glob
-
         safetensor_files = glob.glob(f"{checkpoint_dir}/*.safetensors")
         checkpoint_files = [os.path.basename(f) for f in safetensor_files]
         checkpoint_files_str = "[" + ", ".join(f'"{f}"' for f in checkpoint_files) + "]"
