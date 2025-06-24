@@ -47,10 +47,11 @@ class TorchtuneService:
     ) -> AsyncIterator[dict[str, float]]:
         llm = await self.llm
         pids_path = f"{self.output_dir}/pids.txt"
+        state_dict_path = f"{self.output_dir}/state_dict.safetensors"
         with open(pids_path, "w") as f:
             f.write("")
-        if os.path.exists("/dev/shm/state_dict.safetensors"):
-            os.remove("/dev/shm/state_dict.safetensors")
+        if os.path.exists(state_dict_path):
+            os.remove(state_dict_path)
 
         def sleep() -> None:
             from vllm.device_allocator.cumem import CuMemAllocator
@@ -76,7 +77,7 @@ class TorchtuneService:
             while True:
                 try:
                     start_time = time.perf_counter()
-                    state_dict = load_file("/dev/shm/state_dict.safetensors")
+                    state_dict = load_file(state_dict_path)
                     end_time = time.perf_counter()
                     if is_worker_0:
                         print(
@@ -124,10 +125,8 @@ class TorchtuneService:
                 ).model_dump_json()
                 + "\n"
             )
-        num_steps = math.ceil(
-            disk_packed_tensors["num_sequences"] / torch.cuda.device_count()
-        )
-        for _ in range(num_steps):
+        num_gradient_steps = -1
+        while num_gradient_steps != 0:
             done, _ = await asyncio.wait(
                 [train_queue.get(), train_process.wait()],
                 return_when=asyncio.FIRST_COMPLETED,
@@ -135,13 +134,16 @@ class TorchtuneService:
             for task in done:
                 result = task.result()
                 if isinstance(result, dict):
+                    if num_gradient_steps == -1:
+                        num_gradient_steps = result["num_gradient_steps"]
                     yield result
                 else:
                     _, stderr = await train_process.communicate()
                     raise RuntimeError(stderr.decode("utf-8"))
+            num_gradient_steps -= 1
         await sleep_task
         os.remove(pids_path)
-        os.remove("/dev/shm/state_dict.safetensors")
+        os.remove(state_dict_path)
 
     @cached_property
     def llm(self) -> asyncio.Task[AsyncLLM]:
