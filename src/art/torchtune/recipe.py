@@ -52,6 +52,7 @@ from typing import cast, List, Literal
 from .batch import Batch
 from .. import dev, types
 from ..local.pack import PackedTensors, packed_tensors_from_dir
+from ..unsloth.train import shift_tensor
 from ..utils.get_model_step import get_step_from_dir
 
 
@@ -836,7 +837,7 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
 
     def _loss_step(
         self,
-        batch: PackedTensors,
+        inputs: PackedTensors,
         config: types.TrainConfig,
         dev_config: dev.TrainConfig,
     ) -> torch.Tensor:
@@ -891,8 +892,8 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
         # )
 
         block_mask = make_block_mask(
-            group_ids=batch["group_ids"],
-            parent_ids=batch["parent_ids"],
+            group_ids=inputs["group_ids"],
+            parent_ids=inputs["parent_ids"],
         )
 
         import torch
@@ -948,33 +949,104 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
         # assert torch.equal(mask, block_mask.to_dense()), "masks differ"
 
         with self.activations_handling_ctx:
-            outputs = self._model(
-                tokens=batch["tokens"],
+            hidden_states = self._model(
+                tokens=inputs["tokens"],
                 # mask=mask,
                 mask=block_mask,
-                input_pos=batch["input_pos"],
+                input_pos=inputs["input_pos"],
             )
 
         # del mask
         del block_mask
 
-        # post process for third party loss functions
-        if not isinstance(self._loss_fn, SFTLoss):
-            # labels = labels.reshape(-1)
-            outputs = outputs.reshape(-1, outputs.size(-1))
-            if isinstance(outputs, DTensor):
-                outputs = outputs.full_tensor()
+        assistant_mask = shift_tensor(inputs["assistant_mask"], False)
+        if assistant_mask.sum() == 0:
+            # Like in LinearCrossEntropyLoss, mask 1 token to allow loss to sync with all data parallel workers
+            assistant_mask[0] = True
 
-        # Compute loss
-        loss = self._loss_fn(
-            outputs,
-            shift_tensor(
-                torch.where(batch["assistant_mask"], batch["tokens"], -100), -100
+        if isinstance(hidden_states, DTensor):
+            # DTensor doesn't support masks so we have to mask locally
+            mesh = hidden_states.device_mesh
+            placements = hidden_states.placements
+            local_hidden_states = hidden_states.to_local()[assistant_mask]
+            hidden_states = DTensor.from_local(local_hidden_states, mesh, placements)
+        else:
+            hidden_states = hidden_states[assistant_mask]
+
+        next_token_ids = shift_tensor(inputs["tokens"], 0)[assistant_mask]
+        old_logprobs = shift_tensor(inputs["logprobs"], 0.0)[assistant_mask]
+        advantages = shift_tensor(inputs["advantages"], 0.0)[assistant_mask]
+        weights = shift_tensor(inputs["weights"], 0.0)[assistant_mask]
+        chunk_size = dev_config.get("logprob_calculation_chunk_size", 1024)
+
+        def calculate_loss(
+            hidden_states: torch.Tensor,  # [chunk_size, hidden_size]
+            next_token_ids: torch.Tensor,  # [chunk_size]
+            old_logprobs: torch.Tensor,  # [chunk_size]
+            advantages: torch.Tensor,  # [chunk_size]
+            weights: torch.Tensor,  # [chunk_size]
+        ) -> torch.Tensor:
+            # [chunk_size, hidden_size] @ [hidden_size, vocab_size]
+            logits = cast(
+                torch.Tensor, self._model.output(hidden_states)
+            )  # [chunk_size, vocab_size]
+            selected_logits = torch.gather(
+                logits, dim=-1, index=next_token_ids.unsqueeze(-1)
+            ).squeeze(
+                -1
+            )  # [chunk_size]
+            logsumexp = torch.logsumexp(logits, dim=-1)  # [chunk_size]
+            new_logprobs = selected_logits - logsumexp
+            old_logprobs = torch.where(
+                torch.isnan(old_logprobs),
+                new_logprobs.detach(),
+                old_logprobs,
+            )
+            prob_ratio = torch.exp(new_logprobs - old_logprobs)
+            epsilon = dev_config.get("epsilon", 0.2)
+            epsilon_high = dev_config.get("epsilon_high", epsilon)
+            if epsilon_high is None:
+                epsilon_high = epsilon
+            policy_loss = -torch.min(
+                prob_ratio * advantages,
+                torch.clip(prob_ratio, 1 - epsilon, 1 + epsilon_high) * advantages,
+            )
+            return (policy_loss * weights).sum()
+
+        loss = torch.tensor(0.0, device=self._device)
+        for chunk_start, chunk_end in zip(
+            range(0, hidden_states.size(0), chunk_size),
+            range(
+                chunk_size,
+                hidden_states.size(0),
+                chunk_size,
             ),
-        )  # type: ignore
+        ):
+            loss += calculate_loss(
+                hidden_states[chunk_start:chunk_end, :],
+                next_token_ids[chunk_start:chunk_end],
+                old_logprobs[chunk_start:chunk_end],
+                advantages[chunk_start:chunk_end],
+                weights[chunk_start:chunk_end],
+            )
+
+        # # post process for third party loss functions
+        # if not isinstance(self._loss_fn, SFTLoss):
+        #     # labels = labels.reshape(-1)
+        #     hidden_states = hidden_states.reshape(-1, hidden_states.size(-1))
+        #     if isinstance(hidden_states, DTensor):
+        #         hidden_states = hidden_states.full_tensor()
+
+        # # Compute loss
+        # loss = self._loss_fn(
+        #     hidden_states,
+        #     shift_tensor(
+        #         torch.where(inputs["assistant_mask"], inputs["tokens"], -100), -100
+        #     ),
+        # )  # type: ignore
 
         # free logits otherwise it peaks backward memory
-        del outputs
+        del hidden_states
 
         return loss
 
@@ -1026,7 +1098,7 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
                 with self.context_parallel_manager(list(micro_batch.values())):  # type: ignore
                     current_loss = (
                         self._loss_step(micro_batch, batch.config, batch.dev_config)
-                        * current_num_tokens
+                        # * current_num_tokens
                     )
                     running_loss += current_loss
                     # For optimizer in backward, we need to normalize before calling backward
