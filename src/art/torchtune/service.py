@@ -134,6 +134,7 @@ class TorchtuneService:
             for task in done:
                 result = task.result()
                 if isinstance(result, dict):
+                    result["num_gradient_steps"] = int(result["num_gradient_steps"])
                     if num_gradient_steps == -1:
                         num_gradient_steps = result["num_gradient_steps"]
                     yield result
