@@ -5,12 +5,10 @@ from functools import cached_property
 import math
 import os
 from safetensors.torch import load_file
-from safetensors import SafetensorError
-import signal
 import time
 import torch
 import torchtune
-from typing import AsyncIterator, Iterable
+from typing import AsyncIterator
 from vllm import AsyncEngineArgs
 from vllm.v1.engine.async_llm import AsyncLLM
 
@@ -102,12 +100,6 @@ class TorchtuneService:
             if is_worker_0:
                 print(f"Time taken to wake up: {end_time - start_time} seconds")
             delattr(allocator, "_override_tags")
-
-            # def weights() -> Iterable[tuple[str, torch.Tensor]]:
-            #     for name, param in state_dict.items():
-            #         param = param.to(worker.model_runner.device)
-            #         yield name, param
-            #         del param
             start_time = time.perf_counter()
             worker.model_runner.model.load_weights(state_dict.items())  # type: ignore
             end_time = time.perf_counter()

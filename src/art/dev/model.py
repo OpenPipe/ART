@@ -51,12 +51,14 @@ def get_model_config(
         enable_sleep_mode=enable_sleep_mode,
         generation_config="vllm",
     )
-    if config.get("torchtune_args") is not None:
-        engine_args["model"] = base_model
     engine_args.update(config.get("engine_args", {}))
     init_args.update(config.get("init_args", {}))
-    if lora_path := get_last_checkpoint_dir(output_dir):
-        init_args["model_name"] = lora_path
+    if last_checkpoint_dir := get_last_checkpoint_dir(output_dir):
+        init_args["model_name"] = last_checkpoint_dir
+        if config.get("torchtune_args") is not None:
+            engine_args["model"] = last_checkpoint_dir
+    elif config.get("torchtune_args") is not None:
+        engine_args["model"] = base_model
     peft_args = PeftArgs(
         r=8,  # Choose any number > 0 ! Suggested 8, 16, 32, 64, 128
         target_modules=[
