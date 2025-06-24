@@ -54,7 +54,12 @@ class TorchtuneService:
             os.remove(state_dict_path)
 
         def sleep() -> None:
+            import logging
             from vllm.device_allocator.cumem import CuMemAllocator
+            from vllm.v1.worker.gpu_worker import logger
+
+            if not verbose:
+                logger.setLevel(logging.CRITICAL)
 
             with open(pids_path, "a") as f:
                 f.write(f"{os.getpid()}\n")
@@ -102,6 +107,7 @@ class TorchtuneService:
                 print(
                     f"Time taken to load weights: {end_time - start_time:.2f} seconds"
                 )
+            logger.setLevel(logging.INFO)
 
         sleep_task = asyncio.create_task(run_on_workers(llm, sleep))
         while True:

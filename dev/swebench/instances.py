@@ -37,7 +37,9 @@ def get_filtered_swe_smith_instances_df() -> pl.DataFrame:
             .cast(pl.Utf8)
             .is_in(
                 [
+                    "swesmith/encode__starlette.db5063c2",
                     "swesmith/facebookresearch__hydra.0f03eb60",
+                    "swesmith/facelessuser__soupsieve.a8080d97",
                     "swesmith/graphql-python__graphene.82903263",
                     "swesmith/jawah__charset_normalizer.1fdd6463",
                     "swesmith/marshmallow-code__marshmallow.9716fc62",
