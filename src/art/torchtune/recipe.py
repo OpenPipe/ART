@@ -1391,7 +1391,8 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
                     batch = Batch.model_validate_json(f.readlines()[curr_epoch].strip())
                 except (IndexError, ValidationError):
                     if self._current_device == self._device:
-
+                        checkpoint_dir = f"{self._output_dir}/{get_step_from_dir(self._output_dir)+1:04d}"
+                        os.makedirs(checkpoint_dir, exist_ok=True)
                         gather_cpu_state_dict = training.gather_cpu_state_dict
 
                         def _gather_cpu_state_dict(
@@ -1465,10 +1466,8 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
                             epoch=0,
                         )
                         if self._is_rank_zero:
-                            os.rename(
-                                f"{self._output_dir}/epoch_0",
-                                f"{self._output_dir}/{get_step_from_dir(self._output_dir)+1:04d}",
-                            )
+                            os.rmdir(checkpoint_dir)
+                            os.rename(f"{self._output_dir}/epoch_0", checkpoint_dir)
                     time.sleep(0.5)
                     continue
             packed_tensors = packed_tensors_from_dir(**batch.disk_packed_tensors)
