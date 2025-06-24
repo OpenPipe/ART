@@ -35,6 +35,7 @@ def get_filtered_swe_smith_instances_df() -> pl.DataFrame:
         .filter(
             ~pl.col("repo")
             .cast(pl.Utf8)
+            .str.to_lowercase()
             .is_in(
                 [
                     f"swesmith/{repo}"
@@ -45,6 +46,7 @@ def get_filtered_swe_smith_instances_df() -> pl.DataFrame:
                         "graphql-python__graphene.82903263",
                         "jawah__charset_normalizer.1fdd6463",
                         "jd__tenacity.0d40e76f",
+                        "knio__dominate.9082227e",
                         "marshmallow-code__marshmallow.9716fc62",
                         "mido__mido.a0158ff9",
                         "pydantic__pydantic.acb0f10f",
@@ -55,7 +57,6 @@ def get_filtered_swe_smith_instances_df() -> pl.DataFrame:
                 ]
             )
         )
-        .filter(~pl.col("instance_id").is_in(["jd__tenacity.0d40e76f.pr_384"]))
         .with_columns(
             base_commit=pl.col("instance_id"),
             image_name="jyangballin/"

@@ -50,6 +50,7 @@ from typing import cast, List, Literal
 
 
 from .batch import Batch
+from .. import dev, types
 from ..local.pack import PackedTensors, packed_tensors_from_dir
 from ..utils.get_model_step import get_step_from_dir
 
@@ -833,7 +834,12 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
             assert self._optimizer is not None
             return self._optimizer
 
-    def _loss_step(self, batch: PackedTensors) -> torch.Tensor:
+    def _loss_step(
+        self,
+        batch: PackedTensors,
+        config: types.TrainConfig,
+        dev_config: dev.TrainConfig,
+    ) -> torch.Tensor:
         from ..unsloth.train import calculate_mask, shift_tensor
 
         # Shape [b, s], needed for the loss not the model
@@ -995,9 +1001,9 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
         self._profiler.start()
         # self.epochs_run should be non-zero when we're resuming from a checkpoint
         for curr_epoch in range(self.epochs_run, self.total_epochs):
-            micro_batches = self._get_micro_batches(curr_epoch)
+            micro_batches, batch = self._get_micro_batches(curr_epoch)
             pbar = tqdm(total=len(micro_batches), disable=not self._is_rank_zero)
-            for idx, batch in enumerate(micro_batches):
+            for idx, micro_batch in enumerate(micro_batches):
                 # Start tracking CUDA memory for active steps for just the first epoch
                 if (
                     self._is_rank_zero
@@ -1008,17 +1014,20 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
                 ):
                     torch.cuda.memory._record_memory_history()
 
-                utils.batch_to_device(batch, self._device)  # type: ignore
+                utils.batch_to_device(micro_batch, self._device)  # type: ignore
 
                 # Calculate the number of unmasked tokens in the current batch
                 # and increment the total number of tokens seen in the step
-                current_num_tokens = batch["assistant_mask"].sum()
+                current_num_tokens = micro_batch["assistant_mask"].sum()
                 num_tokens += current_num_tokens
 
                 # Loss is normalized by default so we multiply by the number of tokens
                 # This way we can normalize by the total number of tokens if we're accumulating gradients
-                with self.context_parallel_manager(list(batch.values())):  # type: ignore
-                    current_loss = self._loss_step(batch) * current_num_tokens
+                with self.context_parallel_manager(list(micro_batch.values())):  # type: ignore
+                    current_loss = (
+                        self._loss_step(micro_batch, batch.config, batch.dev_config)
+                        * current_num_tokens
+                    )
                     running_loss += current_loss
                     # For optimizer in backward, we need to normalize before calling backward
                     # This case and gradient accumulation are mutually exclusive
@@ -1142,7 +1151,7 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
 
         self._profiler.stop()
 
-    def _get_micro_batches(self, curr_epoch: int) -> list[PackedTensors]:
+    def _get_micro_batches(self, curr_epoch: int) -> tuple[list[PackedTensors], Batch]:
         import math
         from safetensors.torch import save_file
         import time
@@ -1249,7 +1258,7 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
                     math.ceil(n / self.dp_degree) * self.dp_degree,
                     self.dp_degree,
                 )
-            ]
+            ], batch
 
     def _move_to(self, device: torch.device) -> None:
         """
