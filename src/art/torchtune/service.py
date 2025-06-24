@@ -184,8 +184,6 @@ class TorchtuneService:
             "art.torchtune.recipe.FullFinetuneRecipeDistributed",
             "--config",
             f"{os.path.dirname(__file__)}/config.yaml",
-            f"tokenizer.path={checkpoint_dir}/vocab.json",
-            f"tokenizer.merges_file={checkpoint_dir}/merges.txt",
             f"checkpointer.checkpoint_dir={checkpoint_dir}",
             f"checkpointer.checkpoint_files={checkpoint_files_str}",
             f"model._component_={torchtune_config['model']}",

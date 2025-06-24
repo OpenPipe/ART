@@ -17,7 +17,7 @@ from sweagent.types import AgentRunResult
 from swebench.harness.modal_eval.run_evaluation_modal import app, run_instance_modal
 from swebench.harness.test_spec.test_spec import make_test_spec
 from swerex.deployment.modal import ModalDeployment
-from swerex.exceptions import CommandTimeoutError
+from swerex.exceptions import CommandTimeoutError, SwerexException
 from typing import Any, Literal, overload
 from urllib3.exceptions import ProtocolError
 
@@ -121,6 +121,7 @@ async def rollout(
         SSLError,
         RuntimeError,
         TimeoutError,
+        SwerexException,
     ) as error:
         print(error)
     finally:

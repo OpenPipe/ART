@@ -37,20 +37,25 @@ def get_filtered_swe_smith_instances_df() -> pl.DataFrame:
             .cast(pl.Utf8)
             .is_in(
                 [
-                    "swesmith/encode__starlette.db5063c2",
-                    "swesmith/facebookresearch__hydra.0f03eb60",
-                    "swesmith/facelessuser__soupsieve.a8080d97",
-                    "swesmith/graphql-python__graphene.82903263",
-                    "swesmith/jawah__charset_normalizer.1fdd6463",
-                    "swesmith/marshmallow-code__marshmallow.9716fc62",
-                    "swesmith/mido__mido.a0158ff9",
-                    "swesmith/pydantic__pydantic.acb0f10f",
-                    "swesmith/pylint-dev__astroid.b114f6b5",
-                    "swesmith/tox-dev__pipdeptree.c31b6418",
-                    "swesmith/un33k__python-slugify.872b3750",
+                    f"swesmith/{repo}"
+                    for repo in [
+                        "encode__starlette.db5063c2",
+                        "facebookresearch__hydra.0f03eb60",
+                        "facelessuser__soupsieve.a8080d97",
+                        "graphql-python__graphene.82903263",
+                        "jawah__charset_normalizer.1fdd6463",
+                        "jd__tenacity.0d40e76f",
+                        "marshmallow-code__marshmallow.9716fc62",
+                        "mido__mido.a0158ff9",
+                        "pydantic__pydantic.acb0f10f",
+                        "pylint-dev__astroid.b114f6b5",
+                        "tox-dev__pipdeptree.c31b6418",
+                        "un33k__python-slugify.872b3750",
+                    ]
                 ]
             )
         )
+        .filter(~pl.col("instance_id").is_in(["jd__tenacity.0d40e76f.pr_384"]))
         .with_columns(
             base_commit=pl.col("instance_id"),
             image_name="jyangballin/"
