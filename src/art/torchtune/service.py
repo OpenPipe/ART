@@ -189,6 +189,8 @@ class TorchtuneService:
             "metric_logger._component_=torchtune.training.metric_logging.StdoutLogger",
             "metric_logger.log_dir=null",
             f"output_dir={self.output_dir}",
+            f"tensor_parallel_dim={torchtune_config.get('tensor_parallel_dim', 1)}",
+            f"context_parallel_dim={torchtune_config.get('context_parallel_dim', 1)}",
         ]
         return await asyncio.subprocess.create_subprocess_exec(
             *program_and_args,

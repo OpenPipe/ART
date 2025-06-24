@@ -18,6 +18,7 @@ import numpy as np
 import os
 import polars as pl
 import subprocess
+import torch
 from transformers.models.auto.tokenization_auto import AutoTokenizer
 from transformers.tokenization_utils_base import PreTrainedTokenizerBase
 from tqdm import auto as tqdm
@@ -334,17 +335,27 @@ class LocalBackend(Backend):
             packed_tensors, f"{get_model_dir(model=model, art_path=self._path)}/tensors"
         )
         results: list[dict[str, float]] = []
-        pbar = tqdm.tqdm(desc="train")
+        estimated_gradient_steps = disk_packed_tensors["num_sequences"]
+        if torchtune_args := (model._internal_config or dev.InternalModelConfig()).get(
+            "torchtune_args"
+        ):
+            tp = torchtune_args.get("tensor_parallel_dim", 1)
+            cp = torchtune_args.get("context_parallel_dim", 1)
+            world_size = torch.cuda.device_count()
+            dp = world_size // (tp * cp)
+            estimated_gradient_steps = math.ceil(estimated_gradient_steps / dp)
+        pbar = tqdm.tqdm(total=estimated_gradient_steps, desc="train")
         async for result in service.train(
             disk_packed_tensors, config, dev_config, verbose
         ):
             num_gradient_steps = int(
-                result.pop("num_gradient_steps", disk_packed_tensors["num_sequences"])
+                result.pop("num_gradient_steps", estimated_gradient_steps)
             )
+            assert (
+                num_gradient_steps == estimated_gradient_steps
+            ), f"num_gradient_steps {num_gradient_steps} != estimated_gradient_steps {estimated_gradient_steps}"
             results.append(result)
             yield {**result, "num_gradient_steps": num_gradient_steps}
-            if pbar.total is None:
-                pbar.total = num_gradient_steps
             pbar.update(1)
             pbar.set_postfix(result)
         pbar.close()
