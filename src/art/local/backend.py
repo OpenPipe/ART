@@ -306,6 +306,7 @@ class LocalBackend(Backend):
         dev_config: dev.TrainConfig,
         verbose: bool = False,
     ) -> AsyncIterator[dict[str, float]]:
+        step = await self._get_step(model)
         if verbose:
             print("Starting _train_model")
         service = await self._get_service(model)
@@ -355,7 +356,7 @@ class LocalBackend(Backend):
             k: sum(d.get(k, 0) for d in results) / sum(1 for d in results if k in d)
             for k in {k for d in results for k in d}
         }
-        self._log_metrics(model, data, "train", step_offset=-1)
+        self._log_metrics(model, data, "train", step=step)
         if verbose:
             print("_train_model complete")
 
@@ -364,7 +365,7 @@ class LocalBackend(Backend):
         model: Model,
         metrics: dict[str, float],
         split: str,
-        step_offset: int = 0,
+        step: int | None = None,
     ) -> None:
         # Add namespacing if needed
         metrics = (
@@ -373,8 +374,11 @@ class LocalBackend(Backend):
             else metrics
         )
         step = (
-            self.__get_step(model) if isinstance(model, TrainableModel) else 0
-        ) + step_offset
+            step
+            if step is not None
+            else (self.__get_step(model) if isinstance(model, TrainableModel) else 0)
+        )
+        print(f"Logging metrics for step {step}")
 
         # Ensure we never log at negative steps
         step = max(0, step)
