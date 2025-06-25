@@ -131,6 +131,14 @@ class TorchtuneService:
         os.remove(pids_path)
         os.remove(state_dict_path)
 
+    @property
+    def torchtune_args(self) -> dev.TorchtuneArgs:
+        torchtune_args = self.config.get("torchtune_args")
+        assert (
+            torchtune_args is not None
+        ), 'TorchtuneService created without config["torchtune_args"]'
+        return torchtune_args
+
     @cached_property
     def llm(self) -> asyncio.Task[AsyncLLM]:
         return asyncio.create_task(
@@ -149,9 +157,7 @@ class TorchtuneService:
         if os.path.exists(f"{self.output_dir}/batches.jsonl"):
             os.remove(f"{self.output_dir}/batches.jsonl")
         checkpoint_dir = await self.get_checkpoint_dir()
-        assert "torchtune_args" in self.config
-        torchtune_config = self.config["torchtune_args"]
-        assert torchtune_config is not None
+        torchtune_args = self.torchtune_args
 
         # Get the list of safetensor files
         safetensor_files = glob.glob(f"{checkpoint_dir}/*.safetensors")
@@ -169,13 +175,13 @@ class TorchtuneService:
             f"{os.path.dirname(__file__)}/config.yaml",
             f"checkpointer.checkpoint_dir={checkpoint_dir}",
             f"checkpointer.checkpoint_files={checkpoint_files_str}",
-            f"checkpointer.model_type={torchtune_config['model_type']}",
-            f"model._component_=torchtune.models.{torchtune_config['model'].split('_')[0]}.{torchtune_config['model']}",
+            f"checkpointer.model_type={torchtune_args['model_type']}",
+            f"model._component_=torchtune.models.{torchtune_args['model'].split('_')[0]}.{torchtune_args['model']}",
             "metric_logger._component_=torchtune.training.metric_logging.StdoutLogger",
             "metric_logger.log_dir=null",
             f"output_dir={self.output_dir}",
-            f"tensor_parallel_dim={torchtune_config.get('tensor_parallel_dim', 1)}",
-            f"context_parallel_dim={torchtune_config.get('context_parallel_dim', 1)}",
+            f"tensor_parallel_dim={torchtune_args.get('tensor_parallel_dim', 1)}",
+            f"context_parallel_dim={torchtune_args.get('context_parallel_dim', 1)}",
         ]
         return await asyncio.subprocess.create_subprocess_exec(
             *program_and_args,
@@ -216,7 +222,7 @@ class TorchtuneService:
         # Use the last of any existing checkpoints to resume training
         if last_checkpoint_dir := self.get_last_checkpoint_dir():
             return last_checkpoint_dir
-        # Assume the self.base_model is a checkpoint directory if it exists
+        # Check if self.base_model is a directory
         if os.path.isdir(self.base_model):
             return self.base_model
         # Otherwise, assume it's a HuggingFace model id and download it
