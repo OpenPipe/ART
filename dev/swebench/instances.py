@@ -51,6 +51,7 @@ def get_filtered_swe_smith_instances_df() -> pl.DataFrame:
                         "mido__mido.a0158ff9",
                         "pydantic__pydantic.acb0f10f",
                         "pylint-dev__astroid.b114f6b5",
+                        "tornadoweb__tornado.d5ac65c1",
                         "tox-dev__pipdeptree.c31b6418",
                         "un33k__python-slugify.872b3750",
                     ]
