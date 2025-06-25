@@ -1077,6 +1077,7 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
                                 model, is_rank_zero, device, adapter_weights_only
                             )
                             self._move_to(torch.device("cpu"))
+                            time.sleep(2)
                             # signal that the GPUs are free
                             Path(f"{self._output_dir}/pids.txt").unlink(missing_ok=True)
                             training.gather_cpu_state_dict = gather_cpu_state_dict
