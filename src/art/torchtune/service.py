@@ -235,7 +235,9 @@ class TorchtuneService:
         return dir if os.path.isdir(dir) else None
 
 
-def sleep(*, level: int, pids_path: str, weights_path: str | None, profile: bool) -> None:
+def sleep(
+    *, level: int, pids_path: str, weights_path: str | None, profile: bool
+) -> None:
     """
     Put the worker to sleep until the new model weights are loaded.
 
@@ -271,14 +273,12 @@ def sleep(*, level: int, pids_path: str, weights_path: str | None, profile: bool
                 except FileNotFoundError:
                     time.sleep(1)
                     continue
+            elif os.path.exists(pids_path):
+                time.sleep(1)
+                continue
             else:
-                # wait for the pids file to be removed
-                try:
-                    if os.path.exists(pids_path):
-                        time.sleep(1)
-                        continue
-                except FileNotFoundError:
-                    break
+                # no pids file indicates we can wake up
+                break
         with worker.time("wake_up"):
             worker.wake_up()
         if weights is None:
@@ -289,9 +289,10 @@ def sleep(*, level: int, pids_path: str, weights_path: str | None, profile: bool
         logger.setLevel(logging.INFO)
         delattr(allocator, "_override_tags")
 
+
 def update_weights(weights_path: str, profile: bool) -> None:
     from vllm.v1.worker.gpu_worker import logger
-    
+
     worker = get_worker()
     try:
         if not (profile and worker.rank == 0):
@@ -299,6 +300,6 @@ def update_weights(weights_path: str, profile: bool) -> None:
         with worker.time("load_file"):
             weights = load_file(weights_path)
         with worker.time("load_weights"):
-            worker.model_runner.model.load_weights(weights.items()) # type: ignore
+            worker.model_runner.model.load_weights(weights.items())  # type: ignore
     finally:
         logger.setLevel(logging.INFO)
