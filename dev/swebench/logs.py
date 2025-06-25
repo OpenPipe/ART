@@ -34,6 +34,9 @@ litellm_logger.addFilter(LangfuseErrorFilter())
 # Suppress urllib3 retry warnings
 logging.getLogger("urllib3.connectionpool").setLevel(logging.ERROR)
 
+# Suppress OpenAI base client retry INFO messages
+logging.getLogger("openai._base_client").setLevel(logging.WARNING)
+
 # Hook into Logger creation to suppress new loggers matching our patterns
 # Only patch if not already patched
 if not hasattr(logging.getLogger, "_is_patched"):
