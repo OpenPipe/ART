@@ -31,6 +31,7 @@ dependencies = [
 
 [project.optional-dependencies]
 swebench = [
+    "aiolimiter>=1.2.1",
     "langfuse>=2.60.7",
     "modal>=1.0.1",
     "sweagent",

@@ -1,3 +1,4 @@
+from aiolimiter import AsyncLimiter
 import art
 import asyncio
 from http.client import RemoteDisconnected
@@ -26,6 +27,8 @@ from eval import eval_instance
 from logs import setup_agent_logger
 from instances import Instance
 from run import run
+
+limiter = AsyncLimiter(max_rate=5, time_period=1)
 
 
 class ModelConfig(BaseModel):
@@ -108,7 +111,8 @@ async def rollout(
             RewardRunHook(instance, trajectory, run_single, reward_power)
         )
     try:
-        await run(run_single.run, run_in_thread)
+        async with limiter:
+            await run(run_single.run, run_in_thread)
     except modal.exception.RemoteError as error:
         print(instance["instance_id"])
         print(error)
