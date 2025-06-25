@@ -42,8 +42,8 @@ def patch_allocator() -> None:
                 continue
             handle = data.handle
             size_in_bytes = handle[1]
-            if offload_to != "none":
-                if offload_to == "disk":
+            if offload_to != "none" or data.tag == "weights":
+                if offload_to == "disk" and data.tag != "weights":
                     cpu_backup_tensor = torch.from_file(
                         f"/tmp/kv-cache-{ptr}.pt",
                         size=size_in_bytes,

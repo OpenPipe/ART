@@ -58,54 +58,37 @@ class TorchtuneService:
             from vllm.device_allocator.cumem import CuMemAllocator
             from vllm.v1.worker.gpu_worker import logger
 
-            if not verbose:
-                logger.setLevel(logging.CRITICAL)
-
             with open(pids_path, "a") as f:
                 f.write(f"{os.getpid()}\n")
             worker = get_worker()
+            if not verbose or worker.rank != 0:
+                logger.setLevel(logging.CRITICAL)
             allocator = CuMemAllocator.get_instance()
             setattr(allocator, "_override_tags", {"weights", "kv_cache"})
-            start_time = time.perf_counter()
-            worker.sleep()
-            end_time = time.perf_counter()
-            if verbose and worker.rank == 0:
-                print(f"Time taken to sleep: {end_time - start_time:.2f} seconds")
+            with worker.time("sleep"):
+                worker.sleep()
             with open(pids_path, "a") as f:
                 f.write(f"{os.getpid()}\n")
             while True:
                 try:
-                    start_time = time.perf_counter()
-                    state_dict = load_file(state_dict_path)
-                    end_time = time.perf_counter()
-                    if verbose and worker.rank == 0:
-                        print(
-                            f"Time taken to load state dict: {end_time - start_time:.2f} seconds"
-                        )
+                    with worker.time("load_state_dict"):
+                        state_dict = load_file(state_dict_path)
                     break
                 except FileNotFoundError:
-                    time.sleep(0.25)
+                    time.sleep(1)
                     continue
                 except Exception as e:
                     if "MetadataIncompleteBuffer" in str(
                         e
                     ) or "InvalidHeaderLength" in str(e):
-                        time.sleep(2)
+                        time.sleep(1)
                         continue
                     raise e
-            start_time = time.perf_counter()
-            worker.wake_up()
-            end_time = time.perf_counter()
-            if verbose and worker.rank == 0:
-                print(f"Time taken to wake up: {end_time - start_time:.2f} seconds")
+            with worker.time("wake_up"):
+                worker.wake_up()
             delattr(allocator, "_override_tags")
-            start_time = time.perf_counter()
-            worker.model_runner.model.load_weights(state_dict.items())  # type: ignore
-            end_time = time.perf_counter()
-            if verbose and worker.rank == 0:
-                print(
-                    f"Time taken to load weights: {end_time - start_time:.2f} seconds"
-                )
+            with worker.time("load_weights"):
+                worker.model_runner.model.load_weights(state_dict.items())  # type: ignore
             logger.setLevel(logging.INFO)
 
         sleep_task = asyncio.create_task(run_on_workers(llm, sleep))

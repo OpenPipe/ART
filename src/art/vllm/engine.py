@@ -2,9 +2,11 @@
 
 import asyncio
 import cloudpickle
+import contextlib
 import contextvars
 from dataclasses import replace
-from typing import Any, Callable, cast, Coroutine, ParamSpec, TypeVar
+import time
+from typing import Any, Callable, cast, Coroutine, Generator, ParamSpec, TypeVar
 import vllm
 from vllm.engine.async_llm_engine import AsyncLLMEngine
 from vllm.v1.engine.async_llm import AsyncLLM
@@ -108,10 +110,10 @@ async def run_on_workers(
 
 
 # Context variable to hold the current worker
-_worker: contextvars.ContextVar[Worker] = contextvars.ContextVar("worker")
+_worker: contextvars.ContextVar["ExtendedWorker"] = contextvars.ContextVar("worker")
 
 
-def get_worker() -> Worker:
+def get_worker() -> "ExtendedWorker":
     """Get the current worker instance"""
     return _worker.get()
 
@@ -121,8 +123,21 @@ class WorkerExtension:
 
     def run(self, pickled_func: bytes, *args: Any, **kwargs: Any) -> Any:
         func = cloudpickle.loads(pickled_func)
-        token = _worker.set(cast(Worker, self))
+        token = _worker.set(cast(ExtendedWorker, self))
         try:
             return func(*args, **kwargs)
         finally:
             _worker.reset(token)
+
+    @contextlib.contextmanager
+    def time(self, name: str) -> Generator[None, None, None]:
+        from vllm.v1.worker.gpu_worker import logger
+
+        start_time = time.perf_counter()
+        yield
+        end_time = time.perf_counter()
+        logger.info(f"{name}: {end_time - start_time:.2f} seconds")
+
+
+class ExtendedWorker(Worker, WorkerExtension):
+    pass
