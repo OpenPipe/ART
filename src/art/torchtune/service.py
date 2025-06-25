@@ -109,20 +109,26 @@ class TorchtuneService:
         await sleep_task
         # update the weights after wake up if async_weight_syncing is enabled
         if async_weight_syncing:
-            # wait for the weights file to be created
-            while True:
-                try:
-                    if os.path.exists(weights_path):
-                        break
-                except FileNotFoundError:
-                    time.sleep(1)
-                    continue
-            await run_on_workers(
-                llm,
-                update_weights,
-                weights_path=weights_path,
-                profile=verbose,
-            )
+            asyncio.create_task(self.update_worker_weights(llm, weights_path, verbose))
+        else:
+            # remove the weights file
+            Path(weights_path).unlink(missing_ok=True)
+
+    async def update_worker_weights(
+        self, llm: AsyncLLM, weights_path: str, profile: bool
+    ) -> None:
+        while True:
+            if os.path.exists(weights_path):
+                break
+            else:
+                time.sleep(1)
+                continue
+        await run_on_workers(
+            llm,
+            update_weights,
+            weights_path=weights_path,
+            profile=profile,
+        )
         # remove the weights file
         Path(weights_path).unlink(missing_ok=True)
 
