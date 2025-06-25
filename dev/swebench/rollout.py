@@ -1,6 +1,7 @@
 from aiolimiter import AsyncLimiter
 import art
 import asyncio
+from grpclib.exceptions import StreamTerminatedError
 from http.client import RemoteDisconnected
 import json
 from langfuse.decorators import observe
@@ -66,7 +67,7 @@ async def rollout(
 @observe(capture_input=False, capture_output=False)
 @art.retry(
     max_attempts=2,
-    exceptions=(modal.exception.SandboxTimeoutError,),
+    exceptions=(modal.exception.SandboxTimeoutError, StreamTerminatedError),
 )
 async def rollout(
     model: art.Model[ModelConfig],
