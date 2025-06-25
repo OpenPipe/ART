@@ -140,8 +140,9 @@ class TorchtuneService:
                         num_gradient_steps = result["num_gradient_steps"]
                     yield result
                 else:
-                    _, stderr = await train_process.communicate()
-                    raise RuntimeError(stderr.decode("utf-8"))
+                    raise RuntimeError(
+                        f"Train process exited early. See {self.output_dir}/logs/train.log for details."
+                    )
             num_gradient_steps -= 1
         await sleep_task
         os.remove(pids_path)
@@ -185,7 +186,8 @@ class TorchtuneService:
             f"{os.path.dirname(__file__)}/config.yaml",
             f"checkpointer.checkpoint_dir={checkpoint_dir}",
             f"checkpointer.checkpoint_files={checkpoint_files_str}",
-            f"model._component_={torchtune_config['model']}",
+            f"checkpointer.model_type={torchtune_config['model_type']}",
+            f"model._component_=torchtune.models.{torchtune_config['model'].split('_')[0]}.{torchtune_config['model']}",
             "metric_logger._component_=torchtune.training.metric_logging.StdoutLogger",
             "metric_logger.log_dir=null",
             f"output_dir={self.output_dir}",
