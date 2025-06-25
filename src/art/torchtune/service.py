@@ -46,6 +46,7 @@ class TorchtuneService:
         verbose: bool = False,
     ) -> AsyncIterator[dict[str, float]]:
         llm = await self.llm
+        sleep_level = 1 if llm.output_processor.has_unfinished_requests() else 2
         pids_path = f"{self.output_dir}/pids.txt"
         state_dict_path = "/dev/shm/state_dict.safetensors"
         with open(pids_path, "w") as f:
@@ -61,12 +62,12 @@ class TorchtuneService:
             with open(pids_path, "a") as f:
                 f.write(f"{os.getpid()}\n")
             worker = get_worker()
-            if not verbose or worker.rank != 0:
+            if not (verbose and worker.rank == 0):
                 logger.setLevel(logging.CRITICAL)
             allocator = CuMemAllocator.get_instance()
             setattr(allocator, "_override_tags", {"weights", "kv_cache"})
             with worker.time("sleep"):
-                worker.sleep()
+                worker.sleep(sleep_level)
             with open(pids_path, "a") as f:
                 f.write(f"{os.getpid()}\n")
             while True:
@@ -173,15 +174,15 @@ class TorchtuneService:
             "art.torchtune.recipe.FullFinetuneRecipeDistributed",
             "--config",
             f"{os.path.dirname(__file__)}/config.yaml",
+            f"model._component_=torchtune.models.{torchtune_args['model'].split('_')[0]}.{torchtune_args['model']}",
             f"checkpointer.checkpoint_dir={checkpoint_dir}",
             f"checkpointer.checkpoint_files={checkpoint_files_str}",
             f"checkpointer.model_type={torchtune_args['model_type']}",
-            f"model._component_=torchtune.models.{torchtune_args['model'].split('_')[0]}.{torchtune_args['model']}",
-            "metric_logger._component_=torchtune.training.metric_logging.StdoutLogger",
-            "metric_logger.log_dir=null",
-            f"output_dir={self.output_dir}",
             f"tensor_parallel_dim={torchtune_args.get('tensor_parallel_dim', 1)}",
             f"context_parallel_dim={torchtune_args.get('context_parallel_dim', 1)}",
+            f"output_dir={self.output_dir}",
+            "metric_logger._component_=torchtune.training.metric_logging.StdoutLogger",
+            "metric_logger.log_dir=null",
         ]
         return await asyncio.subprocess.create_subprocess_exec(
             *program_and_args,
