@@ -1055,6 +1055,7 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
 
     def _get_micro_batches(self, curr_epoch: int) -> tuple[list[PackedTensors], Batch]:
         import math
+        from pathlib import Path
         from safetensors.torch import save_file
         import time
 
@@ -1073,6 +1074,8 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
                             adapter_weights_only: bool = False,
                         ) -> dict[str, Any]:
                             self._move_to(torch.device("cpu"))
+                            # signal that the GPUs are free
+                            Path(f"{self._output_dir}/pids.txt").unlink(missing_ok=True)
                             state_dict = gather_cpu_state_dict(
                                 model, is_rank_zero, device, adapter_weights_only
                             )
@@ -1105,7 +1108,11 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
                                     if key == training.MODEL_KEY:
                                         start_time = time.perf_counter()
                                         save_file(
-                                            value, "/dev/shm/state_dict.safetensors"
+                                            value, "/dev/shm/weights.safetensors.tmp"
+                                        )
+                                        os.rename(
+                                            "/dev/shm/weights.safetensors.tmp",
+                                            "/dev/shm/weights.safetensors",
                                         )
                                         end_time = time.perf_counter()
                                         logger.info(

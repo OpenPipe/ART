@@ -49,27 +49,34 @@ class TorchtuneService:
     ) -> AsyncIterator[dict[str, float]]:
         llm = await self.llm
         pids_path = f"{self.output_dir}/pids.txt"
+        # reset the pids file
         with open(pids_path, "w") as f:
             f.write("")
-        state_dict_path = "/dev/shm/state_dict.safetensors"
-        Path(state_dict_path).unlink(missing_ok=True)
+        weights_path = "/dev/shm/weights.safetensors"
+        # remove the weights file if it exists
+        Path(weights_path).unlink(missing_ok=True)
+        async_weight_syncing = self.torchtune_args.get("async_weight_syncing", False)
+        # start putting the workers to sleep
         sleep_task = asyncio.create_task(
             run_on_workers(
                 llm,
                 sleep,
                 level=1 if llm.output_processor.has_unfinished_requests() else 2,
                 pids_path=pids_path,
-                state_dict_path=state_dict_path,
+                weights_path=None if async_weight_syncing else weights_path,
                 profile=verbose,
             )
         )
+        # wait for the workers to write their pids twice, indicating that they are asleep
         while True:
             pids = Counter(open(pids_path).read().splitlines())
             if set(pids.values()) == {2}:
                 break
             await asyncio.sleep(0.25)
+        # acquire the train process and queue
         train_process = await self.train_process
         train_queue = await self.train_queue
+        # write the batch to communicate with the train process
         with open(f"{self.output_dir}/batches.jsonl", "a") as f:
             f.write(
                 Batch(
@@ -79,6 +86,7 @@ class TorchtuneService:
                 ).model_dump_json()
                 + "\n"
             )
+        # consume the batch gradient step results
         num_gradient_steps = -1
         while num_gradient_steps != 0:
             done, _ = await asyncio.wait(
@@ -97,9 +105,26 @@ class TorchtuneService:
                         f"Train process exited early. See {self.output_dir}/logs/train.log for details."
                     )
             num_gradient_steps -= 1
+        # wait for the workers to wake up
         await sleep_task
-        Path(pids_path).unlink(missing_ok=True)
-        Path(state_dict_path).unlink(missing_ok=True)
+        # update the weights after wake up if async_weight_syncing is enabled
+        if async_weight_syncing:
+            # wait for the weights file to be created
+            while True:
+                try:
+                    if os.path.exists(weights_path):
+                        break
+                except FileNotFoundError:
+                    time.sleep(1)
+                    continue
+            await run_on_workers(
+                llm,
+                update_weights,
+                weights_path=weights_path,
+                profile=verbose,
+            )
+        # remove the weights file
+        Path(weights_path).unlink(missing_ok=True)
 
     @property
     def torchtune_args(self) -> dev.TorchtuneArgs:
@@ -210,14 +235,14 @@ class TorchtuneService:
         return dir if os.path.isdir(dir) else None
 
 
-def sleep(*, level: int, pids_path: str, state_dict_path: str, profile: bool) -> None:
+def sleep(*, level: int, pids_path: str, weights_path: str | None, profile: bool) -> None:
     """
     Put the worker to sleep until the new model weights are loaded.
 
     Args:
         level: The sleep level: 1 to offload the kv cache, 2 to discard the kv cache.
         pids_path: The path to the file that contains the PIDs of the workers.
-        state_dict_path: The path to the state dict file.
+        weights_path: The path to the weights file.
         profile: Whether to profile
     """
     from vllm.device_allocator.cumem import CuMemAllocator
@@ -235,25 +260,45 @@ def sleep(*, level: int, pids_path: str, state_dict_path: str, profile: bool) ->
             worker.sleep(level)
         with open(pids_path, "a") as f:
             f.write(f"{os.getpid()}\n")
+        weights = None
         while True:
-            try:
-                with worker.time("load_file"):
-                    state_dict = load_file(state_dict_path)
-                break
-            except FileNotFoundError:
-                time.sleep(1)
-                continue
-            except Exception as e:
-                if "MetadataIncompleteBuffer" in str(e) or "InvalidHeaderLength" in str(
-                    e
-                ):
+            if weights_path:
+                # wait for the weights file to be created
+                try:
+                    with worker.time("load_file"):
+                        weights = load_file(weights_path)
+                    break
+                except FileNotFoundError:
                     time.sleep(1)
                     continue
-                raise e
+            else:
+                # wait for the pids file to be removed
+                try:
+                    if os.path.exists(pids_path):
+                        time.sleep(1)
+                        continue
+                except FileNotFoundError:
+                    break
         with worker.time("wake_up"):
             worker.wake_up()
+        if weights is None:
+            return
         with worker.time("load_weights"):
-            worker.model_runner.model.load_weights(state_dict.items())  # type: ignore
+            worker.model_runner.model.load_weights(weights.items())  # type: ignore
     finally:
         logger.setLevel(logging.INFO)
         delattr(allocator, "_override_tags")
+
+def update_weights(weights_path: str, profile: bool) -> None:
+    from vllm.v1.worker.gpu_worker import logger
+    
+    worker = get_worker()
+    try:
+        if not (profile and worker.rank == 0):
+            logger.setLevel(logging.CRITICAL)
+        with worker.time("load_file"):
+            weights = load_file(weights_path)
+        with worker.time("load_weights"):
+            worker.model_runner.model.load_weights(weights.items()) # type: ignore
+    finally:
+        logger.setLevel(logging.INFO)

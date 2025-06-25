@@ -95,7 +95,7 @@ def get_model_config(
     )
     trainer_args.update(config.get("trainer_args", {}))
     if config.get("torchtune_args") is not None:
-        torchtune_args = TorchtuneArgs(model="torchtune.models.qwen3.qwen3_32b")
+        torchtune_args = TorchtuneArgs(model="qwen3_32b", model_type="QWEN3")
         torchtune_args.update(config.get("torchtune_args", {}) or {})
     else:
         torchtune_args = None
