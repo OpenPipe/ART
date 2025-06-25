@@ -3,7 +3,9 @@ from collections import Counter
 from dataclasses import dataclass
 from functools import cached_property
 import glob
+import logging
 import os
+from pathlib import Path
 from safetensors.torch import load_file
 import time
 import torch
@@ -46,59 +48,26 @@ class TorchtuneService:
         verbose: bool = False,
     ) -> AsyncIterator[dict[str, float]]:
         llm = await self.llm
-        sleep_level = 1 if llm.output_processor.has_unfinished_requests() else 2
         pids_path = f"{self.output_dir}/pids.txt"
-        state_dict_path = "/dev/shm/state_dict.safetensors"
         with open(pids_path, "w") as f:
             f.write("")
-        if os.path.exists(state_dict_path):
-            os.remove(state_dict_path)
-
-        def sleep() -> None:
-            import logging
-            from vllm.device_allocator.cumem import CuMemAllocator
-            from vllm.v1.worker.gpu_worker import logger
-
-            with open(pids_path, "a") as f:
-                f.write(f"{os.getpid()}\n")
-            worker = get_worker()
-            if not (verbose and worker.rank == 0):
-                logger.setLevel(logging.CRITICAL)
-            allocator = CuMemAllocator.get_instance()
-            setattr(allocator, "_override_tags", {"weights", "kv_cache"})
-            with worker.time("sleep"):
-                worker.sleep(sleep_level)
-            with open(pids_path, "a") as f:
-                f.write(f"{os.getpid()}\n")
-            while True:
-                try:
-                    with worker.time("load_state_dict"):
-                        state_dict = load_file(state_dict_path)
-                    break
-                except FileNotFoundError:
-                    time.sleep(1)
-                    continue
-                except Exception as e:
-                    if "MetadataIncompleteBuffer" in str(
-                        e
-                    ) or "InvalidHeaderLength" in str(e):
-                        time.sleep(1)
-                        continue
-                    raise e
-            with worker.time("wake_up"):
-                worker.wake_up()
-            delattr(allocator, "_override_tags")
-            with worker.time("load_weights"):
-                worker.model_runner.model.load_weights(state_dict.items())  # type: ignore
-            logger.setLevel(logging.INFO)
-
-        sleep_task = asyncio.create_task(run_on_workers(llm, sleep))
+        state_dict_path = "/dev/shm/state_dict.safetensors"
+        Path(state_dict_path).unlink(missing_ok=True)
+        sleep_task = asyncio.create_task(
+            run_on_workers(
+                llm,
+                sleep,
+                level=1 if llm.output_processor.has_unfinished_requests() else 2,
+                pids_path=pids_path,
+                state_dict_path=state_dict_path,
+                profile=verbose,
+            )
+        )
         while True:
             pids = Counter(open(pids_path).read().splitlines())
             if set(pids.values()) == {2}:
                 break
             await asyncio.sleep(0.25)
-
         train_process = await self.train_process
         train_queue = await self.train_queue
         with open(f"{self.output_dir}/batches.jsonl", "a") as f:
@@ -129,8 +98,8 @@ class TorchtuneService:
                     )
             num_gradient_steps -= 1
         await sleep_task
-        os.remove(pids_path)
-        os.remove(state_dict_path)
+        Path(pids_path).unlink(missing_ok=True)
+        Path(state_dict_path).unlink(missing_ok=True)
 
     @property
     def torchtune_args(self) -> dev.TorchtuneArgs:
@@ -155,8 +124,7 @@ class TorchtuneService:
         return asyncio.create_task(self.get_train_process())
 
     async def get_train_process(self) -> asyncio.subprocess.Process:
-        if os.path.exists(f"{self.output_dir}/batches.jsonl"):
-            os.remove(f"{self.output_dir}/batches.jsonl")
+        Path(f"{self.output_dir}/batches.jsonl").unlink(missing_ok=True)
         checkpoint_dir = await self.get_checkpoint_dir()
         torchtune_args = self.torchtune_args
 
@@ -240,3 +208,52 @@ class TorchtuneService:
     def get_last_checkpoint_dir(self) -> str | None:
         dir = f"{self.output_dir}/{get_step_from_dir(self.output_dir):04d}"
         return dir if os.path.isdir(dir) else None
+
+
+def sleep(*, level: int, pids_path: str, state_dict_path: str, profile: bool) -> None:
+    """
+    Put the worker to sleep until the new model weights are loaded.
+
+    Args:
+        level: The sleep level: 1 to offload the kv cache, 2 to discard the kv cache.
+        pids_path: The path to the file that contains the PIDs of the workers.
+        state_dict_path: The path to the state dict file.
+        profile: Whether to profile
+    """
+    from vllm.device_allocator.cumem import CuMemAllocator
+    from vllm.v1.worker.gpu_worker import logger
+
+    with open(pids_path, "a") as f:
+        f.write(f"{os.getpid()}\n")
+    worker = get_worker()
+    allocator = CuMemAllocator.get_instance()
+    try:
+        if not (profile and worker.rank == 0):
+            logger.setLevel(logging.CRITICAL)
+        setattr(allocator, "_override_tags", {"weights", "kv_cache"})
+        with worker.time("sleep"):
+            worker.sleep(level)
+        with open(pids_path, "a") as f:
+            f.write(f"{os.getpid()}\n")
+        while True:
+            try:
+                with worker.time("load_file"):
+                    state_dict = load_file(state_dict_path)
+                break
+            except FileNotFoundError:
+                time.sleep(1)
+                continue
+            except Exception as e:
+                if "MetadataIncompleteBuffer" in str(e) or "InvalidHeaderLength" in str(
+                    e
+                ):
+                    time.sleep(1)
+                    continue
+                raise e
+        with worker.time("wake_up"):
+            worker.wake_up()
+        with worker.time("load_weights"):
+            worker.model_runner.model.load_weights(state_dict.items())  # type: ignore
+    finally:
+        logger.setLevel(logging.INFO)
+        delattr(allocator, "_override_tags")

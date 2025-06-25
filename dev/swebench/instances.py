@@ -49,6 +49,7 @@ def get_filtered_swe_smith_instances_df() -> pl.DataFrame:
                         "knio__dominate.9082227e",
                         "marshmallow-code__marshmallow.9716fc62",
                         "mido__mido.a0158ff9",
+                        "pallets__markupsafe.620c06c9",
                         "pydantic__pydantic.acb0f10f",
                         "pylint-dev__astroid.b114f6b5",
                         "pyupio__safety.7654596b",
