@@ -43,8 +43,6 @@ optimizer:
   _component_: torch.optim.AdamW
   fused: True
   lr: 5e-6
-loss:
-  _component_: torchtune.modules.loss.LinearCrossEntropyLoss
 max_steps_per_epoch: null
 gradient_accumulation_steps: 1  # Use to increase effective batch size
 clip_grad_norm: null

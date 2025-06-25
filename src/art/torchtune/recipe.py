@@ -18,7 +18,6 @@ from warnings import warn
 from omegaconf import DictConfig, OmegaConf
 from pydantic import BaseModel, ConfigDict, Field, field_validator, ValidationError
 import torch
-from torch import nn
 from torch.distributed import destroy_process_group, init_process_group
 from torch.distributed.fsdp import FSDPModule
 from torch.distributed.tensor import DTensor
@@ -27,7 +26,6 @@ from torch.optim import Optimizer
 from torchao.float8 import precompute_float8_dynamic_scale_for_fsdp
 from torchtune import config, modules, training, utils
 from torchtune.modules import TransformerDecoder
-from torchtune.modules.loss import SFTLoss, LinearCrossEntropyLoss
 from torchtune.modules.moe import utils as moe_utils
 from torchtune.recipe_interfaces import FTRecipeInterface
 from torchtune.training import (
@@ -83,12 +81,6 @@ class OptimizerConfig(ComponentConfig):
     weight_decay: float = Field(default=0.0, ge=0)
 
 
-class LossConfig(ComponentConfig):
-    """Configuration for loss function instantiation"""
-
-    ignore_index: int = Field(default=-100)
-
-
 class MetricLoggerConfig(ComponentConfig):
     """Configuration for metric logger instantiation"""
 
@@ -140,7 +132,6 @@ class RecipeConfig(BaseModel):
     # Core components
     model: ModelConfig
     optimizer: OptimizerConfig
-    loss: LossConfig
     metric_logger: MetricLoggerConfig
     checkpointer: CheckpointerConfig
 
@@ -457,7 +448,7 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
     def setup(self, cfg: RecipeConfig) -> None:
         """
         Setup the recipe. This includes training state (if resume_from_checkpoint is True),
-        model, loss, optimizer, and metric logger.
+        model, optimizer, and metric logger.
         """
         if self.fsdp_cpu_offload:
             # Utilize all available CPU cores for intra-op parallelism. This provides ~2x
@@ -554,16 +545,8 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
             # Update the recipe state from the checkpoint state dict.
             self._update_recipe_state(checkpoint_dict)
 
-        # initialize loss
-        self._loss_fn = config.instantiate(cfg.loss.model_dump(by_alias=True))
-        if isinstance(self._loss_fn, SFTLoss):
-            self._loss_fn.set_model_output(self._model)
-
-        if self._compile_loss:
-            assert isinstance(self._loss_fn, nn.Module)
-            training.compile_loss(self._loss_fn, verbose=self._is_rank_zero)
-
-        utils.log_rank_zero(self._logger, "Loss is initialized.")
+        # Skip output layer since we implement loss calculation directly
+        self._model.skip_output_layer = True
 
         # Finally update the recipe state which can only be correctly set after all of the
         # other components have been initialized and updated.
@@ -843,9 +826,6 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
     ) -> torch.Tensor:
         from ..unsloth.train import calculate_mask, shift_tensor
 
-        # Shape [b, s], needed for the loss not the model
-        # labels = batch.pop("labels")
-
         import torch
         from torch.nn.attention.flex_attention import create_block_mask, BlockMask
 
@@ -1024,21 +1004,6 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
                 weights[i:chunk_end],
             )
 
-        # # post process for third party loss functions
-        # if not isinstance(self._loss_fn, SFTLoss):
-        #     # labels = labels.reshape(-1)
-        #     hidden_states = hidden_states.reshape(-1, hidden_states.size(-1))
-        #     if isinstance(hidden_states, DTensor):
-        #         hidden_states = hidden_states.full_tensor()
-
-        # # Compute loss
-        # loss = self._loss_fn(
-        #     hidden_states,
-        #     shift_tensor(
-        #         torch.where(inputs["assistant_mask"], inputs["tokens"], -100), -100
-        #     ),
-        # )  # type: ignore
-
         # free logits otherwise it peaks backward memory
         del hidden_states
 
@@ -1087,8 +1052,7 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
                 current_num_tokens = micro_batch["assistant_mask"].sum()
                 num_tokens += current_num_tokens
 
-                # Loss is normalized by default so we multiply by the number of tokens
-                # This way we can normalize by the total number of tokens if we're accumulating gradients
+                # We'll normalize by the total number of tokens when accumulating gradients
                 with self.context_parallel_manager(list(micro_batch.values())):  # type: ignore
                     current_loss = (
                         self._loss_step(micro_batch, batch.config, batch.dev_config)
@@ -1108,10 +1072,10 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
                     if not self._optimizer_in_bwd:
                         # Get total number of tokens across all ranks to normalize gradients
                         torch.distributed.all_reduce(num_tokens)
-                        # This will ensure that the logged loss matches what we're optimizing
+                        # Ensure consistency across all ranks for logging
                         torch.distributed.all_reduce(running_loss)
 
-                        # Manually scale the gradients from unnormalized loss by total # of tokens
+                        # Manually scale the gradients by total # of tokens
                         self._grad_scaler(
                             list(self._model.parameters()),
                             self.world_size / num_tokens,
@@ -1127,6 +1091,8 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
                             if isinstance(grad_norm, DTensor):
                                 grad_norm = grad_norm.full_tensor()
                         assert self._optimizer is not None
+                        for param_group in self._optimizer.param_groups:
+                            param_group["lr"] = batch.config.learning_rate
                         self._optimizer.step()
                         self._optimizer.zero_grad(set_to_none=True)
 
@@ -1359,15 +1325,6 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
             except Exception as e2:
                 print(f"Both methods failed: {e2}")
                 return
-
-        # # Move loss function if it's a nn.Module
-        # if hasattr(self._loss_fn, "to"):
-        #     try:
-        #         self._loss_fn.to(device)
-        #     except Exception as e:
-        #         print(f"Failed to move loss function: {e}")
-
-        # self._loss_fn = self._loss_fn.linear_projection.to(device)
 
         # Move optimizer states to device
         if hasattr(self, "_optimizer") and self._optimizer is not None:
