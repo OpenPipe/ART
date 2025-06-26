@@ -137,4 +137,4 @@ def run(host: str = "0.0.0.0", port: int = 7999) -> None:
             wait_for_completion=wait_for_completion,
         )
 
-    uvicorn.run(app, host=host, port=port)
+    uvicorn.run(app, host=host, port=port, loop="asyncio")
