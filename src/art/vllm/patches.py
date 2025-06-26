@@ -2,8 +2,7 @@
 
 import ctypes
 import torch
-from typing import Any, Optional
-from vllm.lora.request import LoRARequest
+from typing import Any
 from vllm.worker.multi_step_model_runner import MultiStepModelRunner
 
 
@@ -112,10 +111,14 @@ def subclass_chat_completion_request() -> None:
 
 def patch_lora_request() -> None:
     """
-    Patches the vLLM LoRARequest type to have attributes Unsloth expects.
+    Patches the vLLM LoRARequest type to have attributes Unsloth expects and the Unsloth LoRARequest type to have attributes vLLM expects.
     """
+    from unsloth_zoo.vllm_lora_request import LoRARequest as UnslothLoRARequest
+    from vllm.lora.request import LoRARequest
+
     LoRARequest.lora_tensors = {}  # type: ignore
     LoRARequest.lora_embeddings = {}  # type: ignore
+    UnslothLoRARequest.tensorizer_config_dict = None  # type: ignore
 
 
 def patch_get_lora_tokenizer_async() -> None:

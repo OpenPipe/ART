@@ -1,6 +1,6 @@
 import asyncio
 from contextlib import asynccontextmanager
-from dataclasses import asdict
+from dataclasses import replace
 import gc
 import unsloth  # type: ignore
 from datasets import Dataset
@@ -68,10 +68,9 @@ class ModelState:
         def _from_engine_args(
             engine_args: AsyncEngineArgs, *args: Any, **kwargs: Any
         ) -> AsyncLLMEngine:
-            engine_args_dict = asdict(engine_args)
-            engine_args_dict.update(config.get("engine_args", {}))
-            engine_args = AsyncEngineArgs(**engine_args_dict)
-            return from_engine_args(engine_args, *args, **kwargs)
+            return from_engine_args(
+                replace(engine_args, **config.get("engine_args", {})), *args, **kwargs
+            )
 
         AsyncLLMEngine.from_engine_args = _from_engine_args
         self.model, self.tokenizer = cast(
