@@ -118,16 +118,23 @@ class LocalBackend(Backend):
                 output_dir=get_model_dir(model=model, art_path=self._path),
                 config=model._internal_config,
             )
-            self._services[model.name] = (
+            service_class = (
                 TorchtuneService
                 if config.get("torchtune_args") is not None
                 else UnslothService
-            )(
+            )
+            self._services[model.name] = service_class(
                 model_name=model.name,
                 base_model=model.base_model,
                 config=config,
                 output_dir=get_model_dir(model=model, art_path=self._path),
             )
+            
+            # Pass wandb run to UnslothService for metrics collection
+            if isinstance(self._services[model.name], UnslothService):
+                wandb_run = self._get_wandb_run(model)
+                if wandb_run is not None:
+                    self._services[model.name].set_wandb_run(wandb_run)
             if not self._in_process:
                 # Kill all "model-service" processes to free up GPU memory
                 subprocess.run(["pkill", "-9", "model-service"])
