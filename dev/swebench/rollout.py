@@ -49,6 +49,7 @@ async def rollout(
     replay_trajectory_path: Path | None = None,
     return_run_single: Literal[False] = False,
     run_in_thread: bool = True,
+    timeout: float = 60 * 15,
 ) -> art.Trajectory: ...
 
 
@@ -61,6 +62,7 @@ async def rollout(
     replay_trajectory_path: Path | None = None,
     return_run_single: Literal[True],
     run_in_thread: bool = True,
+    timeout: float = 60 * 15,
 ) -> tuple[art.Trajectory, RunSingle]: ...
 
 
@@ -77,6 +79,7 @@ async def rollout(
     return_run_single: bool = False,
     reward_power: float = 1.0,
     run_in_thread: bool = True,
+    timeout: float = 60 * 15,
 ) -> art.Trajectory | tuple[art.Trajectory, RunSingle]:
     trajectory = art.Trajectory(messages_and_choices=[], reward=0.0)
     config = get_config(model, instance, completion_kwargs)
@@ -113,11 +116,12 @@ async def rollout(
         )
     try:
         async with limiter:
-            await run(run_single.run, run_in_thread)
+            await asyncio.wait_for(run(run_single.run, run_in_thread), timeout)
     except modal.exception.RemoteError as error:
         print(instance["instance_id"])
         print(error)
     except (
+        asyncio.TimeoutError,
         ProtocolError,
         RemoteDisconnected,
         ConnectionError,
@@ -132,7 +136,7 @@ async def rollout(
     finally:
         try:
             if isinstance(run_single.env.deployment, ModalDeployment):
-                await run_single.env.deployment.stop()
+                asyncio.create_task(run_single.env.deployment.stop())
         except:
             pass
     if instance["use_swebench_modal_harness"]:
