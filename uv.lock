@@ -1539,15 +1539,15 @@ wheels = [
 
 [[package]]
 name = "flask-cors"
-version = "6.0.0"
+version = "6.0.1"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "flask" },
     { name = "werkzeug" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/20/e7/b3c6afdd984672b55dff07482699c688af6c01bd7fd5dd55f9c9d1a88d1c/flask_cors-6.0.0.tar.gz", hash = "sha256:4592c1570246bf7beee96b74bc0adbbfcb1b0318f6ba05c412e8909eceec3393", size = 11875 }
+sdist = { url = "https://files.pythonhosted.org/packages/76/37/bcfa6c7d5eec777c4c7cf45ce6b27631cebe5230caf88d85eadd63edd37a/flask_cors-6.0.1.tar.gz", hash = "sha256:d81bcb31f07b0985be7f48406247e9243aced229b7747219160a0559edd678db", size = 13463 }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/ba/f0/0ee29090016345938f016ee98aa8b5de1c500ee93491dc0c76495848fca1/flask_cors-6.0.0-py3-none-any.whl", hash = "sha256:6332073356452343a8ccddbfec7befdc3fdd040141fe776ec9b94c262f058657", size = 11549 },
+    { url = "https://files.pythonhosted.org/packages/17/f8/01bf35a3afd734345528f98d0353f2a978a476528ad4d7e78b70c4d149dd/flask_cors-6.0.1-py3-none-any.whl", hash = "sha256:c7b2cbfb1a31aa0d2e5341eea03a6805349f7a61647daee1a15c46bbe981494c", size = 13244 },
 ]
 
 [[package]]
@@ -3904,7 +3904,7 @@ requires-dist = [
     { name = "seaborn", specifier = ">=0.13.2" },
     { name = "semver", specifier = ">=3.0.4" },
     { name = "setuptools", specifier = ">=78.1.0" },
-    { name = "sweagent", marker = "extra == 'swebench'", git = "https://github.com/bradhilton/SWE-agent.git" },
+    { name = "sweagent", marker = "extra == 'swebench'", git = "https://github.com/bradhilton/SWE-agent" },
     { name = "swebench", marker = "extra == 'swebench'", specifier = ">=4.0.3" },
     { name = "tblib", specifier = ">=3.0.0" },
     { name = "torch", specifier = ">=2.7.0" },
@@ -5152,14 +5152,14 @@ wheels = [
 
 [[package]]
 name = "python-engineio"
-version = "4.12.1"
+version = "4.12.2"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "simple-websocket" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/3c/9d/8492fbde3d4cb0e052de8a91a09754f222b5093f0342ef2dac92d60c751f/python_engineio-4.12.1.tar.gz", hash = "sha256:9f2b5a645c416208a9c727254316d487252493de52bee0ff70dc29ca9210397e", size = 91549 }
+sdist = { url = "https://files.pythonhosted.org/packages/ba/0b/67295279b66835f9fa7a491650efcd78b20321c127036eef62c11a31e028/python_engineio-4.12.2.tar.gz", hash = "sha256:e7e712ffe1be1f6a05ee5f951e72d434854a32fcfc7f6e4d9d3cae24ec70defa", size = 91677 }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/cf/f7/044532c6af7fe3135f572298f74d3e86fbb8d1803412f538403f175b16c6/python_engineio-4.12.1-py3-none-any.whl", hash = "sha256:9ec20d7900def0886fb9621f86fd1f05140d407f8d4e6a51bef0cfba2d112ff7", size = 59325 },
+    { url = "https://files.pythonhosted.org/packages/0c/fa/df59acedf7bbb937f69174d00f921a7b93aa5a5f5c17d05296c814fff6fc/python_engineio-4.12.2-py3-none-any.whl", hash = "sha256:8218ab66950e179dfec4b4bbb30aecf3f5d86f5e58e6fc1aa7fde2c698b2804f", size = 59536 },
 ]
 
 [[package]]
@@ -6232,7 +6232,7 @@ wheels = [
 
 [[package]]
 name = "swe-rex"
-version = "1.2.2"
+version = "1.3.0"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "bashlex" },
@@ -6244,15 +6244,15 @@ dependencies = [
     { name = "rich" },
     { name = "uvicorn" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/f9/8d/a778e4919769d07b7b994a05f3b90e6d24e7f8df8e2cc75a305a67ec8dc9/swe_rex-1.2.2.tar.gz", hash = "sha256:e0b99f518ef1484f989f7146fdd0ba5292be960ba1f58ed69e1840c294d5ff78", size = 38902 }
+sdist = { url = "https://files.pythonhosted.org/packages/99/b7/b02f0901fe1fc797381e2c1a727298d2a96c4ba35b9cc41b5ea38a7a2a71/swe_rex-1.3.0.tar.gz", hash = "sha256:7bfafd44e05af277c19db019b8213e07c45f2a66283d7526b55c2dc143802407", size = 39445 }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/a7/9c/0a3248bb60c156b490c3032ae888be8397bf5ed0730a2864f423cacbc34c/swe_rex-1.2.2-py3-none-any.whl", hash = "sha256:5ce81d195bcf4494e41e357944bc1d0d699dd0f704e4eeea67f22dc6a35c40bb", size = 44136 },
+    { url = "https://files.pythonhosted.org/packages/dc/9f/9f2ea5ebae6dcade1d04cdfa7fda85ab6185e787bf2b03e6105b7cbac2a9/swe_rex-1.3.0-py3-none-any.whl", hash = "sha256:d7e2a88f1b559efa483d63fdb1510a72ce6850acaa0c1eae723f6417a92ea124", size = 44147 },
 ]
 
 [[package]]
 name = "sweagent"
 version = "1.1.0"
-source = { git = "https://github.com/bradhilton/SWE-agent.git#c6fef776583117261e3ab87724f68352c911ce27" }
+source = { git = "https://github.com/bradhilton/SWE-agent#ed2f6c985544521d02aa1b046e1275734d5f435a" }
 dependencies = [
     { name = "datasets" },
     { name = "flask" },
@@ -6356,7 +6356,7 @@ wheels = [
 
 [[package]]
 name = "textual"
-version = "3.3.0"
+version = "3.5.0"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "markdown-it-py", extra = ["linkify", "plugins"] },
@@ -6364,9 +6364,9 @@ dependencies = [
     { name = "rich" },
     { name = "typing-extensions" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/6d/96/02751746cf6950e9e8968186cb42eed1e52d91e2c80cc52bb19589e25900/textual-3.3.0.tar.gz", hash = "sha256:aa162b92dde93c5231e3689cdf26b141e86a77ac0a5ba96069bc9547e44119ae", size = 1618996 }
+sdist = { url = "https://files.pythonhosted.org/packages/0c/63/16cdf4b9efb47366940d8315118c5c6dd6309f5eb2c159d7195b60e2e221/textual-3.5.0.tar.gz", hash = "sha256:c4a440338694672acf271c74904f1cf1e4a64c6761c056b02a561774b81a04f4", size = 1590084 }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/78/c2/c8be0b51bfce3278e057e1563a477bf128097bf5ce82ab21b0bbbcb30986/textual-3.3.0-py3-none-any.whl", hash = "sha256:463809791fd2c979c91ff0b54e25f2e57874828815e51a6503f32cb2e21e4eb0", size = 687997 },
+    { url = "https://files.pythonhosted.org/packages/1f/36/2597036cb80e40f71555bf59741471f7bd76ebed112f10ae0549650a12bf/textual-3.5.0-py3-none-any.whl", hash = "sha256:7c960efb70391b754e66201776793de2b26d699d51fb91f5f78401d13cec79a1", size = 688740 },
 ]
 
 [[package]]
