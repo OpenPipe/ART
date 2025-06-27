@@ -73,5 +73,5 @@ override-dependencies = [
 
 [tool.uv.sources]
 panza = { git = "https://github.com/corbt/panza.git" }
-sweagent = { git = "https://github.com/bradhilton/SWE-agent.git" }
 torchtune = { git = "https://github.com/pytorch/torchtune.git", rev = "2344509cf83bd886538fe3e8263e5145d1afb5c2" }
+sweagent = { git = "https://github.com/bradhilton/SWE-agent" }
