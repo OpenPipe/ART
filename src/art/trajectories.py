@@ -22,6 +22,7 @@ class PydanticException(pydantic.BaseModel):
 class Trajectory(pydantic.BaseModel):
     messages_and_choices: MessagesAndChoices
     tools: Tools | None = None
+    additional_messages_and_choices: list[MessagesAndChoices] = []
     reward: float
     metrics: dict[str, float | int | bool] = {}
     metadata: dict[str, MetadataValue] = {}
@@ -54,34 +55,7 @@ class Trajectory(pydantic.BaseModel):
         return f"Trajectory(reward={self.reward}, metrics={self.metrics}, metadata={self.metadata})"
 
     def messages(self) -> Messages:
-        return [
-            (
-                {
-                    "role": "assistant",
-                    "content": message_or_choice.message.content,
-                    **(
-                        {
-                            "tool_calls": [
-                                {
-                                    "id": tool_call.id,
-                                    "type": tool_call.type,
-                                    "function": {
-                                        "name": tool_call.function.name,
-                                        "arguments": tool_call.function.arguments,
-                                    },
-                                }
-                                for tool_call in message_or_choice.message.tool_calls
-                            ]
-                        }
-                        if message_or_choice.message.tool_calls
-                        else {}
-                    ),  # type: ignore
-                }
-                if isinstance(message_or_choice, Choice)
-                else message_or_choice
-            )
-            for message_or_choice in self.messages_and_choices
-        ]
+        return get_messages(self.messages_and_choices)
 
     # Used for logging to console
     def for_logging(self) -> dict[str, Any]:
@@ -100,6 +74,37 @@ class Trajectory(pydantic.BaseModel):
             )
             loggable_dict["messages"].append({**message, "trainable": trainable})
         return loggable_dict
+
+
+def get_messages(messages_and_choices: MessagesAndChoices) -> Messages:
+    return [
+        (
+            {
+                "role": "assistant",
+                "content": message_or_choice.message.content,
+                **(
+                    {
+                        "tool_calls": [
+                            {
+                                "id": tool_call.id,
+                                "type": tool_call.type,
+                                "function": {
+                                    "name": tool_call.function.name,
+                                    "arguments": tool_call.function.arguments,
+                                },
+                            }
+                            for tool_call in message_or_choice.message.tool_calls
+                        ]
+                    }
+                    if message_or_choice.message.tool_calls
+                    else {}
+                ),  # type: ignore
+            }
+            if isinstance(message_or_choice, Choice)
+            else message_or_choice
+        )
+        for message_or_choice in messages_and_choices
+    ]
 
 
 class TrajectoryGroup(pydantic.BaseModel):
