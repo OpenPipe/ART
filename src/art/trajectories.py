@@ -19,10 +19,15 @@ class PydanticException(pydantic.BaseModel):
     traceback: str
 
 
+class History(pydantic.BaseModel):
+    messages_and_choices: MessagesAndChoices
+    tools: Tools | None = None
+
+
 class Trajectory(pydantic.BaseModel):
     messages_and_choices: MessagesAndChoices
     tools: Tools | None = None
-    additional_messages_and_choices: list[MessagesAndChoices] = []
+    additional_histories: list[History] = []
     reward: float
     metrics: dict[str, float | int | bool] = {}
     metadata: dict[str, MetadataValue] = {}

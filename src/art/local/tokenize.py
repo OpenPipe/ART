@@ -5,8 +5,7 @@ import random
 from transformers.tokenization_utils_base import PreTrainedTokenizerBase
 from typing import cast, Generator
 
-from ..trajectories import get_messages, TrajectoryGroup
-from ..types import MessagesAndChoices, Tools
+from ..trajectories import get_messages, History, TrajectoryGroup
 
 
 @dataclass
@@ -59,14 +58,16 @@ def tokenize_trajectory_groups(
             if advantage == 0:
                 continue
             trajectory_results: list[TokenizedResult] = []
-            for messages_and_choices in [
-                trajectory.messages_and_choices,
-                *trajectory.additional_messages_and_choices,
+            for history in [
+                History(
+                    messages_and_choices=trajectory.messages_and_choices,
+                    tools=trajectory.tools,
+                ),
+                *trajectory.additional_histories,
             ]:
                 if result := tokenize_trajectory(
                     tokenizer,
-                    messages_and_choices,
-                    trajectory.tools,
+                    history,
                     advantage,
                     allow_training_without_logprobs,
                 ):
@@ -101,8 +102,7 @@ def tokenize_trajectory_groups(
 
 def tokenize_trajectory(
     tokenizer: "PreTrainedTokenizerBase",
-    messages_and_choices: MessagesAndChoices,
-    tools: Tools | None,
+    history: History,
     advantage: float,
     allow_training_without_logprobs: bool,
 ) -> TokenizedResult | None:
@@ -111,7 +111,7 @@ def tokenize_trajectory(
     """
     # Find the index of the last assistant message
     last_assistant_index = -1
-    for i, message_or_choice in enumerate(messages_and_choices):
+    for i, message_or_choice in enumerate(history.messages_and_choices):
         if (
             isinstance(message_or_choice, dict)
             and message_or_choice["role"] == "assistant"
@@ -125,13 +125,13 @@ def tokenize_trajectory(
     # If there are no trainable assistant messages, return None
     if last_assistant_index == -1:
         return None
-    messages_and_choices = messages_and_choices[: last_assistant_index + 1]
+    messages_and_choices = history.messages_and_choices[: last_assistant_index + 1]
     messages = get_messages(messages_and_choices)
     chat = cast(
         str,
         tokenizer.apply_chat_template(
             cast(list[dict], messages),
-            tools=tools,  # type: ignore
+            tools=history.tools,  # type: ignore
             tokenize=False,
         ),
     )
@@ -139,7 +139,7 @@ def tokenize_trajectory(
         list[int],
         tokenizer.apply_chat_template(
             cast(list[dict], messages),
-            tools=tools,  # type: ignore
+            tools=history.tools,  # type: ignore
         ),
     )
     sentinal_token_id = max(
@@ -163,7 +163,7 @@ def tokenize_trajectory(
                     for message_or_choice in messages_and_choices
                 ],
             ),
-            tools=tools,  # type: ignore
+            tools=history.tools,  # type: ignore
             return_dict=True,
             return_assistant_token_mask=allow_training_without_logprobs,
         ),
