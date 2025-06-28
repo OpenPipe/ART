@@ -48,6 +48,7 @@ async def rollout(
     completion_kwargs: dict[str, Any] | None = None,
     replay_trajectory_path: Path | None = None,
     return_run_single: Literal[False] = False,
+    reward_power: float = 1.0,
     run_in_thread: bool = True,
     timeout: float = 60 * 15,
 ) -> art.Trajectory: ...
@@ -61,6 +62,7 @@ async def rollout(
     completion_kwargs: dict[str, Any] | None = None,
     replay_trajectory_path: Path | None = None,
     return_run_single: Literal[True],
+    reward_power: float = 1.0,
     run_in_thread: bool = True,
     timeout: float = 60 * 15,
 ) -> tuple[art.Trajectory, RunSingle]: ...
@@ -339,7 +341,7 @@ def update_trajectory(
     )
     # calculate reward and save metrics
     trajectory.reward = (
-        0.45 * maintenance + 0.45 * progress**reward_power + 0.1 * resolved
+        0.2 * maintenance + 0.3 * progress**reward_power + 0.5 * resolved
     )
     trajectory.metrics["progress"] = progress
     trajectory.metrics["maintenance"] = maintenance
