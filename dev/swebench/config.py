@@ -155,7 +155,7 @@ def get_config(
     if model.trainable and model.config.xml_function_calling:
         completion_kwargs["stop"] = "</function>"
         completion_kwargs["include_stop_str_in_output"] = True
-        completion_kwargs["timeout"] = 60.0 * 10
+        completion_kwargs["timeout"] = 60.0 * 30
     completion_kwargs["metadata"] = {
         "trace_id": langfuse_context.get_current_trace_id(),
         "parent_observation_id": langfuse_context.get_current_observation_id(),
