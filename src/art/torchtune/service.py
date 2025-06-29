@@ -181,7 +181,7 @@ class TorchtuneService:
             f"tensor_parallel_dim={torchtune_args.get('tensor_parallel_dim', 1)}",
             f"context_parallel_dim={torchtune_args.get('context_parallel_dim', 1)}",
             f"output_dir={self.output_dir}",
-            "clip_grad_norm=0.01",
+            "clip_grad_norm=0.1",
             "metric_logger._component_=torchtune.training.metric_logging.StdoutLogger",
             "metric_logger.log_dir=null",
         ]

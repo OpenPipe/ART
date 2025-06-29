@@ -17,6 +17,7 @@ from warnings import warn
 
 from omegaconf import DictConfig, OmegaConf
 from pydantic import ValidationError
+import setproctitle
 import torch
 from torch.distributed import destroy_process_group, init_process_group
 from torch.distributed.fsdp import FSDPModule
@@ -1073,11 +1074,10 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
                             device: torch.device | None = None,
                             adapter_weights_only: bool = False,
                         ) -> dict[str, Any]:
+                            self._move_to(torch.device("cpu"))
                             state_dict = gather_cpu_state_dict(
                                 model, is_rank_zero, device, adapter_weights_only
                             )
-                            self._move_to(torch.device("cpu"))
-                            time.sleep(4)
                             # signal that the GPUs are free
                             Path(f"{self._output_dir}/pids.txt").unlink(missing_ok=True)
                             training.gather_cpu_state_dict = gather_cpu_state_dict
@@ -1283,4 +1283,5 @@ def recipe_main(cfg: DictConfig) -> None:
 
 
 if __name__ == "__main__":
+    setproctitle.setproctitle("model-service")
     sys.exit(recipe_main())
