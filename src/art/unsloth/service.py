@@ -2,7 +2,7 @@ import asyncio
 from dataclasses import dataclass
 import functools
 import torch
-from typing import AsyncIterator, TYPE_CHECKING, Optional, Any
+from typing import AsyncIterator, TYPE_CHECKING
 
 from art.utils.get_model_step import get_step_from_dir
 
@@ -11,7 +11,6 @@ from .. import types
 from ..local.checkpoints import get_last_checkpoint_dir
 from ..local.pack import DiskPackedTensors, packed_tensors_from_dir, PackedTensors
 from .train import train
-from ..vllm.metrics_collector import VLLMMetricsCollector
 
 if TYPE_CHECKING:
     from unsloth_zoo.vllm_lora_request import LoRARequest  # type: ignore
@@ -32,8 +31,6 @@ class UnslothService:
     output_dir: str
     _openai_server_task: asyncio.Task[None] | None = None
     _train_task: asyncio.Task[None] | None = None
-    _metrics_collector: Optional[VLLMMetricsCollector] = None
-    _wandb_run: Optional[Any] = None
 
     @functools.cached_property
     def state(self) -> "ModelState":
@@ -53,41 +50,22 @@ class UnslothService:
             lora_path = f"{self.output_dir}/0000"
             self.state.trainer.save_model(lora_path)
         await self.stop_openai_server()
-
-        # Get the server config to extract host and port
-        server_config = dev.get_openai_server_config(
-            model_name=self.model_name,
-            base_model=self.base_model,
-            log_file=f"{self.output_dir}/logs/vllm.log",
-            lora_path=lora_path,
-            config=config,
-        )
-
         self._openai_server_task = await openai_server_task(
             engine=self.state.vllm.async_engine,
-            config=server_config,
+            config=dev.get_openai_server_config(
+                model_name=self.model_name,
+                base_model=self.base_model,
+                log_file=f"{self.output_dir}/logs/vllm.log",
+                lora_path=lora_path,
+                config=config,
+            ),
         )
         self._set_lora(lora_path)
-
-        # Start metrics collection if wandb is available
-        if self._wandb_run is not None:
-            host = server_config.get("server_args", {}).get("host", "localhost")
-            port = server_config.get("server_args", {}).get("port", 8000)
-            self._metrics_collector = VLLMMetricsCollector(
-                base_url=f"http://{host}:{port}",
-                wandb_run=self._wandb_run,
-            )
-            await self._metrics_collector.start()
 
     async def stop_openai_server(self) -> None:
         if self._openai_server_task:
             self._openai_server_task.cancel()
             self._openai_server_task = None
-
-        # Stop metrics collection
-        if self._metrics_collector:
-            await self._metrics_collector.stop()
-            self._metrics_collector = None
 
     async def train(
         self,
@@ -152,9 +130,9 @@ class UnslothService:
                     for task in done:
                         result = task.result()
                         # If `result` is `None`, the training task finished somehow.
-                        assert result is not None, (
-                            "The training task should never finish."
-                        )
+                        assert (
+                            result is not None
+                        ), "The training task should never finish."
                         self.results_queue.task_done()
                         if warmup:
                             from .state import free_memory
@@ -192,7 +170,3 @@ class UnslothService:
         lora_request.lora_path = lora_path
         self.state.vllm.async_engine.engine.remove_lora(1)
         self.state.vllm.async_engine.engine.add_lora(lora_request)  # type: ignore
-
-    def set_wandb_run(self, wandb_run: Any) -> None:
-        """Set the wandb run for metrics logging."""
-        self._wandb_run = wandb_run

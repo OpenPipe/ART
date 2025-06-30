@@ -152,4 +152,4 @@ assert models["212"].config.training_config is not None
 models["212"].config.training_config.eval_steps = 5
 models["212"].config.training_config.val_set_size = 10
 models["212"].config.training_config.groups_per_step = 2
-models["212"].name = "email-agent-212-22"
+models["212"].name = "email-agent-212-26"

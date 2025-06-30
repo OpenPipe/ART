@@ -130,11 +130,6 @@ class LocalBackend(Backend):
                 output_dir=get_model_dir(model=model, art_path=self._path),
             )
 
-            # Pass wandb run to UnslothService for metrics collection
-            if isinstance(self._services[model.name], UnslothService):
-                wandb_run = self._get_wandb_run(model)
-                if wandb_run is not None:
-                    self._services[model.name].set_wandb_run(wandb_run)
             if not self._in_process:
                 # Kill all "model-service" processes to free up GPU memory
                 subprocess.run(["pkill", "-9", "model-service"])
@@ -390,7 +385,6 @@ class LocalBackend(Backend):
         split: str,
         step: int | None = None,
     ) -> None:
-        # Add namespacing if needed
         metrics = {f"{split}/{metric}": value for metric, value in metrics.items()}
         step = (
             step
@@ -402,11 +396,9 @@ class LocalBackend(Backend):
         if run := self._get_wandb_run(model):
             # Mark the step metric itself as hidden so W&B doesn't create an automatic chart for it
             wandb.define_metric("training_step", hidden=True)
+
             # Ensure all metrics for this split are associated with the correct x-axis
-            # Wildcard is important because W&B auto-generates charts based on the prefix
             wandb.define_metric(f"{split}/*", step_metric="training_step")
-            for metric in metrics:
-                wandb.define_metric(metric, step_metric="training_step")
             run.log({"training_step": step, **metrics})
 
     def _get_wandb_run(self, model: Model) -> Run | None:
@@ -421,6 +413,15 @@ class LocalBackend(Backend):
                 name=model.name,
                 id=model.name,
                 resume="allow",
+                settings=wandb.Settings(
+                    x_stats_open_metrics_endpoints={
+                        "vllm": "http://localhost:8000/metrics",
+                    },
+                    x_stats_open_metrics_filters=(
+                        "vllm.vllm:num_requests_waiting",
+                        "vllm.vllm:num_requests_running",
+                    ),
+                ),
             )
             self._wandb_runs[model.name] = run
             os.environ["WEAVE_PRINT_CALL_LINK"] = os.getenv(
