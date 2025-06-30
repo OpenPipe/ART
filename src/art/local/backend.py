@@ -397,8 +397,8 @@ class LocalBackend(Backend):
             # Mark the step metric itself as hidden so W&B doesn't create an automatic chart for it
             wandb.define_metric("training_step", hidden=True)
 
-            # Ensure all metrics for this split are associated with the correct x-axis
-            wandb.define_metric(f"{split}/*", step_metric="training_step")
+            # Enabling the following line will cause W&B to use the training_step metric as the x-axis for all metrics
+            # wandb.define_metric(f"{split}/*", step_metric="training_step")
             run.log({"training_step": step, **metrics})
 
     def _get_wandb_run(self, model: Model) -> Run | None:
