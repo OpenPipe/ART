@@ -148,4 +148,8 @@ models["211"] = models["206"].model_copy(deep=True)
 models["211"].name = "email-agent-211"
 
 models["212"] = models["008"].model_copy(deep=True)
-models["212"].name = "email-agent-212-8"
+assert models["212"].config.training_config is not None
+models["212"].config.training_config.eval_steps = 5
+models["212"].config.training_config.val_set_size = 10
+models["212"].config.training_config.groups_per_step = 2
+models["212"].name = "email-agent-212-22"

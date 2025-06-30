@@ -1,10 +1,12 @@
 """Collect metrics from vLLM's Prometheus endpoint and log to wandb."""
 
 import asyncio
-import re
-from typing import Dict, Optional, Any
+from typing import Dict, Optional, Any, DefaultDict
+from collections import defaultdict
 import httpx
 from wandb.wandb_run import Run as WandbRun
+from prometheus_client.parser import text_string_to_metric_families
+import math
 
 
 class VLLMMetricsCollector:
@@ -32,6 +34,9 @@ class VLLMMetricsCollector:
         self.timeout = timeout
         self._task: Optional[asyncio.Task] = None
         self._stop_event = asyncio.Event()
+
+        if self.wandb_run is not None:
+            self.wandb_run.define_metric("vllm/*", step_metric="_runtime")
 
     async def start(self):
         """Start the metrics collection task."""
@@ -76,64 +81,67 @@ class VLLMMetricsCollector:
 
         # Log to wandb if run is available
         if self.wandb_run is not None:
-            wandb_metrics = {
-                "vllm/concurrent_requests": metrics.get("vllm:num_requests_running", 0),
-                "vllm/queued_requests": metrics.get("vllm:num_requests_waiting", 0),
-                "vllm/gpu_cache_usage_perc": metrics.get(
-                    "vllm:gpu_cache_usage_perc", 0
-                ),
-            }
-
-            # Add request latency metrics if available
-            if "vllm:request_latency_seconds" in metrics:
-                wandb_metrics["vllm/request_latency_p50"] = metrics[
-                    "vllm:request_latency_seconds"
-                ].get("0.5", 0)
-                wandb_metrics["vllm/request_latency_p99"] = metrics[
-                    "vllm:request_latency_seconds"
-                ].get("0.99", 0)
-
-            self.wandb_run.log(wandb_metrics)
+            if metrics:
+                # Let wandb auto-log _runtime and _step; we don't pass an explicit step
+                # so that charts use _runtime as configured in `define_metric`.
+                self.wandb_run.log(metrics)
 
     def _parse_prometheus_metrics(self, metrics_text: str) -> Dict[str, Any]:
-        """Parse Prometheus format metrics into a dictionary."""
-        metrics = {}
+        """Extract latency p50/p99 and concurrency gauges from Prometheus text."""
 
-        # Parse simple gauge metrics
-        gauge_pattern = r"^([a-zA-Z_:][a-zA-Z0-9_:]*)\s+([0-9.]+(?:[eE][+-]?[0-9]+)?)"
+        running: Optional[float] = None
+        waiting: Optional[float] = None
 
-        # Parse histogram/summary metrics with labels
-        histogram_pattern = (
-            r"^([a-zA-Z_:][a-zA-Z0-9_:]*){(.+?)}\s+([0-9.]+(?:[eE][+-]?[0-9]+)?)"
-        )
+        # Aggregate histogram buckets across all models
+        bucket_totals: DefaultDict[float, float] = defaultdict(float)
 
-        for line in metrics_text.split("\n"):
-            line = line.strip()
-            if not line or line.startswith("#"):
-                continue
-
-            # Try simple gauge pattern first
-            match = re.match(gauge_pattern, line)
-            if match:
-                metric_name, value = match.groups()
-                metrics[metric_name] = float(value)
-                continue
-
-            # Try histogram pattern with labels
-            match = re.match(histogram_pattern, line)
-            if match:
-                metric_name, labels, value = match.groups()
-
-                # Parse quantile from labels for latency metrics
-                if "quantile=" in labels:
-                    quantile_match = re.search(r'quantile="([0-9.]+)"', labels)
-                    if quantile_match:
-                        quantile = quantile_match.group(1)
-                        if metric_name not in metrics:
-                            metrics[metric_name] = {}
-                        metrics[metric_name][quantile] = float(value)
+        for family in text_string_to_metric_families(metrics_text):
+            if family.name in {
+                "vllm:num_requests_running",
+                "vllm:num_requests_waiting",
+            }:
+                total = sum(float(s.value) for s in family.samples)
+                if family.name == "vllm:num_requests_running":
+                    running = total
                 else:
-                    # For other labeled metrics, just use the base name
-                    metrics[metric_name] = float(value)
+                    waiting = total
+            elif family.name == "vllm:e2e_request_latency_seconds":
+                for sample in family.samples:
+                    # Only consider the histogram *buckets*; ignore _count/_sum etc.
+                    if not sample.name.endswith("_bucket"):
+                        continue
 
-        return metrics
+                    le = sample.labels.get("le", "+Inf")
+                    bound = float("inf") if le == "+Inf" else float(le)
+                    bucket_totals[bound] += float(sample.value)
+
+        p50 = p99 = None
+        if bucket_totals:
+            bounds_sorted = sorted(bucket_totals.keys())
+            counts_sorted = [bucket_totals[b] for b in bounds_sorted]
+            total = counts_sorted[-1]
+
+            if total > 0:
+
+                def _quantile(q: float) -> float:
+                    target = total * q
+                    for b, c in zip(bounds_sorted, counts_sorted):
+                        if c >= target:
+                            return b
+                    return float("nan")
+
+                p50 = _quantile(0.5)
+                p99 = _quantile(0.99)
+
+        # Use "/" in metric names for wandb (vllm/...)
+        out: Dict[str, Any] = {}
+        if running is not None:
+            out["vllm/num_requests_running"] = running
+        if waiting is not None:
+            out["vllm/num_requests_waiting"] = waiting
+        if p50 is not None and not math.isnan(p50):
+            out["vllm/e2e_request_latency_seconds_p50"] = p50
+        if p99 is not None and not math.isnan(p99):
+            out["vllm/e2e_request_latency_seconds_p99"] = p99
+
+        return out

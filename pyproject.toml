@@ -28,6 +28,7 @@ dependencies = [
     "panza",
     "semver>=3.0.4",
     "torchtune",
+    "prometheus-client>=0.22.1",
 ]
 
 [project.optional-dependencies]
