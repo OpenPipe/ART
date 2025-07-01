@@ -1,10 +1,11 @@
+import argparse
 import asyncio
 import base64
 import daytona_sdk
-import argparse
-import sys
 from dotenv import load_dotenv
 import re
+from tqdm.auto import tqdm
+from typing import Literal
 
 load_dotenv()
 
@@ -17,8 +18,34 @@ instances = list(
 )
 
 
+Logging = Literal["as-you-go", "on-exit", "on-error", "none"]
+
+
+class Logger:
+    def __init__(self, logging: Logging) -> None:
+        self.logging = logging
+        self.messages = []
+
+    def log(self, message: str) -> None:
+        if self.logging == "as-you-go":
+            print(message)
+        elif self.logging == "on-exit":
+            self.messages.append(message)
+        elif self.logging == "on-error":
+            self.messages.append(message)
+        elif self.logging == "none":
+            pass
+
+    def print_queued_messages(self) -> None:
+        for message in self.messages:
+            print(message)
+
+
 async def write_file_chunked(
-    sandbox, content: str, target_path: str, chunk_size: int = 1000
+    sandbox: daytona_sdk.AsyncSandbox,
+    content: str,
+    target_path: str,
+    chunk_size: int = 1000,
 ) -> None:
     """Write content to a file in chunks to avoid command length limits.
 
@@ -80,7 +107,9 @@ def extract_missing_modules(output: str) -> list[str]:
     return list(set(missing_modules))  # Remove duplicates
 
 
-async def install_missing_module(sandbox, module: str, uv_cmd: str) -> bool:
+async def install_missing_module(
+    sandbox: daytona_sdk.AsyncSandbox, module: str, uv_cmd: str
+) -> bool:
     """Try to install a missing module, attempting various package name transformations.
 
     Args:
@@ -168,7 +197,9 @@ def analyze_test_results(output: str, instance: Instance) -> dict:
     }
 
 
-async def install_base_dependencies(sandbox, uv_cmd: str) -> None:
+async def install_base_dependencies(
+    sandbox: daytona_sdk.AsyncSandbox, uv_cmd: str, logger: Logger
+) -> None:
     """Install base dependencies for testing.
 
     Args:
@@ -176,7 +207,7 @@ async def install_base_dependencies(sandbox, uv_cmd: str) -> None:
         uv_cmd: The uv command with environment setup
     """
     # Install pytest first
-    print("  Installing pytest...")
+    logger.log("  Installing pytest...")
     await sandbox.process.exec(f"{uv_cmd} pip install -q pytest", cwd="/testbed")
 
     # Try to sync dependencies if pyproject.toml with dependencies exists
@@ -185,7 +216,7 @@ async def install_base_dependencies(sandbox, uv_cmd: str) -> None:
         cwd="/testbed",
     )
     if pyproject_check.result.strip() == "1":
-        print("  Syncing dependencies with uv...")
+        logger.log("  Syncing dependencies with uv...")
         # For projects with pyproject.toml, try installing directly
         await sandbox.process.exec(f"{uv_cmd} pip install -q -e .", cwd="/testbed")
 
@@ -203,13 +234,13 @@ async def install_base_dependencies(sandbox, uv_cmd: str) -> None:
             f"test -f {req_file} && echo 1", cwd="/testbed"
         )
         if check.result.strip() == "1":
-            print(f"  Installing from {req_file}")
+            logger.log(f"  Installing from {req_file}")
             await sandbox.process.exec(
                 f"{uv_cmd} pip install -q -r {req_file}", cwd="/testbed"
             )
 
     # Install the package itself if not already done
-    print("  Installing package...")
+    logger.log("  Installing package...")
     install_result = await sandbox.process.exec(
         f"{uv_cmd} pip install -q -e . 2>&1", cwd="/testbed"
     )
@@ -223,31 +254,36 @@ async def install_base_dependencies(sandbox, uv_cmd: str) -> None:
         await sandbox.process.exec(f"{uv_cmd} pip install -q . 2>&1", cwd="/testbed")
 
 
-async def run_tests(daytona: daytona_sdk.AsyncDaytona, instance: Instance) -> None:
+async def run_tests(
+    daytona: daytona_sdk.AsyncDaytona,
+    instance: Instance,
+    logging: Logging = "as-you-go",
+) -> None:
     """Run tests for a SWE-bench instance.
 
     The patch in the instance data introduces a bug that needs to be fixed.
     FAIL_TO_PASS tests should fail after the patch is applied.
     PASS_TO_PASS tests should continue to pass after the patch.
     """
+    logger = Logger(logging)
     sandbox = await daytona.create(
         daytona_sdk.CreateSandboxFromImageParams(image=instance["image_name"])
     )
     try:
-        print(f"\n=== {instance['instance_id']} ===")
+        logger.log(f"\n=== {instance['instance_id']} ===")
 
         # Apply patch to introduce the bug
         await write_file_chunked(sandbox, instance["patch"], "/tmp/patch.txt")
         await sandbox.process.exec("patch -p1 < /tmp/patch.txt", cwd="/testbed")
-        print("Patch applied (bug introduced)")
+        logger.log("Patch applied (bug introduced)")
 
         # Install dependencies and package
-        print("Installing dependencies...")
+        logger.log("Installing dependencies...")
 
         # 1. Install uv if not already present
         uv_check = await sandbox.process.exec("which uv", cwd="/testbed")
         if uv_check.exit_code != 0:
-            print("  Installing uv...")
+            logger.log("  Installing uv...")
             await sandbox.process.exec(
                 "curl -LsSf https://astral.sh/uv/install.sh | sh -s -- --quiet",
                 cwd="/testbed",
@@ -259,14 +295,14 @@ async def run_tests(daytona: daytona_sdk.AsyncDaytona, instance: Instance) -> No
         uv_cmd = "UV_SYSTEM_PYTHON=true PATH=$HOME/.local/bin:$PATH uv"
 
         # 3. Install dependencies
-        await install_base_dependencies(sandbox, uv_cmd)
+        await install_base_dependencies(sandbox, uv_cmd, logger)
 
         # Prepare and run tests
         tests = instance["FAIL_TO_PASS"] + instance["PASS_TO_PASS"]
         await write_file_chunked(sandbox, "\n".join(tests), "/tmp/tests.txt")
 
         # 4. Try running tests and install missing dependencies if needed
-        print("\nRunning tests...")
+        logger.log("\nRunning tests...")
         max_retries = 5
         for attempt in range(max_retries):
             result = await sandbox.process.exec(
@@ -280,51 +316,55 @@ async def run_tests(daytona: daytona_sdk.AsyncDaytona, instance: Instance) -> No
                 missing_modules = extract_missing_modules(result.result)
 
                 if missing_modules and attempt < max_retries - 1:
-                    print(f"  Missing modules detected: {', '.join(missing_modules)}")
-                    print(f"  Installing missing dependencies...")
+                    logger.log(
+                        f"  Missing modules detected: {', '.join(missing_modules)}"
+                    )
+                    logger.log("  Installing missing dependencies...")
 
                     # Try to install the missing modules
                     for module in missing_modules:
                         await install_missing_module(sandbox, module, uv_cmd)
 
                     # Retry the tests
-                    print(f"  Retrying tests (attempt {attempt + 2}/{max_retries})...")
+                    logger.log(
+                        f"  Retrying tests (attempt {attempt + 2}/{max_retries})..."
+                    )
                     continue
 
             # No more import errors or max retries reached
             break
 
         # Analyze results
-        print(f"\nTest Results:")
-        print(f"Exit code: {result.exit_code}")
+        logger.log(f"\nTest Results:")
+        logger.log(f"Exit code: {result.exit_code}")
 
         output = result.result
         results = analyze_test_results(output, instance)
 
-        print(f"Failed: {results['failed']}")
-        print(f"Passed: {results['passed']}")
-        print(f"Errors: {results['errors']}")
+        logger.log(f"Failed: {results['failed']}")
+        logger.log(f"Passed: {results['passed']}")
+        logger.log(f"Errors: {results['errors']}")
 
         # Show expectations and summary
-        print(f"\nExpectations:")
-        print(f"FAIL_TO_PASS tests ({results['fail_to_pass_count']}): Should fail")
-        print(f"PASS_TO_PASS tests ({results['pass_to_pass_count']}): Should pass")
+        logger.log(f"\nExpectations:")
+        logger.log(f"FAIL_TO_PASS tests ({results['fail_to_pass_count']}): Should fail")
+        logger.log(f"PASS_TO_PASS tests ({results['pass_to_pass_count']}): Should pass")
 
         if results["is_expected"]:
-            print("✓ Tests are failing as expected")
+            logger.log("✓ Tests are failing as expected")
         else:
-            print("⚠️  Unexpected test results")
+            logger.log("⚠️  Unexpected test results")
 
         # Show sample failures
         if results["total_issues"] > 0:
-            print("\nSample failures/errors:")
+            logger.log("\nSample failures/errors:")
             lines = output.split("\n")
             failure_lines = [
                 line for line in lines if "FAILED" in line or "ERROR" in line
             ][:5]
             for line in failure_lines:
                 if line.strip():
-                    print(f"  {line.strip()}")
+                    logger.log(f"  {line.strip()}")
 
             # If we have collection errors, show more detail
             if results["errors"] > 0 and "ERROR collecting" in output:
@@ -334,30 +374,66 @@ async def run_tests(daytona: daytona_sdk.AsyncDaytona, instance: Instance) -> No
                     if "ModuleNotFoundError" in line or "ImportError" in line
                 ][:3]
                 if error_details:
-                    print("\nImport errors detected:")
+                    logger.log("\nImport errors detected:")
                     for line in error_details:
-                        print(f"  {line.strip()}")
+                        logger.log(f"  {line.strip()}")
 
-        print(f"\n{'✅' if results['is_expected'] else '⚠️ '} Ready for agent")
+        logger.log(f"\n{'✅' if results['is_expected'] else '⚠️ '} Ready for agent")
 
+    except Exception as e:
+        if logging == "on-error":
+            logger.print_queued_messages()
+        raise e
     finally:
         await sandbox.delete()
+        if logging == "on-exit":
+            logger.print_queued_messages()
 
 
-async def test_instances(instance_indices: list[int]) -> None:
+async def test_instances(
+    instance_indices: list[int],
+    logging: Logging = "as-you-go",
+    parallel: bool = False,
+    print_exceptions: bool = False,
+    use_pbar: bool = False,
+) -> None:
     """Test specified instances"""
     async with daytona_sdk.AsyncDaytona() as daytona:
         print(f"Testing {len(instance_indices)} instance(s)...")
         print("=" * 60)
 
-        for idx in instance_indices:
-            if 0 <= idx < len(instances):
-                await run_tests(daytona, instances[idx])
+        if use_pbar:
+            pbar = tqdm(total=len(instance_indices), desc="instances")
+        else:
+            pbar = None
+        try:
+            if parallel:
+                for future in asyncio.as_completed(
+                    run_tests(daytona, instances[idx], logging)
+                    for idx in instance_indices
+                ):
+                    try:
+                        await future
+                    except Exception as e:
+                        if print_exceptions:
+                            print(e if str(e) else type(e))
+                            if logging == "on-error":
+                                print("\n" + "=" * 60)
+                        else:
+                            raise e
+                    finally:
+                        if pbar:
+                            pbar.update(1)
+                        if logging == "as-you-go" or logging == "on-exit":
+                            print("\n" + "=" * 60)
             else:
-                print(
-                    f"\nError: Instance index {idx} is out of range (0-{len(instances)-1})"
-                )
-            print("\n" + "=" * 60)
+                for idx in instance_indices:
+                    await run_tests(daytona, instances[idx], logging)
+                    if logging == "as-you-go" or logging == "on-exit":
+                        print("\n" + "=" * 60)
+        finally:
+            if pbar:
+                pbar.close()
 
 
 def main() -> None:
@@ -371,6 +447,19 @@ def main() -> None:
     parser.add_argument(
         "--list", action="store_true", help="List all available instances"
     )
+    parser.add_argument(
+        "--logging",
+        choices=["as-you-go", "on-exit", "on-error", "none"],
+        default="as-you-go",
+        help="Logging mode (default: as-you-go)",
+    )
+    parser.add_argument("--parallel", action="store_true", help="Run tests in parallel")
+    parser.add_argument(
+        "--print-exceptions",
+        action="store_true",
+        help="Print exceptions instead of raising them (only applies with --parallel)",
+    )
+    parser.add_argument("--use-pbar", action="store_true", help="Use progress bar")
 
     args = parser.parse_args()
 
@@ -387,7 +476,15 @@ def main() -> None:
     else:
         indices = [0, 1, 2]  # Default to first 3
 
-    asyncio.run(test_instances(indices))
+    asyncio.run(
+        test_instances(
+            indices,
+            logging=args.logging,
+            parallel=args.parallel,
+            print_exceptions=args.print_exceptions,
+            use_pbar=args.use_pbar,
+        )
+    )
 
 
 if __name__ == "__main__":
