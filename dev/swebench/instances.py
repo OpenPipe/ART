@@ -79,6 +79,11 @@ def get_filtered_swe_smith_instances_df() -> pl.DataFrame:
                     "pandas-dev__pandas.95280573.pr_57116",
                     "pandas-dev__pandas.95280573.combine_module__bwhtr1n5",
                     "pandas-dev__pandas.95280573.combine_file__i3dkumyn",
+                    "pandas-dev__pandas.95280573.lm_rewrite__36dwchy4",
+                    "pandas-dev__pandas.95280573.pr_57174",
+                    # pypika: no tests collected (same issue as other pypika instances)
+                    "kayak__pypika.1c9646f0.lm_rewrite__nqk3tt63",
+                    "kayak__pypika.1c9646f0.lm_rewrite__ddbee9oz",
                 ]
             )
         )
