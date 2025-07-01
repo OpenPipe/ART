@@ -423,6 +423,9 @@ async def test_instances(
 ) -> None:
     """Test specified instances"""
     async with daytona_sdk.AsyncDaytona() as daytona:
+        if sandboxes := await daytona.list():
+            print(f"Deleting {len(sandboxes)} running sandboxes...")
+            await asyncio.gather(*[sandbox.delete() for sandbox in sandboxes])
         print(f"Testing {len(instance_indices)} instance(s)...")
         print("=" * 60)
 

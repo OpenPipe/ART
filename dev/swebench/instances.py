@@ -60,6 +60,12 @@ def get_filtered_swe_smith_instances_df() -> pl.DataFrame:
                 ]
             )
         )
+        .filter(
+            ~pl.col("instance_id")
+            .cast(pl.Utf8)
+            .str.to_lowercase()
+            .is_in(["dask__dask.5f61e423.pr_10746"])
+        )
         .with_columns(
             base_commit=pl.col("instance_id"),
             image_name="jyangballin/"
