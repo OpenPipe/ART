@@ -1204,6 +1204,64 @@ wheels = [
 ]
 
 [[package]]
+name = "daytona-api-client"
+version = "0.21.0"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "pydantic" },
+    { name = "python-dateutil" },
+    { name = "typing-extensions" },
+    { name = "urllib3" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/86/d1/2fbc8178e1a8293bb28c0f3bb5f464e517e0065a1bbafd75ab840903d4fc/daytona_api_client-0.21.0.tar.gz", hash = "sha256:92d591c5a1750a827b5850425ce483441609b72b05d35a618d5353fbbba50bca", size = 82421, upload-time = "2025-06-15T10:00:33.894Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/9c/46/47c01c620cc367be7be8f0f6aa7840092e80b66a9819d5edc155cd763ccc/daytona_api_client-0.21.0-py3-none-any.whl", hash = "sha256:a8ff1f0fb397368dbd6ddb224c28d679e599c657eab2ec5821cf0c972a60229a", size = 212750, upload-time = "2025-06-15T10:00:32.47Z" },
+]
+
+[[package]]
+name = "daytona-api-client-async"
+version = "0.21.0"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "aiohttp" },
+    { name = "aiohttp-retry" },
+    { name = "pydantic" },
+    { name = "python-dateutil" },
+    { name = "typing-extensions" },
+    { name = "urllib3" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/8b/84/36736853d633fac2dfed5324f25f454e77649d81824ab13a3528e1c6fb84/daytona_api_client_async-0.21.0.tar.gz", hash = "sha256:08a22c0d1616f82efa8d157d7be6c432554fd43d75560725c4e0cef0228607d6", size = 83534, upload-time = "2025-06-15T10:00:56.158Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/d7/43/1f8e9b55b65070093b090b3f7d3a7984328a24f31749c076926d9cbb029e/daytona_api_client_async-0.21.0-py3-none-any.whl", hash = "sha256:f5731963d0dd6c1e207b92bdc7f5b59952d3365444bc9dc8b013d77a4dddf377", size = 215632, upload-time = "2025-06-15T10:00:54.81Z" },
+]
+
+[[package]]
+name = "daytona-sdk"
+version = "0.21.5"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "aioboto3" },
+    { name = "aiofiles" },
+    { name = "aiohttp" },
+    { name = "aiohttp-retry" },
+    { name = "boto3" },
+    { name = "daytona-api-client" },
+    { name = "daytona-api-client-async" },
+    { name = "deprecated" },
+    { name = "environs" },
+    { name = "httpx" },
+    { name = "marshmallow" },
+    { name = "pydantic" },
+    { name = "python-dateutil" },
+    { name = "toml" },
+    { name = "urllib3" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/56/ce/6f58763b71ba0a046b26968c6e5c2c9eb1d8b81ab84c69cae611d3bf4f59/daytona_sdk-0.21.5.tar.gz", hash = "sha256:4a845674c18b682e90617c86391d8019359f0c133f987649afe787b47fe89f5c", size = 87361, upload-time = "2025-06-30T10:36:36.458Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/62/b2/a451c1eb65413e04d0eab2d210b2cbf4f4e1717a786c35f559457f57ae2e/daytona_sdk-0.21.5-py3-none-any.whl", hash = "sha256:2465e6cbb0e381eec88c3e2280d5857ca19204951d8e83e9e7a12a7aa2a7fea0", size = 106140, upload-time = "2025-06-30T10:36:34.043Z" },
+]
+
+[[package]]
 name = "debugpy"
 version = "1.8.14"
 source = { registry = "https://pypi.org/simple" }
@@ -1387,6 +1445,19 @@ source = { registry = "https://pypi.org/simple" }
 sdist = { url = "https://files.pythonhosted.org/packages/cb/7d/01cddcbb6f5cc0ba72e00ddf9b1fa206c802d557fd0a20b18e130edf1336/emoji-2.14.1.tar.gz", hash = "sha256:f8c50043d79a2c1410ebfae833ae1868d5941a67a6cd4d18377e2eb0bd79346b", size = 597182, upload-time = "2025-01-16T06:31:24.983Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/91/db/a0335710caaa6d0aebdaa65ad4df789c15d89b7babd9a30277838a7d9aac/emoji-2.14.1-py3-none-any.whl", hash = "sha256:35a8a486c1460addb1499e3bf7929d3889b2e2841a57401903699fef595e942b", size = 590617, upload-time = "2025-01-16T06:31:23.526Z" },
+]
+
+[[package]]
+name = "environs"
+version = "9.5.0"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "marshmallow" },
+    { name = "python-dotenv" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/d4/e3/c3c6c76f3dbe3e019e9a451b35bf9f44690026a5bb1232f7b77097b72ff5/environs-9.5.0.tar.gz", hash = "sha256:a76307b36fbe856bdca7ee9161e6c466fd7fcffc297109a118c59b54e27e30c9", size = 20795, upload-time = "2022-01-30T18:07:56.251Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/ca/5e/f0f217dc393372681bfe05c50f06a212e78d0a3fee907a74ab451ec1dcdb/environs-9.5.0-py2.py3-none-any.whl", hash = "sha256:1e549569a3de49c05f856f40bce86979e7d5ffbbc4398e7f338574c220189124", size = 12548, upload-time = "2022-01-30T18:07:54.874Z" },
 ]
 
 [[package]]
@@ -3039,6 +3110,18 @@ wheels = [
 ]
 
 [[package]]
+name = "marshmallow"
+version = "3.26.1"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "packaging" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/ab/5e/5e53d26b42ab75491cda89b871dab9e97c840bf12c63ec58a1919710cd06/marshmallow-3.26.1.tar.gz", hash = "sha256:e6d8affb6cb61d39d26402096dc0aee12d5a26d490a121f118d2e81dc0719dc6", size = 221825, upload-time = "2025-02-03T15:32:25.093Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/34/75/51952c7b2d3873b44a0028b1bd26a25078c18f92f256608e8d1dc61b39fd/marshmallow-3.26.1-py3-none-any.whl", hash = "sha256:3350409f20a70a7e4e11a27661187b77cdcaeb20abca41c1454fe33636bea09c", size = 50878, upload-time = "2025-02-03T15:32:22.295Z" },
+]
+
+[[package]]
 name = "matplotlib"
 version = "3.10.3"
 source = { registry = "https://pypi.org/simple" }
@@ -3881,6 +3964,7 @@ dependencies = [
 [package.optional-dependencies]
 swebench = [
     { name = "aiolimiter" },
+    { name = "daytona-sdk" },
     { name = "langfuse" },
     { name = "modal" },
     { name = "sweagent" },
@@ -3894,7 +3978,7 @@ dev = [
     { name = "ipykernel" },
     { name = "ipywidgets" },
     { name = "openpipe" },
-    { name = "skypilot", extra = ["aws", "cudo", "do", "gcp", "lambda", "runpod"] },
+    { name = "skypilot", extra = ["cudo", "do", "gcp", "lambda", "runpod"] },
 ]
 
 [package.metadata]
@@ -3902,6 +3986,7 @@ requires-dist = [
     { name = "aiolimiter", marker = "extra == 'swebench'", specifier = ">=1.2.1" },
     { name = "awscli", specifier = ">=1.38.1" },
     { name = "bitsandbytes", marker = "sys_platform == 'linux'", specifier = ">=0.45.2" },
+    { name = "daytona-sdk", marker = "extra == 'swebench'", specifier = ">=0.21.5" },
     { name = "hf-xet", specifier = ">=1.1.0" },
     { name = "langfuse", marker = "extra == 'swebench'", specifier = ">=2.60.7" },
     { name = "litellm", specifier = ">=1.63.0" },
@@ -3937,7 +4022,7 @@ dev = [
     { name = "ipykernel", specifier = ">=6.29.5" },
     { name = "ipywidgets", specifier = ">=8.1.5" },
     { name = "openpipe", specifier = ">=4.49.0" },
-    { name = "skypilot", extras = ["aws", "cudo", "do", "fluidstack", "gcp", "lambda", "paperspace", "runpod"], specifier = "==0.8.0" },
+    { name = "skypilot", extras = ["cudo", "do", "fluidstack", "gcp", "lambda", "paperspace", "runpod"], specifier = "==0.8.0" },
 ]
 
 [[package]]
@@ -6149,13 +6234,6 @@ wheels = [
 ]
 
 [package.optional-dependencies]
-aws = [
-    { name = "awscli" },
-    { name = "boto3" },
-    { name = "botocore" },
-    { name = "colorama" },
-    { name = "urllib3" },
-]
 cudo = [
     { name = "cudo-compute" },
 ]
@@ -7034,11 +7112,11 @@ wheels = [
 
 [[package]]
 name = "urllib3"
-version = "1.26.20"
+version = "2.5.0"
 source = { registry = "https://pypi.org/simple" }
-sdist = { url = "https://files.pythonhosted.org/packages/e4/e8/6ff5e6bc22095cfc59b6ea711b687e2b7ed4bdb373f7eeec370a97d7392f/urllib3-1.26.20.tar.gz", hash = "sha256:40c2dc0c681e47eb8f90e7e27bf6ff7df2e677421fd46756da1161c39ca70d32", size = 307380, upload-time = "2024-08-29T15:43:11.37Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/15/22/9ee70a2574a4f4599c47dd506532914ce044817c7752a79b6a51286319bc/urllib3-2.5.0.tar.gz", hash = "sha256:3fc47733c7e419d4bc3f6b3dc2b4f890bb743906a30d56ba4a5bfa4bbff92760", size = 393185, upload-time = "2025-06-18T14:07:41.644Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/33/cf/8435d5a7159e2a9c83a95896ed596f68cf798005fe107cc655b5c5c14704/urllib3-1.26.20-py2.py3-none-any.whl", hash = "sha256:0ed14ccfbf1c30a9072c7ca157e4319b70d65f623e91e7b32fadb2853431016e", size = 144225, upload-time = "2024-08-29T15:43:08.921Z" },
+    { url = "https://files.pythonhosted.org/packages/a7/c2/fe1e52489ae3122415c51f387e221dd0773709bad6c6cdaa599e8a2c5185/urllib3-2.5.0-py3-none-any.whl", hash = "sha256:e6b01673c0fa6a13e374b50871808eb3bf7046c4b125b216f6bf1cc604cff0dc", size = 129795, upload-time = "2025-06-18T14:07:40.39Z" },
 ]
 
 [[package]]
