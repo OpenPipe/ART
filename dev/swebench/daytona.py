@@ -258,6 +258,7 @@ async def run_tests(
     daytona: daytona_sdk.AsyncDaytona,
     instance: Instance,
     logging: Logging = "as-you-go",
+    index: int = -1,
 ) -> None:
     """Run tests for a SWE-bench instance.
 
@@ -270,7 +271,7 @@ async def run_tests(
         daytona_sdk.CreateSandboxFromImageParams(image=instance["image_name"])
     )
     try:
-        logger.log(f"\n=== {instance['instance_id']} ===")
+        logger.log(f"\n=== [{index}] {instance['instance_id']} ===")
 
         # Apply patch to introduce the bug
         await write_file_chunked(sandbox, instance["patch"], "/tmp/patch.txt")
@@ -426,13 +427,18 @@ async def test_instances(
         print("=" * 60)
 
         if use_pbar:
-            pbar = tqdm(total=len(instance_indices), desc="instances")
+            pbar = tqdm(
+                total=len(instance_indices),
+                desc="instances",
+                postfix={"indices": f"{min(instance_indices)}-{max(instance_indices)}"},
+            )
         else:
             pbar = None
 
         try:
             coros = [
-                run_tests(daytona, instances[idx], logging) for idx in instance_indices
+                run_tests(daytona, instances[idx], logging, idx)
+                for idx in instance_indices
             ]
             for awaitable in asyncio.as_completed(coros) if parallel else coros:
                 try:
@@ -454,12 +460,56 @@ async def test_instances(
                 pbar.close()
 
 
+def parse_indices(index_args: list[str]) -> list[int]:
+    """Parse index arguments which can be individual numbers or ranges.
+
+    Args:
+        index_args: List of strings like ["0", "5-10", "15"]
+
+    Returns:
+        List of individual indices
+
+    Examples:
+        >>> parse_indices(["0", "5-10", "15"])
+        [0, 5, 6, 7, 8, 9, 10, 15]
+    """
+    indices = []
+    for arg in index_args:
+        if "-" in arg:
+            # Parse range
+            parts = arg.split("-")
+            if len(parts) == 2:
+                try:
+                    start = int(parts[0])
+                    end = int(parts[1])
+                    if start <= end:
+                        indices.extend(range(start, end + 1))
+                    else:
+                        raise ValueError(f"Invalid range: {arg} (start > end)")
+                except ValueError as e:
+                    raise ValueError(f"Invalid range format: {arg}") from e
+            else:
+                raise ValueError(f"Invalid range format: {arg}")
+        else:
+            # Parse individual index
+            try:
+                indices.append(int(arg))
+            except ValueError:
+                raise ValueError(f"Invalid index: {arg}")
+
+    # Remove duplicates and sort
+    return sorted(set(indices))
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         description="Run SWE-bench tests on specified instances"
     )
     parser.add_argument(
-        "indices", nargs="*", type=int, help="Instance indices to test (default: 0 1 2)"
+        "indices",
+        nargs="*",
+        type=str,
+        help="Instance indices to test (e.g., '0 5-10 15', default: 0 1 2)",
     )
     parser.add_argument("--all", action="store_true", help="Test all instances")
     parser.add_argument(
@@ -490,7 +540,7 @@ def main() -> None:
     if args.all:
         indices = list(range(len(instances)))
     elif args.indices:
-        indices = args.indices
+        indices = parse_indices(args.indices)
     else:
         indices = [0, 1, 2]  # Default to first 3
 
