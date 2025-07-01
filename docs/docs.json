@@ -68,7 +68,7 @@
       {
         "group": "Resources",
         "pages": [
-          "getting-started/models",
+          "resources/models",
           "resources/glossary"
         ]
       }
