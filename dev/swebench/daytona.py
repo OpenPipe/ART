@@ -311,6 +311,35 @@ async def run_tests(
                 cwd="/testbed",
             )
 
+            # Check for missing pytest plugins
+            if "Missing required plugins:" in result.result:
+                plugin_line = [
+                    line
+                    for line in result.result.split("\n")
+                    if "Missing required plugins:" in line
+                ]
+                if plugin_line and attempt < max_retries - 1:
+                    # Extract plugin names
+                    plugins_str = (
+                        plugin_line[0].split("Missing required plugins:")[1].strip()
+                    )
+                    plugins = [p.strip() for p in plugins_str.split(",")]
+                    logger.log(
+                        f"  Missing pytest plugins detected: {', '.join(plugins)}"
+                    )
+                    logger.log("  Installing missing plugins...")
+
+                    # Install the plugins
+                    for plugin in plugins:
+                        await sandbox.process.exec(
+                            f"{uv_cmd} pip install -q {plugin}", cwd="/testbed"
+                        )
+
+                    logger.log(
+                        f"  Retrying tests (attempt {attempt + 2}/{max_retries})..."
+                    )
+                    continue
+
             # Check for import errors
             if "ModuleNotFoundError" in result.result or "ImportError" in result.result:
                 # Extract missing module names from both test execution and collection errors
@@ -340,6 +369,61 @@ async def run_tests(
         logger.log(f"Exit code: {result.exit_code}")
 
         output = result.result
+
+        # Handle conftest loading errors with recursive dependency installation
+        conftest_retry_count = 0
+        max_conftest_retries = 5
+
+        while (
+            "ImportError while loading conftest" in output
+            and conftest_retry_count < max_conftest_retries
+        ):
+            # Extract package suggestions from error message
+            if "pip install" in output:
+                # Look for patterns like "pip install sunpy[timeseries]" or "pip install sunpy[all]"
+                install_suggestions = []
+                for line in output.split("\n"):
+                    if "pip install" in line:
+                        # Extract the package[extras] pattern
+                        import re
+
+                        matches = re.findall(
+                            r"pip install\s+`?([^\s`]+(?:\[[^\]]+\])?)`?", line
+                        )
+                        install_suggestions.extend(matches)
+
+                if install_suggestions:
+                    logger.log(
+                        f"  Conftest loading error (attempt {conftest_retry_count + 1}/{max_conftest_retries}) - trying: {', '.join(install_suggestions[:2])}"
+                    )
+
+                    # Try the first suggestion (usually the specific one)
+                    installed_any = False
+                    for suggestion in install_suggestions[:1]:
+                        install_res = await sandbox.process.exec(
+                            f"{uv_cmd} pip install -q '{suggestion}'", cwd="/testbed"
+                        )
+                        if install_res.exit_code == 0:
+                            logger.log(f"  Installed {suggestion}")
+                            installed_any = True
+                            break
+
+                    if installed_any:
+                        # Retry tests after installing optional dependencies
+                        logger.log(
+                            "  Retrying tests after installing optional dependencies..."
+                        )
+                        result = await sandbox.process.exec(
+                            "cat /tmp/tests.txt | xargs -d '\n' python -m pytest -v -o addopts= --tb=short",
+                            cwd="/testbed",
+                        )
+                        output = result.result
+                        conftest_retry_count += 1
+                        continue
+
+            # No more suggestions found or installation failed
+            break
+
         results = analyze_test_results(output, instance)
 
         logger.log(f"Failed: {results['failed']}")
@@ -351,7 +435,62 @@ async def run_tests(
         logger.log(f"FAIL_TO_PASS tests ({results['fail_to_pass_count']}): Should fail")
         logger.log(f"PASS_TO_PASS tests ({results['pass_to_pass_count']}): Should pass")
 
-        if results["is_expected"]:
+        # Check if any tests actually ran (diagnostic addition)
+        total_tests_ran = results["failed"] + results["passed"] + results["errors"]
+        if total_tests_ran == 0 and (
+            results["fail_to_pass_count"] > 0 or results["pass_to_pass_count"] > 0
+        ):
+            # No tests ran at all
+            logger.log("⚠️  WARNING: No tests were executed!")
+            logger.log("\nPossible issues:")
+            logger.log("  - Test paths may be incorrect")
+            logger.log("  - Tests may require special setup or configuration")
+            logger.log("  - The test collection mechanism may be incompatible")
+
+            # Additional diagnostics to understand why tests didn't run
+            if output:
+                # Check for common pytest collection errors
+                if "collected 0 items" in output:
+                    logger.log(
+                        "\nPytest collected 0 items - checking test file existence..."
+                    )
+                    # Check if test files exist
+                    sample_tests = (
+                        instance["FAIL_TO_PASS"] + instance["PASS_TO_PASS"]
+                    )[:3]
+                    for test_path in sample_tests:
+                        test_file = (
+                            test_path.split("::")[0] if "::" in test_path else test_path
+                        )
+                        check_result = await sandbox.process.exec(
+                            f"test -f {test_file} && echo 'exists' || echo 'not found'",
+                            cwd="/testbed",
+                        )
+                        logger.log(f"  {test_file}: {check_result.result.strip()}")
+
+                # Look for other pytest errors
+                if "INTERNALERROR>" in output:
+                    logger.log("\nPytest internal error detected")
+                    internal_error_lines = [
+                        line for line in output.split("\n") if "INTERNALERROR>" in line
+                    ][:3]
+                    for line in internal_error_lines:
+                        logger.log(f"  {line.strip()}")
+
+                # Check for configuration issues
+                if (
+                    "pytest.ini" in output
+                    or "setup.cfg" in output
+                    or "pyproject.toml" in output
+                ):
+                    logger.log("\nPossible pytest configuration issue detected")
+
+            # Add this instance to potential blacklist candidates
+            error_msg = f"No tests executed for {instance['instance_id']}\n"
+            error_msg += f"Expected to run {results['fail_to_pass_count'] + results['pass_to_pass_count']} tests\n"
+            error_msg += "This instance may need to be blacklisted if the issue cannot be resolved."
+            assert False, error_msg
+        elif results["is_expected"]:
             logger.log("✓ Tests are failing as expected")
         else:
             logger.log("⚠️  Unexpected test results")
