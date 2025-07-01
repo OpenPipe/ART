@@ -378,7 +378,30 @@ async def run_tests(
                     for line in error_details:
                         logger.log(f"  {line.strip()}")
 
-        logger.log(f"\n{'✅' if results['is_expected'] else '⚠️ '} Ready for agent")
+        if not results["is_expected"]:
+            error_msg = f"Tests are not failing as expected!\n"
+            error_msg += f"\nExpected behavior:\n"
+            if results["fail_to_pass_count"] > 0:
+                error_msg += f"  - {results['fail_to_pass_count']} FAIL_TO_PASS tests should fail (have failures/errors)\n"
+            else:
+                error_msg += f"  - No FAIL_TO_PASS tests, so there should be no failures/errors\n"
+
+            error_msg += f"\nActual results:\n"
+            error_msg += f"  - Failed: {results['failed']}\n"
+            error_msg += f"  - Errors: {results['errors']}\n"
+            error_msg += f"  - Total issues: {results['total_issues']}\n"
+
+            error_msg += f"\nProblem:\n"
+            if results["fail_to_pass_count"] > 0 and results["total_issues"] == 0:
+                error_msg += f"  - Expected {results['fail_to_pass_count']} tests to fail after patch, but all tests are passing!\n"
+                error_msg += f"  - This likely means the patch didn't introduce the expected bug.\n"
+            elif results["fail_to_pass_count"] == 0 and results["total_issues"] > 0:
+                error_msg += f"  - Expected no failures (no FAIL_TO_PASS tests), but got {results['total_issues']} failures/errors!\n"
+                error_msg += f"  - This might indicate issues with the test setup or dependencies.\n"
+
+            assert False, error_msg
+
+        logger.log("✅ Ready for agent")
 
     except Exception as e:
         if logging == "on-error":
@@ -406,29 +429,24 @@ async def test_instances(
             pbar = tqdm(total=len(instance_indices), desc="instances")
         else:
             pbar = None
+
         try:
-            if parallel:
-                for future in asyncio.as_completed(
-                    run_tests(daytona, instances[idx], logging)
-                    for idx in instance_indices
-                ):
-                    try:
-                        await future
-                    except Exception as e:
-                        if print_exceptions:
-                            print(e if str(e) else type(e))
-                            if logging == "on-error":
-                                print("\n" + "=" * 60)
-                        else:
-                            raise e
-                    finally:
-                        if pbar:
-                            pbar.update(1)
-                        if logging == "as-you-go" or logging == "on-exit":
+            coros = [
+                run_tests(daytona, instances[idx], logging) for idx in instance_indices
+            ]
+            for awaitable in asyncio.as_completed(coros) if parallel else coros:
+                try:
+                    await awaitable
+                except Exception as e:
+                    if print_exceptions:
+                        print(e if str(e) else type(e))
+                        if logging == "on-error":
                             print("\n" + "=" * 60)
-            else:
-                for idx in instance_indices:
-                    await run_tests(daytona, instances[idx], logging)
+                    else:
+                        raise e
+                finally:
+                    if pbar:
+                        pbar.update(1)
                     if logging == "as-you-go" or logging == "on-exit":
                         print("\n" + "=" * 60)
         finally:
@@ -457,7 +475,7 @@ def main() -> None:
     parser.add_argument(
         "--print-exceptions",
         action="store_true",
-        help="Print exceptions instead of raising them (only applies with --parallel)",
+        help="Print exceptions instead of raising them",
     )
     parser.add_argument("--use-pbar", action="store_true", help="Use progress bar")
 
