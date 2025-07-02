@@ -56,7 +56,7 @@
         "pages": [
           "fundamentals/training-loop",
           "fundamentals/art-client",
-          "fundamentals/art-server"
+          "fundamentals/art-backend"
         ]
       },
       {
