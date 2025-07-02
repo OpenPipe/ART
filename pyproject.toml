@@ -14,7 +14,7 @@ dependencies = [
     "torchao>=0.9.0",
     "unsloth==2025.6.12 ; sys_platform == 'linux'",
     "unsloth-zoo==2025.6.8 ; sys_platform == 'linux'",
-    "vllm>=0.9.0",
+    "vllm==0.9.1 ; sys_platform == 'linux'",
     "wandb>=0.19.8",
     "weave>=0.51.51",
     "peft>=0.14.0",
