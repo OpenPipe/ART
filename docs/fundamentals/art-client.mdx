@@ -93,7 +93,7 @@ messages: art.Messages = [
         "content": "..."
     }
 ]
-chat_completion = await client.chat.completions.create(
+chat_completion = await openai_client.chat.completions.create(
     messages=messages,
     model=model.name,
     max_tokens=100,
@@ -147,7 +147,7 @@ async def rollout(model: art.Model, scenario: Scenario) -> art.Trajectory:
     )
 
     # generate a completion using the client
-    chat_completion = await client.chat.completions.create(
+    chat_completion = await openai_client.chat.completions.create(
         messages=trajectory.messages(), model=model.name
     )
     choice = chat_completion.choices[0]
@@ -168,7 +168,7 @@ async def train(): # train for 50 steps
         # Trajectories produced using the same training scenario are automatically grouped
         train_groups = await art.gather_trajectory_groups(
             (
-                art.TrajectoryGroup(rollout(openai_client, scenario) for _ in range(8))
+                art.TrajectoryGroup(rollout(model, scenario) for _ in range(8))
                 for scenario in scenarios
             ),
             pbar_desc="gather",

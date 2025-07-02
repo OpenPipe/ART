@@ -65,10 +65,10 @@ backend = LocalBackend(
 
 When a `SkyPilotBackend` instance is initialized, it does a few things:
 
-- Provision a remote machine with an advanced GPU (by default on RunPod)
-- Install `openpipe-art` and its dependencies
-- Initialize a `LocalBackend` instance with vLLM and a training server (unsloth or torchtune)
-- Register the `LocalBackend` instance to forward requests to it over http
+- Provisions a remote machine with an advanced GPU (by default on RunPod)
+- Installs `openpipe-art` and its dependencies
+- Initializes a `LocalBackend` instance with vLLM and a training server (unsloth or torchtune)
+- Registers the `LocalBackend` instance to forward requests to it over http
 
 To initialize a `SkyPilotBackend` instance, follow the code sample below:
 
