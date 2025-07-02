@@ -40,7 +40,10 @@ The ART client can also be run locally and connected to a remote server, which A
 from art import TrainableModel, gather_trajectory_groups
 from art.skypilot.backend import SkyPilotBackend
 
-backend = SkyPilotBackend()
+backend = await SkyPilotBackend.initialize_cluster(
+    cluster_name: "my-cluster",
+    gpu="H100"
+)
 
 model = TrainableModel(
     model_name="deepseek-r1-distill-qwen-32b",
