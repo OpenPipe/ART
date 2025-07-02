@@ -3857,9 +3857,10 @@ wheels = [
 
 [[package]]
 name = "openpipe-art"
-version = "0.3.12"
+version = "0.3.13"
 source = { editable = "." }
 dependencies = [
+    { name = "accelerate" },
     { name = "awscli" },
     { name = "bitsandbytes", marker = "sys_platform == 'linux'" },
     { name = "hf-xet" },
@@ -3909,6 +3910,7 @@ dev = [
 
 [package.metadata]
 requires-dist = [
+    { name = "accelerate", specifier = "==1.7.0" },
     { name = "aiolimiter", marker = "extra == 'swebench'", specifier = ">=1.2.1" },
     { name = "awscli", specifier = ">=1.38.1" },
     { name = "bitsandbytes", marker = "sys_platform == 'linux'", specifier = ">=0.45.2" },
