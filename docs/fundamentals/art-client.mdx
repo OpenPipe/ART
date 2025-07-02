@@ -49,8 +49,13 @@ The client that you'll use to generate tokens and train your model is initialize
 import art
 
 model = art.TrainableModel(
+    # the name of your model as it will appear in W&B
+    # and other observability platforms
     name="agent-001",
+    # keep your project name constant between all the models you train
+    # for a given task to consistently group metrics
     project="my-agentic-task",
+    # the model that you want to train from
     base_model="Qwen/Qwen2.5-14B-Instruct",
 )
 ```
