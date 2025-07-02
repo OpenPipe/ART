@@ -40,3 +40,26 @@ a[href^="https://mintlify.com/preview-request"]
   border-left: none;
   padding-left: 8px !important;
 }
+
+/* Responsive card container */
+.cards-container {
+  display: flex;
+  gap: 1rem;
+  justify-content: space-between;
+}
+
+.card-wrapper {
+  width: 50%;
+}
+
+/* Single column layout for screens smaller than 1000px */
+@media (max-width: 999px) {
+  .cards-container {
+    flex-direction: column;
+    gap: 0;
+  }
+
+  .card-wrapper {
+    width: 100%;
+  }
+}

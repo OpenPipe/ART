@@ -23,8 +23,9 @@ from art.local.backend import LocalBackend
 backend = LocalBackend()
 
 model = TrainableModel(
-    model_name="deepseek-r1-distill-qwen-32b",
-    model_type="deepseek",
+    name="agent-001",
+    project="my-agentic-task",
+    base_model="Qwen/Qwen2.5-14B-Instruct",
 )
 
 await model.register(backend)
@@ -46,11 +47,40 @@ backend = await SkyPilotBackend.initialize_cluster(
 )
 
 model = TrainableModel(
-    model_name="deepseek-r1-distill-qwen-32b",
-    model_type="deepseek",
+    name="agent-001",
+    project="my-agentic-task",
+    base_model="Qwen/Qwen2.5-14B-Instruct",
 )
 
 await model.register(backend)
 
 ... the rest of your code ...
 ```
+
+To learn more about the ART client and server, see the docs below.
+
+<div className="cards-container">
+  <div className="card-wrapper">
+    <Card
+      title="ART Client"
+      icon="laptop-code"
+      href="/fundamentals/art-client"
+      horizontal={true}
+      arrow={true}
+    >
+      The client is responsible for interfacing between your code and the ART
+      backend.
+    </Card>
+  </div>
+  <div className="card-wrapper">
+    <Card
+      title="ART Backend"
+      icon="server"
+      href="/fundamentals/art-backend"
+      horizontal={true}
+      arrow={true}
+    >
+      The backend is responsible for generating tokens and training your models.
+    </Card>
+  </div>
+</div>

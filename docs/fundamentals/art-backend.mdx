@@ -8,12 +8,8 @@ ART divides the logic for training an agent into two distinct abstractions. The 
 
 While the backend's training and inference settings are highly configurable, they're also set up to use **intelligent defaults** that save beginners time while getting started. However, there are a few important considerations to take before running your first training job.
 
-<div style={{ display: "flex", gap: "1rem", justifyContent: "space-between" }}>
-  <div
-    style={{
-      width: "50%",
-    }}
-  >
+<div className="cards-container">
+  <div className="card-wrapper">
     <Card
       title="LocalBackend"
       icon="laptop-code"
@@ -22,11 +18,7 @@ While the backend's training and inference settings are highly configurable, the
       arrow={true}
     ></Card>
   </div>
-  <div
-    style={{
-      width: "50%",
-    }}
-  >
+  <div className="card-wrapper">
     <Card
       title="SkyPilotBackend"
       icon="cloud"
@@ -138,12 +130,8 @@ if not LOCAL:
 
 To see `LocalBackend` and `SkyPilotBackend` in action, try the examples below.
 
-<div style={{ display: "flex", gap: "1rem", justifyContent: "space-between" }}>
-  <div
-    style={{
-      width: "50%",
-    }}
-  >
+<div className="cards-container">
+  <div className="card-wrapper">
     <Card
       title="2048 Notebook"
       icon="laptop-code"
@@ -154,11 +142,7 @@ To see `LocalBackend` and `SkyPilotBackend` in action, try the examples below.
       Use LocalBackend to train an agent to play 2048.
     </Card>
   </div>
-  <div
-    style={{
-      width: "50%",
-    }}
-  >
+  <div className="card-wrapper">
     <Card
       title="Summarizer"
       icon="cloud"

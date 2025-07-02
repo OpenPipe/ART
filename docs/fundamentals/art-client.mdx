@@ -8,12 +8,8 @@ One of ART's primary goals is to minimize the amount of setup necessary to begin
 
 If you're curious about how ART allows you to run training and inference either remotely or locally depending on your development machine, check out the backend docs below. Otherwise, let's dive deeper into the client!
 
-<div style={{ display: "flex", gap: "1rem", justifyContent: "space-between" }}>
-  <div
-    style={{
-      width: "50%",
-    }}
-  >
+<div className="cards-container">
+  <div className="card-wrapper">
     <Card
       title="LocalBackend"
       icon="laptop-code"
@@ -24,11 +20,7 @@ If you're curious about how ART allows you to run training and inference either 
       Run training and inference on your local machine.
     </Card>
   </div>
-  <div
-    style={{
-      width: "50%",
-    }}
-  >
+  <div className="card-wrapper">
     <Card
       title="SkyPilotBackend"
       icon="cloud"
@@ -192,12 +184,8 @@ async def train(): # train for 50 steps
 
 To see the ART client and backend working together in action, check out our Summarizer tutorial or one of the notebooks! If you have questions on how to integrate the ART client into your own codebase, please ask in the [Discord](https://discord.com/channels/1359674493949448375/1359674622965973185)!
 
-<div style={{ display: "flex", gap: "1rem", justifyContent: "space-between" }}>
-  <div
-    style={{
-      width: "50%",
-    }}
-  >
+<div className="cards-container">
+  <div className="card-wrapper">
     <Card
       title="Summarizer Tutorial"
       icon="list"
@@ -208,11 +196,7 @@ To see the ART client and backend working together in action, check out our Summ
       Teach a summarizer agent to outperform Sonnet 4.
     </Card>
   </div>
-  <div
-    style={{
-      width: "50%",
-    }}
-  >
+  <div className="card-wrapper">
     <Card
       title="Notebooks"
       icon="book"
