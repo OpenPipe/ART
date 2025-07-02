@@ -121,7 +121,7 @@ if LOCAL:
 else:
     from art.skypilot import SkyPilotBackend
     backend = await SkyPilotBackend.initialize_cluster(
-        cluster_name: "my-cluster",
+        cluster_name="my-cluster",
         gpu="H100"
     )
 
