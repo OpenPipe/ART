@@ -143,16 +143,18 @@ def get_compute_loss_fn(trainer: "GRPOTrainer") -> Callable[..., torch.Tensor]:
         kl_div = kl_div * weights * assistant_mask
         mean_policy_loss = policy_loss.sum() / (assistant_mask.sum() + 1e-6)
         mean_kl = kl_div.sum() / (assistant_mask.sum() + 1e-6)
-        
+
         # Compute mean entropy for the current step
         shifted_entropies = shift_tensor(entropies, 0.0)
-        mean_entropy = (shifted_entropies * weights * assistant_mask).sum() / (assistant_mask.sum() + 1e-6)
+        mean_entropy = (shifted_entropies * weights * assistant_mask).sum() / (
+            assistant_mask.sum() + 1e-6
+        )
 
-        trainer._metrics["learning_rate"].append(config.learning_rate)
-        trainer._metrics["policy_loss"].append(mean_policy_loss.item())
-        trainer._metrics["entropy"].append(mean_entropy.item())
+        trainer._metrics["train"]["learning_rate"].append(config.learning_rate)
+        trainer._metrics["train"]["policy_loss"].append(mean_policy_loss.item())
+        trainer._metrics["train"]["entropy"].append(mean_entropy.item())  # type: ignore
         if config.beta > 0.0:
-            trainer._metrics["kl_div"].append(mean_kl.item())
+            trainer._metrics["train"]["kl_div"].append(mean_kl.item())
         return mean_policy_loss + config.beta * mean_kl
 
     return compute_loss
@@ -163,7 +165,7 @@ def get_log_fn(
 ) -> Callable[..., None]:
     def log(logs: dict[str, float], start_time: float | None = None) -> None:
         metrics = {
-            key: sum(val) / len(val) for key, val in trainer._metrics.items()
+            key: sum(val) / len(val) for key, val in trainer._metrics["train"].items()
         }  # average the metrics
 
         # This method can be called both in training and evaluation. When called in evaluation, the keys in `logs`
@@ -174,7 +176,7 @@ def get_log_fn(
         logs = {**logs, **metrics}
         logs.pop("learning_rate", None)
         results_queue.put_nowait(logs)
-        trainer._metrics.clear()
+        trainer._metrics["train"].clear()
 
     return log
 
@@ -240,7 +242,9 @@ def calculate_logprobs(
     lm_head_t: torch.Tensor,
     chunk_size: int,
     reference_logprobs: bool,
-) -> tuple[torch.Tensor, torch.Tensor]:  # Returns (log_probs, entropy) both shape [B, S]
+) -> tuple[
+    torch.Tensor, torch.Tensor
+]:  # Returns (log_probs, entropy) both shape [B, S]
     with (
         torch.amp.autocast_mode.autocast(device_type="cuda", dtype=autocast_dtype),
         torch.inference_mode() if reference_logprobs else nullcontext(),
@@ -263,7 +267,9 @@ def _calculate_logprobs(
     hidden_states: torch.Tensor,  # Shape [B, S, H]
     next_input_ids: torch.Tensor,  # Shape [B, S]
     chunk_size: int,
-) -> tuple[torch.Tensor, torch.Tensor]:  # Returns (log_probs, entropy) both shape [B, S]
+) -> tuple[
+    torch.Tensor, torch.Tensor
+]:  # Returns (log_probs, entropy) both shape [B, S]
     batch_size, seq_len, _ = hidden_states.shape
     # Output shape is [B, S]
     log_probs = torch.empty(
@@ -291,14 +297,14 @@ def _calculate_logprobs(
         )  # [B, chunk_size]
         chunk_logsumexp = torch.logsumexp(chunk_logits, dim=-1)  # [B, chunk_size]
         log_probs[:, i : i + chunk_size] = chunk_selected_logits - chunk_logsumexp
-        
+
         # Compute entropy for the chunk
         log_probs_full = chunk_logits - chunk_logsumexp.unsqueeze(-1)
         chunk_entropy = (-torch.exp(log_probs_full) * log_probs_full).sum(
             dim=-1
         )  # [B, chunk_size]
         entropy[:, i : i + chunk_size] = chunk_entropy
-        
+
         del (
             chunk_hs,
             chunk_input_ids,

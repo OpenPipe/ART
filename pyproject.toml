@@ -19,7 +19,6 @@ dependencies = [
     "weave>=0.51.51",
     "peft>=0.14.0",
     "typer>=0.15.2",
-    "trl==0.15.2",
     "tblib>=3.0.0",
     "litellm>=1.63.0",
     "polars>=1.26.0",
@@ -28,6 +27,7 @@ dependencies = [
     "panza",
     "semver>=3.0.4",
     "torchtune",
+    "trl>=0.19.0",
 ]
 
 [project.optional-dependencies]
