@@ -156,6 +156,10 @@ class TorchtuneService:
         return asyncio.create_task(self.get_train_process())
 
     async def get_train_process(self) -> asyncio.subprocess.Process:
+        # Migrate existing checkpoints to new structure if needed
+        from ..local.checkpoints import migrate_checkpoints_to_new_structure
+        migrate_checkpoints_to_new_structure(self.output_dir)
+        
         Path(f"{self.output_dir}/batches.jsonl").unlink(missing_ok=True)
         checkpoint_dir = await self.get_checkpoint_dir()
         torchtune_args = self.torchtune_args
@@ -181,6 +185,7 @@ class TorchtuneService:
             f"tensor_parallel_dim={torchtune_args.get('tensor_parallel_dim', 1)}",
             f"context_parallel_dim={torchtune_args.get('context_parallel_dim', 1)}",
             f"output_dir={self.output_dir}",
+            "clip_grad_norm=0.1",
             "metric_logger._component_=torchtune.training.metric_logging.StdoutLogger",
             "metric_logger.log_dir=null",
             f"enable_activation_offloading={torchtune_args.get('enable_activation_offloading', False)}",
@@ -239,8 +244,8 @@ class TorchtuneService:
         return stdout.decode("utf-8").splitlines()[-1].strip()
 
     def get_last_checkpoint_dir(self) -> str | None:
-        dir = f"{self.output_dir}/{get_step_from_dir(self.output_dir):04d}"
-        return dir if os.path.isdir(dir) else None
+        from ..local.checkpoints import get_last_checkpoint_dir
+        return get_last_checkpoint_dir(self.output_dir)
 
 
 def sleep(

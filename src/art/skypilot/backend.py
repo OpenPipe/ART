@@ -154,15 +154,16 @@ class SkyPilotBackend(Backend):
 
         art_version_is_semver = False
         # check if art_version is valid semver
-        if art_version is not None:
-            try:
-                semver.Version.parse(art_version)
-                art_version_is_semver = True
-            except Exception:
-                pass
+        try:
+            semver.Version.parse(art_version)
+            art_version_is_semver = True
+        except Exception:
+            pass
 
         if art_version_is_semver:
-            art_installation_command = f"uv pip install openpipe-art=={art_version}"
+            art_installation_command = (
+                f"uv pip install openpipe-art[backend]=={art_version}"
+            )
         elif os.path.exists(art_version):
             # copy the contents of the art_path onto the new machine
             task.workdir = art_version

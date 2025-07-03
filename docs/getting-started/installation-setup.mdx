@@ -14,7 +14,13 @@ pip install openpipe-art
 
 ### Running the client and server locally
 
-The ART server can be run locally on any machine with a GPU.
+The ART server can be run locally on any machine with a GPU. To install the backend dependencies required for training and inference, you can install the `backend` extra:
+
+```bash
+pip install openpipe-art[backend]
+```
+
+
 
 ```python
 from art import TrainableModel, gather_trajectory_groups

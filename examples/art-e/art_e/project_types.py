@@ -20,7 +20,7 @@ class TrainingConfig(BaseModel):
     # Random seed to control which subset of the training data is sampled. When None, the sampler can
     # choose its own default (e.g., derive from the current time).
     training_dataset_seed: int | None = None
-
+    messages_only: bool = False
 
 class ProjectPolicyConfig(BaseModel):
     max_turns: int = 10

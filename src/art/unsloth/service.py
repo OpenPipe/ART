@@ -47,7 +47,10 @@ class UnslothService:
 
         lora_path = get_last_checkpoint_dir(self.output_dir)
         if lora_path is None:
-            lora_path = f"{self.output_dir}/0000"
+            from ..utils.output_dirs import get_step_checkpoint_dir
+            import os
+            lora_path = get_step_checkpoint_dir(self.output_dir, 0)
+            os.makedirs(os.path.dirname(lora_path), exist_ok=True)
             self.state.trainer.save_model(lora_path)
         await self.stop_openai_server()
         self._openai_server_task = await openai_server_task(
@@ -145,9 +148,11 @@ class UnslothService:
             if verbose:
                 print("Saving new LoRA adapter...")
             # Save the new LoRA adapter
-            checkpoint_dir = (
-                f"{self.output_dir}/{get_step_from_dir(self.output_dir) + 1:04d}"
-            )
+            from ..utils.output_dirs import get_step_checkpoint_dir
+            next_step = get_step_from_dir(self.output_dir) + 1
+            checkpoint_dir = get_step_checkpoint_dir(self.output_dir, next_step)
+            import os
+            os.makedirs(os.path.dirname(checkpoint_dir), exist_ok=True)
             self.state.trainer.save_model(checkpoint_dir)
             if verbose:
                 print("Setting new LoRA adapter...")

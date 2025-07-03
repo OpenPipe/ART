@@ -17,6 +17,7 @@ from warnings import warn
 
 from omegaconf import DictConfig, OmegaConf
 from pydantic import ValidationError
+import setproctitle
 import torch
 from torch.distributed import destroy_process_group, init_process_group
 from torch.distributed.fsdp import FSDPModule
@@ -1073,11 +1074,10 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
                             device: torch.device | None = None,
                             adapter_weights_only: bool = False,
                         ) -> dict[str, Any]:
+                            self._move_to(torch.device("cpu"))
                             state_dict = gather_cpu_state_dict(
                                 model, is_rank_zero, device, adapter_weights_only
                             )
-                            self._move_to(torch.device("cpu"))
-                            time.sleep(4)
                             # signal that the GPUs are free
                             Path(f"{self._output_dir}/pids.txt").unlink(missing_ok=True)
                             training.gather_cpu_state_dict = gather_cpu_state_dict
@@ -1145,9 +1145,23 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
                             epoch=0,
                         )
                         if self._is_rank_zero:
+                            # Ensure checkpoints directory exists
+                            checkpoint_dir = os.path.join(self._output_dir, "checkpoints")
+                            os.makedirs(checkpoint_dir, exist_ok=True)
+                            
+                            # Get the next step number from the checkpoints directory
+                            next_step = max(
+                                (
+                                    int(subdir)
+                                    for subdir in os.listdir(checkpoint_dir)
+                                    if os.path.isdir(os.path.join(checkpoint_dir, subdir)) and subdir.isdigit()
+                                ),
+                                default=0,
+                            ) + 1
+                            
                             os.rename(
                                 f"{self._output_dir}/epoch_0",
-                                f"{self._output_dir}/{get_step_from_dir(self._output_dir)+1:04d}",
+                                f"{checkpoint_dir}/{next_step:04d}",
                             )
                     time.sleep(0.5)
                     continue
@@ -1283,4 +1297,5 @@ def recipe_main(cfg: DictConfig) -> None:
 
 
 if __name__ == "__main__":
+    setproctitle.setproctitle("model-service")
     sys.exit(recipe_main())

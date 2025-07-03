@@ -238,8 +238,8 @@ if __name__ == "__main__":
         MODEL_CONFIGS = [
             "openai/gpt-4o",
             "openai/gpt-4.1",
-            # "openai/o4-mini",
-            # "openai/o3",
+            "openai/o4-mini",
+            "openai/o3",
         ]
 
         # Create the four models we want to benchmark.

@@ -1,7 +1,7 @@
 import argparse
 import art
 import sky
-from art_e.project_types import ProjectPolicyConfig, TrainingConfig
+from art_e.project_types import ProjectPolicyConfig
 import json
 import textwrap
 import concurrent.futures
@@ -62,11 +62,6 @@ def launch_model(model_key: str):
             apt install -y nvtop
             curl -LsSf https://astral.sh/uv/install.sh | sh
             source $HOME/.local/bin/env
-
-            uv remove openpipe-art
-            uv add --editable ~/ART
-
-            uv sync
         """
     )
 
@@ -75,7 +70,7 @@ def launch_model(model_key: str):
     # Pass the model key as run_name and the serialized model
     run_script = textwrap.dedent(f"""
         uv remove openpipe-art
-        uv add --editable ~/ART
+        uv add --editable ~/ART --extra backend
 
         uv run art_e/train.py '{json.dumps(model_dict)}'
     """)

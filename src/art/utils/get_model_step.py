@@ -8,11 +8,15 @@ if TYPE_CHECKING:
 
 def get_step_from_dir(output_dir: str) -> int:
     os.makedirs(output_dir, exist_ok=True)
+    checkpoint_dir = os.path.join(output_dir, "checkpoints")
+    if not os.path.exists(checkpoint_dir):
+        return 0
+
     return max(
         (
             int(subdir)
-            for subdir in os.listdir(output_dir)
-            if os.path.isdir(os.path.join(output_dir, subdir)) and subdir.isdigit()
+            for subdir in os.listdir(checkpoint_dir)
+            if os.path.isdir(os.path.join(checkpoint_dir, subdir)) and subdir.isdigit()
         ),
         default=0,
     )

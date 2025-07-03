@@ -15,7 +15,7 @@ class EvalResult(TypedDict):
 
 
 async def eval_instance(
-    instance: Instance, runtime: AbstractRuntime, timeout: float = 600.0
+    instance: Instance, runtime: AbstractRuntime, timeout: float = 240.0
 ) -> EvalResult:
     """
     Evaluate a problem instance using a SWE-ReX runtime by running the fail-to-pass
@@ -24,7 +24,7 @@ async def eval_instance(
     Args:
         instance: The instance to evaluate.
         runtime: The runtime to use.
-        timeout: The timeout for the tests. (default: 600.0)
+        timeout: The timeout for the tests. (default: 240.0)
 
     Returns:
         The evaluation result.

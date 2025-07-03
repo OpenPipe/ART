@@ -27,6 +27,9 @@ git clean -fd
 # Install astral-uv
 sudo snap install --classic astral-uv
 
+# Update uv
+uv self update
+
 # Install tmux
 apt install tmux -y
 

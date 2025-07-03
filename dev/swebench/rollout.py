@@ -48,7 +48,9 @@ async def rollout(
     completion_kwargs: dict[str, Any] | None = None,
     replay_trajectory_path: Path | None = None,
     return_run_single: Literal[False] = False,
+    reward_power: float = 1.0,
     run_in_thread: bool = True,
+    timeout: float = 60 * 15,
 ) -> art.Trajectory: ...
 
 
@@ -60,7 +62,9 @@ async def rollout(
     completion_kwargs: dict[str, Any] | None = None,
     replay_trajectory_path: Path | None = None,
     return_run_single: Literal[True],
+    reward_power: float = 1.0,
     run_in_thread: bool = True,
+    timeout: float = 60 * 15,
 ) -> tuple[art.Trajectory, RunSingle]: ...
 
 
@@ -77,6 +81,7 @@ async def rollout(
     return_run_single: bool = False,
     reward_power: float = 1.0,
     run_in_thread: bool = True,
+    timeout: float = 60 * 15,
 ) -> art.Trajectory | tuple[art.Trajectory, RunSingle]:
     trajectory = art.Trajectory(messages_and_choices=[], reward=0.0)
     config = get_config(model, instance, completion_kwargs)
@@ -113,11 +118,12 @@ async def rollout(
         )
     try:
         async with limiter:
-            await run(run_single.run, run_in_thread)
+            await asyncio.wait_for(run(run_single.run, run_in_thread), timeout)
     except modal.exception.RemoteError as error:
         print(instance["instance_id"])
         print(error)
     except (
+        asyncio.TimeoutError,
         ProtocolError,
         RemoteDisconnected,
         ConnectionError,
@@ -132,7 +138,7 @@ async def rollout(
     finally:
         try:
             if isinstance(run_single.env.deployment, ModalDeployment):
-                await run_single.env.deployment.stop()
+                asyncio.create_task(run_single.env.deployment.stop())
         except:
             pass
     if instance["use_swebench_modal_harness"]:
@@ -335,7 +341,7 @@ def update_trajectory(
     )
     # calculate reward and save metrics
     trajectory.reward = (
-        0.45 * maintenance + 0.45 * progress**reward_power + 0.1 * resolved
+        0.2 * maintenance + 0.3 * progress**reward_power + 0.5 * resolved
     )
     trajectory.metrics["progress"] = progress
     trajectory.metrics["maintenance"] = maintenance
