@@ -19,7 +19,9 @@ class TokenUsage(BaseModel):
     by_primitive: dict[str, "TokenUsage"]
 
 
-def batch_token_analysis(dps: list[Datapoint], encoding_for_model: str = "gpt-4o") -> TokenUsage:
+def batch_token_analysis(
+    dps: list[Datapoint], encoding_for_model: str = "gpt-4o"
+) -> TokenUsage:
     import tiktoken
 
     enc = tiktoken.encoding_for_model(encoding_for_model)
@@ -27,7 +29,9 @@ def batch_token_analysis(dps: list[Datapoint], encoding_for_model: str = "gpt-4o
     inputs_by_primitive: dict[str, list[str]] = {}
     outputs_by_primitive: dict[str, list[str]] = {}
     for dp in dps:
-        input = json.dumps({k: v for k, v in dp.model_dump().items() if k != "response"})
+        input = json.dumps(
+            {k: v for k, v in dp.model_dump().items() if k != "response"}
+        )
         inputs_by_primitive.setdefault(type(dp).__name__, []).append(input)
         if isinstance(dp, ClassifyDatapoint):
             output = f'{{"classification": {dp.response}}}'

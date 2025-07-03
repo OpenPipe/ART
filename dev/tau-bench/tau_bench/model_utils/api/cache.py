@@ -43,7 +43,9 @@ def hash_item(item: Any) -> int:
     return hash(item)
 
 
-def hash_func_call(func: Callable[..., Any], args: tuple[Any], kwargs: dict[str, Any]) -> str:
+def hash_func_call(
+    func: Callable[..., Any], args: tuple[Any], kwargs: dict[str, Any]
+) -> str:
     bound_args = inspect.signature(func).bind(*args, **kwargs)
     bound_args.apply_defaults()
     standardized_args = sorted(bound_args.arguments.items())

@@ -14,7 +14,9 @@ class RequestRouter(abc.ABC):
 
 class FirstModelRequestRouter(RequestRouter):
     def route(self, dp: Datapoint, available_models: list[Model]) -> Model:
-        supporting_models = [model for model in available_models if model.supports_dp(dp)]
+        supporting_models = [
+            model for model in available_models if model.supports_dp(dp)
+        ]
         if len(supporting_models) == 0:
             raise ValueError(f"No supporting models found from {available_models}")
         return supporting_models[0]
@@ -35,7 +37,9 @@ class PromptedLLMCapabilityScoreModel:
             model = ClaudeModel()
         self.model = model
 
-    def score_dp(self, dp: Datapoint, examples: list[ScoreDatapoint] | None = None) -> float:
+    def score_dp(
+        self, dp: Datapoint, examples: list[ScoreDatapoint] | None = None
+    ) -> float:
         return (
             self.model.score(
                 instruction="Score the task in the datapoint on a scale of 1 (least complex) to 10 (most complex).",
@@ -53,7 +57,9 @@ class MinimumCapabilityRequestRouter(RequestRouter):
         self.capability_score_model = capability_score_model
 
     def route(self, dp: Datapoint, available_models: list[Model]) -> Model:
-        supporting_models = [model for model in available_models if model.supports_dp(dp)]
+        supporting_models = [
+            model for model in available_models if model.supports_dp(dp)
+        ]
         if len(supporting_models) == 0:
             raise ValueError(f"No supporting models found from {available_models}")
         required_capability = self.capability_score_model.score_dp(dp)
@@ -62,7 +68,8 @@ class MinimumCapabilityRequestRouter(RequestRouter):
         for model in supporting_models:
             capability = model.get_capability()
             if capability >= required_capability and (
-                minimum_model_capability is None or capability < minimum_model_capability
+                minimum_model_capability is None
+                or capability < minimum_model_capability
             ):
                 minimum_model = model
                 minimum_model_capability = capability
@@ -78,8 +85,12 @@ def request_router_factory(
         return FirstModelRequestRouter()
     elif router_id == "minimum-capability":
         if capability_score_model is None:
-            raise ValueError("CapabilityScoreModel is required for minimum-capability router")
-        return MinimumCapabilityRequestRouter(capability_score_model=capability_score_model)
+            raise ValueError(
+                "CapabilityScoreModel is required for minimum-capability router"
+            )
+        return MinimumCapabilityRequestRouter(
+            capability_score_model=capability_score_model
+        )
     raise ValueError(f"Unknown router_id: {router_id}")
 
 

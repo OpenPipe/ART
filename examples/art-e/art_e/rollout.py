@@ -12,16 +12,13 @@ from art_e.email_search_tools import (
 from langchain_core.utils.function_calling import convert_to_openai_tool
 from litellm.caching.caching import LiteLLMCacheType, Cache
 import json
-from openai.types.chat.chat_completion_message_param import ChatCompletionMessageParam
-from openai.types.chat.chat_completion_tool_param import ChatCompletionToolParam
-from litellm.types.utils import Choices, ModelResponse, Message
+from litellm.types.utils import Choices, ModelResponse
 from dataclasses import asdict
 from art.utils.litellm import convert_litellm_choice_to_openai
 from dataclasses import dataclass
 from art_e.project_types import ProjectPolicyConfig
 import textwrap
 from tenacity import retry, stop_after_attempt
-import weave
 import logging
 from pydantic import BaseModel, Field, validate_call, ValidationError
 from rich import print
@@ -338,7 +335,7 @@ async def rollout(
             try:
                 tool_args = json.loads(tool_call.function.arguments)
                 assert isinstance(tool_args, dict)
-            except Exception as e:
+            except Exception:
                 rubric.bad_tool_call_args = True
                 break
 

@@ -1,7 +1,7 @@
 import json
 import os
 from pathlib import Path
-from typing import Any, List, Optional, Tuple, Union
+from typing import Any, Optional
 
 
 class EnvRegistry:
@@ -19,7 +19,9 @@ class EnvRegistry:
     @property
     def env_file(self) -> Path:
         if self._env_file is None:
-            env_file = Path(os.environ.get("SWE_AGENT_ENV_FILE", "/root/.swe-agent-env"))
+            env_file = Path(
+                os.environ.get("SWE_AGENT_ENV_FILE", "/root/.swe-agent-env")
+            )
         else:
             env_file = self._env_file
         if not env_file.exists():
@@ -29,7 +31,9 @@ class EnvRegistry:
     def __getitem__(self, key: str) -> str:
         return json.loads(self.env_file.read_text())[key]
 
-    def get(self, key: str, default_value: Any = None, fallback_to_env: bool = True) -> Any:
+    def get(
+        self, key: str, default_value: Any = None, fallback_to_env: bool = True
+    ) -> Any:
         """Get a value from registry:
 
         Args:

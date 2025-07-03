@@ -5,7 +5,7 @@ This script sends 5 concurrent requests with approximately 1000 input tokens
 and requests approximately 1000 output tokens (max_tokens=1000), repeating
 for 10 iterations. It measures per-request latencies and summarizes statistics.
 """
-import os
+
 import time
 import asyncio
 import statistics
@@ -14,6 +14,8 @@ import art
 from art.local import LocalBackend
 
 load_dotenv()
+
+
 async def timed_request(client, model_name, prompt, max_tokens, temperature):
     """Execute a single model request and measure elapsed time and token usage."""
     start = time.perf_counter()
@@ -31,11 +33,19 @@ async def timed_request(client, model_name, prompt, max_tokens, temperature):
         usage = response.usage
         prompt_tokens = getattr(usage, "prompt_tokens", None)
         completion_tokens = getattr(usage, "completion_tokens", None)
-    return {"response": response, "elapsed": elapsed, "prompt_tokens": prompt_tokens, "completion_tokens": completion_tokens}
+    return {
+        "response": response,
+        "elapsed": elapsed,
+        "prompt_tokens": prompt_tokens,
+        "completion_tokens": completion_tokens,
+    }
+
 
 async def main():
     # Define prompt (approx 1000 input tokens) and model
-    prompt = ("Hello world. " * 500).strip() + "Please repeat the entire prompt back to me verbatim"
+    prompt = (
+        "Hello world. " * 500
+    ).strip() + "Please repeat the entire prompt back to me verbatim"
     # Output tokens to request
     max_tokens = 1000
     temperature = 1.0
@@ -59,7 +69,9 @@ async def main():
     per_request_completion_tokens = []
 
     for i in range(1, iterations + 1):
-        print(f"Iteration {i}/{iterations}: sending {concurrency} concurrent requests...")
+        print(
+            f"Iteration {i}/{iterations}: sending {concurrency} concurrent requests..."
+        )
         iteration_start = time.perf_counter()
         # launch concurrent requests and time each individually
         tasks = [
@@ -92,11 +104,21 @@ async def main():
     pr_min = min(per_request_durations) if per_request_durations else 0.0
     pr_max = max(per_request_durations) if per_request_durations else 0.0
     pr_avg = statistics.mean(per_request_durations) if per_request_durations else 0.0
-    pr_std = statistics.stdev(per_request_durations) if len(per_request_durations) > 1 else 0.0
-    avg_prompt_tokens = (statistics.mean(per_request_prompt_tokens)
-                         if per_request_prompt_tokens else None)
-    avg_completion_tokens = (statistics.mean(per_request_completion_tokens)
-                             if per_request_completion_tokens else None)
+    pr_std = (
+        statistics.stdev(per_request_durations)
+        if len(per_request_durations) > 1
+        else 0.0
+    )
+    avg_prompt_tokens = (
+        statistics.mean(per_request_prompt_tokens)
+        if per_request_prompt_tokens
+        else None
+    )
+    avg_completion_tokens = (
+        statistics.mean(per_request_completion_tokens)
+        if per_request_completion_tokens
+        else None
+    )
 
     # Report results
     print("\nInference benchmark results:")
@@ -117,6 +139,7 @@ async def main():
         print(f"  Avg prompt tokens: {avg_prompt_tokens:.2f}")
     if avg_completion_tokens is not None:
         print(f"  Avg completion tokens: {avg_completion_tokens:.2f}")
+
 
 if __name__ == "__main__":
     asyncio.run(main())

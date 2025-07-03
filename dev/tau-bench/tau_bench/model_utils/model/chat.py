@@ -228,7 +228,9 @@ def build_parse_state(
     ]
     if examples is not None:
         for example in examples:
-            example_msgs = display_sample(t=example.text, ty=typ, response=example.response)
+            example_msgs = display_sample(
+                t=example.text, ty=typ, response=example.response
+            )
             assert isinstance(example_msgs, list) and all(
                 isinstance(msg, Message) for msg in example_msgs
             ), example_msgs
@@ -295,7 +297,10 @@ def build_classify_state(
 class ChatModel(GeneralModel):
     @abc.abstractmethod
     def generate_message(
-        self, messages: list[Message], force_json: bool, temperature: float | None = None
+        self,
+        messages: list[Message],
+        force_json: bool,
+        temperature: float | None = None,
     ) -> Message:
         raise NotImplementedError
 
@@ -321,7 +326,9 @@ class ChatModel(GeneralModel):
             return Message(role=Role.ASSISTANT, content=content, obj=cleaned)
         return Message(role=Role.ASSISTANT, content=content, obj=None)
 
-    def build_generate_message_state(self, messages: list[Message]) -> list[dict[str, str]]:
+    def build_generate_message_state(
+        self, messages: list[Message]
+    ) -> list[dict[str, str]]:
         msgs: list[dict[str, str]] = []
         for msg in messages:
             if msg.obj is not None:
@@ -331,7 +338,9 @@ class ChatModel(GeneralModel):
             msgs.append({"role": msg.role.value, "content": content})
         return msgs
 
-    def _handle_classify_response(self, res: Message, decode_map: dict[str, int]) -> int:
+    def _handle_classify_response(
+        self, res: Message, decode_map: dict[str, int]
+    ) -> int:
         assert res.obj is not None
         if "classification" not in res.obj:
             raise ModelError(f"Invalid response from model: {res.content}")
@@ -351,7 +360,9 @@ class ChatModel(GeneralModel):
         examples: list[ClassifyDatapoint] | None = None,
         temperature: float | None = None,
     ) -> int:
-        messages, decode_map = build_classify_state(instruction, text, options, examples=examples)
+        messages, decode_map = build_classify_state(
+            instruction, text, options, examples=examples
+        )
         res = self.generate_message(messages, force_json=True, temperature=temperature)
         return self._handle_classify_response(res, decode_map)
 
@@ -374,8 +385,12 @@ class ChatModel(GeneralModel):
         examples: list[GenerateDatapoint] | None = None,
         temperature: float | None = None,
     ) -> str:
-        messages = build_generate_state(instruction=instruction, text=text, examples=examples)
-        return self.generate_message(messages, force_json=False, temperature=temperature).content
+        messages = build_generate_state(
+            instruction=instruction, text=text, examples=examples
+        )
+        return self.generate_message(
+            messages, force_json=False, temperature=temperature
+        ).content
 
     def _handle_parse_force_response(
         self, res: Message, typ: type[T] | dict[str, Any]
@@ -475,13 +490,17 @@ def build_parse_prompts(
             text=dp.text,
             typ=dp.typ,
             suffix_strategy=(
-                suffix_strategy if suffix_strategy is not None else PromptSuffixStrategy.JSON
+                suffix_strategy
+                if suffix_strategy is not None
+                else PromptSuffixStrategy.JSON
             ),
         )
         json_response = apply_suffix_strategy(
             response=json_response_object, suffix_strategy=suffix_strategy
         )
-        datapoints.append(prompt_msgs + [Message(role=Role.ASSISTANT, content=json_response)])
+        datapoints.append(
+            prompt_msgs + [Message(role=Role.ASSISTANT, content=json_response)]
+        )
     return datapoints
 
 
@@ -519,14 +538,18 @@ def build_classify_prompts(
 
     datapoints = []
     for dp in dps:
-        suffix_strategy = PromptSuffixStrategy.JSON if suffix_strategy is None else suffix_strategy
+        suffix_strategy = (
+            PromptSuffixStrategy.JSON if suffix_strategy is None else suffix_strategy
+        )
         prompt_msgs, decode_map = build_classify_state(
             instruction=dp.instruction,
             text=dp.text,
             options=dp.options,
             suffix_strategy=suffix_strategy,
         )
-        json_response_object = label_idx_to_label_json(idx=dp.response, decode_map=decode_map)
+        json_response_object = label_idx_to_label_json(
+            idx=dp.response, decode_map=decode_map
+        )
         json_response = apply_suffix_strategy(
             response=json_response_object, suffix_strategy=suffix_strategy
         )
@@ -553,7 +576,9 @@ def build_parse_force_prompts(
             if isinstance(dp.response, BaseModel)
             else json.dumps(dp.response)
         )
-        suffix_strategy = PromptSuffixStrategy.JSON if suffix_strategy is None else suffix_strategy
+        suffix_strategy = (
+            PromptSuffixStrategy.JSON if suffix_strategy is None else suffix_strategy
+        )
         prompt_msgs = build_parse_force_state(
             instruction=dp.instruction,
             text=dp.text,
@@ -563,7 +588,9 @@ def build_parse_force_prompts(
         json_response = apply_suffix_strategy(
             response=json_response_obj, suffix_strategy=suffix_strategy
         )
-        datapoints.append(prompt_msgs + [Message(role=Role.ASSISTANT, content=json_response)])
+        datapoints.append(
+            prompt_msgs + [Message(role=Role.ASSISTANT, content=json_response)]
+        )
     return datapoints
 
 
@@ -571,7 +598,9 @@ def build_generate_prompts(dps: list[GenerateDatapoint]) -> list[str | list[Mess
     datapoints = []
     for dp in dps:
         prompt_msgs = build_generate_state(instruction=dp.instruction, text=dp.text)
-        datapoints.append(prompt_msgs + [Message(role=Role.ASSISTANT, content=dp.response)])
+        datapoints.append(
+            prompt_msgs + [Message(role=Role.ASSISTANT, content=dp.response)]
+        )
     return datapoints
 
 
@@ -583,7 +612,9 @@ def build_score_prompts(
     for dp in dps:
         json_response_object = f'{{"score": {dp.response}}}'
         suffix_strategy = (
-            suffix_strategy if suffix_strategy is not None else PromptSuffixStrategy.JSON
+            suffix_strategy
+            if suffix_strategy is not None
+            else PromptSuffixStrategy.JSON
         )
         prompt_msgs = build_score_state(
             instruction=dp.instruction,
@@ -595,7 +626,9 @@ def build_score_prompts(
         json_response = apply_suffix_strategy(
             response=json_response_object, suffix_strategy=suffix_strategy
         )
-        datapoints.append(prompt_msgs + [Message(role=Role.ASSISTANT, content=json_response)])
+        datapoints.append(
+            prompt_msgs + [Message(role=Role.ASSISTANT, content=json_response)]
+        )
     return datapoints
 
 

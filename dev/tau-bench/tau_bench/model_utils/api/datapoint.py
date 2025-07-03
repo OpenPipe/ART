@@ -97,7 +97,9 @@ def str_equal(s1: str, s2: str) -> bool:
     def strip_and_lower(s: str) -> str:
         return s.lower().strip()
 
-    return strip_and_lower(remove_special_chars(s1)) == strip_and_lower(remove_special_chars(s2))
+    return strip_and_lower(remove_special_chars(s1)) == strip_and_lower(
+        remove_special_chars(s2)
+    )
 
 
 class EvaluationResult(BaseModel):
@@ -196,7 +198,9 @@ class GenerateDatapoint(Datapoint):
     response: str | None = None
     examples: list["GenerateDatapoint"] | None = None
 
-    def evaluate(self, api: tau_bench.model_utils.API) -> tau_bench.model_utils.EvaluationResult:
+    def evaluate(
+        self, api: tau_bench.model_utils.API
+    ) -> tau_bench.model_utils.EvaluationResult:
         raise NotImplementedError
 
 
@@ -244,7 +248,9 @@ def datapoint_factory(d: dict[str, Any]) -> Datapoint:
             d["response"], int
         ):
             return ClassifyDatapoint(**d)
-        elif all(k in d for k in ["instruction", "text"]) and isinstance(d["response"], bool):
+        elif all(k in d for k in ["instruction", "text"]) and isinstance(
+            d["response"], bool
+        ):
             return BinaryClassifyDatapoint(**d)
         elif all(k in d for k in ["instruction", "text", "min", "max"]) and isinstance(
             d["response"], int
@@ -256,7 +262,9 @@ def datapoint_factory(d: dict[str, Any]) -> Datapoint:
             return ParseForceDatapoint(**d)
         elif all(k in d for k in ["text", "typ"]) and isinstance(d["response"], dict):
             return ParseDatapoint(**d)
-        elif all(k in d for k in ["instruction", "text"]) and isinstance(d["response"], str):
+        elif all(k in d for k in ["instruction", "text"]) and isinstance(
+            d["response"], str
+        ):
             return GenerateDatapoint(**d)
         else:
             raise ValueError(f"Unknown datapoint: {d}")

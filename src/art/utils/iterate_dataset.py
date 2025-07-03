@@ -1,9 +1,20 @@
 import math
 import random
-from typing import List, Generator, Tuple, TypeVar
+from dataclasses import dataclass
+from typing import List, Generator, TypeVar, Generic
 from tqdm.auto import tqdm
 
 T = TypeVar("T")
+
+
+@dataclass
+class DatasetBatch(Generic[T]):
+    """Container for dataset batch information."""
+
+    items: List[T]
+    step: int
+    epoch: int
+    epoch_step: int
 
 
 def iterate_dataset(
@@ -12,7 +23,7 @@ def iterate_dataset(
     num_epochs: int = 1,
     initial_step: int = 0,
     use_tqdm: bool = True,
-) -> Generator[Tuple[List[T], int, int, int], None, None]:
+) -> Generator[DatasetBatch[T], None, None]:
     """
     Generates batches from a dataset over multiple epochs with deterministic shuffling.
 
@@ -25,8 +36,8 @@ def iterate_dataset(
         use_tqdm: Whether to display a progress bar. Defaults to True.
 
     Yields:
-        A tuple containing:
-        - batch (List[T]): The list of items for the current batch.
+        DatasetBatch: A dataclass containing:
+        - items (List[T]): The list of items for the current batch.
         - epoch (int): The current epoch number (0-indexed).
         - global_step (int): The overall step number across all epochs.
         - epoch_step (int): The step number within the current epoch (0-indexed).
@@ -69,8 +80,10 @@ def iterate_dataset(
                 continue
 
             batch_indices = indices[i : i + groups_per_step]
-            batch = [dataset[idx] for idx in batch_indices]
-            yield batch, epoch, global_step, epoch_step
+            items = [dataset[idx] for idx in batch_indices]
+            yield DatasetBatch(
+                items=items, epoch=epoch, step=global_step, epoch_step=epoch_step
+            )
 
             # Update progress bar after yielding
             if progress_bar:

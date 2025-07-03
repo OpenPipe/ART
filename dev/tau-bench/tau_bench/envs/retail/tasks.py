@@ -8,7 +8,11 @@ tasks = [
         "actions": [
             {
                 "name": "find_user_id_by_name_zip",
-                "arguments": {"first_name": "Yusuf", "last_name": "Rossi", "zip": "19122"},
+                "arguments": {
+                    "first_name": "Yusuf",
+                    "last_name": "Rossi",
+                    "zip": "19122",
+                },
             },
             {"name": "get_order_details", "arguments": {"order_id": "#W2378156"}},
             {"name": "get_product_details", "arguments": {"product_id": "1656367028"}},
@@ -31,7 +35,11 @@ tasks = [
         "actions": [
             {
                 "name": "find_user_id_by_name_zip",
-                "arguments": {"first_name": "Yusuf", "last_name": "Rossi", "zip": "19122"},
+                "arguments": {
+                    "first_name": "Yusuf",
+                    "last_name": "Rossi",
+                    "zip": "19122",
+                },
             },
             {"name": "get_order_details", "arguments": {"order_id": "#W2378156"}},
             {"name": "get_product_details", "arguments": {"product_id": "1656367028"}},
@@ -54,7 +62,11 @@ tasks = [
         "actions": [
             {
                 "name": "find_user_id_by_name_zip",
-                "arguments": {"first_name": "Yusuf", "last_name": "Rossi", "zip": "19122"},
+                "arguments": {
+                    "first_name": "Yusuf",
+                    "last_name": "Rossi",
+                    "zip": "19122",
+                },
             },
             {"name": "get_product_details", "arguments": {"product_id": "6086499569"}},
             {"name": "list_all_product_types", "arguments": {}},
@@ -84,7 +96,11 @@ tasks = [
         "actions": [
             {
                 "name": "find_user_id_by_name_zip",
-                "arguments": {"first_name": "Yusuf", "last_name": "Rossi", "zip": "19122"},
+                "arguments": {
+                    "first_name": "Yusuf",
+                    "last_name": "Rossi",
+                    "zip": "19122",
+                },
             },
             {"name": "get_product_details", "arguments": {"product_id": "6086499569"}},
             {"name": "list_all_product_types", "arguments": {}},
@@ -116,7 +132,11 @@ tasks = [
         "actions": [
             {
                 "name": "find_user_id_by_name_zip",
-                "arguments": {"first_name": "Yusuf", "last_name": "Rossi", "zip": "19122"},
+                "arguments": {
+                    "first_name": "Yusuf",
+                    "last_name": "Rossi",
+                    "zip": "19122",
+                },
             },
             {"name": "get_product_details", "arguments": {"product_id": "6086499569"}},
             {"name": "list_all_product_types", "arguments": {}},
@@ -157,7 +177,11 @@ tasks = [
         "actions": [
             {
                 "name": "find_user_id_by_name_zip",
-                "arguments": {"first_name": "Mei", "last_name": "Kovacs", "zip": "28236"},
+                "arguments": {
+                    "first_name": "Mei",
+                    "last_name": "Kovacs",
+                    "zip": "28236",
+                },
             },
             {"name": "get_user_details", "arguments": {"user_id": "mei_kovacs_8020"}},
             {"name": "get_order_details", "arguments": {"order_id": "#W6390527"}},
@@ -179,7 +203,11 @@ tasks = [
         "actions": [
             {
                 "name": "find_user_id_by_name_zip",
-                "arguments": {"first_name": "Mei", "last_name": "Kovacs", "zip": "28236"},
+                "arguments": {
+                    "first_name": "Mei",
+                    "last_name": "Kovacs",
+                    "zip": "28236",
+                },
             },
             {"name": "get_user_details", "arguments": {"user_id": "mei_kovacs_8020"}},
             {"name": "get_order_details", "arguments": {"order_id": "#W6390527"}},
@@ -203,7 +231,11 @@ tasks = [
         "actions": [
             {
                 "name": "find_user_id_by_name_zip",
-                "arguments": {"first_name": "Mei", "last_name": "Kovacs", "zip": "28236"},
+                "arguments": {
+                    "first_name": "Mei",
+                    "last_name": "Kovacs",
+                    "zip": "28236",
+                },
             },
             {"name": "get_user_details", "arguments": {"user_id": "mei_kovacs_8020"}},
             {"name": "get_order_details", "arguments": {"order_id": "#W6390527"}},
@@ -227,7 +259,11 @@ tasks = [
         "actions": [
             {
                 "name": "find_user_id_by_name_zip",
-                "arguments": {"first_name": "Mei", "last_name": "Kovacs", "zip": "28236"},
+                "arguments": {
+                    "first_name": "Mei",
+                    "last_name": "Kovacs",
+                    "zip": "28236",
+                },
             },
             {"name": "get_user_details", "arguments": {"user_id": "mei_kovacs_8020"}},
             {"name": "get_order_details", "arguments": {"order_id": "#W6390527"}},
@@ -251,7 +287,11 @@ tasks = [
         "actions": [
             {
                 "name": "find_user_id_by_name_zip",
-                "arguments": {"first_name": "Mei", "last_name": "Kovacs", "zip": "28236"},
+                "arguments": {
+                    "first_name": "Mei",
+                    "last_name": "Kovacs",
+                    "zip": "28236",
+                },
             },
             {"name": "get_user_details", "arguments": {"user_id": "mei_kovacs_8020"}},
             {"name": "get_order_details", "arguments": {"order_id": "#W6390527"}},
@@ -273,7 +313,10 @@ tasks = [
         "user_id": "mia_garcia_4516",
         "instruction": "You are mia_garcia_4516 (mia.garcia2723@example.com). For some reason, you want to return all things ordered. You have two payment methods and two orders, and you want to refund each order to the opposite order's payment method. If not possible, you are angry and swear for a few times, then asks for human representative. You are a mysterious person and do not want to reveal much about yourself or speak too many words at the same time.",
         "actions": [
-            {"name": "find_user_id_by_email", "arguments": {"email": "mia.garcia2723@example.com"}},
+            {
+                "name": "find_user_id_by_email",
+                "arguments": {"email": "mia.garcia2723@example.com"},
+            },
             {"name": "get_user_details", "arguments": {"user_id": "mia_garcia_4516"}},
             {"name": "get_order_details", "arguments": {"order_id": "#W5490111"}},
             {"name": "get_order_details", "arguments": {"order_id": "#W7387996"}},
@@ -290,7 +333,10 @@ tasks = [
         "user_id": "mia_garcia_4516",
         "instruction": "You are mia_garcia_4516 (mia.garcia2723@example.com). For some reason, you want to return all things ordered. You have two payment methods and two orders, and you want to refund each order to the opposite order's payment method. If not possible, you are angry and swear for a few times, then agree to return all things with the original payment method. You are a mysterious person and do not want to reveal much about yourself or speak too many words at the same time.",
         "actions": [
-            {"name": "find_user_id_by_email", "arguments": {"email": "mia.garcia2723@example.com"}},
+            {
+                "name": "find_user_id_by_email",
+                "arguments": {"email": "mia.garcia2723@example.com"},
+            },
             {"name": "get_user_details", "arguments": {"user_id": "mia_garcia_4516"}},
             {"name": "get_order_details", "arguments": {"order_id": "#W5490111"}},
             {"name": "get_order_details", "arguments": {"order_id": "#W7387996"}},
@@ -298,7 +344,12 @@ tasks = [
                 "name": "return_delivered_order_items",
                 "arguments": {
                     "order_id": "#W5490111",
-                    "item_ids": ["4579334072", "1421289881", "6117189161", "4947717507"],
+                    "item_ids": [
+                        "4579334072",
+                        "1421289881",
+                        "6117189161",
+                        "4947717507",
+                    ],
                     "payment_method_id": "credit_card_3124723",
                 },
             },
@@ -317,7 +368,10 @@ tasks = [
         "user_id": "mia_garcia_4516",
         "instruction": "You are mia_garcia_4516 (mia.garcia2723@example.com). You just got into gaming and want to cancel or return everything not associated with it. (Everything except a keyboard and a mouse, but do not reveal it to the agent). PayPal is prefered for refund, but otherwise you are angry and ask for human agent for help. You are into gaming but realized the importance of studying hard.",
         "actions": [
-            {"name": "find_user_id_by_email", "arguments": {"email": "mia.garcia2723@example.com"}},
+            {
+                "name": "find_user_id_by_email",
+                "arguments": {"email": "mia.garcia2723@example.com"},
+            },
             {"name": "get_user_details", "arguments": {"user_id": "mia_garcia_4516"}},
             {"name": "get_order_details", "arguments": {"order_id": "#W5490111"}},
             {"name": "get_order_details", "arguments": {"order_id": "#W7387996"}},
@@ -342,7 +396,10 @@ tasks = [
         "user_id": "mia_garcia_4516",
         "instruction": "You are mia_garcia_4516 (mia.garcia2723@example.com). You just got into gaming and want to cancel or return everything not associated with it. (Everything except a keyboard and a mouse, but do not reveal it to the agent). PayPal is prefered for refund, but otherwise credit card can be accepted. You are into gaming but realized the importance of studying hard.",
         "actions": [
-            {"name": "find_user_id_by_email", "arguments": {"email": "mia.garcia2723@example.com"}},
+            {
+                "name": "find_user_id_by_email",
+                "arguments": {"email": "mia.garcia2723@example.com"},
+            },
             {"name": "get_user_details", "arguments": {"user_id": "mia_garcia_4516"}},
             {"name": "get_order_details", "arguments": {"order_id": "#W5490111"}},
             {"name": "get_order_details", "arguments": {"order_id": "#W7387996"}},
@@ -369,7 +426,10 @@ tasks = [
         "user_id": "mia_garcia_4516",
         "instruction": "You are mia_garcia_4516 (mia.garcia2723@example.com). You just quit gaming and want to cancel or return everything associated with it. (It's just a keyboard and a mouse, but do not reveal it to the agent). Original payment is preferred. You are into gaming but realized the importance of studying hard.",
         "actions": [
-            {"name": "find_user_id_by_email", "arguments": {"email": "mia.garcia2723@example.com"}},
+            {
+                "name": "find_user_id_by_email",
+                "arguments": {"email": "mia.garcia2723@example.com"},
+            },
             {"name": "get_user_details", "arguments": {"user_id": "mia_garcia_4516"}},
             {"name": "get_order_details", "arguments": {"order_id": "#W5490111"}},
             {"name": "get_order_details", "arguments": {"order_id": "#W7387996"}},
@@ -398,9 +458,16 @@ tasks = [
         "actions": [
             {
                 "name": "find_user_id_by_name_zip",
-                "arguments": {"first_name": "Fatima", "last_name": "Johnson", "zip": "78712"},
+                "arguments": {
+                    "first_name": "Fatima",
+                    "last_name": "Johnson",
+                    "zip": "78712",
+                },
             },
-            {"name": "get_user_details", "arguments": {"user_id": "fatima_johnson_7581"}},
+            {
+                "name": "get_user_details",
+                "arguments": {"user_id": "fatima_johnson_7581"},
+            },
             {"name": "get_order_details", "arguments": {"order_id": "#W9389413"}},
             {"name": "get_order_details", "arguments": {"order_id": "#W8665881"}},
             {"name": "get_order_details", "arguments": {"order_id": "#W5199551"}},
@@ -423,13 +490,23 @@ tasks = [
         "actions": [
             {
                 "name": "find_user_id_by_name_zip",
-                "arguments": {"first_name": "Fatima", "last_name": "Johnson", "zip": "78712"},
+                "arguments": {
+                    "first_name": "Fatima",
+                    "last_name": "Johnson",
+                    "zip": "78712",
+                },
             },
-            {"name": "get_user_details", "arguments": {"user_id": "fatima_johnson_7581"}},
+            {
+                "name": "get_user_details",
+                "arguments": {"user_id": "fatima_johnson_7581"},
+            },
             {"name": "get_order_details", "arguments": {"order_id": "#W5199551"}},
             {"name": "get_order_details", "arguments": {"order_id": "#W8665881"}},
             {"name": "get_order_details", "arguments": {"order_id": "#W9389413"}},
-            {"name": "calculate", "arguments": {"expression": "3131.1 + 4777.75 + 367.38"}},
+            {
+                "name": "calculate",
+                "arguments": {"expression": "3131.1 + 4777.75 + 367.38"},
+            },
             {
                 "name": "cancel_pending_order",
                 "arguments": {"order_id": "#W5199551", "reason": "no longer needed"},
@@ -456,9 +533,16 @@ tasks = [
         "actions": [
             {
                 "name": "find_user_id_by_name_zip",
-                "arguments": {"first_name": "Fatima", "last_name": "Johnson", "zip": "78712"},
+                "arguments": {
+                    "first_name": "Fatima",
+                    "last_name": "Johnson",
+                    "zip": "78712",
+                },
             },
-            {"name": "get_user_details", "arguments": {"user_id": "fatima_johnson_7581"}},
+            {
+                "name": "get_user_details",
+                "arguments": {"user_id": "fatima_johnson_7581"},
+            },
             {"name": "get_order_details", "arguments": {"order_id": "#W5199551"}},
             {"name": "get_order_details", "arguments": {"order_id": "#W8665881"}},
             {"name": "get_order_details", "arguments": {"order_id": "#W9389413"}},
@@ -483,7 +567,11 @@ tasks = [
         "actions": [
             {
                 "name": "find_user_id_by_name_zip",
-                "arguments": {"first_name": "Mei", "last_name": "Davis", "zip": "80217"},
+                "arguments": {
+                    "first_name": "Mei",
+                    "last_name": "Davis",
+                    "zip": "80217",
+                },
             },
             {"name": "get_user_details", "arguments": {"user_id": "mei_davis_8935"}},
             {"name": "get_order_details", "arguments": {"order_id": "#W2890441"}},
@@ -506,7 +594,11 @@ tasks = [
         "actions": [
             {
                 "name": "find_user_id_by_name_zip",
-                "arguments": {"first_name": "Mei", "last_name": "Davis", "zip": "80217"},
+                "arguments": {
+                    "first_name": "Mei",
+                    "last_name": "Davis",
+                    "zip": "80217",
+                },
             },
             {"name": "get_user_details", "arguments": {"user_id": "mei_davis_8935"}},
             {"name": "get_order_details", "arguments": {"order_id": "#W2890441"}},
@@ -531,7 +623,11 @@ tasks = [
         "actions": [
             {
                 "name": "find_user_id_by_name_zip",
-                "arguments": {"first_name": "Ethan", "last_name": "Garcia", "zip": "80280"},
+                "arguments": {
+                    "first_name": "Ethan",
+                    "last_name": "Garcia",
+                    "zip": "80280",
+                },
             },
             {"name": "get_user_details", "arguments": {"user_id": "ethan_garcia_1261"}},
             {"name": "get_order_details", "arguments": {"order_id": "#W4967593"}},
@@ -544,8 +640,18 @@ tasks = [
                 "name": "modify_pending_order_items",
                 "arguments": {
                     "order_id": "#W9911714",
-                    "item_ids": ["2366567022", "1340995114", "9791469541", "1763705424"],
-                    "new_item_ids": ["4579334072", "1151293680", "4107812777", "2882812427"],
+                    "item_ids": [
+                        "2366567022",
+                        "1340995114",
+                        "9791469541",
+                        "1763705424",
+                    ],
+                    "new_item_ids": [
+                        "4579334072",
+                        "1151293680",
+                        "4107812777",
+                        "2882812427",
+                    ],
                     "payment_method_id": "gift_card_4332117",
                 },
             },
@@ -559,7 +665,11 @@ tasks = [
         "actions": [
             {
                 "name": "find_user_id_by_name_zip",
-                "arguments": {"first_name": "Ethan", "last_name": "Garcia", "zip": "80280"},
+                "arguments": {
+                    "first_name": "Ethan",
+                    "last_name": "Garcia",
+                    "zip": "80280",
+                },
             },
             {"name": "get_user_details", "arguments": {"user_id": "ethan_garcia_1261"}},
             {"name": "get_order_details", "arguments": {"order_id": "#W4967593"}},
@@ -570,7 +680,10 @@ tasks = [
             {"name": "get_product_details", "arguments": {"product_id": "1656367028"}},
             {"name": "get_product_details", "arguments": {"product_id": "4107812777"}},
             {"name": "get_product_details", "arguments": {"product_id": "6938111410"}},
-            {"name": "calculate", "arguments": {"expression": "155.33 - 147.05 + 268.77 - 235.13"}},
+            {
+                "name": "calculate",
+                "arguments": {"expression": "155.33 - 147.05 + 268.77 - 235.13"},
+            },
             {
                 "name": "modify_pending_order_items",
                 "arguments": {
@@ -590,7 +703,11 @@ tasks = [
         "actions": [
             {
                 "name": "find_user_id_by_name_zip",
-                "arguments": {"first_name": "Ethan", "last_name": "Garcia", "zip": "80280"},
+                "arguments": {
+                    "first_name": "Ethan",
+                    "last_name": "Garcia",
+                    "zip": "80280",
+                },
             },
             {
                 "name": "modify_user_address",
@@ -640,9 +757,16 @@ tasks = [
         "actions": [
             {
                 "name": "find_user_id_by_name_zip",
-                "arguments": {"first_name": "Sofia", "last_name": "Hernandez", "zip": "98193"},
+                "arguments": {
+                    "first_name": "Sofia",
+                    "last_name": "Hernandez",
+                    "zip": "98193",
+                },
             },
-            {"name": "get_user_details", "arguments": {"user_id": "sofia_hernandez_5364"}},
+            {
+                "name": "get_user_details",
+                "arguments": {"user_id": "sofia_hernandez_5364"},
+            },
             {"name": "get_order_details", "arguments": {"order_id": "#W3561391"}},
             {"name": "get_order_details", "arguments": {"order_id": "#W6876713"}},
             {"name": "get_order_details", "arguments": {"order_id": "#W9609649"}},
@@ -693,9 +817,16 @@ tasks = [
         "actions": [
             {
                 "name": "find_user_id_by_name_zip",
-                "arguments": {"first_name": "Isabella", "last_name": "Johansson", "zip": "32286"},
+                "arguments": {
+                    "first_name": "Isabella",
+                    "last_name": "Johansson",
+                    "zip": "32286",
+                },
             },
-            {"name": "get_user_details", "arguments": {"user_id": "isabella_johansson_2152"}},
+            {
+                "name": "get_user_details",
+                "arguments": {"user_id": "isabella_johansson_2152"},
+            },
             {"name": "get_order_details", "arguments": {"order_id": "#W3792453"}},
             {"name": "get_order_details", "arguments": {"order_id": "#W7181492"}},
             {"name": "get_order_details", "arguments": {"order_id": "#W5565470"}},
@@ -709,9 +840,16 @@ tasks = [
         "actions": [
             {
                 "name": "find_user_id_by_name_zip",
-                "arguments": {"first_name": "Isabella", "last_name": "Johansson", "zip": "32286"},
+                "arguments": {
+                    "first_name": "Isabella",
+                    "last_name": "Johansson",
+                    "zip": "32286",
+                },
             },
-            {"name": "get_user_details", "arguments": {"user_id": "isabella_johansson_2152"}},
+            {
+                "name": "get_user_details",
+                "arguments": {"user_id": "isabella_johansson_2152"},
+            },
             {"name": "get_order_details", "arguments": {"order_id": "#W3792453"}},
             {"name": "get_order_details", "arguments": {"order_id": "#W7181492"}},
             {"name": "get_order_details", "arguments": {"order_id": "#W5565470"}},
@@ -739,9 +877,16 @@ tasks = [
         "actions": [
             {
                 "name": "find_user_id_by_name_zip",
-                "arguments": {"first_name": "Isabella", "last_name": "Johansson", "zip": "32286"},
+                "arguments": {
+                    "first_name": "Isabella",
+                    "last_name": "Johansson",
+                    "zip": "32286",
+                },
             },
-            {"name": "get_user_details", "arguments": {"user_id": "isabella_johansson_2152"}},
+            {
+                "name": "get_user_details",
+                "arguments": {"user_id": "isabella_johansson_2152"},
+            },
             {"name": "get_order_details", "arguments": {"order_id": "#W3792453"}},
             {"name": "get_order_details", "arguments": {"order_id": "#W7181492"}},
             {"name": "get_product_details", "arguments": {"product_id": "7363354090"}},
@@ -763,9 +908,16 @@ tasks = [
         "actions": [
             {
                 "name": "find_user_id_by_name_zip",
-                "arguments": {"first_name": "Isabella", "last_name": "Johansson", "zip": "32286"},
+                "arguments": {
+                    "first_name": "Isabella",
+                    "last_name": "Johansson",
+                    "zip": "32286",
+                },
             },
-            {"name": "get_user_details", "arguments": {"user_id": "isabella_johansson_2152"}},
+            {
+                "name": "get_user_details",
+                "arguments": {"user_id": "isabella_johansson_2152"},
+            },
             {"name": "get_order_details", "arguments": {"order_id": "#W3792453"}},
             {"name": "get_order_details", "arguments": {"order_id": "#W7181492"}},
             {"name": "get_order_details", "arguments": {"order_id": "#W5565470"}},
@@ -809,9 +961,16 @@ tasks = [
         "actions": [
             {
                 "name": "find_user_id_by_name_zip",
-                "arguments": {"first_name": "Isabella", "last_name": "Johansson", "zip": "32286"},
+                "arguments": {
+                    "first_name": "Isabella",
+                    "last_name": "Johansson",
+                    "zip": "32286",
+                },
             },
-            {"name": "get_user_details", "arguments": {"user_id": "isabella_johansson_2152"}},
+            {
+                "name": "get_user_details",
+                "arguments": {"user_id": "isabella_johansson_2152"},
+            },
             {"name": "get_order_details", "arguments": {"order_id": "#W3792453"}},
             {"name": "get_product_details", "arguments": {"product_id": "1968349452"}},
             {
@@ -842,7 +1001,11 @@ tasks = [
         "actions": [
             {
                 "name": "find_user_id_by_name_zip",
-                "arguments": {"first_name": "Olivia", "last_name": "Lopez", "zip": "76171"},
+                "arguments": {
+                    "first_name": "Olivia",
+                    "last_name": "Lopez",
+                    "zip": "76171",
+                },
             },
             {"name": "get_user_details", "arguments": {"user_id": "olivia_lopez_3865"}},
             {"name": "get_order_details", "arguments": {"order_id": "#W9319364"}},
@@ -883,7 +1046,11 @@ tasks = [
         "actions": [
             {
                 "name": "find_user_id_by_name_zip",
-                "arguments": {"first_name": "Olivia", "last_name": "Lopez", "zip": "76171"},
+                "arguments": {
+                    "first_name": "Olivia",
+                    "last_name": "Lopez",
+                    "zip": "76171",
+                },
             },
             {"name": "get_user_details", "arguments": {"user_id": "olivia_lopez_3865"}},
             {"name": "get_order_details", "arguments": {"order_id": "#W9319364"}},
@@ -916,7 +1083,11 @@ tasks = [
         "actions": [
             {
                 "name": "find_user_id_by_name_zip",
-                "arguments": {"first_name": "Olivia", "last_name": "Lopez", "zip": "76171"},
+                "arguments": {
+                    "first_name": "Olivia",
+                    "last_name": "Lopez",
+                    "zip": "76171",
+                },
             },
             {"name": "get_user_details", "arguments": {"user_id": "olivia_lopez_3865"}},
             {"name": "get_order_details", "arguments": {"order_id": "#W9319364"}},
@@ -953,7 +1124,11 @@ tasks = [
         "actions": [
             {
                 "name": "find_user_id_by_name_zip",
-                "arguments": {"first_name": "Noah", "last_name": "Patel", "zip": "10108"},
+                "arguments": {
+                    "first_name": "Noah",
+                    "last_name": "Patel",
+                    "zip": "10108",
+                },
             },
             {"name": "get_user_details", "arguments": {"user_id": "noah_patel_6952"}},
             {"name": "get_order_details", "arguments": {"order_id": "#W6111398"}},
@@ -981,7 +1156,11 @@ tasks = [
         "actions": [
             {
                 "name": "find_user_id_by_name_zip",
-                "arguments": {"first_name": "Noah", "last_name": "Patel", "zip": "10108"},
+                "arguments": {
+                    "first_name": "Noah",
+                    "last_name": "Patel",
+                    "zip": "10108",
+                },
             },
             {"name": "get_user_details", "arguments": {"user_id": "noah_patel_6952"}},
             {"name": "get_order_details", "arguments": {"order_id": "#W6111398"}},
@@ -1048,9 +1227,16 @@ tasks = [
             },
             {
                 "name": "find_user_id_by_name_zip",
-                "arguments": {"first_name": "Daiki", "last_name": "Sanchez", "zip": "46236"},
+                "arguments": {
+                    "first_name": "Daiki",
+                    "last_name": "Sanchez",
+                    "zip": "46236",
+                },
             },
-            {"name": "get_user_details", "arguments": {"user_id": "daiki_sanchez_3253"}},
+            {
+                "name": "get_user_details",
+                "arguments": {"user_id": "daiki_sanchez_3253"},
+            },
             {"name": "get_order_details", "arguments": {"order_id": "#W9348897"}},
             {"name": "get_product_details", "arguments": {"product_id": "3377618313"}},
             {"name": "get_product_details", "arguments": {"product_id": "9743693396"}},
@@ -1080,9 +1266,16 @@ tasks = [
             },
             {
                 "name": "find_user_id_by_name_zip",
-                "arguments": {"first_name": "Daiki", "last_name": "Sanchez", "zip": "46236"},
+                "arguments": {
+                    "first_name": "Daiki",
+                    "last_name": "Sanchez",
+                    "zip": "46236",
+                },
             },
-            {"name": "get_user_details", "arguments": {"user_id": "daiki_sanchez_3253"}},
+            {
+                "name": "get_user_details",
+                "arguments": {"user_id": "daiki_sanchez_3253"},
+            },
             {"name": "get_order_details", "arguments": {"order_id": "#W9348897"}},
             {"name": "get_product_details", "arguments": {"product_id": "3377618313"}},
             {"name": "get_product_details", "arguments": {"product_id": "9743693396"}},
@@ -1112,9 +1305,16 @@ tasks = [
             },
             {
                 "name": "find_user_id_by_name_zip",
-                "arguments": {"first_name": "Daiki", "last_name": "Sanchez", "zip": "46236"},
+                "arguments": {
+                    "first_name": "Daiki",
+                    "last_name": "Sanchez",
+                    "zip": "46236",
+                },
             },
-            {"name": "get_user_details", "arguments": {"user_id": "daiki_sanchez_3253"}},
+            {
+                "name": "get_user_details",
+                "arguments": {"user_id": "daiki_sanchez_3253"},
+            },
             {"name": "get_order_details", "arguments": {"order_id": "#W9348897"}},
             {"name": "get_product_details", "arguments": {"product_id": "3377618313"}},
             {"name": "get_product_details", "arguments": {"product_id": "9743693396"}},
@@ -1123,7 +1323,9 @@ tasks = [
             {"name": "get_product_details", "arguments": {"product_id": "9523456873"}},
             {
                 "name": "calculate",
-                "arguments": {"expression": "466.75 + 288.82 + 135.24 + 193.38 + 46.66"},
+                "arguments": {
+                    "expression": "466.75 + 288.82 + 135.24 + 193.38 + 46.66"
+                },
             },
             {
                 "name": "cancel_pending_order",
@@ -1139,13 +1341,24 @@ tasks = [
         "actions": [
             {
                 "name": "find_user_id_by_name_zip",
-                "arguments": {"first_name": "Fatima", "last_name": "Taylor", "zip": "85033"},
+                "arguments": {
+                    "first_name": "Fatima",
+                    "last_name": "Taylor",
+                    "zip": "85033",
+                },
             },
             {
                 "name": "find_user_id_by_name_zip",
-                "arguments": {"first_name": "Fatima", "last_name": "Taylor", "zip": "32169"},
+                "arguments": {
+                    "first_name": "Fatima",
+                    "last_name": "Taylor",
+                    "zip": "32169",
+                },
             },
-            {"name": "get_user_details", "arguments": {"user_id": "fatima_taylor_3452"}},
+            {
+                "name": "get_user_details",
+                "arguments": {"user_id": "fatima_taylor_3452"},
+            },
             {"name": "get_order_details", "arguments": {"order_id": "#W5285031"}},
             {
                 "name": "modify_user_address",
@@ -1173,11 +1386,17 @@ tasks = [
                 "name": "find_user_id_by_email",
                 "arguments": {"email": "isabella.lopez3271@example.com"},
             },
-            {"name": "get_user_details", "arguments": {"user_id": "isabella_lopez_6490"}},
+            {
+                "name": "get_user_details",
+                "arguments": {"user_id": "isabella_lopez_6490"},
+            },
             {"name": "get_order_details", "arguments": {"order_id": "#W4923227"}},
             {
                 "name": "modify_pending_order_payment",
-                "arguments": {"order_id": "#W4923227", "payment_method_id": "credit_card_8897086"},
+                "arguments": {
+                    "order_id": "#W4923227",
+                    "payment_method_id": "credit_card_8897086",
+                },
             },
         ],
         "outputs": ["60", "mastercard"],
@@ -1189,7 +1408,11 @@ tasks = [
         "actions": [
             {
                 "name": "find_user_id_by_name_zip",
-                "arguments": {"first_name": "Mei", "last_name": "Patel", "zip": "76165"},
+                "arguments": {
+                    "first_name": "Mei",
+                    "last_name": "Patel",
+                    "zip": "76165",
+                },
             },
             {"name": "get_user_details", "arguments": {"user_id": "mei_patel_7272"}},
             {"name": "get_order_details", "arguments": {"order_id": "#W9583042"}},
@@ -1251,7 +1474,11 @@ tasks = [
         "actions": [
             {
                 "name": "find_user_id_by_name_zip",
-                "arguments": {"first_name": "Mei", "last_name": "Patel", "zip": "76165"},
+                "arguments": {
+                    "first_name": "Mei",
+                    "last_name": "Patel",
+                    "zip": "76165",
+                },
             },
             {"name": "get_user_details", "arguments": {"user_id": "mei_patel_7272"}},
             {"name": "get_order_details", "arguments": {"order_id": "#W9583042"}},
@@ -1313,7 +1540,11 @@ tasks = [
         "actions": [
             {
                 "name": "find_user_id_by_name_zip",
-                "arguments": {"first_name": "Lucas", "last_name": "Santos", "zip": "80239"},
+                "arguments": {
+                    "first_name": "Lucas",
+                    "last_name": "Santos",
+                    "zip": "80239",
+                },
             },
             {"name": "get_user_details", "arguments": {"user_id": "lucas_santos_6600"}},
             {"name": "get_order_details", "arguments": {"order_id": "#W1588712"}},
@@ -1348,7 +1579,11 @@ tasks = [
         "actions": [
             {
                 "name": "find_user_id_by_name_zip",
-                "arguments": {"first_name": "Aarav", "last_name": "Anderson", "zip": "19031"},
+                "arguments": {
+                    "first_name": "Aarav",
+                    "last_name": "Anderson",
+                    "zip": "19031",
+                },
             },
             {"name": "get_order_details", "arguments": {"order_id": "#W9300146"}},
             {"name": "get_product_details", "arguments": {"product_id": "6817146515"}},
@@ -1372,7 +1607,11 @@ tasks = [
         "actions": [
             {
                 "name": "find_user_id_by_name_zip",
-                "arguments": {"first_name": "Daiki", "last_name": "Johnson", "zip": "80273"},
+                "arguments": {
+                    "first_name": "Daiki",
+                    "last_name": "Johnson",
+                    "zip": "80273",
+                },
             },
             {"name": "get_order_details", "arguments": {"order_id": "#W9502127"}},
             {"name": "get_product_details", "arguments": {"product_id": "1762337868"}},
@@ -1396,7 +1635,11 @@ tasks = [
         "actions": [
             {
                 "name": "find_user_id_by_name_zip",
-                "arguments": {"first_name": "Daiki", "last_name": "Johnson", "zip": "80273"},
+                "arguments": {
+                    "first_name": "Daiki",
+                    "last_name": "Johnson",
+                    "zip": "80273",
+                },
             },
             {"name": "get_order_details", "arguments": {"order_id": "#9502126"}},
             {"name": "get_order_details", "arguments": {"order_id": "#9502127"}},
@@ -1421,7 +1664,11 @@ tasks = [
         "actions": [
             {
                 "name": "find_user_id_by_name_zip",
-                "arguments": {"first_name": "Daiki", "last_name": "Johnson", "zip": "80273"},
+                "arguments": {
+                    "first_name": "Daiki",
+                    "last_name": "Johnson",
+                    "zip": "80273",
+                },
             },
             {"name": "get_order_details", "arguments": {"order_id": "#9502126"}},
             {"name": "get_order_details", "arguments": {"order_id": "#9502127"}},
@@ -1446,9 +1693,16 @@ tasks = [
         "actions": [
             {
                 "name": "find_user_id_by_name_zip",
-                "arguments": {"first_name": "Daiki", "last_name": "Johnson", "zip": "80273"},
+                "arguments": {
+                    "first_name": "Daiki",
+                    "last_name": "Johnson",
+                    "zip": "80273",
+                },
             },
-            {"name": "get_user_details", "arguments": {"user_id": "daiki_johnson_9523"}},
+            {
+                "name": "get_user_details",
+                "arguments": {"user_id": "daiki_johnson_9523"},
+            },
             {"name": "get_order_details", "arguments": {"order_id": "#W1436802"}},
             {"name": "get_order_details", "arguments": {"order_id": "#W5282037"}},
             {"name": "get_order_details", "arguments": {"order_id": "#W9502127"}},
@@ -1470,9 +1724,16 @@ tasks = [
         "actions": [
             {
                 "name": "find_user_id_by_name_zip",
-                "arguments": {"first_name": "Aarav", "last_name": "Anderson", "zip": "19031"},
+                "arguments": {
+                    "first_name": "Aarav",
+                    "last_name": "Anderson",
+                    "zip": "19031",
+                },
             },
-            {"name": "get_user_details", "arguments": {"user_id": "aarav_anderson_8794"}},
+            {
+                "name": "get_user_details",
+                "arguments": {"user_id": "aarav_anderson_8794"},
+            },
             {"name": "get_order_details", "arguments": {"order_id": "#W4316152"}},
             {"name": "get_order_details", "arguments": {"order_id": "#W9311069"}},
             {"name": "get_order_details", "arguments": {"order_id": "#W9300146"}},
@@ -1584,7 +1845,10 @@ tasks = [
         "user_id": "amelia_silva_7726",
         "instruction": "You are Amelia, and you have two emails: silva7872@example.com and amelia.silva7872@example.com. You live in Philadelphia, and you are a loyal customer. But you just faced a fincinal issue and want to cancel or return all possible orders. Well, except the boots that you really really love, but you are happy to exchange it for boots of the exact same size and material to get maximum money back, but only if they are cheaper than what you have paid. You are now emotional and a bit stress out. You like to talk very tersely. At the end of the day, you wonder how much money you can get back today.",
         "actions": [
-            {"name": "find_user_id_by_email", "arguments": {"email": "silva7872@example.com"}},
+            {
+                "name": "find_user_id_by_email",
+                "arguments": {"email": "silva7872@example.com"},
+            },
             {
                 "name": "find_user_id_by_email",
                 "arguments": {"email": "amelia.silva7872@example.com"},
@@ -1608,7 +1872,12 @@ tasks = [
                 "name": "return_delivered_order_items",
                 "arguments": {
                     "order_id": "#W4597054",
-                    "item_ids": ["5669664287", "4900990404", "9862136885", "6777246137"],
+                    "item_ids": [
+                        "5669664287",
+                        "4900990404",
+                        "9862136885",
+                        "6777246137",
+                    ],
                     "payment_method_id": "gift_card_3491931",
                 },
             },
@@ -1620,7 +1889,10 @@ tasks = [
         "user_id": "amelia_silva_7726",
         "instruction": "You are Amelia, and you have two emails: silva7872@example.com and amelia.silva7872@example.com. You live in Philadelphia, and you are a loyal customer. But you just faced a fincinal issue and want to cancel or return all possible orders. You are now emotional and a bit stress out. You like to talk a lot and explain your situation.",
         "actions": [
-            {"name": "find_user_id_by_email", "arguments": {"email": "silva7872@example.com"}},
+            {
+                "name": "find_user_id_by_email",
+                "arguments": {"email": "silva7872@example.com"},
+            },
             {
                 "name": "find_user_id_by_email",
                 "arguments": {"email": "amelia.silva7872@example.com"},
@@ -1644,7 +1916,12 @@ tasks = [
                 "name": "return_delivered_order_items",
                 "arguments": {
                     "order_id": "#W4597054",
-                    "item_ids": ["5669664287", "4900990404", "9862136885", "6777246137"],
+                    "item_ids": [
+                        "5669664287",
+                        "4900990404",
+                        "9862136885",
+                        "6777246137",
+                    ],
                     "payment_method_id": "gift_card_3491931",
                 },
             },
@@ -1666,9 +1943,16 @@ tasks = [
         "actions": [
             {
                 "name": "find_user_id_by_name_zip",
-                "arguments": {"first_name": "Ivan", "last_name": "Hernandez", "zip": "92133"},
+                "arguments": {
+                    "first_name": "Ivan",
+                    "last_name": "Hernandez",
+                    "zip": "92133",
+                },
             },
-            {"name": "get_user_details", "arguments": {"user_id": "ivan_hernandez_6923"}},
+            {
+                "name": "get_user_details",
+                "arguments": {"user_id": "ivan_hernandez_6923"},
+            },
             {"name": "get_order_details", "arguments": {"order_id": "#W5838674"}},
             {"name": "get_order_details", "arguments": {"order_id": "#W4284542"}},
             {"name": "get_order_details", "arguments": {"order_id": "#W2782744"}},
@@ -1699,9 +1983,16 @@ tasks = [
         "actions": [
             {
                 "name": "find_user_id_by_name_zip",
-                "arguments": {"first_name": "Ivan", "last_name": "Hernandez", "zip": "92133"},
+                "arguments": {
+                    "first_name": "Ivan",
+                    "last_name": "Hernandez",
+                    "zip": "92133",
+                },
             },
-            {"name": "get_user_details", "arguments": {"user_id": "ivan_hernandez_6923"}},
+            {
+                "name": "get_user_details",
+                "arguments": {"user_id": "ivan_hernandez_6923"},
+            },
             {"name": "get_order_details", "arguments": {"order_id": "#W5838674"}},
             {"name": "get_product_details", "arguments": {"product_id": "4354588079"}},
             {"name": "get_product_details", "arguments": {"product_id": "4760268021"}},
@@ -1724,7 +2015,11 @@ tasks = [
         "actions": [
             {
                 "name": "find_user_id_by_name_zip",
-                "arguments": {"first_name": "Yusuf", "last_name": "Taylor", "zip": "95154"},
+                "arguments": {
+                    "first_name": "Yusuf",
+                    "last_name": "Taylor",
+                    "zip": "95154",
+                },
             },
             {"name": "get_order_details", "arguments": {"order_id": "#W2702727"}},
             {"name": "get_order_details", "arguments": {"order_id": "#W8268610"}},
@@ -1755,7 +2050,11 @@ tasks = [
         "actions": [
             {
                 "name": "find_user_id_by_name_zip",
-                "arguments": {"first_name": "Chen", "last_name": "Johnson", "zip": "77004"},
+                "arguments": {
+                    "first_name": "Chen",
+                    "last_name": "Johnson",
+                    "zip": "77004",
+                },
             },
             {"name": "get_order_details", "arguments": {"order_id": "#W5061109"}},
             {"name": "get_product_details", "arguments": {"product_id": "9924732112"}},
@@ -1778,7 +2077,11 @@ tasks = [
         "actions": [
             {
                 "name": "find_user_id_by_name_zip",
-                "arguments": {"first_name": "Chen", "last_name": "Johnson", "zip": "77004"},
+                "arguments": {
+                    "first_name": "Chen",
+                    "last_name": "Johnson",
+                    "zip": "77004",
+                },
             },
             {"name": "get_order_details", "arguments": {"order_id": "#W5061109"}},
             {"name": "get_product_details", "arguments": {"product_id": "9924732112"}},
@@ -1802,7 +2105,11 @@ tasks = [
         "actions": [
             {
                 "name": "find_user_id_by_name_zip",
-                "arguments": {"first_name": "Chen", "last_name": "Johnson", "zip": "77004"},
+                "arguments": {
+                    "first_name": "Chen",
+                    "last_name": "Johnson",
+                    "zip": "77004",
+                },
             },
             {"name": "get_user_details", "arguments": {"user_id": "chen_johnson_4204"}},
             {"name": "get_order_details", "arguments": {"order_id": "#W5797164"}},
@@ -1819,13 +2126,20 @@ tasks = [
         "actions": [
             {
                 "name": "find_user_id_by_name_zip",
-                "arguments": {"first_name": "Chen", "last_name": "Johnson", "zip": "77004"},
+                "arguments": {
+                    "first_name": "Chen",
+                    "last_name": "Johnson",
+                    "zip": "77004",
+                },
             },
             {"name": "get_user_details", "arguments": {"user_id": "chen_johnson_4204"}},
             {"name": "get_order_details", "arguments": {"order_id": "#W5797164"}},
             {"name": "get_order_details", "arguments": {"order_id": "#W5061109"}},
             {"name": "get_product_details", "arguments": {"product_id": "4768869376"}},
-            {"name": "calculate", "arguments": {"expression": "1319.43 - 302.67 + 271.89"}},
+            {
+                "name": "calculate",
+                "arguments": {"expression": "1319.43 - 302.67 + 271.89"},
+            },
             {
                 "name": "modify_pending_order_items",
                 "arguments": {
@@ -1845,9 +2159,16 @@ tasks = [
         "actions": [
             {
                 "name": "find_user_id_by_name_zip",
-                "arguments": {"first_name": "James", "last_name": "Sanchez", "zip": "60623"},
+                "arguments": {
+                    "first_name": "James",
+                    "last_name": "Sanchez",
+                    "zip": "60623",
+                },
             },
-            {"name": "get_user_details", "arguments": {"user_id": "james_sanchez_3954"}},
+            {
+                "name": "get_user_details",
+                "arguments": {"user_id": "james_sanchez_3954"},
+            },
             {"name": "get_order_details", "arguments": {"order_id": "#W7464385"}},
             {"name": "get_order_details", "arguments": {"order_id": "#W8499625"}},
             {"name": "get_order_details", "arguments": {"order_id": "#W1279004"}},
@@ -1879,7 +2200,11 @@ tasks = [
         "actions": [
             {
                 "name": "find_user_id_by_name_zip",
-                "arguments": {"first_name": "James", "last_name": "Kovacs", "zip": "95190"},
+                "arguments": {
+                    "first_name": "James",
+                    "last_name": "Kovacs",
+                    "zip": "95190",
+                },
             },
             {"name": "get_user_details", "arguments": {"user_id": "james_kovacs_9247"}},
             {"name": "get_order_details", "arguments": {"order_id": "#W5362037"}},
@@ -1892,7 +2217,11 @@ tasks = [
         "actions": [
             {
                 "name": "find_user_id_by_name_zip",
-                "arguments": {"first_name": "Aarav", "last_name": "Lee", "zip": "85025"},
+                "arguments": {
+                    "first_name": "Aarav",
+                    "last_name": "Lee",
+                    "zip": "85025",
+                },
             },
             {"name": "get_user_details", "arguments": {"user_id": "aarav_lee_1982"}},
             {"name": "get_order_details", "arguments": {"order_id": "#W3361211"}},
@@ -1950,7 +2279,11 @@ tasks = [
         "actions": [
             {
                 "name": "find_user_id_by_name_zip",
-                "arguments": {"first_name": "Emma", "last_name": "Smith", "zip": "10192"},
+                "arguments": {
+                    "first_name": "Emma",
+                    "last_name": "Smith",
+                    "zip": "10192",
+                },
             },
             {"name": "get_user_details", "arguments": {"user_id": "emma_smith_8564"}},
             {"name": "get_order_details", "arguments": {"order_id": "#W2417020"}},
@@ -2044,7 +2377,12 @@ tasks = [
                 "name": "return_delivered_order_items",
                 "arguments": {
                     "order_id": "#W5272531",
-                    "item_ids": ["7228247242", "2698416822", "8098621301", "3320557165"],
+                    "item_ids": [
+                        "7228247242",
+                        "2698416822",
+                        "8098621301",
+                        "3320557165",
+                    ],
                     "payment_method_id": "credit_card_6824399",
                 },
             }
@@ -2215,7 +2553,12 @@ tasks = [
                 "name": "return_delivered_order_items",
                 "arguments": {
                     "order_id": "#W9571698",
-                    "item_ids": ["5952720925", "9973034634", "7381052709", "6065192424"],
+                    "item_ids": [
+                        "5952720925",
+                        "9973034634",
+                        "7381052709",
+                        "6065192424",
+                    ],
                     "payment_method_id": "gift_card_7250692",
                 },
             }

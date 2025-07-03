@@ -7,10 +7,11 @@ from art.utils.benchmarking.load_trajectories import (
 from art_e.evaluate.charts import training_progress_chart, comparison_models_bar_chart
 from all_models import models
 import asyncio
+from art_e.data.query_iterators import load_synthetic_queries
 
 ds_size_models = [m for m in models.values() if m.name.startswith("ea-210")]
 
-await asyncio.gather(*[pull_model_trajectories(m) for m in ds_size_models])  # type: ignore
+await asyncio.gather(*[pull_model_trajectories(m) for m in ds_size_models])  # type: ignore  # noqa: F704
 
 # %%
 
@@ -24,7 +25,7 @@ models = [
 ]
 
 # await load_trajectories.bust_cache()
-df = await load_trajectories(
+df = await load_trajectories(  # noqa: F704
     "../../.art/email_agent",
     models=models,
 )  # type: ignore
@@ -41,7 +42,7 @@ training_progress_chart(
 )
 
 # %%
-import polars as pl
+import polars as pl  # noqa: E402
 
 labeled_models = []
 for m in ds_size_models:
@@ -66,8 +67,6 @@ comparison_models_bar_chart(
 
 
 # %%
-
-from art_e.data.query_iterators import load_synthetic_queries
 
 scenarios = load_synthetic_queries(split="train", limit=10)
 

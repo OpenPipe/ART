@@ -1,7 +1,7 @@
 from IPython.display import display, HTML  # Add import
 import html  # Add import for escaping
 
-from art_e.data.query_iterators import load_synthetic_queries, SyntheticQuery
+from art_e.data.query_iterators import SyntheticQuery
 from art_e.email_search_tools import read_email
 
 
@@ -44,7 +44,7 @@ def display_run_html(row: dict, scenarios: list[SyntheticQuery]):
 
     # Header
     html_parts.append(
-        f'<div style="border: 1px solid #ccc; padding: 15px; margin-bottom: 20px; background-color: #f9f9f9;">'
+        '<div style="border: 1px solid #ccc; padding: 15px; margin-bottom: 20px; background-color: #f9f9f9;">'
     )
     html_parts.append(f"<h2>Run Details (Model: {html.escape(str(row['model']))})</h2>")
 

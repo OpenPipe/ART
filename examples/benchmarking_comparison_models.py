@@ -118,16 +118,16 @@ async def train_model(model: art.TrainableModel):
         initial_step=await model.get_step(),
     )
 
-    for batch, epoch, global_step, epoch_step in train_iterator:
+    for batch in train_iterator:
         groups = await art.gather_trajectory_groups(
             art.TrajectoryGroup(
                 (rollout(model, scenario) for _ in range(6)),
             )
-            for scenario in batch
+            for scenario in batch.items
         )
         await model.train(groups)
 
-        if global_step % 20 == 0:
+        if batch.step % 20 == 0:
             # Every 20 steps let's benchmark our model under training so we can
             # see how it's doing.
             await benchmark_model(model)

@@ -11,16 +11,16 @@ import art_e.evaluate.charts
 
 importlib.reload(art_e.evaluate.charts)
 
-import polars as pl
-from art_e.evaluate.load_trajectories import load_trajectories
-from art_e.evaluate.charts import comparison_models_bar_chart, training_progress_chart
+import polars as pl  # noqa: E402
+from art_e.evaluate.load_trajectories import load_trajectories  # noqa: E402
+from art_e.evaluate.charts import comparison_models_bar_chart, training_progress_chart  # noqa: E402
 
 # Define and create the temporary directory early
 TMP_DIR = "/tmp/art-e"
 os.makedirs(TMP_DIR, exist_ok=True)
 
 # await load_trajectories.bust_cache()
-df = await load_trajectories(
+df = await load_trajectories(  # noqa: F704
     ".art/email_agent",
     models=[
         "email-agent-008",

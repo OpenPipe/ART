@@ -154,7 +154,7 @@ class LocalBackend(Backend):
         allow_training_without_logprobs: bool,
         plot_tensors: bool,
     ) -> PackedTensors | None:
-        if not model.base_model in self._tokenizers:
+        if model.base_model not in self._tokenizers:
             self._tokenizers[model.base_model] = AutoTokenizer.from_pretrained(
                 model.base_model
             )

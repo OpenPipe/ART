@@ -156,7 +156,8 @@ def record_metrics(context: "GatherContext", trajectory: Trajectory) -> None:
     ]
     if logprobs:
         trajectory.metrics["completion_tokens"] = sum(
-            len(l.content or l.refusal or []) for l in logprobs
+            len(l.content or l.refusal or [])
+            for l in logprobs  # noqa: E741
         ) / len(logprobs)
     context.metric_sums["reward"] += trajectory.reward  # type: ignore
     context.metric_divisors["reward"] += 1

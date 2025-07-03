@@ -28,15 +28,25 @@ class FewShotToolCallingAgent(Agent):
         if len(few_shot_displays) == 0:
             raise ValueError("Few shot displays are empty")
         elif len(few_shot_displays) < num_few_shots:
-            raise ValueError(f"Few shot displays are less than num_few_shots requested: {len(few_shot_displays)} < {num_few_shots}")
+            raise ValueError(
+                f"Few shot displays are less than num_few_shots requested: {len(few_shot_displays)} < {num_few_shots}"
+            )
         self.few_shot_displays = few_shot_displays
         self.temperature = temperature
         self.num_few_shots = num_few_shots
+
     async def solve(
         self, env: Env, task_index: Optional[int] = None, max_num_steps: int = 30
     ) -> SolveResult:
-        sampled_few_shot_displays = random.sample(self.few_shot_displays, self.num_few_shots)
-        few_shots = "\n\n".join([f"Example {i+1}:\n{display}" for i, display in enumerate(sampled_few_shot_displays)])
+        sampled_few_shot_displays = random.sample(
+            self.few_shot_displays, self.num_few_shots
+        )
+        few_shots = "\n\n".join(
+            [
+                f"Example {i + 1}:\n{display}"
+                for i, display in enumerate(sampled_few_shot_displays)
+            ]
+        )
         total_cost = 0.0
         env_reset_res = await env.reset(task_index=task_index)
         obs = env_reset_res.observation
@@ -93,7 +103,12 @@ class FewShotToolCallingAgent(Agent):
 def message_to_action(
     message: Dict[str, Any],
 ) -> Action:
-    if "tool_calls" in message and message["tool_calls"] is not None and len(message["tool_calls"]) > 0 and message["tool_calls"][0]["function"] is not None:
+    if (
+        "tool_calls" in message
+        and message["tool_calls"] is not None
+        and len(message["tool_calls"]) > 0
+        and message["tool_calls"][0]["function"] is not None
+    ):
         tool_call = message["tool_calls"][0]
         return Action(
             name=tool_call["function"]["name"],

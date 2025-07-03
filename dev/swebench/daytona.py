@@ -9,7 +9,7 @@ from typing import Literal
 
 load_dotenv()
 
-from instances import Instance, as_instances_iter, get_filtered_swe_smith_instances_df
+from instances import Instance, as_instances_iter, get_filtered_swe_smith_instances_df  # noqa: E402
 
 instances = list(
     get_filtered_swe_smith_instances_df()
@@ -318,7 +318,7 @@ async def run_tests(
 
         # 4. Try running tests and install missing dependencies if needed
         logger.log("\nRunning tests...")
-        num_tests = len(tests)  # Store for later use in retry logic
+        num_tests = len(tests)  # Store for later use in retry logic  # noqa: F841
         max_retries = 5
         for attempt in range(max_retries):
             # Create a Python script that uses pytest's Python API to avoid command line limits
@@ -423,7 +423,7 @@ sys.exit(exit_code)
             break
 
         # Analyze results
-        logger.log(f"\nTest Results:")
+        logger.log("\nTest Results:")
         logger.log(f"Exit code: {result.exit_code}")
 
         output = result.result
@@ -463,7 +463,7 @@ sys.exit(exit_code)
         logger.log(f"Errors: {results['errors']}")
 
         # Show expectations and summary
-        logger.log(f"\nExpectations:")
+        logger.log("\nExpectations:")
         logger.log(f"FAIL_TO_PASS tests ({results['fail_to_pass_count']}): Should fail")
         logger.log(f"PASS_TO_PASS tests ({results['pass_to_pass_count']}): Should pass")
 
@@ -555,7 +555,7 @@ sys.exit(exit_code)
             fail_diff = results["total_issues"] - results["fail_to_pass_count"]
             pass_diff = results["passed"] - results["pass_to_pass_count"]
 
-            error_msg = f"Test count mismatch!\n"
+            error_msg = "Test count mismatch!\n"
             error_msg += f"Expected: {results['fail_to_pass_count']} failures, {results['pass_to_pass_count']} passes\n"
             error_msg += f"Actual:   {results['total_issues']} failures/errors, {results['passed']} passes\n"
 

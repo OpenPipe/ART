@@ -10,6 +10,7 @@ from tau_bench.agents.base import Agent
 from tau_bench.envs.base import Env
 from tau_bench.types import SolveResult, Action, RESPOND_ACTION_NAME
 
+
 class ToolCallingAgent(Agent):
     def __init__(
         self,
@@ -37,7 +38,7 @@ class ToolCallingAgent(Agent):
         )
         assert isinstance(completion_obj, ModelResponse)
         return completion_obj
-    
+
     async def solve(
         self, env: Env, task_index: Optional[int] = None, max_num_steps: int = 30
     ) -> SolveResult:
@@ -56,11 +57,13 @@ class ToolCallingAgent(Agent):
         forced_stop = True
         for curr_step_number in range(max_num_steps):
             res = await self.llm_completion(messages)
-            final_prompt_tokens = res.usage.prompt_tokens # type: ignore
-            avg_completion_tokens += res.usage.completion_tokens # type: ignore
-            max_completion_tokens = max(max_completion_tokens, res.usage.completion_tokens) # type: ignore
-            next_message = res.choices[0].message.model_dump() # type: ignore
-            total_cost += (res._hidden_params.get("response_cost") or 0.0)
+            final_prompt_tokens = res.usage.prompt_tokens  # type: ignore
+            avg_completion_tokens += res.usage.completion_tokens  # type: ignore
+            max_completion_tokens = max(
+                max_completion_tokens, res.usage.completion_tokens
+            )  # type: ignore
+            next_message = res.choices[0].message.model_dump()  # type: ignore
+            total_cost += res._hidden_params.get("response_cost") or 0.0
             action = message_to_action(next_message)
             env_response = await env.step(action)
             reward = env_response.reward
@@ -102,6 +105,7 @@ class ToolCallingAgent(Agent):
             total_cost=total_cost,
         )
 
+
 class ToolCallingRLAgent(ToolCallingAgent):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -109,7 +113,7 @@ class ToolCallingRLAgent(ToolCallingAgent):
         self.base_url = kwargs.get("base_url", None)
         self.base_model = kwargs.get("base_model", None)
         self.choices = []
-    
+
     async def llm_completion(self, messages: List[Dict[str, Any]]):
         response = await acompletion(
             messages=messages,
@@ -121,13 +125,15 @@ class ToolCallingRLAgent(ToolCallingAgent):
             temperature=self.temperature,
             max_completion_tokens=1024,
             logprobs=False if self.provider == "openai" else True,
-            extra_body={"chat_template_kwargs": {"enable_thinking": False}} if "Qwen3-" in self.base_model else {},
+            extra_body={"chat_template_kwargs": {"enable_thinking": False}}
+            if "Qwen3-" in self.base_model
+            else {},
         )
-        choice = response.choices[0] # type: ignore
+        choice = response.choices[0]  # type: ignore
         assert isinstance(choice, Choices), f"Choice is not a Choices object: {choice}"
         self.choices.append(convert_litellm_choice_to_openai(choice))
         return response
-    
+
     def create_messages_and_choices(self, messages: List[Dict[str, Any]]):
         messages_and_choices = []
         choice_idx = 0
@@ -135,7 +141,10 @@ class ToolCallingRLAgent(ToolCallingAgent):
             if message["role"] == "assistant":
                 choice = self.choices[choice_idx]
                 if "Qwen3-" in self.base_model:
-                    if hasattr(choice.message, "content") and choice.message.content is None:
+                    if (
+                        hasattr(choice.message, "content")
+                        and choice.message.content is None
+                    ):
                         choice.message.content = ""
                 messages_and_choices.append(choice)
                 choice_idx += 1
@@ -149,10 +158,16 @@ class ToolCallingRLAgent(ToolCallingAgent):
                 messages_and_choices.append(message)
         return messages_and_choices
 
+
 def message_to_action(
     message: Dict[str, Any],
 ) -> Action:
-    if "tool_calls" in message and message["tool_calls"] is not None and len(message["tool_calls"]) > 0 and message["tool_calls"][0]["function"] is not None:
+    if (
+        "tool_calls" in message
+        and message["tool_calls"] is not None
+        and len(message["tool_calls"]) > 0
+        and message["tool_calls"][0]["function"] is not None
+    ):
         tool_call = message["tool_calls"][0]
         return Action(
             name=tool_call["function"]["name"],

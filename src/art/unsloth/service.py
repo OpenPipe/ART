@@ -49,6 +49,7 @@ class UnslothService:
         if lora_path is None:
             from ..utils.output_dirs import get_step_checkpoint_dir
             import os
+
             lora_path = get_step_checkpoint_dir(self.output_dir, 0)
             os.makedirs(os.path.dirname(lora_path), exist_ok=True)
             self.state.trainer.save_model(lora_path)
@@ -133,9 +134,9 @@ class UnslothService:
                     for task in done:
                         result = task.result()
                         # If `result` is `None`, the training task finished somehow.
-                        assert (
-                            result is not None
-                        ), "The training task should never finish."
+                        assert result is not None, (
+                            "The training task should never finish."
+                        )
                         self.results_queue.task_done()
                         if warmup:
                             from .state import free_memory
@@ -149,9 +150,11 @@ class UnslothService:
                 print("Saving new LoRA adapter...")
             # Save the new LoRA adapter
             from ..utils.output_dirs import get_step_checkpoint_dir
+
             next_step = get_step_from_dir(self.output_dir) + 1
             checkpoint_dir = get_step_checkpoint_dir(self.output_dir, next_step)
             import os
+
             os.makedirs(os.path.dirname(checkpoint_dir), exist_ok=True)
             self.state.trainer.save_model(checkpoint_dir)
             if verbose:

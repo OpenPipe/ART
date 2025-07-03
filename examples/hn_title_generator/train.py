@@ -292,7 +292,7 @@ async def main():
         use_tqdm=True,
     )
 
-    for batch_inputs, epoch, global_step, epoch_step in data_iterator:
+    for batch in data_iterator:
         train_groups = await art.gather_trajectory_groups(
             (
                 art.TrajectoryGroup(
@@ -302,12 +302,12 @@ async def main():
                         MODEL_NAME,
                         bi["prompt"],
                         bi["row"],
-                        global_step,
-                        epoch,
+                        batch.step,
+                        batch.epoch,
                     )
                     for _ in range(NUM_GENERATIONS)
                 )
-                for bi in batch_inputs
+                for bi in batch.items
             )
         )
 
@@ -319,7 +319,7 @@ async def main():
 
         if not valid_train_groups:
             print(
-                f"Warning: No valid trajectories generated for step {global_step}. Skipping tune step."
+                f"Warning: No valid trajectories generated for step {batch.step}. Skipping tune step."
             )
             continue
 
@@ -328,8 +328,8 @@ async def main():
             config=art.TrainConfig(learning_rate=LEARNING_RATE),
         )
 
-        if global_step > 0 and global_step % EVAL_STEPS == 0:
-            print(f"\n--- Evaluating at Step {global_step} ---")
+        if batch.step > 0 and batch.step % EVAL_STEPS == 0:
+            print(f"\n--- Evaluating at Step {batch.step} ---")
 
             print(f"Running validation rollouts on {len(val_data_list)} samples...")
             val_trajectories = await art.gather_trajectories(
@@ -340,8 +340,8 @@ async def main():
                         MODEL_NAME,
                         item["prompt"],
                         item["row"],
-                        global_step,
-                        epoch,
+                        batch.step,
+                        batch.epoch,
                     )
                     for item in val_data_list
                 ),

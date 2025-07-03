@@ -1,6 +1,7 @@
 from art.trajectories import TrajectoryGroup
 import numpy as np
 
+
 # calculate the average standard deviation of rewards within groups
 def calculate_step_std_dev(trajectory_groups: list[TrajectoryGroup]) -> float:
     std_devs = []

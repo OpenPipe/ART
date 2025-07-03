@@ -24,6 +24,7 @@ T = TypeVar("T")
 # Special ID to signal shutdown
 _SHUTDOWN_ID = "__shutdown__"
 
+
 def move_to_child_process(
     obj: T, log_file: str | None = None, process_name: str | None = None
 ) -> T:
@@ -227,7 +228,7 @@ async def _handle_request(
     try:
         result_or_callable = getattr(obj, request.method_name)
         if inspect.isasyncgenfunction(result_or_callable):
-            if not request.id in generators:
+            if request.id not in generators:
                 generators[request.id] = result_or_callable(
                     *request.args, **request.kwargs
                 )

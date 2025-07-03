@@ -139,7 +139,7 @@ async def rollout(
         try:
             if isinstance(run_single.env.deployment, ModalDeployment):
                 asyncio.create_task(run_single.env.deployment.stop())
-        except:
+        except:  # noqa: E722
             pass
     if instance["use_swebench_modal_harness"]:
         await update_trajectory_with_swebench_modal_harness(

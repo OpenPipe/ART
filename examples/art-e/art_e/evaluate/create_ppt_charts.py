@@ -395,12 +395,10 @@ def comparison_models_bar_chart(
         The created figure so that it can be displayed inline in IPython /
         Jupyter notebooks.
     """
-    import os
-    from pathlib import Path
 
     import matplotlib.pyplot as plt
     import numpy as np
-    import seaborn as sns
+    import seaborn  # noqa: F401
 
     # Resolve column name (support both raw + prefixed)
     full_metric_col = (
@@ -483,18 +481,11 @@ def comparison_models_bar_chart(
 
     tick_col = plt.rcParams.get("text.color", "white")
 
-    trained_set = {m for m, b, imp in model_stats if imp != 0}
-
     ORANGE = "#e67a30"
     GREY = "#e0dcd5"
 
     # Colour assignment: use same approach (trained first) so the most
     # distinctive colours are given to the trained models.
-    ordered_for_palette = [m for m in plot_models if m in trained_set] + [
-        m for m in plot_models if m not in trained_set
-    ]
-    palette = sns.color_palette(n_colors=len(ordered_for_palette))
-    model_colors = {m: c for m, c in zip(ordered_for_palette, palette)}  # type: ignore
 
     bar_width = 0.7
     x_positions = np.arange(len(model_stats))
@@ -628,7 +619,7 @@ def load_trajectories_sync():
 
     try:
         # Check if we're in a running event loop (like Jupyter)
-        loop = asyncio.get_running_loop()
+        loop = asyncio.get_running_loop()  # noqa: F841
         # We're in a running loop, try to use nest_asyncio
         try:
             import nest_asyncio

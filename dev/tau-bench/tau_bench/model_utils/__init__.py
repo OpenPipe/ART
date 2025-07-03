@@ -1,6 +1,8 @@
 from tau_bench.model_utils.api.api import API as API
 from tau_bench.model_utils.api.api import default_api_from_args as default_api_from_args
-from tau_bench.model_utils.api.api import BinaryClassifyDatapoint as BinaryClassifyDatapoint
+from tau_bench.model_utils.api.api import (
+    BinaryClassifyDatapoint as BinaryClassifyDatapoint,
+)
 from tau_bench.model_utils.api.api import ClassifyDatapoint as ClassifyDatapoint
 from tau_bench.model_utils.api.api import GenerateDatapoint as GenerateDatapoint
 from tau_bench.model_utils.api.api import ParseDatapoint as ParseDatapoint
@@ -22,9 +24,13 @@ from tau_bench.model_utils.api.sample import (
 from tau_bench.model_utils.api.sample import (
     RedundantSamplingStrategy as RedundantSamplingStrategy,
 )
-from tau_bench.model_utils.api.sample import RetrySamplingStrategy as RetrySamplingStrategy
+from tau_bench.model_utils.api.sample import (
+    RetrySamplingStrategy as RetrySamplingStrategy,
+)
 from tau_bench.model_utils.api.sample import SamplingStrategy as SamplingStrategy
-from tau_bench.model_utils.api.sample import SingleSamplingStrategy as SingleSamplingStrategy
+from tau_bench.model_utils.api.sample import (
+    SingleSamplingStrategy as SingleSamplingStrategy,
+)
 from tau_bench.model_utils.api.sample import (
     UnanimousSamplingStrategy as UnanimousSamplingStrategy,
 )
@@ -34,7 +40,9 @@ from tau_bench.model_utils.api.sample import (
 from tau_bench.model_utils.api.sample import (
     set_default_sampling_strategy as set_default_sampling_strategy,
 )
-from tau_bench.model_utils.model.chat import PromptSuffixStrategy as PromptSuffixStrategy
+from tau_bench.model_utils.model.chat import (
+    PromptSuffixStrategy as PromptSuffixStrategy,
+)
 from tau_bench.model_utils.model.exception import ModelError as ModelError
 from tau_bench.model_utils.model.general_model import GeneralModel as GeneralModel
 from tau_bench.model_utils.model.general_model import default_model as default_model

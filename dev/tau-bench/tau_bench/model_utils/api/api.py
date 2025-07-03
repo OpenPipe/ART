@@ -122,7 +122,9 @@ class API(object):
             request_router=request_router,
         )
 
-    def set_default_binary_classify_models(self, models: list[BinaryClassifyModel]) -> None:
+    def set_default_binary_classify_models(
+        self, models: list[BinaryClassifyModel]
+    ) -> None:
         if len(models) == 0:
             raise ValueError("Must provide at least one model")
         self.binary_classify_models = models
@@ -152,7 +154,9 @@ class API(object):
             raise ValueError("Must provide at least one model")
         self.score_models = models
 
-    def set_default_sampling_strategy(self, sampling_strategy: SamplingStrategy) -> None:
+    def set_default_sampling_strategy(
+        self, sampling_strategy: SamplingStrategy
+    ) -> None:
         self.sampling_strategy = sampling_strategy
 
     def set_default_request_router(self, request_router: RequestRouter) -> None:
@@ -222,15 +226,23 @@ class API(object):
             )
         return sampling_strategy.execute(
             lambda: _run_datapoint(
-                models[0], 0.2 if isinstance(sampling_strategy, MajoritySamplingStrategy) else None
+                models[0],
+                0.2
+                if isinstance(sampling_strategy, MajoritySamplingStrategy)
+                else None,
             )
         )
 
     def _api_call(
-        self, models: list[AnyModel], datapoint: Datapoint, sampling_strategy: SamplingStrategy
+        self,
+        models: list[AnyModel],
+        datapoint: Datapoint,
+        sampling_strategy: SamplingStrategy,
     ) -> T:
         if isinstance(sampling_strategy, EnsembleSamplingStrategy):
-            return self._run_with_sampling_strategy(models, datapoint, sampling_strategy)
+            return self._run_with_sampling_strategy(
+                models, datapoint, sampling_strategy
+            )
         model = self.request_router.route(dp=datapoint, available_models=models)
         return self._run_with_sampling_strategy(
             models=[model], datapoint=datapoint, sampling_strategy=sampling_strategy
@@ -329,7 +341,9 @@ class API(object):
 
         return self._api_call(
             models=models,
-            datapoint=GenerateDatapoint(instruction=instruction, text=text, examples=examples),
+            datapoint=GenerateDatapoint(
+                instruction=instruction, text=text, examples=examples
+            ),
             sampling_strategy=sampling_strategy,
         )
 
@@ -405,9 +419,13 @@ def default_api(
         log_file=log_file,
     )
 
+
 def default_api_from_args(args: argparse.Namespace) -> API:
     from tau_bench.model_utils.model.general_model import model_factory
-    model = model_factory(model_id=args.model, platform=args.platform, base_url=args.base_url)
+
+    model = model_factory(
+        model_id=args.model, platform=args.platform, base_url=args.base_url
+    )
     return API.from_general_model(model=model)
 
 

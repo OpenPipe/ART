@@ -3,7 +3,10 @@ import os
 
 from tau_bench.model_utils.api.datapoint import Datapoint
 from tau_bench.model_utils.model.chat import ChatModel, Message
-from tau_bench.model_utils.model.completion import approx_cost_for_datapoint, approx_prompt_str
+from tau_bench.model_utils.model.completion import (
+    approx_cost_for_datapoint,
+    approx_prompt_str,
+)
 from tau_bench.model_utils.model.general_model import wrap_temperature
 from tau_bench.model_utils.model.utils import approx_num_tokens
 
@@ -53,20 +56,25 @@ class ClaudeModel(ChatModel):
                 raise ValueError(f"{ENV_VAR_API_KEY} environment variable is not set")
         # `anthropic-beta` header is needed for the 8192 context length (https://docs.anthropic.com/en/docs/about-claude/models)
         self.client = Anthropic(
-            api_key=api_key, default_headers={"anthropic-beta": "max-tokens-3-5-sonnet-2024-07-15"}
+            api_key=api_key,
+            default_headers={"anthropic-beta": "max-tokens-3-5-sonnet-2024-07-15"},
         )
         self.async_client = AsyncAnthropic(api_key=api_key)
         self.temperature = temperature
 
     def get_approx_cost(self, dp: Datapoint) -> float:
-        cost_per_token = PRICE_PER_INPUT_TOKEN_MAP.get(self.model, INPUT_PRICE_PER_TOKEN_FALLBACK)
+        cost_per_token = PRICE_PER_INPUT_TOKEN_MAP.get(
+            self.model, INPUT_PRICE_PER_TOKEN_FALLBACK
+        )
         return approx_cost_for_datapoint(dp=dp, price_per_input_token=cost_per_token)
 
     def get_latency(self, dp: Datapoint) -> float:
         latency_per_output_token = LATENCY_MS_PER_OUTPUT_TOKEN_MAP.get(
             self.model, LATENCY_MS_PER_OUTPUT_TOKEN_FALLBACK
         )
-        return approx_cost_for_datapoint(dp=dp, price_per_input_token=latency_per_output_token)
+        return approx_cost_for_datapoint(
+            dp=dp, price_per_input_token=latency_per_output_token
+        )
 
     def get_capability(self) -> float:
         return CAPABILITY_SCORE_MAP.get(self.model, CAPABILITY_SCORE_FALLBACK)

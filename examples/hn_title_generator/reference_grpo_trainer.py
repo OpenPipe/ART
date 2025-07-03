@@ -1,12 +1,11 @@
-import unsloth
 from unsloth import FastLanguageModel, is_bfloat16_supported
 from datasets import Dataset
 from trl import GRPOConfig, GRPOTrainer
 from dotenv import load_dotenv
 import wandb
-from transformers import PreTrainedTokenizer, AutoTokenizer
+from transformers import PreTrainedTokenizer
 import numpy as np
-from typing import Tuple, Coroutine, Any, Callable
+from typing import Tuple
 import asyncio
 from utils import (
     score_title,

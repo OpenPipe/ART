@@ -71,6 +71,7 @@ dev-dependencies = [
     "openpipe>=4.49.0",
     "hatch>=1.14.1",
     "skypilot[cudo,do,fluidstack,gcp,lambda,paperspace,runpod]==0.8.0",
+    "ruff>=0.12.1",
 ]
 
 [tool.uv.sources]

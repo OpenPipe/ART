@@ -1,6 +1,9 @@
 from tau_bench.model_utils.api.datapoint import Datapoint
 from tau_bench.model_utils.model.chat import ChatModel, Message
-from tau_bench.model_utils.model.completion import approx_cost_for_datapoint, approx_prompt_str
+from tau_bench.model_utils.model.completion import (
+    approx_cost_for_datapoint,
+    approx_prompt_str,
+)
 from tau_bench.model_utils.model.general_model import wrap_temperature
 from tau_bench.model_utils.model.utils import approx_num_tokens
 
@@ -84,7 +87,9 @@ class VLLMChatModel(ChatModel):
         self.latency_ms_per_output_token = (
             latency_ms_per_output_token
             if latency_ms_per_output_token is not None
-            else LATENCY_MS_PER_OUTPUT_TOKEN_MAP.get(model, LATENCY_MS_PER_OUTPUT_TOKEN_FALLBACK)
+            else LATENCY_MS_PER_OUTPUT_TOKEN_MAP.get(
+                model, LATENCY_MS_PER_OUTPUT_TOKEN_FALLBACK
+            )
         )
         self.max_context_length = (
             max_context_length
@@ -98,7 +103,9 @@ class VLLMChatModel(ChatModel):
 
     def get_latency(self, dp: Datapoint) -> float:
         latency_per_output_token = self.latency_ms_per_output_token
-        return approx_cost_for_datapoint(dp=dp, price_per_input_token=latency_per_output_token)
+        return approx_cost_for_datapoint(
+            dp=dp, price_per_input_token=latency_per_output_token
+        )
 
     def get_capability(self) -> float:
         return CAPABILITY_SCORE_MAP.get(self.model, CAPABILITY_SCORE_FALLBACK)

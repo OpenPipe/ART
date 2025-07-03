@@ -3,7 +3,6 @@
 from pydantic import BaseModel
 from typing import List, Dict, Any, Optional, Union
 
-import art
 
 RESPOND_ACTION_NAME = "respond"
 RESPOND_ACTION_FIELD_NAME = "content"

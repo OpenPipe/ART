@@ -1,5 +1,4 @@
 import argparse
-import art
 import sky
 from art_e.project_types import ProjectPolicyConfig
 import json

@@ -18,7 +18,7 @@ class SearchOnestopFlight(Tool):
                         and flight1["destination"] == flight2["origin"]
                     ):
                         date2 = (
-                            f"2024-05-{int(date[-2:])+1}"
+                            f"2024-05-{int(date[-2:]) + 1}"
                             if "+1" in flight1["scheduled_arrival_time_est"]
                             else date
                         )

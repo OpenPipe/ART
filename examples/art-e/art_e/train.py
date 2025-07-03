@@ -63,10 +63,10 @@ async def train(model: art.TrainableModel[ProjectPolicyConfig]):
             initial_step=await model.get_step(),
         )
 
-        for batch, epoch, global_step, epoch_step in train_iterator:
-            if global_step % model.config.training_config.eval_steps == 0:
-                print(f"\n--- Evaluating at Iteration {global_step} ---")
-                await benchmark_model(model, step=global_step)
+        for batch in train_iterator:
+            if batch.step % model.config.training_config.eval_steps == 0:
+                print(f"\n--- Evaluating at Iteration {batch.step} ---")
+                await benchmark_model(model, step=batch.step)
                 await model.delete_checkpoints()
                 await backend._experimental_push_to_s3(
                     model,
@@ -83,7 +83,7 @@ async def train(model: art.TrainableModel[ProjectPolicyConfig]):
                             )
                         )
                     )
-                    for scenario in batch
+                    for scenario in batch.items
                 )
             )
 
@@ -104,7 +104,7 @@ async def train(model: art.TrainableModel[ProjectPolicyConfig]):
                 for grp_idx, (g, res) in enumerate(zip(groups, results)):
                     if isinstance(res, Exception):
                         print(
-                            f"WARNING:JUDGE_GROUP_FAILED group={grp_idx} step={global_step}: {res!r}",
+                            f"WARNING:JUDGE_GROUP_FAILED group={grp_idx} step={batch.step}: {res!r}",
                             flush=True,
                         )
                     else:
@@ -116,12 +116,12 @@ async def train(model: art.TrainableModel[ProjectPolicyConfig]):
 
                 for g in groups:
                     for t in g.trajectories:
-                        report_trajectory(model, t, global_step)
+                        report_trajectory(model, t, batch.step)
 
                 # If every group failed, skip this training step entirely.
                 if not groups:
                     print(
-                        f"WARNING:ALL_JUDGE_GROUPS_FAILED step={global_step}; skipping training step",
+                        f"WARNING:ALL_JUDGE_GROUPS_FAILED step={batch.step}; skipping training step",
                         flush=True,
                     )
                     continue  # Proceed to next batch/epoch without training.
@@ -140,7 +140,7 @@ async def train(model: art.TrainableModel[ProjectPolicyConfig]):
                         std_dev = statistics.pstdev(rewards)
                     if std_dev < training_cfg.minimum_reward_std_dev:
                         print(
-                            f"WARNING:REWARD_STD_DEV_TOO_LOW group={grp_idx} step={global_step} stddev={std_dev:.4f}; dropping group",
+                            f"WARNING:REWARD_STD_DEV_TOO_LOW group={grp_idx} step={batch.step} stddev={std_dev:.4f}; dropping group",
                             flush=True,
                         )
                         continue
@@ -152,7 +152,7 @@ async def train(model: art.TrainableModel[ProjectPolicyConfig]):
                 # If every group failed the std dev filter, skip this training step
                 if not groups:
                     print(
-                        f"WARNING:ALL_GROUPS_DROPPED_LOW_STD_DEV step={global_step}; skipping training step",
+                        f"WARNING:ALL_GROUPS_DROPPED_LOW_STD_DEV step={batch.step}; skipping training step",
                         flush=True,
                     )
                     continue  # Proceed to next batch/epoch without training.
@@ -162,10 +162,14 @@ async def train(model: art.TrainableModel[ProjectPolicyConfig]):
                 config=art.TrainConfig(
                     learning_rate=model.config.training_config.learning_rate
                 ),
-                _config=art.dev.TrainConfig(allow_training_without_logprobs=True if model.config.training_config.messages_only else False)
+                _config=art.dev.TrainConfig(
+                    allow_training_without_logprobs=True
+                    if model.config.training_config.messages_only
+                    else False
+                ),
             )
 
-        await benchmark_model(model, step=global_step)
+        await benchmark_model(model, step=batch.step)
         await backend._experimental_push_to_s3(
             model,
             s3_bucket=os.environ["BACKUP_BUCKET"],

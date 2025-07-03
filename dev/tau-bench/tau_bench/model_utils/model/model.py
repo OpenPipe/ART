@@ -126,5 +126,10 @@ class ScoreModel(Model):
 
 
 AnyModel = (
-    BinaryClassifyModel | ClassifyModel | ParseForceModel | GenerateModel | ParseModel | ScoreModel
+    BinaryClassifyModel
+    | ClassifyModel
+    | ParseForceModel
+    | GenerateModel
+    | ParseModel
+    | ScoreModel
 )

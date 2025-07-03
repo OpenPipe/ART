@@ -40,8 +40,7 @@ def type_to_json_schema_string(typ: type[T]) -> str:
 
 
 def optionalize_type(typ: type[T]) -> type[T]:
-    class OptionalModel(typ):
-        ...
+    class OptionalModel(typ): ...
 
     new_fields = {}
     for name, field in OptionalModel.model_fields.items():

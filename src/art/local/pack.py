@@ -181,7 +181,10 @@ def plot_packed_tensors(packed_tensors: PackedTensors) -> None:
     ):
         plt.subplot(4, 2, subplot_idx)
         sns.heatmap(
-            tensor.numpy(), cmap="viridis", cbar_kws={"label": label}, xticklabels=False  # type: ignore
+            tensor.numpy(),
+            cmap="viridis",
+            cbar_kws={"label": label},
+            xticklabels=False,  # type: ignore
         )
         plt.title(title)
         plt.xlabel("Sequence Position")
