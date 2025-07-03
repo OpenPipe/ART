@@ -12,7 +12,7 @@ API_KEY_ENV_VAR = "OPENAI_API_KEY"
 PRICE_PER_INPUT_TOKEN_MAP = {
     "gpt-4o-2024-08-06": 2.5 / 1000000,
     "gpt-4o": 5 / 1000000,
-    "gpt-4o-2024-08-06": 2.5 / 1000000,
+    "gpt-4o-2024-08-06": 2.5 / 1000000,  # noqa: F601
     "gpt-4o-2024-05-13": 5 / 1000000,
     "gpt-4-turbo": 10 / 1000000,
     "gpt-4-turbo-2024-04-09": 10 / 1000000,
@@ -28,7 +28,7 @@ INPUT_PRICE_PER_TOKEN_FALLBACK = 10 / 1000000
 CAPABILITY_SCORE_MAP = {
     "gpt-4o-2024-08-06": 0.8,
     "gpt-4o": 0.8,
-    "gpt-4o-2024-08-06": 0.8,
+    "gpt-4o-2024-08-06": 0.8,  # noqa: F601
     "gpt-4o-2024-05-13": 0.8,
     "gpt-4-turbo": 0.9,
     "gpt-4-turbo-2024-04-09": 0.9,
@@ -48,7 +48,7 @@ LATENCY_MS_PER_OUTPUT_TOKEN_FALLBACK = 0.0
 MAX_CONTEXT_LENGTH_MAP = {
     "gpt-4o-2024-08-06": 128000,
     "gpt-4o": 128000,
-    "gpt-4o-2024-08-06": 128000,
+    "gpt-4o-2024-08-06": 128000,  # noqa: F601
     "gpt-4o-2024-05-13": 128000,
     "gpt-4-turbo": 128000,
     "gpt-4-turbo-2024-04-09": 128000,
