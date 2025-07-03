@@ -138,9 +138,9 @@ class TorchtuneService:
     @property
     def torchtune_args(self) -> dev.TorchtuneArgs:
         torchtune_args = self.config.get("torchtune_args")
-        assert (
-            torchtune_args is not None
-        ), 'TorchtuneService created without config["torchtune_args"]'
+        assert torchtune_args is not None, (
+            'TorchtuneService created without config["torchtune_args"]'
+        )
         return torchtune_args
 
     @cached_property

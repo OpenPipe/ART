@@ -142,9 +142,9 @@ async def consume_chat_completion_stream(
                         choice.message.tool_calls[tool_call.index].id = tool_call.id
                     if tool_call.function:
                         if tool_call.function.name:
-                            choice.message.tool_calls[tool_call.index].function.name = (
-                                tool_call.function.name
-                            )
+                            choice.message.tool_calls[
+                                tool_call.index
+                            ].function.name = tool_call.function.name
                         if tool_call.function.arguments:
                             choice.message.tool_calls[
                                 tool_call.index

@@ -179,9 +179,9 @@ def tokenize_trajectory(
         if isinstance(message_or_choice, dict):
             continue
         choice = message_or_choice
-        assert (
-            choice.logprobs or allow_training_without_logprobs
-        ), "Chat completion choices must have logprobs"
+        assert choice.logprobs or allow_training_without_logprobs, (
+            "Chat completion choices must have logprobs"
+        )
         if not choice.logprobs:
             continue
         token_logprobs = choice.logprobs.content or choice.logprobs.refusal or []

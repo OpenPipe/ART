@@ -379,7 +379,6 @@ async def train(model: art.TrainableModel[TauBenchPolicyConfig]):
 def main():
     """Entry point: expects a JSON-serialized TrainableModel (model_json) just like art-e/train.py"""
 
-
     parser = argparse.ArgumentParser(
         description="Run RL training for a serialized TrainableModel"
     )

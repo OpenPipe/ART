@@ -17,12 +17,13 @@ def freeze_tool_schema(tool: dict, fixed_args: dict) -> ChatCompletionToolParam:
     """
     fields = {k: (Literal[v], ...) for k, v in fixed_args.items()}
     FrozenModel = create_model(
-        f"{tool['function']['name'].title()}FrozenArgs", **fields # type: ignore
+        f"{tool['function']['name'].title()}FrozenArgs",
+        **fields,  # type: ignore
     )
 
     locked = deepcopy(tool)
     locked["function"]["parameters"] = FrozenModel.model_json_schema()
-    return locked # type: ignore
+    return locked  # type: ignore
 
 
 def get_guided_completion_params(
@@ -63,9 +64,9 @@ def get_guided_completion_params(
         }
         chosen_tool = next(t for t in base_tools if t["function"]["name"] == tool_name)
         tool_params = [
-            freeze_tool_schema(chosen_tool, json.loads(tool_call.function.arguments)) # type: ignore
+            freeze_tool_schema(chosen_tool, json.loads(tool_call.function.arguments))  # type: ignore
         ]
     else:
         content = completion.choices[0].message.content
         guided_choice = [content]
-    return (guided_choice, tool_choice, tool_params) # type: ignore
+    return (guided_choice, tool_choice, tool_params)  # type: ignore

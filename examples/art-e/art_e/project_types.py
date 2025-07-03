@@ -22,6 +22,7 @@ class TrainingConfig(BaseModel):
     training_dataset_seed: int | None = None
     messages_only: bool = False
 
+
 class ProjectPolicyConfig(BaseModel):
     max_turns: int = 10
     max_tokens: int = 2048

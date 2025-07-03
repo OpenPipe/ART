@@ -58,7 +58,9 @@ def build_score_state(
     max: int,
     examples: list[ScoreDatapoint] | None = None,
 ) -> str:
-    def display_sample(instr: str, t: str, min: int, max: int, response: int | None = None) -> str:
+    def display_sample(
+        instr: str, t: str, min: int, max: int, response: int | None = None
+    ) -> str:
         p = task_prompt(
             task='Score the following text with the provided instruction and range as an integer value in valid JSON:\n{"score": number}',
             text=force_json_prompt(
@@ -73,7 +75,10 @@ def build_score_state(
 
     p = (
         "\n\n".join(
-            [display_sample(ex.instruction, ex.text, min, max, ex.response) for ex in examples]
+            [
+                display_sample(ex.instruction, ex.text, min, max, ex.response)
+                for ex in examples
+            ]
         )
         if examples is not None
         else ""
@@ -171,7 +176,10 @@ def build_parse_state(
     p = ""
     if examples is not None and len(examples) > 0:
         p = "\n\n".join(
-            [display_sample(t=ex.text, ty=ex.typ, response=ex.response) for ex in examples]
+            [
+                display_sample(t=ex.text, ty=ex.typ, response=ex.response)
+                for ex in examples
+            ]
         )
     return f"{p}\n\n{display_sample(t=text, ty=typ)}"
 
@@ -233,7 +241,8 @@ def build_generate_state(
         return prompt
 
     prompt = (
-        "\n\n".join([display_sample(ex.instruction, ex.text) for ex in examples]) + "\n\n"
+        "\n\n".join([display_sample(ex.instruction, ex.text) for ex in examples])
+        + "\n\n"
         if examples is not None and len(examples) > 0
         else ""
     )
@@ -242,12 +251,17 @@ def build_generate_state(
 
 class CompletionModel(GeneralModel):
     @abc.abstractmethod
-    def generate_from_prompt(self, prompt: str, temperature: float | None = None) -> str:
+    def generate_from_prompt(
+        self, prompt: str, temperature: float | None = None
+    ) -> str:
         raise NotImplementedError
 
     @abc.abstractmethod
     def parse_force_from_prompt(
-        self, prompt: str, typ: BaseModel | dict[str, Any], temperature: float | None = None
+        self,
+        prompt: str,
+        typ: BaseModel | dict[str, Any],
+        temperature: float | None = None,
     ) -> dict[str, Any]:
         raise NotImplementedError
 
@@ -256,10 +270,14 @@ class CompletionModel(GeneralModel):
             return parse_json_or_json_markdown(content)
         except (json.decoder.JSONDecodeError, ValueError) as e:
             raise ModelError(
-                short_message=f"Failed to decode JSON: {content}", prompt=prompt, response=content
+                short_message=f"Failed to decode JSON: {content}",
+                prompt=prompt,
+                response=content,
             ) from e
 
-    def _handle_classify_response(self, res: dict[str, int], decode_map: dict[str, int]) -> int:
+    def _handle_classify_response(
+        self, res: dict[str, int], decode_map: dict[str, int]
+    ) -> int:
         if "classification" not in res:
             raise ModelError(f"Invalid response from model: {res}")
         choice = res["classification"]
@@ -278,8 +296,12 @@ class CompletionModel(GeneralModel):
         examples: list[ClassifyDatapoint] | None = None,
         temperature: float | None = None,
     ) -> int:
-        prompt, decode_map = build_classify_state(instruction, text, options, examples=examples)
-        res = self.parse_force_from_prompt(prompt, typ=Classification, temperature=temperature)
+        prompt, decode_map = build_classify_state(
+            instruction, text, options, examples=examples
+        )
+        res = self.parse_force_from_prompt(
+            prompt, typ=Classification, temperature=temperature
+        )
         return self._handle_classify_response(res, decode_map)
 
     def parse(
@@ -290,7 +312,9 @@ class CompletionModel(GeneralModel):
         temperature: float | None = None,
     ) -> T | PartialObj | dict[str, Any]:
         prompt = build_parse_state(text, typ, examples=examples)
-        res = self.parse_force_from_prompt(prompt=prompt, typ=typ, temperature=temperature)
+        res = self.parse_force_from_prompt(
+            prompt=prompt, typ=typ, temperature=temperature
+        )
         return json_response_to_obj_or_partial_obj(response=res, typ=typ)
 
     def generate(
@@ -300,7 +324,9 @@ class CompletionModel(GeneralModel):
         examples: list[GenerateDatapoint] | None = None,
         temperature: float | None = None,
     ) -> str:
-        prompt = build_generate_state(instruction=instruction, text=text, examples=examples)
+        prompt = build_generate_state(
+            instruction=instruction, text=text, examples=examples
+        )
         return self.generate_from_prompt(prompt=prompt, temperature=temperature)
 
     def _handle_parse_force_response(self, res: dict[str, Any], typ: type[T]) -> T:
@@ -320,7 +346,9 @@ class CompletionModel(GeneralModel):
         prompt = build_parse_force_state(
             instruction=instruction, text=text, typ=typ, examples=examples
         )
-        res = self.parse_force_from_prompt(prompt=prompt, typ=typ, temperature=temperature)
+        res = self.parse_force_from_prompt(
+            prompt=prompt, typ=typ, temperature=temperature
+        )
         return self._handle_parse_force_response(res, typ)
 
     def _handle_score_response(
@@ -348,7 +376,9 @@ class CompletionModel(GeneralModel):
         temperature: float | None = None,
     ) -> int:
         prompt = build_score_state(instruction, text, min, max, examples=examples)
-        res = self.parse_force_from_prompt(prompt=prompt, typ=Score, temperature=temperature)
+        res = self.parse_force_from_prompt(
+            prompt=prompt, typ=Score, temperature=temperature
+        )
         return self._handle_score_response(res, min, max)
 
 
@@ -436,7 +466,9 @@ def build_classify_prompts(
             instruction=dp.instruction, text=dp.text, options=dp.options
         )
         if include_response:
-            json_response_object = label_idx_to_label_json(idx=dp.response, decode_map=decode_map)
+            json_response_object = label_idx_to_label_json(
+                idx=dp.response, decode_map=decode_map
+            )
             json_response = add_md_close_tag(json_response_object)
             datapoints.append(prompt + json_response)
         else:
@@ -519,18 +551,24 @@ def approx_cost_for_datapoint(
 
 
 # TODO: handle examples
-def approx_latency_for_datapoint(dp: Datapoint, latency_ms_per_output_token: float) -> float:
+def approx_latency_for_datapoint(
+    dp: Datapoint, latency_ms_per_output_token: float
+) -> float:
     if isinstance(dp, BinaryClassifyDatapoint) or isinstance(dp, ClassifyDatapoint):
         approx_response = '{"classification": 0}'
     elif isinstance(dp, ParseDatapoint):
         # this is extremely approximate
-        approx_response = '{"street": "main st", "city": "san francisco", "state": "CA"}'
+        approx_response = (
+            '{"street": "main st", "city": "san francisco", "state": "CA"}'
+        )
     elif isinstance(dp, GenerateDatapoint):
         # this is extremely approximate
         approx_response = "This is a generated text response."
     elif isinstance(dp, ParseForceDatapoint):
         # this is extremely approximate
-        approx_response = '{"street": "main st", "city": "san francisco", "state": "CA"}'
+        approx_response = (
+            '{"street": "main st", "city": "san francisco", "state": "CA"}'
+        )
     elif isinstance(dp, ScoreDatapoint):
         approx_response = '{"score": 0}'
     else:

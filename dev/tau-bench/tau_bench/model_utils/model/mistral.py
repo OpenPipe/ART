@@ -2,7 +2,10 @@ import os
 
 from tau_bench.model_utils.api.datapoint import Datapoint
 from tau_bench.model_utils.model.chat import ChatModel, Message
-from tau_bench.model_utils.model.completion import approx_cost_for_datapoint, approx_prompt_str
+from tau_bench.model_utils.model.completion import (
+    approx_cost_for_datapoint,
+    approx_prompt_str,
+)
 from tau_bench.model_utils.model.general_model import wrap_temperature
 from tau_bench.model_utils.model.utils import approx_num_tokens
 
@@ -31,7 +34,10 @@ MAX_CONTEXT_LENGTH_FALLBACK = 128000
 
 class MistralModel(ChatModel):
     def __init__(
-        self, model: str | None = None, api_key: str | None = None, temperature: float = 0.0
+        self,
+        model: str | None = None,
+        api_key: str | None = None,
+        temperature: float = 0.0,
     ) -> None:
         from mistralai.async_client import MistralAsyncClient
         from mistralai.client import MistralClient
@@ -70,14 +76,18 @@ class MistralModel(ChatModel):
         )
 
     def get_approx_cost(self, dp: Datapoint) -> float:
-        cost_per_token = PRICE_PER_INPUT_TOKEN_MAP.get(self.model, INPUT_PRICE_PER_TOKEN_FALLBACK)
+        cost_per_token = PRICE_PER_INPUT_TOKEN_MAP.get(
+            self.model, INPUT_PRICE_PER_TOKEN_FALLBACK
+        )
         return approx_cost_for_datapoint(dp=dp, price_per_input_token=cost_per_token)
 
     def get_latency(self, dp: Datapoint) -> float:
         latency_per_output_token = LATENCY_MS_PER_OUTPUT_TOKEN_MAP.get(
             self.model, LATENCY_MS_PER_OUTPUT_TOKEN_FALLBACK
         )
-        return approx_cost_for_datapoint(dp=dp, price_per_input_token=latency_per_output_token)
+        return approx_cost_for_datapoint(
+            dp=dp, price_per_input_token=latency_per_output_token
+        )
 
     def get_capability(self) -> float:
         return CAPABILITY_SCORE_MAP.get(self.model, CAPABILITY_SCORE_FALLBACK)

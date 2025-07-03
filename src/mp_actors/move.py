@@ -24,6 +24,7 @@ T = TypeVar("T")
 # Special ID to signal shutdown
 _SHUTDOWN_ID = "__shutdown__"
 
+
 def move_to_child_process(
     obj: T, log_file: str | None = None, process_name: str | None = None
 ) -> T:

@@ -13,6 +13,26 @@ Install the dependencies:
 uv sync
 ```
 
+### Code Formatting and Linting
+
+This project uses [ruff](https://github.com/astral-sh/ruff) for both code formatting and linting. Before submitting a pull request, please ensure your code passes both checks:
+
+```bash
+# Check code formatting
+uv run ruff format --check .
+
+# Run linting checks
+uv run ruff check .
+
+# To automatically fix formatting issues
+uv run ruff format .
+
+# To automatically fix some linting issues
+uv run ruff check --fix .
+```
+
+These checks are automatically run in CI for all pull requests. You can also install ruff as a pre-commit hook if desired.
+
 Then follow the SkyPilot or Local Training instructions below.
 
 > **Warning:** There is currently a bug with tool use functionality. The issue appears to be that vLLM does not return all the token log probabilities for tool use. Further investigation is needed to determine the exact cause. For now, teaching use case-specific tool use with non-tool use models is the recommended workaround.

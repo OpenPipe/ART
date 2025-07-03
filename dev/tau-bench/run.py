@@ -7,6 +7,7 @@ from litellm import provider_list
 from tau_bench.envs.user import UserStrategy
 
 from dotenv import load_dotenv
+
 load_dotenv(override=True)
 
 
@@ -60,7 +61,12 @@ def parse_args() -> RunConfig:
     )
     parser.add_argument("--start-index", type=int, default=0)
     parser.add_argument("--end-index", type=int, default=-1, help="Run all tasks if -1")
-    parser.add_argument("--task-ids", type=int, nargs="+", help="(Optional) run only the tasks with the given IDs")
+    parser.add_argument(
+        "--task-ids",
+        type=int,
+        nargs="+",
+        help="(Optional) run only the tasks with the given IDs",
+    )
     parser.add_argument("--log-dir", type=str, default="results")
     parser.add_argument(
         "--max-concurrency",
@@ -70,8 +76,17 @@ def parse_args() -> RunConfig:
     )
     parser.add_argument("--seed", type=int, default=10)
     parser.add_argument("--shuffle", type=int, default=0)
-    parser.add_argument("--user-strategy", type=str, default="llm", choices=[item.value for item in UserStrategy])
-    parser.add_argument("--few-shot-displays-path", type=str, help="Path to a jsonlines file containing few shot displays")
+    parser.add_argument(
+        "--user-strategy",
+        type=str,
+        default="llm",
+        choices=[item.value for item in UserStrategy],
+    )
+    parser.add_argument(
+        "--few-shot-displays-path",
+        type=str,
+        help="Path to a jsonlines file containing few shot displays",
+    )
     args = parser.parse_args()
     print(args)
     return RunConfig(

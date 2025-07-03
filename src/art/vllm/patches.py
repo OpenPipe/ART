@@ -140,7 +140,9 @@ def patch_get_lora_tokenizer_async() -> None:
     vllm.transformers_utils.tokenizer_group.get_lora_tokenizer_async = (  # type: ignore
         _return_nothing
     )
-    vllm.transformers_utils.tokenizer_group.TokenizerGroup.get_lora_tokenizer_async = get_self_lora_tokenizer_async  # type: ignore
+    vllm.transformers_utils.tokenizer_group.TokenizerGroup.get_lora_tokenizer_async = (
+        get_self_lora_tokenizer_async  # type: ignore
+    )
 
 
 def patch_listen_for_disconnect() -> None:

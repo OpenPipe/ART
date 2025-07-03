@@ -787,10 +787,10 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
             print("b  q_blk  kv_blk | dense  block")
             for b, q, kv in idx[:max_print]:
                 print(
-                    f"{b:2d} {q:6d} {kv:7d} |   {int(dense_blk[b,q,kv])}      {int(bm_blk[b,q,kv])}"
+                    f"{b:2d} {q:6d} {kv:7d} |   {int(dense_blk[b, q, kv])}      {int(bm_blk[b, q, kv])}"
                 )
             if idx.size(0) > max_print:
-                print(f"... (+{idx.size(0)-max_print} more)")
+                print(f"... (+{idx.size(0) - max_print} more)")
 
         # ---------------------------------------------------------------------
         # EXAMPLE USAGE inside your training loop -----------------------------
@@ -842,9 +842,7 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
             )  # [chunk_size, vocab_size]
             selected_logits = torch.gather(
                 logits, dim=-1, index=next_token_ids.unsqueeze(-1)
-            ).squeeze(
-                -1
-            )  # [chunk_size]
+            ).squeeze(-1)  # [chunk_size]
             logsumexp = torch.logsumexp(logits, dim=-1)  # [chunk_size]
             new_logprobs = selected_logits - logsumexp
             old_logprobs = torch.where(
@@ -1097,7 +1095,6 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
                             *,
                             step: int | None = None,
                         ) -> None:
-
                             logger = self._logger
 
                             class DictWrapper(dict):
@@ -1145,19 +1142,27 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
                         )
                         if self._is_rank_zero:
                             # Ensure checkpoints directory exists
-                            checkpoint_dir = os.path.join(self._output_dir, "checkpoints")
+                            checkpoint_dir = os.path.join(
+                                self._output_dir, "checkpoints"
+                            )
                             os.makedirs(checkpoint_dir, exist_ok=True)
-                            
+
                             # Get the next step number from the checkpoints directory
-                            next_step = max(
-                                (
-                                    int(subdir)
-                                    for subdir in os.listdir(checkpoint_dir)
-                                    if os.path.isdir(os.path.join(checkpoint_dir, subdir)) and subdir.isdigit()
-                                ),
-                                default=0,
-                            ) + 1
-                            
+                            next_step = (
+                                max(
+                                    (
+                                        int(subdir)
+                                        for subdir in os.listdir(checkpoint_dir)
+                                        if os.path.isdir(
+                                            os.path.join(checkpoint_dir, subdir)
+                                        )
+                                        and subdir.isdigit()
+                                    ),
+                                    default=0,
+                                )
+                                + 1
+                            )
+
                             os.rename(
                                 f"{self._output_dir}/epoch_0",
                                 f"{checkpoint_dir}/{next_step:04d}",

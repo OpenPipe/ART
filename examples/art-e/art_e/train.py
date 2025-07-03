@@ -162,7 +162,11 @@ async def train(model: art.TrainableModel[ProjectPolicyConfig]):
                 config=art.TrainConfig(
                     learning_rate=model.config.training_config.learning_rate
                 ),
-                _config=art.dev.TrainConfig(allow_training_without_logprobs=True if model.config.training_config.messages_only else False)
+                _config=art.dev.TrainConfig(
+                    allow_training_without_logprobs=True
+                    if model.config.training_config.messages_only
+                    else False
+                ),
             )
 
         await benchmark_model(model, step=global_step)
