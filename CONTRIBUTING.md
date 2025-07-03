@@ -3,8 +3,8 @@
 Clone the repository:
 
 ```bash
-git clone https://github.com/OpenPipe/agent-reinforcement-training.git
-cd agent-reinforcement-training
+git clone https://github.com/OpenPipe/ART.git
+cd ART
 ```
 
 Install the dependencies:
