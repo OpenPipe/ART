@@ -1,5 +1,4 @@
 from art_e.rollout import ProjectTrajectory
-from art_e.project_types import TrainingConfig
 from typing import List, Literal
 import json
 from litellm import acompletion

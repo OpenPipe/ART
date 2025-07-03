@@ -395,8 +395,6 @@ def comparison_models_bar_chart(
         The created figure so that it can be displayed inline in IPython /
         Jupyter notebooks.
     """
-    import os
-    from pathlib import Path
 
     import matplotlib.pyplot as plt
     import numpy as np

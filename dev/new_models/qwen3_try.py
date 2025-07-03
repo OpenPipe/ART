@@ -3,7 +3,6 @@ import json
 import art
 from art.local import LocalBackend
 from dotenv import load_dotenv
-import openai
 
 load_dotenv()
 

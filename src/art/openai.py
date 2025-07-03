@@ -130,7 +130,7 @@ async def consume_chat_completion_stream(
                 if choice.message.tool_calls is None:
                     choice.message.tool_calls = []
                 for tool_call in chunk_choice.delta.tool_calls:
-                    while not tool_call.index in range(len(choice.message.tool_calls)):
+                    while tool_call.index not in range(len(choice.message.tool_calls)):
                         choice.message.tool_calls.append(
                             ChatCompletionMessageToolCall(
                                 id="",

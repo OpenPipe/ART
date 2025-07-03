@@ -11,13 +11,11 @@ from typing import List, Dict, Any
 from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor
 
-import art
 from tau_bench.envs import get_env
 from tau_bench.agents.base import Agent
 from tau_bench.types import EnvRunResult, RunConfig
 from litellm import provider_list
 from tau_bench.envs.user import UserStrategy
-from tau_bench.types import TauBenchPolicyConfig
 
 from langfuse import Langfuse
 

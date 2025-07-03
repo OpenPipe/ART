@@ -1,7 +1,6 @@
 # %%
 import pandas as pd
 from datasets import load_dataset
-import random
 import sqlite3
 import collections.abc
 from art_e.data.local_email_db import DEFAULT_DB_PATH
@@ -124,7 +123,6 @@ conn.close()
 
 # %%
 
-from art_e.email_search_tools import read_email
 from IPython.display import display, HTML
 import sqlite3
 import collections.abc
@@ -201,7 +199,6 @@ display(HTML(html_table))
 good_df_list = good_df.to_dict(orient="records")
 
 
-import json
 
 good_df_json = json.dumps(good_df_list, indent=2)
 

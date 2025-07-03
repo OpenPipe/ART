@@ -141,7 +141,7 @@ def apply_agent_move(game: TwentyFortyEightGame, move_xml: str) -> None:
     try:
         root = ET.fromstring(move_xml)
         direction = root.text
-    except Exception as e:
+    except Exception:
         raise ValueError("Invalid xml")
 
     if direction not in ["left", "right", "up", "down"]:

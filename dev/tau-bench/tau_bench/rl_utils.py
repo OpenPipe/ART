@@ -3,7 +3,7 @@
 import os
 from typing import Any, Dict, List
 import art
-from openpipe.client import AsyncOpenPipe, OpenPipe, UpdateLogTagsRequestFiltersItem
+from openpipe.client import AsyncOpenPipe, UpdateLogTagsRequestFiltersItem
 from langfuse import Langfuse
 from art.trajectories import MetadataValue
 import uuid

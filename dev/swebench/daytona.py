@@ -423,7 +423,7 @@ sys.exit(exit_code)
             break
 
         # Analyze results
-        logger.log(f"\nTest Results:")
+        logger.log("\nTest Results:")
         logger.log(f"Exit code: {result.exit_code}")
 
         output = result.result
@@ -463,7 +463,7 @@ sys.exit(exit_code)
         logger.log(f"Errors: {results['errors']}")
 
         # Show expectations and summary
-        logger.log(f"\nExpectations:")
+        logger.log("\nExpectations:")
         logger.log(f"FAIL_TO_PASS tests ({results['fail_to_pass_count']}): Should fail")
         logger.log(f"PASS_TO_PASS tests ({results['pass_to_pass_count']}): Should pass")
 
@@ -555,7 +555,7 @@ sys.exit(exit_code)
             fail_diff = results["total_issues"] - results["fail_to_pass_count"]
             pass_diff = results["passed"] - results["pass_to_pass_count"]
 
-            error_msg = f"Test count mismatch!\n"
+            error_msg = "Test count mismatch!\n"
             error_msg += f"Expected: {results['fail_to_pass_count']} failures, {results['pass_to_pass_count']} passes\n"
             error_msg += f"Actual:   {results['total_issues']} failures/errors, {results['passed']} passes\n"
 

@@ -1,7 +1,7 @@
 import pandas as pd
 
 from .load_benchmarked_models import load_benchmarked_models
-from .types import BenchmarkedModelKey, BenchmarkedModel
+from .types import BenchmarkedModelKey
 
 def generate_comparison_table(
     project: str,

@@ -51,7 +51,7 @@ def apply_agent_move(game: TicTacToeGame, move: str) -> None:
     try:
         root = ET.fromstring(move)
         square = root.text
-    except Exception as e:
+    except Exception:
         raise ValueError("Invalid xml")
 
     try:

@@ -58,7 +58,6 @@ from .config import (
 )
 from .. import dev, types
 from ..local.pack import PackedTensors, packed_tensors_from_dir
-from ..utils.get_model_step import get_step_from_dir
 
 
 class FullFinetuneRecipeDistributed(FTRecipeInterface):
@@ -695,7 +694,7 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
         config: types.TrainConfig,
         dev_config: dev.TrainConfig,
     ) -> torch.Tensor:
-        from ..unsloth.train import calculate_mask, shift_tensor
+        from ..unsloth.train import shift_tensor
 
         import torch
         from torch.nn.attention.flex_attention import create_block_mask, BlockMask
@@ -1213,7 +1212,7 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
             # Fallback: try the standard .to() method
             try:
                 self._model.to(device)
-                print(f"Fallback: moved model using .to() method")
+                print("Fallback: moved model using .to() method")
             except Exception as e2:
                 print(f"Both methods failed: {e2}")
                 return

@@ -1,6 +1,5 @@
 # %%
 
-import polars as pl
 
 from art_e.evaluate.load_trajectories import load_trajectories
 

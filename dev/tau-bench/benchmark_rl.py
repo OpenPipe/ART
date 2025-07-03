@@ -9,8 +9,7 @@ from typing import List, Dict, Any
 from dotenv import load_dotenv
 
 import art
-from art.utils import iterate_dataset
-from tau_bench.types import RunConfig, TauBenchPolicyConfig, TauBenchTrainingConfig
+from tau_bench.types import RunConfig, TauBenchPolicyConfig
 from tau_bench.envs import get_env
 from tau_bench.run import display_metrics
 from tau_bench.types import EnvRunResult
@@ -18,7 +17,7 @@ from litellm import provider_list
 from tau_bench.envs.user import UserStrategy
 
 # Import evaluate_model and rollout functions from run_rl
-from run_rl import evaluate_model, rollout_tau_bench_task
+from run_rl import rollout_tau_bench_task
 
 # Load environment variables
 load_dotenv(override=True)

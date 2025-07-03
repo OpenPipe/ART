@@ -162,7 +162,6 @@ async def load_trajectories(
             "step": pl.Int64,
             "reward": pl.Float64,
             "group_number": pl.Int64,
-            "messages": pl.Object,
             "messages": pl.List(
                 pl.Struct(
                     {

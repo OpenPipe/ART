@@ -16,10 +16,8 @@ from art.utils import iterate_dataset
 from tau_bench.types import RunConfig, SolveResult
 from tau_bench.envs import get_env
 from tau_bench.run import agent_factory
-from litellm import provider_list
-from tau_bench.envs.user import UserStrategy
 from tau_bench.agents.tool_calling_agent import ToolCallingRLAgent
-from tau_bench.types import TauBenchPolicyConfig, TauBenchTrainingConfig
+from tau_bench.types import TauBenchPolicyConfig
 from tau_bench.general_rm import create_general_rm_trajectory_groups
 from tau_bench.rl_utils import (
     log_trajectory_to_openpipe,
@@ -381,7 +379,6 @@ async def train(model: art.TrainableModel[TauBenchPolicyConfig]):
 def main():
     """Entry point: expects a JSON-serialized TrainableModel (model_json) just like art-e/train.py"""
 
-    import argparse
 
     parser = argparse.ArgumentParser(
         description="Run RL training for a serialized TrainableModel"

@@ -5,7 +5,6 @@ This script sends 5 concurrent requests with approximately 1000 input tokens
 and requests approximately 1000 output tokens (max_tokens=1000), repeating
 for 10 iterations. It measures per-request latencies and summarizes statistics.
 """
-import os
 import time
 import asyncio
 import statistics
