@@ -1,65 +1,47 @@
 ---
 title: "Quick Start"
-description: "Get started with OpenPipe in a few quick steps."
+description: "Get started with ART in a few quick steps."
 icon: "forward"
 ---
 
-## Step 1: Create Your OpenPipe Account
+In this Quick Start tutorial, we'll be training Qwen 2.5 3B to play [2048](https://play2048.co/), a simple game that requires forward planning and basic math skills.
 
-If you don't already have one, create an account with OpenPipe at https://app.openpipe.ai/. You can sign up with GitHub, so you don't need to remember an extra password.
+<Info>
 
-## Step 2: Find Your Project API Key
+Reading time: <b>15 min</b>
 
-In order to capture your calls and fine-tune a model on them, we need an API key to authenticate you and determine which project to store your logs under.
+Training time: <b>2 hours</b>
 
-<Note>
-  When you created your account, a project was automatically configured for you
-  as well. Find its API key at https://app.openpipe.ai/settings.
-</Note>
+Total cost: <b>Free!</b>
 
-## Step 3: Record Training Data (Optional)
+</Info>
 
-If you don't have any training data, you can record it by integrating the OpenPipe SDK or using the OpenPipe Proxy. If you already have a dataset, you can skip this step!
+## Step 1: Provision optional API keys
 
-<CardGroup cols={2}>
-  <Card
-    title="Installing the SDK"
-    icon="code"
-    iconType="duotone"
-    href="/getting-started/openpipe-sdk"
-  ></Card>
-  <Card
-    title="Using the OpenPipe Proxy"
-    icon="layer-group"
-    href="/features/request-logs/logging-requests#proxy"
-  ></Card>
-</CardGroup>
+[ART](https://github.com/OpenPipe/art) is an open source library and does not require an API key to run in Google Colab, which we'll use for this quick start. But if you're interested in seeing the progress of your training runs and inspecting your model's completions as it trains, you can optionally provision API keys from platforms like Weights & Biases and OpenPipe.
 
-## Step 4: Prepare a Dataset
+If you'd like to enable observability while working through this guide, create accounts and API keys on the links below.
 
-Datasets are the core of OpenPipe. They store your training data, and allow you to fine-tune and evaluate models on it. To learn more about datasets, check out the [Datasets](/features/datasets/overview) page.
+- [OpenPipe](https://app.openpipe.ai)
+- [Weights & Biases](https://wandb.ai/home)
 
-Datasets can be populated in two ways:
+Once you have your Weights & Biases and OpenPipe API keys, open the [notebook](https://colab.research.google.com/github/openpipe/art/blob/main/examples/2048/2048.ipynb) in Google Colab and set them in the **Environment Variables** cell.
 
-1. [Uploading external data](/features/datasets/uploading-data)
-2. [Importing request logs](/features/datasets/importing-logs)
+Once your API keys are set, or if you won't need observability while completing this walkthrough, continue on to the next step.
 
-If you already have a dataset, we recommend uploading it as a starting point. Otherwise, make sure you set up request logging in step 3!
+## Step 2: Prepare your notebook
 
-## Step 5: Fine Tune a Model
+If you have't already, open the [notebook](https://colab.research.google.com/github/openpipe/art/blob/main/examples/2048/2048.ipynb) in Google Colab and connect to a T4 runtime environment.
 
-Once your dataset has been created and populated, you can fine-tune models on it. Follow the [fine-tuning quickstart](/features/fine-tuning/quick-start) guide to kick off your first fine-tuning run.
+<Accordion title="Connecting to a T4 GPU">
+  In the top bar of your Google Colab notebook, find *Runtime* > *Change runtime
+  type* to open the selection modal. Select **T4 GPU** and hit **Save**.
+</Accordion>
 
-<Frame>![](/images/features/fine-tuning/fine-tune-modal.png)</Frame>
+Due to a quirk in the default Google Colab settings, you'll have restart the runtime session after installing `numpy<2.0.0`. To do this, run the first `pip install` cell, and restart the session when it completes (_Runtime_ > _Restart session and run all_).
 
-We recommend training several models of varying sizes and configurations to determine the best one for your use case. If you have questions on this step, please reach out to us at [support@openpipe.ai](mailto:support@openpipe.ai)!
+## Step 3: Run the notebook
 
-## Step 6: Evaluate Your Model
+From here on out, you can follow the instructions in the notebook! While training is occuring, remember to track your progress in [Weights and Biases](https://wandb.ai) and [OpenPipe](https://app.openpipe.ai).
 
-Once your model (or models) have been fine-tuned, you can evaluate them. To learn more about evaluating models, check out the [Evaluations](/features/evaluations/overview) page.
-
-## Step 7: Deploy Your Model
-
-By default, your model will be automatically hosted on OpenPipe's cloud infrastructure. Additionally, you can export and deploy any of our open-weight models on your own cloud.
-
-Good luck! If you have any questions, don't hesitate to reach out!
+If you have questions along the way, please ask in the [Discord](https://discord.gg/zbBHRUpwf4). Happy training!
