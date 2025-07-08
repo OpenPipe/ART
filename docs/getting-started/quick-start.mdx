@@ -20,18 +20,17 @@ Total cost: <b>Free!</b>
 
 [ART](https://github.com/OpenPipe/art) is an open source library and does not require an API key to run in Google Colab, which we'll use for this quick start. But if you're interested in seeing the progress of your training runs and inspecting your model's completions as it trains, you can optionally provision API keys from platforms like Weights & Biases and OpenPipe.
 
-If you'd like to enable observability while working through this guide, create accounts and API keys on the links below.
+If you'd like to enable observability while working through this guide, create a W&B account and provision an API key.
 
-- [OpenPipe](https://app.openpipe.ai)
 - [Weights & Biases](https://wandb.ai/home)
 
-Once you have your Weights & Biases and OpenPipe API keys, open the [notebook](https://colab.research.google.com/github/openpipe/art/blob/main/examples/2048/2048.ipynb) in Google Colab and set them in the **Environment Variables** cell.
+Once you have your Weights & Biases API key, open the [notebook](https://colab.research.google.com/github/openpipe/art/blob/main/examples/2048/2048.ipynb) in Google Colab and set them in the **Environment Variables** cell.
 
 Once your API keys are set, or if you won't need observability while completing this walkthrough, continue on to the next step.
 
 ## Step 2: Prepare your notebook
 
-If you have't already, open the [notebook](https://colab.research.google.com/github/openpipe/art/blob/main/examples/2048/2048.ipynb) in Google Colab and connect to a T4 runtime environment.
+If you haven't already, open the [notebook](https://colab.research.google.com/github/openpipe/art/blob/main/examples/2048/2048.ipynb) in Google Colab and connect to a T4 runtime environment.
 
 <Accordion title="Connecting to a T4 GPU">
   In the top bar of your Google Colab notebook, find *Runtime* > *Change runtime
@@ -42,6 +41,6 @@ Due to a quirk in the default Google Colab settings, you'll have restart the run
 
 ## Step 3: Run the notebook
 
-From here on out, you can follow the instructions in the notebook! While training is occuring, remember to track your progress in [Weights & Biases](https://wandb.ai) and [OpenPipe](https://app.openpipe.ai).
+From here on out, you can follow the instructions in the notebook! While training is occuring, remember to track your progress in [Weights & Biases](https://wandb.ai).
 
 If you have questions along the way, please ask in the [Discord](https://discord.gg/zbBHRUpwf4). Happy training!
