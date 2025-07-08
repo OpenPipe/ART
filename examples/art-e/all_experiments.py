@@ -1,6 +1,5 @@
 import art
 from art_e.project_types import ProjectPolicyConfig
-from typing import cast
 
 models: dict[str, art.TrainableModel[ProjectPolicyConfig]] = {
     "002": art.TrainableModel(
