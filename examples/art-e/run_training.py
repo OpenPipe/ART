@@ -42,10 +42,7 @@ def launch_model(model_key: str):
     model = models[model_key]
     print(f"Launching {model_key} ({model.name}) on SkyPilot…")
 
-    if (
-        not model.config
-        or not isinstance(model.config, ProjectPolicyConfig)
-    ):
+    if not model.config or not isinstance(model.config, ProjectPolicyConfig):
         raise ValueError(
             f"Training config not found or is invalid for model {model_key}"
         )

@@ -1,6 +1,5 @@
 import art
 from art_e.project_types import ProjectPolicyConfig
-from typing import cast
 
 models: dict[str, art.TrainableModel[ProjectPolicyConfig]] = {
     "002": art.TrainableModel(
@@ -116,7 +115,9 @@ for _size in [1, 4, 16, 64, 256, 1024, 4096]:
     # Compute num_epochs so that total training steps ~= 600.
     # Approximation: total_steps ≈ num_epochs * (training_dataset_size / groups_per_step)
     # => num_epochs ≈ 600 * groups_per_step / training_dataset_size
-    models[key].config.num_epochs = max(1, round(600 * models[key].config.groups_per_step / _size))
+    models[key].config.num_epochs = max(
+        1, round(600 * models[key].config.groups_per_step / _size)
+    )
 
 # Model 210-16-s* variants: explore robustness to different data mixes by varying the random seed.
 for _seed in [1, 2, 3]:
