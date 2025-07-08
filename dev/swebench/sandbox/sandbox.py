@@ -17,5 +17,8 @@ class Sandbox(ABC):
     async def exec(self, command: str, timeout: int) -> tuple[int, str]:
         raise NotImplementedError
 
-    async def eval(self, tests: list[str], timeout: int) -> tuple[int, int]:
+    async def apply_patch(self, patch: str, timeout: int) -> None:
+        raise NotImplementedError
+
+    async def run_tests(self, tests: list[str], timeout: int) -> tuple[int, int]:
         raise NotImplementedError
