@@ -1,0 +1,1 @@
+Instead of using an extra for swebench dependencies in pyproject.toml, we should create a dedicated pyproject.toml in `/dev/swebench` and install the dependencies there. A good example of how to make the change is to look at `/dev/tau-bench`.
