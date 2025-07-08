@@ -62,11 +62,10 @@ dev-dependencies = [
     "openpipe>=4.49.0",
     "hatch>=1.14.1",
     "ruff>=0.12.1",
-    "skypilot[aws,cudo,do,fluidstack,gcp,kubernetes,lambda,paperspace,runpod]",
+    "skypilot[cudo,do,fluidstack,gcp,lambda,paperspace,runpod]==0.8.0",
 ]
 
 [tool.uv.sources]
 panza = { git = "https://github.com/corbt/panza.git" }
 torchtune = { git = "https://github.com/pytorch/torchtune.git", rev = "2344509cf83bd886538fe3e8263e5145d1afb5c2" }
 sweagent = { git = "https://github.com/bradhilton/SWE-agent" }
-skypilot = { git = "https://github.com/bradhilton/skypilot.git", rev = "c0a40e6c" }
