@@ -84,9 +84,7 @@ async def train(model: art.TrainableModel[ProjectPolicyConfig]):
                     art.TrajectoryGroup(
                         (
                             rollout(model, scenario)
-                            for _ in range(
-                                model.config.trajectories_per_group
-                            )
+                            for _ in range(model.config.trajectories_per_group)
                         )
                     )
                     for scenario in batch.items
@@ -164,9 +162,7 @@ async def train(model: art.TrainableModel[ProjectPolicyConfig]):
 
             await model.train(
                 groups,
-                config=art.TrainConfig(
-                    learning_rate=model.config.learning_rate
-                ),
+                config=art.TrainConfig(learning_rate=model.config.learning_rate),
                 _config=art.dev.TrainConfig(
                     allow_training_without_logprobs=True
                     if model.config.messages_only
