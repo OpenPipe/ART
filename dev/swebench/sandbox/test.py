@@ -1,6 +1,7 @@
 from dotenv import load_dotenv
 import pytest
 
+from ..instances import as_instances_iter, get_filtered_swe_smith_instances_df
 from .new import new_sandbox
 from .sandbox import Provider
 
@@ -14,3 +15,21 @@ async def test_sandbox(provider: Provider) -> None:
         code, stdout = await sandbox.exec("echo 'Hello, world!'", 10)
         assert code == 0
         assert stdout == "Hello, world!\n"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("provider", ["daytona", "modal"])
+@pytest.mark.parametrize("instance_idx", range(1, 5))
+async def test_eval(provider: Provider, instance_idx: int) -> None:
+    instance = next(
+        get_filtered_swe_smith_instances_df()
+        .tail(-instance_idx)
+        .pipe(as_instances_iter)
+    )
+    async with new_sandbox(image=instance["image_name"], provider=provider) as sandbox:
+        failed, passed = await sandbox.eval(instance["FAIL_TO_PASS"], 60)
+        assert failed == len(instance["FAIL_TO_PASS"])
+        assert passed == 0
+        failed, passed = await sandbox.eval(instance["PASS_TO_PASS"], 60)
+        assert failed == 0
+        assert passed == len(instance["PASS_TO_PASS"])
