@@ -15,6 +15,6 @@ class DaytonaSandbox(Sandbox):
     def __init__(self, sandbox: daytona_sdk.AsyncSandbox) -> None:
         self._sandbox = sandbox
 
-    async def exec(self, command: str, timeout: int) -> str:
+    async def exec(self, command: str, timeout: int) -> tuple[int, str]:
         result = await self._sandbox.process.exec(command, timeout=timeout)
-        return result.result
+        return int(result.exit_code), result.result

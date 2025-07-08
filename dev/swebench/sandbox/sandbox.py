@@ -14,7 +14,7 @@ class Sandbox(ABC):
     provider: Provider
 
     @abstractmethod
-    async def exec(self, command: str, timeout: int) -> str:
+    async def exec(self, command: str, timeout: int) -> tuple[int, str]:
         raise NotImplementedError
 
     async def eval(self, tests: list[str], timeout: int) -> tuple[int, int]: ...

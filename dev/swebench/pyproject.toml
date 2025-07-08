@@ -8,6 +8,8 @@ dependencies = [
     "langfuse>=2.60.7",
     "modal>=1.0.1",
     "openpipe-art",
+    "pytest>=8.4.1",
+    "pytest-asyncio>=1.0.0",
     "sweagent",
     "swebench>=4.0.3",
 ]
@@ -20,4 +22,6 @@ sweagent = { git = "https://github.com/bradhilton/SWE-agent" }
 dev = [
     "ipykernel>=6.29.5",
     "ipywidgets>=8.1.7",
+    "pytest>=8.4.1",
+    "pytest-asyncio>=1.0.0",
 ]

@@ -46,7 +46,7 @@ async def new_sandbox(*, image: str, provider: Provider) -> AsyncIterator[Sandbo
             )
         app = await modal_app_task
         sandbox = await modal.Sandbox.create.aio(
-            app=app, image=await modal.Image.from_registry.aio(image)
+            app=app, image=modal.Image.from_registry(image)
         )
         try:
             yield ModalSandbox(sandbox)

@@ -15,6 +15,7 @@ class ModalSandbox(Sandbox):
     def __init__(self, sandbox: modal.Sandbox) -> None:
         self._sandbox = sandbox
 
-    async def exec(self, command: str, timeout: int) -> str:
+    async def exec(self, command: str, timeout: int) -> tuple[int, str]:
         process = await self._sandbox.exec.aio(command, timeout=timeout)
-        return await process.stdout.read.aio()
+        stdout = await process.stdout.read.aio()
+        return process.returncode, stdout
