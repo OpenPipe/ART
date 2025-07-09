@@ -37,5 +37,5 @@ apt install tmux -y
 if [ "${INSTALL_EXTRAS:-false}" = "true" ]; then
     uv sync --all-extras
 else
-    uv sync
+    uv sync --extra backend
 fi

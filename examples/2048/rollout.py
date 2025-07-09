@@ -78,36 +78,39 @@ async def rollout(
                 print(content)
             move_number += 1
         except ValueError:
+            trajectory.metrics["invalid_move"] = 1
             trajectory.reward = -1
             break
 
         if check_game_finished(game):
-            max_value = max_cell_value(game)
-            board_value = total_board_value(game)
-            trajectory.metrics["max_value"] = max_value
-            trajectory.metrics["board_value"] = board_value
-            trajectory.metrics["num_moves"] = move_number
-
-            # try to get as close to the winning value as possible
-            # otherwise, try to maximize number of high cells on board
-            # but above all else: WIN THE GAME!
-            if max_value < WINNING_VALUE:
-                # scale max value logarithmically between 0 for 2 and 1 for WINNING_VALUE
-                max_value_reward = (math.log(max_value, 2) - 1) / (
-                    math.log(WINNING_VALUE, 2) - 1
-                )
-                # scale board value logarithmically between 0 for 2 * 16 and 1 for WINNING_VALUE * 16
-                board_value_reward = (math.log(board_value, 2) - 1) / (
-                    math.log(WINNING_VALUE * 16, 2) - 1
-                )
-                # combine the two rewards, with max value having a higher weight
-                trajectory.reward = max_value_reward + (board_value_reward * 0.2)
-                trajectory.metrics["win"] = 0
-            else:
-                # double reward if the agent wins
-                trajectory.reward = 2
-                trajectory.metrics["win"] = 1
+            trajectory.metrics["invalid_move"] = 0
             break
+
+    max_value = max_cell_value(game)
+    board_value = total_board_value(game)
+    agent_won = max_value == WINNING_VALUE
+    trajectory.metrics["max_value"] = max_value
+    trajectory.metrics["board_value"] = board_value
+    trajectory.metrics["num_moves"] = move_number
+    trajectory.metrics["win"] = agent_won
+
+    # try to get as close to the winning value as possible
+    # otherwise, try to maximize number of high cells on board
+    # but above all else: WIN THE GAME!
+    if agent_won:
+        # double reward if the agent wins
+        trajectory.reward = 2
+    else:
+        # scale max value logarithmically between 0 for 2 and 1 for WINNING_VALUE
+        max_value_reward = (math.log(max_value, 2) - 1) / (
+            math.log(WINNING_VALUE, 2) - 1
+        )
+        # scale board value logarithmically between 0 for 2 * 16 and 1 for WINNING_VALUE * 16
+        board_value_reward = (math.log(board_value, 2) - 1) / (
+            math.log(WINNING_VALUE * 16, 2) - 1
+        )
+        # combine the two rewards, with max value having a higher weight
+        trajectory.reward = max_value_reward + (board_value_reward * 0.2)
 
     return trajectory
 
