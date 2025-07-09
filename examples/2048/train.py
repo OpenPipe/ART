@@ -13,20 +13,9 @@ random.seed(42)
 
 # Declare the model
 model = art.TrainableModel(
-    name="003",
+    name="tutorial-001",
     project="2048",
-    base_model="Qwen/Qwen2.5-7B-Instruct",
-)
-# To run on a T4, we need to override some config defaults.
-model._internal_config = art.dev.InternalModelConfig(
-    init_args=art.dev.InitArgs(
-        max_seq_length=8192,
-    ),
-    engine_args=art.dev.EngineArgs(
-        enforce_eager=True,
-        gpu_memory_utilization=0.8,
-        num_scheduler_steps=1,
-    ),
+    base_model="Qwen/Qwen2.5-3B-Instruct",
 )
 
 
@@ -43,7 +32,7 @@ async def main():
     # Register the model with the local backend (sets up logging, inference, and training)
     await model.register(backend)
 
-    for i in range(await model.get_step(), 100):
+    for i in range(await model.get_step(), 40):
         train_groups = await art.gather_trajectory_groups(
             (
                 art.TrajectoryGroup(
