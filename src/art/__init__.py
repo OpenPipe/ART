@@ -1,5 +1,9 @@
 import os
 
+# Set PYTORCH_CUDA_ALLOC_CONF to prevent expandable segments error with vLLM + Unsloth
+# This must be set before torch is imported
+os.environ["PYTORCH_CUDA_ALLOC_CONF"] = ""
+
 # Import peft (and transformers by extension) before unsloth to enable sleep mode
 if os.environ.get("IMPORT_PEFT", "0") == "1":
     import peft  # type: ignore # noqa: F401

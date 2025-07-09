@@ -2,21 +2,43 @@ import asyncio
 from collections import Counter
 from dataclasses import dataclass
 from functools import cached_property
-import json
+import gc
 import logging
 import os
 from pathlib import Path
-from safetensors.torch import save_file
+from safetensors.torch import save_file, load_file
 import time
 import torch
-from typing import AsyncIterator
+from typing import AsyncIterator, TYPE_CHECKING, cast
 from vllm import AsyncEngineArgs
 from vllm.v1.engine.async_llm import AsyncLLM
+import unsloth  # type: ignore
+from datasets import Dataset
+from transformers.tokenization_utils_base import PreTrainedTokenizerBase
+from transformers.utils.dummy_pt_objects import PreTrainedModel, GenerationMixin
+import peft
+from trl import GRPOConfig, GRPOTrainer
 
 from .. import dev
-from ..local.pack import DiskPackedTensors
+from ..local.pack import DiskPackedTensors, packed_tensors_from_dir, PackedTensors
 from .. import types
 from ..vllm import get_llm, get_worker, openai_server_task, run_on_workers
+from ..utils.get_model_step import get_step_from_dir
+from ..utils.output_dirs import get_step_checkpoint_dir
+from ..local.checkpoints import get_last_checkpoint_dir
+
+if TYPE_CHECKING:
+    from unsloth_zoo.vllm_lora_request import LoRARequest  # type: ignore
+
+
+class CausalLM(PreTrainedModel, GenerationMixin):
+    """Dummy class for type checking."""
+    pass
+
+
+class TrainInputs(PackedTensors):
+    config: types.TrainConfig
+    _config: dev.TrainConfig
 
 
 @dataclass
@@ -27,12 +49,20 @@ class DecoupledUnslothService:
     output_dir: str
 
     async def start_openai_server(self, config: dev.OpenAIServerConfig | None) -> None:
+        lora_path = get_last_checkpoint_dir(self.output_dir)
+        if lora_path is None:
+            # Create initial LoRA checkpoint if none exists
+            lora_path = get_step_checkpoint_dir(self.output_dir, 0)
+            os.makedirs(os.path.dirname(lora_path), exist_ok=True)
+            self._save_initial_lora(lora_path)
+            
         await openai_server_task(
             engine=await self.llm,
             config=dev.get_openai_server_config(
                 model_name=self.model_name,
-                base_model=self.get_last_checkpoint_dir() or self.base_model,
+                base_model=self.base_model,
                 log_file=f"{self.output_dir}/logs/vllm.log",
+                lora_path=lora_path,
                 config=config,
             ),
         )
@@ -71,51 +101,156 @@ class DecoupledUnslothService:
                 break
             await asyncio.sleep(0.25)
         
-        # acquire the train process and queue
-        train_process = await self.train_process
-        train_queue = await self.train_queue
+        # Free memory after vLLM workers are asleep
+        self._free_memory()
         
-        # write the batch info for communication with the train process
-        batch_info = {
-            "disk_packed_tensors": disk_packed_tensors,
-            "config": config.model_dump(),
-            "_config": _config,
-        }
+        # Initialize Unsloth trainer if not already done
+        if not hasattr(self, '_trainer'):
+            self._init_unsloth()
         
-        # Send batch info to train process via stdin
-        import json
-        batch_json = json.dumps(batch_info) + "\n"
-        assert train_process.stdin is not None
-        train_process.stdin.write(batch_json.encode())
-        await train_process.stdin.drain()
+        # Load packed tensors
+        packed_tensors = packed_tensors_from_dir(**disk_packed_tensors)
         
-        # consume the batch gradient step results
-        num_gradient_steps = -1
-        while num_gradient_steps != 0:
-            done, _ = await asyncio.wait(
-                [
-                    asyncio.create_task(train_queue.get()),
-                    asyncio.create_task(train_process.wait()),
-                ],
-                return_when=asyncio.FIRST_COMPLETED,
+        # Train on the batch
+        results = []
+        num_sequences = packed_tensors["tokens"].shape[0]
+        
+        for offset in range(num_sequences):
+            # Prepare inputs for this sequence
+            inputs = TrainInputs(
+                **{
+                    k: v[offset : offset + 1]
+                    for k, v in packed_tensors.items()
+                    if isinstance(v, torch.Tensor)
+                },
+                config=config,
+                _config=_config,
             )
-            for task in done:
-                result = task.result()
-                if isinstance(result, dict):
-                    result["num_gradient_steps"] = int(result.get("num_gradient_steps", 1))
-                    if num_gradient_steps == -1:
-                        num_gradient_steps = result["num_gradient_steps"]
-                    yield result
-                else:
-                    raise RuntimeError(
-                        f"Train process exited early. See {self.output_dir}/logs/train.log for details."
-                    )
-            num_gradient_steps -= 1
+            
+            # Run one training step
+            metrics = self._train_step(inputs)
+            results.append(metrics)
+            metrics["num_gradient_steps"] = num_sequences
+            yield metrics
+        
+        # Save checkpoint after training
+        next_step = get_step_from_dir(self.output_dir) + 1
+        checkpoint_dir = get_step_checkpoint_dir(self.output_dir, next_step)
+        os.makedirs(checkpoint_dir, exist_ok=True)
+        self._trainer.save_model(checkpoint_dir)
+        
+        # Export weights for vLLM to load
+        self._export_lora_weights(weights_path)
+        
+        # Free memory before waking up vLLM
+        self._free_memory()
         
         # wait for the workers to wake up
         await sleep_task
         # remove the weights file
         Path(weights_path).unlink(missing_ok=True)
+
+    def _init_unsloth(self) -> None:
+        """Initialize Unsloth model and trainer."""
+        # Initialize Unsloth model
+        init_args = self.config.get("init_args", {})
+        checkpoint_dir = get_last_checkpoint_dir(self.output_dir)
+        if checkpoint_dir:
+            init_args["model_name"] = checkpoint_dir
+        else:
+            init_args["model_name"] = self.base_model
+            
+        self._model, self._tokenizer = cast(
+            tuple[CausalLM, PreTrainedTokenizerBase],
+            unsloth.FastLanguageModel.from_pretrained(**init_args),
+        )
+        
+        # Initialize PEFT model
+        self._peft_model = cast(
+            peft.peft_model.PeftModelForCausalLM,
+            unsloth.FastLanguageModel.get_peft_model(
+                self._model, **self.config.get("peft_args", {})
+            ),
+        )
+        
+        # Initialize trainer with dummy dataset
+        data = {"prompt": ""}
+        self._trainer = GRPOTrainer(
+            model=self._peft_model,  # type: ignore
+            reward_funcs=[],
+            args=GRPOConfig(**self.config.get("trainer_args", {})),
+            train_dataset=Dataset.from_list([data for _ in range(10_000_000)]),
+            processing_class=self._tokenizer,
+        )
+        
+        # Initialize results queue
+        self._results_queue: asyncio.Queue[dict[str, float]] = asyncio.Queue()
+
+    def _train_step(self, inputs: TrainInputs) -> dict[str, float]:
+        """Run a single training step."""
+        # Override _prepare_inputs to return our inputs
+        self._trainer._prepare_inputs = lambda *_, **__: cast(dict[str, torch.Tensor], inputs)
+        
+        # Zero gradients
+        self._trainer.optimizer.zero_grad()
+        
+        # Get model outputs
+        outputs = self._trainer.model(**inputs)
+        
+        # Calculate loss
+        loss = outputs.loss if hasattr(outputs, 'loss') else outputs[0]
+        
+        # Backward pass
+        loss.backward()
+        
+        # Optimizer step
+        if inputs.config.learning_rate > 0:
+            # Update learning rate
+            for param_group in self._trainer.optimizer.param_groups:
+                param_group['lr'] = inputs.config.learning_rate
+            
+            self._trainer.optimizer.step()
+        
+        # Prepare metrics
+        metrics = {
+            "loss": loss.item(),
+        }
+        
+        # Add reward if available
+        if "rewards" in inputs:
+            metrics["reward"] = inputs["rewards"].mean().item()
+            
+        return metrics
+
+    def _export_lora_weights(self, weights_path: str) -> None:
+        """Export LoRA weights for vLLM to load."""
+        # Get LoRA weights
+        lora_state_dict = {}
+        for name, param in self._peft_model.named_parameters():
+            if param.requires_grad:  # Only LoRA parameters
+                lora_state_dict[name] = param.detach().cpu()
+        
+        # Save weights
+        save_file(lora_state_dict, weights_path)
+
+    def _save_initial_lora(self, lora_path: str) -> None:
+        """Save initial LoRA checkpoint when none exists."""
+        # We need to temporarily initialize Unsloth to save the initial LoRA
+        if not hasattr(self, '_trainer'):
+            self._init_unsloth()
+        self._trainer.save_model(lora_path)
+        # Clean up to free memory
+        del self._trainer
+        del self._peft_model
+        del self._model
+        del self._tokenizer
+        self._free_memory()
+
+    def _free_memory(self) -> None:
+        """Free GPU memory."""
+        for _ in range(3):
+            gc.collect()
+            torch.cuda.empty_cache()
 
     @cached_property
     def llm(self) -> asyncio.Task[AsyncLLM]:
@@ -124,68 +259,6 @@ class DecoupledUnslothService:
         return asyncio.create_task(
             get_llm(AsyncEngineArgs(**self.config.get("engine_args", {})))  # type: ignore
         )
-
-    @cached_property
-    def train_queue(self) -> asyncio.Task[asyncio.Queue[dict[str, float]]]:
-        return asyncio.create_task(self.get_train_queue())
-
-    @cached_property
-    def train_process(self) -> asyncio.Task[asyncio.subprocess.Process]:
-        return asyncio.create_task(self.get_train_process())
-
-    async def get_train_process(self) -> asyncio.subprocess.Process:
-        # Migrate existing checkpoints to new structure if needed
-        from ..local.checkpoints import migrate_checkpoints_to_new_structure
-        migrate_checkpoints_to_new_structure(self.output_dir)
-        
-        checkpoint_dir = self.get_last_checkpoint_dir() or self.base_model
-        
-        # Create the training script command
-        program_and_args = [
-            "python",
-            "-m",
-            "art.unsloth.train_process",
-            "--base-model", self.base_model,
-            "--checkpoint-dir", checkpoint_dir,
-            "--output-dir", self.output_dir,
-            "--config", json.dumps(self.config),
-        ]
-        
-        return await asyncio.subprocess.create_subprocess_exec(
-            *program_and_args,
-            stdin=asyncio.subprocess.PIPE,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
-
-    async def get_train_queue(self) -> asyncio.Queue[dict[str, float]]:
-        process = await self.train_process
-        queue = asyncio.Queue()
-
-        async def read(reader: asyncio.StreamReader) -> None:
-            async for line in reader:
-                line_str = line.decode("utf-8")
-                with open(f"{self.output_dir}/logs/train.log", "a") as f:
-                    f.write(line_str)
-                line_str = line_str.strip()
-                
-                # Parse training metrics from the output
-                if line_str.startswith("{") and line_str.endswith("}"):
-                    try:
-                        metrics = json.loads(line_str)
-                        if isinstance(metrics, dict) and any(k in metrics for k in ["loss", "reward", "kl"]):
-                            await queue.put(metrics)
-                    except json.JSONDecodeError:
-                        pass
-
-        assert process.stdout and process.stderr
-        asyncio.create_task(read(process.stdout))
-        asyncio.create_task(read(process.stderr))
-        return queue
-
-    def get_last_checkpoint_dir(self) -> str | None:
-        from ..local.checkpoints import get_last_checkpoint_dir
-        return get_last_checkpoint_dir(self.output_dir)
 
 
 def sleep(
@@ -220,7 +293,6 @@ def sleep(
         while True:
             if os.path.exists(weights_path):
                 # Load the new weights
-                from safetensors.torch import load_file
                 with worker.time("load_file"):
                     weights = load_file(weights_path)
                 break
