@@ -19,7 +19,7 @@ async def test_sandbox(provider: Provider) -> None:
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("provider", ["daytona", "modal"])
-@pytest.mark.parametrize("instance_idx", range(8))
+@pytest.mark.parametrize("instance_idx", range(16))
 async def test_run_tests(provider: Provider, instance_idx: int) -> None:
     instance = next(
         get_filtered_swe_smith_instances_df()
@@ -27,6 +27,9 @@ async def test_run_tests(provider: Provider, instance_idx: int) -> None:
         .pipe(as_instances_iter)
     )
     async with new_sandbox(image=instance["image_name"], provider=provider) as sandbox:
+        failed, passed = await sandbox.run_tests(instance["FAIL_TO_PASS"], 60)
+        assert failed == 0
+        assert passed == len(instance["FAIL_TO_PASS"])
         await sandbox.apply_patch(instance["patch"], 10)
         failed, passed = await sandbox.run_tests(instance["FAIL_TO_PASS"], 60)
         assert failed == len(instance["FAIL_TO_PASS"])

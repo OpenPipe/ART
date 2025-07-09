@@ -31,9 +31,19 @@ async def new_sandbox(*, image: str, provider: Provider) -> AsyncIterator[Sandbo
         ```
     """
     if provider == "daytona":
-        sandbox = await daytona.create(
-            daytona_sdk.CreateSandboxFromImageParams(image=image)
-        )
+        global daytona
+        for _ in range(2):
+            try:
+                sandbox = await daytona.create(
+                    daytona_sdk.CreateSandboxFromImageParams(image=image)
+                )
+                break
+            except daytona_sdk.DaytonaError as e:
+                if "Event loop is closed" in str(e):
+                    await daytona.close()
+                    daytona = daytona_sdk.AsyncDaytona()
+                    continue
+                raise
         try:
             yield DaytonaSandbox(sandbox)
         finally:
