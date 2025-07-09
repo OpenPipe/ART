@@ -17,7 +17,6 @@ class Sandbox(ABC):
     async def exec(self, command: str, timeout: int) -> tuple[int, str]:
         raise NotImplementedError
 
-
     async def apply_patch(self, patch: str, timeout: int) -> None:
         # Write patch to file using heredoc
         exit_code, output = await self.exec(
@@ -32,7 +31,6 @@ class Sandbox(ABC):
         )
         if exit_code != 0:
             raise RuntimeError(f"Failed to apply patch: {output}")
-
 
     async def run_tests(self, tests: list[str], timeout: int) -> tuple[int, int]:
         import re
@@ -50,9 +48,6 @@ class Sandbox(ABC):
         # Install pytest first
         await self.exec(f"{uv_cmd} pip install -q pytest", timeout)
 
-
-
-
         # Write test list
         test_list = "\n".join(tests)
         exit_code, output = await self.exec(
@@ -64,14 +59,15 @@ class Sandbox(ABC):
         # Run the tests with retry logic for missing dependencies
         max_retries = 5
         for attempt in range(max_retries):
-            # Read tests from file and run pytest directly
             test_cmd = f"cd /testbed && python -m pytest -v -o addopts= --tb=short --no-header --doctest-modules $(cat /tmp/tests.txt | tr '\\n' ' ')"
             exit_code, output = await self.exec(test_cmd + " 2>&1", timeout)
 
             # Check for missing dependencies and try to install them
             if "ModuleNotFoundError" in output or "ImportError" in output:
                 # Extract missing module names using a single pattern
-                missing_modules = list(set(re.findall(r"No module named [']([^']+)[']", output)))
+                missing_modules = list(
+                    set(re.findall(r"No module named [']([^']+)[']", output))
+                )
 
                 if missing_modules and attempt < max_retries - 1:
                     # Try to install missing modules

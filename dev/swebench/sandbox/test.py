@@ -19,7 +19,7 @@ async def test_sandbox(provider: Provider) -> None:
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("provider", ["daytona", "modal"])
-@pytest.mark.parametrize("instance_idx", range(32))
+@pytest.mark.parametrize("instance_idx", range(48, 64))
 async def test_run_tests(provider: Provider, instance_idx: int) -> None:
     instance = next(
         get_filtered_swe_smith_instances_df()
