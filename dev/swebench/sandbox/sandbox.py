@@ -17,37 +17,36 @@ class Sandbox(ABC):
     async def exec(self, command: str, timeout: int) -> tuple[int, str]:
         raise NotImplementedError
 
+    async def safe_exec(self, command: str, timeout: int, error_msg: str) -> str:
+        """Execute a command and raise RuntimeError on failure with custom error message."""
+        exit_code, output = await self.exec(command, timeout)
+        if exit_code != 0:
+            raise RuntimeError(f"{error_msg}: {output}")
+        return output
+
+    async def write_file(self, content: str, target_path: str, timeout: int) -> None:
+        """Write content to a file using heredoc to handle special characters."""
+        await self.safe_exec(
+            f"cat > {target_path} << 'EOF'\n{content}\nEOF",
+            timeout,
+            f"Failed to write to {target_path}"
+        )
+
     async def apply_patch(self, patch: str, timeout: int) -> None:
-        import base64
-
-        # Convert patch to base64 to handle special characters and large size
-        patch_b64 = base64.b64encode(patch.encode()).decode()
-
-        # Remove existing patch file if it exists
-        await self.exec("rm -f /tmp/patch.txt.b64", timeout)
-
-        # Write patch in chunks to avoid command length limits
-        chunk_size = 1000
-        for i in range(0, len(patch_b64), chunk_size):
-            chunk = patch_b64[i : i + chunk_size]
-            await self.exec(f"echo -n '{chunk}' >> /tmp/patch.txt.b64", timeout)
-
-        # Decode the patch file
-        await self.exec("base64 -d /tmp/patch.txt.b64 > /tmp/patch.txt", timeout)
+        # Write patch to file
+        await self.write_file(patch, "/tmp/patch.txt", timeout)
 
         # Apply the patch in the /testbed directory
-        exit_code, output = await self.exec(
-            "cd /testbed && patch -p1 < /tmp/patch.txt", timeout
+        await self.safe_exec(
+            "cd /testbed && patch -p1 < /tmp/patch.txt", 
+            timeout,
+            "Failed to apply patch"
         )
 
         # Clean up
-        await self.exec("rm -f /tmp/patch.txt /tmp/patch.txt.b64", timeout)
-
-        if exit_code != 0:
-            raise RuntimeError(f"Failed to apply patch: {output}")
+        await self.exec("rm -f /tmp/patch.txt", timeout)
 
     async def run_tests(self, tests: list[str], timeout: int) -> tuple[int, int]:
-        import base64
         import re
 
         # First, ensure uv is installed
@@ -89,36 +88,14 @@ class Sandbox(ABC):
         # Install the package itself
         await self.exec(f"{uv_cmd} pip install -q -e .", timeout)
 
-        # Filter tests to remove obvious non-test files (like in daytona.py)
-        filtered_tests = []
-        for test in tests:
-            # Skip documentation files
-            if test.endswith((".md", ".rst", ".txt")) and "::" in test:
-                continue
-            filtered_tests.append(test)
+        # Use tests directly without filtering
+        filtered_tests = tests
 
         # Use the same chunked writing approach as daytona.py
         test_list_content = "\n".join(filtered_tests)
 
-        # Helper function to write content in chunks (from daytona.py)
-        async def write_file_chunked(
-            content: str, target_path: str, chunk_size: int = 1000
-        ) -> None:
-            content_b64 = base64.b64encode(content.encode()).decode()
-
-            # Remove existing file
-            await self.exec(f"rm -f {target_path}.b64", timeout)
-
-            # Write in chunks
-            for i in range(0, len(content_b64), chunk_size):
-                chunk = content_b64[i : i + chunk_size]
-                await self.exec(f"echo -n '{chunk}' >> {target_path}.b64", timeout)
-
-            # Decode the file
-            await self.exec(f"base64 -d {target_path}.b64 > {target_path}", timeout)
-
         # Write test list
-        await write_file_chunked(test_list_content, "/tmp/tests.txt")
+        await self.write_file(test_list_content, "/tmp/tests.txt", timeout)
 
         # Create pytest runner script that properly handles both regular tests and doctests
         pytest_script = """
@@ -174,7 +151,7 @@ sys.exit(exit_code)
 """
 
         # Write pytest script
-        await write_file_chunked(pytest_script, "/tmp/run_pytest.py")
+        await self.write_file(pytest_script, "/tmp/run_pytest.py", timeout)
 
         # Run the tests with retry logic for missing dependencies
         max_retries = 5
@@ -230,15 +207,12 @@ sys.exit(exit_code)
         passed_count = output.count(" PASSED")
         error_count = output.count(" ERROR")
 
-        # Count collection errors specifically (ERROR: not found)
-        collection_errors = output.count("ERROR: not found:")
-
         # Clean up
         await self.exec(
-            "rm -f /tmp/tests.txt /tmp/tests.txt.b64 /tmp/run_pytest.py /tmp/run_pytest.py.b64",
+            "rm -f /tmp/tests.txt /tmp/run_pytest.py",
             timeout,
         )
 
-        # Return failed count (including errors and collection errors) and passed count
-        total_failed = failed_count + error_count + collection_errors
+        # Return failed count (including errors) and passed count
+        total_failed = failed_count + error_count
         return total_failed, passed_count
