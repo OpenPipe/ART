@@ -32,11 +32,14 @@ async def main():
     # Register the model with the local backend (sets up logging, inference, and training)
     await model.register(backend)
 
+    # train for 40 steps
     for i in range(await model.get_step(), 40):
         train_groups = await art.gather_trajectory_groups(
             (
                 art.TrajectoryGroup(
-                    rollout(model, i, is_validation=False) for _ in range(48)
+                    # for each step, rollout 18 trajectories
+                    rollout(model, i, is_validation=False)
+                    for _ in range(18)
                 )
                 for _ in range(1)
             ),
@@ -44,15 +47,13 @@ async def main():
             max_exceptions=10,
         )
         await model.delete_checkpoints()
+        # save the model to S3
         await backend._experimental_push_to_s3(
             model,
         )
         await model.train(
             train_groups,
-            config=art.TrainConfig(learning_rate=3e-5),
-            # Lowering the logprob_calculation_chunk_size is a memory saving measure
-            # to allow longer sequences (up to 4096 tokens) to be processed on a T4.
-            _config={"logprob_calculation_chunk_size": 8},
+            config=art.TrainConfig(learning_rate=1e-5),
         )
 
 
