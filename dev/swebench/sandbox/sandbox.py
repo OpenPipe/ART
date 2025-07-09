@@ -29,7 +29,7 @@ class Sandbox(ABC):
         await self.safe_exec(
             f"cat > {target_path} << 'EOF'\n{content}\nEOF",
             timeout,
-            f"Failed to write to {target_path}"
+            f"Failed to write to {target_path}",
         )
 
     async def apply_patch(self, patch: str, timeout: int) -> None:
@@ -38,9 +38,9 @@ class Sandbox(ABC):
 
         # Apply the patch in the /testbed directory
         await self.safe_exec(
-            "cd /testbed && patch -p1 < /tmp/patch.txt", 
+            "cd /testbed && patch -p1 < /tmp/patch.txt",
             timeout,
-            "Failed to apply patch"
+            "Failed to apply patch",
         )
 
         # Clean up
@@ -88,14 +88,8 @@ class Sandbox(ABC):
         # Install the package itself
         await self.exec(f"{uv_cmd} pip install -q -e .", timeout)
 
-        # Use tests directly without filtering
-        filtered_tests = tests
-
-        # Use the same chunked writing approach as daytona.py
-        test_list_content = "\n".join(filtered_tests)
-
         # Write test list
-        await self.write_file(test_list_content, "/tmp/tests.txt", timeout)
+        await self.write_file("\n".join(tests), "/tmp/tests.txt", timeout)
 
         # Create pytest runner script that properly handles both regular tests and doctests
         pytest_script = """
