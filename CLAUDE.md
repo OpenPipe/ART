@@ -32,6 +32,8 @@ model = art.TrainableModel(
 ```
 
 ### Next Steps:
-- Run the yes-no-maybe.py test for 6 minutes to verify 2%+ reward improvement
-- Test the DecoupledUnslothService with yes-no-maybe-decoupled.py
-- Further optimize the training process communication and weight loading
+- Run the yes-no-maybe-decoupled.py and pipe the output to a log file
+- Sleep for one minute at a time and check the file for errors and reward improvement
+- Should see 2%+ reward improvement per step
+- If an error occurs, be sure to kill the process if it's still running
+- Diagnose any errors and fix them
