@@ -19,7 +19,7 @@ model = art.TrainableModel(
 )
 
 
-async def main():
+async def train():
     # Initialize the server
     backend = LocalBackend()
 
@@ -58,4 +58,4 @@ async def main():
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    asyncio.run(train())

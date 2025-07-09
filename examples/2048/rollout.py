@@ -1,3 +1,5 @@
+import asyncio
+import os
 import openai
 import math
 import requests
@@ -20,7 +22,9 @@ load_dotenv()
 
 @weave.op
 @art.retry(exceptions=(openai.LengthFinishReasonError, requests.ReadTimeout))
-async def rollout(model: art.Model, step: int, is_validation: bool) -> art.Trajectory:
+async def rollout(
+    model: art.Model, step: int, is_validation: bool, verbose: bool = False
+) -> art.Trajectory:
     game = generate_game()
 
     move_number = 0
@@ -44,6 +48,8 @@ async def rollout(model: art.Model, step: int, is_validation: bool) -> art.Traje
         trajectory.messages_and_choices.append(
             {"role": "user", "content": render_board(game)}
         )
+        if verbose:
+            print(render_board(game))
 
         async def get_completion():
             client = model.openai_client()
@@ -68,6 +74,8 @@ async def rollout(model: art.Model, step: int, is_validation: bool) -> art.Traje
 
         try:
             apply_agent_move(game, content)
+            if verbose:
+                print(content)
             move_number += 1
         except ValueError:
             trajectory.reward = -1
@@ -102,3 +110,25 @@ async def rollout(model: art.Model, step: int, is_validation: bool) -> art.Traje
             break
 
     return trajectory
+
+
+if __name__ == "__main__":
+    gpt_4o_mini = art.Model(
+        name="gpt-4o-mini",
+        project="2048",
+        inference_model_name="openai/gpt-4o-mini",
+        inference_base_url="https://openrouter.ai/api/v1",
+        inference_api_key=os.getenv("OPENROUTER_API_KEY"),
+    )
+
+    async def main():
+        trajectory = await rollout(gpt_4o_mini, 0, True, True)
+        print("================" * 3)
+        print("METRICS\n")
+        print(trajectory.metrics)
+        print("================" * 3)
+        print("REWARD\n")
+        print(trajectory.reward)
+        print("================" * 3)
+
+    asyncio.run(main())
