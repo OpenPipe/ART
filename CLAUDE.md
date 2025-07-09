@@ -1,5 +1,37 @@
 Unsloth does not yet support the vLLM V1 engine or multi-device training. A realistic solution is to decouple vLLM for inference and the Unsloth model for training so that we can update them independently.
 
-As a first step I propose creating a new `ModelService` protocol compliant service class, `DecoupledUnslothService` in a new file `/src/art/unsloth/decoupled-service.py`. It will mimic the approach taken with the `TorchtuneService` in `/src/art/torchtune/service.py` with a division between the vLLM (V1) engine and the trainer. Some logical internal model config setting will act as a sentinel to indicate that the new `DecoupledUnslothService` should be used instead of the `UnslothService` in `/src/art/local/backend.py`. In the same way as with the torchtune service, we will offload vLLM's model and KV cache during training and load the Unsloth model and optimizer. After training is finished, we will offload the Unsloth model and optimizer and save the LoRA checkpoint to disk. We will then reload vLLM's model and KV cache and then load the latest LoRA checkpoint so that the model's name points to the appropriate LoRA, same as we do now in the `UnslothService`.
+## Implementation Status
 
-We want to do this with the absolute minimum number of changes to the existing code to minimize disruption and avoid any breaking changes to usage of the existing Unsloth and torchtune model services.
+### Completed:
+1. Created `DecoupledUnslothService` in `/src/art/unsloth/decoupled_service.py` that follows the `TorchtuneService` pattern:
+   - Uses vLLM V1 engine for inference
+   - Runs Unsloth training in a separate process (`/src/art/unsloth/train_process.py`)
+   - Implements sleep/wake mechanism for offloading vLLM during training
+   - Saves LoRA checkpoints and reloads them after training
+
+2. Updated `/src/art/local/backend.py` to support the new service:
+   - Added config check for `use_decoupled_unsloth` flag
+   - Service selection logic: TorchtuneService > DecoupledUnslothService > UnslothService
+
+3. Created test scripts:
+   - `/dev/yes-no-maybe.py` - Basic test script converted from notebook
+   - `/dev/yes-no-maybe-decoupled.py` - Test script using DecoupledUnslothService
+
+### Usage:
+To use the DecoupledUnslothService, set `use_decoupled_unsloth: true` in the model's internal config:
+
+```python
+model = art.TrainableModel(
+    name="my-model",
+    project="my-project",
+    base_model="Qwen/Qwen2.5-7B-Instruct",
+    _internal_config={
+        "use_decoupled_unsloth": True
+    }
+)
+```
+
+### Next Steps:
+- Run the yes-no-maybe.py test for 6 minutes to verify 2%+ reward improvement
+- Test the DecoupledUnslothService with yes-no-maybe-decoupled.py
+- Further optimize the training process communication and weight loading

@@ -112,6 +112,7 @@ class LocalBackend(Backend):
     async def _get_service(self, model: TrainableModel) -> ModelService:
         from ..torchtune.service import TorchtuneService
         from ..unsloth.service import UnslothService
+        from ..unsloth.decoupled_service import DecoupledUnslothService
 
         if model.name not in self._services:
             config = dev.get_model_config(
@@ -119,11 +120,15 @@ class LocalBackend(Backend):
                 output_dir=get_model_dir(model=model, art_path=self._path),
                 config=model._internal_config,
             )
-            service_class = (
-                TorchtuneService
-                if config.get("torchtune_args") is not None
-                else UnslothService
-            )
+            
+            # Determine which service class to use
+            if config.get("torchtune_args") is not None:
+                service_class = TorchtuneService
+            elif config.get("use_decoupled_unsloth", False):
+                service_class = DecoupledUnslothService
+            else:
+                service_class = UnslothService
+                
             self._services[model.name] = service_class(
                 model_name=model.name,
                 base_model=model.base_model,
@@ -142,6 +147,8 @@ class LocalBackend(Backend):
                     # When moving the service to a child process, import unsloth
                     # early to maximize optimizations
                     os.environ["IMPORT_UNSLOTH"] = "1"
+                # Note: DecoupledUnslothService doesn't need special imports since
+                # vLLM V1 and Unsloth run in separate processes
                 self._services[model.name] = move_to_child_process(
                     self._services[model.name],
                     process_name="model-service",
