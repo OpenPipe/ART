@@ -48,19 +48,46 @@ class Sandbox(ABC):
         # Install pytest first
         await self.exec(f"{uv_cmd} pip install -q pytest", timeout)
 
-        # Write test list
-        test_list = "\n".join(tests)
+        # Write test list in chunks to avoid command length limits
+        # First, clear any existing file
+        await self.exec("rm -f /tmp/tests.txt", timeout)
+        
+        # Write tests in chunks
+        chunk_size = 50  # Write 50 tests at a time
+        for i in range(0, len(tests), chunk_size):
+            chunk = tests[i:i + chunk_size]
+            test_chunk = "\n".join(chunk)
+            exit_code, output = await self.exec(
+                f"cat >> /tmp/tests.txt << 'EOF'\n{test_chunk}\nEOF", timeout
+            )
+            if exit_code != 0:
+                raise RuntimeError(f"Failed to write test chunk: {output}")
+
+        # Create a Python script to run pytest with proper handling of special characters
+        pytest_script = """
+import sys
+sys.path.insert(0, '/testbed')
+
+with open('/tmp/tests.txt', 'r') as f:
+    tests = [line.strip() for line in f if line.strip()]
+
+import pytest
+args = ['-v', '-o', 'addopts=', '--tb=short', '--no-header', '--doctest-modules'] + tests
+exit_code = pytest.main(args)
+sys.exit(exit_code)
+"""
         exit_code, output = await self.exec(
-            f"cat > /tmp/tests.txt << 'EOF'\n{test_list}\nEOF", timeout
+            f"cat > /tmp/run_pytest.py << 'EOF'\n{pytest_script}\nEOF", timeout
         )
         if exit_code != 0:
-            raise RuntimeError(f"Failed to write test list: {output}")
+            raise RuntimeError(f"Failed to write pytest script: {output}")
 
         # Run the tests with retry logic for missing dependencies
         max_retries = 5
         for attempt in range(max_retries):
-            test_cmd = f"cd /testbed && python -m pytest -v -o addopts= --tb=short --no-header --doctest-modules $(cat /tmp/tests.txt | tr '\\n' ' ')"
-            exit_code, output = await self.exec(test_cmd + " 2>&1", timeout)
+            exit_code, output = await self.exec(
+                "cd /testbed && python /tmp/run_pytest.py 2>&1", timeout
+            )
 
             # Check for missing dependencies and try to install them
             if "ModuleNotFoundError" in output or "ImportError" in output:
