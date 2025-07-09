@@ -56,7 +56,7 @@ class Sandbox(ABC):
         # Set up uv environment
         uv_cmd = "UV_SYSTEM_PYTHON=true PATH=$HOME/.local/bin:$PATH uv"
         
-        # Install pytest
+        # Install pytest first
         await self.exec(f"{uv_cmd} pip install -q pytest", timeout)
         
         # Try to install dependencies
@@ -104,7 +104,7 @@ class Sandbox(ABC):
         # Write test list
         await write_file_chunked(test_list_content, "/tmp/tests.txt")
         
-        # Create pytest runner script with better error handling
+        # Create pytest runner script that properly handles both regular tests and doctests
         pytest_script = '''
 import sys
 import os
@@ -116,74 +116,54 @@ sys.path.insert(0, '/testbed')
 with open('/tmp/tests.txt', 'r') as f:
     tests = [line.strip() for line in f if line.strip()]
 
+print(f"DEBUG: Total tests to run: {len(tests)}", file=sys.stderr)
+print(f"DEBUG: First few tests: {tests[:3]}", file=sys.stderr)
 
 # Use pytest.main() which doesn't have command line length limits
 import pytest
 
-# Separate tests that look like regular pytest tests vs doctest-style paths
-valid_tests = []
+# Separate regular tests from doctest paths
+regular_tests = []
 doctest_paths = []
+doctest_files = set()
 
 for test in tests:
-    if "::" in test and not test.split("::")[-1].startswith("test_"):
-        # Check if the part after :: looks like a module path rather than a test function
-        test_name = test.split("::")[-1]
-        if "." in test_name and not test_name.startswith("test_"):
+    if "::" in test:
+        file_path, test_name = test.split("::", 1)
+        # Check if this looks like a doctest path
+        if not test_name.startswith("test_") and "." in test_name:
+            # This is a doctest path - we need to run the whole file with --doctest-modules
+            doctest_files.add(file_path)
             doctest_paths.append(test)
         else:
-            valid_tests.append(test)
+            regular_tests.append(test)
     else:
-        valid_tests.append(test)
+        regular_tests.append(test)
 
+print(f"DEBUG: Regular tests: {len(regular_tests)}", file=sys.stderr)
+print(f"DEBUG: Doctest paths: {len(doctest_paths)}", file=sys.stderr)
+print(f"DEBUG: Doctest files: {len(doctest_files)}", file=sys.stderr)
 
-# Run valid tests first
-failed_count = 0
-passed_count = 0
-error_count = 0
-
-if valid_tests:
-    args = ['-v', '-o', 'addopts=', '--tb=short', '--no-header'] + valid_tests
+# Run regular tests first
+exit_code = 0
+if regular_tests:
+    print(f"DEBUG: Running {len(regular_tests)} regular tests...", file=sys.stderr)
+    args = ['-v', '-o', 'addopts=', '--tb=short', '--no-header'] + regular_tests
     exit_code = pytest.main(args)
+    print(f"DEBUG: Regular tests exit code: {exit_code}", file=sys.stderr)
 
-# For doctest paths, try to run them with doctest
-doctest_failures = 0
-if doctest_paths:
-    import doctest
-    for doctest_path in doctest_paths:
-        try:
-            # Extract module path from the doctest path
-            if "::" in doctest_path:
-                file_path = doctest_path.split("::")[0]
-                # Try to run doctest on the file
-                import importlib.util
-                spec = importlib.util.spec_from_file_location("module", file_path)
-                if spec and spec.loader:
-                    module = importlib.util.module_from_spec(spec)
-                    spec.loader.exec_module(module)
-                    # Run doctest on the module
-                    result = doctest.testmod(module, verbose=False)
-                    if result.failed > 0:
-                        doctest_failures += 1
-                        print(f"FAILED {doctest_path}")
-                    else:
-                        print(f"PASSED {doctest_path}")
-                else:
-                    doctest_failures += 1
-                    print(f"FAILED {doctest_path} (could not load module)")
-            else:
-                doctest_failures += 1
-                print(f"FAILED {doctest_path} (invalid path)")
-        except Exception as e:
-            doctest_failures += 1
-            print(f"FAILED {doctest_path} (error: {e})")
+# Run doctest files with --doctest-modules
+if doctest_files:
+    print(f"DEBUG: Running doctests for {len(doctest_files)} files...", file=sys.stderr)
+    doctest_args = ['-v', '-o', 'addopts=', '--tb=short', '--no-header', '--doctest-modules'] + list(doctest_files)
+    doctest_exit_code = pytest.main(doctest_args)
+    print(f"DEBUG: Doctest exit code: {doctest_exit_code}", file=sys.stderr)
+    # If either regular tests or doctests failed, overall should fail
+    if doctest_exit_code != 0:
+        exit_code = doctest_exit_code
 
-print(f"DEBUG: Doctest failures: {doctest_failures}", file=sys.stderr)
-
-# Exit with appropriate code
-if doctest_failures > 0 or exit_code != 0:
-    sys.exit(1)
-else:
-    sys.exit(0)
+print(f"DEBUG: Final exit code: {exit_code}", file=sys.stderr)
+sys.exit(exit_code)
 '''
         
         # Write pytest script
@@ -228,18 +208,9 @@ else:
         # Count collection errors specifically (ERROR: not found)
         collection_errors = output.count("ERROR: not found:")
         
-        # Also count doctest failures from our custom runner
-        doctest_failures = 0
-        if "DEBUG: Doctest failures:" in output:
-            import re
-            match = re.search(r"DEBUG: Doctest failures: (\d+)", output)
-            if match:
-                doctest_failures = int(match.group(1))
-        
-        
         # Clean up
         await self.exec("rm -f /tmp/tests.txt /tmp/tests.txt.b64 /tmp/run_pytest.py /tmp/run_pytest.py.b64", timeout)
         
-        # Return failed count (including errors, collection errors, and doctest failures) and passed count
-        total_failed = failed_count + error_count + collection_errors + doctest_failures
+        # Return failed count (including errors and collection errors) and passed count
+        total_failed = failed_count + error_count + collection_errors
         return total_failed, passed_count
