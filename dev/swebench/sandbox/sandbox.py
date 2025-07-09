@@ -124,6 +124,7 @@ class Sandbox(ABC):
         pytest_script = """
 import sys
 import os
+import json
 
 # Add testbed to path
 sys.path.insert(0, '/testbed')
@@ -148,25 +149,22 @@ for test in tests:
         file_path, test_name = test.split("::", 1)
         # Check if this is a doctest path (module path with dots, not starting with test_)
         if "." in test_name and not test_name.startswith("test_") and file_path.endswith(".py"):
-            # For doctests, we need to run the file with --doctest-modules
-            doctest_files.add(file_path)
+            # For doctests, we should run them individually, not the whole file
+            # This ensures we only run the specific doctests in our test list
+            regular_tests.append(test)
         else:
             regular_tests.append(test)
     else:
         regular_tests.append(test)
 
-# Run all tests together, including doctest files with --doctest-modules flag
+# Run all tests together
 all_args = ['-v', '-o', 'addopts=', '--tb=short', '--no-header']
 
-# If we have doctests, add the flag and the files
-if doctest_files:
-    all_args.append('--doctest-modules')
-    # Add regular tests first, then doctest files
-    all_args.extend(regular_tests)
-    all_args.extend(sorted(doctest_files))
-else:
-    # Just regular tests
-    all_args.extend(tests)
+# Always add --doctest-modules flag to handle any doctests
+all_args.append('--doctest-modules')
+
+# Add all tests
+all_args.extend(tests)
 
 print(f"DEBUG: Running pytest with args: {all_args[:10]}...", file=sys.stderr)
 exit_code = pytest.main(all_args)
@@ -196,6 +194,13 @@ sys.exit(exit_code)
                 )
                 missing_modules.extend(
                     re.findall(r"No module named [']([^']+)[']", output)
+                )
+                # Also catch from E prefix lines in pytest output
+                missing_modules.extend(
+                    re.findall(
+                        r"E\s+ModuleNotFoundError: No module named [']([^']+)[']",
+                        output,
+                    )
                 )
 
                 # Remove duplicates
