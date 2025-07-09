@@ -10,6 +10,7 @@ dependencies = [
     "openpipe-art",
     "pytest>=8.4.1",
     "pytest-asyncio>=1.0.0",
+    "pytest-timeout>=2.4.0",
     "sweagent",
     "swebench>=4.0.3",
 ]

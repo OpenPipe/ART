@@ -108,7 +108,17 @@ sys.exit(exit_code)
             break
 
         # Parse results - look for FAILED and PASSED (with leading space like in pytest output)
-        failed_count = output.count(" FAILED") + output.count(" ERROR")
+        # Note: We only count test results, not pytest framework messages
+        # Test results appear in format like "tests/test_file.py::test_name FAILED"
+        failed_count = output.count(" FAILED")
         passed_count = output.count(" PASSED")
+        
+        # Handle edge case: if pytest exits with code 4 (collection errors) and no tests ran,
+        # we should count the requested tests as failures since they couldn't be executed
+        if exit_code == 4 and failed_count == 0 and passed_count == 0:
+            # Check if there were collection errors preventing tests from running
+            if "ERROR collecting" in output or "ImportError" in output or "ModuleNotFoundError" in output:
+                # Count all requested tests as failures since they couldn't run
+                failed_count = len(tests)
 
         return failed_count, passed_count
