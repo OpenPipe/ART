@@ -120,7 +120,7 @@ trainable_models["010"]._internal_config = art.dev.InternalModelConfig(
 
 trainable_models["011"] = trainable_models["001"].model_copy(deep=True)
 assert trainable_models["011"].config.training_config is not None
-trainable_models["011"].name = "tau-bench-rl-011-tm-too-big-2"
+trainable_models["011"].name = "tau-bench-rl-011-tm-too-big-7"
 trainable_models["011"].config.training_config.trajectories_per_group = 64
 trainable_models["011"].config.training_config.groups_per_step = 32
 trainable_models["011"].config.training_config.training_dataset_size = 32

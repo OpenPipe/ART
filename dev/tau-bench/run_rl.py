@@ -24,6 +24,7 @@ from tau_bench.rl_utils import (
     update_steps_for_openpipe_logs,
 )
 from tqdm.asyncio import tqdm_asyncio
+from art.utils import limit_concurrency
 
 # Load environment variables
 load_dotenv(override=True)
@@ -37,6 +38,7 @@ def clean_messages(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     return cleaned_messages
 
 
+@limit_concurrency(256)
 async def rollout_tau_bench_task(
     model: art.Model[TauBenchPolicyConfig],
     task_index: int,
@@ -123,17 +125,16 @@ async def rollout_tau_bench_task(
         if config.messages_only:
             traj.messages_and_choices = clean_messages(result.messages)  # type: ignore
         else:
-            traj.messages_and_choices = agent.create_messages_and_choices(
-                result.messages
-            )  # type: ignore
+            traj.messages_and_choices = agent.create_messages_and_choices()  # type: ignore
     except Exception as e:
         print(f"Error in rollout for task {task_index}: {e}")
-        traj.reward = 0.0
+        traj.reward = -1.0
         traj.metadata["error"] = str(e)
+        traj.messages_and_choices = agent.create_messages_and_choices()  # type: ignore
         result = SolveResult(
-            reward=0.0,
+            reward=-1.0,
             info={"error": str(e)},
-            messages=[],
+            messages=agent.messages,
             total_cost=0.0,
         )
 

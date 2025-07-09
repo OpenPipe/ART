@@ -16,3 +16,4 @@ trajectories/
 .local/
 .claude/
 .vscode/
+.ruff_cache/

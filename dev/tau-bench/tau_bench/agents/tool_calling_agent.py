@@ -10,9 +10,15 @@ from art.utils.litellm import convert_litellm_choice_to_openai
 from tau_bench.agents.base import Agent
 from tau_bench.envs.base import Env
 from tau_bench.types import SolveResult, Action, RESPOND_ACTION_NAME
+from tenacity import retry, stop_after_attempt, wait_exponential
 
 
-@limit_concurrency(n=256)
+@retry(
+    stop=stop_after_attempt(3),
+    wait=wait_exponential(multiplier=1, min=4, max=15),
+    reraise=True,
+)
+@limit_concurrency(n=128)
 async def acompletion_with_limit_concurrency(*args, **kwargs):
     return await acompletion(*args, **kwargs)
 
@@ -33,6 +39,7 @@ class ToolCallingAgent(Agent):
         self.model = model
         self.provider = provider
         self.temperature = temperature
+        self.messages = []
 
     async def llm_completion(self, messages: List[Dict[str, Any]]) -> ModelResponse:
         completion_obj = await acompletion(
@@ -53,7 +60,7 @@ class ToolCallingAgent(Agent):
         obs = env_reset_res.observation
         info = env_reset_res.info.model_dump()
         reward = 0.0
-        messages: List[Dict[str, Any]] = [
+        self.messages: List[Dict[str, Any]] = [
             {"role": "system", "content": self.wiki},
             {"role": "user", "content": obs},
         ]
@@ -62,37 +69,42 @@ class ToolCallingAgent(Agent):
         max_completion_tokens = 0
         forced_stop = True
         for curr_step_number in range(max_num_steps):
-            res = await self.llm_completion(messages)
+            res = await self.llm_completion(self.messages)
             final_prompt_tokens = res.usage.prompt_tokens  # type: ignore
             avg_completion_tokens += res.usage.completion_tokens  # type: ignore
             max_completion_tokens = max(
                 max_completion_tokens, res.usage.completion_tokens
             )  # type: ignore
             next_message = res.choices[0].message.model_dump()  # type: ignore
+            if (
+                "tool_calls" in next_message
+                and next_message["tool_calls"] is not None
+                and len(next_message["tool_calls"]) > 0
+                and next_message["tool_calls"][0]["function"] is not None
+            ):
+                next_message["tool_calls"] = next_message["tool_calls"][:1]
+            self.messages.append(next_message)
+
             total_cost += res._hidden_params.get("response_cost") or 0.0
             action = message_to_action(next_message)
             env_response = await env.step(action)
             reward = env_response.reward
             info = {**info, **env_response.info.model_dump()}
             if action.name != RESPOND_ACTION_NAME:
-                next_message["tool_calls"] = next_message["tool_calls"][:1]
-                messages.extend(
-                    [
-                        next_message,
-                        {
-                            "role": "tool",
-                            "tool_call_id": next_message["tool_calls"][0]["id"],
-                            "name": next_message["tool_calls"][0]["function"]["name"],
-                            "content": env_response.observation,
-                        },
-                    ]
+                self.messages.append(
+                    {
+                        "role": "tool",
+                        "tool_call_id": next_message["tool_calls"][0]["id"],
+                        "name": next_message["tool_calls"][0]["function"]["name"],
+                        "content": env_response.observation,
+                    }
                 )
             else:
-                messages.extend(
-                    [
-                        next_message,
-                        {"role": "user", "content": env_response.observation},
-                    ]
+                self.messages.append(
+                    {
+                        "role": "user",
+                        "content": env_response.observation,
+                    }
                 )
             if env_response.done:
                 forced_stop = False
@@ -107,7 +119,7 @@ class ToolCallingAgent(Agent):
         return SolveResult(
             reward=reward,
             info=info,
-            messages=messages,
+            messages=self.messages,
             total_cost=total_cost,
         )
 
@@ -140,10 +152,10 @@ class ToolCallingRLAgent(ToolCallingAgent):
         self.choices.append(convert_litellm_choice_to_openai(choice))
         return response
 
-    def create_messages_and_choices(self, messages: List[Dict[str, Any]]):
+    def create_messages_and_choices(self):
         messages_and_choices = []
         choice_idx = 0
-        for message in messages:
+        for message in self.messages:
             if message["role"] == "assistant":
                 choice = self.choices[choice_idx]
                 if "Qwen3-" in self.base_model:

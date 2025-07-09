@@ -23,15 +23,6 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-swebench = [
-    "aiolimiter>=1.2.1",
-    "daytona-sdk>=0.21.5",
-    "langfuse>=2.60.7",
-    "modal>=1.0.1",
-    "sweagent",
-    "swebench>=4.0.3",
-]
-
 backend = [
     "peft>=0.14.0",
     "hf-xet>=1.1.0",
@@ -70,8 +61,8 @@ dev-dependencies = [
     "ipywidgets>=8.1.5",
     "openpipe>=4.49.0",
     "hatch>=1.14.1",
-    "skypilot[cudo,do,fluidstack,gcp,lambda,paperspace,runpod]==0.8.0",
     "ruff>=0.12.1",
+    "skypilot[cudo,do,fluidstack,gcp,lambda,paperspace,runpod]==0.8.0",
 ]
 
 [tool.uv.sources]
