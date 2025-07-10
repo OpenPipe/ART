@@ -47,6 +47,13 @@ class Sandbox(ABC):
 
         # Install pytest first
         await self.exec(f"{uv_cmd} pip install -q pytest", timeout)
+        
+        # Try to install the project itself if it has a setup.py or pyproject.toml
+        # This will install all project dependencies
+        setup_exists = await self.exec("test -f /testbed/setup.py && echo exists", timeout)
+        pyproject_exists = await self.exec("test -f /testbed/pyproject.toml && echo exists", timeout)
+        if setup_exists[1].strip() == "exists" or pyproject_exists[1].strip() == "exists":
+            await self.exec(f"cd /testbed && {uv_cmd} pip install -q -e . 2>/dev/null", timeout)
 
         # Write test list in chunks to avoid command length limits
         # First, clear any existing file
@@ -72,7 +79,7 @@ with open('/tmp/tests.txt', 'r') as f:
     tests = [line.strip() for line in f if line.strip()]
 
 import pytest
-args = ['-v', '-o', 'addopts=', '--tb=short', '--no-header', '--doctest-modules'] + tests
+args = ['-v', '-o', 'addopts=', '--tb=short', '--no-header'] + tests
 exit_code = pytest.main(args)
 sys.exit(exit_code)
 """
@@ -83,7 +90,7 @@ sys.exit(exit_code)
             raise RuntimeError(f"Failed to write pytest script: {output}")
 
         # Run the tests with retry logic for missing dependencies
-        max_retries = 5
+        max_retries = 20
         for attempt in range(max_retries):
             exit_code, output = await self.exec(
                 "cd /testbed && python /tmp/run_pytest.py 2>&1", timeout
@@ -99,7 +106,16 @@ sys.exit(exit_code)
                 if missing_modules and attempt < max_retries - 1:
                     # Try to install missing modules
                     for module in missing_modules:
-                        await self.exec(f"{uv_cmd} pip install -q {module}", timeout)
+                        # Handle special cases where import name differs from package name
+                        package_name = module
+                        if module == "OpenSSL":
+                            package_name = "pyOpenSSL"
+                        elif module == "yaml":
+                            package_name = "pyyaml"
+                        elif module == "cv2":
+                            package_name = "opencv-python"
+                        
+                        await self.exec(f"{uv_cmd} pip install -q {package_name}", timeout)
 
                     # Retry the test
                     continue
