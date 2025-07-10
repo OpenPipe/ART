@@ -1,7 +1,5 @@
 from dotenv import load_dotenv
 import pytest
-import tempfile
-import os
 
 from ..instances import as_instances_iter, get_filtered_swe_smith_instances_df
 from .new import new_sandbox
