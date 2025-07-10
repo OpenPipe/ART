@@ -268,7 +268,7 @@ class LocalBackend(Backend):
 
         # Get the file name for the current iteration, or default to 0 for non-trainable models
         iteration = self.__get_step(model) if isinstance(model, TrainableModel) else 0
-        file_name = f"{iteration:04d}.yaml"
+        file_name = f"{iteration:04d}.jsonl"
 
         # Write the logs to the file
         with open(f"{parent_dir}/{file_name}", "w") as f:

@@ -22,21 +22,6 @@ load_dotenv()
 async def train(model: art.TrainableModel[ProjectPolicyConfig]):
     generate_database()
 
-    # Training config is now directly on the model config
-
-    if model.config.group_judge_model is not None:
-        judge_model = model.config.group_judge_model
-
-        if model.config.group_judge_model == "self":
-            judge_model = model
-        elif judge_model == "base_model":
-            judge_model = model.base_model
-
-        group_judge = GroupJudge(
-            project=model.project,
-            judge_model=judge_model,
-        )
-
     with LocalBackend() as backend:
         print(f"Pulling from S3 bucket: `{os.environ['BACKUP_BUCKET']}`")
         await backend._experimental_pull_from_s3(
@@ -68,6 +53,18 @@ async def train(model: art.TrainableModel[ProjectPolicyConfig]):
             num_epochs=model.config.num_epochs,
             initial_step=await model.get_step(),
         )
+
+        if model.config.group_judge_model is not None:
+            judge_model = model.config.group_judge_model
+
+            if model.config.group_judge_model in ["self", "base_model"]:
+                judge_model = model
+
+            group_judge = GroupJudge(
+                project=model.project,
+                judge_model=judge_model,
+                judge_model_use_base_model=judge_model == "base_model",
+            )
 
         for batch in train_iterator:
             if batch.step % model.config.eval_steps == 0:

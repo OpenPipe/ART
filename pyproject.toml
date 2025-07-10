@@ -4,25 +4,11 @@ version = "0.3.13"
 description = "The OpenPipe Agent Reinforcement Training (ART) library"
 readme = "README.md"
 requires-python = ">=3.10"
-dependencies = [
-    "matplotlib>=3.10.1",
-    "openai>=1.65.5",
-    "seaborn>=0.13.2",
-    "setuptools>=78.1.0",
-    "wandb>=0.19.8",
-    "weave>=0.51.51",
-    "typer>=0.15.2",
-    "tblib>=3.0.0",
-    "litellm>=1.63.0",
-    "polars>=1.26.0",
-    "awscli>=1.38.1",
-    "panza",
-    "semver>=3.0.4",
-    "setproctitle>=1.3.6",
-    "accelerate==1.7.0"
-]
+dependencies = ["openai>=1.65.5", "typer>=0.15.2", "litellm>=1.63.0"]
 
 [project.optional-dependencies]
+plotting = ["matplotlib>=3.10.1", "seaborn>=0.13.2", "polars>=1.26.0"]
+
 backend = [
     "peft>=0.14.0",
     "hf-xet>=1.1.0",
@@ -34,6 +20,14 @@ backend = [
     "trl>=0.19.0",
     "torch>=2.7.0",
     "torchao>=0.9.0",
+    "accelerate==1.7.0",
+    "awscli>=1.38.1",
+    "setproctitle>=1.3.6",
+    "weave>=0.51.51",
+    "tblib>=3.0.0",
+    "semver>=3.0.4",
+    "setuptools>=78.1.0",
+    "wandb>=0.19.8",
 ]
 
 [project.scripts]
@@ -62,7 +56,7 @@ dev-dependencies = [
     "openpipe>=4.49.0",
     "hatch>=1.14.1",
     "ruff>=0.12.1",
-    "skypilot[cudo,do,fluidstack,gcp,lambda,paperspace,runpod]==0.8.0",
+    "skypilot[cudo,do,fluidstack,gcp,lambda,paperspace,runpod]==0.9.3",
 ]
 
 [tool.uv.sources]

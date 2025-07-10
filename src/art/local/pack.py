@@ -1,7 +1,5 @@
-import matplotlib.pyplot as plt
 import os
 import random
-import seaborn as sns
 import torch
 from typing_extensions import TypedDict, Unpack
 
@@ -167,6 +165,15 @@ def packed_tensors_to_dir(tensors: PackedTensors, dir: str) -> DiskPackedTensors
 
 
 def plot_packed_tensors(packed_tensors: PackedTensors) -> None:
+    try:
+        import matplotlib.pyplot as plt
+        import seaborn as sns
+    except ImportError:
+        raise ImportError(
+            "Plotting dependencies are not installed. Please install them with: "
+            "pip install openpipe-art[plotting]"
+        )
+
     plt.figure(figsize=(15, 24))
 
     for tensor, label, title, subplot_idx in (

@@ -1,3 +1,4 @@
+import json
 import yaml
 from typing import Any
 
@@ -10,14 +11,14 @@ from openai.types.chat.chat_completion_message_param import (
 )
 
 
-# serialize trajectory groups to a yaml string
+# serialize trajectory groups to a jsonl string
 def serialize_trajectory_groups(trajectory_groups: list[TrajectoryGroup]) -> str:
     group_dicts = [
         trajectory_group_to_dict(trajectory_group)
         for trajectory_group in trajectory_groups
     ]
 
-    return yaml.dump(group_dicts)
+    return "\n".join(json.dumps(group_dict) for group_dict in group_dicts)
 
 
 def trajectory_group_to_dict(trajectory_group: TrajectoryGroup) -> dict[str, Any]:
@@ -66,7 +67,14 @@ def message_or_choice_to_dict(message_or_choice: Message | Choice) -> dict[str, 
 
 
 def deserialize_trajectory_groups(serialized: str) -> list[TrajectoryGroup]:
-    loaded_groups = yaml.load(serialized, Loader=yaml.SafeLoader)
+    # Try to parse as JSONL first (new format)
+    try:
+        loaded_groups = [
+            json.loads(line) for line in serialized.strip().split("\n") if line
+        ]
+    except json.JSONDecodeError:
+        # Fall back to YAML parsing (old format)
+        loaded_groups = yaml.load(serialized, Loader=yaml.SafeLoader)
     return [dict_to_trajectory_group(group) for group in loaded_groups]
 
 

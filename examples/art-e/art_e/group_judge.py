@@ -50,11 +50,13 @@ class GroupJudge:
     def __init__(
         self,
         project: str,
-        judge_model: str | art.Model = "openai/o3",
+        judge_model: str | art.TrainableModel = "openai/o3",
+        judge_model_use_base_model: bool = False,
         rubric: str = DEFAULT_RUBRIC,
     ):
         self.project = project  # store for later use
         self.judge_model = judge_model
+        self.judge_model_use_base_model = judge_model_use_base_model
         self.rubric = rubric
 
     @weave.op()
@@ -129,13 +131,18 @@ class GroupJudge:
         completion_params = {}
         if isinstance(self.judge_model, art.Model):
             completion_params = self.judge_model.litellm_completion_params()
+            if self.judge_model_use_base_model:
+                # When using base_model, we still need the model's inference configuration
+                # (api_key, base_url) but we override the model name to use the base model
+                completion_params["model"] = (
+                    f"hosted_vllm/{self.judge_model.base_model}"
+                )
         else:
             completion_params["model"] = self.judge_model
 
-        print("model is", self.judge_model)
+        print("judge completion_params", completion_params)
         response = await acompletion(
-            # **completion_params,
-            model=self.judge_model,
+            **completion_params,
             messages=messages,
             response_format=GroupJudgeResponse,
             caching=True,
@@ -218,9 +225,20 @@ if __name__ == "__main__":
             for m, t in zip(models, rollouts):
                 print(f"  {m.name:10s}: {t.reward:.3f}")
 
+            art_model = art.TrainableModel[ProjectPolicyConfig](
+                name="willcb/Qwen3-32B",
+                base_model="willcb/Qwen3-32B",
+                # inference_model_name="hosted_vllm/willcb/Qwen3-32B",
+                project="email_agent",
+                config=ProjectPolicyConfig(),
+            )
+            art_model.inference_api_key = "default"
+            art_model.inference_base_url = "http://localhost:8000/v1"
+
             judge = GroupJudge(
                 project="email_agent",
-                judge_model="openrouter/qwen/qwen3-32b",
+                judge_model=art_model,
+                judge_model_use_base_model=True,
                 # judge_model="openrouter/qwen/qwen3-14b",
                 # judge_model="openai/o3",
             )

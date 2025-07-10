@@ -150,5 +150,26 @@ models["217"].base_model = "Qwen/Qwen3-14B"
 models["217"].config.include_qwen3_nothink = True
 
 models["218"] = models["206"].model_copy(deep=True)
-models["218"].name = "email-agent-218"
+models["218"].name = "email-agent-218-5"
+models["218"].base_model = "Qwen/Qwen3-32B"
 models["218"].config.group_judge_model = "base_model"
+models["218"].config.include_qwen3_nothink = True
+
+# Model 219: like 008 but with custom internal config (low max_grad_norm) and high learning rate
+models["219"] = models["008"].model_copy(deep=True)
+models["219"].name = "email-agent-219"
+models["219"].config.learning_rate = 1e-2
+models["219"]._internal_config = art.dev.InternalModelConfig(
+    trainer_args=art.dev.TrainerArgs(
+        max_grad_norm=1e-7,
+    )
+)
+
+models["220"] = models["217"].model_copy(deep=True)
+models["220"].name = "email-agent-220"
+models["220"].base_model = "willcb/Qwen3-14B"
+
+models["221"] = models["008"].model_copy(deep=True)
+models["221"].name = "email-agent-221"
+models["221"].config.include_qwen3_nothink = True
+models["221"].base_model = "willcb/Qwen3-32B"

@@ -148,47 +148,50 @@ async def update_steps_for_openpipe_logs(
     await op_client.base_client._client_wrapper.httpx_client.aclose()
 
 
-class ErrorAnalysis(BaseModel):
+class ErrorAnalysisRollout(BaseModel):
     """Model representing the error analysis for a task with failed rollouts"""
 
-    task_id: int = Field(description="The task ID that was analyzed")
-    reasoning: str = Field(
-        description="Detailed reasoning about why the rollouts failed"
+    summary: str = Field(
+        description="A summary of the rollout. This should be such that a reader can understand what happened in the rollout without haveing to look at the whole rollout. Not too verbose, but relevant."
     )
+    reasoning: str = Field(description="Reasoning about why the rollout failed")
     blame_assignment: str = Field(
         description="Assignment of blame: 'scenario', 'assistant', 'user', or 'combination'"
     )
-    specific_issues: List[str] = Field(
-        description="List of specific issues identified in the rollouts"
+    category: str = Field(
+        description="A few word description for a category of the failure"
     )
-    recommendations: str = Field(
-        description="Recommendations for addressing the identified issues"
+
+
+class ErrorAnalysis(BaseModel):
+    """Model representing the error analysis for a task with failed rollouts"""
+
+    error_analysis_rollouts: List[ErrorAnalysisRollout] = Field(
+        description="The error analysis for each failed rollout"
     )
 
 
 ERROR_ANALYSIS_PROMPT = """You are an expert at analyzing AI assistant performance in customer service scenarios. You will be given:
 
-1. A user objective/task
-2. The correct set of tools that should be used to accomplish the task
-3. The system message given to the assistant
-4. Multiple rollouts where the assistant failed to complete the task correctly
+1. A user objective/task. This is what the user knew about what they wanted to accomplish.
+2. A minimal reproduction of what would have been the correct order of tool calls that would have accomplished the task
+3. The system message given to the assistant. This contains the instructions for the assistant.
+4. Multiple rollouts where the task was not completed correctly.
 
-Your job is to analyze why the assistant failed and assign blame appropriately.
+Your job is to analyze why the task was not completed correctly and assign blame appropriately.
 
 **Blame Categories:**
-- "scenario": The task setup, tools, or environment is problematic/unclear
-- "assistant": The assistant made poor decisions or mistakes
-- "user": The user's instructions were unclear or problematic
-- "combination": Multiple factors contributed to the failure
+- "scenario": Something about the task setup / user objective or system message / environment is problematic/unclear and the assistant couldn't have completed the task.
+- "assistant": The assistant made poor decisions or mistakes that prevented it from completing the task.
+- "user": The user did not behave as per the user objective which led to the assistant not being able to complete the task.
+- "combination": Multiple factors contributed to the failure.
 
-**Analysis Guidelines:**
-1. Look for patterns across the failed rollouts
-2. Identify if the assistant consistently makes the same mistakes
-3. Check if the tools provided are sufficient for the task
-4. Evaluate if the system message gives clear guidance
-5. Consider if the user's objective is achievable with the given tools
-
-Provide detailed reasoning, specific issues found, and recommendations for improvement.
+Try to look for patterns across the failed rollouts and identify specific issues found.
+In your response, provide, for each failed rollout, the following:
+- A summary of the rollout. This should be such that a reader can understand what happened in the rollout without haveing to look at the whole rollout. Not too verbose, but relevant.
+- Reasoning for why the rollout failed.
+- The blame assignment
+- Category of the failure (a few word description for a category of the failure)
 """
 
 
@@ -224,10 +227,10 @@ def format_rollout_messages(messages: List[Dict[str, Any]]) -> str:
         if tool_calls:
             tool_call_str = ""
             for tool_call in tool_calls:
-                tool_call_str += f"TOOL CALL: {tool_call['function']['name']}: {tool_call['function']['arguments']}\n"
-            formatted += f"{role.upper()}: {tool_call_str}\n"
+                tool_call_str += f"TOOL CALL: {tool_call['function']['name']}: {tool_call['function']['arguments']}\n\n"
+            formatted += f"{role.upper()}: {tool_call_str}\n\n"
         else:
-            formatted += f"{role.upper()}: {content}\n"
+            formatted += f"{role.upper()}: {content}\n\n"
     return formatted
 
 
@@ -253,7 +256,6 @@ async def analyze_failed_task(
 
         # Build analysis prompt
         prompt = ERROR_ANALYSIS_PROMPT + "\n\n"
-        prompt += f"**Task ID:** {task_id}\n\n"
         prompt += f"**User Objective:**\n{user_objective}\n\n"
         prompt += f"**Correct Tools:**\n{correct_tools}\n\n"
         prompt += f"**System Message:**\n{system_message}\n\n"
@@ -274,7 +276,7 @@ async def analyze_failed_task(
                 messages=[{"role": "user", "content": prompt}],
                 response_format=ErrorAnalysis,
             )
-
+            assert response.choices[0].message.parsed is not None
             return response.choices[0].message.parsed, prompt
 
     except Exception as e:
@@ -282,39 +284,118 @@ async def analyze_failed_task(
         return None
 
 
-async def log_analysis_to_openpipe(
-    task_id: int, analysis: ErrorAnalysis, prompt: str, response: str
+async def log_rollout_analysis_to_openpipe(
+    task_id: int,
+    rollout_analysis: ErrorAnalysisRollout,
+    trajectory_data: Dict[str, Any],
+    rollout_index: int,
+    prompt: str,
 ) -> None:
-    """Log the analysis prompt and response to OpenPipe."""
+    """Log an individual rollout analysis with its trajectory data to OpenPipe."""
 
     try:
-        # Create a dummy trajectory for OpenPipe logging
-        dummy_trajectory = art.Trajectory(
+        # Create metadata that includes both trajectory info and analysis
+        metadata = {
+            "task_id": str(task_id),
+            "rollout_index": str(rollout_index),
+            "analysis_type": "error_analysis_rollout",
+            "analysis_summary": rollout_analysis.summary,
+            "analysis_reasoning": rollout_analysis.reasoning,
+            "analysis_blame": rollout_analysis.blame_assignment,
+            "analysis_category": rollout_analysis.category,
+            "model": "error_analyzer",
+            "phase": "analysis",
+            "reward": str(trajectory_data["reward"]),
+            "completion_id": f"rollout-{task_id}-{rollout_index}-{int(datetime.now().timestamp())}",
+        }
+
+        # Create trajectory with enhanced metadata
+        enhanced_trajectory = art.Trajectory(
+            messages_and_choices=trajectory_data["traj"],
+            reward=trajectory_data["reward"],
+            metadata=metadata,
+            tools=[],
+            metrics={},
+        )
+
+        # Format analysis response
+        response = f"Summary: {rollout_analysis.summary}\nReasoning: {rollout_analysis.reasoning}\nBlame: {rollout_analysis.blame_assignment}\nCategory: {rollout_analysis.category}"
+
+        # Get messages for logging
+        messages = keep_only_messages(trajectory_data["traj"])
+
+        # Log to OpenPipe
+        await log_trajectory_to_openpipe(
+            enhanced_trajectory, messages, response_str=response
+        )
+        print(
+            f"Logged rollout analysis for task {task_id}, rollout {rollout_index} to OpenPipe"
+        )
+
+    except Exception as e:
+        print(
+            f"Error logging rollout analysis for task {task_id}, rollout {rollout_index}: {e}"
+        )
+
+
+async def log_full_analysis_to_openpipe(
+    task_id: int, analysis: ErrorAnalysis, prompt: str, response: str
+) -> None:
+    """Log the full error analysis (all rollouts) to OpenPipe."""
+
+    try:
+        # Create summary metadata from all rollouts
+        blame_counts = {}
+        category_counts = {}
+        for rollout in analysis.error_analysis_rollouts:
+            blame_counts[rollout.blame_assignment] = (
+                blame_counts.get(rollout.blame_assignment, 0) + 1
+            )
+            category_counts[rollout.category] = (
+                category_counts.get(rollout.category, 0) + 1
+            )
+
+        metadata = {
+            "task_id": str(task_id),
+            "analysis_type": "error_analysis_full",
+            "num_rollouts": str(len(analysis.error_analysis_rollouts)),
+            "blame_distribution": str(blame_counts),
+            "category_distribution": str(category_counts),
+            "model": "error_analyzer",
+            "phase": "analysis",
+            "completion_id": f"full-analysis-{task_id}-{int(datetime.now().timestamp())}",
+        }
+
+        # Create a summary trajectory for the full analysis
+        summary_trajectory = art.Trajectory(
             messages_and_choices=[
                 {"role": "user", "content": prompt},
                 {"role": "assistant", "content": response},
             ],
             reward=0.0,
-            metadata={
-                "task_id": task_id,
-                "analysis_type": "error_analysis",
-                "blame_assignment": analysis.blame_assignment,
-                "model": "error_analyzer",
-                "phase": "analysis",
-                "completion_id": f"analysis-{task_id}-{int(datetime.now().timestamp())}",
-            },
+            metadata=metadata,
             tools=[],
         )
 
         messages = [
             {"role": "user", "content": prompt},
-            # {"role": "assistant", "content": response},
         ]
 
         await log_trajectory_to_openpipe(
-            dummy_trajectory, messages, response_str=response
+            summary_trajectory, messages, response_str=response
         )
-        print(f"Logged analysis for task {task_id} to OpenPipe")
+        print(f"Logged full analysis for task {task_id} to OpenPipe")
 
     except Exception as e:
-        print(f"Error logging analysis for task {task_id} to OpenPipe: {e}")
+        print(f"Error logging full analysis for task {task_id} to OpenPipe: {e}")
+
+
+# Keep the old function for backward compatibility but mark it as deprecated
+async def log_analysis_to_openpipe(
+    task_id: int, analysis: ErrorAnalysis, prompt: str, response: str
+) -> None:
+    """
+    DEPRECATED: Use log_full_analysis_to_openpipe instead.
+    Log the analysis prompt and response to OpenPipe.
+    """
+    await log_full_analysis_to_openpipe(task_id, analysis, prompt, response)

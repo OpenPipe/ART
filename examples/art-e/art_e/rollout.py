@@ -216,7 +216,7 @@ async def rollout(
     )
 
     if model.config.include_qwen3_nothink:
-        system_prompt += "\n/nothink"
+        system_prompt += "\n/no_think"
 
     async def search_emails(keywords: list[str]) -> list[dict]:
         """
