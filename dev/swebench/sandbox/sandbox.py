@@ -47,22 +47,31 @@ class Sandbox(ABC):
 
         # Install pytest first
         await self.exec(f"{uv_cmd} pip install -q pytest", timeout)
-        
+
         # Try to install the project itself if it has a setup.py or pyproject.toml
         # This will install all project dependencies
-        setup_exists = await self.exec("test -f /testbed/setup.py && echo exists", timeout)
-        pyproject_exists = await self.exec("test -f /testbed/pyproject.toml && echo exists", timeout)
-        if setup_exists[1].strip() == "exists" or pyproject_exists[1].strip() == "exists":
-            await self.exec(f"cd /testbed && {uv_cmd} pip install -q -e . 2>/dev/null", timeout)
+        setup_exists = await self.exec(
+            "test -f /testbed/setup.py && echo exists", timeout
+        )
+        pyproject_exists = await self.exec(
+            "test -f /testbed/pyproject.toml && echo exists", timeout
+        )
+        if (
+            setup_exists[1].strip() == "exists"
+            or pyproject_exists[1].strip() == "exists"
+        ):
+            await self.exec(
+                f"cd /testbed && {uv_cmd} pip install -q -e . 2>/dev/null", timeout
+            )
 
         # Write test list in chunks to avoid command length limits
         # First, clear any existing file
         await self.exec("rm -f /tmp/tests.txt", timeout)
-        
+
         # Write tests in chunks
         chunk_size = 50  # Write 50 tests at a time
         for i in range(0, len(tests), chunk_size):
-            chunk = tests[i:i + chunk_size]
+            chunk = tests[i : i + chunk_size]
             test_chunk = "\n".join(chunk)
             exit_code, output = await self.exec(
                 f"cat >> /tmp/tests.txt << 'EOF'\n{test_chunk}\nEOF", timeout
@@ -114,8 +123,10 @@ sys.exit(exit_code)
                             package_name = "pyyaml"
                         elif module == "cv2":
                             package_name = "opencv-python"
-                        
-                        await self.exec(f"{uv_cmd} pip install -q {package_name}", timeout)
+
+                        await self.exec(
+                            f"{uv_cmd} pip install -q {package_name}", timeout
+                        )
 
                     # Retry the test
                     continue
@@ -128,12 +139,16 @@ sys.exit(exit_code)
         # Test results appear in format like "tests/test_file.py::test_name FAILED"
         failed_count = output.count(" FAILED")
         passed_count = output.count(" PASSED")
-        
+
         # Handle edge case: if pytest exits with code 4 (collection errors) and no tests ran,
         # we should count the requested tests as failures since they couldn't be executed
         if exit_code == 4 and failed_count == 0 and passed_count == 0:
             # Check if there were collection errors preventing tests from running
-            if "ERROR collecting" in output or "ImportError" in output or "ModuleNotFoundError" in output:
+            if (
+                "ERROR collecting" in output
+                or "ImportError" in output
+                or "ModuleNotFoundError" in output
+            ):
                 # Count all requested tests as failures since they couldn't run
                 failed_count = len(tests)
 
@@ -148,11 +163,11 @@ sys.exit(exit_code)
         old_str: Optional[str] = None,
         new_str: Optional[str] = None,
         insert_line: Optional[int] = None,
-        timeout: int = 10
+        timeout: int = 10,
     ) -> str:
         """
         Execute the edit_anthropic tool to view, create, and edit files in the sandbox.
-        
+
         Args:
             command: The command to run. Options: "view", "create", "str_replace", "insert", "undo_edit"
             path: Absolute path to file or directory
@@ -162,84 +177,86 @@ sys.exit(exit_code)
             new_str: Optional for "str_replace", required for "insert" - new string to add
             insert_line: Required for "insert" command - line number after which to insert
             timeout: Command execution timeout in seconds
-            
+
         Returns:
             str: The output from the edit command
-            
+
         Raises:
             RuntimeError: If the command fails or required parameters are missing
         """
         import shlex
-        
+
         # First, ensure the str_replace_editor tool is available in the sandbox
         # Check if it already exists
-        exit_code, _ = await self.exec("test -f /tmp/str_replace_editor && echo exists", timeout)
+        exit_code, _ = await self.exec(
+            "test -f /tmp/str_replace_editor && echo exists", timeout
+        )
         if exit_code != 0:
             # Copy the tool and its dependencies into the sandbox
             host_tool_path = "/home/brad/art/dev/swebench/tools/edit_anthropic/bin/str_replace_editor"
-            
+
             # Read the tool from host
-            with open(host_tool_path, 'r') as f:
+            with open(host_tool_path, "r") as f:
                 tool_content = f.read()
-            
+
             # Patch the tool to persist file history after modifications
             # We need to patch specific locations to avoid breaking indentation
-            
+
             # Patch in create_file method
             tool_content = tool_content.replace(
-                '''        self.write_file(path, file_text)
+                """        self.write_file(path, file_text)
         self._file_history[path].append(file_text)
-        print(f"File created successfully at: {path}")''',
-                '''        self.write_file(path, file_text)
+        print(f"File created successfully at: {path}")""",
+                """        self.write_file(path, file_text)
         self._file_history[path].append(file_text)
         self._file_history = self._file_history  # Trigger setter to save
-        print(f"File created successfully at: {path}")'''
+        print(f"File created successfully at: {path}")""",
             )
-            
+
             # Patch in str_replace method (for file_content)
             tool_content = tool_content.replace(
-                '''        # Save the content to history
-        self._file_history[path].append(file_content)''',
-                '''        # Save the content to history
+                """        # Save the content to history
+        self._file_history[path].append(file_content)""",
+                """        # Save the content to history
         self._file_history[path].append(file_content)
-        self._file_history = self._file_history  # Trigger setter to save'''
+        self._file_history = self._file_history  # Trigger setter to save""",
             )
-            
+
             # Patch in insert method (for file_text)
             tool_content = tool_content.replace(
-                '''        self.write_file(path, new_file_text)
-        self._file_history[path].append(file_text)''',
-                '''        self.write_file(path, new_file_text)
+                """        self.write_file(path, new_file_text)
+        self._file_history[path].append(file_text)""",
+                """        self.write_file(path, new_file_text)
         self._file_history[path].append(file_text)
-        self._file_history = self._file_history  # Trigger setter to save'''
+        self._file_history = self._file_history  # Trigger setter to save""",
             )
-            
+
             # Patch in undo_edit method
             tool_content = tool_content.replace(
-                '''        old_text = self._file_history[path].pop()
-        self.write_file(path, old_text)''',
-                '''        old_text = self._file_history[path].pop()
+                """        old_text = self._file_history[path].pop()
+        self.write_file(path, old_text)""",
+                """        old_text = self._file_history[path].pop()
         self._file_history = self._file_history  # Trigger setter to save
-        self.write_file(path, old_text)'''
+        self.write_file(path, old_text)""",
             )
-            
+
             # Also need to handle Path objects being used as keys
             # The setter converts to JSON which requires string keys
             tool_content = tool_content.replace(
                 'REGISTRY["file_history"] = json.dumps(value)',
-                '''# Convert Path keys to strings for JSON serialization
+                """# Convert Path keys to strings for JSON serialization
         str_value = {str(k): v for k, v in value.items()}
         REGISTRY["file_history"] = json.dumps(str_value)
-        self._file_history_cache = None  # Clear cache so it reloads next time'''
+        self._file_history_cache = None  # Clear cache so it reloads next time""",
             )
-            
+
             # Most importantly, we need to cache the file history instead of recreating it
             # Replace the getter to cache the defaultdict
             tool_content = tool_content.replace(
-                '''    @property
+                """    @property
     def _file_history(self):
-        return defaultdict(list, json.loads(REGISTRY.get("file_history", "{}")))''',
-                '''    _file_history_cache = None
+        return defaultdict(list, json.loads(REGISTRY.get("file_history", "{}")))""",
+                """    _file_history_cache = None
     
     @property
     def _file_history(self):
@@ -265,21 +282,27 @@ sys.exit(exit_code)
                     return super().__contains__(key)
             
             self._file_history_cache = PathKeyDefaultDict(list, data)
-        return self._file_history_cache'''
+        return self._file_history_cache""",
             )
-            
+
             # Write the patched tool to sandbox
             exit_code, output = await self.exec(
                 f"cat > /tmp/str_replace_editor << 'EOF'\n{tool_content}\nEOF", timeout
             )
             if exit_code != 0:
-                raise RuntimeError(f"Failed to copy str_replace_editor to sandbox: {output}")
-            
+                raise RuntimeError(
+                    f"Failed to copy str_replace_editor to sandbox: {output}"
+                )
+
             # Make it executable
-            exit_code, output = await self.exec("chmod +x /tmp/str_replace_editor", timeout)
+            exit_code, output = await self.exec(
+                "chmod +x /tmp/str_replace_editor", timeout
+            )
             if exit_code != 0:
-                raise RuntimeError(f"Failed to make str_replace_editor executable: {output}")
-            
+                raise RuntimeError(
+                    f"Failed to make str_replace_editor executable: {output}"
+                )
+
             # Create a registry.py module that the tool imports with persistent state
             # The tool uses Path objects as keys, but JSON requires string keys
             registry_content = """
@@ -381,27 +404,33 @@ registry = Registry()
             )
             if exit_code != 0:
                 raise RuntimeError(f"Failed to create registry module: {output}")
-        
+
         # Build the command
         cmd = f"cd /tmp && python /tmp/str_replace_editor {command} {shlex.quote(path)}"
-        
+
         # Add optional arguments based on command type
         if command == "create":
             if file_text is None:
-                raise RuntimeError("Parameter 'file_text' is required for create command")
+                raise RuntimeError(
+                    "Parameter 'file_text' is required for create command"
+                )
             cmd += f" --file_text {shlex.quote(file_text)}"
         elif command == "view":
             if view_range is not None:
                 cmd += f" --view_range {view_range[0]} {view_range[1]}"
         elif command == "str_replace":
             if old_str is None:
-                raise RuntimeError("Parameter 'old_str' is required for str_replace command")
+                raise RuntimeError(
+                    "Parameter 'old_str' is required for str_replace command"
+                )
             cmd += f" --old_str {shlex.quote(old_str)}"
             if new_str is not None:
                 cmd += f" --new_str {shlex.quote(new_str)}"
         elif command == "insert":
             if insert_line is None:
-                raise RuntimeError("Parameter 'insert_line' is required for insert command")
+                raise RuntimeError(
+                    "Parameter 'insert_line' is required for insert command"
+                )
             if new_str is None:
                 raise RuntimeError("Parameter 'new_str' is required for insert command")
             cmd += f" --insert_line {insert_line}"
@@ -411,10 +440,10 @@ registry = Registry()
             pass
         else:
             raise RuntimeError(f"Unrecognized command: {command}")
-        
+
         # Execute the command
         exit_code, output = await self.exec(cmd, timeout)
-        
+
         # Handle errors based on exit codes
         if exit_code != 0:
             error_messages = {
@@ -438,12 +467,14 @@ registry = Registry()
                 18: "File encoding error",
                 19: "Invalid JSON state file",
                 20: "Permission denied",
-                21: "Unknown error"
+                21: "Unknown error",
             }
-            error_msg = error_messages.get(exit_code, f"Command failed with exit code {exit_code}")
+            error_msg = error_messages.get(
+                exit_code, f"Command failed with exit code {exit_code}"
+            )
             if output:
                 error_msg = f"{error_msg}: {output}"
             raise RuntimeError(error_msg)
-        
+
         # Return the output from the command
         return output
