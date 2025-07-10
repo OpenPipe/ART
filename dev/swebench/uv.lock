@@ -2442,9 +2442,6 @@ dependencies = [
     { name = "langfuse" },
     { name = "modal" },
     { name = "openpipe-art" },
-    { name = "pytest" },
-    { name = "pytest-asyncio" },
-    { name = "pytest-timeout" },
     { name = "sweagent" },
     { name = "swebench" },
 ]
@@ -2454,6 +2451,8 @@ dev = [
     { name = "ipykernel" },
     { name = "ipywidgets" },
     { name = "pytest" },
+    { name = "pytest-asyncio" },
+    { name = "pytest-timeout" },
     { name = "pytest-xdist" },
 ]
 
@@ -2464,9 +2463,6 @@ requires-dist = [
     { name = "langfuse", specifier = ">=2.60.7" },
     { name = "modal", specifier = ">=1.0.1" },
     { name = "openpipe-art", editable = "../../" },
-    { name = "pytest", specifier = ">=8.4.1" },
-    { name = "pytest-asyncio", specifier = ">=1.0.0" },
-    { name = "pytest-timeout", specifier = ">=2.4.0" },
     { name = "sweagent", git = "https://github.com/bradhilton/SWE-agent" },
     { name = "swebench", specifier = ">=4.0.3" },
 ]
@@ -2476,6 +2472,8 @@ dev = [
     { name = "ipykernel", specifier = ">=6.29.5" },
     { name = "ipywidgets", specifier = ">=8.1.7" },
     { name = "pytest", specifier = ">=8.4.1" },
+    { name = "pytest-asyncio", specifier = ">=1.0.0" },
+    { name = "pytest-timeout", specifier = ">=2.4.0" },
     { name = "pytest-xdist", specifier = ">=3.8.0" },
 ]
 
