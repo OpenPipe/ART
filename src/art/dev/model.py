@@ -105,6 +105,7 @@ def get_model_config(
         peft_args=peft_args,
         trainer_args=trainer_args,
         torchtune_args=torchtune_args,
+        _decouple_vllm_and_unsloth=config.get("_decouple_vllm_and_unsloth", False),
     )
 
 
@@ -123,6 +124,7 @@ class InternalModelConfig(TypedDict, total=False):
     peft_args: "PeftArgs"
     trainer_args: "TrainerArgs"
     torchtune_args: TorchtuneArgs | None
+    _decouple_vllm_and_unsloth: bool
 
 
 class InitArgs(TypedDict, total=False):

@@ -45,9 +45,9 @@ async def main():
         name="001-decoupled",
         project="yes-no-maybe",
         base_model="Qwen/Qwen2.5-7B-Instruct",
-        _internal_config={
-            "use_decoupled_unsloth": True,  # This triggers the use of DecoupledUnslothService
-        },
+        _internal_config=art.dev.InternalModelConfig(
+            _decouple_vllm_and_unsloth=True,
+        ),
     )
     await model.register(backend)
 
@@ -77,6 +77,9 @@ async def main():
 
     start_step = await model.get_step()
     print(f"Starting training from step {start_step} using DecoupledUnslothService")
+
+    initial_avg = 0.0
+    latest_avg = 0.0
 
     for step in range(start_step, 1_000):
         # Check if 6 minutes have elapsed

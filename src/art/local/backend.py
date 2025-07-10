@@ -120,15 +120,15 @@ class LocalBackend(Backend):
                 output_dir=get_model_dir(model=model, art_path=self._path),
                 config=model._internal_config,
             )
-            
+
             # Determine which service class to use
             if config.get("torchtune_args") is not None:
                 service_class = TorchtuneService
-            elif config.get("use_decoupled_unsloth", False):
+            elif config.get("_decouple_vllm_and_unsloth", False):
                 service_class = DecoupledUnslothService
             else:
                 service_class = UnslothService
-                
+
             self._services[model.name] = service_class(
                 model_name=model.name,
                 base_model=model.base_model,
@@ -368,9 +368,9 @@ class LocalBackend(Backend):
             num_gradient_steps = int(
                 result.pop("num_gradient_steps", estimated_gradient_steps)
             )
-            assert num_gradient_steps == estimated_gradient_steps, (
-                f"num_gradient_steps {num_gradient_steps} != estimated_gradient_steps {estimated_gradient_steps}"
-            )
+            assert (
+                num_gradient_steps == estimated_gradient_steps
+            ), f"num_gradient_steps {num_gradient_steps} != estimated_gradient_steps {estimated_gradient_steps}"
             results.append(result)
             yield {**result, "num_gradient_steps": num_gradient_steps}
             pbar.update(1)
