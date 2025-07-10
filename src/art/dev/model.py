@@ -45,6 +45,7 @@ def get_model_config(
         num_scheduler_steps=(
             16
             if config.get("torchtune_args") is None
+            and not config.get("_decouple_vllm_and_unsloth", False)
             and torch.cuda.get_device_capability()[0] >= 8
             else 1
         ),
@@ -58,6 +59,10 @@ def get_model_config(
         if config.get("torchtune_args") is not None:
             engine_args["model"] = last_checkpoint_dir
     elif config.get("torchtune_args") is not None:
+        engine_args["model"] = base_model
+    # For decoupled service, always use base model in engine_args
+    # LoRA adapters will be loaded separately
+    if config.get("_decouple_vllm_and_unsloth", False):
         engine_args["model"] = base_model
     peft_args = PeftArgs(
         r=8,  # Choose any number > 0 ! Suggested 8, 16, 32, 64, 128

@@ -5,6 +5,7 @@ import cloudpickle
 import contextlib
 import contextvars
 from dataclasses import replace
+import os
 import time
 from typing import Any, Callable, cast, Coroutine, Generator, ParamSpec, TypeVar
 import vllm
@@ -25,15 +26,16 @@ async def get_llm(args: vllm.AsyncEngineArgs) -> AsyncLLM:
     Returns:
         A configured AsyncLLM instance.
     """
-    # Download model
-    process = await asyncio.create_subprocess_shell(
-        f"HF_HUB_ENABLE_HF_TRANSFER=1 huggingface-cli download {args.model}"
-    )
-    await process.wait()
+    # Download model only if it's not a local path
+    if not os.path.exists(args.model):
+        process = await asyncio.create_subprocess_shell(
+            f"HF_HUB_ENABLE_HF_TRANSFER=1 huggingface-cli download {args.model}"
+        )
+        await process.wait()
     # Make sure we are using the v1 engine
     import vllm.envs as envs
 
-    envs.VLLM_USE_V1 = "1"
+    envs.VLLM_USE_V1 = True
     # Create engine
     llm = AsyncLLM.from_engine_args(
         replace(
