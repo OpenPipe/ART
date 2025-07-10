@@ -38,6 +38,13 @@ def get_model_config(
         max_lora_rank=8,
         use_async=True,
     )
+    if config.get("_decouple_vllm_and_unsloth", False):
+        init_args["fast_inference"] = False
+        init_args.pop("disable_log_stats")
+        init_args.pop("enable_prefix_caching")
+        init_args.pop("gpu_memory_utilization")
+        init_args.pop("max_lora_rank")
+        init_args.pop("use_async")
     engine_args = EngineArgs(
         disable_log_requests=True,
         # Multi-step processing is not supported for the Xformers attention backend
