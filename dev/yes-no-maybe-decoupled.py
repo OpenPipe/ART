@@ -99,7 +99,7 @@ async def main():
         # Track rewards
         all_rewards = []
         for group in train_groups:
-            trajectories = await group
+            trajectories = group
             for trajectory in trajectories:
                 all_rewards.append(trajectory.reward)
 
