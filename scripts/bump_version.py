@@ -65,11 +65,11 @@ def main():
         
         print(f"Bumping version from {current} to {new}")
         update_version(new)
-        print(f"✓ Updated pyproject.toml")
-        print(f"\nNext steps:")
+        print("✓ Updated pyproject.toml")
+        print("\nNext steps:")
         print(f"1. Commit the change: git add pyproject.toml && git commit -m 'Bump version to {new}'")
         print(f"2. Create and push tag: git tag v{new} && git push origin v{new}")
-        print(f"3. The GitHub Action will automatically create a release and publish to PyPI")
+        print("3. The GitHub Action will automatically create a release and publish to PyPI")
         
     except Exception as e:
         print(f"Error: {e}")
