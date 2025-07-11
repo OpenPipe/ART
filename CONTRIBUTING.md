@@ -15,23 +15,22 @@ uv sync
 
 ### Code Formatting and Linting
 
-This project uses [ruff](https://github.com/astral-sh/ruff) for both code formatting and linting. Before submitting a pull request, please ensure your code passes both checks:
+This project uses [ruff](https://github.com/astral-sh/ruff) for both code formatting and linting. Before submitting a pull request, please ensure your code passes all quality checks:
 
 ```bash
-# Check code formatting
-uv run ruff format --check .
+# Run all code quality checks (formatting, linting, and dependency sync)
+./scripts/run_checks.sh
 
-# Run linting checks
-uv run ruff check .
-
-# To automatically fix formatting issues
-uv run ruff format .
-
-# To automatically fix some linting issues
-uv run ruff check --fix .
+# Automatically fix any issues that can be fixed
+./scripts/run_checks.sh --fix
 ```
 
-These checks are automatically run in CI for all pull requests. You can also install ruff as a pre-commit hook if desired.
+The `run_checks.sh` script will:
+1. Check code formatting with ruff
+2. Check for linting issues with ruff
+3. Verify that `uv.lock` is in sync with `pyproject.toml`
+
+These checks are automatically run in CI for all pull requests. If your PR fails these checks, simply run `./scripts/run_checks.sh --fix` locally and commit the changes.
 
 ### Release Process
 

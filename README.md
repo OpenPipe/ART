@@ -21,7 +21,29 @@ Train multi-step agents for real-world tasks using GRPO.
 
 </div>
 
-## Overview
+## 📏 RULER: Zero-Shot Agent Rewards
+
+**RULER** (Relative Universal LLM-Elicited Rewards) eliminates the need for hand-crafted reward functions by using an LLM-as-judge to automatically score agent trajectories. Simply define your task in the system prompt, and RULER handles the rest—**no labeled data, expert feedback, or reward engineering required**.
+
+✨ **Key Benefits:**
+- **2-3x faster development** - Skip reward function engineering entirely
+- **General-purpose** - Works across any task without modification  
+- **Strong performance** - Matches or exceeds hand-crafted rewards in 3/4 benchmarks
+- **Easy integration** - Drop-in replacement for manual reward functions
+
+```python
+# Before: Hours of reward engineering
+def complex_reward_function(trajectory):
+    # 50+ lines of careful scoring logic...
+    pass
+
+# After: One line with RULER
+judged_group = await ruler_score_group(group, "openai/o3")
+```
+
+[📖 Learn more about RULER →](https://art.openpipe.ai/fundamentals/ruler)
+
+## ART Overview
 
 ART is an open-source RL framework that improves agent reliability by allowing LLMs to **learn from experience**. ART provides an ergonomic harness for integrating GRPO into any python application. For a quick hands-on introduction, run one of the notebooks below. When you're ready to learn more, check out the [docs](https://art.openpipe.ai).
 
