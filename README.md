@@ -9,7 +9,7 @@
 </p>
 
 <p>
-Use GRPO to train multi-step agents for real-world tasks.
+Train multi-step agents for real-world tasks using GRPO.
 </p>
 
 [![PRs-Welcome][contribute-image]][contribute-url]
@@ -21,18 +21,9 @@ Use GRPO to train multi-step agents for real-world tasks.
 
 </div>
 
-## Quick Links
-
-- <a href="https://art.openpipe.ai">Docs</a>
-- <a href="https://art.openpipe.ai/getting-started/faq">FAQ</a>
-- <a href="https://art.openpipe.ai/getting-started/quick-start">Train an agent</a>
-- <a href="#notebooks">Notebooks</a>
-- <a href="#training-loop-overview">Training Loop Overview</a>
-- <a href="#contributing">Contributing</a>
-
 ## Overview
 
-ART is an open-source reinforcement training library for improving LLM performance in agentic workflows. ART utilizes the powerful GRPO reinforcement learning algorithm to train models from their own experience. Unlike most RL libraries, ART allows you to execute agent runs **in your existing codebase** while offloading the complexity of the RL training loop to the ART backend. Read about the [ training loop](#training-loop-overview). Then try out one of the notebooks below!
+ART is an open-source reinforcement training library for improving LLM reliability in agentic workflows. ART utilizes the powerful GRPO reinforcement learning algorithm to teach models from their own experience. Unlike most RL libraries, ART allows you to execute agent runs **in your existing codebase** while offloading the complexity of the RL training loop to the ART backend. Read about the [ training loop](#training-loop-overview). Then run one of the notebooks below to train your own agent!
 
 ## 📒 Notebooks
 
@@ -42,6 +33,21 @@ ART is an open-source reinforcement training library for improving LLM performan
 | **Temporal Clue** | [🏋️ Train agent](https://colab.research.google.com/github/openpipe/art/blob/main/examples/temporal_clue/temporal-clue.ipynb) | Qwen 2.5 7B learns to solve Temporal Clue | [Link coming soon]                                                                                                                                          |
 | **Tic Tac Toe**   | [🏋️ Train agent](https://colab.research.google.com/github/openpipe/art/blob/main/examples/tic_tac_toe/tic-tac-toe.ipynb)     | Qwen 2.5 3B learns to play Tic Tac Toe    | <img src="/assets/benchmarks/tic-tac-toe-local/accuracy-training-progress.svg" height="72"> [benchmarks](/examples/tic_tac_toe/benchmark_tic_tac_toe.ipynb) |
 | **Codenames**     | [🏋️ Train agent](https://colab.research.google.com/github/openpipe/art/blob/main/examples/codenames/Codenames_RL.ipynb)      | Qwen 2.5 3B learns to play Codenames      | <img src="/assets/benchmarks/codenames/win_rate_over_time.png" height="72"> [benchmarks](/examples/codenames/Codenames_RL.ipynb)                            |
+
+## Why ART?
+
+- ART provides convenient wrappers for introducing RL training into **existing applications**. We abstract the training server into a modular service that your code doesn't need to interface with.
+- **Train from anywhere.** Run the ART client on your laptop and let the ART server kick off an ephemeral GPU-enabled environment, or run on a local GPU.
+- Integrations with hosted platforms like W&B, Langfuse, and OpenPipe provide flexible observability and **simplify debugging**.
+- ART is customizable with **intelligent defaults**. You can configure training parameters and inference engine configurations to meet specific needs, or take advantage of the defaults, which have been optimized for training efficiency and stability.
+
+## Installation
+
+ART agents can be trained from any client machine that runs python. To add to an existing project, run this command:
+
+```
+pip install openpipe-art
+```
 
 ## 🤖 ART•E Agent
 
