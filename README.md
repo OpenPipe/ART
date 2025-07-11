@@ -1,7 +1,7 @@
 <div align="center">
 
 <a href="https://art.openpipe.ai"><picture>
-<img alt="ART logo" src="assets/ART_logo.png" width="100px">
+<img alt="ART logo" src="assets/ART_logo.png" width="160px">
 </picture></a>
 
 <p align="center">
