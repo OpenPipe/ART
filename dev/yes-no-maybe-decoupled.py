@@ -47,7 +47,7 @@ async def main():
         base_model="Qwen/Qwen2.5-7B-Instruct",
         _internal_config=art.dev.InternalModelConfig(
             _decouple_vllm_and_unsloth=True,
-            engine_args=art.dev.EngineArgs(gpu_memory_utilization=0.6),
+            engine_args=art.dev.EngineArgs(gpu_memory_utilization=0.5),
         ),
     )
     await model.register(backend)
@@ -121,10 +121,12 @@ async def main():
 
         print(f"Step {step}: Average reward = {avg_reward:.4f}")
 
+        print(f"Starting training for step {step}...")
         await model.train(
             train_groups,
             config=art.TrainConfig(learning_rate=1e-4),
         )
+        print(f"Training completed for step {step}, continuing to step {step + 1}...")
 
     # Calculate improvement
     if initial_rewards and latest_rewards:

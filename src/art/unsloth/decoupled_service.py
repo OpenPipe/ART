@@ -5,7 +5,6 @@ from functools import cached_property
 import gc
 import os
 from pathlib import Path
-from safetensors.torch import save_file
 import torch
 from typing import AsyncIterator, TYPE_CHECKING, cast, Any
 from vllm import AsyncEngineArgs
@@ -16,6 +15,7 @@ from transformers.tokenization_utils_base import PreTrainedTokenizerBase
 from transformers.utils.dummy_pt_objects import PreTrainedModel, GenerationMixin
 import peft
 from trl import GRPOConfig, GRPOTrainer
+import safetensors.torch
 
 from .. import dev
 from ..local.pack import DiskPackedTensors, packed_tensors_from_dir, PackedTensors
@@ -57,8 +57,13 @@ class DecoupledUnslothService:
             os.makedirs(os.path.dirname(lora_path), exist_ok=True)
             self._save_initial_lora(lora_path)
 
+        # Store the engine for later use
+        self._engine = await self.llm
+        
+        # Skip setting initial LoRA for now - vLLM will handle it through lora_path
+        
         await openai_server_task(
-            engine=await self.llm,
+            engine=self._engine,
             config=dev.get_openai_server_config(
                 model_name=self.model_name,
                 base_model=self.base_model,
@@ -80,10 +85,6 @@ class DecoupledUnslothService:
         # reset the pids file
         with open(pids_path, "w") as f:
             f.write("")
-        weights_path = "/dev/shm/weights.safetensors"
-        # remove the weights file if it exists
-        Path(weights_path).unlink(missing_ok=True)
-
         # start putting the workers to sleep
         sleep_task = asyncio.create_task(
             run_on_workers(
@@ -91,7 +92,6 @@ class DecoupledUnslothService:
                 sleep,
                 level=1,
                 pids_path=pids_path,
-                weights_path=weights_path,
                 profile=verbose,
             )
         )
@@ -182,21 +182,28 @@ class DecoupledUnslothService:
         next_step = get_step_from_dir(self.output_dir) + 1
         checkpoint_dir = get_step_checkpoint_dir(self.output_dir, next_step)
         os.makedirs(checkpoint_dir, exist_ok=True)
-        self._trainer.save_model(checkpoint_dir)
-
-        # Export weights for vLLM to load
-        self._export_lora_weights(weights_path)
+        self._save_lora_without_prefix(checkpoint_dir)
 
         # Free memory before waking up vLLM
         self._free_memory()
 
+        # Remove pids.txt to signal workers to wake up
+        pids_path = f"{self.output_dir}/pids.txt"
+        if os.path.exists(pids_path):
+            os.remove(pids_path)
+            if verbose:
+                print("Removed pids.txt to signal workers to wake up")
+
         # wait for the workers to wake up
         await sleep_task
-        # remove the weights file
-        Path(weights_path).unlink(missing_ok=True)
+        
+        # TODO: Set the new LoRA adapter in vLLM
+        # For now, we'll rely on vLLM to reload the LoRA from disk
+        # self._set_lora(checkpoint_dir)
 
         if verbose:
             print("DecoupledUnslothService.train complete")
+        print("DEBUG: DecoupledUnslothService.train() method returning control to caller")
 
     def _init_unsloth(self) -> None:
         """Initialize Unsloth model and trainer."""
@@ -251,29 +258,72 @@ class DecoupledUnslothService:
 
         self._trainer._prepare_inputs = _async_prepare_inputs
 
-    def _export_lora_weights(self, weights_path: str) -> None:
-        """Export LoRA weights for vLLM to load."""
-        # Get LoRA weights
-        lora_state_dict = {}
-        for name, param in self._peft_model.named_parameters():
-            if param.requires_grad:  # Only LoRA parameters
-                lora_state_dict[name] = param.detach().cpu()
-
-        # Save weights
-        save_file(lora_state_dict, weights_path)
+    def _set_lora(self, lora_path: str) -> None:
+        """Sets the LoRA adapter with ID 1 in the vLLM engine."""
+        from vllm.lora.request import LoRARequest
+        
+        # Create LoRA request
+        lora_request = LoRARequest(
+            lora_name=self.model_name,
+            lora_int_id=1,
+            lora_path=lora_path,
+        )
+        
+        # Remove old LoRA and add new one
+        # AsyncLLM has engine_core attribute which contains the actual engine
+        engine_core = getattr(self._engine, 'engine_core', None)
+        if engine_core and hasattr(engine_core, 'engine'):
+            engine = engine_core.engine
+        else:
+            # Try to find the engine through model_executor
+            engine = self._engine
+        
+        # Remove and add LoRA
+        if hasattr(engine, 'remove_lora'):
+            engine.remove_lora(1)
+            engine.add_lora(lora_request)
+        elif hasattr(engine, 'engine_core'):
+            engine.engine_core.engine.remove_lora(1)
+            engine.engine_core.engine.add_lora(lora_request)
 
     def _save_initial_lora(self, lora_path: str) -> None:
         """Save initial LoRA checkpoint when none exists."""
         # We need to temporarily initialize Unsloth to save the initial LoRA
         if not hasattr(self, "_trainer"):
             self._init_unsloth()
-        self._trainer.save_model(lora_path)
+        self._save_lora_without_prefix(lora_path)
         # Clean up to free memory
         del self._trainer
         del self._peft_model
         del self._model
         del self._tokenizer
         self._free_memory()
+
+    def _save_lora_without_prefix(self, lora_path: str) -> None:
+        """Save LoRA checkpoint with weights renamed to remove base_model prefix."""
+        # First save normally
+        self._trainer.save_model(lora_path)
+        
+        # Now load and fix the weights
+        # Read the saved weights
+        weights_path = os.path.join(lora_path, "adapter_model.safetensors")
+        state_dict = safetensors.torch.load_file(weights_path)
+        
+        # Remove base_model prefix from all keys
+        new_state_dict = {}
+        for key, value in state_dict.items():
+            if key.startswith("base_model.model."):
+                # Remove "base_model.model." prefix
+                new_key = key[len("base_model.model."):]
+            elif key.startswith("base_model."):
+                # Remove "base_model." prefix  
+                new_key = key[len("base_model."):]
+            else:
+                new_key = key
+            new_state_dict[new_key] = value
+        
+        # Save the fixed weights
+        safetensors.torch.save_file(new_state_dict, weights_path)
 
     def _free_memory(self) -> None:
         """Free GPU memory."""
@@ -288,6 +338,7 @@ class DecoupledUnslothService:
         # Get engine args and ensure LoRA is enabled
         engine_args = self.config.get("engine_args", {}).copy()
         engine_args["enable_lora"] = True
+        engine_args["max_lora_rank"] = engine_args.get("max_lora_rank", 64)
         return asyncio.create_task(
             get_llm(AsyncEngineArgs(**engine_args))  # type: ignore
         )
