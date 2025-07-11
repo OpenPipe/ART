@@ -1,24 +1,38 @@
 <div align="center">
 
-<a href="https://openpipe.ai"><picture>
-<img alt="ART header" src="https://github.com/openpipe/art/raw/main/assets/ART_header.png" width="100%">
+<a href="https://art.openpipe.ai"><picture>
+<img alt="ART logo" src="assets/ART_logo.png" width="100px">
 </picture></a>
 
 <p align="center">
-  <a href="https://colab.research.google.com/github/openpipe/art/blob/main/examples/2048/2048.ipynb"><img src="https://github.com/openpipe/art/raw/main/assets/Train_pill.png"  width="150"  alt="Train on Colab"></a>
-  <a href="https://discord.gg/zbBHRUpwf4"><img src="https://github.com/openpipe/art/raw/main/assets/Discord_pill.png" width="180" alt="Join Discord"></a>
-  <a href="https://art.openpipe.ai"><img src="https://github.com/openpipe/art/raw/main/assets/Documentation_pill.png" width="180" alt="Docs"></a>
+  <h1>Agent Reinforcement Trainer</h1>
 </p>
 
-### Train GRPO-powered RL agents for real-world tasks!
+<p>
+Use GRPO to train multi-step agents for real-world tasks.
+</p>
 
-![](https://github.com/openpipe/art/raw/main/assets/Header_separator.png)
+[![PRs-Welcome][contribute-image]][contribute-url]
+[![Downloads][downloads-image]][pypi-url]
+[![Train Agent](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/openpipe/art/blob/main/examples/2048/2048.ipynb)
+
+[![Join Discord](https://img.shields.io/badge/Join%20Discord-5865F2?style=plastic&logo=discord&logoColor=white)](https://discord.gg/zbBHRUpwf4)
+[![Documentation](https://img.shields.io/badge/Documentation-orange?style=plastic&logo=gitbook&logoColor=white)](https://art.openpipe.ai)
 
 </div>
 
-# Agent Reinforcement Trainer (ART)
+## Quick Links
 
-ART is an open-source reinforcement training library for improving LLM performance in agentic workflows. ART utilizes the powerful GRPO reinforcement learning algorithm to train models from their own experiences. Unlike most RL libraries, ART allows you to execute agent runs **in your existing codebase** while offloading all the complexity of the RL training loop to the ART backend. Read about the [ training loop](#training-loop-overview). Then try out one of the notebooks below!
+- <a href="https://art.openpipe.ai">Docs</a>
+- <a href="https://art.openpipe.ai/getting-started/faq">FAQ</a>
+- <a href="https://art.openpipe.ai/getting-started/quick-start">Train an agent</a>
+- <a href="#notebooks">Notebooks</a>
+- <a href="#training-loop-overview">Training Loop Overview</a>
+- <a href="#contributing">Contributing</a>
+
+## Overview
+
+ART is an open-source reinforcement training library for improving LLM performance in agentic workflows. ART utilizes the powerful GRPO reinforcement learning algorithm to train models from their own experience. Unlike most RL libraries, ART allows you to execute agent runs **in your existing codebase** while offloading the complexity of the RL training loop to the ART backend. Read about the [ training loop](#training-loop-overview). Then try out one of the notebooks below!
 
 ## 📒 Notebooks
 
@@ -90,3 +104,8 @@ ART stands on the shoulders of giants. While we owe many of the ideas and early 
 - [SkyPilot](https://github.com/skypilot-org/skypilot)
 
 Finally, thank you to our partners who've helped us test ART in the wild! We're excited to see what you all build with it.
+
+[pypi-url]: https://pypi.org/project/openpipe-art/
+[contribute-url]: https://github.com/openpipe/art/blob/main/CONTRIBUTING.md
+[contribute-image]: https://img.shields.io/badge/PRs-welcome-blue.svg
+[downloads-image]: https://img.shields.io/pypi/dm/openpipe-art?color=364fc7&logoColor=364fc7
