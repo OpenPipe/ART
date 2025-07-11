@@ -23,7 +23,7 @@ Train multi-step agents for real-world tasks using GRPO.
 
 ## Overview
 
-ART is an open-source reinforcement training library for improving LLM reliability in agentic workflows. ART utilizes the powerful GRPO reinforcement learning algorithm to teach models from their own experience. Unlike most RL libraries, ART allows you to execute agent runs **in your existing codebase** while offloading the complexity of the RL training loop to the ART backend. Read about the [ training loop](#training-loop-overview). Then run one of the notebooks below to train your own agent!
+ART is an open-source reinforcement training library for improving LLM reliability in agentic workflows. ART utilizes the powerful GRPO reinforcement learning algorithm to let models learn from experience. Read about the [training loop](#training-loop-overview). Then run one of the notebooks below to train your own agent!
 
 ## 📒 Notebooks
 
