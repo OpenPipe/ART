@@ -2,12 +2,14 @@
 
 This is in a separate module to avoid importing unsloth in the worker process.
 """
+
 import os
 import time
 import logging
 from vllm.device_allocator.cumem import CuMemAllocator
 from vllm.v1.worker.gpu_worker import logger
 from ..vllm import get_worker
+
 
 def sleep(*, level: int, pids_path: str, profile: bool) -> None:
     """

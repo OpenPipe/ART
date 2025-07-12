@@ -131,7 +131,7 @@ async def main():
     # Calculate improvement
     if initial_rewards and latest_rewards:
         improvement = ((latest_avg - initial_avg) / initial_avg) * 100
-        print(f"\nTraining completed.")
+        print("\nTraining completed.")
         print(f"Initial average reward: {initial_avg:.4f}")
         print(f"Final average reward: {latest_avg:.4f}")
         print(f"Reward improvement: {improvement:.2f}%")

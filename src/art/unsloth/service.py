@@ -1,6 +1,7 @@
 import asyncio
 from dataclasses import dataclass
 import functools
+import os
 import torch
 from typing import AsyncIterator, TYPE_CHECKING
 
@@ -48,7 +49,6 @@ class UnslothService:
         lora_path = get_last_checkpoint_dir(self.output_dir)
         if lora_path is None:
             from ..utils.output_dirs import get_step_checkpoint_dir
-            import os
 
             lora_path = get_step_checkpoint_dir(self.output_dir, 0)
             os.makedirs(os.path.dirname(lora_path), exist_ok=True)
@@ -153,8 +153,6 @@ class UnslothService:
 
             next_step = get_step_from_dir(self.output_dir) + 1
             checkpoint_dir = get_step_checkpoint_dir(self.output_dir, next_step)
-            import os
-
             os.makedirs(os.path.dirname(checkpoint_dir), exist_ok=True)
             self.state.trainer.save_model(checkpoint_dir)
             if verbose:
