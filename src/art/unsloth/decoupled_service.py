@@ -4,29 +4,29 @@ from datasets import Dataset
 from dataclasses import dataclass
 from functools import cached_property
 import gc
+import logging
 import os
 import peft
+import time
 from transformers.tokenization_utils_base import PreTrainedTokenizerBase
 from transformers.utils.dummy_pt_objects import PreTrainedModel, GenerationMixin
 import torch
 from trl import GRPOConfig, GRPOTrainer
-from typing import AsyncIterator, TYPE_CHECKING, cast, Any
+from typing import AsyncIterator, cast, Any
 from vllm import AsyncEngineArgs
+from vllm.device_allocator.cumem import CuMemAllocator
 from vllm.lora.request import LoRARequest
 from vllm.v1.engine.async_llm import AsyncLLM
+from vllm.v1.worker.gpu_worker import logger
 
 from .. import dev
 from ..local.pack import DiskPackedTensors, packed_tensors_from_dir, PackedTensors
 from .. import types
-from ..vllm import get_llm, openai_server_task, run_on_workers
+from ..vllm import get_llm, get_worker, openai_server_task, run_on_workers
 from ..utils.get_model_step import get_step_from_dir
 from ..utils.output_dirs import get_step_checkpoint_dir
 from ..local.checkpoints import get_last_checkpoint_dir
 from .train import train
-from .sleep_worker import sleep
-
-if TYPE_CHECKING:
-    pass
 
 
 class CausalLM(PreTrainedModel, GenerationMixin):
@@ -193,6 +193,8 @@ class DecoupledUnslothService:
 
         # wait for the workers to wake up
         await sleep_task
+
+        # swap out the LoRA adapter
         await llm.remove_lora(1)
         await llm.add_lora(
             LoRARequest(
@@ -204,9 +206,6 @@ class DecoupledUnslothService:
 
         if verbose:
             print("DecoupledUnslothService.train complete")
-        print(
-            "DEBUG: DecoupledUnslothService.train() method returning control to caller"
-        )
 
     def _free_memory(self) -> None:
         """Free GPU memory."""
@@ -216,8 +215,7 @@ class DecoupledUnslothService:
 
     @cached_property
     def _state(self) -> UnslothState:
-        # Import unsloth here to avoid loading it in vLLM worker process
-        import unsloth  # type: ignore
+        import unsloth
 
         # Initialize Unsloth model
         init_args = self.config.get("init_args", {})
@@ -278,12 +276,43 @@ class DecoupledUnslothService:
 
     @cached_property
     def llm(self) -> asyncio.Task[AsyncLLM]:
-        # Ensure we use vLLM V1 engine
-        os.environ["VLLM_USE_V1"] = "1"
-        # Get engine args and ensure LoRA is enabled
-        engine_args = self.config.get("engine_args", {}).copy()
-        engine_args["enable_lora"] = True
-        engine_args["max_lora_rank"] = engine_args.get("max_lora_rank", 64)
         return asyncio.create_task(
-            get_llm(AsyncEngineArgs(**engine_args))  # type: ignore
+            get_llm(
+                AsyncEngineArgs(
+                    **{**self.config.get("engine_args", {}), "enable_lora": True}
+                )
+            )
         )
+
+
+def sleep(*, level: int, pids_path: str, profile: bool) -> None:
+    """
+    Put the worker to sleep until signaled to wake up.
+
+    Args:
+        level: The sleep level: 1 to offload the kv cache, 2 to discard the kv cache.
+        pids_path: The path to the file that contains the PIDs of the workers.
+        profile: Whether to profile
+    """
+    with open(pids_path, "a") as f:
+        f.write(f"{os.getpid()}\n")
+    worker = get_worker()
+    allocator = CuMemAllocator.get_instance()
+    try:
+        if not (profile and worker.rank == 0):
+            logger.setLevel(logging.CRITICAL)
+        setattr(allocator, "_override_tags", {"weights", "kv_cache"})
+        with worker.time("sleep"):
+            worker.sleep(level)
+        with open(pids_path, "a") as f:
+            f.write(f"{os.getpid()}\n")
+
+        # Wait for the signal to wake up
+        while os.path.exists(pids_path):
+            time.sleep(1)
+
+        with worker.time("wake_up"):
+            worker.wake_up()
+    finally:
+        logger.setLevel(logging.INFO)
+        delattr(allocator, "_override_tags")

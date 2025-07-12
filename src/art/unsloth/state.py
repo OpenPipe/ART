@@ -50,9 +50,12 @@ class ModelState:
         async_llm_engine.ENGINE_ITERATION_TIMEOUT_S = 2**31 - 1
         # Sticking with V0 engine for now
         os.environ["VLLM_USE_V1"] = "0"
-        # We can't use expandable segments with vLLM + Unsloth
-        # Always disable expandable segments to avoid CUDA memory pool errors
-        os.environ["PYTORCH_CUDA_ALLOC_CONF"] = ""
+        # We can't use expandable segments with sleep mode
+        enable_sleep_mode = config.get("engine_args", {}).get(
+            "enable_sleep_mode", False
+        )
+        if enable_sleep_mode:
+            os.environ["PYTORCH_CUDA_ALLOC_CONF"] = ""
         # Initialize Unsloth model
         # NOTE: We have to patch empty_cache with a no-op during model initialization
         # to avoid an allocator error.

@@ -39,11 +39,11 @@ async def get_llm(args: vllm.AsyncEngineArgs) -> AsyncLLM:
         conf.remove("expandable_segments:True")
     os.environ["PYTORCH_CUDA_ALLOC_CONF"] = ",".join(conf)
 
-    # Make sure we are using the v1 engine
+    # Make sure we are using the V1 engine
     import vllm.envs as envs
 
     envs.VLLM_USE_V1 = True
-    # Create engine
+
     llm = AsyncLLM.from_engine_args(
         replace(
             args,
