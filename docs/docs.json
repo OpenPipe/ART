@@ -56,21 +56,17 @@
         "pages": [
           "fundamentals/training-loop",
           "fundamentals/art-client",
-          "fundamentals/art-backend"
+          "fundamentals/art-backend",
+          "fundamentals/ruler"
         ]
       },
       {
         "group": "Tutorials",
-        "pages": [
-          "tutorials/summarizer"
-        ]
+        "pages": ["tutorials/summarizer"]
       },
       {
         "group": "Resources",
-        "pages": [
-          "resources/models",
-          "resources/glossary"
-        ]
+        "pages": ["resources/models", "resources/glossary"]
       }
     ]
   },

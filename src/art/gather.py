@@ -5,7 +5,7 @@ from collections import Counter
 from dataclasses import dataclass, field
 from openai.types.chat.chat_completion import Choice
 from tqdm import auto as tqdm
-from typing import Awaitable, Iterable, Iterator, Literal, overload
+from typing import Awaitable, Iterable, Iterator, Literal, overload, Callable
 
 from .trajectories import Trajectory, TrajectoryGroup
 
@@ -17,6 +17,8 @@ async def gather_trajectory_groups(
     pbar_total_completion_tokens: bool = True,
     max_exceptions: int | float = 0,
     max_metrics: int | None = None,
+    after_each: Callable[[TrajectoryGroup], Awaitable[TrajectoryGroup | None]]
+    | None = None,
 ) -> list[TrajectoryGroup]:
     groups = list(groups)
     context = GatherContext(
@@ -30,9 +32,25 @@ async def gather_trajectory_groups(
         total = sum(getattr(g, "_num_trajectories", 1) for g in groups)
         context.pbar = tqdm.tqdm(desc=pbar_desc, total=total)
         result_groups = await future
+
     if context.pbar is not None:
         context.pbar.close()
-    return [g for g in result_groups if g is not None]
+
+    # Filter out any None results that may have been returned due to handled exceptions
+    processed_groups: list[TrajectoryGroup] = [
+        g for g in result_groups if g is not None
+    ]
+
+    # If an after_each callback was provided, await it and collect its return values.
+    if after_each is not None:
+        processed_groups = await asyncio.gather(
+            *(after_each(g) for g in processed_groups)
+        )  # type: ignore[arg-type]
+
+        # Filter out callbacks that returned None
+        processed_groups = [g for g in processed_groups if g is not None]  # type: ignore[list-item]
+
+    return processed_groups
 
 
 @overload

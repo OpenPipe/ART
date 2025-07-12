@@ -1,6 +1,7 @@
 import art
 from art_e.project_types import ProjectPolicyConfig
 
+
 models: dict[str, art.TrainableModel[ProjectPolicyConfig]] = {
     "002": art.TrainableModel(
         name="email-agent-002",
@@ -145,7 +146,7 @@ models["216"].name = "email-agent-216-3"
 
 # Model 217: like 206 but with Qwen/Qwen3-14B base model and nothink option enabled
 models["217"] = models["206"].model_copy(deep=True)
-models["217"].name = "email-agent-217-2"
+models["217"].name = "email-agent-217-3"
 models["217"].base_model = "Qwen/Qwen3-14B"
 models["217"].config.include_qwen3_nothink = True
 
@@ -173,3 +174,33 @@ models["221"] = models["008"].model_copy(deep=True)
 models["221"].name = "email-agent-221"
 models["221"].config.include_qwen3_nothink = True
 models["221"].base_model = "willcb/Qwen3-32B"
+models["221"]._internal_config = art.dev.InternalModelConfig(
+    engine_args=art.dev.EngineArgs(
+        num_scheduler_steps=1,
+    )
+)
+
+models["222"] = models["206"].model_copy(deep=True)
+models["222"].name = "email-agent-222"
+models["222"].base_model = "willcb/Qwen3-32B"
+models["222"]._internal_config = art.dev.InternalModelConfig(
+    engine_args=art.dev.EngineArgs(
+        num_scheduler_steps=1,
+    )
+)
+models["222"].config.group_judge_model = "base_model"
+models["222"].config.include_qwen3_nothink = True
+
+models["223"] = models["206"].model_copy(deep=True)
+models["223"].name = "email-agent-223"
+models["223"].base_model = "willcb/Qwen3-32B"
+models["223"].config.include_qwen3_nothink = True
+models["223"]._internal_config = art.dev.InternalModelConfig(
+    engine_args=art.dev.EngineArgs(
+        num_scheduler_steps=1,
+    )
+)
+
+models["224"] = models["223"].model_copy(deep=True)
+models["224"].name = "email-agent-224"
+models["224"].config.learning_rate = 1e-6

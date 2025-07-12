@@ -1,0 +1,79 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+  id-token: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install uv
+        run: |
+          curl -LsSf https://astral.sh/uv/install.sh | sh
+          echo "$HOME/.cargo/bin" >> $GITHUB_PATH
+
+      - name: Install dependencies
+        run: |
+          uv venv
+          uv pip install -e .
+          uv pip install hatch
+
+      - name: Build package
+        run: uv run hatch build
+
+      - name: Generate release notes
+        id: release_notes
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          # Get the previous tag
+          PREVIOUS_TAG=$(git describe --tags --abbrev=0 HEAD^ 2>/dev/null || echo "")
+          
+          # Get merged PRs since last release
+          if [ -z "$PREVIOUS_TAG" ]; then
+            # If no previous tag, get all PRs
+            PRS=$(gh pr list --state merged --limit 100 --json number,title,url | jq -r '.[] | "- \(.title) ([#\(.number)](\(.url)))"')
+          else
+            # Get PRs merged since the last tag
+            LAST_TAG_DATE=$(git log -1 --format=%aI $PREVIOUS_TAG)
+            PRS=$(gh pr list --state merged --limit 100 --json number,title,url,mergedAt | jq -r --arg date "$LAST_TAG_DATE" '.[] | select(.mergedAt > $date) | "- \(.title) ([#\(.number)](\(.url)))"')
+          fi
+          
+          # Create release notes
+          cat << EOF > release_notes.md
+          ## What's Changed
+          
+          $PRS
+          
+          **Full Changelog**: https://github.com/OpenPipe/ART/compare/$PREVIOUS_TAG...${{ github.ref_name }}
+          EOF
+          
+          # Output for GitHub Actions
+          echo "PREVIOUS_TAG=$PREVIOUS_TAG" >> $GITHUB_OUTPUT
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v1
+        with:
+          body_path: release_notes.md
+          files: dist/*
+          generate_release_notes: false
+
+      - name: Publish to PyPI
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          password: ${{ secrets.PYPI_ART_TOKEN }}

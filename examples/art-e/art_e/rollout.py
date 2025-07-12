@@ -311,7 +311,9 @@ async def rollout(
         assert isinstance(llm_response, ModelResponse)
         rubric.prompt_tokens += llm_response.usage.prompt_tokens  # type: ignore
         rubric.completion_tokens += llm_response.usage.completion_tokens  # type: ignore
-        choice = llm_response.choices[0]  # type: ignore
+        if len(llm_response.choices) == 0:
+            raise ValueError(f"No choices in response: {llm_response}")
+        choice = llm_response.choices[0]
         assert isinstance(choice, Choices)
 
         # Our rollout is only set up to handle one tool call at a time, so just ignore any parallel tool calls.

@@ -23,10 +23,11 @@ MODELS_TO_BENCHMARK = [
     ("gpt-4.1", "openai/gpt-4.1"),
     ("o4-mini", "openai/o4-mini"),
     ("o3", "openai/o3"),
-    # ("qwen3-235b", "openrouter/qwen/qwen3-235b-a22b"),
-    ("qwen3-32b", "deepinfra/Qwen/Qwen3-32B"),
-    ("deepseek-r1", "deepinfra/deepseek-ai/DeepSeek-R1"),
+    ("qwen3-235b", "openrouter/qwen/qwen3-235b-a22b"),
+    ("qwen3-32b", "openrouter/qwen/qwen3-32b"),
+    # ("deepseek-r1", "openrouter/deepseek-ai/DeepSeek-R1"),
     ("gemini-2.5-flash", "gemini/gemini-2.5-flash"),
+    ("sonnet 4", "openrouter/anthropic/claude-sonnet-4"),
     ("gemini-2.5-pro", "gemini/gemini-2.5-pro"),
 ]
 
@@ -40,7 +41,8 @@ async def main():
         model = art.Model(
             name=model_name.split("/")[-1],
             project="email_agent",
-            config=ProjectPolicyConfig(litellm_model_name=model_id),
+            inference_model_name=model_id,
+            config=ProjectPolicyConfig(),
         )
         await model.register(backend)
         models.append(model)

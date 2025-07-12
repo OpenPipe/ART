@@ -100,6 +100,8 @@ class RunConfig(BaseModel):
     messages_only: bool = False
     base_model: str = "unsloth/Qwen2.5-14B-Instruct"
     is_multi_gpu: bool = False
+    add_no_think: bool = False
+    plot_tensors: bool = False
 
 
 class TauBenchTrainingConfig(BaseModel):

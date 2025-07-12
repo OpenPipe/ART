@@ -1,9 +1,9 @@
 from dotenv import load_dotenv
 import random
 from typing import TypedDict
-from typing import Literal
 import string
 import xml.etree.ElementTree as ET
+from enum import Enum
 
 load_dotenv()
 
@@ -14,6 +14,13 @@ WINNING_VALUE = 128
 class TwentyFortyEightGame(TypedDict):
     id: str
     board: list[list[int | None]]
+
+
+class Direction(str, Enum):
+    LEFT = "left"
+    RIGHT = "right"
+    UP = "up"
+    DOWN = "down"
 
 
 # Randomly populates a cell on the board with a 2 or 4
@@ -35,10 +42,10 @@ def populate_random_cell(game: TwentyFortyEightGame) -> None:
 def generate_game(board_length: int = 4) -> TwentyFortyEightGame:
     # random 6 character string
     id = "".join(random.choices(string.ascii_letters + string.digits, k=6))
-    game = {
-        "id": id,
-        "board": [[None for _ in range(board_length)] for _ in range(board_length)],
-    }
+    game = TwentyFortyEightGame(
+        id=id,
+        board=[[None for _ in range(board_length)] for _ in range(board_length)],
+    )
 
     # populate two random cells
     populate_random_cell(game)
@@ -100,9 +107,7 @@ def condense_sequence(sequence: list[int | None]) -> list[int | None]:
 
 
 # Condenses the board in a given direction
-def condense_board(
-    game: TwentyFortyEightGame, direction: Literal["left", "right", "up", "down"]
-) -> None:
+def condense_board(game: TwentyFortyEightGame, direction: Direction) -> None:
     if direction == "left":
         for row in game["board"]:
             condensed_row = condense_sequence(row)
@@ -147,7 +152,7 @@ def apply_agent_move(game: TwentyFortyEightGame, move_xml: str) -> None:
     if direction not in ["left", "right", "up", "down"]:
         raise ValueError("Invalid direction")
 
-    condense_board(game, direction)
+    condense_board(game, Direction(direction))
 
     populate_random_cell(game)
 
@@ -172,3 +177,16 @@ def check_game_finished(game: TwentyFortyEightGame) -> bool:
 # Returns the sum of all the cell values on the board
 def total_board_value(game: TwentyFortyEightGame) -> int:
     return sum([cell for row in game["board"] for cell in row if cell is not None])
+
+
+if __name__ == "__main__":
+    game = generate_game()
+    print(render_board(game))
+    for move in ["left", "up", "right", "down"]:
+        move_xml = f"<move>{move}</move>"
+        apply_agent_move(game, move_xml)
+        print("-" * 10)
+        print(move.upper())
+        print("-" * 10)
+        print()
+        print(render_board(game))

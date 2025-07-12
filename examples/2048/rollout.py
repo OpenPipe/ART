@@ -1,10 +1,9 @@
+import asyncio
 import os
 import openai
-import time
 import math
 import requests
 import weave
-from openpipe.client import AsyncOpenPipe
 from dotenv import load_dotenv
 
 import art
@@ -18,15 +17,14 @@ from utils import (
     WINNING_VALUE,
 )
 
-
 load_dotenv()
-
-op_client = AsyncOpenPipe(os.getenv("OPENPIPE_API_KEY"))
 
 
 @weave.op
 @art.retry(exceptions=(openai.LengthFinishReasonError, requests.ReadTimeout))
-async def rollout(model: art.Model, step: int, is_validation: bool) -> art.Trajectory:
+async def rollout(
+    model: art.Model, step: int, is_validation: bool, verbose: bool = False
+) -> art.Trajectory:
     game = generate_game()
 
     move_number = 0
@@ -36,8 +34,13 @@ async def rollout(model: art.Model, step: int, is_validation: bool) -> art.Traje
             {
                 "role": "system",
                 "content": "You are an excellent 2048 player. Always choose the move most likely to lead to combine cells to eventually reach the number 2048. Optional moves are 'left', 'right', 'up', 'down'. Return your move as an XML object with a single property 'move', like so: <move>left</move>",
-            }
+            },
         ],
+        metadata={
+            "game_id": game["id"],
+            "step": step,
+            "validation": is_validation,
+        },
         reward=0,
     )
 
@@ -45,48 +48,24 @@ async def rollout(model: art.Model, step: int, is_validation: bool) -> art.Traje
         trajectory.messages_and_choices.append(
             {"role": "user", "content": render_board(game)}
         )
-
-        requested_at = int(time.time() * 1000)
-        messages = trajectory.messages()
+        if verbose:
+            print(render_board(game))
 
         async def get_completion():
             client = model.openai_client()
             return await client.chat.completions.create(
                 max_completion_tokens=128,
-                messages=messages,
+                messages=trajectory.messages(),
                 model=model.name,
             )
 
         try:
             chat_completion = await get_completion()
-            last_completion = chat_completion
         except openai.LengthFinishReasonError as e:
             raise e
         except Exception as e:
             print("caught exception generating chat completion", e)
             raise e
-
-        try:
-            if op_client.api_key:
-                await op_client.report(
-                    requested_at=requested_at,
-                    received_at=int(time.time() * 1000),
-                    req_payload={
-                        "model": model.name,
-                        "messages": messages,
-                        "metadata": {
-                            "game_id": game["id"],
-                            "notebook-id": "2048",
-                            "step": str(step),
-                            "validation": str(is_validation),
-                            "move_number": str(move_number),
-                        },
-                    },
-                    resp_payload=chat_completion,
-                    status_code=200,
-                )
-        except Exception as e:
-            print(f"Error reporting to OpenPipe: {e}")
 
         choice = chat_completion.choices[0]
         content = choice.message.content
@@ -95,51 +74,64 @@ async def rollout(model: art.Model, step: int, is_validation: bool) -> art.Traje
 
         try:
             apply_agent_move(game, content)
+            if verbose:
+                print(content)
             move_number += 1
         except ValueError:
+            trajectory.metrics["invalid_move"] = 1
             trajectory.reward = -1
             break
 
         if check_game_finished(game):
-            max_value = max_cell_value(game)
-            board_value = total_board_value(game)
-            trajectory.metrics["max_value"] = max_value
-            trajectory.metrics["board_value"] = board_value
-            trajectory.metrics["num_moves"] = move_number
-
-            if max_value < WINNING_VALUE:
-                # scale max value logarithmically between 0 for 2 and 1 for WINNING_VALUE
-                max_value_reward = (math.log(max_value, 2) - 1) / (
-                    math.log(WINNING_VALUE, 2) - 1
-                )
-                # scale board value logarithmically between 0 for 2 * 16 and 1 for WINNING_VALUE * 16
-                board_value_reward = (math.log(board_value, 2) - 1) / (
-                    math.log(WINNING_VALUE * 16, 2) - 1
-                )
-                # combine the two rewards, with max value having a higher weight
-                trajectory.reward = max_value_reward + (board_value_reward * 0.2)
-                trajectory.metrics["win"] = 0
-            else:
-                # double reward if the agent wins
-                trajectory.reward = 2
-                trajectory.metrics["win"] = 1
+            trajectory.metrics["invalid_move"] = 0
             break
 
-    try:
-        if op_client.api_key:
-            await op_client.update_log_metadata(
-                filters=[
-                    {
-                        "field": "completionId",
-                        "equals": last_completion.id,
-                    }
-                ],
-                metadata={
-                    "reward": str(trajectory.reward),
-                    "reward_assigned": "true",
-                },
-            )
-    except Exception as e:
-        print(f"Error updating log metadata: {e}")
+    max_value = max_cell_value(game)
+    board_value = total_board_value(game)
+    agent_won = max_value == WINNING_VALUE
+    trajectory.metrics["max_value"] = max_value
+    trajectory.metrics["board_value"] = board_value
+    trajectory.metrics["num_moves"] = move_number
+    trajectory.metrics["win"] = agent_won
+
+    # try to get as close to the winning value as possible
+    # otherwise, try to maximize number of high cells on board
+    # but above all else: WIN THE GAME!
+    if agent_won:
+        # double reward if the agent wins
+        trajectory.reward = 2
+    else:
+        # scale max value logarithmically between 0 for 2 and 1 for WINNING_VALUE
+        max_value_reward = (math.log(max_value, 2) - 1) / (
+            math.log(WINNING_VALUE, 2) - 1
+        )
+        # scale board value logarithmically between 0 for 2 * 16 and 1 for WINNING_VALUE * 16
+        board_value_reward = (math.log(board_value, 2) - 1) / (
+            math.log(WINNING_VALUE * 16, 2) - 1
+        )
+        # combine the two rewards, with max value having a higher weight
+        trajectory.reward = max_value_reward + (board_value_reward * 0.2)
 
     return trajectory
+
+
+if __name__ == "__main__":
+    gpt_4o_mini = art.Model(
+        name="gpt-4o-mini",
+        project="2048",
+        inference_model_name="openai/gpt-4o-mini",
+        inference_base_url="https://openrouter.ai/api/v1",
+        inference_api_key=os.getenv("OPENROUTER_API_KEY"),
+    )
+
+    async def main():
+        trajectory = await rollout(gpt_4o_mini, 0, True, True)
+        print("================" * 3)
+        print("METRICS\n")
+        print(trajectory.metrics)
+        print("================" * 3)
+        print("REWARD\n")
+        print(trajectory.reward)
+        print("================" * 3)
+
+    asyncio.run(main())
