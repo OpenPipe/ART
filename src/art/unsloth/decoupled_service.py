@@ -12,6 +12,7 @@ import torch
 from trl import GRPOConfig, GRPOTrainer
 from typing import AsyncIterator, TYPE_CHECKING, cast, Any
 from vllm import AsyncEngineArgs
+from vllm.lora.request import LoRARequest
 from vllm.v1.engine.async_llm import AsyncLLM
 
 from .. import dev
@@ -180,7 +181,6 @@ class DecoupledUnslothService:
         checkpoint_dir = get_step_checkpoint_dir(self.output_dir, next_step)
         os.makedirs(checkpoint_dir, exist_ok=True)
         self._state.trainer.save_model(checkpoint_dir)
-        # self._save_lora_without_prefix(checkpoint_dir)
 
         # Free memory before waking up vLLM
         self._free_memory()
@@ -193,42 +193,20 @@ class DecoupledUnslothService:
 
         # wait for the workers to wake up
         await sleep_task
-
-        # TODO: Set the new LoRA adapter in vLLM
-        # For now, we'll rely on vLLM to reload the LoRA from disk
-        # self._set_lora(checkpoint_dir)
+        await llm.remove_lora(1)
+        await llm.add_lora(
+            LoRARequest(
+                lora_name=self.model_name,
+                lora_int_id=1,
+                lora_path=checkpoint_dir,
+            )
+        )
 
         if verbose:
             print("DecoupledUnslothService.train complete")
         print(
             "DEBUG: DecoupledUnslothService.train() method returning control to caller"
         )
-
-    # def _save_lora_without_prefix(self, lora_path: str) -> None:
-    #     """Save LoRA checkpoint with weights renamed to remove base_model prefix."""
-    #     # First save normally
-    #     self._state.trainer.save_model(lora_path)
-
-    #     # Now load and fix the weights
-    #     # Read the saved weights
-    #     weights_path = os.path.join(lora_path, "adapter_model.safetensors")
-    #     state_dict = safetensors.torch.load_file(weights_path)
-
-    #     # Remove base_model prefix from all keys
-    #     new_state_dict = {}
-    #     for key, value in state_dict.items():
-    #         if key.startswith("base_model.model."):
-    #             # Remove "base_model.model." prefix
-    #             new_key = key[len("base_model.model.") :]
-    #         elif key.startswith("base_model."):
-    #             # Remove "base_model." prefix
-    #             new_key = key[len("base_model.") :]
-    #         else:
-    #             new_key = key
-    #         new_state_dict[new_key] = value
-
-    #     # Save the fixed weights
-    #     safetensors.torch.save_file(new_state_dict, weights_path)
 
     def _free_memory(self) -> None:
         """Free GPU memory."""
