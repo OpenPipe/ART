@@ -80,9 +80,6 @@ class ModelState:
         AsyncLLMEngine.from_engine_args = from_engine_args
         torch.cuda.empty_cache = empty_cache
         torch.cuda.empty_cache()
-        enable_sleep_mode = config.get("engine_args", {}).get(
-            "enable_sleep_mode", False
-        )
         self.vllm = vLLMState(self.model.vllm_engine, enable_sleep_mode)
         # Initialize PEFT model
         self.peft_model = cast(
