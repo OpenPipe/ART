@@ -38,6 +38,7 @@ class ModelState:
     """
 
     def __init__(self, config: InternalModelConfig) -> None:
+        from unsloth_zoo.vllm_rlhf_utils import ColocateWorkerExtension
         from vllm.engine import async_llm_engine
 
         # Patch MultiStepModelRunner for Unsloth compatibility
@@ -49,7 +50,7 @@ class ModelState:
         # Set effectively unlimited timeout to support engine pausing & resumption
         async_llm_engine.ENGINE_ITERATION_TIMEOUT_S = 2**31 - 1
         # Sticking with V0 engine for now
-        os.environ["VLLM_USE_V1"] = "0"
+        os.environ["VLLM_USE_V1"] = "1"
         # We can't use expandable segments with sleep mode
         enable_sleep_mode = config.get("engine_args", {}).get(
             "enable_sleep_mode", False
@@ -69,7 +70,13 @@ class ModelState:
             engine_args: AsyncEngineArgs, *args: Any, **kwargs: Any
         ) -> AsyncLLMEngine:
             return from_engine_args(
-                replace(engine_args, **config.get("engine_args", {})), *args, **kwargs
+                replace(
+                    engine_args,
+                    **config.get("engine_args", {}),
+                    worker_extension_cls=f"{ColocateWorkerExtension.__module__}.{ColocateWorkerExtension.__qualname__}",
+                ),
+                *args,
+                **kwargs,
             )
 
         AsyncLLMEngine.from_engine_args = _from_engine_args
