@@ -9,6 +9,13 @@ if os.environ.get("IMPORT_PEFT", "0") == "1":
 if os.environ.get("IMPORT_UNSLOTH", "0") == "1":
     import unsloth  # type: ignore # noqa: F401
 
+if os.environ.get("IMPORT_PEFT", "0") == "1":
+    # torch.cuda.MemPool doesn't currently support expandable_segments which is used in sleep mode
+    conf = os.environ["PYTORCH_CUDA_ALLOC_CONF"].split(",")
+    if "expandable_segments:True" in conf:
+        conf.remove("expandable_segments:True")
+    os.environ["PYTORCH_CUDA_ALLOC_CONF"] = ",".join(conf)
+
 from . import dev
 from .backend import Backend
 from .batches import trajectory_group_batches

@@ -33,12 +33,6 @@ async def get_llm(args: vllm.AsyncEngineArgs) -> AsyncLLM:
         )
         await process.wait()
 
-    # torch.cuda.MemPool doesn't currently support expandable_segments which is used in sleep mode
-    conf = os.environ["PYTORCH_CUDA_ALLOC_CONF"].split(",")
-    if "expandable_segments:True" in conf:
-        conf.remove("expandable_segments:True")
-    os.environ["PYTORCH_CUDA_ALLOC_CONF"] = ",".join(conf)
-
     # Make sure we are using the V1 engine
     import vllm.envs as envs
 
