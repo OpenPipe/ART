@@ -3,9 +3,9 @@ import asyncio
 import random
 
 import art
+from art.rewards import ruler_score_group
 from art.local import LocalBackend
 from rollout import rollout
-from group_judge import GroupJudge
 
 load_dotenv()
 
@@ -25,7 +25,7 @@ model._internal_config = art.dev.InternalModelConfig(
 
 TRAIN_STEPS = 40
 SIMULTANEOUS_GAMES = 18
-ENABLE_GROUP_JUDGE = True
+ENABLE_RULER = True
 
 
 async def train():
@@ -40,12 +40,6 @@ async def train():
         verbose=True,
     )
 
-    if ENABLE_GROUP_JUDGE:
-        group_judge = GroupJudge(
-            project=model.project,
-            judge_model="openai/o4-mini",
-        )
-
     # train for 40 steps
     for i in range(await model.get_step(), TRAIN_STEPS):
         train_groups = await art.gather_trajectory_groups(
@@ -57,13 +51,19 @@ async def train():
                 )
                 for _ in range(1)
             ),
+            after_each=lambda group: (
+                ruler_score_group(
+                    group,
+                    "openai/o4-mini",
+                    debug=True,
+                    swallow_exceptions=True,  # Return None on error, filtering out the group
+                )
+                if ENABLE_RULER
+                else None
+            ),
             pbar_desc="gather",
             max_exceptions=10,
         )
-
-        if ENABLE_GROUP_JUDGE:
-            for group in train_groups:
-                group.trajectories = await group_judge.judge(group.trajectories)
 
         # save the model to S3
         await backend._experimental_push_to_s3(
