@@ -139,7 +139,10 @@ class LocalBackend(Backend):
             if not self._in_process:
                 # Kill all "model-service" processes to free up GPU memory
                 subprocess.run(["pkill", "-9", "model-service"])
-                if isinstance(self._services[model.name], UnslothService):
+                if isinstance(
+                    self._services[model.name],
+                    (UnslothService, DecoupledUnslothService),
+                ):
                     # To enable sleep mode, import peft before unsloth
                     # Unsloth will issue warnings, but everything appears to be okay
                     if config.get("engine_args", {}).get("enable_sleep_mode", False):
@@ -147,8 +150,6 @@ class LocalBackend(Backend):
                     # When moving the service to a child process, import unsloth
                     # early to maximize optimizations
                     os.environ["IMPORT_UNSLOTH"] = "1"
-                elif isinstance(self._services[model.name], DecoupledUnslothService):
-                    os.environ["DISABLE_EXPANDABLE_SEGMENTS"] = "1"
                 # Note: DecoupledUnslothService doesn't need special imports since
                 # vLLM V1 and Unsloth run in separate processes
                 self._services[model.name] = move_to_child_process(
