@@ -1,6 +1,12 @@
-import polars as pl
-import matplotlib.pyplot as plt
-import seaborn as sns
+try:
+    import polars as pl
+    import matplotlib.pyplot as plt
+    import seaborn as sns
+except ImportError:
+    raise ImportError(
+        "Plotting dependencies are not installed. Please install them with: "
+        "pip install openpipe-art[plotting]"
+    )
 
 from art.utils.benchmarking.types import BenchmarkModelKey
 from art.utils.benchmarking.filter_model_split import filter_rename_model_split

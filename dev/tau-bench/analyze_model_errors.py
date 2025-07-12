@@ -19,7 +19,8 @@ from tau_bench.envs.user import UserStrategy
 from tau_bench.rl_utils import (
     ErrorAnalysis,
     analyze_failed_task,
-    log_analysis_to_openpipe,
+    log_rollout_analysis_to_openpipe,
+    log_full_analysis_to_openpipe,
 )
 
 # Import evaluate_model and rollout functions from run_rl
@@ -276,20 +277,43 @@ async def analyze_model_errors(
 
         print(f"Task {task_idx}: {passed_count}/{len(trajectories_for_task)} passed")
 
-        # If all trials failed, analyze the task
+        # If all trials failed, collect for analysis
         if (
             len(failed_trajectories) == len(trajectories_for_task)
             and len(failed_trajectories) > 0
         ):
-            print(f"Task {task_idx} failed all trials, analyzing...")
+            print(f"Task {task_idx} failed all trials, queuing for analysis...")
             failed_tasks[task_idx] = failed_trajectories
 
+    # Parallelize analysis of failed tasks
+    if failed_tasks:
+        print(f"\nAnalyzing {len(failed_tasks)} failed tasks in parallel...")
+
+        # Create analysis tasks for parallel execution
+        analysis_tasks = []
+        task_ids_for_analysis = []
+
+        for task_idx, failed_trajectories in failed_tasks.items():
             # Get task information from environment
             env_task = env.tasks[task_idx] if task_idx < len(env.tasks) else None
             if env_task:
-                result = await analyze_failed_task(
+                analysis_task = analyze_failed_task(
                     task_idx, failed_trajectories, env_task.model_dump(), analyzer_model
                 )
+                analysis_tasks.append(analysis_task)
+                task_ids_for_analysis.append(task_idx)
+            else:
+                print(f"Could not find task {task_idx} in environment")
+
+        # Run all analyses in parallel with progress bar
+        if analysis_tasks:
+            analysis_results_list = await tqdm_asyncio.gather(
+                *analysis_tasks, desc="Running analyses", total=len(analysis_tasks)
+            )
+
+            # Process results
+            for i, result in enumerate(analysis_results_list):
+                task_idx = task_ids_for_analysis[i]
                 if result:
                     analysis, prompt = result
                     analysis_results[task_idx] = analysis
@@ -297,8 +321,6 @@ async def analyze_model_errors(
                     print(f"Analysis complete for task {task_idx}")
                 else:
                     print(f"Failed to analyze task {task_idx}")
-            else:
-                print(f"Could not find task {task_idx} in environment")
 
     # Display overall metrics
     print(f"\n{'-' * 40}")
@@ -367,14 +389,56 @@ async def main():
 
     # Log analysis results to OpenPipe
     if results["analysis_results"]:
-        print(f"\nLogging {len(results['analysis_results'])} analyses to OpenPipe...")
-        for task_id, analysis_dict in results["analysis_results"].items():
-            # Use the full prompt and response for logging
-            analysis = ErrorAnalysis(**analysis_dict)
-            prompt = results["analysis_prompts"][task_id]  # Use the actual full prompt
-            response = f"Reasoning: {analysis.reasoning}\nBlame: {analysis.blame_assignment}\nRecommendations: {analysis.recommendations}"
+        print("\nLogging analysis results to OpenPipe...")
 
-            await log_analysis_to_openpipe(int(task_id), analysis, prompt, response)
+        for task_id, analysis_dict in results["analysis_results"].items():
+            analysis = ErrorAnalysis(**analysis_dict)
+
+            # Find failed trajectories for this task from the stored results
+            failed_trajectories = [
+                r
+                for r in results["all_results"]
+                if str(r["task_id"]) == str(task_id) and r["reward"] < 0.999
+            ]
+
+            # 1. Log each failing trajectory separately with its rollout analysis
+            for i, rollout_analysis in enumerate(analysis.error_analysis_rollouts):
+                if i < len(failed_trajectories):
+                    trajectory_data = failed_trajectories[i]
+
+                    # Create prompt for this specific rollout
+                    prompt = f"Error analysis for Task {task_id}, Rollout {i + 1}"
+
+                    # Log individual rollout with its trajectory data
+                    await log_rollout_analysis_to_openpipe(
+                        task_id=int(task_id),
+                        rollout_analysis=rollout_analysis,
+                        trajectory_data=trajectory_data,
+                        rollout_index=i,
+                        prompt=prompt,
+                    )
+
+            # 2. Log the full analysis summary for this task
+            full_prompt = results["analysis_prompts"][task_id]
+            full_response = f"Analysis of {len(analysis.error_analysis_rollouts)} failed rollouts for task {task_id}:\n\n"
+
+            for i, rollout_analysis in enumerate(analysis.error_analysis_rollouts):
+                full_response += f"ROLLOUT {i + 1}:\n"
+                full_response += f"Summary: {rollout_analysis.summary}\n"
+                full_response += f"Reasoning: {rollout_analysis.reasoning}\n"
+                full_response += f"Blame: {rollout_analysis.blame_assignment}\n"
+                full_response += f"Category: {rollout_analysis.category}\n\n"
+
+            await log_full_analysis_to_openpipe(
+                task_id=int(task_id),
+                analysis=analysis,
+                prompt=full_prompt,
+                response=full_response,
+            )
+
+            print(
+                f"Logged {len(analysis.error_analysis_rollouts)} rollouts + full analysis for task {task_id}"
+            )
 
     # Save results
     time_str = datetime.now().strftime("%m%d%H%M%S")
@@ -398,12 +462,22 @@ async def main():
     if results["analysis_results"]:
         print("\nBlame assignment distribution:")
         blame_counts = {}
+        category_counts = {}
+
         for analysis_dict in results["analysis_results"].values():
-            blame = analysis_dict["blame_assignment"]
-            blame_counts[blame] = blame_counts.get(blame, 0) + 1
+            analysis = ErrorAnalysis(**analysis_dict)
+            for rollout_analysis in analysis.error_analysis_rollouts:
+                blame = rollout_analysis.blame_assignment
+                category = rollout_analysis.category
+                blame_counts[blame] = blame_counts.get(blame, 0) + 1
+                category_counts[category] = category_counts.get(category, 0) + 1
 
         for blame, count in blame_counts.items():
             print(f"  {blame}: {count}")
+
+        print("\nFailure category distribution:")
+        for category, count in category_counts.items():
+            print(f"  {category}: {count}")
 
 
 if __name__ == "__main__":

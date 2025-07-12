@@ -69,6 +69,8 @@ async def rollout_tau_bench_task(
         task_split=config.task_split,
         task_index=task_index,
     )
+    if config.add_no_think:
+        env.wiki += "\n/no_think"
 
     # Create agent with the trainable model
     agent = agent_factory(
@@ -289,6 +291,7 @@ async def train(model: art.TrainableModel[TauBenchPolicyConfig]):
                 await model.train(
                     trajectory_groups,
                     config=art.TrainConfig(learning_rate=training_config.learning_rate),
+                    _config=art.dev.TrainConfig(plot_tensors=config.plot_tensors),
                 )
                 if config.is_multi_gpu:
                     await model.delete_checkpoints()

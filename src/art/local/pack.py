@@ -1,7 +1,6 @@
-import matplotlib.pyplot as plt
 import os
 import random
-import seaborn as sns
+import time
 import torch
 from typing_extensions import TypedDict, Unpack
 
@@ -166,7 +165,18 @@ def packed_tensors_to_dir(tensors: PackedTensors, dir: str) -> DiskPackedTensors
     return disk_packed_tensors
 
 
-def plot_packed_tensors(packed_tensors: PackedTensors) -> None:
+def plot_packed_tensors(
+    packed_tensors: PackedTensors, output_dir: str | None = None
+) -> None:
+    try:
+        import matplotlib.pyplot as plt
+        import seaborn as sns
+    except ImportError:
+        raise ImportError(
+            "Plotting dependencies are not installed. Please install them with: "
+            "pip install openpipe-art[plotting]"
+        )
+
     plt.figure(figsize=(15, 24))
 
     for tensor, label, title, subplot_idx in (
@@ -192,3 +202,11 @@ def plot_packed_tensors(packed_tensors: PackedTensors) -> None:
 
     plt.tight_layout()
     plt.show()
+
+    if output_dir:
+        os.makedirs(output_dir, exist_ok=True)
+        plot_path = f"{output_dir}/packed_tensors_plot_{int(time.time())}.png"
+        plt.savefig(plot_path)
+        print(f"Plot saved to: {plot_path}")
+    else:
+        print("No output directory specified, plot not saved")

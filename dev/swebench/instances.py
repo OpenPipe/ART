@@ -32,6 +32,7 @@ def get_filtered_swe_smith_instances_df() -> pl.DataFrame:
         pl.read_parquet(
             "hf://datasets/bradhiltonendercorp/SWE-smith-filtered/instances.parquet"
         )
+        .sample(fraction=1.0, shuffle=True, seed=42)
         .filter(
             ~pl.col("repo")
             .cast(pl.Utf8)

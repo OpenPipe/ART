@@ -12,7 +12,7 @@ import art_e.evaluate.charts
 importlib.reload(art_e.evaluate.charts)
 
 import polars as pl  # noqa: E402
-from art_e.evaluate.load_trajectories import load_trajectories  # noqa: E402
+from art.utils.benchmarking.load_trajectories import load_trajectories  # noqa: E402
 from art_e.evaluate.charts import comparison_models_bar_chart, training_progress_chart  # noqa: E402
 
 # Define and create the temporary directory early

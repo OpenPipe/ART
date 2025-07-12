@@ -193,7 +193,9 @@ class LocalBackend(Backend):
             )
             return None
         if plot_tensors:
-            plot_packed_tensors(packed_tensors)
+            plot_packed_tensors(
+                packed_tensors, get_model_dir(model=model, art_path=self._path)
+            )
         else:
             print(
                 f"Packed {len(tokenized_results)} trajectories into {packed_tensors['tokens'].shape[0]} sequences of length {packed_tensors['tokens'].shape[1]}"
@@ -261,7 +263,7 @@ class LocalBackend(Backend):
 
         # Get the file name for the current iteration, or default to 0 for non-trainable models
         iteration = self.__get_step(model) if isinstance(model, TrainableModel) else 0
-        file_name = f"{iteration:04d}.yaml"
+        file_name = f"{iteration:04d}.jsonl"
 
         # Write the logs to the file
         with open(f"{parent_dir}/{file_name}", "w") as f:
@@ -332,7 +334,7 @@ class LocalBackend(Backend):
             allow_training_without_logprobs=dev_config.get(
                 "allow_training_without_logprobs", False
             ),
-            plot_tensors=False,
+            plot_tensors=dev_config.get("plot_tensors", False),
         )
         if packed_tensors is None:
             print(
@@ -400,7 +402,7 @@ class LocalBackend(Backend):
 
             # Enabling the following line will cause W&B to use the training_step metric as the x-axis for all metrics
             # wandb.define_metric(f"{split}/*", step_metric="training_step")
-            run.log({"training_step": step, **metrics})
+            run.log({"training_step": step, **metrics}, step=step)
 
     def _get_wandb_run(self, model: Model) -> Run | None:
         if "WANDB_API_KEY" not in os.environ:

@@ -3,7 +3,7 @@ name = "art-e"
 version = "0.1.0"
 description = "Deep learning research for email search and processing"
 readme = "README.md"
-requires-python = ">=3.12"
+requires-python = ">=3.10"
 dependencies = [
     "datasets>=3.4.1",
     "diskcache>=5.6.3",
@@ -25,10 +25,11 @@ dependencies = [
     "skypilot[runpod]==0.9.3",
     "ipywidgets>=8.1.6",
     "polars>=1.27.1",
-    "openpipe-art",
+    "openpipe-art[backend,plotting]",
     "weave>=0.51.53",
     "accelerate==1.7.0",
     "litellm==1.73.6",
+    "tenacity>=9.1.2",
 ]
 
 [build-system]
@@ -37,6 +38,13 @@ build-backend = "setuptools.build_meta"
 
 [tool.setuptools.packages.find]
 include = ["art_e*"]
+
+[tool.uv]
+override-dependencies = [
+    "bitsandbytes; sys_platform == 'linux'",
+    "xformers; sys_platform == 'linux'",
+]
+
 
 [tool.uv.sources]
 art-e = { workspace = true }

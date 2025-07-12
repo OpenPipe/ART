@@ -62,11 +62,12 @@ def launch_model(model_key: str):
     model_dict = model.model_dump()
     model_dict["config"] = model.config.model_dump()
     # Pass the model key as run_name and the serialized model
+    # Remove --no-managed-python and revert to python 3.12 once https://github.com/astral-sh/python-build-standalone/pull/667#issuecomment-3059073433 is addressed.
     run_script = textwrap.dedent(f"""
         uv remove openpipe-art
         uv add --editable ~/ART --extra backend
 
-        uv run art_e/train.py '{json.dumps(model_dict)}'
+        uv run --no-managed-python art_e/train.py '{json.dumps(model_dict)}'
     """)
 
     # Create a SkyPilot Task

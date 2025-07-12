@@ -143,9 +143,9 @@ class ToolCallingRLAgent(ToolCallingAgent):
             temperature=self.temperature,
             max_completion_tokens=1024,
             logprobs=False if self.provider == "openai" else True,
-            extra_body={"chat_template_kwargs": {"enable_thinking": False}}
-            if "Qwen3-" in self.base_model
-            else {},
+            # extra_body={"chat_template_kwargs": {"enable_thinking": False}}
+            # if "Qwen3-" in self.base_model
+            # else {},
         )
         choice = response.choices[0]  # type: ignore
         assert isinstance(choice, Choices), f"Choice is not a Choices object: {choice}"

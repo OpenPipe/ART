@@ -1,7 +1,14 @@
 import os
 from datetime import datetime
-import matplotlib.pyplot as plt
 from typing import Literal
+
+try:
+    import matplotlib.pyplot as plt
+except ImportError:
+    raise ImportError(
+        "Plotting dependencies are not installed. Please install them with: "
+        "pip install openpipe-art[plotting]"
+    )
 
 from .load_benchmarked_models import load_benchmarked_models
 from .types import BenchmarkedModelKey

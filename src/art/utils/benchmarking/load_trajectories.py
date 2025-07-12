@@ -1,8 +1,15 @@
-import polars as pl
+try:
+    import polars as pl
+except ImportError:
+    raise ImportError(
+        "Plotting dependencies are not installed. Please install them with: "
+        "pip install openpipe-art[plotting]"
+    )
 import yaml
+import json
 from pathlib import Path
-from panza import SQLiteCache
 import os
+from tqdm.auto import tqdm
 
 from art.model import Model as ArtModel
 from art.local import LocalBackend
@@ -15,10 +22,8 @@ from art.utils.output_dirs import (
 
 cache_path = Path(get_repo_root_path()) / "data" / "cache.db"
 cache_path.parent.mkdir(parents=True, exist_ok=True)
-cache = SQLiteCache(str(cache_path))
 
 
-@cache.cache()
 async def load_trajectories(
     project_name: str,
     models: list[str] | None = None,
@@ -26,15 +31,15 @@ async def load_trajectories(
     art_path: str | None = None,
 ) -> pl.DataFrame:
     """
-      Load and flatten trajectory YAML files into a Polars DataFrame.
+      Load and flatten trajectory files (YAML or JSONL) into a Polars DataFrame.
 
       The expected on-disk layout is::
 
-          {api_path}/{project_name}/models/{model_name}/trajectories/{split}/{step_number}.yaml
+          {api_path}/{project_name}/models/{model_name}/trajectories/{split}/{step_number}.{yaml|jsonl}
 
-      Each YAML file contains a list of *TrajectoryGroups* (see `art`), and each
+      Each file contains a list of *TrajectoryGroups* (see `art`), and each
       group in turn contains a list of *Trajectories*.  This helper walks the
-      directory tree, reads every YAML file, and converts every single trajectory
+      directory tree, reads every trajectory file, and converts every single trajectory
       into one row of a tabular dataset.
 
       For every trajectory we record a handful of fixed columns plus two dynamic
@@ -97,16 +102,21 @@ async def load_trajectories(
     models_set: set[str] | None = set(models) if models is not None else None
 
     # Walk through all models and their trajectory files
-    for model_dir in root.iterdir():
+    # Build list of model directories we will actually process so that the
+    # progress bar reflects the real workload. If *models* was provided, we
+    # filter accordingly.
+    model_dirs = [
+        d
+        for d in root.iterdir()
+        if d.is_dir() and (models_set is None or d.name in models_set)
+    ]
+    for model_dir in tqdm(model_dirs, desc="Models", unit="model"):
         if debug:
             print(f"Processing {model_dir}")
+        # Basic sanity check (should normally be redundant with filtering above)
         if not model_dir.is_dir():
             continue
         model_name = model_dir.name
-
-        # If a subset of models is requested, skip any others early to save time
-        if models_set is not None and model_name not in models_set:
-            continue
 
         traj_root = Path(get_trajectories_dir(str(model_dir)))
         if not traj_root.exists():
@@ -117,13 +127,29 @@ async def load_trajectories(
             if not split_dir.is_dir():
                 continue
 
-            for yaml_path in split_dir.glob("*.yaml"):
-                step = int(yaml_path.stem)
+            # Look for both .yaml and .jsonl files
+            trajectory_files = sorted(split_dir.glob("*"))
+            for trajectory_path in tqdm(
+                trajectory_files,
+                desc=f"{model_name}/{split_dir.name}",
+                unit="file",
+                leave=False,
+            ):
+                if trajectory_path.suffix not in [".yaml", ".jsonl"]:
+                    continue
+                step = int(trajectory_path.stem)
                 if debug:
-                    print(f"Processing {yaml_path}")
+                    print(f"Processing {trajectory_path}")
 
-                # Each YAML file is a list of trajectory groups
-                trajectory_groups = yaml.safe_load(yaml_path.read_text())
+                # Load trajectory groups based on file extension
+                if trajectory_path.suffix == ".yaml":
+                    trajectory_groups = yaml.safe_load(trajectory_path.read_text())
+                else:  # .jsonl
+                    trajectory_groups = []
+                    with open(trajectory_path, "r") as f:
+                        for line in f:
+                            if line.strip():
+                                trajectory_groups.append(json.loads(line))
 
                 for group in trajectory_groups:
                     group_number += 1
@@ -206,7 +232,7 @@ async def pull_model_trajectories(model: ArtModel) -> None:
     This is a lightweight helper that mirrors the S3-sync logic used inside
     ``art_e.train`` but without performing any training.  It can be invoked from
     notebooks or other scripts to ensure that the local ART project directory
-    contains all trajectory YAML files for subsequent evaluation / analysis.
+    contains all trajectory files for subsequent evaluation / analysis.
 
     Parameters
     ----------

@@ -1,4 +1,11 @@
-import polars as pl
+try:
+    import polars as pl
+except ImportError:
+    raise ImportError(
+        "Plotting dependencies are not installed. Please install them with: "
+        "pip install openpipe-art[plotting]"
+    )
+
 from ..types import BenchmarkModelKey
 from ..filter_model_split import filter_rename_model_split
 
@@ -46,9 +53,15 @@ def percentage_comparison_bar_chart(
         Jupyter notebooks.
     """
 
-    import matplotlib.pyplot as plt
-    import numpy as np
-    import seaborn as sns
+    try:
+        import matplotlib.pyplot as plt
+        import numpy as np
+        import seaborn as sns
+    except ImportError:
+        raise ImportError(
+            "Plotting dependencies are not installed. Please install them with: "
+            "pip install openpipe-art[plotting]"
+        )
 
     # create new copy of df
     df = df.clone()
