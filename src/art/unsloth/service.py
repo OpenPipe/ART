@@ -22,6 +22,7 @@ if TYPE_CHECKING:
 class TrainInputs(PackedTensors):
     config: types.TrainConfig
     _config: dev.TrainConfig
+    return_new_logprobs: bool
 
 
 @dataclass
@@ -93,10 +94,34 @@ class UnslothService:
             warmup = True
         else:
             warmup = False
+        precalculate_logprobs = _config.get("precalculate_logprobs", False)
         # Enter training mode
         async with self.state.vllm.train_mode():
             for offset in range(0, packed_tensors["tokens"].shape[0]):
                 for _ in range(2 if warmup else 1):
+                    if precalculate_logprobs and not warmup:
+                        # Precalculate the logprobs for the entire batch
+                        packed_tensors["logprobs"] = torch.stack(
+                            [
+                                self.state.trainer.compute_loss(
+                                    self.state.peft_model,
+                                    TrainInputs(
+                                        **{
+                                            k: v[_offset : _offset + 1]
+                                            for k, v in packed_tensors.items()
+                                            if isinstance(v, torch.Tensor)
+                                        },
+                                        config=config,
+                                        _config=_config,
+                                        return_new_logprobs=True,
+                                    ),
+                                )
+                                for _offset in range(
+                                    0, packed_tensors["tokens"].shape[0]
+                                )
+                            ]
+                        )
+                        precalculate_logprobs = False
                     self.state.inputs_queue.put_nowait(
                         TrainInputs(
                             **{
@@ -134,9 +159,9 @@ class UnslothService:
                     for task in done:
                         result = task.result()
                         # If `result` is `None`, the training task finished somehow.
-                        assert result is not None, (
-                            "The training task should never finish."
-                        )
+                        assert (
+                            result is not None
+                        ), "The training task should never finish."
                         self.results_queue.task_done()
                         if warmup:
                             from .state import free_memory

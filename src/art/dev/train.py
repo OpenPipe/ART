@@ -9,3 +9,4 @@ class TrainConfig(TypedDict, total=False):
     )  # asymmetric clip upper bound. Defaults to epsilon when None
     logprob_calculation_chunk_size: int
     plot_tensors: bool
+    precalculate_logprobs: bool
