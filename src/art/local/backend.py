@@ -113,9 +113,10 @@ class LocalBackend(Backend):
         from ..torchtune.service import TorchtuneService
         from ..unsloth.service import UnslothService
         from ..unsloth.decoupled_service import DecoupledUnslothService
+        from ..dev.get_model_config import get_model_config
 
         if model.name not in self._services:
-            config = dev.get_model_config(
+            config = get_model_config(
                 base_model=model.base_model,
                 output_dir=get_model_dir(model=model, art_path=self._path),
                 config=model._internal_config,

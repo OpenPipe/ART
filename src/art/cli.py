@@ -1,5 +1,7 @@
 from fastapi import FastAPI, Body
 from fastapi.responses import StreamingResponse
+from fastapi import Request
+from fastapi.responses import JSONResponse
 import json
 import pydantic
 import socket
@@ -13,6 +15,7 @@ from .model import Model, TrainableModel
 from .trajectories import TrajectoryGroup
 from .types import TrainConfig
 from .utils.deploy_model import LoRADeploymentProvider
+from .errors import ARTError
 
 app = typer.Typer()
 
@@ -44,6 +47,12 @@ def run(host: str = "0.0.0.0", port: int = 7999) -> None:
 
     backend = LocalBackend()
     app = FastAPI()
+
+    # Add exception handler for ARTError
+    @app.exception_handler(ARTError)
+    async def art_error_handler(request: Request, exc: ARTError):
+        return JSONResponse(status_code=exc.status_code, content={"detail": exc.detail})
+
     app.get("/healthcheck")(lambda: {"status": "ok"})
     app.post("/close")(backend.close)
     app.post("/register")(backend.register)

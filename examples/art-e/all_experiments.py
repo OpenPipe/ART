@@ -67,9 +67,6 @@ models["202"].name = "email-agent-202"
 # Enable the new flag
 models["202"].config.use_judge_group_variant = "v1"
 
-models["203"] = models["201"].model_copy(deep=True)
-models["203"].name = "email-agent-203"
-
 # Model 204: like 202 but with judge-group rescoring variant v2
 models["204"] = models["202"].model_copy(deep=True)
 models["204"].name = "email-agent-204"

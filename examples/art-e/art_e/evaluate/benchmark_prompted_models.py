@@ -20,15 +20,16 @@ generate_database()
 MODELS_TO_BENCHMARK = [
     # ("gpt-4o", "openai/gpt-4o"),
     # ("gpt-4.1-mini", "openai/gpt-4.1-mini"),
-    ("gpt-4.1", "openai/gpt-4.1"),
-    ("o4-mini", "openai/o4-mini"),
-    ("o3", "openai/o3"),
-    ("qwen3-235b", "openrouter/qwen/qwen3-235b-a22b"),
-    ("qwen3-32b", "openrouter/qwen/qwen3-32b"),
+    # ("gpt-4.1", "openai/gpt-4.1"),
+    # ("o4-mini", "openai/o4-mini"),
+    # ("o3", "openai/o3"),
+    # ("qwen3-235b", "openrouter/qwen/qwen3-235b-a22b"),
+    # ("qwen3-32b", "openrouter/qwen/qwen3-32b"),
     # ("deepseek-r1", "openrouter/deepseek-ai/DeepSeek-R1"),
-    ("gemini-2.5-flash", "gemini/gemini-2.5-flash"),
-    ("sonnet 4", "openrouter/anthropic/claude-sonnet-4"),
-    ("gemini-2.5-pro", "gemini/gemini-2.5-pro"),
+    # ("gemini-2.5-flash", "gemini/gemini-2.5-flash"),
+    # ("sonnet 4", "openrouter/anthropic/claude-sonnet-4"),
+    # ("gemini-2.5-pro", "gemini/gemini-2.5-pro"),
+    ("kimi-k2", "openrouter/moonshotai/kimi-k2"),
 ]
 
 TEST_SET_ENTRIES = 100

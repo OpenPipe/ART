@@ -1,6 +1,5 @@
 from .engine import EngineArgs
 from .model import (
-    get_model_config,
     InternalModelConfig,
     InitArgs,
     PeftArgs,
@@ -12,7 +11,6 @@ from .train import TrainConfig
 
 __all__ = [
     "EngineArgs",
-    "get_model_config",
     "InternalModelConfig",
     "InitArgs",
     "PeftArgs",

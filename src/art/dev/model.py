@@ -1,122 +1,108 @@
-import torch
-from transformers.debug_utils import DebugOption
-from transformers.training_args import OptimizerNames
-from transformers.trainer_utils import (
-    FSDPOption,
-    HubStrategy,
-    IntervalStrategy,
-    SaveStrategy,
-    SchedulerType,
-)
+from enum import Enum
 from typing_extensions import TypedDict
 
 from .engine import EngineArgs
 from .torchtune import TorchtuneArgs
 
 
-def get_model_config(
-    base_model: str,
-    output_dir: str,
-    config: "InternalModelConfig | None",
-) -> "InternalModelConfig":
-    from ..local.checkpoints import get_last_checkpoint_dir
+# Vendored from transformers.training_args.OptimizerNames
+class OptimizerNames(str, Enum):
+    """
+    Stores the acceptable string identifiers for optimizers.
+    """
 
-    if config is None:
-        config = InternalModelConfig()
-    enable_sleep_mode = config.get("engine_args", {}).get("enable_sleep_mode", True)
-    init_args = InitArgs(
-        model_name=base_model,
-        max_seq_length=32768,
-        load_in_4bit=True,  # False for LoRA 16bit
-        fast_inference=True,  # Enable vLLM fast inference
-        # vLLM args
-        disable_log_stats=False,
-        enable_prefix_caching=True,
-        gpu_memory_utilization=(
-            0.79 if enable_sleep_mode else 0.55
-        ),  # Reduce if out of memory
-        max_lora_rank=8,
-        use_async=True,
-    )
-    if config.get("_decouple_vllm_and_unsloth", False):
-        init_args["fast_inference"] = False
-        init_args.pop("disable_log_stats")
-        init_args.pop("enable_prefix_caching")
-        init_args.pop("gpu_memory_utilization")
-        init_args.pop("max_lora_rank")
-        init_args.pop("use_async")
-    engine_args = EngineArgs(
-        disable_log_requests=True,
-        # Multi-step processing is not supported for the Xformers attention backend
-        # which is the fallback for devices with compute capability < 8.0
-        num_scheduler_steps=(
-            16
-            if config.get("torchtune_args") is None
-            and not config.get("_decouple_vllm_and_unsloth", False)
-            and torch.cuda.get_device_capability()[0] >= 8
-            else 1
-        ),
-        enable_sleep_mode=enable_sleep_mode,
-        generation_config="vllm",
-    )
-    engine_args.update(config.get("engine_args", {}))
-    init_args.update(config.get("init_args", {}))
-    if last_checkpoint_dir := get_last_checkpoint_dir(output_dir):
-        init_args["model_name"] = last_checkpoint_dir
-        if config.get("torchtune_args") is not None:
-            engine_args["model"] = last_checkpoint_dir
-    elif config.get("torchtune_args") is not None:
-        engine_args["model"] = base_model
-    if config.get("_decouple_vllm_and_unsloth", False):
-        engine_args["model"] = base_model
-    peft_args = PeftArgs(
-        r=8,  # Choose any number > 0 ! Suggested 8, 16, 32, 64, 128
-        target_modules=[
-            "q_proj",
-            "k_proj",
-            "v_proj",
-            "o_proj",
-            "gate_proj",
-            "up_proj",
-            "down_proj",
-        ],  # Remove QKVO if out of memory
-        lora_alpha=16,
-        # Enable long context finetuning
-        use_gradient_checkpointing="unsloth",  # type: ignore
-        random_state=3407,
-    )
-    peft_args.update(config.get("peft_args", {}))
-    trainer_args = TrainerArgs(
-        learning_rate=5e-6,
-        adam_beta1=0.9,
-        adam_beta2=0.99,
-        weight_decay=0.1,
-        lr_scheduler_type="constant",
-        optim="paged_adamw_8bit",
-        logging_steps=1,
-        per_device_train_batch_size=2,
-        gradient_accumulation_steps=1,  # Increase to 4 for smoother training
-        num_generations=2,  # Decrease if out of memory
-        max_grad_norm=0.1,
-        save_strategy="no",
-        output_dir=output_dir,
-        disable_tqdm=True,
-        report_to="none",
-    )
-    trainer_args.update(config.get("trainer_args", {}))
-    if config.get("torchtune_args") is not None:
-        torchtune_args = TorchtuneArgs(model="qwen3_32b", model_type="QWEN3")
-        torchtune_args.update(config.get("torchtune_args", {}) or {})
-    else:
-        torchtune_args = None
-    return InternalModelConfig(
-        init_args=init_args,
-        engine_args=engine_args,
-        peft_args=peft_args,
-        trainer_args=trainer_args,
-        torchtune_args=torchtune_args,
-        _decouple_vllm_and_unsloth=config.get("_decouple_vllm_and_unsloth", False),
-    )
+    ADAMW_TORCH = "adamw_torch"
+    ADAMW_TORCH_FUSED = "adamw_torch_fused"
+    ADAMW_TORCH_XLA = "adamw_torch_xla"
+    ADAMW_TORCH_NPU_FUSED = "adamw_torch_npu_fused"
+    ADAMW_APEX_FUSED = "adamw_apex_fused"
+    ADAFACTOR = "adafactor"
+    ADAMW_ANYPRECISION = "adamw_anyprecision"
+    ADAMW_TORCH_4BIT = "adamw_torch_4bit"
+    ADAMW_TORCH_8BIT = "adamw_torch_8bit"
+    ADEMAMIX = "ademamix"
+    SGD = "sgd"
+    ADAGRAD = "adagrad"
+    ADAMW_BNB = "adamw_bnb_8bit"
+    ADAMW_8BIT = "adamw_8bit"  # just an alias for adamw_bnb_8bit
+    ADEMAMIX_8BIT = "ademamix_8bit"
+    LION_8BIT = "lion_8bit"
+    LION = "lion_32bit"
+    PAGED_ADAMW = "paged_adamw_32bit"
+    PAGED_ADAMW_8BIT = "paged_adamw_8bit"
+    PAGED_ADEMAMIX = "paged_ademamix_32bit"
+    PAGED_ADEMAMIX_8BIT = "paged_ademamix_8bit"
+    PAGED_LION = "paged_lion_32bit"
+    PAGED_LION_8BIT = "paged_lion_8bit"
+    RMSPROP = "rmsprop"
+    RMSPROP_BNB = "rmsprop_bnb"
+    RMSPROP_8BIT = "rmsprop_bnb_8bit"
+    RMSPROP_32BIT = "rmsprop_bnb_32bit"
+    GALORE_ADAMW = "galore_adamw"
+    GALORE_ADAMW_8BIT = "galore_adamw_8bit"
+    GALORE_ADAFACTOR = "galore_adafactor"
+    GALORE_ADAMW_LAYERWISE = "galore_adamw_layerwise"
+    GALORE_ADAMW_8BIT_LAYERWISE = "galore_adamw_8bit_layerwise"
+    GALORE_ADAFACTOR_LAYERWISE = "galore_adafactor_layerwise"
+    LOMO = "lomo"
+    ADALOMO = "adalomo"
+    GROKADAMW = "grokadamw"
+    SCHEDULE_FREE_RADAM = "schedule_free_radam"
+    SCHEDULE_FREE_ADAMW = "schedule_free_adamw"
+    SCHEDULE_FREE_SGD = "schedule_free_sgd"
+    APOLLO_ADAMW = "apollo_adamw"
+    APOLLO_ADAMW_LAYERWISE = "apollo_adamw_layerwise"
+
+
+# Vendored from transformers.debug_utils.DebugOption
+class DebugOption(str, Enum):
+    UNDERFLOW_OVERFLOW = "underflow_overflow"
+    TPU_METRICS_DEBUG = "tpu_metrics_debug"
+
+
+# Vendored from transformers.trainer_utils.IntervalStrategy
+class IntervalStrategy(str, Enum):
+    NO = "no"
+    STEPS = "steps"
+    EPOCH = "epoch"
+
+
+# Vendored from transformers.trainer_utils.SaveStrategy (which is an alias for IntervalStrategy)
+SaveStrategy = IntervalStrategy
+
+
+# Vendored from transformers.trainer_utils.HubStrategy
+class HubStrategy(str, Enum):
+    END = "end"
+    EVERY_SAVE = "every_save"
+    CHECKPOINT = "checkpoint"
+    ALL_CHECKPOINTS = "all_checkpoints"
+
+
+# Vendored from transformers.trainer_utils.SchedulerType
+class SchedulerType(str, Enum):
+    LINEAR = "linear"
+    COSINE = "cosine"
+    COSINE_WITH_RESTARTS = "cosine_with_restarts"
+    POLYNOMIAL = "polynomial"
+    CONSTANT = "constant"
+    CONSTANT_WITH_WARMUP = "constant_with_warmup"
+    INVERSE_SQRT = "inverse_sqrt"
+    REDUCE_ON_PLATEAU = "reduce_lr_on_plateau"
+    COSINE_WITH_MIN_LR = "cosine_with_min_lr"
+    WARMUP_STABLE_DECAY = "warmup_stable_decay"
+    WORMHOLE = "wormhole"
+
+
+# Vendored from transformers.trainer_utils.FSDPOption
+class FSDPOption(str, Enum):
+    FULL_SHARD = "full_shard"
+    SHARD_GRAD_OP = "shard_grad_op"
+    NO_SHARD = "no_shard"
+    HYBRID_SHARD = "hybrid_shard"
+    HYBRID_SHARD_ZERO2 = "hybrid_shard_zero2"
+    OFFLOAD = "offload"
+    AUTO_WRAP = "auto_wrap"
 
 
 class InternalModelConfig(TypedDict, total=False):
@@ -263,7 +249,7 @@ class TrainerArgs(TypedDict, total=False):
     accelerator_config: dict | str | None
     deepspeed: dict | str | None
     label_smoothing_factor: float
-    optim: "OptimizerNames | str"
+    optim: OptimizerNames | str
     optim_args: str | None
     adafactor: bool
     group_by_length: bool

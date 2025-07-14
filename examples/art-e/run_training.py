@@ -1,3 +1,6 @@
+# Usage:
+# uv run run_training.py --models=207 --fast
+
 import argparse
 import sky
 from art_e.project_types import ProjectPolicyConfig
@@ -5,13 +8,14 @@ import json
 import textwrap
 import concurrent.futures
 import traceback
-from dotenv import dotenv_values
+from dotenv import dotenv_values, load_dotenv
 from sky import ClusterStatus
+import random
+import os
 
 from all_experiments import models
 
-# Usage:
-# uv run run_training.py --models=207 --fast
+load_dotenv()
 
 parser = argparse.ArgumentParser(
     description="Train one or more models (comma separated)."
@@ -27,6 +31,11 @@ parser.add_argument(
     action="store_true",
     help="Whether to use fast launch (skip setup).",
 )
+parser.add_argument(
+    "--add-suffix",
+    type=str,
+    help="Add suffix to model name. Use 'random' to generate a random suffix.",
+)
 args = parser.parse_args()
 
 # Parse and validate the requested model keys
@@ -39,8 +48,22 @@ if unknown:
 
 
 def launch_model(model_key: str):
-    model = models[model_key]
-    print(f"Launching {model_key} ({model.name}) on SkyPilot…")
+    model = models[model_key].model_copy(deep=True)
+
+    # Add suffix if requested
+    if args.add_suffix:
+        if args.add_suffix.lower() == "random":
+            # Generate a random suffix
+            suffix = f"-{random.randint(1000, 9999)}"
+            print(f"Generated random suffix: {suffix}")
+        else:
+            # Use the provided suffix
+            suffix = f"-{args.add_suffix}"
+
+        model.name = f"{model.name}{suffix}"
+        print(f"Launching {model_key} as {model.name} on SkyPilot…")
+    else:
+        print(f"Launching {model_key} ({model.name}) on SkyPilot…")
 
     if not model.config or not isinstance(model.config, ProjectPolicyConfig):
         raise ValueError(
@@ -83,6 +106,10 @@ def launch_model(model_key: str):
 
     # Generate cluster name
     cluster_name = f"art-e-{model_key}"
+    # Add cluster prefix if defined in environment
+    cluster_prefix = os.environ.get("CLUSTER_PREFIX")
+    if cluster_prefix:
+        cluster_name = f"{cluster_prefix}-{cluster_name}"
     print(f"Launching task on cluster: {cluster_name}")
 
     print("Checking for existing cluster and jobs…")
