@@ -100,8 +100,15 @@ class UnslothService:
             for offset in range(0, packed_tensors["tokens"].shape[0]):
                 for _ in range(2 if warmup else 1):
                     if precalculate_logprobs and not warmup:
+                        print("Precalculating logprobs...")
                         # Precalculate the logprobs for the entire batch
-                        packed_tensors["logprobs"] = torch.stack(
+                        print(
+                            f"Precalculating logprobs for logprobs of shape {packed_tensors['logprobs'].shape}"
+                        )
+                        print(
+                            f"Non-NaN logprobs: {packed_tensors['logprobs'].isnan().sum()}"
+                        )
+                        new_logprobs = torch.stack(
                             [
                                 self.state.trainer.compute_loss(
                                     self.state.peft_model,
@@ -114,13 +121,46 @@ class UnslothService:
                                         config=config,
                                         _config=_config,
                                         return_new_logprobs=True,
-                                    ),
+                                    ),  # type: ignore
                                 )
                                 for _offset in range(
                                     0, packed_tensors["tokens"].shape[0]
                                 )
                             ]
                         )
+
+                        print(
+                            f"Precalculated logprobs for logprobs of shape {new_logprobs.shape}"
+                        )
+                        print(f"Non-NaN logprobs: {new_logprobs.isnan().sum()}")
+
+                        # Debug: Compare with original logprobs
+                        print(
+                            f"Original logprobs range: [{packed_tensors['logprobs'].min():.3f}, {packed_tensors['logprobs'].max():.3f}]"
+                        )
+                        print(
+                            f"New logprobs range: [{new_logprobs.min():.3f}, {new_logprobs.max():.3f}]"
+                        )
+
+                        # Check for NaN differences
+                        orig_nan_mask = packed_tensors["logprobs"].isnan()
+                        new_nan_mask = new_logprobs.isnan()
+                        print(
+                            f"Original NaN count: {orig_nan_mask.sum()}, New NaN count: {new_nan_mask.sum()}"
+                        )
+
+                        # Compare non-NaN values
+                        valid_mask = ~orig_nan_mask & ~new_nan_mask
+                        if valid_mask.any():
+                            diff = (
+                                packed_tensors["logprobs"][valid_mask]
+                                - new_logprobs[valid_mask]
+                            ).abs()
+                            print(
+                                f"Logprob difference stats - Mean: {diff.mean():.3f}, Max: {diff.max():.3f}, Min: {diff.min():.3f}"
+                            )
+
+                        packed_tensors["logprobs"] = new_logprobs
                         precalculate_logprobs = False
                     self.state.inputs_queue.put_nowait(
                         TrainInputs(
@@ -141,6 +181,7 @@ class UnslothService:
                                 else config
                             ),
                             _config=_config,
+                            return_new_logprobs=False,
                         )
                     )
                     # Wait for a result from the queue or for the training task to,

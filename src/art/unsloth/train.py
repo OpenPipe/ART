@@ -95,10 +95,12 @@ def get_compute_loss_fn(trainer: "GRPOTrainer") -> Callable[..., torch.Tensor]:
             next_input_ids,
             lm_head_t,
             chunk_size=chunk_size,
+            inference_mode=return_new_logprobs,
+            no_grad=return_new_logprobs,
             reference_logprobs=False,
         )
         if return_new_logprobs:
-            return new_logprobs
+            return new_logprobs.detach().squeeze(0).to("cpu")
         if config.beta > 0.0:
             ref_logprobs, _ = calculate_logprobs(
                 autocast_dtype,
@@ -108,6 +110,8 @@ def get_compute_loss_fn(trainer: "GRPOTrainer") -> Callable[..., torch.Tensor]:
                 next_input_ids,
                 lm_head_t,
                 chunk_size=chunk_size,
+                inference_mode=True,
+                no_grad=False,
                 reference_logprobs=True,
             )
         else:
@@ -247,13 +251,16 @@ def calculate_logprobs(
     next_input_ids: torch.Tensor,
     lm_head_t: torch.Tensor,
     chunk_size: int,
+    inference_mode: bool,
+    no_grad: bool,
     reference_logprobs: bool,
 ) -> tuple[
     torch.Tensor, torch.Tensor
 ]:  # Returns (log_probs, entropy) both shape [B, S]
     with (
         torch.amp.autocast_mode.autocast(device_type="cuda", dtype=autocast_dtype),
-        torch.inference_mode() if reference_logprobs else nullcontext(),
+        torch.inference_mode() if inference_mode else nullcontext(),
+        torch.no_grad() if no_grad else nullcontext(),
         (
             trainer.accelerator.unwrap_model(
                 trainer.model, keep_fp32_wrapper=False
