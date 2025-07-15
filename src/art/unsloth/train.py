@@ -53,8 +53,8 @@ def get_compute_loss_fn(trainer: "GRPOTrainer") -> Callable[..., torch.Tensor]:
 
         # Move tensors to the correct device
         inputs = {
-            key: tensor.to(trainer.accelerator.device)
-            for key, tensor in inputs.items()  # type: ignore
+            key: tensor.to(trainer.accelerator.device)  # type: ignore
+            for key, tensor in inputs.items()
         }
 
         # Unsloth code
