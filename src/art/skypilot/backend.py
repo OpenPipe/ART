@@ -191,7 +191,7 @@ class SkyPilotBackend(Backend):
         elif os.path.exists(art_version):
             # copy the contents of the art_path onto the new machine
             task.workdir = art_version
-            art_installation_command = "uv sync"
+            art_installation_command = "uv sync --extra backend"
         else:
             raise ValueError(
                 f"Invalid art_version: {art_version}. Must be a semver or a path to a local directory."
