@@ -5,6 +5,7 @@ __pycache__/
 grpo_trainer_lora_model/
 logs/
 shared_cache.db
+data/cache.db
 streaming-chat-completions/
 unsloth_compiled_cache/
 wandb/
