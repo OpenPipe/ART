@@ -33,7 +33,13 @@ Then install the project dependencies by running `uv sync`.
 
 ### 2. Install SkyPilot/RunPod
 
-We'll be using `SkyPilotBackend` to manage the GPU that your model will be trained on. In order for the backend to work, you'll need to have SkyPilot installed on your machine and provide it with the credentials to spin up machines on at least one infra provider.
+We'll be using `SkyPilotBackend` to manage the GPU that your model will be trained on. You'll need to install ART with the SkyPilot optional dependency:
+
+```bash
+pip install openpipe-art[skypilot]
+```
+
+In order for the backend to work, you'll need to have SkyPilot installed on your machine and provide it with the credentials to spin up machines on at least one infra provider.
 
 We recommend using RunPod because of their ease of use, but any infra provider that SkyPilot [supports](https://docs.skypilot.co/en/latest/overview.html#bringing-your-infra) will work.
 
