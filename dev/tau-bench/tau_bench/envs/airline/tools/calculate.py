@@ -1,35 +1,51 @@
-# Copyright Sierra
+import ast
+import operator
 
-from typing import Any, Dict
-from tau_bench.envs.tool import Tool
+def safe_eval(expression):
+    """Safely evaluate mathematical expressions"""
+    # Whitelist of allowed operations
+    allowed_ops = {
+        ast.Add: operator.add,
+        ast.Sub: operator.sub,
+        ast.Mult: operator.mul,
+        ast.Div: operator.truediv,
+        ast.Pow: operator.pow,
+        ast.Mod: operator.mod,
+        ast.USub: operator.neg,
+        ast.UAdd: operator.pos,
+    }
+    
+    def eval_node(node):
+        if isinstance(node, ast.Num):  # Numbers
+            return node.n
+        elif isinstance(node, ast.Constant):  # Python 3.8+
+            return node.value
+        elif isinstance(node, ast.BinOp):  # Binary operations
+            left = eval_node(node.left)
+            right = eval_node(node.right)
+            op = allowed_ops.get(type(node.op))
+            if op is None:
+                raise ValueError(f"Unsupported operation: {type(node.op)}")
+            return op(left, right)
+        elif isinstance(node, ast.UnaryOp):  # Unary operations
+            operand = eval_node(node.operand)
+            op = allowed_ops.get(type(node.op))
+            if op is None:
+                raise ValueError(f"Unsupported operation: {type(node.op)}")
+            return op(operand)
+        else:
+            raise ValueError(f"Unsupported node type: {type(node)}")
+    
+    try:
+        tree = ast.parse(expression, mode='eval')
+        return eval_node(tree.body)
+    except (SyntaxError, ValueError) as e:
+        raise ValueError(f"Invalid expression: {e}")
 
-
-class Calculate(Tool):
-    @staticmethod
-    def invoke(data: Dict[str, Any], expression: str) -> str:
-        if not all(char in "0123456789+-*/(). " for char in expression):
-            return "Error: invalid characters in expression"
-        try:
-            return str(round(float(eval(expression, {"__builtins__": None}, {})), 2))
-        except Exception as e:
-            return f"Error: {e}"
-
-    @staticmethod
-    def get_info() -> Dict[str, Any]:
-        return {
-            "type": "function",
-            "function": {
-                "name": "calculate",
-                "description": "Calculate the result of a mathematical expression.",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "expression": {
-                            "type": "string",
-                            "description": "The mathematical expression to calculate, such as '2 + 2'. The expression can contain numbers, operators (+, -, *, /), parentheses, and spaces.",
-                        },
-                    },
-                    "required": ["expression"],
-                },
-            },
-        }
+def calculate(expression):
+    """Calculate the result of a mathematical expression safely"""
+    try:
+        result = safe_eval(expression)
+        return str(result)
+    except Exception as e:
+        return f"Error: {e}"
