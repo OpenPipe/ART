@@ -53,8 +53,8 @@ def get_compute_loss_fn(trainer: "GRPOTrainer") -> Callable[..., torch.Tensor]:
 
         # Move tensors to the correct device
         inputs = {
-            key: tensor.to(trainer.accelerator.device) for key, tensor in inputs.items()
-        }  # type: ignore
+            key: tensor.to(trainer.accelerator.device) for key, tensor in inputs.items()  # type: ignore
+        }
 
         # Unsloth code
         autocast_dtype = (
@@ -100,7 +100,7 @@ def get_compute_loss_fn(trainer: "GRPOTrainer") -> Callable[..., torch.Tensor]:
             reference_logprobs=False,
         )
         if return_new_logprobs:
-            return new_logprobs.detach().squeeze(0).to("cpu")
+            return torch.nn.functional.pad(new_logprobs[:, :-1], (1, 0), value=0.0)
         if config.beta > 0.0:
             ref_logprobs, _ = calculate_logprobs(
                 autocast_dtype,
@@ -269,7 +269,7 @@ def calculate_logprobs(
             else nullcontext()
         ),
     ):
-        hidden_states = trainer.model(
+        hidden_states = trainer.model(  # type: ignore
             input_ids=input_ids, causal_mask=causal_mask
         ).logits  # Shape [B, S, H]
     return _calculate_logprobs(lm_head_t, hidden_states, next_input_ids, chunk_size)
