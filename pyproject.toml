@@ -1,6 +1,6 @@
 [project]
 name = "openpipe-art"
-version = "0.4.1"
+version = "0.4.2"
 description = "The OpenPipe Agent Reinforcement Training (ART) library"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -25,11 +25,12 @@ backend = [
     "setproctitle>=1.3.6",
     "weave>=0.51.51",
     "tblib>=3.0.0",
-    "semver>=3.0.4",
     "setuptools>=78.1.0",
     "wandb>=0.19.8",
     "polars>=1.26.0",
 ]
+
+skypilot = ["semver>=3.0.4", "skypilot==0.9.3"]
 
 [project.scripts]
 art = "art.cli:app"
@@ -57,7 +58,6 @@ dev-dependencies = [
     "openpipe>=4.49.0",
     "hatch>=1.14.1",
     "ruff>=0.12.1",
-    "skypilot[cudo,do,fluidstack,gcp,lambda,paperspace,runpod]==0.8.0",
 ]
 
 [tool.uv.sources]

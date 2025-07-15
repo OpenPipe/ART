@@ -19,7 +19,7 @@ args = parser.parse_args()
 
 async def stop_server() -> None:
     cluster_status = await to_thread_typed(
-        lambda: sky.status(cluster_names=[args.cluster])
+        lambda: sky.stream_and_get(sky.status(cluster_names=[args.cluster]))
     )
     if len(cluster_status) == 0 or cluster_status[0]["status"] != sky.ClusterStatus.UP:
         raise ValueError(f"Cluster {args.cluster} is not running")

@@ -41,7 +41,13 @@ await model.register(backend)
 
 ### Running the client locally and connecting to a remote server
 
-The ART client can also be run locally and connected to a remote server, which ART will automatically provision for you.
+The ART client can also be run locally and connected to a remote server, which ART will automatically provision for you. To use SkyPilot, you'll need to install the optional dependency:
+
+```bash
+pip install openpipe-art[skypilot]
+```
+
+Then you can use SkyPilotBackend in your code:
 
 ```python
 from art import TrainableModel, gather_trajectory_groups
