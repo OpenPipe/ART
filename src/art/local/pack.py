@@ -118,6 +118,14 @@ def packed_tensors_from_tokenized_results(
     weights_tensor[assistant_mask_tensor] /= weights_tensor[
         assistant_mask_tensor
     ].mean()
+    advantages_tensor = torch.tensor(pad(advantages, 0.0))
+    advantages_tensor = torch.where(
+        assistant_mask_tensor, advantages_tensor, torch.zeros_like(advantages_tensor)
+    )
+    advantages_tensor[assistant_mask_tensor] /= (
+        advantages_tensor[assistant_mask_tensor].abs()
+        * weights_tensor[assistant_mask_tensor]
+    ).mean()
 
     return {
         "tokens": torch.tensor(pad(token_ids, pad_token_id)),
@@ -126,7 +134,7 @@ def packed_tensors_from_tokenized_results(
         "input_pos": torch.tensor(pad(input_pos, 0)),
         "assistant_mask": assistant_mask_tensor,
         "logprobs": torch.tensor(pad(logprobs, float("nan"))),
-        "advantages": torch.tensor(pad(advantages, 0.0)),
+        "advantages": advantages_tensor,
         "weights": weights_tensor,
     }
 

@@ -40,6 +40,7 @@ def tokenize_trajectory_groups(
     tokenizer: "PreTrainedTokenizerBase",
     trajectory_groups: list[TrajectoryGroup],
     allow_training_without_logprobs: bool,
+    scale_rewards: bool,
 ) -> Generator["TokenizedResult", None, None]:
     for group in trajectory_groups:
         if not group:
@@ -53,7 +54,9 @@ def tokenize_trajectory_groups(
         )
         for trajectory in group:
             # Calculate GRPO advantage for this trajectory
-            advantage = (trajectory.reward - reward_mean) / (reward_std + 1e-6)
+            advantage = trajectory.reward - reward_mean
+            if scale_rewards:
+                advantage /= reward_std + 1e-6
             # Skip trajectories with no advantage
             if advantage == 0:
                 continue
@@ -179,9 +182,9 @@ def tokenize_trajectory(
         if isinstance(message_or_choice, dict):
             continue
         choice = message_or_choice
-        assert choice.logprobs or allow_training_without_logprobs, (
-            "Chat completion choices must have logprobs"
-        )
+        assert (
+            choice.logprobs or allow_training_without_logprobs
+        ), "Chat completion choices must have logprobs"
         if not choice.logprobs:
             continue
         token_logprobs = choice.logprobs.content or choice.logprobs.refusal or []

@@ -158,6 +158,7 @@ class LocalBackend(Backend):
         model: TrainableModel,
         trajectory_groups: list[TrajectoryGroup],
         allow_training_without_logprobs: bool,
+        scale_rewards: bool,
         plot_tensors: bool,
     ) -> PackedTensors | None:
         if model.base_model not in self._tokenizers:
@@ -170,6 +171,7 @@ class LocalBackend(Backend):
                 tokenizer,
                 trajectory_groups,
                 allow_training_without_logprobs,
+                scale_rewards,
             )
         )
         if not tokenized_results:
@@ -339,6 +341,7 @@ class LocalBackend(Backend):
             allow_training_without_logprobs=dev_config.get(
                 "allow_training_without_logprobs", False
             ),
+            scale_rewards=dev_config.get("scale_rewards", True),
             plot_tensors=dev_config.get("plot_tensors", False),
         )
         if packed_tensors is None:
@@ -368,9 +371,9 @@ class LocalBackend(Backend):
             num_gradient_steps = int(
                 result.pop("num_gradient_steps", estimated_gradient_steps)
             )
-            assert num_gradient_steps == estimated_gradient_steps, (
-                f"num_gradient_steps {num_gradient_steps} != estimated_gradient_steps {estimated_gradient_steps}"
-            )
+            assert (
+                num_gradient_steps == estimated_gradient_steps
+            ), f"num_gradient_steps {num_gradient_steps} != estimated_gradient_steps {estimated_gradient_steps}"
             results.append(result)
             yield {**result, "num_gradient_steps": num_gradient_steps}
             pbar.update(1)

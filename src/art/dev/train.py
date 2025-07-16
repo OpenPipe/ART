@@ -10,3 +10,4 @@ class TrainConfig(TypedDict, total=False):
     logprob_calculation_chunk_size: int
     plot_tensors: bool
     precalculate_logprobs: bool
+    scale_rewards: bool
