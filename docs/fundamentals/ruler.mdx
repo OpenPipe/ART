@@ -9,8 +9,20 @@ description: "Learn how to use RULER to automatically reward your agents."
 RULER (Relative Universal LLM-Elicited Rewards) is a general-purpose reward function that uses an LLM-as-judge to rank multiple agent trajectories. It requires no labeled data, expert feedback, or hand-crafted reward functions, yet reliably improves agent performance.
 
 <div align="center">
-  <img src="/images/ruler-results.png" alt="RULER Performance Results" style={{maxWidth: "100%", height: "auto"}} />
-  <p><em>RULER performance across multiple tasks at launch. In 3 out of 4 tasks, models trained with RULER slightly outperform those trained with hand-crafted reward functions. See the full <a href="https://openpipe.ai/blog/ruler">launch announcement</a> for details.</em></p>
+  <img
+    src="/images/ruler-results.png"
+    alt="RULER Performance Results"
+    style={{ maxWidth: "100%", height: "auto" }}
+  />
+  <p>
+    <em>
+      RULER performance across multiple tasks at launch. In 3 out of 4 tasks,
+      models trained with RULER slightly outperform those trained with
+      hand-crafted reward functions. See the full{" "}
+      <a href="https://openpipe.ai/blog/ruler">launch announcement</a> for
+      details.
+    </em>
+  </p>
 </div>
 
 ## Key Benefits
@@ -28,6 +40,7 @@ RULER leverages two key insights:
 2. **GRPO only needs relative scores**: Since GRPO normalizes scores within each group, only the relative rankings matter, not absolute values
 
 The process:
+
 1. Generate N trajectories for a given scenario
 2. Pass all N trajectories to RULER
 3. RULER deduplicates common prefixes (e.g., identical system messages)
@@ -74,7 +87,7 @@ async def main():
         {"role": "system", "content": "You are a comedy writer. Generate funny jokes based on the given topic."},
         {"role": "user", "content": "Tell me a funny joke about computers"}
     ]
-    
+
     # Create three trajectories with different quality responses
     good_trajectory = art.Trajectory(
         messages_and_choices=[
@@ -86,7 +99,7 @@ async def main():
         ],
         reward=0.0
     )
-    
+
     mediocre_trajectory = art.Trajectory(
         messages_and_choices=[
             *initial_messages,
@@ -97,7 +110,7 @@ async def main():
         ],
         reward=0.0
     )
-    
+
     off_topic_trajectory = art.Trajectory(
         messages_and_choices=[
             *initial_messages,
@@ -108,11 +121,11 @@ async def main():
         ],
         reward=0.0
     )
-    
+
     # Create a TrajectoryGroup and use RULER to score
     group = art.TrajectoryGroup([good_trajectory, mediocre_trajectory, off_topic_trajectory])
     judged_group = await ruler_score_group(group, "openai/o3", debug=True)
-    
+
     # Display rankings
     if judged_group:
         sorted_trajectories = sorted(judged_group.trajectories, key=lambda t: t.reward, reverse=True)
@@ -276,6 +289,37 @@ await model.train(groups)
 
 The `swallow_exceptions=True` parameter is recommended in production to handle judge API failures gracefully - groups that fail to be judged are simply filtered out rather than crashing the training loop.
 
+## Combining RULER with Independent Rewards
+
+While not usually necessary, RULER can be easily combined with other reward functions that judge trajectories independently. You can calculate independent rewards before applying RULER during the rollout function, or calculate and combine them afterward. Either of these approaches allow you to combine hand-crafted rewards with RULER's general-purpose scoring.
+
+### Preserving Original Rewards
+
+If you assign rewards within your rollout function, RULER preserves them under the "independent_reward" metric:
+
+```python
+# Your trajectories already have rewards from rollout
+judged_group = await ruler_score_group(group, "openai/o3", debug=True)
+
+# Combine RULER scores with original rewards
+for traj in judged_group.trajectories:
+    traj.reward += traj.metrics["independent_reward"]
+```
+
+### Adding Independent Rewards After Judging
+
+Additionally, you can adjust rewards after calling `ruler_score_group`:
+
+```python
+# Score with RULER first
+judged_group = await ruler_score_group(group, "openai/o3", debug=True)
+
+# Add your own scoring on top
+for traj in judged_group.trajectories:
+    independent_reward = score(traj)  # Your custom scoring function
+    traj.reward += independent_reward
+```
+
 ## Performance Tips
 
 - **Caching**: RULER automatically caches judge responses to disk to avoid redundant API calls
@@ -285,15 +329,18 @@ The `swallow_exceptions=True` parameter is recommended in production to handle j
 ## Troubleshooting
 
 ### Low scores for all trajectories
+
 - Check that your system prompt clearly defines the task
 - Ensure trajectories are actually attempting the task
 - Try the default rubric before customizing
 
 ### Inconsistent rankings
+
 - Increase group size for more stable relative rankings
 - Use a more capable judge model
 - Add more specific criteria to your rubric
 
 ### High API costs
+
 - Use cheaper judge models (e.g., Qwen3 32B)
 - Reduce group size
