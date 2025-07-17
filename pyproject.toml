@@ -30,7 +30,7 @@ backend = [
     "polars>=1.26.0",
 ]
 
-skypilot = ["semver>=3.0.4", "skypilot==0.9.3"]
+skypilot = ["semver>=3.0.4", "skypilot[cudo,do,fluidstack,gcp,lambda,paperspace,runpod]==0.9.3"]
 
 [project.scripts]
 art = "art.cli:app"
