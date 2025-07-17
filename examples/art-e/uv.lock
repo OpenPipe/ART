@@ -3198,7 +3198,7 @@ wheels = [
 
 [[package]]
 name = "openpipe-art"
-version = "0.4.0"
+version = "0.4.2"
 source = { editable = "../../" }
 dependencies = [
     { name = "litellm" },
@@ -3214,7 +3214,6 @@ backend = [
     { name = "hf-xet" },
     { name = "peft" },
     { name = "polars" },
-    { name = "semver" },
     { name = "setproctitle" },
     { name = "setuptools", version = "79.0.1", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.12'" },
     { name = "setuptools", version = "80.9.0", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.12'" },
@@ -3246,9 +3245,10 @@ requires-dist = [
     { name = "peft", marker = "extra == 'backend'", specifier = ">=0.14.0" },
     { name = "polars", marker = "extra == 'backend'", specifier = ">=1.26.0" },
     { name = "seaborn", marker = "extra == 'plotting'", specifier = ">=0.13.2" },
-    { name = "semver", marker = "extra == 'backend'", specifier = ">=3.0.4" },
+    { name = "semver", marker = "extra == 'skypilot'", specifier = ">=3.0.4" },
     { name = "setproctitle", marker = "extra == 'backend'", specifier = ">=1.3.6" },
     { name = "setuptools", marker = "extra == 'backend'", specifier = ">=78.1.0" },
+    { name = "skypilot", marker = "extra == 'skypilot'", specifier = "==0.9.3" },
     { name = "tblib", marker = "extra == 'backend'", specifier = ">=3.0.0" },
     { name = "torch", marker = "extra == 'backend'", specifier = ">=2.7.0" },
     { name = "torchao", marker = "extra == 'backend'", specifier = ">=0.9.0" },
@@ -3261,7 +3261,7 @@ requires-dist = [
     { name = "wandb", marker = "extra == 'backend'", specifier = ">=0.19.8" },
     { name = "weave", marker = "extra == 'backend'", specifier = ">=0.51.51" },
 ]
-provides-extras = ["plotting", "backend"]
+provides-extras = ["plotting", "backend", "skypilot"]
 
 [package.metadata.requires-dev]
 dev = [
@@ -3271,7 +3271,6 @@ dev = [
     { name = "ipywidgets", specifier = ">=8.1.5" },
     { name = "openpipe", specifier = ">=4.49.0" },
     { name = "ruff", specifier = ">=0.12.1" },
-    { name = "skypilot", extras = ["cudo", "do", "fluidstack", "gcp", "lambda", "paperspace", "runpod"], specifier = "==0.8.0" },
 ]
 
 [[package]]
@@ -5125,15 +5124,6 @@ dependencies = [
 sdist = { url = "https://files.pythonhosted.org/packages/86/59/a451d7420a77ab0b98f7affa3a1d78a313d2f7281a57afb1a34bae8ab412/seaborn-0.13.2.tar.gz", hash = "sha256:93e60a40988f4d65e9f4885df477e2fdaff6b73a9ded434c1ab356dd57eefff7", size = 1457696, upload-time = "2024-01-25T13:21:52.551Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/83/11/00d3c3dfc25ad54e731d91449895a79e4bf2384dc3ac01809010ba88f6d5/seaborn-0.13.2-py3-none-any.whl", hash = "sha256:636f8336facf092165e27924f223d3c62ca560b1f2bb5dff7ab7fad265361987", size = 294914, upload-time = "2024-01-25T13:21:49.598Z" },
-]
-
-[[package]]
-name = "semver"
-version = "3.0.4"
-source = { registry = "https://pypi.org/simple" }
-sdist = { url = "https://files.pythonhosted.org/packages/72/d1/d3159231aec234a59dd7d601e9dd9fe96f3afff15efd33c1070019b26132/semver-3.0.4.tar.gz", hash = "sha256:afc7d8c584a5ed0a11033af086e8af226a9c0b206f313e0301f8dd7b6b589602", size = 269730, upload-time = "2025-01-24T13:19:27.617Z" }
-wheels = [
-    { url = "https://files.pythonhosted.org/packages/a6/24/4d91e05817e92e3a61c8a21e08fd0f390f5301f1c448b137c57c4bc6e543/semver-3.0.4-py3-none-any.whl", hash = "sha256:9c824d87ba7f7ab4a1890799cec8596f15c1241cb473404ea1cb0c55e4b04746", size = 17912, upload-time = "2025-01-24T13:19:24.949Z" },
 ]
 
 [[package]]

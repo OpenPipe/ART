@@ -7,7 +7,7 @@ from rollout import rollout
 from art_e.data.query_iterators import load_synthetic_queries
 from art_e.data.types_enron import SyntheticQuery
 from art_e.data.local_email_db import generate_database
-from art.utils import iterate_dataset
+from art.utils import iterate_dataset, adjust_lr
 from art_e.project_types import ProjectPolicyConfig
 from art_e.evaluate.benchmark import benchmark_model
 import os
@@ -139,13 +139,20 @@ async def train(model: art.TrainableModel[ProjectPolicyConfig]):
                     )
                     continue  # Proceed to next batch/epoch without training.
 
+            # Calculate learning rate for this batch
+            current_lr = adjust_lr(
+                batch,
+                learning_rate=model.config.learning_rate,
+                warmup_length=model.config.warmup_length,
+                cooldown_length=model.config.cooldown_length,
+            )
+
             await model.train(
                 groups,
-                config=art.TrainConfig(learning_rate=model.config.learning_rate),
+                config=art.TrainConfig(learning_rate=current_lr),
                 _config=art.dev.TrainConfig(
-                    allow_training_without_logprobs=True
-                    if model.config.messages_only
-                    else False
+                    allow_training_without_logprobs=model.config.messages_only,
+                    precalculate_logprobs=model.config.precalculate_logprobs,
                 ),
             )
 
