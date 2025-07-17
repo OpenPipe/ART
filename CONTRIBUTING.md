@@ -59,7 +59,7 @@ To create a new release:
 4. **Commit and tag the version**:
 
    ```bash
-   git add pyproject.toml
+   git add pyproject.toml uv.lock
    git commit -m "Bump version to X.Y.Z"
    git tag vX.Y.Z
    git push origin main vX.Y.Z
