@@ -122,19 +122,25 @@ def packed_tensors_from_tokenized_results(
     advantages_tensor = torch.where(
         assistant_mask_tensor, advantages_tensor, torch.zeros_like(advantages_tensor)
     )
-    advantage_balance = -0.5
-    if advantage_balance > 0.0:
-        advantages_tensor = torch.where(
-            advantages_tensor > 0,
-            advantages_tensor,
-            advantages_tensor * (1 - advantage_balance),
-        )
-    elif advantage_balance < 0.0:
-        advantages_tensor = torch.where(
-            advantages_tensor < 0,
-            advantages_tensor,
-            advantages_tensor * (1 + advantage_balance),
-        )
+    positive_advantage_weight = 0.1
+    advantages_tensor = torch.where(
+        advantages_tensor > 0,
+        advantages_tensor * positive_advantage_weight,
+        advantages_tensor,
+    )
+    # advantage_balance = -0.5
+    # if advantage_balance > 0.0:
+    #     advantages_tensor = torch.where(
+    #         advantages_tensor > 0,
+    #         advantages_tensor,
+    #         advantages_tensor * (1 - advantage_balance),
+    #     )
+    # elif advantage_balance < 0.0:
+    #     advantages_tensor = torch.where(
+    #         advantages_tensor < 0,
+    #         advantages_tensor,
+    #         advantages_tensor * (1 + advantage_balance),
+    #     )
     advantages_tensor[assistant_mask_tensor] /= (
         advantages_tensor[assistant_mask_tensor].abs()
         * weights_tensor[assistant_mask_tensor]
