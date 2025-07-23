@@ -3,8 +3,6 @@ title: Checkpoint Forking
 description: Learn how to fork training from existing model checkpoints
 ---
 
-# Checkpoint Forking
-
 <Frame caption="Run 206 had a catastrophic failure. We fixed it by forking into run 230 before the point of collapse.">
   <img
     src="/images/forked-run.webp"
@@ -20,7 +18,8 @@ Checkpoint forking allows you to create a new training run that starts from an e
 - You need to branch off multiple experiments from the same checkpoint
 
 <Note>
-This feature is marked as experimental because we're still refining the API shape. However, the core functionality will remain stable.
+  This feature is marked as experimental because we're still refining the API
+  shape. However, the core functionality will remain stable.
 </Note>
 
 ## Basic Usage
@@ -47,7 +46,7 @@ async def train():
             not_after_step=500,  # Use checkpoint at or before step 500
             verbose=True,
         )
-        
+
         # Register and continue training
         await model.register(backend)
         # ... rest of training code
@@ -70,18 +69,23 @@ await backend._experimental_fork_checkpoint(
 ## Parameters
 
 ### `from_model` (required)
+
 The name of the model to fork from.
 
 ### `from_project` (optional)
+
 The project containing the model to fork from. Defaults to the current model's project.
 
 ### `from_s3_bucket` (optional)
+
 S3 bucket to pull the checkpoint from. If not provided, will look for the checkpoint locally.
 
 ### `not_after_step` (optional)
+
 The maximum step number to use. The function will use the latest checkpoint that is less than or equal to this step. If not provided, uses the latest available checkpoint.
 
 ### `verbose` (optional)
+
 Whether to print detailed progress information during the forking process.
 
 ## How It Works
@@ -120,7 +124,7 @@ async def experiment():
             verbose=True,
         )
         await model.register(backend)
-        
+
         # Now train with a lower learning rate
         # ... training code with different configs
 ```
