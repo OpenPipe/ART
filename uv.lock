@@ -3474,6 +3474,7 @@ dependencies = [
     { name = "litellm" },
     { name = "openai" },
     { name = "typer" },
+    { name = "weave" },
 ]
 
 [package.optional-dependencies]
@@ -3495,7 +3496,6 @@ backend = [
     { name = "unsloth-zoo" },
     { name = "vllm" },
     { name = "wandb" },
-    { name = "weave" },
 ]
 plotting = [
     { name = "matplotlib" },
@@ -3542,7 +3542,7 @@ requires-dist = [
     { name = "unsloth-zoo", marker = "extra == 'backend'", specifier = "==2025.6.8" },
     { name = "vllm", marker = "extra == 'backend'", specifier = "==0.9.1" },
     { name = "wandb", marker = "extra == 'backend'", specifier = ">=0.19.8" },
-    { name = "weave", marker = "extra == 'backend'", specifier = ">=0.51.51" },
+    { name = "weave", specifier = ">=0.51.51" },
 ]
 provides-extras = ["plotting", "backend", "skypilot"]
 
