@@ -1,3 +1,4 @@
+from typing import Literal
 from typing_extensions import TypedDict
 
 
@@ -11,6 +12,7 @@ positive advantages. Defaults to 0.0 (perfectly balanced)."""
     epsilon_high: (
         float | None
     )  # asymmetric clip upper bound. Defaults to epsilon when None
+    importance_sampling_level: Literal["token", "sequence"]
     logprob_calculation_chunk_size: int
     plot_tensors: bool
     precalculate_logprobs: bool
