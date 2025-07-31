@@ -1,4 +1,6 @@
 import httpx
+import os
+import shutil
 from openai import AsyncOpenAI, DefaultAsyncHttpxClient
 from pydantic import BaseModel
 from typing import TYPE_CHECKING, cast, Generic, Iterable, Optional, overload, TypeVar
@@ -8,6 +10,7 @@ from . import dev
 from .openai import patch_openai
 from .trajectories import Trajectory, TrajectoryGroup
 from .types import TrainConfig
+from .utils.output_dirs import get_models_dir, get_model_dir
 
 if TYPE_CHECKING:
     from art.backend import Backend
@@ -30,22 +33,26 @@ class Model(
 
     You can instantiate a prompted model like so:
 
-    ``python model = art.Model(
-        name="gpt-4.1", project="my-project",
+    ```python
+    model = art.Model(
+        name="gpt-4.1",
+        project="my-project",
         inference_api_key=os.getenv("OPENAI_API_KEY"),
         inference_base_url="https://api.openai.com/v1/",
     )
-    ``
+    ```
 
     Or, if you're pointing at OpenRouter:
 
-    ``python model = art.Model(
-        name="gemini-2.5-pro", project="my-project",
+    ```python
+    model = art.Model(
+        name="gemini-2.5-pro",
+        project="my-project",
         inference_api_key=os.getenv("OPENROUTER_API_KEY"),
         inference_base_url="https://openrouter.ai/api/v1",
         inference_model_name="google/gemini-2.5-pro-preview-03-25",
     )
-    ``
+    ```
 
     For trainable (`art.TrainableModel`) models the inference values will be
     populated automatically by `model.register(api)` so you generally don't need
@@ -227,9 +234,9 @@ class Model(
         )
 
 
-# ---------------------------------------------------------------------------
+# --------------------------------------------------------------------------
 # Trainable models
-# ---------------------------------------------------------------------------
+# --------------------------------------------------------------------------
 
 
 class TrainableModel(Model[ModelConfig], Generic[ModelConfig]):
@@ -354,3 +361,46 @@ class TrainableModel(Model[ModelConfig], Generic[ModelConfig]):
             self, list(trajectory_groups), config, _config or {}, verbose
         ):
             pass
+
+
+def _get_trash_dir(project_name: str) -> str:
+    models_dir = get_models_dir(project_name)
+    return os.path.join(models_dir, ".trash")
+
+
+def move_to_trash(project_name: str, model_name: str):
+    model_dir = get_model_dir(Model(name=model_name, project=project_name, config=None))
+    if not os.path.exists(model_dir):
+        raise FileNotFoundError(f"Model '{model_name}' not found in project '{project_name}'.")
+
+    trash_dir = _get_trash_dir(project_name)
+    os.makedirs(trash_dir, exist_ok=True)
+
+    shutil.move(model_dir, os.path.join(trash_dir, model_name))
+
+
+def list_trash(project_name: str) -> list[str]:
+    trash_dir = _get_trash_dir(project_name)
+    if not os.path.exists(trash_dir):
+        return []
+    return os.listdir(trash_dir)
+
+
+def restore_from_trash(project_name: str, model_name: str):
+    trash_dir = _get_trash_dir(project_name)
+    trashed_model_path = os.path.join(trash_dir, model_name)
+    if not os.path.exists(trashed_model_path):
+        raise FileNotFoundError(f"Model '{model_name}' not found in trash.")
+
+    models_dir = get_models_dir(project_name)
+    shutil.move(trashed_model_path, os.path.join(models_dir, model_name))
+
+
+def empty_trash(project_name: str):
+    trash_dir = _get_trash_dir(project_name)
+    if os.path.exists(trash_dir):
+        shutil.rmtree(trash_dir)
+
+
+def delete_model(project_name: str, model_name: str):
+    move_to_trash(project_name, model_name)

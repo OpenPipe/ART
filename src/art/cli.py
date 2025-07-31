@@ -11,7 +11,7 @@ import uvicorn
 
 from . import dev
 from .local import LocalBackend
-from .model import Model, TrainableModel
+from .model import Model, TrainableModel, list_trash, restore_from_trash, empty_trash, delete_model
 from .trajectories import TrajectoryGroup, AsyncTrajectoryGroup
 from .types import TrainConfig
 from .utils.deploy_model import LoRADeploymentProvider
@@ -139,3 +139,38 @@ def run(host: str = "0.0.0.0", port: int = 7999) -> None:
         )
 
     uvicorn.run(app, host=host, port=port, loop="asyncio")
+
+@app.command()
+def delete(project_name: str, model_name: str):
+    """Move a model to the trash."""
+    try:
+        delete_model(project_name, model_name)
+        print(f"Model '{model_name}' in project '{project_name}' moved to trash.")
+    except FileNotFoundError as e:
+        print(e)
+
+@app.command()
+def list_trashed_models(project_name: str):
+    """List models in the trash."""
+    trashed_models = list_trash(project_name)
+    if not trashed_models:
+        print("Trash is empty.")
+    else:
+        print("Models in trash:")
+        for model_name in trashed_models:
+            print(f"- {model_name}")
+
+@app.command()
+def restore_model(project_name: str, model_name: str):
+    """Restore a model from the trash."""
+    try:
+        restore_from_trash(project_name, model_name)
+        print(f"Model '{model_name}' in project '{project_name}' restored.")
+    except FileNotFoundError as e:
+        print(e)
+
+@app.command()
+def empty_trashed_models(project_name: str):
+    """Permanently delete all models in the trash."""
+    empty_trash(project_name)
+    print("Trash has been emptied.")
