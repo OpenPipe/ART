@@ -119,7 +119,7 @@ class TrajectoryGroup(pydantic.BaseModel):
     def __init__(
         self,
         trajectories: (
-            Iterable[Trajectory | BaseException] | Iterable[Awaitable[Trajectory]]
+            Iterable[Trajectory | BaseException]
         ),
         *,
         exceptions: list[BaseException] = [],
@@ -158,13 +158,15 @@ class TrajectoryGroup(pydantic.BaseModel):
     def __len__(self) -> int:
         return len(self.trajectories)
 
+
+class AsyncTrajectoryGroup(TrajectoryGroup):
     @overload
     def __new__(
         cls,
         trajectories: Iterable[Trajectory | BaseException],
         *,
         exceptions: list[BaseException] = [],
-    ) -> "TrajectoryGroup": ...
+    ) -> "AsyncTrajectoryGroup": ...
 
     @overload
     def __new__(
@@ -172,7 +174,7 @@ class TrajectoryGroup(pydantic.BaseModel):
         trajectories: Iterable[Awaitable[Trajectory]],
         *,
         exceptions: list[BaseException] = [],
-    ) -> Awaitable["TrajectoryGroup"]: ...
+    ) -> Awaitable["AsyncTrajectoryGroup"]: ...
 
     def __new__(
         cls,
@@ -181,7 +183,7 @@ class TrajectoryGroup(pydantic.BaseModel):
         ),
         *,
         exceptions: list[BaseException] = [],
-    ) -> "TrajectoryGroup | Awaitable[TrajectoryGroup]":
+    ) -> "AsyncTrajectoryGroup | Awaitable[AsyncTrajectoryGroup]":
         ts = list(trajectories)
         if any(hasattr(t, "__await__") for t in ts):
 
@@ -204,7 +206,7 @@ class TrajectoryGroup(pydantic.BaseModel):
                         context.update_pbar(n=0)
                         if context.too_many_exceptions():
                             raise
-                return TrajectoryGroup(
+                return AsyncTrajectoryGroup(
                     trajectories=trajectories,
                     exceptions=exceptions,
                 )
@@ -226,3 +228,4 @@ class TrajectoryGroup(pydantic.BaseModel):
                 exceptions=exceptions,
             )
             return group
+

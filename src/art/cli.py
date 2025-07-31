@@ -12,7 +12,7 @@ import uvicorn
 from . import dev
 from .local import LocalBackend
 from .model import Model, TrainableModel
-from .trajectories import TrajectoryGroup
+from .trajectories import TrajectoryGroup, AsyncTrajectoryGroup
 from .types import TrainConfig
 from .utils.deploy_model import LoRADeploymentProvider
 from .errors import ARTError
@@ -35,15 +35,7 @@ def run(host: str = "0.0.0.0", port: int = 7999) -> None:
         )
         return
 
-    # Reset the custom __new__ and __init__ methods for TrajectoryGroup
-    def __new__(cls, *args: Any, **kwargs: Any) -> TrajectoryGroup:
-        return pydantic.BaseModel.__new__(cls)
-
-    def __init__(self, *args: Any, **kwargs: Any) -> None:
-        return pydantic.BaseModel.__init__(self, *args, **kwargs)
-
-    TrajectoryGroup.__new__ = __new__  # type: ignore
-    TrajectoryGroup.__init__ = __init__
+    
 
     backend = LocalBackend()
     app = FastAPI()
@@ -77,7 +69,7 @@ def run(host: str = "0.0.0.0", port: int = 7999) -> None:
     @app.post("/_train_model")
     async def _train_model(
         model: TrainableModel,
-        trajectory_groups: list[TrajectoryGroup],
+        trajectory_groups: list[AsyncTrajectoryGroup],
         config: TrainConfig,
         dev_config: dev.TrainConfig,
         verbose: bool = Body(False),
