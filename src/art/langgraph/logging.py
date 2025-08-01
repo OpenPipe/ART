@@ -1,6 +1,7 @@
 import pickle
 import os
 
+
 class FileLogger:
     def __init__(self, filepath):
         self.text_path = filepath

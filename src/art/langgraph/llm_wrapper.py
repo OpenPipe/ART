@@ -19,75 +19,90 @@ CURRENT_CONFIG = contextvars.ContextVar("CURRENT_CONFIG")
 
 mappings = {}
 
+
 def add_thread(thread_id, base_url, api_key, model):
-    log_path = f'.art/langgraph/{thread_id}'
+    log_path = f".art/langgraph/{thread_id}"
     os.makedirs(os.path.dirname(log_path), exist_ok=True)
-    CURRENT_CONFIG.set({
-        "logger": FileLogger(log_path),
-        "base_url": base_url,
-        "api_key": api_key,
-        "model": model,
-    })
+    CURRENT_CONFIG.set(
+        {
+            "logger": FileLogger(log_path),
+            "base_url": base_url,
+            "api_key": api_key,
+            "model": model,
+        }
+    )
     return log_path
 
+
 def create_messages_from_logs(log_path: str, trajectory: Trajectory):
-        logs = FileLogger(log_path).load_logs()
-        conversations = []
-        tools = []
+    logs = FileLogger(log_path).load_logs()
+    conversations = []
+    tools = []
 
-        for log_entry in logs:
-            output = log_entry[1]['output']
-            new_tools = log_entry[1]['tools']
-            raw_output = output.get('raw') if hasattr(output, 'get') else output
+    for log_entry in logs:
+        output = log_entry[1]["output"]
+        new_tools = log_entry[1]["tools"]
+        raw_output = output.get("raw") if hasattr(output, "get") else output
 
-            input_msgs = log_entry[1]['input'].to_messages() if isinstance(log_entry[1]['input'], ChatPromptValue) else log_entry[1]['input']
-            new_conversation = input_msgs + [raw_output]
+        input_msgs = (
+            log_entry[1]["input"].to_messages()
+            if isinstance(log_entry[1]["input"], ChatPromptValue)
+            else log_entry[1]["input"]
+        )
+        new_conversation = input_msgs + [raw_output]
 
-            # Try to match with existing conversations
-            matched = False
-            for idx, existing in enumerate(conversations):
-                existing_non_tool = [m for m in existing if not isinstance(m, ToolMessage)]
-                new_non_tool = [m for m in input_msgs if not isinstance(m, ToolMessage)]
-                new_non_tool = new_non_tool[:-1] if new_non_tool and isinstance(new_non_tool[-1], HumanMessage) else new_non_tool
+        # Try to match with existing conversations
+        matched = False
+        for idx, existing in enumerate(conversations):
+            existing_non_tool = [m for m in existing if not isinstance(m, ToolMessage)]
+            new_non_tool = [m for m in input_msgs if not isinstance(m, ToolMessage)]
+            new_non_tool = (
+                new_non_tool[:-1]
+                if new_non_tool and isinstance(new_non_tool[-1], HumanMessage)
+                else new_non_tool
+            )
 
-                if existing_non_tool == new_non_tool:
-                    # Replace with the longer one
-                    conversations[idx] = new_conversation
-                    tools[idx] = new_tools
-                    matched = True
-                    break
+            if existing_non_tool == new_non_tool:
+                # Replace with the longer one
+                conversations[idx] = new_conversation
+                tools[idx] = new_tools
+                matched = True
+                break
 
-            if not matched:
-                conversations.append(new_conversation)
-                tools.append(new_tools)
+        if not matched:
+            conversations.append(new_conversation)
+            tools.append(new_tools)
 
-        for idx, conv in enumerate(conversations):
-            try:
-                converted = convert_langgraph_messages(conv)
-                if idx == 0:
-                    trajectory.messages_and_choices = converted
-                    trajectory.tools = tools[idx]
-                else:
-                    trajectory.additional_histories.append(
-                        History(messages_and_choices=converted, tools=tools[idx])
-                    )
-            except:
-                pass
-        
-        return trajectory
+    for idx, conv in enumerate(conversations):
+        try:
+            converted = convert_langgraph_messages(conv)
+            if idx == 0:
+                trajectory.messages_and_choices = converted
+                trajectory.tools = tools[idx]
+            else:
+                trajectory.additional_histories.append(
+                    History(messages_and_choices=converted, tools=tools[idx])
+                )
+        except Exception:
+            pass
+
+    return trajectory
+
 
 def wrap_rollout(model, fn):
     async def wrapper(*args, **kwargs):
         thread_id = str(uuid.uuid4())
         log_path = add_thread(
-            thread_id, 
-            model.inference_base_url, 
-            model.inference_api_key, 
-            model.inference_model_name
+            thread_id,
+            model.inference_base_url,
+            model.inference_api_key,
+            model.inference_model_name,
         )
         result = await fn(*args, **kwargs)
         return create_messages_from_logs(log_path, result)
+
     return wrapper
+
 
 def init_chat_model(
     model: Literal[None] = None,
@@ -96,7 +111,7 @@ def init_chat_model(
     configurable_fields: Literal[None] = None,
     config_prefix: str | None = None,
     **kwargs: Any,
-    ):
+):
     config = CURRENT_CONFIG.get()
     return LoggingLLM(
         ChatOpenAI(
@@ -105,8 +120,9 @@ def init_chat_model(
             model=config["model"],
             temperature=1.0,
         ),
-        config["logger"]
+        config["logger"],
     )
+
 
 class LoggingLLM(Runnable):
     def __init__(self, llm, logger, structured_output=None, tools=None):
@@ -126,9 +142,9 @@ class LoggingLLM(Runnable):
         result = self.llm.invoke(input, config=config)
         self._log(completion_id, input, result)
 
-        if hasattr(result, 'get') and result.get('parsed'):
-            return result.get('parsed')
-        
+        if hasattr(result, "get") and result.get("parsed"):
+            return result.get("parsed")
+
         if self.structured_output:
             content = json.loads(result.content)
             return self.structured_output.model_validate(content)
@@ -139,23 +155,32 @@ class LoggingLLM(Runnable):
 
         async def execute():
             try:
-                result = await asyncio.wait_for(self.llm.ainvoke(input, config=config), timeout=10 * 60)
+                result = await asyncio.wait_for(
+                    self.llm.ainvoke(input, config=config), timeout=10 * 60
+                )
                 self._log(completion_id, input, result)
             except asyncio.TimeoutError as e:
                 raise e
             return result
-        
+
         result = await execute()
 
-        if hasattr(result, 'get') and result.get('parsed'):
-            return result.get('parsed')
-        
+        if hasattr(result, "get") and result.get("parsed"):
+            return result.get("parsed")
+
         if self.structured_output:
-            return self.structured_output.model_validate(result.tool_calls[0]['args'] if result.tool_calls else None)
+            return self.structured_output.model_validate(
+                result.tool_calls[0]["args"] if result.tool_calls else None
+            )
         return result
 
     def with_structured_output(self, tools):
-        return LoggingLLM(self.llm.bind_tools([tools]), self.logger, structured_output=tools, tools=[tools])
+        return LoggingLLM(
+            self.llm.bind_tools([tools]),
+            self.logger,
+            structured_output=tools,
+            tools=[tools],
+        )
 
     def bind_tools(self, tools):
         return LoggingLLM(self.llm.bind_tools(tools), self.logger, tools=tools)
@@ -163,21 +188,21 @@ class LoggingLLM(Runnable):
     def with_retry(
         self,
         *,
-        retry_if_exception_type = (Exception,),
-        wait_exponential_jitter = True,
-        exponential_jitter_params = None,
-        stop_after_attempt = 3,
+        retry_if_exception_type=(Exception,),
+        wait_exponential_jitter=True,
+        exponential_jitter_params=None,
+        stop_after_attempt=3,
     ):
         return self
-    
+
     def with_config(
         self,
-        config = None,
+        config=None,
         **kwargs: Any,
     ):
         art_config = CURRENT_CONFIG.get()
         self.logger = art_config["logger"]
-        max_tokens = config.get('max_tokens')
+        max_tokens = config.get("max_tokens")
 
         if hasattr(self.llm, "bound"):
             self.llm.bound = ChatOpenAI(

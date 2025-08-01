@@ -6,7 +6,6 @@ from art_e.report_trajectory import report_trajectory
 from art_e.data.types_enron import SyntheticQuery
 from tqdm.asyncio import tqdm
 from art_e.project_types import ProjectPolicyConfig
-import uuid
 from art.langgraph import wrap_rollout
 
 

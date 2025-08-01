@@ -11,16 +11,13 @@ from art_e.email_search_tools import (
 )
 from langchain_core.utils.function_calling import convert_to_openai_tool
 from litellm.caching.caching import LiteLLMCacheType, Cache
-import json
-from litellm.types.utils import Choices, ModelResponse
 from dataclasses import asdict
-from art.utils.litellm import convert_litellm_choice_to_openai
 from dataclasses import dataclass
 from art_e.project_types import ProjectPolicyConfig
 import textwrap
 from tenacity import retry, stop_after_attempt
 import logging
-from pydantic import BaseModel, Field, validate_call, ValidationError
+from pydantic import BaseModel, Field
 from rich import print
 from langgraph_email_search import EmailSearchReActAgent
 from langchain_core.tools import tool
@@ -58,9 +55,7 @@ class FinalRubric:
         return metrics
 
 
-def calculate_reward(
-    rubric: FinalRubric, traj: Trajectory
-) -> float:
+def calculate_reward(rubric: FinalRubric, traj: Trajectory) -> float:
     # Note: make sure all possible partial rewards always sum to less than 0.5.
     partial_rewards = 0
     partial_rewards += 0.1 if rubric.ever_found_right_email else 0
@@ -282,7 +277,6 @@ async def rollout(
     traj.tools = [convert_to_openai_tool(t) for t in tools]  # type: ignore
 
     await EmailSearchReActAgent(tools=tools).search(system_prompt, scenario.question)
-
 
     reward = calculate_reward(rubric, traj)
     traj.reward = reward
