@@ -33,6 +33,12 @@ backend = [
 
 skypilot = ["semver>=3.0.4", "skypilot[cudo,do,fluidstack,gcp,lambda,paperspace,runpod]==0.9.3"]
 
+langgraph = [
+    "langchain-core>=0.3.51",
+    "langgraph>=0.6.2",
+    "langchain-openai>=0.3.27",
+]
+
 [project.scripts]
 art = "art.cli:app"
 stop-server = "art.skypilot.stop_server:main"

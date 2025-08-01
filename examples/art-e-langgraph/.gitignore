@@ -1,0 +1,11 @@
+*.db
+*.db-journal
+*.log
+.litellm_cache
+__pycache__
+.env
+*.egg-info/
+.art/
+plots/
+/data/
+!/art_e/data/

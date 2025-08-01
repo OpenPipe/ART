@@ -1,0 +1,5 @@
+---
+description: data loading/transformation scripts, exploratory notebooks
+globs: 
+---
+Unless told otherwise do not bother with defensive programming like try/catch, calling `.get` instead of using `[]` directly, etc. Just write the code as simply as possible, and if an error happens, let it happen and the programmer deal with it.
