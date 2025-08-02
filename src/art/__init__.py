@@ -8,6 +8,9 @@ if os.environ.get("IMPORT_PEFT", "0") == "1":
 # NOTE: If we import peft before unsloth to enable sleep mode, a warning will be shown
 if os.environ.get("IMPORT_UNSLOTH", "0") == "1":
     import unsloth  # type: ignore # noqa: F401
+    from .vllm import patch_lora_request
+
+    patch_lora_request()
 
 if os.environ.get("IMPORT_PEFT", "0") == "1":
     # torch.cuda.MemPool doesn't currently support expandable_segments which is used in sleep mode

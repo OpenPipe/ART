@@ -1,12 +1,25 @@
 from enum import Enum
+from typing import Sequence
 from typing_extensions import TypedDict
 
 from .engine import EngineArgs
 from .torchtune import TorchtuneArgs
 
 
+class ExplicitEnum(str, Enum):
+    """
+    Enum with more explicit error message for missing values.
+    """
+
+    @classmethod
+    def _missing_(cls, value):
+        raise ValueError(
+            f"{value} is not a valid {cls.__name__}, please select one of {list(cls._value2member_map_.keys())}"
+        )
+
+
 # Vendored from transformers.training_args.OptimizerNames
-class OptimizerNames(str, Enum):
+class OptimizerNames(ExplicitEnum):
     """
     Stores the acceptable string identifiers for optimizers.
     """
@@ -55,13 +68,13 @@ class OptimizerNames(str, Enum):
 
 
 # Vendored from transformers.debug_utils.DebugOption
-class DebugOption(str, Enum):
+class DebugOption(ExplicitEnum):
     UNDERFLOW_OVERFLOW = "underflow_overflow"
     TPU_METRICS_DEBUG = "tpu_metrics_debug"
 
 
 # Vendored from transformers.trainer_utils.IntervalStrategy
-class IntervalStrategy(str, Enum):
+class IntervalStrategy(ExplicitEnum):
     NO = "no"
     STEPS = "steps"
     EPOCH = "epoch"
@@ -72,7 +85,7 @@ SaveStrategy = IntervalStrategy
 
 
 # Vendored from transformers.trainer_utils.HubStrategy
-class HubStrategy(str, Enum):
+class HubStrategy(ExplicitEnum):
     END = "end"
     EVERY_SAVE = "every_save"
     CHECKPOINT = "checkpoint"
@@ -80,7 +93,7 @@ class HubStrategy(str, Enum):
 
 
 # Vendored from transformers.trainer_utils.SchedulerType
-class SchedulerType(str, Enum):
+class SchedulerType(ExplicitEnum):
     LINEAR = "linear"
     COSINE = "cosine"
     COSINE_WITH_RESTARTS = "cosine_with_restarts"
@@ -95,7 +108,7 @@ class SchedulerType(str, Enum):
 
 
 # Vendored from transformers.trainer_utils.FSDPOption
-class FSDPOption(str, Enum):
+class FSDPOption(ExplicitEnum):
     FULL_SHARD = "full_shard"
     SHARD_GRAD_OP = "shard_grad_op"
     NO_SHARD = "no_shard"
@@ -157,7 +170,7 @@ class PeftArgs(TypedDict, total=False):
     bias: str
     layers_to_transform: list[int] | None
     layers_pattern: str | None
-    use_gradient_checkpointing: bool
+    use_gradient_checkpointing: str
     random_state: int
     max_seq_length: int  # not used anymore
     use_rslora: bool
@@ -195,8 +208,8 @@ class TrainerArgs(TypedDict, total=False):
     lr_scheduler_kwargs: dict | str | None
     warmup_ratio: float
     warmup_steps: int
-    log_level: str | None
-    log_level_replica: str | None
+    log_level: str
+    log_level_replica: str
     log_on_each_node: bool
     logging_dir: str | None
     logging_strategy: "IntervalStrategy | str"
@@ -228,7 +241,7 @@ class TrainerArgs(TypedDict, total=False):
     ddp_backend: str | None
     tpu_num_cores: int | None
     tpu_metrics_debug: bool
-    debug: str | list["DebugOption"]
+    debug: str | Sequence["DebugOption"]
     dataloader_drop_last: bool
     eval_steps: float | None
     dataloader_num_workers: int
@@ -242,7 +255,7 @@ class TrainerArgs(TypedDict, total=False):
     metric_for_best_model: str | None
     greater_is_better: bool | None
     ignore_data_skip: bool
-    fsdp: list["FSDPOption"] | str | None
+    fsdp: Sequence["FSDPOption"] | str | None
     fsdp_min_num_params: int
     fsdp_config: dict | str | None
     fsdp_transformer_layer_cls_to_wrap: str | None
@@ -283,7 +296,7 @@ class TrainerArgs(TypedDict, total=False):
     full_determinism: bool
     torchdynamo: str | None
     ray_scope: str | None
-    ddp_timeout: int | None
+    ddp_timeout: int
     torch_compile: bool
     torch_compile_backend: str | None
     torch_compile_mode: str | None
@@ -299,14 +312,9 @@ class TrainerArgs(TypedDict, total=False):
     model_init_kwargs: dict | None
     max_prompt_length: int | None
     num_generations: int | None
-    temperature: float | None
+    temperature: float
     max_completion_length: int | None
     ds3_gather_for_generation: bool
-    use_vllm: bool | None
-    vllm_device: str | None
-    vllm_gpu_memory_utilization: float
-    vllm_dtype: str | None
-    vllm_max_model_len: int | None
     beta: float
     reward_weights: list[float] | None
     sync_ref_model: bool

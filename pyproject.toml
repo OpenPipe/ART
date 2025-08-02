@@ -13,8 +13,8 @@ backend = [
     "peft>=0.14.0",
     "hf-xet>=1.1.0",
     "bitsandbytes>=0.45.2",
-    "unsloth==2025.6.12",
-    "unsloth-zoo==2025.6.8",
+    "unsloth==2025.8.1",
+    "unsloth-zoo==2025.8.1",
     "vllm==0.9.1",
     "torchtune",
     "trl>=0.19.0",
@@ -28,7 +28,7 @@ backend = [
     "wandb>=0.19.8",
     "polars>=1.26.0",
     "transformers==4.53.2",
-    "trl==0.19.0",
+    "trl==0.20.0",
 ]
 
 skypilot = ["semver>=3.0.4", "skypilot[cudo,do,fluidstack,gcp,lambda,paperspace,runpod]==0.9.3"]
