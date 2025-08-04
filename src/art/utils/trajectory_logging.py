@@ -3,6 +3,7 @@ import yaml
 from typing import Any
 
 from art import TrajectoryGroup, Trajectory
+from art.trajectories import History
 from art.types import Choice, Message, MessageOrChoice
 from openai.types.chat.chat_completion_message_param import (
     ChatCompletionSystemMessageParam,
@@ -34,6 +35,15 @@ def trajectory_group_to_dict(trajectory_group: TrajectoryGroup) -> dict[str, Any
     }
 
 
+def history_to_dict(history: History) -> dict[str, Any]:
+    messages_and_choices = [
+        message_or_choice_to_dict(message_or_choice)
+        for message_or_choice in history.messages_and_choices
+    ]
+
+    return {"messages_and_choices": messages_and_choices, "tools": history.tools}
+
+
 def trajectory_to_dict(trajectory: Trajectory) -> dict[str, Any]:
     messages_and_choices = [
         message_or_choice_to_dict(message_or_choice)
@@ -46,7 +56,11 @@ def trajectory_to_dict(trajectory: Trajectory) -> dict[str, Any]:
         "metadata": trajectory.metadata,
         "messages_and_choices": messages_and_choices,
         "tools": trajectory.tools,
-        "additional_histories": trajectory.additional_histories,
+        "additional_histories": [
+            history_to_dict(h) for h in trajectory.additional_histories
+        ]
+        if trajectory.additional_histories
+        else trajectory.additional_histories,
         "logs": trajectory.logs,
     }
 

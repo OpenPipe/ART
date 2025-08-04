@@ -1,4 +1,5 @@
 from pydantic import BaseModel
+from typing import Literal
 
 
 class ProjectPolicyConfig(BaseModel):
@@ -31,3 +32,4 @@ class ProjectPolicyConfig(BaseModel):
 
     # Training configuration
     scale_rewards: bool = True  # Whether to scale rewards during training
+    importance_sampling_level: Literal["token", "sequence"] = "token"

@@ -9,6 +9,7 @@ from typing import cast, Callable, TYPE_CHECKING
 
 from .. import dev
 from ..types import TrainConfig
+from ..utils.group_aggregate import group_aggregate
 
 if TYPE_CHECKING:
     from .service import TrainInputs
@@ -132,7 +133,17 @@ def get_compute_loss_fn(trainer: "GRPOTrainer") -> Callable[..., torch.Tensor]:
             new_logprobs.detach(),
             old_logprobs,
         )
-        prob_ratio = torch.exp(new_logprobs - old_logprobs)
+        logprob_diff = new_logprobs - old_logprobs
+        if _config.get("importance_sampling_level", "token") == "sequence":
+            prob_ratio = torch.exp(
+                group_aggregate(
+                    logprob_diff,
+                    by=shift_tensor(inputs["group_ids"], 0) * assistant_mask,
+                    reduce="mean",
+                )
+            )
+        else:
+            prob_ratio = torch.exp(logprob_diff)
         epsilon = _config.get("epsilon", 0.2)
         epsilon_high = _config.get("epsilon_high", epsilon)
         if epsilon_high is None:

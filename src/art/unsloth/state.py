@@ -94,7 +94,7 @@ class ModelState:
         self.trainer = GRPOTrainer(
             model=self.peft_model,  # type: ignore
             reward_funcs=[],
-            args=GRPOConfig(**config.get("trainer_args", {})),
+            args=GRPOConfig(**config.get("trainer_args", {})),  # type: ignore
             train_dataset=Dataset.from_list([data for _ in range(10_000_000)]),
             processing_class=self.tokenizer,
         )

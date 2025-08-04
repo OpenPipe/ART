@@ -382,7 +382,7 @@
 
 workdir: .
 resources:
-  accelerators: ["H100:1", "A100-80GB:1"]
+  accelerators: ["H100-SXM:1", "H100:1", "A100-80GB:1"]
   ports:
     - 7999 # main ART server
     - 8000 # vLLM server

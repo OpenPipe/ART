@@ -3,8 +3,6 @@ title: Additional Histories
 description: Learn how to use additional histories for complex agent training scenarios
 ---
 
-# Additional Histories
-
 Additional histories allow you to include multiple separate conversation histories within a single trajectory. This powerful feature enables training of agents with non-linear conversation flows, such as agents that call sub-agents or compact their message history periodically.
 
 ## What are Additional Histories?
@@ -12,13 +10,17 @@ Additional histories allow you to include multiple separate conversation histori
 In ART, a trajectory typically contains a single sequence of messages representing the agent's conversation. However, some advanced use cases require training on multiple related but separate conversations within the same trajectory context. The `additional_histories` feature addresses this need.
 
 Each trajectory can contain:
+
 - A primary `messages_and_choices` sequence (the main conversation)
 - An optional list of `additional_histories`, where each history contains its own `messages_and_choices` and optional `tools`
 
 ## Why Use Additional Histories?
 
 <Callout type="warning">
-Note: for simplicity and ease of use, we've used normal "assistant" messages in the examples below. In reality, you'll want to use `Choice` objects to represent assistant messages that should be trained on, as seen in the example notebooks.
+  Note: for simplicity and ease of use, we've used normal "assistant" messages
+  in the examples below. In reality, you'll want to use `Choice` objects to
+  represent assistant messages that should be trained on, as seen in the example
+  notebooks.
 </Callout>
 
 ### 1. Preserving Special Tokens in Multi-Turn Conversations
@@ -65,7 +67,7 @@ trajectory = Trajectory(
             {"type": "function", "function": {"name": "analyze_code", "arguments": "Find potential bugs in main.py"}},
         ]},
         {
-            "role": "tool", 
+            "role": "tool",
             "tool_call_id": "...",
             "content": "Found 3 potential issues..."
         },
@@ -73,7 +75,7 @@ trajectory = Trajectory(
             {"type": "function", "function": {"name": "fix_issues", "arguments": "Fix the null pointer issue on line 42 of main.py"}},
         ]},
         {
-            "role": "tool", 
+            "role": "tool",
             "tool_call_id": "...",
             "content": "Fixed by adding null check..."
         },
@@ -211,9 +213,12 @@ trajectory = Trajectory(
 
 ## Current Limitations
 
-<Callout type="warning">
-The RULER reward function does not currently support trajectories with additional histories. If you attempt to use RULER with `additional_histories`, it will raise an error. Support for this feature in RULER is planned for a future release.
-</Callout>
+<Warning>
+  The RULER reward function does not currently support trajectories with
+  additional histories. If you attempt to use RULER with `additional_histories`,
+  it will raise an error. Support for this feature in RULER is planned for a
+  future release.
+</Warning>
 
 ## Related Topics
 

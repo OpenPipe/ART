@@ -161,6 +161,7 @@ async def train(model: art.TrainableModel[ProjectPolicyConfig]):
                 _config=art.dev.TrainConfig(
                     allow_training_without_logprobs=model.config.messages_only,
                     scale_rewards=model.config.scale_rewards,
+                    importance_sampling_level=model.config.importance_sampling_level,
                 ),
             )
 

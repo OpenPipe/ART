@@ -1,5 +1,7 @@
 # Usage:
 # uv run run_training.py --models=207 --fast
+# uv run run_training.py --models=210-% --fast  # Run all 210-* models
+# uv run run_training.py --models=210-16,210-% --fast  # Run 210-16 and all 210-* models
 
 import argparse
 import sky
@@ -12,6 +14,7 @@ from dotenv import dotenv_values, load_dotenv
 from sky import ClusterStatus
 import random
 import os
+import fnmatch
 
 from all_experiments import models
 
@@ -24,7 +27,7 @@ parser.add_argument(
     "--models",
     type=str,
     required=True,
-    help="Comma-separated list of model keys to train (e.g. art-1).",
+    help="Comma-separated list of model keys to train (e.g. 207 or 210-% for wildcards).",
 )
 parser.add_argument(
     "--fast",
@@ -39,12 +42,34 @@ parser.add_argument(
 args = parser.parse_args()
 
 # Parse and validate the requested model keys
-requested_models = [m.strip() for m in args.models.split(",") if m.strip()]
-unknown = [m for m in requested_models if m not in models]
-if unknown:
-    raise ValueError(
-        f"Unknown model keys requested: {', '.join(unknown)}. Valid keys: {', '.join(models.keys())}"
-    )
+requested_patterns = [m.strip() for m in args.models.split(",") if m.strip()]
+requested_models = []
+
+for pattern in requested_patterns:
+    # Replace % with * for fnmatch
+    glob_pattern = pattern.replace("%", "*")
+
+    # Find all matching model keys
+    matching_keys = [key for key in models.keys() if fnmatch.fnmatch(key, glob_pattern)]
+
+    if matching_keys:
+        requested_models.extend(matching_keys)
+        if len(matching_keys) > 1:
+            print(f"Pattern '{pattern}' matched: {', '.join(sorted(matching_keys))}")
+    else:
+        # If no wildcard and exact match doesn't exist, it's an error
+        if "%" not in pattern and pattern not in models:
+            raise ValueError(
+                f"Unknown model key: {pattern}. Valid keys: {', '.join(sorted(models.keys()))}"
+            )
+        elif "%" in pattern:
+            print(f"Warning: Pattern '{pattern}' matched no models")
+
+# Remove duplicates while preserving order
+requested_models = list(dict.fromkeys(requested_models))
+
+if not requested_models:
+    raise ValueError("No models matched the provided patterns")
 
 
 def launch_model(model_key: str):

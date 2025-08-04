@@ -120,20 +120,21 @@ trainable_models["010"]._internal_config = art.dev.InternalModelConfig(
 
 trainable_models["011"] = trainable_models["001"].model_copy(deep=True)
 assert trainable_models["011"].config.training_config is not None
-trainable_models["011"].name = "tau-bench-rl-011-tm-too-big-8-plot-tensors"
-trainable_models["011"].config.training_config.trajectories_per_group = 32
+trainable_models["011"].name = "tau-bench-rl-011-tm-32b-4"
+trainable_models["011"].base_model = "Qwen/Qwen2.5-32B-Instruct"
+trainable_models["011"].config.training_config.trajectories_per_group = 64
 trainable_models["011"].config.training_config.groups_per_step = 32
 trainable_models["011"].config.training_config.training_dataset_size = 32
-trainable_models["011"].config.training_config.learning_rate = 2e-6
+trainable_models["011"].config.training_config.learning_rate = 5e-7
 trainable_models["011"].config.run_config.skip_eval = False
 trainable_models["011"].config.run_config.reward_type = "real"
 trainable_models["011"].config.run_config.user_model = "gpt-4.1"
 trainable_models["011"].config.training_config.val_set_size = 60
 trainable_models["011"].config.training_config.eval_steps = 8
 trainable_models["011"]._internal_config = art.dev.InternalModelConfig(
-    engine_args=art.dev.EngineArgs(tensor_parallel_size=4, gpu_memory_utilization=0.75),
+    engine_args=art.dev.EngineArgs(tensor_parallel_size=8, gpu_memory_utilization=0.75),
     torchtune_args=art.dev.TorchtuneArgs(
-        model="qwen2_5_14b_instruct", model_type="QWEN2", async_weight_syncing=True
+        model="qwen2_5_32b_instruct", model_type="QWEN2", async_weight_syncing=True
     ),
 )
 trainable_models["011"].config.run_config.plot_tensors = True
@@ -176,6 +177,27 @@ trainable_models["015"]._internal_config = art.dev.InternalModelConfig(
     engine_args=art.dev.EngineArgs(tensor_parallel_size=4, gpu_memory_utilization=0.75),
     torchtune_args=art.dev.TorchtuneArgs(
         model="qwen3_14b_instruct", model_type="QWEN3", async_weight_syncing=True
+    ),
+)
+
+trainable_models["016"] = trainable_models["001"].model_copy(deep=True)
+assert trainable_models["016"].config.training_config is not None
+trainable_models["016"].name = "tau-bench-rl-016-tm-14b-gspo-2"
+trainable_models["016"].base_model = "Qwen/Qwen2.5-14B-Instruct"
+trainable_models["016"].config.training_config.trajectories_per_group = 32
+trainable_models["016"].config.training_config.groups_per_step = 32
+trainable_models["016"].config.training_config.training_dataset_size = 32
+trainable_models["016"].config.training_config.learning_rate = 5e-7
+trainable_models["016"].config.training_config.importance_sampling_level = "sequence"
+trainable_models["016"].config.run_config.skip_eval = False
+trainable_models["016"].config.run_config.reward_type = "real"
+trainable_models["016"].config.run_config.user_model = "gpt-4.1"
+trainable_models["016"].config.training_config.val_set_size = 60
+trainable_models["016"].config.training_config.eval_steps = 8
+trainable_models["016"]._internal_config = art.dev.InternalModelConfig(
+    engine_args=art.dev.EngineArgs(tensor_parallel_size=8, gpu_memory_utilization=0.75),
+    torchtune_args=art.dev.TorchtuneArgs(
+        model="qwen2_5_14b_instruct", model_type="QWEN2", async_weight_syncing=True
     ),
 )
 
@@ -249,7 +271,7 @@ def launch_model(model_key: str):
 
             # Install project in editable mode
             uv remove openpipe-art
-            uv add --editable ~/ART --extra backend
+            uv add --editable ~/ART --extra backend --extra plotting
 
             # Sync dependencies
             uv sync
@@ -260,7 +282,7 @@ def launch_model(model_key: str):
         f"""
         # Run the RL training
         uv remove openpipe-art
-        uv add --editable ~/ART --extra backend
+        uv add --editable ~/ART --extra backend --extra plotting
 
         uv run run_rl.py '{model_json}'
     """
@@ -280,7 +302,13 @@ def launch_model(model_key: str):
             "tensor_parallel_size", 1
         )
 
-    task.set_resources(sky.Resources(accelerators=f"H100-SXM:{num_gpus}"))
+    task.set_resources(
+        sky.Resources(
+            accelerators=f"H200-SXM:{num_gpus}",
+            cloud=sky.clouds.RunPod(),
+            region="US",
+        )
+    )
     task.set_file_mounts({"~/ART": "../.."})
 
     # Generate cluster name

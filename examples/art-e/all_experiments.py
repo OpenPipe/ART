@@ -67,10 +67,8 @@ models["205"].name = "email-agent-205"
 # Set the judge group model
 models["205"].config.ruler_judge_model = "gemini/gemini-2.5-flash"
 
-# Model 206: like 204 but using Qwen3 32B as the judge-group model
-models["206"] = models["204"].model_copy(deep=True)
+models["206"] = models["008"].model_copy(deep=True)
 models["206"].name = "email-agent-206"
-# Set the judge group model
 models["206"].config.ruler_judge_model = "openrouter/qwen/qwen3-32b"
 
 # Model 207: like 205 but only uses 12 training examples total
@@ -112,9 +110,6 @@ for _seed in [1, 2, 3]:
     models[key].name = f"ea-{key}"
     # Set the seed
     models[key].config.training_dataset_seed = _seed
-
-models["211"] = models["206"].model_copy(deep=True)
-models["211"].name = "email-agent-211"
 
 models["212"] = models["206"].model_copy(deep=True)
 models["212"].name = "email-agent-212-30"
@@ -210,3 +205,33 @@ models["230"].config.fork_not_after_step = 90
 models["231"] = models["206"].model_copy(deep=True)
 models["231"].name = "email-agent-231"
 models["231"].config.scale_rewards = False
+models["231"].config.num_epochs = 10
+
+models["232"] = models["008"].model_copy(deep=True)
+models["232"].name = "email-agent-232"
+models["232"].config.scale_rewards = False
+
+# Model 233-* sweep: based on 231 but varying training_dataset_size across powers of 4
+# Generates models 233-1, 233-4, 233-16, 233-64, 233-256, 233-1024, 233-4096
+for _size in [1, 4, 16, 64, 256, 1024, 4096]:
+    key = f"233-{_size}"
+    models[key] = models["206"].model_copy(deep=True)
+    models[key].config.scale_rewards = False
+    models[key].name = f"ea-{key}"
+    # Set the dataset size
+    models[key].config.training_dataset_size = _size
+    # For very small datasets, match groups_per_step to the dataset size (<=16)
+    if _size <= 16:
+        models[key].config.groups_per_step = _size
+    # Compute num_epochs so that total training steps ~= 1200.
+    # Approximation: total_steps ≈ num_epochs * (training_dataset_size / groups_per_step)
+    # => num_epochs ≈ 1200 * groups_per_step / training_dataset_size
+    models[key].config.num_epochs = max(
+        1, round(1200 * models[key].config.groups_per_step / _size)
+    )
+
+# Model 234: Like 206 but with importance_sampling_level="sequence"
+models["234"] = models["206"].model_copy(deep=True)
+models["234"].name = "email-agent-234"
+models["234"].config.importance_sampling_level = "sequence"
+models["234"].config.num_epochs = 10

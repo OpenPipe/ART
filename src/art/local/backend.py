@@ -159,6 +159,7 @@ class LocalBackend(Backend):
         self,
         model: TrainableModel,
         trajectory_groups: list[TrajectoryGroup],
+        advantage_balance: float,
         allow_training_without_logprobs: bool,
         scale_rewards: bool,
         plot_tensors: bool,
@@ -192,6 +193,7 @@ class LocalBackend(Backend):
             tokenized_results,
             sequence_length,
             pad_token_id=tokenizer.eos_token_id,  # type: ignore
+            advantage_balance=advantage_balance,
         )
         if (
             not allow_training_without_logprobs
@@ -328,7 +330,6 @@ class LocalBackend(Backend):
         dev_config: dev.TrainConfig,
         verbose: bool = False,
     ) -> AsyncIterator[dict[str, float]]:
-        step = await self._get_step(model)
         if verbose:
             print("Starting _train_model")
         service = await self._get_service(model)
@@ -337,9 +338,19 @@ class LocalBackend(Backend):
         await self._log(model, trajectory_groups, "train")
         if verbose:
             print("Packing tensors...")
+
+        # Count submitted groups and trainable groups
+        num_groups_submitted = len(trajectory_groups)
+        num_groups_trainable = sum(
+            1
+            for group in trajectory_groups
+            if group and len(set(trajectory.reward for trajectory in group)) > 1
+        )
+
         packed_tensors = self._get_packed_tensors(
             model,
             trajectory_groups,
+            advantage_balance=dev_config.get("advantage_balance", 0.0),
             allow_training_without_logprobs=dev_config.get(
                 "allow_training_without_logprobs", False
             ),
@@ -351,6 +362,34 @@ class LocalBackend(Backend):
                 "Skipping tuning as there is no suitable data. "
                 "This can happen when all the trajectories in the same group "
                 "have the same reward and thus no advantage to train on."
+            )
+
+            # Still advance the step by renaming the checkpoint directory
+            current_step = self.__get_step(model)
+            next_step = current_step + 1
+            current_checkpoint_dir = get_step_checkpoint_dir(
+                get_model_dir(model=model, art_path=self._path), current_step
+            )
+            next_checkpoint_dir = get_step_checkpoint_dir(
+                get_model_dir(model=model, art_path=self._path), next_step
+            )
+
+            # If the current checkpoint exists, rename it to the next step
+            if os.path.exists(current_checkpoint_dir):
+                os.rename(current_checkpoint_dir, next_checkpoint_dir)
+                print(
+                    f"Advanced step from {current_step} to {next_step} (no training occurred)"
+                )
+
+            # Log metrics showing no groups were trainable
+            self._log_metrics(
+                model,
+                {
+                    "num_groups_submitted": num_groups_submitted,
+                    "num_groups_trainable": 0,
+                },
+                "train",
+                step=next_step,
             )
             return
         disk_packed_tensors = packed_tensors_to_dir(
@@ -387,7 +426,12 @@ class LocalBackend(Backend):
             k: sum(d.get(k, 0) for d in results) / sum(1 for d in results if k in d)
             for k in {k for d in results for k in d}
         }
-        self._log_metrics(model, data, "train", step=step)
+        # Add group counting metrics
+        data["num_groups_submitted"] = num_groups_submitted
+        data["num_groups_trainable"] = num_groups_trainable
+        # Get the current step after training
+        current_step = self.__get_step(model)
+        self._log_metrics(model, data, "train", step=current_step)
         if verbose:
             print("_train_model complete")
 
