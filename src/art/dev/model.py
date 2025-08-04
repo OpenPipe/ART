@@ -1,25 +1,12 @@
 from enum import Enum
-from typing import Sequence
 from typing_extensions import TypedDict
 
 from .engine import EngineArgs
 from .torchtune import TorchtuneArgs
 
 
-class ExplicitEnum(str, Enum):
-    """
-    Enum with more explicit error message for missing values.
-    """
-
-    @classmethod
-    def _missing_(cls, value):
-        raise ValueError(
-            f"{value} is not a valid {cls.__name__}, please select one of {list(cls._value2member_map_.keys())}"
-        )
-
-
 # Vendored from transformers.training_args.OptimizerNames
-class OptimizerNames(ExplicitEnum):
+class OptimizerNames(str, Enum):
     """
     Stores the acceptable string identifiers for optimizers.
     """
@@ -68,13 +55,13 @@ class OptimizerNames(ExplicitEnum):
 
 
 # Vendored from transformers.debug_utils.DebugOption
-class DebugOption(ExplicitEnum):
+class DebugOption(str, Enum):
     UNDERFLOW_OVERFLOW = "underflow_overflow"
     TPU_METRICS_DEBUG = "tpu_metrics_debug"
 
 
 # Vendored from transformers.trainer_utils.IntervalStrategy
-class IntervalStrategy(ExplicitEnum):
+class IntervalStrategy(str, Enum):
     NO = "no"
     STEPS = "steps"
     EPOCH = "epoch"
@@ -85,7 +72,7 @@ SaveStrategy = IntervalStrategy
 
 
 # Vendored from transformers.trainer_utils.HubStrategy
-class HubStrategy(ExplicitEnum):
+class HubStrategy(str, Enum):
     END = "end"
     EVERY_SAVE = "every_save"
     CHECKPOINT = "checkpoint"
@@ -93,7 +80,7 @@ class HubStrategy(ExplicitEnum):
 
 
 # Vendored from transformers.trainer_utils.SchedulerType
-class SchedulerType(ExplicitEnum):
+class SchedulerType(str, Enum):
     LINEAR = "linear"
     COSINE = "cosine"
     COSINE_WITH_RESTARTS = "cosine_with_restarts"
@@ -108,7 +95,7 @@ class SchedulerType(ExplicitEnum):
 
 
 # Vendored from transformers.trainer_utils.FSDPOption
-class FSDPOption(ExplicitEnum):
+class FSDPOption(str, Enum):
     FULL_SHARD = "full_shard"
     SHARD_GRAD_OP = "shard_grad_op"
     NO_SHARD = "no_shard"
@@ -241,7 +228,7 @@ class TrainerArgs(TypedDict, total=False):
     ddp_backend: str | None
     tpu_num_cores: int | None
     tpu_metrics_debug: bool
-    debug: str | Sequence["DebugOption"]
+    debug: str | list[DebugOption]
     dataloader_drop_last: bool
     eval_steps: float | None
     dataloader_num_workers: int
@@ -255,7 +242,7 @@ class TrainerArgs(TypedDict, total=False):
     metric_for_best_model: str | None
     greater_is_better: bool | None
     ignore_data_skip: bool
-    fsdp: Sequence["FSDPOption"] | str | None
+    fsdp: list[FSDPOption] | str | None
     fsdp_min_num_params: int
     fsdp_config: dict | str | None
     fsdp_transformer_layer_cls_to_wrap: str | None
