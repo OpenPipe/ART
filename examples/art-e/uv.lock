@@ -3226,6 +3226,7 @@ backend = [
     { name = "torch" },
     { name = "torchao" },
     { name = "torchtune" },
+    { name = "transformers" },
     { name = "trl" },
     { name = "unsloth" },
     { name = "unsloth-zoo" },
@@ -3257,6 +3258,8 @@ requires-dist = [
     { name = "torch", marker = "extra == 'backend'", specifier = ">=2.7.0" },
     { name = "torchao", marker = "extra == 'backend'", specifier = ">=0.9.0" },
     { name = "torchtune", marker = "extra == 'backend'", git = "https://github.com/pytorch/torchtune.git?rev=2344509cf83bd886538fe3e8263e5145d1afb5c2" },
+    { name = "transformers", marker = "extra == 'backend'", specifier = "==4.53.2" },
+    { name = "trl", marker = "extra == 'backend'", specifier = "==0.19.0" },
     { name = "trl", marker = "extra == 'backend'", specifier = ">=0.19.0" },
     { name = "typer", specifier = ">=0.15.2" },
     { name = "unsloth", marker = "extra == 'backend'", specifier = "==2025.6.12" },
@@ -5786,7 +5789,7 @@ wheels = [
 
 [[package]]
 name = "transformers"
-version = "4.53.0"
+version = "4.53.2"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "filelock" },
@@ -5800,9 +5803,9 @@ dependencies = [
     { name = "tokenizers" },
     { name = "tqdm" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/e8/40/f2d2c3bcf5c6135027cab0fd7db52f6149a1c23acc4e45f914c43d362386/transformers-4.53.0.tar.gz", hash = "sha256:f89520011b4a73066fdc7aabfa158317c3934a22e3cd652d7ffbc512c4063841", size = 9177265, upload-time = "2025-06-26T16:10:54.729Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/4c/67/80f51466ec447028fd84469b208eb742533ce06cc8fad2e3181380199e5c/transformers-4.53.2.tar.gz", hash = "sha256:6c3ed95edfb1cba71c4245758f1b4878c93bf8cde77d076307dacb2cbbd72be2", size = 9201233, upload-time = "2025-07-11T12:39:08.742Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/5e/0c/68d03a38f6ab2ba2b2829eb11b334610dd236e7926787f7656001b68e1f2/transformers-4.53.0-py3-none-any.whl", hash = "sha256:7d8039ff032c01a2d7f8a8fe0066620367003275f023815a966e62203f9f5dd7", size = 10821970, upload-time = "2025-06-26T16:10:51.505Z" },
+    { url = "https://files.pythonhosted.org/packages/96/88/beb33a79a382fcd2aed0be5222bdc47f41e4bfe7aaa90ae1374f1d8ea2af/transformers-4.53.2-py3-none-any.whl", hash = "sha256:db8f4819bb34f000029c73c3c557e7d06fc1b8e612ec142eecdae3947a9c78bf", size = 10826609, upload-time = "2025-07-11T12:39:05.461Z" },
 ]
 
 [[package]]
@@ -5838,16 +5841,16 @@ wheels = [
 
 [[package]]
 name = "trl"
-version = "0.19.1"
+version = "0.19.0"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "accelerate" },
     { name = "datasets" },
     { name = "transformers" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/3d/69/303db8941a08edd646f658d18a0f00a5b83df523ae8967bbc6cce3a81466/trl-0.19.1.tar.gz", hash = "sha256:545592462ed985f4b77c9b1dbc0957efb17c43262648bb147abf3250ad3ff100", size = 397181, upload-time = "2025-07-08T00:48:40.359Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/d1/b6/660a997e547bbd7157875eb76e73fd81c5f30e8f00f4421a5bab59ea97b8/trl-0.19.0.tar.gz", hash = "sha256:b91fd44066f9fac58f9ca2717c3c9367eb8f75421599e403be35d3bbe87b8f35", size = 396208, upload-time = "2025-06-20T16:53:20.947Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/a2/19/42df113377d440f2a5a0a45ffa617db03c4a25b1e4cd171b018649845eb0/trl-0.19.1-py3-none-any.whl", hash = "sha256:8a2d4277b4ba7221eaab545a35ee89b6fbb8721fa3709ac01876a8c1bd7fd78a", size = 376159, upload-time = "2025-07-08T00:48:38.843Z" },
+    { url = "https://files.pythonhosted.org/packages/c4/69/7c8541f1e1834698b8ba3e344121169f774dd72a8f4e308834e6c8eceb7d/trl-0.19.0-py3-none-any.whl", hash = "sha256:0dcd0723c736648e8367d1e8943b646b4c0596812eda7e697984641e54428ed0", size = 375757, upload-time = "2025-06-20T16:53:19.622Z" },
 ]
 
 [[package]]

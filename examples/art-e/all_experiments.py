@@ -235,3 +235,8 @@ models["234"] = models["206"].model_copy(deep=True)
 models["234"].name = "email-agent-234"
 models["234"].config.importance_sampling_level = "sequence"
 models["234"].config.num_epochs = 10
+
+# Model 235: Like 206 but with num_validation_runs=10 to reduce validation noise
+models["235"] = models["206"].model_copy(deep=True)
+models["235"].name = "email-agent-235"
+models["235"].config.num_validation_runs = 10

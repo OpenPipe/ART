@@ -9,7 +9,7 @@ from art_e.project_types import ProjectPolicyConfig
 
 
 async def benchmark_model(
-    model: art.Model,
+    model: art.Model[ProjectPolicyConfig],
     limit: int = 100,
     step: int = 0,
     report: bool = True,
@@ -22,9 +22,15 @@ async def benchmark_model(
             report_trajectory(model, traj, step)
         return traj
 
+    # Create a list of tasks, running each scenario num_runs times
+    tasks = []
+    for scenario in val_scenarios:
+        for _ in range(model.config.num_validation_runs):
+            tasks.append(rollout_and_report(scenario))
+
     val_trajectories = await tqdm.gather(
-        *(rollout_and_report(scenario) for scenario in val_scenarios),
-        desc=f"validation {model.name}",
+        *tasks,
+        desc=f"validation {model.name} ({model.config.num_validation_runs}x per entry)",
     )
 
     valid_trajectories = [t for t in val_trajectories if isinstance(t, art.Trajectory)]
@@ -54,7 +60,7 @@ if __name__ == "__main__":
             art.Model(
                 name="openai/gpt-4.1",
                 project="email_agent",
-                config=ProjectPolicyConfig(litellm_model_name="openai/gpt-4.1"),
+                config=ProjectPolicyConfig(),
             ),
             limit=2,
         )
