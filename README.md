@@ -21,47 +21,28 @@ Train multi-step agents for real-world tasks using GRPO.
 
 </div>
 
-## 🔌 MCP•RL: Teach your agents to master MCP
+## 📏 RULER: Zero-Shot Agent Rewards
 
-<img src="assets/MCP_RL_diagram.svg" width="7000">
+**RULER** (Relative Universal LLM-Elicited Rewards) eliminates the need for hand-crafted reward functions by using an LLM-as-judge to automatically score agent trajectories. Simply define your task in the system prompt, and RULER handles the rest—**no labeled data, expert feedback, or reward engineering required**.
 
-**MCP•RL** enables you to train agents to effectively use any MCP (Model Context Protocol) server with minimal setup. Simply provide a server URL and MCP•RL will:
+✨ **Key Benefits:**
 
-1. Automatically discover server tools
-2. Design input tasks that utilize those tools
-3. Train the model to improve performance on the MCP server using RULER
-4. Test on new tasks to validate the trained model
-
-✨ **Key Features:**
-
-- **No labeled data** - MCP•RL learns what tasks a server will be used for by analyzing its tools
-- **General-purpose** - Optimizes models for any MCP server
-- **Strong performance** - Matches or exceeds SOTA performance in 2/3 benchmarks
-- **Easy integration** - No customization of your MCP server required!
+- **2-3x faster development** - Skip reward function engineering entirely
+- **General-purpose** - Works across any task without modification
+- **Strong performance** - Matches or exceeds hand-crafted rewards in 3/4 benchmarks
+- **Easy integration** - Drop-in replacement for manual reward functions
 
 ```python
-from art.rewards import ruler_score_group
+# Before: Hours of reward engineering
+def complex_reward_function(trajectory):
+    # 50+ lines of careful scoring logic...
+    pass
 
-# Specialize a model for NWS MCP server
-MCP_SERVER_URL = "https://server.smithery.ai/@smithery-ai/national-weather-service/mcp"
-
-# Generate training scenarios based on MCP tools
-scenarios = await generate_scenarios(
-    num_scenarios=24,
-    server_url=MCP_SERVER_URL,
-)
-
-# ...run the agent...
-
-# Use RULER to assign relative scores to each trajectory
-scored_groups = []
-for group in groups:
-    judged_group = await ruler_score_group(group)
-    scored_groups.append(judged_group)
-
-# Train the model to improve performance on the MCP server
-await model.train(scored_groups)
+# After: One line with RULER
+judged_group = await ruler_score_group(group, "openai/o3")
 ```
+
+[📖 Learn more about RULER →](https://art.openpipe.ai/fundamentals/ruler)
 
 ## ART Overview
 
@@ -71,7 +52,6 @@ ART is an open-source RL framework that improves agent reliability by allowing L
 
 | Agent Task         | Example Notebook                                                                                                             | Description                                     | Comparative Performance                                                                                                                                                                             |
 | ------------------ | ---------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| **MCP•RL**         | [🏋️ Train agent](https://colab.research.google.com/github/openpipe/art/blob/art-mcp/examples/mcp-rl/mcp_rl.ipynb)            | Qwen 2.5 3B masters the NWS MCP server          | [Link coming soon]                                                                                                                                                                                  |
 | **ART•E [RULER]**  | [🏋️ Train agent](https://colab.research.google.com/github/openpipe/art/blob/main/examples/art-e/art-e.ipynb)                 | Qwen 2.5 7B learns to search emails using RULER | <img src="https://github.com/openpipe/art/raw/main/assets/benchmarks/email_agent/accuracy-training-progress.svg" height="72"> [benchmarks](/examples/art-e/art_e/evaluate/display_benchmarks.ipynb) |
 | **2048**           | [🏋️ Train agent](https://colab.research.google.com/github/openpipe/art/blob/main/examples/2048/2048.ipynb)                   | Qwen 2.5 3B learns to play 2048                 | <img src="https://github.com/openpipe/art/raw/main/assets/benchmarks/2048/accuracy-training-progress.svg" height="72"> [benchmarks](/examples/2048/benchmark_2048.ipynb)                            |
 | **Temporal Clue**  | [🏋️ Train agent](https://colab.research.google.com/github/openpipe/art/blob/main/examples/temporal_clue/temporal-clue.ipynb) | Qwen 2.5 7B learns to solve Temporal Clue       | [Link coming soon]                                                                                                                                                                                  |

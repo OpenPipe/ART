@@ -1,1 +1,0 @@
-"""MCP AlphaVantage Python Server"""
