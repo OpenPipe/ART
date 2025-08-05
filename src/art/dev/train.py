@@ -12,8 +12,9 @@ positive advantages. Defaults to 0.0 (perfectly balanced)."""
     epsilon_high: (
         float | None
     )  # asymmetric clip upper bound. Defaults to epsilon when None
-    importance_sampling_level: Literal["token", "sequence"]
     logprob_calculation_chunk_size: int
+    importance_sampling_level: Literal["token", "sequence"]
+    max_negative_advantage_importance_sampling_weight: float
     plot_tensors: bool
     precalculate_logprobs: bool
     scale_rewards: bool
