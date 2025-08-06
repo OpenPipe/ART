@@ -73,7 +73,7 @@ async def main():
 
     print(df.to_pandas().to_markdown())
 
-    print(f"View full table at `./data/benchmark_prompted_models.html`")
+    print("View full table at `./data/benchmark_prompted_models.html`")
 
 
 asyncio.run(main())

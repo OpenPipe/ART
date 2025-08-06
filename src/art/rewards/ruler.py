@@ -237,7 +237,9 @@ async def ruler_score_group(
         new_traj = t.__class__(
             messages_and_choices=t.messages_and_choices.copy(),
             tools=t.tools.copy() if t.tools else None,
-            additional_histories=[h.model_copy(deep=True) for h in t.additional_histories],
+            additional_histories=[
+                h.model_copy(deep=True) for h in t.additional_histories
+            ],
             reward=t.reward,
             metrics=t.metrics.copy(),
             metadata=t.metadata.copy(),
