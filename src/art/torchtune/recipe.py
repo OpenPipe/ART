@@ -24,8 +24,6 @@ from torch.distributed.device_mesh import DeviceMesh
 from torch.distributed.fsdp import FSDPModule
 from torch.distributed.tensor import DTensor
 from torch.distributed.tensor.parallel import parallelize_module
-from torch.nn.attention import flex_attention
-from torchtune.modules import attention_utils
 from torch.optim import Optimizer
 from torchao.float8 import precompute_float8_dynamic_scale_for_fsdp
 from torchtune import config, modules, training, utils
