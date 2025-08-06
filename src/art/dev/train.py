@@ -19,4 +19,3 @@ positive advantages. Defaults to 0.0 (perfectly balanced)."""
     precalculate_logprobs: bool
     scale_rewards: bool
     truncated_importance_sampling: float | None
-    use_causal_advantages: bool
