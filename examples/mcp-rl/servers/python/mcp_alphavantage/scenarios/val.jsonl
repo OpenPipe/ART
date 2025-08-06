@@ -1,0 +1,8 @@
+{"task": "Calculate the 60-minute SMA for IBM and generate a detailed trend analysis including a summary of the work done and a thorough analysis and report of the results.", "difficulty": 3}
+{"task": "Compare the weekly RSI and monthly SMA for a stock like Costco (COST), providing a detailed trend analysis and generating a summary of the work done and a thorough analysis and report of the results.", "difficulty": 4}
+{"task": "Obtain the company overview and daily RSI for Facebook (FB), then generate a combined summary of the work done and a thorough analysis and report of the results.", "difficulty": 3}
+{"task": "Perform a market research task by searching for stock symbols related to 'bank', selecting a top candidate, retrieving its daily time series and technical indicators (SMA and RSI), and generating a summary of the work done with a thorough analysis and report of the results.", "difficulty": 5}
+{"task": "Retrieve the daily time series for Tesla (TSLA) and generate a summary of the work done and a thorough analysis and report of the results.", "difficulty": 2}
+{"task": "Perform a technical analysis by comparing the 30-day SMA and the 14-day RSI for IBM. Generate a summary of the work done and a thorough analysis and report of the results.", "difficulty": 3}
+{"task": "Fetch the daily Relative Strength Index (RSI) for Apple (AAPL) and generate a summary of the work done and a thorough analysis and report of the results.", "difficulty": 2}
+{"task": "Search for stock symbols that match the keyword 'Tesla', then analyze the top result and generate a summary of the work done and a thorough analysis and report of the results.", "difficulty": 2}

@@ -1,0 +1,16 @@
+{"task": "Get detailed team information using a specific team ID, analyze their win-loss records for the season, and compile a summary report of their overall performance.", "difficulty": 2}
+{"task": "Fetch information for games associated with a designated team over a set period, then produce a summary analysis report on game outcomes and player contributions.", "difficulty": 3}
+{"task": "Retrieve the list of games played on a specific date, and analyze game trends and score differentials in a detailed summary report.", "difficulty": 2}
+{"task": "Search for NBA players with the last name 'James', retrieve their profiles, and create an in-depth summary analyzing their career trajectories and performance highlights.", "difficulty": 3}
+{"task": "Analyze the performance of a specific division by retrieving relevant team data and corresponding game results, then compile a complete summary report highlighting seasonal performance trends.", "difficulty": 5}
+{"task": "Search and filter games involving a prominent rivalry between two specific teams by dates, then generate a thorough analysis report summarizing key moments, statistics, and shifts in momentum.", "difficulty": 4}
+{"task": "Gather data for multiple teams within the same division, perform an analytical comparison of their cumulative seasonal performance, and produce a comprehensive summary report detailing trends and insights.", "difficulty": 3}
+{"task": "Compile an analysis report by filtering NBA games using season and date filters, summarizing predictive trends in upcoming game performances with a detailed summary of key metrics.", "difficulty": 2}
+{"task": "Fetch game data for a specific season and a designated team, analyze win-loss records and performance trends, and prepare an in-depth summary report on the season's outcomes.", "difficulty": 3}
+{"task": "Lookup teams by conference, retrieve their game results over a set time period, and compile a detailed analysis report comparing their performance trends and scoring statistics.", "difficulty": 4}
+{"task": "Generate a summary report by fetching player data for a specific team, then analyze individual contributions and overall team performance throughout the season.", "difficulty": 3}
+{"task": "Compile data for teams based on a specific division and then generate an analytical report on the distribution of wins, losses, and performance trends within that division.", "difficulty": 3}
+{"task": "Retrieve multiple players using search filters, analyze patterns in their recent performances, and generate a comprehensive summary report highlighting their improvements and trends.", "difficulty": 2}
+{"task": "Retrieve player details using name search filters, then provide a comprehensive analysis comparing their season statistics with career averages, accompanied by a summary report.", "difficulty": 4}
+{"task": "Gather NBA game data for postseason matches for a given season, and generate a detailed report analyzing key playoff trends and performance metrics.", "difficulty": 4}
+{"task": "Retrieve player data for multiple specific player IDs, then perform a thorough analysis of their statistical performance and provide a comprehensive summary report.", "difficulty": 3}

@@ -1,0 +1,20 @@
+[project]
+name = "mcp-googlemaps"
+version = "0.1.0"
+description = "Google Maps MCP Server - Provides access to Google Maps APIs including Geocoding and Places"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "aiohttp>=3.9.0",
+    "click>=8.1.0",
+    "mcp>=1.0.0",
+    "python-dotenv>=1.0.0",
+    "tenacity>=8.0.0",
+]
+
+[project.scripts]
+mcp-googlemaps = "mcp_googlemaps.server:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"

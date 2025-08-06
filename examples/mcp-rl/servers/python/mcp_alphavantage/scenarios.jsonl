@@ -1,0 +1,24 @@
+{"task": "Get the current stock price for Apple (AAPL).", "difficulty": 1}
+{"task": "Retrieve daily time series data for Microsoft (MSFT) using compact output.", "difficulty": 1}
+{"task": "Search for stock symbol information using the keyword 'Amazon' to find relevant company details.", "difficulty": 1}
+{"task": "Obtain the company overview for Tesla (TSLA) to review its fundamentals.", "difficulty": 1}
+{"task": "Get the 30-day Simple Moving Average (SMA) for Google (GOOGL) using a daily interval for technical analysis.", "difficulty": 2}
+{"task": "Check the 14-day Relative Strength Index (RSI) for Netflix (NFLX) on a daily interval to monitor momentum.", "difficulty": 2}
+{"task": "For a day trader: Retrieve the 5-minute RSI for GameStop (GME) to perform short-term trade assessments.", "difficulty": 3}
+{"task": "For an investor: Analyze daily time series data and retrieve the company overview for Coca-Cola (KO) to evaluate investment viability.", "difficulty": 3}
+{"task": "For a technical analyst: Compare the daily SMA and RSI for Nvidia (NVDA) to gauge trend and momentum.", "difficulty": 4}
+{"task": "For a researcher: Retrieve full daily time series data for IBM to conduct an in-depth historical trend analysis.", "difficulty": 4}
+{"task": "For technical analysis: Get the 15-minute SMA for AMD to identify short-term price trends.", "difficulty": 3}
+{"task": "For a quick market check: Retrieve the current stock quote for Berkshire Hathaway (BRK.A).", "difficulty": 1}
+{"task": "For a lookup: Search for the stock symbol related to 'Alphabet' to verify its ticker information.", "difficulty": 1}
+{"task": "For a detailed technical review: Retrieve both the 60-minute RSI and 60-minute SMA for Ford (F) to analyze market momentum and trends.", "difficulty": 5}
+{"task": "For quantitative research: Fetch the daily RSI for Intel (INTC) over the past few weeks to evaluate its price strength.", "difficulty": 3}
+{"task": "For portfolio management: Obtain the company overview for JPMorgan Chase (JPM) along with its current daily stock quote to assess overall performance.", "difficulty": 3}
+{"task": "For a comparative study: Retrieve daily time series data for both Pepsi (PEP) and Coca-Cola (KO) to compare their historical performance.", "difficulty": 5}
+{"task": "For advanced technical analysis: Get the monthly SMA for Procter & Gamble (PG) and compare it with its RSI to spot long-term trends.", "difficulty": 4}
+{"task": "For stock screening purposes: Search for companies whose names include 'Energy' to identify relevant stocks in the energy sector.", "difficulty": 2}
+{"task": "For high-level market sentiment analysis: Get the current stock price for ExxonMobil (XOM) and complement it with a 14-day daily RSI reading.", "difficulty": 4}
+{"task": "For day trading: Retrieve a real-time stock quote and the 1-minute RSI for Snap Inc. (SNAP) to make rapid trading decisions.", "difficulty": 3}
+{"task": "For risk assessment: Get the daily stock quote and corresponding time series data for Starbucks (SBUX) to evaluate recent market trends.", "difficulty": 4}
+{"task": "For a comprehensive research report: Fetch the full daily time series data and company overview for Johnson & Johnson (JNJ) to analyze both historical trends and fundamental strength.", "difficulty": 5}
+{"task": "For an integrated technical strategy: Retrieve both 30-minute SMA and 30-minute RSI for Advanced Micro Devices (AMD) and compare the signals to guide trading decisions.", "difficulty": 5}

@@ -1,0 +1,30 @@
+[project]
+name = "art-mcp"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "aiohttp>=3.12.14",
+    "asyncio>=3.4.3",
+    "click>=8.1.8",
+    "mcp>=1.11.0",
+    "openai>=1.74.0",
+    "openpipe-art[skypilot]",
+    "python-dotenv>=1.1.1",
+    "tenacity>=9.1.2",
+    "weave>=0.51.56",
+]
+
+
+[tool.uv.sources]
+openpipe-art = { path = "../../", editable = true }
+
+[dependency-groups]
+dev = [
+    "polars>=1.31.0",
+    "ipywidgets>=8.1.6",
+    "ipykernel>=6.29.5",
+    "matplotlib>=3.10.3",
+    "seaborn>=0.13.2",
+]
