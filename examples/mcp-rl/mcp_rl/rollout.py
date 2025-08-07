@@ -152,6 +152,7 @@ async def rollout(
                                 if model.inference_model_name
                                 else model.name,
                                 messages=traj.messages(),
+                                temperature=1.0,
                                 tools=tool_schemas,
                                 max_completion_tokens=8000,
                             )
