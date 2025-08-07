@@ -10,15 +10,14 @@
 import os
 import sys
 import time
-
 from functools import partial
-from typing import Any, Optional, Union
+from typing import Any, Optional, Union, cast
 from warnings import warn
 
-from omegaconf import DictConfig, OmegaConf
-from pydantic import ValidationError
 import setproctitle
 import torch
+from omegaconf import DictConfig, OmegaConf
+from pydantic import ValidationError
 from torch.distributed import destroy_process_group, init_process_group
 from torch.distributed.device_mesh import DeviceMesh
 from torch.distributed.fsdp import FSDPModule
@@ -31,24 +30,24 @@ from torchtune.modules import TransformerDecoder
 from torchtune.modules.moe import utils as moe_utils
 from torchtune.recipe_interfaces import FTRecipeInterface
 from torchtune.training import (
-    DummyProfiler,
     VALID_BACKENDS_FOR_MEMORY_STATS,
+    DummyProfiler,
+    FullModelHFCheckpointer,
 )
 from torchtune.training.activations import apply_selective_activation_checkpointing
 from torchtune.training.checkpointing._checkpoint_client import (
     CheckpointClient,
     TrainingProgress,
 )
-from torchtune.training import FullModelHFCheckpointer
 from torchtune.training.memory import OptimizerInBackwardWrapper
 from torchtune.training.quantization import (
     convert_to_float8_training,
     is_fp8_tensorwise_scaling,
 )
 from tqdm import tqdm
-from typing import cast
 
-
+from .. import dev, types
+from ..local.pack import PackedTensors, packed_tensors_from_dir
 from .batch import Batch
 from .config import (
     CompileConfig,
@@ -57,8 +56,6 @@ from .config import (
     ProfilerConfig,
     RecipeConfig,
 )
-from .. import dev, types
-from ..local.pack import PackedTensors, packed_tensors_from_dir
 
 
 class FullFinetuneRecipeDistributed(FTRecipeInterface):
@@ -706,10 +703,10 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
         dev_config: dev.TrainConfig,
         return_new_logprobs: bool = False,
     ) -> torch.Tensor:
-        from ..unsloth.train import shift_tensor
-
         import torch
-        from torch.nn.attention.flex_attention import create_block_mask, BlockMask
+        from torch.nn.attention.flex_attention import BlockMask, create_block_mask
+
+        from ..unsloth.train import shift_tensor
 
         def make_block_mask(
             group_ids: torch.Tensor,  # [B, S]  int32/64
@@ -1057,9 +1054,10 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
 
     def _get_micro_batches(self, curr_epoch: int) -> tuple[list[PackedTensors], Batch]:
         import math
-        from pathlib import Path
-        from safetensors.torch import save_file
         import time
+        from pathlib import Path
+
+        from safetensors.torch import save_file
 
         while True:
             with open(f"{self._output_dir}/batches.jsonl", "r") as f:

@@ -1,15 +1,16 @@
 import json
-import yaml
 from typing import Any
 
-from art import TrajectoryGroup, Trajectory
-from art.trajectories import History
-from art.types import Choice, Message, MessageOrChoice
+import yaml
 from openai.types.chat.chat_completion_message_param import (
+    ChatCompletionAssistantMessageParam,
     ChatCompletionSystemMessageParam,
     ChatCompletionUserMessageParam,
-    ChatCompletionAssistantMessageParam,
 )
+
+from art import Trajectory, TrajectoryGroup
+from art.trajectories import History
+from art.types import Choice, Message, MessageOrChoice
 
 
 # serialize trajectory groups to a jsonl string

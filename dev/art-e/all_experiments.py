@@ -1,6 +1,6 @@
-import art
 from art_e.project_types import ProjectPolicyConfig
 
+import art
 
 models: dict[str, art.TrainableModel[ProjectPolicyConfig]] = {
     "002": art.TrainableModel(

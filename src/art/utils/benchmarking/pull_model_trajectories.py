@@ -1,7 +1,7 @@
 import os
 
-from art.model import Model as ArtModel
 from art.local import LocalBackend
+from art.model import Model as ArtModel
 
 
 async def pull_model_trajectories(model: ArtModel) -> None:

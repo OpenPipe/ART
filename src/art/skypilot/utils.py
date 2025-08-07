@@ -1,8 +1,9 @@
-import sky
 import asyncio
 from typing import Callable, TypeVar
-from sky.core import endpoints
+
 import httpx
+import sky
+from sky.core import endpoints
 
 T = TypeVar("T")
 

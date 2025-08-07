@@ -1,16 +1,17 @@
 """Generate scenarios for MCP agent evaluation using OpenAI's o3 model."""
 
-import json
-import os
-import importlib.util
 import argparse
 import asyncio
+import importlib.util
+import json
+import os
 import random
-from typing import List, Dict, Any
-from mcp import ClientSession
-from mcp.client.stdio import stdio_client
+from typing import Any, Dict, List
+
 import openai
 from dotenv import load_dotenv
+from mcp import ClientSession
+from mcp.client.stdio import stdio_client
 
 load_dotenv()
 

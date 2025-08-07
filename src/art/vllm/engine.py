@@ -1,13 +1,14 @@
 """Engine and worker management for vLLM."""
 
 import asyncio
-import cloudpickle
 import contextlib
 import contextvars
-from dataclasses import replace
 import os
 import time
-from typing import Any, Callable, cast, Coroutine, Generator, ParamSpec, TypeVar
+from dataclasses import replace
+from typing import Any, Callable, Coroutine, Generator, ParamSpec, TypeVar, cast
+
+import cloudpickle
 import vllm
 from vllm.engine.async_llm_engine import AsyncLLMEngine
 from vllm.v1.engine.async_llm import AsyncLLM

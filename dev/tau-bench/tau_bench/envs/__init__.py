@@ -1,6 +1,7 @@
 # Copyright Sierra
 
 from typing import Optional, Union
+
 from tau_bench.envs.base import Env
 from tau_bench.envs.user import UserStrategy
 

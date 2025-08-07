@@ -1,5 +1,6 @@
 import os
 from typing import TYPE_CHECKING
+
 from art.utils.output_dirs import get_model_dir
 
 if TYPE_CHECKING:

@@ -2,16 +2,17 @@ import asyncio
 import json
 import os
 import time
-from typing import Any, TYPE_CHECKING
-import aiohttp
 from enum import Enum
+from typing import TYPE_CHECKING, Any
+
+import aiohttp
+from pydantic import BaseModel
+
 from art.errors import (
     LoRADeploymentTimedOutError,
     UnsupportedBaseModelDeploymentError,
     UnsupportedLoRADeploymentProviderError,
 )
-from pydantic import BaseModel
-
 from art.utils.get_model_step import get_model_step
 from art.utils.output_dirs import get_default_art_path
 from art.utils.s3 import archive_and_presign_step_url, pull_model_from_s3

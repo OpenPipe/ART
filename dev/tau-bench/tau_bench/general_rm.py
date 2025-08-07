@@ -1,11 +1,13 @@
 import copy
-from tau_bench.types import RunConfig, SolveResult
-import art
-from pydantic import BaseModel, Field
 from typing import Any, Dict, List, Tuple, Type, TypeVar
-from openai.types.chat.chat_completion import Choice
+
 from openai import AsyncOpenAI
+from openai.types.chat.chat_completion import Choice
+from pydantic import BaseModel, Field
+
+import art
 from tau_bench.rl_utils import update_openpipe_log
+from tau_bench.types import RunConfig, SolveResult
 
 T = TypeVar("T")
 

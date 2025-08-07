@@ -1,5 +1,4 @@
 from tau_bench.model_utils.api.api import API as API
-from tau_bench.model_utils.api.api import default_api_from_args as default_api_from_args
 from tau_bench.model_utils.api.api import (
     BinaryClassifyDatapoint as BinaryClassifyDatapoint,
 )
@@ -9,6 +8,7 @@ from tau_bench.model_utils.api.api import ParseDatapoint as ParseDatapoint
 from tau_bench.model_utils.api.api import ParseForceDatapoint as ParseForceDatapoint
 from tau_bench.model_utils.api.api import ScoreDatapoint as ScoreDatapoint
 from tau_bench.model_utils.api.api import default_api as default_api
+from tau_bench.model_utils.api.api import default_api_from_args as default_api_from_args
 from tau_bench.model_utils.api.api import default_quick_api as default_quick_api
 from tau_bench.model_utils.api.datapoint import Datapoint as Datapoint
 from tau_bench.model_utils.api.datapoint import EvaluationResult as EvaluationResult

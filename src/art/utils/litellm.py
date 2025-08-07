@@ -1,3 +1,10 @@
+from litellm.types.utils import (
+    ChoiceLogprobs as LitellmChoiceLogprobs,
+)
+from litellm.types.utils import (
+    Choices,
+    StreamingChoices,
+)
 from openai.types.chat.chat_completion import Choice, ChoiceLogprobs
 from openai.types.chat.chat_completion_message import ChatCompletionMessage
 from openai.types.chat.chat_completion_message_tool_call import (
@@ -7,11 +14,6 @@ from openai.types.chat.chat_completion_message_tool_call import (
 from openai.types.chat.chat_completion_token_logprob import (
     ChatCompletionTokenLogprob,
     TopLogprob,
-)
-from litellm.types.utils import (
-    Choices,
-    StreamingChoices,
-    ChoiceLogprobs as LitellmChoiceLogprobs,
 )
 
 

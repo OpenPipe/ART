@@ -1,11 +1,12 @@
-import art
-from art_e.rollout import rollout
-from art_e.data.query_iterators import load_synthetic_queries
 import polars as pl
-from art_e.report_trajectory import report_trajectory
+from art_e.data.query_iterators import load_synthetic_queries
 from art_e.data.types_enron import SyntheticQuery
-from tqdm.asyncio import tqdm
 from art_e.project_types import ProjectPolicyConfig
+from art_e.report_trajectory import report_trajectory
+from art_e.rollout import rollout
+from tqdm.asyncio import tqdm
+
+import art
 
 
 async def benchmark_model(
@@ -51,6 +52,7 @@ async def benchmark_model(
 
 if __name__ == "__main__":
     import asyncio
+
     from dotenv import load_dotenv
 
     load_dotenv()

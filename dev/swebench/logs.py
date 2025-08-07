@@ -1,12 +1,12 @@
+import logging
+from logging import Handler, LogRecord
+
+import litellm
 from langfuse import Langfuse
 from langfuse.decorators import langfuse_context
 from langfuse.types import SpanLevel
-from logging import Handler, LogRecord
-import litellm
-import logging
 from sweagent.agent.agents import DefaultAgent
 from sweagent.run.hooks.apply_patch import SaveApplyPatchHook
-
 
 # Add Langfuse callbacks for SWE-agent litellm calls
 litellm.success_callback.append("langfuse")

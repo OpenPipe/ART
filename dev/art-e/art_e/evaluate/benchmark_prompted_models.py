@@ -1,15 +1,17 @@
 # To run:
 # uv run scripts/benchmark_prompted_models.py
 
-import art
 import asyncio
-import polars as pl
-from art.local import LocalBackend
-from dotenv import load_dotenv
-from art_e.data.local_email_db import generate_database
-from art_e.project_types import ProjectPolicyConfig
-from art_e.evaluate.benchmark import benchmark_model
 import os
+
+import polars as pl
+from art_e.data.local_email_db import generate_database
+from art_e.evaluate.benchmark import benchmark_model
+from art_e.project_types import ProjectPolicyConfig
+from dotenv import load_dotenv
+
+import art
+from art.local import LocalBackend
 
 load_dotenv()
 generate_database()

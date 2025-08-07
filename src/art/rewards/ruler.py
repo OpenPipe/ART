@@ -9,15 +9,17 @@ scores within each group.
 For detailed documentation and examples, see: https://art.openpipe.ai/fundamentals/ruler
 """
 
-import art
-from typing import List
 import json
+from textwrap import dedent
+from typing import List
+
 from litellm import acompletion
 from litellm.types.utils import ModelResponse
-from textwrap import dedent
+from openai.types.chat.chat_completion_message_param import ChatCompletionMessageParam
 from pydantic import BaseModel, Field
 from rich import print
-from openai.types.chat.chat_completion_message_param import ChatCompletionMessageParam
+
+import art
 
 
 class TrajectoryScore(BaseModel):

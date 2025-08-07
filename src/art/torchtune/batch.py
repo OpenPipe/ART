@@ -1,8 +1,7 @@
 from pydantic import BaseModel
 
+from .. import dev, types
 from ..local.pack import DiskPackedTensors
-from .. import types
-from .. import dev
 
 
 class Batch(BaseModel):

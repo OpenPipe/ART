@@ -1,24 +1,25 @@
 import asyncio
+import gc
+import os
 from contextlib import asynccontextmanager
 from dataclasses import replace
-import gc
-import unsloth  # type: ignore
-from datasets import Dataset
+from typing import TYPE_CHECKING, Any, AsyncGenerator, cast
+
 import nest_asyncio
-import os
 import peft
 import torch
+import unsloth  # type: ignore
+from datasets import Dataset
 from transformers.tokenization_utils_base import PreTrainedTokenizerBase
 from transformers.utils.dummy_pt_objects import (
-    PreTrainedModel,
     GenerationMixin,
+    PreTrainedModel,
 )
 from trl import GRPOConfig, GRPOTrainer
-from typing import Any, AsyncGenerator, cast, TYPE_CHECKING
-from vllm.engine.async_llm_engine import AsyncLLMEngine
 from vllm.engine.arg_utils import AsyncEngineArgs
-from vllm.worker.worker_base import WorkerWrapperBase
+from vllm.engine.async_llm_engine import AsyncLLMEngine
 from vllm.worker.multi_step_model_runner import MultiStepModelRunner
+from vllm.worker.worker_base import WorkerWrapperBase
 
 from ..dev.model import InternalModelConfig
 
@@ -119,8 +120,8 @@ class vLLMState:
         from ..vllm import (
             create_engine_pause_and_resume_functions,
             patch_allocator,
-            patch_lora_request,
             patch_get_lora_tokenizer_async,
+            patch_lora_request,
             patch_multi_step_model_runner,
         )
 

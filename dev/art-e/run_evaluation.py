@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
 
 import argparse
-import sky
+import os
 import textwrap
+
+import sky
 from dotenv import dotenv_values, load_dotenv
 from sky import ClusterStatus
-import os
 
 load_dotenv()
 

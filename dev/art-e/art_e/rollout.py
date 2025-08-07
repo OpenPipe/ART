@@ -1,27 +1,32 @@
+import json
+import logging
+import textwrap
+from dataclasses import asdict, dataclass
 from typing import Any, Dict
-import art
-from art_e.data.types_enron import SyntheticQuery
-from art import Trajectory
-from litellm import acompletion
+
 import litellm
+from art_e.data.types_enron import SyntheticQuery
 from art_e.email_search_tools import (
-    search_emails as search_emails_impl,
-    read_email as read_email_impl,
     Email,
 )
-from langchain_core.utils.function_calling import convert_to_openai_tool
-from litellm.caching.caching import LiteLLMCacheType, Cache
-import json
-from litellm.types.utils import Choices, ModelResponse
-from dataclasses import asdict
-from art.utils.litellm import convert_litellm_choice_to_openai
-from dataclasses import dataclass
+from art_e.email_search_tools import (
+    read_email as read_email_impl,
+)
+from art_e.email_search_tools import (
+    search_emails as search_emails_impl,
+)
 from art_e.project_types import ProjectPolicyConfig
-import textwrap
-from tenacity import retry, stop_after_attempt
-import logging
-from pydantic import BaseModel, Field, validate_call, ValidationError
+from langchain_core.utils.function_calling import convert_to_openai_tool
+from litellm import acompletion
+from litellm.caching.caching import Cache, LiteLLMCacheType
+from litellm.types.utils import Choices, ModelResponse
+from pydantic import BaseModel, Field, ValidationError, validate_call
 from rich import print
+from tenacity import retry, stop_after_attempt
+
+import art
+from art import Trajectory
+from art.utils.litellm import convert_litellm_choice_to_openai
 
 litellm.cache = Cache(type=LiteLLMCacheType.DISK)
 litellm.drop_params = True
@@ -395,10 +400,11 @@ async def rollout(
 
 
 if __name__ == "__main__":
+    import asyncio
+
+    import yaml
     from art_e.data.query_iterators import load_synthetic_queries
     from dotenv import load_dotenv
-    import asyncio
-    import yaml
 
     load_dotenv()
 
