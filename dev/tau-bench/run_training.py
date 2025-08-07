@@ -180,6 +180,27 @@ trainable_models["015"]._internal_config = art.dev.InternalModelConfig(
     ),
 )
 
+trainable_models["016"] = trainable_models["001"].model_copy(deep=True)
+assert trainable_models["016"].config.training_config is not None
+trainable_models["016"].name = "tau-bench-rl-016-tm-14b-gspo-2"
+trainable_models["016"].base_model = "Qwen/Qwen2.5-14B-Instruct"
+trainable_models["016"].config.training_config.trajectories_per_group = 32
+trainable_models["016"].config.training_config.groups_per_step = 32
+trainable_models["016"].config.training_config.training_dataset_size = 32
+trainable_models["016"].config.training_config.learning_rate = 5e-7
+trainable_models["016"].config.training_config.importance_sampling_level = "sequence"
+trainable_models["016"].config.run_config.skip_eval = False
+trainable_models["016"].config.run_config.reward_type = "real"
+trainable_models["016"].config.run_config.user_model = "gpt-4.1"
+trainable_models["016"].config.training_config.val_set_size = 60
+trainable_models["016"].config.training_config.eval_steps = 8
+trainable_models["016"]._internal_config = art.dev.InternalModelConfig(
+    engine_args=art.dev.EngineArgs(tensor_parallel_size=8, gpu_memory_utilization=0.75),
+    torchtune_args=art.dev.TorchtuneArgs(
+        model="qwen2_5_14b_instruct", model_type="QWEN2", async_weight_syncing=True
+    ),
+)
+
 # trainable_models["002"] = trainable_models["001"].model_copy(deep=True)
 # assert trainable_models["002"].config.training_config is not None
 # trainable_models["002"].name = "tau-bench-rl-002-tm-llm-reward-test"
@@ -281,7 +302,13 @@ def launch_model(model_key: str):
             "tensor_parallel_size", 1
         )
 
-    task.set_resources(sky.Resources(accelerators=f"H100-SXM:{num_gpus}"))
+    task.set_resources(
+        sky.Resources(
+            accelerators=f"H200-SXM:{num_gpus}",
+            cloud=sky.clouds.RunPod(),
+            region="US",
+        )
+    )
     task.set_file_mounts({"~/ART": "../.."})
 
     # Generate cluster name

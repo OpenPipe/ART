@@ -9,7 +9,7 @@ from typing import cast, Callable, TYPE_CHECKING
 
 from .. import dev
 from ..types import TrainConfig
-from ..utils import group_aggregate
+from ..utils.group_aggregate import group_aggregate
 
 if TYPE_CHECKING:
     from .service import TrainInputs
@@ -148,10 +148,18 @@ def get_compute_loss_fn(trainer: "GRPOTrainer") -> Callable[..., torch.Tensor]:
         epsilon_high = _config.get("epsilon_high", epsilon)
         if epsilon_high is None:
             epsilon_high = epsilon
+        if max_negative_advantage_importance_sampling_weight := _config.get(
+            "max_negative_advantage_importance_sampling_weight", None
+        ):
+            prob_ratio = torch.clamp(
+                prob_ratio, max=max_negative_advantage_importance_sampling_weight
+            )
         policy_loss = -torch.min(
             prob_ratio * advantages,
             torch.clip(prob_ratio, 1 - epsilon, 1 + epsilon_high) * advantages,
         )
+        if upper_bound := _config.get("truncated_importance_sampling", None):
+            policy_loss *= torch.clamp(prob_ratio, max=upper_bound)
         if ref_logprobs is not None:
             kl_div = (
                 torch.exp(ref_logprobs - new_logprobs)

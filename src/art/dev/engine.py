@@ -1,5 +1,4 @@
-from typing import Any, Literal, Tuple
-from typing_extensions import TypedDict
+from typing import Any, Literal, Tuple, TypedDict
 
 
 class EngineArgs(TypedDict, total=False):

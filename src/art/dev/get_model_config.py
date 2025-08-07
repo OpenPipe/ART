@@ -74,7 +74,7 @@ def get_model_config(
         ],  # Remove QKVO if out of memory
         lora_alpha=16,
         # Enable long context finetuning
-        use_gradient_checkpointing="unsloth",  # type: ignore
+        use_gradient_checkpointing="unsloth",
         random_state=3407,
     )
     peft_args.update(config.get("peft_args", {}))

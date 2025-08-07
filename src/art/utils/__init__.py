@@ -1,6 +1,5 @@
 # Import all utilities to maintain the same interface
 from .format_message import format_message
-from .group_aggregate import group_aggregate
 from .retry import retry
 from .iterate_dataset import iterate_dataset
 from .limit_concurrency import limit_concurrency
@@ -9,7 +8,6 @@ from .get_model_step import get_model_step
 
 __all__ = [
     "format_message",
-    "group_aggregate",
     "retry",
     "iterate_dataset",
     "limit_concurrency",

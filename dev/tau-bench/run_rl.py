@@ -362,9 +362,10 @@ async def train(model: art.TrainableModel[TauBenchPolicyConfig]):
                     groups,
                     config=art.TrainConfig(learning_rate=training_config.learning_rate),
                     _config=art.dev.TrainConfig(
+                        importance_sampling_level=training_config.importance_sampling_level,
                         allow_training_without_logprobs=True
                         if config.messages_only
-                        else False
+                        else False,
                     ),
                 )
                 if config.is_multi_gpu:

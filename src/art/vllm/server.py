@@ -71,13 +71,16 @@ async def openai_server_task(
 
     test_client_task = asyncio.create_task(test_client())
     try:
+        timeout = float(os.environ.get("ART_SERVER_TIMEOUT", 10.0))
         done, _ = await asyncio.wait(
             [openai_server_task, test_client_task],
-            timeout=10.0,
+            timeout=timeout,
             return_when="FIRST_COMPLETED",
         )
         if not done:
-            raise TimeoutError("Unable to reach OpenAI-compatible server in time.")
+            raise TimeoutError(
+                f"Unable to reach OpenAI-compatible server within {timeout} seconds. You can increase this timeout by setting the ART_SERVER_TIMEOUT environment variable."
+            )
         for task in done:
             task.result()
 

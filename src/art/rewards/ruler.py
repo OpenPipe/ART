@@ -230,7 +230,22 @@ async def ruler_score_group(
             raise ValueError("Additional histories are not supported by RULER yet.")
 
     # Create deep copies to avoid modifying the original trajectories
-    new_trajectories = [t.model_copy(deep=True) for t in group.trajectories]
+    # First create shallow copies to avoid issues with unpicklable objects
+    new_trajectories = []
+    for t in group.trajectories:
+        # Create a new trajectory with the same data but fresh objects
+        new_traj = t.__class__(
+            messages_and_choices=t.messages_and_choices.copy(),
+            tools=t.tools.copy() if t.tools else None,
+            additional_histories=[
+                h.model_copy(deep=True) for h in t.additional_histories
+            ],
+            reward=t.reward,
+            metrics=t.metrics.copy(),
+            metadata=t.metadata.copy(),
+            logs=t.logs.copy(),
+        )
+        new_trajectories.append(new_traj)
 
     # Extract message lists and preserve original rewards for comparison
     message_lists: list[list[ChatCompletionMessageParam]] = []
