@@ -3547,7 +3547,7 @@ requires-dist = [
     { name = "hf-xet", marker = "extra == 'backend'", specifier = ">=1.1.0" },
     { name = "litellm", specifier = ">=1.63.0" },
     { name = "matplotlib", marker = "extra == 'plotting'", specifier = ">=3.10.1" },
-    { name = "openai", specifier = ">=1.65.5" },
+    { name = "openai", specifier = ">=1.65.5,<=1.99.1" },
     { name = "peft", marker = "extra == 'backend'", specifier = ">=0.14.0" },
     { name = "polars", marker = "extra == 'backend'", specifier = ">=1.26.0" },
     { name = "seaborn", marker = "extra == 'plotting'", specifier = ">=0.13.2" },
