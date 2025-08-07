@@ -20,6 +20,7 @@ from pydantic import ValidationError
 import setproctitle
 import torch
 from torch.distributed import destroy_process_group, init_process_group
+from torch.distributed.device_mesh import DeviceMesh
 from torch.distributed.fsdp import FSDPModule
 from torch.distributed.tensor import DTensor
 from torch.distributed.tensor.parallel import parallelize_module
@@ -144,12 +145,14 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
         # Set up the backend for distributed training (NCCL, GLOO, etc.)
         self._enable_async_checkpointing = cfg.enable_async_checkpointing
         self.fsdp_cpu_offload = cfg.fsdp_cpu_offload
+        self.is_distributed = os.getenv("WORLD_SIZE", "1") != "1"
         self.distributed_backend = training.get_distributed_backend(
             device_type,
             offload_ops_to_cpu=self.fsdp_cpu_offload
             or self._enable_async_checkpointing,
         )
-        init_process_group(self.distributed_backend)
+        if self.is_distributed:
+            init_process_group(self.distributed_backend)
 
         # Initialize distributed variables
         self.world_size, self.rank = utils.get_world_size_and_rank()
@@ -175,7 +178,11 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
             cp=self.cp_degree,
             world_size=self.world_size,
         )
-        self.world_mesh = self.parallel_dims.build_mesh(device_type=device_type)
+        self.world_mesh = (
+            self.parallel_dims.build_mesh(device_type=device_type)
+            if self.is_distributed
+            else DeviceMesh(device_type="xla", mesh=[0])
+        )
         if self.parallel_dims.dp_enabled:
             dp_mesh = self.world_mesh["dp"]
             self.dp_degree, self.dp_rank = (
@@ -488,7 +495,10 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
         )
         init_start = time.perf_counter()
 
-        with training.set_default_dtype(self._dtype), torch.device("meta"):
+        with (
+            training.set_default_dtype(self._dtype),
+            torch.device("meta") if self.is_distributed else self._device,
+        ):
             model = config.instantiate(cfg_model.model_dump(by_alias=True))
 
         if self._compile_model:
@@ -586,17 +596,18 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
                 if hasattr(m, "rope_init"):
                     m.rope_init()  # type: ignore
 
-        assert isinstance(model, FSDPModule)
-
-        # This method will convert the full model state dict into a sharded state
-        # dict and load into the model
-        training.load_from_full_model_state_dict(
-            model,
-            model_state_dict,
-            self._device,
-            strict=True,
-            cpu_offload=fsdp_cpu_offload,
-        )
+        if isinstance(model, FSDPModule):
+            # This method will convert the full model state dict into a sharded state
+            # dict and load into the model
+            training.load_from_full_model_state_dict(
+                model,
+                model_state_dict,
+                self._device,
+                strict=True,
+                cpu_offload=fsdp_cpu_offload,
+            )
+        else:
+            model.load_state_dict(model_state_dict)
 
         # activation offloading
         self.activations_handling_ctx = training.get_act_offloading_ctx_manager(
@@ -615,8 +626,9 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
             memory_stats = training.get_memory_stats(device=self._device)
             training.log_memory_stats(memory_stats)
 
-        # synchronize before training begins
-        torch.distributed.barrier(device_ids=[self._device.index])
+        if self.is_distributed:
+            # synchronize before training begins
+            torch.distributed.barrier(device_ids=[self._device.index])
 
         return model
 
@@ -626,7 +638,6 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
         optimizer_in_bwd: bool = False,
         opt_state_dict: Optional[dict[str, Any]] = None,
     ) -> Optional[Optimizer]:
-        assert isinstance(self._model, FSDPModule)
         if optimizer_in_bwd:
             # Maintain a dict of optims for every parameter.
             optim_dict = {
@@ -647,7 +658,7 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
             # Load optimizer states for each param. If optimizer states are being restored in an optimizer in
             # backward run, these need to have been saved with the same setting. Cannot restore from runs that
             # did not use optimizer in backward.
-            if opt_state_dict is not None:
+            if opt_state_dict is not None and isinstance(self._model, FSDPModule):
                 for param in opt_state_dict.keys():
                     try:
                         training.load_from_full_optimizer_state_dict(
@@ -667,7 +678,7 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
             optimizer = config.instantiate(
                 cfg_optimizer.model_dump(by_alias=True), self._model.parameters()
             )
-            if opt_state_dict:
+            if opt_state_dict and isinstance(self._model, FSDPModule):
                 training.load_from_full_optimizer_state_dict(
                     self._model,
                     optimizer,
@@ -693,6 +704,7 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
         inputs: PackedTensors,
         config: types.TrainConfig,
         dev_config: dev.TrainConfig,
+        return_new_logprobs: bool = False,
     ) -> torch.Tensor:
         from ..unsloth.train import shift_tensor
 
@@ -813,6 +825,9 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
         if assistant_mask.sum() == 0:
             # Like in LinearCrossEntropyLoss, mask 1 token to allow loss to sync with all data parallel workers
             assistant_mask[0] = True
+        if return_new_logprobs:
+            # If we're returning new logprobs, we need to mask all tokens
+            assistant_mask = torch.ones_like(assistant_mask, dtype=torch.bool)
 
         if isinstance(hidden_states, DTensor):
             # DTensor doesn't support masks so we have to mask locally
@@ -829,51 +844,39 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
         weights = shift_tensor(inputs["weights"], 0.0)[assistant_mask]
         chunk_size = dev_config.get("logprob_calculation_chunk_size", 1024)
 
-        def calculate_loss(
-            hidden_states: torch.Tensor,  # [chunk_size, hidden_size]
-            next_token_ids: torch.Tensor,  # [chunk_size]
-            old_logprobs: torch.Tensor,  # [chunk_size]
-            advantages: torch.Tensor,  # [chunk_size]
-            weights: torch.Tensor,  # [chunk_size]
-        ) -> torch.Tensor:
-            # [chunk_size, hidden_size] @ [hidden_size, vocab_size]
-            logits = cast(
-                torch.Tensor, self._model.output(hidden_states)
-            )  # [chunk_size, vocab_size]
-            selected_logits = torch.gather(
-                logits, dim=-1, index=next_token_ids.unsqueeze(-1)
-            ).squeeze(-1)  # [chunk_size]
-            logsumexp = torch.logsumexp(logits, dim=-1)  # [chunk_size]
-            new_logprobs = selected_logits - logsumexp
-            old_logprobs = torch.where(
-                torch.isnan(old_logprobs),
-                new_logprobs.detach(),
-                old_logprobs,
-            )
-            prob_ratio = torch.exp(new_logprobs - old_logprobs)
-            epsilon = dev_config.get("epsilon", 0.2)
-            epsilon_high = dev_config.get("epsilon_high", epsilon)
-            if epsilon_high is None:
-                epsilon_high = epsilon
-            policy_loss = -torch.min(
-                prob_ratio * advantages,
-                torch.clip(prob_ratio, 1 - epsilon, 1 + epsilon_high) * advantages,
-            )
-            return (policy_loss * weights).sum()
+        selected_logits = torch.zeros_like(old_logprobs)
+        new_logprobs = torch.zeros_like(old_logprobs)
 
-        loss = torch.tensor(0.0, device=self._device)
-        for i in range(0, hidden_states.size(0), chunk_size):
-            chunk_end = min(i + chunk_size, hidden_states.size(0))
-            loss += calculate_loss(
-                hidden_states[i:chunk_end, :],
-                next_token_ids[i:chunk_end],
-                old_logprobs[i:chunk_end],
-                advantages[i:chunk_end],
-                weights[i:chunk_end],
+        for start in range(0, hidden_states.size(0), chunk_size):
+            end = min(start + chunk_size, hidden_states.size(0))
+            logits = cast(torch.Tensor, self._model.output(hidden_states[start:end]))
+            selected_logits[start:end] = torch.gather(
+                logits, dim=-1, index=next_token_ids[start:end].unsqueeze(-1)
+            ).squeeze(-1)
+            new_logprobs[start:end] = selected_logits[start:end] - torch.logsumexp(
+                logits, dim=-1
             )
 
-        # free logits otherwise it peaks backward memory
-        del hidden_states
+        del hidden_states, logits
+
+        if return_new_logprobs:
+            return torch.nn.functional.pad(new_logprobs[:-1], (1, 0), value=0.0)
+
+        old_logprobs = torch.where(
+            torch.isnan(old_logprobs),
+            new_logprobs.detach(),
+            old_logprobs,
+        )
+        prob_ratio = torch.exp(new_logprobs - old_logprobs)
+        epsilon = dev_config.get("epsilon", 0.2)
+        epsilon_high = dev_config.get("epsilon_high", epsilon)
+        if epsilon_high is None:
+            epsilon_high = epsilon
+        policy_loss = -torch.min(
+            prob_ratio * advantages,
+            torch.clip(prob_ratio, 1 - epsilon, 1 + epsilon_high) * advantages,
+        )
+        loss = (policy_loss * weights).sum()
 
         return loss
 
@@ -929,7 +932,7 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
                     running_loss += current_loss
                     # For optimizer in backward, we need to normalize before calling backward
                     # This case and gradient accumulation are mutually exclusive
-                    if self._optimizer_in_bwd:
+                    if self._optimizer_in_bwd and self.is_distributed:
                         torch.distributed.all_reduce(num_tokens)
                         torch.distributed.all_reduce(running_loss)
                         current_loss = current_loss * (self.dp_degree / num_tokens)
@@ -938,10 +941,11 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
                 # Optimizer step (if not fused in backward call)
                 if (idx + 1) % self._gradient_accumulation_steps == 0:
                     if not self._optimizer_in_bwd:
-                        # Get total number of tokens across all ranks to normalize gradients
-                        torch.distributed.all_reduce(num_tokens)
-                        # Ensure consistency across all ranks for logging
-                        torch.distributed.all_reduce(running_loss)
+                        if self.is_distributed:
+                            # Get total number of tokens across all ranks to normalize gradients
+                            torch.distributed.all_reduce(num_tokens)
+                            # Ensure consistency across all ranks for logging
+                            torch.distributed.all_reduce(running_loss)
 
                         # Manually scale the gradients by total # of tokens
                         self._grad_scaler(
@@ -1063,25 +1067,26 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
                     batch = Batch.model_validate_json(f.readlines()[curr_epoch].strip())
                 except (IndexError, ValidationError):
                     if self._current_device == self._device:
-                        gather_cpu_state_dict = training.gather_cpu_state_dict
+                        if self.is_distributed:
+                            gather_cpu_state_dict = training.gather_cpu_state_dict
 
-                        def _gather_cpu_state_dict(
-                            model: FSDPModule,
-                            is_rank_zero: bool,
-                            device: torch.device | None = None,
-                            adapter_weights_only: bool = False,
-                        ) -> dict[str, Any]:
-                            self._move_to(torch.device("cpu"))
-                            state_dict = gather_cpu_state_dict(
-                                model, is_rank_zero, device, adapter_weights_only
-                            )
-                            # signal that the GPUs are free
-                            Path(f"{self._output_dir}/pids.txt").unlink(missing_ok=True)
-                            training.gather_cpu_state_dict = gather_cpu_state_dict
-                            return state_dict
+                            def _gather_cpu_state_dict(
+                                model: FSDPModule,
+                                is_rank_zero: bool,
+                                device: torch.device | None = None,
+                                adapter_weights_only: bool = False,
+                            ) -> dict[str, Any]:
+                                state_dict = gather_cpu_state_dict(
+                                    model, is_rank_zero, device, adapter_weights_only
+                                )
+                                # signal that the GPUs are free
+                                Path(f"{self._output_dir}/pids.txt").unlink(
+                                    missing_ok=True
+                                )
+                                training.gather_cpu_state_dict = gather_cpu_state_dict
+                                return state_dict
 
-                        training.gather_cpu_state_dict = _gather_cpu_state_dict
-
+                            training.gather_cpu_state_dict = _gather_cpu_state_dict
                         checkpointer: FullModelHFCheckpointer = (
                             self._checkpoint_client._get_checkpointer()
                         )
@@ -1127,18 +1132,21 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
                             checkpointer.save_checkpoint = save_checkpoint
 
                         checkpointer.save_checkpoint = _save_checkpoint
+                        self._move_to(torch.device("cpu"))
+                        if not self.is_distributed:
+                            # signal that the GPUs are free
+                            Path(f"{self._output_dir}/pids.txt").unlink(missing_ok=True)
                         self._checkpoint_client.save_checkpoint(
                             model=self._model,
                             optimizer=self._optimizer_or_optim_ckpt_wrapper,
                             training_progress=TrainingProgress(
                                 seed=self.seed,
                                 epochs_run=self.epochs_run,
-                                # total_epochs=self.total_epochs,
                                 total_epochs=1,
                                 max_steps_per_epoch=self.max_steps_per_epoch,
                             ),
-                            # epoch=curr_epoch,
                             epoch=0,
+                            single_device=not self.is_distributed,
                         )
                         if self._is_rank_zero:
                             # Ensure checkpoints directory exists
@@ -1173,7 +1181,7 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
             if self._current_device != self._device:
                 self._move_to(self._device)
             n = batch.disk_packed_tensors["num_sequences"]
-            return [
+            micro_batches = [
                 cast(
                     PackedTensors,
                     {
@@ -1186,7 +1194,28 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
                     math.ceil(n / self.dp_degree) * self.dp_degree,
                     self.dp_degree,
                 )
-            ], batch
+            ]
+            if batch.dev_config.get("precalculate_logprobs", False):
+                for micro_batch in micro_batches:
+                    utils.batch_to_device(micro_batch, self._device)  # type: ignore
+
+                    # Disable gradient tracking for logprob calculation to save memory
+                    with torch.no_grad():
+                        # We'll normalize by the total number of tokens when accumulating gradients
+                        with self.context_parallel_manager(list(micro_batch.values())):  # type: ignore
+                            micro_batch["logprobs"] = self._loss_step(
+                                micro_batch,
+                                batch.config,
+                                batch.dev_config,
+                                return_new_logprobs=True,
+                            ).unsqueeze(0)
+
+                    # Move tensors back to CPU after calculation
+                    utils.batch_to_device(micro_batch, torch.device("cpu"))  # type: ignore
+                    # # Free GPU memory immediately
+                    # if self._device.type == "cuda":
+                    #     torch.cuda.empty_cache()
+            return micro_batches, batch
 
     def _move_to(self, device: torch.device) -> None:
         """

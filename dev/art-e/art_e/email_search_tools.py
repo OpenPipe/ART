@@ -63,7 +63,7 @@ def search_emails(
 
     # 1. Keywords (FTS)
     if not keywords:
-        raise ValueError("No keywords provided for search.")
+        return []
 
     if max_results > 10:
         raise ValueError("max_results must be less than or equal to 10.")

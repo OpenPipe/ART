@@ -1,0 +1,157 @@
+<svg id="visualization" width="1200" height="400" viewBox="0 0 1200 400" xmlns="http://www.w3.org/2000/svg">
+            <defs>
+                <linearGradient id="backgroundGradient" x1="0%" y1="0%" x2="100%" y2="100%">
+                    <stop offset="0%" style="stop-color:#0a0e27;stop-opacity:1"/>
+                    <stop offset="100%" style="stop-color:#1a1f3a;stop-opacity:1"/>
+                </linearGradient>
+                
+                <linearGradient id="mcpGradient" x1="0%" y1="0%" x2="100%" y2="100%">
+                    <stop offset="0%" style="stop-color:#3b82f6;stop-opacity:1"/>
+                    <stop offset="100%" style="stop-color:#1d4ed8;stop-opacity:1"/>
+                </linearGradient>
+                
+                <linearGradient id="qwenGradient" x1="0%" y1="0%" x2="100%" y2="100%">
+                    <stop offset="0%" style="stop-color:#10b981;stop-opacity:1"/>
+                    <stop offset="100%" style="stop-color:#047857;stop-opacity:1"/>
+                </linearGradient>
+                
+                <linearGradient id="taskGradient" x1="0%" y1="0%" x2="100%" y2="100%">
+                    <stop offset="0%" style="stop-color:#f59e0b;stop-opacity:1"/>
+                    <stop offset="100%" style="stop-color:#d97706;stop-opacity:1"/>
+                </linearGradient>
+                
+                <linearGradient id="trainingGradient" x1="0%" y1="0%" x2="100%" y2="100%">
+                    <stop offset="0%" style="stop-color:#8b5cf6;stop-opacity:1"/>
+                    <stop offset="100%" style="stop-color:#7c3aed;stop-opacity:1"/>
+                </linearGradient>
+                
+                <linearGradient id="indigoGradient" x1="0%" y1="0%" x2="100%" y2="100%">
+                    <stop offset="0%" style="stop-color:#6366f1;stop-opacity:1"/>
+                    <stop offset="100%" style="stop-color:#4f46e5;stop-opacity:1"/>
+                </linearGradient>
+                
+                <linearGradient id="evaluationGradient" x1="0%" y1="0%" x2="100%" y2="100%">
+                    <stop offset="0%" style="stop-color:#ef4444;stop-opacity:1"/>
+                    <stop offset="100%" style="stop-color:#dc2626;stop-opacity:1"/>
+                </linearGradient>
+                
+                <filter id="glow">
+                    <feGaussianBlur stdDeviation="3" result="coloredBlur"/>
+                    <feMerge> 
+                        <feMergeNode in="coloredBlur"/>
+                        <feMergeNode in="SourceGraphic"/>
+                    </feMerge>
+                </filter>
+                
+                <marker id="arrowhead" markerWidth="10" markerHeight="7" refX="9" refY="3.5" orient="auto">
+                    <polygon points="0 0, 10 3.5, 0 7" fill="#64748b"/>
+                </marker>
+                
+                <animate id="flowAnimation" attributeName="stroke-dashoffset" values="20;0" dur="2s" repeatCount="indefinite"/>
+            </defs>
+            
+            <!-- Background -->
+            <rect width="1200" height="400" fill="url(#backgroundGradient)"/>
+            
+            <!-- Title -->
+            <text x="600" y="40" font-family="Arial, sans-serif" font-size="28" font-weight="bold" text-anchor="middle" fill="#ffffff">
+                MCP•RL Overview
+            </text>
+            
+            <!-- Subtitle -->
+            <text x="600" y="65" font-family="Arial, sans-serif" font-size="14" text-anchor="middle" fill="#94a3b8">
+                4-Step Automated Training Pipeline
+            </text>
+            
+            <!-- Top Level Nodes -->
+            <!-- MCP Server Node -->
+            <g id="mcpServerTop">
+                <rect x="308" y="90" width="200" height="80" rx="12" fill="url(#indigoGradient)" stroke="#6366f1" stroke-width="2" filter="url(#glow)"/>
+                <text x="408" y="115" font-family="Arial, sans-serif" font-size="16" font-weight="bold" text-anchor="middle" fill="#ffffff">MCP Server</text>
+                <text x="408" y="135" font-family="Arial, sans-serif" font-size="12" text-anchor="middle" fill="#e0e7ff">Remote server providing</text>
+                <text x="408" y="150" font-family="Arial, sans-serif" font-size="12" text-anchor="middle" fill="#e0e7ff">tools and capabilities</text>
+            </g>
+            
+            <!-- RULER Evaluation Node -->
+            <g id="rulerTop">
+                <rect x="774" y="90" width="200" height="80" rx="12" fill="url(#qwenGradient)" stroke="#10b981" stroke-width="2" filter="url(#glow)"/>
+                <text x="874" y="115" font-family="Arial, sans-serif" font-size="16" font-weight="bold" text-anchor="middle" fill="#ffffff">RULER Evaluation</text>
+                <text x="874" y="135" font-family="Arial, sans-serif" font-size="12" text-anchor="middle" fill="#d1fae5">Automatic quality</text>
+                <text x="874" y="150" font-family="Arial, sans-serif" font-size="12" text-anchor="middle" fill="#d1fae5">assessment system</text>
+            </g>
+            
+            <!-- Step 1: Query MCP Server -->
+            <g id="step1">
+                <rect x="64" y="220" width="220" height="120" rx="15" fill="url(#mcpGradient)" stroke="#ffffff" stroke-width="2" filter="url(#glow)"/>
+                <text x="174" y="245" font-family="Arial, sans-serif" font-size="14" font-weight="bold" text-anchor="middle" fill="#ffffff">STEP 1</text>
+                <text x="174" y="265" font-family="Arial, sans-serif" font-size="18" font-weight="bold" text-anchor="middle" fill="#ffffff">Query MCP Server</text>
+                <text x="174" y="290" font-family="Arial, sans-serif" font-size="12" text-anchor="middle" fill="#e2e8f0">Discover available tools</text>
+                <text x="174" y="305" font-family="Arial, sans-serif" font-size="12" text-anchor="middle" fill="#e2e8f0">and capabilities from</text>
+                <text x="174" y="320" font-family="Arial, sans-serif" font-size="12" text-anchor="middle" fill="#e2e8f0">any MCP server URL</text>
+            </g>
+            
+            <!-- Step 2: Generate Tasks -->
+            <g id="step2">
+                <rect x="348" y="220" width="220" height="120" rx="15" fill="url(#taskGradient)" stroke="#ffffff" stroke-width="2" filter="url(#glow)"/>
+                <text x="458" y="245" font-family="Arial, sans-serif" font-size="14" font-weight="bold" text-anchor="middle" fill="#ffffff">STEP 2</text>
+                <text x="458" y="265" font-family="Arial, sans-serif" font-size="18" font-weight="bold" text-anchor="middle" fill="#ffffff">Generate Tasks</text>
+                <text x="458" y="290" font-family="Arial, sans-serif" font-size="12" text-anchor="middle" fill="#fef3c7">Create input tasks that</text>
+                <text x="458" y="305" font-family="Arial, sans-serif" font-size="12" text-anchor="middle" fill="#fef3c7">effectively use the</text>
+                <text x="458" y="320" font-family="Arial, sans-serif" font-size="12" text-anchor="middle" fill="#fef3c7">discovered tools</text>
+            </g>
+            
+            <!-- Step 3: Train Model -->
+            <g id="step3">
+                <rect x="632" y="220" width="220" height="120" rx="15" fill="url(#trainingGradient)" stroke="#ffffff" stroke-width="2" filter="url(#glow)"/>
+                <text x="742" y="245" font-family="Arial, sans-serif" font-size="14" font-weight="bold" text-anchor="middle" fill="#ffffff">STEP 3</text>
+                <text x="742" y="265" font-family="Arial, sans-serif" font-size="18" font-weight="bold" text-anchor="middle" fill="#ffffff">Train Model</text>
+                <text x="742" y="290" font-family="Arial, sans-serif" font-size="12" text-anchor="middle" fill="#ede9fe">Train model on tasks using</text>
+                <text x="742" y="305" font-family="Arial, sans-serif" font-size="12" text-anchor="middle" fill="#ede9fe">automatic RULER</text>
+                <text x="742" y="320" font-family="Arial, sans-serif" font-size="12" text-anchor="middle" fill="#ede9fe">evaluation system</text>
+            </g>
+            
+            <!-- Step 4: Test & Evaluate -->
+            <g id="step4">
+                <rect x="916" y="220" width="220" height="120" rx="15" fill="url(#evaluationGradient)" stroke="#ffffff" stroke-width="2" filter="url(#glow)"/>
+                <text x="1026" y="245" font-family="Arial, sans-serif" font-size="14" font-weight="bold" text-anchor="middle" fill="#ffffff">STEP 4</text>
+                <text x="1026" y="265" font-family="Arial, sans-serif" font-size="18" font-weight="bold" text-anchor="middle" fill="#ffffff">Test &amp; Evaluate</text>
+                <text x="1026" y="290" font-family="Arial, sans-serif" font-size="12" text-anchor="middle" fill="#fecaca">Test trained model with</text>
+                <text x="1026" y="305" font-family="Arial, sans-serif" font-size="12" text-anchor="middle" fill="#fecaca">new tasks to validate</text>
+                <text x="1026" y="320" font-family="Arial, sans-serif" font-size="12" text-anchor="middle" fill="#fecaca">performance &amp; quality</text>
+            </g>
+            
+            <!-- Flow Arrows Between Steps -->
+            <line x1="284" y1="280" x2="348" y2="280" stroke="#64748b" stroke-width="3" marker-end="url(#arrowhead)" stroke-dasharray="5,5">
+                <animate attributeName="stroke-dashoffset" values="10;0" dur="2s" repeatCount="indefinite"/>
+            </line>
+            
+            <line x1="568" y1="280" x2="632" y2="280" stroke="#64748b" stroke-width="3" marker-end="url(#arrowhead)" stroke-dasharray="5,5">
+                <animate attributeName="stroke-dashoffset" values="10;0" dur="2s" repeatCount="indefinite"/>
+            </line>
+            
+            <line x1="852" y1="280" x2="916" y2="280" stroke="#64748b" stroke-width="3" marker-end="url(#arrowhead)" stroke-dasharray="5,5">
+                <animate attributeName="stroke-dashoffset" values="10;0" dur="2s" repeatCount="indefinite"/>
+            </line>
+            
+            <!-- Connections from Top Nodes to Steps -->
+            <!-- MCP Server to Step 1 -->
+            <line x1="358" y1="170" x2="204" y2="220" stroke="#8b5cf6" stroke-width="2" stroke-dasharray="3,3">
+                <animate attributeName="stroke-dashoffset" values="6;0" dur="1.5s" repeatCount="indefinite"/>
+            </line>
+            
+            <!-- MCP Server to Step 3 -->
+            <line x1="458" y1="170" x2="672" y2="220" stroke="#8b5cf6" stroke-width="2" stroke-dasharray="3,3">
+                <animate attributeName="stroke-dashoffset" values="6;0" dur="1.5s" repeatCount="indefinite"/>
+            </line>
+            
+            <!-- RULER Evaluation to Step 3 -->
+            <line x1="824" y1="170" x2="772" y2="220" stroke="#10b981" stroke-width="2" stroke-dasharray="3,3">
+                <animate attributeName="stroke-dashoffset" values="6;0" dur="1.5s" repeatCount="indefinite"/>
+            </line>
+            
+            <!-- RULER Evaluation to Step 4 -->
+            <line x1="924" y1="170" x2="996" y2="220" stroke="#10b981" stroke-width="2" stroke-dasharray="3,3">
+                <animate attributeName="stroke-dashoffset" values="6;0" dur="1.5s" repeatCount="indefinite"/>
+            </line>
+            
+        </svg>

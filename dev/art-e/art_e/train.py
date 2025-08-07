@@ -14,6 +14,7 @@ import os
 import statistics
 from art.rewards import ruler_score_group
 import tenacity
+from art_e.create_stepwise_groups import create_all_stepwise_groups
 
 load_dotenv()
 
@@ -115,6 +116,10 @@ async def train(model: art.TrainableModel[ProjectPolicyConfig]):
                 ),
                 after_each=judge_after_each,
             )
+
+            if model.config.train_on_stepwise_groups:
+                await model.log(groups, split="train_full")
+                groups = await create_all_stepwise_groups(model, groups)
 
             # If every group failed, skip this training step entirely.
             if not groups:

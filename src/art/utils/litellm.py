@@ -8,10 +8,19 @@ from openai.types.chat.chat_completion_token_logprob import (
     ChatCompletionTokenLogprob,
     TopLogprob,
 )
-from litellm.types.utils import Choices, ChoiceLogprobs as LitellmChoiceLogprobs
+from litellm.types.utils import (
+    Choices,
+    StreamingChoices,
+    ChoiceLogprobs as LitellmChoiceLogprobs,
+)
 
 
-def convert_litellm_choice_to_openai(litellm_choice: Choices) -> Choice:
+def convert_litellm_choice_to_openai(
+    litellm_choice: Choices | StreamingChoices,
+) -> Choice:
+    assert isinstance(litellm_choice, Choices), (
+        "Only non-streaming choices are currently supported"
+    )
     litellm_message = litellm_choice.message
     assert litellm_message.role == "assistant", "Only assistant messages are supported"
 

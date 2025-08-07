@@ -25,11 +25,13 @@ MODELS_TO_BENCHMARK = [
     # ("o3", "openai/o3"),
     # ("qwen3-235b", "openrouter/qwen/qwen3-235b-a22b"),
     # ("qwen3-32b", "openrouter/qwen/qwen3-32b"),
-    # ("deepseek-r1", "openrouter/deepseek-ai/DeepSeek-R1"),
+    # # ("deepseek-r1", "openrouter/deepseek-ai/DeepSeek-R1"),
     # ("gemini-2.5-flash", "gemini/gemini-2.5-flash"),
     # ("sonnet 4", "openrouter/anthropic/claude-sonnet-4"),
     # ("gemini-2.5-pro", "gemini/gemini-2.5-pro"),
-    ("kimi-k2", "openrouter/moonshotai/kimi-k2"),
+    # ("gpt-oss-20b", "openrouter/openai/gpt-oss-20b"),
+    # ("gpt-oss-120b", "openrouter/openai/gpt-oss-120b"),
+    ("q3-235b-2507", "openrouter/qwen/qwen3-235b-a22b-2507"),
 ]
 
 TEST_SET_ENTRIES = 100
@@ -70,6 +72,8 @@ async def main():
         f.write(df.to_pandas().to_html())
 
     print(df.to_pandas().to_markdown())
+
+    print("View full table at `./data/benchmark_prompted_models.html`")
 
 
 asyncio.run(main())

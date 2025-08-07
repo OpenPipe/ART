@@ -298,14 +298,19 @@ async def rollout(
             rubric.ran_out_of_turns = True
             break
 
+        litellm_params = model.litellm_completion_params()
+        if scenario.split == "test":
+            litellm_params["temperature"] = 0
+
         async with traj.track_duration("llm_completion"):
             llm_response = await acompletion(
+                # **litellm_params,
                 **model.litellm_completion_params(),
                 messages=traj.messages(),
                 caching=not model.trainable,
                 max_completion_tokens=model.config.max_tokens,
                 tools=traj.tools,
-                # tool_choice=None if model.trainable else "required",
+                tool_choice=None if model.trainable else "required",
             )  # type: ignore
 
         assert isinstance(llm_response, ModelResponse)
@@ -402,9 +407,9 @@ if __name__ == "__main__":
     traj = asyncio.run(
         rollout(
             art.Model(
-                name="openrouter/qwen/qwen3-32b",
+                name="together_ai/Qwen/Qwen3-235B-A22B-Instruct-2507-tput",
                 project="email_agent",
-                inference_model_name="openrouter/qwen/qwen3-32b",
+                inference_model_name="together_ai/Qwen/Qwen3-235B-A22B-Instruct-2507-tput",
                 config=ProjectPolicyConfig(),
             ),
             scenario,

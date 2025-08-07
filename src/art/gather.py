@@ -17,7 +17,9 @@ async def gather_trajectory_groups(
     pbar_total_completion_tokens: bool = True,
     max_exceptions: int | float = 0,
     max_metrics: int | None = None,
-    after_each: Callable[[TrajectoryGroup], Awaitable[TrajectoryGroup | None]]
+    after_each: Callable[
+        [TrajectoryGroup], Awaitable[TrajectoryGroup | None | list[TrajectoryGroup]]
+    ]
     | None = None,
 ) -> list[TrajectoryGroup]:
     groups = list(groups)
@@ -43,12 +45,17 @@ async def gather_trajectory_groups(
 
     # If an after_each callback was provided, await it and collect its return values.
     if after_each is not None:
-        processed_groups = await asyncio.gather(
+        ae_processed_groups = await asyncio.gather(
             *(after_each(g) for g in processed_groups)
-        )  # type: ignore[arg-type]
-
-        # Filter out callbacks that returned None
-        processed_groups = [g for g in processed_groups if g is not None]  # type: ignore[list-item]
+        )
+        processed_groups = []
+        for g in ae_processed_groups:
+            if g is None:
+                continue
+            if isinstance(g, list):
+                processed_groups.extend(g)
+            elif isinstance(g, TrajectoryGroup):
+                processed_groups.append(g)
 
     return processed_groups
 
