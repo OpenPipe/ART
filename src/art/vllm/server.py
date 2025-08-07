@@ -71,7 +71,7 @@ async def openai_server_task(
 
     test_client_task = asyncio.create_task(test_client())
     try:
-        timeout = float(os.environ.get("ART_SERVER_TIMEOUT", 10.0))
+        timeout = float(os.environ.get("ART_SERVER_TIMEOUT", 30.0))
         done, _ = await asyncio.wait(
             [openai_server_task, test_client_task],
             timeout=timeout,
