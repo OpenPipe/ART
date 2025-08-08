@@ -1,18 +1,20 @@
 """Training example for MCP agent using rollout with AlphaMcpServer in scenarios."""
 
+import argparse
 import asyncio
+import fnmatch
+import json
+import os
+
+import weave
+from dotenv import load_dotenv
+
 import art
 from art.rewards import ruler_score_group
 from art.utils import iterate_dataset
-from dotenv import load_dotenv
-import os
-import weave
-import json
-import argparse
-import fnmatch
 
-from .rollout import rollout, McpScenario
-from .benchmarks.generate_benchmarks import generate_val_groups, calculate_beat_comp
+from .benchmarks.generate_benchmarks import calculate_beat_comp, generate_val_groups
+from .rollout import McpScenario, rollout
 
 load_dotenv()
 

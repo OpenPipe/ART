@@ -1,11 +1,12 @@
 # Copyright Sierra
 
+from typing import Optional, Union
+
 from tau_bench.envs.airline.data import load_data
 from tau_bench.envs.airline.rules import RULES
 from tau_bench.envs.airline.tools import ALL_TOOLS
 from tau_bench.envs.airline.wiki import WIKI
 from tau_bench.envs.base import Env
-from typing import Optional, Union
 from tau_bench.envs.user import UserStrategy
 
 

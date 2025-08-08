@@ -1,7 +1,8 @@
-import httpx
 import json
+from typing import TYPE_CHECKING, AsyncIterator, Literal
+
+import httpx
 from tqdm import auto as tqdm
-from typing import AsyncIterator, TYPE_CHECKING, Literal
 
 from art.utils import log_http_errors
 from art.utils.deploy_model import LoRADeploymentJob, LoRADeploymentProvider

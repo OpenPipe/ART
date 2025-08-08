@@ -1,11 +1,12 @@
 import os
 import random
 import time
+
 import torch
 from typing_extensions import TypedDict, Unpack
 
-from .tokenize import TokenizedResult
 from ..types import Verbosity
+from .tokenize import TokenizedResult
 
 
 class PackedTensors(TypedDict):

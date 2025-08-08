@@ -1,7 +1,22 @@
 import json
 import math
+import os
+import subprocess
 from datetime import datetime
 from types import TracebackType
+from typing import AsyncIterator, Literal, cast
+
+import numpy as np
+import polars as pl
+import torch
+import wandb
+import weave
+from tqdm import auto as tqdm
+from transformers.models.auto.tokenization_auto import AutoTokenizer
+from transformers.tokenization_utils_base import PreTrainedTokenizerBase
+from typing_extensions import Self
+from wandb.sdk.wandb_run import Run
+from weave.trace.weave_client import WeaveClient
 
 from art.utils.deploy_model import (
     LoRADeploymentJob,
@@ -16,45 +31,31 @@ from art.utils.output_dirs import (
     get_step_checkpoint_dir,
     get_trajectories_split_dir,
 )
+from art.utils.s3 import (
+    ExcludableOption,
+    pull_model_from_s3,
+    push_model_to_s3,
+)
 from art.utils.trajectory_logging import serialize_trajectory_groups
 from mp_actors import close_proxy, move_to_child_process
-import numpy as np
-import os
-import polars as pl
-import subprocess
-import torch
-from transformers.models.auto.tokenization_auto import AutoTokenizer
-from transformers.tokenization_utils_base import PreTrainedTokenizerBase
-from tqdm import auto as tqdm
-from typing import AsyncIterator, cast, Literal
-from typing_extensions import Self
-import wandb
-from wandb.sdk.wandb_run import Run
-import weave
-from weave.trace.weave_client import WeaveClient
 
 from .. import dev
 from ..backend import Backend
 from ..model import Model, TrainableModel
-from .service import ModelService
 from ..trajectories import Trajectory, TrajectoryGroup
 from ..types import Message, TrainConfig
 from ..utils import format_message, get_model_step
-from .pack import (
-    packed_tensors_from_tokenized_results,
-    packed_tensors_to_dir,
-    PackedTensors,
-    plot_packed_tensors,
-)
-from .tokenize import tokenize_trajectory_groups
 from .checkpoints import (
     delete_checkpoints,
 )
-from art.utils.s3 import (
-    pull_model_from_s3,
-    push_model_to_s3,
-    ExcludableOption,
+from .pack import (
+    PackedTensors,
+    packed_tensors_from_tokenized_results,
+    packed_tensors_to_dir,
+    plot_packed_tensors,
 )
+from .service import ModelService
+from .tokenize import tokenize_trajectory_groups
 
 
 class LocalBackend(Backend):
@@ -118,10 +119,10 @@ class LocalBackend(Backend):
             _ = self._get_wandb_run(model)
 
     async def _get_service(self, model: TrainableModel) -> ModelService:
-        from ..torchtune.service import TorchtuneService
-        from ..unsloth.service import UnslothService
-        from ..unsloth.decoupled_service import DecoupledUnslothService
         from ..dev.get_model_config import get_model_config
+        from ..torchtune.service import TorchtuneService
+        from ..unsloth.decoupled_service import DecoupledUnslothService
+        from ..unsloth.service import UnslothService
 
         if model.name not in self._services:
             config = get_model_config(

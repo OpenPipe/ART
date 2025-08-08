@@ -1,8 +1,9 @@
 # %%
-import polars as pl
-import matplotlib.pyplot as plt
-import seaborn as sns
 from typing import Sequence
+
+import matplotlib.pyplot as plt
+import polars as pl
+import seaborn as sns
 
 
 def training_progress_chart(

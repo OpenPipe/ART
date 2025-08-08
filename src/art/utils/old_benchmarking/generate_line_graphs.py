@@ -10,9 +10,9 @@ except ImportError:
         "pip install openpipe-art[plotting]"
     )
 
+from ..output_dirs import get_default_art_path
 from .load_benchmarked_models import load_benchmarked_models
 from .types import BenchmarkedModelKey
-from ..output_dirs import get_default_art_path
 
 
 # returns an array of paths to image files, one for each metric

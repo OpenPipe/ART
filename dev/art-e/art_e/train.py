@@ -1,20 +1,22 @@
-import art
-from art.local import LocalBackend
 import asyncio
-from dotenv import load_dotenv
-from typing import List
-from rollout import rollout
-from art_e.data.query_iterators import load_synthetic_queries
-from art_e.data.types_enron import SyntheticQuery
-from art_e.data.local_email_db import generate_database
-from art.utils import iterate_dataset
-from art_e.project_types import ProjectPolicyConfig
-from art_e.evaluate.benchmark import benchmark_model
 import os
 import statistics
-from art.rewards import ruler_score_group
+from typing import List
+
 import tenacity
 from art_e.create_stepwise_groups import create_all_stepwise_groups
+from art_e.data.local_email_db import generate_database
+from art_e.data.query_iterators import load_synthetic_queries
+from art_e.data.types_enron import SyntheticQuery
+from art_e.evaluate.benchmark import benchmark_model
+from art_e.project_types import ProjectPolicyConfig
+from dotenv import load_dotenv
+from rollout import rollout
+
+import art
+from art.local import LocalBackend
+from art.rewards import ruler_score_group
+from art.utils import iterate_dataset
 
 load_dotenv()
 

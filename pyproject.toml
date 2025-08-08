@@ -74,6 +74,12 @@ exclude = [
   "**/*.pyc",
 ]
 
+[tool.ruff.lint]
+select = ["I"]
+
+[tool.ruff.lint.isort]
+case-sensitive = false
+
 [tool.uv]
 required-version = ">=0.6.15"
 dev-dependencies = [

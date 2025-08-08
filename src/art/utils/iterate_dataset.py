@@ -1,7 +1,8 @@
 import math
 import random
 from dataclasses import dataclass
-from typing import List, Generator, TypeVar, Generic
+from typing import Generator, Generic, List, TypeVar
+
 from tqdm.auto import tqdm
 
 T = TypeVar("T")

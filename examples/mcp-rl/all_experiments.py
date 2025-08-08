@@ -1,5 +1,6 @@
-import art
 from pydantic import BaseModel
+
+import art
 
 
 class McpPolicyConfig(BaseModel):

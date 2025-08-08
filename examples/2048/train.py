@@ -1,11 +1,12 @@
-from dotenv import load_dotenv
 import asyncio
 import random
 
-import art
-from art.rewards import ruler_score_group
-from art.local import LocalBackend
+from dotenv import load_dotenv
 from rollout import rollout
+
+import art
+from art.local import LocalBackend
+from art.rewards import ruler_score_group
 
 load_dotenv()
 

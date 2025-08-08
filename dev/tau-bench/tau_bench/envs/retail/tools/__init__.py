@@ -17,7 +17,6 @@ from .return_delivered_order_items import ReturnDeliveredOrderItems
 from .think import Think
 from .transfer_to_human_agents import TransferToHumanAgents
 
-
 ALL_TOOLS = [
     Calculate,
     CancelPendingOrder,

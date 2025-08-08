@@ -1,11 +1,12 @@
-from dataclasses import dataclass
-from itertools import takewhile
 import math
 import random
-from transformers.tokenization_utils_base import PreTrainedTokenizerBase
-from typing import cast, Generator
+from dataclasses import dataclass
+from itertools import takewhile
+from typing import Generator, cast
 
-from ..trajectories import get_messages, History, TrajectoryGroup
+from transformers.tokenization_utils_base import PreTrainedTokenizerBase
+
+from ..trajectories import History, TrajectoryGroup, get_messages
 
 
 @dataclass

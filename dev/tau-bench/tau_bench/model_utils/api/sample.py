@@ -5,12 +5,12 @@ from typing import Any, Callable, TypeVar
 
 from pydantic import BaseModel
 
+from tau_bench.model_utils import func_tools
 from tau_bench.model_utils.api.exception import (
     APIError,
     execute_and_filter_model_errors,
 )
 from tau_bench.model_utils.model.exception import ModelError
-from tau_bench.model_utils import func_tools
 
 T = TypeVar("T")
 

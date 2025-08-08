@@ -4,27 +4,25 @@ import argparse
 import asyncio
 import concurrent.futures
 import copy
+import json
 import random
 from typing import Any, Dict, List
+
 from dotenv import load_dotenv
-import json
-
-import art
-from art.local import LocalBackend
-from art.utils import iterate_dataset
-
-from tau_bench.types import RunConfig, SolveResult
-from tau_bench.envs import get_env
-from tau_bench.run import agent_factory
 from tau_bench.agents.tool_calling_agent import ToolCallingRLAgent
-from tau_bench.types import TauBenchPolicyConfig
-from tau_bench.general_rm import create_general_rm_trajectory_groups, calculate_reward
+from tau_bench.envs import get_env
+from tau_bench.general_rm import calculate_reward, create_general_rm_trajectory_groups
 from tau_bench.rl_utils import (
     log_trajectory_to_openpipe,
     update_steps_for_openpipe_logs,
 )
+from tau_bench.run import agent_factory
+from tau_bench.types import RunConfig, SolveResult, TauBenchPolicyConfig
 from tqdm.asyncio import tqdm_asyncio
-from art.utils import limit_concurrency
+
+import art
+from art.local import LocalBackend
+from art.utils import iterate_dataset, limit_concurrency
 
 # Load environment variables
 load_dotenv(override=True)

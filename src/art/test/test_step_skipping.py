@@ -9,13 +9,14 @@
 # ///
 
 import asyncio
-import tempfile
 import os
-from art.local import LocalBackend
+import tempfile
+import uuid
+
 from art import TrainableModel, Trajectory, TrajectoryGroup
 from art.dev import TrainConfig as DevTrainConfig
+from art.local import LocalBackend
 from art.utils.output_dirs import get_model_dir, get_step_checkpoint_dir
-import uuid
 
 # Define base trajectory outside of tests
 BASE_TRAJECTORY = Trajectory(

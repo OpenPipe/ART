@@ -6,8 +6,8 @@ except ImportError:
         "pip install openpipe-art[plotting]"
     )
 
-from ..types import BenchmarkModelKey
 from ..filter_model_split import filter_rename_model_split
+from ..types import BenchmarkModelKey
 
 
 def percentage_comparison_bar_chart(

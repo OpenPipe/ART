@@ -1,15 +1,20 @@
 import argparse
 import asyncio
 import base64
+import re
+from typing import Literal
+
 import daytona_sdk
 from dotenv import load_dotenv
-import re
 from tqdm.auto import tqdm
-from typing import Literal
 
 load_dotenv()
 
-from instances import Instance, as_instances_iter, get_filtered_swe_smith_instances_df  # noqa: E402
+from instances import (  # noqa: E402
+    Instance,
+    as_instances_iter,
+    get_filtered_swe_smith_instances_df,
+)
 
 instances = list(
     get_filtered_swe_smith_instances_df()

@@ -4,21 +4,23 @@ This module provides a rollout function for running MCP agents with scenarios.
 Based on the art-e rollout.py structure.
 """
 
-from openai import AsyncOpenAI
-import art
+import asyncio
 import json
 import logging
-from dataclasses import dataclass
 import os
-import asyncio
-from dotenv import load_dotenv
+from dataclasses import dataclass
+
 import weave
+from dotenv import load_dotenv
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
-
+from openai import AsyncOpenAI
 from servers.python.mcp_alphavantage.server_params import server_params
-from .utils import get_content_text
+
+import art
+
 from .checks import check_successful
+from .utils import get_content_text
 
 load_dotenv()
 

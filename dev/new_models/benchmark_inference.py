@@ -6,10 +6,12 @@ and requests approximately 1000 output tokens (max_tokens=1000), repeating
 for 10 iterations. It measures per-request latencies and summarizes statistics.
 """
 
-import time
 import asyncio
 import statistics
+import time
+
 from dotenv import load_dotenv
+
 import art
 from art.local import LocalBackend
 

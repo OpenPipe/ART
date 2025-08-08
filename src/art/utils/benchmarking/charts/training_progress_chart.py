@@ -1,6 +1,6 @@
 try:
-    import polars as pl
     import matplotlib.pyplot as plt
+    import polars as pl
     import seaborn as sns
 except ImportError:
     raise ImportError(
@@ -8,8 +8,8 @@ except ImportError:
         "pip install openpipe-art[plotting]"
     )
 
-from art.utils.benchmarking.types import BenchmarkModelKey
 from art.utils.benchmarking.filter_model_split import filter_rename_model_split
+from art.utils.benchmarking.types import BenchmarkModelKey
 
 
 def training_progress_chart(

@@ -1,19 +1,20 @@
-import art
-import openai
-import time
 import math
 import os
-from dotenv import load_dotenv
-from pydantic import BaseModel
-from openpipe.client import OpenPipe
+import time
 
+import openai
+from dotenv import load_dotenv
 from game_utils import (
-    generate_game,
-    get_opponent_move,
     apply_agent_move,
     check_winner,
+    generate_game,
+    get_opponent_move,
     render_board,
 )
+from openpipe.client import OpenPipe
+from pydantic import BaseModel
+
+import art
 
 load_dotenv()
 
