@@ -168,6 +168,11 @@ class LoggingLLM(Runnable):
         if hasattr(result, "get") and result.get("parsed"):
             return result.get("parsed")
 
+        if hasattr(result, 'tool_calls'):
+            for tool_call in result.tool_calls:
+                if isinstance(tool_call["args"], str):
+                    tool_call["args"] = json.loads(tool_call["args"])
+
         if self.structured_output:
             return self.structured_output.model_validate(
                 result.tool_calls[0]["args"] if result.tool_calls else None
