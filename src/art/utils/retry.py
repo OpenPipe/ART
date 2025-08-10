@@ -1,14 +1,14 @@
-import time
 import asyncio
 import functools
-import logging
 import inspect
+import logging
+import time
 from typing import (
     Any,
     Callable,
-    TypeVar,
     Optional,
     ParamSpec,
+    TypeVar,
 )
 
 P = ParamSpec("P")

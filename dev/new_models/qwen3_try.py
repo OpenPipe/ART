@@ -1,8 +1,10 @@
 import asyncio
 import json
+
+from dotenv import load_dotenv
+
 import art
 from art.local import LocalBackend
-from dotenv import load_dotenv
 
 load_dotenv()
 

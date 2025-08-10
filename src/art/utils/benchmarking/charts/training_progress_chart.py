@@ -1,6 +1,6 @@
 try:
-    import polars as pl
     import matplotlib.pyplot as plt
+    import polars as pl
     import seaborn as sns
 except ImportError:
     raise ImportError(
@@ -8,8 +8,8 @@ except ImportError:
         "pip install openpipe-art[plotting]"
     )
 
-from art.utils.benchmarking.types import BenchmarkModelKey
 from art.utils.benchmarking.filter_model_split import filter_rename_model_split
+from art.utils.benchmarking.types import BenchmarkModelKey
 
 
 def training_progress_chart(
@@ -75,15 +75,15 @@ def training_progress_chart(
     # Determine plotting / legend order
     # ------------------------------------------------------------------
     if models is not None:
-        models = [
+        models_keys = [
             entry if isinstance(entry, BenchmarkModelKey) else BenchmarkModelKey(entry)
             for entry in models
         ]
 
-        df = filter_rename_model_split(df, models)
+        df = filter_rename_model_split(df, models_keys)
 
         # Preserve caller‑specified order *after* renaming
-        plot_models = [key.display_name for key in models]
+        plot_models = [key.display_name for key in models_keys]
     else:
         # Separate trained models (multiple distinct steps) from comparison
         # models (exactly one step) and list trained models first.

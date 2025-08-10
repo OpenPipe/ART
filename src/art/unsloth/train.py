@@ -1,11 +1,12 @@
 import asyncio
-from contextlib import nullcontext
-import nest_asyncio
 import os
-from peft.peft_model import PeftModel
+from contextlib import nullcontext
+from typing import TYPE_CHECKING, Callable, cast
+
+import nest_asyncio
 import torch
+from peft.peft_model import PeftModel
 from trl import GRPOTrainer
-from typing import cast, Callable, TYPE_CHECKING
 
 from .. import dev
 from ..types import TrainConfig
@@ -158,6 +159,8 @@ def get_compute_loss_fn(trainer: "GRPOTrainer") -> Callable[..., torch.Tensor]:
             prob_ratio * advantages,
             torch.clip(prob_ratio, 1 - epsilon, 1 + epsilon_high) * advantages,
         )
+        if upper_bound := _config.get("truncated_importance_sampling", None):
+            policy_loss *= torch.clamp(prob_ratio, max=upper_bound)
         if ref_logprobs is not None:
             kl_div = (
                 torch.exp(ref_logprobs - new_logprobs)

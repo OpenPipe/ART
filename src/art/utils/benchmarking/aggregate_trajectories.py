@@ -1,9 +1,10 @@
 """Aggregation utilities for trajectory data."""
 
-import polars as pl
+import json
 from pathlib import Path
 from typing import Any
-import json
+
+import polars as pl
 
 from art.utils.benchmarking.load_trajectories import load_trajectories
 from art.utils.output_dirs import get_default_art_path, get_models_dir

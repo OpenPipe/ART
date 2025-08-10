@@ -1,10 +1,12 @@
 import asyncio
-from dotenv import load_dotenv
-import art
-from art_e.project_types import ProjectPolicyConfig
+
 from art_e.data.query_iterators import load_synthetic_queries
+from art_e.project_types import ProjectPolicyConfig
 from art_e.rollout import rollout
+from dotenv import load_dotenv
 from tqdm.asyncio import tqdm
+
+import art
 from art.rewards import ruler_score_group
 
 load_dotenv()

@@ -1,17 +1,18 @@
 # Copyright Sierra
 
 import json
+from typing import Any, Dict, List, Optional, Tuple
+
 from litellm import acompletion
 
 from tau_bench.agents.base import Agent
 from tau_bench.envs.base import Env
 from tau_bench.types import (
+    RESPOND_ACTION_FIELD_NAME,
+    RESPOND_ACTION_NAME,
     Action,
     SolveResult,
-    RESPOND_ACTION_NAME,
-    RESPOND_ACTION_FIELD_NAME,
 )
-from typing import Optional, List, Dict, Any, Tuple
 
 
 class ChatReActAgent(Agent):

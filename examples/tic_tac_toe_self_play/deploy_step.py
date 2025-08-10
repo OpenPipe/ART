@@ -1,11 +1,11 @@
-import asyncio
-import art
-import os
 import argparse
+import asyncio
+import os
 
-from train import PROJECT_NAME, BASE_MODEL, MODEL_NAME
-from train import CLUSTER_NAME
-from rollout import ModelConfig, rollout, TicTacToeScenario
+from rollout import ModelConfig, TicTacToeScenario, rollout
+from train import BASE_MODEL, CLUSTER_NAME, MODEL_NAME, PROJECT_NAME
+
+import art
 
 
 async def deploy_step():

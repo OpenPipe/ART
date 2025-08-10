@@ -1,5 +1,6 @@
-from pydantic import BaseModel
 from typing import Literal
+
+from pydantic import BaseModel
 
 
 class ProjectPolicyConfig(BaseModel):
@@ -33,6 +34,7 @@ class ProjectPolicyConfig(BaseModel):
     # Training configuration
     scale_rewards: bool = True  # Whether to scale rewards during training
     importance_sampling_level: Literal["token", "sequence"] = "token"
+    train_on_stepwise_groups: bool = False
 
     # Validation configuration
     num_validation_runs: int = 1  # Number of times to run each validation entry

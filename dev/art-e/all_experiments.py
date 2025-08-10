@@ -1,6 +1,6 @@
-import art
 from art_e.project_types import ProjectPolicyConfig
 
+import art
 
 models: dict[str, art.TrainableModel[ProjectPolicyConfig]] = {
     "002": art.TrainableModel(
@@ -240,3 +240,7 @@ models["234"].config.num_epochs = 10
 models["235"] = models["206"].model_copy(deep=True)
 models["235"].name = "email-agent-235"
 models["235"].config.num_validation_runs = 10
+
+models["236"] = models["206"].model_copy(deep=True)
+models["236"].name = "email-agent-236"
+# models["236"].config.train_on_stepwise_groups = True

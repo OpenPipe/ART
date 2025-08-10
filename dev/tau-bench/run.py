@@ -1,12 +1,12 @@
 # Copyright Sierra
 
 import argparse
-from tau_bench.types import RunConfig
-from tau_bench.run import run
-from litellm import provider_list
-from tau_bench.envs.user import UserStrategy
 
 from dotenv import load_dotenv
+from litellm import provider_list
+from tau_bench.envs.user import UserStrategy
+from tau_bench.run import run
+from tau_bench.types import RunConfig
 
 load_dotenv(override=True)
 

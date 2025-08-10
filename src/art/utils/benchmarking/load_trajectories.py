@@ -5,9 +5,10 @@ except ImportError:
         "Plotting dependencies are not installed. Please install them with: "
         "pip install openpipe-art[plotting]"
     )
-import yaml
 import json
 from pathlib import Path
+
+import yaml
 from tqdm.auto import tqdm
 
 from art.utils.get_repo_root_path import get_repo_root_path

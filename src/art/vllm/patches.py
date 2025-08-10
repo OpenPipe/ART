@@ -1,8 +1,9 @@
 """Monkey patches and modifications for vLLM."""
 
 import ctypes
-import torch
 from typing import Any
+
+import torch
 from vllm.worker.multi_step_model_runner import MultiStepModelRunner
 
 
@@ -12,8 +13,8 @@ def patch_allocator() -> None:
     the KV cache.
     """
     from vllm.device_allocator.cumem import (
-        create_and_map,
         CuMemAllocator,
+        create_and_map,
         libcudart,
         unmap_and_release,
     )

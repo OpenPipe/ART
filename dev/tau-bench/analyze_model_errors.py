@@ -5,26 +5,27 @@ import asyncio
 import json
 import os
 from datetime import datetime
-from typing import List, Dict, Any
-from dotenv import load_dotenv
-import litellm
-from tqdm.asyncio import tqdm_asyncio
+from typing import Any, Dict, List
 
-import art
-from tau_bench.types import RunConfig, TauBenchPolicyConfig, EnvRunResult
-from tau_bench.envs import get_env
-from tau_bench.run import display_metrics
+import litellm
+from dotenv import load_dotenv
 from litellm import provider_list
+
+# Import evaluate_model and rollout functions from run_rl
+from run_rl import rollout_tau_bench_task
+from tau_bench.envs import get_env
 from tau_bench.envs.user import UserStrategy
 from tau_bench.rl_utils import (
     ErrorAnalysis,
     analyze_failed_task,
-    log_rollout_analysis_to_openpipe,
     log_full_analysis_to_openpipe,
+    log_rollout_analysis_to_openpipe,
 )
+from tau_bench.run import display_metrics
+from tau_bench.types import EnvRunResult, RunConfig, TauBenchPolicyConfig
+from tqdm.asyncio import tqdm_asyncio
 
-# Import evaluate_model and rollout functions from run_rl
-from run_rl import rollout_tau_bench_task
+import art
 
 # Load environment variables
 load_dotenv(override=True)

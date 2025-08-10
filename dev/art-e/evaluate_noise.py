@@ -1,13 +1,15 @@
 #!/usr/bin/env python3
 
 import asyncio
-import statistics
-from art.local import LocalBackend
-from art_e.evaluate.benchmark import benchmark_model
-from all_experiments import models
 import os
-from dotenv import load_dotenv
+import statistics
+
+from all_experiments import models
 from art_e.data.local_email_db import generate_database
+from art_e.evaluate.benchmark import benchmark_model
+from dotenv import load_dotenv
+
+from art.local import LocalBackend
 
 load_dotenv()
 

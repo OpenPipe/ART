@@ -1,11 +1,10 @@
-import sqlite3
 import logging
-from typing import List, Optional
+import sqlite3
 from dataclasses import dataclass
+from typing import List, Optional
 
 from art_e.data.local_email_db import DEFAULT_DB_PATH
 from art_e.data.types_enron import Email
-
 
 conn = None
 
@@ -63,7 +62,7 @@ def search_emails(
 
     # 1. Keywords (FTS)
     if not keywords:
-        raise ValueError("No keywords provided for search.")
+        return []
 
     if max_results > 10:
         raise ValueError("max_results must be less than or equal to 10.")

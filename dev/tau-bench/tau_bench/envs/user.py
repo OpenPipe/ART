@@ -2,9 +2,9 @@
 
 import abc
 import enum
-from litellm import acompletion
+from typing import Any, Dict, List, Optional, Union
 
-from typing import Optional, List, Dict, Any, Union
+from litellm import acompletion
 
 
 class BaseUserSimulationEnv(abc.ABC):

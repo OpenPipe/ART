@@ -1,11 +1,13 @@
 # %%
 
+import asyncio
+
+from all_experiments import models
+from art_e.data.query_iterators import load_synthetic_queries
+from art_e.evaluate.charts import comparison_models_bar_chart, training_progress_chart
+
 from art.utils.benchmarking.load_trajectories import load_trajectories
 from art.utils.benchmarking.pull_model_trajectories import pull_model_trajectories
-from art_e.evaluate.charts import training_progress_chart, comparison_models_bar_chart
-from all_experiments import models
-import asyncio
-from art_e.data.query_iterators import load_synthetic_queries
 
 ds_size_models = [m for m in models.values() if m.name.startswith("ea-210")]
 

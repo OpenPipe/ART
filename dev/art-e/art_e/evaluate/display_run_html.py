@@ -1,8 +1,8 @@
-from IPython.display import display, HTML  # Add import
 import html  # Add import for escaping
 
 from art_e.data.query_iterators import SyntheticQuery
 from art_e.email_search_tools import read_email
+from IPython.display import HTML, display  # Add import
 
 
 def display_run_html(row: dict, scenarios: list[SyntheticQuery]):
