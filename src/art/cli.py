@@ -12,7 +12,7 @@ import uvicorn
 from . import dev
 from .local import LocalBackend
 from .model import Model, TrainableModel, list_trash, restore_from_trash, empty_trash, delete_model
-from .trajectories import TrajectoryGroup, AsyncTrajectoryGroup
+from .trajectories import TrajectoryGroup
 from .types import TrainConfig
 from .utils.deploy_model import LoRADeploymentProvider
 from .errors import ARTError
@@ -69,7 +69,7 @@ def run(host: str = "0.0.0.0", port: int = 7999) -> None:
     @app.post("/_train_model")
     async def _train_model(
         model: TrainableModel,
-        trajectory_groups: list[AsyncTrajectoryGroup],
+        trajectory_groups: list[TrajectoryGroup],
         config: TrainConfig,
         dev_config: dev.TrainConfig,
         verbose: bool = Body(False),
