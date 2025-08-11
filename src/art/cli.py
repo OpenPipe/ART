@@ -36,6 +36,16 @@ def run(host: str = "0.0.0.0", port: int = 7999) -> None:
         return
 
     
+    # Reset the custom __new__ and __init__ methods for TrajectoryGroup
+    def __new__(cls, *args: Any, **kwargs: Any) -> TrajectoryGroup:
+        return pydantic.BaseModel.__new__(cls)
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        return pydantic.BaseModel.__init__(self, *args, **kwargs)
+
+    TrajectoryGroup.__new__ = __new__  # type: ignore
+    TrajectoryGroup.__init__ = __init__
+
 
     backend = LocalBackend()
     app = FastAPI()
@@ -141,7 +151,7 @@ def run(host: str = "0.0.0.0", port: int = 7999) -> None:
     uvicorn.run(app, host=host, port=port, loop="asyncio")
 
 @app.command()
-def delete(project_name: str, model_name: str):
+def delete_model(project_name: str, model_name: str):
     """Move a model to the trash."""
     try:
         delete_model(project_name, model_name)
@@ -150,7 +160,7 @@ def delete(project_name: str, model_name: str):
         print(e)
 
 @app.command()
-def list_trashed_models(project_name: str):
+def list_trash(project_name: str):
     """List models in the trash."""
     trashed_models = list_trash(project_name)
     if not trashed_models:
@@ -170,7 +180,7 @@ def restore_model(project_name: str, model_name: str):
         print(e)
 
 @app.command()
-def empty_trashed_models(project_name: str):
+def empty_trash(project_name: str):
     """Permanently delete all models in the trash."""
     empty_trash(project_name)
     print("Trash has been emptied.")
