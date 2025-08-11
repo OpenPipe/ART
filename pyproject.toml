@@ -58,22 +58,6 @@ packages = ["src/art", "src/mp_actors"]
 [tool.hatch.build]
 sources = ["src"]
 
-[tool.hatch.build.targets.sdist]
-exclude = [
-  "/dev",
-  "/wandb", 
-  "/.art",
-  "/.ruff_cache",
-  "/.venv",
-  "/dist",
-  "/.git",
-  "/.github",
-  "/examples/*/data",
-  "/examples/*/wandb",
-  "**/__pycache__",
-  "**/*.pyc",
-]
-
 [tool.ruff.lint]
 select = ["I"]
 
