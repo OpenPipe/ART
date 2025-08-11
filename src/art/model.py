@@ -10,7 +10,7 @@ from . import dev
 from .openai import patch_openai
 from .trajectories import Trajectory, TrajectoryGroup
 from .types import TrainConfig
-from .utils.output_dirs import get_models_dir, get_model_dir
+from .utils.output_dirs import get_default_art_path, get_models_dir, get_model_dir
 
 if TYPE_CHECKING:
     from art.backend import Backend
@@ -364,8 +364,8 @@ class TrainableModel(Model[ModelConfig], Generic[ModelConfig]):
 
 
 def _get_trash_dir(project_name: str) -> str:
-    models_dir = get_models_dir(project_name)
-    return os.path.join(models_dir, ".trash")
+    art_path = get_default_art_path()
+    return os.path.join(art_path, "trash", project_name, "models")
 
 
 def move_to_trash(project_name: str, model_name: str):
