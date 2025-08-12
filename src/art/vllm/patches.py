@@ -232,8 +232,8 @@ def patch_patch_vllm() -> None:
         try:
             import vllm.v1.worker.lora_model_runner_mixin
 
-            vllm.v1.worker.lora_model_runner_mixin.LRUCacheWorkerLoRAManager = (
-                PatchedLRUCacheWorkerLoRAManager  # type: ignore
+            vllm.v1.worker.lora_model_runner_mixin.LRUCacheWorkerLoRAManager = (  # type: ignore
+                PatchedLRUCacheWorkerLoRAManager
             )
         except:
             pass
