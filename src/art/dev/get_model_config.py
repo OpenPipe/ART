@@ -15,20 +15,37 @@ def get_model_config(
     if config is None:
         config = InternalModelConfig()
     enable_sleep_mode = config.get("engine_args", {}).get("enable_sleep_mode", True)
-    init_args = InitArgs(
-        model_name=base_model,
-        max_seq_length=32768,
-        load_in_4bit=True,  # False for LoRA 16bit
-        fast_inference=True,  # Enable vLLM fast inference
-        # vLLM args
-        disable_log_stats=False,
-        enable_prefix_caching=True,
-        gpu_memory_utilization=(
-            0.79 if enable_sleep_mode else 0.55
-        ),  # Reduce if out of memory
-        max_lora_rank=8,
-        use_async=True,
-    )
+    use_gemma_config = config.get("use_gemma_config", False)
+
+    if use_gemma_config:
+        init_args = InitArgs(
+            model_name=base_model,
+            max_seq_length=32768,
+            load_in_4bit=True,  # False for LoRA 16bit
+            fast_inference=True,  # Enable vLLM fast inference
+            # vLLM args
+            disable_log_stats=False,
+            gpu_memory_utilization=(
+                0.79 if enable_sleep_mode else 0.55
+            ),  # Reduce if out of memory
+            max_lora_rank=8,
+            #use_async=True,
+        )
+    else:
+        init_args = InitArgs(
+            model_name=base_model,
+            max_seq_length=32768,
+            load_in_4bit=True,  # False for LoRA 16bit
+            fast_inference=True,  # Enable vLLM fast inference
+            # vLLM args
+            disable_log_stats=False,
+            enable_prefix_caching=True,
+            gpu_memory_utilization=(
+                0.79 if enable_sleep_mode else 0.55
+            ),  # Reduce if out of memory
+            max_lora_rank=8,
+            use_async=True,
+        )
     if config.get("_decouple_vllm_and_unsloth", False):
         init_args["fast_inference"] = False
         init_args.pop("disable_log_stats")

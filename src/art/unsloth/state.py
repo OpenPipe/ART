@@ -87,7 +87,13 @@ class ModelState:
         AsyncLLMEngine.from_engine_args = from_engine_args
         torch.cuda.empty_cache = empty_cache
         torch.cuda.empty_cache()
-        self.vllm = vLLMState(self.model.vllm_engine, enable_sleep_mode)
+        
+        # Only initialize vLLM if not using gemma config (for models without vLLM support)
+        if not config.get("use_gemma_config", False):
+            self.vllm = vLLMState(self.model.vllm_engine, enable_sleep_mode)
+        else:
+            self.vllm = None
+            
         # Initialize PEFT model
         self.peft_model = cast(
             peft.peft_model.PeftModelForCausalLM,
