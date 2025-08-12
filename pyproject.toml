@@ -3,9 +3,9 @@ name = "openpipe-art"
 version = "0.4.7"
 description = "The OpenPipe Agent Reinforcement Training (ART) library"
 readme = "README.md"
-requires-python = ">=3.10"
+requires-python = ">=3.12,<3.13"
 dependencies = [
-    "openai>=1.65.5,<=1.99.1",
+    "openai==1.99.5",
     "typer>=0.15.2",
     "litellm>=1.63.0",
     "weave>=0.51.51",
@@ -18,9 +18,9 @@ backend = [
     "peft>=0.14.0",
     "hf-xet>=1.1.0",
     "bitsandbytes>=0.45.2",
-    "unsloth==2025.8.1",
-    "unsloth-zoo==2025.8.1",
-    "vllm==0.10.0",
+#    "unsloth==2025.8.1",
+    "unsloth-zoo",
+    "vllm==0.10.1+gptoss",
     "torchtune",
     "trl>=0.19.0",
     "torch>=2.7.0",
@@ -86,11 +86,18 @@ dev-dependencies = [
     "black>=25.1.0",
     "ipykernel>=6.29.5",
     "ipywidgets>=8.1.5",
-    "openpipe>=4.49.0",
+#    "openpipe>=4.49.0",
     "hatch>=1.14.1",
     "ruff>=0.12.1",
     "pyright>=1.1.403",
 ]
+extra-index-url = [
+    "https://wheels.vllm.ai/gpt-oss/",
+    "https://download.pytorch.org/whl/nightly/cu128",
+]
+index-strategy = "unsafe-best-match"
+prerelease = "allow"
+
 
 [tool.uv.sources]
 panza = { git = "https://github.com/corbt/panza.git" }
