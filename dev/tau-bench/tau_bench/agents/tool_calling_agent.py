@@ -1,16 +1,17 @@
 # Copyright Sierra
 
 import json
+from typing import Any, Dict, List, Optional
+
 from litellm import Choices, acompletion
 from litellm.types.utils import ModelResponse
-from typing import List, Optional, Dict, Any
+from tenacity import retry, stop_after_attempt, wait_exponential
 
 from art.utils import limit_concurrency
 from art.utils.litellm import convert_litellm_choice_to_openai
 from tau_bench.agents.base import Agent
 from tau_bench.envs.base import Env
-from tau_bench.types import SolveResult, Action, RESPOND_ACTION_NAME
-from tenacity import retry, stop_after_attempt, wait_exponential
+from tau_bench.types import RESPOND_ACTION_NAME, Action, SolveResult
 
 
 @retry(

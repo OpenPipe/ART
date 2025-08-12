@@ -1,15 +1,16 @@
 import asyncio
-from dataclasses import dataclass
 import inspect
 import multiprocessing as mp
-import nest_asyncio
 import os
-import setproctitle
 import sys
-from tblib import pickling_support
-from typing import Any, AsyncGenerator, cast, TypeVar
 import uuid
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass
+from typing import Any, AsyncGenerator, TypeVar, cast
+
+import nest_asyncio
+import setproctitle
+from tblib import pickling_support
 
 from .traceback import streamline_tracebacks
 
@@ -46,6 +47,17 @@ def move_to_child_process(
         The proxy has the same interface as the original object.
     """
     return cast(T, Proxy(obj, log_file, process_name))
+
+
+def close_proxy(proxy: object) -> None:
+    """
+    After moving an object to a child process, you can use this function to close
+    the proxy object and terminate the child process.
+
+    Args:
+        proxy: The proxy object to close.
+    """
+    getattr(proxy, "close", lambda: None)()
 
 
 @dataclass
@@ -180,7 +192,8 @@ class Proxy:
                     self._process.kill()
                 except AttributeError:
                     # fallback: os.kill
-                    os.kill(self._process.pid, 9)
+                    if self._process.pid:
+                        os.kill(self._process.pid, 9)
                 self._process.join()
 
         # shutdown executor cleanly

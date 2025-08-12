@@ -1,11 +1,12 @@
 """OpenAI-compatible server functionality for vLLM."""
 
 import asyncio
-from contextlib import asynccontextmanager
 import logging
-from openai import AsyncOpenAI
 import os
+from contextlib import asynccontextmanager
 from typing import Any, AsyncIterator, Coroutine
+
+from openai import AsyncOpenAI
 from uvicorn.config import LOGGING_CONFIG
 from vllm.engine.protocol import EngineClient
 from vllm.entrypoints.openai.cli_args import make_arg_parser, validate_parsed_serve_args
@@ -32,9 +33,9 @@ async def openai_server_task(
     """
     # Import patches before importing api_server
     from .patches import (
-        subclass_chat_completion_request,
         patch_listen_for_disconnect,
         patch_tool_parser_manager,
+        subclass_chat_completion_request,
     )
 
     # We must subclass ChatCompletionRequest before importing api_server
@@ -71,13 +72,16 @@ async def openai_server_task(
 
     test_client_task = asyncio.create_task(test_client())
     try:
+        timeout = float(os.environ.get("ART_SERVER_TIMEOUT", 30.0))
         done, _ = await asyncio.wait(
             [openai_server_task, test_client_task],
-            timeout=10.0,
+            timeout=timeout,
             return_when="FIRST_COMPLETED",
         )
         if not done:
-            raise TimeoutError("Unable to reach OpenAI-compatible server in time.")
+            raise TimeoutError(
+                f"Unable to reach OpenAI-compatible server within {timeout} seconds. You can increase this timeout by setting the ART_SERVER_TIMEOUT environment variable."
+            )
         for task in done:
             task.result()
 

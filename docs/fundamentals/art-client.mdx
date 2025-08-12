@@ -66,6 +66,29 @@ backend = SkyPilotBackend.initialize_cluster(
 await model.register(backend)
 ```
 
+### Initializing from an existing SFT LoRA
+
+If you've already fine-tuned a model with SFT using a LoRA adapter (e.g., Unsloth/PEFT) and have a standard Hugging Face–style adapter directory, you can start RL training from those weights by passing the adapter directory path as `base_model` when creating your `TrainableModel`.
+
+Why this?
+
+- Warm-start from task-aligned weights to reduce steps/GPU cost.
+- Stabilize early training, especially for small models (1B–8B) that may get near-zero rewards at RL start.
+
+```python
+import art
+
+model = art.TrainableModel(
+    name="agent-001",
+    project="my-agentic-task",
+    # Point to the local SFT LoRA adapter directory
+    # (e.g., contains adapter_config.json and adapter_model.bin/safetensors)
+    base_model="/path/to/my_sft_lora_adapter",
+)
+```
+
+ART will load the adapter as the initial checkpoint and proceed with RL updates from there.
+
 You're now ready to start training your agent.
 
 ## Running inference

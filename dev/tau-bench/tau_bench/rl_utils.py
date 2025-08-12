@@ -1,14 +1,16 @@
 import os
-from typing import Any, Dict, List, Optional
-import art
-from openpipe.client import AsyncOpenPipe, UpdateLogTagsRequestFiltersItem
-from langfuse import Langfuse
-from art.trajectories import MetadataValue
-import uuid
 import time
+import uuid
 from datetime import datetime
+from typing import Any, Dict, List, Optional
+
+from langfuse import Langfuse
 from openai import AsyncOpenAI
+from openpipe.client import AsyncOpenPipe, UpdateLogTagsRequestFiltersItem
 from pydantic import BaseModel, Field
+
+import art
+from art.trajectories import MetadataValue
 
 
 def log_trajectory_to_langfuse(

@@ -10,7 +10,7 @@ unsloth_compiled_cache/
 wandb/
 docs/node_modules/
 dist/
-examples/art-e/data/
+dev/art-e/data/
 replays/
 trajectories/
 .DS_Store

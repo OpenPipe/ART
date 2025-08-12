@@ -1,8 +1,8 @@
 # Copyright Sierra
 
-from pydantic import BaseModel
-from typing import List, Dict, Any, Optional, Union
+from typing import Any, Dict, List, Literal, Optional, Union
 
+from pydantic import BaseModel
 
 RESPOND_ACTION_NAME = "respond"
 RESPOND_ACTION_FIELD_NAME = "content"
@@ -115,6 +115,7 @@ class TauBenchTrainingConfig(BaseModel):
     training_dataset_size: int = 30
     num_epochs: int = 50
     train_mode: str = "sync_rl"
+    importance_sampling_level: Literal["token", "sequence"] = "token"
 
 
 class TauBenchPolicyConfig(BaseModel):

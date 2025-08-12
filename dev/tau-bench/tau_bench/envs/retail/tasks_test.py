@@ -1,4 +1,4 @@
-from tau_bench.types import Task, Action
+from tau_bench.types import Action, Task
 
 TASKS_TEST = [
     Task(

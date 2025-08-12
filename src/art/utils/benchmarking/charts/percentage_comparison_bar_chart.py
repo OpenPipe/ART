@@ -6,8 +6,8 @@ except ImportError:
         "pip install openpipe-art[plotting]"
     )
 
-from ..types import BenchmarkModelKey
 from ..filter_model_split import filter_rename_model_split
+from ..types import BenchmarkModelKey
 
 
 def percentage_comparison_bar_chart(
@@ -82,14 +82,14 @@ def percentage_comparison_bar_chart(
     # ------------------------------------------------------------------
 
     if models is not None:
-        models = [
+        models_keys = [
             entry if isinstance(entry, BenchmarkModelKey) else BenchmarkModelKey(entry)
             for entry in models
         ]
 
-        df = filter_rename_model_split(df, models)
+        df = filter_rename_model_split(df, models_keys)
 
-        plot_models = [key.display_name for key in models]
+        plot_models = [key.display_name for key in models_keys]
     else:
         step_counts = (
             df.group_by("model")

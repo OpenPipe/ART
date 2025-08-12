@@ -1,11 +1,12 @@
 import os
 import random
 import time
+
 import torch
 from typing_extensions import TypedDict, Unpack
 
-from .tokenize import TokenizedResult
 from ..types import Verbosity
+from .tokenize import TokenizedResult
 
 
 class PackedTensors(TypedDict):
@@ -30,6 +31,7 @@ def packed_tensors_from_tokenized_results(
     seq_len: int,
     pad_token_id: int = -100,
     truncate_long_results: bool = True,
+    advantage_balance: float = 0.0,
     verbosity: Verbosity = 1,
 ) -> PackedTensors:
     # TODO: This function could potentially be optimized with vectorized operations
@@ -122,6 +124,18 @@ def packed_tensors_from_tokenized_results(
     advantages_tensor = torch.where(
         assistant_mask_tensor, advantages_tensor, torch.zeros_like(advantages_tensor)
     )
+    if advantage_balance > 0.0:
+        advantages_tensor = torch.where(
+            advantages_tensor > 0,
+            advantages_tensor,
+            advantages_tensor * (1 - advantage_balance),
+        )
+    elif advantage_balance < 0.0:
+        advantages_tensor = torch.where(
+            advantages_tensor < 0,
+            advantages_tensor,
+            advantages_tensor * (1 + advantage_balance),
+        )
     advantages_tensor[assistant_mask_tensor] /= (
         advantages_tensor[assistant_mask_tensor].abs()
         * weights_tensor[assistant_mask_tensor]

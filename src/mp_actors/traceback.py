@@ -1,9 +1,8 @@
-import sys
 import functools
 import inspect
+import sys
 from types import TracebackType
-from typing import Any, Callable, cast, TypeVar
-
+from typing import Any, Callable, TypeVar, cast
 
 T = TypeVar("T", bound=Callable[..., Any])
 

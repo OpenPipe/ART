@@ -1,8 +1,7 @@
 from typing import AsyncIterator, Protocol, runtime_checkable
 
+from .. import dev, types
 from .pack import DiskPackedTensors
-from .. import dev
-from .. import types
 
 
 @runtime_checkable

@@ -1,3 +1,5 @@
+from typing import Any, AsyncIterator, Callable, cast
+
 import openai
 from openai import AsyncStream
 from openai.types.chat.chat_completion import ChatCompletion, Choice, ChoiceLogprobs
@@ -10,7 +12,6 @@ from openai.types.chat.chat_completion_message_tool_call import (
     ChatCompletionMessageToolCall,
     Function,
 )
-from typing import Any, AsyncIterator, Callable, cast
 
 from .gather import get_gather_context
 

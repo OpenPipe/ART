@@ -1,0 +1,115 @@
+name: Create Draft Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      version_type:
+        description: 'Version bump type'
+        required: true
+        default: 'patch'
+        type: choice
+        options:
+        - patch
+        - minor
+        - major
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  create-draft:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install uv
+        run: |
+          curl -LsSf https://astral.sh/uv/install.sh | sh
+          echo "$HOME/.cargo/bin" >> $GITHUB_PATH
+
+      - name: Install dependencies
+        run: |
+          uv venv
+          uv pip install -e .
+
+      - name: Bump version
+        id: bump
+        run: |
+          python scripts/bump_version.py ${{ github.event.inputs.version_type }}
+          NEW_VERSION=$(python -c "import tomllib; print(tomllib.load(open('pyproject.toml', 'rb'))['project']['version'])")
+          echo "NEW_VERSION=$NEW_VERSION" >> $GITHUB_OUTPUT
+
+      - name: Generate release notes template
+        id: release_notes
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          # Get the previous tag
+          PREVIOUS_TAG=$(git describe --tags --abbrev=0 2>/dev/null || echo "")
+          
+          # Get merged PRs since last release
+          if [ -z "$PREVIOUS_TAG" ]; then
+            PRS=$(gh pr list --state merged --limit 100 --json number,title,url | jq -r '.[] | "- \(.title) ([#\(.number)](\(.url)))"')
+          else
+            LAST_TAG_DATE=$(git log -1 --format=%aI $PREVIOUS_TAG)
+            PRS=$(gh pr list --state merged --limit 100 --json number,title,url,mergedAt | jq -r --arg date "$LAST_TAG_DATE" '.[] | select(.mergedAt > $date) | "- \(.title) ([#\(.number)](\(.url)))"')
+          fi
+          
+          # Create release notes template
+          cat << EOF > release_notes_template.md
+          ## Release Highlights
+          
+          <!-- Add key features, improvements, and breaking changes here -->
+          
+          ## What's Changed
+          
+          $PRS
+          
+          **Full Changelog**: https://github.com/OpenPipe/ART/compare/$PREVIOUS_TAG...v${{ steps.bump.outputs.NEW_VERSION }}
+          EOF
+
+      - name: Create draft release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create v${{ steps.bump.outputs.NEW_VERSION }} \
+            --title "v${{ steps.bump.outputs.NEW_VERSION }}" \
+            --notes-file release_notes_template.md \
+            --draft
+
+      - name: Create PR with version bump
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          git config --local user.email "action@github.com"
+          git config --local user.name "GitHub Action"
+          git checkout -b release/v${{ steps.bump.outputs.NEW_VERSION }}
+          git add pyproject.toml uv.lock
+          git commit -m "Bump version to ${{ steps.bump.outputs.NEW_VERSION }}"
+          git push origin release/v${{ steps.bump.outputs.NEW_VERSION }}
+          
+          gh pr create \
+            --title "Release v${{ steps.bump.outputs.NEW_VERSION }}" \
+            --body "This PR bumps the version to ${{ steps.bump.outputs.NEW_VERSION }}. 
+
+          **Next steps:**
+          1. Review and edit the [draft release](https://github.com/OpenPipe/ART/releases) 
+          2. Add release highlights and curate the changelog
+          3. Merge this PR to publish the release automatically" \
+            --base main \
+            --head release/v${{ steps.bump.outputs.NEW_VERSION }}
+
+      - name: Output instructions
+        run: |
+          echo "::notice::Draft release created! Next steps:"
+          echo "::notice::1. Go to https://github.com/OpenPipe/ART/releases and edit the draft"
+          echo "::notice::2. Add release highlights and curate the auto-generated PR list"  
+          echo "::notice::3. Merge the PR to publish the release"

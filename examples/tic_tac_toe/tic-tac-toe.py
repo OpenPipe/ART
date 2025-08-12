@@ -1,12 +1,12 @@
+import argparse
+import asyncio
 import os
 import random
-import asyncio
-import argparse
+
 from dotenv import load_dotenv
+from rollout import TicTacToeScenario, rollout
 
 import art
-from rollout import rollout, TicTacToeScenario
-
 
 load_dotenv()
 

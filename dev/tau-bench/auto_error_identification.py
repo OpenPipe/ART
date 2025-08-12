@@ -1,16 +1,17 @@
 # Copyright Sierra
 
-import json
 import argparse
+import json
+from concurrent.futures import ThreadPoolExecutor
 from enum import Enum
+from typing import Any, Dict, List
+
 from pydantic import BaseModel
-from tau_bench.model_utils import default_api_from_args, API
 from tau_bench.envs.airline.tasks_test import TASKS as AIRLINE_TASKS
 from tau_bench.envs.retail.tasks_test import TASKS_TEST as RETAIL_TASKS
+from tau_bench.model_utils import API, default_api_from_args
 from tau_bench.model_utils.args import api_parser
-from tau_bench.types import Task, Action
-from typing import List, Dict, Any
-from concurrent.futures import ThreadPoolExecutor
+from tau_bench.types import Action, Task
 
 
 def get_args() -> argparse.Namespace:

@@ -1,11 +1,12 @@
-from dataclasses import dataclass
-from itertools import takewhile
 import math
 import random
-from transformers.tokenization_utils_base import PreTrainedTokenizerBase
-from typing import cast, Generator
+from dataclasses import dataclass
+from itertools import takewhile
+from typing import Generator, cast
 
-from ..trajectories import get_messages, History, TrajectoryGroup
+from transformers.tokenization_utils_base import PreTrainedTokenizerBase
+
+from ..trajectories import History, TrajectoryGroup, get_messages
 
 
 @dataclass
@@ -189,13 +190,22 @@ def tokenize_trajectory(
             continue
         token_logprobs = choice.logprobs.content or choice.logprobs.refusal or []
         sentinal_index = token_ids.index(sentinal_token_id)
-        token_ids[sentinal_index : sentinal_index + 1] = (
+        if (
+            bytes(token_logprobs[0].bytes or []).decode("utf-8")
+            == "<think>"
+            == tokenizer.decode(token_ids[sentinal_index - 4])
+        ):
+            start = sentinal_index - 4
+        else:
+            start = sentinal_index
+        end = sentinal_index + 1
+        token_ids[start:end] = (
             int(token_logprob.token.split(":")[1]) for token_logprob in token_logprobs
         )
-        logprobs[sentinal_index : sentinal_index + 1] = (
+        logprobs[start:end] = (
             token_logprob.logprob for token_logprob in token_logprobs
         )
-        assistant_mask[sentinal_index : sentinal_index + 1] = [1] * len(token_logprobs)
+        assistant_mask[start:end] = [1] * len(token_logprobs)
     return TokenizedResult(
         advantage=advantage,
         chat=chat,

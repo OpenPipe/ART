@@ -74,6 +74,10 @@
       {
         "group": "Resources",
         "pages": ["resources/models", "resources/glossary"]
+      },
+      {
+        "group": "Experimental",
+        "pages": ["experimental/gspo"]
       }
     ]
   },

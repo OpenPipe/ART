@@ -1,14 +1,11 @@
 import json
-import yaml
-from typing import Any
+from typing import Any, cast
 
-from art import TrajectoryGroup, Trajectory
+import yaml
+
+from art import Trajectory, TrajectoryGroup
+from art.trajectories import History
 from art.types import Choice, Message, MessageOrChoice
-from openai.types.chat.chat_completion_message_param import (
-    ChatCompletionSystemMessageParam,
-    ChatCompletionUserMessageParam,
-    ChatCompletionAssistantMessageParam,
-)
 
 
 # serialize trajectory groups to a jsonl string
@@ -34,6 +31,15 @@ def trajectory_group_to_dict(trajectory_group: TrajectoryGroup) -> dict[str, Any
     }
 
 
+def history_to_dict(history: History) -> dict[str, Any]:
+    messages_and_choices = [
+        message_or_choice_to_dict(message_or_choice)
+        for message_or_choice in history.messages_and_choices
+    ]
+
+    return {"messages_and_choices": messages_and_choices, "tools": history.tools}
+
+
 def trajectory_to_dict(trajectory: Trajectory) -> dict[str, Any]:
     messages_and_choices = [
         message_or_choice_to_dict(message_or_choice)
@@ -46,12 +52,16 @@ def trajectory_to_dict(trajectory: Trajectory) -> dict[str, Any]:
         "metadata": trajectory.metadata,
         "messages_and_choices": messages_and_choices,
         "tools": trajectory.tools,
-        "additional_histories": trajectory.additional_histories,
+        "additional_histories": (
+            [history_to_dict(h) for h in trajectory.additional_histories]
+            if trajectory.additional_histories
+            else trajectory.additional_histories
+        ),
         "logs": trajectory.logs,
     }
 
 
-def message_or_choice_to_dict(message_or_choice: Message | Choice) -> dict[str, Any]:
+def message_or_choice_to_dict(message_or_choice: MessageOrChoice) -> dict[str, Any]:
     # messages are sometimes stored as dicts, so we need to handle both cases
     item_dict = (
         message_or_choice
@@ -63,7 +73,7 @@ def message_or_choice_to_dict(message_or_choice: Message | Choice) -> dict[str, 
         # item is a choice with logprobs, remove the logprobs
         item_dict.pop("logprobs")
 
-    return item_dict
+    return dict(item_dict)
 
 
 def deserialize_trajectory_groups(serialized: str) -> list[TrajectoryGroup]:
@@ -104,12 +114,4 @@ def dict_to_message_or_choice(dict: dict[str, Any]) -> MessageOrChoice:
     if "message" in dict:
         return Choice(**dict)
     else:
-        # cannot be instantiated as just "Message" because it is a union type alias
-        if dict["role"] == "system":
-            return ChatCompletionSystemMessageParam(**dict)
-        elif dict["role"] == "user":
-            return ChatCompletionUserMessageParam(**dict)
-        elif dict["role"] == "assistant":
-            return ChatCompletionAssistantMessageParam(**dict)
-        else:
-            raise ValueError(f"Unknown message role: {dict['role']}")
+        return cast(Message, dict)
