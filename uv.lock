@@ -1,5 +1,5 @@
 version = 1
-revision = 2
+revision = 3
 requires-python = ">=3.10"
 resolution-markers = [
     "python_full_version >= '3.13' and sys_platform == 'linux'",
@@ -3499,7 +3499,7 @@ wheels = [
 
 [[package]]
 name = "openpipe-art"
-version = "0.4.5"
+version = "0.4.6"
 source = { editable = "." }
 dependencies = [
     { name = "litellm" },
@@ -3574,7 +3574,7 @@ requires-dist = [
     { name = "trl", marker = "extra == 'backend'", specifier = ">=0.19.0" },
     { name = "typer", specifier = ">=0.15.2" },
     { name = "unsloth", marker = "extra == 'backend'", specifier = "==2025.8.1" },
-    { name = "unsloth-zoo", marker = "extra == 'backend'", git = "https://github.com/bradhilton/unsloth-zoo" },
+    { name = "unsloth-zoo", marker = "extra == 'backend'", git = "https://github.com/bradhilton/unsloth-zoo?rev=323cf5e" },
     { name = "vllm", marker = "extra == 'backend'", specifier = "==0.10.0" },
     { name = "wandb", marker = "extra == 'backend'", specifier = ">=0.19.8" },
     { name = "weave", specifier = ">=0.51.51" },
@@ -6630,8 +6630,8 @@ wheels = [
 
 [[package]]
 name = "unsloth-zoo"
-version = "2025.8.1"
-source = { git = "https://github.com/bradhilton/unsloth-zoo#01d831919d5be58c5f0ce912db522e8cb9494b3e" }
+version = "2025.8.2"
+source = { git = "https://github.com/bradhilton/unsloth-zoo?rev=323cf5e#323cf5e4cd0a9e62e49bb40d4dfd52b7bc8354f2" }
 dependencies = [
     { name = "accelerate" },
     { name = "cut-cross-entropy" },
