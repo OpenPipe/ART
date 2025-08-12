@@ -15,5 +15,3 @@ def test_can_import_art_and_create_trajectory():
     # Finish should add a duration metric
     traj.finish()
     assert "duration" in traj.metrics
-
-
