@@ -1,12 +1,13 @@
+import json
+from copy import deepcopy
+from typing import Iterable, List, Literal, Tuple
+
 from openai.types.chat.chat_completion import ChatCompletion
-from openai.types.chat.chat_completion_tool_param import ChatCompletionToolParam
 from openai.types.chat.chat_completion_tool_choice_option_param import (
     ChatCompletionToolChoiceOptionParam,
 )
+from openai.types.chat.chat_completion_tool_param import ChatCompletionToolParam
 from pydantic import create_model
-from typing import Literal, Tuple, Iterable, List
-from copy import deepcopy
-import json
 
 
 def freeze_tool_schema(tool: dict, fixed_args: dict) -> ChatCompletionToolParam:

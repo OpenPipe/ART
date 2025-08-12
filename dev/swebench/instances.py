@@ -1,6 +1,7 @@
 from datetime import datetime
+from typing import Iterator, TypedDict, cast
+
 import polars as pl
-from typing import cast, Iterator, TypedDict
 from typing_extensions import NotRequired
 
 

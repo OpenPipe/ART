@@ -14,7 +14,7 @@ def generate_comparison_table(
         project, benchmark_keys, metrics, api_path
     )
 
-    rows = []
+    rows: list[dict[str, str]] = []
 
     for benchmarked_model in benchmarked_models:
         for step in benchmarked_model.steps:
@@ -24,7 +24,7 @@ def generate_comparison_table(
                 "Step": f"{step.index:04d}",
             }
             for metric in metrics:
-                row[metric] = step.metrics.get(metric, "N/A")
+                row[metric] = str(step.metrics.get(metric, "N/A"))
             rows.append(row)
 
-    return pd.DataFrame(rows, columns=["Model", "Split", "Step"] + metrics)
+    return pd.DataFrame(rows, columns=pd.Index(["Model", "Split", "Step"] + metrics))

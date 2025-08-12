@@ -2,11 +2,12 @@
 # uv run run_training.py --models=207 --fast
 
 import argparse
-import sky
 import textwrap
+from datetime import datetime
+
+import sky
 from dotenv import dotenv_values, load_dotenv
 from sky import ClusterStatus
-from datetime import datetime
 
 load_dotenv()
 

@@ -1,10 +1,10 @@
 import re
 import shlex
-from swerex.exceptions import CommandTimeoutError
-from swerex.runtime.abstract import AbstractRuntime, BashAction
 from typing import TypedDict
 
 from instances import Instance
+from swerex.exceptions import CommandTimeoutError
+from swerex.runtime.abstract import AbstractRuntime, BashAction
 
 
 class EvalResult(TypedDict):

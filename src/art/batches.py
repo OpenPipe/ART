@@ -1,6 +1,7 @@
 import asyncio
-from tqdm import auto as tqdm
 from typing import AsyncIterator, Awaitable, Iterable
+
+from tqdm import auto as tqdm
 
 from .gather import GatherContext, set_gather_context, wrap_group_awaitable
 from .trajectories import TrajectoryGroup

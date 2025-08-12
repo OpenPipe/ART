@@ -10,9 +10,9 @@ except ImportError:
         "pip install openpipe-art[plotting]"
     )
 
+from ..output_dirs import get_default_art_path
 from .load_benchmarked_models import load_benchmarked_models
 from .types import BenchmarkedModelKey
-from ..output_dirs import get_default_art_path
 
 
 # returns an array of paths to image files, one for each metric
@@ -53,25 +53,34 @@ def generate_line_graphs(
 
     for metric in metrics:
         plt.figure()  # Create a new figure for each metric
+        last_x_global: float | None = None
         for model in line_graph_models:
-            x_values = [
-                step.recorded_at if x_axis_metric == "time" else step.index
-                for step in model.steps
-            ]
+            if x_axis_metric == "time":
+                from matplotlib import dates as mdates  # type: ignore
+
+                x_values_float = [
+                    float(mdates.date2num(step.recorded_at or datetime.min))
+                    for step in model.steps
+                ]
+            else:
+                x_values_float = [float(step.index) for step in model.steps]
+
             values = [step.metrics.get(metric, float("nan")) for step in model.steps]
             label = f"{model.model_key.model} {model.model_key.split}"
-            plt.plot(x_values, values, label=label)
+            plt.plot(x_values_float, values, label=label)
+            if x_values_float:
+                last_x_global = x_values_float[-1]
 
             # Add a dot only at the last point
-            if x_values and values:
-                plt.scatter(x_values[-1], values[-1], s=10)
+            if x_values_float and values:
+                plt.scatter(x_values_float[-1], values[-1], s=10)
 
         for model in comparison_models:
             last_step = model.steps[-1]
             # draw horizontal black dashed line at the last step's value
             plt.axhline(y=last_step.metrics[metric], color="black", linestyle="--")
             plt.text(
-                x_values[-1],
+                last_x_global if last_x_global is not None else 0.0,
                 last_step.metrics[metric],
                 f"{model.model_key.model} {model.model_key.split}",
                 ha="right",

@@ -1,11 +1,11 @@
 [project]
 name = "openpipe-art"
-version = "0.4.5"
+version = "0.4.7"
 description = "The OpenPipe Agent Reinforcement Training (ART) library"
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
-    "openai>=1.65.5",
+    "openai>=1.65.5,<=1.99.1",
     "typer>=0.15.2",
     "litellm>=1.63.0",
     "weave>=0.51.51",
@@ -19,7 +19,7 @@ backend = [
     "hf-xet>=1.1.0",
     "bitsandbytes>=0.45.2",
     "unsloth==2025.8.1",
-    "unsloth-zoo",
+    "unsloth-zoo==2025.8.1",
     "vllm==0.10.0",
     "torchtune",
     "trl>=0.19.0",
@@ -61,7 +61,7 @@ sources = ["src"]
 [tool.hatch.build.targets.sdist]
 exclude = [
   "/dev",
-  "/wandb", 
+  "/wandb",
   "/.art",
   "/.ruff_cache",
   "/.venv",
@@ -74,6 +74,12 @@ exclude = [
   "**/*.pyc",
 ]
 
+[tool.ruff.lint]
+select = ["I"]
+
+[tool.ruff.lint.isort]
+case-sensitive = false
+
 [tool.uv]
 required-version = ">=0.6.15"
 dev-dependencies = [
@@ -83,10 +89,10 @@ dev-dependencies = [
     "openpipe>=4.49.0",
     "hatch>=1.14.1",
     "ruff>=0.12.1",
+    "pyright>=1.1.403",
 ]
 
 [tool.uv.sources]
 panza = { git = "https://github.com/corbt/panza.git" }
-torchtune = { git = "https://github.com/pytorch/torchtune.git", rev = "2344509cf83bd886538fe3e8263e5145d1afb5c2" }
 sweagent = { git = "https://github.com/bradhilton/SWE-agent" }
-unsloth-zoo = { git = "https://github.com/bradhilton/unsloth-zoo" }
+torchtune = { git = "https://github.com/pytorch/torchtune.git", rev = "2344509cf83bd886538fe3e8263e5145d1afb5c2" }

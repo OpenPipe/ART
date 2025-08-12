@@ -1,6 +1,8 @@
-import art
-from langfuse.decorators import langfuse_context
 from pathlib import Path
+from typing import TYPE_CHECKING, Any
+
+from instances import Instance
+from langfuse.decorators import langfuse_context
 from pydantic import SecretStr
 from sweagent.agent.agents import DefaultAgentConfig, TemplateConfig
 from sweagent.agent.history_processors import (
@@ -16,9 +18,8 @@ from sweagent.tools.bundle import Bundle
 from sweagent.tools.parsing import FunctionCallingParser, XMLFunctionCallingParser
 from sweagent.tools.tools import ToolConfig
 from swerex.deployment.config import ModalDeploymentConfig
-from typing import Any, TYPE_CHECKING
 
-from instances import Instance
+import art
 
 if TYPE_CHECKING:
     # Avoid circular import

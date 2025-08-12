@@ -1,5 +1,6 @@
-import torch
 from typing import Literal
+
+import torch
 
 Reduction = Literal["sum", "mean", "var", "std", "count", "min", "max"]
 

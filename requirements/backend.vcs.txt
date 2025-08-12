@@ -1,0 +1,11 @@
+# Pinned backend dependencies that must come from VCS (not allowed in PyPI metadata).
+# Install with:
+#   uv pip install -r requirements/backend.vcs.txt
+# or
+#   pip install -r requirements/backend.vcs.txt
+
+# Torchtune pinned to known-good commit
+ torchtune @ git+https://github.com/pytorch/torchtune.git@2344509cf83bd886538fe3e8263e5145d1afb5c2
+
+# Unsloth Zoo pinned to known-good commit
+ unsloth-zoo @ git+https://github.com/bradhilton/unsloth-zoo@323cf5e

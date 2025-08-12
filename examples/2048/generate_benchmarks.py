@@ -1,11 +1,12 @@
-import art
-from art.local import LocalBackend
-from dotenv import load_dotenv
-import random
 import asyncio
 import os
+import random
 
+from dotenv import load_dotenv
 from rollout import rollout
+
+import art
+from art.local import LocalBackend
 
 load_dotenv()
 

@@ -1,8 +1,8 @@
 # Copyright Sierra
 
-from pydantic import BaseModel
-from typing import List, Dict, Any, Literal, Optional, Union
+from typing import Any, Dict, List, Literal, Optional, Union
 
+from pydantic import BaseModel
 
 RESPOND_ACTION_NAME = "respond"
 RESPOND_ACTION_FIELD_NAME = "content"

@@ -1,21 +1,22 @@
 import asyncio
-import os
-import openai
 import math
+import os
+
+import openai
 import requests
 import weave
 from dotenv import load_dotenv
-
-import art
 from utils import (
+    WINNING_VALUE,
     apply_agent_move,
     check_game_finished,
     generate_game,
     max_cell_value,
-    total_board_value,
     render_board,
-    WINNING_VALUE,
+    total_board_value,
 )
+
+import art
 
 load_dotenv()
 

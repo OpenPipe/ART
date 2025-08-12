@@ -1,10 +1,11 @@
 """MCP Server wrapper class for integration with ART."""
 
 import json
+import ssl
 from abc import ABC, abstractmethod
 from typing import Any, Dict, List, Optional
+
 import aiohttp
-import ssl
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
 

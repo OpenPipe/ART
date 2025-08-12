@@ -1,4 +1,4 @@
-from typing import Callable, Coroutine, Any
+from typing import Any, Callable, Coroutine
 
 import art
 

@@ -1,10 +1,12 @@
+import asyncio
+import os
+import re
+
+from pydantic import BaseModel
+
 import art
 from art.local import LocalBackend
-import asyncio
-from pydantic import BaseModel
-import re
 from art.utils import iterate_dataset
-import os
 
 PROJECT_NAME = "benchmarking-comparison-models"
 

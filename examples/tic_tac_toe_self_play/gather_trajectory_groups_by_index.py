@@ -1,10 +1,10 @@
+import asyncio
 from typing import Awaitable, Iterable
 
-import asyncio
 import tqdm
 
-from art.gather import GatherContext, set_gather_context, wrap_group_awaitable
 import art
+from art.gather import GatherContext, set_gather_context, wrap_group_awaitable
 
 
 async def gather_trajectory_groups_by_index(

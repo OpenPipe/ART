@@ -1,13 +1,15 @@
 """Task completion checking using LLM evaluation."""
 
-import os
 import json
+import os
+
+import weave
+from dotenv import load_dotenv
 from openai import AsyncOpenAI
+from tenacity import retry, stop_after_attempt, wait_exponential
+
 import art
 from art.utils import limit_concurrency
-from dotenv import load_dotenv
-from tenacity import retry, stop_after_attempt, wait_exponential
-import weave
 
 load_dotenv()
 

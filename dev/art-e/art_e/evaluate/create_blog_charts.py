@@ -1,19 +1,23 @@
 # %%
 
 import importlib
-import matplotlib.pyplot as plt
-import numpy as np
-import seaborn as sns
 import json
 import os
 
 import art_e.evaluate.charts
+import matplotlib.pyplot as plt
+import numpy as np
+import seaborn as sns
 
 importlib.reload(art_e.evaluate.charts)
 
 import polars as pl  # noqa: E402
+from art_e.evaluate.charts import (  # noqa: E402
+    comparison_models_bar_chart,
+    training_progress_chart,
+)
+
 from art.utils.benchmarking.load_trajectories import load_trajectories  # noqa: E402
-from art_e.evaluate.charts import comparison_models_bar_chart, training_progress_chart  # noqa: E402
 
 # Define and create the temporary directory early
 TMP_DIR = "/tmp/art-e"

@@ -1,10 +1,11 @@
-import os
-import pandas as pd
-import mailparser
 import argparse
+import os
+
+import mailparser
+import pandas as pd
+from datasets import Dataset
 from kaggle.api.kaggle_api_extended import KaggleApi
 from tqdm import tqdm
-from datasets import Dataset
 
 
 def download_enron_dataset():
