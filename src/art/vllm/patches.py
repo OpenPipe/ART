@@ -200,17 +200,23 @@ def patch_multi_step_model_runner(runner: MultiStepModelRunner) -> None:
     runner.pin_lora = base_runner.pin_lora
     runner.list_loras = base_runner.list_loras
 
+
 def patch_patch_vllm() -> None:
     """
     Unironically patches the vLLM patch_vllm function to address a bug (see below).
     """
     import os
-    from unsloth_zoo.vllm_lora_request import LoRARequest as PatchedLoRARequest  # type: ignore
-    from unsloth_zoo.vllm_lora_worker_manager import (  # type: ignore
-        WorkerLoRAManager as PatchedWorkerLoRAManager,
+
+    from unsloth_zoo import vllm_utils
+    from unsloth_zoo.vllm_lora_request import (
+        LoRARequest as PatchedLoRARequest,  # type: ignore
+    )
+    from unsloth_zoo.vllm_lora_worker_manager import (
         LRUCacheWorkerLoRAManager as PatchedLRUCacheWorkerLoRAManager,
     )
-    from unsloth_zoo import vllm_utils
+    from unsloth_zoo.vllm_lora_worker_manager import (  # type: ignore
+        WorkerLoRAManager as PatchedWorkerLoRAManager,
+    )
 
     def patch_vllm_lora_load_tensors() -> None:
         import vllm.lora.request
@@ -226,7 +232,9 @@ def patch_patch_vllm() -> None:
         try:
             import vllm.v1.worker.lora_model_runner_mixin
 
-            vllm.v1.worker.lora_model_runner_mixin.LRUCacheWorkerLoRAManager = PatchedLRUCacheWorkerLoRAManager  # type: ignore
+            vllm.v1.worker.lora_model_runner_mixin.LRUCacheWorkerLoRAManager = (
+                PatchedLRUCacheWorkerLoRAManager  # type: ignore
+            )
         except:
             pass
         # We comment this out because it causes issues with vLLM's LoRARequest
