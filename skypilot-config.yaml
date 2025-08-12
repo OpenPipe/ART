@@ -391,5 +391,6 @@ envs:
   GIT_USER_NAME: "Your Name"
   GIT_USER_EMAIL: "your.email@example.com"
   GITHUB_TOKEN: ""
+  PYTHONUTF8: "1" #Enforce UTF-8 Encoding to fix ASCII encoding issue in unsloth-zoo
 setup: |
   ./scripts/setup.sh

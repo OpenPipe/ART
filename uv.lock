@@ -1,5 +1,5 @@
 version = 1
-revision = 2
+revision = 3
 requires-python = ">=3.10"
 resolution-markers = [
     "python_full_version >= '3.13' and sys_platform == 'linux'",
@@ -3642,7 +3642,7 @@ wheels = [
 
 [[package]]
 name = "openpipe-art"
-version = "0.4.5"
+version = "0.4.7"
 source = { editable = "." }
 dependencies = [
     { name = "litellm" },
@@ -3720,7 +3720,7 @@ requires-dist = [
     { name = "trl", marker = "extra == 'backend'", specifier = ">=0.19.0" },
     { name = "typer", specifier = ">=0.15.2" },
     { name = "unsloth", marker = "extra == 'backend'", specifier = "==2025.8.1" },
-    { name = "unsloth-zoo", marker = "extra == 'backend'", git = "https://github.com/bradhilton/unsloth-zoo" },
+    { name = "unsloth-zoo", marker = "extra == 'backend'", specifier = "==2025.8.1" },
     { name = "vllm", marker = "extra == 'backend'", specifier = "==0.10.0" },
     { name = "wandb", marker = "extra == 'backend'", specifier = ">=0.19.8" },
     { name = "weave", specifier = ">=0.51.51" },
@@ -6811,7 +6811,7 @@ wheels = [
 [[package]]
 name = "unsloth-zoo"
 version = "2025.8.1"
-source = { git = "https://github.com/bradhilton/unsloth-zoo#01d831919d5be58c5f0ce912db522e8cb9494b3e" }
+source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "accelerate" },
     { name = "cut-cross-entropy" },
@@ -6836,6 +6836,10 @@ dependencies = [
     { name = "typing-extensions" },
     { name = "tyro" },
     { name = "wheel" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/37/bc/c710b9da0d70ca1cb324adc3310b9d1ed31dc340956cbb64cbb7412ef57a/unsloth_zoo-2025.8.1.tar.gz", hash = "sha256:02401f77e7496fc03d71460afd51f7d10e71376056ff1e33ca776723237dcb5e", size = 148526, upload-time = "2025-08-02T10:38:43.356Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/9e/d9/7199031146fbf00eeea1af1b8b9db16c6ec0e86ae86db515eabcedfaa00d/unsloth_zoo-2025.8.1-py3-none-any.whl", hash = "sha256:3dc80e8909072e5812efaca38f965ebb4cdc2c8bd87df9fb0690dc37dcf5003c", size = 166706, upload-time = "2025-08-02T10:38:41.728Z" },
 ]
 
 [[package]]

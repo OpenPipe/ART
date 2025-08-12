@@ -1,6 +1,6 @@
 [project]
 name = "openpipe-art"
-version = "0.4.5"
+version = "0.4.7"
 description = "The OpenPipe Agent Reinforcement Training (ART) library"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -19,7 +19,7 @@ backend = [
     "hf-xet>=1.1.0",
     "bitsandbytes>=0.45.2",
     "unsloth==2025.8.1",
-    "unsloth-zoo",
+    "unsloth-zoo==2025.8.1",
     "vllm==0.10.0",
     "torchtune",
     "trl>=0.19.0",
@@ -61,7 +61,7 @@ sources = ["src"]
 [tool.hatch.build.targets.sdist]
 exclude = [
   "/dev",
-  "/wandb", 
+  "/wandb",
   "/.art",
   "/.ruff_cache",
   "/.venv",
@@ -97,6 +97,5 @@ dev-dependencies = [
 
 [tool.uv.sources]
 panza = { git = "https://github.com/corbt/panza.git" }
-torchtune = { git = "https://github.com/pytorch/torchtune.git", rev = "2344509cf83bd886538fe3e8263e5145d1afb5c2" }
 sweagent = { git = "https://github.com/bradhilton/SWE-agent" }
-unsloth-zoo = { git = "https://github.com/bradhilton/unsloth-zoo" }
+torchtune = { git = "https://github.com/pytorch/torchtune.git", rev = "2344509cf83bd886538fe3e8263e5145d1afb5c2" }

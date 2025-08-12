@@ -41,6 +41,8 @@ class ModelState:
     def __init__(self, config: InternalModelConfig) -> None:
         from vllm.engine import async_llm_engine
 
+        from ..vllm import patch_patch_vllm
+
         # Patch MultiStepModelRunner for Unsloth compatibility
         if not hasattr(MultiStepModelRunner, "model"):
             MultiStepModelRunner.model = property(  # type: ignore
@@ -74,6 +76,10 @@ class ModelState:
             )
 
         AsyncLLMEngine.from_engine_args = _from_engine_args
+
+        # Patch patch_vllm before loading an Unsloth model
+        patch_patch_vllm()
+
         self.model, self.tokenizer = cast(
             tuple[CausallLM, PreTrainedTokenizerBase],
             unsloth.FastLanguageModel.from_pretrained(**config.get("init_args", {})),
