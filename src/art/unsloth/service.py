@@ -100,6 +100,7 @@ class UnslothService:
             for offset in range(0, packed_tensors["tokens"].shape[0]):
                 for _ in range(2 if warmup else 1):
                     if precalculate_logprobs and not warmup:
+                        packed_tensors["original_logprobs"] = packed_tensors["logprobs"]  # type: ignore
                         packed_tensors["logprobs"] = torch.cat(
                             [
                                 self.state.trainer.compute_loss(
@@ -159,9 +160,9 @@ class UnslothService:
                     for task in done:
                         result = task.result()
                         # If `result` is `None`, the training task finished somehow.
-                        assert result is not None, (
-                            "The training task should never finish."
-                        )
+                        assert (
+                            result is not None
+                        ), "The training task should never finish."
                         self.results_queue.task_done()
                         if warmup:
                             from .state import free_memory
