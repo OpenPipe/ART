@@ -160,9 +160,9 @@ class UnslothService:
                     for task in done:
                         result = task.result()
                         # If `result` is `None`, the training task finished somehow.
-                        assert (
-                            result is not None
-                        ), "The training task should never finish."
+                        assert result is not None, (
+                            "The training task should never finish."
+                        )
                         self.results_queue.task_done()
                         if warmup:
                             from .state import free_memory
