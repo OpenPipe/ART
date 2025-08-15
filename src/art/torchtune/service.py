@@ -16,7 +16,7 @@ from vllm import AsyncEngineArgs
 from vllm.v1.engine.async_llm import AsyncLLM
 
 from .. import dev, types
-from ..local.pack import DiskPackedTensors
+from ..preprocessing.pack import DiskPackedTensors
 from ..vllm import get_llm, get_worker, openai_server_task, run_on_workers
 from .batch import Batch
 
