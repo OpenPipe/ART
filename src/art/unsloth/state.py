@@ -57,6 +57,8 @@ class ModelState:
         )
         if enable_sleep_mode:
             os.environ["PYTORCH_CUDA_ALLOC_CONF"] = ""
+        # We disable patching the v0 LoRA manager because it disables adapter loading
+        os.environ["UNSLOTH_DO_NOT_PATCH_V0_LRU_LORA_MANAGER"] = "1"
         # Initialize Unsloth model
         # NOTE: We have to patch empty_cache with a no-op during model initialization
         # to avoid an allocator error.

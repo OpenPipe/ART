@@ -410,7 +410,6 @@ class LocalBackend(Backend):
         )
 
         output_dir = get_model_dir(model=model, art_path=self._path)
-        last_step_prediction = None
         learning_rate_multiplier = 1.0  # Default prior
         try:
             std_dev_history = (
