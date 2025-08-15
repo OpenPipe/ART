@@ -3719,8 +3719,8 @@ requires-dist = [
     { name = "trl", marker = "extra == 'backend'", specifier = "==0.20.0" },
     { name = "trl", marker = "extra == 'backend'", specifier = ">=0.19.0" },
     { name = "typer", specifier = ">=0.15.2" },
-    { name = "unsloth", marker = "extra == 'backend'", specifier = "==2025.8.1" },
-    { name = "unsloth-zoo", marker = "extra == 'backend'", specifier = "==2025.8.1" },
+    { name = "unsloth", marker = "extra == 'backend'", specifier = "==2025.8.4" },
+    { name = "unsloth-zoo", marker = "extra == 'backend'", specifier = "==2025.8.3" },
     { name = "vllm", marker = "extra == 'backend'", specifier = "==0.10.0" },
     { name = "wandb", marker = "extra == 'backend'", specifier = ">=0.19.8" },
     { name = "weave", specifier = ">=0.51.51" },
@@ -6776,7 +6776,7 @@ wheels = [
 
 [[package]]
 name = "unsloth"
-version = "2025.8.1"
+version = "2025.8.4"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "accelerate" },
@@ -6803,14 +6803,14 @@ dependencies = [
     { name = "wheel" },
     { name = "xformers" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/e7/2c/8d89c085c1456a8bfbd3107aa79ed1256612327cc6436ed5dfb783a1c40e/unsloth-2025.8.1.tar.gz", hash = "sha256:86413e7fa6a982296b1349454d645ef0f12f450ef562ea07a5083377f47f15a2", size = 257556, upload-time = "2025-08-02T10:41:17.224Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/50/f6/b176a1253f680fa2368c02d65c1692a5d9d33fa7f53780d4e1a166371e73/unsloth-2025.8.4.tar.gz", hash = "sha256:37d9519f2ea1c28a710352b87b4eac13a537ca22b98b81684cf189b4a082830f", size = 264559, upload-time = "2025-08-08T18:53:20.908Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/d9/d0/184903cbcb80b7bbd5c96afedb3e91beafc5df8c1a114b823419d381a3a3/unsloth-2025.8.1-py3-none-any.whl", hash = "sha256:3f3a407f85c084baaca7704b242627556b890f2fdb64ec0d3cb726864616f47e", size = 299780, upload-time = "2025-08-02T10:41:14.996Z" },
+    { url = "https://files.pythonhosted.org/packages/da/9f/8a158ce711be3e409b31b692c43dc6cb84118f4d47fc350665c2151560a3/unsloth-2025.8.4-py3-none-any.whl", hash = "sha256:a786a86d5b12ed60c69c994f036b6ee8746d502c8bfa47f2440567b8160622d4", size = 306847, upload-time = "2025-08-08T18:53:17.036Z" },
 ]
 
 [[package]]
 name = "unsloth-zoo"
-version = "2025.8.1"
+version = "2025.8.3"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "accelerate" },
@@ -6837,9 +6837,9 @@ dependencies = [
     { name = "tyro" },
     { name = "wheel" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/37/bc/c710b9da0d70ca1cb324adc3310b9d1ed31dc340956cbb64cbb7412ef57a/unsloth_zoo-2025.8.1.tar.gz", hash = "sha256:02401f77e7496fc03d71460afd51f7d10e71376056ff1e33ca776723237dcb5e", size = 148526, upload-time = "2025-08-02T10:38:43.356Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/1d/d0/9e5ed7f1a18a5b5d3096a5291a695adc9b43ad3b8b3a5a3c52e405e229f8/unsloth_zoo-2025.8.3.tar.gz", hash = "sha256:0565e9ab1e8d803bc4915ba83b40fdead7afa159ffa6c13be011b2bf30786432", size = 157394, upload-time = "2025-08-08T18:52:38.748Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/9e/d9/7199031146fbf00eeea1af1b8b9db16c6ec0e86ae86db515eabcedfaa00d/unsloth_zoo-2025.8.1-py3-none-any.whl", hash = "sha256:3dc80e8909072e5812efaca38f965ebb4cdc2c8bd87df9fb0690dc37dcf5003c", size = 166706, upload-time = "2025-08-02T10:38:41.728Z" },
+    { url = "https://files.pythonhosted.org/packages/d8/9c/5b4614d89409dc89674ce9fd7809063d9c5242c17e0c67c339b0d64c3bab/unsloth_zoo-2025.8.3-py3-none-any.whl", hash = "sha256:74a066ffc3af5486ff396466b03c3e6852f252a956efa75a025d734640e6f34d", size = 176411, upload-time = "2025-08-08T18:52:37.317Z" },
 ]
 
 [[package]]

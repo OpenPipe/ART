@@ -131,18 +131,18 @@ def patch_get_lora_tokenizer_async() -> None:
     import vllm.transformers_utils.tokenizer
     import vllm.transformers_utils.tokenizer_group
 
-    async def _return_nothing(*_, **__) -> None:
+    async def async_noop(*_, **__) -> None:
         return None
 
-    async def get_self_lora_tokenizer_async(self, *args, **kwargs):
+    async def async_get_lora_tokenizer(self, *args, **kwargs):
         return self.tokenizer
 
-    vllm.transformers_utils.tokenizer.get_lora_tokenizer_async = _return_nothing  # type: ignore
+    vllm.transformers_utils.tokenizer.get_lora_tokenizer_async = async_noop  # type: ignore
     vllm.transformers_utils.tokenizer_group.get_lora_tokenizer_async = (  # type: ignore
-        _return_nothing
+        async_noop
     )
     vllm.transformers_utils.tokenizer_group.TokenizerGroup.get_lora_tokenizer_async = (
-        get_self_lora_tokenizer_async  # type: ignore
+        async_get_lora_tokenizer  # type: ignore
     )
 
 
@@ -199,66 +199,3 @@ def patch_multi_step_model_runner(runner: MultiStepModelRunner) -> None:
     runner.remove_lora = base_runner.remove_lora
     runner.pin_lora = base_runner.pin_lora
     runner.list_loras = base_runner.list_loras
-
-
-def patch_patch_vllm() -> None:
-    """
-    Unironically patches the vLLM patch_vllm function to address a bug (see below).
-    """
-    import os
-
-    from unsloth_zoo import vllm_utils
-    from unsloth_zoo.vllm_lora_request import (
-        LoRARequest as PatchedLoRARequest,  # type: ignore
-    )
-    from unsloth_zoo.vllm_lora_worker_manager import (
-        LRUCacheWorkerLoRAManager as PatchedLRUCacheWorkerLoRAManager,
-    )
-    from unsloth_zoo.vllm_lora_worker_manager import (  # type: ignore
-        WorkerLoRAManager as PatchedWorkerLoRAManager,
-    )
-
-    def patch_vllm_lora_load_tensors() -> None:
-        import vllm.lora.request
-
-        vllm.lora.request.LoRARequest = PatchedLoRARequest
-        import vllm.lora.worker_manager
-
-        vllm.lora.worker_manager.LoRARequest = PatchedLoRARequest  # type: ignore
-        vllm.lora.worker_manager.WorkerLoRAManager = PatchedWorkerLoRAManager
-        vllm.lora.worker_manager.LRUCacheWorkerLoRAManager = (
-            PatchedLRUCacheWorkerLoRAManager
-        )
-        try:
-            import vllm.v1.worker.lora_model_runner_mixin
-
-            vllm.v1.worker.lora_model_runner_mixin.LRUCacheWorkerLoRAManager = (  # type: ignore
-                PatchedLRUCacheWorkerLoRAManager
-            )
-        except:
-            pass
-        # We comment this out because it causes issues with vLLM's LoRARequest
-        # try:
-        #     import vllm.worker.model_runner
-        #     vllm.worker.model_runner.LRUCacheWorkerLoRAManager = PatchedLRUCacheWorkerLoRAManager
-        # except:
-        #     pass
-
-    def patch_vllm(debug: bool = True) -> None:
-        # Temporary patch to disable multiprocessing for vLLM
-        # Allows accessing model_executor
-        os.environ["VLLM_ENABLE_V1_MULTIPROCESSING"] = "0"
-        if debug:
-            os.environ["VLLM_LOGGING_LEVEL"] = "DEBUG"
-        # os.environ["VLLM_TRACE_FUNCTION"] = "1"
-        vllm_utils.patch_vllm_set_inductor_config()
-        vllm_utils.patch_bitsandbytes_quant_state()
-        vllm_utils.patch_vllm_bitsandbytes()
-        vllm_utils.patch_vllm_lora_tokenizer()
-        # sub our patch in
-        patch_vllm_lora_load_tensors()
-        vllm_utils.patch_vllm_enable_sleep_mode()
-        vllm_utils.patch_vllm_graph_capture()
-        vllm_utils.LORA_REQUEST_ID = 1
-
-    vllm_utils.patch_vllm = patch_vllm

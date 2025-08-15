@@ -100,6 +100,7 @@ class UnslothService:
             for offset in range(0, packed_tensors["tokens"].shape[0]):
                 for _ in range(2 if warmup else 1):
                     if precalculate_logprobs and not warmup:
+                        packed_tensors["original_logprobs"] = packed_tensors["logprobs"]  # type: ignore
                         packed_tensors["logprobs"] = torch.cat(
                             [
                                 self.state.trainer.compute_loss(
