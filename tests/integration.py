@@ -3,13 +3,12 @@ import os
 import re
 import sys
 from pathlib import Path
-from typing import Dict, Any, Optional
+from typing import Any, Dict, Optional
 
 import nbformat
 import pytest
 from nbclient import NotebookClient
 from nbclient.exceptions import CellExecutionError
-
 
 NOTEBOOKS = [
     {
@@ -25,6 +24,13 @@ NOTEBOOKS = [
         },
     },
     {
+        "path": "../examples/prisoners-dilemma.ipynb",
+        "variables": {
+            "TRAINING_STEPS": 1,
+            "PRISONERS_DILEMMA_ROUNDS": 10,
+        },
+    },
+    {
         "path": "../examples/art-e.ipynb",
         "variables": {
             "training_config": {
@@ -37,13 +43,6 @@ NOTEBOOKS = [
         },
     },
     {
-        "path": "../examples/prisoners-dilemma.ipynb",
-        "variables": {
-            "TRAINING_STEPS": 1,
-            "PRISONERS_DILEMMA_ROUNDS": 10,
-        },
-    },
-    {
         "path": "../examples/rock-paper-tool-use.ipynb",
         "variables": {"TRAINING_STEPS": 1},
     },
@@ -52,12 +51,11 @@ NOTEBOOKS = [
 
 def make_patch_source() -> str:
     """
-    This is a patch to the art.TrainableModel class to force _internal_config to None to avoid CUDA illegal memory access error.
-    It also changes project name and model name logging these runs as test runs.
+    This is a patch to the art.TrainableModel class to force _internal_config['engine_args'] to None to avoid CUDA illegal memory access error.
+    It also changes project name logging these runs as test runs.
     """
     project = "Tester"
     return (
-        "import datetime as _dt\n"
         "try:\n"
         "    import art as _art\n"
         "    import art.model as _art_model\n"
@@ -66,23 +64,14 @@ def make_patch_source() -> str:
         "else:\n"
         "    _orig_tm_init = _art_model.TrainableModel.__init__\n"
         "    def _patched_tm_init(self, *args, **kwargs):\n"
-        "        name = kwargs.get('name')\n"
-        "        if name:\n"
-        "            _suffix = _dt.datetime.utcnow().strftime('%Y%m%d-%H%M%SZ')\n"
-        "            kwargs['name'] = f'{name}-{_suffix}'\n"
         f"        kwargs['project'] = {project!r}\n"
         "        result = _orig_tm_init(self, *args, **kwargs)\n"
-        "        # Force _internal_config to None\n"
-        "        self._internal_config = None\n"
+        "        # Force _internal_config['engine_args'] to None if _internal_config exists\n"
+        "        if hasattr(self, '_internal_config') and self._internal_config is not None:\n"
+        "            if isinstance(self._internal_config, dict) and 'engine_args' in self._internal_config:\n"
+        "                self._internal_config['engine_args'] = None\n"
         "        return result\n"
-        "    def _patched_setattr(self, name, value):\n"
-        "        if name == '_internal_config':\n"
-        "            # Always set _internal_config to None\n"
-        "            object.__setattr__(self, name, None)\n"
-        "        else:\n"
-        "            object.__setattr__(self, name, value)\n"
         "    _art_model.TrainableModel.__init__ = _patched_tm_init\n"
-        "    _art_model.TrainableModel.__setattr__ = _patched_setattr\n"
         "    _art.TrainableModel = _art_model.TrainableModel\n"
     )
 
@@ -243,6 +232,11 @@ def test_notebook_execution(notebook_config: dict) -> None:
                 traceback_lines = output.get("traceback") or []
                 if traceback_lines:
                     print("\n".join(traceback_lines), file=sys.stderr)
+
+    # Print success message after test completes successfully
+    notebook_name = Path(notebook_path).name
+    print(f"\n✅ Test completed successfully: {notebook_name}")
+    print("-" * 50)
 
 
 def main() -> int:

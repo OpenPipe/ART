@@ -1,10 +1,10 @@
 import asyncio
 import os
+from collections import defaultdict
 from contextlib import nullcontext
 from typing import TYPE_CHECKING, Callable, cast
 
 import nest_asyncio
-from collections import defaultdict
 import torch
 from peft.peft_model import PeftModel
 from trl import GRPOTrainer

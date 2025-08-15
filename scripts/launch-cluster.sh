@@ -1,6 +1,6 @@
 #!/bin/bash
 
-CLUSTER_NAME="bohdan-art"
+CLUSTER_NAME="art"
 
 # Parse arguments
 ARGS=()
