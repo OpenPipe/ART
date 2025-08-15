@@ -18,11 +18,15 @@ git config --global user.name "${GIT_USER_NAME}"
 git config --global user.email "${GIT_USER_EMAIL}"
 git config --global --add safe.directory /root/sky_workdir
 
-# Reset any uncommitted changes to the last commit
-git reset --hard HEAD
+if [ "${GIT_RESET_CLEAN:-true}" = "true" ]; then
+    # Reset any uncommitted changes to the last commit
+    git reset --hard HEAD
 
-# Remove all untracked files and directories
-git clean -fd
+    # Remove all untracked files and directories
+    git clean -fd
+else
+    echo "Skipping git reset/clean (GIT_RESET_CLEAN is not true). Preserving synced working tree."
+fi
 
 # Install astral-uv
 sudo snap install --classic astral-uv
