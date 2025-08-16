@@ -128,11 +128,11 @@ echo
 
 # Run tests
 echo "🧪 Running unit tests..."
-echo "  Running: uv run pytest --nbval tests/unit"
+echo "  Running: uv run pytest --nbval --current-env tests/unit"
 
 # Capture pytest output quietly to parse the summary
 PYTEST_OUTPUT=$(mktemp)
-if uv run pytest --nbval --tb=short tests/unit > "$PYTEST_OUTPUT" 2>&1; then
+if uv run pytest --nbval --current-env --tb=short tests/unit > "$PYTEST_OUTPUT" 2>&1; then
     TEST_EXIT_CODE=0
 else
     TEST_EXIT_CODE=$?
@@ -267,7 +267,7 @@ else
             echo -e "💡 Tip: Type errors can't be auto-fixed by --fix. Re-run ${YELLOW}uv run pyright src${NC} to see full diagnostics."
         fi
         if $TESTS_FAILED; then
-            echo -e "💡 Tip: Test failures can't be auto-fixed by --fix. Re-run ${YELLOW}uv run pytest --nbval tests/unit${NC} to see full test output."
+            echo -e "💡 Tip: Test failures can't be auto-fixed by --fix. Re-run ${YELLOW}uv run pytest --nbval --current-env tests/unit${NC} to see full test output."
         fi
         # Show general fix tip if there are failures but not type/test specific ones
         if ! $TYPECHECK_FAILED && ! $TESTS_FAILED; then
