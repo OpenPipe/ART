@@ -408,7 +408,56 @@ class LocalBackend(Backend):
         disk_packed_tensors = packed_tensors_to_dir(
             packed_tensors, f"{get_model_dir(model=model, art_path=self._path)}/tensors"
         )
+        if dev_config.get("scale_learning_rate_by_reward_std_dev", False):
+            config = config.model_copy(
+                update={
+                    "learning_rate": config.learning_rate
+                    * self._get_reward_std_dev_learning_rate_multiplier(model)
+                }
+            )
+        results: list[dict[str, float]] = []
+        estimated_gradient_steps = disk_packed_tensors["num_sequences"]
+        if torchtune_args := (model._internal_config or dev.InternalModelConfig()).get(
+            "torchtune_args"
+        ):
+            tp = torchtune_args.get("tensor_parallel_dim", 1)
+            cp = torchtune_args.get("context_parallel_dim", 1)
+            world_size = torch.cuda.device_count()
+            dp = world_size // (tp * cp)
+            estimated_gradient_steps = math.ceil(estimated_gradient_steps / dp)
+        pbar = tqdm.tqdm(total=estimated_gradient_steps, desc="train")
+        async for result in service.train(
+            disk_packed_tensors, config, dev_config, verbose
+        ):
+            num_gradient_steps = int(
+                result.pop("num_gradient_steps", estimated_gradient_steps)
+            )
+            assert num_gradient_steps == estimated_gradient_steps, (
+                f"num_gradient_steps {num_gradient_steps} != estimated_gradient_steps {estimated_gradient_steps}"
+            )
+            results.append(result)
+            yield {**result, "num_gradient_steps": num_gradient_steps}
+            pbar.update(1)
+            pbar.set_postfix(result)
+        pbar.close()
+        if verbose:
+            print("Logging metrics...")
+        data = {
+            k: sum(d.get(k, 0) for d in results) / sum(1 for d in results if k in d)
+            for k in {k for d in results for k in d}
+        }
+        # Add group counting metrics
+        data["num_groups_submitted"] = num_groups_submitted
+        data["num_groups_trainable"] = num_groups_trainable
+        # Get the current step after training
+        current_step = self.__get_step(model)
+        self._log_metrics(model, data, "train", step=current_step)
+        if verbose:
+            print("_train_model complete")
 
+    def _get_reward_std_dev_learning_rate_multiplier(
+        self, model: TrainableModel
+    ) -> float:
         output_dir = get_model_dir(model=model, art_path=self._path)
         learning_rate_multiplier = 1.0  # Default prior
         try:
@@ -492,47 +541,7 @@ class LocalBackend(Backend):
         except pl.exceptions.ColumnNotFoundError:
             print(f'No "train/reward_std_dev" metric found in history')
 
-        config.learning_rate *= learning_rate_multiplier
-
-        results: list[dict[str, float]] = []
-        estimated_gradient_steps = disk_packed_tensors["num_sequences"]
-        if torchtune_args := (model._internal_config or dev.InternalModelConfig()).get(
-            "torchtune_args"
-        ):
-            tp = torchtune_args.get("tensor_parallel_dim", 1)
-            cp = torchtune_args.get("context_parallel_dim", 1)
-            world_size = torch.cuda.device_count()
-            dp = world_size // (tp * cp)
-            estimated_gradient_steps = math.ceil(estimated_gradient_steps / dp)
-        pbar = tqdm.tqdm(total=estimated_gradient_steps, desc="train")
-        async for result in service.train(
-            disk_packed_tensors, config, dev_config, verbose
-        ):
-            num_gradient_steps = int(
-                result.pop("num_gradient_steps", estimated_gradient_steps)
-            )
-            assert num_gradient_steps == estimated_gradient_steps, (
-                f"num_gradient_steps {num_gradient_steps} != estimated_gradient_steps {estimated_gradient_steps}"
-            )
-            results.append(result)
-            yield {**result, "num_gradient_steps": num_gradient_steps}
-            pbar.update(1)
-            pbar.set_postfix(result)
-        pbar.close()
-        if verbose:
-            print("Logging metrics...")
-        data = {
-            k: sum(d.get(k, 0) for d in results) / sum(1 for d in results if k in d)
-            for k in {k for d in results for k in d}
-        }
-        # Add group counting metrics
-        data["num_groups_submitted"] = num_groups_submitted
-        data["num_groups_trainable"] = num_groups_trainable
-        # Get the current step after training
-        current_step = self.__get_step(model)
-        self._log_metrics(model, data, "train", step=current_step)
-        if verbose:
-            print("_train_model complete")
+        return learning_rate_multiplier
 
     def _log_metrics(
         self,

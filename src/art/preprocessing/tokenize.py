@@ -195,9 +195,9 @@ def tokenize_trajectory(
             assistant_mask[start:end] = [1] * (end - start - 2)
         else:
             choice = message_or_choice
-            assert (
-                choice.logprobs or allow_training_without_logprobs
-            ), "Chat completion choices must have logprobs"
+            assert choice.logprobs or allow_training_without_logprobs, (
+                "Chat completion choices must have logprobs"
+            )
             if not choice.logprobs:
                 continue
             token_logprobs = choice.logprobs.content or choice.logprobs.refusal or []
