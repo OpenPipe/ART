@@ -22,7 +22,11 @@ from vllm.v1.worker.gpu_worker import logger
 
 from .. import dev, types
 from ..local.checkpoints import get_last_checkpoint_dir
-from ..local.pack import DiskPackedTensors, PackedTensors, packed_tensors_from_dir
+from ..preprocessing.pack import (
+    DiskPackedTensors,
+    PackedTensors,
+    packed_tensors_from_dir,
+)
 from ..utils.get_model_step import get_step_from_dir
 from ..utils.output_dirs import get_step_checkpoint_dir
 from ..vllm import get_llm, get_worker, openai_server_task, run_on_workers

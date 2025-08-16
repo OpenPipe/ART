@@ -47,7 +47,7 @@ from torchtune.training.quantization import (
 from tqdm import tqdm
 
 from .. import dev, types
-from ..local.pack import PackedTensors, packed_tensors_from_dir
+from ..preprocessing.pack import PackedTensors, packed_tensors_from_dir
 from .batch import Batch
 from .config import (
     CompileConfig,
