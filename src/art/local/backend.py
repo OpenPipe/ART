@@ -457,9 +457,10 @@ class LocalBackend(Backend):
                 # adjusted by goodness of fit: multiplier = 1 + adj_R² * (raw_multiplier - 1)
                 if intercept > 0:
                     raw_multiplier = last_step_prediction / intercept
-                    learning_rate_multiplier = 1 + adjusted_r_squared * (
-                        raw_multiplier - 1
-                    )
+                    # learning_rate_multiplier = 1 + adjusted_r_squared * (
+                    #     raw_multiplier - 1
+                    # )
+                    learning_rate_multiplier = raw_multiplier
                 else:
                     # If intercept <= 0, can't calculate meaningful ratio, stick with prior
                     raw_multiplier = 1.0
