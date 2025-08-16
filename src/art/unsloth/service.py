@@ -10,7 +10,11 @@ from art.utils.get_model_step import get_step_from_dir
 
 from .. import dev, types
 from ..local.checkpoints import get_last_checkpoint_dir
-from ..local.pack import DiskPackedTensors, PackedTensors, packed_tensors_from_dir
+from ..preprocessing.pack import (
+    DiskPackedTensors,
+    PackedTensors,
+    packed_tensors_from_dir,
+)
 from .train import train
 
 if TYPE_CHECKING:
