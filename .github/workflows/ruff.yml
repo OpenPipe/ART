@@ -30,7 +30,7 @@ jobs:
     
     - name: Run code quality checks
       run: |
-        ./scripts/run_checks.sh || {
+        ./scripts/run_checks.sh --verbose-test-failure || {
           echo ""
           echo "❌ Code quality checks failed!"
           echo ""

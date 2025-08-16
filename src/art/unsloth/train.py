@@ -53,11 +53,17 @@ def get_compute_loss_fn(trainer: "GRPOTrainer") -> Callable[..., torch.Tensor]:
         _config: dev.TrainConfig = inputs.pop("_config")  # type: ignore
         return_new_logprobs: bool = inputs.pop("return_new_logprobs", False)  # type: ignore
 
+        num_trajectories_learning_rate_multiplier = (
+            torch.unique(inputs["group_ids"]).numel()
+            - torch.unique(inputs["parent_ids"]).numel()
+        ) ** _config.get("num_trajectories_learning_rate_multiplier_power", 0.0)
         if optimizer := trainer.optimizer:
             optimizer = getattr(optimizer, "optimizer", optimizer)
             if param_groups := getattr(optimizer, "param_groups"):
                 for param_group in param_groups:
-                    param_group["lr"] = config.learning_rate
+                    param_group["lr"] = (
+                        config.learning_rate * num_trajectories_learning_rate_multiplier
+                    )
                     # param_group["betas"] = config.betas
                     # if param_group.get("weight_decay"):
                     #     param_group["weight_decay"] = config.weight_decay

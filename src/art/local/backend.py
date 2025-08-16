@@ -408,6 +408,13 @@ class LocalBackend(Backend):
         disk_packed_tensors = packed_tensors_to_dir(
             packed_tensors, f"{get_model_dir(model=model, art_path=self._path)}/tensors"
         )
+        if dev_config.get("scale_learning_rate_by_reward_std_dev", False):
+            config = config.model_copy(
+                update={
+                    "learning_rate": config.learning_rate
+                    * self._get_reward_std_dev_learning_rate_multiplier(model)
+                }
+            )
         results: list[dict[str, float]] = []
         estimated_gradient_steps = disk_packed_tensors["num_sequences"]
         if torchtune_args := (model._internal_config or dev.InternalModelConfig()).get(
@@ -447,6 +454,94 @@ class LocalBackend(Backend):
         self._log_metrics(model, data, "train", step=current_step)
         if verbose:
             print("_train_model complete")
+
+    def _get_reward_std_dev_learning_rate_multiplier(
+        self, model: TrainableModel
+    ) -> float:
+        output_dir = get_model_dir(model=model, art_path=self._path)
+        learning_rate_multiplier = 1.0  # Default prior
+        try:
+            std_dev_history = (
+                pl.read_ndjson(f"{output_dir}/history.jsonl")
+                .drop_nulls(subset=["train/reward_std_dev"])
+                .group_by("step")
+                .mean()
+                .sort("step")
+            )
+
+            # Fit linear regression to std_dev_history
+            if len(std_dev_history) > 1:
+                steps = std_dev_history["step"].to_numpy()
+                std_devs = std_dev_history["train/reward_std_dev"].to_numpy()
+
+                # Fit linear regression: y = mx + b
+                # polyfit returns [coefficient, intercept] for degree 1
+                coefficient, intercept = np.polyfit(steps, std_devs, deg=1)
+
+                # Get prediction for the last step
+                last_step = steps[-1]
+                last_step_prediction = coefficient * last_step + intercept
+                last_step_actual = std_devs[-1]
+
+                # Calculate R-squared and adjusted R-squared
+                predictions = coefficient * steps + intercept
+                ss_residual = np.sum((std_devs - predictions) ** 2)
+                ss_total = np.sum((std_devs - np.mean(std_devs)) ** 2)
+                r_squared = 1 - (ss_residual / ss_total) if ss_total > 0 else 0
+
+                # Adjusted R-squared accounts for sample size
+                # For simple linear regression: adj_R² = 1 - (1 - R²) * (n - 1) / (n - 2)
+                n_samples = len(steps)
+                if n_samples > 2:
+                    adjusted_r_squared = 1 - (1 - r_squared) * (n_samples - 1) / (
+                        n_samples - 2
+                    )
+                else:
+                    adjusted_r_squared = (
+                        0  # Not enough samples for meaningful adjustment
+                    )
+
+                # Calculate learning rate multiplier
+                # raw_multiplier = last_step_prediction / intercept (if intercept > 0)
+                # adjusted by goodness of fit: multiplier = 1 + adj_R² * (raw_multiplier - 1)
+                if intercept > 0:
+                    raw_multiplier = last_step_prediction / intercept
+                    # learning_rate_multiplier = 1 + adjusted_r_squared * (
+                    #     raw_multiplier - 1
+                    # )
+                    learning_rate_multiplier = raw_multiplier
+                else:
+                    # If intercept <= 0, can't calculate meaningful ratio, stick with prior
+                    raw_multiplier = 1.0
+                    learning_rate_multiplier = 1.0
+
+                print(f"Regression fitted: y = {coefficient:.6f}x + {intercept:.6f}")
+                print(f"  Coefficient (slope): {coefficient:.6f}")
+                print(f"  Intercept: {intercept:.6f}")
+                print(f"  R-squared: {r_squared:.4f}")
+                print(
+                    f"  Adjusted R-squared: {adjusted_r_squared:.4f} (n={n_samples} samples)"
+                )
+                print(
+                    f"  Last step ({last_step}) prediction: {last_step_prediction:.6f}"
+                )
+                print(f"  Last step actual value: {last_step_actual:.6f}")
+                print(
+                    f"  Prediction error: {abs(last_step_actual - last_step_prediction):.6f}"
+                )
+                print(f"  Raw LR multiplier (pred/intercept): {raw_multiplier:.4f}")
+                print(f"  Adjusted LR multiplier: {learning_rate_multiplier:.4f}")
+            else:
+                print(
+                    f"Not enough data points to fit regression (need at least 2, got {len(std_dev_history)})"
+                )
+
+        except FileNotFoundError:
+            print(f'"{output_dir}/history.jsonl" not found')
+        except pl.exceptions.ColumnNotFoundError:
+            print(f'No "train/reward_std_dev" metric found in history')
+
+        return learning_rate_multiplier
 
     def _log_metrics(
         self,

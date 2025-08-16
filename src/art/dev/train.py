@@ -16,7 +16,9 @@ positive advantages. Defaults to 0.0 (perfectly balanced)."""
     importance_sampling_level: Literal["token", "sequence"]
     logprob_calculation_chunk_size: int
     max_negative_advantage_importance_sampling_weight: float
+    num_trajectories_learning_rate_multiplier_power: float
     plot_tensors: bool
     precalculate_logprobs: bool
+    scale_learning_rate_by_reward_std_dev: bool
     scale_rewards: bool
     truncated_importance_sampling: float | None

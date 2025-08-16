@@ -10,9 +10,17 @@ NC='\033[0m' # No Color
 
 # Parse command line arguments
 FIX_FLAG=""
-if [[ "$1" == "--fix" ]]; then
-    FIX_FLAG="--fix"
-fi
+VERBOSE_TEST_FAILURE=""
+for arg in "$@"; do
+    case $arg in
+        --fix)
+            FIX_FLAG="--fix"
+            ;;
+        --verbose-test-failure)
+            VERBOSE_TEST_FAILURE="true"
+            ;;
+    esac
+done
 
 echo "🔍 Running code quality checks..."
 echo
@@ -128,11 +136,11 @@ echo
 
 # Run tests
 echo "🧪 Running unit tests..."
-echo "  Running: uv run pytest --nbval tests/unit"
+echo "  Running: uv run pytest --nbval --current-env tests/unit"
 
 # Capture pytest output quietly to parse the summary
 PYTEST_OUTPUT=$(mktemp)
-if uv run pytest --nbval --tb=short tests/unit > "$PYTEST_OUTPUT" 2>&1; then
+if uv run pytest --nbval --current-env --tb=short tests/unit > "$PYTEST_OUTPUT" 2>&1; then
     TEST_EXIT_CODE=0
 else
     TEST_EXIT_CODE=$?
@@ -171,6 +179,15 @@ if [[ -n "$TEST_SUMMARY" ]]; then
         [[ -n "$DETAILS" ]] && echo "  $DETAILS"
         CHECKS_PASSED=false
         TESTS_FAILED=true
+        
+        # If verbose test failure flag is set, dump full test output
+        if [[ -n "$VERBOSE_TEST_FAILURE" ]]; then
+            echo
+            echo "📋 Full test output:"
+            echo "───────────────────────────────────────────────────────────────"
+            cat "$PYTEST_OUTPUT"
+            echo "───────────────────────────────────────────────────────────────"
+        fi
     fi
 else
     # Fallback if we can't parse the summary
@@ -180,6 +197,15 @@ else
         echo -e "${RED}❌ Some unit tests failed${NC}"
         CHECKS_PASSED=false
         TESTS_FAILED=true
+        
+        # If verbose test failure flag is set, dump full test output
+        if [[ -n "$VERBOSE_TEST_FAILURE" ]]; then
+            echo
+            echo "📋 Full test output:"
+            echo "───────────────────────────────────────────────────────────────"
+            cat "$PYTEST_OUTPUT"
+            echo "───────────────────────────────────────────────────────────────"
+        fi
     fi
 fi
 
@@ -267,7 +293,12 @@ else
             echo -e "💡 Tip: Type errors can't be auto-fixed by --fix. Re-run ${YELLOW}uv run pyright src${NC} to see full diagnostics."
         fi
         if $TESTS_FAILED; then
-            echo -e "💡 Tip: Test failures can't be auto-fixed by --fix. Re-run ${YELLOW}uv run pytest --nbval tests/unit${NC} to see full test output."
+            if [[ -z "$VERBOSE_TEST_FAILURE" ]]; then
+                echo -e "💡 Tip: Test failures can't be auto-fixed by --fix. Re-run ${YELLOW}uv run pytest --nbval --current-env tests/unit${NC} to see full test output."
+                echo -e "        Or use ${YELLOW}./scripts/run_checks.sh --verbose-test-failure${NC} to see full output on failure."
+            else
+                echo -e "💡 Tip: Test failures can't be auto-fixed by --fix. Re-run ${YELLOW}uv run pytest --nbval --current-env tests/unit${NC} to debug."
+            fi
         fi
         # Show general fix tip if there are failures but not type/test specific ones
         if ! $TYPECHECK_FAILED && ! $TESTS_FAILED; then

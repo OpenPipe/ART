@@ -42,6 +42,7 @@ def tokenize_trajectory_groups(
     trajectory_groups: list[TrajectoryGroup],
     allow_training_without_logprobs: bool,
     scale_rewards: bool,
+    shuffle_group_trajectories: bool = True,
 ) -> Generator["TokenizedResult", None, None]:
     for group in trajectory_groups:
         if not group:
@@ -100,7 +101,8 @@ def tokenize_trajectory_groups(
         for result in results:
             result.prompt_id = prompt_id
             result.prompt_length = prompt_length
-        random.shuffle(results)
+        if shuffle_group_trajectories:
+            random.shuffle(results)
         yield from results
 
 
