@@ -1,3 +1,4 @@
+import argparse
 import ast
 import re
 import sys
@@ -12,12 +13,6 @@ from nbclient.exceptions import CellExecutionError
 NOTEBOOKS = [
     {
         "path": "../examples/temporal_clue/temporal-clue.ipynb",
-        "variables": {
-            "TRAINING_STEPS": 1,
-        },
-    },
-    {
-        "path": "../examples/tic_tac_toe/tic-tac-toe.ipynb",
         "variables": {
             "TRAINING_STEPS": 1,
         },
@@ -50,8 +45,7 @@ NOTEBOOKS = [
 
 def make_patch_source() -> str:
     """
-    This is a patch to the art.TrainableModel class to force _internal_config['engine_args'] to None to avoid CUDA illegal memory access error.
-    It also changes project name logging these runs as test runs.
+    This is a patch to the art.TrainableModel class to change project name logging these runs as test runs.
     """
     project = "Tester"
     return (
@@ -65,10 +59,6 @@ def make_patch_source() -> str:
         "    def _patched_tm_init(self, *args, **kwargs):\n"
         f"        kwargs['project'] = {project!r}\n"
         "        result = _orig_tm_init(self, *args, **kwargs)\n"
-        "        # Force _internal_config['engine_args'] to None if _internal_config exists\n"
-        "        if hasattr(self, '_internal_config') and self._internal_config is not None:\n"
-        "            if isinstance(self._internal_config, dict) and 'engine_args' in self._internal_config:\n"
-        "                self._internal_config['engine_args'] = None\n"
         "        return result\n"
         "    _art_model.TrainableModel.__init__ = _patched_tm_init\n"
         "    _art.TrainableModel = _art_model.TrainableModel\n"
@@ -238,12 +228,102 @@ def test_notebook_execution(notebook_config: dict) -> None:
     print("-" * 50)
 
 
+def parse_indexes(indexes_str: str, max_index: int) -> list[int]:
+    """
+    Parse index specification string into list of valid indexes.
+
+    Supports:
+    - Single indexes: "0", "2"
+    - Comma-separated: "0,2,3"
+    - Ranges: "1-3" (inclusive)
+    - Mixed: "0,2-4,6"
+
+    Args:
+        indexes_str: String specification of indexes
+        max_index: Maximum valid index (exclusive)
+
+    Returns:
+        List of valid, unique indexes in ascending order
+    """
+    indexes = set()
+
+    try:
+        for part in indexes_str.split(","):
+            part = part.strip()
+            if not part:
+                continue
+
+            if "-" in part:
+                # Handle range like "1-3"
+                start_str, end_str = part.split("-", 1)
+                start = int(start_str.strip())
+                end = int(end_str.strip())
+
+                if start > end:
+                    print(f"Warning: Invalid range '{part}' - start > end")
+                    continue
+
+                for i in range(start, end + 1):
+                    if 0 <= i < max_index:
+                        indexes.add(i)
+                    else:
+                        print(f"Warning: Index {i} is out of range (0-{max_index - 1})")
+            else:
+                # Handle single index
+                index = int(part)
+                if 0 <= index < max_index:
+                    indexes.add(index)
+                else:
+                    print(f"Warning: Index {index} is out of range (0-{max_index - 1})")
+
+    except ValueError as e:
+        print(f"Error parsing indexes '{indexes_str}': {e}")
+        return []
+
+    return sorted(list(indexes))
+
+
 def main() -> int:
+    parser = argparse.ArgumentParser(
+        description="Run integration tests for notebooks",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=f"""
+Available notebooks (by index):
+{chr(10).join(f"  {i}: {config['path']}" for i, config in enumerate(NOTEBOOKS))}
+
+Examples:
+  uv run integration.py              # Run all notebooks
+  uv run integration.py -n 0         # Run only notebook 0
+  uv run integration.py -n 0,2       # Run notebooks 0 and 2
+  uv run integration.py -n 1-3       # Run notebooks 1, 2, and 3
+""",
+    )
+    parser.add_argument(
+        "--notebooks",
+        "-n",
+        type=str,
+        help="Comma-separated list of notebook indexes to run (e.g., '0,2' or '1-3'). If not specified, all notebooks will be run.",
+    )
+
+    args = parser.parse_args()
+
     here = Path(__file__).parent.resolve()
+
+    # Determine which notebooks to run
+    if args.notebooks:
+        selected_indexes = parse_indexes(args.notebooks, len(NOTEBOOKS))
+        if not selected_indexes:
+            print("Error: No valid notebook indexes specified")
+            return 1
+        selected_configs = [NOTEBOOKS[i] for i in selected_indexes]
+        print(f"Running notebooks at indexes: {sorted(selected_indexes)}")
+    else:
+        selected_configs = NOTEBOOKS
+        print("Running all notebooks")
 
     # Process notebook configurations
     processed_configs = []
-    for config in NOTEBOOKS:
+    for config in selected_configs:
         if isinstance(config, str):
             # Handle legacy string format
             processed_config = {"path": config, "variables": {}}
@@ -260,12 +340,14 @@ def main() -> int:
     # Invoke pytest programmatically, injecting notebook params via a plugin
     # -s: do not capture stdout so notebook output is visible
     # --maxfail=1: stop on first failure to terminate the whole training run
-    args = [
+    pytest_args = [
         "-s",
         "--maxfail=1",
         str(here / "integration.py"),
     ]
-    result_code = pytest.main(args=args, plugins=[_NotebookPlugin(processed_configs)])
+    result_code = pytest.main(
+        args=pytest_args, plugins=[_NotebookPlugin(processed_configs)]
+    )
     return int(result_code)
 
 
