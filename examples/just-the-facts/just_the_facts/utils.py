@@ -4,6 +4,9 @@ import aiohttp
 from newspaper import Article
 
 
+cached_articles = {}
+
+
 async def scrape_article(url: str) -> str:
     """
     Scrape article text from a news URL (Fox News, MSNBC, etc.)
@@ -17,6 +20,9 @@ async def scrape_article(url: str) -> str:
     Raises:
         Exception: If article cannot be scraped or processed
     """
+    if url in cached_articles:
+        return cached_articles[url]
+
     try:
         # Use newspaper3k to download and parse the article
         article = Article(url)
@@ -33,7 +39,9 @@ async def scrape_article(url: str) -> str:
         if not article.text:
             raise Exception(f"No text content found in article: {url}")
 
-        return article.text.strip()
+        cached_articles[url] = article.text.strip()
+
+        return cached_articles[url]
 
     except Exception as e:
         # Fallback to basic HTML scraping if newspaper3k fails
