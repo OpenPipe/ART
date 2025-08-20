@@ -52,7 +52,7 @@ async def rollout(model: art.Model, scenario: FactsScenario) -> art.Trajectory:
     )
 
     completion = await client.chat.completions.create(
-        model=model.name,
+        model=model.inference_model_name,
         messages=traj.messages(),
     )
 

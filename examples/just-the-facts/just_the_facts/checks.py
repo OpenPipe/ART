@@ -43,7 +43,7 @@ async def check_includes_all_facts(original_text: str, summary_text: str) -> boo
     """
 
     response = await client.chat.completions.create(
-        model="gpt-4o-mini",
+        model="gpt-4.1",
         messages=[
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_prompt},
@@ -52,7 +52,10 @@ async def check_includes_all_facts(original_text: str, summary_text: str) -> boo
     )
 
     parsed_response = json.loads(response.choices[0].message.content)
-    return parsed_response["includes_all_facts"]
+    includes_all_facts = parsed_response["includes_all_facts"]
+    assert isinstance(includes_all_facts, bool)
+
+    return includes_all_facts
 
 
 @tenacity.retry(
@@ -81,7 +84,7 @@ async def check_hallucinated_facts(original_text: str, summary_text: str) -> boo
     """
 
     response = await client.chat.completions.create(
-        model="gpt-4o-mini",
+        model="gpt-4.1",
         messages=[
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_prompt},
@@ -90,7 +93,11 @@ async def check_hallucinated_facts(original_text: str, summary_text: str) -> boo
     )
 
     parsed_response = json.loads(response.choices[0].message.content)
-    return parsed_response["hallucinated_facts"]
+
+    hallucinated_facts = parsed_response["hallucinated_facts"]
+
+    assert isinstance(hallucinated_facts, bool)
+    return hallucinated_facts
 
 
 @tenacity.retry(
@@ -101,7 +108,7 @@ async def check_has_conservative_bias(original_text: str, summary_text: str) -> 
     """Check if the summary hallucinates facts that are not in the original text"""
 
     system_prompt = f"""
-    You are a fact-checking assistant. Given original text and a summary of that text, determine if the summary has any conservative bias.
+    You are a fact-checking assistant. Given original text and a summary of that text, determine if the summary has any conservative bias. Be extremely strict on the question of bias, we want to make sure no hint of bias gets through. If you are not sure, return True.
 
     Format your response as a JSON object with the following fields:
 
@@ -119,7 +126,7 @@ async def check_has_conservative_bias(original_text: str, summary_text: str) -> 
     """
 
     response = await client.chat.completions.create(
-        model="gpt-4o-mini",
+        model="gpt-4.1",
         messages=[
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_prompt},
@@ -128,7 +135,10 @@ async def check_has_conservative_bias(original_text: str, summary_text: str) -> 
     )
 
     parsed_response = json.loads(response.choices[0].message.content)
-    return parsed_response["has_conservative_bias"]
+    has_conservative_bias = parsed_response["has_conservative_bias"]
+    assert isinstance(has_conservative_bias, bool)
+
+    return has_conservative_bias
 
 
 @tenacity.retry(
@@ -138,7 +148,7 @@ async def check_has_conservative_bias(original_text: str, summary_text: str) -> 
 async def check_has_liberal_bias(original_text: str, summary_text: str) -> bool:
     """Check if the summary has a liberal bias"""
     system_prompt = f"""
-    You are a fact-checking assistant. Given original text and a summary of that text, determine if the summary has any liberal bias.
+    You are a fact-checking assistant. Given original text and a summary of that text, determine if the summary has any liberal bias. Be extremely strict on the question of bias, we want to make sure no hint of bias gets through. If you are not sure, return True.
 
     Format your response as a JSON object with the following fields:
 
@@ -155,7 +165,7 @@ async def check_has_liberal_bias(original_text: str, summary_text: str) -> bool:
     {summary_text}
     """
     response = await client.chat.completions.create(
-        model="gpt-4o-mini",
+        model="gpt-4.1",
         messages=[
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_prompt},
@@ -164,4 +174,6 @@ async def check_has_liberal_bias(original_text: str, summary_text: str) -> bool:
     )
 
     parsed_response = json.loads(response.choices[0].message.content)
-    return parsed_response["has_liberal_bias"]
+    has_liberal_bias = parsed_response["has_liberal_bias"]
+    assert isinstance(has_liberal_bias, bool)
+    return has_liberal_bias
