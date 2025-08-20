@@ -41,7 +41,7 @@ async def rollout(model: art.Model, scenario: FactsScenario) -> art.Trajectory:
     traj.messages_and_choices.append(
         {
             "role": "system",
-            "content": "You are an unbiased summarizer of news articles. You will be provided with an article and expected to give a completely unbiased representation of all of the facts in the article. Do not include extra facts not present in the article, and do not forget to include all of the facts. Return your response in one or two paragraphs.",
+            "content": "You are an unbiased summarizer of news articles. You will be provided with an article and expected to give a completely unbiased representation of all of the facts in the article. Do not include extra facts not present in the article, and do not forget to include all of the facts. Return your response in one or two paragraphs. Answer in the same language as the article.",
         }
     )
     traj.messages_and_choices.append(

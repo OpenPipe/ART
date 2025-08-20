@@ -27,3 +27,7 @@ models: dict[str, art.TrainableModel[JustTheFactsConfig]] = {
 models["facts-7b-001"] = models["facts-14b-001"].model_copy(deep=True)
 models["facts-7b-001"].name = "facts-7b-001"
 models["facts-7b-001"].base_model = "Qwen/Qwen2.5-7B-Instruct"
+
+models["facts-qwen3-4b-001"] = models["facts-14b-001"].model_copy(deep=True)
+models["facts-qwen3-4b-001"].name = "facts-qwen3-4b-001"
+models["facts-qwen3-4b-001"].base_model = "Qwen/Qwen3-4B-Instruct"

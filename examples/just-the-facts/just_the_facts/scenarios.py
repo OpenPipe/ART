@@ -10,7 +10,7 @@ train_urls = [
     "https://www.bbc.com/news/articles/cm2vz9jg8jzo",
     "https://www.nbcnews.com/business/markets/nasdaq-tumbles-jackson-hole-jitters-hit-tech-stocks-rcna225890",
     "https://www.nbcnews.com/news/us-news/fake-labubu-dolls-knows-lafufus-are-serious-choking-hazards-kill-kids-rcna225691",
-    "https://www.nbcbayarea.com/news/local/intel-trump/3935458/",
+    "https://www.nbcnews.com/business/markets/nasdaq-tumbles-jackson-hole-jitters-hit-tech-stocks-rcna225890",
     "https://www.nbcnews.com/news/us-news/walmart-shrimp-may-exposed-radioactive-material-fda-says-rcna225903",
     "https://www.cbsnews.com/news/politics-may-have-spurred-august-purge-of-5-veteran-fbi-agents/",
     "https://www.cbsnews.com/news/venezuela-nicolas-maduro-deploying-militia-us-threats/",
