@@ -47,13 +47,14 @@ async def rollout(model: art.Model, scenario: FactsScenario) -> art.Trajectory:
     traj.messages_and_choices.append(
         {
             "role": "user",
-            "content": article_text,
+            "content": f"Article:\n\n{article_text}",
         }
     )
 
     completion = await client.chat.completions.create(
         model=model.name if model.trainable else model.inference_model_name,
         messages=traj.messages(),
+        extra_body={"chat_template_kwargs": {"enable_thinking": False}},
     )
 
     traj.messages_and_choices.append(completion.choices[0])
