@@ -61,17 +61,12 @@ async def rollout(model: art.Model, scenario: FactsScenario) -> art.Trajectory:
     summary_text = completion.choices[0].message.content
 
     # run checks concurrently
-    includes_all_facts_check = check_includes_all_facts(article_text, summary_text)
-    hallucinated_facts_check = check_hallucinated_facts(article_text, summary_text)
-    has_conservative_bias_check = check_has_conservative_bias(
+    includes_all_facts = await check_includes_all_facts(article_text, summary_text)
+    hallucinated_facts = await check_hallucinated_facts(article_text, summary_text)
+    has_conservative_bias = await check_has_conservative_bias(
         article_text, summary_text
     )
-    has_liberal_bias_check = check_has_liberal_bias(article_text, summary_text)
-
-    includes_all_facts = await includes_all_facts_check
-    hallucinated_facts = await hallucinated_facts_check
-    has_conservative_bias = await has_conservative_bias_check
-    has_liberal_bias = await has_liberal_bias_check
+    has_liberal_bias = await check_has_liberal_bias(article_text, summary_text)
 
     # add checks to traj
     traj.metrics["includes_all_facts"] = includes_all_facts
