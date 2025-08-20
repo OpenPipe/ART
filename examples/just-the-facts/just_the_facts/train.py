@@ -77,7 +77,8 @@ async def train(model: art.TrainableModel[JustTheFactsConfig]):
             config=art.TrainConfig(learning_rate=model.config.learning_rate),
         )
 
-    await backend._experimental_push_to_s3(model)
+        await backend._experimental_push_to_s3(model)
+
     print("Training finished.")
 
 
