@@ -1,6 +1,6 @@
 import json
 import socket
-from typing import Any, AsyncIterator, Union
+from typing import Any, AsyncIterator
 
 import pydantic
 import typer
@@ -13,6 +13,7 @@ from . import dev
 from .errors import ARTError
 from .local import LocalBackend
 from .model import Model, TrainableModel
+
 from .trajectories import TrajectoryGroup
 from .types import TrainConfig
 from .utils.deploy_model import LoRADeploymentProvider
@@ -62,8 +63,7 @@ def run(host: str = "0.0.0.0", port: int = 7999) -> None:
 
     @app.post("/register")
     async def register(
-        # Ensure that trainable models are serialzed as TrainableModel, not Model
-        model: Union[TrainableModel, Model] = Body(...),
+        model: Model = Body(...),
     ):
         await backend.register(model)
 
@@ -76,7 +76,7 @@ def run(host: str = "0.0.0.0", port: int = 7999) -> None:
 
     @app.post("/_log")
     async def _log(
-        model: Union[TrainableModel, Model],
+        model: Model,
         trajectory_groups: list[TrajectoryGroup],
         split: str = Body("val"),
     ):
@@ -102,7 +102,7 @@ def run(host: str = "0.0.0.0", port: int = 7999) -> None:
     # all parameters as body parameters
     @app.post("/_experimental_pull_from_s3")
     async def _experimental_pull_from_s3(
-        model: Union[TrainableModel, Model] = Body(...),
+        model: Model = Body(...),
         s3_bucket: str | None = Body(None),
         prefix: str | None = Body(None),
         verbose: bool = Body(False),
@@ -118,7 +118,7 @@ def run(host: str = "0.0.0.0", port: int = 7999) -> None:
 
     @app.post("/_experimental_push_to_s3")
     async def _experimental_push_to_s3(
-        model: Union[TrainableModel, Model] = Body(...),
+        model: Model = Body(...),
         s3_bucket: str | None = Body(None),
         prefix: str | None = Body(None),
         verbose: bool = Body(False),

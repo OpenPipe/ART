@@ -56,6 +56,8 @@ class Model(
     name: str
     project: str
     config: ModelConfig
+    # Discriminator field for FastAPI serialization
+    trainable: bool = False
 
     # --- Inference connection information (populated automatically for
     #     TrainableModel or set manually for prompted / comparison models) ---
@@ -131,9 +133,6 @@ class Model(
         data["config"] = None
         return data
 
-    @property
-    def trainable(self) -> bool:
-        return False
 
     def backend(self) -> "Backend":
         if self._backend is None:
@@ -244,6 +243,8 @@ class Model(
 
 class TrainableModel(Model[ModelConfig], Generic[ModelConfig]):
     base_model: str
+    # Override discriminator field for FastAPI serialization
+    trainable: bool = True
 
     # The fields within `_internal_config` are unstable and subject to change.
     # Use at your own risk.
@@ -313,9 +314,6 @@ class TrainableModel(Model[ModelConfig], Generic[ModelConfig]):
         data["config"] = None
         return data
 
-    @property
-    def trainable(self) -> bool:
-        return True
 
     async def register(
         self,

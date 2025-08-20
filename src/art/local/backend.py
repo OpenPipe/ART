@@ -121,7 +121,7 @@ class LocalBackend(Backend):
             json.dump(model.model_dump(), f)
 
         # Initialize wandb and weave early if this is a trainable model
-        if isinstance(model, TrainableModel) and "WANDB_API_KEY" in os.environ:
+        if model.trainable and "WANDB_API_KEY" in os.environ:
             _ = self._get_wandb_run(model)
 
     async def _get_service(self, model: TrainableModel) -> ModelService:
@@ -230,7 +230,8 @@ class LocalBackend(Backend):
         return self.__get_step(model)
 
     def __get_step(self, model: Model) -> int:
-        if isinstance(model, TrainableModel):
+        if model.trainable:
+            model = cast(TrainableModel, model)
             return get_model_step(model, self._path)
         # Non-trainable models do not have checkpoints/steps; default to 0
         return 0
