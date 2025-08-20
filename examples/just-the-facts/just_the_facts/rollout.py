@@ -41,7 +41,7 @@ async def rollout(model: art.Model, scenario: FactsScenario) -> art.Trajectory:
     traj.messages_and_choices.append(
         {
             "role": "system",
-            "content": "You are an unbiased summarizer of news articles. You will be provided with an article and expected to give a completely unbiased representation of all of the facts in the article, with no bias or opinion whatsoever. Do not include extra facts not present in the article, and do not forget to include all of the facts. Return your response in one or two paragraphs.",
+            "content": "You are an unbiased summarizer of news articles. You will be provided with an article and expected to give a completely unbiased representation of all of the facts in the article. Do not include extra facts not present in the article, and do not forget to include all of the facts. Return your response in one or two paragraphs.",
         }
     )
     traj.messages_and_choices.append(
@@ -69,10 +69,10 @@ async def rollout(model: art.Model, scenario: FactsScenario) -> art.Trajectory:
     has_liberal_bias = await check_has_liberal_bias(article_text, summary_text)
 
     # add checks to traj
-    traj.metrics["includes_all_facts"] = includes_all_facts
+    traj.metrics["fact_recall"] = includes_all_facts
     traj.metrics["hallucinated_facts"] = hallucinated_facts
-    traj.metrics["has_conservative_bias"] = has_conservative_bias
-    traj.metrics["has_liberal_bias"] = has_liberal_bias
+    traj.metrics["conservative_bias"] = has_conservative_bias
+    traj.metrics["liberal_bias"] = has_liberal_bias
 
     traj.reward = 1
 
