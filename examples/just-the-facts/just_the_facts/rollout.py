@@ -1,12 +1,18 @@
+import asyncio
+import os
+
 import weave
+from dotenv import load_dotenv
 from openai import AsyncOpenAI
+from pydantic import BaseModel
+from utils import scrape_article
 
 import art
 
-from .utils import scrape_article
+load_dotenv()
 
 
-class FactsScenario(art.Scenario):
+class FactsScenario(BaseModel):
     article_url: str
 
 
@@ -47,3 +53,22 @@ async def rollout(model: art.Model, scenario: FactsScenario) -> art.Trajectory:
     traj.messages_and_choices.append(completion.choices[0])
 
     return traj
+
+
+if __name__ == "__main__":
+    model = art.Model(
+        name="gpt-4o-mini",
+        project="just-the-facts",
+        inference_api_key=os.getenv("OPENROUTER_API_KEY"),
+        inference_base_url="https://openrouter.ai/api/v1",
+    )
+    traj = asyncio.run(
+        rollout(
+            model=model,
+            scenario=FactsScenario(
+                article_url="https://www.foxnews.com/politics/schiff-launches-legal-defense-fund-response-claims-trump-weaponizing-justice-system"
+            ),
+        )
+    )
+
+    print(traj.messages()[-1]["content"])

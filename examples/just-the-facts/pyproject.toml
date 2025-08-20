@@ -7,8 +7,12 @@ requires-python = ">=3.10"
 dependencies = [
     "aiohttp>=3.12.14",
     "asyncio>=3.4.3",
+    "beautifulsoup4>=4.13.4",
     "click>=8.1.8",
+    "lxml>=6.0.0",
+    "lxml-html-clean>=0.4.2",
     "mcp>=1.11.0",
+    "newspaper3k>=0.2.8",
     "openai>=1.74.0",
     "openpipe-art[skypilot]",
     "python-dotenv>=1.1.1",
