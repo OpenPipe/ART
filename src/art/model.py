@@ -128,7 +128,7 @@ class Model(
         """
         data = super().model_dump(*args, **kwargs)
         # remove config from dumped_model to prevent serialization errors
-        data.pop("config")
+        data["config"] = None
         return data
 
     @property
@@ -310,7 +310,7 @@ class TrainableModel(Model[ModelConfig], Generic[ModelConfig]):
         """
         data = self.model_dump(*args, **kwargs)
         # remove config from dumped_model to prevent serialization errors
-        data.pop("config")
+        data["config"] = None
         return data
 
     @property
