@@ -295,6 +295,15 @@ class TrainableModel(Model[ModelConfig], Generic[ModelConfig]):
         data["_internal_config"] = self._internal_config
         return data
 
+    def safe_model_dump(self, *args, **kwargs) -> dict:
+        """
+        Dump the model, but remove the config field to prevent serialization errors in the backend.
+        """
+        data = self.model_dump(*args, **kwargs)
+        # remove config from dumped_model to prevent serialization errors
+        data.pop("config")
+        return data
+
     @property
     def trainable(self) -> bool:
         return True

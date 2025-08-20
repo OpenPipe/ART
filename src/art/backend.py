@@ -41,11 +41,11 @@ class Backend:
         Args:
             model: An art.Model instance.
         """
-        response = await self._client.post("/register", json=model.model_dump())
+        response = await self._client.post("/register", json=model.safe_model_dump())
         response.raise_for_status()
 
     async def _get_step(self, model: "TrainableModel") -> int:
-        response = await self._client.post("/_get_step", json=model.model_dump())
+        response = await self._client.post("/_get_step", json=model.safe_model_dump())
         response.raise_for_status()
         return response.json()
 
@@ -57,7 +57,7 @@ class Backend:
     ) -> None:
         response = await self._client.post(
             "/_delete_checkpoints",
-            json=model.model_dump(),
+            json=model.safe_model_dump(),
             params={"benchmark": benchmark, "benchmark_smoothing": benchmark_smoothing},
         )
         response.raise_for_status()
@@ -69,7 +69,7 @@ class Backend:
     ) -> tuple[str, str]:
         response = await self._client.post(
             "/_prepare_backend_for_training",
-            json={"model": model.model_dump(), "config": config},
+            json={"model": model.safe_model_dump(), "config": config},
             timeout=600,
         )
         response.raise_for_status()
@@ -85,7 +85,7 @@ class Backend:
         response = await self._client.post(
             "/_log",
             json={
-                "model": model.model_dump(),
+                "model": model.safe_model_dump(),
                 "trajectory_groups": [tg.model_dump() for tg in trajectory_groups],
                 "split": split,
             },
@@ -105,7 +105,7 @@ class Backend:
             "POST",
             "/_train_model",
             json={
-                "model": model.model_dump(),
+                "model": model.safe_model_dump(),
                 "trajectory_groups": [tg.model_dump() for tg in trajectory_groups],
                 "config": config.model_dump(),
                 "dev_config": dev_config,
@@ -150,7 +150,7 @@ class Backend:
         response = await self._client.post(
             "/_experimental_pull_from_s3",
             json={
-                "model": model.model_dump(),
+                "model": model.safe_model_dump(),
                 "s3_bucket": s3_bucket,
                 "prefix": prefix,
                 "verbose": verbose,
@@ -175,7 +175,7 @@ class Backend:
         response = await self._client.post(
             "/_experimental_push_to_s3",
             json={
-                "model": model.model_dump(),
+                "model": model.safe_model_dump(),
                 "s3_bucket": s3_bucket,
                 "prefix": prefix,
                 "verbose": verbose,
@@ -212,7 +212,7 @@ class Backend:
         response = await self._client.post(
             "/_experimental_fork_checkpoint",
             json={
-                "model": model.model_dump(),
+                "model": model.safe_model_dump(),
                 "from_model": from_model,
                 "from_project": from_project,
                 "from_s3_bucket": from_s3_bucket,
@@ -246,7 +246,7 @@ class Backend:
             "/_experimental_deploy",
             json={
                 "deploy_to": deploy_to,
-                "model": model.model_dump(),
+                "model": model.safe_model_dump(),
                 "step": step,
                 "s3_bucket": s3_bucket,
                 "prefix": prefix,
