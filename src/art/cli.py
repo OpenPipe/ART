@@ -5,6 +5,7 @@ from typing import Any, AsyncIterator
 import pydantic
 import typer
 import uvicorn
+from dotenv import load_dotenv
 from fastapi import Body, FastAPI, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 
@@ -15,6 +16,8 @@ from .model import Model, TrainableModel
 from .trajectories import TrajectoryGroup
 from .types import TrainConfig
 from .utils.deploy_model import LoRADeploymentProvider
+
+load_dotenv()
 
 app = typer.Typer()
 
