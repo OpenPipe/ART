@@ -9,6 +9,7 @@ dependencies = [
     "asyncio>=3.4.3",
     "beautifulsoup4>=4.13.4",
     "click>=8.1.8",
+    "feedparser>=6.0.11",
     "lxml>=6.0.0",
     "lxml-html-clean>=0.4.2",
     "mcp>=1.11.0",
