@@ -1,14 +1,14 @@
 import asyncio
+import copy
 import os
 import random
 
 from dotenv import load_dotenv
 
 import art
-import copy
 from art.skypilot import SkyPilotBackend
-from just_the_facts.rollout import FactsScenario, rollout
-from just_the_facts.scenarios import val_urls
+from just_the_facts.rollout import rollout
+from just_the_facts.scenarios import val_scenarios
 
 load_dotenv()
 
@@ -57,12 +57,10 @@ r1_0528.inference_model_name = "deepseek/deepseek-r1-0528:free"
 
 
 async def log_comparison_model(comparison_model: art.Model):
-    scenarios = [FactsScenario(article_url=url) for url in val_urls]
-
     trajectory_groups = await art.gather_trajectory_groups(
         (
             art.TrajectoryGroup(rollout(comparison_model, scenario) for _ in range(4))
-            for scenario in scenarios
+            for scenario in val_scenarios
         ),
         pbar_desc=f"gather {comparison_model.name}",
         max_exceptions=1,

@@ -1,3 +1,5 @@
+from just_the_facts.rollout import FactsScenario
+
 train_urls = [
     "https://www.foxnews.com/politics/bostons-wu-fires-back-bondi-other-cities-slam-feds-over-sanctuary-warnings",
     "https://www.msnbc.com/top-stories/latest/joseph-humire-defense-department-pentagon-tren-de-aragua-rcna225929",
@@ -20,3 +22,7 @@ val_urls = [
     "https://www.foxnews.com/politics/schiff-launches-legal-defense-fund-response-claims-trump-weaponizing-justice-system",
     "https://www.msnbc.com/rachel-maddow-show/maddowblog/trump-rig-midterm-elections-redistricting-mail-in-voting-census-rcna225826",
 ]
+
+train_scenarios = [FactsScenario(article_url=url) for url in train_urls]
+
+val_scenarios = [FactsScenario(article_url=url) for url in val_urls]
