@@ -82,6 +82,7 @@ async def run_benchmarks():
         gpu="H100-SXM",
         tail_logs=False,
         env_path="../../.env",
+        art_version="../../",
     )
     await gpt_4o_mini.register(backend)
     await gpt_4o.register(backend)
