@@ -3,20 +3,14 @@
 import asyncio
 
 from just_the_facts.utils import scrape_article
+from just_the_facts.scenarios import train_urls, val_urls
 
 
 async def test_scraper():
     """Test the scrape_article function with example URLs"""
 
     # Test URLs from different news sources (using homepage URLs that should exist)
-    test_urls = [
-        # Trump wars
-        "https://www.bbc.com/news/articles/c5y3599gx4qo",
-        # Australia - Netanyahu
-        "https://www.reuters.com/world/asia-pacific/australias-albanese-downplays-netanyahus-criticism-ties-sour-2025-08-20/",
-        # Trump weaponizing justice system
-        "https://www.foxnews.com/politics/schiff-launches-legal-defense-fund-response-claims-trump-weaponizing-justice-system",
-    ]
+    test_urls = train_urls + val_urls
 
     for url in test_urls:
         try:
@@ -26,6 +20,7 @@ async def test_scraper():
             print(f"First 200 characters: {article_text[:200]}...")
         except Exception as e:
             print(f"Failed to scrape {url}: {str(e)}")
+            raise e
 
 
 if __name__ == "__main__":

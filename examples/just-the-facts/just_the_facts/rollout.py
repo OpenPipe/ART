@@ -3,9 +3,15 @@ import os
 
 import weave
 from dotenv import load_dotenv
+from just_the_facts.checks import (
+    check_hallucinated_facts,
+    check_has_conservative_bias,
+    check_has_liberal_bias,
+    check_includes_all_facts,
+)
+from just_the_facts.utils import scrape_article
 from openai import AsyncOpenAI
 from pydantic import BaseModel
-from utils import scrape_article
 
 import art
 
@@ -52,6 +58,41 @@ async def rollout(model: art.Model, scenario: FactsScenario) -> art.Trajectory:
 
     traj.messages_and_choices.append(completion.choices[0])
 
+    summary_text = completion.choices[0].message.content
+
+    # run checks concurrently
+    includes_all_facts_check = check_includes_all_facts(article_text, summary_text)
+    hallucinated_facts_check = check_hallucinated_facts(article_text, summary_text)
+    has_conservative_bias_check = check_has_conservative_bias(
+        article_text, summary_text
+    )
+    has_liberal_bias_check = check_has_liberal_bias(article_text, summary_text)
+
+    includes_all_facts = await includes_all_facts_check
+    hallucinated_facts = await hallucinated_facts_check
+    has_conservative_bias = await has_conservative_bias_check
+    has_liberal_bias = await has_liberal_bias_check
+
+    # add checks to traj
+    traj.metrics["includes_all_facts"] = includes_all_facts
+    traj.metrics["hallucinated_facts"] = hallucinated_facts
+    traj.metrics["has_conservative_bias"] = has_conservative_bias
+    traj.metrics["has_liberal_bias"] = has_liberal_bias
+
+    traj.reward = 1
+
+    if not includes_all_facts:
+        traj.reward -= 0.3
+
+    if hallucinated_facts:
+        traj.reward -= 0.3
+
+    if has_conservative_bias:
+        traj.reward -= 0.2
+
+    if has_liberal_bias:
+        traj.reward -= 0.2
+
     return traj
 
 
@@ -70,5 +111,7 @@ if __name__ == "__main__":
             ),
         )
     )
+
+    print(traj.metrics)
 
     print(traj.messages()[-1]["content"])
