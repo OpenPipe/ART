@@ -2,8 +2,8 @@
 
 import asyncio
 
-from just_the_facts.utils import scrape_article
 from just_the_facts.scenarios import train_urls, val_urls
+from just_the_facts.utils import scrape_article
 
 
 async def test_scraper():

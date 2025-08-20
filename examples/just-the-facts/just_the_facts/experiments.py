@@ -7,7 +7,7 @@ class JustTheFactsConfig(BaseModel):
     learning_rate: float = 1e-6
     num_epochs: int = 20
 
-    eval_steps: int = 5
+    eval_steps: int = 1
     groups_per_step: int = 3
     trajectories_per_group: int = 4
 
@@ -30,4 +30,13 @@ models["facts-7b-001"].base_model = "Qwen/Qwen2.5-7B-Instruct"
 
 models["facts-qwen3-4b-001"] = models["facts-14b-001"].model_copy(deep=True)
 models["facts-qwen3-4b-001"].name = "facts-qwen3-4b-001"
-models["facts-qwen3-4b-001"].base_model = "Qwen/Qwen3-4B-Instruct"
+models["facts-qwen3-4b-001"].base_model = "Qwen/Qwen3-4B"
+
+models["facts-qwen3-4b-002"] = models["facts-14b-001"].model_copy(deep=True)
+models["facts-qwen3-4b-002"].name = "facts-qwen3-4b-002"
+models["facts-qwen3-4b-002"].base_model = "Qwen/Qwen3-4B"
+
+models["facts-qwen3-4b-003"] = models["facts-14b-001"].model_copy(deep=True)
+models["facts-qwen3-4b-003"].name = "facts-qwen3-4b-003"
+models["facts-qwen3-4b-003"].base_model = "Qwen/Qwen3-4B"
+models["facts-qwen3-4b-003"].config.groups_per_step = 8
