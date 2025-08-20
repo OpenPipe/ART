@@ -20,6 +20,13 @@ dependencies = [
     "weave>=0.51.56",
 ]
 
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["just_the_facts*"]
 
 [tool.uv.sources]
 openpipe-art = { path = "../../", editable = true }
