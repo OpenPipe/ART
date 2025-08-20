@@ -122,6 +122,15 @@ class Model(
     ) -> "Model[ModelConfig] | Model[None]":
         return super().__new__(cls)
 
+    def safe_model_dump(self, *args, **kwargs) -> dict:
+        """
+        Dump the model, but remove the config field to prevent serialization errors in the backend.
+        """
+        data = super().model_dump(*args, **kwargs)
+        # remove config from dumped_model to prevent serialization errors
+        data.pop("config")
+        return data
+
     @property
     def trainable(self) -> bool:
         return False
