@@ -19,6 +19,7 @@ async def train(model: art.TrainableModel[JustTheFactsConfig]):
         gpu="H100-SXM",
         tail_logs=False,
         env_path="../../.env",
+        force_restart=False,
     )
 
     print(f"Pulling latest checkpoint from S3 bucket: `{os.environ['BACKUP_BUCKET']}`")

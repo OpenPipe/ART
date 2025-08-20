@@ -4,10 +4,12 @@ import art
 
 
 class JustTheFactsConfig(BaseModel):
-    num_epochs: int = 20
-    eval_steps: int = 5
-    trajectories_per_group: int = 4
     learning_rate: float = 1e-6
+    num_epochs: int = 20
+
+    eval_steps: int = 5
+    groups_per_step: int = 3
+    trajectories_per_group: int = 4
 
 
 models: dict[str, art.TrainableModel[JustTheFactsConfig]] = {

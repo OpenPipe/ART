@@ -70,9 +70,9 @@ async def log_comparison_model(comparison_model: art.Model):
         trajectory_groups,
         split="val",
     )
-    # await backend._experimental_push_to_s3(
-    #     comparison_model,
-    # )
+    await backend._experimental_push_to_s3(
+        comparison_model,
+    )
 
 
 async def run_benchmarks():
