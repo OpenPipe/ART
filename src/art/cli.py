@@ -1,6 +1,6 @@
 import json
 import socket
-from typing import Any, AsyncIterator
+from typing import Any, AsyncIterator, Union
 
 import pydantic
 import typer
@@ -57,9 +57,15 @@ def run(host: str = "0.0.0.0", port: int = 7999) -> None:
 
     app.get("/healthcheck")(lambda: {"status": "ok"})
     app.post("/close")(backend.close)
-    app.post("/register")(backend.register)
     app.post("/_get_step")(backend._get_step)
     app.post("/_delete_checkpoints")(backend._delete_checkpoints)
+
+    @app.post("/register")
+    async def register(
+        # Ensure that trainable models are serialzed as TrainableModel, not Model
+        model: Union[TrainableModel, Model] = Body(...),
+    ):
+        await backend.register(model)
 
     @app.post("/_prepare_backend_for_training")
     async def _prepare_backend_for_training(
@@ -70,7 +76,7 @@ def run(host: str = "0.0.0.0", port: int = 7999) -> None:
 
     @app.post("/_log")
     async def _log(
-        model: Model,
+        model: Union[TrainableModel, Model],
         trajectory_groups: list[TrajectoryGroup],
         split: str = Body("val"),
     ):
@@ -96,7 +102,7 @@ def run(host: str = "0.0.0.0", port: int = 7999) -> None:
     # all parameters as body parameters
     @app.post("/_experimental_pull_from_s3")
     async def _experimental_pull_from_s3(
-        model: Model = Body(...),
+        model: Union[TrainableModel, Model] = Body(...),
         s3_bucket: str | None = Body(None),
         prefix: str | None = Body(None),
         verbose: bool = Body(False),
@@ -112,7 +118,7 @@ def run(host: str = "0.0.0.0", port: int = 7999) -> None:
 
     @app.post("/_experimental_push_to_s3")
     async def _experimental_push_to_s3(
-        model: Model = Body(...),
+        model: Union[TrainableModel, Model] = Body(...),
         s3_bucket: str | None = Body(None),
         prefix: str | None = Body(None),
         verbose: bool = Body(False),
