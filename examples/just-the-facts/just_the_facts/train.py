@@ -14,7 +14,7 @@ load_dotenv()
 
 
 async def train(model: art.TrainableModel[JustTheFactsConfig]):
-    backend = SkyPilotBackend.initialize_cluster(
+    backend = await SkyPilotBackend.initialize_cluster(
         cluster_name="just-the-facts",
         gpu="H100-SXM",
         tail_logs=False,
@@ -27,7 +27,6 @@ async def train(model: art.TrainableModel[JustTheFactsConfig]):
         s3_bucket=os.environ["BACKUP_BUCKET"],
         verbose=True,
         only_step="latest",  # Only pull the latest checkpoint
-        exclude=["trajectories"],  # Exclude trajectories to save space/time
     )
 
     await model.register(backend)
@@ -85,7 +84,7 @@ if __name__ == "__main__":
     import argparse
 
     parser = argparse.ArgumentParser()
-    parser.add_argument("model", help="Name of the model to train")
+    parser.add_argument("--model", required=True, help="Name of the model to train")
     args = parser.parse_args()
 
     model = models[args.model]
