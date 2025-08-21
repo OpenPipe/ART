@@ -96,7 +96,6 @@ train_urls = [
     "https://www.bbc.com/news/articles/cyvn9z3y78lo?at_medium=RSS&at_campaign=rss",
     "https://www.cbsnews.com/news/ps5-price-increase-sony/",
     "https://www.nbcnews.com/video/watch-live-white-house-holds-press-briefing-236804677569",
-    "https://www.foxnews.com/politics/full-s-new-york-republican-accuses-state-dems-hypocrisy-redistricting-push",
     "https://www.foxnews.com/politics/bostons-wu-fires-back-bondi-other-cities-slam-feds-over-sanctuary-warnings",
     "https://www.msnbc.com/top-stories/latest/joseph-humire-defense-department-pentagon-tren-de-aragua-rcna225929",
     "https://www.msnbc.com/top-stories/latest/texas-democrat-spends-night-house-floor-nicole-collier-rcna225907",
@@ -108,7 +107,6 @@ train_urls = [
     "https://www.nbcnews.com/news/us-news/fake-labubu-dolls-knows-lafufus-are-serious-choking-hazards-kill-kids-rcna225691",
     "https://www.nbcnews.com/business/markets/nasdaq-tumbles-jackson-hole-jitters-hit-tech-stocks-rcna225890",
     "https://www.nbcnews.com/news/us-news/walmart-shrimp-may-exposed-radioactive-material-fda-says-rcna225903",
-    "https://www.cbsnews.com/news/politics-may-have-spurred-august-purge-of-5-veteran-fbi-agents/",
     "https://www.cbsnews.com/news/venezuela-nicolas-maduro-deploying-militia-us-threats/",
 ]
 
@@ -118,8 +116,9 @@ val_urls = [
     "https://www.bbc.com/news/articles/cn85z0z3gz3o?at_medium=RSS&at_campaign=rss",
     "https://www.cbsnews.com/video/wyoming-launches-state-issued-stablecoin/",
     "https://www.foxnews.com/travel/hurricane-erin-prompts-beach-closures-emergency-declarations-across-multiple-states",
+    "https://www.foxnews.com/politics/full-s-new-york-republican-accuses-state-dems-hypocrisy-redistricting-push",
     "https://www.bbc.com/news/articles/c5y3599gx4qo",
-    "https://www.reuters.com/world/asia-pacific/australias-albanese-downplays-netanyahus-criticism-ties-sour-2025-08-20/",
+    "https://www.cbsnews.com/news/politics-may-have-spurred-august-purge-of-5-veteran-fbi-agents/",
     "https://www.foxnews.com/politics/schiff-launches-legal-defense-fund-response-claims-trump-weaponizing-justice-system",
     "https://www.msnbc.com/rachel-maddow-show/maddowblog/trump-rig-midterm-elections-redistricting-mail-in-voting-census-rcna225826",
 ]

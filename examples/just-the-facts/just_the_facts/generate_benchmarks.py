@@ -59,7 +59,7 @@ r1_0528.inference_model_name = "deepseek/deepseek-r1-0528:free"
 async def log_comparison_model(comparison_model: art.Model):
     trajectory_groups = await art.gather_trajectory_groups(
         (
-            art.TrajectoryGroup(rollout(comparison_model, scenario) for _ in range(4))
+            art.TrajectoryGroup(rollout(comparison_model, scenario) for _ in range(2))
             for scenario in val_scenarios
         ),
         pbar_desc=f"gather {comparison_model.name}",

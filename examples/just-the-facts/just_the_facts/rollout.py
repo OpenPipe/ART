@@ -3,6 +3,10 @@ import os
 
 import weave
 from dotenv import load_dotenv
+from openai import AsyncOpenAI
+from pydantic import BaseModel
+
+import art
 from just_the_facts.checks import (
     check_hallucinated_facts,
     check_has_conservative_bias,
@@ -10,10 +14,6 @@ from just_the_facts.checks import (
     check_includes_all_facts,
 )
 from just_the_facts.utils import scrape_article
-from openai import AsyncOpenAI
-from pydantic import BaseModel
-
-import art
 
 load_dotenv()
 
@@ -77,11 +77,9 @@ async def rollout(model: art.Model, scenario: FactsScenario) -> art.Trajectory:
 
     traj.reward = 1
 
-    if not includes_all_facts:
-        traj.reward -= 0.3
+    traj.reward -= (1 - includes_all_facts) * 0.3
 
-    if hallucinated_facts:
-        traj.reward -= 0.3
+    traj.reward -= hallucinated_facts * 0.3
 
     if has_conservative_bias:
         traj.reward -= 0.2
