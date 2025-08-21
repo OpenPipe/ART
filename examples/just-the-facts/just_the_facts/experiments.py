@@ -10,6 +10,7 @@ class JustTheFactsConfig(BaseModel):
     eval_steps: int = 1
     groups_per_step: int = 3
     trajectories_per_group: int = 4
+    scale_rewards: bool = False
 
 
 models: dict[str, art.TrainableModel[JustTheFactsConfig]] = {
@@ -26,6 +27,13 @@ models: dict[str, art.TrainableModel[JustTheFactsConfig]] = {
 models["facts-14b-002"] = models["facts-14b-001"].model_copy(deep=True)
 models["facts-14b-002"].name = "facts-14b-002"
 models["facts-14b-002"].base_model = "Qwen/Qwen2.5-14B-Instruct"
+
+models["facts-14b-003"] = models["facts-14b-001"].model_copy(deep=True)
+models["facts-14b-003"].name = "facts-14b-003"
+models["facts-14b-003"].base_model = "Qwen/Qwen2.5-14B-Instruct"
+models["facts-14b-003"].config.scale_rewards = True
+models["facts-14b-003"].config.trajectories_per_group = 12
+
 
 models["facts-7b-001"] = models["facts-14b-001"].model_copy(deep=True)
 models["facts-7b-001"].name = "facts-7b-001"

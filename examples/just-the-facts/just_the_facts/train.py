@@ -6,7 +6,6 @@ from dotenv import load_dotenv
 from rollout import rollout
 
 import art
-from art.skypilot.backend import SkyPilotBackend
 from art.utils import iterate_dataset
 from just_the_facts.experiments import JustTheFactsConfig, models
 from just_the_facts.scenarios import train_scenarios, val_scenarios
@@ -90,6 +89,9 @@ async def train(
         await model.train(
             groups,
             config=art.TrainConfig(learning_rate=model.config.learning_rate),
+            _config=art.dev.TrainConfig(
+                scale_rewards=model.config.scale_rewards,
+            ),
         )
 
         await backend._experimental_push_to_s3(model)

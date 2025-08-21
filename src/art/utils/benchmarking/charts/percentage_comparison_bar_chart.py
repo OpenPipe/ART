@@ -17,6 +17,7 @@ def percentage_comparison_bar_chart(
     title: str | None = None,
     y_label: str | None = None,
     perfect_score: float | None = None,
+    num_decimals: int = 0,
 ):
     """Create a bar chart visualising *metric_name* for all *models* at the
     **first** and **last** available training step.
@@ -175,7 +176,7 @@ def percentage_comparison_bar_chart(
             ax.text(
                 x_positions[idx],
                 base_scaled + imp_scaled / 2,
-                f"RL +{imp_scaled:.0f}{'%' if scale == 100 else ''}",
+                f"RL +{imp_scaled:.{num_decimals}f}{'%' if scale == 100 else ''}",
                 ha="center",
                 va="center",
                 color="#c05a20",  # slightly darker orange for contrast
@@ -194,7 +195,7 @@ def percentage_comparison_bar_chart(
         ax.text(
             x_positions[idx],
             total + (max_val * scale) * 0.02,
-            f"{total:.0f}{'%' if scale == 100 else ''}",
+            f"{total:.{num_decimals}f}{'%' if scale == 100 else ''}",
             ha="center",
             va="bottom",
             fontweight="bold",
