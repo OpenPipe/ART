@@ -133,7 +133,6 @@ class Model(
         data["config"] = None
         return data
 
-
     def backend(self) -> "Backend":
         if self._backend is None:
             raise ValueError(
@@ -313,7 +312,6 @@ class TrainableModel(Model[ModelConfig], Generic[ModelConfig]):
         # remove config from dumped_model to prevent serialization errors
         data["config"] = None
         return data
-
 
     async def register(
         self,
