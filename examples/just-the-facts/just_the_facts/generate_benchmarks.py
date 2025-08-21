@@ -53,7 +53,7 @@ gemini_2_5_pro.inference_model_name = "google/gemini-2.5-pro"
 
 r1_0528 = copy.deepcopy(gpt_4o_mini)
 r1_0528.name = "r1-0528"
-r1_0528.inference_model_name = "deepseek/deepseek-r1-0528:free"
+r1_0528.inference_model_name = "deepseek/deepseek-r1-0528"
 
 
 async def log_comparison_model(comparison_model: art.Model):

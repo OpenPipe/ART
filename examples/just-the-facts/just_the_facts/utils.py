@@ -3,7 +3,6 @@ import asyncio
 import aiohttp
 from newspaper import Article
 
-
 cached_articles = {}
 
 

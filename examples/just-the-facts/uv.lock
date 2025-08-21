@@ -206,63 +206,6 @@ wheels = [
 ]
 
 [[package]]
-name = "art-mcp"
-version = "0.1.0"
-source = { editable = "." }
-dependencies = [
-    { name = "aiohttp" },
-    { name = "asyncio" },
-    { name = "beautifulsoup4" },
-    { name = "click" },
-    { name = "feedparser" },
-    { name = "lxml" },
-    { name = "lxml-html-clean" },
-    { name = "mcp" },
-    { name = "newspaper3k" },
-    { name = "openai" },
-    { name = "openpipe-art", extra = ["skypilot"] },
-    { name = "python-dotenv" },
-    { name = "tenacity" },
-    { name = "weave" },
-]
-
-[package.dev-dependencies]
-dev = [
-    { name = "ipykernel" },
-    { name = "ipywidgets" },
-    { name = "matplotlib" },
-    { name = "polars" },
-    { name = "seaborn" },
-]
-
-[package.metadata]
-requires-dist = [
-    { name = "aiohttp", specifier = ">=3.12.14" },
-    { name = "asyncio", specifier = ">=3.4.3" },
-    { name = "beautifulsoup4", specifier = ">=4.13.4" },
-    { name = "click", specifier = ">=8.1.8" },
-    { name = "feedparser", specifier = ">=6.0.11" },
-    { name = "lxml", specifier = ">=6.0.0" },
-    { name = "lxml-html-clean", specifier = ">=0.4.2" },
-    { name = "mcp", specifier = ">=1.11.0" },
-    { name = "newspaper3k", specifier = ">=0.2.8" },
-    { name = "openai", specifier = ">=1.74.0" },
-    { name = "openpipe-art", extras = ["skypilot"], editable = "../../" },
-    { name = "python-dotenv", specifier = ">=1.1.1" },
-    { name = "tenacity", specifier = ">=9.1.2" },
-    { name = "weave", specifier = ">=0.51.56" },
-]
-
-[package.metadata.requires-dev]
-dev = [
-    { name = "ipykernel", specifier = ">=6.29.5" },
-    { name = "ipywidgets", specifier = ">=8.1.6" },
-    { name = "matplotlib", specifier = ">=3.10.3" },
-    { name = "polars", specifier = ">=1.31.0" },
-    { name = "seaborn", specifier = ">=0.13.2" },
-]
-
-[[package]]
 name = "asttokens"
 version = "3.0.0"
 source = { registry = "https://pypi.org/simple" }
@@ -2051,6 +1994,63 @@ wheels = [
 ]
 
 [[package]]
+name = "just-the-facts"
+version = "0.1.0"
+source = { editable = "." }
+dependencies = [
+    { name = "aiohttp" },
+    { name = "asyncio" },
+    { name = "beautifulsoup4" },
+    { name = "click" },
+    { name = "feedparser" },
+    { name = "lxml" },
+    { name = "lxml-html-clean" },
+    { name = "mcp" },
+    { name = "newspaper3k" },
+    { name = "openai" },
+    { name = "openpipe-art", extra = ["skypilot"] },
+    { name = "python-dotenv" },
+    { name = "tenacity" },
+    { name = "weave" },
+]
+
+[package.dev-dependencies]
+dev = [
+    { name = "ipykernel" },
+    { name = "ipywidgets" },
+    { name = "matplotlib" },
+    { name = "polars" },
+    { name = "seaborn" },
+]
+
+[package.metadata]
+requires-dist = [
+    { name = "aiohttp", specifier = ">=3.12.14" },
+    { name = "asyncio", specifier = ">=3.4.3" },
+    { name = "beautifulsoup4", specifier = ">=4.13.4" },
+    { name = "click", specifier = ">=8.1.8" },
+    { name = "feedparser", specifier = ">=6.0.11" },
+    { name = "lxml", specifier = ">=6.0.0" },
+    { name = "lxml-html-clean", specifier = ">=0.4.2" },
+    { name = "mcp", specifier = ">=1.11.0" },
+    { name = "newspaper3k", specifier = ">=0.2.8" },
+    { name = "openai", specifier = ">=1.74.0" },
+    { name = "openpipe-art", extras = ["skypilot"], editable = "../../" },
+    { name = "python-dotenv", specifier = ">=1.1.1" },
+    { name = "tenacity", specifier = ">=9.1.2" },
+    { name = "weave", specifier = ">=0.51.56" },
+]
+
+[package.metadata.requires-dev]
+dev = [
+    { name = "ipykernel", specifier = ">=6.29.5" },
+    { name = "ipywidgets", specifier = ">=8.1.6" },
+    { name = "matplotlib", specifier = ">=3.10.3" },
+    { name = "polars", specifier = ">=1.31.0" },
+    { name = "seaborn", specifier = ">=0.13.2" },
+]
+
+[[package]]
 name = "kaitaistruct"
 version = "0.10"
 source = { registry = "https://pypi.org/simple" }
@@ -2870,7 +2870,7 @@ wheels = [
 
 [[package]]
 name = "openpipe-art"
-version = "0.4.7"
+version = "0.4.8"
 source = { editable = "../../" }
 dependencies = [
     { name = "litellm" },
