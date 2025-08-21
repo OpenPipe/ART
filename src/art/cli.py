@@ -57,14 +57,9 @@ def run(host: str = "0.0.0.0", port: int = 7999) -> None:
 
     app.get("/healthcheck")(lambda: {"status": "ok"})
     app.post("/close")(backend.close)
+    app.post("/register")(backend.register)
     app.post("/_get_step")(backend._get_step)
     app.post("/_delete_checkpoints")(backend._delete_checkpoints)
-
-    @app.post("/register")
-    async def register(
-        model: Model = Body(...),
-    ):
-        await backend.register(model)
 
     @app.post("/_prepare_backend_for_training")
     async def _prepare_backend_for_training(
