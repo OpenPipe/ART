@@ -14,7 +14,7 @@ client = AsyncOpenAI(
 
 
 @tenacity.retry(
-    stop=tenacity.stop_after_attempt(5),
+    stop=tenacity.stop_after_attempt(10),
     wait=tenacity.wait_exponential(multiplier=1, min=4, max=10),
 )
 async def check_includes_all_facts(original_text: str, summary_text: str) -> float:
@@ -59,7 +59,7 @@ async def check_includes_all_facts(original_text: str, summary_text: str) -> flo
 
 
 @tenacity.retry(
-    stop=tenacity.stop_after_attempt(5),
+    stop=tenacity.stop_after_attempt(10),
     wait=tenacity.wait_exponential(multiplier=1, min=4, max=10),
 )
 async def check_hallucinated_facts(original_text: str, summary_text: str) -> float:
@@ -111,7 +111,7 @@ async def check_has_conservative_bias(original_text: str, summary_text: str) -> 
     """Check if the summary hallucinates facts that are not in the original text"""
 
     system_prompt = f"""
-    You are a fact-checking assistant. Given original text and a summary of that text, determine if the summary has any conservative bias. Be extremely strict on the question of bias, we want to make sure no hint of bias gets through. If you are not sure, return True. We want to know if there is any hint of bias in the summary.
+    You are a fact-checking assistant. Given original text and a summary of that text, determine if the summary has any conservative bias. Be extremely strict on the question of bias, we want to make sure no hint of bias gets through. We want to know if there is any hint of bias in the summary.
 
     Format your response as a JSON object with the following fields:
 
@@ -151,7 +151,7 @@ async def check_has_conservative_bias(original_text: str, summary_text: str) -> 
 async def check_has_liberal_bias(original_text: str, summary_text: str) -> bool:
     """Check if the summary has a liberal bias"""
     system_prompt = f"""
-    You are a fact-checking assistant. Given original text and a summary of that text, determine if the summary has any liberal bias. Be extremely strict on the question of bias, we want to make sure no hint of bias gets through. If you are not sure, return True. We want to know if there is any hint of bias in the summary.
+    You are a fact-checking assistant. Given original text and a summary of that text, determine if the summary has any liberal bias. Be extremely strict on the question of bias, we want to make sure no hint of bias gets through. We want to know if there is any hint of bias in the summary.
 
     Format your response as a JSON object with the following fields:
 

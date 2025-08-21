@@ -62,12 +62,7 @@ async def train(
 
             val_groups = await art.gather_trajectory_groups(
                 (
-                    art.TrajectoryGroup(
-                        (
-                            rollout(model, scenario)
-                            for _ in range(model.config.trajectories_per_group)
-                        )
-                    )
+                    art.TrajectoryGroup((rollout(model, scenario) for _ in range(2)))
                     for scenario in val_scenarios
                 ),
             )
