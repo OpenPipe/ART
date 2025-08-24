@@ -23,6 +23,8 @@ This project includes code adapted from Unsloth Notebooks:
   - examples/2048/2048.ipynb
   - examples/2048/2048-ruler.ipynb
   - examples/auto_rl.ipynb
+  - examples/mcp-rl/mcp-rl.ipynb
+  - examples/mcp-rl/mcp-rl-alphavantage.ipynb
 - Notes: Code adapted to use uv, changed vLLM/TRITON pin logic, added litellm/protobuf pins.
 
 Full license texts: licenses/LGPL-3.0.txt, licenses/GPL-3.0.txt
