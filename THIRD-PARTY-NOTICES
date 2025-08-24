@@ -11,24 +11,6 @@ The following files contain code copied and modified from TorchTune:
 Note: This project also uses TorchTune as a dependency. The above notice applies
 specifically to files containing copied/modified code from the TorchTune repository.
 
-This project includes code adapted from Unsloth Notebooks:
-
-- Repository: https://github.com/unslothai/notebooks
-- License: GNU LGPL v3.0
-- Files containing adapted code:
-  - examples/art-e.ipynb
-  - examples/tic_tac_toe/tic-tac-toe.ipynb
-  - examples/temporal_clue/temporal-clue.ipynb
-  - examples/codenames/Codenames_RL.ipynb
-  - examples/2048/2048.ipynb
-  - examples/2048/2048-ruler.ipynb
-  - examples/auto_rl.ipynb
-  - examples/mcp-rl/mcp-rl.ipynb
-  - examples/mcp-rl/mcp-rl-alphavantage.ipynb
-- Notes: Code adapted to use uv, changed vLLM/TRITON pin logic, added litellm/protobuf pins.
-
-Full license texts: licenses/LGPL-3.0.txt, licenses/GPL-3.0.txt
-
 Full license text:
 
 BSD 3-Clause License
