@@ -1,33 +1,34 @@
+import json
 from typing import List, Union
+
 from langchain_core.messages import (
-    BaseMessage,
-    HumanMessage,
     AIMessage,
+    BaseMessage,
+    FunctionMessage,
+    HumanMessage,
     SystemMessage,
     ToolMessage,
-    FunctionMessage,
 )
 from openai.types.chat.chat_completion import Choice
-from openai.types.chat.chat_completion_message_param import ChatCompletionMessageParam
-from openai.types.chat.chat_completion_user_message_param import (
-    ChatCompletionUserMessageParam,
-)
 from openai.types.chat.chat_completion_assistant_message_param import (
     ChatCompletionAssistantMessageParam,
 )
+from openai.types.chat.chat_completion_developer_message_param import (
+    ChatCompletionDeveloperMessageParam,
+)
+from openai.types.chat.chat_completion_function_message_param import (
+    ChatCompletionFunctionMessageParam,
+)
+from openai.types.chat.chat_completion_message_param import ChatCompletionMessageParam
 from openai.types.chat.chat_completion_system_message_param import (
     ChatCompletionSystemMessageParam,
 )
 from openai.types.chat.chat_completion_tool_message_param import (
     ChatCompletionToolMessageParam,
 )
-from openai.types.chat.chat_completion_function_message_param import (
-    ChatCompletionFunctionMessageParam,
+from openai.types.chat.chat_completion_user_message_param import (
+    ChatCompletionUserMessageParam,
 )
-from openai.types.chat.chat_completion_developer_message_param import (
-    ChatCompletionDeveloperMessageParam,
-)
-import json
 
 Message = ChatCompletionMessageParam
 MessagesAndChoices = List[Union[Message, Choice]]
@@ -64,6 +65,8 @@ def langchain_msg_to_openai(msg: BaseMessage) -> Message:
         raise TypeError(f"Unsupported LangChain message type: {type(msg)}")
 
     content = msg.content
+    if not content:
+        content = ""
 
     result = {"role": role, "content": content}
 

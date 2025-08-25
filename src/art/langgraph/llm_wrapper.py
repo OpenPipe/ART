@@ -1,18 +1,21 @@
 """LLM wrapper with logging functionality."""
 
-import uuid
+import asyncio
 import contextvars
+import json
 import os
-from typing import Literal, Any
+import uuid
+from typing import Any, Literal
+
+from langchain_core.messages import HumanMessage, ToolMessage
+from langchain_core.prompt_values import ChatPromptValue
 from langchain_core.runnables import Runnable
 from langchain_core.utils.function_calling import convert_to_openai_tool
 from langchain_openai import ChatOpenAI
+
+from art.trajectories import History, Trajectory
+
 from .logging import FileLogger
-import json
-import asyncio
-from art.trajectories import Trajectory, History
-from langchain_core.messages import ToolMessage, HumanMessage
-from langchain_core.prompt_values import ChatPromptValue
 from .message_utils import convert_langgraph_messages
 
 CURRENT_CONFIG = contextvars.ContextVar("CURRENT_CONFIG")
@@ -139,15 +142,25 @@ class LoggingLLM(Runnable):
     def invoke(self, input, config=None):
         completion_id = str(uuid.uuid4())
 
-        result = self.llm.invoke(input, config=config)
-        self._log(completion_id, input, result)
+        async def execute():
+            result = self.llm.invoke(input, config=config)
+            self._log(completion_id, input, result)
+            return result
+
+        result = execute()
 
         if hasattr(result, "get") and result.get("parsed"):
             return result.get("parsed")
 
+        if hasattr(result, "tool_calls"):
+            for tool_call in result.tool_calls:
+                if isinstance(tool_call["args"], str):
+                    tool_call["args"] = json.loads(tool_call["args"])
+
         if self.structured_output:
-            content = json.loads(result.content)
-            return self.structured_output.model_validate(content)
+            return self.structured_output.model_validate(
+                result.tool_calls[0]["args"] if result.tool_calls else None
+            )
         return result
 
     async def ainvoke(self, input, config=None):
@@ -168,7 +181,7 @@ class LoggingLLM(Runnable):
         if hasattr(result, "get") and result.get("parsed"):
             return result.get("parsed")
 
-        if hasattr(result, 'tool_calls'):
+        if hasattr(result, "tool_calls"):
             for tool_call in result.tool_calls:
                 if isinstance(tool_call["args"], str):
                     tool_call["args"] = json.loads(tool_call["args"])
