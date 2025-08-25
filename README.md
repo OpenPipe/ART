@@ -21,47 +21,38 @@ Train multi-step agents for real-world tasks using GRPO.
 
 </div>
 
-## 🔌 MCP•RL: Teach your agents to master MCP
+## 🦜🔗 LangGraph Integration: Build Smarter Multi-Step Agents
 
-<img src="assets/MCP_RL_diagram.svg" width="7000">
+ART's **LangGraph integration** enables you to train sophisticated ReAct-style agents that improve through reinforcement learning. Build agents that reason, use tools, and adapt their behavior over time without manual prompt engineering.
 
-**MCP•RL** enables you to train agents to effectively use any MCP (Model Context Protocol) server with minimal setup. Simply provide a server URL and MCP•RL will:
+✨ **Key Benefits:**
 
-1. Automatically discover server tools
-2. Design input tasks that utilize those tools
-3. Train the model to improve performance on the MCP server using RULER
-4. Test on new tasks to validate the trained model
-
-✨ **Key Features:**
-
-- **No labeled data** - MCP•RL learns what tasks a server will be used for by analyzing its tools
-- **General-purpose** - Optimizes models for any MCP server
-- **Strong performance** - Matches or exceeds SOTA performance in 2/3 benchmarks
-- **Easy integration** - No customization of your MCP server required!
+- **Automatic behavior improvement** - Train agents to get better at multi-step reasoning
+- **Tool usage optimization** - Learn when and how to use tools more effectively
+- **Seamless integration** - Drop-in replacement for LangGraph's LLM initialization
+- **RULER compatibility** - Train without hand-crafted reward functions
 
 ```python
-from art.rewards import ruler_score_group
+import art
+from art.langgraph import wrap_rollout, init_chat_model
+from langgraph import create_react_agent
 
-# Specialize a model for NWS MCP server
-MCP_SERVER_URL = "https://server.smithery.ai/@smithery-ai/national-weather-service/mcp"
+# Your existing tools
+tools = [search_inbox, read_email, return_final_answer]
 
-# Generate training scenarios based on MCP tools
-scenarios = await generate_scenarios(
-    num_scenarios=24,
-    server_url=MCP_SERVER_URL,
-)
+@wrap_rollout(model)
+async def run_agent(scenario: str) -> art.Trajectory:
+    # Create LangGraph agent with ART's LLM wrapper
+    agent = create_react_agent(init_chat_model(), tools)
 
-# ...run the agent...
+    result = await agent.ainvoke({"messages": [("user", scenario)]})
+    return art.Trajectory()  # Automatically captured
 
-# Use RULER to assign relative scores to each trajectory
-scored_groups = []
-for group in groups:
-    judged_group = await ruler_score_group(group)
-    scored_groups.append(judged_group)
-
-# Train the model to improve performance on the MCP server
-await model.train(scored_groups)
+# Train with RULER - no reward engineering needed!
+await art.train(model, reward_function="ruler")
 ```
+
+[📖 Learn more about LangGraph integration →](https://art.openpipe.ai/integrations/langgraph-integration)
 
 ## ART Overview
 
