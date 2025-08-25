@@ -7,7 +7,7 @@ requires-python = ">=3.10"
 dependencies = [
     "openai>=1.65.5,<=1.99.1",
     "typer>=0.15.2",
-    "litellm>=1.63.0",
+    "litellm==1.74.1",
     "weave>=0.51.51",
 ]
 
