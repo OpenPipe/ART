@@ -1,6 +1,22 @@
 import json
 import math
+import os
+import subprocess
 from datetime import datetime
+from types import TracebackType
+from typing import AsyncIterator, Literal, cast
+
+import numpy as np
+import polars as pl
+import torch
+import wandb
+import weave
+from tqdm import auto as tqdm
+from transformers.models.auto.tokenization_auto import AutoTokenizer
+from transformers.tokenization_utils_base import PreTrainedTokenizerBase
+from typing_extensions import Self
+from wandb.sdk.wandb_run import Run
+from weave.trace.weave_client import WeaveClient
 
 from art.utils.deploy_model import (
     LoRADeploymentJob,
@@ -15,44 +31,31 @@ from art.utils.output_dirs import (
     get_step_checkpoint_dir,
     get_trajectories_split_dir,
 )
+from art.utils.s3 import (
+    ExcludableOption,
+    pull_model_from_s3,
+    push_model_to_s3,
+)
 from art.utils.trajectory_logging import serialize_trajectory_groups
-from mp_actors import move_to_child_process
-import numpy as np
-import os
-import polars as pl
-import subprocess
-import torch
-from transformers.models.auto.tokenization_auto import AutoTokenizer
-from transformers.tokenization_utils_base import PreTrainedTokenizerBase
-from tqdm import auto as tqdm
-from typing import AsyncIterator, cast, Literal
-import wandb
-from wandb.sdk.wandb_run import Run
-import weave
-from weave.trace.weave_client import WeaveClient
+from mp_actors import close_proxy, move_to_child_process
 
 from .. import dev
 from ..backend import Backend
 from ..model import Model, TrainableModel
-from .service import ModelService
 from ..trajectories import Trajectory, TrajectoryGroup
 from ..types import Message, TrainConfig
 from ..utils import format_message, get_model_step
-from .pack import (
-    packed_tensors_from_tokenized_results,
-    packed_tensors_to_dir,
-    PackedTensors,
-    plot_packed_tensors,
-)
-from .tokenize import tokenize_trajectory_groups
 from .checkpoints import (
     delete_checkpoints,
 )
-from art.utils.s3 import (
-    pull_model_from_s3,
-    push_model_to_s3,
-    ExcludableOption,
+from .pack import (
+    PackedTensors,
+    packed_tensors_from_tokenized_results,
+    packed_tensors_to_dir,
+    plot_packed_tensors,
 )
+from .service import ModelService
+from .tokenize import tokenize_trajectory_groups
 
 
 class LocalBackend(Backend):
@@ -78,20 +81,26 @@ class LocalBackend(Backend):
         self._wandb_runs: dict[str, Run] = {}
         self._weave_clients: dict[str, WeaveClient] = {}
 
-    def __enter__(self):
+    def __enter__(self) -> Self:
         return self
 
-    def __exit__(self, *excinfo):
-        self.close()
+    def __exit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc: BaseException | None,
+        tb: TracebackType | None,
+    ) -> None:
+        self._close()
 
-    def close(self):
+    async def close(self) -> None:
         """
         If running vLLM in a separate process, this will kill that process and close the communication threads.
         """
+        self._close()
+
+    def _close(self) -> None:
         for _, service in self._services.items():
-            close_method = getattr(service, "close", None)
-            if callable(close_method):
-                close_method()
+            close_proxy(service)
 
     async def register(
         self,
@@ -113,10 +122,10 @@ class LocalBackend(Backend):
             _ = self._get_wandb_run(model)
 
     async def _get_service(self, model: TrainableModel) -> ModelService:
-        from ..torchtune.service import TorchtuneService
-        from ..unsloth.service import UnslothService
-        from ..unsloth.decoupled_service import DecoupledUnslothService
         from ..dev.get_model_config import get_model_config
+        from ..torchtune.service import TorchtuneService
+        from ..unsloth.decoupled_service import DecoupledUnslothService
+        from ..unsloth.service import UnslothService
 
         if model.name not in self._services:
             config = get_model_config(
@@ -217,8 +226,11 @@ class LocalBackend(Backend):
     async def _get_step(self, model: TrainableModel) -> int:
         return self.__get_step(model)
 
-    def __get_step(self, model: TrainableModel) -> int:
-        return get_model_step(model, self._path)
+    def __get_step(self, model: Model) -> int:
+        if isinstance(model, TrainableModel):
+            return get_model_step(model, self._path)
+        # Non-trainable models do not have checkpoints/steps; default to 0
+        return 0
 
     async def _delete_checkpoints(
         self,
@@ -505,14 +517,16 @@ class LocalBackend(Backend):
     async def _experimental_pull_from_s3(
         self,
         model: Model,
-        step: int | None = None,
+        *,
         s3_bucket: str | None = None,
         prefix: str | None = None,
         verbose: bool = False,
         delete: bool = False,
+        only_step: int | Literal["latest"] | None = None,
+        # LocalBackend extensions (not part of the base interface)
+        step: int | None = None,
         exclude: list[ExcludableOption] | None = None,
         latest_only: bool = False,
-        only_step: int | Literal["latest"] | None = None,
     ) -> None:
         """Download the model directory from S3 into local Backend storage. Right now this can be used to pull trajectory logs for processing or model checkpoints.
         Args:
@@ -575,6 +589,7 @@ class LocalBackend(Backend):
     async def _experimental_push_to_s3(
         self,
         model: Model,
+        *,
         s3_bucket: str | None = None,
         prefix: str | None = None,
         verbose: bool = False,

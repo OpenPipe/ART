@@ -1,9 +1,10 @@
-from dotenv import load_dotenv
 import random
-from typing import TypedDict
 import string
 import xml.etree.ElementTree as ET
 from enum import Enum
+from typing import TypedDict
+
+from dotenv import load_dotenv
 
 load_dotenv()
 

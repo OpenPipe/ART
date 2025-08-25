@@ -1,7 +1,8 @@
-from art_e.rollout import ProjectTrajectory
-import art
 import weave
+from art_e.rollout import ProjectTrajectory
 from weave.trace.autopatch import AutopatchSettings
+
+import art
 
 
 def report_trajectory(

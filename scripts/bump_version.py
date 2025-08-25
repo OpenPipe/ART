@@ -9,9 +9,9 @@ Usage:
 """
 
 import re
+import subprocess
 import sys
 from pathlib import Path
-import subprocess
 
 
 def get_current_version():

@@ -14,6 +14,22 @@ By allowing an LLM to make multiple attempts at accomplishing a task and scoring
 
 </Accordion>
 
+<Accordion title="Can I start RL from an existing SFT LoRA adapter?">
+  Yes. If you have a standard Hugging Face–style LoRA adapter directory (e.g., produced by Unsloth/PEFT), pass the adapter folder path as the `base_model` when creating your `TrainableModel`.
+
+```python
+import art
+
+model = art.TrainableModel(
+    name="agent-001",
+    project="my-agentic-task",
+    base_model="/path/to/my_sft_lora_adapter",  # HF-style adapter dir
+)
+```
+
+ART will load the adapter as the initial checkpoint and proceed with RL updates from there.
+</Accordion>
+
 <Accordion title="How does ART work under the hood?">
   This flow chart shows a highly simplified flow of how ART optimizes your agent. Your code is responsible for actually running the agent in the environment it will operate in, as well as scoring the trajectory (deciding whether the agent did a good job or not). ART is then able to take those trajectories and scores and use them to iteratively train your agent and improve performance.
 

@@ -1,7 +1,8 @@
-from art_e.data.types_enron import SyntheticQuery
-from typing import List, Optional, Literal
-from datasets import load_dataset
 import random
+from typing import List, Literal, Optional
+
+from art_e.data.types_enron import SyntheticQuery
+from datasets import load_dataset
 
 # Define the Hugging Face repository ID
 HF_REPO_ID = "corbt/enron_emails_sample_questions"

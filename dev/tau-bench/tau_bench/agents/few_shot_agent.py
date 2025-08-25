@@ -2,12 +2,13 @@
 
 import json
 import random
+from typing import Any, Dict, List, Optional
+
 from litellm import acompletion
-from typing import List, Optional, Dict, Any
 
 from tau_bench.agents.base import Agent
 from tau_bench.envs.base import Env
-from tau_bench.types import SolveResult, Action, RESPOND_ACTION_NAME
+from tau_bench.types import RESPOND_ACTION_NAME, Action, SolveResult
 
 
 class FewShotToolCallingAgent(Agent):

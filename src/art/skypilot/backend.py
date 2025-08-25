@@ -1,22 +1,22 @@
 import asyncio
-from typing import TYPE_CHECKING, cast
-import sky
 import os
-import semver
-from dotenv import dotenv_values
-from importlib.metadata import version, PackageNotFoundError
+from importlib.metadata import PackageNotFoundError, version
+from typing import TYPE_CHECKING, cast
 
-from .utils import (
-    is_task_created,
-    to_thread_typed,
-    wait_for_art_server_to_start,
-    get_art_server_base_url,
-    get_vllm_base_url,
-    get_task_job_id,
-)
+import semver
+import sky
+from dotenv import dotenv_values
 
 from .. import dev
 from ..backend import Backend
+from .utils import (
+    get_art_server_base_url,
+    get_task_job_id,
+    get_vllm_base_url,
+    is_task_created,
+    to_thread_typed,
+    wait_for_art_server_to_start,
+)
 
 if TYPE_CHECKING:
     from ..model import Model, TrainableModel
@@ -25,6 +25,7 @@ if TYPE_CHECKING:
 class SkyPilotBackend(Backend):
     _cluster_name: str
     _envs: dict[str, str]
+    _art_server_job_id: str | None
 
     @classmethod
     async def initialize_cluster(
@@ -109,6 +110,8 @@ class SkyPilotBackend(Backend):
                 )
             )
             resources = clusters[0]["handle"].launched_resources
+            if resources is None:
+                raise ValueError("Cluster handle has no launched resources")
 
             # For some reason, skypilot doesn't support the region and zone set
             resources = resources.copy(region=None, zone=None)

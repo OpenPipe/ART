@@ -10,15 +10,14 @@
 import os
 import sys
 import time
-
 from functools import partial
-from typing import Any, Optional, Union
+from typing import Any, Optional, Union, cast
 from warnings import warn
 
-from omegaconf import DictConfig, OmegaConf
-from pydantic import ValidationError
 import setproctitle
 import torch
+from omegaconf import DictConfig, OmegaConf
+from pydantic import ValidationError
 from torch.distributed import destroy_process_group, init_process_group
 from torch.distributed.device_mesh import DeviceMesh
 from torch.distributed.fsdp import FSDPModule
@@ -31,24 +30,24 @@ from torchtune.modules import TransformerDecoder
 from torchtune.modules.moe import utils as moe_utils
 from torchtune.recipe_interfaces import FTRecipeInterface
 from torchtune.training import (
-    DummyProfiler,
     VALID_BACKENDS_FOR_MEMORY_STATS,
+    DummyProfiler,
+    FullModelHFCheckpointer,
 )
 from torchtune.training.activations import apply_selective_activation_checkpointing
 from torchtune.training.checkpointing._checkpoint_client import (
     CheckpointClient,
     TrainingProgress,
 )
-from torchtune.training import FullModelHFCheckpointer
 from torchtune.training.memory import OptimizerInBackwardWrapper
 from torchtune.training.quantization import (
     convert_to_float8_training,
     is_fp8_tensorwise_scaling,
 )
 from tqdm import tqdm
-from typing import cast
 
-
+from .. import dev, types
+from ..local.pack import PackedTensors, packed_tensors_from_dir
 from .batch import Batch
 from .config import (
     CompileConfig,
@@ -57,8 +56,6 @@ from .config import (
     ProfilerConfig,
     RecipeConfig,
 )
-from .. import dev, types
-from ..local.pack import PackedTensors, packed_tensors_from_dir
 
 
 class FullFinetuneRecipeDistributed(FTRecipeInterface):
@@ -322,7 +319,7 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
                 "Are you sure you passed in the right recipe checkpoint?"
             ) from e
 
-    def setup(self, cfg: RecipeConfig) -> None:
+    def setup(self, *, cfg: RecipeConfig, **kwargs: Any) -> None:
         """
         Setup the recipe. This includes training state (if resume_from_checkpoint is True),
         model, optimizer, and metric logger.
@@ -706,10 +703,10 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
         dev_config: dev.TrainConfig,
         return_new_logprobs: bool = False,
     ) -> torch.Tensor:
-        from ..unsloth.train import shift_tensor
-
         import torch
-        from torch.nn.attention.flex_attention import create_block_mask, BlockMask
+        from torch.nn.attention.flex_attention import BlockMask, create_block_mask
+
+        from ..unsloth.train import shift_tensor
 
         def make_block_mask(
             group_ids: torch.Tensor,  # [B, S]  int32/64
@@ -846,6 +843,7 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
 
         selected_logits = torch.zeros_like(old_logprobs)
         new_logprobs = torch.zeros_like(old_logprobs)
+        logits: torch.Tensor | None = None
 
         for start in range(0, hidden_states.size(0), chunk_size):
             end = min(start + chunk_size, hidden_states.size(0))
@@ -857,7 +855,9 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
                 logits, dim=-1
             )
 
-        del hidden_states, logits
+        del hidden_states
+        if logits is not None:
+            del logits
 
         if return_new_logprobs:
             return torch.nn.functional.pad(new_logprobs[:-1], (1, 0), value=0.0)
@@ -880,7 +880,7 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
 
         return loss
 
-    def train(self) -> None:
+    def train(self, *args: Any, **kwargs: Any) -> None:
         """
         The core training loop.
         """
@@ -940,6 +940,7 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
 
                 # Optimizer step (if not fused in backward call)
                 if (idx + 1) % self._gradient_accumulation_steps == 0:
+                    grad_norm: float | torch.Tensor | None = None
                     if not self._optimizer_in_bwd:
                         if self.is_distributed:
                             # Get total number of tokens across all ranks to normalize gradients
@@ -1011,8 +1012,16 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
                             log_dict.update(
                                 training.get_memory_stats(device=self._device)
                             )
-                        if self._clip_grad_norm is not None:
-                            log_dict.update({"grad_norm": grad_norm})
+                        if self._clip_grad_norm is not None and grad_norm is not None:
+                            log_dict.update(
+                                {
+                                    "grad_norm": (
+                                        float(grad_norm)
+                                        if not isinstance(grad_norm, torch.Tensor)
+                                        else float(grad_norm.detach().item())
+                                    )
+                                }
+                            )
                         log_dict["num_gradient_steps"] = (
                             len(micro_batches) // self._gradient_accumulation_steps
                         )
@@ -1057,9 +1066,10 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
 
     def _get_micro_batches(self, curr_epoch: int) -> tuple[list[PackedTensors], Batch]:
         import math
-        from pathlib import Path
-        from safetensors.torch import save_file
         import time
+        from pathlib import Path
+
+        from safetensors.torch import save_file
 
         while True:
             with open(f"{self._output_dir}/batches.jsonl", "r") as f:
@@ -1299,7 +1309,7 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
             f"Completed move to {device} in {move_time:.2f} seconds",
         )
 
-    def cleanup(self) -> None:
+    def cleanup(self, *args: Any, **kwargs: Any) -> None:
         if self._is_rank_zero:
             self._metric_logger.close()
         destroy_process_group()

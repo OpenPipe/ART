@@ -1,12 +1,12 @@
-import os
 import copy
 import json
+import os
 
 from art.utils.old_benchmarking.calculate_step_metrics import calculate_step_std_dev
 from art.utils.old_benchmarking.types import (
-    BenchmarkedModelStep,
-    BenchmarkedModelKey,
     BenchmarkedModel,
+    BenchmarkedModelKey,
+    BenchmarkedModelStep,
 )
 from art.utils.output_dirs import (
     get_output_dir_from_model_properties,

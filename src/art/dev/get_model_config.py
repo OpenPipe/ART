@@ -1,9 +1,8 @@
 import torch
 
 from .engine import EngineArgs
-from .model import InitArgs, PeftArgs, TrainerArgs
+from .model import InitArgs, InternalModelConfig, PeftArgs, TrainerArgs
 from .torchtune import TorchtuneArgs
-from .model import InternalModelConfig
 
 
 def get_model_config(

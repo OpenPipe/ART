@@ -1,13 +1,13 @@
 import argparse
 import asyncio
 import os
+
 from dotenv import load_dotenv
 
 import art
 from art.utils.deploy_model import deploy_model
 from art.utils.get_model_step import get_model_step
 from art.utils.s3 import pull_model_from_s3
-
 
 load_dotenv()
 

@@ -2,22 +2,23 @@ import asyncio
 import json
 import random
 import sqlite3
+from dataclasses import asdict, dataclass
 from datetime import datetime, timedelta
-from dataclasses import dataclass, asdict
-from typing import List, Dict, Any, Coroutine
+from typing import Any, Coroutine, Dict, List
 
 import litellm
-from litellm.caching.caching import LiteLLMCacheType, Cache
-from dotenv import load_dotenv
-from pydantic import BaseModel, ValidationError
-from huggingface_hub import create_repo
 from datasets import Dataset, DatasetDict, Features, Sequence, Value
-from tqdm.asyncio import tqdm
+from dotenv import load_dotenv
+from huggingface_hub import create_repo
+from litellm.caching.caching import Cache, LiteLLMCacheType
 
 # External references in your original script
 from local_email_db import DEFAULT_DB_PATH
-from test_and_train_inboxes import train_inboxes, test_inboxes
+from pydantic import BaseModel, ValidationError
+from test_and_train_inboxes import test_inboxes, train_inboxes
+from tqdm.asyncio import tqdm
 from types_enron import SyntheticQuery
+
 from art.utils import limit_concurrency
 
 litellm.cache = Cache(type=LiteLLMCacheType.DISK)

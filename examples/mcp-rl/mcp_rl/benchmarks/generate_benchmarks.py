@@ -1,23 +1,24 @@
-import art
-from art.local import LocalBackend
-from dotenv import load_dotenv
-import random
-import asyncio
-import os
-import json
-from typing import List
-import weave
 import argparse
+import asyncio
+import json
+import os
+import random
+from typing import List
 
-from art.rewards.ruler import ruler_score_group
-
-from ..rollout import McpScenario, rollout
+import weave
+from dotenv import load_dotenv
 from servers.python.mcp_alphavantage.server_params import (
     server_params as alphavantage_server_params,
 )
 from servers.python.mcp_balldontlie.server_params import (
     server_params as balldontlie_server_params,
 )
+
+import art
+from art.local import LocalBackend
+from art.rewards.ruler import ruler_score_group
+
+from ..rollout import McpScenario, rollout
 
 load_dotenv()
 

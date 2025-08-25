@@ -1,23 +1,22 @@
 # Copyright Sierra
-import warnings
-
-import os
 import json
+import multiprocessing
+import os
 import random
 import traceback
-from math import comb
-import multiprocessing
-from typing import List, Dict, Any
-from datetime import datetime
+import warnings
 from concurrent.futures import ThreadPoolExecutor
-
-from tau_bench.envs import get_env
-from tau_bench.agents.base import Agent
-from tau_bench.types import EnvRunResult, RunConfig
-from litellm import provider_list
-from tau_bench.envs.user import UserStrategy
+from datetime import datetime
+from math import comb
+from typing import Any, Dict, List
 
 from langfuse import Langfuse
+from litellm import provider_list
+
+from tau_bench.agents.base import Agent
+from tau_bench.envs import get_env
+from tau_bench.envs.user import UserStrategy
+from tau_bench.types import EnvRunResult, RunConfig
 
 warnings.filterwarnings(
     "ignore",

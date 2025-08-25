@@ -1,33 +1,34 @@
-from aiolimiter import AsyncLimiter
-import art
 import asyncio
-from grpclib.exceptions import StreamTerminatedError
-from http.client import RemoteDisconnected
 import json
-from langfuse.decorators import observe
-import modal
+from http.client import RemoteDisconnected
 from pathlib import Path
-from pydantic import BaseModel
+from typing import Any, Literal, overload
+
+import modal
 import requests
+from aiolimiter import AsyncLimiter
+from config import get_config
+from eval import eval_instance
+from grpclib.exceptions import StreamTerminatedError
+from instances import Instance
+from langfuse.decorators import observe
+from logs import setup_agent_logger
+from pydantic import BaseModel
 from requests import adapters as requests_adapters
-from requests.exceptions import ConnectTimeout, ConnectionError, SSLError
+from requests.exceptions import ConnectionError, ConnectTimeout, SSLError
+from run import run
 from sweagent.agent.agents import DefaultAgent, DefaultAgentConfig
 from sweagent.run.hooks.abstract import RunHook
 from sweagent.run.run_replay import RunReplay
 from sweagent.run.run_single import RunSingle, RunSingleConfig
 from sweagent.types import AgentRunResult
-from swebench.harness.modal_eval.run_evaluation_modal import app, run_instance_modal
-from swebench.harness.test_spec.test_spec import make_test_spec
 from swerex.deployment.modal import ModalDeployment
 from swerex.exceptions import CommandTimeoutError, SwerexException
-from typing import Any, Literal, overload
 from urllib3.exceptions import ProtocolError
 
-from config import get_config
-from eval import eval_instance
-from logs import setup_agent_logger
-from instances import Instance
-from run import run
+import art
+from swebench.harness.modal_eval.run_evaluation_modal import app, run_instance_modal
+from swebench.harness.test_spec.test_spec import make_test_spec
 
 limiter = AsyncLimiter(max_rate=5, time_period=1)
 

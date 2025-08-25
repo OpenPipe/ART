@@ -1,11 +1,12 @@
 # Copyright Sierra
 
+from typing import Optional, Union
+
 from tau_bench.envs.base import Env
 from tau_bench.envs.retail.data import load_data
 from tau_bench.envs.retail.rules import RULES
 from tau_bench.envs.retail.tools import ALL_TOOLS
 from tau_bench.envs.retail.wiki import WIKI
-from typing import Optional, Union
 from tau_bench.envs.user import UserStrategy
 
 

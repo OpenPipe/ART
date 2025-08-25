@@ -1,21 +1,22 @@
-import art
-import openai
-from openai.types.chat import ChatCompletion
-import time
 import math
 import os
-from dotenv import load_dotenv
-from pydantic import BaseModel
-from openpipe.client import OpenPipe
+import time
 
+import openai
+from dotenv import load_dotenv
 from game_utils import (
     TicTacToeGame,
-    generate_game,
     apply_agent_move,
     check_winner,
+    generate_game,
     render_board,
     unwrap_move,
 )
+from openai.types.chat import ChatCompletion
+from openpipe.client import OpenPipe
+from pydantic import BaseModel
+
+import art
 from art.guided_completion import get_guided_completion_params
 
 load_dotenv()

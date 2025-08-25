@@ -1,7 +1,6 @@
 import random
-from typing import TypedDict
-from typing import Literal
 import xml.etree.ElementTree as ET
+from typing import Literal, TypedDict
 
 
 class TicTacToeGame(TypedDict):

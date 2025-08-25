@@ -1,6 +1,6 @@
 from typing import Literal, TypedDict
-from typing_extensions import Required
 
+from typing_extensions import Required
 
 # Update from torchtune.models.{model_family}.__init__.py files
 # Only include argument-less TransformerDecoder factory functions

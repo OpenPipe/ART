@@ -1,14 +1,14 @@
 import asyncio
-import pydantic
-import traceback
-from typing import Awaitable, Any, cast, Iterable, Iterator, overload
-from openai.types.chat.chat_completion import Choice
-from .types import Messages, MessagesAndChoices, Tools
 import time
+import traceback
 from contextlib import asynccontextmanager
-from typing import AsyncGenerator
 from datetime import datetime
+from typing import Any, AsyncGenerator, Awaitable, Iterable, Iterator, cast, overload
 
+import pydantic
+from openai.types.chat.chat_completion import Choice
+
+from .types import Messages, MessagesAndChoices, Tools
 
 MetadataValue = float | int | str | bool | None
 
@@ -152,7 +152,7 @@ class TrajectoryGroup(pydantic.BaseModel):
             ],
         )
 
-    def __iter__(self) -> Iterator[Trajectory]:
+    def __iter__(self) -> Iterator[Trajectory]:  # type: ignore[override]
         return iter(self.trajectories)
 
     def __len__(self) -> int:

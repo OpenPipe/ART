@@ -125,6 +125,7 @@ async def migrate_s3_checkpoints_to_new_structure(
         dry_run: If True, only print what would be done without making changes.
     """
     import os
+
     from .s3 import build_s3_path
 
     if s3_bucket is None:

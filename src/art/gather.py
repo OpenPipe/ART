@@ -1,11 +1,12 @@
 import asyncio
-import contextvars
 import contextlib
+import contextvars
 from collections import Counter
 from dataclasses import dataclass, field
+from typing import Awaitable, Callable, Iterable, Iterator, Literal, overload
+
 from openai.types.chat.chat_completion import Choice
 from tqdm import auto as tqdm
-from typing import Awaitable, Iterable, Iterator, Literal, overload, Callable
 
 from .trajectories import Trajectory, TrajectoryGroup
 

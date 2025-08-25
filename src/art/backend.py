@@ -1,7 +1,8 @@
-import httpx
 import json
+from typing import TYPE_CHECKING, AsyncIterator, Literal
+
+import httpx
 from tqdm import auto as tqdm
-from typing import AsyncIterator, TYPE_CHECKING, Literal
 
 from art.utils import log_http_errors
 from art.utils.deploy_model import LoRADeploymentJob, LoRADeploymentProvider
@@ -227,7 +228,7 @@ class Backend:
     async def _experimental_deploy(
         self,
         deploy_to: LoRADeploymentProvider,
-        model: "Model",
+        model: "TrainableModel",
         step: int | None = None,
         s3_bucket: str | None = None,
         prefix: str | None = None,
