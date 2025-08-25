@@ -68,16 +68,29 @@
         ]
       },
       {
+        "group": "Integrations",
+        "pages": [
+          "integrations/langgraph-integration"
+        ]
+      },
+      {
         "group": "Tutorials",
-        "pages": ["tutorials/summarizer"]
+        "pages": [
+          "tutorials/summarizer"
+        ]
       },
       {
         "group": "Resources",
-        "pages": ["resources/models", "resources/glossary"]
+        "pages": [
+          "resources/models",
+          "resources/glossary"
+        ]
       },
       {
         "group": "Experimental",
-        "pages": ["experimental/gspo"]
+        "pages": [
+          "experimental/gspo"
+        ]
       }
     ]
   },

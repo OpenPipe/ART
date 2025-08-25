@@ -30,7 +30,7 @@ backend = [
     "setproctitle>=1.3.6",
     "tblib>=3.0.0",
     "setuptools>=78.1.0",
-    "wandb>=0.19.8",
+    "wandb==0.21.0",
     "polars>=1.26.0",
     "transformers==4.53.2",
     "trl==0.20.0",

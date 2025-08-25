@@ -1,0 +1,228 @@
+---
+title: "🦜🔗 LangGraph"
+description: "Build and train sophisticated AI agents using LangGraph with ART's reinforcement learning"
+---
+
+# LangGraph Integration
+
+ART's LangGraph integration enables you to build sophisticated, multi-step AI agents that learn and improve through reinforcement training. By combining LangGraph's powerful agent framework with ART's training capabilities, you can create agents that reason, use tools, and adapt their behavior over time.
+
+## Why Use ART with LangGraph?
+
+LangGraph provides an excellent framework for building ReAct-style agents that can reason through complex tasks step-by-step. However, getting these agents to perform optimally often requires extensive prompt engineering and manual tuning. ART's integration with LangGraph addresses this by:
+
+- **Automatic behavior improvement**: Train your agents to get better at multi-step reasoning without manual prompt tuning
+- **Tool usage optimization**: Learn when and how to use tools more effectively through reinforcement learning
+- **Adaptive decision making**: Agents learn to make better choices about which actions to take in different situations
+- **Scalable training**: Train on diverse scenarios to build robust, generalizable agent behaviors
+
+## Key Features
+
+- **Seamless integration**: Drop-in replacement for LangGraph's LLM initialization
+- **Automatic logging**: Captures all agent interactions for training data generation
+- **Multi-step trajectory support**: Handles complex agent workflows with tool calls and reasoning steps
+- **RULER compatibility**: Use ART's general-purpose reward function to train agents without hand-crafted rewards
+
+## Basic Usage
+
+Here's how to integrate ART with your existing LangGraph agent:
+
+```python
+import art
+from art.langgraph import wrap_rollout, init_chat_model
+from art.local import LocalBackend
+from langgraph import create_react_agent
+
+# Define your tools
+def search_inbox(query: str) -> str:
+    """Search for emails matching the query."""
+    # Your search implementation
+    return f"Found emails matching: {query}"
+
+def read_email(email_id: str) -> str:
+    """Read a specific email by ID."""
+    # Your email reading implementation
+    return f"Email content for {email_id}"
+
+tools = [search_inbox, read_email]
+
+async def train_email_agent():
+    with LocalBackend() as backend:
+        # Create your trainable model
+        model = art.TrainableModel(
+            name="email-agent-langgraph",
+            project="email-search-agent",
+            base_model="Qwen/Qwen2.5-7B-Instruct",
+        )
+
+        await backend.register_model(model)
+
+        # Define your rollout function
+        @wrap_rollout(model)
+        async def run_agent(scenario: str) -> art.Trajectory:
+            # Create the LangGraph agent with ART's LLM wrapper
+            agent = create_react_agent(init_chat_model(), tools)
+
+            # Run the agent
+            result = await agent.ainvoke({"messages": [("user", scenario)]})
+
+            # Return trajectory (automatically captured by wrap_rollout)
+            return art.Trajectory()
+
+        # Generate training data
+        scenarios = [
+            "Find emails from John about the quarterly report",
+            "Search for emails containing budget discussions from last week",
+            "Find the latest email from Sarah and summarize it",
+        ]
+
+        for scenario in scenarios:
+            await run_agent(scenario)
+
+        # Start training with RULER
+        await art.train(model, reward_function="ruler")
+
+if __name__ == "__main__":
+    import asyncio
+    asyncio.run(train_email_agent())
+```
+
+## How It Works
+
+The ART-LangGraph integration works through two main components:
+
+### 1. LLM Wrapper (`init_chat_model`)
+
+Replaces LangGraph's standard LLM initialization with ART's logging-enabled wrapper:
+
+```python
+# Standard LangGraph
+from langchain_openai import ChatOpenAI
+llm = ChatOpenAI(model="gpt-4")
+
+# With ART integration
+from art.langgraph import init_chat_model
+llm = init_chat_model()  # Automatically uses your model's inference settings
+```
+
+The wrapper captures all LLM interactions, including:
+
+- Input messages and prompts
+- Generated responses and tool calls
+- Tool execution results
+- Multi-step reasoning chains
+
+### 2. Rollout Wrapper (`wrap_rollout`)
+
+Automatically converts your agent execution into ART trajectories:
+
+```python
+@wrap_rollout(model)
+async def run_agent(scenario: str) -> art.Trajectory:
+    # Your agent logic here
+    agent = create_react_agent(init_chat_model(), tools)
+    result = await agent.ainvoke({"messages": [("user", scenario)]})
+    return art.Trajectory()  # Automatically populated from logs
+```
+
+The wrapper:
+
+- Creates unique execution threads for each agent run
+- Logs all intermediate steps and tool calls
+- Converts LangGraph messages to ART's training format
+- Handles complex multi-turn conversations automatically
+
+## Advanced Example: Email Search Agent
+
+Here's a more complete example of training an email search agent:
+
+```python
+import art
+from art.langgraph import wrap_rollout, init_chat_model
+from art.local import LocalBackend
+from langgraph import create_react_agent
+from typing import List
+
+def search_inbox(query: str, limit: int = 5) -> str:
+    """Search emails with improved functionality."""
+    # Simulate email search with realistic results
+    results = [
+        f"Email {i}: Subject matching '{query}' from user@example.com"
+        for i in range(min(limit, 3))
+    ]
+    return "\n".join(results) if results else "No emails found."
+
+def read_email(email_id: str) -> str:
+    """Read email with error handling."""
+    if not email_id.isdigit():
+        return "Error: Invalid email ID format"
+    return f"Email {email_id}: [Email content here...]"
+
+def return_final_answer(answer: str) -> str:
+    """Return the final answer to the user."""
+    return f"Final Answer: {answer}"
+
+tools = [search_inbox, read_email, return_final_answer]
+
+async def train_advanced_email_agent():
+    with LocalBackend() as backend:
+        model = art.TrainableModel(
+            name="advanced-email-agent",
+            project="email-agents",
+            base_model="Qwen/Qwen2.5-7B-Instruct",
+        )
+
+        await backend.register_model(model)
+
+        @wrap_rollout(model)
+        async def run_email_agent(scenario: str) -> art.Trajectory:
+            agent = create_react_agent(init_chat_model(), tools)
+
+            result = await agent.ainvoke({
+                "messages": [("user", scenario)]
+            })
+
+            return art.Trajectory()
+
+        # Diverse training scenarios
+        scenarios = [
+            "Find the most recent email from the finance team about Q4 budget",
+            "Search for emails containing 'meeting' and summarize the key points",
+            "Look for urgent emails from management and provide a brief overview",
+            "Find emails about project deadlines and list them by priority",
+        ]
+
+        # Generate training trajectories
+        for scenario in scenarios:
+            trajectory = await run_email_agent(scenario)
+            print(f"Generated trajectory for: {scenario}")
+
+        # Train with RULER
+        await art.train(model, reward_function="ruler")
+
+if __name__ == "__main__":
+    import asyncio
+    asyncio.run(train_advanced_email_agent())
+```
+
+## Best Practices
+
+### Agent Design
+
+- **Clear tool descriptions**: Ensure your tool functions have descriptive docstrings
+- **Error handling**: Include proper error handling in your tools for robust training
+- **Final answer pattern**: Use a dedicated tool for returning final answers to users
+
+### Training Data
+
+- **Diverse scenarios**: Create varied training scenarios that cover different use cases
+- **Realistic complexity**: Include both simple and complex multi-step tasks
+- **Edge cases**: Add scenarios that test error handling and edge cases
+
+### Performance Optimization
+
+- **Tool efficiency**: Optimize tool execution time since it affects training speed
+- **Batch generation**: Generate multiple trajectories efficiently using async patterns
+- **Resource management**: Monitor memory usage during long training runs
+
+The ART-LangGraph integration makes it straightforward to build and train sophisticated AI agents that improve their performance over time, turning your prototype agents into production-ready intelligent systems.
