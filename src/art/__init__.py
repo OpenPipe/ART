@@ -17,6 +17,7 @@ if os.environ.get("IMPORT_PEFT", "0") == "1":
     os.environ["PYTORCH_CUDA_ALLOC_CONF"] = ",".join(conf)
 
 from . import dev
+from .auto_trajectory import auto_trajectory, capture_auto_trajectory
 from .backend import Backend
 from .batches import trajectory_group_batches
 from .gather import gather_trajectories, gather_trajectory_groups
@@ -24,9 +25,12 @@ from .model import Model, TrainableModel
 from .trajectories import Trajectory, TrajectoryGroup
 from .types import Messages, MessagesAndChoices, Tools, TrainConfig
 from .utils import retry
+from .yield_trajectory import capture_yielded_trajectory, yield_trajectory
 
 __all__ = [
     "dev",
+    "auto_trajectory",
+    "capture_auto_trajectory",
     "gather_trajectories",
     "gather_trajectory_groups",
     "trajectory_group_batches",
@@ -40,4 +44,6 @@ __all__ = [
     "TrainConfig",
     "Trajectory",
     "TrajectoryGroup",
+    "capture_yielded_trajectory",
+    "yield_trajectory",
 ]

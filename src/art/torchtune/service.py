@@ -16,7 +16,7 @@ from vllm import AsyncEngineArgs
 from vllm.v1.engine.async_llm import AsyncLLM
 
 from .. import dev, types
-from ..local.pack import DiskPackedTensors
+from ..preprocessing.pack import DiskPackedTensors
 from ..vllm import get_llm, get_worker, openai_server_task, run_on_workers
 from .batch import Batch
 
@@ -27,6 +27,7 @@ class TorchtuneService:
     base_model: str
     config: dev.InternalModelConfig
     output_dir: str
+    _is_sleeping: bool = False
 
     async def start_openai_server(self, config: dev.OpenAIServerConfig | None) -> None:
         await openai_server_task(
@@ -38,6 +39,9 @@ class TorchtuneService:
                 config=config,
             ),
         )
+
+    async def vllm_engine_is_sleeping(self) -> bool:
+        return self._is_sleeping
 
     async def train(
         self,
@@ -73,6 +77,7 @@ class TorchtuneService:
             if set(pids.values()) == {2}:
                 break
             await asyncio.sleep(0.25)
+        self._is_sleeping = True
         # acquire the train process and queue
         train_process = await self.train_process
         train_queue = await self.train_queue
@@ -110,6 +115,7 @@ class TorchtuneService:
             num_gradient_steps -= 1
         # wait for the workers to wake up
         await sleep_task
+        self._is_sleeping = False
         # update the weights after wake up if async_weight_syncing is enabled
         if async_weight_syncing:
             asyncio.create_task(self.update_worker_weights(llm, weights_path, verbose))

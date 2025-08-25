@@ -37,6 +37,7 @@ class SkyPilotBackend(Backend):
         art_version: str | None = None,
         env_path: str | None = None,
         force_restart: bool = False,
+        tail_logs: bool = True,
     ) -> "SkyPilotBackend":
         self = cls.__new__(cls)
         self._cluster_name = cluster_name
@@ -146,14 +147,15 @@ class SkyPilotBackend(Backend):
         # Manually call the real __init__ now that base_url is ready
         super(cls, self).__init__(base_url=base_url)
 
-        if self._art_server_job_id is not None:
-            asyncio.create_task(
-                asyncio.to_thread(
-                    sky.tail_logs,
-                    cluster_name=self._cluster_name,
-                    job_id=self._art_server_job_id,
-                    follow=True,
-                )
+        if self._art_server_job_id is not None and tail_logs:
+            await asyncio.to_thread(
+                sky.tail_logs,
+                cluster_name=self._cluster_name,
+                job_id=self._art_server_job_id,
+                follow=True,
+            )
+            print(
+                "Tailing logs. This process will only automatically exit after the backend is down. To exit before then, you'll have to manually close the process (e.g. ctrl+C)."
             )
         return self
 

@@ -1,5 +1,4 @@
 import asyncio
-import gc
 import os
 from contextlib import asynccontextmanager
 from dataclasses import replace
@@ -22,6 +21,7 @@ from vllm.worker.multi_step_model_runner import MultiStepModelRunner
 from vllm.worker.worker_base import WorkerWrapperBase
 
 from ..dev.model import InternalModelConfig
+from .train import gc_and_empty_cuda_cache
 
 if TYPE_CHECKING:
     from .service import TrainInputs
@@ -57,6 +57,8 @@ class ModelState:
         )
         if enable_sleep_mode:
             os.environ["PYTORCH_CUDA_ALLOC_CONF"] = ""
+        # We disable patching the v0 LoRA manager because it disables adapter loading
+        os.environ["UNSLOTH_DO_NOT_PATCH_V0_LRU_LORA_MANAGER"] = "1"
         # Initialize Unsloth model
         # NOTE: We have to patch empty_cache with a no-op during model initialization
         # to avoid an allocator error.
@@ -74,6 +76,7 @@ class ModelState:
             )
 
         AsyncLLMEngine.from_engine_args = _from_engine_args
+
         self.model, self.tokenizer = cast(
             tuple[CausallLM, PreTrainedTokenizerBase],
             unsloth.FastLanguageModel.from_pretrained(**config.get("init_args", {})),
@@ -161,17 +164,11 @@ class vLLMState:
                     # Reset prefix cache and discard KV cache
                     await self.async_engine.reset_prefix_cache()
                     await self.async_engine.sleep(level=2)
-                free_memory()
+                gc_and_empty_cuda_cache()
                 yield
             finally:
-                free_memory()
+                gc_and_empty_cuda_cache()
                 await asyncio.sleep(0.1)
                 await self.async_engine.wake_up()
         finally:
             await self.resume_engine()
-
-
-def free_memory() -> None:
-    for _ in range(3):
-        gc.collect()
-        torch.cuda.empty_cache()

@@ -56,6 +56,8 @@ class Model(
     name: str
     project: str
     config: ModelConfig
+    # Discriminator field for FastAPI serialization
+    trainable: bool = False
 
     # --- Inference connection information (populated automatically for
     #     TrainableModel or set manually for prompted / comparison models) ---
@@ -122,9 +124,14 @@ class Model(
     ) -> "Model[ModelConfig] | Model[None]":
         return super().__new__(cls)
 
-    @property
-    def trainable(self) -> bool:
-        return False
+    def safe_model_dump(self, *args, **kwargs) -> dict:
+        """
+        Dump the model, but remove the config field to prevent serialization errors in the backend.
+        """
+        data = super().model_dump(*args, **kwargs)
+        # remove config from dumped_model to prevent serialization errors
+        data["config"] = None
+        return data
 
     def backend(self) -> "Backend":
         if self._backend is None:
@@ -235,6 +242,8 @@ class Model(
 
 class TrainableModel(Model[ModelConfig], Generic[ModelConfig]):
     base_model: str
+    # Override discriminator field for FastAPI serialization
+    trainable: bool = True
 
     # The fields within `_internal_config` are unstable and subject to change.
     # Use at your own risk.
@@ -295,9 +304,14 @@ class TrainableModel(Model[ModelConfig], Generic[ModelConfig]):
         data["_internal_config"] = self._internal_config
         return data
 
-    @property
-    def trainable(self) -> bool:
-        return True
+    def safe_model_dump(self, *args, **kwargs) -> dict:
+        """
+        Dump the model, but remove the config field to prevent serialization errors in the backend.
+        """
+        data = self.model_dump(*args, **kwargs)
+        # remove config from dumped_model to prevent serialization errors
+        data["config"] = None
+        return data
 
     async def register(
         self,

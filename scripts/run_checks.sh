@@ -10,9 +10,17 @@ NC='\033[0m' # No Color
 
 # Parse command line arguments
 FIX_FLAG=""
-if [[ "$1" == "--fix" ]]; then
-    FIX_FLAG="--fix"
-fi
+VERBOSE_TEST_FAILURE=""
+for arg in "$@"; do
+    case $arg in
+        --fix)
+            FIX_FLAG="--fix"
+            ;;
+        --verbose-test-failure)
+            VERBOSE_TEST_FAILURE="true"
+            ;;
+    esac
+done
 
 echo "🔍 Running code quality checks..."
 echo
@@ -27,6 +35,7 @@ fi
 # Track if any checks fail
 CHECKS_PASSED=true
 TYPECHECK_FAILED=false
+TESTS_FAILED=false
 
 # Run format check
 echo "📝 Checking code formatting..."
@@ -75,7 +84,7 @@ echo
 # Run type checking (Pyright)
 echo "🧠 Running type checking..."
 TMP_PYRIGHT_JSON=$(mktemp)
-echo "  Running: uv run pyright --outputjson src"
+echo "  Running: uv run pyright --outputjson src tests"
 # Capture JSON output quietly regardless of success/failure
 if uv run pyright --outputjson src > "$TMP_PYRIGHT_JSON" 2>/dev/null; then
     : # success, continue
@@ -123,6 +132,84 @@ else
     fi
 fi
 rm -f "$TMP_PYRIGHT_JSON"
+echo
+
+# Run tests
+echo "🧪 Running unit tests..."
+echo "  Running: uv run pytest --nbval --current-env tests/unit"
+
+# Capture pytest output quietly to parse the summary
+PYTEST_OUTPUT=$(mktemp)
+if uv run pytest --nbval --current-env --tb=short tests/unit > "$PYTEST_OUTPUT" 2>&1; then
+    TEST_EXIT_CODE=0
+else
+    TEST_EXIT_CODE=$?
+fi
+
+# Extract the test summary line (e.g., "===== 5 passed, 2 failed, 1 skipped in 3.45s =====")
+# This regex captures various pytest summary formats
+TEST_SUMMARY=$(grep -E "^=+ .*(passed|failed|error|skipped|xfailed|xpassed|warning).*=+$" "$PYTEST_OUTPUT" | tail -1)
+
+if [[ -n "$TEST_SUMMARY" ]]; then
+    # Parse the summary to extract counts
+    PASSED=$(echo "$TEST_SUMMARY" | grep -oE "[0-9]+ passed" | grep -oE "[0-9]+" || echo "0")
+    FAILED=$(echo "$TEST_SUMMARY" | grep -oE "[0-9]+ failed" | grep -oE "[0-9]+" || echo "0")
+    ERRORS=$(echo "$TEST_SUMMARY" | grep -oE "[0-9]+ error" | grep -oE "[0-9]+" || echo "0")
+    SKIPPED=$(echo "$TEST_SUMMARY" | grep -oE "[0-9]+ skipped" | grep -oE "[0-9]+" || echo "0")
+    WARNINGS=$(echo "$TEST_SUMMARY" | grep -oE "[0-9]+ warning" | grep -oE "[0-9]+" || echo "0")
+    XFAILED=$(echo "$TEST_SUMMARY" | grep -oE "[0-9]+ xfailed" | grep -oE "[0-9]+" || echo "0")
+    XPASSED=$(echo "$TEST_SUMMARY" | grep -oE "[0-9]+ xpassed" | grep -oE "[0-9]+" || echo "0")
+    
+    # Build detailed summary
+    DETAILS=""
+    [[ "$PASSED" != "0" ]] && DETAILS="${DETAILS}Passed: $PASSED"
+    [[ "$FAILED" != "0" ]] && DETAILS="${DETAILS:+$DETAILS, }Failed: $FAILED"
+    [[ "$ERRORS" != "0" ]] && DETAILS="${DETAILS:+$DETAILS, }Errors: $ERRORS"
+    [[ "$SKIPPED" != "0" ]] && DETAILS="${DETAILS:+$DETAILS, }Skipped: $SKIPPED"
+    [[ "$XFAILED" != "0" ]] && DETAILS="${DETAILS:+$DETAILS, }XFailed: $XFAILED"
+    [[ "$XPASSED" != "0" ]] && DETAILS="${DETAILS:+$DETAILS, }XPassed: $XPASSED"
+    [[ "$WARNINGS" != "0" ]] && DETAILS="${DETAILS:+$DETAILS, }Warnings: $WARNINGS"
+    
+    # Check if there were any failures or errors
+    if [[ "$FAILED" == "0" && "$ERRORS" == "0" && $TEST_EXIT_CODE -eq 0 ]]; then
+        echo -e "${GREEN}✅ All tests passed${NC}"
+        [[ -n "$DETAILS" ]] && echo "  $DETAILS"
+    else
+        echo -e "${RED}❌ Tests failed${NC}"
+        [[ -n "$DETAILS" ]] && echo "  $DETAILS"
+        CHECKS_PASSED=false
+        TESTS_FAILED=true
+        
+        # If verbose test failure flag is set, dump full test output
+        if [[ -n "$VERBOSE_TEST_FAILURE" ]]; then
+            echo
+            echo "📋 Full test output:"
+            echo "───────────────────────────────────────────────────────────────"
+            cat "$PYTEST_OUTPUT"
+            echo "───────────────────────────────────────────────────────────────"
+        fi
+    fi
+else
+    # Fallback if we can't parse the summary
+    if [[ $TEST_EXIT_CODE -eq 0 ]]; then
+        echo -e "${GREEN}✅ All unit tests passed${NC}"
+    else
+        echo -e "${RED}❌ Some unit tests failed${NC}"
+        CHECKS_PASSED=false
+        TESTS_FAILED=true
+        
+        # If verbose test failure flag is set, dump full test output
+        if [[ -n "$VERBOSE_TEST_FAILURE" ]]; then
+            echo
+            echo "📋 Full test output:"
+            echo "───────────────────────────────────────────────────────────────"
+            cat "$PYTEST_OUTPUT"
+            echo "───────────────────────────────────────────────────────────────"
+        fi
+    fi
+fi
+
+rm -f "$PYTEST_OUTPUT"
 echo
 
 # Check if uv.lock is in sync with pyproject.toml
@@ -201,9 +288,20 @@ if $CHECKS_PASSED; then
 else
     echo -e "${RED}❌ Some checks failed${NC}"
     if [[ -z "$FIX_FLAG" ]]; then
+        # Show tips for each type of failure
         if $TYPECHECK_FAILED; then
             echo -e "💡 Tip: Type errors can't be auto-fixed by --fix. Re-run ${YELLOW}uv run pyright src${NC} to see full diagnostics."
-        else
+        fi
+        if $TESTS_FAILED; then
+            if [[ -z "$VERBOSE_TEST_FAILURE" ]]; then
+                echo -e "💡 Tip: Test failures can't be auto-fixed by --fix. Re-run ${YELLOW}uv run pytest --nbval --current-env tests/unit${NC} to see full test output."
+                echo -e "        Or use ${YELLOW}./scripts/run_checks.sh --verbose-test-failure${NC} to see full output on failure."
+            else
+                echo -e "💡 Tip: Test failures can't be auto-fixed by --fix. Re-run ${YELLOW}uv run pytest --nbval --current-env tests/unit${NC} to debug."
+            fi
+        fi
+        # Show general fix tip if there are failures but not type/test specific ones
+        if ! $TYPECHECK_FAILED && ! $TESTS_FAILED; then
             echo -e "💡 Tip: Run ${YELLOW}./scripts/run_checks.sh --fix${NC} to automatically fix some issues"
         fi
     fi

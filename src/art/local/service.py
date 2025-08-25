@@ -1,7 +1,7 @@
 from typing import AsyncIterator, Protocol, runtime_checkable
 
 from .. import dev, types
-from .pack import DiskPackedTensors
+from ..preprocessing.pack import DiskPackedTensors
 
 
 @runtime_checkable
@@ -18,6 +18,8 @@ class ModelService(Protocol):
     async def start_openai_server(
         self, config: dev.OpenAIServerConfig | None
     ) -> None: ...
+
+    async def vllm_engine_is_sleeping(self) -> bool: ...
 
     def train(
         self,

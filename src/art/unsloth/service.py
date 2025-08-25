@@ -10,7 +10,11 @@ from art.utils.get_model_step import get_step_from_dir
 
 from .. import dev, types
 from ..local.checkpoints import get_last_checkpoint_dir
-from ..local.pack import DiskPackedTensors, PackedTensors, packed_tensors_from_dir
+from ..preprocessing.pack import (
+    DiskPackedTensors,
+    PackedTensors,
+    packed_tensors_from_dir,
+)
 from .train import train
 
 if TYPE_CHECKING:
@@ -67,6 +71,9 @@ class UnslothService:
         )
         self._set_lora(lora_path)
 
+    async def vllm_engine_is_sleeping(self) -> bool:
+        return await self.state.vllm.async_engine.is_sleeping()
+
     async def stop_openai_server(self) -> None:
         if self._openai_server_task:
             self._openai_server_task.cancel()
@@ -100,6 +107,7 @@ class UnslothService:
             for offset in range(0, packed_tensors["tokens"].shape[0]):
                 for _ in range(2 if warmup else 1):
                     if precalculate_logprobs and not warmup:
+                        packed_tensors["original_logprobs"] = packed_tensors["logprobs"]  # type: ignore
                         packed_tensors["logprobs"] = torch.cat(
                             [
                                 self.state.trainer.compute_loss(
@@ -164,9 +172,9 @@ class UnslothService:
                         )
                         self.results_queue.task_done()
                         if warmup:
-                            from .state import free_memory
+                            from .state import gc_and_empty_cuda_cache
 
-                            free_memory()
+                            gc_and_empty_cuda_cache()
                             await asyncio.sleep(0.1)
                             warmup = False
                         else:

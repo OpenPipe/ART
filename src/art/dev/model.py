@@ -160,7 +160,7 @@ class PeftArgs(TypedDict, total=False):
     layers_pattern: str | None
     use_gradient_checkpointing: str
     random_state: int
-    max_seq_length: int  # not used anymore
+    max_seq_length: int
     use_rslora: bool
     modules_to_save: list[str] | None
     init_lora_weights: bool

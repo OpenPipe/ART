@@ -1,5 +1,7 @@
 import asyncio
+import gc
 import os
+from collections import defaultdict
 from contextlib import nullcontext
 from typing import TYPE_CHECKING, Callable, cast
 
@@ -26,6 +28,14 @@ async def train(
     _log = trainer.log
     trainer.compute_loss = get_compute_loss_fn(trainer)
     trainer.log = get_log_fn(trainer, results_queue)
+    # Ensure we have a metrics container in the expected format
+    try:
+        is_dict = isinstance(getattr(trainer, "_metrics", None), dict)
+        is_train_dict = is_dict and isinstance(trainer._metrics.get("train"), dict)
+    except Exception:
+        is_train_dict = False
+    if not is_train_dict:
+        trainer._metrics = {"train": defaultdict(list)}
     try:
         trainer.train()
     finally:
@@ -44,11 +54,17 @@ def get_compute_loss_fn(trainer: "GRPOTrainer") -> Callable[..., torch.Tensor]:
         _config: dev.TrainConfig = inputs.pop("_config")  # type: ignore
         return_new_logprobs: bool = inputs.pop("return_new_logprobs", False)  # type: ignore
 
+        num_trajectories_learning_rate_multiplier = (
+            torch.unique(inputs["group_ids"]).numel()
+            - torch.unique(inputs["parent_ids"]).numel()
+        ) ** _config.get("num_trajectories_learning_rate_multiplier_power", 0.0)
         if optimizer := trainer.optimizer:
             optimizer = getattr(optimizer, "optimizer", optimizer)
             if param_groups := getattr(optimizer, "param_groups"):
                 for param_group in param_groups:
-                    param_group["lr"] = config.learning_rate
+                    param_group["lr"] = (
+                        config.learning_rate * num_trajectories_learning_rate_multiplier
+                    )
                     # param_group["betas"] = config.betas
                     # if param_group.get("weight_decay"):
                     #     param_group["weight_decay"] = config.weight_decay
@@ -59,14 +75,17 @@ def get_compute_loss_fn(trainer: "GRPOTrainer") -> Callable[..., torch.Tensor]:
             for key, tensor in inputs.items()
         }
 
-        # Unsloth code
-        autocast_dtype = (
-            torch.float16
-            if os.environ.get("ACCELERATE_MIXED_PRECISION", "fp16") == "fp16"
-            else torch.bfloat16
-        )
-        if os.environ.get("UNSLOTH_FORCE_FLOAT32", "0") == "1":
-            autocast_dtype = torch.float16
+        accelerate_mixed_precision = os.environ.get("ACCELERATE_MIXED_PRECISION")
+        force_float32 = os.environ.get("UNSLOTH_FORCE_FLOAT32")
+
+        if (
+            accelerate_mixed_precision is None
+            or accelerate_mixed_precision == "fp16"
+            or force_float32 == "1"
+        ):
+            dtype_for_autocasting = torch.float16
+        else:
+            dtype_for_autocasting = torch.bfloat16
 
         batch_size, seq_len = inputs["tokens"].size()
         attn_bias = calculate_attn_bias(
@@ -75,7 +94,7 @@ def get_compute_loss_fn(trainer: "GRPOTrainer") -> Callable[..., torch.Tensor]:
             trainer.accelerator.device,
             inputs["group_ids"],
             inputs["parent_ids"],
-            autocast_dtype,
+            dtype_for_autocasting,
         )
 
         # Calculate log probabilities
@@ -91,7 +110,7 @@ def get_compute_loss_fn(trainer: "GRPOTrainer") -> Callable[..., torch.Tensor]:
         )
         os.environ["UNSLOTH_RETURN_HIDDEN_STATES"] = "1"
         new_logprobs, entropies = calculate_logprobs(
-            autocast_dtype,
+            dtype_for_autocasting,
             trainer,
             inputs["tokens"],
             attn_bias,
@@ -106,7 +125,7 @@ def get_compute_loss_fn(trainer: "GRPOTrainer") -> Callable[..., torch.Tensor]:
             return torch.nn.functional.pad(new_logprobs[:, :-1], (1, 0), value=0.0)
         if config.beta > 0.0:
             ref_logprobs, _ = calculate_logprobs(
-                autocast_dtype,
+                dtype_for_autocasting,
                 trainer,
                 inputs["tokens"],
                 attn_bias,
@@ -160,7 +179,16 @@ def get_compute_loss_fn(trainer: "GRPOTrainer") -> Callable[..., torch.Tensor]:
             torch.clip(prob_ratio, 1 - epsilon, 1 + epsilon_high) * advantages,
         )
         if upper_bound := _config.get("truncated_importance_sampling", None):
-            policy_loss *= torch.clamp(prob_ratio, max=upper_bound)
+            if "original_logprobs" in inputs:
+                original_logprobs = shift_tensor(inputs["original_logprobs"], 0.0)
+                original_logprobs = torch.where(
+                    torch.isnan(original_logprobs),
+                    new_logprobs.detach(),
+                    original_logprobs,
+                )
+                logprob_diff = old_logprobs - original_logprobs
+                prob_ratio = torch.exp(logprob_diff)
+            policy_loss *= torch.clamp(prob_ratio, max=upper_bound).detach()
         if ref_logprobs is not None:
             kl_div = (
                 torch.exp(ref_logprobs - new_logprobs)
@@ -218,7 +246,7 @@ def calculate_attn_bias(
     device: torch.device,
     group_ids: torch.Tensor,
     parent_ids: torch.Tensor,
-    autocast_dtype: torch.dtype,
+    dtype: torch.dtype,
 ) -> torch.Tensor:
     mask = calculate_mask(batch_size, seq_len, device, group_ids, parent_ids)
     # Use the same dtype as autocast to save memory and avoid dtype conversions
@@ -226,12 +254,12 @@ def calculate_attn_bias(
         mask,
         torch.tensor(
             0.0,
-            dtype=autocast_dtype,
+            dtype=dtype,
             device=device,
         ),
         torch.tensor(
             float("-inf"),
-            dtype=autocast_dtype,
+            dtype=dtype,
             device=device,
         ),
     )
@@ -265,7 +293,7 @@ def calculate_mask(
 
 
 def calculate_logprobs(
-    autocast_dtype: torch.dtype,
+    dtype_for_autocast: torch.dtype,
     trainer: "GRPOTrainer",
     input_ids: torch.Tensor,
     causal_mask: torch.Tensor,
@@ -279,7 +307,6 @@ def calculate_logprobs(
     torch.Tensor, torch.Tensor
 ]:  # Returns (log_probs, entropy) both shape [B, S]
     with (
-        torch.amp.autocast_mode.autocast(device_type="cuda", dtype=autocast_dtype),
         torch.inference_mode() if inference_mode else nullcontext(),
         torch.no_grad() if no_grad else nullcontext(),
         (
@@ -289,6 +316,7 @@ def calculate_logprobs(
             if reference_logprobs
             else nullcontext()
         ),
+        torch.amp.autocast_mode.autocast(device_type="cuda", dtype=dtype_for_autocast),
     ):
         hidden_states = trainer.model(  # type: ignore
             input_ids=input_ids, causal_mask=causal_mask
@@ -352,3 +380,7 @@ def _calculate_logprobs(
 
 def shift_tensor(tensor: torch.Tensor, pad: int | float | bool) -> torch.Tensor:
     return torch.nn.functional.pad(tensor[:, 1:], (0, 1), value=pad)
+
+
+def gc_and_empty_cuda_cache(n: int = 3) -> None:
+    [gc.collect() >= 0 and torch.cuda.empty_cache() for _ in range(n)]

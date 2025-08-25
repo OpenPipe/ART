@@ -23,6 +23,9 @@ class History(pydantic.BaseModel):
     messages_and_choices: MessagesAndChoices
     tools: Tools | None = None
 
+    def messages(self) -> Messages:
+        return get_messages(self.messages_and_choices)
+
 
 class Trajectory(pydantic.BaseModel):
     messages_and_choices: MessagesAndChoices
@@ -82,34 +85,41 @@ class Trajectory(pydantic.BaseModel):
 
 
 def get_messages(messages_and_choices: MessagesAndChoices) -> Messages:
-    return [
-        (
-            {
-                "role": "assistant",
-                "content": message_or_choice.message.content,
-                **(
-                    {
-                        "tool_calls": [
-                            {
-                                "id": tool_call.id,
-                                "type": tool_call.type,
-                                "function": {
-                                    "name": tool_call.function.name,
-                                    "arguments": tool_call.function.arguments,
-                                },
-                            }
-                            for tool_call in message_or_choice.message.tool_calls
-                        ]
-                    }
-                    if message_or_choice.message.tool_calls
-                    else {}
-                ),  # type: ignore
-            }
-            if isinstance(message_or_choice, Choice)
-            else message_or_choice
-        )
-        for message_or_choice in messages_and_choices
-    ]
+    messages: Messages = []
+    for message_or_choice in messages_and_choices:
+        if isinstance(message_or_choice, Choice):
+            content = message_or_choice.message.content or ""
+            tool_calls = message_or_choice.message.tool_calls or []
+            messages.append(
+                {
+                    "role": "assistant",
+                    "content": content,
+                    **(
+                        {
+                            "tool_calls": [
+                                {
+                                    "id": tool_call.id,
+                                    "type": tool_call.type,
+                                    "function": {
+                                        "name": tool_call.function.name,
+                                        "arguments": tool_call.function.arguments,
+                                    },
+                                }
+                                for tool_call in tool_calls
+                            ]
+                        }
+                        if tool_calls
+                        else {}
+                    ),  # type: ignore
+                }
+            )
+        else:
+            # Ensure content is always a string for tokenizer chat templates
+            msg = dict(message_or_choice)
+            if msg.get("content") is None:
+                msg["content"] = ""
+            messages.append(msg)  # type: ignore[arg-type]
+    return messages
 
 
 class TrajectoryGroup(pydantic.BaseModel):

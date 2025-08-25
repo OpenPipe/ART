@@ -42,6 +42,7 @@ def tokenize_trajectory_groups(
     trajectory_groups: list[TrajectoryGroup],
     allow_training_without_logprobs: bool,
     scale_rewards: bool,
+    shuffle_group_trajectories: bool = True,
 ) -> Generator["TokenizedResult", None, None]:
     for group in trajectory_groups:
         if not group:
@@ -100,7 +101,8 @@ def tokenize_trajectory_groups(
         for result in results:
             result.prompt_id = prompt_id
             result.prompt_length = prompt_length
-        random.shuffle(results)
+        if shuffle_group_trajectories:
+            random.shuffle(results)
         yield from results
 
 
@@ -150,8 +152,8 @@ def tokenize_trajectory(
         set(range(cast(int, tokenizer.vocab_size))) - set(original_token_ids)
     )
     sentinal_token = tokenizer.decode(sentinal_token_id)
-    result = cast(
-        dict,
+    token_ids = cast(
+        list[int],
         tokenizer.apply_chat_template(
             cast(
                 list[dict],
@@ -159,6 +161,7 @@ def tokenize_trajectory(
                     (
                         message_or_choice
                         if isinstance(message_or_choice, dict)
+                        and not message_or_choice["role"] == "assistant"
                         else {
                             "role": "assistant",
                             "content": sentinal_token,
@@ -168,44 +171,50 @@ def tokenize_trajectory(
                 ],
             ),
             tools=history.tools,  # type: ignore
-            return_dict=True,
-            return_assistant_token_mask=allow_training_without_logprobs,
         ),
     )
-    token_ids: list[int] = result["input_ids"]
-    assistant_mask: list[int] = (
-        result["attention_mask"]
-        if allow_training_without_logprobs
-        else [0] * len(token_ids)
-    )
+    assistant_mask: list[int] = [0] * len(token_ids)
     logprobs = [float("nan")] * len(token_ids)
     for message_or_choice in messages_and_choices:
-        if isinstance(message_or_choice, dict):
-            continue
-        choice = message_or_choice
-        assert choice.logprobs or allow_training_without_logprobs, (
-            "Chat completion choices must have logprobs"
-        )
-        if not choice.logprobs:
-            continue
-        token_logprobs = choice.logprobs.content or choice.logprobs.refusal or []
-        sentinal_index = token_ids.index(sentinal_token_id)
         if (
-            bytes(token_logprobs[0].bytes or []).decode("utf-8")
-            == "<think>"
-            == tokenizer.decode(token_ids[sentinal_index - 4])
+            isinstance(message_or_choice, dict)
+            and not message_or_choice["role"] == "assistant"
         ):
-            start = sentinal_index - 4
+            continue
+        start = token_ids.index(sentinal_token_id)
+        end = start + 1
+        if isinstance(message_or_choice, dict):
+            content = message_or_choice.get("content")
+            assert isinstance(content, str)
+            content_token_ids = tokenizer.encode(
+                content,
+                add_special_tokens=False,
+            )
+            token_ids[start:end] = content_token_ids
+            logprobs[start:end] = [float("nan")] * len(content_token_ids)
+            assistant_mask[start:end] = [1] * len(content_token_ids)
         else:
-            start = sentinal_index
-        end = sentinal_index + 1
-        token_ids[start:end] = (
-            int(token_logprob.token.split(":")[1]) for token_logprob in token_logprobs
-        )
-        logprobs[start:end] = (
-            token_logprob.logprob for token_logprob in token_logprobs
-        )
-        assistant_mask[start:end] = [1] * len(token_logprobs)
+            choice = message_or_choice
+            assert choice.logprobs or allow_training_without_logprobs, (
+                "Chat completion choices must have logprobs"
+            )
+            if not choice.logprobs:
+                continue
+            token_logprobs = choice.logprobs.content or choice.logprobs.refusal or []
+            if (
+                bytes(token_logprobs[0].bytes or []).decode("utf-8")
+                == "<think>"
+                == tokenizer.decode(token_ids[start - 4])
+            ):
+                start -= 4
+            token_ids[start:end] = (
+                int(token_logprob.token.split(":")[1])
+                for token_logprob in token_logprobs
+            )
+            logprobs[start:end] = (
+                token_logprob.logprob for token_logprob in token_logprobs
+            )
+            assistant_mask[start:end] = [1] * len(token_logprobs)
     return TokenizedResult(
         advantage=advantage,
         chat=chat,

@@ -1,3 +1,4 @@
+import asyncio
 import json
 import math
 import os
@@ -6,11 +7,13 @@ from datetime import datetime
 from types import TracebackType
 from typing import AsyncIterator, Literal, cast
 
+import aiohttp
 import numpy as np
 import polars as pl
 import torch
 import wandb
 import weave
+from openai import AsyncOpenAI
 from tqdm import auto as tqdm
 from transformers.models.auto.tokenization_auto import AutoTokenizer
 from transformers.tokenization_utils_base import PreTrainedTokenizerBase
@@ -42,20 +45,20 @@ from mp_actors import close_proxy, move_to_child_process
 from .. import dev
 from ..backend import Backend
 from ..model import Model, TrainableModel
+from ..preprocessing.pack import (
+    PackedTensors,
+    packed_tensors_from_tokenized_results,
+    packed_tensors_to_dir,
+    plot_packed_tensors,
+)
+from ..preprocessing.tokenize import tokenize_trajectory_groups
 from ..trajectories import Trajectory, TrajectoryGroup
 from ..types import Message, TrainConfig
 from ..utils import format_message, get_model_step
 from .checkpoints import (
     delete_checkpoints,
 )
-from .pack import (
-    PackedTensors,
-    packed_tensors_from_tokenized_results,
-    packed_tensors_to_dir,
-    plot_packed_tensors,
-)
 from .service import ModelService
-from .tokenize import tokenize_trajectory_groups
 
 
 class LocalBackend(Backend):
@@ -118,7 +121,7 @@ class LocalBackend(Backend):
             json.dump(model.model_dump(), f)
 
         # Initialize wandb and weave early if this is a trainable model
-        if isinstance(model, TrainableModel) and "WANDB_API_KEY" in os.environ:
+        if model.trainable and "WANDB_API_KEY" in os.environ:
             _ = self._get_wandb_run(model)
 
     async def _get_service(self, model: TrainableModel) -> ModelService:
@@ -227,7 +230,8 @@ class LocalBackend(Backend):
         return self.__get_step(model)
 
     def __get_step(self, model: Model) -> int:
-        if isinstance(model, TrainableModel):
+        if model.trainable:
+            model = cast(TrainableModel, model)
             return get_model_step(model, self._path)
         # Non-trainable models do not have checkpoints/steps; default to 0
         return 0
@@ -271,7 +275,57 @@ class LocalBackend(Backend):
         base_url = f"http://{server_args.get('host', '0.0.0.0')}:{server_args.get('port', 8000)}/v1"
         api_key = server_args.get("api_key", None) or "default"
 
+        def done_callback(_: asyncio.Task[None]) -> None:
+            close_proxy(self._services.pop(model.name))
+
+        asyncio.create_task(
+            self._monitor_openai_server(model.name, base_url, api_key)
+        ).add_done_callback(done_callback)
+
         return base_url, api_key
+
+    async def _monitor_openai_server(
+        self, model_name: str, base_url: str, api_key: str
+    ) -> None:
+        openai_client = AsyncOpenAI(
+            base_url=base_url,
+            api_key=api_key,
+        )
+        async with aiohttp.ClientSession() as session:
+            while True:
+                # Wait 30 seconds before checking again
+                await asyncio.sleep(30)
+                # If the server is sleeping, skip the check
+                if await self._services[model_name].vllm_engine_is_sleeping():
+                    continue
+                # Check the metrics
+                async with session.get(
+                    f"{base_url.split('/v1')[0]}/metrics"
+                ) as response:
+                    metrics = await response.text()
+                # Parse Prometheus metrics for running requests
+                running_requests = 0
+                pending_requests = 0
+                for line in metrics.split("\n"):
+                    if line.startswith("vllm:num_requests_running"):
+                        running_requests = int(float(line.split()[1]))
+                    elif line.startswith("vllm:num_requests_waiting"):
+                        pending_requests = int(float(line.split()[1]))
+                # If there are no running or pending requests, send a health check
+                if running_requests == 0 and pending_requests == 0:
+                    try:
+                        # Send a health check with a 5 second timeout
+                        await openai_client.completions.create(
+                            model=model_name,
+                            prompt="Hi",
+                            max_tokens=1,
+                            timeout=5,
+                        )
+                    except Exception as e:
+                        # If the server is sleeping, a failed health check is okay
+                        if await self._services[model_name].vllm_engine_is_sleeping():
+                            continue
+                        raise e
 
     async def _log(
         self,
@@ -408,6 +462,13 @@ class LocalBackend(Backend):
         disk_packed_tensors = packed_tensors_to_dir(
             packed_tensors, f"{get_model_dir(model=model, art_path=self._path)}/tensors"
         )
+        if dev_config.get("scale_learning_rate_by_reward_std_dev", False):
+            config = config.model_copy(
+                update={
+                    "learning_rate": config.learning_rate
+                    * self._get_reward_std_dev_learning_rate_multiplier(model)
+                }
+            )
         results: list[dict[str, float]] = []
         estimated_gradient_steps = disk_packed_tensors["num_sequences"]
         if torchtune_args := (model._internal_config or dev.InternalModelConfig()).get(
@@ -447,6 +508,94 @@ class LocalBackend(Backend):
         self._log_metrics(model, data, "train", step=current_step)
         if verbose:
             print("_train_model complete")
+
+    def _get_reward_std_dev_learning_rate_multiplier(
+        self, model: TrainableModel
+    ) -> float:
+        output_dir = get_model_dir(model=model, art_path=self._path)
+        learning_rate_multiplier = 1.0  # Default prior
+        try:
+            std_dev_history = (
+                pl.read_ndjson(f"{output_dir}/history.jsonl")
+                .drop_nulls(subset=["train/reward_std_dev"])
+                .group_by("step")
+                .mean()
+                .sort("step")
+            )
+
+            # Fit linear regression to std_dev_history
+            if len(std_dev_history) > 1:
+                steps = std_dev_history["step"].to_numpy()
+                std_devs = std_dev_history["train/reward_std_dev"].to_numpy()
+
+                # Fit linear regression: y = mx + b
+                # polyfit returns [coefficient, intercept] for degree 1
+                coefficient, intercept = np.polyfit(steps, std_devs, deg=1)
+
+                # Get prediction for the last step
+                last_step = steps[-1]
+                last_step_prediction = coefficient * last_step + intercept
+                last_step_actual = std_devs[-1]
+
+                # Calculate R-squared and adjusted R-squared
+                predictions = coefficient * steps + intercept
+                ss_residual = np.sum((std_devs - predictions) ** 2)
+                ss_total = np.sum((std_devs - np.mean(std_devs)) ** 2)
+                r_squared = 1 - (ss_residual / ss_total) if ss_total > 0 else 0
+
+                # Adjusted R-squared accounts for sample size
+                # For simple linear regression: adj_R² = 1 - (1 - R²) * (n - 1) / (n - 2)
+                n_samples = len(steps)
+                if n_samples > 2:
+                    adjusted_r_squared = 1 - (1 - r_squared) * (n_samples - 1) / (
+                        n_samples - 2
+                    )
+                else:
+                    adjusted_r_squared = (
+                        0  # Not enough samples for meaningful adjustment
+                    )
+
+                # Calculate learning rate multiplier
+                # raw_multiplier = last_step_prediction / intercept (if intercept > 0)
+                # adjusted by goodness of fit: multiplier = 1 + adj_R² * (raw_multiplier - 1)
+                if intercept > 0:
+                    raw_multiplier = last_step_prediction / intercept
+                    # learning_rate_multiplier = 1 + adjusted_r_squared * (
+                    #     raw_multiplier - 1
+                    # )
+                    learning_rate_multiplier = raw_multiplier
+                else:
+                    # If intercept <= 0, can't calculate meaningful ratio, stick with prior
+                    raw_multiplier = 1.0
+                    learning_rate_multiplier = 1.0
+
+                print(f"Regression fitted: y = {coefficient:.6f}x + {intercept:.6f}")
+                print(f"  Coefficient (slope): {coefficient:.6f}")
+                print(f"  Intercept: {intercept:.6f}")
+                print(f"  R-squared: {r_squared:.4f}")
+                print(
+                    f"  Adjusted R-squared: {adjusted_r_squared:.4f} (n={n_samples} samples)"
+                )
+                print(
+                    f"  Last step ({last_step}) prediction: {last_step_prediction:.6f}"
+                )
+                print(f"  Last step actual value: {last_step_actual:.6f}")
+                print(
+                    f"  Prediction error: {abs(last_step_actual - last_step_prediction):.6f}"
+                )
+                print(f"  Raw LR multiplier (pred/intercept): {raw_multiplier:.4f}")
+                print(f"  Adjusted LR multiplier: {learning_rate_multiplier:.4f}")
+            else:
+                print(
+                    f"Not enough data points to fit regression (need at least 2, got {len(std_dev_history)})"
+                )
+
+        except FileNotFoundError:
+            print(f'"{output_dir}/history.jsonl" not found')
+        except pl.exceptions.ColumnNotFoundError:
+            print(f'No "train/reward_std_dev" metric found in history')
+
+        return learning_rate_multiplier
 
     def _log_metrics(
         self,

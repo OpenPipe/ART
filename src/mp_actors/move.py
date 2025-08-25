@@ -81,6 +81,7 @@ class Proxy:
         self, obj: object, log_file: str | None = None, process_name: str | None = None
     ) -> None:
         self._obj = obj
+        self._process_name = process_name
         self._requests = mp.Queue()
         self._responses = mp.Queue()
         self._process = mp.Process(
@@ -91,7 +92,9 @@ class Proxy:
         # dedicated executor for queue.get calls
         self._executor = ThreadPoolExecutor()
         self._futures: dict[str, asyncio.Future] = {}
+        self._process_future = asyncio.Future()
         self._handle_responses_task = asyncio.create_task(self._handle_responses())
+        self._monitor_task = asyncio.create_task(self._monitor_process())
 
     async def _handle_responses(self) -> None:
         loop = asyncio.get_event_loop()
@@ -111,6 +114,29 @@ class Proxy:
             else:
                 future.set_result(response.result)
 
+    async def _monitor_process(self) -> None:
+        """Monitor the child process and set exception if it dies unexpectedly."""
+        loop = asyncio.get_event_loop()
+        while not self._process_future.done():
+            is_alive = await loop.run_in_executor(None, self._process.is_alive)
+            if not is_alive:
+                if not self._process_future.done():
+                    exit_code = self._process.exitcode
+                    name = f" '{self._process_name}'" if self._process_name else ""
+                    if exit_code is None:
+                        exc = RuntimeError(f"Child process{name} died unexpectedly")
+                    elif exit_code < 0:
+                        exc = RuntimeError(
+                            f"Child process{name} was killed by signal {-exit_code}"
+                        )
+                    else:
+                        exc = RuntimeError(
+                            f"Child process{name} exited with code {exit_code}"
+                        )
+                    self._process_future.set_exception(exc)
+                break
+            await asyncio.sleep(0.1)
+
     @streamline_tracebacks()
     def __getattr__(self, name: str) -> Any:
         # For attributes that aren't methods, get them directly
@@ -128,7 +154,11 @@ class Proxy:
             request = Request(str(id or uuid.uuid4()), name, args, kwargs, send_value)
             self._futures[request.id] = asyncio.Future()
             self._requests.put_nowait(request)
-            return await self._futures[request.id]
+            done, _ = await asyncio.wait(
+                [self._futures[request.id], self._process_future],
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            return done.pop().result()
 
         # Check if it's a method or property
         attr = getattr(self._obj, name)
@@ -169,6 +199,12 @@ class Proxy:
             return asyncio.run(get_response(tuple(), dict()))
 
     def close(self):
+        # Cancel monitoring to avoid false alarms during shutdown
+        if not self._process_future.done():
+            self._process_future.cancel()
+        if hasattr(self, "_monitor_task"):
+            self._monitor_task.cancel()
+
         # signal the response loop to exit
         self._responses.put_nowait(Response(_SHUTDOWN_ID, None, None))
         # wait for the handler to finish
