@@ -68,12 +68,6 @@
         ]
       },
       {
-        "group": "Integrations",
-        "pages": [
-          "integrations/langgraph-integration"
-        ]
-      },
-      {
         "group": "Tutorials",
         "pages": [
           "tutorials/summarizer"
