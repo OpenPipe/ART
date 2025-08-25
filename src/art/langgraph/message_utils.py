@@ -10,7 +10,6 @@ from langchain_core.messages import (
     ToolMessage,
 )
 from openai.types.chat.chat_completion import Choice
-from openai.types.chat.chat_completion_message import ChatCompletionMessage
 from openai.types.chat.chat_completion_assistant_message_param import (
     ChatCompletionAssistantMessageParam,
 )
@@ -20,6 +19,7 @@ from openai.types.chat.chat_completion_developer_message_param import (
 from openai.types.chat.chat_completion_function_message_param import (
     ChatCompletionFunctionMessageParam,
 )
+from openai.types.chat.chat_completion_message import ChatCompletionMessage
 from openai.types.chat.chat_completion_message_param import ChatCompletionMessageParam
 from openai.types.chat.chat_completion_system_message_param import (
     ChatCompletionSystemMessageParam,
@@ -105,7 +105,9 @@ def convert_langgraph_messages(messages: List[object]) -> MessagesAndChoices:
             converted.append(
                 Choice(
                     message=ChatCompletionMessage(
-                        role="assistant", content=getattr(msg, "content"), tool_calls=tool_calls
+                        role="assistant",
+                        content=getattr(msg, "content"),
+                        tool_calls=tool_calls,
                     ),
                     index=0,
                     **response_metadata,

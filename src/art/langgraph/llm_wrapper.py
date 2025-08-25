@@ -217,14 +217,17 @@ class LoggingLLM(Runnable):
         art_config = CURRENT_CONFIG.get()
         self.logger = art_config["logger"]
 
-
         if hasattr(self.llm, "bound"):
-            setattr(self.llm, "bound", ChatOpenAI(
-                base_url=art_config["base_url"],
-                api_key=art_config["api_key"],
-                model=art_config["model"],
-                temperature=1.0,
-            ))
+            setattr(
+                self.llm,
+                "bound",
+                ChatOpenAI(
+                    base_url=art_config["base_url"],
+                    api_key=art_config["api_key"],
+                    model=art_config["model"],
+                    temperature=1.0,
+                ),
+            )
         else:
             self.llm = ChatOpenAI(
                 base_url=art_config["base_url"],
