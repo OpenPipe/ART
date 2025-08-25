@@ -139,31 +139,29 @@ class LoggingLLM(Runnable):
             entry = {"input": input, "output": output, "tools": self.tools}
             self.logger.log(f"{completion_id}", entry)
 
-    def invoke(self, input, config=None):
+    def invoke(self, input, config=None, **kwargs):
         completion_id = str(uuid.uuid4())
 
-        async def execute():
+        def execute():
             result = self.llm.invoke(input, config=config)
             self._log(completion_id, input, result)
             return result
 
         result = execute()
 
-        if hasattr(result, "get") and result.get("parsed"):
-            return result.get("parsed")
-
-        if hasattr(result, "tool_calls"):
-            for tool_call in result.tool_calls:
+        tool_calls = getattr(result, "tool_calls", None)
+        if tool_calls:
+            for tool_call in tool_calls:
                 if isinstance(tool_call["args"], str):
                     tool_call["args"] = json.loads(tool_call["args"])
 
         if self.structured_output:
             return self.structured_output.model_validate(
-                result.tool_calls[0]["args"] if result.tool_calls else None
+                tool_calls[0]["args"] if tool_calls else None
             )
         return result
 
-    async def ainvoke(self, input, config=None):
+    async def ainvoke(self, input, config=None, **kwargs):
         completion_id = str(uuid.uuid4())
 
         async def execute():
@@ -178,17 +176,15 @@ class LoggingLLM(Runnable):
 
         result = await execute()
 
-        if hasattr(result, "get") and result.get("parsed"):
-            return result.get("parsed")
-
-        if hasattr(result, "tool_calls"):
-            for tool_call in result.tool_calls:
+        tool_calls = getattr(result, "tool_calls", None)
+        if tool_calls:
+            for tool_call in tool_calls:
                 if isinstance(tool_call["args"], str):
                     tool_call["args"] = json.loads(tool_call["args"])
 
         if self.structured_output:
             return self.structured_output.model_validate(
-                result.tool_calls[0]["args"] if result.tool_calls else None
+                tool_calls[0]["args"] if tool_calls else None
             )
         return result
 
@@ -220,15 +216,17 @@ class LoggingLLM(Runnable):
     ):
         art_config = CURRENT_CONFIG.get()
         self.logger = art_config["logger"]
-        max_tokens = config.get("max_tokens")
 
         if hasattr(self.llm, "bound"):
-            self.llm.bound = ChatOpenAI(
-                base_url=art_config["base_url"],
-                api_key=art_config["api_key"],
-                model=art_config["model"],
-                temperature=1.0,
-                max_tokens=max_tokens,
+            setattr(
+                self.llm,
+                "bound",
+                ChatOpenAI(
+                    base_url=art_config["base_url"],
+                    api_key=art_config["api_key"],
+                    model=art_config["model"],
+                    temperature=1.0,
+                ),
             )
         else:
             self.llm = ChatOpenAI(
@@ -236,7 +234,6 @@ class LoggingLLM(Runnable):
                 api_key=art_config["api_key"],
                 model=art_config["model"],
                 temperature=1.0,
-                max_tokens=max_tokens,
             )
 
         return self
