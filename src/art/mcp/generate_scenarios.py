@@ -65,7 +65,7 @@ async def generate_scenarios(
     # Validate that we have at least tools or resources
     if not tools and not resources:
         raise ValueError("At least one tool or resource must be provided")
-    
+
     ok(f"Using model: {generator_model}")
 
     # Convert tools to dictionaries
