@@ -34,6 +34,13 @@ class MCPTool:
             "parameters": self.parameters,
         }
 
+    def to_tool_schema(self) -> Dict[str, Any]:
+        """Convert the tool to a tool schema."""
+        return {
+            "type": "function",
+            "function": self.to_dict(),
+        }
+
 
 @dataclass
 class MCPResource:
