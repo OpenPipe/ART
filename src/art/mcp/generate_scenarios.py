@@ -70,14 +70,20 @@ async def generate_scenarios(
 
     # Convert tools to dictionaries
     if isinstance(tools, list) and tools and isinstance(tools[0], MCPTool):
-        tools_info = [tool.to_dict() for tool in tools]
+        tools_info = [tool.to_dict() for tool in tools]  # type: ignore
     else:
         # Assume it's already a list of dictionaries
         tools_info = [
             {
-                "name": tool.get("name", ""),
-                "description": tool.get("description", ""),
-                "parameters": tool.get("parameters", {}),
+                "name": tool.get("name", "")
+                if isinstance(tool, dict)
+                else getattr(tool, "name", ""),
+                "description": tool.get("description", "")
+                if isinstance(tool, dict)
+                else getattr(tool, "description", ""),
+                "parameters": tool.get("parameters", {})
+                if isinstance(tool, dict)
+                else getattr(tool, "parameters", {}),
             }
             for tool in tools
         ]
@@ -90,7 +96,7 @@ async def generate_scenarios(
         and resources
         and isinstance(resources[0], MCPResource)
     ):
-        resources_info = [resource.to_dict() for resource in resources]
+        resources_info = [resource.to_dict() for resource in resources]  # type: ignore
     else:
         # Assume it's already a list of dictionaries
         resources_info = resources or []
@@ -173,6 +179,9 @@ You must respond with a JSON object containing a "scenarios" array of exactly {n
     ok(f"Model responded in {dt:.2f}s.")
 
     content = response.choices[0].message.content
+    if content is None:
+        err("Model response content is None.")
+        raise ValueError("Model response content is None")
     info(f"Raw content length: {len(content)} chars.")
 
     # Parse JSON
@@ -182,7 +191,7 @@ You must respond with a JSON object containing a "scenarios" array of exactly {n
         err("Failed to parse JSON from model response.")
         dim(f"   Exception: {e}")
         dim("   First 500 chars of response content:")
-        dim(content[:500])
+        dim(content[:500] if content else "No content")
         raise
 
     # Extract scenarios
