@@ -34,22 +34,26 @@ ART's **LangGraph integration** enables you to train sophisticated ReAct-style a
 
 ```python
 import art
-from art.langgraph import wrap_rollout, init_chat_model
-from langgraph import create_react_agent
+from art.langgraph import init_chat_model
+from langgraph.prebuilt import create_react_agent
 
-# Your existing tools
-tools = [search_inbox, read_email, return_final_answer]
+async def email_rollout(model: art.Model, scenario: str) -> art.Trajectory:
+    traj = art.Trajectory(reward=0.0, messages_and_choices=[])
+    
+    # Create LangGraph agent with ART's chat model
+    chat_model = init_chat_model(model.name)
+    agent = create_react_agent(chat_model, tools)
+    
+    await agent.ainvoke({"messages": [("user", scenario)]})
+    traj.reward = 1.0  # Score based on results
+    return traj
 
-@wrap_rollout(model)
-async def run_agent(scenario: str) -> art.Trajectory:
-    # Create LangGraph agent with ART's LLM wrapper
-    agent = create_react_agent(init_chat_model(), tools)
-
-    result = await agent.ainvoke({"messages": [("user", scenario)]})
-    return art.Trajectory()  # Automatically captured
-
-# Train with RULER - no reward engineering needed!
-await art.train(model, reward_function="ruler")
+# Train your agent
+scenarios = ["Find urgent emails", "Search Q4 budget"]
+groups = await art.gather_trajectory_groups(
+    (art.TrajectoryGroup(email_rollout(model, s) for _ in range(4)) for s in scenarios)
+)
+await model.train(groups)
 ```
 
 [📖 Learn more about LangGraph integration →](https://art.openpipe.ai/integrations/langgraph-integration) | [🏋️ Try the notebook →](https://colab.research.google.com/github/openpipe/art-notebooks/blob/main/examples/langgraph/art-e-langgraph.ipynb)
