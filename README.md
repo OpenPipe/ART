@@ -34,25 +34,26 @@ ART's **LangGraph integration** enables you to train sophisticated ReAct-style a
 
 ```python
 import art
-from art.langgraph import init_chat_model
+from art.langgraph import init_chat_model, wrap_rollout
 from langgraph.prebuilt import create_react_agent
 
 async def email_rollout(model: art.Model, scenario: str) -> art.Trajectory:
-    traj = art.Trajectory(reward=0.0, messages_and_choices=[])
-    
     # Create LangGraph agent with ART's chat model
     chat_model = init_chat_model(model.name)
     agent = create_react_agent(chat_model, tools)
-    
+
     await agent.ainvoke({"messages": [("user", scenario)]})
-    traj.reward = 1.0  # Score based on results
-    return traj
+    return art.Trajectory(reward=1.0, messages_and_choices=[])
 
 # Train your agent
 scenarios = ["Find urgent emails", "Search Q4 budget"]
-groups = await art.gather_trajectory_groups(
-    (art.TrajectoryGroup(email_rollout(model, s) for _ in range(4)) for s in scenarios)
-)
+
+# Using wrap_rollout (captures interactions automatically)
+groups = await art.gather_trajectory_groups([
+    art.TrajectoryGroup(wrap_rollout(model, email_rollout)(model, s) for _ in range(4))
+    for s in scenarios
+])
+
 await model.train(groups)
 ```
 
