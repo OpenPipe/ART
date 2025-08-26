@@ -81,19 +81,20 @@ else
 fi
 echo
 
-# Run type checking (Pyright)
-echo "🧠 Running type checking..."
-TMP_PYRIGHT_JSON=$(mktemp)
-echo "  Running: uv run pyright --outputjson src tests"
-# Capture JSON output quietly regardless of success/failure
-if uv run pyright --outputjson src > "$TMP_PYRIGHT_JSON" 2>/dev/null; then
-    : # success, continue
-else
-    : # non-zero exit means errors may be present; we'll parse JSON next
-fi
+# Run type checking (Pyright) - only on Linux
+if [[ "$(uname)" == "Linux" ]]; then
+    echo "🧠 Running type checking..."
+    TMP_PYRIGHT_JSON=$(mktemp)
+    echo "  Running: uv run pyright --outputjson src tests"
+    # Capture JSON output quietly regardless of success/failure
+    if uv run pyright --outputjson src > "$TMP_PYRIGHT_JSON" 2>/dev/null; then
+        : # success, continue
+    else
+        : # non-zero exit means errors may be present; we'll parse JSON next
+    fi
 
-# Parse counts from JSON (errors, warnings, information)
-PYRIGHT_COUNTS=$(python3 - "$TMP_PYRIGHT_JSON" <<'PY'
+    # Parse counts from JSON (errors, warnings, information)
+    PYRIGHT_COUNTS=$(python3 - "$TMP_PYRIGHT_JSON" <<'PY'
 import json, sys
 path = sys.argv[1]
 try:
@@ -113,103 +114,110 @@ print(f"{counts['error']} {counts['warning']} {counts['information']}")
 PY
 )
 
-if [[ "$PYRIGHT_COUNTS" == "PARSE_ERROR" ]]; then
-    echo -e "${RED}❌ Type checking failed (unable to parse results)${NC}"
-    CHECKS_PASSED=false
-    TYPECHECK_FAILED=true
-else
-    ERR_COUNT=$(echo "$PYRIGHT_COUNTS" | awk '{print $1}')
-    WARN_COUNT=$(echo "$PYRIGHT_COUNTS" | awk '{print $2}')
-    INFO_COUNT=$(echo "$PYRIGHT_COUNTS" | awk '{print $3}')
-    if [[ "$ERR_COUNT" -gt 0 ]]; then
-        echo -e "${RED}❌ Type checking failed${NC}"
-        echo "  Errors: $ERR_COUNT, Warnings: $WARN_COUNT, Info: $INFO_COUNT"
+    if [[ "$PYRIGHT_COUNTS" == "PARSE_ERROR" ]]; then
+        echo -e "${RED}❌ Type checking failed (unable to parse results)${NC}"
         CHECKS_PASSED=false
         TYPECHECK_FAILED=true
     else
-        echo -e "${GREEN}✅ Type checking passed${NC}"
-        echo "  Errors: $ERR_COUNT, Warnings: $WARN_COUNT, Info: $INFO_COUNT"
+        ERR_COUNT=$(echo "$PYRIGHT_COUNTS" | awk '{print $1}')
+        WARN_COUNT=$(echo "$PYRIGHT_COUNTS" | awk '{print $2}')
+        INFO_COUNT=$(echo "$PYRIGHT_COUNTS" | awk '{print $3}')
+        if [[ "$ERR_COUNT" -gt 0 ]]; then
+            echo -e "${RED}❌ Type checking failed${NC}"
+            echo "  Errors: $ERR_COUNT, Warnings: $WARN_COUNT, Info: $INFO_COUNT"
+            CHECKS_PASSED=false
+            TYPECHECK_FAILED=true
+        else
+            echo -e "${GREEN}✅ Type checking passed${NC}"
+            echo "  Errors: $ERR_COUNT, Warnings: $WARN_COUNT, Info: $INFO_COUNT"
+        fi
     fi
+    rm -f "$TMP_PYRIGHT_JSON"
+else
+    echo "🧠 Skipping type checking (Linux only)"
 fi
-rm -f "$TMP_PYRIGHT_JSON"
 echo
 
-# Run tests
-echo "🧪 Running unit tests..."
-echo "  Running: uv run pytest --nbval --current-env tests/unit"
+# Run tests - only on Linux
+if [[ "$(uname)" == "Linux" ]]; then
+    echo "🧪 Running unit tests..."
+    echo "  Running: uv run pytest --nbval --current-env tests/unit"
 
-# Capture pytest output quietly to parse the summary
-PYTEST_OUTPUT=$(mktemp)
-if uv run pytest --nbval --current-env --tb=short tests/unit > "$PYTEST_OUTPUT" 2>&1; then
-    TEST_EXIT_CODE=0
-else
-    TEST_EXIT_CODE=$?
-fi
-
-# Extract the test summary line (e.g., "===== 5 passed, 2 failed, 1 skipped in 3.45s =====")
-# This regex captures various pytest summary formats
-TEST_SUMMARY=$(grep -E "^=+ .*(passed|failed|error|skipped|xfailed|xpassed|warning).*=+$" "$PYTEST_OUTPUT" | tail -1)
-
-if [[ -n "$TEST_SUMMARY" ]]; then
-    # Parse the summary to extract counts
-    PASSED=$(echo "$TEST_SUMMARY" | grep -oE "[0-9]+ passed" | grep -oE "[0-9]+" || echo "0")
-    FAILED=$(echo "$TEST_SUMMARY" | grep -oE "[0-9]+ failed" | grep -oE "[0-9]+" || echo "0")
-    ERRORS=$(echo "$TEST_SUMMARY" | grep -oE "[0-9]+ error" | grep -oE "[0-9]+" || echo "0")
-    SKIPPED=$(echo "$TEST_SUMMARY" | grep -oE "[0-9]+ skipped" | grep -oE "[0-9]+" || echo "0")
-    WARNINGS=$(echo "$TEST_SUMMARY" | grep -oE "[0-9]+ warning" | grep -oE "[0-9]+" || echo "0")
-    XFAILED=$(echo "$TEST_SUMMARY" | grep -oE "[0-9]+ xfailed" | grep -oE "[0-9]+" || echo "0")
-    XPASSED=$(echo "$TEST_SUMMARY" | grep -oE "[0-9]+ xpassed" | grep -oE "[0-9]+" || echo "0")
-    
-    # Build detailed summary
-    DETAILS=""
-    [[ "$PASSED" != "0" ]] && DETAILS="${DETAILS}Passed: $PASSED"
-    [[ "$FAILED" != "0" ]] && DETAILS="${DETAILS:+$DETAILS, }Failed: $FAILED"
-    [[ "$ERRORS" != "0" ]] && DETAILS="${DETAILS:+$DETAILS, }Errors: $ERRORS"
-    [[ "$SKIPPED" != "0" ]] && DETAILS="${DETAILS:+$DETAILS, }Skipped: $SKIPPED"
-    [[ "$XFAILED" != "0" ]] && DETAILS="${DETAILS:+$DETAILS, }XFailed: $XFAILED"
-    [[ "$XPASSED" != "0" ]] && DETAILS="${DETAILS:+$DETAILS, }XPassed: $XPASSED"
-    [[ "$WARNINGS" != "0" ]] && DETAILS="${DETAILS:+$DETAILS, }Warnings: $WARNINGS"
-    
-    # Check if there were any failures or errors
-    if [[ "$FAILED" == "0" && "$ERRORS" == "0" && $TEST_EXIT_CODE -eq 0 ]]; then
-        echo -e "${GREEN}✅ All tests passed${NC}"
-        [[ -n "$DETAILS" ]] && echo "  $DETAILS"
+    # Capture pytest output quietly to parse the summary
+    PYTEST_OUTPUT=$(mktemp)
+    if uv run pytest --nbval --current-env --tb=short tests/unit > "$PYTEST_OUTPUT" 2>&1; then
+        TEST_EXIT_CODE=0
     else
-        echo -e "${RED}❌ Tests failed${NC}"
-        [[ -n "$DETAILS" ]] && echo "  $DETAILS"
-        CHECKS_PASSED=false
-        TESTS_FAILED=true
+        TEST_EXIT_CODE=$?
+    fi
+
+    # Extract the test summary line (e.g., "===== 5 passed, 2 failed, 1 skipped in 3.45s =====")
+    # This regex captures various pytest summary formats
+    TEST_SUMMARY=$(grep -E "^=+ .*(passed|failed|error|skipped|xfailed|xpassed|warning).*=+$" "$PYTEST_OUTPUT" | tail -1)
+
+    if [[ -n "$TEST_SUMMARY" ]]; then
+        # Parse the summary to extract counts
+        PASSED=$(echo "$TEST_SUMMARY" | grep -oE "[0-9]+ passed" | grep -oE "[0-9]+" || echo "0")
+        FAILED=$(echo "$TEST_SUMMARY" | grep -oE "[0-9]+ failed" | grep -oE "[0-9]+" || echo "0")
+        ERRORS=$(echo "$TEST_SUMMARY" | grep -oE "[0-9]+ error" | grep -oE "[0-9]+" || echo "0")
+        SKIPPED=$(echo "$TEST_SUMMARY" | grep -oE "[0-9]+ skipped" | grep -oE "[0-9]+" || echo "0")
+        WARNINGS=$(echo "$TEST_SUMMARY" | grep -oE "[0-9]+ warning" | grep -oE "[0-9]+" || echo "0")
+        XFAILED=$(echo "$TEST_SUMMARY" | grep -oE "[0-9]+ xfailed" | grep -oE "[0-9]+" || echo "0")
+        XPASSED=$(echo "$TEST_SUMMARY" | grep -oE "[0-9]+ xpassed" | grep -oE "[0-9]+" || echo "0")
         
-        # If verbose test failure flag is set, dump full test output
-        if [[ -n "$VERBOSE_TEST_FAILURE" ]]; then
-            echo
-            echo "📋 Full test output:"
-            echo "───────────────────────────────────────────────────────────────"
-            cat "$PYTEST_OUTPUT"
-            echo "───────────────────────────────────────────────────────────────"
+        # Build detailed summary
+        DETAILS=""
+        [[ "$PASSED" != "0" ]] && DETAILS="${DETAILS}Passed: $PASSED"
+        [[ "$FAILED" != "0" ]] && DETAILS="${DETAILS:+$DETAILS, }Failed: $FAILED"
+        [[ "$ERRORS" != "0" ]] && DETAILS="${DETAILS:+$DETAILS, }Errors: $ERRORS"
+        [[ "$SKIPPED" != "0" ]] && DETAILS="${DETAILS:+$DETAILS, }Skipped: $SKIPPED"
+        [[ "$XFAILED" != "0" ]] && DETAILS="${DETAILS:+$DETAILS, }XFailed: $XFAILED"
+        [[ "$XPASSED" != "0" ]] && DETAILS="${DETAILS:+$DETAILS, }XPassed: $XPASSED"
+        [[ "$WARNINGS" != "0" ]] && DETAILS="${DETAILS:+$DETAILS, }Warnings: $WARNINGS"
+        
+        # Check if there were any failures or errors
+        if [[ "$FAILED" == "0" && "$ERRORS" == "0" && $TEST_EXIT_CODE -eq 0 ]]; then
+            echo -e "${GREEN}✅ All tests passed${NC}"
+            [[ -n "$DETAILS" ]] && echo "  $DETAILS"
+        else
+            echo -e "${RED}❌ Tests failed${NC}"
+            [[ -n "$DETAILS" ]] && echo "  $DETAILS"
+            CHECKS_PASSED=false
+            TESTS_FAILED=true
+            
+            # If verbose test failure flag is set, dump full test output
+            if [[ -n "$VERBOSE_TEST_FAILURE" ]]; then
+                echo
+                echo "📋 Full test output:"
+                echo "───────────────────────────────────────────────────────────────"
+                cat "$PYTEST_OUTPUT"
+                echo "───────────────────────────────────────────────────────────────"
+            fi
+        fi
+    else
+        # Fallback if we can't parse the summary
+        if [[ $TEST_EXIT_CODE -eq 0 ]]; then
+            echo -e "${GREEN}✅ All unit tests passed${NC}"
+        else
+            echo -e "${RED}❌ Some unit tests failed${NC}"
+            CHECKS_PASSED=false
+            TESTS_FAILED=true
+            
+            # If verbose test failure flag is set, dump full test output
+            if [[ -n "$VERBOSE_TEST_FAILURE" ]]; then
+                echo
+                echo "📋 Full test output:"
+                echo "───────────────────────────────────────────────────────────────"
+                cat "$PYTEST_OUTPUT"
+                echo "───────────────────────────────────────────────────────────────"
+            fi
         fi
     fi
-else
-    # Fallback if we can't parse the summary
-    if [[ $TEST_EXIT_CODE -eq 0 ]]; then
-        echo -e "${GREEN}✅ All unit tests passed${NC}"
-    else
-        echo -e "${RED}❌ Some unit tests failed${NC}"
-        CHECKS_PASSED=false
-        TESTS_FAILED=true
-        
-        # If verbose test failure flag is set, dump full test output
-        if [[ -n "$VERBOSE_TEST_FAILURE" ]]; then
-            echo
-            echo "📋 Full test output:"
-            echo "───────────────────────────────────────────────────────────────"
-            cat "$PYTEST_OUTPUT"
-            echo "───────────────────────────────────────────────────────────────"
-        fi
-    fi
-fi
 
-rm -f "$PYTEST_OUTPUT"
+    rm -f "$PYTEST_OUTPUT"
+else
+    echo "🧪 Skipping unit tests (Linux only)"
+fi
 echo
 
 # Check if uv.lock is in sync with pyproject.toml
