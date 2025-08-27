@@ -4,8 +4,6 @@ from collections import Counter
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
 
-from openai.types.chat.chat_completion_tool import ChatCompletionTool
-
 from art.utils.logging import _C, dim, info
 
 
