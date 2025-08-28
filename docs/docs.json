@@ -77,7 +77,8 @@
       {
         "group": "Tutorials",
         "pages": [
-          "tutorials/summarizer"
+          "tutorials/summarizer",
+          "tutorials/open-deep-research"
         ]
       },
       {
