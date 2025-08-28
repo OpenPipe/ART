@@ -27,7 +27,7 @@ Total cost: <b>~$100</b>
 
 </Info>
 
-## Step 1: Clone the starter repo and install dependencies
+### Step 1: Clone the starter repo and install dependencies
 
 To get started, clone [Open Deep Research Training](https://github.com/OpenPipe/open_deep_research_training), which contains the following pieces of our RL pipeline:
 
@@ -40,7 +40,7 @@ Once the repository is cloned, install dependencies. If you haven't already, ins
 
 Then install the project dependencies by running `uv sync`.
 
-### 2. Install SkyPilot/RunPod
+### Step 2: Install SkyPilot/RunPod
 
 We'll be using `LocalBackend` to manage the GPU that your model will be trained on. In order to provision a GPU for your training run, you'll need to have SkyPilot installed on your machine and provide it with the credentials to spin up machines on at least one infra provider.
 
@@ -48,11 +48,11 @@ We recommend using RunPod because of their ease of use, but any infra provider t
 
 Follow RunPod's **Getting Started** guide [here](https://docs.runpod.io/integrations/skypilot/). You'll have to provide a credit card to use RunPod, but you'll only pay for the time your GPUs are running.
 
-### 3. Set up optional environment variables found in `.env.example`
+### Step 3: Set up optional environment variables found in `.env.example`
 
 Copy `.env.example` to `.env` at the root of the repository, and fill in the values for the environment variables. If you're unsure about any of the values, refer to [ENV_INSTRUCTIONS.md](https://github.com/OpenPipe/open_deep_research_training/blob/main/ENV_INSTRUCTIONS.md).
 
-### 4. Run the training scripts
+### Step 4: Run the training scripts
 
 You'll want to run these scripts in this order:
 
@@ -87,7 +87,7 @@ The following steps execute when a training run on a new cluster begins:
 - **Upload the final model checkpoint.**
   - This usually takes a few minutes.
 
-### 5. Generate the benchmarks
+### Step 5: Generate the benchmarks
 
 Run the benchmark script to evaluate your trained models:
 
@@ -103,7 +103,7 @@ This script will:
 
 Then run the `display_benchmarks.ipynb` notebook to visualize the results and generate comparison charts.
 
-### 6. Shutting down the cluster
+### Step 6: Shutting down the cluster
 
 When you're done training and running benchmarks, you can shut down the cluster by running:
 
