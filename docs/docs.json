@@ -89,7 +89,9 @@
       },
       {
         "group": "Experimental",
-        "pages": []
+        "pages": [
+          "experimental/gspo"
+        ]
       }
     ]
   },
