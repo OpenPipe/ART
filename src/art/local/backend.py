@@ -315,7 +315,9 @@ class LocalBackend(Backend):
                 if running_requests == 0 and pending_requests == 0:
                     try:
                         # Send a health check with a 5 second timeout
-                        timeout = float(os.environ.get("ART_SERVER_MONITOR_TIMEOUT", 5.0))
+                        timeout = float(
+                            os.environ.get("ART_SERVER_MONITOR_TIMEOUT", 5.0)
+                        )
                         # Send a health check with a 5 second timeout
                         await openai_client.models.retrieve(
                             model=model_name,
