@@ -42,7 +42,7 @@ backend = [
 
 skypilot = [
     "semver>=3.0.4",
-    "skypilot[cudo,do,fluidstack,gcp,lambda,paperspace,runpod]==0.9.3",
+    "skypilot[cudo,do,fluidstack,gcp,lambda,kubernetes,paperspace,runpod]==0.10.2",
 ]
 
 langgraph = [
