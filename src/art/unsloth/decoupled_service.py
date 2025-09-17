@@ -96,23 +96,27 @@ class DecoupledUnslothService:
         with open(pids_path, "w") as f:
             f.write("")
         # start putting the workers to sleep
-        sleep_task = asyncio.create_task(
-            run_on_workers(
-                llm,
-                sleep,
-                level=1,
-                pids_path=pids_path,
-                profile=verbose,
+        # Only attempt sleep mode if engine was created with sleep enabled
+        sleep_task = None
+        if getattr(llm.engine.engine.vllm_config.parallel_config, "enable_sleep_mode", False) or getattr(llm.engine, "sleep", None):
+            sleep_task = asyncio.create_task(
+                run_on_workers(
+                    llm,
+                    sleep,
+                    level=1,
+                    pids_path=pids_path,
+                    profile=verbose,
+                )
             )
-        )
         # wait for the workers to write their pids twice, indicating that they are asleep
-        while True:
-            pids = Counter(open(pids_path).read().splitlines())
-            if set(pids.values()) == {2}:
-                break
-            await asyncio.sleep(0.25)
+        if sleep_task is not None:
+            while True:
+                pids = Counter(open(pids_path).read().splitlines())
+                if set(pids.values()) == {2}:
+                    break
+                await asyncio.sleep(0.25)
 
-        self._is_sleeping = True
+        self._is_sleeping = sleep_task is not None
 
         # Free memory after vLLM workers are asleep
         gc_and_empty_cuda_cache()
@@ -217,13 +221,14 @@ class DecoupledUnslothService:
         gc_and_empty_cuda_cache()
 
         # Remove pids.txt to signal workers to wake up
-        if os.path.exists(pids_path):
+        if sleep_task is not None and os.path.exists(pids_path):
             os.remove(pids_path)
             if verbose:
                 print("Removed pids.txt to signal workers to wake up")
 
         # wait for the workers to wake up
-        await sleep_task
+        if sleep_task is not None:
+            await sleep_task
 
         self._is_sleeping = False
 

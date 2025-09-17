@@ -34,19 +34,27 @@ async def get_llm(args: vllm.AsyncEngineArgs) -> AsyncLLM:
         )
         await process.wait()
 
-    # Make sure we are using the V1 engine
+    # Make sure we are using the V1 engine and allow pickle-based fallback
+    # across all spawned worker processes by setting OS environment variables.
+    # Also explicitly disable expandable_segments to avoid MemPool incompatibility.
+    os.environ.setdefault("VLLM_ALLOW_INSECURE_SERIALIZATION", "1")
+    os.environ.setdefault("VLLM_USE_V1", "1")
+    # Force-disable expandable_segments to avoid MemPool incompatibility
+    os.environ["PYTORCH_CUDA_ALLOC_CONF"] = ""
     import vllm.envs as envs
-
+    envs.VLLM_ALLOW_INSECURE_SERIALIZATION = True
     envs.VLLM_USE_V1 = True
 
     llm = AsyncLLM.from_engine_args(
         replace(
             args,
             worker_extension_cls=f"{WorkerExtension.__module__}.{WorkerExtension.__qualname__}",
-            enable_sleep_mode=True,
+            enable_sleep_mode=getattr(args, "enable_sleep_mode", False),
         )
     )
-    await run_on_workers(llm, patch_allocator)
+    # Only patch allocator if sleep mode is enabled; otherwise skip
+    if getattr(args, "enable_sleep_mode", False):
+        await run_on_workers(llm, patch_allocator)
     return llm
 
 

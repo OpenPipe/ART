@@ -16,6 +16,8 @@ from vllm.utils import FlexibleArgumentParser
 from ..dev.openai_server import OpenAIServerConfig
 
 
+
+
 async def openai_server_task(
     engine: EngineClient,
     config: OpenAIServerConfig,
@@ -47,22 +49,28 @@ async def openai_server_task(
     patch_tool_parser_manager()
     set_vllm_log_file(config.get("log_file", "vllm.log"))
 
-    # Patch engine.add_lora; hopefully temporary
-    add_lora = engine.add_lora
+    # Patch engine.add_lora once, mutating request in-place for Unsloth compat
+    if not getattr(engine.add_lora, "__art_patched__", False):
+        original_add_lora = engine.add_lora
 
-    async def _add_lora(lora_request) -> None:
-        class LoRARequest:
-            def __getattr__(self, name: str) -> Any:
-                if name == "lora_tensors" and not hasattr(lora_request, name):
-                    return None
-                return getattr(lora_request, name)
+        async def _add_lora(lora_request: Any) -> None:
+            # Avoid wrappers; just ensure optional fields exist for Unsloth
+            try:
+                # Some Unsloth builds expect these attributes to exist
+                if not hasattr(lora_request, "lora_tensors"):
+                    setattr(lora_request, "lora_tensors", None)
+                if not hasattr(lora_request, "lora_embeddings"):
+                    setattr(lora_request, "lora_embeddings", None)
+                if not hasattr(lora_request, "tensorizer_config_dict"):
+                    setattr(lora_request, "tensorizer_config_dict", None)
+            except Exception:
+                # Best-effort; continue with original object
+                pass
+            await original_add_lora(lora_request)  # type: ignore
 
-            def __setattr__(self, name: str, value: Any) -> None:
-                setattr(lora_request, name, value)
-
-        await add_lora(LoRARequest())  # type: ignore
-
-    engine.add_lora = _add_lora
+        setattr(_add_lora, "__art_patched__", True)
+        setattr(_add_lora, "__art_original__", original_add_lora)
+        engine.add_lora = _add_lora
 
     @asynccontextmanager
     async def build_async_engine_client(
@@ -89,7 +97,7 @@ async def openai_server_task(
 
     test_client_task = asyncio.create_task(test_client())
     try:
-        timeout = float(os.environ.get("ART_SERVER_TIMEOUT", 30.0))
+        timeout = float(os.environ.get("ART_SERVER_TIMEOUT", 360.0))
         done, _ = await asyncio.wait(
             [openai_server_task, test_client_task],
             timeout=timeout,
