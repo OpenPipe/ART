@@ -16,6 +16,19 @@ if os.environ.get("IMPORT_PEFT", "0") == "1":
         conf.remove("expandable_segments:True")
     os.environ["PYTORCH_CUDA_ALLOC_CONF"] = ",".join(conf)
 
+try:
+    import transformers  # type: ignore
+
+    try:
+        from .transformers.patches import patch_preprocess_mask_arguments
+
+        patch_preprocess_mask_arguments()
+    except Exception:
+        pass
+except ImportError:
+    pass
+
+
 from . import dev
 from .auto_trajectory import auto_trajectory, capture_auto_trajectory
 from .backend import Backend
