@@ -20,7 +20,7 @@ def get_model_config(
         enable_prefix_caching=True,
         fast_inference=True,
         gpu_memory_utilization=(0.79 if enable_sleep_mode else 0.55),
-        load_in_4bit=True,
+        load_in_4bit=False,
         max_lora_rank=8,
         max_seq_length=32768,
         model_name=base_model,
@@ -33,6 +33,11 @@ def get_model_config(
         init_args.pop("gpu_memory_utilization")
         init_args.pop("max_lora_rank")
         init_args.pop("use_async")
+    # Qwen3 MoE models: avoid Unsloth empty-model trick that sets hidden_size=1,
+    # which breaks MoE gate dimensions during training. Disable fast_inference.
+    base_lower = base_model.lower()
+    if ("qwen3" in base_lower) and ("a3b" in base_lower or "moe" in base_lower):
+        init_args["fast_inference"] = False
     engine_args = EngineArgs(
         disable_log_requests=True,
         enable_sleep_mode=enable_sleep_mode,
@@ -57,12 +62,19 @@ def get_model_config(
             "k_proj",
             "v_proj",
             "o_proj",
-            "gate_proj",
-            "up_proj",
-            "down_proj",
         ],
         use_gradient_checkpointing="unsloth",
     )
+    # For Qwen3 MoE (A3B) models, avoid targeting MLP expert modules which
+    # produce expert-specific LoRA weights unsupported by vLLM. Restrict to
+    # attention projections only.
+    if ("qwen3" in base_lower) and ("a3b" in base_lower or "moe" in base_lower):
+        peft_args["target_modules"] = [
+            "q_proj",
+            "k_proj",
+            "v_proj",
+            "o_proj",
+        ]
     peft_args.update(config.get("peft_args", {}))
     trainer_args = TrainerArgs(
         adam_beta1=0.9,

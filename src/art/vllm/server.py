@@ -47,20 +47,22 @@ async def openai_server_task(
     patch_tool_parser_manager()
     set_vllm_log_file(config.get("log_file", "vllm.log"))
 
-    # Patch engine.add_lora; hopefully temporary
-    add_lora = engine.add_lora
+    # Patch engine.add_lora to ensure missing fields exist without wrapping
+    _orig_add_lora = engine.add_lora
 
     async def _add_lora(lora_request) -> None:
-        class LoRARequest:
-            def __getattr__(self, name: str) -> Any:
-                if name == "lora_tensors" and not hasattr(lora_request, name):
-                    return None
-                return getattr(lora_request, name)
-
-            def __setattr__(self, name: str, value: Any) -> None:
-                setattr(lora_request, name, value)
-
-        await add_lora(LoRARequest())  # type: ignore
+        # Some versions expect these attributes; set defaults if absent.
+        if not hasattr(lora_request, "lora_tensors"):
+            try:
+                setattr(lora_request, "lora_tensors", None)
+            except Exception:
+                pass
+        if not hasattr(lora_request, "lora_embeddings"):
+            try:
+                setattr(lora_request, "lora_embeddings", None)
+            except Exception:
+                pass
+        await _orig_add_lora(lora_request)  # type: ignore
 
     engine.add_lora = _add_lora
 
