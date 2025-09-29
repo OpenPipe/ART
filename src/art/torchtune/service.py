@@ -123,6 +123,20 @@ class TorchtuneService:
             # remove the weights file
             Path(weights_path).unlink(missing_ok=True)
 
+    async def set_temperature(self, temperature: float) -> None:
+        self.config.setdefault("trainer_args", {})["temperature"] = temperature
+        override_generation_config = self.config.setdefault(
+            "engine_args", {}
+        ).setdefault("override_generation_config", {})
+        override_generation_config["temperature"] = temperature
+        await self.start_openai_server(
+            dev.OpenAIServerConfig(
+                engine_args=dev.EngineArgs(
+                    override_generation_config={"temperature": temperature}
+                )
+            )
+        )
+
     async def update_worker_weights(
         self, llm: AsyncLLM, weights_path: str, profile: bool
     ) -> None:
