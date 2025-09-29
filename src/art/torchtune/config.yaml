@@ -1,0 +1,94 @@
+# Config for multi-device full finetuning in full_finetune_distributed.py
+# using a Qwen3 8B model
+#
+# This config assumes that you've run the following command before launching:
+#   tune download Qwen/Qwen3-8B --output-dir /tmp/Qwen3-8B
+#
+# To launch on 4 devices, run the following command from root:
+#   tune run --nnodes 1 --nproc_per_node 4 full_finetune_distributed --config qwen3/8B_full
+#
+# You can add specific overrides through the command line. For example
+# to override the checkpointer directory while launching training
+# you can run:
+#   tune run --nnodes 1 --nproc_per_node 4 full_finetune_distributed --config qwen3/8B_full checkpointer.checkpoint_dir=<YOUR_CHECKPOINT_DIR>
+#
+# This config works best when the model is being fine-tuned on 4+ GPUs.
+# Single device full finetuning requires more memory optimizations. It's
+# best to use 8B_full_single_device.yaml for those cases
+
+output_dir: /tmp/torchtune/qwen3_8B/full # /tmp may be deleted by your system. Change it to your preference.
+
+# Model Arguments
+model:
+  _component_: torchtune.models.qwen3.qwen3_8b_instruct
+
+checkpointer:
+  _component_: torchtune.training.FullModelHFCheckpointer
+  checkpoint_dir: /tmp/Qwen3-8B
+  checkpoint_files: [
+    model-00001-of-00005.safetensors,
+    model-00002-of-00005.safetensors,
+    model-00003-of-00005.safetensors,
+    model-00004-of-00005.safetensors,
+    model-00005-of-00005.safetensors,
+  ]
+  recipe_checkpoint: null
+  output_dir: ${output_dir}
+  model_type: QWEN3
+resume_from_checkpoint: False
+
+# Fine-tuning arguments
+epochs: 100
+optimizer:
+  _component_: torch.optim.AdamW
+  fused: True
+  lr: 5e-6
+max_steps_per_epoch: null
+gradient_accumulation_steps: 1  # Use to increase effective batch size
+clip_grad_norm: null
+compile: False  # torch.compile the model + loss, True increases speed + decreases memory
+optimizer_in_bwd: False  # True saves memory. Requires gradient_accumulation_steps=1
+
+# Training env
+device: cuda
+
+# Memory management
+enable_activation_checkpointing: True  # True reduces memory
+enable_activation_offloading: False  # True reduces memory
+
+# Reduced precision
+dtype: bf16
+
+# Logging
+metric_logger:
+  _component_: torchtune.training.metric_logging.DiskLogger
+  log_dir: ${output_dir}/logs
+log_every_n_steps: 1
+log_peak_memory_stats: False
+log_level: INFO  # DEBUG, WARN, etc.
+
+
+# Profiler (disabled)
+profiler:
+  _component_: torchtune.training.setup_torch_profiler
+  enabled: False
+
+  #Output directory of trace artifacts
+  output_dir: ${output_dir}/profiling_outputs
+
+  #`torch.profiler.ProfilerActivity` types to trace
+  cpu: True
+  cuda: True
+
+  #trace options passed to `torch.profiler.profile`
+  profile_memory: False
+  with_stack: False
+  record_shapes: True
+  with_flops: False
+
+  # `torch.profiler.schedule` options:
+  # wait_steps -> wait, warmup_steps -> warmup, active_steps -> active, num_cycles -> repeat
+  wait_steps: 5
+  warmup_steps: 3
+  active_steps: 2
+  num_cycles: 1

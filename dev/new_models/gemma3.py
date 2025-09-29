@@ -1,11 +1,13 @@
 import asyncio
 import json
+
+from dotenv import load_dotenv
+
 import art
 from art.local import LocalBackend
-from dotenv import load_dotenv
-import openai
 
 load_dotenv()
+
 
 async def rollout(model: art.TrainableModel, prompt: str) -> art.Trajectory:
     messages: art.Messages = [
@@ -16,7 +18,10 @@ async def rollout(model: art.TrainableModel, prompt: str) -> art.Trajectory:
     ]
     client = model.openai_client()
     chat_completion = await client.chat.completions.create(
-        messages=messages, model=model.name, max_tokens=100, timeout=100,
+        messages=messages,
+        model=model.name,
+        max_tokens=100,
+        timeout=100,
     )
     choice = chat_completion.choices[0]
     content = choice.message.content
@@ -30,6 +35,7 @@ async def rollout(model: art.TrainableModel, prompt: str) -> art.Trajectory:
     else:
         reward = 0.0
     return art.Trajectory(messages_and_choices=[*messages, choice], reward=reward)
+
 
 async def main():
     with open("dev/new_models/prompts.json", "r") as f:
@@ -60,6 +66,7 @@ async def main():
             train_groups,
             config=art.TrainConfig(learning_rate=1e-4),
         )
+
 
 if __name__ == "__main__":
     asyncio.run(main())

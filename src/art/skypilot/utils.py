@@ -1,8 +1,9 @@
-import sky
 import asyncio
 from typing import Callable, TypeVar
-from sky.core import endpoints
+
 import httpx
+import sky
+from sky.core import endpoints
 
 T = TypeVar("T")
 
@@ -11,12 +12,25 @@ async def to_thread_typed(func: Callable[[], T]) -> T:
     return await asyncio.to_thread(func)
 
 
-async def get_task_status(cluster_name: str, task_name: str) -> sky.JobStatus:
-    job_queue = await to_thread_typed(lambda: sky.queue(cluster_name))
+async def get_task_status(cluster_name: str, task_name: str) -> sky.JobStatus | None:
+    job_queue = await to_thread_typed(
+        lambda: sky.stream_and_get(sky.queue(cluster_name))
+    )
 
     for job in job_queue:
         if job["job_name"] == task_name:
             return job["status"]
+    return None
+
+
+async def get_task_job_id(cluster_name: str, task_name: str) -> int | None:
+    job_queue = await to_thread_typed(
+        lambda: sky.stream_and_get(sky.queue(cluster_name))
+    )
+
+    for job in job_queue:
+        if job["job_name"] == task_name:
+            return job["job_id"]
     return None
 
 
@@ -52,7 +66,7 @@ async def wait_for_task_to_start(cluster_name: str, task_name: str) -> None:
     )
 
 
-async def wait_for_art_server_to_start(cluster_name: str) -> None:
+async def wait_for_art_server_to_start(cluster_name: str) -> str:
     print(f"Waiting for art server task to start on cluster {cluster_name}...")
     await wait_for_task_to_start(cluster_name, "art_server")
     print(
@@ -70,7 +84,7 @@ async def wait_for_art_server_to_start(cluster_name: str) -> None:
         try:
             response = await client.get("/healthcheck")
             if response.status_code == 200:
-                return
+                return base_url
         except Exception:
             pass
         await asyncio.sleep(5)

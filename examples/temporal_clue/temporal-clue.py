@@ -1,12 +1,13 @@
-import art
 import asyncio
-from dotenv import load_dotenv
 import json
+import os
 import random
 import re
 from typing import TypedDict
-import os
 
+from dotenv import load_dotenv
+
+import art
 from art.local import LocalBackend
 
 load_dotenv()

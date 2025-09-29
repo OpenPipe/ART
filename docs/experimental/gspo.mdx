@@ -1,0 +1,59 @@
+---
+title: "GSPO (Group Sequence Policy Optimization)"
+description: "A stable and efficient RL algorithm for training language models"
+---
+
+<Note>
+GSPO is an experimental feature. The API and behavior may change in future releases.
+</Note>
+
+## Overview
+
+GSPO was introduced by the Qwen team to train state-of-the-art models including [Qwen3-235B-A22B-Instruct-2507](https://huggingface.co/Qwen/Qwen3-235B-A22B-Instruct-2507). It can improve training stability and efficiency for Mixture-of-Experts (MoE) models, and may have limited or no impact for dense models.
+
+## Key Benefits
+
+- **Stable Training**: Maintains stable training processes and resolves stability challenges in large MoE models
+- **Efficient Scaling**: Achieves higher training efficiency and continues improving with increased computational resources  
+- **Infrastructure-Friendly**: More tolerant of precision discrepancies, eliminating the need for complex strategies like "Routing Replay"
+
+## How It Works
+
+GSPO's core innovation is its **sequence-level optimization objective**. Instead of focusing on individual token likelihoods, GSPO defines importance ratios based on the **sequence likelihood** with length normalization to reduce variance.
+
+The algorithm optimizes:
+
+```
+J_GSPO(θ) = E[1/G ∑ᵢ min(sᵢ(θ) Âᵢ, clip(sᵢ(θ), 1-ε, 1+ε) Âᵢ)]
+```
+
+Where the importance ratio `sᵢ(θ)` is defined as:
+
+```
+sᵢ(θ) = (π_θ(yᵢ|x) / π_θ_old(yᵢ|x))^(1/|yᵢ|)
+```
+
+This sequence-level approach makes GSPO more robust to noise and eliminates the need for complex MoE-specific strategies.
+
+## Configuration
+
+GSPO can be configured using the `importance_sampling_level` parameter when training with ART:
+
+```python
+model.train(
+    trajectory_groups,
+    _config=art.dev.TrainConfig(
+        importance_sampling_level="sequence",
+    )
+)
+```
+
+## Technical Details
+
+For a deeper understanding of GSPO's technical foundations and comparative analysis with other RL algorithms, see the [original research paper](https://qwenlm.github.io/blog/gspo/).
+
+## Limitations
+
+- As an experimental feature, GSPO may have limited compatibility with some model architectures
+- Performance characteristics may vary depending on model size and dataset
+- API is subject to change in future releases

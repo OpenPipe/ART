@@ -1,4 +1,10 @@
-import polars as pl
+try:
+    import polars as pl
+except ImportError:
+    raise ImportError(
+        "Plotting dependencies are not installed. Please install them with: "
+        "pip install openpipe-art[plotting]"
+    )
 
 from art.utils.benchmarking.types import BenchmarkModelKey
 

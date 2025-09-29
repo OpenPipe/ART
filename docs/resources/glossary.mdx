@@ -1,0 +1,57 @@
+---
+title: "Glossary"
+description: "Terms and definitions used in the ART docs."
+icon: "circle-info"
+---
+
+## Additional Histories
+
+A feature that allows a trajectory to contain multiple separate conversation histories. Used for training agents with non-linear conversation flows, preserving special tokens across turns, or handling sub-agent interactions. See [Additional Histories](/features/additional-histories) for details.
+
+## Agent
+
+A program that uses an LLM to perform a task.
+
+## Batch Size
+
+The number of training scenarios that are run in a single training step.
+
+## Reward Function
+
+The function used to assess agent performance and score a trajectory.
+
+## Rollout
+
+A single attempt by the agent to complete a training or validation scenario.
+
+## Training Environment
+
+The programmatic environment that the agent interacts with. This includes all the tools available to the agent, the data it can query, and any other external aspects of the system the agent is operating in.
+
+## Training Loop
+
+The training loop is the process of training the agent.
+
+## Training Scenarios
+
+The scenarios that the agent will run through during training. Adding new training scenarios that represent edge cases on which the agent is currently underperforming will help it correct is behavior.
+
+## Training Step
+
+A single step in the training loop. During a training step, the agent completes a set of training scenarios and has its performance assessed and weights updated to improve its performance.
+
+## Trajectory
+
+A set of system, user, and assistant messages that are produced by the agent in a single rollout.
+
+## Trajectory Group
+
+A set of trajectories that the agent produced while completing a single scenario. Differences in trajectory rewards are used to train the agent.
+
+## Trajectory Group Size
+
+The number of trajectories in a trajectory group.
+
+## Validation Scenarios
+
+Validation scenarios are the scenarios that the agent is evaluated on. These scenarios are used to assess the agent's performance and determine whether it has improved.

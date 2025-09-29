@@ -1,0 +1,225 @@
+---
+title: Additional Histories
+description: Learn how to use additional histories for complex agent training scenarios
+---
+
+Additional histories allow you to include multiple separate conversation histories within a single trajectory. This powerful feature enables training of agents with non-linear conversation flows, such as agents that call sub-agents or compact their message history periodically.
+
+## What are Additional Histories?
+
+In ART, a trajectory typically contains a single sequence of messages representing the agent's conversation. However, some advanced use cases require training on multiple related but separate conversations within the same trajectory context. The `additional_histories` feature addresses this need.
+
+Each trajectory can contain:
+
+- A primary `messages_and_choices` sequence (the main conversation)
+- An optional list of `additional_histories`, where each history contains its own `messages_and_choices` and optional `tools`
+
+## Why Use Additional Histories?
+
+<Callout type="warning">
+  Note: for simplicity and ease of use, we've used normal "assistant" messages
+  in the examples below. In reality, you'll want to use `Choice` objects to
+  represent assistant messages that should be trained on, as seen in the example
+  notebooks.
+</Callout>
+
+### 1. Preserving Special Tokens in Multi-Turn Conversations
+
+Some models, like Qwen 3, use chat templates that remove special tokens (such as `<think>`) from previous turns in multi-turn conversations. This can interfere with training when you want the model to learn from its thinking process across all turns.
+
+By splitting each turn into a separate history, you can preserve these tokens for training:
+
+```python
+from art.trajectories import Trajectory, History
+
+# Instead of a single multi-turn conversation that loses <think> tokens
+# Train as separate histories to preserve them
+trajectory = Trajectory(
+    messages_and_choices=[
+        # First turn with thinking
+        {"role": "user", "content": "What is 2+2?"},
+        {"role": "assistant", "content": "<think>I need to add 2 and 2</think>4"}
+    ],
+    additional_histories=[
+        History(
+            messages_and_choices=[
+                # The Qwen 3 chat template removes <think> tokens from previous turns
+                {"role": "user", "content": "What is 2+2?"},
+                {"role": "assistant", "content": "4"},
+                {"role": "user", "content": "What is 3+3?"},
+                {"role": "assistant", "content": "<think>I need to add 3 and 3</think>6"}
+            ]
+        )
+    ]
+)
+```
+
+### 2. Training Agents That Call Sub-Agents
+
+When an agent delegates work to sub-agents, each sub-agent conversation can be stored as an additional history:
+
+```python
+trajectory = Trajectory(
+    # Main agent conversation
+    messages_and_choices=[
+        {"role": "user", "content": "Analyze this codebase and fix any bugs"},
+        {"role": "assistant", "tool_calls": [
+            {"type": "function", "function": {"name": "analyze_code", "arguments": "Find potential bugs in main.py"}},
+        ]},
+        {
+            "role": "tool",
+            "tool_call_id": "...",
+            "content": "Found 3 potential issues..."
+        },
+        {"role": "assistant", "tool_calls": [
+            {"type": "function", "function": {"name": "fix_issues", "arguments": "Fix the null pointer issue on line 42 of main.py"}},
+        ]},
+        {
+            "role": "tool",
+            "tool_call_id": "...",
+            "content": "Fixed by adding null check..."
+        },
+    ],
+    additional_histories=[
+        # Sub-agent 1: Code analysis
+        History(
+            messages_and_choices=[
+                {"role": "system", "content": "You are a code analysis expert"},
+                {"role": "user", "content": "Find potential bugs in main.py"},
+                {"role": "assistant", "content": "Found 3 potential issues..."}
+            ]
+        ),
+        # Sub-agent 2: Bug fixing
+        History(
+            messages_and_choices=[
+                {"role": "system", "content": "You are a bug fixing expert"},
+                {"role": "user", "content": "Fix the null pointer issue on line 42"},
+                {"role": "assistant", "content": "Fixed by adding null check..."}
+            ]
+        )
+    ]
+)
+```
+
+### 3. History Compaction and Summarization
+
+For long-running agents that periodically compress their conversation history:
+
+```python
+trajectory = Trajectory(
+    # Current active conversation
+    messages_and_choices=[
+        {"role": "system", "content": "You are a helpful assistant."},
+        {"role": "user", "content": "Explain quantum entanglement"},
+        {"role": "assistant", "content": "Quantum entanglement is..."},
+        # ... many more messages ...
+    ],
+    additional_histories=[
+        # Previous conversation segment before compaction
+        History(
+            messages_and_choices=[
+                {"role": "system", "content": "You are a helpful assistant."},
+                {"role": "user", "content": "Compacted conversation history: the user asked about quantum entanglement, and the assistant explained..."},
+                {"role": "user", "content": "Tell me more about the history of quantum entanglement"},
+                {"role": "assistant", "content": "Quantum entanglement was first..."},
+            ]
+        )
+    ]
+)
+```
+
+## How It Works
+
+### Tokenization Process
+
+When a trajectory with additional histories is tokenized:
+
+1. The main history (from `messages_and_choices`) is tokenized first
+2. Each additional history is tokenized separately
+3. The training weight is distributed across all tokenized results
+4. Each history maintains its own context and token boundaries
+
+```python
+# In the tokenization pipeline
+histories = [create_history_from_trajectory(trajectory)]  # Main history
+histories.extend(trajectory.additional_histories)  # Add all additional histories
+
+# Each history is tokenized independently
+for history in histories:
+    tokenized_result = tokenize_history(history)
+    # Weight is distributed across all results
+```
+
+### Data Structure
+
+The `History` class structure:
+
+```python
+@dataclass
+class History:
+    messages_and_choices: list[dict[str, Any]]
+    tools: list[Tool] | None = None
+```
+
+The `Trajectory` class with additional histories:
+
+```python
+@dataclass
+class Trajectory:
+    messages_and_choices: list[dict[str, Any]]
+    tools: list[Tool] | None = None
+    additional_histories: list[History] = field(default_factory=list)
+    reward: float | None = None
+    metrics: dict[str, Any] = field(default_factory=dict)
+```
+
+## Implementation Guide
+
+### Creating a Trajectory with Additional Histories
+
+```python
+from art.trajectories import Trajectory, History
+
+# Create the main conversation
+main_messages = [
+    {"role": "system", "content": "You are a helpful assistant"},
+    {"role": "user", "content": "Help me with a complex task"},
+    {"role": "assistant", "content": "I'll help you with that"}
+]
+
+# Create additional histories
+history1 = History(
+    messages_and_choices=[
+        {"role": "user", "content": "First subtask"},
+        {"role": "assistant", "content": "Completing first subtask..."}
+    ]
+)
+
+history2 = History(
+    messages_and_choices=[
+        {"role": "user", "content": "Second subtask"},
+        {"role": "assistant", "content": "Completing second subtask..."}
+    ]
+)
+
+# Combine into a trajectory
+trajectory = Trajectory(
+    messages_and_choices=main_messages,
+    additional_histories=[history1, history2],
+    reward=0.8,
+    metrics={"task_completed": True}
+)
+```
+
+## Current Limitations
+
+<Warning>
+  The RULER reward function does not currently support trajectories with
+  additional histories. If you attempt to use RULER with `additional_histories`,
+  it will raise an error. Support for this feature in RULER is planned for a
+  future release.
+</Warning>
+
+## Related Topics
+
+- [Models](/resources/models) - Model-specific considerations including Qwen 3

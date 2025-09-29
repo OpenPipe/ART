@@ -1,6 +1,13 @@
-import polars as pl
-from ..types import BenchmarkModelKey
+try:
+    import polars as pl
+except ImportError:
+    raise ImportError(
+        "Plotting dependencies are not installed. Please install them with: "
+        "pip install openpipe-art[plotting]"
+    )
+
 from ..filter_model_split import filter_rename_model_split
+from ..types import BenchmarkModelKey
 
 
 def percentage_comparison_bar_chart(
@@ -10,6 +17,7 @@ def percentage_comparison_bar_chart(
     title: str | None = None,
     y_label: str | None = None,
     perfect_score: float | None = None,
+    num_decimals: int = 0,
 ):
     """Create a bar chart visualising *metric_name* for all *models* at the
     **first** and **last** available training step.
@@ -45,12 +53,16 @@ def percentage_comparison_bar_chart(
         The created figure so that it can be displayed inline in IPython /
         Jupyter notebooks.
     """
-    import os
-    from pathlib import Path
 
-    import matplotlib.pyplot as plt
-    import numpy as np
-    import seaborn as sns
+    try:
+        import matplotlib.pyplot as plt
+        import numpy as np
+        import seaborn as sns
+    except ImportError:
+        raise ImportError(
+            "Plotting dependencies are not installed. Please install them with: "
+            "pip install openpipe-art[plotting]"
+        )
 
     # create new copy of df
     df = df.clone()
@@ -71,14 +83,14 @@ def percentage_comparison_bar_chart(
     # ------------------------------------------------------------------
 
     if models is not None:
-        models = [
+        models_keys = [
             entry if isinstance(entry, BenchmarkModelKey) else BenchmarkModelKey(entry)
             for entry in models
         ]
 
-        df = filter_rename_model_split(df, models)
+        df = filter_rename_model_split(df, models_keys)
 
-        plot_models = [key.display_name for key in models]
+        plot_models = [key.display_name for key in models_keys]
     else:
         step_counts = (
             df.group_by("model")
@@ -125,21 +137,11 @@ def percentage_comparison_bar_chart(
     fig, ax = plt.subplots(figsize=(6, 4))
     ax.grid(False)
 
-    trained_set = {m for m, b, imp in model_stats if imp != 0}
-
     # ------------------------------------------------------------------
     # Colour scheme - match the example shared by the caller
     # ------------------------------------------------------------------
     ORANGE = "#e67a30"
     GREY = "#e0dcd5"
-
-    # Colour assignment: use same approach (trained first) so the most
-    # distinctive colours are given to the trained models.
-    ordered_for_palette = [m for m in plot_models if m in trained_set] + [
-        m for m in plot_models if m not in trained_set
-    ]
-    palette = sns.color_palette(n_colors=len(ordered_for_palette))
-    model_colors = {m: c for m, c in zip(ordered_for_palette, palette)}  # type: ignore
 
     bar_width = 0.7
     x_positions = np.arange(len(model_stats))
@@ -174,7 +176,7 @@ def percentage_comparison_bar_chart(
             ax.text(
                 x_positions[idx],
                 base_scaled + imp_scaled / 2,
-                f"RL +{imp_scaled:.0f}{'%' if scale == 100 else ''}",
+                f"RL +{imp_scaled:.{num_decimals}f}{'%' if scale == 100 else ''}",
                 ha="center",
                 va="center",
                 color="#c05a20",  # slightly darker orange for contrast
@@ -193,7 +195,7 @@ def percentage_comparison_bar_chart(
         ax.text(
             x_positions[idx],
             total + (max_val * scale) * 0.02,
-            f"{total:.0f}{'%' if scale == 100 else ''}",
+            f"{total:.{num_decimals}f}{'%' if scale == 100 else ''}",
             ha="center",
             va="bottom",
             fontweight="bold",

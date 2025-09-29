@@ -1,11 +1,11 @@
 from __future__ import annotations
 
-import os
 import asyncio
-from asyncio.subprocess import DEVNULL
+import os
 import tempfile
-from typing import Optional, Sequence
 import zipfile
+from asyncio.subprocess import DEVNULL
+from typing import Literal, Optional, Sequence
 
 from art.errors import ForbiddenBucketCreationError
 from art.utils.output_dirs import (
@@ -16,6 +16,8 @@ from art.utils.output_dirs import (
 from ..utils import limit_concurrency
 
 __all__: Sequence[str] = ("s3_sync",)
+
+ExcludableOption = Literal["checkpoints", "logs", "trajectories"]
 
 
 class S3SyncError(RuntimeError):
@@ -37,7 +39,8 @@ def build_s3_path(
     prefix_part = f"{prefix.strip('/')}/" if prefix else ""
     path = f"s3://{s3_bucket}/{prefix_part}{project}/models/{model_name}"
     if step is not None:
-        path += f"/{step:04d}"
+        # Use the new checkpoint structure in S3
+        path += f"/checkpoints/{step:04d}"
     return path
 
 
@@ -67,6 +70,7 @@ async def s3_sync(
     profile: Optional[str] = None,
     verbose: bool = False,
     delete: bool = False,
+    exclude: list[ExcludableOption] | None = None,
 ) -> None:
     """Synchronise *source* and *destination* using the AWS CLI.
 
@@ -82,6 +86,7 @@ async def s3_sync(
         profile: Optional AWS profile name to pass to the CLI.
         verbose: When *True*, the output of the AWS CLI is streamed to the
             calling process; otherwise it is suppressed.
+        exclude: List of directories to exclude from sync.
 
     Raises:
         S3SyncError: If the *aws s3 sync* command exits with a non‑zero status.
@@ -100,6 +105,12 @@ async def s3_sync(
 
     if delete:
         cmd.append("--delete")
+
+    # Add exclude patterns for each excluded directory
+    if exclude:
+        for excluded_dir in exclude:
+            cmd.extend(["--exclude", f"{excluded_dir}/*"])
+
     cmd += [source, destination]
 
     # Suppress output unless verbose mode is requested.
@@ -156,6 +167,7 @@ async def pull_model_from_s3(
     verbose: bool = False,
     delete: bool = False,
     art_path: str | None = None,
+    exclude: list[ExcludableOption] | None = None,
 ) -> str:
     """Pull a model from S3 to the local directory.
 
@@ -169,6 +181,7 @@ async def pull_model_from_s3(
             calling process; otherwise it is suppressed.
         delete: When *True*, delete the local model directory if it exists.
         art_path: The path to the ART directory.
+        exclude: List of directories to exclude from sync.
 
     Returns:
         The local directory path.
@@ -179,11 +192,14 @@ async def pull_model_from_s3(
         art_path=art_path,
     )
     os.makedirs(local_model_dir, exist_ok=True)
-    local_dir = local_model_dir
+    # Use the new checkpoint structure
     if step is not None:
-        local_step_dir = get_step_checkpoint_dir(local_model_dir, step)
-        os.makedirs(local_step_dir, exist_ok=True)
-        local_dir = local_step_dir
+        # Pull directly to the new checkpoint structure
+        checkpoint_dir = get_step_checkpoint_dir(local_model_dir, step)
+        os.makedirs(checkpoint_dir, exist_ok=True)
+        local_dir = checkpoint_dir
+    else:
+        local_dir = local_model_dir
 
     s3_path = build_s3_path(
         model_name=model_name,
@@ -193,7 +209,13 @@ async def pull_model_from_s3(
         prefix=prefix,
     )
     await ensure_bucket_exists(s3_bucket)
-    await s3_sync(s3_path, local_dir, verbose=verbose, delete=delete)
+    if verbose:
+        print(f"DEBUG: S3 sync from {s3_path} to {local_dir}")
+    await s3_sync(s3_path, local_dir, verbose=verbose, delete=delete, exclude=exclude)
+    if verbose:
+        print(
+            f"DEBUG: After sync, local_dir contents: {os.listdir(local_dir) if os.path.exists(local_dir) else 'Does not exist'}"
+        )
 
     return local_model_dir
 

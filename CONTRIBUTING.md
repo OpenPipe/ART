@@ -3,8 +3,8 @@
 Clone the repository:
 
 ```bash
-git clone https://github.com/OpenPipe/agent-reinforcement-training.git
-cd agent-reinforcement-training
+git clone https://github.com/OpenPipe/ART.git
+cd ART
 ```
 
 Install the dependencies:
@@ -13,9 +13,57 @@ Install the dependencies:
 uv sync
 ```
 
-Then follow the SkyPilot or Local Training instructions below.
+### Code Formatting and Linting
 
-> **Warning:** There is currently a bug with tool use functionality. The issue appears to be that vLLM does not return all the token log probabilities for tool use. Further investigation is needed to determine the exact cause. For now, teaching use case-specific tool use with non-tool use models is the recommended workaround.
+This project uses [ruff](https://github.com/astral-sh/ruff) for both code formatting and linting. Before submitting a pull request, please ensure your code passes all quality checks:
+
+```bash
+# Run all code quality checks (formatting, linting, and dependency sync)
+./scripts/run_checks.sh
+
+# Automatically fix any issues that can be fixed
+./scripts/run_checks.sh --fix
+```
+
+The `run_checks.sh` script will:
+
+1. Check code formatting with ruff
+2. Check for linting issues with ruff
+3. Verify that `uv.lock` is in sync with `pyproject.toml`
+
+These checks are automatically run in CI for all pull requests. If your PR fails these checks, simply run `./scripts/run_checks.sh --fix` locally and commit the changes.
+
+### Release Process
+
+To create a new release:
+
+1. **Review merged PRs since the last release**:
+   - Go to the [pull requests page](https://github.com/OpenPipe/ART/pulls?q=is%3Apr+is%3Amerged+sort%3Aupdated-desc)
+   - Review PRs merged since the last release to understand what changed
+   - Note any breaking changes, new features, or important bug fixes
+
+2. **Create a draft release**:
+   - Go to [Actions](https://github.com/OpenPipe/ART/actions/workflows/create-draft-release.yml)
+   - Click "Run workflow"
+   - Select the version bump type:
+     - `patch`: Bug fixes and minor changes (0.3.13 → 0.3.14)
+     - `minor`: New features and non-breaking changes (0.3.13 → 0.4.0)  
+     - `major`: Breaking changes (0.3.13 → 1.0.0)
+
+3. **Edit the draft release notes**:
+   - Go to the [releases page](https://github.com/OpenPipe/ART/releases)
+   - Click "Edit" on the draft release
+   - Add release highlights, breaking changes, and curated changelog
+   - The auto-generated PR list provides a starting point, but manual curation improves clarity
+
+4. **Finalize the release**:
+   - Review and merge the automatically created release PR
+   - This will automatically:
+     - Create the git tag
+     - Publish the curated release notes
+     - Build and publish the package to PyPI
+
+Then follow the SkyPilot or Local Training instructions below.
 
 ### SkyPilot
 

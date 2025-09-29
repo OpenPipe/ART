@@ -1,0 +1,103 @@
+{
+  "results": [
+    {
+      "url": "https://www.openpipe.ai",
+      "question": "Find all the open jobs and descriptions and salary ranges for this company",
+      "answer": "The LinkedIn page for OpenPipe requires signing in to view more detailed information. However, we can still gather some useful information from the publicly accessible parts of the page.\n\nFrom the page, we can see that OpenPipe is hiring for various roles, though specific job details and salary ranges are not available without signing in. Here are the roles mentioned:\n\n- DevRel Engineer (In Office, San Francisco, CA)\n- Founding AI Engineer (In Office, Bellevue, WA)\n- Founding Software Engineer (Backend) (In Office, Bellevue, WA)\n- Founding Software Engineer (Full Stack) (In Office, Bellevue, WA)\n\nTo get more detailed information, we would need to visit the actual job posting pages linked from the OpenPipe careers page or sign in to LinkedIn.\n\nSince we don't have direct access to these details here, let's conclude with what we have.\n\nFinal Answer:\n- **DevRel Engineer** (In Office, San Francisco, CA)\n- **Founding AI Engineer** (In Office, Bellevue, WA)\n- **Founding Software Engineer (Backend)** (In Office, Bellevue, WA)\n- **Founding Software Engineer (Full Stack)** (In Office, Bellevue, WA)\n\nFor more detailed job descriptions and salary ranges, please visit the OpenPipe careers page or sign in to LinkedIn.",
+      "score": 0.5,
+      "justification": "The answer lists the open jobs and their locations, which is relevant and specific. However, it does not provide job descriptions or salary ranges, and it does not cite any evidence from the provided URL (openpipe.ai), instead referencing LinkedIn. The answer is clear and concise, but lacks key requested details and direct grounding in the provided page."
+    },
+    {
+      "url": "https://www.withflex.com/shop",
+      "question": "Find all the open jobs and descriptions and salary ranges for this company",
+      "answer": "1. Manager, Strategic Finance & GTM Ops (Finance & Strategy, Remote, Full-time)\n2. Support Engineer (Engineering, Remote, Full-time)\n3. Software Engineer (Engineering, Remote, Full-time, Salary Range: $165K - $212K)",
+      "score": 0.5,
+      "justification": "The answer lists three job titles and provides a salary range for one, but does not include job descriptions or salary ranges for all positions. The information is partially relevant and specific, but incomplete and lacks evidence for all required details."
+    },
+    {
+      "url": "https://www.trymartin.com/",
+      "question": "Find all the open jobs and descriptions and salary ranges for this company",
+      "answer": "Here are the open jobs and their descriptions along with salary ranges for Martin:\n\n1. **Founding Growth Marketer**\n   - **Location:** San Francisco, CA, US\n   - **Salary Range:** $100K - $140K\n   - **Equity:** 0.50% - 1.50%\n   - **Experience:** Any (new grads okay)\n\n2. **Founding Product Engineer**\n   - **Location:** San Francisco, CA, US\n   - **Salary Range:** $120K - $180K\n   - **Equity:** 1.00% - 2.50%\n   - **Experience:** 3+ years\n\n3. **Founding AI Engineer**\n   - **Location:** San Francisco, CA, US\n   - **Salary Range:** $120K - $180K\n   - **Equity:** 1.00% - 2.50%\n   - **Experience:** 3+ years\n\nTo apply for these positions, you would need to authenticate through your Y Combinator account.\n\nFinal Answer:\n- Founding Growth Marketer: $100K - $140K\n- Founding Product Engineer: $120K - $180K\n- Founding AI Engineer: $120K - $180K\n\nAll positions are located in San Francisco, CA, USA.",
+      "score": 0.85,
+      "justification": "The answer lists all open jobs, their locations, salary ranges, and equity, which matches the information on the provided page. However, it omits the full job descriptions, which are present on the site. The answer is otherwise clear, relevant, and concise, but lacks the key detail of job descriptions for full specificity."
+    },
+    {
+      "url": "https://www.healthtech1.uk/",
+      "question": "Find all the open jobs and descriptions and salary ranges for this company",
+      "answer": "Healthtech-1 เปิดรับสมัครตำแหน่งงาน Software Engineers และ Growth Specialists รายละเอียดของงานและช่วงเงินเดือนสามารถพบได้ที่เว็บไซต์การสมัครงานที่ URL: https://jobs.ashbyhq.com/Healthtech-1",
+      "score": 0.3,
+      "justification": "The answer identifies two open roles (Software Engineers and Growth Specialists) and provides a link to a jobs page, but it does not list all open jobs, their descriptions, or salary ranges as requested. There is no evidence or specific detail from the provided URL, and the answer is not sufficiently specific or complete."
+    },
+    {
+      "url": "https://www.feanixbio.com/",
+      "question": "Find all the open jobs and descriptions and salary ranges for this company",
+      "answer": "There are no open jobs listed on the website feanixbio.com.",
+      "score": 0.85,
+      "justification": "The answer is relevant, clear, and concise, directly addressing the question by stating there are no open jobs listed. However, it lacks explicit evidence (such as a statement like 'Careers page checked and found empty'), and does not mention job descriptions or salary ranges, though this is justified by their absence. Slight penalty for not specifying where or how this was determined."
+    },
+    {
+      "url": "https://www.orbio.earth/",
+      "question": "Find all the open jobs and descriptions and salary ranges for this company",
+      "answer": "No currently open job listings. Research Residency program available for innovative thinkers. Contact info@orbio.earth for more information.",
+      "score": 0.7,
+      "justification": "The answer correctly states there are no open job listings and mentions the Research Residency program, which matches the information on the page. However, it does not provide job descriptions or salary ranges, and the answer could be more specific about the lack of such details on the site."
+    },
+    {
+      "url": "https://aide.dev/",
+      "question": "Find all the open jobs and descriptions and salary ranges for this company",
+      "answer": "No open jobs or descriptions were found on the Aide.dev website.",
+      "score": 0.95,
+      "justification": "The answer is relevant, concise, and clear, directly stating that no open jobs or descriptions were found. However, it would be slightly improved by specifying that no salary ranges were found either. Evidence is grounded in the provided page."
+    },
+    {
+      "url": "https://www.trycatamaran.com/",
+      "question": "Find all the open jobs and descriptions and salary ranges for this company",
+      "answer": "There are no open jobs or job descriptions available on the TryCatamaran website.",
+      "score": 0.9,
+      "justification": "The answer is relevant, clear, and concise, directly stating that there are no open jobs or descriptions on the website. However, it does not explicitly mention salary ranges, though this is likely because no jobs are listed. The answer could be slightly improved by stating that no salary information is available either."
+    },
+    {
+      "url": "https://www.coba.ai/",
+      "question": "Find all the open jobs and descriptions and salary ranges for this company",
+      "answer": "No job openings were found on the Coba website. They may post job listings on LinkedIn or another careers page that is not directly linked from the main site.",
+      "score": 0.7,
+      "justification": "The answer is relevant and clear, stating that no job openings were found on the Coba website, which addresses the question. However, it lacks evidence (such as a direct statement from the site) and does not provide any job descriptions or salary ranges, nor does it specify that these details are unavailable. The answer could be more specific about where it looked and what was found."
+    },
+    {
+      "url": "https://trytaylor.ai/",
+      "question": "Find all the open jobs and descriptions and salary ranges for this company",
+      "answer": "No direct job listings were found on the Taylor AI website or LinkedIn page due to authentication requirements. For the most recent job openings and details, please visit Taylor AI's LinkedIn page and search for 'Taylor AI jobs' online.",
+      "score": 0.2,
+      "justification": "The answer does not provide any specific job listings, descriptions, or salary ranges as requested. It is relevant in acknowledging the lack of information but lacks evidence, specificity, and detail from the provided URL."
+    },
+    {
+      "url": "https://www.tempo.new/",
+      "question": "Find all the open jobs and descriptions and salary ranges for this company",
+      "answer": "The open jobs at Tempo include:\n- Frontend Engineer (React Native): Remote across Philippines, Argentina, India, Brazil; Full time; Compensation: $40,000 - $60,000 (starting salary fixed at $40,000 USD, non-negotiable).\n- Frontend Engineer (React): Remote across Philippines, Argentina, India, Brazil; Full time.\n- Product Designer: Remote across Brazil, India, Argentina; Full time.\nThe salary range for the Frontend Engineer (React Native) is $40,000 - $60,000, with a starting salary fixed at $40,000 USD.",
+      "score": 0.7,
+      "justification": "The answer lists the open jobs and provides a salary range for the Frontend Engineer (React Native) role, which matches the information on the site. However, it does not provide job descriptions or salary ranges for the other positions (Frontend Engineer (React) and Product Designer), which are key details asked in the question. The answer is clear and concise but incomplete regarding specificity and evidence for all roles."
+    },
+    {
+      "url": "https://curatle.com/",
+      "question": "Find all the open jobs and descriptions and salary ranges for this company",
+      "answer": "It appears there is no specific \"Contact Us\" page or any mention of job openings on the main website or the Privacy Policy/Terms of Service pages.\n\nSince I couldn't find any open jobs on the Curatle website, I'll conclude that there are no publicly listed job openings at this time.\n\nTo find out more about potential job opportunities, you could try searching their social media channels or professional networking sites like LinkedIn.\n\nReturning the answer:\n\nThere are no open jobs listed on the Curatle website.",
+      "score": 0.9,
+      "justification": "The answer is relevant, clear, and concise, directly addressing the question by stating there are no open jobs listed on the Curatle website. It is grounded in the provided page, as the agent checked the main and policy pages. However, it could be slightly more specific by stating explicitly that no job descriptions or salary ranges are available, rather than just implying it."
+    },
+    {
+      "url": "https://autotab.com/",
+      "question": "Find all the open jobs and descriptions and salary ranges for this company",
+      "answer": "No open jobs or job descriptions were found on the Autotab website.",
+      "score": 0.9,
+      "justification": "The answer is relevant, clear, and concise, stating that no open jobs or descriptions were found. However, it would be slightly improved by specifying that the website was checked for a careers or jobs section, so a minor penalty is applied for not explicitly stating the search process."
+    },
+    {
+      "url": "https://oliolabs.co/",
+      "question": "Find all the open jobs and descriptions and salary ranges for this company",
+      "answer": "Unfortunately, there are no job listings found for Olio Labs in the United States according to LinkedIn's search results.\n\nGiven this information, it appears that Olio Labs does not have any publicly listed job openings on LinkedIn at the moment.\n\nTherefore, I am unable to find any open jobs and their descriptions or salary ranges for Olio Labs.\n\nReturning the final answer:\n\nThere are no currently open jobs listed for Olio Labs on LinkedIn.\n\nIf you would like further assistance or if there is another source where we can find this information, please let me know!\n\nWould you like to try another approach or source?",
+      "score": 0.4,
+      "justification": "The answer does not reference or use information from the provided URL (oliolabs.co), instead relying on LinkedIn, which is not the source requested. It addresses the question but lacks evidence from the specified page, and does not provide any job descriptions or salary ranges as asked. The response is clear and concise, but not grounded in the required source."
+    }
+  ],
+  "avg_score": 0.6679
+}

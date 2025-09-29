@@ -1,17 +1,16 @@
 from .engine import EngineArgs
 from .model import (
-    get_model_config,
-    InternalModelConfig,
     InitArgs,
+    InternalModelConfig,
     PeftArgs,
     TrainerArgs,
 )
-from .openai_server import get_openai_server_config, OpenAIServerConfig, ServerArgs
+from .openai_server import OpenAIServerConfig, ServerArgs, get_openai_server_config
+from .torchtune import TorchtuneArgs
 from .train import TrainConfig
 
 __all__ = [
     "EngineArgs",
-    "get_model_config",
     "InternalModelConfig",
     "InitArgs",
     "PeftArgs",
@@ -19,5 +18,6 @@ __all__ = [
     "get_openai_server_config",
     "OpenAIServerConfig",
     "ServerArgs",
+    "TorchtuneArgs",
     "TrainConfig",
 ]

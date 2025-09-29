@@ -1,0 +1,135 @@
+---
+title: "Summarizer Tutorial"
+sidebarTitle: "Summarizer"
+description: "Train a summarizer model to outperform Sonnet 4 and GPT-4.1."
+icon: "list"
+---
+
+Most SOTA models are already trained to condense long documents into short summaries. However, not every summary is created equal.
+
+In this tutorial, we're going to train a summarizer that excels at filtering useful information from a document and cutting out the fluff. To skip ahead and see the results of a prior training run, check out the [blog post](https://openpipe.ai/blog/summary-rl). Otherwise, please enjoy this tutorial!
+
+<Info>
+
+Reading time: <b>45 min</b>
+
+Training time: <b>4 hours</b>
+
+Total cost: <b>$22</b>
+
+</Info>
+
+## Step 1: Clone the starter repo and install dependencies
+
+To get started, clone [Summary-RL](https://github.com/OpenPipe/Summary-RL/), which contains the following pieces of our RL pipeline:
+
+- The agent's environment
+- The reward function
+- Some training examples
+
+Once the repository is cloned, install dependencies. If you haven't already, install `uv` by following the instructions [here](https://docs.astral.sh/uv/getting-started/installation/).
+
+Then install the project dependencies by running `uv sync`.
+
+### 2. Install SkyPilot/RunPod
+
+We'll be using `SkyPilotBackend` to manage the GPU that your model will be trained on. You'll need to install ART with the SkyPilot optional dependency:
+
+```bash
+pip install openpipe-art[skypilot]
+```
+
+In order for the backend to work, you'll need to have SkyPilot installed on your machine and provide it with the credentials to spin up machines on at least one infra provider.
+
+We recommend using RunPod because of their ease of use, but any infra provider that SkyPilot [supports](https://docs.skypilot.co/en/latest/overview.html#bringing-your-infra) will work.
+
+Follow RunPod's **Getting Started** guide [here](https://docs.runpod.io/integrations/skypilot/). You'll have to provide a credit card to use RunPod, but you'll only pay for the time your GPUs are running.
+
+### 3. Set up optional environment variables found in `.env.example`.
+
+In a new `.env` file at the root of the repository, set the following optional environment variables:
+
+- `WANDB_API_KEY` - Enables metric logging to Weights & Biases.
+- `OPENPIPE_API_KEY` - Enables chat completion logging to OpenPipe.
+- `OPENAI_API_KEY` - Will be necessary for later comparison benchmarks, but not used for training.
+
+To enable model and logging backup to S3, you'll also need to provide AWS credentials. These are necessary for generating the benchmarks found in the `benchmarks` directory, but not for training itself. If you don't already have AWS credentials with create/read/write permissions for s3 buckets, follow the instructions [here](https://github.com/OpenPipe/Summary-RL/blob/main/CONFIGURING_AWS.md).
+
+- `AWS_ACCESS_KEY_ID` - Your AWS access key ID, which should have create/read/write permissions for s3 buckets.
+- `AWS_SECRET_ACCESS_KEY` - Your matching secret access key.
+- `AWS_REGION` - The region of the S3 bucket.
+- `BACKUP_BUCKET` - The name of the S3 bucket in which to store model checkpoints and logging data. Can be a new bucket or an existing one.
+
+### 4. Run the training script
+
+```bash
+uv run python src/summarizer/train.py
+```
+
+The following steps execute when a training run on a new cluster begins:
+
+- **Spin up a cluster with 1 H100 GPU.**
+  - This usually takes about 10 minutes, but RunPod occasionally has network throughput issues that can cause the cluster to take up to 30 minutes to spin up. Once the cluster is provisioned, it can be used for subsequent training runs without going through this process again.
+- **Register the model with ART.**
+  - This usually takes less than 5 minutes, though it can require up to 30 minutes if RunPod experiences network issues.
+- **Download the model checkpoint from S3.**
+  - Usually takes a few seconds.
+- **Train the model for a specified number of steps.**
+  - Training itself should be pretty quick (each step takes less than a minute), but the total training time will depend on how many steps you run for. During training, the model checkpoint is saved to S3 after each step.
+- **Upload the final model checkpoint to S3.**
+  - This usually takes a few seconds.
+
+### 5. Shutting down the cluster
+
+When you're done training and running benchmarks, you can shut down the cluster in two ways:
+
+Through the CLI:
+
+```bash
+uv run sky down <cluster-name>
+```
+
+or through code:
+
+```python
+DESTROY_AFTER_RUN = True
+
+if DESTROY_AFTER_RUN:
+    await backend.down()
+```
+
+However, since spinning up clusters is a time-intensive process, we recommend keeping clusters alive until you're sure you won't be using them in the near future.
+
+### Running Benchmarks
+
+The `benchmark_models.py` script will compare the performance of the trained model to `gpt-4o`, `gpt-4.1`, `o4-mini`, and `gemini-2.5-pro-preview`.
+
+Before running the benchmark script, make sure you've provided a valid `OPENROUTER_API_KEY` and the AWS credentials detailed in step 3. These credentials are necessary for the script to upload the benchmark results to S3.
+
+```bash
+uv run python benchmarks/benchmark_models.py
+```
+
+This script will:
+
+- Run each benchmarked model through each document in the validation set.
+- Record the percentage of questions that each model's summary allowed Gemini 2.5 Flash to answer correctly.
+- Upload the results to S3.
+
+Once the benchmark generation script has finished running, you can view the results and generate visual charts by navigating to `benchmarks/display_benchmarks.ipynb` and running the cells. After running all the cells, you should see something like the following:
+
+<img
+  src="https://github.com/OpenPipe/Summary-RL/raw/main/assets/benchmarks/summarize/percentage-training-progress.svg"
+  alt="Benchmark Percentage of Questions Answered Comparison"
+  width="500"
+/>
+
+_The percentage of questions that each model's summary allowed Gemini 2.5 Flash to answer correctly at each training step. By step 40 of this training run, the trained model outperforms every other model._
+
+<img
+  src="https://github.com/OpenPipe/Summary-RL/raw/main/assets/benchmarks/summarize/percentage-comparison.svg"
+  alt="Benchmark Percentage of Questions Answered Comparison"
+  width="500"
+/>
+
+_A side-by-side comparison of the percentage of questions that each model's summary allowed Gemini 2.5 Flash to answer correctly. The trained model began with a percentage of 37%, but by the final step, it was able to generate summaries that allowed Gemini 2.5 Flash to answer 70% of the questions correctly._

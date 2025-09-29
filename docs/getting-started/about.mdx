@@ -1,0 +1,125 @@
+---
+title: "ART Docs"
+description: "Train your own multi-turn agents with **ART**, an open-source framework for LLM reinforcement learning using GRPO."
+icon: "house"
+---
+
+**ART** (Agent Reinforcement Trainer) is an open-source training framework for teaching agentic LLMs to improve **performance and reliability** through **experience**. ART provides a convenient wrapper around reinforcement learning techniques like **GRPO** (Group Relative Policy Optimization) to dramatically improve model performance while minimizing training costs.
+
+Our docs will guide you through the process of training your own agents to operate more **reliably and efficiently**.
+
+<div className="cards-container">
+  <div className="card-wrapper">
+    <Card
+      title="Quick Start"
+      icon="forward"
+      href="/getting-started/quick-start"
+      horizontal={true}
+      arrow={true}
+    ></Card>
+  </div>
+  <div className="card-wrapper">
+    <Card
+      title="Notebooks"
+      icon="book"
+      href="/getting-started/notebooks"
+      horizontal={true}
+      arrow={true}
+    ></Card>
+  </div>
+</div>
+<div className="cards-container">
+  <div className="card-wrapper">
+    <Card
+      title="Supported Models"
+      icon="robot"
+      href="/resources/models"
+      horizontal={true}
+      arrow={true}
+    ></Card>
+  </div>
+  <div className="card-wrapper">
+    <Card
+      title="FAQ"
+      icon="block-question"
+      href="/getting-started/faq"
+      horizontal={true}
+      arrow={true}
+    ></Card>
+  </div>
+</div>
+
+## Why ART?
+
+- ART provides convenient wrappers for introducing RL training into **existing applications**. We abstract the training server into a modular service that your code doesn't need to interface with.
+- **Train from anywhere.** Run the ART client on your laptop and let the ART server kick off an ephemeral GPU-enabled environment, or run on a local GPU.
+- Integrations with hosted platforms like W&B, Langfuse, and OpenPipe provide flexible observability and **simplify debugging**.
+- ART is customizable with **intelligent defaults**. You can configure training parameters and inference engine configurations to meet specific needs, or take advantage of the defaults, which have been optimized for training efficiency and stability.
+
+## Installation
+
+ART agents can be trained from any client machine that runs python. To add to an existing project, run this command:
+
+```
+pip install openpipe-art
+```
+
+## What is RL and when should I use it?
+
+RL (reinforcement learning) is a set of training techniques that allow AI models to learn from their own experience.
+
+Applying RL to an existing LLM can:
+
+- **Improve overall agent reliablity**
+- **Correct specific mistakes detected in QA or production**
+- **Build confidence in agent performance before deploying to users**
+
+Examples:
+
+- Train a deep research agent to search and parse information from a knowledge store.
+- Resolve annoying bugs in model behavior by adding new training examples.
+- Build a lightning fast voice agent that always follows its script.
+
+## What do I need in order to use RL?
+
+Getting started may be simpler than you expect.
+
+### Things you DO need:
+
+<ul>
+  <li>✅ A project that uses one or more LLMs.</li>
+  <li>✅ Knowledge of the kinds of scenarios your LLM will have to handle.</li>
+  <li>✅ That's it!</li>
+</ul>
+
+### Things you DON'T need:
+
+<ul>
+  <li>❌ A training dataset.</li>
+  <li>❌ A complicated reward function.</li>
+  <li>❌ A development machine with a GPU.</li>
+  <li>❌ A PhD from MIT.</li>
+  <li>❌ Existing RL expertise.</li>
+</ul>
+
+## How to start using ART?
+
+The ART client can be installed into projects designed to run on any machine that runs python. ART server can be run on any machine with a GPU, including your local laptop or within any cloud environment equipped with GPUs. To train an agent for free, try training a model to play 2048 on a free GPU in Google Colab.
+
+<Card
+  title="Train an agent to play 2048"
+  icon="robot"
+  href="https://colab.research.google.com/github/openpipe/art-notebooks/blob/main/examples/2048/2048.ipynb"
+  horizontal={true}
+  arrow={true}
+></Card>
+
+Or install ART into your existing project to start improving your agent's performance!
+
+<Card
+  title="Install ART in an existing project"
+  icon="gear"
+  href="/getting-started/installation-setup"
+  horizontal={true}
+  arrow={true}
+></Card>

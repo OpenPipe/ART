@@ -1,0 +1,9 @@
+[project]
+name = "playwright-agent"
+version = "0.1.0"
+requires-python = ">=3.10"
+dependencies = [
+    "mcp>=1.13.1",
+    "openpipe>=5.0.0",
+    "panza>=0.1.0",
+]

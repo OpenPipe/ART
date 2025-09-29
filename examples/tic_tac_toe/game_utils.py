@@ -1,7 +1,6 @@
 import random
-from typing import TypedDict
-from typing import Literal
 import xml.etree.ElementTree as ET
+from typing import Literal, TypedDict
 
 
 class TicTacToeGame(TypedDict):
@@ -51,7 +50,7 @@ def apply_agent_move(game: TicTacToeGame, move: str) -> None:
     try:
         root = ET.fromstring(move)
         square = root.text
-    except Exception as e:
+    except Exception:
         raise ValueError("Invalid xml")
 
     try:

@@ -1,10 +1,12 @@
+import asyncio
+import os
+import re
+
+from pydantic import BaseModel
+
 import art
 from art.local import LocalBackend
-import asyncio
-from pydantic import BaseModel
-import re
 from art.utils import iterate_dataset
-import os
 
 PROJECT_NAME = "benchmarking-comparison-models"
 
@@ -79,9 +81,7 @@ async def benchmark_model(model: art.Model):
 
 # In this case we have a very simple rollout function, but you can see how we're
 # using the `use_thinking` flag to change the prompt slightly.
-async def rollout(model: art.Model, scenario: MyTask) -> art.Trajectory:
-    assert isinstance(model.config, MyConfig)
-
+async def rollout(model: art.Model[MyConfig], scenario: MyTask) -> art.Trajectory:
     openai_client = model.openai_client()
     messages = []
     if model.config.use_thinking:
@@ -120,16 +120,16 @@ async def train_model(model: art.TrainableModel):
         initial_step=await model.get_step(),
     )
 
-    for batch, epoch, global_step, epoch_step in train_iterator:
+    for batch in train_iterator:
         groups = await art.gather_trajectory_groups(
             art.TrajectoryGroup(
                 (rollout(model, scenario) for _ in range(6)),
             )
-            for scenario in batch
+            for scenario in batch.items
         )
         await model.train(groups)
 
-        if global_step % 20 == 0:
+        if batch.step % 20 == 0:
             # Every 20 steps let's benchmark our model under training so we can
             # see how it's doing.
             await benchmark_model(model)
@@ -145,6 +145,7 @@ async def main():
     gpt_4_1 = art.Model(
         name="gpt-4.1",
         project=PROJECT_NAME,
+        config=MyConfig(),
         inference_base_url="https://api.openai.com/v1/",
         inference_api_key=os.getenv("OPENAI_API_KEY"),
     )
@@ -152,7 +153,6 @@ async def main():
     # We'll create a second GPT-4.1 variant that uses CoT reasoning
     gpt_4_1_thinking = gpt_4_1.model_copy(deep=True)
     gpt_4_1_thinking.name = "gpt-4.1-thinking"
-    assert isinstance(gpt_4_1_thinking.config, MyConfig)
     gpt_4_1_thinking.config.use_thinking = True
 
     gemini_flash = gpt_4_1.model_copy(deep=True)
@@ -163,10 +163,9 @@ async def main():
 
     gemini_flash_thinking = gemini_flash.model_copy(deep=True)
     gemini_flash_thinking.name = "gemini-flash-2.5-thinking"
-    assert isinstance(gemini_flash_thinking.config, MyConfig)
     gemini_flash_thinking.config.use_thinking = True
 
-    prompted_models: list[art.Model] = [
+    prompted_models = [
         gpt_4_1,
         gpt_4_1_thinking,
         gemini_flash,
@@ -181,10 +180,9 @@ async def main():
         config=MyConfig(),
     )
     qwen_thinking = qwen.model_copy(deep=True)
-    assert isinstance(qwen_thinking.config, MyConfig)
     qwen_thinking.name = "qwen-2.5-14b-instruct-thinking"
 
-    train_models: list[art.TrainableModel] = [
+    train_models = [
         qwen,
         qwen_thinking,
     ]

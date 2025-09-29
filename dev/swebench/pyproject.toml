@@ -1,0 +1,27 @@
+[project]
+name = "openpipe-art-swebench"
+version = "0.1.0"
+requires-python = ">=3.10"
+dependencies = [
+    "aiolimiter>=1.2.1",
+    "daytona-sdk>=0.21.5",
+    "langfuse>=2.60.7",
+    "modal>=1.0.1",
+    "openpipe-art",
+    "sweagent",
+    "swebench>=4.0.3",
+]
+
+[tool.uv.sources]
+openpipe-art = { path = "../../", editable = true }
+sweagent = { git = "https://github.com/bradhilton/SWE-agent" }
+
+[dependency-groups]
+dev = [
+    "ipykernel>=6.29.5",
+    "ipywidgets>=8.1.7",
+    "pytest>=8.4.1",
+    "pytest-asyncio>=1.0.0",
+    "pytest-timeout>=2.4.0",
+    "pytest-xdist>=3.8.0",
+]
