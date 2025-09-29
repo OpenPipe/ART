@@ -1,0 +1,44 @@
+name: Code Quality Checks
+
+on:
+  pull_request:
+    branches: [ main ]
+  push:
+    branches: [ main ]
+
+jobs:
+  quality-checks:
+    runs-on: ubuntu-latest
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+    
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.10'
+    
+    - name: Install uv
+      run: |
+        curl -LsSf https://astral.sh/uv/install.sh | sh
+        echo "$HOME/.cargo/bin" >> $GITHUB_PATH
+
+    - name: Install dependencies
+      run: |
+        uv sync --all-extras
+    
+    - name: Run code quality checks
+      run: |
+        ./scripts/run_checks.sh --verbose-test-failure || {
+          echo ""
+          echo "❌ Code quality checks failed!"
+          echo ""
+          echo "To fix these issues locally, run:"
+          echo "  ./scripts/run_checks.sh --fix"
+          echo ""
+          echo "Then commit and push the changes."
+          echo ""
+          echo "For more details, see CONTRIBUTING.md"
+          exit 1
+        }

@@ -1,7 +1,7 @@
 {
   "name": "ART",
   "description": "Train LLMs to be better agents using RL",
-  "theme": "maple",
+  "theme": "mint",
   "logo": {
     "light": "/images/site-assets/logo/light.svg",
     "dark": "/images/site-assets/logo/dark.svg"
@@ -12,6 +12,9 @@
     "light": "#FF5733",
     "dark": "#FF5733"
   },
+  "styling": {
+    "eyebrows": "section"
+  },
   "modeToggle": {
     "default": "light"
   },
@@ -19,16 +22,33 @@
     "name": "Subscribe",
     "url": "https://openpipe.ai"
   },
-  "anchors": [],
-  "navigation": {
-    "pages": [
+  "navbar": {
+    "links": [
       {
-        "group": "Getting Started",
+        "label": "Discord",
+        "href": "https://discord.gg/zbBHRUpwf4"
+      },
+      {
+        "label": "Blog",
+        "href": "https://openpipe.ai/blog"
+      }
+    ],
+    "primary": {
+      "type": "button",
+      "label": "GitHub",
+      "href": "https://github.com/openpipe/ART"
+    }
+  },
+  "navigation": {
+    "groups": [
+      {
+        "group": "Get Started",
         "pages": [
-          "getting-started/introduction",
-          "getting-started/overview",
+          "getting-started/about",
+          "getting-started/quick-start",
+          "getting-started/installation-setup",
           "getting-started/notebooks",
-          "getting-started/quick-start"
+          "getting-started/faq"
         ]
       },
       {
@@ -36,14 +56,49 @@
         "pages": [
           "fundamentals/training-loop",
           "fundamentals/art-client",
-          "fundamentals/art-server"
+          "fundamentals/art-backend",
+          "fundamentals/ruler"
+        ]
+      },
+      {
+        "group": "Features",
+        "pages": [
+          "features/checkpoint-forking",
+          "features/additional-histories",
+          "features/mcp-rl"
+        ]
+      },
+      {
+        "group": "Integrations",
+        "pages": [
+          "integrations/langgraph-integration"
+        ]
+      },
+      {
+        "group": "Tutorials",
+        "pages": [
+          "tutorials/summarizer",
+          "tutorials/open-deep-research"
+        ]
+      },
+      {
+        "group": "Resources",
+        "pages": [
+          "resources/models",
+          "resources/glossary"
+        ]
+      },
+      {
+        "group": "Experimental",
+        "pages": [
+          "experimental/gspo"
         ]
       }
     ]
   },
   "topbarLinks": [],
   "footerSocials": {
-    "twitter": "https://twitter.com/OpenPipeAI",
+    "x": "https://twitter.com/OpenPipeAI",
     "linkedin": "https://www.linkedin.com/company/openpipe/about/",
     "bluesky": "https://bsky.app/profile/openpipe.bsky.social",
     "github": "https://github.com/openpipe/ART"

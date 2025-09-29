@@ -1,12 +1,12 @@
-import os
 import copy
 import json
+import os
 
 from art.utils.old_benchmarking.calculate_step_metrics import calculate_step_std_dev
 from art.utils.old_benchmarking.types import (
-    BenchmarkedModelStep,
-    BenchmarkedModelKey,
     BenchmarkedModel,
+    BenchmarkedModelKey,
+    BenchmarkedModelStep,
 )
 from art.utils.output_dirs import (
     get_output_dir_from_model_properties,
@@ -69,7 +69,18 @@ def load_benchmarked_models(
                     step.recorded_at = log["recorded_at"]
                     break
 
-            file_path = os.path.join(split_dir, f"{index:04d}.yaml")
+            # Try both .jsonl and .yaml extensions
+            jsonl_path = os.path.join(split_dir, f"{index:04d}.jsonl")
+            yaml_path = os.path.join(split_dir, f"{index:04d}.yaml")
+
+            if os.path.exists(jsonl_path):
+                file_path = jsonl_path
+            elif os.path.exists(yaml_path):
+                file_path = yaml_path
+            else:
+                raise FileNotFoundError(
+                    f"No trajectory file found for step {index} in {split_dir}"
+                )
 
             with open(file_path, "r") as f:
                 trajectory_groups = deserialize_trajectory_groups(f.read())

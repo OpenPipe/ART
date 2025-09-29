@@ -1,0 +1,156 @@
+---
+title: "Open Deep Research Tutorial"
+sidebarTitle: "Open Deep Research"
+description: "Train a deep research agent to exceed SOTA performance using GRPO and SFT."
+icon: "magnifying-glass"
+---
+
+This tutorial demonstrates how to train your own deep research agent using GRPO to exceed Sonnet 4's perfromance. Specifically, you will be using the [ART](https://github.com/OpenPipe/ART) library to specialize Qwen 2.5 14B for [Langchain's open deep research](https://github.com/langchain-ai/open_deep_research) framework, and will evaluate your agent's performance using [DeepResearch Bench: A Comprehensive Benchmark for Deep Research Agents](https://github.com/Ayanami0730/deep_research_bench).
+
+In addition to the GRPO training step, you will also run an initial SFT training run to improve the model's baseline performance.
+
+<Frame caption="Accuracy of a Qwen 2.5 14B Instruct model (the same model you will be training) as it learns to perform deep research, eventually exceeding the performance of GPT-4.1 and Sonnet 4.">
+  <img
+    src="/images/open-deep-research-progress.png"
+    alt="Checkpoint forking example"
+    style={{ maxWidth: "100%", height: "auto" }}
+  />
+</Frame>
+
+<Info>
+
+Reading time: <b>45 min</b>
+
+Training time: <b>30 hr</b>
+
+Total cost: <b>~$350</b>
+
+</Info>
+
+### Step 1: Clone the starter repo and install dependencies
+
+To get started, clone [Open Deep Research Training](https://github.com/OpenPipe/open_deep_research_training), which contains the following pieces of our RL pipeline:
+
+- The deep research agent environment
+- The reward function based on DeepResearch Bench
+- SFT and GRPO training scripts
+- Evaluation benchmarks
+
+Once the repository is cloned, install dependencies. If you haven't already, install `uv` by following the instructions [here](https://docs.astral.sh/uv/getting-started/installation/).
+
+Then install the project dependencies by running `uv sync`.
+
+### Step 2: Install SkyPilot/RunPod
+
+We'll be using `LocalBackend` to manage the GPU that your model will be trained on. In order to provision a GPU for your training run, you'll need to have SkyPilot installed on your machine and provide it with the credentials to spin up machines on at least one infra provider.
+
+We recommend using RunPod because of their ease of use, but any infra provider that SkyPilot [supports](https://docs.skypilot.co/en/latest/overview.html#bringing-your-infra) will work.
+
+Follow RunPod's **Getting Started** guide [here](https://docs.runpod.io/integrations/skypilot/). You'll have to provide a credit card to use RunPod, but you'll only pay for the time your GPUs are running.
+
+### Step 3: Set up optional environment variables found in `.env.example`
+
+Copy `.env.example` to `.env` at the root of the repository, and fill in the values for the environment variables. If you're unsure about any of the values, refer to [ENV_INSTRUCTIONS.md](https://github.com/OpenPipe/open_deep_research_training/blob/main/ENV_INSTRUCTIONS.md).
+
+### Step 4: Run the training scripts
+
+You'll want to run these scripts in this order:
+
+```bash
+uv run collect_sft.py # Collect samples for your sft training run. ~1 Hour
+```
+
+This script collects supervised fine-tuning data by running the research agent on a subset of the DeepResearch Bench dataset. The collected trajectories will be used to improve the model's baseline performance before RL training.
+
+```bash
+uv run run_sft.py # Run your sft training run. ~1 Hour
+```
+
+The SFT training step improves the model's ability to follow the research agent format and reasoning patterns. This creates a better starting point for the subsequent RL training.
+
+```bash
+uv run run_train.py # Run your rl training run. 1+ Day
+```
+
+This is the main GRPO training loop where the model learns to optimize its research strategies based on feedback from the DeepResearch Bench evaluation framework.
+
+The following steps execute when a training run on a new cluster begins:
+
+- **Spin up a cluster with 1 or more H200 GPUs.**
+  - This usually takes about 10 minutes, but RunPod occasionally has network throughput issues that can cause the cluster to take up to 30 minutes to spin up.
+- **Register the model with ART.**
+  - This usually takes less than 5 minutes, though it can require up to 30 minutes if RunPod experiences network issues.
+- **Download the model checkpoint.**
+  - Usually takes a few minutes depending on the model size.
+- **Train the model for a specified number of steps.**
+  - Each RL step involves running the research agent on a subset of benchmark questions, and updating the model based on the rewards. We hold out another subset of test set questions to evalutate model progress every 10 steps that we do not train on. Training time depends on the number of steps and the complexity of each research task.
+- **Upload the final model checkpoint.**
+  - This usually takes a few minutes.
+
+### Step 5: Generate the benchmarks
+
+Run the benchmark script to evaluate your trained models:
+
+```bash
+uv run evaluate/benchmark_model.py
+```
+
+This script will:
+
+- Run each benchmarked model through the DeepResearch Bench evaluation
+- Compare performance against baseline models (GPT-4.1, Sonnet 4, etc.)
+- Generate accuracy metrics and detailed results
+
+Then run the `display_benchmarks.ipynb` notebook to visualize the results and generate comparison charts.
+
+### Step 6: Shutting down the cluster
+
+When you're done training and running benchmarks, you can shut down the cluster by running:
+
+```bash
+uv run sky down [cluster-name]
+```
+
+However, since spinning up clusters is a time-intensive process, we recommend keeping clusters alive until you're sure you won't be using them in the near future.
+
+## Training Results
+
+After completing the full training pipeline, you should see results similar to the chart at the beginning of this tutorial. The trained model typically shows:
+
+- Improved accuracy on research questions compared to the base model
+- Better structured research approaches
+- More comprehensive information gathering
+- Higher quality synthesis of research findings
+
+The benchmark comparison will show how your trained model performs relative to leading commercial models like GPT-4.1 and Sonnet 4.
+
+## Next Steps
+
+Your model is trained and portable! Upload it to any platform you choose, including HuggingFace and inference providers like Together and Fireworks.
+
+To learn more about ART, check out another tutorial or look through our notebooks! As always, the [ART Discord](https://discord.gg/zbBHRUpwf4) is a great place to ask questions and share results!
+
+<div className="cards-container">
+  <div className="card-wrapper">
+    <Card
+      title="Summary RL (Tutorial)"
+      icon="list"
+      href="/tutorials/summarizer"
+      horizontal={true}
+      arrow={true}
+    >
+      Train a summarizer model to outperform Sonnet 4 and GPT-4.1.
+    </Card>
+  </div>
+  <div className="card-wrapper">
+    <Card
+      title="ART Notebooks"
+      icon="book"
+      href="/getting-started/notebooks"
+      horizontal={true}
+      arrow={true}
+    >
+      Train a variety of agents in free Colab notebooks.
+    </Card>
+  </div>
+</div>

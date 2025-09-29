@@ -1,20 +1,23 @@
 import asyncio
-from typing import TYPE_CHECKING, cast
-import sky
 import os
-import semver
-from dotenv import dotenv_values
+from importlib.metadata import PackageNotFoundError, version
+from typing import TYPE_CHECKING, cast
 
-from .utils import (
-    is_task_created,
-    to_thread_typed,
-    wait_for_art_server_to_start,
-    get_art_server_base_url,
-    get_vllm_base_url,
-)
+import semver
+import sky
+import sky.clouds
+from dotenv import dotenv_values
 
 from .. import dev
 from ..backend import Backend
+from .utils import (
+    get_art_server_base_url,
+    get_task_job_id,
+    get_vllm_base_url,
+    is_task_created,
+    to_thread_typed,
+    wait_for_art_server_to_start,
+)
 
 if TYPE_CHECKING:
     from ..model import Model, TrainableModel
@@ -23,6 +26,7 @@ if TYPE_CHECKING:
 class SkyPilotBackend(Backend):
     _cluster_name: str
     _envs: dict[str, str]
+    _art_server_job_id: int | None
 
     @classmethod
     async def initialize_cluster(
@@ -34,13 +38,17 @@ class SkyPilotBackend(Backend):
         art_version: str | None = None,
         env_path: str | None = None,
         force_restart: bool = False,
+        tail_logs: bool = True,
     ) -> "SkyPilotBackend":
         self = cls.__new__(cls)
         self._cluster_name = cluster_name
         self._envs = {}
+        self._art_server_job_id = None
 
         if env_path is not None:
-            self._envs = dotenv_values(env_path)
+            self._envs = {
+                k: v for k, v in dotenv_values(env_path).items() if v is not None
+            }
             print(f"Loading envs from {env_path}")
             print(f"{len(self._envs)} environment variables found")
 
@@ -66,13 +74,14 @@ class SkyPilotBackend(Backend):
 
         # check if cluster already exists
         cluster_status = await to_thread_typed(
-            lambda: sky.status(cluster_names=[self._cluster_name])
+            lambda: sky.stream_and_get(sky.status(cluster_names=[self._cluster_name]))
         )
         if (
             len(cluster_status) == 0
             or cluster_status[0]["status"] != sky.ClusterStatus.UP
         ):
             await self._launch_cluster(resources, art_version)
+
         else:
             print(f"Cluster {self._cluster_name} exists, using it...")
 
@@ -90,31 +99,45 @@ class SkyPilotBackend(Backend):
             art_server_running = False
 
         if art_server_running:
+            self._art_server_job_id = await get_task_job_id(
+                cluster_name=self._cluster_name, task_name="art_server"
+            )
             print("Art server task already running, using it…")
         else:
             art_server_task = sky.Task(name="art_server", run="uv run art")
-            resources = await to_thread_typed(
-                lambda: sky.status(cluster_names=[self._cluster_name])[0][
-                    "handle"
-                ].launched_resources
+
+            clusters = await to_thread_typed(
+                lambda: sky.stream_and_get(
+                    sky.status(cluster_names=[self._cluster_name])
+                )
             )
+            resources = clusters[0]["handle"].launched_resources
+            if resources is None:
+                raise ValueError("Cluster handle has no launched resources")
+
+            # For some reason, skypilot doesn't support the region and zone set
+            resources = resources.copy(region=None, zone=None)
 
             # If a local path was provided for art_version, ensure it is mounted so the latest
             # code is synced to the remote cluster every time we (re)launch the art_server task.
             if art_version is not None and os.path.exists(art_version):
                 art_server_task.workdir = art_version
 
+            # print(clusters[0]["handle"].launched_resources)
             art_server_task.set_resources(cast(sky.Resources, resources))
             art_server_task.update_envs(self._envs)
 
             # run art server task
-            await to_thread_typed(
-                lambda: sky.exec(
-                    task=art_server_task,
-                    cluster_name=self._cluster_name,
-                    detach_run=True,
+            job_id, _ = await to_thread_typed(
+                lambda: sky.stream_and_get(
+                    sky.exec(
+                        task=art_server_task,
+                        cluster_name=self._cluster_name,
+                    )
                 )
             )
+            self._art_server_job_id = job_id
+
             print("Task launched, waiting for it to start...")
             await wait_for_art_server_to_start(cluster_name=self._cluster_name)
             print("Art server task started")
@@ -123,8 +146,18 @@ class SkyPilotBackend(Backend):
         print(f"Using base_url: {base_url}")
 
         # Manually call the real __init__ now that base_url is ready
-        super(SkyPilotBackend, self).__init__(base_url=base_url)
+        super(cls, self).__init__(base_url=base_url)
 
+        if self._art_server_job_id is not None and tail_logs:
+            await asyncio.to_thread(
+                sky.tail_logs,
+                cluster_name=self._cluster_name,
+                job_id=self._art_server_job_id,
+                follow=True,
+            )
+            print(
+                "Tailing logs. This process will only automatically exit after the backend is down. To exit before then, you'll have to manually close the process (e.g. ctrl+C)."
+            )
         return self
 
     async def _launch_cluster(
@@ -140,28 +173,35 @@ class SkyPilotBackend(Backend):
         task.set_resources(resources)
         task.update_envs(self._envs)
 
-        # default to installing latest version of art
-        art_installation_command = "uv pip install openpipe-art"
-        if art_version is not None:
-            art_version_is_semver = False
-            # check if art_version is valid semver
-            if art_version is not None:
-                try:
-                    semver.Version.parse(art_version)
-                    art_version_is_semver = True
-                except Exception:
-                    pass
-
-            if art_version_is_semver:
-                art_installation_command = f"uv pip install openpipe-art=={art_version}"
-            elif os.path.exists(art_version):
-                # copy the contents of the art_path onto the new machine
-                task.workdir = art_version
-                art_installation_command = "uv sync"
-            else:
+        # default to installing the version of art that is used by the client
+        if art_version is None:
+            try:
+                art_version = version("openpipe-art")
+            except PackageNotFoundError:
                 raise ValueError(
-                    f"Invalid art_version: {art_version}. Must be a semver or a path to a local directory."
+                    "No version of openpipe-art installed in project. Please provide an art_version."
                 )
+
+        art_version_is_semver = False
+        # check if art_version is valid semver
+        try:
+            semver.Version.parse(art_version)
+            art_version_is_semver = True
+        except Exception:
+            pass
+
+        if art_version_is_semver:
+            art_installation_command = (
+                f"uv pip install openpipe-art[backend]=={art_version}"
+            )
+        elif os.path.exists(art_version):
+            # copy the contents of the art_path onto the new machine
+            task.workdir = art_version
+            art_installation_command = "uv sync --extra backend"
+        else:
+            raise ValueError(
+                f"Invalid art_version: {art_version}. Must be a semver or a path to a local directory."
+            )
 
         setup_script = f"""
     curl -LsSf https://astral.sh/uv/install.sh | sh
@@ -175,13 +215,22 @@ class SkyPilotBackend(Backend):
         task.setup = setup_script
 
         try:
-            await to_thread_typed(
-                lambda: sky.launch(
-                    task=task,
-                    cluster_name=self._cluster_name,
-                    retry_until_up=True,
+            job_id, _ = await to_thread_typed(
+                lambda: sky.stream_and_get(
+                    sky.launch(
+                        task=task, cluster_name=self._cluster_name, retry_until_up=True
+                    )
                 )
             )
+
+            await to_thread_typed(
+                lambda: sky.tail_logs(
+                    cluster_name=self._cluster_name,
+                    job_id=job_id,
+                    follow=True,
+                )
+            )
+
         except Exception as e:
             print(f"Error launching cluster: {e}")
             print()
@@ -220,4 +269,6 @@ class SkyPilotBackend(Backend):
         return (vllm_base_url, api_key)
 
     async def down(self) -> None:
-        await to_thread_typed(lambda: sky.down(cluster_name=self._cluster_name))
+        await to_thread_typed(
+            lambda: sky.stream_and_get(sky.down(cluster_name=self._cluster_name))
+        )

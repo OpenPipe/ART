@@ -382,26 +382,15 @@
 
 workdir: .
 resources:
-  accelerators: ["H100:1", "A100-80GB:1"]
+  accelerators: ["H100-SXM:1", "H100:1", "A100-80GB:1"]
   ports:
     - 7999 # main ART server
     - 8000 # vLLM server
 envs:
+  ALL_EXTRAS: "false"
   GIT_USER_NAME: "Your Name"
   GIT_USER_EMAIL: "your.email@example.com"
   GITHUB_TOKEN: ""
+  PYTHONUTF8: "1" #Enforce UTF-8 Encoding to fix ASCII encoding issue in unsloth-zoo
 setup: |
-  # Configure git user name and email
-  git config --global user.name "${GIT_USER_NAME}"
-  git config --global user.email "${GIT_USER_EMAIL}"
-  git config --global --add safe.directory /root/sky_workdir
-  # Reset any uncommitted changes to the last commit
-  git reset --hard HEAD
-  # Remove all untracked files and directories
-  git clean -fd
-  # Install astral-uv
-  sudo snap install --classic astral-uv
-  # Install tmux
-  apt install tmux -y
-  # Sync the dependencies
-  uv sync
+  ./scripts/setup.sh

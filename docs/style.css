@@ -1,0 +1,65 @@
+/* Styles for tables wrapped in a .full-width container */
+.full-width table th,
+.full-width table td {
+  vertical-align: top !important;
+  line-height: 1.5;
+  /* Horizontal borders */
+  border-top: 1px solid #d0d0d0;
+  border-bottom: 1px solid #d0d0d0;
+  /* Vertical inner borders */
+  border-left: 1px solid #d0d0d0;
+  padding: 6px 8px;
+  width: auto;
+}
+
+/* Hide the "Powered by Mintlify" credit link everywhere */
+a[href^="https://mintlify.com/preview-request"]
+{
+  display: none !important;
+}
+
+.full-width {
+  margin-top: -16px;
+}
+
+.full-width table {
+  width: 100%;
+  border-collapse: collapse;
+  table-layout: auto;
+}
+
+.prose.overflow-x-auto .full-width table {
+  display: table !important;
+  width: 100% !important;
+  min-width: 100%;
+}
+
+/* Remove border on the far left of the table */
+.full-width table th:first-child,
+.full-width table td:first-child {
+  border-left: none;
+  padding-left: 8px !important;
+}
+
+/* Responsive card container */
+.cards-container {
+  display: flex;
+  gap: 1rem;
+  justify-content: space-between;
+}
+
+.card-wrapper {
+  width: 50%;
+}
+
+/* Single column layout for screens smaller than 1000px */
+@media (max-width: 999px) {
+  .cards-container {
+    flex-direction: column;
+    gap: 0;
+  }
+
+  .card-wrapper {
+    width: 100%;
+  }
+}

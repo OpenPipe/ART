@@ -1,31 +1,39 @@
-from fastapi import FastAPI, Body
-from fastapi.responses import StreamingResponse
 import json
-import pydantic
 import socket
-import typer
 from typing import Any, AsyncIterator
+
+import pydantic
+import typer
 import uvicorn
+from dotenv import load_dotenv
+from fastapi import Body, FastAPI, Request
+from fastapi.responses import JSONResponse, StreamingResponse
 
 from . import dev
+from .errors import ARTError
 from .local import LocalBackend
 from .model import Model, TrainableModel
 from .trajectories import TrajectoryGroup
 from .types import TrainConfig
 from .utils.deploy_model import LoRADeploymentProvider
 
+load_dotenv()
+
 app = typer.Typer()
 
 
 @app.command()
-def run(host: str = "0.0.0.0", port: int = 7999, openai_port: int = 8000) -> None:
-    """Run the ART CLI.
-
-    Args:
-        host: Address for the training backend.
-        port: Port for the training backend.
-        openai_port: Port for the OpenAI-compatible inference server.
-    """
+def run(
+    host: str = "0.0.0.0",
+    port: int = 7999,
+    openai_port: int = 8000,
+    path: str | None = typer.Option(
+        None,
+        "--path",
+        help="Directory for model weights and artifacts",
+    ),
+) -> None:
+    """Run the ART CLI."""
 
     # check if port is available
     def is_port_available(port: int) -> bool:
@@ -48,8 +56,14 @@ def run(host: str = "0.0.0.0", port: int = 7999, openai_port: int = 8000) -> Non
     TrajectoryGroup.__new__ = __new__  # type: ignore
     TrajectoryGroup.__init__ = __init__
 
-    backend = LocalBackend(openai_port=openai_port)
+    backend = LocalBackend(path=path, openai_port=openai_port)
     app = FastAPI()
+
+    # Add exception handler for ARTError
+    @app.exception_handler(ARTError)
+    async def art_error_handler(request: Request, exc: ARTError):
+        return JSONResponse(status_code=exc.status_code, content={"detail": exc.detail})
+
     app.get("/healthcheck")(lambda: {"status": "ok"})
     app.post("/close")(backend.close)
     app.post("/register")(backend.register)
@@ -149,4 +163,4 @@ def run(host: str = "0.0.0.0", port: int = 7999, openai_port: int = 8000) -> Non
             wait_for_completion=wait_for_completion,
         )
 
-    uvicorn.run(app, host=host, port=port)
+    uvicorn.run(app, host=host, port=port, loop="asyncio")

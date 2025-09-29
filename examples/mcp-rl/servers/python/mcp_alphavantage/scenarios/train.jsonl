@@ -1,0 +1,16 @@
+{"task": "Calculate the daily Simple Moving Average (SMA) for Apple (AAPL) using the closing price, and generate a summary of the work done and a thorough analysis and report of the results.", "difficulty": 2}
+{"task": "Fetch the current stock quote for Apple (AAPL) and generate a summary of the work done and a thorough analysis and report of the results.", "difficulty": 1}
+{"task": "Fetch the real-time stock quote for Alibaba (BABA) and then retrieve its company overview, generating a summary of the work done and a thorough analysis and report of the results.", "difficulty": 3}
+{"task": "Perform a comprehensive technical analysis on Apple (AAPL) by retrieving both the daily SMA and daily RSI, then generate a summary of the work done and a thorough analysis and report of the results.", "difficulty": 4}
+{"task": "Search for stock symbols using the keyword 'Google', then retrieve the company overview for the most relevant result and generate a summary of the work done and a thorough analysis and report of the results.", "difficulty": 3}
+{"task": "Retrieve the daily time series and calculate the daily SMA for Oracle (ORCL), then generate a summary of the work done and a thorough analysis and report of the results.", "difficulty": 3}
+{"task": "Retrieve the daily time series data for Nvidia (NVDA) and generate a summary of the work done and a thorough analysis and report of the results examining historical performance against market conditions.", "difficulty": 3}
+{"task": "Fetch the current stock quote and daily time series for Microsoft (MSFT), and generate a summary of the work done and a thorough analysis and report of the results comparing real-time data with historical trends.", "difficulty": 3}
+{"task": "Obtain the current stock quote for Amazon (AMZN) and generate a summary of the work done and a thorough analysis and report of the results.", "difficulty": 1}
+{"task": "Calculate the 15-minute interval SMA for Tesla (TSLA) and generate a summary of the work done and a thorough analysis and report of the results.", "difficulty": 3}
+{"task": "Obtain the company overview for Alphabet (GOOGL) and generate a summary of the work done and a thorough analysis and report of the results.", "difficulty": 1}
+{"task": "Fetch the default daily RSI for Apple (AAPL) and generate a summary of the work done and a thorough analysis and report of the results.", "difficulty": 1}
+{"task": "For Tesla (TSLA), fetch the daily SMA, daily RSI, and company overview, then compile a detailed report that includes a summary of the work done and a thorough analysis and report of the results.", "difficulty": 5}
+{"task": "Fetch the weekly RSI for Netflix (NFLX) and generate a summary of the work done and a thorough analysis and report of the results.", "difficulty": 2}
+{"task": "Search for stock symbols with the keyword 'MegaCorp', then retrieve the company overview for the best match and generate a summary of the work done and a thorough analysis and report of the results.", "difficulty": 3}
+{"task": "Retrieve the daily time series data for Microsoft (MSFT) and generate a summary of the work done and a thorough analysis and report of the results.", "difficulty": 2}

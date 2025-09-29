@@ -1,0 +1,162 @@
+---
+title: "ART Backend"
+icon: "server"
+description: "Learn the underlying architecture of the ART backend"
+---
+
+ART divides the logic for training an agent into two distinct abstractions. The [client](/fundamentals/art-client) is responsible for interfacing with the environment in which the agent runs and for sending inference and training requests to the backend. The **backend** is responsible for generating tokens at inference time, updating the agent's weights based on past performance, and managing GPU memory as it switches from inference to training mode. This separation of concerns simplifies the process of teaching an agent to improve its performance using RL.
+
+While the backend's training and inference settings are highly configurable, they're also set up to use **intelligent defaults** that save beginners time while getting started. However, there are a few important considerations to take before running your first training job.
+
+<div className="cards-container">
+  <div className="card-wrapper">
+    <Card
+      title="LocalBackend"
+      icon="laptop-code"
+      href="/fundamentals/art-backend#localbackend"
+      horizontal={true}
+      arrow={true}
+    ></Card>
+  </div>
+  <div className="card-wrapper">
+    <Card
+      title="SkyPilotBackend"
+      icon="cloud"
+      href="/fundamentals/art-backend#skypilotbackend"
+      horizontal={true}
+      arrow={true}
+    ></Card>
+  </div>
+</div>
+
+## Remote or local training
+
+ART provides two backend classes, `LocalBackend` and `SkyPilotBackend`. If your agent is already running on a machine equipped with an advanced GPU and you want to run training on the same machine, use `LocalBackend`. If your agent is running on a machine without an advanced GPU (this includes most personal computers and production servers), use `SkyPilotBackend` instead.
+
+Both `LocalBackend` and `SkyPilotBackend` implement the `art.Backend` class, and once initialized, the client interacts with them in the exact same way. Under the hood, `SkyPilotBackend` configures a remote machine equipped with a GPU to run `LocalBackend`, and forwards requests from the client to the remote instance.
+
+### LocalBackend
+
+The `LocalBackend` class runs a vLLM server and either an Unsloth or torchtune instance on whatever machine your agent itself is executing. This is a good fit if you're already running your agent on a machine with a GPU.
+
+To declare a `LocalBackend` instance, follow the code sample below:
+
+```python
+from art.local import LocalBackend
+
+backend = LocalBackend(
+    # set to True if you want your backend to shut down automatically
+    # when your client process ends
+    in_process: False,
+    # local path where the backend will store trajectory logs and model weights
+    path: './.art',
+)
+```
+
+### SkyPilotBackend
+
+To use SkyPilotBackend, you'll need to install the optional dependency:
+
+```bash
+pip install openpipe-art[skypilot]
+```
+
+When a `SkyPilotBackend` instance is initialized, it does a few things:
+
+- Provisions a remote machine with an advanced GPU (by default on RunPod)
+- Installs `openpipe-art` and its dependencies
+- Initializes a `LocalBackend` instance with vLLM and a training server (unsloth or torchtune)
+- Registers the `LocalBackend` instance to forward requests to it over http
+
+To initialize a `SkyPilotBackend` instance, follow the code sample below:
+
+```python
+from art.skypilot import SkyPilotBackend
+
+backend = await SkyPilotBackend.initialize_cluster(
+    # name of the cluster in SkyPilot's registry
+    cluster_name="my-cluster",
+    # version of openpipe-art that should be installed on the remote cluster
+    # default to version installed on the client
+    art_version="0.3.12",
+    # path to environment variables (e.g. WANDB_API_KEY) to set on the remote cluster
+    env_path=".env",
+    # the GPU the cluster is equipped with
+    gpu="H100"
+    # alternatively, more complicated requirements can be specified in
+    # the `resources` argument
+)
+```
+
+When a training job is finished, you can shut down a cluster either through code or the cli.
+
+**Code:**
+
+```python
+backend = await SkyPilotBackend.initialize_cluster(...)
+
+# ...training code...
+
+backend.down()
+```
+
+**CLI:**
+
+```bash
+uv run sky down my-cluster
+```
+
+## Using a backend
+
+Once initialized, a backend can be used in the same way regardless of whether it runs locally or remotely.
+
+```python
+LOCAL = True
+
+if LOCAL:
+    from art.local import LocalBackend
+    backend = LocalBackend()
+else:
+    from art.skypilot import SkyPilotBackend
+    backend = await SkyPilotBackend.initialize_cluster(
+        cluster_name="my-cluster",
+        gpu="H100"
+    )
+
+model = art.TrainableModel(...)
+
+await model.register(backend)
+
+# ...training code...
+
+if not LOCAL:
+    # optionally shut down the cluster when training finishes
+    await backend.down()
+```
+
+To see `LocalBackend` and `SkyPilotBackend` in action, try the examples below.
+
+<div className="cards-container">
+  <div className="card-wrapper">
+    <Card
+      title="2048 Notebook"
+      icon="laptop-code"
+      href="https://colab.research.google.com/github/openpipe/art-notebooks/blob/main/examples/2048/2048.ipynb"
+      horizontal={true}
+      arrow={true}
+    >
+      Use LocalBackend to train an agent to play 2048.
+    </Card>
+  </div>
+  <div className="card-wrapper">
+    <Card
+      title="Summarizer"
+      icon="cloud"
+      href="/tutorials/summarizer"
+      horizontal={true}
+      arrow={true}
+    >
+      Use SkyPilotBackend to train a SOTA summarizing agent.
+    </Card>
+  </div>
+</div>

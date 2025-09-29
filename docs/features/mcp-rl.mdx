@@ -1,0 +1,211 @@
+---
+title: "MCP•RL: Training Agents to Use MCP Servers"
+sidebarTitle: "MCP Training"
+description: "Learn how to train language models to effectively use Model Context Protocol (MCP) servers using ART"
+---
+
+MCP•RL is a specialized application of ART that teaches language models to effectively use [Model Context Protocol (MCP) servers](https://modelcontextprotocol.io/). This approach enables you to train agents that can seamlessly interact with any MCP-compatible tool or service.
+
+## What is MCP•RL?
+
+MCP•RL combines two powerful technologies:
+
+- **Model Context Protocol (MCP)**: A standard for connecting AI assistants to external tools and data sources
+- **ART (Agent Reinforcement Trainer)**: OpenPipe's framework for training better AI agents using reinforcement learning
+
+The result is a training pipeline that can automatically teach any language model to use MCP servers effectively, without requiring manually labeled training data.
+
+## How MCP•RL Works
+
+The training process follows these key steps:
+
+### 1. **Server Discovery**
+
+```python
+# Query the MCP server to understand available tools
+tools_list = await mcp_client.list_tools()
+```
+
+### 2. **Scenario Generation**
+
+```python
+# Generate diverse training scenarios automatically
+from art.mcp import generate_scenarios
+
+scenario_collection = await generate_scenarios(
+    tools=tools_list,
+    num_scenarios=24,
+    show_preview=True,
+    generator_model="openai/gpt-4.1-mini",
+    generator_api_key="your_openrouter_key",
+    generator_base_url="https://openrouter.ai/api/v1",
+)
+```
+
+ART automatically generates diverse training scenarios that exercise different aspects of the MCP server: simple single-tool usage, complex multi-step workflows, edge cases and error handling, and creative combinations of available tools.
+
+### 3. **RULER Evaluation**
+
+```python
+from art.rewards import ruler_score_group
+
+# RULER evaluates responses without labeled data
+scored_group = await ruler_score_group(
+    group,
+    judge_model="openai/o4-mini",
+)
+```
+
+Instead of requiring human-labeled examples, RULER judges response quality by analyzing whether the agent accomplished the intended task, quality of tool usage, efficiency of the approach, and error handling.
+
+### 4. **Reinforcement Learning**
+
+```python
+# Train using RULER feedback
+groups = await gather_trajectory_groups(
+    trajectory_groups_generator,
+    pbar_desc="train gather step",
+)
+
+scored_groups = [
+    await ruler_score_group(
+        group,
+        judge_model="openai/o4-mini",
+    )
+    for group in groups
+]
+
+await model.train(
+    scored_groups,
+    config=art.TrainConfig(learning_rate=1e-5),
+)
+```
+
+The model learns from RULER feedback using reinforcement learning, improving its ability to select appropriate tools, use correct parameters, chain tools effectively, and handle failures gracefully.
+
+## Getting Started
+
+Optimizing against an MCP server can be surprisingly straightforward!
+
+### Prerequisites
+
+- Access to an MCP server you want to train on
+- OpenRouter API key for training
+- Python environment with ART installed
+
+### Basic Training Pipeline
+
+Here's a simplified example of training a model to use an MCP server:
+
+```python
+import art
+from art.mcp import generate_scenarios
+from art.rewards import ruler_score_group
+from art import gather_trajectory_groups
+
+# Initialize the model
+model = art.RemoteModel(
+    model="Qwen/Qwen2.5-3B-Instruct",
+    openrouter_api_key="your_openrouter_key"
+)
+
+# Generate training scenarios automatically
+scenario_collection = await generate_scenarios(
+    tools=tools_list,
+    resources=resources_list,
+    num_scenarios=100,
+    show_preview=False,
+    generator_model="gpt-4o-mini",
+    generator_api_key="your_openrouter_key",
+)
+
+# Gather trajectory groups
+groups = await gather_trajectory_groups(
+    (
+        art.TrajectoryGroup(
+            rollout(model, scenario, False)
+            for _ in range(4)  # rollouts per group
+        )
+        for scenario in scenario_collection
+    ),
+    pbar_desc="train gather step",
+)
+
+# Score groups using RULER
+scored_groups = [
+    await ruler_score_group(
+        group,
+        judge_model="gpt-4o-mini",
+        debug=True,
+        swallow_exceptions=True
+    )
+    for group in groups
+]
+
+# Train the model
+await model.train(
+    scored_groups,
+    config=art.TrainConfig(learning_rate=1e-5),
+)
+```
+
+### Example Use Cases
+
+- **Database Agent**: Train a model to query databases, understand schemas, and generate appropriate SQL commands via an MCP database server.
+
+- **File Management Agent**: Teach an agent to navigate file systems, read/write files, and perform complex file operations through an MCP file server.
+
+- **API Integration Agent**: Train models to interact with REST APIs, handle authentication, and process responses via MCP API wrappers.
+
+- **Development Tools Agent**: Create agents that can use development tools like Git, package managers, or testing frameworks through MCP servers.
+
+## What MCP•RL is Good At
+
+MCP•RL excels at training agents to effectively use MCP servers by:
+
+- **Tool Usage**: Teaching when and how to use specific tools with appropriate parameters
+- **Multi-Step Workflows**: Chaining tool calls and interpreting outputs to build complex workflows
+- **Domain Adaptation**: Learning specialized terminology and conventions for different server types
+
+## Best Practices
+
+- 📈 **Iterative Training** - Use checkpoint forking to experiment with different training approaches and parameters.
+
+- 🔍 **Monitor RULER Scores** - Pay attention to RULER evaluation metrics to understand where your agent excels and where it needs improvement.
+
+- 🧪 **Test Thoroughly** - Validate your trained agent on held-out scenarios that weren't used during training.
+
+- 📊 **Use Diverse Scenarios** - Ensure your training data covers the full range of tasks your agent will encounter in production.
+
+## Troubleshooting
+
+### Common Issues
+
+**Low RULER Scores**:
+
+- Check if your MCP server is responding correctly
+- Verify that generated scenarios are appropriate for your use case
+- Consider adjusting training parameters
+
+**Tool Selection Errors**:
+
+- Ensure the model has seen diverse examples of when to use each tool
+- Add more training scenarios that require careful tool selection
+
+**Parameter Issues**:
+
+- Include scenarios that demonstrate correct parameter usage
+- Consider adding validation examples to your training data
+
+## Next Steps
+
+- Explore the [complete MCP•RL notebook](https://colab.research.google.com/github/openpipe/art-notebooks/blob/main/examples/mcp-rl/mcp-rl.ipynb)
+- Learn more about [RULER evaluation](/fundamentals/ruler)
+- Check out [checkpoint forking](/features/checkpoint-forking) for iterative training
+- Join our [Discord](https://discord.gg/zbBHRUpwf4) to discuss MCP•RL with the community
+
+<Note>
+  MCP•RL is particularly effective because RULER can judge response quality
+  purely from the agent's final output—no labeled data required! This makes it
+  possible to train high-quality MCP agents with minimal manual intervention.
+</Note>

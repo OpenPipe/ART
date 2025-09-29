@@ -1,0 +1,30 @@
+---
+title: "Supported Models"
+sidebarTitle: "Models"
+description: "Train open source models on ART."
+icon: "robot"
+---
+
+## Recommended Models
+
+- [Qwen 2.5 14B Instruct](https://huggingface.co/Qwen/Qwen2.5-14B-Instruct)
+  - Good balance of performance and size. Has support for tool calling and generally trains well. This is our recommended model for users new to RL.
+- [Qwen 2.5 7B Instruct](https://huggingface.co/Qwen/Qwen2.5-7B-Instruct)
+  - Less capable than 14B, but smaller and faster
+- [Qwen 2.5 32B Instruct](https://huggingface.co/Qwen/Qwen2.5-32B-Instruct)
+  - More capable than 14B, but larger and slower
+
+## More Models
+
+ART has wide support for models supported by [vLLM](https://docs.vllm.ai/en/latest/models/supported_models.html). However, not all models support all features. For instance, if a model's chat template does not include tool call support, you won't be able to use tools with it natively. And if a model's architecture doesn't have support for LoRA layers, it won't be compatible with our LoRA-based backend, but still may work with our full-fine-tuning backend.
+
+Here are additional models that we've tested and found to work well with ART:
+
+- [Llama 3.1 8B Instruct](https://huggingface.co/meta-llama/Llama-3.1-8B-Instruct)
+- [Llama 3.2 1B Instruct](https://huggingface.co/meta-llama/Llama-3.2-1B-Instruct)
+- [Llama 3.2 3B Instruct](https://huggingface.co/meta-llama/Llama-3.2-3B-Instruct)
+- [Llama 3.3 70B Instruct](https://huggingface.co/meta-llama/Llama-3.3-70B-Instruct)
+- [Qwen 2.5 72B Instruct](https://huggingface.co/Qwen/Qwen2.5-72B-Instruct)
+- Additionally, the [Qwen 3](https://huggingface.co/collections/Qwen/qwen3-67dd247413f0e2e4f653967f) family of models is well supported for single-turn workflows. For multi-turn workflows the Qwen 3 chat template removes the `<think>` tokens from previous turns, which makes training more complicated. It is still possible to use for multi-turn workflows by splitting each turn into a separate message history with our `additional_histories` trajectory parameter (see [Additional Histories](/features/additional-histories)).
+
+If you're curious about a model that is not listed above, ask in the Discord [#support](https://discord.com/channels/1359674493949448375/1359674622965973185) channel.

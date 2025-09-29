@@ -1,14 +1,15 @@
+import argparse
+import asyncio
 import os
 import random
-import asyncio
-import argparse
+
 from dotenv import load_dotenv
+from game_utils import possible_moves
+from gather_trajectory_groups_by_index import gather_trajectory_groups_by_index
+from rollout import ModelConfig, TicTacToeScenario, rollout
 
 import art
 from art.trajectories import TrajectoryGroup
-from gather_trajectory_groups_by_index import gather_trajectory_groups_by_index
-from rollout import ModelConfig, rollout, TicTacToeScenario
-from game_utils import possible_moves
 
 load_dotenv()
 
