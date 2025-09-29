@@ -58,7 +58,7 @@ __all__ = [
     "TrainConfig",
     "Trajectory",
     "TrajectoryGroup",
+    "LinearTemperatureAnnealer",
     "capture_yielded_trajectory",
     "yield_trajectory",
-    "LinearTemperatureAnnealer",
 ]

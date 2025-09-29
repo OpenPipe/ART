@@ -26,6 +26,7 @@ app = typer.Typer()
 def run(
     host: str = "0.0.0.0",
     port: int = 7999,
+    openai_port: int = 8000,
     path: str | None = typer.Option(
         None,
         "--path",
@@ -55,7 +56,7 @@ def run(
     TrajectoryGroup.__new__ = __new__  # type: ignore
     TrajectoryGroup.__init__ = __init__
 
-    backend = LocalBackend(path=path)
+    backend = LocalBackend(path=path, openai_port=openai_port)
     app = FastAPI()
 
     # Add exception handler for ARTError

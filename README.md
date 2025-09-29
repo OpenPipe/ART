@@ -120,6 +120,8 @@ ART's server can run on any machine with a GPU. Start it on the remote host:
 
 ```bash
 uv run art --host 0.0.0.0 --port 7999
+# You can run multiple servers by specifying a different OpenAI port
+uv run art --host 0.0.0.0 --port 7999 --openai-port 8001
 ```
 
 From your local machine, create a `Backend` that points at this server and
