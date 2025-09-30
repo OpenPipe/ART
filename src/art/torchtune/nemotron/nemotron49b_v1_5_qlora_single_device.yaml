@@ -1,0 +1,66 @@
+# configs/nemotron49b_v1_5_qlora_single_device.yaml
+# Minimal, reproducible config for Nemotron 49B v1.5 via HF passthrough + PEFT
+# Run: tune run lora_finetune_single_device --config configs/nemotron49b_v1_5_qlora_single_device.yaml
+
+# Where to write logs/checkpoints
+output_dir: /tmp/torchtune/nemotron49b_v1_5/qlora
+
+seed: 1337
+compile: false           # leave False for custom remote models
+device: "cuda"
+dtype: "bf16"            # Hopper/Ampere: prefer bf16
+
+# --- Tokenizer ---
+# We use torchtune's Hugging Face tokenizer wrapper to read tokenizer.json.
+tokenizer:
+  _component_: torchtune.modules.transforms.tokenizers.HuggingFaceBaseTokenizer
+  tokenizer_json_path: /PATH/TO/your/local/hf-cache/nvidia__Llama-3_3-Nemotron-Super-49B-v1_5/tokenizer.json
+  tokenizer_config_json_path: /PATH/TO/your/local/hf-cache/nvidia__Llama-3_3-Nemotron-Super-49B-v1_5/tokenizer_config.json
+  max_seq_len: 4096
+
+# --- Dataset ---
+# Swap this out for your real SFT dataset; packed=True for throughput.
+dataset:
+  _component_: torchtune.datasets.alpaca_dataset
+  packed: true
+  train_on_input: false
+
+# --- Model (HF passthrough + PEFT) ---
+model:
+  _component_: nemotron_tt.builders.build_nemotron49b_v1_5_for_lora
+  model_id: "nvidia/Llama-3_3-Nemotron-Super-49B-v1_5"
+  dtype: "bf16"
+  load_in_4bit: true
+  attn_implementation: "sdpa"
+  gradient_checkpointing: true
+  # Optional: override lora_target_modules if you want to pin layers
+  # lora_target_modules: ["q_proj","k_proj","v_proj","o_proj","up_proj","down_proj","gate_proj"]
+
+# --- Optimizer / LR schedule (typical QLoRA) ---
+optimizer: torch.optim.AdamW
+learning_rate: 2.0e-4
+betas: [0.9, 0.95]
+weight_decay: 0.0
+max_grad_norm: 1.0
+lr_scheduler: cosine
+warmup_ratio: 0.03
+
+# --- Training ---
+epochs: 1                 # bump as needed
+batch_size: 1             # start conservative; increase with gradient_accumulation_steps
+gradient_accumulation_steps: 8
+enable_activation_checkpointing: true
+
+# --- Checkpointer ---
+# We skip pre-loading via checkpointer and just let HF load the base model in the builder.
+# We still let Torchtune save a recipe state file. LoRA adapter weights are saved via PEFT hooks.
+checkpointer:
+  _component_: torchtune.training.FullModelHFCheckpointer
+  checkpoint_dir: null
+  checkpoint_files: []
+  model_type: null
+  output_dir: ${output_dir}
+  adapter_checkpoint: null
+  recipe_checkpoint: null
+  resume_from_checkpoint: false
+  safe_serialization: true
