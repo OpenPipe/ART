@@ -51,6 +51,10 @@ langgraph = [
     "langchain-openai>=0.3.27",
 ]
 
+smolagents = [
+    "smolagents>=1.22.0",
+]
+
 [project.scripts]
 art = "art.cli:app"
 stop-server = "art.skypilot.stop_server:main"
