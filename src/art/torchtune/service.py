@@ -3,7 +3,7 @@ import glob
 import logging
 import os
 import time
-from collections import Counter
+from collections import Counter, deque
 from dataclasses import dataclass
 from functools import cached_property
 from pathlib import Path
@@ -19,6 +19,8 @@ from .. import dev, types
 from ..preprocessing.pack import DiskPackedTensors
 from ..vllm import get_llm, get_worker, openai_server_task, run_on_workers
 from .batch import Batch
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -109,8 +111,14 @@ class TorchtuneService:
                         num_gradient_steps = result["num_gradient_steps"]
                     yield result
                 else:
+                    exit_code = int(result)
+                    log_path = f"{self.output_dir}/logs/train.log"
+                    log_tail = tail_file(log_path, 40)
                     raise RuntimeError(
-                        f"Train process exited early. See {self.output_dir}/logs/train.log for details."
+                        "Train process exited early with exit code "
+                        f"{exit_code}. See {log_path} for full details. "
+                        "Last 40 log lines:\n"
+                        f"{log_tail}"
                     )
             num_gradient_steps -= 1
         # wait for the workers to wake up
@@ -225,6 +233,10 @@ class TorchtuneService:
             "metric_logger.log_dir=null",
             f"enable_activation_offloading={torchtune_args.get('enable_activation_offloading', False)}",
         ]
+        logger.info(
+            "Starting torchtune train process with command: %s",
+            " ".join(program_and_args),
+        )
         return await asyncio.subprocess.create_subprocess_exec(
             *program_and_args,
             stdout=asyncio.subprocess.PIPE,
@@ -241,6 +253,8 @@ class TorchtuneService:
                 with open(f"{self.output_dir}/logs/train.log", "a") as f:
                     f.write(line_str)
                 line_str = line_str.strip()
+                if line_str:
+                    logger.info("[torchtune] %s", line_str)
                 if line_str.startswith("Step ") and " | " in line_str:
                     parts = line_str.split(" | ", 1)
                     metrics: dict[str, float] = {}
@@ -352,3 +366,21 @@ def update_weights(weights_path: str, profile: bool) -> None:
             worker.model_runner.model.load_weights(weights.items())  # type: ignore
     finally:
         logger.setLevel(logging.INFO)
+
+
+def tail_file(path: str, num_lines: int) -> str:
+    """Return the last ``num_lines`` lines from ``path``.
+
+    If the file cannot be read, a helpful placeholder message is returned
+    instead of raising a secondary exception that could hide the original
+    training failure.
+    """
+
+    try:
+        with open(path, "r") as f:
+            lines = deque(f, maxlen=num_lines)
+    except FileNotFoundError:
+        return f"<log file {path} not found>"
+    except OSError as exc:
+        return f"<unable to read {path}: {exc}>"
+    return "".join(lines).rstrip()
