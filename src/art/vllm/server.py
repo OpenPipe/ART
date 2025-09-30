@@ -1,6 +1,7 @@
 """OpenAI-compatible server functionality for vLLM."""
 
 import asyncio
+import json
 import logging
 import os
 from contextlib import asynccontextmanager
@@ -120,15 +121,26 @@ def _openai_server_coroutine(
     parser = make_arg_parser(parser)
     engine_args = config.get("engine_args", {})
     server_args = config.get("server_args", {})
-    args = [
-        *[
-            f"--{key.replace('_', '-')}{f'={item}' if item is not True else ''}"
-            for args in [engine_args, server_args]
-            for key, value in args.items()
-            for item in (value if isinstance(value, list) else [value])
-            if item is not None
-        ],
-    ]
+    args: list[str] = []
+    for argument_group in (engine_args, server_args):
+        for key, value in argument_group.items():
+            if value is None:
+                continue
+            flag = f"--{key.replace('_', '-')}"
+            values = value if isinstance(value, list) else [value]
+            for item in values:
+                if item is None:
+                    continue
+                if item is True:
+                    args.append(flag)
+                    continue
+                if isinstance(item, (dict, list)):
+                    item_str = json.dumps(item)
+                elif isinstance(item, bool):
+                    item_str = str(item).lower()
+                else:
+                    item_str = str(item)
+                args.append(f"{flag}={item_str}")
     namespace = parser.parse_args(args)
     assert namespace is not None
     validate_parsed_serve_args(namespace)
