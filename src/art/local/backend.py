@@ -348,8 +348,7 @@ class LocalBackend(Backend):
                             model=model_name,
                             timeout=timeout,
                         )
-                        # get the completion response, exit the loop
-                        break
+                        # Health check successful, continue monitoring
                     except Exception as e:
                         # If the server is sleeping, a failed health check is okay
                         if await self._services[model_name].vllm_engine_is_sleeping():
@@ -525,10 +524,18 @@ class LocalBackend(Backend):
         pbar.close()
         if verbose:
             print("Logging metrics...")
-        data = {
-            k: sum(d.get(k, 0) for d in results) / sum(1 for d in results if k in d)
-            for k in {k for d in results for k in d}
-        }
+        # Average only numeric metrics; ignore any non-numeric fields that may
+        # appear in streamed results (e.g., status strings)
+        data: dict[str, float] = {}
+        all_keys = {k for d in results for k in d}
+        for k in all_keys:
+            numeric_values = [
+                v
+                for v in (d.get(k) for d in results)
+                if isinstance(v, (int, float)) and not isinstance(v, bool)
+            ]
+            if numeric_values:
+                data[k] = float(sum(numeric_values)) / float(len(numeric_values))
         # Add group counting metrics
         data["num_groups_submitted"] = num_groups_submitted
         data["num_groups_trainable"] = num_groups_trainable
