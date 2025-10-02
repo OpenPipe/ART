@@ -84,7 +84,27 @@ class ServerlessBackend(Backend):
         trajectory_groups: list[TrajectoryGroup],
         split: str = "val",
     ) -> None:
-        raise NotImplementedError
+        # TODO: Implement proper serverless logging via API
+        # For now, write to local jsonl file as a placeholder
+        import os
+        from pathlib import Path
+
+        from ..utils.trajectory_logging import serialize_trajectory_groups
+
+        # Create log directory (configurable via env var)
+        log_base = os.getenv("ART_SERVERLESS_LOG_DIR", "/tmp/serverless-training-logs")
+        log_dir = Path(log_base) / model.name / split
+        log_dir.mkdir(parents=True, exist_ok=True)
+
+        # Get current step
+        step = await model.get_step()
+        file_path = log_dir / f"{step:04d}.jsonl"
+
+        # Write trajectory groups to jsonl
+        with open(file_path, "w") as f:
+            f.write(serialize_trajectory_groups(trajectory_groups))
+
+        print(f"[ServerlessBackend] Logged {len(trajectory_groups)} groups to {file_path}")
 
     async def _train_model(
         self,
