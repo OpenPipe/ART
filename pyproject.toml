@@ -1,6 +1,6 @@
 [project]
 name = "openpipe-art"
-version = "0.4.12"
+version = "0.5.0"
 description = "The OpenPipe Agent Reinforcement Training (ART) library"
 readme = "README.md"
 requires-python = ">=3.10"
