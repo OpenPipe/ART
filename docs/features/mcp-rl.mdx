@@ -104,8 +104,8 @@ from art.rewards import ruler_score_group
 from art import gather_trajectory_groups
 
 # Initialize the model
-model = art.RemoteModel(
-    model="Qwen/Qwen2.5-3B-Instruct",
+model = art.TrainableModel(
+    model="OpenPipe/Qwen3-14B-Instruct",
     openrouter_api_key="your_openrouter_key"
 )
 

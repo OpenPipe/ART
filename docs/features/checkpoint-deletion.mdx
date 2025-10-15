@@ -17,7 +17,7 @@ from art.serverless.backend import ServerlessBackend
 model = art.TrainableModel(
     name="agent-001",
     project="checkpoint-deletion-demo",
-    base_model="Qwen/Qwen2.5-14B-Instruct",
+    base_model="OpenPipe/Qwen3-14B-Instruct",
 )
 backend = ServerlessBackend()
 # in order for the model to know where to look for its existing checkpoints,
@@ -55,7 +55,7 @@ TRAINING_STEPS = 50
 model = art.TrainableModel(
     name="agent-001",
     project="checkpoint-deletion-demo",
-    base_model="Qwen/Qwen2.5-14B-Instruct",
+    base_model="OpenPipe/Qwen3-14B-Instruct",
 )
 backend = ServerlessBackend()
 await model.register(backend)

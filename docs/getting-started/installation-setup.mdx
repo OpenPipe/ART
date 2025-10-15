@@ -31,7 +31,7 @@ backend = LocalBackend()
 model = TrainableModel(
     name="agent-001",
     project="my-agentic-task",
-    base_model="Qwen/Qwen2.5-14B-Instruct",
+    base_model="OpenPipe/Qwen3-14B-Instruct",
 )
 
 await model.register(backend)
@@ -57,7 +57,7 @@ backend = ServerlessBackend()
 model = TrainableModel(
     name="agent-001",
     project="my-agentic-task",
-    base_model="Qwen/Qwen2.5-14B-Instruct",
+    base_model="OpenPipe/Qwen3-14B-Instruct",
 )
 
 await model.register(backend)
@@ -87,7 +87,7 @@ backend = await SkyPilotBackend.initialize_cluster(
 model = TrainableModel(
     name="agent-001",
     project="my-agentic-task",
-    base_model="Qwen/Qwen2.5-14B-Instruct",
+    base_model="OpenPipe/Qwen3-14B-Instruct",
 )
 
 await model.register(backend)
