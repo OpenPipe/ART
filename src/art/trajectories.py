@@ -43,6 +43,7 @@ class Trajectory(pydantic.BaseModel):
     additional_histories: list[History] = []
     reward: float
     metrics: dict[str, float | int | bool] = {}
+    auto_metrics: dict[str, float | int | bool] = {}
     metadata: dict[str, MetadataValue] = {}
     logs: list[str] = []
     start_time: datetime = pydantic.Field(default_factory=datetime.now, exclude=True)
