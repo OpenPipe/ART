@@ -192,7 +192,9 @@ def tokenize_trajectory(
         end = start + 1
         if isinstance(message, dict):
             content = message.get("content")
-            assert isinstance(content, str)
+            assert isinstance(content, str), (
+                "Trajectories must have a 'content' field of type str"
+            )
             content_token_ids = tokenizer.encode(
                 content,
                 add_special_tokens=False,
