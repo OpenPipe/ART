@@ -9,11 +9,12 @@
 import asyncio
 from datetime import datetime
 
-import art
-from art.serverless.backend import ServerlessBackend
+import weave
 from dotenv import load_dotenv
 from envs.echo_env import EchoAction, EchoEnv
-import weave
+
+import art
+from art.serverless.backend import ServerlessBackend
 
 PROMPT = "Use at most 100 tokens; maximize the total character length of the output."
 NUM_STEPS = 50
