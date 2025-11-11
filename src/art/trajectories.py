@@ -187,9 +187,13 @@ class TrajectoryGroup(pydantic.BaseModel):
         new_instance.exceptions = self.exceptions[:]
         return new_instance
 
-    def __deepcopy__(self, memo):
+    def __deepcopy__(self, memo: dict[int, Any] | None = None):
         """Support for copy.deepcopy()"""
         import copy
+
+        # Initialize memo if not provided
+        if memo is None:
+            memo = {}
 
         # Check memo to handle circular references
         if id(self) in memo:
