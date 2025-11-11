@@ -183,7 +183,7 @@ class TrajectoryGroup(pydantic.BaseModel):
             trajectories=self.trajectories[:],  # Shallow copy of list
             exceptions=[],  # Will be set below
         )
-        # Manually copy exceptions  since they're PydanticException objects
+        # Manually copy exceptions since they're PydanticException objects
         new_instance.exceptions = self.exceptions[:]
         return new_instance
 
