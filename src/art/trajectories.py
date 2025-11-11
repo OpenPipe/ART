@@ -173,6 +173,39 @@ class TrajectoryGroup(pydantic.BaseModel):
             ],
         )
 
+    def __copy__(self):
+        """Support for copy.copy()"""
+        import copy
+
+        # Create a new instance using the constructor
+        # Pass shallow copies of the lists to avoid shared mutation
+        new_instance = self.__class__(
+            trajectories=self.trajectories[:],  # Shallow copy of list
+            exceptions=[],  # Will be set below
+        )
+        # Manually copy exceptions since they're PydanticException objects
+        new_instance.exceptions = self.exceptions[:]
+        return new_instance
+
+    def __deepcopy__(self, memo):
+        """Support for copy.deepcopy()"""
+        import copy
+
+        # Check memo to handle circular references
+        if id(self) in memo:
+            return memo[id(self)]
+
+        # Create a new instance with deep copies
+        new_instance = self.__class__(
+            trajectories=copy.deepcopy(self.trajectories, memo),
+            exceptions=[],  # Will be set below
+        )
+        # Register in memo before deep copying attributes to handle circular refs
+        memo[id(self)] = new_instance
+        # Deep copy exceptions
+        new_instance.exceptions = copy.deepcopy(self.exceptions, memo)
+        return new_instance
+
     def __iter__(self) -> Iterator[Trajectory]:  # type: ignore[override]
         return iter(self.trajectories)
 
