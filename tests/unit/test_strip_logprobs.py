@@ -2,7 +2,7 @@
 
 import copy
 import logging
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock
 
 import pytest
 
@@ -21,8 +21,7 @@ class TestStripLogprobs:
         }
         expected = {"data": "value", "nested": {"key": "val"}}
 
-        with patch("builtins.print"):  # Suppress debug prints
-            result = strip_logprobs(input_dict)
+        result = strip_logprobs(input_dict)
 
         assert result == expected
         assert input_dict["logprobs"] == [0.1, 0.2, 0.3]  # Original unchanged
@@ -40,8 +39,7 @@ class TestStripLogprobs:
         }
         expected = {"level1": {"level2": {"level3": {"data": 1}}}}
 
-        with patch("builtins.print"):
-            result = strip_logprobs(input_dict)
+        result = strip_logprobs(input_dict)
 
         assert result == expected
 
@@ -54,8 +52,7 @@ class TestStripLogprobs:
         ]
         expected = [{"item": 1}, {"item": 2}, {"item": 3}]
 
-        with patch("builtins.print"):
-            result = strip_logprobs(input_list)
+        result = strip_logprobs(input_list)
 
         assert result == expected
 
@@ -68,8 +65,7 @@ class TestStripLogprobs:
         )
         expected = ({"item": 1}, {"item": 2}, {"nested": {}})
 
-        with patch("builtins.print"):
-            result = strip_logprobs(input_tuple)
+        result = strip_logprobs(input_tuple)
 
         assert result == expected
         assert isinstance(result, tuple)
@@ -84,8 +80,7 @@ class TestStripLogprobs:
                 self.nested = {"key": "val", "logprobs": "remove"}
 
         obj = TestObject()
-        with patch("builtins.print"):
-            result = strip_logprobs(obj)
+        result = strip_logprobs(obj)
 
         assert result.data == "value"
         assert result.logprobs is None  # Set to None for objects
@@ -107,8 +102,7 @@ class TestStripLogprobs:
             "dict": {"nested": {"data": "keep"}},
         }
 
-        with patch("builtins.print"):
-            result = strip_logprobs(input_data)
+        result = strip_logprobs(input_data)
 
         assert result == expected
 
@@ -120,12 +114,11 @@ class TestStripLogprobs:
 
     def test_strip_none_and_primitives(self):
         """Test stripping logprobs from None and primitive values."""
-        with patch("builtins.print"):
-            assert strip_logprobs(None) is None
-            assert strip_logprobs(42) == 42
-            assert strip_logprobs("string") == "string"
-            assert strip_logprobs(3.14) == 3.14
-            assert strip_logprobs(True) is True
+        assert strip_logprobs(None) is None
+        assert strip_logprobs(42) == 42
+        assert strip_logprobs("string") == "string"
+        assert strip_logprobs(3.14) == 3.14
+        assert strip_logprobs(True) is True
 
     def test_no_logprobs_unchanged(self):
         """Test that structures without logprobs remain unchanged."""
@@ -135,8 +128,7 @@ class TestStripLogprobs:
             "list": [1, 2, 3],
         }
 
-        with patch("builtins.print"):
-            result = strip_logprobs(input_dict)
+        result = strip_logprobs(input_dict)
 
         assert result == input_dict
 
@@ -148,24 +140,11 @@ class TestStripLogprobs:
             "logprobs": "remove",
         }
 
-        with patch("builtins.print"):
-            result = strip_logprobs(input_dict)
+        result = strip_logprobs(input_dict)
 
         result["data"].append(4)
         assert nested_list == [1, 2, 3]  # Original unchanged
         assert result["data"] == [1, 2, 3, 4]
-
-    def test_debug_output(self, capsys):
-        """Test that debug output is printed."""
-        input_dict = {"test": "data", "logprobs": "remove"}
-
-        strip_logprobs(input_dict)
-        captured = capsys.readouterr()
-
-        assert "====== CALLED STRIP_LOGPROBS ======" in captured.out
-        assert "====== INPUT ======" in captured.out
-        assert "====== OUTPUT ======" in captured.out
-        assert "====== END STRIP_LOGPROBS ======" in captured.out
 
     def test_deepcopy_failure_returns_original(self, caplog):
         """Test that deepcopy failure returns original object and logs warning."""
