@@ -8,7 +8,7 @@ logger = logging.getLogger(__name__)
 
 def strip_logprobs(obj: Any) -> Any:
     """
-    Recursively remove 'logprobs' keys from nested data structures.
+    Recursively remove 'logprobs' keys from nested data structures to reduce data storage size.
 
     Args:
         obj: Any nested data structure
