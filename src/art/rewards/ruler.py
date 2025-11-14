@@ -39,7 +39,7 @@ class Response(BaseModel):
 
 
 DEFAULT_RUBRIC = dedent(
-    """         
+    """
         - A trajectory that achieves its goal should always get a significantly higher score than a trajectory that does not achieve its goal.
         - A trajectory that achieves its goal more efficiently (eg. by avoiding unproductive detours) should get a higher score than a trajectory that achieves its goal less efficiently.
         - If one trajectory is only slightly better than another, the difference in scores should be small. If it is significantly better, the difference in scores should be large.
