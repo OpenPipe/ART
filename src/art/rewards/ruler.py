@@ -124,7 +124,7 @@ async def ruler(
 
     if all_identical and len(message_lists) > 1:
         print(
-            f"[art_ruler] Warning: All {len(message_lists)} trajectories are identical. "
+            f"[RULER] Warning: All {len(message_lists)} trajectories are identical. "
             "Using absolute scoring (loses relative grounding benefit)."
         )
 
