@@ -39,7 +39,7 @@ class Response(BaseModel):
 
 
 DEFAULT_RUBRIC = dedent(
-    """         
+    """
         - A trajectory that achieves its goal should always get a significantly higher score than a trajectory that does not achieve its goal.
         - A trajectory that achieves its goal more efficiently (eg. by avoiding unproductive detours) should get a higher score than a trajectory that achieves its goal less efficiently.
         - If one trajectory is only slightly better than another, the difference in scores should be small. If it is significantly better, the difference in scores should be large.
@@ -117,23 +117,44 @@ async def ruler(
         else:
             break
 
+    # Detect if all trajectories are identical
+    all_identical = all(
+        len(msg_list) == common_prefix_len for msg_list in message_lists
+    )
+
+    if all_identical and len(message_lists) > 1:
+        print(
+            f"[RULER] Warning: All {len(message_lists)} trajectories are identical. "
+            "Using absolute scoring (loses relative grounding benefit)."
+        )
+
     # If there is a non-empty common prefix, serialize it once to save tokens.
+    # Skip this optimization if all trajectories are identical (we'll send the full trajectory instead).
     user_text = ""
-    if common_prefix_len > 0:
+    if common_prefix_len > 0 and not all_identical:
         common_prefix_messages = message_lists[0][:common_prefix_len]
         user_text += (
             "<context>\n" + json.dumps(common_prefix_messages) + "\n</context>\n\n"
         )
 
     # Serialize each trajectory (minus the common prefix) for the judge.
+    # If all trajectories are identical, only serialize one full trajectory to save tokens.
     serialized_trajectories: List[str] = []
-    for idx, full_messages in enumerate(message_lists, start=1):
-        trimmed_messages = full_messages[common_prefix_len:]
+    if all_identical:
+        # Send the full trajectory since they're all identical
+        full_trajectory = message_lists[0]
         serialized_trajectories.append(
-            f'<trajectory id="{idx}">\n'
-            + json.dumps(trimmed_messages)
-            + "\n</trajectory>"
+            f'<trajectory id="1">\n' + json.dumps(full_trajectory) + "\n</trajectory>"
         )
+    else:
+        # Serialize each unique trajectory
+        for idx, full_messages in enumerate(message_lists, start=1):
+            trimmed_messages = full_messages[common_prefix_len:]
+            serialized_trajectories.append(
+                f'<trajectory id="{idx}">\n'
+                + json.dumps(trimmed_messages)
+                + "\n</trajectory>"
+            )
 
     user_text += "Trajectories:\n\n" + "\n\n".join(serialized_trajectories)
 
@@ -175,9 +196,25 @@ async def ruler(
 
     content = first_choice.message.content or "{}"  # type: ignore[attr-defined]
     parsed = Response.model_validate_json(content)
-    assert len(parsed.scores) == len(message_lists)
 
-    return parsed.scores
+    # If all trajectories were identical, we only sent one to the judge
+    # Duplicate the score for all trajectories
+    if all_identical:
+        if len(parsed.scores) != 1:
+            raise ValueError(
+                f"Expected 1 score for identical trajectories, but got {len(parsed.scores)}"
+            )
+        single_score = parsed.scores[0]
+        return [
+            single_score.model_copy(update={"trajectory_id": str(i)})
+            for i in range(1, len(message_lists) + 1)
+        ]
+    else:
+        if len(parsed.scores) != len(message_lists):
+            raise ValueError(
+                f"Expected {len(message_lists)} scores, but got {len(parsed.scores)}"
+            )
+        return parsed.scores
 
 
 async def ruler_score_group(
