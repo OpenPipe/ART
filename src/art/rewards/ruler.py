@@ -200,14 +200,20 @@ async def ruler(
     # If all trajectories were identical, we only sent one to the judge
     # Duplicate the score for all trajectories
     if all_identical:
-        assert len(parsed.scores) == 1
+        if len(parsed.scores) != 1:
+            raise ValueError(
+                f"Expected 1 score for identical trajectories, but got {len(parsed.scores)}"
+            )
         single_score = parsed.scores[0]
         return [
             single_score.model_copy(update={"trajectory_id": str(i)})
             for i in range(1, len(message_lists) + 1)
         ]
     else:
-        assert len(parsed.scores) == len(message_lists)
+        if len(parsed.scores) != len(message_lists):
+            raise ValueError(
+                f"Expected {len(message_lists)} scores, but got {len(parsed.scores)}"
+            )
         return parsed.scores
 
 
