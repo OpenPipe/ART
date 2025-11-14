@@ -3,6 +3,7 @@ import os
 import time
 
 import openai
+import weave
 from dotenv import load_dotenv
 from game_utils import (
     TicTacToeGame,
@@ -13,15 +14,12 @@ from game_utils import (
     unwrap_move,
 )
 from openai.types.chat import ChatCompletion
-from openpipe.client import OpenPipe
 from pydantic import BaseModel
 
 import art
 from art.guided_completion import get_guided_completion_params
 
 load_dotenv()
-
-op_client = OpenPipe(api_key=os.getenv("OPENPIPE_API_KEY"))
 
 
 class PlayerState(BaseModel):
@@ -110,6 +108,7 @@ class TicTacToeScenario(BaseModel):
 
 
 @art.retry(exceptions=(openai.LengthFinishReasonError,))
+@weave.op
 async def rollout(
     x_model: art.Model, o_model: art.Model, scenario: TicTacToeScenario
 ) -> list[art.Trajectory]:
@@ -204,48 +203,15 @@ async def rollout(
             1 if player_state.invalid_move else 0
         )
 
-    if op_client.api_key:
-        for symbol in ["x", "o"]:
-            player_state = player_states[symbol]
-            trajectory = player_state.trajectory
-            messages = trajectory.messages()
-            # avoid double-reporting the last assistant completion message
-            if messages[-1]["role"] == "assistant":
-                messages = messages[:-1]
+    for symbol in ["x", "o"]:
+        player_state = player_states[symbol]
+        trajectory = player_state.trajectory
+        messages = trajectory.messages()
+        # avoid double-reporting the last assistant completion message
+        if messages[-1]["role"] == "assistant":
+            messages = messages[:-1]
 
-            model = x_model if symbol == "x" else o_model
-            teacher = scenario.x_teacher if symbol == "x" else scenario.o_teacher
-            try:
-                reported_win = (
-                    trajectory.metrics["win"] if "win" in trajectory.metrics else -1
-                )
-                op_client.report(
-                    requested_at=start_time,
-                    received_at=int(time.time() * 1000),
-                    req_payload={
-                        "model": model.name,
-                        "messages": messages,
-                        "metadata": {
-                            "project": "tic-tac-toe",
-                            "split": scenario.split,
-                            "step": str(scenario.step),
-                            "num_moves": str(move_number),
-                            "win": str(reported_win),
-                            "reward": str(trajectory.reward),
-                            "invalid_move": str(player_state.invalid_move),
-                            "symbol": symbol,
-                            "teacher": teacher.name if teacher else "",
-                            "initial_move": (
-                                unwrap_move(scenario.initial_move)
-                                if scenario.initial_move
-                                else ""
-                            ),
-                        },
-                    },
-                    resp_payload=player_state.last_completion,
-                    status_code=200,
-                )
-            except Exception as e:
-                print(f"Error reporting to OpenPipe: {e}")
+        model = x_model if symbol == "x" else o_model
+        teacher = scenario.x_teacher if symbol == "x" else scenario.o_teacher
 
     return player_states["x"].trajectory, player_states["o"].trajectory

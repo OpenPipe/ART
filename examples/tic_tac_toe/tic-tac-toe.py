@@ -3,10 +3,12 @@ import asyncio
 import os
 import random
 
+import weave
 from dotenv import load_dotenv
 from rollout import TicTacToeScenario, rollout
 
 import art
+from art.utils.strip_logprobs import strip_logprobs
 
 load_dotenv()
 
@@ -26,6 +28,8 @@ parser.add_argument(
     help="Backend to use for training (default: local)",
 )
 args = parser.parse_args()
+
+weave.init("tic-tac-toe", global_postprocess_output=strip_logprobs)
 
 
 async def main():

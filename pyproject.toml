@@ -70,18 +70,18 @@ sources = ["src"]
 
 [tool.hatch.build.targets.sdist]
 exclude = [
-  "/dev",
-  "/wandb",
-  "/.art",
-  "/.ruff_cache",
-  "/.venv",
-  "/dist",
-  "/.git",
-  "/.github",
-  "/examples/*/data",
-  "/examples/*/wandb",
-  "**/__pycache__",
-  "**/*.pyc",
+    "/dev",
+    "/wandb",
+    "/.art",
+    "/.ruff_cache",
+    "/.venv",
+    "/dist",
+    "/.git",
+    "/.github",
+    "/examples/*/data",
+    "/examples/*/wandb",
+    "**/__pycache__",
+    "**/*.pyc",
 ]
 
 [tool.ruff.lint]
@@ -99,7 +99,6 @@ dev-dependencies = [
     "black>=25.1.0",
     "ipykernel>=6.29.5",
     "ipywidgets>=8.1.5",
-    "openpipe>=4.49.0",
     "hatch>=1.14.1",
     "ruff>=0.12.1",
     "pytest>=8.4.1",
