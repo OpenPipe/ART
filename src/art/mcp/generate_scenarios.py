@@ -4,11 +4,14 @@ import json
 import time
 from typing import Any, Dict, List, Optional
 
-import openai
+from azure.identity import DefaultAzureCredential, get_bearer_token_provider
+import litellm
 
 from art.mcp.types import GeneratedScenarioCollection, MCPResource, MCPTool
-from art.utils.logging import _C, dim, err, info, ok, step
+from art.utils.logging import _C, dim, err, info, ok, step, warn
 
+# Enable automatic fallback to DefaultAzureCredential
+litellm.enable_azure_ad_token_refresh = True
 
 def preview_scenarios(scenarios: List[Dict[str, Any]], n: int = 5):
     """Preview generated scenarios."""
@@ -32,7 +35,7 @@ async def generate_scenarios(
     custom_instructions: Optional[str] = None,
     generator_model: str = "openai/gpt-4.1-mini",
     generator_api_key: Optional[str] = None,
-    generator_base_url: str = "https://openrouter.ai/api/v1",
+    generator_base_url: str = "",
 ) -> GeneratedScenarioCollection:
     """
     Generate scenarios for MCP tools.
@@ -43,9 +46,9 @@ async def generate_scenarios(
         num_scenarios: Number of scenarios to generate (default: 24)
         show_preview: Whether to show a preview of generated scenarios (default: True)
         custom_instructions: Optional custom instructions for scenario generation
-        generator_model: Model to use for generation (default: "openai/gpt-4.1-mini")
-        generator_api_key: API key for the generator model. If None, will use OPENROUTER_API_KEY env var
-        generator_base_url: Base URL for the API (default: OpenRouter)
+        generator_model: LiteLLM model to use for generation (default: "openai/gpt-4.1-mini")
+        generator_api_key: API key for the generator model. If None, will use environment variable associated with the LiteLLM model.
+        generator_base_url: Base URL for the API
 
     Returns:
         GeneratedScenarioCollection containing the generated scenarios
@@ -54,13 +57,16 @@ async def generate_scenarios(
 
     t0 = time.perf_counter()
 
-    # Handle API key
-    if generator_api_key is None:
-        generator_api_key = os.getenv("OPENROUTER_API_KEY")
-        if not generator_api_key:
-            raise ValueError(
-                "generator_api_key is required or OPENROUTER_API_KEY env var must be set"
-            )
+    # Handle API key if provided
+    if generator_api_key:
+        result = litellm.utils.check_valid_key(model=generator_model, api_key=generator_api_key)
+        if result:
+            litellm.api_key = generator_api_key
+        else:
+            raise ValueError("Invalid API key provided.")
+
+    if not generator_api_key:
+        warn("generator_api_key is not set. Will use environment variable associated with the LiteLLM model.")
 
     # Validate that we have at least tools or resources
     if not tools and not resources:
@@ -160,50 +166,60 @@ You must respond with a JSON object containing a "scenarios" array of exactly {n
     }
 
     step(f"Calling model: {_C.BOLD}{generator_model}{_C.RESET} &")
-    client_openai = openai.OpenAI(
-        api_key=generator_api_key,
-        base_url=generator_base_url,
-    )
 
-    t1 = time.perf_counter()
-    response = client_openai.chat.completions.create(
-        model=generator_model,
-        messages=[{"role": "user", "content": prompt}],
-        max_completion_tokens=8000,
-        response_format={
-            "type": "json_schema",
-            "json_schema": {"name": "scenario_list", "schema": response_schema},
-        },
-    )
-    dt = time.perf_counter() - t1
-    ok(f"Model responded in {dt:.2f}s.")
+    # If using Azure OpenAI, support managed identity authentication via DefaultAzureCredential
+    token_provider = None
+    if os.getenv("AZURE_API_BASE") and not os.getenv("AZURE_API_KEY"):
+        warn("AZURE_API_KEY environment variable not set for Azure OpenAI. Will fallback to DefaultAzureCredential().")
+        try:
+            token_provider = get_bearer_token_provider(DefaultAzureCredential(), "https://cognitiveservices.azure.com/.default")
+        except Exception:
+            err(f"Failed to get bearer token provider for Azure AD authentication.")
+            raise
 
-    content = response.choices[0].message.content
-    if content is None:
-        err("Model response content is None.")
-        raise ValueError("Model response content is None")
-    info(f"Raw content length: {len(content)} chars.")
+    scenarios = []
+    while len(scenarios) < num_scenarios:
+        if len(scenarios) > 0:
+            warn(f"Expected {num_scenarios} scenarios, got {len(scenarios)}. Retrying to get more scenarios.")
 
-    # Parse JSON
-    try:
-        result = json.loads(content)
-    except Exception as e:
-        err("Failed to parse JSON from model response.")
-        dim(f"   Exception: {e}")
-        dim("   First 500 chars of response content:")
-        dim(content[:500] if content else "No content")
-        raise
+        t1 = time.perf_counter()
+        response = await litellm.acompletion(
+            model=generator_model,
+            messages=[{"role": "user", "content": prompt}],
+            azure_ad_token_provider=token_provider,
+            max_completion_tokens=8000,
+            response_format={
+                "type": "json_schema",
+                "json_schema": {"name": "scenario_list", "schema": response_schema},
+            },
+        )
+        dt = time.perf_counter() - t1
+        ok(f"Model responded in {dt:.2f}s.")
 
-    # Extract scenarios
-    if "scenarios" in result:
-        scenarios = result["scenarios"]
-    else:
-        scenarios = result if isinstance(result, list) else list(result.values())[0]
+        content = response.choices[0].message.content
+        if content is None:
+            err("Model response content is None.")
+            raise ValueError("Model response content is None")
+        info(f"Raw content length: {len(content)} chars.")
 
-    # Validate count
-    if len(scenarios) != num_scenarios:
-        err(f"Expected {num_scenarios} scenarios, got {len(scenarios)}.")
-        raise ValueError(f"Expected {num_scenarios} scenarios, got {len(scenarios)}")
+        # Parse JSON
+        try:
+            result = json.loads(content)
+        except Exception as e:
+            err("Failed to parse JSON from model response.")
+            dim(f"   Exception: {e}")
+            dim("   First 500 chars of response content:")
+            dim(content[:500] if content else "No content")
+            raise
+
+        # Extract scenarios
+        if "scenarios" in result:
+            scenarios_list = result["scenarios"]
+        else:
+            scenarios_list = result if isinstance(result, list) else list(result.values())[0]
+        scenarios.extend(scenarios_list)
+
+    scenarios = scenarios[:num_scenarios]  # Trim to exact number if we got too many scenarios
 
     ok(f"Parsed {len(scenarios)} scenario(s) successfully.")
 

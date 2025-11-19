@@ -1,13 +1,16 @@
+import os
 from typing import TYPE_CHECKING, Generic, Iterable, Optional, TypeVar, cast, overload
 
+from azure.identity import DefaultAzureCredential, get_bearer_token_provider
 import httpx
-from openai import AsyncOpenAI, DefaultAsyncHttpxClient
+from openai import AsyncOpenAI, AsyncAzureOpenAI, DefaultAsyncHttpxClient
 from pydantic import BaseModel
 from typing_extensions import Never
 
 from . import dev
 from .trajectories import Trajectory, TrajectoryGroup
 from .types import TrainConfig
+from .utils.logging import warn
 
 if TYPE_CHECKING:
     from art.backend import Backend
@@ -71,7 +74,7 @@ class Model(
     _backend: Optional["Backend"] = None
     _s3_bucket: str | None = None
     _s3_prefix: str | None = None
-    _openai_client: AsyncOpenAI | None = None
+    _openai_client: AsyncOpenAI | AsyncAzureOpenAI | None = None
 
     def __init__(
         self,
@@ -178,6 +181,41 @@ class Model(
         self._openai_client = AsyncOpenAI(
             base_url=self.inference_base_url,
             api_key=self.inference_api_key,
+            http_client=DefaultAsyncHttpxClient(
+                timeout=httpx.Timeout(timeout=1200, connect=5.0),
+                limits=httpx.Limits(
+                    max_connections=100_000, max_keepalive_connections=100_000
+                ),
+            ),
+        )
+        return self._openai_client
+
+    def azure_openai_client(
+        self,
+    ) -> AsyncAzureOpenAI:
+        if self._openai_client is not None:
+            return self._openai_client # type: ignore
+
+        if self.inference_base_url is None:
+            if self.trainable:
+                raise ValueError(
+                    "AzureOpenAI client not yet available on this trainable model. You must call `model.register()` first."
+                )
+            else:
+                raise ValueError(
+                    "In order to create an AzureOpenAI client you must provide an `inference_api_key` (optional) and `inference_base_url`."
+                )
+        if not os.getenv("AZURE_API_BASE"):
+            raise ValueError("AZURE_API_BASE environment variable must be set for Azure OpenAI")
+        token_provider = None
+        if not self.inference_api_key:
+            warn("Creating AzureOpenAI client without an inference_api_key. Will fall back to DefaultAzureCredential().")
+            token_provider = get_bearer_token_provider(DefaultAzureCredential(), "https://cognitiveservices.azure.com/.default")
+        self._openai_client = AsyncAzureOpenAI(
+            base_url=os.environ["AZURE_API_BASE"],
+            api_key=self.inference_api_key,
+            azure_ad_token_provider=token_provider,
+            api_version=os.getenv("AZURE_API_VERSION", "2024-12-01-preview"),
             http_client=DefaultAsyncHttpxClient(
                 timeout=httpx.Timeout(timeout=1200, connect=5.0),
                 limits=httpx.Limits(

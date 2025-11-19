@@ -10,10 +10,14 @@ For detailed documentation and examples, see: https://art.openpipe.ai/fundamenta
 """
 
 import json
+import os
 from textwrap import dedent
 from typing import List
 
-from litellm import acompletion
+from art.utils.logging import err, warn
+from azure.identity import DefaultAzureCredential, get_bearer_token_provider
+
+import litellm
 from litellm.types.utils import ModelResponse
 from openai.types.chat.chat_completion_message_param import ChatCompletionMessageParam
 from pydantic import BaseModel, Field
@@ -172,9 +176,19 @@ async def ruler(
         {"role": "user", "content": user_text},
     ]
 
-    response = await acompletion(
+    token_provider = None
+    # If using Azure OpenAI, support managed identity authentication via DefaultAzureCredential
+    if os.getenv("AZURE_API_BASE") and not os.getenv("AZURE_API_KEY"):
+        warn("AZURE_API_KEY environment variable not set for Azure OpenAI. Will fallback to DefaultAzureCredential().")
+        try:
+            token_provider = get_bearer_token_provider(DefaultAzureCredential(), "https://cognitiveservices.azure.com/.default")
+        except Exception:
+            err(f"Failed to get bearer token provider for Azure AD authentication.")
+            raise
+    response = await litellm.acompletion(
         model=judge_model,
         messages=messages,
+        azure_ad_token_provider=token_provider,
         response_format=Response,
         caching=False,
         **extra_litellm_params if extra_litellm_params else {},
