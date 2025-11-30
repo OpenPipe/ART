@@ -137,9 +137,7 @@ class TrajectoryGroup(pydantic.BaseModel):
 
     def __init__(
         self,
-        trajectories: (
-            Iterable[Trajectory | BaseException] | Iterable[Awaitable[Trajectory]]
-        ),
+        trajectories: Iterable[Trajectory | BaseException],
         *,
         exceptions: list[BaseException] = [],
     ) -> None:
@@ -231,53 +229,43 @@ class TrajectoryGroup(pydantic.BaseModel):
 
     def __new__(
         cls,
-        trajectories: (
-            Iterable[Trajectory | BaseException] | Iterable[Awaitable[Trajectory]]
-        ),
+        trajectories: Iterable,
         *,
         exceptions: list[BaseException] = [],
-    ) -> "TrajectoryGroup | Awaitable[TrajectoryGroup]":
+    ):
         ts = list(trajectories)
-        if any(hasattr(t, "__await__") for t in ts):
+        if not ts or isinstance(ts[0], (Trajectory, BaseException)):
+            return super().__new__(cls)
 
-            async def _(exceptions: list[BaseException]):
-                from .gather import get_gather_context, record_metrics
+        async def _(exceptions: list[BaseException]):
+            from .gather import get_gather_context, record_metrics
 
-                context = get_gather_context()
-                trajectories = []
-                for future in asyncio.as_completed(
-                    cast(list[Awaitable[Trajectory]], ts)
-                ):
-                    try:
-                        trajectory = await future
-                        trajectories.append(trajectory)
-                        record_metrics(context, trajectory)
-                        context.update_pbar(n=1)
-                    except BaseException as e:
-                        exceptions.append(e)
-                        context.metric_sums["exceptions"] += 1
-                        context.update_pbar(n=0)
-                        if context.too_many_exceptions():
-                            raise
-                return TrajectoryGroup(
-                    trajectories=trajectories,
-                    exceptions=exceptions,
-                )
-
-            class CoroutineWithMetadata:
-                def __init__(self, coro, num_trajectories):
-                    self.coro = coro
-                    self._num_trajectories = num_trajectories
-
-                def __await__(self):
-                    return self.coro.__await__()
-
-            coro = _(exceptions.copy())
-            return CoroutineWithMetadata(coro, len(ts))
-        else:
-            group = super().__new__(cls)
-            group.__init__(
-                trajectories=cast(list[Trajectory | BaseException], ts),
+            context = get_gather_context()
+            trajectories = []
+            for future in asyncio.as_completed(cast(list[Awaitable[Trajectory]], ts)):
+                try:
+                    trajectory = await future
+                    trajectories.append(trajectory)
+                    record_metrics(context, trajectory)
+                    context.update_pbar(n=1)
+                except BaseException as e:
+                    exceptions.append(e)
+                    context.metric_sums["exceptions"] += 1
+                    context.update_pbar(n=0)
+                    if context.too_many_exceptions():
+                        raise
+            return TrajectoryGroup(
+                trajectories=trajectories,
                 exceptions=exceptions,
             )
-            return group
+
+        class CoroutineWithMetadata:
+            def __init__(self, coro, num_trajectories):
+                self.coro = coro
+                self._num_trajectories = num_trajectories
+
+            def __await__(self):
+                return self.coro.__await__()
+
+        coro = _(exceptions.copy())
+        return CoroutineWithMetadata(coro, len(ts))

@@ -94,7 +94,7 @@ case-sensitive = false
 asyncio_mode = "auto"
 
 [tool.uv]
-required-version = ">=0.6.15"
+required-version = ">=0.6.13"
 dev-dependencies = [
     "black>=25.1.0",
     "ipykernel>=6.29.5",

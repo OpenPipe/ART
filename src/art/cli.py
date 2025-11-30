@@ -9,6 +9,7 @@ from dotenv import load_dotenv
 from fastapi import Body, FastAPI, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 
+
 from . import dev
 from .errors import ARTError
 from .local import LocalBackend
@@ -36,16 +37,6 @@ def run(host: str = "0.0.0.0", port: int = 7999) -> None:
             f"Port {port} is already in use, possibly because the ART server is already running."
         )
         return
-
-    # Reset the custom __new__ and __init__ methods for TrajectoryGroup
-    def __new__(cls, *args: Any, **kwargs: Any) -> TrajectoryGroup:
-        return pydantic.BaseModel.__new__(cls)
-
-    def __init__(self, *args: Any, **kwargs: Any) -> None:
-        return pydantic.BaseModel.__init__(self, *args, **kwargs)
-
-    TrajectoryGroup.__new__ = __new__  # type: ignore
-    TrajectoryGroup.__init__ = __init__
 
     backend = LocalBackend()
     app = FastAPI()
