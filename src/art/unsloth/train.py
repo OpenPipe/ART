@@ -190,10 +190,23 @@ def get_compute_loss_fn(trainer: "GRPOTrainer") -> Callable[..., torch.Tensor]:
             prob_ratio = torch.clamp(
                 prob_ratio, max=max_negative_advantage_importance_sampling_weight
             )
-        policy_loss = -torch.min(
-            prob_ratio * advantages,
-            torch.clip(prob_ratio, 1 - epsilon, 1 + epsilon_high) * advantages,
-        )
+        if _config.get("gmpo", True):
+            advantage_signs = -torch.sign(advantages)
+            signed_logprob_diff = logprob_diff * advantage_signs
+            signed_logprob_diff_clamp = torch.clamp(
+                signed_logprob_diff, -epsilon, epsilon_high
+            )
+            signed_logprob_diff_max = torch.max(
+                signed_logprob_diff, signed_logprob_diff_clamp
+            )
+            logprobs_diff_max = advantage_signs * signed_logprob_diff_max
+            prob_ratio = torch.exp(logprobs_diff_max)
+            policy_loss = -advantages * prob_ratio
+        else:
+            policy_loss = -torch.min(
+                prob_ratio * advantages,
+                torch.clip(prob_ratio, 1 - epsilon, 1 + epsilon_high) * advantages,
+            )
         if upper_bound := _config.get("truncated_importance_sampling", None):
             if "original_logprobs" in inputs:
                 original_logprobs = shift_tensor(inputs["original_logprobs"], 0.0)
