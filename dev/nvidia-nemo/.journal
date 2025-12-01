@@ -1,0 +1,55 @@
+We need to add support for Nvidia NeMo training.
+
+We have 2 H200s at our disposal.
+
+We need to successfully run a LoRA SFT job with Qwen/Qwen3-30B-A3B-Instruct-2507.
+
+User insists as much as possible be done via pyproject.toml dependencies.
+
+Can create new extra, `nvidia-nemo`.
+
+Anything that cannot be done with `uv sync --extra nvidia-nemo` must be documented.
+
+We will provide a reproducable script to run the training job with 2 H200s.
+
+What if the model, activations, optimizer, etc. doesn't fit? It should fit with LoRA, but we can try activation offloading and other tricks if we need to.
+
+If the LoRA format is not HF/vLLM compatible, we will need to document how to convert to and from Nvidia NeMo format.
+
+We will keep working until it works.
+
+We need to keep this journal up-to-date so work can be resumed later.
+
+2025-09-16
+
+- Created `nvidia-nemo` extra in `pyproject.toml` with NeMo/Aligner deps: `nemo_toolkit[all]>=2.0.0`, `hydra-core>=1.3.2`, `omegaconf>=2.3.0`, `datasets>=2.20.0`, `safetensors>=0.4.5`, `flash-attn>=2.6.0` (Linux), and `nemo-aligner` (installed via uv git source `https://github.com/NVIDIA/NeMo-Aligner.git`).
+- Next: verify `uv sync --extra nvidia-nemo`; draft 2× H200 LoRA SFT script for `Qwen/Qwen3-30B-A3B-Instruct-2507`; add example config and run script.
+- Notes/risks: FlashAttention for H200 (sm_90a) may build from source and require proper CUDA toolchain; will document any manual steps if needed.
+- Open questions:
+  1) Is using a Git source for NeMo-Aligner acceptable, and should we pin a specific commit?
+  2) Do we have a Hugging Face token on this machine with access to `Qwen/Qwen3-30B-A3B-Instruct-2507`?
+  3) Which SFT dataset should we target first (provide path or HF repo)?
+  4) Any constraints on CUDA/cuDNN versions on the H200 nodes we should adhere to?
+
+2025-09-16 (cont.)
+
+- Ran `uv sync --extra nvidia-nemo` and hit resolver conflicts:
+  - Initial conflict with dev `black` (NeMo needs `black>=24.3,<25.dev0`, project had `black>=25.1.0`). Relaxed dev black to `>=24.10.0,<25`.
+  - Next conflict between `nemo_toolkit[all]` and `backend` extra pins:
+    - `nemo_toolkit[all]` requires `transformers<=4.52.0` and `numba==0.61.0`.
+    - `backend` extra pins `transformers==4.53.2` and `vllm>=0.9.2,<=0.10.0` which requires `numba==0.61.2`.
+    - Result: `openpipe-art[backend]` and `openpipe-art[nvidia-nemo]` cannot be resolved together.
+- Adjusted `nvidia-nemo` extra to `nemo_toolkit[all]>=2.3.0` and made `flash-attn` optional; conflict persists due to `backend`.
+- Proposed paths:
+  1) Keep `backend` as-is; install NeMo in an isolated env (no `backend`), e.g., run `uv sync --extra nvidia-nemo --no-dev` in a fresh environment and avoid mixing `backend` in the same venv.
+  2) Loosen `backend` pins (e.g., allow `transformers<=4.52.0`, check `vllm` vs `numba==0.61.0` compatibility); risk of ripple effects.
+  3) Add a small, separate `pyproject.toml` under `dev/nvidia-nemo/` dedicated to NeMo training to fully decouple.
+- Waiting on answers to proceed with either 1) isolated env or 3) subproject approach. Once decided, will implement the LoRA SFT script and a 2×H200 launch helper.
+
+2025-09-16 — Isolated subproject scaffolding
+
+- Created isolated subproject `dev/nvidia-nemo/pyproject.toml` with pinned deps compatible with NeMo 2.2.x. Avoided `[all]` extras to reduce build pain. Added `README.md`, `train_lora_sft.py`, `run_2x_h200.sh`, and `data/sample_sft.jsonl`.
+- Installed isolated env with `uv sync --no-install-project` and iteratively added missing runtime deps required by NeMo imports: `lightning`, `megatron-core`, `einops`, `transformers<=4.52.0`, `sentencepiece`, `braceexpand`, `webdataset`, `h5py`, `psutil`, `ijson`, `matplotlib`, `sacrebleu`.
+- Downgraded `nemo_toolkit` to `2.2.1` to avoid `nvidia_resiliency_ext` import. NeMo import progresses; optional warnings about missing Transformer Engine/Apex are acceptable for LoRA SFT.
+- Updated run helper to activate `.venv` and call `python` directly (avoids editable-build errors). Sample command uses `Qwen/Qwen3-30B-A3B-Instruct-2507` and the small JSONL dataset.
+- Next: validate `train_lora_sft.py` end-to-end on 2×H200 with tiny steps/batches. If OOM, adjust `seq-length`, micro-batch, and consider activation checkpointing/offloading. Document any manual steps.

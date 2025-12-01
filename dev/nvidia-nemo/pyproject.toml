@@ -1,0 +1,51 @@
+[project]
+name = "art-nemo"
+version = "0.1.0"
+description = "Isolated NVIDIA NeMo training env for ART"
+readme = "README.md"
+requires-python = ">=3.10,<3.13"
+dependencies = [
+    "nemo_toolkit==2.2.1",
+    "nemo-aligner",
+    "lightning>=2.4.0",
+    "megatron-core>=0.13.1",
+    "einops>=0.8.0",
+    "tensorstore>=0.1.56",
+    "zarr<3",
+    "numcodecs<0.12",
+    "hydra-core>=1.3.2",
+    "omegaconf>=2.3.0",
+    "datasets>=2.20.0",
+    "safetensors>=0.4.5",
+    "huggingface_hub>=0.24.5",
+    "transformers>=4.51.0,<=4.52.0",
+    "sentencepiece>=0.2.0",
+    "nemo_run>=0.2.0",
+    "webdataset>=0.2.86",
+    "braceexpand>=0.1.7",
+    "h5py>=3.11.0",
+    "psutil>=5.9.0",
+    "ijson>=3.2.3",
+    "matplotlib>=3.9.2",
+    "sacrebleu>=2.4.3",
+    "rouge-score>=0.1.2",
+    "jieba>=0.42.1",
+    "opencc-python-reimplemented>=0.1.7",
+    "pypinyin>=0.53.0",
+    "pypinyin-dict>=0.8.0",
+    "pangu>=4.0.6",
+]
+
+[project.optional-dependencies]
+aligner = ["nemo-aligner"]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.uv]
+required-version = ">=0.6.15"
+
+[tool.uv.sources]
+nemo-aligner = { git = "https://github.com/NVIDIA/NeMo-Aligner.git", rev = "main" }
+

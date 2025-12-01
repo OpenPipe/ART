@@ -1,0 +1,3 @@
+{"prompt": "Summarize: The sky is blue because of Rayleigh scattering.", "completion": "Rayleigh scattering makes shorter blue wavelengths scatter more, coloring the sky."}
+{"instruction": "Rewrite to be more polite", "input": "Shut the door.", "output": "Please close the door."}
+

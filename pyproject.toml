@@ -51,6 +51,16 @@ langgraph = [
     "langchain-openai>=0.3.27",
 ]
 
+nvidia-nemo = [
+    "nemo_toolkit[all]>=2.3.0",
+    "hydra-core>=1.3.2",
+    "omegaconf>=2.3.0",
+    "datasets>=2.20.0",
+    "safetensors>=0.4.5",
+    # flash-attn is optional and often builds from source on H200; install separately if desired
+    "nemo-aligner",
+]
+
 [project.scripts]
 art = "art.cli:app"
 stop-server = "art.skypilot.stop_server:main"
@@ -96,7 +106,7 @@ asyncio_mode = "auto"
 [tool.uv]
 required-version = ">=0.6.15"
 dev-dependencies = [
-    "black>=25.1.0",
+    "black>=24.10.0,<25",
     "ipykernel>=6.29.5",
     "ipywidgets>=8.1.5",
     "hatch>=1.14.1",
@@ -112,3 +122,4 @@ dev-dependencies = [
 panza = { git = "https://github.com/corbt/panza.git" }
 sweagent = { git = "https://github.com/bradhilton/SWE-agent" }
 torchtune = { git = "https://github.com/pytorch/torchtune.git", rev = "2344509cf83bd886538fe3e8263e5145d1afb5c2" }
+nemo-aligner = { git = "https://github.com/NVIDIA/NeMo-Aligner.git", rev = "main" }
