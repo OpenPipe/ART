@@ -136,7 +136,7 @@ ART is in active development, and contributions are most welcome! Please see the
 
 ```bibtex
 @misc{hilton2025art,
-  author = {Brad Hilton and Kyle Corbitt and David Corbitt and Saumya Gandhi and Angky William and Bohdan Kovalenskyi and Andie Jones},
+  author = {Brad Hilton and Kyle Corbitt and David Corbitt and Saumya Gandhi and Angky William and Bohdan Kovalevskyi and Andie Jones},
   title = {ART: Agent Reinforcement Trainer},
   year = {2025},
   publisher = {GitHub},
