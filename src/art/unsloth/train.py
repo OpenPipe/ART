@@ -108,9 +108,10 @@ def get_compute_loss_fn(trainer: "GRPOTrainer") -> Callable[..., torch.Tensor]:
         # Get attention head counts from model config for xformers format
         # Training mode (requires_grad=True): 4D [B, n_heads, S, S]
         # Inference mode (requires_grad=False): 5D [B, n_kv_heads, n_groups, S, S]
-        num_attention_heads = trainer.model.config.num_attention_heads
-        num_key_value_heads = getattr(
-            trainer.model.config, "num_key_value_heads", num_attention_heads
+        model_config = trainer.model.config  # type: ignore[union-attr]
+        num_attention_heads = int(model_config.num_attention_heads)  # type: ignore[union-attr]
+        num_key_value_heads = int(
+            getattr(model_config, "num_key_value_heads", num_attention_heads)
         )
         # Create base 3D mask, will be expanded in calculate_logprobs
         attn_bias_3d = calculate_attn_bias(
