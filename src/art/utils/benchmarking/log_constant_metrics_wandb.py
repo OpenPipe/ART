@@ -8,8 +8,7 @@ import art
 async def log_constant_metrics_wandb(
     model: art.Model,
     num_steps: int,
-    split: str,
-    metrics: dict[str, float],
+    split_metrics: dict[str, dict[str, float]],
 ) -> None:
     """
     Log constant metrics to W&B as horizontal lines across all training steps.
@@ -24,10 +23,11 @@ async def log_constant_metrics_wandb(
         The model whose `project` and `name` are used for the W&B run.
     num_steps : int
         Total training steps. Metrics are logged at steps 0 through `num_steps`.
-    split : str
-        Data split name (e.g., "val"). Used as prefix: "{split}/{metric_name}".
-    metrics : dict[str, float]
-        Metric names mapped to their constant values.
+    split_metrics : dict[str, dict[str, float]]
+        Nested dict mapping split names (e.g., "train", "val") to metric dicts.
+        Each metric is logged as "{split}/{metric_name}".
+
+        Example: `{"train": {"loss": 0.5}, "val": {"loss": 0.4, "accuracy": 0.8}}`
     """
     run = wandb.init(
         project=model.project,
@@ -35,10 +35,14 @@ async def log_constant_metrics_wandb(
         reinit="create_new",
     )
 
-    # Prefix metrics with split
-    prefixed_metrics = {f"{split}/{key}": value for key, value in metrics.items()}
+    # Prefix metrics with their split names
+    prefixed_metrics = {
+        f"{split}/{key}": value
+        for split, metrics in split_metrics.items()
+        for key, value in metrics.items()
+    }
 
-    # Log at every step to create a horizontal line
+    # Log at every step to create horizontal lines
     for step in range(num_steps + 1):
         run.log(prefixed_metrics, step=step)
 
