@@ -1,7 +1,8 @@
 """Utilities for logging constant baseline metrics to Weights & Biases."""
 
-import art
 import wandb
+
+import art
 
 
 async def log_constant_metrics_wandb(
