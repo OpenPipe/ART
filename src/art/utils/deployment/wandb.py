@@ -15,6 +15,8 @@ class WandbDeploymentConfig(DeploymentConfig):
     """Configuration for deploying to W&B.
 
     Supported base models:
+    - meta-llama/llama-3.1-8b-instruct
+    - meta-llama/llama-3.1-70b-instruct
     - OpenPipe/Qwen3-14B-Instruct
     - Qwen/Qwen2.5-14B-Instruct
     """
@@ -23,6 +25,8 @@ class WandbDeploymentConfig(DeploymentConfig):
 
 
 WANDB_SUPPORTED_BASE_MODELS = [
+    "meta-llama/llama-3.1-8b-instruct",
+    "meta-llama/llama-3.1-70b-instruct",
     "OpenPipe/Qwen3-14B-Instruct",
     "Qwen/Qwen2.5-14B-Instruct",
 ]
