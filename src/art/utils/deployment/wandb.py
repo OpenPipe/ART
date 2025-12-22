@@ -68,6 +68,7 @@ def deploy_wandb(
         print(f"Uploading checkpoint from {checkpoint_path} to W&B...")
 
     run = wandb.init(
+        name=model.name + " (deployment)",
         entity=model.entity,
         project=model.project,
         settings=wandb.Settings(api_key=os.environ["WANDB_API_KEY"]),
