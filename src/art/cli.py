@@ -1,6 +1,6 @@
 import json
 import socket
-from typing import Any, AsyncIterator
+from typing import Any, AsyncIterator, Literal
 
 import pydantic
 import typer
@@ -105,6 +105,8 @@ def run(host: str = "0.0.0.0", port: int = 7999) -> None:
         prefix: str | None = Body(None),
         verbose: bool = Body(False),
         delete: bool = Body(False),
+        only_step: int | Literal["latest"] | None = Body(None),
+        exclude: list[Literal["checkpoints", "logs", "trajectories"]] | None = Body(None),
     ):
         await backend._experimental_pull_from_s3(
             model=model,
@@ -112,6 +114,8 @@ def run(host: str = "0.0.0.0", port: int = 7999) -> None:
             prefix=prefix,
             verbose=verbose,
             delete=delete,
+            only_step=only_step,
+            exclude=exclude,
         )
 
     @app.post("/_experimental_push_to_s3")

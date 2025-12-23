@@ -146,6 +146,7 @@ class Backend:
         verbose: bool = False,
         delete: bool = False,
         only_step: int | Literal["latest"] | None = None,
+        exclude: list[Literal["checkpoints", "logs", "trajectories"]] | None = None,
     ) -> None:
         """Download the model directory from S3 into file system where the LocalBackend is running. Right now this can be used to pull trajectory logs for processing or model checkpoints.
 
@@ -155,6 +156,7 @@ class Backend:
         Args:
             only_step: If specified, only pull this specific step. Can be an int for a specific step,
                       or "latest" to pull only the latest checkpoint. If None, pulls all steps.
+            exclude: List of directories to exclude from sync. Valid options: "checkpoints", "logs", "trajectories".
         """
         warnings.warn(
             "_experimental_pull_from_s3 is deprecated. Use _experimental_pull_model_checkpoint instead.",
@@ -170,6 +172,7 @@ class Backend:
                 "verbose": verbose,
                 "delete": delete,
                 "only_step": only_step,
+                "exclude": exclude,
             },
             timeout=600,
         )
