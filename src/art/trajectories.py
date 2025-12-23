@@ -213,6 +213,8 @@ class TrajectoryGroup(pydantic.BaseModel):
     def __len__(self) -> int:
         return len(self.trajectories)
 
+
+
     @overload
     def __new__(
         cls,
@@ -281,3 +283,4 @@ class TrajectoryGroup(pydantic.BaseModel):
                 exceptions=exceptions,
             )
             return group
+
