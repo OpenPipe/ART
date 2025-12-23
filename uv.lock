@@ -4300,6 +4300,7 @@ name = "openpipe-art"
 version = "0.5.4"
 source = { editable = "." }
 dependencies = [
+    { name = "azure-identity" },
     { name = "litellm" },
     { name = "openai" },
     { name = "typer" },
@@ -4363,6 +4364,7 @@ dev = [
 requires-dist = [
     { name = "accelerate", marker = "extra == 'backend'", specifier = "==1.7.0" },
     { name = "awscli", marker = "extra == 'backend'", specifier = ">=1.38.1" },
+    { name = "azure-identity", specifier = ">=1.24.0" },
     { name = "bitsandbytes", marker = "extra == 'backend'", specifier = ">=0.45.2" },
     { name = "gql", marker = "extra == 'backend'", specifier = "<4" },
     { name = "hf-xet", marker = "extra == 'backend'", specifier = ">=1.1.0" },
