@@ -4,29 +4,20 @@ import os
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, AsyncIterator
 
-import torch
-
-from art.utils.get_model_step import get_step_from_dir
-
 from .. import dev, types
 from ..local.checkpoints import get_last_checkpoint_dir
 from ..preprocessing.pack import (
     DiskPackedTensors,
-    PackedTensors,
     packed_tensors_from_dir,
+)
+from .shared import (
+    process_train_batch,
+    save_checkpoint,
 )
 from .train import train
 
 if TYPE_CHECKING:
-    from unsloth_zoo.vllm_lora_request import LoRARequest  # type: ignore
-
     from .state import ModelState
-
-
-class TrainInputs(PackedTensors):
-    config: types.TrainConfig
-    _config: dev.TrainConfig
-    return_new_logprobs: bool
 
 
 @dataclass
@@ -104,108 +95,26 @@ class UnslothService:
         precalculate_logprobs = _config.get("precalculate_logprobs", False)
         # Enter training mode
         async with self.state.vllm.train_mode():
-            for offset in range(0, packed_tensors["tokens"].shape[0]):
-                for _ in range(2 if warmup else 1):
-                    if precalculate_logprobs and not warmup:
-                        packed_tensors["original_logprobs"] = packed_tensors["logprobs"]  # type: ignore
-                        packed_tensors["logprobs"] = torch.cat(
-                            [
-                                self.state.trainer.compute_loss(
-                                    self.state.peft_model,
-                                    TrainInputs(
-                                        **{
-                                            k: v[_offset : _offset + 1]
-                                            for k, v in packed_tensors.items()
-                                            if isinstance(v, torch.Tensor)
-                                        },
-                                        pixel_values=packed_tensors["pixel_values"][
-                                            _offset : _offset + 1
-                                        ],
-                                        image_grid_thw=packed_tensors["image_grid_thw"][
-                                            _offset : _offset + 1
-                                        ],
-                                        config=config,
-                                        _config=_config,
-                                        return_new_logprobs=True,
-                                    ),  # type: ignore
-                                )
-                                for _offset in range(
-                                    0, packed_tensors["tokens"].shape[0]
-                                )
-                            ]
-                        ).to("cpu")
-                        precalculate_logprobs = False
-                    self.state.inputs_queue.put_nowait(
-                        TrainInputs(
-                            **{
-                                k: (
-                                    v[offset : offset + 1, :1024]
-                                    if warmup and v.dim() > 1
-                                    else v[offset : offset + 1]
-                                )
-                                for k, v in packed_tensors.items()
-                                if isinstance(v, torch.Tensor)
-                            },
-                            pixel_values=(
-                                [None]
-                                if warmup
-                                else packed_tensors["pixel_values"][offset : offset + 1]
-                            ),
-                            image_grid_thw=(
-                                [None]
-                                if warmup
-                                else packed_tensors["image_grid_thw"][
-                                    offset : offset + 1
-                                ]
-                            ),
-                            config=(
-                                config.model_copy(
-                                    update={"lr": 1e-9, "beta": 0.0, "kl_coef": 0.0}
-                                )
-                                if warmup
-                                else config
-                            ),
-                            _config=_config,
-                            return_new_logprobs=False,
-                        )
-                    )
-                    # Wait for a result from the queue or for the training task to,
-                    # presumably, raise an exception
-                    done, _ = await asyncio.wait(
-                        [
-                            asyncio.create_task(self.results_queue.get()),
-                            self._train_task,
-                        ],
-                        return_when=asyncio.FIRST_COMPLETED,
-                    )
-                    if verbose:
-                        print(
-                            "Done waiting for a result from the queue or for the training task to, presumably, raise an exception"
-                        )
-                    for task in done:
-                        result = task.result()
-                        # If `result` is `None`, the training task finished somehow.
-                        assert result is not None, (
-                            "The training task should never finish."
-                        )
-                        self.results_queue.task_done()
-                        if warmup:
-                            from .state import gc_and_empty_cuda_cache
-
-                            gc_and_empty_cuda_cache()
-                            await asyncio.sleep(0.1)
-                            warmup = False
-                        else:
-                            yield result
-            if verbose:
-                print("Saving new LoRA adapter...")
+            # Train on the batch using shared logic
+            async for result in process_train_batch(
+                packed_tensors=packed_tensors,
+                config=config,
+                _config=_config,
+                inputs_queue=self.state.inputs_queue,
+                results_queue=self.results_queue,
+                train_task=self._train_task,
+                trainer=self.state.trainer,
+                peft_model=self.state.peft_model,
+                warmup=warmup,
+                verbose=verbose,
+            ):
+                yield result
             # Save the new LoRA adapter
-            from ..utils.output_dirs import get_step_checkpoint_dir
-
-            next_step = get_step_from_dir(self.output_dir) + 1
-            checkpoint_dir = get_step_checkpoint_dir(self.output_dir, next_step)
-            os.makedirs(os.path.dirname(checkpoint_dir), exist_ok=True)
-            self.state.trainer.save_model(checkpoint_dir)
+            checkpoint_dir = save_checkpoint(
+                trainer=self.state.trainer,
+                output_dir=self.output_dir,
+                verbose=verbose,
+            )
             if verbose:
                 print("Setting new LoRA adapter...")
             # Set the new LoRA adapter
