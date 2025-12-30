@@ -12,7 +12,6 @@ import aiohttp
 import numpy as np
 import polars as pl
 import torch
-import wandb
 import weave
 from openai import AsyncOpenAI
 from tqdm import auto as tqdm
@@ -20,9 +19,9 @@ from transformers import AutoImageProcessor, AutoTokenizer
 from transformers.image_processing_utils import BaseImageProcessor
 from transformers.tokenization_utils_base import PreTrainedTokenizerBase
 from typing_extensions import Self
-from wandb.sdk.wandb_run import Run
 from weave.trace.weave_client import WeaveClient
 
+import wandb
 from art.utils.deployment import (
     DeploymentResult,
     Provider,
@@ -45,6 +44,7 @@ from art.utils.s3 import (
 )
 from art.utils.trajectory_logging import serialize_trajectory_groups
 from mp_actors import close_proxy, move_to_child_process
+from wandb.sdk.wandb_run import Run
 
 from .. import dev
 from ..backend import Backend
@@ -304,43 +304,63 @@ class LocalBackend(Backend):
             base_url=base_url,
             api_key=api_key,
         )
+        consecutive_failures = 0
+        max_consecutive_failures = 3
         async with aiohttp.ClientSession() as session:
             while True:
                 # Wait 30 seconds before checking again
                 await asyncio.sleep(30)
-                # If the server is sleeping, skip the check
-                if await self._services[model_name].vllm_engine_is_sleeping():
-                    continue
-                # Check the metrics
-                async with session.get(
-                    f"{base_url.split('/v1')[0]}/metrics"
-                ) as response:
-                    metrics = await response.text()
-                # Parse Prometheus metrics for running requests
-                running_requests = 0
-                pending_requests = 0
-                for line in metrics.split("\n"):
-                    if line.startswith("vllm:num_requests_running"):
-                        running_requests = int(float(line.split()[1]))
-                    elif line.startswith("vllm:num_requests_waiting"):
-                        pending_requests = int(float(line.split()[1]))
-                # If there are no running or pending requests, send a health check
-                if running_requests == 0 and pending_requests == 0:
+                try:
+                    # If the server is sleeping, skip the check
+                    if await self._services[model_name].vllm_engine_is_sleeping():
+                        consecutive_failures = 0
+                        continue
+                    # Check the metrics with a timeout
+                    async with session.get(
+                        f"{base_url.split('/v1')[0]}/metrics",
+                        timeout=aiohttp.ClientTimeout(total=10),
+                    ) as response:
+                        metrics = await response.text()
+                    # Parse Prometheus metrics for running requests
+                    running_requests = 0
+                    pending_requests = 0
+                    for line in metrics.split("\n"):
+                        if line.startswith("vllm:num_requests_running"):
+                            running_requests = int(float(line.split()[1]))
+                        elif line.startswith("vllm:num_requests_waiting"):
+                            pending_requests = int(float(line.split()[1]))
+                    # If there are no running or pending requests, send a health check
+                    if running_requests == 0 and pending_requests == 0:
+                        try:
+                            # Send a health check with a short timeout
+                            await openai_client.completions.create(
+                                model=model_name,
+                                prompt="Hi",
+                                max_tokens=1,
+                                timeout=float(
+                                    os.environ.get("ART_SERVER_MONITOR_TIMEOUT", 5.0)
+                                ),
+                            )
+                        except Exception as e:
+                            # If the server is sleeping, a failed health check is okay
+                            if await self._services[model_name].vllm_engine_is_sleeping():
+                                consecutive_failures = 0
+                                continue
+                            raise e
+                    # Reset failure counter on success
+                    consecutive_failures = 0
+                except Exception:
+                    # If the server is sleeping during an exception, it's okay
                     try:
-                        # Send a health check with a short timeout
-                        await openai_client.completions.create(
-                            model=model_name,
-                            prompt="Hi",
-                            max_tokens=1,
-                            timeout=float(
-                                os.environ.get("ART_SERVER_MONITOR_TIMEOUT", 5.0)
-                            ),
-                        )
-                    except Exception as e:
-                        # If the server is sleeping, a failed health check is okay
                         if await self._services[model_name].vllm_engine_is_sleeping():
+                            consecutive_failures = 0
                             continue
-                        raise e
+                    except Exception:
+                        pass  # If we can't check sleeping status, count it as a failure
+                    consecutive_failures += 1
+                    if consecutive_failures >= max_consecutive_failures:
+                        raise
+                    # Otherwise, continue and try again
 
     async def _log(
         self,

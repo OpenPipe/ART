@@ -47,20 +47,24 @@ async def openai_server_task(
     patch_tool_parser_manager()
     set_vllm_log_file(config.get("log_file", "vllm.log"))
 
-    # Patch engine.add_lora; hopefully temporary
+    # Patch engine.add_lora to ensure lora_tensors attribute exists
+    # This is needed for compatibility with Unsloth
     add_lora = engine.add_lora
 
     async def _add_lora(lora_request) -> None:
-        class LoRARequest:
-            def __getattr__(self, name: str) -> Any:
-                if name == "lora_tensors" and not hasattr(lora_request, name):
-                    return None
-                return getattr(lora_request, name)
+        # Ensure lora_tensors attribute exists on the request
+        if not hasattr(lora_request, "lora_tensors"):
+            # For msgspec.Struct, we need to create a new instance with the attribute
+            from vllm.lora.request import LoRARequest
 
-            def __setattr__(self, name: str, value: Any) -> None:
-                setattr(lora_request, name, value)
-
-        await add_lora(LoRARequest())  # type: ignore
+            lora_request = LoRARequest(
+                lora_name=lora_request.lora_name,
+                lora_int_id=lora_request.lora_int_id,
+                lora_path=lora_request.lora_path,
+                long_lora_max_len=getattr(lora_request, "long_lora_max_len", None),
+                base_model_name=getattr(lora_request, "base_model_name", None),
+            )
+        await add_lora(lora_request)
 
     engine.add_lora = _add_lora
 
