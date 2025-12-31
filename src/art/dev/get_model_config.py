@@ -1,4 +1,4 @@
-import torch
+from packaging.version import Version
 
 from .engine import EngineArgs
 from .model import InitArgs, InternalModelConfig, PeftArgs, TrainerArgs
@@ -16,7 +16,7 @@ def _should_decouple_vllm_and_unsloth() -> bool:
     try:
         from vllm import __version__ as vllm_version
 
-        return vllm_version >= "0.13.0"
+        return Version(vllm_version) >= Version("0.13.0")
     except ImportError:
         return False
 
