@@ -45,41 +45,92 @@ class UnslothState:
     inputs_queue: asyncio.Queue[TrainInputs]
     results_queue: asyncio.Queue[dict[str, float]]
     _is_offloaded: bool = False
+    _pinned_buffers: dict[str, torch.Tensor] | None = None
 
     def offload_to_cpu(self) -> None:
-        """Offload training model and optimizer to CPU to free GPU memory."""
+        """Offload training model and optimizer to CPU using pinned memory for faster transfers."""
+        import time
+
         if self._is_offloaded:
             return
 
-        # Offload PEFT model (which wraps the base model)
-        self.peft_model.to("cpu")
+        start_time = time.perf_counter()
 
-        # Offload optimizer state
+        # Initialize pinned buffer storage
+        if self._pinned_buffers is None:
+            self._pinned_buffers = {}
+
+        # Offload model parameters to pinned memory for faster reload
+        for name, param in self.peft_model.named_parameters():
+            if param.device.type == "cuda":
+                # Create pinned buffer if not exists or wrong size
+                if name not in self._pinned_buffers or self._pinned_buffers[name].shape != param.shape:
+                    self._pinned_buffers[name] = torch.empty(
+                        param.shape, dtype=param.dtype, device="cpu", pin_memory=True
+                    )
+                # Async copy to pinned memory
+                self._pinned_buffers[name].copy_(param.data, non_blocking=True)
+                param.data = self._pinned_buffers[name]
+
+        # Offload optimizer state to pinned memory
         optimizer = getattr(self.trainer, "optimizer", None)
         if optimizer is not None and hasattr(optimizer, "state"):
-            for state in optimizer.state.values():
+            for param_id, state in optimizer.state.items():
                 for k, v in state.items():
-                    if isinstance(v, torch.Tensor):
-                        state[k] = v.cpu()
+                    if isinstance(v, torch.Tensor) and v.device.type == "cuda":
+                        key = f"opt_{id(param_id)}_{k}"
+                        if key not in self._pinned_buffers or self._pinned_buffers[key].shape != v.shape:
+                            self._pinned_buffers[key] = torch.empty(
+                                v.shape, dtype=v.dtype, device="cpu", pin_memory=True
+                            )
+                        self._pinned_buffers[key].copy_(v, non_blocking=True)
+                        state[k] = self._pinned_buffers[key]
+
+        # Sync to ensure all copies are complete before freeing GPU memory
+        torch.cuda.synchronize()
+
+        elapsed = time.perf_counter() - start_time
+        _debug_log(f"[training_model offload] completed in {elapsed:.2f}s")
 
         self._is_offloaded = True
         gc_and_empty_cuda_cache()
 
     def reload_to_gpu(self, device: str = "cuda:0") -> None:
-        """Reload training model and optimizer back to GPU."""
+        """Reload training model and optimizer back to GPU using async transfers."""
+        import time
+
         if not self._is_offloaded:
             return
 
-        # Reload PEFT model
-        self.peft_model.to(device)
+        start_time = time.perf_counter()
+
+        # Reload model parameters from pinned memory (fast async transfer)
+        for name, param in self.peft_model.named_parameters():
+            if param.device.type == "cpu":
+                # Allocate on GPU and async copy from pinned memory
+                gpu_tensor = torch.empty(
+                    param.shape, dtype=param.dtype, device=device
+                )
+                gpu_tensor.copy_(param.data, non_blocking=True)
+                param.data = gpu_tensor
 
         # Reload optimizer state
         optimizer = getattr(self.trainer, "optimizer", None)
         if optimizer is not None and hasattr(optimizer, "state"):
             for state in optimizer.state.values():
                 for k, v in state.items():
-                    if isinstance(v, torch.Tensor):
-                        state[k] = v.to(device)
+                    if isinstance(v, torch.Tensor) and v.device.type == "cpu":
+                        gpu_tensor = torch.empty(
+                            v.shape, dtype=v.dtype, device=device
+                        )
+                        gpu_tensor.copy_(v, non_blocking=True)
+                        state[k] = gpu_tensor
+
+        # Sync to ensure all copies are complete before training
+        torch.cuda.synchronize()
+
+        elapsed = time.perf_counter() - start_time
+        _debug_log(f"[training_model reload] completed in {elapsed:.2f}s")
 
         self._is_offloaded = False
 
