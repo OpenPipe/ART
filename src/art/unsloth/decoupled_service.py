@@ -44,6 +44,44 @@ class UnslothState:
     trainer: GRPOTrainer
     inputs_queue: asyncio.Queue[TrainInputs]
     results_queue: asyncio.Queue[dict[str, float]]
+    _is_offloaded: bool = False
+
+    def offload_to_cpu(self) -> None:
+        """Offload training model and optimizer to CPU to free GPU memory."""
+        if self._is_offloaded:
+            return
+
+        # Offload PEFT model (which wraps the base model)
+        self.peft_model.to("cpu")
+
+        # Offload optimizer state
+        optimizer = getattr(self.trainer, "optimizer", None)
+        if optimizer is not None and hasattr(optimizer, "state"):
+            for state in optimizer.state.values():
+                for k, v in state.items():
+                    if isinstance(v, torch.Tensor):
+                        state[k] = v.cpu()
+
+        self._is_offloaded = True
+        gc_and_empty_cuda_cache()
+
+    def reload_to_gpu(self, device: str = "cuda:0") -> None:
+        """Reload training model and optimizer back to GPU."""
+        if not self._is_offloaded:
+            return
+
+        # Reload PEFT model
+        self.peft_model.to(device)
+
+        # Reload optimizer state
+        optimizer = getattr(self.trainer, "optimizer", None)
+        if optimizer is not None and hasattr(optimizer, "state"):
+            for state in optimizer.state.values():
+                for k, v in state.items():
+                    if isinstance(v, torch.Tensor):
+                        state[k] = v.to(device)
+
+        self._is_offloaded = False
 
 
 @dataclass
@@ -61,6 +99,10 @@ class DecoupledUnslothService:
             lora_path = get_step_checkpoint_dir(self.output_dir, 0)
             os.makedirs(os.path.dirname(lora_path), exist_ok=True)
             self._state.trainer.save_model(lora_path)
+
+        # Offload training model to CPU before vLLM starts to free GPU memory
+        self._state.offload_to_cpu()
+
         await openai_server_task(
             engine=await self.llm,
             config=dev.get_openai_server_config(
@@ -103,6 +145,9 @@ class DecoupledUnslothService:
         self._is_sleeping = True
         gc_and_empty_cuda_cache()
 
+        # Reload training model to GPU (after vLLM is asleep)
+        self._state.reload_to_gpu()
+
         # Load packed tensors
         packed_tensors = packed_tensors_from_dir(**disk_packed_tensors)
 
@@ -142,6 +187,9 @@ class DecoupledUnslothService:
             output_dir=self.output_dir,
             verbose=verbose,
         )
+
+        # Offload training model to CPU before waking vLLM
+        self._state.offload_to_cpu()
 
         # Free memory before waking up vLLM
         gc_and_empty_cuda_cache()

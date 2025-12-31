@@ -47,7 +47,7 @@ async def main():
         base_model="Qwen/Qwen3-30B-A3B-Instruct-2507",
         _internal_config=art.dev.InternalModelConfig(
             _decouple_vllm_and_unsloth=True,
-            engine_args=art.dev.EngineArgs(gpu_memory_utilization=0.7),
+            # engine_args=art.dev.EngineArgs(gpu_memory_utilization=0.7),
         ),
     )
     await model.register(backend)
