@@ -188,13 +188,17 @@ class DecoupledUnslothService:
             unsloth.FastLanguageModel.from_pretrained(**init_args),
         )
 
-        # Initialize PEFT model
-        peft_model = cast(
-            peft.peft_model.PeftModelForCausalLM,
-            unsloth.FastLanguageModel.get_peft_model(
-                model, **self.config.get("peft_args", {})
-            ),
-        )
+        # Initialize PEFT model - skip if already a PeftModel (e.g. loaded from checkpoint)
+        if hasattr(model, "peft_config") and getattr(model, "peft_config", None) is not None:
+            # Model already has LoRA adapters (loaded from checkpoint)
+            peft_model = cast(peft.peft_model.PeftModelForCausalLM, model)
+        else:
+            peft_model = cast(
+                peft.peft_model.PeftModelForCausalLM,
+                unsloth.FastLanguageModel.get_peft_model(
+                    model, **self.config.get("peft_args", {})
+                ),
+            )
 
         # Initialize trainer with dummy dataset
         data = {"prompt": ""}
