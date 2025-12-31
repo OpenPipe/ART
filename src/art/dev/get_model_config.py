@@ -5,6 +5,22 @@ from .model import InitArgs, InternalModelConfig, PeftArgs, TrainerArgs
 from .torchtune import TorchtuneArgs
 
 
+def _should_decouple_vllm_and_unsloth() -> bool:
+    """
+    Check if vLLM and unsloth should be decoupled.
+
+    In vLLM 0.13+, AsyncLLM always uses multiprocessing which prevents
+    unsloth from directly accessing model weights. We need to decouple
+    the two by loading the model separately.
+    """
+    try:
+        from vllm import __version__ as vllm_version
+
+        return vllm_version >= "0.13.0"
+    except ImportError:
+        return False
+
+
 def get_model_config(
     base_model: str,
     output_dir: str,
@@ -14,6 +30,12 @@ def get_model_config(
 
     if config is None:
         config = InternalModelConfig()
+
+    # Auto-enable decoupled mode for vLLM 0.13+ unless explicitly disabled
+    decouple = config.get("_decouple_vllm_and_unsloth", None)
+    if decouple is None:
+        decouple = _should_decouple_vllm_and_unsloth()
+
     enable_sleep_mode = config.get("engine_args", {}).get("enable_sleep_mode", True)
     init_args = InitArgs(
         disable_log_stats=False,
@@ -26,7 +48,7 @@ def get_model_config(
         model_name=base_model,
         use_async=True,
     )
-    if config.get("_decouple_vllm_and_unsloth", False):
+    if decouple:
         init_args["fast_inference"] = False
         init_args.pop("disable_log_stats")
         init_args.pop("enable_prefix_caching")
@@ -35,7 +57,6 @@ def get_model_config(
         init_args.pop("use_async")
     engine_args = EngineArgs(
         allowed_local_media_path="/tmp",
-        disable_log_requests=True,
         enable_sleep_mode=enable_sleep_mode,
         generation_config="vllm",
     )
@@ -47,7 +68,7 @@ def get_model_config(
             engine_args["model"] = last_checkpoint_dir
     elif config.get("torchtune_args") is not None:
         engine_args["model"] = base_model
-    if config.get("_decouple_vllm_and_unsloth", False):
+    if decouple:
         engine_args["model"] = base_model
     peft_args = PeftArgs(
         lora_alpha=16,
@@ -94,5 +115,5 @@ def get_model_config(
         peft_args=peft_args,
         trainer_args=trainer_args,
         torchtune_args=torchtune_args,
-        _decouple_vllm_and_unsloth=config.get("_decouple_vllm_and_unsloth", False),
+        _decouple_vllm_and_unsloth=decouple,
     )

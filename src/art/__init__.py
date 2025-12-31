@@ -1,5 +1,20 @@
 import os
 
+# Create a dummy GuidedDecodingParams class and inject it into vllm.sampling_params for trl compatibility
+try:
+    import vllm.sampling_params
+
+    class GuidedDecodingParams:
+        """Shim for vLLM 0.13+ where GuidedDecodingParams was removed."""
+
+        def __init__(self, **kwargs):
+            for key, value in kwargs.items():
+                setattr(self, key, value)
+
+    vllm.sampling_params.GuidedDecodingParams = GuidedDecodingParams  # type: ignore
+except ImportError:
+    pass  # vllm not installed
+
 # Import peft (and transformers by extension) before unsloth to enable sleep mode
 if os.environ.get("IMPORT_PEFT", "0") == "1":
     import peft  # type: ignore # noqa: F401

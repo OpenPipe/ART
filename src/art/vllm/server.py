@@ -11,7 +11,8 @@ from uvicorn.config import LOGGING_CONFIG
 from vllm.engine.protocol import EngineClient
 from vllm.entrypoints.openai.cli_args import make_arg_parser, validate_parsed_serve_args
 from vllm.logger import _DATE_FORMAT, _FORMAT
-from vllm.utils import FlexibleArgumentParser
+from vllm.logging_utils import NewLineFormatter
+from vllm.utils.argparse_utils import FlexibleArgumentParser
 
 from ..dev.openai_server import OpenAIServerConfig
 
@@ -51,7 +52,7 @@ async def openai_server_task(
     # This is needed for compatibility with Unsloth
     add_lora = engine.add_lora
 
-    async def _add_lora(lora_request) -> None:
+    async def _add_lora(lora_request) -> bool:
         # Ensure lora_tensors attribute exists on the request
         if not hasattr(lora_request, "lora_tensors"):
             # For msgspec.Struct, we need to create a new instance with the attribute
@@ -64,7 +65,7 @@ async def openai_server_task(
                 long_lora_max_len=getattr(lora_request, "long_lora_max_len", None),
                 base_model_name=getattr(lora_request, "base_model_name", None),
             )
-        await add_lora(lora_request)
+        return await add_lora(lora_request)
 
     engine.add_lora = _add_lora
 
@@ -181,8 +182,8 @@ def set_vllm_log_file(path: str) -> None:
     # Create a file handler
     file_handler = logging.FileHandler(path)
 
-    # Use the same formatter as vLLM's default
-    formatter = logging.Formatter(_FORMAT, _DATE_FORMAT)
+    # Use vLLM's NewLineFormatter which adds the fileinfo field
+    formatter = NewLineFormatter(fmt=_FORMAT, datefmt=_DATE_FORMAT)
     file_handler.setFormatter(formatter)
 
     # Add the handler to the logger

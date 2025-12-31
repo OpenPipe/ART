@@ -4,7 +4,6 @@ import ctypes
 from typing import Any
 
 import torch
-from vllm.worker.multi_step_model_runner import MultiStepModelRunner
 
 
 def patch_allocator() -> None:
@@ -12,52 +11,82 @@ def patch_allocator() -> None:
     Patch the vLLM CuMemAllocator to specifically focus on offloading/discarding
     the KV cache.
     """
+    import gc
+    import logging
+
     from vllm.device_allocator.cumem import (
         CuMemAllocator,
         create_and_map,
         libcudart,
         unmap_and_release,
     )
-    from vllm.utils import is_pin_memory_available
+
+    logger = logging.getLogger(__name__)
+
+    # is_pin_memory_available was moved in vLLM 0.13.0
+    try:
+        from vllm.utils.platform_utils import is_pin_memory_available
+    except ImportError:
+        from vllm.utils import is_pin_memory_available
 
     allocator = CuMemAllocator.get_instance()
 
-    def sleep(offload_tags: tuple[str, ...] | str | None = None) -> None:
-        # In this version of vLLM (0.7.3) one tag is provided for sleep level 1
-        # and no tags are provided for sleep level 2, so we can reverse-engineer
-        # the sleep level from the tags
-        sleep_level = 1 if offload_tags else 2
-        # We reinterpret the sleep levels as follows:
-        # Sleep level 1: offload kv cache to CPU memory (or disk)
-        if sleep_level == 1:
-            offload_to = "cpu"
-            # TODO: Check if there is sufficient CPU memory, otherwise offload to disk
-        # Sleep level 2: discard kv cache
-        else:
-            offload_to = "none"
+    # Save original methods
+    _original_sleep = allocator.sleep
+    _original_wake_up = allocator.wake_up
 
-        override_tags = getattr(allocator, "_override_tags", {"kv_cache"})
-        for ptr, data in allocator.pointer_to_data.items():
+    def patched_sleep(
+        self: CuMemAllocator, offload_tags: tuple[str, ...] | str | None = None
+    ) -> None:
+        """
+        Enhanced sleep that respects _override_tags for controlling what gets offloaded.
+
+        The override_tags attribute allows the caller to specify which memory pools
+        should be offloaded (backed up to CPU) vs discarded. This enables:
+        - Offloading both weights and KV cache for full memory recovery
+        - Selective offloading based on outstanding requests
+        """
+        # Check for override tags set by do_sleep
+        override_tags = getattr(self, "_override_tags", None)
+
+        if override_tags is None:
+            # No override, use original behavior
+            return _original_sleep(offload_tags)
+
+        # Determine sleep level from offload_tags
+        # In vLLM 0.13.0: offload_tags=("weights",) for level 1, offload_tags=() for level 2
+        sleep_level = 1 if offload_tags else 2
+        offload_to = "cpu" if sleep_level == 1 else "none"
+
+        import datetime
+
+        with open("/tmp/patch_allocator_debug.log", "a") as f:
+            f.write(
+                f"{datetime.datetime.now()}: [patched sleep] offload_tags={offload_tags}, "
+                f"sleep_level={sleep_level}, override_tags={override_tags}\n"
+            )
+            f.flush()
+
+        total_bytes = 0
+        backup_bytes = 0
+        tag_counts: dict[str, int] = {}
+
+        for ptr, data in self.pointer_to_data.items():
+            tag_counts[data.tag] = tag_counts.get(data.tag, 0) + 1
             if data.tag not in override_tags:
                 continue
             handle = data.handle
             size_in_bytes = handle[1]
+            total_bytes += size_in_bytes
+            # Always backup weights; backup KV cache only at level 1
             if offload_to != "none" or data.tag == "weights":
-                if offload_to == "disk" and data.tag != "weights":
-                    cpu_backup_tensor = torch.from_file(
-                        f"/tmp/kv-cache-{ptr}.pt",
-                        size=size_in_bytes,
-                        dtype=torch.uint8,
-                        device="cpu",
-                        shared=True,
-                    )
-                else:
-                    cpu_backup_tensor = torch.empty(
-                        size_in_bytes,
-                        dtype=torch.uint8,
-                        device="cpu",
-                        pin_memory=is_pin_memory_available(),
-                    )
+                backup_bytes += size_in_bytes
+                cpu_backup_tensor = torch.empty(
+                    size_in_bytes,
+                    dtype=torch.uint8,
+                    device="cpu",
+                    pin_memory=is_pin_memory_available(),
+                )
                 cpu_ptr = cpu_backup_tensor.data_ptr()
                 libcudart.cudaMemcpy(
                     ctypes.c_void_p(cpu_ptr), ctypes.c_void_p(ptr), size_in_bytes
@@ -65,17 +94,43 @@ def patch_allocator() -> None:
                 data.cpu_backup_tensor = cpu_backup_tensor
             unmap_and_release(handle)
 
-    def wake_up(tags: list[str] | None = None) -> None:
+        with open("/tmp/patch_allocator_debug.log", "a") as f:
+            f.write(
+                f"{datetime.datetime.now()}: [patched sleep] freed {total_bytes / 1024**3:.2f} GiB, "
+                f"backed up {backup_bytes / 1024**3:.2f} GiB, "
+                f"tag_counts={tag_counts}\n"
+            )
+            f.flush()
+
+        gc.collect()
+        torch.cuda.empty_cache()
+
+    def patched_wake_up(self: CuMemAllocator, tags: list[str] | None = None) -> None:
         """
-        Wake up the allocator from sleep mode.
-        All data that is previously offloaded will be loaded back to GPU
-        memory, and the rest of the data will have empty memory.
+        Enhanced wake_up that respects _override_tags for controlling what gets restored.
         """
-        override_tags = getattr(allocator, "_override_tags", {"kv_cache"})
-        for ptr, data in allocator.pointer_to_data.items():
+        override_tags = getattr(self, "_override_tags", None)
+
+        if override_tags is None:
+            # No override, use original behavior
+            return _original_wake_up(tags)
+
+        import datetime
+
+        with open("/tmp/patch_allocator_debug.log", "a") as f:
+            f.write(
+                f"{datetime.datetime.now()}: [patched wake_up] tags={tags}, override_tags={override_tags}\n"
+            )
+            f.flush()
+
+        restored_bytes = 0
+        allocated_bytes = 0
+
+        for ptr, data in self.pointer_to_data.items():
             if data.tag not in override_tags:
                 continue
             create_and_map(data.handle)
+            allocated_bytes += data.handle[1]
             if data.cpu_backup_tensor is not None:
                 cpu_backup_tensor = data.cpu_backup_tensor
                 if cpu_backup_tensor is not None:
@@ -89,9 +144,29 @@ def patch_allocator() -> None:
                         size_in_bytes,
                     )
                     data.cpu_backup_tensor = None
+                    restored_bytes += size_in_bytes
 
-    allocator.sleep = sleep
-    allocator.wake_up = wake_up
+        with open("/tmp/patch_allocator_debug.log", "a") as f:
+            f.write(
+                f"{datetime.datetime.now()}: [patched wake_up] allocated {allocated_bytes / 1024**3:.2f} GiB, "
+                f"restored {restored_bytes / 1024**3:.2f} GiB from backup\n"
+            )
+            f.flush()
+
+    # Bind methods to allocator instance
+    import types
+
+    allocator.sleep = types.MethodType(patched_sleep, allocator)
+    allocator.wake_up = types.MethodType(patched_wake_up, allocator)
+
+    # Write to a file for debugging since worker stdout/stderr may not be visible
+    with open("/tmp/patch_allocator_debug.log", "a") as f:
+        import datetime
+
+        f.write(
+            f"{datetime.datetime.now()}: Patched allocator.sleep and allocator.wake_up\n"
+        )
+        f.flush()
 
 
 def subclass_chat_completion_request() -> None:
@@ -163,9 +238,14 @@ def patch_tool_parser_manager() -> None:
     Patch ToolParserManager to support streaming tool call logprobs.
     """
     from vllm.entrypoints.openai.protocol import DeltaMessage
-    from vllm.entrypoints.openai.tool_parsers.abstract_tool_parser import (
-        ToolParserManager,
-    )
+
+    # ToolParserManager was moved in vLLM 0.13.0
+    try:
+        from vllm.tool_parsers.abstract_tool_parser import ToolParserManager
+    except ImportError:
+        from vllm.entrypoints.openai.tool_parsers.abstract_tool_parser import (
+            ToolParserManager,
+        )
 
     get_tool_parser = ToolParserManager.get_tool_parser
 
@@ -183,15 +263,3 @@ def patch_tool_parser_manager() -> None:
         return tool_parser_class
 
     ToolParserManager.get_tool_parser = patched_get_tool_parser
-
-
-def patch_multi_step_model_runner(runner: MultiStepModelRunner) -> None:
-    """
-    Patches a MultiStepModelRunner to support LoRA adapters.
-    """
-    base_runner = runner._base_model_runner
-    runner.set_active_loras = base_runner.set_active_loras
-    runner.add_lora = base_runner.add_lora
-    runner.remove_lora = base_runner.remove_lora
-    runner.pin_lora = base_runner.pin_lora
-    runner.list_loras = base_runner.list_loras

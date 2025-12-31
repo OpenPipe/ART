@@ -16,7 +16,6 @@ from .patches import (
     patch_get_lora_tokenizer_async,
     patch_listen_for_disconnect,
     patch_lora_request,
-    patch_multi_step_model_runner,
     patch_tool_parser_manager,
     subclass_chat_completion_request,
 )
@@ -44,5 +43,4 @@ __all__ = [
     "patch_get_lora_tokenizer_async",
     "patch_listen_for_disconnect",
     "patch_tool_parser_manager",
-    "patch_multi_step_model_runner",
 ]

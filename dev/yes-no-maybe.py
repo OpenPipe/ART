@@ -42,13 +42,13 @@ async def main():
     backend = LocalBackend()
     global model
     model = art.TrainableModel(
-        name="009",
+        name="011",
         project="yes-no-maybe",
         base_model="Qwen/Qwen2.5-7B-Instruct",
-        _internal_config=art.dev.InternalModelConfig(
-            _decouple_vllm_and_unsloth=True,
-            engine_args=art.dev.EngineArgs(gpu_memory_utilization=0.7),
-        ),
+        # _internal_config=art.dev.InternalModelConfig(
+        #     _decouple_vllm_and_unsloth=True,
+        #     engine_args=art.dev.EngineArgs(gpu_memory_utilization=0.7),
+        # ),
     )
     await model.register(backend)
 

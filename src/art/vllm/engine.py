@@ -14,7 +14,7 @@ from vllm.engine.async_llm_engine import AsyncLLMEngine
 from vllm.v1.engine.async_llm import AsyncLLM
 from vllm.v1.worker.gpu_worker import Worker
 
-from .patches import patch_allocator
+# Note: patch_allocator is no longer used here - patching is done in do_sleep/do_wake_up
 
 
 async def get_llm(args: vllm.AsyncEngineArgs) -> AsyncLLM:
@@ -46,7 +46,8 @@ async def get_llm(args: vllm.AsyncEngineArgs) -> AsyncLLM:
             enable_sleep_mode=True,
         )
     )
-    await run_on_workers(llm, patch_allocator)
+    # Note: allocator patching is now done directly in do_sleep/do_wake_up
+    # to ensure it's applied at the right time
     return llm
 
 

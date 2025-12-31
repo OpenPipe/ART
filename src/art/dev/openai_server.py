@@ -29,9 +29,7 @@ def get_openai_server_config(
     server_args.update(config.get("server_args", {}))
     engine_args = EngineArgs(
         model=base_model,
-        num_scheduler_steps=16 if lora_path else 1,
         served_model_name=base_model if lora_path else model_name,
-        disable_log_requests=True,
         generation_config="vllm",
     )
     engine_args.update(config.get("engine_args", {}))
