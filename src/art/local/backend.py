@@ -125,7 +125,7 @@ class LocalBackend(Backend):
     async def _get_service(self, model: TrainableModel) -> ModelService:
         from ..dev.get_model_config import get_model_config
         from ..torchtune.service import TorchtuneService
-        from ..unsloth.decoupled_service import DecoupledUnslothService
+        from ..unsloth.service import UnslothService
 
         if model.name not in self._services:
             config = get_model_config(
@@ -136,7 +136,7 @@ class LocalBackend(Backend):
             if config.get("torchtune_args") is not None:
                 service_class = TorchtuneService
             else:
-                service_class = DecoupledUnslothService
+                service_class = UnslothService
             self._services[model.name] = service_class(
                 model_name=model.name,
                 base_model=model.base_model,

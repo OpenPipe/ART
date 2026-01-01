@@ -7,7 +7,7 @@ from art import dev
 from art.utils.group_aggregate import group_aggregate
 
 if TYPE_CHECKING:
-    from art.unsloth.shared import TrainInputs
+    from art.unsloth.service import TrainInputs
 
 
 class Loss(BaseModel):
