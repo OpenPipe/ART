@@ -72,14 +72,7 @@ def patch_tool_parser_manager() -> None:
     Patch ToolParserManager to support streaming tool call logprobs.
     """
     from vllm.entrypoints.openai.protocol import DeltaMessage
-
-    # ToolParserManager was moved in vLLM 0.13.0
-    try:
-        from vllm.tool_parsers.abstract_tool_parser import ToolParserManager
-    except ImportError:
-        from vllm.entrypoints.openai.tool_parsers.abstract_tool_parser import (
-            ToolParserManager,
-        )
+    from vllm.tool_parsers.abstract_tool_parser import ToolParserManager
 
     get_tool_parser = ToolParserManager.get_tool_parser
 

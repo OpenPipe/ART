@@ -11,17 +11,8 @@ from uvicorn.config import LOGGING_CONFIG
 from vllm.engine.protocol import EngineClient
 from vllm.entrypoints.openai.cli_args import make_arg_parser, validate_parsed_serve_args
 from vllm.logger import _DATE_FORMAT, _FORMAT
-
-# Backwards-compatible imports for vLLM < 0.11
-try:
-    from vllm.logging_utils import NewLineFormatter
-except ImportError:
-    NewLineFormatter = logging.Formatter
-
-try:
-    from vllm.utils.argparse_utils import FlexibleArgumentParser
-except ImportError:
-    from vllm.utils import FlexibleArgumentParser
+from vllm.logging_utils import NewLineFormatter
+from vllm.utils.argparse_utils import FlexibleArgumentParser
 
 from ..dev.openai_server import OpenAIServerConfig
 
