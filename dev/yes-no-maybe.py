@@ -47,6 +47,14 @@ async def main():
         name=os.environ.get("MODEL_NAME", "011"),
         project="yes-no-maybe",
         base_model=base_model,
+        _internal_config=art.dev.InternalModelConfig(
+            engine_args=art.dev.EngineArgs(
+                max_lora_rank=1,
+            ),
+            peft_args=art.dev.PeftArgs(
+                r=1,
+            ),
+        ),
     )
     await model.register(backend)
 
