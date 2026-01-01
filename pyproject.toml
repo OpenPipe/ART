@@ -88,6 +88,7 @@ select = ["I"]
 
 [tool.ruff.lint.isort]
 case-sensitive = false
+known-first-party = ["art"]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
