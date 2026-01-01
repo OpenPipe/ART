@@ -19,9 +19,6 @@ def subclass_chat_completion_request() -> None:
     vllm.entrypoints.openai.protocol.ChatCompletionRequest = ChatCompletionRequest
 
 
-
-
-
 def patch_listen_for_disconnect() -> None:
     async def patched_listen_for_disconnect(request):
         try:
