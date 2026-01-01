@@ -7,10 +7,10 @@ from openai.types.chat.chat_completion_message import (
     ChatCompletionMessage,
     FunctionCall,
 )
-from openai.types.chat.chat_completion_message_tool_call import (
-    ChatCompletionMessageToolCall,
-    Function,
+from openai.types.chat.chat_completion_message_function_tool_call import (
+    ChatCompletionMessageFunctionToolCall,
 )
+from openai.types.chat.chat_completion_message_tool_call import Function
 
 
 async def consume_chat_completion_stream(
@@ -115,26 +115,30 @@ def update_chat_completion(
         if chunk_choice.delta.tool_calls:
             if choice.message.tool_calls is None:
                 choice.message.tool_calls = []
-            for tool_call in chunk_choice.delta.tool_calls:
-                while tool_call.index not in range(len(choice.message.tool_calls)):
+            for tool_call_delta in chunk_choice.delta.tool_calls:
+                while tool_call_delta.index not in range(
+                    len(choice.message.tool_calls)
+                ):
                     choice.message.tool_calls.append(
-                        ChatCompletionMessageToolCall(
+                        ChatCompletionMessageFunctionToolCall(
                             id="",
                             function=Function(arguments="", name=""),
                             type="function",
                         )
                     )
-                if tool_call.id:
-                    choice.message.tool_calls[tool_call.index].id = tool_call.id
-                if tool_call.function:
-                    if tool_call.function.name:
-                        choice.message.tool_calls[
-                            tool_call.index
-                        ].function.name = tool_call.function.name
-                    if tool_call.function.arguments:
-                        choice.message.tool_calls[
-                            tool_call.index
-                        ].function.arguments += tool_call.function.arguments
+                if tool_call_delta.id:
+                    choice.message.tool_calls[
+                        tool_call_delta.index
+                    ].id = tool_call_delta.id
+                if tool_call_delta.function:
+                    tool_call = choice.message.tool_calls[tool_call_delta.index]
+                    assert isinstance(tool_call, ChatCompletionMessageFunctionToolCall)
+                    if tool_call_delta.function.name:
+                        tool_call.function.name = tool_call_delta.function.name
+                    if tool_call_delta.function.arguments:
+                        tool_call.function.arguments += (
+                            tool_call_delta.function.arguments
+                        )
         if getattr(chunk_choice.delta, "reasoning", None):
             if not hasattr(choice.message, "reasoning"):
                 setattr(choice.message, "reasoning", "")

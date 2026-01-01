@@ -1,15 +1,45 @@
 import contextvars
 import json
+import logging
 from typing import Any, AsyncIterator, Coroutine, Iterator, Literal, overload
 
 import httpx._models
-from openai import OpenAI
-from openai._streaming import Stream
-from openai.types.chat.chat_completion import Choice
+from openai.types.chat.chat_completion import ChatCompletion, Choice
 from openai.types.chat.chat_completion_chunk import ChatCompletionChunk
 
-from .openai import consume_sync_chat_completion_stream
+from .openai import init_chat_completion, update_chat_completion
 from .trajectories import History, Trajectory
+
+logger = logging.getLogger(__name__)
+
+
+def parse_sse_to_chat_completion(content: bytes) -> ChatCompletion:
+    """Parse SSE (Server-Sent Events) content and build a ChatCompletion.
+
+    This handles the case where streaming responses have already been consumed
+    and we need to reconstruct the ChatCompletion from buffered bytes.
+    """
+    chat_completion: ChatCompletion | None = None
+
+    # Parse SSE format: each line starting with "data: " contains JSON
+    for line in content.decode("utf-8").split("\n"):
+        line = line.strip()
+        if not line.startswith("data: "):
+            continue
+        data = line[6:]  # Remove "data: " prefix
+        if data == "[DONE]":
+            continue
+
+        chunk_data = json.loads(data)
+        chunk = ChatCompletionChunk(**chunk_data)
+        if chat_completion is None:
+            chat_completion = init_chat_completion(chunk)
+        update_chat_completion(chat_completion, chunk)
+
+    if chat_completion is None:
+        raise ValueError("No valid chat completion chunks found in SSE content")
+
+    return chat_completion
 
 
 @overload
@@ -45,7 +75,6 @@ class AutoTrajectoryContext:
             messages_and_choices=[],
             reward=0.0,
         )
-        self.openai_client = OpenAI(api_key="")
 
     def __enter__(self) -> None:
         self.token = auto_trajectory_context_var.set(self)
@@ -54,47 +83,59 @@ class AutoTrajectoryContext:
         auto_trajectory_context_var.reset(self.token)
 
     def handle_httpx_response(self, response: httpx._models.Response) -> None:
+        # Get buffered content (set by patched aiter_bytes/iter_bytes)
+        content = getattr(response, "_content_so_far", b"")
+        if not content:
+            # No content captured, nothing to process
+            return
+
         try:
             request_content = json.loads(getattr(response.request, "_content", b""))
-            messages = request_content["messages"]
-            tools = request_content.get("tools", None)
-            setattr(response, "_content", getattr(response, "_content_so_far", b""))
-            print(getattr(response, "_content"))
+        except (json.JSONDecodeError, AttributeError):
+            # Not a JSON request body, skip
+            return
+
+        messages = request_content.get("messages")
+        if messages is None:
+            # Not a chat completion request
+            return
+
+        tools = request_content.get("tools", None)
+
+        try:
             if request_content.get("stream", False):
-                choice = consume_sync_chat_completion_stream(
-                    Stream(
-                        cast_to=ChatCompletionChunk,
-                        response=response,
-                        client=self.openai_client,
-                    )
-                ).choices[0]
+                # Parse SSE content directly from buffered bytes
+                chat_completion = parse_sse_to_chat_completion(content)
+                choice = chat_completion.choices[0]
             else:
-                choice = Choice(
-                    **json.loads(getattr(response, "_content"))["choices"][0]
-                )
-            history: Trajectory | History = self.trajectory
-            history_index = -1
-            while True:
-                history_messages = history.messages()
-                if history_messages == messages[: len(history_messages)] and (
-                    history.tools == tools
-                    or (history_messages == [] and history.tools is None)
-                ):
-                    break
-                history_index += 1
-                try:
-                    history = self.trajectory.additional_histories[history_index]
-                except IndexError:
-                    history = History(messages_and_choices=[])
-                    self.trajectory.additional_histories.append(history)
-                    break
-            history.messages_and_choices.extend(
-                messages[len(history.messages_and_choices) :]
-            )
-            history.messages_and_choices.append(choice)
-            history.tools = tools
-        except:
-            pass
+                choice = Choice(**json.loads(content)["choices"][0])
+        except (json.JSONDecodeError, KeyError, ValueError) as e:
+            logger.debug(f"Failed to parse response content: {e}")
+            return
+
+        # Find the appropriate history to add this response to
+        history: Trajectory | History = self.trajectory
+        history_index = -1
+        while True:
+            history_messages = history.messages()
+            if history_messages == messages[: len(history_messages)] and (
+                history.tools == tools
+                or (history_messages == [] and history.tools is None)
+            ):
+                break
+            history_index += 1
+            try:
+                history = self.trajectory.additional_histories[history_index]
+            except IndexError:
+                history = History(messages_and_choices=[])
+                self.trajectory.additional_histories.append(history)
+                break
+
+        history.messages_and_choices.extend(
+            messages[len(history.messages_and_choices) :]
+        )
+        history.messages_and_choices.append(choice)
+        history.tools = tools
 
 
 auto_trajectory_context_var: contextvars.ContextVar[AutoTrajectoryContext] = (
