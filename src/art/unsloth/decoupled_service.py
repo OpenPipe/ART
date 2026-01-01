@@ -49,12 +49,8 @@ class UnslothState:
 
     def offload_to_cpu(self) -> None:
         """Offload training model and optimizer to CPU using pinned memory for faster transfers."""
-        import time
-
         if self._is_offloaded:
             return
-
-        start_time = time.perf_counter()
 
         # Initialize pinned buffer storage
         if self._pinned_buffers is None:
@@ -89,20 +85,13 @@ class UnslothState:
         # Sync to ensure all copies are complete before freeing GPU memory
         torch.cuda.synchronize()
 
-        elapsed = time.perf_counter() - start_time
-        _debug_log(f"[training_model offload] completed in {elapsed:.2f}s")
-
         self._is_offloaded = True
         gc_and_empty_cuda_cache()
 
     def reload_to_gpu(self, device: str = "cuda:0") -> None:
         """Reload training model and optimizer back to GPU using async transfers."""
-        import time
-
         if not self._is_offloaded:
             return
-
-        start_time = time.perf_counter()
 
         # Reload model parameters from pinned memory (fast async transfer)
         for name, param in self.peft_model.named_parameters():
@@ -128,9 +117,6 @@ class UnslothState:
 
         # Sync to ensure all copies are complete before training
         torch.cuda.synchronize()
-
-        elapsed = time.perf_counter() - start_time
-        _debug_log(f"[training_model reload] completed in {elapsed:.2f}s")
 
         self._is_offloaded = False
 
@@ -247,11 +233,7 @@ class DecoupledUnslothService:
         await asyncio.sleep(0.5)  # Longer delay to allow memory cleanup and pending ops to complete
 
         # Wake up workers
-        try:
-            await run_on_workers(llm, do_wake_up)
-        except Exception as e:
-            _debug_log(f"[train] wake_up FAILED: {e}")
-            raise
+        await run_on_workers(llm, do_wake_up)
         self._is_sleeping = False
 
         # Swap out the LoRA adapter with the newly trained checkpoint
@@ -348,15 +330,6 @@ class DecoupledUnslothService:
         return asyncio.create_task(get_llm(AsyncEngineArgs(**engine_args)))
 
 
-def _debug_log(msg: str) -> None:
-    """Write debug message to file since worker stdout/stderr may not be visible."""
-    import datetime
-
-    with open("/tmp/patch_allocator_debug.log", "a") as f:
-        f.write(f"{datetime.datetime.now()}: {msg}\n")
-        f.flush()
-
-
 def do_sleep(*, level: int) -> None:
     """
     Put the worker to sleep, offloading both weights and KV cache.
@@ -384,12 +357,6 @@ def do_sleep(*, level: int) -> None:
     worker = get_worker()
     allocator = CuMemAllocator.get_instance()
 
-    # Debug: log allocator state before sleep
-    tag_counts: dict[str, int] = {}
-    for _, data in allocator.pointer_to_data.items():
-        tag_counts[data.tag] = tag_counts.get(data.tag, 0) + 1
-    _debug_log(f"[do_sleep] level={level}, pointer_to_data tags: {tag_counts}")
-
     # Determine what to offload based on level:
     # level=1: offload both weights and kv_cache to CPU
     # level=2: offload weights, discard kv_cache
@@ -403,19 +370,14 @@ def do_sleep(*, level: int) -> None:
             name: buffer.cpu().clone() for name, buffer in model.named_buffers()
         }
 
-    total_bytes = 0
-    backup_bytes = 0
-
     for ptr, data in allocator.pointer_to_data.items():
         if data.tag not in tags_to_process:
             continue
         handle = data.handle
         size_in_bytes = handle[1]
-        total_bytes += size_in_bytes
 
         # Always backup weights; backup kv_cache only at level 1
         if offload_to != "none" or data.tag == "weights":
-            backup_bytes += size_in_bytes
             cpu_backup_tensor = torch.empty(
                 size_in_bytes,
                 dtype=torch.uint8,
@@ -430,14 +392,8 @@ def do_sleep(*, level: int) -> None:
 
         unmap_and_release(handle)
 
-    _debug_log(
-        f"[do_sleep] freed {total_bytes / 1024**3:.2f} GiB, "
-        f"backed up {backup_bytes / 1024**3:.2f} GiB"
-    )
-
     gc.collect()
     torch.cuda.empty_cache()
-    _debug_log("[do_sleep] completed")
 
 
 def do_wake_up() -> None:
@@ -455,26 +411,12 @@ def do_wake_up() -> None:
     worker = get_worker()
     allocator = CuMemAllocator.get_instance()
 
-    # Debug: log allocator state before wake
-    backup_count = sum(
-        1
-        for _, data in allocator.pointer_to_data.items()
-        if data.cpu_backup_tensor is not None
-    )
-    _debug_log(
-        f"[do_wake_up] pointer_to_data count: {len(allocator.pointer_to_data)}, "
-        f"with backups: {backup_count}"
-    )
-
     tags_to_process = {"weights", "kv_cache"}
-    restored_bytes = 0
-    allocated_bytes = 0
 
     for ptr, data in allocator.pointer_to_data.items():
         if data.tag not in tags_to_process:
             continue
         create_and_map(data.handle)
-        allocated_bytes += data.handle[1]
         if data.cpu_backup_tensor is not None:
             cpu_backup_tensor = data.cpu_backup_tensor
             size_in_bytes = cpu_backup_tensor.numel() * cpu_backup_tensor.element_size()
@@ -485,7 +427,6 @@ def do_wake_up() -> None:
                 size_in_bytes,
             )
             data.cpu_backup_tensor = None
-            restored_bytes += size_in_bytes
 
     # Restore buffers after level 2 sleep (like vLLM does)
     if hasattr(worker, "_sleep_saved_buffers") and worker._sleep_saved_buffers:
@@ -494,9 +435,3 @@ def do_wake_up() -> None:
             if name in worker._sleep_saved_buffers:
                 buffer.copy_(worker._sleep_saved_buffers[name].to(buffer.device))
         worker._sleep_saved_buffers = {}
-
-    _debug_log(
-        f"[do_wake_up] allocated {allocated_bytes / 1024**3:.2f} GiB, "
-        f"restored {restored_bytes / 1024**3:.2f} GiB from backup"
-    )
-    _debug_log("[do_wake_up] completed")

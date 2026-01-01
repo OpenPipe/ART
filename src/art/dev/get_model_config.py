@@ -13,8 +13,6 @@ def get_model_config(
     if config is None:
         config = InternalModelConfig()
 
-    if "_decoupled_vllm_and_unsloth" in config:
-        print("Decoupled service is now the only supported path")
     enable_sleep_mode = config.get("engine_args", {}).get("enable_sleep_mode", True)
     init_args = InitArgs(
         fast_inference=False,

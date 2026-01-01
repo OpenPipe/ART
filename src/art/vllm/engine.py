@@ -6,15 +6,12 @@ import contextvars
 import os
 import time
 from dataclasses import replace
-from typing import Any, Callable, Coroutine, Generator, ParamSpec, TypeVar, cast
+from typing import Any, Callable, Generator, ParamSpec, TypeVar, cast
 
 import cloudpickle
 import vllm
-from vllm.engine.async_llm_engine import AsyncLLMEngine
 from vllm.v1.engine.async_llm import AsyncLLM
 from vllm.v1.worker.gpu_worker import Worker
-
-# Note: patch_allocator is no longer used here - patching is done in do_sleep/do_wake_up
 
 
 async def get_llm(args: vllm.AsyncEngineArgs) -> AsyncLLM:
@@ -46,48 +43,7 @@ async def get_llm(args: vllm.AsyncEngineArgs) -> AsyncLLM:
             enable_sleep_mode=True,
         )
     )
-    # Note: allocator patching is now done directly in do_sleep/do_wake_up
-    # to ensure it's applied at the right time
     return llm
-
-
-def create_engine_pause_and_resume_functions(
-    engine: AsyncLLMEngine,
-) -> tuple[
-    Callable[[], Coroutine[Any, Any, None]], Callable[[], Coroutine[Any, Any, None]]
-]:
-    """
-    Patches the vLLM engine and returns a pair of functions for pausing and resuming
-    request processing respectively.
-
-    Args:
-        engine: The AsyncLLMEngine to patch.
-
-    Returns:
-        A tuple of (pause_engine, resume_engine) async functions.
-    """
-    _engine_step = engine.engine_step
-    resume_event = asyncio.Event()
-    resume_event.set()
-    engine_step_event = asyncio.Event()
-
-    async def engine_step(virtual_engine: int) -> bool:
-        engine_step_event.set()
-        await resume_event.wait()
-        return await _engine_step(virtual_engine)
-
-    engine.engine_step = engine_step
-
-    async def pause_engine() -> None:
-        resume_event.clear()
-        if engine.engine.has_unfinished_requests():
-            engine_step_event.clear()
-            await engine_step_event.wait()
-
-    async def resume_engine() -> None:
-        resume_event.set()
-
-    return pause_engine, resume_engine
 
 
 P = ParamSpec("P")
