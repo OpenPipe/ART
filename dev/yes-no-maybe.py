@@ -1,4 +1,5 @@
 import asyncio
+import os
 from itertools import permutations
 
 import openai
@@ -41,15 +42,11 @@ async def main():
 
     backend = LocalBackend()
     global model
+    base_model = os.environ.get("BASE_MODEL", "Qwen/Qwen3-30B-A3B-Instruct-2507")
     model = art.TrainableModel(
-        name="011",
+        name=os.environ.get("MODEL_NAME", "011"),
         project="yes-no-maybe",
-        base_model="Qwen/Qwen3-30B-A3B-Instruct-2507",
-        _internal_config=art.dev.InternalModelConfig(
-            _decouple_vllm_and_unsloth=True,
-            # engine_args=art.dev.EngineArgs(gpu_memory_utilization=0.7),
-            init_args=art.dev.InitArgs(load_in_4bit=False),
-        ),
+        base_model=base_model,
     )
     await model.register(backend)
 
@@ -63,7 +60,9 @@ async def main():
     ]
 
     openai_client = model.openai_client()
-    for _ in range(await model.get_step(), 1_000):
+    max_steps = int(os.environ.get("NUM_STEPS", "4"))
+    start_step = await model.get_step()
+    for _ in range(start_step, start_step + max_steps):
         train_groups = await art.gather_trajectory_groups(
             (
                 art.TrajectoryGroup(rollout(openai_client, prompt) for _ in range(32))
@@ -81,4 +80,3 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
-
