@@ -41,9 +41,7 @@ if TYPE_CHECKING:
 class SupportsLoadLora(Protocol):
     """Protocol for models that support the optimized load_lora method."""
 
-    def load_lora(
-        self, lora_path: str, load_tensors: bool = True
-    ) -> LoRARequest: ...
+    def load_lora(self, lora_path: str, load_tensors: bool = True) -> LoRARequest: ...
 
 
 class TrainInputs(PackedTensors):
@@ -229,7 +227,10 @@ class UnslothState:
         for name, param in self.peft_model.named_parameters():
             if param.device.type == "cuda":
                 # Create pinned buffer if not exists or wrong size
-                if name not in self._pinned_buffers or self._pinned_buffers[name].shape != param.shape:
+                if (
+                    name not in self._pinned_buffers
+                    or self._pinned_buffers[name].shape != param.shape
+                ):
                     self._pinned_buffers[name] = torch.empty(
                         param.shape, dtype=param.dtype, device="cpu", pin_memory=True
                     )
@@ -244,7 +245,10 @@ class UnslothState:
                 for k, v in state.items():
                     if isinstance(v, torch.Tensor) and v.device.type == "cuda":
                         key = f"opt_{id(param_id)}_{k}"
-                        if key not in self._pinned_buffers or self._pinned_buffers[key].shape != v.shape:
+                        if (
+                            key not in self._pinned_buffers
+                            or self._pinned_buffers[key].shape != v.shape
+                        ):
                             self._pinned_buffers[key] = torch.empty(
                                 v.shape, dtype=v.dtype, device="cpu", pin_memory=True
                             )
@@ -266,9 +270,7 @@ class UnslothState:
         for name, param in self.peft_model.named_parameters():
             if param.device.type == "cpu":
                 # Allocate on GPU and async copy from pinned memory
-                gpu_tensor = torch.empty(
-                    param.shape, dtype=param.dtype, device=device
-                )
+                gpu_tensor = torch.empty(param.shape, dtype=param.dtype, device=device)
                 gpu_tensor.copy_(param.data, non_blocking=True)
                 param.data = gpu_tensor
 
@@ -278,9 +280,7 @@ class UnslothState:
             for state in optimizer.state.values():
                 for k, v in state.items():
                     if isinstance(v, torch.Tensor) and v.device.type == "cpu":
-                        gpu_tensor = torch.empty(
-                            v.shape, dtype=v.dtype, device=device
-                        )
+                        gpu_tensor = torch.empty(v.shape, dtype=v.dtype, device=device)
                         gpu_tensor.copy_(v, non_blocking=True)
                         state[k] = gpu_tensor
 
@@ -404,7 +404,9 @@ class UnslothService:
 
         # Free memory before waking up vLLM
         gc_and_empty_cuda_cache()
-        await asyncio.sleep(0.5)  # Longer delay to allow memory cleanup and pending ops to complete
+        await asyncio.sleep(
+            0.5
+        )  # Longer delay to allow memory cleanup and pending ops to complete
 
         # Wake up workers
         await run_on_workers(llm, do_wake_up)
@@ -444,7 +446,10 @@ class UnslothService:
         )
 
         # Initialize PEFT model - skip if already a PeftModel (e.g. loaded from checkpoint)
-        if hasattr(model, "peft_config") and getattr(model, "peft_config", None) is not None:
+        if (
+            hasattr(model, "peft_config")
+            and getattr(model, "peft_config", None) is not None
+        ):
             # Model already has LoRA adapters (loaded from checkpoint)
             peft_model = cast(peft.peft_model.PeftModelForCausalLM, model)
         else:
@@ -614,4 +619,3 @@ def do_wake_up() -> None:
             if name in worker._sleep_saved_buffers:
                 buffer.copy_(worker._sleep_saved_buffers[name].to(buffer.device))
         worker._sleep_saved_buffers = {}
-

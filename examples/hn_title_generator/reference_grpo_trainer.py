@@ -3,7 +3,6 @@ import os
 from typing import Tuple
 
 import numpy as np
-import wandb
 from datasets import Dataset
 from dotenv import load_dotenv
 from transformers import PreTrainedTokenizer
@@ -18,6 +17,7 @@ from utils import (
 )
 from vllm import SamplingParams
 
+import wandb
 from art.utils import limit_concurrency
 
 load_dotenv()

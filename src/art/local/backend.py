@@ -325,7 +325,9 @@ class LocalBackend(Backend):
                             )
                         except Exception as e:
                             # If the server is sleeping, a failed health check is okay
-                            if await self._services[model_name].vllm_engine_is_sleeping():
+                            if await self._services[
+                                model_name
+                            ].vllm_engine_is_sleeping():
                                 consecutive_failures = 0
                                 continue
                             raise e
