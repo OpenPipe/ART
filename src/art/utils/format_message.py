@@ -1,3 +1,7 @@
+from openai.types.chat.chat_completion_message_function_tool_call import (
+    ChatCompletionMessageFunctionToolCall,
+)
+
 from ..types import Message
 
 
@@ -12,6 +16,7 @@ def format_message(message: Message) -> str:
     tool_calls_text += "\n".join(
         f"{tool_call['function']['name']}({tool_call['function']['arguments']})"
         for tool_call in message.get("tool_calls") or []
+        if "function" in tool_call
     )
 
     # Combine all parts

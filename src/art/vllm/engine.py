@@ -31,11 +31,6 @@ async def get_llm(args: vllm.AsyncEngineArgs) -> AsyncLLM:
         )
         await process.wait()
 
-    # Make sure we are using the V1 engine
-    import vllm.envs as envs
-
-    envs.VLLM_USE_V1 = True
-
     llm = AsyncLLM.from_engine_args(
         replace(
             args,
