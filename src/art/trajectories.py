@@ -1,8 +1,8 @@
 import asyncio
-import time
-import traceback
 from contextlib import asynccontextmanager
 from datetime import datetime
+import time
+import traceback
 from typing import (
     Any,
     AsyncGenerator,
@@ -13,8 +13,8 @@ from typing import (
     overload,
 )
 
-import pydantic
 from openai.types.chat.chat_completion import Choice
+import pydantic
 
 from .types import Messages, MessagesAndChoices, Tools
 

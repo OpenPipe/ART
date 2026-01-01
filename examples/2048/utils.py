@@ -1,8 +1,8 @@
+from enum import Enum
 import random
 import string
-import xml.etree.ElementTree as ET
-from enum import Enum
 from typing import TypedDict
+import xml.etree.ElementTree as ET
 
 from dotenv import load_dotenv
 

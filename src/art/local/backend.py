@@ -1,28 +1,28 @@
 import asyncio
+from datetime import datetime
 import json
 import math
 import os
 import subprocess
-import warnings
-from datetime import datetime
 from types import TracebackType
 from typing import AsyncIterator, Literal, cast
+import warnings
 
 import aiohttp
 import numpy as np
+from openai import AsyncOpenAI
 import polars as pl
 import torch
-import weave
-from openai import AsyncOpenAI
 from tqdm import auto as tqdm
 from transformers import AutoImageProcessor, AutoTokenizer
 from transformers.image_processing_utils import BaseImageProcessor
 from transformers.tokenization_utils_base import PreTrainedTokenizerBase
 from typing_extensions import Self
+import wandb
 from wandb.sdk.wandb_run import Run
+import weave
 from weave.trace.weave_client import WeaveClient
 
-import wandb
 from art.utils.old_benchmarking.calculate_step_metrics import calculate_step_std_dev
 from art.utils.output_dirs import (
     get_default_art_path,

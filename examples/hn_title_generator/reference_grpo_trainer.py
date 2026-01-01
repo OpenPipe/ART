@@ -2,9 +2,9 @@ import asyncio
 import os
 from typing import Tuple
 
-import numpy as np
 from datasets import Dataset
 from dotenv import load_dotenv
+import numpy as np
 from transformers import PreTrainedTokenizer
 from transformers.trainer_callback import TrainerCallback
 from trl import GRPOConfig, GRPOTrainer
@@ -16,8 +16,8 @@ from utils import (
     score_title,
 )
 from vllm import SamplingParams
-
 import wandb
+
 from art.utils import limit_concurrency
 
 load_dotenv()

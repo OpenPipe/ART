@@ -1,10 +1,10 @@
 import logging
 from logging import Handler, LogRecord
 
-import litellm
 from langfuse import Langfuse
 from langfuse.decorators import langfuse_context
 from langfuse.types import SpanLevel
+import litellm
 from sweagent.agent.agents import DefaultAgent
 from sweagent.run.hooks.apply_patch import SaveApplyPatchHook
 

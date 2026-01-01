@@ -1,7 +1,7 @@
 # Copyright Sierra
 
-import json
 from copy import deepcopy
+import json
 from typing import Any, Dict, List
 
 from tau_bench.envs.tool import Tool

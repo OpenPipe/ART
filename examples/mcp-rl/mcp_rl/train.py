@@ -6,8 +6,8 @@ import fnmatch
 import json
 import os
 
-import weave
 from dotenv import load_dotenv
+import weave
 
 import art
 from art.rewards import ruler_score_group

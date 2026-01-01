@@ -1,11 +1,11 @@
 from __future__ import annotations
 
 import asyncio
+from asyncio.subprocess import DEVNULL
 import os
 import tempfile
-import zipfile
-from asyncio.subprocess import DEVNULL
 from typing import Literal, Optional, Sequence
+import zipfile
 
 from art.errors import ForbiddenBucketCreationError
 from art.utils.output_dirs import (

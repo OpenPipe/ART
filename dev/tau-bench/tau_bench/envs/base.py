@@ -1,7 +1,7 @@
 # Copyright Sierra
 
-import random
 from hashlib import sha256
+import random
 from typing import Any, Callable, Dict, List, Optional, Set, Tuple, Type, Union
 
 from tau_bench.envs.tool import Tool

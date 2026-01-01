@@ -1,5 +1,5 @@
-import json
 from copy import deepcopy
+import json
 from typing import Iterable, List, Literal, Tuple
 
 from openai.types.chat.chat_completion import ChatCompletion

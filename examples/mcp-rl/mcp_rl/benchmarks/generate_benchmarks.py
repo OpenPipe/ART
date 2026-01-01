@@ -5,7 +5,6 @@ import os
 import random
 from typing import List
 
-import weave
 from dotenv import load_dotenv
 from servers.python.mcp_alphavantage.server_params import (
     server_params as alphavantage_server_params,
@@ -13,6 +12,7 @@ from servers.python.mcp_alphavantage.server_params import (
 from servers.python.mcp_balldontlie.server_params import (
     server_params as balldontlie_server_params,
 )
+import weave
 
 import art
 from art.local import LocalBackend

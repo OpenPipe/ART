@@ -1,9 +1,9 @@
+from collections import defaultdict
 import functools
 import hashlib
 import inspect
-import threading
-from collections import defaultdict
 from multiprocessing import Lock
+import threading
 from typing import Any, Callable, TypeVar
 
 from pydantic import BaseModel

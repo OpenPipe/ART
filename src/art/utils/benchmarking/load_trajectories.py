@@ -8,8 +8,8 @@ except ImportError:
 import json
 from pathlib import Path
 
-import yaml
 from tqdm.auto import tqdm
+import yaml
 
 from art.utils.get_repo_root_path import get_repo_root_path
 from art.utils.output_dirs import (

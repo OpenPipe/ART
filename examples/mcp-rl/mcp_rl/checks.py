@@ -3,10 +3,10 @@
 import json
 import os
 
-import weave
 from dotenv import load_dotenv
 from openai import AsyncOpenAI
 from tenacity import retry, stop_after_attempt, wait_exponential
+import weave
 
 import art
 from art.utils import limit_concurrency

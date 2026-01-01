@@ -3,9 +3,9 @@ import asyncio
 import os
 import random
 
-import weave
 from dotenv import load_dotenv
 from rollout import TicTacToeScenario, rollout
+import weave
 
 import art
 from art.utils.deployment import TogetherDeploymentConfig, deploy_model

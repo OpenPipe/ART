@@ -1,8 +1,8 @@
-import pytest_asyncio
 from aiohttp import web
 from openai import AsyncOpenAI
 from openai.types.chat.chat_completion import Choice
 from openai.types.chat.chat_completion_message_param import ChatCompletionMessageParam
+import pytest_asyncio
 
 import art
 

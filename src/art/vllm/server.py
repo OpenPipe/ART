@@ -1,9 +1,9 @@
 """OpenAI-compatible server functionality for vLLM."""
 
 import asyncio
+from contextlib import asynccontextmanager
 import logging
 import os
-from contextlib import asynccontextmanager
 from typing import Any, AsyncIterator, Coroutine
 
 from openai import AsyncOpenAI

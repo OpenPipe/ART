@@ -1,9 +1,9 @@
 # Copyright Sierra
 
 import argparse
-import json
 from concurrent.futures import ThreadPoolExecutor
 from enum import Enum
+import json
 from typing import Any, Dict, List
 
 from pydantic import BaseModel

@@ -7,17 +7,17 @@
 # Modifications:
 # Bradley Hilton, OpenPipe Inc., and other ART contributors.
 
+from functools import partial
 import os
 import sys
 import time
-from functools import partial
 from typing import Any, Optional, Union, cast
 from warnings import warn
 
-import setproctitle
-import torch
 from omegaconf import DictConfig, OmegaConf
 from pydantic import ValidationError
+import setproctitle
+import torch
 from torch.distributed import destroy_process_group, init_process_group
 from torch.distributed.device_mesh import DeviceMesh
 from torch.distributed.fsdp import FSDPModule
@@ -1067,8 +1067,8 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
 
     def _get_micro_batches(self, curr_epoch: int) -> tuple[list[PackedTensors], Batch]:
         import math
-        import time
         from pathlib import Path
+        import time
 
         from safetensors.torch import save_file
 

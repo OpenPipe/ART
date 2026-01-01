@@ -2,8 +2,6 @@ import math
 import os
 import time
 
-import openai
-import weave
 from dotenv import load_dotenv
 from game_utils import (
     apply_agent_move,
@@ -12,7 +10,9 @@ from game_utils import (
     get_opponent_move,
     render_board,
 )
+import openai
 from pydantic import BaseModel
+import weave
 
 import art
 

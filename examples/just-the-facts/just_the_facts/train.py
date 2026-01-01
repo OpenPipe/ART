@@ -1,9 +1,9 @@
 import asyncio
 import os
 
-import weave
 from dotenv import load_dotenv
 from rollout import rollout
+import weave
 
 import art
 from art.utils import iterate_dataset

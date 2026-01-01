@@ -3,16 +3,16 @@ import warnings
 # Suppress pydantic warnings at module level
 warnings.filterwarnings("ignore", category=DeprecationWarning, module="pydantic")
 
+from aiohttp import web
 import litellm
 import litellm.litellm_core_utils.streaming_handler
 import litellm.types.utils
-import pytest
-import pytest_asyncio
-from aiohttp import web
 from openai import AsyncOpenAI
 from openai.types.chat.chat_completion import Choice
 from openai.types.chat.chat_completion_message_param import ChatCompletionMessageParam
 from openai.types.chat.chat_completion_tool_param import ChatCompletionToolParam
+import pytest
+import pytest_asyncio
 
 import art
 from art.utils.litellm import convert_litellm_choice_to_openai

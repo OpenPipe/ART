@@ -2,8 +2,6 @@ import math
 import os
 import time
 
-import openai
-import weave
 from dotenv import load_dotenv
 from game_utils import (
     TicTacToeGame,
@@ -13,8 +11,10 @@ from game_utils import (
     render_board,
     unwrap_move,
 )
+import openai
 from openai.types.chat import ChatCompletion
 from pydantic import BaseModel
+import weave
 
 import art
 from art.guided_completion import get_guided_completion_params

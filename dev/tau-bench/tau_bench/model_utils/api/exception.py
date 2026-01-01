@@ -1,7 +1,7 @@
+from concurrent.futures import ThreadPoolExecutor
 import json
 import os
 import time
-from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Callable, TypeVar
 
 from tau_bench.model_utils.model.exception import ModelError, Result

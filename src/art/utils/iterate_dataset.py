@@ -1,6 +1,6 @@
+from dataclasses import dataclass
 import math
 import random
-from dataclasses import dataclass
 from typing import Generator, Generic, List, TypeVar
 
 from tqdm.auto import tqdm

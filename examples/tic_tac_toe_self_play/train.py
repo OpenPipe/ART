@@ -3,11 +3,11 @@ import asyncio
 import os
 import random
 
-import weave
 from dotenv import load_dotenv
 from game_utils import possible_moves
 from gather_trajectory_groups_by_index import gather_trajectory_groups_by_index
 from rollout import ModelConfig, TicTacToeScenario, rollout
+import weave
 
 import art
 from art.utils.strip_logprobs import strip_logprobs

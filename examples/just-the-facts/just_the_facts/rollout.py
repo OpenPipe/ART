@@ -1,10 +1,10 @@
 import asyncio
 import os
 
-import weave
 from dotenv import load_dotenv
 from openai import AsyncOpenAI
 from pydantic import BaseModel
+import weave
 
 import art
 from just_the_facts.checks import (

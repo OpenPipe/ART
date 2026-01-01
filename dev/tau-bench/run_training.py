@@ -4,8 +4,8 @@ import json
 import textwrap
 import traceback
 
-import sky
 from dotenv import dotenv_values
+import sky
 from sky import ClusterStatus
 from tau_bench.types import RunConfig, TauBenchPolicyConfig, TauBenchTrainingConfig
 

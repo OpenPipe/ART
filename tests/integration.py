@@ -1,14 +1,14 @@
 import argparse
 import ast
+from pathlib import Path
 import re
 import sys
-from pathlib import Path
 from typing import Any, Dict
 
-import nbformat
-import pytest
 from nbclient import NotebookClient
 from nbclient.exceptions import CellExecutionError
+import nbformat
+import pytest
 
 NOTEBOOKS = [
     {

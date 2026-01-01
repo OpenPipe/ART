@@ -1,10 +1,10 @@
 """Together deployment functionality."""
 
 import asyncio
+from enum import Enum
 import json
 import os
 import time
-from enum import Enum
 from typing import TYPE_CHECKING, Any
 
 import aiohttp

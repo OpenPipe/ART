@@ -1,11 +1,11 @@
-import math
-import random
 from dataclasses import dataclass
 from itertools import takewhile
+import math
+import random
 from typing import Any, Generator, cast
 
-import torch
 from PIL import Image
+import torch
 from transformers.image_processing_utils import BaseImageProcessor
 from transformers.tokenization_utils_base import PreTrainedTokenizerBase
 

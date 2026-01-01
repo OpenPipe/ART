@@ -8,10 +8,10 @@ Usage:
     python scripts/bump_version.py major  # 0.3.13 -> 1.0.0
 """
 
+from pathlib import Path
 import re
 import subprocess
 import sys
-from pathlib import Path
 
 
 def get_current_version():

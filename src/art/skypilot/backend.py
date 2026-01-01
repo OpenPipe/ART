@@ -1,12 +1,12 @@
 import asyncio
-import os
 from importlib.metadata import PackageNotFoundError, version
+import os
 from typing import TYPE_CHECKING, Literal, cast
 
+from dotenv import dotenv_values
 import semver
 import sky
 import sky.clouds
-from dotenv import dotenv_values
 
 from .. import dev
 from ..backend import Backend

@@ -2,9 +2,9 @@
 
 import copy
 
-import pytest
 from openai.types.chat import ChatCompletionMessage
 from openai.types.chat.chat_completion import Choice
+import pytest
 
 from art.trajectories import PydanticException, Trajectory, TrajectoryGroup
 

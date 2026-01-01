@@ -9,9 +9,9 @@
 import asyncio
 from datetime import datetime
 
-import weave
 from dotenv import load_dotenv
 from envs.echo_env import EchoAction, EchoEnv
+import weave
 
 import art
 from art.serverless.backend import ServerlessBackend

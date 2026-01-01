@@ -1,7 +1,7 @@
 from typing import TYPE_CHECKING
 
-import torch
 from pydantic import BaseModel, ConfigDict
+import torch
 
 from art import dev
 from art.utils.group_aggregate import group_aggregate

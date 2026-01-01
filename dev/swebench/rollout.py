@@ -1,11 +1,9 @@
 import asyncio
-import json
 from http.client import RemoteDisconnected
+import json
 from pathlib import Path
 from typing import Any, Literal, overload
 
-import modal
-import requests
 from aiolimiter import AsyncLimiter
 from config import get_config
 from eval import eval_instance
@@ -13,7 +11,9 @@ from grpclib.exceptions import StreamTerminatedError
 from instances import Instance
 from langfuse.decorators import observe
 from logs import setup_agent_logger
+import modal
 from pydantic import BaseModel
+import requests
 from requests import adapters as requests_adapters
 from requests.exceptions import ConnectionError, ConnectTimeout, SSLError
 from run import run

@@ -1,9 +1,9 @@
 import asyncio
-import os
 from itertools import permutations
+import os
 
-import openai
 from dotenv import load_dotenv
+import openai
 
 import art
 from art.local import LocalBackend

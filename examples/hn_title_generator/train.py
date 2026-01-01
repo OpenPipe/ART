@@ -1,11 +1,11 @@
 import asyncio
-import os
 from datetime import datetime
+import os
 from typing import Any, Dict, Iterable, List
 
-import openai
 from datasets import Dataset
 from dotenv import load_dotenv
+import openai
 from openai.types.chat import ChatCompletionMessageParam
 from openpipe import AsyncOpenPipe
 from transformers.models.auto.tokenization_auto import AutoTokenizer
