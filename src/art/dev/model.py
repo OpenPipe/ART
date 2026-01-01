@@ -121,7 +121,6 @@ class InternalModelConfig(TypedDict, total=False):
     peft_args: "PeftArgs"
     trainer_args: "TrainerArgs"
     torchtune_args: TorchtuneArgs | None
-    _decouple_vllm_and_unsloth: bool
 
 
 class InitArgs(TypedDict, total=False):

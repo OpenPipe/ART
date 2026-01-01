@@ -19,16 +19,10 @@ from transformers import AutoImageProcessor, AutoTokenizer
 from transformers.image_processing_utils import BaseImageProcessor
 from transformers.tokenization_utils_base import PreTrainedTokenizerBase
 from typing_extensions import Self
+from wandb.sdk.wandb_run import Run
 from weave.trace.weave_client import WeaveClient
 
 import wandb
-from art.utils.deployment import (
-    DeploymentResult,
-    Provider,
-    TogetherDeploymentConfig,
-    WandbDeploymentConfig,
-    deploy_model,
-)
 from art.utils.old_benchmarking.calculate_step_metrics import calculate_step_std_dev
 from art.utils.output_dirs import (
     get_default_art_path,
@@ -44,7 +38,6 @@ from art.utils.s3 import (
 )
 from art.utils.trajectory_logging import serialize_trajectory_groups
 from mp_actors import close_proxy, move_to_child_process
-from wandb.sdk.wandb_run import Run
 
 from .. import dev
 from ..backend import Backend
@@ -133,7 +126,6 @@ class LocalBackend(Backend):
         from ..dev.get_model_config import get_model_config
         from ..torchtune.service import TorchtuneService
         from ..unsloth.decoupled_service import DecoupledUnslothService
-        from ..unsloth.service import UnslothService
 
         if model.name not in self._services:
             config = get_model_config(
@@ -143,10 +135,8 @@ class LocalBackend(Backend):
             )
             if config.get("torchtune_args") is not None:
                 service_class = TorchtuneService
-            elif config.get("_decouple_vllm_and_unsloth", False):
-                service_class = DecoupledUnslothService
             else:
-                service_class = UnslothService
+                service_class = DecoupledUnslothService
             self._services[model.name] = service_class(
                 model_name=model.name,
                 base_model=model.base_model,
@@ -156,17 +146,9 @@ class LocalBackend(Backend):
             if not self._in_process:
                 # Kill all "model-service" processes to free up GPU memory
                 subprocess.run(["pkill", "-9", "model-service"])
-                if isinstance(
-                    self._services[model.name],
-                    (UnslothService, DecoupledUnslothService),
-                ):
-                    # To enable sleep mode, import peft before unsloth
-                    # Unsloth will issue warnings, but everything appears to be okay
-                    if config.get("engine_args", {}).get("enable_sleep_mode", False):
-                        os.environ["IMPORT_PEFT"] = "1"
-                    # When moving the service to a child process, import unsloth
-                    # early to maximize optimizations
-                    os.environ["IMPORT_UNSLOTH"] = "1"
+                # When moving the service to a child process, import unsloth
+                # early to maximize optimizations
+                os.environ["IMPORT_UNSLOTH"] = "1"
                 self._services[model.name] = move_to_child_process(
                     self._services[model.name],
                     process_name="model-service",

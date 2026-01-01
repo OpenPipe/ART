@@ -1,24 +1,6 @@
-from packaging.version import Version
-
 from .engine import EngineArgs
 from .model import InitArgs, InternalModelConfig, PeftArgs, TrainerArgs
 from .torchtune import TorchtuneArgs
-
-
-def _should_decouple_vllm_and_unsloth() -> bool:
-    """
-    Check if vLLM and unsloth should be decoupled.
-
-    In vLLM 0.13+, AsyncLLM always uses multiprocessing which prevents
-    unsloth from directly accessing model weights. We need to decouple
-    the two by loading the model separately.
-    """
-    try:
-        from vllm import __version__ as vllm_version
-
-        return Version(vllm_version) >= Version("0.13.0")
-    except ImportError:
-        return False
 
 
 def get_model_config(
@@ -31,34 +13,20 @@ def get_model_config(
     if config is None:
         config = InternalModelConfig()
 
-    # Auto-enable decoupled mode for vLLM 0.13+ unless explicitly disabled
-    decouple = config.get("_decouple_vllm_and_unsloth", None)
-    if decouple is None:
-        decouple = _should_decouple_vllm_and_unsloth()
-
+    if "_decoupled_vllm_and_unsloth" in config:
+        print("Decoupled service is now the only supported path")
     enable_sleep_mode = config.get("engine_args", {}).get("enable_sleep_mode", True)
     init_args = InitArgs(
-        disable_log_stats=False,
-        enable_prefix_caching=True,
-        fast_inference=True,
-        gpu_memory_utilization=(0.79 if enable_sleep_mode else 0.55),
+        fast_inference=False,
         load_in_4bit=True,
-        max_lora_rank=8,
         max_seq_length=32768,
         model_name=base_model,
-        use_async=True,
     )
-    if decouple:
-        init_args["fast_inference"] = False
-        init_args.pop("disable_log_stats")
-        init_args.pop("enable_prefix_caching")
-        init_args.pop("gpu_memory_utilization")
-        init_args.pop("max_lora_rank")
-        init_args.pop("use_async")
     engine_args = EngineArgs(
         allowed_local_media_path="/tmp",
         enable_sleep_mode=enable_sleep_mode,
         generation_config="vllm",
+        model=base_model,
     )
     engine_args.update(config.get("engine_args", {}))
     init_args.update(config.get("init_args", {}))
@@ -67,8 +35,6 @@ def get_model_config(
         if config.get("torchtune_args") is not None:
             engine_args["model"] = last_checkpoint_dir
     elif config.get("torchtune_args") is not None:
-        engine_args["model"] = base_model
-    if decouple:
         engine_args["model"] = base_model
     peft_args = PeftArgs(
         lora_alpha=16,
@@ -115,5 +81,4 @@ def get_model_config(
         peft_args=peft_args,
         trainer_args=trainer_args,
         torchtune_args=torchtune_args,
-        _decouple_vllm_and_unsloth=decouple,
     )
