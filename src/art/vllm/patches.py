@@ -19,36 +19,7 @@ def subclass_chat_completion_request() -> None:
     vllm.entrypoints.openai.protocol.ChatCompletionRequest = ChatCompletionRequest
 
 
-def patch_lora_request() -> None:
-    """
-    Patches the vLLM LoRARequest type to have attributes Unsloth expects and the Unsloth LoRARequest type to have attributes vLLM expects.
-    """
-    from unsloth_zoo.vllm_lora_request import LoRARequest as UnslothLoRARequest
-    from vllm.lora.request import LoRARequest
 
-    LoRARequest.lora_tensors = {}  # type: ignore
-    LoRARequest.lora_embeddings = {}  # type: ignore
-    UnslothLoRARequest.tensorizer_config_dict = None  # type: ignore
-
-
-def patch_get_lora_tokenizer_async() -> None:
-    import vllm.transformers_utils.tokenizer
-    import vllm.transformers_utils.tokenizer_group
-
-    async def patch(*_: Any, **__: Any) -> None:
-        return None
-
-    vllm.transformers_utils.tokenizer.get_lora_tokenizer_async = patch  # type: ignore
-    vllm.transformers_utils.tokenizer_group.get_lora_tokenizer_async = (  # type: ignore
-        patch
-    )
-
-    async def patch2(self, *args: Any, **kwargs: Any) -> None:
-        return self.tokenizer
-
-    vllm.transformers_utils.tokenizer_group.TokenizerGroup.get_lora_tokenizer_async = (
-        patch2  # type: ignore
-    )
 
 
 def patch_listen_for_disconnect() -> None:

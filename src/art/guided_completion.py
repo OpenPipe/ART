@@ -61,7 +61,9 @@ def get_guided_completion_params(
             raise ValueError("No tool call found in completion")
         if base_tools is None:
             raise ValueError("No base tools provided")
-        assert isinstance(tool_call, ChatCompletionMessageFunctionToolCall), "Only function tool calls are supported"
+        assert isinstance(tool_call, ChatCompletionMessageFunctionToolCall), (
+            "Only function tool calls are supported"
+        )
         tool_name = tool_call.function.name
         tool_choice = {
             "type": "function",  # ← must call it

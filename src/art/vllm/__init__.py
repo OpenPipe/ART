@@ -11,9 +11,7 @@ from .engine import (
 
 # Patches - these are typically imported for their side effects
 from .patches import (
-    patch_get_lora_tokenizer_async,
     patch_listen_for_disconnect,
-    patch_lora_request,
     patch_tool_parser_manager,
     subclass_chat_completion_request,
 )
@@ -35,8 +33,6 @@ __all__ = [
     "WorkerExtension",
     # Patches
     "subclass_chat_completion_request",
-    "patch_lora_request",
-    "patch_get_lora_tokenizer_async",
     "patch_listen_for_disconnect",
     "patch_tool_parser_manager",
 ]
