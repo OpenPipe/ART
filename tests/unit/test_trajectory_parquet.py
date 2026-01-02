@@ -185,7 +185,7 @@ class TestParquetRoundTrip:
                             {"role": "user", "content": "Hello 你好 مرحبا 🎉"},
                             {
                                 "role": "assistant",
-                                "content": "Hi! 你好！مرحبا! 👋\n\tTabbed \"quoted\" content",
+                                "content": 'Hi! 你好！مرحبا! 👋\n\tTabbed "quoted" content',
                             },
                         ],
                         logs=["Unicode: 中文日志"],
@@ -247,14 +247,18 @@ class TestParquetRoundTrip:
                         reward=0.5,
                         metrics={"group": 0, "idx": 0},
                         metadata={},
-                        messages_and_choices=[{"role": "user", "content": "group0-msg0"}],
+                        messages_and_choices=[
+                            {"role": "user", "content": "group0-msg0"}
+                        ],
                         logs=[],
                     ),
                     Trajectory(
                         reward=0.6,
                         metrics={"group": 0, "idx": 1},
                         metadata={},
-                        messages_and_choices=[{"role": "user", "content": "group0-msg1"}],
+                        messages_and_choices=[
+                            {"role": "user", "content": "group0-msg1"}
+                        ],
                         logs=[],
                     ),
                 ],
@@ -266,7 +270,9 @@ class TestParquetRoundTrip:
                         reward=0.9,
                         metrics={"group": 1, "idx": 0},
                         metadata={},
-                        messages_and_choices=[{"role": "user", "content": "group1-msg0"}],
+                        messages_and_choices=[
+                            {"role": "user", "content": "group1-msg0"}
+                        ],
                         logs=[],
                     ),
                 ],
@@ -278,7 +284,9 @@ class TestParquetRoundTrip:
                         reward=1.0,
                         metrics={"group": 2, "idx": 0},
                         metadata={},
-                        messages_and_choices=[{"role": "user", "content": "group2-msg0"}],
+                        messages_and_choices=[
+                            {"role": "user", "content": "group2-msg0"}
+                        ],
                         logs=[],
                     ),
                 ],
@@ -362,7 +370,10 @@ class TestMigration:
                     "metrics": {"duration": 5.0},
                     "metadata": {"id": "test"},
                     "messages_and_choices": [
-                        {"role": "system", "content": "You are a helpful assistant. " * 100},
+                        {
+                            "role": "system",
+                            "content": "You are a helpful assistant. " * 100,
+                        },
                         {"role": "user", "content": "Hello"},
                         {"role": "assistant", "content": "Hi!"},
                     ],
@@ -428,10 +439,38 @@ class TestMigration:
         # Create files
         for i in range(3):
             (train_dir / f"{i:04d}.jsonl").write_text(
-                json.dumps({"trajectories": [{"reward": i * 0.1, "metrics": {}, "metadata": {}, "messages_and_choices": [], "tools": None, "additional_histories": [], "logs": []}]})
+                json.dumps(
+                    {
+                        "trajectories": [
+                            {
+                                "reward": i * 0.1,
+                                "metrics": {},
+                                "metadata": {},
+                                "messages_and_choices": [],
+                                "tools": None,
+                                "additional_histories": [],
+                                "logs": [],
+                            }
+                        ]
+                    }
+                )
             )
         (val_dir / "0000.jsonl").write_text(
-            json.dumps({"trajectories": [{"reward": 0.5, "metrics": {}, "metadata": {}, "messages_and_choices": [], "tools": None, "additional_histories": [], "logs": []}]})
+            json.dumps(
+                {
+                    "trajectories": [
+                        {
+                            "reward": 0.5,
+                            "metrics": {},
+                            "metadata": {},
+                            "messages_and_choices": [],
+                            "tools": None,
+                            "additional_histories": [],
+                            "logs": [],
+                        }
+                    ]
+                }
+            )
         )
 
         # Migrate
@@ -449,7 +488,21 @@ class TestMigration:
         traj_dir.mkdir(parents=True)
 
         (traj_dir / "0000.jsonl").write_text(
-            json.dumps({"trajectories": [{"reward": 0.8, "metrics": {}, "metadata": {}, "messages_and_choices": [], "tools": None, "additional_histories": [], "logs": []}]})
+            json.dumps(
+                {
+                    "trajectories": [
+                        {
+                            "reward": 0.8,
+                            "metrics": {},
+                            "metadata": {},
+                            "messages_and_choices": [],
+                            "tools": None,
+                            "additional_histories": [],
+                            "logs": [],
+                        }
+                    ]
+                }
+            )
         )
 
         result = migrate_model_dir(model_dir)
@@ -500,7 +553,9 @@ class TestGoldenFiles:
         new_size = parquet_path.stat().st_size
 
         # Check compression (should be at least 10x)
-        assert result.compression_ratio >= 10, f"Compression ratio {result.compression_ratio} is less than expected"
+        assert result.compression_ratio >= 10, (
+            f"Compression ratio {result.compression_ratio} is less than expected"
+        )
 
         # Verify data integrity
         with open(test_file, "r") as f:

@@ -82,38 +82,50 @@ def write_trajectory_groups_parquet(
                     msg = {
                         "finish_reason": msg.finish_reason,
                         "index": msg.index,
-                        "message": msg.message.to_dict() if hasattr(msg.message, "to_dict") else msg.message,
+                        "message": msg.message.to_dict()
+                        if hasattr(msg.message, "to_dict")
+                        else msg.message,
                     }
                 messages.append(_flatten_message(msg))
 
-            rows.append({
-                "group_index": group_index,
-                "reward": trajectory.reward,
-                "metrics": json.dumps(trajectory.metrics) if trajectory.metrics else None,
-                "metadata": json.dumps(trajectory.metadata) if trajectory.metadata else None,
-                "tools": json.dumps(trajectory.tools) if trajectory.tools else None,
-                "logs": trajectory.logs if trajectory.logs else None,
-                "messages": messages,
-            })
+            rows.append(
+                {
+                    "group_index": group_index,
+                    "reward": trajectory.reward,
+                    "metrics": json.dumps(trajectory.metrics)
+                    if trajectory.metrics
+                    else None,
+                    "metadata": json.dumps(trajectory.metadata)
+                    if trajectory.metadata
+                    else None,
+                    "tools": json.dumps(trajectory.tools) if trajectory.tools else None,
+                    "logs": trajectory.logs if trajectory.logs else None,
+                    "messages": messages,
+                }
+            )
 
     # Define schema
-    message_type = pa.struct([
-        ("role", pa.string()),
-        ("content", pa.string()),
-        ("tool_calls", pa.string()),
-        ("tool_call_id", pa.string()),
-        ("trainable", pa.bool_()),
-    ])
+    message_type = pa.struct(
+        [
+            ("role", pa.string()),
+            ("content", pa.string()),
+            ("tool_calls", pa.string()),
+            ("tool_call_id", pa.string()),
+            ("trainable", pa.bool_()),
+        ]
+    )
 
-    schema = pa.schema([
-        ("group_index", pa.int64()),
-        ("reward", pa.float64()),
-        ("metrics", pa.string()),
-        ("metadata", pa.string()),
-        ("tools", pa.string()),
-        ("logs", pa.list_(pa.string())),
-        ("messages", pa.list_(message_type)),
-    ])
+    schema = pa.schema(
+        [
+            ("group_index", pa.int64()),
+            ("reward", pa.float64()),
+            ("metrics", pa.string()),
+            ("metadata", pa.string()),
+            ("tools", pa.string()),
+            ("logs", pa.list_(pa.string())),
+            ("messages", pa.list_(message_type)),
+        ]
+    )
 
     if not rows:
         table = pa.table({name: [] for name in schema.names}, schema=schema)
@@ -168,7 +180,9 @@ def read_trajectory_groups_parquet(path: str | Path) -> list[TrajectoryGroup]:
             messages_and_choices=messages_and_choices,
             reward=row_dict["reward"],
             metrics=json.loads(row_dict["metrics"]) if row_dict.get("metrics") else {},
-            metadata=json.loads(row_dict["metadata"]) if row_dict.get("metadata") else {},
+            metadata=json.loads(row_dict["metadata"])
+            if row_dict.get("metadata")
+            else {},
             logs=row_dict.get("logs") or [],
         )
 

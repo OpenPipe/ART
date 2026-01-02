@@ -235,53 +235,77 @@ def migrate_jsonl_to_parquet(
                     if "finish_reason" in msg:
                         # Choice format - extract inner message, mark as trainable
                         inner = msg.get("message", {})
-                        messages.append({
-                            "role": inner.get("role"),
-                            "content": inner.get("content"),
-                            "tool_calls": json.dumps(inner.get("tool_calls")) if inner.get("tool_calls") else None,
-                            "tool_call_id": None,
-                            "trainable": True,
-                        })
+                        messages.append(
+                            {
+                                "role": inner.get("role"),
+                                "content": inner.get("content"),
+                                "tool_calls": json.dumps(inner.get("tool_calls"))
+                                if inner.get("tool_calls")
+                                else None,
+                                "tool_call_id": None,
+                                "trainable": True,
+                            }
+                        )
                     else:
                         # Regular message
-                        messages.append({
-                            "role": msg.get("role"),
-                            "content": msg.get("content"),
-                            "tool_calls": json.dumps(msg.get("tool_calls")) if msg.get("tool_calls") else None,
-                            "tool_call_id": msg.get("tool_call_id"),
-                            "trainable": False,
-                        })
+                        messages.append(
+                            {
+                                "role": msg.get("role"),
+                                "content": msg.get("content"),
+                                "tool_calls": json.dumps(msg.get("tool_calls"))
+                                if msg.get("tool_calls")
+                                else None,
+                                "tool_call_id": msg.get("tool_call_id"),
+                                "trainable": False,
+                            }
+                        )
 
-                rows.append({
-                    "group_index": group_index,
-                    "reward": traj.get("reward"),
-                    "metrics": json.dumps(traj.get("metrics")) if traj.get("metrics") else None,
-                    "metadata": json.dumps(traj.get("metadata")) if traj.get("metadata") else None,
-                    "tools": json.dumps(traj.get("tools")) if traj.get("tools") else None,
-                    "logs": traj.get("logs"),
-                    "additional_histories": json.dumps(traj.get("additional_histories")) if traj.get("additional_histories") else None,
-                    "messages": messages,
-                })
+                rows.append(
+                    {
+                        "group_index": group_index,
+                        "reward": traj.get("reward"),
+                        "metrics": json.dumps(traj.get("metrics"))
+                        if traj.get("metrics")
+                        else None,
+                        "metadata": json.dumps(traj.get("metadata"))
+                        if traj.get("metadata")
+                        else None,
+                        "tools": json.dumps(traj.get("tools"))
+                        if traj.get("tools")
+                        else None,
+                        "logs": traj.get("logs"),
+                        "additional_histories": json.dumps(
+                            traj.get("additional_histories")
+                        )
+                        if traj.get("additional_histories")
+                        else None,
+                        "messages": messages,
+                    }
+                )
 
         # Define the message struct schema
-        message_type = pa.struct([
-            ("role", pa.string()),
-            ("content", pa.string()),
-            ("tool_calls", pa.string()),
-            ("tool_call_id", pa.string()),
-            ("trainable", pa.bool_()),
-        ])
+        message_type = pa.struct(
+            [
+                ("role", pa.string()),
+                ("content", pa.string()),
+                ("tool_calls", pa.string()),
+                ("tool_call_id", pa.string()),
+                ("trainable", pa.bool_()),
+            ]
+        )
 
-        schema = pa.schema([
-            ("group_index", pa.int64()),
-            ("reward", pa.float64()),
-            ("metrics", pa.string()),
-            ("metadata", pa.string()),
-            ("tools", pa.string()),
-            ("logs", pa.list_(pa.string())),
-            ("additional_histories", pa.string()),
-            ("messages", pa.list_(message_type)),
-        ])
+        schema = pa.schema(
+            [
+                ("group_index", pa.int64()),
+                ("reward", pa.float64()),
+                ("metrics", pa.string()),
+                ("metadata", pa.string()),
+                ("tools", pa.string()),
+                ("logs", pa.list_(pa.string())),
+                ("additional_histories", pa.string()),
+                ("messages", pa.list_(message_type)),
+            ]
+        )
 
         # Handle empty case
         if not rows:

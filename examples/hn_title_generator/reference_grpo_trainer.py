@@ -5,16 +5,11 @@ from typing import Tuple
 from datasets import Dataset
 from dotenv import load_dotenv
 import numpy as np
-from transformers import PreTrainedTokenizer
+from transformers.tokenization_utils import PreTrainedTokenizer
 from transformers.trainer_callback import TrainerCallback
 from trl import GRPOConfig, GRPOTrainer
 from unsloth import FastLanguageModel, is_bfloat16_supported
-from utils import (
-    cache,
-    prompt_for_title,
-    pull_data,
-    score_title,
-)
+from utils import cache, prompt_for_title, pull_data, score_title
 from vllm import SamplingParams
 import wandb
 

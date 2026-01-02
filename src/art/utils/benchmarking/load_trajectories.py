@@ -106,9 +106,13 @@ async def load_trajectories(
         return pl.DataFrame()
 
     # Collect all parquet files
-    all_parquet_files: list[tuple[str, str, str, int]] = []  # (path, model, split, step)
+    all_parquet_files: list[
+        tuple[str, str, str, int]
+    ] = []  # (path, model, split, step)
 
-    for model_dir in tqdm(model_dirs, desc="Scanning models", unit="model", disable=not debug):
+    for model_dir in tqdm(
+        model_dirs, desc="Scanning models", unit="model", disable=not debug
+    ):
         model_name = model_dir.name
         traj_root = Path(get_trajectories_dir(str(model_dir)))
 
@@ -122,12 +126,14 @@ async def load_trajectories(
             for trajectory_path in split_dir.glob("*.parquet"):
                 try:
                     step = int(trajectory_path.stem)
-                    all_parquet_files.append((
-                        str(trajectory_path),
-                        model_name,
-                        split_dir.name,
-                        step,
-                    ))
+                    all_parquet_files.append(
+                        (
+                            str(trajectory_path),
+                            model_name,
+                            split_dir.name,
+                            step,
+                        )
+                    )
                 except ValueError:
                     continue
 
@@ -221,7 +227,8 @@ async def load_trajectories(
                             "content": msg[1],
                             "tool_calls": msg[2],
                             "tool_call_id": msg[3],
-                            "trainable": msg[4] is not None,  # finish_reason present = trainable
+                            "trainable": msg[4]
+                            is not None,  # finish_reason present = trainable
                         }
 
                 # Build processed message

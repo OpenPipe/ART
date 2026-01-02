@@ -29,10 +29,21 @@ app = typer.Typer()
 
 @app.command()
 def migrate(
-    path: Path = typer.Argument(..., help="Path to model dir, project dir, or trajectories dir"),
-    dry_run: bool = typer.Option(False, "--dry-run", "-n", help="Show what would be migrated without making changes"),
-    keep_jsonl: bool = typer.Option(False, "--keep-jsonl", help="Keep original JSONL files after conversion"),
-    verbose: bool = typer.Option(False, "--verbose", "-v", help="Print progress for each file"),
+    path: Path = typer.Argument(
+        ..., help="Path to model dir, project dir, or trajectories dir"
+    ),
+    dry_run: bool = typer.Option(
+        False,
+        "--dry-run",
+        "-n",
+        help="Show what would be migrated without making changes",
+    ),
+    keep_jsonl: bool = typer.Option(
+        False, "--keep-jsonl", help="Keep original JSONL files after conversion"
+    ),
+    verbose: bool = typer.Option(
+        False, "--verbose", "-v", help="Print progress for each file"
+    ),
 ) -> None:
     """
     Migrate trajectory files from JSONL to Parquet format.
@@ -88,24 +99,33 @@ def migrate(
                     model_dir,
                     delete_originals=not keep_jsonl,
                     dry_run=dry_run,
-                    progress_callback=lambda f: typer.echo(f"    {f}") if verbose else None,
+                    progress_callback=lambda f: typer.echo(f"    {f}")
+                    if verbose
+                    else None,
                 )
                 result = result + model_result
     else:
-        typer.echo(f"Error: Could not determine path type. Expected a model, project, or trajectories directory.", err=True)
+        typer.echo(
+            f"Error: Could not determine path type. Expected a model, project, or trajectories directory.",
+            err=True,
+        )
         raise typer.Exit(1)
 
     # Print summary
     if dry_run:
         typer.echo(f"\n[DRY RUN] Would migrate {result.files_migrated} files")
         if result.bytes_before > 0:
-            typer.echo(f"  Estimated space savings: {result.space_saved / 1024 / 1024:.1f} MB")
+            typer.echo(
+                f"  Estimated space savings: {result.space_saved / 1024 / 1024:.1f} MB"
+            )
     else:
         typer.echo(f"\nMigrated {result.files_migrated} files")
         if result.files_skipped > 0:
             typer.echo(f"Skipped {result.files_skipped} files")
         if result.bytes_before > 0 and result.bytes_after > 0:
-            typer.echo(f"Space saved: {result.space_saved / 1024 / 1024:.1f} MB ({result.compression_ratio:.1f}x compression)")
+            typer.echo(
+                f"Space saved: {result.space_saved / 1024 / 1024:.1f} MB ({result.compression_ratio:.1f}x compression)"
+            )
 
     if result.errors:
         typer.echo(f"\nErrors ({len(result.errors)}):", err=True)
