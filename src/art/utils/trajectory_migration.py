@@ -10,8 +10,8 @@ This module provides functions to:
 The migration provides ~25x compression and ~20x faster query performance.
 """
 
-import json
 from dataclasses import dataclass, field
+import json
 from pathlib import Path
 from typing import Any, Callable, Iterator, cast
 

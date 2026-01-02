@@ -1,6 +1,6 @@
 import json
-import socket
 from pathlib import Path
+import socket
 from typing import Any, AsyncIterator, Optional
 
 from dotenv import load_dotenv
