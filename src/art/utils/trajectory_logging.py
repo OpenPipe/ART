@@ -9,11 +9,16 @@ For legacy JSONL support and migration utilities, see trajectory_migration.py.
 
 import json
 from pathlib import Path
+from typing import Any
+
+from litellm.types.utils import Choices
+from openai.types.chat.chat_completion import Choice
+from openai.types.chat.chat_completion_message_param import ChatCompletionMessageParam
 
 from art import Trajectory, TrajectoryGroup
 
 
-def _flatten_message(msg) -> dict:
+def _flatten_message(msg: dict) -> dict:
     """Convert a message or Choice to flat parquet format."""
     if "finish_reason" in msg:
         # Choice format - extract inner message, mark as trainable
@@ -73,20 +78,20 @@ def write_trajectory_groups_parquet(
 
             # Flatten messages
             messages = []
-            for msg in trajectory.messages_and_choices:
-                # Handle both dict and Choice/Message objects
-                if hasattr(msg, "to_dict"):
-                    msg = msg.to_dict()
-                elif hasattr(msg, "finish_reason"):
-                    # Choice object - convert to dict format
-                    msg = {
-                        "finish_reason": msg.finish_reason,
-                        "index": msg.index,
-                        "message": msg.message.to_dict()
-                        if hasattr(msg.message, "to_dict")
-                        else msg.message,
+            for message_or_choice in trajectory.messages_and_choices:
+                if isinstance(message_or_choice, Choice):
+                    message = message_or_choice.to_dict()
+                elif isinstance(message_or_choice, Choices):
+                    message = {
+                        "finish_reason": message_or_choice.finish_reason,
+                        "index": message_or_choice.index,
+                        "message": message_or_choice.message.to_dict()
+                        if hasattr(message_or_choice.message, "to_dict")
+                        else message_or_choice.message,
                     }
-                messages.append(_flatten_message(msg))
+                else:
+                    message = message_or_choice
+                messages.append(_flatten_message(message))  # type: ignore
 
             rows.append(
                 {

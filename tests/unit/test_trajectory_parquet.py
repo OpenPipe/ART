@@ -14,10 +14,29 @@ import os
 from pathlib import Path
 import shutil
 import tempfile
+from typing import cast
 
+from openai.types.chat.chat_completion import Choice
+from openai.types.chat.chat_completion_assistant_message_param import (
+    ChatCompletionAssistantMessageParam,
+)
+from openai.types.chat.chat_completion_message_function_tool_call_param import (
+    ChatCompletionMessageFunctionToolCallParam,
+)
+from openai.types.chat.chat_completion_message_param import ChatCompletionMessageParam
+from openai.types.chat.chat_completion_message_tool_call_union_param import (
+    ChatCompletionMessageToolCallUnionParam,
+)
+from openai.types.chat.chat_completion_tool_message_param import (
+    ChatCompletionToolMessageParam,
+)
+from openai.types.chat.chat_completion_user_message_param import (
+    ChatCompletionUserMessageParam,
+)
 import pytest
 
 from art import Trajectory, TrajectoryGroup
+from art.types import MessageOrChoice
 from art.utils.trajectory_logging import (
     read_trajectory_groups_parquet,
     write_trajectory_groups_parquet,
@@ -34,6 +53,32 @@ from art.utils.trajectory_migration import (
 
 # Path to test fixtures
 FIXTURES_DIR = Path(__file__).parent.parent / "fixtures" / "trajectories"
+
+
+def _ensure_message(item: MessageOrChoice) -> ChatCompletionMessageParam:
+    """Narrow a trajectory entry to a concrete message (not a Choice)."""
+    assert not isinstance(item, Choice)
+    return cast(ChatCompletionMessageParam, item)
+
+
+def _ensure_assistant_message(
+    item: MessageOrChoice,
+) -> ChatCompletionAssistantMessageParam:
+    msg = _ensure_message(item)
+    assert msg["role"] == "assistant"
+    return cast(ChatCompletionAssistantMessageParam, msg)
+
+
+def _ensure_tool_message(item: MessageOrChoice) -> ChatCompletionToolMessageParam:
+    msg = _ensure_message(item)
+    assert msg["role"] == "tool"
+    return cast(ChatCompletionToolMessageParam, msg)
+
+
+def _ensure_user_message(item: MessageOrChoice) -> ChatCompletionUserMessageParam:
+    msg = _ensure_message(item)
+    assert msg["role"] == "user"
+    return cast(ChatCompletionUserMessageParam, msg)
 
 
 class TestParquetRoundTrip:
@@ -120,12 +165,19 @@ class TestParquetRoundTrip:
         assert len(traj.messages_and_choices) == 3
 
         # Check tool call message
-        tool_call_msg = traj.messages_and_choices[1]
-        assert "tool_calls" in tool_call_msg
-        assert tool_call_msg["tool_calls"][0]["function"]["name"] == "search"
+        tool_call_msg = _ensure_assistant_message(traj.messages_and_choices[1])
+        tool_calls = cast(
+            list[ChatCompletionMessageToolCallUnionParam],
+            list(tool_call_msg.get("tool_calls") or []),
+        )
+        assert tool_calls, "Assistant message should include tool calls"
+        first_call = tool_calls[0]
+        assert first_call["type"] == "function"
+        function_call = cast(ChatCompletionMessageFunctionToolCallParam, first_call)
+        assert function_call["function"]["name"] == "search"
 
         # Check tool result message
-        tool_result_msg = traj.messages_and_choices[2]
+        tool_result_msg = _ensure_tool_message(traj.messages_and_choices[2])
         assert tool_result_msg["tool_call_id"] == "call_123"
 
     def test_choice_format(self, tmp_path: Path):
@@ -163,14 +215,18 @@ class TestParquetRoundTrip:
         traj = loaded[0].trajectories[0]
         # Choice format is flattened to a simple message dict
         # The inner message content is preserved
-        user_msg = traj.messages_and_choices[0]
-        assistant_msg = traj.messages_and_choices[1]
+        user_msg = _ensure_user_message(traj.messages_and_choices[0])
+        assistant_msg = _ensure_assistant_message(traj.messages_and_choices[1])
 
         assert user_msg["role"] == "user"
-        assert user_msg["content"] == "Hello"
+        user_content = user_msg["content"]
+        assert isinstance(user_content, str)
+        assert user_content == "Hello"
 
         assert assistant_msg["role"] == "assistant"
-        assert assistant_msg["content"] == "Hi!"
+        assistant_content = assistant_msg.get("content")
+        assert isinstance(assistant_content, str)
+        assert assistant_content == "Hi!"
 
     def test_unicode_content(self, tmp_path: Path):
         """Test trajectories with unicode and special characters."""
@@ -200,8 +256,11 @@ class TestParquetRoundTrip:
         loaded = read_trajectory_groups_parquet(parquet_path)
 
         traj = loaded[0].trajectories[0]
-        assert "你好" in traj.messages_and_choices[0]["content"]
-        assert "🎉" in traj.messages_and_choices[0]["content"]
+        user_msg = _ensure_user_message(traj.messages_and_choices[0])
+        user_content = user_msg["content"]
+        assert isinstance(user_content, str)
+        assert "你好" in user_content
+        assert "🎉" in user_content
         assert "中文日志" in traj.logs[0]
 
     def test_multiple_trajectories(self, tmp_path: Path):
