@@ -394,9 +394,8 @@ envs:
   PYTHONUTF8: "1" #Enforce UTF-8 Encoding to fix ASCII encoding issue in unsloth-zoo
 setup: |
   ./scripts/setup.sh
-experimental:
-  config_overrides:
-    kubernetes:
-      pod_config:
-        spec:
-          schedulerName: gpu-binpack
+config:
+  kubernetes:
+    pod_config:
+      spec:
+        schedulerName: gpu-binpack

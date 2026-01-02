@@ -36,7 +36,7 @@ from art.utils.s3 import (
     pull_model_from_s3,
     push_model_to_s3,
 )
-from art.utils.trajectory_logging import serialize_trajectory_groups
+from art.utils.trajectory_logging import write_trajectory_groups_parquet
 from mp_actors import close_proxy, move_to_child_process
 
 from .. import dev
@@ -117,6 +117,11 @@ class LocalBackend(Backend):
         os.makedirs(output_dir, exist_ok=True)
         with open(f"{output_dir}/model.json", "w") as f:
             json.dump(model.model_dump(), f)
+
+        # Auto-migrate any old JSONL trajectory files to Parquet
+        from art.utils.trajectory_migration import auto_migrate_on_register
+
+        auto_migrate_on_register(output_dir)
 
         # Initialize wandb and weave early if this is a trainable model
         if model.trainable and "WANDB_API_KEY" in os.environ:
@@ -360,11 +365,10 @@ class LocalBackend(Backend):
 
         # Get the file name for the current iteration, or default to 0 for non-trainable models
         iteration = self.__get_step(model)
-        file_name = f"{iteration:04d}.jsonl"
+        file_name = f"{iteration:04d}.parquet"
 
-        # Write the logs to the file
-        with open(f"{parent_dir}/{file_name}", "w") as f:
-            f.write(serialize_trajectory_groups(trajectory_groups))
+        # Write the logs to Parquet file (with ZSTD compression)
+        write_trajectory_groups_parquet(trajectory_groups, f"{parent_dir}/{file_name}")
 
         # Collect all metrics (including reward) across all trajectories
         all_metrics: dict[str, list[float]] = {"reward": [], "exception_rate": []}

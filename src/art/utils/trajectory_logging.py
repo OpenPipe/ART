@@ -1,120 +1,182 @@
-import json
-from typing import Any, Iterator, cast
+"""
+Parquet-based trajectory logging.
 
-import yaml
+This module provides efficient Parquet serialization for trajectory data,
+offering ~25x compression compared to JSONL and fast columnar queries.
+
+For legacy JSONL support and migration utilities, see trajectory_migration.py.
+"""
+
+import json
+from pathlib import Path
 
 from art import Trajectory, TrajectoryGroup
-from art.trajectories import History
-from art.types import Choice, Message, MessageOrChoice
 
 
-# serialize trajectory groups to a jsonl string
-def serialize_trajectory_groups(trajectory_groups: list[TrajectoryGroup]) -> str:
-    group_dicts = [
-        trajectory_group_to_dict(trajectory_group)
-        for trajectory_group in trajectory_groups
-    ]
-
-    return "\n".join(json.dumps(group_dict) for group_dict in group_dicts)
-
-
-def trajectory_group_to_dict(trajectory_group: TrajectoryGroup) -> dict[str, Any]:
-    trajectory_dicts = []
-    for trajectory in trajectory_group.trajectories:
-        if not isinstance(trajectory, Trajectory):
-            # remove exceptions
-            continue
-        trajectory_dicts.append(trajectory_to_dict(trajectory))
-
-    return {
-        "trajectories": trajectory_dicts,
-    }
-
-
-def history_to_dict(history: History) -> dict[str, Any]:
-    messages_and_choices = [
-        message_or_choice_to_dict(message_or_choice)
-        for message_or_choice in history.messages_and_choices
-    ]
-
-    return {"messages_and_choices": messages_and_choices, "tools": history.tools}
-
-
-def trajectory_to_dict(trajectory: Trajectory) -> dict[str, Any]:
-    messages_and_choices = [
-        message_or_choice_to_dict(message_or_choice)
-        for message_or_choice in trajectory.messages_and_choices
-    ]
-
-    return {
-        "reward": trajectory.reward,
-        "metrics": trajectory.metrics,
-        "metadata": trajectory.metadata,
-        "messages_and_choices": messages_and_choices,
-        "tools": trajectory.tools,
-        "additional_histories": (
-            [history_to_dict(h) for h in trajectory.additional_histories]
-            if trajectory.additional_histories
-            else trajectory.additional_histories
-        ),
-        "logs": trajectory.logs,
-    }
-
-
-def message_or_choice_to_dict(message_or_choice: MessageOrChoice) -> dict[str, Any]:
-    # messages are sometimes stored as dicts, so we need to handle both cases
-    item_dict = (
-        message_or_choice
-        if isinstance(message_or_choice, dict)
-        else message_or_choice.to_dict()
-    )
-
-    if "logprobs" in item_dict:
-        # item is a choice with logprobs, remove the logprobs
-        item_dict.pop("logprobs")
-
-    if "content" in item_dict and isinstance(item_dict["content"], Iterator):
-        item_dict["content"] = list(item_dict["content"])  # type: ignore
-
-    return dict(item_dict)
-
-
-def deserialize_trajectory_groups(serialized: str) -> list[TrajectoryGroup]:
-    # Try to parse as JSONL first (new format)
-    try:
-        loaded_groups = [
-            json.loads(line) for line in serialized.strip().split("\n") if line
-        ]
-    except json.JSONDecodeError:
-        # Fall back to YAML parsing (old format)
-        loaded_groups = yaml.load(serialized, Loader=yaml.SafeLoader)
-    return [dict_to_trajectory_group(group) for group in loaded_groups]
-
-
-def dict_to_trajectory_group(dict: dict[str, Any]) -> TrajectoryGroup:
-    return TrajectoryGroup(
-        trajectories=[
-            dict_to_trajectory(trajectory) for trajectory in dict["trajectories"]
-        ],
-        exceptions=[],
-    )
-
-
-def dict_to_trajectory(dict: dict[str, Any]) -> Trajectory:
-    return Trajectory(
-        messages_and_choices=[
-            dict_to_message_or_choice(message_or_choice)
-            for message_or_choice in dict["messages_and_choices"]
-        ],
-        reward=dict["reward"],
-        metrics=dict["metrics"],
-        metadata=dict["metadata"],
-        logs=dict["logs"],
-    )
-
-
-def dict_to_message_or_choice(dict: dict[str, Any]) -> MessageOrChoice:
-    if "message" in dict:
-        return Choice(**dict)
+def _flatten_message(msg) -> dict:
+    """Convert a message or Choice to flat parquet format."""
+    if "finish_reason" in msg:
+        # Choice format - extract inner message, mark as trainable
+        inner = msg.get("message", {})
+        tool_calls = inner.get("tool_calls")
+        return {
+            "role": inner.get("role"),
+            "content": inner.get("content"),
+            "tool_calls": json.dumps(tool_calls) if tool_calls else None,
+            "tool_call_id": None,
+            "trainable": True,
+        }
     else:
-        return cast(Message, dict)
+        # Regular message
+        tool_calls = msg.get("tool_calls")
+        return {
+            "role": msg.get("role"),
+            "content": msg.get("content"),
+            "tool_calls": json.dumps(tool_calls) if tool_calls else None,
+            "tool_call_id": msg.get("tool_call_id"),
+            "trainable": False,
+        }
+
+
+def _unflatten_message(msg_dict: dict) -> dict:
+    """Convert flat parquet format back to message dict."""
+    result = {
+        "role": msg_dict["role"],
+        "content": msg_dict["content"],
+    }
+    if msg_dict.get("tool_calls"):
+        result["tool_calls"] = json.loads(msg_dict["tool_calls"])
+    if msg_dict.get("tool_call_id"):
+        result["tool_call_id"] = msg_dict["tool_call_id"]
+    return result
+
+
+def write_trajectory_groups_parquet(
+    trajectory_groups: list[TrajectoryGroup],
+    path: str | Path,
+) -> None:
+    """
+    Write trajectory groups to a Parquet file with ZSTD compression.
+
+    Args:
+        trajectory_groups: List of TrajectoryGroup objects to serialize.
+        path: Output path for the Parquet file.
+    """
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    rows = []
+    for group_index, group in enumerate(trajectory_groups):
+        for trajectory in group.trajectories:
+            if not isinstance(trajectory, Trajectory):
+                continue
+
+            # Flatten messages
+            messages = []
+            for msg in trajectory.messages_and_choices:
+                # Handle both dict and Choice/Message objects
+                if hasattr(msg, "to_dict"):
+                    msg = msg.to_dict()
+                elif hasattr(msg, "finish_reason"):
+                    # Choice object - convert to dict format
+                    msg = {
+                        "finish_reason": msg.finish_reason,
+                        "index": msg.index,
+                        "message": msg.message.to_dict() if hasattr(msg.message, "to_dict") else msg.message,
+                    }
+                messages.append(_flatten_message(msg))
+
+            rows.append({
+                "group_index": group_index,
+                "reward": trajectory.reward,
+                "metrics": json.dumps(trajectory.metrics) if trajectory.metrics else None,
+                "metadata": json.dumps(trajectory.metadata) if trajectory.metadata else None,
+                "tools": json.dumps(trajectory.tools) if trajectory.tools else None,
+                "logs": trajectory.logs if trajectory.logs else None,
+                "messages": messages,
+            })
+
+    # Define schema
+    message_type = pa.struct([
+        ("role", pa.string()),
+        ("content", pa.string()),
+        ("tool_calls", pa.string()),
+        ("tool_call_id", pa.string()),
+        ("trainable", pa.bool_()),
+    ])
+
+    schema = pa.schema([
+        ("group_index", pa.int64()),
+        ("reward", pa.float64()),
+        ("metrics", pa.string()),
+        ("metadata", pa.string()),
+        ("tools", pa.string()),
+        ("logs", pa.list_(pa.string())),
+        ("messages", pa.list_(message_type)),
+    ])
+
+    if not rows:
+        table = pa.table({name: [] for name in schema.names}, schema=schema)
+        pq.write_table(table, path, compression="zstd")
+        return
+
+    table = pa.Table.from_pylist(rows, schema=schema)
+    pq.write_table(table, path, compression="zstd")
+
+
+def read_trajectory_groups_parquet(path: str | Path) -> list[TrajectoryGroup]:
+    """
+    Read trajectory groups from a Parquet file.
+
+    Args:
+        path: Path to the Parquet file.
+
+    Returns:
+        List of TrajectoryGroup objects.
+    """
+    import duckdb
+
+    con = duckdb.connect(":memory:")
+    rows = con.execute(f"SELECT * FROM '{path}' ORDER BY group_index").fetchall()
+    columns = [desc[0] for desc in con.description]
+
+    groups_dict: dict[int, list[Trajectory]] = {}
+
+    for row in rows:
+        row_dict = dict(zip(columns, row))
+
+        if row_dict.get("reward") is None and row_dict.get("messages") is None:
+            continue
+
+        group_index = row_dict.get("group_index", 0)
+
+        # Convert messages
+        messages_and_choices = []
+        for msg in row_dict.get("messages") or []:
+            # Handle tuple format from DuckDB
+            if not isinstance(msg, dict):
+                msg = {
+                    "role": msg[0],
+                    "content": msg[1],
+                    "tool_calls": msg[2],
+                    "tool_call_id": msg[3],
+                    "trainable": msg[4],
+                }
+            messages_and_choices.append(_unflatten_message(msg))
+
+        trajectory = Trajectory(
+            messages_and_choices=messages_and_choices,
+            reward=row_dict["reward"],
+            metrics=json.loads(row_dict["metrics"]) if row_dict.get("metrics") else {},
+            metadata=json.loads(row_dict["metadata"]) if row_dict.get("metadata") else {},
+            logs=row_dict.get("logs") or [],
+        )
+
+        if group_index not in groups_dict:
+            groups_dict[group_index] = []
+        groups_dict[group_index].append(trajectory)
+
+    return [
+        TrajectoryGroup(trajectories=groups_dict[idx], exceptions=[])
+        for idx in sorted(groups_dict.keys())
+    ]
