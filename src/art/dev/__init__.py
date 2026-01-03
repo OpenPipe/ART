@@ -3,6 +3,8 @@ from .model import (
     InitArgs,
     InternalModelConfig,
     PeftArgs,
+    TinkerArgs,
+    TinkerTrainingClientArgs,
     TrainerArgs,
 )
 from .openai_server import OpenAIServerConfig, ServerArgs, get_openai_server_config
@@ -14,6 +16,8 @@ __all__ = [
     "InternalModelConfig",
     "InitArgs",
     "PeftArgs",
+    "TinkerArgs",
+    "TinkerTrainingClientArgs",
     "TrainerArgs",
     "get_openai_server_config",
     "OpenAIServerConfig",

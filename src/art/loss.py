@@ -15,6 +15,7 @@ class Loss(BaseModel):
     mean_policy_loss: torch.Tensor
     mean_kl: torch.Tensor
     mean_entropy: torch.Tensor | None
+    policy_loss_sum: torch.Tensor
     probs_corr: torch.Tensor
 
 
@@ -135,6 +136,7 @@ def loss_fn(
         mean_policy_loss=mean_policy_loss,
         mean_kl=mean_kl,
         mean_entropy=mean_entropy,
+        policy_loss_sum=policy_loss.sum(),
         probs_corr=probs_corr,
     )
 

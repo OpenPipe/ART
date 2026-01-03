@@ -18,6 +18,7 @@ from vllm.v1.engine.async_llm import AsyncLLM
 
 from .. import dev, types
 from ..local.checkpoints import get_last_checkpoint_dir
+from ..preprocessing.inputs import TrainInputs, create_train_inputs
 from ..preprocessing.pack import (
     DiskPackedTensors,
     PackedTensors,
@@ -42,48 +43,6 @@ class SupportsLoadLora(Protocol):
     """Protocol for models that support the optimized load_lora method."""
 
     def load_lora(self, lora_path: str, load_tensors: bool = True) -> LoRARequest: ...
-
-
-class TrainInputs(PackedTensors):
-    """Training inputs with config attached."""
-
-    config: types.TrainConfig
-    _config: dev.TrainConfig
-    return_new_logprobs: bool
-
-
-def create_train_inputs(
-    packed_tensors: PackedTensors,
-    offset: int,
-    config: types.TrainConfig,
-    _config: dev.TrainConfig,
-    warmup: bool,
-) -> TrainInputs:
-    """Create TrainInputs for a single batch offset."""
-    return TrainInputs(
-        **{
-            k: (
-                v[offset : offset + 1, :1024]
-                if warmup and v.dim() > 1
-                else v[offset : offset + 1]
-            )
-            for k, v in packed_tensors.items()
-            if isinstance(v, torch.Tensor)
-        },
-        pixel_values=(
-            [None] if warmup else packed_tensors["pixel_values"][offset : offset + 1]
-        ),
-        image_grid_thw=(
-            [None] if warmup else packed_tensors["image_grid_thw"][offset : offset + 1]
-        ),
-        config=(
-            config.model_copy(update={"lr": 1e-9, "beta": 0.0, "kl_coef": 0.0})
-            if warmup
-            else config
-        ),
-        _config=_config,
-        return_new_logprobs=False,
-    )
 
 
 def precalculate_new_logprobs(

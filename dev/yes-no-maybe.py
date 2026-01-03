@@ -40,19 +40,26 @@ def with_quotes(w: str) -> str:
 async def main():
     load_dotenv()
 
-    backend = LocalBackend()
+    backend = LocalBackend(in_process=True)
     global model
     base_model = os.environ.get("BASE_MODEL", "Qwen/Qwen3-30B-A3B-Instruct-2507")
     model = art.TrainableModel(
-        name=os.environ.get("MODEL_NAME", "011"),
+        name=os.environ.get("MODEL_NAME", "012"),
         project="yes-no-maybe",
         base_model=base_model,
         _internal_config=art.dev.InternalModelConfig(
-            engine_args=art.dev.EngineArgs(
-                max_lora_rank=1,
-            ),
-            peft_args=art.dev.PeftArgs(
-                r=1,
+            # engine_args=art.dev.EngineArgs(
+            #     max_lora_rank=1,
+            # ),
+            # peft_args=art.dev.PeftArgs(
+            #     r=1,
+            # ),
+            tinker_args=art.dev.TinkerArgs(
+                renderer_name="qwen3_instruct",
+                training_client_args=art.dev.TinkerTrainingClientArgs(
+                    rank=1,
+                    train_unembed=False,
+                ),
             ),
         ),
     )
@@ -68,7 +75,7 @@ async def main():
     ]
 
     openai_client = model.openai_client()
-    max_steps = int(os.environ.get("NUM_STEPS", "4"))
+    max_steps = int(os.environ.get("NUM_STEPS", "20"))
     start_step = await model.get_step()
     for _ in range(start_step, start_step + max_steps):
         train_groups = await art.gather_trajectory_groups(

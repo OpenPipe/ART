@@ -129,8 +129,6 @@ class LocalBackend(Backend):
 
     async def _get_service(self, model: TrainableModel) -> ModelService:
         from ..dev.get_model_config import get_model_config
-        from ..torchtune.service import TorchtuneService
-        from ..unsloth.service import UnslothService
 
         if model.name not in self._services:
             config = get_model_config(
@@ -138,10 +136,21 @@ class LocalBackend(Backend):
                 output_dir=get_model_dir(model=model, art_path=self._path),
                 config=model._internal_config,
             )
-            if config.get("torchtune_args") is not None:
+            if config.get("tinker_args") is not None:
+                from ..tinker_service import TinkerService
+
+                service_class = TinkerService
+            elif config.get("torchtune_args") is not None:
+                from ..torchtune.service import TorchtuneService
+
                 service_class = TorchtuneService
             else:
+                from ..unsloth.service import UnslothService
+
                 service_class = UnslothService
+                # When moving the service to a child process, import unsloth
+                # early to maximize optimizations
+                os.environ["IMPORT_UNSLOTH"] = "1"
             self._services[model.name] = service_class(
                 model_name=model.name,
                 base_model=model.base_model,
@@ -151,9 +160,6 @@ class LocalBackend(Backend):
             if not self._in_process:
                 # Kill all "model-service" processes to free up GPU memory
                 subprocess.run(["pkill", "-9", "model-service"])
-                # When moving the service to a child process, import unsloth
-                # early to maximize optimizations
-                os.environ["IMPORT_UNSLOTH"] = "1"
                 self._services[model.name] = move_to_child_process(
                     self._services[model.name],
                     process_name="model-service",
@@ -509,9 +515,9 @@ class LocalBackend(Backend):
             num_gradient_steps = int(
                 result.pop("num_gradient_steps", estimated_gradient_steps)
             )
-            assert num_gradient_steps == estimated_gradient_steps, (
-                f"num_gradient_steps {num_gradient_steps} != estimated_gradient_steps {estimated_gradient_steps}"
-            )
+            assert (
+                num_gradient_steps == estimated_gradient_steps
+            ), f"num_gradient_steps {num_gradient_steps} != estimated_gradient_steps {estimated_gradient_steps}"
             results.append(result)
             yield {**result, "num_gradient_steps": num_gradient_steps}
             pbar.update(1)
