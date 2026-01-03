@@ -105,7 +105,7 @@ class TinkerService:
             for mask, lp in zip(masks, logprobs_list):
                 logprobs[mask] = lp
             loss = loss_fn(inputs, logprobs.unsqueeze(0), None, None, _config)
-            return loss.policy_loss_sum, {"policy_loss": loss.mean_policy_loss.item()}
+            return loss.mean_policy_loss, {"policy_loss": loss.mean_policy_loss.item()}
 
         shifted_tokens = shift_tensor(packed_tensors["tokens"], 0)
         shifted_weights = shift_tensor(packed_tensors["weights"], 0.0)
