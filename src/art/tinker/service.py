@@ -314,9 +314,9 @@ class TinkerService:
             choices: list[Choice] = []
             for i, sequence in enumerate(sample_response.sequences):
                 assert sequence.logprobs is not None, "Logprobs are required"
-                assert len(sequence.tokens) == len(
-                    sequence.logprobs
-                ), "Tokens and logprobs must have the same length"
+                assert len(sequence.tokens) == len(sequence.logprobs), (
+                    "Tokens and logprobs must have the same length"
+                )
                 message, _ = state.renderer.parse_response(sequence.tokens)
                 choices.append(
                     Choice(
