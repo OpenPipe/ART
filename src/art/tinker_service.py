@@ -4,6 +4,7 @@ from dataclasses import dataclass
 from functools import cached_property, partial
 import os
 from pathlib import Path
+import socket
 import time
 from typing import AsyncIterator, Generator
 import uuid
@@ -33,6 +34,18 @@ from .preprocessing.pack import (
     packed_tensors_from_dir,
 )
 
+# Patch Tinker's Qwen3InstructRenderer which mistakenly expects "args" instead of "arguments" in tool calls.
+_parse_tool_call = renderers.Qwen3InstructRenderer._parse_tool_call
+
+
+def _patched_parse_tool_call(
+    self, tool_call_str: str
+) -> list[renderers.ToolCall] | None:
+    return _parse_tool_call(self, tool_call_str.replace('"arguments": ', '"args": '))
+
+
+renderers.Qwen3InstructRenderer._parse_tool_call = _patched_parse_tool_call
+
 
 @contextmanager
 def log_timing(msg: str) -> Generator[None, None, None]:
@@ -50,7 +63,6 @@ class TinkerService:
     config: dev.InternalModelConfig
     output_dir: str
     _openai_server_task: asyncio.Task[None] | None = None
-    _server: uvicorn.Server | None = None
 
     async def start_openai_server(self, config: dev.OpenAIServerConfig | None) -> None:
         self._openai_server_task = asyncio.create_task(
@@ -108,7 +120,6 @@ class TinkerService:
             return loss.mean_policy_loss, {"policy_loss": loss.mean_policy_loss.item()}
 
         shifted_tokens = shift_tensor(packed_tensors["tokens"], 0)
-        shifted_weights = shift_tensor(packed_tensors["weights"], 0.0)
 
         for i in range(packed_tensors["tokens"].shape[0]):
             masks = [
@@ -130,7 +141,9 @@ class TinkerService:
                                     shifted_tokens[i][mask]
                                 ),
                                 "weights": tinker.TensorData.from_torch(
-                                    shifted_weights[i][mask]
+                                    torch.ones_like(
+                                        shifted_tokens[i][mask], dtype=torch.float32
+                                    )
                                 ),
                             },
                             model_input=tinker.ModelInput.from_ints(
@@ -257,7 +270,7 @@ class TinkerService:
             return "# Tinker service metrics\n"
 
         @app.post("/v1/completions")
-        async def completions(request: Request) -> dict:
+        async def completions() -> dict:
             # Minimal completions endpoint for health checks
             return {"choices": [{"text": ""}]}
 
@@ -265,8 +278,12 @@ class TinkerService:
         async def chat_completions(
             request: Request, body: CompletionCreateParams
         ) -> ChatCompletion:
-            prompt = state.renderer.build_generation_prompt(
-                messages=list(body["messages"])  # type: ignore
+            prompt = tinker.ModelInput.from_ints(
+                tokens=state.renderer.tokenizer.apply_chat_template(
+                    list(body["messages"]),  # type: ignore
+                    tools=body.get("tools"),  # type: ignore
+                    add_generation_prompt=True,
+                )
             )
             sample_response = await state.sampler_client.sample_async(
                 prompt=prompt,
@@ -340,11 +357,25 @@ class TinkerService:
         server_config = uvicorn.Config(
             app,
             host=config.get("host", "0.0.0.0"),
-            port=config.get("port", 8000),
+            port=config.get("port", get_free_port()),
             log_level="error",
         )
-        self._server = uvicorn.Server(server_config)
-        await self._server.serve()
+        server = uvicorn.Server(server_config)
+        await server.serve()
+
+
+def get_free_port() -> int:
+    """
+    Returns the first free port >= 8000.
+    """
+    port = 8000
+    while True:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            try:
+                s.bind(("", port))
+                return port
+            except OSError:
+                port += 1
 
 
 @dataclass
