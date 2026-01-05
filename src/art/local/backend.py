@@ -137,7 +137,7 @@ class LocalBackend(Backend):
                 config=model._internal_config,
             )
             if config.get("tinker_args") is not None:
-                from ..tinker_service import TinkerService
+                from ..tinker.service import TinkerService
 
                 service_class = TinkerService
             elif config.get("torchtune_args") is not None:
@@ -248,6 +248,8 @@ class LocalBackend(Backend):
         benchmark: str,
         benchmark_smoothing: float,
     ) -> None:
+        from ..tinker.service import TinkerService
+
         output_dir = get_model_dir(model=model, art_path=self._path)
         # Keep the latest step
         steps_to_keep = [get_model_step(model, self._path)]
@@ -267,7 +269,11 @@ class LocalBackend(Backend):
             print(f'"{output_dir}/history.jsonl" not found')
         except pl.exceptions.ColumnNotFoundError:
             print(f'No "{benchmark}" metric found in history')
-        delete_checkpoints(output_dir, steps_to_keep)
+        service = await self._get_service(model)
+        if isinstance(service, TinkerService):
+            await service.delete_checkpoints(steps_to_keep)
+        else:
+            delete_checkpoints(output_dir, steps_to_keep)
 
     async def _prepare_backend_for_training(
         self,

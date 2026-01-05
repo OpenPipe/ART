@@ -7,13 +7,13 @@ from tqdm import auto as tqdm
 
 from art.serverless.client import Client, ExperimentalTrainingConfig
 
-from . import dev
-from .backend import Backend
-from .trajectories import TrajectoryGroup
-from .types import TrainConfig
+from .. import dev
+from ..backend import Backend
+from ..trajectories import TrajectoryGroup
+from ..types import TrainConfig
 
 if TYPE_CHECKING:
-    from .model import Model, TrainableModel
+    from ..model import Model, TrainableModel
 
 
 class TinkerBackend(Backend):

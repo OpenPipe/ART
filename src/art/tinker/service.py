@@ -4,6 +4,7 @@ from dataclasses import dataclass
 from functools import cached_property, partial
 import os
 from pathlib import Path
+import shutil
 import socket
 import time
 from typing import AsyncIterator, Generator
@@ -21,15 +22,16 @@ from openai.types.chat.chat_completion_token_logprob import ChatCompletionTokenL
 from openai.types.chat.completion_create_params import CompletionCreateParams
 from openai.types.completion_usage import CompletionUsage
 import tinker
+from tinker.lib.public_interfaces.rest_client import RestClient as TinkerRestClient
 from tinker_cookbook import renderers, tokenizer_utils
 import torch
 import uvicorn
 import yaml
 
-from . import dev, types
-from .loss import loss_fn, shift_tensor
-from .preprocessing.inputs import TrainInputs, create_train_inputs
-from .preprocessing.pack import (
+from .. import dev, types
+from ..loss import loss_fn, shift_tensor
+from ..preprocessing.inputs import TrainInputs, create_train_inputs
+from ..preprocessing.pack import (
     DiskPackedTensors,
     packed_tensors_from_dir,
 )
@@ -178,6 +180,16 @@ class TinkerService:
             state.training_client,
         )
 
+    async def delete_checkpoints(self, steps_to_keep: list[int]) -> None:
+        state = await self._state_task
+        await asyncio.gather(
+            *[
+                delete_checkpoint(checkpoint_dir, state.rest_client)
+                for checkpoint_dir in self._checkpoints_path.iterdir()
+                if int(checkpoint_dir.name) not in steps_to_keep
+            ]
+        )
+
     @cached_property
     def _state_task(self) -> asyncio.Task["TinkerState"]:
         return asyncio.create_task(self._get_state())
@@ -185,6 +197,7 @@ class TinkerService:
     async def _get_state(self) -> "TinkerState":
         config = self.config.get("tinker_args") or {"renderer_name": "qwen3_instruct"}
         service_client = tinker.ServiceClient()
+        rest_client = service_client.create_rest_client()
         checkpoint_dir = self._get_last_checkpoint_dir()
         if checkpoint_dir:
             info = yaml.safe_load(open(checkpoint_dir / "info.yaml", "r"))
@@ -212,6 +225,7 @@ class TinkerService:
             )
         return TinkerState(
             service_client=service_client,
+            rest_client=rest_client,
             training_client=training_client,
             sampler_client=sampler_client,
             renderer=renderers.get_renderer(
@@ -364,6 +378,22 @@ class TinkerService:
         await server.serve()
 
 
+async def delete_checkpoint(
+    checkpoint_dir: Path, rest_client: TinkerRestClient
+) -> None:
+    info = yaml.safe_load(open(checkpoint_dir / "info.yaml", "r"))
+    await asyncio.gather(
+        rest_client.delete_checkpoint_from_tinker_path_async(
+            tinker_path=info["state_with_optimizer_path"],
+        ),
+        rest_client.delete_checkpoint_from_tinker_path_async(
+            tinker_path=info["sampler_weights_path"],
+        ),
+    )
+    shutil.rmtree(checkpoint_dir)
+    print(f"Deleted checkpoint {checkpoint_dir.name}")
+
+
 def get_free_port() -> int:
     """
     Returns the first free port >= 8000.
@@ -381,6 +411,7 @@ def get_free_port() -> int:
 @dataclass
 class TinkerState:
     service_client: tinker.ServiceClient
+    rest_client: TinkerRestClient
     training_client: tinker.TrainingClient
     sampler_client: tinker.SamplingClient
     renderer: renderers.Renderer

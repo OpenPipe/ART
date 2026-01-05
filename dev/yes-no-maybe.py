@@ -40,7 +40,7 @@ def with_quotes(w: str) -> str:
 async def main():
     load_dotenv()
 
-    backend = LocalBackend(in_process=True)
+    backend = LocalBackend()
     global model
     base_model = os.environ.get("BASE_MODEL", "Qwen/Qwen3-30B-A3B-Instruct-2507")
     model = art.TrainableModel(
@@ -58,7 +58,6 @@ async def main():
                 renderer_name="qwen3_instruct",
                 training_client_args=art.dev.TinkerTrainingClientArgs(
                     rank=1,
-                    train_unembed=False,
                 ),
             ),
         ),
