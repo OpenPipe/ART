@@ -136,7 +136,8 @@ class LocalBackend(Backend):
                 output_dir=get_model_dir(model=model, art_path=self._path),
                 config=model._internal_config,
             )
-            if config.get("tinker_args") is not None:
+            is_tinker = config.get("tinker_args") is not None
+            if is_tinker:
                 from ..tinker.service import TinkerService
 
                 service_class = TinkerService
@@ -162,7 +163,7 @@ class LocalBackend(Backend):
                 subprocess.run(["pkill", "-9", "model-service"])
                 self._services[model.name] = move_to_child_process(
                     self._services[model.name],
-                    process_name="model-service",
+                    process_name="tinker-service" if is_tinker else "model-service",
                 )
         return self._services[model.name]
 
