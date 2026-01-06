@@ -24,7 +24,7 @@ backend = [
     "bitsandbytes>=0.45.2",
     "unsloth==2025.12.9",
     "unsloth-zoo==2025.12.7",
-    "vllm>=0.11.0",
+    "vllm==0.13.0",
     "torchtune",
     "torch>=2.8.0",
     "torchao==0.14.1",
