@@ -5,7 +5,7 @@ description = "The OpenPipe Agent Reinforcement Training (ART) library"
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
-    "openai>=1.65.5",
+    "openai>=2.14.0",
     "typer>=0.15.2",
     "litellm==1.74.1",
     "weave>=0.51.51",
