@@ -1,3 +1,4 @@
+import os
 from abc import ABC, abstractmethod
 from typing import List, Literal, Optional
 
@@ -193,7 +194,12 @@ sys.exit(exit_code)
         )
         if exit_code != 0:
             # Copy the tool and its dependencies into the sandbox
-            host_tool_path = "/home/brad/art/dev/swebench/tools/edit_anthropic/bin/str_replace_editor"
+
+            # Get the path relative to this file
+            current_dir = os.path.dirname(os.path.abspath(__file__))
+            host_tool_path = os.path.join(
+                current_dir, "../tools/edit_anthropic/bin/str_replace_editor"
+            )
 
             # Read the tool from host
             with open(host_tool_path, "r") as f:

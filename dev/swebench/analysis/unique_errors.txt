@@ -1,0 +1,92 @@
+Unique Error Messages: 7
+================================================================================
+
+Error (76 occurrences):
+----------------------------------------
+Failed to execute command: <html>
+<head><title>504 Gateway Time-out</title></head>
+<body>
+<center><h1>504 Gateway Time-out</h1></center>
+</body>
+</html>
+
+
+Affected instances:
+  - conan-io__conan.86f29e13.lm_rewrite__9dp34dn6 (f2p_initial_error)
+  - sqlfluff__sqlfluff.50a1c4b6.func_pm_ctrl_invert_if__w8e3m8ag (f2p_initial_error)
+  - tobymao__sqlglot.036601ba.lm_rewrite__jfj6trkz (f2p_initial_error)
+  - conan-io__conan.86f29e13.pr_10717 (f2p_initial_error)
+  - tobymao__sqlglot.036601ba.lm_rewrite__4x4jcxkb (f2p_initial_error)
+  ... and 71 more
+
+================================================================================
+
+Error (64 occurrences):
+----------------------------------------
+Failed to execute command: command execution timeout
+
+Affected instances:
+  - getnikola__nikola.0f4c230e.lm_rewrite__ydwl8yud (f2p_initial_error)
+  - getnikola__nikola.0f4c230e.combine_module__6cabwzd7 (f2p_initial_error)
+  - getnikola__nikola.0f4c230e.lm_rewrite__6gp9a2cp (f2p_initial_error)
+  - getnikola__nikola.0f4c230e.lm_rewrite__mnwy4oou (f2p_initial_error)
+  - getnikola__nikola.0f4c230e.lm_rewrite__qjc66i7w (f2p_initial_error)
+  ... and 59 more
+
+================================================================================
+
+Error (31 occurrences):
+----------------------------------------
+Failed to execute command: 
+
+Affected instances:
+  - getnikola__nikola.0f4c230e.combine_module__nhjk0grt (f2p_initial_error)
+  - tobymao__sqlglot.036601ba.lm_rewrite__fpqolxwl (f2p_initial_error)
+  - tobymao__sqlglot.036601ba.lm_rewrite__wz366ul0 (f2p_post_error)
+  - tobymao__sqlglot.036601ba.lm_rewrite__aaducvrr (f2p_post_error)
+  - getnikola__nikola.0f4c230e.combine_module__nhjk0grt (f2p_post_error)
+  ... and 26 more
+
+================================================================================
+
+Error (10 occurrences):
+----------------------------------------
+Sandbox error: Failed to create sandbox: Failed to create and start sandbox within 60 seconds timeout period.
+
+Affected instances:
+  - facebookresearch__fvcore.a491d5b9.func_pm_ctrl_shuffle__kd43vy4l (error)
+  - pygments__pygments.27649ebb.pr_2659 (error)
+  - pygments__pygments.27649ebb.lm_rewrite__2s9fgj0c (error)
+  - python-trio__trio.cfbbe2c1.lm_rewrite__uhrd1ebw (error)
+  - pygments__pygments.27649ebb.combine_file__x44f9cqe (error)
+  ... and 5 more
+
+================================================================================
+
+Error (1 occurrences):
+----------------------------------------
+Failed to apply patch: Failed to execute command: command execution timeout
+
+Affected instances:
+  - Project-MONAI__MONAI.a09c1f08.func_pm_remove_assign__70jyz2gr (error)
+
+================================================================================
+
+Error (1 occurrences):
+----------------------------------------
+Sandbox error: Failed to create sandbox: Failure during waiting for sandbox to start: Sandbox cc8cbe9c-0846-4fa9-8df1-b8663b8dadce failed to start with state: error, error reason: timeout waiting for daemon to start
+
+Affected instances:
+  - sunpy__sunpy.f8edfd5c.lm_rewrite__t1d7mg0t (error)
+
+================================================================================
+
+Error (1 occurrences):
+----------------------------------------
+Failed to apply patch: Failed to execute command: Missing parameter name at 6: https://git.new/pathToRegexpError
+
+Affected instances:
+  - mozilla__bleach.73871d76.lm_rewrite__01ahwe6g (error)
+
+================================================================================
+

@@ -4,6 +4,12 @@ from typing import AsyncIterator
 
 import daytona_sdk
 import modal
+from tenacity import (
+    retry,
+    retry_if_exception_message,
+    stop_after_attempt,
+    wait_exponential,
+)
 
 from .daytona import DaytonaSandbox
 from .modal import ModalSandbox
@@ -14,6 +20,14 @@ modal_app_task: asyncio.Task[modal.App] | None = None
 
 # Enable Modal output to see image build logs
 modal.enable_output()
+
+
+# Retry decorator for sandbox creation
+create_sandbox_retry = retry(
+    stop=stop_after_attempt(5),
+    wait=wait_exponential(multiplier=2, min=2, max=30),
+    retry=retry_if_exception_message(match="No available runners|timeout|504 Gateway"),
+)
 
 
 @asynccontextmanager
@@ -38,23 +52,29 @@ async def new_sandbox(
     """
     if provider == "daytona":
         global daytona
-        for _ in range(2):
+
+        @create_sandbox_retry
+        async def create_daytona_sandbox():
+            global daytona
             try:
-                sandbox = await daytona.create(
+                return await daytona.create(
                     daytona_sdk.CreateSandboxFromImageParams(image=image),
                     timeout=timeout,
                 )
-                break
             except daytona_sdk.DaytonaError as e:
                 if "Event loop is closed" in str(e):
                     await daytona.close()
                     daytona = daytona_sdk.AsyncDaytona()
-                    continue
                 raise
+
         try:
+            sandbox = await create_daytona_sandbox()
             yield DaytonaSandbox(sandbox)
         finally:
-            await sandbox.delete()
+            try:
+                await sandbox.delete()
+            except Exception:
+                pass
     else:
         global modal_app_task
         if modal_app_task is None:

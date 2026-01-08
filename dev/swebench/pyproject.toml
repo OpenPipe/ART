@@ -7,9 +7,10 @@ dependencies = [
     "daytona-sdk>=0.21.5",
     "langfuse>=2.60.7",
     "modal>=1.0.1",
-    "openpipe-art",
+    "openpipe-art[backend,plotting]",
     "sweagent",
     "swebench>=4.0.3",
+    "tenacity>=9.1.2",
 ]
 
 [tool.uv.sources]
