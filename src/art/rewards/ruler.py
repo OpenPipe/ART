@@ -50,6 +50,26 @@ DEFAULT_RUBRIC = dedent(
 as RULER extracts task understanding from the system prompts in the trajectories."""
 
 
+def _is_ollama_model(model: str) -> bool:
+    """Check if the model is an Ollama model."""
+    return model.startswith("ollama/") or model.startswith("ollama_chat/")
+
+
+def _get_response_format_for_ollama(pydantic_model: type[BaseModel]) -> dict:
+    """Convert Pydantic model to explicit JSON schema format for Ollama.
+
+    LiteLLM requires an explicit JSON schema format for Ollama models to
+    produce structured output via the /api/chat endpoint.
+    """
+    return {
+        "type": "json_schema",
+        "json_schema": {
+            "name": pydantic_model.__name__,
+            "schema": pydantic_model.model_json_schema(),
+        },
+    }
+
+
 async def ruler(
     message_lists: list[list[ChatCompletionMessageParam]],
     judge_model: str = "openai/o3",
@@ -172,13 +192,21 @@ async def ruler(
         {"role": "user", "content": user_text},
     ]
 
+    # Prepare response_format based on model type
+    # Ollama models require explicit JSON schema format for structured output
+    if _is_ollama_model(judge_model):
+        response_format = _get_response_format_for_ollama(Response)
+    else:
+        response_format = Response
+
     response = await acompletion(
         model=judge_model,
         messages=messages,
-        response_format=Response,
+        response_format=response_format,
         caching=False,
         **extra_litellm_params if extra_litellm_params else {},
     )
+
     assert isinstance(response, ModelResponse)
 
     if len(response.choices) == 0:
