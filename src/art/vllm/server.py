@@ -44,11 +44,9 @@ async def openai_server_task(
     # We must subclass ChatCompletionRequest before importing api_server
     # or logprobs will not always be returned
     subclass_chat_completion_request()
-    from vllm.entrypoints.openai import api_server
-
     # Capture the OpenAIServingModels instance so dynamically added LoRAs
     # are reflected in the model list.
-    from vllm.entrypoints.openai import serving_models
+    from vllm.entrypoints.openai import api_server, serving_models
 
     serving_models_any = cast(Any, serving_models)
     if not getattr(serving_models_any, "_art_openai_serving_models_patched", False):
