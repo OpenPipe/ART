@@ -173,7 +173,13 @@ def run(host: str = "0.0.0.0", port: int = 7999) -> None:
     app.post("/close")(backend.close)
     app.post("/register")(backend.register)
     app.post("/_get_step")(backend._get_step)
-    app.post("/_delete_checkpoints")(backend._delete_checkpoints)
+
+    @app.post("/_delete_checkpoint_files")
+    async def _delete_checkpoint_files(
+        model: TrainableModel = Body(...),
+        steps_to_keep: list[int] = Body(...),
+    ):
+        await backend._delete_checkpoint_files(model, steps_to_keep)
 
     @app.post("/_prepare_backend_for_training")
     async def _prepare_backend_for_training(
@@ -182,13 +188,7 @@ def run(host: str = "0.0.0.0", port: int = 7999) -> None:
     ):
         return await backend._prepare_backend_for_training(model, config)
 
-    @app.post("/_log")
-    async def _log(
-        model: Model,
-        trajectory_groups: list[TrajectoryGroup],
-        split: str = Body("val"),
-    ):
-        await backend._log(model, trajectory_groups, split)
+    # Note: /_log endpoint removed - logging now handled by frontend (Model.log())
 
     @app.post("/_train_model")
     async def _train_model(

@@ -55,16 +55,14 @@ class Backend:
         response.raise_for_status()
         return response.json()
 
-    async def _delete_checkpoints(
+    async def _delete_checkpoint_files(
         self,
         model: "TrainableModel",
-        benchmark: str,
-        benchmark_smoothing: float,
+        steps_to_keep: list[int],
     ) -> None:
         response = await self._client.post(
-            "/_delete_checkpoints",
-            json=model.safe_model_dump(),
-            params={"benchmark": benchmark, "benchmark_smoothing": benchmark_smoothing},
+            "/_delete_checkpoint_files",
+            json={"model": model.safe_model_dump(), "steps_to_keep": steps_to_keep},
         )
         response.raise_for_status()
 
@@ -81,23 +79,6 @@ class Backend:
         response.raise_for_status()
         base_url, api_key = tuple(response.json())
         return base_url, api_key
-
-    async def _log(
-        self,
-        model: "Model",
-        trajectory_groups: list[TrajectoryGroup],
-        split: str = "val",
-    ) -> None:
-        response = await self._client.post(
-            "/_log",
-            json={
-                "model": model.safe_model_dump(),
-                "trajectory_groups": [tg.model_dump() for tg in trajectory_groups],
-                "split": split,
-            },
-            timeout=None,
-        )
-        response.raise_for_status()
 
     async def _train_model(
         self,

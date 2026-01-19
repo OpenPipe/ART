@@ -1,15 +1,23 @@
+from datetime import datetime
+import json
+import os
 from typing import TYPE_CHECKING, Generic, Iterable, Optional, TypeVar, cast, overload
 
 import httpx
 from openai import AsyncOpenAI, DefaultAsyncHttpxClient
+import polars as pl
 from pydantic import BaseModel
 from typing_extensions import Never
 
 from . import dev
 from .trajectories import Trajectory, TrajectoryGroup
 from .types import TrainConfig
+from .utils.old_benchmarking.calculate_step_metrics import calculate_step_std_dev
+from .utils.trajectory_logging import write_trajectory_groups_parquet
 
 if TYPE_CHECKING:
+    from wandb.sdk.wandb_run import Run
+
     from art.backend import Backend
 
 
@@ -68,10 +76,15 @@ class Model(
     # inference endpoint.
     inference_model_name: str | None = None
 
+    # --- Frontend logging configuration ---
+    base_path: str = ".art"  # Same default as LocalBackend for backward compat
+    report_metrics: list[str] | None = None  # None = default (wandb if key present)
+
     _backend: Optional["Backend"] = None
     _s3_bucket: str | None = None
     _s3_prefix: str | None = None
     _openai_client: AsyncOpenAI | None = None
+    _wandb_run: Optional["Run"] = None  # Private, for lazy wandb initialization
 
     def __init__(
         self,
@@ -84,6 +97,8 @@ class Model(
         inference_api_key: str | None = None,
         inference_base_url: str | None = None,
         inference_model_name: str | None = None,
+        base_path: str = ".art",
+        report_metrics: list[str] | None = None,
         **kwargs: Never,
     ) -> None:
         super().__init__(
@@ -94,6 +109,8 @@ class Model(
             inference_api_key=inference_api_key,
             inference_base_url=inference_base_url,
             inference_model_name=inference_model_name,
+            base_path=base_path,
+            report_metrics=report_metrics,
             **kwargs,
         )
 
@@ -109,6 +126,8 @@ class Model(
         inference_api_key: str | None = None,
         inference_base_url: str | None = None,
         inference_model_name: str | None = None,
+        base_path: str = ".art",
+        report_metrics: list[str] | None = None,
     ) -> "Model[None]": ...
 
     @overload
@@ -123,6 +142,8 @@ class Model(
         inference_api_key: str | None = None,
         inference_base_url: str | None = None,
         inference_model_name: str | None = None,
+        base_path: str = ".art",
+        report_metrics: list[str] | None = None,
     ) -> "Model[ModelConfig]": ...
 
     def __new__(
@@ -225,6 +246,71 @@ class Model(
             return f"{base_name}@{step}"
         return base_name
 
+    def _get_output_dir(self) -> str:
+        """Get the output directory for this model."""
+        return f"{self.base_path}/{self.project}/models/{self.name}"
+
+    def _get_wandb_run(self) -> Optional["Run"]:
+        """Get or create the wandb run for this model."""
+        import wandb
+
+        if "WANDB_API_KEY" not in os.environ:
+            return None
+        if self._wandb_run is None or self._wandb_run._is_finished:
+            run = wandb.init(
+                project=self.project,
+                name=self.name,
+                id=self.name,
+                resume="allow",
+                settings=wandb.Settings(
+                    x_stats_open_metrics_endpoints={
+                        "vllm": "http://localhost:8000/metrics",
+                    },
+                    x_stats_open_metrics_filters=(
+                        "vllm.vllm:num_requests_waiting",
+                        "vllm.vllm:num_requests_running",
+                    ),
+                ),
+            )
+            self._wandb_run = run
+
+            # Define training_step as the x-axis for all metrics.
+            # This allows out-of-order logging (e.g., async validation for previous steps).
+            wandb.define_metric("training_step")
+            wandb.define_metric("train/*", step_metric="training_step")
+            wandb.define_metric("val/*", step_metric="training_step")
+        return self._wandb_run
+
+    def _log_metrics(
+        self,
+        metrics: dict[str, float],
+        split: str,
+        step: int,
+    ) -> None:
+        """Log metrics to history.jsonl and optionally wandb."""
+        prefixed = {f"{split}/{k}": v for k, v in metrics.items()}
+        output_dir = self._get_output_dir()
+
+        # Write to history.jsonl
+        with open(f"{output_dir}/history.jsonl", "a") as f:
+            f.write(
+                json.dumps(
+                    {
+                        k: v for k, v in prefixed.items() if v == v
+                    }  # Filter out NaN values
+                    | {"step": step, "recorded_at": datetime.now().isoformat()}
+                )
+                + "\n"
+            )
+
+        # Log to wandb if enabled
+        should_log_wandb = (
+            self.report_metrics is None and "WANDB_API_KEY" in os.environ
+        ) or (self.report_metrics is not None and "wandb" in self.report_metrics)
+        if should_log_wandb:
+            if run := self._get_wandb_run():
+                run.log({"training_step": step, **prefixed})
+
     async def log(
         self,
         trajectories: Iterable[Trajectory | BaseException] | Iterable[TrajectoryGroup],
@@ -237,6 +323,7 @@ class Model(
             trajectories: A batch of trajectories or trajectory groups.
             split: The evaluation's split. Defaults to "val".
         """
+        # Convert to list[TrajectoryGroup]
         if any(isinstance(t, Trajectory) for t in trajectories) or any(
             isinstance(t, BaseException) for t in trajectories
         ):
@@ -247,11 +334,59 @@ class Model(
             ]
         else:
             trajectory_groups = cast(list[TrajectoryGroup], list(trajectories))
-        await self.backend()._log(
-            self,
-            trajectory_groups,
-            split,
+
+        # Get the current step
+        step = await self.get_step() if self.trainable else 0
+
+        # Ensure output directories exist
+        output_dir = self._get_output_dir()
+        trajectories_dir = f"{output_dir}/trajectories/{split}"
+        os.makedirs(trajectories_dir, exist_ok=True)
+
+        # 1. Write parquet
+        file_name = f"{step:04d}.parquet"
+        write_trajectory_groups_parquet(
+            trajectory_groups, f"{trajectories_dir}/{file_name}"
         )
+
+        # 2. Calculate aggregate metrics
+        all_metrics: dict[str, list[float]] = {"reward": [], "exception_rate": []}
+
+        for group in trajectory_groups:
+            for trajectory in group:
+                if isinstance(trajectory, BaseException):
+                    all_metrics["exception_rate"].append(1)
+                    continue
+                else:
+                    all_metrics["exception_rate"].append(0)
+                # Add reward metric
+                all_metrics["reward"].append(trajectory.reward)
+
+                # Collect other custom metrics
+                for metric, value in trajectory.metrics.items():
+                    if metric not in all_metrics:
+                        all_metrics[metric] = []
+                    all_metrics[metric].append(float(value))
+
+        # Calculate averages for all metrics
+        averages: dict[str, float] = {}
+        for metric, values in all_metrics.items():
+            if len(values) > 0:
+                averages[metric] = sum(values) / len(values)
+
+        # Calculate average standard deviation of rewards within groups
+        averages["reward_std_dev"] = calculate_step_std_dev(trajectory_groups)
+
+        # 3. Log metrics (writes to history.jsonl and wandb)
+        self._log_metrics(averages, split, step)
+
+    async def get_step(self) -> int:
+        """
+        Get the model's current training step. For non-trainable models, returns 0.
+        """
+        if self.trainable:
+            return await self.backend()._get_step(self)  # type: ignore
+        return 0
 
 
 # ---------------------------------------------------------------------------
@@ -277,6 +412,8 @@ class TrainableModel(Model[ModelConfig], Generic[ModelConfig]):
         id: str | None = None,
         config: ModelConfig | None = None,
         base_model: str,
+        base_path: str = ".art",
+        report_metrics: list[str] | None = None,
         _internal_config: dev.InternalModelConfig | None = None,
         **kwargs: Never,
     ) -> None:
@@ -287,6 +424,8 @@ class TrainableModel(Model[ModelConfig], Generic[ModelConfig]):
             id=id,
             config=config,
             base_model=base_model,  # type: ignore
+            base_path=base_path,
+            report_metrics=report_metrics,
             **kwargs,
         )
         if _internal_config is not None:
@@ -303,6 +442,8 @@ class TrainableModel(Model[ModelConfig], Generic[ModelConfig]):
         id: str | None = None,
         config: None = None,
         base_model: str,
+        base_path: str = ".art",
+        report_metrics: list[str] | None = None,
         _internal_config: dev.InternalModelConfig | None = None,
     ) -> "TrainableModel[None]": ...
 
@@ -316,6 +457,8 @@ class TrainableModel(Model[ModelConfig], Generic[ModelConfig]):
         id: str | None = None,
         config: ModelConfig,
         base_model: str,
+        base_path: str = ".art",
+        report_metrics: list[str] | None = None,
         _internal_config: dev.InternalModelConfig | None = None,
     ) -> "TrainableModel[ModelConfig]": ...
 
@@ -360,12 +503,6 @@ class TrainableModel(Model[ModelConfig], Generic[ModelConfig]):
             or self.name
         )
 
-    async def get_step(self) -> int:
-        """
-        Get the model's current training step.
-        """
-        return await self.backend()._get_step(self)
-
     async def delete_checkpoints(
         self, best_checkpoint_metric: str = "val/reward"
     ) -> None:
@@ -376,9 +513,28 @@ class TrainableModel(Model[ModelConfig], Generic[ModelConfig]):
             best_checkpoint_metric: The metric to use to determine the best checkpoint.
                 Defaults to "val/reward".
         """
-        await self.backend()._delete_checkpoints(
-            self, best_checkpoint_metric, benchmark_smoothing=1.0
-        )
+        output_dir = self._get_output_dir()
+        steps_to_keep = [await self.get_step()]  # Keep latest
+
+        # Read history.jsonl to find best step
+        try:
+            best_step = (
+                pl.read_ndjson(f"{output_dir}/history.jsonl")
+                .drop_nulls(subset=[best_checkpoint_metric])
+                .group_by("step")
+                .mean()
+                .sort(best_checkpoint_metric)
+                .select(pl.col("step").last())
+                .item()
+            )
+            steps_to_keep.append(best_step)
+        except FileNotFoundError:
+            print(f'"{output_dir}/history.jsonl" not found')
+        except pl.exceptions.ColumnNotFoundError:
+            print(f'No "{best_checkpoint_metric}" metric found in history')
+
+        # Backend only does file deletion
+        await self.backend()._delete_checkpoint_files(self, steps_to_keep)
 
     async def train(
         self,
@@ -396,7 +552,27 @@ class TrainableModel(Model[ModelConfig], Generic[ModelConfig]):
             _config: Additional configuration that is subject to change and
                 not yet part of the public API. Use at your own risk.
         """
-        async for _ in self.backend()._train_model(
-            self, list(trajectory_groups), config, _config or {}, verbose
+        groups_list = list(trajectory_groups)
+        _config = _config or {}
+
+        # 1. Log trajectories first (frontend handles this now)
+        await self.log(groups_list, split="train")
+
+        # 2. Train (backend no longer logs internally)
+        training_metrics: list[dict[str, float]] = []
+        async for metrics in self.backend()._train_model(
+            self, groups_list, config, _config, verbose
         ):
-            pass
+            training_metrics.append(metrics)
+
+        # 3. Log training metrics (loss, gradient norms, etc.)
+        if training_metrics:
+            avg_metrics = {
+                k: sum(d.get(k, 0) for d in training_metrics)
+                / sum(1 for d in training_metrics if k in d)
+                for k in {k for d in training_metrics for k in d}
+                if k != "num_gradient_steps"
+            }
+            # Get the current step after training
+            step = await self.get_step()
+            self._log_metrics(avg_metrics, "train", step)

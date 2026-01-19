@@ -1,5 +1,4 @@
 import asyncio
-from datetime import datetime
 import json
 import math
 import os
@@ -11,32 +10,24 @@ import warnings
 import aiohttp
 import numpy as np
 from openai import AsyncOpenAI
-import polars as pl
 import torch
 from tqdm import auto as tqdm
 from transformers import AutoImageProcessor, AutoTokenizer
 from transformers.image_processing_utils import BaseImageProcessor
 from transformers.tokenization_utils_base import PreTrainedTokenizerBase
 from typing_extensions import Self
-import wandb
-from wandb.sdk.wandb_run import Run
-import weave
-from weave.trace.weave_client import WeaveClient
 
-from art.utils.old_benchmarking.calculate_step_metrics import calculate_step_std_dev
 from art.utils.output_dirs import (
     get_default_art_path,
     get_model_dir,
     get_output_dir_from_model_properties,
     get_step_checkpoint_dir,
-    get_trajectories_split_dir,
 )
 from art.utils.s3 import (
     ExcludableOption,
     pull_model_from_s3,
     push_model_to_s3,
 )
-from art.utils.trajectory_logging import write_trajectory_groups_parquet
 from mp_actors import close_proxy, move_to_child_process
 
 from .. import dev
@@ -79,8 +70,6 @@ class LocalBackend(Backend):
         self._services: dict[str, ModelService] = {}
         self._tokenizers: dict[str, PreTrainedTokenizerBase] = {}
         self._image_processors: dict[str, BaseImageProcessor | None] = {}
-        self._wandb_runs: dict[str, Run] = {}
-        self._weave_clients: dict[str, WeaveClient] = {}
 
     def __enter__(self) -> Self:
         return self
@@ -123,9 +112,10 @@ class LocalBackend(Backend):
 
         auto_migrate_on_register(output_dir)
 
-        # Initialize wandb and weave early if this is a trainable model
+        # Initialize wandb early if this is a trainable model
+        # (wandb initialization is now handled by the model's _get_wandb_run method)
         if model.trainable and "WANDB_API_KEY" in os.environ:
-            _ = self._get_wandb_run(model)
+            _ = model._get_wandb_run()
 
     async def _get_service(self, model: TrainableModel) -> ModelService:
         from ..dev.get_model_config import get_model_config
@@ -243,33 +233,15 @@ class LocalBackend(Backend):
         # Non-trainable models do not have checkpoints/steps; default to 0
         return 0
 
-    async def _delete_checkpoints(
+    async def _delete_checkpoint_files(
         self,
         model: TrainableModel,
-        benchmark: str,
-        benchmark_smoothing: float,
+        steps_to_keep: list[int],
     ) -> None:
+        """Delete checkpoint files, keeping only the specified steps."""
         from ..tinker.service import TinkerService
 
         output_dir = get_model_dir(model=model, art_path=self._path)
-        # Keep the latest step
-        steps_to_keep = [get_model_step(model, self._path)]
-        try:
-            best_step = (
-                pl.read_ndjson(f"{output_dir}/history.jsonl")
-                .drop_nulls(subset=[benchmark])
-                .group_by("step")
-                .mean()
-                .with_columns(pl.col(benchmark).ewm_mean(alpha=benchmark_smoothing))
-                .sort(benchmark)
-                .select(pl.col("step").last())
-                .item()
-            )
-            steps_to_keep.append(best_step)
-        except FileNotFoundError:
-            print(f'"{output_dir}/history.jsonl" not found')
-        except pl.exceptions.ColumnNotFoundError:
-            print(f'No "{benchmark}" metric found in history')
         service = await self._get_service(model)
         if isinstance(service, TinkerService):
             await service.delete_checkpoints(steps_to_keep)
@@ -364,54 +336,7 @@ class LocalBackend(Backend):
                         raise
                     # Otherwise, continue and try again
 
-    async def _log(
-        self,
-        model: Model,
-        trajectory_groups: list[TrajectoryGroup],
-        split: str = "val",
-    ) -> None:
-        # Save logs for trajectory groups
-        parent_dir = get_trajectories_split_dir(
-            get_model_dir(model=model, art_path=self._path), split
-        )
-        os.makedirs(parent_dir, exist_ok=True)
-
-        # Get the file name for the current iteration, or default to 0 for non-trainable models
-        iteration = self.__get_step(model)
-        file_name = f"{iteration:04d}.parquet"
-
-        # Write the logs to Parquet file (with ZSTD compression)
-        write_trajectory_groups_parquet(trajectory_groups, f"{parent_dir}/{file_name}")
-
-        # Collect all metrics (including reward) across all trajectories
-        all_metrics: dict[str, list[float]] = {"reward": [], "exception_rate": []}
-
-        for group in trajectory_groups:
-            for trajectory in group:
-                if isinstance(trajectory, BaseException):
-                    all_metrics["exception_rate"].append(1)
-                    continue
-                else:
-                    all_metrics["exception_rate"].append(0)
-                # Add reward metric
-                all_metrics["reward"].append(trajectory.reward)
-
-                # Collect other custom metrics
-                for metric, value in trajectory.metrics.items():
-                    if metric not in all_metrics:
-                        all_metrics[metric] = []
-                    all_metrics[metric].append(float(value))
-
-        # Calculate averages for all metrics
-        averages = {}
-        for metric, values in all_metrics.items():
-            if len(values) > 0:
-                averages[metric] = sum(values) / len(values)
-
-        # Calculate average standard deviation of rewards within groups
-        averages["reward_std_dev"] = calculate_step_std_dev(trajectory_groups)
-
-        self._log_metrics(model, averages, split)
+    # Note: _log() method has been moved to the Model class (frontend)
 
     def _trajectory_log(self, trajectory: Trajectory) -> str:
         """Format a trajectory into a readable log string."""
@@ -436,9 +361,7 @@ class LocalBackend(Backend):
         if verbose:
             print("Starting _train_model")
         service = await self._get_service(model)
-        if verbose:
-            print("Logging training data to disk...")
-        await self._log(model, trajectory_groups, "train")
+        # Note: Logging is now handled by the frontend (Model.train() calls Model.log())
         if verbose:
             print("Packing tensors...")
 
@@ -491,27 +414,18 @@ class LocalBackend(Backend):
                 if isinstance(service, UnslothService):
                     await service.register_lora_for_step(next_step, next_checkpoint_dir)
 
-            # Log metrics showing no groups were trainable
-            self._log_metrics(
-                model,
-                {
-                    "num_groups_submitted": num_groups_submitted,
-                    "num_groups_trainable": 0,
-                },
-                "train",
-                step=next_step,
-            )
+            # Yield metrics showing no groups were trainable
+            # (the frontend will handle logging)
+            yield {
+                "num_groups_submitted": num_groups_submitted,
+                "num_groups_trainable": 0,
+                "num_gradient_steps": 0,
+            }
             return
         disk_packed_tensors = packed_tensors_to_dir(
             packed_tensors, f"{get_model_dir(model=model, art_path=self._path)}/tensors"
         )
-        if dev_config.get("scale_learning_rate_by_reward_std_dev", False):
-            config = config.model_copy(
-                update={
-                    "learning_rate": config.learning_rate
-                    * self._get_reward_std_dev_learning_rate_multiplier(model)
-                }
-            )
+        # Note: scale_learning_rate_by_reward_std_dev is now handled by the frontend (Model.train())
         results: list[dict[str, float]] = []
         estimated_gradient_steps = disk_packed_tensors["num_sequences"]
         if torchtune_args := (model._internal_config or dev.InternalModelConfig()).get(
@@ -537,171 +451,12 @@ class LocalBackend(Backend):
             pbar.update(1)
             pbar.set_postfix(result)
         pbar.close()
-        if verbose:
-            print("Logging metrics...")
-        data = {
-            k: sum(d.get(k, 0) for d in results) / sum(1 for d in results if k in d)
-            for k in {k for d in results for k in d}
-        }
-        # Add group counting metrics
-        data["num_groups_submitted"] = num_groups_submitted
-        data["num_groups_trainable"] = num_groups_trainable
-        # Get the current step after training
-        current_step = self.__get_step(model)
-        self._log_metrics(model, data, "train", step=current_step)
+        # Note: Metrics logging is now handled by the frontend (Model.train())
         if verbose:
             print("_train_model complete")
 
-    def _get_reward_std_dev_learning_rate_multiplier(
-        self, model: TrainableModel
-    ) -> float:
-        output_dir = get_model_dir(model=model, art_path=self._path)
-        learning_rate_multiplier = 1.0  # Default prior
-        try:
-            std_dev_history = (
-                pl.read_ndjson(f"{output_dir}/history.jsonl")
-                .drop_nulls(subset=["train/reward_std_dev"])
-                .group_by("step")
-                .mean()
-                .sort("step")
-            )
-
-            # Fit linear regression to std_dev_history
-            if len(std_dev_history) > 1:
-                steps = std_dev_history["step"].to_numpy()
-                std_devs = std_dev_history["train/reward_std_dev"].to_numpy()
-
-                # Fit linear regression: y = mx + b
-                # polyfit returns [coefficient, intercept] for degree 1
-                coefficient, intercept = np.polyfit(steps, std_devs, deg=1)
-
-                # Get prediction for the last step
-                last_step = steps[-1]
-                last_step_prediction = coefficient * last_step + intercept
-                last_step_actual = std_devs[-1]
-
-                # Calculate R-squared and adjusted R-squared
-                predictions = coefficient * steps + intercept
-                ss_residual = np.sum((std_devs - predictions) ** 2)
-                ss_total = np.sum((std_devs - np.mean(std_devs)) ** 2)
-                r_squared = 1 - (ss_residual / ss_total) if ss_total > 0 else 0
-
-                # Adjusted R-squared accounts for sample size
-                # For simple linear regression: adj_R² = 1 - (1 - R²) * (n - 1) / (n - 2)
-                n_samples = len(steps)
-                if n_samples > 2:
-                    adjusted_r_squared = 1 - (1 - r_squared) * (n_samples - 1) / (
-                        n_samples - 2
-                    )
-                else:
-                    adjusted_r_squared = (
-                        0  # Not enough samples for meaningful adjustment
-                    )
-
-                # Calculate learning rate multiplier
-                # raw_multiplier = last_step_prediction / intercept (if intercept > 0)
-                # adjusted by goodness of fit: multiplier = 1 + adj_R² * (raw_multiplier - 1)
-                if intercept > 0:
-                    raw_multiplier = last_step_prediction / intercept
-                    # learning_rate_multiplier = 1 + adjusted_r_squared * (
-                    #     raw_multiplier - 1
-                    # )
-                    learning_rate_multiplier = raw_multiplier
-                else:
-                    # If intercept <= 0, can't calculate meaningful ratio, stick with prior
-                    raw_multiplier = 1.0
-                    learning_rate_multiplier = 1.0
-
-                print(f"Regression fitted: y = {coefficient:.6f}x + {intercept:.6f}")
-                print(f"  Coefficient (slope): {coefficient:.6f}")
-                print(f"  Intercept: {intercept:.6f}")
-                print(f"  R-squared: {r_squared:.4f}")
-                print(
-                    f"  Adjusted R-squared: {adjusted_r_squared:.4f} (n={n_samples} samples)"
-                )
-                print(
-                    f"  Last step ({last_step}) prediction: {last_step_prediction:.6f}"
-                )
-                print(f"  Last step actual value: {last_step_actual:.6f}")
-                print(
-                    f"  Prediction error: {abs(last_step_actual - last_step_prediction):.6f}"
-                )
-                print(f"  Raw LR multiplier (pred/intercept): {raw_multiplier:.4f}")
-                print(f"  Adjusted LR multiplier: {learning_rate_multiplier:.4f}")
-            else:
-                print(
-                    f"Not enough data points to fit regression (need at least 2, got {len(std_dev_history)})"
-                )
-
-        except FileNotFoundError:
-            print(f'"{output_dir}/history.jsonl" not found')
-        except pl.exceptions.ColumnNotFoundError:
-            print(f'No "train/reward_std_dev" metric found in history')
-
-        return learning_rate_multiplier
-
-    def _log_metrics(
-        self,
-        model: Model,
-        metrics: dict[str, float],
-        split: str,
-        step: int | None = None,
-    ) -> None:
-        metrics = {f"{split}/{metric}": value for metric, value in metrics.items()}
-        step = step if step is not None else self.__get_step(model)
-
-        with open(
-            f"{get_model_dir(model=model, art_path=self._path)}/history.jsonl", "a"
-        ) as f:
-            f.write(
-                json.dumps(
-                    {
-                        k: v for k, v in metrics.items() if v == v
-                    }  # Filter out NaN values
-                    | {"step": step, "recorded_at": datetime.now().isoformat()}
-                )
-                + "\n"
-            )
-
-        # If we have a W&B run, log the data there
-        if run := self._get_wandb_run(model):
-            run.log({"training_step": step, **metrics})
-
-    def _get_wandb_run(self, model: Model) -> Run | None:
-        if "WANDB_API_KEY" not in os.environ:
-            return None
-        if (
-            model.name not in self._wandb_runs
-            or self._wandb_runs[model.name]._is_finished
-        ):
-            run = wandb.init(
-                project=model.project,
-                name=model.name,
-                id=model.name,
-                resume="allow",
-                settings=wandb.Settings(
-                    x_stats_open_metrics_endpoints={
-                        "vllm": "http://localhost:8000/metrics",
-                    },
-                    x_stats_open_metrics_filters=(
-                        "vllm.vllm:num_requests_waiting",
-                        "vllm.vllm:num_requests_running",
-                    ),
-                ),
-            )
-            self._wandb_runs[model.name] = run
-
-            # Define training_step as the x-axis for all metrics.
-            # This allows out-of-order logging (e.g., async validation for previous steps).
-            wandb.define_metric("training_step")
-            wandb.define_metric("train/*", step_metric="training_step")
-            wandb.define_metric("val/*", step_metric="training_step")
-            os.environ["WEAVE_PRINT_CALL_LINK"] = os.getenv(
-                "WEAVE_PRINT_CALL_LINK", "False"
-            )
-            os.environ["WEAVE_LOG_LEVEL"] = os.getenv("WEAVE_LOG_LEVEL", "CRITICAL")
-            self._weave_clients[model.name] = weave.init(model.project)
-        return self._wandb_runs[model.name]
+    # Note: _get_reward_std_dev_learning_rate_multiplier and _log_metrics
+    # have been moved to the Model class (frontend)
 
     # ------------------------------------------------------------------
     # Experimental support for S3
