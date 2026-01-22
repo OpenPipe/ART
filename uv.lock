@@ -5130,7 +5130,7 @@ requires-dist = [
     { name = "langchain-core", marker = "extra == 'langgraph'", specifier = ">=0.3.51" },
     { name = "langchain-openai", marker = "extra == 'langgraph'", specifier = ">=0.3.27" },
     { name = "langgraph", marker = "extra == 'langgraph'", specifier = ">=0.6.2" },
-    { name = "litellm", specifier = ">=1.74.1" },
+    { name = "litellm", specifier = ">=1.71.1" },
     { name = "matplotlib", marker = "extra == 'plotting'", specifier = ">=3.10.1" },
     { name = "nbclient", marker = "extra == 'backend'", specifier = ">=0.10.1" },
     { name = "nbmake", marker = "extra == 'backend'", specifier = ">=1.5.5" },

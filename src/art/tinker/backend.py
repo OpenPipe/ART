@@ -1,7 +1,9 @@
 import os
+from typing import Any, cast
 
 from mp_actors import move_to_child_process
 
+from .. import dev
 from ..local.backend import LocalBackend
 from ..local.service import ModelService
 from ..model import TrainableModel
@@ -24,9 +26,41 @@ class TinkerBackend(LocalBackend):
             os.environ["TINKER_API_KEY"] = tinker_api_key
         super().__init__(in_process=in_process, path=path)
 
+    async def _prepare_backend_for_training(
+        self,
+        model: TrainableModel,
+        config: dev.OpenAIServerConfig | None = None,
+    ) -> tuple[str, str]:
+        """Start the local OpenAI server and return its base URL + API key."""
+        service = await self._get_service(model)
+        raw_config: dict[str, Any] = cast(dict[str, Any], config) if config else {}
+
+        server_args = cast(dict[str, Any], raw_config.get("server_args", {}))
+        host = server_args.get("host", raw_config.get("host", "0.0.0.0"))
+        port = server_args.get("port", raw_config.get("port"))
+        if port is None:
+            from .service import get_free_port
+
+            port = get_free_port()
+        api_key = server_args.get("api_key", raw_config.get("api_key")) or "default"
+
+        # Ensure the Tinker server binds to the same host/port we return.
+        tinker_config = cast(
+            dev.OpenAIServerConfig,
+            {
+                **raw_config,
+                "host": host,
+                "port": port,
+            },
+        )
+        await service.start_openai_server(config=tinker_config)
+
+        base_url = f"http://{host}:{port}/v1"
+        return base_url, api_key
+
     async def _get_service(self, model: TrainableModel) -> ModelService:
         from ..dev.get_model_config import get_model_config
-        from ..dev.model import TinkerArgs
+        from ..dev.model import TinkerArgs, TinkerTrainingClientArgs
         from .service import TinkerService
 
         if model.name not in self._services:
@@ -38,8 +72,9 @@ class TinkerBackend(LocalBackend):
             config["tinker_args"] = config.get("tinker_args") or TinkerArgs(
                 renderer_name=get_renderer_name(model.base_model)
             )
-            config["tinker_args"]["training_client_args"] = (
-                config["tinker_args"].get("training_client_args") or {}
+            config["tinker_args"]["training_client_args"] = cast(
+                TinkerTrainingClientArgs,
+                config["tinker_args"].get("training_client_args") or {},
             )
             self._services[model.name] = TinkerService(
                 model_name=model.name,
