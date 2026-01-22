@@ -10,6 +10,7 @@ import warnings
 import aiohttp
 import numpy as np
 from openai import AsyncOpenAI
+import polars as pl
 import torch
 from tqdm import auto as tqdm
 from transformers import AutoImageProcessor, AutoTokenizer
@@ -41,7 +42,7 @@ from ..preprocessing.pack import (
 )
 from ..preprocessing.tokenize import tokenize_trajectory_groups
 from ..trajectories import Trajectory, TrajectoryGroup
-from ..types import LocalTrainResult, Message, TrainConfig
+from ..types import LocalTrainResult, Message, SFTConfig, TrainConfig
 from ..utils import format_message, get_model_step
 from .checkpoints import (
     delete_checkpoints,
@@ -349,7 +350,6 @@ class LocalBackend(Backend):
                     # Otherwise, continue and try again
 
     # Note: _log() method has been moved to the Model class (frontend)
-
     def _trajectory_log(self, trajectory: Trajectory) -> str:
         """Format a trajectory into a readable log string."""
         header = f"reward: {trajectory.reward} {' '.join(f'{k}: {v}' for k, v in trajectory.metrics.items())}\n\n"
@@ -613,8 +613,119 @@ class LocalBackend(Backend):
         if verbose:
             print("_train_model complete")
 
-    # Note: _get_reward_std_dev_learning_rate_multiplier and _log_metrics
-    # have been moved to the Model class (frontend)
+    async def _train_sft(
+        self,
+        model: TrainableModel,
+        trajectories: Iterable[Trajectory],
+        config: SFTConfig,
+        dev_config: dev.SFTConfig,
+        verbose: bool = False,
+    ) -> AsyncIterator[dict[str, float]]:
+        """Train the model using supervised fine-tuning.
+
+        Args:
+            model: The trainable model to fine-tune
+            trajectories: Iterable of Trajectory objects
+            config: SFT configuration with batch_size and learning rates
+            dev_config: Developer configuration
+            verbose: Whether to print detailed logs
+
+        Yields:
+            Dictionary containing training metrics for each batch
+        """
+        if verbose:
+            print("Starting _train_sft")
+
+        # Convert iterator to list
+        trajectory_list = list(trajectories)
+
+        if len(trajectory_list) == 0:
+            if verbose:
+                print("No trajectories to train on")
+            return
+
+        # Get tokenizer
+        if model.base_model not in self._tokenizers:
+            self._tokenizers[model.base_model] = AutoTokenizer.from_pretrained(
+                model.base_model
+            )
+        tokenizer = self._tokenizers[model.base_model]
+
+        # Determine batch_size
+        batch_size = config.batch_size
+        if batch_size == "auto":
+            batch_size = 1  # Default to 1 for SFT
+
+        # Determine learning rates
+        if config.custom_lr_schedule and len(config.custom_lr_schedule) > 0:
+            # Use custom learning rate schedule
+            learning_rates = config.custom_lr_schedule
+        else:
+            # Use constant learning rate for all batches
+            num_batches = math.ceil(len(trajectory_list) / batch_size)
+            learning_rates = [config.learning_rate] * num_batches
+
+        # Tokenize trajectories into batches
+        from ..preprocessing.tokenize import tokenize_sft_batches
+        from ..utils.model_config import get_instruction_response_parts
+
+        # Get instruction/response parts (from config or auto-detect)
+        instruction_part = dev_config.get("instruction_part", None)
+        response_part = dev_config.get("response_part", None)
+
+        if instruction_part is None or response_part is None:
+            detected_inst, detected_resp = get_instruction_response_parts(
+                model.base_model, tokenizer
+            )
+            instruction_part = instruction_part or detected_inst
+            response_part = response_part or detected_resp
+
+        if verbose:
+            print(f"Using instruction_part: {instruction_part!r}")
+            print(f"Using response_part: {response_part!r}")
+
+        sft_batches = list(
+            tokenize_sft_batches(
+                trajectories=trajectory_list,
+                batch_size=batch_size,
+                learning_rates=learning_rates,
+                tokenizer=tokenizer,
+                instruction_part=instruction_part,
+                response_part=response_part,
+            )
+        )
+
+        if verbose:
+            total_trainable = sum(b.num_trainable_tokens for b in sft_batches)
+            print(
+                f"Tokenized {len(trajectory_list)} trajectories into {len(sft_batches)} batches"
+            )
+            print(f"Total trainable tokens: {total_trainable}")
+            if total_trainable == 0:
+                print(
+                    "WARNING: No trainable tokens found! Check instruction_part and response_part settings."
+                )
+
+        # Get the service to access the model and optimizer
+        service = await self._get_service(model)
+
+        # Train using the service's train_sft method
+        if verbose:
+            print("Using service.train_sft")
+
+        num_batches = len(sft_batches)
+        pbar = tqdm.tqdm(total=num_batches, desc="Processing chunk", leave=False)
+
+        async for result in service.train_sft(sft_batches, verbose):
+            pbar.update(1)
+            pbar.set_postfix({"loss": f"{result.get('loss', 0):.4f}"})
+
+            # Note: Metrics logging is handled by the frontend (Model.train_sft())
+            yield result
+        pbar.close()
+
+        if verbose:
+            print("_train_sft complete")
 
     # ------------------------------------------------------------------
     # Experimental support for S3

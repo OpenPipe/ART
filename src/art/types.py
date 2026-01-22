@@ -19,6 +19,12 @@ class TrainConfig(pydantic.BaseModel):
     beta: float = 0.0
 
 
+class SFTConfig(pydantic.BaseModel):
+    learning_rate: float = 2e-4
+    batch_size: int | Literal["auto"] = "auto"
+    custom_lr_schedule: list[float] = []
+
+
 Verbosity = Literal[0, 1, 2]
 
 

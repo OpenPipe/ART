@@ -12,7 +12,7 @@ from typing_extensions import Never, TypeVar
 
 from . import dev
 from .trajectories import Trajectory, TrajectoryGroup
-from .types import TrainConfig
+from .types import SFTConfig, TrainConfig
 from .utils.old_benchmarking.calculate_step_metrics import calculate_step_std_dev
 from .utils.trajectory_logging import write_trajectory_groups_parquet
 
@@ -672,3 +672,35 @@ class TrainableModel(Model[ModelConfig, StateType], Generic[ModelConfig, StateTy
             # Get the current step after training
             step = await self.get_step()
             self._log_metrics(avg_metrics, "train", step)
+
+    async def train_sft(
+        self,
+        trajectories: Iterable[Trajectory],
+        config: SFTConfig | None = None,
+        _config: dev.SFTConfig | None = None,
+        verbose: bool = False,
+    ) -> None:
+        """
+        Supervised fine-tune the model with an iterable of trajectories.
+
+        Args:
+            trajectories: An iterable of Trajectory objects.
+            config: SFT configuration including learning_rates and batch_size.
+                If None, uses default SFTConfig().
+            _config: Additional experimental configuration that is subject to change and
+                not yet part of the public API. Use at your own risk.
+            verbose: Whether to print verbose output.
+        """
+        if config is None:
+            config = SFTConfig()
+
+        # Get starting step from checkpoint for per-batch logging
+        step = await self.get_step()
+
+        # Train (backend yields metrics for each batch without logging)
+        async for metrics in self.backend()._train_sft(
+            self, trajectories, config, _config or {}, verbose
+        ):
+            # Log each batch's metrics with incrementing step
+            step += 1
+            self._log_metrics(metrics, "train", step)

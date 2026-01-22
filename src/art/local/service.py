@@ -28,3 +28,9 @@ class ModelService(Protocol):
         _config: dev.TrainConfig,
         verbose: bool = False,
     ) -> AsyncIterator[dict[str, float]]: ...
+
+    def train_sft(
+        self,
+        sft_batches: list,
+        verbose: bool = False,
+    ) -> AsyncIterator[dict[str, float]]: ...

@@ -184,6 +184,14 @@ class TinkerService:
         state.sampler_clients[next_step] = new_sampler_client
         state.latest_step = next_step
 
+    async def train_sft(
+        self,
+        sft_batches: list,
+        verbose: bool = False,
+    ) -> AsyncIterator[dict[str, float]]:
+        raise NotImplementedError("SFT training is not supported for TinkerService")
+        yield {}  # Make this a generator
+
     async def delete_checkpoints(self, steps_to_keep: list[int]) -> None:
         state = await self._state_task
         # Find steps to delete

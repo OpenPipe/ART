@@ -14,8 +14,8 @@ from art.utils.deployment import (
 )
 
 from . import dev
-from .trajectories import TrajectoryGroup
-from .types import TrainConfig, TrainResult
+from .trajectories import Trajectory, TrajectoryGroup
+from .types import SFTConfig, TrainConfig, TrainResult
 
 if TYPE_CHECKING:
     from .model import Model, TrainableModel
@@ -148,6 +148,21 @@ class Backend:
                 pbar.set_postfix(result)
             if pbar is not None:
                 pbar.close()
+
+    async def _train_sft(
+        self,
+        model: "TrainableModel",
+        trajectories: Iterable[Trajectory],
+        config: SFTConfig,
+        dev_config: dev.SFTConfig,
+        verbose: bool = False,
+    ) -> AsyncIterator[dict[str, float]]:
+        raise NotImplementedError(
+            "SFT training is not yet implemented. "
+            "This method will be available in a future release."
+        )
+        # This yield is unreachable but makes this an async generator
+        yield  # type: ignore
 
     # ------------------------------------------------------------------
     # Experimental support for S3
