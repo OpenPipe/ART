@@ -61,7 +61,7 @@ async def simple_rollout(
 
 async def run_training_loop(
     model: art.TrainableModel,
-    backend: Union[LocalBackend, art.ServerlessBackend, art.TinkerBackend],
+    backend: art.Backend,
     num_steps: int = 1,
     rollouts_per_step: int = 4,
 ) -> list[TrainResult]:

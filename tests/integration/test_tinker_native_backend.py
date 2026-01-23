@@ -2,16 +2,12 @@
 
 import os
 import tempfile
-from typing import Any, cast
 import uuid
 
 import openai
 import pytest
 
 import art
-
-art = cast(Any, art)
-
 
 DEFAULT_BASE_MODEL = "Qwen/Qwen3-30B-A3B-Instruct-2507"
 
@@ -33,7 +29,7 @@ def ensure_reward_variance(groups) -> None:
 async def simple_rollout(
     client: openai.AsyncOpenAI, model_name: str, prompt: str
 ) -> art.Trajectory:
-    messages: art.Messages = [{"role": "user", "content": prompt}]  # type: ignore[attr-defined]
+    messages: art.Messages = [{"role": "user", "content": prompt}]
     chat_completion = await client.chat.completions.create(
         messages=messages,
         model=model_name,

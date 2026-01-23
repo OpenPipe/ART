@@ -5,8 +5,8 @@ from dataclasses import dataclass
 import os
 import re
 import time
-import uuid
 from typing import Any, Iterable, Literal, cast
+import uuid
 
 from fastapi import FastAPI, HTTPException
 from openai import AsyncOpenAI
@@ -15,6 +15,9 @@ from openai.types.chat.chat_completion_message import ChatCompletionMessage
 from openai.types.chat.chat_completion_message_function_tool_call import (
     ChatCompletionMessageFunctionToolCall,
     Function,
+)
+from openai.types.chat.chat_completion_message_tool_call import (
+    ChatCompletionMessageToolCallUnion,
 )
 from openai.types.chat.chat_completion_token_logprob import ChatCompletionTokenLogprob
 from openai.types.chat.completion_create_params import CompletionCreateParams
@@ -26,18 +29,17 @@ import uvicorn
 from .. import dev
 from ..backend import Backend
 from ..model import Model, TrainableModel
+from ..tinker.backend import get_renderer_name
+from ..tinker.service import get_free_port
 from ..trajectories import TrajectoryGroup
 from ..types import TrainResult
 from ..utils.output_dirs import get_model_dir
 from ..utils.trajectory_migration import auto_migrate_on_register
-from ..tinker.backend import get_renderer_name
-from ..tinker.service import get_free_port
 from .data import (
     convert_openai_messages_to_renderer_format,
     parse_completion_to_openai_message,
     trajectory_groups_to_datums,
 )
-
 
 STATE_KEY_RUN_IDS = "tinker_run_ids"
 STATE_KEY_LATEST_STEP = "latest_step"
@@ -239,9 +241,7 @@ class TinkerNativeBackend(Backend):
         model: TrainableModel,
         steps_to_keep: list[int],
     ) -> None:
-        print(
-            "Checkpoint deletion is not yet implemented for TinkerNativeBackend."
-        )
+        print("Checkpoint deletion is not yet implemented for TinkerNativeBackend.")
 
     def _model_inference_name(self, model: Model, step: int | None = None) -> str:
         base_name = model.inference_model_name or model.name
@@ -299,9 +299,7 @@ class TinkerNativeBackend(Backend):
             choices: list[Choice] = []
             for i, sequence in enumerate(sample_response.sequences):
                 if sequence.logprobs is None:
-                    raise HTTPException(
-                        status_code=400, detail="Logprobs are required"
-                    )
+                    raise HTTPException(status_code=400, detail="Logprobs are required")
                 if len(sequence.tokens) != len(sequence.logprobs):
                     raise HTTPException(
                         status_code=400,
@@ -310,7 +308,7 @@ class TinkerNativeBackend(Backend):
                 parsed_message = parse_completion_to_openai_message(
                     list(sequence.tokens), state.renderer
                 )
-                tool_calls = None
+                tool_calls: list[ChatCompletionMessageToolCallUnion] | None = None
                 if parsed_message.get("tool_calls"):
                     tool_calls = [
                         ChatCompletionMessageFunctionToolCall(
@@ -363,9 +361,7 @@ class TinkerNativeBackend(Backend):
                 ),
             )
 
-        server_config = uvicorn.Config(
-            app, host=host, port=port, log_level="error"
-        )
+        server_config = uvicorn.Config(app, host=host, port=port, log_level="error")
         server = uvicorn.Server(server_config)
         await server.serve()
 
@@ -447,10 +443,10 @@ class TinkerNativeBackend(Backend):
 
         sampler_clients: dict[int, tinker.SamplingClient] = {}
         if current_step in sampler_paths:
-            sampler_clients[current_step] = (
-                await training_client.create_sampling_client_async(
-                    model_path=sampler_paths[current_step]
-                )
+            sampler_clients[
+                current_step
+            ] = await training_client.create_sampling_client_async(
+                model_path=sampler_paths[current_step]
             )
         else:
             checkpoint_name = f"step_{current_step:06d}"
@@ -458,10 +454,10 @@ class TinkerNativeBackend(Backend):
                 training_client, checkpoint_name
             )
             sampler_paths[current_step] = sampler_response.path
-            sampler_clients[current_step] = (
-                await training_client.create_sampling_client_async(
-                    model_path=sampler_response.path
-                )
+            sampler_clients[
+                current_step
+            ] = await training_client.create_sampling_client_async(
+                model_path=sampler_response.path
             )
 
         state = ModelState(
@@ -476,9 +472,7 @@ class TinkerNativeBackend(Backend):
             tokenizer=tokenizer,
             output_dir=get_model_dir(model=model, art_path=self._path),
             tinker_run_ids=tinker_run_ids,
-            model_name=(
-                (model.inference_model_name or model.name).split("@", 1)[0]
-            ),
+            model_name=((model.inference_model_name or model.name).split("@", 1)[0]),
         )
         self._persist_model_state(model, state)
         return state
@@ -564,9 +558,7 @@ class TinkerNativeBackend(Backend):
         state.sampler_clients[actual_step] = sampler_client
         return sampler_client
 
-    def _normalize_messages(
-        self, messages: Iterable[Any]
-    ) -> list[dict[str, Any]]:
+    def _normalize_messages(self, messages: Iterable[Any]) -> list[dict[str, Any]]:
         normalized: list[dict[str, Any]] = []
         for message in messages:
             if hasattr(message, "model_dump"):
@@ -588,7 +580,9 @@ class TinkerNativeBackend(Backend):
                 normalized.append(dict(tool))
         return normalized
 
-    def _parse_model_name(self, model_name: str | None) -> tuple[str | None, int | None]:
+    def _parse_model_name(
+        self, model_name: str | None
+    ) -> tuple[str | None, int | None]:
         if model_name and "@" in model_name:
             base_name, step_str = model_name.rsplit("@", 1)
             try:

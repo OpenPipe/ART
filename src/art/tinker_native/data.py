@@ -1,12 +1,12 @@
 from __future__ import annotations
 
-from typing import Any, Iterable
-
 import re
-import torch
-import tinker
+from typing import Any, Iterable, cast
+
 from openai.types.chat.chat_completion import Choice
+import tinker
 from tinker_cookbook import renderers
+import torch
 
 from ..trajectories import History, Trajectory, TrajectoryGroup, get_messages
 from ..types import MessagesAndChoices
@@ -253,10 +253,12 @@ def history_to_datum(
     if not completion_tokens or len(completion_tokens) != len(logprobs):
         return None
 
-    prompt_messages = get_messages(history.messages_and_choices[:choice_index])
+    prompt_messages = cast(
+        list[dict[str, Any]], get_messages(history.messages_and_choices[:choice_index])
+    )
     renderer_messages = convert_openai_messages_to_renderer_format(
         messages=prompt_messages,
-        tools=history.tools or None,
+        tools=cast(list[dict[str, Any]] | None, history.tools),
         renderer=renderer,
     )
     prompt_input = renderer.build_generation_prompt(renderer_messages)
@@ -300,9 +302,7 @@ def build_datum(
     return tinker.Datum(
         model_input=tinker.ModelInput.from_ints(tokens=input_tokens),
         loss_fn_inputs={
-            "target_tokens": tinker.TensorData.from_torch(
-                torch.tensor(target_tokens)
-            ),
+            "target_tokens": tinker.TensorData.from_torch(torch.tensor(target_tokens)),
             "logprobs": tinker.TensorData.from_torch(
                 torch.tensor(padded_logprobs, dtype=torch.float32)
             ),
