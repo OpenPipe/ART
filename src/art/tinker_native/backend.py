@@ -657,7 +657,7 @@ class TinkerNativeBackend(Backend):
         return await state_future.result_async()
 
     def _persist_model_state(self, model: TrainableModel, state: ModelState) -> None:
-        model.write_state(
+        model.merge_state(
             {
                 STATE_KEY_RUN_IDS: state.tinker_run_ids,
                 STATE_KEY_LATEST_STEP: state.current_step,

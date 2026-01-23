@@ -169,6 +169,17 @@ def parse_completion_to_openai_message(
     return result
 
 
+def _trajectory_has_choice(trajectory: Trajectory) -> bool:
+    for message_or_choice in trajectory.messages_and_choices:
+        if isinstance(message_or_choice, Choice):
+            return True
+    for history in trajectory.additional_histories:
+        for message_or_choice in history.messages_and_choices:
+            if isinstance(message_or_choice, Choice):
+                return True
+    return False
+
+
 def trajectory_groups_to_datums(
     trajectory_groups: Iterable[TrajectoryGroup],
     renderer: Any,
@@ -180,6 +191,13 @@ def trajectory_groups_to_datums(
     for group in trajectory_groups:
         if not group.trajectories:
             continue
+        for trajectory in group.trajectories:
+            if not _trajectory_has_choice(trajectory):
+                raise ValueError(
+                    "Trajectory is missing a Choice object. Training requires at least one Choice "
+                    "to compute logprobs. Ensure your rollout includes an OpenAI Choice in "
+                    "Trajectory.messages_and_choices."
+                )
         rewards = [trajectory.reward for trajectory in group.trajectories]
         advantages = compute_advantages(rewards, normalize_advantages)
 

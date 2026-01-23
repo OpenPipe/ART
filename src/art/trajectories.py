@@ -40,6 +40,8 @@ class Trajectory(pydantic.BaseModel):
     tools: Tools | None = None
     additional_histories: list[History] = []
     reward: float
+    initial_policy_version: int | None = None
+    final_policy_version: int | None = None
     metrics: dict[str, float | int | bool] = {}
     auto_metrics: dict[str, float | int | bool] = {}
     metadata: dict[str, MetadataValue] = {}
@@ -78,6 +80,8 @@ class Trajectory(pydantic.BaseModel):
     def for_logging(self) -> dict[str, Any]:
         loggable_dict = {
             "reward": self.reward,
+            "initial_policy_version": self.initial_policy_version,
+            "final_policy_version": self.final_policy_version,
             "metrics": self.metrics,
             "metadata": self.metadata,
             "messages": [],
