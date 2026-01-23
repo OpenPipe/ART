@@ -314,9 +314,12 @@ wheels = [
 
 [[package]]
 name = "antlr4-python3-runtime"
-version = "4.9.3"
+version = "4.13.2"
 source = { registry = "https://pypi.org/simple" }
-sdist = { url = "https://files.pythonhosted.org/packages/3e/38/7859ff46355f76f8d19459005ca000b6e7012f2f1ca597746cbcd1fbfe5e/antlr4-python3-runtime-4.9.3.tar.gz", hash = "sha256:f224469b4168294902bb1efa80a8bf7855f24c99aef99cbefc1bcd3cce77881b", size = 117034, upload-time = "2021-11-06T17:52:23.524Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/33/5f/2cdf6f7aca3b20d3f316e9f505292e1f256a32089bd702034c29ebde6242/antlr4_python3_runtime-4.13.2.tar.gz", hash = "sha256:909b647e1d2fc2b70180ac586df3933e38919c85f98ccc656a96cd3f25ef3916", size = 117467, upload-time = "2024-08-03T19:00:12.757Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/89/03/a851e84fcbb85214dc637b6378121ef9a0dd61b4c65264675d8a5c9b1ae7/antlr4_python3_runtime-4.13.2-py3-none-any.whl", hash = "sha256:fe3835eb8d33daece0e799090eda89719dbccee7aa39ef94eed3818cafa5a7e8", size = 144462, upload-time = "2024-08-03T19:00:11.134Z" },
+]
 
 [[package]]
 name = "anyio"
@@ -2918,7 +2921,7 @@ wheels = [
 
 [[package]]
 name = "inspect-ai"
-version = "0.3.158"
+version = "0.3.163"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "aioboto3" },
@@ -2953,13 +2956,14 @@ dependencies = [
     { name = "sniffio" },
     { name = "tenacity" },
     { name = "textual" },
+    { name = "tiktoken" },
     { name = "typing-extensions" },
     { name = "universal-pathlib" },
     { name = "zipp" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/99/ed/39847f3251ad4cc78553be3ebe458cf9962614ea17badaef0578e27d0221/inspect_ai-0.3.158.tar.gz", hash = "sha256:08b8025341c5815075e2f3fdcb2313074b0dc7a22d6ac8ee48306d7bc92700e0", size = 43435860, upload-time = "2025-12-24T12:03:47.24Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/d8/1f/ceaff3a92c03196cc2503a1ec8cc865ca4695a7e25a20f3c9fb9892664da/inspect_ai-0.3.163.tar.gz", hash = "sha256:4a3b131a1d48430bf6d64ab9842fababf1ce66d64aa126f96ab09f399c4f9f61", size = 43358268, upload-time = "2026-01-21T20:36:44.792Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/d9/ca/308f85765bcbc681bcb9f308a2443fb8a91d57b80e2e74f64e734cb6f946/inspect_ai-0.3.158-py3-none-any.whl", hash = "sha256:80d895b62c1cfea9cca20c54dffc2f7a23e822634b1cce45af7b03eb4fb92885", size = 34682434, upload-time = "2025-12-24T12:03:39.798Z" },
+    { url = "https://files.pythonhosted.org/packages/5e/a0/bc25e3c895ff462f8b901784813a4241bdef8ed6aed66837f757a5e36747/inspect_ai-0.3.163-py3-none-any.whl", hash = "sha256:c09fd251d184a77f7a69fdd75695c457ed1c328fee4dafeabd9232f7309c6741", size = 34559953, upload-time = "2026-01-21T20:36:36.141Z" },
 ]
 
 [[package]]
@@ -3632,15 +3636,15 @@ wheels = [
 
 [[package]]
 name = "latex2sympy2-extended"
-version = "1.10.2"
+version = "1.11.0"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "antlr4-python3-runtime" },
     { name = "sympy" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/f4/de/472f9115c14c6f6d8a5889cabe3418283d708bde62ce00402c29441deed4/latex2sympy2_extended-1.10.2.tar.gz", hash = "sha256:41a517ffcc5a140e910a7d1646ce6ff440817e5f9d48fc8279d88bd0925bc389", size = 206188, upload-time = "2025-07-02T15:26:06.225Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/30/75/456da2da05f6380ea96e6ea804ab2c03e41fc3ed80052307fe8efe6ea20e/latex2sympy2_extended-1.11.0.tar.gz", hash = "sha256:9695657c81b50abba2636638638618db59f4663ed2a4a12d62cef74a40e28fec", size = 207023, upload-time = "2026-01-10T01:43:21.319Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/ab/60/dfbbf40e3a371388c0e03ff65b01319b7d4023e883df6d7261125772ffdc/latex2sympy2_extended-1.10.2-py3-none-any.whl", hash = "sha256:f910442c5b02a466c1046f47d05cc5285181068b882399281f30102715337fb7", size = 207855, upload-time = "2025-07-02T15:26:04.88Z" },
+    { url = "https://files.pythonhosted.org/packages/e9/61/f75cd1fa54d8434276126034aed54dd120747de9a8fa013cdd79545ccbeb/latex2sympy2_extended-1.11.0-py3-none-any.whl", hash = "sha256:aebb77d52ce269e25028e4bea89ddb14d242ba36bcf7b636496fb5fd9728d234", size = 209050, upload-time = "2026-01-10T01:43:19.458Z" },
 ]
 
 [[package]]
@@ -3950,14 +3954,14 @@ wheels = [
 
 [[package]]
 name = "math-verify"
-version = "0.8.0"
+version = "0.9.0"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "latex2sympy2-extended" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/35/b5/b1db6fa6b6c28ebbe1889ee11a4703a72a2ca7750ec415f4559c758cf01a/math_verify-0.8.0.tar.gz", hash = "sha256:3295e0adb94bfe553ff6e3189c44f1916a85aa24ab5d1900f2086a706e28f7c4", size = 60191, upload-time = "2025-07-02T15:52:07.209Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/4f/12/b8d13b581e110ac2f724a2351a8361a70fa36d057eb945d6379e8747c256/math_verify-0.9.0.tar.gz", hash = "sha256:45ac6c61344ba056b9e99a660a4bc8d044ed408f730aed68c60435aa5eec4645", size = 60329, upload-time = "2026-01-10T01:48:33.056Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/fe/9f/59979f699b5c97334298f1295bc9fcdc9904d98d2276479bffff863d23b1/math_verify-0.8.0-py3-none-any.whl", hash = "sha256:31ca651296d817a9bb3fd58ca1fd0d192dcea709b1e5ecf2d0a4514c16f89087", size = 29994, upload-time = "2025-07-02T15:52:05.023Z" },
+    { url = "https://files.pythonhosted.org/packages/62/76/6b4969bccc842b6567f7e6ee015684b9428a9b7fcbdf479e73716f43597f/math_verify-0.9.0-py3-none-any.whl", hash = "sha256:3703e7c4885354027fa84409d762a596a2906d1fd4deb78361876bd905a76194", size = 29967, upload-time = "2026-01-10T01:48:31.674Z" },
 ]
 
 [[package]]
@@ -5093,6 +5097,12 @@ dev = [
     { name = "ruff" },
     { name = "ty" },
 ]
+tinker = [
+    { name = "fastapi" },
+    { name = "tinker" },
+    { name = "tinker-cookbook" },
+    { name = "uvicorn" },
+]
 
 [package.metadata]
 requires-dist = [
@@ -5151,6 +5161,12 @@ dev = [
     { name = "pytest-xdist", specifier = ">=3.8.0" },
     { name = "ruff", specifier = ">=0.12.1" },
     { name = "ty", specifier = ">=0.0.14" },
+]
+tinker = [
+    { name = "fastapi", specifier = ">=0.128.0" },
+    { name = "tinker", specifier = ">=0.7.0" },
+    { name = "tinker-cookbook", specifier = ">=0.1.0" },
+    { name = "uvicorn", specifier = ">=0.35.0" },
 ]
 
 [[package]]
@@ -7946,11 +7962,11 @@ wheels = [
 
 [[package]]
 name = "soupsieve"
-version = "2.8.1"
+version = "2.8.3"
 source = { registry = "https://pypi.org/simple" }
-sdist = { url = "https://files.pythonhosted.org/packages/89/23/adf3796d740536d63a6fbda113d07e60c734b6ed5d3058d1e47fc0495e47/soupsieve-2.8.1.tar.gz", hash = "sha256:4cf733bc50fa805f5df4b8ef4740fc0e0fa6218cf3006269afd3f9d6d80fd350", size = 117856, upload-time = "2025-12-18T13:50:34.655Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/7b/ae/2d9c981590ed9999a0d91755b47fc74f74de286b0f5cee14c9269041e6c4/soupsieve-2.8.3.tar.gz", hash = "sha256:3267f1eeea4251fb42728b6dfb746edc9acaffc4a45b27e19450b676586e8349", size = 118627, upload-time = "2026-01-20T04:27:02.457Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/48/f3/b67d6ea49ca9154453b6d70b34ea22f3996b9fa55da105a79d8732227adc/soupsieve-2.8.1-py3-none-any.whl", hash = "sha256:a11fe2a6f3d76ab3cf2de04eb339c1be5b506a8a47f2ceb6d139803177f85434", size = 36710, upload-time = "2025-12-18T13:50:33.267Z" },
+    { url = "https://files.pythonhosted.org/packages/46/2c/1462b1d0a634697ae9e55b3cecdcb64788e8b7d63f54d923fcd0bb140aed/soupsieve-2.8.3-py3-none-any.whl", hash = "sha256:ed64f2ba4eebeab06cc4962affce381647455978ffc1e36bb79a545b91f45a95", size = 37016, upload-time = "2026-01-20T04:27:01.012Z" },
 ]
 
 [[package]]
@@ -8134,7 +8150,7 @@ wheels = [
 
 [[package]]
 name = "textual"
-version = "6.12.0"
+version = "7.3.0"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "markdown-it-py", extra = ["linkify"] },
@@ -8144,9 +8160,9 @@ dependencies = [
     { name = "rich" },
     { name = "typing-extensions" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/39/55/29416ef63de4c37b37da217b94439a28496a4dc585209f5bf1437a61d120/textual-6.12.0.tar.gz", hash = "sha256:a32e8edbf6abdb0c42d486e96bdf419eb3aa378edb1b1271b84637f3dbd64c73", size = 1584182, upload-time = "2026-01-02T09:42:30.415Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/6f/ee/620c887bfad9d6eba062dfa3b6b0e735e0259102e2667b19f21625ef598d/textual-7.3.0.tar.gz", hash = "sha256:3169e8ba5518a979b0771e60be380ab1a6c344f30a2126e360e6f38d009a3de4", size = 1590692, upload-time = "2026-01-15T16:32:02.342Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/13/f8/2a6a6ff1d07788f635493867d5a4003dfecacad16af1fdc9814d10daca3d/textual-6.12.0-py3-none-any.whl", hash = "sha256:cf9ea9a54d213c7736efe9fef440c7f49218d4e6ab75279afd060eded9c567ec", size = 714912, upload-time = "2026-01-02T09:42:28.786Z" },
+    { url = "https://files.pythonhosted.org/packages/c3/1f/abeb4e5cb36b99dd37db72beb2a74d58598ccb35aaadf14624ee967d4a6b/textual-7.3.0-py3-none-any.whl", hash = "sha256:db235cecf969c87fe5a9c04d83595f506affc9db81f3a53ab849534d726d330a", size = 716374, upload-time = "2026-01-15T16:31:58.233Z" },
 ]
 
 [[package]]
@@ -8205,7 +8221,7 @@ wheels = [
 
 [[package]]
 name = "tinker"
-version = "0.8.1"
+version = "0.9.0"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "anyio" },
@@ -8219,9 +8235,9 @@ dependencies = [
     { name = "transformers" },
     { name = "typing-extensions" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/ec/a2/fe985e880a4a0a7ee47a0fa4824f5a1d1b24c27b7dd8a32e2606838b42a0/tinker-0.8.1.tar.gz", hash = "sha256:5ccf49f2ad7ca2dade303e9e7c33a1d21e14948d051e2a70e4a4f89d4fa52abf", size = 171213, upload-time = "2026-01-21T23:13:42.738Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/a0/f6/5ad5faa0e34f18f4d921fb1afab038b4fa2f662cd199b78072c486840d75/tinker-0.9.0.tar.gz", hash = "sha256:d47dd5870f3f3c982ad515254903753ccb626a2ee096e72ebaa90beb24573926", size = 173090, upload-time = "2026-01-26T22:33:58.998Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/70/d6/41d8c5ad6145f360f7bb476ff69cfa836cd961ffe7492d7ab3fa0da46bc1/tinker-0.8.1-py3-none-any.whl", hash = "sha256:ec743006d596735e8197b3c43adb03bdb46a5cbc01c02b920a0b7f60743c3377", size = 168164, upload-time = "2026-01-21T23:13:44.192Z" },
+    { url = "https://files.pythonhosted.org/packages/e7/00/0282156cf66331e3f2dc0f8cb7020886fdbe6843771d3afac810c94f2638/tinker-0.9.0-py3-none-any.whl", hash = "sha256:e7c4a476a3c68799654021807cd9e1a4b3954f664b30f60fe613caeb774d7f94", size = 168536, upload-time = "2026-01-26T22:33:57.478Z" },
 ]
 
 [[package]]
@@ -8792,15 +8808,15 @@ wheels = [
 
 [[package]]
 name = "universal-pathlib"
-version = "0.3.7"
+version = "0.3.8"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "fsspec" },
     { name = "pathlib-abc" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/d5/96/b58b00ce27cbc37fd3c79944438dd8630d2c39f9467c9e73e1a4a3eec1ef/universal_pathlib-0.3.7.tar.gz", hash = "sha256:36331056fa59a7d7cd3b61b4045f3a3418f446f23ec1a01d281c4510814b4b05", size = 253466, upload-time = "2025-12-03T00:06:43.859Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/6e/ec/764b0d4593c6a8f5f66b347a19b5db9486dd0024b5e3339d468064a90c76/universal_pathlib-0.3.8.tar.gz", hash = "sha256:ead2b65bca3df6e11c3b7cb36fc9846340bc3c2db4ef57131550260422b0a3e8", size = 258837, upload-time = "2026-01-11T22:13:53.328Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/79/77/53c2d3a0413bc55b4c91067a0c41e55451be9b0784d204e4e46ce5abf668/universal_pathlib-0.3.7-py3-none-any.whl", hash = "sha256:fb95117b20b5981f86ef9d887fddbf9c61d3596634ba42cccea444931d87c201", size = 80738, upload-time = "2025-12-03T00:06:41.997Z" },
+    { url = "https://files.pythonhosted.org/packages/86/2c/fc9416619a418e94576aef84ef263906a24f76a21a1c3e96ddae25c82df9/universal_pathlib-0.3.8-py3-none-any.whl", hash = "sha256:dac4fd9a3df918d85bb6da678e794b5dfa9ecdb5ff74675b497553dbe50134b8", size = 82608, upload-time = "2026-01-11T22:13:51.313Z" },
 ]
 
 [[package]]

@@ -4,6 +4,7 @@ from .model import (
     InternalModelConfig,
     PeftArgs,
     TinkerArgs,
+    TinkerNativeArgs,
     TinkerTrainingClientArgs,
     TrainerArgs,
 )
@@ -16,6 +17,7 @@ __all__ = [
     "InitArgs",
     "PeftArgs",
     "TinkerArgs",
+    "TinkerNativeArgs",
     "TinkerTrainingClientArgs",
     "TrainerArgs",
     "get_openai_server_config",

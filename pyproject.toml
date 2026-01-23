@@ -165,6 +165,12 @@ dev = [
     "pyarrow>=15.0.0",
     "prek>=0.2.29",
 ]
+tinker = [
+    "fastapi>=0.128.0",
+    "tinker>=0.7.0",
+    "tinker-cookbook>=0.1.0",
+    "uvicorn>=0.35.0",
+]
 
 [tool.uv.sources]
 panza = { git = "https://github.com/corbt/panza.git" }

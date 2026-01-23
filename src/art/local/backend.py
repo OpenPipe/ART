@@ -102,6 +102,8 @@ class LocalBackend(Backend):
         Args:
             model: An art.Model instance.
         """
+        # Ensure model state/logging uses the backend path
+        model.base_path = self._path
         output_dir = get_model_dir(model=model, art_path=self._path)
         os.makedirs(output_dir, exist_ok=True)
         with open(f"{output_dir}/model.json", "w") as f:
