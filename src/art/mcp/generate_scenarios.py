@@ -1,27 +1,17 @@
-"""Scenario generation for MCP tools."""
+"""Scenario generation for MCP tools using local MCP server for JSON formatting."""
 
+import asyncio
 import json
+import os
 import time
 from typing import Any, Dict, List, Optional
 
 import openai
+from mcp import ClientSession, StdioServerParameters
+from mcp.client.stdio import stdio_client
 
 from art.mcp.types import GeneratedScenarioCollection, MCPResource, MCPTool
 from art.utils.logging import _C, dim, err, info, ok, step
-
-
-def preview_scenarios(scenarios: List[Dict[str, Any]], n: int = 5):
-    """Preview generated scenarios."""
-    n = min(n, len(scenarios))
-    for i in range(n):
-        s = scenarios[i]
-        task_preview = s["task"][:120].strip()
-        ellipsis = "&" if len(s["task"]) > 120 else ""
-        difficulty = s.get("difficulty", "N/A")
-        dim(
-            f"   {i + 1}. {task_preview}{ellipsis}  "
-            f"{_C.GRAY}(difficulty {difficulty}/5){_C.RESET}"
-        )
 
 
 async def generate_scenarios(
@@ -33,9 +23,11 @@ async def generate_scenarios(
     generator_model: str = "openai/gpt-4.1-mini",
     generator_api_key: Optional[str] = None,
     generator_base_url: str = "https://openrouter.ai/api/v1",
+    mcp_server_command: str = "python",
+    mcp_server_args: Optional[List[str]] = None,
 ) -> GeneratedScenarioCollection:
     """
-    Generate scenarios for MCP tools.
+    Generate scenarios for MCP tools using an MCP server for JSON formatting.
 
     Args:
         tools: List of Tool objects or list of tool dictionaries
@@ -44,13 +36,16 @@ async def generate_scenarios(
         show_preview: Whether to show a preview of generated scenarios (default: True)
         custom_instructions: Optional custom instructions for scenario generation
         generator_model: Model to use for generation (default: "openai/gpt-4.1-mini")
-        generator_api_key: API key for the generator model. If None, will use OPENROUTER_API_KEY env var
+        generator_api_key: API key for the generator model
         generator_base_url: Base URL for the API (default: OpenRouter)
+        mcp_server_command: Command to start MCP server (default: "python")
+        mcp_server_args: Args for MCP server (default: None, will use bundled format_server)
 
     Returns:
         GeneratedScenarioCollection containing the generated scenarios
     """
-    import os
+    if mcp_server_args is None:
+        mcp_server_args = ["format_server.py"]  # Will be replaced with bundled version
 
     t0 = time.perf_counter()
 
@@ -62,58 +57,54 @@ async def generate_scenarios(
                 "generator_api_key is required or OPENROUTER_API_KEY env var must be set"
             )
 
-    # Validate that we have at least tools or resources
+    # Validate inputs
     if not tools and not resources:
         raise ValueError("At least one tool or resource must be provided")
 
     ok(f"Using model: {generator_model}")
 
     # Convert tools to dictionaries
-    if isinstance(tools, list) and tools and isinstance(tools[0], MCPTool):
-        tools_info = [tool.to_dict() for tool in tools]  # type: ignore
+    if tools and hasattr(tools[0], 'to_dict'):
+        tools_info = [tool.to_dict() for tool in tools]
     else:
-        # Assume it's already a list of dictionaries
         tools_info = [
             {
-                "name": tool.get("name", "")
-                if isinstance(tool, dict)
-                else getattr(tool, "name", ""),
-                "description": tool.get("description", "")
-                if isinstance(tool, dict)
-                else getattr(tool, "description", ""),
-                "parameters": tool.get("parameters", {})
-                if isinstance(tool, dict)
-                else getattr(tool, "parameters", {}),
+                "name": tool.get("name", "") if isinstance(tool, dict) else getattr(tool, "name", ""),
+                "description": tool.get("description", "") if isinstance(tool, dict) else getattr(tool, "description", ""),
+                "parameters": tool.get("parameters", {}) if isinstance(tool, dict) else getattr(tool, "parameters", {}),
             }
             for tool in tools
         ]
 
     # Convert resources to dictionaries
-    if resources is None:
-        resources_info = []
-    elif (
-        isinstance(resources, list)
-        and resources
-        and isinstance(resources[0], MCPResource)
-    ):
-        resources_info = [resource.to_dict() for resource in resources]  # type: ignore
+    if resources and hasattr(resources[0], 'to_dict'):
+        resources_info = [resource.to_dict() for resource in resources]
     else:
-        # Assume it's already a list of dictionaries
         resources_info = resources or []
+    
+    # Ensure all values are JSON-serializable (convert AnyUrl, etc.)
+    def make_serializable(obj):
+        """Convert objects to JSON-serializable types."""
+        if isinstance(obj, dict):
+            return {k: make_serializable(v) for k, v in obj.items()}
+        elif isinstance(obj, list):
+            return [make_serializable(item) for item in obj]
+        elif hasattr(obj, '__str__') and not isinstance(obj, (str, int, float, bool, type(None))):
+            return str(obj)
+        return obj
+    
+    resources_info = [make_serializable(r) for r in resources_info]
 
     info(f"Available: {len(tools_info)} tool(s), {len(resources_info)} resource(s).")
 
-    step("Preparing prompt & JSON schema &")
+    step("Preparing prompt for scenario generation")
     tools_description = json.dumps(tools_info, indent=2)
     resources_description = (
-        json.dumps(resources_info, indent=2)
-        if resources_info
-        else "No resources available"
+        json.dumps(resources_info, indent=2) if resources_info else "No resources available"
     )
 
-    prompt = f"""You are an expert at creating realistic scenarios for testing AI agents that interact with MCP (Model Context Protocol) servers.
-
-Given the following available tools and resources from an MCP server, generate {num_scenarios} diverse, realistic scenarios that a user might want to accomplish using these tools.
+    # Simple prompt that asks for plain text output
+    prompt = f"""Generate {num_scenarios} diverse, realistic scenarios for testing AI agents with these MCP tools and resources.
 
 AVAILABLE TOOLS:
 {tools_description}
@@ -121,96 +112,106 @@ AVAILABLE TOOLS:
 AVAILABLE RESOURCES:
 {resources_description}
 
-Requirements for scenarios:
-1. Each scenario should be a task that can be accomplished using the available tools
-2. Scenarios should vary in complexity - some simple (1-2 tool calls), some complex (multiple tool calls)
-3. Scenarios should cover different use cases and tool combinations (though the task should not specify which tools to use)
-4. Each scenario should be realistic - something a real user might actually want to do
-5. Assign a difficulty rating from 1 (easy, single tool call) to 5 (hard, complex multi-step analysis)
-6. The task should always include generating a summary of the work done and a thorough analysis and report of the results
+Requirements:
+1. Each scenario should use the available tools
+2. Vary complexity from simple (1-2 tool calls) to complex (multiple tool calls)
+3. Cover different use cases and tool combinations
+4. Make scenarios realistic - what real users would actually want to do
+5. Rate difficulty from 1 (easy, single tool) to 5 (hard, complex multi-step)
+6. Tasks should include generating summaries and thorough analysis/reports
 
-You must respond with a JSON object containing a "scenarios" array of exactly {num_scenarios} objects. Each object must have:
-- "task": string describing the scenario
-- "difficulty": integer from 1-5 representing complexity
-"""
+{f"CUSTOM INSTRUCTIONS: {custom_instructions}" if custom_instructions else ""}
 
-    if custom_instructions:
-        prompt += f"\n\nPay close attention to the following instructions when generating scenarios:\n\n{custom_instructions}"
+For each scenario, provide:
+- A task description (what the user wants to accomplish)
+- A difficulty rating (1-5)
 
-    response_schema = {
-        "type": "object",
-        "properties": {
-            "scenarios": {
-                "type": "array",
-                "items": {
-                    "type": "object",
-                    "properties": {
-                        "task": {"type": "string"},
-                        "difficulty": {"type": "integer", "minimum": 1, "maximum": 5},
-                    },
-                    "required": ["task", "difficulty"],
-                    "additionalProperties": False,
-                },
-                "minItems": num_scenarios,
-                "maxItems": num_scenarios,
-            }
-        },
-        "required": ["scenarios"],
-        "additionalProperties": False,
-    }
+Format each scenario as:
+SCENARIO N:
+Task: [description]
+Difficulty: [1-5]
 
-    step(f"Calling model: {_C.BOLD}{generator_model}{_C.RESET} &")
-    client_openai = openai.OpenAI(
-        api_key=generator_api_key,
-        base_url=generator_base_url,
-    )
+Generate exactly {num_scenarios} scenarios."""
+
+    step(f"Calling model: {_C.BOLD}{generator_model}{_C.RESET}")
+    client = openai.OpenAI(api_key=generator_api_key, base_url=generator_base_url)
 
     t1 = time.perf_counter()
-    response = client_openai.chat.completions.create(
+    response = client.chat.completions.create(
         model=generator_model,
         messages=[{"role": "user", "content": prompt}],
         max_completion_tokens=8000,
-        response_format={
-            "type": "json_schema",
-            "json_schema": {"name": "scenario_list", "schema": response_schema},
-        },
     )
     dt = time.perf_counter() - t1
     ok(f"Model responded in {dt:.2f}s.")
 
     content = response.choices[0].message.content
-    if content is None:
-        err("Model response content is None.")
+    if not content:
         raise ValueError("Model response content is None")
+
     info(f"Raw content length: {len(content)} chars.")
 
-    # Parse JSON
-    try:
-        result = json.loads(content)
-    except Exception as e:
-        err("Failed to parse JSON from model response.")
-        dim(f"   Exception: {e}")
-        dim("   First 500 chars of response content:")
-        dim(content[:500] if content else "No content")
-        raise
+    # Parse plain text response
+    step("Parsing model output")
+    scenarios_raw = _parse_plain_text_scenarios(content)
+    
+    if len(scenarios_raw) != num_scenarios:
+        dim(f"   Warning: Expected {num_scenarios} scenarios, got {len(scenarios_raw)}.")
 
-    # Extract scenarios
-    if "scenarios" in result:
-        scenarios = result["scenarios"]
+    # Use MCP server to format into proper JSON
+    step("Connecting to MCP server for JSON formatting")
+    
+    # If no custom command provided, use the bundled format_server
+    if mcp_server_command == "python" and mcp_server_args == ["format_server.py"]:
+        import art.mcp.format_server
+        server_script = art.mcp.format_server.__file__
+        server_params = StdioServerParameters(
+            command=mcp_server_command,
+            args=[server_script],
+        )
     else:
-        scenarios = result if isinstance(result, list) else list(result.values())[0]
+        server_params = StdioServerParameters(
+            command=mcp_server_command,
+            args=mcp_server_args,
+        )
+    
+    formatted_scenarios = []
+    
+    async with stdio_client(server_params) as (read, write):
+        async with ClientSession(read, write) as session:
+            # Initialize the connection
+            await session.initialize()
+            
+            # Get available tools
+            tools_response = await session.list_tools()
+            
+            if not tools_response.tools:
+                raise ValueError("MCP server has no tools available")
+            
+            format_tool = tools_response.tools[0]  # Use first tool
+            ok(f"Using MCP tool: {format_tool.name}")
+            
+            # Format each scenario through MCP
+            for i, scenario in enumerate(scenarios_raw):
+                result = await session.call_tool(
+                    format_tool.name,
+                    arguments={
+                        "task": scenario["task"],
+                        "difficulty": scenario["difficulty"],
+                    }
+                )
+                
+                # Extract text content
+                if result.content and hasattr(result.content[0], 'text'):
+                    formatted_scenarios.append(json.loads(result.content[0].text))
+                
+                if (i + 1) % 5 == 0:
+                    info(f"Formatted {i + 1}/{len(scenarios_raw)} scenarios")
 
-    # Validate count
-    if len(scenarios) != num_scenarios:
-        err(f"Expected {num_scenarios} scenarios, got {len(scenarios)}.")
-        raise ValueError(f"Expected {num_scenarios} scenarios, got {len(scenarios)}")
+    ok(f"Formatted {len(formatted_scenarios)} scenarios via MCP server.")
 
-    ok(f"Parsed {len(scenarios)} scenario(s) successfully.")
-
-    # Convert to ScenarioCollection
-    scenario_collection = GeneratedScenarioCollection.from_dicts(scenarios)
-
-    # Show difficulty distribution and preview using the collection methods
+    # Create collection
+    scenario_collection = GeneratedScenarioCollection.from_dicts(formatted_scenarios)
     scenario_collection.print_difficulty_distribution()
 
     if show_preview:
@@ -220,3 +221,33 @@ You must respond with a JSON object containing a "scenarios" array of exactly {n
     ok(f"Generated {len(scenario_collection)} scenarios in {total_time:.2f}s total.")
 
     return scenario_collection
+
+
+def _parse_plain_text_scenarios(content: str) -> List[Dict[str, Any]]:
+    """Parse plain text scenarios from model output."""
+    scenarios = []
+    lines = content.strip().split("\n")
+    
+    current_scenario = {}
+    for line in lines:
+        line = line.strip()
+        
+        if line.startswith("Task:") or line.startswith("task:"):
+            current_scenario["task"] = line.split(":", 1)[1].strip()
+        elif line.startswith("Difficulty:") or line.startswith("difficulty:"):
+            try:
+                diff = int(line.split(":", 1)[1].strip().split()[0])
+                current_scenario["difficulty"] = max(1, min(5, diff))
+            except (ValueError, IndexError):
+                current_scenario["difficulty"] = 3
+            
+            # Scenario complete
+            if current_scenario.get("task"):
+                scenarios.append(current_scenario)
+                current_scenario = {}
+    
+    # Handle last scenario if needed
+    if current_scenario.get("task") and current_scenario.get("difficulty"):
+        scenarios.append(current_scenario)
+    
+    return scenarios

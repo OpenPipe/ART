@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """Test scenario generation functionality."""
 
 import asyncio
@@ -117,7 +116,9 @@ async def test_basic_scenario_generation():
             tools=tools,
             num_scenarios=5,
             show_preview=True,
-            generator_model="openai/gpt-4o-mini",  # Use a cheaper model for testing
+            generator_model="gpt-oss",  # Use a cheaper model for testing
+            generator_api_key="sk-1234",
+            generator_base_url="http://vllm:8000/v1"
         )
 
         print(f"[PASS] Generated {len(scenarios)} scenarios successfully")
@@ -161,7 +162,9 @@ async def test_scenario_generation_with_resources():
             num_scenarios=3,
             show_preview=True,
             custom_instructions="Focus on file management and code analysis tasks.",
-            generator_model="openai/gpt-4o-mini",
+            generator_model="gpt-oss",  # Use a cheaper model for testing
+            generator_api_key="sk-1234",
+            generator_base_url="http://vllm:8000/v1"
         )
 
         print(f"[PASS] Generated {len(scenarios)} scenarios with resources")
@@ -225,7 +228,9 @@ async def test_dict_input_compatibility():
             resources=resources_dict,
             num_scenarios=3,
             show_preview=False,  # Don't show preview to keep output clean
-            generator_model="openai/gpt-4o-mini",
+            generator_model="gpt-oss",
+            generator_base_url="http://vllm:8000/v1",
+            generator_api_key="sk-1234"
         )
 
         print(f"[PASS] Dictionary input test passed: {len(scenarios)} scenarios")
@@ -246,7 +251,10 @@ async def test_error_handling():
             tools=[],
             num_scenarios=1,
             show_preview=False,
-            generator_model="openai/gpt-4o-mini",
+            generator_model="gpt-oss",
+            generator_base_url="http://vllm:8000/v1",
+            generator_api_key="sk-1234"
+
         )
         print("[FAIL] Should have failed with empty tools list")
         return False
@@ -261,8 +269,9 @@ async def test_error_handling():
             tools=tools,
             num_scenarios=1,
             show_preview=False,
-            generator_model="openai/gpt-4o-mini",
-            generator_api_key="invalid_key",
+            generator_model="gpt-oss",
+            generator_base_url="http://vllm:8000/v1",
+            generator_api_key="sk-1234"
         )
         print("[FAIL] Should have failed with invalid API key")
         return False
