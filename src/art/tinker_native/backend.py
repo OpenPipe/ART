@@ -5,7 +5,7 @@ from dataclasses import dataclass
 import os
 import re
 import time
-from typing import Any, Iterable, Literal, cast
+from typing import Any, Awaitable, Iterable, Literal, TypeVar, cast
 import uuid
 
 from fastapi import FastAPI, HTTPException
@@ -43,6 +43,7 @@ from .data import (
 
 STATE_KEY_RUN_IDS = "tinker_run_ids"
 STATE_KEY_LATEST_STEP = "latest_step"
+T = TypeVar("T")
 
 
 @dataclass
@@ -72,6 +73,9 @@ class TinkerNativeModelConfig:
 
 
 class TinkerNativeBackend(Backend):
+    _tinker_train_log_env = "ART_TINKER_TRAIN_LOG"
+    _tinker_sample_log_env = "ART_TINKER_SAMPLE_LOG"
+
     def __init__(
         self,
         *,
@@ -88,6 +92,52 @@ class TinkerNativeBackend(Backend):
         self._path = path or ".art"
         os.makedirs(self._path, exist_ok=True)
         self._model_state: dict[str, ModelState] = {}
+
+    def _env_enabled(self, env_name: str) -> bool:
+        value = os.getenv(env_name)
+        if value is None:
+            return False
+        return value.lower() not in ("", "0", "false", "no")
+
+    def _timestamp(self) -> str:
+        return time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
+
+    async def _tinker_call(
+        self,
+        label: str,
+        awaitable: Awaitable[T],
+        *,
+        env_name: str,
+        prefix: str,
+    ) -> T:
+        if not self._env_enabled(env_name):
+            return await awaitable
+        start = time.perf_counter()
+        print(f"[tinker:{prefix}] {label} start {self._timestamp()}")
+        try:
+            return await awaitable
+        finally:
+            elapsed = time.perf_counter() - start
+            print(
+                f"[tinker:{prefix}] {label} done in {elapsed:.2f}s "
+                f"at {self._timestamp()}"
+            )
+
+    async def _tinker_train_call(self, label: str, awaitable: Awaitable[T]) -> T:
+        return await self._tinker_call(
+            label,
+            awaitable,
+            env_name=self._tinker_train_log_env,
+            prefix="train",
+        )
+
+    async def _tinker_sample_call(self, label: str, awaitable: Awaitable[T]) -> T:
+        return await self._tinker_call(
+            label,
+            awaitable,
+            env_name=self._tinker_sample_log_env,
+            prefix="sample",
+        )
 
     async def close(self) -> None:
         for state in self._model_state.values():
@@ -189,12 +239,17 @@ class TinkerNativeBackend(Backend):
                 model_input=datum.model_input, loss_fn_inputs=loss_fn_inputs
             )
 
-        forward_output = await state.training_client.forward_backward(
-            [remove_mask(datum) for datum in datums],
-            loss_fn=loss_fn,
-            loss_fn_config=loss_fn_config,
+        forward_output = await self._tinker_train_call(
+            "forward_backward",
+            state.training_client.forward_backward(
+                [remove_mask(datum) for datum in datums],
+                loss_fn=loss_fn,
+                loss_fn_config=loss_fn_config,
+            ),
         )
-        optim_output = await state.training_client.optim_step(adam_params)
+        optim_output = await self._tinker_train_call(
+            "optim_step", state.training_client.optim_step(adam_params)
+        )
 
         if forward_output.metrics:
             for key, value in forward_output.metrics.items():
@@ -219,8 +274,11 @@ class TinkerNativeBackend(Backend):
             sampler_response = await self._save_sampler_weights(
                 state.training_client, checkpoint_name
             )
-        sampler_client = await state.training_client.create_sampling_client_async(
-            model_path=sampler_response.path
+        sampler_client = await self._tinker_train_call(
+            "create_sampling_client_async",
+            state.training_client.create_sampling_client_async(
+                model_path=sampler_response.path
+            ),
         )
         state.sampler_clients[next_step] = sampler_client
         state.sampler_checkpoint_paths[next_step] = sampler_response.path
@@ -290,10 +348,13 @@ class TinkerNativeBackend(Backend):
                 top_p=top_p if top_p is not None else 1.0,
                 stop=state.renderer.get_stop_sequences(),
             )
-            sample_response = await sampler_client.sample_async(
-                prompt=prompt,
-                num_samples=body.get("n") or 1,
-                sampling_params=sampling_params,
+            sample_response = await self._tinker_sample_call(
+                "sample_async",
+                sampler_client.sample_async(
+                    prompt=prompt,
+                    num_samples=body.get("n") or 1,
+                    sampling_params=sampling_params,
+                ),
             )
 
             choices: list[Choice] = []
@@ -313,10 +374,10 @@ class TinkerNativeBackend(Backend):
                     tool_calls = [
                         ChatCompletionMessageFunctionToolCall(
                             type="function",
-                            id=tool_call.get("id", ""),
+                            id=tool_call["id"],
                             function=Function(
-                                name=tool_call["function"].get("name", ""),
-                                arguments=tool_call["function"].get("arguments", ""),
+                                name=tool_call["function"]["name"],
+                                arguments=tool_call["function"]["arguments"],
                             ),
                         )
                         for tool_call in parsed_message["tool_calls"]
@@ -428,8 +489,11 @@ class TinkerNativeBackend(Backend):
                 reset_optimizer=False,
             )
         else:
-            training_client = await service_client.create_lora_training_client_async(
-                model.base_model, **config.training_client_args
+            training_client = await self._tinker_train_call(
+                "create_lora_training_client_async",
+                service_client.create_lora_training_client_async(
+                    model.base_model, **config.training_client_args
+                ),
             )
             checkpoint_name = f"step_{current_step:06d}"
             sampler_response = await self._save_sampler_weights(
@@ -443,10 +507,11 @@ class TinkerNativeBackend(Backend):
 
         sampler_clients: dict[int, tinker.SamplingClient] = {}
         if current_step in sampler_paths:
-            sampler_clients[
-                current_step
-            ] = await training_client.create_sampling_client_async(
-                model_path=sampler_paths[current_step]
+            sampler_clients[current_step] = await self._tinker_train_call(
+                "create_sampling_client_async",
+                training_client.create_sampling_client_async(
+                    model_path=sampler_paths[current_step]
+                ),
             )
         else:
             checkpoint_name = f"step_{current_step:06d}"
@@ -454,10 +519,11 @@ class TinkerNativeBackend(Backend):
                 training_client, checkpoint_name
             )
             sampler_paths[current_step] = sampler_response.path
-            sampler_clients[
-                current_step
-            ] = await training_client.create_sampling_client_async(
-                model_path=sampler_response.path
+            sampler_clients[current_step] = await self._tinker_train_call(
+                "create_sampling_client_async",
+                training_client.create_sampling_client_async(
+                    model_path=sampler_response.path
+                ),
             )
 
         state = ModelState(
@@ -515,7 +581,10 @@ class TinkerNativeBackend(Backend):
 
         for run_id in tinker_run_ids:
             try:
-                response = await rest_client.list_checkpoints_async(run_id)
+                response = await self._tinker_train_call(
+                    f"list_checkpoints_async {run_id}",
+                    rest_client.list_checkpoints_async(run_id),
+                )
             except Exception as exc:
                 print(f"Warning: Could not list checkpoints for {run_id}: {exc}")
                 continue
@@ -552,8 +621,11 @@ class TinkerNativeBackend(Backend):
                 detail=f"No sampler checkpoint for step {actual_step}. Available: {available}",
             )
 
-        sampler_client = await state.training_client.create_sampling_client_async(
-            model_path=state.sampler_checkpoint_paths[actual_step]
+        sampler_client = await self._tinker_train_call(
+            "create_sampling_client_async",
+            state.training_client.create_sampling_client_async(
+                model_path=state.sampler_checkpoint_paths[actual_step]
+            ),
         )
         state.sampler_clients[actual_step] = sampler_client
         return sampler_client
@@ -610,18 +682,29 @@ class TinkerNativeBackend(Backend):
         training_client_args: dict[str, Any],
         reset_optimizer: bool = False,
     ) -> tinker.TrainingClient:
-        training_client = await service_client.create_lora_training_client_async(
-            base_model, **training_client_args
+        training_client = await self._tinker_train_call(
+            "create_lora_training_client_async",
+            service_client.create_lora_training_client_async(
+                base_model, **training_client_args
+            ),
         )
 
         if reset_optimizer:
-            load_future = await training_client.load_state_async(checkpoint_state_path)
-            await load_future.result_async()
-        else:
-            load_future = await training_client.load_state_with_optimizer_async(
-                checkpoint_state_path
+            load_future = await self._tinker_train_call(
+                "load_state_async",
+                training_client.load_state_async(checkpoint_state_path),
             )
-            await load_future.result_async()
+            await self._tinker_train_call(
+                "load_state_result_async", load_future.result_async()
+            )
+        else:
+            load_future = await self._tinker_train_call(
+                "load_state_with_optimizer_async",
+                training_client.load_state_with_optimizer_async(checkpoint_state_path),
+            )
+            await self._tinker_train_call(
+                "load_state_with_optimizer_result_async", load_future.result_async()
+            )
 
         return training_client
 
@@ -631,11 +714,21 @@ class TinkerNativeBackend(Backend):
         checkpoint_name: str,
     ) -> tuple[Any, Any]:
         state_future, sampler_future = await asyncio.gather(
-            training_client.save_state_async(checkpoint_name),
-            training_client.save_weights_for_sampler_async(checkpoint_name),
+            self._tinker_train_call(
+                "save_state_async",
+                training_client.save_state_async(checkpoint_name),
+            ),
+            self._tinker_train_call(
+                "save_weights_for_sampler_async",
+                training_client.save_weights_for_sampler_async(checkpoint_name),
+            ),
         )
-        state_result = await state_future.result_async()
-        sampler_result = await sampler_future.result_async()
+        state_result = await self._tinker_train_call(
+            "save_state_result_async", state_future.result_async()
+        )
+        sampler_result = await self._tinker_train_call(
+            "save_weights_for_sampler_result_async", sampler_future.result_async()
+        )
         return state_result, sampler_result
 
     async def _save_sampler_weights(
@@ -643,18 +736,26 @@ class TinkerNativeBackend(Backend):
         training_client: tinker.TrainingClient,
         checkpoint_name: str,
     ) -> Any:
-        sampler_future = await training_client.save_weights_for_sampler_async(
-            checkpoint_name
+        sampler_future = await self._tinker_train_call(
+            "save_weights_for_sampler_async",
+            training_client.save_weights_for_sampler_async(checkpoint_name),
         )
-        return await sampler_future.result_async()
+        return await self._tinker_train_call(
+            "save_weights_for_sampler_result_async", sampler_future.result_async()
+        )
 
     async def _save_training_state(
         self,
         training_client: tinker.TrainingClient,
         checkpoint_name: str,
     ) -> Any:
-        state_future = await training_client.save_state_async(checkpoint_name)
-        return await state_future.result_async()
+        state_future = await self._tinker_train_call(
+            "save_state_async",
+            training_client.save_state_async(checkpoint_name),
+        )
+        return await self._tinker_train_call(
+            "save_state_result_async", state_future.result_async()
+        )
 
     def _persist_model_state(self, model: TrainableModel, state: ModelState) -> None:
         model.merge_state(
