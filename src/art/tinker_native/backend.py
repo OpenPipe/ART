@@ -30,7 +30,7 @@ from .. import dev
 from ..backend import Backend
 from ..model import Model, TrainableModel
 from ..tinker.backend import get_renderer_name
-from ..tinker.service import get_free_port
+from ..tinker.server import get_free_port
 from ..trajectories import TrajectoryGroup
 from ..types import TrainResult
 from ..utils.output_dirs import get_model_dir

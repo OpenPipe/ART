@@ -5038,8 +5038,6 @@ dependencies = [
     { name = "polars" },
     { name = "setproctitle" },
     { name = "tblib" },
-    { name = "tinker" },
-    { name = "tinker-cookbook" },
     { name = "typer" },
     { name = "weave" },
 ]
@@ -5131,8 +5129,6 @@ requires-dist = [
     { name = "setuptools", marker = "extra == 'backend'", specifier = ">=78.1.0" },
     { name = "skypilot", extras = ["cudo", "do", "fluidstack", "gcp", "lambda", "kubernetes", "paperspace", "runpod"], marker = "extra == 'skypilot'", specifier = "==0.10.5" },
     { name = "tblib", specifier = ">=3.0.0" },
-    { name = "tinker", specifier = ">=0.8.1" },
-    { name = "tinker-cookbook", specifier = ">=0.1.0" },
     { name = "torch", marker = "extra == 'backend'", specifier = ">=2.8.0" },
     { name = "torchao", marker = "extra == 'backend'", specifier = "==0.14.1" },
     { name = "transformers", marker = "extra == 'backend'", specifier = ">=4.55.2,<=4.57.3" },
@@ -5164,7 +5160,7 @@ dev = [
 ]
 tinker = [
     { name = "fastapi", specifier = ">=0.128.0" },
-    { name = "tinker", specifier = ">=0.7.0" },
+    { name = "tinker", specifier = ">=0.8.1" },
     { name = "tinker-cookbook", specifier = ">=0.1.0" },
     { name = "uvicorn", specifier = ">=0.35.0" },
 ]

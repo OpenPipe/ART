@@ -9,8 +9,6 @@ dependencies = [
     "typer>=0.15.2",
     "litellm>=1.71.1",
     "weave>=0.52.23",
-    "tinker>=0.8.1",
-    "tinker-cookbook>=0.1.0",
     "polars>=1.26.0",
     "tblib>=3.0.0",
     "nest-asyncio>=1.6.0",
@@ -115,6 +113,9 @@ unused-ignore-comment = "ignore"
 # Allow unresolved imports for optional dependencies that may not be installed locally.
 # In CI, we install all optional deps so these will be resolved and type-checked.
 allowed-unresolved-imports = [
+    # tinker deps
+    "tinker.**",
+    "tinker_cookbook.**",
     # backend deps
     "accelerate.**",
     "awscli.**",
@@ -167,7 +168,7 @@ dev = [
 ]
 tinker = [
     "fastapi>=0.128.0",
-    "tinker>=0.7.0",
+    "tinker>=0.8.1",
     "tinker-cookbook>=0.1.0",
     "uvicorn>=0.35.0",
 ]

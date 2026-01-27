@@ -308,7 +308,7 @@ class Model(
         existing = self.read_state() or {}
         merged = self._deep_merge_dicts(existing, state)
         self.overwrite_state(merged)
-        return merged
+        return cast(StateType, merged)
 
     @staticmethod
     def _deep_merge_dicts(

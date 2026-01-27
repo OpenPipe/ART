@@ -70,16 +70,20 @@ async def test_tinker_native_backend():
             current_step = await model.get_step()
             model_name_step = model.get_inference_name(step=current_step)
             prompts = ["Say yes", "Say no", "Say maybe"]
+
+            async def make_group(prompt: str) -> art.TrajectoryGroup:
+                import asyncio
+
+                trajectories = await asyncio.gather(
+                    *[
+                        simple_rollout(openai_client, model_name_step, prompt)
+                        for _ in range(2)
+                    ]
+                )
+                return art.TrajectoryGroup(trajectories)  # type: ignore[attr-defined]
+
             train_groups = await art.gather_trajectory_groups(  # type: ignore[attr-defined]
-                [
-                    art.TrajectoryGroup(  # type: ignore[attr-defined]
-                        [
-                            simple_rollout(openai_client, model_name_step, prompt)
-                            for _ in range(2)
-                        ]
-                    )
-                    for prompt in prompts
-                ]
+                [make_group(prompt) for prompt in prompts]
             )
             ensure_reward_variance(train_groups)
 
