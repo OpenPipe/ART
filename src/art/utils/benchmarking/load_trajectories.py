@@ -239,7 +239,7 @@ async def load_trajectories(
                 }
                 if msg_dict.get("tool_calls"):
                     try:
-                        processed_msg["tool_calls"] = json.loads(msg_dict["tool_calls"])
+                        processed_msg["tool_calls"] = json.loads(msg_dict["tool_calls"])  # ty:ignore[invalid-argument-type]
                     except (json.JSONDecodeError, TypeError):
                         pass
 

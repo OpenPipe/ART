@@ -331,7 +331,7 @@ Examples:
             processed_config = config.copy()
 
         # Resolve path relative to this file
-        p = (here / processed_config["path"]).resolve()
+        p = (here / processed_config["path"]).resolve()  # ty:ignore[unsupported-operator]
         if not p.exists():
             print(f"Warning: notebook not found: {p}")
         processed_config["path"] = str(p)

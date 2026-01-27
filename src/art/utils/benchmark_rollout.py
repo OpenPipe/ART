@@ -11,7 +11,7 @@ async def benchmark_rollout(
     rollout: Callable[[str, int, bool], Coroutine[Any, Any, Trajectory]],
 ) -> float:
     trajectory_groups = await art.gather_trajectory_groups(
-        [TrajectoryGroup(rollout(model, i, False) for i in range(num_rollouts))],
+        [TrajectoryGroup(rollout(model, i, False) for i in range(num_rollouts))],  # ty:ignore[invalid-argument-type]
         pbar_desc="Benchmarking rollout",
     )
 

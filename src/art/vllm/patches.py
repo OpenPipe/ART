@@ -11,12 +11,12 @@ def subclass_chat_completion_request() -> None:
 
     class ChatCompletionRequest(vllm.entrypoints.openai.protocol.ChatCompletionRequest):
         def __init__(self, *args: object, **kwargs: object) -> None:
-            super().__init__(*args, **kwargs)
+            super().__init__(*args, **kwargs)  # ty:ignore[invalid-argument-type]
             self.logprobs = True
             if self.top_logprobs is None:
                 self.top_logprobs = 0
 
-    vllm.entrypoints.openai.protocol.ChatCompletionRequest = ChatCompletionRequest
+    vllm.entrypoints.openai.protocol.ChatCompletionRequest = ChatCompletionRequest  # ty:ignore[invalid-assignment]
 
 
 def patch_listen_for_disconnect() -> None:
@@ -32,7 +32,7 @@ def patch_listen_for_disconnect() -> None:
     # Replace the original function
     import vllm.entrypoints.utils
 
-    vllm.entrypoints.utils.listen_for_disconnect = patched_listen_for_disconnect
+    vllm.entrypoints.utils.listen_for_disconnect = patched_listen_for_disconnect  # ty:ignore[invalid-assignment]
 
 
 def patch_tool_parser_manager() -> None:
@@ -54,7 +54,7 @@ def patch_tool_parser_manager() -> None:
         ) -> Any:
             return original(*args, **kwargs) or DeltaMessage()
 
-        tool_parser_class.extract_tool_calls_streaming = patch
+        tool_parser_class.extract_tool_calls_streaming = patch  # ty:ignore[invalid-assignment]
         return tool_parser_class
 
-    ToolParserManager.get_tool_parser = patched_get_tool_parser
+    ToolParserManager.get_tool_parser = patched_get_tool_parser  # ty:ignore[invalid-assignment]

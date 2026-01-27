@@ -81,17 +81,17 @@ def message_or_choice_to_dict(message_or_choice: MessageOrChoice) -> dict[str, A
     item_dict = (
         message_or_choice
         if isinstance(message_or_choice, dict)
-        else message_or_choice.to_dict()
+        else message_or_choice.to_dict()  # ty:ignore[possibly-missing-attribute]
     )
 
     if "logprobs" in item_dict:
         # item is a choice with logprobs, remove the logprobs
-        item_dict.pop("logprobs")
+        item_dict.pop("logprobs")  # ty:ignore[invalid-argument-type]
 
     if "content" in item_dict and isinstance(item_dict["content"], Iterator):
         item_dict["content"] = list(item_dict["content"])  # type: ignore
 
-    return dict(item_dict)
+    return dict(item_dict)  # ty:ignore[no-matching-overload]
 
 
 def deserialize_trajectory_groups(serialized: str) -> list[TrajectoryGroup]:

@@ -186,7 +186,7 @@ async def ruler(
     first_choice = response.choices[0]
 
     if debug:
-        raw_content = first_choice.message.content or "{}"  # type: ignore[attr-defined]
+        raw_content = first_choice.message.content or "{}"
         try:
             print("\n[RULER] Pretty-printed LLM choice JSON:")
             print(json.loads(raw_content))
@@ -194,7 +194,7 @@ async def ruler(
             print(f"[RULER] Could not parse choice content as JSON: {e}")
             print(f"[RULER] Raw choice content: {raw_content}")
 
-    content = first_choice.message.content or "{}"  # type: ignore[attr-defined]
+    content = first_choice.message.content or "{}"
     parsed = Response.model_validate_json(content)
 
     # If all trajectories were identical, we only sent one to the judge

@@ -34,4 +34,4 @@ def _patched_preprocess_mask_arguments(
 
 
 def patch_preprocess_mask_arguments() -> None:
-    masking_utils._preprocess_mask_arguments = _patched_preprocess_mask_arguments
+    masking_utils._preprocess_mask_arguments = _patched_preprocess_mask_arguments  # ty:ignore[invalid-assignment]

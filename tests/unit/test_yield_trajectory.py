@@ -150,5 +150,5 @@ async def test_yield_trajectory(test_server: None) -> None:
     trajectory = await art.capture_yielded_trajectory(say_hi())
     assert trajectory.messages_and_choices == [
         {"role": "user", "content": "Hi!"},
-        Choice(**mock_response["choices"][0]),
+        Choice(**mock_response["choices"][0]),  # ty:ignore[invalid-argument-type, not-subscriptable]
     ]

@@ -87,9 +87,9 @@ class Trajectory(pydantic.BaseModel):
         for message_or_choice in self.messages_and_choices:
             trainable = isinstance(message_or_choice, Choice)
             message = (
-                message_or_choice.message.to_dict() if trainable else message_or_choice
+                message_or_choice.message.to_dict() if trainable else message_or_choice  # ty:ignore[possibly-missing-attribute]
             )
-            loggable_dict["messages"].append({**message, "trainable": trainable})
+            loggable_dict["messages"].append({**message, "trainable": trainable})  # ty:ignore[invalid-argument-type, possibly-missing-attribute]
         return loggable_dict
 
 
@@ -112,7 +112,7 @@ def get_messages(messages_and_choices: MessagesAndChoices) -> Messages:
                         }
                         if tool_calls
                         else {}
-                    ),  # type: ignore
+                    ),
                 }
             )
         else:

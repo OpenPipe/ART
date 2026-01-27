@@ -102,6 +102,53 @@ asyncio_mode = "auto"
 [tool.uv]
 required-version = ">=0.6.15"
 
+[tool.ty.environment]
+python-version = "3.11"
+
+[tool.ty.rules]
+# Ignore unused-ignore-comment warnings because they vary depending on whether
+# optional deps are installed. The ty:ignore comments are needed in CI (with all deps)
+# but become unused locally (without all deps).
+unused-ignore-comment = "ignore"
+
+[tool.ty.analysis]
+# Allow unresolved imports for optional dependencies that may not be installed locally.
+# In CI, we install all optional deps so these will be resolved and type-checked.
+allowed-unresolved-imports = [
+    # backend deps
+    "accelerate.**",
+    "awscli.**",
+    "bitsandbytes.**",
+    "duckdb.**",
+    "fastapi.**",
+    "gql.**",
+    "hf_xet.**",
+    "nbclient.**",
+    "nbmake.**",
+    "peft.**",
+    "pyarrow.**",
+    "torch.**",
+    "torchao.**",
+    "transformers.**",
+    "trl.**",
+    "unsloth.**",
+    "unsloth_zoo.**",
+    "uvicorn.**",
+    "vllm.**",
+    "wandb.**",
+    # skypilot deps
+    "semver.**",
+    "sky.**",
+    "skypilot.**",
+    # langgraph deps
+    "langchain_core.**",
+    "langchain_openai.**",
+    "langgraph.**",
+    # plotting deps
+    "matplotlib.**",
+    "seaborn.**",
+]
+
 [dependency-groups]
 dev = [
     "black>=25.1.0",
@@ -112,7 +159,7 @@ dev = [
     "pytest>=8.4.1",
     "nbval>=0.11.0",
     "pytest-xdist>=3.8.0",
-    "pyright[nodejs]>=1.1.403",
+    "ty>=0.0.14",
     "pytest-asyncio>=1.1.0",
     "duckdb>=1.0.0",
     "pyarrow>=15.0.0",

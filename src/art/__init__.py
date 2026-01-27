@@ -34,10 +34,10 @@ os.environ["PYTORCH_CUDA_ALLOC_CONF"] = ",".join(conf)
 
 # Import unsloth before transformers, peft, and trl to maximize Unsloth optimizations
 if os.environ.get("IMPORT_UNSLOTH", "0") == "1":
-    import unsloth  # type: ignore # noqa: F401
+    import unsloth  # noqa: F401
 
 try:
-    import transformers  # type: ignore
+    import transformers
 
     try:
         from .transformers.patches import patch_preprocess_mask_arguments

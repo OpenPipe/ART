@@ -58,7 +58,7 @@ FIXTURES_DIR = Path(__file__).parent.parent / "fixtures" / "trajectories"
 def _ensure_message(item: MessageOrChoice) -> ChatCompletionMessageParam:
     """Narrow a trajectory entry to a concrete message (not a Choice)."""
     assert not isinstance(item, Choice)
-    return cast(ChatCompletionMessageParam, item)
+    return cast(ChatCompletionMessageParam, item)  # ty:ignore[redundant-cast]
 
 
 def _ensure_assistant_message(
@@ -66,19 +66,19 @@ def _ensure_assistant_message(
 ) -> ChatCompletionAssistantMessageParam:
     msg = _ensure_message(item)
     assert msg["role"] == "assistant"
-    return cast(ChatCompletionAssistantMessageParam, msg)
+    return cast(ChatCompletionAssistantMessageParam, msg)  # ty:ignore[redundant-cast]
 
 
 def _ensure_tool_message(item: MessageOrChoice) -> ChatCompletionToolMessageParam:
     msg = _ensure_message(item)
     assert msg["role"] == "tool"
-    return cast(ChatCompletionToolMessageParam, msg)
+    return cast(ChatCompletionToolMessageParam, msg)  # ty:ignore[redundant-cast]
 
 
 def _ensure_user_message(item: MessageOrChoice) -> ChatCompletionUserMessageParam:
     msg = _ensure_message(item)
     assert msg["role"] == "user"
-    return cast(ChatCompletionUserMessageParam, msg)
+    return cast(ChatCompletionUserMessageParam, msg)  # ty:ignore[redundant-cast]
 
 
 class TestParquetRoundTrip:
@@ -173,7 +173,7 @@ class TestParquetRoundTrip:
         assert tool_calls, "Assistant message should include tool calls"
         first_call = tool_calls[0]
         assert first_call["type"] == "function"
-        function_call = cast(ChatCompletionMessageFunctionToolCallParam, first_call)
+        function_call = cast(ChatCompletionMessageFunctionToolCallParam, first_call)  # ty:ignore[redundant-cast]
         assert function_call["function"]["name"] == "search"
 
         # Check tool result message

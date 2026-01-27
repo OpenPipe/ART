@@ -215,7 +215,7 @@ class LocalBackend(Backend):
         packed_tensors = packed_tensors_from_tokenized_results(
             tokenized_results,
             sequence_length,
-            pad_token_id=tokenizer.eos_token_id,  # type: ignore
+            pad_token_id=tokenizer.eos_token_id,
             advantage_balance=advantage_balance,
         )
         if (
@@ -360,7 +360,7 @@ class LocalBackend(Backend):
             if isinstance(message_or_choice, dict):
                 message = message_or_choice
             else:
-                message = cast(Message, message_or_choice.message.model_dump())
+                message = cast(Message, message_or_choice.message.model_dump())  # ty:ignore[possibly-missing-attribute]
             formatted_messages.append(format_message(message))
         return header + "\n".join(formatted_messages)
 

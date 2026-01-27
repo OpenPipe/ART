@@ -153,7 +153,7 @@ class Model(
         *args,
         **kwargs,
     ) -> "Model[ModelConfig, StateType]":
-        return super().__new__(cls)  # type: ignore[return-value]
+        return super().__new__(cls)
 
     def safe_model_dump(self, *args, **kwargs) -> dict:
         """
@@ -174,7 +174,7 @@ class Model(
     async def register(self, backend: "Backend") -> None:
         if self.config is not None:
             try:
-                self.config.model_dump_json()
+                self.config.model_dump_json()  # ty:ignore[invalid-argument-type, possibly-missing-attribute]
             except Exception as e:
                 raise ValueError(
                     "The model config cannot be serialized to JSON. Please ensure that all fields are JSON serializable and try again."
@@ -500,7 +500,7 @@ class TrainableModel(Model[ModelConfig, StateType], Generic[ModelConfig, StateTy
             entity=entity,
             id=id,
             config=config,
-            base_model=base_model,  # type: ignore
+            base_model=base_model,
             base_path=base_path,
             report_metrics=report_metrics,
             **kwargs,
@@ -544,7 +544,7 @@ class TrainableModel(Model[ModelConfig, StateType], Generic[ModelConfig, StateTy
         *args,
         **kwargs,
     ) -> "TrainableModel[ModelConfig, StateType]":
-        return super().__new__(cls)  # type: ignore
+        return super().__new__(cls)
 
     def model_dump(self, *args, **kwargs) -> dict:
         data = super().model_dump(*args, **kwargs)
@@ -649,7 +649,7 @@ class TrainableModel(Model[ModelConfig, StateType], Generic[ModelConfig, StateTy
             stacklevel=2,
         )
         groups_list = list(trajectory_groups)
-        _config = _config or {}
+        _config = _config or {}  # ty:ignore[invalid-assignment]
 
         # 1. Log trajectories first (frontend handles this now)
         await self.log(groups_list, split="train")
@@ -657,7 +657,11 @@ class TrainableModel(Model[ModelConfig, StateType], Generic[ModelConfig, StateTy
         # 2. Train (backend no longer logs internally)
         training_metrics: list[dict[str, float]] = []
         async for metrics in self.backend()._train_model(
-            self, groups_list, config, _config, verbose
+            self,
+            groups_list,
+            config,
+            _config,  # ty:ignore[invalid-argument-type]
+            verbose,
         ):
             training_metrics.append(metrics)
 

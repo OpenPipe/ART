@@ -78,7 +78,7 @@ async def main():
                         ]
                     )
                     for prompt in prompts
-                ]
+                ]  # ty:ignore[invalid-argument-type]
             )
             print(f"   ✓ Gathered {len(train_groups)} trajectory groups")
 

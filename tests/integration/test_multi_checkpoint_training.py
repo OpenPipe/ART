@@ -83,7 +83,7 @@ async def run_training_loop(
                     ]
                 )
                 for prompt in prompts
-            ]
+            ]  # ty:ignore[invalid-argument-type]
         )
         result = await backend.train(model, train_groups, learning_rate=1e-5)
         await model.log(

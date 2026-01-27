@@ -31,7 +31,7 @@ def _patched_parse_tool_call(
     return _parse_tool_call(self, tool_call_str.replace('"arguments": ', '"args": '))
 
 
-renderers.Qwen3InstructRenderer._parse_tool_call = _patched_parse_tool_call
+renderers.Qwen3InstructRenderer._parse_tool_call = _patched_parse_tool_call  # ty:ignore[invalid-assignment]
 
 
 @dataclass
@@ -102,7 +102,7 @@ class OpenAICompatibleTinkerServer:
                     list(body["messages"]),  # type: ignore
                     tools=body.get("tools"),  # type: ignore
                     add_generation_prompt=True,
-                )
+                )  # ty:ignore[invalid-argument-type]
             )
             try:
                 sample_response = await sampler_client.sample_async(
@@ -122,7 +122,7 @@ class OpenAICompatibleTinkerServer:
             except tinker.APIStatusError as e:
                 error_body = e.body
                 if isinstance(error_body, dict) and "detail" in error_body:
-                    detail = error_body["detail"]
+                    detail = error_body["detail"]  # ty:ignore[invalid-argument-type]
                 elif error_body is not None:
                     detail = error_body
                 else:

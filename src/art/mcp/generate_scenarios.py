@@ -75,13 +75,13 @@ async def generate_scenarios(
         # Assume it's already a list of dictionaries
         tools_info = [
             {
-                "name": tool.get("name", "")
+                "name": tool.get("name", "")  # ty:ignore[no-matching-overload]
                 if isinstance(tool, dict)
                 else getattr(tool, "name", ""),
-                "description": tool.get("description", "")
+                "description": tool.get("description", "")  # ty:ignore[no-matching-overload]
                 if isinstance(tool, dict)
                 else getattr(tool, "description", ""),
-                "parameters": tool.get("parameters", {})
+                "parameters": tool.get("parameters", {})  # ty:ignore[no-matching-overload]
                 if isinstance(tool, dict)
                 else getattr(tool, "parameters", {}),
             }

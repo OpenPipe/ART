@@ -194,8 +194,8 @@ def packed_tensors_from_dir(**kwargs: Unpack[DiskPackedTensors]) -> PackedTensor
             "weights": torch.float32,
         }.items()
     }
-    _add_tensor_list(packed_tensors, kwargs, "pixel_values", torch.float32)
-    _add_tensor_list(packed_tensors, kwargs, "image_grid_thw", torch.long)
+    _add_tensor_list(packed_tensors, kwargs, "pixel_values", torch.float32)  # ty:ignore[invalid-argument-type]
+    _add_tensor_list(packed_tensors, kwargs, "image_grid_thw", torch.long)  # ty:ignore[invalid-argument-type]
     return cast(PackedTensors, packed_tensors)
 
 
@@ -237,7 +237,7 @@ def packed_tensors_to_dir(tensors: PackedTensors, dir: str) -> DiskPackedTensors
         if isinstance(tensor, list):
             for i, t in enumerate(tensor):
                 if t is not None:
-                    t.copy_(tensors[key][i])
+                    t.copy_(tensors[key][i])  # ty:ignore[invalid-key, unresolved-attribute]
         else:
             tensor.copy_(tensors[key])  # type: ignore
     return disk_packed_tensors
@@ -288,7 +288,7 @@ def plot_packed_tensors(
             tensor.numpy(),
             cmap="viridis",
             cbar_kws={"label": label},
-            xticklabels=False,  # type: ignore
+            xticklabels=False,
         )
         plt.title(title)
         plt.xlabel("Sequence Position")
