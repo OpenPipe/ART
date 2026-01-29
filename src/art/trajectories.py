@@ -1,20 +1,21 @@
 import asyncio
-from contextlib import asynccontextmanager
-from datetime import datetime
 import time
 import traceback
+from contextlib import asynccontextmanager
+from datetime import datetime
 from typing import (
     Any,
     AsyncGenerator,
     Awaitable,
+    Coroutine,
     Iterable,
     Iterator,
     cast,
     overload,
 )
 
-from openai.types.chat.chat_completion import Choice
 import pydantic
+from openai.types.chat.chat_completion import Choice
 
 from .types import Messages, MessagesAndChoices, Tools
 
@@ -229,11 +230,11 @@ class TrajectoryGroup(pydantic.BaseModel):
         ),
         *,
         exceptions: list[BaseException] = [],
-    ) -> "TrajectoryGroup | Awaitable[TrajectoryGroup]":
+    ) -> "TrajectoryGroup | Coroutine[Any, Any, TrajectoryGroup]":
         ts = list(trajectories)
         if any(hasattr(t, "__await__") for t in ts):
 
-            async def _(exceptions: list[BaseException]):
+            async def _(exceptions: list[BaseException]) -> TrajectoryGroup:
                 from .gather import get_gather_context, record_metrics
 
                 context = get_gather_context()

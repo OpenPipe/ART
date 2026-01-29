@@ -62,10 +62,8 @@ def auto_trajectory(*, required: bool = False) -> Trajectory | None:
 
 
 async def capture_auto_trajectory(coroutine: Coroutine[Any, Any, Any]) -> Trajectory:
-    with AutoTrajectoryContext():
+    with AutoTrajectoryContext() as trajectory:
         await coroutine
-        trajectory = auto_trajectory_context_var.get().trajectory
-        trajectory.finish()
         return trajectory
 
 
@@ -76,11 +74,13 @@ class AutoTrajectoryContext:
             reward=0.0,
         )
 
-    def __enter__(self) -> None:
+    def __enter__(self) -> Trajectory:
         self.token = auto_trajectory_context_var.set(self)
+        return self.trajectory
 
     def __exit__(self, exc_type: Any, exc_value: Any, traceback: Any) -> None:
         auto_trajectory_context_var.reset(self.token)
+        self.trajectory.finish()
 
     def handle_httpx_response(self, response: httpx._models.Response) -> None:
         # Get buffered content (set by patched aiter_bytes/iter_bytes)
