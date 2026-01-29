@@ -181,7 +181,7 @@ mock_stream_choice = Choice(
                 }
             ],
         },
-    }
+    }  # ty:ignore[invalid-argument-type]
 )
 
 
@@ -288,9 +288,9 @@ async def test_auto_trajectory(test_server: None) -> None:
     trajectory = await art.capture_auto_trajectory(say_hi())
     assert trajectory.messages_and_choices == [
         message,
-        Choice(**mock_response["choices"][0]),
+        Choice(**mock_response["choices"][0]),  # ty:ignore[invalid-argument-type, not-subscriptable]
         message,
-        Choice(**mock_response["choices"][0]),
+        Choice(**mock_response["choices"][0]),  # ty:ignore[invalid-argument-type, not-subscriptable]
     ]
     assert trajectory.tools == tools
     assert trajectory.additional_histories[0].messages_and_choices == [
@@ -305,12 +305,12 @@ async def test_auto_trajectory(test_server: None) -> None:
             "role": "assistant",
         },
         message,
-        Choice(**mock_response["choices"][0]),
+        Choice(**mock_response["choices"][0]),  # ty:ignore[invalid-argument-type, not-subscriptable]
     ]
     assert trajectory.additional_histories[0].tools is None
     assert trajectory.additional_histories[1].messages_and_choices == [
         message,
-        Choice(**mock_response["choices"][0]),
+        Choice(**mock_response["choices"][0]),  # ty:ignore[invalid-argument-type, not-subscriptable]
     ]
     assert trajectory.additional_histories[1].tools == tools
     assert trajectory.additional_histories[2].messages_and_choices == [
@@ -387,9 +387,9 @@ async def test_litellm_auto_trajectory(test_server: None) -> None:
     trajectory = await art.capture_auto_trajectory(say_hi())
     assert trajectory.messages_and_choices == [
         message,
-        Choice(**mock_response["choices"][0]),
+        Choice(**mock_response["choices"][0]),  # ty:ignore[invalid-argument-type, not-subscriptable]
         message,
-        Choice(**mock_response["choices"][0]),
+        Choice(**mock_response["choices"][0]),  # ty:ignore[invalid-argument-type, not-subscriptable]
     ]
     assert trajectory.additional_histories[0].messages_and_choices == [
         message,

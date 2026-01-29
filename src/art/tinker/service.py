@@ -10,9 +10,10 @@ from typing import AsyncIterator, Generator
 
 import tinker
 from tinker.lib.public_interfaces.rest_client import RestClient as TinkerRestClient
-from tinker_cookbook import renderers, tokenizer_utils
 import torch
 import yaml
+
+from art.tinker.cookbook_v import renderers, tokenizer_utils
 
 from .. import dev, types
 from ..loss import loss_fn, shift_tensor

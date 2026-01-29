@@ -27,7 +27,7 @@ async def train(
     _compute_loss = trainer.compute_loss
     _log = trainer.log
     trainer.compute_loss = get_compute_loss_fn(trainer)
-    trainer.log = get_log_fn(trainer, results_queue)
+    trainer.log = get_log_fn(trainer, results_queue)  # ty:ignore[invalid-assignment]
     # Ensure we have a metrics container in the expected format
     try:
         is_dict = isinstance(getattr(trainer, "_metrics", None), dict)
@@ -40,7 +40,7 @@ async def train(
         trainer.train()
     finally:
         trainer.compute_loss = _compute_loss
-        trainer.log = _log
+        trainer.log = _log  # ty:ignore[invalid-assignment]
 
 
 def get_compute_loss_fn(trainer: "GRPOTrainer") -> Callable[..., torch.Tensor]:
@@ -82,7 +82,7 @@ def get_compute_loss_fn(trainer: "GRPOTrainer") -> Callable[..., torch.Tensor]:
         inputs = {
             key: tensor.to(trainer.accelerator.device)  # type: ignore
             for key, tensor in inputs.items()
-        }
+        }  # ty:ignore[invalid-assignment]
 
         accelerate_mixed_precision = os.environ.get("ACCELERATE_MIXED_PRECISION")
         force_float32 = os.environ.get("UNSLOTH_FORCE_FLOAT32")
@@ -120,9 +120,9 @@ def get_compute_loss_fn(trainer: "GRPOTrainer") -> Callable[..., torch.Tensor]:
         os.environ["UNSLOTH_RETURN_HIDDEN_STATES"] = "1"
         forward_kwargs = {}
         if "pixel_values" in inputs:
-            forward_kwargs["pixel_values"] = inputs["pixel_values"]  # type: ignore
+            forward_kwargs["pixel_values"] = inputs["pixel_values"]
         if "image_grid_thw" in inputs:
-            forward_kwargs["image_grid_thw"] = inputs["image_grid_thw"]  # type: ignore
+            forward_kwargs["image_grid_thw"] = inputs["image_grid_thw"]
         new_logprobs, entropies = calculate_logprobs(
             dtype_for_autocasting,
             trainer,
@@ -167,10 +167,10 @@ def get_compute_loss_fn(trainer: "GRPOTrainer") -> Callable[..., torch.Tensor]:
         trainer._metrics["train"]["learning_rate"].append(config.learning_rate)
         trainer._metrics["train"]["policy_loss"].append(loss.mean_policy_loss.item())
         if loss.mean_entropy is not None:
-            trainer._metrics["train"]["entropy"].append(loss.mean_entropy.item())  # type: ignore
+            trainer._metrics["train"]["entropy"].append(loss.mean_entropy.item())
         if config.beta > 0.0:
             trainer._metrics["train"]["kl_div"].append(loss.mean_kl.item())
-        return loss.mean_policy_loss + config.beta * loss.mean_kl  # type: ignore
+        return loss.mean_policy_loss + config.beta * loss.mean_kl
 
     return compute_loss
 

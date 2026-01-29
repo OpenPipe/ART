@@ -69,6 +69,10 @@ async def load_trajectories(
         One column for every distinct metric key found in the dataset.
     metadata_* : str
         One column for every distinct metadata key.
+    group_metric_* : float
+        One column for every distinct group-level metric key.
+    group_metadata_* : str
+        One column for every distinct group-level metadata key.
 
     Parameters
     ----------
@@ -144,6 +148,8 @@ async def load_trajectories(
     rows: list[dict] = []
     metric_cols: set[str] = set()
     metadata_cols: set[str] = set()
+    group_metric_cols: set[str] = set()
+    group_metadata_cols: set[str] = set()
     # Map (model, split, step, group_index) -> unique group_number
     group_key_to_number: dict[tuple[str, str, int, int], int] = {}
     next_group_number = 1
@@ -195,11 +201,35 @@ async def load_trajectories(
                 except (json.JSONDecodeError, TypeError):
                     pass
 
+            # Parse group metrics from JSON (duplicated across group rows)
+            group_metrics = {}
+            if row_dict.get("group_metrics"):
+                try:
+                    group_metrics = json.loads(row_dict["group_metrics"])
+                except (json.JSONDecodeError, TypeError):
+                    pass
+
+            # Parse group metadata from JSON (duplicated across group rows)
+            group_metadata = {}
+            if row_dict.get("group_metadata"):
+                try:
+                    group_metadata = json.loads(row_dict["group_metadata"])
+                except (json.JSONDecodeError, TypeError):
+                    pass
+
             # Prepare metrics and metadata columns
             prepped_metrics = {f"metric_{k}": v for k, v in metrics.items()}
             prepped_metadata = {f"metadata_{k}": str(v) for k, v in metadata.items()}
+            prepped_group_metrics = {
+                f"group_metric_{k}": v for k, v in group_metrics.items()
+            }
+            prepped_group_metadata = {
+                f"group_metadata_{k}": str(v) for k, v in group_metadata.items()
+            }
             metric_cols.update(prepped_metrics.keys())
             metadata_cols.update(prepped_metadata.keys())
+            group_metric_cols.update(prepped_group_metrics.keys())
+            group_metadata_cols.update(prepped_group_metadata.keys())
 
             # Process messages
             messages = []
@@ -239,7 +269,7 @@ async def load_trajectories(
                 }
                 if msg_dict.get("tool_calls"):
                     try:
-                        processed_msg["tool_calls"] = json.loads(msg_dict["tool_calls"])
+                        processed_msg["tool_calls"] = json.loads(msg_dict["tool_calls"])  # ty:ignore[invalid-argument-type]
                     except (json.JSONDecodeError, TypeError):
                         pass
 
@@ -255,6 +285,8 @@ async def load_trajectories(
                 "logs": row_dict.get("logs"),
                 **prepped_metrics,
                 **prepped_metadata,
+                **prepped_group_metrics,
+                **prepped_group_metadata,
             }
 
             rows.append(row_data)
@@ -295,6 +327,8 @@ async def load_trajectories(
         }
         | {k: pl.Float64 for k in metric_cols}
         | {k: pl.Utf8 for k in metadata_cols}
+        | {k: pl.Float64 for k in group_metric_cols}
+        | {k: pl.Utf8 for k in group_metadata_cols}
     )
 
     return pl.DataFrame(rows, schema=schema)

@@ -134,7 +134,7 @@ async def gather_trajectories(
         )
     if context.pbar is not None:
         context.pbar.close()
-    return results  # type: ignore
+    return results
 
 
 async def wrap_group_awaitable(
@@ -193,7 +193,7 @@ def record_metrics(context: "GatherContext", trajectory: Trajectory) -> None:
             len(l.content or l.refusal or [])
             for l in logprobs  # noqa: E741
         ) / len(logprobs)
-    context.metric_sums["reward"] += trajectory.reward  # type: ignore
+    context.metric_sums["reward"] += trajectory.reward
     context.metric_divisors["reward"] += 1
     context.metric_sums.update(trajectory.metrics)
     context.metric_divisors.update(trajectory.metrics.keys())
@@ -229,7 +229,7 @@ class GatherContext:
         if (
             0 < self.max_exceptions < 1
             and self.pbar is not None
-            and self.metric_sums["exceptions"] / self.pbar.total <= self.max_exceptions
+            and self.metric_sums["exceptions"] / self.pbar.total <= self.max_exceptions  # ty:ignore[unsupported-operator]
         ) or self.metric_sums["exceptions"] <= self.max_exceptions:
             return False
         return True

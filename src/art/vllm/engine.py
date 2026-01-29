@@ -14,7 +14,7 @@ from vllm.v1.engine.async_llm import AsyncLLM
 from vllm.v1.worker.gpu_worker import Worker
 
 
-async def get_llm(args: vllm.AsyncEngineArgs) -> AsyncLLM:
+async def get_llm(args: vllm.AsyncEngineArgs) -> AsyncLLM:  # ty:ignore[unresolved-attribute]
     """
     Create an AsyncLLM engine with model download and patches applied.
 

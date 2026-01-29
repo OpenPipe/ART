@@ -24,7 +24,7 @@ def create_train_inputs(
     warmup: bool,
 ) -> TrainInputs:
     """Create TrainInputs for a single batch offset."""
-    return TrainInputs(
+    return TrainInputs(  # ty:ignore[missing-typed-dict-key]
         **{
             k: (
                 v[offset : offset + 1, :1024]

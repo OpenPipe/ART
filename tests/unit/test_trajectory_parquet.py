@@ -58,7 +58,7 @@ FIXTURES_DIR = Path(__file__).parent.parent / "fixtures" / "trajectories"
 def _ensure_message(item: MessageOrChoice) -> ChatCompletionMessageParam:
     """Narrow a trajectory entry to a concrete message (not a Choice)."""
     assert not isinstance(item, Choice)
-    return cast(ChatCompletionMessageParam, item)
+    return cast(ChatCompletionMessageParam, item)  # ty:ignore[redundant-cast]
 
 
 def _ensure_assistant_message(
@@ -66,19 +66,19 @@ def _ensure_assistant_message(
 ) -> ChatCompletionAssistantMessageParam:
     msg = _ensure_message(item)
     assert msg["role"] == "assistant"
-    return cast(ChatCompletionAssistantMessageParam, msg)
+    return cast(ChatCompletionAssistantMessageParam, msg)  # ty:ignore[redundant-cast]
 
 
 def _ensure_tool_message(item: MessageOrChoice) -> ChatCompletionToolMessageParam:
     msg = _ensure_message(item)
     assert msg["role"] == "tool"
-    return cast(ChatCompletionToolMessageParam, msg)
+    return cast(ChatCompletionToolMessageParam, msg)  # ty:ignore[redundant-cast]
 
 
 def _ensure_user_message(item: MessageOrChoice) -> ChatCompletionUserMessageParam:
     msg = _ensure_message(item)
     assert msg["role"] == "user"
-    return cast(ChatCompletionUserMessageParam, msg)
+    return cast(ChatCompletionUserMessageParam, msg)  # ty:ignore[redundant-cast]
 
 
 class TestParquetRoundTrip:
@@ -179,6 +179,43 @@ class TestParquetRoundTrip:
         # Check tool result message
         tool_result_msg = _ensure_tool_message(traj.messages_and_choices[2])
         assert tool_result_msg["tool_call_id"] == "call_123"
+
+    def test_group_level_fields_round_trip(self, tmp_path: Path):
+        """Group-level metadata/metrics/logs should survive round-trip."""
+        original = [
+            TrajectoryGroup(
+                trajectories=[
+                    Trajectory(
+                        reward=0.4,
+                        metrics={"idx": 0},
+                        metadata={},
+                        messages_and_choices=[{"role": "user", "content": "msg0"}],
+                        logs=[],
+                    ),
+                    Trajectory(
+                        reward=0.6,
+                        metrics={"idx": 1},
+                        metadata={},
+                        messages_and_choices=[{"role": "user", "content": "msg1"}],
+                        logs=[],
+                    ),
+                ],
+                metadata={"scenario_id": "abc-123", "difficulty": "hard"},
+                metrics={"judge_score": 0.7, "pass_rate": 1},
+                logs=["group log 1", "group log 2"],
+                exceptions=[],
+            )
+        ]
+
+        parquet_path = tmp_path / "test.parquet"
+        write_trajectory_groups_parquet(original, parquet_path)
+        loaded = read_trajectory_groups_parquet(parquet_path)
+
+        assert len(loaded) == 1
+        group = loaded[0]
+        assert group.metadata == {"scenario_id": "abc-123", "difficulty": "hard"}
+        assert group.metrics == {"judge_score": 0.7, "pass_rate": 1}
+        assert group.logs == ["group log 1", "group log 2"]
 
     def test_choice_format(self, tmp_path: Path):
         """Test trajectories with Choice format (finish_reason) are flattened to messages."""

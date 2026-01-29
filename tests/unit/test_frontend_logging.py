@@ -75,6 +75,7 @@ class TestFrontendLoggingCompatibility:
             name="test-model",
             project="test-project",
             base_path=str(tmp_path),
+            report_metrics=[],
         )
 
         # Mock get_step to return 0 for non-trainable model
@@ -102,6 +103,7 @@ class TestFrontendLoggingCompatibility:
             name="test-model",
             project="test-project",
             base_path=str(tmp_path),
+            report_metrics=[],
         )
 
         await model.log(sample_trajectory_groups, split="val")
@@ -114,6 +116,9 @@ class TestFrontendLoggingCompatibility:
         # Check expected columns exist
         expected_columns = [
             "group_index",
+            "group_metadata",
+            "group_metrics",
+            "group_logs",
             "reward",
             "metrics",
             "metadata",
@@ -164,6 +169,7 @@ class TestHistoryJsonlCompatibility:
             name="test-model",
             project="test-project",
             base_path=str(tmp_path),
+            report_metrics=[],
         )
 
         await model.log(sample_trajectory_groups, split="val")
@@ -188,6 +194,7 @@ class TestHistoryJsonlCompatibility:
             name="test-model",
             project="test-project",
             base_path=str(tmp_path),
+            report_metrics=[],
         )
 
         await model.log(sample_trajectory_groups, split="val")
@@ -208,6 +215,7 @@ class TestHistoryJsonlCompatibility:
             name="test-model",
             project="test-project",
             base_path=str(tmp_path),
+            report_metrics=[],
         )
 
         # Log twice
@@ -236,6 +244,7 @@ class TestPathStructure:
             name="mymodel",
             project="myproj",
             base_path=str(tmp_path),
+            report_metrics=[],
         )
 
         trajectories = [
@@ -267,6 +276,7 @@ class TestPathStructure:
             project="myproj",
             base_model="gpt-4",
             base_path=str(tmp_path),
+            report_metrics=[],
         )
 
         # Mock the backend and get_step
@@ -304,6 +314,7 @@ class TestMetricCalculation:
             name="test",
             project="test",
             base_path=str(tmp_path),
+            report_metrics=[],
         )
 
         trajectories = [
@@ -338,6 +349,7 @@ class TestMetricCalculation:
             name="test",
             project="test",
             base_path=str(tmp_path),
+            report_metrics=[],
         )
 
         trajectory_groups = [
@@ -370,12 +382,54 @@ class TestMetricCalculation:
         assert entry["val/reward"] == 0.7  # (0.8 + 0.6) / 2
 
     @pytest.mark.asyncio
+    async def test_group_metric_aggregation(self, tmp_path: Path):
+        """Verify group-level metrics are aggregated once per group."""
+        model = Model(
+            name="test",
+            project="test",
+            base_path=str(tmp_path),
+            report_metrics=[],
+        )
+
+        trajectory_groups = [
+            TrajectoryGroup(
+                trajectories=[
+                    Trajectory(
+                        reward=0.8,
+                        messages_and_choices=[{"role": "user", "content": "a"}],
+                    )
+                ],
+                metrics={"judge_score": 0.2},
+                exceptions=[],
+            ),
+            TrajectoryGroup(
+                trajectories=[
+                    Trajectory(
+                        reward=0.6,
+                        messages_and_choices=[{"role": "user", "content": "b"}],
+                    )
+                ],
+                metrics={"judge_score": 0.6},
+                exceptions=[],
+            ),
+        ]
+
+        await model.log(trajectory_groups, split="val")
+
+        history_path = tmp_path / "test/models/test/history.jsonl"
+        with open(history_path) as f:
+            entry = json.loads(f.readline())
+
+        assert entry["val/group_metric_judge_score"] == 0.4
+
+    @pytest.mark.asyncio
     async def test_exception_rate_calculation(self, tmp_path: Path):
         """Verify exception_rate is calculated correctly for successful trajectories."""
         model = Model(
             name="test",
             project="test",
             base_path=str(tmp_path),
+            report_metrics=[],
         )
 
         # TrajectoryGroup stores trajectories and exceptions separately

@@ -58,7 +58,7 @@ async def openai_server_task(
             global _openai_serving_models
             _openai_serving_models = self
 
-        serving_models.OpenAIServingModels.__init__ = _init
+        serving_models.OpenAIServingModels.__init__ = _init  # ty:ignore[invalid-assignment]
 
     patch_listen_for_disconnect()
     patch_tool_parser_manager()
@@ -86,7 +86,7 @@ async def openai_server_task(
             _openai_serving_models.lora_requests[lora_request.lora_name] = lora_request
         return added
 
-    engine.add_lora = _add_lora
+    engine.add_lora = _add_lora  # ty:ignore[invalid-assignment]
 
     @asynccontextmanager
     async def build_async_engine_client(

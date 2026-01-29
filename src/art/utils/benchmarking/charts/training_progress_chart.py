@@ -187,7 +187,7 @@ def training_progress_chart(
 
     ordered_for_palette = trained_first + comparison_last
     palette = sns.color_palette(n_colors=len(ordered_for_palette))
-    model_colors = {m: c for m, c in zip(ordered_for_palette, palette)}  # type: ignore
+    model_colors = {m: c for m, c in zip(ordered_for_palette, palette)}
 
     # Track scores of comparison models to adjust linestyle for overlaps
     plotted_comparison_scores: set[float] = set()

@@ -3,34 +3,34 @@ name: Prek
 on:
   pull_request:
   push:
-    branches: [ main ]
+    branches: [main]
 
 jobs:
   quality-checks:
     runs-on: ubuntu-latest
-    
+
     steps:
-    - name: Checkout code
-      uses: actions/checkout@v4
-    
-    - name: Set up Python
-      uses: actions/setup-python@v5
-      with:
-        python-version: '3.10'
-    
-    - name: Install uv
-      run: |
-        curl -LsSf https://astral.sh/uv/install.sh | sh
-        echo "$HOME/.cargo/bin" >> $GITHUB_PATH
+      - name: Checkout code
+        uses: actions/checkout@v4
 
-    - name: Install dependencies
-      run: |
-        uv sync --all-extras
-    
-    - name: Run prek hooks (lint, format, typecheck, uv.lock, tests)
-      run: |
-        uv run prek run --all-files
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
 
-    - name: Run unit tests (via prek)
-      run: |
-        uv run prek run pytest
+      - name: Install uv
+        run: |
+          curl -LsSf https://astral.sh/uv/install.sh | sh
+          echo "$HOME/.cargo/bin" >> $GITHUB_PATH
+
+      - name: Install dependencies (with all optional extras for complete type checking)
+        run: |
+          uv sync --all-extras
+
+      - name: Run prek hooks (lint, format, typecheck, uv.lock, tests)
+        run: |
+          uv run prek run --all-files
+
+      - name: Run unit tests (via prek)
+        run: |
+          uv run prek run pytest

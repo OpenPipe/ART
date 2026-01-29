@@ -106,7 +106,7 @@ def loss_fn(
         )
     if upper_bound := experimental_config.get("truncated_importance_sampling", None):
         if "original_logprobs" in inputs:
-            original_logprobs = shift_tensor(inputs["original_logprobs"], 0.0)
+            original_logprobs = shift_tensor(inputs["original_logprobs"], 0.0)  # ty:ignore[invalid-key]
             original_logprobs = torch.where(
                 torch.isnan(original_logprobs),
                 new_logprobs.detach(),

@@ -159,7 +159,7 @@ def run(host: str = "0.0.0.0", port: int = 7999) -> None:
         return pydantic.BaseModel.__init__(self, *args, **kwargs)
 
     TrajectoryGroup.__new__ = __new__  # type: ignore
-    TrajectoryGroup.__init__ = __init__
+    TrajectoryGroup.__init__ = __init__  # ty:ignore[invalid-assignment]
 
     backend = LocalBackend()
     app = FastAPI()

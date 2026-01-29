@@ -7,9 +7,9 @@ repos:
 
   - repo: local
     hooks:
-      - id: pyright
-        name: Pyright type checking
-        entry: uv run pyright src tests
+      - id: ty
+        name: ty type checking
+        entry: uv run ty check src tests
         language: system
         pass_filenames: false
 

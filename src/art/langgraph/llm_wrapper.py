@@ -118,9 +118,9 @@ def init_chat_model(
     config = CURRENT_CONFIG.get()
     return LoggingLLM(
         ChatOpenAI(
-            base_url=config["base_url"],
-            api_key=config["api_key"],
-            model=config["model"],
+            base_url=config["base_url"],  # ty:ignore[unknown-argument]
+            api_key=config["api_key"],  # ty:ignore[unknown-argument]
+            model=config["model"],  # ty:ignore[unknown-argument]
             temperature=1.0,
         ),
         config["logger"],
@@ -222,17 +222,17 @@ class LoggingLLM(Runnable):
                 self.llm,
                 "bound",
                 ChatOpenAI(
-                    base_url=art_config["base_url"],
-                    api_key=art_config["api_key"],
-                    model=art_config["model"],
+                    base_url=art_config["base_url"],  # ty:ignore[unknown-argument]
+                    api_key=art_config["api_key"],  # ty:ignore[unknown-argument]
+                    model=art_config["model"],  # ty:ignore[unknown-argument]
                     temperature=1.0,
                 ),
             )
         else:
             self.llm = ChatOpenAI(
-                base_url=art_config["base_url"],
-                api_key=art_config["api_key"],
-                model=art_config["model"],
+                base_url=art_config["base_url"],  # ty:ignore[unknown-argument]
+                api_key=art_config["api_key"],  # ty:ignore[unknown-argument]
+                model=art_config["model"],  # ty:ignore[unknown-argument]
                 temperature=1.0,
             )
 

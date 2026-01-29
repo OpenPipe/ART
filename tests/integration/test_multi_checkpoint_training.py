@@ -23,6 +23,7 @@ import pytest
 
 import art
 from art.local import LocalBackend
+from art.tinker import TinkerBackend
 from art.types import LocalTrainResult, ServerlessTrainResult, TrainResult
 
 # Use a small model for fast testing
@@ -61,7 +62,7 @@ async def simple_rollout(
 
 async def run_training_loop(
     model: art.TrainableModel,
-    backend: Union[LocalBackend, art.ServerlessBackend, art.TinkerBackend],
+    backend: art.Backend,
     num_steps: int = 1,
     rollouts_per_step: int = 4,
 ) -> list[TrainResult]:
@@ -83,7 +84,7 @@ async def run_training_loop(
                     ]
                 )
                 for prompt in prompts
-            ]
+            ]  # ty:ignore[invalid-argument-type]
         )
         result = await backend.train(model, train_groups, learning_rate=1e-5)
         await model.log(
@@ -116,7 +117,7 @@ async def test_tinker_backend():
     """Test multi-checkpoint inference with TinkerBackend."""
     model_name = f"test-multi-ckpt-tinker-{uuid.uuid4().hex[:8]}"
     with tempfile.TemporaryDirectory() as tmpdir:
-        backend = art.TinkerBackend(path=tmpdir)
+        backend = TinkerBackend(path=tmpdir)
         model = art.TrainableModel(
             name=model_name,
             project="integration-tests",

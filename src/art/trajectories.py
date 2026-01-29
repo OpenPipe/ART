@@ -41,6 +41,8 @@ class Trajectory(pydantic.BaseModel):
     tools: Tools | None = None
     additional_histories: list[History] = []
     reward: float
+    initial_policy_version: int | None = None
+    final_policy_version: int | None = None
     metrics: dict[str, float | int | bool] = {}
     auto_metrics: dict[str, float | int | bool] = {}
     metadata: dict[str, MetadataValue] = {}
@@ -79,6 +81,8 @@ class Trajectory(pydantic.BaseModel):
     def for_logging(self) -> dict[str, Any]:
         loggable_dict = {
             "reward": self.reward,
+            "initial_policy_version": self.initial_policy_version,
+            "final_policy_version": self.final_policy_version,
             "metrics": self.metrics,
             "metadata": self.metadata,
             "messages": [],
@@ -88,9 +92,9 @@ class Trajectory(pydantic.BaseModel):
         for message_or_choice in self.messages_and_choices:
             trainable = isinstance(message_or_choice, Choice)
             message = (
-                message_or_choice.message.to_dict() if trainable else message_or_choice
+                message_or_choice.message.to_dict() if trainable else message_or_choice  # ty:ignore[possibly-missing-attribute]
             )
-            loggable_dict["messages"].append({**message, "trainable": trainable})
+            loggable_dict["messages"].append({**message, "trainable": trainable})  # ty:ignore[invalid-argument-type, possibly-missing-attribute]
         return loggable_dict
 
 
@@ -113,7 +117,7 @@ def get_messages(messages_and_choices: MessagesAndChoices) -> Messages:
                         }
                         if tool_calls
                         else {}
-                    ),  # type: ignore
+                    ),
                 }
             )
         else:
@@ -128,6 +132,9 @@ def get_messages(messages_and_choices: MessagesAndChoices) -> Messages:
 class TrajectoryGroup(pydantic.BaseModel):
     trajectories: list[Trajectory]
     exceptions: list[PydanticException] = []
+    metadata: dict[str, MetadataValue] = {}
+    metrics: dict[str, float | int | bool] = {}
+    logs: list[str] = []
 
     def __init__(
         self,
@@ -136,6 +143,9 @@ class TrajectoryGroup(pydantic.BaseModel):
         ),
         *,
         exceptions: list[BaseException] = [],
+        metadata: dict[str, MetadataValue] | None = None,
+        metrics: dict[str, float | int | bool] | None = None,
+        logs: list[str] | None = None,
     ) -> None:
         super().__init__(
             trajectories=[
@@ -163,6 +173,11 @@ class TrajectoryGroup(pydantic.BaseModel):
                     + exceptions
                 )
             ],
+            metadata=metadata
+            if metadata is not None
+            else getattr(self, "metadata", {}),
+            metrics=metrics if metrics is not None else getattr(self, "metrics", {}),
+            logs=logs if logs is not None else getattr(self, "logs", []),
         )
 
     def __copy__(self):
@@ -173,6 +188,9 @@ class TrajectoryGroup(pydantic.BaseModel):
         new_instance = self.__class__(
             trajectories=self.trajectories[:],  # Shallow copy of list
             exceptions=[],  # Will be set below
+            metadata=self.metadata.copy(),
+            metrics=self.metrics.copy(),
+            logs=self.logs[:],
         )
         # Manually copy exceptions since they're PydanticException objects
         new_instance.exceptions = self.exceptions[:]
@@ -194,12 +212,18 @@ class TrajectoryGroup(pydantic.BaseModel):
         new_instance = self.__class__(
             trajectories=copy.deepcopy(self.trajectories, memo),
             exceptions=[],  # Will be set below
+            metadata=copy.deepcopy(self.metadata, memo),
+            metrics=copy.deepcopy(self.metrics, memo),
+            logs=copy.deepcopy(self.logs, memo),
         )
         # Register in memo before deep copying attributes to handle circular refs
         memo[id(self)] = new_instance
         # Deep copy exceptions
         new_instance.exceptions = copy.deepcopy(self.exceptions, memo)
         return new_instance
+
+    def log(self, message: str) -> None:
+        self.logs.append(message)
 
     def __iter__(self) -> Iterator[Trajectory]:  # type: ignore[override]
         return iter(self.trajectories)
@@ -213,6 +237,9 @@ class TrajectoryGroup(pydantic.BaseModel):
         trajectories: Iterable[Trajectory | BaseException],
         *,
         exceptions: list[BaseException] = [],
+        metadata: dict[str, MetadataValue] | None = None,
+        metrics: dict[str, float | int | bool] | None = None,
+        logs: list[str] | None = None,
     ) -> "TrajectoryGroup": ...
 
     @overload
@@ -221,6 +248,9 @@ class TrajectoryGroup(pydantic.BaseModel):
         trajectories: Iterable[Awaitable[Trajectory]],
         *,
         exceptions: list[BaseException] = [],
+        metadata: dict[str, MetadataValue] | None = None,
+        metrics: dict[str, float | int | bool] | None = None,
+        logs: list[str] | None = None,
     ) -> Awaitable["TrajectoryGroup"]: ...
 
     def __new__(
@@ -230,11 +260,19 @@ class TrajectoryGroup(pydantic.BaseModel):
         ),
         *,
         exceptions: list[BaseException] = [],
+        metadata: dict[str, MetadataValue] | None = None,
+        metrics: dict[str, float | int | bool] | None = None,
+        logs: list[str] | None = None,
     ) -> "TrajectoryGroup | Coroutine[Any, Any, TrajectoryGroup]":
         ts = list(trajectories)
         if any(hasattr(t, "__await__") for t in ts):
 
-            async def _(exceptions: list[BaseException]) -> TrajectoryGroup:
+            async def _(
+                exceptions: list[BaseException],
+                metadata: dict[str, MetadataValue] | None,
+                metrics: dict[str, float | int | bool] | None,
+                logs: list[str] | None,
+            ):
                 from .gather import get_gather_context, record_metrics
 
                 context = get_gather_context()
@@ -256,6 +294,9 @@ class TrajectoryGroup(pydantic.BaseModel):
                 return TrajectoryGroup(
                     trajectories=trajectories,
                     exceptions=exceptions,
+                    metadata=metadata,
+                    metrics=metrics,
+                    logs=logs,
                 )
 
             class CoroutineWithMetadata:
@@ -266,12 +307,15 @@ class TrajectoryGroup(pydantic.BaseModel):
                 def __await__(self):
                     return self.coro.__await__()
 
-            coro = _(exceptions.copy())
+            coro = _(exceptions.copy(), metadata, metrics, logs)
             return CoroutineWithMetadata(coro, len(ts))
         else:
             group = super().__new__(cls)
             group.__init__(
                 trajectories=cast(list[Trajectory | BaseException], ts),
                 exceptions=exceptions,
+                metadata=metadata,
+                metrics=metrics,
+                logs=logs,
             )
             return group

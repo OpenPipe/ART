@@ -121,10 +121,16 @@ class InternalModelConfig(TypedDict, total=False):
     engine_args: "EngineArgs"
     peft_args: "PeftArgs"
     tinker_args: "TinkerArgs | None"
+    tinker_native_args: "TinkerNativeArgs | None"
     trainer_args: "TrainerArgs"
 
 
 class TinkerArgs(TypedDict, total=False):
+    renderer_name: Required[str]
+    training_client_args: "TinkerTrainingClientArgs"
+
+
+class TinkerNativeArgs(TypedDict, total=False):
     renderer_name: Required[str]
     training_client_args: "TinkerTrainingClientArgs"
 

@@ -165,7 +165,7 @@ def tokenize_trajectory(
         ):
             last_assistant_index = i
         elif not isinstance(message, dict) and (
-            message.logprobs or allow_training_without_logprobs
+            message.logprobs or allow_training_without_logprobs  # ty:ignore[possibly-missing-attribute]
         ):
             last_assistant_index = i
     # If there are no trainable assistant messages, return None
@@ -182,7 +182,7 @@ def tokenize_trajectory(
         str,
         tokenizer.apply_chat_template(
             cast(list[dict], messages),
-            tools=tools,  # type: ignore
+            tools=tools,
             continue_final_message=True,
             tokenize=False,
         ),
@@ -191,7 +191,7 @@ def tokenize_trajectory(
         list[int],
         tokenizer.apply_chat_template(
             cast(list[dict], messages),
-            tools=tools,  # type: ignore
+            tools=tools,
             continue_final_message=True,
         ),
     )
@@ -214,8 +214,8 @@ def tokenize_trajectory(
                     "role": "assistant",
                     "content": sentinal_token,
                     **(
-                        {"tool_calls": message.get("tool_calls")}  # type: ignore[call-overload]
-                        if message.get("tool_calls")  # type: ignore[call-overload]
+                        {"tool_calls": message.get("tool_calls")}
+                        if message.get("tool_calls")
                         else {}
                     ),
                 }
@@ -226,7 +226,7 @@ def tokenize_trajectory(
         list[int],
         tokenizer.apply_chat_template(
             cast(list[dict], token_template_messages),
-            tools=tools,  # type: ignore
+            tools=tools,
             continue_final_message=True,
         ),
     )
@@ -238,7 +238,7 @@ def tokenize_trajectory(
                 continue
             if not allow_training_without_logprobs:
                 continue
-        elif message.logprobs is None and not allow_training_without_logprobs:
+        elif message.logprobs is None and not allow_training_without_logprobs:  # ty:ignore[possibly-missing-attribute]
             continue
         start = token_ids.index(sentinal_token_id)
         end = start + 1
@@ -263,12 +263,12 @@ def tokenize_trajectory(
             assistant_mask[start:end] = [1] * len(content_token_ids)
         else:
             choice = message
-            assert choice.logprobs or allow_training_without_logprobs, (
+            assert choice.logprobs or allow_training_without_logprobs, (  # ty:ignore[possibly-missing-attribute]
                 "Chat completion choices must have logprobs"
             )
-            if not choice.logprobs:
+            if not choice.logprobs:  # ty:ignore[possibly-missing-attribute]
                 continue
-            token_logprobs = choice.logprobs.content or choice.logprobs.refusal or []
+            token_logprobs = choice.logprobs.content or choice.logprobs.refusal or []  # ty:ignore[possibly-missing-attribute]
             if (
                 bytes(token_logprobs[0].bytes or []).decode("utf-8")
                 == "<think>"
@@ -281,14 +281,14 @@ def tokenize_trajectory(
                     for token_logprob in token_logprobs
                 )
             except (IndexError, ValueError):
-                token_ids[start:end] = [  # type: ignore
+                token_ids[start:end] = [
                     token_id if token_id is not None else tokenizer.eos_token_id
                     for token_id in tokenizer.convert_tokens_to_ids(
                         [
                             token_logprob.token or tokenizer.eos_token
                             for token_logprob in token_logprobs
                         ]
-                    )  # type: ignore
+                    )
                 ]
             logprobs[start:end] = (
                 token_logprob.logprob for token_logprob in token_logprobs
@@ -313,7 +313,7 @@ def tokenize_trajectory(
         image_token_id = cast(
             int,
             getattr(image_processor, "image_token_id", None)
-            or tokenizer.convert_tokens_to_ids(  # type: ignore
+            or tokenizer.convert_tokens_to_ids(
                 getattr(image_processor, "image_token", "<|image_pad|>")
             ),
         )
