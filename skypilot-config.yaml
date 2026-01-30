@@ -383,6 +383,7 @@
 workdir: .
 resources:
   accelerators: ["H100-SXM:1", "H100:1", "A100-80GB:1"]
+  image_id: docker:pytorch/pytorch:2.9.0-cuda12.8-cudnn9-devel
   ports:
     - 7999 # main ART server
     - 8000 # vLLM server
