@@ -7,6 +7,7 @@ os.environ["TORCH_CUDA_ARCH_LIST"] = "9.0"
 # isort: on
 
 import json
+import math
 import shutil
 import time
 from typing import Any, cast
@@ -122,9 +123,9 @@ class LoRA(torch.nn.Module):
         num_local_experts: int = 1,
     ) -> None:
         super().__init__()
-        assert num_local_experts == 1 or "{expert}" in adapter_model_prefix, (
-            "adapter_model_prefix must contain the '{expert}' format placeholder if num_local_experts > 1"
-        )
+        assert (
+            num_local_experts == 1 or "{expert}" in adapter_model_prefix
+        ), "adapter_model_prefix must contain the '{expert}' format placeholder if num_local_experts > 1"
         self.adapter_model_prefix = adapter_model_prefix
         self.scale = alpha / rank
         self.A_T = torch.nn.Parameter(
@@ -138,10 +139,22 @@ class LoRA(torch.nn.Module):
             ).squeeze(0)
         )
         self._expert_offset = ps.get_expert_model_parallel_rank() * num_local_experts
+        self.reset_lora_parameters()
 
     @property
     def num_local_experts(self) -> int:
         return self.A_T.shape[0] if self.A_T.ndim == 3 else 1
+
+    def reset_lora_parameters(self) -> None:
+        """Initialize LoRA weights (A=Kaiming, B=zeros) like PEFT defaults."""
+        if self.A_T.ndim == 3:
+            for expert in range(self.A_T.shape[0]):
+                torch.nn.init.kaiming_uniform_(
+                    self.A_T[expert].T, a=math.sqrt(5)
+                )
+        else:
+            torch.nn.init.kaiming_uniform_(self.A_T.T, a=math.sqrt(5))
+        torch.nn.init.zeros_(self.B_T)
 
     def load_lora(self, adapter_model: dict[str, torch.Tensor]) -> None:
         try:
@@ -157,10 +170,7 @@ class LoRA(torch.nn.Module):
             )
         except KeyError:
             print("Unable to find LoRA weights for", self.adapter_model_prefix)
-            torch.nn.init.zeros_(self.A_T)
-            torch.nn.init.zeros_(self.B_T)
-            self.A_T.requires_grad = False
-            self.B_T.requires_grad = False
+            self.reset_lora_parameters()
 
     def load_weights(
         self,
@@ -170,16 +180,18 @@ class LoRA(torch.nn.Module):
         into: torch.nn.Parameter,
     ) -> None:
         self.load_weight(
-            torch.stack(
-                [
-                    adapter_model[
-                        f"{self.adapter_model_prefix.format(expert=expert + self._expert_offset)}.{suffix}.weight"
-                    ].T
-                    for expert in range(self.num_local_experts)
-                ]
-            )
-            if self.num_local_experts > 1
-            else adapter_model[f"{self.adapter_model_prefix}.{suffix}.weight"].T,
+            (
+                torch.stack(
+                    [
+                        adapter_model[
+                            f"{self.adapter_model_prefix.format(expert=expert + self._expert_offset)}.{suffix}.weight"
+                        ].T
+                        for expert in range(self.num_local_experts)
+                    ]
+                )
+                if self.num_local_experts > 1
+                else adapter_model[f"{self.adapter_model_prefix}.{suffix}.weight"].T
+            ),
             into=into,
         )
 
@@ -191,9 +203,9 @@ class LoRA(torch.nn.Module):
             if weight.shape[axis] == into.shape[axis]:
                 continue
             # assume our param is tensor sharded along this axis
-            assert weight.shape[axis] // tp_world_size == into.shape[axis], (
-                f"Weight shape {weight.shape} does not match into shape {into.shape} along axis {axis}"
-            )
+            assert (
+                weight.shape[axis] // tp_world_size == into.shape[axis]
+            ), f"Weight shape {weight.shape} does not match into shape {into.shape} along axis {axis}"
             s = into.shape[axis]
             weight = weight.narrow(axis, tp_rank * s, s)
             setattr(into, "sharded", True)
@@ -230,9 +242,9 @@ class LoRA(torch.nn.Module):
         self, x: torch.Tensor, tokens_per_expert: list[int] | torch.Tensor | None = None
     ) -> torch.Tensor:
         if tokens_per_expert is not None:
-            assert self.num_local_experts > 1, (
-                "tokens_per_expert is only supported if num_local_experts > 1"
-            )
+            assert (
+                self.num_local_experts > 1
+            ), "tokens_per_expert is only supported if num_local_experts > 1"
             bsz = tokens_per_expert
             if isinstance(bsz, list):
                 bsz = torch.tensor(bsz, dtype=torch.int64, device="cpu")
@@ -298,12 +310,12 @@ class SelfAttentionLinearQKVLoRA(torch.nn.Module):
         q_out_features = provider.kv_channels * provider.num_attention_heads
         kv_out_features = provider.kv_channels * provider.num_query_groups
         tp_world_size = ps.get_tensor_model_parallel_world_size()
-        assert kv_out_features % tp_world_size == 0, (
-            "kv_out_features must be divisible by tensor parallel size"
-        )
-        assert q_out_features % tp_world_size == 0, (
-            "q_out_features must be divisible by tensor parallel size"
-        )
+        assert (
+            kv_out_features % tp_world_size == 0
+        ), "kv_out_features must be divisible by tensor parallel size"
+        assert (
+            q_out_features % tp_world_size == 0
+        ), "q_out_features must be divisible by tensor parallel size"
         q_out_features_per_rank = q_out_features // tp_world_size
         kv_out_features_per_rank = kv_out_features // tp_world_size
         self.q_proj_lora = LoRA(
@@ -550,7 +562,10 @@ def offload_to_cpu() -> None:
                 if not hasattr(module, attr):
                     continue
                 param = getattr(module, attr)
-                if not isinstance(param, torch.nn.Parameter) or param.device.type != "cuda":
+                if (
+                    not isinstance(param, torch.nn.Parameter)
+                    or param.device.type != "cuda"
+                ):
                     continue
                 key = f"{id(module)}_{attr}"
                 if (
@@ -603,7 +618,10 @@ def reload_to_gpu(device: torch.device | str | None = None) -> None:
                 if not hasattr(module, attr):
                     continue
                 param = getattr(module, attr)
-                if not isinstance(param, torch.nn.Parameter) or param.device.type != "cpu":
+                if (
+                    not isinstance(param, torch.nn.Parameter)
+                    or param.device.type != "cpu"
+                ):
                     continue
                 gpu_tensor = torch.empty(param.shape, dtype=param.dtype, device=device)
                 gpu_tensor.copy_(param.data, non_blocking=True)
@@ -670,13 +688,23 @@ while True:
     experimental_config = job.experimental_config
     print0("Loaded job from", job_path)
     print0("Job:", job)
-    print0("Loading adapter model from", f"{job.lora_path}/adapter_model.safetensors")
-    adapter_model = load_file(f"{job.lora_path}/adapter_model.safetensors")
-    with torch.no_grad():
-        for chunk in model:
-            for module in chunk.modules():
-                if hasattr(module, "load_lora"):
-                    module.load_lora(adapter_model)  # type: ignore
+    adapter_model_path = f"{job.lora_path}/adapter_model.safetensors"
+    if os.path.exists(adapter_model_path):
+        print0("Loading adapter model from", adapter_model_path)
+        adapter_model = load_file(adapter_model_path)
+        with torch.no_grad():
+            for chunk in model:
+                for module in chunk.modules():
+                    if hasattr(module, "load_lora"):
+                        module.load_lora(adapter_model)  # type: ignore
+    else:
+        print0("No adapter model found at", adapter_model_path)
+        adapter_model = {}
+        with torch.no_grad():
+            for chunk in model:
+                for module in chunk.modules():
+                    if hasattr(module, "reset_lora_parameters"):
+                        module.reset_lora_parameters()  # type: ignore
     optimizer_shard_path = os.path.join(
         job.optimizer_state_path, f"{rank + 1:02d}-of-{world_size:02d}.pt"
     )
@@ -805,8 +833,10 @@ while True:
                     module.sharded_lora_state_dict()  # type: ignore
                 )
                 for key, value in module_sharded_lora_state_dict.items():
-                    assert key in adapter_model
-                    sharded_state_dict[key] = value.to(adapter_model[key].dtype)
+                    target_dtype = (
+                        adapter_model[key].dtype if key in adapter_model else value.dtype
+                    )
+                    sharded_state_dict[key] = value.to(target_dtype)
     shard_path = os.path.join(
         job.lora_path,
         f"adapter_model-{rank + 1:02d}-of-{world_size:02d}.safetensors",
