@@ -1,18 +1,18 @@
 import asyncio
+from dataclasses import dataclass
 import datetime
+from functools import cached_property
 import json
 import os
-import shutil
-import uuid
-from dataclasses import dataclass
-from functools import cached_property
 from pathlib import Path
+import shutil
 from typing import AsyncIterator
+import uuid
 
-import torch
 from pydantic import BaseModel
 from safetensors import safe_open
 from safetensors.torch import load_file, save_file
+import torch
 from vllm import AsyncEngineArgs
 from vllm.lora.request import LoRARequest
 from vllm.v1.engine.async_llm import AsyncLLM
@@ -71,7 +71,9 @@ class MegatronService:
         num_gpus = torch.cuda.device_count()
         os.environ["MODEL_IDENTIFIER"] = self.base_model
 
-        command = f"{setup_cmd}uv run torchrun --nproc_per_node {num_gpus} {train_script}"
+        command = (
+            f"{setup_cmd}uv run torchrun --nproc_per_node {num_gpus} {train_script}"
+        )
         self._megatron_process = await asyncio.create_subprocess_shell(command)
 
     async def start_openai_server(
@@ -123,7 +125,9 @@ class MegatronService:
             lora_path = get_step_checkpoint_dir(self.output_dir, 0)
 
         if self._optimizer_state_path is None:
-            self._optimizer_state_path = f"/tmp/megatron_optimizer_states/{uuid.uuid4().hex}"
+            self._optimizer_state_path = (
+                f"/tmp/megatron_optimizer_states/{uuid.uuid4().hex}"
+            )
 
         job = MegatronTrainingJob(
             lora_path=lora_path,
