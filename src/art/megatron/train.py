@@ -123,9 +123,9 @@ class LoRA(torch.nn.Module):
         num_local_experts: int = 1,
     ) -> None:
         super().__init__()
-        assert (
-            num_local_experts == 1 or "{expert}" in adapter_model_prefix
-        ), "adapter_model_prefix must contain the '{expert}' format placeholder if num_local_experts > 1"
+        assert num_local_experts == 1 or "{expert}" in adapter_model_prefix, (
+            "adapter_model_prefix must contain the '{expert}' format placeholder if num_local_experts > 1"
+        )
         self.adapter_model_prefix = adapter_model_prefix
         self.scale = alpha / rank
         self.A_T = torch.nn.Parameter(
@@ -149,9 +149,7 @@ class LoRA(torch.nn.Module):
         """Initialize LoRA weights (A=Kaiming, B=zeros) like PEFT defaults."""
         if self.A_T.ndim == 3:
             for expert in range(self.A_T.shape[0]):
-                torch.nn.init.kaiming_uniform_(
-                    self.A_T[expert].T, a=math.sqrt(5)
-                )
+                torch.nn.init.kaiming_uniform_(self.A_T[expert].T, a=math.sqrt(5))
         else:
             torch.nn.init.kaiming_uniform_(self.A_T.T, a=math.sqrt(5))
         torch.nn.init.zeros_(self.B_T)
@@ -203,9 +201,9 @@ class LoRA(torch.nn.Module):
             if weight.shape[axis] == into.shape[axis]:
                 continue
             # assume our param is tensor sharded along this axis
-            assert (
-                weight.shape[axis] // tp_world_size == into.shape[axis]
-            ), f"Weight shape {weight.shape} does not match into shape {into.shape} along axis {axis}"
+            assert weight.shape[axis] // tp_world_size == into.shape[axis], (
+                f"Weight shape {weight.shape} does not match into shape {into.shape} along axis {axis}"
+            )
             s = into.shape[axis]
             weight = weight.narrow(axis, tp_rank * s, s)
             setattr(into, "sharded", True)
@@ -242,9 +240,9 @@ class LoRA(torch.nn.Module):
         self, x: torch.Tensor, tokens_per_expert: list[int] | torch.Tensor | None = None
     ) -> torch.Tensor:
         if tokens_per_expert is not None:
-            assert (
-                self.num_local_experts > 1
-            ), "tokens_per_expert is only supported if num_local_experts > 1"
+            assert self.num_local_experts > 1, (
+                "tokens_per_expert is only supported if num_local_experts > 1"
+            )
             bsz = tokens_per_expert
             if isinstance(bsz, list):
                 bsz = torch.tensor(bsz, dtype=torch.int64, device="cpu")
@@ -310,12 +308,12 @@ class SelfAttentionLinearQKVLoRA(torch.nn.Module):
         q_out_features = provider.kv_channels * provider.num_attention_heads
         kv_out_features = provider.kv_channels * provider.num_query_groups
         tp_world_size = ps.get_tensor_model_parallel_world_size()
-        assert (
-            kv_out_features % tp_world_size == 0
-        ), "kv_out_features must be divisible by tensor parallel size"
-        assert (
-            q_out_features % tp_world_size == 0
-        ), "q_out_features must be divisible by tensor parallel size"
+        assert kv_out_features % tp_world_size == 0, (
+            "kv_out_features must be divisible by tensor parallel size"
+        )
+        assert q_out_features % tp_world_size == 0, (
+            "q_out_features must be divisible by tensor parallel size"
+        )
         q_out_features_per_rank = q_out_features // tp_world_size
         kv_out_features_per_rank = kv_out_features // tp_world_size
         self.q_proj_lora = LoRA(
@@ -834,7 +832,9 @@ while True:
                 )
                 for key, value in module_sharded_lora_state_dict.items():
                     target_dtype = (
-                        adapter_model[key].dtype if key in adapter_model else value.dtype
+                        adapter_model[key].dtype
+                        if key in adapter_model
+                        else value.dtype
                     )
                     sharded_state_dict[key] = value.to(target_dtype)
     shard_path = os.path.join(
