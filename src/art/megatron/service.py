@@ -6,6 +6,7 @@ import json
 import os
 from pathlib import Path
 import shutil
+import subprocess
 from typing import AsyncIterator
 import uuid
 
@@ -52,6 +53,121 @@ class MegatronService:
         self._lora_id_counter += 1
         return self._lora_id_counter
 
+    def _default_lora_adapter_config(self) -> dict[str, object]:
+        # Keep in sync with LoRA settings in megatron/train.py.
+        return {
+            "r": 1,
+            "lora_alpha": 32,
+            "target_modules": [
+                "q_proj",
+                "k_proj",
+                "v_proj",
+                "o_proj",
+                "gate_proj",
+                "up_proj",
+                "down_proj",
+            ],
+            "bias": "none",
+        }
+
+    def _adapter_has_weights(self, lora_path: str) -> bool:
+        adapter_path = os.path.join(lora_path, "adapter_model.safetensors")
+        if not os.path.exists(adapter_path):
+            return False
+        try:
+            with safe_open(adapter_path, framework="pt") as adapter_file:
+                for key in adapter_file.keys():
+                    tensor = adapter_file.get_tensor(key)
+                    if torch.any(tensor != 0):
+                        return True
+        except Exception:
+            return False
+        return False
+
+    def _create_identity_lora(self, lora_path: str) -> None:
+        # Create an identity (zero) LoRA using PEFT so vLLM can load it.
+        from peft import LoraConfig, get_peft_model
+        from transformers import AutoModelForCausalLM
+
+        config = self._default_lora_adapter_config()
+        target_modules = list(config["target_modules"])
+        lora_config = LoraConfig(
+            r=int(config["r"]),
+            lora_alpha=int(config["lora_alpha"]),
+            target_modules=target_modules,
+            lora_dropout=0.0,
+            bias=str(config["bias"]),
+            task_type="CAUSAL_LM",
+        )
+        model = AutoModelForCausalLM.from_pretrained(
+            self.base_model,
+            torch_dtype=torch.bfloat16,
+            device_map="auto",
+            trust_remote_code=True,
+        )
+        peft_model = get_peft_model(model, lora_config)
+        # Keep LoRA A initialized (trainable) and zero only B for identity.
+        for name, param in peft_model.named_parameters():
+            if "lora_B" in name:
+                param.data.zero_()
+        os.makedirs(lora_path, exist_ok=True)
+        peft_model.save_pretrained(lora_path)
+        del peft_model, model
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+            torch.cuda.empty_cache()
+
+    def _ensure_identity_lora(self, lora_path: str) -> None:
+        if self._adapter_has_weights(lora_path):
+            return
+        self._create_identity_lora(lora_path)
+
+    def _ensure_lora_adapter_config(
+        self, lora_path: str, *, source_path: str | None = None
+    ) -> None:
+        config_path = os.path.join(lora_path, "adapter_config.json")
+        if os.path.exists(config_path):
+            return
+        os.makedirs(lora_path, exist_ok=True)
+        if source_path is not None:
+            source_config = os.path.join(source_path, "adapter_config.json")
+            if os.path.exists(source_config):
+                shutil.copy(source_config, config_path)
+                return
+        with open(config_path, "w") as f:
+            json.dump(self._default_lora_adapter_config(), f)
+
+    async def _add_lora_aliases(
+        self, llm: AsyncLLM, step: int, checkpoint_dir: str
+    ) -> None:
+        added = await llm.add_lora(
+            LoRARequest(
+                lora_name=f"{self.model_name}@{step}",
+                lora_int_id=self._next_lora_id(),
+                lora_path=checkpoint_dir,
+            )
+        )
+        if not added:
+            raise RuntimeError(f"Failed to add LoRA adapter for step {step}")
+        added_alias = await llm.add_lora(
+            LoRARequest(
+                lora_name=self.model_name,
+                lora_int_id=self._next_lora_id(),
+                lora_path=checkpoint_dir,
+            )
+        )
+        if not added_alias:
+            raise RuntimeError(
+                f"Failed to add LoRA alias for step {step} at {checkpoint_dir}"
+            )
+        self._latest_step = step
+
+    async def register_lora_for_step(self, step: int, checkpoint_dir: str) -> None:
+        llm = await self.llm
+        await llm.pause_generation()
+        await self._add_lora_aliases(llm, step, checkpoint_dir)
+        await llm.resume_generation()
+
     async def _ensure_megatron_running(self) -> None:
         """Lazily start Megatron training process if not running."""
         if self._megatron_process is not None:
@@ -67,6 +183,7 @@ class MegatronService:
             setup_script = Path(__file__).parent / "setup.sh"
             setup_cmd = f"bash {setup_script} && "
 
+        subprocess.run(["pkill", "-9", "megatron-service"], check=False)
         train_script = Path(__file__).parent / "train.py"
         num_gpus = torch.cuda.device_count()
         os.environ["MODEL_IDENTIFIER"] = self.base_model
@@ -82,17 +199,18 @@ class MegatronService:
         lora_path = get_last_checkpoint_dir(self.output_dir)
         if lora_path is None:
             lora_path = get_step_checkpoint_dir(self.output_dir, 0)
-            os.makedirs(lora_path, exist_ok=True)
-            save_file({}, f"{lora_path}/adapter_model.safetensors")
             self._latest_step = 0
         else:
             self._latest_step = get_step_from_dir(self.output_dir)
+        self._ensure_identity_lora(lora_path)
+        self._ensure_lora_adapter_config(lora_path)
 
+        lora_path_for_server = lora_path if self._adapter_has_weights(lora_path) else None
         server_config = dev.get_openai_server_config(
             model_name=self.model_name,
             base_model=self.base_model,
             log_file=f"{self.output_dir}/logs/vllm.log",
-            lora_path=lora_path,
+            lora_path=lora_path_for_server,
             config=config,
         )
         await openai_server_task(engine=await self.llm, config=server_config)
@@ -111,8 +229,6 @@ class MegatronService:
         _config: dev.TrainConfig,
         verbose: bool = False,
     ) -> AsyncIterator[dict[str, float]]:
-        await self._ensure_megatron_running()
-
         llm = await self.llm
         await llm.pause_generation()
         await llm.reset_prefix_cache()
@@ -120,15 +236,24 @@ class MegatronService:
         self._is_sleeping = True
         gc_and_empty_cuda_cache()
 
+        # Start Megatron after vLLM has freed GPU memory.
+        await self._ensure_megatron_running()
+
         lora_path = get_last_checkpoint_dir(self.output_dir)
         if lora_path is None:
             lora_path = get_step_checkpoint_dir(self.output_dir, 0)
+        self._ensure_lora_adapter_config(lora_path)
 
         if self._optimizer_state_path is None:
             self._optimizer_state_path = (
                 f"/tmp/megatron_optimizer_states/{uuid.uuid4().hex}"
             )
 
+        jobs_dir = "/tmp/megatron_training_jobs"
+        os.makedirs(jobs_dir, exist_ok=True)
+        for job_name in os.listdir(jobs_dir):
+            if job_name.endswith(".json"):
+                os.remove(os.path.join(jobs_dir, job_name))
         job = MegatronTrainingJob(
             lora_path=lora_path,
             optimizer_state_path=self._optimizer_state_path,
@@ -136,8 +261,6 @@ class MegatronService:
             config=config,
             experimental_config=_config,
         )
-        jobs_dir = "/tmp/megatron_training_jobs"
-        os.makedirs(jobs_dir, exist_ok=True)
         job_path = os.path.join(jobs_dir, f"{datetime.datetime.now().isoformat()}.json")
         with open(job_path, "w") as f:
             f.write(job.model_dump_json())
@@ -170,20 +293,19 @@ class MegatronService:
             f"{lora_path}/adapter_model.safetensors",
             f"{new_checkpoint_dir}/adapter_model.safetensors",
         )
+        self._ensure_lora_adapter_config(new_checkpoint_dir, source_path=lora_path)
 
-        await run_on_workers(llm, do_wake_up)
-        self._is_sleeping = False
+        wake_lock_path = "/tmp/megatron_vllm_waking"
+        try:
+            with open(wake_lock_path, "w") as lock_file:
+                lock_file.write("waking vllm\n")
+            await run_on_workers(llm, do_wake_up)
+            self._is_sleeping = False
+        finally:
+            if os.path.exists(wake_lock_path):
+                os.remove(wake_lock_path)
 
-        added = await llm.add_lora(
-            LoRARequest(
-                lora_name=f"{self.model_name}@{next_step}",
-                lora_int_id=self._next_lora_id(),
-                lora_path=new_checkpoint_dir,
-            )
-        )
-        if not added:
-            raise RuntimeError(f"Failed to add LoRA adapter for step {next_step}")
-        self._latest_step = next_step
+        await self._add_lora_aliases(llm, next_step, new_checkpoint_dir)
         await llm.resume_generation()
 
     def _merge_lora_adapter(self, lora_path: str) -> None:

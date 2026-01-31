@@ -6,6 +6,7 @@ os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 os.environ["TORCH_CUDA_ARCH_LIST"] = "9.0"
 # isort: on
 
+import gc
 import json
 import math
 import shutil
@@ -549,7 +550,7 @@ def print0(*values: Any) -> None:
 
 
 def offload_to_cpu() -> None:
-    """Offload LoRA params and optimizer state to CPU pinned memory."""
+    """Offload model params and optimizer state to CPU pinned memory."""
     global _is_offloaded, _pinned_buffers
     if _is_offloaded:
         return
@@ -577,6 +578,23 @@ def offload_to_cpu() -> None:
                 _pinned_buffers[key].copy_(param.data, non_blocking=True)
                 param.data = _pinned_buffers[key]
 
+    # Offload remaining model parameters (including base weights).
+    for chunk in model:
+        for param in chunk.parameters():
+            if not isinstance(param, torch.nn.Parameter) or param.device.type != "cuda":
+                continue
+            key = f"param_{id(param)}"
+            if (
+                key not in _pinned_buffers
+                or _pinned_buffers[key].shape != param.shape
+                or _pinned_buffers[key].dtype != param.dtype
+            ):
+                _pinned_buffers[key] = torch.empty(
+                    param.shape, dtype=param.dtype, device="cpu", pin_memory=True
+                )
+            _pinned_buffers[key].copy_(param.data, non_blocking=True)
+            param.data = _pinned_buffers[key]
+
     for param_id, state in optimizer.optimizer.state.items():
         for k, v in state.items():
             if isinstance(v, torch.Tensor) and v.device.type == "cuda":
@@ -593,14 +611,15 @@ def offload_to_cpu() -> None:
                 state[k] = _pinned_buffers[key]
 
     torch.cuda.synchronize()
+    gc.collect()
     torch.cuda.empty_cache()
     _is_offloaded = True
     if rank == 0:
-        print("Offloaded LoRA params and optimizer to CPU")
+        print("Offloaded model params and optimizer to CPU")
 
 
 def reload_to_gpu(device: torch.device | str | None = None) -> None:
-    """Reload LoRA params and optimizer state to GPU."""
+    """Reload model params and optimizer state to GPU."""
     global _is_offloaded
     if not _is_offloaded:
         return
@@ -624,6 +643,15 @@ def reload_to_gpu(device: torch.device | str | None = None) -> None:
                 gpu_tensor = torch.empty(param.shape, dtype=param.dtype, device=device)
                 gpu_tensor.copy_(param.data, non_blocking=True)
                 param.data = gpu_tensor
+
+    # Reload remaining model parameters (including base weights).
+    for chunk in model:
+        for param in chunk.parameters():
+            if not isinstance(param, torch.nn.Parameter) or param.device.type != "cpu":
+                continue
+            gpu_tensor = torch.empty(param.shape, dtype=param.dtype, device=device)
+            gpu_tensor.copy_(param.data, non_blocking=True)
+            param.data = gpu_tensor
 
     for state in optimizer.optimizer.state.values():
         for k, v in state.items():
@@ -675,6 +703,10 @@ while True:
     if not job_names:
         time.sleep(1)
         continue
+
+    wake_lock_path = "/tmp/megatron_vllm_waking"
+    while os.path.exists(wake_lock_path):
+        time.sleep(0.2)
 
     reload_to_gpu()
 

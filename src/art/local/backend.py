@@ -2,6 +2,7 @@ import asyncio
 import json
 import math
 import os
+import shutil
 import subprocess
 from types import TracebackType
 from typing import AsyncIterator, Iterable, Literal, cast
@@ -362,7 +363,9 @@ class LocalBackend(Backend):
             if isinstance(message_or_choice, dict):
                 message = message_or_choice
             else:
-                message = cast(Message, message_or_choice.message.model_dump())  # ty:ignore[possibly-missing-attribute]
+                message = cast(
+                    Message, message_or_choice.message.model_dump()
+                )  # ty:ignore[possibly-missing-attribute]
             formatted_messages.append(format_message(message))
         return header + "\n".join(formatted_messages)
 
@@ -570,20 +573,22 @@ class LocalBackend(Backend):
                 get_model_dir(model=model, art_path=self._path), next_step
             )
 
-            # If the current checkpoint exists, rename it to the next step
+            # If the current checkpoint exists, copy it to the next step
             if os.path.exists(current_checkpoint_dir):
-                os.rename(current_checkpoint_dir, next_checkpoint_dir)
+                shutil.copytree(
+                    current_checkpoint_dir,
+                    next_checkpoint_dir,
+                    dirs_exist_ok=True,
+                )
                 print(
                     f"Advanced step from {current_step} to {next_step} (no training occurred)"
                 )
 
                 try:
-                    # Register the renamed checkpoint as a new LoRA adapter
+                    # Register the copied checkpoint as a new LoRA adapter
                     # so it's available for inference at the new step
-                    from ..unsloth.service import UnslothService
-
-                    if isinstance(service, UnslothService):
-                        await service.register_lora_for_step(
+                    if hasattr(service, "register_lora_for_step"):
+                        await service.register_lora_for_step(  # type: ignore[attr-defined]
                             next_step, next_checkpoint_dir
                         )
                 except ModuleNotFoundError:
@@ -610,9 +615,9 @@ class LocalBackend(Backend):
             num_gradient_steps = int(
                 result.pop("num_gradient_steps", estimated_gradient_steps)
             )
-            assert num_gradient_steps == estimated_gradient_steps, (
-                f"num_gradient_steps {num_gradient_steps} != estimated_gradient_steps {estimated_gradient_steps}"
-            )
+            assert (
+                num_gradient_steps == estimated_gradient_steps
+            ), f"num_gradient_steps {num_gradient_steps} != estimated_gradient_steps {estimated_gradient_steps}"
             results.append(result)
             yield {**result, "num_gradient_steps": num_gradient_steps}
             pbar.update(1)
