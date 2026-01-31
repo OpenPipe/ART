@@ -771,7 +771,7 @@ while True:
             (list(range(num_sequences)) * (dp_world_size // num_sequences + 1))[dp_rank]
         )
     for index in indices:
-        inputs = PackedTensors(
+        inputs = PackedTensors(  # type: ignore
             **{
                 key: value[index : index + 1]
                 for key, value in packed_tensors.items()
@@ -784,7 +784,7 @@ while True:
         device = next(model[0].parameters()).device
         for key, value in inputs.items():
             if isinstance(value, torch.Tensor):
-                inputs[key] = value.to(device)
+                inputs[key] = value.to(device)  # type: ignore
         attention_mask = ~calculate_mask(
             batch_size=inputs["tokens"].shape[0],
             seq_len=inputs["tokens"].shape[1],

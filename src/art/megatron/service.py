@@ -56,9 +56,7 @@ class MegatronService:
     def _get_optimizer_state_path(self) -> str:
         if self._optimizer_state_path is not None:
             return self._optimizer_state_path
-        self._optimizer_state_path = os.path.join(
-            self.output_dir, "optimizer_states"
-        )
+        self._optimizer_state_path = os.path.join(self.output_dir, "optimizer_states")
         os.makedirs(self._optimizer_state_path, exist_ok=True)
         return self._optimizer_state_path
 
@@ -214,7 +212,9 @@ class MegatronService:
         self._ensure_identity_lora(lora_path)
         self._ensure_lora_adapter_config(lora_path)
 
-        lora_path_for_server = lora_path if self._adapter_has_weights(lora_path) else None
+        lora_path_for_server = (
+            lora_path if self._adapter_has_weights(lora_path) else None
+        )
         server_config = dev.get_openai_server_config(
             model_name=self.model_name,
             base_model=self.base_model,
@@ -351,4 +351,4 @@ class MegatronService:
         }
         for key in ["enable_log_requests", "disable_log_requests"]:
             engine_args.pop(key, None)
-        return asyncio.create_task(get_llm(AsyncEngineArgs(**engine_args)))
+        return asyncio.create_task(get_llm(AsyncEngineArgs(**engine_args)))  # type: ignore

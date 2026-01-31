@@ -152,6 +152,8 @@ allowed-unresolved-imports = [
     # plotting deps
     "matplotlib.**",
     "seaborn.**",
+    # megatron deps
+    "megatron.**",
 ]
 
 [dependency-groups]

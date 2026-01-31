@@ -173,8 +173,7 @@ class TestParquetRoundTrip:
         assert tool_calls, "Assistant message should include tool calls"
         first_call = tool_calls[0]
         assert first_call["type"] == "function"
-        function_call = cast(ChatCompletionMessageFunctionToolCallParam, first_call)
-        assert function_call["function"]["name"] == "search"
+        assert first_call["function"]["name"] == "search"
 
         # Check tool result message
         tool_result_msg = _ensure_tool_message(traj.messages_and_choices[2])
