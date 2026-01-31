@@ -53,6 +53,15 @@ class MegatronService:
         self._lora_id_counter += 1
         return self._lora_id_counter
 
+    def _get_optimizer_state_path(self) -> str:
+        if self._optimizer_state_path is not None:
+            return self._optimizer_state_path
+        self._optimizer_state_path = os.path.join(
+            self.output_dir, "optimizer_states"
+        )
+        os.makedirs(self._optimizer_state_path, exist_ok=True)
+        return self._optimizer_state_path
+
     def _default_lora_adapter_config(self) -> dict[str, object]:
         # Keep in sync with LoRA settings in megatron/train.py.
         return {
@@ -244,10 +253,7 @@ class MegatronService:
             lora_path = get_step_checkpoint_dir(self.output_dir, 0)
         self._ensure_lora_adapter_config(lora_path)
 
-        if self._optimizer_state_path is None:
-            self._optimizer_state_path = (
-                f"/tmp/megatron_optimizer_states/{uuid.uuid4().hex}"
-            )
+        self._optimizer_state_path = self._get_optimizer_state_path()
 
         jobs_dir = "/tmp/megatron_training_jobs"
         os.makedirs(jobs_dir, exist_ok=True)
