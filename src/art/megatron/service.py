@@ -1,5 +1,5 @@
 import asyncio
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 import datetime
 from functools import cached_property
 import json
@@ -8,8 +8,8 @@ from pathlib import Path
 import shutil
 import subprocess
 from typing import AsyncIterator
-import uuid
 
+from peft.tuners.lora.config import LoraConfig
 from pydantic import BaseModel
 from safetensors import safe_open
 from safetensors.torch import load_file, save_file
@@ -60,12 +60,12 @@ class MegatronService:
         os.makedirs(self._optimizer_state_path, exist_ok=True)
         return self._optimizer_state_path
 
-    def _default_lora_adapter_config(self) -> dict[str, object]:
+    def _default_lora_adapter_config(self) -> LoraConfig:
         # Keep in sync with LoRA settings in megatron/train.py.
-        return {
-            "r": 1,
-            "lora_alpha": 32,
-            "target_modules": [
+        return LoraConfig(
+            r=1,
+            lora_alpha=32,
+            target_modules=[
                 "q_proj",
                 "k_proj",
                 "v_proj",
@@ -74,8 +74,8 @@ class MegatronService:
                 "up_proj",
                 "down_proj",
             ],
-            "bias": "none",
-        }
+            bias="none",
+        )
 
     def _adapter_has_weights(self, lora_path: str) -> bool:
         adapter_path = os.path.join(lora_path, "adapter_model.safetensors")
@@ -93,19 +93,10 @@ class MegatronService:
 
     def _create_identity_lora(self, lora_path: str) -> None:
         # Create an identity (zero) LoRA using PEFT so vLLM can load it.
-        from peft import LoraConfig, get_peft_model
+        from peft import get_peft_model
         from transformers import AutoModelForCausalLM
 
-        config = self._default_lora_adapter_config()
-        target_modules = list(config["target_modules"])
-        lora_config = LoraConfig(
-            r=int(config["r"]),
-            lora_alpha=int(config["lora_alpha"]),
-            target_modules=target_modules,
-            lora_dropout=0.0,
-            bias=str(config["bias"]),
-            task_type="CAUSAL_LM",
-        )
+        lora_config = self._default_lora_adapter_config()
         model = AutoModelForCausalLM.from_pretrained(
             self.base_model,
             torch_dtype=torch.bfloat16,
@@ -142,7 +133,7 @@ class MegatronService:
                 shutil.copy(source_config, config_path)
                 return
         with open(config_path, "w") as f:
-            json.dump(self._default_lora_adapter_config(), f)
+            json.dump(asdict(self._default_lora_adapter_config()), f)
 
     async def _add_lora_aliases(
         self, llm: AsyncLLM, step: int, checkpoint_dir: str
@@ -183,7 +174,7 @@ class MegatronService:
             self._megatron_process = None
 
         try:
-            import megatron.bridge  # noqa: F401
+            import megatron.bridge  # type: ignore
 
             setup_cmd = ""
         except ImportError:
