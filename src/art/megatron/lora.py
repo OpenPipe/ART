@@ -15,6 +15,8 @@ from megatron.core.transformer.moe.experts import TEGroupedMLP
 from megatron.core.transformer.transformer_layer import TransformerLayer
 import torch
 
+assert isinstance(TERowParallelGroupedLinear, type)
+
 
 class LoRA(torch.nn.Module):
     def __init__(
@@ -174,6 +176,7 @@ class SelfAttentionLinearProjLoRA(torch.nn.Module):
         super().__init__()
         self.provider = provider
         self.linear_proj = linear_proj
+        assert isinstance(linear_proj.weight, torch.Tensor)
         self.lora = LoRA(
             adapter_model_prefix=adapter_model_prefix,
             in_features=linear_proj.in_features,
@@ -229,6 +232,7 @@ class SelfAttentionLinearQKVLoRA(torch.nn.Module):
         )
         q_out_features_per_rank = q_out_features // tp_world_size
         kv_out_features_per_rank = kv_out_features // tp_world_size
+        assert isinstance(linear_qkv.weight, torch.Tensor)
         self.q_proj_lora = LoRA(
             adapter_model_prefix=f"{adapter_model_prefix}.q_proj",
             in_features=linear_qkv.in_features,
@@ -298,7 +302,9 @@ class MLPExpertsLinearFC1LoRA(torch.nn.Module):
         num_local_experts: int,
     ) -> None:
         super().__init__()
+        assert linear_fc1 is not None
         self.linear_fc1 = linear_fc1
+        assert isinstance(linear_fc1.weight0, torch.Tensor)
         self.gate_lora = LoRA(
             adapter_model_prefix=f"{adapter_model_prefix}.{{expert}}.gate_proj",
             in_features=linear_fc1.in_features,
@@ -340,6 +346,7 @@ class MLPExpertsLinearFC2LoRA(torch.nn.Module):
         num_local_experts: int,
     ) -> None:
         super().__init__()
+        assert isinstance(linear_fc2.weight0, torch.Tensor)
         self.linear_fc2 = linear_fc2
         self.lora = LoRA(
             adapter_model_prefix=f"{adapter_model_prefix}.{{expert}}.down_proj",
@@ -405,11 +412,13 @@ def apply_lora_adapters(
                     assert isinstance(module.mlp.experts, TEGroupedMLP)
                     mlp_experts_linear_fc1 = module.mlp.experts.linear_fc1
                     if not isinstance(
-                        mlp_experts_linear_fc1, TEColumnParallelGroupedLinear
+                        mlp_experts_linear_fc1,
+                        TEColumnParallelGroupedLinear,  # type: ignore
                     ):
                         mlp_experts_linear_fc1 = mlp_experts_linear_fc1.linear_fc1
                         assert isinstance(
-                            mlp_experts_linear_fc1, TEColumnParallelGroupedLinear
+                            mlp_experts_linear_fc1,
+                            TEColumnParallelGroupedLinear,  # type: ignore
                         )
                     module.mlp.experts.linear_fc1 = MLPExpertsLinearFC1LoRA(
                         adapter_model_prefix=f"{adapter_model_prefix}.mlp.experts",
@@ -420,11 +429,13 @@ def apply_lora_adapters(
                     )
                     mlp_experts_linear_fc2 = module.mlp.experts.linear_fc2
                     if not isinstance(
-                        mlp_experts_linear_fc2, TERowParallelGroupedLinear
+                        mlp_experts_linear_fc2,
+                        TERowParallelGroupedLinear,  # type: ignore
                     ):
                         mlp_experts_linear_fc2 = mlp_experts_linear_fc2.linear_fc2
                         assert isinstance(
-                            mlp_experts_linear_fc2, TERowParallelGroupedLinear
+                            mlp_experts_linear_fc2,
+                            TERowParallelGroupedLinear,  # type: ignore
                         )
                     module.mlp.experts.linear_fc2 = MLPExpertsLinearFC2LoRA(
                         adapter_model_prefix=f"{adapter_model_prefix}.mlp.experts",
