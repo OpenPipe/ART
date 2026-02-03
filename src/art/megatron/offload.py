@@ -1,9 +1,6 @@
-from __future__ import annotations
-
-from collections.abc import Sequence
 from dataclasses import dataclass, field
 import gc
-from typing import Any
+from typing import Any, Sequence
 
 import torch
 

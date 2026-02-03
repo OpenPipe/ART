@@ -1,5 +1,5 @@
-from collections.abc import Sequence
 import math
+from typing import Sequence
 
 from megatron.bridge.models.gpt_provider import GPTModelProvider
 from megatron.core import parallel_state as ps
@@ -14,8 +14,6 @@ from megatron.core.transformer.moe import grouped_gemm_util
 from megatron.core.transformer.moe.experts import TEGroupedMLP
 from megatron.core.transformer.transformer_layer import TransformerLayer
 import torch
-
-assert isinstance(TERowParallelGroupedLinear, type)
 
 
 class LoRA(torch.nn.Module):
@@ -346,6 +344,7 @@ class MLPExpertsLinearFC2LoRA(torch.nn.Module):
         num_local_experts: int,
     ) -> None:
         super().__init__()
+        assert linear_fc2 is not None
         assert isinstance(linear_fc2.weight0, torch.Tensor)
         self.linear_fc2 = linear_fc2
         self.lora = LoRA(

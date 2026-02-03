@@ -1,5 +1,6 @@
 from megatron.bridge import AutoBridge
 from megatron.bridge.models.gpt_provider import GPTModelProvider
+from megatron.bridge.models.qwen.qwen3_moe_bridge import Qwen3MoEBridge
 from megatron.core.transformer.enums import AttnBackend
 import torch
 
@@ -10,7 +11,9 @@ def get_provider(model: str) -> GPTModelProvider:
         torch_dtype=torch.bfloat16,
         trust_remote_code=True,
     )
-    print(f"Bridge: {bridge}")
+    assert isinstance(bridge._model_bridge, Qwen3MoEBridge), (
+        "Only Qwen3 MoE models are supported"
+    )
     provider = bridge.to_megatron_provider()
     provider.attention_backend = AttnBackend.fused
     provider.recompute_granularity = "full"
