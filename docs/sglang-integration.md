@@ -203,57 +203,10 @@ await backend.register(model)
 | `disk` | ~10-20s | Preserved | Large checkpoints |
 | `restart` | ~30-60s | Lost | Single-GPU fallback |
 
-## Known Issues and Workarounds
 
-### 1. DeviceMesh Memory Imbalance Error
 
-**Symptom**: SGLang fails to start with memory imbalance error.
 
-**Solution**: Set environment variable (done automatically by SGLangBackend):
-```bash
-export SGL_DISABLE_TP_MEMORY_INBALANCE_CHECK=True
-```
 
-### 2. update_weights_from_tensor Fails with TP > 1
-
-**Reference**: [SGLang #3726](https://github.com/sgl-project/sglang/issues/3726)
-
-**Solution**: Use `weight_sync_method="lora"` or `"disk"` instead of tensor sync.
-
-### 3. OOM on Weight Update
-
-**Reference**: [SGLang #8076](https://github.com/sgl-project/sglang/issues/8076)
-
-**Solution**: Use disk-based sync or reduce `mem_fraction_static`.
-
-### 4. dp_size Must Be 1 for Weight Updates
-
-**Reference**: [SGLang #4283](https://github.com/sgl-project/sglang/issues/4283)
-
-**Solution**: Don't use data parallelism for inference (use TP instead).
-
-### 5. Garbled Output with Small Tensor Buckets
-
-**Reference**: [SGLang #14178](https://github.com/sgl-project/sglang/issues/14178)
-
-**Solution**: Use LoRA-based sync instead of tensor sync.
-
-## Performance Comparison
-
-Based on external benchmarks (H100, Llama 3.1 8B):
-
-| Metric | vLLM | SGLang | Improvement |
-|--------|------|--------|-------------|
-| Throughput (tok/s) | ~12,500 | ~16,200 | ~29% |
-| TTFT (ms) | ~45 | ~35 | ~22% |
-| P99 Latency (ms) | ~120 | ~95 | ~21% |
-
-*Source: [aimultiple.com benchmark](https://aimultiple.com/llm-inference-benchmark)*
-
-The performance advantage comes from:
-- RadixAttention's automatic prefix caching
-- Zero-overhead scheduler design
-- Optimized FlashInfer kernels
 
 ## Benchmarking Your Setup
 
