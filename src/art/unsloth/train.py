@@ -23,7 +23,14 @@ nest_asyncio.apply()
 async def train(
     trainer: "GRPOTrainer",
     results_queue: asyncio.Queue[dict[str, float]],
+    training_device: int | None = None,
 ) -> None:
+    # Set the CUDA device before training - required for 4-bit/8-bit quantized models
+    # because accelerate checks torch.cuda.current_device() matches the model's device
+    if training_device is not None:
+        torch.cuda.set_device(training_device)
+        print(f"[train] Set CUDA device to {training_device}, current_device={torch.cuda.current_device()}")
+    
     _compute_loss = trainer.compute_loss
     _log = trainer.log
     trainer.compute_loss = get_compute_loss_fn(trainer)
@@ -37,7 +44,10 @@ async def train(
     if not is_train_dict:
         trainer._metrics = {"train": defaultdict(list)}
     try:
-        trainer.train()
+        # Use context manager to ensure device is set during training
+        with torch.cuda.device(training_device) if training_device is not None else nullcontext():
+            print(f"[train] About to call trainer.train(), current_device={torch.cuda.current_device()}")
+            trainer.train()
     finally:
         trainer.compute_loss = _compute_loss
         trainer.log = _log  # ty:ignore[invalid-assignment]

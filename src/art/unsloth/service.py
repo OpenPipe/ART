@@ -1,7 +1,7 @@
 """Unsloth training service with decoupled vLLM inference."""
 
 import asyncio
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from functools import cached_property
 import os
 from typing import TYPE_CHECKING, Any, AsyncIterator, Protocol, cast
@@ -28,6 +28,76 @@ from ..utils.get_model_step import get_step_from_dir
 from ..utils.output_dirs import get_step_checkpoint_dir
 from ..vllm import get_llm, get_worker, openai_server_task, run_on_workers
 from .train import gc_and_empty_cuda_cache, train
+
+
+# ============================================================================
+# Device Configuration for Multi-GPU Support
+# ============================================================================
+
+
+@dataclass
+class DeviceConfig:
+    """GPU device assignment for Unsloth training and vLLM inference.
+    
+    For optimal performance, training and inference should run on separate GPUs.
+    This eliminates memory contention and the need for CPU offloading.
+    
+    Attributes:
+        inference_device: GPU index for vLLM inference (default: 0)
+        training_device: GPU index for Unsloth training (default: 1, or 0 if single GPU)
+        auto_detect: If True, automatically detect available GPUs
+    
+    Example:
+        # 2-GPU setup (recommended)
+        config = DeviceConfig(inference_device=0, training_device=1)
+        
+        # Single GPU (fallback with CPU offloading)
+        config = DeviceConfig(inference_device=0, training_device=0)
+    """
+    inference_device: int = 0
+    training_device: int = 1
+    auto_detect: bool = True
+    
+    def __post_init__(self):
+        if self.auto_detect:
+            self._auto_configure()
+    
+    def _auto_configure(self):
+        """Auto-detect GPU count and configure devices."""
+        try:
+            gpu_count = torch.cuda.device_count()
+        except Exception:
+            gpu_count = 1
+        
+        if gpu_count == 0:
+            raise RuntimeError("No CUDA GPUs available.")
+        elif gpu_count == 1:
+            # Single GPU: shared mode (will use CPU offloading)
+            self.inference_device = 0
+            self.training_device = 0
+            print(f"[DeviceConfig] Single GPU detected. Using shared mode with CPU offloading.")
+        else:
+            # Multi-GPU: split mode (no offloading needed!)
+            self.inference_device = 0
+            self.training_device = 1
+            print(f"[DeviceConfig] {gpu_count} GPUs detected. Using split mode:")
+            print(f"  - GPU {self.inference_device}: vLLM inference")
+            print(f"  - GPU {self.training_device}: Unsloth training")
+    
+    @property
+    def is_split_mode(self) -> bool:
+        """True if inference and training use separate GPUs."""
+        return self.inference_device != self.training_device
+    
+    @property
+    def inference_cuda_devices(self) -> str:
+        """CUDA_VISIBLE_DEVICES string for vLLM inference subprocess."""
+        return str(self.inference_device)
+    
+    @property
+    def training_cuda_device(self) -> str:
+        """CUDA device string for training (e.g., 'cuda:1')."""
+        return f"cuda:{self.training_device}"
 
 if TYPE_CHECKING:
     from peft.peft_model import PeftModelForCausalLM
@@ -174,79 +244,54 @@ class UnslothState:
     _pinned_buffers: dict[str, torch.Tensor] | None = None
 
     def offload_to_cpu(self) -> None:
-        """Offload training model and optimizer to CPU using pinned memory for faster transfers."""
+        """Offload entire training model (base + adapters) and optimizer to CPU."""
         if self._is_offloaded:
             return
 
-        # Initialize pinned buffer storage
-        if self._pinned_buffers is None:
-            self._pinned_buffers = {}
-
-        # Offload model parameters to pinned memory for faster reload
-        for name, param in self.peft_model.named_parameters():
-            if param.device.type == "cuda":
-                # Create pinned buffer if not exists or wrong size
-                if (
-                    name not in self._pinned_buffers
-                    or self._pinned_buffers[name].shape != param.shape
-                ):
-                    self._pinned_buffers[name] = torch.empty(
-                        param.shape, dtype=param.dtype, device="cpu", pin_memory=True
-                    )
-                # Async copy to pinned memory
-                self._pinned_buffers[name].copy_(param.data, non_blocking=True)
-                param.data = self._pinned_buffers[name]
-
-        # Offload optimizer state to pinned memory
+        print("[UnslothService] Offloading entire model to CPU...")
+        
+        # Move the entire PEFT model to CPU (this includes base model + adapters)
+        self.peft_model.to("cpu")
+        
+        # Offload optimizer state to CPU
         optimizer = getattr(self.trainer, "optimizer", None)
         if optimizer is not None and hasattr(optimizer, "state"):
             for param_id, state in optimizer.state.items():
                 for k, v in state.items():
                     if isinstance(v, torch.Tensor) and v.device.type == "cuda":
-                        key = f"opt_{id(param_id)}_{k}"
-                        if (
-                            key not in self._pinned_buffers
-                            or self._pinned_buffers[key].shape != v.shape
-                        ):
-                            self._pinned_buffers[key] = torch.empty(
-                                v.shape, dtype=v.dtype, device="cpu", pin_memory=True
-                            )
-                        self._pinned_buffers[key].copy_(v, non_blocking=True)
-                        state[k] = self._pinned_buffers[key]
+                        state[k] = v.cpu()
 
-        # Sync to ensure all copies are complete before freeing GPU memory
+        # Sync and clear GPU memory
         torch.cuda.synchronize()
-
         self._is_offloaded = True
         gc_and_empty_cuda_cache()
+        
+        # Report free memory
+        free_mem = torch.cuda.mem_get_info()[0] / 1e9
+        print(f"[UnslothService] Model offloaded. GPU memory free: {free_mem:.2f} GB")
 
     def reload_to_gpu(self, device: str = "cuda:0") -> None:
-        """Reload training model and optimizer back to GPU using async transfers."""
+        """Reload entire training model and optimizer back to GPU."""
         if not self._is_offloaded:
             return
 
-        # Reload model parameters from pinned memory (fast async transfer)
-        for name, param in self.peft_model.named_parameters():
-            if param.device.type == "cpu":
-                # Allocate on GPU and async copy from pinned memory
-                gpu_tensor = torch.empty(param.shape, dtype=param.dtype, device=device)
-                gpu_tensor.copy_(param.data, non_blocking=True)
-                param.data = gpu_tensor
+        print(f"[UnslothService] Reloading model to {device}...")
+        
+        # Move the entire PEFT model back to GPU
+        self.peft_model.to(device)
 
-        # Reload optimizer state
+        # Reload optimizer state to GPU
         optimizer = getattr(self.trainer, "optimizer", None)
         if optimizer is not None and hasattr(optimizer, "state"):
             for state in optimizer.state.values():
                 for k, v in state.items():
                     if isinstance(v, torch.Tensor) and v.device.type == "cpu":
-                        gpu_tensor = torch.empty(v.shape, dtype=v.dtype, device=device)
-                        gpu_tensor.copy_(v, non_blocking=True)
-                        state[k] = gpu_tensor
+                        state[k] = v.to(device)
 
         # Sync to ensure all copies are complete before training
         torch.cuda.synchronize()
-
         self._is_offloaded = False
+        print(f"[UnslothService] Model reloaded to {device}")
 
 
 # ============================================================================
@@ -260,6 +305,7 @@ class UnslothService:
     base_model: str
     config: dev.InternalModelConfig
     output_dir: str
+    device_config: DeviceConfig = field(default_factory=DeviceConfig)
     _is_sleeping: bool = False
     _latest_step: int = 0
     _lora_id_counter: int = 1  # Start from 1 since 0 is reserved
@@ -283,8 +329,13 @@ class UnslothService:
             # Extract step from checkpoint path
             self._latest_step = get_step_from_dir(self.output_dir)
 
-        # Offload training model to CPU before vLLM starts to free GPU memory
+        # Offload training model to CPU so vLLM can use the GPU
         self._state.offload_to_cpu()
+        # Force garbage collection and clear CUDA cache
+        import gc
+        gc.collect()
+        torch.cuda.empty_cache()
+        torch.cuda.synchronize()
 
         server_config = dev.get_openai_server_config(
             model_name=self.model_name,
@@ -334,7 +385,7 @@ class UnslothService:
     ) -> AsyncIterator[dict[str, float]]:
         llm = await self.llm
 
-        # Pause generation to prevent new requests during training
+        # Time-sharing mode: pause vLLM, free GPU memory, then train
         await llm.pause_generation()
 
         # Determine sleep level based on outstanding requests:
@@ -364,10 +415,14 @@ class UnslothService:
 
         # If we haven't already, start the training task
         if not hasattr(self, "_train_task") or self._train_task is None:
+            # Use remapped device index: in split mode with CUDA_VISIBLE_DEVICES=0,1,
+            # training is cuda:1 (second visible device)
+            # Training device is cuda:0
             self._train_task = asyncio.create_task(
                 train(
                     trainer=self._state.trainer,
                     results_queue=self._state.results_queue,
+                    training_device=0,
                 )
             )
             warmup = True
@@ -396,7 +451,7 @@ class UnslothService:
             verbose=verbose,
         )
 
-        # Offload training model to CPU before waking vLLM
+        # Offload training model before waking vLLM
         self._state.offload_to_cpu()
 
         # Free memory before waking up vLLM
@@ -438,6 +493,12 @@ class UnslothService:
     def _state(self) -> UnslothState:
         import unsloth
 
+        # Use cuda:0 for training - Unsloth's compiled code expects this
+        # Time-sharing with vLLM via sleep/wake handles memory management
+        cuda_device_index = 0
+        torch.cuda.set_device(cuda_device_index)
+        print(f"[UnslothService] Loading training model on cuda:{cuda_device_index}")
+
         # Initialize Unsloth model
         init_args = self.config.get("init_args", {})
         checkpoint_dir = get_last_checkpoint_dir(self.output_dir)
@@ -445,11 +506,19 @@ class UnslothService:
             init_args["model_name"] = checkpoint_dir
         else:
             init_args["model_name"] = self.base_model
+        
+        # Set device_map to cuda:0 - Unsloth expects training on cuda:0
+        if "device_map" not in init_args:
+            init_args["device_map"] = {"": 0}
 
         model, tokenizer = cast(
             tuple[CausalLM, PreTrainedTokenizerBase],
             unsloth.FastLanguageModel.from_pretrained(**init_args),
         )
+        
+        # Verify the model is on the correct device
+        model_device = next(model.parameters()).device
+        print(f"[UnslothService] Model loaded on device: {model_device}, current_device={torch.cuda.current_device()}")
 
         # Initialize PEFT model - skip if already a PeftModel (e.g. loaded from checkpoint)
         if (
@@ -466,6 +535,56 @@ class UnslothService:
                 ),
             )
 
+        # Reset AcceleratorState singleton and patch device check before creating trainer
+        # This is necessary because AcceleratorState caches the device from first initialization,
+        # which might have been device 0 (from vLLM or imports). We need it to use device 1.
+        try:
+            from accelerate.state import AcceleratorState
+            from accelerate import Accelerator
+            AcceleratorState._reset_state()
+            
+            # Monkey-patch Accelerator to skip device check for 4-bit models
+            # The check fails when model is on GPU 1 but Accelerator was initialized earlier
+            # We need to bypass the check BEFORE original_prepare_model runs
+            original_prepare_model = Accelerator.prepare_model
+            def patched_prepare_model(self, model, device_placement=None, evaluation_mode=False):
+                # For quantized models, temporarily remove the quantization flags to bypass the check
+                # Then restore them after prepare_model completes
+                was_8bit = getattr(model, "is_loaded_in_8bit", False)
+                was_4bit = getattr(model, "is_loaded_in_4bit", False)
+                was_device_map = getattr(model, "hf_device_map", None)
+                
+                if was_8bit or was_4bit:
+                    print(f"[UnslothService] Temporarily hiding quantization flags to bypass device check")
+                    # Temporarily hide the quantization flags
+                    model.is_loaded_in_8bit = False
+                    model.is_loaded_in_4bit = False
+                    # Try to delete hf_device_map - it may be on inner model (accessible via __getattr__)
+                    # but not directly deletable from the PEFT wrapper
+                    try:
+                        delattr(model, "hf_device_map")
+                    except AttributeError:
+                        pass  # Attribute is on inner model, not directly on PEFT wrapper
+                    
+                    try:
+                        result = original_prepare_model(self, model, device_placement, evaluation_mode)
+                    finally:
+                        # Restore the flags
+                        if was_8bit:
+                            model.is_loaded_in_8bit = True
+                        if was_4bit:
+                            model.is_loaded_in_4bit = True
+                        if was_device_map is not None:
+                            model.hf_device_map = was_device_map
+                    return result
+                else:
+                    return original_prepare_model(self, model, device_placement, evaluation_mode)
+            Accelerator.prepare_model = patched_prepare_model
+            
+            print(f"[UnslothService] Reset AcceleratorState and patched prepare_model, current_device={torch.cuda.current_device()}")
+        except Exception as e:
+            print(f"[UnslothService] Could not reset AcceleratorState: {e}")
+        
         # Initialize trainer with dummy dataset
         data = {"prompt": ""}
         trainer = GRPOTrainer(
@@ -504,12 +623,29 @@ class UnslothService:
 
     @cached_property
     def llm(self) -> asyncio.Task[AsyncLLM]:
+        # Use single GPU (cuda:0) for both vLLM and Unsloth with time-sharing
+        # Unsloth's compiled training loop expects cuda:0, so split-GPU mode is not supported
+        inference_gpu = self.device_config.inference_device
+        os.environ["CUDA_VISIBLE_DEVICES"] = str(inference_gpu)
+        print(f"[UnslothService] Starting vLLM on GPU {inference_gpu} (time-sharing mode with Unsloth)")
+        
         # Filter engine args to remove incompatible boolean flags
         engine_args = {
             **self.config.get("engine_args", {}),
             "enable_lora": True,
             "max_loras": self.config.get("engine_args", {}).get("max_loras", 2),
         }
+        
+        # In split mode, vLLM has the full GPU to itself, so use high utilization
+        # In shared mode, use lower utilization to leave room for training model
+        if self.device_config.is_split_mode:
+            if "gpu_memory_utilization" not in engine_args:
+                engine_args["gpu_memory_utilization"] = 0.90
+        else:
+            # Shared mode: lower utilization to coexist with training
+            if "gpu_memory_utilization" not in engine_args:
+                engine_args["gpu_memory_utilization"] = 0.80
+        
         # Remove boolean flags that vLLM's argparse doesn't accept as =False
         for key in ["enable_log_requests", "disable_log_requests"]:
             engine_args.pop(key, None)
