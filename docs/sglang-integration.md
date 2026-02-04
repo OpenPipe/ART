@@ -81,24 +81,34 @@ this provides significant speedups.
 
 ## Installation
 
-**CRITICAL**: SGLang and vLLM have conflicting PyTorch dependencies. You MUST use
-separate virtual environments.
+**CRITICAL**: SGLang requires a TWO-environment architecture due to torchao version conflicts.
 
-### vLLM Environment (Default)
-
+### Quick Setup (Recommended)
 ```bash
-python -m venv .venv-vllm
-source .venv-vllm/bin/activate
-pip install openpipe-art[backend]
+# Run the setup script (creates both environments)
+chmod +x scripts/setup_sglang.sh
+./scripts/setup_sglang.sh
 ```
 
-### SGLang Environment
-
+### Manual Setup
 ```bash
-python -m venv .venv-sglang
-source .venv-sglang/bin/activate
-pip install openpipe-art[sglang]
+# 1. Main training environment (ART + Unsloth)
+python3.11 -m venv .venv
+source .venv/bin/activate
+pip install -e ".[sglang]"
+deactivate
+
+# 2. SGLang server environment (ISOLATED - no ART)
+python3.11 -m venv .venv-sglang-server
+source .venv-sglang-server/bin/activate
+pip install "sglang[srt]>=0.5.5"
+deactivate
+
+# 3. Activate main env to run training
+source .venv/bin/activate
 ```
+
+The SGLang backend automatically detects `.venv-sglang-server` and uses it for the inference server subprocess.
 
 ## Usage
 
