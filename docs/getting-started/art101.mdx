@@ -253,6 +253,16 @@ data after every 50 steps in the training loop.
 Here is an how the training loop looks like when training with ART and Serverless API:
 
 ```python
+from art.utils import iterate_dataset
+
+# Create a dataset iterator for your dataset
+iterator = iterate_dataset(
+        training_inputs,
+        groups_per_step=4,
+        num_epochs=1
+        initial_step=0,
+)
+ 
 for batch in data_iterator:
     # 1. Sample the next batch
     print(f"\nTraining step {batch.step}")
@@ -279,7 +289,6 @@ for batch in data_iterator:
         train_groups,
         pbar_desc="Generating rollouts",
         max_exceptions=rollouts_per_group * len(batch.items),
-
     )
 
     # 3. Score the trajectories using the reward functions defined in your environment
