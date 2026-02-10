@@ -645,6 +645,18 @@ class ServerlessBackend(Backend):
         run.log_artifact(dest_artifact, aliases=aliases)
         run.finish()
 
+        # Copy provenance from the source model's W&B run to the destination model
+        api = wandb.Api(api_key=self._client.api_key)  # ty:ignore[possibly-missing-attribute]
+        try:
+            source_run = api.run(f"{model.entity}/{from_project}/{from_model}")
+            source_provenance = source_run.config.get("provenance")
+            if source_provenance is not None:
+                dest_run = model._get_wandb_run()
+                if dest_run is not None:
+                    dest_run.config.update({"provenance": list(source_provenance)})
+        except Exception:
+            pass  # Source run may not exist (e.g., S3-only models)
+
         if verbose:
             print(
                 f"Successfully forked checkpoint from {from_model} "
