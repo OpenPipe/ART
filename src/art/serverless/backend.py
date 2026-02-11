@@ -210,11 +210,6 @@ class ServerlessBackend(Backend):
         """
         groups_list = list(trajectory_groups)
 
-        # Record provenance in W&B
-        wandb_run = model._get_wandb_run()
-        if wandb_run is not None:
-            record_provenance(wandb_run, "serverless-rl")
-
         # Build config objects from explicit kwargs
         config = TrainConfig(learning_rate=learning_rate, beta=beta)
         dev_config: dev.TrainConfig = {
@@ -259,6 +254,11 @@ class ServerlessBackend(Backend):
         artifact_name: str | None = None
         if model.entity is not None:
             artifact_name = f"{model.entity}/{model.project}/{model.name}:step{step}"
+
+        # Record provenance on the latest W&B artifact
+        wandb_run = model._get_wandb_run()
+        if wandb_run is not None:
+            record_provenance(wandb_run, "serverless-rl")
 
         return ServerlessTrainResult(
             step=step,

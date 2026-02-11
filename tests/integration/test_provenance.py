@@ -1,9 +1,10 @@
-"""Integration test: verify provenance tracking in W&B run config via ServerlessBackend."""
+"""Integration test: verify provenance tracking on W&B artifact metadata via ServerlessBackend."""
 
 import asyncio
 from datetime import datetime
 
 from dotenv import load_dotenv
+import wandb
 
 import art
 from art.serverless.backend import ServerlessBackend
@@ -40,6 +41,15 @@ async def make_group(model: art.TrainableModel) -> art.TrajectoryGroup:
     return art.TrajectoryGroup(simple_rollout(model) for _ in range(4))
 
 
+def get_latest_artifact_provenance(
+    entity: str, project: str, name: str
+) -> list[str] | None:
+    """Fetch provenance from the latest W&B artifact's metadata."""
+    api = wandb.Api()
+    artifact = api.artifact(f"{entity}/{project}/{name}:latest", type="lora")
+    return artifact.metadata.get("provenance")
+
+
 async def main() -> None:
     backend = ServerlessBackend()
 
@@ -49,24 +59,21 @@ async def main() -> None:
         base_model="OpenPipe/Qwen3-14B-Instruct",
     )
     await model.register(backend)
+    assert model.entity is not None
 
     # --- Step 1: first training call ---
     groups = await art.gather_trajectory_groups(make_group(model) for _ in range(1))
     result = await backend.train(model, groups)
     await model.log(groups, metrics=result.metrics, step=result.step, split="train")
 
-    # Check provenance after first train call
-    run = model._get_wandb_run()
-    assert run is not None, "W&B run should exist"
-    provenance = run.config.get("provenance")
+    # Check provenance on the latest artifact after first train call
+    provenance = get_latest_artifact_provenance(model.entity, model.project, model.name)
     print(f"After step 1: provenance = {provenance}")
     assert provenance == ["serverless-rl"], (
         f"Expected ['serverless-rl'], got {provenance}"
     )
 
     # --- Step 2: second training call (same technique, should NOT duplicate) ---
-    # Provenance is recorded at the start of train(), before the remote call,
-    # so we can verify deduplication even if the server-side training fails.
     groups2 = await art.gather_trajectory_groups(make_group(model) for _ in range(1))
     try:
         result2 = await backend.train(model, groups2)
@@ -76,7 +83,7 @@ async def main() -> None:
     except RuntimeError as e:
         print(f"Step 2 training failed (transient server error, OK for this test): {e}")
 
-    provenance = run.config.get("provenance")
+    provenance = get_latest_artifact_provenance(model.entity, model.project, model.name)
     print(f"After step 2: provenance = {provenance}")
     assert provenance == ["serverless-rl"], (
         f"Expected ['serverless-rl'] (no duplicate), got {provenance}"
