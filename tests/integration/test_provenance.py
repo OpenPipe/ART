@@ -37,10 +37,6 @@ async def simple_rollout(model: art.TrainableModel) -> art.Trajectory:
     return traj
 
 
-async def make_group(model: art.TrainableModel) -> art.TrajectoryGroup:
-    return art.TrajectoryGroup(simple_rollout(model) for _ in range(4))
-
-
 def get_latest_artifact_provenance(
     entity: str, project: str, name: str
 ) -> list[str] | None:
@@ -61,10 +57,21 @@ async def main() -> None:
     await model.register(backend)
     assert model.entity is not None
 
-    # --- Step 1: first training call ---
-    groups = await art.gather_trajectory_groups(make_group(model) for _ in range(1))
-    result = await backend.train(model, groups)
-    await model.log(groups, metrics=result.metrics, step=result.step, split="train")
+    # --- Step 1: first training call (retry on transient server errors) ---
+    for attempt in range(3):
+        groups = await art.gather_trajectory_groups(
+            [art.TrajectoryGroup(simple_rollout(model) for _ in range(4))]  # ty: ignore[invalid-argument-type]
+        )
+        try:
+            result = await backend.train(model, groups)
+            await model.log(
+                groups, metrics=result.metrics, step=result.step, split="train"
+            )
+            break
+        except RuntimeError as e:
+            print(f"Step 1 attempt {attempt + 1} failed: {e}")
+            if attempt == 2:
+                raise
 
     # Check provenance on the latest artifact after first train call
     provenance = get_latest_artifact_provenance(model.entity, model.project, model.name)
@@ -74,7 +81,9 @@ async def main() -> None:
     )
 
     # --- Step 2: second training call (same technique, should NOT duplicate) ---
-    groups2 = await art.gather_trajectory_groups(make_group(model) for _ in range(1))
+    groups2 = await art.gather_trajectory_groups(
+        [art.TrajectoryGroup(simple_rollout(model) for _ in range(4))]  # ty: ignore[invalid-argument-type]
+    )
     try:
         result2 = await backend.train(model, groups2)
         await model.log(
