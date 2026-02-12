@@ -36,7 +36,7 @@ async def train():
         model = art.TrainableModel(
             name="my-model-v2",
             project="my-project",
-            base_model="Qwen/Qwen2.5-14B-Instruct",
+            base_model="OpenPipe/Qwen3-14B-Instruct",
         )
 
         # Copy the checkpoint from another model
@@ -104,14 +104,14 @@ Here's a practical example of using checkpoint forking to test a lower learning 
 base_model = art.TrainableModel(
     name="summarizer-base",
     project="experiments",
-    base_model="Qwen/Qwen2.5-14B-Instruct",
+    base_model="OpenPipe/Qwen3-14B-Instruct",
 )
 
 # Fork at step 1000 to try lower learning rate
 low_lr_model = art.TrainableModel(
     name="summarizer-low-lr",
     project="experiments",
-    base_model="Qwen/Qwen2.5-14B-Instruct",
+    base_model="OpenPipe/Qwen3-14B-Instruct",
 )
 
 async def experiment():

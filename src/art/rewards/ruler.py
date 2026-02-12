@@ -39,7 +39,7 @@ class Response(BaseModel):
 
 
 DEFAULT_RUBRIC = dedent(
-    """         
+    """
         - A trajectory that achieves its goal should always get a significantly higher score than a trajectory that does not achieve its goal.
         - A trajectory that achieves its goal more efficiently (eg. by avoiding unproductive detours) should get a higher score than a trajectory that achieves its goal less efficiently.
         - If one trajectory is only slightly better than another, the difference in scores should be small. If it is significantly better, the difference in scores should be large.
@@ -55,6 +55,7 @@ async def ruler(
     judge_model: str = "openai/o3",
     extra_litellm_params: dict | None = None,
     rubric: str = DEFAULT_RUBRIC,
+    tools: list | None = None,
     *,
     debug: bool = False,
 ) -> list[TrajectoryScore]:
@@ -81,6 +82,8 @@ async def ruler(
         extra_litellm_params: Additional parameters to pass to LiteLLM completion.
             Can include temperature, max_tokens, etc.
         rubric: The grading rubric. The default rubric works well for most tasks.
+        tools: Optional list of tool definitions available to the agent. When provided,
+            the judge will see which tools were available when evaluating tool usage.
         debug: If True, pretty-print the judge's reasoning to help understand scores.
 
     Returns:
@@ -117,23 +120,50 @@ async def ruler(
         else:
             break
 
+    # Detect if all trajectories are identical
+    all_identical = all(
+        len(msg_list) == common_prefix_len for msg_list in message_lists
+    )
+
+    if all_identical and len(message_lists) > 1:
+        print(
+            f"[RULER] Warning: All {len(message_lists)} trajectories are identical. "
+            "Using absolute scoring (loses relative grounding benefit)."
+        )
+
     # If there is a non-empty common prefix, serialize it once to save tokens.
+    # Skip this optimization if all trajectories are identical (we'll send the full trajectory instead).
     user_text = ""
-    if common_prefix_len > 0:
+    if common_prefix_len > 0 and not all_identical:
         common_prefix_messages = message_lists[0][:common_prefix_len]
         user_text += (
             "<context>\n" + json.dumps(common_prefix_messages) + "\n</context>\n\n"
         )
 
-    # Serialize each trajectory (minus the common prefix) for the judge.
-    serialized_trajectories: List[str] = []
-    for idx, full_messages in enumerate(message_lists, start=1):
-        trimmed_messages = full_messages[common_prefix_len:]
-        serialized_trajectories.append(
-            f'<trajectory id="{idx}">\n'
-            + json.dumps(trimmed_messages)
-            + "\n</trajectory>"
+    # Include available tools so the judge knows which tool calls are valid
+    if tools:
+        user_text += (
+            "<available_tools>\n" + json.dumps(tools) + "\n</available_tools>\n\n"
         )
+
+    # Serialize each trajectory (minus the common prefix) for the judge.
+    # If all trajectories are identical, only serialize one full trajectory to save tokens.
+    serialized_trajectories: List[str] = []
+    if all_identical:
+        # Send the full trajectory since they're all identical
+        full_trajectory = message_lists[0]
+        serialized_trajectories.append(
+            f'<trajectory id="1">\n' + json.dumps(full_trajectory) + "\n</trajectory>"
+        )
+    else:
+        # Serialize each unique trajectory
+        for idx, full_messages in enumerate(message_lists, start=1):
+            trimmed_messages = full_messages[common_prefix_len:]
+            serialized_trajectories.append(
+                f'<trajectory id="{idx}">\n'
+                + json.dumps(trimmed_messages)
+                + "\n</trajectory>"
+            )
 
     user_text += "Trajectories:\n\n" + "\n\n".join(serialized_trajectories)
 
@@ -165,7 +195,7 @@ async def ruler(
     first_choice = response.choices[0]
 
     if debug:
-        raw_content = first_choice.message.content or "{}"  # type: ignore[attr-defined]
+        raw_content = first_choice.message.content or "{}"
         try:
             print("\n[RULER] Pretty-printed LLM choice JSON:")
             print(json.loads(raw_content))
@@ -173,11 +203,27 @@ async def ruler(
             print(f"[RULER] Could not parse choice content as JSON: {e}")
             print(f"[RULER] Raw choice content: {raw_content}")
 
-    content = first_choice.message.content or "{}"  # type: ignore[attr-defined]
+    content = first_choice.message.content or "{}"
     parsed = Response.model_validate_json(content)
-    assert len(parsed.scores) == len(message_lists)
 
-    return parsed.scores
+    # If all trajectories were identical, we only sent one to the judge
+    # Duplicate the score for all trajectories
+    if all_identical:
+        if len(parsed.scores) != 1:
+            raise ValueError(
+                f"Expected 1 score for identical trajectories, but got {len(parsed.scores)}"
+            )
+        single_score = parsed.scores[0]
+        return [
+            single_score.model_copy(update={"trajectory_id": str(i)})
+            for i in range(1, len(message_lists) + 1)
+        ]
+    else:
+        if len(parsed.scores) != len(message_lists):
+            raise ValueError(
+                f"Expected {len(message_lists)} scores, but got {len(parsed.scores)}"
+            )
+        return parsed.scores
 
 
 async def ruler_score_group(
@@ -255,6 +301,9 @@ async def ruler_score_group(
         message_lists.append(traj.messages())
         traj.metrics["independent_reward"] = traj.reward
 
+    # Extract tools from first trajectory (they should all be the same)
+    tools = new_trajectories[0].tools if new_trajectories else None
+
     try:
         # Call the core ruler function to get scores
         scores = await ruler(
@@ -262,6 +311,7 @@ async def ruler_score_group(
             judge_model=judge_model,
             extra_litellm_params=extra_litellm_params,
             rubric=rubric,
+            tools=tools,
             debug=debug,
         )
     except Exception as e:

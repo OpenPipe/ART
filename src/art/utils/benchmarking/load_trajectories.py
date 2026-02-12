@@ -5,11 +5,13 @@ except ImportError:
         "Plotting dependencies are not installed. Please install them with: "
         "pip install openpipe-art[plotting]"
     )
+
 import json
 from pathlib import Path
 
-import yaml
+import duckdb
 from tqdm.auto import tqdm
+import yaml
 
 from art.utils.get_repo_root_path import get_repo_root_path
 from art.utils.output_dirs import (
@@ -29,164 +31,270 @@ async def load_trajectories(
     art_path: str | None = None,
 ) -> pl.DataFrame:
     """
-      Load and flatten trajectory files (YAML or JSONL) into a Polars DataFrame.
+    Load and flatten trajectory files (Parquet) into a Polars DataFrame.
 
-      The expected on-disk layout is::
+    The expected on-disk layout is::
 
-          {api_path}/{project_name}/models/{model_name}/trajectories/{split}/{step_number}.{yaml|jsonl}
+        {art_path}/{project_name}/models/{model_name}/trajectories/{split}/{step_number}.parquet
 
-      Each file contains a list of *TrajectoryGroups* (see `art`), and each
-      group in turn contains a list of *Trajectories*.  This helper walks the
-      directory tree, reads every trajectory file, and converts every single trajectory
-      into one row of a tabular dataset.
+    Each file contains trajectory data with the following columns:
+    - reward: float
+    - metrics: JSON string
+    - metadata: JSON string
+    - tools: JSON string (nullable)
+    - logs: list of strings
+    - messages: list of message structs
 
-      For every trajectory we record a handful of fixed columns plus two dynamic
-      families of columns:
+    This function reads all Parquet files efficiently using DuckDB and returns
+    a flattened Polars DataFrame with one row per trajectory.
 
-      Fixed columns
-      -------------
-      model : str
-          Name of the model that produced the trajectory (taken from the folder
-          name under ``models/``).
+    Fixed columns
+    -------------
+    model : str
+        Name of the model that produced the trajectory.
     split : str
-          Split name extracted from the folder name under ``trajectories/``.
-      step : int
-          Training / evaluation step extracted from the YAML filename.
-      reward : float | None
-          Reward associated with the trajectory.
-      group_number : int
-          Running counter that uniquely identifies the surrounding trajectory
-          group within the current parsing session (useful for debugging / joins).
-      messages : list[str] | None
-          Raw list of messages & choices for the dialogue.
-      logs : list[str] | None
-          Internal log lines captured during rollout.
+        Split name (e.g., 'train', 'val').
+    step : int
+        Training / evaluation step extracted from the filename.
+    reward : float | None
+        Reward associated with the trajectory.
+    messages : list[dict] | None
+        List of messages and choices for the dialogue.
+    logs : list[str] | None
+        Internal log lines captured during rollout.
 
-      Dynamic columns
-      ---------------
-      metric_* : float
-          One column for every distinct metric key found in the dataset.  Missing
-          values are filled with nulls.
-      metadata_* : str
-          One column for every distinct metadata key (after merging group- and
-          trajectory-level metadata).  Values are coerced to strings so that the
-          resulting table is rectangular.
+    Dynamic columns
+    ---------------
+    metric_* : float
+        One column for every distinct metric key found in the dataset.
+    metadata_* : str
+        One column for every distinct metadata key.
+    group_metric_* : float
+        One column for every distinct group-level metric key.
+    group_metadata_* : str
+        One column for every distinct group-level metadata key.
 
-      Parameters
-      ----------
-      project_path : str
-          Path to the ART project on disk. Typically found in `.art/{project_name}`.
-      debug : bool, optional
-          If *True*, the function prints progress information while parsing.  The
-          default is *False*.
+    Parameters
+    ----------
+    project_name : str
+        Name of the project to load trajectories from.
+    models : list[str] | None, optional
+        List of model names to load. If None, loads all models.
+    debug : bool, optional
+        If True, prints progress information.
+    art_path : str | None, optional
+        Path to the .art directory. If None, uses default.
 
-      Returns
-      -------
-      pl.DataFrame
-          A Polars DataFrame containing one row per trajectory with the schema
-          described above.
+    Returns
+    -------
+    pl.DataFrame
+        A Polars DataFrame containing one row per trajectory.
     """
-    rows: list[dict] = []
-    metric_cols: set[str] = set()
-    metadata_cols: set[str] = set()
-
     if art_path is None:
         art_path = get_default_art_path()
 
     root = Path(get_models_dir(project_name=project_name, art_path=art_path))
-    group_number = 0
 
-    # Normalize the optional *models* argument for quick membership tests
+    if not root.exists():
+        return pl.DataFrame()
+
+    # Determine which models to process
     models_set: set[str] | None = set(models) if models is not None else None
-
-    # Walk through all models and their trajectory files
-    # Build list of model directories we will actually process so that the
-    # progress bar reflects the real workload. If *models* was provided, we
-    # filter accordingly.
     model_dirs = [
         d
         for d in root.iterdir()
         if d.is_dir() and (models_set is None or d.name in models_set)
     ]
-    for model_dir in tqdm(model_dirs, desc="Models", unit="model"):
-        if debug:
-            print(f"Processing {model_dir}")
-        # Basic sanity check (should normally be redundant with filtering above)
-        if not model_dir.is_dir():
-            continue
-        model_name = model_dir.name
 
+    if not model_dirs:
+        return pl.DataFrame()
+
+    # Collect all parquet files
+    all_parquet_files: list[
+        tuple[str, str, str, int]
+    ] = []  # (path, model, split, step)
+
+    for model_dir in tqdm(
+        model_dirs, desc="Scanning models", unit="model", disable=not debug
+    ):
+        model_name = model_dir.name
         traj_root = Path(get_trajectories_dir(str(model_dir)))
+
         if not traj_root.exists():
             continue
 
-        # Iterate over splits (e.g. train/val)
         for split_dir in traj_root.iterdir():
             if not split_dir.is_dir():
                 continue
 
-            # Look for both .yaml and .jsonl files
-            trajectory_files = sorted(split_dir.glob("*"))
-            for trajectory_path in tqdm(
-                trajectory_files,
-                desc=f"{model_name}/{split_dir.name}",
-                unit="file",
-                leave=False,
-            ):
-                if trajectory_path.suffix not in [".yaml", ".jsonl"]:
+            for trajectory_path in split_dir.glob("*.parquet"):
+                try:
+                    step = int(trajectory_path.stem)
+                    all_parquet_files.append(
+                        (
+                            str(trajectory_path),
+                            model_name,
+                            split_dir.name,
+                            step,
+                        )
+                    )
+                except ValueError:
                     continue
-                step = int(trajectory_path.stem)
-                if debug:
-                    print(f"Processing {trajectory_path}")
 
-                # Load trajectory groups based on file extension
-                if trajectory_path.suffix == ".yaml":
-                    trajectory_groups = yaml.safe_load(trajectory_path.read_text())
-                else:  # .jsonl
-                    trajectory_groups = []
-                    with open(trajectory_path, "r") as f:
-                        for line in f:
-                            if line.strip():
-                                trajectory_groups.append(json.loads(line))
+    if not all_parquet_files:
+        return pl.DataFrame()
 
-                for group in trajectory_groups:
-                    group_number += 1
-                    group_meta = group.get("metadata", {})
-                    for traj in group.get("trajectories", []):
-                        # Merge metadata downward (group metadata < traj metadata wins)
-                        merged_meta = {**group_meta, **traj.get("metadata", {})}
+    # Use DuckDB to read all parquet files efficiently
+    rows: list[dict] = []
+    metric_cols: set[str] = set()
+    metadata_cols: set[str] = set()
+    group_metric_cols: set[str] = set()
+    group_metadata_cols: set[str] = set()
+    # Map (model, split, step, group_index) -> unique group_number
+    group_key_to_number: dict[tuple[str, str, int, int], int] = {}
+    next_group_number = 1
 
-                        metrics = traj.get("metrics", {})
+    con = duckdb.connect(":memory:")
 
-                        prepped_metrics = {f"metric_{k}": v for k, v in metrics.items()}
-                        prepped_metadata = {
-                            f"metadata_{k}": str(v) for k, v in merged_meta.items()
+    for file_path, model_name, split_name, step in tqdm(
+        all_parquet_files,
+        desc="Loading trajectories",
+        unit="file",
+        disable=not debug,
+    ):
+        try:
+            result = con.execute(f"SELECT * FROM '{file_path}'").fetchall()
+            columns = [desc[0] for desc in con.description]
+        except Exception as e:
+            if debug:
+                print(f"Error reading {file_path}: {e}")
+            continue
+
+        for row in result:
+            row_dict = dict(zip(columns, row))
+
+            # Skip empty rows
+            if row_dict.get("reward") is None and row_dict.get("messages") is None:
+                continue
+
+            # Get group_index from parquet, default to 0 for backwards compatibility
+            group_index = row_dict.get("group_index", 0)
+            group_key = (model_name, split_name, step, group_index)
+            if group_key not in group_key_to_number:
+                group_key_to_number[group_key] = next_group_number
+                next_group_number += 1
+            group_number = group_key_to_number[group_key]
+
+            # Parse metrics from JSON
+            metrics = {}
+            if row_dict.get("metrics"):
+                try:
+                    metrics = json.loads(row_dict["metrics"])
+                except (json.JSONDecodeError, TypeError):
+                    pass
+
+            # Parse metadata from JSON
+            metadata = {}
+            if row_dict.get("metadata"):
+                try:
+                    metadata = json.loads(row_dict["metadata"])
+                except (json.JSONDecodeError, TypeError):
+                    pass
+
+            # Parse group metrics from JSON (duplicated across group rows)
+            group_metrics = {}
+            if row_dict.get("group_metrics"):
+                try:
+                    group_metrics = json.loads(row_dict["group_metrics"])
+                except (json.JSONDecodeError, TypeError):
+                    pass
+
+            # Parse group metadata from JSON (duplicated across group rows)
+            group_metadata = {}
+            if row_dict.get("group_metadata"):
+                try:
+                    group_metadata = json.loads(row_dict["group_metadata"])
+                except (json.JSONDecodeError, TypeError):
+                    pass
+
+            # Prepare metrics and metadata columns
+            prepped_metrics = {f"metric_{k}": v for k, v in metrics.items()}
+            prepped_metadata = {f"metadata_{k}": str(v) for k, v in metadata.items()}
+            prepped_group_metrics = {
+                f"group_metric_{k}": v for k, v in group_metrics.items()
+            }
+            prepped_group_metadata = {
+                f"group_metadata_{k}": str(v) for k, v in group_metadata.items()
+            }
+            metric_cols.update(prepped_metrics.keys())
+            metadata_cols.update(prepped_metadata.keys())
+            group_metric_cols.update(prepped_group_metrics.keys())
+            group_metadata_cols.update(prepped_group_metadata.keys())
+
+            # Process messages
+            messages = []
+            raw_messages = row_dict.get("messages") or []
+            for msg in raw_messages:
+                if isinstance(msg, dict):
+                    msg_dict = msg
+                else:
+                    # Handle tuple format from DuckDB struct
+                    # New format has 5 fields: role, content, tool_calls, tool_call_id, trainable
+                    # Old format has 6 fields: role, content, tool_calls, tool_call_id, finish_reason, choice_index
+                    if len(msg) == 5:
+                        # New format with trainable
+                        msg_dict = {
+                            "role": msg[0],
+                            "content": msg[1],
+                            "tool_calls": msg[2],
+                            "tool_call_id": msg[3],
+                            "trainable": msg[4],
                         }
-                        metric_cols.update(prepped_metrics.keys())
-                        metadata_cols.update(prepped_metadata.keys())
-                        messages = []
-                        for message in traj.get("messages_and_choices", []):
-                            if "message" in message:
-                                messages.append(
-                                    {**message["message"], "trainable": True}
-                                )
-                            else:
-                                messages.append({**message, "trainable": False})
-
-                        row: dict[str, object] = {
-                            "model": model_name,
-                            "split": split_dir.name,
-                            "step": step,
-                            "reward": traj.get("reward"),
-                            "group_number": group_number,
-                            "messages": messages,
-                            "logs": traj.get("logs"),
-                            **prepped_metrics,
-                            **prepped_metadata,
+                    else:
+                        # Old format with finish_reason/choice_index
+                        msg_dict = {
+                            "role": msg[0],
+                            "content": msg[1],
+                            "tool_calls": msg[2],
+                            "tool_call_id": msg[3],
+                            "trainable": msg[4]
+                            is not None,  # finish_reason present = trainable
                         }
 
-                        rows.append(row)
+                # Build processed message
+                processed_msg = {
+                    "role": msg_dict.get("role"),
+                    "content": msg_dict.get("content"),
+                    "trainable": msg_dict.get("trainable", False),
+                }
+                if msg_dict.get("tool_calls"):
+                    try:
+                        processed_msg["tool_calls"] = json.loads(msg_dict["tool_calls"])  # ty:ignore[invalid-argument-type]
+                    except (json.JSONDecodeError, TypeError):
+                        pass
 
+                messages.append(processed_msg)
+
+            row_data: dict[str, object] = {
+                "model": model_name,
+                "split": split_name,
+                "step": step,
+                "reward": row_dict.get("reward"),
+                "group_number": group_number,
+                "messages": messages,
+                "logs": row_dict.get("logs"),
+                **prepped_metrics,
+                **prepped_metadata,
+                **prepped_group_metrics,
+                **prepped_group_metadata,
+            }
+
+            rows.append(row_data)
+
+    if not rows:
+        return pl.DataFrame()
+
+    # Build schema
     schema = (
         {
             "model": pl.Utf8,
@@ -219,6 +327,8 @@ async def load_trajectories(
         }
         | {k: pl.Float64 for k in metric_cols}
         | {k: pl.Utf8 for k in metadata_cols}
+        | {k: pl.Float64 for k in group_metric_cols}
+        | {k: pl.Utf8 for k in group_metadata_cols}
     )
 
     return pl.DataFrame(rows, schema=schema)

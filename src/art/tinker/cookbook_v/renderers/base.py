@@ -1,0 +1,1016 @@
+"""
+Base types, utilities, and abstract Renderer class for message rendering.
+
+Use viz_sft_dataset to visualize the output of different renderers. E.g.,
+    python -m tinker_cookbook.supervised.viz_sft_dataset dataset_path=Tulu3Builder renderer_name=role_colon
+"""
+
+from abc import ABC, abstractmethod
+from dataclasses import dataclass
+from enum import StrEnum
+import io
+import json
+import logging
+import re
+from typing import Literal, NotRequired, Optional, Protocol, TypedDict
+import urllib.request
+
+from PIL import Image
+import pydantic
+import tinker
+import torch
+
+from ..tokenizer_utils import Tokenizer
+
+logger = logging.getLogger(__name__)
+
+# Tool types are based on kosong (https://github.com/MoonshotAI/kosong).
+
+
+class StrictBase(pydantic.BaseModel):
+    """
+    Pydantic base class that's immutable and doesn't silently ignore extra fields.
+    """
+
+    model_config = pydantic.ConfigDict(frozen=True, extra="forbid")
+
+    def __str__(self) -> str:
+        return repr(self)
+
+
+class ToolCall(StrictBase):
+    """
+    Structured tool invocation following OpenAI/kosong format.
+
+    This represents a request to invoke a tool/function. The structure follows
+    the OpenAI function calling format for compatibility with various LLM APIs.
+
+    Example:
+        tool_call = ToolCall(
+            function=ToolCall.FunctionBody(
+                name="search",
+                arguments='{"query_list": ["python async", "pydantic validation"]}'
+            ),
+            id="call_abc123"
+        )
+    """
+
+    class FunctionBody(pydantic.BaseModel):
+        """
+        Tool call function body containing the tool name and arguments.
+
+        The arguments field must be a valid JSON string that will be parsed
+        by the tool implementation.
+        """
+
+        name: str
+        """The name of the tool to be called."""
+        arguments: str
+        """Arguments of the tool call in JSON string format."""
+
+    type: Literal["function"] = "function"
+    """Tool call type, must be 'function' for compatibility."""
+
+    id: str | None = None
+    """Optional unique identifier for tracking this specific tool call."""
+
+    function: FunctionBody
+    """The function body containing tool name and arguments."""
+
+
+class UnparsedToolCall(StrictBase):
+    """
+    Represents a tool call that failed to parse from model output.
+
+    When a model generates text that looks like a tool call but cannot be
+    parsed (e.g., invalid JSON), this class captures the raw text and error
+    for debugging and optional re-rendering.
+
+    Example:
+        unparsed = UnparsedToolCall(
+            raw_text='<tool_call>{"name": "search", invalid json}</tool_call>',
+            error="Invalid JSON: Expecting property name"
+        )
+    """
+
+    raw_text: str
+    """The original text from the model that failed to parse."""
+
+    error: str
+    """Description of what went wrong during parsing."""
+
+
+class TextPart(TypedDict):
+    """A chunk of text content in a message, usually meant to be visible to the user
+    (unlike ThinkingPart, which is internal reasoning)."""
+
+    type: Literal["text"]
+    text: str
+
+
+class ImagePart(TypedDict):
+    """
+    A chunk of image content in a message.
+    """
+
+    type: Literal["image"]
+    image: str | Image.Image
+
+
+class ThinkingPart(TypedDict):
+    """Model's internal reasoning (chain-of-thought) as a content part."""
+
+    type: Literal["thinking"]
+    thinking: str  # The thinking/reasoning content
+
+
+class ToolCallPart(TypedDict):
+    """Tool/function call as a content part, preserving position in content list."""
+
+    type: Literal["tool_call"]
+    tool_call: ToolCall  # The parsed tool call object
+
+
+class UnparsedToolCallPart(TypedDict):
+    """Tool call that failed to parse, preserving raw text for debugging."""
+
+    type: Literal["unparsed_tool_call"]
+    raw_text: str  # Raw text of the tool call block including tags
+    error: str  # Description of what went wrong during parsing
+
+
+# Container for a part of a multimodal message content
+ContentPart = TextPart | ImagePart | ThinkingPart | ToolCallPart | UnparsedToolCallPart
+
+
+# NOTE: we use a broad type definition for the role to be flexible
+# Common roles are "user", "assistant", "system", "tool"
+Role = str
+
+# Content is a string or a list of parts
+Content = str | list[ContentPart]
+
+
+class Message(TypedDict):
+    """
+    Container for a single turn in a multi-turn conversation.
+
+    Args:
+
+    role: Role
+        String that denotes the source of the message, typically system, user, assistant, and tool.
+    content: Content
+        Content of the message, can be a string, or a list of ContentPart.
+        When content is a list, it can contain TextPart, ImagePart, and ThinkingPart elements.
+        ThinkingPart represents the model's internal reasoning (chain-of-thought).
+    tool_calls: NotRequired[list[ToolCall]]
+        Optional sequence of successfully parsed tool calls generated by the model.
+    unparsed_tool_calls: NotRequired[list[UnparsedToolCall]]
+        Optional sequence of tool calls that failed to parse (e.g., invalid JSON).
+        The raw text is preserved for debugging or re-rendering.
+    trainable: NotRequired[bool]
+        Optional indicator whether this message should contribute to the training loss.
+    tool_call_id: NotRequired[str]
+        For tool result messages (role="tool"): ID correlating this result to a specific
+        tool call. Used by renderers whose wire format references calls by ID (e.g., Kimi K2
+        renders "## Return of {tool_call_id}"). The value should match ToolCall.id from the
+        assistant's tool_calls. Not all formats use IDs - GptOss/Harmony does not.
+    name: NotRequired[str]
+        For tool result messages (role="tool"): The function name that was called.
+        Required by GptOss (renders "<|start|>functions.{name}..."), optional for others.
+        When constructing tool results, include both name and tool_call_id when available
+        since different renderers require different fields.
+
+    """
+
+    role: Role
+    content: Content
+
+    tool_calls: NotRequired[list[ToolCall]]
+    unparsed_tool_calls: NotRequired[list["UnparsedToolCall"]]
+    trainable: NotRequired[bool]
+    tool_call_id: NotRequired[str]
+    name: NotRequired[str]
+
+
+@dataclass
+class RenderContext:
+    """
+    Context passed to render_message for rendering a single message.
+
+    This allows renderers to access information about the message's position
+    in the conversation without changing the render_message signature for
+    each new piece of context needed.
+    """
+
+    idx: int
+    """Index of the message in the conversation (0-based)."""
+
+    is_last: bool
+    """Whether this is the last message in the conversation."""
+
+    prev_message: Message | None = None
+    """The previous message in the conversation, if any."""
+
+
+class ToolSpec(TypedDict):
+    """
+    Tool specification following the OpenAI function calling format.
+
+    This represents a tool that can be called by the model, including its name,
+    description, and parameter schema.
+
+    Example:
+        tool_spec: ToolSpec = {
+            "name": "get_weather",
+            "description": "Get the current weather for a location",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "location": {"type": "string", "description": "City name"},
+                },
+                "required": ["location"],
+            },
+        }
+    """
+
+    name: str
+    """The name of the tool."""
+    description: str
+    """A description of what the tool does."""
+    parameters: dict
+    """JSON Schema object describing the tool's parameters."""
+
+
+def ensure_text(content: Content) -> str:
+    """
+    Assert that content is text-only and return it as a string.
+
+    Raises ValueError if content contains images or multiple parts.
+    Use this to validate that message content is text-only before
+    processing it in code paths that don't support multimodal content.
+    """
+    if isinstance(content, str):
+        return content
+    if len(content) == 1 and content[0]["type"] == "text":
+        return content[0]["text"]
+    raise ValueError(
+        f"Expected text content, got multimodal content with {len(content)} parts"
+    )
+
+
+def ensure_list(content: Content) -> list[ContentPart]:
+    """Normalize content to list form. Wraps string content in a TextPart."""
+    if isinstance(content, str):
+        return [TextPart(type="text", text=content)]
+    return content
+
+
+def remove_thinking(parts: list[ContentPart]) -> list[ContentPart]:
+    """Filter out ThinkingPart elements from a content part list."""
+    return [p for p in parts if p["type"] != "thinking"]
+
+
+def get_text_content(message: Message) -> str:
+    """Extract text content from message, stripping thinking parts.
+
+    Use this after parse_response when you only need the text output,
+    ignoring any thinking/reasoning content.
+    """
+    content = message["content"]
+    if isinstance(content, str):
+        return content
+    return "".join(p["text"] for p in content if p["type"] == "text")
+
+
+def format_content_as_string(content: Content, separator: str = "\n") -> str:
+    """Format message content as a string, preserving all part types.
+
+    Unlike get_text_content which only extracts text parts, this formats
+    all content parts (thinking, text, tool_call, etc.) as a readable string.
+
+    This is useful for compatibility with APIs that expect string content
+    (e.g., OpenAI Chat Completions API), but we don't recommend it if you
+    need to ensure correctness - prefer working with structured content directly
+    and using build_generation_prompt to convert to tokens.
+
+    Args:
+        content: Message content (string or list of ContentPart).
+        separator: String to join parts with. Default is newline.
+
+    Returns:
+        Formatted string representation of all content parts.
+    """
+    if isinstance(content, str):
+        return content
+
+    parts = []
+    for p in content:
+        if p["type"] == "thinking":
+            parts.append(f"<think>{p['thinking']}</think>")
+        elif p["type"] == "text":
+            parts.append(p["text"])
+        elif p["type"] == "tool_call":
+            tc = p["tool_call"]
+            parts.append(
+                f"<tool_call>{tc.function.name}({tc.function.arguments})</tool_call>"
+            )
+        elif p["type"] == "unparsed_tool_call":
+            parts.append(f"<unparsed_tool_call>{p['raw_text']}</unparsed_tool_call>")
+        else:
+            raise ValueError(f"Unknown content part type: {p['type']}")
+    return separator.join(parts)
+
+
+def _parse_tool_call_json(
+    tool_call_str: str, raw_text: str
+) -> ToolCall | UnparsedToolCall:
+    """Parse tool call JSON. Returns UnparsedToolCall on failure."""
+    try:
+        tool_call = json.loads(tool_call_str.strip())
+    except json.JSONDecodeError as e:
+        return UnparsedToolCall(raw_text=raw_text, error=f"Invalid JSON: {e}")
+
+    if not isinstance(tool_call, dict):
+        return UnparsedToolCall(
+            raw_text=raw_text, error="Tool call is not a JSON object"
+        )
+
+    name = tool_call.get("name")
+    arguments = tool_call.get("arguments")
+    tool_id = tool_call.get("id")
+
+    if not isinstance(name, str):
+        return UnparsedToolCall(
+            raw_text=raw_text, error="Missing or invalid 'name' field"
+        )
+    if not isinstance(arguments, dict):
+        return UnparsedToolCall(
+            raw_text=raw_text, error="Missing or invalid 'arguments' field"
+        )
+
+    if tool_id is not None and not isinstance(tool_id, str):
+        tool_id = None
+
+    # TODO: arguments is already a dict from json.loads above, but ToolCall.FunctionBody.arguments
+    # expects a JSON string. This round-trip (loads then dumps) is wasteful. Consider changing
+    # FunctionBody.arguments to accept dict directly, or parse tool calls more lazily.
+    # We may want to revisit the decision to store arguments as unparsed JSON string.
+    return ToolCall(
+        function=ToolCall.FunctionBody(name=name, arguments=json.dumps(arguments)),
+        id=tool_id,
+    )
+
+
+def parse_content_blocks(content: str) -> list[ContentPart] | None:
+    """
+    Parse a string with <think>...</think> and <tool_call>...</tool_call> tags.
+
+    Handles interleaved thinking, tool call, and text blocks, returning parts
+    in order. Empty parts are omitted. Failed tool call parses are included as
+    UnparsedToolCallPart to preserve ordering.
+
+    Whitespace is preserved exactly - roundtrip (parse then render) is identity.
+
+    Args:
+        content: String potentially containing <think> and/or <tool_call> blocks.
+
+    Returns:
+        List of ContentPart (ThinkingPart, TextPart, ToolCallPart, UnparsedToolCallPart)
+        in order. Returns None if no special tags are found - caller should use
+        the original string for backward compatibility.
+
+    Example:
+        >>> parse_content_blocks("<think>step 1</think>answer<tool_call>{...}</tool_call>more")
+        [
+            ThinkingPart(type="thinking", thinking="step 1"),
+            TextPart(type="text", text="answer"),
+            ToolCallPart(type="tool_call", tool_call=ToolCall(...)),
+            TextPart(type="text", text="more"),
+        ]
+    """
+    if "<think>" not in content and "<tool_call>" not in content:
+        return None  # No special blocks, caller should use original string
+
+    parts: list[ContentPart] = []
+    pos = 0
+
+    # Pattern to find both <think>...</think> and <tool_call>...</tool_call> blocks
+    pattern = re.compile(
+        r"<think>(.*?)</think>|<tool_call>(.*?)</tool_call>", re.DOTALL
+    )
+
+    for match in pattern.finditer(content):
+        # Add any text before this block (preserve whitespace for identity roundtrip)
+        text_before = content[pos : match.start()]
+        if text_before:  # Skip only truly empty strings
+            parts.append(TextPart(type="text", text=text_before))
+
+        if match.group(1) is not None:
+            # This is a <think> block
+            thinking = match.group(1)
+            if thinking:  # Skip empty thinking blocks
+                parts.append(ThinkingPart(type="thinking", thinking=thinking))
+        else:
+            # This is a <tool_call> block
+            tool_call_json = match.group(2)
+            raw_text = match.group(0)  # Full match including tags
+            parsed = _parse_tool_call_json(tool_call_json, raw_text)
+            if isinstance(parsed, UnparsedToolCall):
+                # Include unparsed tool calls as UnparsedToolCallPart to preserve order
+                parts.append(
+                    UnparsedToolCallPart(
+                        type="unparsed_tool_call",
+                        raw_text=parsed.raw_text,
+                        error=parsed.error,
+                    )
+                )
+            else:
+                parts.append(ToolCallPart(type="tool_call", tool_call=parsed))
+
+        pos = match.end()
+
+    # Add any remaining text after the last block
+    remaining = content[pos:]
+    if remaining:  # Skip only truly empty strings
+        parts.append(TextPart(type="text", text=remaining))
+
+    return parts
+
+
+def parse_think_blocks(content: str) -> list[ContentPart] | None:
+    """
+    Parse a string with only <think>...</think> tags into ThinkingPart/TextPart list.
+
+    This is a simpler version of parse_content_blocks for renderers that use
+    non-standard tool call formats (like DeepSeek's <｜tool▁calls▁begin｜>).
+
+    Whitespace is preserved exactly - roundtrip (parse then render) is identity.
+
+    Args:
+        content: String potentially containing <think>...</think> blocks.
+
+    Returns:
+        List of ThinkingPart and TextPart in order. None if no <think> tags found.
+    """
+    if "<think>" not in content:
+        return None
+
+    parts: list[ContentPart] = []
+    pos = 0
+    pattern = re.compile(r"<think>(.*?)</think>", re.DOTALL)
+
+    for match in pattern.finditer(content):
+        text_before = content[pos : match.start()]
+        if text_before:  # Skip only truly empty strings
+            parts.append(TextPart(type="text", text=text_before))
+
+        thinking = match.group(1)
+        if thinking:  # Skip empty thinking blocks
+            parts.append(ThinkingPart(type="thinking", thinking=thinking))
+
+        pos = match.end()
+
+    remaining = content[pos:]
+    if remaining:  # Skip only truly empty strings
+        parts.append(TextPart(type="text", text=remaining))
+
+    return parts
+
+
+def _tool_call_payload(tool_call: ToolCall) -> dict[str, object]:
+    """Minimal JSON payload for embedding in <tool_call> blocks."""
+    # Convert from nested structure to flat format for compatibility
+    return {
+        "name": tool_call.function.name,
+        "arguments": json.loads(tool_call.function.arguments),
+    }
+
+
+@dataclass(frozen=True)
+class RenderedMessage:
+    """
+    Container for parts of a rendered message, structured for loss masking.
+
+    A rendered message is split into header and output to control which tokens receive
+    training loss. In the simplest case (where the full conversation is formed by
+    concatenation), building a supervised example from messages [m_0, ..., m_{n-1}]
+    produces:
+
+        tokens = BOS + header_0 + output_0 + header_1 + output_1 + ... + header_{n-1} + output_{n-1}
+
+    However, some renderers modify this structure. For example, Qwen3Renderer strips
+    thinking blocks from historical assistant messages. Such renderers must override
+    build_supervised_example to match their build_generation_prompt behavior.
+
+    Attributes:
+        output: What the model generates for this turn: the message text/images plus
+            end-of-turn tokens. This is the trainable portion.
+            Examples: " Hello world\\\\n\\\\n" (RoleColon), "Hello world<|eot_id|>" (Llama3).
+        header: Role identifier and delimiters that introduce the turn. This is what the
+            model sees but does not generate.
+            Examples: "User:" (RoleColon), "<|start_header_id|>user<|end_header_id|>\\\\n\\\\n" (Llama3).
+            Typically receives zero training weight.
+        stop_overlap: Edge case field for formats where the stop sequence spans message
+            boundaries. Most renderers (Llama3, Qwen3, DeepSeek, etc.) don't use this—their
+            stop tokens are included in output.
+
+            Only RoleColonRenderer uses this. Its stop sequence is "\\\\n\\\\nUser:", where "\\\\n\\\\n"
+            ends the output but "User:" would duplicate the next message's header. To avoid
+            duplication, "User:" is stored here and only appended for the last message in
+            supervised training. The name "stop_overlap" reflects that these tokens are the
+            overlap between the stop sequence and the next message's header.
+    """
+
+    output: list[tinker.ModelInputChunk]
+    """What the model generates for this turn."""
+
+    header: tinker.EncodedTextChunk | None = None
+    """Role identifier and delimiters that introduce the turn."""
+
+    stop_overlap: tinker.EncodedTextChunk | None = None
+    """Tokens that overlap between stop sequence and next message's header."""
+
+
+class TrainOnWhat(StrEnum):
+    LAST_ASSISTANT_MESSAGE = "last_assistant_message"
+    ALL_ASSISTANT_MESSAGES = "all_assistant_messages"
+    ALL_MESSAGES = "all_messages"
+    ALL_TOKENS = "all_tokens"
+    ALL_USER_AND_SYSTEM_MESSAGES = "all_user_and_system_messages"
+    CUSTOMIZED = "customized"
+
+
+class Renderer(ABC):
+    """
+    Abstract base class for rendering message lists into training and sampling prompts.
+
+    Subclasses must implement:
+    - get_stop_sequences(): Return stop tokens/strings for sampling
+    - render_message(): Break a message into header/output/stop_overlap components
+    - parse_response(): Convert sampled tokens back into a Message
+
+    The default build_generation_prompt and build_supervised_example implementations
+    assume simple concatenation of rendered messages. Override these if your renderer
+    modifies the conversation structure (e.g., stripping thinking blocks from history).
+    """
+
+    tokenizer: Tokenizer
+
+    def __init__(self, tokenizer: Tokenizer):
+        self.tokenizer = tokenizer
+
+    @property
+    def has_extension_property(self) -> bool:
+        """Whether this renderer satisfies the sequence extension property.
+
+        A renderer has the extension property if, for any multi-turn conversation,
+        calling build_generation_prompt at each successive assistant turn produces
+        token sequences where each is a prefix of the next. This enables:
+        - Merging multiple timesteps into a single training datum
+        - KV-cache reuse during sampling
+        - O(T) compute scaling instead of O(T^2) for T-turn trajectories
+
+        Renderers that strip thinking blocks from history (like Qwen3Renderer with
+        strip_thinking_from_history=True) do NOT have this property because the
+        observation at timestep 2 is not a prefix of timestep 1's full sequence.
+
+        See docs/rl/sequence-extension.mdx for details.
+        """
+        return False
+
+    @property
+    def _bos_tokens(self) -> list[int]:
+        return []
+
+    @abstractmethod
+    def get_stop_sequences(self) -> list[str] | list[int]:
+        """Return the stop sequences used when sampling from this renderer."""
+        ...
+
+    @abstractmethod
+    def render_message(self, message: Message, ctx: RenderContext) -> RenderedMessage:
+        """
+        Render a single message into its header/output/stop_overlap components.
+
+        This method breaks down a message into parts for loss masking. See RenderedMessage
+        for detailed semantics of each component.
+
+        Args:
+            message: The message to render.
+            ctx: Context about the message's position in the conversation, including:
+                - idx: The index of this message (0-based)
+                - is_last: Whether this is the last message
+                - prev_message: The previous message, if any
+
+        Returns:
+            RenderedMessage with header, output, and optionally stop_overlap.
+        """
+        ...
+
+    @abstractmethod
+    def parse_response(self, response: list[int]) -> tuple[Message, bool]:
+        """
+        Parse sampled tokens back into a Message.
+
+        Args:
+            response: Token IDs returned from sampling.
+
+        Returns:
+            A tuple of (message, success). If success is False, the response could not
+            be parsed (e.g., missing stop token), but a best-effort message is still returned.
+        """
+        ...
+
+    def to_openai_message(self, message: Message) -> dict:
+        """
+        Convert a Message to OpenAI chat completions API format.
+
+        The returned object can be passed into the transformers library's
+        apply_chat_template function, which is useful for testing purposes.
+
+        It's also useful for querying models that are being served through
+        OpenAI-compatible APIs (OpenRouter, vLLM, etc.).
+
+        The base implementation handles:
+        - Basic role/content conversion
+        - tool_calls conversion from ToolCall objects to OpenAI dict format
+        - tool_call_id and name for tool response messages
+
+        Subclasses should override this to handle model-specific features like
+        reasoning_content for thinking models.
+
+        Args:
+            message: The Message to convert.
+
+        Returns:
+            A dict in OpenAI API message format.
+        """
+        result: dict = {"role": message["role"]}
+
+        # Handle content
+        content = message["content"]
+        if isinstance(content, str):
+            result["content"] = content
+        else:
+            # Structured content with ThinkingPart/TextPart/etc.
+            # Base implementation: concatenate text parts, render thinking as <think> tags
+            # TODO: Add proper support for ImagePart by converting to OpenAI-style content parts
+            # (list of {"type": "image_url", "image_url": {...}} dicts)
+            parts = []
+            for p in content:
+                if p["type"] == "text":
+                    parts.append(p["text"])
+                elif p["type"] == "thinking":
+                    parts.append(f"<think>{p['thinking']}</think>")
+                elif p["type"] == "image":
+                    raise NotImplementedError(
+                        "to_openai_message does not support ImagePart content. "
+                        "Images would be silently dropped, leading to incorrect HF template "
+                        "comparisons or OpenAI API calls. Use build_generation_prompt for VL models."
+                    )
+                # Skip tool_call and unparsed_tool_call parts - handled via tool_calls field
+            result["content"] = "".join(parts)
+
+        # Handle tool_calls (convert ToolCall objects to OpenAI format)
+        if "tool_calls" in message and message["tool_calls"]:
+            result["tool_calls"] = [
+                {
+                    "type": "function",
+                    "id": tc.id,
+                    "function": {
+                        "name": tc.function.name,
+                        "arguments": tc.function.arguments,
+                    },
+                }
+                for tc in message["tool_calls"]
+            ]
+
+        # Handle tool response fields
+        if message["role"] == "tool":
+            if "tool_call_id" in message:
+                result["tool_call_id"] = message["tool_call_id"]
+            if "name" in message:
+                result["name"] = message["name"]
+
+        return result
+
+    def create_conversation_prefix_with_tools(
+        self, tools: list[ToolSpec], system_prompt: str = ""
+    ) -> list[Message]:
+        """Create message(s) with tool specifications to prepend to conversations.
+
+        Returns one or more messages to prepend to the conversation. This is the
+        standard way to add tools - the returned messages should be placed at the
+        start of your message list before user/assistant messages.
+
+        Args:
+            tools: List of tool specifications.
+            system_prompt: The system prompt content.
+
+        Returns:
+            List of messages to prepend to the conversation.
+
+        Raises:
+            NotImplementedError: If the renderer doesn't support tool calling.
+        """
+        raise NotImplementedError
+
+    def _get_generation_suffix(self, role: Role, ctx: RenderContext) -> list[int]:
+        """Return tokens to append to the prompt for generation.
+
+        This is called by build_generation_prompt to add the role header that
+        precedes the model's response. The default implementation renders an
+        empty message and extracts its header tokens.
+
+        Args:
+            role: The role to generate (usually "assistant")
+            ctx: Context for the generation suffix. Note that ctx.is_last is True
+                because we're rendering the header for the final (to-be-generated) message.
+
+        Returns:
+            List of token IDs for the role header. Examples in string form:
+            - Llama3: "<|start_header_id|>assistant<|end_header_id|>\n\n"
+            - Qwen3: "<|im_start|>assistant\n"
+            - DeepSeek: "<｜Assistant｜>" (single special token)
+        """
+        # Default: render an empty message and use its header tokens
+        rendered = self.render_message(Message(role=role, content=""), ctx)
+        if rendered.header:
+            return list(rendered.header.tokens)
+        return []
+
+    def build_generation_prompt(
+        self,
+        messages: list[Message],
+        role: Role = "assistant",
+        prefill: str | None = None,
+    ) -> tinker.ModelInput:
+        """
+        Generates tokens for sampling from the model.
+
+        Args:
+            messages: a list of messages to render.
+            role: the role of the partial message to be completed.
+            prefill: an optional string to prefill in the model's generation.
+        """
+
+        chunks: list[tinker.types.ModelInputChunk] = []
+        if self._bos_tokens:
+            chunks.append(tinker.types.EncodedTextChunk(tokens=self._bos_tokens))
+        for idx, message in enumerate(messages):
+            ctx = RenderContext(
+                idx=idx,
+                is_last=(idx == len(messages) - 1),
+                prev_message=messages[idx - 1] if idx > 0 else None,
+            )
+            rendered_message = self.render_message(message, ctx)
+            header_chunk = rendered_message.header
+            output_chunks = rendered_message.output
+            if header_chunk:
+                chunks.append(header_chunk)
+            chunks.extend([x for x in output_chunks if x])
+
+        suffix_ctx = RenderContext(
+            idx=len(messages),
+            is_last=True,
+            prev_message=messages[-1] if messages else None,
+        )
+        suffix_tokens = self._get_generation_suffix(role, suffix_ctx)
+        if suffix_tokens:
+            chunks.append(tinker.types.EncodedTextChunk(tokens=suffix_tokens))
+
+        if prefill:
+            chunks.append(
+                tinker.types.EncodedTextChunk(
+                    tokens=self.tokenizer.encode(prefill, add_special_tokens=False)
+                )
+            )
+        return tinker.ModelInput(chunks=chunks)
+
+    def build_supervised_example(
+        self,
+        messages: list[Message],
+        train_on_what: TrainOnWhat = TrainOnWhat.LAST_ASSISTANT_MESSAGE,
+    ) -> tuple[tinker.ModelInput, torch.Tensor]:
+        """
+        Build tokens and per-token weights for supervised fine-tuning.
+
+        This default implementation concatenates rendered messages in order. Override
+        this method if your build_generation_prompt does anything that breaks the simple
+        concatenation assumption—for example, if it strips thinking blocks from history
+        (like Qwen3Renderer), injects default system prompts (like KimiK2Renderer), or
+        otherwise modifies the token sequence.
+
+        The supervised example tokens should match what build_generation_prompt would
+        produce for the same conversation prefix, so the model trains on the same
+        distribution it sees at inference time.
+
+        Args:
+            messages: A list of messages to render.
+            train_on_what: Controls which tokens receive non-zero training weight:
+                - LAST_ASSISTANT_MESSAGE: Only the last assistant message
+                - ALL_ASSISTANT_MESSAGES: All assistant messages
+                - ALL_MESSAGES: All messages (but not headers)
+                - ALL_TOKENS: Everything including headers
+                - ALL_USER_AND_SYSTEM_MESSAGES: User and system messages only
+                - CUSTOMIZED: Use the 'trainable' field on each message
+
+        Returns:
+            A tuple of (model_input, weights) where weights is a 1D tensor with the
+            same length as the total number of tokens.
+        """
+        # Warn if training on multiple assistant messages with a renderer that doesn't
+        # satisfy the extension property. In that case, each assistant message sees a
+        # different context prefix, so they should be trained as separate examples.
+        # NOTE: This warning only covers ALL_ASSISTANT_MESSAGES. Other modes that train
+        # multiple assistant messages (e.g., ALL_MESSAGES, ALL_TOKENS, CUSTOMIZED) should
+        # be used with caution when has_extension_property=False.
+        if (
+            train_on_what == TrainOnWhat.ALL_ASSISTANT_MESSAGES
+            and not self.has_extension_property
+        ):
+            logger.warning(
+                "WARNING: Using train_on_what=ALL_ASSISTANT_MESSAGES with a renderer that "
+                "does not satisfy the extension property (has_extension_property=False). "
+                "This means earlier assistant messages in the conversation see a different "
+                "token prefix than what build_generation_prompt would produce at that turn. "
+                "You should instead create separate conversations for each assistant message "
+                "and call build_supervised_example with train_on_what=LAST_ASSISTANT_MESSAGE "
+                "for each one. See docs/rl/sequence-extension.mdx for details."
+            )
+
+        model_input_chunks_weights: list[
+            tuple[tinker.types.ModelInputChunk, float]
+        ] = []
+        if self._bos_tokens:
+            model_input_chunks_weights.append(
+                (tinker.types.EncodedTextChunk(tokens=self._bos_tokens), 0.0)
+            )
+
+        for idx, message in enumerate(messages):
+            if train_on_what == TrainOnWhat.CUSTOMIZED:
+                assert "trainable" in message, (
+                    "When using CUSTOMIZED train_on_what, each message must have a trainable field: True if loss is applied on this message, False otherwise"
+                )
+            else:
+                assert "trainable" not in message, (
+                    "When using non-CUSTOMIZED train_on_what, each message must not have a trainable field. Either change train_on_what to CUSTOMIZED or remove the trainable field from the message"
+                )
+
+            is_last_message = idx == len(messages) - 1
+            is_assistant = message["role"] == "assistant"
+            is_user_or_system = message["role"] in ["user", "system"]
+
+            # only apply weight to header if train_on_what is ALL_TOKENS
+            ctx = RenderContext(
+                idx=idx,
+                is_last=is_last_message,
+                prev_message=messages[idx - 1] if idx > 0 else None,
+            )
+            rendered_message = self.render_message(message, ctx)
+            header_part = rendered_message.header
+            output_parts = rendered_message.output
+            stop_overlap_part = rendered_message.stop_overlap
+
+            header_weight = int(train_on_what == TrainOnWhat.ALL_TOKENS)
+            if header_part:
+                model_input_chunks_weights += [(header_part, header_weight)]
+
+            match train_on_what:
+                case TrainOnWhat.LAST_ASSISTANT_MESSAGE:
+                    output_has_weight = is_last_message and is_assistant
+                case TrainOnWhat.ALL_ASSISTANT_MESSAGES:
+                    output_has_weight = is_assistant
+                case TrainOnWhat.ALL_MESSAGES:
+                    output_has_weight = True
+                case TrainOnWhat.ALL_TOKENS:
+                    output_has_weight = True
+                case TrainOnWhat.ALL_USER_AND_SYSTEM_MESSAGES:
+                    output_has_weight = is_user_or_system
+                case TrainOnWhat.CUSTOMIZED:
+                    output_has_weight = message.get("trainable", False)
+                case _:
+                    raise ValueError(f"Unknown train_on_what: {train_on_what}")
+
+            model_input_chunks_weights += [
+                (output_part, int(output_has_weight))
+                for output_part in output_parts
+                if output_part
+            ]
+
+            # stop_overlap completes the stop sequence for formats like RoleColon (e.g., "User:")
+            # Only included for the last message.
+            if is_last_message and stop_overlap_part:
+                model_input_chunks_weights += [
+                    (stop_overlap_part, int(output_has_weight))
+                ]
+
+        weights_data = [
+            w for chunk, w in model_input_chunks_weights for _ in range(chunk.length)
+        ]
+        weights_tensor = torch.tensor(weights_data)
+
+        model_input_chunks = [chunk for chunk, _ in model_input_chunks_weights]
+        return tinker.ModelInput(chunks=model_input_chunks), weights_tensor
+
+
+def tokens_weights_from_strings_weights(
+    strings_weights: list[tuple[str, float]],
+    tokenizer: Tokenizer,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    strings, weights = zip(*strings_weights, strict=True)
+    token_chunks = [
+        tokenizer.encode(s, add_special_tokens=i == 0) for i, s in enumerate(strings)
+    ]
+    weights = torch.cat(
+        [
+            torch.full((len(chunk),), w)
+            for chunk, w in zip(token_chunks, weights, strict=True)
+        ]
+    )
+    tokens = torch.cat([torch.tensor(chunk) for chunk in token_chunks])
+    assert tokens.dtype == torch.int64
+    return tokens, weights
+
+
+def parse_response_for_stop_token(
+    response: list[int], tokenizer: Tokenizer, stop_token: int
+) -> tuple[Message, bool]:
+    """Parse response for a single stop token.
+
+    We expect a properly rendered response to have exactly one stop token; but it may have zero if e.g. the model
+    ran out of tokens when sampling, which will incur a format error. If there are > 1, there is likely a bug in the
+    sampler and we should error.
+    """
+    emt_count = response.count(stop_token)
+    if emt_count == 0:
+        str_response = tokenizer.decode(response)
+        logger.debug(f"Response is not a valid assistant response: {str_response}")
+        return Message(role="assistant", content=str_response), False
+    elif emt_count == 1:
+        str_response = tokenizer.decode(response[: response.index(stop_token)])
+        return Message(role="assistant", content=str_response), True
+    else:
+        raise ValueError(
+            f"When parsing response, expected to split into 1 or 2 pieces using stop tokens, but got {emt_count}. "
+            "You probably are using the wrong stop tokens when sampling"
+        )
+
+
+# ============================================================================
+# Image processing utilities (used by VL renderers)
+# ============================================================================
+
+
+class ImageProcessorProtocol(Protocol):
+    merge_size: int
+    patch_size: int
+
+    def get_number_of_image_patches(
+        self, height: int, width: int, images_kwargs: Optional[dict] = None
+    ) -> int:
+        raise NotImplementedError()
+
+
+def image_to_chunk(
+    image_or_str: Image.Image | str, image_processor: ImageProcessorProtocol
+) -> tinker.types.ImageChunk:
+    """
+    Convert a PIL Image to a tinker.types.ImageChunk for QwenVL
+    """
+
+    # load an image from a data URI or a URL
+    if isinstance(image_or_str, str):
+        with urllib.request.urlopen(image_or_str) as response:
+            pil_image = Image.open(io.BytesIO(response.read()))
+
+    # Otherwise the image is a PIL image and can be loaded directly
+    elif isinstance(image_or_str, Image.Image):
+        pil_image = image_or_str
+
+    # Validate the provided data is actually a valid image type
+    else:
+        raise ValueError(
+            "The provided image must be a PIL.Image.Image, URL, or data URI."
+        )
+
+    # Convert to RGB if needed (JPEG doesn't support RGBA/LA/P modes)
+    if pil_image.mode in ("RGBA", "LA", "P"):
+        pil_image = pil_image.convert("RGB")
+
+    img_byte_arr = io.BytesIO()
+    pil_image.save(img_byte_arr, format="JPEG")
+    image_data = img_byte_arr.getvalue()
+
+    width, height = pil_image.size
+    num_image_tokens = (
+        image_processor.get_number_of_image_patches(height, width, images_kwargs={})
+        // image_processor.merge_size**2
+    )
+
+    return tinker.types.ImageChunk(
+        data=image_data,
+        format="jpeg",
+        expected_tokens=num_image_tokens,
+    )

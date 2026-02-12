@@ -61,7 +61,7 @@ def retry(
                             on_retry(e, attempt)
                         else:
                             logging.warning(
-                                f"Retry {attempt}/{max_attempts} for {func.__name__} "
+                                f"Retry {attempt}/{max_attempts} for {func.__name__} "  # ty:ignore[unresolved-attribute]
                                 f"after error: {str(e)}"
                             )
 
@@ -92,7 +92,7 @@ def retry(
                             on_retry(e, attempt)
                         else:
                             logging.warning(
-                                f"Retry {attempt}/{max_attempts} for {func.__name__} "
+                                f"Retry {attempt}/{max_attempts} for {func.__name__} "  # ty:ignore[unresolved-attribute]
                                 f"after error: {str(e)}"
                             )
 

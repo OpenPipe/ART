@@ -125,4 +125,7 @@ class EngineArgs(TypedDict, total=False):
 
     additional_config: dict[str, Any] | None
 
-    disable_log_requests: bool
+    disable_log_requests: (
+        bool  # Deprecated in vLLM 0.13+, use enable_log_requests instead
+    )
+    enable_log_requests: bool  # New in vLLM 0.13+

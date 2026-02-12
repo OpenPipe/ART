@@ -15,13 +15,16 @@ async def trajectory_group_batches(
     max_concurrent_batches: int = 4,
     skip_batches: int = 0,
     pbar_desc: str | None = "batches",
-    pbar_total_completion_tokens: bool = True,
+    pbar_total_completion_tokens: bool = False,
 ) -> AsyncIterator[list[TrajectoryGroup]]:
+    if pbar_total_completion_tokens:
+        print(
+            "pbar_total_completion_tokens is deprecated and will be removed in a future version."
+        )
     unstarted = list(groups)[batch_size * skip_batches :]
     pending = set[asyncio.Task[TrajectoryGroup | None]]()
     batch = list[TrajectoryGroup]()
     context = GatherContext(
-        pbar_total_completion_tokens=pbar_total_completion_tokens,
         max_exceptions=max_batch_exceptions,
         increment_pbar=False,
     )

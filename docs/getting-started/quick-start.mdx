@@ -4,7 +4,7 @@ description: "Get started with ART in a few quick steps."
 icon: "forward"
 ---
 
-In this Quick Start tutorial, we'll be training Qwen 2.5 3B to play [2048](https://play2048.co/), a simple game that requires forward planning and basic math skills.
+In this Quick Start tutorial, we'll be training Qwen3 14B Instruct to play [2048](https://play2048.co/), a simple game that requires forward planning and basic math skills.
 
 <Info>
 
@@ -16,29 +16,26 @@ Total cost: <b>Free!</b>
 
 </Info>
 
-## Step 1: Provision optional API keys
+## Step 1: Provision W&B API key
 
-[ART](https://github.com/OpenPipe/art) is an open source library and does not require an API key to run in Google Colab, which we'll use for this quick start. But if you're interested in seeing the progress of your training runs and inspecting your model's completions as it trains, you can optionally provision API keys from platforms like Weights & Biases.
+[ART](https://github.com/OpenPipe/art) is an open source library and works across infra and observability providers. To keep things simple in this tutorial, we'll exclusively use Weights & Biases services, which means we'll only need to provision one API key. We'll use these services:
 
-If you'd like to enable observability while working through this guide, create a W&B account and provision an API key.
+* **W&B Training** - autoscale GPUs for inference and training
+* **W&B Models** - record metrics like reward
+* **W&B Weave** - record your model's traces as it generates completions
+* **W&B Artifacts** - store and manage your model's checkpoints
+
+Weights & Biases currently provides a small free tier for all the services we'll use during this quickstart, so you shouldn't need to add a credit card to get started.
 
 - [Weights & Biases](https://wandb.ai/home)
 
-Once you have your Weights & Biases API key, open the [notebook](https://colab.research.google.com/github/openpipe/art-notebooks/blob/main/examples/2048/2048.ipynb) in Google Colab and set them in the **Environment Variables** cell.
+Once you have your Weights & Biases API key, open the [notebook](https://colab.research.google.com/github/openpipe/art-notebooks/blob/main/examples/2048/2048.ipynb) in Google Colab and set it in the **Environment Variables** cell. Then continue on to the next step.
 
-Once your API keys are set, or if you won't need observability while completing this walkthrough, continue on to the next step.
+## Step 2: Run the notebook
 
-## Step 2: Prepare your notebook
+At the top of the [notebook](https://colab.research.google.com/github/openpipe/art-notebooks/blob/main/examples/2048/2048.ipynb) you should see a small **Run all** button. Press it to begin training your model.
 
-If you haven't already, open the [notebook](https://colab.research.google.com/github/openpipe/art-notebooks/blob/main/examples/2048/2048.ipynb) in Google Colab and connect to a T4 runtime environment.
 
-<Accordion title="Connecting to a T4 GPU">
-  In the top bar of your Google Colab notebook, find *Runtime* > *Change runtime
-  type* to open the selection modal. Select **T4 GPU** and hit **Save**.
-</Accordion>
+## Step 3: Track metrics
 
-## Step 3: Run the notebook
-
-From here on out, you can follow the instructions in the notebook! While training is occuring, remember to track your progress in [Weights & Biases](https://wandb.ai).
-
-If you have questions along the way, please ask in the [Discord](https://discord.gg/zbBHRUpwf4). Happy training!
+While your run progresses, observe its traces and metrics in your [W&B workspace](https://wandb.ai/home). You should start seeing some progress in the first 20-30 steps. If you have questions along the way, please ask in the [Discord](https://discord.gg/zbBHRUpwf4). Happy training!

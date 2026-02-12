@@ -6,8 +6,8 @@ import fnmatch
 import json
 import os
 
-import weave
 from dotenv import load_dotenv
+import weave
 
 import art
 from art.rewards import ruler_score_group
@@ -30,7 +30,7 @@ if os.getenv("WANDB_API_KEY"):
     weave.init("mcp-agent-training")
 
 
-async def train_mcp_agent(model: art.TrainableModel, use_skypilot: bool = False):
+async def train_mcp_agent(model: art.TrainableModel):
     """Example training function that creates AlphaMcpServer and passes it in scenarios."""
     load_dotenv()
 
@@ -89,16 +89,9 @@ async def train_mcp_agent(model: art.TrainableModel, use_skypilot: bool = False)
         f"Using config: max_turns={max_turns}, trajectories_per_group={trajectories_per_group}, groups_per_step={groups_per_step}, num_epochs={num_epochs}, learning_rate={learning_rate}"
     )
 
-    if use_skypilot:
-        from art.skypilot.backend import SkyPilotBackend
+    from art.local.backend import LocalBackend
 
-        backend = await SkyPilotBackend().initialize_cluster(
-            cluster_name="mcp-agent-training", gpu="H100-SXM"
-        )
-    else:
-        from art.local.backend import LocalBackend
-
-        backend = LocalBackend()
+    backend = LocalBackend()
 
     await backend._experimental_pull_from_s3(
         model,
@@ -168,7 +161,8 @@ async def train_mcp_agent(model: art.TrainableModel, use_skypilot: bool = False)
             await model.log(val_groups, split="val")
 
         print("starting train")
-        await model.train(groups, config=art.TrainConfig(learning_rate=learning_rate))
+        result = await backend.train(model, groups, learning_rate=learning_rate)
+        await model.log(groups, metrics=result.metrics, step=result.step, split="train")
 
         await backend._experimental_push_to_s3(
             model,
@@ -185,12 +179,6 @@ def main():
         required=True,
         help="Model key to train from all_experiments.py (e.g. 001, 002, etc.). If not provided, uses default model.",
     )
-    parser.add_argument(
-        "--use-skypilot",
-        action="store_true",
-        help="Whether to use SkyPilot backend instead of local backend.",
-    )
-
     args = parser.parse_args()
 
     if args.models not in models:
@@ -221,7 +209,7 @@ def main():
 
     print("Starting MCP agent training...")
     try:
-        asyncio.run(train_mcp_agent(model, use_skypilot=args.use_skypilot))
+        asyncio.run(train_mcp_agent(model))
     except Exception as e:
         print(f"Training failed with error: {e}")
         import traceback

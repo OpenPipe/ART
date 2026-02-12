@@ -1,11 +1,11 @@
 import asyncio
-import os
 from datetime import datetime
+import os
 from typing import Any, Dict, Iterable, List
 
-import openai
 from datasets import Dataset
 from dotenv import load_dotenv
+import openai
 from openai.types.chat import ChatCompletionMessageParam
 from openpipe import AsyncOpenPipe
 from transformers.models.auto.tokenization_auto import AutoTokenizer
@@ -325,9 +325,11 @@ async def main():
             )
             continue
 
-        await model.train(
-            valid_train_groups,
-            config=art.TrainConfig(learning_rate=LEARNING_RATE),
+        result = await backend.train(
+            model, valid_train_groups, learning_rate=LEARNING_RATE
+        )
+        await model.log(
+            valid_train_groups, metrics=result.metrics, step=result.step, split="train"
         )
 
         if batch.step > 0 and batch.step % EVAL_STEPS == 0:

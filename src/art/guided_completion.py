@@ -1,8 +1,11 @@
-import json
 from copy import deepcopy
+import json
 from typing import Iterable, List, Literal, Tuple
 
 from openai.types.chat.chat_completion import ChatCompletion
+from openai.types.chat.chat_completion_message_function_tool_call import (
+    ChatCompletionMessageFunctionToolCall,
+)
 from openai.types.chat.chat_completion_tool_choice_option_param import (
     ChatCompletionToolChoiceOptionParam,
 )
@@ -16,11 +19,11 @@ def freeze_tool_schema(tool: dict, fixed_args: dict) -> ChatCompletionToolParam:
     Each field is cast to typing.Literal[value] so Pydantic emits an
     enum-of-one in the JSON schema, which vLLM's `guided_json` accepts.
     """
-    fields = {k: (Literal[v], ...) for k, v in fixed_args.items()}
+    fields = {k: (Literal[v], ...) for k, v in fixed_args.items()}  # ty:ignore[invalid-type-form]
     FrozenModel = create_model(
         f"{tool['function']['name'].title()}FrozenArgs",
-        **fields,  # type: ignore
-    )
+        **fields,
+    )  # ty:ignore[no-matching-overload]
 
     locked = deepcopy(tool)
     locked["function"]["parameters"] = FrozenModel.model_json_schema()
@@ -58,6 +61,9 @@ def get_guided_completion_params(
             raise ValueError("No tool call found in completion")
         if base_tools is None:
             raise ValueError("No base tools provided")
+        assert isinstance(tool_call, ChatCompletionMessageFunctionToolCall), (
+            "Only function tool calls are supported"
+        )
         tool_name = tool_call.function.name
         tool_choice = {
             "type": "function",  # ← must call it
@@ -65,7 +71,7 @@ def get_guided_completion_params(
         }
         chosen_tool = next(t for t in base_tools if t["function"]["name"] == tool_name)
         tool_params = [
-            freeze_tool_schema(chosen_tool, json.loads(tool_call.function.arguments))  # type: ignore
+            freeze_tool_schema(chosen_tool, json.loads(tool_call.function.arguments))
         ]
     else:
         content = completion.choices[0].message.content

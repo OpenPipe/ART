@@ -8,30 +8,26 @@ One of ART's primary goals is to minimize the amount of setup necessary to begin
 
 If you're curious about how ART allows you to run training and inference either remotely or locally depending on your development machine, check out the backend docs below. Otherwise, let's dive deeper into the client!
 
-<div className="cards-container">
-  <div className="card-wrapper">
-    <Card
-      title="LocalBackend"
-      icon="laptop-code"
-      href="/fundamentals/art-backend#local-backend"
-      horizontal={true}
-      arrow={true}
-    >
-      Run training and inference on your local machine.
-    </Card>
-  </div>
-  <div className="card-wrapper">
-    <Card
-      title="SkyPilotBackend"
-      icon="cloud"
-      href="/fundamentals/art-backend#skypilotbackend"
-      horizontal={true}
-      arrow={true}
-    >
-      Run training and inference on a separate ephemeral machine.
-    </Card>
-  </div>
-</div>
+
+<Card
+  title="ServerlessBackend"
+  icon="bolt"
+  href="/fundamentals/art-backend#serverlessbackend"
+  horizontal={true}
+  arrow={true}
+>
+  Run training and inference on autoscaling GPUs.
+</Card>
+<Card
+  title="LocalBackend"
+  icon="laptop-code"
+  href="/fundamentals/art-backend#localbackend"
+  horizontal={true}
+  arrow={true}
+>
+  Run training and inference on your local machine.
+</Card>
+
 
 ## Initializing the client
 
@@ -48,20 +44,18 @@ model = art.TrainableModel(
     # for a given task to consistently group metrics
     project="my-agentic-task",
     # the model that you want to train from
-    base_model="Qwen/Qwen2.5-14B-Instruct",
+    base_model="OpenPipe/Qwen3-14B-Instruct",
 )
 ```
 
 Once you've initialized your [backend](/fundamentals/art-backend), you can register it with your model. This sets up all the wiring to run inference and training.
 
 ```python
-# local training
-backend = art.LocalBackend()
+# managed training
+backend = ServerlessBackend()
 
-# remote training
-backend = SkyPilotBackend.initialize_cluster(
-    cluster_name="art", gpu="H100"
-)
+# local training
+backend = LocalBackend()
 
 await model.register(backend)
 ```

@@ -1,7 +1,7 @@
 import asyncio
+from collections import Counter
 import contextlib
 import contextvars
-from collections import Counter
 from dataclasses import dataclass, field
 from typing import Awaitable, Callable, Iterable, Iterator, Literal, overload
 
@@ -15,23 +15,36 @@ async def gather_trajectory_groups(
     groups: Iterable[Awaitable[TrajectoryGroup]],
     *,
     pbar_desc: str | None = "gather",
-    pbar_total_completion_tokens: bool = True,
+    pbar_total_completion_tokens: bool = False,
     max_exceptions: int | float = 0,
     max_metrics: int | None = None,
-    after_each: Callable[
-        [TrajectoryGroup], Awaitable[TrajectoryGroup | None | list[TrajectoryGroup]]
-    ]
-    | None = None,
+    after_each: (
+        Callable[
+            [TrajectoryGroup], Awaitable[TrajectoryGroup | None | list[TrajectoryGroup]]
+        ]
+        | None
+    ) = None,
 ) -> list[TrajectoryGroup]:
+    if pbar_total_completion_tokens:
+        print(
+            "pbar_total_completion_tokens is deprecated and will be removed in a future version."
+        )
     groups = list(groups)
     context = GatherContext(
         pbar=None,
-        pbar_total_completion_tokens=pbar_total_completion_tokens,
         max_exceptions=max_exceptions,
         max_metrics=max_metrics,
     )
+
+    # Fuse the after_each callback into the gather process
+    async def group_forward(g: Awaitable[TrajectoryGroup]):
+        group = await wrap_group_awaitable(g)
+        if group is None or after_each is None:
+            return group
+        return await after_each(group)
+
     with set_gather_context(context):
-        future = asyncio.gather(*[wrap_group_awaitable(g) for g in groups])
+        future = asyncio.gather(*[group_forward(g) for g in groups])
         total = sum(getattr(g, "_num_trajectories", 1) for g in groups)
         context.pbar = tqdm.tqdm(desc=pbar_desc, total=total)
         result_groups = await future
@@ -40,23 +53,14 @@ async def gather_trajectory_groups(
         context.pbar.close()
 
     # Filter out any None results that may have been returned due to handled exceptions
-    processed_groups: list[TrajectoryGroup] = [
-        g for g in result_groups if g is not None
-    ]
-
-    # If an after_each callback was provided, await it and collect its return values.
-    if after_each is not None:
-        ae_processed_groups = await asyncio.gather(
-            *(after_each(g) for g in processed_groups)
-        )
-        processed_groups = []
-        for g in ae_processed_groups:
-            if g is None:
-                continue
-            if isinstance(g, list):
-                processed_groups.extend(g)
-            elif isinstance(g, TrajectoryGroup):
-                processed_groups.append(g)
+    processed_groups = []
+    for g in result_groups:
+        if g is None:
+            continue
+        if isinstance(g, list):
+            processed_groups.extend(g)
+        elif isinstance(g, TrajectoryGroup):
+            processed_groups.append(g)
 
     return processed_groups
 
@@ -66,7 +70,7 @@ async def gather_trajectories(
     trajectories: Iterable[Awaitable[Trajectory]],
     *,
     pbar_desc: str | None = "gather",
-    pbar_total_completion_tokens: bool = True,
+    pbar_total_completion_tokens: bool = False,
     max_exceptions: Literal[0] = 0,
 ) -> list[Trajectory]: ...
 
@@ -76,7 +80,7 @@ async def gather_trajectories(
     trajectories: Iterable[Awaitable[Trajectory]],
     *,
     pbar_desc: str | None = "gather",
-    pbar_total_completion_tokens: bool = True,
+    pbar_total_completion_tokens: bool = False,
     max_exceptions: int | float,
 ) -> list[Trajectory | BaseException]: ...
 
@@ -86,7 +90,7 @@ async def gather_trajectories(
     trajectories: Iterable[Awaitable[Iterable[Trajectory]]],
     *,
     pbar_desc: str | None = "gather",
-    pbar_total_completion_tokens: bool = True,
+    pbar_total_completion_tokens: bool = False,
     max_exceptions: Literal[0] = 0,
 ) -> list[list[Trajectory]]: ...
 
@@ -96,7 +100,7 @@ async def gather_trajectories(
     trajectories: Iterable[Awaitable[Iterable[Trajectory]]],
     *,
     pbar_desc: str | None = "gather",
-    pbar_total_completion_tokens: bool = True,
+    pbar_total_completion_tokens: bool = False,
     max_exceptions: int | float,
 ) -> list[list[Trajectory] | BaseException]: ...
 
@@ -107,7 +111,7 @@ async def gather_trajectories(
     ),
     *,
     pbar_desc: str | None = "gather",
-    pbar_total_completion_tokens: bool = True,
+    pbar_total_completion_tokens: bool = False,
     max_exceptions: int | float = 0,
 ) -> (
     list[Trajectory]
@@ -115,10 +119,13 @@ async def gather_trajectories(
     | list[list[Trajectory]]
     | list[list[Trajectory] | BaseException]
 ):
+    if pbar_total_completion_tokens:
+        print(
+            "pbar_total_completion_tokens is deprecated and will be removed in a future version."
+        )
     trajectories_list = list(trajectories)
     context = GatherContext(
         pbar=tqdm.tqdm(desc=pbar_desc, total=len(trajectories_list)),
-        pbar_total_completion_tokens=pbar_total_completion_tokens,
         max_exceptions=max_exceptions,
     )
     with set_gather_context(context):
@@ -127,7 +134,7 @@ async def gather_trajectories(
         )
     if context.pbar is not None:
         context.pbar.close()
-    return results  # type: ignore
+    return results
 
 
 async def wrap_group_awaitable(
@@ -181,11 +188,12 @@ def record_metrics(context: "GatherContext", trajectory: Trajectory) -> None:
         if message_or_choice.logprobs
     ]
     if logprobs:
+        # TODO: probably shouldn't average this
         trajectory.metrics["completion_tokens"] = sum(
             len(l.content or l.refusal or [])
             for l in logprobs  # noqa: E741
         ) / len(logprobs)
-    context.metric_sums["reward"] += trajectory.reward  # type: ignore
+    context.metric_sums["reward"] += trajectory.reward
     context.metric_divisors["reward"] += 1
     context.metric_sums.update(trajectory.metrics)
     context.metric_divisors.update(trajectory.metrics.keys())
@@ -197,7 +205,6 @@ class GatherContext:
     metric_sums: Counter[str] = field(default_factory=Counter)
     metric_divisors: Counter[str] = field(default_factory=Counter)
     max_metrics: int | None = None
-    pbar_total_completion_tokens: bool = False
     max_exceptions: int | float = 0
     increment_pbar: bool = True
 
@@ -214,21 +221,15 @@ class GatherContext:
             sum = self.metric_sums[metric]
             divisor = max(1, self.metric_divisors[metric])
             postfix[metric] = sum / divisor
-        # move token metrics to the end
-        for key in (
-            "prompt_tokens",
-            "completion_tokens",
-            "total_completion_tokens",
-        ):
-            if key in postfix:
-                postfix[key] = postfix.pop(key)
+        if "completion_tokens" in postfix:
+            postfix["completion_tokens"] = postfix.pop("completion_tokens")
         self.pbar.set_postfix(postfix)
 
     def too_many_exceptions(self) -> bool:
         if (
             0 < self.max_exceptions < 1
             and self.pbar is not None
-            and self.metric_sums["exceptions"] / self.pbar.total <= self.max_exceptions
+            and self.metric_sums["exceptions"] / self.pbar.total <= self.max_exceptions  # ty:ignore[unsupported-operator]
         ) or self.metric_sums["exceptions"] <= self.max_exceptions:
             return False
         return True
@@ -237,7 +238,6 @@ class GatherContext:
         self.pbar = None
         self.metric_sums = Counter()
         self.metric_divisors = Counter()
-        self.pbar_total_completion_tokens = False
         self.max_exceptions = 0
 
 

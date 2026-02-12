@@ -1,9 +1,9 @@
 import json
 import os
 
-import tenacity
 from dotenv import load_dotenv
 from openai import AsyncOpenAI
+import tenacity
 
 load_dotenv()
 

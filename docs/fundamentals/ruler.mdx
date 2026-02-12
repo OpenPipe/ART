@@ -335,3 +335,7 @@ for traj in judged_group.trajectories:
 
 - Use cheaper judge models (e.g., Qwen3 32B)
 - Reduce group size
+
+<Note>
+Since RULER uses LiteLLM under the hood, ART automatically suppresses harmless Pydantic serialization warnings from LiteLLM ([related issue](https://github.com/BerriAI/litellm/issues/11759)). To disable this behavior, set `SUPPRESS_LITELLM_SERIALIZATION_WARNINGS=0` in your environment.
+</Note>

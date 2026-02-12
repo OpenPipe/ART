@@ -1,4 +1,3 @@
-import argparse
 import asyncio
 import os
 import random
@@ -17,44 +16,15 @@ random.seed(42)
 
 PULL_FROM_S3 = False
 STEP = 200
-DESTROY_AFTER_RUN = False
-
-CLUSTER_NAME = "art5"
 PROJECT_NAME = "tic-tac-toe"
 BASE_MODEL = "meta-llama/Meta-Llama-3.1-8B-Instruct"
 MODEL_NAME = "llama-8b-o4-mini-001"
 
 
 async def main():
-    parser = argparse.ArgumentParser(description="Train a model to play Tic-Tac-Toe")
-    parser.add_argument(
-        "--backend",
-        choices=["skypilot", "local"],
-        default="local",
-        help="Backend to use for training (default: local)",
-    )
-    parser.add_argument(
-        "--restart",
-        action="store_true",
-        help="Restart the ART server",
-    )
-    args = parser.parse_args()
+    from art.local.backend import LocalBackend
 
-    # Avoid import unnecessary backend dependencies
-    if args.backend == "skypilot":
-        from art.skypilot.backend import SkyPilotBackend
-
-        backend = await SkyPilotBackend.initialize_cluster(
-            cluster_name=CLUSTER_NAME,
-            art_version=".",
-            env_path=".env",
-            gpu="H100",
-            force_restart=args.restart,
-        )
-    else:
-        from art.local.backend import LocalBackend
-
-        backend = LocalBackend()
+    backend = LocalBackend()
 
     model = art.TrainableModel(
         name=MODEL_NAME,
@@ -149,10 +119,12 @@ async def main():
             await model.log(model_trajectories, split="val")
 
         # await model.delete_checkpoints()
-        await model.train(
-            trajectory_groups=[x_trajectory_group, o_trajectory_group],
-            config=art.TrainConfig(learning_rate=2e-5),
-            verbose=True,
+        trajectory_groups = [x_trajectory_group, o_trajectory_group]
+        result = await backend.train(
+            model, trajectory_groups, learning_rate=2e-5, verbose=True
+        )
+        await model.log(
+            trajectory_groups, metrics=result.metrics, step=result.step, split="train"
         )
         await backend._experimental_push_to_s3(model)
 

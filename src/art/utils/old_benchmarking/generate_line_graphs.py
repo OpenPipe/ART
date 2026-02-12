@@ -1,5 +1,5 @@
-import os
 from datetime import datetime
+import os
 from typing import Literal
 
 try:
@@ -56,7 +56,7 @@ def generate_line_graphs(
         last_x_global: float | None = None
         for model in line_graph_models:
             if x_axis_metric == "time":
-                from matplotlib import dates as mdates  # type: ignore
+                from matplotlib import dates as mdates
 
                 x_values_float = [
                     float(mdates.date2num(step.recorded_at or datetime.min))

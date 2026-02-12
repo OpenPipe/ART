@@ -15,7 +15,7 @@ To use ART with LangGraph, install ART with the required extras:
 uv pip install -U openpipe-art[backend,langgraph]>=0.4.9
 ```
 
-The `langgraph` extra includes the LangGraph integration dependencies, while `backend` provides the training backend components. If running using the [SkyPilotBackend](/fundamentals/art-backend#skypilotbackend), substitute `skypilot` for `backend` in the extras array.
+The `langgraph` extra includes the LangGraph integration dependencies, while `backend` provides the training backend components.
 
 ## Why Use ART with LangGraph?
 
@@ -264,7 +264,7 @@ from art.utils import iterate_dataset
 
 # Initialize model and backend
 model = art.Model(name="Qwen/Qwen2.5-7B-Instruct")
-backend = art.backends.SkyPilotBackend()
+backend = art.LocalBackend()
 
 # Data models
 class EmailResult(BaseModel):

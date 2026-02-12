@@ -1,18 +1,18 @@
 import asyncio
-import gc
-import os
 from collections import defaultdict
 from contextlib import nullcontext
+import gc
+import os
 from typing import TYPE_CHECKING, Callable, cast
 
 import nest_asyncio
-import torch
 from peft.peft_model import PeftModel
+import torch
 from trl import GRPOTrainer
 
 from .. import dev
+from ..loss import loss_fn, shift_tensor
 from ..types import TrainConfig
-from ..utils.group_aggregate import group_aggregate
 
 if TYPE_CHECKING:
     from .service import TrainInputs
@@ -27,7 +27,7 @@ async def train(
     _compute_loss = trainer.compute_loss
     _log = trainer.log
     trainer.compute_loss = get_compute_loss_fn(trainer)
-    trainer.log = get_log_fn(trainer, results_queue)
+    trainer.log = get_log_fn(trainer, results_queue)  # ty:ignore[invalid-assignment]
     # Ensure we have a metrics container in the expected format
     try:
         is_dict = isinstance(getattr(trainer, "_metrics", None), dict)
@@ -40,7 +40,7 @@ async def train(
         trainer.train()
     finally:
         trainer.compute_loss = _compute_loss
-        trainer.log = _log
+        trainer.log = _log  # ty:ignore[invalid-assignment]
 
 
 def get_compute_loss_fn(trainer: "GRPOTrainer") -> Callable[..., torch.Tensor]:
@@ -69,11 +69,20 @@ def get_compute_loss_fn(trainer: "GRPOTrainer") -> Callable[..., torch.Tensor]:
                     # if param_group.get("weight_decay"):
                     #     param_group["weight_decay"] = config.weight_decay
 
+        if inputs.get("pixel_values") and inputs["pixel_values"][0] is not None:
+            inputs["pixel_values"] = inputs["pixel_values"][0]  # type: ignore
+        else:
+            del inputs["pixel_values"]  # type: ignore
+        if inputs.get("image_grid_thw") and inputs["image_grid_thw"][0] is not None:
+            inputs["image_grid_thw"] = inputs["image_grid_thw"][0]  # type: ignore
+        else:
+            del inputs["image_grid_thw"]  # type: ignore
+
         # Move tensors to the correct device
         inputs = {
             key: tensor.to(trainer.accelerator.device)  # type: ignore
             for key, tensor in inputs.items()
-        }
+        }  # ty:ignore[invalid-assignment]
 
         accelerate_mixed_precision = os.environ.get("ACCELERATE_MIXED_PRECISION")
         force_float32 = os.environ.get("UNSLOTH_FORCE_FLOAT32")
@@ -109,11 +118,17 @@ def get_compute_loss_fn(trainer: "GRPOTrainer") -> Callable[..., torch.Tensor]:
             f"Sequence length ({seq_len}) must be evenly divisible by chunk size ({chunk_size})"
         )
         os.environ["UNSLOTH_RETURN_HIDDEN_STATES"] = "1"
+        forward_kwargs = {}
+        if "pixel_values" in inputs:
+            forward_kwargs["pixel_values"] = inputs["pixel_values"]
+        if "image_grid_thw" in inputs:
+            forward_kwargs["image_grid_thw"] = inputs["image_grid_thw"]
         new_logprobs, entropies = calculate_logprobs(
             dtype_for_autocasting,
             trainer,
             inputs["tokens"],
             attn_bias,
+            forward_kwargs,
             next_input_ids,
             lm_head_t,
             chunk_size=chunk_size,
@@ -129,6 +144,7 @@ def get_compute_loss_fn(trainer: "GRPOTrainer") -> Callable[..., torch.Tensor]:
                 trainer,
                 inputs["tokens"],
                 attn_bias,
+                forward_kwargs,
                 next_input_ids,
                 lm_head_t,
                 chunk_size=chunk_size,
@@ -140,81 +156,21 @@ def get_compute_loss_fn(trainer: "GRPOTrainer") -> Callable[..., torch.Tensor]:
             ref_logprobs = None
         del attn_bias
 
-        # Shift inputs for loss calculation
-        old_logprobs = shift_tensor(inputs["logprobs"], 0.0)
-        advantages = shift_tensor(inputs["advantages"], 0.0)
-        assistant_mask = shift_tensor(inputs["assistant_mask"], False).to(
-            new_logprobs.dtype
-        )
-        weights = shift_tensor(inputs["weights"], 0.0)
-        # Assume missing old logprobs were sampled under the current policy
-        old_logprobs = torch.where(
-            torch.isnan(old_logprobs),
-            new_logprobs.detach(),
-            old_logprobs,
-        )
-        logprob_diff = new_logprobs - old_logprobs
-        if _config.get("importance_sampling_level", "token") == "sequence":
-            prob_ratio = torch.exp(
-                group_aggregate(
-                    logprob_diff,
-                    by=shift_tensor(inputs["group_ids"], 0) * assistant_mask,
-                    reduce="mean",
-                )
-            )
-        else:
-            prob_ratio = torch.exp(logprob_diff)
-        epsilon = _config.get("epsilon", 0.2)
-        epsilon_high = _config.get("epsilon_high", epsilon)
-        if epsilon_high is None:
-            epsilon_high = epsilon
-        if max_negative_advantage_importance_sampling_weight := _config.get(
-            "max_negative_advantage_importance_sampling_weight", None
-        ):
-            prob_ratio = torch.clamp(
-                prob_ratio, max=max_negative_advantage_importance_sampling_weight
-            )
-        policy_loss = -torch.min(
-            prob_ratio * advantages,
-            torch.clip(prob_ratio, 1 - epsilon, 1 + epsilon_high) * advantages,
-        )
-        if upper_bound := _config.get("truncated_importance_sampling", None):
-            if "original_logprobs" in inputs:
-                original_logprobs = shift_tensor(inputs["original_logprobs"], 0.0)
-                original_logprobs = torch.where(
-                    torch.isnan(original_logprobs),
-                    new_logprobs.detach(),
-                    original_logprobs,
-                )
-                logprob_diff = old_logprobs - original_logprobs
-                prob_ratio = torch.exp(logprob_diff)
-            policy_loss *= torch.clamp(prob_ratio, max=upper_bound).detach()
-        if ref_logprobs is not None:
-            kl_div = (
-                torch.exp(ref_logprobs - new_logprobs)
-                - (ref_logprobs - new_logprobs)
-                - 1.0
-            )
-        else:
-            kl_div = torch.zeros_like(policy_loss)
-
-        policy_loss = policy_loss * weights * assistant_mask
-        kl_div = kl_div * weights * assistant_mask
-        mean_policy_loss = policy_loss.sum() / (assistant_mask.sum() + 1e-6)
-        mean_kl = kl_div.sum() / (assistant_mask.sum() + 1e-6)
-
-        # Compute mean entropy for the current step
-        shifted_entropies = shift_tensor(entropies, 0.0)
-        mean_entropy = (shifted_entropies * weights * assistant_mask).sum() / (
-            assistant_mask.sum() + 1e-6
+        loss = loss_fn(
+            inputs,
+            new_logprobs,
+            ref_logprobs,
+            entropies,
+            _config,
         )
 
         trainer._metrics["train"]["learning_rate"].append(config.learning_rate)
-        trainer._metrics["train"]["policy_loss"].append(mean_policy_loss.item())
-        trainer._metrics["train"]["entropy"].append(mean_entropy.item())  # type: ignore
+        trainer._metrics["train"]["policy_loss"].append(loss.mean_policy_loss.item())
+        if loss.mean_entropy is not None:
+            trainer._metrics["train"]["entropy"].append(loss.mean_entropy.item())
         if config.beta > 0.0:
-            trainer._metrics["train"]["kl_div"].append(mean_kl.item())
-        return mean_policy_loss + config.beta * mean_kl
+            trainer._metrics["train"]["kl_div"].append(loss.mean_kl.item())
+        return loss.mean_policy_loss + config.beta * loss.mean_kl
 
     return compute_loss
 
@@ -297,6 +253,7 @@ def calculate_logprobs(
     trainer: "GRPOTrainer",
     input_ids: torch.Tensor,
     causal_mask: torch.Tensor,
+    forward_kwargs: dict[str, torch.Tensor],
     next_input_ids: torch.Tensor,
     lm_head_t: torch.Tensor,
     chunk_size: int,
@@ -319,7 +276,7 @@ def calculate_logprobs(
         torch.amp.autocast_mode.autocast(device_type="cuda", dtype=dtype_for_autocast),
     ):
         hidden_states = trainer.model(  # type: ignore
-            input_ids=input_ids, causal_mask=causal_mask
+            input_ids=input_ids, causal_mask=causal_mask, **forward_kwargs
         ).logits  # Shape [B, S, H]
     return _calculate_logprobs(lm_head_t, hidden_states, next_input_ids, chunk_size)
 
@@ -376,10 +333,6 @@ def _calculate_logprobs(
         )
     del hidden_states
     return log_probs, entropy
-
-
-def shift_tensor(tensor: torch.Tensor, pad: int | float | bool) -> torch.Tensor:
-    return torch.nn.functional.pad(tensor[:, 1:], (0, 1), value=pad)
 
 
 def gc_and_empty_cuda_cache(n: int = 3) -> None:

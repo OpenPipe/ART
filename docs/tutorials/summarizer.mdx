@@ -31,19 +31,15 @@ Once the repository is cloned, install dependencies. If you haven't already, ins
 
 Then install the project dependencies by running `uv sync`.
 
-### 2. Install SkyPilot/RunPod
+### 2. Install backend dependencies and provision a GPU
 
-We'll be using `SkyPilotBackend` to manage the GPU that your model will be trained on. You'll need to install ART with the SkyPilot optional dependency:
+You'll be using `LocalBackend` to manage the GPU that your model will be trained on. Install ART with the backend dependencies:
 
 ```bash
-pip install openpipe-art[skypilot]
+pip install openpipe-art[backend]
 ```
 
-In order for the backend to work, you'll need to have SkyPilot installed on your machine and provide it with the credentials to spin up machines on at least one infra provider.
-
-We recommend using RunPod because of their ease of use, but any infra provider that SkyPilot [supports](https://docs.skypilot.co/en/latest/overview.html#bringing-your-infra) will work.
-
-Follow RunPod's **Getting Started** guide [here](https://docs.runpod.io/integrations/skypilot/). You'll have to provide a credit card to use RunPod, but you'll only pay for the time your GPUs are running.
+Make sure you have access to a machine with a modern NVIDIA GPU. This can be your local workstation or a cloud VM. If you're using a cloud provider (e.g. RunPod, Lambda, or GCP), launch the GPU instance and run the rest of this tutorial on that machine.
 
 ### 3. Set up optional environment variables found in `.env.example`.
 
@@ -66,39 +62,17 @@ To enable model and logging backup to S3, you'll also need to provide AWS creden
 uv run python src/summarizer/train.py
 ```
 
-The following steps execute when a training run on a new cluster begins:
+The first training run will:
 
-- **Spin up a cluster with 1 H100 GPU.**
-  - This usually takes about 10 minutes, but RunPod occasionally has network throughput issues that can cause the cluster to take up to 30 minutes to spin up. Once the cluster is provisioned, it can be used for subsequent training runs without going through this process again.
-- **Register the model with ART.**
-  - This usually takes less than 5 minutes, though it can require up to 30 minutes if RunPod experiences network issues.
-- **Download the model checkpoint from S3.**
-  - Usually takes a few seconds.
-- **Train the model for a specified number of steps.**
-  - Training itself should be pretty quick (each step takes less than a minute), but the total training time will depend on how many steps you run for. During training, the model checkpoint is saved to S3 after each step.
-- **Upload the final model checkpoint to S3.**
-  - This usually takes a few seconds.
+- Register the model with ART.
+- Download the model checkpoint from S3 (if configured).
+- Start vLLM and the training service on your GPU.
+- Train the model for a specified number of steps.
+- Upload the final model checkpoint to S3 (if configured).
 
-### 5. Shutting down the cluster
+### 5. Shutting down your GPU instance
 
-When you're done training and running benchmarks, you can shut down the cluster in two ways:
-
-Through the CLI:
-
-```bash
-uv run sky down <cluster-name>
-```
-
-or through code:
-
-```python
-DESTROY_AFTER_RUN = True
-
-if DESTROY_AFTER_RUN:
-    await backend.down()
-```
-
-However, since spinning up clusters is a time-intensive process, we recommend keeping clusters alive until you're sure you won't be using them in the near future.
+When you're done training and running benchmarks, shut down your GPU instance through your cloud provider's console or CLI. If you're running locally, you can simply stop the training process.
 
 ### Running Benchmarks
 

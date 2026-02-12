@@ -1,9 +1,8 @@
 from enum import Enum
 
-from typing_extensions import TypedDict
+from typing_extensions import Required, TypedDict
 
 from .engine import EngineArgs
-from .torchtune import TorchtuneArgs
 
 
 # Vendored from transformers.training_args.OptimizerNames
@@ -112,16 +111,37 @@ class InternalModelConfig(TypedDict, total=False):
 
     Args:
         init: Arguments for initializing an Unsloth FastLanguageModel.
+        engine: Arguments for the vLLM engine.
         peft: Arguments for creating an Unsloth PEFT model wrapper.
-        train: Arguments for the GRPO trainer.
+        tinker: Arguments for the Tinker training client.
+        trainer: Arguments for the GRPO trainer.
     """
 
     init_args: "InitArgs"
     engine_args: "EngineArgs"
     peft_args: "PeftArgs"
+    tinker_args: "TinkerArgs | None"
+    tinker_native_args: "TinkerNativeArgs | None"
     trainer_args: "TrainerArgs"
-    torchtune_args: TorchtuneArgs | None
-    _decouple_vllm_and_unsloth: bool
+
+
+class TinkerArgs(TypedDict, total=False):
+    renderer_name: Required[str]
+    training_client_args: "TinkerTrainingClientArgs"
+
+
+class TinkerNativeArgs(TypedDict, total=False):
+    renderer_name: Required[str]
+    training_client_args: "TinkerTrainingClientArgs"
+
+
+class TinkerTrainingClientArgs(TypedDict, total=False):
+    rank: int
+    seed: int | None
+    train_mlp: bool
+    train_attn: bool
+    train_unembed: bool
+    user_metadata: dict[str, str] | None
 
 
 class InitArgs(TypedDict, total=False):

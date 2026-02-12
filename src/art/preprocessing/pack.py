@@ -1,9 +1,10 @@
 import os
 import random
 import time
+from typing import Any, cast
 
 import torch
-from typing_extensions import TypedDict, Unpack
+from typing_extensions import NotRequired, TypedDict, Unpack
 
 from ..types import Verbosity
 from .tokenize import TokenizedResult
@@ -18,12 +19,16 @@ class PackedTensors(TypedDict):
     logprobs: torch.Tensor
     advantages: torch.Tensor
     weights: torch.Tensor
+    pixel_values: list[torch.Tensor | None]
+    image_grid_thw: list[torch.Tensor | None]
 
 
 class DiskPackedTensors(TypedDict):
     dir: str
     num_sequences: int
     sequence_length: int
+    pixel_values: NotRequired[tuple[int, list[int]]]
+    image_grid_thw: NotRequired[tuple[int, list[int]]]
 
 
 def packed_tensors_from_tokenized_results(
@@ -43,6 +48,8 @@ def packed_tensors_from_tokenized_results(
     logprobs: list[list[float]] = [[]]
     advantages: list[list[float]] = [[]]
     weights: list[list[float]] = [[]]
+    pixel_values: list[list[torch.Tensor]] = [[]]
+    image_grid_thw: list[list[torch.Tensor]] = [[]]
 
     for result in tokenized_results:
         if len(result.token_ids) > seq_len and not truncate_long_results:
@@ -71,6 +78,8 @@ def packed_tensors_from_tokenized_results(
             logprobs.append([])
             advantages.append([])
             weights.append([])
+            pixel_values.append([])
+            image_grid_thw.append([])
         group_id = random.randint(-(2**63), 2**63 - 1)
         if result.prompt_id in group_ids[-1]:
             result = result_without_prompt
@@ -85,6 +94,10 @@ def packed_tensors_from_tokenized_results(
         logprobs[-1].extend(result.logprobs)
         advantages[-1].extend([result.advantage] * len(result.token_ids))
         weights[-1].extend([result.weight] * len(result.token_ids))
+        if result.pixel_values is not None:
+            pixel_values[-1].append(result.pixel_values)
+        if result.image_grid_thw is not None:
+            image_grid_thw[-1].append(result.image_grid_thw)
         if truncate_long_results:
             token_ids[-1] = token_ids[-1][:seq_len]
             group_ids[-1] = group_ids[-1][:seq_len]
@@ -105,6 +118,8 @@ def packed_tensors_from_tokenized_results(
     logprobs = [logprobs[i] for i in permutation]
     advantages = [advantages[i] for i in permutation]
     weights = [weights[i] for i in permutation]
+    pixel_values = [pixel_values[i] for i in permutation]
+    image_grid_thw = [image_grid_thw[i] for i in permutation]
 
     def pad(values: list[list], pad_value) -> list[list]:
         max_len = seq_len
@@ -150,12 +165,18 @@ def packed_tensors_from_tokenized_results(
         "logprobs": torch.tensor(pad(logprobs, float("nan"))),
         "advantages": advantages_tensor,
         "weights": weights_tensor,
+        "pixel_values": [
+            torch.concat(tensors) if tensors else None for tensors in pixel_values
+        ],
+        "image_grid_thw": [
+            torch.concat(tensors) if tensors else None for tensors in image_grid_thw
+        ],
     }
 
 
 def packed_tensors_from_dir(**kwargs: Unpack[DiskPackedTensors]) -> PackedTensors:
     os.makedirs(kwargs["dir"], exist_ok=True)
-    return {
+    packed_tensors = {
         key: torch.from_file(
             f"{kwargs['dir']}/{key}.pt",
             shared=True,
@@ -172,7 +193,33 @@ def packed_tensors_from_dir(**kwargs: Unpack[DiskPackedTensors]) -> PackedTensor
             "advantages": torch.float32,
             "weights": torch.float32,
         }.items()
-    }  # type: ignore
+    }
+    _add_tensor_list(packed_tensors, kwargs, "pixel_values", torch.float32)  # ty:ignore[invalid-argument-type]
+    _add_tensor_list(packed_tensors, kwargs, "image_grid_thw", torch.long)  # ty:ignore[invalid-argument-type]
+    return cast(PackedTensors, packed_tensors)
+
+
+def _add_tensor_list(
+    packed_tensors: dict[str, Any],
+    disk_packed_tensors: DiskPackedTensors,
+    key: str,
+    dtype: torch.dtype,
+) -> None:
+    if info := disk_packed_tensors.get(key):
+        packed_tensors[key] = []
+        inner_dim, offsets = cast(tuple[int, list[int]], info)
+        packed_pixel_values = torch.from_file(
+            f"{disk_packed_tensors['dir']}/{key}.pt",
+            shared=True,
+            size=offsets[-1] * inner_dim,
+            dtype=dtype,
+        ).view(-1, inner_dim)
+        for start, end in zip(offsets[:-1], offsets[1:]):
+            packed_tensors[key].append(
+                packed_pixel_values[start:end] if start < end else None
+            )
+    else:
+        packed_tensors[key] = [None] * disk_packed_tensors["num_sequences"]
 
 
 def packed_tensors_to_dir(tensors: PackedTensors, dir: str) -> DiskPackedTensors:
@@ -182,9 +229,34 @@ def packed_tensors_to_dir(tensors: PackedTensors, dir: str) -> DiskPackedTensors
         "num_sequences": tensors["tokens"].shape[0],
         "sequence_length": tensors["tokens"].shape[1],
     }
+    if info := _get_tensor_list_info(tensors["pixel_values"]):
+        disk_packed_tensors["pixel_values"] = info
+    if info := _get_tensor_list_info(tensors["image_grid_thw"]):
+        disk_packed_tensors["image_grid_thw"] = info
     for key, tensor in packed_tensors_from_dir(**disk_packed_tensors).items():
-        tensor.copy_(tensors[key])  # type: ignore
+        if isinstance(tensor, list):
+            for i, t in enumerate(tensor):
+                if t is not None:
+                    t.copy_(tensors[key][i])  # ty:ignore[invalid-key, unresolved-attribute]
+        else:
+            tensor.copy_(tensors[key])  # type: ignore
     return disk_packed_tensors
+
+
+def _get_tensor_list_info(
+    tensors: list[torch.Tensor | None],
+) -> tuple[int, list[int]] | None:
+    inner_dims = {tensor.shape[1] for tensor in tensors if tensor is not None}
+    if len(inner_dims) == 0:
+        return None
+    assert len(inner_dims) == 1, f"Inner dimensions of {tensors} are not the same"
+    offsets = [0]
+    for tensor in tensors:
+        if tensor is not None:
+            offsets.append(offsets[-1] + tensor.shape[0])
+        else:
+            offsets.append(offsets[-1])
+    return inner_dims.pop(), offsets
 
 
 def plot_packed_tensors(
@@ -216,7 +288,7 @@ def plot_packed_tensors(
             tensor.numpy(),
             cmap="viridis",
             cbar_kws={"label": label},
-            xticklabels=False,  # type: ignore
+            xticklabels=False,
         )
         plt.title(title)
         plt.xlabel("Sequence Position")

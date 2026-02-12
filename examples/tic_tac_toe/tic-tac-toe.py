@@ -1,12 +1,14 @@
-import argparse
 import asyncio
 import os
 import random
 
 from dotenv import load_dotenv
 from rollout import TicTacToeScenario, rollout
+import weave
 
 import art
+from art.utils.deployment import TogetherDeploymentConfig, deploy_model
+from art.utils.strip_logprobs import strip_logprobs
 
 load_dotenv()
 
@@ -16,30 +18,14 @@ PULL_FROM_S3 = False
 STEP = 50
 DEPLOY_MODEL = False
 GENERATE_BENCHMARKS = False
-DESTROY_AFTER_RUN = False
 
-parser = argparse.ArgumentParser(description="Train a model to play Tic-Tac-Toe")
-parser.add_argument(
-    "--backend",
-    choices=["skypilot", "local"],
-    default="local",
-    help="Backend to use for training (default: local)",
-)
-args = parser.parse_args()
+weave.init("tic-tac-toe", global_postprocess_output=strip_logprobs)
 
 
 async def main():
-    # Avoid import unnecessary backend dependencies
-    if args.backend == "skypilot":
-        from art.skypilot.backend import SkyPilotBackend
+    from art.local.backend import LocalBackend
 
-        backend = await SkyPilotBackend.initialize_cluster(
-            cluster_name="art3", art_version=".", env_path=".env", gpu="H100"
-        )
-    else:
-        from art.local.backend import LocalBackend
-
-        backend = LocalBackend()
+    backend = LocalBackend()
 
     model = art.TrainableModel(
         name="llama-8b-007",
@@ -66,23 +52,36 @@ async def main():
             pbar_desc="gather",
         )
         await model.delete_checkpoints()
-        await model.train(train_groups, config=art.TrainConfig(learning_rate=5e-5))
+        result = await backend.train(model, train_groups, learning_rate=5e-5)
+        await model.log(
+            train_groups, metrics=result.metrics, step=result.step, split="train"
+        )
         await backend._experimental_push_to_s3(model)
 
     if DEPLOY_MODEL:
         print("deploying")
-        deployment_result = await backend._experimental_deploy(
-            deploy_to="together",
-            model=model,
+        # Pull checkpoint (already local since we just trained, but ensures correct path)
+        checkpoint_path = await backend._experimental_pull_model_checkpoint(
+            model,
             step=STEP,
+            s3_bucket=os.environ.get("BACKUP_BUCKET"),
             verbose=True,
-            pull_s3=False,
-            wait_for_completion=True,
         )
-        if deployment_result.status == "Failed":
-            raise Exception(f"Deployment failed: {deployment_result.failure_reason}")
 
-        deployed_model_name = deployment_result.model_name
+        # Deploy to Together
+        deployment_result = await deploy_model(
+            model=model,
+            checkpoint_path=checkpoint_path,
+            step=STEP,
+            provider="together",
+            config=TogetherDeploymentConfig(
+                s3_bucket=os.environ.get("BACKUP_BUCKET"),
+                wait_for_completion=True,
+            ),
+            verbose=True,
+        )
+
+        deployed_model_name = deployment_result.inference_model_name
 
         lora_model = art.Model(
             name=deployed_model_name,
@@ -96,9 +95,6 @@ async def main():
         traj = await rollout(lora_model, TicTacToeScenario(step=0))
 
         print(traj)
-
-    if DESTROY_AFTER_RUN:
-        await backend.down()
 
     if GENERATE_BENCHMARKS:
         gpt_4o_mini = art.Model(

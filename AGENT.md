@@ -8,7 +8,7 @@ This project uses the `uv` package manager.
 
 ## Testing
 
-- Always run tests before committing. The test command is `./scripts/run_checks.sh`.
+- Always run tests before committing. The test command is `uv run prek run --all-files`.
 
 ## Releases
 
