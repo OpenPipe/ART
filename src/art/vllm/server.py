@@ -2,6 +2,7 @@
 
 import asyncio
 from contextlib import asynccontextmanager
+import importlib
 import logging
 import os
 from typing import Any, AsyncIterator, Coroutine, cast
@@ -17,6 +18,30 @@ from vllm.utils.argparse_utils import FlexibleArgumentParser
 from ..dev.openai_server import OpenAIServerConfig
 
 _openai_serving_models: Any | None = None
+
+
+def _get_openai_serving_models_module() -> Any:
+    """Return serving-models module across vLLM 0.13/0.15 layouts."""
+    try:
+        return importlib.import_module("vllm.entrypoints.openai.serving_models")
+    except ModuleNotFoundError:
+        return importlib.import_module("vllm.entrypoints.openai.models.serving")
+
+
+def _normalize_lora_request(lora_request: Any) -> Any:
+    """Rebuild LoRARequest using the currently installed vLLM schema."""
+    from vllm.lora.request import LoRARequest
+
+    request_fields = tuple(getattr(LoRARequest, "__struct_fields__", ()))
+    request_kwargs = {
+        field: getattr(lora_request, field)
+        for field in request_fields
+        if hasattr(lora_request, field)
+    }
+    request_kwargs.setdefault("lora_name", lora_request.lora_name)
+    request_kwargs.setdefault("lora_int_id", lora_request.lora_int_id)
+    request_kwargs.setdefault("lora_path", lora_request.lora_path)
+    return LoRARequest(**request_kwargs)
 
 
 async def openai_server_task(
@@ -46,7 +71,9 @@ async def openai_server_task(
     subclass_chat_completion_request()
     # Capture the OpenAIServingModels instance so dynamically added LoRAs
     # are reflected in the model list.
-    from vllm.entrypoints.openai import api_server, serving_models
+    from vllm.entrypoints.openai import api_server
+
+    serving_models = _get_openai_serving_models_module()
 
     serving_models_any = cast(Any, serving_models)
     if not getattr(serving_models_any, "_art_openai_serving_models_patched", False):
@@ -64,23 +91,11 @@ async def openai_server_task(
     patch_tool_parser_manager()
     set_vllm_log_file(config.get("log_file", "vllm.log"))
 
-    # Patch engine.add_lora to ensure lora_tensors attribute exists
-    # This is needed for compatibility with Unsloth
+    # Patch engine.add_lora to normalize requests across vLLM schema changes.
     add_lora = engine.add_lora
 
     async def _add_lora(lora_request) -> bool:
-        # Ensure lora_tensors attribute exists on the request
-        if not hasattr(lora_request, "lora_tensors"):
-            # For msgspec.Struct, we need to create a new instance with the attribute
-            from vllm.lora.request import LoRARequest
-
-            lora_request = LoRARequest(
-                lora_name=lora_request.lora_name,
-                lora_int_id=lora_request.lora_int_id,
-                lora_path=lora_request.lora_path,
-                long_lora_max_len=getattr(lora_request, "long_lora_max_len", None),
-                base_model_name=getattr(lora_request, "base_model_name", None),
-            )
+        lora_request = _normalize_lora_request(lora_request)
         added = await add_lora(lora_request)
         if added and _openai_serving_models is not None:
             _openai_serving_models.lora_requests[lora_request.lora_name] = lora_request
