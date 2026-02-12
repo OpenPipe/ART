@@ -8,11 +8,58 @@ Usage:
 """
 
 import asyncio
+import os
 import tempfile
 
 import art
 from art.local import LocalBackend
 from art.types import LocalTrainResult
+
+DEFAULT_GPU_MEMORY_UTILIZATION = 0.2
+DEFAULT_MAX_MODEL_LEN = 2048
+DEFAULT_MAX_SEQ_LENGTH = 2048
+
+
+def get_vllm_test_config() -> tuple[art.dev.InternalModelConfig, str | None]:
+    requested = float(
+        os.environ.get(
+            "ART_TEST_GPU_MEMORY_UTILIZATION",
+            str(DEFAULT_GPU_MEMORY_UTILIZATION),
+        )
+    )
+    min_free_gib = float(os.environ.get("ART_TEST_MIN_FREE_GPU_GIB", "8"))
+    safe_utilization = requested
+    skip_reason: str | None = None
+    try:
+        import torch
+
+        if torch.cuda.is_available():
+            free_bytes, total_bytes = torch.cuda.mem_get_info()
+            free_gib = free_bytes / (1024**3)
+            if free_gib < min_free_gib:
+                skip_reason = (
+                    f"Skipping backend.train API test: free GPU memory is too low "
+                    f"({free_gib:.2f} GiB < {min_free_gib:.2f} GiB)."
+                )
+            safe_utilization = min(requested, (free_bytes / total_bytes) * 0.8)
+    except Exception:
+        pass
+
+    return {
+        "engine_args": {
+            "gpu_memory_utilization": safe_utilization,
+            "max_model_len": int(
+                os.environ.get("ART_TEST_MAX_MODEL_LEN", str(DEFAULT_MAX_MODEL_LEN))
+            ),
+            "max_num_seqs": 8,
+            "enforce_eager": True,
+        },
+        "init_args": {
+            "max_seq_length": int(
+                os.environ.get("ART_TEST_MAX_SEQ_LENGTH", str(DEFAULT_MAX_SEQ_LENGTH))
+            ),
+        },
+    }, skip_reason
 
 
 async def simple_rollout(client, model_name: str, prompt: str) -> art.Trajectory:
@@ -53,6 +100,11 @@ async def main():
             project="api-test",
             base_model="Qwen/Qwen3-0.6B",
         )
+        test_config, skip_reason = get_vllm_test_config()
+        if skip_reason is not None:
+            print(f"\n{skip_reason}")
+            return
+        object.__setattr__(model, "_internal_config", test_config)
 
         try:
             print("\n1. Registering model with backend...")
