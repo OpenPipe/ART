@@ -7,11 +7,9 @@ def subclass_chat_completion_request() -> None:
     """
     Subclass ChatCompletionRequest so that logprobs are always returned.
     """
-    import vllm.entrypoints.openai.chat_completion.protocol as protocol
+    from vllm.entrypoints.openai.chat_completion import protocol
 
-    base_request = protocol.ChatCompletionRequest
-
-    class ChatCompletionRequest(base_request):
+    class ChatCompletionRequest(protocol.ChatCompletionRequest):
         def __init__(self, *args: object, **kwargs: object) -> None:
             super().__init__(*args, **kwargs)  # ty:ignore[invalid-argument-type]
             self.logprobs = True
