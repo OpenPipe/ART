@@ -3,29 +3,12 @@
 from typing import Any
 
 
-def _get_chat_protocol_module() -> Any:
-    """Return the vLLM chat protocol module across 0.13/0.15 layouts."""
-    try:
-        import vllm.entrypoints.openai.protocol as protocol
-    except ModuleNotFoundError:
-        import vllm.entrypoints.openai.chat_completion.protocol as protocol
-    return protocol
-
-
-def _get_delta_message_class() -> Any:
-    """Return DeltaMessage class across 0.13/0.15 layouts."""
-    try:
-        from vllm.entrypoints.openai.protocol import DeltaMessage
-    except ModuleNotFoundError:
-        from vllm.entrypoints.openai.engine.protocol import DeltaMessage
-    return DeltaMessage
-
-
 def subclass_chat_completion_request() -> None:
     """
     Subclass ChatCompletionRequest so that logprobs are always returned.
     """
-    protocol = _get_chat_protocol_module()
+    import vllm.entrypoints.openai.chat_completion.protocol as protocol
+
     base_request = protocol.ChatCompletionRequest
 
     class ChatCompletionRequest(base_request):
@@ -58,9 +41,8 @@ def patch_tool_parser_manager() -> None:
     """
     Patch ToolParserManager to support streaming tool call logprobs.
     """
+    from vllm.entrypoints.openai.engine.protocol import DeltaMessage
     from vllm.tool_parsers.abstract_tool_parser import ToolParserManager
-
-    DeltaMessage = _get_delta_message_class()
 
     get_tool_parser = ToolParserManager.get_tool_parser
 

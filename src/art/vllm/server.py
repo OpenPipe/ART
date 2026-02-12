@@ -2,7 +2,6 @@
 
 import asyncio
 from contextlib import asynccontextmanager
-import importlib
 import logging
 import os
 from typing import Any, AsyncIterator, Coroutine, cast
@@ -20,28 +19,19 @@ from ..dev.openai_server import OpenAIServerConfig
 _openai_serving_models: Any | None = None
 
 
-def _get_openai_serving_models_module() -> Any:
-    """Return serving-models module across vLLM 0.13/0.15 layouts."""
-    try:
-        return importlib.import_module("vllm.entrypoints.openai.serving_models")
-    except ModuleNotFoundError:
-        return importlib.import_module("vllm.entrypoints.openai.models.serving")
-
-
 def _normalize_lora_request(lora_request: Any) -> Any:
-    """Rebuild LoRARequest using the currently installed vLLM schema."""
+    """Ensure add_lora receives a vLLM 0.15 LoRARequest instance."""
     from vllm.lora.request import LoRARequest
 
-    request_fields = tuple(getattr(LoRARequest, "__struct_fields__", ()))
-    request_kwargs = {
-        field: getattr(lora_request, field)
-        for field in request_fields
-        if hasattr(lora_request, field)
-    }
-    request_kwargs.setdefault("lora_name", lora_request.lora_name)
-    request_kwargs.setdefault("lora_int_id", lora_request.lora_int_id)
-    request_kwargs.setdefault("lora_path", lora_request.lora_path)
-    return LoRARequest(**request_kwargs)
+    if isinstance(lora_request, LoRARequest):
+        return lora_request
+    return LoRARequest(
+        lora_name=lora_request.lora_name,
+        lora_int_id=lora_request.lora_int_id,
+        lora_path=lora_request.lora_path,
+        base_model_name=getattr(lora_request, "base_model_name", None),
+        load_inplace=getattr(lora_request, "load_inplace", False),
+    )
 
 
 async def openai_server_task(
@@ -72,8 +62,7 @@ async def openai_server_task(
     # Capture the OpenAIServingModels instance so dynamically added LoRAs
     # are reflected in the model list.
     from vllm.entrypoints.openai import api_server
-
-    serving_models = _get_openai_serving_models_module()
+    from vllm.entrypoints.openai.models import serving as serving_models
 
     serving_models_any = cast(Any, serving_models)
     if not getattr(serving_models_any, "_art_openai_serving_models_patched", False):

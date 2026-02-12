@@ -10,23 +10,8 @@ pytest.importorskip("vllm")
 from art.vllm.patches import patch_tool_parser_manager, subclass_chat_completion_request
 
 
-def get_chat_protocol_module():
-    try:
-        return importlib.import_module("vllm.entrypoints.openai.protocol")
-    except ModuleNotFoundError:
-        return importlib.import_module("vllm.entrypoints.openai.chat_completion.protocol")
-
-
-def get_delta_message_class():
-    try:
-        protocol = importlib.import_module("vllm.entrypoints.openai.protocol")
-    except ModuleNotFoundError:
-        protocol = importlib.import_module("vllm.entrypoints.openai.engine.protocol")
-    return protocol.DeltaMessage
-
-
 def test_subclass_chat_completion_request_forces_logprobs() -> None:
-    protocol = get_chat_protocol_module()
+    protocol = importlib.import_module("vllm.entrypoints.openai.chat_completion.protocol")
     original = protocol.ChatCompletionRequest
 
     try:
@@ -42,7 +27,8 @@ def test_subclass_chat_completion_request_forces_logprobs() -> None:
 
 
 def test_patch_tool_parser_manager_falls_back_to_empty_delta_message() -> None:
-    DeltaMessage = get_delta_message_class()
+    protocol = importlib.import_module("vllm.entrypoints.openai.engine.protocol")
+    DeltaMessage = protocol.DeltaMessage
 
     from vllm.tool_parsers.abstract_tool_parser import ToolParserManager
 
