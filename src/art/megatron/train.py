@@ -340,3 +340,10 @@ while True:
         with open("/tmp/megatron_training_log.jsonl", "a+") as log_file:
             log_file.write("all done\n")
         shutil.rmtree(job.disk_packed_tensors["dir"])
+    if os.environ.get("MEGATRON_EXIT_AFTER_JOB") == "1":
+        # Exit after each job so that all GPU memory (including CUDA context)
+        # is fully freed before vLLM wakes up.  The service restarts us for
+        # the next step.
+        torch.distributed.barrier()
+        torch.distributed.destroy_process_group()
+        break
