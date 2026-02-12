@@ -153,7 +153,7 @@ def get_compute_loss_fn(trainer: "GRPOTrainer") -> Callable[..., torch.Tensor]:
                 inference_mode=True,
                 no_grad=False,
                 reference_logprobs=True,
-                top_k_entropy=0,  # Don't compute entropy for reference model
+                top_k_entropy=top_k_entropy,
             )
         else:
             ref_logprobs = None
@@ -265,8 +265,8 @@ def calculate_logprobs(
     reference_logprobs: bool,
     top_k_entropy: int = 0,
 ) -> tuple[
-    torch.Tensor, torch.Tensor | None
-]:  # Returns (log_probs, entropy) where entropy is shape [B, S] or None
+    torch.Tensor, torch.Tensor
+]:  # Returns (log_probs, entropy) both shape [B, S]
     with (
         torch.inference_mode() if inference_mode else nullcontext(),
         torch.no_grad() if no_grad else nullcontext(),
@@ -294,8 +294,8 @@ def _calculate_logprobs(
     chunk_size: int,
     top_k_entropy: int = 0,
 ) -> tuple[
-    torch.Tensor, torch.Tensor | None
-]:  # Returns (log_probs, entropy) where entropy is shape [B, S] or None
+    torch.Tensor, torch.Tensor
+]:  # Returns (log_probs, entropy) both shape [B, S]
     batch_size, seq_len, _ = hidden_states.shape
     # Output shape is [B, S]
     log_probs = torch.empty(
@@ -303,15 +303,11 @@ def _calculate_logprobs(
         dtype=hidden_states.dtype,
         device=hidden_states.device,
     )
-    # Only allocate entropy tensor if we're computing it
-    if top_k_entropy > 0:
-        entropy = torch.empty(
-            (batch_size, seq_len),
-            dtype=hidden_states.dtype,
-            device=hidden_states.device,
-        )
-    else:
-        entropy = None
+    entropy = torch.empty(
+        (batch_size, seq_len),
+        dtype=hidden_states.dtype,
+        device=hidden_states.device,
+    )
     # Ensure lm_head_t is in the same dtype as hidden_states
     lm_head_t = lm_head_t.to(hidden_states.dtype)
 
@@ -326,9 +322,9 @@ def _calculate_logprobs(
         chunk_logsumexp = torch.logsumexp(chunk_logits, dim=-1)  # [B, chunk_size]
         log_probs[:, i : i + chunk_size] = chunk_selected_logits - chunk_logsumexp
 
-        # Compute entropy for the chunk (only if top_k_entropy > 0)
+        # Compute entropy for the chunk
         if top_k_entropy > 0:
-            # Use top-k approximation for entropy
+            # Use top-k approximation for memory-efficient entropy
             topk_logits, _ = torch.topk(
                 chunk_logits, k=min(top_k_entropy, chunk_logits.size(-1)), dim=-1
             )  # [B, chunk_size, k]
@@ -341,6 +337,14 @@ def _calculate_logprobs(
             )  # [B, chunk_size]
             entropy[:, i : i + chunk_size] = chunk_entropy
             del topk_logits, topk_logsumexp, log_probs_topk, chunk_entropy
+        else:
+            # Full-vocabulary entropy (original behavior)
+            log_probs_full = chunk_logits - chunk_logsumexp.unsqueeze(-1)
+            chunk_entropy = (-torch.exp(log_probs_full) * log_probs_full).sum(
+                dim=-1
+            )  # [B, chunk_size]
+            entropy[:, i : i + chunk_size] = chunk_entropy
+            del log_probs_full, chunk_entropy
 
         del (
             chunk_hs,
