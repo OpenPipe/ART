@@ -19,21 +19,6 @@ from ..dev.openai_server import OpenAIServerConfig
 _openai_serving_models: Any | None = None
 
 
-def _normalize_lora_request(lora_request: Any) -> Any:
-    """Ensure add_lora receives a vLLM 0.15 LoRARequest instance."""
-    from vllm.lora.request import LoRARequest
-
-    if isinstance(lora_request, LoRARequest):
-        return lora_request
-    return LoRARequest(
-        lora_name=lora_request.lora_name,
-        lora_int_id=lora_request.lora_int_id,
-        lora_path=lora_request.lora_path,
-        base_model_name=getattr(lora_request, "base_model_name", None),
-        load_inplace=getattr(lora_request, "load_inplace", False),
-    )
-
-
 async def openai_server_task(
     engine: EngineClient,
     config: OpenAIServerConfig,
@@ -84,7 +69,16 @@ async def openai_server_task(
     add_lora = engine.add_lora
 
     async def _add_lora(lora_request) -> bool:
-        lora_request = _normalize_lora_request(lora_request)
+        from vllm.lora.request import LoRARequest
+
+        if not isinstance(lora_request, LoRARequest):
+            lora_request = LoRARequest(
+                lora_name=lora_request.lora_name,
+                lora_int_id=lora_request.lora_int_id,
+                lora_path=lora_request.lora_path,
+                base_model_name=getattr(lora_request, "base_model_name", None),
+                load_inplace=getattr(lora_request, "load_inplace", False),
+            )
         added = await add_lora(lora_request)
         if added and _openai_serving_models is not None:
             _openai_serving_models.lora_requests[lora_request.lora_name] = lora_request
