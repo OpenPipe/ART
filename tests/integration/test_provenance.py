@@ -43,7 +43,7 @@ def get_latest_artifact_provenance(
     """Fetch provenance from the latest W&B artifact's metadata."""
     api = wandb.Api()
     artifact = api.artifact(f"{entity}/{project}/{name}:latest", type="lora")
-    return artifact.metadata.get("provenance")
+    return artifact.metadata.get("wandb.provenance")
 
 
 async def main() -> None:

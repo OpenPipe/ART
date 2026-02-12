@@ -649,11 +649,13 @@ class ServerlessBackend(Backend):
         api = wandb.Api(api_key=self._client.api_key)  # ty:ignore[possibly-missing-attribute]
         try:
             source_run = api.run(f"{model.entity}/{from_project}/{from_model}")
-            source_provenance = source_run.config.get("provenance")
+            source_provenance = source_run.config.get("wandb.provenance")
             if source_provenance is not None:
                 dest_run = model._get_wandb_run()
                 if dest_run is not None:
-                    dest_run.config.update({"provenance": list(source_provenance)})
+                    dest_run.config.update(
+                        {"wandb.provenance": list(source_provenance)}
+                    )
         except Exception:
             pass  # Source run may not exist (e.g., S3-only models)
 

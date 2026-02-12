@@ -17,12 +17,12 @@ def record_provenance(run: wandb.Run, provenance: str) -> None:
     except wandb_module.errors.CommError:
         return  # No artifact exists yet
 
-    existing = artifact.metadata.get("provenance")
+    existing = artifact.metadata.get("wandb.provenance")
     if existing is not None:
         existing = list(existing)
         if existing[-1] != provenance:
             existing.append(provenance)
-        artifact.metadata["provenance"] = existing
+        artifact.metadata["wandb.provenance"] = existing
     else:
-        artifact.metadata["provenance"] = [provenance]
+        artifact.metadata["wandb.provenance"] = [provenance]
     artifact.save()

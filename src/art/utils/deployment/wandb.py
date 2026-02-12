@@ -79,7 +79,7 @@ def deploy_wandb(
     try:
         metadata: dict[str, object] = {"wandb.base_model": model.base_model}
         if config is not None:
-            metadata["provenance"] = config.provenance
+            metadata["wandb.provenance"] = config.provenance
         artifact = wandb.Artifact(
             model.name,
             type="lora",
