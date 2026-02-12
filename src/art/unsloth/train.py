@@ -113,6 +113,7 @@ def get_compute_loss_fn(trainer: "GRPOTrainer") -> Callable[..., torch.Tensor]:
         )  # Shape [H, V]
         next_input_ids = shift_tensor(inputs["tokens"], 0)
         chunk_size = _config.get("logprob_calculation_chunk_size", 1024)
+        top_k_entropy = _config.get("top_k_entropy", 0)
         # Assert that sequence length is evenly divisible by the chunk size
         assert seq_len % chunk_size == 0, (
             f"Sequence length ({seq_len}) must be evenly divisible by chunk size ({chunk_size})"
@@ -135,6 +136,7 @@ def get_compute_loss_fn(trainer: "GRPOTrainer") -> Callable[..., torch.Tensor]:
             inference_mode=return_new_logprobs,
             no_grad=return_new_logprobs,
             reference_logprobs=False,
+            top_k_entropy=top_k_entropy,
         )
         if return_new_logprobs:
             return torch.nn.functional.pad(new_logprobs[:, :-1], (1, 0), value=0.0)
@@ -151,6 +153,7 @@ def get_compute_loss_fn(trainer: "GRPOTrainer") -> Callable[..., torch.Tensor]:
                 inference_mode=True,
                 no_grad=False,
                 reference_logprobs=True,
+                top_k_entropy=0,  # Don't compute entropy for reference model
             )
         else:
             ref_logprobs = None
@@ -260,9 +263,10 @@ def calculate_logprobs(
     inference_mode: bool,
     no_grad: bool,
     reference_logprobs: bool,
+    top_k_entropy: int = 0,
 ) -> tuple[
-    torch.Tensor, torch.Tensor
-]:  # Returns (log_probs, entropy) both shape [B, S]
+    torch.Tensor, torch.Tensor | None
+]:  # Returns (log_probs, entropy) where entropy is shape [B, S] or None
     with (
         torch.inference_mode() if inference_mode else nullcontext(),
         torch.no_grad() if no_grad else nullcontext(),
@@ -278,7 +282,9 @@ def calculate_logprobs(
         hidden_states = trainer.model(  # type: ignore
             input_ids=input_ids, causal_mask=causal_mask, **forward_kwargs
         ).logits  # Shape [B, S, H]
-    return _calculate_logprobs(lm_head_t, hidden_states, next_input_ids, chunk_size)
+    return _calculate_logprobs(
+        lm_head_t, hidden_states, next_input_ids, chunk_size, top_k_entropy
+    )
 
 
 def _calculate_logprobs(
@@ -286,9 +292,10 @@ def _calculate_logprobs(
     hidden_states: torch.Tensor,  # Shape [B, S, H]
     next_input_ids: torch.Tensor,  # Shape [B, S]
     chunk_size: int,
+    top_k_entropy: int = 0,
 ) -> tuple[
-    torch.Tensor, torch.Tensor
-]:  # Returns (log_probs, entropy) both shape [B, S]
+    torch.Tensor, torch.Tensor | None
+]:  # Returns (log_probs, entropy) where entropy is shape [B, S] or None
     batch_size, seq_len, _ = hidden_states.shape
     # Output shape is [B, S]
     log_probs = torch.empty(
@@ -296,11 +303,15 @@ def _calculate_logprobs(
         dtype=hidden_states.dtype,
         device=hidden_states.device,
     )
-    entropy = torch.empty(
-        (batch_size, seq_len),
-        dtype=hidden_states.dtype,
-        device=hidden_states.device,
-    )
+    # Only allocate entropy tensor if we're computing it
+    if top_k_entropy > 0:
+        entropy = torch.empty(
+            (batch_size, seq_len),
+            dtype=hidden_states.dtype,
+            device=hidden_states.device,
+        )
+    else:
+        entropy = None
     # Ensure lm_head_t is in the same dtype as hidden_states
     lm_head_t = lm_head_t.to(hidden_states.dtype)
 
@@ -315,12 +326,21 @@ def _calculate_logprobs(
         chunk_logsumexp = torch.logsumexp(chunk_logits, dim=-1)  # [B, chunk_size]
         log_probs[:, i : i + chunk_size] = chunk_selected_logits - chunk_logsumexp
 
-        # Compute entropy for the chunk
-        log_probs_full = chunk_logits - chunk_logsumexp.unsqueeze(-1)
-        chunk_entropy = (-torch.exp(log_probs_full) * log_probs_full).sum(
-            dim=-1
-        )  # [B, chunk_size]
-        entropy[:, i : i + chunk_size] = chunk_entropy
+        # Compute entropy for the chunk (only if top_k_entropy > 0)
+        if top_k_entropy > 0:
+            # Use top-k approximation for entropy
+            topk_logits, _ = torch.topk(
+                chunk_logits, k=min(top_k_entropy, chunk_logits.size(-1)), dim=-1
+            )  # [B, chunk_size, k]
+            topk_logsumexp = torch.logsumexp(
+                topk_logits, dim=-1, keepdim=True
+            )  # [B, chunk_size, 1]
+            log_probs_topk = topk_logits - topk_logsumexp  # [B, chunk_size, k]
+            chunk_entropy = (-torch.exp(log_probs_topk) * log_probs_topk).sum(
+                dim=-1
+            )  # [B, chunk_size]
+            entropy[:, i : i + chunk_size] = chunk_entropy
+            del topk_logits, topk_logsumexp, log_probs_topk, chunk_entropy
 
         del (
             chunk_hs,
@@ -328,8 +348,6 @@ def _calculate_logprobs(
             chunk_logits,
             chunk_selected_logits,
             chunk_logsumexp,
-            log_probs_full,
-            chunk_entropy,
         )
     del hidden_states
     return log_probs, entropy
