@@ -24,7 +24,6 @@ backend = [
     "bitsandbytes>=0.45.2",
     "unsloth==2025.12.9",
     "unsloth-zoo==2025.12.7",
-    "vllm==0.13.0",
     "torch>=2.8.0",
     "torchao==0.14.1",
     "accelerate==1.7.0",
@@ -39,6 +38,7 @@ backend = [
     "pytest>=8.4.1",
     "nbmake>=1.5.5",
     "gql<4",
+    "vllm==0.15.1 ; sys_platform == 'linux'",
 ]
 
 langgraph = [
