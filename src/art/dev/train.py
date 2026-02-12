@@ -13,11 +13,16 @@ positive advantages. Defaults to 0.0 (perfectly balanced)."""
     epsilon_high: (
         float | None
     )  # asymmetric clip upper bound. Defaults to epsilon when None
-    importance_sampling_level: Literal["token", "sequence"]
+    importance_sampling_level: Literal[
+        "token", "sequence", "average", "geometric_average"
+    ]
+    kimi_k2_tau: float | None
     logprob_calculation_chunk_size: int
+    mask_prob_ratio: bool
     max_negative_advantage_importance_sampling_weight: float
     num_trajectories_learning_rate_multiplier_power: float
     plot_tensors: bool
+    ppo: bool
     precalculate_logprobs: bool
     scale_learning_rate_by_reward_std_dev: bool
     scale_rewards: bool

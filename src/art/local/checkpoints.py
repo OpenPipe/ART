@@ -22,8 +22,6 @@ def delete_checkpoints(output_dir: str, excluding: list[int]) -> None:
 
 def get_last_checkpoint_dir(output_dir: str) -> str | None:
     step = get_step_from_dir(output_dir)
-    if step == 0:
-        return None
 
     checkpoint_dir = os.path.join(output_dir, "checkpoints", f"{step:04d}")
     if os.path.exists(checkpoint_dir):

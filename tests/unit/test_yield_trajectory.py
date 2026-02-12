@@ -1,8 +1,8 @@
-import pytest_asyncio
 from aiohttp import web
 from openai import AsyncOpenAI
 from openai.types.chat.chat_completion import Choice
 from openai.types.chat.chat_completion_message_param import ChatCompletionMessageParam
+import pytest_asyncio
 
 import art
 
@@ -150,5 +150,5 @@ async def test_yield_trajectory(test_server: None) -> None:
     trajectory = await art.capture_yielded_trajectory(say_hi())
     assert trajectory.messages_and_choices == [
         {"role": "user", "content": "Hi!"},
-        Choice(**mock_response["choices"][0]),
+        Choice(**mock_response["choices"][0]),  # ty:ignore[invalid-argument-type, not-subscriptable]
     ]

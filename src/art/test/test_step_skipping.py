@@ -1,4 +1,4 @@
-#!/usr/bin/env -S uv run --with skypilot[runpod] sky launch --cluster=kyle-tss --gpus=H100-SXM:1 --yes --retry-until-up --down --fast --idle-minutes-to-autostop=20 --workdir=. --env-file=.env -- uv run src/art/test/test_step_skipping.py
+#!/usr/bin/env -S uv run
 # /// script
 # dependencies = [
 #     "openpipe-art[backend]",

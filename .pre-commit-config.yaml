@@ -1,0 +1,27 @@
+repos:
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.12.1
+    hooks:
+      - id: ruff
+      - id: ruff-format
+
+  - repo: local
+    hooks:
+      - id: ty
+        name: ty type checking
+        entry: uv run ty check src tests
+        language: system
+        pass_filenames: false
+
+      - id: uv-lock-check
+        name: uv.lock sync check
+        entry: uv lock --check
+        language: system
+        pass_filenames: false
+
+      - id: pytest
+        name: Unit tests (manual)
+        entry: uv run pytest --nbval --current-env --tb=short tests/unit
+        language: system
+        pass_filenames: false
+        stages: [manual]

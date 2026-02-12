@@ -6,7 +6,7 @@ import random
 from dotenv import load_dotenv
 
 import art
-from art.skypilot import SkyPilotBackend
+from art.local import LocalBackend
 from just_the_facts.rollout import rollout
 from just_the_facts.scenarios import val_scenarios
 
@@ -77,13 +77,7 @@ async def log_comparison_model(comparison_model: art.Model):
 
 async def run_benchmarks():
     global backend
-    backend = await SkyPilotBackend.initialize_cluster(
-        cluster_name="just-the-facts",
-        gpu="H100-SXM",
-        tail_logs=False,
-        env_path="../../.env",
-        art_version="../../",
-    )
+    backend = LocalBackend()
     await gpt_4o_mini.register(backend)
     await gpt_4o.register(backend)
     await gpt_4_1.register(backend)

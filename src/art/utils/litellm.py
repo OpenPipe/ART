@@ -40,7 +40,7 @@ def convert_litellm_choice_to_openai(
             openai_tool_calls.append(
                 ChatCompletionMessageToolCall(
                     id=tool_call.id,
-                    type=tool_call.type,
+                    type=tool_call.type,  # ty:ignore[invalid-argument-type]
                     function=Function(
                         name=tool_call.function.name,
                         arguments=tool_call.function.arguments,

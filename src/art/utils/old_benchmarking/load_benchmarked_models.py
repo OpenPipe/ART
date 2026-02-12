@@ -12,7 +12,7 @@ from art.utils.output_dirs import (
     get_output_dir_from_model_properties,
     get_trajectories_split_dir,
 )
-from art.utils.trajectory_logging import deserialize_trajectory_groups
+from art.utils.trajectory_migration import deserialize_trajectory_groups
 
 
 def load_benchmarked_models(

@@ -2,48 +2,38 @@ import asyncio
 import json
 import math
 import os
+import shutil
 import subprocess
-from datetime import datetime
 from types import TracebackType
-from typing import AsyncIterator, Literal, cast
+from typing import AsyncIterator, Iterable, Literal, cast
+import warnings
 
 import aiohttp
 import numpy as np
-import polars as pl
-import torch
-import wandb
-import weave
 from openai import AsyncOpenAI
+import torch
 from tqdm import auto as tqdm
-from transformers.models.auto.tokenization_auto import AutoTokenizer
+from transformers import AutoImageProcessor, AutoTokenizer
+from transformers.image_processing_utils import BaseImageProcessor
 from transformers.tokenization_utils_base import PreTrainedTokenizerBase
 from typing_extensions import Self
-from wandb.sdk.wandb_run import Run
-from weave.trace.weave_client import WeaveClient
 
-from art.utils.deploy_model import (
-    LoRADeploymentJob,
-    LoRADeploymentProvider,
-    deploy_model,
-)
-from art.utils.old_benchmarking.calculate_step_metrics import calculate_step_std_dev
 from art.utils.output_dirs import (
     get_default_art_path,
     get_model_dir,
     get_output_dir_from_model_properties,
     get_step_checkpoint_dir,
-    get_trajectories_split_dir,
 )
+from art.utils.record_provenance import record_provenance
 from art.utils.s3 import (
     ExcludableOption,
     pull_model_from_s3,
     push_model_to_s3,
 )
-from art.utils.trajectory_logging import serialize_trajectory_groups
 from mp_actors import close_proxy, move_to_child_process
 
 from .. import dev
-from ..backend import Backend
+from ..backend import AnyTrainableModel, Backend
 from ..model import Model, TrainableModel
 from ..preprocessing.pack import (
     PackedTensors,
@@ -53,7 +43,7 @@ from ..preprocessing.pack import (
 )
 from ..preprocessing.tokenize import tokenize_trajectory_groups
 from ..trajectories import Trajectory, TrajectoryGroup
-from ..types import Message, TrainConfig
+from ..types import LocalTrainResult, Message, TrainConfig
 from ..utils import format_message, get_model_step
 from .checkpoints import (
     delete_checkpoints,
@@ -80,9 +70,8 @@ class LocalBackend(Backend):
 
         # Other initialization
         self._services: dict[str, ModelService] = {}
-        self._tokenizers: dict[str, "PreTrainedTokenizerBase"] = {}
-        self._wandb_runs: dict[str, Run] = {}
-        self._weave_clients: dict[str, WeaveClient] = {}
+        self._tokenizers: dict[str, PreTrainedTokenizerBase] = {}
+        self._image_processors: dict[str, BaseImageProcessor | None] = {}
 
     def __enter__(self) -> Self:
         return self
@@ -115,20 +104,42 @@ class LocalBackend(Backend):
         Args:
             model: An art.Model instance.
         """
+        # Ensure model state/logging uses the backend path
+        model.base_path = self._path
         output_dir = get_model_dir(model=model, art_path=self._path)
         os.makedirs(output_dir, exist_ok=True)
         with open(f"{output_dir}/model.json", "w") as f:
             json.dump(model.model_dump(), f)
 
-        # Initialize wandb and weave early if this is a trainable model
+        # Auto-migrate any old JSONL trajectory files to Parquet
+        from art.utils.trajectory_migration import auto_migrate_on_register
+
+        auto_migrate_on_register(output_dir)
+
+        # Initialize wandb early if this is a trainable model
+        # (wandb initialization is now handled by the model's _get_wandb_run method)
         if model.trainable and "WANDB_API_KEY" in os.environ:
-            _ = self._get_wandb_run(model)
+            _ = model._get_wandb_run()
+
+    def _model_inference_name(self, model: Model, step: int | None = None) -> str:
+        """Return the inference name for a model checkpoint.
+
+        For LocalBackend with vLLM, the base model is served under its HF name,
+        and LoRA adapters are served as `model.name@step`.
+
+        Args:
+            model: The model.
+            step: If provided, returns name for specific checkpoint.
+                  If None, returns name for latest checkpoint (step 0 initially).
+        """
+
+        # For LocalBackend, vLLM always serves LoRA adapters with @step suffix
+        # Default to step 0 when not specified (the initial checkpoint created at registration)
+        actual_step = step if step is not None else self.__get_step(model)
+        return f"{model.name}@{actual_step}"
 
     async def _get_service(self, model: TrainableModel) -> ModelService:
         from ..dev.get_model_config import get_model_config
-        from ..torchtune.service import TorchtuneService
-        from ..unsloth.decoupled_service import DecoupledUnslothService
-        from ..unsloth.service import UnslothService
 
         if model.name not in self._services:
             config = get_model_config(
@@ -136,12 +147,18 @@ class LocalBackend(Backend):
                 output_dir=get_model_dir(model=model, art_path=self._path),
                 config=model._internal_config,
             )
-            if config.get("torchtune_args") is not None:
-                service_class = TorchtuneService
-            elif config.get("_decouple_vllm_and_unsloth", False):
-                service_class = DecoupledUnslothService
+            is_tinker = config.get("tinker_args") is not None
+            if is_tinker:
+                from ..tinker.service import TinkerService
+
+                service_class = TinkerService
             else:
+                from ..unsloth.service import UnslothService
+
                 service_class = UnslothService
+                # When moving the service to a child process, import unsloth
+                # early to maximize optimizations
+                os.environ["IMPORT_UNSLOTH"] = "1"
             self._services[model.name] = service_class(
                 model_name=model.name,
                 base_model=model.base_model,
@@ -151,26 +168,15 @@ class LocalBackend(Backend):
             if not self._in_process:
                 # Kill all "model-service" processes to free up GPU memory
                 subprocess.run(["pkill", "-9", "model-service"])
-                if isinstance(
-                    self._services[model.name],
-                    (UnslothService, DecoupledUnslothService),
-                ):
-                    # To enable sleep mode, import peft before unsloth
-                    # Unsloth will issue warnings, but everything appears to be okay
-                    if config.get("engine_args", {}).get("enable_sleep_mode", False):
-                        os.environ["IMPORT_PEFT"] = "1"
-                    # When moving the service to a child process, import unsloth
-                    # early to maximize optimizations
-                    os.environ["IMPORT_UNSLOTH"] = "1"
                 self._services[model.name] = move_to_child_process(
                     self._services[model.name],
-                    process_name="model-service",
+                    process_name="tinker-service" if is_tinker else "model-service",
                 )
         return self._services[model.name]
 
     def _get_packed_tensors(
         self,
-        model: TrainableModel,
+        model: AnyTrainableModel,
         trajectory_groups: list[TrajectoryGroup],
         advantage_balance: float,
         allow_training_without_logprobs: bool,
@@ -181,6 +187,13 @@ class LocalBackend(Backend):
             self._tokenizers[model.base_model] = AutoTokenizer.from_pretrained(
                 model.base_model
             )
+        if model.base_model not in self._image_processors:
+            try:
+                self._image_processors[model.base_model] = (
+                    AutoImageProcessor.from_pretrained(model.base_model, use_fast=True)
+                )
+            except Exception:
+                self._image_processors[model.base_model] = None
         tokenizer = self._tokenizers[model.base_model]
         tokenized_results = list(
             tokenize_trajectory_groups(
@@ -188,6 +201,7 @@ class LocalBackend(Backend):
                 trajectory_groups,
                 allow_training_without_logprobs,
                 scale_rewards,
+                image_processor=self._image_processors[model.base_model],
             )
         )
         if not tokenized_results:
@@ -205,7 +219,7 @@ class LocalBackend(Backend):
         packed_tensors = packed_tensors_from_tokenized_results(
             tokenized_results,
             sequence_length,
-            pad_token_id=tokenizer.eos_token_id,  # type: ignore
+            pad_token_id=tokenizer.eos_token_id,
             advantage_balance=advantage_balance,
         )
         if (
@@ -226,7 +240,7 @@ class LocalBackend(Backend):
             )
         return packed_tensors
 
-    async def _get_step(self, model: TrainableModel) -> int:
+    async def _get_step(self, model: AnyTrainableModel) -> int:
         return self.__get_step(model)
 
     def __get_step(self, model: Model) -> int:
@@ -236,44 +250,33 @@ class LocalBackend(Backend):
         # Non-trainable models do not have checkpoints/steps; default to 0
         return 0
 
-    async def _delete_checkpoints(
+    async def _delete_checkpoint_files(
         self,
-        model: TrainableModel,
-        benchmark: str,
-        benchmark_smoothing: float,
+        model: AnyTrainableModel,
+        steps_to_keep: list[int],
     ) -> None:
+        """Delete checkpoint files, keeping only the specified steps."""
+        from ..tinker.service import TinkerService
+
         output_dir = get_model_dir(model=model, art_path=self._path)
-        # Keep the latest step
-        steps_to_keep = [get_model_step(model, self._path)]
-        try:
-            best_step = (
-                pl.read_ndjson(f"{output_dir}/history.jsonl")
-                .drop_nulls(subset=[benchmark])
-                .group_by("step")
-                .mean()
-                .with_columns(pl.col(benchmark).ewm_mean(alpha=benchmark_smoothing))
-                .sort(benchmark)
-                .select(pl.col("step").last())
-                .item()
-            )
-            steps_to_keep.append(best_step)
-        except FileNotFoundError:
-            print(f'"{output_dir}/history.jsonl" not found')
-        except pl.exceptions.ColumnNotFoundError:
-            print(f'No "{benchmark}" metric found in history')
-        delete_checkpoints(output_dir, steps_to_keep)
+        service = await self._get_service(model)
+        if isinstance(service, TinkerService):
+            await service.delete_checkpoints(steps_to_keep)
+        else:
+            delete_checkpoints(output_dir, steps_to_keep)
 
     async def _prepare_backend_for_training(
         self,
-        model: TrainableModel,
+        model: AnyTrainableModel,
         config: dev.OpenAIServerConfig | None = None,
     ) -> tuple[str, str]:
         service = await self._get_service(model)
-        await service.start_openai_server(config=config)
-        server_args = (config or {}).get("server_args", {})
+        host, port = await service.start_openai_server(config=config)
 
-        base_url = f"http://{server_args.get('host', '0.0.0.0')}:{server_args.get('port', 8000)}/v1"
-        api_key = server_args.get("api_key", None) or "default"
+        base_url = f"http://{host}:{port}/v1"
+        api_key = (config or {}).get("server_args", {}).get(
+            "api_key", None
+        ) or "default"
 
         def done_callback(_: asyncio.Task[None]) -> None:
             close_proxy(self._services.pop(model.name))
@@ -291,91 +294,67 @@ class LocalBackend(Backend):
             base_url=base_url,
             api_key=api_key,
         )
+        consecutive_failures = 0
+        max_consecutive_failures = 3
         async with aiohttp.ClientSession() as session:
             while True:
                 # Wait 30 seconds before checking again
                 await asyncio.sleep(30)
-                # If the server is sleeping, skip the check
-                if await self._services[model_name].vllm_engine_is_sleeping():
-                    continue
-                # Check the metrics
-                async with session.get(
-                    f"{base_url.split('/v1')[0]}/metrics"
-                ) as response:
-                    metrics = await response.text()
-                # Parse Prometheus metrics for running requests
-                running_requests = 0
-                pending_requests = 0
-                for line in metrics.split("\n"):
-                    if line.startswith("vllm:num_requests_running"):
-                        running_requests = int(float(line.split()[1]))
-                    elif line.startswith("vllm:num_requests_waiting"):
-                        pending_requests = int(float(line.split()[1]))
-                # If there are no running or pending requests, send a health check
-                if running_requests == 0 and pending_requests == 0:
+                try:
+                    # If the server is sleeping, skip the check
+                    if await self._services[model_name].vllm_engine_is_sleeping():
+                        consecutive_failures = 0
+                        continue
+                    # Check the metrics with a timeout
+                    async with session.get(
+                        f"{base_url.split('/v1')[0]}/metrics",
+                        timeout=aiohttp.ClientTimeout(total=10),
+                    ) as response:
+                        metrics = await response.text()
+                    # Parse Prometheus metrics for running requests
+                    running_requests = 0
+                    pending_requests = 0
+                    for line in metrics.split("\n"):
+                        if line.startswith("vllm:num_requests_running"):
+                            running_requests = int(float(line.split()[1]))
+                        elif line.startswith("vllm:num_requests_waiting"):
+                            pending_requests = int(float(line.split()[1]))
+                    # If there are no running or pending requests, send a health check
+                    if running_requests == 0 and pending_requests == 0:
+                        try:
+                            # Send a health check with a short timeout
+                            await openai_client.completions.create(
+                                model=model_name,
+                                prompt="Hi",
+                                max_tokens=1,
+                                timeout=float(
+                                    os.environ.get("ART_SERVER_MONITOR_TIMEOUT", 5.0)
+                                ),
+                            )
+                        except Exception as e:
+                            # If the server is sleeping, a failed health check is okay
+                            if await self._services[
+                                model_name
+                            ].vllm_engine_is_sleeping():
+                                consecutive_failures = 0
+                                continue
+                            raise e
+                    # Reset failure counter on success
+                    consecutive_failures = 0
+                except Exception:
+                    # If the server is sleeping during an exception, it's okay
                     try:
-                        # Send a health check with a 5 second timeout
-                        await openai_client.completions.create(
-                            model=model_name,
-                            prompt="Hi",
-                            max_tokens=1,
-                            timeout=5,
-                        )
-                    except Exception as e:
-                        # If the server is sleeping, a failed health check is okay
                         if await self._services[model_name].vllm_engine_is_sleeping():
+                            consecutive_failures = 0
                             continue
-                        raise e
+                    except Exception:
+                        pass  # If we can't check sleeping status, count it as a failure
+                    consecutive_failures += 1
+                    if consecutive_failures >= max_consecutive_failures:
+                        raise
+                    # Otherwise, continue and try again
 
-    async def _log(
-        self,
-        model: Model,
-        trajectory_groups: list[TrajectoryGroup],
-        split: str = "val",
-    ) -> None:
-        # Save logs for trajectory groups
-        parent_dir = get_trajectories_split_dir(
-            get_model_dir(model=model, art_path=self._path), split
-        )
-        os.makedirs(parent_dir, exist_ok=True)
-
-        # Get the file name for the current iteration, or default to 0 for non-trainable models
-        iteration = self.__get_step(model)
-        file_name = f"{iteration:04d}.jsonl"
-
-        # Write the logs to the file
-        with open(f"{parent_dir}/{file_name}", "w") as f:
-            f.write(serialize_trajectory_groups(trajectory_groups))
-
-        # Collect all metrics (including reward) across all trajectories
-        all_metrics: dict[str, list[float]] = {"reward": [], "exception_rate": []}
-
-        for group in trajectory_groups:
-            for trajectory in group:
-                if isinstance(trajectory, BaseException):
-                    all_metrics["exception_rate"].append(1)
-                    continue
-                else:
-                    all_metrics["exception_rate"].append(0)
-                # Add reward metric
-                all_metrics["reward"].append(trajectory.reward)
-
-                # Collect other custom metrics
-                for metric, value in trajectory.metrics.items():
-                    if metric not in all_metrics:
-                        all_metrics[metric] = []
-                    all_metrics[metric].append(float(value))
-
-        # Calculate averages for all metrics
-        averages = {}
-        for metric, values in all_metrics.items():
-            if len(values) > 0:
-                averages[metric] = sum(values) / len(values)
-
-        # Calculate average standard deviation of rewards within groups
-        averages["reward_std_dev"] = calculate_step_std_dev(trajectory_groups)
-
-        self._log_metrics(model, averages, split)
+    # Note: _log() method has been moved to the Model class (frontend)
 
     def _trajectory_log(self, trajectory: Trajectory) -> str:
         """Format a trajectory into a readable log string."""
@@ -385,9 +364,168 @@ class LocalBackend(Backend):
             if isinstance(message_or_choice, dict):
                 message = message_or_choice
             else:
-                message = cast(Message, message_or_choice.message.model_dump())
+                message = cast(Message, message_or_choice.message.model_dump())  # ty:ignore[possibly-missing-attribute]
             formatted_messages.append(format_message(message))
         return header + "\n".join(formatted_messages)
+
+    async def train(  # type: ignore[override]
+        self,
+        model: AnyTrainableModel,
+        trajectory_groups: Iterable[TrajectoryGroup],
+        *,
+        # Core training parameters
+        learning_rate: float = 5e-6,
+        beta: float = 0.0,
+        # RL algorithm settings
+        ppo: bool = False,
+        epsilon: float | None = None,
+        epsilon_high: float | None = None,
+        # Advantage computation
+        advantage_balance: float = 0.0,
+        scale_rewards: bool = True,
+        # Importance sampling
+        importance_sampling_level: Literal[
+            "token", "sequence", "average", "geometric_average"
+        ] = "token",
+        max_negative_advantage_importance_sampling_weight: float | None = None,
+        mask_prob_ratio: bool = False,
+        # Experimental parameters
+        kimi_k2_tau: float | None = None,
+        precalculate_logprobs: bool = False,
+        # LocalBackend-specific parameters
+        allow_training_without_logprobs: bool = False,
+        plot_tensors: bool = False,
+        truncated_importance_sampling: float | None = None,
+        scale_learning_rate_by_reward_std_dev: bool = False,
+        logprob_calculation_chunk_size: int = 1024,
+        num_trajectories_learning_rate_multiplier_power: float = 0.0,
+        # Checkpoint behavior
+        save_checkpoint: bool = True,
+        # Verbosity
+        verbose: bool = False,
+    ) -> LocalTrainResult:
+        """Train the model on the given trajectory groups.
+
+        This is the recommended way to train models. Unlike model.train(), this
+        method does NOT automatically log trajectories or metrics. Call model.log()
+        explicitly before and/or after training if you want to log data.
+
+        Args:
+            model: The trainable model to train.
+            trajectory_groups: Batches of trajectories to train on.
+            learning_rate: Learning rate for training. Defaults to 5e-6.
+            beta: KL penalty coefficient. Defaults to 0.0.
+            ppo: Whether to use PPO clipping. Defaults to False.
+            epsilon: Clip epsilon for importance sampling. Defaults based on ppo.
+            epsilon_high: Asymmetric upper clip bound. Defaults to epsilon.
+            advantage_balance: Balance between negative and positive advantages
+                in range [-1.0, 1.0]. Defaults to 0.0 (balanced).
+            scale_rewards: Whether to scale rewards by standard deviation.
+                Defaults to True.
+            importance_sampling_level: Level at which to compute importance
+                sampling weights. Defaults to "token".
+            max_negative_advantage_importance_sampling_weight: Maximum weight
+                for negative advantage samples.
+            mask_prob_ratio: Whether to mask probability ratios. Defaults to False.
+            kimi_k2_tau: Tau parameter for Kimi K2 algorithm.
+            precalculate_logprobs: Whether to precalculate logprobs.
+            allow_training_without_logprobs: Allow training even when no logprobs
+                are available. Defaults to False.
+            plot_tensors: Whether to plot training tensors for debugging.
+                Defaults to False.
+            truncated_importance_sampling: Truncation threshold for importance
+                sampling weights.
+            scale_learning_rate_by_reward_std_dev: Whether to scale learning rate
+                by reward standard deviation. Defaults to False.
+            logprob_calculation_chunk_size: Chunk size for logprob calculation.
+                Defaults to 1024.
+            num_trajectories_learning_rate_multiplier_power: Power for learning
+                rate multiplier based on number of trajectories.
+            save_checkpoint: Whether to save a checkpoint after training.
+                Defaults to True.
+            verbose: Whether to print verbose output. Defaults to False.
+
+        Returns:
+            LocalTrainResult with step number, training metrics, and checkpoint path.
+
+        Example:
+            # Before (deprecated):
+            await model.train(trajectory_groups, config=TrainConfig(learning_rate=5e-6))
+
+            # After (recommended):
+            await model.log(trajectory_groups, split="train")
+            result = await backend.train(model, trajectory_groups, learning_rate=5e-6)
+            # Optionally log training metrics:
+            # await model.log(metrics=result.metrics, step=result.step)
+        """
+        groups_list = list(trajectory_groups)
+
+        # Build config objects from explicit kwargs
+        config = TrainConfig(learning_rate=learning_rate, beta=beta)
+        dev_config: dev.TrainConfig = {
+            "advantage_balance": advantage_balance,
+            "allow_training_without_logprobs": allow_training_without_logprobs,
+            "importance_sampling_level": importance_sampling_level,
+            "mask_prob_ratio": mask_prob_ratio,
+            "plot_tensors": plot_tensors,
+            "ppo": ppo,
+            "precalculate_logprobs": precalculate_logprobs,
+            "scale_learning_rate_by_reward_std_dev": scale_learning_rate_by_reward_std_dev,
+            "scale_rewards": scale_rewards,
+            "logprob_calculation_chunk_size": logprob_calculation_chunk_size,
+            "num_trajectories_learning_rate_multiplier_power": num_trajectories_learning_rate_multiplier_power,
+        }
+        # Only include optional fields if they're set
+        if epsilon is not None:
+            dev_config["epsilon"] = epsilon
+        if epsilon_high is not None:
+            dev_config["epsilon_high"] = epsilon_high
+        if max_negative_advantage_importance_sampling_weight is not None:
+            dev_config["max_negative_advantage_importance_sampling_weight"] = (
+                max_negative_advantage_importance_sampling_weight
+            )
+        if kimi_k2_tau is not None:
+            dev_config["kimi_k2_tau"] = kimi_k2_tau
+        if truncated_importance_sampling is not None:
+            dev_config["truncated_importance_sampling"] = truncated_importance_sampling
+
+        # Collect metrics from training
+        training_metrics: list[dict[str, float]] = []
+        async for metrics in self._train_model(
+            model, groups_list, config, dev_config, verbose
+        ):
+            training_metrics.append(metrics)
+
+        # Aggregate metrics
+        avg_metrics: dict[str, float] = {}
+        if training_metrics:
+            avg_metrics = {
+                k: sum(d.get(k, 0) for d in training_metrics)
+                / sum(1 for d in training_metrics if k in d)
+                for k in {k for d in training_metrics for k in d}
+                if k != "num_gradient_steps"
+            }
+
+        # Get step and checkpoint path
+        step = await self._get_step(model)
+        checkpoint_path: str | None = None
+        if save_checkpoint:
+            checkpoint_path = get_step_checkpoint_dir(
+                get_model_dir(model=model, art_path=self._path), step
+            )
+            if not os.path.exists(checkpoint_path):
+                checkpoint_path = None
+
+        # Record provenance on the latest W&B artifact
+        wandb_run = model._get_wandb_run()
+        if wandb_run is not None:
+            record_provenance(wandb_run, "local-rl")
+
+        return LocalTrainResult(
+            step=step,
+            metrics=avg_metrics,
+            checkpoint_path=checkpoint_path,
+        )
 
     async def _train_model(
         self,
@@ -400,9 +538,7 @@ class LocalBackend(Backend):
         if verbose:
             print("Starting _train_model")
         service = await self._get_service(model)
-        if verbose:
-            print("Logging training data to disk...")
-        await self._log(model, trajectory_groups, "train")
+        # Note: Logging is now handled by the frontend (Model.train() calls Model.log())
         if verbose:
             print("Packing tensors...")
 
@@ -441,44 +577,41 @@ class LocalBackend(Backend):
                 get_model_dir(model=model, art_path=self._path), next_step
             )
 
-            # If the current checkpoint exists, rename it to the next step
+            # If the current checkpoint exists, copy it to the next step
             if os.path.exists(current_checkpoint_dir):
-                os.rename(current_checkpoint_dir, next_checkpoint_dir)
+                shutil.copytree(
+                    current_checkpoint_dir,
+                    next_checkpoint_dir,
+                    dirs_exist_ok=True,
+                )
                 print(
                     f"Advanced step from {current_step} to {next_step} (no training occurred)"
                 )
 
-            # Log metrics showing no groups were trainable
-            self._log_metrics(
-                model,
-                {
-                    "num_groups_submitted": num_groups_submitted,
-                    "num_groups_trainable": 0,
-                },
-                "train",
-                step=next_step,
-            )
+                try:
+                    # Register the copied checkpoint as a new LoRA adapter
+                    # so it's available for inference at the new step
+                    if hasattr(service, "register_lora_for_step"):
+                        await service.register_lora_for_step(  # type: ignore[attr-defined]
+                            next_step, next_checkpoint_dir
+                        )
+                except ModuleNotFoundError:
+                    pass  # Unsloth is not installed
+
+            # Yield metrics showing no groups were trainable
+            # (the frontend will handle logging)
+            yield {
+                "num_groups_submitted": num_groups_submitted,
+                "num_groups_trainable": 0,
+                "num_gradient_steps": 0,
+            }
             return
         disk_packed_tensors = packed_tensors_to_dir(
             packed_tensors, f"{get_model_dir(model=model, art_path=self._path)}/tensors"
         )
-        if dev_config.get("scale_learning_rate_by_reward_std_dev", False):
-            config = config.model_copy(
-                update={
-                    "learning_rate": config.learning_rate
-                    * self._get_reward_std_dev_learning_rate_multiplier(model)
-                }
-            )
+        # Note: scale_learning_rate_by_reward_std_dev is now handled by the frontend (Model.train())
         results: list[dict[str, float]] = []
         estimated_gradient_steps = disk_packed_tensors["num_sequences"]
-        if torchtune_args := (model._internal_config or dev.InternalModelConfig()).get(
-            "torchtune_args"
-        ):
-            tp = torchtune_args.get("tensor_parallel_dim", 1)
-            cp = torchtune_args.get("context_parallel_dim", 1)
-            world_size = torch.cuda.device_count()
-            dp = world_size // (tp * cp)
-            estimated_gradient_steps = math.ceil(estimated_gradient_steps / dp)
         pbar = tqdm.tqdm(total=estimated_gradient_steps, desc="train")
         async for result in service.train(
             disk_packed_tensors, config, dev_config, verbose
@@ -494,174 +627,156 @@ class LocalBackend(Backend):
             pbar.update(1)
             pbar.set_postfix(result)
         pbar.close()
-        if verbose:
-            print("Logging metrics...")
-        data = {
-            k: sum(d.get(k, 0) for d in results) / sum(1 for d in results if k in d)
-            for k in {k for d in results for k in d}
-        }
-        # Add group counting metrics
-        data["num_groups_submitted"] = num_groups_submitted
-        data["num_groups_trainable"] = num_groups_trainable
-        # Get the current step after training
-        current_step = self.__get_step(model)
-        self._log_metrics(model, data, "train", step=current_step)
+        # Note: Metrics logging is now handled by the frontend (Model.train())
         if verbose:
             print("_train_model complete")
 
-    def _get_reward_std_dev_learning_rate_multiplier(
-        self, model: TrainableModel
-    ) -> float:
-        output_dir = get_model_dir(model=model, art_path=self._path)
-        learning_rate_multiplier = 1.0  # Default prior
-        try:
-            std_dev_history = (
-                pl.read_ndjson(f"{output_dir}/history.jsonl")
-                .drop_nulls(subset=["train/reward_std_dev"])
-                .group_by("step")
-                .mean()
-                .sort("step")
-            )
-
-            # Fit linear regression to std_dev_history
-            if len(std_dev_history) > 1:
-                steps = std_dev_history["step"].to_numpy()
-                std_devs = std_dev_history["train/reward_std_dev"].to_numpy()
-
-                # Fit linear regression: y = mx + b
-                # polyfit returns [coefficient, intercept] for degree 1
-                coefficient, intercept = np.polyfit(steps, std_devs, deg=1)
-
-                # Get prediction for the last step
-                last_step = steps[-1]
-                last_step_prediction = coefficient * last_step + intercept
-                last_step_actual = std_devs[-1]
-
-                # Calculate R-squared and adjusted R-squared
-                predictions = coefficient * steps + intercept
-                ss_residual = np.sum((std_devs - predictions) ** 2)
-                ss_total = np.sum((std_devs - np.mean(std_devs)) ** 2)
-                r_squared = 1 - (ss_residual / ss_total) if ss_total > 0 else 0
-
-                # Adjusted R-squared accounts for sample size
-                # For simple linear regression: adj_R² = 1 - (1 - R²) * (n - 1) / (n - 2)
-                n_samples = len(steps)
-                if n_samples > 2:
-                    adjusted_r_squared = 1 - (1 - r_squared) * (n_samples - 1) / (
-                        n_samples - 2
-                    )
-                else:
-                    adjusted_r_squared = (
-                        0  # Not enough samples for meaningful adjustment
-                    )
-
-                # Calculate learning rate multiplier
-                # raw_multiplier = last_step_prediction / intercept (if intercept > 0)
-                # adjusted by goodness of fit: multiplier = 1 + adj_R² * (raw_multiplier - 1)
-                if intercept > 0:
-                    raw_multiplier = last_step_prediction / intercept
-                    # learning_rate_multiplier = 1 + adjusted_r_squared * (
-                    #     raw_multiplier - 1
-                    # )
-                    learning_rate_multiplier = raw_multiplier
-                else:
-                    # If intercept <= 0, can't calculate meaningful ratio, stick with prior
-                    raw_multiplier = 1.0
-                    learning_rate_multiplier = 1.0
-
-                print(f"Regression fitted: y = {coefficient:.6f}x + {intercept:.6f}")
-                print(f"  Coefficient (slope): {coefficient:.6f}")
-                print(f"  Intercept: {intercept:.6f}")
-                print(f"  R-squared: {r_squared:.4f}")
-                print(
-                    f"  Adjusted R-squared: {adjusted_r_squared:.4f} (n={n_samples} samples)"
-                )
-                print(
-                    f"  Last step ({last_step}) prediction: {last_step_prediction:.6f}"
-                )
-                print(f"  Last step actual value: {last_step_actual:.6f}")
-                print(
-                    f"  Prediction error: {abs(last_step_actual - last_step_prediction):.6f}"
-                )
-                print(f"  Raw LR multiplier (pred/intercept): {raw_multiplier:.4f}")
-                print(f"  Adjusted LR multiplier: {learning_rate_multiplier:.4f}")
-            else:
-                print(
-                    f"Not enough data points to fit regression (need at least 2, got {len(std_dev_history)})"
-                )
-
-        except FileNotFoundError:
-            print(f'"{output_dir}/history.jsonl" not found')
-        except pl.exceptions.ColumnNotFoundError:
-            print(f'No "train/reward_std_dev" metric found in history')
-
-        return learning_rate_multiplier
-
-    def _log_metrics(
-        self,
-        model: Model,
-        metrics: dict[str, float],
-        split: str,
-        step: int | None = None,
-    ) -> None:
-        metrics = {f"{split}/{metric}": value for metric, value in metrics.items()}
-        step = step if step is not None else self.__get_step(model)
-
-        with open(
-            f"{get_model_dir(model=model, art_path=self._path)}/history.jsonl", "a"
-        ) as f:
-            f.write(
-                json.dumps(
-                    {
-                        k: v for k, v in metrics.items() if v == v
-                    }  # Filter out NaN values
-                    | {"step": step, "recorded_at": datetime.now().isoformat()}
-                )
-                + "\n"
-            )
-
-        # If we have a W&B run, log the data there
-        if run := self._get_wandb_run(model):
-            # Mark the step metric itself as hidden so W&B doesn't create an automatic chart for it
-            wandb.define_metric("training_step", hidden=True)
-
-            # Enabling the following line will cause W&B to use the training_step metric as the x-axis for all metrics
-            # wandb.define_metric(f"{split}/*", step_metric="training_step")
-            run.log({"training_step": step, **metrics}, step=step)
-
-    def _get_wandb_run(self, model: Model) -> Run | None:
-        if "WANDB_API_KEY" not in os.environ:
-            return None
-        if (
-            model.name not in self._wandb_runs
-            or self._wandb_runs[model.name]._is_finished
-        ):
-            run = wandb.init(
-                project=model.project,
-                name=model.name,
-                id=model.name,
-                resume="allow",
-                settings=wandb.Settings(
-                    x_stats_open_metrics_endpoints={
-                        "vllm": "http://localhost:8000/metrics",
-                    },
-                    x_stats_open_metrics_filters=(
-                        "vllm.vllm:num_requests_waiting",
-                        "vllm.vllm:num_requests_running",
-                    ),
-                ),
-            )
-            self._wandb_runs[model.name] = run
-            os.environ["WEAVE_PRINT_CALL_LINK"] = os.getenv(
-                "WEAVE_PRINT_CALL_LINK", "False"
-            )
-            os.environ["WEAVE_LOG_LEVEL"] = os.getenv("WEAVE_LOG_LEVEL", "CRITICAL")
-            self._weave_clients[model.name] = weave.init(model.project)
-        return self._wandb_runs[model.name]
+    # Note: _get_reward_std_dev_learning_rate_multiplier and _log_metrics
+    # have been moved to the Model class (frontend)
 
     # ------------------------------------------------------------------
     # Experimental support for S3
     # ------------------------------------------------------------------
+
+    async def _experimental_pull_model_checkpoint(
+        self,
+        model: "TrainableModel",
+        *,
+        step: int | Literal["latest"] | None = None,
+        local_path: str | None = None,
+        s3_bucket: str | None = None,
+        prefix: str | None = None,
+        verbose: bool = False,
+    ) -> str:
+        """Pull a model checkpoint to a local path.
+
+        For LocalBackend, this:
+        1. When step is "latest" or None, checks both local storage and S3 (if provided)
+           to find the latest checkpoint, preferring local if steps are equal
+        2. If checkpoint exists locally, uses it (optionally copying to local_path)
+        3. If checkpoint doesn't exist locally but s3_bucket is provided, pulls from S3
+        4. Returns the final checkpoint path
+
+        Args:
+            model: The model to pull checkpoint for.
+            step: The step to pull. Can be an int for a specific step,
+                 or "latest" to pull the latest checkpoint. If None, pulls latest.
+            local_path: Custom directory to save/copy the checkpoint to.
+                       If None, returns checkpoint from backend's default art path.
+            s3_bucket: S3 bucket to check/pull from. When step is "latest", both
+                       local storage and S3 are checked to find the true latest.
+            prefix: S3 prefix.
+            verbose: Whether to print verbose output.
+
+        Returns:
+            Path to the local checkpoint directory.
+        """
+        # Determine which step to use
+        resolved_step: int
+        if step is None or step == "latest":
+            # Check both local storage and S3 (if provided) for the latest checkpoint
+            local_latest_step: int | None = None
+            s3_latest_step: int | None = None
+
+            # Get latest from local storage
+            try:
+                local_latest_step = get_model_step(model, self._path)
+                if local_latest_step == 0:
+                    # get_model_step returns 0 if no checkpoints exist
+                    local_latest_step = None
+            except Exception:
+                local_latest_step = None
+
+            # Get latest from S3 if bucket provided
+            if s3_bucket is not None:
+                from art.utils.s3_checkpoint_utils import (
+                    get_latest_checkpoint_step_from_s3,
+                )
+
+                s3_latest_step = await get_latest_checkpoint_step_from_s3(
+                    model_name=model.name,
+                    project=model.project,
+                    s3_bucket=s3_bucket,
+                    prefix=prefix,
+                )
+
+            # Determine which source has the latest checkpoint
+            if local_latest_step is None and s3_latest_step is None:
+                raise ValueError(
+                    f"No checkpoints found for {model.project}/{model.name} in local storage or S3"
+                )
+            elif local_latest_step is None:
+                resolved_step = s3_latest_step  # type: ignore[assignment]
+                if verbose:
+                    print(f"Using latest checkpoint from S3: step {resolved_step}")
+            elif s3_latest_step is None:
+                resolved_step = local_latest_step
+                if verbose:
+                    print(
+                        f"Using latest checkpoint from local storage: step {resolved_step}"
+                    )
+            elif local_latest_step >= s3_latest_step:
+                # Prefer local if equal or greater
+                resolved_step = local_latest_step
+                if verbose:
+                    print(
+                        f"Using latest checkpoint from local storage: step {resolved_step} "
+                    )
+            else:
+                resolved_step = s3_latest_step
+                if verbose:
+                    print(f"Using latest checkpoint from S3: step {resolved_step} ")
+        else:
+            resolved_step = step
+
+        # Check if checkpoint exists in the original training location
+        original_checkpoint_dir = get_step_checkpoint_dir(
+            get_model_dir(model=model, art_path=self._path), resolved_step
+        )
+
+        # Step 1: Ensure checkpoint exists at original_checkpoint_dir
+        if not os.path.exists(original_checkpoint_dir):
+            if s3_bucket is None:
+                raise FileNotFoundError(
+                    f"Checkpoint not found at {original_checkpoint_dir} and no S3 bucket specified"
+                )
+            if verbose:
+                print(f"Pulling checkpoint step {resolved_step} from S3...")
+            await pull_model_from_s3(
+                model_name=model.name,
+                project=model.project,
+                step=resolved_step,
+                s3_bucket=s3_bucket,
+                prefix=prefix,
+                verbose=verbose,
+                art_path=self._path,
+                exclude=["logs", "trajectories"],
+            )
+            # Validate that the checkpoint was actually downloaded
+            if not os.path.exists(original_checkpoint_dir) or not os.listdir(
+                original_checkpoint_dir
+            ):
+                raise FileNotFoundError(f"Checkpoint step {resolved_step} not found")
+
+        # Step 2: Handle local_path if provided
+        if local_path is not None:
+            if verbose:
+                print(
+                    f"Copying checkpoint from {original_checkpoint_dir} to {local_path}..."
+                )
+            import shutil
+
+            os.makedirs(local_path, exist_ok=True)
+            shutil.copytree(original_checkpoint_dir, local_path, dirs_exist_ok=True)
+            if verbose:
+                print(f"✓ Checkpoint copied successfully")
+            return local_path
+
+        if verbose:
+            print(
+                f"Checkpoint step {resolved_step} exists at {original_checkpoint_dir}"
+            )
+        return original_checkpoint_dir
 
     async def _experimental_pull_from_s3(
         self,
@@ -678,6 +793,10 @@ class LocalBackend(Backend):
         latest_only: bool = False,
     ) -> None:
         """Download the model directory from S3 into local Backend storage. Right now this can be used to pull trajectory logs for processing or model checkpoints.
+
+        .. deprecated::
+            This method is deprecated. Use `_experimental_pull_model_checkpoint` instead.
+
         Args:
             model: The model to pull from S3.
             step: DEPRECATED. Use only_step instead.
@@ -690,6 +809,11 @@ class LocalBackend(Backend):
             only_step: If specified, only pull this specific step. Can be an int for a specific step,
                       or "latest" to pull only the latest checkpoint. If None, pulls all steps.
         """
+        warnings.warn(
+            "_experimental_pull_from_s3 is deprecated. Use _experimental_pull_model_checkpoint instead.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
 
         # Handle backward compatibility and new only_step parameter
         if only_step is None and latest_only:
@@ -929,32 +1053,3 @@ class LocalBackend(Backend):
             print(
                 f"Successfully forked checkpoint from {from_model} (step {selected_step}) to {model.name}"
             )
-
-    async def _experimental_deploy(
-        self,
-        deploy_to: LoRADeploymentProvider,
-        model: "TrainableModel",
-        step: int | None = None,
-        s3_bucket: str | None = None,
-        prefix: str | None = None,
-        verbose: bool = False,
-        pull_s3: bool = True,
-        wait_for_completion: bool = True,
-    ) -> LoRADeploymentJob:
-        """
-        Deploy the model's latest checkpoint to a hosted inference endpoint.
-
-        Together is currently the only supported provider. See link for supported base models:
-        https://docs.together.ai/docs/lora-inference#supported-base-models
-        """
-        return await deploy_model(
-            deploy_to=deploy_to,
-            model=model,
-            step=step,
-            s3_bucket=s3_bucket,
-            prefix=prefix,
-            verbose=verbose,
-            pull_s3=pull_s3,
-            wait_for_completion=wait_for_completion,
-            art_path=self._path,
-        )

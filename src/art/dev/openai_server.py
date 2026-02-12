@@ -12,16 +12,25 @@ def get_openai_server_config(
     lora_path: str | None = None,
     config: "OpenAIServerConfig | None" = None,
 ) -> "OpenAIServerConfig":
+    import os
+
     if config is None:
         config = OpenAIServerConfig()
     log_file = config.get("log_file", log_file)
+
+    # Build LoRA modules list for multi-checkpoint support
+    # Register under both model_name (for "current" model) and model_name@step (for specific checkpoint)
+    lora_modules: list[str] | None = None
+    if lora_path:
+        step = int(os.path.basename(lora_path))
+        lora_modules = [
+            f'{{"name": "{model_name}", "path": "{lora_path}"}}',
+            f'{{"name": "{model_name}@{step}", "path": "{lora_path}"}}',
+        ]
+
     server_args = ServerArgs(
         api_key="default",
-        lora_modules=(
-            [f'{{"name": "{model_name}", "path": "{lora_path}"}}']
-            if lora_path
-            else None
-        ),
+        lora_modules=lora_modules,
         return_tokens_as_token_ids=True,
         enable_auto_tool_choice=True,
         tool_call_parser="hermes",
@@ -29,9 +38,7 @@ def get_openai_server_config(
     server_args.update(config.get("server_args", {}))
     engine_args = EngineArgs(
         model=base_model,
-        num_scheduler_steps=16 if lora_path else 1,
-        served_model_name=base_model if lora_path else model_name,
-        disable_log_requests=True,
+        served_model_name=model_name,
         generation_config="vllm",
     )
     engine_args.update(config.get("engine_args", {}))

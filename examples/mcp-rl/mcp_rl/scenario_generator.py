@@ -8,10 +8,10 @@ import os
 import random
 from typing import Any, Dict, List
 
-import openai
 from dotenv import load_dotenv
 from mcp import ClientSession
 from mcp.client.stdio import stdio_client
+import openai
 
 load_dotenv()
 

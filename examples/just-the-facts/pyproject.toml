@@ -3,7 +3,7 @@ name = "just-the-facts"
 version = "0.1.0"
 description = "Add your description here"
 readme = "README.md"
-requires-python = ">=3.10"
+requires-python = ">=3.11"
 dependencies = [
     "aiohttp>=3.12.14",
     "asyncio>=3.4.3",
@@ -15,7 +15,7 @@ dependencies = [
     "mcp>=1.11.0",
     "newspaper3k>=0.2.8",
     "openai>=1.74.0",
-    "openpipe-art[skypilot]",
+    "openpipe-art[backend]",
     "python-dotenv>=1.1.1",
     "tenacity>=9.1.2",
     "weave>=0.51.56",

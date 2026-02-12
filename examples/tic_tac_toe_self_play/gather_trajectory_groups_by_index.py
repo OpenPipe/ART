@@ -11,14 +11,17 @@ async def gather_trajectory_groups_by_index(
     grouped_trajectory_awaitables: Iterable[Awaitable[tuple[art.Trajectory, ...]]],
     *,
     pbar_desc: str | None = "gather",
-    pbar_total_completion_tokens: bool = True,
+    pbar_total_completion_tokens: bool = False,
     max_exceptions: int | float = 0,
     trajectories_per_rollout: int = 1,
 ) -> list[art.TrajectoryGroup]:
+    if pbar_total_completion_tokens:
+        print(
+            "pbar_total_completion_tokens is deprecated and will be removed in a future version."
+        )
     grouped_trajectory_awaitables = list(grouped_trajectory_awaitables)
     context = GatherContext(
         pbar=None,
-        pbar_total_completion_tokens=pbar_total_completion_tokens,
         max_exceptions=max_exceptions,
     )
 

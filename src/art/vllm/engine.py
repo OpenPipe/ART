@@ -3,21 +3,18 @@
 import asyncio
 import contextlib
 import contextvars
+from dataclasses import replace
 import os
 import time
-from dataclasses import replace
-from typing import Any, Callable, Coroutine, Generator, ParamSpec, TypeVar, cast
+from typing import Any, Callable, Generator, ParamSpec, TypeVar, cast
 
 import cloudpickle
 import vllm
-from vllm.engine.async_llm_engine import AsyncLLMEngine
 from vllm.v1.engine.async_llm import AsyncLLM
 from vllm.v1.worker.gpu_worker import Worker
 
-from .patches import patch_allocator
 
-
-async def get_llm(args: vllm.AsyncEngineArgs) -> AsyncLLM:
+async def get_llm(args: vllm.AsyncEngineArgs) -> AsyncLLM:  # ty:ignore[unresolved-attribute]
     """
     Create an AsyncLLM engine with model download and patches applied.
 
@@ -34,11 +31,6 @@ async def get_llm(args: vllm.AsyncEngineArgs) -> AsyncLLM:
         )
         await process.wait()
 
-    # Make sure we are using the V1 engine
-    import vllm.envs as envs
-
-    envs.VLLM_USE_V1 = True
-
     llm = AsyncLLM.from_engine_args(
         replace(
             args,
@@ -46,47 +38,7 @@ async def get_llm(args: vllm.AsyncEngineArgs) -> AsyncLLM:
             enable_sleep_mode=True,
         )
     )
-    await run_on_workers(llm, patch_allocator)
     return llm
-
-
-def create_engine_pause_and_resume_functions(
-    engine: AsyncLLMEngine,
-) -> tuple[
-    Callable[[], Coroutine[Any, Any, None]], Callable[[], Coroutine[Any, Any, None]]
-]:
-    """
-    Patches the vLLM engine and returns a pair of functions for pausing and resuming
-    request processing respectively.
-
-    Args:
-        engine: The AsyncLLMEngine to patch.
-
-    Returns:
-        A tuple of (pause_engine, resume_engine) async functions.
-    """
-    _engine_step = engine.engine_step
-    resume_event = asyncio.Event()
-    resume_event.set()
-    engine_step_event = asyncio.Event()
-
-    async def engine_step(virtual_engine: int) -> bool:
-        engine_step_event.set()
-        await resume_event.wait()
-        return await _engine_step(virtual_engine)
-
-    engine.engine_step = engine_step
-
-    async def pause_engine() -> None:
-        resume_event.clear()
-        if engine.engine.has_unfinished_requests():
-            engine_step_event.clear()
-            await engine_step_event.wait()
-
-    async def resume_engine() -> None:
-        resume_event.set()
-
-    return pause_engine, resume_engine
 
 
 P = ParamSpec("P")

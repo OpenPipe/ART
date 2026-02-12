@@ -1,14 +1,14 @@
 import argparse
 import ast
+from pathlib import Path
 import re
 import sys
-from pathlib import Path
 from typing import Any, Dict
 
-import nbformat
-import pytest
 from nbclient import NotebookClient
 from nbclient.exceptions import CellExecutionError
+import nbformat
+import pytest
 
 NOTEBOOKS = [
     {
@@ -331,7 +331,7 @@ Examples:
             processed_config = config.copy()
 
         # Resolve path relative to this file
-        p = (here / processed_config["path"]).resolve()
+        p = (here / processed_config["path"]).resolve()  # ty:ignore[unsupported-operator]
         if not p.exists():
             print(f"Warning: notebook not found: {p}")
         processed_config["path"] = str(p)

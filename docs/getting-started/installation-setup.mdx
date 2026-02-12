@@ -12,7 +12,7 @@ The ART client can be installed into projects designed to run on any machine tha
 pip install openpipe-art
 ```
 
-### Running the client and server locally
+### Running the server locally
 
 The ART server can be run locally on any machine with a GPU. To install the backend dependencies required for training and inference, you can install the `backend` extra:
 
@@ -31,7 +31,7 @@ backend = LocalBackend()
 model = TrainableModel(
     name="agent-001",
     project="my-agentic-task",
-    base_model="Qwen/Qwen2.5-14B-Instruct",
+    base_model="OpenPipe/Qwen3-14B-Instruct",
 )
 
 await model.register(backend)
@@ -39,29 +39,25 @@ await model.register(backend)
 ... the rest of your code ...
 ```
 
-### Running the client locally and connecting to a remote server
+### Using a managed autoscaling backend
 
-The ART client can also be run locally and connected to a remote server, which ART will automatically provision for you. To use SkyPilot, you'll need to install the optional dependency:
+Instead of managing the GPUs and training processes yourself, you can optionally send inference and training requests to the W&B Training cluster, which autoscales to match your job's demand. To do so, install `openpipe-art` without any extras and use `ServerlessBackend`:
 
 ```bash
-pip install openpipe-art[skypilot]
+pip install openpipe-art
 ```
 
-Then you can use SkyPilotBackend in your code:
 
 ```python
 from art import TrainableModel, gather_trajectory_groups
-from art.skypilot.backend import SkyPilotBackend
+from art.serverless.backend import ServerlessBackend
 
-backend = await SkyPilotBackend.initialize_cluster(
-    cluster_name="my-cluster",
-    gpu="H100"
-)
+backend = ServerlessBackend()
 
 model = TrainableModel(
     name="agent-001",
     project="my-agentic-task",
-    base_model="Qwen/Qwen2.5-14B-Instruct",
+    base_model="OpenPipe/Qwen3-14B-Instruct",
 )
 
 await model.register(backend)
