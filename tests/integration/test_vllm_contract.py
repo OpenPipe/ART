@@ -1,10 +1,4 @@
-"""End-to-end vLLM contract tests for ART LocalBackend.
-
-These tests capture behaviors ART depends on from the vLLM integration:
-- Step-qualified LoRA models are visible via /v1/models.
-- Chat completions return logprobs for rollout collection.
-- Both step 0 and the latest trained checkpoint remain queryable.
-"""
+"""End-to-end vLLM contract tests for ART LocalBackend."""
 
 import os
 import tempfile
@@ -45,8 +39,7 @@ def get_safe_gpu_memory_utilization() -> float:
             f"Insufficient free GPU memory for vLLM contract test: {free_gib:.1f} GiB free < {min_free_gib:.1f} GiB required."
         )
     # Keep requested utilization below currently free memory with headroom.
-    free_ratio = free_bytes / total_bytes
-    return max(0.02, min(requested, free_ratio * 0.8))
+    return max(0.02, min(requested, (free_bytes / total_bytes) * 0.8))
 
 
 def get_vllm_test_config() -> art.dev.InternalModelConfig:
@@ -121,8 +114,6 @@ async def test_local_backend_vllm_contract() -> None:
             project="integration-tests",
             base_model=get_base_model(),
         )
-        # LocalBackend service creation reads this private field to build vLLM args.
-        # Keep memory bounds conservative for shared GPU CI/VM environments.
         object.__setattr__(model, "_internal_config", get_vllm_test_config())
         try:
             await model.register(backend)
