@@ -128,10 +128,7 @@ async def test_local_backend_vllm_contract() -> None:
             train_groups = await art.gather_trajectory_groups(
                 [
                     art.TrajectoryGroup(
-                        [
-                            simple_rollout(client, step0_name, prompt)
-                            for _ in range(2)
-                        ]
+                        [simple_rollout(client, step0_name, prompt) for _ in range(2)]
                     )
                     for prompt in ("Say yes", "Say no")
                 ]  # ty:ignore[invalid-argument-type]

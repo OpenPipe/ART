@@ -11,7 +11,9 @@ from art.vllm.patches import patch_tool_parser_manager, subclass_chat_completion
 
 
 def test_subclass_chat_completion_request_forces_logprobs() -> None:
-    protocol = importlib.import_module("vllm.entrypoints.openai.chat_completion.protocol")
+    protocol = importlib.import_module(
+        "vllm.entrypoints.openai.chat_completion.protocol"
+    )
     original = protocol.ChatCompletionRequest
 
     try:
