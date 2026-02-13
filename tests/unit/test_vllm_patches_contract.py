@@ -14,18 +14,19 @@ def test_subclass_chat_completion_request_forces_logprobs() -> None:
     protocol = importlib.import_module(
         "vllm.entrypoints.openai.chat_completion.protocol"
     )
-    original = protocol.ChatCompletionRequest
+    original = getattr(protocol, "ChatCompletionRequest")
 
     try:
         subclass_chat_completion_request()
-        request = protocol.ChatCompletionRequest(
+        request_cls = getattr(protocol, "ChatCompletionRequest")
+        request = request_cls(
             messages=[{"role": "user", "content": "hello"}],
             model="dummy-model",
         )
         assert request.logprobs is True
         assert request.top_logprobs == 0
     finally:
-        protocol.ChatCompletionRequest = original
+        setattr(protocol, "ChatCompletionRequest", original)
 
 
 def test_patch_tool_parser_manager_falls_back_to_empty_delta_message() -> None:
