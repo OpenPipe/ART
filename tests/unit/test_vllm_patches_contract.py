@@ -43,14 +43,16 @@ def test_patch_tool_parser_manager_falls_back_to_empty_delta_message() -> None:
     original_get_tool_parser = ToolParserManager.get_tool_parser
 
     try:
-        ToolParserManager.get_tool_parser = classmethod(
-            lambda _cls, _name: DummyToolParser
+        setattr(
+            ToolParserManager,
+            "get_tool_parser",
+            classmethod(lambda _cls, _name: DummyToolParser),
         )
         patch_tool_parser_manager()
 
         parser_cls = ToolParserManager.get_tool_parser("dummy")
-        result = parser_cls.extract_tool_calls_streaming()
+        result = parser_cls.extract_tool_calls_streaming("", "", "", [], [], [], None)  # ty:ignore[missing-argument,invalid-argument-type]
 
         assert isinstance(result, DeltaMessage)
     finally:
-        ToolParserManager.get_tool_parser = original_get_tool_parser
+        setattr(ToolParserManager, "get_tool_parser", original_get_tool_parser)
