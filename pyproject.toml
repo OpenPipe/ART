@@ -105,6 +105,10 @@ asyncio_mode = "auto"
 
 [tool.uv]
 required-version = ">=0.6.15"
+# Override numpy to <2.0 for compatibility with megatron-core in the training
+# environment. vLLM 0.15.1 pulls opencv-python-headless>=4.13 which wants
+# numpy>=2 on Python 3.9+, but megatron-core requires numpy<2.
+override-dependencies = ["numpy<2"]
 
 [tool.ty.environment]
 python-version = "3.11"
