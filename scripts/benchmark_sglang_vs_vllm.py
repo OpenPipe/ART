@@ -18,16 +18,16 @@ Key Insight:
 
 Usage:
     # Run full comparison (requires both backends installed)
-    python scripts/benchmark_sglang_vs_vllm.py
+    python scripts/benchmark_sglang_benchmarks.py
 
     # Run only SGLang benchmark
-    python scripts/benchmark_sglang_vs_vllm.py --backend sglang
+    python scripts/benchmark_sglang_benchmarks.py --backend sglang
 
     # Run only vLLM benchmark  
-    python scripts/benchmark_sglang_vs_vllm.py --backend vllm
+    python scripts/benchmark_sglang_benchmarks.py --backend vllm
 
     # Quick test with fewer iterations
-    python scripts/benchmark_sglang_vs_vllm.py --quick
+    python scripts/benchmark_sglang_benchmarks.py --quick
 
 Requirements:
     - For SGLang: source .venv/bin/activate (main ART environment)
@@ -505,16 +505,16 @@ def main():
         epilog="""
 Examples:
   # Full comparison
-  python scripts/benchmark_sglang_vs_vllm.py
+  python scripts/benchmark_sglang_benchmarks.py
 
   # Quick test
-  python scripts/benchmark_sglang_vs_vllm.py --quick
+  python scripts/benchmark_sglang_benchmarks.py --quick
 
   # SGLang only
-  python scripts/benchmark_sglang_vs_vllm.py --backend sglang
+  python scripts/benchmark_sglang_benchmarks.py --backend sglang
 
   # Larger model
-  python scripts/benchmark_sglang_vs_vllm.py --model Qwen/Qwen2.5-3B-Instruct
+  python scripts/benchmark_sglang_benchmarks.py --model Qwen/Qwen2.5-3B-Instruct
         """
     )
     parser.add_argument(

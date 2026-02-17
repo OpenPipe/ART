@@ -44,11 +44,11 @@ def run_worker(backend: str, cfg: dict, results_path: str) -> None:
     import aiohttp
     import torch
 
-    from benchmarks.sglang_vs_vllm.metrics_collector import (
+    from benchmarks.sglang_benchmarks.metrics_collector import (
         BenchmarkRun, RequestMetrics, StepMetrics,
         get_gpu_memory_usage_nvidia_smi,
     )
-    from benchmarks.sglang_vs_vllm.config import generate_benchmark_prompts
+    from benchmarks.sglang_benchmarks.config import generate_benchmark_prompts
 
     logger.info(f"[{backend}] Worker PID={os.getpid()} GPUs={torch.cuda.device_count()}")
 
@@ -217,7 +217,7 @@ def run_worker(backend: str, cfg: dict, results_path: str) -> None:
             packed_tensors_from_tokenized_results,
             packed_tensors_to_dir,
         )
-        from benchmarks.sglang_vs_vllm.unsloth_sglang_service import UnslothSGLangService
+        from benchmarks.sglang_benchmarks.unsloth_sglang_service import UnslothSGLangService
 
         unsloth_port = cfg.get("unsloth_port", 8300)
         unsloth_lora_rank = cfg.get("unsloth_lora_rank", 1)
@@ -552,7 +552,7 @@ def main():
         return
 
     # ---- Orchestrator mode ----------------------------------------
-    from benchmarks.sglang_vs_vllm.metrics_collector import (
+    from benchmarks.sglang_benchmarks.metrics_collector import (
         BenchmarkRun, StepMetrics, RequestMetrics,
         generate_comparison_report_multi,
     )
@@ -641,7 +641,7 @@ def main():
 
 
 def _dict_to_run(d: dict):
-    from benchmarks.sglang_vs_vllm.metrics_collector import BenchmarkRun, StepMetrics, RequestMetrics
+    from benchmarks.sglang_benchmarks.metrics_collector import BenchmarkRun, StepMetrics, RequestMetrics
     run = BenchmarkRun(backend=d["backend"], model=d["model"],
                        dataset=d.get("dataset", ""), server_startup_time=d.get("server_startup_s", 0))
     run.start_time = 0.0
