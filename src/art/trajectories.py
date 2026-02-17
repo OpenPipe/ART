@@ -251,7 +251,7 @@ class TrajectoryGroup(pydantic.BaseModel):
         metadata: dict[str, MetadataValue] | None = None,
         metrics: dict[str, float | int | bool] | None = None,
         logs: list[str] | None = None,
-    ) -> Coroutine[Any, Any, "TrajectoryGroup"]: ...
+    ) -> Awaitable["TrajectoryGroup"]: ...
 
     def __new__(
         cls,

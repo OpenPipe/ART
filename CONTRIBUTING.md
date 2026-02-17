@@ -133,22 +133,4 @@ If you run into any issues, the training output is set to maximum verbosity. Cop
 
 ### Cleaning Up
 
-When you're done, you can tear down the cluster with:
-
-```bash
-uv run sky down art
-```
-
-### Adding Docs
-
-We use Mintlify to serve our docs. Here are the steps for adding a new page:
-1. Clone the ART repo
-2. Open the /docs directory in your CLI and IDE
-3. Run npx mintlify dev to start serving a local version of the docs in your browser
-4. Create a new .mdx file in the relevant directory
-5. Add a title and sidebar title (see other pages for examples)
-6. In docs.json, add a link to the new page within one of the `navigation`.`groups`
-7. Ensure everything works by navigating to and viewing the page in your browser
-8. Submit a PR
-
 When you're done, shut down your GPU instance (if using a cloud VM) or stop the local training process.

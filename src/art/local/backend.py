@@ -2,8 +2,6 @@ import asyncio
 import json
 import math
 import os
-import shutil
-import socket
 import subprocess
 from types import TracebackType
 from typing import AsyncIterator, Iterable, Literal, cast
@@ -25,7 +23,6 @@ from art.utils.output_dirs import (
     get_output_dir_from_model_properties,
     get_step_checkpoint_dir,
 )
-from art.utils.record_provenance import record_provenance
 from art.utils.s3 import (
     ExcludableOption,
     pull_model_from_s3,
@@ -271,36 +268,26 @@ class LocalBackend(Backend):
         model: AnyTrainableModel,
         config: dev.OpenAIServerConfig | None = None,
     ) -> tuple[str, str]:
-        config_dict: dict = dict(config or {})
-        server_args = dict(config_dict.get("server_args", {}))
-
-        # Avoid binding collisions on busy hosts when no explicit port is provided.
-        if "port" not in server_args:
-            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-                s.bind(("", 0))
-                server_args["port"] = s.getsockname()[1]
-        config_dict["server_args"] = server_args
-        resolved_config = cast(dev.OpenAIServerConfig, config_dict)
-
         service = await self._get_service(model)
-        host, port = await service.start_openai_server(config=resolved_config)
+        host, port = await service.start_openai_server(config=config)
 
         base_url = f"http://{host}:{port}/v1"
-        api_key = server_args.get("api_key") or "default"
+        api_key = (config or {}).get("server_args", {}).get(
+            "api_key", None
+        ) or "default"
 
         def done_callback(_: asyncio.Task[None]) -> None:
             close_proxy(self._services.pop(model.name))
 
         asyncio.create_task(
-            self._monitor_openai_server(model, base_url, api_key)
+            self._monitor_openai_server(model.name, base_url, api_key)
         ).add_done_callback(done_callback)
 
         return base_url, api_key
 
     async def _monitor_openai_server(
-        self, model: AnyTrainableModel, base_url: str, api_key: str
+        self, model_name: str, base_url: str, api_key: str
     ) -> None:
-        model_name = model.name
         openai_client = AsyncOpenAI(
             base_url=base_url,
             api_key=api_key,
@@ -335,7 +322,7 @@ class LocalBackend(Backend):
                         try:
                             # Send a health check with a short timeout
                             await openai_client.completions.create(
-                                model=self._model_inference_name(model),
+                                model=model_name,
                                 prompt="Hi",
                                 max_tokens=1,
                                 timeout=float(
@@ -527,11 +514,6 @@ class LocalBackend(Backend):
             if not os.path.exists(checkpoint_path):
                 checkpoint_path = None
 
-        # Record provenance on the latest W&B artifact
-        wandb_run = model._get_wandb_run()
-        if wandb_run is not None:
-            record_provenance(wandb_run, "local-rl")
-
         return LocalTrainResult(
             step=step,
             metrics=avg_metrics,
@@ -588,22 +570,20 @@ class LocalBackend(Backend):
                 get_model_dir(model=model, art_path=self._path), next_step
             )
 
-            # If the current checkpoint exists, copy it to the next step
+            # If the current checkpoint exists, rename it to the next step
             if os.path.exists(current_checkpoint_dir):
-                shutil.copytree(
-                    current_checkpoint_dir,
-                    next_checkpoint_dir,
-                    dirs_exist_ok=True,
-                )
+                os.rename(current_checkpoint_dir, next_checkpoint_dir)
                 print(
                     f"Advanced step from {current_step} to {next_step} (no training occurred)"
                 )
 
                 try:
-                    # Register the copied checkpoint as a new LoRA adapter
+                    # Register the renamed checkpoint as a new LoRA adapter
                     # so it's available for inference at the new step
-                    if hasattr(service, "register_lora_for_step"):
-                        await service.register_lora_for_step(  # type: ignore[attr-defined]
+                    from ..unsloth.service import UnslothService
+
+                    if isinstance(service, UnslothService):
+                        await service.register_lora_for_step(
                             next_step, next_checkpoint_dir
                         )
                 except ModuleNotFoundError:

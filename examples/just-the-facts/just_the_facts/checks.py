@@ -7,7 +7,6 @@ import tenacity
 
 load_dotenv()
 
-
 client = AsyncOpenAI(
     api_key=os.getenv("OPENROUTER_API_KEY"), base_url="https://openrouter.ai/api/v1"
 )
@@ -43,12 +42,13 @@ async def check_includes_all_facts(original_text: str, summary_text: str) -> flo
     """
 
     response = await client.chat.completions.create(
-        model="gpt-4.1",
+        model="openai/gpt-4.1",
         messages=[
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_prompt},
         ],
         response_format={"type": "json_object"},
+        max_tokens=1000,
     )
 
     parsed_response = json.loads(response.choices[0].message.content)
@@ -87,12 +87,13 @@ async def check_hallucinated_facts(original_text: str, summary_text: str) -> flo
     """
 
     response = await client.chat.completions.create(
-        model="gpt-4.1",
+        model="openai/gpt-4.1",
         messages=[
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_prompt},
         ],
         response_format={"type": "json_object"},
+        max_tokens=1000,
     )
 
     parsed_response = json.loads(response.choices[0].message.content)
@@ -129,12 +130,13 @@ async def check_has_conservative_bias(original_text: str, summary_text: str) -> 
     """
 
     response = await client.chat.completions.create(
-        model="gpt-4.1",
+        model="openai/gpt-4.1",
         messages=[
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_prompt},
         ],
         response_format={"type": "json_object"},
+        max_tokens=1000,
     )
 
     parsed_response = json.loads(response.choices[0].message.content)
@@ -168,12 +170,13 @@ async def check_has_liberal_bias(original_text: str, summary_text: str) -> bool:
     {summary_text}
     """
     response = await client.chat.completions.create(
-        model="gpt-4.1",
+        model="openai/gpt-4.1",
         messages=[
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_prompt},
         ],
         response_format={"type": "json_object"},
+        max_tokens=1000,
     )
 
     parsed_response = json.loads(response.choices[0].message.content)

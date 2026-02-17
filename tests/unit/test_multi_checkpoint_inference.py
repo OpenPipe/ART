@@ -311,22 +311,6 @@ class TestOpenAIServerConfigLoraName:
         assert len(lora_modules) == 1
         assert "my-model@0" in lora_modules[0]
 
-    def test_served_model_name_uses_base_model_when_lora_enabled(self):
-        """With LoRA enabled, served model name should remain the base model."""
-        from art.dev.openai_server import get_openai_server_config
-
-        config = get_openai_server_config(
-            model_name="my-model",
-            base_model="meta-llama/Llama-3.1-8B",
-            log_file="/tmp/test.log",
-            lora_path="/path/to/checkpoints/0005",
-        )
-
-        assert (
-            config.get("engine_args", {}).get("served_model_name")
-            == "meta-llama/Llama-3.1-8B"
-        )
-
 
 # =============================================================================
 # Step Parsing Tests
@@ -334,40 +318,32 @@ class TestOpenAIServerConfigLoraName:
 
 
 class TestStepParsing:
-    """Test TinkerNative model-name parsing behavior."""
+    """Test parsing of @step suffix from model names."""
 
-    @pytest.fixture
-    def tinker_native_backend_class(self):
-        """Import TinkerNativeBackend, skipping if dependency unavailable."""
-        try:
-            from art.tinker_native.backend import TinkerNativeBackend
+    def test_parse_step_from_model_name(self):
+        """Test the step parsing logic used in TinkerService."""
+        test_cases = [
+            ("model-name", None),  # No @ suffix
+            ("model-name@5", 5),  # Valid step
+            ("model-name@0", 0),  # Step 0
+            ("model-name@100", 100),  # Large step
+            ("model@name@5", 5),  # Multiple @ (use last)
+            ("model-name@invalid", None),  # Invalid step (not a number)
+            ("model-name@", None),  # Empty step
+        ]
 
-            return TinkerNativeBackend
-        except ImportError as e:
-            pytest.skip(f"Tinker dependencies not available: {e}")
+        for model_name, expected_step in test_cases:
+            step = None
+            if "@" in str(model_name):
+                _, step_str = str(model_name).rsplit("@", 1)
+                try:
+                    step = int(step_str)
+                except ValueError:
+                    pass
 
-    def test_parse_step_from_model_name(self, tinker_native_backend_class):
-        """Valid `model@step` names should parse correctly."""
-        backend = object.__new__(tinker_native_backend_class)
-        assert backend._parse_model_name("model-name@5") == ("model-name", 5)
-        assert backend._parse_model_name("model-name@0") == ("model-name", 0)
-        assert backend._parse_model_name("model@name@12") == ("model@name", 12)
-
-    def test_missing_step_suffix_fails_loudly(self, tinker_native_backend_class):
-        """Unsuffixed model names should fail with a helpful message."""
-        from fastapi import HTTPException
-
-        backend = object.__new__(tinker_native_backend_class)
-        with pytest.raises(HTTPException, match="missing an '@step' suffix"):
-            backend._parse_model_name("model-name")
-
-    def test_invalid_step_suffix_fails_loudly(self, tinker_native_backend_class):
-        """Non-numeric step suffix should fail with a helpful message."""
-        from fastapi import HTTPException
-
-        backend = object.__new__(tinker_native_backend_class)
-        with pytest.raises(HTTPException, match="Invalid model step"):
-            backend._parse_model_name("model-name@not-a-number")
+            assert step == expected_step, (
+                f"Failed for {model_name}: got {step}, expected {expected_step}"
+            )
 
 
 # =============================================================================

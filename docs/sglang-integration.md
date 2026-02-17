@@ -81,34 +81,24 @@ this provides significant speedups.
 
 ## Installation
 
-**CRITICAL**: SGLang requires a TWO-environment architecture due to torchao version conflicts.
+**CRITICAL**: SGLang and vLLM have conflicting PyTorch dependencies. You MUST use
+separate virtual environments.
 
-### Quick Setup (Recommended)
+### vLLM Environment (Default)
+
 ```bash
-# Run the setup script (creates both environments)
-chmod +x scripts/setup_sglang.sh
-./scripts/setup_sglang.sh
+python -m venv .venv-vllm
+source .venv-vllm/bin/activate
+pip install openpipe-art[backend]
 ```
 
-### Manual Setup
+### SGLang Environment
+
 ```bash
-# 1. Main training environment (ART + Unsloth)
-python3.11 -m venv .venv
-source .venv/bin/activate
-pip install -e ".[sglang]"
-deactivate
-
-# 2. SGLang server environment (ISOLATED - no ART)
-python3.11 -m venv .venv-sglang-server
-source .venv-sglang-server/bin/activate
-pip install "sglang[srt]>=0.5.5"
-deactivate
-
-# 3. Activate main env to run training
-source .venv/bin/activate
+python -m venv .venv-sglang
+source .venv-sglang/bin/activate
+pip install openpipe-art[sglang]
 ```
-
-The SGLang backend automatically detects `.venv-sglang-server` and uses it for the inference server subprocess.
 
 ## Usage
 
@@ -203,10 +193,57 @@ await backend.register(model)
 | `disk` | ~10-20s | Preserved | Large checkpoints |
 | `restart` | ~30-60s | Lost | Single-GPU fallback |
 
+## Known Issues and Workarounds
 
+### 1. DeviceMesh Memory Imbalance Error
 
+**Symptom**: SGLang fails to start with memory imbalance error.
 
+**Solution**: Set environment variable (done automatically by SGLangBackend):
+```bash
+export SGL_DISABLE_TP_MEMORY_INBALANCE_CHECK=True
+```
 
+### 2. update_weights_from_tensor Fails with TP > 1
+
+**Reference**: [SGLang #3726](https://github.com/sgl-project/sglang/issues/3726)
+
+**Solution**: Use `weight_sync_method="lora"` or `"disk"` instead of tensor sync.
+
+### 3. OOM on Weight Update
+
+**Reference**: [SGLang #8076](https://github.com/sgl-project/sglang/issues/8076)
+
+**Solution**: Use disk-based sync or reduce `mem_fraction_static`.
+
+### 4. dp_size Must Be 1 for Weight Updates
+
+**Reference**: [SGLang #4283](https://github.com/sgl-project/sglang/issues/4283)
+
+**Solution**: Don't use data parallelism for inference (use TP instead).
+
+### 5. Garbled Output with Small Tensor Buckets
+
+**Reference**: [SGLang #14178](https://github.com/sgl-project/sglang/issues/14178)
+
+**Solution**: Use LoRA-based sync instead of tensor sync.
+
+## Performance Comparison
+
+Based on external benchmarks (H100, Llama 3.1 8B):
+
+| Metric | vLLM | SGLang | Improvement |
+|--------|------|--------|-------------|
+| Throughput (tok/s) | ~12,500 | ~16,200 | ~29% |
+| TTFT (ms) | ~45 | ~35 | ~22% |
+| P99 Latency (ms) | ~120 | ~95 | ~21% |
+
+*Source: [aimultiple.com benchmark](https://aimultiple.com/llm-inference-benchmark)*
+
+The performance advantage comes from:
+- RadixAttention's automatic prefix caching
+- Zero-overhead scheduler design
+- Optimized FlashInfer kernels
 
 ## Benchmarking Your Setup
 

@@ -143,6 +143,10 @@ class TinkerService:
             last_checkpoint_dir.with_name(f"{next_step:04d}"),
             state.training_client,
         )
+        state.sampling_clients_and_renderers[self.model_name] = (
+            new_sampling_client,
+            state.renderer,
+        )
         state.sampling_clients_and_renderers[f"{self.model_name}@{next_step}"] = (
             new_sampling_client,
             state.renderer,
@@ -219,6 +223,7 @@ class TinkerService:
             rest_client=rest_client,
             training_client=training_client,
             sampling_clients_and_renderers={
+                self.model_name: (sampling_client, renderer),
                 f"{self.model_name}@{current_step}": (sampling_client, renderer),
             },
             renderer=renderer,

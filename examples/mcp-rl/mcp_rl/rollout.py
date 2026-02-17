@@ -150,7 +150,9 @@ async def rollout(
                             )
 
                             response = await client.chat.completions.create(
-                                model=model.get_inference_name(),
+                                model=model.inference_model_name
+                                if model.inference_model_name
+                                else model.name,
                                 messages=traj.messages(),
                                 temperature=1.0,
                                 tools=tool_schemas,

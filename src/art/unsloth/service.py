@@ -543,9 +543,6 @@ class UnslothService:
             from accelerate import Accelerator
             AcceleratorState._reset_state()
             
-            # Monkey-patch Accelerator to skip device check for 4-bit models
-            # The check fails when model is on GPU 1 but Accelerator was initialized earlier
-            # We need to bypass the check BEFORE original_prepare_model runs
             original_prepare_model = Accelerator.prepare_model
             def patched_prepare_model(self, model, device_placement=None, evaluation_mode=False):
                 # For quantized models, temporarily remove the quantization flags to bypass the check

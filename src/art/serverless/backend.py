@@ -11,23 +11,9 @@ from .. import dev
 from ..backend import AnyTrainableModel, Backend
 from ..trajectories import TrajectoryGroup
 from ..types import ServerlessTrainResult, TrainConfig
-from ..utils.record_provenance import record_provenance
 
 if TYPE_CHECKING:
-    import wandb
-
     from ..model import Model, TrainableModel
-
-
-def _extract_step_from_wandb_artifact(artifact: "wandb.Artifact") -> int | None:
-    """Extract step number from a W&B artifact's aliases."""
-    for alias in artifact.aliases:
-        if alias.startswith("step"):
-            try:
-                return int(alias[4:])
-            except ValueError:
-                pass
-    return None
 
 
 class ServerlessBackend(Backend):
@@ -255,11 +241,6 @@ class ServerlessBackend(Backend):
         if model.entity is not None:
             artifact_name = f"{model.entity}/{model.project}/{model.name}:step{step}"
 
-        # Record provenance on the latest W&B artifact
-        wandb_run = model._get_wandb_run()
-        if wandb_run is not None:
-            record_provenance(wandb_run, "serverless-rl")
-
         return ServerlessTrainResult(
             step=step,
             metrics=avg_metrics,
@@ -436,58 +417,7 @@ class ServerlessBackend(Backend):
         verbose: bool = False,
         delete: bool = False,
     ) -> None:
-        """Push model checkpoints from W&B artifacts to S3.
-
-        Downloads checkpoint(s) from W&B and uploads them to S3.
-
-        Args:
-            model: The model whose checkpoints to push.
-            s3_bucket: S3 bucket name. If None, uses BACKUP_BUCKET env var.
-            prefix: Optional S3 prefix path.
-            verbose: Whether to print verbose output.
-            delete: Whether to delete files from S3 that don't exist in source.
-        """
-        from art.utils.s3 import build_s3_path, ensure_bucket_exists, s3_sync
-
-        assert model.id is not None, "Model ID is required"
-
-        # Get all checkpoint steps
-        steps: list[int] = []
-        async for checkpoint in self._client.models.checkpoints.list(  # ty:ignore[possibly-missing-attribute]
-            model_id=model.id, order="asc"
-        ):
-            steps.append(checkpoint.step)
-
-        if not steps:
-            if verbose:
-                print("No checkpoints found to push.")
-            return
-
-        await ensure_bucket_exists(s3_bucket)
-
-        for step in steps:
-            if verbose:
-                print(f"Pushing checkpoint step {step} to S3...")
-
-            # Pull from W&B to local temp dir
-            checkpoint_dir = await self._experimental_pull_model_checkpoint(
-                model,  # type: ignore[arg-type]
-                step=step,
-                verbose=verbose,
-            )
-
-            # Push to S3
-            s3_path = build_s3_path(
-                model_name=model.name,
-                project=model.project,
-                step=step,
-                s3_bucket=s3_bucket,
-                prefix=prefix,
-            )
-            await s3_sync(checkpoint_dir, s3_path, verbose=verbose, delete=delete)
-
-        if verbose:
-            print(f"Successfully pushed {len(steps)} checkpoint(s) to S3.")
+        raise NotImplementedError
 
     async def _experimental_fork_checkpoint(
         self,
@@ -499,168 +429,4 @@ class ServerlessBackend(Backend):
         verbose: bool = False,
         prefix: str | None = None,
     ) -> None:
-        """Fork a checkpoint from another model to initialize this model.
-
-        Pulls the source checkpoint from W&B artifacts (or S3 if from_s3_bucket
-        is provided) and uploads it as a W&B artifact for the destination model.
-
-        Note: This uploads the artifact directly to W&B. The ServerlessBackend's
-        checkpoint tracking may not immediately reflect the forked checkpoint
-        until the next training step.
-
-        Args:
-            model: The destination model to fork to.
-            from_model: The name of the source model to fork from.
-            from_project: The project of the source model. Defaults to model.project.
-            from_s3_bucket: Optional S3 bucket to pull the checkpoint from.
-            not_after_step: If provided, uses the latest checkpoint <= this step.
-            verbose: Whether to print verbose output.
-            prefix: Optional S3 prefix for bucket operations.
-        """
-        import os
-        import tempfile
-
-        import wandb
-
-        from_project = from_project or model.project
-
-        if from_s3_bucket is not None:
-            # Pull from S3
-            from art.utils.s3 import build_s3_path, ensure_bucket_exists, s3_sync
-            from art.utils.s3_checkpoint_utils import (
-                get_checkpoint_step_not_after_from_s3,
-                get_latest_checkpoint_step_from_s3,
-            )
-
-            if not_after_step is None:
-                target_step = await get_latest_checkpoint_step_from_s3(
-                    model_name=from_model,
-                    project=from_project,
-                    s3_bucket=from_s3_bucket,
-                    prefix=prefix,
-                )
-            else:
-                target_step = await get_checkpoint_step_not_after_from_s3(
-                    model_name=from_model,
-                    project=from_project,
-                    not_after_step=not_after_step,
-                    s3_bucket=from_s3_bucket,
-                    prefix=prefix,
-                )
-
-            if target_step is None:
-                raise ValueError(
-                    f"No suitable checkpoint found in S3 for model {from_model}"
-                )
-
-            if verbose:
-                print(f"Pulling checkpoint step {target_step} from S3...")
-
-            checkpoint_dir = os.path.join(
-                tempfile.gettempdir(),
-                "art_fork_checkpoints",
-                from_project,
-                from_model,
-                f"{target_step:04d}",
-            )
-            os.makedirs(checkpoint_dir, exist_ok=True)
-
-            s3_path = build_s3_path(
-                model_name=from_model,
-                project=from_project,
-                step=target_step,
-                s3_bucket=from_s3_bucket,
-                prefix=prefix,
-            )
-            await ensure_bucket_exists(from_s3_bucket)
-            await s3_sync(s3_path, checkpoint_dir, verbose=verbose)
-            selected_step = target_step
-        else:
-            # Pull from W&B artifacts
-            api = wandb.Api(api_key=self._client.api_key)  # ty:ignore[possibly-missing-attribute]
-            from_entity = model.entity or api.default_entity
-
-            # Iterate all artifact versions to find the best step.
-            # We avoid relying on the W&B `:latest` alias because it
-            # may not correspond to the highest training step.
-            collection_path = f"{from_entity}/{from_project}/{from_model}"
-            versions = api.artifacts("lora", collection_path)
-
-            best_step: int | None = None
-            best_artifact = None
-            for version in versions:
-                step_num = _extract_step_from_wandb_artifact(version)
-                if step_num is None:
-                    continue
-                if not_after_step is not None and step_num > not_after_step:
-                    continue
-                if best_step is None or step_num > best_step:
-                    best_step = step_num
-                    best_artifact = version
-
-            if best_step is None or best_artifact is None:
-                if not_after_step is not None:
-                    raise ValueError(
-                        f"No checkpoints found not after step {not_after_step} "
-                        f"for model {from_model}"
-                    )
-                raise ValueError(f"No checkpoints found for model {from_model}")
-            selected_step = best_step
-            artifact = best_artifact
-
-            checkpoint_dir = os.path.join(
-                tempfile.gettempdir(),
-                "art_fork_checkpoints",
-                from_project,
-                from_model,
-                f"{selected_step:04d}" if selected_step is not None else "latest",
-            )
-            os.makedirs(checkpoint_dir, exist_ok=True)
-            artifact.download(root=checkpoint_dir)
-
-            if verbose:
-                print(f"Downloaded source checkpoint step {selected_step} from W&B")
-
-        # Upload as W&B artifact for the destination model
-        assert model.entity is not None, "Model entity is required"
-
-        if verbose:
-            print(f"Uploading forked checkpoint as W&B artifact for {model.name}...")
-
-        wandb.login(key=self._client.api_key)  # ty:ignore[possibly-missing-attribute]
-        run = wandb.init(
-            project=model.project,
-            entity=model.entity,
-            job_type="checkpoint-fork",
-            name=f"fork-{from_model}-to-{model.name}",
-            settings=wandb.Settings(silent=True),
-        )
-        assert run is not None
-
-        dest_artifact = wandb.Artifact(name=model.name, type="lora")
-        dest_artifact.add_dir(checkpoint_dir)
-        aliases = ["latest"]
-        if selected_step is not None:
-            aliases.insert(0, f"step{selected_step}")
-        run.log_artifact(dest_artifact, aliases=aliases)
-        run.finish()
-
-        # Copy provenance from the source model's W&B run to the destination model
-        api = wandb.Api(api_key=self._client.api_key)  # ty:ignore[possibly-missing-attribute]
-        try:
-            source_run = api.run(f"{model.entity}/{from_project}/{from_model}")
-            source_provenance = source_run.config.get("wandb.provenance")
-            if source_provenance is not None:
-                dest_run = model._get_wandb_run()
-                if dest_run is not None:
-                    dest_run.config.update(
-                        {"wandb.provenance": list(source_provenance)}
-                    )
-        except Exception:
-            pass  # Source run may not exist (e.g., S3-only models)
-
-        if verbose:
-            print(
-                f"Successfully forked checkpoint from {from_model} "
-                f"(step {selected_step}) to {model.name}"
-            )
+        raise NotImplementedError
