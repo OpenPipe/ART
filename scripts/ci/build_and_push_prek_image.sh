@@ -158,23 +158,46 @@ dispatch_workflow() {
 
 watch_latest_run() {
   local ref="$1"
+  local dispatch_epoch="$2"
   local run_id
   local elapsed=0
   local poll_sec=5
-  local branch_args=()
-
-  if [[ ! "${ref}" =~ ^[0-9a-f]{40}$ ]]; then
-    branch_args=(--branch "${ref}")
-  fi
 
   while (( elapsed < WATCH_TIMEOUT_SEC )); do
     run_id="$(gh run list \
       --workflow "${WORKFLOW_SELECTOR}" \
-      --event workflow_dispatch \
-      "${branch_args[@]}" \
-      --limit 1 \
-      --json databaseId \
-      --jq '.[0].databaseId' 2>/dev/null || true)"
+      --limit 20 \
+      --json databaseId,event,headBranch,createdAt 2>/dev/null | \
+      RUN_LOOKUP_REF="${ref}" RUN_LOOKUP_DISPATCH_EPOCH="${dispatch_epoch}" python3 -c '
+import datetime
+import json
+import os
+import sys
+
+ref = os.environ.get("RUN_LOOKUP_REF", "")
+dispatch_epoch = int(os.environ.get("RUN_LOOKUP_DISPATCH_EPOCH", "0"))
+is_sha = len(ref) == 40 and all(c in "0123456789abcdef" for c in ref)
+payload = sys.stdin.read().strip()
+if not payload:
+    raise SystemExit(0)
+
+runs = json.loads(payload)
+for run in runs:
+    if run.get("event") != "workflow_dispatch":
+        continue
+    created = run.get("createdAt", "")
+    created_epoch = 0
+    if created.endswith("Z"):
+        created_epoch = int(datetime.datetime.fromisoformat(created.replace("Z", "+00:00")).timestamp())
+    if created_epoch < dispatch_epoch - 30:
+        continue
+    if (not is_sha) and run.get("headBranch") != ref:
+        continue
+    rid = run.get("databaseId")
+    if rid:
+        print(rid)
+        break
+' 2>/dev/null || true)"
 
     if [[ -n "${run_id}" && "${run_id}" != "null" ]]; then
       log "Watching workflow run ${run_id}."
@@ -204,6 +227,8 @@ main() {
 
   local immutable_tag="${IMAGE_REPO}:prek-megatron-${fingerprint}"
   local current_tag="${IMAGE_REPO}:prek-megatron-current"
+  local dispatch_epoch
+  dispatch_epoch="$(date +%s)"
 
   dispatch_workflow "${resolved_ref}" "${fingerprint}"
 
@@ -218,7 +243,7 @@ main() {
 MSG
 
   if [[ "${WATCH}" -eq 1 ]]; then
-    watch_latest_run "${resolved_ref}"
+    watch_latest_run "${resolved_ref}" "${dispatch_epoch}"
   fi
 }
 
