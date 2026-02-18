@@ -10,6 +10,7 @@ PYTHON_MM="${PYTHON_MM:-3.11}"
 BUILD_JOBS="${BUILD_JOBS:-auto}"
 WORKFLOW_FILE="${WORKFLOW_FILE:-build-prek-cache-image.yml}"
 WORKFLOW_SELECTOR=""
+WATCH_TIMEOUT_SEC="${WATCH_TIMEOUT_SEC:-180}"
 REF=""
 WATCH=0
 
@@ -156,13 +157,36 @@ dispatch_workflow() {
 }
 
 watch_latest_run() {
+  local ref="$1"
   local run_id
-  sleep 2
-  run_id="$(gh run list --workflow "${WORKFLOW_SELECTOR}" --event workflow_dispatch --limit 1 --json databaseId --jq '.[0].databaseId' 2>/dev/null || true)"
-  [[ -n "${run_id}" && "${run_id}" != "null" ]] || fail "Could not find dispatched run. Check with: gh run list --workflow ${WORKFLOW_SELECTOR}"
+  local elapsed=0
+  local poll_sec=5
+  local branch_args=()
 
-  log "Watching workflow run ${run_id}."
-  gh run watch "${run_id}" --exit-status
+  if [[ ! "${ref}" =~ ^[0-9a-f]{40}$ ]]; then
+    branch_args=(--branch "${ref}")
+  fi
+
+  while (( elapsed < WATCH_TIMEOUT_SEC )); do
+    run_id="$(gh run list \
+      --workflow "${WORKFLOW_SELECTOR}" \
+      --event workflow_dispatch \
+      "${branch_args[@]}" \
+      --limit 1 \
+      --json databaseId \
+      --jq '.[0].databaseId' 2>/dev/null || true)"
+
+    if [[ -n "${run_id}" && "${run_id}" != "null" ]]; then
+      log "Watching workflow run ${run_id}."
+      gh run watch "${run_id}" --exit-status
+      return
+    fi
+
+    sleep "${poll_sec}"
+    elapsed=$((elapsed + poll_sec))
+  done
+
+  fail "Could not find dispatched run after ${WATCH_TIMEOUT_SEC}s. Check with: gh run list --workflow ${WORKFLOW_SELECTOR}"
 }
 
 main() {
@@ -194,7 +218,7 @@ main() {
 MSG
 
   if [[ "${WATCH}" -eq 1 ]]; then
-    watch_latest_run
+    watch_latest_run "${resolved_ref}"
   fi
 }
 
