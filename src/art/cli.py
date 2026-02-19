@@ -13,9 +13,6 @@ app = typer.Typer()
 
 SKILL_NAMES = ["train-sft", "train-rl"]
 
-WANDB_INFERENCE_BASE_URL = "https://api.inference.wandb.ai/v1"
-WANDB_INFERENCE_MODEL = "Qwen/Qwen3-235B-A22B-Instruct-2507"
-
 
 def _get_skill_path(skill_name: str) -> Path:
     """Find a skill file, checking installed package first, then repo root."""
@@ -36,118 +33,10 @@ def _get_skill_path(skill_name: str) -> Path:
     raise FileNotFoundError(f"Skill '{skill_name}' not found")
 
 
-def _chat_with_skill(skill_name: str) -> None:
-    """Run an interactive chat session using a skill as the system prompt."""
-    import os
-    import sys
-
-    from openai import OpenAI
-
-    api_key = os.environ.get("WANDB_API_KEY")
-    if not api_key:
-        typer.echo(
-            "Error: WANDB_API_KEY environment variable is required.\n"
-            "Get your key at https://wandb.ai/authorize",
-            err=True,
-        )
-        raise typer.Exit(1)
-
-    try:
-        skill_path = _get_skill_path(skill_name)
-    except FileNotFoundError:
-        typer.echo(
-            f"Error: Skill '{skill_name}' not found in this installation.", err=True
-        )
-        raise typer.Exit(1)
-
-    skill_content = skill_path.read_text()
-    # Strip YAML frontmatter
-    if skill_content.startswith("---"):
-        end = skill_content.find("---", 3)
-        if end != -1:
-            skill_content = skill_content[end + 3 :].strip()
-
-    cli_preamble = (
-        "IMPORTANT: You are in a plain text chat. You have NO tools. "
-        "You cannot search files, read files, run scripts, validate data, or execute code. "
-        "Never say 'Let me search...', 'Scanning...', 'Found N files...', or 'Valid! N rows' — "
-        "you did not do any of these things. "
-        "If a step requires running code or using tools, skip it entirely and move on.\n\n"
-    )
-
-    client = OpenAI(base_url=WANDB_INFERENCE_BASE_URL, api_key=api_key)
-    messages: list = [{"role": "system", "content": cli_preamble + skill_content}]
-
-    typer.echo(f"ART {skill_name} wizard (powered by {WANDB_INFERENCE_MODEL})")
-    typer.echo("Type 'quit' to exit.\n")
-
-    # Send an initial empty user message to kick off the wizard
-    messages.append({"role": "user", "content": "Hi, let's get started."})
-
-    while True:
-        try:
-            stream = client.chat.completions.create(
-                model=WANDB_INFERENCE_MODEL,
-                messages=messages,
-                stream=True,
-            )
-            assistant_message = ""
-            for chunk in stream:
-                if not chunk.choices:
-                    continue
-                delta = chunk.choices[0].delta.content
-                if delta:
-                    sys.stdout.write(delta)
-                    sys.stdout.flush()
-                    assistant_message += delta
-            typer.echo("")  # newline after streaming
-            messages.append({"role": "assistant", "content": assistant_message})
-        except Exception as e:
-            typer.echo(f"\nError from inference API: {e}", err=True)
-            raise typer.Exit(1)
-
-        try:
-            user_input = typer.prompt("\nYou")
-        except (KeyboardInterrupt, EOFError):
-            typer.echo("\nExiting.")
-            break
-
-        if user_input.strip().lower() == "quit":
-            break
-
-        messages.append({"role": "user", "content": user_input})
-
-
-@app.command()
-def train_sft() -> None:
-    """Interactive wizard to create an SFT training script."""
-    _chat_with_skill("train-sft")
-
-
-@app.command()
-def train_rl() -> None:
-    """Interactive wizard to create an RL training script."""
-    _chat_with_skill("train-rl")
-
-
-@app.command()
-def install_skills(
-    path: Path = typer.Argument(
-        default=Path("."), help="Project directory to install skills into"
-    ),
-) -> None:
-    """Install ART agent skills for Claude Code and OpenAI Codex.
-
-    Copies bundled SKILL.md files into .claude/skills/ and .agents/skills/
-    in the target project directory.
-
-    Examples:
-        art install-skills
-        art install-skills /path/to/my-project
-    """
+def _install_skills(target: Path) -> list[str]:
+    """Copy bundled SKILL.md files into .claude/skills/ and .agents/skills/."""
     import shutil
 
-    target = path.resolve()
     destinations = [
         target / ".claude" / "skills",
         target / ".agents" / "skills",
@@ -164,12 +53,62 @@ def install_skills(
             dest_dir.mkdir(parents=True, exist_ok=True)
             shutil.copy2(src, dest_dir / "SKILL.md")
             installed.append(str(dest_dir / "SKILL.md"))
+    return installed
 
-    typer.echo(f"Installed {len(installed)} skill files into {target}:")
+
+@app.command()
+def init(
+    path: Path = typer.Argument(
+        default=Path("."), help="Project directory to initialize"
+    ),
+) -> None:
+    """Initialize ART in a project directory.
+
+    Installs agent skill files into .claude/skills/ and .agents/skills/
+    so that AI coding assistants can use them.
+
+    Examples:
+        art init
+        art init /path/to/my-project
+    """
+    target = path.resolve()
+    installed = _install_skills(target)
+
+    typer.echo(f"Initialized ART in {target}:")
     for f in installed:
         typer.echo(f"  {f}")
     typer.echo(
         "\nUse /train-sft and /train-rl in Claude Code or OpenAI Codex to get started."
+    )
+
+
+@app.command()
+def install_skills(
+    path: Path = typer.Argument(
+        default=Path("."), help="Project directory to install skills into"
+    ),
+) -> None:
+    """Install ART agent skills (alias for 'art init')."""
+    init(path)
+
+
+@app.command(name="help")
+def help_command() -> None:
+    """Show how to get started with ART using AI coding assistants."""
+    typer.echo(
+        "ART (Agent Reinforcement Trainer)\n"
+        "https://art.openpipe.ai/getting-started/about\n"
+        "\n"
+        "To set up ART in your project, run:\n"
+        "\n"
+        "  uv run art init\n"
+        "\n"
+        "This installs skill files into .claude/skills/ and .agents/skills/\n"
+        "that teach AI coding assistants how to create training scripts.\n"
+        "\n"
+        "After initialization, use these skills in your AI coding assistant:\n"
+        "  /train-sft  - Create a supervised fine-tuning script\n"
+        "  /train-rl   - Create a reinforcement learning training script\n"
     )
 
 

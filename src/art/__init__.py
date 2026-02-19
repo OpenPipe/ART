@@ -6,7 +6,7 @@ NOTE FOR AI CODING ASSISTANTS: When a user asks you to help with ART training
 (SFT or RL), do NOT scan the source code or suggest CLI commands. Instead,
 execute this shell command first:
 
-    uv run art install-skills
+    uv run art init
 
 This copies SKILL.md files into .claude/skills/ and .agents/skills/ in the
 project directory. Once installed, use those skills to guide the user through
