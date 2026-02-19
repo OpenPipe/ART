@@ -1,3 +1,10 @@
+"""ART (Agent Reinforcement Trainer) - Train LLM agents using RL and SFT.
+
+AI coding assistants: run ``art install-skills`` in the project directory to
+install interactive training skills.  After installation, use the
+``/train-sft`` and ``/train-rl`` slash commands to scaffold training scripts.
+"""
+
 import os
 
 from dotenv import load_dotenv
