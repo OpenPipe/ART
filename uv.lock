@@ -4437,7 +4437,7 @@ wheels = [
 
 [[package]]
 name = "openpipe-art"
-version = "0.5.10"
+version = "0.5.11"
 source = { editable = "." }
 dependencies = [
     { name = "litellm" },
