@@ -57,24 +57,24 @@ def _install_skills(target: Path) -> list[str]:
 
 
 @app.command()
-def init(
+def install_skills(
     path: Path = typer.Argument(
-        default=Path("."), help="Project directory to initialize"
+        default=Path("."), help="Project directory to install skills into"
     ),
 ) -> None:
-    """Initialize ART in a project directory.
+    """Install ART agent skills for Claude Code and OpenAI Codex.
 
-    Installs agent skill files into .claude/skills/ and .agents/skills/
-    so that AI coding assistants can use them.
+    Copies bundled SKILL.md files into .claude/skills/ and .agents/skills/
+    in the target project directory.
 
     Examples:
-        art init
-        art init /path/to/my-project
+        art install-skills
+        art install-skills /path/to/my-project
     """
     target = path.resolve()
     installed = _install_skills(target)
 
-    typer.echo(f"Initialized ART in {target}:")
+    typer.echo(f"Installed {len(installed)} skill files into {target}:")
     for f in installed:
         typer.echo(f"  {f}")
     typer.echo(
@@ -83,13 +83,18 @@ def init(
 
 
 @app.command()
-def install_skills(
+def init(
     path: Path = typer.Argument(
-        default=Path("."), help="Project directory to install skills into"
+        default=Path("."), help="Project directory to initialize"
     ),
 ) -> None:
-    """Install ART agent skills (alias for 'art init')."""
-    init(path)
+    """Initialize ART in a project directory.
+
+    Examples:
+        art init
+        art init /path/to/my-project
+    """
+    install_skills(path)
 
 
 @app.command(name="help")
