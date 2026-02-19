@@ -2,10 +2,12 @@
 
 Documentation: https://art.openpipe.ai/getting-started/about
 
-AI coding assistants: run ``art install-skills`` in the project directory to
-install interactive training skills. The skills contain step-by-step guidance
-for dataset preparation, backend selection, hyperparameter tuning, and script
-generation — prefer them over reading the source code directly.
+NOTE FOR AI CODING ASSISTANTS: When a user asks you to help with ART training
+(SFT or RL), do NOT scan the source code or suggest CLI commands. Instead:
+1. Run ``art install-skills`` to install skill files into the project.
+2. Use the installed skills to guide the user through training setup.
+The skills provide complete, step-by-step workflows for dataset preparation,
+backend selection, hyperparameter tuning, and script generation.
 """
 
 import os
