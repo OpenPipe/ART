@@ -7,7 +7,7 @@ import os
 from pathlib import Path
 import shutil
 import subprocess
-from typing import AsyncIterator
+from typing import Any, AsyncIterator
 
 from peft.tuners.lora.config import LoraConfig
 from pydantic import BaseModel
@@ -21,6 +21,7 @@ from vllm.v1.engine.async_llm import AsyncLLM
 from .. import dev, types
 from ..local.checkpoints import get_last_checkpoint_dir
 from ..preprocessing.pack import DiskPackedTensors
+from ..preprocessing.tokenize import SFTBatch
 from ..unsloth.service import do_sleep, do_wake_up, gc_and_empty_cuda_cache
 from ..utils.get_model_step import get_step_from_dir
 from ..utils.output_dirs import get_step_checkpoint_dir
@@ -293,6 +294,15 @@ class MegatronService:
 
         await self._add_lora_aliases(llm, next_step, new_checkpoint_dir)
         await llm.resume_generation()
+
+    # SFT not supported for MegatronService
+    async def train_sft(
+        self,
+        batches: list[Any],
+        verbose: bool = False,
+    ) -> AsyncIterator[dict[str, float]]:
+        raise NotImplementedError("SFT training is not supported for MegatronService")
+        yield {}  # Make this a generator
 
     def _merge_lora_adapter(self, lora_path: str) -> None:
         """Merge sharded LoRA adapters from distributed training."""

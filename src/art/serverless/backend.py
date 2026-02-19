@@ -1,5 +1,5 @@
 import asyncio
-from typing import TYPE_CHECKING, AsyncIterator, Iterable, Literal
+from typing import TYPE_CHECKING, Any, AsyncIterator, Iterable, Literal
 import warnings
 
 from openai._types import NOT_GIVEN
@@ -9,11 +9,25 @@ from art.serverless.client import Client, ExperimentalTrainingConfig
 
 from .. import dev
 from ..backend import AnyTrainableModel, Backend
-from ..trajectories import TrajectoryGroup
-from ..types import ServerlessTrainResult, TrainConfig
+from ..trajectories import Trajectory, TrajectoryGroup
+from ..types import ServerlessTrainResult, TrainConfig, TrainSFTConfig
+from ..utils.record_provenance import record_provenance
 
 if TYPE_CHECKING:
+    import wandb
+
     from ..model import Model, TrainableModel
+
+
+def _extract_step_from_wandb_artifact(artifact: "wandb.Artifact") -> int | None:
+    """Extract step number from a W&B artifact's aliases."""
+    for alias in artifact.aliases:
+        if alias.startswith("step"):
+            try:
+                return int(alias[4:])
+            except ValueError:
+                pass
+    return None
 
 
 class ServerlessBackend(Backend):
@@ -53,6 +67,7 @@ class ServerlessBackend(Backend):
         )
         model.id = client_model.id
         model.entity = client_model.entity
+        model.run_id = client_model.run_id
 
     async def delete(
         self,
@@ -241,6 +256,11 @@ class ServerlessBackend(Backend):
         if model.entity is not None:
             artifact_name = f"{model.entity}/{model.project}/{model.name}:step{step}"
 
+        # Record provenance on the latest W&B artifact
+        wandb_run = model._get_wandb_run()
+        if wandb_run is not None:
+            record_provenance(wandb_run, "serverless-rl")
+
         return ServerlessTrainResult(
             step=step,
             metrics=avg_metrics,
@@ -300,6 +320,175 @@ class ServerlessBackend(Backend):
                         "error_message", "Training failed with an unknown error"
                     )
                     raise RuntimeError(f"Training job failed: {error_message}")
+                after = event.id
+
+    async def _train_sft(
+        self,
+        model: AnyTrainableModel,
+        trajectories: Iterable[Trajectory],
+        config: TrainSFTConfig,
+        dev_config: dev.TrainSFTConfig,
+        verbose: bool = False,
+    ) -> AsyncIterator[dict[str, float]]:
+        """Train the model using supervised fine-tuning.
+
+        For ServerlessBackend, this serializes trajectories to a JSONL file,
+        uploads it to W&B artifacts, and calls the SFT training API.
+
+        Args:
+            model: The trainable model to fine-tune.
+            trajectories: Iterable of Trajectory objects.
+            config: SFT configuration with batch_size and learning rates.
+            dev_config: Developer configuration.
+            verbose: Whether to print detailed logs.
+
+        Yields:
+            Dictionary containing training metrics for each batch.
+        """
+        import json
+        import tempfile
+        import uuid
+
+        import wandb
+
+        assert model.id is not None, "Model ID is required"
+
+        # Get the user's default entity from W&B if not set
+        if model.entity is None:
+            api = wandb.Api(api_key=self._client.api_key)
+            model.entity = api.default_entity
+
+        # Generate unique artifact name to avoid race conditions in distributed systems
+        artifact_id = uuid.uuid4().hex[:12]
+        artifact_name = f"{model.name}-sft-data-{artifact_id}"
+
+        if verbose:
+            print("Serializing trajectories to file (streaming)...")
+
+        # Serialize trajectories to a temporary JSONL file (streaming - no memory load)
+        num_trajectories = 0
+        with tempfile.NamedTemporaryFile(
+            mode="w", suffix=".jsonl", delete=False
+        ) as tmp_file:
+            for trajectory in trajectories:
+                # Convert trajectory to the expected JSONL format
+                line: dict[str, Any] = {
+                    "messages": trajectory.messages(),
+                }
+                if trajectory.tools:
+                    line["tools"] = trajectory.tools
+                tmp_file.write(json.dumps(line) + "\n")
+                num_trajectories += 1
+            tmp_file_path = tmp_file.name
+
+        if num_trajectories == 0:
+            if verbose:
+                print("No trajectories to train on")
+            import os
+
+            os.unlink(tmp_file_path)
+            return
+
+        if verbose:
+            print(f"Serialized {num_trajectories} trajectories")
+
+        try:
+            if verbose:
+                print("Uploading training data to W&B artifacts...")
+
+            # Upload the file to W&B as a dataset artifact
+            # Use the model's canonical run_id from database, or fall back to model name
+            run = wandb.init(
+                name=model.name,
+                id=model.run_id
+                or model.name,  # Use stored run_id to match the canonical wandb run
+                entity=model.entity,
+                project=model.project,
+                resume="allow",  # Resume if this run already exists
+                settings=wandb.Settings(api_key=self._client.api_key),
+            )
+            try:
+                artifact = wandb.Artifact(
+                    artifact_name,
+                    type="dataset",
+                    metadata={
+                        "format": "jsonl",
+                        "num_trajectories": num_trajectories,
+                    },
+                )
+                artifact.add_file(tmp_file_path, name="train.jsonl")
+                artifact = run.log_artifact(artifact)
+                try:
+                    artifact = artifact.wait()
+                except ValueError as e:
+                    if "Unable to fetch artifact with id" in str(e):
+                        if verbose:
+                            print(f"Warning: {e}")
+                    else:
+                        raise e
+            finally:
+                # Finish the run so the workflow can resume it later
+                # The workflow uses wandb_run with resume="must" to continue this run
+                run.finish()
+        finally:
+            # Clean up temporary file
+            import os
+
+            os.unlink(tmp_file_path)
+
+        # Construct the artifact URL with unique name (v0 is the first version)
+        training_data_url = (
+            f"wandb-artifact:///{model.entity}/{model.project}/{artifact_name}:v0"
+        )
+
+        if verbose:
+            print(f"Training data uploaded. Artifact URL: {training_data_url}")
+            print("Starting SFT training job...")
+
+        # Create SFT training job
+        from .client import SFTTrainingConfig
+
+        sft_config: SFTTrainingConfig = {}
+        if config.batch_size != "auto":
+            sft_config["batch_size"] = config.batch_size
+        sft_config["learning_rate"] = config.learning_rate
+
+        sft_training_job = await self._client.sft_training_jobs.create(
+            model_id=model.id,
+            training_data_url=training_data_url,
+            config=sft_config,
+        )
+
+        # Poll for events
+        after: str | None = None
+        num_batches: int | None = None
+        pbar: tqdm.tqdm | None = None
+        while True:
+            await asyncio.sleep(1)
+            async for event in self._client.sft_training_jobs.events.list(
+                training_job_id=sft_training_job.id, after=after or NOT_GIVEN
+            ):
+                if event.type == "gradient_step":
+                    assert pbar is not None and num_batches is not None
+                    pbar.update(1)
+                    pbar.set_postfix(event.data)
+                    yield {**event.data, "num_gradient_steps": num_batches}
+                elif event.type == "training_started":
+                    num_batches = event.data.get("num_sequences", 0)
+                    if pbar is None:
+                        pbar = tqdm.tqdm(total=num_batches, desc="train sft")
+                    continue
+                elif event.type == "training_ended":
+                    if pbar is not None:
+                        pbar.close()
+                    return
+                elif event.type == "training_failed":
+                    if pbar is not None:
+                        pbar.close()
+                    error_message = event.data.get(
+                        "error_message", "SFT training failed with an unknown error"
+                    )
+                    raise RuntimeError(f"SFT training job failed: {error_message}")
                 after = event.id
 
     # ------------------------------------------------------------------
@@ -417,7 +606,58 @@ class ServerlessBackend(Backend):
         verbose: bool = False,
         delete: bool = False,
     ) -> None:
-        raise NotImplementedError
+        """Push model checkpoints from W&B artifacts to S3.
+
+        Downloads checkpoint(s) from W&B and uploads them to S3.
+
+        Args:
+            model: The model whose checkpoints to push.
+            s3_bucket: S3 bucket name. If None, uses BACKUP_BUCKET env var.
+            prefix: Optional S3 prefix path.
+            verbose: Whether to print verbose output.
+            delete: Whether to delete files from S3 that don't exist in source.
+        """
+        from art.utils.s3 import build_s3_path, ensure_bucket_exists, s3_sync
+
+        assert model.id is not None, "Model ID is required"
+
+        # Get all checkpoint steps
+        steps: list[int] = []
+        async for checkpoint in self._client.models.checkpoints.list(  # ty:ignore[possibly-missing-attribute]
+            model_id=model.id, order="asc"
+        ):
+            steps.append(checkpoint.step)
+
+        if not steps:
+            if verbose:
+                print("No checkpoints found to push.")
+            return
+
+        await ensure_bucket_exists(s3_bucket)
+
+        for step in steps:
+            if verbose:
+                print(f"Pushing checkpoint step {step} to S3...")
+
+            # Pull from W&B to local temp dir
+            checkpoint_dir = await self._experimental_pull_model_checkpoint(
+                model,  # type: ignore[arg-type]
+                step=step,
+                verbose=verbose,
+            )
+
+            # Push to S3
+            s3_path = build_s3_path(
+                model_name=model.name,
+                project=model.project,
+                step=step,
+                s3_bucket=s3_bucket,
+                prefix=prefix,
+            )
+            await s3_sync(checkpoint_dir, s3_path, verbose=verbose, delete=delete)
+
+        if verbose:
+            print(f"Successfully pushed {len(steps)} checkpoint(s) to S3.")
 
     async def _experimental_fork_checkpoint(
         self,
@@ -429,4 +669,168 @@ class ServerlessBackend(Backend):
         verbose: bool = False,
         prefix: str | None = None,
     ) -> None:
-        raise NotImplementedError
+        """Fork a checkpoint from another model to initialize this model.
+
+        Pulls the source checkpoint from W&B artifacts (or S3 if from_s3_bucket
+        is provided) and uploads it as a W&B artifact for the destination model.
+
+        Note: This uploads the artifact directly to W&B. The ServerlessBackend's
+        checkpoint tracking may not immediately reflect the forked checkpoint
+        until the next training step.
+
+        Args:
+            model: The destination model to fork to.
+            from_model: The name of the source model to fork from.
+            from_project: The project of the source model. Defaults to model.project.
+            from_s3_bucket: Optional S3 bucket to pull the checkpoint from.
+            not_after_step: If provided, uses the latest checkpoint <= this step.
+            verbose: Whether to print verbose output.
+            prefix: Optional S3 prefix for bucket operations.
+        """
+        import os
+        import tempfile
+
+        import wandb
+
+        from_project = from_project or model.project
+
+        if from_s3_bucket is not None:
+            # Pull from S3
+            from art.utils.s3 import build_s3_path, ensure_bucket_exists, s3_sync
+            from art.utils.s3_checkpoint_utils import (
+                get_checkpoint_step_not_after_from_s3,
+                get_latest_checkpoint_step_from_s3,
+            )
+
+            if not_after_step is None:
+                target_step = await get_latest_checkpoint_step_from_s3(
+                    model_name=from_model,
+                    project=from_project,
+                    s3_bucket=from_s3_bucket,
+                    prefix=prefix,
+                )
+            else:
+                target_step = await get_checkpoint_step_not_after_from_s3(
+                    model_name=from_model,
+                    project=from_project,
+                    not_after_step=not_after_step,
+                    s3_bucket=from_s3_bucket,
+                    prefix=prefix,
+                )
+
+            if target_step is None:
+                raise ValueError(
+                    f"No suitable checkpoint found in S3 for model {from_model}"
+                )
+
+            if verbose:
+                print(f"Pulling checkpoint step {target_step} from S3...")
+
+            checkpoint_dir = os.path.join(
+                tempfile.gettempdir(),
+                "art_fork_checkpoints",
+                from_project,
+                from_model,
+                f"{target_step:04d}",
+            )
+            os.makedirs(checkpoint_dir, exist_ok=True)
+
+            s3_path = build_s3_path(
+                model_name=from_model,
+                project=from_project,
+                step=target_step,
+                s3_bucket=from_s3_bucket,
+                prefix=prefix,
+            )
+            await ensure_bucket_exists(from_s3_bucket)
+            await s3_sync(s3_path, checkpoint_dir, verbose=verbose)
+            selected_step = target_step
+        else:
+            # Pull from W&B artifacts
+            api = wandb.Api(api_key=self._client.api_key)  # ty:ignore[possibly-missing-attribute]
+            from_entity = model.entity or api.default_entity
+
+            # Iterate all artifact versions to find the best step.
+            # We avoid relying on the W&B `:latest` alias because it
+            # may not correspond to the highest training step.
+            collection_path = f"{from_entity}/{from_project}/{from_model}"
+            versions = api.artifacts("lora", collection_path)
+
+            best_step: int | None = None
+            best_artifact = None
+            for version in versions:
+                step_num = _extract_step_from_wandb_artifact(version)
+                if step_num is None:
+                    continue
+                if not_after_step is not None and step_num > not_after_step:
+                    continue
+                if best_step is None or step_num > best_step:
+                    best_step = step_num
+                    best_artifact = version
+
+            if best_step is None or best_artifact is None:
+                if not_after_step is not None:
+                    raise ValueError(
+                        f"No checkpoints found not after step {not_after_step} "
+                        f"for model {from_model}"
+                    )
+                raise ValueError(f"No checkpoints found for model {from_model}")
+            selected_step = best_step
+            artifact = best_artifact
+
+            checkpoint_dir = os.path.join(
+                tempfile.gettempdir(),
+                "art_fork_checkpoints",
+                from_project,
+                from_model,
+                f"{selected_step:04d}" if selected_step is not None else "latest",
+            )
+            os.makedirs(checkpoint_dir, exist_ok=True)
+            artifact.download(root=checkpoint_dir)
+
+            if verbose:
+                print(f"Downloaded source checkpoint step {selected_step} from W&B")
+
+        # Upload as W&B artifact for the destination model
+        assert model.entity is not None, "Model entity is required"
+
+        if verbose:
+            print(f"Uploading forked checkpoint as W&B artifact for {model.name}...")
+
+        wandb.login(key=self._client.api_key)  # ty:ignore[possibly-missing-attribute]
+        run = wandb.init(
+            project=model.project,
+            entity=model.entity,
+            job_type="checkpoint-fork",
+            name=f"fork-{from_model}-to-{model.name}",
+            settings=wandb.Settings(silent=True),
+        )
+        assert run is not None
+
+        dest_artifact = wandb.Artifact(name=model.name, type="lora")
+        dest_artifact.add_dir(checkpoint_dir)
+        aliases = ["latest"]
+        if selected_step is not None:
+            aliases.insert(0, f"step{selected_step}")
+        run.log_artifact(dest_artifact, aliases=aliases)
+        run.finish()
+
+        # Copy provenance from the source model's W&B run to the destination model
+        api = wandb.Api(api_key=self._client.api_key)  # ty:ignore[possibly-missing-attribute]
+        try:
+            source_run = api.run(f"{model.entity}/{from_project}/{from_model}")
+            source_provenance = source_run.config.get("wandb.provenance")
+            if source_provenance is not None:
+                dest_run = model._get_wandb_run()
+                if dest_run is not None:
+                    dest_run.config.update(
+                        {"wandb.provenance": list(source_provenance)}
+                    )
+        except Exception:
+            pass  # Source run may not exist (e.g., S3-only models)
+
+        if verbose:
+            print(
+                f"Successfully forked checkpoint from {from_model} "
+                f"(step {selected_step}) to {model.name}"
+            )

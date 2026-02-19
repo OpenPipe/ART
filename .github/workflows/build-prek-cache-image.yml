@@ -1,0 +1,180 @@
+name: Build Prek Cache Image
+
+on:
+  workflow_dispatch:
+    inputs:
+      image_repo:
+        description: GHCR image repository
+        required: true
+        default: ghcr.io/openpipe/art-ci
+        type: string
+      base_image:
+        description: Base image used for prewarm build
+        required: true
+        default: pytorch/pytorch:2.9.0-cuda12.8-cudnn9-devel
+        type: string
+      python_mm:
+        description: Python major.minor for CI metadata
+        required: true
+        default: "3.11"
+        type: string
+      build_jobs:
+        description: Parallel build jobs for native builds (auto or positive integer)
+        required: true
+        default: auto
+        type: string
+      fingerprint:
+        description: Megatron fingerprint for immutable tag
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  build-and-push:
+    runs-on: art-large-runner
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Resolve build parallelism
+        id: parallelism
+        shell: bash
+        run: |
+          requested="${{ inputs.build_jobs }}"
+          mem_kib="$(awk '/MemTotal/ {print $2}' /proc/meminfo)"
+          mem_gib="$((mem_kib / 1024 / 1024))"
+
+          if [[ "${requested}" == "auto" ]]; then
+            # Keep headroom for linker and container overhead.
+            if (( mem_gib >= 28 )); then
+              jobs=4
+            elif (( mem_gib >= 20 )); then
+              jobs=3
+            elif (( mem_gib >= 14 )); then
+              jobs=2
+            else
+              jobs=1
+            fi
+          else
+            if ! [[ "${requested}" =~ ^[1-9][0-9]*$ ]]; then
+              echo "::error::build_jobs must be 'auto' or a positive integer."
+              exit 1
+            fi
+            jobs="${requested}"
+          fi
+
+          echo "jobs=${jobs}" >> "${GITHUB_OUTPUT}"
+          echo "mem_gib=${mem_gib}" >> "${GITHUB_OUTPUT}"
+          echo "Using ${jobs} parallel build jobs on ${mem_gib} GiB runner memory."
+
+      - name: Build and push image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: docker/ci-prek-cache.Dockerfile
+          push: true
+          tags: |
+            ${{ inputs.image_repo }}:prek-megatron-${{ inputs.fingerprint }}
+            ${{ inputs.image_repo }}:prek-megatron-current
+          build-args: |
+            BASE_IMAGE=${{ inputs.base_image }}
+            CI_PYTHON_MM=${{ inputs.python_mm }}
+            MEGATRON_FINGERPRINT=${{ inputs.fingerprint }}
+            BUILD_JOBS=${{ steps.parallelism.outputs.jobs }}
+          cache-from: type=gha,scope=prek-cache-image
+          cache-to: type=gha,mode=max,scope=prek-cache-image
+
+      - name: Resolve GHCR package coordinates
+        id: package
+        shell: bash
+        run: |
+          image_repo="${{ inputs.image_repo }}"
+          if [[ ! "${image_repo}" =~ ^ghcr\.io/([^/]+)/([^:@]+)$ ]]; then
+            echo "::error::image_repo must be in format ghcr.io/<owner>/<package>"
+            exit 1
+          fi
+          echo "owner=${BASH_REMATCH[1]}" >> "${GITHUB_OUTPUT}"
+          echo "package=${BASH_REMATCH[2]}" >> "${GITHUB_OUTPUT}"
+
+      - name: Prune old managed GHCR image versions
+        id: prune
+        uses: actions/github-script@v7
+        env:
+          IMAGE_OWNER: ${{ steps.package.outputs.owner }}
+          PACKAGE_NAME: ${{ steps.package.outputs.package }}
+          KEEP_COUNT: "4"
+        with:
+          script: |
+            const owner = process.env.IMAGE_OWNER;
+            const packageName = process.env.PACKAGE_NAME;
+            const keepCount = Number(process.env.KEEP_COUNT || "4");
+            const currentTag = "prek-megatron-current";
+            const immutablePrefix = "prek-megatron-";
+
+            const versions = await github.paginate(
+              github.rest.packages.getAllPackageVersionsForPackageOwnedByOrg,
+              {
+                org: owner,
+                package_type: "container",
+                package_name: packageName,
+                per_page: 100,
+              },
+            );
+
+            const managed = versions
+              .filter((version) => {
+                const tags = version.metadata?.container?.tags || [];
+                return tags.some(
+                  (tag) => tag === currentTag || tag.startsWith(immutablePrefix),
+                );
+              })
+              .sort(
+                (a, b) =>
+                  new Date(b.created_at).getTime() - new Date(a.created_at).getTime(),
+              );
+
+            const toDelete = managed.slice(keepCount);
+            for (const version of toDelete) {
+              await github.rest.packages.deletePackageVersionForPackageOwnedByOrg({
+                org: owner,
+                package_type: "container",
+                package_name: packageName,
+                package_version_id: version.id,
+              });
+            }
+
+            core.setOutput("managed_total", String(managed.length));
+            core.setOutput("deleted_count", String(toDelete.length));
+            core.setOutput("retained_count", String(Math.min(keepCount, managed.length)));
+            core.info(
+              `Managed versions: ${managed.length}; deleted: ${toDelete.length}; retained: ${Math.min(keepCount, managed.length)}.`,
+            );
+
+      - name: Summarize tags
+        run: |
+          {
+            echo "## Prek Cache Image Pushed"
+            echo ""
+            echo "- Immutable: \\`${{ inputs.image_repo }}:prek-megatron-${{ inputs.fingerprint }}\\`"
+            echo "- Current: \\`${{ inputs.image_repo }}:prek-megatron-current\\`"
+            echo "- Base image: \\`${{ inputs.base_image }}\\`"
+            echo "- Runner memory: \\`${{ steps.parallelism.outputs.mem_gib }} GiB\\`"
+            echo "- Build jobs: \\`${{ steps.parallelism.outputs.jobs }}\\`"
+            echo "- Managed versions seen: \\`${{ steps.prune.outputs.managed_total }}\\`"
+            echo "- Versions deleted: \\`${{ steps.prune.outputs.deleted_count }}\\`"
+            echo "- Versions retained: \\`${{ steps.prune.outputs.retained_count }}\\`"
+          } >> "$GITHUB_STEP_SUMMARY"

@@ -6,14 +6,13 @@ checkpoints while validation runs on older ones.
 
 The key features tested are:
 1. Model.get_inference_name() with optional step parameter
-2. TinkerState.get_sampler_client() for step-based routing
-3. ServerlessBackend._model_inference_name() with step suffix
-4. UnslothService max_loras configuration
+2. ServerlessBackend._model_inference_name() with step suffix
+3. UnslothService max_loras configuration
 """
 
 import asyncio
 from dataclasses import dataclass
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, patch
 
 import pytest
 
@@ -124,87 +123,6 @@ class TestLitellmCompletionParams:
 
         params_with_step = model.litellm_completion_params(step=3)
         assert params_with_step["model"] == "hosted_vllm/trainable-model@3"
-
-
-# =============================================================================
-# TinkerState Tests
-# =============================================================================
-
-
-class TestTinkerStateGetSamplerClient:
-    """Test TinkerState.get_sampler_client() for step-based routing."""
-
-    @pytest.fixture
-    def tinker_state_class(self):
-        """Import TinkerState, skipping if dependencies unavailable."""
-        try:
-            from art.tinker.service import TinkerState
-
-            return TinkerState
-        except ImportError as e:
-            pytest.skip(f"Tinker dependencies not available: {e}")
-
-    def test_get_sampler_client_without_step_returns_latest(self, tinker_state_class):
-        """Without step, should return client for latest_step."""
-        TinkerState = tinker_state_class
-
-        # Create mock sampler clients
-        mock_client_0 = MagicMock()
-        mock_client_5 = MagicMock()
-
-        state = TinkerState(
-            service_client=MagicMock(),
-            rest_client=MagicMock(),
-            training_client=MagicMock(),
-            sampler_clients={0: mock_client_0, 5: mock_client_5},
-            latest_step=5,
-            renderer=MagicMock(),
-        )
-
-        assert state.get_sampler_client() is mock_client_5
-        assert state.get_sampler_client(step=None) is mock_client_5
-
-    def test_get_sampler_client_with_step_returns_specific_client(
-        self, tinker_state_class
-    ):
-        """With step, should return client for that specific step."""
-        TinkerState = tinker_state_class
-
-        mock_client_0 = MagicMock()
-        mock_client_3 = MagicMock()
-        mock_client_5 = MagicMock()
-
-        state = TinkerState(
-            service_client=MagicMock(),
-            rest_client=MagicMock(),
-            training_client=MagicMock(),
-            sampler_clients={0: mock_client_0, 3: mock_client_3, 5: mock_client_5},
-            latest_step=5,
-            renderer=MagicMock(),
-        )
-
-        assert state.get_sampler_client(step=0) is mock_client_0
-        assert state.get_sampler_client(step=3) is mock_client_3
-        assert state.get_sampler_client(step=5) is mock_client_5
-
-    def test_get_sampler_client_invalid_step_raises_error(self, tinker_state_class):
-        """Invalid step should raise ValueError with available steps."""
-        TinkerState = tinker_state_class
-
-        state = TinkerState(
-            service_client=MagicMock(),
-            rest_client=MagicMock(),
-            training_client=MagicMock(),
-            sampler_clients={0: MagicMock(), 5: MagicMock()},
-            latest_step=5,
-            renderer=MagicMock(),
-        )
-
-        with pytest.raises(ValueError) as exc_info:
-            state.get_sampler_client(step=3)
-
-        assert "No sampler client for step 3" in str(exc_info.value)
-        assert "Available steps: [0, 5]" in str(exc_info.value)
 
 
 # =============================================================================

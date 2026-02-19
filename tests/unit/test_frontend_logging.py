@@ -573,3 +573,128 @@ class TestModelAttributes:
         """Verify report_metrics can be customized."""
         model = Model(name="test", project="test", report_metrics=["wandb", "custom"])
         assert model.report_metrics == ["wandb", "custom"]
+
+
+class TestTrainSFTMetricsAggregation:
+    """Test that train_sft aggregates metrics and logs once (same as RL)."""
+
+    @pytest.mark.asyncio
+    async def test_train_sft_aggregates_metrics(self, tmp_path: Path):
+        """Verify train_sft aggregates metrics from multiple batches into one log entry."""
+        model = TrainableModel(
+            name="test-sft",
+            project="test-project",
+            base_model="Qwen/Qwen2.5-0.5B-Instruct",
+            base_path=str(tmp_path),
+        )
+
+        # Mock the backend to yield multiple batch metrics
+        mock_backend = MagicMock()
+
+        async def mock_train_sft(*args, **kwargs):
+            # Simulate 3 batches with different metrics
+            yield {"loss": 1.0, "learning_rate": 1e-4, "grad_norm": 0.5}
+            yield {"loss": 0.8, "learning_rate": 1e-4, "grad_norm": 0.4}
+            yield {"loss": 0.6, "learning_rate": 1e-4, "grad_norm": 0.3}
+
+        mock_backend._train_sft = mock_train_sft
+        mock_backend._get_step = AsyncMock(return_value=1)  # Step after training
+        model._backend = mock_backend
+
+        # Create dummy trajectories
+        trajectories = [
+            Trajectory(
+                reward=0.0,
+                messages_and_choices=[
+                    {"role": "user", "content": "Hello"},
+                    {"role": "assistant", "content": "Hi!"},
+                ],
+            )
+            for _ in range(3)
+        ]
+
+        # Run train_sft
+        await model.train_sft(trajectories)
+
+        # Verify history.jsonl has exactly ONE entry (not 3)
+        history_path = tmp_path / "test-project/models/test-sft/history.jsonl"
+        assert history_path.exists(), "history.jsonl should be created"
+
+        with open(history_path) as f:
+            lines = f.readlines()
+
+        assert len(lines) == 1, f"Expected 1 log entry, got {len(lines)}"
+
+        # Verify metrics are aggregated (averaged)
+        entry = json.loads(lines[0])
+        assert entry["step"] == 1
+        assert entry["train/loss"] == pytest.approx(0.8)  # (1.0 + 0.8 + 0.6) / 3
+        assert entry["train/grad_norm"] == pytest.approx(0.4)  # (0.5 + 0.4 + 0.3) / 3
+
+    @pytest.mark.asyncio
+    async def test_train_sft_single_step_increment(self, tmp_path: Path):
+        """Verify train_sft results in single step increment regardless of batch count."""
+        model = TrainableModel(
+            name="test-sft-step",
+            project="test-project",
+            base_model="gpt-4",
+            base_path=str(tmp_path),
+        )
+
+        mock_backend = MagicMock()
+
+        async def mock_train_sft(*args, **kwargs):
+            # Simulate 5 batches
+            for i in range(5):
+                yield {"loss": 1.0 - i * 0.1}
+
+        mock_backend._train_sft = mock_train_sft
+        mock_backend._get_step = AsyncMock(return_value=1)  # Step is 1 after training
+        model._backend = mock_backend
+
+        trajectories = [
+            Trajectory(
+                reward=0.0,
+                messages_and_choices=[{"role": "user", "content": f"msg{i}"}],
+            )
+            for i in range(10)
+        ]
+
+        await model.train_sft(trajectories)
+
+        # Verify only one log entry at step 1
+        history_path = tmp_path / "test-project/models/test-sft-step/history.jsonl"
+        df = pl.read_ndjson(str(history_path))
+
+        assert len(df) == 1, "Should have exactly 1 log entry"
+        assert df["step"][0] == 1, "Step should be 1 (single increment)"
+
+    @pytest.mark.asyncio
+    async def test_train_sft_no_metrics_when_empty(self, tmp_path: Path):
+        """Verify train_sft handles empty training gracefully."""
+        model = TrainableModel(
+            name="test-sft-empty",
+            project="test-project",
+            base_model="gpt-4",
+            base_path=str(tmp_path),
+        )
+
+        mock_backend = MagicMock()
+
+        async def mock_train_sft(*args, **kwargs):
+            # No batches yielded (empty training)
+            return
+            yield  # Make it a generator
+
+        mock_backend._train_sft = mock_train_sft
+        model._backend = mock_backend
+
+        trajectories = []
+
+        await model.train_sft(trajectories)
+
+        # Verify no history.jsonl created (no metrics to log)
+        history_path = tmp_path / "test-project/models/test-sft-empty/history.jsonl"
+        assert not history_path.exists(), (
+            "No history.jsonl should be created for empty training"
+        )

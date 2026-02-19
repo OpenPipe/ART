@@ -40,7 +40,7 @@ class Trajectory(pydantic.BaseModel):
     messages_and_choices: MessagesAndChoices
     tools: Tools | None = None
     additional_histories: list[History] = []
-    reward: float
+    reward: float = 0.0
     initial_policy_version: int | None = None
     final_policy_version: int | None = None
     metrics: dict[str, float | int | bool] = {}

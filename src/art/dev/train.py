@@ -27,3 +27,7 @@ positive advantages. Defaults to 0.0 (perfectly balanced)."""
     scale_learning_rate_by_reward_std_dev: bool
     scale_rewards: bool
     truncated_importance_sampling: float | None
+
+
+class TrainSFTConfig(TypedDict, total=False):
+    """Experimental SFT configuration options. Use at your own risk."""

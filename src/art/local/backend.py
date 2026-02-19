@@ -10,6 +10,7 @@ import warnings
 import aiohttp
 import numpy as np
 from openai import AsyncOpenAI
+import polars as pl
 import torch
 from tqdm import auto as tqdm
 from transformers import AutoImageProcessor, AutoTokenizer
@@ -39,9 +40,12 @@ from ..preprocessing.pack import (
     packed_tensors_to_dir,
     plot_packed_tensors,
 )
-from ..preprocessing.tokenize import tokenize_trajectory_groups
+from ..preprocessing.tokenize import (
+    tokenize_sft_batch,
+    tokenize_trajectory_groups,
+)
 from ..trajectories import Trajectory, TrajectoryGroup
-from ..types import LocalTrainResult, Message, TrainConfig
+from ..types import LocalTrainResult, Message, TrainConfig, TrainSFTConfig
 from ..utils import format_message, get_model_step
 from .checkpoints import (
     delete_checkpoints,
@@ -624,6 +628,103 @@ class LocalBackend(Backend):
 
     # Note: _get_reward_std_dev_learning_rate_multiplier and _log_metrics
     # have been moved to the Model class (frontend)
+
+    async def _train_sft(
+        self,
+        model: AnyTrainableModel,
+        trajectories: Iterable[Trajectory],
+        config: TrainSFTConfig,
+        dev_config: dev.TrainSFTConfig,
+        verbose: bool = False,
+    ) -> AsyncIterator[dict[str, float]]:
+        """Train the model using supervised fine-tuning.
+
+        Args:
+            model: The trainable model to fine-tune
+            trajectories: Iterable of Trajectory objects
+            config: SFT configuration with batch_size and learning rates.
+                    If learning_rate is a list, streaming mode is used automatically.
+            dev_config: Developer configuration
+            verbose: Whether to print detailed logs
+
+        Yields:
+            Dictionary containing training metrics for each batch
+        """
+        if verbose:
+            print("Starting _train_sft")
+
+        # Get tokenizer
+        if model.base_model not in self._tokenizers:
+            self._tokenizers[model.base_model] = AutoTokenizer.from_pretrained(
+                model.base_model
+            )
+        tokenizer = self._tokenizers[model.base_model]
+
+        # Determine batch_size
+        batch_size = config.batch_size
+        if batch_size == "auto":
+            batch_size = 2  # Default to 2 for SFT
+
+        # Auto-detect instruction/response parts from model
+        from ..utils.model_config import get_instruction_response_parts
+
+        instruction_part, response_part = get_instruction_response_parts(
+            model.base_model, tokenizer
+        )
+
+        if verbose:
+            print(f"Using instruction_part: {instruction_part!r}")
+            print(f"Using response_part: {response_part!r}")
+
+        import itertools
+        from typing import Iterator
+
+        from ..preprocessing.tokenize import SFTBatch
+
+        if isinstance(config.learning_rate, list):
+            learning_rates_iter: Iterator[float] = iter(config.learning_rate)
+        else:
+            learning_rates_iter = itertools.repeat(config.learning_rate)
+
+        # Build all batches in memory
+        trajectory_list = list(trajectories)
+        batches: list[SFTBatch] = []
+        for i in range(0, len(trajectory_list), batch_size):
+            batch_trajectories = trajectory_list[i : i + batch_size]
+            batches.append(
+                tokenize_sft_batch(
+                    trajectory_batch=batch_trajectories,
+                    learning_rate=next(learning_rates_iter),
+                    tokenizer=tokenizer,
+                    instruction_part=instruction_part,
+                    response_part=response_part,
+                )
+            )
+
+        # Get the service and train
+        service = await self._get_service(model)
+
+        pbar = tqdm.tqdm(total=len(batches), desc="sft train")
+        total_trainable_tokens = 0
+        batch_count = 0
+
+        async for result in service.train_sft(batches, verbose):
+            pbar.update(1)
+            pbar.set_postfix({"loss": f"{result.get('loss', 0):.4f}"})
+            total_trainable_tokens += result.get("num_trainable_tokens", 0)
+            batch_count += 1
+            yield result
+
+        pbar.close()
+
+        if batch_count > 0 and total_trainable_tokens == 0:
+            print(
+                "WARNING: No trainable tokens found! "
+                "Check instruction_part and response_part settings."
+            )
+
+        if verbose:
+            print("_train_sft complete")
 
     # ------------------------------------------------------------------
     # Experimental support for S3

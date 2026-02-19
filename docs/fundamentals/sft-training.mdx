@@ -1,0 +1,256 @@
+---
+title: "SFT Training"
+description: "Train models using supervised fine-tuning with ART."
+sidebarTitle: "SFT Training"
+icon: "graduation-cap"
+---
+
+**Supervised fine-tuning (SFT)** trains a model on labeled chat examples rather than through trial-and-error with rewards. It's useful for **distillation** (training a smaller model on outputs from a larger teacher model), **teaching a specific output style or format**, and **warming up** a model before RL training so it starts from a stronger baseline.
+
+ART supports SFT on both `LocalBackend` and `ServerlessBackend`.
+
+## Data format
+
+SFT training data is a JSONL file where each line is a JSON object with `messages` and optionally `tools`. Here's a simple example:
+
+```json
+{
+  "messages": [
+    { "role": "system", "content": "You are a helpful assistant" },
+    { "role": "user", "content": "What is the capital of Tasmania?" },
+    { "role": "assistant", "content": "Hobart" }
+  ]
+}
+```
+
+To train on tool-call conversations, include a `tools` array and `tool_calls` in the assistant message:
+
+```json
+{
+  "messages": [
+    { "role": "system", "content": "You are a helpful assistant" },
+    { "role": "user", "content": "What's the weather in Hobart?" },
+    {
+      "role": "assistant",
+      "content": null,
+      "tool_calls": [
+        {
+          "id": "call_1",
+          "type": "function",
+          "function": {
+            "name": "get_weather",
+            "arguments": "{\"location\": \"Hobart\"}"
+          }
+        }
+      ]
+    },
+    {
+      "role": "tool",
+      "tool_call_id": "call_1",
+      "content": "15°C, partly cloudy"
+    },
+    {
+      "role": "assistant",
+      "content": "It's currently 15°C and partly cloudy in Hobart."
+    }
+  ],
+  "tools": [
+    {
+      "type": "function",
+      "function": {
+        "name": "get_weather",
+        "description": "Get current weather",
+        "parameters": {
+          "type": "object",
+          "properties": { "location": { "type": "string" } }
+        }
+      }
+    }
+  ]
+}
+```
+
+Each line must follow these rules:
+
+- **`messages`** (required) — a non-empty list of chat messages. Each message has a `role` (`system`, `user`, `assistant`, or `tool`) and `content`. The last message **must** be from the `assistant` role.
+- **`tools`** (optional) — a list of tool/function definitions, following the [OpenAI tool format](https://platform.openai.com/docs/api-reference/chat).
+
+Messages follow the [OpenAI chat format](https://platform.openai.com/docs/api-reference/chat), including support for `tool_calls` in assistant messages.
+
+<Note>
+  Only the assistant's response tokens contribute to the training loss.
+  Instruction and user tokens are automatically masked so the model learns to
+  produce better responses without memorizing prompts.
+</Note>
+
+## Training from a JSONL file
+
+For large datasets, use `train_sft_from_file`. It handles batching and applies a learning rate schedule automatically.
+
+```python
+import asyncio
+import art
+from art.local import LocalBackend
+# from art.serverless.backend import ServerlessBackend
+from art.utils.sft import train_sft_from_file
+
+async def main():
+    backend = LocalBackend()
+    # backend = ServerlessBackend()  # or use serverless for managed GPUs
+    model = art.TrainableModel(
+        name="my-sft-model",
+        project="sft-project",
+        base_model="Qwen/Qwen3-30B-A3B-Instruct-2507",
+    )
+    await model.register(backend)
+
+    await train_sft_from_file(
+        model=model,
+        file_path="data/train.jsonl",
+        epochs=3,
+        batch_size=2,
+        peak_lr=2e-4,
+        schedule_type="cosine",
+        warmup_ratio=0.1,
+        verbose=True,
+    )
+
+asyncio.run(main())
+```
+
+## Distillation
+
+Distillation trains a smaller model on completions from a larger teacher model. Generate responses from the teacher, wrap them as trajectories, and fine-tune:
+
+```python
+import asyncio
+from openai import AsyncOpenAI
+import art
+from art.local import LocalBackend
+# from art.serverless.backend import ServerlessBackend
+from art.utils.sft import create_sft_dataset_iterator
+
+TEACHER_MODEL = "z-ai/glm-5"
+
+async def main():
+    teacher_client = AsyncOpenAI(
+        api_key="your-api-key",
+        base_url="https://openrouter.ai/api/v1",
+    )
+    # Small models often produce malformed JSON or miss fields.
+    # Distilling from a larger model teaches consistent structured extraction.
+    system_prompt = "Extract {name, role, company} as JSON from the text. Return only valid JSON."
+    inputs = [
+        "Hi, I'm Sarah Chen, VP of Engineering at Acme Corp.",
+        "David Park here — senior data scientist at Globex.",
+        "I'm Maria Lopez. I lead product at Initech.",
+        "Hey, this is James Wu from Umbrella Corp, working as a DevOps engineer.",
+        "My name is Aisha Patel and I'm a research lead at DeepMind.",
+        # ... more inputs
+    ]
+
+    trajectories = []
+    for text in inputs:
+        messages = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": text},
+        ]
+        completion = await teacher_client.chat.completions.create(
+            model=TEACHER_MODEL,
+            messages=messages,
+        )
+        trajectories.append(art.Trajectory(
+            messages_and_choices=[
+                *messages,
+                {"role": "assistant", "content": completion.choices[0].message.content},
+            ],
+        ))
+
+    # Train student model on teacher outputs
+    backend = LocalBackend()
+    # backend = ServerlessBackend()  # or use serverless for managed GPUs
+    student = art.TrainableModel(
+        name="distillation-001",
+        project="sft-distillation",
+        base_model="Qwen/Qwen3-30B-A3B-Instruct-2507",
+    )
+    await student.register(backend)
+
+    # create_sft_dataset_iterator computes the LR schedule (warmup + decay) over
+    # the full dataset, then slices it correctly across chunks. Each
+    # chunk's train_sft call logs its own metrics, giving you granular
+    # loss curves instead of a single aggregated number.
+    for chunk in create_sft_dataset_iterator(trajectories, peak_lr=2e-4):
+        await student.train_sft(chunk.trajectories, chunk.config)
+
+asyncio.run(main())
+```
+
+## SFT as warmup before RL
+
+A common pattern is to run SFT first to give the model a head start, then switch to RL for further improvement. ART supports switching between SFT and RL training seamlessly within the same run:
+
+```python
+import art
+from art.local import LocalBackend
+# from art.serverless.backend import ServerlessBackend
+from art.utils.sft import train_sft_from_file
+
+async def main():
+    backend = LocalBackend()
+    # backend = ServerlessBackend()  # or use serverless for managed GPUs
+    model = art.TrainableModel(
+        name="warmup-then-rl",
+        project="my-project",
+        base_model="Qwen/Qwen3-30B-A3B-Instruct-2507",
+    )
+    await model.register(backend)
+
+    # Phase 1: SFT warmup from a dataset
+    await train_sft_from_file(
+        model=model,
+        file_path="data/train.jsonl",
+        epochs=3,
+    )
+
+    # Phase 2: RL training picks up from the SFT checkpoint
+    from my_project import rollout, scenarios
+    for step in range(await model.get_step(), 50):
+        train_groups = await art.gather_trajectory_groups(
+            [
+                art.TrajectoryGroup(rollout(model, scenario) for _ in range(8))
+                for scenario in scenarios
+            ]
+        )
+        await model.train(train_groups)
+```
+
+This works because both SFT and RL train the same LoRA adapter. After SFT completes, RL continues from the updated weights.
+
+## Local vs Serverless
+
+Both backends support SFT with the same API. The key differences are in how training executes:
+
+|                 | LocalBackend                         | ServerlessBackend                                  |
+| --------------- | ------------------------------------ | -------------------------------------------------- |
+| **Execution**   | Trains on your local GPU             | Sends data to remote managed GPUs                  |
+| **Checkpoints** | Saved as LoRA adapters in `.art/`    | Stored as W&B Artifacts                            |
+| **Inference**   | You deploy the LoRA adapter yourself | Production-ready inference endpoint out of the box |
+| **Best for**    | Development, iteration, full control | Production, no local GPU, large-scale training     |
+
+The `ServerlessBackend` requires a W&B API key. See the [backend docs](/fundamentals/art-backend) for setup instructions.
+
+```python
+# Serverless — same API, training runs remotely
+from art.serverless.backend import ServerlessBackend
+
+backend = ServerlessBackend()  # uses WANDB_API_KEY env var
+model = art.TrainableModel(
+    name="my-sft-model",
+    project="sft-project",
+    base_model="Qwen/Qwen3-30B-A3B-Instruct-2507",
+)
+await model.register(backend)
+
+await model.train_sft(trajectories, config=art.TrainSFTConfig(learning_rate=5e-5))
+```

@@ -1,8 +1,8 @@
 from typing import TYPE_CHECKING, Any, AsyncIterator, Iterable, Protocol, TypeAlias
 
 from . import dev
-from .trajectories import TrajectoryGroup
-from .types import TrainConfig, TrainResult
+from .trajectories import Trajectory, TrajectoryGroup
+from .types import TrainConfig, TrainResult, TrainSFTConfig
 
 if TYPE_CHECKING:
     from .model import Model, TrainableModel
@@ -48,5 +48,14 @@ class Backend(Protocol):
         trajectory_groups: list[TrajectoryGroup],
         config: TrainConfig,
         dev_config: dev.TrainConfig,
+        verbose: bool = False,
+    ) -> AsyncIterator[dict[str, float]]: ...
+
+    def _train_sft(
+        self,
+        model: AnyTrainableModel,
+        trajectories: Iterable[Trajectory],
+        config: TrainSFTConfig,
+        dev_config: dev.TrainSFTConfig,
         verbose: bool = False,
     ) -> AsyncIterator[dict[str, float]]: ...

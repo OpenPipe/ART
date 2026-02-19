@@ -354,53 +354,29 @@ def tokenize_trajectory(
     )
 
 
-def tokenize_sft_batches(
-    trajectories: list[Trajectory],
-    batch_size: int,
-    learning_rates: list[float],
+def tokenize_sft_batch(
+    trajectory_batch: list[Trajectory],
+    learning_rate: float,
     tokenizer: PreTrainedTokenizerBase,
     instruction_part: str,
     response_part: str,
-) -> Generator[SFTBatch, None, None]:
-    """
-    Tokenize trajectories into batches for supervised fine-tuning.
+) -> SFTBatch:
+    """Tokenize a single batch of trajectories for SFT.
+
     Args:
-        trajectories: Flat list of trajectories
-        batch_size: Number of trajectories per batch
-        learning_rates: Learning rate for each batch
+        trajectory_batch: List of trajectories in this batch
+        learning_rate: Learning rate for this batch
         tokenizer: Tokenizer to use for encoding
-        instruction_part: Instruction template part (e.g., "User:")
-        response_part: Response template part (e.g., "Assistant:")
-    Yields:
-        SFTBatch object containing:
-            - trajectory_tensors: List of tensors for each trajectory
-            - learning_rate: Learning rate for this batch
-            - num_trajectories: Number of trajectories in this batch
-            - num_trainable_tokens: Total number of trainable tokens
+        instruction_part: Instruction template part (e.g., "<|im_start|>user")
+        response_part: Response template part (e.g., "<|im_start|>assistant")
+
+    Returns:
+        SFTBatch object for this batch
     """
-    # Import Unsloth Zoo utility for training on responses only
-    # Source: https://github.com/unslothai/unsloth-zoo/blob/main/unsloth_zoo/dataset_utils.py
-    # This function handles edge cases with tokenization (newlines, spaces, etc.)
+    import unsloth  # noqa: F401 - Must be imported first to set UNSLOTH_IS_PRESENT env var
     from unsloth_zoo.dataset_utils import train_on_responses_only
 
-    # Validate inputs
-    num_trajectories = len(trajectories)
-    num_learning_rates = len(learning_rates)
-    expected_num_batches = math.ceil(num_trajectories / batch_size)
-
-    if num_learning_rates != expected_num_batches:
-        raise ValueError(
-            f"Mismatch between trajectories and learning_rates: "
-            f"{num_trajectories} trajectories with batch_size={batch_size} "
-            f"yields {expected_num_batches} batches, but got {num_learning_rates} learning_rates"
-        )
-
-    # Handle missing pad_token_id (common for LLaMA and similar models)
-    pad_token_id = tokenizer.pad_token_id
-    if pad_token_id is None:
-        pad_token_id = tokenizer.eos_token_id
-
-    _train_on_responses_only = train_on_responses_only(
+    train_on_responses_only_fn = train_on_responses_only(
         trainer=None,
         instruction_part=instruction_part,
         response_part=response_part,
@@ -408,18 +384,27 @@ def tokenize_sft_batches(
         tokenizer=tokenizer,
         return_function=True,
     )
+    # Handle missing pad_token_id (common for LLaMA and similar models)
+    pad_token_id = tokenizer.pad_token_id
+    if pad_token_id is None:
+        pad_token_id = tokenizer.eos_token_id
 
-    # TODO Process input_ids in batch for better efficiency
-    for batch_idx, lr in enumerate(learning_rates):
-        start_idx = batch_idx * batch_size
-        end_idx = start_idx + batch_size
-        trajectory_batch = trajectories[start_idx:end_idx]
+    # First pass: tokenize all trajectories
+    tokenized_trajectories = []
+    for trajectory in trajectory_batch:
+        messages = trajectory.messages_and_choices
+        tools = trajectory.tools
 
-        # First pass: tokenize all trajectories
-        tokenized_trajectories = []
-        for trajectory in trajectory_batch:
-            messages = trajectory.messages_and_choices
-            tools = trajectory.tools
+        # Single-step tokenization: apply_chat_template with tokenize=True
+        input_ids = cast(
+            list[int],
+            tokenizer.apply_chat_template(
+                cast(Any, messages),
+                tools=cast(Any, tools),
+                tokenize=True,
+                add_generation_prompt=False,
+            ),
+        )
 
             # Single-step tokenization: apply_chat_template with tokenize=True
             input_ids_raw = tokenizer.apply_chat_template(
@@ -432,54 +417,53 @@ def tokenize_sft_batches(
                 input_ids = cast(list[int], list(input_ids_raw.input_ids))
             else:
                 input_ids = cast(list[int], list(input_ids_raw))
+        # Create attention mask (all 1s - no padding yet)
+        attention_mask = [1] * len(input_ids)
 
-            # Create attention mask (all 1s - no padding yet)
-            attention_mask = [1] * len(input_ids)
+        labels = train_on_responses_only_fn({"input_ids": [input_ids]})["labels"][0]
 
-            labels = _train_on_responses_only({"input_ids": [input_ids]})["labels"][0]
-
-            tokenized_trajectories.append(
-                {
-                    "input_ids": input_ids,
-                    "attention_mask": attention_mask,
-                    "labels": labels,
-                }
-            )
-
-        # Find max length in this batch for padding
-        max_seq_length = max(len(t["input_ids"]) for t in tokenized_trajectories)
-
-        # Second pass: pad all trajectories to max_seq_length
-        trajectory_tensors = []
-        for tokenized in tokenized_trajectories:
-            input_ids = tokenized["input_ids"]
-            attention_mask = tokenized["attention_mask"]
-            labels = tokenized["labels"]
-
-            # Pad to max_seq_length
-            padding_length = max_seq_length - len(input_ids)
-            if padding_length > 0:
-                input_ids = input_ids + [pad_token_id] * padding_length
-                attention_mask = attention_mask + [0] * padding_length
-                labels = labels + [-100] * padding_length
-
-            trajectory_tensor = {
-                "input_ids": torch.tensor([input_ids], dtype=torch.long),
-                "attention_mask": torch.tensor([attention_mask], dtype=torch.long),
-                "labels": torch.tensor([labels], dtype=torch.long),
+        tokenized_trajectories.append(
+            {
+                "input_ids": input_ids,
+                "attention_mask": attention_mask,
+                "labels": labels,
             }
-
-            trajectory_tensors.append(trajectory_tensor)
-
-        # Calculate total trainable tokens (labels != -100)
-        num_trainable_tokens = sum(
-            (tensor_dict["labels"] != -100).sum().item()
-            for tensor_dict in trajectory_tensors
         )
 
-        yield SFTBatch(
-            trajectory_tensors=trajectory_tensors,
-            learning_rate=lr,
-            num_trajectories=len(trajectory_tensors),
-            num_trainable_tokens=num_trainable_tokens,
-        )
+    # Find max length in this batch for padding
+    max_seq_length = max(len(t["input_ids"]) for t in tokenized_trajectories)
+
+    # Second pass: pad all trajectories to max_seq_length
+    trajectory_tensors = []
+    for tokenized in tokenized_trajectories:
+        input_ids = tokenized["input_ids"]
+        attention_mask = tokenized["attention_mask"]
+        labels = tokenized["labels"]
+
+        # Pad to max_seq_length
+        padding_length = max_seq_length - len(input_ids)
+        if padding_length > 0:
+            input_ids = input_ids + [pad_token_id] * padding_length
+            attention_mask = attention_mask + [0] * padding_length
+            labels = labels + [-100] * padding_length
+
+        trajectory_tensor = {
+            "input_ids": torch.tensor([input_ids], dtype=torch.long),
+            "attention_mask": torch.tensor([attention_mask], dtype=torch.long),
+            "labels": torch.tensor([labels], dtype=torch.long),
+        }
+
+        trajectory_tensors.append(trajectory_tensor)
+
+    # Calculate total trainable tokens (labels != -100)
+    num_trainable_tokens = sum(
+        (tensor_dict["labels"] != -100).sum().item()
+        for tensor_dict in trajectory_tensors
+    )
+
+    return SFTBatch(
+        trajectory_tensors=trajectory_tensors,
+        learning_rate=learning_rate,
+        num_trajectories=len(trajectory_tensors),
+        num_trainable_tokens=num_trainable_tokens,
+    )

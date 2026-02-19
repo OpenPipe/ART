@@ -1,6 +1,6 @@
 [project]
 name = "openpipe-art"
-version = "0.5.9"
+version = "0.5.11"
 description = "The OpenPipe Agent Reinforcement Training (ART) library"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -8,7 +8,7 @@ dependencies = [
     "openai>=2.14.0",
     "typer>=0.15.2",
     "litellm>=1.71.1",
-    "weave>=0.52.23",
+    "weave>=0.52.24",
     "polars>=1.26.0",
     "tblib>=3.0.0",
     "nest-asyncio>=1.6.0",
@@ -30,7 +30,7 @@ backend = [
     "accelerate==1.7.0",
     "awscli>=1.38.1",
     "setuptools>=78.1.0",
-    "wandb==0.23.1",
+    "wandb==0.24.0",
     "transformers>=4.55.2,<=4.57.3",
     "duckdb>=1.0.0",
     "pyarrow>=15.0.0",
@@ -100,6 +100,9 @@ allow-direct-references = true
 [tool.hatch.build.targets.wheel]
 packages = ["src/art", "src/mp_actors"]
 
+[tool.hatch.build.targets.wheel.force-include]
+".agents/skills" = "art/skills"
+
 [tool.hatch.build]
 sources = ["src"]
 
@@ -133,6 +136,10 @@ asyncio_mode = "auto"
 
 [tool.uv]
 required-version = ">=0.6.15"
+# Override numpy to <2.0 for compatibility with megatron-core in the training
+# environment. vLLM 0.15.1 pulls opencv-python-headless>=4.13 which wants
+# numpy>=2 on Python 3.9+, but megatron-core requires numpy<2.
+override-dependencies = ["numpy<2"]
 
 [tool.ty.environment]
 python-version = "3.11"
