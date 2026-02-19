@@ -15,7 +15,6 @@ from . import dev
 from .costs import CostCalculator
 from .trajectories import Trajectory, TrajectoryGroup
 from .types import TrainConfig, TrainSFTConfig
-from .utils.old_benchmarking.calculate_step_metrics import calculate_step_std_dev
 from .utils.trajectory_logging import write_trajectory_groups_parquet
 
 if TYPE_CHECKING:
@@ -638,6 +637,10 @@ class Model(
                 averages[f"group_metric_{metric}"] = sum(values) / len(values)
 
         # Calculate average standard deviation of rewards within groups
+        from .utils.old_benchmarking.calculate_step_metrics import (
+            calculate_step_std_dev,
+        )
+
         averages["reward_std_dev"] = calculate_step_std_dev(trajectory_groups)
 
         # Merge in any additional metrics passed directly

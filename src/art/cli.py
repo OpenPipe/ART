@@ -1,26 +1,10 @@
 import json
 from pathlib import Path
 import socket
-from typing import Any, AsyncIterator, Optional
+from typing import Any, AsyncIterator
 
 from dotenv import load_dotenv
-from fastapi import Body, FastAPI, Request
-from fastapi.responses import JSONResponse, StreamingResponse
-import pydantic
 import typer
-import uvicorn
-
-from . import dev
-from .errors import ARTError
-from .local import LocalBackend
-from .model import Model, TrainableModel
-from .trajectories import TrajectoryGroup
-from .types import TrainConfig
-from .utils.deployment import (
-    Provider,
-    TogetherDeploymentConfig,
-    WandbDeploymentConfig,
-)
 
 load_dotenv()
 
@@ -301,6 +285,18 @@ def migrate(
 @app.command()
 def run(host: str = "0.0.0.0", port: int = 7999) -> None:
     """Run the ART CLI."""
+
+    from fastapi import Body, FastAPI, Request
+    from fastapi.responses import JSONResponse, StreamingResponse
+    import pydantic
+    import uvicorn
+
+    from . import dev
+    from .errors import ARTError
+    from .local import LocalBackend
+    from .model import Model, TrainableModel
+    from .trajectories import TrajectoryGroup
+    from .types import TrainConfig
 
     # check if port is available
     def is_port_available(port: int) -> bool:
