@@ -13,21 +13,6 @@ app = typer.Typer()
 
 SKILL_NAMES = ["train-sft", "train-rl"]
 
-_ART_SECTION_START = "<!-- ART-SKILLS-START -->"
-_ART_SECTION_END = "<!-- ART-SKILLS-END -->"
-_ART_CLAUDE_MD_SECTION = f"""{_ART_SECTION_START}
-## ART (Agent Reinforcement Trainer)
-
-This project uses [OpenPipe ART](https://art.openpipe.ai) for model training.
-
-### Available skills
-- `/train-sft` - Create a supervised fine-tuning script
-- `/train-rl` - Create a reinforcement learning training script
-
-Use these skills instead of writing training code from scratch.
-{_ART_SECTION_END}
-"""
-
 WANDB_INFERENCE_BASE_URL = "https://api.inference.wandb.ai/v1"
 WANDB_INFERENCE_MODEL = "Qwen/Qwen3-235B-A22B-Instruct-2507"
 
@@ -145,35 +130,6 @@ def train_rl() -> None:
     _chat_with_skill("train-rl")
 
 
-def _update_claude_md(target: Path) -> bool:
-    """Create or update CLAUDE.md with the ART skills section.
-
-    Returns True if the file was created or modified.
-    """
-    import re
-
-    claude_md = target / "CLAUDE.md"
-    pattern = re.compile(
-        rf"{re.escape(_ART_SECTION_START)}.*?{re.escape(_ART_SECTION_END)}\n?",
-        re.DOTALL,
-    )
-
-    if claude_md.exists():
-        content = claude_md.read_text()
-        if pattern.search(content):
-            updated = pattern.sub(_ART_CLAUDE_MD_SECTION, content)
-            if updated == content:
-                return False
-            claude_md.write_text(updated)
-            return True
-        # Append to existing file
-        separator = "" if content.endswith("\n") else "\n"
-        claude_md.write_text(content + separator + "\n" + _ART_CLAUDE_MD_SECTION)
-    else:
-        claude_md.write_text(_ART_CLAUDE_MD_SECTION)
-    return True
-
-
 @app.command()
 def install_skills(
     path: Path = typer.Argument(
@@ -183,8 +139,7 @@ def install_skills(
     """Install ART agent skills for Claude Code and OpenAI Codex.
 
     Copies bundled SKILL.md files into .claude/skills/ and .agents/skills/
-    in the target project directory. Also creates or updates CLAUDE.md with
-    skill documentation so AI coding assistants can discover them.
+    in the target project directory.
 
     Examples:
         art install-skills
@@ -210,13 +165,9 @@ def install_skills(
             shutil.copy2(src, dest_dir / "SKILL.md")
             installed.append(str(dest_dir / "SKILL.md"))
 
-    claude_md_updated = _update_claude_md(target)
-
     typer.echo(f"Installed {len(installed)} skill files into {target}:")
     for f in installed:
         typer.echo(f"  {f}")
-    if claude_md_updated:
-        typer.echo(f"  {target / 'CLAUDE.md'}")
     typer.echo(
         "\nUse /train-sft and /train-rl in Claude Code or OpenAI Codex to get started."
     )
