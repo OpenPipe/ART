@@ -65,6 +65,7 @@ from .types import (
     Tools,
     TrainConfig,
     TrainResult,
+    TrainSFTConfig,
 )
 from .utils import retry
 from .yield_trajectory import capture_yielded_trajectory, yield_trajectory
@@ -87,6 +88,7 @@ __all__ = [
     "Model",
     "TrainableModel",
     "retry",
+    "TrainSFTConfig",
     "TrainConfig",
     "TrainResult",
     "Trajectory",

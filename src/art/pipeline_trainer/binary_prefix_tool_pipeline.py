@@ -234,7 +234,7 @@ async def main() -> None:
         messages: art.Messages = scenario["messages"]
         response = await openai_client.chat.completions.create(
             messages=messages,
-            model=model.name,
+            model=model.get_inference_name(),
             max_tokens=max_tokens,
             timeout=request_timeout,
             temperature=temp,

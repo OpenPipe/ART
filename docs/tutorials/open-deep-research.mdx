@@ -78,11 +78,16 @@ This is the main GRPO training loop where the model learns to optimize its resea
 
 The first training run will:
 
-- Register the model with ART.
-- Download the model checkpoint.
-- Start vLLM and the training service on your GPU.
-- Train the model for a specified number of steps.
-- Upload the final model checkpoint (if configured).
+- **Spin up a cluster with 1 or more H200 GPUs.**
+  - This usually takes about 10 minutes, but RunPod occasionally has network throughput issues that can cause the cluster to take up to 30 minutes to spin up.
+- **Register the model with ART.**
+  - This usually takes less than 5 minutes, though it can require up to 30 minutes if RunPod experiences network issues.
+- **Download the model checkpoint.**
+  - Usually takes a few minutes depending on the model size.
+- **Train the model for a specified number of steps.**
+  - Each RL step involves running the research agent on a subset of benchmark questions, and updating the model based on the rewards. We hold out another randomly-selected subset of 10 questions (10% of the total benchmark) that are never used in training that we run evaluations on every 10 steps to make sure the model is still making progress. Training time depends on the number of steps and the complexity of each research task.
+- **Upload the final model checkpoint.**
+  - This usually takes a few minutes.
 
 ### Step 5: Generate the benchmarks
 

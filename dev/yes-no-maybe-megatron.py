@@ -64,7 +64,8 @@ async def main():
         train_groups = await art.gather_trajectory_groups(
             (
                 art.TrajectoryGroup(
-                    rollout(openai_client, model.name, prompt) for _ in range(32)
+                    rollout(openai_client, model.get_inference_name(), prompt)
+                    for _ in range(32)
                 )
                 for prompt in prompts
             )

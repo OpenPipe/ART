@@ -18,15 +18,13 @@ def get_openai_server_config(
         config = OpenAIServerConfig()
     log_file = config.get("log_file", log_file)
 
-    # Build LoRA modules list for multi-checkpoint support
-    # Register under both model_name (for "current" model) and model_name@step (for specific checkpoint)
+    # Build LoRA modules list for multi-checkpoint support.
+    # Only register the explicit step-qualified name so unsuffixed
+    # trainable model names fail loudly.
     lora_modules: list[str] | None = None
     if lora_path:
         step = int(os.path.basename(lora_path))
-        lora_modules = [
-            f'{{"name": "{model_name}", "path": "{lora_path}"}}',
-            f'{{"name": "{model_name}@{step}", "path": "{lora_path}"}}',
-        ]
+        lora_modules = [f'{{"name": "{model_name}@{step}", "path": "{lora_path}"}}']
 
     server_args = ServerArgs(
         api_key="default",
@@ -38,7 +36,9 @@ def get_openai_server_config(
     server_args.update(config.get("server_args", {}))
     engine_args = EngineArgs(
         model=base_model,
-        served_model_name=model_name,
+        # Serve the base model under its own HF name when LoRA is enabled so
+        # `model.name` does not silently route to a stale/incorrect adapter.
+        served_model_name=base_model if lora_path else model_name,
         generation_config="vllm",
     )
     engine_args.update(config.get("engine_args", {}))

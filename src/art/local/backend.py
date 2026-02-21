@@ -3,6 +3,7 @@ import json
 import math
 import os
 import shutil
+import socket
 import subprocess
 from types import TracebackType
 from typing import AsyncIterator, Iterable, Literal, cast
@@ -11,6 +12,7 @@ import warnings
 import aiohttp
 import numpy as np
 from openai import AsyncOpenAI
+import polars as pl
 import torch
 from tqdm import auto as tqdm
 from transformers import AutoImageProcessor, AutoTokenizer
@@ -41,9 +43,12 @@ from ..preprocessing.pack import (
     packed_tensors_to_dir,
     plot_packed_tensors,
 )
-from ..preprocessing.tokenize import tokenize_trajectory_groups
+from ..preprocessing.tokenize import (
+    tokenize_sft_batch,
+    tokenize_trajectory_groups,
+)
 from ..trajectories import Trajectory, TrajectoryGroup
-from ..types import LocalTrainResult, Message, TrainConfig
+from ..types import LocalTrainResult, Message, TrainConfig, TrainSFTConfig
 from ..utils import format_message, get_model_step
 from .checkpoints import (
     delete_checkpoints,
@@ -270,26 +275,36 @@ class LocalBackend(Backend):
         model: AnyTrainableModel,
         config: dev.OpenAIServerConfig | None = None,
     ) -> tuple[str, str]:
+        config_dict: dict = dict(config or {})
+        server_args = dict(config_dict.get("server_args", {}))
+
+        # Avoid binding collisions on busy hosts when no explicit port is provided.
+        if "port" not in server_args:
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+                s.bind(("", 0))
+                server_args["port"] = s.getsockname()[1]
+        config_dict["server_args"] = server_args
+        resolved_config = cast(dev.OpenAIServerConfig, config_dict)
+
         service = await self._get_service(model)
-        host, port = await service.start_openai_server(config=config)
+        host, port = await service.start_openai_server(config=resolved_config)
 
         base_url = f"http://{host}:{port}/v1"
-        api_key = (config or {}).get("server_args", {}).get(
-            "api_key", None
-        ) or "default"
+        api_key = server_args.get("api_key") or "default"
 
         def done_callback(_: asyncio.Task[None]) -> None:
             close_proxy(self._services.pop(model.name))
 
         asyncio.create_task(
-            self._monitor_openai_server(model.name, base_url, api_key)
+            self._monitor_openai_server(model, base_url, api_key)
         ).add_done_callback(done_callback)
 
         return base_url, api_key
 
     async def _monitor_openai_server(
-        self, model_name: str, base_url: str, api_key: str
+        self, model: AnyTrainableModel, base_url: str, api_key: str
     ) -> None:
+        model_name = model.name
         openai_client = AsyncOpenAI(
             base_url=base_url,
             api_key=api_key,
@@ -324,7 +339,7 @@ class LocalBackend(Backend):
                         try:
                             # Send a health check with a short timeout
                             await openai_client.completions.create(
-                                model=model_name,
+                                model=self._model_inference_name(model),
                                 prompt="Hi",
                                 max_tokens=1,
                                 timeout=float(
@@ -460,11 +475,6 @@ class LocalBackend(Backend):
         """
         groups_list = list(trajectory_groups)
 
-        # Record provenance in W&B
-        wandb_run = model._get_wandb_run()
-        if wandb_run is not None:
-            record_provenance(wandb_run, "local-rl")
-
         # Build config objects from explicit kwargs
         config = TrainConfig(learning_rate=learning_rate, beta=beta)
         dev_config: dev.TrainConfig = {
@@ -520,6 +530,11 @@ class LocalBackend(Backend):
             )
             if not os.path.exists(checkpoint_path):
                 checkpoint_path = None
+
+        # Record provenance on the latest W&B artifact
+        wandb_run = model._get_wandb_run()
+        if wandb_run is not None:
+            record_provenance(wandb_run, "local-rl")
 
         return LocalTrainResult(
             step=step,
@@ -633,6 +648,103 @@ class LocalBackend(Backend):
 
     # Note: _get_reward_std_dev_learning_rate_multiplier and _log_metrics
     # have been moved to the Model class (frontend)
+
+    async def _train_sft(
+        self,
+        model: AnyTrainableModel,
+        trajectories: Iterable[Trajectory],
+        config: TrainSFTConfig,
+        dev_config: dev.TrainSFTConfig,
+        verbose: bool = False,
+    ) -> AsyncIterator[dict[str, float]]:
+        """Train the model using supervised fine-tuning.
+
+        Args:
+            model: The trainable model to fine-tune
+            trajectories: Iterable of Trajectory objects
+            config: SFT configuration with batch_size and learning rates.
+                    If learning_rate is a list, streaming mode is used automatically.
+            dev_config: Developer configuration
+            verbose: Whether to print detailed logs
+
+        Yields:
+            Dictionary containing training metrics for each batch
+        """
+        if verbose:
+            print("Starting _train_sft")
+
+        # Get tokenizer
+        if model.base_model not in self._tokenizers:
+            self._tokenizers[model.base_model] = AutoTokenizer.from_pretrained(
+                model.base_model
+            )
+        tokenizer = self._tokenizers[model.base_model]
+
+        # Determine batch_size
+        batch_size = config.batch_size
+        if batch_size == "auto":
+            batch_size = 2  # Default to 2 for SFT
+
+        # Auto-detect instruction/response parts from model
+        from ..utils.model_config import get_instruction_response_parts
+
+        instruction_part, response_part = get_instruction_response_parts(
+            model.base_model, tokenizer
+        )
+
+        if verbose:
+            print(f"Using instruction_part: {instruction_part!r}")
+            print(f"Using response_part: {response_part!r}")
+
+        import itertools
+        from typing import Iterator
+
+        from ..preprocessing.tokenize import SFTBatch
+
+        if isinstance(config.learning_rate, list):
+            learning_rates_iter: Iterator[float] = iter(config.learning_rate)
+        else:
+            learning_rates_iter = itertools.repeat(config.learning_rate)
+
+        # Build all batches in memory
+        trajectory_list = list(trajectories)
+        batches: list[SFTBatch] = []
+        for i in range(0, len(trajectory_list), batch_size):
+            batch_trajectories = trajectory_list[i : i + batch_size]
+            batches.append(
+                tokenize_sft_batch(
+                    trajectory_batch=batch_trajectories,
+                    learning_rate=next(learning_rates_iter),
+                    tokenizer=tokenizer,
+                    instruction_part=instruction_part,
+                    response_part=response_part,
+                )
+            )
+
+        # Get the service and train
+        service = await self._get_service(model)
+
+        pbar = tqdm.tqdm(total=len(batches), desc="sft train")
+        total_trainable_tokens = 0
+        batch_count = 0
+
+        async for result in service.train_sft(batches, verbose):
+            pbar.update(1)
+            pbar.set_postfix({"loss": f"{result.get('loss', 0):.4f}"})
+            total_trainable_tokens += result.get("num_trainable_tokens", 0)
+            batch_count += 1
+            yield result
+
+        pbar.close()
+
+        if batch_count > 0 and total_trainable_tokens == 0:
+            print(
+                "WARNING: No trainable tokens found! "
+                "Check instruction_part and response_part settings."
+            )
+
+        if verbose:
+            print("_train_sft complete")
 
     # ------------------------------------------------------------------
     # Experimental support for S3

@@ -19,7 +19,7 @@ async def rollout(model: art.TrainableModel, prompt: str) -> art.Trajectory:
     client = model.openai_client()
     chat_completion = await client.chat.completions.create(
         messages=messages,
-        model=model.name,
+        model=model.get_inference_name(),
         max_tokens=100,
         timeout=100,
         extra_body={"chat_template_kwargs": {"enable_thinking": False}},

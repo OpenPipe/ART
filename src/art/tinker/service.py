@@ -6,7 +6,7 @@ import os
 from pathlib import Path
 import shutil
 import time
-from typing import AsyncIterator, Generator
+from typing import Any, AsyncIterator, Generator
 
 import tinker
 from tinker.lib.public_interfaces.rest_client import RestClient as TinkerRestClient
@@ -22,6 +22,7 @@ from ..preprocessing.pack import (
     DiskPackedTensors,
     packed_tensors_from_dir,
 )
+from ..preprocessing.tokenize import SFTBatch
 from .server import OpenAICompatibleTinkerServer
 
 
@@ -143,14 +144,19 @@ class TinkerService:
             last_checkpoint_dir.with_name(f"{next_step:04d}"),
             state.training_client,
         )
-        state.sampling_clients_and_renderers[self.model_name] = (
-            new_sampling_client,
-            state.renderer,
-        )
         state.sampling_clients_and_renderers[f"{self.model_name}@{next_step}"] = (
             new_sampling_client,
             state.renderer,
         )
+
+    # SFT not supported for TinkerService
+    async def train_sft(
+        self,
+        batches: list[Any],
+        verbose: bool = False,
+    ) -> AsyncIterator[dict[str, float]]:
+        raise NotImplementedError("SFT training is not supported for TinkerService")
+        yield {}  # Make this a generator
 
     async def delete_checkpoints(self, steps_to_keep: list[int]) -> None:
         state = await self._state_task
@@ -223,7 +229,6 @@ class TinkerService:
             rest_client=rest_client,
             training_client=training_client,
             sampling_clients_and_renderers={
-                self.model_name: (sampling_client, renderer),
                 f"{self.model_name}@{current_step}": (sampling_client, renderer),
             },
             renderer=renderer,

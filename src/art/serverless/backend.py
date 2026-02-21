@@ -1,5 +1,5 @@
 import asyncio
-from typing import TYPE_CHECKING, AsyncIterator, Iterable, Literal
+from typing import TYPE_CHECKING, Any, AsyncIterator, Iterable, Literal
 import warnings
 
 from openai._types import NOT_GIVEN
@@ -9,8 +9,8 @@ from art.serverless.client import Client, ExperimentalTrainingConfig
 
 from .. import dev
 from ..backend import AnyTrainableModel, Backend
-from ..trajectories import TrajectoryGroup
-from ..types import ServerlessTrainResult, TrainConfig
+from ..trajectories import Trajectory, TrajectoryGroup
+from ..types import ServerlessTrainResult, TrainConfig, TrainSFTConfig
 from ..utils.record_provenance import record_provenance
 
 if TYPE_CHECKING:
@@ -67,6 +67,7 @@ class ServerlessBackend(Backend):
         )
         model.id = client_model.id
         model.entity = client_model.entity
+        model.run_id = client_model.run_id
 
     async def delete(
         self,
@@ -210,11 +211,6 @@ class ServerlessBackend(Backend):
         """
         groups_list = list(trajectory_groups)
 
-        # Record provenance in W&B
-        wandb_run = model._get_wandb_run()
-        if wandb_run is not None:
-            record_provenance(wandb_run, "serverless-rl")
-
         # Build config objects from explicit kwargs
         config = TrainConfig(learning_rate=learning_rate, beta=beta)
         dev_config: dev.TrainConfig = {
@@ -259,6 +255,11 @@ class ServerlessBackend(Backend):
         artifact_name: str | None = None
         if model.entity is not None:
             artifact_name = f"{model.entity}/{model.project}/{model.name}:step{step}"
+
+        # Record provenance on the latest W&B artifact
+        wandb_run = model._get_wandb_run()
+        if wandb_run is not None:
+            record_provenance(wandb_run, "serverless-rl")
 
         return ServerlessTrainResult(
             step=step,
@@ -319,6 +320,175 @@ class ServerlessBackend(Backend):
                         "error_message", "Training failed with an unknown error"
                     )
                     raise RuntimeError(f"Training job failed: {error_message}")
+                after = event.id
+
+    async def _train_sft(
+        self,
+        model: AnyTrainableModel,
+        trajectories: Iterable[Trajectory],
+        config: TrainSFTConfig,
+        dev_config: dev.TrainSFTConfig,
+        verbose: bool = False,
+    ) -> AsyncIterator[dict[str, float]]:
+        """Train the model using supervised fine-tuning.
+
+        For ServerlessBackend, this serializes trajectories to a JSONL file,
+        uploads it to W&B artifacts, and calls the SFT training API.
+
+        Args:
+            model: The trainable model to fine-tune.
+            trajectories: Iterable of Trajectory objects.
+            config: SFT configuration with batch_size and learning rates.
+            dev_config: Developer configuration.
+            verbose: Whether to print detailed logs.
+
+        Yields:
+            Dictionary containing training metrics for each batch.
+        """
+        import json
+        import tempfile
+        import uuid
+
+        import wandb
+
+        assert model.id is not None, "Model ID is required"
+
+        # Get the user's default entity from W&B if not set
+        if model.entity is None:
+            api = wandb.Api(api_key=self._client.api_key)
+            model.entity = api.default_entity
+
+        # Generate unique artifact name to avoid race conditions in distributed systems
+        artifact_id = uuid.uuid4().hex[:12]
+        artifact_name = f"{model.name}-sft-data-{artifact_id}"
+
+        if verbose:
+            print("Serializing trajectories to file (streaming)...")
+
+        # Serialize trajectories to a temporary JSONL file (streaming - no memory load)
+        num_trajectories = 0
+        with tempfile.NamedTemporaryFile(
+            mode="w", suffix=".jsonl", delete=False
+        ) as tmp_file:
+            for trajectory in trajectories:
+                # Convert trajectory to the expected JSONL format
+                line: dict[str, Any] = {
+                    "messages": trajectory.messages(),
+                }
+                if trajectory.tools:
+                    line["tools"] = trajectory.tools
+                tmp_file.write(json.dumps(line) + "\n")
+                num_trajectories += 1
+            tmp_file_path = tmp_file.name
+
+        if num_trajectories == 0:
+            if verbose:
+                print("No trajectories to train on")
+            import os
+
+            os.unlink(tmp_file_path)
+            return
+
+        if verbose:
+            print(f"Serialized {num_trajectories} trajectories")
+
+        try:
+            if verbose:
+                print("Uploading training data to W&B artifacts...")
+
+            # Upload the file to W&B as a dataset artifact
+            # Use the model's canonical run_id from database, or fall back to model name
+            run = wandb.init(
+                name=model.name,
+                id=model.run_id
+                or model.name,  # Use stored run_id to match the canonical wandb run
+                entity=model.entity,
+                project=model.project,
+                resume="allow",  # Resume if this run already exists
+                settings=wandb.Settings(api_key=self._client.api_key),
+            )
+            try:
+                artifact = wandb.Artifact(
+                    artifact_name,
+                    type="dataset",
+                    metadata={
+                        "format": "jsonl",
+                        "num_trajectories": num_trajectories,
+                    },
+                )
+                artifact.add_file(tmp_file_path, name="train.jsonl")
+                artifact = run.log_artifact(artifact)
+                try:
+                    artifact = artifact.wait()
+                except ValueError as e:
+                    if "Unable to fetch artifact with id" in str(e):
+                        if verbose:
+                            print(f"Warning: {e}")
+                    else:
+                        raise e
+            finally:
+                # Finish the run so the workflow can resume it later
+                # The workflow uses wandb_run with resume="must" to continue this run
+                run.finish()
+        finally:
+            # Clean up temporary file
+            import os
+
+            os.unlink(tmp_file_path)
+
+        # Construct the artifact URL with unique name (v0 is the first version)
+        training_data_url = (
+            f"wandb-artifact:///{model.entity}/{model.project}/{artifact_name}:v0"
+        )
+
+        if verbose:
+            print(f"Training data uploaded. Artifact URL: {training_data_url}")
+            print("Starting SFT training job...")
+
+        # Create SFT training job
+        from .client import SFTTrainingConfig
+
+        sft_config: SFTTrainingConfig = {}
+        if config.batch_size != "auto":
+            sft_config["batch_size"] = config.batch_size
+        sft_config["learning_rate"] = config.learning_rate
+
+        sft_training_job = await self._client.sft_training_jobs.create(
+            model_id=model.id,
+            training_data_url=training_data_url,
+            config=sft_config,
+        )
+
+        # Poll for events
+        after: str | None = None
+        num_batches: int | None = None
+        pbar: tqdm.tqdm | None = None
+        while True:
+            await asyncio.sleep(1)
+            async for event in self._client.sft_training_jobs.events.list(
+                training_job_id=sft_training_job.id, after=after or NOT_GIVEN
+            ):
+                if event.type == "gradient_step":
+                    assert pbar is not None and num_batches is not None
+                    pbar.update(1)
+                    pbar.set_postfix(event.data)
+                    yield {**event.data, "num_gradient_steps": num_batches}
+                elif event.type == "training_started":
+                    num_batches = event.data.get("num_sequences", 0)
+                    if pbar is None:
+                        pbar = tqdm.tqdm(total=num_batches, desc="train sft")
+                    continue
+                elif event.type == "training_ended":
+                    if pbar is not None:
+                        pbar.close()
+                    return
+                elif event.type == "training_failed":
+                    if pbar is not None:
+                        pbar.close()
+                    error_message = event.data.get(
+                        "error_message", "SFT training failed with an unknown error"
+                    )
+                    raise RuntimeError(f"SFT training job failed: {error_message}")
                 after = event.id
 
     # ------------------------------------------------------------------
@@ -644,6 +814,20 @@ class ServerlessBackend(Backend):
             aliases.insert(0, f"step{selected_step}")
         run.log_artifact(dest_artifact, aliases=aliases)
         run.finish()
+
+        # Copy provenance from the source model's W&B run to the destination model
+        api = wandb.Api(api_key=self._client.api_key)  # ty:ignore[possibly-missing-attribute]
+        try:
+            source_run = api.run(f"{model.entity}/{from_project}/{from_model}")
+            source_provenance = source_run.config.get("wandb.provenance")
+            if source_provenance is not None:
+                dest_run = model._get_wandb_run()
+                if dest_run is not None:
+                    dest_run.config.update(
+                        {"wandb.provenance": list(source_provenance)}
+                    )
+        except Exception:
+            pass  # Source run may not exist (e.g., S3-only models)
 
         if verbose:
             print(

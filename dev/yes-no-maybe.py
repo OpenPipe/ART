@@ -17,7 +17,7 @@ async def rollout(client: openai.AsyncOpenAI, prompt: str) -> art.Trajectory:
         }
     ]
     chat_completion = await client.chat.completions.create(
-        messages=messages, model=model.name, max_tokens=100, timeout=100
+        messages=messages, model=model.get_inference_name(), max_tokens=100, timeout=100
     )
     choice = chat_completion.choices[0]
     content = choice.message.content

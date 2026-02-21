@@ -46,7 +46,8 @@ async def openai_server_task(
     subclass_chat_completion_request()
     # Capture the OpenAIServingModels instance so dynamically added LoRAs
     # are reflected in the model list.
-    from vllm.entrypoints.openai import api_server, serving_models
+    from vllm.entrypoints.openai import api_server
+    from vllm.entrypoints.openai.models import serving as serving_models
 
     serving_models_any = cast(Any, serving_models)
     if not getattr(serving_models_any, "_art_openai_serving_models_patched", False):
@@ -64,22 +65,19 @@ async def openai_server_task(
     patch_tool_parser_manager()
     set_vllm_log_file(config.get("log_file", "vllm.log"))
 
-    # Patch engine.add_lora to ensure lora_tensors attribute exists
-    # This is needed for compatibility with Unsloth
+    # Patch engine.add_lora to normalize requests across vLLM schema changes.
     add_lora = engine.add_lora
 
     async def _add_lora(lora_request) -> bool:
-        # Ensure lora_tensors attribute exists on the request
-        if not hasattr(lora_request, "lora_tensors"):
-            # For msgspec.Struct, we need to create a new instance with the attribute
-            from vllm.lora.request import LoRARequest
+        from vllm.lora.request import LoRARequest
 
+        if not isinstance(lora_request, LoRARequest):
             lora_request = LoRARequest(
                 lora_name=lora_request.lora_name,
                 lora_int_id=lora_request.lora_int_id,
                 lora_path=lora_request.lora_path,
-                long_lora_max_len=getattr(lora_request, "long_lora_max_len", None),
                 base_model_name=getattr(lora_request, "base_model_name", None),
+                load_inplace=getattr(lora_request, "load_inplace", False),
             )
         added = await add_lora(lora_request)
         if added and _openai_serving_models is not None:

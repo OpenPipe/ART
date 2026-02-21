@@ -2,6 +2,7 @@ from typing import AsyncIterator, Protocol, runtime_checkable
 
 from .. import dev, types
 from ..preprocessing.pack import DiskPackedTensors
+from ..preprocessing.tokenize import SFTBatch
 
 
 @runtime_checkable
@@ -28,3 +29,19 @@ class ModelService(Protocol):
         _config: dev.TrainConfig,
         verbose: bool = False,
     ) -> AsyncIterator[dict[str, float]]: ...
+
+    def train_sft(
+        self,
+        batches: list[SFTBatch],
+        verbose: bool = False,
+    ) -> AsyncIterator[dict[str, float]]:
+        """Train using SFT on pre-computed batches.
+
+        Args:
+            batches: List of SFTBatch objects to train on.
+            verbose: Whether to print detailed logs.
+
+        Yields:
+            Dictionary containing training metrics for each batch.
+        """
+        ...

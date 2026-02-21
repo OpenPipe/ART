@@ -6,14 +6,13 @@ checkpoints while validation runs on older ones.
 
 The key features tested are:
 1. Model.get_inference_name() with optional step parameter
-2. TinkerState.get_sampler_client() for step-based routing
-3. ServerlessBackend._model_inference_name() with step suffix
-4. UnslothService max_loras configuration
+2. ServerlessBackend._model_inference_name() with step suffix
+3. UnslothService max_loras configuration
 """
 
 import asyncio
 from dataclasses import dataclass
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, patch
 
 import pytest
 
@@ -127,87 +126,6 @@ class TestLitellmCompletionParams:
 
 
 # =============================================================================
-# TinkerState Tests
-# =============================================================================
-
-
-class TestTinkerStateGetSamplerClient:
-    """Test TinkerState.get_sampler_client() for step-based routing."""
-
-    @pytest.fixture
-    def tinker_state_class(self):
-        """Import TinkerState, skipping if dependencies unavailable."""
-        try:
-            from art.tinker.service import TinkerState
-
-            return TinkerState
-        except ImportError as e:
-            pytest.skip(f"Tinker dependencies not available: {e}")
-
-    def test_get_sampler_client_without_step_returns_latest(self, tinker_state_class):
-        """Without step, should return client for latest_step."""
-        TinkerState = tinker_state_class
-
-        # Create mock sampler clients
-        mock_client_0 = MagicMock()
-        mock_client_5 = MagicMock()
-
-        state = TinkerState(
-            service_client=MagicMock(),
-            rest_client=MagicMock(),
-            training_client=MagicMock(),
-            sampler_clients={0: mock_client_0, 5: mock_client_5},
-            latest_step=5,
-            renderer=MagicMock(),
-        )
-
-        assert state.get_sampler_client() is mock_client_5
-        assert state.get_sampler_client(step=None) is mock_client_5
-
-    def test_get_sampler_client_with_step_returns_specific_client(
-        self, tinker_state_class
-    ):
-        """With step, should return client for that specific step."""
-        TinkerState = tinker_state_class
-
-        mock_client_0 = MagicMock()
-        mock_client_3 = MagicMock()
-        mock_client_5 = MagicMock()
-
-        state = TinkerState(
-            service_client=MagicMock(),
-            rest_client=MagicMock(),
-            training_client=MagicMock(),
-            sampler_clients={0: mock_client_0, 3: mock_client_3, 5: mock_client_5},
-            latest_step=5,
-            renderer=MagicMock(),
-        )
-
-        assert state.get_sampler_client(step=0) is mock_client_0
-        assert state.get_sampler_client(step=3) is mock_client_3
-        assert state.get_sampler_client(step=5) is mock_client_5
-
-    def test_get_sampler_client_invalid_step_raises_error(self, tinker_state_class):
-        """Invalid step should raise ValueError with available steps."""
-        TinkerState = tinker_state_class
-
-        state = TinkerState(
-            service_client=MagicMock(),
-            rest_client=MagicMock(),
-            training_client=MagicMock(),
-            sampler_clients={0: MagicMock(), 5: MagicMock()},
-            latest_step=5,
-            renderer=MagicMock(),
-        )
-
-        with pytest.raises(ValueError) as exc_info:
-            state.get_sampler_client(step=3)
-
-        assert "No sampler client for step 3" in str(exc_info.value)
-        assert "Available steps: [0, 5]" in str(exc_info.value)
-
-
-# =============================================================================
 # ServerlessBackend Tests
 # =============================================================================
 
@@ -311,6 +229,22 @@ class TestOpenAIServerConfigLoraName:
         assert len(lora_modules) == 1
         assert "my-model@0" in lora_modules[0]
 
+    def test_served_model_name_uses_base_model_when_lora_enabled(self):
+        """With LoRA enabled, served model name should remain the base model."""
+        from art.dev.openai_server import get_openai_server_config
+
+        config = get_openai_server_config(
+            model_name="my-model",
+            base_model="meta-llama/Llama-3.1-8B",
+            log_file="/tmp/test.log",
+            lora_path="/path/to/checkpoints/0005",
+        )
+
+        assert (
+            config.get("engine_args", {}).get("served_model_name")
+            == "meta-llama/Llama-3.1-8B"
+        )
+
 
 # =============================================================================
 # Step Parsing Tests
@@ -318,32 +252,40 @@ class TestOpenAIServerConfigLoraName:
 
 
 class TestStepParsing:
-    """Test parsing of @step suffix from model names."""
+    """Test TinkerNative model-name parsing behavior."""
 
-    def test_parse_step_from_model_name(self):
-        """Test the step parsing logic used in TinkerService."""
-        test_cases = [
-            ("model-name", None),  # No @ suffix
-            ("model-name@5", 5),  # Valid step
-            ("model-name@0", 0),  # Step 0
-            ("model-name@100", 100),  # Large step
-            ("model@name@5", 5),  # Multiple @ (use last)
-            ("model-name@invalid", None),  # Invalid step (not a number)
-            ("model-name@", None),  # Empty step
-        ]
+    @pytest.fixture
+    def tinker_native_backend_class(self):
+        """Import TinkerNativeBackend, skipping if dependency unavailable."""
+        try:
+            from art.tinker_native.backend import TinkerNativeBackend
 
-        for model_name, expected_step in test_cases:
-            step = None
-            if "@" in str(model_name):
-                _, step_str = str(model_name).rsplit("@", 1)
-                try:
-                    step = int(step_str)
-                except ValueError:
-                    pass
+            return TinkerNativeBackend
+        except ImportError as e:
+            pytest.skip(f"Tinker dependencies not available: {e}")
 
-            assert step == expected_step, (
-                f"Failed for {model_name}: got {step}, expected {expected_step}"
-            )
+    def test_parse_step_from_model_name(self, tinker_native_backend_class):
+        """Valid `model@step` names should parse correctly."""
+        backend = object.__new__(tinker_native_backend_class)
+        assert backend._parse_model_name("model-name@5") == ("model-name", 5)
+        assert backend._parse_model_name("model-name@0") == ("model-name", 0)
+        assert backend._parse_model_name("model@name@12") == ("model@name", 12)
+
+    def test_missing_step_suffix_fails_loudly(self, tinker_native_backend_class):
+        """Unsuffixed model names should fail with a helpful message."""
+        from fastapi import HTTPException
+
+        backend = object.__new__(tinker_native_backend_class)
+        with pytest.raises(HTTPException, match="missing an '@step' suffix"):
+            backend._parse_model_name("model-name")
+
+    def test_invalid_step_suffix_fails_loudly(self, tinker_native_backend_class):
+        """Non-numeric step suffix should fail with a helpful message."""
+        from fastapi import HTTPException
+
+        backend = object.__new__(tinker_native_backend_class)
+        with pytest.raises(HTTPException, match="Invalid model step"):
+            backend._parse_model_name("model-name@not-a-number")
 
 
 # =============================================================================

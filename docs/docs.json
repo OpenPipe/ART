@@ -57,7 +57,8 @@
           "fundamentals/training-loop",
           "fundamentals/art-client",
           "fundamentals/art-backend",
-          "fundamentals/ruler"
+          "fundamentals/ruler",
+          "fundamentals/sft-training"
         ]
       },
       {

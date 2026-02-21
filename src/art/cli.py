@@ -1,30 +1,176 @@
 import json
 from pathlib import Path
 import socket
-from typing import Any, AsyncIterator, Optional
+from typing import Any, AsyncIterator
 
 from dotenv import load_dotenv
-from fastapi import Body, FastAPI, Request
-from fastapi.responses import JSONResponse, StreamingResponse
-import pydantic
 import typer
-import uvicorn
-
-from . import dev
-from .errors import ARTError
-from .local import LocalBackend
-from .model import Model, TrainableModel
-from .trajectories import TrajectoryGroup
-from .types import TrainConfig
-from .utils.deployment import (
-    Provider,
-    TogetherDeploymentConfig,
-    WandbDeploymentConfig,
-)
 
 load_dotenv()
 
 app = typer.Typer()
+
+
+SKILL_NAMES = ["train-sft", "train-rl"]
+
+WANDB_INFERENCE_BASE_URL = "https://api.inference.wandb.ai/v1"
+WANDB_INFERENCE_MODEL = "Qwen/Qwen3-235B-A22B-Instruct-2507"
+
+
+def _get_skill_path(skill_name: str) -> Path:
+    """Find a skill file, checking installed package first, then repo root."""
+    # Installed from wheel: art/skills/ in site-packages
+    pkg_path = Path(__file__).parent / "skills" / skill_name / "SKILL.md"
+    if pkg_path.exists():
+        return pkg_path
+    # Development: .agents/skills/ in repo root
+    dev_path = (
+        Path(__file__).parent.parent.parent
+        / ".agents"
+        / "skills"
+        / skill_name
+        / "SKILL.md"
+    )
+    if dev_path.exists():
+        return dev_path
+    raise FileNotFoundError(f"Skill '{skill_name}' not found")
+
+
+def _chat_with_skill(skill_name: str) -> None:
+    """Run an interactive chat session using a skill as the system prompt."""
+    import os
+    import sys
+
+    from openai import OpenAI
+
+    api_key = os.environ.get("WANDB_API_KEY")
+    if not api_key:
+        typer.echo(
+            "Error: WANDB_API_KEY environment variable is required.\n"
+            "Get your key at https://wandb.ai/authorize",
+            err=True,
+        )
+        raise typer.Exit(1)
+
+    try:
+        skill_path = _get_skill_path(skill_name)
+    except FileNotFoundError:
+        typer.echo(
+            f"Error: Skill '{skill_name}' not found in this installation.", err=True
+        )
+        raise typer.Exit(1)
+
+    skill_content = skill_path.read_text()
+    # Strip YAML frontmatter
+    if skill_content.startswith("---"):
+        end = skill_content.find("---", 3)
+        if end != -1:
+            skill_content = skill_content[end + 3 :].strip()
+
+    cli_preamble = (
+        "IMPORTANT: You are in a plain text chat. You have NO tools. "
+        "You cannot search files, read files, run scripts, validate data, or execute code. "
+        "Never say 'Let me search...', 'Scanning...', 'Found N files...', or 'Valid! N rows' — "
+        "you did not do any of these things. "
+        "If a step requires running code or using tools, skip it entirely and move on.\n\n"
+    )
+
+    client = OpenAI(base_url=WANDB_INFERENCE_BASE_URL, api_key=api_key)
+    messages: list = [{"role": "system", "content": cli_preamble + skill_content}]
+
+    typer.echo(f"ART {skill_name} wizard (powered by {WANDB_INFERENCE_MODEL})")
+    typer.echo("Type 'quit' to exit.\n")
+
+    # Send an initial empty user message to kick off the wizard
+    messages.append({"role": "user", "content": "Hi, let's get started."})
+
+    while True:
+        try:
+            stream = client.chat.completions.create(
+                model=WANDB_INFERENCE_MODEL,
+                messages=messages,
+                stream=True,
+            )
+            assistant_message = ""
+            for chunk in stream:
+                if not chunk.choices:
+                    continue
+                delta = chunk.choices[0].delta.content
+                if delta:
+                    sys.stdout.write(delta)
+                    sys.stdout.flush()
+                    assistant_message += delta
+            typer.echo("")  # newline after streaming
+            messages.append({"role": "assistant", "content": assistant_message})
+        except Exception as e:
+            typer.echo(f"\nError from inference API: {e}", err=True)
+            raise typer.Exit(1)
+
+        try:
+            user_input = typer.prompt("\nYou")
+        except (KeyboardInterrupt, EOFError):
+            typer.echo("\nExiting.")
+            break
+
+        if user_input.strip().lower() == "quit":
+            break
+
+        messages.append({"role": "user", "content": user_input})
+
+
+@app.command()
+def train_sft() -> None:
+    """Interactive wizard to create an SFT training script."""
+    _chat_with_skill("train-sft")
+
+
+@app.command()
+def train_rl() -> None:
+    """Interactive wizard to create an RL training script."""
+    _chat_with_skill("train-rl")
+
+
+@app.command()
+def install_skills(
+    path: Path = typer.Argument(
+        default=Path("."), help="Project directory to install skills into"
+    ),
+) -> None:
+    """Install ART agent skills for Claude Code and OpenAI Codex.
+
+    Copies bundled SKILL.md files into .claude/skills/ and .agents/skills/
+    in the target project directory.
+
+    Examples:
+        art install-skills
+        art install-skills /path/to/my-project
+    """
+    import shutil
+
+    target = path.resolve()
+    destinations = [
+        target / ".claude" / "skills",
+        target / ".agents" / "skills",
+    ]
+
+    installed = []
+    for dest_root in destinations:
+        for skill_name in SKILL_NAMES:
+            try:
+                src = _get_skill_path(skill_name)
+            except FileNotFoundError:
+                continue
+            dest_dir = dest_root / skill_name
+            dest_dir.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(src, dest_dir / "SKILL.md")
+            installed.append(str(dest_dir / "SKILL.md"))
+
+    typer.echo(f"Installed {len(installed)} skill files into {target}:")
+    for f in installed:
+        typer.echo(f"  {f}")
+    typer.echo(
+        "\nUse /train-sft and /train-rl in Claude Code or OpenAI Codex to get started."
+    )
 
 
 @app.command()
@@ -139,6 +285,18 @@ def migrate(
 @app.command()
 def run(host: str = "0.0.0.0", port: int = 7999) -> None:
     """Run the ART CLI."""
+
+    from fastapi import Body, FastAPI, Request
+    from fastapi.responses import JSONResponse, StreamingResponse
+    import pydantic
+    import uvicorn
+
+    from . import dev
+    from .errors import ARTError
+    from .local import LocalBackend
+    from .model import Model, TrainableModel
+    from .trajectories import TrajectoryGroup
+    from .types import TrainConfig
 
     # check if port is available
     def is_port_available(port: int) -> bool:

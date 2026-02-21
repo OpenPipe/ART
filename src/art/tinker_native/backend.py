@@ -334,7 +334,7 @@ class TinkerNativeBackend(Backend):
         @app.post("/v1/chat/completions")
         async def chat_completions(body: CompletionCreateParams) -> ChatCompletion:
             model_name = body.get("model")
-            _, step = self._parse_model_name(model_name)
+            parsed_model_name, step = self._parse_model_name(model_name)
             sampler_client = await self._get_sampler_client(state, step)
 
             messages = self._normalize_messages(body["messages"])
@@ -427,7 +427,7 @@ class TinkerNativeBackend(Backend):
                 id=str(uuid.uuid4()),
                 choices=choices,
                 created=int(time.time()),
-                model=self._format_response_model(model_name, step, state),
+                model=self._format_response_model(parsed_model_name, step),
                 object="chat.completion",
                 usage=CompletionUsage(
                     completion_tokens=completion_tokens,
@@ -666,27 +666,32 @@ class TinkerNativeBackend(Backend):
                 normalized.append(dict(tool))
         return normalized
 
-    def _parse_model_name(
-        self, model_name: str | None
-    ) -> tuple[str | None, int | None]:
-        if model_name and "@" in model_name:
-            base_name, step_str = model_name.rsplit("@", 1)
-            try:
-                return base_name, int(step_str)
-            except ValueError as exc:
-                raise HTTPException(
-                    status_code=400, detail=f"Invalid model step: {model_name}"
-                ) from exc
-        return model_name, None
+    def _parse_model_name(self, model_name: str | None) -> tuple[str, int]:
+        if not model_name:
+            raise HTTPException(
+                status_code=400,
+                detail="Model name is required and must include an '@step' suffix. Use model.get_inference_name().",
+            )
+        if "@" not in model_name:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"Model '{model_name}' is missing an '@step' suffix. "
+                    "Use model.get_inference_name()."
+                ),
+            )
 
-    def _format_response_model(
-        self, model_name: str | None, step: int | None, state: ModelState
-    ) -> str:
-        if model_name is None:
-            return f"{state.model_name}@{state.current_step}"
-        if step is None and "@" not in model_name:
-            return f"{model_name}@{state.current_step}"
-        return model_name
+        base_name, step_str = model_name.rsplit("@", 1)
+        try:
+            return base_name, int(step_str)
+        except ValueError as exc:
+            raise HTTPException(
+                status_code=400, detail=f"Invalid model step: {model_name}"
+            ) from exc
+
+    def _format_response_model(self, model_name: str, step: int) -> str:
+        # Echo back the explicit model@step used for this completion.
+        return f"{model_name}@{step}"
 
     async def _create_training_client_from_checkpoint(
         self,

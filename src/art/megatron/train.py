@@ -6,6 +6,7 @@ os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 os.environ["TORCH_CUDA_ARCH_LIST"] = "9.0"
 # isort: on
 
+import gc
 import json
 import shutil
 import time
@@ -333,6 +334,11 @@ while True:
     os.makedirs(job.optimizer_state_path, exist_ok=True)
     torch.save(optimizer.state_dict(), optimizer_shard_path)
     offload_to_cpu(model, optimizer, rank, offload_state)
+    # Release mmap-backed packed tensor references on all ranks before rank0 cleanup.
+    del packed_tensors
+    if "inputs" in locals():
+        del inputs
+    gc.collect()
     # Ensure all ranks have finished saving before signaling completion
     torch.distributed.barrier()
     if rank == 0:

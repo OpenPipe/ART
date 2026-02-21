@@ -7,16 +7,16 @@ def subclass_chat_completion_request() -> None:
     """
     Subclass ChatCompletionRequest so that logprobs are always returned.
     """
-    import vllm.entrypoints.openai.protocol
+    from vllm.entrypoints.openai.chat_completion import protocol
 
-    class ChatCompletionRequest(vllm.entrypoints.openai.protocol.ChatCompletionRequest):
+    class ChatCompletionRequest(protocol.ChatCompletionRequest):
         def __init__(self, *args: object, **kwargs: object) -> None:
             super().__init__(*args, **kwargs)  # ty:ignore[invalid-argument-type]
             self.logprobs = True
             if self.top_logprobs is None:
                 self.top_logprobs = 0
 
-    vllm.entrypoints.openai.protocol.ChatCompletionRequest = ChatCompletionRequest  # ty:ignore[invalid-assignment]
+    protocol.ChatCompletionRequest = ChatCompletionRequest  # ty:ignore[invalid-assignment]
 
 
 def patch_listen_for_disconnect() -> None:
@@ -39,7 +39,7 @@ def patch_tool_parser_manager() -> None:
     """
     Patch ToolParserManager to support streaming tool call logprobs.
     """
-    from vllm.entrypoints.openai.protocol import DeltaMessage
+    from vllm.entrypoints.openai.engine.protocol import DeltaMessage
     from vllm.tool_parsers.abstract_tool_parser import ToolParserManager
 
     get_tool_parser = ToolParserManager.get_tool_parser

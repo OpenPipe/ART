@@ -7,11 +7,22 @@ if TYPE_CHECKING:
 
 
 def record_provenance(run: wandb.Run, provenance: str) -> None:
-    """Record provenance in run metadata, ensuring it's the last value in the array."""
-    if "provenance" in run.config:
-        existing = list(run.config["provenance"])
+    """Record provenance on the latest artifact version's metadata."""
+    import wandb as wandb_module
+
+    api = wandb_module.Api()
+    artifact_path = f"{run.entity}/{run.project}/{run.name}:latest"
+    try:
+        artifact = api.artifact(artifact_path, type="lora")
+    except wandb_module.errors.CommError:
+        return  # No artifact exists yet
+
+    existing = artifact.metadata.get("wandb.provenance")
+    if existing is not None:
+        existing = list(existing)
         if existing[-1] != provenance:
             existing.append(provenance)
-        run.config.update({"provenance": existing})
+        artifact.metadata["wandb.provenance"] = existing
     else:
-        run.config.update({"provenance": [provenance]})
+        artifact.metadata["wandb.provenance"] = [provenance]
+    artifact.save()

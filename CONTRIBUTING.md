@@ -37,6 +37,36 @@ uv run prek run pytest
 
 These checks are automatically run in CI for all pull requests. If your PR fails these checks, re-run the corresponding `prek` hook locally and commit any fixes.
 
+### CI uv Cache Refresh
+
+The PR `prek` workflow uses a prebuilt full `uv` cache (stored as a GitHub release asset) to avoid rebuilding heavy dependencies on every run.
+
+To refresh the cache after dependency changes, run:
+
+```bash
+bash scripts/ci/build_and_push_uv_cache.sh
+```
+
+This command builds a full cache archive locally (using `uv sync --frozen --all-extras --group dev --no-install-project`) and uploads a fingerprinted part set:
+
+- `prek-uv-cache-<fingerprint>.tar.zst.part-000`
+- `prek-uv-cache-<fingerprint>.tar.zst.part-001`
+- ...
+
+The script also prunes old immutable cache assets (keeps newest 4 by default).
+It requires GitHub CLI authentication (`gh auth login`) and should be run in an environment compatible with CI (same base CUDA image/toolchain).
+
+You can override native-build parallelism while preparing cache:
+
+```bash
+bash scripts/ci/build_and_push_uv_cache.sh --build-jobs 2
+```
+
+By default, `--build-jobs auto` is used and resolves from available CPU and memory.
+By default, cache parts are split at `1900 MiB`; override with `--part-size-mb <n>` if needed.
+
+CI computes the expected cache fingerprint from `pyproject.toml`, `uv.lock`, base image, Python version, and cache asset layout contract. If no matching cache part set exists, CI fails fast and tells you to refresh cache with the script above.
+
 ### Release Process
 
 To create a new release:
@@ -132,5 +162,23 @@ You should see immediate improvement in `val/reward` after one step.
 If you run into any issues, the training output is set to maximum verbosity. Copying the outputs such as the vLLM or torchtune logs, or copying/screenshotting the plotted packed tensors, may help me debug the issue.
 
 ### Cleaning Up
+
+When you're done, you can tear down the cluster with:
+
+```bash
+uv run sky down art
+```
+
+### Adding Docs
+
+We use Mintlify to serve our docs. Here are the steps for adding a new page:
+1. Clone the ART repo
+2. Open the /docs directory in your CLI and IDE
+3. Run npx mintlify dev to start serving a local version of the docs in your browser
+4. Create a new .mdx file in the relevant directory
+5. Add a title and sidebar title (see other pages for examples)
+6. In docs.json, add a link to the new page within one of the `navigation`.`groups`
+7. Ensure everything works by navigating to and viewing the page in your browser
+8. Submit a PR
 
 When you're done, shut down your GPU instance (if using a cloud VM) or stop the local training process.

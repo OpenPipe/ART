@@ -52,7 +52,7 @@ async def rollout(model: art.Model, scenario: FactsScenario) -> art.Trajectory:
     )
 
     completion = await client.chat.completions.create(
-        model=model.name if model.trainable else model.inference_model_name,
+        model=model.get_inference_name(),
         messages=traj.messages(),
         max_completion_tokens=500,
         extra_body={"chat_template_kwargs": {"enable_thinking": False}},

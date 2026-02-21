@@ -90,6 +90,7 @@ async def deploy_model(
             model=model,
             checkpoint_path=checkpoint_path,
             step=step,
+            config=config,
             verbose=verbose,
         )
         return DeploymentResult(inference_model_name=inference_name)

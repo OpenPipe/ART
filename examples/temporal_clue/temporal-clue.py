@@ -36,7 +36,7 @@ async def rollout(model: art.Model, puzzle: TemporalCluePuzzle) -> art.Trajector
     messages: art.Messages = [{"role": "user", "content": puzzle["prompt"]}]
     client = model.openai_client()
     chat_completion = await client.chat.completions.create(
-        messages=messages, model=model.name
+        messages=messages, model=model.get_inference_name()
     )
     choice = chat_completion.choices[0]
     content = choice.message.content

@@ -15,7 +15,7 @@ replays/
 trajectories/
 .DS_Store
 .local/
-.claude/
+.claude/settings.local.json
 .vscode/
 .ruff_cache/
 !/src/art/wandb/

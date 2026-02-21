@@ -77,7 +77,13 @@ async def main():
         iteration_start = time.perf_counter()
         # launch concurrent requests and time each individually
         tasks = [
-            timed_request(client, model.name, prompt, max_tokens, temperature)
+            timed_request(
+                client,
+                model.get_inference_name(),
+                prompt,
+                max_tokens,
+                temperature,
+            )
             for _ in range(concurrency)
         ]
         # Wait for all responses

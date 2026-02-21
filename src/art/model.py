@@ -14,8 +14,7 @@ from typing_extensions import Never, TypeVar
 from . import dev
 from .costs import CostCalculator
 from .trajectories import Trajectory, TrajectoryGroup
-from .types import TrainConfig
-from .utils.old_benchmarking.calculate_step_metrics import calculate_step_std_dev
+from .types import TrainConfig, TrainSFTConfig
 from .utils.trajectory_logging import write_trajectory_groups_parquet
 
 if TYPE_CHECKING:
@@ -72,6 +71,7 @@ class Model(
     project: str
     entity: str | None = None
     id: str | None = None
+    run_id: str | None = None
     config: ModelConfig
     # Discriminator field for FastAPI serialization
     trainable: bool = False
@@ -395,6 +395,9 @@ class Model(
         prefixed = {f"{split}/{k}": v for k, v in metrics.items()}
         output_dir = self._get_output_dir()
 
+        # Ensure output directory exists
+        os.makedirs(output_dir, exist_ok=True)
+
         # Write to history.jsonl
         with open(f"{output_dir}/history.jsonl", "a") as f:
             f.write(
@@ -634,6 +637,10 @@ class Model(
                 averages[f"group_metric_{metric}"] = sum(values) / len(values)
 
         # Calculate average standard deviation of rewards within groups
+        from .utils.old_benchmarking.calculate_step_metrics import (
+            calculate_step_std_dev,
+        )
+
         averages["reward_std_dev"] = calculate_step_std_dev(trajectory_groups)
 
         # Merge in any additional metrics passed directly
@@ -688,6 +695,7 @@ class TrainableModel(Model[ModelConfig, StateType], Generic[ModelConfig, StateTy
         project: str,
         entity: str | None = None,
         id: str | None = None,
+        run_id: str | None = None,
         config: ModelConfig | None = None,
         base_model: str,
         base_path: str = ".art",
@@ -708,6 +716,9 @@ class TrainableModel(Model[ModelConfig, StateType], Generic[ModelConfig, StateTy
         )
         object.__setattr__(self, "_costs_lock", asyncio.Lock())
         object.__setattr__(self, "_cost_calculator", self._noop_cost_calculator)
+        if _internal_config is not None:
+            # Bypass BaseModel __setattr__ to allow setting private attr
+            object.__setattr__(self, "_internal_config", _internal_config)
 
     @property
     def cost_calculator(self) -> CostCalculator:
@@ -725,9 +736,6 @@ class TrainableModel(Model[ModelConfig, StateType], Generic[ModelConfig, StateTy
         _prompt_tokens: int | None, _completion_tokens: int | None
     ) -> dict[str, float]:
         return {}
-        if _internal_config is not None:
-            # Bypass BaseModel __setattr__ to allow setting private attr
-            object.__setattr__(self, "_internal_config", _internal_config)
 
     @overload
     def __new__(
@@ -871,10 +879,7 @@ class TrainableModel(Model[ModelConfig, StateType], Generic[ModelConfig, StateTy
         groups_list = list(trajectory_groups)
         _config = _config or {}  # ty:ignore[invalid-assignment]
 
-        # 1. Log trajectories first (frontend handles this now)
-        await self.log(groups_list, split="train")
-
-        # 2. Train (backend no longer logs internally)
+        # 1. Train (backend no longer logs internally)
         training_metrics: list[dict[str, float]] = []
         async for metrics in self.backend()._train_model(
             self,
@@ -885,13 +890,60 @@ class TrainableModel(Model[ModelConfig, StateType], Generic[ModelConfig, StateTy
         ):
             training_metrics.append(metrics)
 
-        # 3. Log training metrics (loss, gradient norms, etc.)
+        # 2. Calculate aggregated training metrics
+        avg_metrics: dict[str, float] = {}
         if training_metrics:
             avg_metrics = {
                 k: sum(d.get(k, 0) for d in training_metrics)
                 / sum(1 for d in training_metrics if k in d)
                 for k in {k for d in training_metrics for k in d}
                 if k != "num_gradient_steps"
+            }
+
+        # 3. Log trajectories and training metrics together (single wandb log call)
+        step = await self.get_step()
+        await self.log(groups_list, split="train", metrics=avg_metrics, step=step)
+
+    async def train_sft(
+        self,
+        trajectories: Iterable[Trajectory],
+        config: TrainSFTConfig | None = None,
+        _config: dev.TrainSFTConfig | None = None,
+        verbose: bool = False,
+    ) -> None:
+        """
+        Supervised fine-tune the model with an iterable of trajectories.
+
+        Args:
+            trajectories: An iterable of Trajectory objects.
+            config: SFT configuration including learning_rates and batch_size.
+                If None, uses default TrainSFTConfig().
+            _config: Additional experimental configuration that is subject to change and
+                not yet part of the public API. Use at your own risk.
+            verbose: Whether to print verbose output.
+        """
+        if config is None:
+            config = TrainSFTConfig()
+
+        # Train (backend yields metrics for each batch without logging)
+        # Collect all metrics and aggregate them at the end (same as RL)
+        _config = _config or {}  # ty:ignore[invalid-assignment]
+        training_metrics: list[dict[str, float]] = []
+        async for metrics in self.backend()._train_sft(
+            self,
+            trajectories,
+            config,
+            _config,  # ty:ignore[invalid-argument-type]
+            verbose,
+        ):
+            training_metrics.append(metrics)
+
+        # Log aggregated training metrics once (same as RL)
+        if training_metrics:
+            avg_metrics = {
+                k: sum(d.get(k, 0) for d in training_metrics)
+                / sum(1 for d in training_metrics if k in d)
+                for k in {k for d in training_metrics for k in d}
             }
             # Get the current step after training
             step = await self.get_step()

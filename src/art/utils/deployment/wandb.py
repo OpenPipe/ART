@@ -21,7 +21,8 @@ class WandbDeploymentConfig(DeploymentConfig):
     - Qwen/Qwen2.5-14B-Instruct
     """
 
-    pass
+    provenance: list[str]
+    """The training provenance history for this model (e.g. ["local-rl", "serverless-rl"])."""
 
 
 WANDB_SUPPORTED_BASE_MODELS = [
@@ -36,6 +37,7 @@ def deploy_wandb(
     model: "TrainableModel",
     checkpoint_path: str,
     step: int,
+    config: "WandbDeploymentConfig | None" = None,
     verbose: bool = False,
 ) -> str:
     """Deploy a model to W&B by uploading a LoRA artifact.
@@ -44,6 +46,7 @@ def deploy_wandb(
         model: The TrainableModel to deploy.
         checkpoint_path: Local path to the checkpoint directory.
         step: The step number of the checkpoint.
+        config: Optional WandbDeploymentConfig with provenance metadata.
         verbose: Whether to print verbose output.
 
     Returns:
@@ -74,10 +77,13 @@ def deploy_wandb(
         settings=wandb.Settings(api_key=os.environ["WANDB_API_KEY"]),
     )
     try:
+        metadata: dict[str, object] = {"wandb.base_model": model.base_model}
+        if config is not None:
+            metadata["wandb.provenance"] = config.provenance
         artifact = wandb.Artifact(
             model.name,
             type="lora",
-            metadata={"wandb.base_model": model.base_model},
+            metadata=metadata,
             storage_region="coreweave-us",
         )
         artifact.add_dir(checkpoint_path)
