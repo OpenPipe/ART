@@ -63,6 +63,8 @@ def main(argv: list[str] | None = None) -> None:
         f"--served-model-name={args.served_model_name}",
         "--enable-lora",
         f"--lora-modules={args.served_model_name}={args.lora_path}",
+        "--enable-auto-tool-choice",
+        "--tool-call-parser=hermes",
     ]
     for key, value in engine_args.items():
         if value is None:

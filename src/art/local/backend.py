@@ -1,5 +1,6 @@
 import asyncio
 import json
+import logging
 import math
 import os
 import shutil
@@ -8,6 +9,8 @@ import subprocess
 from types import TracebackType
 from typing import AsyncIterator, Iterable, Literal, cast
 import warnings
+
+logger = logging.getLogger(__name__)
 
 import aiohttp
 import numpy as np
@@ -144,7 +147,12 @@ class LocalBackend(Backend):
         # For LocalBackend, vLLM always serves LoRA adapters with @step suffix
         # Default to step 0 when not specified (the initial checkpoint created at registration)
         actual_step = step if step is not None else self.__get_step(model)
-        return f"{model.name}@{actual_step}"
+        name = f"{model.name}@{actual_step}"
+        logger.debug(
+            f"[BACKEND] _model_inference_name: step_arg={step} "
+            f"actual_step={actual_step} -> {name}"
+        )
+        return name
 
     async def _get_service(self, model: TrainableModel) -> ModelService:
         from ..dev.get_model_config import get_model_config
@@ -598,6 +606,10 @@ class LocalBackend(Backend):
             # Still advance the step by renaming the checkpoint directory
             current_step = self.__get_step(model)
             next_step = current_step + 1
+            logger.info(
+                f"[BACKEND] _train_model SKIP: current_step={current_step} "
+                f"next_step={next_step} (all rewards equal)"
+            )
             current_checkpoint_dir = get_step_checkpoint_dir(
                 get_model_dir(model=model, art_path=self._path), current_step
             )
@@ -612,8 +624,9 @@ class LocalBackend(Backend):
                     next_checkpoint_dir,
                     dirs_exist_ok=True,
                 )
-                print(
-                    f"Advanced step from {current_step} to {next_step} (no training occurred)"
+                logger.info(
+                    f"[BACKEND] _train_model SKIP: copied checkpoint "
+                    f"{current_step} -> {next_step}, calling register_lora_for_step..."
                 )
 
                 try:
@@ -623,6 +636,10 @@ class LocalBackend(Backend):
                         await service.register_lora_for_step(  # type: ignore[attr-defined]
                             next_step, next_checkpoint_dir
                         )
+                    logger.info(
+                        f"[BACKEND] _train_model SKIP: register_lora_for_step "
+                        f"completed for step {next_step}"
+                    )
                 except ModuleNotFoundError:
                     pass  # Unsloth is not installed
 

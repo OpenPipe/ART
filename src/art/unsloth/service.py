@@ -366,17 +366,26 @@ class UnslothService:
         """Reload LoRA adapter in vLLM subprocess via HTTP."""
         import httpx
 
+        lora_name = f"{self.model_name}@{self._latest_step}"
+        logger.info(
+            f"[DEDICATED] _reload_adapter START: lora_name={lora_name} "
+            f"path={checkpoint_path}"
+        )
         async with httpx.AsyncClient() as client:
             response = await client.post(
                 f"http://{self._vllm_host}:{self._vllm_port}/v1/load_lora_adapter",
                 json={
-                    "lora_name": f"{self.model_name}@{self._latest_step}",
+                    "lora_name": lora_name,
                     "lora_path": checkpoint_path,
                     "load_inplace": True,
                 },
                 timeout=60.0,
             )
             response.raise_for_status()
+        logger.info(
+            f"[DEDICATED] _reload_adapter DONE: lora_name={lora_name} "
+            f"status={response.status_code}"
+        )
 
     def close(self) -> None:
         """Terminate vLLM subprocess if running."""
@@ -441,6 +450,10 @@ class UnslothService:
         """Register a LoRA adapter for a specific checkpoint step.
         This is called when training is skipped but the checkpoint is renamed.
         """
+        logger.info(
+            f"[DEDICATED] register_lora_for_step called: step={step} "
+            f"checkpoint_dir={checkpoint_dir} is_dedicated={self.is_dedicated}"
+        )
         if self.is_dedicated:
             self._latest_step = step
             await self._reload_adapter(checkpoint_dir)
@@ -551,11 +564,15 @@ class UnslothService:
         )
 
         new_step = int(os.path.basename(checkpoint_dir))
+        logger.info(
+            f"[DEDICATED] _train_dedicated: saved checkpoint step={new_step}, "
+            f"reloading adapter..."
+        )
         self._latest_step = new_step
         await self._reload_adapter(checkpoint_dir)
-
-        if verbose:
-            print(f"Dedicated train complete, adapter reloaded for step {new_step}")
+        logger.info(
+            f"[DEDICATED] _train_dedicated: adapter reloaded for step {new_step}"
+        )
 
     async def _train_shared(
         self,
