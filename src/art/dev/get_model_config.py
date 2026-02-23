@@ -1,5 +1,6 @@
 from .engine import EngineArgs
 from .model import InitArgs, InternalModelConfig, PeftArgs, TrainerArgs
+from .validate import is_dedicated_mode
 
 
 def get_model_config(
@@ -12,13 +13,22 @@ def get_model_config(
     if config is None:
         config = InternalModelConfig()
 
-    enable_sleep_mode = config.get("engine_args", {}).get("enable_sleep_mode", True)
+    dedicated = is_dedicated_mode(config)
+
+    if dedicated:
+        enable_sleep_mode = False
+    else:
+        enable_sleep_mode = config.get("engine_args", {}).get("enable_sleep_mode", True)
+
     init_args = InitArgs(
-        fast_inference=False,
         load_in_4bit=True,
         max_seq_length=32768,
         model_name=base_model,
     )
+    # fast_inference triggers in-process vLLM via Unsloth; dedicated mode runs vLLM as a subprocess
+    if not dedicated:
+        init_args["fast_inference"] = False
+
     engine_args = EngineArgs(
         allowed_local_media_path="/tmp",
         enable_sleep_mode=enable_sleep_mode,
@@ -63,10 +73,15 @@ def get_model_config(
         weight_decay=0.1,
     )
     trainer_args.update(config.get("trainer_args", {}))
-    return InternalModelConfig(
+    result = InternalModelConfig(
         init_args=init_args,
         engine_args=engine_args,
         peft_args=peft_args,
         tinker_args=config.get("tinker_args"),
         trainer_args=trainer_args,
     )
+    if "trainer_gpu_ids" in config:
+        result["trainer_gpu_ids"] = config["trainer_gpu_ids"]
+    if "inference_gpu_ids" in config:
+        result["inference_gpu_ids"] = config["inference_gpu_ids"]
+    return result
