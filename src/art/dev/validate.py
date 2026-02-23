@@ -52,3 +52,16 @@ def validate_dedicated_config(config: InternalModelConfig) -> None:
         raise ValueError(
             "trainer_gpu_ids must be contiguous starting from 0 (e.g., [0], [0,1])"
         )
+
+    # Reject settings that are incompatible with dedicated mode
+    if config.get("init_args", {}).get("fast_inference"):
+        raise ValueError(
+            "fast_inference is incompatible with dedicated mode "
+            "(dedicated mode runs vLLM as a subprocess, not in-process)"
+        )
+
+    if config.get("engine_args", {}).get("enable_sleep_mode"):
+        raise ValueError(
+            "enable_sleep_mode is incompatible with dedicated mode "
+            "(dedicated mode runs vLLM on a separate GPU, sleep/wake is not needed)"
+        )

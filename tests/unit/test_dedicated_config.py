@@ -97,6 +97,41 @@ def test_trainer_not_contiguous():
         )
 
 
+def test_dedicated_rejects_fast_inference():
+    with pytest.raises(ValueError, match="fast_inference is incompatible with dedicated"):
+        validate_dedicated_config(
+            InternalModelConfig(
+                trainer_gpu_ids=[0],
+                inference_gpu_ids=[1],
+                init_args={"fast_inference": True},  # type: ignore[typeddict-item]
+            )
+        )
+
+
+def test_dedicated_rejects_enable_sleep_mode():
+    with pytest.raises(
+        ValueError, match="enable_sleep_mode is incompatible with dedicated"
+    ):
+        validate_dedicated_config(
+            InternalModelConfig(
+                trainer_gpu_ids=[0],
+                inference_gpu_ids=[1],
+                engine_args={"enable_sleep_mode": True},  # type: ignore[typeddict-item]
+            )
+        )
+
+
+def test_dedicated_allows_fast_inference_false():
+    """fast_inference=False is fine in dedicated mode (it's the intended state)."""
+    validate_dedicated_config(
+        InternalModelConfig(
+            trainer_gpu_ids=[0],
+            inference_gpu_ids=[1],
+            init_args={"fast_inference": False},  # type: ignore[typeddict-item]
+        )
+    )
+
+
 def test_get_model_config_shared_mode():
     from art.dev.get_model_config import get_model_config
 
