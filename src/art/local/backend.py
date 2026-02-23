@@ -97,6 +97,9 @@ class LocalBackend(Backend):
 
     def _close(self) -> None:
         for _, service in self._services.items():
+            close = getattr(service, "close", None)
+            if close is not None:
+                close()
             close_proxy(service)
 
     async def register(
@@ -145,6 +148,7 @@ class LocalBackend(Backend):
 
     async def _get_service(self, model: TrainableModel) -> ModelService:
         from ..dev.get_model_config import get_model_config
+        from ..dev.validate import is_dedicated_mode, validate_dedicated_config
 
         if model.name not in self._services:
             config = get_model_config(
@@ -152,6 +156,9 @@ class LocalBackend(Backend):
                 output_dir=get_model_dir(model=model, art_path=self._path),
                 config=model._internal_config,
             )
+            validate_dedicated_config(config)
+            dedicated = is_dedicated_mode(config)
+
             is_tinker = config.get("tinker_args") is not None
             if is_tinker:
                 from ..tinker.service import TinkerService
@@ -164,13 +171,19 @@ class LocalBackend(Backend):
                 # When moving the service to a child process, import unsloth
                 # early to maximize optimizations
                 os.environ["IMPORT_UNSLOTH"] = "1"
+
+            if dedicated:
+                os.environ["CUDA_VISIBLE_DEVICES"] = ",".join(
+                    str(g) for g in config["trainer_gpu_ids"]
+                )
+
             self._services[model.name] = service_class(
                 model_name=model.name,
                 base_model=model.base_model,
                 config=config,
                 output_dir=get_model_dir(model=model, art_path=self._path),
             )
-            if not self._in_process:
+            if not dedicated and not self._in_process:
                 # Kill all "model-service" processes to free up GPU memory
                 subprocess.run(["pkill", "-9", "model-service"])
                 self._services[model.name] = move_to_child_process(
