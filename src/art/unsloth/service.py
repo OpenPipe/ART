@@ -362,11 +362,11 @@ class UnslothService:
         logger.info("vLLM subprocess ready on port %d (GPUs: %s)", port, cuda_devices)
         return self._vllm_host, self._vllm_port
 
-    async def _reload_adapter(self, checkpoint_path: str) -> None:
+    async def _reload_adapter(self, checkpoint_path: str, step: int) -> None:
         """Reload LoRA adapter in vLLM subprocess via HTTP."""
         import httpx
 
-        lora_name = f"{self.model_name}@{self._latest_step}"
+        lora_name = f"{self.model_name}@{step}"
         logger.info(
             f"[DEDICATED] _reload_adapter START: lora_name={lora_name} "
             f"path={checkpoint_path}"
@@ -455,8 +455,8 @@ class UnslothService:
             f"checkpoint_dir={checkpoint_dir} is_dedicated={self.is_dedicated}"
         )
         if self.is_dedicated:
+            await self._reload_adapter(checkpoint_dir, step)
             self._latest_step = step
-            await self._reload_adapter(checkpoint_dir)
             return
 
         llm = await self.llm
@@ -568,8 +568,8 @@ class UnslothService:
             f"[DEDICATED] _train_dedicated: saved checkpoint step={new_step}, "
             f"reloading adapter..."
         )
+        await self._reload_adapter(checkpoint_dir, new_step)
         self._latest_step = new_step
-        await self._reload_adapter(checkpoint_dir)
         logger.info(
             f"[DEDICATED] _train_dedicated: adapter reloaded for step {new_step}"
         )

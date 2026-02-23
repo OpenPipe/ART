@@ -146,7 +146,19 @@ class LocalBackend(Backend):
 
         # For LocalBackend, vLLM always serves LoRA adapters with @step suffix
         # Default to step 0 when not specified (the initial checkpoint created at registration)
-        actual_step = step if step is not None else self.__get_step(model)
+        if step is not None:
+            actual_step = step
+        elif model.name in self._services:
+            # In dedicated mode the service tracks which adapter vLLM has
+            # actually loaded.  Reading the filesystem would race: the
+            # checkpoint directory appears before the HTTP reload completes.
+            svc = self._services[model.name]
+            loaded_step = getattr(svc, "_latest_step", None)
+            actual_step = (
+                loaded_step if loaded_step is not None else self.__get_step(model)
+            )
+        else:
+            actual_step = self.__get_step(model)
         name = f"{model.name}@{actual_step}"
         logger.debug(
             f"[BACKEND] _model_inference_name: step_arg={step} "
