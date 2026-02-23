@@ -1,9 +1,13 @@
 """Unsloth training service with decoupled vLLM inference."""
 
 import asyncio
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from functools import cached_property
+import json
+import logging
 import os
+import subprocess
+import sys
 from typing import TYPE_CHECKING, Any, AsyncIterator, Literal, Protocol, cast
 
 from datasets import Dataset
@@ -17,6 +21,7 @@ from vllm.lora.request import LoRARequest
 from vllm.v1.engine.async_llm import AsyncLLM
 
 from .. import dev, types
+from ..dev.validate import is_dedicated_mode
 from ..local.checkpoints import get_last_checkpoint_dir
 from ..preprocessing.inputs import TrainInputs, create_train_inputs
 from ..preprocessing.pack import (
@@ -29,6 +34,8 @@ from ..utils.get_model_step import get_step_from_dir
 from ..utils.output_dirs import get_step_checkpoint_dir
 from ..vllm import get_llm, get_worker, openai_server_task, run_on_workers
 from .train import gc_and_empty_cuda_cache, train
+
+logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from peft.peft_model import PeftModelForCausalLM
@@ -265,27 +272,149 @@ class UnslothService:
     _last_training_mode: Literal["sft", "rl"] | None = None
     _latest_step: int = 0
     _lora_id_counter: int = 1  # Start from 1 since 0 is reserved
+    # Dedicated mode subprocess state
+    _vllm_process: subprocess.Popen | None = field(default=None, repr=False)  # type: ignore[type-arg]
+    _vllm_log_file: Any = field(default=None, repr=False)
+    _vllm_host: str = "127.0.0.1"
+    _vllm_port: int = 0
+
+    @property
+    def is_dedicated(self) -> bool:
+        return is_dedicated_mode(self.config)
 
     def _next_lora_id(self) -> int:
         """Return a new unique LoRA ID to avoid collisions in vLLM."""
         self._lora_id_counter += 1
         return self._lora_id_counter
 
+    # =========================================================================
+    # Dedicated mode: vLLM subprocess lifecycle
+    # =========================================================================
+
+    async def _start_vllm_subprocess(
+        self, lora_path: str, port: int
+    ) -> tuple[str, int]:
+        """Launch vLLM as a subprocess on inference GPUs. Returns (host, port)."""
+        import atexit
+
+        inference_gpu_ids = self.config["inference_gpu_ids"]
+        cuda_devices = ",".join(str(g) for g in inference_gpu_ids)
+
+        engine_args = dict(self.config.get("engine_args", {}))
+        for key in ["model", "enable_sleep_mode"]:
+            engine_args.pop(key, None)
+        engine_args["enable_lora"] = True
+        engine_args["max_loras"] = engine_args.get("max_loras", 2)
+
+        cmd = [
+            sys.executable,
+            "-m",
+            "art.vllm.dedicated_server",
+            f"--model={self.base_model}",
+            f"--port={port}",
+            f"--host={self._vllm_host}",
+            f"--cuda-visible-devices={cuda_devices}",
+            f"--lora-path={lora_path}",
+            f"--served-model-name={self.model_name}@{self._latest_step}",
+            f"--engine-args-json={json.dumps(engine_args)}",
+        ]
+
+        log_dir = os.path.join(self.output_dir, "logs")
+        os.makedirs(log_dir, exist_ok=True)
+        self._vllm_log_file = open(os.path.join(log_dir, "vllm-dedicated.log"), "w")
+
+        self._vllm_process = subprocess.Popen(
+            cmd, stdout=self._vllm_log_file, stderr=subprocess.STDOUT
+        )
+        self._vllm_port = port
+
+        import httpx
+
+        timeout = float(os.environ.get("ART_DEDICATED_VLLM_TIMEOUT", 600))
+        poll_interval = 1.0
+        elapsed = 0.0
+        async with httpx.AsyncClient() as client:
+            while elapsed < timeout:
+                if self._vllm_process.poll() is not None:
+                    raise RuntimeError(
+                        f"vLLM subprocess exited with code {self._vllm_process.returncode}. "
+                        f"Check logs at {log_dir}/vllm-dedicated.log"
+                    )
+                try:
+                    resp = await client.get(
+                        f"http://{self._vllm_host}:{self._vllm_port}/v1/models",
+                        timeout=5.0,
+                    )
+                    if resp.status_code == 200:
+                        break
+                except (httpx.ConnectError, httpx.ReadTimeout):
+                    pass
+                await asyncio.sleep(poll_interval)
+                elapsed += poll_interval
+            else:
+                self.close()
+                raise TimeoutError(
+                    f"vLLM subprocess did not become ready within {timeout}s. "
+                    f"Check logs at {log_dir}/vllm-dedicated.log"
+                )
+
+        atexit.register(self.close)
+        logger.info("vLLM subprocess ready on port %d (GPUs: %s)", port, cuda_devices)
+        return self._vllm_host, self._vllm_port
+
+    async def _reload_adapter(self, checkpoint_path: str) -> None:
+        """Reload LoRA adapter in vLLM subprocess via HTTP."""
+        import httpx
+
+        async with httpx.AsyncClient() as client:
+            response = await client.post(
+                f"http://{self._vllm_host}:{self._vllm_port}/v1/load_lora_adapter",
+                json={
+                    "lora_name": f"{self.model_name}@{self._latest_step}",
+                    "lora_path": checkpoint_path,
+                    "load_inplace": True,
+                },
+                timeout=60.0,
+            )
+            response.raise_for_status()
+
+    def close(self) -> None:
+        """Terminate vLLM subprocess if running."""
+        if self._vllm_process is None:
+            return
+        self._vllm_process.terminate()
+        try:
+            self._vllm_process.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            self._vllm_process.kill()
+            self._vllm_process.wait()
+        self._vllm_process = None
+        if self._vllm_log_file is not None:
+            self._vllm_log_file.close()
+            self._vllm_log_file = None
+
+    # =========================================================================
+    # start_openai_server
+    # =========================================================================
+
     async def start_openai_server(
         self, config: dev.OpenAIServerConfig | None
     ) -> tuple[str, int]:
         lora_path = get_last_checkpoint_dir(self.output_dir)
         if lora_path is None:
-            # Create initial LoRA checkpoint if none exists
             lora_path = get_step_checkpoint_dir(self.output_dir, 0)
             os.makedirs(os.path.dirname(lora_path), exist_ok=True)
             self._state.trainer.save_model(lora_path)
             self._latest_step = 0
         else:
-            # Extract step from checkpoint path
             self._latest_step = get_step_from_dir(self.output_dir)
 
-        # Offload training model to CPU before vLLM starts to free GPU memory
+        if self.is_dedicated:
+            server_args = (config or {}).get("server_args", {})
+            port = server_args.get("port", 8000)
+            return await self._start_vllm_subprocess(lora_path, port)
+
+        # Shared mode: in-process vLLM
         self._state.offload_to_cpu()
 
         server_config = dev.get_openai_server_config(
@@ -304,6 +433,8 @@ class UnslothService:
         ) or "0.0.0.0", server_config.get("server_args", {}).get("port", 8000)
 
     async def vllm_engine_is_sleeping(self) -> bool:
+        if self.is_dedicated:
+            return False
         return self._is_sleeping
 
     async def register_lora_for_step(self, step: int, checkpoint_dir: str) -> None:
@@ -353,6 +484,82 @@ class UnslothService:
         _config: dev.TrainConfig,
         verbose: bool = False,
     ) -> AsyncIterator[dict[str, float]]:
+        if self.is_dedicated:
+            async for result in self._train_dedicated(
+                disk_packed_tensors, config, _config, verbose
+            ):
+                yield result
+            return
+
+        async for result in self._train_shared(
+            disk_packed_tensors, config, _config, verbose
+        ):
+            yield result
+
+    async def _train_dedicated(
+        self,
+        disk_packed_tensors: DiskPackedTensors,
+        config: types.TrainConfig,
+        _config: dev.TrainConfig,
+        verbose: bool = False,
+    ) -> AsyncIterator[dict[str, float]]:
+        """Train in dedicated mode — no sleep/wake, vLLM keeps running on separate GPU."""
+        self._reset_optimizer_if_mode_changed("rl")
+
+        rl_weight_decay = 0.1
+        for param_group in self._state.trainer.optimizer.param_groups:
+            param_group["weight_decay"] = rl_weight_decay
+
+        packed_tensors = packed_tensors_from_dir(**disk_packed_tensors)
+
+        await self._state.results_queue.join()
+
+        if not hasattr(self, "_train_task") or self._train_task is None:
+            self._train_task = asyncio.create_task(
+                train(
+                    trainer=self._state.trainer,
+                    results_queue=self._state.results_queue,
+                )
+            )
+            warmup = True
+        else:
+            warmup = False
+
+        async for result in process_train_batch(
+            packed_tensors=packed_tensors,
+            config=config,
+            _config=_config,
+            inputs_queue=self._state.inputs_queue,
+            results_queue=self._state.results_queue,
+            train_task=self._train_task,
+            trainer=self._state.trainer,
+            peft_model=self._state.peft_model,
+            warmup=warmup,
+            verbose=verbose,
+        ):
+            yield result
+
+        checkpoint_dir = save_checkpoint(
+            trainer=self._state.trainer,
+            output_dir=self.output_dir,
+            verbose=verbose,
+        )
+
+        new_step = int(os.path.basename(checkpoint_dir))
+        self._latest_step = new_step
+        await self._reload_adapter(checkpoint_dir)
+
+        if verbose:
+            print(f"Dedicated train complete, adapter reloaded for step {new_step}")
+
+    async def _train_shared(
+        self,
+        disk_packed_tensors: DiskPackedTensors,
+        config: types.TrainConfig,
+        _config: dev.TrainConfig,
+        verbose: bool = False,
+    ) -> AsyncIterator[dict[str, float]]:
+        """Train in shared mode — sleep/wake cycle with in-process vLLM."""
         llm = await self.llm
 
         # Pause generation to prevent new requests during training
