@@ -57,8 +57,6 @@ def main(argv: list[str] | None = None) -> None:
     )
     from vllm.utils.argparse_utils import FlexibleArgumentParser
 
-    from .server import get_uvicorn_logging_config
-
     engine_args = json.loads(args.engine_args_json)
     server_args = json.loads(args.server_args_json)
 
@@ -91,16 +89,9 @@ def main(argv: list[str] | None = None) -> None:
     namespace = vllm_parser.parse_args(vllm_args)
     validate_parsed_serve_args(namespace)
 
-    log_dir = os.path.join(os.path.dirname(args.lora_path), "..", "logs")
-    os.makedirs(log_dir, exist_ok=True)
-    log_file = os.path.join(log_dir, "vllm-dedicated.log")
-
-    asyncio.run(
-        api_server.run_server(
-            namespace,
-            log_config=get_uvicorn_logging_config(log_file),
-        )
-    )
+    # stdout/stderr are captured to a log file by the parent process,
+    # so no separate uvicorn file handler is needed here.
+    asyncio.run(api_server.run_server(namespace))
 
 
 if __name__ == "__main__":
