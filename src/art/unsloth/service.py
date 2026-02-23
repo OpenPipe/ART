@@ -337,10 +337,12 @@ class UnslothService:
 
         log_dir = os.path.join(self.output_dir, "logs")
         os.makedirs(log_dir, exist_ok=True)
-        self._vllm_log_file = open(os.path.join(log_dir, "vllm-dedicated.log"), "w")
+        self._vllm_log_file = open(
+            os.path.join(log_dir, "vllm-dedicated.log"), "w", buffering=1
+        )
 
         self._vllm_process = subprocess.Popen(
-            cmd, stdout=self._vllm_log_file, stderr=subprocess.STDOUT
+            cmd, stdout=self._vllm_log_file, stderr=subprocess.STDOUT, bufsize=1
         )
         self._vllm_port = port
 
