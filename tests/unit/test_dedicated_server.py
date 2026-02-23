@@ -30,6 +30,7 @@ def test_parse_args_required():
     assert args.served_model_name == "my-model@0"
     assert args.host == "127.0.0.1"
     assert args.engine_args_json == "{}"
+    assert args.server_args_json == "{}"
 
 
 def test_parse_args_with_engine_args():
@@ -70,3 +71,27 @@ def test_parse_args_custom_host():
         ]
     )
     assert args.host == "0.0.0.0"
+
+
+def test_parse_args_with_server_args():
+    args = parse_args(
+        [
+            "--model",
+            "test-model",
+            "--port",
+            "8000",
+            "--cuda-visible-devices",
+            "1",
+            "--lora-path",
+            "/tmp/lora",
+            "--served-model-name",
+            "test@0",
+            "--server-args-json",
+            '{"enable_auto_tool_choice": true, "tool_call_parser": "hermes"}',
+        ]
+    )
+    import json
+
+    server_args = json.loads(args.server_args_json)
+    assert server_args["enable_auto_tool_choice"] is True
+    assert server_args["tool_call_parser"] == "hermes"

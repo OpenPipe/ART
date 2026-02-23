@@ -292,7 +292,10 @@ class UnslothService:
     # =========================================================================
 
     async def _start_vllm_subprocess(
-        self, lora_path: str, port: int
+        self,
+        lora_path: str,
+        port: int,
+        config: dev.OpenAIServerConfig | None = None,
     ) -> tuple[str, int]:
         """Launch vLLM as a subprocess on inference GPUs. Returns (host, port)."""
         import atexit
@@ -300,11 +303,23 @@ class UnslothService:
         inference_gpu_ids = self.config["inference_gpu_ids"]
         cuda_devices = ",".join(str(g) for g in inference_gpu_ids)
 
+        server_config = dev.get_openai_dedicated_server_config(
+            model_name=self.model_name,
+            base_model=self.base_model,
+            lora_path=lora_path,
+            step=self._latest_step,
+            config=config,
+        )
+
+        # Start from model-level engine_args, then overlay server config defaults
         engine_args = dict(self.config.get("engine_args", {}))
-        for key in ["model", "enable_sleep_mode"]:
+        engine_args.update(server_config.get("engine_args", {}))
+        # These are passed as dedicated CLI args or not applicable
+        for key in ["model", "served_model_name", "enable_sleep_mode"]:
             engine_args.pop(key, None)
-        engine_args["enable_lora"] = True
         engine_args["max_loras"] = engine_args.get("max_loras", 2)
+
+        server_args = dict(server_config.get("server_args", {}))
 
         cmd = [
             sys.executable,
@@ -317,6 +332,7 @@ class UnslothService:
             f"--lora-path={lora_path}",
             f"--served-model-name={self.model_name}@{self._latest_step}",
             f"--engine-args-json={json.dumps(engine_args)}",
+            f"--server-args-json={json.dumps(server_args)}",
         ]
 
         log_dir = os.path.join(self.output_dir, "logs")
@@ -419,9 +435,8 @@ class UnslothService:
             self._latest_step = get_step_from_dir(self.output_dir)
 
         if self.is_dedicated:
-            server_args = (config or {}).get("server_args", {})
-            port = server_args.get("port", 8000)
-            return await self._start_vllm_subprocess(lora_path, port)
+            port = (config or {}).get("server_args", {}).get("port", 8000)
+            return await self._start_vllm_subprocess(lora_path, port, config=config)
 
         # Shared mode: in-process vLLM
         self._state.offload_to_cpu()

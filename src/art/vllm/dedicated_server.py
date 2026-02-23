@@ -24,6 +24,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--engine-args-json", default="{}", help="Additional engine args as JSON"
     )
+    parser.add_argument(
+        "--server-args-json",
+        default="{}",
+        help="Additional server args as JSON (tool_call_parser, etc.)",
+    )
     return parser.parse_args(argv)
 
 
@@ -55,6 +60,7 @@ def main(argv: list[str] | None = None) -> None:
     from .server import get_uvicorn_logging_config
 
     engine_args = json.loads(args.engine_args_json)
+    server_args = json.loads(args.server_args_json)
 
     vllm_args = [
         f"--model={args.model}",
@@ -63,21 +69,20 @@ def main(argv: list[str] | None = None) -> None:
         f"--served-model-name={args.served_model_name}",
         "--enable-lora",
         f"--lora-modules={args.served_model_name}={args.lora_path}",
-        "--enable-auto-tool-choice",
-        "--tool-call-parser=hermes",
     ]
-    for key, value in engine_args.items():
-        if value is None:
-            continue
-        cli_key = f"--{key.replace('_', '-')}"
-        if isinstance(value, bool):
-            if value:
-                vllm_args.append(cli_key)
-        elif isinstance(value, list):
-            for item in value:
-                vllm_args.append(f"{cli_key}={item}")
-        else:
-            vllm_args.append(f"{cli_key}={value}")
+    for extra_args in (engine_args, server_args):
+        for key, value in extra_args.items():
+            if value is None:
+                continue
+            cli_key = f"--{key.replace('_', '-')}"
+            if isinstance(value, bool):
+                if value:
+                    vllm_args.append(cli_key)
+            elif isinstance(value, list):
+                for item in value:
+                    vllm_args.append(f"{cli_key}={item}")
+            else:
+                vllm_args.append(f"{cli_key}={value}")
 
     vllm_parser = FlexibleArgumentParser(
         description="vLLM OpenAI-Compatible RESTful API server."
