@@ -8,12 +8,7 @@ from .model import (
     TinkerTrainingClientArgs,
     TrainerArgs,
 )
-from .openai_server import (
-    OpenAIServerConfig,
-    ServerArgs,
-    get_openai_dedicated_server_config,
-    get_openai_server_config,
-)
+from .openai_server import OpenAIServerConfig, ServerArgs, get_openai_server_config
 from .train import TrainConfig, TrainSFTConfig
 from .validate import is_dedicated_mode, validate_dedicated_config
 
@@ -26,7 +21,6 @@ __all__ = [
     "TinkerNativeArgs",
     "TinkerTrainingClientArgs",
     "TrainerArgs",
-    "get_openai_dedicated_server_config",
     "get_openai_server_config",
     "is_dedicated_mode",
     "OpenAIServerConfig",

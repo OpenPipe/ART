@@ -5,50 +5,6 @@ from typing_extensions import TypedDict
 from .engine import EngineArgs
 
 
-def get_openai_dedicated_server_config(
-    model_name: str,
-    base_model: str,
-    lora_path: str,
-    step: int,
-    config: "OpenAIServerConfig | None" = None,
-) -> "OpenAIServerConfig":
-    """Build OpenAI server config for dedicated mode (vLLM as a subprocess).
-
-    Differences from shared mode:
-    - lora_modules uses name=path format (vLLM CLI style, not JSON)
-    - enable_lora is always set in engine_args
-    - served_model_name uses the step-qualified adapter name
-    - No api_key default (subprocess is localhost-only)
-    """
-    if config is None:
-        config = OpenAIServerConfig()
-
-    served_name = f"{model_name}@{step}"
-
-    server_args = ServerArgs(
-        return_tokens_as_token_ids=True,
-        enable_auto_tool_choice=True,
-        tool_call_parser="hermes",
-    )
-    server_args.update(config.get("server_args", {}))
-    # These are handled by dedicated CLI args, not server_args passthrough
-    for key in ("port", "host", "lora_modules", "api_key"):
-        server_args.pop(key, None)  # type: ignore[misc]
-
-    engine_args = EngineArgs(
-        model=base_model,
-        served_model_name=served_name,
-        generation_config="vllm",
-        enable_lora=True,
-    )
-    engine_args.update(config.get("engine_args", {}))
-
-    return OpenAIServerConfig(
-        server_args=server_args,
-        engine_args=engine_args,
-    )
-
-
 def get_openai_server_config(
     model_name: str,
     base_model: str,

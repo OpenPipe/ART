@@ -303,23 +303,25 @@ class UnslothService:
         inference_gpu_ids = self.config["inference_gpu_ids"]
         cuda_devices = ",".join(str(g) for g in inference_gpu_ids)
 
-        server_config = dev.get_openai_dedicated_server_config(
-            model_name=self.model_name,
-            base_model=self.base_model,
-            lora_path=lora_path,
-            step=self._latest_step,
-            config=config,
-        )
+        # Build server_args: ART defaults, then user overrides, strip CLI-handled keys
+        server_args: dict[str, object] = {
+            "return_tokens_as_token_ids": True,
+            "enable_auto_tool_choice": True,
+            "tool_call_parser": "hermes",
+        }
+        server_args.update((config or {}).get("server_args", {}))
+        for key in ("port", "host", "lora_modules", "api_key"):
+            server_args.pop(key, None)
 
-        # Start from model-level engine_args, then overlay server config defaults
+        # Build engine_args: model-level config, then user server overrides,
+        # add dedicated-mode defaults, strip CLI-handled keys
         engine_args = dict(self.config.get("engine_args", {}))
-        engine_args.update(server_config.get("engine_args", {}))
-        # These are passed as dedicated CLI args or not applicable
-        for key in ["model", "served_model_name", "enable_sleep_mode"]:
+        engine_args.update((config or {}).get("engine_args", {}))
+        engine_args.setdefault("generation_config", "vllm")
+        engine_args["enable_lora"] = True
+        engine_args.setdefault("max_loras", 2)
+        for key in ("model", "served_model_name", "enable_sleep_mode"):
             engine_args.pop(key, None)
-        engine_args["max_loras"] = engine_args.get("max_loras", 2)
-
-        server_args = dict(server_config.get("server_args", {}))
 
         cmd = [
             sys.executable,
