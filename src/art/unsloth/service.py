@@ -441,6 +441,11 @@ class UnslothService:
         """Register a LoRA adapter for a specific checkpoint step.
         This is called when training is skipped but the checkpoint is renamed.
         """
+        if self.is_dedicated:
+            self._latest_step = step
+            await self._reload_adapter(checkpoint_dir)
+            return
+
         llm = await self.llm
         await llm.pause_generation()
         added = await llm.add_lora(
