@@ -725,6 +725,10 @@ class UnslothService:
         Yields:
             Dictionary containing training metrics for each batch.
         """
+        if self.is_dedicated:
+            raise NotImplementedError(
+                "train_sft is not yet supported in dedicated mode"
+            )
         import time
 
         llm = await self.llm
