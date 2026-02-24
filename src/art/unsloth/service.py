@@ -309,14 +309,16 @@ class UnslothService:
             "enable_auto_tool_choice": True,
             "tool_call_parser": "hermes",
         }
-        server_args.update((config or {}).get("server_args", {}))
+        if config and "server_args" in config:
+            server_args.update(dict(config["server_args"]))
         for key in ("port", "host", "lora_modules", "api_key"):
             server_args.pop(key, None)
 
         # Build engine_args: model-level config, then user server overrides,
         # add dedicated-mode defaults, strip CLI-handled keys
         engine_args = dict(self.config.get("engine_args", {}))
-        engine_args.update((config or {}).get("engine_args", {}))
+        if config and "engine_args" in config:
+            engine_args.update(dict(config["engine_args"]))
         engine_args.setdefault("generation_config", "vllm")
         engine_args["enable_lora"] = True
         engine_args.setdefault("max_loras", 2)
