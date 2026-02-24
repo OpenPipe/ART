@@ -98,7 +98,9 @@ def test_trainer_not_contiguous():
 
 
 def test_dedicated_rejects_fast_inference():
-    with pytest.raises(ValueError, match="fast_inference is incompatible with dedicated"):
+    with pytest.raises(
+        ValueError, match="fast_inference is incompatible with dedicated"
+    ):
         validate_dedicated_config(
             InternalModelConfig(
                 trainer_gpu_ids=[0],
