@@ -245,9 +245,9 @@ def migrate(
                     model_dir,
                     delete_originals=not keep_jsonl,
                     dry_run=dry_run,
-                    progress_callback=lambda f: typer.echo(f"    {f}")
-                    if verbose
-                    else None,
+                    progress_callback=lambda f: (
+                        typer.echo(f"    {f}") if verbose else None
+                    ),
                 )
                 result = result + model_result
     else:
