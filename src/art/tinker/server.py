@@ -185,7 +185,7 @@ class OpenAICompatibleTinkerServer:
             try:
                 await client.completions.create(model="", prompt="")
                 break  # Server is ready
-            except:
+            except Exception:
                 await asyncio.sleep(0.1)
         return host, port
 
