@@ -2,11 +2,11 @@ import asyncio
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 import inspect
+import itertools as it
 import multiprocessing as mp
 import os
 import sys
 from typing import Any, AsyncGenerator, TypeVar, cast
-import uuid
 
 import nest_asyncio
 import setproctitle
@@ -23,7 +23,7 @@ nest_asyncio.apply()
 T = TypeVar("T")
 
 # Special ID to signal shutdown
-_SHUTDOWN_ID = "__shutdown__"
+_SHUTDOWN_ID = -1
 
 
 def move_to_child_process(
@@ -62,7 +62,7 @@ def close_proxy(proxy: object) -> None:
 
 @dataclass
 class Request:
-    id: str
+    id: int
     method_name: str
     args: tuple[Any, ...]
     kwargs: dict[str, Any]
@@ -71,7 +71,7 @@ class Request:
 
 @dataclass
 class Response:
-    id: str
+    id: int
     result: Any
     exception: Exception | None
 
@@ -91,10 +91,11 @@ class Proxy:
         self._process.start()
         # dedicated executor for queue.get calls
         self._executor = ThreadPoolExecutor()
-        self._futures: dict[str, asyncio.Future] = {}
+        self._futures: dict[int, asyncio.Future] = {}
         self._process_future = asyncio.Future()
         self._handle_responses_task = asyncio.create_task(self._handle_responses())
         self._monitor_task = asyncio.create_task(self._monitor_process())
+        self._next_id = it.count(1).__next__
 
     async def _handle_responses(self) -> None:
         loop = asyncio.get_event_loop()
@@ -148,10 +149,16 @@ class Proxy:
         async def get_response(
             args: tuple[Any, ...],
             kwargs: dict[str, Any],
-            id: uuid.UUID | None = None,
+            id: int | None = None,
             send_value: Any | None = None,
         ) -> Any:
-            request = Request(str(id or uuid.uuid4()), name, args, kwargs, send_value)
+            request = Request(
+                id=id if id is not None else self._next_id(),
+                method_name=name,
+                args=args,
+                kwargs=kwargs,
+                send_value=send_value,
+            )
             self._futures[request.id] = asyncio.Future()
             self._requests.put_nowait(request)
             done, _ = await asyncio.wait(
@@ -169,7 +176,7 @@ class Proxy:
                 *args: Any, **kwargs: Any
             ) -> AsyncGenerator[Any, Any]:
                 try:
-                    id = uuid.uuid4()
+                    id = self._next_id()
                     send_value = None
                     while True:
                         send_value = yield await get_response(
@@ -260,7 +267,7 @@ def _target(
 async def _handle_requests(
     obj: object, requests: mp.Queue, responses: mp.Queue
 ) -> None:
-    generators: dict[str, AsyncGenerator[Any, Any]] = {}
+    generators: dict[int, AsyncGenerator[Any, Any]] = {}
     while True:
         request: Request = await asyncio.get_event_loop().run_in_executor(
             None, requests.get
@@ -272,7 +279,7 @@ async def _handle_request(
     obj: object,
     request: Request,
     responses: mp.Queue,
-    generators: dict[str, AsyncGenerator[Any, Any]],
+    generators: dict[int, AsyncGenerator[Any, Any]],
 ) -> None:
     try:
         result_or_callable = getattr(obj, request.method_name)

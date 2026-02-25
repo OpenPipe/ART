@@ -13,8 +13,6 @@ from tinker.lib.public_interfaces.rest_client import RestClient as TinkerRestCli
 import torch
 import yaml
 
-from art.tinker.cookbook_v import renderers, tokenizer_utils
-
 from .. import dev, types
 from ..loss import loss_fn, shift_tensor
 from ..preprocessing.inputs import TrainInputs, create_train_inputs
@@ -22,7 +20,6 @@ from ..preprocessing.pack import (
     DiskPackedTensors,
     packed_tensors_from_dir,
 )
-from ..preprocessing.tokenize import SFTBatch
 from .server import OpenAICompatibleTinkerServer
 
 
@@ -50,7 +47,7 @@ class TinkerService:
         self._server = OpenAICompatibleTinkerServer(
             host=config.get("host") if config else None,
             port=config.get("port") if config else None,
-            sampling_clients_and_renderers=state.sampling_clients_and_renderers,
+            models=state.models,
         )
         with log_timing("Starting OpenAI-compatible Tinker server"):
             return await self._server.start()
@@ -140,33 +137,45 @@ class TinkerService:
         last_checkpoint_dir = self._get_last_checkpoint_dir()
         assert last_checkpoint_dir is not None, "No checkpoint found"
         next_step = int(last_checkpoint_dir.name) + 1
-        new_sampling_client = await self._save_checkpoint(
+        sampler_path = await self._save_checkpoint(
             last_checkpoint_dir.with_name(f"{next_step:04d}"),
             state.training_client,
         )
-        state.sampling_clients_and_renderers[f"{self.model_name}@{next_step}"] = (
-            new_sampling_client,
-            state.renderer,
-        )
+        state.models[f"{self.model_name}@{next_step}"] = sampler_path
+        state.models[self.model_name] = sampler_path
 
-    # SFT not supported for TinkerService
+    async def register_lora_for_step(self, step: int, checkpoint_dir: str) -> None:
+        """Register a copied checkpoint path for no-train step advances."""
+        state = await self._state_task
+        info_path = Path(checkpoint_dir) / "info.yaml"
+        if not info_path.exists():
+            raise FileNotFoundError(f"Checkpoint metadata not found: {info_path}")
+        info = yaml.safe_load(open(info_path, "r"))
+        if not isinstance(info, dict):
+            raise ValueError(f"Invalid checkpoint metadata format in {info_path}")
+        sampler_path = info.get("sampler_weights_path")
+        if not isinstance(sampler_path, str) or not sampler_path:
+            raise ValueError(f"Missing sampler_weights_path in {info_path}")
+        model_alias = f"{self.model_name}@{step}"
+        state.models[model_alias] = sampler_path
+        state.models[self.model_name] = sampler_path
+        print(f"Registered model {model_alias} from {checkpoint_dir}")
+
     async def train_sft(
         self,
         batches: list[Any],
         verbose: bool = False,
     ) -> AsyncIterator[dict[str, float]]:
         raise NotImplementedError("SFT training is not supported for TinkerService")
-        yield {}  # Make this a generator
+        yield {}
 
     async def delete_checkpoints(self, steps_to_keep: list[int]) -> None:
         state = await self._state_task
-        # Find steps to delete
         steps_to_delete = [
             int(checkpoint_dir.name)
             for checkpoint_dir in self._checkpoints_path.iterdir()
             if int(checkpoint_dir.name) not in steps_to_keep
         ]
-        # Delete checkpoints from disk and Tinker
         await asyncio.gather(
             *[
                 delete_checkpoint(
@@ -175,11 +184,11 @@ class TinkerService:
                 for step in steps_to_delete
             ]
         )
-        # Also remove corresponding sampler clients from state
         for step in steps_to_delete:
-            if f"{self.model_name}@{step}" in state.sampling_clients_and_renderers:
-                del state.sampling_clients_and_renderers[f"{self.model_name}@{step}"]
-                print(f"Removed sampler client for step {step}")
+            model_name = f"{self.model_name}@{step}"
+            if model_name in state.models:
+                del state.models[model_name]
+                print(f"Removed model {model_name} from server")
 
     @cached_property
     def _state_task(self) -> asyncio.Task["TinkerState"]:
@@ -192,19 +201,13 @@ class TinkerService:
         rest_client = service_client.create_rest_client()
         checkpoint_dir = self._get_last_checkpoint_dir()
         if checkpoint_dir:
-            current_step = int(checkpoint_dir.name)
             info = yaml.safe_load(open(checkpoint_dir / "info.yaml", "r"))
             with log_timing("Creating Tinker training client from checkpoint"):
                 training_client = await service_client.create_training_client_from_state_with_optimizer_async(
                     path=info["state_with_optimizer_path"],
                     user_metadata=config.get("user_metadata", None),
                 )
-            with log_timing("Creating Tinker sampling client from checkpoint"):
-                sampling_client = await training_client.create_sampling_client_async(
-                    model_path=info["sampler_weights_path"],
-                )
         else:
-            current_step = 0
             with log_timing("Creating Tinker training client"):
                 training_client_args = config.get("training_client_args", {})
                 if "rank" not in training_client_args:
@@ -217,22 +220,29 @@ class TinkerService:
                         **training_client_args,
                     )
                 )
-            sampling_client = await self._save_checkpoint(
+            await self._save_checkpoint(
                 self._checkpoints_path / "0000", training_client
             )
-        renderer = renderers.get_renderer(
-            name=config["renderer_name"],
-            tokenizer=tokenizer_utils.get_tokenizer(self.base_model),
-        )
         return TinkerState(
             service_client=service_client,
             rest_client=rest_client,
             training_client=training_client,
-            sampling_clients_and_renderers={
-                f"{self.model_name}@{current_step}": (sampling_client, renderer),
-            },
-            renderer=renderer,
+            models=self._build_models_dict(self.base_model),
         )
+
+    def _build_models_dict(self, base_model: str) -> dict[str, str]:
+        """Build models dict from checkpoint info files."""
+        models: dict[str, str] = {base_model: base_model}
+        if not self._checkpoints_path.is_dir():
+            return models
+        for checkpoint_dir in sorted(self._checkpoints_path.iterdir()):
+            info_path = checkpoint_dir / "info.yaml"
+            if info_path.exists():
+                info = yaml.safe_load(open(info_path, "r"))
+                step = int(checkpoint_dir.name)
+                models[f"{self.model_name}@{step}"] = info["sampler_weights_path"]
+                models[self.model_name] = info["sampler_weights_path"]
+        return models
 
     @property
     def _checkpoints_path(self) -> Path:
@@ -249,7 +259,8 @@ class TinkerService:
 
     async def _save_checkpoint(
         self, checkpoint_dir: Path, training_client: tinker.TrainingClient
-    ) -> tinker.SamplingClient:
+    ) -> str:
+        """Save checkpoint and return the sampler weights path."""
         with log_timing("Saving Tinker checkpoint"):
             state_response, sampler_response = await asyncio.gather(
                 *await asyncio.gather(
@@ -266,11 +277,7 @@ class TinkerService:
             },
             open(checkpoint_dir / "info.yaml", "w"),
         )
-        with log_timing("Creating Tinker sampling client"):
-            sampling_client = await training_client.create_sampling_client_async(
-                model_path=sampler_response.path
-            )
-        return sampling_client
+        return sampler_response.path
 
 
 async def delete_checkpoint(
@@ -294,7 +301,4 @@ class TinkerState:
     service_client: tinker.ServiceClient
     rest_client: TinkerRestClient
     training_client: tinker.TrainingClient
-    sampling_clients_and_renderers: dict[
-        str, tuple[tinker.SamplingClient, renderers.Renderer]
-    ]
-    renderer: renderers.Renderer
+    models: dict[str, str]

@@ -1,3 +1,12 @@
+"""Yes-no-maybe training with KL-penalized advantage adjustment.
+
+Demonstrates the kl_penalty_coef feature: tokens where the policy has drifted
+more from the reference model get reduced advantages, while tokens that have
+drifted less get increased advantages.
+
+Uses meta-llama/Meta-Llama-3.1-8B-Instruct as the base model (trained locally).
+"""
+
 import asyncio
 from itertools import permutations
 import os
@@ -6,10 +15,12 @@ from dotenv import load_dotenv
 import openai
 
 import art
-from art.tinker import TinkerBackend
+from art.local import LocalBackend
 
 
-async def rollout(client: openai.AsyncOpenAI, prompt: str) -> art.Trajectory:
+async def rollout(
+    client: openai.AsyncOpenAI, model: art.TrainableModel, prompt: str
+) -> art.Trajectory:
     messages: art.Messages = [
         {
             "role": "user",
@@ -40,29 +51,22 @@ def with_quotes(w: str) -> str:
 async def main():
     load_dotenv()
 
-    backend = TinkerBackend()
-    global model
-    base_model = os.environ.get("BASE_MODEL", "Qwen/Qwen3-30B-A3B-Instruct-2507")
+    backend = LocalBackend()
+    base_model = os.environ.get("BASE_MODEL", "meta-llama/Meta-Llama-3.1-8B-Instruct")
+    kl_penalty_coef = float(os.environ.get("KL_PENALTY_COEF", "0.1"))
     model = art.TrainableModel(
-        name=os.environ.get("MODEL_NAME", "012"),
+        name=os.environ.get("MODEL_NAME", f"kl-{kl_penalty_coef}"),
         project="yes-no-maybe",
         base_model=base_model,
-        # _internal_config=art.dev.InternalModelConfig(
-        #     # engine_args=art.dev.EngineArgs(
-        #     #     max_lora_rank=1,
-        #     # ),
-        #     # peft_args=art.dev.PeftArgs(
-        #     #     r=1,
-        #     # ),
-        #     tinker_args=art.dev.TinkerArgs(
-        #         renderer_name="qwen3_instruct",
-        #         training_client_args=art.dev.TinkerTrainingClientArgs(
-        #             rank=1,
-        #         ),
-        #     ),
-        # ),
     )
     await model.register(backend)
+
+    kl_penalty_reference_step: int | None = (
+        int(os.environ["KL_REF_STEP"])
+        if os.environ.get("KL_REF_STEP") is not None
+        else None
+    )
+    kl_ref_adapter_path: str | None = os.environ.get("KL_REF_ADAPTER_PATH") or None
 
     prompts = [
         f"{prefix} with {', '.join([with_quotes(w) if use_quotes else w for w in words]) if len(words) == 3 else f'{words[0]}' + (f' or {words[1]}' if len(words) > 1 else '')}"
@@ -76,20 +80,30 @@ async def main():
     openai_client = model.openai_client()
     max_steps = int(os.environ.get("NUM_STEPS", "20"))
     start_step = await model.get_step()
-    for _ in range(start_step, start_step + max_steps):
+    for step in range(start_step, start_step + max_steps):
         train_groups = await art.gather_trajectory_groups(
             (
-                art.TrajectoryGroup(rollout(openai_client, prompt) for _ in range(32))
+                art.TrajectoryGroup(
+                    rollout(openai_client, model, prompt) for _ in range(32)
+                )
                 for prompt in prompts
             )
         )
-        await model.train(
+        result = await backend.train(
+            model,
             train_groups,
-            config=art.TrainConfig(learning_rate=1e-4),
-            # _config=art.dev.TrainConfig(
-            #     precalculate_logprobs=True,
-            # ),
+            learning_rate=1e-4,
+            kl_penalty_coef=kl_penalty_coef,
+            kl_penalty_reference_step=kl_penalty_reference_step,
+            kl_ref_adapter_path=kl_ref_adapter_path,
         )
+        await model.log(
+            train_groups,
+            metrics=result.metrics,
+            step=result.step,
+            split="train",
+        )
+        print(f"step {result.step}: {result.metrics}")
 
 
 if __name__ == "__main__":

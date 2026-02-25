@@ -1,5 +1,6 @@
 import asyncio
 import json
+import logging
 import math
 import os
 import shutil
@@ -8,6 +9,8 @@ import subprocess
 from types import TracebackType
 from typing import AsyncIterator, Iterable, Literal, cast
 import warnings
+
+logger = logging.getLogger(__name__)
 
 import aiohttp
 import numpy as np
@@ -97,6 +100,9 @@ class LocalBackend(Backend):
 
     def _close(self) -> None:
         for _, service in self._services.items():
+            close = getattr(service, "close", None)
+            if close is not None:
+                close()
             close_proxy(service)
 
     async def register(
@@ -140,11 +146,29 @@ class LocalBackend(Backend):
 
         # For LocalBackend, vLLM always serves LoRA adapters with @step suffix
         # Default to step 0 when not specified (the initial checkpoint created at registration)
-        actual_step = step if step is not None else self.__get_step(model)
-        return f"{model.name}@{actual_step}"
+        if step is not None:
+            actual_step = step
+        elif model.name in self._services:
+            # In dedicated mode the service tracks which adapter vLLM has
+            # actually loaded.  Reading the filesystem would race: the
+            # checkpoint directory appears before the HTTP reload completes.
+            svc = self._services[model.name]
+            loaded_step = getattr(svc, "_latest_step", None)
+            actual_step = (
+                loaded_step if loaded_step is not None else self.__get_step(model)
+            )
+        else:
+            actual_step = self.__get_step(model)
+        name = f"{model.name}@{actual_step}"
+        logger.debug(
+            f"[BACKEND] _model_inference_name: step_arg={step} "
+            f"actual_step={actual_step} -> {name}"
+        )
+        return name
 
     async def _get_service(self, model: TrainableModel) -> ModelService:
         from ..dev.get_model_config import get_model_config
+        from ..dev.validate import is_dedicated_mode, validate_dedicated_config
 
         if model.name not in self._services:
             config = get_model_config(
@@ -152,6 +176,9 @@ class LocalBackend(Backend):
                 output_dir=get_model_dir(model=model, art_path=self._path),
                 config=model._internal_config,
             )
+            validate_dedicated_config(config)
+            dedicated = is_dedicated_mode(config)
+
             is_tinker = config.get("tinker_args") is not None
             if is_tinker:
                 from ..tinker.service import TinkerService
@@ -164,13 +191,19 @@ class LocalBackend(Backend):
                 # When moving the service to a child process, import unsloth
                 # early to maximize optimizations
                 os.environ["IMPORT_UNSLOTH"] = "1"
+
+            if dedicated:
+                os.environ["CUDA_VISIBLE_DEVICES"] = ",".join(
+                    str(g) for g in config["trainer_gpu_ids"]
+                )
+
             self._services[model.name] = service_class(
                 model_name=model.name,
                 base_model=model.base_model,
                 config=config,
                 output_dir=get_model_dir(model=model, art_path=self._path),
             )
-            if not self._in_process:
+            if not dedicated and not self._in_process:
                 # Kill all "model-service" processes to free up GPU memory
                 subprocess.run(["pkill", "-9", "model-service"])
                 self._services[model.name] = move_to_child_process(
@@ -391,6 +424,10 @@ class LocalBackend(Backend):
         # Core training parameters
         learning_rate: float = 5e-6,
         beta: float = 0.0,
+        # KL-penalized advantage adjustment
+        kl_penalty_coef: float = 0.0,
+        kl_penalty_reference_step: int | None = None,
+        kl_ref_adapter_path: str | None = None,
         # RL algorithm settings
         ppo: bool = False,
         epsilon: float | None = None,
@@ -429,7 +466,16 @@ class LocalBackend(Backend):
             model: The trainable model to train.
             trajectory_groups: Batches of trajectories to train on.
             learning_rate: Learning rate for training. Defaults to 5e-6.
-            beta: KL penalty coefficient. Defaults to 0.0.
+            beta: KL penalty coefficient added to the loss. Defaults to 0.0.
+            kl_penalty_coef: Coefficient for KL-penalized advantage adjustment.
+                Tokens diverging more from the reference get reduced advantages.
+                Defaults to 0.0 (disabled).
+            kl_penalty_reference_step: Checkpoint step of the training model to
+                use as the KL reference. If None, uses the base model (LoRA
+                disabled) as reference.
+            kl_ref_adapter_path: Direct filesystem path to a LoRA adapter
+                checkpoint to use as the KL reference. Alternative to
+                kl_penalty_reference_step.
             ppo: Whether to use PPO clipping. Defaults to False.
             epsilon: Clip epsilon for importance sampling. Defaults based on ppo.
             epsilon_high: Asymmetric upper clip bound. Defaults to epsilon.
@@ -476,11 +522,14 @@ class LocalBackend(Backend):
         groups_list = list(trajectory_groups)
 
         # Build config objects from explicit kwargs
-        config = TrainConfig(learning_rate=learning_rate, beta=beta)
+        config = TrainConfig(
+            learning_rate=learning_rate, beta=beta, kl_penalty_coef=kl_penalty_coef
+        )
         dev_config: dev.TrainConfig = {
             "advantage_balance": advantage_balance,
             "allow_training_without_logprobs": allow_training_without_logprobs,
             "importance_sampling_level": importance_sampling_level,
+            "kl_penalty_coef": kl_penalty_coef,
             "mask_prob_ratio": mask_prob_ratio,
             "plot_tensors": plot_tensors,
             "ppo": ppo,
@@ -503,6 +552,14 @@ class LocalBackend(Backend):
             dev_config["kimi_k2_tau"] = kimi_k2_tau
         if truncated_importance_sampling is not None:
             dev_config["truncated_importance_sampling"] = truncated_importance_sampling
+        if kl_ref_adapter_path is not None:
+            dev_config["kl_ref_adapter_path"] = kl_ref_adapter_path
+        elif kl_penalty_reference_step is not None:
+            ref_checkpoint_dir = get_step_checkpoint_dir(
+                get_model_dir(model=model, art_path=self._path),
+                kl_penalty_reference_step,
+            )
+            dev_config["kl_ref_adapter_path"] = ref_checkpoint_dir
 
         # Collect metrics from training
         training_metrics: list[dict[str, float]] = []
@@ -585,6 +642,10 @@ class LocalBackend(Backend):
             # Still advance the step by renaming the checkpoint directory
             current_step = self.__get_step(model)
             next_step = current_step + 1
+            logger.info(
+                f"[BACKEND] _train_model SKIP: current_step={current_step} "
+                f"next_step={next_step} (all rewards equal)"
+            )
             current_checkpoint_dir = get_step_checkpoint_dir(
                 get_model_dir(model=model, art_path=self._path), current_step
             )
@@ -599,8 +660,9 @@ class LocalBackend(Backend):
                     next_checkpoint_dir,
                     dirs_exist_ok=True,
                 )
-                print(
-                    f"Advanced step from {current_step} to {next_step} (no training occurred)"
+                logger.info(
+                    f"[BACKEND] _train_model SKIP: copied checkpoint "
+                    f"{current_step} -> {next_step}, calling register_lora_for_step..."
                 )
 
                 try:
@@ -610,6 +672,10 @@ class LocalBackend(Backend):
                         await service.register_lora_for_step(  # type: ignore[attr-defined]
                             next_step, next_checkpoint_dir
                         )
+                    logger.info(
+                        f"[BACKEND] _train_model SKIP: register_lora_for_step "
+                        f"completed for step {next_step}"
+                    )
                 except ModuleNotFoundError:
                     pass  # Unsloth is not installed
 

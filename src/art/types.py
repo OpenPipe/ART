@@ -17,6 +17,7 @@ Tools = list[ChatCompletionToolParam]
 class TrainConfig(pydantic.BaseModel):
     learning_rate: float = 5e-6
     beta: float = 0.0
+    kl_penalty_coef: float = 0.0
 
 
 class TrainSFTConfig(pydantic.BaseModel):

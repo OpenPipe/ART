@@ -28,10 +28,9 @@ class LRUTrieCache:
 
     @staticmethod
     def _encode_tokens(tokens: Sequence[int]) -> str:
-        packed = bytearray()
-        for token in tokens:
-            packed.extend(struct.pack(">I", token))
-        return packed.hex()
+        if not tokens:
+            return ""
+        return struct.pack(f">{len(tokens)}I", *tokens).hex()
 
     def lookup(self, rendered_tokens: Sequence[int]) -> PrefixEntry | None:
         key = self._encode_tokens(rendered_tokens)

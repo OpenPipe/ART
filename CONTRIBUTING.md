@@ -41,7 +41,7 @@ These checks are automatically run in CI for all pull requests. If your PR fails
 
 The PR `prek` workflow uses a prebuilt full `uv` cache (stored as a GitHub release asset) to avoid rebuilding heavy dependencies on every run.
 
-To refresh the cache after dependency changes, run:
+To refresh the cache after dependency changes, ensure your branch is rebased or merged with main, or checkout the PR merge branch, then run:
 
 ```bash
 bash scripts/ci/build_and_push_uv_cache.sh

@@ -400,3 +400,9 @@ config:
     pod_config:
       spec:
         schedulerName: gpu-binpack
+        # Work around uv 0.10.5 stripping execute bits from Ray binaries.
+        containers:
+          - name: ray-node
+            env:
+              - name: UV_LINK_MODE
+                value: copy

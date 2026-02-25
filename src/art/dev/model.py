@@ -115,6 +115,11 @@ class InternalModelConfig(TypedDict, total=False):
         peft: Arguments for creating an Unsloth PEFT model wrapper.
         tinker: Arguments for the Tinker training client.
         trainer: Arguments for the GRPO trainer.
+        trainer_gpu_ids: GPU IDs for training (e.g., [0]). When set with
+            inference_gpu_ids, enables dedicated mode where training and
+            inference run on separate GPUs.
+        inference_gpu_ids: GPU IDs for vLLM inference (e.g., [1]). When set
+            with trainer_gpu_ids, enables dedicated mode.
     """
 
     init_args: "InitArgs"
@@ -123,6 +128,8 @@ class InternalModelConfig(TypedDict, total=False):
     tinker_args: "TinkerArgs | None"
     tinker_native_args: "TinkerNativeArgs | None"
     trainer_args: "TrainerArgs"
+    trainer_gpu_ids: list[int]
+    inference_gpu_ids: list[int]
 
 
 class TinkerArgs(TypedDict, total=False):

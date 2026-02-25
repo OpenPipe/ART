@@ -1,6 +1,6 @@
 import asyncio
 from collections import defaultdict
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
 import gc
 import os
 from typing import TYPE_CHECKING, Callable, cast
@@ -138,7 +138,8 @@ def get_compute_loss_fn(trainer: "GRPOTrainer") -> Callable[..., torch.Tensor]:
         )
         if return_new_logprobs:
             return torch.nn.functional.pad(new_logprobs[:, :-1], (1, 0), value=0.0)
-        if config.beta > 0.0:
+        if config.beta > 0.0 or config.kl_penalty_coef > 0.0:
+            ref_adapter = _config.get("kl_ref_adapter_path")
             ref_logprobs, _ = calculate_logprobs(
                 dtype_for_autocasting,
                 trainer,
@@ -148,9 +149,13 @@ def get_compute_loss_fn(trainer: "GRPOTrainer") -> Callable[..., torch.Tensor]:
                 next_input_ids,
                 lm_head_t,
                 chunk_size=chunk_size,
-                inference_mode=True,
-                no_grad=False,
+                # Can't use inference_mode with a custom adapter — inference
+                # tensors don't track version counters, which breaks unsloth's
+                # LoRA kernels. Use no_grad instead.
+                inference_mode=ref_adapter is None,
+                no_grad=ref_adapter is not None,
                 reference_logprobs=True,
+                reference_adapter_name=ref_adapter,
             )
         else:
             ref_logprobs = None
@@ -170,6 +175,8 @@ def get_compute_loss_fn(trainer: "GRPOTrainer") -> Callable[..., torch.Tensor]:
             trainer._metrics["train"]["entropy"].append(loss.mean_entropy.item())
         if config.beta > 0.0:
             trainer._metrics["train"]["kl_div"].append(loss.mean_kl.item())
+        if loss.kl_policy_ref is not None:
+            trainer._metrics["train"]["kl_policy_ref"].append(loss.kl_policy_ref.item())
         return loss.mean_policy_loss + config.beta * loss.mean_kl
 
     return compute_loss
@@ -248,6 +255,26 @@ def calculate_mask(
     return mask
 
 
+@contextmanager
+def _use_adapter(trainer: "GRPOTrainer", adapter_path: str):
+    """Context manager that switches to a named LoRA adapter, then restores the original."""
+    # Sanitize the path to a valid module name (no dots allowed by PyTorch)
+    safe_name = adapter_path.replace(".", "_").replace("/", "_")
+    peft_model = trainer.accelerator.unwrap_model(
+        trainer.model, keep_fp32_wrapper=False
+    )
+    if safe_name not in peft_model.peft_config:
+        peft_model.load_adapter(adapter_path, adapter_name=safe_name)
+    previous_adapter = peft_model.active_adapter
+    if isinstance(previous_adapter, list):
+        previous_adapter = previous_adapter[0]
+    peft_model.set_adapter(safe_name)
+    try:
+        yield
+    finally:
+        peft_model.set_adapter(previous_adapter)
+
+
 def calculate_logprobs(
     dtype_for_autocast: torch.dtype,
     trainer: "GRPOTrainer",
@@ -260,19 +287,22 @@ def calculate_logprobs(
     inference_mode: bool,
     no_grad: bool,
     reference_logprobs: bool,
+    reference_adapter_name: str | None = None,
 ) -> tuple[
     torch.Tensor, torch.Tensor
 ]:  # Returns (log_probs, entropy) both shape [B, S]
+    if reference_logprobs and reference_adapter_name is not None:
+        adapter_ctx = _use_adapter(trainer, reference_adapter_name)
+    elif reference_logprobs:
+        adapter_ctx = trainer.accelerator.unwrap_model(
+            trainer.model, keep_fp32_wrapper=False
+        ).disable_adapter()
+    else:
+        adapter_ctx = nullcontext()
     with (
         torch.inference_mode() if inference_mode else nullcontext(),
         torch.no_grad() if no_grad else nullcontext(),
-        (
-            trainer.accelerator.unwrap_model(
-                trainer.model, keep_fp32_wrapper=False
-            ).disable_adapter()
-            if reference_logprobs
-            else nullcontext()
-        ),
+        adapter_ctx,
         torch.amp.autocast_mode.autocast(device_type="cuda", dtype=dtype_for_autocast),
     ):
         hidden_states = trainer.model(  # type: ignore

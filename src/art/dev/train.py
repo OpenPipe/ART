@@ -17,6 +17,8 @@ positive advantages. Defaults to 0.0 (perfectly balanced)."""
         "token", "sequence", "average", "geometric_average"
     ]
     kimi_k2_tau: float | None
+    kl_penalty_coef: float
+    kl_ref_adapter_path: str | None
     logprob_calculation_chunk_size: int
     mask_prob_ratio: bool
     max_negative_advantage_importance_sampling_weight: float
