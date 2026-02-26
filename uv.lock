@@ -2249,24 +2249,68 @@ wheels = [
 name = "flashinfer-python"
 version = "0.6.1"
 source = { registry = "https://pypi.org/simple" }
+resolution-markers = [
+    "python_full_version >= '3.14' and sys_platform == 'win32'",
+    "python_full_version == '3.13.*' and sys_platform == 'win32'",
+    "python_full_version == '3.12.*' and sys_platform == 'win32'",
+    "python_full_version >= '3.14' and sys_platform == 'emscripten'",
+    "python_full_version == '3.13.*' and sys_platform == 'emscripten'",
+    "python_full_version == '3.12.*' and sys_platform == 'emscripten'",
+    "python_full_version >= '3.14' and sys_platform != 'emscripten' and sys_platform != 'linux' and sys_platform != 'win32'",
+    "python_full_version == '3.13.*' and sys_platform != 'emscripten' and sys_platform != 'linux' and sys_platform != 'win32'",
+    "python_full_version == '3.12.*' and sys_platform != 'emscripten' and sys_platform != 'linux' and sys_platform != 'win32'",
+    "python_full_version < '3.12' and sys_platform == 'win32'",
+    "python_full_version < '3.12' and sys_platform == 'emscripten'",
+    "python_full_version < '3.12' and sys_platform != 'emscripten' and sys_platform != 'linux' and sys_platform != 'win32'",
+]
 dependencies = [
-    { name = "apache-tvm-ffi" },
-    { name = "click" },
-    { name = "einops" },
-    { name = "ninja" },
-    { name = "numpy" },
-    { name = "nvidia-cudnn-frontend" },
-    { name = "nvidia-cutlass-dsl" },
-    { name = "nvidia-ml-py" },
-    { name = "packaging" },
-    { name = "requests" },
-    { name = "tabulate" },
-    { name = "torch" },
-    { name = "tqdm" },
+    { name = "apache-tvm-ffi", marker = "sys_platform != 'linux'" },
+    { name = "click", marker = "sys_platform != 'linux'" },
+    { name = "einops", marker = "sys_platform != 'linux'" },
+    { name = "ninja", marker = "sys_platform != 'linux'" },
+    { name = "numpy", marker = "sys_platform != 'linux'" },
+    { name = "nvidia-cudnn-frontend", marker = "sys_platform != 'linux'" },
+    { name = "nvidia-cutlass-dsl", marker = "sys_platform != 'linux'" },
+    { name = "nvidia-ml-py", marker = "sys_platform != 'linux'" },
+    { name = "packaging", marker = "sys_platform != 'linux'" },
+    { name = "requests", marker = "sys_platform != 'linux'" },
+    { name = "tabulate", marker = "sys_platform != 'linux'" },
+    { name = "torch", marker = "sys_platform != 'linux'" },
+    { name = "tqdm", marker = "sys_platform != 'linux'" },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/68/81/5a84e14df7358d2c2903b18c6f2779bd4b4a6739076d01a847d4c18fb102/flashinfer_python-0.6.1.tar.gz", hash = "sha256:8dc2fc5dc187fc70151d5f39ef560fde8a38117a4f6cf40dce0ddb09cbd4f0bf", size = 5141191, upload-time = "2026-01-14T05:40:27.825Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/76/d5/bca632bb5781689415186421bbee2ad39ae8a39b0996d579c76901e5c66f/flashinfer_python-0.6.1-py3-none-any.whl", hash = "sha256:610dd4ac15e7a0874b79e7577d027cb35133e8dc31dc3137c2f2d6497fe46f18", size = 7580432, upload-time = "2026-01-14T05:40:25.636Z" },
+]
+
+[[package]]
+name = "flashinfer-python"
+version = "0.6.3"
+source = { registry = "https://pypi.org/simple" }
+resolution-markers = [
+    "python_full_version >= '3.14' and sys_platform == 'linux'",
+    "python_full_version == '3.13.*' and sys_platform == 'linux'",
+    "python_full_version == '3.12.*' and sys_platform == 'linux'",
+    "python_full_version < '3.12' and sys_platform == 'linux'",
+]
+dependencies = [
+    { name = "apache-tvm-ffi", marker = "sys_platform == 'linux'" },
+    { name = "click", marker = "sys_platform == 'linux'" },
+    { name = "einops", marker = "sys_platform == 'linux'" },
+    { name = "ninja", marker = "sys_platform == 'linux'" },
+    { name = "numpy", marker = "sys_platform == 'linux'" },
+    { name = "nvidia-cudnn-frontend", marker = "sys_platform == 'linux'" },
+    { name = "nvidia-cutlass-dsl", marker = "sys_platform == 'linux'" },
+    { name = "nvidia-ml-py", marker = "sys_platform == 'linux'" },
+    { name = "packaging", marker = "sys_platform == 'linux'" },
+    { name = "requests", marker = "sys_platform == 'linux'" },
+    { name = "tabulate", marker = "sys_platform == 'linux'" },
+    { name = "torch", marker = "sys_platform == 'linux'" },
+    { name = "tqdm", marker = "sys_platform == 'linux'" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/d6/aa/c564313b42dee7573da4ed0e441844f0c2bd827aecc9f29ea02c3838ffae/flashinfer_python-0.6.3.tar.gz", hash = "sha256:84a762538247a86bc52ff31d9505d161ce1ec059174c1821c87c3ed1e44670fc", size = 5181963, upload-time = "2026-02-06T00:28:23.294Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/33/13/2d95248101d8cb978db9000a4dceafb5b122484a694b53e84df1ac2a7b3d/flashinfer_python-0.6.3-py3-none-any.whl", hash = "sha256:0fe2de934a4b3690c543dafb03f38d7bb4a762431abe8ae4f7292d6fef10c65d", size = 7636254, upload-time = "2026-02-06T00:28:21.234Z" },
 ]
 
 [[package]]
@@ -4181,7 +4225,8 @@ dev = [
     { name = "av" },
     { name = "causal-conv1d" },
     { name = "einops" },
-    { name = "flashinfer-python" },
+    { name = "flashinfer-python", version = "0.6.1", source = { registry = "https://pypi.org/simple" }, marker = "sys_platform != 'linux'" },
+    { name = "flashinfer-python", version = "0.6.3", source = { registry = "https://pypi.org/simple" }, marker = "sys_platform == 'linux'" },
     { name = "mamba-ssm" },
     { name = "megatron-energon", extra = ["av-decode"] },
     { name = "multi-storage-client" },
@@ -5325,7 +5370,7 @@ requires-dist = [
     { name = "unsloth", marker = "extra == 'backend'", specifier = "==2026.2.1" },
     { name = "unsloth-zoo", marker = "extra == 'backend'", specifier = "==2026.2.1" },
     { name = "uvicorn", marker = "extra == 'tinker'", specifier = ">=0.35.0" },
-    { name = "vllm", marker = "sys_platform == 'linux' and extra == 'backend'", specifier = "==0.15.1" },
+    { name = "vllm", marker = "sys_platform == 'linux' and extra == 'backend'", specifier = "==0.16.0" },
     { name = "wandb", marker = "extra == 'backend'", specifier = "==0.25.0" },
     { name = "weave", specifier = ">=0.52.24" },
 ]
@@ -9153,7 +9198,7 @@ wheels = [
 
 [[package]]
 name = "vllm"
-version = "0.15.1"
+version = "0.16.0"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "aiohttp", marker = "sys_platform == 'linux'" },
@@ -9168,7 +9213,7 @@ dependencies = [
     { name = "einops", marker = "sys_platform == 'linux'" },
     { name = "fastapi", extra = ["standard"], marker = "sys_platform == 'linux'" },
     { name = "filelock", marker = "sys_platform == 'linux'" },
-    { name = "flashinfer-python", marker = "sys_platform == 'linux'" },
+    { name = "flashinfer-python", version = "0.6.3", source = { registry = "https://pypi.org/simple" }, marker = "sys_platform == 'linux'" },
     { name = "gguf", marker = "sys_platform == 'linux'" },
     { name = "grpcio", marker = "sys_platform == 'linux'" },
     { name = "grpcio-reflection", marker = "sys_platform == 'linux'" },
@@ -9217,9 +9262,10 @@ dependencies = [
     { name = "watchfiles", marker = "sys_platform == 'linux'" },
     { name = "xgrammar", marker = "(platform_machine == 'aarch64' and sys_platform == 'linux') or (platform_machine == 'arm64' and sys_platform == 'linux') or (platform_machine == 'ppc64le' and sys_platform == 'linux') or (platform_machine == 's390x' and sys_platform == 'linux') or (platform_machine == 'x86_64' and sys_platform == 'linux')" },
 ]
+sdist = { url = "https://files.pythonhosted.org/packages/e6/fa/ab31c88afd21b69a46c3cc80d4017a2d5045a30cc4862dba6eae6eca7865/vllm-0.16.0.tar.gz", hash = "sha256:1f684bb31fbef59d862e2fe666e23a41f1d39d93f86215ce1ce1db89a8f5665b", size = 29197396, upload-time = "2026-02-26T03:09:45.533Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/e7/62/17dd4b80508b26c1a85db4fd9789d4726d3f36c95856a89419a178dda461/vllm-0.15.1-cp38-abi3-manylinux_2_31_aarch64.whl", hash = "sha256:97bfc79b0c29d242c57b0d395e48d2949a868957587b853deb813a985a41ed6e", size = 461362624, upload-time = "2026-02-05T00:18:12.38Z" },
-    { url = "https://files.pythonhosted.org/packages/19/2a/a8fdb1d71dfb5b67485b1755a2cc2e069e72fccfa1787cc6dadb6b4176e8/vllm-0.15.1-cp38-abi3-manylinux_2_31_x86_64.whl", hash = "sha256:d3810299d331fc1031c8a2a9886f1f0e0cc2f14ddad284d337174324b1c83e92", size = 509219874, upload-time = "2026-02-05T00:18:30.377Z" },
+    { url = "https://files.pythonhosted.org/packages/d6/ed/9fafb939bf8326e4a45e62041bf5d1eb73b4f76aff8ef75ae1169df7f3cb/vllm-0.16.0-cp38-abi3-manylinux_2_31_aarch64.whl", hash = "sha256:dfaa14846608fd229dda9d372e2ad3f13854fd09147c2ba36b40579cf3c03804", size = 460494130, upload-time = "2026-02-26T03:02:38.495Z" },
+    { url = "https://files.pythonhosted.org/packages/84/ce/44a5a999eb7116516a8d4a08ab9fe14df773f0da4b243ceffe76b0afe54a/vllm-0.16.0-cp38-abi3-manylinux_2_31_x86_64.whl", hash = "sha256:f066b2a2f8597a4a3ada8fbbfd122b59086864b2260ca42dc81bf9fb57af0c42", size = 508337437, upload-time = "2026-02-26T03:02:55.258Z" },
 ]
 
 [[package]]
