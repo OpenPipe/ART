@@ -82,7 +82,6 @@ __all__ = [
     "gather_trajectory_groups",
     "trajectory_group_batches",
     "Backend",
-    "LocalBackend",
     "LocalTrainResult",
     "ServerlessBackend",
     "ServerlessTrainResult",
