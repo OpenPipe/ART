@@ -18,6 +18,7 @@ class Loss(BaseModel):
     mean_entropy: torch.Tensor | None
     policy_loss_sum: torch.Tensor
     probs_corr: torch.Tensor
+    kl_policy_ref: torch.Tensor | None = None
 
 
 def loss_fn(
@@ -92,6 +93,14 @@ def loss_fn(
         )
     if tau := experimental_config.get("kimi_k2_tau", None):
         advantages -= tau * logprob_diff.detach()
+    kl_policy_ref: torch.Tensor | None = None
+    kl_penalty_coef = experimental_config.get("kl_penalty_coef", 0.0)
+    if kl_penalty_coef > 0 and ref_logprobs is not None:
+        kl_per_token = (new_logprobs - ref_logprobs).detach() * assistant_mask
+        avg_kl = kl_per_token.sum() / (assistant_mask.sum() + 1e-6)
+        kl_penalty = kl_penalty_coef * (avg_kl - kl_per_token) * assistant_mask
+        advantages = advantages + kl_penalty
+        kl_policy_ref = avg_kl
     if ppo:
         policy_loss = -torch.min(
             prob_ratio * advantages,
@@ -139,6 +148,7 @@ def loss_fn(
         mean_entropy=mean_entropy,
         policy_loss_sum=policy_loss.sum(),
         probs_corr=probs_corr,
+        kl_policy_ref=kl_policy_ref,
     )
 
 

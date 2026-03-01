@@ -45,9 +45,13 @@ try:
     import transformers
 
     try:
-        from .transformers.patches import patch_preprocess_mask_arguments
+        from .transformers.patches import (
+            patch_apply_chat_template,
+            patch_preprocess_mask_arguments,
+        )
 
         patch_preprocess_mask_arguments()
+        patch_apply_chat_template()
     except Exception:
         pass
 except ImportError:

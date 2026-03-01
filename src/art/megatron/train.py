@@ -6,7 +6,9 @@ os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 os.environ["TORCH_CUDA_ARCH_LIST"] = "9.0"
 # isort: on
 
+import gc
 import json
+import math
 import shutil
 import time
 from typing import Any, cast
@@ -212,18 +214,13 @@ while True:
     num_sequences = job.disk_packed_tensors["num_sequences"]
     dp_rank = ps.get_data_parallel_rank()
     dp_world_size = ps.get_data_parallel_world_size()
-    indices = list(
-        range(
-            dp_rank,
-            num_sequences,
-            dp_world_size,
-        )
-    )
-    # pad indices
-    if num_sequences % dp_world_size <= dp_rank > 0:
-        indices.append(
-            (list(range(num_sequences)) * (dp_world_size // num_sequences + 1))[dp_rank]
-        )
+    num_indices = math.ceil(num_sequences / dp_world_size)
+    indices = list(range(dp_rank, num_sequences, dp_world_size))
+    if not indices:
+        indices = [dp_rank % num_sequences]
+    # pad indices by repeating & slicing to target length
+    repeat = math.ceil(num_indices / len(indices))
+    indices = (indices * repeat)[:num_indices]
     for index in indices:
         inputs = PackedTensors(  # type: ignore
             **{
@@ -333,6 +330,11 @@ while True:
     os.makedirs(job.optimizer_state_path, exist_ok=True)
     torch.save(optimizer.state_dict(), optimizer_shard_path)
     offload_to_cpu(model, optimizer, rank, offload_state)
+    # Release mmap-backed packed tensor references on all ranks before rank0 cleanup.
+    del packed_tensors
+    if "inputs" in locals():
+        del inputs
+    gc.collect()
     # Ensure all ranks have finished saving before signaling completion
     torch.distributed.barrier()
     if rank == 0:

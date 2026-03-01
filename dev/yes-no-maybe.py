@@ -6,7 +6,7 @@ from dotenv import load_dotenv
 import openai
 
 import art
-from art.local import LocalBackend
+from art.tinker import TinkerBackend
 
 
 async def rollout(client: openai.AsyncOpenAI, prompt: str) -> art.Trajectory:
@@ -40,7 +40,7 @@ def with_quotes(w: str) -> str:
 async def main():
     load_dotenv()
 
-    backend = art.TinkerBackend()
+    backend = TinkerBackend()
     global model
     base_model = os.environ.get("BASE_MODEL", "Qwen/Qwen3-30B-A3B-Instruct-2507")
     model = art.TrainableModel(

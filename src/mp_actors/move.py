@@ -1,12 +1,16 @@
 import asyncio
-from concurrent.futures import ThreadPoolExecutor
+import atexit
+from concurrent.futures import Future, InvalidStateError
 from dataclasses import dataclass
 import inspect
+import itertools as it
 import multiprocessing as mp
 import os
+import queue
 import sys
+import threading
 from typing import Any, AsyncGenerator, TypeVar, cast
-import uuid
+import weakref
 
 import nest_asyncio
 import setproctitle
@@ -23,7 +27,28 @@ nest_asyncio.apply()
 T = TypeVar("T")
 
 # Special ID to signal shutdown
-_SHUTDOWN_ID = "__shutdown__"
+_SHUTDOWN_ID = -1
+_LIVE_PROXIES: weakref.WeakSet[Any] = weakref.WeakSet()
+_ATEXIT_REGISTERED = False
+
+
+def _close_all_live_proxies() -> None:
+    # Best-effort cleanup for callers that forget close_proxy().
+    for proxy in list(_LIVE_PROXIES):
+        try:
+            close = getattr(proxy, "close", None)
+            if callable(close):
+                close()
+        except BaseException:
+            pass
+
+
+def _register_proxy_for_atexit(proxy: "Proxy") -> None:
+    global _ATEXIT_REGISTERED
+    _LIVE_PROXIES.add(proxy)
+    if not _ATEXIT_REGISTERED:
+        atexit.register(_close_all_live_proxies)
+        _ATEXIT_REGISTERED = True
 
 
 def move_to_child_process(
@@ -62,7 +87,7 @@ def close_proxy(proxy: object) -> None:
 
 @dataclass
 class Request:
-    id: str
+    id: int
     method_name: str
     args: tuple[Any, ...]
     kwargs: dict[str, Any]
@@ -71,7 +96,7 @@ class Request:
 
 @dataclass
 class Response:
-    id: str
+    id: int
     result: Any
     exception: Exception | None
 
@@ -89,53 +114,66 @@ class Proxy:
             args=(obj, self._requests, self._responses, log_file, process_name),
         )
         self._process.start()
-        # dedicated executor for queue.get calls
-        self._executor = ThreadPoolExecutor()
-        self._futures: dict[str, asyncio.Future] = {}
-        self._process_future = asyncio.Future()
-        self._handle_responses_task = asyncio.create_task(self._handle_responses())
-        self._monitor_task = asyncio.create_task(self._monitor_process())
+        self._futures: dict[int, Future] = {}
+        self._futures_lock = threading.Lock()
+        self._dead_process_error: RuntimeError | None = None
+        self._closing = False
+        self._closed = False
+        self._next_id = it.count(1).__next__
+        self._dispatcher = threading.Thread(
+            target=self._dispatch_responses, name="mp-actors-dispatch", daemon=True
+        )
+        self._dispatcher.start()
+        _register_proxy_for_atexit(self)
 
-    async def _handle_responses(self) -> None:
-        loop = asyncio.get_event_loop()
-        while True:
-            response: Response = await loop.run_in_executor(
-                self._executor, self._responses.get
+    def _process_error(self) -> RuntimeError:
+        exit_code = self._process.exitcode
+        name = f" '{self._process_name}'" if self._process_name else ""
+        if exit_code is None:
+            return RuntimeError(f"Child process{name} died unexpectedly")
+        if exit_code < 0:
+            return RuntimeError(
+                f"Child process{name} was killed by signal {-exit_code}"
             )
-            # check for shutdown signal
+        return RuntimeError(f"Child process{name} exited with code {exit_code}")
+
+    def _fail_pending(self, error: Exception) -> None:
+        with self._futures_lock:
+            pending = list(self._futures.values())
+            self._futures.clear()
+        for future in pending:
+            if not future.done():
+                try:
+                    future.set_exception(error)
+                except InvalidStateError:
+                    pass
+
+    def _dispatch_responses(self) -> None:
+        while True:
+            try:
+                response: Response = self._responses.get(timeout=0.1)
+            except queue.Empty:
+                if self._closing:
+                    break
+                if self._dead_process_error is None and not self._process.is_alive():
+                    self._dead_process_error = self._process_error()
+                    self._fail_pending(self._dead_process_error)
+                continue
+            except Exception:
+                break
             if response.id == _SHUTDOWN_ID:
                 break
-            # normal processing
-            future = self._futures.pop(response.id, None)
+            with self._futures_lock:
+                future = self._futures.pop(response.id, None)
             if future is None:
                 continue
-            if response.exception:
-                future.set_exception(response.exception)
-            else:
-                future.set_result(response.result)
-
-    async def _monitor_process(self) -> None:
-        """Monitor the child process and set exception if it dies unexpectedly."""
-        loop = asyncio.get_event_loop()
-        while not self._process_future.done():
-            is_alive = await loop.run_in_executor(None, self._process.is_alive)
-            if not is_alive:
-                if not self._process_future.done():
-                    exit_code = self._process.exitcode
-                    name = f" '{self._process_name}'" if self._process_name else ""
-                    if exit_code is None:
-                        exc = RuntimeError(f"Child process{name} died unexpectedly")
-                    elif exit_code < 0:
-                        exc = RuntimeError(
-                            f"Child process{name} was killed by signal {-exit_code}"
-                        )
-                    else:
-                        exc = RuntimeError(
-                            f"Child process{name} exited with code {exit_code}"
-                        )
-                    self._process_future.set_exception(exc)
-                break
-            await asyncio.sleep(0.1)
+            try:
+                if response.exception:
+                    future.set_exception(response.exception)
+                else:
+                    future.set_result(response.result)
+            except InvalidStateError:
+                pass
 
     @streamline_tracebacks()
     def __getattr__(self, name: str) -> Any:
@@ -145,20 +183,33 @@ class Proxy:
                 f"{type(self._obj).__name__} has no attribute '{name}'"
             )
 
-        async def get_response(
+        def response_future(
             args: tuple[Any, ...],
             kwargs: dict[str, Any],
-            id: uuid.UUID | None = None,
+            id: int | None = None,
             send_value: Any | None = None,
-        ) -> Any:
-            request = Request(str(id or uuid.uuid4()), name, args, kwargs, send_value)
-            self._futures[request.id] = asyncio.Future()
-            self._requests.put_nowait(request)
-            done, _ = await asyncio.wait(
-                [self._futures[request.id], self._process_future],
-                return_when=asyncio.FIRST_COMPLETED,
+        ) -> Future:
+            request = Request(
+                id=id if id is not None else self._next_id(),
+                method_name=name,
+                args=args,
+                kwargs=kwargs,
+                send_value=send_value,
             )
-            return done.pop().result()
+            future: Future = Future()
+            with self._futures_lock:
+                if self._dead_process_error:
+                    raise self._dead_process_error
+                if self._closing:
+                    raise RuntimeError("Proxy is closing")
+                self._futures[request.id] = future
+            try:
+                self._requests.put_nowait(request)
+            except BaseException:
+                with self._futures_lock:
+                    self._futures.pop(request.id, None)
+                raise
+            return future
 
         # Check if it's a method or property
         attr = getattr(self._obj, name)
@@ -169,11 +220,11 @@ class Proxy:
                 *args: Any, **kwargs: Any
             ) -> AsyncGenerator[Any, Any]:
                 try:
-                    id = uuid.uuid4()
+                    id = self._next_id()
                     send_value = None
                     while True:
-                        send_value = yield await get_response(
-                            args, kwargs, id, send_value
+                        send_value = yield await asyncio.wrap_future(
+                            response_future(args, kwargs, id, send_value)
                         )
                         args, kwargs = (), {}
                 except StopAsyncIteration:
@@ -184,62 +235,41 @@ class Proxy:
             # Return an async wrapper function
             @streamline_tracebacks()
             async def async_method_wrapper(*args: Any, **kwargs: Any) -> Any:
-                return await get_response(args, kwargs)
+                return await asyncio.wrap_future(response_future(args, kwargs))
 
             return async_method_wrapper
         elif callable(attr):
             # Return a regular function wrapper
             @streamline_tracebacks()
             def method_wrapper(*args: Any, **kwargs: Any) -> Any:
-                return asyncio.run(get_response(args, kwargs))
+                return response_future(args, kwargs).result()
 
             return method_wrapper
         else:
             # For non-callable attributes, get them directly
-            return asyncio.run(get_response(tuple(), dict()))
+            return response_future(tuple(), dict()).result()
 
     def close(self):
-        # Cancel monitoring to avoid false alarms during shutdown
-        if not self._process_future.done():
-            self._process_future.cancel()
-        if hasattr(self, "_monitor_task"):
-            self._monitor_task.cancel()
-
-        # signal the response loop to exit
-        self._responses.put_nowait(Response(_SHUTDOWN_ID, None, None))
-        # wait for the handler to finish
-        if hasattr(self, "_handle_responses_task"):
-            # give it a moment to break
-            try:
-                asyncio.get_event_loop().run_until_complete(self._handle_responses_task)
-            except Exception:
-                pass
+        if self._closed:
+            return
+        self._closed = True
+        _LIVE_PROXIES.discard(self)
+        self._closing = True
+        self._fail_pending(RuntimeError("Proxy is closing"))
 
         # terminate child process and force kill if needed
-        if hasattr(self, "_process"):
-            self._process.terminate()
-            try:
-                self._process.join(timeout=1)
-            except Exception:
-                pass
-            if self._process.is_alive():
-                # Python 3.7+: force kill
-                try:
-                    self._process.kill()
-                except AttributeError:
-                    # fallback: os.kill
-                    if self._process.pid:
-                        os.kill(self._process.pid, 9)
-                self._process.join()
-
-        # shutdown executor cleanly
-        self._executor.shutdown(wait=True)
+        self._process.terminate()
+        self._process.join(timeout=1)
+        if self._process.is_alive():
+            self._process.kill()
+            self._process.join(timeout=1)
 
         # close and cancel queue feeder threads
         self._responses.close()
         self._responses.cancel_join_thread()
         self._requests.close()
         self._requests.cancel_join_thread()
+        self._dispatcher.join(timeout=1)
 
 
 def _target(
@@ -260,19 +290,21 @@ def _target(
 async def _handle_requests(
     obj: object, requests: mp.Queue, responses: mp.Queue
 ) -> None:
-    generators: dict[str, AsyncGenerator[Any, Any]] = {}
+    generators: dict[int, AsyncGenerator[Any, Any]] = {}
     while True:
         request: Request = await asyncio.get_event_loop().run_in_executor(
             None, requests.get
         )
-        asyncio.create_task(_handle_request(obj, request, responses, generators))
+        asyncio.create_task(
+            _handle_request(obj, request, responses, generators)
+        ).add_done_callback(lambda t: None if t.cancelled() else t.exception())
 
 
 async def _handle_request(
     obj: object,
     request: Request,
     responses: mp.Queue,
-    generators: dict[str, AsyncGenerator[Any, Any]],
+    generators: dict[int, AsyncGenerator[Any, Any]],
 ) -> None:
     try:
         result_or_callable = getattr(obj, request.method_name)

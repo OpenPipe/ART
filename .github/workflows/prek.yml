@@ -5,27 +5,124 @@ on:
   push:
     branches: [main]
 
+permissions:
+  contents: read
+
 jobs:
   quality-checks:
-    runs-on: ubuntu-latest
+    runs-on: art-large-runner
+    container:
+      image: pytorch/pytorch:2.9.0-cuda12.8-cudnn9-devel
+    env:
+      CI_BASE_IMAGE: "pytorch/pytorch:2.9.0-cuda12.8-cudnn9-devel"
+      CI_PYTHON_MM: "3.11"
+      CI_UV_CACHE_RELEASE_TAG: "prek-uv-cache"
+      CI_UV_CACHE_ASSET_PREFIX: "prek-uv-cache"
+      UV_CACHE_DIR: "/root/.cache/uv"
+      UV_LINK_MODE: "copy"
+      TORCH_CUDA_ARCH_LIST: "8.0"
 
     steps:
+      - name: Install CI dependencies
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends ca-certificates curl git zstd
+          rm -rf /var/lib/apt/lists/*
+          curl -LsSf https://astral.sh/uv/install.sh | sh
+          echo "/root/.local/bin" >> "${GITHUB_PATH}"
+
       - name: Checkout code
         uses: actions/checkout@v4
 
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.11"
-
-      - name: Install uv
+      - name: Mark workspace as a safe git directory
         run: |
-          curl -LsSf https://astral.sh/uv/install.sh | sh
-          echo "$HOME/.cargo/bin" >> $GITHUB_PATH
+          git config --global --add safe.directory "${GITHUB_WORKSPACE}"
+
+      - name: Compute expected uv cache fingerprint
+        id: expected-uv-fingerprint
+        run: |
+          fp="$(python3 scripts/ci/compute_uv_fingerprint.py \
+            --pyproject pyproject.toml \
+            --uv-lock uv.lock \
+            --base-image "${CI_BASE_IMAGE}" \
+            --python-mm "${CI_PYTHON_MM}")"
+          echo "fingerprint=${fp}" >> "${GITHUB_OUTPUT}"
+          echo "Expected uv cache fingerprint: ${fp}"
+
+      - name: Restore prebuilt uv cache
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          release_api="https://api.github.com/repos/${GITHUB_REPOSITORY}/releases/tags/${CI_UV_CACHE_RELEASE_TAG}"
+          fingerprint="${{ steps.expected-uv-fingerprint.outputs.fingerprint }}"
+          part_prefix="${CI_UV_CACHE_ASSET_PREFIX}-${fingerprint}.tar.zst.part-"
+
+          release_json="$(curl -fsSL \
+            -H "Authorization: Bearer ${GITHUB_TOKEN}" \
+            -H "Accept: application/vnd.github+json" \
+            "${release_api}" || true)"
+
+          if [ -z "${release_json}" ]; then
+            echo "::error::Missing cache release '${CI_UV_CACHE_RELEASE_TAG}'."
+            echo "::error::Build and upload cache with: bash scripts/ci/build_and_push_uv_cache.sh"
+            exit 1
+          fi
+
+          part_selection_file="/tmp/uv-cache-part-selection.txt"
+          if ! RELEASE_JSON="${release_json}" PART_PREFIX="${part_prefix}" python3 -c "import json, os, re, sys; payload=json.loads(os.environ['RELEASE_JSON']); part_prefix=os.environ['PART_PREFIX']; pattern=re.compile(r'^' + re.escape(part_prefix) + r'(\\d{3})$'); parts=[]; [parts.append((int(m.group(1)), int(a.get('id')), a.get('name'))) for a in payload.get('assets', []) for m in [pattern.match(a.get('name', ''))] if m and a.get('id') is not None]; parts.sort(key=lambda x: x[0]); indices=[p[0] for p in parts]; expected=list(range(len(parts))); print('\\n'.join(f'{asset_id} {name}' for _, asset_id, name in parts)) if parts and indices == expected else (_ for _ in ()).throw(SystemExit(2 if not parts else 3))" > "${part_selection_file}"; then
+            echo "::error::No complete uv cache part set found for prefix '${part_prefix}'."
+            echo "::error::Build and upload cache with: bash scripts/ci/build_and_push_uv_cache.sh"
+            exit 1
+          fi
+
+          part_count="$(wc -l < "${part_selection_file}" | tr -d ' ')"
+          echo "Using uv cache part set '${part_prefix}*' (${part_count} parts)."
+
+          parts_dir="/tmp/uv-cache-parts"
+          part_paths_file="/tmp/uv-cache-part-paths.txt"
+          rm -rf "${parts_dir}"
+          mkdir -p "${parts_dir}"
+          awk -v d="${parts_dir}" '{print d "/" $2}' "${part_selection_file}" > "${part_paths_file}"
+
+          PARTS_DIR="${parts_dir}" GITHUB_TOKEN="${GITHUB_TOKEN}" GITHUB_REPOSITORY="${GITHUB_REPOSITORY}" \
+            xargs -n 2 -P 8 sh -c '
+              asset_id="$1"
+              asset_name="$2"
+              part_path="${PARTS_DIR}/${asset_name}"
+              curl -fsSL -L \
+                -H "Authorization: Bearer ${GITHUB_TOKEN}" \
+                -H "Accept: application/octet-stream" \
+                "https://api.github.com/repos/${GITHUB_REPOSITORY}/releases/assets/${asset_id}" \
+                -o "${part_path}"
+            ' sh < "${part_selection_file}"
+
+          while IFS= read -r part_path; do
+            [ -s "${part_path}" ] || {
+              echo "::error::Missing or empty cache part: ${part_path}"
+              exit 1
+            }
+          done < "${part_paths_file}"
+
+          rm -rf "${UV_CACHE_DIR}"
+          mkdir -p "${UV_CACHE_DIR}"
+          while IFS= read -r part_path; do
+            cat "${part_path}"
+          done < "${part_paths_file}" | zstd -d -c | tar -xf - -C "${UV_CACHE_DIR}"
+          du -sh "${UV_CACHE_DIR}"
 
       - name: Install dependencies (with all optional extras for complete type checking)
         run: |
-          uv sync --all-extras
+          py_mm="$(python -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")')"
+          cudnn_path="${GITHUB_WORKSPACE}/.venv/lib/python${py_mm}/site-packages/nvidia/cudnn"
+          export CUDNN_PATH="${cudnn_path}"
+          export CUDNN_HOME="${cudnn_path}"
+          export CUDNN_INCLUDE_PATH="${cudnn_path}/include"
+          export CUDNN_LIBRARY_PATH="${cudnn_path}/lib"
+          export CPLUS_INCLUDE_PATH="${CUDNN_INCLUDE_PATH}${CPLUS_INCLUDE_PATH:+:${CPLUS_INCLUDE_PATH}}"
+          export LIBRARY_PATH="${CUDNN_LIBRARY_PATH}${LIBRARY_PATH:+:${LIBRARY_PATH}}"
+          export LD_LIBRARY_PATH="${CUDNN_LIBRARY_PATH}${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}"
+          uv --version
+          uv sync --all-extras --group dev --frozen
 
       - name: Run prek hooks (lint, format, typecheck, uv.lock, tests)
         run: |

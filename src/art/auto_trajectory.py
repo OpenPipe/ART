@@ -69,10 +69,7 @@ async def capture_auto_trajectory(coroutine: Coroutine[Any, Any, Any]) -> Trajec
 
 class AutoTrajectoryContext:
     def __init__(self) -> None:
-        self.trajectory = Trajectory(
-            messages_and_choices=[],
-            reward=0.0,
-        )
+        self.trajectory = Trajectory()
 
     def __enter__(self) -> Trajectory:
         self.token = auto_trajectory_context_var.set(self)

@@ -1,9 +1,11 @@
+import functools
 from typing import TYPE_CHECKING, Optional, Union
 
 import torch
 from transformers import masking_utils
 from transformers.cache_utils import Cache
 from transformers.configuration_utils import PretrainedConfig
+from transformers.tokenization_utils_base import PreTrainedTokenizerBase
 
 if TYPE_CHECKING:
     from torch.nn.attention.flex_attention import BlockMask
@@ -35,3 +37,19 @@ def _patched_preprocess_mask_arguments(
 
 def patch_preprocess_mask_arguments() -> None:
     masking_utils._preprocess_mask_arguments = _patched_preprocess_mask_arguments  # ty:ignore[invalid-assignment]
+
+
+def patch_apply_chat_template() -> None:
+    """Default return_dict=False in apply_chat_template for transformers v5.
+
+    Transformers v5 changed the default from list[int] to BatchEncoding.
+    This restores the v4 behavior so all call sites get list[int] back.
+    """
+    original = PreTrainedTokenizerBase.apply_chat_template
+
+    @functools.wraps(original)
+    def _patched(self, *args, **kwargs):  # type: ignore
+        kwargs.setdefault("return_dict", False)
+        return original(self, *args, **kwargs)
+
+    PreTrainedTokenizerBase.apply_chat_template = _patched  # type: ignore

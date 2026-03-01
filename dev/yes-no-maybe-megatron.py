@@ -4,6 +4,7 @@ import os
 
 from dotenv import load_dotenv
 import openai
+import torch
 
 import art
 from art.megatron import MegatronBackend
@@ -43,6 +44,12 @@ async def main():
         name=os.environ.get("MODEL_NAME", "megatron-001"),
         project="yes-no-maybe-megatron",
         base_model=base_model,
+        _internal_config=art.dev.InternalModelConfig(
+            engine_args=art.dev.EngineArgs(
+                gpu_memory_utilization=0.8,
+                tensor_parallel_size=torch.cuda.device_count(),
+            ),
+        ),
     )
     await model.register(backend)
 

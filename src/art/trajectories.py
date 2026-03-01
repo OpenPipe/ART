@@ -7,7 +7,6 @@ from typing import (
     Any,
     AsyncGenerator,
     Awaitable,
-    Coroutine,
     Iterable,
     Iterator,
     cast,
@@ -17,7 +16,7 @@ from typing import (
 from openai.types.chat.chat_completion import Choice
 import pydantic
 
-from .types import Messages, MessagesAndChoices, Tools
+from .types import Message, Messages, MessagesAndChoices, Tools
 
 MetadataValue = float | int | str | bool | None
 
@@ -37,21 +36,16 @@ class History(pydantic.BaseModel):
 
 
 class Trajectory(pydantic.BaseModel):
-    messages_and_choices: MessagesAndChoices
+    messages_and_choices: MessagesAndChoices = []
     tools: Tools | None = None
     additional_histories: list[History] = []
     reward: float = 0.0
     initial_policy_version: int | None = None
     final_policy_version: int | None = None
     metrics: dict[str, float | int | bool] = {}
-    auto_metrics: dict[str, float | int | bool] = {}
     metadata: dict[str, MetadataValue] = {}
     logs: list[str] = []
     start_time: datetime = pydantic.Field(default_factory=datetime.now, exclude=True)
-
-    def __init__(self, **data: Any):
-        super().__init__(**data)
-        self.start_time = datetime.now()
 
     def log(self, message: str) -> None:
         self.logs.append(message)
@@ -79,7 +73,7 @@ class Trajectory(pydantic.BaseModel):
 
     # Used for logging to console
     def for_logging(self) -> dict[str, Any]:
-        loggable_dict = {
+        loggable_dict: dict[str, Any] = {
             "reward": self.reward,
             "initial_policy_version": self.initial_policy_version,
             "final_policy_version": self.final_policy_version,
@@ -90,11 +84,13 @@ class Trajectory(pydantic.BaseModel):
             "logs": self.logs,
         }
         for message_or_choice in self.messages_and_choices:
-            trainable = isinstance(message_or_choice, Choice)
-            message = (
-                message_or_choice.message.to_dict() if trainable else message_or_choice  # ty:ignore[possibly-missing-attribute]
-            )
-            loggable_dict["messages"].append({**message, "trainable": trainable})  # ty:ignore[invalid-argument-type, possibly-missing-attribute]
+            if isinstance(message_or_choice, Choice):
+                trainable = True
+                message: dict[str, Any] = message_or_choice.message.to_dict()
+            else:
+                trainable = False
+                message = cast(dict[str, Any], message_or_choice)
+            loggable_dict["messages"].append({**message, "trainable": trainable})
         return loggable_dict
 
 
@@ -104,7 +100,8 @@ def get_messages(messages_and_choices: MessagesAndChoices) -> Messages:
         if isinstance(message_or_choice, Choice):
             content = message_or_choice.message.content or ""
             tool_calls = message_or_choice.message.tool_calls or []
-            messages.append(
+            assistant_message: Message = cast(
+                Message,
                 {
                     "role": "assistant",
                     "content": content,
@@ -118,8 +115,9 @@ def get_messages(messages_and_choices: MessagesAndChoices) -> Messages:
                         if tool_calls
                         else {}
                     ),
-                }
+                },
             )
+            messages.append(assistant_message)
         else:
             # Ensure content is always a string for tokenizer chat templates
             msg = dict(message_or_choice)
@@ -263,7 +261,7 @@ class TrajectoryGroup(pydantic.BaseModel):
         metadata: dict[str, MetadataValue] | None = None,
         metrics: dict[str, float | int | bool] | None = None,
         logs: list[str] | None = None,
-    ) -> "TrajectoryGroup | Coroutine[Any, Any, TrajectoryGroup]":
+    ) -> "TrajectoryGroup | Awaitable[TrajectoryGroup]":
         ts = list(trajectories)
         if any(hasattr(t, "__await__") for t in ts):
 

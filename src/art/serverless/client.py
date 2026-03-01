@@ -126,7 +126,7 @@ class Models(AsyncAPIResource):
             body={
                 "model_id": model_id,
                 "trajectory_groups": [
-                    trajectory_group.model_dump()
+                    trajectory_group.model_dump(mode="json")
                     for trajectory_group in trajectory_groups
                 ],
                 "split": split,

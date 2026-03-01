@@ -60,35 +60,47 @@ async def main():
         base_model="Qwen/Qwen2.5-7B-Instruct",
         _internal_config={"init_args": {"gpu_memory_utilization": 0.775}},
     )
-    backend = LocalBackend()
-    await backend._experimental_pull_from_s3(model)
-    await model.register(backend)
+    with LocalBackend() as backend:
+        if "BACKUP_BUCKET" in os.environ:
+            await backend._experimental_pull_from_s3(
+                model,
+                s3_bucket=os.environ["BACKUP_BUCKET"],
+                verbose=True,
+            )
+        else:
+            print("BACKUP_BUCKET not found in environment variables")
+        await model.register(backend)
 
-    stride = 4
-    for i in range(await model.get_step(), 1_000):
-        val_groups, train_groups = await asyncio.gather(
-            art.gather_trajectory_groups(
-                (
-                    art.TrajectoryGroup(rollout(model, puzzle) for _ in range(2))
-                    for puzzle in val_puzzles
+        stride = 4
+        for i in range(await model.get_step(), 1_000):
+            val_groups, train_groups = await asyncio.gather(
+                art.gather_trajectory_groups(
+                    (
+                        art.TrajectoryGroup(rollout(model, puzzle) for _ in range(2))
+                        for puzzle in val_puzzles
+                    ),
+                    pbar_desc="val",
                 ),
-                pbar_desc="val",
-            ),
-            art.gather_trajectory_groups(
-                (
-                    art.TrajectoryGroup(rollout(model, puzzle) for _ in range(50))
-                    for puzzle in train_puzzles[i * stride : (i + 1) * stride]
+                art.gather_trajectory_groups(
+                    (
+                        art.TrajectoryGroup(rollout(model, puzzle) for _ in range(50))
+                        for puzzle in train_puzzles[i * stride : (i + 1) * stride]
+                    ),
+                    pbar_desc="train",
                 ),
-                pbar_desc="train",
-            ),
-        )
-        await model.log(val_groups)
-        await model.delete_checkpoints()
-        await backend._experimental_push_to_s3(model)
-        result = await backend.train(model, train_groups, learning_rate=5e-5)
-        await model.log(
-            train_groups, metrics=result.metrics, step=result.step, split="train"
-        )
+            )
+            await model.log(val_groups)
+            await model.delete_checkpoints()
+            if "BACKUP_BUCKET" in os.environ:
+                await backend._experimental_push_to_s3(
+                    model,
+                    s3_bucket=os.environ["BACKUP_BUCKET"],
+                    verbose=True,
+                )
+            result = await backend.train(model, train_groups, learning_rate=5e-5)
+            await model.log(
+                train_groups, metrics=result.metrics, step=result.step, split="train"
+            )
 
 
 if __name__ == "__main__":

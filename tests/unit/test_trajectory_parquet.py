@@ -236,8 +236,8 @@ class TestParquetRoundTrip:
                                     "content": "Hi!",
                                     "tool_calls": None,
                                 },
-                            },
-                        ],
+                            },  # type: ignore
+                        ],  # ty:ignore[invalid-argument-type]
                         logs=[],
                     )
                 ],
