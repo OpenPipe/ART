@@ -28,8 +28,14 @@ jobs:
           curl -LsSf https://astral.sh/uv/install.sh | sh
           echo "$HOME/.cargo/bin" >> $GITHUB_PATH
 
+      - name: Install dependencies
+        run: |
+          uv venv
+          uv pip install -e .
+          uv pip install hatch
+
       - name: Build package
-        run: uv build --clear
+        run: uv run hatch build
 
       - name: Get version from pyproject.toml
         id: get_version
