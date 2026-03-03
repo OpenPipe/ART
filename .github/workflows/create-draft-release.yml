@@ -41,10 +41,10 @@ jobs:
           python -m build --sdist --wheel --outdir dist
           WHEEL_PATH=$(ls dist/openpipe_art-*.whl | head -n 1)
           python -m pip install "${WHEEL_PATH}[backend]"
-          python -c "import art, unsloth, transformers, trl; print('ok')"
+          python -c "import importlib.metadata as m, art, transformers, trl; m.version('unsloth'); m.version('unsloth-zoo'); print('ok')"
           uv venv .uv-install-check
           uv pip install --python .uv-install-check/bin/python "${WHEEL_PATH}[backend]"
-          .uv-install-check/bin/python -c "import art, unsloth, transformers, trl; print('ok')"
+          .uv-install-check/bin/python -c "import importlib.metadata as m, art, transformers, trl; m.version('unsloth'); m.version('unsloth-zoo'); print('ok')"
 
       - name: Bump version
         id: bump
