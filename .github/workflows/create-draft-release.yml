@@ -35,10 +35,16 @@ jobs:
           curl -LsSf https://astral.sh/uv/install.sh | sh
           echo "$HOME/.cargo/bin" >> $GITHUB_PATH
 
-      - name: Install dependencies
+      - name: Validate backend artifact installability
         run: |
-          uv venv
-          uv pip install -e .
+          python -m pip install --upgrade pip build
+          python -m build --sdist --wheel --outdir dist
+          WHEEL_PATH=$(ls dist/openpipe_art-*.whl | head -n 1)
+          python -m pip install "${WHEEL_PATH}[backend]"
+          python -c "import art, unsloth, transformers, trl; print('ok')"
+          uv venv .uv-install-check
+          uv pip install --python .uv-install-check/bin/python "${WHEEL_PATH}[backend]"
+          .uv-install-check/bin/python -c "import art, unsloth, transformers, trl; print('ok')"
 
       - name: Bump version
         id: bump

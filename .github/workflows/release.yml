@@ -10,7 +10,46 @@ permissions:
   id-token: write
 
 jobs:
+  backend-artifact-installability:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ['3.11', '3.12']
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Build package artifacts
+        run: |
+          python -m pip install --upgrade pip build
+          python -m build --sdist --wheel --outdir dist
+          ls -lh dist
+          echo "WHEEL_PATH=$(ls dist/openpipe_art-*.whl | head -n 1)" >> "${GITHUB_ENV}"
+
+      - name: Validate backend wheel install with pip
+        run: |
+          python -m pip install "${WHEEL_PATH}[backend]"
+          python -c "import art, unsloth, transformers, trl; print('ok')"
+
+      - name: Install uv
+        run: |
+          curl -LsSf https://astral.sh/uv/install.sh | sh
+          echo "$HOME/.cargo/bin" >> "${GITHUB_PATH}"
+
+      - name: Validate backend wheel install with uv
+        run: |
+          uv venv .uv-install-check
+          uv pip install --python .uv-install-check/bin/python "${WHEEL_PATH}[backend]"
+          .uv-install-check/bin/python -c "import art, unsloth, transformers, trl; print('ok')"
+
   release:
+    needs: backend-artifact-installability
     runs-on: ubuntu-latest
     if: github.event.pull_request.merged == true && startsWith(github.event.pull_request.head.ref, 'release/')
     steps:
