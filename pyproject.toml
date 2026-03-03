@@ -22,8 +22,9 @@ backend = [
     "peft>=0.18.0",
     "hf-xet>=1.1.0",
     "bitsandbytes>=0.45.2",
-    "unsloth==2026.2.1",
-    "unsloth-zoo==2026.2.1",
+    "unsloth==2025.12.9",
+    "unsloth-zoo==2025.12.7",
+    "vllm==0.13.0",
     "torch>=2.8.0",
     "torchao==0.15.0",
     "accelerate==1.7.0",
@@ -38,7 +39,6 @@ backend = [
     "pytest>=8.4.1",
     "nbmake>=1.5.5",
     "gql<4",
-    "vllm==0.15.1 ; sys_platform == 'linux'",
 ]
 megatron = [
     "torch>=2.8.0",
@@ -51,6 +51,34 @@ megatron = [
     "nvidia-ml-py==13.580.82",
     "ml-dtypes>=0.5.0 ; python_full_version < '3.13'",
 ]
+
+# SGLang training environment (main env - NO sglang here, just training deps)
+# SGLang server runs in COMPLETELY SEPARATE venv (just: pip install sglang[srt])
+# Communication between envs is via HTTP (localhost), not Python imports
+sglang = [
+    "peft>=0.14.0",
+    "hf-xet>=1.1.0",
+    "bitsandbytes>=0.45.2",
+    "unsloth==2025.12.9",
+    "unsloth-zoo==2025.12.7",
+    "torch>=2.8.0",
+    "torchao==0.14.1",
+    "accelerate==1.7.0",
+    "awscli>=1.38.1",
+    "setuptools>=78.1.0",
+    "wandb==0.23.1",
+    "transformers>=4.55.2,<=4.57.3",
+    "duckdb>=1.0.0",
+    "pyarrow>=15.0.0",
+    "trl==0.20.0",
+    "nbclient>=0.10.1",
+    "pytest>=8.4.1",
+    "nbmake>=1.5.5",
+    "gql<4",
+    "aiohttp>=3.9.0",
+]
+# NOTE: SGLang server venv is created separately with JUST: pip install "sglang[srt]"
+# Do NOT install ART in the server venv - they communicate via HTTP only
 
 langgraph = [
     "langchain-core>=0.3.51",
@@ -178,6 +206,10 @@ allowed-unresolved-imports = [
     "uvicorn.**",
     "vllm.**",
     "wandb.**",
+    # sglang deps
+    "sglang.**",
+    "flashinfer.**",
+    "flashinfer_python.**",
     # langgraph deps
     "langchain_core.**",
     "langchain_openai.**",
@@ -185,8 +217,6 @@ allowed-unresolved-imports = [
     # plotting deps
     "matplotlib.**",
     "seaborn.**",
-    # megatron deps
-    "megatron.**",
 ]
 
 [dependency-groups]

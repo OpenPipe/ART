@@ -141,25 +141,14 @@ class TinkerService:
             last_checkpoint_dir.with_name(f"{next_step:04d}"),
             state.training_client,
         )
-        state.models[f"{self.model_name}@{next_step}"] = sampler_path
-        state.models[self.model_name] = sampler_path
-
-    async def register_lora_for_step(self, step: int, checkpoint_dir: str) -> None:
-        """Register a copied checkpoint path for no-train step advances."""
-        state = await self._state_task
-        info_path = Path(checkpoint_dir) / "info.yaml"
-        if not info_path.exists():
-            raise FileNotFoundError(f"Checkpoint metadata not found: {info_path}")
-        info = yaml.safe_load(open(info_path, "r"))
-        if not isinstance(info, dict):
-            raise ValueError(f"Invalid checkpoint metadata format in {info_path}")
-        sampler_path = info.get("sampler_weights_path")
-        if not isinstance(sampler_path, str) or not sampler_path:
-            raise ValueError(f"Missing sampler_weights_path in {info_path}")
-        model_alias = f"{self.model_name}@{step}"
-        state.models[model_alias] = sampler_path
-        state.models[self.model_name] = sampler_path
-        print(f"Registered model {model_alias} from {checkpoint_dir}")
+        state.sampling_clients_and_renderers[self.model_name] = (
+            new_sampling_client,
+            state.renderer,
+        )
+        state.sampling_clients_and_renderers[f"{self.model_name}@{next_step}"] = (
+            new_sampling_client,
+            state.renderer,
+        )
 
     async def train_sft(
         self,
@@ -227,7 +216,11 @@ class TinkerService:
             service_client=service_client,
             rest_client=rest_client,
             training_client=training_client,
-            models=self._build_models_dict(self.base_model),
+            sampling_clients_and_renderers={
+                self.model_name: (sampling_client, renderer),
+                f"{self.model_name}@{current_step}": (sampling_client, renderer),
+            },
+            renderer=renderer,
         )
 
     def _build_models_dict(self, base_model: str) -> dict[str, str]:

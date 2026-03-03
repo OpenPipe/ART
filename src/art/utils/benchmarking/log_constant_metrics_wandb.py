@@ -9,7 +9,6 @@ async def log_constant_metrics_wandb(
     model: art.Model,
     num_steps: int,
     split_metrics: dict[str, dict[str, float]],
-    logged_run_name: str | None = None,
 ) -> None:
     """
     Log constant metrics to W&B as horizontal lines across all training steps.
@@ -32,7 +31,7 @@ async def log_constant_metrics_wandb(
     """
     run = wandb.init(
         project=model.project,
-        name=logged_run_name if logged_run_name else model.name,
+        name=model.name,
         reinit="create_new",
     )
 

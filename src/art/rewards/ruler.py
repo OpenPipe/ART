@@ -277,6 +277,10 @@ async def ruler_score_group(
         if len(traj.additional_histories) > 0:
             raise ValueError("Additional histories are not supported by RULER yet.")
 
+    # If no trajectories, return group as-is (preserves exceptions)
+    if not group.trajectories:
+        return group
+
     # Create deep copies to avoid modifying the original trajectories
     # First create shallow copies to avoid issues with unpicklable objects
     new_trajectories = []
@@ -328,4 +332,7 @@ async def ruler_score_group(
         traj.reward = score.score  # Replace reward with RULER score
         traj.log(f"RULER explanation: {score.explanation}")
 
-    return art.TrajectoryGroup(new_trajectories)
+    # Create new group and preserve exceptions from the original group
+    new_group = art.TrajectoryGroup(new_trajectories)
+    new_group.exceptions = group.exceptions[:]  # Copy exceptions
+    return new_group

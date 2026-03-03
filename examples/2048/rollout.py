@@ -57,7 +57,7 @@ async def rollout(
             return await client.chat.completions.create(
                 max_completion_tokens=128,
                 messages=trajectory.messages(),
-                model=model.get_inference_name(),
+                model=model.name,
             )
 
         try:

@@ -1,11 +1,13 @@
-from dataclasses import dataclass
-from itertools import takewhile
+# ruff: noqa: I001
+# Import order is intentional - unsloth MUST be imported before transformers
 import math
 import random
+from dataclasses import dataclass
+from itertools import takewhile
 from typing import Any, Generator, cast
 
-from PIL import Image
 import torch
+from PIL import Image
 from transformers.image_processing_utils import BaseImageProcessor
 from transformers.tokenization_utils_base import PreTrainedTokenizerBase
 
@@ -23,7 +25,6 @@ class TokenizedResult:
     logprobs: list[float]
     pixel_values: torch.Tensor | None
     image_grid_thw: torch.Tensor | None
-    trajectory: Trajectory
     weight: float = 0.0
     prompt_id: int = 0
     prompt_length: int = 0
@@ -39,7 +40,6 @@ class TokenizedResult:
             logprobs=self.logprobs[self.prompt_length :],
             pixel_values=None,
             image_grid_thw=None,
-            trajectory=self.trajectory,
             weight=self.weight,
             prompt_id=self.prompt_id,
             prompt_length=0,
@@ -103,7 +103,6 @@ def tokenize_trajectory_groups(
                     history,
                     advantage,
                     allow_training_without_logprobs,
-                    trajectory,
                 ):
                     trajectory_results.append(result)
             weight = 1 / (
@@ -152,7 +151,6 @@ def tokenize_trajectory(
     history: History,
     advantage: float,
     allow_training_without_logprobs: bool,
-    trajectory: Trajectory,
 ) -> TokenizedResult | None:
     """
     Tokenizes a trajectory and returns a TokenizedResult.
@@ -189,15 +187,18 @@ def tokenize_trajectory(
             tokenize=False,
         ),
     )
-    original_token_ids = cast(
-        list[int],
-        tokenizer.apply_chat_template(
-            cast(list[dict], messages),
-            tools=tools,
-            continue_final_message=True,
-        ),
+    original_token_ids_raw = tokenizer.apply_chat_template(
+        cast(list[dict], messages),
+        tools=tools,
+        continue_final_message=True,
     )
-    sentinal_token_id = max(set(range(tokenizer.vocab_size)) - set(original_token_ids))
+    if hasattr(original_token_ids_raw, "input_ids"):
+        original_token_ids = cast(list[int], list(original_token_ids_raw.input_ids))
+    else:
+        original_token_ids = cast(list[int], list(original_token_ids_raw))
+    sentinal_token_id = max(
+        set(range(cast(int, tokenizer.vocab_size))) - set(original_token_ids)
+    )
     sentinal_token = tokenizer.decode(sentinal_token_id)
     token_template_messages: list[dict[str, Any]] = []
     for original, message in zip(messages_and_choices, messages):
@@ -222,14 +223,15 @@ def tokenize_trajectory(
             )
         else:
             token_template_messages.append(cast(dict[str, Any], message))
-    token_ids = cast(
-        list[int],
-        tokenizer.apply_chat_template(
-            cast(list[dict], token_template_messages),
-            tools=tools,
-            continue_final_message=True,
-        ),
+    token_ids_raw = tokenizer.apply_chat_template(
+        cast(list[dict], token_template_messages),
+        tools=tools,
+        continue_final_message=True,
     )
+    if hasattr(token_ids_raw, "input_ids"):
+        token_ids = cast(list[int], list(token_ids_raw.input_ids))
+    else:
+        token_ids = cast(list[int], list(token_ids_raw))
     assistant_mask: list[int] = [0] * len(token_ids)
     logprobs = [float("nan")] * len(token_ids)
     for message in messages_and_choices:
@@ -253,9 +255,7 @@ def tokenize_trajectory(
                     "via tokenizer.encode(content). This path ignores tool calls."
                 )
             content = message.get("content")
-            assert isinstance(content, str), (
-                "Trajectories must have a 'content' field of type str"
-            )
+            assert isinstance(content, str)
             content_token_ids = tokenizer.encode(
                 content,
                 add_special_tokens=False,
@@ -354,7 +354,6 @@ def tokenize_trajectory(
         logprobs=logprobs,
         pixel_values=pixel_values,
         image_grid_thw=image_grid_thw,
-        trajectory=trajectory,
     )
 
 
@@ -406,6 +405,18 @@ def tokenize_sft_batch(
             ),
         )
 
+            # Single-step tokenization: apply_chat_template with tokenize=True
+            input_ids_raw = tokenizer.apply_chat_template(
+                cast(Any, messages),
+                tools=cast(Any, tools),
+                tokenize=True,
+                add_generation_prompt=False,
+            )
+            if hasattr(input_ids_raw, "input_ids"):
+                input_ids = cast(list[int], list(input_ids_raw.input_ids))
+            else:
+                input_ids = cast(list[int], list(input_ids_raw))
+        # Create attention mask (all 1s - no padding yet)
         attention_mask = [1] * len(input_ids)
 
         labels = train_on_responses_only_fn({"input_ids": [input_ids]})["labels"][0]
