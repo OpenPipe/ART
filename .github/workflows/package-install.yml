@@ -1,0 +1,52 @@
+name: Package Install
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  install-smoke-test:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install uv
+        run: |
+          curl -LsSf https://astral.sh/uv/install.sh | sh
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+
+      - name: Build distributions
+        run: uv build --sdist --wheel --out-dir dist
+
+      - name: Create clean virtual environment
+        run: python -m venv /tmp/art-install-venv
+
+      - name: Install package from built distribution
+        run: |
+          source /tmp/art-install-venv/bin/activate
+          python -m pip install --upgrade pip
+          python -m pip install dist/*.whl
+          python -m pip check
+
+      - name: Smoke test installed package
+        run: |
+          source /tmp/art-install-venv/bin/activate
+          art --help > /dev/null
+          python - <<'PY'
+          from pathlib import Path
+
+          import art
+
+          print(f"Imported art from: {Path(art.__file__).resolve()}")
+          PY
