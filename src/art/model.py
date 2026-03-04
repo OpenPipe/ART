@@ -714,6 +714,9 @@ class TrainableModel(Model[ModelConfig, StateType], Generic[ModelConfig, StateTy
             report_metrics=report_metrics,
             **kwargs,
         )
+        if _internal_config is not None:
+            # Bypass BaseModel __setattr__ to allow setting private attr
+            object.__setattr__(self, "_internal_config", _internal_config)
         object.__setattr__(self, "_costs_lock", asyncio.Lock())
         object.__setattr__(self, "_cost_calculator", self._noop_cost_calculator)
         if _internal_config is not None:
