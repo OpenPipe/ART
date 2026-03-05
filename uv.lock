@@ -5327,8 +5327,8 @@ requires-dist = [
     { name = "transformers", marker = "extra == 'tinker'", specifier = ">=4.55.2,<=4.57.3" },
     { name = "trl", marker = "extra == 'backend'", specifier = "==0.20.0" },
     { name = "typer", specifier = ">=0.15.2" },
-    { name = "unsloth", marker = "extra == 'backend'", specifier = "==2025.12.9" },
-    { name = "unsloth-zoo", marker = "extra == 'backend'", specifier = "==2025.12.7" },
+    { name = "unsloth", marker = "extra == 'backend'", specifier = "==2026.3.3" },
+    { name = "unsloth-zoo", marker = "extra == 'backend'", specifier = "==2026.3.1" },
     { name = "uvicorn", marker = "extra == 'tinker'", specifier = ">=0.35.0" },
     { name = "vllm", marker = "sys_platform == 'linux' and extra == 'backend'", specifier = "==0.15.1" },
     { name = "wandb", marker = "extra == 'backend'", specifier = "==0.25.0" },
@@ -8941,7 +8941,7 @@ wheels = [
 
 [[package]]
 name = "unsloth"
-version = "2025.12.9"
+version = "2026.3.3"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "accelerate" },
@@ -8968,14 +8968,14 @@ dependencies = [
     { name = "wheel" },
     { name = "xformers", marker = "(platform_machine == 'AMD64' and 'linux' in sys_platform) or (platform_machine == 'x86_64' and 'linux' in sys_platform) or (platform_machine == 'AMD64' and sys_platform == 'win32') or (platform_machine == 'x86_64' and sys_platform == 'win32')" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/9c/bd/5e9848b122465a979fa08cfc6e1e55867bb581a6a06d0f5210d712fe12ef/unsloth-2025.12.9.tar.gz", hash = "sha256:5d8581aef6a5c8e525a8d0e4363f58624866661981b9451c93fe505bddb07ef7", size = 4772694, upload-time = "2025-12-23T13:53:20.654Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/04/78/26b0d5299d9ccbc8ce72933729ef309f57c2991edbb6d70c41a93cb6438c/unsloth-2026.3.3.tar.gz", hash = "sha256:80cb3dd56381117175888cc7caa662ff160704a5cc39b44eee54f8d15ad8522a", size = 4855357, upload-time = "2026-03-03T16:31:25.518Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/8e/21/016951db8995b2011f70f673d303264666fb0f1f41ba73c6168f1b8d5cad/unsloth-2025.12.9-py3-none-any.whl", hash = "sha256:4ca70f46146ababefa29e3e510f81c8db705e549a7209b62c21da79815ec3791", size = 376137, upload-time = "2025-12-23T13:53:13.744Z" },
+    { url = "https://files.pythonhosted.org/packages/a2/3a/88b536416afdd091aefe42682d7654c19b613a23f43d2a8d8ccb529266fd/unsloth-2026.3.3-py3-none-any.whl", hash = "sha256:9378fec4e9132bd0ff50822903eff52e346b19f01c86dbb26dd60a31a3dafb4c", size = 446976, upload-time = "2026-03-03T16:31:15.216Z" },
 ]
 
 [[package]]
 name = "unsloth-zoo"
-version = "2025.12.7"
+version = "2026.3.1"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "accelerate" },
@@ -8998,15 +8998,14 @@ dependencies = [
     { name = "tqdm" },
     { name = "transformers" },
     { name = "triton", marker = "'linux' in sys_platform" },
-    { name = "triton-windows", marker = "(platform_machine == 'AMD64' and sys_platform == 'win32') or (platform_machine == 'x86_64' and sys_platform == 'win32')" },
     { name = "trl" },
     { name = "typing-extensions" },
     { name = "tyro" },
     { name = "wheel" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/35/f3/e098b4f217db2df42ea2852d429cf2ea0b8fb844250419f977206947ab6c/unsloth_zoo-2025.12.7.tar.gz", hash = "sha256:a610d611295e5f1ce199782540cd818c4a005ed235eff81a1728c5728d371452", size = 271430, upload-time = "2025-12-23T13:47:38.449Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/6d/a9/d8ca0a75359e25666c77feea64b2d069d4504575abec8e8a8ca9ecba4050/unsloth_zoo-2026.3.1.tar.gz", hash = "sha256:3f1cdc21e06daf9f6be522dcfa2a125f4a76f12f0a760e0a40a27cc43800b165", size = 363746, upload-time = "2026-03-03T15:00:23.79Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/82/c6/3b46454b46834bbab9ca1769454cfcb8783ae32b008d222ce85ee8026a4f/unsloth_zoo-2025.12.7-py3-none-any.whl", hash = "sha256:acce67bdb22a2386b542e658bffdedf176adccf25dbae4dc644b85306c6114ba", size = 290713, upload-time = "2025-12-23T13:47:37.166Z" },
+    { url = "https://files.pythonhosted.org/packages/a0/f2/c0b7983f1803901574727f857a0ab571d263cea5ec277d2683f4ff014a2b/unsloth_zoo-2026.3.1-py3-none-any.whl", hash = "sha256:e41e4cefad55307025f72e79a9b961d8e82cc495b4a71780ee70997d88f42190", size = 393768, upload-time = "2026-03-03T15:00:22.245Z" },
 ]
 
 [[package]]

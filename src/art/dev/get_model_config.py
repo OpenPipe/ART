@@ -60,6 +60,7 @@ def get_model_config(
         adam_beta2=0.99,
         disable_tqdm=True,
         gradient_accumulation_steps=1,
+        gradient_checkpointing=True,
         learning_rate=5e-6,
         logging_steps=1,
         lr_scheduler_type="constant",
