@@ -63,8 +63,8 @@ model = provider.provide_distributed_model(
     data_parallel_random_init=False,
 )
 
-rank = torch.distributed.get_rank()
-world_size = torch.distributed.get_world_size()
+rank = torch.distributed.get_rank()  # ty:ignore[possibly-missing-attribute]
+world_size = torch.distributed.get_world_size()  # ty:ignore[possibly-missing-attribute]
 
 if rank == 0:
     print("TORCHINDUCTOR_CACHE_DIR:", os.environ["TORCHINDUCTOR_CACHE_DIR"])
@@ -141,7 +141,7 @@ offload_state = OffloadState()
 offload_to_cpu(model, optimizer, rank, offload_state)
 
 while True:
-    torch.distributed.barrier()
+    torch.distributed.barrier()  # ty:ignore[possibly-missing-attribute]
     jobs_dir = "/tmp/megatron_training_jobs"
     os.makedirs(jobs_dir, exist_ok=True)
     job_names = sorted(
@@ -259,9 +259,9 @@ while True:
             for param in chunk.parameters():
                 if param.grad is None:
                     continue
-                torch.distributed.all_reduce(
+                torch.distributed.all_reduce(  # ty:ignore[possibly-missing-attribute]
                     param.grad,
-                    op=torch.distributed.ReduceOp.AVG,
+                    op=torch.distributed.ReduceOp.AVG,  # ty:ignore[possibly-missing-attribute]
                     group=ps.get_data_parallel_group(),
                 )
                 num_grads += 1
@@ -276,7 +276,7 @@ while True:
         optimizer.zero_grad()
 
         # Mean reduce loss across all ranks for logging
-        torch.distributed.all_reduce(loss, op=torch.distributed.ReduceOp.AVG)
+        torch.distributed.all_reduce(loss, op=torch.distributed.ReduceOp.AVG)  # ty:ignore[possibly-missing-attribute]
 
         if rank == 0:
             with open("/tmp/megatron_training_log.jsonl", "a+") as log_file:
@@ -322,7 +322,7 @@ while True:
     gc.collect()
     torch.cuda.empty_cache()
     # Ensure all ranks have finished saving before signaling completion
-    torch.distributed.barrier()
+    torch.distributed.barrier()  # ty:ignore[possibly-missing-attribute]
     if rank == 0:
         os.remove(job_path)
         with open("/tmp/megatron_training_log.jsonl", "a+") as log_file:

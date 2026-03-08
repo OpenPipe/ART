@@ -250,7 +250,7 @@ class SFTTrainingJobs(AsyncAPIResource):
 
     @cached_property
     def events(self) -> "TrainingJobEvents":
-        return TrainingJobEvents(cast(AsyncOpenAI, self._client))
+        return TrainingJobEvents(cast(AsyncOpenAI, self._client))  # ty:ignore[redundant-cast]
 
 
 class Client(AsyncAPIClient):

@@ -296,7 +296,7 @@ class OpenAICompatibleTinkerServer:
 
     def _default_num_workers(self) -> int:
         try:
-            return max(1, len(os.sched_getaffinity(0)))
+            return max(1, len(os.sched_getaffinity(0)))  # ty:ignore[unresolved-attribute]
         except (AttributeError, OSError):
             return os.cpu_count() or 1
 

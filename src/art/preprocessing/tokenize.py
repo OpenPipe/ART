@@ -347,7 +347,7 @@ def tokenize_trajectory(
     return TokenizedResult(
         advantage=advantage,
         chat=chat,
-        tokens=[cast(str, tokenizer.decode(token_id)) for token_id in token_ids],
+        tokens=[tokenizer.decode(token_id) for token_id in token_ids],
         token_ids=token_ids,
         input_pos=list(range(len(token_ids))),
         assistant_mask=assistant_mask,

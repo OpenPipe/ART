@@ -448,9 +448,9 @@ class Qwen3VLRenderer(Qwen3Renderer):
             base_parts: list[ImagePart | TextPart] = []
             for p in content:
                 if p["type"] == "text":
-                    base_parts.append(cast(TextPart, p))
+                    base_parts.append(p)
                 elif p["type"] == "image":
-                    base_parts.append(cast(ImagePart, p))
+                    base_parts.append(p)
                 elif p["type"] == "thinking":
                     if not strip_thinking:
                         # Render thinking as <think>...</think> text
