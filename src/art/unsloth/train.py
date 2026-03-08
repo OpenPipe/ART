@@ -138,7 +138,7 @@ def get_compute_loss_fn(trainer: "GRPOTrainer") -> Callable[..., torch.Tensor]:
         )
         if return_new_logprobs:
             return torch.nn.functional.pad(new_logprobs[:, :-1], (1, 0), value=0.0)
-        if config.beta > 0.0 or config.kl_penalty_coef > 0.0:
+        if config.kl_penalty_coef > 0.0:
             ref_adapter = _config.get("kl_ref_adapter_path")
             ref_logprobs, _ = calculate_logprobs(
                 dtype_for_autocasting,
@@ -173,11 +173,9 @@ def get_compute_loss_fn(trainer: "GRPOTrainer") -> Callable[..., torch.Tensor]:
         trainer._metrics["train"]["policy_loss"].append(loss.mean_policy_loss.item())
         if loss.mean_entropy is not None:
             trainer._metrics["train"]["entropy"].append(loss.mean_entropy.item())
-        if config.beta > 0.0:
-            trainer._metrics["train"]["kl_div"].append(loss.mean_kl.item())
         if loss.kl_policy_ref is not None:
             trainer._metrics["train"]["kl_policy_ref"].append(loss.kl_policy_ref.item())
-        return loss.mean_policy_loss + config.beta * loss.mean_kl
+        return loss.mean_policy_loss
 
     return compute_loss
 

@@ -250,7 +250,7 @@ while True:
         )
         probs_corr = loss.probs_corr.item()
         print0("Correlation between old and new probabilities:", probs_corr)
-        loss = loss.mean_policy_loss + config.beta * loss.mean_kl
+        loss = loss.mean_policy_loss
         loss.backward()
         # Reduce LoRA grads
         start = time.perf_counter()

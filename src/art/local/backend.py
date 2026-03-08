@@ -427,7 +427,6 @@ class LocalBackend(Backend):
         *,
         # Core training parameters
         learning_rate: float = 5e-6,
-        beta: float = 0.0,
         # KL-penalized advantage adjustment
         kl_penalty_coef: float = 0.0,
         kl_penalty_reference_step: int | None = None,
@@ -470,7 +469,6 @@ class LocalBackend(Backend):
             model: The trainable model to train.
             trajectory_groups: Batches of trajectories to train on.
             learning_rate: Learning rate for training. Defaults to 5e-6.
-            beta: KL penalty coefficient added to the loss. Defaults to 0.0.
             kl_penalty_coef: Coefficient for KL-penalized advantage adjustment.
                 Tokens diverging more from the reference get reduced advantages.
                 Defaults to 0.0 (disabled).
@@ -527,7 +525,7 @@ class LocalBackend(Backend):
 
         # Build config objects from explicit kwargs
         config = TrainConfig(
-            learning_rate=learning_rate, beta=beta, kl_penalty_coef=kl_penalty_coef
+            learning_rate=learning_rate, kl_penalty_coef=kl_penalty_coef
         )
         dev_config: dev.TrainConfig = {
             "advantage_balance": advantage_balance,

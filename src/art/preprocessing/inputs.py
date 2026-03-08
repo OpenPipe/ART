@@ -41,9 +41,7 @@ def create_train_inputs(
             [None] if warmup else packed_tensors["image_grid_thw"][offset : offset + 1]
         ),
         config=(
-            config.model_copy(
-                update={"learning_rate": 1e-9, "beta": 0.0, "kl_penalty_coef": 0.0}
-            )
+            config.model_copy(update={"learning_rate": 1e-9, "kl_penalty_coef": 0.0})
             if warmup
             else config
         ),

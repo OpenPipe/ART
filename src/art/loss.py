@@ -14,7 +14,6 @@ if TYPE_CHECKING:
 class Loss(BaseModel):
     model_config = ConfigDict(arbitrary_types_allowed=True)
     mean_policy_loss: torch.Tensor
-    mean_kl: torch.Tensor
     mean_entropy: torch.Tensor | None
     policy_loss_sum: torch.Tensor
     probs_corr: torch.Tensor
@@ -124,16 +123,8 @@ def loss_fn(
             logprob_diff = old_logprobs - original_logprobs
             prob_ratio = torch.exp(logprob_diff)
         policy_loss *= torch.clamp(prob_ratio, max=upper_bound).detach()
-    if ref_logprobs is not None:
-        kl_div = (
-            torch.exp(ref_logprobs - new_logprobs) - (ref_logprobs - new_logprobs) - 1.0
-        )
-    else:
-        kl_div = torch.zeros_like(policy_loss)
     policy_loss = policy_loss * weights * assistant_mask
-    kl_div = kl_div * weights * assistant_mask
     mean_policy_loss = policy_loss.sum() / (assistant_mask.sum() + 1e-6)
-    mean_kl = kl_div.sum() / (assistant_mask.sum() + 1e-6)
     # Compute mean entropy for the current step
     if entropies is not None:
         shifted_entropies = shift_tensor(entropies, 0.0)
@@ -144,7 +135,6 @@ def loss_fn(
         mean_entropy = None
     return Loss(
         mean_policy_loss=mean_policy_loss,
-        mean_kl=mean_kl,
         mean_entropy=mean_entropy,
         policy_loss_sum=policy_loss.sum(),
         probs_corr=probs_corr,

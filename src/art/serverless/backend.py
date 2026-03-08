@@ -149,7 +149,6 @@ class ServerlessBackend(Backend):
         *,
         # Core training parameters
         learning_rate: float = 5e-6,
-        beta: float = 0.0,
         # RL algorithm settings
         ppo: bool = False,
         epsilon: float | None = None,
@@ -179,7 +178,6 @@ class ServerlessBackend(Backend):
             model: The trainable model to train.
             trajectory_groups: Batches of trajectories to train on.
             learning_rate: Learning rate for training. Defaults to 5e-6.
-            beta: KL penalty coefficient. Defaults to 0.0.
             ppo: Whether to use PPO clipping. Defaults to False.
             epsilon: Clip epsilon for importance sampling. Defaults based on ppo.
             epsilon_high: Asymmetric upper clip bound. Defaults to epsilon.
@@ -212,7 +210,7 @@ class ServerlessBackend(Backend):
         groups_list = list(trajectory_groups)
 
         # Build config objects from explicit kwargs
-        config = TrainConfig(learning_rate=learning_rate, beta=beta)
+        config = TrainConfig(learning_rate=learning_rate)
         dev_config: dev.TrainConfig = {
             "advantage_balance": advantage_balance,
             "importance_sampling_level": importance_sampling_level,
