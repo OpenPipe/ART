@@ -12,6 +12,17 @@ ENV MAX_JOBS=${BUILD_JOBS}
 ENV NINJAFLAGS=-j${BUILD_JOBS}
 ENV TORCH_CUDA_ARCH_LIST=8.0
 
+# cuDNN headers are provided by the pip nvidia-cudnn package installed into
+# the venv.  Set the paths up front so native extensions that compile later
+# in the same uv sync (e.g. transformer-engine-torch) can find them.
+ENV CUDNN_PATH=/opt/art-uv-cache/.venv/lib/python${CI_PYTHON_MM}/site-packages/nvidia/cudnn
+ENV CUDNN_HOME=${CUDNN_PATH}
+ENV CUDNN_INCLUDE_PATH=${CUDNN_PATH}/include
+ENV CUDNN_LIBRARY_PATH=${CUDNN_PATH}/lib
+ENV CPLUS_INCLUDE_PATH=${CUDNN_PATH}/include
+ENV LIBRARY_PATH=${CUDNN_PATH}/lib
+ENV LD_LIBRARY_PATH=${CUDNN_PATH}/lib
+
 RUN apt-get update && \
     apt-get install -y --no-install-recommends ca-certificates curl git && \
     rm -rf /var/lib/apt/lists/*
