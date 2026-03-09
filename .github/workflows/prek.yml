@@ -89,7 +89,7 @@ jobs:
   build-cache:
     needs: cache-status
     if: needs.cache-status.outputs.cache-hit != 'true'
-    runs-on: art-large-runner
+    runs-on: art-cache-builder
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
