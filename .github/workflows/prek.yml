@@ -90,54 +90,40 @@ jobs:
     needs: cache-status
     if: needs.cache-status.outputs.cache-hit != 'true'
     runs-on: art-cache-builder
+    container:
+      image: pytorch/pytorch:2.9.0-cuda12.8-cudnn9-devel
     steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
+      - name: Install CI dependencies
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends ca-certificates curl git zstd
+          rm -rf /var/lib/apt/lists/*
+          curl -LsSf https://astral.sh/uv/install.sh | sh
+          echo "/root/.local/bin" >> "${GITHUB_PATH}"
 
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
-
-      - name: Build uv cache image
-        uses: docker/build-push-action@v6
-        with:
-          context: .
-          file: docker/ci-uv-cache.Dockerfile
-          push: false
-          load: true
-          tags: art-uv-cache:latest
-          build-args: |
-            BASE_IMAGE=${{ env.CI_BASE_IMAGE }}
-            CI_PYTHON_MM=${{ env.CI_PYTHON_MM }}
-            BUILD_JOBS=2
-          cache-from: type=gha,scope=uv-cache
-          cache-to: type=gha,mode=max,scope=uv-cache
-
-      - name: Extract and upload uv cache
+      - name: Install gh CLI
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          fingerprint="${{ needs.cache-status.outputs.fingerprint }}"
-          archive_path="/tmp/${CI_UV_CACHE_ASSET_PREFIX}-${fingerprint}.tar.zst"
-
-          # Extract the pre-built tar from the image and compress it.
-          container_id="$(docker create art-uv-cache:latest)"
-          docker cp "${container_id}:/tmp/uv-cache.tar" /tmp/uv-cache.tar
-          docker rm "${container_id}"
-          zstd -6 -T0 -o "${archive_path}" /tmp/uv-cache.tar
-          rm /tmp/uv-cache.tar
-          ls -lh "${archive_path}"
-
-          # Install gh CLI for upload.
           GH_DL_URL="$(curl -fsSL \
             -H "Authorization: Bearer ${GH_TOKEN}" \
             https://api.github.com/repos/cli/cli/releases/latest \
             | python3 -c "import json,sys;r=json.load(sys.stdin);print([a['browser_download_url'] for a in r['assets'] if a['name'].endswith('_linux_amd64.tar.gz')][0])")"
           curl -fsSL "${GH_DL_URL}" | tar xz --strip-components=1 -C /usr/local
+          gh version
 
-          # Upload using the existing cache script.
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Mark workspace as a safe git directory
+        run: |
+          git config --global --add safe.directory "${GITHUB_WORKSPACE}"
+
+      - name: Build and upload uv cache
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
           bash scripts/ci/build_and_push_uv_cache.sh \
-            --skip-build \
-            --archive-path "${archive_path}" \
             --base-image "${CI_BASE_IMAGE}" \
             --python-mm "${CI_PYTHON_MM}"
 
