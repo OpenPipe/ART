@@ -6,7 +6,7 @@ on:
     branches: [main]
 
 permissions:
-  contents: read
+  contents: write
 
 jobs:
   quality-checks:
@@ -50,6 +50,7 @@ jobs:
           echo "Expected uv cache fingerprint: ${fp}"
 
       - name: Restore prebuilt uv cache
+        id: uv-cache
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
@@ -63,16 +64,16 @@ jobs:
             "${release_api}" || true)"
 
           if [ -z "${release_json}" ]; then
-            echo "::error::Missing cache release '${CI_UV_CACHE_RELEASE_TAG}'."
-            echo "::error::Build and upload cache with: bash scripts/ci/build_and_push_uv_cache.sh"
-            exit 1
+            echo "::warning::Cache release '${CI_UV_CACHE_RELEASE_TAG}' not found. Will build from scratch."
+            echo "cache-hit=false" >> "${GITHUB_OUTPUT}"
+            exit 0
           fi
 
           part_selection_file="/tmp/uv-cache-part-selection.txt"
           if ! RELEASE_JSON="${release_json}" PART_PREFIX="${part_prefix}" python3 -c "import json, os, re, sys; payload=json.loads(os.environ['RELEASE_JSON']); part_prefix=os.environ['PART_PREFIX']; pattern=re.compile(r'^' + re.escape(part_prefix) + r'(\\d{3})$'); parts=[]; [parts.append((int(m.group(1)), int(a.get('id')), a.get('name'))) for a in payload.get('assets', []) for m in [pattern.match(a.get('name', ''))] if m and a.get('id') is not None]; parts.sort(key=lambda x: x[0]); indices=[p[0] for p in parts]; expected=list(range(len(parts))); print('\\n'.join(f'{asset_id} {name}' for _, asset_id, name in parts)) if parts and indices == expected else (_ for _ in ()).throw(SystemExit(2 if not parts else 3))" > "${part_selection_file}"; then
-            echo "::error::No complete uv cache part set found for prefix '${part_prefix}'."
-            echo "::error::Build and upload cache with: bash scripts/ci/build_and_push_uv_cache.sh"
-            exit 1
+            echo "::warning::No cache parts for fingerprint '${fingerprint}'. Will build from scratch."
+            echo "cache-hit=false" >> "${GITHUB_OUTPUT}"
+            exit 0
           fi
 
           part_count="$(wc -l < "${part_selection_file}" | tr -d ' ')"
@@ -98,8 +99,9 @@ jobs:
 
           while IFS= read -r part_path; do
             [ -s "${part_path}" ] || {
-              echo "::error::Missing or empty cache part: ${part_path}"
-              exit 1
+              echo "::warning::Cache part missing or empty: ${part_path}. Will build from scratch."
+              echo "cache-hit=false" >> "${GITHUB_OUTPUT}"
+              exit 0
             }
           done < "${part_paths_file}"
 
@@ -109,6 +111,7 @@ jobs:
             cat "${part_path}"
           done < "${part_paths_file}" | zstd -d -c | tar -xf - -C "${UV_CACHE_DIR}"
           du -sh "${UV_CACHE_DIR}"
+          echo "cache-hit=true" >> "${GITHUB_OUTPUT}"
 
       - name: Install dependencies (with all optional extras for complete type checking)
         run: |
@@ -123,6 +126,58 @@ jobs:
           export LD_LIBRARY_PATH="${CUDNN_LIBRARY_PATH}${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}"
           uv --version
           uv sync --all-extras --group dev --frozen
+
+      - name: Upload uv cache on miss
+        if: steps.uv-cache.outputs.cache-hit != 'true'
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          fingerprint="${{ steps.expected-uv-fingerprint.outputs.fingerprint }}"
+          part_prefix="${CI_UV_CACHE_ASSET_PREFIX}-${fingerprint}.tar.zst.part-"
+
+          # Re-check: another concurrent CI run may have already uploaded this cache.
+          release_json="$(curl -fsSL \
+            -H "Authorization: Bearer ${GH_TOKEN}" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/${GITHUB_REPOSITORY}/releases/tags/${CI_UV_CACHE_RELEASE_TAG}" || true)"
+          if [ -n "${release_json}" ]; then
+            existing="$(RELEASE_JSON="${release_json}" PART_PREFIX="${part_prefix}" python3 -c "
+          import json, os, re
+          payload = json.loads(os.environ['RELEASE_JSON'])
+          prefix = os.environ['PART_PREFIX']
+          pattern = re.compile(r'^' + re.escape(prefix) + r'\d{3}$')
+          print(sum(1 for a in payload.get('assets', []) if pattern.match(a.get('name', ''))))
+          ")"
+            if [ "${existing}" -gt 0 ] 2>/dev/null; then
+              echo "Cache already uploaded by another run (${existing} parts). Skipping."
+              exit 0
+            fi
+          fi
+
+          # Install gh CLI (only needed on cache miss).
+          echo "::group::Install gh CLI"
+          GH_DL_URL="$(curl -fsSL \
+            -H "Authorization: Bearer ${GH_TOKEN}" \
+            https://api.github.com/repos/cli/cli/releases/latest \
+            | python3 -c "import json,sys;r=json.load(sys.stdin);print([a['browser_download_url'] for a in r['assets'] if a['name'].endswith('_linux_amd64.tar.gz')][0])")"
+          curl -fsSL "${GH_DL_URL}" | tar xz --strip-components=1 -C /usr/local
+          gh version
+          echo "::endgroup::"
+
+          # Archive the uv cache populated by the install step.
+          archive_path="/tmp/${CI_UV_CACHE_ASSET_PREFIX}-${fingerprint}.tar.zst"
+          echo "Archiving uv cache to ${archive_path}..."
+          tar -C "${UV_CACHE_DIR}" -cf - . | zstd -6 -T0 -o "${archive_path}"
+          ls -lh "${archive_path}"
+
+          # Upload using the existing cache script (handles release creation,
+          # chunked upload, and old-asset pruning).
+          bash scripts/ci/build_and_push_uv_cache.sh \
+            --skip-build \
+            --archive-path "${archive_path}" \
+            --base-image "${CI_BASE_IMAGE}" \
+            --python-mm "${CI_PYTHON_MM}"
 
       - name: Run prek hooks (lint, format, typecheck, uv.lock, tests)
         run: |
