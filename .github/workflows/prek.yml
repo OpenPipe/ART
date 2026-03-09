@@ -122,10 +122,13 @@ jobs:
       - name: Build and upload uv cache
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          UV_CONCURRENT_DOWNLOADS: "4"
+          UV_CONCURRENT_INSTALLS: "1"
         run: |
           bash scripts/ci/build_and_push_uv_cache.sh \
             --base-image "${CI_BASE_IMAGE}" \
-            --python-mm "${CI_PYTHON_MM}"
+            --python-mm "${CI_PYTHON_MM}" \
+            --build-jobs 2
 
   quality-checks:
     needs: [cache-status, build-cache]
