@@ -20,24 +20,12 @@ env:
 jobs:
   cache-status:
     runs-on: art-large-runner
-    container:
-      image: pytorch/pytorch:2.9.0-cuda12.8-cudnn9-devel
     outputs:
       cache-hit: ${{ steps.check.outputs.cache-hit }}
       fingerprint: ${{ steps.fingerprint.outputs.fingerprint }}
     steps:
-      - name: Install CI dependencies
-        run: |
-          apt-get update
-          apt-get install -y --no-install-recommends ca-certificates curl git
-          rm -rf /var/lib/apt/lists/*
-
       - name: Checkout code
         uses: actions/checkout@v4
-
-      - name: Mark workspace as a safe git directory
-        run: |
-          git config --global --add safe.directory "${GITHUB_WORKSPACE}"
 
       - name: Compute expected uv cache fingerprint
         id: fingerprint
