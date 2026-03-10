@@ -37,35 +37,19 @@ uv run prek run pytest
 
 These checks are automatically run in CI for all pull requests. If your PR fails these checks, re-run the corresponding `prek` hook locally and commit any fixes.
 
-### CI uv Cache Refresh
+### CI uv Cache
 
 The PR `prek` workflow uses a prebuilt full `uv` cache (stored as a GitHub release asset) to avoid rebuilding heavy dependencies on every run.
 
-To refresh the cache after dependency changes, ensure your branch is rebased or merged with main, or checkout the PR merge branch, then run:
+The cache is keyed by a fingerprint computed from `pyproject.toml`, `uv.lock`, the base Docker image, and the Python version. When dependencies change, the fingerprint changes and CI automatically rebuilds the cache using Docker Buildx and uploads it for future runs. The first CI run after a dependency change will be slower while the cache is built.
+
+To manually rebuild the cache (e.g., if the automatic build fails), run:
 
 ```bash
 bash scripts/ci/build_and_push_uv_cache.sh
 ```
 
-This command builds a full cache archive locally (using `uv sync --frozen --all-extras --group dev --no-install-project`) and uploads a fingerprinted part set:
-
-- `prek-uv-cache-<fingerprint>.tar.zst.part-000`
-- `prek-uv-cache-<fingerprint>.tar.zst.part-001`
-- ...
-
-The script also prunes old immutable cache assets (keeps newest 4 by default).
-It requires GitHub CLI authentication (`gh auth login`) and should be run in an environment compatible with CI (same base CUDA image/toolchain).
-
-You can override native-build parallelism while preparing cache:
-
-```bash
-bash scripts/ci/build_and_push_uv_cache.sh --build-jobs 2
-```
-
-By default, `--build-jobs auto` is used and resolves from available CPU and memory.
-By default, cache parts are split at `1900 MiB`; override with `--part-size-mb <n>` if needed.
-
-CI computes the expected cache fingerprint from `pyproject.toml`, `uv.lock`, base image, Python version, and cache asset layout contract. If no matching cache part set exists, CI fails fast and tells you to refresh cache with the script above.
+This requires GitHub CLI authentication (`gh auth login`) and should be run in an environment compatible with CI (same base CUDA image/toolchain).
 
 ### Release Process
 
