@@ -47,8 +47,8 @@ class TinkerService:
         self._server = OpenAICompatibleTinkerServer(
             host=config.get("host") if config else None,
             port=config.get("port") if config else None,
-            models=state.models,
         )
+        self._server.models = state.models
         with log_timing("Starting OpenAI-compatible Tinker server"):
             return await self._server.start()
 

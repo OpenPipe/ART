@@ -3,6 +3,8 @@ from typing import cast
 
 from mp_actors import move_to_child_process
 
+from .. import dev
+from ..backend import AnyTrainableModel
 from ..local.backend import LocalBackend
 from ..local.service import ModelService
 from ..model import TrainableModel
@@ -25,6 +27,19 @@ class TinkerBackend(LocalBackend):
             print("Setting TINKER_API_KEY to", tinker_api_key, "in environment")
             os.environ["TINKER_API_KEY"] = tinker_api_key
         super().__init__(in_process=in_process, path=path)
+
+    async def _prepare_backend_for_training(
+        self,
+        model: AnyTrainableModel,
+        config: dev.OpenAIServerConfig | None = None,
+    ) -> tuple[str, str]:
+        api_key = os.environ["TINKER_API_KEY"]
+        config_dict: dict = dict(config or {})
+        server_args = dict(config_dict.get("server_args", {}))
+        server_args["api_key"] = api_key
+        config_dict["server_args"] = server_args
+        base_url, _ = await super()._prepare_backend_for_training(model, config)
+        return base_url, api_key
 
     async def _get_service(self, model: TrainableModel) -> ModelService:
         from ..dev.get_model_config import get_model_config
