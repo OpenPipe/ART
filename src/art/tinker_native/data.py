@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from typing import Any, Iterable, cast
 
 from openai.types.chat.chat_completion import Choice
@@ -79,12 +80,15 @@ def convert_openai_messages_to_renderer_format(
                 tool_calls = []
                 for tool_call in msg["tool_calls"]:
                     func = tool_call.get("function", {})
+                    arguments = func.get("arguments", "{}")
+                    if not isinstance(arguments, str):
+                        arguments = json.dumps(arguments)
                     tool_calls.append(
                         renderers.ToolCall(
                             id=tool_call.get("id", ""),
                             function=renderers.ToolCall.FunctionBody(
                                 name=func.get("name", ""),
-                                arguments=func.get("arguments", "{}"),
+                                arguments=arguments,
                             ),
                         )
                     )

@@ -24,6 +24,7 @@ from .base import (
     RenderedMessage,
     Renderer,
     TextPart,
+    ToolCall,
     ToolSpec,
     UnparsedToolCall,
     _tool_call_payload,
@@ -152,7 +153,6 @@ class Qwen3Renderer(Renderer):
                     rendered_parts.append(f"<think>{p['thinking']}</think>")
                 elif p["type"] == "text":
                     rendered_parts.append(p["text"])
-                # ToolCallPart handled via message's tool_calls field
             output_content = "".join(rendered_parts)
         else:
             # String content - pass through as-is.
@@ -211,23 +211,16 @@ class Qwen3Renderer(Renderer):
         content = assistant_message["content"]
 
         # Parse all blocks in one pass, preserving order
-        parts = parse_content_blocks(content)
+        result = parse_content_blocks(content)
 
-        if parts is not None:
+        if result is not None:
+            parts, tool_results = result
             assistant_message["content"] = parts
 
-            # Also populate tool_calls and unparsed_tool_calls fields for backward compatibility
-            # TODO: Consider moving away from TypedDicts for part types - current approach
-            # relies on runtime type checking (p["type"] == "tool_call") without static guarantees.
-            tool_calls = [p["tool_call"] for p in parts if p["type"] == "tool_call"]
+            tool_calls = [t for t in tool_results if isinstance(t, ToolCall)]
+            unparsed = [t for t in tool_results if isinstance(t, UnparsedToolCall)]
             if tool_calls:
                 assistant_message["tool_calls"] = tool_calls
-
-            unparsed = [
-                UnparsedToolCall(raw_text=p["raw_text"], error=p["error"])
-                for p in parts
-                if p["type"] == "unparsed_tool_call"
-            ]
             if unparsed:
                 assistant_message["unparsed_tool_calls"] = unparsed
         else:
@@ -273,7 +266,9 @@ class Qwen3Renderer(Renderer):
                     "id": tc.id,
                     "function": {
                         "name": tc.function.name,
-                        "arguments": tc.function.arguments,
+                        "arguments": self._to_openai_tool_arguments(
+                            tc.function.arguments
+                        ),
                     },
                 }
                 for tc in message["tool_calls"]
@@ -287,6 +282,14 @@ class Qwen3Renderer(Renderer):
                 result["name"] = message["name"]
 
         return result
+
+    def _to_openai_tool_arguments(self, arguments: str) -> str | dict:
+        """Convert tool arguments for OpenAI-compatible message payloads.
+
+        Qwen3 templates accept JSON-string arguments directly; subclasses can
+        override to return dicts for templates that iterate over arguments.
+        """
+        return arguments
 
     def create_conversation_prefix_with_tools(
         self, tools: list[ToolSpec], system_prompt: str = ""
@@ -306,7 +309,8 @@ class Qwen3Renderer(Renderer):
             # Use separators=(", ", ": ") to match HF's tojson filter output
             tool_lines = "\n".join(
                 json.dumps(
-                    {"type": "function", "function": tool}, separators=(", ", ": ")
+                    {"type": "function", "function": tool},
+                    separators=(", ", ": "),
                 )
                 for tool in tools
             )
@@ -415,12 +419,12 @@ class Qwen3VLRenderer(Qwen3Renderer):
     The default strip_thinking_from_history=True matches the non-VL Qwen3Renderer behavior.
     """
 
-    image_processor: ImageProcessor
+    image_processor: ImageProcessor | None
 
     def __init__(
         self,
         tokenizer: Tokenizer,
-        image_processor: ImageProcessor,
+        image_processor: ImageProcessor | None = None,
         strip_thinking_from_history: bool = True,
         merge_text_chunks: bool = True,
     ):
@@ -429,14 +433,21 @@ class Qwen3VLRenderer(Qwen3Renderer):
         self.strip_thinking_from_history = strip_thinking_from_history
         self.merge_text_chunks = merge_text_chunks
 
+    def _format_thinking_text(self, thinking: str) -> str:
+        """Format a ThinkingPart payload for rendering."""
+        return f"<think>{thinking}</think>"
+
+    def _assistant_header_suffix(self, message: Message, ctx: RenderContext) -> str:
+        """Additional assistant header text injected before content."""
+        return ""
+
     def _preprocess_message_parts(
         self, message: Message, *, strip_thinking: bool = False
     ) -> list[ImagePart | TextPart]:
         """Convert message content to list form for VL rendering.
 
         Converts ThinkingPart to <think>...</think> text (or strips if strip_thinking=True).
-        Wraps images with vision tokens. ToolCallPart is not supported in VL content list
-        (use message's tool_calls field instead).
+        Wraps images with vision tokens. Tool calls are in message's tool_calls field.
         """
         content = message["content"]
         if isinstance(content, str):
@@ -456,11 +467,11 @@ class Qwen3VLRenderer(Qwen3Renderer):
                         # Render thinking as <think>...</think> text
                         base_parts.append(
                             TextPart(
-                                type="text", text=f"<think>{p['thinking']}</think>"
+                                type="text",
+                                text=self._format_thinking_text(p["thinking"]),
                             )
                         )
                     # else: strip thinking by not appending
-                # ToolCallPart and UnparsedToolCallPart are handled via message's tool_calls field
 
         # Wrap images with vision tokens
         chunks: list[ImagePart | TextPart] = []
@@ -485,11 +496,30 @@ class Qwen3VLRenderer(Qwen3Renderer):
             + [TextPart(type="text", text="\n</tool_response>")]
         )
 
+    def _format_tool_calls_chunks(self, message: Message) -> list[ImagePart | TextPart]:
+        """Format tool_calls as output chunks. Override in subclasses for different formats."""
+        # Add leading newline to match HF template behavior
+        assert "tool_calls" in message, "tool_calls are required to format tool calls"
+        return [
+            TextPart(
+                type="text",
+                text="\n"
+                + "\n".join(
+                    [
+                        f"<tool_call>\n{json.dumps(_tool_call_payload(tool_call))}\n</tool_call>"
+                        for tool_call in message["tool_calls"]
+                    ]
+                ),
+            )
+        ]
+
     def render_message(self, message: Message, ctx: RenderContext) -> RenderedMessage:
         maybe_newline = "\n" if ctx.idx > 0 else ""
 
         role = self._get_qwen_role_for_message(message)
         header_str = f"{maybe_newline}<|im_start|>{role}\n"
+        if message["role"] == "assistant":
+            header_str += self._assistant_header_suffix(message, ctx)
 
         # Strip thinking from history for non-last assistant messages (matching non-VL behavior)
         strip_thinking = (
@@ -506,35 +536,34 @@ class Qwen3VLRenderer(Qwen3Renderer):
             output_chunks = self._wrap_qwen_tool_response_chunks(output_chunks)
 
         if "tool_calls" in message:
-            # Add leading newline to match HF template behavior
-            output_chunks += [
-                TextPart(
-                    type="text",
-                    text="\n"
-                    + "\n".join(
-                        [
-                            f"<tool_call>\n{json.dumps(_tool_call_payload(tool_call))}\n</tool_call>"
-                            for tool_call in message["tool_calls"]
-                        ]
-                    ),
-                )
-            ]
+            output_chunks += self._format_tool_calls_chunks(message)
         output_chunks += [TextPart(type="text", text="<|im_end|>")]
 
         if self.merge_text_chunks:
             output_chunks = _merge_consecutive_text_parts(output_chunks)
 
-        output_chunks_encoded: list[tinker.ModelInputChunk] = [
-            image_to_chunk(
-                image_or_str=x["image"],
-                image_processor=cast(ImageProcessorProtocol, self.image_processor),
-            )
-            if x["type"] == "image"
-            else tinker.EncodedTextChunk(
-                tokens=self.tokenizer.encode(x["text"], add_special_tokens=False)
-            )
-            for x in output_chunks
-        ]
+        output_chunks_encoded: list[tinker.ModelInputChunk] = []
+        for x in output_chunks:
+            if x["type"] == "image":
+                assert self.image_processor is not None, (
+                    "image_processor is required to render image content"
+                )
+                output_chunks_encoded.append(
+                    image_to_chunk(
+                        image_or_str=x["image"],
+                        image_processor=cast(
+                            ImageProcessorProtocol, self.image_processor
+                        ),
+                    )
+                )
+            else:
+                output_chunks_encoded.append(
+                    tinker.EncodedTextChunk(
+                        tokens=self.tokenizer.encode(
+                            x["text"], add_special_tokens=False
+                        )
+                    )
+                )
 
         header = tinker.types.EncodedTextChunk(
             tokens=self.tokenizer.encode(header_str, add_special_tokens=False)

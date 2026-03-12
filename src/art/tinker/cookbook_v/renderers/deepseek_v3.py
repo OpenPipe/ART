@@ -127,7 +127,6 @@ class _DeepSeekV3BaseRenderer(Renderer):
                             rendered_parts.append(f"<think>{p['thinking']}</think>")
                     elif p["type"] == "text":
                         rendered_parts.append(p["text"])
-                    # ToolCallPart handled via message's tool_calls field
                 output_content = "".join(rendered_parts)
             else:
                 # String content - pass through as-is.

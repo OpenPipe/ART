@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import dataclass
+import json
 import os
 import re
 import time
@@ -436,7 +437,13 @@ class TinkerNativeBackend(Backend):
                             id=tool_call.get("id") or f"call_{idx}",
                             function=Function(
                                 name=tool_call["function"]["name"],
-                                arguments=tool_call["function"]["arguments"],
+                                arguments=(
+                                    tool_call["function"]["arguments"]
+                                    if isinstance(
+                                        tool_call["function"]["arguments"], str
+                                    )
+                                    else json.dumps(tool_call["function"]["arguments"])
+                                ),
                             ),
                         )
                         for idx, tool_call in enumerate(parsed_message["tool_calls"])
@@ -526,6 +533,7 @@ class TinkerNativeBackend(Backend):
         renderer = renderers.get_renderer(
             name=config.renderer_name,
             tokenizer=tokenizer,
+            model_name=model.base_model,
         )
 
         saved_state = model.read_state() or {}

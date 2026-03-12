@@ -1,6 +1,7 @@
 import asyncio
 from dataclasses import dataclass, field
 from itertools import cycle
+import json
 import os
 import socket
 import time
@@ -385,7 +386,11 @@ class OpenAICompatibleTinkerServerWorker:
                         id=tool_call.get("id") or "",
                         function=Function(
                             name=tool_call["function"]["name"],
-                            arguments=tool_call["function"]["arguments"],
+                            arguments=(
+                                tool_call["function"]["arguments"]
+                                if isinstance(tool_call["function"]["arguments"], str)
+                                else json.dumps(tool_call["function"]["arguments"])
+                            ),
                         ),
                     )
                     for tool_call in openai_message.get("tool_calls", [])
@@ -441,6 +446,7 @@ class OpenAICompatibleTinkerServerWorker:
             self._renderers[base_model] = renderers.get_renderer(
                 name=get_renderer_name(base_model),
                 tokenizer=get_tokenizer(base_model),
+                model_name=base_model,
             )
         return self._renderers[base_model]
 

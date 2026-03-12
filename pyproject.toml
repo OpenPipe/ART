@@ -62,6 +62,7 @@ tinker = [
     "huggingface_hub",
     "numpy",
     "pillow",
+    "pyarrow>=15.0.0",
     "pydantic>=2.12.5",
     "tinker>=0.8.1",
     "torch>=2.8.0",

@@ -57,6 +57,15 @@ class RoleColonRenderer(Renderer):
 
         logger = logging.getLogger(__name__)
 
+        # Strip EOS token from the end if present (base models may terminate with EOS
+        # instead of the expected stop sequence). We still return False for parse success
+        # since the model didn't produce the expected stop sequence.
+        terminated_with_eos = False
+        eos_token_id = self.tokenizer.eos_token_id
+        if eos_token_id is not None and response and response[-1] == eos_token_id:
+            response = response[:-1]
+            terminated_with_eos = True
+
         str_response = self.tokenizer.decode(response)
         splitted = str_response.split("\n\nUser:")
         if len(splitted) == 1:
@@ -64,12 +73,17 @@ class RoleColonRenderer(Renderer):
             return Message(role="assistant", content=str_response.strip()), False
         elif len(splitted) == 2:
             before, _after = splitted
-            return Message(role="assistant", content=before.strip()), True
+            return Message(
+                role="assistant", content=before.strip()
+            ), not terminated_with_eos
         else:
-            raise ValueError(
-                f"When parsing response, expected to split into 1 or 2 pieces using stop tokens, but got {len(splitted)}. "
-                "You probably are using the wrong stop tokens when sampling"
+            logger.warning(
+                "RoleColonRenderer.parse_response saw multiple stop delimiters "
+                "(count=%d). Returning parse_success=False. Full response:\n%s",
+                len(splitted) - 1,
+                str_response,
             )
+            return Message(role="assistant", content=splitted[0].strip()), False
 
     @property
     def _bos_tokens(self) -> list[int]:

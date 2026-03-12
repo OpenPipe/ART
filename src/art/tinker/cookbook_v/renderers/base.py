@@ -11,8 +11,9 @@ from enum import StrEnum
 import io
 import json
 import logging
+import pickle
 import re
-from typing import Literal, NotRequired, Optional, Protocol, TypedDict
+from typing import Any, Literal, NotRequired, Optional, Protocol, TypedDict, Union
 import urllib.request
 
 from PIL import Image
@@ -124,23 +125,169 @@ class ThinkingPart(TypedDict):
     thinking: str  # The thinking/reasoning content
 
 
-class ToolCallPart(TypedDict):
-    """Tool/function call as a content part, preserving position in content list."""
-
-    type: Literal["tool_call"]
-    tool_call: ToolCall  # The parsed tool call object
+# Container for a part of a multimodal message content.
+# Tool calls live exclusively in message["tool_calls"] / message["unparsed_tool_calls"].
+ContentPart = TextPart | ImagePart | ThinkingPart
 
 
-class UnparsedToolCallPart(TypedDict):
-    """Tool call that failed to parse, preserving raw text for debugging."""
-
-    type: Literal["unparsed_tool_call"]
-    raw_text: str  # Raw text of the tool call block including tags
-    error: str  # Description of what went wrong during parsing
+# Streaming types to enable incremental parsing of model output for real-time display.
 
 
-# Container for a part of a multimodal message content
-ContentPart = TextPart | ImagePart | ThinkingPart | ToolCallPart | UnparsedToolCallPart
+@dataclass
+class StreamingMessageHeader:
+    """Emitted at the start of a new message during streaming.
+
+    This signals that a new message is beginning and provides the author info.
+    """
+
+    role: str
+    name: str | None = None
+
+
+@dataclass
+class StreamingTextDelta:
+    """Incremental text content during streaming.
+
+    Contains only the new text since the last delta, not the accumulated text.
+    The recipient should concatenate deltas to build the full content.
+    """
+
+    text: str
+    content_index: int = 0
+    """Index of this content block within the message. Increments when content type changes."""
+
+
+@dataclass
+class StreamingThinkingDelta:
+    """Incremental thinking/reasoning content during streaming.
+
+    Contains only the new thinking text since the last delta.
+    """
+
+    thinking: str
+    content_index: int = 0
+    """Index of this content block within the message. Increments when content type changes."""
+
+
+# Union of all streaming update types.
+# A streaming parser yields these in sequence:
+# 1. StreamingMessageHeader (once at start)
+# 2. StreamingTextDelta / StreamingThinkingDelta (as content arrives)
+# 3. Message (once at end, containing the complete parsed message)
+MessageDelta = Union[
+    StreamingMessageHeader, StreamingTextDelta, StreamingThinkingDelta, "Message"
+]
+
+
+# Unicode replacement character - indicates incomplete/invalid UTF-8 sequence
+_REPLACEMENT_CHAR = "\ufffd"
+
+
+@dataclass
+class Utf8TokenDecoder:
+    """Handles incremental UTF-8 decoding from tokens.
+
+    Tokens can split multi-byte UTF-8 sequences (e.g., a 3-byte character
+    might be split across 2 tokens). This class buffers tokens until a
+    valid UTF-8 string can be decoded.
+
+    Detection strategy:
+    1. Try decoding all pending + new tokens
+    2. If result contains trailing U+FFFD (replacement char), it's incomplete
+    3. Scan backwards to find longest prefix without trailing replacement chars
+    4. Emit that prefix, buffer the rest
+
+    This handles tiktoken-style tokenizers that return replacement chars
+    instead of throwing exceptions for incomplete UTF-8.
+    """
+
+    tokenizer: "Tokenizer"
+    _pending_tokens: list[int] = None  # type: ignore[assignment]
+
+    def __post_init__(self) -> None:
+        if self._pending_tokens is None:
+            self._pending_tokens = []
+
+    # Max tokens to try removing from the end when looking for decodable prefix.
+    # UTF-8 chars are max 4 bytes, tokens typically 1-4 bytes each,
+    # so 8 tokens is plenty to cover any incomplete trailing sequence.
+    _MAX_TRAILING_TOKENS_TO_TRY: int = 8
+
+    def _is_valid_decode(self, text: str) -> bool:
+        """Check if decoded text represents a complete UTF-8 sequence.
+
+        Returns False if the text ends with a replacement character,
+        which indicates an incomplete multi-byte sequence that needs
+        more tokens to complete.
+        """
+        return not text.endswith(_REPLACEMENT_CHAR)
+
+    def decode(self, tokens: list[int]) -> str | None:
+        """Decode tokens to string, buffering incomplete UTF-8 sequences.
+
+        Args:
+            tokens: New tokens to decode.
+
+        Returns:
+            Decoded string if complete UTF-8 sequences are available,
+            None if all tokens were buffered (incomplete sequence).
+        """
+        self._pending_tokens.extend(tokens)
+
+        # Try to decode all pending tokens (common case)
+        try:
+            text = self.tokenizer.decode(self._pending_tokens)
+            if self._is_valid_decode(text):
+                self._pending_tokens = []
+                return text
+            # Has trailing replacement chars - fall through to find valid prefix
+        except Exception:
+            pass
+
+        # Scan backwards to find longest decodable prefix without replacement chars.
+        # We only need to try removing a few tokens since UTF-8 sequences are at
+        # most 4 bytes and tokens are typically 1-4 bytes each.
+        for remove in range(
+            1, min(len(self._pending_tokens), self._MAX_TRAILING_TOKENS_TO_TRY) + 1
+        ):
+            prefix = self._pending_tokens[:-remove]
+            if not prefix:
+                break
+            try:
+                text = self.tokenizer.decode(prefix)
+                if self._is_valid_decode(text):
+                    self._pending_tokens = self._pending_tokens[-remove:]
+                    return text
+            except Exception:
+                continue
+
+        # All tokens buffered - need more data
+        return None
+
+    def flush(self) -> str:
+        """Force decode any remaining tokens.
+
+        Call this at end of stream. May produce replacement characters
+        for incomplete sequences.
+        """
+        if not self._pending_tokens:
+            return ""
+        try:
+            text = self.tokenizer.decode(self._pending_tokens)
+        except Exception:
+            # Last resort: decode with errors='replace' behavior
+            # Most tokenizers handle this, but fall back to empty string
+            text = ""
+        self._pending_tokens = []
+        return text
+
+    def reset(self) -> None:
+        """Clear any buffered tokens."""
+        self._pending_tokens = []
+
+    def has_pending(self) -> bool:
+        """Check if there are buffered tokens waiting for more data."""
+        return len(self._pending_tokens) > 0
 
 
 # NOTE: we use a broad type definition for the role to be flexible
@@ -211,6 +358,14 @@ class RenderContext:
 
     prev_message: Message | None = None
     """The previous message in the conversation, if any."""
+
+    last_user_index: int = -1
+    """Index of the last user message in the conversation. -1 if no user messages.
+
+    This is computed by the base build_generation_prompt/build_supervised_example
+    and used by renderers like Qwen3.5 that need to treat assistant messages
+    differently based on whether they come before or after the last user message.
+    """
 
 
 class ToolSpec(TypedDict):
@@ -287,7 +442,7 @@ def format_content_as_string(content: Content, separator: str = "\n") -> str:
     """Format message content as a string, preserving all part types.
 
     Unlike get_text_content which only extracts text parts, this formats
-    all content parts (thinking, text, tool_call, etc.) as a readable string.
+    all content parts (thinking, text) as a readable string.
 
     This is useful for compatibility with APIs that expect string content
     (e.g., OpenAI Chat Completions API), but we don't recommend it if you
@@ -310,13 +465,6 @@ def format_content_as_string(content: Content, separator: str = "\n") -> str:
             parts.append(f"<think>{p['thinking']}</think>")
         elif p["type"] == "text":
             parts.append(p["text"])
-        elif p["type"] == "tool_call":
-            tc = p["tool_call"]
-            parts.append(
-                f"<tool_call>{tc.function.name}({tc.function.arguments})</tool_call>"
-            )
-        elif p["type"] == "unparsed_tool_call":
-            parts.append(f"<unparsed_tool_call>{p['raw_text']}</unparsed_tool_call>")
         else:
             raise ValueError(f"Unknown content part type: {p['type']}")
     return separator.join(parts)
@@ -362,37 +510,42 @@ def _parse_tool_call_json(
     )
 
 
-def parse_content_blocks(content: str) -> list[ContentPart] | None:
+def parse_content_blocks(
+    content: str,
+) -> tuple[list[ContentPart], list[ToolCall | UnparsedToolCall]] | None:
     """
     Parse a string with <think>...</think> and <tool_call>...</tool_call> tags.
 
-    Handles interleaved thinking, tool call, and text blocks, returning parts
-    in order. Empty parts are omitted. Failed tool call parses are included as
-    UnparsedToolCallPart to preserve ordering.
+    Handles interleaved thinking, tool call, and text blocks. Content parts
+    (ThinkingPart, TextPart) are returned in the first element; tool calls
+    (ToolCall, UnparsedToolCall) are returned separately in the second element,
+    preserving their relative order.
 
-    Whitespace is preserved exactly - roundtrip (parse then render) is identity.
+    Whitespace in non-tool-call regions is preserved exactly - roundtrip
+    (parse then render) is identity for the content parts.
 
     Args:
         content: String potentially containing <think> and/or <tool_call> blocks.
 
     Returns:
-        List of ContentPart (ThinkingPart, TextPart, ToolCallPart, UnparsedToolCallPart)
-        in order. Returns None if no special tags are found - caller should use
-        the original string for backward compatibility.
+        Tuple of (content_parts, tool_calls), or None if no special tags are found.
+        content_parts contains only ThinkingPart/TextPart.
+        tool_calls contains ToolCall and UnparsedToolCall in order.
 
     Example:
         >>> parse_content_blocks("<think>step 1</think>answer<tool_call>{...}</tool_call>more")
-        [
-            ThinkingPart(type="thinking", thinking="step 1"),
-            TextPart(type="text", text="answer"),
-            ToolCallPart(type="tool_call", tool_call=ToolCall(...)),
-            TextPart(type="text", text="more"),
-        ]
+        (
+            [ThinkingPart(type="thinking", thinking="step 1"),
+             TextPart(type="text", text="answer"),
+             TextPart(type="text", text="more")],
+            [ToolCall(...)],
+        )
     """
     if "<think>" not in content and "<tool_call>" not in content:
         return None  # No special blocks, caller should use original string
 
     parts: list[ContentPart] = []
+    tool_calls: list[ToolCall | UnparsedToolCall] = []
     pos = 0
 
     # Pattern to find both <think>...</think> and <tool_call>...</tool_call> blocks
@@ -412,21 +565,10 @@ def parse_content_blocks(content: str) -> list[ContentPart] | None:
             if thinking:  # Skip empty thinking blocks
                 parts.append(ThinkingPart(type="thinking", thinking=thinking))
         else:
-            # This is a <tool_call> block
+            # This is a <tool_call> block — goes into separate tool_calls list
             tool_call_json = match.group(2)
             raw_text = match.group(0)  # Full match including tags
-            parsed = _parse_tool_call_json(tool_call_json, raw_text)
-            if isinstance(parsed, UnparsedToolCall):
-                # Include unparsed tool calls as UnparsedToolCallPart to preserve order
-                parts.append(
-                    UnparsedToolCallPart(
-                        type="unparsed_tool_call",
-                        raw_text=parsed.raw_text,
-                        error=parsed.error,
-                    )
-                )
-            else:
-                parts.append(ToolCallPart(type="tool_call", tool_call=parsed))
+            tool_calls.append(_parse_tool_call_json(tool_call_json, raw_text))
 
         pos = match.end()
 
@@ -435,7 +577,7 @@ def parse_content_blocks(content: str) -> list[ContentPart] | None:
     if remaining:  # Skip only truly empty strings
         parts.append(TextPart(type="text", text=remaining))
 
-    return parts
+    return parts, tool_calls
 
 
 def parse_think_blocks(content: str) -> list[ContentPart] | None:
@@ -534,11 +676,34 @@ class RenderedMessage:
 
 class TrainOnWhat(StrEnum):
     LAST_ASSISTANT_MESSAGE = "last_assistant_message"
+    LAST_ASSISTANT_TURN = "last_assistant_turn"
     ALL_ASSISTANT_MESSAGES = "all_assistant_messages"
     ALL_MESSAGES = "all_messages"
     ALL_TOKENS = "all_tokens"
     ALL_USER_AND_SYSTEM_MESSAGES = "all_user_and_system_messages"
     CUSTOMIZED = "customized"
+
+
+def _unpickle_renderer(
+    renderer_name: str, model_name: str, has_image_processor: bool
+) -> "Renderer":
+    """Reconstruct a Renderer from its name and model name.
+
+    Called by pickle to deserialize Renderer instances. Uses cached tokenizer/image_processor
+    so reconstruction cost is negligible after first call.
+    """
+    from ..tokenizer_utils import get_tokenizer
+    from . import get_renderer
+
+    tokenizer = get_tokenizer(model_name)
+    image_processor = None
+    if has_image_processor:
+        from ..image_processing_utils import get_image_processor
+
+        image_processor = get_image_processor(model_name)
+    return get_renderer(
+        renderer_name, tokenizer, image_processor, model_name=model_name
+    )
 
 
 class Renderer(ABC):
@@ -553,12 +718,46 @@ class Renderer(ABC):
     The default build_generation_prompt and build_supervised_example implementations
     assume simple concatenation of rendered messages. Override these if your renderer
     modifies the conversation structure (e.g., stripping thinking blocks from history).
+
+    Pickle support: Renderers created via ``get_renderer()`` are automatically pickleable.
+    On deserialization, the tokenizer and image processor are reconstructed from cached
+    loaders, so the cost is negligible. Renderers created directly (not via ``get_renderer()``)
+    must set ``_renderer_name`` and ``_model_name`` manually to be pickleable.
+
+    Implementations of ``EnvGroupBuilder`` must be pickleable to support distributed rollout
+    execution. Since many builders store a Renderer, this pickle support is critical.
     """
 
     tokenizer: Tokenizer
 
+    # Pickle metadata — set by get_renderer() via _stamp_pickle_metadata().
+    # Class-level defaults ensure these exist even when subclasses bypass super().__init__().
+    _renderer_name: str | None = None
+    _model_name: str | None = None
+    _has_image_processor: bool = False
+
     def __init__(self, tokenizer: Tokenizer):
         self.tokenizer = tokenizer
+
+    def __reduce__(self) -> tuple:
+        """Enable pickling by storing only (renderer_name, model_name, has_image_processor).
+
+        On unpickling, the Renderer is reconstructed via get_renderer() with a
+        cached tokenizer, so the cost is negligible.
+        """
+        renderer_name = getattr(self, "_renderer_name", None)
+        model_name = getattr(self, "_model_name", None)
+        has_image_processor = getattr(self, "_has_image_processor", False)
+        if renderer_name is None or model_name is None:
+            raise pickle.PicklingError(
+                f"Cannot pickle {type(self).__name__}: _renderer_name or _model_name not set. "
+                "Renderers must be created via get_renderer() to be pickleable, "
+                "or set _renderer_name and _model_name manually."
+            )
+        return (
+            _unpickle_renderer,
+            (renderer_name, model_name, has_image_processor),
+        )
 
     @property
     def has_extension_property(self) -> bool:
@@ -669,7 +868,6 @@ class Renderer(ABC):
                         "Images would be silently dropped, leading to incorrect HF template "
                         "comparisons or OpenAI API calls. Use build_generation_prompt for VL models."
                     )
-                # Skip tool_call and unparsed_tool_call parts - handled via tool_calls field
             result["content"] = "".join(parts)
 
         # Handle tool_calls (convert ToolCall objects to OpenAI format)
@@ -758,23 +956,38 @@ class Renderer(ABC):
         chunks: list[tinker.types.ModelInputChunk] = []
         if self._bos_tokens:
             chunks.append(tinker.types.EncodedTextChunk(tokens=self._bos_tokens))
+
+        last_user_idx = max(
+            (idx for idx, message in enumerate(messages) if message["role"] == "user"),
+            default=-1,
+        )
+
         for idx, message in enumerate(messages):
             ctx = RenderContext(
                 idx=idx,
                 is_last=(idx == len(messages) - 1),
                 prev_message=messages[idx - 1] if idx > 0 else None,
+                last_user_index=last_user_idx,
             )
             rendered_message = self.render_message(message, ctx)
             header_chunk = rendered_message.header
             output_chunks = rendered_message.output
             if header_chunk:
                 chunks.append(header_chunk)
-            chunks.extend([x for x in output_chunks if x])
+            # Filter out empty EncodedTextChunks, which cause 400 errors in model requests
+            chunks.extend(
+                [
+                    x
+                    for x in output_chunks
+                    if not isinstance(x, tinker.EncodedTextChunk) or x.tokens
+                ]
+            )
 
         suffix_ctx = RenderContext(
             idx=len(messages),
             is_last=True,
             prev_message=messages[-1] if messages else None,
+            last_user_index=last_user_idx,
         )
         suffix_tokens = self._get_generation_suffix(role, suffix_ctx)
         if suffix_tokens:
@@ -787,6 +1000,30 @@ class Renderer(ABC):
                 )
             )
         return tinker.ModelInput(chunks=chunks)
+
+    def build_supervised_examples(
+        self,
+        messages: list[Message],
+        train_on_what: TrainOnWhat = TrainOnWhat.LAST_ASSISTANT_TURN,
+    ) -> list[tuple[tinker.ModelInput, torch.Tensor]]:
+        """
+        Build tokens and per-token weights for supervised fine-tuning.
+        This function returns a list of examples in the form of tuples, where each tuple contains a model input and a tensor of weights.
+        This is needed because some renderers do not satisfy the extension property, so we need to return a list of examples instead of a single example.
+
+        This default implementation concatenates rendered messages in order, which assumes the renderer satisfies the extension property.
+        Override this method if your renderer does not satisfy the extension property.
+        """
+
+        if self.has_extension_property:
+            return [
+                self.build_supervised_example(messages, train_on_what=train_on_what)
+            ]
+        else:
+            # TODO: Add a default implementation that calls `build_supervised_example` for each message and merges examples with shared prefixes.
+            raise NotImplementedError(
+                "build_supervised_examples has not been implemented for this renderer."
+            )
 
     def build_supervised_example(
         self,
@@ -810,6 +1047,7 @@ class Renderer(ABC):
             messages: A list of messages to render.
             train_on_what: Controls which tokens receive non-zero training weight:
                 - LAST_ASSISTANT_MESSAGE: Only the last assistant message
+                - LAST_ASSISTANT_TURN: The last assistant message after the last user message
                 - ALL_ASSISTANT_MESSAGES: All assistant messages
                 - ALL_MESSAGES: All messages (but not headers)
                 - ALL_TOKENS: Everything including headers
@@ -848,6 +1086,11 @@ class Renderer(ABC):
                 (tinker.types.EncodedTextChunk(tokens=self._bos_tokens), 0.0)
             )
 
+        last_user_idx = max(
+            (idx for idx, message in enumerate(messages) if message["role"] == "user"),
+            default=-1,
+        )
+
         for idx, message in enumerate(messages):
             if train_on_what == TrainOnWhat.CUSTOMIZED:
                 assert "trainable" in message, (
@@ -861,12 +1104,14 @@ class Renderer(ABC):
             is_last_message = idx == len(messages) - 1
             is_assistant = message["role"] == "assistant"
             is_user_or_system = message["role"] in ["user", "system"]
+            is_after_last_user = last_user_idx == -1 or idx > last_user_idx
 
             # only apply weight to header if train_on_what is ALL_TOKENS
             ctx = RenderContext(
                 idx=idx,
                 is_last=is_last_message,
                 prev_message=messages[idx - 1] if idx > 0 else None,
+                last_user_index=last_user_idx,
             )
             rendered_message = self.render_message(message, ctx)
             header_part = rendered_message.header
@@ -880,6 +1125,8 @@ class Renderer(ABC):
             match train_on_what:
                 case TrainOnWhat.LAST_ASSISTANT_MESSAGE:
                     output_has_weight = is_last_message and is_assistant
+                case TrainOnWhat.LAST_ASSISTANT_TURN:
+                    output_has_weight = is_assistant and is_after_last_user
                 case TrainOnWhat.ALL_ASSISTANT_MESSAGES:
                     output_has_weight = is_assistant
                 case TrainOnWhat.ALL_MESSAGES:
@@ -958,9 +1205,7 @@ def parse_response_for_stop_token(
         )
 
 
-# ============================================================================
 # Image processing utilities (used by VL renderers)
-# ============================================================================
 
 
 class ImageProcessorProtocol(Protocol):
@@ -970,6 +1215,9 @@ class ImageProcessorProtocol(Protocol):
     def get_number_of_image_patches(
         self, height: int, width: int, images_kwargs: Optional[dict] = None
     ) -> int:
+        raise NotImplementedError()
+
+    def get_resize_config(self, image_data: dict[str, Any]) -> dict[str, Any]:
         raise NotImplementedError()
 
 
@@ -1003,11 +1251,23 @@ def image_to_chunk(
     pil_image.save(img_byte_arr, format="JPEG")
     image_data = img_byte_arr.getvalue()
 
-    width, height = pil_image.size
-    num_image_tokens = (
-        image_processor.get_number_of_image_patches(height, width, images_kwargs={})
-        // image_processor.merge_size**2
-    )
+    # Get the number of expected tokens for the image. The way to do this is not consistent between
+    # image processors (qwen3vl supports get_number_of_image_patches, kimi2.5 doesn't but has get_resize_config)
+    if hasattr(image_processor, "get_number_of_image_patches"):
+        width, height = pil_image.size
+        num_image_tokens = (
+            image_processor.get_number_of_image_patches(height, width, images_kwargs={})
+            // image_processor.merge_size**2
+        )
+    elif hasattr(image_processor, "get_resize_config"):
+        config = image_processor.get_resize_config(
+            {"type": "image", "image": pil_image}
+        )
+        num_image_tokens = config["num_tokens"]
+    else:
+        raise ValueError(
+            f"Don't know how to get the number of image tokens for image processor: {image_processor}"
+        )
 
     return tinker.types.ImageChunk(
         data=image_data,
