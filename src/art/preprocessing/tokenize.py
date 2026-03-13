@@ -163,6 +163,12 @@ def tokenize_trajectory(
     Tokenizes a trajectory and returns a TokenizedResult.
     """
     # Find the index of the last assistant message
+
+    # Check if the trajectory is finished
+    continue_final_message = (
+        False if trajectory.metadata.get("finished", False) is True else True
+    )
+
     last_assistant_index = -1
     for i, message in enumerate(history.messages_and_choices):
         if (
@@ -190,7 +196,7 @@ def tokenize_trajectory(
         tokenizer.apply_chat_template(
             cast(list[dict], messages),
             tools=tools,
-            continue_final_message=True,
+            continue_final_message=continue_final_message,
             tokenize=False,
         ),
     )
@@ -199,7 +205,7 @@ def tokenize_trajectory(
         tokenizer.apply_chat_template(
             cast(list[dict], messages),
             tools=tools,
-            continue_final_message=True,
+            continue_final_message=continue_final_message,
         ),
     )
     sentinal_token_id = max(set(range(tokenizer.vocab_size)) - set(original_token_ids))
@@ -232,7 +238,7 @@ def tokenize_trajectory(
         tokenizer.apply_chat_template(
             cast(list[dict], token_template_messages),
             tools=tools,
-            continue_final_message=True,
+            continue_final_message=continue_final_message,
         ),
     )
     assistant_mask: list[int] = [0] * len(token_ids)

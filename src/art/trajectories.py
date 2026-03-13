@@ -53,6 +53,7 @@ class Trajectory(pydantic.BaseModel):
     def finish(self) -> "Trajectory":
         duration = (datetime.now() - self.start_time).total_seconds()
         self.metrics["duration"] = duration
+        self.metadata["finished"] = True
         return self
 
     @asynccontextmanager
