@@ -36,11 +36,7 @@ def validate_dedicated_config(config: InternalModelConfig) -> None:
 
     if set(trainer_gpu_ids) & set(inference_gpu_ids):
         raise ValueError("trainer_gpu_ids and inference_gpu_ids must not overlap")
-
-    if len(inference_gpu_ids) > 1:
-        raise ValueError(
-            "Multi-GPU inference not yet supported; inference_gpu_ids must have exactly one GPU"
-        )
+    inference_gpu_count = len(inference_gpu_ids)
 
     if trainer_gpu_ids[0] != 0:
         raise ValueError(
@@ -65,3 +61,16 @@ def validate_dedicated_config(config: InternalModelConfig) -> None:
             "enable_sleep_mode is incompatible with dedicated mode "
             "(dedicated mode runs vLLM on a separate GPU, sleep/wake is not needed)"
         )
+
+    engine_args = config.get("engine_args", {})
+    for key in ("data_parallel_size", "data_parallel_size_local"):
+        value = engine_args.get(key)
+        if value is None:
+            continue
+        if isinstance(value, bool) or not isinstance(value, int):
+            raise ValueError(f"{key} must be an integer in dedicated mode")
+        if value != inference_gpu_count:
+            raise ValueError(
+                f"{key} must equal len(inference_gpu_ids) ({inference_gpu_count}) "
+                "in dedicated mode"
+            )

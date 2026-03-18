@@ -77,10 +77,46 @@ def test_overlapping_gpu_ids():
 
 
 def test_multi_gpu_inference():
-    with pytest.raises(ValueError, match="Multi-GPU inference not yet supported"):
+    validate_dedicated_config(
+        InternalModelConfig(trainer_gpu_ids=[0], inference_gpu_ids=[1, 2])
+    )
+
+
+def test_dedicated_data_parallel_size_must_match_inference_gpus():
+    with pytest.raises(ValueError, match="data_parallel_size must equal"):
         validate_dedicated_config(
-            InternalModelConfig(trainer_gpu_ids=[0], inference_gpu_ids=[1, 2])
+            InternalModelConfig(
+                trainer_gpu_ids=[0],
+                inference_gpu_ids=[1, 2],
+                engine_args={"data_parallel_size": 1},  # type: ignore[typeddict-item]
+            )
         )
+
+
+def test_dedicated_data_parallel_size_local_must_match_inference_gpus():
+    with pytest.raises(ValueError, match="data_parallel_size_local must equal"):
+        validate_dedicated_config(
+            InternalModelConfig(
+                trainer_gpu_ids=[0],
+                inference_gpu_ids=[1, 2],
+                engine_args={  # type: ignore[typeddict-item]
+                    "data_parallel_size_local": 1
+                },
+            )
+        )
+
+
+def test_dedicated_data_parallel_size_allows_matching_values():
+    validate_dedicated_config(
+        InternalModelConfig(
+            trainer_gpu_ids=[0],
+            inference_gpu_ids=[1, 2],
+            engine_args={  # type: ignore[typeddict-item]
+                "data_parallel_size": 2,
+                "data_parallel_size_local": 2,
+            },
+        )
+    )
 
 
 def test_trainer_not_starting_at_zero():

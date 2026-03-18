@@ -339,7 +339,22 @@ class UnslothService:
         """Launch vLLM as a subprocess on inference GPUs. Returns (host, port)."""
         import atexit
 
+        def _parse_int_arg(name: str, value: object) -> int:
+            if isinstance(value, bool):
+                raise ValueError(f"{name} must be an integer, got bool")
+            if isinstance(value, int):
+                return value
+            if isinstance(value, str):
+                try:
+                    return int(value)
+                except ValueError as exc:
+                    raise ValueError(
+                        f"{name} must be an integer, got {value!r}"
+                    ) from exc
+            raise ValueError(f"{name} must be an integer, got {type(value).__name__}")
+
         inference_gpu_ids = self.config["inference_gpu_ids"]
+        inference_gpu_count = len(inference_gpu_ids)
         cuda_devices = ",".join(str(g) for g in inference_gpu_ids)
 
         # Build server_args: ART defaults, then user overrides, strip CLI-handled keys
@@ -350,6 +365,16 @@ class UnslothService:
         }
         if config and "server_args" in config:
             server_args.update(dict(config["server_args"]))
+        api_server_count = server_args.pop("api_server_count", None)
+        if api_server_count is not None:
+            parsed_api_server_count = _parse_int_arg(
+                "api_server_count", api_server_count
+            )
+            if parsed_api_server_count != 1:
+                raise ValueError(
+                    "api_server_count must be 1 in dedicated mode when runtime "
+                    "LoRA updating is enabled"
+                )
         for key in ("port", "host", "lora_modules", "api_key"):
             server_args.pop(key, None)
 
@@ -358,6 +383,24 @@ class UnslothService:
         engine_args = dict(self.config.get("engine_args", {}))
         if config and "engine_args" in config:
             engine_args.update(dict(config["engine_args"]))
+
+        for key in ("data_parallel_size", "data_parallel_size_local"):
+            value = engine_args.get(key)
+            if value is None:
+                continue
+            parsed_value = _parse_int_arg(key, value)
+            if parsed_value != inference_gpu_count:
+                raise ValueError(
+                    f"{key} must equal len(inference_gpu_ids) "
+                    f"({inference_gpu_count}) in dedicated mode"
+                )
+            engine_args[key] = parsed_value
+
+        if inference_gpu_count > 1:
+            engine_args.setdefault("data_parallel_size", inference_gpu_count)
+            engine_args.setdefault("data_parallel_size_local", inference_gpu_count)
+            engine_args.setdefault("distributed_executor_backend", "mp")
+
         engine_args.setdefault("generation_config", "vllm")
         engine_args["enable_lora"] = True
         engine_args.setdefault("max_loras", 2)
