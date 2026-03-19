@@ -6,7 +6,6 @@ export TORCH_CUDA_ARCH_LIST="${TORCH_CUDA_ARCH_LIST:-9.0}"
 # install missing cudnn headers & ninja build tools
 apt-get update
 apt-get install -y libcudnn9-headers-cuda-12 ninja-build
-
 # Python dependencies are declared in pyproject.toml extras.
 # Keep backend + megatron together so setup does not prune runtime deps (e.g. vllm).
 script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"

@@ -205,13 +205,18 @@ while True:
     num_sequences = job.disk_packed_tensors["num_sequences"]
     dp_rank = ps.get_data_parallel_rank()
     dp_world_size = ps.get_data_parallel_world_size()
-    num_indices = math.ceil(num_sequences / dp_world_size)
-    indices = list(range(dp_rank, num_sequences, dp_world_size))
-    if not indices:
-        indices = [dp_rank % num_sequences]
-    # pad indices by repeating & slicing to target length
-    repeat = math.ceil(num_indices / len(indices))
-    indices = (indices * repeat)[:num_indices]
+    indices = list(
+        range(
+            dp_rank,
+            num_sequences,
+            dp_world_size,
+        )
+    )
+    # pad indices
+    if 0 < num_sequences % dp_world_size <= dp_rank:
+        indices.append(
+            (list(range(num_sequences)) * (dp_world_size // num_sequences + 1))[dp_rank]
+        )
     for index in indices:
         inputs = PackedTensors(  # type: ignore
             **{

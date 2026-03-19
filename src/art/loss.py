@@ -28,6 +28,8 @@ def loss_fn(
     experimental_config: dev.TrainConfig,
 ) -> Loss:
     old_logprobs = shift_tensor(inputs["logprobs"], float("nan"))
+    if experimental_config.get("on_policy_correction", False):
+        old_logprobs = torch.full_like(old_logprobs, float("nan"))
     advantages = shift_tensor(inputs["advantages"], 0.0)
     assistant_mask = shift_tensor(inputs["assistant_mask"], False).to(
         new_logprobs.dtype

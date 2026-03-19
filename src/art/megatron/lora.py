@@ -27,10 +27,14 @@ class LoRA(torch.nn.Module):
         dtype: torch.dtype,
         device: torch.device,
         num_local_experts: int = 1,
+        tp_shard: str | None = None,
     ) -> None:
         super().__init__()
         assert num_local_experts == 1 or "{expert}" in adapter_model_prefix, (
             "adapter_model_prefix must contain the '{expert}' format placeholder if num_local_experts > 1"
+        )
+        assert tp_shard in (None, "A", "B", "column", "row"), (
+            f"tp_shard must be None, 'A'/'column' (row-parallel), or 'B'/'row' (column-parallel), got {tp_shard}"
         )
         self.adapter_model_prefix = adapter_model_prefix
         self.scale = alpha / rank
@@ -45,6 +49,12 @@ class LoRA(torch.nn.Module):
             ).squeeze(0)
         )
         self._expert_offset = ps.get_expert_model_parallel_rank() * num_local_experts
+        # Store TP shard topology as instance variables — NOT on tensors.
+        # load_weight() unconditionally resets tensor.sharded=False, so storing
+        # on the tensor was silently overwritten on every checkpoint load.
+        _is_tp = ps.get_tensor_model_parallel_world_size() > 1
+        self._a_is_tp_sharded = _is_tp and tp_shard in ("A", "row")
+        self._b_is_tp_sharded = _is_tp and tp_shard in ("B", "column")
         self.reset_lora_parameters()
 
     @property
@@ -134,11 +144,11 @@ class LoRA(torch.nn.Module):
             return {}
         return {
             f"{self.adapter_model_prefix}.{key}": param.data.T
-            for key, param in (
-                ("lora_A.weight", self.A_T),
-                ("lora_B.weight", self.B_T),
+            for key, param, is_sharded in (
+                ("lora_A.weight", self.A_T, self._a_is_tp_sharded),
+                ("lora_B.weight", self.B_T, self._b_is_tp_sharded),
             )
-            if getattr(param, "sharded", False)
+            if is_sharded
             or ps.get_tensor_model_parallel_rank() == 0
         }
 
@@ -183,6 +193,7 @@ class SelfAttentionLinearProjLoRA(torch.nn.Module):
             alpha=alpha,
             dtype=linear_proj.weight.dtype,
             device=linear_proj.weight.device,
+            tp_shard="row",
         )
 
     def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor | None]:
@@ -239,6 +250,7 @@ class SelfAttentionLinearQKVLoRA(torch.nn.Module):
             alpha=alpha,
             dtype=linear_qkv.weight.dtype,
             device=linear_qkv.weight.device,
+            tp_shard="column",
         )
         self.k_proj_lora = LoRA(
             adapter_model_prefix=f"{adapter_model_prefix}.k_proj",
@@ -248,6 +260,7 @@ class SelfAttentionLinearQKVLoRA(torch.nn.Module):
             alpha=alpha,
             dtype=linear_qkv.weight.dtype,
             device=linear_qkv.weight.device,
+            tp_shard="column",
         )
         self.v_proj_lora = LoRA(
             adapter_model_prefix=f"{adapter_model_prefix}.v_proj",
@@ -257,6 +270,7 @@ class SelfAttentionLinearQKVLoRA(torch.nn.Module):
             alpha=alpha,
             dtype=linear_qkv.weight.dtype,
             device=linear_qkv.weight.device,
+            tp_shard="column",
         )
 
     def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor | None]:
@@ -312,6 +326,7 @@ class MLPExpertsLinearFC1LoRA(torch.nn.Module):
             dtype=linear_fc1.weight0.dtype,
             device=linear_fc1.weight0.device,
             num_local_experts=num_local_experts,
+            tp_shard="column",
         )
         self.up_lora = LoRA(
             adapter_model_prefix=f"{adapter_model_prefix}.{{expert}}.up_proj",
@@ -322,6 +337,7 @@ class MLPExpertsLinearFC1LoRA(torch.nn.Module):
             dtype=linear_fc1.weight0.dtype,
             device=linear_fc1.weight0.device,
             num_local_experts=num_local_experts,
+            tp_shard="column",
         )
 
     def forward(
@@ -356,6 +372,7 @@ class MLPExpertsLinearFC2LoRA(torch.nn.Module):
             dtype=linear_fc2.weight0.dtype,
             device=linear_fc2.weight0.device,
             num_local_experts=num_local_experts,
+            tp_shard="row",
         )
 
     def forward(

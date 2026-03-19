@@ -1,0 +1,1 @@
+{"model": "Qwen/Qwen3-30B-A3B-Instruct-2507", "dataset": "agentic", "num_steps": 3, "num_rollouts": 16, "concurrency": 32, "max_output_tokens": 1024, "max_seq_length": 8192, "tp": 2, "gpu_mem": 0.7, "vllm_port": 8100, "sglang_port": 8200, "sglang_python": "/home/ubuntu/.venvs/sglang-bench/bin/python", "seed": 42, "learning_rate": 5e-06, "output_dir": "benchmark_results"}

@@ -26,6 +26,7 @@ positive advantages. Defaults to 0.0 (perfectly balanced)."""
     plot_tensors: bool
     ppo: bool
     precalculate_logprobs: bool
+    on_policy_correction: bool
     scale_learning_rate_by_reward_std_dev: bool
     scale_rewards: bool
     truncated_importance_sampling: float | None
