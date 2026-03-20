@@ -1,10 +1,10 @@
-"""Yes-no-maybe training with KL-penalized advantage adjustment.
+"""Yes-no-maybe training with KL-penalized advantage adjustment (Tinker backend).
 
 Demonstrates the kl_penalty_coef feature: tokens where the policy has drifted
 more from the reference model get reduced advantages, while tokens that have
 drifted less get increased advantages.
 
-Uses meta-llama/Meta-Llama-3.1-8B-Instruct as the base model (trained locally).
+Uses meta-llama/Llama-3.1-8B-Instruct as the base model (trained via Tinker).
 """
 
 import asyncio
@@ -17,7 +17,7 @@ from dotenv import load_dotenv
 import openai
 
 import art
-from art.local import LocalBackend
+from art.tinker_native import TinkerNativeBackend
 
 
 async def rollout(
@@ -53,12 +53,12 @@ def with_quotes(w: str) -> str:
 async def main():
     load_dotenv()
 
-    backend = LocalBackend()
-    base_model = os.environ.get("BASE_MODEL", "meta-llama/Meta-Llama-3.1-8B-Instruct")
+    backend = TinkerNativeBackend()
+    base_model = os.environ.get("BASE_MODEL", "meta-llama/Llama-3.1-8B-Instruct")
     kl_penalty_coef = float(os.environ.get("KL_PENALTY_COEF", "0.1"))
     random_suffix = "".join(random.choices(string.ascii_lowercase, k=4))
     model = art.TrainableModel(
-        name=os.environ.get("MODEL_NAME", f"local-{random_suffix}-{kl_penalty_coef}"),
+        name=os.environ.get("MODEL_NAME", f"tinker-{random_suffix}-{kl_penalty_coef}"),
         project="yes-no-maybe",
         base_model=base_model,
     )
@@ -69,7 +69,6 @@ async def main():
         if os.environ.get("KL_REF_STEP") is not None
         else None
     )
-    kl_ref_adapter_path: str | None = os.environ.get("KL_REF_ADAPTER_PATH") or None
 
     prompts = [
         f"{prefix} with {', '.join([with_quotes(w) if use_quotes else w for w in words]) if len(words) == 3 else f'{words[0]}' + (f' or {words[1]}' if len(words) > 1 else '')}"
@@ -98,7 +97,6 @@ async def main():
             learning_rate=1e-4,
             kl_penalty_coef=kl_penalty_coef,
             kl_penalty_reference_step=kl_penalty_reference_step,
-            kl_ref_adapter_path=kl_ref_adapter_path,
         )
         await model.log(
             train_groups,

@@ -167,7 +167,6 @@ async def test_pipeline_trainer_local_backend_dedicated_smoke() -> None:
                     max_batch_size=1,
                     max_steps=2,
                     kl_penalty_coef=0.25,
-                    kl_penalty_reference_step=0,
                     loss_fn="cispo",
                     eval_fn=None,
                 )

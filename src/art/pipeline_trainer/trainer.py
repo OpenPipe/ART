@@ -79,7 +79,7 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
         normalize_advantages: bool = True,
         adam_params: object | None = None,
         kl_penalty_coef: float = 0.0,
-        kl_penalty_reference_step: int | None = None,
+        kl_penalty_step_lag: int | None = None,
         max_steps: int | None = None,
         # Discard handling
         discard_queue_multiplier: int = 100,
@@ -114,6 +114,8 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
             raise ValueError("log_interval_seconds must be > 0")
         if discard_queue_multiplier <= 0:
             raise ValueError("discard_queue_multiplier must be > 0")
+        if kl_penalty_step_lag is not None and kl_penalty_step_lag < 1:
+            raise ValueError("kl_penalty_step_lag must be >= 1")
         self.model = model
         self.backend = backend
         self.rollout_fn = rollout_fn
@@ -132,7 +134,7 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
         self.normalize_advantages = normalize_advantages
         self.adam_params = adam_params
         self.kl_penalty_coef = kl_penalty_coef
-        self.kl_penalty_reference_step = kl_penalty_reference_step
+        self.kl_penalty_step_lag = kl_penalty_step_lag
         self.max_steps = max_steps
         self._status_log_interval_seconds = log_interval_seconds
         self.eval_every_n_steps = eval_every_n_steps
@@ -460,9 +462,11 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
                 if self.kl_penalty_coef > 0.0:
                     kl_train_kwargs["kl_penalty_coef"] = self.kl_penalty_coef
                     kl_train_kwargs["kl_penalty_source"] = "sample"
-                    if self.kl_penalty_reference_step is not None:
-                        kl_train_kwargs["kl_penalty_reference_step"] = (
-                            self.kl_penalty_reference_step
+                    if self.kl_penalty_step_lag is None:
+                        kl_train_kwargs["kl_penalty_reference_step"] = 0
+                    else:
+                        kl_train_kwargs["kl_penalty_reference_step"] = max(
+                            0, current_step - self.kl_penalty_step_lag
                         )
                 result = await self.backend.train(
                     self.model,

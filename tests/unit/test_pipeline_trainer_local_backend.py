@@ -105,7 +105,6 @@ async def test_pipeline_trainer_forwards_kl_kwargs_for_generic_backend(
         model=model,
         backend=backend,
         kl_penalty_coef=0.25,
-        kl_penalty_reference_step=7,
     )
     trainer._output_queue = asyncio.Queue()
     await trainer._output_queue.put(_make_group([0.0, 1.0]))
@@ -121,9 +120,75 @@ async def test_pipeline_trainer_forwards_kl_kwargs_for_generic_backend(
         "save_checkpoint": False,
         "adam_params": None,
         "kl_penalty_coef": 0.25,
-        "kl_penalty_reference_step": 7,
+        "kl_penalty_reference_step": 0,
         "kl_penalty_source": "sample",
     }
+
+
+@pytest.mark.asyncio
+async def test_pipeline_trainer_kl_step_lag_floors_at_zero(
+    tmp_path: Path,
+) -> None:
+    """kl_penalty_step_lag floors at step 0 when lag > current_step."""
+    model = TrainableModel(
+        name="pipeline-kl-step-lag-floor",
+        project="pipeline-tests",
+        base_model="test-model",
+        base_path=str(tmp_path),
+    )
+    backend = MagicMock()
+    backend.train = AsyncMock(return_value=SimpleNamespace(step=2, metrics={}))
+
+    trainer = _make_trainer(
+        model=model,
+        backend=backend,
+        kl_penalty_coef=0.25,
+        kl_penalty_step_lag=5,
+    )
+    trainer._output_queue = asyncio.Queue()
+    await trainer._output_queue.put(_make_group([0.0, 1.0]))
+    await trainer._output_queue.put(None)
+
+    # Simulate being at step 1
+    trainer.state.next_training_step = 1
+
+    await trainer._training_stage()
+
+    # At step 1, lag=5 → reference = max(0, 1-5) = 0
+    assert backend.train.await_args.kwargs["kl_penalty_reference_step"] == 0
+
+
+@pytest.mark.asyncio
+async def test_pipeline_trainer_kl_step_lag_computes_reference(
+    tmp_path: Path,
+) -> None:
+    """kl_penalty_step_lag computes reference from current step."""
+    model = TrainableModel(
+        name="pipeline-kl-step-lag",
+        project="pipeline-tests",
+        base_model="test-model",
+        base_path=str(tmp_path),
+    )
+    backend = MagicMock()
+    backend.train = AsyncMock(return_value=SimpleNamespace(step=4, metrics={}))
+
+    trainer = _make_trainer(
+        model=model,
+        backend=backend,
+        kl_penalty_coef=0.25,
+        kl_penalty_step_lag=2,
+    )
+    trainer._output_queue = asyncio.Queue()
+    await trainer._output_queue.put(_make_group([0.0, 1.0]))
+    await trainer._output_queue.put(None)
+
+    # Simulate being at step 3
+    trainer.state.next_training_step = 3
+
+    await trainer._training_stage()
+
+    # At step 3, lag=2 → reference = max(0, 3-2) = 1
+    assert backend.train.await_args.kwargs["kl_penalty_reference_step"] == 1
 
 
 @pytest.mark.asyncio
