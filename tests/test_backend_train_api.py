@@ -11,6 +11,8 @@ import asyncio
 import os
 import tempfile
 
+import torch
+
 import art
 from art.local import LocalBackend
 from art.types import LocalTrainResult
@@ -18,6 +20,19 @@ from art.types import LocalTrainResult
 DEFAULT_GPU_MEMORY_UTILIZATION = 0.2
 DEFAULT_MAX_MODEL_LEN = 2048
 DEFAULT_MAX_SEQ_LENGTH = 2048
+DEFAULT_BASE_MODEL = "Qwen/Qwen3-0.6B"
+
+
+def _get_env_bool(name: str) -> bool | None:
+    value = os.environ.get(name)
+    if value is None:
+        return None
+    lowered = value.strip().lower()
+    if lowered in {"1", "true", "yes", "on"}:
+        return True
+    if lowered in {"0", "false", "no", "off"}:
+        return False
+    raise ValueError(f"Invalid boolean value for {name}: {value!r}. Use true/false.")
 
 
 def get_vllm_test_config() -> tuple[art.dev.InternalModelConfig, str | None]:
@@ -30,35 +45,40 @@ def get_vllm_test_config() -> tuple[art.dev.InternalModelConfig, str | None]:
     min_free_gib = float(os.environ.get("ART_TEST_MIN_FREE_GPU_GIB", "8"))
     safe_utilization = requested
     skip_reason: str | None = None
-    try:
-        import torch
+    if torch.cuda.is_available():
+        free_bytes, total_bytes = torch.cuda.mem_get_info()
+        free_gib = free_bytes / (1024**3)
+        if free_gib < min_free_gib:
+            skip_reason = (
+                f"Skipping backend.train API test: free GPU memory is too low "
+                f"({free_gib:.2f} GiB < {min_free_gib:.2f} GiB)."
+            )
+        safe_utilization = min(requested, (free_bytes / total_bytes) * 0.8)
 
-        if torch.cuda.is_available():
-            free_bytes, total_bytes = torch.cuda.mem_get_info()
-            free_gib = free_bytes / (1024**3)
-            if free_gib < min_free_gib:
-                skip_reason = (
-                    f"Skipping backend.train API test: free GPU memory is too low "
-                    f"({free_gib:.2f} GiB < {min_free_gib:.2f} GiB)."
-                )
-            safe_utilization = min(requested, (free_bytes / total_bytes) * 0.8)
-    except Exception:
-        pass
+    init_args: art.dev.InitArgs = {
+        "max_seq_length": int(
+            os.environ.get("ART_TEST_MAX_SEQ_LENGTH", str(DEFAULT_MAX_SEQ_LENGTH))
+        ),
+    }
+    load_in_4bit = _get_env_bool("ART_TEST_LOAD_IN_4BIT")
+    if load_in_4bit is not None:
+        init_args["load_in_4bit"] = load_in_4bit
+    load_in_16bit = _get_env_bool("ART_TEST_LOAD_IN_16BIT")
+    if load_in_16bit is not None:
+        init_args["load_in_16bit"] = load_in_16bit
+
+    engine_args: art.dev.EngineArgs = {
+        "gpu_memory_utilization": safe_utilization,
+        "max_model_len": int(
+            os.environ.get("ART_TEST_MAX_MODEL_LEN", str(DEFAULT_MAX_MODEL_LEN))
+        ),
+        "max_num_seqs": 8,
+        "enforce_eager": True,
+    }
 
     return {
-        "engine_args": {
-            "gpu_memory_utilization": safe_utilization,
-            "max_model_len": int(
-                os.environ.get("ART_TEST_MAX_MODEL_LEN", str(DEFAULT_MAX_MODEL_LEN))
-            ),
-            "max_num_seqs": 8,
-            "enforce_eager": True,
-        },
-        "init_args": {
-            "max_seq_length": int(
-                os.environ.get("ART_TEST_MAX_SEQ_LENGTH", str(DEFAULT_MAX_SEQ_LENGTH))
-            ),
-        },
+        "engine_args": engine_args,
+        "init_args": init_args,
     }, skip_reason
 
 
@@ -85,7 +105,7 @@ async def simple_rollout(client, model_name: str, prompt: str) -> art.Trajectory
     return art.Trajectory(messages_and_choices=[*messages, choice], reward=reward)
 
 
-async def main():
+async def main() -> None:
     print("=" * 60)
     print("Testing new backend.train() API")
     print("=" * 60)
@@ -98,7 +118,7 @@ async def main():
         model = art.TrainableModel(
             name="test-backend-train-api",
             project="api-test",
-            base_model="Qwen/Qwen3-0.6B",
+            base_model=os.environ.get("BASE_MODEL", DEFAULT_BASE_MODEL),
         )
         test_config, skip_reason = get_vllm_test_config()
         if skip_reason is not None:
