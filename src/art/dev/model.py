@@ -157,6 +157,7 @@ class InitArgs(TypedDict, total=False):
     dtype: str | None
     load_in_4bit: bool
     load_in_8bit: bool
+    load_in_16bit: bool
     full_finetuning: bool
     token: str | None
     device_map: str

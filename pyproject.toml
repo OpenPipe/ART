@@ -30,7 +30,7 @@ backend = [
     "awscli>=1.38.1",
     "setuptools>=78.1.0",
     "wandb==0.25.0",
-    "transformers>=4.55.2,<=4.57.3",
+    "transformers==5.2.0",
     "duckdb>=1.0.0",
     "pyarrow>=15.0.0",
     "trl==0.20.0",
@@ -38,7 +38,7 @@ backend = [
     "pytest>=8.4.1",
     "nbmake>=1.5.5",
     "gql<4",
-    "vllm==0.17.0 ; sys_platform == 'linux'",
+    "vllm @ https://github.com/vivekkalyan/vllm/releases/download/v0.17.0-art1/vllm-0.17.0%2Bart1-cp38-abi3-manylinux_2_31_x86_64.whl ; sys_platform == 'linux'",
 ]
 megatron = [
     "torch>=2.8.0",
@@ -66,13 +66,16 @@ tinker = [
     "pydantic>=2.12.5",
     "tinker>=0.8.1",
     "torch>=2.8.0",
-    "transformers>=4.55.2,<=4.57.3",
+    "transformers==5.2.0",
     "uvicorn>=0.35.0",
     "datrie>=0.8.3",
 ]
 
 [project.scripts]
 art = "art.cli:app"
+
+[project.entry-points."vllm.general_plugins"]
+art = "art.vllm.patches:patch_transformers_v5_compat"
 
 [build-system]
 requires = ["hatchling"]
