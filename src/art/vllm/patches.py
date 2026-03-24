@@ -1,6 +1,9 @@
 """Monkey patches and modifications for vLLM."""
 
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from torch import Tensor
 
 
 def patch_transformers_v5_compat() -> None:
@@ -69,7 +72,10 @@ def _patch_qwen3_5_lora() -> None:
 
     MergedColumnParallelLinearWithLoRA.can_replace_layer = can_replace_layer
 
-    def slice_lora_a(self: Any, lora_a: list[Any]) -> list[Any]:
+    def slice_lora_a(
+        self: Any,
+        lora_a: "list[Tensor | None]",
+    ) -> "list[Tensor | None]":
         output_shard_size = self.lora_a_stacked[0].shape[2]
         output_start_idx = self.tp_rank * output_shard_size
         return [
@@ -79,7 +85,7 @@ def _patch_qwen3_5_lora() -> None:
             for a in lora_a
         ]
 
-    MergedColumnParallelLinearWithShardedLoRA.slice_lora_a = slice_lora_a
+    MergedColumnParallelLinearWithShardedLoRA.slice_lora_a = slice_lora_a  # ty:ignore[invalid-assignment]
 
 
 def subclass_chat_completion_request() -> None:
