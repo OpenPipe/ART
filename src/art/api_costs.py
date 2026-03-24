@@ -10,6 +10,7 @@ from .costs import get_model_pricing, tokens_to_cost
 
 OPENAI_PROVIDER = "openai"
 ANTHROPIC_PROVIDER = "anthropic"
+NOVITA_PROVIDER = "novita"
 
 P = ParamSpec("P")
 R = TypeVar("R")
@@ -53,6 +54,21 @@ MODEL_TOKEN_PRICING: dict[str, TokenPricing] = {
         completion_per_million=15.0,
         cache_creation_per_million=3.75,
         cache_read_per_million=0.30,
+    ),
+    "novita/moonshotai/kimi-k2.5": TokenPricing(
+        prompt_per_million=0.6,
+        completion_per_million=3.0,
+        cached_prompt_per_million=0.1,
+    ),
+    "novita/zai-org/glm-5": TokenPricing(
+        prompt_per_million=1.0,
+        completion_per_million=3.2,
+        cached_prompt_per_million=0.2,
+    ),
+    "novita/minimax/minimax-m2.5": TokenPricing(
+        prompt_per_million=0.3,
+        completion_per_million=1.2,
+        cached_prompt_per_million=0.03,
     ),
 }
 
@@ -264,7 +280,7 @@ def _estimate_provider_cost(
     response: Any,
     pricing: TokenPricing,
 ) -> float | None:
-    if provider_name == OPENAI_PROVIDER:
+    if provider_name in {OPENAI_PROVIDER, NOVITA_PROVIDER}:
         return _estimate_openai_cost(_extract_openai_token_counts(response), pricing)
     if provider_name == ANTHROPIC_PROVIDER:
         return _estimate_anthropic_cost(
@@ -438,7 +454,7 @@ def extract_api_cost(
     if provider_cost is not None:
         return provider_cost
 
-    if provider_name in {OPENAI_PROVIDER, ANTHROPIC_PROVIDER}:
+    if provider_name in {OPENAI_PROVIDER, ANTHROPIC_PROVIDER, NOVITA_PROVIDER}:
         raise ValueError(
             f"Response usage does not match provider '{provider_name}'. "
             "Pass the correct provider/model pair or register a custom cost extractor."
