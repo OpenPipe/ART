@@ -562,7 +562,7 @@ class UnslothService:
             inference_world_size,
         )
 
-    def _merged_checkpoint_weights(self) -> list[tuple[str, torch.Tensor]]:
+    def _merged_checkpoint_weights_for_vllm(self) -> list[tuple[str, torch.Tensor]]:
         model = self._state.peft_model.base_model.model
         device = next(model.parameters()).device
         assert device.type == "cuda"
@@ -614,7 +614,7 @@ class UnslothService:
                 merged = True
                 torch.cuda.synchronize()
 
-                weights = self._merged_checkpoint_weights()
+                weights = self._merged_checkpoint_weights_for_vllm()
                 update_info = {
                     "names": [name for name, _ in weights],
                     "dtype_names": [
