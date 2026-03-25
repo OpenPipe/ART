@@ -1,11 +1,28 @@
 """Validation functions for model configuration."""
 
-from .model import InternalModelConfig
+from .model import InternalModelConfig, RolloutWeightsMode
+
+QWEN3_5_MOE_MODELS = {
+    "Qwen/Qwen3.5-35B-A3B",
+    "Qwen/Qwen3.5-397B-A17B",
+}
 
 
 def is_dedicated_mode(config: InternalModelConfig) -> bool:
     """Return True if the config specifies dedicated mode (separate training and inference GPUs)."""
     return "trainer_gpu_ids" in config and "inference_gpu_ids" in config
+
+
+def _rollout_weights_mode(config: InternalModelConfig) -> RolloutWeightsMode:
+    mode = config.get("rollout_weights_mode", "lora")
+    if mode in {"lora", "merged"}:
+        return mode
+    raise ValueError("rollout_weights_mode must be either 'lora' or 'merged'")
+
+
+def _is_qwen3_5_moe_model(config: InternalModelConfig) -> bool:
+    model_name = config.get("engine_args", {}).get("model")
+    return model_name in QWEN3_5_MOE_MODELS
 
 
 def validate_dedicated_config(config: InternalModelConfig) -> None:
@@ -16,10 +33,17 @@ def validate_dedicated_config(config: InternalModelConfig) -> None:
     """
     has_trainer = "trainer_gpu_ids" in config
     has_inference = "inference_gpu_ids" in config
+    rollout_weights_mode = _rollout_weights_mode(config)
 
     if has_trainer != has_inference:
         raise ValueError(
             "trainer_gpu_ids and inference_gpu_ids must both be set or both unset"
+        )
+
+    if rollout_weights_mode == "merged" and not has_trainer:
+        raise ValueError(
+            "rollout_weights_mode='merged' requires dedicated mode "
+            "(set both trainer_gpu_ids and inference_gpu_ids)"
         )
 
     if not has_trainer:
@@ -64,4 +88,10 @@ def validate_dedicated_config(config: InternalModelConfig) -> None:
         raise ValueError(
             "enable_sleep_mode is incompatible with dedicated mode "
             "(dedicated mode runs vLLM on a separate GPU, sleep/wake is not needed)"
+        )
+
+    if _is_qwen3_5_moe_model(config) and rollout_weights_mode == "lora":
+        raise ValueError(
+            "Qwen3.5-MoE models require rollout_weights_mode='merged' with the "
+            "current vLLM version because direct LoRA inference is currently broken"
         )

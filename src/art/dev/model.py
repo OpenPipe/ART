@@ -1,8 +1,11 @@
 from enum import Enum
+from typing import Literal
 
 from typing_extensions import Required, TypedDict
 
 from .engine import EngineArgs
+
+RolloutWeightsMode = Literal["lora", "merged"]
 
 
 # Vendored from transformers.training_args.OptimizerNames
@@ -120,6 +123,10 @@ class InternalModelConfig(TypedDict, total=False):
             inference run on separate GPUs.
         inference_gpu_ids: GPU IDs for vLLM inference (e.g., [1]). When set
             with trainer_gpu_ids, enables dedicated mode.
+        rollout_weights_mode: How inference weights are applied in vLLM.
+            - "lora": load LoRA adapters into vLLM directly
+            - "merged": keep training LoRA adapters, but push merged weights
+              into vLLM for inference
     """
 
     init_args: "InitArgs"
@@ -130,6 +137,7 @@ class InternalModelConfig(TypedDict, total=False):
     trainer_args: "TrainerArgs"
     trainer_gpu_ids: list[int]
     inference_gpu_ids: list[int]
+    rollout_weights_mode: "RolloutWeightsMode"
 
 
 class TinkerArgs(TypedDict, total=False):

@@ -143,6 +143,7 @@ def test_get_model_config_shared_mode():
         assert "inference_gpu_ids" not in result
         assert result["engine_args"]["enable_sleep_mode"] is True
         assert result["init_args"].get("fast_inference") is False
+        assert result["rollout_weights_mode"] == "lora"
 
 
 def test_get_model_config_dedicated_mode():
@@ -158,6 +159,7 @@ def test_get_model_config_dedicated_mode():
         assert result["inference_gpu_ids"] == [1]
         assert result["engine_args"]["enable_sleep_mode"] is False
         assert "fast_inference" not in result["init_args"]
+        assert result["rollout_weights_mode"] == "lora"
 
 
 def test_get_model_config_dedicated_preserves_user_engine_args():
@@ -173,3 +175,71 @@ def test_get_model_config_dedicated_preserves_user_engine_args():
         assert result["engine_args"]["max_model_len"] == 4096
         # Sleep mode should still be disabled even if user didn't set it
         assert result["engine_args"]["enable_sleep_mode"] is False
+
+
+def test_get_model_config_preserves_rollout_weights_mode():
+    from art.dev.get_model_config import get_model_config
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        config = InternalModelConfig(
+            trainer_gpu_ids=[0],
+            inference_gpu_ids=[1],
+            rollout_weights_mode="merged",
+        )
+        result = get_model_config("test-model", tmpdir, config)
+        assert result["rollout_weights_mode"] == "merged"
+
+
+def test_invalid_rollout_weights_mode():
+    with pytest.raises(
+        ValueError, match="rollout_weights_mode must be either 'lora' or 'merged'"
+    ):
+        validate_dedicated_config(
+            InternalModelConfig(rollout_weights_mode="bad-mode")  # type: ignore[typeddict-item]
+        )
+
+
+def test_merged_rollout_weights_requires_dedicated_mode():
+    with pytest.raises(
+        ValueError, match="rollout_weights_mode='merged' requires dedicated mode"
+    ):
+        validate_dedicated_config(InternalModelConfig(rollout_weights_mode="merged"))
+
+
+def test_qwen3_5_moe_requires_merged_rollout_weights():
+    with pytest.raises(
+        ValueError,
+        match="Qwen3.5-MoE models require rollout_weights_mode='merged'",
+    ):
+        validate_dedicated_config(
+            InternalModelConfig(
+                trainer_gpu_ids=[0],
+                inference_gpu_ids=[1],
+                engine_args={"model": "Qwen/Qwen3.5-35B-A3B"},  # type: ignore[typeddict-item]
+            )
+        )
+
+
+def test_qwen3_5_moe_allows_merged_rollout_weights():
+    validate_dedicated_config(
+        InternalModelConfig(
+            trainer_gpu_ids=[0],
+            inference_gpu_ids=[1],
+            rollout_weights_mode="merged",
+            engine_args={"model": "Qwen/Qwen3.5-35B-A3B"},  # type: ignore[typeddict-item]
+        )
+    )
+
+
+def test_other_qwen3_5_moe_requires_merged_rollout_weights():
+    with pytest.raises(
+        ValueError,
+        match="Qwen3.5-MoE models require rollout_weights_mode='merged'",
+    ):
+        validate_dedicated_config(
+            InternalModelConfig(
+                trainer_gpu_ids=[0],
+                inference_gpu_ids=[1],
+                engine_args={"model": "Qwen/Qwen3.5-397B-A17B"},  # type: ignore[typeddict-item]
+            )
+        )
