@@ -6,6 +6,7 @@ from functools import cached_property
 import json
 import logging
 import os
+import socket
 import subprocess
 import sys
 from typing import TYPE_CHECKING, Any, AsyncIterator, Literal, Protocol, cast
@@ -207,6 +208,21 @@ def _get_trainer_optimizer(trainer: GRPOTrainer) -> Optimizer:
     return optimizer
 
 
+def _find_free_tcp_port() -> int:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.bind(("127.0.0.1", 0))
+        return cast(int, sock.getsockname()[1])
+
+
+def _normalize_merged_checkpoint_name(name: str) -> str:
+    # PEFT wraps adapted modules under `.base_layer`, but vLLM expects the
+    # original checkpoint parameter names during update_weights().
+    normalized = name.removeprefix("base_model.model.")
+    while ".base_layer." in normalized:
+        normalized = normalized.replace(".base_layer.", ".")
+    return normalized
+
+
 # ============================================================================
 # Model Classes
 # ============================================================================
@@ -325,11 +341,22 @@ class UnslothService:
     _vllm_log_file: Any = field(default=None, repr=False)
     _vllm_host: str = "127.0.0.1"
     _vllm_port: int = 0
+    _weight_transfer_group: Any = field(default=None, init=False, repr=False)
     _train_task: asyncio.Task[None] | None = field(default=None, init=False, repr=False)
 
     @property
     def is_dedicated(self) -> bool:
         return is_dedicated_mode(self.config)
+
+    @property
+    def rollout_weights_mode(self) -> Literal["lora", "merged"]:
+        mode = self.config["rollout_weights_mode"]
+        assert mode in {"lora", "merged"}
+        return mode
+
+    @property
+    def _vllm_base_url(self) -> str:
+        return f"http://{self._vllm_host}:{self._vllm_port}"
 
     def _next_lora_id(self) -> int:
         """Return a new unique LoRA ID to avoid collisions in vLLM."""
@@ -387,8 +414,13 @@ class UnslothService:
         if config and "engine_args" in config:
             engine_args.update(dict(config["engine_args"]))
         engine_args.setdefault("generation_config", "vllm")
-        engine_args["enable_lora"] = True
-        engine_args.setdefault("max_loras", 2)
+        if self.rollout_weights_mode == "merged":
+            engine_args["weight_transfer_config"] = {"backend": "nccl"}
+            engine_args.pop("enable_lora", None)
+            engine_args.pop("max_loras", None)
+        else:
+            engine_args["enable_lora"] = True
+            engine_args.setdefault("max_loras", 2)
         for key in ("model", "served_model_name", "enable_sleep_mode"):
             engine_args.pop(key, None)
 
@@ -402,6 +434,7 @@ class UnslothService:
             f"--cuda-visible-devices={cuda_devices}",
             f"--lora-path={lora_path}",
             f"--served-model-name={self.model_name}@{self._latest_step}",
+            f"--rollout-weights-mode={self.rollout_weights_mode}",
             f"--engine-args-json={json.dumps(engine_args)}",
             f"--server-args-json={json.dumps(server_args)}",
         ]
@@ -451,6 +484,194 @@ class UnslothService:
         logger.info("vLLM subprocess ready on port %d (GPUs: %s)", port, cuda_devices)
         return self._vllm_host, self._vllm_port
 
+    async def _set_served_model_name(self, step: int) -> None:
+        import httpx
+
+        served_model_name = f"{self.model_name}@{step}"
+        async with httpx.AsyncClient() as client:
+            response = await client.post(
+                f"{self._vllm_base_url}/art/set_served_model_name",
+                json={"name": served_model_name},
+                timeout=30.0,
+            )
+            response.raise_for_status()
+        logger.info(
+            "[DEDICATED] Updated merged rollout alias to %s",
+            served_model_name,
+        )
+
+    async def _init_merged_weight_transfer(self) -> None:
+        import httpx
+        from vllm.distributed.weight_transfer.nccl_engine import (
+            NCCLWeightTransferEngine,
+        )
+
+        if self._weight_transfer_group is not None:
+            return
+
+        async with httpx.AsyncClient() as client:
+            world_size_response = await client.get(
+                f"{self._vllm_base_url}/get_world_size",
+                timeout=30.0,
+            )
+            try:
+                world_size_response.raise_for_status()
+            except httpx.HTTPStatusError as exc:
+                raise RuntimeError(
+                    "Merged rollout weights require a vLLM build with the "
+                    "/get_world_size endpoint"
+                ) from exc
+            inference_world_size = int(world_size_response.json()["world_size"])
+
+            master_port = _find_free_tcp_port()
+            init_info = {
+                "master_address": "127.0.0.1",
+                "master_port": master_port,
+                "rank_offset": 1,
+                "world_size": inference_world_size + 1,
+            }
+
+            remote_init_task = asyncio.create_task(
+                client.post(
+                    f"{self._vllm_base_url}/init_weight_transfer_engine",
+                    json={"init_info": init_info},
+                    timeout=300.0,
+                )
+            )
+            # TODO: replace this with a real readiness handshake if this ever flakes.
+            await asyncio.sleep(1.0)
+            self._weight_transfer_group = await asyncio.to_thread(
+                NCCLWeightTransferEngine.trainer_init,
+                {
+                    "master_address": init_info["master_address"],
+                    "master_port": init_info["master_port"],
+                    "world_size": init_info["world_size"],
+                },
+            )
+            remote_init_response = await remote_init_task
+            try:
+                remote_init_response.raise_for_status()
+            except httpx.HTTPStatusError as exc:
+                raise RuntimeError(
+                    "Merged rollout weights require a vLLM build with the "
+                    "/init_weight_transfer_engine endpoint"
+                ) from exc
+
+        logger.info(
+            "[DEDICATED] Initialized merged weight transfer: inference_world_size=%d",
+            inference_world_size,
+        )
+
+    def _merged_checkpoint_weights(self) -> list[tuple[str, torch.Tensor]]:
+        model = self._state.peft_model.base_model.model
+        device = next(model.parameters()).device
+        assert device.type == "cuda"
+
+        weights: list[tuple[str, torch.Tensor]] = []
+        normalized_names: set[str] = set()
+        for name, tensor in model.state_dict().items():
+            if "lora_" in name:
+                continue
+            normalized_name = _normalize_merged_checkpoint_name(name)
+            assert normalized_name not in normalized_names
+            normalized_names.add(normalized_name)
+            detached = tensor.detach()
+            if detached.device != device:
+                detached = detached.to(device=device, non_blocking=True)
+            weights.append((normalized_name, detached))
+
+        assert weights
+        return weights
+
+    async def _sync_merged_weights(
+        self,
+        step: int,
+        pause_generation: bool,
+    ) -> None:
+        import httpx
+        from vllm.distributed.weight_transfer.nccl_engine import (
+            NCCLWeightTransferEngine,
+        )
+
+        assert self._weight_transfer_group is not None
+
+        peft_model = self._state.peft_model
+        merged = False
+        error: Exception | None = None
+        logger.info("[DEDICATED] Syncing merged rollout weights for step %d", step)
+
+        async with httpx.AsyncClient() as client:
+            try:
+                if pause_generation:
+                    response = await client.post(
+                        f"{self._vllm_base_url}/pause",
+                        params={"mode": "wait"},
+                        timeout=300.0,
+                    )
+                    response.raise_for_status()
+
+                peft_model.merge_adapter()
+                merged = True
+                torch.cuda.synchronize()
+
+                weights = self._merged_checkpoint_weights()
+                update_info = {
+                    "names": [name for name, _ in weights],
+                    "dtype_names": [
+                        str(tensor.dtype).removeprefix("torch.")
+                        for _, tensor in weights
+                    ],
+                    "shapes": [list(tensor.shape) for _, tensor in weights],
+                    "is_checkpoint_format": True,
+                }
+
+                _, update_response = await asyncio.gather(
+                    asyncio.to_thread(
+                        NCCLWeightTransferEngine.trainer_send_weights,
+                        iter(weights),
+                        {"group": self._weight_transfer_group},
+                    ),
+                    client.post(
+                        f"{self._vllm_base_url}/update_weights",
+                        json={"update_info": update_info},
+                        timeout=600.0,
+                    ),
+                )
+                try:
+                    update_response.raise_for_status()
+                except httpx.HTTPStatusError as exc:
+                    raise RuntimeError(
+                        "Merged rollout weights require a vLLM build with the "
+                        "/update_weights endpoint"
+                    ) from exc
+                self._latest_step = step
+                await self._set_served_model_name(step)
+            except Exception as exc:
+                error = exc
+                raise
+            finally:
+                if merged:
+                    peft_model.unmerge_adapter()
+                    torch.cuda.synchronize()
+                if pause_generation:
+                    try:
+                        response = await client.post(
+                            f"{self._vllm_base_url}/resume",
+                            timeout=30.0,
+                        )
+                        response.raise_for_status()
+                    except Exception:
+                        if error is None:
+                            raise
+                        logger.exception(
+                            "Failed to resume generation after merged weight sync error"
+                        )
+
+        logger.info(
+            "[DEDICATED] Merged rollout sync complete for step %d",
+            step,
+        )
+
     async def _reload_adapter(self, checkpoint_path: str, step: int) -> None:
         """Reload LoRA adapter in vLLM subprocess via HTTP."""
         import httpx
@@ -478,6 +699,7 @@ class UnslothService:
 
     def close(self) -> None:
         """Terminate vLLM subprocess if running."""
+        self._weight_transfer_group = None
         if self._vllm_process is None:
             return
         self._vllm_process.terminate()
@@ -510,7 +732,16 @@ class UnslothService:
 
         if self.is_dedicated:
             port = (config or {}).get("server_args", {}).get("port", 8000)
-            return await self._start_vllm_subprocess(lora_path, port, config=config)
+            vllm_location = await self._start_vllm_subprocess(
+                lora_path,
+                port,
+                config=config,
+            )
+            if self.rollout_weights_mode == "merged":
+                _ = self._state
+                await self._init_merged_weight_transfer()
+                await self._sync_merged_weights(self._latest_step, False)
+            return vllm_location
 
         # Shared mode: in-process vLLM
         self._state.offload_to_cpu()
@@ -544,7 +775,10 @@ class UnslothService:
             f"checkpoint_dir={checkpoint_dir} is_dedicated={self.is_dedicated}"
         )
         if self.is_dedicated:
-            await self._reload_adapter(checkpoint_dir, step)
+            if self.rollout_weights_mode == "merged":
+                await self._set_served_model_name(step)
+            else:
+                await self._reload_adapter(checkpoint_dir, step)
             self._latest_step = step
             return
 
@@ -655,14 +889,21 @@ class UnslothService:
         )
 
         new_step = int(os.path.basename(checkpoint_dir))
-        logger.info(
-            f"[DEDICATED] _train_dedicated: saved checkpoint step={new_step}, "
-            f"reloading adapter..."
-        )
-        await self._reload_adapter(checkpoint_dir, new_step)
+        if self.rollout_weights_mode == "merged":
+            logger.info(
+                "[DEDICATED] _train_dedicated: saved checkpoint step=%s, syncing merged weights...",
+                new_step,
+            )
+            await self._sync_merged_weights(new_step, True)
+        else:
+            logger.info(
+                "[DEDICATED] _train_dedicated: saved checkpoint step=%s, reloading adapter...",
+                new_step,
+            )
+            await self._reload_adapter(checkpoint_dir, new_step)
         self._latest_step = new_step
         logger.info(
-            f"[DEDICATED] _train_dedicated: adapter reloaded for step {new_step}"
+            f"[DEDICATED] _train_dedicated: inference weights updated for step {new_step}"
         )
 
     async def _train_shared(

@@ -3,6 +3,10 @@ from typing import Any, Literal, Tuple
 from typing_extensions import TypedDict
 
 
+class WeightTransferConfig(TypedDict):
+    backend: Literal["nccl"]
+
+
 class EngineArgs(TypedDict, total=False):
     model: str
     served_model_name: str | list[str] | None
@@ -124,6 +128,7 @@ class EngineArgs(TypedDict, total=False):
     calculate_kv_scales: bool | None
 
     additional_config: dict[str, Any] | None
+    weight_transfer_config: WeightTransferConfig | None
 
     disable_log_requests: (
         bool  # Deprecated in vLLM 0.13+, use enable_log_requests instead
