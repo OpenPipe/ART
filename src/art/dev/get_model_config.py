@@ -1,6 +1,31 @@
 from .engine import EngineArgs
 from .model import InitArgs, InternalModelConfig, PeftArgs, TrainerArgs
-from .validate import is_dedicated_mode
+from .validate import QWEN3_5_MOE_MODELS, is_dedicated_mode
+
+
+def default_target_modules(base_model: str) -> list[str]:
+    if base_model in QWEN3_5_MOE_MODELS:
+        return [
+            "q_proj",
+            "k_proj",
+            "v_proj",
+            "o_proj",
+            "in_proj_qkv",
+            "in_proj_z",
+            "out_proj",
+            "gate_proj",
+            "up_proj",
+            "down_proj",
+        ]
+    return [
+        "q_proj",
+        "k_proj",
+        "v_proj",
+        "o_proj",
+        "gate_proj",
+        "up_proj",
+        "down_proj",
+    ]
 
 
 def get_model_config(
@@ -44,15 +69,7 @@ def get_model_config(
         lora_alpha=16,
         r=8,
         random_state=3407,
-        target_modules=[
-            "q_proj",
-            "k_proj",
-            "v_proj",
-            "o_proj",
-            "gate_proj",
-            "up_proj",
-            "down_proj",
-        ],
+        target_modules=default_target_modules(base_model),
         use_gradient_checkpointing="unsloth",
     )
     peft_args.update(config.get("peft_args", {}))

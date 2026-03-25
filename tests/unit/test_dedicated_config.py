@@ -144,6 +144,52 @@ def test_get_model_config_shared_mode():
         assert result["engine_args"]["enable_sleep_mode"] is True
         assert result["init_args"].get("fast_inference") is False
         assert result["rollout_weights_mode"] == "lora"
+        assert result["peft_args"]["target_modules"] == [
+            "q_proj",
+            "k_proj",
+            "v_proj",
+            "o_proj",
+            "gate_proj",
+            "up_proj",
+            "down_proj",
+        ]
+
+
+@pytest.mark.parametrize(
+    "base_model",
+    ["Qwen/Qwen3.5-35B-A3B", "Qwen/Qwen3.5-397B-A17B"],
+)
+def test_get_model_config_qwen3_5_moe_target_modules(base_model: str):
+    from art.dev.get_model_config import get_model_config
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        result = get_model_config(base_model, tmpdir, None)
+        assert result["peft_args"]["target_modules"] == [
+            "q_proj",
+            "k_proj",
+            "v_proj",
+            "o_proj",
+            "in_proj_qkv",
+            "in_proj_z",
+            "out_proj",
+            "gate_proj",
+            "up_proj",
+            "down_proj",
+        ]
+
+
+def test_get_model_config_preserves_user_target_modules():
+    from art.dev.get_model_config import get_model_config
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        result = get_model_config(
+            "Qwen/Qwen3.5-35B-A3B",
+            tmpdir,
+            InternalModelConfig(
+                peft_args={"target_modules": ["custom_proj"]},  # type: ignore[typeddict-item]
+            ),
+        )
+        assert result["peft_args"]["target_modules"] == ["custom_proj"]
 
 
 def test_get_model_config_dedicated_mode():

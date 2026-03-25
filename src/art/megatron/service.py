@@ -19,6 +19,7 @@ from vllm.lora.request import LoRARequest
 from vllm.v1.engine.async_llm import AsyncLLM
 
 from .. import dev, types
+from ..dev.get_model_config import default_target_modules
 from ..local.checkpoints import get_last_checkpoint_dir
 from ..preprocessing.pack import DiskPackedTensors
 from ..preprocessing.tokenize import SFTBatch
@@ -66,15 +67,7 @@ class MegatronService:
         return LoraConfig(
             r=1,
             lora_alpha=32,
-            target_modules=[
-                "q_proj",
-                "k_proj",
-                "v_proj",
-                "o_proj",
-                "gate_proj",
-                "up_proj",
-                "down_proj",
-            ],
+            target_modules=default_target_modules(self.base_model),
             bias="none",
         )
 
