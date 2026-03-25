@@ -223,6 +223,12 @@ def build_internal_config() -> art.dev.InternalModelConfig:
         result["trainer_gpu_ids"] = trainer_gpu_ids
         result["inference_gpu_ids"] = inference_gpu_ids
 
+    rollout_weights_mode = os.environ.get("ROLLOUT_WEIGHTS_MODE")
+    if rollout_weights_mode is not None:
+        if rollout_weights_mode not in {"lora", "merged"}:
+            raise ValueError("ROLLOUT_WEIGHTS_MODE must be either 'lora' or 'merged'")
+        result["rollout_weights_mode"] = rollout_weights_mode
+
     return result
 
 

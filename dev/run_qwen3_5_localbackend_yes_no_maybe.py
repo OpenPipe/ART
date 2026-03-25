@@ -51,6 +51,11 @@ parser.add_argument(
 parser.add_argument(
     "--enable-thinking", action=argparse.BooleanOptionalAction, default=False
 )
+parser.add_argument(
+    "--rollout-weights-mode",
+    choices=("lora", "merged"),
+    default=None,
+)
 parser.add_argument("--trainer-gpu-ids", type=int, nargs="+")
 parser.add_argument("--inference-gpu-ids", type=int, nargs="+")
 args = parser.parse_args()
@@ -98,6 +103,8 @@ if args.trainer_gpu_ids is not None:
             f"INFERENCE_GPU_IDS={_format_int_list(args.inference_gpu_ids)}",
         ]
     )
+if args.rollout_weights_mode is not None:
+    env.append(f"ROLLOUT_WEIGHTS_MODE={args.rollout_weights_mode}")
 env_block = " \\\n    ".join(env)
 
 run_script = textwrap.dedent(
@@ -143,6 +150,7 @@ print(f"  learning_rate: {args.learning_rate}")
 print(f"  load_in_4bit: {args.load_in_4bit}")
 print(f"  load_in_16bit: {args.load_in_16bit}")
 print(f"  enable_thinking: {args.enable_thinking}")
+print(f"  rollout_weights_mode: {args.rollout_weights_mode}")
 print(f"  trainer_gpu_ids: {args.trainer_gpu_ids}")
 print(f"  inference_gpu_ids: {args.inference_gpu_ids}")
 
