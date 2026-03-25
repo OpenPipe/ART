@@ -2,7 +2,7 @@
 
 import torch
 
-from art.loss import Loss, loss_fn
+from art.loss import loss_fn, shift_tensor
 
 
 def _make_inputs(
@@ -114,3 +114,50 @@ def test_kl_advantage_does_not_affect_when_no_ref():
 
     loss = loss_fn(inputs, new_logprobs, None, None, {"kl_penalty_coef": 0.5})
     assert loss.kl_policy_ref is None
+
+
+def test_kl_advantage_can_use_sample_logprobs() -> None:
+    """Sample-source KL should use stored rollout logprobs rather than learner logprobs."""
+    inputs = _make_inputs(seq_len=8)
+    inputs["logprobs"] = torch.tensor(
+        [[0.0, -0.2, -0.4, -0.6, -0.8, -1.0, -1.2, -1.4]], dtype=torch.float32
+    )
+    new_logprobs = torch.tensor(
+        [[0.0, -1.2, -1.1, -1.0, -0.9, -0.8, -0.7, -0.6]], dtype=torch.float32
+    )
+    ref_logprobs = torch.full((1, 8), -0.5)
+    assistant_mask = shift_tensor(inputs["assistant_mask"], False).to(
+        new_logprobs.dtype
+    )
+    sampled_logprobs = torch.where(
+        torch.isnan(shift_tensor(inputs["logprobs"], float("nan"))),
+        new_logprobs.detach(),
+        shift_tensor(inputs["logprobs"], float("nan")),
+    )
+    expected_sample_kl = ((sampled_logprobs - ref_logprobs) * assistant_mask).sum() / (
+        assistant_mask.sum() + 1e-6
+    )
+    expected_current_kl = ((new_logprobs - ref_logprobs) * assistant_mask).sum() / (
+        assistant_mask.sum() + 1e-6
+    )
+
+    sample_loss = loss_fn(
+        inputs,
+        new_logprobs,
+        ref_logprobs,
+        None,
+        {"kl_penalty_coef": 0.5, "kl_penalty_source": "sample"},
+    )
+    learner_loss = loss_fn(
+        inputs,
+        new_logprobs,
+        ref_logprobs,
+        None,
+        {"kl_penalty_coef": 0.5, "kl_penalty_source": "current_learner"},
+    )
+
+    assert sample_loss.kl_policy_ref is not None
+    assert learner_loss.kl_policy_ref is not None
+    assert torch.isclose(sample_loss.kl_policy_ref, expected_sample_kl)
+    assert torch.isclose(learner_loss.kl_policy_ref, expected_current_kl)
+    assert not torch.isclose(sample_loss.kl_policy_ref, learner_loss.kl_policy_ref)

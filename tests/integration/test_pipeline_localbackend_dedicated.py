@@ -1,7 +1,10 @@
 """Dedicated LocalBackend smoke test for PipelineTrainer."""
 
 import asyncio
+import json
+import math
 import os
+from pathlib import Path
 import tempfile
 import uuid
 
@@ -163,6 +166,8 @@ async def test_pipeline_trainer_local_backend_dedicated_smoke() -> None:
                     min_batch_size=1,
                     max_batch_size=1,
                     max_steps=2,
+                    kl_penalty_coef=0.25,
+                    kl_penalty_reference_step=0,
                     loss_fn="cispo",
                     eval_fn=None,
                 )
@@ -180,5 +185,23 @@ async def test_pipeline_trainer_local_backend_dedicated_smoke() -> None:
                 model_ids = [m.id async for m in client.models.list()]
                 assert f"{model.name}@0" in model_ids
                 assert f"{model.name}@{latest_step}" in model_ids
+
+                history_path = (
+                    Path(tmpdir)
+                    / model.project
+                    / "models"
+                    / model.name
+                    / "history.jsonl"
+                )
+                history_rows = [
+                    json.loads(line) for line in history_path.read_text().splitlines()
+                ]
+                kl_values = [
+                    row["loss/kl_policy_ref"]
+                    for row in history_rows
+                    if "loss/kl_policy_ref" in row
+                ]
+                assert kl_values
+                assert all(math.isfinite(value) for value in kl_values)
             finally:
                 await client.close()

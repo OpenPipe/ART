@@ -9,6 +9,8 @@ import pytest
 
 import art
 from art.tinker_native import TinkerNativeBackend
+from art.tinker_native.backend import _apply_kl_penalty
+from art.tinker_native.data import trajectory_groups_to_datums
 
 DEFAULT_BASE_MODEL = "Qwen/Qwen3-30B-A3B-Instruct-2507"
 
@@ -37,6 +39,8 @@ async def simple_rollout(
         max_tokens=10,
         timeout=60,
         temperature=1,
+        logprobs=True,
+        top_logprobs=0,
     )
     choice = chat_completion.choices[0]
     content = (choice.message.content or "").lower()
@@ -111,6 +115,85 @@ async def test_tinker_native_backend():
                 max_tokens=10,
                 timeout=30,
             )
+        finally:
+            await backend.close()
+
+
+@pytest.mark.skipif(
+    "TINKER_API_KEY" not in os.environ,
+    reason="TINKER_API_KEY not set - skipping TinkerNativeBackend KL test",
+)
+async def test_tinker_native_backend_kl_identity_metric():
+    model_name = f"test-tinker-native-kl-{uuid.uuid4().hex[:8]}"
+    with tempfile.TemporaryDirectory() as tmpdir:
+        backend = TinkerNativeBackend(path=tmpdir)
+        model = art.TrainableModel(
+            name=model_name,
+            project="integration-tests",
+            base_model=get_base_model(),
+        )
+        try:
+            await model.register(backend)
+
+            openai_client = model.openai_client()
+            current_step = await model.get_step()
+            model_name_step = model.get_inference_name(step=current_step)
+            prompts = ["Say yes", "Say no", "Say maybe"]
+
+            async def make_group(prompt: str) -> art.TrajectoryGroup:
+                import asyncio
+
+                trajectories = await asyncio.gather(
+                    *[
+                        simple_rollout(openai_client, model_name_step, prompt)
+                        for _ in range(2)
+                    ]
+                )
+                return art.TrajectoryGroup(trajectories)  # type: ignore[attr-defined]
+
+            train_groups = await art.gather_trajectory_groups(  # type: ignore[attr-defined]
+                [make_group(prompt) for prompt in prompts]
+            )
+            ensure_reward_variance(train_groups)
+
+            state = backend._model_state[model.name]
+            datums = trajectory_groups_to_datums(
+                train_groups,
+                state.renderer,
+                state.tokenizer,
+            )
+            assert datums
+
+            reference_sampling_client = await backend._get_kl_reference_sampling_client(
+                state,
+                model.base_model,
+                current_step,
+            )
+            expected_kl = (
+                await _apply_kl_penalty(
+                    trajectory_groups_to_datums(
+                        train_groups,
+                        state.renderer,
+                        state.tokenizer,
+                    ),
+                    reference_sampling_client,
+                    kl_penalty_coef=0.25,
+                )
+            )["loss/kl_policy_ref"]
+
+            result = await backend.train(
+                model,
+                train_groups,
+                learning_rate=1e-5,
+                kl_penalty_coef=0.25,
+                kl_penalty_reference_step=current_step,
+            )
+
+            assert result.metrics["loss/kl_policy_ref"] == pytest.approx(
+                expected_kl,
+                abs=0.05,
+            )
+            assert result.metrics["loss/kl_policy_ref"] == pytest.approx(0.0, abs=0.05)
         finally:
             await backend.close()
 

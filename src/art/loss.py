@@ -95,7 +95,14 @@ def loss_fn(
     kl_policy_ref: torch.Tensor | None = None
     kl_penalty_coef = experimental_config.get("kl_penalty_coef", 0.0)
     if kl_penalty_coef > 0 and ref_logprobs is not None:
-        kl_per_token = (new_logprobs - ref_logprobs).detach() * assistant_mask
+        match experimental_config.get("kl_penalty_source", "current_learner"):
+            case "sample":
+                kl_source_logprobs = old_logprobs.detach()
+            case "current_learner":
+                kl_source_logprobs = new_logprobs.detach()
+            case other:
+                raise AssertionError(other)
+        kl_per_token = (kl_source_logprobs - ref_logprobs).detach() * assistant_mask
         avg_kl = kl_per_token.sum() / (assistant_mask.sum() + 1e-6)
         kl_penalty = kl_penalty_coef * (avg_kl - kl_per_token) * assistant_mask
         advantages = advantages + kl_penalty
