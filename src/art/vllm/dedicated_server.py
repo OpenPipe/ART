@@ -39,17 +39,21 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
 
 def _patch_art_dedicated_routes() -> None:
-    from fastapi import APIRouter, Request
+    from fastapi import APIRouter, FastAPI, Request
     from fastapi.responses import JSONResponse
     from vllm.entrypoints.openai import api_server
+    from vllm.tasks import SupportedTask
 
     if getattr(api_server, "_art_dedicated_routes_patched", False):
         return
 
     original_build_app = api_server.build_app
 
-    def build_app(*build_args: object, **build_kwargs: object):
-        app = original_build_app(*build_args, **build_kwargs)
+    def art_build_app(
+        args: argparse.Namespace,
+        supported_tasks: tuple[SupportedTask, ...] | None = None,
+    ) -> FastAPI:
+        app = original_build_app(args, supported_tasks)
         router = APIRouter()
 
         @router.post("/art/set_served_model_name")
@@ -65,8 +69,8 @@ def _patch_art_dedicated_routes() -> None:
         app.include_router(router)
         return app
 
-    api_server.build_app = build_app  # ty:ignore[method-assign]
-    api_server._art_dedicated_routes_patched = True
+    setattr(api_server, "build_app", art_build_app)
+    setattr(api_server, "_art_dedicated_routes_patched", True)
 
 
 def _append_cli_arg(vllm_args: list[str], key: str, value: object) -> None:
