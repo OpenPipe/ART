@@ -21,6 +21,31 @@ class MegatronTrainingJob(BaseModel):
     log_path: str = DEFAULT_TRAINING_LOG_PATH
 
 
+class MergedWeightTransferInitInfo(BaseModel):
+    master_address: str
+    master_port: int
+    rank_offset: int
+    world_size: int
+
+
+class MergedWeightTransferSpec(BaseModel):
+    init_info: MergedWeightTransferInitInfo
+    vllm_base_url: str
+    served_model_name: str
+
+
+class MegatronMergedTrainJob(MegatronTrainingJob):
+    job_type: Literal["merged"] = "merged"
+    merged_weight_transfer: MergedWeightTransferSpec
+
+
+class MegatronSyncJob(BaseModel):
+    job_type: Literal["sync"] = "sync"
+    lora_path: str
+    merged_weight_transfer: MergedWeightTransferSpec
+    log_path: str = DEFAULT_TRAINING_LOG_PATH
+
+
 class MegatronSFTTrainingJob(BaseModel):
     job_type: Literal["sft"] = "sft"
     lora_path: str
@@ -35,4 +60,9 @@ class MegatronSFTTrainingJob(BaseModel):
     log_path: str = DEFAULT_TRAINING_LOG_PATH
 
 
-MegatronJob = MegatronTrainingJob | MegatronSFTTrainingJob
+MegatronJob = (
+    MegatronTrainingJob
+    | MegatronMergedTrainJob
+    | MegatronSyncJob
+    | MegatronSFTTrainingJob
+)

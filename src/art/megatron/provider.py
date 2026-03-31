@@ -328,6 +328,7 @@ def get_provider(
             )
         )
     provider = bridge.to_megatron_provider()
+    setattr(provider, "art_bridge", bridge)
     base_layer_spec = provider.transformer_layer_spec
 
     def _flex_attention_layer_spec(
