@@ -1,3 +1,5 @@
+import os
+
 from mp_actors import move_to_child_process
 
 from ..local.backend import LocalBackend
@@ -19,6 +21,7 @@ class MegatronBackend(LocalBackend):
 
     async def _get_service(self, model: TrainableModel) -> ModelService:
         from ..dev.get_model_config import get_model_config
+        from ..dev.validate import is_dedicated_mode, validate_dedicated_config
         from .service import MegatronService
 
         if model.name not in self._services:
@@ -27,13 +30,19 @@ class MegatronBackend(LocalBackend):
                 output_dir=get_model_dir(model=model, art_path=self._path),
                 config=model._internal_config,
             )
+            validate_dedicated_config(config)
+            dedicated = is_dedicated_mode(config)
+            if dedicated:
+                os.environ["CUDA_VISIBLE_DEVICES"] = ",".join(
+                    str(gpu_id) for gpu_id in config["trainer_gpu_ids"]
+                )
             self._services[model.name] = MegatronService(
                 model_name=model.name,
                 base_model=model.base_model,
                 config=config,
                 output_dir=get_model_dir(model=model, art_path=self._path),
             )
-            if not self._in_process:
+            if not dedicated and not self._in_process:
                 self._services[model.name] = move_to_child_process(
                     self._services[model.name],
                     process_name="megatron-service",
