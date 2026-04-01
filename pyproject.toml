@@ -50,7 +50,7 @@ megatron = [
     "transformer-engine-torch==2.11.0",
     "megatron-core==0.16.0rc0",
     "pybind11>=2.13.6",
-    "megatron-bridge",
+    "megatron-bridge @ git+https://github.com/NVIDIA-NeMo/Megatron-Bridge.git@e049cc00c24d03e2ae45d2608c7a44e2d2364e3d",
     "deep_ep @ git+https://github.com/deepseek-ai/DeepEP.git@v1.2.1 ; sys_platform == 'linux'",
     "nvidia-ml-py==13.580.82",
     "ml-dtypes>=0.5.0 ; python_full_version < '3.13'",
@@ -241,5 +241,4 @@ dev = [
 [tool.uv.sources]
 panza = { git = "https://github.com/corbt/panza.git" }
 apex = { git = "https://github.com/NVIDIA/apex.git", branch = "25.09" }
-megatron-bridge = { git = "https://github.com/NVIDIA-NeMo/Megatron-Bridge.git", rev = "75f2c5ad4afb702b57b4781a00f5291a66bcf183" }
 transformer-engine-torch = { git = "https://github.com/NVIDIA/TransformerEngine.git", tag = "v2.11", subdirectory = "transformer_engine/pytorch" }

@@ -4327,7 +4327,7 @@ wheels = [
 [[package]]
 name = "megatron-bridge"
 version = "0.4.0rc0"
-source = { git = "https://github.com/NVIDIA-NeMo/Megatron-Bridge.git?rev=75f2c5ad4afb702b57b4781a00f5291a66bcf183#75f2c5ad4afb702b57b4781a00f5291a66bcf183" }
+source = { git = "https://github.com/NVIDIA-NeMo/Megatron-Bridge.git?rev=e049cc00c24d03e2ae45d2608c7a44e2d2364e3d#e049cc00c24d03e2ae45d2608c7a44e2d2364e3d" }
 dependencies = [
     { name = "accelerate" },
     { name = "causal-conv1d" },
@@ -4358,7 +4358,7 @@ dependencies = [
 [[package]]
 name = "megatron-core"
 version = "0.16.0rc0"
-source = { git = "https://github.com/NVIDIA-NeMo/Megatron-Bridge.git?subdirectory=3rdparty%2FMegatron-LM&rev=75f2c5ad4afb702b57b4781a00f5291a66bcf183#75f2c5ad4afb702b57b4781a00f5291a66bcf183" }
+source = { git = "https://github.com/NVIDIA-NeMo/Megatron-Bridge.git?subdirectory=3rdparty%2FMegatron-LM&rev=e049cc00c24d03e2ae45d2608c7a44e2d2364e3d#e049cc00c24d03e2ae45d2608c7a44e2d2364e3d" }
 dependencies = [
     { name = "numpy" },
     { name = "packaging" },
@@ -5591,7 +5591,7 @@ requires-dist = [
     { name = "langgraph", marker = "extra == 'langgraph'", specifier = ">=0.6.2" },
     { name = "litellm", specifier = ">=1.71.1,<=1.82.0" },
     { name = "matplotlib", marker = "extra == 'plotting'", specifier = ">=3.10.1" },
-    { name = "megatron-bridge", marker = "extra == 'megatron'", git = "https://github.com/NVIDIA-NeMo/Megatron-Bridge.git?rev=75f2c5ad4afb702b57b4781a00f5291a66bcf183" },
+    { name = "megatron-bridge", marker = "extra == 'megatron'", git = "https://github.com/NVIDIA-NeMo/Megatron-Bridge.git?rev=e049cc00c24d03e2ae45d2608c7a44e2d2364e3d" },
     { name = "megatron-core", marker = "extra == 'megatron'", specifier = "==0.16.0rc0" },
     { name = "ml-dtypes", marker = "python_full_version < '3.13' and extra == 'megatron'", specifier = ">=0.5.0" },
     { name = "nbclient", marker = "extra == 'backend'", specifier = ">=0.10.1" },
