@@ -46,6 +46,8 @@ def test_kl_advantage_no_effect_when_disabled():
 
     assert loss_no_kl.kl_policy_ref is None
     assert loss_without_ref.kl_policy_ref is None
+    assert loss_no_kl.reduction == "mean"
+    assert not hasattr(loss_no_kl, "kl")
 
 
 def test_kl_advantage_enabled():

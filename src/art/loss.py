@@ -15,7 +15,6 @@ class Loss(BaseModel):
     model_config = ConfigDict(arbitrary_types_allowed=True)
     reduction: Literal["mean", "sum"]
     policy_loss: torch.Tensor
-    kl: torch.Tensor
     entropy: torch.Tensor | None
     policy_loss_sum: torch.Tensor
     probs_corr: torch.Tensor
@@ -126,17 +125,9 @@ def loss_fn(
             logprob_diff = old_logprobs - original_logprobs
             prob_ratio = torch.exp(logprob_diff)
         policy_loss *= torch.clamp(prob_ratio, max=upper_bound).detach()
-    if ref_logprobs is not None:
-        kl_div = (
-            torch.exp(ref_logprobs - new_logprobs) - (ref_logprobs - new_logprobs) - 1.0
-        )
-    else:
-        kl_div = torch.zeros_like(policy_loss)
     policy_loss = policy_loss * weights * assistant_mask
-    kl_div = kl_div * weights * assistant_mask
     denominator = assistant_mask.sum() + 1e-6 if reduction == "mean" else 1.0
     reduced_policy_loss = policy_loss.sum() / denominator
-    kl = kl_div.sum() / denominator
     # Compute reduced entropy for the current step.
     if entropies is not None:
         shifted_entropies = shift_tensor(entropies, 0.0)
@@ -146,7 +137,6 @@ def loss_fn(
     return Loss(
         reduction=reduction,
         policy_loss=reduced_policy_loss,
-        kl=kl,
         entropy=entropy,
         policy_loss_sum=policy_loss.sum(),
         probs_corr=probs_corr,

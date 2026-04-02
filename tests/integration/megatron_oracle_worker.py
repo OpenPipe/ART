@@ -682,7 +682,6 @@ def _mutation_hook(
             return loss.model_copy(
                 update={
                     "policy_loss": loss.policy_loss * effective_loss_scale,
-                    "kl": loss.kl * effective_loss_scale,
                     "policy_loss_sum": loss.policy_loss_sum * effective_loss_scale,
                 }
             )
