@@ -422,6 +422,13 @@ class LocalBackend(Backend):
             with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
                 s.bind(("", 0))
                 server_args["port"] = s.getsockname()[1]
+
+        # Ensure the server and client share the same API key.
+        # If the caller did not supply one, generate a secure random key
+        # so the vLLM server is never exposed with a well-known credential.
+        if not server_args.get("api_key"):
+            server_args["api_key"] = dev._generate_api_key()
+
         config_dict["server_args"] = server_args
         resolved_config = cast(dev.OpenAIServerConfig, config_dict)
 
@@ -429,7 +436,7 @@ class LocalBackend(Backend):
         host, port = await service.start_openai_server(config=resolved_config)
 
         base_url = f"http://{host}:{port}/v1"
-        api_key = server_args.get("api_key") or "default"
+        api_key = server_args["api_key"]
 
         def done_callback(_: asyncio.Task[None]) -> None:
             close_proxy(self._services.pop(model.name))

@@ -213,7 +213,7 @@ class TinkerNativeBackend(Backend):
         port = server_args.get("port", raw_config.get("port"))
         if port is None:
             port = get_free_port()
-        api_key = server_args.get("api_key", raw_config.get("api_key")) or "default"
+        api_key = server_args.get("api_key", raw_config.get("api_key")) or dev._generate_api_key()
 
         if state.server_task is None:
             state.server_host = host

@@ -5,6 +5,19 @@ from typing_extensions import TypedDict
 from .engine import EngineArgs
 
 
+def _generate_api_key() -> str:
+    """Return a secure, unique API key for the vLLM server.
+
+    Prefers the ``ART_API_KEY`` environment variable so operators can pin
+    a known credential.  Falls back to a cryptographically random token
+    that is different for every server invocation.
+    """
+    import os
+    import secrets
+
+    return os.environ.get("ART_API_KEY") or secrets.token_urlsafe(32)
+
+
 def get_openai_server_config(
     model_name: str,
     base_model: str,
@@ -27,7 +40,7 @@ def get_openai_server_config(
         lora_modules = [f'{{"name": "{model_name}@{step}", "path": "{lora_path}"}}']
 
     server_args = ServerArgs(
-        api_key="default",
+        api_key=_generate_api_key(),
         lora_modules=lora_modules,
         return_tokens_as_token_ids=True,
         enable_auto_tool_choice=True,
