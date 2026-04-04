@@ -17,8 +17,12 @@ command above and they will appear in the project directory.
 """
 
 import os
+from typing import Any, TYPE_CHECKING
 
 from dotenv import load_dotenv
+
+if TYPE_CHECKING:
+    from .local import LocalBackend
 
 load_dotenv()
 
@@ -87,6 +91,17 @@ from .types import (
 )
 from .utils import retry
 from .yield_trajectory import capture_yielded_trajectory, yield_trajectory
+
+
+def __getattr__(name: str) -> Any:
+    if name == "LocalBackend":
+        # Keep backend-only dependencies optional until the symbol is requested.
+        from .local import LocalBackend
+
+        globals()[name] = LocalBackend
+        return LocalBackend
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
 
 __all__ = [
     "dev",
