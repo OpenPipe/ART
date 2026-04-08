@@ -21,6 +21,16 @@ class SFTChunk(NamedTuple):
     epoch_step: int
 
 
+def resolve_sft_batch_size(
+    *,
+    batch_size: int | Literal["auto"],
+    default_batch_size: int,
+) -> int:
+    if batch_size == "auto":
+        return default_batch_size
+    return batch_size
+
+
 def _parse_jsonl_line(line: str) -> "Trajectory":
     """Parse a JSONL line into a Trajectory object.
 

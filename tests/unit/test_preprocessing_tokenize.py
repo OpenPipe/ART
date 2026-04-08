@@ -176,6 +176,7 @@ def test_tokenize_sft_batch_accepts_batchencoding_chat_template_output(
     assert batch.trajectory_tensors[0]["attention_mask"].tolist() == [
         [1] * len(expected_ids)
     ]
+    assert batch.num_tokens == len(expected_ids)
     assert batch.num_trainable_tokens == len(expected_ids)
 
 

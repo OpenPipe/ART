@@ -23,7 +23,14 @@ ParsedMessagesAndChoices = list[ParsedMessageOrChoice]
 def _message_or_choice_to_dict(message_or_choice: MessageOrChoice) -> dict[str, Any]:
     if isinstance(message_or_choice, dict):
         return cast(dict[str, Any], message_or_choice)
-    return cast(dict[str, Any], message_or_choice.to_dict())
+    if isinstance(message_or_choice, BaseModel):
+        return cast(dict[str, Any], message_or_choice.to_dict())
+    to_dict = getattr(message_or_choice, "to_dict", None)
+    if to_dict is None:
+        raise TypeError(
+            "message_or_choice must be a dict or OpenAI model with to_dict()"
+        )
+    return cast(dict[str, Any], to_dict())
 
 
 class MessagesAndChoicesWithLogprobs(BaseModel):

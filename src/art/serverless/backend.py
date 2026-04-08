@@ -9,10 +9,13 @@ from tqdm import auto as tqdm
 from art.serverless.client import Client, ExperimentalTrainingConfig
 
 from .. import dev
+from .._backend_training import (
+    aggregate_rl_training_metrics,
+    build_rl_train_configs,
+)
 from ..backend import AnyTrainableModel, Backend
 from ..metrics_taxonomy import (
     TRAIN_GRADIENT_STEPS_KEY,
-    average_metric_samples,
     build_training_summary_metrics,
     summarize_trajectory_groups,
 )
@@ -254,27 +257,19 @@ class ServerlessBackend(Backend):
         """
         groups_list = list(trajectory_groups)
 
-        # Build config objects from explicit kwargs
-        config = TrainConfig(learning_rate=learning_rate)
-        dev_config: dev.TrainConfig = {
-            "advantage_balance": advantage_balance,
-            "importance_sampling_level": importance_sampling_level,
-            "mask_prob_ratio": mask_prob_ratio,
-            "ppo": ppo,
-            "precalculate_logprobs": precalculate_logprobs,
-            "scale_rewards": scale_rewards,
-        }
-        # Only include optional fields if they're set
-        if epsilon is not None:
-            dev_config["epsilon"] = epsilon
-        if epsilon_high is not None:
-            dev_config["epsilon_high"] = epsilon_high
-        if max_negative_advantage_importance_sampling_weight is not None:
-            dev_config["max_negative_advantage_importance_sampling_weight"] = (
-                max_negative_advantage_importance_sampling_weight
-            )
-        if kimi_k2_tau is not None:
-            dev_config["kimi_k2_tau"] = kimi_k2_tau
+        config, dev_config = build_rl_train_configs(
+            learning_rate=learning_rate,
+            advantage_balance=advantage_balance,
+            scale_rewards=scale_rewards,
+            importance_sampling_level=importance_sampling_level,
+            mask_prob_ratio=mask_prob_ratio,
+            ppo=ppo,
+            precalculate_logprobs=precalculate_logprobs,
+            epsilon=epsilon,
+            epsilon_high=epsilon_high,
+            max_negative_advantage_importance_sampling_weight=max_negative_advantage_importance_sampling_weight,
+            kimi_k2_tau=kimi_k2_tau,
+        )
 
         # Collect metrics from training
         training_metrics: list[dict[str, float]] = []
@@ -284,21 +279,10 @@ class ServerlessBackend(Backend):
         ):
             training_metrics.append(metrics)
 
-        # Aggregate metrics
-        avg_metrics = average_metric_samples(training_metrics)
-        summary = summarize_trajectory_groups(groups_list)
-        avg_metrics.setdefault(
-            "time/step_trainer_s", time.monotonic() - trainer_started
-        )
-        avg_metrics.update(
-            {
-                key: value
-                for key, value in build_training_summary_metrics(
-                    summary,
-                    include_trainable_groups=True,
-                ).items()
-                if key not in avg_metrics
-            }
+        avg_metrics = aggregate_rl_training_metrics(
+            training_metrics=training_metrics,
+            trajectory_groups=groups_list,
+            trainer_started=trainer_started,
         )
 
         # Get step and artifact name
@@ -414,6 +398,8 @@ class ServerlessBackend(Backend):
 
         import wandb
 
+        from ..utils.sft import resolve_sft_batch_size
+
         assert model.id is not None, "Model ID is required"
 
         # Get the user's default entity from W&B if not set
@@ -513,7 +499,11 @@ class ServerlessBackend(Backend):
 
         sft_config: SFTTrainingConfig = {}
         if config.batch_size != "auto":
-            sft_config["batch_size"] = config.batch_size
+            batch_size = resolve_sft_batch_size(
+                batch_size=config.batch_size,
+                default_batch_size=2,
+            )
+            sft_config["batch_size"] = batch_size
         sft_config["learning_rate"] = config.learning_rate
 
         sft_training_job = await self._client.sft_training_jobs.create(

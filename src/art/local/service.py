@@ -33,12 +33,14 @@ class ModelService(Protocol):
     def train_sft(
         self,
         batches: list[SFTBatch],
+        config: types.TrainSFTConfig,
         verbose: bool = False,
     ) -> AsyncIterator[dict[str, float]]:
         """Train using SFT on pre-computed batches.
 
         Args:
             batches: List of SFTBatch objects to train on.
+            config: SFT batch/grad-accumulation configuration.
             verbose: Whether to print detailed logs.
 
         Yields:

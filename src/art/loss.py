@@ -8,7 +8,7 @@ from art.utils.group_aggregate import group_aggregate
 from . import dev
 
 if TYPE_CHECKING:
-    from art.unsloth.service import TrainInputs
+    from art.preprocessing.inputs import TrainInputs
 
 
 class Loss(BaseModel):

@@ -26,9 +26,14 @@ ORACLE_REPLAY_TOPOLOGY_SUFFIX = "oracle_replay"
 REGENERATE_ENV = "ART_REGENERATE_ORACLE"
 EXTENDED_TOPOLOGIES_ENV = "ART_ENABLE_EXTENDED_TOPOLOGIES"
 SENSITIVITY_MUTATION_ENV = "ART_SENSITIVITY_MUTATIONS"
+ORACLE_OBJECTIVE_ENV = "ART_ORACLE_OBJECTIVE"
+
+OracleObjective = Literal["rl", "sft"]
+SUPPORTED_ORACLE_OBJECTIVES: tuple[OracleObjective, ...] = ("rl", "sft")
+SensitivityMutation = str
 
 DEFAULT_SENSITIVITY_MUTATION = "skip_finalize"
-SUPPORTED_SENSITIVITY_MUTATIONS = (
+SHARED_SENSITIVITY_MUTATIONS = (
     DEFAULT_SENSITIVITY_MUTATION,
     "fwd_skip_o_proj_tp_reduce",
     "fwd_o_proj_tp_reduce_avg_not_sum",
@@ -38,10 +43,19 @@ SUPPORTED_SENSITIVITY_MUTATIONS = (
     "save_drop_nonzero_ranked_tp_shards",
     "save_duplicate_replicated_entries",
     "dp_grad_accumulation_seqs",
-    "dp_local_token_normalization",
 )
-SensitivityMutation = str
-
+RL_ONLY_SENSITIVITY_MUTATIONS = ("dp_local_token_normalization",)
+SFT_ONLY_SENSITIVITY_MUTATIONS = ("sft_local_token_normalization",)
+SUPPORTED_SENSITIVITY_MUTATIONS = (
+    *SHARED_SENSITIVITY_MUTATIONS,
+    *RL_ONLY_SENSITIVITY_MUTATIONS,
+    *SFT_ONLY_SENSITIVITY_MUTATIONS,
+)
+OBJECTIVE_SENSITIVITY_MUTATIONS: dict[OracleObjective, tuple[SensitivityMutation, ...]]
+OBJECTIVE_SENSITIVITY_MUTATIONS = {
+    "rl": (*SHARED_SENSITIVITY_MUTATIONS, *RL_ONLY_SENSITIVITY_MUTATIONS),
+    "sft": (*SHARED_SENSITIVITY_MUTATIONS, *SFT_ONLY_SENSITIVITY_MUTATIONS),
+}
 REQUIRED_PACKED_TENSOR_FILES = (
     "tokens.pt",
     "group_ids.pt",
@@ -68,6 +82,46 @@ PHASE_PRINT_ORDER = {
     "grads": 5,
     "deltas": 6,
 }
+
+
+def oracle_output_slug(
+    objective: OracleObjective,
+    topology: "Topology",
+    suffix: str | None = None,
+) -> str:
+    slug = f"{objective}__{topology.slug()}"
+    if suffix is not None:
+        slug = f"{slug}__{suffix}"
+    return slug
+
+
+def supported_sensitivity_mutations_for_objective(
+    objective: OracleObjective,
+) -> tuple[SensitivityMutation, ...]:
+    return OBJECTIVE_SENSITIVITY_MUTATIONS[objective]
+
+
+def objective_supports_sensitivity_mutation(
+    objective: OracleObjective,
+    mutation: SensitivityMutation,
+) -> bool:
+    return mutation in supported_sensitivity_mutations_for_objective(objective)
+
+
+def selected_oracle_objectives() -> list[OracleObjective]:
+    raw = os.environ.get(ORACLE_OBJECTIVE_ENV)
+    if raw is None or raw.strip() == "":
+        return list(SUPPORTED_ORACLE_OBJECTIVES)
+    normalized = raw.strip().lower()
+    if normalized == "all":
+        return list(SUPPORTED_ORACLE_OBJECTIVES)
+    if normalized in SUPPORTED_ORACLE_OBJECTIVES:
+        return [cast(OracleObjective, normalized)]
+    supported = ", ".join((*SUPPORTED_ORACLE_OBJECTIVES, "all"))
+    raise ValueError(
+        f"Unsupported {ORACLE_OBJECTIVE_ENV} value '{raw}'. "
+        f"Supported values: {supported}."
+    )
 
 
 class Topology(BaseModel):
@@ -134,7 +188,11 @@ SENSITIVITY_TOPOLOGY_BY_MUTATION["bwd_skip_sync_fc1_a"] = Topology(
 )
 SENSITIVITY_TOPOLOGY_BY_MUTATION |= {
     k: Topology(tp=1, ep=2, etp=1, dp=2, sp=False)
-    for k in ["dp_grad_accumulation_seqs", "dp_local_token_normalization"]
+    for k in [
+        "dp_grad_accumulation_seqs",
+        "dp_local_token_normalization",
+        "sft_local_token_normalization",
+    ]
 }
 
 
@@ -232,6 +290,7 @@ class WorkerRunRequest(BaseModel):
     """Defines one distributed worker invocation for generating variant artifacts."""
 
     case_id: str
+    objective: OracleObjective
     case_config: OracleCaseConfig
     topology: Topology
     topology_dir: str
@@ -259,6 +318,7 @@ class RunManifest(BaseModel):
     """Records run metadata and per-step trace references for one topology output."""
 
     case_id: str
+    objective: OracleObjective
     base_model: str
     num_layers: int
     topology: str
@@ -294,6 +354,7 @@ class VariantSpec(BaseModel):
     """Declares how to execute and evaluate one candidate variant against the oracle."""
 
     name: str
+    objective: OracleObjective
     topology: Topology
     pass_fn_by_phase: dict[str, PhasePassFn] = Field(
         default_factory=dict,
@@ -310,13 +371,13 @@ class VariantSpec(BaseModel):
         """Resolves the artifact slug for this run, including mutation suffix when present."""
         if self.output_slug is not None:
             return self.output_slug
-        return _topology_output_slug(self.topology, self.mutation)
+        return oracle_output_slug(self.objective, self.topology, self.mutation)
 
     def resolved_reference_slug(self) -> str:
         """Resolves which topology slug should be treated as the comparison oracle."""
         if self.reference_slug is not None:
             return self.reference_slug
-        return ORACLE_TOPOLOGY.slug()
+        return oracle_output_slug(self.objective, ORACLE_TOPOLOGY)
 
 
 class VariantReport(BaseModel):
@@ -481,6 +542,17 @@ def sensitivity_mutations() -> list[SensitivityMutation]:
 def sensitivity_enabled() -> bool:
     """Returns whether any sensitivity mutation has been requested via environment."""
     return bool(sensitivity_mutations())
+
+
+def selected_sensitivity_mutations_for_objective(
+    objective: OracleObjective,
+    mutations: list[SensitivityMutation],
+) -> list[SensitivityMutation]:
+    return [
+        mutation
+        for mutation in mutations
+        if objective_supports_sensitivity_mutation(objective, mutation)
+    ]
 
 
 def sensitivity_topology_for_mutation(mutation: SensitivityMutation) -> Topology:
@@ -718,14 +790,6 @@ def _replace_topology_dir(path: Path) -> None:
     (path / "traces").mkdir(parents=True, exist_ok=True)
 
 
-def _topology_output_slug(
-    topology: Topology,
-    mutation: SensitivityMutation | None = None,
-) -> str:
-    """Builds output slug for a topology and optional mutation variant."""
-    return topology.slug() if mutation is None else f"{topology.slug()}__{mutation}"
-
-
 def _load_manifest(topology_dir: Path) -> RunManifest:
     """Loads one run manifest for a topology output directory."""
     manifest_path = topology_dir / "manifest.json"
@@ -742,7 +806,7 @@ def _load_output_tensor(topology_dir: Path, step: StepTrace):
 
 def _load_safetensor_map(path: Path) -> dict[str, Any]:
     """Loads one safetensor map from disk."""
-    from safetensors.torch import load_file
+    from safetensors.torch import load_file  # ty: ignore[unresolved-import]
 
     return load_file(str(path))
 
@@ -847,17 +911,19 @@ class VariantRunner:
     def __init__(
         self,
         *,
+        objective: OracleObjective,
         case_config: OracleCaseConfig,
         console: Console | None = None,
     ) -> None:
+        self.objective = objective
         self.case_config = case_config
         self.case_artifacts = ensure_case_artifacts(case_config)
         self.case_id = self.case_artifacts.case_id
         self.case_dir = Path(self.case_artifacts.case_dir)
-        self.oracle_slug = ORACLE_TOPOLOGY.slug()
+        self.oracle_slug = oracle_output_slug(objective, ORACLE_TOPOLOGY)
         self.oracle_dir = self.case_dir / self.oracle_slug
         self.oracle_routing_bundle_dir = (
-            self.case_dir / ORACLE_MOE_ROUTING_BUNDLE_DIRNAME
+            self.case_dir / f"{objective}__{ORACLE_MOE_ROUTING_BUNDLE_DIRNAME}"
         )
         self.shared_init_path = Path(self.case_artifacts.shared_init_adapter_path)
         self.console = console or Console(width=140)
@@ -883,6 +949,7 @@ class VariantRunner:
         run_case_config = self.case_config
         request = WorkerRunRequest(
             case_id=self.case_id,
+            objective=self.objective,
             case_config=run_case_config,
             topology=topology,
             topology_dir=str(topology_dir),
@@ -1189,6 +1256,34 @@ class VariantRunner:
         reference_manifest = _load_manifest(reference_dir)
         topology_manifest = _load_manifest(topology_dir)
         rows: list[MetricRow] = []
+        if reference_manifest.objective != variant.objective:
+            rows.append(
+                self._build_metric_row(
+                    variant=variant,
+                    step_index=0,
+                    phase="objective",
+                    param="__reference_objective__",
+                    summary=self._inf_summary(),
+                    structural_failure=(
+                        f"reference={reference_manifest.objective} "
+                        f"expected={variant.objective}"
+                    ),
+                )
+            )
+        if topology_manifest.objective != variant.objective:
+            rows.append(
+                self._build_metric_row(
+                    variant=variant,
+                    step_index=0,
+                    phase="objective",
+                    param="__candidate_objective__",
+                    summary=self._inf_summary(),
+                    structural_failure=(
+                        f"candidate={topology_manifest.objective} "
+                        f"expected={variant.objective}"
+                    ),
+                )
+            )
         if len(reference_manifest.steps) != len(topology_manifest.steps):
             rows.append(
                 self._build_metric_row(
@@ -1414,15 +1509,18 @@ def _default_phase_pass_fns() -> dict[str, PhasePassFn]:
     }
 
 
-def _suite_variants() -> list[VariantSpec]:
+def _suite_variants(objective: OracleObjective) -> list[VariantSpec]:
     """Builds the standard oracle suite variant ordering."""
     phase_pass = _default_phase_pass_fns()
     variants = [
         VariantSpec(
-            name="oracle_replay_parity",
+            name=f"{objective}_oracle_replay_parity",
+            objective=objective,
             topology=ORACLE_TOPOLOGY,
-            output_slug=_topology_output_slug(
-                ORACLE_TOPOLOGY, ORACLE_REPLAY_TOPOLOGY_SUFFIX
+            output_slug=oracle_output_slug(
+                objective,
+                ORACLE_TOPOLOGY,
+                ORACLE_REPLAY_TOPOLOGY_SUFFIX,
             ),
             pass_fn_by_phase=phase_pass,
             force_regenerate=regenerate_requested(),
@@ -1433,7 +1531,8 @@ def _suite_variants() -> list[VariantSpec]:
     ):
         variants.append(
             VariantSpec(
-                name=f"topology_{topology.slug()}",
+                name=f"{objective}_topology_{topology.slug()}",
+                objective=objective,
                 topology=topology,
                 pass_fn_by_phase=phase_pass,
             )
@@ -1446,8 +1545,11 @@ def run_suite(
     case_config: OracleCaseConfig,
 ) -> list[VariantReport]:
     """Runs replay parity and topology variants with fail-fast assertions."""
-    runner = VariantRunner(case_config=case_config)
-    return runner.run_suite(_suite_variants())
+    reports: list[VariantReport] = []
+    for objective in selected_oracle_objectives():
+        runner = VariantRunner(objective=objective, case_config=case_config)
+        reports.extend(runner.run_suite(_suite_variants(objective)))
+    return reports
 
 
 def run_sensitivity_suite(
@@ -1456,16 +1558,38 @@ def run_sensitivity_suite(
     mutations: list[SensitivityMutation],
 ) -> list[VariantReport]:
     """Runs a list of sensitivity mutations and expects each to fail."""
-    runner = VariantRunner(case_config=case_config)
     phase_pass = _default_phase_pass_fns()
-    variants = [
-        VariantSpec(
-            name=f"sensitivity_{mutation}",
-            topology=sensitivity_topology_for_mutation(mutation),
-            mutation=mutation,
-            expected_signal="fail",
-            pass_fn_by_phase=phase_pass,
+    reports: list[VariantReport] = []
+    ran_any_variants = False
+    for objective in selected_oracle_objectives():
+        runner = VariantRunner(objective=objective, case_config=case_config)
+        objective_mutations = selected_sensitivity_mutations_for_objective(
+            objective,
+            mutations,
         )
-        for mutation in mutations
-    ]
-    return runner.run_suite(variants)
+        if not objective_mutations:
+            continue
+        variants = [
+            VariantSpec(
+                name=f"{objective}_sensitivity_{mutation}",
+                objective=objective,
+                topology=sensitivity_topology_for_mutation(mutation),
+                mutation=mutation,
+                expected_signal="fail",
+                pass_fn_by_phase=phase_pass,
+            )
+            for mutation in objective_mutations
+        ]
+        ran_any_variants = True
+        reports.extend(runner.run_suite(variants))
+    if ran_any_variants:
+        return reports
+    requested = ", ".join(mutations)
+    supported = ", ".join(
+        f"{objective}: {', '.join(supported_sensitivity_mutations_for_objective(objective))}"
+        for objective in selected_oracle_objectives()
+    )
+    raise ValueError(
+        "No sensitivity variants matched the selected objectives. "
+        f"Requested mutations: {requested}. Supported by objective: {supported}."
+    )

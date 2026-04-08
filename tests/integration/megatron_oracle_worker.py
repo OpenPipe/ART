@@ -20,6 +20,7 @@ from art.megatron.routing_replay import (
 from art.megatron.routing_replay import (
     build_bundle_from_forward_trace_dir,
 )
+from art.preprocessing.pack import PackedTensors
 
 from .megatron_forward_trace import ForwardTraceCapture
 from .megatron_oracle_harness import (
@@ -601,6 +602,9 @@ def _mutation_hook(
     original_local_token_count_tensor = (
         megatron_train_module._local_trainable_token_count_tensor
     )
+    original_local_sft_token_count_tensor = (
+        megatron_train_module._local_trainable_sft_token_count_tensor
+    )
     original_build_micro_sample_indices = (
         megatron_train_module.build_micro_sample_indices
     )
@@ -638,6 +642,32 @@ def _mutation_hook(
 
         megatron_train_module._local_trainable_token_count_tensor = (
             _wrong_local_trainable_token_count_tensor
+        )
+
+    if mutation == "sft_local_token_normalization":
+
+        def _wrong_local_trainable_sft_token_count_tensor(
+            micro_inputs: list[Any],
+            device: torch.device,
+        ) -> torch.Tensor:
+            local_token_total = sum(
+                megatron_train_module._count_sft_trainable_tokens(micro)
+                for micro in micro_inputs
+            )
+            dp_world_size = int(
+                megatron_train_module.ps.get_data_parallel_world_size(
+                    with_context_parallel=True
+                )
+            )
+            wrong_local_token_total = local_token_total / max(dp_world_size, 1)
+            return torch.tensor(
+                [wrong_local_token_total],
+                device=device,
+                dtype=torch.float32,
+            )
+
+        megatron_train_module._local_trainable_sft_token_count_tensor = (
+            _wrong_local_trainable_sft_token_count_tensor
         )
 
     if mutation == "dp_grad_accumulation_seqs":
@@ -704,14 +734,34 @@ def _mutation_hook(
             megatron_train_module._local_trainable_token_count_tensor = (
                 original_local_token_count_tensor
             )
+            megatron_train_module._local_trainable_sft_token_count_tensor = (
+                original_local_sft_token_count_tensor
+            )
             megatron_train_module.build_micro_sample_indices = (
                 original_build_micro_sample_indices
             )
 
 
+def _build_sft_trajectory_tensors_from_packed_tensors(
+    packed_tensors: PackedTensors,
+) -> list[dict[str, torch.Tensor]]:
+    tokens = packed_tensors["tokens"]
+    assistant_mask = packed_tensors["assistant_mask"]
+    labels = torch.where(assistant_mask, tokens, torch.full_like(tokens, -100))
+    attention_mask = torch.ones_like(tokens, dtype=torch.long)
+    return [
+        {
+            "input_ids": tokens[index].detach().clone(),
+            "attention_mask": attention_mask[index].detach().clone(),
+            "labels": labels[index].detach().clone(),
+        }
+        for index in range(int(tokens.shape[0]))
+    ]
+
+
 def _worker_run(request: WorkerRunRequest) -> None:
     """Executes one full distributed training trace generation worker run."""
-    from safetensors.torch import load_file, save_file
+    from safetensors.torch import load_file, save_file  # ty: ignore[unresolved-import]
     import torch
 
     from art import dev, types
@@ -779,8 +829,19 @@ def _worker_run(request: WorkerRunRequest) -> None:
     packed_tensors = packed_tensors_from_dir(
         **request.packed_tensors.model_dump(exclude_none=True)
     )
-    template = megatron_train.select_indexed_inputs(packed_tensors, 0)
-    zero_template = megatron_train._zero_contribution_inputs(template)
+    sft_trajectory_tensors: list[dict[str, torch.Tensor]] | None = None
+    rl_zero_template: PackedTensors | None = None
+    sft_zero_template: dict[str, torch.Tensor] | None = None
+    if request.objective == "rl":
+        template = megatron_train.select_indexed_inputs(packed_tensors, 0)
+        rl_zero_template = megatron_train._zero_contribution_inputs(template)
+    else:
+        sft_trajectory_tensors = _build_sft_trajectory_tensors_from_packed_tensors(
+            packed_tensors
+        )
+        sft_zero_template = megatron_train._zero_contribution_sft_inputs(
+            sft_trajectory_tensors[0]
+        )
     initial_lora_state = loaded_state
     global_grad_accumulation_sequences = request.case_config.grad_accumulation_sequences
 
@@ -826,23 +887,41 @@ def _worker_run(request: WorkerRunRequest) -> None:
                 global_grad_accumulation_sequences=global_grad_accumulation_sequences,
             )
             forward_trace_capture.set_step(step_index, micro_sample_indices)
-            micro_inputs = megatron_train.select_micro_inputs(
-                packed_tensors, micro_sample_indices, zero_template
-            )
             captured_grads = None
-
-            step_result = megatron_train.run_training_step(
-                model_chunks=model_chunks,
-                optimizer=optimizer,
-                learning_rate=train_config.learning_rate,
-                inputs=micro_inputs,
-                config=train_config,
-                experimental_config=experimental_config,
-                ref_logprobs=None,
-                step_index=step_index,
-                sample_index=micro_sample_indices,
-                moe_routing_replay_controller=runtime.moe_routing_replay_controller,
-            )
+            if request.objective == "rl":
+                micro_inputs = megatron_train.select_micro_inputs(
+                    packed_tensors,
+                    micro_sample_indices,
+                    _require_not_none(rl_zero_template, "rl_zero_template"),
+                )
+                step_result = megatron_train.run_training_step(
+                    model_chunks=model_chunks,
+                    optimizer=optimizer,
+                    learning_rate=train_config.learning_rate,
+                    inputs=micro_inputs,
+                    config=train_config,
+                    experimental_config=experimental_config,
+                    ref_logprobs=None,
+                    step_index=step_index,
+                    sample_index=micro_sample_indices,
+                    moe_routing_replay_controller=runtime.moe_routing_replay_controller,
+                )
+            else:
+                micro_inputs = megatron_train.select_sft_micro_inputs(
+                    _require_not_none(sft_trajectory_tensors, "sft_trajectory_tensors"),
+                    micro_sample_indices,
+                    _require_not_none(sft_zero_template, "sft_zero_template"),
+                )
+                step_result = megatron_train.run_megatron_sft_step(
+                    model_chunks=model_chunks,
+                    optimizer=optimizer,
+                    learning_rate=train_config.learning_rate,
+                    inputs=micro_inputs,
+                    step_index=step_index,
+                    sample_index=micro_sample_indices,
+                    global_grad_accumulation_sequences=global_grad_accumulation_sequences,
+                    moe_routing_replay_controller=runtime.moe_routing_replay_controller,
+                )
             ordered_micro_outputs = forward_trace_capture.ordered_step_outputs()
             forward_trace_capture.save_current_step(traces_dir)
             torch.distributed.barrier()  # ty: ignore[possibly-missing-attribute]
@@ -922,6 +1001,7 @@ def _worker_run(request: WorkerRunRequest) -> None:
         # build and save the run manifest
         manifest = RunManifest(
             case_id=request.case_id,
+            objective=request.objective,
             base_model=request.case_config.base_model,
             num_layers=request.case_config.num_layers,
             topology=request.topology.slug(),

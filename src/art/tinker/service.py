@@ -164,6 +164,7 @@ class TinkerService:
     async def train_sft(
         self,
         batches: list[Any],
+        config: types.TrainSFTConfig,
         verbose: bool = False,
     ) -> AsyncIterator[dict[str, float]]:
         raise NotImplementedError("SFT training is not supported for TinkerService")

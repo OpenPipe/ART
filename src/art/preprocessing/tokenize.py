@@ -121,12 +121,14 @@ class SFTBatch:
                            Each dict contains 'input_ids', 'attention_mask', and 'labels'.
         learning_rate: Learning rate to use for this batch.
         num_trajectories: Number of trajectories in this batch.
+        num_tokens: Total number of non-padding tokens (attention_mask != 0).
         num_trainable_tokens: Total number of tokens being trained on (labels != -100).
     """
 
     trajectory_tensors: list[dict[str, torch.Tensor]]
     learning_rate: float
     num_trajectories: int
+    num_tokens: int
     num_trainable_tokens: int
 
 
@@ -489,6 +491,7 @@ def tokenize_sft_batch(
     )
     # Tokenize all trajectories (no padding — each keeps its natural length)
     trajectory_tensors = []
+    num_tokens = 0
     num_trainable_tokens = 0
     for trajectory in trajectory_batch:
         messages = trajectory.messages_and_choices
@@ -514,11 +517,13 @@ def tokenize_sft_batch(
                 "labels": torch.tensor([labels], dtype=torch.long),
             }
         )
+        num_tokens += sum(attention_mask)
         num_trainable_tokens += sum(1 for l in labels if l != -100)
 
     return SFTBatch(
         trajectory_tensors=trajectory_tensors,
         learning_rate=learning_rate,
         num_trajectories=len(trajectory_tensors),
+        num_tokens=num_tokens,
         num_trainable_tokens=num_trainable_tokens,
     )

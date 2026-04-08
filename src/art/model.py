@@ -1207,7 +1207,7 @@ class TrainableModel(Model[ModelConfig, StateType], Generic[ModelConfig, StateTy
 
         Args:
             trajectories: An iterable of Trajectory objects.
-            config: SFT configuration including learning_rates and batch_size.
+            config: SFT configuration including learning_rate and batch_size.
                 If None, uses default TrainSFTConfig().
             _config: Additional experimental configuration that is subject to change and
                 not yet part of the public API. Use at your own risk.

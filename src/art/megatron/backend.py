@@ -37,3 +37,10 @@ class MegatronBackend(LocalBackend):
                     process_name="megatron-service",
                 )
         return self._services[model.name]
+
+    def _default_sft_batch_size(self) -> int:
+        import torch
+
+        num_gpus = max(int(torch.cuda.device_count()), 1)
+        tensor_parallel_size = min(2, num_gpus)
+        return max(num_gpus // tensor_parallel_size, 1)

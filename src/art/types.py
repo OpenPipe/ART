@@ -17,7 +17,7 @@ Tools = list[ChatCompletionToolParam]
 class TrainConfig(pydantic.BaseModel):
     learning_rate: float = 5e-6
     kl_penalty_coef: float = 0.0
-    grad_accumulation_sequences: int = pydantic.Field(default=1, ge=1)
+    grad_accumulation_sequences: int | None = pydantic.Field(default=None, ge=1)
 
 
 class TrainSFTConfig(pydantic.BaseModel):

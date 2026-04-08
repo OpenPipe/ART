@@ -53,17 +53,13 @@ else
     echo "Skipping git reset/clean (GIT_RESET_CLEAN is not true). Preserving synced working tree."
 fi
 
-# Install astral-uv
-if ! command -v uv >/dev/null 2>&1; then
-    if ! curl -LsSf https://astral.sh/uv/install.sh | sh; then
-        echo "Failed to install uv." >&2
-        exit 1
-    fi
-    export PATH="$HOME/.local/bin:$HOME/.cargo/bin:$PATH"
+# Install astral-uv (standalone version)
+# Always prepend standalone install path so it takes precedence over system/conda uv
+export PATH="$HOME/.local/bin:$HOME/.cargo/bin:$PATH"
+if ! curl -LsSf https://astral.sh/uv/install.sh | sh; then
+    echo "Failed to install uv." >&2
+    exit 1
 fi
-
-# Update uv
-uv self update
 
 # Sync the dependencies
 if [ "${INSTALL_EXTRAS:-false}" = "true" ]; then

@@ -43,11 +43,14 @@ from art.utils.s3 import (
 from mp_actors import close_proxy, move_to_child_process
 
 from .. import dev
+from .._backend_training import (
+    aggregate_rl_training_metrics,
+    build_rl_train_configs,
+)
 from ..backend import AnyTrainableModel, Backend
 from ..costs import build_cost_calculator, get_model_pricing
 from ..metrics_taxonomy import (
     TRAIN_GRADIENT_STEPS_KEY,
-    average_metric_samples,
     build_training_summary_metrics,
     summarize_trajectory_groups,
 )
@@ -649,45 +652,36 @@ class LocalBackend(Backend):
         if adam_params is not None:
             raise ValueError("LocalBackend requires adam_params=None.")
 
-        # Build config objects from explicit kwargs
-        config = TrainConfig(
-            learning_rate=learning_rate, kl_penalty_coef=kl_penalty_coef
-        )
-        dev_config: dev.TrainConfig = {
-            "advantage_balance": advantage_balance,
-            "allow_training_without_logprobs": allow_training_without_logprobs,
-            "importance_sampling_level": importance_sampling_level,
-            "kl_penalty_coef": kl_penalty_coef,
-            "mask_prob_ratio": mask_prob_ratio,
-            "plot_tensors": plot_tensors,
-            "ppo": loss_fn == "ppo",
-            "precalculate_logprobs": precalculate_logprobs,
-            "scale_learning_rate_by_reward_std_dev": scale_learning_rate_by_reward_std_dev,
-            "scale_rewards": scale_rewards,
-            "logprob_calculation_chunk_size": logprob_calculation_chunk_size,
-            "num_trajectories_learning_rate_multiplier_power": num_trajectories_learning_rate_multiplier_power,
-        }
-        # Only include optional fields if they're set
-        if epsilon is not None:
-            dev_config["epsilon"] = epsilon
-        if epsilon_high is not None:
-            dev_config["epsilon_high"] = epsilon_high
-        if max_negative_advantage_importance_sampling_weight is not None:
-            dev_config["max_negative_advantage_importance_sampling_weight"] = (
-                max_negative_advantage_importance_sampling_weight
-            )
-        if kimi_k2_tau is not None:
-            dev_config["kimi_k2_tau"] = kimi_k2_tau
-        if truncated_importance_sampling is not None:
-            dev_config["truncated_importance_sampling"] = truncated_importance_sampling
-        if kl_ref_adapter_path is not None:
-            dev_config["kl_ref_adapter_path"] = kl_ref_adapter_path
-        elif kl_penalty_reference_step is not None:
-            ref_checkpoint_dir = get_step_checkpoint_dir(
+        resolved_kl_ref_adapter_path = kl_ref_adapter_path
+        if (
+            resolved_kl_ref_adapter_path is None
+            and kl_penalty_reference_step is not None
+        ):
+            resolved_kl_ref_adapter_path = get_step_checkpoint_dir(
                 get_model_dir(model=model, art_path=self._path),
                 kl_penalty_reference_step,
             )
-            dev_config["kl_ref_adapter_path"] = ref_checkpoint_dir
+        config, dev_config = build_rl_train_configs(
+            learning_rate=learning_rate,
+            advantage_balance=advantage_balance,
+            scale_rewards=scale_rewards,
+            importance_sampling_level=importance_sampling_level,
+            mask_prob_ratio=mask_prob_ratio,
+            ppo=loss_fn == "ppo",
+            precalculate_logprobs=precalculate_logprobs,
+            epsilon=epsilon,
+            epsilon_high=epsilon_high,
+            max_negative_advantage_importance_sampling_weight=max_negative_advantage_importance_sampling_weight,
+            kimi_k2_tau=kimi_k2_tau,
+            kl_penalty_coef=kl_penalty_coef,
+            allow_training_without_logprobs=allow_training_without_logprobs,
+            plot_tensors=plot_tensors,
+            truncated_importance_sampling=truncated_importance_sampling,
+            scale_learning_rate_by_reward_std_dev=scale_learning_rate_by_reward_std_dev,
+            logprob_calculation_chunk_size=logprob_calculation_chunk_size,
+            num_trajectories_learning_rate_multiplier_power=num_trajectories_learning_rate_multiplier_power,
+            kl_ref_adapter_path=resolved_kl_ref_adapter_path,
+        )
 
         # Collect metrics from training
         training_metrics: list[dict[str, float]] = []
@@ -697,21 +691,10 @@ class LocalBackend(Backend):
         ):
             training_metrics.append(metrics)
 
-        # Aggregate metrics
-        avg_metrics = average_metric_samples(training_metrics)
-        summary = summarize_trajectory_groups(groups_list)
-        avg_metrics.setdefault(
-            "time/step_trainer_s", time.monotonic() - trainer_started
-        )
-        avg_metrics.update(
-            {
-                key: value
-                for key, value in build_training_summary_metrics(
-                    summary,
-                    include_trainable_groups=True,
-                ).items()
-                if key not in avg_metrics
-            }
+        avg_metrics = aggregate_rl_training_metrics(
+            training_metrics=training_metrics,
+            trajectory_groups=groups_list,
+            trainer_started=trainer_started,
         )
 
         # Get step and checkpoint path
@@ -829,20 +812,31 @@ class LocalBackend(Backend):
             packed_tensors, f"{get_model_dir(model=model, art_path=self._path)}/tensors"
         )
         # Note: scale_learning_rate_by_reward_std_dev is now handled by the frontend (Model.train())
-        grad_accumulation_sequences = max(1, int(config.grad_accumulation_sequences))
-        estimated_gradient_steps = math.ceil(
+        grad_accumulation_sequences = max(
+            1, int(config.grad_accumulation_sequences or 1)
+        )
+        fallback_gradient_steps = math.ceil(
             disk_packed_tensors["num_sequences"] / grad_accumulation_sequences
         )
-        pbar = tqdm.tqdm(total=estimated_gradient_steps, desc="train")
+        pbar = tqdm.tqdm(total=fallback_gradient_steps, desc="train")
+        reported_gradient_steps: int | None = None
         async for result in service.train(
             disk_packed_tensors, config, dev_config, verbose
         ):
-            num_gradient_steps = int(
-                result.pop(TRAIN_GRADIENT_STEPS_KEY, estimated_gradient_steps)
-            )
-            assert num_gradient_steps == estimated_gradient_steps, (
-                f"num_gradient_steps {num_gradient_steps} != estimated_gradient_steps {estimated_gradient_steps}"
-            )
+            raw_num_gradient_steps = result.pop(TRAIN_GRADIENT_STEPS_KEY, None)
+            if raw_num_gradient_steps is not None:
+                num_gradient_steps = int(raw_num_gradient_steps)
+                if reported_gradient_steps is None:
+                    reported_gradient_steps = num_gradient_steps
+                    if pbar.total != num_gradient_steps:
+                        pbar.total = num_gradient_steps
+                        pbar.refresh()
+                else:
+                    assert num_gradient_steps == reported_gradient_steps, (
+                        f"num_gradient_steps {num_gradient_steps} != reported_gradient_steps {reported_gradient_steps}"
+                    )
+            else:
+                num_gradient_steps = reported_gradient_steps or fallback_gradient_steps
             yield {
                 **base_metrics,
                 **result,
@@ -889,10 +883,13 @@ class LocalBackend(Backend):
             )
         tokenizer = self._tokenizers[model.base_model]
 
-        # Determine batch_size
-        batch_size = config.batch_size
-        if batch_size == "auto":
-            batch_size = 2  # Default to 2 for SFT
+        from ..utils.sft import resolve_sft_batch_size
+
+        batch_size = resolve_sft_batch_size(
+            batch_size=config.batch_size,
+            default_batch_size=self._default_sft_batch_size(),
+        )
+        service_config = config.model_copy(update={"batch_size": batch_size})
 
         # Auto-detect instruction/response parts from model
         from ..utils.model_config import get_instruction_response_parts
@@ -938,7 +935,7 @@ class LocalBackend(Backend):
         total_trajectories = len(trajectory_list)
         batch_count = 0
 
-        async for result in service.train_sft(batches, verbose):
+        async for result in service.train_sft(batches, service_config, verbose):
             pbar.update(1)
             pbar.set_postfix({"loss": f"{result.get('loss/train', 0):.4f}"})
             batch_count += 1
@@ -959,6 +956,9 @@ class LocalBackend(Backend):
 
         if verbose:
             print("_train_sft complete")
+
+    def _default_sft_batch_size(self) -> int:
+        return 2
 
     # ------------------------------------------------------------------
     # Experimental support for S3
