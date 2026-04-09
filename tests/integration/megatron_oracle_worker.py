@@ -62,10 +62,12 @@ def run_worker_subprocess(
         "--run-request",
         str(request_path),
     ]
+    env = {**os.environ, "PYTHONUNBUFFERED": "1"}
+    env["ART_DISABLE_MEGATRON_COMPILE"] = "1"
     run = subprocess.run(
         command,
         cwd=str(worker_cwd),
-        env={**os.environ, "PYTHONUNBUFFERED": "1"},
+        env=env,
         capture_output=True,
         text=True,
         check=False,
@@ -279,6 +281,45 @@ def _configure_provider(
         provider.attention_dropout = 0.0
     if hasattr(provider, "hidden_dropout"):
         provider.hidden_dropout = 0.0
+
+
+@contextmanager
+def _patch_get_provider_for_oracle(
+    megatron_train_module: Any,
+    topology: Topology,
+    case_config: OracleCaseConfig,
+):
+    from art.megatron import provider as provider_module
+
+    original_get_provider = megatron_train_module.get_provider
+
+    def _oracle_get_provider(
+        model: str,
+        *,
+        torch_dtype: torch.dtype = torch.bfloat16,
+    ) -> Any:
+        provider = original_get_provider(model, torch_dtype=torch_dtype)
+        _configure_provider(provider, topology, case_config)
+        provider_module._apply_runtime_env_overrides(provider)
+        if case_config.precision == "fp32":
+            provider.moe_token_dispatcher_type = "alltoall"
+            provider.moe_flex_dispatcher_backend = None
+            provider.moe_shared_expert_overlap = True
+            provider.overlap_moe_expert_parallel_comm = False
+            provider.delay_wgrad_compute = False
+            provider.ep_overlap_early_attn_memory_release = False
+        elif provider_module._tp_ep_parallel_domain_size(provider) > 1:
+            provider_module.apply_flex_dispatcher_backend(
+                provider, moe_flex_dispatcher_backend="deepep"
+            )
+        provider.finalize()
+        return provider
+
+    megatron_train_module.get_provider = _oracle_get_provider
+    try:
+        yield
+    finally:
+        megatron_train_module.get_provider = original_get_provider
 
 
 def _build_optimizer_config(case_config: OracleCaseConfig):
@@ -774,18 +815,19 @@ def _worker_run(request: WorkerRunRequest) -> None:
     _set_deterministic_seed(request.case_config.seed)
     _configure_cuda_precision(request.case_config)
 
-    runtime = megatron_train.build_training_runtime(
-        model_identifier=request.case_config.base_model,
-        provider_torch_dtype=(
-            torch.float32 if request.case_config.precision == "fp32" else torch.bfloat16
-        ),
-        provider_configure=lambda provider: _configure_provider(
-            provider, request.topology, request.case_config
-        ),
-        optimizer_config=_build_optimizer_config(request.case_config),
-        print_env=False,
-        print_optimizer_stats=False,
-    )
+    with _patch_get_provider_for_oracle(
+        megatron_train, request.topology, request.case_config
+    ):
+        runtime = megatron_train.build_training_runtime(
+            model_identifier=request.case_config.base_model,
+            provider_torch_dtype=(
+                torch.float32
+                if request.case_config.precision == "fp32"
+                else torch.bfloat16
+            ),
+            optimizer_config=_build_optimizer_config(request.case_config),
+            print_env=False,
+        )
     model_chunks = runtime.model
     optimizer = runtime.optimizer
     megatron_train.configure_moe_routing_replay(

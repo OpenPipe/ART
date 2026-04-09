@@ -57,7 +57,7 @@ from art.megatron.offload import (
     offload_to_cpu,
     reload_to_gpu,
 )
-from art.megatron.provider import get_provider
+from art.megatron.provider import _env_flag, get_provider
 from art.megatron.routing_replay import (
     MoeRoutingReplayBundle,
     MoeRoutingReplayController,
@@ -75,6 +75,7 @@ safe_open = safetensors.safe_open
 save_file = safetensors_torch.save_file
 
 DEFAULT_MODEL_IDENTIFIER = "Qwen/Qwen3-30B-A3B-Instruct-2507"
+_optimizer_stats_printed = False
 
 __all__ = [
     "DEFAULT_MODEL_IDENTIFIER",
@@ -176,11 +177,8 @@ def _eager_initialize_optimizer_state(optimizer: Any) -> None:
 
 
 def _compile_enabled() -> bool:
-    return os.environ.get("ART_DISABLE_MEGATRON_COMPILE", "0") in {
-        "0",
-        "false",
-        "False",
-    }
+    disabled = _env_flag("ART_DISABLE_MEGATRON_COMPILE")
+    return disabled is not True
 
 
 def _install_gpt_preprocess_hook(model_chunks: ModelChunks) -> None:
@@ -224,11 +222,40 @@ def _default_optimizer_config() -> OptimizerConfig:
     )
 
 
-def _build_optimizer(model: ModelChunks, optimizer_config: OptimizerConfig) -> Any:
-    return get_megatron_optimizer(
+def _maybe_print_optimizer_stats(
+    optimizer: Any,
+    model: ModelChunks,
+) -> None:
+    global _optimizer_stats_printed
+    if _optimizer_stats_printed:
+        return
+    if torch.distributed.is_initialized():  # ty: ignore[possibly-missing-attribute]
+        if torch.distributed.get_rank() != 0:  # ty: ignore[possibly-missing-attribute]
+            _optimizer_stats_printed = True
+            return
+    num_params = sum(
+        p.numel()
+        for group in optimizer.param_groups
+        if not group["is_decoupled_lr"]
+        for p in group["params"]
+    )
+    print(f"Number of parameters in optimizer: {num_params:,}")
+    total_params = sum(p.numel() for module in model for p in module.parameters())
+    percent = (num_params / total_params) * 100 if total_params > 0 else 0
+    print(f"Optimizer parameters as percent of total: {percent:0.2f}%")
+    _optimizer_stats_printed = True
+
+
+def _build_optimizer(
+    model: ModelChunks,
+    optimizer_config: OptimizerConfig,
+) -> Any:
+    optimizer = get_megatron_optimizer(
         config=optimizer_config,
         model_chunks=as_megatron_api_chunks(model),
     )
+    _maybe_print_optimizer_stats(optimizer, model)
+    return optimizer
 
 
 def configure_moe_routing_replay(
@@ -274,7 +301,7 @@ def build_training_runtime(
     moe_routing_replay_bundle: MoeRoutingReplayBundle | None = None,
     moe_routing_replay_strict: bool = True,
     print_env: bool = True,
-    print_optimizer_stats: bool = True,
+    build_optimizer: bool = True,
 ) -> TrainingRuntime:
     if random_state := os.environ.get("ART_MEGATRON_RANDOM_STATE"):
         seed = int(random_state)
@@ -326,19 +353,14 @@ def build_training_runtime(
             _compile_transformer_layers(chunk)
 
     optimizer_config = optimizer_config or _default_optimizer_config()
-    optimizer = _build_optimizer(model, optimizer_config)
-
-    if rank == 0 and print_optimizer_stats:
-        num_params = sum(
-            p.numel()
-            for group in optimizer.param_groups
-            if not group["is_decoupled_lr"]
-            for p in group["params"]
+    optimizer = (
+        _build_optimizer(
+            model,
+            optimizer_config,
         )
-        print(f"Number of parameters in optimizer: {num_params:,}")
-        total_params = sum(p.numel() for module in model for p in module.parameters())
-        percent = (num_params / total_params) * 100 if total_params > 0 else 0
-        print(f"Optimizer parameters as percent of total: {percent:0.2f}%")
+        if build_optimizer
+        else None
+    )
 
     runtime = TrainingRuntime(
         provider=provider,
@@ -672,7 +694,10 @@ def _load_lora_and_optimizer(
     print0(runtime.rank, "Loading adapter model from", lora_path)
     adapter_model = load_lora_adapter_state_dict(lora_path)
     load_adapter_into_model(runtime.model, adapter_model)
-    runtime.optimizer = _build_optimizer(runtime.model, runtime.optimizer_config)
+    runtime.optimizer = _build_optimizer(
+        runtime.model,
+        runtime.optimizer_config,
+    )
     assert runtime.optimizer is not None
 
     optimizer_shard_path = os.path.join(
@@ -1273,10 +1298,7 @@ def _run_service_loop(runtime: TrainingRuntime) -> None:
         reload_to_gpu(runtime.model, runtime.rank, offload_state)
 
     def after_job() -> None:
-        optimizer = runtime.optimizer
         runtime.optimizer = None
-        if optimizer is not None:
-            del optimizer
         gc.collect()
         torch.cuda.empty_cache()
         offload_to_cpu(runtime.model, runtime.rank, offload_state)
@@ -1293,7 +1315,8 @@ def _run_service_loop(runtime: TrainingRuntime) -> None:
 
 def main() -> None:
     runtime = build_training_runtime(
-        model_identifier=os.environ.get("MODEL_IDENTIFIER", DEFAULT_MODEL_IDENTIFIER)
+        model_identifier=os.environ.get("MODEL_IDENTIFIER", DEFAULT_MODEL_IDENTIFIER),
+        build_optimizer=False,
     )
     _run_service_loop(runtime)
 

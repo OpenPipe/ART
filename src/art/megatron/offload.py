@@ -1,9 +1,12 @@
 from collections.abc import Iterator
 from dataclasses import dataclass, field
 import gc
-from typing import Any, Sequence
+from typing import Any, Sequence, cast
 
+from megatron.core.distributed import DistributedDataParallel
 import torch
+
+from art.megatron.model_chunks import unwrap_megatron_chunk
 
 
 @dataclass
@@ -14,14 +17,23 @@ class OffloadState:
 
 def _iter_megatron_param_buffers(model: Sequence[torch.nn.Module]) -> Iterator[Any]:
     for chunk in model:
-        chunk_buffers = getattr(chunk, "buffers", None)
-        if callable(chunk_buffers):
-            raise RuntimeError("Megatron chunk is missing distributed param buffers")
-        if chunk_buffers is not None:
-            yield from chunk_buffers
-        expert_buffers = getattr(chunk, "expert_parallel_buffers", None)
-        if expert_buffers is not None:
-            yield from expert_buffers
+        ddp_chunk = unwrap_megatron_chunk(chunk)
+        if not isinstance(ddp_chunk, DistributedDataParallel):
+            raise RuntimeError(
+                "Expected Megatron chunk wrapped by DistributedDataParallel, got "
+                f"{type(ddp_chunk).__name__}"
+            )
+        ddp_buffers = cast(Sequence[Any] | None, ddp_chunk.__dict__.get("buffers"))
+        expert_buffers = cast(
+            Sequence[Any] | None, ddp_chunk.__dict__.get("expert_parallel_buffers")
+        )
+        if ddp_buffers is None or expert_buffers is None:
+            raise RuntimeError(
+                "Megatron DistributedDataParallel chunk is missing expected "
+                "param buffer attributes"
+            )
+        yield from ddp_buffers
+        yield from expert_buffers
 
 
 def offload_to_cpu(

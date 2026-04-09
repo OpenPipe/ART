@@ -396,7 +396,8 @@ class LocalBackend(Backend):
                 f"{len(too_long_results)} tokenized results from "
                 f"{len({id(result.trajectory) for result in too_long_results})} "
                 f"trajectories longer than packed_sequence_length={sequence_length} "
-                f"(max seen {max(len(result.token_ids) for result in too_long_results)}).",
+                f"(max seen {max(len(result.token_ids) for result in too_long_results)}). "
+                "This affects training, but your model may still learn.",
                 stacklevel=2,
             )
             tokenized_results = [

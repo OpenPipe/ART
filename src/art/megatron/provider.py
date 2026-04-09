@@ -1,9 +1,10 @@
 import copy
-from functools import partial
 import inspect
+import json
 import os
 from pathlib import Path
 from typing import Callable, Literal, cast
+import warnings
 
 from megatron.bridge import AutoBridge
 from megatron.bridge.models.gpt_provider import GPTModelProvider
@@ -21,6 +22,8 @@ from megatron.core.transformer.spec_utils import ModuleSpec
 import torch
 
 from art.megatron.flex_attention import FlexDotProductAttention
+
+_finalized_env_settings_printed = False
 
 
 def _resolve_layer_spec(
@@ -90,6 +93,26 @@ def _env_optional_int(name: str) -> tuple[bool, int | None]:
     return True, int(value)
 
 
+def _env_default_or_even_positive_int(name: str) -> tuple[bool, int | None]:
+    raw = os.environ.get(name)
+    if raw is None:
+        return False, None
+    value = raw.strip().lower()
+    if value == "default":
+        return True, None
+    try:
+        parsed = int(raw.strip())
+    except ValueError as exc:
+        raise ValueError(
+            f"{name} must be 'default' or a positive, even integer, got {raw!r}"
+        ) from exc
+    if parsed <= 0 or parsed % 2 != 0:
+        raise ValueError(
+            f"{name} must be 'default' or a positive, even integer, got {raw!r}"
+        )
+    return True, parsed
+
+
 def _env_optional_str_list(name: str) -> tuple[bool, list[str] | None]:
     found, value = _env_optional_str(name)
     if not found or value is None:
@@ -145,6 +168,44 @@ def _tp_ep_parallel_domain_size(provider: GPTModelProvider) -> int:
     )
 
 
+def _maybe_print_finalized_env_settings(provider: GPTModelProvider) -> None:
+    global _finalized_env_settings_printed
+    if _finalized_env_settings_printed:
+        return
+    if torch.distributed.is_initialized():  # ty: ignore[possibly-missing-attribute]
+        if torch.distributed.get_rank() != 0:  # ty: ignore[possibly-missing-attribute]
+            _finalized_env_settings_printed = True
+            return
+    _finalized_env_settings_printed = True
+    print(
+        "Finalized Megatron env settings:",
+        json.dumps(
+            {
+                "tensor_model_parallel_size": provider.tensor_model_parallel_size,
+                "expert_model_parallel_size": provider.expert_model_parallel_size,
+                "overlap_moe_expert_parallel_comm": provider.overlap_moe_expert_parallel_comm,
+                "delay_wgrad_compute": provider.delay_wgrad_compute,
+                "ep_overlap_early_attn_memory_release": provider.ep_overlap_early_attn_memory_release,
+                "moe_deepep_num_sms": provider.moe_deepep_num_sms,
+                "moe_apply_probs_on_input": provider.moe_apply_probs_on_input,
+                "bias_activation_fusion": provider.bias_activation_fusion,
+                "fine_grained_activation_offloading": provider.fine_grained_activation_offloading,
+                "offload_modules": provider.offload_modules,
+                "recompute_granularity": provider.recompute_granularity,
+                "recompute_method": provider.recompute_method,
+                "recompute_num_layers": provider.recompute_num_layers,
+                "recompute_modules": provider.recompute_modules,
+                "moe_shared_expert_overlap": provider.moe_shared_expert_overlap,
+                "moe_flex_dispatcher_backend": (
+                    "deepep" if _tp_ep_parallel_domain_size(provider) > 1 else None
+                ),
+                "sequence_parallel": provider.sequence_parallel,
+            },
+            indent=2,
+        ),
+    )
+
+
 def _apply_runtime_env_overrides(provider: GPTModelProvider) -> None:
     overlap = _env_flag("ART_MEGATRON_OVERLAP_MOE_EXPERT_PARALLEL_COMM")
     if overlap is not None:
@@ -160,10 +221,16 @@ def _apply_runtime_env_overrides(provider: GPTModelProvider) -> None:
     if early_attn_release is not None:
         provider.ep_overlap_early_attn_memory_release = early_attn_release
 
-    found, deepep_num_sms = _env_optional_int("ART_MEGATRON_MOE_DEEPEP_NUM_SMS")
-    if found and deepep_num_sms is not None:
-        provider.moe_deepep_num_sms = deepep_num_sms
-    if "ART_MEGATRON_MOE_DEEPEP_NUM_SMS" not in os.environ:
+    found, deepep_num_sms = _env_default_or_even_positive_int(
+        "ART_MEGATRON_MOE_DEEPEP_NUM_SMS"
+    )
+    if found:
+        provider.moe_deepep_num_sms = (
+            _resolve_default_deepep_num_sms(provider)
+            if deepep_num_sms is None
+            else deepep_num_sms
+        )
+    else:
         provider.moe_deepep_num_sms = _resolve_default_deepep_num_sms(provider)
 
     moe_apply_probs_on_input = _env_flag("ART_MEGATRON_MOE_APPLY_PROBS_ON_INPUT")
@@ -224,6 +291,13 @@ def _apply_runtime_env_overrides(provider: GPTModelProvider) -> None:
         # EP overlap is incompatible with full recompute in Megatron, so treat
         # overlap as the authoritative request even if a launcher exported the
         # usual recompute defaults. Selective recompute is still allowed.
+        if shared_expert_overlap:
+            warnings.warn(
+                "ART_MEGATRON_MOE_SHARED_EXPERT_OVERLAP=true is incompatible with "
+                "ART_MEGATRON_OVERLAP_MOE_EXPERT_PARALLEL_COMM; forcing "
+                "moe_shared_expert_overlap=False",
+                stacklevel=2,
+            )
         provider.moe_shared_expert_overlap = False
         provider.recompute_method = None
         provider.recompute_num_layers = None
@@ -286,5 +360,6 @@ def get_provider(
     # effectively just a flag modifying finalize_model_grads behavior for DPxCP
     provider.calculate_per_token_loss = True
     provider.sequence_parallel = provider.tensor_model_parallel_size > 1
+    _maybe_print_finalized_env_settings(provider)
     provider.finalize()
     return provider
