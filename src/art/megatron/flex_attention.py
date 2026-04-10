@@ -1,7 +1,8 @@
 """Flex attention plumbing for ART's Megatron backend."""
 
+from collections.abc import Callable
 import math
-from typing import Any, ClassVar, cast
+from typing import Any, ClassVar, TypeAlias, cast
 
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.process_groups_config import ProcessGroupCollection
@@ -25,11 +26,14 @@ class SharedPrefixAttentionState(BaseModel):
     block_mask: BlockMask
 
 
+CompileOptions: TypeAlias = dict[str, str | int | bool | Callable[..., Any]]
+
+
 class FlexAttentionWrapper(torch.nn.Module):
     """Compiled `flex_attention` wrapper with Torchtitan-style inductor options."""
 
     # Torchtitan inductor options for compiling flex attention.
-    _compile_options = {
+    _compile_options: ClassVar[CompileOptions] = {
         "max_autotune": True,
         "coordinate_descent_tuning": True,
         "triton.cudagraphs": False,
