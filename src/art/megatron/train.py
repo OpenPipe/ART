@@ -895,6 +895,25 @@ def load_adapter_into_model(
     optimizer.reload_model_params()
 
 
+def maybe_load_adapter_into_model(
+    model_chunks: ModelChunks,
+    adapter_model_path: str,
+    optimizer: Any | None = None,
+    *,
+    rank: int,
+) -> dict[str, torch.Tensor]:
+    if not os.path.exists(adapter_model_path):
+        print0(rank, "No adapter model found at", adapter_model_path)
+        return {}
+    print0(rank, "Loading adapter model from", adapter_model_path)
+    with safe_open(adapter_model_path, framework="pt") as adapter_file:
+        adapter_model = {
+            key: adapter_file.get_tensor(key) for key in adapter_file.keys()
+        }
+    load_adapter_into_model(model_chunks, adapter_model, optimizer)
+    return adapter_model
+
+
 def collect_sharded_lora_state(
     model_chunks: ModelChunks,
     adapter_model: dict[str, torch.Tensor],

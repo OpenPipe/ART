@@ -124,8 +124,8 @@ async def test_megatron_service_ensure_megatron_running_uses_trainer_gpus(
 
     await service._ensure_megatron_running()
 
-    assert shlex.quote(sys.executable) in seen["command"]
-    assert "torch.distributed.run" in seen["command"]
+    assert "uv run --project" in seen["command"]
+    assert "torchrun" in seen["command"]
     assert "--nproc_per_node 2" in seen["command"]
     assert seen["env"]["CUDA_VISIBLE_DEVICES"] == "0,1"
     assert seen["env"]["MODEL_IDENTIFIER"] == "Qwen/Qwen3-30B-A3B-Instruct-2507"
