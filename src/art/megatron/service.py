@@ -618,6 +618,7 @@ class MegatronService:
             port = (config or {}).get("server_args", {}).get("port", 8000)
             location = await self._start_vllm_subprocess(lora_path, port, config)
             if self.rollout_weights_mode == "merged":
+                self._clear_pending_jobs()
                 await self._sync_dedicated_merged_weights(
                     lora_path=lora_path,
                     step=self._latest_step,
