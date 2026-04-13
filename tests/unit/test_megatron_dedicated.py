@@ -18,6 +18,7 @@ from art.megatron.jobs import (
     MergedWeightTransferInitInfo,
 )
 from art.megatron.service import MegatronService
+from art.megatron.train import _unwrap_art_wrapper_name
 
 
 @pytest.mark.asyncio
@@ -130,6 +131,21 @@ async def test_megatron_service_ensure_megatron_running_uses_trainer_gpus(
     assert seen["env"]["CUDA_VISIBLE_DEVICES"] == "0,1"
     assert seen["env"]["MODEL_IDENTIFIER"] == "Qwen/Qwen3-30B-A3B-Instruct-2507"
     assert seen["start_new_session"] is True
+
+
+def test_unwrap_art_wrapper_name_strips_compiled_wrapper_segments() -> None:
+    assert (
+        _unwrap_art_wrapper_name(
+            "module.module.decoder.layers.0._orig_mod.self_attention.linear_proj.linear_proj.weight"
+        )
+        == "decoder.layers.0.self_attention.linear_proj.weight"
+    )
+    assert (
+        _unwrap_art_wrapper_name(
+            "module.module.decoder.layers.0._orig_mod.mlp.experts.linear_fc1.linear_fc1.weight7"
+        )
+        == "decoder.layers.0.mlp.experts.linear_fc1.weight7"
+    )
 
 
 @pytest.mark.asyncio
