@@ -226,7 +226,7 @@ async def test_megatron_service_start_openai_server_merged_syncs_step_zero(
         ),
         output_dir=str(tmp_path),
     )
-    calls: list[tuple[str, int]] = []
+    calls: list[object] = []
     ensured_identity_paths: list[str] = []
 
     monkeypatch.setattr(
@@ -244,6 +244,7 @@ async def test_megatron_service_start_openai_server_merged_syncs_step_zero(
         "_start_vllm_subprocess",
         lambda lora_path, port, config: asyncio.sleep(0, result=("127.0.0.1", port)),
     )
+    monkeypatch.setattr(service, "_clear_pending_jobs", lambda: calls.append("clear"))
     monkeypatch.setattr(
         service,
         "_sync_dedicated_merged_weights",
@@ -254,7 +255,7 @@ async def test_megatron_service_start_openai_server_merged_syncs_step_zero(
 
     assert location == ("127.0.0.1", 8123)
     assert ensured_identity_paths == [str(checkpoint_dir)]
-    assert calls == [(str(checkpoint_dir), 0)]
+    assert calls == ["clear", (str(checkpoint_dir), 0)]
 
 
 @pytest.mark.asyncio
