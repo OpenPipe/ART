@@ -273,7 +273,7 @@ class MegatronService:
             self._latest_step = 0
         else:
             self._latest_step = get_step_from_dir(self.output_dir)
-        if self.rollout_weights_mode == "lora":
+        if self.is_dedicated or self.rollout_weights_mode == "lora":
             self._ensure_identity_lora(lora_path)
         self._ensure_lora_adapter_config(lora_path)
         return lora_path

@@ -227,10 +227,16 @@ async def test_megatron_service_start_openai_server_merged_syncs_step_zero(
         output_dir=str(tmp_path),
     )
     calls: list[tuple[str, int]] = []
+    ensured_identity_paths: list[str] = []
 
     monkeypatch.setattr(
         "art.megatron.service.get_last_checkpoint_dir",
         lambda _output_dir: str(checkpoint_dir),
+    )
+    monkeypatch.setattr(
+        service,
+        "_ensure_identity_lora",
+        lambda path: ensured_identity_paths.append(path),
     )
     monkeypatch.setattr(service, "_ensure_lora_adapter_config", lambda _path: None)
     monkeypatch.setattr(
@@ -247,7 +253,48 @@ async def test_megatron_service_start_openai_server_merged_syncs_step_zero(
     location = await service.start_openai_server({"server_args": {"port": 8123}})
 
     assert location == ("127.0.0.1", 8123)
+    assert ensured_identity_paths == [str(checkpoint_dir)]
     assert calls == [(str(checkpoint_dir), 0)]
+
+
+@pytest.mark.asyncio
+async def test_megatron_service_start_openai_server_shared_lora_bootstraps_step_zero(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    checkpoint_dir = tmp_path / "checkpoints" / "0000"
+    checkpoint_dir.mkdir(parents=True)
+    service = MegatronService(
+        model_name="megatron-shared",
+        base_model="Qwen/Qwen3-30B-A3B-Instruct-2507",
+        config=InternalModelConfig(),
+        output_dir=str(tmp_path),
+    )
+    ensured_identity_paths: list[str] = []
+
+    monkeypatch.setattr(
+        "art.megatron.service.get_last_checkpoint_dir",
+        lambda _output_dir: str(checkpoint_dir),
+    )
+    monkeypatch.setattr(
+        service,
+        "_ensure_identity_lora",
+        lambda path: ensured_identity_paths.append(path),
+    )
+    monkeypatch.setattr(service, "_ensure_lora_adapter_config", lambda _path: None)
+    monkeypatch.setattr(
+        "art.megatron.service.dev.get_openai_server_config",
+        lambda **_kwargs: {"server_args": {"port": 8123}, "engine_args": {}},
+    )
+    monkeypatch.setattr(
+        "art.megatron.service.openai_server_task",
+        lambda **_kwargs: asyncio.sleep(0),
+    )
+
+    location = await service.start_openai_server({"server_args": {"port": 8123}})
+
+    assert location == ("0.0.0.0", 8123)
+    assert ensured_identity_paths == [str(checkpoint_dir)]
 
 
 @pytest.mark.asyncio
