@@ -1388,6 +1388,12 @@ def _is_art_adapter_param_name(name: str) -> bool:
 def _unwrap_art_wrapper_name(name: str) -> str:
     while name.startswith("module."):
         name = name[len("module.") :]
+    while name.startswith("_orig_mod."):
+        name = name[len("_orig_mod.") :]
+    while "._orig_mod." in name:
+        name = name.replace("._orig_mod.", ".")
+    if name.endswith("._orig_mod"):
+        name = name[: -len("._orig_mod")]
     for wrapped, unwrapped in (
         (".linear_proj.linear_proj.", ".linear_proj."),
         (".linear_qkv.linear_qkv.", ".linear_qkv."),
@@ -1480,24 +1486,35 @@ def _build_art_merge_handlers(
             continue
         if not _is_language_transformer_layer_name(module_name):
             continue
-        prefix = f"language_model.decoder.layers.{module.layer_number - 1}"
+        prefixes = (
+            f"decoder.layers.{module.layer_number - 1}",
+            f"language_model.decoder.layers.{module.layer_number - 1}",
+        )
         linear_proj = getattr(module.self_attention, "linear_proj", None)
         if isinstance(linear_proj, SelfAttentionLinearProjLoRA):
-            exact_handlers[f"{prefix}.self_attention.linear_proj.weight"] = linear_proj
+            for prefix in prefixes:
+                exact_handlers[f"{prefix}.self_attention.linear_proj.weight"] = (
+                    linear_proj
+                )
         linear_qkv = getattr(module.self_attention, "linear_qkv", None)
         if isinstance(linear_qkv, SelfAttentionLinearQKVLoRA):
-            exact_handlers[f"{prefix}.self_attention.linear_qkv.weight"] = linear_qkv
+            for prefix in prefixes:
+                exact_handlers[f"{prefix}.self_attention.linear_qkv.weight"] = (
+                    linear_qkv
+                )
         experts = getattr(module.mlp, "experts", None)
         if experts is None:
             continue
         if isinstance(experts.linear_fc1, MLPExpertsLinearFC1LoRA):
-            prefix_handlers[f"{prefix}.mlp.experts.linear_fc1.weight"] = (
-                experts.linear_fc1
-            )
+            for prefix in prefixes:
+                prefix_handlers[f"{prefix}.mlp.experts.linear_fc1.weight"] = (
+                    experts.linear_fc1
+                )
         if isinstance(experts.linear_fc2, MLPExpertsLinearFC2LoRA):
-            prefix_handlers[f"{prefix}.mlp.experts.linear_fc2.weight"] = (
-                experts.linear_fc2
-            )
+            for prefix in prefixes:
+                prefix_handlers[f"{prefix}.mlp.experts.linear_fc2.weight"] = (
+                    experts.linear_fc2
+                )
     return exact_handlers, prefix_handlers
 
 
@@ -1542,21 +1559,15 @@ def _merge_art_lora_into_hf_weights(
         return converted_weights_dict
     if isinstance(handler, MLPExpertsLinearFC1LoRA):
         for hf_name, base_weight in list(converted_weights_dict.items()):
-            delta = (
-                torch.cat(
-                    [
-                        _lora_delta(
-                            handler.gate_lora, _expert_index_from_hf_name(hf_name)
-                        ),
-                        _lora_delta(
-                            handler.up_lora, _expert_index_from_hf_name(hf_name)
-                        ),
-                    ],
-                    dim=0,
-                )
-                if _hf_name_has_indexed_expert(hf_name)
-                else _stack_moe_fc1_deltas(handler)
-            )
+            if _hf_name_has_indexed_expert(hf_name):
+                expert_idx = _expert_index_from_hf_name(hf_name)
+                if ".gate_proj." in hf_name:
+                    delta = _lora_delta(handler.gate_lora, expert_idx)
+                else:
+                    assert ".up_proj." in hf_name, hf_name
+                    delta = _lora_delta(handler.up_lora, expert_idx)
+            else:
+                delta = _stack_moe_fc1_deltas(handler)
             converted_weights_dict[hf_name] = _merge_delta_into_weight(
                 hf_name,
                 base_weight,
