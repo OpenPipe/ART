@@ -76,9 +76,13 @@ def create_identity_lora(
     if random_state is not None:
         torch.manual_seed(random_state)
     base_config = AutoConfig.from_pretrained(base_model, trust_remote_code=True)
+    model_config = base_config
+    nested_text_config = getattr(base_config, "text_config", None)
+    if not hasattr(base_config, "vocab_size") and hasattr(nested_text_config, "vocab_size"):
+        model_config = nested_text_config
     with init_empty_weights():
         model = AutoModelForCausalLM.from_config(
-            base_config, torch_dtype=torch.bfloat16, trust_remote_code=True
+            model_config, torch_dtype=torch.bfloat16, trust_remote_code=True
         )
     model.name_or_path = base_model
 
@@ -96,8 +100,14 @@ def create_identity_lora(
                     "k_proj.weight",
                     "v_proj.weight",
                     "o_proj.weight",
+                    "linear_attn.in_proj_qkv.weight",
+                    "linear_attn.in_proj_z.weight",
+                    "linear_attn.out_proj.weight",
                     "mlp.experts.gate_up_proj",
                     "mlp.experts.down_proj",
+                    "mlp.shared_expert.gate_proj.weight",
+                    "mlp.shared_expert.up_proj.weight",
+                    "mlp.shared_expert.down_proj.weight",
                 )
             )
         ],

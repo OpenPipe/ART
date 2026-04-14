@@ -12,4 +12,9 @@ apt-get install -y libcudnn9-headers-cuda-12 libibverbs-dev ninja-build
 script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 repo_root="$(cd -- "${script_dir}/../../.." && pwd)"
 cd "${repo_root}"
-uv sync --extra backend --extra megatron --frozen --active
+uv_bin="${HOME}/.local/bin/uv"
+if [[ -x "${uv_bin}" ]]; then
+    "${uv_bin}" sync --extra backend --extra megatron --frozen --active
+else
+    uv sync --extra backend --extra megatron --frozen --active
+fi
