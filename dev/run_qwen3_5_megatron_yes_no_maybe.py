@@ -35,6 +35,7 @@ parser.add_argument("--project", type=str, default="qwen35-megatron-ynm")
 parser.add_argument("--gpu-memory-utilization", type=float, default=0.65)
 parser.add_argument("--max-model-len", type=int, default=1024)
 parser.add_argument("--max-seq-length", type=int, default=1024)
+parser.add_argument("--packed-sequence-length", type=int, default=None)
 parser.add_argument("--max-num-seqs", type=int, default=8)
 parser.add_argument("--num-steps", type=int, default=10)
 parser.add_argument("--rollouts-per-prompt", type=int, default=8)
@@ -71,6 +72,12 @@ env = [
     f"GPU_MEMORY_UTILIZATION={args.gpu_memory_utilization}",
     f"MAX_MODEL_LEN={args.max_model_len}",
     f"MAX_SEQ_LENGTH={args.max_seq_length}",
+    "PACKED_SEQUENCE_LENGTH="
+    + str(
+        args.packed_sequence_length
+        if args.packed_sequence_length is not None
+        else args.max_seq_length
+    ),
     f"MAX_NUM_SEQS={args.max_num_seqs}",
     f"LOAD_IN_4BIT={_format_env_bool(args.load_in_4bit)}",
     f"LOAD_IN_16BIT={_format_env_bool(args.load_in_16bit)}",
@@ -118,6 +125,10 @@ print(f"  image_id: {args.image_id}")
 print(f"  gpu_memory_utilization: {args.gpu_memory_utilization}")
 print(f"  max_model_len: {args.max_model_len}")
 print(f"  max_seq_length: {args.max_seq_length}")
+print(
+    "  packed_sequence_length: "
+    f"{args.packed_sequence_length if args.packed_sequence_length is not None else args.max_seq_length}"
+)
 print(f"  max_num_seqs: {args.max_num_seqs}")
 print(f"  num_steps: {args.num_steps}")
 print(f"  rollouts_per_prompt: {args.rollouts_per_prompt}")

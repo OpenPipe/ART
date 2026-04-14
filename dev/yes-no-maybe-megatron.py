@@ -192,6 +192,12 @@ async def main() -> None:
     max_tokens = int(os.environ.get("MAX_TOKENS", "100"))
     timeout = float(os.environ.get("TIMEOUT", "100"))
     learning_rate = float(os.environ.get("LEARNING_RATE", "1e-4"))
+    packed_sequence_length = int(
+        os.environ.get(
+            "PACKED_SEQUENCE_LENGTH",
+            os.environ.get("MAX_SEQ_LENGTH", "4096"),
+        )
+    )
 
     backend = MegatronBackend()
     model = art.TrainableModel(
@@ -285,6 +291,7 @@ async def main() -> None:
                 model,
                 train_groups,
                 learning_rate=learning_rate,
+                packed_sequence_length=packed_sequence_length,
             )
             print(
                 json.dumps(
