@@ -19,7 +19,6 @@ _AUTO_GPU_HOURLY_PRICING_USD = {
 
 import aiohttp
 import numpy as np
-from openai import AsyncOpenAI
 import polars as pl
 import torch
 from tqdm import auto as tqdm
@@ -497,10 +496,6 @@ class LocalBackend(Backend):
         self, model: AnyTrainableModel, base_url: str, api_key: str
     ) -> None:
         model_name = model.name
-        openai_client = AsyncOpenAI(
-            base_url=base_url,
-            api_key=api_key,
-        )
         consecutive_failures = 0
         max_consecutive_failures = 3
         async with aiohttp.ClientSession() as session:
@@ -526,18 +521,22 @@ class LocalBackend(Backend):
                             running_requests = int(float(line.split()[1]))
                         elif line.startswith("vllm:num_requests_waiting"):
                             pending_requests = int(float(line.split()[1]))
-                    # If there are no running or pending requests, send a health check
+                    # If there are no running or pending requests, send a cheap liveness
+                    # probe rather than a real generation request. Large models can take
+                    # longer than a short completion-based probe while still being healthy.
                     if running_requests == 0 and pending_requests == 0:
                         try:
-                            # Send a health check with a short timeout
-                            await openai_client.completions.create(
-                                model=self._model_inference_name(model),
-                                prompt="Hi",
-                                max_tokens=1,
+                            async with session.get(
+                                f"{base_url.split('/v1')[0]}/health",
                                 timeout=float(
                                     os.environ.get("ART_SERVER_MONITOR_TIMEOUT", 5.0)
                                 ),
-                            )
+                            ) as health_response:
+                                if health_response.status >= 400:
+                                    raise RuntimeError(
+                                        "OpenAI server health check failed with "
+                                        f"status {health_response.status}"
+                                    )
                         except Exception as e:
                             # If the server is sleeping, a failed health check is okay
                             if await self._services[
