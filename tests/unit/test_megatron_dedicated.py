@@ -1,12 +1,15 @@
 import asyncio
+from contextlib import nullcontext
 import os
 from pathlib import Path
 import shlex
 import sys
 import types as pytypes
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
+import torch
 
 pytest.importorskip("vllm")
 
@@ -17,8 +20,8 @@ from art.megatron.jobs import (
     MegatronMergedTrainJob,
     MergedWeightTransferInitInfo,
 )
-from art.megatron.service import MegatronService
-from art.megatron.train import _unwrap_art_wrapper_name
+from art.megatron.service import MegatronService, create_identity_lora
+from art.megatron.train import _compile_enabled, _unwrap_art_wrapper_name
 
 
 @pytest.mark.asyncio
@@ -146,6 +149,75 @@ def test_unwrap_art_wrapper_name_strips_compiled_wrapper_segments() -> None:
         )
         == "decoder.layers.0.mlp.experts.linear_fc1.weight7"
     )
+
+
+def test_compile_enabled_disables_qwen35_by_default() -> None:
+    assert _compile_enabled("Qwen/Qwen3-30B-A3B-Instruct-2507") is True
+    assert _compile_enabled("Qwen/Qwen3.5-35B-A3B") is False
+
+
+def test_compile_enabled_honors_env_override(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("ART_DISABLE_MEGATRON_COMPILE", "0")
+    assert _compile_enabled("Qwen/Qwen3.5-35B-A3B") is True
+    monkeypatch.setenv("ART_DISABLE_MEGATRON_COMPILE", "1")
+    assert _compile_enabled("Qwen/Qwen3-30B-A3B-Instruct-2507") is False
+
+
+def test_create_identity_lora_uses_nested_text_config_when_top_level_lacks_vocab_size(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    top_level_config = SimpleNamespace(
+        text_config=SimpleNamespace(vocab_size=128),
+    )
+    seen: dict[str, Any] = {}
+
+    class FakeModel:
+        name_or_path = ""
+
+        def named_parameters(self) -> list[tuple[str, torch.Tensor]]:
+            return [
+                (
+                    "model.layers.0.self_attn.q_proj.weight",
+                    torch.empty(1, device="meta"),
+                ),
+                (
+                    "model.layers.0.linear_attn.in_proj_qkv.weight",
+                    torch.empty(1, device="meta"),
+                ),
+            ]
+
+    class FakePeftModel:
+        def save_pretrained(self, lora_path: str) -> None:
+            Path(lora_path).mkdir(parents=True, exist_ok=True)
+
+    monkeypatch.setattr(
+        "transformers.AutoConfig.from_pretrained",
+        lambda *_args, **_kwargs: top_level_config,
+    )
+    monkeypatch.setattr(
+        "transformers.AutoModelForCausalLM.from_config",
+        lambda config, **_kwargs: seen.setdefault("config", config) or FakeModel(),
+    )
+    monkeypatch.setattr("accelerate.init_empty_weights", nullcontext)
+    monkeypatch.setattr(
+        "peft.get_peft_model",
+        lambda _model, lora_config, **_kwargs: seen.setdefault("lora_config", lora_config)
+        or FakePeftModel(),
+    )
+    monkeypatch.setattr(
+        "art.megatron.service.convert_checkpoint_if_needed",
+        lambda _path: None,
+    )
+
+    create_identity_lora("Qwen/Qwen3.5-35B-A3B", str(tmp_path))
+
+    assert seen["config"] is top_level_config.text_config
+    assert "model.layers.0.linear_attn.in_proj_qkv.weight" in seen[
+        "lora_config"
+    ].target_parameters
 
 
 @pytest.mark.asyncio
