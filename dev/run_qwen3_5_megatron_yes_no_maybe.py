@@ -41,6 +41,7 @@ parser.add_argument("--num-steps", type=int, default=10)
 parser.add_argument("--rollouts-per-prompt", type=int, default=8)
 parser.add_argument("--eval-prompts", type=int, default=24)
 parser.add_argument("--max-tokens", type=int, default=5)
+parser.add_argument("--timeout", type=float, default=600.0)
 parser.add_argument("--learning-rate", type=float, default=5e-5)
 parser.add_argument(
     "--load-in-4bit", action=argparse.BooleanOptionalAction, default=False
@@ -85,6 +86,7 @@ env = [
     f"ROLLOUTS_PER_PROMPT={args.rollouts_per_prompt}",
     f"EVAL_PROMPTS={args.eval_prompts}",
     f"MAX_TOKENS={args.max_tokens}",
+    f"TIMEOUT={args.timeout}",
     f"LEARNING_RATE={args.learning_rate}",
     f"TRAINER_GPU_IDS={_format_int_list(args.trainer_gpu_ids)}",
     f"INFERENCE_GPU_IDS={_format_int_list(args.inference_gpu_ids)}",
@@ -135,6 +137,7 @@ print(f"  num_steps: {args.num_steps}")
 print(f"  rollouts_per_prompt: {args.rollouts_per_prompt}")
 print(f"  eval_prompts: {args.eval_prompts}")
 print(f"  max_tokens: {args.max_tokens}")
+print(f"  timeout: {args.timeout}")
 print(f"  learning_rate: {args.learning_rate}")
 print(f"  load_in_4bit: {args.load_in_4bit}")
 print(f"  load_in_16bit: {args.load_in_16bit}")
