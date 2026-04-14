@@ -115,7 +115,8 @@ task.set_resources(
         image_id=args.image_id,
     )
 )
-task.set_file_mounts({"~/sky_workdir/.env": ".env"})
+if os.path.exists(".env"):
+    task.set_file_mounts({"~/sky_workdir/.env": ".env"})
 
 print(f"Launching on cluster: {cluster_name}")
 print(f"  base_model: {args.base_model}")
