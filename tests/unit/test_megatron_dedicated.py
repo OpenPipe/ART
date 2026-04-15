@@ -15,6 +15,7 @@ pytest.importorskip("vllm")
 
 from art import TrainableModel, types
 from art.dev.model import InternalModelConfig
+from art.dev.validate import QWEN3_5_MOE_MODELS
 from art.megatron.backend import MegatronBackend
 from art.megatron.jobs import (
     MegatronMergedTrainJob,
@@ -151,9 +152,11 @@ def test_unwrap_art_wrapper_name_strips_compiled_wrapper_segments() -> None:
     )
 
 
-def test_compile_enabled_disables_qwen35_by_default() -> None:
+def test_compile_enabled_disables_qwen35_moe_by_default() -> None:
     assert _compile_enabled("Qwen/Qwen3-30B-A3B-Instruct-2507") is True
-    assert _compile_enabled("Qwen/Qwen3.5-35B-A3B") is False
+    assert _compile_enabled("Qwen/Qwen3.5-32B-Instruct") is True
+    for model_identifier in QWEN3_5_MOE_MODELS:
+        assert _compile_enabled(model_identifier) is False
 
 
 def test_compile_enabled_honors_env_override(
