@@ -322,11 +322,8 @@ async def archive_and_presign_step_url(
         await ensure_bucket_exists(s3_bucket)
         await s3_sync(archive_path, s3_step_path, verbose=verbose, delete=delete)
 
-    # Remove the s3:// prefix to get the key
-    s3_key = s3_step_path.removeprefix("s3://")
-
     # Generate presigned URL with 1 hour expiration
-    cmd = ["aws", "s3", "presign", s3_key, "--expires-in", "3600"]
+    cmd = ["aws", "s3", "presign", s3_step_path, "--expires-in", "3600"]
 
     process = await asyncio.create_subprocess_exec(
         *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
