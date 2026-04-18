@@ -875,9 +875,7 @@ def iter_named_modules(model_chunks: list[MegatronModule]) -> Any:
 def _is_language_transformer_layer_name(module_name: str) -> bool:
     while module_name.startswith("module."):
         module_name = module_name.removeprefix("module.")
-    return module_name.startswith(
-        ("decoder.layers.", "language_model.decoder.layers.")
-    )
+    return module_name.startswith(("decoder.layers.", "language_model.decoder.layers."))
 
 
 def load_adapter_into_model(
@@ -1606,14 +1604,15 @@ def _build_art_conversion_tasks(runtime: TrainingRuntime) -> list[Any]:
     mapping_registry = bridge._model_bridge.mapping_registry()
     hf_source = bridge.hf_pretrained.state.source
     hf_keys = set(hf_source.get_all_keys())
-    model_config = runtime.model[0].config
+    megatron_chunks = as_megatron_api_chunks(runtime.model)
+    model_config = megatron_chunks[0].config
     tasks: list[Any] = []
-    for vp_stage, model in enumerate(runtime.model):
+    for vp_stage, model in enumerate(megatron_chunks):
         for local_name, _ in chain(model.named_parameters(), persistent_buffers(model)):
             if "_extra_state" in local_name or _is_art_adapter_param_name(local_name):
                 continue
             global_name = _megatron_local_name_to_global(
-                runtime.model,
+                megatron_chunks,
                 model_config,
                 _unwrap_art_wrapper_name(local_name),
                 vp_stage,
@@ -1621,11 +1620,13 @@ def _build_art_conversion_tasks(runtime: TrainingRuntime) -> list[Any]:
             mapping = mapping_registry.megatron_to_hf_lookup(global_name)
             if mapping is None or not _mapping_hf_weights_exist(mapping, hf_keys):
                 continue
-            local_module, local_weights = get_module_and_param_from_name(
-                runtime.model,
+            module_and_param = get_module_and_param_from_name(
+                megatron_chunks,
                 local_name,
                 vp_stage,
             )
+            local_module = module_and_param[0]
+            local_weights = module_and_param[1]
             if local_module is not None and not hasattr(local_module, "config"):
                 setattr(local_module, "config", model_config)
             tasks.append(
@@ -1649,7 +1650,8 @@ def _iter_merged_vllm_weights(runtime: TrainingRuntime) -> Any:
     assert bridge is not None
     model_bridge = bridge._model_bridge
     hf_state_dict = bridge.hf_pretrained.state
-    exact_handlers, prefix_handlers = _build_art_merge_handlers(runtime.model)
+    megatron_chunks = as_megatron_api_chunks(runtime.model)
+    exact_handlers, prefix_handlers = _build_art_merge_handlers(megatron_chunks)
     for task in _build_art_conversion_tasks(runtime):
         converted_weights_dict = task.mapping.megatron_to_hf(
             task.param_weight,
