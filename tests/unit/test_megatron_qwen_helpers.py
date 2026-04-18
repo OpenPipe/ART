@@ -1,5 +1,5 @@
 from types import SimpleNamespace
-from typing import Any
+from typing import Any, cast
 
 import pytest
 
@@ -49,10 +49,10 @@ def test_self_attention_linear_qkv_lora_accepts_nongated_qwen3_layout(
 
     wrapped = SelfAttentionLinearQKVLoRA(
         adapter_model_prefix="base_model.model.model.layers.0.self_attn",
-        linear_qkv=linear_qkv,
+        linear_qkv=cast(Any, linear_qkv),
         rank=4,
         alpha=8.0,
-        provider=provider,
+        provider=cast(Any, provider),
     )
 
     assert wrapped.attention_output_gate is False

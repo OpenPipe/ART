@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from types import SimpleNamespace
+from typing import Any, cast
 
 import pytest
 
@@ -107,6 +108,7 @@ def test_get_provider_accepts_supported_qwen_moe_bridges(
         resolved,
         vp_stage=7,
     )
+    layer_spec = cast(Any, layer_spec)
     assert (
         layer_spec.submodules.self_attention.submodules.core_attention
         is FlexDotProductAttention
