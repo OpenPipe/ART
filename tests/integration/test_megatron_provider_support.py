@@ -102,7 +102,11 @@ def test_get_provider_accepts_supported_qwen_moe_bridges(
     assert resolved.moe_aux_loss_coeff == 0.0
     assert resolved.calculate_per_token_loss is True
 
-    layer_spec = resolved.transformer_layer_spec(resolved, vp_stage=7)
+    layer_spec = provider_module._resolve_layer_spec(
+        resolved.transformer_layer_spec,
+        resolved,
+        vp_stage=7,
+    )
     assert (
         layer_spec.submodules.self_attention.submodules.core_attention
         is FlexDotProductAttention
@@ -142,10 +146,15 @@ def test_get_provider_preserves_hybrid_qwen35_layer_specs(
     monkeypatch.setattr(provider_module.torch.cuda, "device_count", lambda: 1)
 
     resolved = provider_module.get_provider("unused-qwen35")
-    layer_spec = resolved.transformer_layer_spec(resolved, vp_stage=0)
+    layer_spec = provider_module._resolve_layer_spec(
+        resolved.transformer_layer_spec,
+        resolved,
+        vp_stage=0,
+    )
 
-    assert hasattr(layer_spec, "layer_specs")
-    gdn_layer, attention_layer = layer_spec.layer_specs
+    layer_specs = getattr(layer_spec, "layer_specs", None)
+    assert layer_specs is not None
+    gdn_layer, attention_layer = layer_specs
     assert not hasattr(gdn_layer.submodules.self_attention.submodules, "core_attention")
     assert (
         attention_layer.submodules.self_attention.submodules.core_attention

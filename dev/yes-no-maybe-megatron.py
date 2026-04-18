@@ -97,9 +97,7 @@ def summarize(groups: list[art.TrajectoryGroup]) -> dict[str, float]:
         "yes_rate": answers.count("yes") / total,
         "no_rate": answers.count("no") / total,
         "maybe_rate": answers.count("maybe") / total,
-        "invalid_rate": sum(
-            answer not in {"yes", "no", "maybe"} for answer in answers
-        )
+        "invalid_rate": sum(answer not in {"yes", "no", "maybe"} for answer in answers)
         / total,
     }
 

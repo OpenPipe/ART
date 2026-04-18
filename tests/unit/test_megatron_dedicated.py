@@ -207,8 +207,9 @@ def test_create_identity_lora_uses_nested_text_config_when_top_level_lacks_vocab
     monkeypatch.setattr("accelerate.init_empty_weights", nullcontext)
     monkeypatch.setattr(
         "peft.get_peft_model",
-        lambda _model, lora_config, **_kwargs: seen.setdefault("lora_config", lora_config)
-        or FakePeftModel(),
+        lambda _model, lora_config, **_kwargs: (
+            seen.setdefault("lora_config", lora_config) or FakePeftModel()
+        ),
     )
     monkeypatch.setattr(
         "art.megatron.service.convert_checkpoint_if_needed",
@@ -218,9 +219,10 @@ def test_create_identity_lora_uses_nested_text_config_when_top_level_lacks_vocab
     create_identity_lora("Qwen/Qwen3.5-35B-A3B", str(tmp_path))
 
     assert seen["config"] is top_level_config.text_config
-    assert "model.layers.0.linear_attn.in_proj_qkv.weight" in seen[
-        "lora_config"
-    ].target_parameters
+    assert (
+        "model.layers.0.linear_attn.in_proj_qkv.weight"
+        in seen["lora_config"].target_parameters
+    )
 
 
 @pytest.mark.asyncio

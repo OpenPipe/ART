@@ -78,7 +78,9 @@ def create_identity_lora(
     base_config = AutoConfig.from_pretrained(base_model, trust_remote_code=True)
     model_config = base_config
     nested_text_config = getattr(base_config, "text_config", None)
-    if not hasattr(base_config, "vocab_size") and hasattr(nested_text_config, "vocab_size"):
+    if not hasattr(base_config, "vocab_size") and hasattr(
+        nested_text_config, "vocab_size"
+    ):
         model_config = nested_text_config
     with init_empty_weights():
         model = AutoModelForCausalLM.from_config(

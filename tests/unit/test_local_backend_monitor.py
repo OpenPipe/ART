@@ -1,9 +1,9 @@
 import asyncio
 from pathlib import Path
-from types import SimpleNamespace
 
 import pytest
 
+from art import TrainableModel
 from art.local import LocalBackend
 
 
@@ -37,8 +37,7 @@ class _FakeSession:
         self._urls.append(url)
         if url.endswith("/metrics"):
             return _FakeResponse(
-                "vllm:num_requests_running 0\n"
-                "vllm:num_requests_waiting 0\n"
+                "vllm:num_requests_running 0\nvllm:num_requests_waiting 0\n"
             )
         if url.endswith("/health"):
             return _FakeResponse("ok")
@@ -51,7 +50,12 @@ async def test_monitor_openai_server_uses_health_probe_when_idle(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     backend = LocalBackend(path=str(tmp_path))
-    model = SimpleNamespace(name="qwen35-monitor")
+    model = TrainableModel(
+        name="qwen35-monitor",
+        project="unit-tests",
+        base_model="Qwen/Qwen3-30B-A3B-Instruct-2507",
+        base_path=str(tmp_path),
+    )
 
     class _FakeService:
         async def vllm_engine_is_sleeping(self) -> bool:

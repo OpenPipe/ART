@@ -51,6 +51,7 @@ class _DenseMLP(torch.nn.Module):
 
 
 def _make_qwen35_provider() -> Qwen35VLMoEModelProvider:
+    assert Qwen3_5MoeVisionConfig is not None
     provider = Qwen35VLMoEModelProvider(
         num_layers=4,
         hidden_size=64,
@@ -277,7 +278,9 @@ def test_build_adapter_weights_handles_grouped_qwen35_moe_hf_weights() -> None:
             lora.B_T.data.fill_(1)
 
         adapter_weights_by_base = build_adapter_weights_by_base([model])
-        layer_prefix = f"language_model.decoder.layers.{target_layer.layer_number - 1}.mlp.experts"
+        layer_prefix = (
+            f"language_model.decoder.layers.{target_layer.layer_number - 1}.mlp.experts"
+        )
 
         for expert_idx in range(fc1_handler.gate_lora.num_local_experts):
             fc1_weights = adapter_weights_by_base[
@@ -354,7 +357,9 @@ def test_build_adapter_weights_handles_grouped_qwen35_moe_hf_weights() -> None:
     not torch.cuda.is_available(),
     reason="No CUDA available in this environment",
 )
-def test_build_adapter_weights_handles_grouped_qwen35_moe_hf_weights_with_expert_suffix() -> None:
+def test_build_adapter_weights_handles_grouped_qwen35_moe_hf_weights_with_expert_suffix() -> (
+    None
+):
     with _single_rank_model_parallel():
         provider = _make_qwen35_provider()
         model = provider.provide_language_model(pre_process=True, post_process=True)
@@ -376,7 +381,9 @@ def test_build_adapter_weights_handles_grouped_qwen35_moe_hf_weights_with_expert
             lora.B_T.data.fill_(1)
 
         adapter_weights_by_base = build_adapter_weights_by_base([model])
-        layer_prefix = f"language_model.decoder.layers.{target_layer.layer_number - 1}.mlp.experts"
+        layer_prefix = (
+            f"language_model.decoder.layers.{target_layer.layer_number - 1}.mlp.experts"
+        )
         expert_idx = 0
         fc1_weights = adapter_weights_by_base[
             f"{layer_prefix}.linear_fc1.weight{expert_idx}"

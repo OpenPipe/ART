@@ -95,6 +95,7 @@ class _CastingStateSource(StateSource):
     def has_glob(self, pattern: str) -> bool:
         return self._source.has_glob(pattern)
 
+
 def _env_flag(name: str) -> bool | None:
     raw = os.environ.get(name)
     if raw is None:
@@ -364,18 +365,21 @@ def get_provider_bundle(
 
         def _patch_qwen35_block_spec(block_spec: TransformerBlockSubmodules) -> None:
             _patch_standard_attention_specs(block_spec, Qwen3VLSelfAttention)
-            for layer_spec in block_spec.layer_specs:
+            layer_specs = block_spec.layer_specs
+            if layer_specs is None:
+                return
+            for layer_spec in layer_specs:
                 _patch_core_attention(layer_spec)
 
         def _qwen35_layer_spec(
             config: GPTModelProvider, vp_stage: int | None = None
-        ) -> TransformerBlockSubmodules:
+        ) -> ModuleSpec:
             block_spec = get_transformer_block_with_experimental_attention_variant_spec(
                 config,
                 vp_stage=vp_stage,
             )
             _patch_qwen35_block_spec(block_spec)
-            return block_spec
+            return cast(ModuleSpec, block_spec)
 
         provider.transformer_layer_spec = _qwen35_layer_spec
 
@@ -385,21 +389,26 @@ def get_provider_bundle(
             post_process: bool | None = None,
             vp_stage: int | None = None,
         ) -> Qwen3VLModel:
-            language_transformer_config = self
+            language_transformer_config = cast(Any, self)
             hf_vision_config = self.vision_config
             hf_vision_config.torch_dtype = self.params_dtype
-            block_spec = get_transformer_block_with_experimental_attention_variant_spec(
-                language_transformer_config,
-                vp_stage=vp_stage,
+            block_spec = cast(
+                ModuleSpec,
+                get_transformer_block_with_experimental_attention_variant_spec(
+                    language_transformer_config,
+                    vp_stage=vp_stage,
+                ),
             )
-            _patch_qwen35_block_spec(block_spec)
+            _patch_qwen35_block_spec(cast(TransformerBlockSubmodules, block_spec))
+            pre_process_value = True if pre_process is None else pre_process
+            post_process_value = True if post_process is None else post_process
             model = Qwen3VLModel(
                 language_transformer_config=language_transformer_config,
                 language_transformer_layer_spec=block_spec,
                 vision_transformer_config=hf_vision_config,
-                pre_process=pre_process,
-                post_process=post_process,
-                pg_collection=self._pg_collection,
+                pre_process=pre_process_value,
+                post_process=post_process_value,
+                pg_collection=cast(Any, self._pg_collection),
                 mtp_block_spec=mtp_block_spec(self, vp_stage=vp_stage),
                 vp_stage=vp_stage,
             )
@@ -415,7 +424,9 @@ def get_provider_bundle(
                 )
             return model
 
-        provider.provide = MethodType(_provide_qwen35_with_flex_attention, provider)
+        provider.provide = cast(
+            Any, MethodType(_provide_qwen35_with_flex_attention, provider)
+        )
     base_layer_spec = provider.transformer_layer_spec
 
     def _flex_attention_layer_spec(

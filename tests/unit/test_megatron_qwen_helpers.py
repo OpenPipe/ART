@@ -1,4 +1,5 @@
 from types import SimpleNamespace
+from typing import Any
 
 import pytest
 
@@ -31,7 +32,7 @@ def test_self_attention_linear_qkv_lora_accepts_nongated_qwen3_layout(
     monkeypatch.setattr(
         "art.megatron.lora.ps.get_tensor_model_parallel_world_size", lambda: 1
     )
-    provider = SimpleNamespace(
+    provider: Any = SimpleNamespace(
         kv_channels=128,
         num_query_groups=4,
         num_attention_heads=32,
@@ -39,7 +40,7 @@ def test_self_attention_linear_qkv_lora_accepts_nongated_qwen3_layout(
     )
     q_out_features = provider.kv_channels * provider.num_attention_heads
     kv_out_features = provider.kv_channels * provider.num_query_groups
-    linear_qkv = SimpleNamespace(
+    linear_qkv: Any = SimpleNamespace(
         weight=torch.empty(q_out_features + 2 * kv_out_features, 16),
         in_features=16,
         return_layernorm_output=False,

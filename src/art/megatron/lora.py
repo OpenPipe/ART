@@ -1,6 +1,6 @@
 from collections.abc import Sequence
 import math
-from typing import Any, Literal
+from typing import Any, Literal, cast
 
 from megatron.bridge.models.gpt_provider import GPTModelProvider
 from megatron.core import parallel_state as ps
@@ -466,7 +466,8 @@ class SelfAttentionLinearQKVLoRA(torch.nn.Module):
             raise ValueError(
                 "num_attention_heads must be divisible by num_query_groups for QKV LoRA"
             )
-        total_out_features_per_rank = linear_qkv.weight.shape[0]
+        linear_qkv_weight = cast(torch.Tensor, linear_qkv.weight)
+        total_out_features_per_rank = linear_qkv_weight.shape[0]
         kv_out_features = self.provider.kv_channels * self.provider.num_query_groups
         tp_world_size = ps.get_tensor_model_parallel_world_size()
         assert kv_out_features % tp_world_size == 0, (
