@@ -61,7 +61,9 @@ async def test_megatron_backend_dedicated_uses_trainer_gpus_without_child_proces
     monkeypatch.setattr(
         "art.megatron.backend.move_to_child_process",
         lambda *args, **kwargs: (_ for _ in ()).throw(
-            AssertionError("Dedicated Megatron service should not move to a child process")
+            AssertionError(
+                "Dedicated Megatron service should not move to a child process"
+            )
         ),
     )
     monkeypatch.setattr("art.megatron.service.MegatronService", FakeService)
@@ -95,7 +97,9 @@ async def test_megatron_service_ensure_megatron_running_uses_trainer_gpus(
 
     seen: dict[str, Any] = {}
 
-    monkeypatch.setattr("art.megatron.service.subprocess.run", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        "art.megatron.service.subprocess.run", lambda *args, **kwargs: None
+    )
 
     async def fake_create_subprocess_shell(
         command: str,
@@ -145,7 +149,9 @@ async def test_megatron_service_start_openai_server_dedicated_starts_subprocess(
         lambda _output_dir: str(checkpoint_dir),
     )
     monkeypatch.setattr(service, "_ensure_identity_lora", lambda _path: None)
-    monkeypatch.setattr(service, "_ensure_lora_adapter_config", lambda _path, source_path=None: None)
+    monkeypatch.setattr(
+        service, "_ensure_lora_adapter_config", lambda _path, source_path=None: None
+    )
 
     async def fake_start_vllm_subprocess(
         lora_path: str,
@@ -186,7 +192,9 @@ async def test_megatron_service_register_lora_for_step_dedicated_reloads_adapter
     monkeypatch.setattr(
         service,
         "_reload_adapter",
-        lambda checkpoint_dir, step: seen.append((checkpoint_dir, step)) or asyncio.sleep(0),
+        lambda checkpoint_dir, step: (
+            seen.append((checkpoint_dir, step)) or asyncio.sleep(0)
+        ),
     )
 
     await service.register_lora_for_step(3, "/tmp/checkpoints/3")
