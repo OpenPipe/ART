@@ -3,6 +3,9 @@
 <a href="https://art.openpipe.ai"><picture>
 <img alt="ART logo" src="https://github.com/openpipe/art/raw/main/assets/ART_logo.png" width="160px">
 </picture></a>
+  <a href="https://gitcgr.com/openpipe/ART">
+    <img src="https://gitcgr.com/badge/openpipe/ART.svg" alt="gitcgr" />
+  </a>
 
 <p align="center">
   <h1>Agent Reinforcement Trainer</h1>
