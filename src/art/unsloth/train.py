@@ -313,7 +313,7 @@ def _canonicalize_upstream_metrics(metrics: dict[str, float]) -> dict[str, float
     }
 
 
-def _get_dtype_for_autocasting(trainer: "GRPOTrainer") -> torch.dtype:
+def _get_dtype_for_autocasting(model: torch.nn.Module) -> torch.dtype:
     if os.environ.get("UNSLOTH_FORCE_FLOAT32") == "1":
         return torch.float16
 
@@ -330,11 +330,11 @@ def _get_dtype_for_autocasting(trainer: "GRPOTrainer") -> torch.dtype:
             )
 
     dtype_numels: dict[torch.dtype, int] = defaultdict(int)
-    for param in trainer.model.parameters():
+    for param in model.parameters():
         if param.is_floating_point():
             dtype_numels[param.dtype] += param.numel()
 
-    assert dtype_numels, "Expected trainer.model to have floating-point parameters"
+    assert dtype_numels, "Expected model to have floating-point parameters"
     model_dtype, _ = max(dtype_numels.items(), key=lambda item: item[1])
     if model_dtype == torch.bfloat16:
         return torch.bfloat16
@@ -370,7 +370,8 @@ async def train(
 
 
 def get_compute_loss_fn(trainer: "GRPOTrainer") -> Callable[..., torch.Tensor]:
-    dtype_for_autocasting = _get_dtype_for_autocasting(trainer)
+    assert isinstance(trainer.model, torch.nn.Module)
+    dtype_for_autocasting = _get_dtype_for_autocasting(trainer.model)
 
     def compute_loss(
         model: "PeftModel",
