@@ -313,6 +313,37 @@ def _canonicalize_upstream_metrics(metrics: dict[str, float]) -> dict[str, float
     }
 
 
+def _get_dtype_for_autocasting(trainer: "GRPOTrainer") -> torch.dtype:
+    if os.environ.get("UNSLOTH_FORCE_FLOAT32") == "1":
+        return torch.float16
+
+    match os.environ.get("ACCELERATE_MIXED_PRECISION"):
+        case "fp16":
+            return torch.float16
+        case "bf16":
+            return torch.bfloat16
+        case None:
+            pass
+        case mixed_precision:
+            raise AssertionError(
+                f"Unsupported ACCELERATE_MIXED_PRECISION={mixed_precision!r}"
+            )
+
+    dtype_numels: dict[torch.dtype, int] = defaultdict(int)
+    for param in trainer.model.parameters():
+        if param.is_floating_point():
+            dtype_numels[param.dtype] += param.numel()
+
+    assert dtype_numels, "Expected trainer.model to have floating-point parameters"
+    model_dtype, _ = max(dtype_numels.items(), key=lambda item: item[1])
+    if model_dtype == torch.bfloat16:
+        return torch.bfloat16
+    if model_dtype in (torch.float16, torch.float32):
+        return torch.float16
+
+    raise AssertionError(f"Unsupported model dtype {model_dtype}")
+
+
 async def train(
     trainer: "GRPOTrainer",
     results_queue: asyncio.Queue[dict[str, float]],
@@ -339,6 +370,8 @@ async def train(
 
 
 def get_compute_loss_fn(trainer: "GRPOTrainer") -> Callable[..., torch.Tensor]:
+    dtype_for_autocasting = _get_dtype_for_autocasting(trainer)
+
     def compute_loss(
         model: "PeftModel",
         inputs: "TrainInputs",
@@ -378,18 +411,6 @@ def get_compute_loss_fn(trainer: "GRPOTrainer") -> Callable[..., torch.Tensor]:
             key: tensor.to(trainer.accelerator.device)  # type: ignore
             for key, tensor in inputs.items()
         }  # ty:ignore[invalid-assignment]
-
-        accelerate_mixed_precision = os.environ.get("ACCELERATE_MIXED_PRECISION")
-        force_float32 = os.environ.get("UNSLOTH_FORCE_FLOAT32")
-
-        if (
-            accelerate_mixed_precision is None
-            or accelerate_mixed_precision == "fp16"
-            or force_float32 == "1"
-        ):
-            dtype_for_autocasting = torch.float16
-        else:
-            dtype_for_autocasting = torch.bfloat16
 
         batch_size, seq_len = inputs["tokens"].size()
         attn_bias = calculate_attn_bias(
