@@ -25,7 +25,7 @@ backend = [
     "unsloth==2026.3.3",
     "unsloth-zoo==2026.3.1",
     "torch==2.10.0",
-    "torchao==0.15.0",
+    "torchao==0.16.0",
     "accelerate==1.7.0",
     "awscli>=1.38.1",
     "setuptools>=78.1.0",
