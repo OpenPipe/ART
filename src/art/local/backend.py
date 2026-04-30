@@ -105,6 +105,7 @@ class LocalBackend(Backend):
 
         # Other initialization
         self._services: dict[str, ModelService] = {}
+        self._monitor_tasks: dict[str, asyncio.Task[None]] = {}
         self._tokenizers: dict[str, PreTrainedTokenizerBase] = {}
         self._image_processors: dict[str, BaseImageProcessor | None] = {}
         self._requires_explicit_packed_sequence_length = False
@@ -188,7 +189,16 @@ class LocalBackend(Backend):
         """
         If running vLLM in a separate process, this will kill that process and close the communication threads.
         """
-        for service in self._services.values():
+        tasks = list(self._monitor_tasks.values())
+        for task in tasks:
+            task.cancel()
+        for task in tasks:
+            try:
+                await task
+            except (asyncio.CancelledError, Exception):
+                pass
+        self._monitor_tasks.clear()
+        for service in list(self._services.values()):
             aclose = getattr(service, "aclose", None)
             if aclose is None:
                 close = getattr(service, "close", None)
@@ -199,7 +209,10 @@ class LocalBackend(Backend):
             close_proxy(service)
 
     def _close(self) -> None:
-        for service in self._services.values():
+        for task in list(self._monitor_tasks.values()):
+            task.cancel()
+        self._monitor_tasks.clear()
+        for service in list(self._services.values()):
             close = getattr(service, "close", None)
             if close is not None:
                 close()
@@ -486,11 +499,14 @@ class LocalBackend(Backend):
         api_key = server_args.get("api_key") or "default"
 
         def done_callback(_: asyncio.Task[None]) -> None:
+            self._monitor_tasks.pop(model.name, None)
             close_proxy(self._services.pop(model.name))
 
-        asyncio.create_task(
+        task = asyncio.create_task(
             self._monitor_openai_server(model, base_url, api_key)
-        ).add_done_callback(done_callback)
+        )
+        task.add_done_callback(done_callback)
+        self._monitor_tasks[model.name] = task
 
         return base_url, api_key
 

@@ -88,3 +88,54 @@ async def test_monitor_openai_server_uses_health_probe_when_idle(
         "http://127.0.0.1:1234/metrics",
         "http://127.0.0.1:1234/health",
     ]
+
+
+@pytest.mark.asyncio
+async def test_close_cancels_monitor_tasks(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Monitor tasks should be cancelled during close() to avoid
+    ConnectionRefusedError after vLLM shuts down."""
+    backend = LocalBackend(path=str(tmp_path))
+
+    class _FakeService:
+        aclose_called = False
+
+        async def aclose(self) -> None:
+            self.aclose_called = True
+
+        async def vllm_engine_is_sleeping(self) -> bool:
+            return False
+
+    service = _FakeService()
+    backend._services["test-model"] = service  # type: ignore[index]
+
+    async def fake_sleep(_seconds: float) -> None:
+        await asyncio.sleep(0)  # yield control
+
+    monkeypatch.setattr("art.local.backend.asyncio.sleep", fake_sleep)
+    monkeypatch.setattr(
+        "art.local.backend.aiohttp.ClientSession",
+        lambda: _FakeSession([]),
+    )
+
+    model = TrainableModel(
+        name="test-model",
+        project="unit-tests",
+        base_model="test/model",
+        base_path=str(tmp_path),
+    )
+
+    task = asyncio.create_task(
+        backend._monitor_openai_server(model, "http://127.0.0.1:1234/v1", "default")
+    )
+    backend._monitor_tasks["test-model"] = task
+
+    # Let the monitor run one iteration
+    await asyncio.sleep(0)
+
+    await backend.close()
+
+    assert task.cancelled() or task.done()
+    assert len(backend._monitor_tasks) == 0

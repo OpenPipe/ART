@@ -115,6 +115,9 @@ class UnslothService:
     _vllm_host: str = "127.0.0.1"
     _vllm_port: int = 0
     _weight_transfer_group: Any = field(default=None, init=False, repr=False)
+    _server_task: asyncio.Task[None] | None = field(
+        default=None, init=False, repr=False
+    )
 
     @property
     def is_dedicated(self) -> bool:
@@ -139,6 +142,13 @@ class UnslothService:
         state = self.__dict__.get("_state")
         if isinstance(state, UnslothTrainContext):
             await state.stop_background_training()
+        if self._server_task is not None:
+            self._server_task.cancel()
+            try:
+                await self._server_task
+            except asyncio.CancelledError:
+                pass
+            self._server_task = None
         self.close()
 
     # =========================================================================
@@ -458,8 +468,11 @@ class UnslothService:
         )
 
     def close(self) -> None:
-        """Terminate vLLM subprocess if running."""
+        """Terminate vLLM subprocess and cancel server task if running."""
         self._weight_transfer_group = None
+        if self._server_task is not None:
+            self._server_task.cancel()
+            self._server_task = None
         if self._vllm_process is None:
             return
         self._vllm_process.terminate()
@@ -513,7 +526,7 @@ class UnslothService:
             lora_path=lora_path,
             config=config,
         )
-        await openai_server_task(
+        self._server_task = await openai_server_task(
             engine=await self.llm,
             config=server_config,
         )
