@@ -72,7 +72,8 @@ tinker = [
     "pillow",
     "pyarrow>=15.0.0",
     "pydantic>=2.12.5",
-    "tinker>=0.8.1",
+    "tinker-cookbook>=0.3.0,<0.4",
+    "tinker>=0.18.2,<0.19",
     "torch==2.10.0",
     "transformers==5.2.0",
     "uvicorn>=0.35.0",
@@ -123,7 +124,7 @@ select = ["I"]
 [tool.ruff.lint.isort]
 case-sensitive = false
 known-first-party = ["art"]
-known-third-party = ["tinker", "wandb"]
+known-third-party = ["tinker", "tinker_cookbook", "wandb"]
 force-sort-within-sections = true
 
 [tool.pytest.ini_options]
@@ -193,6 +194,7 @@ unused-ignore-comment = "ignore"
 allowed-unresolved-imports = [
     # tinker deps
     "tinker.**",
+    "tinker_cookbook.**",
     "datrie.**",
     # backend deps
     "accelerate.**",

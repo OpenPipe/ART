@@ -1,7 +1,7 @@
 def get_renderer_name(base_model: str) -> str:
     if base_model.startswith("meta-llama/"):
         return "llama3"
-    elif base_model.startswith("Qwen/Qwen3.5-"):
+    elif base_model.startswith("Qwen/Qwen3."):
         # print("Defaulting to Qwen3.5 renderer with thinking for", base_model)
         # print(renderer_name_message)
         return "qwen3_5_disable_thinking"

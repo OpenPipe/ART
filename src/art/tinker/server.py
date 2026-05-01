@@ -28,11 +28,11 @@ from openai.types.chat.completion_create_params import CompletionCreateParams
 from openai.types.completion_usage import CompletionUsage
 from pydantic import BaseModel, Field, SkipValidation, TypeAdapter
 import tinker
+from tinker_cookbook import renderers
+from tinker_cookbook.tokenizer_utils import get_tokenizer
 from transformers.tokenization_utils_base import BatchEncoding
 import uvicorn
 
-from art.tinker.cookbook_v import renderers
-from art.tinker.cookbook_v.tokenizer_utils import get_tokenizer
 from art.tinker.prefix_cache import LRUTrieCache
 from art.tinker.renderers import get_renderer_name
 from art.types import Message, Tools
@@ -76,7 +76,7 @@ def _normalize_qwen3_5_messages(
     base_model: str, messages: list[ChatCompletionMessageParam]
 ) -> list[dict[str, Any]]:
     normalized_messages = [cast(dict[str, Any], message) for message in messages]
-    if not base_model.startswith("Qwen/Qwen3.5"):
+    if not base_model.startswith("Qwen/Qwen3."):
         return normalized_messages
     for i, message in enumerate(normalized_messages):
         tool_calls = message.get("tool_calls")
@@ -111,6 +111,10 @@ def _normalize_qwen3_5_messages(
         if changed:
             normalized_messages[i] = {**message, "tool_calls": normalized_tool_calls}
     return normalized_messages
+
+
+def _chat_template_disables_thinking(base_model: str) -> bool:
+    return base_model.startswith("Qwen/Qwen3.")
 
 
 @dataclass
@@ -194,6 +198,10 @@ class OpenAICompatibleTinkerServer:
         async def metrics() -> str:
             # Minimal Prometheus-style metrics to satisfy the health monitor
             return "# Tinker service metrics\n"
+
+        @app.get("/health")
+        async def health() -> dict[str, str]:
+            return {"status": "ok"}
 
         @app.post("/v1/completions")
         async def completions() -> dict:
@@ -536,11 +544,20 @@ class OpenAICompatibleTinkerServerWorker:
         tools: list[ChatCompletionToolUnionParam] | None,
     ) -> list[int]:
         normalized_messages = _normalize_qwen3_5_messages(base_model, messages)
-        encoding = self._get_renderer(base_model).tokenizer.apply_chat_template(
-            cast(Any, normalized_messages),
-            tools=cast(Any, tools),
-            add_generation_prompt=True,
-        )
+        tokenizer = self._get_renderer(base_model).tokenizer
+        if _chat_template_disables_thinking(base_model):
+            encoding = tokenizer.apply_chat_template(
+                cast(Any, normalized_messages),
+                tools=cast(Any, tools),
+                add_generation_prompt=True,
+                enable_thinking=False,
+            )
+        else:
+            encoding = tokenizer.apply_chat_template(
+                cast(Any, normalized_messages),
+                tools=cast(Any, tools),
+                add_generation_prompt=True,
+            )
         if isinstance(encoding, BatchEncoding):
             return encoding.input_ids
         else:
@@ -625,7 +642,9 @@ class OpenAICompatibleTinkerServerWorker:
                         content=[
                             ChatCompletionTokenLogprob(
                                 token=f"token_id:{token}",
-                                bytes=list(renderer.tokenizer.decode(token).encode()),
+                                bytes=list(
+                                    cast(str, renderer.tokenizer.decode(token)).encode()
+                                ),
                                 logprob=logprob,
                                 top_logprobs=[],
                             )

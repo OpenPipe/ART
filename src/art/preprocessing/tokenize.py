@@ -18,6 +18,11 @@ from ..trajectories import History, Trajectory, TrajectoryGroup, get_messages
 ChatTemplateTool = dict[Any, Any] | Callable[..., Any]
 
 
+def _chat_template_disables_thinking(tokenizer: PreTrainedTokenizerBase) -> bool:
+    chat_template = tokenizer.chat_template
+    return isinstance(chat_template, str) and "enable_thinking" in chat_template
+
+
 def _normalize_tools_for_chat_template(tools: Any) -> list[ChatTemplateTool] | None:
     if tools is None:
         return None
@@ -281,6 +286,11 @@ def tokenize_trajectory(
             tools=tools,
             continue_final_message=True,
             tokenize=False,
+            **(
+                {"enable_thinking": False}
+                if _chat_template_disables_thinking(tokenizer)
+                else {}
+            ),  # type: ignore[arg-type]
         ),
     )
     original_token_ids = _apply_chat_template_token_ids(
@@ -288,6 +298,11 @@ def tokenize_trajectory(
         messages,
         tools=tools,
         continue_final_message=True,
+        **(
+            {"enable_thinking": False}
+            if _chat_template_disables_thinking(tokenizer)
+            else {}
+        ),
     )
     sentinel_token_id = max(set(range(tokenizer.vocab_size)) - set(original_token_ids))
     sentinel_token = tokenizer.decode(sentinel_token_id)
@@ -319,6 +334,11 @@ def tokenize_trajectory(
         token_template_messages,
         tools=tools,
         continue_final_message=True,
+        **(
+            {"enable_thinking": False}
+            if _chat_template_disables_thinking(tokenizer)
+            else {}
+        ),
     )
     assistant_mask: list[int] = [0] * len(token_ids)
     logprobs = [float("nan")] * len(token_ids)
@@ -377,7 +397,7 @@ def tokenize_trajectory(
                     for token_logprob in token_logprobs
                 )
             except (IndexError, ValueError):
-                token_ids[start:end] = [
+                token_ids[start:end] = [  # type: ignore[assignment]
                     token_id if token_id is not None else tokenizer.eos_token_id
                     for token_id in cast(
                         list[int],
@@ -385,7 +405,7 @@ def tokenize_trajectory(
                             [
                                 token_logprob.token or tokenizer.eos_token
                                 for token_logprob in token_logprobs
-                            ]
+                            ]  # type: ignore[arg-type]
                         ),
                     )
                 ]

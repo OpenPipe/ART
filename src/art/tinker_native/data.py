@@ -5,9 +5,8 @@ from typing import Any, Iterable, cast
 
 from openai.types.chat.chat_completion import Choice
 import tinker
+from tinker_cookbook import renderers
 import torch
-
-from art.tinker.cookbook_v import renderers
 
 from ..trajectories import History, Trajectory, TrajectoryGroup, get_messages
 from ..types import MessagesAndChoices

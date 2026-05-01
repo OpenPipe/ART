@@ -24,9 +24,8 @@ from openai.types.chat.chat_completion_token_logprob import ChatCompletionTokenL
 from openai.types.chat.completion_create_params import CompletionCreateParams
 from openai.types.completion_usage import CompletionUsage
 import tinker
+from tinker_cookbook import renderers, tokenizer_utils
 import uvicorn
-
-from art.tinker.cookbook_v import renderers, tokenizer_utils
 
 from .. import dev
 from ..backend import Backend
