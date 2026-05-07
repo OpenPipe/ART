@@ -26,7 +26,13 @@ from ..utils.convert_moe_lora import convert_checkpoint_if_needed
 from ..utils.get_model_step import get_step_from_dir
 from ..utils.network import find_free_tcp_port
 from ..utils.output_dirs import get_step_checkpoint_dir
-from ..vllm import get_llm, get_worker, openai_server_task, run_on_workers
+from ..vllm import (
+    get_llm,
+    get_worker,
+    openai_server_task,
+    register_lora_request,
+    run_on_workers,
+)
 from .train import (
     UnslothTrainContext,
     create_unsloth_train_context,
@@ -539,6 +545,22 @@ class UnslothService:
             return False
         return self._is_sleeping
 
+    async def _add_lora_adapter(
+        self, llm: AsyncLLM, step: int, checkpoint_dir: str
+    ) -> None:
+        lora_request = LoRARequest(
+            lora_name=f"{self.model_name}@{step}",
+            lora_int_id=self._next_lora_id(),
+            lora_path=checkpoint_dir,
+        )
+        added = await llm.add_lora(lora_request)
+        if not added:
+            raise RuntimeError(
+                f"Failed to add LoRA adapter for step {step} at {checkpoint_dir}"
+            )
+        register_lora_request(lora_request)
+        self._latest_step = step
+
     async def register_lora_for_step(self, step: int, checkpoint_dir: str) -> None:
         """Register a LoRA adapter for a specific checkpoint step.
         This is called when training is skipped but the checkpoint is renamed.
@@ -557,18 +579,7 @@ class UnslothService:
 
         llm = await self.llm
         await llm.pause_generation()
-        added = await llm.add_lora(
-            LoRARequest(
-                lora_name=f"{self.model_name}@{step}",
-                lora_int_id=self._next_lora_id(),
-                lora_path=checkpoint_dir,
-            )
-        )
-        if not added:
-            raise RuntimeError(
-                f"Failed to add LoRA adapter for step {step} at {checkpoint_dir}"
-            )
-        self._latest_step = step
+        await self._add_lora_adapter(llm, step, checkpoint_dir)
         await llm.resume_generation()
 
     async def train(
@@ -698,18 +709,7 @@ class UnslothService:
 
         # Add the new LoRA adapter
         # We keep old LoRAs loaded - vLLM will page them out as needed
-        added = await llm.add_lora(
-            LoRARequest(
-                lora_name=f"{self.model_name}@{new_step}",
-                lora_int_id=self._next_lora_id(),
-                lora_path=checkpoint_dir,
-            )
-        )
-        if not added:
-            raise RuntimeError(
-                f"Failed to add LoRA adapter for step {new_step} at {checkpoint_dir}"
-            )
-        self._latest_step = new_step
+        await self._add_lora_adapter(llm, new_step, checkpoint_dir)
 
         # Resume generation after LoRA add is complete
         await llm.resume_generation()
@@ -800,18 +800,7 @@ class UnslothService:
 
         # Add the new LoRA adapter
         new_step = int(os.path.basename(checkpoint_dir))
-        added = await llm.add_lora(
-            LoRARequest(
-                lora_name=f"{self.model_name}@{new_step}",
-                lora_int_id=self._next_lora_id(),
-                lora_path=checkpoint_dir,
-            )
-        )
-        if not added:
-            raise RuntimeError(
-                f"Failed to add LoRA adapter for step {new_step} at {checkpoint_dir}"
-            )
-        self._latest_step = new_step
+        await self._add_lora_adapter(llm, new_step, checkpoint_dir)
 
         # Resume generation after LoRA swap is complete
         await llm.resume_generation()

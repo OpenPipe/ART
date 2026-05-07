@@ -1,6 +1,7 @@
 """Unit tests for ART's vLLM patch contract."""
 
 import importlib
+from types import SimpleNamespace
 from typing import Any, cast
 
 import pytest
@@ -86,3 +87,17 @@ def test_patch_transformers_v5_compat_normalizes_rope_ignore_keys() -> None:
     )
 
     assert dummy.ignore_keys == {"mrope_section", "partial_rotary_factor"}
+
+
+def test_register_lora_request_updates_openai_serving_models() -> None:
+    server = cast(Any, importlib.import_module("art.vllm.server"))
+    original_serving_models = server._openai_serving_models
+    serving_models = SimpleNamespace(lora_requests={})
+    request = SimpleNamespace(lora_name="test-model@1")
+
+    try:
+        server._openai_serving_models = serving_models
+        server.register_lora_request(request)
+        assert serving_models.lora_requests == {"test-model@1": request}
+    finally:
+        server._openai_serving_models = original_serving_models

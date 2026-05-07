@@ -19,6 +19,11 @@ from ..dev.openai_server import OpenAIServerConfig
 _openai_serving_models: Any | None = None
 
 
+def register_lora_request(lora_request: Any) -> None:
+    if _openai_serving_models is not None:
+        _openai_serving_models.lora_requests[lora_request.lora_name] = lora_request
+
+
 async def openai_server_task(
     engine: EngineClient,
     config: OpenAIServerConfig,
@@ -80,8 +85,8 @@ async def openai_server_task(
                 load_inplace=getattr(lora_request, "load_inplace", False),
             )
         added = await add_lora(lora_request)
-        if added and _openai_serving_models is not None:
-            _openai_serving_models.lora_requests[lora_request.lora_name] = lora_request
+        if added:
+            register_lora_request(lora_request)
         return added
 
     engine.add_lora = _add_lora  # ty:ignore[invalid-assignment]

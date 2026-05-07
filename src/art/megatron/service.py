@@ -31,7 +31,7 @@ from ..utils.convert_moe_lora import convert_checkpoint_if_needed
 from ..utils.get_model_step import get_step_from_dir
 from ..utils.network import find_free_tcp_port
 from ..utils.output_dirs import get_step_checkpoint_dir
-from ..vllm import get_llm, openai_server_task, run_on_workers
+from ..vllm import get_llm, openai_server_task, register_lora_request, run_on_workers
 from .client import create_megatron_job_paths, stream_megatron_job, write_megatron_job
 from .jobs import (
     MegatronMergedTrainJob,
@@ -478,15 +478,15 @@ class MegatronService:
     async def _add_lora_aliases(
         self, llm: AsyncLLM, step: int, checkpoint_dir: str
     ) -> None:
-        added = await llm.add_lora(
-            LoRARequest(
-                lora_name=f"{self.model_name}@{step}",
-                lora_int_id=self._next_lora_id(),
-                lora_path=checkpoint_dir,
-            )
+        lora_request = LoRARequest(
+            lora_name=f"{self.model_name}@{step}",
+            lora_int_id=self._next_lora_id(),
+            lora_path=checkpoint_dir,
         )
+        added = await llm.add_lora(lora_request)
         if not added:
             raise RuntimeError(f"Failed to add LoRA adapter for step {step}")
+        register_lora_request(lora_request)
         self._latest_step = step
 
     async def register_lora_for_step(self, step: int, checkpoint_dir: str) -> None:

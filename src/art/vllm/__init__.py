@@ -18,6 +18,7 @@ from .patches import (
 from .server import (
     get_uvicorn_logging_config,
     openai_server_task,
+    register_lora_request,
     set_vllm_log_file,
 )
 
@@ -25,6 +26,7 @@ __all__ = [
     # Server
     "openai_server_task",
     "get_uvicorn_logging_config",
+    "register_lora_request",
     "set_vllm_log_file",
     # Engine
     "get_llm",
