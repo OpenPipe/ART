@@ -13,6 +13,9 @@ class TrainConfig(TypedDict, total=False):
 positive advantages. Defaults to 0.0 (perfectly balanced)."""
     allow_training_without_logprobs: bool
     epsilon: float  # clip epsilon, using the same name as TRL
+    normalize_by_length: bool
+    """When True (default), divides loss by response length. Set to False for \
+Dr. GRPO which removes length normalization bias."""
     epsilon_high: (
         float | None
     )  # asymmetric clip upper bound. Defaults to epsilon when None
