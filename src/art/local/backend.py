@@ -1467,6 +1467,25 @@ class LocalBackend(Backend):
 
         shutil.copytree(source_checkpoint_dir, dest_checkpoint_dir)
 
+        # Ensure the trainer picks up the forked LoRA weights.
+        #
+        # 1. Invalidate the _state cache so create_unsloth_train_context
+        #    re-initializes with the forked checkpoint path.
+        #
+        # 2. Store the forked checkpoint path so the first training call can
+        #    explicitly load the adapter weights via load_lora_adapter. This
+        #    is necessary because from_pretrained may set up the LoRA
+        #    architecture without loading the actual trained weights
+        #    (especially across precision mismatches).
+        service = await self._get_service(cast(TrainableModel, model))
+        if hasattr(service, "_state") and "_state" in service.__dict__:
+            del service.__dict__["_state"]
+            if verbose:
+                print(
+                    "Invalidated UnslothService _state cache to pick up forked checkpoint"
+                )
+        service._forked_checkpoint_dir = dest_checkpoint_dir  # type: ignore[union-attr]
+
         if verbose:
             print(
                 f"Successfully forked checkpoint from {from_model} (step {selected_step}) to {model.name}"

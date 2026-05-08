@@ -209,6 +209,7 @@ allowed-unresolved-imports = [
     "nbclient.**",
     "nbmake.**",
     "peft.**",
+    "safetensors.**",
     "pyarrow.**",
     "torch.**",
     "torchao.**",
