@@ -153,7 +153,7 @@ class OpenAICompatibleTinkerServer:
             for i in range(self.num_workers or self._default_num_workers())
         ]
         self._task = asyncio.create_task(self._run(host, port))
-        client = AsyncOpenAI(api_key="default", base_url=f"http://{host}:{port}/v1")
+        client = AsyncOpenAI(api_key="health-check", base_url=f"http://{host}:{port}/v1")
         start = time.time()
         while True:
             timeout = float(os.environ.get("ART_SERVER_TIMEOUT", 300.0))
