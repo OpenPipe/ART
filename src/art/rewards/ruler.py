@@ -88,7 +88,7 @@ async def ruler(
     message_lists: list[list[ChatCompletionMessageParam]],
     judge_model: str = "openai/o3",
     extra_litellm_params: dict | None = None,
-    rubric: str = DEFAULT_RUBRIC,
+    rubric: str | None = DEFAULT_RUBRIC,
     tools: list | None = None,
     *,
     debug: bool = False,
@@ -115,7 +115,8 @@ async def ruler(
             - "anthropic/claude-3-opus-20240229" - Alternative judge
         extra_litellm_params: Additional parameters to pass to LiteLLM completion.
             Can include temperature, max_tokens, etc.
-        rubric: The grading rubric. The default rubric works well for most tasks.
+        rubric: The grading rubric, or None to use DEFAULT_RUBRIC.
+            The default rubric works well for most tasks.
         tools: Optional list of tool definitions available to the agent. When provided,
             the judge will see which tools were available when evaluating tool usage.
         debug: If True, pretty-print the judge's reasoning to help understand scores.
@@ -136,6 +137,9 @@ async def ruler(
         >>> print(scores[0].score)  # Higher score for correct answer
         0.9
     """
+
+    if rubric is None:
+        rubric = DEFAULT_RUBRIC
 
     # Short-circuit for the trivial case
     if not message_lists:
@@ -265,7 +269,7 @@ async def ruler_score_group(
     group: art.TrajectoryGroup,
     judge_model: str = "openai/o3",
     extra_litellm_params: dict | None = None,
-    rubric: str = DEFAULT_RUBRIC,
+    rubric: str | None = DEFAULT_RUBRIC,
     *,
     swallow_exceptions: bool = False,
     debug: bool = False,
@@ -286,7 +290,8 @@ async def ruler_score_group(
         group: A TrajectoryGroup containing trajectories to score.
         judge_model: The model to use for judging. See `ruler` for options.
         extra_litellm_params: Additional parameters to pass to LiteLLM completion.
-        rubric: Custom rubric or use the default which works well for most tasks.
+        rubric: Custom rubric, or None to use DEFAULT_RUBRIC. The default works well
+            for most tasks.
         swallow_exceptions: If True, returns None on errors instead of raising.
             This is recommended for production to handle API failures gracefully.
         debug: If True, prints the judge's reasoning.
@@ -306,6 +311,9 @@ async def ruler_score_group(
 
     For complete documentation and examples, see: https://art.openpipe.ai/fundamentals/ruler
     """
+
+    if rubric is None:
+        rubric = DEFAULT_RUBRIC
 
     # Validate that we don't have additional histories (not yet supported)
     for traj in group.trajectories:
