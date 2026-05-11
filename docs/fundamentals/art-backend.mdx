@@ -55,6 +55,23 @@ backend = ServerlessBackend(
 
 As your training job progresses, `ServerlessBackend` automatically saves your LoRA checkpoints as W&B Artifacts and deploys them for production inference on W&B Inference.
 
+Each `backend.train(...)` call submits one remote training job. ART stores the
+job inputs and outputs in W&B so that every trained step has its own artifacts,
+metrics, and provenance. If your W&B user settings send Slack notifications
+when runs finish, that can produce one notification per training step in a loop
+such as:
+
+```python
+for step in range(num_steps):
+    groups = await art.gather_trajectory_groups(...)
+    result = await backend.train(model, groups, learning_rate=1e-5)
+```
+
+This is expected for the current serverless training lifecycle. To reduce alert
+noise, disable W&B "Run finished" notifications for the account or use a W&B
+account/team whose notification settings are dedicated to ART training jobs.
+ART still records checkpoints and provenance for each step.
+
 ### LocalBackend
 
 The `LocalBackend` class runs a vLLM server and either an Unsloth or torchtune instance on whatever machine your agent itself is executing. This is a good fit if you're already running your agent on a machine with a GPU.

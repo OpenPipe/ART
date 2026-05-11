@@ -8,6 +8,13 @@ icon: "chart-line"
 ART writes a metrics row every time you call `model.log(...)`. Those rows go to
 `history.jsonl` in the run directory and, if W&B logging is enabled, to W&B.
 
+Serverless training also creates W&B-backed artifacts and runs for each remote
+training job so checkpoints can be traced back to their inputs. If W&B "Run
+finished" notifications are enabled for your account, a multi-step
+`ServerlessBackend` training loop can therefore send one notification per
+`backend.train(...)` call. See [ART Backend](/fundamentals/art-backend#serverlessbackend)
+for the serverless lifecycle notes and alert workaround.
+
 Use this page for three things:
 
 - understand the metrics ART emits automatically
