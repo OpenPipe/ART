@@ -40,6 +40,20 @@ def _extract_step_from_wandb_artifact(artifact: "wandb.Artifact") -> int | None:
     return None
 
 
+def _wandb_checkpoint_collection_path(
+    *,
+    from_model: str,
+    from_project: str,
+    model_entity: str | None,
+    default_entity: str | None,
+    from_entity: str | None = None,
+) -> str:
+    resolved_entity = from_entity or model_entity or default_entity
+    if resolved_entity is None:
+        raise ValueError("A W&B entity is required to locate the source checkpoint")
+    return f"{resolved_entity}/{from_project}/{from_model}"
+
+
 _UPSTREAM_TRAIN_METRIC_KEYS = {
     "reward": "reward",
     "reward_std_dev": "reward_std_dev",
@@ -728,6 +742,7 @@ class ServerlessBackend(Backend):
         model: "Model",
         from_model: str,
         from_project: str | None = None,
+        from_entity: str | None = None,
         from_s3_bucket: str | None = None,
         not_after_step: int | None = None,
         verbose: bool = False,
@@ -746,6 +761,8 @@ class ServerlessBackend(Backend):
             model: The destination model to fork to.
             from_model: The name of the source model to fork from.
             from_project: The project of the source model. Defaults to model.project.
+            from_entity: Optional W&B entity for the source model. Defaults to the
+                destination model's entity, then the W&B default entity.
             from_s3_bucket: Optional S3 bucket to pull the checkpoint from.
             not_after_step: If provided, uses the latest checkpoint <= this step.
             verbose: Whether to print verbose output.
@@ -812,12 +829,17 @@ class ServerlessBackend(Backend):
         else:
             # Pull from W&B artifacts
             api = wandb.Api(api_key=self._client.api_key)  # ty:ignore[possibly-missing-attribute]
-            from_entity = model.entity or api.default_entity
 
             # Iterate all artifact versions to find the best step.
             # We avoid relying on the W&B `:latest` alias because it
             # may not correspond to the highest training step.
-            collection_path = f"{from_entity}/{from_project}/{from_model}"
+            collection_path = _wandb_checkpoint_collection_path(
+                from_model=from_model,
+                from_project=from_project,
+                from_entity=from_entity,
+                model_entity=model.entity,
+                default_entity=api.default_entity,
+            )
             versions = api.artifacts("lora", collection_path)
 
             best_step: int | None = None
