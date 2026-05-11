@@ -74,6 +74,8 @@ ART is an open-source RL framework that improves agent reliability by allowing L
 | **Summarizer (SFT + RL)** | [🏋️ Train model](https://colab.research.google.com/github/openpipe/art-notebooks/blob/main/examples/sft/sft-rl.ipynb)            | Train a document summarizer with SFT warmup then RL | [Link coming soon]                                                                                                                                                                                                          |
 | **SFT from a dataset** | [🏋️ Train model](https://colab.research.google.com/github/openpipe/art-notebooks/blob/main/examples/sft/train_from_file.ipynb)      | Fine-tune Qwen 3 30B on text-to-SQL from a dataset  | [Link coming soon]                                                                                                                                                                                                          |
 
+The ART-E LangGraph implementation is also available as a local, testable Python package in [`examples/art-e`](examples/art-e).
+
 ## 📰 ART News
 
 Explore our latest research and updates on building SOTA agents.

@@ -1,0 +1,31 @@
+[project]
+name = "art-e-example"
+version = "0.1.0"
+description = "ART-E email research agent example for OpenPipe ART"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "gql<4",
+    "langchain-core>=0.3.51",
+    "langgraph>=0.6.2",
+    "openpipe-art[backend,langgraph]",
+    "python-dotenv>=1.1.1",
+    "weave>=0.52.24",
+]
+
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["art_e*"]
+
+[tool.uv.sources]
+openpipe-art = { path = "../../", editable = true }
+
+[dependency-groups]
+dev = [
+    "pytest>=8.4.1",
+    "ruff>=0.14.8",
+]
