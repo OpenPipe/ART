@@ -5,7 +5,6 @@ from langchain_core.messages import HumanMessage, SystemMessage
 from langchain_core.tools import tool
 from langgraph.prebuilt import create_react_agent
 from pydantic import BaseModel
-import weave
 
 import art
 from art.langgraph import init_chat_model
@@ -13,6 +12,15 @@ from art.langgraph import init_chat_model
 from .email_tools import LocalInbox
 from .scoring import grade_answer
 from .types import FinalAnswer, Scenario
+
+try:
+    import weave
+except ImportError:
+
+    class weave:
+        @staticmethod
+        def op(func):
+            return func
 
 
 class EmailScenario(BaseModel):
