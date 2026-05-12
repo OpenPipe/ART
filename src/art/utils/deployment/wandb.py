@@ -32,6 +32,18 @@ WANDB_SUPPORTED_BASE_MODELS = [
     "Qwen/Qwen2.5-14B-Instruct",
 ]
 
+WANDB_BASE_MODEL_ALIASES = {
+    "unsloth/Meta-Llama-3.1-8B-Instruct": "meta-llama/Llama-3.1-8B-Instruct",
+    "meta-llama/Meta-Llama-3.1-8B-Instruct": "meta-llama/Llama-3.1-8B-Instruct",
+    "unsloth/Meta-Llama-3.1-70B-Instruct": "meta-llama/Llama-3.1-70B-Instruct",
+    "meta-llama/Meta-Llama-3.1-70B-Instruct": "meta-llama/Llama-3.1-70B-Instruct",
+}
+
+
+def get_wandb_base_model(base_model: str) -> str:
+    """Return the W&B inference base model id for compatible aliases."""
+    return WANDB_BASE_MODEL_ALIASES.get(base_model, base_model)
+
 
 def deploy_wandb(
     model: "TrainableModel",
@@ -54,7 +66,8 @@ def deploy_wandb(
     """
     import wandb
 
-    if model.base_model not in WANDB_SUPPORTED_BASE_MODELS:
+    wandb_base_model = get_wandb_base_model(model.base_model)
+    if wandb_base_model not in WANDB_SUPPORTED_BASE_MODELS:
         raise UnsupportedBaseModelDeploymentError(
             message=f"Base model {model.base_model} is not supported for serverless LoRA deployment by W&B. Supported models: {WANDB_SUPPORTED_BASE_MODELS}"
         )
@@ -77,7 +90,9 @@ def deploy_wandb(
         settings=wandb.Settings(api_key=os.environ["WANDB_API_KEY"]),
     )
     try:
-        metadata: dict[str, object] = {"wandb.base_model": model.base_model}
+        metadata: dict[str, object] = {"wandb.base_model": wandb_base_model}
+        if wandb_base_model != model.base_model:
+            metadata["source_base_model"] = model.base_model
         if config is not None:
             metadata["wandb.provenance"] = config.provenance
         artifact = wandb.Artifact(

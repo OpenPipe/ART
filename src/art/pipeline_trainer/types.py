@@ -12,7 +12,8 @@ ScalarMetadataValue = float | int | str | bool | None
 
 
 RolloutFn = Callable[
-    [art.TrainableModel, ScenarioT, ConfigT], Awaitable[TrajectoryGroup]
+    [art.TrainableModel, ScenarioT, ConfigT],
+    Awaitable[TrajectoryGroup | list[TrajectoryGroup]],
 ]
 
 SingleRolloutFn = Callable[

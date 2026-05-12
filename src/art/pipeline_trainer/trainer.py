@@ -80,6 +80,13 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
         adam_params: object | None = None,
         packed_sequence_length: int | None = None,
         max_steps: int | None = None,
+        # KL-penalized advantage adjustment
+        kl_penalty_coef: float = 0.0,
+        kl_penalty_reference_step: int | None = None,
+        kl_ref_adapter_path: str | None = None,
+        kl_window_size: int | None = None,
+        kl_window_base_step: int = 0,
+        kl_window_base_adapter_path: str | None = None,
         # Discard handling
         discard_queue_multiplier: int = 100,
         # Status output
@@ -90,6 +97,7 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
         eval_every_n_steps: int = 20,
         eval_at_start: bool = True,
         save_checkpoint: bool = True,
+        save_checkpoint_artifact: bool = False,
         # Resumption
         resume: bool = True,
     ) -> None:
@@ -109,10 +117,20 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
             raise ValueError("eval_every_n_steps must be >= 0")
         if max_steps is not None and max_steps < 0:
             raise ValueError("max_steps must be >= 0")
+        if kl_penalty_coef < 0:
+            raise ValueError("kl_penalty_coef must be >= 0")
+        if kl_penalty_reference_step is not None and kl_penalty_reference_step < 0:
+            raise ValueError("kl_penalty_reference_step must be >= 0")
+        if kl_window_size is not None and kl_window_size < 0:
+            raise ValueError("kl_window_size must be >= 0")
+        if kl_window_base_step < 0:
+            raise ValueError("kl_window_base_step must be >= 0")
         if log_interval_seconds <= 0:
             raise ValueError("log_interval_seconds must be > 0")
         if discard_queue_multiplier <= 0:
             raise ValueError("discard_queue_multiplier must be > 0")
+        if save_checkpoint_artifact and not save_checkpoint:
+            raise ValueError("save_checkpoint_artifact=True requires save_checkpoint=True")
         self.model = model
         self.backend = backend
         self.rollout_fn = rollout_fn
@@ -132,10 +150,17 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
         self.adam_params = adam_params
         self.packed_sequence_length = packed_sequence_length
         self.max_steps = max_steps
+        self.kl_penalty_coef = kl_penalty_coef
+        self.kl_penalty_reference_step = kl_penalty_reference_step
+        self.kl_ref_adapter_path = kl_ref_adapter_path
+        self.kl_window_size = kl_window_size
+        self.kl_window_base_step = kl_window_base_step
+        self.kl_window_base_adapter_path = kl_window_base_adapter_path
         self._status_log_interval_seconds = log_interval_seconds
         self.eval_every_n_steps = eval_every_n_steps
         self.eval_at_start = eval_at_start
         self.save_checkpoint = save_checkpoint
+        self.save_checkpoint_artifact = save_checkpoint_artifact
         self.resume = resume
         self.discard_queue_multiplier = discard_queue_multiplier
         self._discard_queue: list[TrajectoryGroup] = []
@@ -374,24 +399,32 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
                 token = self.model.activate_metrics_context("train")
                 rollout_started = time.monotonic()
                 try:
-                    group = await self.rollout_fn(self.model, scenario, self.config)
+                    result = await self.rollout_fn(self.model, scenario, self.config)
                 finally:
                     token.var.reset(token)
                 rollout_wall_s = time.monotonic() - rollout_started
-                if not isinstance(group, TrajectoryGroup):
+                groups = result if isinstance(result, list) else [result]
+                if not groups or not all(
+                    isinstance(group, TrajectoryGroup) for group in groups
+                ):
                     errored = True
                     continue
-                self._apply_scenario_metadata(group, scenario)
-                self._apply_policy_versions(
-                    group,
-                    initial_version=initial_version,
-                    final_version=self.state.policy_version,
-                )
-                if self.state.done:
-                    break
-                queue_wait_s = await self._put_output_group(group)
-                group.metadata[_ROLLOUT_WALL_TIME_KEY] = rollout_wall_s
-                group.metadata[_ACTOR_IDLE_TIME_KEY] = actor_idle_s + queue_wait_s
+                rollout_wall_per_group = rollout_wall_s / len(groups)
+                actor_idle_per_group = actor_idle_s / len(groups)
+                for group in groups:
+                    self._apply_scenario_metadata(group, scenario)
+                    self._apply_policy_versions(
+                        group,
+                        initial_version=initial_version,
+                        final_version=self.state.policy_version,
+                    )
+                    if self.state.done:
+                        break
+                    queue_wait_s = await self._put_output_group(group)
+                    group.metadata[_ROLLOUT_WALL_TIME_KEY] = rollout_wall_per_group
+                    group.metadata[_ACTOR_IDLE_TIME_KEY] = (
+                        actor_idle_per_group + queue_wait_s
+                    )
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
@@ -464,11 +497,24 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
                 }
                 if self.packed_sequence_length is not None:
                     train_kwargs["packed_sequence_length"] = self.packed_sequence_length
+                train_kwargs.update(
+                    self._backend_kl_train_kwargs(current_step=current_step)
+                )
                 result = await self.backend.train(
                     self.model,
                     batch,
                     **train_kwargs,
                 )
+                checkpoint_path = getattr(result, "checkpoint_path", None)
+                if (
+                    should_checkpoint
+                    and self.save_checkpoint_artifact
+                    and checkpoint_path is not None
+                ):
+                    self._save_checkpoint_artifact(
+                        checkpoint_path=checkpoint_path,
+                        step=result.step,
+                    )
             except Exception:
                 self._status.note_training_end()
                 raise
@@ -810,6 +856,53 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
             return False
         return (step - self.state.last_eval_step) >= self.eval_every_n_steps
 
+    def _backend_kl_train_kwargs(self, *, current_step: int) -> dict[str, Any]:
+        if self.kl_penalty_coef <= 0:
+            return {}
+
+        kwargs: dict[str, Any] = {"kl_penalty_coef": self.kl_penalty_coef}
+        if self.kl_ref_adapter_path is not None:
+            kwargs["kl_ref_adapter_path"] = self.kl_ref_adapter_path
+            return kwargs
+
+        if self.kl_penalty_reference_step is not None:
+            kwargs["kl_penalty_reference_step"] = self.kl_penalty_reference_step
+            return kwargs
+
+        if self.kl_window_size is None:
+            return kwargs
+
+        if self.kl_window_size == 0:
+            if self.kl_window_base_adapter_path is not None:
+                kwargs["kl_ref_adapter_path"] = self.kl_window_base_adapter_path
+            return kwargs
+
+        target_step = current_step - self.kl_window_size
+        if target_step <= self.kl_window_base_step:
+            reference_step = self.kl_window_base_step
+        elif self.eval_every_n_steps <= 0:
+            reference_step = target_step
+        else:
+            window_steps = (target_step - self.kl_window_base_step) // (
+                self.eval_every_n_steps
+            )
+            reference_step = (
+                self.kl_window_base_step + window_steps * self.eval_every_n_steps
+            )
+        kwargs["kl_penalty_reference_step"] = reference_step
+        return kwargs
+
+    def _save_checkpoint_artifact(self, *, checkpoint_path: str, step: int) -> None:
+        from art.utils.deployment import WandbDeploymentConfig, deploy_wandb
+
+        deploy_wandb(
+            model=self.model,
+            checkpoint_path=checkpoint_path,
+            step=step,
+            config=WandbDeploymentConfig(provenance=["local-rl"]),
+            verbose=True,
+        )
+
     def _read_pipeline_state(self) -> dict[str, Any]:
         state = self.model.read_state() or {}
         return state.get(PIPELINE_STATE_KEY, {})
@@ -829,6 +922,9 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
 
     async def _put_output_group(self, group: TrajectoryGroup) -> float:
         assert self._output_queue is not None
+        if group.metadata and group.metadata.get("skip_training"):
+            self._status.note_zero_variance_discarded(1)
+            return 0.0
         queue_wait_started = time.monotonic()
         while not self.state.done:
             try:

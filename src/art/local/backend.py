@@ -1467,6 +1467,31 @@ class LocalBackend(Backend):
 
         shutil.copytree(source_checkpoint_dir, dest_checkpoint_dir)
 
+        # Make the fork effective for already-created local services. The
+        # checkpoint copy alone updates disk, but Unsloth may already have a
+        # cached trainer and a running vLLM server pointed at the fresh step-0
+        # adapter.
+        service = await self._get_service(cast(TrainableModel, model))
+        if hasattr(service, "_state") and "_state" in service.__dict__:
+            del service.__dict__["_state"]
+            if verbose:
+                print("Invalidated service _state cache for forked checkpoint")
+        service._forked_checkpoint_dir = dest_checkpoint_dir  # type: ignore[attr-defined]
+
+        server_started = bool(getattr(service, "_vllm_process", None)) or bool(
+            getattr(service, "_server_task", None)
+        )
+        register_lora = getattr(service, "register_lora_for_step", None)
+        if server_started and callable(register_lora):
+            await register_lora(selected_step, dest_checkpoint_dir)
+            if verbose:
+                print(
+                    f"Registered forked checkpoint {model.name}@{selected_step} "
+                    "with running inference service"
+                )
+        elif hasattr(service, "_latest_step"):
+            service._latest_step = selected_step  # type: ignore[attr-defined]
+
         if verbose:
             print(
                 f"Successfully forked checkpoint from {from_model} (step {selected_step}) to {model.name}"

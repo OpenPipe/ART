@@ -15,6 +15,7 @@ from art.megatron import MegatronBackend
 from art.megatron.train import load_adapter_into_model
 from art.pipeline_trainer.trainer import PipelineTrainer
 from art.preprocessing.tokenize import TokenizedResult
+from art.utils.deployment.wandb import get_wandb_base_model
 from art.utils.output_dirs import get_model_dir
 
 
@@ -157,6 +158,80 @@ async def test_pipeline_trainer_uses_same_train_kwargs_for_local_backend(
         "save_checkpoint": False,
         "adam_params": None,
     }
+
+
+@pytest.mark.asyncio
+async def test_pipeline_trainer_saves_checkpoint_artifact_on_eval_step(
+    tmp_path: Path,
+) -> None:
+    model = TrainableModel(
+        name="pipeline-save-checkpoint-artifact",
+        project="pipeline-tests",
+        base_model="test-model",
+        base_path=str(tmp_path),
+    )
+    checkpoint_path = str(tmp_path / "checkpoint-1")
+    backend = MagicMock()
+    backend.train = AsyncMock(
+        return_value=SimpleNamespace(
+            step=1,
+            metrics={},
+            checkpoint_path=checkpoint_path,
+        )
+    )
+
+    trainer = _make_trainer(
+        model=model,
+        backend=backend,
+        eval_fn=AsyncMock(return_value=[]),
+        eval_every_n_steps=1,
+        save_checkpoint_artifact=True,
+    )
+    trainer._save_checkpoint_artifact = MagicMock()  # type: ignore[method-assign]
+    trainer._output_queue = asyncio.Queue()
+    await trainer._output_queue.put(_make_group([0.0, 1.0]))
+    await trainer._output_queue.put(None)
+
+    await trainer._training_stage()
+
+    assert backend.train.await_args.kwargs["save_checkpoint"] is True
+    trainer._save_checkpoint_artifact.assert_called_once_with(  # type: ignore[attr-defined]
+        checkpoint_path=checkpoint_path,
+        step=1,
+    )
+
+
+def test_pipeline_trainer_checkpoint_artifact_requires_checkpoint(
+    tmp_path: Path,
+) -> None:
+    model = TrainableModel(
+        name="pipeline-save-checkpoint-artifact-validation",
+        project="pipeline-tests",
+        base_model="test-model",
+        base_path=str(tmp_path),
+    )
+    backend = MagicMock()
+
+    with pytest.raises(
+        ValueError, match="save_checkpoint_artifact=True requires save_checkpoint=True"
+    ):
+        _make_trainer(
+            model=model,
+            backend=backend,
+            save_checkpoint=False,
+            save_checkpoint_artifact=True,
+        )
+
+
+def test_wandb_base_model_aliases_for_unsloth_llama() -> None:
+    assert (
+        get_wandb_base_model("unsloth/Meta-Llama-3.1-8B-Instruct")
+        == "meta-llama/Llama-3.1-8B-Instruct"
+    )
+    assert (
+        get_wandb_base_model("unsloth/Meta-Llama-3.1-70B-Instruct")
+        == "meta-llama/Llama-3.1-70B-Instruct"
+    )
 
 
 @pytest.mark.asyncio

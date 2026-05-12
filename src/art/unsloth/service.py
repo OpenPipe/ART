@@ -108,6 +108,7 @@ class UnslothService:
     output_dir: str
     _is_sleeping: bool = False
     _latest_step: int = 0
+    _forked_checkpoint_dir: str | None = None
     _lora_id_counter: int = 1  # Start from 1 since 0 is reserved
     # Dedicated mode subprocess state
     _vllm_process: subprocess.Popen | None = field(default=None, repr=False)  # type: ignore[type-arg]
@@ -571,6 +572,14 @@ class UnslothService:
         self._latest_step = step
         await llm.resume_generation()
 
+    async def _load_forked_checkpoint_if_needed(self) -> None:
+        forked_dir = self._forked_checkpoint_dir
+        if forked_dir is None:
+            return
+
+        self._forked_checkpoint_dir = None
+        await self._state.load_lora_adapter(forked_dir)
+
     async def train(
         self,
         disk_packed_tensors: DiskPackedTensors,
@@ -598,6 +607,8 @@ class UnslothService:
         verbose: bool = False,
     ) -> AsyncIterator[dict[str, float]]:
         """Train in dedicated mode — no sleep/wake, vLLM keeps running on separate GPU."""
+        await self._load_forked_checkpoint_if_needed()
+
         async for result in run_unsloth_rl_training(
             self._state,
             disk_packed_tensors=disk_packed_tensors,
@@ -662,6 +673,8 @@ class UnslothService:
 
         # Reload training model to GPU (after vLLM is asleep)
         self._state.reload_to_gpu()
+
+        await self._load_forked_checkpoint_if_needed()
 
         async for result in run_unsloth_rl_training(
             self._state,
