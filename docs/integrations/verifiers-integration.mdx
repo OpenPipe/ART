@@ -87,6 +87,19 @@ from art.verifiers import rollout_output_from_trajectory
 output = rollout_output_from_trajectory(trajectory)
 ```
 
+To validate 2-way portability for saved verifiers outputs, round-trip through
+ART and back to normalized verifiers-compatible output:
+
+```python
+from art.verifiers import normalize_verifiers_rollout_output
+
+normalized = normalize_verifiers_rollout_output(output)
+```
+
+The normalizer preserves reward, numeric metrics, tool definitions, logs,
+completion state, answer/stop metadata, and prompt/completion message shape
+while adding ART metadata to the optional trajectory column.
+
 ## Notes
 
 - `art.verifiers` does not import verifiers until you call a function that

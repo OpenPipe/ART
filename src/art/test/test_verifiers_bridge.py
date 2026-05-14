@@ -3,6 +3,8 @@ import types
 
 import art
 from art.verifiers import (
+    normalize_verifiers_rollout_output,
+    normalize_verifiers_rollout_outputs,
     rollout_output_from_trajectory,
     rollout_outputs_from_trajectory_group,
     rollout_with_verifiers_environment,
@@ -164,6 +166,60 @@ def test_rollout_outputs_from_trajectory_group_assigns_example_ids():
 
     assert [output["example_id"] for output in outputs] == [10, 11]
     assert [output["reward"] for output in outputs] == [1.0, 0.5]
+
+
+def test_normalize_verifiers_rollout_output_round_trips_through_art():
+    output = {
+        "example_id": 42,
+        "prompt": [{"role": "user", "content": "Use a tool"}],
+        "completion": [{"role": "assistant", "content": "done"}],
+        "reward": 0.25,
+        "metrics": {"score": 0.25, "label": "ignored"},
+        "logs": ["started", "scored"],
+        "answer": "done",
+        "stop_condition": "final_answer",
+        "is_completed": True,
+        "is_truncated": True,
+        "timing": {"total": 1.5},
+        "tool_defs": [
+            {
+                "name": "lookup",
+                "description": "Lookup records",
+                "parameters": {"type": "object", "properties": {}},
+            }
+        ],
+    }
+
+    normalized = normalize_verifiers_rollout_output(output)
+
+    assert normalized["example_id"] == 42
+    assert normalized["prompt"] == [{"role": "user", "content": "Use a tool"}]
+    assert normalized["completion"] == [{"role": "assistant", "content": "done"}]
+    assert normalized["reward"] == 0.25
+    assert normalized["metrics"]["score"] == 0.25
+    assert "label" not in normalized["metrics"]
+    assert normalized["logs"] == ["started", "scored"]
+    assert normalized["answer"] == "done"
+    assert normalized["stop_condition"] == "final_answer"
+    assert normalized["is_completed"] is True
+    assert normalized["is_truncated"] is True
+    assert normalized["timing"] == {"total": 1.5}
+    assert normalized["tool_defs"] == output["tool_defs"]
+    assert normalized["trajectory"][0]["extras"]["art_metadata"]["verifiers_example_id"] == 42
+
+
+def test_normalize_verifiers_rollout_outputs_handles_iterables():
+    outputs = normalize_verifiers_rollout_outputs(
+        [
+            {"example_id": 1, "prompt": "first", "completion": [{"role": "assistant", "content": "a"}], "reward": 1},
+            {"example_id": 2, "prompt": "second", "completion": [{"role": "assistant", "content": "b"}], "reward": 0},
+        ],
+        include_trajectory=False,
+    )
+
+    assert [output["example_id"] for output in outputs] == [1, 2]
+    assert "trajectory" not in outputs[0]
+    assert outputs[0]["completion"] == [{"role": "assistant", "content": "a"}]
 
 
 async def test_rollout_with_verifiers_environment_uses_art_model_client(monkeypatch):

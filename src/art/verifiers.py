@@ -119,6 +119,59 @@ def rollout_outputs_from_trajectory_group(
     ]
 
 
+def normalize_verifiers_rollout_output(
+    output: Mapping[str, Any],
+    *,
+    prompt_length: int | None = None,
+    include_trajectory: bool = True,
+) -> dict[str, Any]:
+    """Round-trip a verifiers output through ART and back to verifiers shape.
+
+    This is useful for portability checks and for tools that need a normalized
+    RolloutOutput-compatible payload after ART has inspected or transformed the
+    trajectory.
+    """
+
+    trajectory = trajectory_from_verifiers_rollout(output)
+    example_id_value = output.get("example_id")
+    example_id = example_id_value if isinstance(example_id_value, int) else 0
+    normalized = rollout_output_from_trajectory(
+        trajectory,
+        example_id=example_id,
+        prompt_length=prompt_length,
+        include_trajectory=include_trajectory,
+    )
+    if "timing" in output:
+        normalized["timing"] = deepcopy(output["timing"])
+    if "logs" in output:
+        normalized["logs"] = _string_list(output.get("logs"))
+    if "answer" in output:
+        normalized["answer"] = output.get("answer")
+    if "stop_condition" in output:
+        normalized["stop_condition"] = output.get("stop_condition")
+    normalized["is_completed"] = bool(output.get("is_completed", True))
+    normalized["is_truncated"] = bool(output.get("is_truncated", normalized["is_truncated"]))
+    return normalized
+
+
+def normalize_verifiers_rollout_outputs(
+    outputs: Iterable[Mapping[str, Any]],
+    *,
+    prompt_length: int | None = None,
+    include_trajectory: bool = True,
+) -> list[dict[str, Any]]:
+    """Normalize a collection of verifiers outputs through ART trajectories."""
+
+    return [
+        normalize_verifiers_rollout_output(
+            output,
+            prompt_length=prompt_length,
+            include_trajectory=include_trajectory,
+        )
+        for output in outputs
+    ]
+
+
 async def rollout_with_verifiers_environment(
     env: Any,
     model: Any,
