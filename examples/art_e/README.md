@@ -19,8 +19,22 @@ For the full ART-E research context, see the
 
 - `scenarios.py` defines inbox fixtures, search/read helpers, and answer
   scoring.
+- `evaluate.py` runs a deterministic no-model baseline over every local
+  scenario so contributors can verify the task contract without API keys.
 - `rollout.py` runs one multi-turn email-search trajectory.
 - `train.py` trains a small model with ART using the local scenarios.
+
+## Offline Evaluation
+
+Run the deterministic baseline before using a model:
+
+```bash
+python examples/art_e/evaluate.py
+```
+
+Expected output includes one line per scenario and an average reward. This
+checks that the fixture answers, reference message IDs, search helper, and
+reward function agree with each other.
 
 ## Run One Rollout
 

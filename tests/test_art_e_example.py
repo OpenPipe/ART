@@ -5,6 +5,7 @@ from examples.art_e.scenarios import (
     score_answer,
     search_emails,
 )
+from examples.art_e.evaluate import evaluate_all, scripted_retrieval_policy
 
 
 def test_search_emails_finds_matching_message() -> None:
@@ -39,3 +40,17 @@ def test_score_answer_rewards_answer_and_citation() -> None:
 
 def test_parse_json_command_ignores_invalid_json() -> None:
     assert parse_json_command("<search>{invalid}</search>", "search") is None
+
+
+def test_scripted_retrieval_policy_matches_expected_reference() -> None:
+    answer, references = scripted_retrieval_policy(SCENARIOS[0])
+
+    assert "Maya owns the quarterly budget deck" in answer
+    assert references == ("msg-budget-2",)
+
+
+def test_offline_evaluation_scores_all_scenarios() -> None:
+    results = evaluate_all()
+
+    assert len(results) == len(SCENARIOS)
+    assert all(result.reward == 1.0 for result in results)
