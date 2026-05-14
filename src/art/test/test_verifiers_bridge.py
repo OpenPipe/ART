@@ -1,5 +1,8 @@
+import inspect
 import sys
 import types
+
+import pytest
 
 import art
 from art.verifiers import (
@@ -220,6 +223,52 @@ def test_normalize_verifiers_rollout_outputs_handles_iterables():
     assert [output["example_id"] for output in outputs] == [1, 2]
     assert "trajectory" not in outputs[0]
     assert outputs[0]["completion"] == [{"role": "assistant", "content": "a"}]
+
+
+def test_real_verifiers_package_contract_if_installed():
+    verifiers = pytest.importorskip("verifiers")
+    client_module = pytest.importorskip(
+        "verifiers.clients.openai_chat_completions_client"
+    )
+    env_module = pytest.importorskip("verifiers.envs.environment")
+
+    assert hasattr(client_module, "OpenAIChatCompletionsClient")
+
+    rollout_params = inspect.signature(env_module.Environment.run_rollout).parameters
+    assert {"input", "client", "model", "sampling_args"} <= set(rollout_params)
+    assert {"max_retries", "state_columns"} <= set(rollout_params)
+
+    group_params = inspect.signature(env_module.Environment.run_group).parameters
+    assert {"group_inputs", "client", "model", "sampling_args"} <= set(group_params)
+    assert {"max_retries", "state_columns"} <= set(group_params)
+
+    output = verifiers.RolloutOutput(
+        example_id=7,
+        prompt=[{"role": "user", "content": "hi"}],
+        completion=[{"role": "assistant", "content": "hello"}],
+        reward=1.0,
+        timing={"total": 0.1},
+        is_completed=True,
+        is_truncated=False,
+        metrics={"score": 1.0},
+        answer="hello",
+        info={},
+        error=None,
+        stop_condition="final_answer",
+        trajectory=[],
+        tool_defs=[],
+        token_usage={},
+    )
+
+    trajectory = trajectory_from_verifiers_rollout(output)
+
+    assert trajectory.reward == 1.0
+    assert trajectory.metrics["score"] == 1.0
+    assert trajectory.metadata["verifiers_example_id"] == 7
+    assert trajectory.messages_and_choices == [
+        {"role": "user", "content": "hi"},
+        {"role": "assistant", "content": "hello"},
+    ]
 
 
 async def test_rollout_with_verifiers_environment_uses_art_model_client(monkeypatch):
