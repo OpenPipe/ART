@@ -101,6 +101,16 @@ def _runtime_python(runtime_dir: Path) -> Path:
     return runtime_dir / ".venv" / "bin" / "python"
 
 
+def _runtime_dir_from_bin(runtime_bin: Path) -> Path | None:
+    if (
+        runtime_bin.name == RUNTIME_SERVER
+        and runtime_bin.parent.name == "bin"
+        and runtime_bin.parent.parent.name == ".venv"
+    ):
+        return runtime_bin.parent.parent.parent
+    return None
+
+
 def _is_executable_file(path: Path) -> bool:
     return path.is_file() and os.access(path, os.X_OK)
 
@@ -347,6 +357,63 @@ def ensure_vllm_runtime() -> Path:
             manifest=manifest,
             manifest_hash=manifest_hash,
         )
+
+
+def _runtime_python_for_nccl_discovery() -> Path:
+    override = os.environ.get("ART_VLLM_RUNTIME_BIN")
+    if override:
+        runtime_bin = Path(shlex.split(override)[0]).expanduser().resolve()
+        runtime_dir = _runtime_dir_from_bin(runtime_bin)
+        if runtime_dir is None:
+            raise RuntimeError(
+                "Cannot infer vLLM runtime Python from ART_VLLM_RUNTIME_BIN. "
+                "Merged rollout weights require ART's source or managed vLLM runtime."
+            )
+        return _runtime_python(runtime_dir)
+
+    source_runtime_bin = _source_runtime_bin()
+    if source_runtime_bin.exists():
+        runtime_dir = _runtime_dir_from_bin(source_runtime_bin)
+        assert runtime_dir is not None
+        return _runtime_python(runtime_dir)
+
+    runtime_bin = ensure_vllm_runtime()
+    runtime_dir = _runtime_dir_from_bin(runtime_bin)
+    assert runtime_dir is not None
+    return _runtime_python(runtime_dir)
+
+
+def get_vllm_runtime_nccl_so_path() -> Path:
+    runtime_python = _runtime_python_for_nccl_discovery()
+    script = (
+        "from pathlib import Path\n"
+        "import importlib.util\n"
+        "spec = importlib.util.find_spec('nvidia.nccl')\n"
+        "if spec is None or spec.submodule_search_locations is None:\n"
+        "    raise SystemExit('vLLM runtime is missing nvidia-nccl-cu12')\n"
+        "package_dir = Path(next(iter(spec.submodule_search_locations)))\n"
+        "path = package_dir / 'lib' / 'libnccl.so.2'\n"
+        "if not path.exists():\n"
+        "    raise SystemExit(f'vLLM runtime is missing {path}')\n"
+        "print(path.resolve())\n"
+    )
+    result = subprocess.run(
+        [str(runtime_python), "-c", script],
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        output = (result.stdout + result.stderr)[-4000:]
+        raise RuntimeError(
+            "Failed to discover vLLM runtime NCCL library with "
+            f"{runtime_python}.\n{output}"
+        )
+    nccl_so_path = Path(result.stdout.strip()).resolve()
+    if not nccl_so_path.exists():
+        raise RuntimeError(
+            f"vLLM runtime reported a missing NCCL library: {nccl_so_path}"
+        )
+    return nccl_so_path
 
 
 def _runtime_command_prefix() -> list[str]:

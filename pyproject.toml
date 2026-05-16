@@ -39,7 +39,6 @@ backend = [
     "nbmake>=1.5.5",
     "gql<4",
     "nvidia-cudnn-frontend<1.21 ; sys_platform == 'linux'",
-    "nvidia-nccl-cu12==2.28.9 ; sys_platform == 'linux'",
     "nvidia-resiliency-ext<0.5 ; sys_platform == 'linux'",
 ]
 megatron = [
@@ -57,7 +56,6 @@ megatron = [
     "causal-conv1d @ https://github.com/Dao-AILab/causal-conv1d/releases/download/v1.6.1.post4/causal_conv1d-1.6.1%2Bcu12torch2.10cxx11abiTRUE-cp311-cp311-linux_x86_64.whl ; sys_platform == 'linux' and platform_machine == 'x86_64' and python_full_version < '3.12'",
     "mamba-ssm @ https://github.com/state-spaces/mamba/releases/download/v2.3.1/mamba_ssm-2.3.1%2Bcu12torch2.10cxx11abiTRUE-cp311-cp311-linux_x86_64.whl ; sys_platform == 'linux' and platform_machine == 'x86_64' and python_full_version < '3.12'",
     "nvidia-ml-py==13.580.82",
-    "nvidia-nccl-cu12==2.28.9 ; sys_platform == 'linux'",
     "nvidia-resiliency-ext<0.5 ; sys_platform == 'linux'",
     "ml-dtypes>=0.5.0 ; python_full_version < '3.13'",
 ]
@@ -76,7 +74,6 @@ tinker = [
     "pydantic>=2.12.5",
     "tinker-cookbook>=0.3.0,<0.4",
     "tinker>=0.18.2,<0.19",
-    "nvidia-nccl-cu12==2.28.9 ; sys_platform == 'linux'",
     "torch==2.10.0",
     "transformers==5.2.0",
     "uvicorn>=0.35.0",
@@ -151,7 +148,6 @@ required-version = ">=0.11.7"
 override-dependencies = [
     "flashinfer-python==0.6.1",
     "numpy<2",
-    "nvidia-nccl-cu12==2.28.9 ; sys_platform == 'linux'",
     "nvidia-resiliency-ext<0.5",
     "quack-kernels==0.2.5",
     "transformer-engine==2.11.0",

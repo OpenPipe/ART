@@ -24,7 +24,6 @@ resolution-markers = [
 overrides = [
     { name = "flashinfer-python", specifier = "==0.6.1" },
     { name = "numpy", specifier = "<2" },
-    { name = "nvidia-nccl-cu12", marker = "sys_platform == 'linux'", specifier = "==2.28.9" },
     { name = "nvidia-resiliency-ext", specifier = "<0.5" },
     { name = "quack-kernels", specifier = "==0.2.5" },
     { name = "transformer-engine", specifier = "==2.11.0" },
@@ -5187,11 +5186,10 @@ wheels = [
 
 [[package]]
 name = "nvidia-nccl-cu12"
-version = "2.28.9"
+version = "2.27.5"
 source = { registry = "https://pypi.org/simple" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/08/c4/120d2dfd92dff2c776d68f361ff8705fdea2ca64e20b612fab0fd3f581ac/nvidia_nccl_cu12-2.28.9-py3-none-manylinux_2_18_aarch64.whl", hash = "sha256:50a36e01c4a090b9f9c47d92cec54964de6b9fcb3362d0e19b8ffc6323c21b60", size = 296766525, upload-time = "2025-11-18T05:49:16.094Z" },
-    { url = "https://files.pythonhosted.org/packages/4a/4e/44dbb46b3d1b0ec61afda8e84837870f2f9ace33c564317d59b70bc19d3e/nvidia_nccl_cu12-2.28.9-py3-none-manylinux_2_18_x86_64.whl", hash = "sha256:485776daa8447da5da39681af455aa3b2c2586ddcf4af8772495e7c532c7e5ab", size = 296782137, upload-time = "2025-11-18T05:49:34.248Z" },
+    { url = "https://files.pythonhosted.org/packages/6e/89/f7a07dc961b60645dbbf42e80f2bc85ade7feb9a491b11a1e973aa00071f/nvidia_nccl_cu12-2.27.5-py3-none-manylinux2014_x86_64.manylinux_2_17_x86_64.whl", hash = "sha256:ad730cf15cb5d25fe849c6e6ca9eb5b76db16a80f13f425ac68d8e2e55624457", size = 322348229, upload-time = "2025-06-26T04:11:28.385Z" },
 ]
 
 [[package]]
@@ -5419,7 +5417,6 @@ backend = [
     { name = "nbclient" },
     { name = "nbmake" },
     { name = "nvidia-cudnn-frontend", marker = "sys_platform == 'linux'" },
-    { name = "nvidia-nccl-cu12", marker = "sys_platform == 'linux'" },
     { name = "nvidia-resiliency-ext" },
     { name = "peft" },
     { name = "pyarrow" },
@@ -5448,7 +5445,6 @@ megatron = [
     { name = "ml-dtypes", marker = "python_full_version < '3.13'" },
     { name = "numpy" },
     { name = "nvidia-ml-py" },
-    { name = "nvidia-nccl-cu12", marker = "sys_platform == 'linux'" },
     { name = "nvidia-resiliency-ext" },
     { name = "pybind11" },
     { name = "quack-kernels" },
@@ -5466,7 +5462,6 @@ tinker = [
     { name = "fastapi" },
     { name = "huggingface-hub" },
     { name = "numpy" },
-    { name = "nvidia-nccl-cu12", marker = "sys_platform == 'linux'" },
     { name = "pillow" },
     { name = "pyarrow" },
     { name = "pydantic" },
@@ -5526,9 +5521,6 @@ requires-dist = [
     { name = "numpy", marker = "extra == 'tinker'", specifier = "<2" },
     { name = "nvidia-cudnn-frontend", marker = "sys_platform == 'linux' and extra == 'backend'", specifier = "<1.21" },
     { name = "nvidia-ml-py", marker = "extra == 'megatron'", specifier = "==13.580.82" },
-    { name = "nvidia-nccl-cu12", marker = "sys_platform == 'linux' and extra == 'backend'", specifier = "==2.28.9" },
-    { name = "nvidia-nccl-cu12", marker = "sys_platform == 'linux' and extra == 'megatron'", specifier = "==2.28.9" },
-    { name = "nvidia-nccl-cu12", marker = "sys_platform == 'linux' and extra == 'tinker'", specifier = "==2.28.9" },
     { name = "nvidia-resiliency-ext", marker = "sys_platform == 'linux' and extra == 'backend'", specifier = "<0.5" },
     { name = "nvidia-resiliency-ext", marker = "sys_platform == 'linux' and extra == 'megatron'", specifier = "<0.5" },
     { name = "openai", specifier = ">=2.14.0" },
@@ -8880,7 +8872,7 @@ dependencies = [
     { name = "nvidia-cusolver-cu12", marker = "platform_machine == 'x86_64' and sys_platform == 'linux'" },
     { name = "nvidia-cusparse-cu12", marker = "platform_machine == 'x86_64' and sys_platform == 'linux'" },
     { name = "nvidia-cusparselt-cu12", marker = "platform_machine == 'x86_64' and sys_platform == 'linux'" },
-    { name = "nvidia-nccl-cu12", marker = "sys_platform == 'linux'" },
+    { name = "nvidia-nccl-cu12", marker = "platform_machine == 'x86_64' and sys_platform == 'linux'" },
     { name = "nvidia-nvjitlink-cu12", marker = "platform_machine == 'x86_64' and sys_platform == 'linux'" },
     { name = "nvidia-nvshmem-cu12", marker = "platform_machine == 'x86_64' and sys_platform == 'linux'" },
     { name = "nvidia-nvtx-cu12", marker = "platform_machine == 'x86_64' and sys_platform == 'linux'" },

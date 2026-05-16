@@ -32,6 +32,7 @@ from ..utils.output_dirs import get_step_checkpoint_dir
 from ..vllm_runtime import (
     VllmRuntimeLaunchConfig,
     build_vllm_runtime_server_cmd,
+    get_vllm_runtime_nccl_so_path,
     get_vllm_runtime_working_dir,
     wait_for_vllm_runtime,
 )
@@ -168,6 +169,7 @@ class MegatronService:
     _vllm_host: str = "127.0.0.1"
     _vllm_port: int = 0
     _vllm_api_key: str | None = None
+    _vllm_nccl_so_path: str | None = None
     _merged_weight_transfer_init_info: MergedWeightTransferInitInfo | None = None
     _lifecycle: ServiceLifecycle = field(
         default_factory=ServiceLifecycle,
@@ -365,11 +367,14 @@ class MegatronService:
     def _build_merged_weight_transfer_spec(self, step: int) -> MergedWeightTransferSpec:
         init_info = self._merged_weight_transfer_init_info
         assert init_info is not None
+        if self._vllm_nccl_so_path is None:
+            raise RuntimeError("vLLM runtime NCCL path is not initialized")
         return MergedWeightTransferSpec(
             init_info=init_info,
             vllm_base_url=self._vllm_base_url,
             served_model_name=f"{self.model_name}@{step}",
             api_key=self._vllm_api_key,
+            nccl_so_path=self._vllm_nccl_so_path,
         )
 
     def _resolve_active_lora_path(self) -> str:
@@ -430,6 +435,11 @@ class MegatronService:
         server_args = self._runtime_server_args(config)
         api_key = server_args.get("api_key")
         self._vllm_api_key = api_key if isinstance(api_key, str) else None
+        self._vllm_nccl_so_path = (
+            str(get_vllm_runtime_nccl_so_path())
+            if self.rollout_weights_mode == "merged"
+            else None
+        )
         cmd = build_vllm_runtime_server_cmd(
             VllmRuntimeLaunchConfig(
                 base_model=self.base_model,
@@ -958,6 +968,7 @@ class MegatronService:
             self._vllm_log_file.close()
             self._vllm_log_file = None
         self._vllm_log_path = None
+        self._vllm_nccl_so_path = None
         self._merged_weight_transfer_init_info = None
         self._loaded_adapter_steps.clear()
 

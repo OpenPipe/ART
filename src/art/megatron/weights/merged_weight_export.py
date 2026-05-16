@@ -292,6 +292,7 @@ def ensure_merged_weight_transfer_group(
             "master_address": spec.init_info.master_address,
             "master_port": spec.init_info.master_port,
             "world_size": spec.init_info.world_size,
+            "nccl_so_path": spec.nccl_so_path,
         }
         executor = ThreadPoolExecutor(max_workers=1)
         try:

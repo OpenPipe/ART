@@ -30,6 +30,7 @@ from ..utils.output_dirs import get_step_checkpoint_dir
 from ..vllm_runtime import (
     VllmRuntimeLaunchConfig,
     build_vllm_runtime_server_cmd,
+    get_vllm_runtime_nccl_so_path,
     get_vllm_runtime_working_dir,
     wait_for_vllm_runtime,
 )
@@ -134,6 +135,7 @@ class UnslothService:
     _vllm_host: str = "127.0.0.1"
     _vllm_port: int = 0
     _vllm_api_key: str | None = None
+    _vllm_nccl_so_path: str | None = None
     _weight_transfer_group: Any = field(default=None, init=False, repr=False)
     _lifecycle: ServiceLifecycle = field(
         default_factory=ServiceLifecycle,
@@ -237,6 +239,11 @@ class UnslothService:
         server_args = self._runtime_server_args(config)
         api_key = server_args.get("api_key")
         self._vllm_api_key = api_key if isinstance(api_key, str) else None
+        self._vllm_nccl_so_path = (
+            str(get_vllm_runtime_nccl_so_path())
+            if self.rollout_weights_mode == "merged"
+            else None
+        )
         cmd = build_vllm_runtime_server_cmd(
             VllmRuntimeLaunchConfig(
                 base_model=self.base_model,
@@ -360,6 +367,8 @@ class UnslothService:
                     "/get_world_size endpoint"
                 ) from exc
             inference_world_size = int(world_size_response.json()["world_size"])
+            if self._vllm_nccl_so_path is None:
+                raise RuntimeError("vLLM runtime NCCL path is not initialized")
 
             master_port = _find_free_tcp_port()
             init_info = {
@@ -383,6 +392,7 @@ class UnslothService:
                     "master_address": init_info["master_address"],
                     "master_port": init_info["master_port"],
                     "world_size": init_info["world_size"],
+                    "nccl_so_path": self._vllm_nccl_so_path,
                 },
             )
             remote_init_response = await remote_init_task
@@ -571,6 +581,7 @@ class UnslothService:
                 self._vllm_log_file.close()
                 self._vllm_log_file = None
             self._vllm_log_path = None
+            self._vllm_nccl_so_path = None
         finally:
             self._lifecycle.restore_parent_cleanup()
 

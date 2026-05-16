@@ -237,12 +237,9 @@ class LocalBackend(Backend):
         self,
         internal_config: dev.InternalModelConfig,
     ) -> ChatTemplateToolSchemaFormat:
-        return cast(
-            ChatTemplateToolSchemaFormat,
-            internal_config.get(
-                "chat_template_tool_schema_format",
-                self._default_chat_template_tool_schema_format,
-            ),
+        return internal_config.get(
+            "chat_template_tool_schema_format",
+            self._default_chat_template_tool_schema_format,
         )
 
     def __enter__(self) -> Self:

@@ -1,6 +1,7 @@
 import importlib.util
 import os
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -69,6 +70,38 @@ def test_build_runtime_server_cmd_honors_runtime_bin_override(monkeypatch) -> No
         )
     )
     assert command[:2] == ["/opt/art/bin/runtime", "--wrapped"]
+
+
+def test_get_vllm_runtime_nccl_so_path_queries_runtime_python(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.delenv("ART_VLLM_RUNTIME_BIN", raising=False)
+    runtime_root = tmp_path / "custom-runtime"
+    runtime_bin = runtime_root / ".venv" / "bin" / "art-vllm-runtime-server"
+    runtime_python = runtime_root / ".venv" / "bin" / "python"
+    runtime_bin.parent.mkdir(parents=True, exist_ok=True)
+    runtime_bin.write_text("#!/bin/sh\n", encoding="ascii")
+    runtime_python.write_text("#!/bin/sh\n", encoding="ascii")
+    nccl_so_path = tmp_path / "libnccl.so.2"
+    nccl_so_path.write_text("nccl\n", encoding="ascii")
+    seen: dict[str, object] = {}
+
+    def fake_run(command, *, capture_output: bool, text: bool):
+        seen["command"] = command
+        seen["capture_output"] = capture_output
+        seen["text"] = text
+        return SimpleNamespace(returncode=0, stdout=f"{nccl_so_path}\n", stderr="")
+
+    monkeypatch.setenv("ART_VLLM_RUNTIME_PROJECT_ROOT", str(runtime_root))
+    monkeypatch.setattr(runtime.subprocess, "run", fake_run)
+
+    assert runtime.get_vllm_runtime_nccl_so_path() == nccl_so_path.resolve()
+    command = seen["command"]
+    assert isinstance(command, list)
+    assert command[0] == str(runtime_python)
+    assert seen["capture_output"] is True
+    assert seen["text"] is True
 
 
 def test_cleanup_old_managed_runtimes_only_deletes_marked_venvs(

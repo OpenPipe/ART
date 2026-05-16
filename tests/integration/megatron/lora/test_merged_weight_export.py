@@ -20,6 +20,7 @@ def _spec() -> MergedWeightTransferSpec:
         ),
         vllm_base_url="http://runtime.test",
         served_model_name="model@7",
+        nccl_so_path="/runtime/libnccl.so.2",
     )
 
 
@@ -71,6 +72,7 @@ def test_ensure_merged_weight_transfer_group_rank_zero_initializes_runtime_and_t
                 "master_address": "127.0.0.1",
                 "master_port": 23456,
                 "world_size": 3,
+                "nccl_so_path": "/runtime/libnccl.so.2",
             },
         ),
     ]
