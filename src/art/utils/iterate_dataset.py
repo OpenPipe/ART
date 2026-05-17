@@ -62,8 +62,7 @@ def iterate_dataset(
     for epoch in range(num_epochs):
         # Create indices and shuffle deterministically based on epoch
         indices = list(range(dataset_size))
-        random.seed(epoch)  # Ensure shuffling is the same for a given epoch
-        random.shuffle(indices)
+        random.Random(epoch).shuffle(indices)
 
         for i in range(0, dataset_size, groups_per_step):
             epoch_step = i // groups_per_step
