@@ -16,6 +16,7 @@ class PipelineState:
     scenario_offset: int = 0
     total_scenarios_consumed: int = 0
     last_eval_step: int = 0
+    completed_eval_steps: set[int] = field(default_factory=set)
 
     # Metrics
     discarded_stale_groups: int = 0
