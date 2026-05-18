@@ -1,4 +1,7 @@
 from .checkpoint_retention import (
+    CHECKPOINT_CREATED_AT_METRIC,
+    CHECKPOINT_EVAL_COMPLETED_METRIC,
+    CHECKPOINT_SAVED_METRIC,
     CheckpointInfo,
     CheckpointRetentionContext,
     CheckpointRetentionStrategy,
@@ -9,6 +12,9 @@ from .trainer import PipelineTrainer, make_group_rollout_fn
 from .types import EvalFn, RolloutFn, ScenarioT, SingleRolloutFn
 
 __all__ = [
+    "CHECKPOINT_CREATED_AT_METRIC",
+    "CHECKPOINT_EVAL_COMPLETED_METRIC",
+    "CHECKPOINT_SAVED_METRIC",
     "CheckpointInfo",
     "CheckpointRetentionContext",
     "CheckpointRetentionStrategy",

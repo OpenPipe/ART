@@ -17,6 +17,8 @@ import art
 from art import TrajectoryGroup
 
 from .checkpoint_retention import (
+    CHECKPOINT_CREATED_AT_METRIC,
+    CHECKPOINT_EVAL_COMPLETED_METRIC,
     CheckpointInfo,
     CheckpointRetentionContext,
     CheckpointRetentionStrategy,
@@ -545,6 +547,7 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
                 current_step = result.step
                 self.state.policy_version = current_step
                 self.state.next_training_step = current_step
+                await self._log_checkpoint_saved(result)
                 await self._prune_model_adapters(current_step)
                 await self._run_checkpoint_retention(current_step)
 
@@ -733,6 +736,7 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
                     step=step,
                     metrics={"time/step_eval_s": eval_elapsed},
                 )
+            await self._log_checkpoint_eval_completed(step)
             eval_completed = True
         except asyncio.CancelledError:
             raise
@@ -907,6 +911,32 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
         }
         self.model.merge_state({PIPELINE_STATE_KEY: payload})
 
+    async def _log_checkpoint_saved(self, result: Any) -> None:
+        step = int(result.step)
+        checkpoint_path = getattr(result, "checkpoint_path", None)
+        path = (
+            Path(checkpoint_path)
+            if isinstance(checkpoint_path, str) and checkpoint_path
+            else Path(self.model._get_output_dir()) / "checkpoints" / f"{step:04d}"
+        )
+        if not path.exists():
+            return
+        await self.model.log(
+            metrics={
+                "saved": 1.0,
+                "created_at_unix": path.stat().st_ctime,
+            },
+            split="checkpoint",
+            step=step,
+        )
+
+    async def _log_checkpoint_eval_completed(self, step: int) -> None:
+        await self.model.log(
+            metrics={"eval_completed": 1.0},
+            split="checkpoint",
+            step=step,
+        )
+
     def _checkpoint_metrics_by_step(self) -> dict[int, dict[str, float]]:
         history_path = Path(self.model._get_output_dir()) / "history.jsonl"
         if not history_path.exists():
@@ -951,13 +981,24 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
                 continue
             step = int(path.name)
             stat = path.stat()
+            metrics = metrics_by_step.get(step, {})
+            created_at_unix = metrics.get(CHECKPOINT_CREATED_AT_METRIC)
+            created_at = (
+                datetime.fromtimestamp(created_at_unix, timezone.utc)
+                if created_at_unix is not None
+                else datetime.fromtimestamp(stat.st_ctime, timezone.utc)
+            )
             checkpoints.append(
                 CheckpointInfo(
                     step=step,
                     path=str(path),
-                    created_at=datetime.fromtimestamp(stat.st_ctime, timezone.utc),
-                    is_eval_step=step in self.state.completed_eval_steps,
-                    metrics=metrics_by_step.get(step, {}),
+                    created_at=created_at,
+                    is_eval_step=(
+                        step in self.state.completed_eval_steps
+                        or metrics.get(CHECKPOINT_EVAL_COMPLETED_METRIC, 0.0) > 0.0
+                        or any(key.startswith(("val/", "test/")) for key in metrics)
+                    ),
+                    metrics=metrics,
                 )
             )
         return sorted(checkpoints, key=lambda checkpoint: checkpoint.step)

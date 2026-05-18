@@ -347,6 +347,53 @@ class TestUnslothServiceMaxLoras:
 
         assert engine_args["max_loras"] == 8
 
+    @pytest.mark.asyncio
+    async def test_prune_loaded_adapters_unloads_non_retained_steps(
+        self, unsloth_service_class, monkeypatch
+    ):
+        """UnslothService should unload old vLLM LoRA adapters like MegatronService."""
+        httpx = pytest.importorskip("httpx")
+        UnslothService = unsloth_service_class
+        calls = []
+
+        class FakeResponse:
+            status_code = 200
+
+            def raise_for_status(self):
+                return None
+
+        class FakeAsyncClient:
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *_args):
+                return None
+
+            async def post(self, url, *, json, **_kwargs):
+                calls.append((url, json))
+                return FakeResponse()
+
+        monkeypatch.setattr(httpx, "AsyncClient", FakeAsyncClient)
+        service = UnslothService(
+            model_name="test-model",
+            base_model="meta-llama/Llama-3.1-8B",
+            config={"rollout_weights_mode": "lora"},
+            output_dir="/tmp/test",
+        )
+        service._vllm_port = 8000
+        service._latest_step = 3
+        service._loaded_adapter_steps.update({1, 2, 3})
+
+        await service.prune_loaded_adapters(retain_steps={2})
+
+        assert calls == [
+            (
+                "http://127.0.0.1:8000/v1/unload_lora_adapter",
+                {"lora_name": "test-model@1"},
+            )
+        ]
+        assert service._loaded_adapter_steps == {2, 3}
+
 
 # =============================================================================
 # Pipelined Training Usage Example

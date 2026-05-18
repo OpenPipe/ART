@@ -143,6 +143,11 @@ class UnslothService:
         repr=False,
     )
     _child_processes: ChildProcessSupervisor = field(init=False, repr=False)
+    _loaded_adapter_steps: set[int] = field(
+        default_factory=set,
+        init=False,
+        repr=False,
+    )
 
     def __post_init__(self) -> None:
         self._child_processes = ChildProcessSupervisor(self._on_child_process_exit)
@@ -552,7 +557,7 @@ class UnslothService:
         )
         async with httpx.AsyncClient() as client:
             response = await client.post(
-                f"http://{self._vllm_host}:{self._vllm_port}/v1/load_lora_adapter",
+                f"{self._vllm_base_url}/v1/load_lora_adapter",
                 json={
                     "lora_name": lora_name,
                     "lora_path": checkpoint_path,
@@ -566,6 +571,33 @@ class UnslothService:
             f"[DEDICATED] _reload_adapter DONE: lora_name={lora_name} "
             f"status={response.status_code}"
         )
+        self._latest_step = step
+        self._loaded_adapter_steps.add(step)
+
+    async def _unload_adapter(self, step: int) -> None:
+        import httpx
+
+        self._raise_if_child_failed()
+        async with httpx.AsyncClient() as client:
+            response = await client.post(
+                f"{self._vllm_base_url}/v1/unload_lora_adapter",
+                json={"lora_name": f"{self.model_name}@{step}"},
+                **self._runtime_request_kwargs(),
+                timeout=30.0,
+            )
+            if response.status_code == 404:
+                self._loaded_adapter_steps.discard(step)
+                return
+            response.raise_for_status()
+        self._loaded_adapter_steps.discard(step)
+
+    async def prune_loaded_adapters(self, *, retain_steps: set[int]) -> None:
+        if self.rollout_weights_mode != "lora" or self._vllm_port == 0:
+            return
+        for step in sorted(self._loaded_adapter_steps - retain_steps):
+            if step == self._latest_step:
+                continue
+            await self._unload_adapter(step)
 
     def close(self) -> None:
         """Terminate vLLM subprocess if running."""
@@ -582,6 +614,7 @@ class UnslothService:
                 self._vllm_log_file = None
             self._vllm_log_path = None
             self._vllm_nccl_so_path = None
+            self._loaded_adapter_steps.clear()
         finally:
             self._lifecycle.restore_parent_cleanup()
 
@@ -617,6 +650,8 @@ class UnslothService:
             port,
             config=config,
         )
+        if self.rollout_weights_mode == "lora":
+            self._loaded_adapter_steps.add(self._latest_step)
         try:
             if self.rollout_weights_mode == "merged":
                 _ = self._state

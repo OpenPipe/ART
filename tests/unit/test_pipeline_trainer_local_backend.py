@@ -1,4 +1,5 @@
 import asyncio
+from datetime import datetime, timezone
 import json
 from pathlib import Path
 from types import SimpleNamespace
@@ -14,7 +15,11 @@ from art.dev.model import InternalModelConfig
 from art.local import LocalBackend
 from art.megatron import MegatronBackend
 from art.megatron.train import load_adapter_into_model
-from art.pipeline_trainer import CheckpointRetentionContext
+from art.pipeline_trainer import (
+    CHECKPOINT_CREATED_AT_METRIC,
+    CHECKPOINT_EVAL_COMPLETED_METRIC,
+    CheckpointRetentionContext,
+)
 from art.pipeline_trainer.trainer import PipelineTrainer
 from art.preprocessing.tokenize import TokenizedResult
 from art.utils.output_dirs import get_model_dir
@@ -257,6 +262,11 @@ async def test_pipeline_trainer_checkpoint_retention_only_passes_unprotected_ste
             for row in [
                 {"step": 2, "val/reward": 1.0},
                 {"step": 2, "val/reward": 3.0},
+                {
+                    "step": 2,
+                    CHECKPOINT_CREATED_AT_METRIC: 123.0,
+                    CHECKPOINT_EVAL_COMPLETED_METRIC: 1.0,
+                },
                 {"step": 3, "val/reward": 10.0},
             ]
         )
@@ -286,6 +296,7 @@ async def test_pipeline_trainer_checkpoint_retention_only_passes_unprotected_ste
     assert [checkpoint.step for checkpoint in contexts[0].checkpoints] == [0, 1, 2]
     step_two = contexts[0].checkpoints[2]
     assert step_two.is_eval_step is True
+    assert step_two.created_at == datetime.fromtimestamp(123.0, timezone.utc)
     assert step_two.metrics["val/reward"] == 2.0
     backend._delete_checkpoint_files.assert_awaited_once_with(  # type: ignore[attr-defined]
         model,
@@ -320,6 +331,37 @@ async def test_pipeline_trainer_checkpoint_retention_honors_interval(
     await trainer._run_checkpoint_retention(4)
 
     backend._delete_checkpoint_files.assert_not_awaited()  # type: ignore[attr-defined]
+
+
+@pytest.mark.asyncio
+async def test_pipeline_trainer_logs_checkpoint_retention_metadata(
+    tmp_path: Path,
+) -> None:
+    model = TrainableModel(
+        name="pipeline-checkpoint-retention-metadata",
+        project="pipeline-tests",
+        base_model="test-model",
+        base_path=str(tmp_path),
+        report_metrics=[],
+    )
+    checkpoint_path = Path(model._get_output_dir()) / "checkpoints" / "0001"
+    checkpoint_path.mkdir(parents=True)
+    trainer = _make_trainer(model=model, backend=MagicMock())
+
+    await trainer._log_checkpoint_saved(
+        SimpleNamespace(step=1, checkpoint_path=str(checkpoint_path))
+    )
+    await trainer._log_checkpoint_eval_completed(1)
+
+    rows = [
+        json.loads(line)
+        for line in (Path(model._get_output_dir()) / "history.jsonl")
+        .read_text()
+        .splitlines()
+    ]
+    assert rows[0]["checkpoint/saved"] == 1.0
+    assert rows[0][CHECKPOINT_CREATED_AT_METRIC] > 0.0
+    assert rows[1][CHECKPOINT_EVAL_COMPLETED_METRIC] == 1.0
 
 
 def _make_tokenized_result(

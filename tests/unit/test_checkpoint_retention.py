@@ -39,6 +39,20 @@ def test_keep_recent_and_top_deletes_everything_else() -> None:
     assert set(strategy(context)) == {0, 1, 2}
 
 
+def test_keep_recent_and_top_uses_metric_presence_for_legacy_history() -> None:
+    strategy = keep_recent_and_top(recent=0, top=1, metric="val/reward")
+    context = CheckpointRetentionContext(
+        current_step=3,
+        checkpoints=[
+            _checkpoint(0),
+            _checkpoint(1, reward=0.9),
+            _checkpoint(2, reward=0.2),
+        ],
+    )
+
+    assert set(strategy(context)) == {0, 2}
+
+
 def test_keep_recent_and_top_handles_zero_limits() -> None:
     strategy = keep_recent_and_top(recent=0, top=0)
     context = CheckpointRetentionContext(

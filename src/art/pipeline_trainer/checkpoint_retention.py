@@ -5,6 +5,10 @@ from datetime import datetime
 
 from pydantic import BaseModel, Field
 
+CHECKPOINT_CREATED_AT_METRIC = "checkpoint/created_at_unix"
+CHECKPOINT_EVAL_COMPLETED_METRIC = "checkpoint/eval_completed"
+CHECKPOINT_SAVED_METRIC = "checkpoint/saved"
+
 
 class CheckpointInfo(BaseModel):
     step: int
@@ -49,7 +53,7 @@ def keep_recent_and_top(
         ranked = [
             checkpoint
             for checkpoint in context.checkpoints
-            if checkpoint.is_eval_step and metric in checkpoint.metrics
+            if metric in checkpoint.metrics
         ]
         ranked.sort(key=lambda item: (item.metrics[metric], item.step), reverse=True)
         keep_steps.update(checkpoint.step for checkpoint in ranked[:top])
@@ -59,6 +63,9 @@ def keep_recent_and_top(
 
 
 __all__ = [
+    "CHECKPOINT_CREATED_AT_METRIC",
+    "CHECKPOINT_EVAL_COMPLETED_METRIC",
+    "CHECKPOINT_SAVED_METRIC",
     "CheckpointInfo",
     "CheckpointRetentionContext",
     "CheckpointRetentionStrategy",
