@@ -34,9 +34,7 @@ class TrajectoryScore(BaseModel):
 class Response(BaseModel):
     """Response format expected from the LLM judge."""
 
-    scores: list[TrajectoryScore] = Field(
-        description="The scores for each trajectory."
-    )
+    scores: list[TrajectoryScore] = Field(description="The scores for each trajectory.")
 
 
 DEFAULT_RUBRIC = dedent(

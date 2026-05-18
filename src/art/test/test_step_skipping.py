@@ -32,6 +32,7 @@ BASE_TRAJECTORY = Trajectory(
     reward=1.0,
 )
 
+
 async def test_step_skipping():
     """Test that step counting works correctly when training is skipped."""
 

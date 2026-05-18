@@ -245,9 +245,6 @@ class TinkerNativeBackend(Backend):
         adam_params: tinker.AdamParams | None = None,
         **kwargs: Any,
     ) -> TrainResult:
-        if kwargs:
-            unexpected = ", ".join(sorted(kwargs))
-            raise TypeError(f"Unexpected training kwargs: {unexpected}")
         state = self._model_state[model.name]
         groups_list = list(trajectory_groups)
         summary = summarize_trajectory_groups(groups_list)
