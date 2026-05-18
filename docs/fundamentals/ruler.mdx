@@ -275,7 +275,8 @@ groups = await art.gather_trajectory_groups(
 )
 
 # Train on the judged groups
-await model.train(groups)
+result = await backend.train(model, groups)
+await model.log(groups, metrics=result.metrics, step=result.step, split="train")
 ```
 
 The `swallow_exceptions=True` parameter is recommended in production to handle judge API failures gracefully - groups that fail to be judged are simply filtered out rather than crashing the training loop.

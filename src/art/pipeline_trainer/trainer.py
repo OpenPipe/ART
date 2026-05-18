@@ -24,7 +24,7 @@ _ACTOR_IDLE_TIME_KEY = "_art_actor_idle_s"
 def _to_async_iterator(iterable: Iterable[T] | AsyncIterator[T]) -> AsyncIterator[T]:
     """Convert a sync Iterable to an AsyncIterator, or pass through if already async."""
     if isinstance(iterable, AsyncIterator):
-        return iterable
+        return cast(AsyncIterator[T], iterable)
 
     async def _iter():
         for item in iterable:

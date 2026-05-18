@@ -72,12 +72,10 @@ for _step in range(await model.get_step(), TRAINING_STEPS):
         ),
         pbar_desc=f"gather(train:{step})",
     )
-    # trains model and automatically persists each LoRA as a W&B Artifact
+    # trains model and persists each LoRA as a W&B Artifact
     # ~120MB per step
-    await model.train(
-        train_groups,
-        config=art.TrainConfig(learning_rate=5e-5),
-    )
+    result = await backend.train(model, train_groups, learning_rate=5e-5)
+    await model.log(train_groups, metrics=result.metrics, step=result.step, split="train")
 
 # ~6GB of storage used by checkpoints
 ```
@@ -96,12 +94,10 @@ for _step in range(await model.get_step(), TRAINING_STEPS):
         ),
         pbar_desc=f"gather(train:{step})",
     )
-    # trains model and automatically persists each LoRA as a W&B Artifact
+    # trains model and persists each LoRA as a W&B Artifact
     # ~120MB per step
-    await model.train(
-        train_groups,
-        config=art.TrainConfig(learning_rate=5e-5),
-    )
+    result = await backend.train(model, train_groups, learning_rate=5e-5)
+    await model.log(train_groups, metrics=result.metrics, step=result.step, split="train")
     # clear all but the most recent and best-performing checkpoint on the train/reward metric
     await model.delete_checkpoints(best_checkpoint_metric="train/reward")
 

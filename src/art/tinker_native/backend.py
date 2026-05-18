@@ -38,7 +38,7 @@ from ..model import Model, TrainableModel
 from ..tinker.backend import get_renderer_name
 from ..tinker.server import get_free_port
 from ..trajectories import Trajectory, TrajectoryGroup
-from ..types import TrainConfig, TrainResult, TrainSFTConfig
+from ..types import TrainResult, TrainSFTConfig
 from ..utils.output_dirs import get_model_dir
 from ..utils.trajectory_migration import auto_migrate_on_register
 from .data import (
@@ -354,20 +354,6 @@ class TinkerNativeBackend(Backend):
         metrics["time/step_trainer_s"] = time.monotonic() - trainer_started
 
         return TrainResult(step=state.current_step, metrics=metrics)
-
-    async def _train_model(
-        self,
-        model: TrainableModel,
-        trajectory_groups: list[TrajectoryGroup],
-        config: TrainConfig,
-        dev_config: dev.TrainConfig,
-        verbose: bool = False,
-    ) -> AsyncIterator[dict[str, float]]:
-        raise NotImplementedError(
-            "TinkerNativeBackend does not support TrainableModel.train(). "
-            "Use TinkerNativeBackend.train() through PipelineTrainer instead."
-        )
-        yield {}
 
     async def _train_sft(
         self,

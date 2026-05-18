@@ -222,7 +222,8 @@ async def main():
                 for scenario in scenarios
             ]
         )
-        await model.train(train_groups)
+        result = await backend.train(model, train_groups)
+        await model.log(train_groups, metrics=result.metrics, step=result.step, split="train")
 ```
 
 This works because both SFT and RL train the same LoRA adapter. After SFT completes, RL continues from the updated weights.
