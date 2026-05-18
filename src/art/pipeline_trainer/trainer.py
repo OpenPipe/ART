@@ -19,6 +19,7 @@ from art import TrajectoryGroup
 from .checkpoint_retention import (
     CHECKPOINT_CREATED_AT_METRIC,
     CHECKPOINT_EVAL_COMPLETED_METRIC,
+    CHECKPOINT_SAVED_METRIC,
     CheckpointInfo,
     CheckpointRetentionContext,
     CheckpointRetentionStrategy,
@@ -911,6 +912,24 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
         }
         self.model.merge_state({PIPELINE_STATE_KEY: payload})
 
+    def _log_checkpoint_history(self, step: int, metrics: dict[str, float]) -> None:
+        row = {
+            (key if key.startswith("checkpoint/") else f"checkpoint/{key}"): value
+            for key, value in metrics.items()
+            if value == value
+        }
+        if not row:
+            return
+        row["training_step"] = step
+        row["time/wall_clock_sec"] = time.time() - self.model._run_start_time
+        row["step"] = step
+        row["recorded_at"] = datetime.now().isoformat()
+
+        output_dir = self.model._get_output_dir()
+        os.makedirs(output_dir, exist_ok=True)
+        with open(Path(output_dir) / "history.jsonl", "a", encoding="utf-8") as f:
+            f.write(json.dumps(row) + "\n")
+
     async def _log_checkpoint_saved(self, result: Any) -> None:
         step = int(result.step)
         checkpoint_path = getattr(result, "checkpoint_path", None)
@@ -921,20 +940,18 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
         )
         if not path.exists():
             return
-        await self.model.log(
-            metrics={
-                "saved": 1.0,
-                "created_at_unix": path.stat().st_ctime,
+        self._log_checkpoint_history(
+            step,
+            {
+                CHECKPOINT_SAVED_METRIC: 1.0,
+                CHECKPOINT_CREATED_AT_METRIC: path.stat().st_ctime,
             },
-            split="checkpoint",
-            step=step,
         )
 
     async def _log_checkpoint_eval_completed(self, step: int) -> None:
-        await self.model.log(
-            metrics={"eval_completed": 1.0},
-            split="checkpoint",
-            step=step,
+        self._log_checkpoint_history(
+            step,
+            {CHECKPOINT_EVAL_COMPLETED_METRIC: 1.0},
         )
 
     def _checkpoint_metrics_by_step(self) -> dict[int, dict[str, float]]:

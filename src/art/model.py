@@ -132,7 +132,6 @@ METRIC_SECTIONS = frozenset(
         "costs",
         "time",
         "data",
-        "checkpoint",
     }
 )
 METRIC_SPLITS = frozenset({"train", "val", "test"})
@@ -618,7 +617,6 @@ class Model(
             run.define_metric("costs/*", step_metric="training_step")
             run.define_metric("time/*", step_metric="training_step")
             run.define_metric("data/*", step_metric="training_step")
-            run.define_metric("checkpoint/*", step_metric="training_step")
             run.define_metric("train/*", step_metric="training_step")
             run.define_metric("val/*", step_metric="training_step")
             run.define_metric("test/*", step_metric="training_step")

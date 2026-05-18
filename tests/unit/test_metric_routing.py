@@ -24,6 +24,7 @@ class TestMetricRoutingBaseline:
             {
                 "reward/mean": 0.9,
                 "custom": 1.0,
+                "checkpoint/foo": 1.5,
                 "rewardish/value": 2.0,
             },
             split="train",
@@ -36,6 +37,7 @@ class TestMetricRoutingBaseline:
 
         assert entry["reward/mean"] == 0.9
         assert entry["train/custom"] == 1.0
+        assert entry["train/checkpoint/foo"] == 1.5
         assert entry["train/rewardish/value"] == 2.0
         assert entry["training_step"] == 7
         assert entry["time/wall_clock_sec"] >= 0
