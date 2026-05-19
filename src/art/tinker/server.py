@@ -113,10 +113,6 @@ def _normalize_qwen3_dot_messages(
     return normalized_messages
 
 
-def _chat_template_disables_thinking(base_model: str) -> bool:
-    return is_qwen3_dot_family_model(base_model)
-
-
 @dataclass
 class OpenAICompatibleTinkerServer:
     host: str | None = None
