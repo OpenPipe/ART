@@ -1,7 +1,6 @@
-import json
 from pathlib import Path
 import socket
-from typing import Any, AsyncIterator
+from typing import Any
 
 from dotenv import load_dotenv
 import typer
@@ -233,7 +232,7 @@ def run(host: str = "0.0.0.0", port: int = 7999) -> None:
     from contextlib import asynccontextmanager
 
     from fastapi import Body, FastAPI, Request
-    from fastapi.responses import JSONResponse, StreamingResponse
+    from fastapi.responses import JSONResponse
     import pydantic
     import uvicorn
 
@@ -242,7 +241,6 @@ def run(host: str = "0.0.0.0", port: int = 7999) -> None:
     from .local import LocalBackend
     from .model import Model, TrainableModel
     from .trajectories import TrajectoryGroup
-    from .types import TrainConfig
 
     # check if port is available
     def is_port_available(port: int) -> bool:
@@ -301,22 +299,6 @@ def run(host: str = "0.0.0.0", port: int = 7999) -> None:
         return await backend._prepare_backend_for_training(model, config)
 
     # Note: /_log endpoint removed - logging now handled by frontend (Model.log())
-
-    @app.post("/_train_model")
-    async def _train_model(
-        model: TrainableModel,
-        trajectory_groups: list[TrajectoryGroup],
-        config: TrainConfig,
-        dev_config: dev.TrainConfig,
-        verbose: bool = Body(False),
-    ) -> StreamingResponse:
-        async def stream() -> AsyncIterator[str]:
-            async for result in backend._train_model(
-                model, trajectory_groups, config, dev_config, verbose
-            ):
-                yield json.dumps(result) + "\n"
-
-        return StreamingResponse(stream())
 
     # Wrap in function with Body(...) to ensure FastAPI correctly interprets
     # all parameters as body parameters

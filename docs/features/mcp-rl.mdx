@@ -75,10 +75,8 @@ scored_groups = [
     for group in groups
 ]
 
-await model.train(
-    scored_groups,
-    config=art.TrainConfig(learning_rate=1e-5),
-)
+result = await backend.train(model, scored_groups, learning_rate=1e-5)
+await model.log(scored_groups, metrics=result.metrics, step=result.step, split="train")
 ```
 
 The model learns from RULER feedback using reinforcement learning, improving its ability to select appropriate tools, use correct parameters, chain tools effectively, and handle failures gracefully.
@@ -143,10 +141,8 @@ scored_groups = [
 ]
 
 # Train the model
-await model.train(
-    scored_groups,
-    config=art.TrainConfig(learning_rate=1e-5),
-)
+result = await backend.train(model, scored_groups, learning_rate=1e-5)
+await model.log(scored_groups, metrics=result.metrics, step=result.step, split="train")
 ```
 
 ### Example Use Cases

@@ -40,12 +40,12 @@ This sequence-level approach makes GSPO more robust to noise and eliminates the 
 GSPO can be configured using the `importance_sampling_level` parameter when training with ART:
 
 ```python
-model.train(
+result = await backend.train(
+    model,
     trajectory_groups,
-    _config=art.dev.TrainConfig(
-        importance_sampling_level="sequence",
-    )
+    importance_sampling_level="sequence",
 )
+await model.log(trajectory_groups, metrics=result.metrics, step=result.step, split="train")
 ```
 
 ## Technical Details

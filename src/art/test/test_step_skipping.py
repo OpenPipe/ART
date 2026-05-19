@@ -14,7 +14,6 @@ import tempfile
 import uuid
 
 from art import TrainableModel, Trajectory, TrajectoryGroup
-from art.dev import TrainConfig as DevTrainConfig
 from art.local import LocalBackend
 from art.utils.output_dirs import get_model_dir, get_step_checkpoint_dir
 
@@ -32,8 +31,6 @@ BASE_TRAJECTORY = Trajectory(
     ],
     reward=1.0,
 )
-
-train_config = DevTrainConfig(allow_training_without_logprobs=True)
 
 
 async def test_step_skipping():
@@ -115,9 +112,10 @@ async def test_step_skipping():
                 ]
             )
 
-            await model.train(
+            await backend.train(
+                model,
                 [group1, group2, group3, group4, group5],
-                _config=train_config,
+                allow_training_without_logprobs=True,
                 verbose=True,
             )
 
@@ -161,9 +159,10 @@ async def test_step_skipping():
                 ]
             )
 
-            await model.train(
+            await backend.train(
+                model,
                 [group1_skip, group2_skip, group3_skip],
-                _config=train_config,
+                allow_training_without_logprobs=True,
                 verbose=True,
             )
 
@@ -225,9 +224,10 @@ async def test_step_skipping():
                 ]
             )
 
-            await model.train(
+            await backend.train(
+                model,
                 [group1_final, group2_final, group3_final, group4_final],
-                _config=train_config,
+                allow_training_without_logprobs=True,
                 verbose=True,
             )
 

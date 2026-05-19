@@ -95,7 +95,8 @@ async def main() -> None:
         ])
 
         # Train the model on collected trajectories
-        await model.train(groups)
+        result = await backend.train(model, groups)
+        await model.log(groups, metrics=result.metrics, step=result.step, split="train")
 
 
 if __name__ == "__main__":

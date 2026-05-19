@@ -190,11 +190,9 @@ async def train(): # train for 50 steps
         # length of each train group: 8
 
         # send the grouped trajectories to the backend and wait until training finishes
-        await model.train(
-            train_groups,
-            config=art.TrainConfig(learning_rate=1e-5),
-        )
-        # once model.train finishes for the current step
+        result = await backend.train(model, train_groups, learning_rate=1e-5)
+        await model.log(train_groups, metrics=result.metrics, step=result.step, split="train")
+        # once backend.train finishes for the current step
         # the backend updates the LoRA weights for inference and
         # the training loop continues until 50 steps have completed
 ```

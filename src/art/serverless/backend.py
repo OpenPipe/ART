@@ -218,9 +218,9 @@ class ServerlessBackend(Backend):
     ) -> ServerlessTrainResult:
         """Train the model on the given trajectory groups.
 
-        This is the recommended way to train models. Unlike model.train(), this
-        method does NOT automatically log trajectories or metrics. Call model.log()
-        explicitly before and/or after training if you want to log data.
+        This method does NOT automatically log trajectories or metrics. Call
+        model.log() explicitly before and/or after training if you want to log
+        data.
 
         Args:
             model: The trainable model to train.
@@ -246,10 +246,6 @@ class ServerlessBackend(Backend):
             ServerlessTrainResult with step number, training metrics, and artifact name.
 
         Example:
-            # Before (deprecated):
-            await model.train(trajectory_groups, config=TrainConfig(learning_rate=5e-6))
-
-            # After (recommended):
             await model.log(trajectory_groups, split="train")
             result = await backend.train(model, trajectory_groups, learning_rate=5e-6)
             # Optionally log training metrics:

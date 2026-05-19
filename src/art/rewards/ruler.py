@@ -11,7 +11,6 @@ For detailed documentation and examples, see: https://art.openpipe.ai/fundamenta
 
 import json
 from textwrap import dedent
-from typing import List
 
 from litellm import acompletion
 from litellm.types.utils import ModelResponse
@@ -35,7 +34,7 @@ class TrajectoryScore(BaseModel):
 class Response(BaseModel):
     """Response format expected from the LLM judge."""
 
-    scores: List[TrajectoryScore] = Field(description="The scores for each trajectory.")
+    scores: list[TrajectoryScore] = Field(description="The scores for each trajectory.")
 
 
 DEFAULT_RUBRIC = dedent(
@@ -87,9 +86,9 @@ def _record_ruler_cost(judge_model: str, response: ModelResponse) -> None:
 async def ruler(
     message_lists: list[list[ChatCompletionMessageParam]],
     judge_model: str = "openai/o3",
-    extra_litellm_params: dict | None = None,
+    extra_litellm_params: dict[str, object] | None = None,
     rubric: str = DEFAULT_RUBRIC,
-    tools: list | None = None,
+    tools: art.Tools | None = None,
     *,
     debug: bool = False,
 ) -> list[TrajectoryScore]:
@@ -182,7 +181,7 @@ async def ruler(
 
     # Serialize each trajectory (minus the common prefix) for the judge.
     # If all trajectories are identical, only serialize one full trajectory to save tokens.
-    serialized_trajectories: List[str] = []
+    serialized_trajectories: list[str] = []
     if all_identical:
         # Send the full trajectory since they're all identical
         full_trajectory = message_lists[0]
@@ -264,7 +263,7 @@ async def ruler(
 async def ruler_score_group(
     group: art.TrajectoryGroup,
     judge_model: str = "openai/o3",
-    extra_litellm_params: dict | None = None,
+    extra_litellm_params: dict[str, object] | None = None,
     rubric: str = DEFAULT_RUBRIC,
     *,
     swallow_exceptions: bool = False,

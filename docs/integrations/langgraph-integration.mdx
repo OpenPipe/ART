@@ -183,11 +183,13 @@ for batch in training_iterator:
         judged_groups.append(judged_group)
 
     # Train the model
-    await model.train(
+    result = await backend.train(
+        model,
         judged_groups,
-        config=art.TrainConfig(learning_rate=training_config["learning_rate"]),
-        _config={"logprob_calculation_chunk_size": 8},
+        learning_rate=training_config["learning_rate"],
+        logprob_calculation_chunk_size=8,
     )
+    await model.log(judged_groups, metrics=result.metrics, step=result.step, split="train")
 ```
 
 ### Correctness Evaluation
@@ -491,10 +493,12 @@ async def main():
             judged_groups.append(judged_group)
 
         # Train model
-        await model.train(
+        result = await backend.train(
+            model,
             judged_groups,
-            config=art.TrainConfig(learning_rate=training_config["learning_rate"]),
+            learning_rate=training_config["learning_rate"],
         )
+        await model.log(judged_groups, metrics=result.metrics, step=result.step, split="train")
 
         print(f"Completed training step {batch.step}")
 

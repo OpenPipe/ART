@@ -23,7 +23,7 @@ from .metrics_taxonomy import (
     summarize_trajectory_groups,
 )
 from .trajectories import Trajectory, TrajectoryGroup
-from .types import TrainConfig, TrainSFTConfig
+from .types import TrainSFTConfig
 from .utils.trajectory_logging import write_trajectory_groups_parquet
 
 if TYPE_CHECKING:
@@ -224,7 +224,8 @@ class Model(
         report_metrics: list[str] | None = None,
         **kwargs: Never,
     ) -> None:
-        super().__init__(
+        BaseModel.__init__(
+            self,
             name=name,
             project=project,
             entity=entity,
@@ -236,6 +237,9 @@ class Model(
             report_metrics=report_metrics,
             **kwargs,
         )
+        self._init_runtime_state()
+
+    def _init_runtime_state(self) -> None:
         object.__setattr__(self, "_wandb_defined_metrics", set())
         object.__setattr__(self, "_wandb_config", {})
         object.__setattr__(self, "_run_start_time", time.time())
@@ -283,10 +287,10 @@ class Model(
 
     def __new__(  # pyright: ignore[reportInconsistentOverload]
         cls,
-        *args,
-        **kwargs,
-    ) -> "Model[ModelConfig, StateType]":
-        return super().__new__(cls)
+        *args: Any,
+        **kwargs: Any,
+    ) -> "Model[Any, Any]":
+        return BaseModel.__new__(cls)
 
     def safe_model_dump(self, *args, **kwargs) -> dict:
         """
@@ -459,7 +463,7 @@ class Model(
         )
         self.overwrite_state(state)
 
-    def merge_state(self, state: StateType) -> StateType:
+    def merge_state(self, state: dict[str, Any]) -> StateType:
         """Deep-merge state into the existing state and persist it.
 
         Args:
@@ -746,7 +750,7 @@ class Model(
         )
         if callable(gpu_cost_getter) and "costs/gpu" not in provided_metric_keys:
             gpu_cost_per_hour_usd = gpu_cost_getter(self)
-            if gpu_cost_per_hour_usd is not None:
+            if isinstance(gpu_cost_per_hour_usd, int | float):
                 automatic_metrics["costs/gpu"] = (
                     step_wall_s * float(gpu_cost_per_hour_usd) / 3600.0
                 )
@@ -1027,7 +1031,8 @@ class TrainableModel(Model[ModelConfig, StateType], Generic[ModelConfig, StateTy
         _internal_config: dev.InternalModelConfig | None = None,
         **kwargs: Never,
     ) -> None:
-        super().__init__(
+        BaseModel.__init__(
+            self,
             name=name,
             project=project,
             entity=entity,
@@ -1038,6 +1043,7 @@ class TrainableModel(Model[ModelConfig, StateType], Generic[ModelConfig, StateTy
             report_metrics=report_metrics,
             **kwargs,
         )
+        self._init_runtime_state()
         object.__setattr__(self, "_cost_calculator", self._noop_cost_calculator)
         if _internal_config is not None:
             # Bypass BaseModel __setattr__ to allow setting private attr
@@ -1122,10 +1128,10 @@ class TrainableModel(Model[ModelConfig, StateType], Generic[ModelConfig, StateTy
 
     def __new__(  # pyright: ignore[reportInconsistentOverload]
         cls,
-        *args,
-        **kwargs,
-    ) -> "TrainableModel[ModelConfig, StateType]":
-        return super().__new__(cls)
+        *args: Any,
+        **kwargs: Any,
+    ) -> "TrainableModel[Any, Any]":
+        return BaseModel.__new__(cls)
 
     def model_dump(self, *args, **kwargs) -> dict:
         data = super().model_dump(*args, **kwargs)
@@ -1193,65 +1199,6 @@ class TrainableModel(Model[ModelConfig, StateType], Generic[ModelConfig, StateTy
 
         # Backend only does file deletion
         await self.backend()._delete_checkpoint_files(self, steps_to_keep)
-
-    async def train(
-        self,
-        trajectory_groups: Iterable[TrajectoryGroup],
-        config: TrainConfig = TrainConfig(),
-        _config: dev.TrainConfig | None = None,
-        verbose: bool = False,
-    ) -> None:
-        """
-        Reinforce fine-tune the model with a batch of trajectory groups.
-
-        .. deprecated::
-            Use ``backend.train(model, trajectory_groups, ...)`` instead.
-            This method will be removed in a future version.
-
-        Args:
-            trajectory_groups: A batch of trajectory groups.
-            config: Fine-tuning specific configuration
-            _config: Additional configuration that is subject to change and
-                not yet part of the public API. Use at your own risk.
-        """
-        warnings.warn(
-            "model.train() is deprecated. Use backend.train(model, ...) instead.\n\n"
-            "Migration guide:\n"
-            "  # Before (deprecated):\n"
-            "  await model.train(trajectory_groups, config=TrainConfig(learning_rate=5e-6))\n\n"
-            "  # After (recommended):\n"
-            "  result = await backend.train(model, trajectory_groups, learning_rate=5e-6)\n"
-            "  await model.log(trajectory_groups, metrics=result.metrics, step=result.step, split='train')\n\n"
-            "Key differences:\n"
-            "  - backend.train() does NOT automatically log trajectories or metrics\n"
-            "  - backend.train() returns a TrainResult with step, metrics, and checkpoint info\n"
-            "  - Each backend has its own type-checked parameters (no more generic config objects)",
-            DeprecationWarning,
-            stacklevel=2,
-        )
-        groups_list = list(trajectory_groups)
-        _config = _config or {}  # ty:ignore[invalid-assignment]
-
-        # 1. Train (backend no longer logs internally)
-        training_metrics: list[dict[str, float]] = []
-        trainer_started = time.monotonic()
-        async for metrics in self.backend()._train_model(
-            self,
-            groups_list,
-            config,
-            _config,  # ty:ignore[invalid-argument-type]
-            verbose,
-        ):
-            training_metrics.append(metrics)
-        trainer_elapsed = time.monotonic() - trainer_started
-
-        # 2. Calculate aggregated training metrics
-        avg_metrics = average_metric_samples(training_metrics)
-        avg_metrics.setdefault("time/step_trainer_s", trainer_elapsed)
-
-        # 3. Log trajectories and training metrics together (single wandb log call)
-        step = await self.get_step()
-        await self.log(groups_list, split="train", metrics=avg_metrics, step=step)
 
     async def train_sft(
         self,

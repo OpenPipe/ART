@@ -16,8 +16,9 @@ Use this page for three things:
 
 ## What ART logs automatically
 
-When you call `await model.train(...)` or `await model.log(train_groups, split="train")`,
-ART already logs most of the metrics you need to monitor a run.
+When you call `await model.log(train_groups, split="train")` with trajectory
+groups and training metrics, ART logs most of the values you need to monitor a
+run.
 
 | Type | Examples |
 | --- | --- |
@@ -102,8 +103,7 @@ A few useful patterns:
 - log `time/step_eval_s` when eval runs happen outside the backend
 - use fully qualified keys like `time/step_actor_s` or `data/step_actor_tokens` for builder-managed metrics
 
-ART flushes builder-managed metrics on the next `model.log(...)` or
-`model.train(...)` call.
+ART flushes builder-managed metrics on the next `model.log(...)` call.
 
 ## Track judge and API costs
 

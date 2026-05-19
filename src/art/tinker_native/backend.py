@@ -6,7 +6,7 @@ import json
 import os
 import re
 import time
-from typing import Any, Awaitable, Iterable, Literal, TypeVar, cast
+from typing import Any, AsyncIterator, Awaitable, Iterable, Literal, TypeVar, cast
 import uuid
 
 from fastapi import FastAPI, HTTPException
@@ -37,8 +37,8 @@ from ..metrics_taxonomy import (
 from ..model import Model, TrainableModel
 from ..tinker.backend import get_renderer_name
 from ..tinker.server import get_free_port
-from ..trajectories import TrajectoryGroup
-from ..types import TrainResult
+from ..trajectories import Trajectory, TrajectoryGroup
+from ..types import TrainResult, TrainSFTConfig
 from ..utils.output_dirs import get_model_dir
 from ..utils.trajectory_migration import auto_migrate_on_register
 from .data import (
@@ -232,7 +232,7 @@ class TinkerNativeBackend(Backend):
         await self._wait_for_server_ready(base_url, api_key, model)
         return base_url, api_key
 
-    async def train(  # type: ignore[override]
+    async def train(
         self,
         model: TrainableModel,
         trajectory_groups: Iterable[TrajectoryGroup],
@@ -243,6 +243,7 @@ class TinkerNativeBackend(Backend):
         save_checkpoint: bool = False,
         loss_fn_config: dict | None = None,
         adam_params: tinker.AdamParams | None = None,
+        **kwargs: Any,
     ) -> TrainResult:
         state = self._model_state[model.name]
         groups_list = list(trajectory_groups)
@@ -350,6 +351,19 @@ class TinkerNativeBackend(Backend):
         metrics["time/step_trainer_s"] = time.monotonic() - trainer_started
 
         return TrainResult(step=state.current_step, metrics=metrics)
+
+    async def _train_sft(
+        self,
+        model: TrainableModel,
+        trajectories: Iterable[Trajectory],
+        config: TrainSFTConfig,
+        dev_config: dev.TrainSFTConfig,
+        verbose: bool = False,
+    ) -> AsyncIterator[dict[str, float]]:
+        raise NotImplementedError(
+            "TinkerNativeBackend does not support TrainableModel.train_sft()."
+        )
+        yield {}
 
     async def _get_step(self, model: TrainableModel) -> int:
         if model.name in self._model_state:
