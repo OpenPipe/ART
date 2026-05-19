@@ -20,20 +20,16 @@ ChatTemplateTool = dict[Any, Any] | Callable[..., Any]
 ChatTemplateToolSchemaFormat = Literal["default", "vllm_openai"]
 
 
-def _chat_template_disables_thinking(tokenizer: PreTrainedTokenizerBase) -> bool:
-    chat_template = tokenizer.chat_template
-    return isinstance(chat_template, str) and "enable_thinking" in chat_template
-
-
 def _chat_template_kwargs(
     tokenizer: PreTrainedTokenizerBase,
     chat_template_kwargs: dict[str, Any] | None,
 ) -> dict[str, Any]:
-    kwargs = (
-        {"enable_thinking": False}
-        if _chat_template_disables_thinking(tokenizer)
-        else {}
-    )
+    kwargs: dict[str, Any] = {}
+    if isinstance(tokenizer.chat_template, str):
+        if "enable_thinking" in tokenizer.chat_template:
+            kwargs["enable_thinking"] = False
+        if "preserve_thinking" in tokenizer.chat_template:
+            kwargs["preserve_thinking"] = True
     kwargs.update(chat_template_kwargs or {})
     return kwargs
 
