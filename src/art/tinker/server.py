@@ -556,19 +556,18 @@ class OpenAICompatibleTinkerServerWorker:
     ) -> list[int]:
         normalized_messages = _normalize_qwen3_dot_messages(base_model, messages)
         tokenizer = self._get_renderer(base_model).tokenizer
-        if _chat_template_disables_thinking(base_model):
-            encoding = tokenizer.apply_chat_template(
-                cast(Any, normalized_messages),
-                tools=cast(Any, tools),
-                add_generation_prompt=True,
-                enable_thinking=False,
-            )
-        else:
-            encoding = tokenizer.apply_chat_template(
-                cast(Any, normalized_messages),
-                tools=cast(Any, tools),
-                add_generation_prompt=True,
-            )
+        chat_template_kwargs = {}
+        if isinstance(tokenizer.chat_template, str):
+            if "enable_thinking" in tokenizer.chat_template:
+                chat_template_kwargs["enable_thinking"] = False
+            if "preserve_thinking" in tokenizer.chat_template:
+                chat_template_kwargs["preserve_thinking"] = True
+        encoding = tokenizer.apply_chat_template(
+            cast(Any, normalized_messages),
+            tools=cast(Any, tools),
+            add_generation_prompt=True,
+            **chat_template_kwargs,
+        )
         if isinstance(encoding, BatchEncoding):
             return encoding.input_ids
         else:
