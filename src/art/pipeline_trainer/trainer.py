@@ -1049,7 +1049,8 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
             checkpoints=eligible,
         )
         eligible_steps = {checkpoint.step for checkpoint in eligible}
-        delete_steps = set(strategy(context)) & eligible_steps
+        keep_eligible_steps = set(strategy(context)) & eligible_steps
+        delete_steps = eligible_steps - keep_eligible_steps
         if not delete_steps:
             return
         keep_steps = {checkpoint.step for checkpoint in all_checkpoints} - delete_steps

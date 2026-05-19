@@ -280,7 +280,7 @@ async def test_pipeline_trainer_checkpoint_retention_only_passes_unprotected_ste
 
     def strategy(context: CheckpointRetentionContext) -> set[int]:
         contexts.append(context)
-        return {0, 2, 4, 99}
+        return {1, 4, 99}
 
     trainer = _make_trainer(
         model=model,

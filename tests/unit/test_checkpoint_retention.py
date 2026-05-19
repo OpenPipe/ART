@@ -22,7 +22,7 @@ def _checkpoint(
     )
 
 
-def test_keep_recent_and_top_deletes_everything_else() -> None:
+def test_keep_recent_and_top_returns_kept_steps() -> None:
     strategy = keep_recent_and_top(recent=2, top=1, metric="val/reward")
     context = CheckpointRetentionContext(
         current_step=6,
@@ -36,7 +36,7 @@ def test_keep_recent_and_top_deletes_everything_else() -> None:
         ],
     )
 
-    assert set(strategy(context)) == {0, 1, 2}
+    assert set(strategy(context)) == {3, 4, 5}
 
 
 def test_keep_recent_and_top_uses_metric_presence_for_legacy_history() -> None:
@@ -50,7 +50,7 @@ def test_keep_recent_and_top_uses_metric_presence_for_legacy_history() -> None:
         ],
     )
 
-    assert set(strategy(context)) == {0, 2}
+    assert set(strategy(context)) == {1}
 
 
 def test_keep_recent_and_top_handles_zero_limits() -> None:
@@ -60,7 +60,7 @@ def test_keep_recent_and_top_handles_zero_limits() -> None:
         checkpoints=[_checkpoint(0), _checkpoint(1), _checkpoint(2)],
     )
 
-    assert set(strategy(context)) == {0, 1, 2}
+    assert set(strategy(context)) == set()
 
 
 @pytest.mark.parametrize(

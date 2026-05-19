@@ -23,8 +23,8 @@ class CheckpointRetentionContext(BaseModel):
     checkpoints: list[CheckpointInfo] = Field(default_factory=list)
 
 
-# Strategies receive only checkpoints that ART has determined are safe to delete
-# and return the subset of those checkpoint steps to remove.
+# Strategies receive only checkpoints that ART has determined are eligible for
+# removal and return the subset of those checkpoint steps to keep.
 CheckpointRetentionStrategy = Callable[[CheckpointRetentionContext], Iterable[int]]
 
 
@@ -34,7 +34,7 @@ def keep_recent_and_top(
     top: int = 2,
     metric: str = "val/reward",
 ) -> CheckpointRetentionStrategy:
-    """Delete eligible checkpoints except the most recent and top metric steps."""
+    """Keep the most recent eligible checkpoints and top metric checkpoints."""
     if recent < 0:
         raise ValueError("recent must be >= 0")
     if top < 0:
@@ -57,7 +57,7 @@ def keep_recent_and_top(
         ]
         ranked.sort(key=lambda item: (item.metrics[metric], item.step), reverse=True)
         keep_steps.update(checkpoint.step for checkpoint in ranked[:top])
-        return eligible_steps - keep_steps
+        return keep_steps & eligible_steps
 
     return strategy
 
