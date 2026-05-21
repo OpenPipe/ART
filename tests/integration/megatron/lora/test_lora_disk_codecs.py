@@ -11,6 +11,7 @@ from art.megatron.model_support.handlers import (
     QWEN3_5_MOE_HANDLER,
     QWEN3_MOE_HANDLER,
 )
+from art.megatron.model_support.lora_disk import normalize_lora_checkpoint_to_vllm
 from art.megatron.weights.merge import load_lora_adapter_state_dict, merge_lora_adapter
 from art.utils.convert_moe_lora import convert_checkpoint_if_needed
 
@@ -204,6 +205,65 @@ def _qwen3_moe_lora_tensors(prefix: str, *, rank: int = 2) -> dict[str, torch.Te
     return tensors
 
 
+def _pack_lora_b_by_expert(blocks: list[torch.Tensor]) -> torch.Tensor:
+    stacked = torch.stack(blocks, dim=0)
+    return stacked.permute(1, 2, 0).reshape(stacked.shape[1], -1).contiguous()
+
+
+def _qwen3_fused_moe_fixture(
+    prefix: str,
+    *,
+    rank: int = 2,
+) -> tuple[dict[str, torch.Tensor], dict[str, torch.Tensor]]:
+    hidden = 3
+    intermediate = 4
+    num_experts = 2
+    gate_up_a = torch.arange(
+        num_experts * rank * hidden,
+        dtype=torch.float32,
+    ).reshape(num_experts * rank, hidden)
+    down_a = (
+        torch.arange(
+            num_experts * rank * intermediate,
+            dtype=torch.float32,
+        ).reshape(num_experts * rank, intermediate)
+        + 100
+    )
+    gate_up_b_blocks = [
+        torch.arange(
+            2 * intermediate * rank,
+            dtype=torch.float32,
+        ).reshape(2 * intermediate, rank)
+        + 200
+        + expert * 100
+        for expert in range(num_experts)
+    ]
+    down_b_blocks = [
+        torch.arange(hidden * rank, dtype=torch.float32).reshape(hidden, rank)
+        + 500
+        + expert * 100
+        for expert in range(num_experts)
+    ]
+    fused = {
+        f"{prefix}.base_layer.lora_A.weight": gate_up_a,
+        f"{prefix}.base_layer.lora_B.weight": _pack_lora_b_by_expert(gate_up_b_blocks),
+        f"{prefix}.lora_A.weight": down_a,
+        f"{prefix}.lora_B.weight": _pack_lora_b_by_expert(down_b_blocks),
+    }
+    expected: dict[str, torch.Tensor] = {}
+    for expert in range(num_experts):
+        rows = slice(expert * rank, (expert + 1) * rank)
+        gate_b, up_b = gate_up_b_blocks[expert].split(intermediate, dim=0)
+        expert_prefix = f"{prefix}.{expert}"
+        expected[f"{expert_prefix}.gate_proj.lora_A.weight"] = gate_up_a[rows].clone()
+        expected[f"{expert_prefix}.gate_proj.lora_B.weight"] = gate_b
+        expected[f"{expert_prefix}.up_proj.lora_A.weight"] = gate_up_a[rows].clone()
+        expected[f"{expert_prefix}.up_proj.lora_B.weight"] = up_b
+        expected[f"{expert_prefix}.down_proj.lora_A.weight"] = down_a[rows].clone()
+        expected[f"{expert_prefix}.down_proj.lora_B.weight"] = down_b_blocks[expert]
+    return fused, expected
+
+
 def test_peft_fused_moe_checkpoint_converts_to_vllm_3d_layout(tmp_path: Path) -> None:
     prefix = "base_model.model.model.layers.0.mlp.experts"
     peft_tensors = {
@@ -264,6 +324,67 @@ def test_peft_fused_moe_checkpoint_converts_to_vllm_3d_layout(tmp_path: Path) ->
     adapter_config = json.loads((tmp_path / "adapter_config.json").read_text())
     assert adapter_config["target_modules"] == ["q_proj", "experts"]
     assert "target_parameters" not in adapter_config
+
+
+def test_qwen3_fused_identity_normalizes_to_per_expert_vllm_layout(
+    tmp_path: Path,
+) -> None:
+    prefix = "base_model.model.model.layers.0.mlp.experts"
+    rank = 2
+    fused, expected = _qwen3_fused_moe_fixture(prefix, rank=rank)
+    _save_adapter(
+        tmp_path,
+        {
+            f"{prefix}.base_layer.lora_A.weight": fused[
+                f"{prefix}.base_layer.lora_B.weight"
+            ].T.contiguous(),
+            f"{prefix}.base_layer.lora_B.weight": fused[
+                f"{prefix}.base_layer.lora_A.weight"
+            ].T.contiguous(),
+            f"{prefix}.lora_A.weight": fused[f"{prefix}.lora_B.weight"].T.contiguous(),
+            f"{prefix}.lora_B.weight": fused[f"{prefix}.lora_A.weight"].T.contiguous(),
+        },
+        {
+            "r": rank,
+            "lora_alpha": 4,
+            "target_modules": ["q_proj"],
+            "target_parameters": [
+                "model.layers.0.mlp.experts.gate_up_proj",
+                "model.layers.0.mlp.experts.down_proj",
+            ],
+        },
+    )
+
+    convert_checkpoint_if_needed(str(tmp_path))
+    normalize_lora_checkpoint_to_vllm(
+        tmp_path,
+        handler=QWEN3_MOE_HANDLER,
+        adapter_config=_config("Qwen/Qwen3-30B-A3B", rank=rank),
+    )
+
+    converted = load_file(tmp_path / "adapter_model.safetensors")
+    _assert_tensors_equal(converted, expected)
+    adapter_config = json.loads((tmp_path / "adapter_config.json").read_text())
+    assert "experts" in adapter_config["target_modules"]
+    loaded_modules = _assert_stock_vllm_loads(
+        tmp_path,
+        expected_modules={
+            "experts.0.gate_proj",
+            "experts.0.up_proj",
+            "experts.0.down_proj",
+            "experts.1.gate_proj",
+            "experts.1.up_proj",
+            "experts.1.down_proj",
+        },
+    )
+    assert loaded_modules == [
+        "model.layers.0.mlp.experts.0.down_proj",
+        "model.layers.0.mlp.experts.0.gate_proj",
+        "model.layers.0.mlp.experts.0.up_proj",
+        "model.layers.0.mlp.experts.1.down_proj",
+        "model.layers.0.mlp.experts.1.gate_proj",
+        "model.layers.0.mlp.experts.1.up_proj",
+    ]
 
 
 def test_qwen35_and_qwen36_vllm_canonical_roundtrip_and_stock_loader(tmp_path: Path):
