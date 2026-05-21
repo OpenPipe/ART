@@ -21,6 +21,8 @@ _DENSE_TARGET_MODULES = (
     "down_proj",
 )
 
+_QWEN3_MOE_TARGET_MODULES = (*_DENSE_TARGET_MODULES, "experts")
+
 _QWEN3_5_DENSE_TARGET_MODULES = (
     "q_proj",
     "k_proj",
@@ -61,7 +63,7 @@ QWEN3_MOE_SPEC = ModelSupportSpec(
         "Qwen/Qwen3-30B-A3B-Instruct-2507",
         "Qwen/Qwen3-235B-A22B-Instruct-2507",
     ),
-    default_target_modules=_DENSE_TARGET_MODULES,
+    default_target_modules=_QWEN3_MOE_TARGET_MODULES,
     native_vllm_lora_status=QWEN3_MOE_HANDLER.native_vllm_lora_status,
 )
 
