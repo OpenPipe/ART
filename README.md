@@ -127,6 +127,20 @@ ART's functionality is divided into a **client** and a **server**. The OpenAI-co
 
 This training loop runs until a specified number of inference and training iterations have completed.
 
+## Verifiers Interoperability
+
+ART includes lightweight helpers for moving rollout data between ART and Verifiers-style tasks without adding Verifiers as a required dependency:
+
+```python
+import art
+
+vf_state = art.trajectory_to_verifiers_state(trajectory)
+trajectory = art.verifiers_state_to_trajectory(vf_state)
+trajectory_group = art.verifiers_states_to_trajectory_group([vf_state])
+```
+
+By default, Verifiers assistant turns are imported as plain transcript messages. If you have the original response payload and want those assistant turns to remain trainable ART choices, pass a `choice_factory` to `verifiers_state_to_trajectory`.
+
 ## 🧩 Supported Models
 
 ART should work with most vLLM/HuggingFace-transformers compatible causal language models, or at least the ones supported by [Unsloth](https://docs.unsloth.ai/get-started/all-our-models). Gemma 3 does not appear to be supported for the time being. If any other model isn't working for you, please let us know on [Discord](https://discord.gg/zbBHRUpwf4) or open an issue on [GitHub](https://github.com/openpipe/art/issues)!

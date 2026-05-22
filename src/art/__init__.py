@@ -73,6 +73,11 @@ from .types import (
     TrainSFTConfig,
 )
 from .utils import retry
+from .verifiers import (
+    trajectory_to_verifiers_state,
+    verifiers_state_to_trajectory,
+    verifiers_states_to_trajectory_group,
+)
 from .yield_trajectory import capture_yielded_trajectory, yield_trajectory
 
 __all__ = [
@@ -98,6 +103,9 @@ __all__ = [
     "TrainResult",
     "Trajectory",
     "TrajectoryGroup",
+    "trajectory_to_verifiers_state",
+    "verifiers_state_to_trajectory",
+    "verifiers_states_to_trajectory_group",
     "capture_yielded_trajectory",
     "yield_trajectory",
 ]
