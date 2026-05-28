@@ -1,15 +1,38 @@
-from art.megatron.model_support.handlers import (
-    DEFAULT_DENSE_HANDLER,
-    QWEN3_5_DENSE_HANDLER,
-    QWEN3_5_MOE_HANDLER,
-    QWEN3_DENSE_HANDLER,
-    QWEN3_MOE_HANDLER,
-)
+import importlib
+
 from art.megatron.model_support.spec import (
+    ALL_HANDLER_METAS,
+    DEFAULT_DENSE_META,
+    QWEN3_5_DENSE_META,
+    QWEN3_5_MOE_META,
+    QWEN3_DENSE_META,
+    QWEN3_MOE_META,
     DependencyFloor,
+    HandlerMeta,
     ModelSupportHandler,
     ModelSupportSpec,
 )
+
+# Handler modules top-level import megatron-core, so we keep the registry
+# importable without megatron-core by deferring those imports until something
+# actually needs a handler instance. The handler `key` / `native_vllm_lora_status`
+# values shared between spec construction (here) and the handler classes live
+# in `handler_meta.py`, which has no megatron dependency.
+_HANDLER_METAS_BY_KEY: dict[str, HandlerMeta] = {
+    meta.key: meta for meta in ALL_HANDLER_METAS
+}
+_HANDLERS_BY_KEY: dict[str, ModelSupportHandler] = {}
+
+
+def _load_handler(handler_key: str) -> ModelSupportHandler:
+    cached = _HANDLERS_BY_KEY.get(handler_key)
+    if cached is not None:
+        return cached
+    meta = _HANDLER_METAS_BY_KEY[handler_key]
+    handler = getattr(importlib.import_module(meta.module), meta.attr)
+    _HANDLERS_BY_KEY[handler_key] = handler
+    return handler
+
 
 _DENSE_TARGET_MODULES = (
     "q_proj",
@@ -48,15 +71,15 @@ _QWEN3_5_MOE_TARGET_MODULES = (
 )
 
 DEFAULT_DENSE_SPEC = ModelSupportSpec(
-    key="default_dense",
-    handler_key=DEFAULT_DENSE_HANDLER.key,
+    key=DEFAULT_DENSE_META.key,
+    handler_key=DEFAULT_DENSE_META.key,
     default_target_modules=_DENSE_TARGET_MODULES,
-    native_vllm_lora_status=DEFAULT_DENSE_HANDLER.native_vllm_lora_status,
+    native_vllm_lora_status=DEFAULT_DENSE_META.native_vllm_lora_status,
 )
 
 QWEN3_MOE_SPEC = ModelSupportSpec(
-    key="qwen3_moe",
-    handler_key=QWEN3_MOE_HANDLER.key,
+    key=QWEN3_MOE_META.key,
+    handler_key=QWEN3_MOE_META.key,
     model_names=(
         "Qwen/Qwen3-30B-A3B",
         "Qwen/Qwen3-30B-A3B-Base",
@@ -64,12 +87,12 @@ QWEN3_MOE_SPEC = ModelSupportSpec(
         "Qwen/Qwen3-235B-A22B-Instruct-2507",
     ),
     default_target_modules=_QWEN3_MOE_TARGET_MODULES,
-    native_vllm_lora_status=QWEN3_MOE_HANDLER.native_vllm_lora_status,
+    native_vllm_lora_status=QWEN3_MOE_META.native_vllm_lora_status,
 )
 
 QWEN3_DENSE_SPEC = ModelSupportSpec(
-    key="qwen3_dense",
-    handler_key=QWEN3_DENSE_HANDLER.key,
+    key=QWEN3_DENSE_META.key,
+    handler_key=QWEN3_DENSE_META.key,
     model_names=(
         "Qwen/Qwen3-0.6B",
         "Qwen/Qwen3-0.6B-Base",
@@ -87,34 +110,34 @@ QWEN3_DENSE_SPEC = ModelSupportSpec(
         "Qwen/Qwen3-32B-Base",
     ),
     default_target_modules=_DENSE_TARGET_MODULES,
-    native_vllm_lora_status=QWEN3_DENSE_HANDLER.native_vllm_lora_status,
+    native_vllm_lora_status=QWEN3_DENSE_META.native_vllm_lora_status,
 )
 
 QWEN3_5_DENSE_SPEC = ModelSupportSpec(
-    key="qwen3_5_dense",
-    handler_key=QWEN3_5_DENSE_HANDLER.key,
+    key=QWEN3_5_DENSE_META.key,
+    handler_key=QWEN3_5_DENSE_META.key,
     model_names=(
         "Qwen/Qwen3.5-4B",
         "Qwen/Qwen3.5-27B",
         "Qwen/Qwen3.6-27B",
     ),
     default_target_modules=_QWEN3_5_DENSE_TARGET_MODULES,
-    native_vllm_lora_status=QWEN3_5_DENSE_HANDLER.native_vllm_lora_status,
+    native_vllm_lora_status=QWEN3_5_DENSE_META.native_vllm_lora_status,
     dependency_floor=DependencyFloor(
         megatron_bridge="e049cc00c24d03e2ae45d2608c7a44e2d2364e3d",
     ),
 )
 
 QWEN3_5_MOE_SPEC = ModelSupportSpec(
-    key="qwen3_5_moe",
-    handler_key=QWEN3_5_MOE_HANDLER.key,
+    key=QWEN3_5_MOE_META.key,
+    handler_key=QWEN3_5_MOE_META.key,
     model_names=(
         "Qwen/Qwen3.5-35B-A3B",
         "Qwen/Qwen3.5-397B-A17B",
         "Qwen/Qwen3.6-35B-A3B",
     ),
     default_target_modules=_QWEN3_5_MOE_TARGET_MODULES,
-    native_vllm_lora_status=QWEN3_5_MOE_HANDLER.native_vllm_lora_status,
+    native_vllm_lora_status=QWEN3_5_MOE_META.native_vllm_lora_status,
     dependency_floor=DependencyFloor(
         megatron_bridge="e049cc00c24d03e2ae45d2608c7a44e2d2364e3d",
     ),
@@ -143,14 +166,6 @@ _UNVALIDATED_ARCH_SPECS_BY_MODEL = {
     for spec in PROBE_ONLY_MODEL_SUPPORT_SPECS
     for model_name in spec.model_names
 }
-_HANDLERS_BY_KEY: dict[str, ModelSupportHandler] = {
-    DEFAULT_DENSE_HANDLER.key: DEFAULT_DENSE_HANDLER,
-    QWEN3_DENSE_HANDLER.key: QWEN3_DENSE_HANDLER,
-    QWEN3_MOE_HANDLER.key: QWEN3_MOE_HANDLER,
-    QWEN3_5_DENSE_HANDLER.key: QWEN3_5_DENSE_HANDLER,
-    QWEN3_5_MOE_HANDLER.key: QWEN3_5_MOE_HANDLER,
-}
-
 QWEN3_DENSE_MODELS = frozenset(QWEN3_DENSE_SPEC.model_names)
 QWEN3_MOE_MODELS = frozenset(QWEN3_MOE_SPEC.model_names)
 QWEN3_5_DENSE_MODELS = frozenset(QWEN3_5_DENSE_SPEC.model_names)
@@ -195,7 +210,7 @@ def get_model_support_handler(
 def get_model_support_handler_for_spec(
     spec: ModelSupportSpec,
 ) -> ModelSupportHandler:
-    return _HANDLERS_BY_KEY[spec.handler_key]
+    return _load_handler(spec.handler_key)
 
 
 def default_target_modules_for_model(
@@ -216,7 +231,7 @@ def native_vllm_lora_status_for_model(
     *,
     allow_unvalidated_arch: bool = False,
 ) -> str:
-    return get_model_support_handler(
+    return get_model_support_spec(
         base_model,
         allow_unvalidated_arch=allow_unvalidated_arch,
     ).native_vllm_lora_status

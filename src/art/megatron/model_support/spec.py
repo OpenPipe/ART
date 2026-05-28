@@ -1,9 +1,66 @@
 from typing import Any, Literal, Protocol, Sequence
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 RolloutWeightsMode = Literal["lora", "merged"]
 NativeVllmLoraStatus = Literal["disabled", "wip", "validated"]
+
+
+class HandlerMeta(BaseModel):
+    """Single source of truth for a registered handler's key, status, and
+    lazy-load address. Kept megatron-free so the registry and spec layer can
+    be imported without `megatron-core` installed."""
+
+    model_config = ConfigDict(frozen=True)
+
+    key: str
+    native_vllm_lora_status: NativeVllmLoraStatus
+    module: str
+    attr: str
+
+
+DEFAULT_DENSE_META = HandlerMeta(
+    key="default_dense",
+    native_vllm_lora_status="disabled",
+    module="art.megatron.model_support.handlers.default_dense",
+    attr="DEFAULT_DENSE_HANDLER",
+)
+
+QWEN3_DENSE_META = HandlerMeta(
+    key="qwen3_dense",
+    native_vllm_lora_status="validated",
+    module="art.megatron.model_support.handlers.qwen3_dense",
+    attr="QWEN3_DENSE_HANDLER",
+)
+
+QWEN3_MOE_META = HandlerMeta(
+    key="qwen3_moe",
+    native_vllm_lora_status="validated",
+    module="art.megatron.model_support.handlers.qwen3_moe",
+    attr="QWEN3_MOE_HANDLER",
+)
+
+QWEN3_5_DENSE_META = HandlerMeta(
+    key="qwen3_5_dense",
+    native_vllm_lora_status="validated",
+    module="art.megatron.model_support.handlers.qwen3_5",
+    attr="QWEN3_5_DENSE_HANDLER",
+)
+
+QWEN3_5_MOE_META = HandlerMeta(
+    key="qwen3_5_moe",
+    native_vllm_lora_status="validated",
+    module="art.megatron.model_support.handlers.qwen3_5",
+    attr="QWEN3_5_MOE_HANDLER",
+)
+
+ALL_HANDLER_METAS: tuple[HandlerMeta, ...] = (
+    DEFAULT_DENSE_META,
+    QWEN3_DENSE_META,
+    QWEN3_MOE_META,
+    QWEN3_5_DENSE_META,
+    QWEN3_5_MOE_META,
+)
 SharedExpertCompileState = Literal[
     "none",
     "shared_experts",

@@ -4,6 +4,7 @@ from typing import Any, Sequence
 import torch
 
 from art.megatron.model_support.spec import (
+    DEFAULT_DENSE_META,
     CompileWorkaroundConfig,
     LayerFamilyInstance,
     SharedExpertCompileState,
@@ -11,9 +12,9 @@ from art.megatron.model_support.spec import (
 
 
 class DefaultDenseHandler:
-    key = "default_dense"
+    key = DEFAULT_DENSE_META.key
     is_moe = False
-    native_vllm_lora_status = "disabled"
+    native_vllm_lora_status = DEFAULT_DENSE_META.native_vllm_lora_status
 
     def identity_lora_model_config(self, base_config: Any) -> Any:
         return base_config

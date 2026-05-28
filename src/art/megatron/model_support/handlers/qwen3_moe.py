@@ -7,7 +7,7 @@ from art.megatron.model_support.handlers.default_dense import DefaultMoeHandler
 from art.megatron.model_support.handlers.qwen3_common import (
     install_qwen3_text_preprocess_patch,
 )
-from art.megatron.model_support.spec import CompileWorkaroundConfig
+from art.megatron.model_support.spec import QWEN3_MOE_META, CompileWorkaroundConfig
 
 _QWEN3_MOE_COMPILE_WORKAROUND_FLAGS = (
     "alltoall_dtoh",
@@ -25,8 +25,8 @@ _QWEN3_EXPERT_MOE_KEY_RE = re.compile(
 
 
 class Qwen3MoeHandler(DefaultMoeHandler):
-    key = "qwen3_moe"
-    native_vllm_lora_status = "validated"
+    key = QWEN3_MOE_META.key
+    native_vllm_lora_status = QWEN3_MOE_META.native_vllm_lora_status
 
     def to_vllm_lora_tensors(
         self,

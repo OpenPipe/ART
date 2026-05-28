@@ -14,6 +14,8 @@ from art.megatron.model_support.handlers.default_dense import (
     _require_moe_experts,
 )
 from art.megatron.model_support.spec import (
+    QWEN3_5_DENSE_META,
+    QWEN3_5_MOE_META,
     CompileWorkaroundConfig,
     LayerFamilyInstance,
 )
@@ -38,8 +40,9 @@ _VLLM_MOE_KEY_RE = re.compile(
 
 
 class Qwen35BaseHandler(DefaultDenseHandler):
+    # Abstract base; the two leaves below override `key` from their own meta.
     key = "qwen3_5_base"
-    native_vllm_lora_status = "validated"
+    native_vllm_lora_status = QWEN3_5_DENSE_META.native_vllm_lora_status
 
     def identity_lora_model_config(self, base_config: Any) -> Any:
         return getattr(base_config, "text_config", base_config)
@@ -364,11 +367,13 @@ class Qwen35BaseHandler(DefaultDenseHandler):
 
 
 class Qwen35DenseHandler(Qwen35BaseHandler):
-    key = "qwen3_5_dense"
+    key = QWEN3_5_DENSE_META.key
+    native_vllm_lora_status = QWEN3_5_DENSE_META.native_vllm_lora_status
 
 
 class Qwen35MoeHandler(Qwen35BaseHandler):
-    key = "qwen3_5_moe"
+    key = QWEN3_5_MOE_META.key
+    native_vllm_lora_status = QWEN3_5_MOE_META.native_vllm_lora_status
     is_moe = True
 
     def to_vllm_lora_tensors(
