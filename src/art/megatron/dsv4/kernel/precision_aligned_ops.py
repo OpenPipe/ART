@@ -41,5 +41,6 @@ class _BFloat16LinearFP32Func(torch.autograd.Function):
         return grad_x, grad_weight
 
 
+@torch.compiler.disable
 def linear_bf16_fp32(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
     return _BFloat16LinearFP32Func.apply(x, weight)
