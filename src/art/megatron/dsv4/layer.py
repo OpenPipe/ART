@@ -15,6 +15,7 @@ from art.megatron.dsv4.hyper_connection import (
     DeepSeekV4HyperConnectionUtil,
     HCHeadParams,
 )
+from art.megatron.dsv4.utils import freeze_parameters_as_buffers
 
 
 def _first_tensor(value: Any) -> Tensor:
@@ -54,6 +55,8 @@ class Dsv4Router(TopKRouter):
     def __init__(self, config: TransformerConfig, *args: Any, **kwargs: Any) -> None:
         super().__init__(config, *args, **kwargs)
         self._dsv4_input_ids: Tensor | None = None
+        if self.topk == 1:
+            freeze_parameters_as_buffers(self)
 
     def set_layer_number(self, layer_number: int):
         super().set_layer_number(layer_number)

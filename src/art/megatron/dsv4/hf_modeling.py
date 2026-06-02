@@ -1262,6 +1262,8 @@ class DeepseekV4TopKRouter(nn.Module):
         self.register_buffer(
             "e_score_correction_bias", torch.zeros(self.num_experts), persistent=True
         )
+        if self.top_k == 1:
+            freeze_parameters_as_buffers(self)
 
     def forward(
         self, hidden_states: torch.Tensor
@@ -1299,6 +1301,8 @@ class DeepseekV4HashRouter(nn.Module):
             torch.zeros(config.vocab_size, self.top_k, dtype=torch.long),
             persistent=True,
         )
+        if self.top_k == 1:
+            freeze_parameters_as_buffers(self)
 
     def forward(
         self, hidden_states: torch.Tensor, input_ids: torch.Tensor
