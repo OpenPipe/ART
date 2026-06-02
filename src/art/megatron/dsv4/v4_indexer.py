@@ -85,6 +85,8 @@ class V4Indexer(MegatronModule):
         configure_rope_cache(
             self, config, rope_head_dim=self.rope_head_dim, base=rope_base
         )
+        for param in self.parameters():
+            param.requires_grad_(False)
 
     def forward(
         self, x: torch.Tensor, qr: torch.Tensor, mask=None, packed_seq_params=None

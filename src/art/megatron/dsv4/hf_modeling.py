@@ -594,6 +594,8 @@ class DeepseekV4Indexer(nn.Module):
         )
         self.weights_proj = nn.Linear(config.hidden_size, self.num_heads, bias=False)
         self.rotary_emb = DeepseekV4RotaryEmbedding(config)
+        for param in self.parameters():
+            param.requires_grad_(False)
 
     def forward(
         self,
