@@ -29,10 +29,6 @@ class Dsv4Handler(DefaultMoeHandler):
 
     def configure_provider_for_runtime(self, provider: Any) -> None:
         provider.mtp_num_layers = None
-        if int(getattr(provider, "context_parallel_size", 1) or 1) != 1:
-            raise RuntimeError(
-                "DSV4 model support in this worktree does not implement context parallelism."
-            )
 
     def install_preprocess_patch(self, model_chunks: Sequence[Any]) -> None:
         from megatron.core.models.gpt.gpt_model import GPTModel
