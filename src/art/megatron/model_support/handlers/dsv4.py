@@ -55,6 +55,61 @@ class Dsv4Handler(DefaultMoeHandler):
 
         return DEEPSEEK_V4_CHAT_TEMPLATE
 
+    def identity_lora_target_parameters(
+        self,
+        model: Any,
+        *,
+        target_modules: list[str],
+    ) -> list[str]:
+        target_set = set(target_modules)
+
+        def include(name: str) -> bool:
+            if ".self_attn.compressor.indexer." in name:
+                return False
+            if "q_a_proj" in target_set and name.endswith(".self_attn.q_a_proj.weight"):
+                return True
+            if "q_b_proj" in target_set and name.endswith(".self_attn.q_b_proj.weight"):
+                return True
+            if "kv_proj" in target_set and name.endswith(".self_attn.kv_proj.weight"):
+                return True
+            if "o_a_proj" in target_set and name.endswith(".self_attn.o_a_proj.weight"):
+                return True
+            if "o_b_proj" in target_set and name.endswith(".self_attn.o_b_proj.weight"):
+                return True
+            if "compressor.kv_proj" in target_set and name.endswith(
+                ".self_attn.compressor.kv_proj.weight"
+            ):
+                return True
+            if "compressor.gate_proj" in target_set and name.endswith(
+                ".self_attn.compressor.gate_proj.weight"
+            ):
+                return True
+            if (
+                "gate_proj" in target_set
+                and ".mlp." in name
+                and name.endswith(".gate_proj.weight")
+            ):
+                return True
+            if (
+                "up_proj" in target_set
+                and ".mlp." in name
+                and name.endswith(".up_proj.weight")
+            ):
+                return True
+            if (
+                "down_proj" in target_set
+                and ".mlp." in name
+                and name.endswith(".down_proj.weight")
+            ):
+                return True
+            if "experts" in target_set and name.endswith(
+                (".mlp.experts.gate_up_proj", ".mlp.experts.down_proj")
+            ):
+                return True
+            return False
+
+        return [name for name, _ in model.named_parameters() if include(name)]
+
     def install_preprocess_patch(self, model_chunks: Sequence[Any]) -> None:
         from megatron.core.models.gpt.gpt_model import GPTModel
 
@@ -138,6 +193,7 @@ class Dsv4Handler(DefaultMoeHandler):
         alpha: int,
     ) -> None:
         from art.megatron.dsv4.layer import Dsv4TransformerLayer
+        from art.megatron.dsv4.lora import apply_dsv4_attention_lora
         from art.megatron.lora import (
             _adapter_model_prefix,
             wrap_grouped_moe_experts,
@@ -150,6 +206,13 @@ class Dsv4Handler(DefaultMoeHandler):
                 if not isinstance(module, Dsv4TransformerLayer):
                     continue
                 adapter_model_prefix = _adapter_model_prefix(module)
+                apply_dsv4_attention_lora(
+                    module.self_attention,
+                    adapter_model_prefix=adapter_model_prefix,
+                    target_modules=target_set,
+                    rank=rank,
+                    alpha=alpha,
+                )
                 wrap_grouped_moe_experts(
                     _require_moe_experts(module),
                     adapter_model_prefix=adapter_model_prefix,
@@ -171,6 +234,7 @@ class Dsv4Handler(DefaultMoeHandler):
         self, model_chunks: Sequence[Any]
     ) -> dict[str, list[Any]]:
         from art.megatron.dsv4.layer import Dsv4TransformerLayer
+        from art.megatron.dsv4.lora import add_dsv4_attention_adapter_weights
         from art.megatron.weights.adapter_export import (
             add_grouped_moe_adapter_weights,
             add_shared_experts_adapter_weights,
@@ -183,6 +247,11 @@ class Dsv4Handler(DefaultMoeHandler):
                 if not isinstance(module, Dsv4TransformerLayer):
                     continue
                 layer_prefix = layer_base_prefix(module, module_name=module_name)
+                add_dsv4_attention_adapter_weights(
+                    adapter_weights_by_base,
+                    layer_prefix=layer_prefix,
+                    attention=module.self_attention,
+                )
                 add_grouped_moe_adapter_weights(
                     adapter_weights_by_base,
                     layer_prefix=layer_prefix,

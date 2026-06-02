@@ -52,6 +52,13 @@ _QWEN3_5_MOE_TARGET_MODULES = (
     "experts",
 )
 _DSV4_TARGET_MODULES = (
+    "q_a_proj",
+    "q_b_proj",
+    "kv_proj",
+    "o_a_proj",
+    "o_b_proj",
+    "compressor.kv_proj",
+    "compressor.gate_proj",
     "gate_proj",
     "up_proj",
     "down_proj",

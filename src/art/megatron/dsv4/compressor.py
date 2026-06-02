@@ -54,6 +54,18 @@ def _overlap_transform(
     return new_tensor
 
 
+def _add_lora_if_present(
+    owner: nn.Module,
+    attr_name: str,
+    base: torch.Tensor,
+    x: torch.Tensor,
+) -> torch.Tensor:
+    lora = getattr(owner, attr_name, None)
+    if lora is None:
+        return base
+    return base + lora(x)
+
+
 class DeepSeekV4Compressor(nn.Module):
     def __init__(
         self,
@@ -154,8 +166,12 @@ class DeepSeekV4Compressor(nn.Module):
         if self.cp_size > 1:
             assert usable % (ratio * 2) == 0
 
-        kv = linear_bf16_fp32(x, self.wkv.weight)
-        score = linear_bf16_fp32(x, self.wgate.weight)
+        kv = _add_lora_if_present(
+            self, "kv_proj_lora", linear_bf16_fp32(x, self.wkv.weight), x
+        )
+        score = _add_lora_if_present(
+            self, "gate_proj_lora", linear_bf16_fp32(x, self.wgate.weight), x
+        )
 
         kv = kv.unflatten(1, (-1, ratio))
         score = score.unflatten(1, (-1, ratio)) + self.ape

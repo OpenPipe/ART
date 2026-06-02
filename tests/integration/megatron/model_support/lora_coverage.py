@@ -22,6 +22,13 @@ from .oracle_harness import OracleCaseConfig, oracle_topology
 from .oracle_worker import _configure_provider, provider_topology_env
 
 _WRAPPED_TARGET_SUFFIXES: dict[str, tuple[str, ...]] = {
+    "q_a_proj": (".self_attn.q_a_proj",),
+    "q_b_proj": (".self_attn.q_b_proj",),
+    "kv_proj": (".self_attn.kv_proj",),
+    "o_a_proj": (".self_attn.o_a_proj",),
+    "o_b_proj": (".self_attn.o_b_proj",),
+    "compressor.kv_proj": (".self_attn.compressor.kv_proj",),
+    "compressor.gate_proj": (".self_attn.compressor.gate_proj",),
     "q_proj": (".self_attn.q_proj",),
     "k_proj": (".self_attn.k_proj",),
     "v_proj": (".self_attn.v_proj",),
@@ -107,6 +114,27 @@ def _covered_exported_target_modules(
 ) -> set[str]:
     covered: set[str] = set()
     for base_name, adapter_weights in adapter_weights_by_base.items():
+        if base_name.endswith(".self_attention.wq_a.weight"):
+            covered.add("q_a_proj")
+            continue
+        if base_name.endswith(".self_attention.wq_b.weight"):
+            covered.add("q_b_proj")
+            continue
+        if base_name.endswith(".self_attention.wkv.weight"):
+            covered.add("kv_proj")
+            continue
+        if base_name.endswith(".self_attention.wo_a.weight"):
+            covered.add("o_a_proj")
+            continue
+        if base_name.endswith(".self_attention.wo_b.weight"):
+            covered.add("o_b_proj")
+            continue
+        if base_name.endswith(".self_attention.compressor.wkv.weight"):
+            covered.add("compressor.kv_proj")
+            continue
+        if base_name.endswith(".self_attention.compressor.wgate.weight"):
+            covered.add("compressor.gate_proj")
+            continue
         if base_name.endswith(".self_attention.linear_qkv.weight"):
             for adapter_weight in adapter_weights:
                 adapter_key = getattr(adapter_weight, "adapter_key", None)

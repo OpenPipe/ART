@@ -68,6 +68,18 @@ def _compress_topk_idxs(
     return compress.unsqueeze(0).expand(bsz, -1, -1)
 
 
+def _add_lora_if_present(
+    owner: nn.Module,
+    attr_name: str,
+    base: torch.Tensor,
+    x: torch.Tensor,
+) -> torch.Tensor:
+    lora = getattr(owner, attr_name, None)
+    if lora is None:
+        return base
+    return base + lora(x)
+
+
 class DeepSeekV4Attention(MegatronModule):
     def __init__(
         self,
@@ -265,9 +277,9 @@ class DeepSeekV4Attention(MegatronModule):
         ratio = self.compress_ratio
         rd = self.rope_head_dim
 
-        q_after_wq_a = self.wq_a(x)[0]
+        q_after_wq_a = _add_lora_if_present(self, "wq_a_lora", self.wq_a(x)[0], x)
         qr = q = cast(Any, self.q_norm)(q_after_wq_a)
-        q_after_wq_b = self.wq_b(q)[0]
+        q_after_wq_b = _add_lora_if_present(self, "wq_b_lora", self.wq_b(q)[0], q)
         q = q_after_wq_b.unflatten(-1, (self.n_local_heads, self.head_dim))
         q_fp32 = q.float()
         q = (
@@ -276,7 +288,7 @@ class DeepSeekV4Attention(MegatronModule):
         q = q.clone()
         apply_rotary_emb(q[..., -rd:], freqs_cis)
 
-        kv_after_wkv = self.wkv(x)[0]
+        kv_after_wkv = _add_lora_if_present(self, "wkv_lora", self.wkv(x)[0], x)
         kv_vanilla = cast(Any, self.kv_norm)(kv_after_wkv)
         kv_vanilla = kv_vanilla.clone()
         apply_rotary_emb(kv_vanilla[..., -rd:], freqs_cis)
@@ -348,11 +360,15 @@ class DeepSeekV4Attention(MegatronModule):
         apply_rotary_emb(o[..., -rd:], freqs_cis, inverse=True)
 
         o = o.view(bsz, seqlen_local, self.n_local_groups, -1)
+        wo_a_input = o
         wo_a = cast(torch.Tensor, self.wo_a.weight).view(
             self.n_local_groups, self.o_lora_rank, -1
         )
         o = torch.einsum("bsgd,grd->bsgr", o, wo_a)
-        x, _ = self.wo_b(o.flatten(2))
+        o = _add_lora_if_present(self, "wo_a_lora", o, wo_a_input)
+        wo_b_input = o.flatten(2)
+        x, _ = self.wo_b(wo_b_input)
+        x = _add_lora_if_present(self, "wo_b_lora", x, wo_b_input)
 
         output = einops.rearrange(x, "b s d -> s b d")
 
