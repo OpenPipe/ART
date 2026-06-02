@@ -52,9 +52,22 @@ class Dsv4Handler(DefaultMoeHandler):
         provider.mtp_num_layers = None
 
     def default_chat_template(self) -> str | None:
-        from art.megatron.dsv4.chat_template import DEEPSEEK_V4_CHAT_TEMPLATE
+        return None
 
-        return DEEPSEEK_V4_CHAT_TEMPLATE
+    def configure_tokenizer(
+        self,
+        tokenizer: Any,
+        *,
+        internal_config: Any,
+    ) -> Any:
+        from art.megatron.dsv4.tokenizer import (
+            get_dsv4_tokenizer,
+            has_configured_chat_template,
+        )
+
+        if has_configured_chat_template(internal_config):
+            return tokenizer
+        return get_dsv4_tokenizer(tokenizer)
 
     def identity_lora_target_parameters(
         self,

@@ -90,6 +90,13 @@ class ModelSupportHandler(Protocol):
 
     def default_chat_template(self) -> str | None: ...
 
+    def configure_tokenizer(
+        self,
+        tokenizer: Any,
+        *,
+        internal_config: Any,
+    ) -> Any: ...
+
     def install_preprocess_patch(self, model_chunks: Sequence[Any]) -> None: ...
 
     def collect_layer_families(self, provider: Any) -> list[LayerFamilyInstance]: ...

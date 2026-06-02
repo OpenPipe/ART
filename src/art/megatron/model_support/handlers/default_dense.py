@@ -87,6 +87,15 @@ class DefaultDenseHandler:
     def default_chat_template(self) -> str | None:
         return None
 
+    def configure_tokenizer(
+        self,
+        tokenizer: Any,
+        *,
+        internal_config: Any,
+    ) -> Any:
+        del internal_config
+        return tokenizer
+
     def install_preprocess_patch(self, model_chunks: Sequence[Any]) -> None:
         del model_chunks
         return None

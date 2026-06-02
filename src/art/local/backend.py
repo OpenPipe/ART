@@ -116,6 +116,16 @@ def _model_support_default_chat_template(
     base_model: str,
     internal_config: dev.InternalModelConfig,
 ) -> str | None:
+    handler = _model_support_handler(base_model, internal_config)
+    if handler is None:
+        return None
+    return handler.default_chat_template()
+
+
+def _model_support_handler(
+    base_model: str,
+    internal_config: dev.InternalModelConfig,
+) -> Any | None:
     from ..megatron.model_support.registry import (
         UnsupportedModelArchitectureError,
         get_model_support_handler,
@@ -130,7 +140,7 @@ def _model_support_default_chat_template(
         )
     except UnsupportedModelArchitectureError:
         return None
-    return handler.default_chat_template()
+    return handler
 
 
 def _apply_configured_chat_template(
@@ -148,6 +158,26 @@ def _apply_configured_chat_template(
         default = _model_support_default_chat_template(base_model, internal_config)
         if default is not None:
             tokenizer.chat_template = default
+
+
+def _configure_tokenizer_for_model_support(
+    tokenizer: PreTrainedTokenizerBase,
+    internal_config: dev.InternalModelConfig,
+    *,
+    base_model: str,
+) -> PreTrainedTokenizerBase:
+    _apply_configured_chat_template(
+        tokenizer,
+        internal_config,
+        base_model=base_model,
+    )
+    handler = _model_support_handler(base_model, internal_config)
+    if handler is None:
+        return tokenizer
+    return cast(
+        PreTrainedTokenizerBase,
+        handler.configure_tokenizer(tokenizer, internal_config=internal_config),
+    )
 
 
 def _apply_configured_chat_template_server_args(
@@ -540,17 +570,12 @@ class LocalBackend(Backend):
         internal_config = cast(dev.InternalModelConfig, model._internal_config or {})
         tokenizer_key = _tokenizer_cache_key(model.base_model, internal_config)
         if tokenizer_key not in self._tokenizers:
-            tokenizer = AutoTokenizer.from_pretrained(model.base_model)
-            _apply_configured_chat_template(
-                tokenizer, internal_config, base_model=model.base_model
-            )
-            self._tokenizers[tokenizer_key] = tokenizer
-        else:
-            _apply_configured_chat_template(
-                self._tokenizers[tokenizer_key],
+            tokenizer = _configure_tokenizer_for_model_support(
+                AutoTokenizer.from_pretrained(model.base_model),
                 internal_config,
                 base_model=model.base_model,
             )
+            self._tokenizers[tokenizer_key] = tokenizer
         if model.base_model not in self._image_processors:
             try:
                 from transformers import AutoImageProcessor
@@ -1133,15 +1158,13 @@ class LocalBackend(Backend):
         internal_config = cast(dev.InternalModelConfig, model._internal_config or {})
         tokenizer_key = _tokenizer_cache_key(model.base_model, internal_config)
         if tokenizer_key not in self._tokenizers:
-            tokenizer = AutoTokenizer.from_pretrained(model.base_model)
-            _apply_configured_chat_template(
-                tokenizer, internal_config, base_model=model.base_model
+            tokenizer = _configure_tokenizer_for_model_support(
+                AutoTokenizer.from_pretrained(model.base_model),
+                internal_config,
+                base_model=model.base_model,
             )
             self._tokenizers[tokenizer_key] = tokenizer
         tokenizer = self._tokenizers[tokenizer_key]
-        _apply_configured_chat_template(
-            tokenizer, internal_config, base_model=model.base_model
-        )
 
         from ..utils.sft import resolve_sft_batch_size
 
