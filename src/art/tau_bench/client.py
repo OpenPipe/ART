@@ -30,7 +30,9 @@ def _normalize_timeout(timeout: float | httpx.Timeout | None) -> httpx.Timeout |
 
 
 def _default_status_retries() -> int:
-    return max(0, int(os.getenv("TAU_BENCH_HTTP_STATUS_RETRIES", DEFAULT_STATUS_RETRIES)))
+    return max(
+        0, int(os.getenv("TAU_BENCH_HTTP_STATUS_RETRIES", DEFAULT_STATUS_RETRIES))
+    )
 
 
 def _default_retry_base_delay() -> float:
@@ -116,7 +118,9 @@ class TauBenchClient:
         retry_base_delay: float | None = None,
         retry_max_delay: float | None = None,
     ) -> None:
-        self.api_key = api_key if api_key is not None else os.getenv("TAU_BENCH_API_KEY")
+        self.api_key = (
+            api_key if api_key is not None else os.getenv("TAU_BENCH_API_KEY")
+        )
         self.status_retries = (
             status_retries if status_retries is not None else _default_status_retries()
         )
@@ -126,7 +130,9 @@ class TauBenchClient:
             else _default_retry_base_delay()
         )
         self.retry_max_delay = (
-            retry_max_delay if retry_max_delay is not None else _default_retry_max_delay()
+            retry_max_delay
+            if retry_max_delay is not None
+            else _default_retry_max_delay()
         )
         self._owns_client = http_client is None
         self._client = http_client or httpx.AsyncClient(
@@ -275,7 +281,9 @@ class TauBenchClient:
                 ):
                     return response
                 await response.aclose()
-            await asyncio.sleep(min(self.retry_base_delay * (2**attempt), self.retry_max_delay))
+            await asyncio.sleep(
+                min(self.retry_base_delay * (2**attempt), self.retry_max_delay)
+            )
         assert last_transport_error is not None
         raise last_transport_error
 

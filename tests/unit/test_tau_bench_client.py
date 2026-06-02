@@ -54,7 +54,11 @@ async def test_client_sends_auth_and_parses_scenarios() -> None:
         seen["query"] = str(request.url.query, "utf-8")
         return httpx.Response(
             200,
-            json={"scenarios": [{"domain": "banking_knowledge", "task": {"id": "task_001"}}]},
+            json={
+                "scenarios": [
+                    {"domain": "banking_knowledge", "task": {"id": "task_001"}}
+                ]
+            },
         )
 
     http_client = httpx.AsyncClient(
@@ -137,7 +141,9 @@ async def test_client_retries_transport_errors() -> None:
 
 
 @pytest.mark.asyncio
-async def test_module_default_client_can_be_replaced(monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_module_default_client_can_be_replaced(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     tau_bench = importlib.import_module("art.tau_bench")
     client_module = importlib.import_module("art.tau_bench.client")
 
@@ -227,7 +233,9 @@ class FakeAsyncOpenAI:
 
 
 @pytest.mark.asyncio
-async def test_rollout_supports_string_model_args(monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_rollout_supports_string_model_args(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     rollout_module = importlib.import_module("art.tau_bench.rollout")
     rollout_module.openai_clients.clear()
     monkeypatch.setattr(rollout_module, "AsyncOpenAI", FakeAsyncOpenAI)
@@ -251,8 +259,7 @@ async def test_rollout_supports_string_model_args(monkeypatch: pytest.MonkeyPatc
 
 
 @pytest.mark.asyncio
-async def test_rollout_supports_art_model_like_args(
-) -> None:
+async def test_rollout_supports_art_model_like_args() -> None:
     rollout_module = importlib.import_module("art.tau_bench.rollout")
     model = art.Model(
         name="registered-model",
