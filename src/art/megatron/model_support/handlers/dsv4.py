@@ -78,7 +78,11 @@ class Dsv4Handler(DefaultMoeHandler):
                         child.set_input_ids(
                             input_ids if isinstance(input_ids, torch.Tensor) else None
                         )
-                return _preprocess(*args, **kwargs)
+                preproc_output = list(_preprocess(*args, **kwargs))
+                decoder_input = cast(torch.Tensor, preproc_output[0])
+                if not decoder_input.requires_grad and decoder_input.is_leaf:
+                    decoder_input.requires_grad_(True)
+                return tuple(preproc_output)
 
             gpt_module._preprocess = preprocess_hook  # type: ignore[attr-defined]
 
