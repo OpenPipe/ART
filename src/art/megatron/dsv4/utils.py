@@ -1,4 +1,12 @@
 import torch
+from torch import nn
+
+
+def freeze_parameters_as_buffers(module: nn.Module) -> None:
+    for child in module.modules():
+        for name, param in list(child.named_parameters(recurse=False)):
+            del child._parameters[name]
+            child.register_buffer(name, param.detach(), persistent=True)
 
 
 def rotate_activation(x: torch.Tensor) -> torch.Tensor:

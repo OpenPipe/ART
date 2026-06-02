@@ -49,6 +49,7 @@ from transformers.utils.generic import maybe_autocast, merge_with_config_default
 from transformers.utils.output_capturing import OutputRecorder, capture_outputs
 
 from art.megatron.dsv4.hf_config import DeepseekV4Config
+from art.megatron.dsv4.utils import freeze_parameters_as_buffers
 
 
 class DeepseekV4SqrtSoftplusActivation(nn.Module):
@@ -594,8 +595,7 @@ class DeepseekV4Indexer(nn.Module):
         )
         self.weights_proj = nn.Linear(config.hidden_size, self.num_heads, bias=False)
         self.rotary_emb = DeepseekV4RotaryEmbedding(config)
-        for param in self.parameters():
-            param.requires_grad_(False)
+        freeze_parameters_as_buffers(self)
 
     def forward(
         self,
