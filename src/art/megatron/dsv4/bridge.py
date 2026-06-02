@@ -8,6 +8,7 @@ from megatron.bridge.models.conversion.param_mapping import (
     FusedExpertMapping,
     FusedGatedExpertMapping,
     GatedMLPMapping,
+    ReplicatedMapping,
 )
 from megatron.bridge.models.deepseek.deepseek_v3_bridge import DeepSeekV3Bridge
 from megatron.bridge.models.mla_provider import MLAModelProvider
@@ -248,11 +249,11 @@ def _dsv4_mapping_registry() -> MegatronMappingRegistry:
             "decoder.layers.*.self_attention.compressor.ape",
             "model.layers.*.self_attn.compressor.position_bias",
         ),
-        AutoMapping(
+        ReplicatedMapping(
             "decoder.layers.*.self_attention.compressor.wkv.weight",
             "model.layers.*.self_attn.compressor.kv_proj.weight",
         ),
-        AutoMapping(
+        ReplicatedMapping(
             "decoder.layers.*.self_attention.compressor.wgate.weight",
             "model.layers.*.self_attn.compressor.gate_proj.weight",
         ),
@@ -272,11 +273,11 @@ def _dsv4_mapping_registry() -> MegatronMappingRegistry:
             "decoder.layers.*.self_attention.indexer.compressor.ape",
             "model.layers.*.self_attn.compressor.indexer.position_bias",
         ),
-        AutoMapping(
+        ReplicatedMapping(
             "decoder.layers.*.self_attention.indexer.compressor.wkv.weight",
             "model.layers.*.self_attn.compressor.indexer.kv_proj.weight",
         ),
-        AutoMapping(
+        ReplicatedMapping(
             "decoder.layers.*.self_attention.indexer.compressor.wgate.weight",
             "model.layers.*.self_attn.compressor.indexer.gate_proj.weight",
         ),
