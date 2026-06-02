@@ -181,7 +181,7 @@ class Dsv4Handler(DefaultMoeHandler):
         self, *, config: Any, dtype: torch.dtype
     ) -> dict[str, Any]:
         del config, dtype
-        return {"experts_implementation": "eager"}
+        return {"experts_implementation": "eager", "ignore_mismatched_sizes": True}
 
     def configure_oracle_provider(self, provider: Any, *, case_config: Any) -> None:
         """Mirrors HF oracle reductions while keeping DSV4 hard kernel invariants."""
