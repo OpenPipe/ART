@@ -33,6 +33,10 @@ class Dsv4Handler(DefaultMoeHandler):
     is_moe = True
     native_vllm_lora_status = "disabled"
 
+    def identity_lora_model_config(self, base_config: Any) -> Any:
+        self.ensure_hf_reference_registered()
+        return base_config
+
     def patch_provider(self, provider: Any, bridge: Any) -> None:
         del bridge
         from art.megatron.dsv4.spec import get_dsv4_decoder_block_spec
@@ -262,4 +266,11 @@ def ensure_dsv4_bridge_registered() -> None:
     _ensure()
 
 
+def _ensure_dsv4_hf_config_registered() -> None:
+    from art.megatron.dsv4.hf_config import ensure_dsv4_hf_config_registered
+
+    ensure_dsv4_hf_config_registered()
+
+
+_ensure_dsv4_hf_config_registered()
 DSV4_HANDLER = Dsv4Handler()
