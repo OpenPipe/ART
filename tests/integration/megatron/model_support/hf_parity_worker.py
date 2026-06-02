@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 from contextlib import ExitStack
 import faulthandler
+from itertools import chain
 import os
 from pathlib import Path
 import re
@@ -324,6 +325,22 @@ def _collect_hf_grads(model: Any) -> dict[str, torch.Tensor]:
     return grads
 
 
+def _collect_hf_state_dict(model: Any) -> dict[str, torch.Tensor]:
+    return {
+        key: value.detach().cpu().clone()
+        for key, value in model.state_dict().items()
+        if _is_language_hf_param_name(key)
+    }
+
+
+def _use_hf_reference_state_for_hf_parity(base_model: str) -> bool:
+    from art.megatron.model_support.registry import get_model_support_handler
+
+    handler = get_model_support_handler(base_model)
+    enabled = getattr(handler, "use_hf_reference_state_for_hf_parity", None)
+    return bool(enabled()) if enabled is not None else False
+
+
 def _bridge_compatible_hf_key(key: str, expected_keys: set[str]) -> str:
     if key in expected_keys:
         return key
@@ -474,6 +491,7 @@ def _run_hf_sft_step(
     torch.Tensor,
     dict[str, torch.Tensor],
     MoeRoutingReplayBundle | None,
+    dict[str, torch.Tensor] | None,
 ]:
     _debug("loading HF model")
     model = _load_hf_model(
@@ -525,6 +543,11 @@ def _run_hf_sft_step(
         token_count += int(mask.sum().item())
         (masked_losses.sum() / total_token_count).backward()
     grads = _collect_hf_grads(model)
+    hf_reference_state_dict = (
+        _collect_hf_state_dict(model)
+        if _use_hf_reference_state_for_hf_parity(base_model)
+        else None
+    )
     routing_replay_bundle = route_capture.build_replay_bundle(topology=topology)
     scalar_loss = (loss_sum / max(token_count, 1)).detach().cpu().reshape(1)
     output_vector = torch.cat(trainable_losses, dim=0).to(dtype=torch.float32)
@@ -533,7 +556,13 @@ def _run_hf_sft_step(
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
     _debug("finished HF step")
-    return output_vector, scalar_loss, grads, routing_replay_bundle
+    return (
+        output_vector,
+        scalar_loss,
+        grads,
+        routing_replay_bundle,
+        hf_reference_state_dict,
+    )
 
 
 def _install_hf_qwen35_gdn_fp32_reference(model: Any, *, base_model: str) -> None:
@@ -571,6 +600,113 @@ def _build_megatron_runtime(
         trainable_parameter_mode="base_model",
         allow_unvalidated_arch=request.case_config.allow_unvalidated_arch,
     )
+
+
+def _hf_param_names_for_mapping(hf_param: Any) -> list[str]:
+    if isinstance(hf_param, str):
+        return [hf_param]
+    if isinstance(hf_param, dict):
+        return [value for value in hf_param.values() if isinstance(value, str)]
+    return []
+
+
+def _build_hf_parity_conversion_tasks(
+    *,
+    bridge: Any,
+    model: megatron_train.ModelChunks,
+    hf_keys: set[str],
+) -> list[Any]:
+    from megatron.bridge.models.conversion.model_bridge import (
+        WeightConversionTask,
+        _megatron_local_name_to_global,
+    )
+    from megatron.bridge.models.conversion.utils import (
+        get_module_and_param_from_name,
+        persistent_buffers,
+    )
+
+    from art.megatron.training.model_chunks import as_megatron_api_chunks
+    from art.megatron.weights.param_name_canonicalization import (
+        canonical_art_param_name,
+        is_art_adapter_param_name,
+    )
+
+    mapping_registry = bridge._model_bridge.mapping_registry()
+    megatron_models = as_megatron_api_chunks(model)
+    model_config = cast(Any, model[0].config)
+    tasks: list[Any] = []
+    for vp_stage, chunk in enumerate(model):
+        for local_name, _ in chain(chunk.named_parameters(), persistent_buffers(chunk)):
+            if "_extra_state" in local_name or is_art_adapter_param_name(local_name):
+                continue
+            global_name = _megatron_local_name_to_global(
+                megatron_models,
+                model_config,
+                canonical_art_param_name(local_name),
+                vp_stage,
+            )
+            mapping = mapping_registry.megatron_to_hf_lookup(global_name)
+            missing_hf_params = sorted(
+                set(_hf_param_names_for_mapping(mapping.hf_param)) - hf_keys
+            )
+            if missing_hf_params:
+                raise RuntimeError(
+                    "Missing HF oracle weights for Megatron param "
+                    f"{global_name}: {missing_hf_params}"
+                )
+            local_module, local_weights = cast(
+                tuple[Any, torch.Tensor],
+                get_module_and_param_from_name(
+                    megatron_models,
+                    local_name,
+                    vp_stage,
+                ),
+            )
+            if local_module is not None and not hasattr(local_module, "config"):
+                setattr(local_module, "config", model_config)
+            tasks.append(
+                WeightConversionTask(
+                    pp_rank=0,
+                    vp_stage=vp_stage,
+                    param_name=local_name,
+                    global_param_name=global_name,
+                    megatron_module=local_module,
+                    param_weight=local_weights,
+                    mapping=mapping,
+                )
+            )
+    return tasks
+
+
+def _seed_megatron_from_hf_reference_state(
+    runtime: megatron_train.TrainingRuntime,
+    *,
+    tasks: list[Any],
+    hf_reference_state_dict: dict[str, torch.Tensor],
+) -> None:
+    model_bridge = runtime.bridge._model_bridge
+    for task in tasks:
+        if task.megatron_module is None or task.param_weight is None:
+            continue
+        hf_weights = model_bridge.maybe_modify_loaded_hf_weight(
+            task.mapping.hf_param,
+            hf_reference_state_dict,
+        )
+        converted_weights = task.mapping.hf_to_megatron(
+            hf_weights, task.megatron_module
+        )
+        if converted_weights is None:
+            continue
+        if tuple(converted_weights.shape) != tuple(task.param_weight.shape):
+            raise RuntimeError(
+                "HF oracle seed shape mismatch for Megatron param "
+                f"{task.global_param_name}: expected={tuple(task.param_weight.shape)} "
+                f"got={tuple(converted_weights.shape)} "
+                f"mapping={type(task.mapping).__name__} hf={task.mapping.hf_param}"
+            )
+        task.param_weight.data.copy_(converted_weights, non_blocking=True)
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
 
 
 def _dtype_for_precision(precision: str) -> torch.dtype:
@@ -644,6 +780,7 @@ def _convert_megatron_tasks_to_hf(
     *,
     mode: str,
     tasks: list[Any] | None = None,
+    hf_state_dict_override: dict[str, torch.Tensor] | None = None,
 ) -> dict[str, torch.Tensor]:
     if tasks is None:
         tasks = [
@@ -655,7 +792,11 @@ def _convert_megatron_tasks_to_hf(
             if isinstance(task.param_weight, torch.nn.Parameter)
         ]
     model_bridge = runtime.bridge._model_bridge
-    hf_state_dict = runtime.bridge.hf_pretrained.state
+    hf_state_dict = (
+        hf_state_dict_override
+        if hf_state_dict_override is not None
+        else runtime.bridge.hf_pretrained.state
+    )
     grouped_buffers: dict[str, dict[int, torch.Tensor]] = {}
     converted: dict[str, torch.Tensor] = {}
     for task in tasks:
@@ -697,6 +838,7 @@ def _run_megatron_sft_step(
     sample_indices: list[int | None],
     device: torch.device,
     moe_routing_replay_bundle: MoeRoutingReplayBundle | None = None,
+    hf_reference_state_dict: dict[str, torch.Tensor] | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, dict[str, torch.Tensor]]:
     runtime = _build_megatron_runtime(
         request,
@@ -715,16 +857,33 @@ def _run_megatron_sft_step(
             sample_index=sample_indices,
             global_grad_accumulation_sequences=request.case_config.grad_accumulation_sequences,
         )
+    if hf_reference_state_dict is None:
+        tasks = [
+            task
+            for task in build_art_conversion_tasks(
+                bridge=runtime.bridge,
+                model=runtime.model,
+            )
+            if isinstance(task.param_weight, torch.nn.Parameter)
+        ]
+    else:
+        tasks = [
+            task
+            for task in _build_hf_parity_conversion_tasks(
+                bridge=runtime.bridge,
+                model=runtime.model,
+                hf_keys=set(hf_reference_state_dict),
+            )
+            if isinstance(task.param_weight, torch.nn.Parameter)
+        ]
+        _debug("seeding Megatron weights from HF oracle state")
+        _seed_megatron_from_hf_reference_state(
+            runtime,
+            tasks=tasks,
+            hf_reference_state_dict=hf_reference_state_dict,
+        )
     _debug("initializing Megatron optimizer state")
     megatron_train._eager_initialize_optimizer_state(runtime.optimizer)
-    tasks = [
-        task
-        for task in build_art_conversion_tasks(
-            bridge=runtime.bridge,
-            model=runtime.model,
-        )
-        if isinstance(task.param_weight, torch.nn.Parameter)
-    ]
     _debug(f"built {len(tasks)} Megatron conversion tasks")
     for chunk in runtime.model:
         if hasattr(chunk, "zero_grad_buffer"):
@@ -790,6 +949,7 @@ def _run_megatron_sft_step(
         runtime,
         mode="grad",
         tasks=derivative_tasks,
+        hf_state_dict_override=hf_reference_state_dict,
     )
     _debug("exported Megatron grads")
     if runtime.moe_routing_replay_controller is not None:
@@ -870,7 +1030,13 @@ def _worker_run(request: HfParityRunRequest) -> None:
         )
     try:
         _debug("starting HF parity worker")
-        hf_outputs, hf_loss, hf_grads, moe_routing_replay_bundle = _run_hf_sft_step(
+        (
+            hf_outputs,
+            hf_loss,
+            hf_grads,
+            moe_routing_replay_bundle,
+            hf_reference_state_dict,
+        ) = _run_hf_sft_step(
             base_model=request.case_config.base_model,
             num_layers=request.case_config.num_layers,
             micro_inputs=micro_inputs,
@@ -885,6 +1051,7 @@ def _worker_run(request: HfParityRunRequest) -> None:
             sample_indices=sample_indices,
             device=device,
             moe_routing_replay_bundle=moe_routing_replay_bundle,
+            hf_reference_state_dict=hf_reference_state_dict,
         )
         _debug("finished HF and Megatron steps, building report")
         normalized_hf_grads = _normalize_hf_grads_for_bridge(

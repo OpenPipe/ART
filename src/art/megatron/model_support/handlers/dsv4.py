@@ -183,6 +183,16 @@ class Dsv4Handler(DefaultMoeHandler):
         del config, dtype
         return {"experts_implementation": "eager", "ignore_mismatched_sizes": True}
 
+    def use_hf_reference_state_for_hf_parity(self) -> bool:
+        """DSV4 parity seeds Megatron from the reduced canonical HF oracle state.
+
+        The public checkpoint uses Miles/RadixArk source names and full model
+        shapes, while the validation oracle uses canonical HF names and reduced
+        fit-only axes. This hook is validation-only; production loading remains
+        tied to the normal Bridge checkpoint source.
+        """
+        return True
+
     def configure_oracle_provider(self, provider: Any, *, case_config: Any) -> None:
         """Mirrors HF oracle reductions while keeping DSV4 hard kernel invariants."""
         del case_config
