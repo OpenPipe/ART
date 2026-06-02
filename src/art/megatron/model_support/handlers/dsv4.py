@@ -224,6 +224,7 @@ class Dsv4Handler(DefaultMoeHandler):
         provider.dsa_indexer_n_heads = _ORACLE_INDEX_HEADS
         provider.dsa_indexer_head_dim = 128
         provider.dsa_indexer_topk = _ORACLE_INDEX_TOPK
+        provider.dsv4_oracle_freeze_attn_sink = True
 
     def _apply_oracle_shape_overrides(self, config: Any) -> None:
         """Reduces memory-heavy axes only; head_dim/window/o-rank stay production-sized."""
@@ -237,6 +238,7 @@ class Dsv4Handler(DefaultMoeHandler):
         config.index_n_heads = _ORACLE_INDEX_HEADS
         config.index_head_dim = 128
         config.index_topk = _ORACLE_INDEX_TOPK
+        config.dsv4_oracle_freeze_attn_sink = True
 
 
 def ensure_dsv4_bridge_registered() -> None:

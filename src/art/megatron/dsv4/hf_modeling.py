@@ -966,7 +966,11 @@ class DeepseekV4Attention(nn.Module):
         self.o_b_proj = nn.Linear(
             config.o_groups * config.o_lora_rank, config.hidden_size, bias=False
         )
-        self.sinks = nn.Parameter(torch.empty(self.num_heads))
+        sinks = torch.empty(self.num_heads)
+        if bool(getattr(config, "dsv4_oracle_freeze_attn_sink", False)):
+            self.register_buffer("sinks", sinks, persistent=True)
+        else:
+            self.sinks = nn.Parameter(sinks)
         self.compressor = (
             COMPRESSOR_CLASSES[self.layer_type](config)  # ty:ignore[call-non-callable]
             if self.layer_type != "sliding_attention"
