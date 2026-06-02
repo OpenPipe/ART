@@ -237,8 +237,12 @@ allowed-unresolved-imports = [
     "matplotlib.**",
     "seaborn.**",
     # megatron deps
+    "causal_conv1d.**",
+    "fla.**",
     "megatron.**",
     "quack.**",
+    "transformer_engine.**",
+    "triton.**",
 ]
 
 [dependency-groups]
