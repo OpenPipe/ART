@@ -284,6 +284,7 @@ class Dsv4Handler(DefaultMoeHandler):
         config.index_head_dim = 128
         config.index_topk = _ORACLE_INDEX_TOPK
         config.dsv4_oracle_freeze_attn_sink = True
+        config.dsv4_oracle_source_aliases = True
 
 
 def ensure_dsv4_bridge_registered() -> None:
