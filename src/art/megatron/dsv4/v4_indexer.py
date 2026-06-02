@@ -9,10 +9,7 @@ from megatron.core.transformer.transformer_config import TransformerConfig
 import torch
 
 from art.megatron.dsv4.compressor import DeepSeekV4Compressor
-from art.megatron.dsv4.kernel.tilelang_indexer_fwd import (
-    _make_causal_cu_seqlens,
-    batched_indexer_fwd,
-)
+from art.megatron.dsv4.kernel.tilelang_indexer_fwd import _make_causal_cu_seqlens
 from art.megatron.dsv4.qat import fp8_simulate_qat
 from art.megatron.dsv4.rope import (
     apply_rotary_emb,
@@ -20,6 +17,52 @@ from art.megatron.dsv4.rope import (
     get_rope_cache,
 )
 from art.megatron.dsv4.utils import freeze_parameters_as_buffers, rotate_activation
+
+
+@torch.compiler.disable
+def _exact_indexer_topk(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    weights: torch.Tensor,
+    cu_seqlen_ks: torch.Tensor,
+    cu_seqlen_ke: torch.Tensor,
+    topk: int,
+) -> torch.Tensor:
+    seqlen, batch, heads, _ = q.shape
+    seqlen_kv = k.shape[0]
+    actual_topk = min(topk, seqlen_kv)
+    out = torch.empty(batch, seqlen, actual_topk, device=q.device, dtype=torch.long)
+    if actual_topk == 0:
+        return out
+
+    kv_ids = torch.arange(seqlen_kv, device=q.device)
+    q_block = 128
+    h_block = 8
+    with torch.no_grad():
+        for b in range(batch):
+            k_b = k[:, b].float()
+            for q_start in range(0, seqlen, q_block):
+                q_end = min(q_start + q_block, seqlen)
+                scores = torch.zeros(
+                    q_end - q_start, seqlen_kv, device=q.device, dtype=torch.float32
+                )
+                for h_start in range(0, heads, h_block):
+                    h_end = min(h_start + h_block, heads)
+                    dot = torch.einsum(
+                        "qhd,kd->qhk",
+                        q[q_start:q_end, b, h_start:h_end].float(),
+                        k_b,
+                    ).relu_()
+                    scores += (
+                        dot
+                        * weights[q_start:q_end, b, h_start:h_end].float().unsqueeze(-1)
+                    ).sum(dim=1)
+                visible = (kv_ids.unsqueeze(0) >= cu_seqlen_ks[q_start:q_end, None]) & (
+                    kv_ids.unsqueeze(0) < cu_seqlen_ke[q_start:q_end, None]
+                )
+                scores.masked_fill_(~visible, float("-inf"))
+                out[b, q_start:q_end] = scores.topk(actual_topk, dim=-1).indices
+    return out
 
 
 class V4Indexer(MegatronModule):
@@ -149,6 +192,4 @@ class V4Indexer(MegatronModule):
         cu_ks, cu_ke = _make_causal_cu_seqlens(
             seqlen_global, seqlen_kv, self.compress_ratio, q.device
         )
-        index_scores = batched_indexer_fwd(q, k, weights.float(), cu_ks, cu_ke)
-        topk = min(self.index_topk, index_scores.size(-1))
-        return index_scores.topk(topk, dim=-1)[1]
+        return _exact_indexer_topk(q, k, weights.float(), cu_ks, cu_ke, self.index_topk)
