@@ -221,7 +221,11 @@ class Dsv4Handler(DefaultMoeHandler):
         self, *, config: Any, dtype: torch.dtype
     ) -> dict[str, Any]:
         del config, dtype
-        return {"experts_implementation": "eager", "ignore_mismatched_sizes": True}
+        return {
+            "experts_implementation": "eager",
+            "ignore_mismatched_sizes": True,
+            "key_mapping": _dsv4_source_to_hf_key_mapping(),
+        }
 
     def use_hf_reference_state_for_hf_parity(self) -> bool:
         """DSV4 parity seeds Megatron from the reduced canonical HF oracle state.
@@ -280,7 +284,6 @@ class Dsv4Handler(DefaultMoeHandler):
         config.index_head_dim = 128
         config.index_topk = _ORACLE_INDEX_TOPK
         config.dsv4_oracle_freeze_attn_sink = True
-        config.dsv4_oracle_source_aliases = True
 
 
 def ensure_dsv4_bridge_registered() -> None:
@@ -297,3 +300,73 @@ def _ensure_dsv4_hf_config_registered() -> None:
 
 _ensure_dsv4_hf_config_registered()
 DSV4_HANDLER = Dsv4Handler()
+
+
+def _dsv4_source_to_hf_key_mapping() -> dict[str, str]:
+    layer = r"layers\.(\d+)"
+    target = r"model.layers.\1"
+    return {
+        r"^embed\.weight$": "model.embed_tokens.weight",
+        r"^head\.weight$": "lm_head.weight",
+        r"^hc_head_fn$": "model.hc_head.hc_fn",
+        r"^hc_head_base$": "model.hc_head.hc_base",
+        r"^hc_head_scale$": "model.hc_head.hc_scale",
+        rf"^{layer}\.attn_norm\.weight$": rf"{target}.input_layernorm.weight",
+        rf"^{layer}\.ffn_norm\.weight$": rf"{target}.post_attention_layernorm.weight",
+        rf"^{layer}\.hc_attn_fn$": rf"{target}.attn_hc.fn",
+        rf"^{layer}\.hc_attn_base$": rf"{target}.attn_hc.base",
+        rf"^{layer}\.hc_attn_scale$": rf"{target}.attn_hc.scale",
+        rf"^{layer}\.hc_ffn_fn$": rf"{target}.ffn_hc.fn",
+        rf"^{layer}\.hc_ffn_base$": rf"{target}.ffn_hc.base",
+        rf"^{layer}\.hc_ffn_scale$": rf"{target}.ffn_hc.scale",
+        rf"^{layer}\.attn\.wq_a\.weight$": rf"{target}.self_attn.q_a_proj.weight",
+        rf"^{layer}\.attn\.q_norm\.weight$": rf"{target}.self_attn.q_a_norm.weight",
+        rf"^{layer}\.attn\.wq_b\.weight$": rf"{target}.self_attn.q_b_proj.weight",
+        rf"^{layer}\.attn\.wkv\.weight$": rf"{target}.self_attn.kv_proj.weight",
+        rf"^{layer}\.attn\.kv_norm\.weight$": rf"{target}.self_attn.kv_norm.weight",
+        rf"^{layer}\.attn\.wo_a\.weight$": rf"{target}.self_attn.o_a_proj.weight",
+        rf"^{layer}\.attn\.wo_b\.weight$": rf"{target}.self_attn.o_b_proj.weight",
+        rf"^{layer}\.attn\.attn_sink$": rf"{target}.self_attn.sinks",
+        rf"^{layer}\.ffn\.gate\.weight$": rf"{target}.mlp.gate.weight",
+        rf"^{layer}\.ffn\.gate\.tid2eid$": rf"{target}.mlp.gate.tid2eid",
+        rf"^{layer}\.ffn\.gate\.bias$": (rf"{target}.mlp.gate.e_score_correction_bias"),
+        rf"^{layer}\.ffn\.shared_experts\.w1\.weight$": (
+            rf"{target}.mlp.shared_experts.gate_proj.weight"
+        ),
+        rf"^{layer}\.ffn\.shared_experts\.w3\.weight$": (
+            rf"{target}.mlp.shared_experts.up_proj.weight"
+        ),
+        rf"^{layer}\.ffn\.shared_experts\.w2\.weight$": (
+            rf"{target}.mlp.shared_experts.down_proj.weight"
+        ),
+        rf"^{layer}\.attn\.compressor\.ape$": (
+            rf"{target}.self_attn.compressor.position_bias"
+        ),
+        rf"^{layer}\.attn\.compressor\.wkv\.weight$": (
+            rf"{target}.self_attn.compressor.kv_proj.weight"
+        ),
+        rf"^{layer}\.attn\.compressor\.wgate\.weight$": (
+            rf"{target}.self_attn.compressor.gate_proj.weight"
+        ),
+        rf"^{layer}\.attn\.compressor\.norm\.weight$": (
+            rf"{target}.self_attn.compressor.kv_norm.weight"
+        ),
+        rf"^{layer}\.attn\.indexer\.wq_b\.weight$": (
+            rf"{target}.self_attn.compressor.indexer.q_b_proj.weight"
+        ),
+        rf"^{layer}\.attn\.indexer\.weights_proj\.weight$": (
+            rf"{target}.self_attn.compressor.indexer.weights_proj.weight"
+        ),
+        rf"^{layer}\.attn\.indexer\.compressor\.ape$": (
+            rf"{target}.self_attn.compressor.indexer.position_bias"
+        ),
+        rf"^{layer}\.attn\.indexer\.compressor\.wkv\.weight$": (
+            rf"{target}.self_attn.compressor.indexer.kv_proj.weight"
+        ),
+        rf"^{layer}\.attn\.indexer\.compressor\.wgate\.weight$": (
+            rf"{target}.self_attn.compressor.indexer.gate_proj.weight"
+        ),
+        rf"^{layer}\.attn\.indexer\.compressor\.norm\.weight$": (
+            rf"{target}.self_attn.compressor.indexer.kv_norm.weight"
+        ),
+    }
