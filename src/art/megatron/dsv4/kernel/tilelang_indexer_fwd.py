@@ -183,6 +183,7 @@ def indexer_fwd_interface(
     return logits
 
 
+@torch.compiler.disable
 def batched_indexer_fwd(q, k, weights, cu_seqlen_ks, cu_seqlen_ke):
     """Batched forward: loops over batch dim.
 

@@ -218,6 +218,7 @@ def indexer_bwd_interface(
     return grad_q, grad_w, grad_k
 
 
+@torch.compiler.disable
 def batched_indexer_bwd(index_q, weights, index_k, topk_indices, grad_scores):
     """Batched backward: loops over batch dim.
 

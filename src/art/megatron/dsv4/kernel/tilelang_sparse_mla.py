@@ -31,5 +31,12 @@ class DeepSeekV4SparseAttention(torch.autograd.Function):
         return dq, dkv, d_attn_sink, None, None
 
 
+@torch.compiler.disable
 def sparse_attn_tilelang(q, kv, attn_sink, topk_idxs, sm_scale=None):
+    """Run TileLang sparse MLA outside TorchDynamo tracing.
+
+    TileLang's TVM FFI adapter uses non-literal string objects internally, which
+    Dynamo cannot represent as constants. Keep only this kernel boundary eager
+    while allowing the surrounding DSV4 transformer layer to compile.
+    """
     return DeepSeekV4SparseAttention.apply(q, kv, attn_sink, topk_idxs, sm_scale)
