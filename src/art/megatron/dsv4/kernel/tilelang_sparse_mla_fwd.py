@@ -30,6 +30,7 @@ def sparse_mqa_fwd(
     block_I=64,
     num_stages=2,
     threads=256,
+    dtype=T.bfloat16,
 ):
     assert dim == tilelang.math.next_power_of_2(dim), (
         f"dim must be power of 2, got {dim}"
@@ -53,7 +54,7 @@ def sparse_mqa_fwd(
     lse_shape = [batch, seq_len, heads]
     attn_sink_shape = [heads]
     indices_dtype = T.int32
-    dtype = T.bfloat16
+    assert dtype == T.bfloat16
     accum_dtype = T.float32
 
     H = heads
@@ -173,6 +174,12 @@ def sparse_mqa_fwd(
     return main
 
 
+def _tilelang_input_dtype(torch_dtype):
+    if torch_dtype is torch.bfloat16:
+        return T.bfloat16
+    raise TypeError(f"DSV4 sparse MLA TileLang launch requires bf16, got {torch_dtype}")
+
+
 def sparse_mqa_fwd_interface(
     q, kv, attn_sink, topk_idxs, sm_scale=None, block_I=64, num_stages=2, threads=256
 ):
@@ -193,7 +200,9 @@ def sparse_mqa_fwd_interface(
     batch, seq_len, heads, dim = q.shape
     _, seq_len_kv, kv_dim = kv.shape
     assert kv_dim == dim
+    assert kv.dtype == q.dtype
     _, _, topk = topk_idxs.shape
+    dtype = _tilelang_input_dtype(q.dtype)
 
     # Pad topk to next multiple of block_I (kernel requires divisibility)
     padded_topk = (topk + block_I - 1) // block_I * block_I
@@ -215,6 +224,7 @@ def sparse_mqa_fwd_interface(
         block_I=block_I,
         num_stages=num_stages,
         threads=threads,
+        dtype=dtype,
     )
     out, lse = kernel(q, kv, attn_sink, topk_idxs)
     return out, lse

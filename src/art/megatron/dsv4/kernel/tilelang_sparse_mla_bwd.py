@@ -301,6 +301,12 @@ def bwd(
     return sparse_mqa_bwd_kernel
 
 
+def _tilelang_input_dtype(torch_dtype):
+    if torch_dtype is torch.bfloat16:
+        return T.bfloat16
+    raise TypeError(f"DSV4 sparse MLA TileLang launch requires bf16, got {torch_dtype}")
+
+
 def sparse_mqa_bwd_interface(q, kv, attn_sink, o, do, topk_idxs, lse, sm_scale=None):
     """Backward interface for V4 sparse MQA attention.
 
@@ -324,6 +330,8 @@ def sparse_mqa_bwd_interface(q, kv, attn_sink, o, do, topk_idxs, lse, sm_scale=N
     B, S, H, D = q.shape
     _, S_kv, _ = kv.shape
     topk = topk_idxs.shape[-1]
+    dtype = _tilelang_input_dtype(q.dtype)
+    assert kv.dtype == q.dtype and o.dtype == q.dtype and do.dtype == q.dtype
 
     # Pad topk to next multiple of block_size (kernel requires divisibility)
     block_size = 64
@@ -338,19 +346,39 @@ def sparse_mqa_bwd_interface(q, kv, attn_sink, o, do, topk_idxs, lse, sm_scale=N
         topk_idxs = torch.cat([topk_idxs, pad], dim=-1).contiguous()
         topk = padded_topk
 
-    preprocess_kernel = preprocess(B, S, H, D)
-    postprocess_kernel = postprocess(B, S_kv, D)
+    preprocess_kernel = preprocess(B, S, H, D, dtype=dtype)
+    postprocess_kernel = postprocess(B, S_kv, D, dtype=dtype)
 
     delta = preprocess_kernel(o, do)
     dkv = torch.zeros_like(kv, dtype=torch.float32)
     d_attn_sink = torch.zeros_like(attn_sink)
     if topk <= block_size:
-        bwd_kernel = bwd(B, S, S_kv, H, D, topk, sm_scale, block_size=block_size)
+        bwd_kernel = bwd(
+            B,
+            S,
+            S_kv,
+            H,
+            D,
+            topk,
+            sm_scale,
+            block_size=block_size,
+            dtype=dtype,
+        )
         dq = bwd_kernel(q, kv, do, attn_sink, topk_idxs, lse, delta, dkv, d_attn_sink)
     else:
         dq_accum = torch.zeros_like(q, dtype=torch.float32)
         chunk_count = topk // block_size
-        bwd_kernel = bwd(B, S, S_kv, H, D, block_size, sm_scale, block_size=block_size)
+        bwd_kernel = bwd(
+            B,
+            S,
+            S_kv,
+            H,
+            D,
+            block_size,
+            sm_scale,
+            block_size=block_size,
+            dtype=dtype,
+        )
         for start in range(0, topk, block_size):
             chunk = topk_idxs[:, :, start : start + block_size].contiguous()
             dq_i = bwd_kernel(q, kv, do, attn_sink, chunk, lse, delta, dkv, d_attn_sink)

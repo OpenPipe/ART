@@ -8,7 +8,8 @@ def rotate_activation(x: torch.Tensor) -> torch.Tensor:
     compressor. The supported ART dimensions are powers of two, specifically
     128 and 512 in the DSV4 Flash config.
     """
-    assert x.dtype == torch.bfloat16
+    if x.dtype not in (torch.bfloat16, torch.float32):
+        raise TypeError(f"rotate_activation supports bf16/fp32, got {x.dtype}")
     width = int(x.size(-1))
     if width <= 0 or width & (width - 1):
         raise ValueError(f"Hadamard width must be a power of two, got {width}.")

@@ -19,6 +19,13 @@ _ORACLE_NUM_EXPERTS_PER_TOK = 1
 _ORACLE_FFN_HIDDEN_SIZE = 128
 _ORACLE_INDEX_HEADS = 1
 _ORACLE_INDEX_TOPK = 8
+_DSV4_MOE_COMPILE_WORKAROUND_FLAGS = (
+    "alltoall_dtoh",
+    "alltoall_dispatch_preprocess",
+    "deepep_dispatch_combine",
+    "deepep_permute_restore",
+    "te_triton_permute_with_mask_map",
+)
 
 
 class Dsv4Handler(DefaultMoeHandler):
@@ -161,7 +168,10 @@ class Dsv4Handler(DefaultMoeHandler):
 
     def compile_workaround_config(self, provider: Any) -> CompileWorkaroundConfig:
         return CompileWorkaroundConfig(
-            flags=_compile_workaround_flags_for_provider(provider),
+            flags=_compile_workaround_flags_for_provider(
+                provider,
+                _DSV4_MOE_COMPILE_WORKAROUND_FLAGS,
+            ),
             shared_expert_state=self._shared_expert_compile_state(provider),
         )
 

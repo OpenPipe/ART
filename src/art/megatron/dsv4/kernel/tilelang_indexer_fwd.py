@@ -163,6 +163,14 @@ def indexer_fwd_interface(
     Returns:
         logits: [seq_len, seq_len_kv] fp32
     """
+    if q.dtype is torch.float32:
+        q = q.to(torch.bfloat16)
+    if kv.dtype is torch.float32:
+        kv = kv.to(torch.bfloat16)
+    if q.dtype != torch.bfloat16 or kv.dtype != torch.bfloat16:
+        raise TypeError(
+            f"DSV4 indexer TileLang launch requires bf16, got {q.dtype=}, {kv.dtype=}"
+        )
     seq_len, heads, index_dim = q.shape
     seq_len_kv = kv.shape[0]
 
