@@ -5,8 +5,8 @@ from pathlib import Path
 from pydantic import BaseModel, Field
 
 import art
-from art.local import LocalBackend
-from art.local.backend import _configure_tokenizer_for_model_support
+from art.megatron.backend import MegatronBackend
+from art.megatron.model_support.tokenizer import configure_tokenizer_for_model_support
 from art.preprocessing.pack import PackedTensors
 from art.preprocessing.tokenize import (
     TokenizedResult,
@@ -40,7 +40,7 @@ def _history(trajectory: art.Trajectory) -> History:
 
 
 def _pack_trajectory_group(
-    backend: LocalBackend,
+    backend: MegatronBackend,
     model: art.TrainableModel,
     trajectory_group: art.TrajectoryGroup,
 ) -> PackedTensors:
@@ -95,7 +95,7 @@ class ChatTemplateRolloutReport(BaseModel):
 
 def run_chat_template_rollout(base_model: str) -> ChatTemplateRolloutReport:
     output_dir = _artifact_dir(base_model)
-    backend = LocalBackend(path=str(output_dir))
+    backend = MegatronBackend(path=str(output_dir))
     model = art.TrainableModel(
         name="model-support-chat-template",
         project="model-support-validation",
@@ -109,10 +109,10 @@ def run_chat_template_rollout(base_model: str) -> ChatTemplateRolloutReport:
 
         internal_config = model._internal_config
         assert internal_config is not None
-        tokenizer = _configure_tokenizer_for_model_support(
+        tokenizer = configure_tokenizer_for_model_support(
             AutoTokenizer.from_pretrained(base_model),
-            internal_config,
             base_model=base_model,
+            internal_config=internal_config,
         )
         backend._tokenizers[tokenizer_key] = tokenizer
 

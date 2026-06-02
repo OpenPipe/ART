@@ -1,10 +1,15 @@
+from types import SimpleNamespace
+
 import pytest
 
+from art.local import LocalBackend
 from art.local.backend import (
     _apply_configured_chat_template,
     _apply_configured_chat_template_server_args,
     _tokenizer_cache_key,
 )
+from art.megatron.backend import MegatronBackend
+from art.megatron.model_support import tokenizer as model_support_tokenizer
 
 
 class _Tokenizer:
@@ -41,6 +46,67 @@ def test_apply_configured_chat_template_server_args_preserves_explicit_override(
         "chat_template": "explicit",
         "chat_template_content_format": "string",
     }
+
+
+def test_apply_configured_chat_template_server_args_dsv4_has_no_default() -> None:
+    config_dict: dict = {}
+
+    _apply_configured_chat_template_server_args(
+        config_dict,
+        {},
+        base_model="deepseek-ai/DeepSeek-V4-Flash",
+    )
+
+    assert "server_args" not in config_dict
+
+
+def test_local_backend_training_tokenizer_does_not_call_model_support(tmp_path) -> None:
+    tokenizer = _Tokenizer()
+    backend = LocalBackend(path=str(tmp_path))
+
+    result = backend._configure_training_tokenizer(
+        tokenizer,  # type: ignore[arg-type]
+        model=SimpleNamespace(base_model="deepseek-ai/DeepSeek-V4-Flash"),  # type: ignore[arg-type]
+        internal_config={},
+    )
+
+    assert result is tokenizer
+    assert tokenizer.chat_template == "base"
+
+
+def test_megatron_backend_training_tokenizer_calls_model_support(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    tokenizer = _Tokenizer()
+    calls: list[tuple[str, dict]] = []
+
+    def fake_configure_tokenizer_for_model_support(
+        tokenizer_arg,
+        *,
+        base_model: str,
+        internal_config: dict,
+    ):
+        calls.append((base_model, internal_config))
+        tokenizer_arg.chat_template = "megatron configured"
+        return tokenizer_arg
+
+    monkeypatch.setattr(
+        model_support_tokenizer,
+        "configure_tokenizer_for_model_support",
+        fake_configure_tokenizer_for_model_support,
+    )
+
+    backend = MegatronBackend(path=str(tmp_path))
+    result = backend._configure_training_tokenizer(
+        tokenizer,  # type: ignore[arg-type]
+        model=SimpleNamespace(base_model="deepseek-ai/DeepSeek-V4-Flash"),  # type: ignore[arg-type]
+        internal_config={},
+    )
+
+    assert result is tokenizer
+    assert calls == [("deepseek-ai/DeepSeek-V4-Flash", {})]
+    assert tokenizer.chat_template == "megatron configured"
 
 
 def test_configured_chat_template_rejects_ambiguous_config(tmp_path) -> None:

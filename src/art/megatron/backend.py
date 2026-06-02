@@ -1,5 +1,9 @@
+from transformers.tokenization_utils_base import PreTrainedTokenizerBase
+
 from mp_actors import move_to_child_process
 
+from .. import dev
+from ..backend import AnyTrainableModel
 from ..local.backend import LocalBackend
 from ..local.service import ModelService
 from ..model import TrainableModel
@@ -22,6 +26,21 @@ class MegatronBackend(LocalBackend):
         self._requires_explicit_packed_sequence_length = True
         self._packed_sequence_length_requires_chunk_alignment = False
         self._supports_result_packing = True
+
+    def _configure_backend_training_tokenizer(
+        self,
+        tokenizer: PreTrainedTokenizerBase,
+        *,
+        model: AnyTrainableModel,
+        internal_config: dev.InternalModelConfig,
+    ) -> PreTrainedTokenizerBase:
+        from .model_support.tokenizer import configure_tokenizer_for_model_support
+
+        return configure_tokenizer_for_model_support(
+            tokenizer,
+            base_model=model.base_model,
+            internal_config=internal_config,
+        )
 
     async def _get_service(self, model: TrainableModel) -> ModelService:
         from ..dev.get_model_config import get_model_config
