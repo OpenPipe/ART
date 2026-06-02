@@ -50,7 +50,7 @@ from transformers.utils.output_capturing import OutputRecorder, capture_outputs
 
 from art.megatron.dsv4.hf_config import DeepseekV4Config
 from art.megatron.dsv4.kernel.precision_aligned_ops import linear_bf16_fp32
-from art.megatron.dsv4.utils import freeze_parameters_as_buffers
+from art.megatron.dsv4.utils import freeze_parameters_as_buffers, rotate_activation
 
 
 class DeepseekV4SqrtSoftplusActivation(nn.Module):
@@ -678,6 +678,7 @@ class DeepseekV4Indexer(nn.Module):
             compressed = apply_rotary_pos_emb(
                 compressed.unsqueeze(1), cos, sin
             ).squeeze(1)
+            compressed = rotate_activation(compressed)
         else:
             compressed = chunk_kv.new_zeros((batch, 0, self.head_dim))
 
@@ -696,6 +697,7 @@ class DeepseekV4Indexer(nn.Module):
             .transpose(1, 2)
         )
         q = apply_rotary_pos_emb(q, cos_q, sin_q).transpose(1, 2)
+        q = rotate_activation(q)
 
         # ReLU(q·kᵀ) * weights, then top-k
         scores = torch.matmul(
