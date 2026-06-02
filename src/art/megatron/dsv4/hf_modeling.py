@@ -28,7 +28,7 @@ from torch import nn
 
 from transformers import initialization as init
 from transformers.activations import ACT2FN
-from transformers.cache_utils import Cache, DynamicCache, DynamicSlidingWindowLayer
+from transformers.cache_utils import Cache, DynamicSlidingWindowLayer
 from transformers.generation import GenerationMixin
 from transformers.integrations import (
     use_experts_implementation,
@@ -239,7 +239,7 @@ class DeepseekV4HCACache(DynamicSlidingWindowLayer):
     layer_type = "heavily_compressed_attention"
 
     def __init__(self, config: "DeepseekV4Config"):
-        super().__init__(config)  # ty:ignore[invalid-argument-type]
+        super().__init__(sliding_window=config.sliding_window)
         self.compress_rate = config.compress_rates["heavily_compressed_attention"]
         self.buffer_kv: dict[str, torch.Tensor | None] = {"compressor": None}
         self.buffer_gate: dict[str, torch.Tensor | None] = {"compressor": None}
@@ -355,6 +355,20 @@ class DeepseekV4CSACache(DeepseekV4HCACache):
         self.overlap_kv[name] = chunk_kv[:, -1, :, :head_dim].clone()
         self.overlap_gate[name] = chunk_gate[:, -1, :, :head_dim].clone()
         return prior_kv, prior_gate
+
+
+def _new_dsv4_cache(config: DeepseekV4Config) -> Cache:
+    layers = []
+    for layer_type in config.layer_types:
+        if layer_type == "compressed_sparse_attention":
+            layers.append(DeepseekV4CSACache(config))
+        elif layer_type == "heavily_compressed_attention":
+            layers.append(DeepseekV4HCACache(config))
+        else:
+            layers.append(
+                DynamicSlidingWindowLayer(sliding_window=config.sliding_window)
+            )
+    return Cache(layers=layers)
 
 
 class DeepseekV4GroupedLinear(nn.Linear):
@@ -1523,7 +1537,7 @@ class DeepseekV4Model(DeepseekV4PreTrainedModel):
             )
         return_cache = past_key_values if use_cache else None
         if past_key_values is None:
-            past_key_values = DynamicCache(config=self.config)
+            past_key_values = _new_dsv4_cache(self.config)
         if inputs_embeds is None:
             inputs_embeds = self.embed_tokens(input_ids)
         past_seen = past_key_values.get_seq_length()
