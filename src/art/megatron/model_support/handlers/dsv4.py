@@ -161,6 +161,17 @@ class Dsv4Handler(DefaultMoeHandler):
 
         ensure_dsv4_hf_model_registered()
 
+    def prepare_hf_reference_config(self, config: Any) -> None:
+        if hasattr(config, "quantization_config"):
+            delattr(config, "quantization_config")
+        config._experts_implementation = "eager"
+
+    def hf_reference_from_pretrained_kwargs(
+        self, *, config: Any, dtype: torch.dtype
+    ) -> dict[str, Any]:
+        del config, dtype
+        return {"experts_implementation": "eager"}
+
 
 def ensure_dsv4_bridge_registered() -> None:
     from art.megatron.dsv4.bridge import ensure_dsv4_bridge_registered as _ensure

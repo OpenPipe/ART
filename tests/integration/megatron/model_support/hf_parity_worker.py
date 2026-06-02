@@ -291,12 +291,24 @@ def _load_hf_model(
     config = AutoConfig.from_pretrained(base_model, trust_remote_code=True)
     set_hf_config_num_layers(config, num_layers)
     zero_hf_dropout_config(config)
+    prepare_hf_reference_config = getattr(handler, "prepare_hf_reference_config", None)
+    if prepare_hf_reference_config is not None:
+        prepare_hf_reference_config(config)
+    hf_reference_from_pretrained_kwargs = getattr(
+        handler, "hf_reference_from_pretrained_kwargs", None
+    )
+    extra_kwargs = (
+        hf_reference_from_pretrained_kwargs(config=config, dtype=dtype)
+        if hf_reference_from_pretrained_kwargs is not None
+        else {}
+    )
     model = AutoModelForCausalLM.from_pretrained(
         base_model,
         config=config,
         trust_remote_code=True,
         torch_dtype=dtype,
         low_cpu_mem_usage=True,
+        **extra_kwargs,
     )
     model.train()
     return cast(Any, model).to(device)
