@@ -108,6 +108,10 @@ class DeepSeekV4Compressor(nn.Module):
         assert base == 160000
         configure_rope_cache(self, config, rope_head_dim=rope_head_dim, base=base)
 
+    @property
+    def weight(self) -> torch.Tensor:
+        return self.ape
+
     def overlap_transform_raw(self, tensor: torch.Tensor, value=0):
         """Raw overlap transform without CP handling."""
         return _overlap_transform(
