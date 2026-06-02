@@ -177,11 +177,13 @@ def _art_dsv4_expert_mapping_types() -> tuple[type[Any], type[Any]]:
                 cast(torch.Tensor, hf_weights["gate"]),
                 torch.Size(gate_target_shape),
                 "gate",
+                transpose_hint=False,
             )
             up = _align_expert_weight_to_shape(
                 cast(torch.Tensor, hf_weights["up"]),
                 torch.Size(gate_target_shape),
                 "up",
+                transpose_hint=False,
             )
             return super().hf_to_megatron({"gate": gate, "up": up}, megatron_module)
 
@@ -262,6 +264,7 @@ def _art_dsv4_expert_mapping_types() -> tuple[type[Any], type[Any]]:
                 cast(torch.Tensor, hf_weights),
                 torch.Size(full_target_shape),
                 "down_proj",
+                transpose_hint=False,
             )
             return self._mapping.hf_to_megatron(aligned, megatron_module)
 
