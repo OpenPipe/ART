@@ -87,6 +87,20 @@ class Dsv4Handler(DefaultMoeHandler):
                 decoder_input = cast(torch.Tensor, preproc_output[0])
                 if not decoder_input.requires_grad and decoder_input.is_leaf:
                     decoder_input.requires_grad_(True)
+                position_ids = kwargs.get("position_ids")
+                table = preproc_output[1]
+                if isinstance(position_ids, torch.Tensor) and torch.is_tensor(table):
+                    embedding_dim = int(table.shape[-1])
+                    batch_size, sequence_length = position_ids.shape
+                    gathered = table.view(table.shape[0], embedding_dim).index_select(
+                        0, position_ids.reshape(-1)
+                    )
+                    preproc_output[1] = (
+                        gathered.view(batch_size, sequence_length, embedding_dim)
+                        .permute(1, 0, 2)
+                        .contiguous()
+                        .unsqueeze(2)
+                    )
                 return tuple(preproc_output)
 
             gpt_module._preprocess = preprocess_hook  # type: ignore[attr-defined]
