@@ -57,6 +57,7 @@ ARCHITECTURE_REPRESENTATIVE_MODELS = {
     "qwen3_dense": "Qwen/Qwen3-32B",
     "qwen3_5_moe": "Qwen/Qwen3.5-35B-A3B",
     "qwen3_5_dense": "Qwen/Qwen3.5-27B",
+    "dsv4": "deepseek-ai/DeepSeek-V4-Flash",
 }
 SUBPROCESS_VALIDATION_STAGES = frozenset(
     {

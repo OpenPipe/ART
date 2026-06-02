@@ -46,6 +46,7 @@ def test_validated_architecture_representative_models_are_fixed() -> None:
         "Qwen/Qwen3-32B",
         "Qwen/Qwen3.5-35B-A3B",
         "Qwen/Qwen3.5-27B",
+        "deepseek-ai/DeepSeek-V4-Flash",
     ]
 
 
