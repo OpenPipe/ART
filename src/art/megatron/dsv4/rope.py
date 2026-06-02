@@ -4,6 +4,7 @@ from typing import Any, cast
 
 from megatron.core.transformer import TransformerConfig
 import torch
+from torch import nn
 
 
 @lru_cache(2)
@@ -110,3 +111,53 @@ def wrapped_precompute_freqs_cis(
     )
 
     return precompute_freqs_cis(**inputs)
+
+
+def configure_rope_cache(
+    module: nn.Module,
+    config: TransformerConfig,
+    *,
+    rope_head_dim: int,
+    base: float,
+    yarn_disabled: bool = False,
+) -> None:
+    setattr(module, "_dsv4_rope_config", config)
+    setattr(module, "_dsv4_rope_head_dim", int(rope_head_dim))
+    setattr(module, "_dsv4_rope_base", float(base))
+    setattr(module, "_dsv4_rope_yarn_disabled", bool(yarn_disabled))
+    module.register_buffer(
+        "freqs_cis", torch.empty(0, dtype=torch.complex64), persistent=False
+    )
+
+
+def materialize_rope_cache(
+    module: nn.Module, device: torch.device | None = None
+) -> bool:
+    config = getattr(module, "_dsv4_rope_config", None)
+    if config is None:
+        return False
+    if device is None:
+        try:
+            device = next(module.parameters()).device
+        except StopIteration:
+            device = torch.device("cpu")
+    if device.type == "meta":
+        return False
+    freqs_cis = wrapped_precompute_freqs_cis(
+        config,
+        rope_head_dim=int(getattr(module, "_dsv4_rope_head_dim")),
+        base=float(getattr(module, "_dsv4_rope_base")),
+        yarn_disabled=bool(getattr(module, "_dsv4_rope_yarn_disabled")),
+    ).to(device)
+    module.freqs_cis = freqs_cis
+    return True
+
+
+def get_rope_cache(
+    module: nn.Module, *, seqlen: int, device: torch.device
+) -> torch.Tensor:
+    freqs_cis = cast(torch.Tensor, module.freqs_cis)
+    if freqs_cis.numel() == 0 or freqs_cis.device != device:
+        materialize_rope_cache(module, device)
+        freqs_cis = cast(torch.Tensor, module.freqs_cis)
+    return freqs_cis[:seqlen]

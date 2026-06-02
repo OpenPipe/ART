@@ -50,6 +50,7 @@ class Dsv4Handler(DefaultMoeHandler):
         from megatron.core.models.gpt.gpt_model import GPTModel
 
         from art.megatron.dsv4.layer import Dsv4MoELayer
+        from art.megatron.dsv4.rope import materialize_rope_cache
 
         for chunk in list(model_chunks):
             module: Any = chunk
@@ -60,6 +61,8 @@ class Dsv4Handler(DefaultMoeHandler):
                 if isinstance(module, GPTModel)
                 else cast(GPTModel, getattr(module, "language_model"))
             )
+            for child in gpt_module.modules():
+                materialize_rope_cache(child)
             preprocess = gpt_module._preprocess
 
             def preprocess_hook(

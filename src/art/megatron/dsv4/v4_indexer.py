@@ -14,7 +14,11 @@ from art.megatron.dsv4.kernel.tilelang_indexer_fwd import (
     batched_indexer_fwd,
 )
 from art.megatron.dsv4.qat import fp8_simulate_qat
-from art.megatron.dsv4.rope import apply_rotary_emb, wrapped_precompute_freqs_cis
+from art.megatron.dsv4.rope import (
+    apply_rotary_emb,
+    configure_rope_cache,
+    get_rope_cache,
+)
 from art.megatron.dsv4.utils import rotate_activation
 
 
@@ -78,10 +82,9 @@ class V4Indexer(MegatronModule):
         rope_base = (
             cfg.dsv4_compress_rope_theta if self.compress_ratio else cfg.rotary_base
         )
-        freqs_cis = wrapped_precompute_freqs_cis(
-            config, rope_head_dim=self.rope_head_dim, base=rope_base
+        configure_rope_cache(
+            self, config, rope_head_dim=self.rope_head_dim, base=rope_base
         )
-        self.register_buffer("freqs_cis", freqs_cis, persistent=False)
 
     def forward(
         self, x: torch.Tensor, qr: torch.Tensor, mask=None, packed_seq_params=None
@@ -116,7 +119,7 @@ class V4Indexer(MegatronModule):
             raise RuntimeError(
                 "DeepSeek-V4 non-CP indexer received context_parallel_size > 1."
             )
-        freqs_cis = cast(torch.Tensor, self.freqs_cis)[:seqlen]
+        freqs_cis = get_rope_cache(self, seqlen=seqlen, device=x.device)
         q = q.clone()
         q = einops.rearrange(q, "s b ... -> b s ...")
         apply_rotary_emb(q[..., -rd:], freqs_cis)

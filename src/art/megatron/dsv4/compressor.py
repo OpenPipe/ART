@@ -8,7 +8,11 @@ from torch.nn import Linear
 
 from art.megatron.dsv4.kernel.precision_aligned_ops import linear_bf16_fp32
 from art.megatron.dsv4.qat import fp8_simulate_qat
-from art.megatron.dsv4.rope import apply_rotary_emb, wrapped_precompute_freqs_cis
+from art.megatron.dsv4.rope import (
+    apply_rotary_emb,
+    configure_rope_cache,
+    get_rope_cache,
+)
 from art.megatron.dsv4.utils import rotate_activation
 
 
@@ -102,10 +106,7 @@ class DeepSeekV4Compressor(nn.Module):
         base = cfg.dsv4_compress_rope_theta
         assert rope_head_dim == 64
         assert base == 160000
-        freqs_cis = wrapped_precompute_freqs_cis(
-            config, rope_head_dim=rope_head_dim, base=base
-        )
-        self.register_buffer("freqs_cis", freqs_cis, persistent=False)
+        configure_rope_cache(self, config, rope_head_dim=rope_head_dim, base=base)
 
     def overlap_transform_raw(self, tensor: torch.Tensor, value=0):
         """Raw overlap transform without CP handling."""
@@ -163,7 +164,9 @@ class DeepSeekV4Compressor(nn.Module):
 
         kv = self.norm(kv.to(dtype))
 
-        freqs_cis = cast(torch.Tensor, self.freqs_cis)[:seqlen_local:ratio]
+        freqs_cis = get_rope_cache(self, seqlen=seqlen_local, device=x.device)[
+            :seqlen_local:ratio
+        ]
 
         apply_rotary_emb(kv[..., -self.rope_head_dim :], freqs_cis)
 

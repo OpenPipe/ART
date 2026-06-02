@@ -33,7 +33,11 @@ from megatron.core.transformer.utils import make_sharded_tensors_for_checkpoint
 from art.megatron.dsv4.compressor import DeepSeekV4Compressor
 from art.megatron.dsv4.kernel.tilelang_sparse_mla import sparse_attn_tilelang
 from art.megatron.dsv4.qat import fp8_simulate_qat
-from art.megatron.dsv4.rope import apply_rotary_emb, wrapped_precompute_freqs_cis
+from art.megatron.dsv4.rope import (
+    apply_rotary_emb,
+    configure_rope_cache,
+    get_rope_cache,
+)
 from art.megatron.dsv4.v4_indexer import V4Indexer
 
 
@@ -206,13 +210,13 @@ class DeepSeekV4Attention(MegatronModule):
             cfg.dsv4_compress_rope_theta if self.compress_ratio else cfg.rotary_base
         )
         yarn_disabled = not self.compress_ratio
-        freqs_cis = wrapped_precompute_freqs_cis(
+        configure_rope_cache(
+            self,
             config,
             rope_head_dim=self.rope_head_dim,
             base=rope_base,
             yarn_disabled=yarn_disabled,
         )
-        self.register_buffer("freqs_cis", freqs_cis, persistent=False)
 
     def sharded_state_dict(
         self,
@@ -254,7 +258,7 @@ class DeepSeekV4Attention(MegatronModule):
         x = einops.rearrange(hidden_states, "s b d -> b s d")
 
         bsz, seqlen_local, _ = x.size()
-        freqs_cis = cast(torch.Tensor, self.freqs_cis)[:seqlen_local]
+        freqs_cis = get_rope_cache(self, seqlen=seqlen_local, device=x.device)
         win = self.window_size
         ratio = self.compress_ratio
         rd = self.rope_head_dim
