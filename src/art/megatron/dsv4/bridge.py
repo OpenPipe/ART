@@ -209,6 +209,9 @@ def ensure_dsv4_bridge_registered() -> None:
         return
     from megatron.bridge.models.conversion.model_bridge import MegatronModelBridge
 
+    from art.megatron.dsv4.hf_config import ensure_dsv4_hf_config_registered
+
+    ensure_dsv4_hf_config_registered()
     MegatronModelBridge.register_bridge(
         source="DeepseekV4ForCausalLM",
         target=GPTModel,
