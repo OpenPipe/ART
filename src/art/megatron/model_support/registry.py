@@ -12,6 +12,7 @@ _QWEN3_DENSE_HANDLER_KEY = "qwen3_dense"
 _QWEN3_MOE_HANDLER_KEY = "qwen3_moe"
 _QWEN3_5_DENSE_HANDLER_KEY = "qwen3_5_dense"
 _QWEN3_5_MOE_HANDLER_KEY = "qwen3_5_moe"
+_DSV4_HANDLER_KEY = "dsv4"
 _VALIDATED_NATIVE_VLLM_LORA_STATUS: NativeVllmLoraStatus = "validated"
 _DISABLED_NATIVE_VLLM_LORA_STATUS: NativeVllmLoraStatus = "disabled"
 
@@ -48,6 +49,12 @@ _QWEN3_5_MOE_TARGET_MODULES = (
     "in_proj_qkv",
     "in_proj_z",
     "out_proj",
+    "experts",
+)
+_DSV4_TARGET_MODULES = (
+    "gate_proj",
+    "up_proj",
+    "down_proj",
     "experts",
 )
 
@@ -126,11 +133,26 @@ QWEN3_5_MOE_SPEC = ModelSupportSpec(
     ),
 )
 
+DSV4_SPEC = ModelSupportSpec(
+    key="dsv4",
+    handler_key=_DSV4_HANDLER_KEY,
+    is_moe=True,
+    model_names=(
+        "deepseek-ai/DeepSeek-V4-Flash",
+        "deepseek-ai/DeepSeek-V4-Flash-Base",
+        "deepseek-ai/DeepSeek-V4-Pro",
+        "deepseek-ai/DeepSeek-V4-Pro-Base",
+    ),
+    default_target_modules=_DSV4_TARGET_MODULES,
+    native_vllm_lora_status=_DISABLED_NATIVE_VLLM_LORA_STATUS,
+)
+
 VALIDATED_MODEL_SUPPORT_SPECS = (
     QWEN3_MOE_SPEC,
     QWEN3_DENSE_SPEC,
     QWEN3_5_MOE_SPEC,
     QWEN3_5_DENSE_SPEC,
+    DSV4_SPEC,
 )
 PROBE_ONLY_MODEL_SUPPORT_SPECS = ()
 _ALL_MODEL_SUPPORT_SPECS = (
@@ -170,6 +192,10 @@ _HANDLER_IMPORTS: dict[str, tuple[str, str]] = {
         "art.megatron.model_support.handlers.qwen3_5",
         "QWEN3_5_MOE_HANDLER",
     ),
+    _DSV4_HANDLER_KEY: (
+        "art.megatron.model_support.handlers.dsv4",
+        "DSV4_HANDLER",
+    ),
 }
 _BRIDGE_REGISTRATION_IMPORTS: dict[str, tuple[str, str]] = {
     "qwen3_5_dense": (
@@ -180,6 +206,10 @@ _BRIDGE_REGISTRATION_IMPORTS: dict[str, tuple[str, str]] = {
         "art.megatron.model_support.handlers.qwen3_5",
         "ensure_qwen35_text_only_bridge_registered",
     ),
+    "dsv4": (
+        "art.megatron.model_support.handlers.dsv4",
+        "ensure_dsv4_bridge_registered",
+    ),
 }
 _HANDLERS_BY_KEY: dict[str, ModelSupportHandler] = {}
 _REGISTERED_BRIDGE_KEYS: set[str] = set()
@@ -189,6 +219,7 @@ QWEN3_MOE_MODELS = frozenset(QWEN3_MOE_SPEC.model_names)
 QWEN3_5_DENSE_MODELS = frozenset(QWEN3_5_DENSE_SPEC.model_names)
 QWEN3_5_MOE_MODELS = frozenset(QWEN3_5_MOE_SPEC.model_names)
 QWEN3_5_MODELS = QWEN3_5_DENSE_MODELS | QWEN3_5_MOE_MODELS
+DSV4_MODELS = frozenset(DSV4_SPEC.model_names)
 
 
 class UnsupportedModelArchitectureError(ValueError):

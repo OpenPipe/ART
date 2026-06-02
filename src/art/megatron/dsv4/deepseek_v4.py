@@ -1,0 +1,368 @@
+import copy
+from typing import Any, cast
+
+import einops
+import torch
+import torch.nn as nn
+
+# Enable TF32 for fp32 matmul to match the precision of the TileKernels MHC
+# kernels (which use TF32 tensor-core GEMM for the HC fp32 mixer).  Without
+# this, PyTorch's default ``allow_tf32=False`` keeps fp32 ``F.linear`` on the
+# SIMT path, which introduces a ~1e-4 mean-abs gap vs the TileKernels output;
+# matching TF32 brings the gap to <=1.5e-5 mean-abs (1 ULP bf16 max-abs).
+torch.backends.cuda.matmul.allow_tf32 = True
+torch.backends.cudnn.allow_tf32 = True
+from megatron.core.dist_checkpointing.mapping import ShardedStateDict
+from megatron.core.extensions.transformer_engine import (
+    TEColumnParallelLinear,
+    TELinear,
+    TENorm,
+    TERowParallelLinear,
+)
+from megatron.core.process_groups_config import ProcessGroupCollection
+from megatron.core.tensor_parallel.layers import ColumnParallelLinear
+from megatron.core.tensor_parallel.mappings import (
+    copy_to_tensor_model_parallel_region,
+    gather_from_sequence_parallel_region,
+    scatter_to_sequence_parallel_region,
+)
+from megatron.core.transformer.module import MegatronModule
+from megatron.core.transformer.transformer_config import TransformerConfig
+from megatron.core.transformer.utils import make_sharded_tensors_for_checkpoint
+
+from art.megatron.dsv4.compressor import DeepSeekV4Compressor
+from art.megatron.dsv4.kernel.tilelang_sparse_mla import sparse_attn_tilelang
+from art.megatron.dsv4.qat import fp8_simulate_qat
+from art.megatron.dsv4.rope import apply_rotary_emb, wrapped_precompute_freqs_cis
+from art.megatron.dsv4.v4_indexer import V4Indexer
+
+
+def _window_topk_idxs(
+    q_positions: torch.Tensor, *, window_size: int, bsz: int
+) -> torch.Tensor:
+    base = q_positions.unsqueeze(1)
+    offsets = torch.arange(
+        min(q_positions.numel(), window_size), device=q_positions.device
+    )
+    k_pos = (base - window_size + 1).clamp(0) + offsets
+    topk = torch.where(k_pos > base, -1, k_pos)
+    return topk.unsqueeze(0).expand(bsz, -1, -1)
+
+
+def _compress_topk_idxs(
+    q_positions: torch.Tensor, *, ratio: int, bsz: int
+) -> torch.Tensor:
+    seqlen = int(q_positions.numel())
+    offset = seqlen
+    k_group_idx = torch.arange(seqlen // ratio, device=q_positions.device).repeat(
+        seqlen, 1
+    )
+    q_first_invalid_group = (q_positions + 1).unsqueeze(1) // ratio
+    compress = torch.where(
+        k_group_idx >= q_first_invalid_group, -1, k_group_idx + offset
+    )
+    return compress.unsqueeze(0).expand(bsz, -1, -1)
+
+
+class DeepSeekV4Attention(MegatronModule):
+    def __init__(
+        self,
+        config: TransformerConfig,
+        submodules=None,
+        layer_number: int = 1,
+        attn_mask_type=None,
+        attention_type: str | None = None,
+        cp_comm_type: str | None = None,
+        pg_collection=None,
+    ):
+        super().__init__(config=config)
+        cfg = cast(Any, config)
+        init_method = config.init_method
+        if init_method is None:
+            raise RuntimeError("DeepSeek-V4 attention requires config.init_method.")
+
+        if pg_collection is None:
+            pg_collection = ProcessGroupCollection.use_mpu_process_groups(
+                required_pgs=["tp"]
+            )
+        else:
+            assert hasattr(pg_collection, "tp")
+        self.pg_collection = pg_collection
+        self.tp_group = self.pg_collection.tp
+        self.cp_group = pg_collection.cp if hasattr(pg_collection, "cp") else None
+        self.cp_size = self.cp_group.size() if self.cp_group else 1
+        if self.cp_size != 1:
+            raise RuntimeError(
+                "DeepSeek-V4 non-CP attention received context_parallel_size > 1."
+            )
+
+        layer_id = layer_number - 1
+        del layer_number
+
+        self.layer_id = layer_id
+        self.dim = config.hidden_size
+        self.n_heads = config.num_attention_heads
+        self.n_local_heads = self.n_heads // config.tensor_model_parallel_size
+        self.q_lora_rank = int(cfg.q_lora_rank)
+        self.o_lora_rank = int(cfg.dsv4_o_lora_rank)
+        self.head_dim = int(cfg.kv_lora_rank)
+        self.rope_head_dim = int(cfg.qk_pos_emb_head_dim)
+        self.nope_head_dim = self.head_dim - self.rope_head_dim
+        self.n_groups = int(cfg.dsv4_o_groups)
+        self.n_local_groups = self.n_groups // config.tensor_model_parallel_size
+        self.window_size = int(cfg.dsv4_window_size)
+        compress_ratios = cfg.dsv4_compress_ratios
+        self.compress_ratio = int(compress_ratios[layer_id]) if compress_ratios else 0
+        self.eps = config.layernorm_epsilon
+        self.use_fp8_qat = config.fp8 is not None
+
+        assert self.o_lora_rank == 1024
+        assert self.head_dim == 512
+        assert self.rope_head_dim == 64
+        assert self.nope_head_dim == 448
+        assert self.window_size == 128
+
+        config_no_sp = copy.copy(config)
+        config_no_sp.sequence_parallel = False
+
+        self.attn_sink = nn.Parameter(
+            torch.empty(self.n_local_heads, dtype=torch.float32)
+        )
+        setattr(self.attn_sink, "_keep_fp32", True)
+
+        self.wq_a = TELinear(
+            self.dim,
+            self.q_lora_rank,
+            config=config,
+            init_method=init_method,
+            bias=False,
+            skip_bias_add=False,
+            skip_weight_param_allocation=False,
+            parallel_mode="duplicated",
+        )
+        self.q_norm = TENorm(config_no_sp, self.q_lora_rank, eps=self.eps)
+        self.wq_b = TEColumnParallelLinear(
+            self.q_lora_rank,
+            self.n_heads * self.head_dim,
+            config=config_no_sp,
+            init_method=init_method,
+            bias=False,
+            gather_output=False,
+            skip_bias_add=False,
+            is_expert=False,
+            tp_group=self.tp_group,
+        )
+        self.wkv = TELinear(
+            self.dim,
+            self.head_dim,
+            config=config,
+            init_method=init_method,
+            bias=False,
+            skip_bias_add=False,
+            skip_weight_param_allocation=False,
+            parallel_mode="duplicated",
+        )
+        self.kv_norm = TENorm(config_no_sp, self.head_dim, eps=self.eps)
+
+        for p in list(self.wq_a.parameters()) + list(self.wkv.parameters()):
+            setattr(p, "sequence_parallel", False)
+
+        self.wo_a = ColumnParallelLinear(
+            self.n_heads * self.head_dim // self.n_groups,
+            self.n_groups * self.o_lora_rank,
+            config=config_no_sp,
+            init_method=init_method,
+            bias=False,
+            gather_output=False,
+        )
+        assert cast(torch.Tensor, self.wo_a.weight).dtype == torch.bfloat16
+        self.wo_b = TERowParallelLinear(
+            self.n_groups * self.o_lora_rank,
+            self.dim,
+            config=config_no_sp,
+            init_method=init_method,
+            bias=False,
+            input_is_parallel=True,
+            skip_bias_add=False,
+            is_expert=False,
+            tp_group=self.tp_group,
+        )
+        self.softmax_scale = self.head_dim**-0.5
+        self.sequence_parallel = config.sequence_parallel
+
+        if self.compress_ratio:
+            self.compressor = DeepSeekV4Compressor(
+                config=config,
+                head_dim=self.head_dim,
+                compress_ratio=self.compress_ratio,
+                rotate=False,
+                cp_group=self.cp_group,
+            )
+            if self.compress_ratio == 4:
+                self.indexer = V4Indexer(config=config, pg_collection=pg_collection)
+            else:
+                self.indexer = None
+
+        rope_base = (
+            cfg.dsv4_compress_rope_theta if self.compress_ratio else cfg.rotary_base
+        )
+        yarn_disabled = not self.compress_ratio
+        freqs_cis = wrapped_precompute_freqs_cis(
+            config,
+            rope_head_dim=self.rope_head_dim,
+            base=rope_base,
+            yarn_disabled=yarn_disabled,
+        )
+        self.register_buffer("freqs_cis", freqs_cis, persistent=False)
+
+    def sharded_state_dict(
+        self,
+        prefix: str = "",
+        sharded_offsets: tuple = (),
+        metadata: dict | None = None,
+    ) -> ShardedStateDict:
+        ans = super().sharded_state_dict(prefix, sharded_offsets, metadata)
+        ans.update(
+            make_sharded_tensors_for_checkpoint(
+                state_dict={"attn_sink": self.attn_sink},
+                prefix=prefix,
+                tensor_parallel_layers_axis_map={"attn_sink": 0},
+                sharded_offsets=sharded_offsets,
+                tp_group=self.tp_group,
+                dp_cp_group=(metadata or {})["dp_cp_group"],
+            )
+        )
+        return ans
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        attention_mask=None,
+        inference_context=None,
+        rotary_pos_emb=None,
+        rotary_pos_cos=None,
+        rotary_pos_sin=None,
+        rotary_pos_cos_sin=None,
+        attention_bias=None,
+        packed_seq_params=None,
+        sequence_len_offset=None,
+    ) -> torch.Tensor:
+        if self.sequence_parallel:
+            hidden_states = gather_from_sequence_parallel_region(
+                hidden_states, tensor_parallel_output_grad=False, group=self.tp_group
+            )
+
+        x = einops.rearrange(hidden_states, "s b d -> b s d")
+
+        bsz, seqlen_local, _ = x.size()
+        freqs_cis = cast(torch.Tensor, self.freqs_cis)[:seqlen_local]
+        win = self.window_size
+        ratio = self.compress_ratio
+        rd = self.rope_head_dim
+
+        q_after_wq_a = self.wq_a(x)[0]
+        qr = q = cast(Any, self.q_norm)(q_after_wq_a)
+        q_after_wq_b = self.wq_b(q)[0]
+        q = q_after_wq_b.unflatten(-1, (self.n_local_heads, self.head_dim))
+        q_fp32 = q.float()
+        q = (
+            q_fp32 * torch.rsqrt(q_fp32.square().mean(-1, keepdim=True) + self.eps)
+        ).to(q.dtype)
+        q = q.clone()
+        apply_rotary_emb(q[..., -rd:], freqs_cis)
+
+        kv_after_wkv = self.wkv(x)[0]
+        kv_vanilla = cast(Any, self.kv_norm)(kv_after_wkv)
+        kv_vanilla = kv_vanilla.clone()
+        apply_rotary_emb(kv_vanilla[..., -rd:], freqs_cis)
+        if self.use_fp8_qat:
+            kv_vanilla = kv_vanilla.clone()
+            kv_vanilla[..., : self.nope_head_dim] = fp8_simulate_qat(
+                kv_vanilla[..., : self.nope_head_dim], 64
+            )
+
+        seqlen_global = seqlen_local
+        q_positions = torch.arange(seqlen_local, device=x.device)
+
+        topk_idxs = _window_topk_idxs(q_positions, window_size=win, bsz=bsz)
+
+        if self.compress_ratio:
+            kv_compress_offset = seqlen_global
+            if self.indexer is not None:
+                x_sbd = einops.rearrange(x, "b s d -> s b d")
+                qr_sbd = einops.rearrange(qr, "b s d -> s b d")
+                if self.sequence_parallel:
+                    x_sbd = scatter_to_sequence_parallel_region(
+                        x_sbd, group=self.tp_group
+                    )
+                    qr_sbd = scatter_to_sequence_parallel_region(
+                        qr_sbd, group=self.tp_group
+                    )
+                if isinstance(self.indexer, V4Indexer):
+                    compress_topk_idxs = self.indexer(x_sbd, qr_sbd)
+                else:
+                    indexer_mask = self._compute_indexer_mask(
+                        q_positions=q_positions, seqlen_global=seqlen_global
+                    )
+                    compress_topk_idxs = self.indexer(
+                        x_sbd, qr_sbd, mask=indexer_mask, packed_seq_params=None
+                    )
+                q_first_invalid_group = (q_positions + 1).unsqueeze(1) // ratio
+                topk_idx_mask = (compress_topk_idxs >= q_first_invalid_group) | (
+                    compress_topk_idxs < 0
+                )
+                compress_topk_idxs = torch.where(
+                    topk_idx_mask, -1, compress_topk_idxs + kv_compress_offset
+                )
+            else:
+                compress_topk_idxs = _compress_topk_idxs(
+                    q_positions, ratio=ratio, bsz=bsz
+                )
+            topk_idxs = torch.cat([topk_idxs, compress_topk_idxs], dim=-1)
+        topk_idxs = topk_idxs.int()
+
+        kv_compress = None
+        if self.compress_ratio:
+            x_sbd = einops.rearrange(x, "b s d -> s b d")
+            kv_compress_sbd = self.compressor(x_sbd)
+            if kv_compress_sbd is not None:
+                kv_compress = einops.rearrange(kv_compress_sbd, "s b d -> b s d")
+
+        assert self.attn_sink.dtype == torch.float32
+
+        if kv_compress is not None:
+            kv = torch.cat([kv_vanilla, kv_compress], dim=1)
+            assert kv_compress_offset == kv_vanilla.size(1)
+        else:
+            kv = kv_vanilla
+
+        kv = copy_to_tensor_model_parallel_region(kv, group=self.tp_group)
+
+        o = sparse_attn_tilelang(q, kv, self.attn_sink, topk_idxs, self.softmax_scale)
+
+        apply_rotary_emb(o[..., -rd:], freqs_cis, inverse=True)
+
+        o = o.view(bsz, seqlen_local, self.n_local_groups, -1)
+        wo_a = cast(torch.Tensor, self.wo_a.weight).view(
+            self.n_local_groups, self.o_lora_rank, -1
+        )
+        o = torch.einsum("bsgd,grd->bsgr", o, wo_a)
+        x, _ = self.wo_b(o.flatten(2))
+
+        output = einops.rearrange(x, "b s d -> s b d")
+
+        if self.sequence_parallel:
+            output = scatter_to_sequence_parallel_region(output, group=self.tp_group)
+
+        return output
+
+    def _compute_indexer_mask(
+        self, *, q_positions: torch.Tensor, seqlen_global: int
+    ) -> torch.Tensor:
+        """Dense causal mask for legacy DSAIndexer path."""
+        ratio = 4
+        device = q_positions.device
+        k_group_idx = torch.arange(seqlen_global // ratio, device=device).unsqueeze(0)
+        q_first_invalid_group = (q_positions.unsqueeze(1) + 1) // ratio
+        invalid_mask = k_group_idx >= q_first_invalid_group
+        return torch.where(invalid_mask, float("-inf"), 0.0)
