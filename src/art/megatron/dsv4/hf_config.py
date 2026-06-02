@@ -4,7 +4,7 @@ import sys
 from typing import Any
 
 import transformers
-from transformers import AutoConfig, PretrainedConfig
+from transformers import AutoConfig, AutoModelForCausalLM, PretrainedConfig
 
 _COMPRESS_RATIO_TO_LAYER_TYPE = {
     0: "sliding_attention",
@@ -287,22 +287,26 @@ class DeepseekV4ForCausalLM:
 
 
 def _ensure_transformers_marker() -> None:
-    _add_marker_to_transformers_module(transformers)
+    _add_marker_to_transformers_module(transformers, DeepseekV4ForCausalLM)
     auto_bridge = sys.modules.get("megatron.bridge.models.conversion.auto_bridge")
     if auto_bridge is not None:
-        _add_marker_to_transformers_module(getattr(auto_bridge, "transformers", None))
+        _add_marker_to_transformers_module(
+            getattr(auto_bridge, "transformers", None), DeepseekV4ForCausalLM
+        )
 
 
-def _add_marker_to_transformers_module(module: Any) -> None:
+def _add_marker_to_transformers_module(module: Any, model_class: type) -> None:
     if module is None:
         return
     objects = getattr(module, "_objects", None)
     if isinstance(objects, dict):
-        objects["DeepseekV4ForCausalLM"] = DeepseekV4ForCausalLM
-    setattr(module, "DeepseekV4ForCausalLM", DeepseekV4ForCausalLM)
+        objects["DeepseekV4ForCausalLM"] = model_class
+    setattr(module, "DeepseekV4ForCausalLM", model_class)
 
 
 _REGISTERED = False
+_MODEL_REGISTERED = False
+_TORCHVISION_LIB: Any | None = None
 
 
 def ensure_dsv4_hf_config_registered() -> None:
@@ -315,8 +319,55 @@ def ensure_dsv4_hf_config_registered() -> None:
     _REGISTERED = True
 
 
+def ensure_dsv4_hf_model_registered() -> None:
+    global _MODEL_REGISTERED
+    if _MODEL_REGISTERED:
+        return
+    ensure_dsv4_hf_config_registered()
+    _ensure_torchvision_nms_schema()
+    from art.megatron.dsv4.hf_modeling import (
+        DeepseekV4ForCausalLM as HfDeepseekV4ForCausalLM,
+    )
+
+    AutoModelForCausalLM.register(
+        DeepseekV4Config, HfDeepseekV4ForCausalLM, exist_ok=True
+    )
+    _add_marker_to_transformers_module(transformers, HfDeepseekV4ForCausalLM)
+    auto_bridge = sys.modules.get("megatron.bridge.models.conversion.auto_bridge")
+    if auto_bridge is not None:
+        _add_marker_to_transformers_module(
+            getattr(auto_bridge, "transformers", None), HfDeepseekV4ForCausalLM
+        )
+    _MODEL_REGISTERED = True
+
+
+def _ensure_torchvision_nms_schema() -> None:
+    global _TORCHVISION_LIB
+    if _TORCHVISION_LIB is not None:
+        return
+    import torch
+
+    try:
+        _TORCHVISION_LIB = torch.library.Library("torchvision", "DEF")
+        _TORCHVISION_LIB.define(
+            "nms(Tensor dets, Tensor scores, float iou_threshold) -> Tensor"
+        )
+    except RuntimeError as exc:
+        if "Only a single TORCH_LIBRARY" not in str(exc) and "already" not in str(exc):
+            raise
+        _TORCHVISION_LIB = torch.library.Library("torchvision", "FRAGMENT")
+        try:
+            _TORCHVISION_LIB.define(
+                "nms(Tensor dets, Tensor scores, float iou_threshold) -> Tensor"
+            )
+        except RuntimeError as define_exc:
+            if "already" not in str(define_exc):
+                raise
+
+
 __all__ = [
     "DeepseekV4Config",
     "DeepseekV4ForCausalLM",
     "ensure_dsv4_hf_config_registered",
+    "ensure_dsv4_hf_model_registered",
 ]

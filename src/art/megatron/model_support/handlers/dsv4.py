@@ -156,6 +156,11 @@ class Dsv4Handler(DefaultMoeHandler):
             shared_expert_state=self._shared_expert_compile_state(provider),
         )
 
+    def ensure_hf_reference_registered(self) -> None:
+        from art.megatron.dsv4.hf_config import ensure_dsv4_hf_model_registered
+
+        ensure_dsv4_hf_model_registered()
+
 
 def ensure_dsv4_bridge_registered() -> None:
     from art.megatron.dsv4.bridge import ensure_dsv4_bridge_registered as _ensure

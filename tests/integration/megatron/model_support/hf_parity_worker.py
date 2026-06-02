@@ -280,6 +280,14 @@ def _load_hf_model(
 ) -> Any:
     from transformers import AutoConfig, AutoModelForCausalLM
 
+    from art.megatron.model_support.registry import get_model_support_handler
+
+    handler = get_model_support_handler(base_model)
+    ensure_hf_reference_registered = getattr(
+        handler, "ensure_hf_reference_registered", None
+    )
+    if ensure_hf_reference_registered is not None:
+        ensure_hf_reference_registered()
     config = AutoConfig.from_pretrained(base_model, trust_remote_code=True)
     set_hf_config_num_layers(config, num_layers)
     zero_hf_dropout_config(config)
