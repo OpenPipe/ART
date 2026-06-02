@@ -272,6 +272,44 @@ def _install_bridge_timing_debug(provider_bundle: Any) -> None:
     model_bridge._art_hf_parity_timing_wrapped = True
 
 
+def _is_bridge_hf_load_hook(hook: Any) -> bool:
+    fn = getattr(hook, "func", hook)
+    name = getattr(fn, "__name__", "")
+    qualname = getattr(fn, "__qualname__", "")
+    return name in {
+        "load_weights_hf_to_megatron",
+        "_optimized_load_weights_hf_to_megatron",
+    } or qualname.endswith(".load_weights_hf_to_megatron")
+
+
+def _remove_bridge_hf_load_hook(provider_bundle: Any) -> None:
+    """Disables the raw checkpoint load when parity will seed from HF oracle state.
+
+    This is intentionally validation-only. DSV4's public checkpoint source names
+    do not match the reduced canonical HF oracle state used by this test, so the
+    normal Bridge pre-wrap load would either miss or partially load the wrong
+    namespace. The caller must seed every mapped param/buffer after model build.
+    """
+    provider = provider_bundle.provider
+    hooks = list(getattr(provider, "_pre_wrap_hooks", []))
+    kept = [hook for hook in hooks if not _is_bridge_hf_load_hook(hook)]
+    if len(kept) == len(hooks):
+        raise RuntimeError(
+            "HF parity expected a Bridge HF-load pre-wrap hook to remove"
+        )
+    provider._pre_wrap_hooks = kept
+
+
+def _configure_hf_parity_provider_bundle(
+    provider_bundle: Any,
+    *,
+    use_hf_reference_state: bool,
+) -> None:
+    if use_hf_reference_state:
+        _remove_bridge_hf_load_hook(provider_bundle)
+    _install_bridge_timing_debug(provider_bundle)
+
+
 def _load_hf_model(
     *,
     base_model: str,
@@ -586,10 +624,18 @@ def _build_megatron_runtime(
     *,
     moe_routing_replay_bundle: MoeRoutingReplayBundle | None = None,
 ) -> megatron_train.TrainingRuntime:
+    use_hf_reference_state = _use_hf_reference_state_for_hf_parity(
+        request.case_config.base_model
+    )
     return megatron_train.build_training_runtime(
         model_identifier=request.case_config.base_model,
         provider_torch_dtype=_dtype_for_precision(request.case_config.precision),
-        provider_bundle_configure=_install_bridge_timing_debug,
+        provider_bundle_configure=lambda provider_bundle: (
+            _configure_hf_parity_provider_bundle(
+                provider_bundle,
+                use_hf_reference_state=use_hf_reference_state,
+            )
+        ),
         provider_configure=lambda provider: _configure_provider(
             provider, ORACLE_TOPOLOGY, request.case_config
         ),
@@ -867,19 +913,20 @@ def _run_megatron_sft_step(
             if isinstance(task.param_weight, torch.nn.Parameter)
         ]
     else:
+        seed_tasks = _build_hf_parity_conversion_tasks(
+            bridge=runtime.bridge,
+            model=runtime.model,
+            hf_keys=set(hf_reference_state_dict),
+        )
         tasks = [
             task
-            for task in _build_hf_parity_conversion_tasks(
-                bridge=runtime.bridge,
-                model=runtime.model,
-                hf_keys=set(hf_reference_state_dict),
-            )
+            for task in seed_tasks
             if isinstance(task.param_weight, torch.nn.Parameter)
         ]
         _debug("seeding Megatron weights from HF oracle state")
         _seed_megatron_from_hf_reference_state(
             runtime,
-            tasks=tasks,
+            tasks=seed_tasks,
             hf_reference_state_dict=hf_reference_state_dict,
         )
     _debug("initializing Megatron optimizer state")
