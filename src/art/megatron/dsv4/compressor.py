@@ -147,11 +147,12 @@ class DeepSeekV4Compressor(nn.Module):
         ratio, overlap, _ = self.compress_ratio, self.overlap, self.head_dim
         dtype = x.dtype
 
-        assert (seqlen_local >= ratio) and (seqlen_local % ratio == 0), (
-            f"{seqlen_local=} {ratio=}"
-        )
+        usable = (seqlen_local // ratio) * ratio
+        if usable == 0:
+            return x.new_zeros((bsz, 0, self.head_dim))
+        x = x[:, :usable]
         if self.cp_size > 1:
-            assert seqlen_local % (ratio * 2) == 0
+            assert usable % (ratio * 2) == 0
 
         kv = linear_bf16_fp32(x, self.wkv.weight)
         score = linear_bf16_fp32(x, self.wgate.weight)
@@ -168,9 +169,7 @@ class DeepSeekV4Compressor(nn.Module):
 
         kv = self.norm(kv.to(dtype))
 
-        freqs_cis = get_rope_cache(self, seqlen=seqlen_local, device=x.device)[
-            :seqlen_local:ratio
-        ]
+        freqs_cis = get_rope_cache(self, seqlen=usable, device=x.device)[:usable:ratio]
 
         apply_rotary_emb(kv[..., -self.rope_head_dim :], freqs_cis)
 
@@ -192,7 +191,7 @@ class DeepSeekV4Compressor(nn.Module):
         Args:
             x: [seqlen, batch, dim] SBHD layout (Megatron standard)
         Returns:
-            k: [seqlen // compress_ratio, batch, head_dim] SBHD layout
+            k: [floor(seqlen / compress_ratio), batch, head_dim] SBHD layout
         """
         x_bshd = einops.rearrange(x, "s b d -> b s d")
         k_bshd = self.forward_raw(x_bshd)

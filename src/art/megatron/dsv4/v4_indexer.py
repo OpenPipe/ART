@@ -131,6 +131,14 @@ class V4Indexer(MegatronModule):
             q = fp8_simulate_qat(q, 128)
 
         k = self.compressor(x)
+        if k.shape[0] == 0:
+            return torch.empty(
+                bsz,
+                seqlen,
+                0,
+                device=x.device,
+                dtype=torch.long,
+            )
 
         weights, _ = self.linear_weights_proj(x)
         softmax_scale = self.index_head_dim**-0.5
