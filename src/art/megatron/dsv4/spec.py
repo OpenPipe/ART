@@ -22,6 +22,7 @@ except (ImportError, ModuleNotFoundError):
 
 
 def get_dsv4_decoder_block_spec(config: Any, vp_stage: int | None = None) -> Any:
+    config.moe_layer_freq = [1] * int(config.num_layers)
     block_spec = deepcopy(
         get_gpt_decoder_block_spec(
             config,

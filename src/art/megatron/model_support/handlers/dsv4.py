@@ -60,8 +60,24 @@ class Dsv4Handler(DefaultMoeHandler):
             gpt_module._preprocess = preprocess_hook  # type: ignore[attr-defined]
 
     def collect_layer_families(self, provider: Any) -> list[LayerFamilyInstance]:
+        ratios = list(getattr(provider, "dsv4_compress_ratios", ()) or ())
+
+        def first_layer_index(ratio: int) -> int | None:
+            try:
+                return ratios.index(ratio)
+            except ValueError:
+                return None
+
         return [
-            LayerFamilyInstance(key="dsv4_attention", layer_index=0),
+            LayerFamilyInstance(
+                key="dsv4_sliding_attention", layer_index=first_layer_index(0)
+            ),
+            LayerFamilyInstance(
+                key="dsv4_csa_attention", layer_index=first_layer_index(4)
+            ),
+            LayerFamilyInstance(
+                key="dsv4_hca_attention", layer_index=first_layer_index(128)
+            ),
             LayerFamilyInstance(key="grouped_moe_mlp", layer_index=0),
             LayerFamilyInstance(key="shared_experts_mlp", layer_index=0),
         ]
