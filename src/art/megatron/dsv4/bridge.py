@@ -182,6 +182,13 @@ class ArtDeepSeekV4Bridge(DeepSeekV3Bridge):
         provider.dsv4_compress_rope_theta = getattr(
             hf_config, "compress_rope_theta", 160000
         )
+        rope_scaling = getattr(hf_config, "rope_scaling", None) or {}
+        provider.rotary_scaling_factor = rope_scaling.get("factor", 16)
+        provider.original_max_position_embeddings = rope_scaling.get(
+            "original_max_position_embeddings", 65536
+        )
+        provider.beta_fast = rope_scaling.get("beta_fast", 32)
+        provider.beta_slow = rope_scaling.get("beta_slow", 1)
         provider.dsv4_swiglu_limit = getattr(hf_config, "swiglu_limit", 0.0)
         provider.dsv4_o_groups = getattr(hf_config, "o_groups", 16)
         provider.dsv4_o_lora_rank = getattr(hf_config, "o_lora_rank", 1024)
