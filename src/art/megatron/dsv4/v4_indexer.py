@@ -18,6 +18,9 @@ from art.megatron.dsv4.rope import (
 )
 from art.megatron.dsv4.utils import freeze_parameters_as_buffers, rotate_activation
 
+_INDEXER_QUERY_BLOCK = 128
+_INDEXER_HEAD_BLOCK = 8
+
 
 @torch.compiler.disable
 def _exact_indexer_topk(
@@ -28,6 +31,15 @@ def _exact_indexer_topk(
     cu_seqlen_ke: torch.Tensor,
     topk: int,
 ) -> torch.Tensor:
+    """Return frozen DSV4 indexer topk using the reference score equation.
+
+    The indexer routing is discrete, so small BF16 fused-kernel score drift can
+    choose different compressed KV rows and send CSA gradients to different
+    windows. Keep the production path exact against the HF/Megatron reference:
+    fp32 dot, ReLU, head weighting, compressed-causal mask, then topk. Query
+    and head chunking avoid materializing the full [S, H, S / 4] score tensor.
+    """
+
     seqlen, batch, heads, _ = q.shape
     seqlen_kv = k.shape[0]
     actual_topk = min(topk, seqlen_kv)
@@ -36,8 +48,8 @@ def _exact_indexer_topk(
         return out
 
     kv_ids = torch.arange(seqlen_kv, device=q.device)
-    q_block = 128
-    h_block = 8
+    q_block = _INDEXER_QUERY_BLOCK
+    h_block = _INDEXER_HEAD_BLOCK
     with torch.no_grad():
         for b in range(batch):
             k_b = k[:, b].float()
