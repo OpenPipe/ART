@@ -35,6 +35,7 @@ def get_dsv4_decoder_block_spec(config: Any, vp_stage: int | None = None) -> Any
     for layer_spec in block_spec.layer_specs or ():
         layer_spec.module = Dsv4TransformerLayer
         submodules = cast(Any, layer_spec.submodules)
+        submodules.input_layernorm = submodules.pre_mlp_layernorm
         submodules.self_attention = ModuleSpec(
             module=DeepSeekV4Attention,
             submodules=None,
