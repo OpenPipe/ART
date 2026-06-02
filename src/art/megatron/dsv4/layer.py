@@ -60,10 +60,12 @@ class Dsv4Router(TopKRouter):
         cfg = cast(Any, self.config)
         if self._is_hash_layer():
             if "tid2eid" not in self._buffers:
-                vocab_size = int(getattr(cfg, "vocab_size", cfg.padded_vocab_size))
+                vocab_size = getattr(cfg, "vocab_size", None)
+                if vocab_size is None:
+                    vocab_size = cfg.padded_vocab_size
                 self.register_buffer(
                     "tid2eid",
-                    torch.zeros(vocab_size, self.topk, dtype=torch.long),
+                    torch.zeros(int(vocab_size), self.topk, dtype=torch.long),
                     persistent=True,
                 )
         elif "e_score_correction_bias" not in self._buffers:
