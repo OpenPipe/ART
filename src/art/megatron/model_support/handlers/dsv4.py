@@ -11,6 +11,15 @@ from art.megatron.model_support.handlers.default_dense import (
 )
 from art.megatron.model_support.spec import CompileWorkaroundConfig, LayerFamilyInstance
 
+_ORACLE_HIDDEN_SIZE = 512
+_ORACLE_Q_LORA_RANK = 128
+_ORACLE_NUM_ATTENTION_HEADS = 1
+_ORACLE_NUM_EXPERTS = 2
+_ORACLE_NUM_EXPERTS_PER_TOK = 1
+_ORACLE_FFN_HIDDEN_SIZE = 128
+_ORACLE_INDEX_HEADS = 1
+_ORACLE_INDEX_TOPK = 8
+
 
 class Dsv4Handler(DefaultMoeHandler):
     key = "dsv4"
@@ -162,15 +171,49 @@ class Dsv4Handler(DefaultMoeHandler):
         ensure_dsv4_hf_model_registered()
 
     def prepare_hf_reference_config(self, config: Any) -> None:
+        """Puts the HF parity oracle in eager training mode with reduced fit-only axes."""
         if hasattr(config, "quantization_config"):
             delattr(config, "quantization_config")
         config._experts_implementation = "eager"
+        self._apply_oracle_shape_overrides(config)
 
     def hf_reference_from_pretrained_kwargs(
         self, *, config: Any, dtype: torch.dtype
     ) -> dict[str, Any]:
         del config, dtype
         return {"experts_implementation": "eager"}
+
+    def configure_oracle_provider(self, provider: Any, *, case_config: Any) -> None:
+        """Mirrors HF oracle reductions while keeping DSV4 hard kernel invariants."""
+        del case_config
+        self._apply_oracle_shape_overrides(provider)
+        provider.kv_lora_rank = 512
+        provider.kv_channels = 512
+        provider.qk_pos_emb_head_dim = 64
+        provider.num_query_groups = 1
+        provider.num_moe_experts = _ORACLE_NUM_EXPERTS
+        provider.moe_ffn_hidden_size = _ORACLE_FFN_HIDDEN_SIZE
+        provider.ffn_hidden_size = _ORACLE_FFN_HIDDEN_SIZE
+        provider.moe_shared_expert_intermediate_size = _ORACLE_FFN_HIDDEN_SIZE
+        provider.moe_router_topk = _ORACLE_NUM_EXPERTS_PER_TOK
+        provider.dsv4_o_groups = 1
+        provider.dsv4_o_lora_rank = 1024
+        provider.dsa_indexer_n_heads = _ORACLE_INDEX_HEADS
+        provider.dsa_indexer_head_dim = 128
+        provider.dsa_indexer_topk = _ORACLE_INDEX_TOPK
+
+    def _apply_oracle_shape_overrides(self, config: Any) -> None:
+        """Reduces memory-heavy axes only; head_dim/window/o-rank stay production-sized."""
+        config.hidden_size = _ORACLE_HIDDEN_SIZE
+        config.q_lora_rank = _ORACLE_Q_LORA_RANK
+        config.num_attention_heads = _ORACLE_NUM_ATTENTION_HEADS
+        config.n_routed_experts = _ORACLE_NUM_EXPERTS
+        config.num_experts_per_tok = _ORACLE_NUM_EXPERTS_PER_TOK
+        config.moe_intermediate_size = _ORACLE_FFN_HIDDEN_SIZE
+        config.o_groups = 1
+        config.index_n_heads = _ORACLE_INDEX_HEADS
+        config.index_head_dim = 128
+        config.index_topk = _ORACLE_INDEX_TOPK
 
 
 def ensure_dsv4_bridge_registered() -> None:

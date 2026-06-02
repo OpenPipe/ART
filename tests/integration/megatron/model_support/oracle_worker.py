@@ -389,7 +389,12 @@ def _configure_provider(
     topology: Topology,
     case_config: OracleCaseConfig,
 ) -> None:
-    """Applies deterministic topology/model overrides to provider config."""
+    """Applies deterministic topology/model overrides to provider config.
+
+    Handler-specific oracle hooks must keep production runtime semantics out of
+    this path: they are only for making validation models fit while preserving
+    the layer families and kernel-facing invariants being tested.
+    """
     del topology
     provider.num_layers = case_config.num_layers
     if case_config.precision == "fp32":
@@ -405,6 +410,15 @@ def _configure_provider(
         provider.attention_dropout = 0.0
     if hasattr(provider, "hidden_dropout"):
         provider.hidden_dropout = 0.0
+    from art.megatron.model_support.registry import get_model_support_handler
+
+    handler = get_model_support_handler(
+        case_config.base_model,
+        allow_unvalidated_arch=case_config.allow_unvalidated_arch,
+    )
+    configure_oracle_provider = getattr(handler, "configure_oracle_provider", None)
+    if configure_oracle_provider is not None:
+        configure_oracle_provider(provider, case_config=case_config)
 
 
 @contextmanager
