@@ -68,6 +68,10 @@ class Dsv4Router(TopKRouter):
                     torch.zeros(int(vocab_size), self.topk, dtype=torch.long),
                     persistent=True,
                 )
+                expert_pattern = (
+                    torch.arange(self.topk, dtype=torch.long) % int(cfg.num_moe_experts)
+                ).expand(int(vocab_size), -1)
+                cast(Tensor, self.tid2eid).copy_(expert_pattern)
         elif "e_score_correction_bias" not in self._buffers:
             self.register_buffer(
                 "e_score_correction_bias",

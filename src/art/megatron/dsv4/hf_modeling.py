@@ -1463,8 +1463,11 @@ class DeepseekV4PreTrainedModel(PreTrainedModel):
             if isinstance(module, DeepseekV4TopKRouter):
                 init.zeros_(module.e_score_correction_bias)  # buffer
             if isinstance(module, DeepseekV4HashRouter):
-                init.zeros_(
-                    module.tid2eid
+                module.tid2eid.copy_(
+                    (
+                        torch.arange(module.top_k, device=module.tid2eid.device)
+                        % module.num_experts
+                    ).expand(module.tid2eid.size(0), -1)
                 )  # buffer; real values come from the checkpoint
         elif isinstance(module, DeepseekV4Experts):
             init.normal_(module.gate_up_proj, mean=0.0, std=std)
