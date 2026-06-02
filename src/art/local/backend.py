@@ -545,6 +545,12 @@ class LocalBackend(Backend):
                 tokenizer, internal_config, base_model=model.base_model
             )
             self._tokenizers[tokenizer_key] = tokenizer
+        else:
+            _apply_configured_chat_template(
+                self._tokenizers[tokenizer_key],
+                internal_config,
+                base_model=model.base_model,
+            )
         if model.base_model not in self._image_processors:
             try:
                 from transformers import AutoImageProcessor
@@ -1133,6 +1139,9 @@ class LocalBackend(Backend):
             )
             self._tokenizers[tokenizer_key] = tokenizer
         tokenizer = self._tokenizers[tokenizer_key]
+        _apply_configured_chat_template(
+            tokenizer, internal_config, base_model=model.base_model
+        )
 
         from ..utils.sft import resolve_sft_batch_size
 
