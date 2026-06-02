@@ -6,6 +6,7 @@ from pathlib import Path
 import shutil
 import socket
 import tempfile
+from typing import cast
 
 from pydantic import BaseModel, Field
 import torch
@@ -20,6 +21,11 @@ from ..model_support.oracle_harness import (
     ensure_case_artifacts,
 )
 from ..model_support.oracle_worker import provider_topology_env
+from ..model_support.workflow_resources import (
+    handler_workflow_resources_for_base_model,
+    validate_dedicated_test_resources,
+    validate_visible_gpu_count,
+)
 
 _TRAINER_GPU_IDS_ENV = "ART_MODEL_SUPPORT_TRAINER_GPU_IDS"
 _INFERENCE_GPU_IDS_ENV = "ART_MODEL_SUPPORT_INFERENCE_GPU_IDS"
@@ -108,7 +114,33 @@ def _copy_adapter_checkpoint(source_dir: str, dest_dir: str) -> None:
 async def _run_native_vllm_lora(
     case_config: OracleCaseConfig,
 ) -> NativeVllmLoraServingReport:
-    trainer_gpu_ids, inference_gpu_ids = _resolve_dedicated_gpu_ids()
+    workflow_resources = handler_workflow_resources_for_base_model(
+        case_config.base_model,
+        allow_unvalidated_arch=case_config.allow_unvalidated_arch,
+    )
+    stage_resources = (
+        workflow_resources.native_vllm_lora if workflow_resources is not None else None
+    )
+    if stage_resources is not None:
+        if stage_resources.vllm is None:
+            raise RuntimeError("native_vllm_lora resources require vLLM")
+        validate_visible_gpu_count(
+            "native_vllm_lora",
+            stage_resources,
+            visible_gpu_count=int(torch.cuda.device_count()),
+        )
+        trainer_gpu_ids = [0]
+        inference_gpu_ids = list(stage_resources.vllm.gpu_ids)
+        validate_dedicated_test_resources(
+            stage_name="native_vllm_lora",
+            trainer_gpu_ids=trainer_gpu_ids,
+            inference_gpu_ids=inference_gpu_ids,
+            allow_overlap=True,
+        )
+        engine_args = cast(dev.EngineArgs, stage_resources.vllm.engine_args())
+    else:
+        trainer_gpu_ids, inference_gpu_ids = _resolve_dedicated_gpu_ids()
+        engine_args = dev.EngineArgs()
     service_name = "model_support_native_lora_validation"
     case_artifacts = ensure_case_artifacts(case_config)
     output_root = Path(case_artifacts.case_dir) / "native_vllm_lora"
@@ -119,8 +151,10 @@ async def _run_native_vllm_lora(
         inference_gpu_ids=inference_gpu_ids,
         rollout_weights_mode="lora",
         allow_unvalidated_arch=case_config.allow_unvalidated_arch,
+        engine_args=engine_args,
     )
-    dev.validate_dedicated_config(internal_config)
+    if stage_resources is None:
+        dev.validate_dedicated_config(internal_config)
     with provider_topology_env(ORACLE_TOPOLOGY):
         service = MegatronService(
             model_name=service_name,

@@ -11,6 +11,10 @@ from typing import Any, Literal, cast
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
+from ..model_support.workflow_resources import (
+    handler_workflow_resources_for_base_model,
+)
+
 # These gates are intentionally bf16-scale, not fp32 oracle-scale. A 2026-05-18
 # Qwen/Qwen3.5-35B-A3B diagnostic on the exact same real generated tokens found:
 # vLLM generation vs Megatron: 2.916% mean_abs_pct, 0.0123 MAE, 0.883 top1,
@@ -327,6 +331,35 @@ def config_from_env() -> TrainInfOutputParityConfig:
         )
         == "1",
     )
+    workflow_resources = handler_workflow_resources_for_base_model(
+        config.base_model,
+        allow_unvalidated_arch=config.allow_unvalidated_arch,
+    )
+    stage_resources = (
+        workflow_resources.train_inf_mismatch
+        if workflow_resources is not None
+        else None
+    )
+    if stage_resources is not None:
+        if (
+            stage_resources.megatron is not None
+            and "ART_TRAIN_INF_MISMATCH_TRAINER_GPU_IDS" not in os.environ
+        ):
+            config.trainer_gpu_ids = list(stage_resources.megatron.gpu_ids)
+        if (
+            stage_resources.vllm is not None
+            and "ART_TRAIN_INF_MISMATCH_INFERENCE_GPU_IDS" not in os.environ
+        ):
+            config.inference_gpu_ids = list(stage_resources.vllm.gpu_ids)
+        if stage_resources.megatron is not None:
+            config.topology = config.topology.model_copy(
+                update=stage_resources.megatron.topology.to_train_inf_topology_kwargs()
+            )
+        if stage_resources.vllm is not None:
+            config.engine_args = {
+                **stage_resources.vllm.engine_args(),
+                **config.engine_args,
+            }
     if raw_modes := os.environ.get("ART_TRAIN_INF_MISMATCH_ROLLOUT_MODES"):
         config.rollout_modes = _parse_rollout_modes(raw_modes)
     if raw_seq_len := os.environ.get("ART_TRAIN_INF_MISMATCH_SEQUENCE_LENGTH"):
@@ -356,7 +389,7 @@ def config_from_env() -> TrainInfOutputParityConfig:
         config.topology = config.topology.model_copy(update={"ep": 1, "etp": 1})
     if not cp_supported and "ART_TRAIN_INF_MISMATCH_CP" not in os.environ:
         updates = {"cp": 1}
-        if "ART_TRAIN_INF_MISMATCH_TP" not in os.environ:
+        if stage_resources is None and "ART_TRAIN_INF_MISMATCH_TP" not in os.environ:
             updates["tp"] = max(config.topology.tp, len(config.trainer_gpu_ids))
         config.topology = config.topology.model_copy(update=updates)
     if raw_targets := os.environ.get("ART_TRAIN_INF_MISMATCH_LORA_TARGET_MODULES"):

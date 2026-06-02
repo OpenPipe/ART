@@ -27,6 +27,9 @@ from art.megatron.model_support.spec import RolloutWeightsMode
 
 from ..model_support.oracle_harness import Topology, oracle_topology
 from ..model_support.oracle_worker import provider_topology_env
+from ..model_support.workflow_resources import (
+    handler_workflow_resources_for_base_model,
+)
 
 _TRAINER_GPU_IDS_ENV = "ART_MODEL_SUPPORT_TRAINER_GPU_IDS"
 _INFERENCE_GPU_IDS_ENV = "ART_MODEL_SUPPORT_INFERENCE_GPU_IDS"
@@ -341,6 +344,15 @@ def _build_variant(
     base_model: str,
     allow_unvalidated_arch: bool = False,
 ) -> _TrainabilityVariant:
+    workflow_resources = handler_workflow_resources_for_base_model(
+        base_model,
+        allow_unvalidated_arch=allow_unvalidated_arch,
+    )
+    stage_resources = (
+        workflow_resources.yes_no_trainability
+        if workflow_resources is not None
+        else None
+    )
     is_moe = model_uses_expert_parallel(
         base_model,
         allow_unvalidated_arch=allow_unvalidated_arch,
@@ -377,6 +389,29 @@ def _build_variant(
             else _DENSE_SHARED_MEGATRON_TOPOLOGY,
             trainer_gpu_ids=shared_gpu_ids,
             inference_gpu_ids=shared_gpu_ids,
+        )
+    if (
+        variant_name == "megatron_dedicated"
+        and stage_resources is not None
+        and stage_resources.megatron is not None
+        and stage_resources.vllm is not None
+    ):
+        workflow_topology = stage_resources.megatron.topology
+        return _TrainabilityVariant(
+            name=variant_name,
+            backend_name="megatron",
+            placement_mode="dedicated",
+            topology=Topology(
+                tp=workflow_topology.tp,
+                ep=workflow_topology.ep,
+                etp=workflow_topology.etp,
+                dp=workflow_topology.dp,
+                sp=workflow_topology.sp,
+                cp=workflow_topology.cp,
+                pp=workflow_topology.pp,
+            ),
+            trainer_gpu_ids=list(stage_resources.megatron.gpu_ids),
+            inference_gpu_ids=list(stage_resources.vllm.gpu_ids),
         )
     trainer_gpu_ids, inference_gpu_ids = _resolve_dedicated_gpu_ids()
     if variant_name == "megatron_dedicated":
@@ -435,6 +470,15 @@ def _default_variant_name(
     *,
     allow_unvalidated_arch: bool = False,
 ) -> _VARIANT_NAME:
+    workflow_resources = handler_workflow_resources_for_base_model(
+        base_model,
+        allow_unvalidated_arch=allow_unvalidated_arch,
+    )
+    if (
+        workflow_resources is not None
+        and workflow_resources.yes_no_trainability_variant is not None
+    ):
+        return workflow_resources.yes_no_trainability_variant
     if (
         _rollout_weights_mode(
             base_model,
@@ -457,11 +501,43 @@ def _build_internal_config(
     inference_gpu_ids = (
         variant.inference_gpu_ids if not shared else _resolve_shared_gpu_ids()
     )
+    workflow_resources = handler_workflow_resources_for_base_model(
+        base_model,
+        allow_unvalidated_arch=allow_unvalidated_arch,
+    )
+    stage_resources = (
+        workflow_resources.yes_no_trainability
+        if workflow_resources is not None
+        else None
+    )
+    stage_resources_apply = (
+        not shared
+        and variant.backend_name == "megatron"
+        and stage_resources is not None
+        and stage_resources.megatron is not None
+        and stage_resources.vllm is not None
+        and variant.trainer_gpu_ids == stage_resources.megatron.gpu_ids
+        and variant.inference_gpu_ids == stage_resources.vllm.gpu_ids
+    )
+    if stage_resources_apply:
+        assert stage_resources is not None
+        assert stage_resources.vllm is not None
+        vllm_resources = stage_resources.vllm
+    else:
+        vllm_resources = None
     engine_args = _engine_args_for_yes_no_trainability(
         inference_gpu_ids=inference_gpu_ids,
-        tensor_parallel_size=len(inference_gpu_ids) if shared else 1,
+        tensor_parallel_size=(
+            vllm_resources.tensor_parallel_size
+            if vllm_resources is not None
+            else len(inference_gpu_ids)
+            if shared
+            else 1
+        ),
         enable_expert_parallel=(
-            shared
+            vllm_resources.enable_expert_parallel
+            if vllm_resources is not None
+            else shared
             and variant.backend_name == "megatron"
             and model_uses_expert_parallel(
                 base_model,
@@ -484,7 +560,16 @@ def _build_internal_config(
     if not shared:
         internal_config["trainer_gpu_ids"] = variant.trainer_gpu_ids
         internal_config["inference_gpu_ids"] = variant.inference_gpu_ids
-    dev.validate_dedicated_config(internal_config)
+        if (
+            stage_resources_apply
+            and stage_resources is not None
+            and stage_resources.megatron is not None
+        ):
+            internal_config["megatron_topology"] = (
+                stage_resources.megatron.topology.to_megatron_config()
+            )
+    if not stage_resources_apply:
+        dev.validate_dedicated_config(internal_config)
     return internal_config
 
 

@@ -200,16 +200,41 @@ def test_qwen3_5_moe_shared_variant_enables_expert_parallel(monkeypatch) -> None
     assert config["engine_args"]["enable_expert_parallel"] is True
 
 
-def test_cp_unsupported_moe_shared_variant_uses_tensor_parallel(monkeypatch) -> None:
-    monkeypatch.setenv("ART_MODEL_SUPPORT_SHARED_GPU_IDS", "0,1")
+def test_dsv4_trainability_uses_large_model_dedicated_resources(
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(
+        "tests.integration.megatron.trainability.yes_no_trainability._safe_gpu_memory_utilization",
+        lambda device_ids: 0.5,
+    )
 
+    default_variant = _default_variant_name(
+        "deepseek-ai/DeepSeek-V4-Flash",
+    )
     variant = _build_variant(
-        "megatron_shared",
+        default_variant,
+        base_model="deepseek-ai/DeepSeek-V4-Flash",
+    )
+    config = _build_internal_config(
+        variant,
         base_model="deepseek-ai/DeepSeek-V4-Flash",
     )
 
+    assert default_variant == "megatron_dedicated"
     assert variant.topology is not None
     assert variant.topology.tp == 2
-    assert variant.topology.ep == 2
+    assert variant.topology.ep == 4
     assert variant.topology.cp == 1
+    assert variant.topology.dp == 2
     assert variant.topology.sp is True
+    assert variant.trainer_gpu_ids == [0, 1, 2, 3]
+    assert variant.inference_gpu_ids == [4, 5, 6, 7]
+    assert config["engine_args"]["tensor_parallel_size"] == 4
+    assert config["engine_args"]["enable_expert_parallel"] is True
+    assert config["megatron_topology"] == {
+        "tp": 2,
+        "ep": 4,
+        "etp": 1,
+        "cp": 1,
+        "pp": 1,
+    }
