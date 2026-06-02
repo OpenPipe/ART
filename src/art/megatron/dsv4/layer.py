@@ -122,10 +122,13 @@ class Dsv4Router(TopKRouter):
                 "DSV4 router selected an invalid number of experts: "
                 f"selected={indices.shape[-1]} expected={self.topk}."
             )
-        probs = scores.gather(1, indices)
+        selected_probs = scores.gather(1, indices)
         if self.score_function != "softmax":
-            probs = probs / (probs.sum(dim=-1, keepdim=True) + 1e-20)
-        probs = probs * float(cfg.moe_router_topk_scaling_factor)
+            selected_probs = selected_probs / (
+                selected_probs.sum(dim=-1, keepdim=True) + 1e-20
+            )
+        selected_probs = selected_probs * float(cfg.moe_router_topk_scaling_factor)
+        probs = torch.zeros_like(scores).scatter(1, indices, selected_probs)
         routing_map = F.one_hot(indices, num_classes=num_moe_experts).sum(dim=1).bool()
         if padding_mask is not None:
             valid = padding_mask.reshape(-1).bool()
