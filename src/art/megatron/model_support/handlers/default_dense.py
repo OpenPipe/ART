@@ -83,6 +83,9 @@ class DefaultDenseHandler:
         del provider
         return None
 
+    def default_chat_template(self) -> str | None:
+        return None
+
     def install_preprocess_patch(self, model_chunks: Sequence[Any]) -> None:
         del model_chunks
         return None

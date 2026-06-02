@@ -50,6 +50,11 @@ class Dsv4Handler(DefaultMoeHandler):
     def configure_provider_for_runtime(self, provider: Any) -> None:
         provider.mtp_num_layers = None
 
+    def default_chat_template(self) -> str | None:
+        from art.megatron.dsv4.chat_template import DEEPSEEK_V4_CHAT_TEMPLATE
+
+        return DEEPSEEK_V4_CHAT_TEMPLATE
+
     def install_preprocess_patch(self, model_chunks: Sequence[Any]) -> None:
         from megatron.core.models.gpt.gpt_model import GPTModel
 

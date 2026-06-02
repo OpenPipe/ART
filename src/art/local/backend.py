@@ -112,20 +112,55 @@ def _configured_chat_template_server_arg(
     return chat_template_path or chat_template
 
 
+def _model_support_default_chat_template(
+    base_model: str,
+    internal_config: dev.InternalModelConfig,
+) -> str | None:
+    from ..megatron.model_support.registry import (
+        UnsupportedModelArchitectureError,
+        get_model_support_handler,
+    )
+
+    try:
+        handler = get_model_support_handler(
+            base_model,
+            allow_unvalidated_arch=bool(
+                internal_config.get("allow_unvalidated_arch", False)
+            ),
+        )
+    except UnsupportedModelArchitectureError:
+        return None
+    return handler.default_chat_template()
+
+
 def _apply_configured_chat_template(
     tokenizer: PreTrainedTokenizerBase,
     internal_config: dev.InternalModelConfig,
+    *,
+    base_model: str | None = None,
 ) -> None:
     chat_template = _configured_chat_template_value(internal_config)
     if chat_template is not None:
         tokenizer.chat_template = chat_template
+    elif base_model is not None and not isinstance(
+        getattr(tokenizer, "chat_template", None), str
+    ):
+        default = _model_support_default_chat_template(base_model, internal_config)
+        if default is not None:
+            tokenizer.chat_template = default
 
 
 def _apply_configured_chat_template_server_args(
     config_dict: dict,
     internal_config: dev.InternalModelConfig,
+    *,
+    base_model: str | None = None,
 ) -> None:
     chat_template = _configured_chat_template_server_arg(internal_config)
+    if chat_template is None and base_model is not None:
+        chat_template = _model_support_default_chat_template(
+            base_model, internal_config
+        )
     if chat_template is None:
         return
     server_args = dict(config_dict.get("server_args", {}))
@@ -506,7 +541,9 @@ class LocalBackend(Backend):
         tokenizer_key = _tokenizer_cache_key(model.base_model, internal_config)
         if tokenizer_key not in self._tokenizers:
             tokenizer = AutoTokenizer.from_pretrained(model.base_model)
-            _apply_configured_chat_template(tokenizer, internal_config)
+            _apply_configured_chat_template(
+                tokenizer, internal_config, base_model=model.base_model
+            )
             self._tokenizers[tokenizer_key] = tokenizer
         if model.base_model not in self._image_processors:
             try:
@@ -651,7 +688,11 @@ class LocalBackend(Backend):
     ) -> tuple[str, str]:
         config_dict: dict = dict(config or {})
         internal_config = cast(dev.InternalModelConfig, model._internal_config or {})
-        _apply_configured_chat_template_server_args(config_dict, internal_config)
+        _apply_configured_chat_template_server_args(
+            config_dict,
+            internal_config,
+            base_model=model.base_model,
+        )
         if self._model_uses_expert_replay(model):
             engine_args = dict(config_dict.get("engine_args", {}))
             engine_args["enable_return_routed_experts"] = True
@@ -1087,7 +1128,9 @@ class LocalBackend(Backend):
         tokenizer_key = _tokenizer_cache_key(model.base_model, internal_config)
         if tokenizer_key not in self._tokenizers:
             tokenizer = AutoTokenizer.from_pretrained(model.base_model)
-            _apply_configured_chat_template(tokenizer, internal_config)
+            _apply_configured_chat_template(
+                tokenizer, internal_config, base_model=model.base_model
+            )
             self._tokenizers[tokenizer_key] = tokenizer
         tokenizer = self._tokenizers[tokenizer_key]
 
