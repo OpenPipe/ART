@@ -49,6 +49,7 @@ from transformers.utils.generic import maybe_autocast, merge_with_config_default
 from transformers.utils.output_capturing import OutputRecorder, capture_outputs
 
 from art.megatron.dsv4.hf_config import DeepseekV4Config
+from art.megatron.dsv4.kernel.precision_aligned_ops import linear_bf16_fp32
 from art.megatron.dsv4.utils import freeze_parameters_as_buffers
 
 
@@ -58,6 +59,12 @@ class DeepseekV4SqrtSoftplusActivation(nn.Module):
 
 
 ACT2FN.setdefault("sqrtsoftplus", DeepseekV4SqrtSoftplusActivation)
+
+
+def _dsv4_oracle_linear(module: nn.Linear, hidden_states: torch.Tensor) -> torch.Tensor:
+    if bool(getattr(module, "_dsv4_oracle_bf16_fp32", False)):
+        return linear_bf16_fp32(hidden_states, module.weight)
+    return module(hidden_states)
 
 
 @use_kernel_forward_from_hub("RMSNorm")
@@ -465,6 +472,9 @@ class DeepseekV4HCACompressor(nn.Module):
         self.head_dim = config.head_dim
         self.kv_proj = nn.Linear(config.hidden_size, self.head_dim, bias=False)
         self.gate_proj = nn.Linear(config.hidden_size, self.head_dim, bias=False)
+        if bool(getattr(config, "dsv4_oracle_precision_aligned_compressor", False)):
+            setattr(self.kv_proj, "_dsv4_oracle_bf16_fp32", True)
+            setattr(self.gate_proj, "_dsv4_oracle_bf16_fp32", True)
         self.position_bias = nn.Parameter(
             torch.empty(self.compress_rate, self.head_dim)
         )
@@ -483,8 +493,8 @@ class DeepseekV4HCACompressor(nn.Module):
         cache_layer: DeepseekV4HCACache = (
             past_key_values.layers[layer_idx] if past_key_values is not None else None
         )  # ty:ignore[invalid-assignment]
-        kv = self.kv_proj(hidden_states)
-        gate = self.gate_proj(hidden_states)
+        kv = _dsv4_oracle_linear(self.kv_proj, hidden_states)
+        gate = _dsv4_oracle_linear(self.gate_proj, hidden_states)
         if cache_layer is None:
             usable = (kv.shape[1] // self.compress_rate) * self.compress_rate
             chunk_kv, chunk_gate, first_window_position = (
@@ -586,6 +596,9 @@ class DeepseekV4Indexer(nn.Module):
         self.weights_scaling = self.num_heads**-0.5
         self.kv_proj = nn.Linear(config.hidden_size, 2 * self.head_dim, bias=False)
         self.gate_proj = nn.Linear(config.hidden_size, 2 * self.head_dim, bias=False)
+        if bool(getattr(config, "dsv4_oracle_precision_aligned_compressor", False)):
+            setattr(self.kv_proj, "_dsv4_oracle_bf16_fp32", True)
+            setattr(self.gate_proj, "_dsv4_oracle_bf16_fp32", True)
         self.position_bias = nn.Parameter(
             torch.empty(self.compress_rate, 2 * self.head_dim)
         )
@@ -609,8 +622,8 @@ class DeepseekV4Indexer(nn.Module):
         cache_layer: DeepseekV4CSACache = (
             past_key_values.layers[layer_idx] if past_key_values is not None else None
         )  # ty:ignore[invalid-assignment]
-        kv = self.kv_proj(hidden_states)
-        gate = self.gate_proj(hidden_states)
+        kv = _dsv4_oracle_linear(self.kv_proj, hidden_states)
+        gate = _dsv4_oracle_linear(self.gate_proj, hidden_states)
 
         if cache_layer is None:
             usable = (kv.shape[1] // self.compress_rate) * self.compress_rate
@@ -747,6 +760,9 @@ class DeepseekV4CSACompressor(nn.Module):
         self.head_dim = config.head_dim
         self.kv_proj = nn.Linear(config.hidden_size, 2 * self.head_dim, bias=False)
         self.gate_proj = nn.Linear(config.hidden_size, 2 * self.head_dim, bias=False)
+        if bool(getattr(config, "dsv4_oracle_precision_aligned_compressor", False)):
+            setattr(self.kv_proj, "_dsv4_oracle_bf16_fp32", True)
+            setattr(self.gate_proj, "_dsv4_oracle_bf16_fp32", True)
         self.position_bias = nn.Parameter(
             torch.empty(self.compress_rate, 2 * self.head_dim)
         )
@@ -766,8 +782,8 @@ class DeepseekV4CSACompressor(nn.Module):
         cache_layer: DeepseekV4CSACache = (
             past_key_values.layers[layer_idx] if past_key_values is not None else None
         )  # ty:ignore[invalid-assignment]
-        kv = self.kv_proj(hidden_states)
-        gate = self.gate_proj(hidden_states)
+        kv = _dsv4_oracle_linear(self.kv_proj, hidden_states)
+        gate = _dsv4_oracle_linear(self.gate_proj, hidden_states)
 
         if cache_layer is None:
             usable = (kv.shape[1] // self.compress_rate) * self.compress_rate
