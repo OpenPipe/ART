@@ -39,4 +39,19 @@ def sparse_attn_tilelang(q, kv, attn_sink, topk_idxs, sm_scale=None):
     Dynamo cannot represent as constants. Keep only this kernel boundary eager
     while allowing the surrounding DSV4 transformer layer to compile.
     """
-    return DeepSeekV4SparseAttention.apply(q, kv, attn_sink, topk_idxs, sm_scale)
+    head_count = int(q.shape[2])
+    if head_count < 16:
+        pad_heads = 16 - head_count
+        q = torch.cat(
+            [
+                q,
+                q.new_zeros((*q.shape[:2], pad_heads, q.shape[3])),
+            ],
+            dim=2,
+        ).contiguous()
+        attn_sink = torch.cat(
+            [attn_sink, attn_sink.new_zeros(pad_heads)],
+            dim=0,
+        ).contiguous()
+    out = DeepSeekV4SparseAttention.apply(q, kv, attn_sink, topk_idxs, sm_scale)
+    return out[:, :, :head_count, :]

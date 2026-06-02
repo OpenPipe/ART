@@ -173,8 +173,10 @@ def bwd(
             acc_p = T.alloc_fragment([block_H, BS], accum_dtype)
             acc_dp = T.alloc_fragment([block_H, BS], accum_dtype)
             acc_dq = T.alloc_fragment([block_H, D], accum_dtype)
+            acc_dq_i = T.alloc_fragment([block_H, D], accum_dtype)
             acc_dkv = T.alloc_fragment([BS, D], accum_dtype)
             acc_dkv_shared = T.alloc_shared([BS // split_store, D], accum_dtype)
+            safe_indices = T.alloc_fragment([BS], indices_dtype)
 
             T.copy(Q[by, s_i, bz * block_H : (bz + 1) * block_H, :D], Q_shared)
             T.copy(dO[by, s_i, bz * block_H : (bz + 1) * block_H, :D], dO_shared)
@@ -184,16 +186,14 @@ def bwd(
             for i_i in T.Pipelined(NS, num_stages=num_stages):
                 for bi_i in T.Parallel(BS):
                     mask[bi_i] = Indices[by, s_i, i_i * BS + bi_i] != -1
-
-                for h_i, bi_i in T.Parallel(block_H, BS):
-                    acc_p[h_i, bi_i] = T.if_then_else(
-                        mask[bi_i], 0, -T.infinity(acc_p.dtype)
+                    safe_indices[bi_i] = T.if_then_else(
+                        mask[bi_i], Indices[by, s_i, i_i * BS + bi_i], 0
                     )
 
+                T.clear(acc_p)
+
                 for bi_i, d_i in T.Parallel(BS, D):
-                    KV_shared[bi_i, d_i] = KV[
-                        by, Indices[by, s_i, i_i * BS + bi_i], d_i
-                    ]
+                    KV_shared[bi_i, d_i] = KV[by, safe_indices[bi_i], d_i]
 
                 T.gemm(
                     Q_shared,
@@ -202,6 +202,10 @@ def bwd(
                     transpose_B=True,
                     policy=T.GemmWarpPolicy.FullCol,
                 )
+                for h_i, bi_i in T.Parallel(block_H, BS):
+                    acc_p[h_i, bi_i] = T.if_then_else(
+                        mask[bi_i], acc_p[h_i, bi_i], -T.infinity(acc_p.dtype)
+                    )
 
                 # P = exp2(scores * sm_scale_log2e - LSE)
                 for h_i, bi_i in T.Parallel(block_H, BS):
@@ -233,8 +237,14 @@ def bwd(
 
                 # dQ += dP @ KV
                 T.gemm(
-                    dP_shared_cast, KV_shared, acc_dq, policy=T.GemmWarpPolicy.FullCol
+                    dP_shared_cast,
+                    KV_shared,
+                    acc_dq_i,
+                    policy=T.GemmWarpPolicy.FullCol,
+                    clear_accum=True,
                 )
+                for h_i, d_i in T.Parallel(block_H, D):
+                    acc_dq[h_i, d_i] += acc_dq_i[h_i, d_i]
 
                 # dKV += dP^T @ Q + P^T @ dO
                 T.gemm(
@@ -257,17 +267,15 @@ def bwd(
                 for s in range(split_store):
                     for bi_i, d_i in T.Parallel(BS, D):
                         if bi_i < BS // split_store:
-                            acc_dkv_shared[bi_i, d_i] = acc_dkv[
-                                bi_i + s * (BS // split_store), d_i
-                            ]
+                            src_i = bi_i + s * (BS // split_store)
+                            acc_dkv_shared[bi_i, d_i] = acc_dkv[src_i, d_i]
 
                     for bi_i, d_i in T.Parallel(BS // split_store, D // 4):
+                        src_i = bi_i + s * (BS // split_store)
                         T.atomic_addx4(
                             dKV[
                                 by,
-                                Indices[
-                                    by, s_i, i_i * BS + bi_i + s * (BS // split_store)
-                                ],
+                                safe_indices[src_i],
                                 d_i * 4,
                             ],
                             acc_dkv_shared[bi_i, d_i * 4],
@@ -318,7 +326,7 @@ def sparse_mqa_bwd_interface(q, kv, attn_sink, o, do, topk_idxs, lse, sm_scale=N
     topk = topk_idxs.shape[-1]
 
     # Pad topk to next multiple of block_size (kernel requires divisibility)
-    block_size = 32
+    block_size = 64
     padded_topk = (topk + block_size - 1) // block_size * block_size
     if padded_topk != topk:
         pad = torch.full(
@@ -331,13 +339,24 @@ def sparse_mqa_bwd_interface(q, kv, attn_sink, o, do, topk_idxs, lse, sm_scale=N
         topk = padded_topk
 
     preprocess_kernel = preprocess(B, S, H, D)
-    bwd_kernel = bwd(B, S, S_kv, H, D, topk, sm_scale)
     postprocess_kernel = postprocess(B, S_kv, D)
 
     delta = preprocess_kernel(o, do)
     dkv = torch.zeros_like(kv, dtype=torch.float32)
     d_attn_sink = torch.zeros_like(attn_sink)
-    dq = bwd_kernel(q, kv, do, attn_sink, topk_idxs, lse, delta, dkv, d_attn_sink)
+    if topk <= block_size:
+        bwd_kernel = bwd(B, S, S_kv, H, D, topk, sm_scale, block_size=block_size)
+        dq = bwd_kernel(q, kv, do, attn_sink, topk_idxs, lse, delta, dkv, d_attn_sink)
+    else:
+        dq_accum = torch.zeros_like(q, dtype=torch.float32)
+        chunk_count = topk // block_size
+        bwd_kernel = bwd(B, S, S_kv, H, D, block_size, sm_scale, block_size=block_size)
+        for start in range(0, topk, block_size):
+            chunk = topk_idxs[:, :, start : start + block_size].contiguous()
+            dq_i = bwd_kernel(q, kv, do, attn_sink, chunk, lse, delta, dkv, d_attn_sink)
+            dq_accum.add_(dq_i.float())
+        dq = dq_accum.to(q.dtype)
+        d_attn_sink.div_(chunk_count)
     dkv = postprocess_kernel(dkv)
 
     return dq, dkv, d_attn_sink
