@@ -1695,6 +1695,111 @@ def load_balancing_loss_func(
     return overall_loss * num_experts  # ty:ignore[unsupported-operator]
 
 
+def _add_dsv4_oracle_source_aliases(state: dict[str, torch.Tensor], config) -> None:
+    def add(raw: str, canonical: str) -> None:
+        if canonical in state and raw not in state:
+            state[raw] = state[canonical]
+
+    add("embed.weight", "model.embed_tokens.weight")
+    add("head.weight", "lm_head.weight")
+    add("hc_head_fn", "model.hc_head.hc_fn")
+    add("hc_head_base", "model.hc_head.hc_base")
+    add("hc_head_scale", "model.hc_head.hc_scale")
+    for layer_idx in range(int(config.num_hidden_layers)):
+        src = f"model.layers.{layer_idx}"
+        raw = f"layers.{layer_idx}"
+        add(f"{raw}.attn_norm.weight", f"{src}.input_layernorm.weight")
+        add(f"{raw}.ffn_norm.weight", f"{src}.post_attention_layernorm.weight")
+        add(f"{raw}.hc_attn_fn", f"{src}.attn_hc.fn")
+        add(f"{raw}.hc_attn_base", f"{src}.attn_hc.base")
+        add(f"{raw}.hc_attn_scale", f"{src}.attn_hc.scale")
+        add(f"{raw}.hc_ffn_fn", f"{src}.ffn_hc.fn")
+        add(f"{raw}.hc_ffn_base", f"{src}.ffn_hc.base")
+        add(f"{raw}.hc_ffn_scale", f"{src}.ffn_hc.scale")
+        add(f"{raw}.attn.wq_a.weight", f"{src}.self_attn.q_a_proj.weight")
+        add(f"{raw}.attn.q_norm.weight", f"{src}.self_attn.q_a_norm.weight")
+        add(f"{raw}.attn.wq_b.weight", f"{src}.self_attn.q_b_proj.weight")
+        add(f"{raw}.attn.wkv.weight", f"{src}.self_attn.kv_proj.weight")
+        add(f"{raw}.attn.kv_norm.weight", f"{src}.self_attn.kv_norm.weight")
+        add(f"{raw}.attn.wo_a.weight", f"{src}.self_attn.o_a_proj.weight")
+        add(f"{raw}.attn.wo_b.weight", f"{src}.self_attn.o_b_proj.weight")
+        add(f"{raw}.attn.attn_sink", f"{src}.self_attn.sinks")
+        add(f"{raw}.ffn.gate.weight", f"{src}.mlp.gate.weight")
+        add(f"{raw}.ffn.gate.tid2eid", f"{src}.mlp.gate.tid2eid")
+        add(f"{raw}.ffn.gate.bias", f"{src}.mlp.gate.e_score_correction_bias")
+        add(
+            f"{raw}.ffn.shared_experts.w1.weight",
+            f"{src}.mlp.shared_experts.gate_proj.weight",
+        )
+        add(
+            f"{raw}.ffn.shared_experts.w3.weight",
+            f"{src}.mlp.shared_experts.up_proj.weight",
+        )
+        add(
+            f"{raw}.ffn.shared_experts.w2.weight",
+            f"{src}.mlp.shared_experts.down_proj.weight",
+        )
+        add(
+            f"{raw}.attn.compressor.ape",
+            f"{src}.self_attn.compressor.position_bias",
+        )
+        add(
+            f"{raw}.attn.compressor.wkv.weight",
+            f"{src}.self_attn.compressor.kv_proj.weight",
+        )
+        add(
+            f"{raw}.attn.compressor.wgate.weight",
+            f"{src}.self_attn.compressor.gate_proj.weight",
+        )
+        add(
+            f"{raw}.attn.compressor.norm.weight",
+            f"{src}.self_attn.compressor.kv_norm.weight",
+        )
+        add(
+            f"{raw}.attn.indexer.wq_b.weight",
+            f"{src}.self_attn.compressor.indexer.q_b_proj.weight",
+        )
+        add(
+            f"{raw}.attn.indexer.weights_proj.weight",
+            f"{src}.self_attn.compressor.indexer.weights_proj.weight",
+        )
+        add(
+            f"{raw}.attn.indexer.compressor.ape",
+            f"{src}.self_attn.compressor.indexer.position_bias",
+        )
+        add(
+            f"{raw}.attn.indexer.compressor.wkv.weight",
+            f"{src}.self_attn.compressor.indexer.kv_proj.weight",
+        )
+        add(
+            f"{raw}.attn.indexer.compressor.wgate.weight",
+            f"{src}.self_attn.compressor.indexer.gate_proj.weight",
+        )
+        add(
+            f"{raw}.attn.indexer.compressor.norm.weight",
+            f"{src}.self_attn.compressor.indexer.kv_norm.weight",
+        )
+        gate_up_key = f"{src}.mlp.experts.gate_up_proj"
+        if gate_up_key in state:
+            gate, up = state[gate_up_key].chunk(2, dim=1)
+            for expert_idx in range(int(gate.shape[0])):
+                state.setdefault(
+                    f"{raw}.ffn.experts.{expert_idx}.w1.weight",
+                    gate[expert_idx],
+                )
+                state.setdefault(
+                    f"{raw}.ffn.experts.{expert_idx}.w3.weight",
+                    up[expert_idx],
+                )
+        down_key = f"{src}.mlp.experts.down_proj"
+        if down_key in state:
+            for expert_idx in range(int(state[down_key].shape[0])):
+                state.setdefault(
+                    f"{raw}.ffn.experts.{expert_idx}.w2.weight",
+                    state[down_key][expert_idx],
+                )
+
+
 @auto_docstring
 class DeepseekV4ForCausalLM(DeepseekV4PreTrainedModel, GenerationMixin):
     _tied_weights_keys = {"lm_head.weight": "model.embed_tokens.weight"}
@@ -1712,6 +1817,12 @@ class DeepseekV4ForCausalLM(DeepseekV4PreTrainedModel, GenerationMixin):
 
         # Initialize weights and apply final processing
         self.post_init()
+
+    def state_dict(self, *args, **kwargs):
+        state = super().state_dict(*args, **kwargs)
+        if bool(getattr(self.config, "dsv4_oracle_source_aliases", False)):
+            _add_dsv4_oracle_source_aliases(state, self.config)
+        return state
 
     @can_return_tuple
     @auto_docstring

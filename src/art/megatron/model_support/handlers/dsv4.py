@@ -209,6 +209,10 @@ class Dsv4Handler(DefaultMoeHandler):
     def configure_oracle_provider(self, provider: Any, *, case_config: Any) -> None:
         """Mirrors HF oracle reductions while keeping DSV4 hard kernel invariants."""
         del case_config
+        hooks = list(getattr(provider, "_pre_wrap_hooks", []))
+        kept = [hook for hook in hooks if not self._is_bridge_hf_load_hook(hook)]
+        if len(kept) != len(hooks):
+            provider._pre_wrap_hooks = kept
         self._apply_oracle_shape_overrides(provider)
         provider.kv_lora_rank = 512
         provider.kv_channels = 512
@@ -226,6 +230,16 @@ class Dsv4Handler(DefaultMoeHandler):
         provider.dsa_indexer_topk = _ORACLE_INDEX_TOPK
         provider.dsv4_oracle_freeze_attn_sink = True
 
+    @staticmethod
+    def _is_bridge_hf_load_hook(hook: Any) -> bool:
+        fn = getattr(hook, "func", hook)
+        name = getattr(fn, "__name__", "")
+        qualname = getattr(fn, "__qualname__", "")
+        return name in {
+            "load_weights_hf_to_megatron",
+            "_optimized_load_weights_hf_to_megatron",
+        } or qualname.endswith(".load_weights_hf_to_megatron")
+
     def _apply_oracle_shape_overrides(self, config: Any) -> None:
         """Reduces memory-heavy axes only; head_dim/window/o-rank stay production-sized."""
         config.hidden_size = _ORACLE_HIDDEN_SIZE
@@ -239,6 +253,7 @@ class Dsv4Handler(DefaultMoeHandler):
         config.index_head_dim = 128
         config.index_topk = _ORACLE_INDEX_TOPK
         config.dsv4_oracle_freeze_attn_sink = True
+        config.dsv4_oracle_source_aliases = True
 
 
 def ensure_dsv4_bridge_registered() -> None:

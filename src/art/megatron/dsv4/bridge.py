@@ -5,8 +5,6 @@ from megatron.bridge.models.conversion.mapping_registry import MegatronMappingRe
 from megatron.bridge.models.conversion.model_bridge import WeightConversionTask
 from megatron.bridge.models.conversion.param_mapping import (
     AutoMapping,
-    FusedExpertMapping,
-    FusedGatedExpertMapping,
     GatedMLPMapping,
     ReplicatedMapping,
 )
@@ -18,9 +16,137 @@ import torch
 from art.megatron.dsv4.spec import get_dsv4_decoder_block_spec
 
 
+def _resolve_dsv4_hf_param(hf_param: Any, captures: tuple[str, ...]) -> Any:
+    def resolve_one(pattern: str) -> str:
+        resolved = pattern
+        capture_index = 0
+        while "**" in resolved and capture_index < len(captures):
+            resolved = resolved.replace("**", captures[capture_index], 1)
+            capture_index += 1
+        while "*" in resolved and capture_index < len(captures):
+            resolved = resolved.replace("*", captures[capture_index], 1)
+            capture_index += 1
+        return resolved
+
+    if isinstance(hf_param, str):
+        return resolve_one(hf_param)
+    return {key: resolve_one(value) for key, value in hf_param.items()}
+
+
+class _Dsv4AutoMapping(AutoMapping):
+    def __init__(
+        self,
+        megatron_param: str,
+        hf_param: str,
+        export_hf_param: str | None = None,
+        permute_dims: tuple[int, ...] | None = None,
+    ):
+        super().__init__(megatron_param, hf_param, permute_dims)
+        self.export_hf_param = export_hf_param or hf_param
+
+    def megatron_to_hf(self, megatron_weights: Any, megatron_module: Any):
+        converted = super().megatron_to_hf(megatron_weights, megatron_module)
+        if not converted or self.export_hf_param == self.hf_param:
+            return converted
+        return {self.export_hf_param: next(iter(converted.values()))}
+
+    def resolve(self, captures: tuple[str, ...]):
+        resolved_megatron_param, resolved_hf_param = self._resolve_names(captures)
+        return type(self)(
+            resolved_megatron_param,
+            cast(str, resolved_hf_param),
+            cast(str, _resolve_dsv4_hf_param(self.export_hf_param, captures)),
+            self.permute_dims,
+        )
+
+
+class _Dsv4ReplicatedMapping(ReplicatedMapping):
+    def __init__(
+        self,
+        megatron_param: str,
+        hf_param: str,
+        export_hf_param: str | None = None,
+    ):
+        super().__init__(megatron_param, hf_param)
+        self.export_hf_param = export_hf_param or hf_param
+
+    def megatron_to_hf(self, megatron_weights: Any, megatron_module: Any):
+        converted = super().megatron_to_hf(megatron_weights, megatron_module)
+        if not converted or self.export_hf_param == self.hf_param:
+            return converted
+        return {self.export_hf_param: next(iter(converted.values()))}
+
+    def resolve(self, captures: tuple[str, ...]):
+        resolved_megatron_param, resolved_hf_param = self._resolve_names(captures)
+        return type(self)(
+            resolved_megatron_param,
+            cast(str, resolved_hf_param),
+            cast(str, _resolve_dsv4_hf_param(self.export_hf_param, captures)),
+        )
+
+
+class _Dsv4GatedMLPMapping(GatedMLPMapping):
+    def __init__(
+        self,
+        megatron_param: str,
+        gate: str,
+        up: str,
+        export_gate: str | None = None,
+        export_up: str | None = None,
+    ):
+        super().__init__(megatron_param, gate, up)
+        self.export_hf_param = {
+            "gate": export_gate or gate,
+            "up": export_up or up,
+        }
+
+    def megatron_to_hf(self, megatron_weights: Any, megatron_module: Any):
+        converted = super().megatron_to_hf(megatron_weights, megatron_module)
+        if not converted or self.export_hf_param == self.hf_param:
+            return converted
+        remapped: dict[str, torch.Tensor] = {}
+        source_hf_param = cast(dict[str, str], self.hf_param)
+        for source_key, target_key in zip(
+            source_hf_param.values(), self.export_hf_param.values(), strict=True
+        ):
+            if source_key in converted:
+                remapped[target_key] = converted[source_key]
+        return remapped
+
+    def resolve(self, captures: tuple[str, ...]):
+        resolved_megatron_param, resolved_hf_param = self._resolve_names(captures)
+        resolved_hf_param = cast(dict[str, str], resolved_hf_param)
+        resolved_export = cast(
+            dict[str, str], _resolve_dsv4_hf_param(self.export_hf_param, captures)
+        )
+        return type(self)(
+            resolved_megatron_param,
+            resolved_hf_param["gate"],
+            resolved_hf_param["up"],
+            resolved_export["gate"],
+            resolved_export["up"],
+        )
+
+
 @lru_cache(maxsize=1)
 def _art_dsv4_expert_mapping_types() -> tuple[type[Any], type[Any]]:
-    class _ArtDsv4ExpertGateUpMapping(FusedGatedExpertMapping):
+    class _ArtDsv4ExpertGateUpMapping(GatedMLPMapping):
+        is_grouped_export = True
+
+        def __init__(
+            self,
+            megatron_param: str,
+            gate: str,
+            up: str,
+            export_hf_param: str,
+        ):
+            super().__init__(megatron_param, gate, up)
+            self.export_hf_param = export_hf_param
+
+        @property
+        def group_key(self) -> str:
+            return self.export_hf_param
+
         def hf_to_megatron(
             self,
             hf_weights: Any,
@@ -32,16 +158,7 @@ def _art_dsv4_expert_mapping_types() -> tuple[type[Any], type[Any]]:
             from megatron.bridge.models.conversion.utils import (
                 get_module_and_param_from_name,
             )
-            from megatron.bridge.utils.common_utils import (
-                extract_expert_number_from_param,
-            )
 
-            global_expert_number = extract_expert_number_from_param(self.megatron_param)
-            expert_weight = _select_dsv4_expert_weight(
-                hf_weights,
-                global_expert_number=global_expert_number,
-                ep_size=int(self.ep_size),
-            )
             normalized_param = self._normalize_expert_param_name(self.megatron_param)
             target_param = get_module_and_param_from_name(
                 megatron_module, normalized_param
@@ -55,33 +172,59 @@ def _art_dsv4_expert_mapping_types() -> tuple[type[Any], type[Any]]:
                     "Expected even fused dim for "
                     f"{self.megatron_param}, got {full_target_shape}."
                 )
-            gate_target_shape = (
-                full_target_shape[0] // 2,
-                full_target_shape[1],
+            gate_target_shape = (full_target_shape[0] // 2, full_target_shape[1])
+            gate = _align_expert_weight_to_shape(
+                cast(torch.Tensor, hf_weights["gate"]),
+                torch.Size(gate_target_shape),
+                "gate",
             )
-            if (
-                isinstance(expert_weight, torch.Tensor)
-                and expert_weight.ndim == 3
-                and expert_weight.shape[0] == 2
-            ):
-                gate = _align_expert_weight_to_shape(
-                    expert_weight[0], torch.Size(gate_target_shape), "gate"
+            up = _align_expert_weight_to_shape(
+                cast(torch.Tensor, hf_weights["up"]),
+                torch.Size(gate_target_shape),
+                "up",
+            )
+            return super().hf_to_megatron({"gate": gate, "up": up}, megatron_module)
+
+        def megatron_to_hf(self, megatron_weights: Any, megatron_module: Any):
+            converted = super().megatron_to_hf(megatron_weights, megatron_module)
+            if not converted:
+                return {}
+            hf_param = cast(dict[str, str], self.hf_param)
+            gate_key, up_key = hf_param["gate"], hf_param["up"]
+            if gate_key not in converted or up_key not in converted:
+                return {}
+            return {
+                self.export_hf_param: torch.cat(
+                    [converted[gate_key], converted[up_key]], dim=0
                 )
-                up = _align_expert_weight_to_shape(
-                    expert_weight[1], torch.Size(gate_target_shape), "up"
-                )
-            else:
-                fused = _align_expert_weight_to_shape(
-                    cast(torch.Tensor, expert_weight),
-                    torch.Size(full_target_shape),
-                    "gate_up",
-                )
-                gate, up = torch.chunk(fused, 2, dim=0)
-            return self._gated_mapping.hf_to_megatron(
-                {"gate": gate, "up": up}, megatron_module
+            }
+
+        def resolve(self, captures: tuple[str, ...]):
+            resolved_megatron_param, resolved_hf_param = self._resolve_names(captures)
+            resolved_hf_param = cast(dict[str, str], resolved_hf_param)
+            return type(self)(
+                resolved_megatron_param,
+                resolved_hf_param["gate"],
+                resolved_hf_param["up"],
+                cast(str, _resolve_dsv4_hf_param(self.export_hf_param, captures)),
             )
 
-    class _ArtDsv4ExpertDownMapping(FusedExpertMapping):
+    class _ArtDsv4ExpertDownMapping(AutoMapping):
+        is_grouped_export = True
+
+        def __init__(
+            self,
+            megatron_param: str,
+            hf_param: str,
+            export_hf_param: str,
+        ):
+            super().__init__(megatron_param, hf_param)
+            self.export_hf_param = export_hf_param
+
+        @property
+        def group_key(self) -> str:
+            return self.export_hf_param
+
         def hf_to_megatron(
             self,
             hf_weights: Any,
@@ -95,16 +238,7 @@ def _art_dsv4_expert_mapping_types() -> tuple[type[Any], type[Any]]:
             from megatron.bridge.models.conversion.utils import (
                 get_module_and_param_from_name,
             )
-            from megatron.bridge.utils.common_utils import (
-                extract_expert_number_from_param,
-            )
 
-            global_expert_number = extract_expert_number_from_param(self.megatron_param)
-            expert_weight = _select_dsv4_expert_weight(
-                hf_weights,
-                global_expert_number=global_expert_number,
-                ep_size=int(self.ep_size),
-            )
             normalized_param = self._normalize_expert_param_name(self.megatron_param)
             target_param = get_module_and_param_from_name(
                 megatron_module, normalized_param
@@ -125,34 +259,27 @@ def _art_dsv4_expert_mapping_types() -> tuple[type[Any], type[Any]]:
             else:
                 full_target_shape = tuple(target_param.shape)
             aligned = _align_expert_weight_to_shape(
-                cast(torch.Tensor, expert_weight),
+                cast(torch.Tensor, hf_weights),
                 torch.Size(full_target_shape),
                 "down_proj",
             )
             return self._mapping.hf_to_megatron(aligned, megatron_module)
 
-    return _ArtDsv4ExpertGateUpMapping, _ArtDsv4ExpertDownMapping
+        def megatron_to_hf(self, megatron_weights: Any, megatron_module: Any):
+            converted = super().megatron_to_hf(megatron_weights, megatron_module)
+            if not converted:
+                return {}
+            return {self.export_hf_param: next(iter(converted.values()))}
 
-
-def _select_dsv4_expert_weight(
-    hf_weights: Any,
-    *,
-    global_expert_number: int,
-    ep_size: int,
-) -> Any:
-    from art.megatron.runtime.bridge_runtime import ExpertTensorSlice
-
-    if isinstance(hf_weights, ExpertTensorSlice):
-        return hf_weights.get(global_expert_number)
-    if isinstance(hf_weights, torch.Tensor) and hf_weights.ndim >= 3:
-        if ep_size > 1:
-            raise RuntimeError(
-                "DSV4 EP expert loading expected a sliced fused-expert HF tensor, "
-                "but received the full all-expert tensor for "
-                f"global expert {global_expert_number}."
+        def resolve(self, captures: tuple[str, ...]):
+            resolved_megatron_param, resolved_hf_param = self._resolve_names(captures)
+            return type(self)(
+                resolved_megatron_param,
+                cast(str, resolved_hf_param),
+                cast(str, _resolve_dsv4_hf_param(self.export_hf_param, captures)),
             )
-        return hf_weights[global_expert_number]
-    return hf_weights
+
+    return _ArtDsv4ExpertGateUpMapping, _ArtDsv4ExpertDownMapping
 
 
 def _register_dsv4_module_types() -> None:
@@ -168,132 +295,195 @@ def _dsv4_mapping_registry() -> MegatronMappingRegistry:
     _register_dsv4_module_types()
     expert_gate_up_mapping, expert_down_mapping = _art_dsv4_expert_mapping_types()
     mappings: list[Any] = [
-        AutoMapping("embedding.word_embeddings.weight", "model.embed_tokens.weight"),
-        AutoMapping(
+        _Dsv4AutoMapping(
+            "embedding.word_embeddings.weight",
+            "embed.weight",
+            "model.embed_tokens.weight",
+        ),
+        _Dsv4AutoMapping(
             "decoder.layers.*.input_layernorm.weight",
+            "layers.*.attn_norm.weight",
             "model.layers.*.input_layernorm.weight",
         ),
-        AutoMapping(
+        _Dsv4AutoMapping(
             "decoder.layers.*.pre_mlp_layernorm.weight",
+            "layers.*.ffn_norm.weight",
             "model.layers.*.post_attention_layernorm.weight",
         ),
-        AutoMapping(
-            "decoder.layers.*.mlp.router.weight", "model.layers.*.mlp.gate.weight"
+        _Dsv4AutoMapping(
+            "decoder.layers.*.mlp.router.weight",
+            "layers.*.ffn.gate.weight",
+            "model.layers.*.mlp.gate.weight",
         ),
-        AutoMapping(
-            "decoder.layers.*.mlp.router.tid2eid", "model.layers.*.mlp.gate.tid2eid"
+        _Dsv4AutoMapping(
+            "decoder.layers.*.mlp.router.tid2eid",
+            "layers.*.ffn.gate.tid2eid",
+            "model.layers.*.mlp.gate.tid2eid",
         ),
-        AutoMapping(
+        _Dsv4AutoMapping(
             "decoder.layers.*.mlp.router.e_score_correction_bias",
+            "layers.*.ffn.gate.bias",
             "model.layers.*.mlp.gate.e_score_correction_bias",
         ),
         expert_down_mapping(
             "decoder.layers.*.mlp.experts.linear_fc2.weight*",
+            "layers.*.ffn.experts.*.w2.weight",
             "model.layers.*.mlp.experts.down_proj",
         ),
-        AutoMapping(
+        _Dsv4AutoMapping(
             "decoder.layers.*.mlp.shared_experts.linear_fc2.weight",
+            "layers.*.ffn.shared_experts.w2.weight",
             "model.layers.*.mlp.shared_experts.down_proj.weight",
         ),
-        AutoMapping("decoder.final_layernorm.weight", "model.norm.weight"),
-        AutoMapping(
-            "decoder.final_layernorm.hc_head_params.hc_head_fn", "model.hc_head.hc_fn"
+        _Dsv4AutoMapping("decoder.final_layernorm.weight", "model.norm.weight"),
+        _Dsv4AutoMapping(
+            "decoder.final_layernorm.hc_head_params.hc_head_fn",
+            "hc_head_fn",
+            "model.hc_head.hc_fn",
         ),
-        AutoMapping(
+        _Dsv4AutoMapping(
             "decoder.final_layernorm.hc_head_params.hc_head_base",
+            "hc_head_base",
             "model.hc_head.hc_base",
         ),
-        AutoMapping(
+        _Dsv4AutoMapping(
             "decoder.final_layernorm.hc_head_params.hc_head_scale",
+            "hc_head_scale",
             "model.hc_head.hc_scale",
         ),
-        AutoMapping("output_layer.weight", "lm_head.weight"),
-        AutoMapping("decoder.layers.*.hc_attn_fn", "model.layers.*.attn_hc.fn"),
-        AutoMapping("decoder.layers.*.hc_attn_base", "model.layers.*.attn_hc.base"),
-        AutoMapping("decoder.layers.*.hc_attn_scale", "model.layers.*.attn_hc.scale"),
-        AutoMapping("decoder.layers.*.hc_ffn_fn", "model.layers.*.ffn_hc.fn"),
-        AutoMapping("decoder.layers.*.hc_ffn_base", "model.layers.*.ffn_hc.base"),
-        AutoMapping("decoder.layers.*.hc_ffn_scale", "model.layers.*.ffn_hc.scale"),
-        AutoMapping(
+        _Dsv4AutoMapping("output_layer.weight", "head.weight", "lm_head.weight"),
+        _Dsv4AutoMapping(
+            "decoder.layers.*.hc_attn_fn",
+            "layers.*.hc_attn_fn",
+            "model.layers.*.attn_hc.fn",
+        ),
+        _Dsv4AutoMapping(
+            "decoder.layers.*.hc_attn_base",
+            "layers.*.hc_attn_base",
+            "model.layers.*.attn_hc.base",
+        ),
+        _Dsv4AutoMapping(
+            "decoder.layers.*.hc_attn_scale",
+            "layers.*.hc_attn_scale",
+            "model.layers.*.attn_hc.scale",
+        ),
+        _Dsv4AutoMapping(
+            "decoder.layers.*.hc_ffn_fn",
+            "layers.*.hc_ffn_fn",
+            "model.layers.*.ffn_hc.fn",
+        ),
+        _Dsv4AutoMapping(
+            "decoder.layers.*.hc_ffn_base",
+            "layers.*.hc_ffn_base",
+            "model.layers.*.ffn_hc.base",
+        ),
+        _Dsv4AutoMapping(
+            "decoder.layers.*.hc_ffn_scale",
+            "layers.*.hc_ffn_scale",
+            "model.layers.*.ffn_hc.scale",
+        ),
+        _Dsv4AutoMapping(
             "decoder.layers.*.self_attention.wq_a.weight",
+            "layers.*.attn.wq_a.weight",
             "model.layers.*.self_attn.q_a_proj.weight",
         ),
-        AutoMapping(
+        _Dsv4AutoMapping(
             "decoder.layers.*.self_attention.q_norm.weight",
+            "layers.*.attn.q_norm.weight",
             "model.layers.*.self_attn.q_a_norm.weight",
         ),
-        AutoMapping(
+        _Dsv4AutoMapping(
             "decoder.layers.*.self_attention.wq_b.weight",
+            "layers.*.attn.wq_b.weight",
             "model.layers.*.self_attn.q_b_proj.weight",
         ),
-        AutoMapping(
+        _Dsv4AutoMapping(
             "decoder.layers.*.self_attention.wkv.weight",
+            "layers.*.attn.wkv.weight",
             "model.layers.*.self_attn.kv_proj.weight",
         ),
-        AutoMapping(
+        _Dsv4AutoMapping(
             "decoder.layers.*.self_attention.kv_norm.weight",
+            "layers.*.attn.kv_norm.weight",
             "model.layers.*.self_attn.kv_norm.weight",
         ),
-        AutoMapping(
+        _Dsv4AutoMapping(
             "decoder.layers.*.self_attention.wo_a.weight",
+            "layers.*.attn.wo_a.weight",
             "model.layers.*.self_attn.o_a_proj.weight",
         ),
-        AutoMapping(
+        _Dsv4AutoMapping(
             "decoder.layers.*.self_attention.wo_b.weight",
+            "layers.*.attn.wo_b.weight",
             "model.layers.*.self_attn.o_b_proj.weight",
         ),
-        AutoMapping(
+        _Dsv4AutoMapping(
             "decoder.layers.*.self_attention.attn_sink",
+            "layers.*.attn.attn_sink",
             "model.layers.*.self_attn.sinks",
         ),
-        AutoMapping(
+        _Dsv4AutoMapping(
             "decoder.layers.*.self_attention.compressor.ape",
+            "layers.*.attn.compressor.ape",
             "model.layers.*.self_attn.compressor.position_bias",
         ),
-        ReplicatedMapping(
+        _Dsv4ReplicatedMapping(
             "decoder.layers.*.self_attention.compressor.wkv.weight",
+            "layers.*.attn.compressor.wkv.weight",
             "model.layers.*.self_attn.compressor.kv_proj.weight",
         ),
-        ReplicatedMapping(
+        _Dsv4ReplicatedMapping(
             "decoder.layers.*.self_attention.compressor.wgate.weight",
+            "layers.*.attn.compressor.wgate.weight",
             "model.layers.*.self_attn.compressor.gate_proj.weight",
         ),
-        AutoMapping(
+        _Dsv4AutoMapping(
             "decoder.layers.*.self_attention.compressor.norm.weight",
+            "layers.*.attn.compressor.norm.weight",
             "model.layers.*.self_attn.compressor.kv_norm.weight",
         ),
-        AutoMapping(
+        _Dsv4AutoMapping(
             "decoder.layers.*.self_attention.indexer.linear_wq_b.weight",
+            "layers.*.attn.indexer.wq_b.weight",
             "model.layers.*.self_attn.compressor.indexer.q_b_proj.weight",
         ),
-        AutoMapping(
+        _Dsv4AutoMapping(
             "decoder.layers.*.self_attention.indexer.linear_weights_proj.weight",
+            "layers.*.attn.indexer.weights_proj.weight",
             "model.layers.*.self_attn.compressor.indexer.weights_proj.weight",
         ),
-        AutoMapping(
+        _Dsv4AutoMapping(
             "decoder.layers.*.self_attention.indexer.compressor.ape",
+            "layers.*.attn.indexer.compressor.ape",
             "model.layers.*.self_attn.compressor.indexer.position_bias",
         ),
-        ReplicatedMapping(
+        _Dsv4ReplicatedMapping(
             "decoder.layers.*.self_attention.indexer.compressor.wkv.weight",
+            "layers.*.attn.indexer.compressor.wkv.weight",
             "model.layers.*.self_attn.compressor.indexer.kv_proj.weight",
         ),
-        ReplicatedMapping(
+        _Dsv4ReplicatedMapping(
             "decoder.layers.*.self_attention.indexer.compressor.wgate.weight",
+            "layers.*.attn.indexer.compressor.wgate.weight",
             "model.layers.*.self_attn.compressor.indexer.gate_proj.weight",
         ),
-        AutoMapping(
+        _Dsv4AutoMapping(
             "decoder.layers.*.self_attention.indexer.compressor.norm.weight",
+            "layers.*.attn.indexer.compressor.norm.weight",
             "model.layers.*.self_attn.compressor.indexer.kv_norm.weight",
         ),
         expert_gate_up_mapping(
             megatron_param="decoder.layers.*.mlp.experts.linear_fc1.weight*",
-            hf_param="model.layers.*.mlp.experts.gate_up_proj",
+            gate="layers.*.ffn.experts.*.w1.weight",
+            up="layers.*.ffn.experts.*.w3.weight",
+            export_hf_param="model.layers.*.mlp.experts.gate_up_proj",
         ),
-        GatedMLPMapping(
+        _Dsv4GatedMLPMapping(
             megatron_param="decoder.layers.*.mlp.shared_experts.linear_fc1.weight",
-            gate="model.layers.*.mlp.shared_experts.gate_proj.weight",
-            up="model.layers.*.mlp.shared_experts.up_proj.weight",
+            gate="layers.*.ffn.shared_experts.w1.weight",
+            up="layers.*.ffn.shared_experts.w3.weight",
+            export_gate="model.layers.*.mlp.shared_experts.gate_proj.weight",
+            export_up="model.layers.*.mlp.shared_experts.up_proj.weight",
         ),
     ]
     return MegatronMappingRegistry(*mappings)
