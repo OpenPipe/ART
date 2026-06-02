@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import sys
 from typing import Any
 
+import transformers
 from transformers import AutoConfig, PretrainedConfig
 
 _COMPRESS_RATIO_TO_LAYER_TYPE = {
@@ -273,15 +275,48 @@ class DeepseekV4Config(PretrainedConfig):
         }
 
 
+class DeepseekV4ForCausalLM:
+    """Bridge-dispatch marker; this is not a runnable HF model implementation."""
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        del args, kwargs
+        raise RuntimeError(
+            "Pinned Transformers does not provide a native DeepSeek-V4 HF model. "
+            "This marker only lets Megatron Bridge resolve DSV4 architecture names."
+        )
+
+
+def _ensure_transformers_marker() -> None:
+    _add_marker_to_transformers_module(transformers)
+    auto_bridge = sys.modules.get("megatron.bridge.models.conversion.auto_bridge")
+    if auto_bridge is not None:
+        _add_marker_to_transformers_module(getattr(auto_bridge, "transformers", None))
+
+
+def _add_marker_to_transformers_module(module: Any) -> None:
+    if module is None:
+        return
+    objects = getattr(module, "_objects", None)
+    if isinstance(objects, dict):
+        objects["DeepseekV4ForCausalLM"] = DeepseekV4ForCausalLM
+    setattr(module, "DeepseekV4ForCausalLM", DeepseekV4ForCausalLM)
+
+
 _REGISTERED = False
 
 
 def ensure_dsv4_hf_config_registered() -> None:
     global _REGISTERED
+    _ensure_transformers_marker()
     if _REGISTERED:
         return
     AutoConfig.register(DeepseekV4Config.model_type, DeepseekV4Config)
+    _ensure_transformers_marker()
     _REGISTERED = True
 
 
-__all__ = ["DeepseekV4Config", "ensure_dsv4_hf_config_registered"]
+__all__ = [
+    "DeepseekV4Config",
+    "DeepseekV4ForCausalLM",
+    "ensure_dsv4_hf_config_registered",
+]
