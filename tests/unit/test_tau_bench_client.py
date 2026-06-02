@@ -141,6 +141,37 @@ async def test_client_retries_transport_errors() -> None:
 
 
 @pytest.mark.asyncio
+async def test_client_sends_create_environment_idle_timeout() -> None:
+    seen: dict[str, Any] = {}
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        seen["json"] = json.loads(request.content)
+        return httpx.Response(
+            200,
+            json={"id": "env-1", "observation": "user: hello", "info": {}},
+        )
+
+    http_client = httpx.AsyncClient(
+        base_url="http://tau.test",
+        transport=httpx.MockTransport(handler),
+    )
+    client = TauBenchClient(api_key="secret", http_client=http_client)
+    await client.create_environment(
+        domain="telecom",
+        task_id="task_001",
+        idle_timeout_seconds=120,
+    )
+    await client.close()
+    await http_client.aclose()
+
+    assert seen["json"] == {
+        "domain": "telecom",
+        "task_id": "task_001",
+        "idle_timeout_seconds": 120,
+    }
+
+
+@pytest.mark.asyncio
 async def test_module_default_client_can_be_replaced(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -182,6 +213,7 @@ class FakeTauBenchClient(TauBenchClient):
         user_llm_args: dict[str, Any] | None = None,
         retrieval_config: str | None = None,
         retrieval_config_kwargs: dict[str, Any] | None = None,
+        idle_timeout_seconds: float | None = None,
     ) -> EnvironmentResponse:
         self.create_kwargs = {
             "domain": domain,
@@ -190,6 +222,7 @@ class FakeTauBenchClient(TauBenchClient):
             "user_llm_args": user_llm_args,
             "retrieval_config": retrieval_config,
             "retrieval_config_kwargs": retrieval_config_kwargs,
+            "idle_timeout_seconds": idle_timeout_seconds,
         }
         return EnvironmentResponse(
             id="env-1",

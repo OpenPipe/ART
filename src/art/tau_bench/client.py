@@ -184,6 +184,7 @@ class TauBenchClient:
         user_llm_args: dict[str, Any] | None = None,
         retrieval_config: str | None = None,
         retrieval_config_kwargs: dict[str, Any] | None = None,
+        idle_timeout_seconds: float | None = None,
     ) -> EnvironmentResponse:
         response = await self._request(
             "POST",
@@ -197,6 +198,7 @@ class TauBenchClient:
                     "user_llm_args": user_llm_args,
                     "retrieval_config": retrieval_config,
                     "retrieval_config_kwargs": retrieval_config_kwargs,
+                    "idle_timeout_seconds": idle_timeout_seconds,
                 }.items()
                 if value is not None
             },
@@ -238,6 +240,7 @@ class TauBenchClient:
         user_llm_args: dict[str, Any] | None = None,
         retrieval_config: str | None = None,
         retrieval_config_kwargs: dict[str, Any] | None = None,
+        idle_timeout_seconds: float | None = None,
     ) -> AsyncGenerator[EnvironmentResponse, None]:
         env = await self.create_environment(
             domain=domain,
@@ -246,6 +249,7 @@ class TauBenchClient:
             user_llm_args=user_llm_args,
             retrieval_config=retrieval_config,
             retrieval_config_kwargs=retrieval_config_kwargs,
+            idle_timeout_seconds=idle_timeout_seconds,
         )
         try:
             yield env
