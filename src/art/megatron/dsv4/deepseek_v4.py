@@ -175,7 +175,6 @@ class DeepSeekV4Attention(MegatronModule):
             bias=False,
             gather_output=False,
         )
-        assert cast(torch.Tensor, self.wo_a.weight).dtype == torch.bfloat16
         self.wo_b = TERowParallelLinear(
             self.n_groups * self.o_lora_rank,
             self.dim,
