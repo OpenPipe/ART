@@ -161,6 +161,7 @@ def _register_dsv4_module_types() -> None:
     AutoMapping.register_module_type("Dsv4FinalNorm", "replicated")
     AutoMapping.register_module_type("Dsv4Router", "replicated")
     AutoMapping.register_module_type("Dsv4TransformerLayer", "replicated")
+    AutoMapping.register_module_type("HCHeadParams", "replicated")
 
 
 def _dsv4_mapping_registry() -> MegatronMappingRegistry:
