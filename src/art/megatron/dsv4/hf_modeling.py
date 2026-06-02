@@ -67,6 +67,12 @@ def _dsv4_oracle_linear(module: nn.Linear, hidden_states: torch.Tensor) -> torch
     return module(hidden_states)
 
 
+def _cast_dsv4_oracle_compressor_linears(model: nn.Module) -> None:
+    for module in model.modules():
+        if bool(getattr(module, "_dsv4_oracle_bf16_fp32", False)):
+            module.to(dtype=torch.bfloat16)
+
+
 @use_kernel_forward_from_hub("RMSNorm")
 class DeepseekV4RMSNorm(nn.Module):
     def __init__(self, hidden_size, eps: float = 1e-6) -> None:
@@ -1851,6 +1857,10 @@ class DeepseekV4ForCausalLM(DeepseekV4PreTrainedModel, GenerationMixin):
                 setattr(config, "dsv4_oracle_source_aliases", True)
         if enable_source_aliases:
             setattr(model.config, "dsv4_oracle_source_aliases", True)
+        if bool(
+            getattr(model.config, "dsv4_oracle_precision_aligned_compressor", False)
+        ):
+            _cast_dsv4_oracle_compressor_linears(model)
         return model
 
     def state_dict(self, *args, **kwargs):
