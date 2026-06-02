@@ -31,6 +31,7 @@ _DSV4_MOE_COMPILE_WORKAROUND_FLAGS = (
 class Dsv4Handler(DefaultMoeHandler):
     key = "dsv4"
     is_moe = True
+    cp_supported = False
     native_vllm_lora_status = "disabled"
 
     def identity_lora_model_config(self, base_config: Any) -> Any:

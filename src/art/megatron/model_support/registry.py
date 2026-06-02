@@ -346,6 +346,18 @@ def model_uses_expert_parallel(
     ).is_moe
 
 
+def model_supports_context_parallel(
+    base_model: str,
+    *,
+    allow_unvalidated_arch: bool = False,
+) -> bool:
+    spec = get_model_support_spec(
+        base_model,
+        allow_unvalidated_arch=allow_unvalidated_arch,
+    )
+    return bool(get_model_support_handler_for_spec(spec).cp_supported)
+
+
 def is_model_support_registered(base_model: str) -> bool:
     return base_model in _SPECS_BY_MODEL
 

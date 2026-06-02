@@ -20,6 +20,7 @@ from art.local import LocalBackend
 from art.megatron.backend import MegatronBackend
 from art.megatron.model_support.registry import (
     get_model_support_spec,
+    model_supports_context_parallel,
     model_uses_expert_parallel,
 )
 from art.megatron.model_support.spec import RolloutWeightsMode
@@ -344,8 +345,29 @@ def _build_variant(
         base_model,
         allow_unvalidated_arch=allow_unvalidated_arch,
     )
+    cp_supported = model_supports_context_parallel(
+        base_model,
+        allow_unvalidated_arch=allow_unvalidated_arch,
+    )
     if variant_name == "megatron_shared":
         shared_gpu_ids = _resolve_shared_gpu_ids()
+        if not cp_supported:
+            shared_world_size = len(shared_gpu_ids)
+            return _TrainabilityVariant(
+                name=variant_name,
+                backend_name="megatron",
+                placement_mode="shared",
+                topology=Topology(
+                    tp=shared_world_size,
+                    ep=shared_world_size if is_moe else 1,
+                    etp=1,
+                    dp=1,
+                    cp=1,
+                    sp=shared_world_size > 1,
+                ),
+                trainer_gpu_ids=shared_gpu_ids,
+                inference_gpu_ids=shared_gpu_ids,
+            )
         return _TrainabilityVariant(
             name=variant_name,
             backend_name="megatron",

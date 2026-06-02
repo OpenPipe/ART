@@ -34,6 +34,7 @@ class DefaultDenseHandler:
     key = "default_dense"
     build_gdn_execution_spec = False
     is_moe = False
+    cp_supported = True
     native_vllm_lora_status = "disabled"
 
     def identity_lora_model_config(self, base_config: Any) -> Any:

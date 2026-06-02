@@ -70,6 +70,7 @@ class ModelSupportSpec(BaseModel):
 class ModelSupportHandler(Protocol):
     key: str
     is_moe: bool
+    cp_supported: bool
     native_vllm_lora_status: NativeVllmLoraStatus
 
     def identity_lora_model_config(self, base_config: Any) -> Any: ...

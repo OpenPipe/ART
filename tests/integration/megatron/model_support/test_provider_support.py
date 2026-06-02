@@ -378,6 +378,52 @@ def test_get_provider_bundle_honors_context_parallel_env_topology(
     )
 
 
+def test_cp_unsupported_handler_defaults_to_tensor_parallel(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    provider = _FakeProvider()
+    provider.num_moe_experts = 8
+    fake_bridge = _FakeBridge(
+        model_bridge=object(),
+        provider=provider,
+    )
+    monkeypatch.setattr(
+        provider_module.AutoBridge,
+        "from_hf_pretrained",
+        lambda *args, **kwargs: fake_bridge,
+    )
+    monkeypatch.setattr(provider_module.torch.cuda, "device_count", lambda: 4)
+
+    bundle = provider_module.prepare_provider_bundle("deepseek-ai/DeepSeek-V4-Flash")
+    resolved = bundle.provider
+
+    assert resolved.tensor_model_parallel_size == 4
+    assert resolved.context_parallel_size == 1
+    assert resolved.expert_model_parallel_size == 4
+    assert resolved.sequence_parallel is True
+
+
+def test_cp_unsupported_handler_rejects_context_parallel_env(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    provider = _FakeProvider()
+    provider.num_moe_experts = 8
+    fake_bridge = _FakeBridge(
+        model_bridge=object(),
+        provider=provider,
+    )
+    monkeypatch.setattr(
+        provider_module.AutoBridge,
+        "from_hf_pretrained",
+        lambda *args, **kwargs: fake_bridge,
+    )
+    monkeypatch.setattr(provider_module.torch.cuda, "device_count", lambda: 4)
+    monkeypatch.setenv("ART_MEGATRON_CONTEXT_PARALLEL_SIZE", "2")
+
+    with pytest.raises(RuntimeError, match="does not implement context parallelism"):
+        provider_module.prepare_provider_bundle("deepseek-ai/DeepSeek-V4-Flash")
+
+
 def test_qwen35_handler_keeps_standard_attention_on_flex_under_cp(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

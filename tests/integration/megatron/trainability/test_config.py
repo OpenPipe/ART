@@ -165,9 +165,10 @@ def test_validated_dense_model_uses_dense_shared_topology(
         base_model="Qwen/Qwen3.5-4B",
     )
     assert built_variant.topology is not None
-    assert built_variant.topology.tp == 2
+    assert built_variant.topology.tp == 1
     assert built_variant.topology.ep == 1
     assert built_variant.topology.etp == 1
+    assert built_variant.topology.cp == 2
 
     variant = _TrainabilityVariant(
         name="megatron_shared",
@@ -197,3 +198,18 @@ def test_qwen3_5_moe_shared_variant_enables_expert_parallel(monkeypatch) -> None
 
     assert config["rollout_weights_mode"] == "lora"
     assert config["engine_args"]["enable_expert_parallel"] is True
+
+
+def test_cp_unsupported_moe_shared_variant_uses_tensor_parallel(monkeypatch) -> None:
+    monkeypatch.setenv("ART_MODEL_SUPPORT_SHARED_GPU_IDS", "0,1")
+
+    variant = _build_variant(
+        "megatron_shared",
+        base_model="deepseek-ai/DeepSeek-V4-Flash",
+    )
+
+    assert variant.topology is not None
+    assert variant.topology.tp == 2
+    assert variant.topology.ep == 2
+    assert variant.topology.cp == 1
+    assert variant.topology.sp is True

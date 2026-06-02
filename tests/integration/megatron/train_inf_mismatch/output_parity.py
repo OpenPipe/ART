@@ -291,6 +291,23 @@ def model_support_is_moe(
     return get_model_support_handler_for_spec(spec).is_moe
 
 
+def model_supports_context_parallel(
+    base_model: str,
+    *,
+    allow_unvalidated_arch: bool = False,
+) -> bool:
+    from art.megatron.model_support.registry import (
+        get_model_support_handler_for_spec,
+        get_model_support_spec,
+    )
+
+    spec = get_model_support_spec(
+        base_model,
+        allow_unvalidated_arch=allow_unvalidated_arch,
+    )
+    return get_model_support_handler_for_spec(spec).cp_supported
+
+
 def config_from_env() -> TrainInfOutputParityConfig:
     config = TrainInfOutputParityConfig(
         base_model=os.environ.get(
@@ -327,11 +344,21 @@ def config_from_env() -> TrainInfOutputParityConfig:
     ):
         if raw_value := os.environ.get(env_name):
             config.topology = config.topology.model_copy(update={attr: int(raw_value)})
-    if not model_support_is_moe(
+    is_moe = model_support_is_moe(
         config.base_model,
         allow_unvalidated_arch=config.allow_unvalidated_arch,
-    ):
+    )
+    cp_supported = model_supports_context_parallel(
+        config.base_model,
+        allow_unvalidated_arch=config.allow_unvalidated_arch,
+    )
+    if not is_moe:
         config.topology = config.topology.model_copy(update={"ep": 1, "etp": 1})
+    if not cp_supported and "ART_TRAIN_INF_MISMATCH_CP" not in os.environ:
+        updates = {"cp": 1}
+        if "ART_TRAIN_INF_MISMATCH_TP" not in os.environ:
+            updates["tp"] = max(config.topology.tp, len(config.trainer_gpu_ids))
+        config.topology = config.topology.model_copy(update=updates)
     if raw_targets := os.environ.get("ART_TRAIN_INF_MISMATCH_LORA_TARGET_MODULES"):
         config.lora_target_modules = _parse_str_list(raw_targets)
     return config

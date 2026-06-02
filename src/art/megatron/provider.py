@@ -336,10 +336,18 @@ def _resolve_default_deepep_num_sms(provider: GPTModelProvider) -> int:
     return sm_count if sm_count >= 2 else 20
 
 
-def _apply_default_parallel_topology(provider: GPTModelProvider) -> None:
+def _handler_cp_supported(handler: Any) -> bool:
+    return bool(getattr(handler, "cp_supported", True))
+
+
+def _apply_default_parallel_topology(
+    provider: GPTModelProvider,
+    handler: Any,
+) -> None:
     visible_gpu_count = max(torch.cuda.device_count(), 1)
-    provider.tensor_model_parallel_size = 1
-    provider.context_parallel_size = visible_gpu_count
+    cp_supported = _handler_cp_supported(handler)
+    provider.tensor_model_parallel_size = 1 if cp_supported else visible_gpu_count
+    provider.context_parallel_size = visible_gpu_count if cp_supported else 1
     provider.pipeline_model_parallel_size = 1
     provider.expert_model_parallel_size = (
         visible_gpu_count
@@ -349,12 +357,32 @@ def _apply_default_parallel_topology(provider: GPTModelProvider) -> None:
     provider.expert_tensor_parallel_size = 1
 
 
-def _apply_art_training_runtime_prepare_defaults(provider: GPTModelProvider) -> None:
+def _apply_art_training_runtime_prepare_defaults(
+    provider: GPTModelProvider,
+    handler: Any,
+) -> None:
     provider.recompute_granularity = "full"
     provider.recompute_method = "uniform"
     provider.recompute_num_layers = 1
     provider.moe_shared_expert_overlap = True
-    _apply_default_parallel_topology(provider)
+    _apply_default_parallel_topology(provider, handler)
+
+
+def _validate_context_parallel_support(
+    handler: Any,
+    runtime_env: _ProviderRuntimeEnv,
+) -> None:
+    if _handler_cp_supported(handler):
+        return
+    if (
+        runtime_env.is_set("context_parallel_size")
+        and runtime_env.context_parallel_size is not None
+        and runtime_env.context_parallel_size > 1
+    ):
+        raise RuntimeError(
+            f"{handler.key} model support does not implement context parallelism; "
+            "set ART_MEGATRON_CONTEXT_PARALLEL_SIZE=1."
+        )
 
 
 def _apply_art_training_runtime_finalize_defaults(
@@ -543,8 +571,9 @@ def prepare_provider_bundle(
     provider.calculate_per_token_loss = True
     provider.cross_entropy_loss_fusion = True
     provider.cross_entropy_fusion_impl = "te"
-    _apply_art_training_runtime_prepare_defaults(provider)
+    _apply_art_training_runtime_prepare_defaults(provider, bundle.handler)
     bundle.handler.configure_provider_for_runtime(provider)
+    _validate_context_parallel_support(bundle.handler, runtime_env)
     _apply_runtime_env_overrides(provider, runtime_env)
     provider.sequence_parallel = provider.tensor_model_parallel_size > 1
     _install_art_training_flex_attention(provider)
