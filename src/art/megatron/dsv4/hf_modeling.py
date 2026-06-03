@@ -1824,6 +1824,17 @@ def _add_dsv4_oracle_source_aliases(state: dict[str, torch.Tensor], config) -> N
                 )
 
 
+@torch.no_grad()
+def _initialize_dsv4_oracle_hash_tables(model: nn.Module) -> None:
+    for module in model.modules():
+        if not isinstance(module, DeepseekV4HashRouter):
+            continue
+        tid2eid = getattr(module, "tid2eid")
+        token_ids = torch.arange(tid2eid.shape[0], device=tid2eid.device).unsqueeze(1)
+        offsets = torch.arange(tid2eid.shape[1], device=tid2eid.device).unsqueeze(0)
+        tid2eid.copy_((token_ids + offsets).remainder(int(module.num_experts)))
+
+
 @auto_docstring
 class DeepseekV4ForCausalLM(DeepseekV4PreTrainedModel, GenerationMixin):
     _tied_weights_keys = {"lm_head.weight": "model.embed_tokens.weight"}
@@ -1861,6 +1872,8 @@ class DeepseekV4ForCausalLM(DeepseekV4PreTrainedModel, GenerationMixin):
             getattr(model.config, "dsv4_oracle_precision_aligned_compressor", False)
         ):
             _cast_dsv4_oracle_compressor_linears(model)
+        if enable_source_aliases:
+            _initialize_dsv4_oracle_hash_tables(model)
         return model
 
     def state_dict(self, *args, **kwargs):
