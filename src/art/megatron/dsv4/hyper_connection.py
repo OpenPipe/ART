@@ -35,9 +35,9 @@ class HCHeadParams(MegatronModule):
 class DeepSeekV4HyperConnectionUtil:
     """DeepSeek-V4 manifold-constrained hyper-connection math.
 
-    This implements the HF reference equations directly in PyTorch. It keeps
-    the Miles public API so DSV4 layers can be wired the same way while avoiding
-    a runtime dependency on TileKernels in this ART worktree.
+    This implements the HF reference equations directly in PyTorch. TileKernels
+    MHC currently requires a newer CUDA toolchain than this ART Megatron env
+    provides, so production training keeps the exact eager math here.
     """
 
     def __init__(self, config: TransformerConfig):
@@ -54,8 +54,8 @@ class DeepSeekV4HyperConnectionUtil:
         hc_scale: Tensor,
         hc_base: Tensor,
     ) -> tuple[Tensor, Tensor, Tensor]:
-        hc = self.hc_mult
         dtype = x.dtype
+        hc = self.hc_mult
         flat = _unweighted_rms_norm(x.flatten(start_dim=2).float(), self.norm_eps)
         pre_w, post_w, comb_w = F.linear(flat, hc_fn.float()).split(
             [hc, hc, hc * hc], dim=-1
