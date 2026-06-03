@@ -420,7 +420,7 @@ class DeepSeekV4Compressor(nn.Module):
             kv = self.overlap_transform_with_cp(kv, 0)
             score = self.overlap_transform_with_cp(score, float("-inf"))
 
-        score_softmax = score.softmax(dim=2)
+        score_softmax = score.softmax(dim=2, dtype=torch.float32).to(kv.dtype)
         kv = (kv * score_softmax).sum(dim=2)
 
         kv = self.norm(kv.to(dtype))
@@ -496,7 +496,9 @@ class DeepSeekV4Compressor(nn.Module):
             slots_score,
             torch.zeros_like(slots_score),
         )
-        score_softmax = slots_score.softmax(dim=2)
+        score_softmax = slots_score.softmax(dim=2, dtype=torch.float32).to(
+            slots_kv.dtype
+        )
         compressed = (slots_kv * score_softmax).sum(dim=2)
         compressed = self.norm(compressed.to(dtype))
         freqs_cis = get_rope_cache_at_positions(
