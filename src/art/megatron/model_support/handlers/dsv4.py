@@ -148,6 +148,7 @@ class Dsv4Handler(DefaultMoeHandler):
     def install_preprocess_patch(self, model_chunks: Sequence[Any]) -> None:
         from megatron.core.models.gpt.gpt_model import GPTModel
 
+        from art.megatron.dsv4.deepseek_v4 import DeepSeekV4Attention
         from art.megatron.dsv4.layer import Dsv4MoELayer
         from art.megatron.dsv4.rope import materialize_rope_cache
 
@@ -168,16 +169,22 @@ class Dsv4Handler(DefaultMoeHandler):
                 *args: Any, _preprocess=preprocess, _gpt=gpt_module, **kwargs: Any
             ):
                 input_ids = kwargs.get("input_ids")
+                position_ids = kwargs.get("position_ids")
                 for child in _gpt.decoder.modules():
                     if isinstance(child, Dsv4MoELayer):
                         child.set_input_ids(
                             input_ids if isinstance(input_ids, torch.Tensor) else None
                         )
+                    if isinstance(child, DeepSeekV4Attention):
+                        child.set_position_ids(
+                            position_ids
+                            if isinstance(position_ids, torch.Tensor)
+                            else None
+                        )
                 preproc_output = list(_preprocess(*args, **kwargs))
                 decoder_input = cast(torch.Tensor, preproc_output[0])
                 if not decoder_input.requires_grad and decoder_input.is_leaf:
                     decoder_input.requires_grad_(True)
-                position_ids = kwargs.get("position_ids")
                 table = preproc_output[1]
                 if isinstance(position_ids, torch.Tensor) and torch.is_tensor(table):
                     embedding_dim = int(table.shape[-1])

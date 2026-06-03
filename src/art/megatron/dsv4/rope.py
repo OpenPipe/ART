@@ -65,9 +65,15 @@ def apply_rotary_emb(
     if inverse:
         freqs_cis = freqs_cis.conj()
     if x.ndim == 3:
-        freqs_cis = freqs_cis.view(1, x.size(1), x.size(-1))
+        if freqs_cis.ndim == 2:
+            freqs_cis = freqs_cis.view(1, x.size(1), x.size(-1))
+        else:
+            freqs_cis = freqs_cis.view(x.size(0), x.size(1), x.size(-1))
     else:
-        freqs_cis = freqs_cis.view(1, x.size(1), 1, x.size(-1))
+        if freqs_cis.ndim == 2:
+            freqs_cis = freqs_cis.view(1, x.size(1), 1, x.size(-1))
+        else:
+            freqs_cis = freqs_cis.view(x.size(0), x.size(1), 1, x.size(-1))
     x = torch.view_as_real(x * freqs_cis).flatten(-2)
     y.copy_(x)
     return y
@@ -161,3 +167,17 @@ def get_rope_cache(
         materialize_rope_cache(module, device)
         freqs_cis = cast(torch.Tensor, module.freqs_cis)
     return freqs_cis[:seqlen]
+
+
+def get_rope_cache_at_positions(
+    module: nn.Module, *, position_ids: torch.Tensor, device: torch.device
+) -> torch.Tensor:
+    freqs_cis = cast(torch.Tensor, module.freqs_cis)
+    if freqs_cis.numel() == 0 or freqs_cis.device != device:
+        materialize_rope_cache(module, device)
+        freqs_cis = cast(torch.Tensor, module.freqs_cis)
+    safe_positions = position_ids.to(device=device, dtype=torch.long).clamp_min(0)
+    return freqs_cis.index_select(0, safe_positions.reshape(-1)).view(
+        *safe_positions.shape,
+        freqs_cis.shape[-1],
+    )

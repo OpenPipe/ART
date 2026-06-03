@@ -37,6 +37,7 @@ from art.megatron.dsv4.rope import (
     apply_rotary_emb,
     configure_rope_cache,
     get_rope_cache,
+    get_rope_cache_at_positions,
 )
 from art.megatron.dsv4.v4_indexer import V4Indexer
 
@@ -66,6 +67,65 @@ def _compress_topk_idxs(
         k_group_idx >= q_first_invalid_group, -1, k_group_idx + offset
     )
     return compress.unsqueeze(0).expand(bsz, -1, -1)
+
+
+def _shared_prefix_tensors(
+    attention_bias: Any,
+    *,
+    bsz: int,
+    seqlen: int,
+    device: torch.device,
+) -> tuple[torch.Tensor, torch.Tensor] | None:
+    group_ids = getattr(attention_bias, "group_ids", None)
+    parent_ids = getattr(attention_bias, "parent_ids", None)
+    if group_ids is None or parent_ids is None:
+        return None
+    group_ids = group_ids.to(device=device, dtype=torch.long)
+    parent_ids = parent_ids.to(device=device, dtype=torch.long)
+    if group_ids.shape != (bsz, seqlen) or parent_ids.shape != (bsz, seqlen):
+        raise ValueError(
+            "DSV4 shared-prefix metadata must match attention input shape: "
+            f"group_ids={tuple(group_ids.shape)} parent_ids={tuple(parent_ids.shape)} "
+            f"expected={(bsz, seqlen)}."
+        )
+    return group_ids, parent_ids
+
+
+def _shared_prefix_window_topk_idxs(
+    position_ids: torch.Tensor,
+    group_ids: torch.Tensor,
+    parent_ids: torch.Tensor,
+    *,
+    window_size: int,
+) -> torch.Tensor:
+    bsz, seqlen = group_ids.shape
+    width = min(seqlen, window_size)
+    arange = torch.arange(seqlen, device=group_ids.device).expand(bsz, -1)
+    valid_token = (group_ids >= 0) & (parent_ids >= 0)
+    group_start = valid_token.clone()
+    group_start[:, 1:] &= group_ids[:, 1:] != group_ids[:, :-1]
+    start_values = torch.where(group_start, arange, torch.zeros_like(arange))
+    group_start_idx = torch.cummax(start_values, dim=1).values
+    prompt_start = group_start & (group_ids == parent_ids)
+    prompt_values = torch.where(prompt_start, arange, torch.zeros_like(arange))
+    prompt_start_idx = torch.cummax(prompt_values, dim=1).values
+
+    q_pos = position_ids.to(device=group_ids.device, dtype=torch.long)
+    group_start_pos = q_pos.gather(1, group_start_idx)
+    offsets = torch.arange(width, device=group_ids.device)
+    target_pos = q_pos.unsqueeze(-1) - width + 1 + offsets
+    from_group = target_pos >= group_start_pos.unsqueeze(-1)
+    group_k = group_start_idx.unsqueeze(-1) + target_pos - group_start_pos.unsqueeze(-1)
+    prompt_k = prompt_start_idx.unsqueeze(-1) + target_pos
+    k_idx = torch.where(from_group, group_k, prompt_k)
+    valid = (
+        valid_token.unsqueeze(-1)
+        & (target_pos >= 0)
+        & (target_pos <= q_pos.unsqueeze(-1))
+        & (k_idx >= 0)
+        & (k_idx < seqlen)
+    )
+    return torch.where(valid, k_idx, torch.full_like(k_idx, -1))
 
 
 def _add_lora_if_present(
@@ -231,6 +291,10 @@ class DeepSeekV4Attention(MegatronModule):
             base=rope_base,
             yarn_disabled=yarn_disabled,
         )
+        self._dsv4_position_ids: torch.Tensor | None = None
+
+    def set_position_ids(self, position_ids: torch.Tensor | None) -> None:
+        self._dsv4_position_ids = position_ids
 
     def sharded_state_dict(
         self,
@@ -272,10 +336,24 @@ class DeepSeekV4Attention(MegatronModule):
         x = einops.rearrange(hidden_states, "s b d -> b s d")
 
         bsz, seqlen_local, _ = x.size()
-        freqs_cis = get_rope_cache(self, seqlen=seqlen_local, device=x.device)
+        position_ids = self._dsv4_position_ids
+        if position_ids is not None:
+            if position_ids.shape != (bsz, seqlen_local):
+                raise ValueError(
+                    "DSV4 position_ids must match attention input shape: "
+                    f"position_ids={tuple(position_ids.shape)} expected={(bsz, seqlen_local)}."
+                )
+            freqs_cis = get_rope_cache_at_positions(
+                self, position_ids=position_ids, device=x.device
+            )
+        else:
+            freqs_cis = get_rope_cache(self, seqlen=seqlen_local, device=x.device)
         win = self.window_size
         ratio = self.compress_ratio
         rd = self.rope_head_dim
+        shared_prefix = _shared_prefix_tensors(
+            attention_bias, bsz=bsz, seqlen=seqlen_local, device=x.device
+        )
 
         q_after_wq_a = _add_lora_if_present(self, "wq_a_lora", self.wq_a(x)[0], x)
         qr = q = cast(Any, self.q_norm)(q_after_wq_a)
@@ -301,7 +379,16 @@ class DeepSeekV4Attention(MegatronModule):
         seqlen_global = seqlen_local
         q_positions = torch.arange(seqlen_local, device=x.device)
 
-        topk_idxs = _window_topk_idxs(q_positions, window_size=win, bsz=bsz)
+        if shared_prefix is not None and position_ids is not None:
+            group_ids, parent_ids = shared_prefix
+            topk_idxs = _shared_prefix_window_topk_idxs(
+                position_ids,
+                group_ids,
+                parent_ids,
+                window_size=win,
+            )
+        else:
+            topk_idxs = _window_topk_idxs(q_positions, window_size=win, bsz=bsz)
 
         if self.compress_ratio:
             kv_compress_offset = seqlen_global
