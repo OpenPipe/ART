@@ -276,10 +276,12 @@ class Dsv4Handler(DefaultMoeHandler):
         self, model_chunks: Sequence[Any]
     ) -> dict[str, list[Any]]:
         from art.megatron.dsv4.layer import Dsv4TransformerLayer
-        from art.megatron.dsv4.lora import add_dsv4_attention_adapter_weights
+        from art.megatron.dsv4.lora import (
+            add_dsv4_attention_adapter_weights,
+            add_dsv4_shared_experts_adapter_weights,
+        )
         from art.megatron.weights.adapter_export import (
             add_grouped_moe_adapter_weights,
-            add_shared_experts_adapter_weights,
             layer_base_prefix,
         )
 
@@ -300,7 +302,7 @@ class Dsv4Handler(DefaultMoeHandler):
                     experts=_require_moe_experts(module),
                 )
                 if getattr(module.mlp, "shared_experts", None) is not None:
-                    add_shared_experts_adapter_weights(
+                    add_dsv4_shared_experts_adapter_weights(
                         adapter_weights_by_base,
                         layer_prefix=layer_prefix,
                         shared_experts=module.mlp.shared_experts,

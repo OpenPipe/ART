@@ -3,6 +3,7 @@ from __future__ import annotations
 import math
 from typing import Any
 
+from megatron.core import parallel_state as ps
 from megatron.core.tensor_parallel.mappings import (
     reduce_from_tensor_model_parallel_region,
 )
@@ -193,6 +194,19 @@ class Dsv4RowOutputLoRA(torch.nn.Module):
         return out
 
 
+class Dsv4PlainLoRA(torch.nn.Module):
+    def __init__(self, lora: LoRA) -> None:
+        super().__init__()
+        self.lora = lora
+
+    @property
+    def adapter_model_prefix(self) -> str:
+        return self.lora.adapter_model_prefix
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.lora(x)
+
+
 def _targets_include(target_modules: set[str], *names: str) -> bool:
     return not target_modules or any(name in target_modules for name in names)
 
@@ -217,39 +231,45 @@ def apply_dsv4_attention_lora(
         _attach_lora(
             attention,
             "wq_a_lora",
-            replicated_lora(
-                adapter_model_prefix=f"{adapter_model_prefix}.self_attn.q_a_proj",
-                weight=attention.wq_a.weight,
-                in_features=attention.wq_a.weight.shape[1],
-                out_features=attention.wq_a.weight.shape[0],
-                rank=rank,
-                alpha=alpha,
+            Dsv4PlainLoRA(
+                replicated_lora(
+                    adapter_model_prefix=f"{adapter_model_prefix}.self_attn.q_a_proj",
+                    weight=attention.wq_a.weight,
+                    in_features=attention.wq_a.weight.shape[1],
+                    out_features=attention.wq_a.weight.shape[0],
+                    rank=rank,
+                    alpha=alpha,
+                )
             ),
         )
     if _targets_include(target_modules, "q_b_proj"):
         _attach_lora(
             attention,
             "wq_b_lora",
-            column_parallel_lora(
-                adapter_model_prefix=f"{adapter_model_prefix}.self_attn.q_b_proj",
-                weight=attention.wq_b.weight,
-                in_features=attention.wq_b.weight.shape[1],
-                out_features=attention.wq_b.weight.shape[0],
-                rank=rank,
-                alpha=alpha,
+            Dsv4PlainLoRA(
+                column_parallel_lora(
+                    adapter_model_prefix=f"{adapter_model_prefix}.self_attn.q_b_proj",
+                    weight=attention.wq_b.weight,
+                    in_features=attention.wq_b.weight.shape[1],
+                    out_features=attention.wq_b.weight.shape[0],
+                    rank=rank,
+                    alpha=alpha,
+                )
             ),
         )
     if _targets_include(target_modules, "kv_proj"):
         _attach_lora(
             attention,
             "wkv_lora",
-            replicated_lora(
-                adapter_model_prefix=f"{adapter_model_prefix}.self_attn.kv_proj",
-                weight=attention.wkv.weight,
-                in_features=attention.wkv.weight.shape[1],
-                out_features=attention.wkv.weight.shape[0],
-                rank=rank,
-                alpha=alpha,
+            Dsv4PlainLoRA(
+                replicated_lora(
+                    adapter_model_prefix=f"{adapter_model_prefix}.self_attn.kv_proj",
+                    weight=attention.wkv.weight,
+                    in_features=attention.wkv.weight.shape[1],
+                    out_features=attention.wkv.weight.shape[0],
+                    rank=rank,
+                    alpha=alpha,
+                )
             ),
         )
     if _targets_include(target_modules, "o_a_proj"):
@@ -287,30 +307,34 @@ def apply_dsv4_attention_lora(
         _attach_lora(
             compressor,
             "kv_proj_lora",
-            replicated_lora(
-                adapter_model_prefix=(
-                    f"{adapter_model_prefix}.self_attn.compressor.kv_proj"
-                ),
-                weight=compressor.wkv.weight,
-                in_features=compressor.wkv.weight.shape[1],
-                out_features=compressor.wkv.weight.shape[0],
-                rank=rank,
-                alpha=alpha,
+            Dsv4PlainLoRA(
+                replicated_lora(
+                    adapter_model_prefix=(
+                        f"{adapter_model_prefix}.self_attn.compressor.kv_proj"
+                    ),
+                    weight=compressor.wkv.weight,
+                    in_features=compressor.wkv.weight.shape[1],
+                    out_features=compressor.wkv.weight.shape[0],
+                    rank=rank,
+                    alpha=alpha,
+                )
             ),
         )
     if _targets_include(target_modules, "compressor.gate_proj"):
         _attach_lora(
             compressor,
             "gate_proj_lora",
-            replicated_lora(
-                adapter_model_prefix=(
-                    f"{adapter_model_prefix}.self_attn.compressor.gate_proj"
-                ),
-                weight=compressor.wgate.weight,
-                in_features=compressor.wgate.weight.shape[1],
-                out_features=compressor.wgate.weight.shape[0],
-                rank=rank,
-                alpha=alpha,
+            Dsv4PlainLoRA(
+                replicated_lora(
+                    adapter_model_prefix=(
+                        f"{adapter_model_prefix}.self_attn.compressor.gate_proj"
+                    ),
+                    weight=compressor.wgate.weight,
+                    in_features=compressor.wgate.weight.shape[1],
+                    out_features=compressor.wgate.weight.shape[0],
+                    rank=rank,
+                    alpha=alpha,
+                )
             ),
         )
 
@@ -331,25 +355,92 @@ def _adapter_alpha_dim(lora: LoRA) -> tuple[int, int]:
     return rounded, dim
 
 
-def _adapter_weight(base_prefix: str, lora: LoRA) -> Any:
+def _adapter_param_prefix(base_prefix: str, adapter_key: str | None) -> str:
+    if adapter_key is None:
+        return f"{base_prefix}.adapter"
+    return f"{base_prefix}.adapter.{adapter_key}"
+
+
+def _adapter_weight(
+    base_prefix: str,
+    lora: LoRA,
+    *,
+    adapter_key: str | None = None,
+) -> Any:
     from megatron.bridge.models.conversion.model_bridge import MegatronWeightTuple
     from megatron.bridge.models.conversion.peft_bridge import AdapterWeight
 
     alpha, dim = _adapter_alpha_dim(lora)
     linear_in = lora.A_T.transpose(-1, -2).contiguous()
     linear_out = lora.B_T.transpose(-1, -2).contiguous()
+    param_prefix = _adapter_param_prefix(base_prefix, adapter_key)
+    return AdapterWeight(
+        global_base_prefix=base_prefix,
+        adapter_key=adapter_key,
+        alpha=alpha,
+        dim=dim,
+        linear_in_weight=MegatronWeightTuple(
+            param_name=f"{param_prefix}.linear_in.weight",
+            weight=linear_in,
+            vp_stage=0,
+        ),
+        linear_out_weight=MegatronWeightTuple(
+            param_name=f"{param_prefix}.linear_out.weight",
+            weight=linear_out,
+            vp_stage=0,
+        ),
+    )
+
+
+def _tensor_parallel_group() -> Any | None:
+    try:
+        return ps.get_tensor_model_parallel_group()
+    except Exception:
+        return None
+
+
+def _gather_tp_input_shards(
+    linear_in: torch.Tensor, tp_group: Any | None
+) -> torch.Tensor:
+    dist = torch.distributed
+    if not (dist.is_available() and dist.is_initialized()):
+        return linear_in
+    tp_group = tp_group or _tensor_parallel_group()
+    world_size = tp_group.size() if tp_group is not None else dist.get_world_size()
+    if world_size <= 1:
+        return linear_in
+    gathered = [torch.empty_like(linear_in) for _ in range(world_size)]
+    dist.all_gather(gathered, linear_in.contiguous(), group=tp_group)
+    return torch.cat(gathered, dim=-1)
+
+
+def _row_parallel_adapter_weight(
+    base_prefix: str,
+    lora: LoRA,
+    *,
+    tp_group: Any | None,
+) -> Any:
+    from megatron.bridge.models.conversion.model_bridge import MegatronWeightTuple
+    from megatron.bridge.models.conversion.peft_bridge import AdapterWeight
+
+    alpha, dim = _adapter_alpha_dim(lora)
+    linear_in = _gather_tp_input_shards(
+        lora.A_T.transpose(-1, -2).contiguous(), tp_group
+    )
+    linear_out = lora.B_T.transpose(-1, -2).contiguous()
+    param_prefix = _adapter_param_prefix(base_prefix, None)
     return AdapterWeight(
         global_base_prefix=base_prefix,
         adapter_key=None,
         alpha=alpha,
         dim=dim,
         linear_in_weight=MegatronWeightTuple(
-            param_name=f"{base_prefix}.adapter.linear_in.weight",
+            param_name=f"{param_prefix}.linear_in.weight",
             weight=linear_in,
             vp_stage=0,
         ),
         linear_out_weight=MegatronWeightTuple(
-            param_name=f"{base_prefix}.adapter.linear_out.weight",
+            param_name=f"{param_prefix}.linear_out.weight",
             weight=linear_out,
             vp_stage=0,
         ),
@@ -367,6 +458,24 @@ def _add_adapter(
         return
     adapter_weights_by_base[f"{base_prefix}.weight"] = [
         _adapter_weight(base_prefix, lora)
+    ]
+
+
+def _add_row_parallel_adapter(
+    adapter_weights_by_base: dict[str, list[Any]],
+    *,
+    base_prefix: str,
+    lora_module: torch.nn.Module | None,
+) -> None:
+    lora = _unwrap_lora(lora_module)
+    if lora is None:
+        return
+    adapter_weights_by_base[f"{base_prefix}.weight"] = [
+        _row_parallel_adapter_weight(
+            base_prefix,
+            lora,
+            tp_group=getattr(lora_module, "tp_group", None),
+        )
     ]
 
 
@@ -397,7 +506,7 @@ def add_dsv4_attention_adapter_weights(
         base_prefix=f"{attn_prefix}.wo_a",
         lora_module=getattr(attention, "wo_a_lora", None),
     )
-    _add_adapter(
+    _add_row_parallel_adapter(
         adapter_weights_by_base,
         base_prefix=f"{attn_prefix}.wo_b",
         lora_module=getattr(attention, "wo_b_lora", None),
@@ -415,3 +524,39 @@ def add_dsv4_attention_adapter_weights(
         base_prefix=f"{attn_prefix}.compressor.wgate",
         lora_module=getattr(compressor, "gate_proj_lora", None),
     )
+
+
+def add_dsv4_shared_experts_adapter_weights(
+    adapter_weights_by_base: dict[str, list[Any]],
+    *,
+    layer_prefix: str,
+    shared_experts: Any,
+) -> None:
+    from art.megatron.lora import SharedExpertsLinearFC1LoRA, SharedExpertsLinearFC2LoRA
+
+    linear_fc1 = getattr(shared_experts, "linear_fc1", None)
+    if isinstance(linear_fc1, SharedExpertsLinearFC1LoRA):
+        base_prefix = f"{layer_prefix}.mlp.shared_experts.linear_fc1"
+        adapter_weights_by_base[f"{base_prefix}.weight"] = [
+            _adapter_weight(
+                base_prefix,
+                linear_fc1.gate_lora,
+                adapter_key="adapter_gate",
+            ),
+            _adapter_weight(
+                base_prefix,
+                linear_fc1.up_lora,
+                adapter_key="adapter_up",
+            ),
+        ]
+
+    linear_fc2 = getattr(shared_experts, "linear_fc2", None)
+    if isinstance(linear_fc2, SharedExpertsLinearFC2LoRA):
+        base_prefix = f"{layer_prefix}.mlp.shared_experts.linear_fc2"
+        adapter_weights_by_base[f"{base_prefix}.weight"] = [
+            _row_parallel_adapter_weight(
+                base_prefix,
+                linear_fc2.row_parallel_lora.lora,
+                tp_group=_tensor_parallel_group(),
+            )
+        ]
