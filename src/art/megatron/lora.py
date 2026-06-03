@@ -331,6 +331,10 @@ class LoRA(torch.nn.Module):
     def num_local_experts(self) -> int:
         return self.A_T.shape[0] if self.A_T.ndim == 3 else 1
 
+    @property
+    def _uses_expert_keys(self) -> bool:
+        return "{expert}" in self.adapter_model_prefix
+
     def _broadcast_if_replicated(self, param: torch.nn.Parameter) -> None:
         if not param.lora_tp_replicated:  # ty: ignore[unresolved-attribute]
             return
@@ -364,7 +368,7 @@ class LoRA(torch.nn.Module):
         self._broadcast_if_replicated(self.B_T)
 
     def _expected_weight_keys(self, suffix: str) -> list[str]:
-        if self.num_local_experts > 1:
+        if self._uses_expert_keys:
             return [
                 f"{self.adapter_model_prefix.format(expert=expert + self._expert_offset)}.{suffix}.weight"
                 for expert in range(self.num_local_experts)
@@ -401,7 +405,7 @@ class LoRA(torch.nn.Module):
         into: torch.nn.Parameter,
     ) -> None:
         keys = self._expected_weight_keys(suffix)
-        if self.num_local_experts > 1:
+        if self._uses_expert_keys and self.num_local_experts > 1:
             weight = torch.stack([adapter_model[key].T for key in keys])
         else:
             weight = adapter_model[keys[0]].T
@@ -464,7 +468,7 @@ class LoRA(torch.nn.Module):
         Determine if the given LoRA param should be exported in the sharded LoRA state dict
         (drop replicated ranks/params).
         """
-        if self.num_local_experts > 1:  # self is a MoE layer
+        if self._uses_expert_keys:  # self is a MoE layer
             if ps.get_expert_data_parallel_rank() != 0:
                 return False
         else:  # self is a non-MoE layer
@@ -515,10 +519,12 @@ class LoRA(torch.nn.Module):
         for key, param in self._lora_params():
             if not self._should_export_parameter(param):
                 continue
-            if self.num_local_experts > 1:
+            if self._uses_expert_keys:
                 for expert in range(self.num_local_experts):
                     full_key = f"{self.adapter_model_prefix.format(expert=expert + self._expert_offset)}.{key}"
-                    export_items.append((full_key, param, expert))
+                    export_items.append(
+                        (full_key, param, expert if param.ndim == 3 else None)
+                    )
             else:
                 export_items.append((f"{self.adapter_model_prefix}.{key}", param, None))
         return export_items
@@ -643,7 +649,7 @@ class LoRAPublishPlanner:
         template: _LoraPublishTemplate,
         adapter_model: dict[str, torch.Tensor],
     ) -> list[LoraShardMeta]:
-        if template.num_local_experts > 1:
+        if "{expert}" in template.adapter_model_prefix:
             return self._expert_metadata_for_template(template, adapter_model)
         return self._dense_metadata_for_template(template, adapter_model)
 

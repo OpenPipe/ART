@@ -903,6 +903,36 @@ def test_lora_publish_planner_derives_metadata_from_lora_modules():
     }
 
 
+def test_lora_single_local_expert_formats_global_expert_keys(monkeypatch):
+    monkeypatch.setattr(lora_module.ps, "get_expert_model_parallel_rank", lambda: 1)
+    monkeypatch.setattr(lora_module.ps, "get_expert_data_parallel_rank", lambda: 0)
+    prefix = "base_model.model.model.layers.0.mlp.experts.{expert}.gate_proj"
+    lora = LoRA(
+        adapter_model_prefix=prefix,
+        in_features=3,
+        out_features=4,
+        rank=2,
+        alpha=4,
+        dtype=torch.float32,
+        device=torch.device("cpu"),
+        num_local_experts=1,
+    )
+    a_key = "base_model.model.model.layers.0.mlp.experts.1.gate_proj.lora_A.weight"
+    b_key = "base_model.model.model.layers.0.mlp.experts.1.gate_proj.lora_B.weight"
+    adapter_model = {
+        a_key: torch.arange(6, dtype=torch.float32).view(2, 3),
+        b_key: torch.arange(8, dtype=torch.float32).view(4, 2),
+    }
+
+    assert lora._expected_weight_keys("lora_A") == [a_key]
+    lora.load_lora(adapter_model)
+    state = lora.sharded_lora_state_dict()
+
+    assert torch.equal(lora.A_T, adapter_model[a_key].T)
+    assert torch.equal(lora.B_T, adapter_model[b_key].T)
+    assert set(state) == {a_key, b_key}
+
+
 def test_lora_publish_planner_maps_expert_owner_ranks(monkeypatch):
     monkeypatch.setattr(lora_module, "_distributed_initialized", lambda: True)
     monkeypatch.setattr(

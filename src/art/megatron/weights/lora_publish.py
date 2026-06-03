@@ -241,7 +241,7 @@ def _global_packed_expert_metadata(
 ) -> list[PackedExpertShardMeta]:
     metadata: list[PackedExpertShardMeta] = []
     for template in planner.templates:
-        if int(template.num_local_experts) <= 1:
+        if "{expert}" not in template.adapter_model_prefix:
             continue
         slot_match = _packed_expert_slot(
             template.adapter_model_prefix,
