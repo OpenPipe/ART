@@ -2,9 +2,6 @@ from typing import Any
 
 import torch
 
-from art.megatron.dsv4.kernel import tilelang_sparse_mla_bwd as sparse_mla_bwd
-from art.megatron.dsv4.kernel import tilelang_sparse_mla_fwd as sparse_mla_fwd
-
 
 def _sparse_attn_torch(q, kv, attn_sink, topk_idxs, sm_scale):
     if sm_scale is None:
@@ -28,6 +25,8 @@ def _sparse_attn_torch(q, kv, attn_sink, topk_idxs, sm_scale):
 class DeepSeekV4SparseAttention(torch.autograd.Function):
     @staticmethod
     def forward(ctx, q, kv, attn_sink, topk_idxs, sm_scale=None, output_dtype=None):
+        from art.megatron.dsv4.kernel import tilelang_sparse_mla_fwd as sparse_mla_fwd
+
         o, lse = sparse_mla_fwd.sparse_mqa_fwd_interface(
             q, kv, attn_sink, topk_idxs, sm_scale=sm_scale
         )
@@ -40,6 +39,8 @@ class DeepSeekV4SparseAttention(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx: Any, *grad_outputs: Any):
+        from art.megatron.dsv4.kernel import tilelang_sparse_mla_bwd as sparse_mla_bwd
+
         do = grad_outputs[0]
         q, kv, attn_sink, topk_idxs, output, lse = ctx.saved_tensors
         sm_scale = ctx.sm_scale

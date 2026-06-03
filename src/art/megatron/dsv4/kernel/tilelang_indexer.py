@@ -9,12 +9,6 @@ from typing import Any
 
 import torch
 
-from art.megatron.dsv4.kernel.tilelang_indexer_bwd import batched_indexer_bwd
-from art.megatron.dsv4.kernel.tilelang_indexer_fwd import (
-    _make_causal_cu_seqlens,
-    batched_indexer_fwd,
-)
-
 
 def pytorch_extract_topk_scores(logits, topk_indices, dim=-1):
     valid_mask = topk_indices != -1
@@ -43,6 +37,11 @@ class V4IndexerFunction(torch.autograd.Function):
         topk: int,
         topk_indices: torch.Tensor | None = None,
     ):
+        from art.megatron.dsv4.kernel.tilelang_indexer_fwd import (
+            _make_causal_cu_seqlens,
+            batched_indexer_fwd,
+        )
+
         seqlen_q = index_q.shape[0]
         seq_len_kv = index_k.shape[0]
 
@@ -72,6 +71,8 @@ class V4IndexerFunction(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx: Any, *grad_outputs: Any):
+        from art.megatron.dsv4.kernel.tilelang_indexer_bwd import batched_indexer_bwd
+
         grad_scores = grad_outputs[0]
         index_q, index_k, weights, cu_seqlen_ks, cu_seqlen_ke, topk_indices = (
             ctx.saved_tensors

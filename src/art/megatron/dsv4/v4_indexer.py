@@ -9,7 +9,6 @@ from megatron.core.transformer.transformer_config import TransformerConfig
 import torch
 
 from art.megatron.dsv4.compressor import DeepSeekV4Compressor
-from art.megatron.dsv4.kernel.tilelang_indexer_fwd import _make_causal_cu_seqlens
 from art.megatron.dsv4.qat import fp8_simulate_qat
 from art.megatron.dsv4.rope import (
     apply_rotary_emb,
@@ -20,6 +19,14 @@ from art.megatron.dsv4.utils import freeze_parameters_as_buffers, rotate_activat
 
 _INDEXER_QUERY_BLOCK = 128
 _INDEXER_HEAD_BLOCK = 8
+
+
+def _make_causal_cu_seqlens(seq_len_q, seq_len_kv, compress_ratio, device):
+    del seq_len_kv
+    positions = torch.arange(seq_len_q, device=device, dtype=torch.int32)
+    cu_seqlen_ks = torch.zeros(seq_len_q, device=device, dtype=torch.int32)
+    cu_seqlen_ke = ((positions + 1) // compress_ratio).to(torch.int32)
+    return cu_seqlen_ks, cu_seqlen_ke
 
 
 @torch.compiler.disable

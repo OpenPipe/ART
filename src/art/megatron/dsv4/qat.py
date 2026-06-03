@@ -2,8 +2,6 @@ from typing import Any
 
 import torch
 
-from art.megatron.dsv4.kernel.act_quant import act_quant
-
 
 def fp8_simulate(x: torch.Tensor, block_size: int):
     """Simulate per-token FP8 (E4M3) cast + dequant with UE8M0 scaling.
@@ -12,6 +10,8 @@ def fp8_simulate(x: torch.Tensor, block_size: int):
     through ``deepseek-ai/TileKernels`` so we share the same FP8 kernels with
     the rest of the DeepSeek stack.
     """
+    from art.megatron.dsv4.kernel.act_quant import act_quant
+
     x_c = x.contiguous()
     y, scale = act_quant(x_c, block_size, "ue8m0")
 
