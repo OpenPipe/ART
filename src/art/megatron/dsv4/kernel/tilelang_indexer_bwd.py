@@ -4,7 +4,11 @@ from typing import Any, cast
 
 import torch
 
-from art.megatron.dsv4.kernel.tilelang_import import import_tilelang
+from art.megatron.dsv4.kernel.tilelang_import import (
+    import_tilelang,
+    preserve_tilelang_env,
+    sanitize_tilelang_env,
+)
 
 _tl, _T = import_tilelang()
 
@@ -148,6 +152,9 @@ def tl_indexer_bwd_impl(
     return tl_indexer_bwd_kernel
 
 
+sanitize_tilelang_env()
+
+
 def indexer_bwd_interface(
     index_q: torch.Tensor,
     weights: torch.Tensor,
@@ -206,16 +213,17 @@ def indexer_bwd_interface(
             dim=1,
         ).contiguous()
 
-    tl_indexer_bwd_impl(head_num, head_dim, padded_topk)(
-        index_q.contiguous(),
-        index_k.contiguous(),
-        weights.squeeze(-1).contiguous(),
-        topk_indices.contiguous(),
-        grad_scores,
-        grad_q,
-        grad_w.squeeze(-1),
-        grad_k,
-    )
+    with preserve_tilelang_env():
+        tl_indexer_bwd_impl(head_num, head_dim, padded_topk)(
+            index_q.contiguous(),
+            index_k.contiguous(),
+            weights.squeeze(-1).contiguous(),
+            topk_indices.contiguous(),
+            grad_scores,
+            grad_q,
+            grad_w.squeeze(-1),
+            grad_k,
+        )
 
     return grad_q, grad_w, grad_k
 

@@ -8,7 +8,11 @@ from typing import Any, cast
 
 import torch
 
-from art.megatron.dsv4.kernel.tilelang_import import import_tilelang
+from art.megatron.dsv4.kernel.tilelang_import import (
+    import_tilelang,
+    preserve_tilelang_env,
+    sanitize_tilelang_env,
+)
 
 _tilelang, _T = import_tilelang()
 
@@ -139,6 +143,9 @@ def clean_logits_(
     return clean_logits_kernel
 
 
+sanitize_tilelang_env()
+
+
 def _make_causal_cu_seqlens(seq_len_q, seq_len_kv, compress_ratio, device):
     """Generate cu_seqlens for causal masking on compressed KV positions.
 
@@ -176,20 +183,20 @@ def indexer_fwd_interface(
     seq_len, heads, index_dim = q.shape
     seq_len_kv = kv.shape[0]
 
-    clean_logits_kernel = clean_logits_()
-    tl_indexer_fwd_kernel = tl_indexer_fwd_impl(heads=heads, index_dim=index_dim)
-
     logits = torch.empty([seq_len, seq_len_kv], device=q.device, dtype=torch.float32)
-    tl_indexer_fwd_kernel(
-        q.view(seq_len * heads, index_dim),
-        kv,
-        logits,
-        weights.float(),
-        cu_seqlen_ks,
-        cu_seqlen_ke,
-    )
-    if clean_logits:
-        clean_logits_kernel(logits, cu_seqlen_ks, cu_seqlen_ke)
+    with preserve_tilelang_env():
+        clean_logits_kernel = clean_logits_()
+        tl_indexer_fwd_kernel = tl_indexer_fwd_impl(heads=heads, index_dim=index_dim)
+        tl_indexer_fwd_kernel(
+            q.view(seq_len * heads, index_dim),
+            kv,
+            logits,
+            weights.float(),
+            cu_seqlen_ks,
+            cu_seqlen_ke,
+        )
+        if clean_logits:
+            clean_logits_kernel(logits, cu_seqlen_ks, cu_seqlen_ke)
     return logits
 
 

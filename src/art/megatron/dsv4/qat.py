@@ -10,7 +10,10 @@ def fp8_simulate(x: torch.Tensor, block_size: int):
     through ``deepseek-ai/TileKernels`` so we share the same FP8 kernels with
     the rest of the DeepSeek stack.
     """
-    from art.megatron.dsv4.kernel.act_quant import act_quant
+    from art.megatron.dsv4.kernel.tilelang_import import preserve_tilelang_env
+
+    with preserve_tilelang_env():
+        from art.megatron.dsv4.kernel.act_quant import act_quant
 
     x_c = x.contiguous()
     y, scale = act_quant(x_c, block_size, "ue8m0")

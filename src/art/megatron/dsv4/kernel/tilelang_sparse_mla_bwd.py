@@ -9,7 +9,11 @@ from typing import Any, cast
 
 import torch
 
-from art.megatron.dsv4.kernel.tilelang_import import import_tilelang
+from art.megatron.dsv4.kernel.tilelang_import import (
+    import_tilelang,
+    preserve_tilelang_env,
+    sanitize_tilelang_env,
+)
 
 _tilelang, _T = import_tilelang()
 
@@ -303,6 +307,9 @@ def bwd(
     return sparse_mqa_bwd_kernel
 
 
+sanitize_tilelang_env()
+
+
 def _tilelang_input_dtype(torch_dtype):
     if torch_dtype is torch.bfloat16:
         return T.bfloat16
@@ -348,45 +355,52 @@ def sparse_mqa_bwd_interface(q, kv, attn_sink, o, do, topk_idxs, lse, sm_scale=N
         topk_idxs = torch.cat([topk_idxs, pad], dim=-1).contiguous()
         topk = padded_topk
 
-    preprocess_kernel = preprocess(B, S, H, D, dtype=dtype)
-    postprocess_kernel = postprocess(B, S_kv, D, dtype=dtype)
-
-    delta = preprocess_kernel(o, do)
+    with preserve_tilelang_env():
+        preprocess_kernel = preprocess(B, S, H, D, dtype=dtype)
+        postprocess_kernel = postprocess(B, S_kv, D, dtype=dtype)
+        delta = preprocess_kernel(o, do)
     dkv = torch.zeros_like(kv, dtype=torch.float32)
     d_attn_sink = torch.zeros_like(attn_sink)
     if topk <= block_size:
-        bwd_kernel = bwd(
-            B,
-            S,
-            S_kv,
-            H,
-            D,
-            topk,
-            sm_scale,
-            block_size=block_size,
-            dtype=dtype,
-        )
-        dq = bwd_kernel(q, kv, do, attn_sink, topk_idxs, lse, delta, dkv, d_attn_sink)
+        with preserve_tilelang_env():
+            bwd_kernel = bwd(
+                B,
+                S,
+                S_kv,
+                H,
+                D,
+                topk,
+                sm_scale,
+                block_size=block_size,
+                dtype=dtype,
+            )
+            dq = bwd_kernel(
+                q, kv, do, attn_sink, topk_idxs, lse, delta, dkv, d_attn_sink
+            )
     else:
         dq_accum = torch.zeros_like(q, dtype=torch.float32)
         chunk_count = topk // block_size
-        bwd_kernel = bwd(
-            B,
-            S,
-            S_kv,
-            H,
-            D,
-            block_size,
-            sm_scale,
-            block_size=block_size,
-            dtype=dtype,
-        )
-        for start in range(0, topk, block_size):
-            chunk = topk_idxs[:, :, start : start + block_size].contiguous()
-            dq_i = bwd_kernel(q, kv, do, attn_sink, chunk, lse, delta, dkv, d_attn_sink)
-            dq_accum.add_(dq_i.float())
+        with preserve_tilelang_env():
+            bwd_kernel = bwd(
+                B,
+                S,
+                S_kv,
+                H,
+                D,
+                block_size,
+                sm_scale,
+                block_size=block_size,
+                dtype=dtype,
+            )
+            for start in range(0, topk, block_size):
+                chunk = topk_idxs[:, :, start : start + block_size].contiguous()
+                dq_i = bwd_kernel(
+                    q, kv, do, attn_sink, chunk, lse, delta, dkv, d_attn_sink
+                )
+                dq_accum.add_(dq_i.float())
         dq = dq_accum.to(q.dtype)
         d_attn_sink.div_(chunk_count)
-    dkv = postprocess_kernel(dkv)
+    with preserve_tilelang_env():
+        dkv = postprocess_kernel(dkv)
 
     return dq, dkv, d_attn_sink

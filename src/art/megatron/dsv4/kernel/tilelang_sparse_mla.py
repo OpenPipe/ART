@@ -2,6 +2,8 @@ from typing import Any
 
 import torch
 
+from art.megatron.dsv4.kernel.tilelang_import import preserve_tilelang_env
+
 
 def _sparse_attn_torch(q, kv, attn_sink, topk_idxs, sm_scale):
     if sm_scale is None:
@@ -25,11 +27,14 @@ def _sparse_attn_torch(q, kv, attn_sink, topk_idxs, sm_scale):
 class DeepSeekV4SparseAttention(torch.autograd.Function):
     @staticmethod
     def forward(ctx, q, kv, attn_sink, topk_idxs, sm_scale=None, output_dtype=None):
-        from art.megatron.dsv4.kernel import tilelang_sparse_mla_fwd as sparse_mla_fwd
+        with preserve_tilelang_env():
+            from art.megatron.dsv4.kernel import (
+                tilelang_sparse_mla_fwd as sparse_mla_fwd,
+            )
 
-        o, lse = sparse_mla_fwd.sparse_mqa_fwd_interface(
-            q, kv, attn_sink, topk_idxs, sm_scale=sm_scale
-        )
+            o, lse = sparse_mla_fwd.sparse_mqa_fwd_interface(
+                q, kv, attn_sink, topk_idxs, sm_scale=sm_scale
+            )
 
         output = o if output_dtype is None else o.to(output_dtype)
         ctx.save_for_backward(q, kv, attn_sink, topk_idxs, output.clone(), lse)
@@ -39,22 +44,25 @@ class DeepSeekV4SparseAttention(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx: Any, *grad_outputs: Any):
-        from art.megatron.dsv4.kernel import tilelang_sparse_mla_bwd as sparse_mla_bwd
-
         do = grad_outputs[0]
         q, kv, attn_sink, topk_idxs, output, lse = ctx.saved_tensors
         sm_scale = ctx.sm_scale
 
-        dq, dkv, d_attn_sink = sparse_mla_bwd.sparse_mqa_bwd_interface(
-            q,
-            kv,
-            attn_sink,
-            output.to(q.dtype),
-            do.to(q.dtype),
-            topk_idxs,
-            lse,
-            sm_scale=sm_scale,
-        )
+        with preserve_tilelang_env():
+            from art.megatron.dsv4.kernel import (
+                tilelang_sparse_mla_bwd as sparse_mla_bwd,
+            )
+
+            dq, dkv, d_attn_sink = sparse_mla_bwd.sparse_mqa_bwd_interface(
+                q,
+                kv,
+                attn_sink,
+                output.to(q.dtype),
+                do.to(q.dtype),
+                topk_idxs,
+                lse,
+                sm_scale=sm_scale,
+            )
 
         return dq, dkv, d_attn_sink, None, None, None
 

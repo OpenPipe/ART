@@ -9,6 +9,8 @@ from typing import Any
 
 import torch
 
+from art.megatron.dsv4.kernel.tilelang_import import preserve_tilelang_env
+
 
 def pytorch_extract_topk_scores(logits, topk_indices, dim=-1):
     valid_mask = topk_indices != -1
@@ -37,22 +39,23 @@ class V4IndexerFunction(torch.autograd.Function):
         topk: int,
         topk_indices: torch.Tensor | None = None,
     ):
-        from art.megatron.dsv4.kernel.tilelang_indexer_fwd import (
-            _make_causal_cu_seqlens,
-            batched_indexer_fwd,
-        )
+        with preserve_tilelang_env():
+            from art.megatron.dsv4.kernel.tilelang_indexer_fwd import (
+                _make_causal_cu_seqlens,
+                batched_indexer_fwd,
+            )
 
-        seqlen_q = index_q.shape[0]
-        seq_len_kv = index_k.shape[0]
+            seqlen_q = index_q.shape[0]
+            seq_len_kv = index_k.shape[0]
 
-        cu_seqlen_ks, cu_seqlen_ke = _make_causal_cu_seqlens(
-            seqlen_q, seq_len_kv, compress_ratio, index_q.device
-        )
+            cu_seqlen_ks, cu_seqlen_ke = _make_causal_cu_seqlens(
+                seqlen_q, seq_len_kv, compress_ratio, index_q.device
+            )
 
-        # [batch, seqlen, seqlen_kv]
-        logits = batched_indexer_fwd(
-            index_q, index_k, weights, cu_seqlen_ks, cu_seqlen_ke
-        )
+            # [batch, seqlen, seqlen_kv]
+            logits = batched_indexer_fwd(
+                index_q, index_k, weights, cu_seqlen_ks, cu_seqlen_ke
+            )
 
         if topk_indices is None:
             actual_topk = min(topk, seq_len_kv)
@@ -71,15 +74,18 @@ class V4IndexerFunction(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx: Any, *grad_outputs: Any):
-        from art.megatron.dsv4.kernel.tilelang_indexer_bwd import batched_indexer_bwd
-
         grad_scores = grad_outputs[0]
         index_q, index_k, weights, cu_seqlen_ks, cu_seqlen_ke, topk_indices = (
             ctx.saved_tensors
         )
-        grad_q, grad_w, grad_k = batched_indexer_bwd(
-            index_q, weights, index_k, topk_indices, grad_scores
-        )
+        with preserve_tilelang_env():
+            from art.megatron.dsv4.kernel.tilelang_indexer_bwd import (
+                batched_indexer_bwd,
+            )
+
+            grad_q, grad_w, grad_k = batched_indexer_bwd(
+                index_q, weights, index_k, topk_indices, grad_scores
+            )
         return grad_q, grad_k, grad_w, None, None, None
 
 

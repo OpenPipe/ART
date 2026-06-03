@@ -9,7 +9,11 @@ from typing import Any, cast
 
 import torch
 
-from art.megatron.dsv4.kernel.tilelang_import import import_tilelang
+from art.megatron.dsv4.kernel.tilelang_import import (
+    import_tilelang,
+    preserve_tilelang_env,
+    sanitize_tilelang_env,
+)
 
 _tilelang, _T = import_tilelang()
 
@@ -176,6 +180,9 @@ def sparse_mqa_fwd(
     return main
 
 
+sanitize_tilelang_env()
+
+
 def _tilelang_input_dtype(torch_dtype):
     if torch_dtype is torch.bfloat16:
         return T.bfloat16
@@ -218,15 +225,16 @@ def sparse_mqa_fwd_interface(
         topk_idxs = torch.cat([topk_idxs, pad], dim=-1).contiguous()
         topk = padded_topk
 
-    kernel = sparse_mqa_fwd(
-        heads,
-        dim,
-        topk,
-        sm_scale,
-        block_I=block_I,
-        num_stages=num_stages,
-        threads=threads,
-        dtype=dtype,
-    )
-    out, lse = kernel(q, kv, attn_sink, topk_idxs)
+    with preserve_tilelang_env():
+        kernel = sparse_mqa_fwd(
+            heads,
+            dim,
+            topk,
+            sm_scale,
+            block_I=block_I,
+            num_stages=num_stages,
+            threads=threads,
+            dtype=dtype,
+        )
+        out, lse = kernel(q, kv, attn_sink, topk_idxs)
     return out, lse

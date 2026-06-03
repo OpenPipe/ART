@@ -11,7 +11,11 @@ from typing import Any, Optional, Tuple, cast
 
 import torch
 
-from art.megatron.dsv4.kernel.tilelang_import import import_tilelang
+from art.megatron.dsv4.kernel.tilelang_import import (
+    import_tilelang,
+    preserve_tilelang_env,
+    sanitize_tilelang_env,
+)
 
 _tilelang, _T = import_tilelang()
 
@@ -131,6 +135,9 @@ def act_quant_kernel(
     return act_quant_kernel_
 
 
+sanitize_tilelang_env()
+
+
 def _resolve_scale_dtype(scale_fmt: Optional[str], block_size: int) -> torch.dtype:
     """Pick scale dtype consistent with the SGLang runtime:
     - UE8M0 (``torch.float8_e8m0fnu``) on Blackwell when DeepGEMM JIT is on.
@@ -173,14 +180,15 @@ def act_quant(
         else torch.empty_like(z, dtype=torch.float8_e4m3fn)
     )
     s = z.new_empty(*z.size()[:-1], N // block_size, dtype=scale_dtype)
-    kernel = act_quant_kernel(
-        N,
-        block_size,
-        scale_dtype=tl_dtype,
-        round_scale=scale_fmt is not None,
-        inplace=inplace,
-    )
-    kernel(z.view(-1, N), y.view(-1, N), s.view(-1, N // block_size))
+    with preserve_tilelang_env():
+        kernel = act_quant_kernel(
+            N,
+            block_size,
+            scale_dtype=tl_dtype,
+            round_scale=scale_fmt is not None,
+            inplace=inplace,
+        )
+        kernel(z.view(-1, N), y.view(-1, N), s.view(-1, N // block_size))
     if inplace:
         x.copy_(y)
         return x
