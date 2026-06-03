@@ -2,9 +2,11 @@
 # Adapted from miles_plugins/models/glm5/ops/tilelang_indexer_bwd.py for DeepSeek-V4.
 from typing import Any, cast
 
-import tilelang as _tl
-import tilelang.language as _T
 import torch
+
+from art.megatron.dsv4.kernel.tilelang_import import import_tilelang
+
+_tl, _T = import_tilelang()
 
 tl = cast(Any, _tl)
 T = cast(Any, _T)

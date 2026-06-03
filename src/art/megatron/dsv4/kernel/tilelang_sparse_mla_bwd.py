@@ -7,9 +7,11 @@
 #   - Outputs: dQ [B, S, H, D], dKV [B, S_kv, D], dAttnSink [H]
 from typing import Any, cast
 
-import tilelang as _tilelang
 import torch
-from tilelang import language as _T
+
+from art.megatron.dsv4.kernel.tilelang_import import import_tilelang
+
+_tilelang, _T = import_tilelang()
 
 tilelang = cast(Any, _tilelang)
 T = cast(Any, _T)

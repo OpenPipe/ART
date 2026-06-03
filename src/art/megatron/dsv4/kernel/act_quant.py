@@ -9,9 +9,11 @@ Source: https://huggingface.co/deepseek-ai/DeepSeek-V4-Pro/blob/main/inference/k
 
 from typing import Any, Optional, Tuple, cast
 
-import tilelang as _tilelang
-import tilelang.language as _T
 import torch
+
+from art.megatron.dsv4.kernel.tilelang_import import import_tilelang
+
+_tilelang, _T = import_tilelang()
 
 tilelang = cast(Any, _tilelang)
 T = cast(Any, _T)

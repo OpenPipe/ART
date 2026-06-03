@@ -6,9 +6,11 @@
 #   - Supports compressed KV (seq_len_kv = seq_len_q / compress_ratio)
 from typing import Any, cast
 
-import tilelang as _tilelang
 import torch
-from tilelang import language as _T
+
+from art.megatron.dsv4.kernel.tilelang_import import import_tilelang
+
+_tilelang, _T = import_tilelang()
 
 tilelang = cast(Any, _tilelang)
 T = cast(Any, _T)
