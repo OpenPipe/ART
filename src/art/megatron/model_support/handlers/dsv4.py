@@ -543,6 +543,7 @@ def _dsv4_source_to_hf_key_mapping() -> dict[str, str]:
     return {
         r"^embed\.weight$": "model.embed_tokens.weight",
         r"^head\.weight$": "lm_head.weight",
+        r"^norm\.weight$": "model.norm.weight",
         r"^hc_head_fn$": "model.hc_head.hc_fn",
         r"^hc_head_base$": "model.hc_head.hc_base",
         r"^hc_head_scale$": "model.hc_head.hc_scale",

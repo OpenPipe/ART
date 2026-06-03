@@ -140,6 +140,46 @@ def _resolve_dsv4_hf_param(hf_param: Any, captures: tuple[str, ...]) -> Any:
     return {key: resolve_one(value) for key, value in hf_param.items()}
 
 
+class _Dsv4AliasStateSource:
+    def __init__(self, source: Any, aliases: Mapping[str, str]):
+        self.source = source
+        self.aliases = dict(aliases)
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self.source, name)
+
+    def get_all_keys(self) -> list[str]:
+        keys = set(self.source.get_all_keys())
+        keys.update(alias for alias, target in self.aliases.items() if target in keys)
+        return sorted(keys)
+
+    def load_tensors(self, keys: list[str]) -> dict[str, torch.Tensor]:
+        source_keys = [self.aliases.get(key, key) for key in keys]
+        loaded = self.source.load_tensors(source_keys)
+        return {key: loaded[self.aliases.get(key, key)] for key in keys}
+
+    def has_glob(self, pattern: str) -> bool:
+        import fnmatch
+
+        return any(fnmatch.fnmatch(key, pattern) for key in self.get_all_keys())
+
+
+def _install_dsv4_source_aliases(hf_pretrained: Any) -> None:
+    state = hf_pretrained.state
+    source = getattr(state, "source", None)
+    if source is None or isinstance(source, _Dsv4AliasStateSource):
+        return
+    keys = set(source.get_all_keys())
+    aliases = {"model.norm.weight": "norm.weight"}
+    active_aliases = {
+        alias: target
+        for alias, target in aliases.items()
+        if alias not in keys and target in keys
+    }
+    if active_aliases:
+        state.source = _Dsv4AliasStateSource(source, active_aliases)
+
+
 class _Dsv4AutoMapping(AutoMapping):
     def __init__(
         self,
@@ -619,6 +659,7 @@ def _dsv4_mapping_registry() -> MegatronMappingRegistry:
 
 class ArtDeepSeekV4Bridge(DeepSeekV3Bridge):
     def provider_bridge(self, hf_pretrained: Any):
+        _install_dsv4_source_aliases(hf_pretrained)
         hf_config = hf_pretrained.config
         if not hasattr(hf_config, "first_k_dense_replace"):
             hf_config.first_k_dense_replace = 0
