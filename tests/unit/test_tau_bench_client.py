@@ -141,11 +141,23 @@ async def test_client_retries_transport_errors() -> None:
 
 
 @pytest.mark.asyncio
-async def test_client_sends_create_environment_idle_timeout() -> None:
+async def test_client_sends_optional_request_fields() -> None:
     seen: dict[str, Any] = {}
 
     async def handler(request: httpx.Request) -> httpx.Response:
-        seen["json"] = json.loads(request.content)
+        seen[request.url.path] = json.loads(request.content)
+        if request.url.path.endswith("/step"):
+            return httpx.Response(
+                200,
+                json={
+                    "id": "env-1",
+                    "observation": "user: hello",
+                    "reward": 0.0,
+                    "terminated": False,
+                    "truncated": False,
+                    "info": {},
+                },
+            )
         return httpx.Response(
             200,
             json={"id": "env-1", "observation": "user: hello", "info": {}},
@@ -161,44 +173,19 @@ async def test_client_sends_create_environment_idle_timeout() -> None:
         task_id="task_001",
         idle_timeout_seconds=120,
     )
-    await client.close()
-    await http_client.aclose()
-
-    assert seen["json"] == {
-        "domain": "telecom",
-        "task_id": "task_001",
-        "idle_timeout_seconds": 120,
-    }
-
-
-@pytest.mark.asyncio
-async def test_client_sends_step_environment_compact_info_flag() -> None:
-    seen: dict[str, Any] = {}
-
-    async def handler(request: httpx.Request) -> httpx.Response:
-        seen["json"] = json.loads(request.content)
-        return httpx.Response(
-            200,
-            json={
-                "id": "env-1",
-                "observation": "user: hello",
-                "reward": 0.0,
-                "terminated": False,
-                "truncated": False,
-                "info": {},
-            },
-        )
-
-    http_client = httpx.AsyncClient(
-        base_url="http://tau.test",
-        transport=httpx.MockTransport(handler),
-    )
-    client = TauBenchClient(api_key="secret", http_client=http_client)
     await client.step_environment("env-1", "done()", include_info=False)
     await client.close()
     await http_client.aclose()
 
-    assert seen["json"] == {"action": "done()", "include_info": False}
+    assert seen["/environments"] == {
+        "domain": "telecom",
+        "task_id": "task_001",
+        "idle_timeout_seconds": 120,
+    }
+    assert seen["/environments/env-1/step"] == {
+        "action": "done()",
+        "include_info": False,
+    }
 
 
 @pytest.mark.asyncio
