@@ -105,11 +105,16 @@ class DeepSeekV4Compressor(nn.Module):
         self.ape = nn.Parameter(
             torch.empty(compress_ratio, coff * self.head_dim, dtype=torch.float32)
         )
+        weight_dtype = config.params_dtype
+        if weight_dtype not in {torch.bfloat16, torch.float32}:
+            raise TypeError(
+                f"DeepSeek-V4 compressor requires bf16/fp32 params, got {weight_dtype}"
+            )
         self.wkv = Linear(
-            self.dim, coff * self.head_dim, bias=False, dtype=torch.bfloat16
+            self.dim, coff * self.head_dim, bias=False, dtype=weight_dtype
         )
         self.wgate = Linear(
-            self.dim, coff * self.head_dim, bias=False, dtype=torch.bfloat16
+            self.dim, coff * self.head_dim, bias=False, dtype=weight_dtype
         )
         self.norm = RMSNorm(self.head_dim, norm_eps)
 
@@ -152,8 +157,8 @@ class DeepSeekV4Compressor(nn.Module):
 
     def forward_raw(self, x: torch.Tensor) -> torch.Tensor:
         assert self.ape.dtype == torch.float32
-        assert self.wkv.weight.dtype == torch.bfloat16
-        assert self.wgate.weight.dtype == torch.bfloat16
+        assert self.wkv.weight.dtype in {torch.bfloat16, torch.float32}
+        assert self.wgate.weight.dtype in {torch.bfloat16, torch.float32}
 
         bsz, seqlen_local, _ = x.size()
         ratio, overlap, _ = self.compress_ratio, self.overlap, self.head_dim
