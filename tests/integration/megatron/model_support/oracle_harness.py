@@ -220,6 +220,10 @@ TOPOLOGIES = [
     Topology(tp=2, ep=2, etp=1, dp=1, cp=2, sp=True),
     Topology(tp=2, ep=4, etp=2, dp=2, cp=2, sp=True),
 ]
+CP_UNSUPPORTED_MOE_TOPOLOGIES = [
+    TOPOLOGIES[0],
+    Topology(tp=2, ep=2, etp=1, dp=1, cp=1, sp=True),
+]
 DENSE_TOPOLOGIES = [
     Topology(tp=1, ep=1, etp=1, dp=1, sp=False),
     Topology(tp=2, ep=1, etp=1, dp=1, sp=True),
@@ -739,9 +743,26 @@ def oracle_topology(*, is_moe: bool = True) -> Topology:
     return ORACLE_TOPOLOGY if is_moe else DENSE_ORACLE_TOPOLOGY
 
 
-def selected_suite_topologies(*, is_moe: bool = True) -> list[Topology]:
+def _filter_context_parallel_support(
+    topologies: list[Topology], *, is_moe: bool, cp_supported: bool
+) -> list[Topology]:
+    if cp_supported:
+        return topologies
+    if is_moe:
+        return list(CP_UNSUPPORTED_MOE_TOPOLOGIES)
+    return [topology for topology in topologies if topology.cp == 1]
+
+
+def selected_suite_topologies(
+    *, is_moe: bool = True, cp_supported: bool = True
+) -> list[Topology]:
     """Returns the correctness topology list for a model family."""
-    return list(TOPOLOGIES if is_moe else DENSE_TOPOLOGIES)
+    topologies = list(TOPOLOGIES if is_moe else DENSE_TOPOLOGIES)
+    return _filter_context_parallel_support(
+        topologies,
+        is_moe=is_moe,
+        cp_supported=cp_supported,
+    )
 
 
 def stable_case_id(case_config: OracleCaseConfig) -> str:
@@ -2113,13 +2134,16 @@ def _suite_variants(
     objective: OracleObjective,
     *,
     is_moe: bool = True,
+    cp_supported: bool = True,
     max_world_size: int | None = None,
     variant_flex_backend: FlexBackend | None = None,
 ) -> list[VariantSpec]:
     """Builds the standard oracle suite variant ordering."""
     phase_pass = _default_phase_pass_fns()
     variants: list[VariantSpec] = []
-    for topology in selected_suite_topologies(is_moe=is_moe)[1:]:
+    for topology in selected_suite_topologies(is_moe=is_moe, cp_supported=cp_supported)[
+        1:
+    ]:
         if max_world_size is not None and topology.world_size() > max_world_size:
             continue
         variants.append(
@@ -2138,6 +2162,7 @@ def run_suite(
     *,
     case_config: OracleCaseConfig,
     max_world_size: int | None = None,
+    cp_supported: bool = True,
     oracle_flex_backend: FlexBackend | None = None,
     variant_flex_backend: FlexBackend | None = None,
 ) -> list[VariantReport]:
@@ -2155,6 +2180,7 @@ def run_suite(
                 _suite_variants(
                     objective,
                     is_moe=case_config.is_moe,
+                    cp_supported=cp_supported,
                     max_world_size=max_world_size,
                     variant_flex_backend=variant_flex_backend,
                 )

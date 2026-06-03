@@ -559,7 +559,7 @@ def test_run_correctness_sensitivity_stage_runs_dense_models(monkeypatch) -> Non
     case_configs: list[SimpleNamespace] = []
     oracle_module = SimpleNamespace(
         OracleCaseConfig=lambda **kwargs: SimpleNamespace(**kwargs),
-        selected_suite_topologies=lambda *, is_moe: [
+        selected_suite_topologies=lambda *, is_moe, cp_supported=True: [
             SimpleNamespace(world_size=lambda: 1, slug=lambda: "tp1"),
             SimpleNamespace(world_size=lambda: 2, slug=lambda: "tp2"),
             SimpleNamespace(world_size=lambda: 2, slug=lambda: "dp2"),
@@ -571,10 +571,10 @@ def test_run_correctness_sensitivity_stage_runs_dense_models(monkeypatch) -> Non
             ["skip_finalize"] if objective == "sft" and not is_moe else []
         ),
         sensitivity_topology_for_mutation=lambda mutation, *, is_moe: SimpleNamespace(
-            world_size=lambda: 2
+            world_size=lambda: 2, cp=1
         ),
         available_gpu_count=lambda: 4,
-        run_suite=lambda case_config, max_world_size: (
+        run_suite=lambda case_config, max_world_size, cp_supported=True: (
             case_configs.append(case_config)
             or [
                 SimpleNamespace(
@@ -877,7 +877,7 @@ def test_run_correctness_sensitivity_stage_summarizes_reports(monkeypatch) -> No
     )
     oracle_module = SimpleNamespace(
         OracleCaseConfig=lambda **kwargs: SimpleNamespace(**kwargs),
-        selected_suite_topologies=lambda *, is_moe: [
+        selected_suite_topologies=lambda *, is_moe, cp_supported=True: [
             SimpleNamespace(world_size=lambda: 1, slug=lambda: "tp1"),
             SimpleNamespace(world_size=lambda: 2, slug=lambda: "tp2"),
         ],
@@ -887,10 +887,10 @@ def test_run_correctness_sensitivity_stage_summarizes_reports(monkeypatch) -> No
             ["skip_finalize"] if objective == "sft" else []
         ),
         sensitivity_topology_for_mutation=lambda mutation, *, is_moe: SimpleNamespace(
-            world_size=lambda: 2
+            world_size=lambda: 2, cp=1
         ),
         available_gpu_count=lambda: 2,
-        run_suite=lambda case_config, max_world_size: [
+        run_suite=lambda case_config, max_world_size, cp_supported=True: [
             SimpleNamespace(
                 variant="sft_topology_tp2",
                 topology="tp2",
@@ -937,6 +937,67 @@ def test_run_correctness_sensitivity_stage_summarizes_reports(monkeypatch) -> No
     assert stage.artifact_dir == "/tmp/oracle"
 
 
+def test_run_correctness_sensitivity_stage_passes_cp_supported(monkeypatch) -> None:
+    seen: dict[str, bool] = {}
+    architecture = ArchitectureReport(
+        base_model="deepseek-ai/DeepSeek-V4-Flash",
+        model_key="dsv4",
+        handler_key="dsv4",
+        layer_families=[LayerFamilyInstance(key="grouped_moe_mlp", layer_index=0)],
+        recommended_min_layers=4,
+    )
+
+    def selected_suite_topologies(*, is_moe: bool, cp_supported: bool = True):
+        seen["selected_cp_supported"] = cp_supported
+        return [
+            SimpleNamespace(world_size=lambda: 1, slug=lambda: "tp1_cp1"),
+            SimpleNamespace(world_size=lambda: 2, slug=lambda: "tp2_cp1"),
+        ]
+
+    def run_suite(case_config, max_world_size, cp_supported: bool = True):
+        seen["run_cp_supported"] = cp_supported
+        return [
+            SimpleNamespace(
+                variant="rl_topology_tp2_cp1",
+                topology="tp2_cp1",
+                signal="pass",
+                fail_count=0,
+            )
+        ]
+
+    oracle_module = SimpleNamespace(
+        OracleCaseConfig=lambda **kwargs: SimpleNamespace(**kwargs),
+        selected_suite_topologies=selected_suite_topologies,
+        oracle_topology=lambda *, is_moe: SimpleNamespace(world_size=lambda: 1),
+        selected_oracle_objectives=lambda: ["rl"],
+        supported_sensitivity_mutations_for_objective=lambda objective, *, is_moe: [],
+        sensitivity_topology_for_mutation=lambda mutation, *, is_moe: SimpleNamespace(
+            world_size=lambda: 1, cp=1
+        ),
+        available_gpu_count=lambda: 2,
+        run_suite=run_suite,
+        run_sensitivity_suite=lambda case_config, mutations, max_world_size: [],
+        ensure_case_artifacts=lambda case_config: SimpleNamespace(
+            case_dir="/tmp/oracle"
+        ),
+        keep_topology_artifacts=lambda: False,
+    )
+    monkeypatch.setattr(
+        "tests.integration.megatron.model_support.workflow._import_integration_module",
+        lambda name: oracle_module,
+    )
+    monkeypatch.setenv(SKIP_SENSITIVITY_ENV, "1")
+
+    stage = run_correctness_sensitivity_stage(
+        base_model="deepseek-ai/DeepSeek-V4-Flash",
+        architecture=architecture,
+    )
+
+    assert stage.passed is True
+    assert stage.metrics["cp_supported"] is False
+    assert seen == {"selected_cp_supported": False, "run_cp_supported": False}
+
+
 def test_run_correctness_sensitivity_stage_can_skip_sensitivity_only(
     monkeypatch,
 ) -> None:
@@ -949,7 +1010,7 @@ def test_run_correctness_sensitivity_stage_can_skip_sensitivity_only(
     )
     oracle_module = SimpleNamespace(
         OracleCaseConfig=lambda **kwargs: SimpleNamespace(**kwargs),
-        selected_suite_topologies=lambda *, is_moe: [
+        selected_suite_topologies=lambda *, is_moe, cp_supported=True: [
             SimpleNamespace(world_size=lambda: 1, slug=lambda: "tp1"),
             SimpleNamespace(world_size=lambda: 2, slug=lambda: "tp2"),
         ],
@@ -959,10 +1020,10 @@ def test_run_correctness_sensitivity_stage_can_skip_sensitivity_only(
             ["skip_finalize"] if objective == "sft" else []
         ),
         sensitivity_topology_for_mutation=lambda mutation, *, is_moe: SimpleNamespace(
-            world_size=lambda: 4
+            world_size=lambda: 4, cp=1
         ),
         available_gpu_count=lambda: 2,
-        run_suite=lambda case_config, max_world_size: [
+        run_suite=lambda case_config, max_world_size, cp_supported=True: [
             SimpleNamespace(
                 variant="sft_topology_tp2",
                 topology="tp2",

@@ -445,6 +445,7 @@ def run_correctness_sensitivity_stage(
         allow_unvalidated_arch=allow_unvalidated_arch,
     )
     handler = get_model_support_handler_for_spec(spec)
+    cp_supported = bool(handler.cp_supported)
     case_config = oracle_harness.OracleCaseConfig(
         base_model=base_model,
         is_moe=handler.is_moe,
@@ -454,7 +455,10 @@ def run_correctness_sensitivity_stage(
         allow_unvalidated_arch=allow_unvalidated_arch,
     )
     suite_topologies = list(
-        oracle_harness.selected_suite_topologies(is_moe=handler.is_moe)
+        oracle_harness.selected_suite_topologies(
+            is_moe=handler.is_moe,
+            cp_supported=cp_supported,
+        )
     )
     objectives = list(oracle_harness.selected_oracle_objectives())
     skip_sensitivity = _truthy_env(SKIP_SENSITIVITY_ENV)
@@ -493,11 +497,14 @@ def run_correctness_sensitivity_stage(
         excluded_sensitivity_mutations = [
             mutation
             for mutation in mutations
-            if oracle_harness.sensitivity_topology_for_mutation(
-                mutation,
-                is_moe=handler.is_moe,
+            if (
+                topology := oracle_harness.sensitivity_topology_for_mutation(
+                    mutation,
+                    is_moe=handler.is_moe,
+                )
             ).world_size()
             > max_world_size
+            or (not cp_supported and topology.cp > 1)
         ]
         mutations = [
             mutation
@@ -511,6 +518,7 @@ def run_correctness_sensitivity_stage(
             suite_reports = oracle_harness.run_suite(
                 case_config=case_config,
                 max_world_size=max_world_size,
+                cp_supported=cp_supported,
             )
         sensitivity_reports = []
         if skip_sensitivity:
@@ -545,6 +553,7 @@ def run_correctness_sensitivity_stage(
         metrics={
             "requested_num_layers": case_config.num_layers,
             "is_moe": handler.is_moe,
+            "cp_supported": cp_supported,
             "allow_unvalidated_arch": allow_unvalidated_arch,
             "objectives": objectives,
             "sensitivity_mutations": mutations,

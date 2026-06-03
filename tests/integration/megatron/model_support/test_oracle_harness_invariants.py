@@ -6,6 +6,7 @@ import torch
 from .forward_trace import ForwardTraceCapture, _extract_router_topk
 from .oracle_harness import (
     CP_ATTENTION_SENSITIVITY_MUTATIONS,
+    CP_UNSUPPORTED_MOE_TOPOLOGIES,
     DENSE_CP_ATTENTION_SENSITIVITY_TOPOLOGY,
     DENSE_DP_SENSITIVITY_TOPOLOGY,
     DENSE_ORACLE_TOPOLOGY,
@@ -28,6 +29,7 @@ from .oracle_harness import (
     _suite_variants,
     case_config,
     selected_sensitivity_mutations_for_objective,
+    selected_suite_topologies,
     sensitivity_topology_for_mutation,
 )
 
@@ -769,6 +771,19 @@ def test_dense_suite_variants_preserve_dense_and_cp_topologies() -> None:
         and variant.topology.dp == 2
         and variant.topology.cp == 2
         for variant in variants
+    )
+
+
+def test_cp_unsupported_moe_suite_uses_cp_free_parallel_topology() -> None:
+    topologies = selected_suite_topologies(is_moe=True, cp_supported=False)
+    variants = _suite_variants("rl", is_moe=True, cp_supported=False)
+
+    assert topologies == CP_UNSUPPORTED_MOE_TOPOLOGIES
+    assert all(topology.cp == 1 for topology in topologies)
+    assert variants
+    assert all(variant.topology.cp == 1 for variant in variants)
+    assert any(
+        variant.topology.tp == 2 and variant.topology.ep == 2 for variant in variants
     )
 
 
