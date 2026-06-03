@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import time
 from typing import Any, overload
 
 from openai import AsyncOpenAI
@@ -71,6 +72,7 @@ async def rollout(
 ) -> Trajectory:
     client = _get_default_client(client)
     task_id = scenario.task.id
+    env_create_started_at = time.perf_counter()
     async with client.environment(
         domain=scenario.domain,
         task_id=task_id,
@@ -83,6 +85,7 @@ async def rollout(
         retrieval_config=retrieval_config,
         retrieval_config_kwargs=retrieval_config_kwargs,
     ) as env:
+        env_create_wait_seconds = time.perf_counter() - env_create_started_at
         chat_completion_kwargs = chat_completion_kwargs or {}
         openai_client, model_name, cost_model = _completion_client_and_model(
             base_url_or_model,
@@ -101,14 +104,25 @@ async def rollout(
                 "cost/tinker/prefill": 0.0,
                 "cost/tinker/sample": 0.0,
                 "cost/user": 0.0,
+                "time/policy_chat_completion": 0.0,
+                "time/tau_bench/env_create_wait": env_create_wait_seconds,
+                "time/tau_bench/env_step_wait": 0.0,
+                "time/tau_bench/env_wait": 0.0,
             },
             metadata={"scenario_id": task_id},
+        )
+        _record_environment_timing(
+            trajectory,
+            env.info,
+            env_create_wait_seconds,
+            is_step=False,
         )
         terminated = False
         num_turns = 0
         while not terminated:
             if max_turns is not None and num_turns >= max_turns:
                 break
+            policy_started_at = time.perf_counter()
             chat_completion = await openai_client.chat.completions.create(
                 messages=trajectory.messages(),
                 model=model_name,
@@ -116,6 +130,9 @@ async def rollout(
                 tool_choice="auto",
                 tools=trajectory.tools or [],
                 **chat_completion_kwargs,
+            )
+            trajectory.metrics["time/policy_chat_completion"] += (
+                time.perf_counter() - policy_started_at
             )
             _record_tinker_costs(
                 trajectory,
@@ -129,7 +146,19 @@ async def rollout(
             if tool_calls:
                 for tool_call in tool_calls:
                     action = _tool_call_action(tool_call)
-                    step = await client.step_environment(env.id, action)
+                    env_step_started_at = time.perf_counter()
+                    step = await client.step_environment(
+                        env.id,
+                        action,
+                        include_info=False,
+                    )
+                    env_step_wait_seconds = time.perf_counter() - env_step_started_at
+                    _record_environment_timing(
+                        trajectory,
+                        step.info,
+                        env_step_wait_seconds,
+                        is_step=True,
+                    )
                     trajectory.messages_and_choices.append(
                         {
                             "role": "tool",
@@ -140,9 +169,18 @@ async def rollout(
                     trajectory.reward += step.reward
                     terminated = step.terminated
             else:
+                env_step_started_at = time.perf_counter()
                 step = await client.step_environment(
                     env.id,
                     choice.message.content or "",
+                    include_info=False,
+                )
+                env_step_wait_seconds = time.perf_counter() - env_step_started_at
+                _record_environment_timing(
+                    trajectory,
+                    step.info,
+                    env_step_wait_seconds,
+                    is_step=True,
                 )
                 if "user_message_cost" in step.info:
                     trajectory.metrics["cost/user"] += step.info["user_message_cost"]
@@ -210,6 +248,28 @@ def _record_tinker_costs(
         getattr(usage, "completion_tokens", None) or 0,
         pricing.sample,
     )
+
+
+def _record_environment_timing(
+    trajectory: Trajectory,
+    info: dict[str, Any],
+    client_wait_seconds: float,
+    *,
+    is_step: bool,
+) -> None:
+    trajectory.metrics["time/tau_bench/env_wait"] += client_wait_seconds
+    if is_step:
+        trajectory.metrics["time/tau_bench/env_step_wait"] += client_wait_seconds
+    timing = info.get("timing")
+    if not isinstance(timing, dict):
+        return
+    for key, value in timing.items():
+        if isinstance(value, bool) or not isinstance(value, int | float):
+            continue
+        metric_key = f"time/tau_bench/{key}"
+        trajectory.metrics[metric_key] = trajectory.metrics.get(
+            metric_key, 0.0
+        ) + float(value)
 
 
 def default_user_llm_args(user_model_name: str) -> dict[str, Any]:

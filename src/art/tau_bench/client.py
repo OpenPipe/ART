@@ -19,7 +19,8 @@ DEFAULT_RETRY_MAX_DELAY = 5.0
 def _default_limits() -> httpx.Limits:
     return httpx.Limits(
         max_connections=512,
-        max_keepalive_connections=0,
+        max_keepalive_connections=512,
+        keepalive_expiry=60.0,
     )
 
 
@@ -211,11 +212,20 @@ class TauBenchClient:
         self,
         env_id: str,
         action: str,
+        *,
+        include_info: bool | None = None,
     ) -> StepEnvironmentResponse:
         response = await self._request(
             "POST",
             f"/environments/{env_id}/step",
-            json={"action": action},
+            json={
+                key: value
+                for key, value in {
+                    "action": action,
+                    "include_info": include_info,
+                }.items()
+                if value is not None
+            },
             headers=self._auth_headers(),
         )
         _raise_for_status(response)

@@ -20,7 +20,7 @@ from art.tau_bench.client import (
 )
 
 
-def test_client_uses_short_lived_connection_pool_by_default(
+def test_client_reuses_connections_by_default(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     seen: dict[str, Any] = {}
@@ -40,7 +40,7 @@ def test_client_uses_short_lived_connection_pool_by_default(
     limits = seen["transport_kwargs"]["limits"]
     assert isinstance(limits, httpx.Limits)
     assert limits.max_connections == 512
-    assert limits.max_keepalive_connections == 0
+    assert limits.max_keepalive_connections == 512
     assert seen["transport_kwargs"]["retries"] == 2
     assert isinstance(seen["timeout"], httpx.Timeout)
 
@@ -172,6 +172,36 @@ async def test_client_sends_create_environment_idle_timeout() -> None:
 
 
 @pytest.mark.asyncio
+async def test_client_sends_step_environment_compact_info_flag() -> None:
+    seen: dict[str, Any] = {}
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        seen["json"] = json.loads(request.content)
+        return httpx.Response(
+            200,
+            json={
+                "id": "env-1",
+                "observation": "user: hello",
+                "reward": 0.0,
+                "terminated": False,
+                "truncated": False,
+                "info": {},
+            },
+        )
+
+    http_client = httpx.AsyncClient(
+        base_url="http://tau.test",
+        transport=httpx.MockTransport(handler),
+    )
+    client = TauBenchClient(api_key="secret", http_client=http_client)
+    await client.step_environment("env-1", "done()", include_info=False)
+    await client.close()
+    await http_client.aclose()
+
+    assert seen["json"] == {"action": "done()", "include_info": False}
+
+
+@pytest.mark.asyncio
 async def test_module_default_client_can_be_replaced(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -231,8 +261,13 @@ class FakeTauBenchClient(TauBenchClient):
         )
 
     async def step_environment(
-        self, env_id: str, action: str
+        self,
+        env_id: str,
+        action: str,
+        *,
+        include_info: bool | None = None,
     ) -> StepEnvironmentResponse:
+        self.step_include_info = include_info
         return StepEnvironmentResponse(
             id=env_id,
             observation=f"user: saw {action}",
@@ -289,6 +324,7 @@ async def test_rollout_supports_string_model_args(
     assert trajectory.metrics["cost/user"] == 0.25
     assert client.deleted == ["env-1"]
     assert client.create_kwargs["user_llm"] == "gpt-4.1-2025-04-14"
+    assert client.step_include_info is False
 
 
 @pytest.mark.asyncio
