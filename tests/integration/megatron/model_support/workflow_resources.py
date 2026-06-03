@@ -53,6 +53,7 @@ class VllmWorkflowResources(BaseModel):
     tensor_parallel_size: int
     enable_expert_parallel: bool = False
     hf_overrides: dict[str, object] = Field(default_factory=dict)
+    extra_engine_args: dict[str, object] = Field(default_factory=dict)
 
     def engine_args(self) -> dict[str, object]:
         engine_args: dict[str, object] = {
@@ -62,6 +63,7 @@ class VllmWorkflowResources(BaseModel):
             engine_args["enable_expert_parallel"] = True
         if self.hf_overrides:
             engine_args["hf_overrides"] = dict(self.hf_overrides)
+        engine_args.update(self.extra_engine_args)
         return engine_args
 
 
@@ -118,6 +120,11 @@ _DSV4_HF_OVERRIDES = {
     "layer_types": _DSV4_REPRESENTATIVE_LAYER_TYPES,
     "mlp_layer_types": _DSV4_REPRESENTATIVE_MLP_LAYER_TYPES,
 }
+_DSV4_VLLM_ENGINE_ARGS = {
+    "kv_cache_dtype": "fp8",
+    "max_num_batched_tokens": 1032,
+    "moe_backend": "triton_unfused",
+}
 _DSV4_MEGATRON = MegatronWorkflowResources(
     gpu_ids=[0, 1, 2, 3],
     topology=_DSV4_TP2_EP4,
@@ -127,12 +134,14 @@ _DSV4_VLLM_EP4 = VllmWorkflowResources(
     tensor_parallel_size=4,
     enable_expert_parallel=True,
     hf_overrides=_DSV4_HF_OVERRIDES,
+    extra_engine_args=_DSV4_VLLM_ENGINE_ARGS,
 )
 _DSV4_NATIVE_VLLM_EP4 = VllmWorkflowResources(
     gpu_ids=[0, 1, 2, 3],
     tensor_parallel_size=4,
     enable_expert_parallel=True,
     hf_overrides=_DSV4_HF_OVERRIDES,
+    extra_engine_args=_DSV4_VLLM_ENGINE_ARGS,
 )
 
 # Explicitly for large models which do not fit in the default topology.
