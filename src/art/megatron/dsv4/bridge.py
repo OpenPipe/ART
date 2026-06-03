@@ -328,6 +328,8 @@ def _art_dsv4_expert_mapping_types() -> tuple[type[Any], type[Any]]:
             export_hf_param: str,
         ):
             super().__init__(megatron_param, hf_param)
+            self.weight_hf_param = hf_param
+            self.hf_param = {"weight": hf_param}
             self.export_hf_param = export_hf_param
 
         @property
@@ -354,7 +356,12 @@ def _art_dsv4_expert_mapping_types() -> tuple[type[Any], type[Any]]:
             )[1]
             if self._mapping is None:
                 self._detected_type = self._detect_parallelism_type(megatron_module)
-                self._mapping = self._get_or_create_mapping(self._detected_type)
+                hf_param = self.hf_param
+                self.hf_param = self.weight_hf_param
+                try:
+                    self._mapping = self._get_or_create_mapping(self._detected_type)
+                finally:
+                    self.hf_param = hf_param
             if isinstance(self._mapping, ColumnParallelMapping):
                 full_target_shape = (
                     target_param.shape[0] * self.tp_size,
@@ -367,8 +374,13 @@ def _art_dsv4_expert_mapping_types() -> tuple[type[Any], type[Any]]:
                 )
             else:
                 full_target_shape = tuple(target_param.shape)
+            hf_weight = (
+                cast(dict[str, torch.Tensor], hf_weights)["weight"]
+                if isinstance(hf_weights, dict)
+                else cast(torch.Tensor, hf_weights)
+            )
             aligned = _align_expert_weight_to_shape(
-                cast(torch.Tensor, hf_weights),
+                hf_weight,
                 torch.Size(full_target_shape),
                 "down_proj",
                 transpose_hint=False,
@@ -376,16 +388,22 @@ def _art_dsv4_expert_mapping_types() -> tuple[type[Any], type[Any]]:
             return self._mapping.hf_to_megatron(aligned, megatron_module)
 
         def megatron_to_hf(self, megatron_weights: Any, megatron_module: Any):
-            converted = super().megatron_to_hf(megatron_weights, megatron_module)
+            hf_param = self.hf_param
+            self.hf_param = self.weight_hf_param
+            try:
+                converted = super().megatron_to_hf(megatron_weights, megatron_module)
+            finally:
+                self.hf_param = hf_param
             if not converted:
                 return {}
             return {self.export_hf_param: next(iter(converted.values()))}
 
         def resolve(self, captures: tuple[str, ...]):
             resolved_megatron_param, resolved_hf_param = self._resolve_names(captures)
+            resolved_hf_param = cast(dict[str, str], resolved_hf_param)
             return type(self)(
                 resolved_megatron_param,
-                cast(str, resolved_hf_param),
+                resolved_hf_param["weight"],
                 cast(str, _resolve_dsv4_hf_param(self.export_hf_param, captures)),
             )
 
