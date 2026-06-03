@@ -151,6 +151,7 @@ DSV4_SPEC = ModelSupportSpec(
         "deepseek-ai/DeepSeek-V4-Pro-Base",
     ),
     default_target_modules=_DSV4_TARGET_MODULES,
+    default_rollout_weights_mode="merged",
     native_vllm_lora_status=_DISABLED_NATIVE_VLLM_LORA_STATUS,
 )
 
