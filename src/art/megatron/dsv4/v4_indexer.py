@@ -104,7 +104,32 @@ def _exact_indexer_topk(
                         q_end=q_end,
                     )[0]
                 scores.masked_fill_(~visible, float("-inf"))
-                top_scores, top_indices = scores.topk(actual_topk, dim=-1)
+                if shared_layout is not None:
+                    rank = visible.to(torch.long).cumsum(dim=1) - 1
+                    safe_rank = rank.clamp_min(0)
+                    compact_scores = torch.full_like(scores, float("-inf"))
+                    compact_scores.scatter_reduce_(
+                        1,
+                        safe_rank,
+                        scores,
+                        reduce="amax",
+                        include_self=True,
+                    )
+                    global_ids = kv_ids.view(1, -1).expand_as(safe_rank)
+                    compact_global = torch.full_like(safe_rank, -1)
+                    compact_global.scatter_reduce_(
+                        1,
+                        safe_rank,
+                        torch.where(
+                            visible, global_ids, torch.full_like(global_ids, -1)
+                        ),
+                        reduce="amax",
+                        include_self=True,
+                    )
+                    top_scores, top_local = compact_scores.topk(actual_topk, dim=-1)
+                    top_indices = compact_global.gather(1, top_local)
+                else:
+                    top_scores, top_indices = scores.topk(actual_topk, dim=-1)
                 out[b, q_start:q_end] = torch.where(
                     torch.isneginf(top_scores),
                     torch.full_like(top_indices, -1),
