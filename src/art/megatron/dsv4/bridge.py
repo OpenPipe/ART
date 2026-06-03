@@ -873,7 +873,9 @@ class ArtDeepSeekV4Bridge(DeepSeekV3Bridge):
         converted_weights_dict: dict[str, torch.Tensor],
         hf_state_dict: Any,
     ) -> dict[str, torch.Tensor]:
-        del task, hf_state_dict
+        del task
+        if isinstance(hf_state_dict, dict):
+            return converted_weights_dict
         remapped: dict[str, torch.Tensor] = {}
         for name, weight in converted_weights_dict.items():
             fused = self._maybe_collect_fused_export(name, weight)
