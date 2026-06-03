@@ -8,12 +8,17 @@ from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.transformer_config import TransformerConfig
 import torch
 
-from art.megatron.dsv4.compressor import DeepSeekV4Compressor
+from art.megatron.dsv4.compressor import (
+    DeepSeekV4Compressor,
+    Dsv4CompressionLayout,
+    compressed_layout_visibility,
+)
 from art.megatron.dsv4.qat import fp8_simulate_qat
 from art.megatron.dsv4.rope import (
     apply_rotary_emb,
     configure_rope_cache,
     get_rope_cache,
+    get_rope_cache_at_positions,
 )
 from art.megatron.dsv4.utils import freeze_parameters_as_buffers, rotate_activation
 
@@ -37,6 +42,11 @@ def _exact_indexer_topk(
     cu_seqlen_ks: torch.Tensor,
     cu_seqlen_ke: torch.Tensor,
     topk: int,
+    *,
+    shared_layout: Dsv4CompressionLayout | None = None,
+    position_ids: torch.Tensor | None = None,
+    group_ids: torch.Tensor | None = None,
+    parent_ids: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Return frozen DSV4 indexer topk using the reference score equation.
 
@@ -76,11 +86,30 @@ def _exact_indexer_topk(
                         dot
                         * weights[q_start:q_end, b, h_start:h_end].float().unsqueeze(-1)
                     ).sum(dim=1)
-                visible = (kv_ids.unsqueeze(0) >= cu_seqlen_ks[q_start:q_end, None]) & (
-                    kv_ids.unsqueeze(0) < cu_seqlen_ke[q_start:q_end, None]
-                )
+                if shared_layout is None:
+                    visible = (
+                        kv_ids.unsqueeze(0) >= cu_seqlen_ks[q_start:q_end, None]
+                    ) & (kv_ids.unsqueeze(0) < cu_seqlen_ke[q_start:q_end, None])
+                else:
+                    if position_ids is None or group_ids is None or parent_ids is None:
+                        raise ValueError(
+                            "DSV4 shared-prefix indexer requires position/group metadata."
+                        )
+                    visible = compressed_layout_visibility(
+                        shared_layout,
+                        position_ids=position_ids[b : b + 1],
+                        group_ids=group_ids[b : b + 1],
+                        parent_ids=parent_ids[b : b + 1],
+                        q_start=q_start,
+                        q_end=q_end,
+                    )[0]
                 scores.masked_fill_(~visible, float("-inf"))
-                out[b, q_start:q_end] = scores.topk(actual_topk, dim=-1).indices
+                top_scores, top_indices = scores.topk(actual_topk, dim=-1)
+                out[b, q_start:q_end] = torch.where(
+                    torch.isneginf(top_scores),
+                    torch.full_like(top_indices, -1),
+                    top_indices,
+                )
     return out
 
 
@@ -150,7 +179,15 @@ class V4Indexer(MegatronModule):
         freeze_parameters_as_buffers(self)
 
     def forward(
-        self, x: torch.Tensor, qr: torch.Tensor, mask=None, packed_seq_params=None
+        self,
+        x: torch.Tensor,
+        qr: torch.Tensor,
+        mask=None,
+        packed_seq_params=None,
+        position_ids: torch.Tensor | None = None,
+        shared_layout: Dsv4CompressionLayout | None = None,
+        group_ids: torch.Tensor | None = None,
+        parent_ids: torch.Tensor | None = None,
     ):
         """Forward pass.
 
@@ -182,7 +219,12 @@ class V4Indexer(MegatronModule):
             raise RuntimeError(
                 "DeepSeek-V4 non-CP indexer received context_parallel_size > 1."
             )
-        freqs_cis = get_rope_cache(self, seqlen=seqlen, device=x.device)
+        if position_ids is None:
+            freqs_cis = get_rope_cache(self, seqlen=seqlen, device=x.device)
+        else:
+            freqs_cis = get_rope_cache_at_positions(
+                self, position_ids=position_ids, device=x.device
+            )
         q = q.clone()
         q = einops.rearrange(q, "s b ... -> b s ...")
         apply_rotary_emb(q[..., -rd:], freqs_cis)
@@ -192,7 +234,11 @@ class V4Indexer(MegatronModule):
         if self.use_fp8_qat:
             q = fp8_simulate_qat(q, 128)
 
-        k = self.compressor(x)
+        k = self.compressor(
+            x,
+            position_ids=position_ids,
+            shared_layout=shared_layout,
+        )
         if k.shape[0] == 0:
             return torch.empty(
                 bsz,
@@ -211,4 +257,15 @@ class V4Indexer(MegatronModule):
         cu_ks, cu_ke = _make_causal_cu_seqlens(
             seqlen_global, seqlen_kv, self.compress_ratio, q.device
         )
-        return _exact_indexer_topk(q, k, weights.float(), cu_ks, cu_ke, self.index_topk)
+        return _exact_indexer_topk(
+            q,
+            k,
+            weights.float(),
+            cu_ks,
+            cu_ke,
+            self.index_topk,
+            shared_layout=shared_layout,
+            position_ids=position_ids,
+            group_ids=group_ids,
+            parent_ids=parent_ids,
+        )

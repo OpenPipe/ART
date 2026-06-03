@@ -30,7 +30,12 @@ from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.utils import make_sharded_tensors_for_checkpoint
 
-from art.megatron.dsv4.compressor import DeepSeekV4Compressor
+from art.megatron.dsv4.compressor import (
+    DeepSeekV4Compressor,
+    Dsv4CompressionLayout,
+    build_shared_prefix_compression_layout,
+    compressed_layout_topk_idxs,
+)
 from art.megatron.dsv4.kernel.tilelang_sparse_mla import sparse_attn_tilelang
 from art.megatron.dsv4.qat import fp8_simulate_qat
 from art.megatron.dsv4.rope import (
@@ -354,6 +359,19 @@ class DeepSeekV4Attention(MegatronModule):
         shared_prefix = _shared_prefix_tensors(
             attention_bias, bsz=bsz, seqlen=seqlen_local, device=x.device
         )
+        shared_layout: Dsv4CompressionLayout | None = None
+        if (
+            self.compress_ratio
+            and shared_prefix is not None
+            and position_ids is not None
+        ):
+            group_ids, parent_ids = shared_prefix
+            shared_layout = build_shared_prefix_compression_layout(
+                position_ids=position_ids,
+                group_ids=group_ids,
+                parent_ids=parent_ids,
+                ratio=ratio,
+            )
 
         q_after_wq_a = _add_lora_if_present(self, "wq_a_lora", self.wq_a(x)[0], x)
         qr = q = cast(Any, self.q_norm)(q_after_wq_a)
@@ -403,7 +421,17 @@ class DeepSeekV4Attention(MegatronModule):
                         qr_sbd, group=self.tp_group
                     )
                 if isinstance(self.indexer, V4Indexer):
-                    compress_topk_idxs = self.indexer(x_sbd, qr_sbd)
+                    group_ids = parent_ids = None
+                    if shared_prefix is not None:
+                        group_ids, parent_ids = shared_prefix
+                    compress_topk_idxs = self.indexer(
+                        x_sbd,
+                        qr_sbd,
+                        position_ids=position_ids,
+                        shared_layout=shared_layout,
+                        group_ids=group_ids,
+                        parent_ids=parent_ids,
+                    )
                 else:
                     indexer_mask = self._compute_indexer_mask(
                         q_positions=q_positions, seqlen_global=seqlen_global
@@ -411,24 +439,49 @@ class DeepSeekV4Attention(MegatronModule):
                     compress_topk_idxs = self.indexer(
                         x_sbd, qr_sbd, mask=indexer_mask, packed_seq_params=None
                     )
-                q_first_invalid_group = (q_positions + 1).unsqueeze(1) // ratio
-                topk_idx_mask = (compress_topk_idxs >= q_first_invalid_group) | (
-                    compress_topk_idxs < 0
-                )
-                compress_topk_idxs = torch.where(
-                    topk_idx_mask, -1, compress_topk_idxs + kv_compress_offset
-                )
+                if shared_layout is None:
+                    q_first_invalid_group = (q_positions + 1).unsqueeze(1) // ratio
+                    topk_idx_mask = (compress_topk_idxs >= q_first_invalid_group) | (
+                        compress_topk_idxs < 0
+                    )
+                    compress_topk_idxs = torch.where(
+                        topk_idx_mask, -1, compress_topk_idxs + kv_compress_offset
+                    )
+                else:
+                    compress_topk_idxs = torch.where(
+                        compress_topk_idxs < 0,
+                        -1,
+                        compress_topk_idxs + kv_compress_offset,
+                    )
             else:
-                compress_topk_idxs = _compress_topk_idxs(
-                    q_positions, ratio=ratio, bsz=bsz
-                )
+                if (
+                    shared_layout is None
+                    or shared_prefix is None
+                    or position_ids is None
+                ):
+                    compress_topk_idxs = _compress_topk_idxs(
+                        q_positions, ratio=ratio, bsz=bsz
+                    )
+                else:
+                    group_ids, parent_ids = shared_prefix
+                    compress_topk_idxs = compressed_layout_topk_idxs(
+                        shared_layout,
+                        position_ids=position_ids,
+                        group_ids=group_ids,
+                        parent_ids=parent_ids,
+                        offset=kv_compress_offset,
+                    )
             topk_idxs = torch.cat([topk_idxs, compress_topk_idxs], dim=-1)
         topk_idxs = topk_idxs.int()
 
         kv_compress = None
         if self.compress_ratio:
             x_sbd = einops.rearrange(x, "b s d -> s b d")
-            kv_compress_sbd = self.compressor(x_sbd)
+            kv_compress_sbd = self.compressor(
+                x_sbd,
+                position_ids=position_ids,
+                shared_layout=shared_layout,
+            )
             if kv_compress_sbd is not None:
                 kv_compress = einops.rearrange(kv_compress_sbd, "s b d -> b s d")
 
