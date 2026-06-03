@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import hashlib
 import os
+import re
 from typing import Any, Sequence, cast
 
 import torch
@@ -21,6 +23,7 @@ _ORACLE_FFN_HIDDEN_SIZE = 128
 _ORACLE_INDEX_HEADS = 1
 _ORACLE_INDEX_TOPK = 8
 _VALIDATION_NUM_LAYERS_ENV = "ART_DSV4_VALIDATION_NUM_LAYERS"
+_ORACLE_EXPERT_WEIGHT_RE = re.compile(r"\.mlp\.experts\..*\.weight(?P<expert>\d+)$")
 _DSV4_MOE_COMPILE_WORKAROUND_FLAGS = (
     "alltoall_dtoh",
     "alltoall_dispatch_preprocess",
@@ -340,11 +343,16 @@ class Dsv4Handler(DefaultMoeHandler):
 
     def configure_oracle_provider(self, provider: Any, *, case_config: Any) -> None:
         """Mirrors HF oracle reductions while keeping DSV4 hard kernel invariants."""
-        del case_config
         hooks = list(getattr(provider, "_pre_wrap_hooks", []))
         kept = [hook for hook in hooks if not self._is_bridge_hf_load_hook(hook)]
         if len(kept) != len(hooks):
             provider._pre_wrap_hooks = kept
+        provider.register_pre_wrap_hook(
+            lambda chunks: self._initialize_oracle_base_weights(
+                chunks,
+                seed=int(case_config.seed),
+            )
+        )
         self._apply_oracle_shape_overrides(provider)
         provider.kv_lora_rank = 512
         provider.kv_channels = 512
@@ -387,6 +395,123 @@ class Dsv4Handler(DefaultMoeHandler):
         config.dsv4_oracle_freeze_attn_sink = True
         config.dsv4_oracle_source_aliases = True
         config.dsv4_oracle_precision_aligned_compressor = True
+
+    def _initialize_oracle_base_weights(
+        self,
+        model_chunks: Sequence[Any],
+        *,
+        seed: int,
+    ) -> Sequence[Any]:
+        """Seeds reduced DSV4 oracle base tensors after meta-device materialization.
+
+        DSV4 correctness runs strip the full-checkpoint Bridge load because the
+        public tensors are production-sized and quantized. Since ART materializes
+        meta models with empty storage, every base tensor must be explicitly
+        initialized before freeze/LoRA hooks run; otherwise the oracle exercises a
+        zero model and cannot produce meaningful adapter gradients.
+        """
+        from megatron.core import parallel_state as ps
+
+        ep_rank = ps.get_expert_model_parallel_rank()
+        ep_size = ps.get_expert_model_parallel_world_size()
+        with torch.no_grad():
+            for chunk in model_chunks:
+                for name, param in chunk.named_parameters():
+                    if self._is_oracle_lora_tensor(name):
+                        continue
+                    init_name = self._oracle_base_tensor_name(
+                        name,
+                        ep_rank=ep_rank,
+                        ep_size=ep_size,
+                    )
+                    self._initialize_oracle_tensor(
+                        init_name,
+                        param,
+                        seed=seed,
+                    )
+                for name, buffer in chunk.named_buffers():
+                    self._initialize_oracle_buffer(name, buffer, seed=seed)
+        return model_chunks
+
+    @staticmethod
+    def _is_oracle_lora_tensor(name: str) -> bool:
+        return "_lora." in name or ".lora." in name
+
+    @staticmethod
+    def _oracle_base_tensor_name(name: str, *, ep_rank: int, ep_size: int) -> str:
+        if ep_size <= 1:
+            return name
+        match = _ORACLE_EXPERT_WEIGHT_RE.search(name)
+        if match is None:
+            return name
+        local_expert = int(match.group("expert"))
+        local_expert_count = max(1, _ORACLE_NUM_EXPERTS // ep_size)
+        global_expert = ep_rank * local_expert_count + local_expert
+        return f"{name[: match.start('expert')]}{global_expert}"
+
+    def _initialize_oracle_buffer(
+        self,
+        name: str,
+        tensor: torch.Tensor,
+        *,
+        seed: int,
+    ) -> None:
+        if name.endswith("freqs_cis"):
+            return
+        if name.endswith("tid2eid"):
+            self._initialize_oracle_tid2eid(tensor)
+            return
+        if not torch.is_floating_point(tensor):
+            return
+        self._initialize_oracle_tensor(name, tensor, seed=seed)
+
+    @staticmethod
+    def _initialize_oracle_tid2eid(tensor: torch.Tensor) -> None:
+        if tensor.ndim != 2:
+            raise RuntimeError(
+                f"Expected DSV4 tid2eid to be 2D, got {tuple(tensor.shape)}"
+            )
+        token_ids = torch.arange(tensor.shape[0], device=tensor.device).unsqueeze(1)
+        offsets = torch.arange(tensor.shape[1], device=tensor.device).unsqueeze(0)
+        tensor.copy_(
+            (token_ids + offsets).remainder(_ORACLE_NUM_EXPERTS).to(tensor.dtype)
+        )
+
+    def _initialize_oracle_tensor(
+        self,
+        name: str,
+        tensor: torch.Tensor,
+        *,
+        seed: int,
+    ) -> None:
+        if tensor.is_meta:
+            raise RuntimeError(f"DSV4 oracle tensor was not materialized: {name}")
+        if not torch.is_floating_point(tensor):
+            return
+        if self._is_oracle_identity_weight(name):
+            tensor.fill_(1)
+            return
+        if name.endswith(
+            ("bias", "attn_sink", "_base", "_scale", "e_score_correction_bias")
+        ):
+            tensor.zero_()
+            return
+        digest = hashlib.sha256(f"{seed}:{name}".encode("utf-8")).digest()
+        key_seed = int.from_bytes(digest[:8], "little") % (2**31)
+        generator = torch.Generator(device=tensor.device).manual_seed(key_seed)
+        values = torch.randn(
+            tensor.shape,
+            generator=generator,
+            device=tensor.device,
+            dtype=torch.float32,
+        )
+        tensor.copy_((0.02 * values).to(dtype=tensor.dtype))
+
+    @staticmethod
+    def _is_oracle_identity_weight(name: str) -> bool:
+        return name.endswith(".weight") and any(
+            token in name for token in ("layernorm", "_norm", ".norm.")
+        )
 
 
 def ensure_dsv4_bridge_registered() -> None:
