@@ -1,5 +1,5 @@
 from functools import lru_cache, partial
-from typing import Any, cast
+from typing import Any, Mapping, cast
 
 from megatron.bridge.models.conversion.mapping_registry import MegatronMappingRegistry
 from megatron.bridge.models.conversion.model_bridge import WeightConversionTask
@@ -14,6 +14,113 @@ from megatron.core.models.gpt.gpt_model import GPTModel
 import torch
 
 from art.megatron.dsv4.spec import get_dsv4_decoder_block_spec
+
+_DSV4_FP4_TABLE = (
+    0.0,
+    0.5,
+    1.0,
+    1.5,
+    2.0,
+    3.0,
+    4.0,
+    6.0,
+    0.0,
+    -0.5,
+    -1.0,
+    -1.5,
+    -2.0,
+    -3.0,
+    -4.0,
+    -6.0,
+)
+
+
+def _dequant_dsv4_mxfp4(weight: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
+    if weight.dtype not in (torch.int8, torch.uint8):
+        raise ValueError(
+            f"Expected MXFP4 packed int8/uint8 weight, got {weight.dtype}."
+        )
+    if scale.dtype != torch.float8_e8m0fnu:
+        raise ValueError(f"Expected MXFP4 E8M0 scale, got {scale.dtype}.")
+    if weight.ndim != 2 or scale.ndim != 2:
+        raise ValueError(
+            f"Expected 2-D MXFP4 weight and scale, got {weight.shape=} {scale.shape=}."
+        )
+
+    out_dim, in_bytes = weight.shape
+    in_dim = in_bytes * 2
+    if in_dim % 32 != 0 or tuple(scale.shape) != (out_dim, in_dim // 32):
+        raise ValueError(
+            "Unexpected MXFP4 scale shape: "
+            f"weight={tuple(weight.shape)} scale={tuple(scale.shape)}."
+        )
+
+    table = torch.tensor(_DSV4_FP4_TABLE, dtype=torch.float32, device=weight.device)
+    packed = weight.contiguous().view(torch.uint8)
+    low = (packed & 0x0F).long()
+    high = ((packed >> 4) & 0x0F).long()
+    decoded = torch.stack((table[low], table[high]), dim=-1).reshape(out_dim, in_dim)
+    expanded_scale = scale.float().repeat_interleave(32, dim=1)
+    return (decoded * expanded_scale).to(torch.bfloat16)
+
+
+def _dequant_dsv4_block_fp8(weight: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
+    if weight.dtype != torch.float8_e4m3fn:
+        raise ValueError(f"Expected block-FP8 E4M3 weight, got {weight.dtype}.")
+    if scale.dtype != torch.float8_e8m0fnu:
+        raise ValueError(f"Expected block-FP8 E8M0 scale, got {scale.dtype}.")
+    if weight.ndim != 2 or scale.ndim != 2:
+        raise ValueError(
+            f"Expected 2-D block-FP8 weight and scale, got {weight.shape=} {scale.shape=}."
+        )
+
+    block = 128
+    out_dim, in_dim = weight.shape
+    expected_scale_shape = (
+        (out_dim + block - 1) // block,
+        (in_dim + block - 1) // block,
+    )
+    if tuple(scale.shape) != expected_scale_shape:
+        raise ValueError(
+            "Unexpected block-FP8 scale shape: "
+            f"weight={tuple(weight.shape)} scale={tuple(scale.shape)} "
+            f"expected={expected_scale_shape}."
+        )
+
+    expanded_scale = (
+        scale.float().repeat_interleave(block, dim=0).repeat_interleave(block, dim=1)
+    )
+    expanded_scale = expanded_scale[:out_dim, :in_dim]
+    return (weight.float() * expanded_scale).to(torch.bfloat16)
+
+
+def _dequant_dsv4_weight(weight: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
+    if weight.dtype in (torch.int8, torch.uint8):
+        return _dequant_dsv4_mxfp4(weight, scale)
+    if weight.dtype == torch.float8_e4m3fn:
+        return _dequant_dsv4_block_fp8(weight, scale)
+    return weight
+
+
+def _load_dsv4_hf_tensor(
+    hf_param: str, hf_state_dict: Mapping[str, torch.Tensor]
+) -> torch.Tensor:
+    weight = hf_state_dict[hf_param]
+    if not hf_param.endswith(".weight") or weight.dtype not in (
+        torch.int8,
+        torch.uint8,
+        torch.float8_e4m3fn,
+    ):
+        return weight
+
+    scale_param = f"{hf_param.removesuffix('.weight')}.scale"
+    try:
+        scale = hf_state_dict[scale_param]
+    except KeyError as exc:
+        raise ValueError(
+            f"Quantized DSV4 weight {hf_param} requires scale {scale_param}."
+        ) from exc
+    return _dequant_dsv4_weight(weight, scale)
 
 
 def _resolve_dsv4_hf_param(hf_param: Any, captures: tuple[str, ...]) -> Any:
@@ -553,6 +660,21 @@ class ArtDeepSeekV4Bridge(DeepSeekV3Bridge):
 
     def mapping_registry(self) -> MegatronMappingRegistry:
         return _dsv4_mapping_registry()
+
+    def maybe_modify_loaded_hf_weight(
+        self,
+        hf_param: str | dict[str, str],
+        hf_state_dict: Mapping[str, torch.Tensor],
+    ) -> torch.Tensor:
+        if isinstance(hf_param, str):
+            return _load_dsv4_hf_tensor(hf_param, hf_state_dict)
+        return cast(
+            torch.Tensor,
+            {
+                name: _load_dsv4_hf_tensor(param, hf_state_dict)
+                for name, param in hf_param.items()
+            },
+        )
 
     def maybe_modify_converted_hf_weight(
         self,
