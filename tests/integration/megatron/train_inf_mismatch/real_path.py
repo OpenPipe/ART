@@ -824,6 +824,7 @@ def _real_path_megatron_worker(
     torch.cuda.set_device(local_rank)
     torch.distributed.init_process_group(backend="nccl")  # type: ignore[possibly-missing-attribute]
     _set_seed(request.config.seed)
+    os.environ.update(request.config.megatron_env)
     os.environ.update(request.config.topology.env())
 
     def _configure_worker_bundle(bundle: Any) -> None:
@@ -960,6 +961,7 @@ def _run_real_path_megatron_worker(
     env["CUDA_VISIBLE_DEVICES"] = ",".join(
         str(value) for value in request.config.trainer_gpu_ids
     )
+    env.update(request.config.megatron_env)
     env["PYTHONUNBUFFERED"] = "1"
     tests_dir = str(REPO_ROOT / "tests")
     env["PYTHONPATH"] = (

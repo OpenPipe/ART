@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from typing import Any, Sequence, cast
 
 import torch
@@ -19,6 +20,7 @@ _ORACLE_NUM_EXPERTS_PER_TOK = 1
 _ORACLE_FFN_HIDDEN_SIZE = 128
 _ORACLE_INDEX_HEADS = 1
 _ORACLE_INDEX_TOPK = 8
+_VALIDATION_NUM_LAYERS_ENV = "ART_DSV4_VALIDATION_NUM_LAYERS"
 _DSV4_MOE_COMPILE_WORKAROUND_FLAGS = (
     "alltoall_dtoh",
     "alltoall_dispatch_preprocess",
@@ -50,6 +52,22 @@ class Dsv4Handler(DefaultMoeHandler):
 
     def configure_provider_for_runtime(self, provider: Any) -> None:
         provider.mtp_num_layers = None
+        raw_num_layers = os.environ.get(_VALIDATION_NUM_LAYERS_ENV)
+        if raw_num_layers is None:
+            return
+        num_layers = int(raw_num_layers)
+        if num_layers < 1:
+            raise ValueError(f"{_VALIDATION_NUM_LAYERS_ENV} must be positive")
+        provider.num_layers = num_layers
+        provider.moe_layer_freq = [1] * num_layers
+        ratios = list(getattr(provider, "dsv4_compress_ratios", ()) or ())
+        if ratios:
+            if num_layers > len(ratios):
+                raise ValueError(
+                    f"{_VALIDATION_NUM_LAYERS_ENV}={num_layers} exceeds "
+                    f"dsv4_compress_ratios length {len(ratios)}"
+                )
+            provider.dsv4_compress_ratios = ratios[:num_layers]
 
     def default_chat_template(self) -> str | None:
         return None

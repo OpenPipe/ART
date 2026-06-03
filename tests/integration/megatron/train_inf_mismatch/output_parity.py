@@ -100,6 +100,7 @@ class TrainInfOutputParityConfig(BaseModel):
     lora_target_modules: list[str] | None = None
     engine_args: dict[str, Any] = Field(default_factory=dict)
     server_args: dict[str, Any] = Field(default_factory=dict)
+    megatron_env: dict[str, str] = Field(default_factory=dict)
     replay_vllm_routing: bool = False
 
     @model_validator(mode="after")
@@ -360,6 +361,10 @@ def config_from_env() -> TrainInfOutputParityConfig:
                 **stage_resources.vllm.engine_args(),
                 **config.engine_args,
             }
+        config.megatron_env = {
+            **stage_resources.megatron_env,
+            **config.megatron_env,
+        }
     if raw_modes := os.environ.get("ART_TRAIN_INF_MISMATCH_ROLLOUT_MODES"):
         config.rollout_modes = _parse_rollout_modes(raw_modes)
     if raw_seq_len := os.environ.get("ART_TRAIN_INF_MISMATCH_SEQUENCE_LENGTH"):

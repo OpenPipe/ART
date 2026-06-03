@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, Field
 
 
 class MegatronWorkflowTopology(BaseModel):
@@ -52,6 +52,7 @@ class VllmWorkflowResources(BaseModel):
     gpu_ids: list[int]
     tensor_parallel_size: int
     enable_expert_parallel: bool = False
+    hf_overrides: dict[str, object] = Field(default_factory=dict)
 
     def engine_args(self) -> dict[str, object]:
         engine_args: dict[str, object] = {
@@ -59,6 +60,8 @@ class VllmWorkflowResources(BaseModel):
         }
         if self.enable_expert_parallel:
             engine_args["enable_expert_parallel"] = True
+        if self.hf_overrides:
+            engine_args["hf_overrides"] = dict(self.hf_overrides)
         return engine_args
 
 
@@ -68,6 +71,7 @@ class WorkflowStageResources(BaseModel):
     required_world_size: int
     megatron: MegatronWorkflowResources | None = None
     vllm: VllmWorkflowResources | None = None
+    megatron_env: dict[str, str] = Field(default_factory=dict)
 
 
 class HandlerWorkflowResources(BaseModel):
@@ -96,6 +100,24 @@ _DSV4_TP2_EP4 = MegatronWorkflowTopology(
     pp=1,
     sp=True,
 )
+_DSV4_REPRESENTATIVE_NUM_LAYERS = 4
+_DSV4_REPRESENTATIVE_COMPRESS_RATIOS = [0, 0, 4, 128]
+_DSV4_REPRESENTATIVE_LAYER_TYPES = [
+    "sliding_attention",
+    "sliding_attention",
+    "compressed_sparse_attention",
+    "heavily_compressed_attention",
+]
+_DSV4_REPRESENTATIVE_MLP_LAYER_TYPES = ["hash_moe", "hash_moe", "hash_moe", "moe"]
+_DSV4_MEGATRON_ENV = {
+    "ART_DSV4_VALIDATION_NUM_LAYERS": str(_DSV4_REPRESENTATIVE_NUM_LAYERS)
+}
+_DSV4_HF_OVERRIDES = {
+    "num_hidden_layers": _DSV4_REPRESENTATIVE_NUM_LAYERS,
+    "compress_ratios": _DSV4_REPRESENTATIVE_COMPRESS_RATIOS,
+    "layer_types": _DSV4_REPRESENTATIVE_LAYER_TYPES,
+    "mlp_layer_types": _DSV4_REPRESENTATIVE_MLP_LAYER_TYPES,
+}
 _DSV4_MEGATRON = MegatronWorkflowResources(
     gpu_ids=[0, 1, 2, 3],
     topology=_DSV4_TP2_EP4,
@@ -104,11 +126,13 @@ _DSV4_VLLM_EP4 = VllmWorkflowResources(
     gpu_ids=[4, 5, 6, 7],
     tensor_parallel_size=4,
     enable_expert_parallel=True,
+    hf_overrides=_DSV4_HF_OVERRIDES,
 )
 _DSV4_NATIVE_VLLM_EP4 = VllmWorkflowResources(
     gpu_ids=[0, 1, 2, 3],
     tensor_parallel_size=4,
     enable_expert_parallel=True,
+    hf_overrides=_DSV4_HF_OVERRIDES,
 )
 
 # Explicitly for large models which do not fit in the default topology.
@@ -118,11 +142,13 @@ HANDLER_WORKFLOW_RESOURCES: dict[str, HandlerWorkflowResources] = {
             required_world_size=8,
             megatron=_DSV4_MEGATRON,
             vllm=_DSV4_VLLM_EP4,
+            megatron_env=_DSV4_MEGATRON_ENV,
         ),
         merged_vllm_serving=WorkflowStageResources(
             required_world_size=8,
             megatron=_DSV4_MEGATRON,
             vllm=_DSV4_VLLM_EP4,
+            megatron_env=_DSV4_MEGATRON_ENV,
         ),
         native_vllm_lora=WorkflowStageResources(
             required_world_size=4,
@@ -132,6 +158,7 @@ HANDLER_WORKFLOW_RESOURCES: dict[str, HandlerWorkflowResources] = {
             required_world_size=8,
             megatron=_DSV4_MEGATRON,
             vllm=_DSV4_VLLM_EP4,
+            megatron_env=_DSV4_MEGATRON_ENV,
         ),
         yes_no_trainability_variant="megatron_dedicated",
     ),

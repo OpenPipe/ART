@@ -546,6 +546,8 @@ def _build_internal_config(
         ),
         enable_sleep_mode=True if shared else None,
     )
+    if vllm_resources is not None:
+        engine_args.update(vllm_resources.engine_args())
     engine_args["model"] = base_model
     internal_config = dev.InternalModelConfig(
         rollout_weights_mode=rollout_weights_mode
@@ -804,9 +806,22 @@ async def run_yes_no_trainability_async(
         report_metrics=[],
     )
     train_kwargs = _variant_train_kwargs(variant)
+    workflow_resources = handler_workflow_resources_for_base_model(
+        base_model,
+        allow_unvalidated_arch=allow_unvalidated_arch,
+    )
+    stage_resources = (
+        workflow_resources.yes_no_trainability
+        if workflow_resources is not None
+        else None
+    )
+    backend_env = {
+        **(stage_resources.megatron_env if stage_resources is not None else {}),
+        **(extra_env or {}),
+    }
 
     async with _backend_context(
-        variant, backend_root=backend_root, extra_env=extra_env
+        variant, backend_root=backend_root, extra_env=backend_env
     ) as backend:
         await model.register(backend)
         output_dir = Path(model.base_path) / model.project / "models" / model.name

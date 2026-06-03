@@ -1,10 +1,11 @@
 from __future__ import annotations
 
 import asyncio
+from contextlib import contextmanager
 import os
 from pathlib import Path
 import socket
-from typing import cast
+from typing import Iterator, cast
 
 from pydantic import BaseModel, Field
 import torch
@@ -51,6 +52,23 @@ def _parse_gpu_id_env(name: str) -> list[int] | None:
     if raw is None or raw.strip() == "":
         return None
     return [int(part.strip()) for part in raw.split(",") if part.strip()]
+
+
+@contextmanager
+def _temporary_env(updates: dict[str, str] | None) -> Iterator[None]:
+    if not updates:
+        yield
+        return
+    saved = {name: os.environ.get(name) for name in updates}
+    os.environ.update(updates)
+    try:
+        yield
+    finally:
+        for name, value in saved.items():
+            if value is None:
+                os.environ.pop(name, None)
+            else:
+                os.environ[name] = value
 
 
 def _resolve_dedicated_gpu_ids() -> tuple[list[int], list[int]]:
@@ -125,7 +143,12 @@ async def _run_merged_vllm_serving(
         internal_config["megatron_topology"] = megatron_topology
     if stage_resources is None:
         dev.validate_dedicated_config(internal_config)
-    with provider_topology_env(topology):
+    with (
+        provider_topology_env(topology),
+        _temporary_env(
+            stage_resources.megatron_env if stage_resources is not None else None
+        ),
+    ):
         service = MegatronService(
             model_name=service_name,
             base_model=case_config.base_model,
