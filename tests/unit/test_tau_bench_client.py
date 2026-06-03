@@ -141,23 +141,11 @@ async def test_client_retries_transport_errors() -> None:
 
 
 @pytest.mark.asyncio
-async def test_client_sends_optional_request_fields() -> None:
+async def test_client_sends_create_environment_idle_timeout() -> None:
     seen: dict[str, Any] = {}
 
     async def handler(request: httpx.Request) -> httpx.Response:
-        seen[request.url.path] = json.loads(request.content)
-        if request.url.path.endswith("/step"):
-            return httpx.Response(
-                200,
-                json={
-                    "id": "env-1",
-                    "observation": "user: hello",
-                    "reward": 0.0,
-                    "terminated": False,
-                    "truncated": False,
-                    "info": {},
-                },
-            )
+        seen["json"] = json.loads(request.content)
         return httpx.Response(
             200,
             json={"id": "env-1", "observation": "user: hello", "info": {}},
@@ -173,18 +161,13 @@ async def test_client_sends_optional_request_fields() -> None:
         task_id="task_001",
         idle_timeout_seconds=120,
     )
-    await client.step_environment("env-1", "done()", include_info=False)
     await client.close()
     await http_client.aclose()
 
-    assert seen["/environments"] == {
+    assert seen["json"] == {
         "domain": "telecom",
         "task_id": "task_001",
         "idle_timeout_seconds": 120,
-    }
-    assert seen["/environments/env-1/step"] == {
-        "action": "done()",
-        "include_info": False,
     }
 
 
@@ -248,13 +231,8 @@ class FakeTauBenchClient(TauBenchClient):
         )
 
     async def step_environment(
-        self,
-        env_id: str,
-        action: str,
-        *,
-        include_info: bool | None = None,
+        self, env_id: str, action: str
     ) -> StepEnvironmentResponse:
-        self.step_include_info = include_info
         return StepEnvironmentResponse(
             id=env_id,
             observation=f"user: saw {action}",
@@ -311,7 +289,6 @@ async def test_rollout_supports_string_model_args(
     assert trajectory.metrics["cost/user"] == 0.25
     assert client.deleted == ["env-1"]
     assert client.create_kwargs["user_llm"] == "gpt-4.1-2025-04-14"
-    assert client.step_include_info is False
 
 
 @pytest.mark.asyncio

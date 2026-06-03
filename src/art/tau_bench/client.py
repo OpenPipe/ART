@@ -212,20 +212,11 @@ class TauBenchClient:
         self,
         env_id: str,
         action: str,
-        *,
-        include_info: bool | None = None,
     ) -> StepEnvironmentResponse:
         response = await self._request(
             "POST",
             f"/environments/{env_id}/step",
-            json={
-                key: value
-                for key, value in {
-                    "action": action,
-                    "include_info": include_info,
-                }.items()
-                if value is not None
-            },
+            json={"action": action},
             headers=self._auth_headers(),
         )
         _raise_for_status(response)

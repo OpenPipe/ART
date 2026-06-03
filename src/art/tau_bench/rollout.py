@@ -129,11 +129,7 @@ async def rollout(
             if tool_calls:
                 for tool_call in tool_calls:
                     action = _tool_call_action(tool_call)
-                    step = await client.step_environment(
-                        env.id,
-                        action,
-                        include_info=False,
-                    )
+                    step = await client.step_environment(env.id, action)
                     trajectory.messages_and_choices.append(
                         {
                             "role": "tool",
@@ -147,7 +143,6 @@ async def rollout(
                 step = await client.step_environment(
                     env.id,
                     choice.message.content or "",
-                    include_info=False,
                 )
                 if "user_message_cost" in step.info:
                     trajectory.metrics["cost/user"] += step.info["user_message_cost"]
