@@ -145,17 +145,6 @@ class Dsv4Handler(DefaultMoeHandler):
 
         return [name for name, _ in model.named_parameters() if include(name)]
 
-    def to_vllm_lora_tensors(
-        self,
-        tensors: dict[str, torch.Tensor],
-        *,
-        adapter_config: dict[str, Any],
-    ) -> tuple[dict[str, torch.Tensor], dict[str, Any]]:
-        from art.megatron.dsv4.kernel.tilelang_import import sanitize_tilelang_env
-
-        sanitize_tilelang_env()
-        return tensors, adapter_config
-
     def install_preprocess_patch(self, model_chunks: Sequence[Any]) -> None:
         from megatron.core.models.gpt.gpt_model import GPTModel
 
