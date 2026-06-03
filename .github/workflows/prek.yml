@@ -10,7 +10,7 @@ permissions:
 
 env:
   CI_BASE_IMAGE: "pytorch/pytorch:2.9.0-cuda12.8-cudnn9-devel"
-  CI_PYTHON_MM: "3.11"
+  CI_PYTHON_MM: "3.12"
   CI_UV_CACHE_RELEASE_TAG: "prek-uv-cache"
   CI_UV_CACHE_ASSET_PREFIX: "prek-uv-cache"
   CI_APEX_PARALLEL_BUILD: "8"
@@ -211,8 +211,7 @@ jobs:
           }
           trap cleanup EXIT
 
-          py_mm="$(python -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")')"
-          cudnn_path="${GITHUB_WORKSPACE}/.venv/lib/python${py_mm}/site-packages/nvidia/cudnn"
+          cudnn_path="${GITHUB_WORKSPACE}/.venv/lib/python${CI_PYTHON_MM}/site-packages/nvidia/cudnn"
           export CUDNN_PATH="${cudnn_path}"
           export CUDNN_HOME="${cudnn_path}"
           export CUDNN_INCLUDE_PATH="${cudnn_path}/include"
@@ -230,7 +229,7 @@ jobs:
             --apex-nvcc-threads "${CI_APEX_NVCC_THREADS}"
           echo "CI uv build overrides: APEX_PARALLEL_BUILD=${CI_APEX_PARALLEL_BUILD}, NVCC_APPEND_FLAGS=--threads ${CI_APEX_NVCC_THREADS}, UV_CONCURRENT_BUILDS=${CI_UV_BUILD_SLOTS}"
           uv --version
-          uv sync --all-extras --group dev --frozen
+          uv sync --all-extras --group dev --frozen --python "${CI_PYTHON_MM}"
 
       - name: Run prek hooks (lint, format, typecheck, uv.lock, tests)
         run: |

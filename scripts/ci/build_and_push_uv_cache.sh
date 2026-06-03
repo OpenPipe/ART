@@ -5,7 +5,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 
 BASE_IMAGE="${BASE_IMAGE:-pytorch/pytorch:2.9.0-cuda12.8-cudnn9-devel}"
-PYTHON_MM="${PYTHON_MM:-3.11}"
+PYTHON_MM="${PYTHON_MM:-3.12}"
 UV_CACHE_RELEASE_TAG="${UV_CACHE_RELEASE_TAG:-prek-uv-cache}"
 UV_CACHE_ASSET_PREFIX="${UV_CACHE_ASSET_PREFIX:-prek-uv-cache}"
 BUILD_JOBS="${BUILD_JOBS:-auto}"
@@ -36,7 +36,7 @@ Description:
 
 Options:
   --base-image <image>     CI base image metadata for fingerprint computation
-  --python-mm <mm>         Python major.minor used in CI (default: 3.11)
+  --python-mm <mm>         Python major.minor used in CI (default: 3.12)
   --build-jobs <n|auto>    Parallel native-build jobs while prebuilding cache (default: auto)
   --release-tag <tag>      GitHub release tag used to store cache assets (default: prek-uv-cache)
   --asset-prefix <prefix>  Asset prefix for cache archive names (default: prek-uv-cache)

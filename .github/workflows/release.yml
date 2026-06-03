@@ -34,7 +34,7 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: "3.11"
+          python-version: "3.12"
 
       - name: Install uv
         run: |
@@ -63,7 +63,7 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: "3.11"
+          python-version: "3.12"
 
       - name: Install uv
         run: |
@@ -89,7 +89,7 @@ jobs:
 
           project_dir="$(mktemp -d)"
           cd "$project_dir"
-          uv init --name art-runtime-smoke --python 3.11 --bare
+          uv init --name art-runtime-smoke --python 3.12 --bare
           uv add "openpipe-art[backend] @ file://${wheel_path}"
           uv sync
           uv run python - <<'PY'
@@ -163,7 +163,7 @@ jobs:
         if: inputs.artifact_run_id == ''
         uses: actions/setup-python@v5
         with:
-          python-version: "3.11"
+          python-version: "3.12"
 
       - name: Install uv
         if: inputs.artifact_run_id == ''

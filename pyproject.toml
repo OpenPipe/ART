@@ -191,7 +191,7 @@ requires-dist = [
 ]
 
 [tool.ty.environment]
-python-version = "3.11"
+python-version = "3.12"
 
 [tool.ty.rules]
 # Ignore unused-ignore-comment warnings because they vary depending on whether
