@@ -783,7 +783,7 @@ def test_cp_unsupported_moe_suite_uses_cp_free_parallel_topology() -> None:
     assert variants
     assert all(variant.topology.cp == 1 for variant in variants)
     assert any(
-        variant.topology.tp == 2 and variant.topology.ep == 2 for variant in variants
+        variant.topology.ep == 2 and variant.topology.dp == 2 for variant in variants
     )
 
 

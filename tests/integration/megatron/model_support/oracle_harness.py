@@ -222,7 +222,7 @@ TOPOLOGIES = [
 ]
 CP_UNSUPPORTED_MOE_TOPOLOGIES = [
     TOPOLOGIES[0],
-    Topology(tp=2, ep=2, etp=1, dp=1, cp=1, sp=True),
+    Topology(tp=1, ep=2, etp=1, dp=2, cp=1, sp=False),
 ]
 DENSE_TOPOLOGIES = [
     Topology(tp=1, ep=1, etp=1, dp=1, sp=False),
