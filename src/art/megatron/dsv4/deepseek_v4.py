@@ -371,6 +371,7 @@ class DeepSeekV4Attention(MegatronModule):
                 group_ids=group_ids,
                 parent_ids=parent_ids,
                 ratio=ratio,
+                duplicate_prompt_entries=ratio == 4,
             )
 
         q_after_wq_a = _add_lora_if_present(self, "wq_a_lora", self.wq_a(x)[0], x)

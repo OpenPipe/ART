@@ -21,6 +21,7 @@ class Dsv4CompressionLayout(NamedTuple):
     current_indices: torch.Tensor
     previous_indices: torch.Tensor
     entry_group_ids: torch.Tensor
+    entry_parent_visible: torch.Tensor
     entry_start_positions: torch.Tensor
     entry_end_positions: torch.Tensor
     entry_valid: torch.Tensor
@@ -53,6 +54,7 @@ def build_shared_prefix_compression_layout(
     group_ids: torch.Tensor,
     parent_ids: torch.Tensor,
     ratio: int,
+    duplicate_prompt_entries: bool = False,
 ) -> Dsv4CompressionLayout:
     device = position_ids.device
     bsz, seqlen = position_ids.shape
@@ -62,6 +64,7 @@ def build_shared_prefix_compression_layout(
     current_rows: list[list[list[int]]] = []
     previous_rows: list[list[list[int]]] = []
     group_rows: list[list[int]] = []
+    parent_visible_rows: list[list[bool]] = []
     start_rows: list[list[int]] = []
     end_rows: list[list[int]] = []
 
@@ -84,8 +87,25 @@ def build_shared_prefix_compression_layout(
         row_current: list[list[int]] = []
         row_previous: list[list[int]] = []
         row_groups: list[int] = []
+        row_parent_visible: list[bool] = []
         row_starts: list[int] = []
         row_ends: list[int] = []
+
+        def append_entry(
+            *,
+            entry_group: int,
+            parent_visible: bool,
+            current_indices: list[int],
+            previous_indices: list[int],
+            logical_start: int,
+        ) -> None:
+            row_current.append(current_indices)
+            row_previous.append(previous_indices)
+            row_groups.append(entry_group)
+            row_parent_visible.append(parent_visible)
+            row_starts.append(logical_start)
+            row_ends.append(logical_start + ratio - 1)
+
         seg_idx = 0
         while seg_idx < len(segments):
             group, parent, prompt_start, prompt_end, _, _ = segments[seg_idx]
@@ -94,28 +114,32 @@ def build_shared_prefix_compression_layout(
                 continue
             prompt_len = prompt_end - prompt_start
             shared_usable = (prompt_len // ratio) * ratio
+            shared_windows: list[tuple[list[int], list[int], int]] = []
             for logical_start in range(0, shared_usable, ratio):
-                row_current.append(
-                    _logical_window_indices(
-                        prompt_start=prompt_start,
-                        prompt_len=prompt_len,
-                        completion_start=None,
-                        logical_start=logical_start,
-                        ratio=ratio,
-                    )
+                current_indices = _logical_window_indices(
+                    prompt_start=prompt_start,
+                    prompt_len=prompt_len,
+                    completion_start=None,
+                    logical_start=logical_start,
+                    ratio=ratio,
                 )
-                row_previous.append(
-                    _logical_window_indices(
-                        prompt_start=prompt_start,
-                        prompt_len=prompt_len,
-                        completion_start=None,
-                        logical_start=logical_start - ratio,
-                        ratio=ratio,
-                    )
+                previous_indices = _logical_window_indices(
+                    prompt_start=prompt_start,
+                    prompt_len=prompt_len,
+                    completion_start=None,
+                    logical_start=logical_start - ratio,
+                    ratio=ratio,
                 )
-                row_groups.append(group)
-                row_starts.append(logical_start)
-                row_ends.append(logical_start + ratio - 1)
+                shared_windows.append(
+                    (current_indices, previous_indices, logical_start)
+                )
+                append_entry(
+                    entry_group=group,
+                    parent_visible=not duplicate_prompt_entries,
+                    current_indices=current_indices,
+                    previous_indices=previous_indices,
+                    logical_start=logical_start,
+                )
 
             child_idx = seg_idx + 1
             while child_idx < len(segments):
@@ -124,37 +148,49 @@ def build_shared_prefix_compression_layout(
                 ]
                 if child_group == child_parent or child_parent != group:
                     break
+                if duplicate_prompt_entries:
+                    for (
+                        current_indices,
+                        previous_indices,
+                        logical_start,
+                    ) in shared_windows:
+                        append_entry(
+                            entry_group=child_group,
+                            parent_visible=False,
+                            current_indices=current_indices,
+                            previous_indices=previous_indices,
+                            logical_start=logical_start,
+                        )
                 branch_usable = ((child_end_pos + 1) // ratio) * ratio
                 for logical_start in range(0, branch_usable, ratio):
                     if logical_start + ratio <= prompt_len:
                         continue
-                    row_current.append(
-                        _logical_window_indices(
+                    append_entry(
+                        entry_group=child_group,
+                        parent_visible=False,
+                        current_indices=_logical_window_indices(
                             prompt_start=prompt_start,
                             prompt_len=prompt_len,
                             completion_start=child_start,
                             logical_start=logical_start,
                             ratio=ratio,
-                        )
-                    )
-                    row_previous.append(
-                        _logical_window_indices(
+                        ),
+                        previous_indices=_logical_window_indices(
                             prompt_start=prompt_start,
                             prompt_len=prompt_len,
                             completion_start=child_start,
                             logical_start=logical_start - ratio,
                             ratio=ratio,
-                        )
+                        ),
+                        logical_start=logical_start,
                     )
-                    row_groups.append(child_group)
-                    row_starts.append(logical_start)
-                    row_ends.append(logical_start + ratio - 1)
                 child_idx += 1
             seg_idx = child_idx
 
         current_rows.append(row_current)
         previous_rows.append(row_previous)
         group_rows.append(row_groups)
+        parent_visible_rows.append(row_parent_visible)
         start_rows.append(row_starts)
         end_rows.append(row_ends)
 
@@ -162,6 +198,7 @@ def build_shared_prefix_compression_layout(
     current = torch.full((bsz, max_entries, ratio), -1, dtype=torch.long, device=device)
     previous = torch.full_like(current, -1)
     entry_groups = torch.full((bsz, max_entries), -1, dtype=torch.long, device=device)
+    parent_visible = torch.zeros((bsz, max_entries), dtype=torch.bool, device=device)
     starts = torch.full_like(entry_groups, -1)
     ends = torch.full_like(entry_groups, -1)
     valid = torch.zeros((bsz, max_entries), dtype=torch.bool, device=device)
@@ -176,10 +213,21 @@ def build_shared_prefix_compression_layout(
         entry_groups[b, :count] = torch.tensor(
             group_rows[b], dtype=torch.long, device=device
         )
+        parent_visible[b, :count] = torch.tensor(
+            parent_visible_rows[b], dtype=torch.bool, device=device
+        )
         starts[b, :count] = torch.tensor(start_rows[b], dtype=torch.long, device=device)
         ends[b, :count] = torch.tensor(end_rows[b], dtype=torch.long, device=device)
         valid[b, :count] = True
-    return Dsv4CompressionLayout(current, previous, entry_groups, starts, ends, valid)
+    return Dsv4CompressionLayout(
+        current,
+        previous,
+        entry_groups,
+        parent_visible,
+        starts,
+        ends,
+        valid,
+    )
 
 
 def compressed_layout_visibility(
@@ -197,10 +245,11 @@ def compressed_layout_visibility(
     q_group = group_ids[:, q_start:q_end].to(dtype=torch.long).unsqueeze(-1)
     q_parent = parent_ids[:, q_start:q_end].to(dtype=torch.long).unsqueeze(-1)
     entry_group = layout.entry_group_ids.unsqueeze(1)
+    parent_visible = layout.entry_parent_visible.unsqueeze(1)
     return (
         layout.entry_valid.unsqueeze(1)
         & (layout.entry_end_positions.unsqueeze(1) <= q_pos)
-        & ((entry_group == q_group) | (entry_group == q_parent))
+        & ((entry_group == q_group) | (parent_visible & (entry_group == q_parent)))
     )
 
 
