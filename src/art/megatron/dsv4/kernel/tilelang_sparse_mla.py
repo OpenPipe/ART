@@ -7,23 +7,6 @@ def _sparse_attn_torch(q, kv, attn_sink, topk_idxs, sm_scale):
     if sm_scale is None:
         sm_scale = q.shape[-1] ** -0.5
     bsz, seqlen, _, dim = q.shape
-    if q.dtype is torch.float32:
-        scores = torch.einsum("bshd,btd->bsht", q.float(), kv.float())
-        scores = scores * float(sm_scale)
-        valid = torch.zeros(
-            bsz, seqlen, kv.shape[1] + 1, device=topk_idxs.device, dtype=torch.bool
-        )
-        sentinel = torch.full_like(topk_idxs, kv.shape[1])
-        valid.scatter_(2, torch.where(topk_idxs >= 0, topk_idxs, sentinel).long(), True)
-        valid = valid[..., : kv.shape[1]]
-        scores = scores.masked_fill(~valid.unsqueeze(2), float("-inf"))
-        sinks = attn_sink.view(1, 1, -1, 1).expand(bsz, seqlen, -1, -1)
-        combined_logits = torch.cat([scores, sinks], dim=-1)
-        combined_logits = (
-            combined_logits - combined_logits.max(dim=-1, keepdim=True).values
-        )
-        probs = torch.softmax(combined_logits, dim=-1, dtype=combined_logits.dtype)
-        return torch.einsum("bsht,btd->bshd", probs[..., :-1], kv.float())
     safe_idxs = topk_idxs.clamp_min(0)
     selected_kv = torch.gather(
         kv[:, None].expand(-1, seqlen, -1, -1),
