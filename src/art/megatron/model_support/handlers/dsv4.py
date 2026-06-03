@@ -24,6 +24,10 @@ _ORACLE_INDEX_HEADS = 1
 _ORACLE_INDEX_TOPK = 1024
 _VALIDATION_NUM_LAYERS_ENV = "ART_DSV4_VALIDATION_NUM_LAYERS"
 _ORACLE_EXPERT_WEIGHT_RE = re.compile(r"\.mlp\.experts\..*\.weight(?P<expert>\d+)$")
+_DSV4_VLLM_MOE_KEY_RE = re.compile(
+    r"^(?P<prefix>.*\.mlp\.experts)\."
+    r"(?:(?P<base_layer>base_layer)\.)?(?P<lora>lora_[AB])\.weight$"
+)
 _DSV4_MOE_COMPILE_WORKAROUND_FLAGS = (
     "alltoall_dtoh",
     "alltoall_dispatch_preprocess",
@@ -308,6 +312,17 @@ class Dsv4Handler(DefaultMoeHandler):
                         shared_experts=module.mlp.shared_experts,
                     )
         return adapter_weights_by_base
+
+    def from_vllm_lora_tensors(
+        self,
+        tensors: dict[str, torch.Tensor],
+        *,
+        adapter_config: dict[str, Any],
+    ) -> dict[str, torch.Tensor]:
+        return _dsv4_from_vllm_lora_tensors(
+            tensors,
+            adapter_config=adapter_config,
+        )
 
     def compile_workaround_config(self, provider: Any) -> CompileWorkaroundConfig:
         return CompileWorkaroundConfig(
@@ -608,3 +623,107 @@ def _dsv4_source_to_hf_key_mapping() -> dict[str, str]:
             rf"{target}.self_attn.compressor.indexer.kv_norm.weight"
         ),
     }
+
+
+def _dsv4_unpack_vllm_3d_lora_b(
+    tensor: torch.Tensor,
+    *,
+    num_experts: int,
+    rank: int,
+) -> torch.Tensor:
+    return tensor.reshape(tensor.shape[0], rank, num_experts).permute(2, 0, 1)
+
+
+def _dsv4_clone(tensor: torch.Tensor) -> torch.Tensor:
+    return tensor.clone().contiguous()
+
+
+def _dsv4_from_vllm_lora_key(key: str) -> str:
+    return key.replace(".mlp.shared_experts.", ".mlp.shared_expert.", 1)
+
+
+def _dsv4_from_vllm_lora_tensors(
+    tensors: dict[str, torch.Tensor],
+    *,
+    adapter_config: dict[str, Any],
+) -> dict[str, torch.Tensor]:
+    grouped: dict[str, dict[str, torch.Tensor]] = {}
+    for key, tensor in tensors.items():
+        match = _DSV4_VLLM_MOE_KEY_RE.match(key)
+        if match is None:
+            continue
+        slot = (
+            f"{'base_layer.' if match.group('base_layer') else ''}{match.group('lora')}"
+        )
+        grouped.setdefault(match.group("prefix"), {})[slot] = tensor
+    if not grouped:
+        return {
+            _dsv4_from_vllm_lora_key(key): tensor for key, tensor in tensors.items()
+        }
+
+    rank = int(adapter_config["r"])
+    transformed: dict[str, torch.Tensor] = {}
+    used_keys: set[str] = set()
+    for prefix, slots in grouped.items():
+        try:
+            gate_up_a = slots["base_layer.lora_A"]
+            gate_up_b = slots["base_layer.lora_B"]
+            down_a = slots["lora_A"]
+            down_b = slots["lora_B"]
+        except KeyError as exc:
+            raise RuntimeError(
+                f"Incomplete DSV4 vLLM MoE LoRA block for {prefix}"
+            ) from exc
+        if gate_up_a.shape[0] % rank != 0:
+            raise RuntimeError(
+                f"{prefix}: gate/up lora_A rows {gate_up_a.shape[0]} are not "
+                f"divisible by rank {rank}"
+            )
+        if gate_up_b.shape[0] % 2 != 0:
+            raise RuntimeError(
+                f"{prefix}: gate/up lora_B rows {gate_up_b.shape[0]} are not even"
+            )
+        num_experts = gate_up_a.shape[0] // rank
+        gate_up_b_by_expert = _dsv4_unpack_vllm_3d_lora_b(
+            gate_up_b,
+            num_experts=num_experts,
+            rank=rank,
+        )
+        down_b_by_expert = _dsv4_unpack_vllm_3d_lora_b(
+            down_b,
+            num_experts=num_experts,
+            rank=rank,
+        )
+        for expert in range(num_experts):
+            row = expert * rank
+            gate_up_a_block = gate_up_a[row : row + rank]
+            down_a_block = down_a[row : row + rank]
+            gate_b, up_b = gate_up_b_by_expert[expert].chunk(2, dim=0)
+            transformed[f"{prefix}.{expert}.gate_proj.lora_A.weight"] = _dsv4_clone(
+                gate_up_a_block
+            )
+            transformed[f"{prefix}.{expert}.gate_proj.lora_B.weight"] = _dsv4_clone(
+                gate_b
+            )
+            transformed[f"{prefix}.{expert}.up_proj.lora_A.weight"] = _dsv4_clone(
+                gate_up_a_block
+            )
+            transformed[f"{prefix}.{expert}.up_proj.lora_B.weight"] = _dsv4_clone(up_b)
+            transformed[f"{prefix}.{expert}.down_proj.lora_A.weight"] = _dsv4_clone(
+                down_a_block
+            )
+            transformed[f"{prefix}.{expert}.down_proj.lora_B.weight"] = _dsv4_clone(
+                down_b_by_expert[expert]
+            )
+        used_keys.update(
+            {
+                f"{prefix}.base_layer.lora_A.weight",
+                f"{prefix}.base_layer.lora_B.weight",
+                f"{prefix}.lora_A.weight",
+                f"{prefix}.lora_B.weight",
+            }
+        )
+    for key, tensor in tensors.items():
+        if key not in used_keys:
+            transformed[_dsv4_from_vllm_lora_key(key)] = tensor
+    return transformed
