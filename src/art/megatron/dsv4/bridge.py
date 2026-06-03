@@ -36,21 +36,68 @@ _DSV4_FP4_TABLE = (
 )
 
 _DSV4_FUSED_EXPORT_SPECS = (
-    (".attn.wq_a.weight", ".attn.wkv.weight", ".attn.fused_wqa_wkv.weight"),
     (
-        ".attn.compressor.wkv.weight",
-        ".attn.compressor.wgate.weight",
+        ".self_attn.q_a_proj.weight",
+        ".self_attn.kv_proj.weight",
+        ".attn.fused_wqa_wkv.weight",
+    ),
+    (
+        ".self_attn.compressor.kv_proj.weight",
+        ".self_attn.compressor.gate_proj.weight",
         ".attn.compressor.fused_wkv_wgate.weight",
     ),
     (
-        ".attn.indexer.compressor.wkv.weight",
-        ".attn.indexer.compressor.wgate.weight",
+        ".self_attn.compressor.indexer.kv_proj.weight",
+        ".self_attn.compressor.indexer.gate_proj.weight",
         ".attn.indexer.compressor.fused_wkv_wgate.weight",
     ),
     (
-        ".ffn.shared_experts.gate_proj.weight",
-        ".ffn.shared_experts.up_proj.weight",
+        ".mlp.shared_experts.gate_proj.weight",
+        ".mlp.shared_experts.up_proj.weight",
         ".ffn.shared_experts.gate_up_proj.weight",
+    ),
+)
+
+_DSV4_RENAMED_EXPORT_SUFFIXES = (
+    ("lm_head.weight", "head.weight"),
+    ("model.hc_head.hc_fn", "model.hc_head_fn"),
+    ("model.hc_head.hc_base", "model.hc_head_base"),
+    ("model.hc_head.hc_scale", "model.hc_head_scale"),
+    (".input_layernorm.weight", ".attn_norm.weight"),
+    (".post_attention_layernorm.weight", ".ffn_norm.weight"),
+    (".attn_hc.fn", ".hc_attn_fn"),
+    (".attn_hc.base", ".hc_attn_base"),
+    (".attn_hc.scale", ".hc_attn_scale"),
+    (".ffn_hc.fn", ".hc_ffn_fn"),
+    (".ffn_hc.base", ".hc_ffn_base"),
+    (".ffn_hc.scale", ".hc_ffn_scale"),
+    (".mlp.gate.weight", ".ffn.gate.weight"),
+    (".mlp.gate.tid2eid", ".ffn.gate.tid2eid"),
+    (".mlp.gate.e_score_correction_bias", ".ffn.gate.bias"),
+    (".mlp.shared_experts.down_proj.weight", ".ffn.shared_experts.w2.weight"),
+    (".self_attn.q_a_norm.weight", ".attn.q_norm.weight"),
+    (".self_attn.q_b_proj.weight", ".attn.wq_b.weight"),
+    (".self_attn.kv_norm.weight", ".attn.kv_norm.weight"),
+    (".self_attn.o_a_proj.weight", ".attn.wo_a.weight"),
+    (".self_attn.o_b_proj.weight", ".attn.wo_b.weight"),
+    (".self_attn.sinks", ".attn.attn_sink"),
+    (".self_attn.compressor.position_bias", ".attn.compressor.ape"),
+    (".self_attn.compressor.kv_norm.weight", ".attn.compressor.norm.weight"),
+    (
+        ".self_attn.compressor.indexer.q_b_proj.weight",
+        ".attn.indexer.wq_b.weight",
+    ),
+    (
+        ".self_attn.compressor.indexer.weights_proj.weight",
+        ".attn.indexer.weights_proj.weight",
+    ),
+    (
+        ".self_attn.compressor.indexer.position_bias",
+        ".attn.indexer.compressor.ape",
+    ),
+    (
+        ".self_attn.compressor.indexer.kv_norm.weight",
+        ".attn.indexer.compressor.norm.weight",
     ),
 )
 
@@ -153,6 +200,23 @@ def _is_dsv4_routed_expert_weight(name: str) -> bool:
     )
 
 
+def _dsv4_canonical_expert_source_name(name: str) -> str | None:
+    replacements = {
+        ".gate_proj.weight": ".w1.weight",
+        ".up_proj.weight": ".w3.weight",
+        ".down_proj.weight": ".w2.weight",
+    }
+    if ".mlp.experts." not in name:
+        return None
+    for canonical, source in replacements.items():
+        if name.endswith(canonical):
+            return (
+                name.replace(".mlp.experts.", ".ffn.experts.").removesuffix(canonical)
+                + source
+            )
+    return None
+
+
 def _is_dsv4_hash_router_table(name: str) -> bool:
     return name.endswith(".ffn.gate.tid2eid")
 
@@ -197,6 +261,13 @@ def _concat_dsv4_fused_export_parts(
             f"{tuple(first.shape)} vs {tuple(second.shape)}."
         )
     return torch.cat((first, second), dim=0).contiguous()
+
+
+def _dsv4_source_export_name(name: str) -> str:
+    for canonical, source in _DSV4_RENAMED_EXPORT_SUFFIXES:
+        if name.endswith(canonical):
+            return f"{name.removesuffix(canonical)}{source}"
+    return name
 
 
 def _load_dsv4_hf_tensor(
@@ -382,14 +453,18 @@ def _art_dsv4_expert_mapping_types() -> tuple[type[Any], type[Any]]:
             megatron_param: str,
             gate: str,
             up: str,
-            export_hf_param: str,
+            export_gate: str,
+            export_up: str,
         ):
             super().__init__(megatron_param, gate, up)
-            self.export_hf_param = export_hf_param
+            self.export_hf_param = {
+                "gate": export_gate,
+                "up": export_up,
+            }
 
         @property
         def group_key(self) -> str:
-            return self.export_hf_param
+            return cast(dict[str, str], self.export_hf_param)["gate"]
 
         def hf_to_megatron(
             self,
@@ -438,6 +513,7 @@ def _art_dsv4_expert_mapping_types() -> tuple[type[Any], type[Any]]:
             hf_param = cast(dict[str, str], self.hf_param)
             gate_suffix = hf_param["gate"].rpartition(".experts.")[2].split(".", 1)[1]
             remapped: dict[str, torch.Tensor] = {}
+            export = cast(dict[str, str], self.export_hf_param)
             for gate_key, gate in converted.items():
                 if not gate_key.endswith(gate_suffix):
                     continue
@@ -449,19 +525,22 @@ def _art_dsv4_expert_mapping_types() -> tuple[type[Any], type[Any]]:
                         f"Missing DSV4 gathered expert up weight {up_key} "
                         f"for gate weight {gate_key}."
                     )
-                remapped[_set_dsv4_expert_id(self.export_hf_param, expert_id)] = (
-                    torch.cat([gate, up], dim=0)
-                )
+                remapped[_set_dsv4_expert_id(export["gate"], expert_id)] = gate
+                remapped[_set_dsv4_expert_id(export["up"], expert_id)] = up
             return remapped
 
         def resolve(self, captures: tuple[str, ...]):
             resolved_megatron_param, resolved_hf_param = self._resolve_names(captures)
             resolved_hf_param = cast(dict[str, str], resolved_hf_param)
+            resolved_export = cast(
+                dict[str, str], _resolve_dsv4_hf_param(self.export_hf_param, captures)
+            )
             return type(self)(
                 resolved_megatron_param,
                 resolved_hf_param["gate"],
                 resolved_hf_param["up"],
-                cast(str, _resolve_dsv4_hf_param(self.export_hf_param, captures)),
+                resolved_export["gate"],
+                resolved_export["up"],
             )
 
     class _ArtDsv4ExpertDownMapping(AutoMapping):
@@ -583,187 +662,188 @@ def _dsv4_mapping_registry() -> MegatronMappingRegistry:
         _Dsv4AutoMapping(
             "decoder.layers.*.input_layernorm.weight",
             "layers.*.attn_norm.weight",
-            "model.layers.*.attn_norm.weight",
+            "model.layers.*.input_layernorm.weight",
         ),
         _Dsv4AutoMapping(
             "decoder.layers.*.pre_mlp_layernorm.weight",
             "layers.*.ffn_norm.weight",
-            "model.layers.*.ffn_norm.weight",
+            "model.layers.*.post_attention_layernorm.weight",
         ),
         _Dsv4AutoMapping(
             "decoder.layers.*.mlp.router.weight",
             "layers.*.ffn.gate.weight",
-            "model.layers.*.ffn.gate.weight",
+            "model.layers.*.mlp.gate.weight",
         ),
         _Dsv4AutoMapping(
             "decoder.layers.*.mlp.router.tid2eid",
             "layers.*.ffn.gate.tid2eid",
-            "model.layers.*.ffn.gate.tid2eid",
+            "model.layers.*.mlp.gate.tid2eid",
         ),
         _Dsv4AutoMapping(
             "decoder.layers.*.mlp.router.e_score_correction_bias",
             "layers.*.ffn.gate.bias",
-            "model.layers.*.ffn.gate.bias",
+            "model.layers.*.mlp.gate.e_score_correction_bias",
         ),
         expert_down_mapping(
             "decoder.layers.*.mlp.experts.linear_fc2.weight*",
             "layers.*.ffn.experts.*.w2.weight",
-            "model.layers.*.ffn.experts.*.w2.weight",
+            "model.layers.*.mlp.experts.*.down_proj.weight",
         ),
         _Dsv4AutoMapping(
             "decoder.layers.*.mlp.shared_experts.linear_fc2.weight",
             "layers.*.ffn.shared_experts.w2.weight",
-            "model.layers.*.ffn.shared_experts.w2.weight",
+            "model.layers.*.mlp.shared_experts.down_proj.weight",
         ),
         _Dsv4AutoMapping("decoder.final_layernorm.weight", "model.norm.weight"),
         _Dsv4AutoMapping(
             "decoder.final_layernorm.hc_head_params.hc_head_fn",
             "hc_head_fn",
-            "model.hc_head_fn",
+            "model.hc_head.hc_fn",
         ),
         _Dsv4AutoMapping(
             "decoder.final_layernorm.hc_head_params.hc_head_base",
             "hc_head_base",
-            "model.hc_head_base",
+            "model.hc_head.hc_base",
         ),
         _Dsv4AutoMapping(
             "decoder.final_layernorm.hc_head_params.hc_head_scale",
             "hc_head_scale",
-            "model.hc_head_scale",
+            "model.hc_head.hc_scale",
         ),
-        _Dsv4AutoMapping("output_layer.weight", "head.weight"),
+        _Dsv4AutoMapping("output_layer.weight", "head.weight", "lm_head.weight"),
         _Dsv4AutoMapping(
             "decoder.layers.*.hc_attn_fn",
             "layers.*.hc_attn_fn",
-            "model.layers.*.hc_attn_fn",
+            "model.layers.*.attn_hc.fn",
         ),
         _Dsv4AutoMapping(
             "decoder.layers.*.hc_attn_base",
             "layers.*.hc_attn_base",
-            "model.layers.*.hc_attn_base",
+            "model.layers.*.attn_hc.base",
         ),
         _Dsv4AutoMapping(
             "decoder.layers.*.hc_attn_scale",
             "layers.*.hc_attn_scale",
-            "model.layers.*.hc_attn_scale",
+            "model.layers.*.attn_hc.scale",
         ),
         _Dsv4AutoMapping(
             "decoder.layers.*.hc_ffn_fn",
             "layers.*.hc_ffn_fn",
-            "model.layers.*.hc_ffn_fn",
+            "model.layers.*.ffn_hc.fn",
         ),
         _Dsv4AutoMapping(
             "decoder.layers.*.hc_ffn_base",
             "layers.*.hc_ffn_base",
-            "model.layers.*.hc_ffn_base",
+            "model.layers.*.ffn_hc.base",
         ),
         _Dsv4AutoMapping(
             "decoder.layers.*.hc_ffn_scale",
             "layers.*.hc_ffn_scale",
-            "model.layers.*.hc_ffn_scale",
+            "model.layers.*.ffn_hc.scale",
         ),
         _Dsv4AutoMapping(
             "decoder.layers.*.self_attention.wq_a.weight",
             "layers.*.attn.wq_a.weight",
-            "model.layers.*.attn.wq_a.weight",
+            "model.layers.*.self_attn.q_a_proj.weight",
         ),
         _Dsv4AutoMapping(
             "decoder.layers.*.self_attention.q_norm.weight",
             "layers.*.attn.q_norm.weight",
-            "model.layers.*.attn.q_norm.weight",
+            "model.layers.*.self_attn.q_a_norm.weight",
         ),
         _Dsv4AutoMapping(
             "decoder.layers.*.self_attention.wq_b.weight",
             "layers.*.attn.wq_b.weight",
-            "model.layers.*.attn.wq_b.weight",
+            "model.layers.*.self_attn.q_b_proj.weight",
         ),
         _Dsv4AutoMapping(
             "decoder.layers.*.self_attention.wkv.weight",
             "layers.*.attn.wkv.weight",
-            "model.layers.*.attn.wkv.weight",
+            "model.layers.*.self_attn.kv_proj.weight",
         ),
         _Dsv4AutoMapping(
             "decoder.layers.*.self_attention.kv_norm.weight",
             "layers.*.attn.kv_norm.weight",
-            "model.layers.*.attn.kv_norm.weight",
+            "model.layers.*.self_attn.kv_norm.weight",
         ),
         _Dsv4AutoMapping(
             "decoder.layers.*.self_attention.wo_a.weight",
             "layers.*.attn.wo_a.weight",
-            "model.layers.*.attn.wo_a.weight",
+            "model.layers.*.self_attn.o_a_proj.weight",
         ),
         _Dsv4AutoMapping(
             "decoder.layers.*.self_attention.wo_b.weight",
             "layers.*.attn.wo_b.weight",
-            "model.layers.*.attn.wo_b.weight",
+            "model.layers.*.self_attn.o_b_proj.weight",
         ),
         _Dsv4AutoMapping(
             "decoder.layers.*.self_attention.attn_sink",
             "layers.*.attn.attn_sink",
-            "model.layers.*.attn.attn_sink",
+            "model.layers.*.self_attn.sinks",
         ),
         _Dsv4AutoMapping(
             "decoder.layers.*.self_attention.compressor.ape",
             "layers.*.attn.compressor.ape",
-            "model.layers.*.attn.compressor.ape",
+            "model.layers.*.self_attn.compressor.position_bias",
         ),
         _Dsv4ReplicatedMapping(
             "decoder.layers.*.self_attention.compressor.wkv.weight",
             "layers.*.attn.compressor.wkv.weight",
-            "model.layers.*.attn.compressor.wkv.weight",
+            "model.layers.*.self_attn.compressor.kv_proj.weight",
         ),
         _Dsv4ReplicatedMapping(
             "decoder.layers.*.self_attention.compressor.wgate.weight",
             "layers.*.attn.compressor.wgate.weight",
-            "model.layers.*.attn.compressor.wgate.weight",
+            "model.layers.*.self_attn.compressor.gate_proj.weight",
         ),
         _Dsv4AutoMapping(
             "decoder.layers.*.self_attention.compressor.norm.weight",
             "layers.*.attn.compressor.norm.weight",
-            "model.layers.*.attn.compressor.norm.weight",
+            "model.layers.*.self_attn.compressor.kv_norm.weight",
         ),
         _Dsv4AutoMapping(
             "decoder.layers.*.self_attention.indexer.linear_wq_b.weight",
             "layers.*.attn.indexer.wq_b.weight",
-            "model.layers.*.attn.indexer.wq_b.weight",
+            "model.layers.*.self_attn.compressor.indexer.q_b_proj.weight",
         ),
         _Dsv4AutoMapping(
             "decoder.layers.*.self_attention.indexer.linear_weights_proj.weight",
             "layers.*.attn.indexer.weights_proj.weight",
-            "model.layers.*.attn.indexer.weights_proj.weight",
+            "model.layers.*.self_attn.compressor.indexer.weights_proj.weight",
         ),
         _Dsv4AutoMapping(
             "decoder.layers.*.self_attention.indexer.compressor.ape",
             "layers.*.attn.indexer.compressor.ape",
-            "model.layers.*.attn.indexer.compressor.ape",
+            "model.layers.*.self_attn.compressor.indexer.position_bias",
         ),
         _Dsv4ReplicatedMapping(
             "decoder.layers.*.self_attention.indexer.compressor.wkv.weight",
             "layers.*.attn.indexer.compressor.wkv.weight",
-            "model.layers.*.attn.indexer.compressor.wkv.weight",
+            "model.layers.*.self_attn.compressor.indexer.kv_proj.weight",
         ),
         _Dsv4ReplicatedMapping(
             "decoder.layers.*.self_attention.indexer.compressor.wgate.weight",
             "layers.*.attn.indexer.compressor.wgate.weight",
-            "model.layers.*.attn.indexer.compressor.wgate.weight",
+            "model.layers.*.self_attn.compressor.indexer.gate_proj.weight",
         ),
         _Dsv4AutoMapping(
             "decoder.layers.*.self_attention.indexer.compressor.norm.weight",
             "layers.*.attn.indexer.compressor.norm.weight",
-            "model.layers.*.attn.indexer.compressor.norm.weight",
+            "model.layers.*.self_attn.compressor.indexer.kv_norm.weight",
         ),
         expert_gate_up_mapping(
             megatron_param="decoder.layers.*.mlp.experts.linear_fc1.weight*",
             gate="layers.*.ffn.experts.*.w1.weight",
             up="layers.*.ffn.experts.*.w3.weight",
-            export_hf_param="model.layers.*.ffn.experts.*.gate_up_proj",
+            export_gate="model.layers.*.mlp.experts.*.gate_proj.weight",
+            export_up="model.layers.*.mlp.experts.*.up_proj.weight",
         ),
         _Dsv4GatedMLPMapping(
             megatron_param="decoder.layers.*.mlp.shared_experts.linear_fc1.weight",
             gate="layers.*.ffn.shared_experts.w1.weight",
             up="layers.*.ffn.shared_experts.w3.weight",
-            export_gate="model.layers.*.ffn.shared_experts.gate_proj.weight",
-            export_up="model.layers.*.ffn.shared_experts.up_proj.weight",
+            export_gate="model.layers.*.mlp.shared_experts.gate_proj.weight",
+            export_up="model.layers.*.mlp.shared_experts.up_proj.weight",
         ),
     ]
     return MegatronMappingRegistry(*mappings)
@@ -881,22 +961,19 @@ class ArtDeepSeekV4Bridge(DeepSeekV3Bridge):
             fused = self._maybe_collect_fused_export(name, weight)
             if fused is not None:
                 remapped.update(fused)
-            elif name.endswith(".gate_up_proj"):
-                if weight.shape[0] % 2 != 0:
-                    raise ValueError(
-                        f"Expected fused DSV4 expert gate/up dim to be even: {name} "
-                        f"has shape {tuple(weight.shape)}."
-                    )
-                gate, up = weight.chunk(2, dim=0)
-                base = name.removesuffix(".gate_up_proj")
-                remapped.update(_export_dsv4_mxfp4_weight(f"{base}.w1.weight", gate))
-                remapped.update(_export_dsv4_mxfp4_weight(f"{base}.w3.weight", up))
-            elif _is_dsv4_routed_expert_weight(name):
-                remapped.update(_export_dsv4_mxfp4_weight(name, weight))
-            elif _is_dsv4_hash_router_table(name):
-                remapped[name] = weight.to(torch.int32).contiguous()
             else:
-                remapped[name] = weight
+                source_expert = _dsv4_canonical_expert_source_name(name)
+                source_name = (
+                    source_expert
+                    if source_expert is not None
+                    else _dsv4_source_export_name(name)
+                )
+                if _is_dsv4_routed_expert_weight(source_name):
+                    remapped.update(_export_dsv4_mxfp4_weight(source_name, weight))
+                elif _is_dsv4_hash_router_table(source_name):
+                    remapped[source_name] = weight.to(torch.int32).contiguous()
+                else:
+                    remapped[source_name] = weight
         return remapped
 
 
