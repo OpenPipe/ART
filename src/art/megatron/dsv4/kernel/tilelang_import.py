@@ -12,6 +12,7 @@ _TILELANG_ENV_KEYS = (
     "TVM_LIBRARY_PATH",
     "TL_CUTLASS_PATH",
     "TL_TEMPLATE_PATH",
+    "TL_COMPOSABLE_KERNEL_PATH",
 )
 
 _TILELANG_PATH_MARKERS = ("/site-packages/tilelang/", "\\site-packages\\tilelang\\")
