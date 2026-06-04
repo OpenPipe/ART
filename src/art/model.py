@@ -1028,6 +1028,7 @@ class Model(
 
 class TrainableModel(Model[ModelConfig, StateType], Generic[ModelConfig, StateType]):
     base_model: str
+    lora_config: dev.LoRAConfig | None = None
     # Override discriminator field for FastAPI serialization
     trainable: bool = True
 
@@ -1045,6 +1046,7 @@ class TrainableModel(Model[ModelConfig, StateType], Generic[ModelConfig, StateTy
         run_id: str | None = None,
         config: ModelConfig | None = None,
         base_model: str,
+        lora_config: dev.LoRAConfig | None = None,
         base_path: str = ".art",
         report_metrics: list[str] | None = None,
         _internal_config: dev.InternalModelConfig | None = None,
@@ -1058,6 +1060,7 @@ class TrainableModel(Model[ModelConfig, StateType], Generic[ModelConfig, StateTy
             id=id,
             config=config,
             base_model=base_model,
+            lora_config=lora_config,
             base_path=base_path,
             report_metrics=report_metrics,
             **kwargs,
@@ -1125,6 +1128,7 @@ class TrainableModel(Model[ModelConfig, StateType], Generic[ModelConfig, StateTy
         id: str | None = None,
         config: None = None,
         base_model: str,
+        lora_config: dev.LoRAConfig | None = None,
         base_path: str = ".art",
         report_metrics: list[str] | None = None,
         _internal_config: dev.InternalModelConfig | None = None,
@@ -1140,6 +1144,7 @@ class TrainableModel(Model[ModelConfig, StateType], Generic[ModelConfig, StateTy
         id: str | None = None,
         config: ModelConfig,
         base_model: str,
+        lora_config: dev.LoRAConfig | None = None,
         base_path: str = ".art",
         report_metrics: list[str] | None = None,
         _internal_config: dev.InternalModelConfig | None = None,

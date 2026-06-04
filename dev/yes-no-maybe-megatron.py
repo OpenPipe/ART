@@ -190,6 +190,7 @@ async def main() -> None:
     max_tokens = int(os.environ.get("MAX_TOKENS", "100"))
     timeout = float(os.environ.get("TIMEOUT", "100"))
     learning_rate = float(os.environ.get("LEARNING_RATE", "1e-4"))
+    lora_rank = os.environ.get("LORA_RANK")
     packed_sequence_length = int(
         os.environ.get(
             "PACKED_SEQUENCE_LENGTH",
@@ -202,6 +203,9 @@ async def main() -> None:
         name=model_name,
         project=project,
         base_model=base_model,
+        lora_config=(
+            art.LoRAConfig(rank=int(lora_rank)) if lora_rank is not None else None
+        ),
         report_metrics=[],
         _internal_config=build_internal_config(),
     )

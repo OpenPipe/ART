@@ -42,8 +42,6 @@ def get_guided_completion_params(
     Given a completion from a teacher model, returns chat completion params that can be used to guide a student model's response.
     Useful for RL-based distillation.
 
-    When guiding the student model's completion, remember to set `num_scheduler_steps` to 1.
-
     Args:
         completion: The completion of a teacher model
         base_tools: The base tools available to the teacher model

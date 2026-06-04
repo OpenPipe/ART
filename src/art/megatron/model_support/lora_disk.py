@@ -5,6 +5,8 @@ from typing import Any
 
 import torch
 
+from art.megatron.model_support.spec import ModelSupportHandler
+
 safetensors = importlib.import_module("safetensors")
 safetensors_torch = importlib.import_module("safetensors.torch")
 safe_open = safetensors.safe_open
@@ -44,10 +46,10 @@ def save_adapter_config(lora_path: str | Path, adapter_config: dict[str, Any]) -
 
 def resolve_lora_handler(
     lora_path: str | Path,
-    handler: Any | None = None,
+    handler: ModelSupportHandler | None = None,
     *,
     allow_unvalidated_arch: bool = False,
-) -> Any:
+) -> ModelSupportHandler:
     if handler is not None:
         return handler
     base_model = load_adapter_config(lora_path).get("base_model_name_or_path")
@@ -83,7 +85,7 @@ def save_vllm_lora_tensors(
 def normalize_lora_checkpoint_to_vllm(
     lora_path: str | Path,
     *,
-    handler: Any | None = None,
+    handler: ModelSupportHandler | None = None,
     adapter_config: dict[str, Any] | None = None,
     allow_unvalidated_arch: bool = False,
 ) -> None:
@@ -108,7 +110,7 @@ def normalize_lora_checkpoint_to_vllm(
 def load_lora_tensors_for_megatron(
     lora_path: str | Path,
     *,
-    handler: Any | None = None,
+    handler: ModelSupportHandler | None = None,
     allow_unvalidated_arch: bool = False,
 ) -> dict[str, torch.Tensor]:
     resolved_handler = resolve_lora_handler(

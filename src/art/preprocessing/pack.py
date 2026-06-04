@@ -27,7 +27,7 @@ class PackedTensors(TypedDict):
     weights: torch.Tensor
     pixel_values: list[torch.Tensor | None]
     image_grid_thw: list[torch.Tensor | None]
-    moe_routing_replay: NotRequired[PackedMoeRoutingReplay]
+    moe_routing_replay: PackedMoeRoutingReplay | None
 
 
 class DiskPackedTensors(TypedDict):
@@ -202,6 +202,7 @@ def packed_tensors_from_tokenized_results(
         "image_grid_thw": [
             torch.concat(tensors) if tensors else None for tensors in image_grid_thw
         ],
+        "moe_routing_replay": None,
     }
     if include_moe_routing:
         (

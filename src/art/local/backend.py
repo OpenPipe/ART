@@ -455,6 +455,7 @@ class LocalBackend(Backend):
                 base_model=model.base_model,
                 output_dir=get_model_dir(model=model, art_path=self._path),
                 config=model._internal_config,
+                lora_config=model.lora_config,
             )
             validate_dedicated_config(config)
             dedicated = is_dedicated_mode(config)

@@ -1,6 +1,10 @@
-from typing import Any, Literal, Protocol, Sequence
+from typing import TYPE_CHECKING, Any, Literal, Protocol, Sequence, runtime_checkable
 
 from pydantic import BaseModel, Field
+
+if TYPE_CHECKING:
+    from megatron.bridge import AutoBridge
+    from megatron.bridge.models.gpt_provider import GPTModelProvider
 
 RolloutWeightsMode = Literal["lora", "merged"]
 NativeVllmLoraStatus = Literal["disabled", "wip", "validated"]
@@ -67,6 +71,7 @@ class ModelSupportSpec(BaseModel):
     dependency_floor: DependencyFloor = Field(default_factory=DependencyFloor)
 
 
+@runtime_checkable
 class ModelSupportHandler(Protocol):
     key: str
     is_moe: bool
@@ -81,20 +86,27 @@ class ModelSupportHandler(Protocol):
         target_modules: list[str],
     ) -> list[str]: ...
 
-    def patch_bridge(self, bridge: Any) -> None: ...
+    def patch_bridge(self, bridge: "AutoBridge") -> None: ...
 
-    def patch_provider(self, provider: Any, bridge: Any) -> None: ...
+    def patch_provider(
+        self,
+        provider: "GPTModelProvider",
+        bridge: "AutoBridge",
+    ) -> None: ...
 
-    def configure_provider_for_runtime(self, provider: Any) -> None: ...
+    def configure_provider_for_runtime(self, provider: "GPTModelProvider") -> None: ...
 
     def install_preprocess_patch(self, model_chunks: Sequence[Any]) -> None: ...
 
-    def collect_layer_families(self, provider: Any) -> list[LayerFamilyInstance]: ...
+    def collect_layer_families(
+        self,
+        provider: "GPTModelProvider",
+    ) -> list[LayerFamilyInstance]: ...
 
     def apply_lora_adapters(
         self,
         model_chunks: Sequence[Any],
-        provider: Any,
+        provider: "GPTModelProvider",
         *,
         target_modules: list[str],
         rank: int,
@@ -124,7 +136,7 @@ class ModelSupportHandler(Protocol):
 
     def compile_workaround_config(
         self,
-        provider: Any,
+        provider: "GPTModelProvider",
     ) -> CompileWorkaroundConfig: ...
 
     def get_forward_kwargs(self, model: Any, **kwargs: Any) -> dict[str, Any]: ...

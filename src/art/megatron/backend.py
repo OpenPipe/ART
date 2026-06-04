@@ -32,6 +32,7 @@ class MegatronBackend(LocalBackend):
                 base_model=model.base_model,
                 output_dir=get_model_dir(model=model, art_path=self._path),
                 config=model._internal_config,
+                lora_config=model.lora_config,
             )
             self._services[model.name] = MegatronService(
                 model_name=model.name,

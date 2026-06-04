@@ -52,18 +52,29 @@ class DeleteCheckpointsResponse(BaseModel):
 
 class ExperimentalTrainingConfig(TypedDict, total=False):
     advantage_balance: float | None
+    allow_training_without_logprobs: bool | None
     epsilon: float | None
     epsilon_high: float | None
     importance_sampling_level: (
         Literal["token", "sequence", "average", "geometric_average"] | None
     )
     kimi_k2_tau: float | None
+    kl_penalty_coef: float | None
+    kl_ref_adapter_path: str | None
     learning_rate: float | None
+    logprob_calculation_chunk_size: int | None
+    loss_fn: Literal["cispo", "ppo"] | None
     mask_prob_ratio: bool | None
     max_negative_advantage_importance_sampling_weight: float | None
+    normalize_advantages: bool | None
+    num_trajectories_learning_rate_multiplier_power: float | None
+    packed_sequence_length: int | None
+    plot_tensors: bool | None
     ppo: bool | None
     precalculate_logprobs: bool | None
+    scale_learning_rate_by_reward_std_dev: bool | None
     scale_rewards: bool | None
+    truncated_importance_sampling: float | None
 
 
 class SFTTrainingConfig(TypedDict, total=False):

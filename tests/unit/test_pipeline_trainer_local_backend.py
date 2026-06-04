@@ -493,7 +493,7 @@ def test_load_adapter_into_model_reloads_optimizer_when_provided() -> None:
     optimizer = FakeOptimizer()
     adapter_model = {"weight": torch.tensor([1.0])}
 
-    load_adapter_into_model([module], adapter_model, optimizer)
+    load_adapter_into_model(cast(Any, [module]), adapter_model, optimizer)
 
     assert module.loaded_adapter is adapter_model
     assert optimizer.reload_calls == 1

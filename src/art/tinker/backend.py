@@ -51,6 +51,7 @@ class TinkerBackend(LocalBackend):
                 base_model=model.base_model,
                 output_dir=get_model_dir(model=model, art_path=self._path),
                 config=model._internal_config,
+                lora_config=model.lora_config,
             )
             config["tinker_args"] = config.get("tinker_args") or TinkerArgs(
                 renderer_name=get_renderer_name(model.base_model)

@@ -519,6 +519,7 @@ def _sft_inputs_to_sparse_packed_tensors(
         weights=assistant_mask.to(dtype=torch.float32),
         pixel_values=[None],
         image_grid_thw=[None],
+        moe_routing_replay=None,
     )
 
 

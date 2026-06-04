@@ -39,8 +39,8 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--python-mm",
-        default="3.11",
-        help="Python major.minor string used in CI (for example: 3.11)",
+        default="3.12",
+        help="Python major.minor string used in CI (for example: 3.12)",
     )
     parser.add_argument(
         "--torch-cuda-arch-list",

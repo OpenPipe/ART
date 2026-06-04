@@ -51,9 +51,6 @@ async def main():
         #     # engine_args=art.dev.EngineArgs(
         #     #     max_lora_rank=1,
         #     # ),
-        #     # peft_args=art.dev.PeftArgs(
-        #     #     r=1,
-        #     # ),
         #     tinker_args=art.dev.TinkerArgs(
         #         renderer_name="qwen3_instruct",
         #         training_client_args=art.dev.TinkerTrainingClientArgs(

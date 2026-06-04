@@ -4,7 +4,8 @@ import tempfile
 
 import pytest
 
-from art.dev.model import InternalModelConfig
+from art.dev.get_model_config import get_model_config
+from art.dev.model import InternalModelConfig, LoRAConfig, PeftArgs
 from art.dev.validate import is_dedicated_mode, validate_dedicated_config
 
 
@@ -134,8 +135,6 @@ def test_dedicated_rejects_fast_inference_false():
 
 
 def test_get_model_config_shared_mode():
-    from art.dev.get_model_config import get_model_config
-
     with tempfile.TemporaryDirectory() as tmpdir:
         result = get_model_config("test-model", tmpdir, None)
         assert "trainer_gpu_ids" not in result
@@ -143,7 +142,7 @@ def test_get_model_config_shared_mode():
         assert result["engine_args"]["enable_sleep_mode"] is True
         assert "fast_inference" not in result["init_args"]
         assert result["rollout_weights_mode"] == "lora"
-        assert result["peft_args"]["target_modules"] == [
+        assert result["lora_config"]["target_modules"] == [
             "q_proj",
             "k_proj",
             "v_proj",
@@ -159,11 +158,9 @@ def test_get_model_config_shared_mode():
     ["Qwen/Qwen3.5-35B-A3B", "Qwen/Qwen3.5-397B-A17B"],
 )
 def test_get_model_config_qwen3_5_moe_target_modules(base_model: str):
-    from art.dev.get_model_config import get_model_config
-
     with tempfile.TemporaryDirectory() as tmpdir:
         result = get_model_config(base_model, tmpdir, None)
-        assert result["peft_args"]["target_modules"] == [
+        assert result["lora_config"]["target_modules"] == [
             "q_proj",
             "k_proj",
             "v_proj",
@@ -175,23 +172,29 @@ def test_get_model_config_qwen3_5_moe_target_modules(base_model: str):
         ]
 
 
-def test_get_model_config_preserves_user_target_modules():
-    from art.dev.get_model_config import get_model_config
-
+def test_get_model_config_preserves_user_lora_config_target_modules():
     with tempfile.TemporaryDirectory() as tmpdir:
         result = get_model_config(
             "Qwen/Qwen3.5-35B-A3B",
             tmpdir,
-            InternalModelConfig(
-                peft_args={"target_modules": ["custom_proj"]},  # type: ignore[typeddict-item]
-            ),
+            InternalModelConfig(),
+            lora_config=LoRAConfig(target_modules=["custom_proj"]),
         )
-        assert result["peft_args"]["target_modules"] == ["custom_proj"]
+        assert result["lora_config"]["target_modules"] == ["custom_proj"]
+
+
+def test_get_model_config_rejects_peft_args_with_migration_message():
+    with pytest.raises(ValueError, match="r->rank"):
+        PeftArgs(r=4)
+    with pytest.raises(ValueError, match="TrainableModel\\(lora_config"):
+        get_model_config(
+            "test-model",
+            "",
+            InternalModelConfig(peft_args={"r": 4}),  # type: ignore[typeddict-item]
+        )
 
 
 def test_get_model_config_dedicated_mode():
-    from art.dev.get_model_config import get_model_config
-
     with tempfile.TemporaryDirectory() as tmpdir:
         config = InternalModelConfig(
             trainer_gpu_ids=[0],
@@ -206,8 +209,6 @@ def test_get_model_config_dedicated_mode():
 
 
 def test_get_model_config_dedicated_preserves_user_engine_args():
-    from art.dev.get_model_config import get_model_config
-
     with tempfile.TemporaryDirectory() as tmpdir:
         config = InternalModelConfig(
             trainer_gpu_ids=[0],
@@ -221,8 +222,6 @@ def test_get_model_config_dedicated_preserves_user_engine_args():
 
 
 def test_get_model_config_preserves_rollout_weights_mode():
-    from art.dev.get_model_config import get_model_config
-
     with tempfile.TemporaryDirectory() as tmpdir:
         config = InternalModelConfig(
             trainer_gpu_ids=[0],

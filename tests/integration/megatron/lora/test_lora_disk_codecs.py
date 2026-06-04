@@ -2,6 +2,7 @@ import json
 from pathlib import Path
 import subprocess
 import sys
+from typing import Any, cast
 
 from safetensors.torch import load_file, save_file
 import torch
@@ -1106,7 +1107,7 @@ def test_save_vllm_lora_from_model_writes_single_vllm_checkpoint(tmp_path: Path)
 
     publish_dir = tmp_path / "published_from_model"
     save_vllm_lora_from_model(
-        model=[torch.nn.Sequential(gate_up_lora, down_lora)],
+        model=cast(Any, [torch.nn.Sequential(gate_up_lora, down_lora)]),
         adapter_model=full,
         handler=QWEN3_5_MOE_HANDLER,
         adapter_config=_config("Qwen/Qwen3.5-35B-A3B", rank=1, alpha=1),
@@ -1200,7 +1201,7 @@ def test_direct_qwen35_packed_expert_publish_matches_old_vllm_exactly(
     )
     save_vllm_lora_tensors(old_dir, old_tensors, old_config)
     save_vllm_lora_from_model(
-        model=[torch.nn.Sequential(gate_up_lora, down_lora)],
+        model=cast(Any, [torch.nn.Sequential(gate_up_lora, down_lora)]),
         adapter_model=full,
         handler=QWEN3_5_MOE_HANDLER,
         adapter_config=dict(adapter_config),

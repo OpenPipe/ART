@@ -76,8 +76,9 @@ tinker = [
     "pillow",
     "pyarrow>=15.0.0",
     "pydantic>=2.12.5",
-    "tinker-cookbook>=0.3.0,<0.4",
-    "tinker>=0.18.2,<0.19",
+    "protobuf>=6.31.1",
+    "tinker-cookbook>=0.4.1,<0.5",
+    "tinker>=0.21.0,<0.22",
     "torch>=2.11.0",
     "transformers==5.2.0",
     "uvicorn>=0.35.0",
@@ -242,8 +243,12 @@ allowed-unresolved-imports = [
     "matplotlib.**",
     "seaborn.**",
     # megatron deps
+    "causal_conv1d.**",
+    "fla.**",
     "megatron.**",
     "quack.**",
+    "transformer_engine.**",
+    "triton.**",
 ]
 
 [dependency-groups]
