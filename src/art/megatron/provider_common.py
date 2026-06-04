@@ -1,19 +1,21 @@
 import copy
 import inspect
-from typing import Any, Callable
+from typing import Any
 
+from megatron.bridge import AutoBridge
+from megatron.bridge.models.gpt_provider import GPTModelProvider
 from megatron.core.transformer.spec_utils import ModuleSpec
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, SkipValidation
 
-from art.megatron.model_support.spec import ModelSupportSpec
+from art.megatron.model_support.spec import ModelSupportHandler, ModelSupportSpec
 
 
 class ProviderBundle(BaseModel):
     model_config = ConfigDict(arbitrary_types_allowed=True)
 
-    provider: Any
-    bridge: Any
-    handler: Any
+    provider: SkipValidation[GPTModelProvider]
+    bridge: SkipValidation[AutoBridge]
+    handler: SkipValidation[ModelSupportHandler]
     spec: ModelSupportSpec
 
 

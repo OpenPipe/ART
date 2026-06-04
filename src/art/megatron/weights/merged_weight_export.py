@@ -3,9 +3,11 @@ from itertools import chain
 import time
 from typing import Any, Iterator, cast
 
+from megatron.bridge import AutoBridge
 from pydantic import BaseModel, ConfigDict
 import torch
 
+from art.megatron.model_support.spec import ModelSupportHandler
 from art.megatron.runtime.jobs import (
     MergedWeightTransferInitInfo,
     MergedWeightTransferSpec,
@@ -18,6 +20,7 @@ from art.megatron.weights.param_name_canonicalization import (
 from art.weight_transfer import (
     DEFAULT_PACKED_BUFFER_SIZE_BYTES,
     DEFAULT_PACKED_NUM_BUFFERS,
+    TrainerNcclCommunicator,
     trainer_init,
     trainer_send_weights,
 )
@@ -26,7 +29,7 @@ from art.weight_transfer import (
 class MergedWeightExport(BaseModel):
     model_config = ConfigDict(arbitrary_types_allowed=True)
 
-    bridge: Any
+    bridge: AutoBridge
     model: ModelChunks
     model_config_value: Any
     conversion_tasks: list[Any]
@@ -39,7 +42,7 @@ def _hf_param_names(hf_param: Any) -> list[str]:
     return list(hf_param.values())
 
 
-def build_art_conversion_tasks(*, bridge: Any, model: ModelChunks) -> list[Any]:
+def build_art_conversion_tasks(*, bridge: AutoBridge, model: ModelChunks) -> list[Any]:
     from megatron.bridge.models.conversion.model_bridge import (
         WeightConversionTask,
         _megatron_local_name_to_global,
@@ -53,7 +56,7 @@ def build_art_conversion_tasks(*, bridge: Any, model: ModelChunks) -> list[Any]:
     hf_source = bridge.hf_pretrained.state.source
     hf_keys = set(hf_source.get_all_keys())
     megatron_models = as_megatron_api_chunks(model)
-    model_config = cast(Any, model[0].config)
+    model_config = getattr(model[0], "config")
     tasks: list[Any] = []
     for vp_stage, chunk in enumerate(model):
         for local_name, _ in chain(
@@ -69,6 +72,10 @@ def build_art_conversion_tasks(*, bridge: Any, model: ModelChunks) -> list[Any]:
                 vp_stage,
             )
             mapping = mapping_registry.megatron_to_hf_lookup(global_name)
+            if mapping is None:
+                raise RuntimeError(
+                    f"Missing HF conversion mapping for Megatron param {global_name}"
+                )
             hf_params = _hf_param_names(mapping.hf_param)
             missing_hf_params = sorted(set(hf_params) - hf_keys)
             if missing_hf_params:
@@ -102,14 +109,14 @@ def build_art_conversion_tasks(*, bridge: Any, model: ModelChunks) -> list[Any]:
 
 def build_merged_weight_export(
     *,
-    bridge: Any,
+    bridge: AutoBridge,
     model: ModelChunks,
-    model_support_handler: Any,
+    model_support_handler: ModelSupportHandler,
 ) -> MergedWeightExport:
     return MergedWeightExport(
         bridge=bridge,
         model=model,
-        model_config_value=model[0].config,
+        model_config_value=getattr(model[0], "config"),
         conversion_tasks=build_art_conversion_tasks(
             bridge=bridge,
             model=model,
@@ -273,10 +280,10 @@ def ensure_merged_weight_transfer_group(
     *,
     rank: int,
     world_size: int,
-    merged_weight_transfer_group: Any | None,
+    merged_weight_transfer_group: TrainerNcclCommunicator | None,
     merged_weight_transfer_init_info: MergedWeightTransferInitInfo | None,
     spec: MergedWeightTransferSpec,
-) -> tuple[Any, MergedWeightTransferInitInfo]:
+) -> tuple[TrainerNcclCommunicator | None, MergedWeightTransferInitInfo]:
     if merged_weight_transfer_init_info == spec.init_info:
         if _is_sender_rank(rank):
             assert merged_weight_transfer_group is not None
@@ -326,11 +333,11 @@ def sync_merged_weights_to_vllm(
     model_support_handler: Any,
     rank: int,
     world_size: int,
-    merged_weight_transfer_group: Any | None,
+    merged_weight_transfer_group: TrainerNcclCommunicator | None,
     merged_weight_transfer_init_info: MergedWeightTransferInitInfo | None,
     spec: MergedWeightTransferSpec,
     pause_generation: bool,
-) -> tuple[Any, MergedWeightTransferInitInfo]:
+) -> tuple[TrainerNcclCommunicator | None, MergedWeightTransferInitInfo]:
     import httpx
 
     (

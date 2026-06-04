@@ -18,6 +18,7 @@ from megatron.core.tensor_parallel.mappings import (
     reduce_scatter_to_sequence_parallel_region,
 )
 from megatron.core.transformer.attention import SelfAttention
+from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.moe.experts import TEGroupedMLP
 from megatron.core.transformer.moe.shared_experts import SharedExpertMLP
 from megatron.core.transformer.transformer_layer import TransformerLayer
@@ -25,9 +26,14 @@ from pydantic import BaseModel, ConfigDict
 import torch
 
 from .kernels.cute_grouped_lora_quack import (
-    quack_grouped_lora,
-    quack_grouped_lora_dual,
+    quack_grouped_lora as _quack_grouped_lora,
 )
+from .kernels.cute_grouped_lora_quack import (
+    quack_grouped_lora_dual as _quack_grouped_lora_dual,
+)
+
+quack_grouped_lora = cast(Any, _quack_grouped_lora)
+quack_grouped_lora_dual = cast(Any, _quack_grouped_lora_dual)
 
 MOE_LORA_RANK = 1
 DENSE_LORA_RANK = 8
@@ -73,6 +79,7 @@ def _get_shard_world_size(domain: ShardDomain) -> int:
     group = ps.get_expert_tensor_parallel_group(check_initialized=False)
     if group is None:
         return 1
+    assert isinstance(group, torch.distributed.ProcessGroup)
     return group.size()
 
 
@@ -84,6 +91,7 @@ def _get_shard_rank(domain: ShardDomain) -> int:
     group = ps.get_expert_tensor_parallel_group(check_initialized=False)
     if group is None:
         return 0
+    assert isinstance(group, torch.distributed.ProcessGroup)
     return group.rank()
 
 
@@ -138,6 +146,12 @@ def default_lora_rank_for_handler(handler: Any) -> int:
     return MOE_LORA_RANK if bool(getattr(handler, "is_moe", False)) else DENSE_LORA_RANK
 
 
+def _forward_backward_dw(linear: Any) -> None:
+    backward_dw = getattr(linear, "backward_dw", None)
+    if callable(backward_dw):
+        backward_dw()
+
+
 def _column_parallel_lora_input(x: torch.Tensor, linear: Any) -> torch.Tensor:
     if _linear_disables_tensor_parallel_comm(linear):
         return x
@@ -145,7 +159,9 @@ def _column_parallel_lora_input(x: torch.Tensor, linear: Any) -> torch.Tensor:
         bool(getattr(linear, "sequence_parallel", False))
         and int(getattr(linear, "tp_size", 1)) > 1
     ):
-        return gather_from_sequence_parallel_region(x)
+        gathered_x = gather_from_sequence_parallel_region(x)
+        assert isinstance(gathered_x, torch.Tensor)
+        return gathered_x
     return x
 
 
@@ -212,7 +228,8 @@ def _set_lora_shard_strategy_metadata(
 
 
 def _exported_shard_dim(param: torch.nn.Parameter) -> int:
-    axis = _normalize_axis(param.lora_tp_shard_dim, param.ndim)  # ty: ignore[unresolved-attribute]
+    assert hasattr(param, "lora_tp_shard_dim")
+    axis = _normalize_axis(getattr(param, "lora_tp_shard_dim"), param.ndim)  # ty: ignore[unresolved-attribute]
     # LoRA exports always serialize a 2D tensor:
     # - non-expert params export `param.T`
     # - expert params export `param[expert].T`
@@ -276,9 +293,9 @@ class LoRA(torch.nn.Module):
         return self.A_T.shape[0] if self.A_T.ndim == 3 else 1
 
     def _broadcast_if_replicated(self, param: torch.nn.Parameter) -> None:
-        if not param.lora_tp_replicated:  # ty: ignore[unresolved-attribute]
+        if not getattr(param, "lora_tp_replicated"):
             return
-        domain = param.lora_shard_domain  # ty: ignore[unresolved-attribute]
+        domain = getattr(param, "lora_shard_domain")
         world_size = _get_shard_world_size(domain)
         if world_size <= 1:
             return
@@ -352,9 +369,9 @@ class LoRA(torch.nn.Module):
         self.load_weight(weight, into=into)
 
     def load_weight(self, weight: torch.Tensor, *, into: torch.nn.Parameter) -> None:
-        domain = into.lora_shard_domain  # ty: ignore[unresolved-attribute]
-        if into.lora_tp_sharded:  # ty: ignore[unresolved-attribute]
-            axis = into.lora_tp_shard_dim  # ty: ignore[unresolved-attribute]
+        domain: ShardDomain = getattr(into, "lora_shard_domain")
+        if getattr(into, "lora_tp_sharded"):
+            axis: int = getattr(into, "lora_tp_shard_dim")
             axis = _normalize_axis(axis, weight.ndim)
             world_size = _get_shard_world_size(domain)
             rank = _get_shard_rank(domain)
@@ -417,24 +434,34 @@ class LoRA(torch.nn.Module):
                 return False
 
         # this param is fully sharded, all shard ranks participate
-        if param.lora_tp_sharded:  # ty: ignore[unresolved-attribute]
+        if param.lora_tp_sharded:  # type: ignore[unresolved-attribute]
             return True
         # param is replicated, tp rank 0 or etp rank 0 participates
-        return _get_shard_rank(param.lora_shard_domain) == 0  # ty: ignore[unresolved-attribute]
+        return (
+            _get_shard_rank(param.lora_shard_domain) == 0  # type: ignore[unresolved-attribute]
+        )
 
     def _manifest_for_param(self, param: torch.nn.Parameter) -> dict[str, Any]:
         manifest = {
-            "domain": param.lora_shard_domain,  # ty: ignore[unresolved-attribute]
-            "sharded": param.lora_tp_sharded,  # ty: ignore[unresolved-attribute]
-            "shard_dim": param.lora_tp_shard_dim,  # ty: ignore[unresolved-attribute]
-            "shard_world_size": _get_shard_world_size(param.lora_shard_domain)  # ty: ignore[unresolved-attribute]
-            if param.lora_tp_sharded  # ty: ignore[unresolved-attribute]
-            else 1,
-            "shard_rank": _get_shard_rank(param.lora_shard_domain)  # ty: ignore[unresolved-attribute]
-            if param.lora_tp_sharded  # ty: ignore[unresolved-attribute]
-            else 0,
+            "domain": param.lora_shard_domain,  # type: ignore[unresolved-attribute]
+            "sharded": param.lora_tp_sharded,  # type: ignore[unresolved-attribute]
+            "shard_dim": param.lora_tp_shard_dim,  # type: ignore[unresolved-attribute]
+            "shard_world_size": (
+                _get_shard_world_size(
+                    param.lora_shard_domain  # type: ignore[unresolved-attribute]
+                )
+                if param.lora_tp_sharded  # type: ignore[unresolved-attribute]
+                else 1
+            ),
+            "shard_rank": (
+                _get_shard_rank(
+                    param.lora_shard_domain  # type: ignore[unresolved-attribute]
+                )
+                if param.lora_tp_sharded  # type: ignore[unresolved-attribute]
+                else 0
+            ),
         }
-        if param.lora_tp_sharded:  # ty: ignore[unresolved-attribute]
+        if param.lora_tp_sharded:  # type: ignore[unresolved-attribute]
             manifest["export_shard_dim"] = _exported_shard_dim(param)
             manifest["export_shard_strategy"] = getattr(
                 param,
@@ -486,11 +513,11 @@ class LoRA(torch.nn.Module):
                 raise RuntimeError(
                     f"LoRA param missing main_grad attribute for key '{key}'"
                 )
-            grad = cast(torch.Tensor, param.main_grad)
+            grad: torch.Tensor | None = getattr(param, "main_grad")
             if grad is None:
                 raise RuntimeError(f"LoRA param main_grad is None for key '{key}'")
             if hasattr(grad, "_local_tensor"):
-                grad = cast(Any, grad)._local_tensor
+                grad = cast(torch.Tensor, getattr(grad, "_local_tensor"))
             local_grad = grad[expert] if expert is not None else grad
             grads[key] = local_grad.T
         return grads
@@ -561,14 +588,17 @@ class SelfAttentionLinearProjLoRA(torch.nn.Module):
         base_output, bias_output = self.linear_proj(x)
         assert isinstance(base_output, torch.Tensor)
         assert isinstance(bias_output, (torch.Tensor, type(None)))
-
         lora_output = self.lora(x)
         if self.reduce_output and self.provider.tensor_model_parallel_size > 1:
             if self.provider.sequence_parallel:
                 lora_output = reduce_scatter_to_sequence_parallel_region(lora_output)
             else:
                 lora_output = reduce_from_tensor_model_parallel_region(lora_output)
+        assert isinstance(lora_output, torch.Tensor)
         return base_output + lora_output, bias_output
+
+    def backward_dw(self) -> None:
+        _forward_backward_dw(self.linear_proj)
 
 
 class SelfAttentionLinearQKVLoRA(torch.nn.Module):
@@ -725,6 +755,9 @@ class SelfAttentionLinearQKVLoRA(torch.nn.Module):
 
         return linear_output + adapter_output, bias
 
+    def backward_dw(self) -> None:
+        _forward_backward_dw(self.linear_qkv)
+
 
 class GatedDeltaNetInProjLoRA(torch.nn.Module):
     def __init__(
@@ -739,6 +772,7 @@ class GatedDeltaNetInProjLoRA(torch.nn.Module):
         in_proj.return_layernorm_output = True
         in_proj.return_layernorm_output_gathered = True
         self.in_proj = in_proj
+        assert gated_delta_net.num_value_heads is not None
         self.num_value_heads_per_partition = (
             gated_delta_net.num_value_heads // ps.get_tensor_model_parallel_world_size()
         )
@@ -827,6 +861,9 @@ class GatedDeltaNetInProjLoRA(torch.nn.Module):
         alpha = beta.clone()
         adapter_output = torch.cat([qkv, z, beta, alpha], dim=-1)
         return linear_output + adapter_output, bias
+
+    def backward_dw(self) -> None:
+        _forward_backward_dw(self.in_proj)
 
 
 class MLPExpertsLinearFC1LoRA(torch.nn.Module):
@@ -920,6 +957,9 @@ class MLPExpertsLinearFC1LoRA(torch.nn.Module):
             )
         return base_out + adapter_out, bias_out
 
+    def backward_dw(self) -> None:
+        _forward_backward_dw(self.linear_fc1)
+
 
 class MLPExpertsLinearFC1FusedLoRA(torch.nn.Module):
     def __init__(
@@ -978,6 +1018,9 @@ class MLPExpertsLinearFC1FusedLoRA(torch.nn.Module):
         adapter_out = self.lora(x, tokens_per_expert=tokens_per_expert)
         return base_out + adapter_out, bias_out
 
+    def backward_dw(self) -> None:
+        _forward_backward_dw(self.linear_fc1)
+
 
 class MLPExpertsLinearFC2LoRA(torch.nn.Module):
     def __init__(
@@ -1030,6 +1073,9 @@ class MLPExpertsLinearFC2LoRA(torch.nn.Module):
         # the reason there is no TP comm here is because the MoE token routing handles
         # expert TP comm externally
         return base_out + adapter_out, bias_out
+
+    def backward_dw(self) -> None:
+        _forward_backward_dw(self.linear_fc2)
 
 
 class SharedExpertsLinearFC1LoRA(torch.nn.Module):
@@ -1114,6 +1160,9 @@ class SharedExpertsLinearFC1LoRA(torch.nn.Module):
             )
         return base_out + adapter_out, bias_out
 
+    def backward_dw(self) -> None:
+        _forward_backward_dw(self.linear_fc1)
+
 
 class SharedExpertsLinearFC2LoRA(torch.nn.Module):
     def __init__(
@@ -1136,6 +1185,9 @@ class SharedExpertsLinearFC2LoRA(torch.nn.Module):
 
     def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor | None]:
         return self.row_parallel_lora(x)
+
+    def backward_dw(self) -> None:
+        self.row_parallel_lora.backward_dw()
 
 
 def _unwrap_attr(
@@ -1382,14 +1434,14 @@ def wrap_shared_experts_mlp(
 
 
 def apply_lora_adapters(
-    model: Sequence[torch.nn.Module],
+    model: Sequence[MegatronModule],
     provider: GPTModelProvider,
     lora_config: Mapping[str, Any] | None = None,
-) -> list[torch.nn.Module]:
+) -> list[MegatronModule]:
     lora_config = lora_config or {}
-    provider = cast(Any, provider)
-    handler = provider._art_model_support_handler
-    spec = provider._art_model_support_spec
+    provider_with_art_attrs = cast(Any, provider)
+    handler = provider_with_art_attrs._art_model_support_handler
+    spec = provider_with_art_attrs._art_model_support_spec
     target_modules = list(
         lora_config.get("target_modules", spec.default_target_modules)
     )

@@ -293,7 +293,7 @@ def prepare_provider_bundle(
 
 
 def finalize_provider_bundle(provider_bundle: ProviderBundle) -> ProviderBundle:
-    provider = cast(GPTModelProvider, provider_bundle.provider)
+    provider = provider_bundle.provider
     _apply_art_training_runtime_finalize_defaults(provider)
     provider.finalize()
     return provider_bundle

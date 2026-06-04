@@ -913,6 +913,7 @@ def _worker_run(request: WorkerRunRequest) -> None:
         _debug("finished build_training_runtime")
     model_chunks = runtime.model
     optimizer = runtime.optimizer
+    assert optimizer is not None
     _assert_runtime_configuration(model_chunks, request.case_config)
 
     topology_dir = Path(request.topology_dir)

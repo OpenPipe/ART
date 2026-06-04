@@ -163,6 +163,7 @@ def test_pack_carries_routes_through_shared_prefix_splicing() -> None:
 
     assert packed["tokens"].tolist()[0][:6] == [10, 11, 20, 21, 22, 23]
     routing_replay = packed["moe_routing_replay"]
+    assert routing_replay is not None
     assert routing_replay.expert_indices.tolist()[0][:6] == [
         _route(0),
         _route(10),

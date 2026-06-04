@@ -12,6 +12,7 @@ from art.megatron.model_support.lora_disk import (
     resolve_lora_handler,
     save_vllm_lora_tensors,
 )
+from art.megatron.model_support.spec import ModelSupportHandler
 
 safetensors = importlib.import_module("safetensors")
 safetensors_torch = importlib.import_module("safetensors.torch")
@@ -155,7 +156,7 @@ def _load_adapter_shards(
 def load_lora_adapter_state_dict(
     lora_path: str,
     *,
-    handler: Any | None = None,
+    handler: ModelSupportHandler | None = None,
     allow_unvalidated_arch: bool = False,
 ) -> dict[str, torch.Tensor]:
     base_dir = Path(lora_path)

@@ -12,6 +12,7 @@ Public cross-repo API consumed by serverless-training:
 - merge_lora_adapter
 """
 
+from collections.abc import Iterator, Sequence
 import gc
 import importlib
 import json
@@ -22,12 +23,18 @@ import shutil
 import time
 from typing import Any, Callable, Literal, cast
 
+from megatron.bridge import AutoBridge
+from megatron.bridge.models.gpt_provider import GPTModelProvider
 from megatron.core import parallel_state as ps
 from megatron.core.distributed import DistributedDataParallelConfig
-from megatron.core.optimizer import OptimizerConfig, get_megatron_optimizer
+from megatron.core.optimizer import (
+    MegatronOptimizer,
+    OptimizerConfig,
+    get_megatron_optimizer,
+)
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.transformer_layer import TransformerLayer
-from pydantic import BaseModel, ConfigDict, field_validator
+from pydantic import BaseModel, ConfigDict, SkipValidation, field_validator
 import torch
 from torch._inductor.runtime.cache_dir_utils import cache_dir as inductor_cache_dir
 
@@ -40,6 +47,7 @@ install_art_bridge_runtime_patches()
 from art.megatron.compile_workarounds import install_torch_compile_workarounds
 from art.megatron.flex_attention import create_shared_prefix_attention_state
 from art.megatron.lora import apply_lora_adapters
+from art.megatron.model_support.spec import ModelSupportHandler, ModelSupportSpec
 from art.megatron.provider import finalize_provider_bundle, prepare_provider_bundle
 from art.megatron.provider_common import ProviderBundle
 from art.megatron.routing_replay import (
@@ -79,6 +87,7 @@ from art.preprocessing.pack import (
     PackedTensors,
     packed_tensors_from_dir,
 )
+from art.weight_transfer import TrainerNcclCommunicator
 
 safetensors = importlib.import_module("safetensors")
 safetensors_torch = importlib.import_module("safetensors.torch")
@@ -104,14 +113,14 @@ class TrainingRuntime(BaseModel):
     model_config = ConfigDict(arbitrary_types_allowed=True)
 
     provider_bundle: ProviderBundle
-    provider: Any
-    model: ModelChunks
-    optimizer: Any | None
+    provider: SkipValidation[GPTModelProvider]
+    model: SkipValidation[ModelChunks]
+    optimizer: SkipValidation[MegatronOptimizer | None]
     optimizer_config: OptimizerConfig
     rank: int
     world_size: int
     moe_routing_replay_controller: MoeRoutingReplayController | None = None
-    merged_weight_transfer_group: Any | None = None
+    merged_weight_transfer_group: SkipValidation[TrainerNcclCommunicator | None] = None
     merged_weight_transfer_init_info: MergedWeightTransferInitInfo | None = None
 
     @field_validator("model")
@@ -121,15 +130,15 @@ class TrainingRuntime(BaseModel):
         return value
 
     @property
-    def bridge(self) -> Any:
+    def bridge(self) -> AutoBridge:
         return self.provider_bundle.bridge
 
     @property
-    def model_support_handler(self) -> Any:
+    def model_support_handler(self) -> ModelSupportHandler:
         return self.provider_bundle.handler
 
     @property
-    def model_support_spec(self) -> Any:
+    def model_support_spec(self) -> ModelSupportSpec:
         return self.provider_bundle.spec
 
 
@@ -157,7 +166,7 @@ def freeze_model(model_chunks: list[MegatronModule]) -> list[MegatronModule]:
 
 
 def _register_trainable_parameter_mode(
-    provider: Any,
+    provider: GPTModelProvider,
     *,
     trainable_parameter_mode: Literal["lora", "base_model"],
     lora_config: dev.LoRAConfig | None,
@@ -207,10 +216,10 @@ def _install_fast_frozen_output_backward() -> None:
         return grad_input, None, None, None, None
 
     setattr(_fast_backward, "__art_fast_output_backward__", True)
-    LinearWithFrozenWeight.backward = staticmethod(_fast_backward)
+    cast(Any, LinearWithFrozenWeight).backward = staticmethod(_fast_backward)
 
 
-def _eager_initialize_optimizer_state(optimizer: Any) -> None:
+def _eager_initialize_optimizer_state(optimizer: MegatronOptimizer) -> None:
     chained_optimizers = getattr(optimizer, "chained_optimizers", None)
     if chained_optimizers is not None:
         for child_optimizer in chained_optimizers:
@@ -243,7 +252,7 @@ def _default_optimizer_config() -> OptimizerConfig:
 
 
 def _maybe_print_optimizer_stats(
-    optimizer: Any,
+    optimizer: MegatronOptimizer,
     model: ModelChunks,
 ) -> None:
     global _optimizer_stats_printed
@@ -269,7 +278,7 @@ def _maybe_print_optimizer_stats(
 def _build_optimizer(
     model: ModelChunks,
     optimizer_config: OptimizerConfig,
-) -> Any:
+) -> MegatronOptimizer:
     optimizer = get_megatron_optimizer(
         config=optimizer_config,
         model_chunks=as_megatron_api_chunks(model),
@@ -329,7 +338,7 @@ def _moe_routing_replay_requested(
     }
 
 
-def _enable_native_moe_routing_replay(provider: Any) -> None:
+def _enable_native_moe_routing_replay(provider: GPTModelProvider) -> None:
     if bool(getattr(provider, "moe_router_fusion", False)):
         raise RuntimeError(
             "MoE routing replay requires provider.moe_router_fusion=False because "
@@ -346,7 +355,7 @@ def build_training_runtime(
     model_identifier: str | None = None,
     provider_torch_dtype: torch.dtype = torch.bfloat16,
     provider_bundle_configure: Callable[[ProviderBundle], None] | None = None,
-    provider_configure: Callable[[Any], None] | None = None,
+    provider_configure: Callable[[GPTModelProvider], None] | None = None,
     optimizer_config: OptimizerConfig | None = None,
     moe_routing_replay_path: str | None = None,
     moe_routing_replay_bundle: MoeRoutingReplayBundle | None = None,
@@ -505,6 +514,7 @@ def run_megatron_rl_job(
             lora_path=job.lora_path,
             optimizer_state_path=job.optimizer_state_path,
         )
+        assert runtime.optimizer is not None
 
         print0(
             runtime.rank,
@@ -598,7 +608,7 @@ def _flush_param_grads_to_main_grads(model_chunks: ModelChunks) -> None:
                 continue
             if not hasattr(param, "main_grad"):
                 continue
-            main_grad = cast(torch.Tensor, param.main_grad)
+            main_grad = cast(torch.Tensor, getattr(param, "main_grad"))
             if not getattr(param, "grad_added_to_main_grad", False) or getattr(
                 param, "zero_out_wgrad", False
             ):
@@ -810,8 +820,8 @@ def _load_adapter_into_model(
     lora_path: str,
     rank: int,
     *,
-    handler: Any | None = None,
-    optimizer: Any | None = None,
+    handler: ModelSupportHandler | None = None,
+    optimizer: MegatronOptimizer | None = None,
 ) -> dict[str, torch.Tensor]:
     print0(rank, "Loading adapter model from", lora_path)
     adapter_model = load_lora_adapter_state_dict(lora_path, handler=handler)
@@ -907,14 +917,14 @@ def _compile_transformer_layers(module: torch.nn.Module) -> None:
         _compile_transformer_layers(child)
 
 
-def iter_modules(model_chunks: ModelChunks) -> Any:
+def iter_modules(model_chunks: Sequence[torch.nn.Module]) -> Iterator[torch.nn.Module]:
     for chunk in model_chunks:
         for module in chunk.modules():
             yield module
 
 
 def load_adapter_into_model(
-    model_chunks: ModelChunks,
+    model_chunks: Sequence[torch.nn.Module],
     adapter_model: dict[str, torch.Tensor],
     optimizer: Any | None = None,
 ) -> None:
@@ -954,27 +964,35 @@ def collect_sharded_lora_state(
 
 @torch.no_grad()
 def select_indexed_inputs(packed_tensors: PackedTensors, index: int) -> PackedTensors:
-    return PackedTensors(  # type: ignore[call-arg]
-        **{
-            key: value[index : index + 1]
-            for key, value in packed_tensors.items()
-            if isinstance(value, torch.Tensor)
+    return cast(
+        PackedTensors,
+        {
+            **{
+                key: value[index : index + 1]
+                for key, value in packed_tensors.items()
+                if isinstance(value, torch.Tensor)
+            },
+            "pixel_values": [None],
+            "image_grid_thw": [None],
+            "moe_routing_replay": None,
         },
-        pixel_values=[None],
-        image_grid_thw=[None],
     )
 
 
 @torch.no_grad()
 def _clone_packed_tensors(inputs: PackedTensors) -> PackedTensors:
-    return PackedTensors(  # type: ignore[call-arg]
-        **{
-            key: value.clone()
-            for key, value in inputs.items()
-            if isinstance(value, torch.Tensor)
+    return cast(
+        PackedTensors,
+        {
+            **{
+                key: value.clone()
+                for key, value in inputs.items()
+                if isinstance(value, torch.Tensor)
+            },
+            "pixel_values": [None],
+            "image_grid_thw": [None],
+            "moe_routing_replay": None,
         },
-        pixel_values=[None],
-        image_grid_thw=[None],
     )
 
 
@@ -1065,9 +1083,11 @@ def select_micro_inputs(
     zero_template: PackedTensors,
 ) -> list[PackedTensors]:
     return [
-        _clone_packed_tensors(zero_template)
-        if sample_index is None
-        else select_indexed_inputs(packed_tensors, sample_index)
+        (
+            _clone_packed_tensors(zero_template)
+            if sample_index is None
+            else select_indexed_inputs(packed_tensors, sample_index)
+        )
         for sample_index in sample_indices
     ]
 
@@ -1078,9 +1098,11 @@ def select_sft_micro_inputs(
     zero_template: dict[str, torch.Tensor],
 ) -> list[dict[str, torch.Tensor]]:
     return [
-        _clone_sft_tensors(zero_template)
-        if sample_index is None
-        else _clone_sft_tensors(trajectory_tensors[sample_index])
+        (
+            _clone_sft_tensors(zero_template)
+            if sample_index is None
+            else _clone_sft_tensors(trajectory_tensors[sample_index])
+        )
         for sample_index in sample_indices
     ]
 
@@ -1092,7 +1114,7 @@ def _move_inputs_to_device(inputs: PackedTensors, device: torch.device) -> None:
 
 
 def _optimizer_step(
-    optimizer: Any,
+    optimizer: MegatronOptimizer,
     learning_rate: float,
 ) -> tuple[bool, float, int | None]:
     for param_group in optimizer.param_groups:
@@ -1169,8 +1191,8 @@ def _prepare_sft_micro_inputs(
 def run_megatron_sft_step(
     *,
     model_chunks: ModelChunks,
-    model_support_handler: Any,
-    optimizer: Any,
+    model_support_handler: ModelSupportHandler,
+    optimizer: MegatronOptimizer,
     learning_rate: float,
     inputs: dict[str, torch.Tensor] | list[dict[str, torch.Tensor]],
     step_index: int,
@@ -1188,7 +1210,7 @@ def run_megatron_sft_step(
                 "sample_index list length must match number of micro inputs: "
                 f"{len(sample_index)} != {len(micro_inputs)}"
             )
-        micro_sample_indices = sample_index
+        micro_sample_indices: list[int | None] = sample_index
     else:
         assert len(micro_inputs) == 1
         micro_sample_indices = [sample_index]
@@ -1208,7 +1230,7 @@ def run_megatron_sft_step(
     device = next(model_chunks[0].parameters()).device
 
     for chunk in model_chunks:
-        chunk.zero_grad_buffer()  # ty: ignore[call-non-callable]
+        chunk.zero_grad_buffer()  # type: ignore[call-non-callable]
 
     raw_loss_sum: torch.Tensor | None = None
     num_tokens = _local_trainable_sft_token_count_tensor(micro_inputs, device=device)
@@ -1274,8 +1296,8 @@ def run_megatron_sft_step(
 def run_training_step(
     *,
     model_chunks: ModelChunks,
-    model_support_handler: Any,
-    optimizer: Any,
+    model_support_handler: ModelSupportHandler,
+    optimizer: MegatronOptimizer,
     learning_rate: float,
     inputs: PackedTensors | list[PackedTensors],
     config: types.TrainConfig,
@@ -1295,7 +1317,7 @@ def run_training_step(
                 "sample_index list length must match number of micro inputs: "
                 f"{len(sample_index)} != {len(micro_inputs)}"
             )
-        micro_sample_indices = sample_index
+        micro_sample_indices: list[int | None] = sample_index
     else:
         assert len(micro_inputs) == 1
         micro_sample_indices = [sample_index]
@@ -1315,7 +1337,7 @@ def run_training_step(
     device = next(model_chunks[0].parameters()).device
 
     for chunk in model_chunks:
-        chunk.zero_grad_buffer()  # ty: ignore[call-non-callable]
+        chunk.zero_grad_buffer()  # type: ignore[call-non-callable]
 
     micro_count = len(micro_inputs)
     raw_loss_sum: torch.Tensor | None = None
@@ -1355,7 +1377,7 @@ def run_training_step(
         )
 
         loss_info = loss_fn(
-            micro,  # ty: ignore[invalid-argument-type]
+            micro,  # type: ignore[invalid-argument-type]
             new_logprobs,
             ref_logprobs,
             None,

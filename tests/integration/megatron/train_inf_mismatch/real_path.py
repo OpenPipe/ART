@@ -532,11 +532,11 @@ async def _score_base_real_generation_path(
             name=f"{served_name}_client",
             project="train_inf_mismatch",
             base_model=parity_config.base_model,
-            _internal_config={
-                "init_args": {
+            _internal_config=art.dev.InternalModelConfig(
+                init_args={
                     "max_seq_length": parity_config.packed.sequence_length,
                 },
-            },
+            ),
         )
         object.__setattr__(model, "inference_base_url", f"http://{host}:{port}/v1")
         object.__setattr__(model, "inference_api_key", "EMPTY")
@@ -585,7 +585,9 @@ async def _score_base_real_generation_path(
             global_grad_accumulation_sequences=global_grad_accumulation_sequences,
         ).to_dir(routing_replay_dir)
         routing_replay_path = str(routing_replay_dir)
-        stats = packed_tensors["moe_routing_replay"].pack_stats
+        moe_routing_replay = packed_tensors["moe_routing_replay"]
+        assert moe_routing_replay is not None
+        stats = moe_routing_replay.pack_stats
     else:
         stats = MoeRoutingPackStats()
 
@@ -972,23 +974,23 @@ async def run_real_path_train_inf_mismatch(
         name=f"train-inf-real-{uuid.uuid4().hex[:8]}",
         project="train_inf_mismatch",
         base_model=parity_config.base_model,
-        _internal_config={
-            "trainer_gpu_ids": parity_config.trainer_gpu_ids,
-            "inference_gpu_ids": parity_config.inference_gpu_ids,
-            "rollout_weights_mode": "lora",
-            "allow_unvalidated_arch": parity_config.allow_unvalidated_arch,
-            "engine_args": {
-                "tensor_parallel_size": len(parity_config.inference_gpu_ids),
-                "enable_expert_parallel": is_moe
+        _internal_config=art.dev.InternalModelConfig(
+            trainer_gpu_ids=parity_config.trainer_gpu_ids,
+            inference_gpu_ids=parity_config.inference_gpu_ids,
+            rollout_weights_mode="lora",
+            allow_unvalidated_arch=parity_config.allow_unvalidated_arch,
+            engine_args=art.dev.EngineArgs(
+                tensor_parallel_size=len(parity_config.inference_gpu_ids),
+                enable_expert_parallel=is_moe
                 and len(parity_config.inference_gpu_ids) > 1,
-                "max_model_len": parity_config.packed.sequence_length + 8,
-                "max_logprobs": TOP_K,
+                max_model_len=parity_config.packed.sequence_length + 8,
+                max_logprobs=TOP_K,
                 **parity_config.engine_args,
-            },
-            "init_args": {
+            ),
+            init_args={
                 "max_seq_length": parity_config.packed.sequence_length,
             },
-        },
+        ),
     )
     _move_adapter_to_step_zero(adapter_path=adapter_path, model=model, backend=backend)
 
@@ -1035,6 +1037,7 @@ async def run_real_path_train_inf_mismatch(
         )
         if is_moe:
             routing_replay = packed_tensors["moe_routing_replay"]
+            assert routing_replay is not None
             stats = routing_replay.pack_stats
         else:
             from art.preprocessing.moe_routing import MoeRoutingPackStats
