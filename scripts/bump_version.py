@@ -17,7 +17,7 @@ import sys
 def get_current_version():
     """Extract current version from pyproject.toml."""
     pyproject_path = Path(__file__).parent.parent / "pyproject.toml"
-    content = pyproject_path.read_text()
+    content = pyproject_path.read_text(encoding="utf-8")
     match = re.search(r'version = "(\d+\.\d+\.\d+)"', content)
     if not match:
         raise ValueError("Could not find version in pyproject.toml")
@@ -41,14 +41,14 @@ def bump_version(current_version, bump_type):
 def update_version(new_version):
     """Update version in pyproject.toml."""
     pyproject_path = Path(__file__).parent.parent / "pyproject.toml"
-    content = pyproject_path.read_text()
+    content = pyproject_path.read_text(encoding="utf-8")
 
     # Update version
     new_content = re.sub(
         r'version = "\d+\.\d+\.\d+"', f'version = "{new_version}"', content
     )
 
-    pyproject_path.write_text(new_content)
+    pyproject_path.write_text(new_content,encoding="utf-8")
 
     # run uv sync
     subprocess.run(["uv", "sync"])
