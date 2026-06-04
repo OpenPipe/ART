@@ -25,6 +25,15 @@ RUNTIME_SERVER = "art-vllm-runtime-server"
 RUNTIME_PACKAGE = "art-vllm-runtime"
 RUNTIME_PROTOCOL_VERSION = 1
 RUNTIME_INSTALL_MARKER = "openpipe-art-vllm-runtime"
+_TILELANG_ENV_KEYS = (
+    "PYTHONPATH",
+    "TVM_IMPORT_PYTHON_PATH",
+    "TVM_LIBRARY_PATH",
+    "TL_CUTLASS_PATH",
+    "TL_TEMPLATE_PATH",
+    "TL_COMPOSABLE_KERNEL_PATH",
+)
+_TILELANG_PATH_MARKERS = ("/site-packages/tilelang/", "\\site-packages\\tilelang\\")
 
 
 class VllmRuntimeLaunchConfig(BaseModel):
@@ -72,6 +81,34 @@ class VllmRuntimeInstallMarker(BaseModel):
 
 class VllmRuntimeRequestKwargs(TypedDict, total=False):
     headers: dict[str, str]
+
+
+def _drop_tilelang_env_paths(value: str | None) -> str | None:
+    if value is None:
+        return None
+    kept = [
+        part
+        for part in value.split(os.pathsep)
+        if not any(marker in part for marker in _TILELANG_PATH_MARKERS)
+    ]
+    return os.pathsep.join(kept) if kept else None
+
+
+def _vllm_runtime_subprocess_env() -> dict[str, str]:
+    """Build a child env without TileLang's vendored TVM paths.
+
+    TileLang mutates process env during import. If a vLLM runtime child inherits
+    those paths, spawn workers can load two TVM FFI libraries and abort on
+    duplicate global registration during model load.
+    """
+    env = os.environ.copy()
+    for key in _TILELANG_ENV_KEYS:
+        value = _drop_tilelang_env_paths(env.get(key))
+        if value is None:
+            env.pop(key, None)
+        else:
+            env[key] = value
+    return env
 
 
 class ManagedVllmRuntime:
@@ -122,7 +159,7 @@ class ManagedVllmRuntime:
         self.process = subprocess.Popen(
             managed_process_cmd(cmd),
             cwd=str(get_vllm_runtime_working_dir()),
-            env=os.environ.copy(),
+            env=_vllm_runtime_subprocess_env(),
             stdout=self.log_file,
             stderr=subprocess.STDOUT,
             bufsize=1,
