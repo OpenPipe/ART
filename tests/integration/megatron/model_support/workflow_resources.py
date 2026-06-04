@@ -121,6 +121,11 @@ _DSV4_HF_OVERRIDES = {
     "mlp_layer_types": _DSV4_REPRESENTATIVE_MLP_LAYER_TYPES,
 }
 _DSV4_VLLM_ENGINE_ARGS = {
+    # The DSV4 runtime gates use a reduced 4-layer validation model and then
+    # sync Megatron weights into vLLM through merged-weight transfer. Loading
+    # the full public checkpoint before that sync is incompatible with the
+    # reduced hf_overrides because vLLM still streams layer-4+ tensors.
+    "load_format": "dummy",
     "kv_cache_dtype": "fp8",
     "max_num_batched_tokens": 1032,
     "moe_backend": "triton_unfused",
