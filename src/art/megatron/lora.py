@@ -229,7 +229,9 @@ def _set_lora_shard_strategy_metadata(
 
 def _exported_shard_dim(param: torch.nn.Parameter) -> int:
     assert hasattr(param, "lora_tp_shard_dim")
-    axis = _normalize_axis(getattr(param, "lora_tp_shard_dim"), param.ndim)  # ty: ignore[unresolved-attribute]
+    axis = _normalize_axis(
+        getattr(param, "lora_tp_shard_dim"), param.ndim
+    )  # ty: ignore[unresolved-attribute]
     # LoRA exports always serialize a 2D tensor:
     # - non-expert params export `param.T`
     # - expert params export `param[expert].T`
@@ -260,9 +262,9 @@ class LoRA(torch.nn.Module):
         allreduce: bool = True,
     ) -> None:
         super().__init__()
-        assert num_local_experts == 1 or "{expert}" in adapter_model_prefix, (
-            "adapter_model_prefix must contain the '{expert}' format placeholder if num_local_experts > 1"
-        )
+        assert (
+            num_local_experts == 1 or "{expert}" in adapter_model_prefix
+        ), "adapter_model_prefix must contain the '{expert}' format placeholder if num_local_experts > 1"
         self.adapter_model_prefix = adapter_model_prefix
         self.scale = alpha / rank
         self.A_T = torch.nn.Parameter(
@@ -293,9 +295,9 @@ class LoRA(torch.nn.Module):
         return self.A_T.shape[0] if self.A_T.ndim == 3 else 1
 
     def _broadcast_if_replicated(self, param: torch.nn.Parameter) -> None:
-        if not getattr(param, "lora_tp_replicated"):
+        if not param.lora_tp_replicated:  # type: ignore[unresolved-attribute]
             return
-        domain = getattr(param, "lora_shard_domain")
+        domain: ShardDomain = param.lora_shard_domain  # type: ignore[unresolved-attribute]
         world_size = _get_shard_world_size(domain)
         if world_size <= 1:
             return
@@ -304,8 +306,10 @@ class LoRA(torch.nn.Module):
             raise RuntimeError(
                 f"{self.adapter_model_prefix}: missing process group for replicated parameter domain={domain}"
             )
-        src = torch.distributed.get_global_rank(  # ty: ignore[possibly-missing-attribute]
-            group, 0
+        src = (
+            torch.distributed.get_global_rank(  # ty: ignore[possibly-missing-attribute]
+                group, 0
+            )
         )
         torch.distributed.broadcast(  # ty: ignore[possibly-missing-attribute]
             param.data,
@@ -369,9 +373,9 @@ class LoRA(torch.nn.Module):
         self.load_weight(weight, into=into)
 
     def load_weight(self, weight: torch.Tensor, *, into: torch.nn.Parameter) -> None:
-        domain: ShardDomain = getattr(into, "lora_shard_domain")
-        if getattr(into, "lora_tp_sharded"):
-            axis: int = getattr(into, "lora_tp_shard_dim")
+        domain: ShardDomain = into.lora_shard_domain  # type: ignore[unresolved-attribute]
+        if into.lora_tp_sharded:  # type: ignore[unresolved-attribute]
+            axis: int = into.lora_tp_shard_dim  # type: ignore[unresolved-attribute]
             axis = _normalize_axis(axis, weight.ndim)
             world_size = _get_shard_world_size(domain)
             rank = _get_shard_rank(domain)
@@ -513,11 +517,11 @@ class LoRA(torch.nn.Module):
                 raise RuntimeError(
                     f"LoRA param missing main_grad attribute for key '{key}'"
                 )
-            grad: torch.Tensor | None = getattr(param, "main_grad")
+            grad: torch.Tensor | None = param.main_grad  # type: ignore[unresolved-attribute]
             if grad is None:
                 raise RuntimeError(f"LoRA param main_grad is None for key '{key}'")
             if hasattr(grad, "_local_tensor"):
-                grad = cast(torch.Tensor, getattr(grad, "_local_tensor"))
+                grad = cast(torch.Tensor, grad._local_tensor)  # type: ignore[unresolved-attribute]
             local_grad = grad[expert] if expert is not None else grad
             grads[key] = local_grad.T
         return grads
@@ -526,9 +530,9 @@ class LoRA(torch.nn.Module):
         self, x: torch.Tensor, tokens_per_expert: list[int] | torch.Tensor | None = None
     ) -> torch.Tensor:
         if tokens_per_expert is not None:
-            assert self.num_local_experts > 1, (
-                "tokens_per_expert is only supported if num_local_experts > 1"
-            )
+            assert (
+                self.num_local_experts > 1
+            ), "tokens_per_expert is only supported if num_local_experts > 1"
             bsz = tokens_per_expert
             if isinstance(bsz, list):
                 bsz = torch.tensor(bsz, dtype=torch.int64, device="cpu")
@@ -627,13 +631,13 @@ class SelfAttentionLinearQKVLoRA(torch.nn.Module):
         total_out_features_per_rank = int(weight.shape[0])
         kv_out_features = self.provider.kv_channels * self.provider.num_query_groups
         tp_world_size = ps.get_tensor_model_parallel_world_size()
-        assert kv_out_features % tp_world_size == 0, (
-            "kv_out_features must be divisible by tensor parallel size"
-        )
+        assert (
+            kv_out_features % tp_world_size == 0
+        ), "kv_out_features must be divisible by tensor parallel size"
         q_out_features = self.provider.kv_channels * self.provider.num_attention_heads
-        assert q_out_features % tp_world_size == 0, (
-            "q_out_features must be divisible by tensor parallel size"
-        )
+        assert (
+            q_out_features % tp_world_size == 0
+        ), "q_out_features must be divisible by tensor parallel size"
         q_out_features_per_rank = q_out_features // tp_world_size
         kv_out_features_per_rank = kv_out_features // tp_world_size
         self.attention_output_gate = bool(
@@ -645,9 +649,9 @@ class SelfAttentionLinearQKVLoRA(torch.nn.Module):
         expected_q_out_features_per_rank = q_out_features_per_rank * (
             2 if self.attention_output_gate else 1
         )
-        assert q_and_gate_out_features_per_rank == expected_q_out_features_per_rank, (
-            "Unexpected per-rank QKV packing for this attention layout"
-        )
+        assert (
+            q_and_gate_out_features_per_rank == expected_q_out_features_per_rank
+        ), "Unexpected per-rank QKV packing for this attention layout"
         self.num_query_groups_per_partition = (
             self.provider.num_query_groups // tp_world_size
         )
