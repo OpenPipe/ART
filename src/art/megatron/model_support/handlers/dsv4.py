@@ -550,6 +550,13 @@ def _ensure_dsv4_hf_config_registered() -> None:
     ensure_dsv4_hf_config_registered()
 
 
+def _sanitize_dsv4_child_process_env() -> None:
+    from art.megatron.dsv4.kernel.tilelang_import import sanitize_tilelang_env
+
+    sanitize_tilelang_env()
+
+
+_sanitize_dsv4_child_process_env()
 _ensure_dsv4_hf_config_registered()
 DSV4_HANDLER = Dsv4Handler()
 
