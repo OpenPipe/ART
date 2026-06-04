@@ -126,6 +126,7 @@ _DSV4_VLLM_ENGINE_ARGS = {
     # the full public checkpoint before that sync is incompatible with the
     # reduced hf_overrides because vLLM still streams layer-4+ tensors.
     "load_format": "dummy",
+    "gpu_memory_utilization": 0.82,
     "kv_cache_dtype": "fp8",
     "max_num_batched_tokens": 1032,
     "moe_backend": "triton_unfused",

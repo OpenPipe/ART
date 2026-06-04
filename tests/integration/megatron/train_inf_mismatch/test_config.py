@@ -21,6 +21,7 @@ def test_cp_unsupported_model_uses_non_cp_default_topology(monkeypatch) -> None:
     assert config.inference_gpu_ids == [4, 5, 6, 7]
     assert config.engine_args["tensor_parallel_size"] == 4
     assert config.engine_args["enable_expert_parallel"] is True
+    assert config.engine_args["gpu_memory_utilization"] == 0.82
     assert config.engine_args["kv_cache_dtype"] == "fp8"
     assert config.engine_args["max_num_batched_tokens"] == 1032
     assert config.engine_args["moe_backend"] == "triton_unfused"
