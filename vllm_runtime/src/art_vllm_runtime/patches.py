@@ -16,6 +16,7 @@ def apply_vllm_runtime_patches() -> None:
     patch_listen_for_disconnect()
     patch_tool_parser_manager()
     patch_nccl_unique_id_bootstrap()
+    patch_layerwise_reload_shadow_attrs()
     patch_routed_experts_prefix_cache_sidecar()
 
 
@@ -168,6 +169,51 @@ def patch_nccl_unique_id_bootstrap() -> None:
 
     patched_comm_init_rank.__art_patched__ = True  # type: ignore[attr-defined]
     NCCLLibrary.ncclCommInitRank = patched_comm_init_rank  # type: ignore[method-assign]
+
+
+def _drop_reload_shadow_attrs(layer: Any, names: Any) -> None:
+    for name in names:
+        if (
+            name in getattr(layer, "__dict__", {})
+            and name not in layer._parameters
+            and name not in layer._buffers
+            and name not in layer._modules
+        ):
+            delattr(layer, name)
+
+
+def patch_layerwise_reload_shadow_attrs() -> None:
+    """Allow vLLM layerwise reload to restore processed DSV4 MegaMoE params.
+
+    DeepSeek V4 MegaMoE drops loader-side Parameters after transforming them for
+    DeepGEMM. Some vLLM builds leave same-name plain attributes behind; PyTorch
+    then rejects register_parameter during the next checkpoint-format reload.
+    """
+    from vllm.model_executor.model_loader.reload import layerwise, meta
+
+    if getattr(meta, "_art_reload_shadow_attrs_patched", False):
+        return
+
+    original_restore_layer_on_meta = meta.restore_layer_on_meta
+    original_place_kernel_tensors = layerwise._place_kernel_tensors
+
+    def restore_layer_on_meta(layer: Any, info: Any) -> None:
+        restore_params, restore_buffers = info.restore_metadata
+        _drop_reload_shadow_attrs(layer, tuple(restore_params) + tuple(restore_buffers))
+        return original_restore_layer_on_meta(layer, info)
+
+    def _place_kernel_tensors(layer: Any, info: Any) -> None:
+        assert info.kernel_tensors is not None
+        parameters, buffers = info.kernel_tensors
+        _drop_reload_shadow_attrs(layer, tuple(parameters) + tuple(buffers))
+        return original_place_kernel_tensors(layer, info)
+
+    restore_layer_on_meta.__art_patched__ = True  # type: ignore[attr-defined]
+    _place_kernel_tensors.__art_patched__ = True  # type: ignore[attr-defined]
+    meta.restore_layer_on_meta = restore_layer_on_meta  # type: ignore[method-assign]
+    layerwise.restore_layer_on_meta = restore_layer_on_meta  # type: ignore[method-assign]
+    layerwise._place_kernel_tensors = _place_kernel_tensors  # type: ignore[method-assign]
+    setattr(meta, "_art_reload_shadow_attrs_patched", True)
 
 
 def _lora_cache_key(lora_request: Any) -> tuple[Any, ...]:
