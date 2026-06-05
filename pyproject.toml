@@ -37,7 +37,7 @@ backend = [
     "nbclient>=0.10.1",
     "pytest>=8.4.1",
     "nbmake>=1.5.5",
-    "gql<4",
+    "gql>=4.0.0",
     "nvidia-cudnn-frontend<1.21 ; sys_platform == 'linux'",
     "nvidia-resiliency-ext<0.5 ; sys_platform == 'linux'",
 ]
