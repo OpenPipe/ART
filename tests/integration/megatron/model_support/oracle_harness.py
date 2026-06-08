@@ -227,7 +227,9 @@ def _without_context_parallel(topology: Topology) -> Topology:
 
 
 CP_UNSUPPORTED_MOE_TOPOLOGIES = [
-    _without_context_parallel(topology) for topology in TOPOLOGIES
+    _without_context_parallel(topology) for topology in TOPOLOGIES[:-1]
+] + [
+    Topology(tp=2, ep=2, etp=2, dp=2, cp=1, sp=True),
 ]
 DENSE_TOPOLOGIES = [
     Topology(tp=1, ep=1, etp=1, dp=1, sp=False),
