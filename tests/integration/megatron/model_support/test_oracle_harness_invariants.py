@@ -779,11 +779,22 @@ def test_cp_unsupported_moe_suite_uses_cp_free_parallel_topology() -> None:
     variants = _suite_variants("rl", is_moe=True, cp_supported=False)
 
     assert topologies == CP_UNSUPPORTED_MOE_TOPOLOGIES
+    assert topologies == [
+        Topology(tp=1, ep=1, etp=1, dp=1, cp=1, sp=False),
+        Topology(tp=1, ep=2, etp=1, dp=2, cp=1, sp=False),
+        Topology(tp=2, ep=2, etp=1, dp=2, cp=1, sp=True),
+        Topology(tp=2, ep=4, etp=2, dp=4, cp=1, sp=True),
+    ]
+    assert [topology.world_size() for topology in topologies] == [1, 2, 4, 8]
     assert all(topology.cp == 1 for topology in topologies)
     assert variants
     assert all(variant.topology.cp == 1 for variant in variants)
     assert any(
-        variant.topology.ep == 2 and variant.topology.dp == 2 for variant in variants
+        variant.topology.tp == 2
+        and variant.topology.ep == 4
+        and variant.topology.etp == 2
+        and variant.topology.dp == 4
+        for variant in variants
     )
 
 

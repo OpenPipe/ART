@@ -220,9 +220,14 @@ TOPOLOGIES = [
     Topology(tp=2, ep=2, etp=1, dp=1, cp=2, sp=True),
     Topology(tp=2, ep=4, etp=2, dp=2, cp=2, sp=True),
 ]
+
+
+def _without_context_parallel(topology: Topology) -> Topology:
+    return topology.model_copy(update={"dp": topology.dp * topology.cp, "cp": 1})
+
+
 CP_UNSUPPORTED_MOE_TOPOLOGIES = [
-    TOPOLOGIES[0],
-    Topology(tp=1, ep=2, etp=1, dp=2, cp=1, sp=False),
+    _without_context_parallel(topology) for topology in TOPOLOGIES
 ]
 DENSE_TOPOLOGIES = [
     Topology(tp=1, ep=1, etp=1, dp=1, sp=False),
