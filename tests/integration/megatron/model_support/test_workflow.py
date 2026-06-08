@@ -66,10 +66,14 @@ def test_dsv4_runtime_stages_use_full_model_resources() -> None:
         assert stage is not None
         assert stage.required_world_size == 8
         assert stage.required_h200_equivalent_gpus == 8
-        assert stage.allow_gpu_overlap is True
+        assert stage.allow_gpu_overlap is False
         assert stage.megatron_env == {}
         assert stage.vllm is not None
         assert stage.vllm.gpu_ids == [4, 5, 6, 7]
+        assert stage.high_vram_megatron is not None
+        assert stage.high_vram_megatron.gpu_ids == [0, 1]
+        assert stage.high_vram_vllm is not None
+        assert stage.high_vram_vllm.gpu_ids == [2, 3]
         engine_args = stage.vllm.engine_args()
         assert "hf_overrides" not in engine_args
         assert engine_args.get("load_format") != "dummy"
@@ -103,9 +107,14 @@ def test_dsv4_resources_remap_to_four_high_vram_gpus(monkeypatch) -> None:
 
     assert stage.megatron is not None
     assert stage.vllm is not None
-    assert stage.megatron.gpu_ids == [0, 1, 2, 3]
-    assert stage.vllm.gpu_ids == [0, 1, 2, 3]
-    assert stage.allow_gpu_overlap is True
+    assert stage.megatron.gpu_ids == [0, 1]
+    assert stage.megatron.topology.tp == 2
+    assert stage.megatron.topology.ep == 2
+    assert stage.megatron.topology.dp == 1
+    assert stage.vllm.gpu_ids == [2, 3]
+    assert stage.vllm.tensor_parallel_size == 2
+    assert stage.vllm.engine_args()["gpu_memory_utilization"] == 0.82
+    assert stage.allow_gpu_overlap is False
 
 
 def test_h200_equivalent_slots_tolerate_reported_gb300_vram() -> None:

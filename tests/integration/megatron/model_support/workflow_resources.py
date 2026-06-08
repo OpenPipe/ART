@@ -78,6 +78,8 @@ class WorkflowStageResources(BaseModel):
     allow_gpu_overlap: bool = False
     megatron: MegatronWorkflowResources | None = None
     vllm: VllmWorkflowResources | None = None
+    high_vram_megatron: MegatronWorkflowResources | None = None
+    high_vram_vllm: VllmWorkflowResources | None = None
     megatron_env: dict[str, str] = Field(default_factory=dict)
 
 
@@ -103,6 +105,15 @@ _DSV4_TP2_EP4 = MegatronWorkflowTopology(
     ep=4,
     etp=1,
     dp=2,
+    cp=1,
+    pp=1,
+    sp=True,
+)
+_DSV4_TP2_EP2 = MegatronWorkflowTopology(
+    tp=2,
+    ep=2,
+    etp=1,
+    dp=1,
     cp=1,
     pp=1,
     sp=True,
@@ -143,15 +154,32 @@ _DSV4_MEGATRON = MegatronWorkflowResources(
     gpu_ids=[0, 1, 2, 3],
     topology=_DSV4_TP2_EP4,
 )
+_DSV4_HIGH_VRAM_MEGATRON = MegatronWorkflowResources(
+    gpu_ids=[0, 1],
+    topology=_DSV4_TP2_EP2,
+)
 _DSV4_FULL_VLLM_EP4 = VllmWorkflowResources(
     gpu_ids=[4, 5, 6, 7],
     tensor_parallel_size=4,
     enable_expert_parallel=True,
     extra_engine_args=_DSV4_COMMON_VLLM_ENGINE_ARGS,
 )
+_DSV4_FULL_VLLM_EP2 = VllmWorkflowResources(
+    gpu_ids=[2, 3],
+    tensor_parallel_size=2,
+    enable_expert_parallel=True,
+    extra_engine_args=_DSV4_COMMON_VLLM_ENGINE_ARGS,
+)
 _DSV4_REDUCED_VLLM_EP4 = VllmWorkflowResources(
     gpu_ids=[4, 5, 6, 7],
     tensor_parallel_size=4,
+    enable_expert_parallel=True,
+    hf_overrides=_DSV4_HF_OVERRIDES,
+    extra_engine_args=_DSV4_REDUCED_VLLM_ENGINE_ARGS,
+)
+_DSV4_REDUCED_VLLM_EP2 = VllmWorkflowResources(
+    gpu_ids=[2, 3],
+    tensor_parallel_size=2,
     enable_expert_parallel=True,
     hf_overrides=_DSV4_HF_OVERRIDES,
     extra_engine_args=_DSV4_REDUCED_VLLM_ENGINE_ARGS,
@@ -170,16 +198,18 @@ HANDLER_WORKFLOW_RESOURCES: dict[str, HandlerWorkflowResources] = {
         train_inf_mismatch=WorkflowStageResources(
             required_world_size=8,
             required_h200_equivalent_gpus=8,
-            allow_gpu_overlap=True,
             megatron=_DSV4_MEGATRON,
             vllm=_DSV4_FULL_VLLM_EP4,
+            high_vram_megatron=_DSV4_HIGH_VRAM_MEGATRON,
+            high_vram_vllm=_DSV4_FULL_VLLM_EP2,
         ),
         merged_vllm_serving=WorkflowStageResources(
             required_world_size=8,
             required_h200_equivalent_gpus=8,
-            allow_gpu_overlap=True,
             megatron=_DSV4_MEGATRON,
             vllm=_DSV4_REDUCED_VLLM_EP4,
+            high_vram_megatron=_DSV4_HIGH_VRAM_MEGATRON,
+            high_vram_vllm=_DSV4_REDUCED_VLLM_EP2,
             megatron_env=_DSV4_MEGATRON_ENV,
         ),
         native_vllm_lora=WorkflowStageResources(
@@ -189,9 +219,10 @@ HANDLER_WORKFLOW_RESOURCES: dict[str, HandlerWorkflowResources] = {
         yes_no_trainability=WorkflowStageResources(
             required_world_size=8,
             required_h200_equivalent_gpus=8,
-            allow_gpu_overlap=True,
             megatron=_DSV4_MEGATRON,
             vllm=_DSV4_FULL_VLLM_EP4,
+            high_vram_megatron=_DSV4_HIGH_VRAM_MEGATRON,
+            high_vram_vllm=_DSV4_FULL_VLLM_EP2,
         ),
         yes_no_trainability_variant="megatron_dedicated",
     ),
@@ -244,6 +275,17 @@ def _remap_gpu_ids_to_visible(
     return list(range(len(gpu_ids)))
 
 
+def _validate_gpu_ids_visible(gpu_ids: list[int], *, visible_gpu_count: int) -> None:
+    invalid = [
+        gpu_id for gpu_id in gpu_ids if gpu_id < 0 or gpu_id >= visible_gpu_count
+    ]
+    if invalid:
+        raise RuntimeError(
+            f"Workflow GPU ids {gpu_ids} are not visible on host with "
+            f"{visible_gpu_count} GPUs"
+        )
+
+
 def resolve_stage_resources_for_visible_gpus(
     stage_name: str,
     stage_resources: WorkflowStageResources,
@@ -256,16 +298,35 @@ def resolve_stage_resources_for_visible_gpus(
     available_equivalent = _visible_h200_equivalent_gpus(
         visible_gpu_count=visible_gpu_count
     )
-    if (
-        required_equivalent is None
-        or available_equivalent < required_equivalent
-        or not stage_resources.allow_gpu_overlap
-    ):
+    if required_equivalent is None or available_equivalent < required_equivalent:
         raise RuntimeError(
             f"Need {stage_resources.required_world_size} visible GPUs for "
             f"{stage_name}, found {visible_gpu_count}. High-VRAM remapping "
             f"requires {required_equivalent or stage_resources.required_world_size} "
             f"H200-equivalent GPUs, found {available_equivalent}."
+        )
+    if (
+        stage_resources.high_vram_megatron is not None
+        or stage_resources.high_vram_vllm is not None
+    ):
+        megatron = stage_resources.high_vram_megatron or stage_resources.megatron
+        vllm = stage_resources.high_vram_vllm or stage_resources.vllm
+        if megatron is not None:
+            _validate_gpu_ids_visible(
+                megatron.gpu_ids,
+                visible_gpu_count=visible_gpu_count,
+            )
+        if vllm is not None:
+            _validate_gpu_ids_visible(
+                vllm.gpu_ids,
+                visible_gpu_count=visible_gpu_count,
+            )
+        return stage_resources.model_copy(update={"megatron": megatron, "vllm": vllm})
+    if not stage_resources.allow_gpu_overlap:
+        raise RuntimeError(
+            f"Need {stage_resources.required_world_size} visible GPUs for "
+            f"{stage_name}, found {visible_gpu_count}. No high-VRAM resource "
+            "override is configured for this stage."
         )
     megatron = stage_resources.megatron
     if megatron is not None:
