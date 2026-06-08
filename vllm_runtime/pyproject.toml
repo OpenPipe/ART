@@ -4,9 +4,23 @@ version = "0.1.0"
 description = "Tiny ART-owned vLLM runtime package"
 requires-python = ">=3.12,<3.13"
 dependencies = [
-    "nvidia-nccl-cu12==2.28.9 ; sys_platform == 'linux'",
     "transformers==5.6.2",
-    "vllm @ https://wheels.vllm.ai/ecd0b60aad2f4e28dd00ababfc1402690d88cbed/vllm-0.20.2rc1.dev168%2Bgecd0b60aa.cu129-cp38-abi3-manylinux_2_34_x86_64.whl ; sys_platform == 'linux'",
+]
+
+[project.optional-dependencies]
+cuda12 = [
+    "nvidia-nccl-cu12==2.28.9 ; sys_platform == 'linux'",
+    "torch==2.11.0 ; sys_platform == 'linux'",
+    "torchaudio==2.11.0 ; sys_platform == 'linux'",
+    "torchvision==0.26.0 ; sys_platform == 'linux'",
+    "vllm==0.20.2rc1.dev168+gecd0b60aa ; sys_platform == 'linux'",
+]
+cuda13 = [
+    "nvidia-nccl-cu13==2.28.9 ; sys_platform == 'linux'",
+    "torch==2.11.0 ; sys_platform == 'linux'",
+    "torchaudio==2.11.0 ; sys_platform == 'linux'",
+    "torchvision==0.26.0 ; sys_platform == 'linux'",
+    "vllm==0.20.2rc1.dev168+gecd0b60aa ; sys_platform == 'linux'",
 ]
 
 [project.scripts]
@@ -30,12 +44,52 @@ allow-direct-references = true
 
 [tool.uv]
 required-version = ">=0.6.15"
+conflicts = [
+    [
+        { extra = "cuda12" },
+        { extra = "cuda13" },
+    ],
+]
 override-dependencies = [
     "flashinfer-python==0.6.8.post1",
     "numpy<2",
-    "nvidia-nccl-cu12==2.28.9 ; sys_platform == 'linux'",
-    "torch @ https://download.pytorch.org/whl/test/cu128/torch-2.11.0%2Bcu128-cp312-cp312-manylinux_2_28_x86_64.whl",
-    "torchaudio @ https://download.pytorch.org/whl/test/cu128/torchaudio-2.11.0%2Bcu128-cp312-cp312-manylinux_2_28_x86_64.whl",
-    "torchvision @ https://download.pytorch.org/whl/test/cu128/torchvision-0.26.0%2Bcu128-cp312-cp312-manylinux_2_28_x86_64.whl",
     "transformers==5.6.2",
 ]
+
+[tool.uv.sources]
+torch = [
+    { index = "pytorch-cu128", extra = "cuda12" },
+    { index = "pytorch-cu130", extra = "cuda13" },
+]
+torchaudio = [
+    { index = "pytorch-cu128", extra = "cuda12" },
+    { index = "pytorch-cu130", extra = "cuda13" },
+]
+torchvision = [
+    { index = "pytorch-cu128", extra = "cuda12" },
+    { index = "pytorch-cu130", extra = "cuda13" },
+]
+vllm = [
+    { index = "vllm-commit-cu129", extra = "cuda12" },
+    { index = "vllm-commit-cu130", extra = "cuda13" },
+]
+
+[[tool.uv.index]]
+name = "pytorch-cu128"
+url = "https://download.pytorch.org/whl/test/cu128"
+explicit = true
+
+[[tool.uv.index]]
+name = "pytorch-cu130"
+url = "https://download.pytorch.org/whl/cu130"
+explicit = true
+
+[[tool.uv.index]]
+name = "vllm-commit-cu129"
+url = "https://wheels.vllm.ai/ecd0b60aad2f4e28dd00ababfc1402690d88cbed"
+explicit = true
+
+[[tool.uv.index]]
+name = "vllm-commit-cu130"
+url = "https://wheels.vllm.ai/ecd0b60aad2f4e28dd00ababfc1402690d88cbed/cu130"
+explicit = true
