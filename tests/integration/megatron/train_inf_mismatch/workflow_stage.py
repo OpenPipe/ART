@@ -66,6 +66,9 @@ def run_train_inf_mismatch(*, base_model: str) -> TrainInfMismatchReport:
     max_attempts = _attempt_limit()
     env = os.environ.copy()
     env["BASE_MODEL"] = base_model
+    env["WANDB_DISABLED"] = "true"
+    env["WANDB_MODE"] = "disabled"
+    env.pop("WANDB_API_KEY", None)
     env["ART_RUN_TRAIN_INF_MISMATCH_LIVE"] = "1"
     env["ART_TRAIN_INF_MISMATCH_BASE_MODEL"] = base_model
     env["ART_REAL_PATH_MAX_COMPLETION_TOKENS"] = "16"

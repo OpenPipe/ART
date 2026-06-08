@@ -39,7 +39,7 @@ def patch_preprocess_mask_arguments() -> None:
 
 def disable_broken_torchvision_for_transformers() -> None:
     try:
-        import torchvision  # noqa: F401
+        import torchvision  # noqa: F401  # ty: ignore[unresolved-import]
 
         return
     except Exception:

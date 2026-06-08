@@ -23,8 +23,8 @@ from ..model_support.oracle_harness import (
 from ..model_support.oracle_worker import provider_topology_env
 from ..model_support.workflow_resources import (
     handler_workflow_resources_for_base_model,
+    resolve_stage_resources_for_visible_gpus,
     validate_dedicated_test_resources,
-    validate_visible_gpu_count,
 )
 
 _TRAINER_GPU_IDS_ENV = "ART_MODEL_SUPPORT_TRAINER_GPU_IDS"
@@ -122,13 +122,13 @@ async def _run_native_vllm_lora(
         workflow_resources.native_vllm_lora if workflow_resources is not None else None
     )
     if stage_resources is not None:
-        if stage_resources.vllm is None:
-            raise RuntimeError("native_vllm_lora resources require vLLM")
-        validate_visible_gpu_count(
+        stage_resources = resolve_stage_resources_for_visible_gpus(
             "native_vllm_lora",
             stage_resources,
             visible_gpu_count=int(torch.cuda.device_count()),
         )
+        if stage_resources.vllm is None:
+            raise RuntimeError("native_vllm_lora resources require vLLM")
         trainer_gpu_ids = [0]
         inference_gpu_ids = list(stage_resources.vllm.gpu_ids)
         validate_dedicated_test_resources(

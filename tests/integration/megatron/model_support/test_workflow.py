@@ -1,5 +1,7 @@
 import os
+from pathlib import Path
 from types import SimpleNamespace
+from typing import cast
 
 from art.megatron.model_support.spec import (
     ArchitectureReport,
@@ -26,6 +28,11 @@ from .workflow import (
     run_yes_no_trainability_stage,
     validated_architecture_representative_models,
 )
+from .workflow_resources import (
+    _h200_equivalent_slots_for_total_gib,
+    handler_workflow_resources_for_base_model,
+    resolve_stage_resources_for_visible_gpus,
+)
 
 
 def test_build_validation_stage_names_has_fixed_order() -> None:
@@ -48,6 +55,63 @@ def test_validated_architecture_representative_models_are_fixed() -> None:
         "Qwen/Qwen3.5-27B",
         "deepseek-ai/DeepSeek-V4-Flash",
     ]
+
+
+def test_dsv4_runtime_stages_use_full_model_resources() -> None:
+    resources = handler_workflow_resources_for_base_model(
+        "deepseek-ai/DeepSeek-V4-Flash"
+    )
+    assert resources is not None
+    for stage in (resources.train_inf_mismatch, resources.yes_no_trainability):
+        assert stage is not None
+        assert stage.required_world_size == 8
+        assert stage.required_h200_equivalent_gpus == 8
+        assert stage.allow_gpu_overlap is True
+        assert stage.megatron_env == {}
+        assert stage.vllm is not None
+        assert stage.vllm.gpu_ids == [4, 5, 6, 7]
+        engine_args = stage.vllm.engine_args()
+        assert "hf_overrides" not in engine_args
+        assert engine_args.get("load_format") != "dummy"
+
+    for stage in (resources.merged_vllm_serving, resources.native_vllm_lora):
+        assert stage is not None
+        assert stage.vllm is not None
+        engine_args = stage.vllm.engine_args()
+        assert engine_args["load_format"] == "dummy"
+        hf_overrides = cast(dict[str, object], engine_args["hf_overrides"])
+        assert hf_overrides["num_hidden_layers"] == 4
+
+
+def test_dsv4_resources_remap_to_four_high_vram_gpus(monkeypatch) -> None:
+    resources = handler_workflow_resources_for_base_model(
+        "deepseek-ai/DeepSeek-V4-Flash"
+    )
+    assert resources is not None
+    assert resources.train_inf_mismatch is not None
+    monkeypatch.setattr(
+        "tests.integration.megatron.model_support.workflow_resources."
+        "_visible_h200_equivalent_gpus",
+        lambda *, visible_gpu_count: 8,
+    )
+
+    stage = resolve_stage_resources_for_visible_gpus(
+        "train_inf_mismatch",
+        resources.train_inf_mismatch,
+        visible_gpu_count=4,
+    )
+
+    assert stage.megatron is not None
+    assert stage.vllm is not None
+    assert stage.megatron.gpu_ids == [0, 1, 2, 3]
+    assert stage.vllm.gpu_ids == [0, 1, 2, 3]
+    assert stage.allow_gpu_overlap is True
+
+
+def test_h200_equivalent_slots_tolerate_reported_gb300_vram() -> None:
+    assert _h200_equivalent_slots_for_total_gib(80.0) == 0
+    assert _h200_equivalent_slots_for_total_gib(139.0) == 1
+    assert _h200_equivalent_slots_for_total_gib(276.6) == 2
 
 
 def test_inspect_architecture_for_workflow_uses_minimal_topology(monkeypatch) -> None:
@@ -1061,7 +1125,9 @@ def test_run_correctness_sensitivity_stage_can_skip_sensitivity_only(
     assert stage.metrics["sensitivity_variants"] == []
 
 
-def test_run_merged_vllm_serving_stage_reports_served_model(monkeypatch) -> None:
+def test_run_merged_vllm_serving_stage_reports_served_model(
+    monkeypatch, tmp_path: Path
+) -> None:
     architecture = ArchitectureReport(
         base_model="Qwen/Qwen3.5-35B-A3B",
         model_key="qwen3_5_moe",
@@ -1071,13 +1137,23 @@ def test_run_merged_vllm_serving_stage_reports_served_model(monkeypatch) -> None
     oracle_module = SimpleNamespace(
         OracleCaseConfig=lambda **kwargs: SimpleNamespace(**kwargs)
     )
+    output_dir = tmp_path / "merged-serving"
+    log_dir = output_dir / "logs"
+    log_dir.mkdir(parents=True)
+    warning = (
+        "Worker WARNING DeepseekV4MLAAttention: Failed to load weights load_numel=0"
+    )
+    (log_dir / "vllm-runtime.log").write_text(f"{warning}\n", encoding="utf-8")
     merged_module = SimpleNamespace(
         run_merged_vllm_serving=lambda case_config: SimpleNamespace(
-            output_dir="/tmp/merged-serving",
+            output_dir=str(output_dir),
             model_ids=["validation@0"],
+            completion_text="x",
             model_dump=lambda mode="json": {
                 "base_model": "Qwen/Qwen3.5-35B-A3B",
                 "served_model_name": "validation@0",
+                "model_ids": ["validation@0"],
+                "completion_text": "x",
             },
         )
     )
@@ -1104,5 +1180,16 @@ def test_run_merged_vllm_serving_stage_reports_served_model(monkeypatch) -> None
     assert stage.metrics == {
         "base_model": "Qwen/Qwen3.5-35B-A3B",
         "served_model_name": "validation@0",
+        "model_ids": ["validation@0"],
+        "completion_text": "x",
+        "vllm_reload_warning_count": 1,
+        "vllm_reload_warnings": [warning],
+        "readable_summary": [
+            "served_model_name=validation@0",
+            "model_ids=['validation@0']",
+            "completion_text='x'",
+            "vllm_reload_warning_count=1",
+            f"vllm_reload_warning={warning}",
+        ],
     }
-    assert stage.artifact_dir == "/tmp/merged-serving"
+    assert stage.artifact_dir == str(output_dir)

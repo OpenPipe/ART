@@ -17,6 +17,7 @@ def apply_vllm_runtime_patches() -> None:
     patch_tool_parser_manager()
     patch_nccl_unique_id_bootstrap()
     patch_layerwise_reload_shadow_attrs()
+    patch_dsv4_attn_sink_layerwise_reload()
     patch_routed_experts_prefix_cache_sidecar()
 
 
@@ -214,6 +215,120 @@ def patch_layerwise_reload_shadow_attrs() -> None:
     layerwise.restore_layer_on_meta = restore_layer_on_meta  # type: ignore[method-assign]
     layerwise._place_kernel_tensors = _place_kernel_tensors  # type: ignore[method-assign]
     setattr(meta, "_art_reload_shadow_attrs_patched", True)
+
+
+def patch_dsv4_attn_sink_layerwise_reload() -> None:
+    """Route DSV4 attention-sink loads through vLLM's layerwise loader.
+
+    Merged-weight transfer uses vLLM checkpoint-format reload. During that path,
+    every loadable parameter must be applied through its `weight_loader`; direct
+    `copy_` into `attn_sink` bypasses layerwise accounting and finalize restores
+    the old kernel tensor. With `load_format=dummy`, that old tensor is the
+    initialized sink, not the checkpoint sink.
+    """
+    try:
+        from vllm.models.deepseek_v4.nvidia import model as dsv4_model
+    except ImportError:
+        return
+
+    model_cls = getattr(dsv4_model, "DeepseekV4Model", None)
+    if model_cls is None:
+        return
+    original = model_cls.load_weights
+    if getattr(original, "__art_patched__", False):
+        return
+
+    def load_weights(self: Any, weights: Any) -> set[str]:
+        stacked_params_mapping = [
+            ("gate_up_proj", "w1", 0),
+            ("gate_up_proj", "w3", 1),
+            ("attn.fused_wqa_wkv", "attn.wq_a", 0),
+            ("attn.fused_wqa_wkv", "attn.wkv", 1),
+            ("compressor.fused_wkv_wgate", "compressor.wkv", 0),
+            ("compressor.fused_wkv_wgate", "compressor.wgate", 1),
+        ]
+        params_dict = dict(self.named_parameters())
+        loaded_params: set[str] = set()
+
+        tp_size = dsv4_model.get_tensor_model_parallel_world_size()
+        tp_rank = dsv4_model.get_tensor_model_parallel_rank()
+        n_head = self.config.num_attention_heads
+        n_local_head = n_head // tp_size
+        head_rank_start = n_local_head * tp_rank
+        head_rank_end = n_local_head * (tp_rank + 1)
+        expert_mapping = self.get_expert_mapping()
+
+        for name, loaded_weight in weights:
+            for param_name, weight_name, shard_id in stacked_params_mapping:
+                if ".experts." in name:
+                    continue
+                if weight_name not in name:
+                    continue
+                name = name.replace(weight_name, param_name)
+
+                if dsv4_model.is_pp_missing_parameter(name, self):
+                    break
+                param = params_dict[name]
+                param.weight_loader(param, loaded_weight, shard_id)
+                loaded_params.add(name)
+                break
+            else:
+                if ".experts." in name:
+                    if (
+                        "weight_scale" in name
+                        and loaded_weight.dtype == dsv4_model.torch.float8_e8m0fnu
+                    ):
+                        loaded_weight = loaded_weight.view(dsv4_model.torch.uint8)
+                    for mapping in expert_mapping:
+                        param_name, weight_name, expert_id, expert_shard_id = mapping
+                        if weight_name not in name:
+                            continue
+                        name_mapped = name.replace(weight_name, param_name)
+                        if dsv4_model.is_pp_missing_parameter(name_mapped, self):
+                            continue
+                        param = params_dict[name_mapped]
+                        success = param.weight_loader(
+                            param,
+                            loaded_weight,
+                            name_mapped,
+                            shard_id=expert_shard_id,
+                            expert_id=expert_id,
+                            return_success=True,
+                        )
+                        if success:
+                            name = name_mapped
+                            break
+                    loaded_params.add(name_mapped)
+                    continue
+                if "attn_sink" in name:
+                    if dsv4_model.is_pp_missing_parameter(name, self):
+                        continue
+                    param = params_dict[name]
+                    narrow_weight = loaded_weight[head_rank_start:head_rank_end]
+                    padded_weight = loaded_weight.new_full(
+                        tuple(param.shape), -float("inf")
+                    )
+                    padded_weight[: narrow_weight.shape[0]].copy_(narrow_weight)
+                    weight_loader = getattr(
+                        param, "weight_loader", dsv4_model.default_weight_loader
+                    )
+                    weight_loader(param, padded_weight)
+                    loaded_params.add(name)
+                    continue
+
+                if dsv4_model.is_pp_missing_parameter(name, self):
+                    continue
+                param = params_dict[name]
+                weight_loader = getattr(
+                    param, "weight_loader", dsv4_model.default_weight_loader
+                )
+                weight_loader(param, loaded_weight)
+                loaded_params.add(name)
+
+        return loaded_params
+
+    load_weights.__art_patched__ = True  # type: ignore[attr-defined]
+    model_cls.load_weights = load_weights  # type: ignore[method-assign]
 
 
 def _lora_cache_key(lora_request: Any) -> tuple[Any, ...]:

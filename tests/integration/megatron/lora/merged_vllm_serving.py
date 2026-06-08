@@ -21,8 +21,8 @@ from ..model_support.oracle_harness import (
 from ..model_support.oracle_worker import provider_topology_env
 from ..model_support.workflow_resources import (
     handler_workflow_resources_for_base_model,
+    resolve_stage_resources_for_visible_gpus,
     validate_dedicated_test_resources,
-    validate_visible_gpu_count,
 )
 
 _TRAINER_GPU_IDS_ENV = "ART_MODEL_SUPPORT_TRAINER_GPU_IDS"
@@ -102,21 +102,22 @@ async def _run_merged_vllm_serving(
         else None
     )
     if stage_resources is not None:
-        if stage_resources.megatron is None or stage_resources.vllm is None:
-            raise RuntimeError(
-                "merged_vllm_serving resources require Megatron and vLLM"
-            )
-        validate_visible_gpu_count(
+        stage_resources = resolve_stage_resources_for_visible_gpus(
             "merged_vllm_serving",
             stage_resources,
             visible_gpu_count=int(torch.cuda.device_count()),
         )
+        if stage_resources.megatron is None or stage_resources.vllm is None:
+            raise RuntimeError(
+                "merged_vllm_serving resources require Megatron and vLLM"
+            )
         trainer_gpu_ids = list(stage_resources.megatron.gpu_ids)
         inference_gpu_ids = list(stage_resources.vllm.gpu_ids)
         validate_dedicated_test_resources(
             stage_name="merged_vllm_serving",
             trainer_gpu_ids=trainer_gpu_ids,
             inference_gpu_ids=inference_gpu_ids,
+            allow_overlap=stage_resources.allow_gpu_overlap,
         )
         engine_args = cast(dev.EngineArgs, stage_resources.vllm.engine_args())
         megatron_topology = stage_resources.megatron.topology.to_megatron_config()

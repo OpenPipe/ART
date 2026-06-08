@@ -13,6 +13,7 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from ..model_support.workflow_resources import (
     handler_workflow_resources_for_base_model,
+    resolve_stage_resources_for_current_host,
 )
 
 # These gates are intentionally bf16-scale, not fp32 oracle-scale. A 2026-05-18
@@ -341,6 +342,11 @@ def config_from_env() -> TrainInfOutputParityConfig:
         if workflow_resources is not None
         else None
     )
+    if stage_resources is not None:
+        stage_resources = resolve_stage_resources_for_current_host(
+            "train_inf_mismatch",
+            stage_resources,
+        )
     if stage_resources is not None:
         if (
             stage_resources.megatron is not None

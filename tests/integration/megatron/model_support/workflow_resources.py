@@ -4,6 +4,9 @@ from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
+_H200_REFERENCE_VRAM_GIB = 140.0
+_H200_SLOT_TOLERANCE = 0.05
+
 
 class MegatronWorkflowTopology(BaseModel):
     model_config = ConfigDict(frozen=True)
@@ -71,6 +74,8 @@ class WorkflowStageResources(BaseModel):
     model_config = ConfigDict(frozen=True)
 
     required_world_size: int
+    required_h200_equivalent_gpus: int | None = None
+    allow_gpu_overlap: bool = False
     megatron: MegatronWorkflowResources | None = None
     vllm: VllmWorkflowResources | None = None
     megatron_env: dict[str, str] = Field(default_factory=dict)
@@ -120,34 +125,43 @@ _DSV4_HF_OVERRIDES = {
     "layer_types": _DSV4_REPRESENTATIVE_LAYER_TYPES,
     "mlp_layer_types": _DSV4_REPRESENTATIVE_MLP_LAYER_TYPES,
 }
-_DSV4_VLLM_ENGINE_ARGS = {
-    # The DSV4 runtime gates use a reduced 4-layer validation model and then
-    # sync Megatron weights into vLLM through merged-weight transfer. Loading
-    # the full public checkpoint before that sync is incompatible with the
-    # reduced hf_overrides because vLLM still streams layer-4+ tensors.
-    "load_format": "dummy",
+_DSV4_COMMON_VLLM_ENGINE_ARGS = {
     "gpu_memory_utilization": 0.82,
     "kv_cache_dtype": "fp8",
     "max_num_batched_tokens": 1032,
     "moe_backend": "triton_unfused",
 }
+_DSV4_REDUCED_VLLM_ENGINE_ARGS = {
+    **_DSV4_COMMON_VLLM_ENGINE_ARGS,
+    # The quick DSV4 vLLM serving gates use a reduced 4-layer validation model and then
+    # sync Megatron weights into vLLM through merged-weight transfer. Loading
+    # the full public checkpoint before that sync is incompatible with the
+    # reduced hf_overrides because vLLM still streams layer-4+ tensors.
+    "load_format": "dummy",
+}
 _DSV4_MEGATRON = MegatronWorkflowResources(
     gpu_ids=[0, 1, 2, 3],
     topology=_DSV4_TP2_EP4,
 )
-_DSV4_VLLM_EP4 = VllmWorkflowResources(
+_DSV4_FULL_VLLM_EP4 = VllmWorkflowResources(
+    gpu_ids=[4, 5, 6, 7],
+    tensor_parallel_size=4,
+    enable_expert_parallel=True,
+    extra_engine_args=_DSV4_COMMON_VLLM_ENGINE_ARGS,
+)
+_DSV4_REDUCED_VLLM_EP4 = VllmWorkflowResources(
     gpu_ids=[4, 5, 6, 7],
     tensor_parallel_size=4,
     enable_expert_parallel=True,
     hf_overrides=_DSV4_HF_OVERRIDES,
-    extra_engine_args=_DSV4_VLLM_ENGINE_ARGS,
+    extra_engine_args=_DSV4_REDUCED_VLLM_ENGINE_ARGS,
 )
-_DSV4_NATIVE_VLLM_EP4 = VllmWorkflowResources(
+_DSV4_REDUCED_NATIVE_VLLM_EP4 = VllmWorkflowResources(
     gpu_ids=[0, 1, 2, 3],
     tensor_parallel_size=4,
     enable_expert_parallel=True,
     hf_overrides=_DSV4_HF_OVERRIDES,
-    extra_engine_args=_DSV4_VLLM_ENGINE_ARGS,
+    extra_engine_args=_DSV4_REDUCED_VLLM_ENGINE_ARGS,
 )
 
 # Explicitly for large models which do not fit in the default topology.
@@ -155,25 +169,29 @@ HANDLER_WORKFLOW_RESOURCES: dict[str, HandlerWorkflowResources] = {
     "dsv4": HandlerWorkflowResources(
         train_inf_mismatch=WorkflowStageResources(
             required_world_size=8,
+            required_h200_equivalent_gpus=8,
+            allow_gpu_overlap=True,
             megatron=_DSV4_MEGATRON,
-            vllm=_DSV4_VLLM_EP4,
-            megatron_env=_DSV4_MEGATRON_ENV,
+            vllm=_DSV4_FULL_VLLM_EP4,
         ),
         merged_vllm_serving=WorkflowStageResources(
             required_world_size=8,
+            required_h200_equivalent_gpus=8,
+            allow_gpu_overlap=True,
             megatron=_DSV4_MEGATRON,
-            vllm=_DSV4_VLLM_EP4,
+            vllm=_DSV4_REDUCED_VLLM_EP4,
             megatron_env=_DSV4_MEGATRON_ENV,
         ),
         native_vllm_lora=WorkflowStageResources(
             required_world_size=4,
-            vllm=_DSV4_NATIVE_VLLM_EP4,
+            vllm=_DSV4_REDUCED_NATIVE_VLLM_EP4,
         ),
         yes_no_trainability=WorkflowStageResources(
             required_world_size=8,
+            required_h200_equivalent_gpus=8,
+            allow_gpu_overlap=True,
             megatron=_DSV4_MEGATRON,
-            vllm=_DSV4_VLLM_EP4,
-            megatron_env=_DSV4_MEGATRON_ENV,
+            vllm=_DSV4_FULL_VLLM_EP4,
         ),
         yes_no_trainability_variant="megatron_dedicated",
     ),
@@ -192,6 +210,101 @@ def handler_workflow_resources_for_base_model(
         allow_unvalidated_arch=allow_unvalidated_arch,
     )
     return HANDLER_WORKFLOW_RESOURCES.get(spec.handler_key)
+
+
+def _h200_equivalent_slots_for_total_gib(total_gib: float) -> int:
+    return max(0, int(total_gib / _H200_REFERENCE_VRAM_GIB + _H200_SLOT_TOLERANCE))
+
+
+def _visible_h200_equivalent_gpus(*, visible_gpu_count: int) -> int:
+    try:
+        import torch
+    except ImportError:
+        return 0
+    if not torch.cuda.is_available():
+        return 0
+    equivalent = 0
+    for device_index in range(visible_gpu_count):
+        props = torch.cuda.get_device_properties(device_index)
+        total_gib = float(props.total_memory) / (1024**3)
+        equivalent += _h200_equivalent_slots_for_total_gib(total_gib)
+    return equivalent
+
+
+def _remap_gpu_ids_to_visible(
+    gpu_ids: list[int], *, visible_gpu_count: int
+) -> list[int]:
+    if all(0 <= gpu_id < visible_gpu_count for gpu_id in gpu_ids):
+        return list(gpu_ids)
+    if len(gpu_ids) > visible_gpu_count:
+        raise RuntimeError(
+            "Cannot remap workflow GPU ids to visible high-VRAM devices: "
+            f"gpu_ids={gpu_ids}, visible_gpu_count={visible_gpu_count}"
+        )
+    return list(range(len(gpu_ids)))
+
+
+def resolve_stage_resources_for_visible_gpus(
+    stage_name: str,
+    stage_resources: WorkflowStageResources,
+    *,
+    visible_gpu_count: int,
+) -> WorkflowStageResources:
+    if visible_gpu_count >= stage_resources.required_world_size:
+        return stage_resources
+    required_equivalent = stage_resources.required_h200_equivalent_gpus
+    available_equivalent = _visible_h200_equivalent_gpus(
+        visible_gpu_count=visible_gpu_count
+    )
+    if (
+        required_equivalent is None
+        or available_equivalent < required_equivalent
+        or not stage_resources.allow_gpu_overlap
+    ):
+        raise RuntimeError(
+            f"Need {stage_resources.required_world_size} visible GPUs for "
+            f"{stage_name}, found {visible_gpu_count}. High-VRAM remapping "
+            f"requires {required_equivalent or stage_resources.required_world_size} "
+            f"H200-equivalent GPUs, found {available_equivalent}."
+        )
+    megatron = stage_resources.megatron
+    if megatron is not None:
+        megatron = megatron.model_copy(
+            update={
+                "gpu_ids": _remap_gpu_ids_to_visible(
+                    megatron.gpu_ids,
+                    visible_gpu_count=visible_gpu_count,
+                )
+            }
+        )
+    vllm = stage_resources.vllm
+    if vllm is not None:
+        vllm = vllm.model_copy(
+            update={
+                "gpu_ids": _remap_gpu_ids_to_visible(
+                    vllm.gpu_ids,
+                    visible_gpu_count=visible_gpu_count,
+                )
+            }
+        )
+    return stage_resources.model_copy(update={"megatron": megatron, "vllm": vllm})
+
+
+def resolve_stage_resources_for_current_host(
+    stage_name: str,
+    stage_resources: WorkflowStageResources,
+) -> WorkflowStageResources:
+    try:
+        import torch
+    except ImportError:
+        visible_gpu_count = 0
+    else:
+        visible_gpu_count = int(torch.cuda.device_count())
+    return resolve_stage_resources_for_visible_gpus(
+        stage_name,
+        stage_resources,
+        visible_gpu_count=visible_gpu_count,
+    )
 
 
 def validate_visible_gpu_count(

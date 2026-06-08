@@ -29,6 +29,7 @@ from ..model_support.oracle_harness import Topology, oracle_topology
 from ..model_support.oracle_worker import provider_topology_env
 from ..model_support.workflow_resources import (
     handler_workflow_resources_for_base_model,
+    resolve_stage_resources_for_current_host,
 )
 
 _TRAINER_GPU_IDS_ENV = "ART_MODEL_SUPPORT_TRAINER_GPU_IDS"
@@ -104,9 +105,11 @@ def build_prompts() -> list[str]:
         for length in (3, 2)
         for words in permutations(("yes", "no", "maybe"), length)
         for body in [
-            ", ".join(f"'{word}'" if use_quotes else word for word in words)
-            if length == 3
-            else " or ".join(f"'{word}'" if use_quotes else word for word in words)
+            (
+                ", ".join(f"'{word}'" if use_quotes else word for word in words)
+                if length == 3
+                else " or ".join(f"'{word}'" if use_quotes else word for word in words)
+            )
         ]
     ]
     if prompt_count <= len(prompts):
@@ -353,6 +356,11 @@ def _build_variant(
         if workflow_resources is not None
         else None
     )
+    if stage_resources is not None:
+        stage_resources = resolve_stage_resources_for_current_host(
+            "yes_no_trainability",
+            stage_resources,
+        )
     is_moe = model_uses_expert_parallel(
         base_model,
         allow_unvalidated_arch=allow_unvalidated_arch,
@@ -384,9 +392,9 @@ def _build_variant(
             name=variant_name,
             backend_name="megatron",
             placement_mode="shared",
-            topology=_SHARED_MEGATRON_TOPOLOGY
-            if is_moe
-            else _DENSE_SHARED_MEGATRON_TOPOLOGY,
+            topology=(
+                _SHARED_MEGATRON_TOPOLOGY if is_moe else _DENSE_SHARED_MEGATRON_TOPOLOGY
+            ),
             trainer_gpu_ids=shared_gpu_ids,
             inference_gpu_ids=shared_gpu_ids,
         )
@@ -510,6 +518,11 @@ def _build_internal_config(
         if workflow_resources is not None
         else None
     )
+    if stage_resources is not None:
+        stage_resources = resolve_stage_resources_for_current_host(
+            "yes_no_trainability",
+            stage_resources,
+        )
     stage_resources_apply = (
         not shared
         and variant.backend_name == "megatron"
@@ -815,6 +828,11 @@ async def run_yes_no_trainability_async(
         if workflow_resources is not None
         else None
     )
+    if stage_resources is not None:
+        stage_resources = resolve_stage_resources_for_current_host(
+            "yes_no_trainability",
+            stage_resources,
+        )
     backend_env = {
         **(stage_resources.megatron_env if stage_resources is not None else {}),
         **(extra_env or {}),

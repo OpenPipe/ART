@@ -1,9 +1,11 @@
 import asyncio
+from types import SimpleNamespace
 from typing import cast
 
 from openai.types.chat.chat_completion import ChatCompletion, Choice
 from openai.types.chat.chat_completion_message import ChatCompletionMessage
 import pytest
+import torch
 
 import art
 
@@ -203,6 +205,13 @@ def test_qwen3_5_moe_shared_variant_enables_expert_parallel(monkeypatch) -> None
 def test_dsv4_trainability_uses_large_model_dedicated_resources(
     monkeypatch,
 ) -> None:
+    monkeypatch.setattr(torch.cuda, "device_count", lambda: 4)
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(
+        torch.cuda,
+        "get_device_properties",
+        lambda device: SimpleNamespace(total_memory=284 * 1024**3),
+    )
     monkeypatch.setattr(
         "tests.integration.megatron.trainability.yes_no_trainability._safe_gpu_memory_utilization",
         lambda device_ids: 0.5,
@@ -228,7 +237,7 @@ def test_dsv4_trainability_uses_large_model_dedicated_resources(
     assert variant.topology.dp == 2
     assert variant.topology.sp is True
     assert variant.trainer_gpu_ids == [0, 1, 2, 3]
-    assert variant.inference_gpu_ids == [4, 5, 6, 7]
+    assert variant.inference_gpu_ids == [0, 1, 2, 3]
     assert config["engine_args"]["tensor_parallel_size"] == 4
     assert config["engine_args"]["enable_expert_parallel"] is True
     assert config["engine_args"]["gpu_memory_utilization"] == 0.82
