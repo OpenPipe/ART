@@ -16,6 +16,7 @@ from art.megatron.model_support.registry import (
     UnsupportedModelArchitectureError,
     get_model_support_handler,
     get_model_support_spec,
+    model_requires_merged_rollout,
     model_uses_expert_parallel,
 )
 import art.megatron.provider as provider_module
@@ -113,6 +114,14 @@ def test_model_support_specs_own_moe_metadata() -> None:
     assert model_uses_expert_parallel("OpenPipe/Qwen3-14B-Instruct") is False
     assert model_uses_expert_parallel("Qwen/Qwen3-30B-A3B-Instruct-2507") is True
     assert model_uses_expert_parallel("Qwen/Qwen3.5-35B-A3B") is True
+    assert model_uses_expert_parallel("deepseek-ai/DeepSeek-V4-Flash") is True
+
+
+def test_dsv4_prefers_validated_native_lora_rollout() -> None:
+    spec = get_model_support_spec("deepseek-ai/DeepSeek-V4-Flash")
+
+    assert spec.native_vllm_lora_status == "validated"
+    assert model_requires_merged_rollout("deepseek-ai/DeepSeek-V4-Flash") is False
 
 
 def test_megatron_lora_rank_defaults_by_architecture() -> None:
