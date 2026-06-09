@@ -150,6 +150,10 @@ _DSV4_REDUCED_VLLM_ENGINE_ARGS = {
     # reduced hf_overrides because vLLM still streams layer-4+ tensors.
     "load_format": "dummy",
 }
+_DSV4_NATIVE_LORA_VLLM_ENGINE_ARGS = {
+    **_DSV4_REDUCED_VLLM_ENGINE_ARGS,
+    "moe_backend": "marlin",
+}
 _DSV4_MEGATRON = MegatronWorkflowResources(
     gpu_ids=[0, 1, 2, 3],
     topology=_DSV4_TP2_EP4,
@@ -189,7 +193,7 @@ _DSV4_REDUCED_NATIVE_VLLM_EP4 = VllmWorkflowResources(
     tensor_parallel_size=4,
     enable_expert_parallel=True,
     hf_overrides=_DSV4_HF_OVERRIDES,
-    extra_engine_args=_DSV4_REDUCED_VLLM_ENGINE_ARGS,
+    extra_engine_args=_DSV4_NATIVE_LORA_VLLM_ENGINE_ARGS,
 )
 
 # Explicitly for large models which do not fit in the default topology.

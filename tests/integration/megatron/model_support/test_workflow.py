@@ -85,6 +85,9 @@ def test_dsv4_runtime_stages_use_full_model_resources() -> None:
         assert engine_args["load_format"] == "dummy"
         hf_overrides = cast(dict[str, object], engine_args["hf_overrides"])
         assert hf_overrides["num_hidden_layers"] == 4
+    assert resources.native_vllm_lora is not None
+    assert resources.native_vllm_lora.vllm is not None
+    assert resources.native_vllm_lora.vllm.engine_args()["moe_backend"] == "marlin"
 
 
 def test_dsv4_resources_remap_to_four_high_vram_gpus(monkeypatch) -> None:
