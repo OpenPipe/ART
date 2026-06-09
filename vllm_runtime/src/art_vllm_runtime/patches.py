@@ -20,7 +20,7 @@ def apply_vllm_runtime_patches() -> None:
     patch_layerwise_reload_shadow_attrs()
     patch_dsv4_attn_sink_layerwise_reload()
     patch_dsv4_lora_support()
-    patch_lora_linear_weight_scale_proxy()
+    patch_lora_linear_base_attr_proxy()
     patch_routed_experts_prefix_cache_sidecar()
 
 
@@ -374,25 +374,32 @@ def patch_dsv4_lora_support() -> None:
     model_cls._art_dsv4_lora_patched = True
 
 
-def patch_lora_linear_weight_scale_proxy() -> None:
-    """Expose base FP8 scale metadata through vLLM linear LoRA wrappers.
+def _base_layer_attr_proxy(name: str) -> property:
+    def attr(self: Any) -> Any:
+        return getattr(self.base_layer, name)
+
+    return property(attr)
+
+
+def patch_lora_linear_base_attr_proxy() -> None:
+    """Expose DSV4 base metadata through vLLM linear LoRA wrappers.
 
     DeepSeek V4's output attention path calls a custom FP8 einsum directly and
     reads ``wo_a.weight_scale_inv`` next to ``wo_a.weight``. vLLM's linear LoRA
-    wrappers already proxy ``weight`` but not the quant scale, so DSV4 LoRA
-    warmup fails after wrapping ``wo_a``. Keep the scale tensor owned by the
-    base layer instead of copying or re-registering it on every wrapper.
+    wrappers already proxy ``weight`` but not the quant scale. Its router also
+    reads dynamic gate metadata from ``self.gate`` after that gate can be LoRA
+    wrapped. Keep these tensors owned by the base layer instead of copying or
+    re-registering them on every wrapper.
     """
     from vllm.lora.layers.base_linear import BaseLinearLayerWithLoRA
 
-    if getattr(BaseLinearLayerWithLoRA, "_art_weight_scale_proxy_patched", False):
+    if getattr(BaseLinearLayerWithLoRA, "_art_base_attr_proxy_patched", False):
         return
 
-    def weight_scale_inv(self: Any) -> Any:
-        return getattr(self.base_layer, "weight_scale_inv")
-
-    BaseLinearLayerWithLoRA.weight_scale_inv = property(weight_scale_inv)  # type: ignore[attr-defined]
-    BaseLinearLayerWithLoRA._art_weight_scale_proxy_patched = True
+    for name in ("weight_scale_inv", "tid2eid", "e_score_correction_bias"):
+        if not hasattr(BaseLinearLayerWithLoRA, name):
+            setattr(BaseLinearLayerWithLoRA, name, _base_layer_attr_proxy(name))
+    BaseLinearLayerWithLoRA._art_base_attr_proxy_patched = True
 
 
 def _lora_cache_key(lora_request: Any) -> tuple[Any, ...]:
