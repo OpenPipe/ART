@@ -367,6 +367,7 @@ async def _direct_vllm_runtime(
     engine_args: dict[str, Any],
     forward_trace_dir: Path | None = None,
 ) -> AsyncIterator[tuple[str, int]]:
+    from art.utils.lifecycle import ChildProcessSupervisor, ServiceLifecycle
     import art.vllm_runtime as runtime
 
     port = _free_port()
@@ -381,44 +382,54 @@ async def _direct_vllm_runtime(
         engine_args=engine_args,
         server_args={"return_tokens_as_token_ids": True, **config.server_args},
     )
-    command = runtime.build_vllm_runtime_server_cmd(launch_config)
-    log_path = artifact_dir / f"real_path_vllm_{served_model_name}.log"
-    env = os.environ.copy()
-    env["PYTHONUNBUFFERED"] = "1"
+    runtime_manager = runtime.ManagedVllmRuntime(host=launch_config.host)
+    lifecycle = ServiceLifecycle()
+    child_error: RuntimeError | None = None
+
+    def close_runtime() -> None:
+        if not lifecycle.begin_close():
+            return
+        child_processes.close()
+        runtime_manager.close()
+        lifecycle.restore_parent_cleanup()
+
+    def on_child_process_exit(error: RuntimeError) -> None:
+        nonlocal child_error
+        child_error = error
+        close_runtime()
+
+    child_processes = ChildProcessSupervisor(on_child_process_exit)
+    env_updates = {"PYTHONUNBUFFERED": "1"}
     if forward_trace_dir is not None:
         trace_site = Path(__file__).resolve().parent / "vllm_forward_trace_site"
-        env["ART_VLLM_FORWARD_TRACE_DIR"] = str(forward_trace_dir)
-        env["PYTHONPATH"] = (
+        env_updates["ART_VLLM_FORWARD_TRACE_DIR"] = str(forward_trace_dir)
+        env_updates["PYTHONPATH"] = (
             str(trace_site)
-            if not env.get("PYTHONPATH")
-            else f"{trace_site}{os.pathsep}{env['PYTHONPATH']}"
-        )
-    with log_path.open("w", encoding="utf-8") as log_file:
-        process = subprocess.Popen(
-            command,
-            cwd=str(runtime.get_vllm_runtime_working_dir()),
-            env=env,
-            stdout=log_file,
-            stderr=subprocess.STDOUT,
-            text=True,
+            if not os.environ.get("PYTHONPATH")
+            else f"{trace_site}{os.pathsep}{os.environ['PYTHONPATH']}"
         )
     try:
-        await runtime.wait_for_vllm_runtime(
-            process=process,
-            host=launch_config.host,
-            port=launch_config.port,
-            timeout=float(
-                os.environ.get("ART_TRAIN_INF_MISMATCH_VLLM_TIMEOUT", "1200")
-            ),
-        )
-        yield launch_config.host, launch_config.port
+        with _temporary_env(env_updates):
+            host, port = await runtime_manager.start(
+                launch_config=launch_config,
+                output_dir=str(
+                    artifact_dir / f"real_path_vllm_{served_model_name}_runtime"
+                ),
+                child_processes=child_processes,
+                install_parent_cleanup=lambda: lifecycle.install_parent_cleanup(
+                    close_runtime
+                ),
+                cleanup_on_error=close_runtime,
+                timeout=float(
+                    os.environ.get("ART_TRAIN_INF_MISMATCH_VLLM_TIMEOUT", "1200")
+                ),
+            )
+        child_processes.raise_if_failed()
+        if child_error is not None:
+            raise child_error
+        yield host, port
     finally:
-        process.terminate()
-        try:
-            process.wait(timeout=30)
-        except subprocess.TimeoutExpired:
-            process.kill()
-            process.wait(timeout=30)
+        close_runtime()
 
 
 def _topk_from_chat_logprob(entry: Any) -> TokenTopK:
