@@ -703,6 +703,33 @@ def test_dsv4_vllm_lora_roundtrip_preserves_expert_factors(tmp_path: Path) -> No
         handler=DSV4_HANDLER,
     )
     _assert_tensors_equal(roundtrip_from_disk, original)
+    expected_modules = {
+        "wq_a",
+        "wq_b",
+        "wkv",
+        "wo_a",
+        "wo_b",
+        "wgate",
+        "gate_proj",
+        "up_proj",
+        "down_proj",
+        "experts",
+    }
+    for expert_id in range(2):
+        expected_modules.update(
+            {
+                f"experts.{expert_id}.w1",
+                f"experts.{expert_id}.w2",
+                f"experts.{expert_id}.w3",
+            }
+        )
+    loaded_modules = _assert_stock_vllm_loads(
+        adapter_dir,
+        expected_modules=expected_modules,
+    )
+    assert f"model.layers.0.ffn.experts.0.w1" in loaded_modules
+    assert f"model.layers.0.ffn.experts.0.w3" in loaded_modules
+    assert f"model.layers.0.attn.mla_attn.compressor.wgate" in loaded_modules
 
 
 def test_qwen35_target_parameter_identity_normalizes_to_fused_vllm_layout(
