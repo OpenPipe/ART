@@ -140,10 +140,17 @@ _DSV4_COMMON_VLLM_ENGINE_ARGS = {
     "gpu_memory_utilization": 0.82,
     "kv_cache_dtype": "fp8",
     "max_num_batched_tokens": 1032,
+}
+_DSV4_MERGED_VLLM_ENGINE_ARGS = {
+    **_DSV4_COMMON_VLLM_ENGINE_ARGS,
     "moe_backend": "triton_unfused",
 }
-_DSV4_REDUCED_VLLM_ENGINE_ARGS = {
+_DSV4_LORA_VLLM_ENGINE_ARGS = {
     **_DSV4_COMMON_VLLM_ENGINE_ARGS,
+    "moe_backend": "marlin",
+}
+_DSV4_REDUCED_VLLM_ENGINE_ARGS = {
+    **_DSV4_MERGED_VLLM_ENGINE_ARGS,
     # The quick DSV4 vLLM serving gates use a reduced 4-layer validation model and then
     # sync Megatron weights into vLLM through merged-weight transfer. Loading
     # the full public checkpoint before that sync is incompatible with the
@@ -151,8 +158,8 @@ _DSV4_REDUCED_VLLM_ENGINE_ARGS = {
     "load_format": "dummy",
 }
 _DSV4_NATIVE_LORA_VLLM_ENGINE_ARGS = {
-    **_DSV4_REDUCED_VLLM_ENGINE_ARGS,
-    "moe_backend": "marlin",
+    **_DSV4_LORA_VLLM_ENGINE_ARGS,
+    "load_format": "dummy",
 }
 _DSV4_MEGATRON = MegatronWorkflowResources(
     gpu_ids=[0, 1, 2, 3],
@@ -166,13 +173,13 @@ _DSV4_FULL_VLLM_EP4 = VllmWorkflowResources(
     gpu_ids=[4, 5, 6, 7],
     tensor_parallel_size=4,
     enable_expert_parallel=True,
-    extra_engine_args=_DSV4_COMMON_VLLM_ENGINE_ARGS,
+    extra_engine_args=_DSV4_LORA_VLLM_ENGINE_ARGS,
 )
 _DSV4_FULL_VLLM_EP2 = VllmWorkflowResources(
     gpu_ids=[2, 3],
     tensor_parallel_size=2,
     enable_expert_parallel=True,
-    extra_engine_args=_DSV4_COMMON_VLLM_ENGINE_ARGS,
+    extra_engine_args=_DSV4_LORA_VLLM_ENGINE_ARGS,
 )
 _DSV4_REDUCED_VLLM_EP4 = VllmWorkflowResources(
     gpu_ids=[4, 5, 6, 7],
