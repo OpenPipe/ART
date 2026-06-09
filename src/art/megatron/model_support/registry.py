@@ -14,6 +14,7 @@ _QWEN3_5_DENSE_HANDLER_KEY = "qwen3_5_dense"
 _QWEN3_5_MOE_HANDLER_KEY = "qwen3_5_moe"
 _DSV4_HANDLER_KEY = "dsv4"
 _VALIDATED_NATIVE_VLLM_LORA_STATUS: NativeVllmLoraStatus = "validated"
+_WIP_NATIVE_VLLM_LORA_STATUS: NativeVllmLoraStatus = "wip"
 _DISABLED_NATIVE_VLLM_LORA_STATUS: NativeVllmLoraStatus = "disabled"
 
 _DENSE_TARGET_MODULES = (
@@ -152,7 +153,7 @@ DSV4_SPEC = ModelSupportSpec(
     ),
     default_target_modules=_DSV4_TARGET_MODULES,
     default_rollout_weights_mode="merged",
-    native_vllm_lora_status=_DISABLED_NATIVE_VLLM_LORA_STATUS,
+    native_vllm_lora_status=_WIP_NATIVE_VLLM_LORA_STATUS,
 )
 
 VALIDATED_MODEL_SUPPORT_SPECS = (

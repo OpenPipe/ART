@@ -24,9 +24,17 @@ _ORACLE_INDEX_HEADS = 1
 _ORACLE_INDEX_TOPK = 1024
 _VALIDATION_NUM_LAYERS_ENV = "ART_DSV4_VALIDATION_NUM_LAYERS"
 _ORACLE_EXPERT_WEIGHT_RE = re.compile(r"\.mlp\.experts\..*\.weight(?P<expert>\d+)$")
+_DSV4_ART_MOE_EXPERT_KEY_RE = re.compile(
+    r"^(?P<prefix>.*\.mlp\.experts)\.(?P<expert>\d+)\."
+    r"(?P<module>gate_proj|up_proj|down_proj)\.(?P<lora>lora_[AB])\.weight$"
+)
 _DSV4_VLLM_MOE_KEY_RE = re.compile(
     r"^(?P<prefix>.*\.mlp\.experts)\."
     r"(?:(?P<base_layer>base_layer)\.)?(?P<lora>lora_[AB])\.weight$"
+)
+_DSV4_VLLM_MOE_EXPERT_KEY_RE = re.compile(
+    r"^(?P<prefix>.*\.ffn\.experts)\.(?P<expert>\d+)\."
+    r"(?P<module>w1|w2|w3)\.(?P<lora>lora_[AB])\.weight$"
 )
 _DSV4_MOE_COMPILE_WORKAROUND_FLAGS = (
     "alltoall_dtoh",
@@ -41,7 +49,7 @@ class Dsv4Handler(DefaultMoeHandler):
     key = "dsv4"
     is_moe = True
     cp_supported = False
-    native_vllm_lora_status = "disabled"
+    native_vllm_lora_status = "wip"
 
     def identity_lora_model_config(self, base_config: Any) -> Any:
         self.ensure_hf_reference_registered()
@@ -323,6 +331,14 @@ class Dsv4Handler(DefaultMoeHandler):
             tensors,
             adapter_config=adapter_config,
         )
+
+    def to_vllm_lora_tensors(
+        self,
+        tensors: dict[str, torch.Tensor],
+        *,
+        adapter_config: dict[str, Any],
+    ) -> tuple[dict[str, torch.Tensor], dict[str, Any]]:
+        return _dsv4_to_vllm_lora_tensors(tensors, adapter_config=adapter_config)
 
     def compile_workaround_config(self, provider: Any) -> CompileWorkaroundConfig:
         return CompileWorkaroundConfig(
@@ -645,8 +661,105 @@ def _dsv4_clone(tensor: torch.Tensor) -> torch.Tensor:
     return tensor.clone().contiguous()
 
 
+def _dsv4_to_vllm_lora_key(key: str) -> str:
+    match = _DSV4_ART_MOE_EXPERT_KEY_RE.match(key)
+    if match is not None:
+        module = {
+            "gate_proj": "w1",
+            "down_proj": "w2",
+            "up_proj": "w3",
+        }[match.group("module")]
+        prefix = match.group("prefix").replace(".mlp.experts", ".ffn.experts", 1)
+        return f"{prefix}.{match.group('expert')}.{module}.{match.group('lora')}.weight"
+
+    replacements = (
+        (".self_attn.compressor.kv_proj.", ".attn.mla_attn.compressor.wkv."),
+        (".self_attn.compressor.gate_proj.", ".attn.mla_attn.compressor.wgate."),
+        (".self_attn.q_a_proj.", ".attn.wq_a."),
+        (".self_attn.q_b_proj.", ".attn.wq_b."),
+        (".self_attn.kv_proj.", ".attn.wkv."),
+        (".self_attn.o_a_proj.", ".attn.wo_a."),
+        (".self_attn.o_b_proj.", ".attn.wo_b."),
+        (".mlp.shared_expert.", ".ffn.shared_experts."),
+        (".mlp.shared_experts.", ".ffn.shared_experts."),
+    )
+    for old, new in replacements:
+        if old in key:
+            return key.replace(old, new, 1)
+    return key
+
+
 def _dsv4_from_vllm_lora_key(key: str) -> str:
-    return key.replace(".mlp.shared_experts.", ".mlp.shared_expert.", 1)
+    match = _DSV4_VLLM_MOE_EXPERT_KEY_RE.match(key)
+    if match is not None:
+        module = {
+            "w1": "gate_proj",
+            "w2": "down_proj",
+            "w3": "up_proj",
+        }[match.group("module")]
+        prefix = match.group("prefix").replace(".ffn.experts", ".mlp.experts", 1)
+        return f"{prefix}.{match.group('expert')}.{module}.{match.group('lora')}.weight"
+
+    replacements = (
+        (".attn.mla_attn.compressor.wkv.", ".self_attn.compressor.kv_proj."),
+        (".attn.mla_attn.compressor.wgate.", ".self_attn.compressor.gate_proj."),
+        (".attn.wq_a.", ".self_attn.q_a_proj."),
+        (".attn.wq_b.", ".self_attn.q_b_proj."),
+        (".attn.wkv.", ".self_attn.kv_proj."),
+        (".attn.wo_a.", ".self_attn.o_a_proj."),
+        (".attn.wo_b.", ".self_attn.o_b_proj."),
+        (".ffn.shared_experts.", ".mlp.shared_expert."),
+        (".mlp.shared_experts.", ".mlp.shared_expert."),
+    )
+    for old, new in replacements:
+        if old in key:
+            return key.replace(old, new, 1)
+    return key
+
+
+def _dsv4_vllm_lora_config(adapter_config: dict[str, Any]) -> dict[str, Any]:
+    target_modules = adapter_config.get("target_modules")
+    if not isinstance(target_modules, list):
+        return adapter_config
+    transformed: list[str] = []
+    for module in target_modules:
+        if module in {"q_a_proj", "kv_proj"}:
+            transformed.append("fused_wqa_wkv")
+        elif module == "q_b_proj":
+            transformed.append("wq_b")
+        elif module == "o_a_proj":
+            transformed.append("wo_a")
+        elif module == "o_b_proj":
+            transformed.append("wo_b")
+        elif module in {"compressor.kv_proj", "compressor.gate_proj"}:
+            transformed.append("fused_wkv_wgate")
+        elif module in {"gate_proj", "up_proj"}:
+            transformed.extend(("gate_up_proj", "experts"))
+        elif module == "down_proj":
+            transformed.extend(("down_proj", "experts"))
+        elif module == "experts":
+            transformed.append("experts")
+        else:
+            transformed.append(module)
+    config = dict(adapter_config)
+    config["target_modules"] = list(dict.fromkeys(transformed))
+    return config
+
+
+def _dsv4_to_vllm_lora_tensors(
+    tensors: dict[str, torch.Tensor],
+    *,
+    adapter_config: dict[str, Any],
+) -> tuple[dict[str, torch.Tensor], dict[str, Any]]:
+    transformed: dict[str, torch.Tensor] = {}
+    for key, tensor in tensors.items():
+        vllm_key = _dsv4_to_vllm_lora_key(key)
+        if vllm_key in transformed:
+            raise RuntimeError(
+                f"Duplicate DSV4 LoRA tensor after conversion: {vllm_key}"
+            )
+        transformed[vllm_key] = tensor
+    return transformed, _dsv4_vllm_lora_config(adapter_config)
 
 
 def _dsv4_from_vllm_lora_tensors(

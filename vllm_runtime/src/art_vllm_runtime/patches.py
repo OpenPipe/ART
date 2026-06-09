@@ -1,6 +1,7 @@
 """Monkey patches and bootstrap contract for the ART-owned vLLM runtime."""
 
 import ctypes
+import importlib
 import inspect
 import logging
 from typing import Any
@@ -18,6 +19,7 @@ def apply_vllm_runtime_patches() -> None:
     patch_nccl_unique_id_bootstrap()
     patch_layerwise_reload_shadow_attrs()
     patch_dsv4_attn_sink_layerwise_reload()
+    patch_dsv4_lora_support()
     patch_routed_experts_prefix_cache_sidecar()
 
 
@@ -217,6 +219,18 @@ def patch_layerwise_reload_shadow_attrs() -> None:
     setattr(meta, "_art_reload_shadow_attrs_patched", True)
 
 
+def _import_dsv4_model_module() -> Any | None:
+    for module_name in (
+        "vllm.model_executor.models.deepseek_v4",
+        "vllm.models.deepseek_v4.nvidia.model",
+    ):
+        try:
+            return importlib.import_module(module_name)
+        except ImportError:
+            continue
+    return None
+
+
 def patch_dsv4_attn_sink_layerwise_reload() -> None:
     """Route DSV4 attention-sink loads through vLLM's layerwise loader.
 
@@ -226,9 +240,8 @@ def patch_dsv4_attn_sink_layerwise_reload() -> None:
     the old kernel tensor. With `load_format=dummy`, that old tensor is the
     initialized sink, not the checkpoint sink.
     """
-    try:
-        from vllm.models.deepseek_v4.nvidia import model as dsv4_model
-    except ImportError:
+    dsv4_model = _import_dsv4_model_module()
+    if dsv4_model is None:
         return
 
     model_cls = getattr(dsv4_model, "DeepseekV4Model", None)
@@ -329,6 +342,35 @@ def patch_dsv4_attn_sink_layerwise_reload() -> None:
 
     load_weights.__art_patched__ = True  # type: ignore[attr-defined]
     model_cls.load_weights = load_weights  # type: ignore[method-assign]
+
+
+def patch_dsv4_lora_support() -> None:
+    """Enable vLLM's existing LoRA manager for ART-served DSV4.
+
+    DSV4 itself does not need a custom LoRA executor here. Once the model
+    advertises packed MLA/shared-expert modules and MoE expert children, vLLM
+    wraps the same FusedMoE module it already uses for serving. With LoRA
+    enabled, vLLM's modular MoE selector picks Marlin, whose expert backend
+    supports fused MoE LoRA. Do not point this patch at the FlashInfer TRTLLM
+    MXFP4 backend; that backend currently has no LoRA hooks.
+    """
+    dsv4_model = _import_dsv4_model_module()
+    if dsv4_model is None:
+        return
+    model_cls = getattr(dsv4_model, "DeepseekV4ForCausalLM", None)
+    if model_cls is None or getattr(model_cls, "_art_dsv4_lora_patched", False):
+        return
+    model_cls.supports_lora = True
+    model_cls.embedding_modules = {}
+    model_cls.packed_modules_mapping = {
+        "fused_wqa_wkv": ["wq_a", "wkv"],
+        "fused_wkv_wgate": ["wkv", "wgate"],
+        "gate_up_proj": ["gate_proj", "up_proj"],
+    }
+    model_cls.is_3d_moe_weight = False
+    model_cls.is_non_gated_moe = False
+    model_cls.lora_skip_prefixes = ["mtp"]
+    model_cls._art_dsv4_lora_patched = True
 
 
 def _lora_cache_key(lora_request: Any) -> tuple[Any, ...]:
