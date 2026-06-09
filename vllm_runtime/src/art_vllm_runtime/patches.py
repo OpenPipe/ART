@@ -21,6 +21,7 @@ def apply_vllm_runtime_patches() -> None:
     patch_dsv4_attn_sink_layerwise_reload()
     patch_dsv4_lora_support()
     patch_lora_linear_base_attr_proxy()
+    patch_marlin_lora_swiglu_limit()
     patch_routed_experts_prefix_cache_sidecar()
 
 
@@ -400,6 +401,59 @@ def patch_lora_linear_base_attr_proxy() -> None:
         if not hasattr(BaseLinearLayerWithLoRA, name):
             setattr(BaseLinearLayerWithLoRA, name, _base_layer_attr_proxy(name))
     BaseLinearLayerWithLoRA._art_base_attr_proxy_patched = True
+
+
+def patch_marlin_lora_swiglu_limit() -> None:
+    """Keep Marlin MoE LoRA active when DSV4 uses a SwiGLU clamp limit.
+
+    vLLM's Marlin LoRA path injects W13 LoRA inside the activation callback and
+    stores that activated cache for W2 LoRA. DSV4 sets ``gemm1_clamp_limit``;
+    upstream Marlin bypasses the callback in that case and calls the clamp op
+    directly, so W13 LoRA is skipped and W2 LoRA later misses ``cache2``. Route
+    the callback through the same clamp op while preserving Marlin execution.
+    """
+    from vllm.model_executor.layers.fused_moe.activation import MoEActivation
+    from vllm.model_executor.layers.fused_moe.fused_marlin_moe import MarlinExperts
+    from vllm.model_executor.layers.fused_moe.utils import swiglu_limit_func
+
+    original_apply = MarlinExperts.apply
+    if getattr(original_apply, "__art_patched__", False):
+        return
+
+    sentinel = object()
+
+    def apply(self: Any, *args: Any, **kwargs: Any) -> Any:
+        clamp_limit = getattr(self, "gemm1_clamp_limit", None)
+        if getattr(self, "_lora_context", None) is None or clamp_limit is None:
+            return original_apply(self, *args, **kwargs)
+
+        original_activation = self.activation
+        previous_activation = self.__dict__.get("activation", sentinel)
+        previous_clamp_limit = self.gemm1_clamp_limit
+
+        def activation_with_clamp(
+            activation: Any,
+            output: Any,
+            input: Any,
+        ) -> None:
+            if activation == MoEActivation.SILU:
+                swiglu_limit_func(output, input, clamp_limit)
+            else:
+                original_activation(activation, output, input)
+
+        self.activation = activation_with_clamp
+        self.gemm1_clamp_limit = None
+        try:
+            return original_apply(self, *args, **kwargs)
+        finally:
+            self.gemm1_clamp_limit = previous_clamp_limit
+            if previous_activation is sentinel:
+                delattr(self, "activation")
+            else:
+                self.activation = previous_activation
+
+    apply.__art_patched__ = True  # type: ignore[attr-defined]
+    MarlinExperts.apply = apply  # type: ignore[method-assign]
 
 
 def _lora_cache_key(lora_request: Any) -> tuple[Any, ...]:
