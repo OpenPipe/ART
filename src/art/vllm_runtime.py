@@ -221,7 +221,10 @@ class ManagedVllmRuntime:
 
     def close(self) -> None:
         if self.process is not None:
-            terminate_popen_process_group(self.process)
+            terminate_popen_process_group(
+                self.process,
+                timeout=float(os.environ.get("ART_VLLM_RUNTIME_CLOSE_TIMEOUT", 30)),
+            )
             self.process = None
         if self.log_file is not None:
             self.log_file.close()
