@@ -245,6 +245,7 @@ def patch_dsv4_attn_sink_layerwise_reload() -> None:
     dsv4_model = _import_dsv4_model_module()
     if dsv4_model is None:
         return
+    from vllm.model_executor.models.utils import is_pp_missing_parameter
 
     model_cls = getattr(dsv4_model, "DeepseekV4Model", None)
     if model_cls is None:
@@ -281,7 +282,7 @@ def patch_dsv4_attn_sink_layerwise_reload() -> None:
                     continue
                 name = name.replace(weight_name, param_name)
 
-                if dsv4_model.is_pp_missing_parameter(name, self):
+                if is_pp_missing_parameter(name, self):
                     break
                 param = params_dict[name]
                 param.weight_loader(param, loaded_weight, shard_id)
@@ -299,7 +300,7 @@ def patch_dsv4_attn_sink_layerwise_reload() -> None:
                         if weight_name not in name:
                             continue
                         name_mapped = name.replace(weight_name, param_name)
-                        if dsv4_model.is_pp_missing_parameter(name_mapped, self):
+                        if is_pp_missing_parameter(name_mapped, self):
                             continue
                         param = params_dict[name_mapped]
                         success = param.weight_loader(
@@ -316,7 +317,7 @@ def patch_dsv4_attn_sink_layerwise_reload() -> None:
                     loaded_params.add(name_mapped)
                     continue
                 if "attn_sink" in name:
-                    if dsv4_model.is_pp_missing_parameter(name, self):
+                    if is_pp_missing_parameter(name, self):
                         continue
                     param = params_dict[name]
                     narrow_weight = loaded_weight[head_rank_start:head_rank_end]
@@ -331,7 +332,7 @@ def patch_dsv4_attn_sink_layerwise_reload() -> None:
                     loaded_params.add(name)
                     continue
 
-                if dsv4_model.is_pp_missing_parameter(name, self):
+                if is_pp_missing_parameter(name, self):
                     continue
                 param = params_dict[name]
                 weight_loader = getattr(
