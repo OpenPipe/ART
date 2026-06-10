@@ -16,8 +16,10 @@ from art.megatron.routing_replay import (
     StepRouterRoutes,
     StepRoutes,
     TopologyAwareLocalTokenIndexer,
+    build_moe_routing_replay_bundle_from_packed_tensors,
     build_router_key_from_module_name,
 )
+from art.preprocessing.moe_routing import MoeRoutingPackStats, PackedMoeRoutingReplay
 
 
 def _make_route(
@@ -242,6 +244,30 @@ def _expected_routing_map(route: RouterCallRoute) -> torch.Tensor:
     return routing_map
 
 
+def _packed_tensors_with_missing_branch_tail(*, future_scored: bool) -> dict[str, Any]:
+    token_mask = torch.tensor([[True, True, True, True, False, False]])
+    return {
+        "tokens": torch.tensor([[10, 11, 12, 13, 14, 15]]),
+        "group_ids": torch.tensor([[1, 1, 2, 2, 2, 2]]),
+        "parent_ids": torch.tensor([[1, 1, 1, 1, 1, 1]]),
+        "input_pos": torch.arange(6).view(1, 6),
+        "assistant_mask": torch.tensor([[False, False, False, True, True, False]]),
+        "logprobs": torch.tensor(
+            [[float("nan"), float("nan"), float("nan"), -0.3, -0.4, -0.5]]
+            if future_scored
+            else [[float("nan"), float("nan"), float("nan"), -0.3, -0.4, float("nan")]]
+        ),
+        "moe_routing_replay": PackedMoeRoutingReplay(
+            expert_indices=torch.zeros((1, 6, 1, 1), dtype=torch.int32),
+            token_mask=token_mask,
+            num_layers=1,
+            topk=1,
+            num_experts=1,
+            pack_stats=MoeRoutingPackStats(),
+        ),
+    }
+
+
 def test_build_router_key_from_compiled_module_name() -> None:
     assert (
         build_router_key_from_module_name(
@@ -294,6 +320,28 @@ def test_topology_aware_local_token_indexer_slices_sequence_parallel_rows() -> N
     )
 
     assert torch.equal(local_uids, torch.arange(128, 256, dtype=torch.int64))
+
+
+def test_build_bundle_allows_missing_branch_tail_without_future_scored_token() -> None:
+    bundle = build_moe_routing_replay_bundle_from_packed_tensors(
+        packed_tensors=cast(
+            Any, _packed_tensors_with_missing_branch_tail(future_scored=False)
+        ),
+        global_grad_accumulation_sequences=1,
+    )
+
+    route = bundle.steps[0].routers[bundle.router_keys[0]].calls[0]
+    assert route.expert_indices.shape == (6, 1)
+
+
+def test_build_bundle_rejects_missing_route_before_future_scored_token() -> None:
+    with pytest.raises(RuntimeError, match="missing MoE routes"):
+        build_moe_routing_replay_bundle_from_packed_tensors(
+            packed_tensors=cast(
+                Any, _packed_tensors_with_missing_branch_tail(future_scored=True)
+            ),
+            global_grad_accumulation_sequences=1,
+        )
 
 
 def test_bundle_roundtrip_disk() -> None:

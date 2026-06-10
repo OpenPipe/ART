@@ -34,6 +34,39 @@ def _active_routing_replay_controller() -> Any | None:
     return _ACTIVE_ROUTING_REPLAY_CONTROLLER
 
 
+def _branch_rows_without_future_scored_tokens(
+    *,
+    group_ids: torch.Tensor,
+    parent_ids: torch.Tensor,
+    logprobs: torch.Tensor,
+) -> torch.Tensor:
+    """Rows whose MoE route cannot affect any later trainable token.
+
+    vLLM returns routes for forwards it actually ran. During generation it does
+    not run a forward for the final generated token, because no later token is
+    sampled from that row. ART shared-prefix packing may still leave a masked
+    suffix token in the same branch, so a physical group boundary is not enough
+    to identify rows that can safely use synthetic replay routes.
+    """
+    non_padding = group_ids != -1
+    branch = non_padding & (group_ids != parent_ids)
+    scored = non_padding & torch.isfinite(logprobs)
+    allowed = torch.zeros_like(branch)
+    for sample_index in range(int(group_ids.shape[0])):
+        future_scored_by_group: dict[int, bool] = {}
+        for position in range(int(group_ids.shape[1]) - 1, -1, -1):
+            group_id = int(group_ids[sample_index, position].item())
+            if group_id == -1:
+                continue
+            has_future_scored = future_scored_by_group.get(group_id, False)
+            allowed[sample_index, position] = (
+                bool(branch[sample_index, position].item()) and not has_future_scored
+            )
+            if bool(scored[sample_index, position].item()):
+                future_scored_by_group[group_id] = True
+    return allowed
+
+
 def _to_tensor_cpu_contiguous(
     tensor: torch.Tensor, *, dtype: torch.dtype
 ) -> torch.Tensor:
@@ -450,7 +483,13 @@ def build_moe_routing_replay_bundle_from_packed_tensors(
     terminal_completion = (
         non_padding & (group_ids != parent_ids) & (group_ids != next_group_ids)
     )
-    unexpected_missing = non_padding & ~token_mask & ~terminal_completion
+    no_future_scored = _branch_rows_without_future_scored_tokens(
+        group_ids=group_ids,
+        parent_ids=parent_ids,
+        logprobs=packed_tensors["logprobs"],
+    )
+    allowed_missing = terminal_completion | no_future_scored
+    unexpected_missing = non_padding & ~token_mask & ~allowed_missing
     if bool(unexpected_missing.any().item()):
         raise RuntimeError(
             "Packed tensors are missing MoE routes outside terminal completion "
@@ -478,8 +517,8 @@ def build_moe_routing_replay_bundle_from_packed_tensors(
                     if bool(missing_rows.any().item()):
                         # Megatron Core RouterReplay replays only top-k ids and does
                         # not consume an expert mask. Rows without vLLM routes are
-                        # allowed only for padding or terminal completion query
-                        # positions, whose next-token logits are not scored.
+                        # allowed only for padding or branch-tail query positions
+                        # that cannot affect any later scored token.
                         missing_positions = torch.nonzero(
                             missing_rows, as_tuple=False
                         ).flatten()
