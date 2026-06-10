@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from collections.abc import Iterable, Mapping
+from collections.abc import Callable, Iterable, Mapping
 import contextlib
 import fnmatch
 from typing import Any, cast
@@ -145,16 +145,19 @@ def _load_hf_tensor_slice(
 def load_unique_hf_keys_once(
     tasks: Iterable[Any],
     hf_state_dict: Mapping[str, torch.Tensor],
+    extra_keys: Callable[[Iterable[str], Mapping[str, torch.Tensor]], Iterable[str]]
+    | None = None,
 ) -> dict[str, torch.Tensor | ExpertTensorSlice]:
     task_list = list(tasks)
-    keys = sorted(
-        {
-            key
-            for task in task_list
-            if _needs_local_hf_prefetch(task)
-            for key in _iter_hf_param_names(task.mapping.hf_param)
-        }
-    )
+    key_set = {
+        key
+        for task in task_list
+        if _needs_local_hf_prefetch(task)
+        for key in _iter_hf_param_names(task.mapping.hf_param)
+    }
+    if extra_keys is not None:
+        key_set.update(extra_keys(tuple(sorted(key_set)), hf_state_dict))
+    keys = sorted(key_set)
     expert_slice_ranges: dict[str, tuple[int, int]] = {}
     for task in task_list:
         if task is None or task.megatron_module is None:
@@ -443,7 +446,11 @@ def _optimized_load_weights_hf_to_megatron(
             stack.enter_context(megatron_model[0].hide_loss_modules())
         tasks = self.build_conversion_tasks(hf_pretrained, megatron_model)
     hf_state_dict = hf_pretrained.state
-    raw_cache = load_unique_hf_keys_once(tasks, hf_state_dict)
+    raw_cache = load_unique_hf_keys_once(
+        tasks,
+        hf_state_dict,
+        extra_keys=getattr(self, "art_extra_hf_prefetch_keys", None),
+    )
     cached_state = _CachedStateLookup(cache=raw_cache, source=hf_state_dict)
     description = f"Loading from {hf_pretrained.model_name_or_path}"
     pending_device_copy = False

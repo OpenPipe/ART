@@ -1,6 +1,6 @@
 from functools import lru_cache, partial
 import re
-from typing import Any, Mapping, cast
+from typing import Any, Iterable, Mapping, cast
 
 from megatron.bridge.models.conversion.mapping_registry import MegatronMappingRegistry
 from megatron.bridge.models.conversion.model_bridge import WeightConversionTask
@@ -122,6 +122,11 @@ def _dequant_dsv4_mxfp4(weight: torch.Tensor, scale: torch.Tensor) -> torch.Tens
             f"weight={tuple(weight.shape)} scale={tuple(scale.shape)}."
         )
 
+    if torch.cuda.is_available():
+        from art.megatron.dsv4.dequant import dequant_mxfp4_cuda
+
+        return dequant_mxfp4_cuda(weight, scale)
+
     table = torch.tensor(_DSV4_FP4_TABLE, dtype=torch.float32, device=weight.device)
     packed = weight.contiguous().view(torch.uint8)
     low = (packed & 0x0F).long()
@@ -153,6 +158,11 @@ def _dequant_dsv4_block_fp8(weight: torch.Tensor, scale: torch.Tensor) -> torch.
             f"weight={tuple(weight.shape)} scale={tuple(scale.shape)} "
             f"expected={expected_scale_shape}."
         )
+
+    if torch.cuda.is_available():
+        from art.megatron.dsv4.dequant import dequant_block_fp8_cuda
+
+        return dequant_block_fp8_cuda(weight, scale)
 
     expanded_scale = (
         scale.float().repeat_interleave(block, dim=0).repeat_interleave(block, dim=1)
@@ -312,14 +322,18 @@ class _Dsv4AliasStateSource:
     def __init__(self, source: Any, aliases: Mapping[str, str]):
         self.source = source
         self.aliases = dict(aliases)
+        self._all_keys_cache: list[str] | None = None
 
     def __getattr__(self, name: str) -> Any:
         return getattr(self.source, name)
 
     def get_all_keys(self) -> list[str]:
+        if self._all_keys_cache is not None:
+            return self._all_keys_cache
         keys = set(self.source.get_all_keys())
         keys.update(alias for alias, target in self.aliases.items() if target in keys)
-        return sorted(keys)
+        self._all_keys_cache = sorted(keys)
+        return self._all_keys_cache
 
     def load_tensors(self, keys: list[str]) -> dict[str, torch.Tensor]:
         source_keys = [self.aliases.get(key, key) for key in keys]
@@ -931,6 +945,21 @@ class ArtDeepSeekV4Bridge(DeepSeekV3Bridge):
 
     def mapping_registry(self) -> MegatronMappingRegistry:
         return _dsv4_mapping_registry()
+
+    def art_extra_hf_prefetch_keys(
+        self,
+        keys: Iterable[str],
+        hf_state_dict: Mapping[str, torch.Tensor],
+    ) -> list[str]:
+        all_keys = set(hf_state_dict.keys())
+        scale_keys: list[str] = []
+        for key in keys:
+            if not key.endswith(".weight"):
+                continue
+            scale_key = f"{key.removesuffix('.weight')}.scale"
+            if scale_key in all_keys:
+                scale_keys.append(scale_key)
+        return scale_keys
 
     def maybe_modify_loaded_hf_weight(
         self,
