@@ -186,6 +186,9 @@ jobs:
           }
           trap cleanup EXIT
 
+          uv run --no-project --with 'skypilot[kubernetes,remote]==0.11.1' \
+            sky check kubernetes
+
           /usr/bin/time -p uv run --no-project --with 'skypilot[kubernetes,remote]==0.11.1' \
             sky launch -y \
               -c "${cluster}" \
