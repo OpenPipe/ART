@@ -383,7 +383,7 @@
 workdir: .
 resources:
   accelerators: ["H200:1", "H100-SXM:1", "H100:1", "A100-80GB:1"]
-  image_id: docker:docker.io/bradhiltonnw/art-gpu:latest
+  image_id: docker:images.coreweave.com/cluster-images/bradhiltonnw/art-gpu:latest
   ports:
     - 7999 # main ART server
     - 8000 # vLLM server

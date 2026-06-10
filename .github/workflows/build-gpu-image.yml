@@ -10,6 +10,11 @@ on:
         required: true
         default: "docker.io/bradhiltonnw/art-gpu"
         type: string
+      pull_image_repo:
+        description: "Image repository for cluster pulls/prewarm"
+        required: true
+        default: "images.coreweave.com/cluster-images/bradhiltonnw/art-gpu"
+        type: string
       tag:
         description: "Image tag to push"
         required: true
@@ -147,12 +152,13 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           IMAGE_REPO: ${{ inputs.image_repo || 'docker.io/bradhiltonnw/art-gpu' }}
+          PULL_IMAGE_REPO: ${{ inputs.pull_image_repo || 'images.coreweave.com/cluster-images/bradhiltonnw/art-gpu' }}
           IMAGE_TAG: ${{ inputs.tag }}
           NO_CACHE: ${{ inputs.no_cache }}
           PREWARM_NODES: ${{ inputs.prewarm_nodes }}
           PREWARM_TIMEOUT: ${{ inputs.prewarm_timeout }}
         run: |
-          IMAGE_TAG="${IMAGE_TAG:-gha-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}}"
+          IMAGE_TAG="${IMAGE_TAG:-latest}"
           NO_CACHE="${NO_CACHE:-false}"
           PREWARM_NODES="${PREWARM_NODES:-true}"
           PREWARM_TIMEOUT="${PREWARM_TIMEOUT:-30m}"
@@ -160,6 +166,7 @@ jobs:
           args=(
             --infra "${SKY_INFRA}"
             --image-repo "${IMAGE_REPO}"
+            --pull-image-repo "${PULL_IMAGE_REPO}"
             --tag "${IMAGE_TAG}"
             --prewarm-timeout "${PREWARM_TIMEOUT}"
           )
@@ -177,11 +184,11 @@ jobs:
       - name: Smoke launch pushed image
         if: ${{ github.event_name != 'workflow_dispatch' || inputs.smoke_launch }}
         env:
-          IMAGE_REPO: ${{ inputs.image_repo || 'docker.io/bradhiltonnw/art-gpu' }}
+          PULL_IMAGE_REPO: ${{ inputs.pull_image_repo || 'images.coreweave.com/cluster-images/bradhiltonnw/art-gpu' }}
           IMAGE_TAG: ${{ inputs.tag }}
           SMOKE_GPUS: ${{ inputs.smoke_gpus }}
         run: |
-          IMAGE_TAG="${IMAGE_TAG:-gha-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}}"
+          IMAGE_TAG="${IMAGE_TAG:-latest}"
           SMOKE_GPUS="${SMOKE_GPUS:-H200:1}"
           cluster="art-gpu-smoke-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
           sky_cmd=(uv run --python 3.10 --no-project --with 'skypilot[kubernetes,remote]==0.11.1' sky)
@@ -196,7 +203,7 @@ jobs:
               -c "${cluster}" \
               --infra "${SKY_INFRA}" \
               --gpus "${SMOKE_GPUS}" \
-              --image-id "docker:${IMAGE_REPO}:${IMAGE_TAG}" \
+              --image-id "docker:${PULL_IMAGE_REPO}:${IMAGE_TAG}" \
               --config kubernetes.pod_config.spec.schedulerName=binpack-scheduler \
               --config kubernetes.pod_config.spec.activeDeadlineSeconds=604800 \
               'python -c "import pathlib, subprocess; print(\"ART_IMAGE_SMOKE_OK\"); print(\"SKY_PYTHON_PATH\", pathlib.Path.home().joinpath(\".sky/python_path\").read_text().strip()); print(\"RAY_PATH\", pathlib.Path.home().joinpath(\".sky/ray_path\").read_text().strip()); print(\"UV\", subprocess.check_output([\"uv\", \"--version\"], text=True).strip())"'

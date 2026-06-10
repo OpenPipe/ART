@@ -11,6 +11,7 @@ Options:
   --infra INFRA          Kubernetes-backed SkyPilot infra (default: k8s/cks-wb3)
   --no-cache             Disable registry-backed BuildKit cache
   --no-prewarm-nodes     Skip pre-pulling the pushed image on GPU nodes
+  --pull-image-repo REPO Image repository for cluster pulls/prewarm
   --prewarm-timeout DUR  Timeout for the prewarm DaemonSet rollout (default: 30m)
   --tag TAG              Image tag to publish
   --help                 Show this help
@@ -22,6 +23,7 @@ repo_root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 cluster_name=""
 infra="${SKY_INFRA:-k8s/cks-wb3}"
 image_repo="${ART_IMAGE_REPO:-}"
+pull_image_repo="${ART_PULL_IMAGE_REPO:-}"
 image_tag=""
 docker_config_path="${DOCKER_CONFIG_PATH:-${HOME}/.docker/config.json}"
 buildkit_image="${BUILDKIT_IMAGE:-moby/buildkit:v0.29.0-rootless}"
@@ -56,6 +58,10 @@ while [[ $# -gt 0 ]]; do
     --no-prewarm-nodes)
       prewarm_nodes=false
       shift
+      ;;
+    --pull-image-repo)
+      pull_image_repo="$2"
+      shift 2
       ;;
     --prewarm-timeout)
       prewarm_timeout="$2"
@@ -141,6 +147,9 @@ if [[ -z "${image_repo}" ]]; then
   else
     image_repo="ghcr.io/openpipe/art-gpu"
   fi
+fi
+if [[ -z "${pull_image_repo}" ]]; then
+  pull_image_repo="${image_repo}"
 fi
 
 registry_host="${image_repo%%/*}"
@@ -245,6 +254,7 @@ printf '%s' "${registry_auth_json_b64}" | base64 -d > "${registry_auth_json_path
 
 echo "Launching temporary BuildKit pod ${cluster_name} on ${infra}"
 echo "Publishing ${image_repo}:${image_tag}"
+echo "Cluster pull image ${pull_image_repo}:${image_tag}"
 if [[ "${no_cache}" == "true" ]]; then
   echo "Registry cache disabled"
 else
@@ -358,6 +368,10 @@ done
 echo
 echo "Image ready for testing:"
 echo "  ${image_repo}:${image_tag}"
+if [[ "${pull_image_repo}" != "${image_repo}" ]]; then
+  echo "Cluster pull image:"
+  echo "  ${pull_image_repo}:${image_tag}"
+fi
 image_digest="$(
   uv run --no-project python - "${build_log_snapshot_path}" "${image_repo}:${image_tag}" <<'PY'
 import re
@@ -371,9 +385,9 @@ if matches:
     print(matches[-1])
 PY
 )"
-prewarm_image="${image_repo}:${image_tag}"
+prewarm_image="${pull_image_repo}:${image_tag}"
 if [[ -n "${image_digest}" ]]; then
-  prewarm_image="${image_repo}@${image_digest}"
+  prewarm_image="${pull_image_repo}@${image_digest}"
 fi
 
 if [[ "${prewarm_nodes}" == "true" ]]; then
