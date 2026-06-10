@@ -66,6 +66,8 @@ jobs:
 
       - name: Install kubectl
         run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends socat
           kubectl_version="$(curl -LsSf https://dl.k8s.io/release/stable.txt)"
           curl -LsSf -o kubectl "https://dl.k8s.io/release/${kubectl_version}/bin/linux/amd64/kubectl"
           sudo install -m 0755 kubectl /usr/local/bin/kubectl
