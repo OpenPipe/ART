@@ -263,19 +263,44 @@ def _wrap_with_mp_wrapper(
 ) -> list[MegatronModule]:
     if not (model_config.fp16 or model_config.bf16) or mixed_precision_wrapper is None:
         return model
-    keep_in_fp32: list[tuple[Any, torch.Tensor]] = []
+    keep_in_fp32 = _collect_fp32_preserved_parameters(model)
+    wrapped = [
+        mixed_precision_wrapper(model_config, model_module) for model_module in model
+    ]
+    _restore_fp32_preserved_parameters(keep_in_fp32)
+    return wrapped
+
+
+def _collect_fp32_preserved_parameters(
+    model: list[MegatronModule],
+) -> list[tuple[torch.nn.Parameter, torch.Tensor]]:
+    """Snapshot parameters that must survive Megatron mixed precision as fp32.
+
+    Megatron's Float16Module casts module parameters to the configured model
+    dtype. DSV4 marks small numerically-sensitive tensors with ``_keep_fp32``;
+    silently casting them changes model math and can also break compiled forward
+    guards that require fp32. This helper is intentionally narrow: it only
+    snapshots explicitly marked parameters plus the existing expert-bias marker.
+    """
+
+    keep_in_fp32: list[tuple[torch.nn.Parameter, torch.Tensor]] = []
     for model_module in model:
         for submodule in model_module.modules():
             if hasattr(submodule, "_maintain_float32_expert_bias"):
                 expert_bias = getattr(submodule, "expert_bias", None)
-                if expert_bias is not None:
-                    keep_in_fp32.append((submodule, expert_bias.data.clone()))
-    wrapped = [
-        mixed_precision_wrapper(model_config, model_module) for model_module in model
-    ]
-    for submodule, fp32_data in keep_in_fp32:
-        submodule.expert_bias.data = fp32_data
-    return wrapped
+                if isinstance(expert_bias, torch.nn.Parameter):
+                    keep_in_fp32.append((expert_bias, expert_bias.data.clone()))
+            for param in submodule.parameters(recurse=False):
+                if getattr(param, "_keep_fp32", False):
+                    keep_in_fp32.append((param, param.data.clone()))
+    return keep_in_fp32
+
+
+def _restore_fp32_preserved_parameters(
+    keep_in_fp32: list[tuple[torch.nn.Parameter, torch.Tensor]],
+) -> None:
+    for param, fp32_data in keep_in_fp32:
+        param.data = fp32_data
 
 
 def _art_get_model(
