@@ -182,17 +182,15 @@ jobs:
           IMAGE_TAG="${IMAGE_TAG:-gha-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}}"
           SMOKE_GPUS="${SMOKE_GPUS:-H200:1}"
           cluster="art-gpu-smoke-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          sky_cmd=(uv run --python 3.10 --no-project --with 'skypilot[kubernetes,remote]==0.11.1' sky)
           cleanup() {
-            uv run --no-project --with 'skypilot[kubernetes,remote]==0.11.1' \
-              sky down -y "${cluster}" || true
+            "${sky_cmd[@]}" down -y "${cluster}" || true
           }
           trap cleanup EXIT
 
-          uv run --no-project --with 'skypilot[kubernetes,remote]==0.11.1' \
-            sky check kubernetes
+          "${sky_cmd[@]}" check kubernetes
 
-          /usr/bin/time -p uv run --no-project --with 'skypilot[kubernetes,remote]==0.11.1' \
-            sky launch -y \
+          /usr/bin/time -p "${sky_cmd[@]}" launch -y \
               -c "${cluster}" \
               --infra "${SKY_INFRA}" \
               --gpus "${SMOKE_GPUS}" \
