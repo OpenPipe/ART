@@ -192,10 +192,28 @@ jobs:
           SMOKE_GPUS="${SMOKE_GPUS:-H200:1}"
           cluster="art-gpu-smoke-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
           sky_cmd=(uv run --python 3.10 --no-project --with 'skypilot[kubernetes,remote]==0.11.2' sky)
+          dump_diagnostics() {
+            echo "::group::Smoke diagnostics"
+            free -h || true
+            ps -eo pid,ppid,stat,rss,comm,args | grep -E 'SkyPilot|sky|python' || true
+            "${sky_cmd[@]}" api status || true
+            if [ -f "${HOME}/.sky/api_server/server.log" ]; then
+              tail -n 240 "${HOME}/.sky/api_server/server.log" || true
+            fi
+            echo "::endgroup::"
+          }
           cleanup() {
             "${sky_cmd[@]}" down -y "${cluster}" || true
           }
-          trap cleanup EXIT
+          finish() {
+            status=$?
+            if [ "${status}" -ne 0 ]; then
+              dump_diagnostics
+            fi
+            cleanup
+            exit "${status}"
+          }
+          trap finish EXIT
 
           "${sky_cmd[@]}" check kubernetes
 
