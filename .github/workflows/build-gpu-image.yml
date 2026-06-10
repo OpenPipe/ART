@@ -191,7 +191,10 @@ jobs:
           IMAGE_TAG="${IMAGE_TAG:-latest}"
           SMOKE_GPUS="${SMOKE_GPUS:-H200:1}"
           cluster="art-gpu-smoke-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
-          sky_cmd=(uv run --python 3.10 --no-project --with 'skypilot[kubernetes,remote]==0.12.0' sky)
+          sky_venv="${RUNNER_TEMP}/skypilot-smoke"
+          uv venv --python 3.10 "${sky_venv}"
+          uv pip install --python "${sky_venv}/bin/python" 'skypilot[kubernetes,remote]==0.12.0'
+          sky_cmd=("${sky_venv}/bin/sky")
           dump_diagnostics() {
             echo "::group::Smoke diagnostics"
             free -h || true
