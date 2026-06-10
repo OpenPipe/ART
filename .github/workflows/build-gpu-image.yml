@@ -191,7 +191,7 @@ jobs:
           IMAGE_TAG="${IMAGE_TAG:-latest}"
           SMOKE_GPUS="${SMOKE_GPUS:-H200:1}"
           cluster="art-gpu-smoke-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
-          sky_cmd=(uv run --python 3.10 --no-project --with 'skypilot[kubernetes,remote]==0.11.1' sky)
+          sky_cmd=(uv run --python 3.10 --no-project --with 'skypilot[kubernetes,remote]==0.11.2' sky)
           cleanup() {
             "${sky_cmd[@]}" down -y "${cluster}" || true
           }
