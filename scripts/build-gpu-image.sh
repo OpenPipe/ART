@@ -245,9 +245,11 @@ cleanup() {
 trap cleanup EXIT
 printf '0' > "${build_log_offset_path}"
 
-mkdir -p "${context_dir}/docker"
+mkdir -p "${context_dir}/docker" "${context_dir}/vllm_runtime"
 cp "${repo_root}/pyproject.toml" "${context_dir}/pyproject.toml"
 cp "${repo_root}/uv.lock" "${context_dir}/uv.lock"
+cp "${repo_root}/vllm_runtime/pyproject.toml" "${context_dir}/vllm_runtime/pyproject.toml"
+cp "${repo_root}/vllm_runtime/uv.lock" "${context_dir}/vllm_runtime/uv.lock"
 cp "${repo_root}/.dockerignore" "${context_dir}/.dockerignore"
 cp "${repo_root}/docker/art-gpu.Dockerfile" "${context_dir}/docker/art-gpu.Dockerfile"
 printf '%s' "${registry_auth_json_b64}" | base64 -d > "${registry_auth_json_path}"
