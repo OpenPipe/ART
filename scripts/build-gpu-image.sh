@@ -31,6 +31,7 @@ no_cache="${NO_CACHE:-false}"
 prewarm_nodes="${PREWARM_NODES:-true}"
 prewarm_namespace="${PREWARM_NAMESPACE:-default}"
 prewarm_name="${PREWARM_NAME:-art-gpu-image-prewarm}"
+prewarm_image_pull_secret="${PREWARM_IMAGE_PULL_SECRET:-art-gpu-registry-auth}"
 prewarm_node_selector="${PREWARM_NODE_SELECTOR:-node.coreweave.cloud/class=gpu}"
 prewarm_timeout="${PREWARM_TIMEOUT:-30m}"
 
@@ -381,6 +382,12 @@ if [[ "${prewarm_nodes}" == "true" ]]; then
     echo "Skipping GPU node prewarm: no nodes match ${prewarm_node_selector}"
   else
     echo "Prewarming ${prewarm_image} on ${gpu_node_count} GPU node(s)"
+    "${kubectl_cmd[@]}" create secret generic "${prewarm_image_pull_secret}" \
+      -n "${prewarm_namespace}" \
+      --from-file=.dockerconfigjson="${registry_auth_json_path}" \
+      --type=kubernetes.io/dockerconfigjson \
+      --dry-run=client -o yaml \
+      | "${kubectl_cmd[@]}" apply -n "${prewarm_namespace}" -f -
     "${kubectl_cmd[@]}" apply -n "${prewarm_namespace}" -f - <<EOF
 apiVersion: apps/v1
 kind: DaemonSet
@@ -405,6 +412,8 @@ spec:
     spec:
       nodeSelector:
         ${prewarm_node_selector_key}: ${prewarm_node_selector_value}
+      imagePullSecrets:
+        - name: ${prewarm_image_pull_secret}
       tolerations:
         - operator: Exists
       initContainers:
