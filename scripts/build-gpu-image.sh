@@ -392,6 +392,10 @@ spec:
   selector:
     matchLabels:
       app: ${prewarm_name}
+  updateStrategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 100%
   template:
     metadata:
       labels:
