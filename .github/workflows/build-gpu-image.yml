@@ -171,7 +171,7 @@ jobs:
           bash scripts/build-gpu-image.sh "${args[@]}"
 
       - name: Smoke launch pushed image
-        if: ${{ inputs.smoke_launch != false }}
+        if: ${{ github.event_name != 'workflow_dispatch' || inputs.smoke_launch }}
         env:
           IMAGE_REPO: ${{ inputs.image_repo || 'docker.io/bradhiltonnw/art-gpu' }}
           IMAGE_TAG: ${{ inputs.tag }}
