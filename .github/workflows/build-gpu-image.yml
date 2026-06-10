@@ -1,6 +1,8 @@
 name: Build GPU Image
 
 on:
+  push:
+    branches: [main]
   workflow_dispatch:
     inputs:
       image_repo:
