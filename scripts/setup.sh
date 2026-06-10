@@ -67,7 +67,7 @@ fi
 
 # Sync the dependencies
 if [ "${INSTALL_EXTRAS:-false}" = "true" ]; then
-    uv sync --all-extras
+    uv sync --all-extras --frozen
 else
-    uv sync --extra backend
+    uv sync --extra backend --frozen
 fi
