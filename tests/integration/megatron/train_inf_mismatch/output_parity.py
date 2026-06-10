@@ -448,6 +448,8 @@ def build_logical_token_map(packed_tensors: dict[str, Any]) -> LogicalTokenMap:
     tokens = packed_tensors["tokens"]
     group_ids = packed_tensors["group_ids"]
     parent_ids = packed_tensors["parent_ids"]
+    assistant_mask = packed_tensors["assistant_mask"]
+    logprobs = packed_tensors["logprobs"]
     prompts: list[LogicalPrompt] = []
     logical_tokens: list[LogicalToken] = []
     prompt_id_by_tokens: dict[tuple[int, ...], int] = {}
@@ -462,14 +464,21 @@ def build_logical_token_map(packed_tensors: dict[str, Any]) -> LogicalTokenMap:
             ):
                 if completion_end - completion_start < 2:
                     continue
-                flat = [
+                comparable_positions = [
+                    packed_i
+                    for packed_i in range(completion_start + 1, completion_end)
+                    if bool(assistant_mask[sample_id, packed_i].item())
+                    and math.isfinite(float(logprobs[sample_id, packed_i].item()))
+                ]
+                if not comparable_positions:
+                    continue
+                vllm_prompt_token_ids = [
                     int(value)
                     for value in tokens[sample_id, prompt_start:prompt_end].tolist()
-                ] + [
-                    int(value)
-                    for value in tokens[
-                        sample_id, completion_start:completion_end
-                    ].tolist()
+                ] + [int(tokens[sample_id, completion_start].item())]
+                flat = vllm_prompt_token_ids + [
+                    int(tokens[sample_id, packed_i].item())
+                    for packed_i in comparable_positions
                 ]
                 flat_key = tuple(flat)
                 prompt_id = prompt_id_by_tokens.get(flat_key)
@@ -487,7 +496,7 @@ def build_logical_token_map(packed_tensors: dict[str, Any]) -> LogicalTokenMap:
                             token_ids=flat,
                         )
                     )
-                for packed_i in range(completion_start + 1, completion_end):
+                for completion_index, packed_i in enumerate(comparable_positions):
                     logical_tokens.append(
                         LogicalToken(
                             token_id=int(tokens[sample_id, packed_i].item()),
@@ -497,8 +506,7 @@ def build_logical_token_map(packed_tensors: dict[str, Any]) -> LogicalTokenMap:
                             prompt_id=prompt_id,
                             art_packed_token_index=packed_i,
                             art_logit_index=packed_i - 1,
-                            vllm_prompt_token_index=prompt_len
-                            + (packed_i - completion_start),
+                            vllm_prompt_token_index=prompt_len + 1 + completion_index,
                         )
                     )
 
