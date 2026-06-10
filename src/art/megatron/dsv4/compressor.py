@@ -431,9 +431,20 @@ class DeepSeekV4Compressor(nn.Module):
         return self.overlap_transform_raw(tensor, value)
 
     def _project_raw(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        assert self.ape.dtype == torch.float32
-        assert self.wkv.weight.dtype in {torch.bfloat16, torch.float32}
-        assert self.wgate.weight.dtype in {torch.bfloat16, torch.float32}
+        if self.ape.dtype != torch.float32:
+            raise TypeError(
+                f"DeepSeek-V4 compressor APE must stay fp32, got {self.ape.dtype}."
+            )
+        if self.wkv.weight.dtype not in {torch.bfloat16, torch.float32}:
+            raise TypeError(
+                "DeepSeek-V4 compressor KV projection requires bf16/fp32 weights, got "
+                f"{self.wkv.weight.dtype}."
+            )
+        if self.wgate.weight.dtype not in {torch.bfloat16, torch.float32}:
+            raise TypeError(
+                "DeepSeek-V4 compressor gate projection requires bf16/fp32 weights, "
+                f"got {self.wgate.weight.dtype}."
+            )
 
         kv = _add_lora_if_present(
             self, "kv_proj_lora", linear_bf16_fp32(x, self.wkv.weight), x

@@ -486,11 +486,19 @@ class DeepSeekV4Attention(MegatronModule):
             if kv_compress_sbd is not None:
                 kv_compress = einops.rearrange(kv_compress_sbd, "s b d -> b s d")
 
-        assert self.attn_sink.dtype == torch.float32
+        if self.attn_sink.dtype != torch.float32:
+            raise TypeError(
+                "DeepSeek-V4 attention sink must stay fp32, got "
+                f"{self.attn_sink.dtype}."
+            )
 
         if kv_compress is not None:
             kv = torch.cat([kv_vanilla, kv_compress], dim=1)
-            assert kv_compress_offset == kv_vanilla.size(1)
+            if kv_compress_offset != kv_vanilla.size(1):
+                raise RuntimeError(
+                    "DeepSeek-V4 compressed KV offset must equal raw KV length, got "
+                    f"{kv_compress_offset} and {kv_vanilla.size(1)}."
+                )
         else:
             kv = kv_vanilla
 
