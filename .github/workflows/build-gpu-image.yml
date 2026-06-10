@@ -103,7 +103,7 @@ jobs:
 
       - name: Configure registry auth
         env:
-          IMAGE_REPO: ${{ inputs.image_repo }}
+          IMAGE_REPO: ${{ inputs.image_repo || 'docker.io/bradhiltonnw/art-gpu' }}
           REGISTRY_AUTH_JSON_B64_SECRET: ${{ secrets.REGISTRY_AUTH_JSON_B64 }}
           DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
           DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
@@ -142,12 +142,17 @@ jobs:
       - name: Build, push, and prewarm GPU image
         env:
           GH_TOKEN: ${{ github.token }}
-          IMAGE_REPO: ${{ inputs.image_repo }}
+          IMAGE_REPO: ${{ inputs.image_repo || 'docker.io/bradhiltonnw/art-gpu' }}
           IMAGE_TAG: ${{ inputs.tag }}
           NO_CACHE: ${{ inputs.no_cache }}
           PREWARM_NODES: ${{ inputs.prewarm_nodes }}
           PREWARM_TIMEOUT: ${{ inputs.prewarm_timeout }}
         run: |
+          IMAGE_TAG="${IMAGE_TAG:-gha-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}}"
+          NO_CACHE="${NO_CACHE:-false}"
+          PREWARM_NODES="${PREWARM_NODES:-true}"
+          PREWARM_TIMEOUT="${PREWARM_TIMEOUT:-30m}"
+
           args=(
             --infra "${SKY_INFRA}"
             --image-repo "${IMAGE_REPO}"
@@ -166,12 +171,14 @@ jobs:
           bash scripts/build-gpu-image.sh "${args[@]}"
 
       - name: Smoke launch pushed image
-        if: ${{ inputs.smoke_launch }}
+        if: ${{ inputs.smoke_launch != false }}
         env:
-          IMAGE_REPO: ${{ inputs.image_repo }}
+          IMAGE_REPO: ${{ inputs.image_repo || 'docker.io/bradhiltonnw/art-gpu' }}
           IMAGE_TAG: ${{ inputs.tag }}
           SMOKE_GPUS: ${{ inputs.smoke_gpus }}
         run: |
+          IMAGE_TAG="${IMAGE_TAG:-gha-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}}"
+          SMOKE_GPUS="${SMOKE_GPUS:-H200:1}"
           cluster="art-gpu-smoke-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
           cleanup() {
             uv run --no-project --with 'skypilot[kubernetes,remote]==0.11.1' \
