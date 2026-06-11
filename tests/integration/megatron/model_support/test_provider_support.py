@@ -124,6 +124,29 @@ def test_dsv4_prefers_validated_native_lora_rollout() -> None:
     assert model_requires_merged_rollout("deepseek-ai/DeepSeek-V4-Flash") is False
 
 
+def test_dsv4_provider_disables_shared_expert_overlap(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    provider = _FakeProvider()
+    provider.num_moe_experts = 256
+    provider.moe_shared_expert_overlap = True
+    fake_bridge = _FakeBridge(
+        model_bridge=object(),
+        provider=provider,
+    )
+    monkeypatch.setattr(
+        provider_module.AutoBridge,
+        "from_hf_pretrained",
+        lambda *args, **kwargs: fake_bridge,
+    )
+    monkeypatch.setattr(provider_module.torch.cuda, "device_count", lambda: 2)
+
+    resolved = provider_module.get_provider("deepseek-ai/DeepSeek-V4-Flash")
+
+    assert resolved.moe_shared_expert_overlap is False
+    assert resolved.context_parallel_size == 1
+
+
 def test_megatron_lora_rank_defaults_by_architecture() -> None:
     dense_handler = get_model_support_handler("OpenPipe/Qwen3-14B-Instruct")
     moe_handler = get_model_support_handler("Qwen/Qwen3-30B-A3B-Instruct-2507")

@@ -67,6 +67,7 @@ class Dsv4Handler(DefaultMoeHandler):
 
     def configure_provider_for_runtime(self, provider: Any) -> None:
         provider.mtp_num_layers = None
+        provider.moe_shared_expert_overlap = False
         raw_num_layers = os.environ.get(_VALIDATION_NUM_LAYERS_ENV)
         if raw_num_layers is None:
             return
