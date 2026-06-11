@@ -288,6 +288,7 @@ def _collect_fp32_preserved_tensors(
     keep_in_fp32: list[_Fp32PreservedTensor] = []
     for model_module in model:
         for submodule in model_module.modules():
+            fp32_parameter_names = set(getattr(submodule, "_keep_fp32_parameters", ()))
             fp32_buffer_names = set(getattr(submodule, "_keep_fp32_buffers", ()))
             if hasattr(submodule, "_maintain_float32_expert_bias"):
                 expert_bias = getattr(submodule, "expert_bias", None)
@@ -296,7 +297,7 @@ def _collect_fp32_preserved_tensors(
                         (submodule, "expert_bias", expert_bias.data.clone(), True)
                     )
             for name, param in submodule.named_parameters(recurse=False):
-                if getattr(param, "_keep_fp32", False):
+                if name in fp32_parameter_names or getattr(param, "_keep_fp32", False):
                     keep_in_fp32.append((submodule, name, param.data.clone(), True))
             for name, buffer in submodule.named_buffers(recurse=False):
                 if name in fp32_buffer_names or getattr(buffer, "_keep_fp32", False):

@@ -393,6 +393,7 @@ class DeepSeekV4Compressor(nn.Module):
         )
         self.norm = RMSNorm(self.head_dim, norm_eps)
 
+        self._keep_fp32_parameters = ("ape",)
         setattr(self.ape, "_keep_fp32", True)
 
         base = cfg.dsv4_compress_rope_theta

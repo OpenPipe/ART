@@ -25,6 +25,11 @@ class HCHeadParams(MegatronModule):
             torch.empty(hc_mult, dtype=torch.float32)
         )
         self.hc_head_scale = torch.nn.Parameter(torch.empty(1, dtype=torch.float32))
+        self._keep_fp32_parameters = (
+            "hc_head_fn",
+            "hc_head_base",
+            "hc_head_scale",
+        )
         for param in (self.hc_head_fn, self.hc_head_base, self.hc_head_scale):
             setattr(param, "_keep_fp32", True)
 

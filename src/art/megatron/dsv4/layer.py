@@ -189,6 +189,14 @@ class Dsv4TransformerLayer(TransformerLayer):
         )
         self.hc_ffn_base = torch.nn.Parameter(torch.empty(mix, dtype=torch.float32))
         self.hc_ffn_scale = torch.nn.Parameter(torch.empty(3, dtype=torch.float32))
+        self._keep_fp32_parameters = (
+            "hc_attn_fn",
+            "hc_attn_base",
+            "hc_attn_scale",
+            "hc_ffn_fn",
+            "hc_ffn_base",
+            "hc_ffn_scale",
+        )
         for param in (
             self.hc_attn_fn,
             self.hc_attn_base,
