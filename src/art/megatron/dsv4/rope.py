@@ -88,8 +88,8 @@ def wrapped_precompute_freqs_cis(
     max_seq_len = 65536
     cfg = cast(Any, config)
 
-    # yarn_disabled=True → original_seq_len=0, which makes precompute_freqs_cis skip the YaRN
-    # correction-range interpolation. Used by 0415 for pure-window (compress_ratio==0) layers.
+    # yarn_disabled=True makes precompute_freqs_cis skip YaRN interpolation.
+    # DSV4 Flash keeps YaRN enabled for sliding and compressed attention.
     original_seq_len = 0 if yarn_disabled else cfg.original_max_position_embeddings
 
     inputs = dict(

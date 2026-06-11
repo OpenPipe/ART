@@ -290,13 +290,11 @@ class DeepSeekV4Attention(MegatronModule):
         rope_base = (
             cfg.dsv4_compress_rope_theta if self.compress_ratio else cfg.rotary_base
         )
-        yarn_disabled = not self.compress_ratio
         configure_rope_cache(
             self,
             config,
             rope_head_dim=self.rope_head_dim,
             base=rope_base,
-            yarn_disabled=yarn_disabled,
         )
         self._dsv4_position_ids: torch.Tensor | None = None
 

@@ -959,8 +959,9 @@ class DeepseekV4Attention(nn.Module):
         self.config = config
         self.layer_idx = layer_idx
         self.layer_type = config.layer_types[layer_idx]
-        # Sliding-only layers use the "main" (plain θ=10000) rope; CSA/HCA layers
-        # share the same yarn-scaled "compress" rope as their compressor.
+        # Sliding-only layers use the main θ=10000 rope; CSA/HCA layers share
+        # the compress θ rope with their compressor. Both inherit checkpoint
+        # YaRN scaling when configured.
         self.rope_layer_type = (
             "main" if self.layer_type == "sliding_attention" else "compress"
         )

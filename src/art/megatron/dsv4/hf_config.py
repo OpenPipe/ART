@@ -257,21 +257,21 @@ class DeepseekV4Config(PretrainedConfig):
                 "main": dict(rope_parameters["main"]),
                 "compress": dict(rope_parameters["compress"]),
             }
-        compress = dict(rope_scaling or {})
-        if "type" in compress and "rope_type" not in compress:
-            compress["rope_type"] = compress.pop("type")
-        compress.setdefault("rope_type", "default")
-        compress["rope_theta"] = compress_rope_theta
-        compress["partial_rotary_factor"] = partial_rotary_factor
-        if compress["rope_type"] == "yarn":
-            compress.setdefault("attention_factor", 1.0)
+
+        def build_params(theta: float | int) -> dict[str, Any]:
+            params = dict(rope_scaling or {})
+            if "type" in params and "rope_type" not in params:
+                params["rope_type"] = params.pop("type")
+            params.setdefault("rope_type", "default")
+            params["rope_theta"] = theta
+            params["partial_rotary_factor"] = partial_rotary_factor
+            if params["rope_type"] == "yarn":
+                params.setdefault("attention_factor", 1.0)
+            return params
+
         return {
-            "main": {
-                "rope_type": "default",
-                "rope_theta": rope_theta,
-                "partial_rotary_factor": partial_rotary_factor,
-            },
-            "compress": compress,
+            "main": build_params(rope_theta),
+            "compress": build_params(compress_rope_theta),
         }
 
 
