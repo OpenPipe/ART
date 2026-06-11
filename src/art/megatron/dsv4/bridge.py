@@ -8,6 +8,7 @@ from megatron.bridge.models.conversion.param_mapping import (
     AutoMapping,
     GatedMLPMapping,
     ReplicatedMapping,
+    RowParallelMapping,
     extract_expert_number_from_param,
 )
 from megatron.bridge.models.deepseek.deepseek_v3_bridge import DeepSeekV3Bridge
@@ -555,6 +556,31 @@ class _Dsv4ReplicatedMapping(ReplicatedMapping):
         )
 
 
+class _Dsv4RowParallelMapping(RowParallelMapping):
+    def __init__(
+        self,
+        megatron_param: str,
+        hf_param: str,
+        export_hf_param: str | None = None,
+    ):
+        super().__init__(megatron_param, hf_param)
+        self.export_hf_param = export_hf_param or hf_param
+
+    def megatron_to_hf(self, megatron_weights: Any, megatron_module: Any):
+        converted = super().megatron_to_hf(megatron_weights, megatron_module)
+        if not converted or self.export_hf_param == self.hf_param:
+            return converted
+        return {self.export_hf_param: next(iter(converted.values()))}
+
+    def resolve(self, captures: tuple[str, ...]):
+        resolved_megatron_param, resolved_hf_param = self._resolve_names(captures)
+        return type(self)(
+            resolved_megatron_param,
+            cast(str, resolved_hf_param),
+            cast(str, _resolve_dsv4_hf_param(self.export_hf_param, captures)),
+        )
+
+
 class _Dsv4GatedMLPMapping(GatedMLPMapping):
     def __init__(
         self,
@@ -844,7 +870,7 @@ def _dsv4_mapping_registry() -> MegatronMappingRegistry:
             "layers.*.ffn.experts.*.w2.weight",
             "model.layers.*.mlp.experts.*.down_proj.weight",
         ),
-        _Dsv4AutoMapping(
+        _Dsv4RowParallelMapping(
             "decoder.layers.*.mlp.shared_experts.linear_fc2.weight",
             "layers.*.ffn.shared_experts.w2.weight",
             "model.layers.*.mlp.shared_experts.down_proj.weight",
@@ -926,7 +952,7 @@ def _dsv4_mapping_registry() -> MegatronMappingRegistry:
             "layers.*.attn.wo_a.weight",
             "model.layers.*.self_attn.o_a_proj.weight",
         ),
-        _Dsv4AutoMapping(
+        _Dsv4RowParallelMapping(
             "decoder.layers.*.self_attention.wo_b.weight",
             "layers.*.attn.wo_b.weight",
             "model.layers.*.self_attn.o_b_proj.weight",
