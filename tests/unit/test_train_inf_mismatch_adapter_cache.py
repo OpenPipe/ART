@@ -50,25 +50,26 @@ def test_make_or_reuse_nonzero_adapter_reuses_valid_cache(
     monkeypatch.setattr(real_path, "_make_nonzero_adapter", make_adapter)
     config = _config(tmp_path / "cache")
 
-    first = Path(
-        real_path._make_or_reuse_nonzero_adapter(
-            config=config,
-            artifact_dir=tmp_path / "artifact_0",
-        )
+    first = real_path._make_or_reuse_nonzero_adapter(
+        config=config,
+        artifact_dir=tmp_path / "artifact_0",
     )
-    second = Path(
-        real_path._make_or_reuse_nonzero_adapter(
-            config=config,
-            artifact_dir=tmp_path / "artifact_1",
-        )
+    second = real_path._make_or_reuse_nonzero_adapter(
+        config=config,
+        artifact_dir=tmp_path / "artifact_1",
     )
+    first_path = Path(first.path)
+    second_path = Path(second.path)
 
     assert calls == 1
-    assert first == second
-    assert first == _cache_dir(config) / real_path._adapter_cache_key(
+    assert not first.cache_hit
+    assert second.cache_hit
+    assert first_path == second_path
+    assert first.cache_key == second.cache_key
+    assert first_path == _cache_dir(config) / real_path._adapter_cache_key(
         config.output_parity
     )
-    assert (first / "adapter_model.safetensors").read_bytes() == b"non-identity"
+    assert (first_path / "adapter_model.safetensors").read_bytes() == b"non-identity"
 
 
 def test_cached_adapter_requires_non_identity_manifest(tmp_path: Path) -> None:

@@ -131,12 +131,16 @@ class RealPathTrainInfReport(BaseModel):
     base_moe_routing_shared_prefix_conflict_rows: int | None = None
     base_moe_routing_shared_prefix_conflict_slots: int | None = None
     adapter_path: str
+    adapter_cache_key: str
+    adapter_cache_hit: bool
     megatron_base_scores: str | None = None
     vllm_base_scores: str | None = None
     megatron_lora_scores: str
     vllm_lora_scores: str
     base: PairComparison | None = None
     base_topk: TopKComparison | None = None
+    megatron_lora_effect: PairComparison | None = None
+    vllm_lora_effect: PairComparison | None = None
     lora: PairComparison
     lora_topk: TopKComparison
     moe_routing_packed_tokens: int
@@ -147,6 +151,12 @@ class RealPathTrainInfReport(BaseModel):
     mean_abs_pct_limit: float
     top20_kl_candidate_to_target_limit: float
     passed: bool
+
+
+class AdapterCacheResult(BaseModel):
+    path: str
+    cache_key: str
+    cache_hit: bool
 
 
 _PROMPT_SENTENCES = [
@@ -844,18 +854,26 @@ def _make_or_reuse_nonzero_adapter(
     *,
     config: RealPathConfig,
     artifact_dir: Path,
-) -> str:
+) -> AdapterCacheResult:
     cache_key = _adapter_cache_key(config.output_parity)
     cache_path = _adapter_cache_dir(config) / cache_key
     if _cached_adapter_is_valid(cache_path, cache_key=cache_key):
-        return str(cache_path)
+        return AdapterCacheResult(
+            path=str(cache_path),
+            cache_key=cache_key,
+            cache_hit=True,
+        )
     adapter_path = Path(
         _make_nonzero_adapter(config=config.output_parity, artifact_dir=artifact_dir)
     )
     if not adapter_path:
         raise RuntimeError("Real-path adapter worker did not create an adapter")
     _copy_adapter_dir(adapter_path, cache_path, cache_key=cache_key)
-    return str(cache_path)
+    return AdapterCacheResult(
+        path=str(cache_path),
+        cache_key=cache_key,
+        cache_hit=False,
+    )
 
 
 def _run_logits_with_replay(
@@ -1199,10 +1217,11 @@ async def run_real_path_train_inf_mismatch(
     )
     rollout_weights_mode = "merged" if score_rollout_mode == "merged" else "lora"
     _write_json(artifact_dir / "real_path_config.json", config.model_dump(mode="json"))
-    adapter_path = _make_or_reuse_nonzero_adapter(
+    adapter = _make_or_reuse_nonzero_adapter(
         config=config,
         artifact_dir=artifact_dir,
     )
+    adapter_path = adapter.path
 
     backend = MegatronBackend(
         path=str(artifact_dir / "art_path"),
@@ -1303,6 +1322,8 @@ async def run_real_path_train_inf_mismatch(
         vllm_base: ScoreBundle | None = None
         base_comparison: PairComparison | None = None
         base_topk_comparison: TopKComparison | None = None
+        megatron_lora_effect: PairComparison | None = None
+        vllm_lora_effect: PairComparison | None = None
         if config.diagnose_base:
             base_diagnostic = await _score_base_real_generation_path(
                 config=config,
@@ -1340,6 +1361,18 @@ async def run_real_path_train_inf_mismatch(
                 sequence_ids=sequence_ids,
             )
             base_topk_comparison = compare_topk(megatron_base, vllm_base)
+            megatron_lora_effect = compare_pair(
+                candidate=torch.tensor(
+                    megatron_lora.target_logprobs, dtype=torch.float32
+                ),
+                target=torch.tensor(megatron_base.target_logprobs, dtype=torch.float32),
+                sequence_ids=sequence_ids,
+            )
+            vllm_lora_effect = compare_pair(
+                candidate=torch.tensor(vllm_lora.target_logprobs, dtype=torch.float32),
+                target=torch.tensor(vllm_base.target_logprobs, dtype=torch.float32),
+                sequence_ids=sequence_ids,
+            )
         comparison = compare_pair(
             candidate=torch.tensor(megatron_lora.target_logprobs, dtype=torch.float32),
             target=torch.tensor(vllm_lora.target_logprobs, dtype=torch.float32),
@@ -1390,6 +1423,8 @@ async def run_real_path_train_inf_mismatch(
                 else None
             ),
             adapter_path=adapter_path,
+            adapter_cache_key=adapter.cache_key,
+            adapter_cache_hit=adapter.cache_hit,
             megatron_base_scores=(
                 base_diagnostic.megatron_score_path
                 if base_diagnostic is not None
@@ -1402,6 +1437,8 @@ async def run_real_path_train_inf_mismatch(
             vllm_lora_scores=str(artifact_dir / "real_path_vllm_lora_scores.json"),
             base=base_comparison,
             base_topk=base_topk_comparison,
+            megatron_lora_effect=megatron_lora_effect,
+            vllm_lora_effect=vllm_lora_effect,
             lora=comparison,
             lora_topk=topk_comparison,
             moe_routing_packed_tokens=int(stats.packed_tokens),
