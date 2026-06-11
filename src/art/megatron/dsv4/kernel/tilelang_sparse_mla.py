@@ -78,6 +78,11 @@ def sparse_attn_tilelang(q, kv, attn_sink, topk_idxs, sm_scale=None):
     output_dtype = q.dtype
     if q.dtype is torch.float32:
         return _sparse_attn_torch(q, kv, attn_sink, topk_idxs, sm_scale)
+    if kv.dtype != q.dtype:
+        kv = kv.to(q.dtype)
+    q = q.contiguous()
+    kv = kv.contiguous()
+    topk_idxs = topk_idxs.contiguous()
     head_count = int(q.shape[2])
     if head_count < 16:
         pad_heads = 16 - head_count
