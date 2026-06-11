@@ -20,6 +20,7 @@ def apply_vllm_runtime_patches() -> None:
     patch_layerwise_reload_shadow_attrs()
     patch_dsv4_attn_sink_layerwise_reload()
     patch_dsv4_lora_support()
+    patch_dsv4_fast_path_lora()
     patch_lora_linear_base_attr_proxy()
     patch_marlin_lora_swiglu_limit()
     patch_routed_experts_prefix_cache_sidecar()
@@ -372,8 +373,227 @@ def patch_dsv4_lora_support() -> None:
     }
     model_cls.is_3d_moe_weight = False
     model_cls.is_non_gated_moe = False
-    model_cls.lora_skip_prefixes = ["mtp"]
+    model_cls.lora_skip_prefixes = ["mtp", "indexer"]
     model_cls._art_dsv4_lora_patched = True
+    _patch_dsv4_lora_manager_indexer_skip(model_cls)
+
+
+def _patch_dsv4_lora_manager_indexer_skip(model_cls: type) -> None:
+    from vllm.lora.model_manager import LoRAModelManager
+
+    original = LoRAModelManager._match_target_modules
+    if getattr(original, "__art_dsv4_indexer_skip_patched__", False):
+        return
+
+    def _match_target_modules(self: Any, module_name: str) -> bool:
+        if isinstance(self.model, model_cls) and ".indexer." in module_name:
+            return False
+        return original(self, module_name)
+
+    _match_target_modules.__art_dsv4_indexer_skip_patched__ = True  # type: ignore[attr-defined]
+    LoRAModelManager._match_target_modules = _match_target_modules  # type: ignore[method-assign]
+
+
+def _is_lora_wrapped_linear(module: Any) -> bool:
+    return all(
+        hasattr(module, name)
+        for name in ("lora_a_stacked", "lora_b_stacked", "punica_wrapper")
+    )
+
+
+def _apply_lora_to_existing_linear_output(
+    module: Any,
+    x: Any,
+    output: Any,
+) -> Any:
+    if not _is_lora_wrapped_linear(module):
+        return output
+    wrapper = module.punica_wrapper
+    if getattr(wrapper, "no_lora", False):
+        return output
+    if getattr(wrapper, "indices_len", [None])[0] is None:
+        return output
+    return module._apply_lora_to_output(x, output)
+
+
+def _dsv4_inverse_rope_grouped_for_wo_a(
+    o: Any,
+    *,
+    positions: Any,
+    cos_sin_cache: Any,
+    rope_head_dim: int,
+    n_local_groups: int,
+) -> Any:
+    import torch
+
+    nope = o[..., :-rope_head_dim]
+    rope = o[..., -rope_head_dim:].to(torch.float32)
+    cos_sin = cos_sin_cache.index_select(0, positions.to(torch.int64)).to(torch.float32)
+    half = rope_head_dim // 2
+    cos = cos_sin[:, :half].view(-1, 1, half)
+    sin = cos_sin[:, half : half + half].view(-1, 1, half)
+
+    pairs = rope.view(*rope.shape[:-1], half, 2)
+    even = pairs[..., 0]
+    odd = pairs[..., 1]
+    inv_rope = torch.stack(
+        (even * cos + odd * sin, odd * cos - even * sin), dim=-1
+    ).flatten(-2)
+    inv = torch.cat((nope.to(torch.float32), inv_rope), dim=-1).to(o.dtype)
+    return inv.view(o.shape[0], n_local_groups, -1)
+
+
+def _apply_dsv4_wo_a_lora(
+    wo_a: Any,
+    z: Any,
+    o: Any,
+    *,
+    positions: Any,
+    cos_sin_cache: Any,
+    rope_head_dim: int,
+    n_local_groups: int,
+) -> Any:
+    if not _is_lora_wrapped_linear(wo_a):
+        return z
+    wrapper = wo_a.punica_wrapper
+    if getattr(wrapper, "no_lora", False):
+        return z
+    if getattr(wrapper, "indices_len", [None])[0] is None:
+        return z
+
+    import torch
+
+    token_lora_indices = wrapper.token_lora_indices[: z.shape[0]]
+    x = _dsv4_inverse_rope_grouped_for_wo_a(
+        o,
+        positions=positions,
+        cos_sin_cache=cos_sin_cache,
+        rope_head_dim=rope_head_dim,
+        n_local_groups=n_local_groups,
+    )
+    lora_a = wo_a.lora_a_stacked[0][:, 0]
+    lora_b = wo_a.lora_b_stacked[0][:, 0]
+    out_per_group = z.shape[-1]
+    delta = torch.zeros_like(z)
+    for slot in range(lora_a.shape[0]):
+        hidden = torch.einsum("tgi,ri->tgr", x, lora_a[slot].to(x.dtype))
+        weight = (
+            lora_b[slot]
+            .view(n_local_groups, out_per_group, hidden.shape[-1])
+            .permute(2, 0, 1)
+            .to(hidden.dtype)
+        )
+        slot_delta = torch.einsum("tgr,rgo->tgo", hidden, weight).to(delta.dtype)
+        mask = (token_lora_indices == slot).view(-1, 1, 1)
+        delta = torch.where(mask, delta + slot_delta, delta)
+    return z + delta
+
+
+def patch_dsv4_fast_path_lora() -> None:
+    """Apply LoRA deltas on DSV4 paths that read base weights directly.
+
+    vLLM's generic LoRA manager can wrap DSV4 linear modules, but the DSV4
+    Flash runtime bypasses some wrapped forwards for performance: compressor
+    projections are direct ``hidden @ fused_wkv_wgate.weight.T`` calls, and
+    ``wo_a`` is a custom inverse-RoPE/FP8/einsum path. Without this patch vLLM
+    accepts and activates these adapter tensors while silently omitting their
+    deltas from generation.
+    """
+    dsv4_attn = importlib.import_module(
+        "vllm.model_executor.layers.deepseek_v4_attention"
+    )
+    wrapper_cls = getattr(dsv4_attn, "DeepseekV4MultiHeadLatentAttentionWrapper", None)
+    if wrapper_cls is None or getattr(
+        wrapper_cls, "_art_fast_path_lora_patched", False
+    ):
+        return
+
+    original_attn_gemm_parallel_execute = wrapper_cls.attn_gemm_parallel_execute
+    original_forward = wrapper_cls.forward
+
+    def attn_gemm_parallel_execute(self: Any, hidden_states: Any) -> tuple[Any, ...]:
+        qr_kv, kv_score, indexer_kv_score, indexer_weights = (
+            original_attn_gemm_parallel_execute(self, hidden_states)
+        )
+        if self.compressor is not None:
+            kv_score = _apply_lora_to_existing_linear_output(
+                self.compressor.fused_wkv_wgate,
+                hidden_states,
+                kv_score,
+            )
+        if self.indexer is not None:
+            indexer_kv_score = _apply_lora_to_existing_linear_output(
+                self.indexer.compressor.fused_wkv_wgate,
+                hidden_states,
+                indexer_kv_score,
+            )
+        return qr_kv, kv_score, indexer_kv_score, indexer_weights
+
+    def forward(
+        self: Any,
+        positions: Any,
+        hidden_states: Any,
+        llama_4_scaling: Any | None = None,
+    ) -> Any:
+        if dsv4_attn.current_platform.is_rocm():
+            return original_forward(self, positions, hidden_states, llama_4_scaling)
+
+        num_tokens = hidden_states.shape[0]
+        o_padded = dsv4_attn.torch.empty(
+            (num_tokens, self.padded_heads, self.head_dim),
+            dtype=hidden_states.dtype,
+            device=hidden_states.device,
+        )
+
+        dsv4_attn.torch.ops.vllm.deepseek_v4_attention(
+            hidden_states,
+            positions,
+            o_padded,
+            self.layer_name,
+        )
+        o = o_padded[:, : self.n_local_heads, :]
+
+        o_fp8, o_scale = dsv4_attn.fused_inv_rope_fp8_quant(
+            o,
+            positions,
+            self.rotary_emb.cos_sin_cache,
+            n_groups=self.n_local_groups,
+            heads_per_group=self.n_local_heads // self.n_local_groups,
+            nope_dim=self.nope_head_dim,
+            rope_dim=self.rope_head_dim,
+            tma_aligned_scales=self._tma_aligned_scales,
+        )
+
+        z = dsv4_attn.torch.empty(
+            (num_tokens, self.n_local_groups, self.o_lora_rank),
+            device=o.device,
+            dtype=dsv4_attn.torch.bfloat16,
+        )
+        dsv4_attn.torch.ops.vllm.deepseek_v4_fp8_einsum(
+            o_fp8,
+            o_scale,
+            self.wo_a.weight,
+            self.wo_a.weight_scale_inv,
+            z,
+            "bhr,hdr->bhd",
+            list(self._einsum_recipe),
+        )
+        z = _apply_dsv4_wo_a_lora(
+            self.wo_a,
+            z,
+            o,
+            positions=positions,
+            cos_sin_cache=self.rotary_emb.cos_sin_cache,
+            rope_head_dim=self.rope_head_dim,
+            n_local_groups=self.n_local_groups,
+        )
+        return self.wo_b(z.flatten(1))
+
+    attn_gemm_parallel_execute.__art_patched__ = True  # type: ignore[attr-defined]
+    forward.__art_patched__ = True  # type: ignore[attr-defined]
+    wrapper_cls.attn_gemm_parallel_execute = attn_gemm_parallel_execute
+    wrapper_cls.forward = forward
+    wrapper_cls._art_fast_path_lora_patched = True
 
 
 def _base_layer_attr_proxy(name: str) -> property:
