@@ -160,12 +160,13 @@ override-dependencies = [
     "transformers==5.2.0",
     "torch==2.11.0",
 ]
-exclude-dependencies = ["pynvml", "emerging-optimizers"]
+exclude-dependencies = ["pynvml", "emerging-optimizers", "causal-conv1d", "mamba-ssm"]
 no-build-isolation-package = ["apex", "transformer-engine", "transformer-engine-cu12", "transformer-engine-torch", "megatron-bridge", "deep-ep", "nv-grouped-gemm"]
 
 [tool.uv.extra-build-dependencies]
 apex = ["torch>=2.11.0"]
 deep-ep = ["torch>=2.11.0"]
+megatron-core = ["pybind11"]
 nv-grouped-gemm = ["torch>=2.11.0"]
 transformer-engine-torch = ["torch>=2.11.0"]
 

@@ -35,7 +35,9 @@ overrides = [
     { name = "transformers", specifier = "==5.2.0" },
 ]
 excludes = [
+    "causal-conv1d",
     "emerging-optimizers",
+    "mamba-ssm",
     "pynvml",
 ]
 
@@ -742,18 +744,6 @@ sdist = { url = "https://files.pythonhosted.org/packages/ad/df/ff2aa55cf0d7c1462
 wheels = [
     { url = "https://files.pythonhosted.org/packages/08/07/facef6abd81378e6153b757dc1848621675d971fbc88ebb5d182ebc1c37f/casbin-1.43.0-py3-none-any.whl", hash = "sha256:63a3d1228870250e859ccd94133fe478821093f71dd37f05e0baa0c6fea26623", size = 475059, upload-time = "2025-05-10T06:57:16.89Z" },
 ]
-
-[[package]]
-name = "causal-conv1d"
-version = "1.6.2.post1"
-source = { registry = "https://pypi.org/simple" }
-dependencies = [
-    { name = "ninja" },
-    { name = "packaging" },
-    { name = "torch", version = "2.11.0", source = { registry = "https://pypi.org/simple" }, marker = "sys_platform != 'linux' and sys_platform != 'win32'" },
-    { name = "torch", version = "2.11.0+cu128", source = { registry = "https://download.pytorch.org/whl/cu128" }, marker = "sys_platform == 'linux' or sys_platform == 'win32'" },
-]
-sdist = { url = "https://files.pythonhosted.org/packages/63/5c/2403b8410122d159405c4bd8456340c7251c193358fa24d30cb273fb5048/causal_conv1d-1.6.2.post1.tar.gz", hash = "sha256:245e314ea21064ded7a5bf6b3b842b644aa6f92e45cecfe3e935629744c35ff4", size = 29434, upload-time = "2026-05-09T13:00:51.622Z" }
 
 [[package]]
 name = "certifi"
@@ -3581,22 +3571,6 @@ wheels = [
 ]
 
 [[package]]
-name = "mamba-ssm"
-version = "2.3.1"
-source = { registry = "https://pypi.org/simple" }
-dependencies = [
-    { name = "einops" },
-    { name = "ninja" },
-    { name = "packaging" },
-    { name = "setuptools" },
-    { name = "torch", version = "2.11.0", source = { registry = "https://pypi.org/simple" }, marker = "sys_platform != 'linux' and sys_platform != 'win32'" },
-    { name = "torch", version = "2.11.0+cu128", source = { registry = "https://download.pytorch.org/whl/cu128" }, marker = "sys_platform == 'linux' or sys_platform == 'win32'" },
-    { name = "transformers" },
-    { name = "triton" },
-]
-sdist = { url = "https://files.pythonhosted.org/packages/34/67/ec89aa703da194a813e35d2ea2de8f74a7ce6991a120a29f3a0c5e30d4b9/mamba_ssm-2.3.1.tar.gz", hash = "sha256:4d529477ad94753962216d583fc8f1c127c717b7d7c875d6bbb9376366d0d761", size = 121707, upload-time = "2026-03-10T09:27:34.798Z" }
-
-[[package]]
 name = "markdown"
 version = "3.10.2"
 source = { registry = "https://pypi.org/simple" }
@@ -3761,7 +3735,6 @@ version = "0.4.0rc0"
 source = { git = "https://github.com/NVIDIA-NeMo/Megatron-Bridge.git?rev=e049cc00c24d03e2ae45d2608c7a44e2d2364e3d#e049cc00c24d03e2ae45d2608c7a44e2d2364e3d" }
 dependencies = [
     { name = "accelerate" },
-    { name = "causal-conv1d" },
     { name = "comet-ml" },
     { name = "datasets" },
     { name = "diffusers" },
@@ -3770,7 +3743,6 @@ dependencies = [
     { name = "hydra-core" },
     { name = "imageio" },
     { name = "imageio-ffmpeg" },
-    { name = "mamba-ssm" },
     { name = "megatron-core" },
     { name = "mlflow" },
     { name = "nvidia-resiliency-ext" },

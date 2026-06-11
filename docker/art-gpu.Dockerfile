@@ -94,8 +94,7 @@ ENV CUDA_HOME=/usr/local/cuda-12.8 \
     MAX_JOBS=${BUILD_JOBS} \
     NINJAFLAGS=-j${BUILD_JOBS} \
     PYTHONUNBUFFERED=1 \
-    HOME=/home/sky \
-    ART_PROJECT_ENVIRONMENT=/home/sky/art-project-venv
+    HOME=/home/sky
 
 SHELL ["/bin/bash", "-c"]
 
@@ -152,18 +151,6 @@ COPY --from=builder --chown=sky:sky /opt/uv-python /opt/uv-python
 
 USER sky
 WORKDIR /home/sky
-
-COPY --chown=sky:sky pyproject.toml uv.lock /tmp/art-project/
-
-RUN mkdir -p "${HOME}/sky_workdir" \
- && UV_PROJECT_ENVIRONMENT="${ART_PROJECT_ENVIRONMENT}" UV_LINK_MODE=copy uv sync \
-      --project /tmp/art-project \
-      --frozen \
-      --all-extras \
-      --no-install-project \
-      --python 3.12 \
- && touch "${ART_PROJECT_ENVIRONMENT}/.art-prebaked-all-extras" \
- && rm -rf /tmp/art-project
 
 RUN mkdir -p "${HOME}/.local/bin" "${HOME}/.sky/sky_app" "${HOME}/sky_workdir" \
  && ln -sf /opt/conda/bin/uv "${HOME}/.local/bin/uv" \
