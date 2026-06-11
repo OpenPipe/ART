@@ -1050,10 +1050,23 @@ def _real_path_megatron_worker(
             ForwardTraceCapture,
         )
 
+        raw_capture_tokens = os.environ.get("ART_REAL_PATH_TRACE_NAME_TOKENS")
+        capture_name_tokens = (
+            tuple(token for token in raw_capture_tokens.split(",") if token)
+            if raw_capture_tokens
+            else (*CAPTURE_NAME_TOKENS, ".decoder.final_layernorm")
+        )
+        raw_max_layer_index = os.environ.get("ART_REAL_PATH_TRACE_MAX_LAYER_INDEX")
         forward_trace_capture = ForwardTraceCapture(
             runtime.model,
             enabled=True,
-            capture_name_tokens=(*CAPTURE_NAME_TOKENS, ".decoder.final_layernorm"),
+            capture_name_tokens=capture_name_tokens,
+            capture_layer_outputs=(
+                os.environ.get("ART_REAL_PATH_TRACE_LAYER_OUTPUTS", "1") != "0"
+            ),
+            max_layer_index=(
+                int(raw_max_layer_index) if raw_max_layer_index is not None else None
+            ),
             strict_output_match=True,
         )
         forward_trace_capture.set_step(
