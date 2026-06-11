@@ -23,6 +23,7 @@ from art.megatron.model_support.registry import (
     model_supports_context_parallel,
     model_uses_expert_parallel,
     native_vllm_lora_status_for_model,
+    vllm_lora_config_for_model,
 )
 from art.megatron.model_support.spec import (
     ArchitectureReport,
@@ -85,5 +86,6 @@ __all__ = [
     "model_supports_context_parallel",
     "model_requires_merged_rollout",
     "native_vllm_lora_status_for_model",
+    "vllm_lora_config_for_model",
     "summarize_layer_families",
 ]

@@ -383,9 +383,29 @@ class MegatronService:
         else:
             engine_args["enable_lora"] = True
             engine_args.setdefault("max_loras", 2)
+            self._configure_vllm_lora_target_modules(engine_args)
         for key in ("model", "served_model_name"):
             engine_args.pop(key, None)
         return engine_args
+
+    def _configure_vllm_lora_target_modules(
+        self, engine_args: dict[str, object]
+    ) -> None:
+        from .model_support import vllm_lora_config_for_model
+
+        raw_targets = engine_args.get("lora_target_modules") or default_target_modules(
+            self.base_model
+        )
+        if not isinstance(raw_targets, (list, tuple, set)):
+            return
+        adapter_config = vllm_lora_config_for_model(
+            self.base_model,
+            {"target_modules": list(raw_targets)},
+            allow_unvalidated_arch=self._allow_unvalidated_arch,
+        )
+        targets = adapter_config.get("target_modules")
+        if isinstance(targets, list) and targets:
+            engine_args["lora_target_modules"] = targets
 
     def _runtime_server_args(
         self, config: dev.OpenAIServerConfig | None

@@ -351,6 +351,9 @@ class Dsv4Handler(DefaultMoeHandler):
     ) -> tuple[dict[str, torch.Tensor], dict[str, Any]]:
         return _dsv4_to_vllm_lora_tensors(tensors, adapter_config=adapter_config)
 
+    def to_vllm_lora_config(self, adapter_config: dict[str, Any]) -> dict[str, Any]:
+        return _dsv4_vllm_lora_config(adapter_config)
+
     def compile_workaround_config(self, provider: Any) -> CompileWorkaroundConfig:
         return CompileWorkaroundConfig(
             flags=_compile_workaround_flags_for_provider(

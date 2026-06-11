@@ -123,6 +123,11 @@ class ModelSupportHandler(Protocol):
         adapter_config: dict[str, Any],
     ) -> tuple[dict[str, Any], dict[str, Any]]: ...
 
+    def to_vllm_lora_config(
+        self,
+        adapter_config: dict[str, Any],
+    ) -> dict[str, Any]: ...
+
     def expert_packed_lora_groups(self) -> tuple[ExpertPackedLoraGroup, ...]: ...
 
     def from_vllm_lora_tensors(

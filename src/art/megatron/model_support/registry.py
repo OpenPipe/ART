@@ -311,6 +311,18 @@ def default_target_modules_for_model(
     )
 
 
+def vllm_lora_config_for_model(
+    base_model: str,
+    adapter_config: dict,
+    *,
+    allow_unvalidated_arch: bool = False,
+) -> dict:
+    return get_model_support_handler(
+        base_model,
+        allow_unvalidated_arch=allow_unvalidated_arch,
+    ).to_vllm_lora_config(adapter_config)
+
+
 def native_vllm_lora_status_for_model(
     base_model: str,
     *,

@@ -448,6 +448,9 @@ class Qwen35MoeHandler(Qwen35BaseHandler):
     ) -> tuple[dict[str, torch.Tensor], dict[str, Any]]:
         return _to_vllm_lora_tensors(tensors, adapter_config=adapter_config)
 
+    def to_vllm_lora_config(self, adapter_config: dict[str, Any]) -> dict[str, Any]:
+        return _vllm_moe_config(adapter_config)
+
     def from_vllm_lora_tensors(
         self,
         tensors: dict[str, torch.Tensor],

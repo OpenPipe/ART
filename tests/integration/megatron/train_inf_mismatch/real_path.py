@@ -758,7 +758,7 @@ def _make_nonzero_adapter(
 
 
 def _adapter_cache_key(config: TrainInfOutputParityConfig) -> str:
-    from art.megatron.model_support import get_model_support_handler
+    from art.megatron.model_support import vllm_lora_config_for_model
 
     from .output_parity import _adapter_config
 
@@ -772,13 +772,10 @@ def _adapter_cache_key(config: TrainInfOutputParityConfig) -> str:
         return value
 
     adapter_config = _adapter_config(config)
-    handler = get_model_support_handler(
+    published_adapter_config = vllm_lora_config_for_model(
         config.base_model,
+        adapter_config,
         allow_unvalidated_arch=config.allow_unvalidated_arch,
-    )
-    _, published_adapter_config = handler.to_vllm_lora_tensors(
-        {},
-        adapter_config=adapter_config,
     )
     payload = {
         "schema": 2,
