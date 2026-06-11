@@ -9,7 +9,12 @@ if [ -f .env ]; then
         [[ -z $line ]] && continue
         
         key="${line%%=*}"
-        if [ -z "${!key+x}" ]; then
+        current_value="${!key-}"
+        if [ -z "${!key+x}" ] ||
+            [ -z "${current_value}" ] ||
+            { [ "${key}" = "GIT_USER_NAME" ] && [ "${current_value}" = "Your Name" ]; } ||
+            { [ "${key}" = "GIT_USER_EMAIL" ] && [ "${current_value}" = "your.email@example.com" ]; } ||
+            { [ "${key}" = "INSTALL_EXTRAS" ] && [ "${current_value}" = "false" ]; }; then
             export "$line"
         fi
     done < .env

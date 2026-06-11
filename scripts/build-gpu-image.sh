@@ -153,7 +153,8 @@ if [[ -z "${pull_image_repo}" ]]; then
 fi
 
 registry_host="${image_repo%%/*}"
-if [[ -z "${registry_host}" || "${registry_host}" == "${image_repo}" ]]; then
+if [[ -z "${registry_host}" || "${registry_host}" == "${image_repo}" ||
+  ( "${registry_host}" != *.* && "${registry_host}" != *:* && "${registry_host}" != "localhost" ) ]]; then
   registry_host="docker.io"
 fi
 cache_ref="${BUILDKIT_CACHE_REF:-${image_repo}:buildcache}"
