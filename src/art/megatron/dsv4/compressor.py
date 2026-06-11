@@ -69,7 +69,11 @@ def build_shared_prefix_compression_layout(
     end_rows: list[list[int]] = []
 
     for b in range(bsz):
-        valid_len = int((group_cpu[b] >= 0).sum().item())
+        valid_mask = (group_cpu[b] != -1) & (parent_cpu[b] != -1)
+        padding = torch.nonzero(~valid_mask, as_tuple=False)
+        valid_len = int(padding[0].item()) if padding.numel() else seqlen
+        if bool(valid_mask[valid_len:].any().item()):
+            raise ValueError("DSV4 shared-prefix metadata must pad only at row end.")
         segments: list[tuple[int, int, int, int, int, int]] = []
         cursor = 0
         while cursor < valid_len:

@@ -106,7 +106,7 @@ def _shared_prefix_window_topk_idxs(
     bsz, seqlen = group_ids.shape
     width = min(seqlen, window_size)
     arange = torch.arange(seqlen, device=group_ids.device).expand(bsz, -1)
-    valid_token = (group_ids >= 0) & (parent_ids >= 0)
+    valid_token = (group_ids != -1) & (parent_ids != -1)
     group_start = valid_token.clone()
     group_start[:, 1:] &= group_ids[:, 1:] != group_ids[:, :-1]
     start_values = torch.where(group_start, arange, torch.zeros_like(arange))
