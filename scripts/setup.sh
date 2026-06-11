@@ -78,3 +78,8 @@ elif [ "${INSTALL_EXTRAS:-false}" = "true" ]; then
 else
     uv sync --extra backend --frozen
 fi
+
+if [ -n "${ART_PROJECT_ENVIRONMENT:-}" ]; then
+    rm -rf .venv
+    ln -s "${ART_PROJECT_ENVIRONMENT}" .venv
+fi
