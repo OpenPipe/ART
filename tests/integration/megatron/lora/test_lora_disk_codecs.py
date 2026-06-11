@@ -671,6 +671,17 @@ def test_dsv4_vllm_lora_roundtrip_preserves_expert_factors(tmp_path: Path) -> No
         "experts",
         "down_proj",
     ]
+    dsv4_config = _dsv4_config("deepseek-ai/DeepSeek-V4-Flash")
+    _, set_config = DSV4_HANDLER.to_vllm_lora_tensors(
+        original,
+        adapter_config={
+            **dsv4_config,
+            "target_modules": set(dsv4_config["target_modules"]),
+        },
+    )
+    assert set(set_config["target_modules"]) == set(vllm_config["target_modules"])
+    assert "q_a_proj" not in set_config["target_modules"]
+    assert "compressor.kv_proj" not in set_config["target_modules"]
     assert f"{prefix}.attn.wq_a.lora_A.weight" in vllm_tensors
     assert f"{prefix}.attn.wkv.lora_A.weight" in vllm_tensors
     assert f"{prefix}.attn.mla_attn.compressor.wkv.lora_A.weight" in vllm_tensors

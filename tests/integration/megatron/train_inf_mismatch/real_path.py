@@ -758,6 +758,8 @@ def _make_nonzero_adapter(
 
 
 def _adapter_cache_key(config: TrainInfOutputParityConfig) -> str:
+    from art.megatron.model_support import get_model_support_handler
+
     from .output_parity import _adapter_config
 
     def jsonable(value: Any) -> Any:
@@ -769,13 +771,23 @@ def _adapter_cache_key(config: TrainInfOutputParityConfig) -> str:
             return [jsonable(item) for item in value]
         return value
 
+    adapter_config = _adapter_config(config)
+    handler = get_model_support_handler(
+        config.base_model,
+        allow_unvalidated_arch=config.allow_unvalidated_arch,
+    )
+    _, published_adapter_config = handler.to_vllm_lora_tensors(
+        {},
+        adapter_config=adapter_config,
+    )
     payload = {
-        "schema": 1,
+        "schema": 2,
         "base_model": config.base_model,
         "seed": config.seed,
         "allow_unvalidated_arch": config.allow_unvalidated_arch,
         "lora_target_modules": _lora_target_modules(config),
-        "adapter_config": _adapter_config(config),
+        "adapter_config": adapter_config,
+        "published_adapter_config": published_adapter_config,
     }
     encoded = json.dumps(
         jsonable(payload),

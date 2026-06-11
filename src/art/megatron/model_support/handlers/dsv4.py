@@ -730,10 +730,13 @@ def _dsv4_from_vllm_lora_key(key: str) -> str:
 
 def _dsv4_vllm_lora_config(adapter_config: dict[str, Any]) -> dict[str, Any]:
     target_modules = adapter_config.get("target_modules")
-    if not isinstance(target_modules, list):
+    if not isinstance(target_modules, (list, tuple, set)):
         return adapter_config
     transformed: list[str] = []
-    for module in target_modules:
+    ordered_target_modules = (
+        sorted(target_modules) if isinstance(target_modules, set) else target_modules
+    )
+    for module in ordered_target_modules:
         if module in {"q_a_proj", "kv_proj"}:
             transformed.append("fused_wqa_wkv")
         elif module == "q_b_proj":
