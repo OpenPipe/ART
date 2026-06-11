@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 import tempfile
+from types import SimpleNamespace
 from typing import Any, cast
 
 import pytest
@@ -380,6 +381,51 @@ def test_controller_uses_native_router_replay_target_indices() -> None:
 
     controller.finalize_step()
     controller.remove_router_patches()
+
+
+def test_controller_replays_dsv4_router_target_indices() -> None:
+    from megatron.core.transformer.moe.router_replay import RouterReplay
+    from megatron.core.transformer.transformer_config import TransformerConfig
+
+    from art.megatron.dsv4.layer import Dsv4Router
+
+    RouterReplay.clear_global_router_replay_instances()
+    cfg = TransformerConfig(
+        num_layers=2,
+        hidden_size=8,
+        num_attention_heads=1,
+        num_moe_experts=3,
+        moe_router_topk=2,
+        moe_enable_routing_replay=True,
+        moe_router_load_balancing_type="none",
+        moe_router_score_function="sigmoid",
+        moe_router_topk_scaling_factor=1.0,
+        add_bias_linear=False,
+        perform_initialization=False,
+        transformer_impl="local",
+    )
+    setattr(cfg, "dsv4_n_hash_layers", 1)
+    setattr(cfg, "vocab_size", 32)
+    router = Dsv4Router(
+        cfg,
+        pg_collection=SimpleNamespace(tp=None, cp=None, tp_cp=None, tp_dp_cp=None),
+    )
+    router.set_layer_number(1)
+    chunk = _FakeChunk(router=cast(Any, router))
+    bundle, route = _make_bundle()
+    controller = MoeRoutingReplayController(bundle=bundle, strict=True, device="cpu")
+
+    controller.install_router_patches([chunk])
+    controller.set_step(step_index=0, sample_index=[0])
+    controller.begin_micro(0, 0)
+    controller.set_local_input_token_uids(torch.arange(4, dtype=torch.int64))
+    router.set_input_ids(torch.tensor([[7, 8, 9, 10]], dtype=torch.long))
+    _probs, routing_map = router.routing(torch.randn((4, 3), dtype=torch.float32))
+
+    assert torch.equal(routing_map.cpu(), _expected_routing_map(route))
+    controller.finalize_step()
+    controller.remove_router_patches()
+    RouterReplay.clear_global_router_replay_instances()
 
 
 def test_controller_explicit_token_uids_refresh_native_router_replay() -> None:

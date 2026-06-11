@@ -3,6 +3,8 @@ from __future__ import annotations
 import argparse
 import asyncio
 from contextlib import asynccontextmanager, contextmanager
+import hashlib
+import json
 import os
 from pathlib import Path
 import random
@@ -64,6 +66,7 @@ class RealPathConfig(BaseModel):
     diagnose_base: bool = False
     trace_layers: bool = False
     trace_enforce_eager: bool = False
+    adapter_cache_dir: str | None = None
 
 
 class RealPathMegatronWorkerRequest(BaseModel):
@@ -194,6 +197,8 @@ def config_from_env() -> RealPathConfig:
             config.diagnose_base = True
     if raw := os.environ.get("ART_REAL_PATH_TRACE_ENFORCE_EAGER"):
         config.trace_enforce_eager = raw == "1"
+    if raw := os.environ.get("ART_TRAIN_INF_MISMATCH_ADAPTER_CACHE_DIR"):
+        config.adapter_cache_dir = raw
     return config
 
 
@@ -752,6 +757,98 @@ def _make_nonzero_adapter(
     return _run_real_path_megatron_worker(request, adapter_only=True).adapter_path or ""
 
 
+def _adapter_cache_key(config: TrainInfOutputParityConfig) -> str:
+    from .output_parity import _adapter_config
+
+    def jsonable(value: Any) -> Any:
+        if isinstance(value, dict):
+            return {key: jsonable(item) for key, item in value.items()}
+        if isinstance(value, set):
+            return [jsonable(item) for item in sorted(value, key=str)]
+        if isinstance(value, (list, tuple)):
+            return [jsonable(item) for item in value]
+        return value
+
+    payload = {
+        "schema": 1,
+        "base_model": config.base_model,
+        "seed": config.seed,
+        "allow_unvalidated_arch": config.allow_unvalidated_arch,
+        "lora_target_modules": _lora_target_modules(config),
+        "adapter_config": _adapter_config(config),
+    }
+    encoded = json.dumps(
+        jsonable(payload),
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode()
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _default_adapter_cache_dir() -> Path:
+    return REPO_ROOT / "scratch" / "train_inf_mismatch_adapters"
+
+
+def _adapter_cache_dir(config: RealPathConfig) -> Path:
+    if config.adapter_cache_dir:
+        return Path(config.adapter_cache_dir)
+    return _default_adapter_cache_dir()
+
+
+def _adapter_cache_manifest_path(adapter_path: Path) -> Path:
+    return adapter_path / "art_train_inf_mismatch_adapter_cache.json"
+
+
+def _cached_adapter_is_valid(adapter_path: Path, *, cache_key: str) -> bool:
+    manifest_path = _adapter_cache_manifest_path(adapter_path)
+    model_path = adapter_path / "adapter_model.safetensors"
+    config_path = adapter_path / "adapter_config.json"
+    if not (manifest_path.exists() and model_path.exists() and config_path.exists()):
+        return False
+    try:
+        manifest = _read_json(manifest_path)
+    except Exception:
+        return False
+    return (
+        manifest.get("cache_key") == cache_key
+        and manifest.get("non_identity") is True
+        and int(manifest.get("adapter_model_bytes", 0)) == model_path.stat().st_size
+        and model_path.stat().st_size > 0
+    )
+
+
+def _copy_adapter_dir(src: Path, dst: Path, *, cache_key: str) -> None:
+    dst.mkdir(parents=True, exist_ok=True)
+    for filename in ("adapter_model.safetensors", "adapter_config.json"):
+        shutil.copy2(src / filename, dst / filename)
+    _write_json(
+        _adapter_cache_manifest_path(dst),
+        {
+            "cache_key": cache_key,
+            "non_identity": True,
+            "adapter_model_bytes": (dst / "adapter_model.safetensors").stat().st_size,
+        },
+    )
+
+
+def _make_or_reuse_nonzero_adapter(
+    *,
+    config: RealPathConfig,
+    artifact_dir: Path,
+) -> str:
+    cache_key = _adapter_cache_key(config.output_parity)
+    cache_path = _adapter_cache_dir(config) / cache_key
+    if _cached_adapter_is_valid(cache_path, cache_key=cache_key):
+        return str(cache_path)
+    adapter_path = Path(
+        _make_nonzero_adapter(config=config.output_parity, artifact_dir=artifact_dir)
+    )
+    if not adapter_path:
+        raise RuntimeError("Real-path adapter worker did not create an adapter")
+    _copy_adapter_dir(adapter_path, cache_path, cache_key=cache_key)
+    return str(cache_path)
+
+
 def _run_logits_with_replay(
     *,
     runtime: Any,
@@ -1080,11 +1177,10 @@ async def run_real_path_train_inf_mismatch(
     )
     rollout_weights_mode = "merged" if score_rollout_mode == "merged" else "lora"
     _write_json(artifact_dir / "real_path_config.json", config.model_dump(mode="json"))
-    adapter_path = _make_nonzero_adapter(
-        config=parity_config, artifact_dir=artifact_dir
+    adapter_path = _make_or_reuse_nonzero_adapter(
+        config=config,
+        artifact_dir=artifact_dir,
     )
-    if not adapter_path:
-        raise RuntimeError("Real-path adapter worker did not create an adapter")
 
     backend = MegatronBackend(
         path=str(artifact_dir / "art_path"),

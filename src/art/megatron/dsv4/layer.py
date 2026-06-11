@@ -107,19 +107,48 @@ class Dsv4Router(TopKRouter):
         num_moe_experts = int(cfg.num_moe_experts)
         logits = logits.view(-1, num_moe_experts)
         scores = self._scores(logits)
+
+        def select_indices(selection_scores: Tensor, default_indices: Tensor) -> Tensor:
+            router_replay = getattr(self, "router_replay", None)
+            if router_replay is None:
+                return default_indices.long()
+
+            def default_compute_topk(
+                local_scores: Tensor,
+                topk: int,
+                num_groups: int | None = None,
+                group_topk: int | None = None,
+            ) -> tuple[Tensor, Tensor]:
+                del num_groups, group_topk
+                del topk
+                return local_scores.gather(1, default_indices), default_indices
+
+            _selected_scores, indices = router_replay.get_replay_topk(
+                selection_scores,
+                self.topk,
+                None,
+                None,
+                default_compute_topk,
+            )
+            return indices.long()
+
         if self._is_hash_layer():
             if self._dsv4_input_ids is None:
                 raise RuntimeError(
                     "DSV4 hash router requires input_ids for hash-moe layers."
                 )
             tid2eid = cast(Tensor, self.tid2eid)
-            indices = tid2eid[self._dsv4_input_ids.reshape(-1)].long()
+            default_indices = tid2eid[self._dsv4_input_ids.reshape(-1)].long()
+            indices = select_indices(scores, default_indices)
         else:
             selection_scores = scores
             e_score_correction_bias = getattr(self, "e_score_correction_bias", None)
             if e_score_correction_bias is not None:
                 selection_scores = selection_scores + e_score_correction_bias
-            indices = selection_scores.topk(self.topk, dim=-1, sorted=False).indices
+            default_indices = selection_scores.topk(
+                self.topk, dim=-1, sorted=False
+            ).indices
+            indices = select_indices(selection_scores, default_indices)
         if indices.shape[-1] != self.topk:
             raise RuntimeError(
                 "DSV4 router selected an invalid number of experts: "
