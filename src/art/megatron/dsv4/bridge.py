@@ -184,6 +184,10 @@ def _quant_dsv4_mxfp4(weight: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]
         raise ValueError(
             f"Expected 2-D MXFP4 weight with K % 32 == 0, got {weight.shape}."
         )
+    if weight.device.type == "cuda":
+        from art.megatron.dsv4.dequant import quant_mxfp4_cuda
+
+        return quant_mxfp4_cuda(weight)
 
     out_dim, in_dim = weight.shape
     blocks = weight.float().contiguous().view(out_dim, in_dim // 32, 32)

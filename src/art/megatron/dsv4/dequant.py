@@ -140,3 +140,83 @@ def dequant_block_fp8_cuda(weight: torch.Tensor, scale: torch.Tensor) -> torch.T
         num_warps=4,  # ty: ignore[unknown-argument]
     )
     return out
+
+
+@triton.jit
+def _mxfp4_quant_kernel(
+    weight_ptr,
+    packed_ptr,
+    scale_ptr,
+    total_blocks: tl.constexpr,
+    cols: tl.constexpr,
+    blocks_per_row: tl.constexpr,
+):
+    block_id = tl.program_id(0)
+    pair_offsets = tl.arange(0, 16)
+    row = block_id // blocks_per_row
+    block_col = block_id - row * blocks_per_row
+    even = tl.load(weight_ptr + row * cols + block_col * 32 + pair_offsets * 2).to(
+        tl.float32
+    )
+    odd = tl.load(weight_ptr + row * cols + block_col * 32 + pair_offsets * 2 + 1).to(
+        tl.float32
+    )
+    amax = tl.maximum(
+        tl.maximum(tl.max(tl.abs(even), axis=0), tl.max(tl.abs(odd), axis=0)),
+        1.0e-4,
+    )
+    exponent = tl.ceil(tl.log2(amax / 6.0))
+    raw_scale = (exponent + 127.0).to(tl.uint8)
+    scale = tl.exp2(exponent)
+    scaled_even = even / scale
+    scaled_odd = odd / scale
+    abs_even = tl.abs(scaled_even)
+    abs_odd = tl.abs(scaled_odd)
+    code_even = tl.zeros((16,), dtype=tl.uint8)
+    code_odd = tl.zeros((16,), dtype=tl.uint8)
+    code_even += (abs_even > 0.25).to(tl.uint8)
+    code_even += (abs_even > 0.75).to(tl.uint8)
+    code_even += (abs_even > 1.25).to(tl.uint8)
+    code_even += (abs_even > 1.75).to(tl.uint8)
+    code_even += (abs_even > 2.5).to(tl.uint8)
+    code_even += (abs_even > 3.5).to(tl.uint8)
+    code_even += (abs_even > 5.0).to(tl.uint8)
+    code_even += ((scaled_even < 0.0) & (code_even != 0)).to(tl.uint8) * 8
+    code_odd += (abs_odd > 0.25).to(tl.uint8)
+    code_odd += (abs_odd > 0.75).to(tl.uint8)
+    code_odd += (abs_odd > 1.25).to(tl.uint8)
+    code_odd += (abs_odd > 1.75).to(tl.uint8)
+    code_odd += (abs_odd > 2.5).to(tl.uint8)
+    code_odd += (abs_odd > 3.5).to(tl.uint8)
+    code_odd += (abs_odd > 5.0).to(tl.uint8)
+    code_odd += ((scaled_odd < 0.0) & (code_odd != 0)).to(tl.uint8) * 8
+    tl.store(
+        packed_ptr + row * (cols // 2) + block_col * 16 + pair_offsets,
+        code_even | (code_odd << 4),
+    )
+    tl.store(scale_ptr + block_id, raw_scale, mask=block_id < total_blocks)
+
+
+def quant_mxfp4_cuda(weight: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    if weight.ndim != 2 or weight.shape[1] % 32 != 0:
+        raise ValueError(
+            f"Expected 2-D MXFP4 weight with K % 32 == 0, got {weight.shape}."
+        )
+    if weight.device.type != "cuda":
+        raise ValueError("quant_mxfp4_cuda expects a CUDA tensor")
+    weight = weight.contiguous()
+    rows, cols = weight.shape
+    packed = torch.empty((rows, cols // 2), dtype=torch.uint8, device=weight.device)
+    scale_raw = torch.empty((rows, cols // 32), dtype=torch.uint8, device=weight.device)
+    blocks_per_row = cols // 32
+    total_blocks = rows * blocks_per_row
+    _mxfp4_quant_kernel[(total_blocks,)](
+        weight,
+        packed,
+        scale_raw,
+        total_blocks,  # ty: ignore[invalid-argument-type]
+        cols,  # ty: ignore[invalid-argument-type]
+        blocks_per_row,  # ty: ignore[invalid-argument-type]
+        num_warps=1,  # ty: ignore[unknown-argument]
+    )
+    return packed, scale_raw.view(torch.float8_e8m0fnu)
