@@ -28,6 +28,7 @@ class MergedWeightExport(BaseModel):
 
     bridge: Any
     model: ModelChunks
+    model_support_handler: Any
     model_config_value: Any
     conversion_tasks: list[Any]
     adapter_weights_by_base: dict[str, list[Any]]
@@ -109,6 +110,7 @@ def build_merged_weight_export(
     return MergedWeightExport(
         bridge=bridge,
         model=model,
+        model_support_handler=model_support_handler,
         model_config_value=model[0].config,
         conversion_tasks=build_art_conversion_tasks(
             bridge=bridge,
@@ -269,6 +271,27 @@ def _drain_merged_vllm_weights(
             shapes.append(list(tensor.shape))
 
 
+def _collect_merged_vllm_weight_metadata(
+    weight_export: MergedWeightExport,
+    *,
+    names: list[str],
+    dtype_names: list[str],
+    shapes: list[list[int]],
+) -> bool:
+    handler = getattr(weight_export, "model_support_handler", None)
+    metadata_iter = getattr(handler, "iter_merged_vllm_weight_metadata", None)
+    if metadata_iter is None:
+        return False
+    metadata = metadata_iter(weight_export)
+    if metadata is None:
+        return False
+    for name, dtype, shape in metadata:
+        names.append(name)
+        dtype_names.append(str(dtype).removeprefix("torch."))
+        shapes.append(list(shape))
+    return True
+
+
 def ensure_merged_weight_transfer_group(
     *,
     rank: int,
@@ -365,12 +388,18 @@ def sync_merged_weights_to_vllm(
     names: list[str] = []
     dtype_names: list[str] = []
     shapes: list[list[int]] = []
-    _drain_merged_vllm_weights(
+    if not _collect_merged_vllm_weight_metadata(
         weight_export,
-        names=names if _is_sender_rank(rank) else None,
-        dtype_names=dtype_names if _is_sender_rank(rank) else None,
-        shapes=shapes if _is_sender_rank(rank) else None,
-    )
+        names=names,
+        dtype_names=dtype_names,
+        shapes=shapes,
+    ):
+        _drain_merged_vllm_weights(
+            weight_export,
+            names=names if _is_sender_rank(rank) else None,
+            dtype_names=dtype_names if _is_sender_rank(rank) else None,
+            shapes=shapes if _is_sender_rank(rank) else None,
+        )
     _maybe_distributed_barrier(world_size)
 
     pause_error: BaseException | None = None

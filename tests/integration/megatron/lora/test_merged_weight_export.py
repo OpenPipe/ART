@@ -1,3 +1,4 @@
+from types import SimpleNamespace
 from typing import Any, cast
 
 import httpx
@@ -264,3 +265,88 @@ def test_sync_merged_weights_to_vllm_sender_controls_runtime_and_sends(
         ("http://runtime.test/resume", None, None, 30.0),
     ]
     assert barrier_calls == [2]
+
+
+def test_sync_merged_weights_to_vllm_sender_uses_metadata_hook_for_first_pass(
+    monkeypatch,
+) -> None:
+    spec = _spec()
+    iter_passes: list[int] = []
+    sent_items: list[list[tuple[str, torch.Tensor]]] = []
+    posts: list[tuple[str, dict[str, object] | None]] = []
+    handler = SimpleNamespace(
+        iter_merged_vllm_weight_metadata=lambda _weight_export: [
+            ("layer.weight", torch.float16, [2, 3]),
+            ("layer.bias", torch.float32, [3]),
+        ]
+    )
+    weight_export = SimpleNamespace(model_support_handler=handler)
+
+    monkeypatch.setattr(
+        export,
+        "ensure_merged_weight_transfer_group",
+        lambda **kwargs: ("trainer-group", spec.init_info),
+    )
+    monkeypatch.setattr(
+        export, "build_merged_weight_export", lambda **kwargs: weight_export
+    )
+
+    def fake_iter(_weight_export: object):
+        iter_passes.append(len(iter_passes) + 1)
+        yield ("layer.weight", torch.zeros((2, 3), dtype=torch.float16))
+        yield ("layer.bias", torch.zeros((3,), dtype=torch.float32))
+
+    def fake_send(iterator, trainer_args):
+        del trainer_args
+        sent_items.append(list(iterator))
+
+    class FakeClient:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return None
+
+        def post(
+            self,
+            url: str,
+            *,
+            json: dict[str, object] | None = None,
+            params: dict[str, object] | None = None,
+            timeout: float,
+        ) -> _OkResponse:
+            del params, timeout
+            posts.append((url, json))
+            return _OkResponse()
+
+    monkeypatch.setattr(export, "iter_merged_vllm_weights", fake_iter)
+    monkeypatch.setattr(export, "trainer_send_weights", fake_send)
+    monkeypatch.setattr(export, "_maybe_distributed_barrier", lambda _world_size: None)
+    monkeypatch.setattr(torch.cuda, "synchronize", lambda: None)
+    monkeypatch.setattr(httpx, "Client", FakeClient)
+
+    export.sync_merged_weights_to_vllm(
+        bridge=object(),
+        model=cast(Any, object()),
+        model_support_handler=object(),
+        rank=0,
+        world_size=2,
+        merged_weight_transfer_group=None,
+        merged_weight_transfer_init_info=None,
+        spec=spec,
+        pause_generation=False,
+    )
+
+    assert iter_passes == [1]
+    assert [name for name, _ in sent_items[0]] == ["layer.weight", "layer.bias"]
+    update_post = next(post for post in posts if post[0].endswith("/update_weights"))
+    assert update_post[1] == {
+        "update_info": {
+            "names": ["layer.weight", "layer.bias"],
+            "dtype_names": ["float16", "float32"],
+            "shapes": [[2, 3], [3]],
+            "packed": True,
+            "packed_buffer_size_bytes": export.DEFAULT_PACKED_BUFFER_SIZE_BYTES,
+            "packed_num_buffers": export.DEFAULT_PACKED_NUM_BUFFERS,
+        }
+    }
