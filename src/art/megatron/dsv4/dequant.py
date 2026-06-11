@@ -81,12 +81,12 @@ def dequant_mxfp4_cuda(weight: torch.Tensor, scale: torch.Tensor) -> torch.Tenso
         scale,
         _fp4_table(device),
         out,
-        out.numel(),
-        in_dim,
-        in_bytes,
-        scale.shape[1],
-        block,
-        num_warps=4,
+        out.numel(),  # ty: ignore[invalid-argument-type]
+        in_dim,  # ty: ignore[invalid-argument-type]
+        in_bytes,  # ty: ignore[invalid-argument-type]
+        scale.shape[1],  # ty: ignore[invalid-argument-type]
+        block,  # ty: ignore[invalid-argument-type]
+        num_warps=4,  # ty: ignore[unknown-argument]
     )
     return out
 
@@ -133,10 +133,10 @@ def dequant_block_fp8_cuda(weight: torch.Tensor, scale: torch.Tensor) -> torch.T
         weight,
         scale,
         out,
-        out.numel(),
-        weight.shape[1],
-        scale.shape[1],
-        block_elems,
-        num_warps=4,
+        out.numel(),  # ty: ignore[invalid-argument-type]
+        weight.shape[1],  # ty: ignore[invalid-argument-type]
+        scale.shape[1],  # ty: ignore[invalid-argument-type]
+        block_elems,  # ty: ignore[invalid-argument-type]
+        num_warps=4,  # ty: ignore[unknown-argument]
     )
     return out

@@ -290,18 +290,31 @@ def _collect_fp32_preserved_tensors(
         for submodule in model_module.modules():
             fp32_parameter_names = set(getattr(submodule, "_keep_fp32_parameters", ()))
             fp32_buffer_names = set(getattr(submodule, "_keep_fp32_buffers", ()))
+            explicit_names = fp32_parameter_names | fp32_buffer_names
+            seen: set[str] = set()
             if hasattr(submodule, "_maintain_float32_expert_bias"):
                 expert_bias = getattr(submodule, "expert_bias", None)
                 if isinstance(expert_bias, torch.nn.Parameter):
                     keep_in_fp32.append(
                         (submodule, "expert_bias", expert_bias.data.clone(), True)
                     )
+                    seen.add("expert_bias")
+            for name in explicit_names:
+                tensor = getattr(submodule, name, None)
+                if isinstance(tensor, torch.nn.Parameter):
+                    keep_in_fp32.append((submodule, name, tensor.data.clone(), True))
+                    seen.add(name)
+                elif isinstance(tensor, torch.Tensor):
+                    keep_in_fp32.append((submodule, name, tensor.data.clone(), False))
+                    seen.add(name)
             for name, param in submodule.named_parameters(recurse=False):
-                if name in fp32_parameter_names or getattr(param, "_keep_fp32", False):
+                if name not in seen and getattr(param, "_keep_fp32", False):
                     keep_in_fp32.append((submodule, name, param.data.clone(), True))
+                    seen.add(name)
             for name, buffer in submodule.named_buffers(recurse=False):
-                if name in fp32_buffer_names or getattr(buffer, "_keep_fp32", False):
+                if name not in seen and getattr(buffer, "_keep_fp32", False):
                     keep_in_fp32.append((submodule, name, buffer.data.clone(), False))
+                    seen.add(name)
     return keep_in_fp32
 
 

@@ -1,4 +1,4 @@
-from typing import Any
+from typing import Any, cast
 
 import pytest
 import torch
@@ -254,6 +254,27 @@ def test_megatron_empty_unpermute_patch_allows_view_then_inplace_add() -> None:
     output.sum().backward()
 
     assert tokens.grad is not None
+
+
+def test_fp32_preservation_handles_declared_parameter_frozen_as_buffer() -> None:
+    from art.megatron.runtime.bridge_runtime import (
+        _collect_fp32_preserved_tensors,
+        _restore_fp32_preserved_tensors,
+    )
+
+    module = torch.nn.Module()
+    module.ape = torch.nn.Parameter(torch.arange(4, dtype=torch.float32))
+    setattr(module, "_keep_fp32_parameters", ("ape",))
+    param = module.ape
+    del module._parameters["ape"]
+    module.register_buffer("ape", param.detach(), persistent=True)
+
+    keep = _collect_fp32_preserved_tensors(cast(Any, [module]))
+    module._buffers["ape"] = module.ape.to(torch.bfloat16)
+    _restore_fp32_preserved_tensors(keep)
+
+    assert module.ape.dtype == torch.float32
+    assert torch.equal(module.ape, torch.arange(4, dtype=torch.float32))
 
 
 def test_forward_trace_splits_expert_rows_with_input_uid_span() -> None:
