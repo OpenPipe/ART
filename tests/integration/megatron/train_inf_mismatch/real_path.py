@@ -850,14 +850,32 @@ def _copy_adapter_dir(src: Path, dst: Path, *, cache_key: str) -> None:
     )
 
 
+def _prune_adapter_cache_dir(cache_dir: Path, *, keep_key: str) -> None:
+    if not cache_dir.exists():
+        return
+    cache_root = cache_dir.resolve()
+    keep_path = (cache_root / keep_key).resolve()
+    for candidate in cache_root.iterdir():
+        if not candidate.is_dir() or candidate.is_symlink():
+            continue
+        resolved = candidate.resolve()
+        if resolved == keep_path:
+            continue
+        resolved.relative_to(cache_root)
+        if _adapter_cache_manifest_path(resolved).exists():
+            shutil.rmtree(resolved)
+
+
 def _make_or_reuse_nonzero_adapter(
     *,
     config: RealPathConfig,
     artifact_dir: Path,
 ) -> AdapterCacheResult:
     cache_key = _adapter_cache_key(config.output_parity)
-    cache_path = _adapter_cache_dir(config) / cache_key
+    cache_dir = _adapter_cache_dir(config)
+    cache_path = cache_dir / cache_key
     if _cached_adapter_is_valid(cache_path, cache_key=cache_key):
+        _prune_adapter_cache_dir(cache_dir, keep_key=cache_key)
         return AdapterCacheResult(
             path=str(cache_path),
             cache_key=cache_key,
@@ -869,6 +887,7 @@ def _make_or_reuse_nonzero_adapter(
     if not adapter_path:
         raise RuntimeError("Real-path adapter worker did not create an adapter")
     _copy_adapter_dir(adapter_path, cache_path, cache_key=cache_key)
+    _prune_adapter_cache_dir(cache_dir, keep_key=cache_key)
     return AdapterCacheResult(
         path=str(cache_path),
         cache_key=cache_key,

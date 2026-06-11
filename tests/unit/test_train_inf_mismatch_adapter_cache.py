@@ -49,6 +49,18 @@ def test_make_or_reuse_nonzero_adapter_reuses_valid_cache(
 
     monkeypatch.setattr(real_path, "_make_nonzero_adapter", make_adapter)
     config = _config(tmp_path / "cache")
+    stale = _cache_dir(config) / "stale"
+    _write_adapter(stale)
+    real_path._write_json(
+        real_path._adapter_cache_manifest_path(stale),
+        {
+            "cache_key": "stale",
+            "non_identity": True,
+            "adapter_model_bytes": (stale / "adapter_model.safetensors").stat().st_size,
+        },
+    )
+    unrelated = _cache_dir(config) / "unrelated"
+    unrelated.mkdir(parents=True)
 
     first = real_path._make_or_reuse_nonzero_adapter(
         config=config,
@@ -70,6 +82,8 @@ def test_make_or_reuse_nonzero_adapter_reuses_valid_cache(
         config.output_parity
     )
     assert (first_path / "adapter_model.safetensors").read_bytes() == b"non-identity"
+    assert not stale.exists()
+    assert unrelated.exists()
 
 
 def test_cached_adapter_requires_non_identity_manifest(tmp_path: Path) -> None:
