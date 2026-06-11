@@ -66,7 +66,12 @@ elif ! curl -LsSf https://astral.sh/uv/install.sh | sh; then
 fi
 
 # Sync the dependencies
-if [ -f .venv/.art-prebaked-all-extras ]; then
+if [ -n "${ART_PROJECT_ENVIRONMENT:-}" ]; then
+    export UV_PROJECT_ENVIRONMENT="${ART_PROJECT_ENVIRONMENT}"
+fi
+
+uv_environment="${UV_PROJECT_ENVIRONMENT:-.venv}"
+if [ -f "${uv_environment}/.art-prebaked-all-extras" ]; then
     uv sync --all-extras --frozen
 elif [ "${INSTALL_EXTRAS:-false}" = "true" ]; then
     uv sync --all-extras --frozen
