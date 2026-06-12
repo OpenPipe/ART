@@ -25,7 +25,10 @@ from .metrics_taxonomy import (
 from .preprocessing.moe_routing import attach_moe_routing_metadata_to_choice
 from .trajectories import Trajectory, TrajectoryGroup
 from .types import TrainSFTConfig
-from .utils.trajectory_logging import write_trajectory_groups_parquet
+from .utils.trajectory_logging import (
+    calculate_step_std_dev,
+    write_trajectory_groups_parquet,
+)
 
 if TYPE_CHECKING:
     from wandb.sdk.wandb_run import Run
@@ -990,11 +993,6 @@ class Model(
             if len(values) > 0:
                 group_key = f"group_{metric}"
                 averages[group_key] = sum(values) / len(values)
-
-        # Calculate average standard deviation of rewards within groups
-        from .utils.old_benchmarking.calculate_step_metrics import (
-            calculate_step_std_dev,
-        )
 
         averages[reward_std_dev_key] = calculate_step_std_dev(trajectory_groups)
 

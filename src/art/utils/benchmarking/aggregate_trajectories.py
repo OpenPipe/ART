@@ -21,8 +21,7 @@ async def load_aggregated_trajectories(
     Load trajectories and aggregate metrics at the step level.
 
     This function builds on top of load_trajectories to provide step-level
-    aggregation similar to load_benchmarked_models, but returns a DataFrame
-    instead of custom objects.
+    aggregation as a DataFrame.
 
     Parameters
     ----------

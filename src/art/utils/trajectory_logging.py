@@ -18,6 +18,25 @@ from openai.types.chat.chat_completion_message_param import ChatCompletionMessag
 from art.trajectories import Trajectory, TrajectoryGroup
 
 
+def calculate_step_std_dev(trajectory_groups: list[TrajectoryGroup]) -> float:
+    """Calculate the average population std-dev of rewards within groups."""
+    std_devs: list[float] = []
+    for group in trajectory_groups:
+        group_rewards = [trajectory.reward for trajectory in group.trajectories]
+
+        if len(group_rewards) > 1:
+            mean_reward = sum(group_rewards) / len(group_rewards)
+            variance = sum(
+                (reward - mean_reward) ** 2 for reward in group_rewards
+            ) / len(group_rewards)
+            std_devs.append(variance**0.5)
+
+    if not std_devs:
+        return 0.0
+
+    return sum(std_devs) / len(std_devs)
+
+
 def _flatten_message(msg: dict) -> dict:
     """Convert a message or Choice to flat parquet format."""
     if "finish_reason" in msg:

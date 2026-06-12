@@ -393,6 +393,7 @@ class TestMetricCalculation:
 
         # Check reward average is correct
         assert entry["val/reward"] == 0.7  # (0.8 + 0.6) / 2
+        assert entry["val/reward_std_dev"] == pytest.approx(0.1)
 
     @pytest.mark.asyncio
     async def test_group_metric_aggregation(self, tmp_path: Path):
