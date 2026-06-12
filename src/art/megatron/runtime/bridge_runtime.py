@@ -448,32 +448,14 @@ def _scatter_to_tp_ranks(
         )
     output = torch.empty(output_shape, dtype=dtype, device=device)
     dist = cast(Any, torch.distributed)
-    if self.tp_rank == src_rank:
-        if not splits:
-            raise RuntimeError("source TP rank must provide tensor splits")
+    global_src = dist.get_global_rank(group=self.tp_group, group_rank=src_rank)
+    scatter_list = None
+    if self.tp_rank == src_rank and splits:
         scatter_list = [
             shard.to(device=device, dtype=dtype, non_blocking=True).contiguous()
             for shard in splits
         ]
-        if device.type == "cuda":
-            torch.cuda.current_stream(device).synchronize()
-        for peer_rank, shard in enumerate(scatter_list):
-            if peer_rank == src_rank:
-                output = shard
-                continue
-            dist.send(
-                shard,
-                dst=dist.get_global_rank(group=self.tp_group, group_rank=peer_rank),
-                group=self.tp_group,
-            )
-    else:
-        dist.recv(
-            output,
-            src=dist.get_global_rank(group=self.tp_group, group_rank=src_rank),
-            group=self.tp_group,
-        )
-    if output.device.type == "cuda":
-        torch.cuda.synchronize(output.device)
+    dist.scatter(output, scatter_list, src=global_src, group=self.tp_group)
     return output
 
 
@@ -496,14 +478,9 @@ def _replicated_hf_to_megatron(
         broadcast_device = _materialization_device()
     if self.tp_rank == 0:
         tensor = hf_weights.to(device=cast(Any, broadcast_device), non_blocking=True)
-        if tensor.device.type == "cuda":
-            torch.cuda.current_stream(tensor.device).synchronize()
     else:
         tensor = torch.empty_like(hf_weights, device=cast(Any, broadcast_device))
-    tensor = self.broadcast_tensor_to_tp_ranks(tensor, src_rank=0)
-    if tensor.device.type == "cuda":
-        torch.cuda.synchronize(tensor.device)
-    return tensor
+    return self.broadcast_tensor_to_tp_ranks(tensor, src_rank=0)
 
 
 def _optimized_load_weights_hf_to_megatron(
