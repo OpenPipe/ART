@@ -416,77 +416,375 @@ def _apply_lora_to_existing_linear_output(
     return module._apply_lora_to_output(x, output)
 
 
-def _dsv4_inverse_rope_grouped_for_wo_a(
+def _is_active_lora_wrapped_linear(module: Any) -> bool:
+    if not _is_lora_wrapped_linear(module):
+        return False
+    wrapper = module.punica_wrapper
+    return not getattr(wrapper, "no_lora", False) and (
+        getattr(wrapper, "indices_len", [None])[0] is not None
+    )
+
+
+def _register_dsv4_inv_rope_lora_input_op() -> None:
+    if getattr(_register_dsv4_inv_rope_lora_input_op, "_registered", False):
+        return
+
+    import torch
+    from vllm.platforms import current_platform
+    from vllm.triton_utils import tl, triton
+    from vllm.utils.torch_utils import direct_register_custom_op
+
+    @triton.jit
+    def _kernel(
+        o_ptr,
+        positions_ptr,
+        cos_sin_cache_ptr,
+        fp8_ptr,
+        scale_ptr,
+        lora_input_ptr,
+        num_tokens,
+        heads_per_group: tl.constexpr,
+        o_stride_token,
+        o_stride_head,
+        cache_stride_pos,
+        fp8_stride_group,
+        fp8_stride_token,
+        scale_stride_group,
+        scale_stride_k,
+        lora_stride_group,
+        lora_stride_token,
+        fp8_max: tl.constexpr,
+        eps: tl.constexpr,
+        QUANT_GROUP_SIZE: tl.constexpr,
+        CHUNKS_PER_HEAD: tl.constexpr,
+        ROPE_START: tl.constexpr,
+        HALF_ROPE: tl.constexpr,
+        TMA_ALIGNED_SCALES: tl.constexpr,
+    ):
+        pid_token = tl.program_id(0).to(tl.int64)
+        pid_gh = tl.program_id(1).to(tl.int64)
+        g = pid_gh // heads_per_group
+        head_in_group = pid_gh % heads_per_group
+        qb_start = head_in_group * CHUNKS_PER_HEAD
+
+        if pid_token >= num_tokens:
+            if TMA_ALIGNED_SCALES:
+                scale_addr = (
+                    scale_ptr
+                    + g * scale_stride_group
+                    + pid_token
+                    + head_in_group * scale_stride_k
+                )
+                tl.store(scale_addr, tl.zeros((), dtype=tl.int32))
+            else:
+                block_offsets = tl.arange(0, CHUNKS_PER_HEAD)
+                qb_indices = qb_start + block_offsets
+                scale_addrs = (
+                    scale_ptr
+                    + g * scale_stride_group
+                    + pid_token
+                    + qb_indices * scale_stride_k
+                )
+                tl.store(scale_addrs, tl.zeros((CHUNKS_PER_HEAD,), dtype=tl.float32))
+            return
+
+        head_dim: tl.constexpr = CHUNKS_PER_HEAD * QUANT_GROUP_SIZE
+        offsets = tl.arange(0, head_dim)
+        input_base = o_ptr + pid_token * o_stride_token + pid_gh * o_stride_head
+        x = tl.load(input_base + offsets).to(tl.float32)
+
+        rope_abs_start: tl.constexpr = (
+            CHUNKS_PER_HEAD - 1
+        ) * QUANT_GROUP_SIZE + ROPE_START
+        pos = tl.load(positions_ptr + pid_token)
+        cache_base = cos_sin_cache_ptr + pos * cache_stride_pos
+        is_rope = offsets >= rope_abs_start
+        rope_local = offsets - rope_abs_start
+
+        x_partner = tl.load(input_base + (offsets ^ 1), mask=is_rope, other=0.0).to(
+            tl.float32
+        )
+        cs_idx = tl.maximum(rope_local >> 1, 0)
+        cos_v = tl.load(cache_base + cs_idx, mask=is_rope, other=1.0)
+        sin_v = tl.load(cache_base + HALF_ROPE + cs_idx, mask=is_rope, other=0.0)
+        x_add = x * cos_v + x_partner * sin_v
+        x_sub = x * cos_v - x_partner * sin_v
+        is_even = (rope_local & 1) == 0
+        x = tl.where(is_rope, tl.where(is_even, x_add, x_sub), x)
+
+        group_head_offset = head_in_group * head_dim
+        lora_base = (
+            lora_input_ptr
+            + g * lora_stride_group
+            + pid_token * lora_stride_token
+            + group_head_offset
+        )
+        tl.store(lora_base + offsets, x)
+
+        x_2d = tl.reshape(tl.abs(x), (CHUNKS_PER_HEAD, QUANT_GROUP_SIZE))
+        block_absmax = tl.maximum(tl.max(x_2d, axis=1), eps)
+        scale_raw = block_absmax * (1.0 / fp8_max)
+        scales = tl.math.exp2(tl.ceil(tl.log2(scale_raw)))
+        scales_exp = tl.reshape(
+            tl.broadcast_to(
+                tl.reshape(scales, (CHUNKS_PER_HEAD, 1)),
+                (CHUNKS_PER_HEAD, QUANT_GROUP_SIZE),
+            ),
+            (head_dim,),
+        )
+        x_quant = tl.clamp(x / scales_exp, -fp8_max, fp8_max).to(tl.float8e4nv)
+
+        fp8_base = (
+            fp8_ptr
+            + g * fp8_stride_group
+            + pid_token * fp8_stride_token
+            + qb_start * QUANT_GROUP_SIZE
+        )
+        tl.store(fp8_base + offsets, x_quant)
+
+        block_offsets = tl.arange(0, CHUNKS_PER_HEAD)
+        qb_indices = qb_start + block_offsets
+        if TMA_ALIGNED_SCALES:
+            scale_bits = scales.to(tl.int32, bitcast=True)
+            ue8m0_bytes = (scale_bits >> 23) & 0xFF
+            packed_val = tl.sum(ue8m0_bytes << (block_offsets * 8))
+            scale_addr = (
+                scale_ptr
+                + g * scale_stride_group
+                + pid_token
+                + head_in_group * scale_stride_k
+            )
+            tl.store(scale_addr, packed_val)
+        else:
+            scale_addrs = (
+                scale_ptr
+                + g * scale_stride_group
+                + pid_token
+                + qb_indices * scale_stride_k
+            )
+            tl.store(scale_addrs, scales)
+
+    def _impl(
+        o: torch.Tensor,
+        positions: torch.Tensor,
+        cos_sin_cache: torch.Tensor,
+        fp8_buf: torch.Tensor,
+        scale_buf: torch.Tensor,
+        lora_input: torch.Tensor,
+        heads_per_group: int,
+        quant_group_size: int,
+        chunks_per_head: int,
+        rope_start: int,
+        half_rope: int,
+        tma_aligned_scales: bool,
+        fp8_max: float,
+        tma_aligned_t: int,
+        num_tokens: int,
+    ) -> None:
+        grid = (tma_aligned_t, fp8_buf.shape[0] * heads_per_group)
+        pdl_kwargs = {} if current_platform.is_rocm() else {"launch_pdl": False}
+        _kernel[grid](
+            o,
+            positions,
+            cos_sin_cache,
+            fp8_buf,
+            scale_buf,
+            lora_input,
+            num_tokens,
+            heads_per_group=heads_per_group,
+            o_stride_token=o.stride(0),
+            o_stride_head=o.stride(1),
+            cache_stride_pos=cos_sin_cache.stride(0),
+            fp8_stride_group=fp8_buf.stride(0),
+            fp8_stride_token=fp8_buf.stride(1),
+            scale_stride_group=scale_buf.stride(0),
+            scale_stride_k=scale_buf.stride(2),
+            lora_stride_group=lora_input.stride(0),
+            lora_stride_token=lora_input.stride(1),
+            fp8_max=fp8_max,
+            eps=1e-10,
+            QUANT_GROUP_SIZE=quant_group_size,
+            CHUNKS_PER_HEAD=chunks_per_head,
+            ROPE_START=rope_start,
+            HALF_ROPE=half_rope,
+            TMA_ALIGNED_SCALES=tma_aligned_scales,
+            num_stages=1,
+            num_warps=1,
+            **pdl_kwargs,
+        )
+
+    def _fake(
+        o: torch.Tensor,
+        positions: torch.Tensor,
+        cos_sin_cache: torch.Tensor,
+        fp8_buf: torch.Tensor,
+        scale_buf: torch.Tensor,
+        lora_input: torch.Tensor,
+        heads_per_group: int,
+        quant_group_size: int,
+        chunks_per_head: int,
+        rope_start: int,
+        half_rope: int,
+        tma_aligned_scales: bool,
+        fp8_max: float,
+        tma_aligned_t: int,
+        num_tokens: int,
+    ) -> None:
+        return None
+
+    direct_register_custom_op(
+        op_name="art_dsv4_inv_rope_fp8_quant_lora_input",
+        op_func=_impl,
+        mutates_args=["fp8_buf", "scale_buf", "lora_input"],
+        fake_impl=_fake,
+    )
+    _register_dsv4_inv_rope_lora_input_op._registered = True  # type: ignore[attr-defined]
+
+
+def _dsv4_fused_inv_rope_fp8_quant_with_lora_input(
+    dsv4_attn: Any,
     o: Any,
-    *,
     positions: Any,
     cos_sin_cache: Any,
-    rope_head_dim: int,
-    n_local_groups: int,
-) -> Any:
+    *,
+    n_groups: int,
+    heads_per_group: int,
+    lora_dtype: Any,
+    nope_dim: int = 448,
+    rope_dim: int = 64,
+    quant_group_size: int = 128,
+    tma_aligned_scales: bool = False,
+) -> tuple[Any, Any, Any]:
+    _register_dsv4_inv_rope_lora_input_op()
     import torch
+    from vllm.utils.deep_gemm import get_tma_aligned_size
 
-    nope = o[..., :-rope_head_dim]
-    rope = o[..., -rope_head_dim:].to(torch.float32)
-    cos_sin = cos_sin_cache.index_select(0, positions.to(torch.int64)).to(torch.float32)
-    half = rope_head_dim // 2
-    cos = cos_sin[:, :half].view(-1, 1, half)
-    sin = cos_sin[:, half : half + half].view(-1, 1, half)
+    num_tokens, num_heads, head_dim = o.shape
+    assert num_heads == n_groups * heads_per_group
+    assert head_dim == nope_dim + rope_dim
+    assert head_dim % quant_group_size == 0
+    assert nope_dim % quant_group_size == (quant_group_size - rope_dim)
+    assert rope_dim % 2 == 0
+    assert cos_sin_cache.shape[-1] == rope_dim
+    assert cos_sin_cache.dtype == torch.float32
 
-    pairs = rope.view(*rope.shape[:-1], half, 2)
-    even = pairs[..., 0]
-    odd = pairs[..., 1]
-    inv_rope = torch.stack(
-        (even * cos + odd * sin, odd * cos - even * sin), dim=-1
-    ).flatten(-2)
-    inv = torch.cat((nope.to(torch.float32), inv_rope), dim=-1).to(o.dtype)
-    return inv.view(o.shape[0], n_local_groups, -1)
+    d = heads_per_group * head_dim
+    num_scale_blocks = d // quant_group_size
+    chunks_per_head = head_dim // quant_group_size
+    fp8_dtype = torch.float8_e4m3fn
+    tma_aligned_t = get_tma_aligned_size(num_tokens, 4)
+    scale_inner = (
+        (num_scale_blocks + 3) // 4 if tma_aligned_scales else num_scale_blocks
+    )
+
+    fp8_buf = torch.empty((n_groups, num_tokens, d), dtype=fp8_dtype, device=o.device)
+    scale_dtype = torch.int32 if tma_aligned_scales else torch.float32
+    scale_buf = torch.empty(
+        n_groups * scale_inner * tma_aligned_t,
+        dtype=scale_dtype,
+        device=o.device,
+    ).as_strided(
+        (n_groups, num_tokens, scale_inner),
+        (scale_inner * tma_aligned_t, 1, tma_aligned_t),
+    )
+    lora_input = torch.empty(
+        (n_groups, num_tokens, d),
+        dtype=lora_dtype,
+        device=o.device,
+    )
+    dsv4_attn.torch.ops.vllm.art_dsv4_inv_rope_fp8_quant_lora_input(
+        o,
+        positions,
+        cos_sin_cache,
+        fp8_buf,
+        scale_buf,
+        lora_input,
+        heads_per_group,
+        quant_group_size,
+        chunks_per_head,
+        nope_dim % quant_group_size,
+        rope_dim // 2,
+        tma_aligned_scales,
+        torch.finfo(fp8_dtype).max,
+        tma_aligned_t,
+        num_tokens,
+    )
+    return fp8_buf.transpose(0, 1), scale_buf.transpose(0, 1), lora_input
 
 
-def _apply_dsv4_wo_a_lora(
+def _dsv4_wo_a_lora_b_group_cache(
+    wo_a: Any,
+    *,
+    n_local_groups: int,
+    out_per_group: int,
+) -> tuple[Any, ...]:
+    source = wo_a.lora_b_stacked[0]
+    key = (
+        source.data_ptr(),
+        getattr(source, "_version", None),
+        n_local_groups,
+        out_per_group,
+        source.shape[-1],
+    )
+    if getattr(wo_a, "_art_wo_a_lora_b_group_cache_key", None) != key:
+        wo_a._art_wo_a_lora_b_group_cache = tuple(
+            source[
+                :, :, group * out_per_group : (group + 1) * out_per_group, :
+            ].contiguous()
+            for group in range(n_local_groups)
+        )
+        wo_a._art_wo_a_lora_b_group_cache_key = key
+    return wo_a._art_wo_a_lora_b_group_cache
+
+
+def _apply_dsv4_wo_a_lora_fast(
     wo_a: Any,
     z: Any,
-    o: Any,
     *,
-    positions: Any,
-    cos_sin_cache: Any,
-    rope_head_dim: int,
+    lora_input: Any,
     n_local_groups: int,
 ) -> Any:
-    if not _is_lora_wrapped_linear(wo_a):
-        return z
-    wrapper = wo_a.punica_wrapper
-    if getattr(wrapper, "no_lora", False):
-        return z
-    if getattr(wrapper, "indices_len", [None])[0] is None:
+    if not _is_active_lora_wrapped_linear(wo_a):
         return z
 
     import torch
+    from vllm.distributed import tensor_model_parallel_all_gather
+    from vllm.platforms import current_platform
 
-    token_lora_indices = wrapper.token_lora_indices[: z.shape[0]]
-    x = _dsv4_inverse_rope_grouped_for_wo_a(
-        o,
-        positions=positions,
-        cos_sin_cache=cos_sin_cache,
-        rope_head_dim=rope_head_dim,
-        n_local_groups=n_local_groups,
-    )
-    lora_a = wo_a.lora_a_stacked[0][:, 0]
-    lora_b = wo_a.lora_b_stacked[0][:, 0]
+    wrapper = wo_a.punica_wrapper
     out_per_group = z.shape[-1]
-    delta = torch.zeros_like(z)
-    for slot in range(lora_a.shape[0]):
-        hidden = torch.einsum("tgi,ri->tgr", x, lora_a[slot].to(x.dtype))
-        weight = (
-            lora_b[slot]
-            .view(n_local_groups, out_per_group, hidden.shape[-1])
-            .permute(2, 0, 1)
-            .to(hidden.dtype)
+    z_flat = z.view(z.shape[0], n_local_groups * out_per_group)
+    group_b = _dsv4_wo_a_lora_b_group_cache(
+        wo_a,
+        n_local_groups=n_local_groups,
+        out_per_group=out_per_group,
+    )
+    local_rank = wo_a.lora_a_stacked[0].shape[2]
+    buffers = torch.empty_strided(
+        (n_local_groups, z.shape[0], local_rank),
+        (z.shape[0] * local_rank, local_rank, 1),
+        dtype=torch.float32,
+        device=z.device,
+    )
+    for group, lora_b in enumerate(group_b):
+        buffer = buffers[group : group + 1]
+        buffer.zero_()
+        shrunk = wrapper.add_shrink(buffer, lora_input[group], wo_a.lora_a_stacked, 1.0)
+        if not current_platform.can_update_inplace():
+            buffer = shrunk
+        buffer = tensor_model_parallel_all_gather(buffer)
+        expanded = wrapper.add_expand(
+            z_flat,
+            buffer,
+            (lora_b,),
+            (out_per_group,),
+            offset_start=group * out_per_group,
+            add_inputs=True,
         )
-        slot_delta = torch.einsum("tgr,rgo->tgo", hidden, weight).to(delta.dtype)
-        mask = (token_lora_indices == slot).view(-1, 1, 1)
-        delta = torch.where(mask, delta + slot_delta, delta)
-    return z + delta
+        if not current_platform.can_update_inplace():
+            z_flat = expanded
+            z = z_flat.view_as(z)
+    return z
 
 
 def patch_dsv4_fast_path_lora() -> None:
@@ -553,16 +851,33 @@ def patch_dsv4_fast_path_lora() -> None:
         )
         o = o_padded[:, : self.n_local_heads, :]
 
-        o_fp8, o_scale = dsv4_attn.fused_inv_rope_fp8_quant(
-            o,
-            positions,
-            self.rotary_emb.cos_sin_cache,
-            n_groups=self.n_local_groups,
-            heads_per_group=self.n_local_heads // self.n_local_groups,
-            nope_dim=self.nope_head_dim,
-            rope_dim=self.rope_head_dim,
-            tma_aligned_scales=self._tma_aligned_scales,
-        )
+        wo_a_lora_input = None
+        if _is_active_lora_wrapped_linear(self.wo_a):
+            o_fp8, o_scale, wo_a_lora_input = (
+                _dsv4_fused_inv_rope_fp8_quant_with_lora_input(
+                    dsv4_attn,
+                    o,
+                    positions,
+                    self.rotary_emb.cos_sin_cache,
+                    n_groups=self.n_local_groups,
+                    heads_per_group=self.n_local_heads // self.n_local_groups,
+                    lora_dtype=self.wo_a.lora_a_stacked[0].dtype,
+                    nope_dim=self.nope_head_dim,
+                    rope_dim=self.rope_head_dim,
+                    tma_aligned_scales=self._tma_aligned_scales,
+                )
+            )
+        else:
+            o_fp8, o_scale = dsv4_attn.fused_inv_rope_fp8_quant(
+                o,
+                positions,
+                self.rotary_emb.cos_sin_cache,
+                n_groups=self.n_local_groups,
+                heads_per_group=self.n_local_heads // self.n_local_groups,
+                nope_dim=self.nope_head_dim,
+                rope_dim=self.rope_head_dim,
+                tma_aligned_scales=self._tma_aligned_scales,
+            )
 
         z = dsv4_attn.torch.empty(
             (num_tokens, self.n_local_groups, self.o_lora_rank),
@@ -578,15 +893,13 @@ def patch_dsv4_fast_path_lora() -> None:
             "bhr,hdr->bhd",
             list(self._einsum_recipe),
         )
-        z = _apply_dsv4_wo_a_lora(
-            self.wo_a,
-            z,
-            o,
-            positions=positions,
-            cos_sin_cache=self.rotary_emb.cos_sin_cache,
-            rope_head_dim=self.rope_head_dim,
-            n_local_groups=self.n_local_groups,
-        )
+        if wo_a_lora_input is not None:
+            z = _apply_dsv4_wo_a_lora_fast(
+                self.wo_a,
+                z,
+                lora_input=wo_a_lora_input,
+                n_local_groups=self.n_local_groups,
+            )
         return self.wo_b(z.flatten(1))
 
     attn_gemm_parallel_execute.__art_patched__ = True  # type: ignore[attr-defined]
