@@ -352,6 +352,13 @@ class Dsv4Handler(DefaultMoeHandler):
         return _dsv4_to_vllm_lora_tensors(tensors, adapter_config=adapter_config)
 
     def to_vllm_lora_config(self, adapter_config: dict[str, Any]) -> dict[str, Any]:
+        """Translate ART training targets only for restrictive vLLM launches.
+
+        A vLLM-format DSV4 adapter can be loaded by a vLLM server whose
+        ``target_modules`` filter is unset. ART-managed vLLM launches set that
+        filter for performance/memory control, so the filter must use
+        vLLM/Miles module names rather than ART/Megatron training target names.
+        """
         return _dsv4_vllm_lora_config(adapter_config)
 
     def compile_workaround_config(self, provider: Any) -> CompileWorkaroundConfig:
