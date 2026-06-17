@@ -655,7 +655,6 @@ def _dsv4_fused_inv_rope_fp8_quant_with_lora_input(
     quant_group_size: int = 128,
     tma_aligned_scales: bool = False,
 ) -> tuple[Any, Any, Any]:
-    _register_dsv4_inv_rope_lora_input_op()
     import torch
     from vllm.utils.deep_gemm import get_tma_aligned_size
 
@@ -801,9 +800,10 @@ def patch_dsv4_fast_path_lora() -> None:
         "vllm.model_executor.layers.deepseek_v4_attention"
     )
     wrapper_cls = getattr(dsv4_attn, "DeepseekV4MultiHeadLatentAttentionWrapper", None)
-    if wrapper_cls is None or getattr(
-        wrapper_cls, "_art_fast_path_lora_patched", False
-    ):
+    if wrapper_cls is None:
+        return
+    _register_dsv4_inv_rope_lora_input_op()
+    if getattr(wrapper_cls, "_art_fast_path_lora_patched", False):
         return
 
     original_attn_gemm_parallel_execute = wrapper_cls.attn_gemm_parallel_execute
