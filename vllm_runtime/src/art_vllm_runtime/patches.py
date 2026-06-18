@@ -19,7 +19,9 @@ def apply_vllm_runtime_patches() -> None:
     patch_nccl_unique_id_bootstrap()
     patch_layerwise_reload_shadow_attrs()
     patch_dsv4_attn_sink_layerwise_reload()
+    patch_dsv4_mhc_pre_fixed_split()
     patch_dsv4_lora_support()
+    patch_dsv4_mla_lora_aliases()
     patch_dsv4_fast_path_lora()
     patch_lora_linear_base_attr_proxy()
     patch_marlin_lora_swiglu_limit()
@@ -348,6 +350,33 @@ def patch_dsv4_attn_sink_layerwise_reload() -> None:
     model_cls.load_weights = load_weights  # type: ignore[method-assign]
 
 
+def patch_dsv4_mhc_pre_fixed_split() -> None:
+    """Make DSV4 mHC pre reductions invariant to total prefill length.
+
+    vLLM's current DSV4 mHC pre path chooses split-K from ``num_tokens``. The
+    same prompt prefix can therefore use a different reduction tree when a
+    suffix is appended, producing float32-level post/comb mix drift that becomes
+    bf16 output drift and later MoE route changes. Pinning the DSV4 prenorm
+    shape to the TileLang kernel default split count keeps the reduction plan
+    stable without changing model math.
+    """
+    try:
+        mhc = importlib.import_module("vllm.model_executor.layers.mhc")
+    except ImportError:
+        return
+    original = getattr(mhc, "compute_num_split", None)
+    if original is None or getattr(original, "__art_dsv4_fixed_split_patched__", False):
+        return
+
+    def compute_num_split(block_k: int, k: int | None, grid_size: int) -> int:
+        if block_k == 64 and k == 16_384:
+            return 16
+        return original(block_k, k, grid_size)
+
+    compute_num_split.__art_dsv4_fixed_split_patched__ = True  # type: ignore[attr-defined]
+    mhc.compute_num_split = compute_num_split
+
+
 def patch_dsv4_lora_support() -> None:
     """Enable vLLM's existing LoRA manager for ART-served DSV4.
 
@@ -385,13 +414,59 @@ def _patch_dsv4_lora_manager_indexer_skip(model_cls: type) -> None:
     if getattr(original, "__art_dsv4_indexer_skip_patched__", False):
         return
 
+    duplicate_mla_aliases = {"fused_wqa_wkv", "wq_b", "wo_a", "wo_b"}
+
     def _match_target_modules(self: Any, module_name: str) -> bool:
         if isinstance(self.model, model_cls) and ".indexer." in module_name:
+            return False
+        if (
+            isinstance(self.model, model_cls)
+            and ".attn.mla_attn." in module_name
+            and module_name.rsplit(".", 1)[-1] in duplicate_mla_aliases
+        ):
             return False
         return original(self, module_name)
 
     _match_target_modules.__art_dsv4_indexer_skip_patched__ = True  # type: ignore[attr-defined]
     LoRAModelManager._match_target_modules = _match_target_modules  # type: ignore[method-assign]
+
+
+def patch_dsv4_mla_lora_aliases() -> None:
+    """Keep DSV4 MLA wrapper references aligned with vLLM LoRA replacements.
+
+    DeepSeek V4 stores direct references to several attention linears inside
+    ``mla_attn`` during model construction. vLLM's LoRA manager later replaces
+    the canonical modules on ``attn``. Without refreshing the aliases, the DSV4
+    custom attention path keeps calling the original unwrapped linears.
+    """
+    from vllm.lora.model_manager import LoRAModelManager
+
+    original = LoRAModelManager.register_module
+    if getattr(original, "__art_dsv4_mla_alias_patched__", False):
+        return
+
+    alias_names = {"fused_wqa_wkv", "wq_b", "wo_a", "wo_b"}
+
+    def register_module(self: Any, module_name: str, module: Any) -> Any:
+        result = original(self, module_name, module)
+        leaf = module_name.rsplit(".", 1)[-1]
+        if leaf not in alias_names:
+            return result
+        parent_name, _, _ = module_name.rpartition(".")
+        if parent_name.endswith(".mla_attn"):
+            mla_name = parent_name
+        else:
+            mla_name = f"{parent_name}.mla_attn"
+        try:
+            mla_attn = self.model.get_submodule(mla_name)
+        except AttributeError:
+            return result
+        if mla_attn is not None and hasattr(mla_attn, leaf):
+            setattr(mla_attn, leaf, module)
+        return result
+
+    register_module.__art_dsv4_mla_alias_patched__ = True  # type: ignore[attr-defined]
+    LoRAModelManager.register_module = register_module  # type: ignore[method-assign]
 
 
 def _is_lora_wrapped_linear(module: Any) -> bool:
@@ -414,6 +489,179 @@ def _apply_lora_to_existing_linear_output(
     if getattr(wrapper, "indices_len", [None])[0] is None:
         return output
     return module._apply_lora_to_output(x, output)
+
+
+def _active_full_batch_lora_index(module: Any, num_tokens: int) -> int | None:
+    wrapper = module.punica_wrapper
+    cached = getattr(wrapper, "_art_full_batch_lora_index", None)
+    if cached is not None:
+        lora_index, cached_num_tokens, active = cached
+        if lora_index is None and not active:
+            return None
+        if lora_index is not None and cached_num_tokens == num_tokens:
+            return int(lora_index)
+        raise RuntimeError(
+            "DSV4 compressor LoRA currently requires one active adapter covering "
+            f"the whole batch, got active_loras={active}, "
+            f"cached_num_tokens={cached_num_tokens}, num_tokens={num_tokens}."
+        )
+
+    import torch
+
+    if torch.cuda.is_available() and torch.cuda.is_current_stream_capturing():
+        raise RuntimeError(
+            "DSV4 compressor LoRA active-adapter metadata was not prepared before "
+            "CUDA graph capture."
+        )
+
+    meta = wrapper.token_mapping_meta
+    if bool(meta.no_lora_flag_cpu.item()):
+        return None
+    limit = wrapper.max_loras + 1
+    lora_ids = meta.active_lora_ids[:limit].detach().cpu().tolist()
+    counts = meta.num_tokens_per_lora[:limit].detach().cpu().tolist()
+    active = [
+        (int(lora_id), int(count))
+        for lora_id, count in zip(lora_ids, counts, strict=True)
+        if int(lora_id) >= 0 and int(count) > 0
+    ]
+    if len(active) == 1 and active[0][1] == num_tokens:
+        return active[0][0]
+    raise RuntimeError(
+        "DSV4 compressor LoRA currently requires one active adapter covering "
+        f"the whole batch, got active_loras={active}, num_tokens={num_tokens}."
+    )
+
+
+def _dsv4_cache_full_batch_lora_index(
+    wrapper: Any,
+    mapping: Any,
+    lora_index_to_id: list[int | None],
+) -> None:
+    active_counts: dict[int, int] = {}
+    total = 0
+    for raw_lora_id in mapping.index_mapping:
+        total += 1
+        lora_id = int(raw_lora_id)
+        if lora_id <= 0:
+            continue
+        try:
+            lora_index = lora_index_to_id.index(lora_id)
+        except ValueError as exc:
+            raise RuntimeError(
+                f"LoRA id {lora_id} is active in the batch but absent from "
+                f"lora_index_to_id={lora_index_to_id}."
+            ) from exc
+        active_counts[lora_index] = active_counts.get(lora_index, 0) + 1
+
+    active = sorted(active_counts.items())
+    if not active:
+        wrapper._art_full_batch_lora_index = (None, total, active)
+    elif len(active) == 1 and active[0][1] == total:
+        wrapper._art_full_batch_lora_index = (active[0][0], total, active)
+    else:
+        wrapper._art_full_batch_lora_index = (None, total, active)
+
+
+def _patch_dsv4_lora_cpu_mapping_cache() -> None:
+    from vllm.lora.punica_wrapper.punica_gpu import PunicaWrapperGPU
+
+    original = PunicaWrapperGPU.update_metadata
+    if getattr(original, "__art_dsv4_mapping_cache_patched__", False):
+        return
+
+    def update_metadata(
+        self: Any,
+        mapping: Any,
+        lora_index_to_id: list[int | None],
+        max_loras: int,
+        vocab_size: int,
+        **kwargs: Any,
+    ) -> Any:
+        _dsv4_cache_full_batch_lora_index(self, mapping, lora_index_to_id)
+        return original(
+            self,
+            mapping,
+            lora_index_to_id,
+            max_loras,
+            vocab_size,
+            **kwargs,
+        )
+
+    update_metadata.__art_dsv4_mapping_cache_patched__ = True  # type: ignore[attr-defined]
+    PunicaWrapperGPU.update_metadata = update_metadata  # type: ignore[method-assign]
+
+
+def _dsv4_compressor_lora_cache(module: Any, lora_index: int) -> tuple[Any, Any]:
+    key = (
+        lora_index,
+        tuple(
+            (tensor.data_ptr(), getattr(tensor, "_version", None), tuple(tensor.shape))
+            for tensor in module.lora_a_stacked
+        ),
+        tuple(
+            (tensor.data_ptr(), getattr(tensor, "_version", None), tuple(tensor.shape))
+            for tensor in module.lora_b_stacked
+        ),
+    )
+    if getattr(module, "_art_dsv4_compressor_lora_cache_key", None) != key:
+        import torch
+
+        module._art_dsv4_compressor_lora_a_t_cache = tuple(
+            tensor[lora_index, 0].t().contiguous() for tensor in module.lora_a_stacked
+        )
+        module._art_dsv4_compressor_lora_b_t_cache = tuple(
+            tensor[lora_index, 0].t().contiguous().to(torch.float32)
+            for tensor in module.lora_b_stacked
+        )
+        module._art_dsv4_compressor_lora_cache_key = key
+    return (
+        module._art_dsv4_compressor_lora_a_t_cache,
+        module._art_dsv4_compressor_lora_b_t_cache,
+    )
+
+
+def _apply_dsv4_compressor_lora_to_existing_output(
+    module: Any,
+    x: Any,
+    output: Any,
+) -> Any:
+    if not _is_lora_wrapped_linear(module):
+        return output
+    wrapper = module.punica_wrapper
+    if getattr(wrapper, "no_lora", False):
+        return output
+    if getattr(wrapper, "indices_len", [None])[0] is None:
+        return output
+
+    import torch
+
+    original_shape = output.shape if output.ndim == 3 else None
+    if x.ndim == 3 and output.ndim == 3:
+        x = x.flatten(0, 1)
+        output = output.flatten(0, 1)
+    if x.ndim != 2 or output.ndim != 2:
+        raise RuntimeError(
+            "DSV4 compressor LoRA expects 2D hidden/output tensors, got "
+            f"x={tuple(x.shape)}, output={tuple(output.shape)}."
+        )
+
+    lora_index = _active_full_batch_lora_index(module, x.shape[0])
+    if lora_index is None:
+        return output.reshape(original_shape) if original_shape is not None else output
+
+    a_tensors, b_tensors = _dsv4_compressor_lora_cache(module, lora_index)
+    offset = 0
+    for a_t, b_t, width in zip(a_tensors, b_tensors, module.output_slices, strict=True):
+        low_rank = torch.mm(x, a_t, out_dtype=torch.float32)
+        output[:, offset : offset + width].add_(torch.mm(low_rank, b_t))
+        offset += width
+    if offset != output.shape[-1]:
+        raise RuntimeError(
+            "DSV4 compressor LoRA output slice width mismatch: "
+            f"slices={module.output_slices}, output={tuple(output.shape)}."
+        )
+    return output.reshape(original_shape) if original_shape is not None else output
 
 
 def _is_active_lora_wrapped_linear(module: Any) -> bool:
@@ -802,6 +1050,7 @@ def patch_dsv4_fast_path_lora() -> None:
     wrapper_cls = getattr(dsv4_attn, "DeepseekV4MultiHeadLatentAttentionWrapper", None)
     if wrapper_cls is None:
         return
+    _patch_dsv4_lora_cpu_mapping_cache()
     _register_dsv4_inv_rope_lora_input_op()
     if getattr(wrapper_cls, "_art_fast_path_lora_patched", False):
         return
@@ -814,13 +1063,13 @@ def patch_dsv4_fast_path_lora() -> None:
             original_attn_gemm_parallel_execute(self, hidden_states)
         )
         if self.compressor is not None:
-            kv_score = _apply_lora_to_existing_linear_output(
+            kv_score = _apply_dsv4_compressor_lora_to_existing_output(
                 self.compressor.fused_wkv_wgate,
                 hidden_states,
                 kv_score,
             )
         if self.indexer is not None:
-            indexer_kv_score = _apply_lora_to_existing_linear_output(
+            indexer_kv_score = _apply_dsv4_compressor_lora_to_existing_output(
                 self.indexer.compressor.fused_wkv_wgate,
                 hidden_states,
                 indexer_kv_score,
