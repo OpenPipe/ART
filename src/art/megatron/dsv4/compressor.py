@@ -7,7 +7,6 @@ import torch.nn as nn
 from torch.nn import Linear
 
 from art.megatron.dsv4.kernel.precision_aligned_ops import linear_bf16_fp32
-from art.megatron.dsv4.qat import fp8_simulate_qat
 from art.megatron.dsv4.rope import (
     apply_rotary_emb,
     configure_rope_cache,
@@ -375,7 +374,6 @@ class DeepSeekV4Compressor(nn.Module):
         self.overlap = compress_ratio == 4
         self.rotate = rotate
         coff = 1 + self.overlap
-        self.use_fp8_qat = config.fp8 is not None
 
         self.cp_group = cp_group
         self.cp_size = cp_group.size() if cp_group is not None else 1
@@ -494,14 +492,6 @@ class DeepSeekV4Compressor(nn.Module):
 
         if self.rotate:
             kv = rotate_activation(kv)
-            if self.use_fp8_qat:
-                kv = fp8_simulate_qat(kv, 128)
-        else:
-            if self.use_fp8_qat:
-                kv = kv.clone()
-                kv[..., : self.nope_head_dim] = fp8_simulate_qat(
-                    kv[..., : self.nope_head_dim], 64
-                )
 
         return kv
 
@@ -578,14 +568,6 @@ class DeepSeekV4Compressor(nn.Module):
 
         if self.rotate:
             compressed = rotate_activation(compressed)
-            if self.use_fp8_qat:
-                compressed = fp8_simulate_qat(compressed, 128)
-        else:
-            if self.use_fp8_qat:
-                compressed = compressed.clone()
-                compressed[..., : self.nope_head_dim] = fp8_simulate_qat(
-                    compressed[..., : self.nope_head_dim], 64
-                )
         return compressed
 
     def forward_raw(

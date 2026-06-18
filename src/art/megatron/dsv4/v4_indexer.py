@@ -13,7 +13,6 @@ from art.megatron.dsv4.compressor import (
     Dsv4CompressionLayout,
     compressed_layout_visibility,
 )
-from art.megatron.dsv4.qat import fp8_simulate_qat
 from art.megatron.dsv4.rope import (
     apply_rotary_emb,
     configure_rope_cache,
@@ -157,7 +156,6 @@ class V4Indexer(MegatronModule):
         self.index_topk = int(cfg.dsa_indexer_topk)
         self.rope_head_dim = int(cfg.qk_pos_emb_head_dim)
         self.compress_ratio = 4
-        self.use_fp8_qat = config.fp8 is not None
 
         if pg_collection is None:
             pg_collection = ProcessGroupCollection.use_mpu_process_groups(
@@ -256,8 +254,6 @@ class V4Indexer(MegatronModule):
         q = einops.rearrange(q, "b s ... -> s b ...")
 
         q = rotate_activation(q)
-        if self.use_fp8_qat:
-            q = fp8_simulate_qat(q, 128)
 
         k = self.compressor(
             x,

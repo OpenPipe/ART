@@ -37,7 +37,6 @@ from art.megatron.dsv4.compressor import (
     compressed_layout_topk_idxs,
 )
 from art.megatron.dsv4.kernel.tilelang_sparse_mla import sparse_attn_tilelang
-from art.megatron.dsv4.qat import fp8_simulate_qat
 from art.megatron.dsv4.rope import (
     apply_rotary_emb,
     configure_rope_cache,
@@ -195,7 +194,6 @@ class DeepSeekV4Attention(MegatronModule):
         compress_ratios = cfg.dsv4_compress_ratios
         self.compress_ratio = int(compress_ratios[layer_id]) if compress_ratios else 0
         self.eps = config.layernorm_epsilon
-        self.use_fp8_qat = config.fp8 is not None
 
         assert self.o_lora_rank == 1024
         assert self.head_dim == 512
@@ -389,11 +387,6 @@ class DeepSeekV4Attention(MegatronModule):
         kv_vanilla = cast(Any, self.kv_norm)(kv_after_wkv)
         kv_vanilla = kv_vanilla.clone()
         apply_rotary_emb(kv_vanilla[..., -rd:], freqs_cis)
-        if self.use_fp8_qat:
-            kv_vanilla = kv_vanilla.clone()
-            kv_vanilla[..., : self.nope_head_dim] = fp8_simulate_qat(
-                kv_vanilla[..., : self.nope_head_dim], 64
-            )
 
         seqlen_global = seqlen_local
         q_positions = torch.arange(seqlen_local, device=x.device)
