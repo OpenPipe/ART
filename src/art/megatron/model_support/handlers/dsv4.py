@@ -598,10 +598,10 @@ class Dsv4Handler(DefaultMoeHandler):
         partition_dim: int,
         partition_rank: int,
     ) -> torch.Tensor:
-        if partition_dim == 0 and Dsv4Handler._oracle_is_shared_expert_fused_fc1(name):
+        if partition_dim == 0 and Dsv4Handler._oracle_is_fused_fc1(name):
             if values.shape[0] % 2 != 0 or tensor.shape[0] % 2 != 0:
                 raise RuntimeError(
-                    "DSV4 shared expert fused FC1 oracle tensor must have an even "
+                    "DSV4 fused FC1 oracle tensor must have an even "
                     f"gate/up dimension, got logical={tuple(values.shape)} "
                     f"local={tuple(tensor.shape)} for {name}."
                 )
@@ -636,16 +636,18 @@ class Dsv4Handler(DefaultMoeHandler):
         partition_dim = getattr(tensor, "partition_dim", None)
         from megatron.core import parallel_state as ps
 
-        if (
-            _ORACLE_EXPERT_WEIGHT_RE.search(name) is not None
-            and partition_dim is not None
-            and int(partition_dim) >= 0
-        ):
+        if _ORACLE_EXPERT_WEIGHT_RE.search(name) is not None:
             etp_group = ps.get_expert_tensor_parallel_group(check_initialized=False)
             etp_size = etp_group.size() if etp_group is not None else 1
             if etp_size <= 1:
                 return tuple(tensor.shape), None, 0
-            dim = int(partition_dim)
+            dim = (
+                int(partition_dim)
+                if partition_dim is not None and int(partition_dim) >= 0
+                else Dsv4Handler._oracle_dsv4_expert_missing_etp_partition_dim(name)
+            )
+            if dim is None:
+                return tuple(tensor.shape), None, 0
             logical_shape = list(tensor.shape)
             logical_shape[dim] *= etp_size
             return tuple(logical_shape), dim, etp_group.rank()
@@ -691,6 +693,15 @@ class Dsv4Handler(DefaultMoeHandler):
         return None
 
     @staticmethod
+    def _oracle_dsv4_expert_missing_etp_partition_dim(name: str) -> int | None:
+        """Mirrors TE grouped-expert ETP shards when TE omits TP metadata."""
+        if ".mlp.experts.linear_fc1." in name:
+            return 0
+        if ".mlp.experts.linear_fc2." in name:
+            return 1
+        return None
+
+    @staticmethod
     def _oracle_is_shared_expert_fused_fc1(name: str) -> bool:
         return name.endswith(
             (
@@ -698,6 +709,18 @@ class Dsv4Handler(DefaultMoeHandler):
                 ".mlp.shared_experts.linear_fc1.linear_fc1.weight",
             )
         )
+
+    @staticmethod
+    def _oracle_is_grouped_expert_fused_fc1(name: str) -> bool:
+        return ".mlp.experts.linear_fc1." in name and bool(
+            _ORACLE_EXPERT_WEIGHT_RE.search(name)
+        )
+
+    @staticmethod
+    def _oracle_is_fused_fc1(name: str) -> bool:
+        return Dsv4Handler._oracle_is_shared_expert_fused_fc1(
+            name
+        ) or Dsv4Handler._oracle_is_grouped_expert_fused_fc1(name)
 
     @staticmethod
     def _is_oracle_identity_weight(name: str) -> bool:
