@@ -35,7 +35,7 @@ def replicated_lora(
     device, dtype = _weight_device_dtype(weight)
     sync = LoRAParallelSpec(
         grad_sync_domain=TP_DEFAULT_GRAD_SYNC_DOMAIN,
-        grad_sync_op=GRAD_SYNC_OP_SUM,
+        grad_sync_op=GRAD_SYNC_OP_NONE,
     )
     return LoRA(
         adapter_model_prefix=adapter_model_prefix,
