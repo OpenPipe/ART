@@ -618,6 +618,7 @@ class Dsv4Handler(DefaultMoeHandler):
                 ".self_attention.wq_b.weight",
                 ".self_attention.wo_a.weight",
                 ".mlp.shared_experts.linear_fc1.weight",
+                ".mlp.shared_experts.linear_fc1.linear_fc1.weight",
             )
         ):
             return 0
@@ -625,6 +626,7 @@ class Dsv4Handler(DefaultMoeHandler):
             (
                 ".self_attention.wo_b.weight",
                 ".mlp.shared_experts.linear_fc2.weight",
+                ".mlp.shared_experts.linear_fc2.row_parallel_lora.linear_proj.weight",
             )
         ):
             return 1
