@@ -39,7 +39,7 @@ def test_cp_unsupported_model_uses_non_cp_default_topology(monkeypatch) -> None:
     assert config.engine_args["gpu_memory_utilization"] == 0.82
     assert config.engine_args["kv_cache_dtype"] == "fp8"
     assert config.engine_args["max_num_batched_tokens"] == 1032
-    assert config.engine_args["moe_backend"] == "triton_unfused"
+    assert config.engine_args["moe_backend"] == "marlin"
 
 
 def test_dsv4_uses_quantized_vllm_noise_train_inf_thresholds() -> None:
