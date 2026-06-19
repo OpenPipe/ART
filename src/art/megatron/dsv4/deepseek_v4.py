@@ -343,7 +343,9 @@ class DeepSeekV4Attention(MegatronModule):
         """
         if self.sequence_parallel:
             hidden_states = gather_from_sequence_parallel_region(
-                hidden_states, group=self.tp_group
+                hidden_states,
+                tensor_parallel_output_grad=False,
+                group=self.tp_group,
             )
 
         x = einops.rearrange(hidden_states, "s b d -> b s d")
