@@ -5,6 +5,7 @@ from typing import Any
 
 from megatron.core import parallel_state as ps
 from megatron.core.tensor_parallel.mappings import (
+    copy_to_tensor_model_parallel_region,
     reduce_from_tensor_model_parallel_region,
 )
 import torch
@@ -195,15 +196,23 @@ class Dsv4RowOutputLoRA(torch.nn.Module):
 
 
 class Dsv4PlainLoRA(torch.nn.Module):
-    def __init__(self, lora: LoRA) -> None:
+    def __init__(self, lora: LoRA, *, sync_input_grad_group: Any | None = None) -> None:
         super().__init__()
         self.lora = lora
+        self.sync_input_grad_group = sync_input_grad_group
 
     @property
     def adapter_model_prefix(self) -> str:
         return self.lora.adapter_model_prefix
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if (
+            self.sync_input_grad_group is not None
+            and self.sync_input_grad_group.size() > 1
+        ):
+            x = copy_to_tensor_model_parallel_region(
+                x, group=self.sync_input_grad_group
+            )
         return self.lora(x)
 
 
@@ -254,7 +263,8 @@ def apply_dsv4_attention_lora(
                     out_features=attention.wq_b.weight.shape[0],
                     rank=rank,
                     alpha=alpha,
-                )
+                ),
+                sync_input_grad_group=attention.tp_group,
             ),
         )
     if _targets_include(target_modules, "kv_proj"):
