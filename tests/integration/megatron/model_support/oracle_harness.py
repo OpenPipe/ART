@@ -1116,6 +1116,21 @@ def _load_manifest(topology_dir: Path) -> RunManifest:
     return RunManifest.model_validate(_read_json(manifest_path))
 
 
+def _topology_artifacts_complete(topology_dir: Path, manifest: RunManifest) -> bool:
+    """Returns whether a cached topology still has tensors needed for comparison."""
+    for step in manifest.steps:
+        required = [
+            topology_dir / "traces" / f"forward_trace_step_{step.step_index:03d}.pt",
+            topology_dir / step.output_file,
+            topology_dir / step.grads_file,
+            topology_dir / step.deltas_file,
+            topology_dir / step.lora_file,
+        ]
+        if any(not path.exists() for path in required):
+            return False
+    return True
+
+
 def _load_output_tensor(topology_dir: Path, step: StepTrace):
     """Loads one output trace tensor referenced by a step trace entry."""
     import torch
@@ -1449,7 +1464,9 @@ class VariantRunner:
             and not regenerate
             and _manifest_matches_current_commit(manifest_path)
         ):
-            return topology_dir
+            manifest = _load_manifest(topology_dir)
+            if _topology_artifacts_complete(topology_dir, manifest):
+                return topology_dir
         _replace_topology_dir(topology_dir)
         run_case_config = self.case_config
         request = WorkerRunRequest(
