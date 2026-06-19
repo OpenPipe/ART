@@ -248,7 +248,10 @@ class Dsv4Handler(DefaultMoeHandler):
         alpha: int,
     ) -> None:
         from art.megatron.dsv4.layer import Dsv4TransformerLayer
-        from art.megatron.dsv4.lora import apply_dsv4_attention_lora
+        from art.megatron.dsv4.lora import (
+            apply_dsv4_attention_lora,
+            disable_dsv4_etp_shared_expert_lora_compile,
+        )
         from art.megatron.lora import (
             _adapter_model_prefix,
             wrap_grouped_moe_experts,
@@ -284,6 +287,13 @@ class Dsv4Handler(DefaultMoeHandler):
                         rank=rank,
                         alpha=alpha,
                     )
+                    if (
+                        int(getattr(provider, "expert_tensor_parallel_size", 1) or 1)
+                        > 1
+                    ):
+                        disable_dsv4_etp_shared_expert_lora_compile(
+                            module.mlp.shared_experts
+                        )
 
     def build_adapter_weights_by_base(
         self, model_chunks: Sequence[Any]

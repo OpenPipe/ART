@@ -570,3 +570,21 @@ def add_dsv4_shared_experts_adapter_weights(
                 tp_group=_tensor_parallel_group(),
             )
         ]
+
+
+def disable_dsv4_etp_shared_expert_lora_compile(shared_experts: Any) -> None:
+    """Keep DSV4 ETP shared-expert down LoRA outside compiled layer graphs.
+
+    Torch 2.11 can spend unbounded time compiling the row-parallel shared-expert
+    LoRA path when DSV4 runs with expert tensor parallelism. The barrier is
+    instance-local and leaves non-ETP and generic MoE shared experts unchanged.
+    """
+    from art.megatron.lora import SharedExpertsLinearFC2LoRA
+
+    linear_fc2 = getattr(shared_experts, "linear_fc2", None)
+    if not isinstance(linear_fc2, SharedExpertsLinearFC2LoRA):
+        return
+    if bool(getattr(linear_fc2, "_art_dsv4_compile_disabled", False)):
+        return
+    linear_fc2.forward = torch.compiler.disable(linear_fc2.forward)
+    linear_fc2._art_dsv4_compile_disabled = True
