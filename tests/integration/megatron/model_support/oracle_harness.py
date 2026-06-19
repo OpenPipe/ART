@@ -642,6 +642,24 @@ def _truthy(value: str | None) -> bool:
     return value.strip().lower() in {"1", "true", "yes", "on"}
 
 
+def _trace_cp_world_size(call: dict[str, Any]) -> int:
+    """Returns the CP size represented by one possibly rank-merged trace call."""
+    rank_meta = call.get("rank_meta")
+    if isinstance(rank_meta, dict):
+        rank_meta = [rank_meta]
+    if not isinstance(rank_meta, list):
+        return 1
+    sizes: list[int] = []
+    for item in rank_meta:
+        if not isinstance(item, dict):
+            continue
+        try:
+            sizes.append(int(item.get("cp_world_size", 1)))
+        except Exception:
+            sizes.append(1)
+    return max(sizes, default=1)
+
+
 def sensitivity_mutations() -> list[SensitivityMutation]:
     """Parses sensitivity mutation selectors from env as a CSV list."""
     raw = os.environ.get(SENSITIVITY_MUTATION_ENV)
@@ -1402,6 +1420,24 @@ class VariantRunner:
         if sequence_length <= 0:
             return trace
 
+        def trim_by_leading_dim(call: dict[str, Any], valid_length: int) -> None:
+            for key in ("primary_output", "router_topk_scores", "router_topk_ids"):
+                tensor = call.get(key)
+                if not isinstance(tensor, torch.Tensor) or tensor.ndim == 0:
+                    continue
+                leading_dim = int(tensor.shape[0])
+                if leading_dim <= valid_length:
+                    continue
+                if leading_dim % sequence_length == 0:
+                    row_multiplier = leading_dim // sequence_length
+                    target_rows = valid_length * row_multiplier
+                elif leading_dim <= sequence_length:
+                    target_rows = valid_length
+                else:
+                    continue
+                if 0 < target_rows < leading_dim:
+                    call[key] = tensor[:target_rows].contiguous()
+
         for calls in trace.values():
             for call in calls:
                 sample_index = call.get("micro_sample_index")
@@ -1409,6 +1445,9 @@ class VariantRunner:
                     continue
                 valid_length = int(valid_lengths[sample_index])
                 if valid_length >= sequence_length:
+                    continue
+                if _trace_cp_world_size(call) <= 1:
+                    trim_by_leading_dim(call, valid_length)
                     continue
                 row_token_uids = call.get("row_token_uids")
                 if (
@@ -1441,22 +1480,7 @@ class VariantRunner:
                                     0, keep_rows
                                 ).contiguous()
                         continue
-                for key in ("primary_output", "router_topk_scores", "router_topk_ids"):
-                    tensor = call.get(key)
-                    if not isinstance(tensor, torch.Tensor) or tensor.ndim == 0:
-                        continue
-                    leading_dim = int(tensor.shape[0])
-                    if leading_dim <= valid_length:
-                        continue
-                    if leading_dim % sequence_length == 0:
-                        row_multiplier = leading_dim // sequence_length
-                        target_rows = valid_length * row_multiplier
-                    elif leading_dim <= sequence_length:
-                        target_rows = valid_length
-                    else:
-                        continue
-                    if 0 < target_rows < leading_dim:
-                        call[key] = tensor[:target_rows].contiguous()
+                trim_by_leading_dim(call, valid_length)
         return trace
 
     def _run_topology(

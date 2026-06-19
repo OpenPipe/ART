@@ -15,7 +15,6 @@ from art.megatron.dsv4.hyper_connection import (
     DeepSeekV4HyperConnectionUtil,
     HCHeadParams,
 )
-from art.megatron.dsv4.trace import attach_trace_row_token_uids
 from art.megatron.dsv4.utils import freeze_parameters_as_buffers
 
 
@@ -167,8 +166,6 @@ class Dsv4Router(TopKRouter):
             valid = padding_mask.reshape(-1).bool()
             probs = torch.where(valid.unsqueeze(-1), probs, torch.zeros_like(probs))
             routing_map = routing_map & valid.unsqueeze(-1)
-        attach_trace_row_token_uids(self, probs)
-        attach_trace_row_token_uids(self, routing_map)
         return probs, routing_map
 
 
@@ -290,13 +287,11 @@ class Dsv4TransformerLayer(TransformerLayer):
         else:
             mlp_output = self.mlp(mlp_input, padding_mask=padding_mask)
         hidden_states = self.hc_util.layer_post(mlp_output, hidden_states, post, comb)
-        output = make_viewless_tensor(
+        return make_viewless_tensor(
             inp=hidden_states,
             requires_grad=hidden_states.requires_grad,
             keep_graph=True,
-        )
-        attach_trace_row_token_uids(output=output, module=self)
-        return output, context
+        ), context
 
 
 class Dsv4FinalNorm(MegatronModule):

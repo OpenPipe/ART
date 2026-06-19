@@ -43,7 +43,6 @@ from art.megatron.dsv4.rope import (
     get_rope_cache,
     get_rope_cache_at_positions,
 )
-from art.megatron.dsv4.trace import attach_trace_row_token_uids
 from art.megatron.dsv4.v4_indexer import V4Indexer
 
 
@@ -530,7 +529,6 @@ class DeepSeekV4Attention(MegatronModule):
         if self.sequence_parallel:
             output = scatter_to_sequence_parallel_region(output, group=self.tp_group)
 
-        attach_trace_row_token_uids(self, output, tp_group=self.tp_group)
         return output
 
     def _compute_indexer_mask(
