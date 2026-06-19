@@ -20,6 +20,7 @@ from art.megatron.routing_replay import (
     ParallelTopology as ReplayParallelTopology,
 )
 from art.preprocessing.pack import PackedTensors
+from art.utils.lifecycle import terminate_popen_process_group
 
 from ..routing_replay.bundle import build_bundle_from_forward_trace_dir
 from ..routing_replay.trace import install_moe_routing_trace_hooks
@@ -103,6 +104,7 @@ def run_worker_subprocess(
     worker_log_path = topology_dir / "worker.log"
     live_log_raw = os.environ.get("ART_ORACLE_LIVE_TRAINING_LOG")
     live_log_path = None if not live_log_raw else Path(live_log_raw)
+    run: subprocess.Popen[str] | None = None
     worker_log_path.parent.mkdir(parents=True, exist_ok=True)
     with worker_log_path.open("w", encoding="utf-8") as worker_log:
         live_log = None
@@ -129,6 +131,7 @@ def run_worker_subprocess(
                 stderr=subprocess.STDOUT,
                 text=True,
                 bufsize=1,
+                start_new_session=True,
             )
             assert run.stdout is not None
             for line in run.stdout:
@@ -140,6 +143,8 @@ def run_worker_subprocess(
                     live_log.flush()
             run.returncode = run.wait()
         finally:
+            if run is not None and run.poll() is None:
+                terminate_popen_process_group(run)
             if live_log is not None:
                 live_log.close()
     combined_output = "".join(combined_lines).strip()
