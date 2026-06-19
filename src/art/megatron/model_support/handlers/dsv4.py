@@ -570,12 +570,46 @@ class Dsv4Handler(DefaultMoeHandler):
             dtype=torch.float32,
         )
         if partition_dim is not None:
-            values = values.narrow(
-                partition_dim,
-                partition_rank * tensor.shape[partition_dim],
-                tensor.shape[partition_dim],
+            values = self._oracle_slice_logical_tensor(
+                name,
+                values,
+                tensor,
+                partition_dim=partition_dim,
+                partition_rank=partition_rank,
             )
         tensor.copy_((0.02 * values).to(dtype=tensor.dtype))
+
+    @staticmethod
+    def _oracle_slice_logical_tensor(
+        name: str,
+        values: torch.Tensor,
+        tensor: torch.Tensor,
+        *,
+        partition_dim: int,
+        partition_rank: int,
+    ) -> torch.Tensor:
+        if partition_dim == 0 and Dsv4Handler._oracle_is_shared_expert_fused_fc1(name):
+            if values.shape[0] % 2 != 0 or tensor.shape[0] % 2 != 0:
+                raise RuntimeError(
+                    "DSV4 shared expert fused FC1 oracle tensor must have an even "
+                    f"gate/up dimension, got logical={tuple(values.shape)} "
+                    f"local={tuple(tensor.shape)} for {name}."
+                )
+            local_component = tensor.shape[0] // 2
+            gate, up = values.chunk(2, dim=0)
+            start = partition_rank * local_component
+            return torch.cat(
+                (
+                    gate.narrow(0, start, local_component),
+                    up.narrow(0, start, local_component),
+                ),
+                dim=0,
+            )
+        return values.narrow(
+            partition_dim,
+            partition_rank * tensor.shape[partition_dim],
+            tensor.shape[partition_dim],
+        )
 
     @staticmethod
     def _oracle_logical_tensor_for_rank(
@@ -631,6 +665,15 @@ class Dsv4Handler(DefaultMoeHandler):
         ):
             return 1
         return None
+
+    @staticmethod
+    def _oracle_is_shared_expert_fused_fc1(name: str) -> bool:
+        return name.endswith(
+            (
+                ".mlp.shared_experts.linear_fc1.weight",
+                ".mlp.shared_experts.linear_fc1.linear_fc1.weight",
+            )
+        )
 
     @staticmethod
     def _is_oracle_identity_weight(name: str) -> bool:
