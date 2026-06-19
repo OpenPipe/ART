@@ -1,6 +1,12 @@
 from __future__ import annotations
 
+from getpass import getuser
+import hashlib
+import importlib
 import os
+from pathlib import Path
+import pickle
+import tempfile
 from typing import Any, cast
 
 from quack.gemm import gemm as quack_gemm
@@ -27,6 +33,65 @@ def _env_positive_int(name: str) -> int | None:
     if value <= 0:
         raise ValueError(f"{name} must be > 0, got {value}")
     return value
+
+
+def _quack_compile_lock_dir() -> Path:
+    path = (
+        Path(os.environ["ART_QUACK_COMPILE_LOCK_DIR"])
+        if "ART_QUACK_COMPILE_LOCK_DIR" in os.environ
+        else Path(tempfile.gettempdir()) / getuser() / "art_quack_compile_locks"
+    )
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def _cache_key(args: tuple[Any, ...], kwargs: dict[str, Any]) -> tuple[Any, ...]:
+    return args + tuple(sorted(kwargs.items())) if kwargs else args
+
+
+def _key_hash(key: tuple[Any, ...]) -> str:
+    try:
+        data = pickle.dumps(key)
+    except Exception:
+        data = repr(key).encode()
+    return hashlib.sha256(data).hexdigest()
+
+
+def _install_quack_compile_lock() -> None:
+    """Serialize QuACK CuTe compilation misses across distributed ranks.
+
+    QuACK protects disk-cache load/store with file locks, but it compiles cache
+    misses outside that lock. ETP runs can make every rank compile the same
+    grouped-LoRA backward GEMM at once, which has crashed inside CuTe DSL codegen.
+    Hot in-process cache hits bypass this guard, so kernel launches stay unlocked.
+    """
+    import quack.cache_utils as quack_cache_utils
+
+    gemm_module = importlib.import_module("quack.gemm")
+    compile_gemm = getattr(gemm_module, "_compile_gemm")
+    if bool(getattr(compile_gemm, "_art_compile_lock_wrapped", False)):
+        return
+    cache = getattr(compile_gemm, "cache", None)
+
+    def locked_compile_gemm(*args: Any, **kwargs: Any) -> Any:
+        key = _cache_key(args, kwargs)
+        if isinstance(cache, dict) and key in cache:
+            return compile_gemm(*args, **kwargs)
+        lock_path = _quack_compile_lock_dir() / f"{_key_hash(key)}.lock"
+        with quack_cache_utils.FileLock(lock_path, exclusive=True, timeout=600):
+            return compile_gemm(*args, **kwargs)
+
+    locked_compile_gemm_any = cast(Any, locked_compile_gemm)
+    locked_compile_gemm_any.cache = getattr(compile_gemm, "cache", None)
+    locked_compile_gemm_any.cache_clear = getattr(compile_gemm, "cache_clear", None)
+    locked_compile_gemm_any.cache_info = getattr(compile_gemm, "cache_info", None)
+    locked_compile_gemm_any._art_compile_lock_wrapped = True
+    setattr(gemm_module, "_compile_gemm", locked_compile_gemm)
+
+
+def _quack_gemm(*args: Any, **kwargs: Any) -> Any:
+    _install_quack_compile_lock()
+    return quack_gemm(*args, **kwargs)
 
 
 def _tokens_per_expert_to_tensor(
@@ -216,7 +281,7 @@ def _varlen_quack_gemm(
             raise ValueError(
                 f"Output tensor must match input device/dtype, got {out.device}/{out.dtype}"
             )
-    quack_gemm(
+    _quack_gemm(
         a,
         b,
         out,
@@ -252,7 +317,7 @@ def _varlen_quack_gemm_k(
         device=a.device,
         dtype=a.dtype,
     )
-    quack_gemm(
+    _quack_gemm(
         a,
         b,
         out,
