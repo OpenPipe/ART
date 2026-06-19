@@ -572,6 +572,81 @@ def add_dsv4_shared_experts_adapter_weights(
         ]
 
 
+def _triton_autotune_key(
+    autotuner: Any, args: tuple[Any, ...], kwargs: dict[str, Any]
+) -> tuple[Any, ...]:
+    nargs = dict(zip(autotuner.arg_names, args))
+    all_args = {**nargs, **kwargs}
+    named_args = {
+        key: value for key, value in all_args.items() if key in autotuner.arg_names
+    }
+    key = [named_args[name] for name in autotuner.keys if name in named_args]
+    for arg in named_args.values():
+        if hasattr(arg, "dtype"):
+            key.append(str(arg.dtype))
+    return tuple(key)
+
+
+def _dsv4_te_permutation_config(hidden_size: int) -> Any:
+    import triton
+
+    block_size = 1 << max(6, min(12, (max(1, hidden_size) - 1).bit_length()))
+    return triton.Config({"BLOCK_SIZE": block_size})
+
+
+def _install_dsv4_triton_static_config(autotuner: Any) -> None:
+    """Bypass TE Triton permutation autotune during DSV4 ETP backward.
+
+    DSV4 ETP validation can make every rank hit the same first-use TE MoE
+    permutation backward path at once. Serializing autotune inside autograd is
+    unsafe because other ranks can be waiting at distributed edges of the same
+    backward graph. Instead, cache a deterministic BLOCK_SIZE before Triton's
+    Autotuner benchmarks. The failure risk is performance from a non-autotuned
+    copy/unpermute tile, not a change in model math.
+    """
+
+    if bool(getattr(autotuner, "_art_dsv4_static_config_wrapped", False)):
+        return
+    original_run = autotuner.run
+
+    def static_config_run(*args: Any, **kwargs: Any) -> Any:
+        configs = getattr(autotuner, "configs", ())
+        if len(configs) <= 1:
+            return original_run(*args, **kwargs)
+        key = _triton_autotune_key(autotuner, args, kwargs)
+        cache = getattr(autotuner, "cache", None)
+        if isinstance(cache, dict) and key not in cache and key:
+            cache[key] = _dsv4_te_permutation_config(int(key[0]))
+        return original_run(*args, **kwargs)
+
+    static_config_run._art_dsv4_static_config_wrapped = True  # type: ignore[attr-defined]
+    autotuner.run = static_config_run
+    autotuner._art_dsv4_static_config_wrapped = True
+
+
+def install_dsv4_te_permutation_static_configs() -> None:
+    """Install DSV4-only static configs for TE MoE permutation Triton autotuners.
+
+    This is called from the DSV4 handler only when expert tensor parallelism is
+    enabled. It is intentionally not a generic compile workaround: the current
+    correctness blocker is DSV4 ETP first-backward autotune inside distributed
+    autograd, and the performance goal is to bypass only cold autotune while
+    leaving normal launches on Triton's regular JIT path.
+    """
+
+    from transformer_engine.common.triton import permutation as te_permutation
+
+    for name in (
+        "_permute_kernel",
+        "_unpermute_kernel",
+        "_unpermute_bwd_with_merging_probs_kernel",
+        "_sort_chunks_by_map_kernel",
+    ):
+        autotuner = getattr(te_permutation, name, None)
+        if hasattr(autotuner, "run"):
+            _install_dsv4_triton_static_config(autotuner)
+
+
 def disable_dsv4_etp_shared_expert_lora_compile(shared_experts: Any) -> None:
     """Keep DSV4 ETP shared-expert down LoRA outside compiled layer graphs.
 

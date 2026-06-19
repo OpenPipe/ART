@@ -251,6 +251,7 @@ class Dsv4Handler(DefaultMoeHandler):
         from art.megatron.dsv4.lora import (
             apply_dsv4_attention_lora,
             disable_dsv4_etp_shared_expert_lora_compile,
+            install_dsv4_te_permutation_static_configs,
         )
         from art.megatron.lora import (
             _adapter_model_prefix,
@@ -259,6 +260,9 @@ class Dsv4Handler(DefaultMoeHandler):
         )
 
         target_set = set(target_modules)
+        etp_enabled = int(getattr(provider, "expert_tensor_parallel_size", 1) or 1) > 1
+        if etp_enabled:
+            install_dsv4_te_permutation_static_configs()
         for chunk in model_chunks:
             for module in chunk.modules():
                 if not isinstance(module, Dsv4TransformerLayer):
@@ -287,10 +291,7 @@ class Dsv4Handler(DefaultMoeHandler):
                         rank=rank,
                         alpha=alpha,
                     )
-                    if (
-                        int(getattr(provider, "expert_tensor_parallel_size", 1) or 1)
-                        > 1
-                    ):
+                    if etp_enabled:
                         disable_dsv4_etp_shared_expert_lora_compile(
                             module.mlp.shared_experts
                         )
