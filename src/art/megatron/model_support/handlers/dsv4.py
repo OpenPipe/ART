@@ -557,16 +557,52 @@ class Dsv4Handler(DefaultMoeHandler):
         ):
             tensor.zero_()
             return
+        logical_shape, partition_dim, partition_rank = (
+            self._oracle_logical_tensor_for_rank(tensor)
+        )
         digest = hashlib.sha256(f"{seed}:{name}".encode("utf-8")).digest()
         key_seed = int.from_bytes(digest[:8], "little") % (2**31)
         generator = torch.Generator(device=tensor.device).manual_seed(key_seed)
         values = torch.randn(
-            tensor.shape,
+            logical_shape,
             generator=generator,
             device=tensor.device,
             dtype=torch.float32,
         )
+        if partition_dim is not None:
+            values = values.narrow(
+                partition_dim,
+                partition_rank * tensor.shape[partition_dim],
+                tensor.shape[partition_dim],
+            )
         tensor.copy_((0.02 * values).to(dtype=tensor.dtype))
+
+    @staticmethod
+    def _oracle_logical_tensor_for_rank(
+        tensor: torch.Tensor,
+    ) -> tuple[tuple[int, ...], int | None, int]:
+        """Returns the logical full tensor shape and rank-local TP slice metadata.
+
+        DSV4 oracle base weights are validation-only random tensors.  TP ranks
+        must receive slices of the same logical tensor as the TP1 oracle; if each
+        rank independently initializes its local shard, TP2 is not mathematically
+        comparable to TP1 even when the layer implementation is correct.
+        """
+        partition_dim = getattr(tensor, "partition_dim", None)
+        if (
+            not bool(getattr(tensor, "tensor_model_parallel", False))
+            or partition_dim is None
+            or int(partition_dim) < 0
+        ):
+            return tuple(tensor.shape), None, 0
+        from megatron.core import parallel_state as ps
+
+        dim = int(partition_dim)
+        tp_size = ps.get_tensor_model_parallel_world_size()
+        tp_rank = ps.get_tensor_model_parallel_rank()
+        logical_shape = list(tensor.shape)
+        logical_shape[dim] *= tp_size
+        return tuple(logical_shape), dim, tp_rank
 
     @staticmethod
     def _is_oracle_identity_weight(name: str) -> bool:
