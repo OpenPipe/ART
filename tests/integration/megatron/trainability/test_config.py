@@ -202,7 +202,7 @@ def test_qwen3_5_moe_shared_variant_enables_expert_parallel(monkeypatch) -> None
     assert config["engine_args"]["enable_expert_parallel"] is True
 
 
-def test_dsv4_trainability_uses_large_model_shared_resources(
+def test_dsv4_trainability_uses_large_model_dedicated_resources(
     monkeypatch,
 ) -> None:
     monkeypatch.setattr(torch.cuda, "device_count", lambda: 4)
@@ -229,19 +229,25 @@ def test_dsv4_trainability_uses_large_model_shared_resources(
         base_model="deepseek-ai/DeepSeek-V4-Flash",
     )
 
-    assert default_variant == "megatron_shared"
+    assert default_variant == "megatron_dedicated"
     assert variant.topology is not None
-    assert variant.topology.tp == 4
-    assert variant.topology.ep == 4
+    assert variant.topology.tp == 2
+    assert variant.topology.ep == 2
     assert variant.topology.cp == 1
     assert variant.topology.dp == 1
     assert variant.topology.sp is True
-    assert variant.trainer_gpu_ids == [0, 1, 2, 3]
-    assert variant.inference_gpu_ids == [0, 1, 2, 3]
-    assert config["engine_args"]["tensor_parallel_size"] == 4
+    assert variant.trainer_gpu_ids == [0, 1]
+    assert variant.inference_gpu_ids == [2, 3]
+    assert config["engine_args"]["tensor_parallel_size"] == 2
     assert config["engine_args"]["enable_expert_parallel"] is True
     assert config["engine_args"]["gpu_memory_utilization"] == 0.82
     assert config["engine_args"]["kv_cache_dtype"] == "fp8"
     assert config["engine_args"]["max_num_batched_tokens"] == 1032
     assert config["engine_args"].get("moe_backend") == "triton_unfused"
-    assert "megatron_topology" not in config
+    assert config["megatron_topology"] == {
+        "tp": 2,
+        "ep": 2,
+        "etp": 1,
+        "cp": 1,
+        "pp": 1,
+    }

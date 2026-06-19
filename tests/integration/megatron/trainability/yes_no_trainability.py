@@ -461,6 +461,23 @@ def _variant_init_args(variant: _TrainabilityVariant) -> dev.InitArgs:
     return {"max_seq_length": _variant_packed_sequence_length(variant)}
 
 
+def _init_megatron_runtime_config(variant: _TrainabilityVariant) -> None:
+    if variant.topology is None:
+        return
+    init_runtime_config = getattr(art, "init_megatron_runtime_config", None)
+    if init_runtime_config is None:
+        return
+    init_runtime_config(
+        topology=art.MegatronTopologyConfig(
+            tp=variant.topology.tp,
+            cp=variant.topology.cp,
+            ep=variant.topology.ep,
+            etp=variant.topology.etp,
+        ),
+        packed_sequence_length=_variant_packed_sequence_length(variant),
+    )
+
+
 def _variant_max_steps(variant: _TrainabilityVariant) -> int:
     default = 12 if variant.backend_name == "local" else 4
     return _get_env_int("ART_MODEL_SUPPORT_YES_NO_MAX_STEPS", default)

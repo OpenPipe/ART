@@ -67,7 +67,6 @@ def test_dsv4_runtime_stages_use_full_model_resources() -> None:
         assert stage.required_world_size == 8
         assert stage.required_h200_equivalent_gpus == 8
         assert stage.allow_gpu_overlap is False
-        assert stage.megatron_env == {}
         assert stage.vllm is not None
         assert stage.vllm.gpu_ids == [4, 5, 6, 7]
         assert stage.high_vram_megatron is not None
@@ -78,6 +77,12 @@ def test_dsv4_runtime_stages_use_full_model_resources() -> None:
         assert "hf_overrides" not in engine_args
         assert engine_args.get("load_format") != "dummy"
         assert engine_args["moe_backend"] == "triton_unfused"
+    assert resources.train_inf_mismatch is not None
+    assert resources.train_inf_mismatch.megatron_env == {}
+    assert resources.yes_no_trainability is not None
+    assert resources.yes_no_trainability.megatron_env == {
+        "ART_MEGATRON_STREAMING_WEIGHT_OFFLOAD": "1"
+    }
 
     for stage in (resources.merged_vllm_serving, resources.native_vllm_lora):
         assert stage is not None
