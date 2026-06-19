@@ -1438,7 +1438,11 @@ class ForwardTraceCapture:
             if cls._is_moe_expert_forward_module(module_name):
                 continue
             for call in calls:
-                if _call_cp_world_size(call) > 1 or "row_uid_span" in call:
+                if (
+                    "rank_meta" not in call
+                    or _call_cp_world_size(call) > 1
+                    or "row_uid_span" in call
+                ):
                     continue
                 tensor = call.get("primary_output")
                 row_token_uids = call.get("row_token_uids")
