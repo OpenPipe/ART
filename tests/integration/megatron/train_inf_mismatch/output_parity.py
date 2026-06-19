@@ -27,12 +27,21 @@ from ..model_support.workflow_resources import (
 # prefix route-conflict behavior on the measured path. With the workflow's
 # 16-token completions, Qwen3.5 MoE reruns on 2026-05-25 measured 4.169% and
 # 4.606% mean_abs_pct while staying under the KL gate, so its gate is 5%.
+# DeepSeek-V4-Flash uses vLLM quantized DSV4 kernels on the serving side while
+# Megatron materializes train-time bf16/fp32 tensors. A 2026-06-18 diagnostic
+# measured non-QAT Megatron vs vLLM generation at 19.016% mean_abs_pct and
+# 0.02603 candidate->target top20 KL; vLLM generation vs exact vLLM prompt
+# rescore was already 15.176% mean_abs_pct and 0.04424 KL.
 BF16_FWD_MEAN_ABS_PCT_LIMIT = 4.0
 BF16_FWD_MEAN_ABS_PCT_LIMIT_BY_MODEL_KEY = {
+    "dsv4": 20.0,
     "qwen3_moe": 8.0,
     "qwen3_5_moe": 5.0,
 }
 TOP20_KL_CANDIDATE_TO_TARGET_LIMIT = 0.002
+TOP20_KL_CANDIDATE_TO_TARGET_LIMIT_BY_MODEL_KEY = {
+    "dsv4": 0.03,
+}
 MEAN_ABS_PCT_DENOMINATOR_EPS = 1e-18
 TOP_K = 20
 ScoreRecord = tuple[int, float, list[int], list[float]]
@@ -273,11 +282,14 @@ def top20_kl_candidate_to_target_limit_for_model(
 ) -> float:
     from art.megatron.model_support.registry import get_model_support_spec
 
-    get_model_support_spec(
+    spec = get_model_support_spec(
         base_model,
         allow_unvalidated_arch=allow_unvalidated_arch,
     )
-    return TOP20_KL_CANDIDATE_TO_TARGET_LIMIT
+    return TOP20_KL_CANDIDATE_TO_TARGET_LIMIT_BY_MODEL_KEY.get(
+        spec.key,
+        TOP20_KL_CANDIDATE_TO_TARGET_LIMIT,
+    )
 
 
 def model_support_is_moe(

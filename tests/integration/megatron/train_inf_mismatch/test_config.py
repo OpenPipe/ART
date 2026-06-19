@@ -4,7 +4,11 @@ from types import SimpleNamespace
 
 import torch
 
-from .output_parity import config_from_env
+from .output_parity import (
+    config_from_env,
+    fwd_mean_abs_pct_limit_for_model,
+    top20_kl_candidate_to_target_limit_for_model,
+)
 
 
 def test_cp_unsupported_model_uses_non_cp_default_topology(monkeypatch) -> None:
@@ -36,3 +40,10 @@ def test_cp_unsupported_model_uses_non_cp_default_topology(monkeypatch) -> None:
     assert config.engine_args["kv_cache_dtype"] == "fp8"
     assert config.engine_args["max_num_batched_tokens"] == 1032
     assert config.engine_args["moe_backend"] == "triton_unfused"
+
+
+def test_dsv4_uses_quantized_vllm_noise_train_inf_thresholds() -> None:
+    base_model = "deepseek-ai/DeepSeek-V4-Flash"
+
+    assert fwd_mean_abs_pct_limit_for_model(base_model) == 20.0
+    assert top20_kl_candidate_to_target_limit_for_model(base_model) == 0.03
