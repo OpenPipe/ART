@@ -318,6 +318,7 @@ class DeepSeekV4Attention(MegatronModule):
         )
         return ans
 
+    @torch.compiler.disable
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -331,6 +332,15 @@ class DeepSeekV4Attention(MegatronModule):
         packed_seq_params=None,
         sequence_len_offset=None,
     ) -> torch.Tensor:
+        """Run DSV4 attention eager inside compiled transformer layers.
+
+        Torch 2.11 currently miscompiles this TP+SP autograd graph: the
+        attention module output receives a nonzero gradient, but the
+        zero-initialized LoRA branches inside the DSV4 attention path get zero
+        tangents. Keeping only this model-specific attention forward eager
+        preserves compiled surrounding layer code and correct first-step LoRA
+        gradients.
+        """
         if self.sequence_parallel:
             hidden_states = gather_from_sequence_parallel_region(
                 hidden_states, tensor_parallel_output_grad=False, group=self.tp_group
