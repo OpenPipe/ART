@@ -1131,6 +1131,18 @@ def _topology_artifacts_complete(topology_dir: Path, manifest: RunManifest) -> b
     return True
 
 
+def _topology_artifacts_current_and_complete(topology_dir: Path) -> bool:
+    """Returns whether cached topology artifacts can be reused for comparison."""
+    manifest_path = topology_dir / "manifest.json"
+    if not _manifest_matches_current_commit(manifest_path):
+        return False
+    try:
+        manifest = _load_manifest(topology_dir)
+    except Exception:
+        return False
+    return _topology_artifacts_complete(topology_dir, manifest)
+
+
 def _load_output_tensor(topology_dir: Path, step: StepTrace):
     """Loads one output trace tensor referenced by a step trace entry."""
     import torch
@@ -1458,15 +1470,12 @@ class VariantRunner:
     ) -> Path:
         """Executes one topology worker run and returns its output directory."""
         topology_dir = self.case_dir / output_slug
-        manifest_path = topology_dir / "manifest.json"
         if (
-            manifest_path.exists()
-            and not regenerate
-            and _manifest_matches_current_commit(manifest_path)
+            not regenerate
+            and topology_dir.exists()
+            and _topology_artifacts_current_and_complete(topology_dir)
         ):
-            manifest = _load_manifest(topology_dir)
-            if _topology_artifacts_complete(topology_dir, manifest):
-                return topology_dir
+            return topology_dir
         _replace_topology_dir(topology_dir)
         run_case_config = self.case_config
         request = WorkerRunRequest(
@@ -1524,7 +1533,7 @@ class VariantRunner:
             or not bundle_manifest.exists()
             or not bundle_format_current
             or not self.shared_init_path.exists()
-            or not _manifest_matches_current_commit(capture_manifest)
+            or not _topology_artifacts_current_and_complete(capture_manifest.parent)
         )
         run_oracle_topology = partial(
             self._run_topology,
@@ -1545,7 +1554,7 @@ class VariantRunner:
             regenerate
             or not oracle_manifest.exists()
             or not self.shared_init_path.exists()
-            or not _manifest_matches_current_commit(oracle_manifest)
+            or not _topology_artifacts_current_and_complete(oracle_manifest.parent)
         ):
             run_oracle_topology(
                 output_slug=self.oracle_slug,
