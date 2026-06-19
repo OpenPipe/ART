@@ -7,8 +7,11 @@ from typing import Any, Callable, cast
 import torch
 
 from .trace_uids import (
+    TRACE_ROW_TOKEN_UIDS_ATTR,
+    TRACE_UID_SPAN_ATTR,
     expand_token_uids_for_heads,
     extract_tensor_attr,
+    normalize_row_token_uids,
     row_token_uids_from_trace_sources,
 )
 
@@ -311,7 +314,8 @@ class ForwardTraceCapture:
                 if metadata:
                     self._trace_metadata_by_name[trace_module_name] = metadata
                 is_layer_output = (
-                    self.capture_layer_outputs and ".decoder.layers." in module_name
+                    self.capture_layer_outputs
+                    and ".decoder.layers." in module_name
                     and module_name.rsplit(".", 1)[-1].isdigit()
                 )
                 if not is_layer_output and not any(
@@ -563,7 +567,8 @@ class ForwardTraceCapture:
                 if isinstance(primary_output, torch.Tensor) and primary_output.ndim > 0
                 else None
             )
-            row_token_uids, _uid_span = self._row_token_uids_for_trace(
+            row_token_uids, _uid_span = self._row_token_uids_for_capture(
+                module_name=name,
                 inputs=inputs,
                 output=output,
                 module=module,
@@ -672,6 +677,47 @@ class ForwardTraceCapture:
             module=module,
             row_count=row_count,
             prefer_uid_span=prefer_uid_span,
+        )
+
+    @staticmethod
+    def _module_row_token_uids(
+        module: Any,
+        *,
+        row_count: int,
+    ) -> tuple[torch.Tensor | None, int | None]:
+        row_token_uids = normalize_row_token_uids(
+            getattr(module, TRACE_ROW_TOKEN_UIDS_ATTR, None)
+        )
+        if row_token_uids is None or int(row_token_uids.numel()) != int(row_count):
+            return None, None
+        uid_span = getattr(module, TRACE_UID_SPAN_ATTR, None)
+        return (
+            row_token_uids,
+            uid_span if isinstance(uid_span, int) and uid_span > 0 else None,
+        )
+
+    @classmethod
+    def _row_token_uids_for_capture(
+        cls,
+        *,
+        module_name: str,
+        inputs: Any,
+        output: Any,
+        module: Any,
+        row_count: int | None,
+    ) -> tuple[torch.Tensor | None, int | None]:
+        if row_count is not None and not cls._is_moe_expert_forward_module(module_name):
+            row_token_uids, uid_span = cls._module_row_token_uids(
+                module,
+                row_count=row_count,
+            )
+            if row_token_uids is not None:
+                return row_token_uids, uid_span
+        return cls._row_token_uids_for_trace(
+            inputs=inputs,
+            output=output,
+            module=module,
+            row_count=row_count,
         )
 
     @classmethod
