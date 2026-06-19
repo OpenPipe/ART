@@ -636,6 +636,20 @@ class Dsv4Handler(DefaultMoeHandler):
         partition_dim = getattr(tensor, "partition_dim", None)
         from megatron.core import parallel_state as ps
 
+        if (
+            _ORACLE_EXPERT_WEIGHT_RE.search(name) is not None
+            and partition_dim is not None
+            and int(partition_dim) >= 0
+        ):
+            etp_group = ps.get_expert_tensor_parallel_group(check_initialized=False)
+            etp_size = etp_group.size() if etp_group is not None else 1
+            if etp_size <= 1:
+                return tuple(tensor.shape), None, 0
+            dim = int(partition_dim)
+            logical_shape = list(tensor.shape)
+            logical_shape[dim] *= etp_size
+            return tuple(logical_shape), dim, etp_group.rank()
+
         tp_size = ps.get_tensor_model_parallel_world_size()
         tp_rank = ps.get_tensor_model_parallel_rank()
         if (
