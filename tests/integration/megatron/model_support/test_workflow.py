@@ -77,7 +77,7 @@ def test_dsv4_runtime_stages_use_full_model_resources() -> None:
         engine_args = stage.vllm.engine_args()
         assert "hf_overrides" not in engine_args
         assert engine_args.get("load_format") != "dummy"
-        assert engine_args["moe_backend"] == "marlin"
+        assert engine_args["moe_backend"] == "triton_unfused"
 
     for stage in (resources.merged_vllm_serving, resources.native_vllm_lora):
         assert stage is not None
@@ -93,7 +93,9 @@ def test_dsv4_runtime_stages_use_full_model_resources() -> None:
     )
     assert resources.native_vllm_lora is not None
     assert resources.native_vllm_lora.vllm is not None
-    assert resources.native_vllm_lora.vllm.engine_args()["moe_backend"] == "marlin"
+    assert (
+        resources.native_vllm_lora.vllm.engine_args()["moe_backend"] == "triton_unfused"
+    )
 
 
 def test_dsv4_resources_remap_to_four_high_vram_gpus(monkeypatch) -> None:
@@ -123,7 +125,7 @@ def test_dsv4_resources_remap_to_four_high_vram_gpus(monkeypatch) -> None:
     assert stage.vllm.gpu_ids == [2, 3]
     assert stage.vllm.tensor_parallel_size == 2
     assert stage.vllm.engine_args()["gpu_memory_utilization"] == 0.82
-    assert stage.vllm.engine_args()["moe_backend"] == "marlin"
+    assert stage.vllm.engine_args()["moe_backend"] == "triton_unfused"
     assert stage.allow_gpu_overlap is False
 
 

@@ -147,7 +147,7 @@ _DSV4_MERGED_VLLM_ENGINE_ARGS = {
 }
 _DSV4_LORA_VLLM_ENGINE_ARGS = {
     **_DSV4_COMMON_VLLM_ENGINE_ARGS,
-    "moe_backend": "marlin",
+    "moe_backend": "triton_unfused",
 }
 _DSV4_REDUCED_VLLM_ENGINE_ARGS = {
     **_DSV4_MERGED_VLLM_ENGINE_ARGS,
