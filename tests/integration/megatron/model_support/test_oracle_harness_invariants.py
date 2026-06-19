@@ -240,6 +240,27 @@ def test_forward_trace_capture_keeps_expert_uid_span_for_expert_modules() -> Non
     assert torch.equal(row_uids, torch.tensor([4, 7]))
 
 
+def test_forward_trace_restores_dense_non_cp_sequence_uids_before_sorting() -> None:
+    trace: dict[str, list[dict[str, Any]]] = {
+        "chunk0.module.decoder.layers.0.self_attention": [
+            {
+                "primary_output": torch.tensor([[1.0], [2.0], [3.0]]),
+                "row_token_uids": torch.tensor([10, 30, 20]),
+                "rank_meta": [
+                    {"cp_world_size": 1, "tp_rank": 0},
+                    {"cp_world_size": 1, "tp_rank": 1},
+                ],
+            }
+        ]
+    }
+
+    ForwardTraceCapture.canonicalize_trace(trace)
+
+    call = trace["chunk0.module.decoder.layers.0.self_attention"][0]
+    assert torch.equal(call["row_token_uids"], torch.tensor([0, 1, 2]))
+    assert torch.equal(call["primary_output"], torch.tensor([[1.0], [2.0], [3.0]]))
+
+
 def test_forward_trace_extracts_empty_router_topk_with_config_hint() -> None:
     topk = _extract_router_topk(
         (

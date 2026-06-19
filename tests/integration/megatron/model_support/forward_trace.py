@@ -73,6 +73,15 @@ def _safe_int(value: Any, default: int = 0) -> int:
         return default
 
 
+def _call_cp_world_size(call: dict[str, Any]) -> int:
+    rank_meta = call.get("rank_meta")
+    if isinstance(rank_meta, list) and rank_meta:
+        rank_meta = rank_meta[0]
+    if not isinstance(rank_meta, dict):
+        return 1
+    return _safe_int(rank_meta.get("cp_world_size"), 1)
+
+
 def _safe_ps_stat(name: str, default: int) -> int:
     """Reads one Megatron parallel-state integer when available."""
     try:
@@ -1421,6 +1430,35 @@ class ForwardTraceCapture:
                     )
 
     @classmethod
+    def _restore_non_cp_sequence_row_token_uids(
+        cls,
+        trace: dict[str, list[dict[str, Any]]],
+    ) -> None:
+        for module_name, calls in trace.items():
+            if cls._is_moe_expert_forward_module(module_name):
+                continue
+            for call in calls:
+                if _call_cp_world_size(call) > 1 or "row_uid_span" in call:
+                    continue
+                tensor = call.get("primary_output")
+                row_token_uids = call.get("row_token_uids")
+                if (
+                    not isinstance(tensor, torch.Tensor)
+                    or tensor.ndim == 0
+                    or not isinstance(row_token_uids, torch.Tensor)
+                    or row_token_uids.ndim != 1
+                    or int(row_token_uids.numel()) != int(tensor.shape[0])
+                    or not bool((row_token_uids >= 0).all().item())
+                    or int(row_token_uids.unique().numel())
+                    != int(row_token_uids.numel())
+                ):
+                    continue
+                call["row_token_uids"] = torch.arange(
+                    row_token_uids.numel(),
+                    dtype=torch.int64,
+                )
+
+    @classmethod
     def canonicalize_trace(
         cls,
         trace: dict[str, list[dict[str, Any]]],
@@ -1442,6 +1480,7 @@ class ForwardTraceCapture:
                 call[PRIMARY_OUTPUT_CANONICAL_KEY] = True
         cls._propagate_decoder_row_token_uids(trace)
         cls._propagate_attention_output_row_token_uids(trace)
+        cls._restore_non_cp_sequence_row_token_uids(trace)
         for calls in trace.values():
             for call in calls:
                 cls._canonicalize_call_row_token_order(call)
