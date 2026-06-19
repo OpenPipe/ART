@@ -235,7 +235,7 @@ HANDLER_WORKFLOW_RESOURCES: dict[str, HandlerWorkflowResources] = {
             high_vram_megatron=_DSV4_HIGH_VRAM_MEGATRON,
             high_vram_vllm=_DSV4_FULL_VLLM_EP2,
         ),
-        yes_no_trainability_variant="megatron_dedicated",
+        yes_no_trainability_variant="megatron_shared",
     ),
 }
 

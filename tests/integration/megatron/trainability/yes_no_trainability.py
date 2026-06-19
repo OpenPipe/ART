@@ -370,7 +370,16 @@ def _build_variant(
         allow_unvalidated_arch=allow_unvalidated_arch,
     )
     if variant_name == "megatron_shared":
-        shared_gpu_ids = _resolve_shared_gpu_ids()
+        if (
+            stage_resources is not None
+            and stage_resources.megatron is not None
+            and stage_resources.vllm is not None
+        ):
+            shared_gpu_ids = sorted(
+                {*stage_resources.megatron.gpu_ids, *stage_resources.vllm.gpu_ids}
+            )
+        else:
+            shared_gpu_ids = _resolve_shared_gpu_ids()
         if not cp_supported:
             shared_world_size = len(shared_gpu_ids)
             return _TrainabilityVariant(
@@ -506,9 +515,7 @@ def _build_internal_config(
     allow_unvalidated_arch: bool = False,
 ) -> dev.InternalModelConfig:
     shared = variant.placement_mode == "shared"
-    inference_gpu_ids = (
-        variant.inference_gpu_ids if not shared else _resolve_shared_gpu_ids()
-    )
+    inference_gpu_ids = variant.inference_gpu_ids
     workflow_resources = handler_workflow_resources_for_base_model(
         base_model,
         allow_unvalidated_arch=allow_unvalidated_arch,
@@ -561,6 +568,8 @@ def _build_internal_config(
     )
     if vllm_resources is not None:
         engine_args.update(vllm_resources.engine_args())
+    elif shared and stage_resources is not None and stage_resources.vllm is not None:
+        engine_args.update(stage_resources.vllm.extra_engine_args)
     engine_args["model"] = base_model
     internal_config = dev.InternalModelConfig(
         rollout_weights_mode=rollout_weights_mode
