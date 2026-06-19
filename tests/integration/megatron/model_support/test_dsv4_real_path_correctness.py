@@ -1,6 +1,8 @@
 from __future__ import annotations
 
-from contextlib import redirect_stderr, redirect_stdout
+from collections.abc import Iterator
+from contextlib import contextmanager, redirect_stderr, redirect_stdout
+import os
 from pathlib import Path
 
 import pytest
@@ -8,6 +10,7 @@ import pytest
 torch = pytest.importorskip("torch")
 
 from .oracle_harness import (  # noqa: E402
+    LIVE_TRAINING_LOG_PATH,
     MetricThresholdRule,
     OracleCaseConfig,
     OracleObjective,
@@ -23,7 +26,8 @@ from .oracle_harness import (  # noqa: E402
 BASE_MODEL = "deepseek-ai/DeepSeek-V4-Flash"
 NUM_LAYERS = 4
 REPO_ROOT = Path(__file__).resolve().parents[4]
-LOG_PATH = REPO_ROOT / ".local" / "dsv4_real_path_bf16_correctness.log"
+CORRECTNESS_LOG_PATH = REPO_ROOT / ".local" / "correctness.log"
+ORACLE_LIVE_TRAINING_LOG_ENV = "ART_ORACLE_LIVE_TRAINING_LOG"
 _EXPECTED_COMPRESS_RATIOS = [0, 0, 4, 128]
 _EXPECTED_LAYER_TYPES = [
     "sliding_attention",
@@ -42,28 +46,69 @@ def test_dsv4_real_path_bf16_correctness(
     gpu_count = available_gpu_count()
     reports: list[VariantReport] = []
     with capsys.disabled():
-        print(f"\nDSV4 real-path bf16 correctness log: {LOG_PATH}", flush=True)
-    LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
-    with LOG_PATH.open("w", encoding="utf-8") as log_file:
-        with redirect_stdout(log_file), redirect_stderr(log_file):
-            for objective in selected_oracle_objectives():
-                runner = VariantRunner(
-                    objective=objective,
-                    case_config=OracleCaseConfig(
-                        base_model=BASE_MODEL,
-                        precision="bf16",
-                        num_layers=NUM_LAYERS,
-                    ),
-                )
-                variants = _dsv4_bf16_variants(
-                    objective=objective,
-                    max_world_size=gpu_count,
-                )
-                if variants:
-                    reports.extend(runner.run_suite(variants))
+        print(
+            f"\nDSV4 real-path bf16 correctness log: {CORRECTNESS_LOG_PATH}",
+            flush=True,
+        )
+        print(
+            f"DSV4 real-path bf16 live training log: {LIVE_TRAINING_LOG_PATH}",
+            flush=True,
+        )
+    CORRECTNESS_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+    LIVE_TRAINING_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+    LIVE_TRAINING_LOG_PATH.write_text(
+        (
+            "DSV4 real-path bf16 live training log.\n"
+            "Topology worker output is appended below. If no topology sections "
+            "appear, complete cached artifacts were reused.\n"
+        ),
+        encoding="utf-8",
+    )
+    with _temporary_env(**{ORACLE_LIVE_TRAINING_LOG_ENV: str(LIVE_TRAINING_LOG_PATH)}):
+        with CORRECTNESS_LOG_PATH.open("w", encoding="utf-8") as log_file:
+            with redirect_stdout(log_file), redirect_stderr(log_file):
+                print("DSV4 real-path bf16 correctness")
+                print(f"base_model={BASE_MODEL}")
+                print(f"num_layers={NUM_LAYERS}")
+                print(f"precision=bf16")
+                print(f"visible_gpus={gpu_count}")
+                print(f"live_training_log={LIVE_TRAINING_LOG_PATH}")
+                for objective in selected_oracle_objectives():
+                    runner = VariantRunner(
+                        objective=objective,
+                        case_config=OracleCaseConfig(
+                            base_model=BASE_MODEL,
+                            precision="bf16",
+                            num_layers=NUM_LAYERS,
+                        ),
+                    )
+                    variants = _dsv4_bf16_variants(
+                        objective=objective,
+                        max_world_size=gpu_count,
+                    )
+                    if variants:
+                        reports.extend(runner.run_suite(variants))
     if not reports:
+        CORRECTNESS_LOG_PATH.write_text(
+            f"DSV4 real-path bf16 correctness skipped. Need at least 2 GPUs; found {gpu_count}.\n",
+            encoding="utf-8",
+        )
         pytest.skip(f"Need at least 2 GPUs for DSV4 correctness; found {gpu_count}.")
     assert all(report.signal == "pass" for report in reports)
+
+
+@contextmanager
+def _temporary_env(**updates: str) -> Iterator[None]:
+    previous = {key: os.environ.get(key) for key in updates}
+    os.environ.update(updates)
+    try:
+        yield
+    finally:
+        for key, value in previous.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
 
 
 def _dsv4_bf16_variants(
