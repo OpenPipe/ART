@@ -81,6 +81,7 @@ def test_dsv4_real_path_bf16_correctness(
                             precision="bf16",
                             num_layers=NUM_LAYERS,
                         ),
+                        use_fp32_lora_reference=False,
                     )
                     variants = _dsv4_bf16_variants(
                         objective=objective,
