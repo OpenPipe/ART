@@ -558,7 +558,7 @@ class Dsv4Handler(DefaultMoeHandler):
             tensor.zero_()
             return
         logical_shape, partition_dim, partition_rank = (
-            self._oracle_logical_tensor_for_rank(tensor)
+            self._oracle_logical_tensor_for_rank(name, tensor)
         )
         digest = hashlib.sha256(f"{seed}:{name}".encode("utf-8")).digest()
         key_seed = int.from_bytes(digest[:8], "little") % (2**31)
@@ -579,6 +579,7 @@ class Dsv4Handler(DefaultMoeHandler):
 
     @staticmethod
     def _oracle_logical_tensor_for_rank(
+        name: str,
         tensor: torch.Tensor,
     ) -> tuple[tuple[int, ...], int | None, int]:
         """Returns the logical full tensor shape and rank-local TP slice metadata.
@@ -589,20 +590,45 @@ class Dsv4Handler(DefaultMoeHandler):
         comparable to TP1 even when the layer implementation is correct.
         """
         partition_dim = getattr(tensor, "partition_dim", None)
-        if (
-            not bool(getattr(tensor, "tensor_model_parallel", False))
-            or partition_dim is None
-            or int(partition_dim) < 0
-        ):
-            return tuple(tensor.shape), None, 0
         from megatron.core import parallel_state as ps
 
-        dim = int(partition_dim)
         tp_size = ps.get_tensor_model_parallel_world_size()
         tp_rank = ps.get_tensor_model_parallel_rank()
+        if (
+            bool(getattr(tensor, "tensor_model_parallel", False))
+            and partition_dim is not None
+            and int(partition_dim) >= 0
+        ):
+            dim = int(partition_dim)
+        else:
+            dim = Dsv4Handler._oracle_dsv4_missing_tp_partition_dim(name)
+            if dim is None or tp_size <= 1:
+                return tuple(tensor.shape), None, 0
         logical_shape = list(tensor.shape)
         logical_shape[dim] *= tp_size
         return tuple(logical_shape), dim, tp_rank
+
+    @staticmethod
+    def _oracle_dsv4_missing_tp_partition_dim(name: str) -> int | None:
+        """Mirrors DSV4 Bridge TP shape rules for custom modules without TP attrs."""
+        if name.endswith(("embedding.word_embeddings.weight", "output_layer.weight")):
+            return 0
+        if name.endswith(
+            (
+                ".self_attention.wq_b.weight",
+                ".self_attention.wo_a.weight",
+                ".mlp.shared_experts.linear_fc1.weight",
+            )
+        ):
+            return 0
+        if name.endswith(
+            (
+                ".self_attention.wo_b.weight",
+                ".mlp.shared_experts.linear_fc2.weight",
+            )
+        ):
+            return 1
+        return None
 
     @staticmethod
     def _is_oracle_identity_weight(name: str) -> bool:
