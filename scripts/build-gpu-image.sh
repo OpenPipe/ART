@@ -38,6 +38,7 @@ prewarm_node_selector="${PREWARM_NODE_SELECTOR:-node.coreweave.cloud/class=gpu}"
 prewarm_timeout="${PREWARM_TIMEOUT:-30m}"
 prewarm_node_timeout="${PREWARM_NODE_TIMEOUT:-10m}"
 prewarm_node_retries="${PREWARM_NODE_RETRIES:-3}"
+prewarm_node_parallelism="${PREWARM_NODE_PARALLELISM:-3}"
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -496,6 +497,10 @@ EOF
 }
 
 if [[ "${prewarm_nodes}" == "true" ]]; then
+  if ! [[ "${prewarm_node_parallelism}" =~ ^[1-9][0-9]*$ ]]; then
+    echo "PREWARM_NODE_PARALLELISM must be a positive integer, got: ${prewarm_node_parallelism}" >&2
+    exit 1
+  fi
   mapfile -t gpu_nodes < <(
     "${kubectl_cmd[@]}" get nodes -l "${prewarm_node_selector}" \
       -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}' 2>/dev/null
@@ -512,16 +517,32 @@ if [[ "${prewarm_nodes}" == "true" ]]; then
       --dry-run=client -o yaml \
       | "${kubectl_cmd[@]}" apply -n "${prewarm_namespace}" -f -
 
-    echo "Stopping existing ${prewarm_name} DaemonSet before serialized node prewarm"
+    echo "Stopping existing ${prewarm_name} DaemonSet before batched node prewarm"
     "${kubectl_cmd[@]}" delete daemonset -n "${prewarm_namespace}" "${prewarm_name}" \
       --ignore-not-found --wait=true >/dev/null 2>&1 || true
 
+    prewarm_failures=0
+    prewarm_pids=()
     for gpu_node in "${gpu_nodes[@]}"; do
-      if ! prewarm_single_node "${gpu_node}"; then
-        dump_prewarm_diagnostics
-        exit 1
+      prewarm_single_node "${gpu_node}" &
+      prewarm_pids+=("$!")
+
+      if (( ${#prewarm_pids[@]} >= prewarm_node_parallelism )); then
+        if ! wait "${prewarm_pids[0]}"; then
+          prewarm_failures=1
+        fi
+        prewarm_pids=("${prewarm_pids[@]:1}")
       fi
     done
+    for prewarm_pid in "${prewarm_pids[@]}"; do
+      if ! wait "${prewarm_pid}"; then
+        prewarm_failures=1
+      fi
+    done
+    if [[ "${prewarm_failures}" != "0" ]]; then
+      dump_prewarm_diagnostics
+      exit 1
+    fi
 
     echo "Installing steady-state ${prewarm_name} DaemonSet"
     "${kubectl_cmd[@]}" apply -n "${prewarm_namespace}" -f - <<EOF
