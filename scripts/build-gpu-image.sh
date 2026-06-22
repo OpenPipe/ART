@@ -37,8 +37,15 @@ prewarm_image_pull_secret="${PREWARM_IMAGE_PULL_SECRET:-art-gpu-registry-auth}"
 prewarm_node_selector="${PREWARM_NODE_SELECTOR:-node.coreweave.cloud/class=gpu}"
 prewarm_timeout="${PREWARM_TIMEOUT:-30m}"
 prewarm_node_timeout="${PREWARM_NODE_TIMEOUT:-10m}"
-prewarm_node_retries="${PREWARM_NODE_RETRIES:-3}"
+prewarm_node_retries="${PREWARM_NODE_RETRIES:-12}"
 prewarm_node_parallelism="${PREWARM_NODE_PARALLELISM:-3}"
+prewarm_tag_convergence_attempts="${PREWARM_TAG_CONVERGENCE_ATTEMPTS:-120}"
+prewarm_tag_convergence_interval="${PREWARM_TAG_CONVERGENCE_INTERVAL:-15}"
+prewarm_clear_mutable_tag="${PREWARM_CLEAR_MUTABLE_TAG:-true}"
+prewarm_crictl_image="${PREWARM_CRICTL_IMAGE:-alpine:3.20}"
+prewarm_crictl_version="${PREWARM_CRICTL_VERSION:-v1.36.0}"
+prewarm_containerd_socket="${PREWARM_CONTAINERD_SOCKET:-/run/containerd/containerd.sock}"
+prewarm_containerd_mount="${prewarm_containerd_socket%/*}"
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -408,6 +415,22 @@ prewarm_display="${prewarm_image}"
 if [[ -n "${prewarm_refresh_tag_image}" ]]; then
   prewarm_display="${prewarm_image} and refreshing ${prewarm_refresh_tag_image}"
 fi
+prewarm_clear_tag_images=()
+if [[ -n "${prewarm_refresh_tag_image}" ]]; then
+  prewarm_clear_tag_images+=("${prewarm_refresh_tag_image}")
+  case "${prewarm_refresh_tag_image}" in
+    docker.io/*)
+      prewarm_clear_tag_images+=(
+        "images.coreweave.com/cluster-images/${prewarm_refresh_tag_image#docker.io/}"
+      )
+      ;;
+    registry-1.docker.io/*)
+      prewarm_clear_tag_images+=(
+        "images.coreweave.com/cluster-images/${prewarm_refresh_tag_image#registry-1.docker.io/}"
+      )
+      ;;
+  esac
+fi
 
 dump_prewarm_diagnostics() {
   echo "::group::Prewarm diagnostics"
@@ -435,6 +458,30 @@ sanitize_k8s_name_part() {
 }
 
 render_prewarm_init_containers() {
+  if [[ -n "${prewarm_refresh_tag_image}" && "${prewarm_clear_mutable_tag}" == "true" ]]; then
+    cat <<EOF
+    - name: clear-tag
+      image: ${prewarm_crictl_image}
+      imagePullPolicy: IfNotPresent
+      securityContext:
+        privileged: true
+      command:
+        - sh
+        - -lc
+        - |
+          set -eu
+          wget -qO /tmp/crictl.tar.gz https://github.com/kubernetes-sigs/cri-tools/releases/download/${prewarm_crictl_version}/crictl-${prewarm_crictl_version}-linux-amd64.tar.gz
+          tar -xzf /tmp/crictl.tar.gz -C /usr/local/bin crictl
+$(render_clear_tag_commands)
+      volumeMounts:
+        - name: containerd-socket
+          mountPath: ${prewarm_containerd_mount}
+      resources:
+        requests:
+          cpu: 10m
+          memory: 32Mi
+EOF
+  fi
   cat <<EOF
     - name: prepull
       image: ${prewarm_image}
@@ -457,6 +504,173 @@ EOF
           memory: 16Mi
 EOF
   fi
+}
+
+render_prewarm_host_volumes() {
+  if [[ -n "${prewarm_refresh_tag_image}" && "${prewarm_clear_mutable_tag}" == "true" ]]; then
+    cat <<EOF
+volumes:
+  - name: containerd-socket
+    hostPath:
+      path: ${prewarm_containerd_mount}
+      type: Directory
+EOF
+  fi
+}
+
+render_clear_tag_commands() {
+  local image
+
+  for image in "${prewarm_clear_tag_images[@]}"; do
+    printf '          crictl --runtime-endpoint "unix://%s" rmi '\''%s'\'' || true\n' \
+      "${prewarm_containerd_socket}" "${image}"
+  done
+}
+
+render_tag_check_init_containers() {
+  local clear_mutable_tag="${1:-${prewarm_clear_mutable_tag}}"
+
+  if [[ -n "${prewarm_refresh_tag_image}" && "${clear_mutable_tag}" == "true" ]]; then
+    cat <<EOF
+    - name: clear-tag
+      image: ${prewarm_crictl_image}
+      imagePullPolicy: IfNotPresent
+      securityContext:
+        privileged: true
+      command:
+        - sh
+        - -lc
+        - |
+          set -eu
+          wget -qO /tmp/crictl.tar.gz https://github.com/kubernetes-sigs/cri-tools/releases/download/${prewarm_crictl_version}/crictl-${prewarm_crictl_version}-linux-amd64.tar.gz
+          tar -xzf /tmp/crictl.tar.gz -C /usr/local/bin crictl
+$(render_clear_tag_commands)
+      volumeMounts:
+        - name: containerd-socket
+          mountPath: ${prewarm_containerd_mount}
+      resources:
+        requests:
+          cpu: 10m
+          memory: 32Mi
+EOF
+  fi
+  cat <<EOF
+    - name: refresh-tag
+      image: ${prewarm_refresh_tag_image}
+      imagePullPolicy: Always
+      command: ["bash", "-lc", "true"]
+      resources:
+        requests:
+          cpu: 10m
+          memory: 16Mi
+EOF
+}
+
+pod_init_image_id() {
+  local pod="$1"
+  local container="$2"
+
+  "${kubectl_cmd[@]}" get pod -n "${prewarm_namespace}" "${pod}" \
+    -o jsonpath="{range .status.initContainerStatuses[?(@.name==\"${container}\")]}{.imageID}{end}" \
+    2>/dev/null || true
+}
+
+verify_prewarm_refresh_tag_digest() {
+  local pod="$1"
+  local image_id
+
+  if [[ -z "${prewarm_refresh_tag_image}" || -z "${image_digest}" ]]; then
+    return 0
+  fi
+
+  image_id="$(pod_init_image_id "${pod}" refresh-tag)"
+  if [[ "${image_id}" == *"@${image_digest}" ]]; then
+    echo "Mutable tag ${prewarm_refresh_tag_image} resolved to ${image_id} in pod ${pod}"
+    return 0
+  fi
+
+  echo "Mutable tag ${prewarm_refresh_tag_image} resolved to ${image_id:-<missing>} in pod ${pod}; expected @${image_digest}" >&2
+  return 1
+}
+
+wait_for_mutable_tag_convergence() {
+  local node="$1"
+  local pod="${prewarm_name}-tag-check"
+  local attempt
+  local clear_mutable_tag
+  local image_id
+
+  if [[ -z "${prewarm_refresh_tag_image}" || -z "${image_digest}" ]]; then
+    return 0
+  fi
+  if ! [[ "${prewarm_tag_convergence_attempts}" =~ ^[1-9][0-9]*$ ]]; then
+    echo "PREWARM_TAG_CONVERGENCE_ATTEMPTS must be a positive integer, got: ${prewarm_tag_convergence_attempts}" >&2
+    exit 1
+  fi
+  if ! [[ "${prewarm_tag_convergence_interval}" =~ ^[1-9][0-9]*$ ]]; then
+    echo "PREWARM_TAG_CONVERGENCE_INTERVAL must be a positive integer number of seconds, got: ${prewarm_tag_convergence_interval}" >&2
+    exit 1
+  fi
+
+  echo "Waiting for ${prewarm_refresh_tag_image} to resolve to ${image_digest} from Kubernetes pulls"
+  for attempt in $(seq 1 "${prewarm_tag_convergence_attempts}"); do
+    clear_mutable_tag=false
+    if [[ "${attempt}" == "1" ]]; then
+      clear_mutable_tag="${prewarm_clear_mutable_tag}"
+    fi
+    "${kubectl_cmd[@]}" delete pod -n "${prewarm_namespace}" "${pod}" \
+      --ignore-not-found --wait=true >/dev/null 2>&1 || true
+    "${kubectl_cmd[@]}" apply -n "${prewarm_namespace}" -f - <<EOF
+apiVersion: v1
+kind: Pod
+metadata:
+  name: ${pod}
+  labels:
+    app: ${prewarm_name}-oneshot
+    art.openpipe/prewarm-name: ${prewarm_name}
+    art.openpipe/prewarm-token: "${timestamp}-${art_short_sha}"
+spec:
+  restartPolicy: Never
+  nodeName: ${node}
+  imagePullSecrets:
+    - name: ${prewarm_image_pull_secret}
+  tolerations:
+    - operator: Exists
+  initContainers:
+$(render_tag_check_init_containers "${clear_mutable_tag}")
+  containers:
+    - name: pause
+      image: registry.k8s.io/pause:3.10
+      resources:
+        requests:
+          cpu: 10m
+          memory: 16Mi
+$(render_prewarm_host_volumes | sed 's/^/  /')
+EOF
+
+    if "${kubectl_cmd[@]}" wait -n "${prewarm_namespace}" \
+      --for=condition=Ready "pod/${pod}" \
+      --timeout="${prewarm_node_timeout}" >/dev/null 2>&1; then
+      image_id="$(pod_init_image_id "${pod}" refresh-tag)"
+      if [[ "${image_id}" == *"@${image_digest}" ]]; then
+        echo "Mutable tag ${prewarm_refresh_tag_image} converged to ${image_id}"
+        "${kubectl_cmd[@]}" delete pod -n "${prewarm_namespace}" "${pod}" \
+          --ignore-not-found --wait=true >/dev/null 2>&1 || true
+        return 0
+      fi
+      echo "Mutable tag check ${attempt}/${prewarm_tag_convergence_attempts} saw ${image_id:-<missing>}; expected @${image_digest}"
+    else
+      echo "Mutable tag check ${attempt}/${prewarm_tag_convergence_attempts} did not become ready"
+      "${kubectl_cmd[@]}" describe pod -n "${prewarm_namespace}" "${pod}" || true
+    fi
+
+    "${kubectl_cmd[@]}" delete pod -n "${prewarm_namespace}" "${pod}" \
+      --ignore-not-found --wait=true >/dev/null 2>&1 || true
+    sleep "${prewarm_tag_convergence_interval}"
+  done
+
+  echo "Timed out waiting for ${prewarm_refresh_tag_image} to resolve to ${image_digest}" >&2
+  return 1
 }
 
 prewarm_single_node() {
@@ -501,13 +715,22 @@ $(render_prewarm_init_containers)
         requests:
           cpu: 10m
           memory: 16Mi
+$(render_prewarm_host_volumes | sed 's/^/  /')
 EOF
     if "${kubectl_cmd[@]}" wait -n "${prewarm_namespace}" \
       --for=condition=Ready "pod/${pod}" \
       --timeout="${prewarm_node_timeout}"; then
+      if verify_prewarm_refresh_tag_digest "${pod}"; then
+        "${kubectl_cmd[@]}" delete pod -n "${prewarm_namespace}" "${pod}" \
+          --ignore-not-found --wait=true >/dev/null 2>&1 || true
+        return 0
+      fi
+
+      echo "Prewarm mutable tag verification failed on node ${node}; retrying after tag convergence delay"
       "${kubectl_cmd[@]}" delete pod -n "${prewarm_namespace}" "${pod}" \
         --ignore-not-found --wait=true >/dev/null 2>&1 || true
-      return 0
+      sleep "$((attempt * 10))"
+      continue
     fi
 
     echo "Prewarm failed on node ${node}; pod diagnostics:"
@@ -545,6 +768,11 @@ if [[ "${prewarm_nodes}" == "true" ]]; then
     echo "Stopping existing ${prewarm_name} DaemonSet before batched node prewarm"
     "${kubectl_cmd[@]}" delete daemonset -n "${prewarm_namespace}" "${prewarm_name}" \
       --ignore-not-found --wait=true >/dev/null 2>&1 || true
+
+    if ! wait_for_mutable_tag_convergence "${gpu_nodes[0]}"; then
+      dump_prewarm_diagnostics
+      exit 1
+    fi
 
     prewarm_failures=0
     prewarm_pids=()
@@ -607,8 +835,23 @@ $(render_prewarm_init_containers | sed 's/^/    /')
             requests:
               cpu: 10m
               memory: 16Mi
+$(render_prewarm_host_volumes | sed 's/^/      /')
 EOF
     if ! "${kubectl_cmd[@]}" rollout status -n "${prewarm_namespace}" "daemonset/${prewarm_name}" --timeout="${prewarm_timeout}"; then
+      dump_prewarm_diagnostics
+      exit 1
+    fi
+    mapfile -t steady_pods < <(
+      "${kubectl_cmd[@]}" get pods -n "${prewarm_namespace}" -l "app=${prewarm_name}" \
+        -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}' 2>/dev/null
+    )
+    steady_failures=0
+    for steady_pod in "${steady_pods[@]}"; do
+      if ! verify_prewarm_refresh_tag_digest "${steady_pod}"; then
+        steady_failures=1
+      fi
+    done
+    if [[ "${steady_failures}" != "0" ]]; then
       dump_prewarm_diagnostics
       exit 1
     fi
