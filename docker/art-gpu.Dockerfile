@@ -82,7 +82,6 @@ ARG SKYPILOT_VERSION
 ARG SKY_REMOTE_RAY_VERSION
 
 ENV CUDA_HOME=/usr/local/cuda-12.8 \
-    ART_IMAGE_REVISION=${ART_SHA} \
     PATH=/home/sky/.local/bin:/opt/conda/bin:${PATH} \
     UV_CACHE_DIR=/opt/uv-cache \
     UV_PYTHON_INSTALL_DIR=/opt/uv-python \
@@ -164,3 +163,5 @@ RUN mkdir -p "${HOME}/.local/bin" "${HOME}/.sky/sky_app" "${HOME}/sky_workdir" \
  && VIRTUAL_ENV="${HOME}/skypilot-runtime" UV_LINK_MODE=copy UV_SYSTEM_PYTHON=false env -u PYTHONPATH -C "${HOME}" uv pip uninstall skypilot \
  && printf '%s\n' "${HOME}/skypilot-runtime/bin/python" > "${HOME}/.sky/python_path" \
  && VIRTUAL_ENV="${HOME}/skypilot-runtime" UV_LINK_MODE=copy UV_SYSTEM_PYTHON=false env -u PYTHONPATH -C "${HOME}" uv run --no-project --no-config which ray > "${HOME}/.sky/ray_path"
+
+ENV ART_IMAGE_REVISION=${ART_SHA}
