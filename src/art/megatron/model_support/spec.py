@@ -63,7 +63,6 @@ class ModelSupportSpec(BaseModel):
     model_names: tuple[str, ...] = ()
     default_target_modules: tuple[str, ...]
     default_rollout_weights_mode: RolloutWeightsMode = "lora"
-    default_vllm_max_loras: int = 2
     native_vllm_lora_status: NativeVllmLoraStatus = "disabled"
     dependency_floor: DependencyFloor = Field(default_factory=DependencyFloor)
 

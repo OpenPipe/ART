@@ -166,7 +166,7 @@ async def test_megatron_runtime_sleep_and_wake_use_runtime_routes(
     assert service._is_sleeping is False
 
 
-def test_megatron_dsv4_runtime_engine_args_use_single_lora_slot(
+def test_megatron_dsv4_runtime_engine_args_use_standard_lora_slots(
     tmp_path: Path,
 ) -> None:
     service = MegatronService(
@@ -179,7 +179,7 @@ def test_megatron_dsv4_runtime_engine_args_use_single_lora_slot(
     engine_args = service._runtime_engine_args(None)
 
     assert engine_args["enable_lora"] is True
-    assert engine_args["max_loras"] == 1
+    assert engine_args["max_loras"] == 2
 
 
 @pytest.mark.asyncio

@@ -41,7 +41,6 @@ from .lora import LORA_ALPHA, default_lora_rank_for_handler
 from .model_support.lora_disk import normalize_lora_checkpoint_to_vllm
 from .model_support.registry import (
     UnsupportedModelArchitectureError,
-    default_vllm_max_loras_for_model,
     model_uses_expert_parallel,
 )
 from .runtime.client import (
@@ -400,13 +399,7 @@ class MegatronService:
             engine_args.pop("max_loras", None)
         else:
             engine_args["enable_lora"] = True
-            engine_args.setdefault(
-                "max_loras",
-                default_vllm_max_loras_for_model(
-                    self.base_model,
-                    allow_unvalidated_arch=self._allow_unvalidated_arch,
-                ),
-            )
+            engine_args.setdefault("max_loras", 2)
             self._configure_vllm_lora_target_modules(engine_args)
         for key in ("model", "served_model_name"):
             engine_args.pop(key, None)
