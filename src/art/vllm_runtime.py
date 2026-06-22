@@ -35,6 +35,8 @@ _TILELANG_ENV_KEYS = (
     "TL_COMPOSABLE_KERNEL_PATH",
 )
 _TILELANG_PATH_MARKERS = ("/site-packages/tilelang/", "\\site-packages\\tilelang\\")
+_FLASHINFER_WORKSPACE_ENV = "FLASHINFER_WORKSPACE_BASE"
+_ART_FLASHINFER_WORKSPACE_ENV = "ART_VLLM_RUNTIME_FLASHINFER_WORKSPACE_BASE"
 
 
 class VllmRuntimeLaunchConfig(BaseModel):
@@ -191,11 +193,15 @@ def _drop_tilelang_env_paths(value: str | None) -> str | None:
 
 
 def _vllm_runtime_subprocess_env() -> dict[str, str]:
-    """Build a child env without TileLang's vendored TVM paths.
+    """Build a child env isolated from runtime-specific JIT path leaks.
 
     TileLang mutates process env during import. If a vLLM runtime child inherits
     those paths, spawn workers can load two TVM FFI libraries and abort on
     duplicate global registration during model load.
+
+    FlashInfer writes absolute source/include paths into generated build.ninja
+    files. Sharing its default ~/.cache/flashinfer across source worktrees can
+    make one runtime compile kernels from another runtime's venv.
     """
     env = os.environ.copy()
     for key in _TILELANG_ENV_KEYS:
@@ -204,6 +210,7 @@ def _vllm_runtime_subprocess_env() -> dict[str, str]:
             env.pop(key, None)
         else:
             env[key] = value
+    env[_FLASHINFER_WORKSPACE_ENV] = str(_vllm_runtime_flashinfer_workspace_base())
     return env
 
 
@@ -358,6 +365,16 @@ def get_vllm_runtime_cache_root() -> Path:
     if override:
         return Path(override).expanduser()
     return Path.home() / ".cache" / "art" / "vllm_runtime"
+
+
+def _vllm_runtime_flashinfer_workspace_base() -> Path:
+    override = os.environ.get(_ART_FLASHINFER_WORKSPACE_ENV)
+    if override:
+        return Path(override).expanduser()
+    runtime_root = get_vllm_runtime_project_root()
+    if runtime_root.exists():
+        return runtime_root.resolve().parent / "scratch" / "vllm_runtime_flashinfer"
+    return get_vllm_runtime_cache_root().expanduser() / "flashinfer_workspace"
 
 
 def _bundled_runtime_dir() -> Path:

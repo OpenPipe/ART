@@ -145,6 +145,61 @@ def test_get_vllm_runtime_nccl_so_path_queries_runtime_python(
     assert seen["text"] is True
 
 
+def test_vllm_runtime_subprocess_env_isolates_flashinfer_for_source_runtime(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    runtime_root = tmp_path / "vllm_runtime"
+    runtime_root.mkdir()
+    monkeypatch.setenv("ART_VLLM_RUNTIME_PROJECT_ROOT", str(runtime_root))
+    monkeypatch.setenv("FLASHINFER_WORKSPACE_BASE", "/shared/flashinfer")
+    monkeypatch.setenv(
+        "PYTHONPATH",
+        os.pathsep.join(
+            [
+                "/keep",
+                "/venv/lib/python3.12/site-packages/tilelang/vendored",
+            ]
+        ),
+    )
+
+    env = runtime._vllm_runtime_subprocess_env()
+
+    assert env["PYTHONPATH"] == "/keep"
+    assert env["FLASHINFER_WORKSPACE_BASE"] == str(
+        tmp_path / "scratch" / "vllm_runtime_flashinfer"
+    )
+
+
+def test_vllm_runtime_subprocess_env_isolates_flashinfer_for_managed_runtime(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    cache_root = tmp_path / "runtime_cache"
+    monkeypatch.setenv("ART_VLLM_RUNTIME_PROJECT_ROOT", str(tmp_path / "missing"))
+    monkeypatch.setenv("ART_VLLM_RUNTIME_CACHE_DIR", str(cache_root))
+    monkeypatch.setenv("FLASHINFER_WORKSPACE_BASE", "/shared/flashinfer")
+
+    env = runtime._vllm_runtime_subprocess_env()
+
+    assert env["FLASHINFER_WORKSPACE_BASE"] == str(cache_root / "flashinfer_workspace")
+
+
+def test_vllm_runtime_subprocess_env_honors_flashinfer_workspace_override(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    override = tmp_path / "explicit_flashinfer"
+    monkeypatch.setenv(
+        "ART_VLLM_RUNTIME_FLASHINFER_WORKSPACE_BASE",
+        str(override),
+    )
+
+    env = runtime._vllm_runtime_subprocess_env()
+
+    assert env["FLASHINFER_WORKSPACE_BASE"] == str(override)
+
+
 def test_cleanup_old_managed_runtimes_only_deletes_marked_venvs(
     monkeypatch,
     tmp_path: Path,
