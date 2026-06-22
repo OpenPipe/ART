@@ -14,6 +14,8 @@ from art.unsloth.service import UnslothService
 
 
 class _AsyncOkResponse:
+    status_code = 200
+
     def raise_for_status(self) -> None:
         return None
 
@@ -38,6 +40,41 @@ class _RecordingAsyncClient:
         timeout: float,
     ) -> _AsyncOkResponse:
         self._posts.append((url, params, timeout))
+        return _AsyncOkResponse()
+
+
+class _RecordingVllmClient:
+    def __init__(self) -> None:
+        self.gets: list[tuple[str, dict[str, str] | None, float]] = []
+        self.posts: list[
+            tuple[str, dict[str, object], dict[str, str] | None, float]
+        ] = []
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, exc_type, exc, tb):
+        return None
+
+    async def get(
+        self,
+        url: str,
+        *,
+        headers: dict[str, str] | None = None,
+        timeout: float,
+    ) -> _AsyncOkResponse:
+        self.gets.append((url, headers, timeout))
+        return _AsyncOkResponse()
+
+    async def post(
+        self,
+        url: str,
+        *,
+        json: dict[str, object],
+        headers: dict[str, str] | None = None,
+        timeout: float,
+    ) -> _AsyncOkResponse:
+        self.posts.append((url, json, headers, timeout))
         return _AsyncOkResponse()
 
 
@@ -184,6 +221,106 @@ async def test_megatron_dedicated_merged_start_syncs_initial_weights(
         step=0,
         megatron_topology=None,
     )
+
+
+@pytest.mark.asyncio
+async def test_megatron_external_vllm_start_attaches_and_loads_mapped_lora(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service = MegatronService(
+        model_name="test-model",
+        base_model="Qwen/Qwen3-0.6B",
+        config={
+            "trainer_gpu_ids": [2, 3],
+            "rollout_weights_mode": "lora",
+            "vllm_runtime": {
+                "mode": "external",
+                "server_url": "http://inference-node:8000",
+                "api_key": "secret",
+                "local_checkpoint_root": "/mnt/ws_pvc/ws",
+                "server_checkpoint_root": "/remote/ws",
+            },
+        },
+        output_dir=str(tmp_path),
+    )
+    client = _RecordingVllmClient()
+    monkeypatch.setattr(httpx, "AsyncClient", lambda: client)
+    monkeypatch.setattr(
+        service,
+        "_resolve_active_lora_path",
+        lambda: "/mnt/ws_pvc/ws/checkpoints/model/0000",
+    )
+
+    location = await service.start_openai_server(None)
+
+    assert location == ("http://inference-node:8000", 0)
+    assert client.gets == [
+        (
+            "http://inference-node:8000/health",
+            {"Authorization": "Bearer secret"},
+            5.0,
+        ),
+        (
+            "http://inference-node:8000/v1/models",
+            {"Authorization": "Bearer secret"},
+            5.0,
+        ),
+    ]
+    assert client.posts == [
+        (
+            "http://inference-node:8000/v1/load_lora_adapter",
+            {
+                "lora_name": "test-model@0",
+                "lora_path": "/remote/ws/checkpoints/model/0000",
+                "load_inplace": True,
+            },
+            {"Authorization": "Bearer secret"},
+            60.0,
+        )
+    ]
+
+
+@pytest.mark.asyncio
+async def test_unsloth_external_vllm_start_attaches_and_loads_lora(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service = UnslothService(
+        model_name="test-model",
+        base_model="Qwen/Qwen3-0.6B",
+        config={
+            "rollout_weights_mode": "lora",
+            "vllm_runtime": {
+                "mode": "external",
+                "server_url": "http://inference-node:8000/v1",
+            },
+        },
+        output_dir=str(tmp_path),
+    )
+    client = _RecordingVllmClient()
+    monkeypatch.setattr(httpx, "AsyncClient", lambda: client)
+    monkeypatch.setattr(
+        "art.unsloth.service.get_last_checkpoint_dir",
+        lambda _output_dir: "/mnt/ws_pvc/ws/checkpoints/model/0000",
+    )
+    monkeypatch.setattr("art.unsloth.service.get_step_from_dir", lambda _output_dir: 0)
+
+    location = await service.start_openai_server(None)
+
+    assert location == ("http://inference-node:8000", 0)
+    assert client.posts == [
+        (
+            "http://inference-node:8000/v1/load_lora_adapter",
+            {
+                "lora_name": "test-model@0",
+                "lora_path": "/mnt/ws_pvc/ws/checkpoints/model/0000",
+                "load_inplace": True,
+            },
+            None,
+            60.0,
+        )
+    ]
 
 
 @pytest.mark.asyncio

@@ -43,6 +43,10 @@ from art.utils.s3 import (
     pull_model_from_s3,
     push_model_to_s3,
 )
+from art.vllm_runtime import (
+    get_external_vllm_runtime_config,
+    openai_base_url_from_vllm_server_url,
+)
 from mp_actors import close_proxy, move_to_child_process
 
 from .. import dev
@@ -534,9 +538,11 @@ class LocalBackend(Backend):
                 os.environ["IMPORT_UNSLOTH"] = "1"
 
             if dedicated:
-                os.environ["CUDA_VISIBLE_DEVICES"] = ",".join(
-                    str(g) for g in config["trainer_gpu_ids"]
-                )
+                trainer_gpu_ids = config.get("trainer_gpu_ids")
+                if trainer_gpu_ids:
+                    os.environ["CUDA_VISIBLE_DEVICES"] = ",".join(
+                        str(g) for g in trainer_gpu_ids
+                    )
 
             self._services[model.name] = service_class(
                 model_name=model.name,
@@ -738,8 +744,15 @@ class LocalBackend(Backend):
         service = await self._get_service(model)
         host, port = await service.start_openai_server(config=resolved_config)
 
-        base_url = f"http://{host}:{port}/v1"
-        api_key = server_args.get("api_key") or "default"
+        external_runtime = get_external_vllm_runtime_config(internal_config)
+        if external_runtime is not None:
+            base_url = openai_base_url_from_vllm_server_url(external_runtime.server_url)
+            api_key = (
+                server_args.get("api_key") or external_runtime.api_key or "default"
+            )
+        else:
+            base_url = f"http://{host}:{port}/v1"
+            api_key = server_args.get("api_key") or "default"
 
         return base_url, api_key
 

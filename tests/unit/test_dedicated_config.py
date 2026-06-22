@@ -5,7 +5,11 @@ import tempfile
 import pytest
 
 from art.dev.model import InternalModelConfig
-from art.dev.validate import is_dedicated_mode, validate_dedicated_config
+from art.dev.validate import (
+    is_dedicated_mode,
+    is_external_vllm_mode,
+    validate_dedicated_config,
+)
 
 
 def test_shared_mode_empty_config():
@@ -20,6 +24,14 @@ def test_shared_mode_with_other_keys():
 
 def test_dedicated_mode_detected():
     config = InternalModelConfig(trainer_gpu_ids=[0], inference_gpu_ids=[1])
+    assert is_dedicated_mode(config) is True
+
+
+def test_external_vllm_mode_detected():
+    config = InternalModelConfig(
+        vllm_runtime={"mode": "external", "server_url": "http://inference:8000"}
+    )
+    assert is_external_vllm_mode(config) is True
     assert is_dedicated_mode(config) is True
 
 
@@ -48,6 +60,35 @@ def test_valid_dedicated_four_gpus():
 def test_only_trainer_gpu_ids():
     with pytest.raises(ValueError, match="must both be set or both unset"):
         validate_dedicated_config(InternalModelConfig(trainer_gpu_ids=[0]))
+
+
+def test_external_vllm_allows_trainer_gpu_ids_without_inference_gpu_ids():
+    validate_dedicated_config(
+        InternalModelConfig(
+            trainer_gpu_ids=[2, 3],
+            vllm_runtime={"mode": "external", "server_url": "http://inference:8000"},
+        )
+    )
+
+
+def test_external_vllm_rejects_merged_rollout_weights():
+    with pytest.raises(ValueError, match="external.*rollout_weights_mode='lora'"):
+        validate_dedicated_config(
+            InternalModelConfig(
+                rollout_weights_mode="merged",
+                vllm_runtime={
+                    "mode": "external",
+                    "server_url": "http://inference:8000",
+                },
+            )
+        )
+
+
+def test_external_vllm_requires_server_url():
+    with pytest.raises(ValueError, match="server_url is required"):
+        validate_dedicated_config(
+            InternalModelConfig(vllm_runtime={"mode": "external"})
+        )
 
 
 def test_only_inference_gpu_ids():
@@ -203,6 +244,26 @@ def test_get_model_config_dedicated_mode():
         assert result["engine_args"]["enable_sleep_mode"] is False
         assert "fast_inference" not in result["init_args"]
         assert result["rollout_weights_mode"] == "lora"
+
+
+def test_get_model_config_preserves_external_vllm_runtime():
+    from art.dev.get_model_config import get_model_config
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        config = InternalModelConfig(
+            trainer_gpu_ids=[2, 3],
+            vllm_runtime={
+                "mode": "external",
+                "server_url": "http://inference:8000",
+                "local_checkpoint_root": "/mnt/ws_pvc/ws",
+                "server_checkpoint_root": "/mnt/ws_pvc/ws",
+            },
+        )
+        result = get_model_config("test-model", tmpdir, config)
+        assert result["trainer_gpu_ids"] == [2, 3]
+        assert "inference_gpu_ids" not in result
+        assert result["engine_args"]["enable_sleep_mode"] is False
+        assert result["vllm_runtime"] == config["vllm_runtime"]
 
 
 def test_get_model_config_dedicated_preserves_user_engine_args():

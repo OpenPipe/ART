@@ -10,7 +10,8 @@ import shlex
 import shutil
 import subprocess
 import tempfile
-from typing import Any, Callable, Literal, TypedDict
+from typing import Any, Callable, Literal, Mapping, TypedDict
+from urllib.parse import urlparse
 
 import httpx
 from pydantic import BaseModel, ConfigDict, Field
@@ -43,11 +44,22 @@ class VllmRuntimeLaunchConfig(BaseModel):
     port: int
     host: str = "127.0.0.1"
     cuda_visible_devices: str
-    lora_path: str
+    lora_path: str | None = None
     served_model_name: str
     rollout_weights_mode: Literal["lora", "merged"]
     engine_args: dict[str, object] = Field(default_factory=dict)
     server_args: dict[str, object] = Field(default_factory=dict)
+
+
+class ExternalVllmRuntimeConfig(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    mode: Literal["external"]
+    server_url: str
+    api_key: str | None = None
+    local_checkpoint_root: str | None = None
+    server_checkpoint_root: str | None = None
+    health_timeout_s: float = Field(default=120.0, gt=0)
 
 
 class VllmRuntimeManifest(BaseModel):
@@ -81,6 +93,90 @@ class VllmRuntimeInstallMarker(BaseModel):
 
 class VllmRuntimeRequestKwargs(TypedDict, total=False):
     headers: dict[str, str]
+
+
+def is_external_vllm_runtime(config: Mapping[str, Any]) -> bool:
+    runtime_config = config.get("vllm_runtime")
+    return (
+        isinstance(runtime_config, Mapping) and runtime_config.get("mode") == "external"
+    )
+
+
+def get_external_vllm_runtime_config(
+    config: Mapping[str, Any],
+) -> ExternalVllmRuntimeConfig | None:
+    runtime_config = config.get("vllm_runtime")
+    if not isinstance(runtime_config, Mapping):
+        return None
+    if runtime_config.get("mode", "managed") != "external":
+        return None
+    return ExternalVllmRuntimeConfig.model_validate(runtime_config)
+
+
+def normalize_vllm_server_url(server_url: str) -> str:
+    normalized = server_url.rstrip("/")
+    if normalized.endswith("/v1"):
+        normalized = normalized[:-3].rstrip("/")
+    parsed = urlparse(normalized)
+    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+        raise ValueError(
+            f"External vLLM server_url must be an HTTP URL: {server_url!r}"
+        )
+    return normalized
+
+
+def openai_base_url_from_vllm_server_url(server_url: str) -> str:
+    return f"{normalize_vllm_server_url(server_url)}/v1"
+
+
+def map_checkpoint_path_for_vllm(
+    config: Mapping[str, Any],
+    checkpoint_path: str,
+) -> str:
+    runtime_config = get_external_vllm_runtime_config(config)
+    if runtime_config is None:
+        return checkpoint_path
+    local_root = runtime_config.local_checkpoint_root
+    server_root = runtime_config.server_checkpoint_root
+    if local_root is None and server_root is None:
+        return checkpoint_path
+    if not local_root or not server_root:
+        raise ValueError(
+            "Set both vllm_runtime.local_checkpoint_root and "
+            "vllm_runtime.server_checkpoint_root, or neither."
+        )
+    checkpoint_abs = os.path.abspath(checkpoint_path)
+    local_root_abs = os.path.abspath(local_root)
+    rel_path = os.path.relpath(checkpoint_abs, local_root_abs)
+    if rel_path == os.pardir or rel_path.startswith(os.pardir + os.sep):
+        raise ValueError(
+            f"Checkpoint path {checkpoint_path!r} is not under "
+            f"vllm_runtime.local_checkpoint_root {local_root!r}"
+        )
+    return os.path.join(server_root, rel_path)
+
+
+async def wait_for_vllm_http_runtime(
+    *,
+    base_url: str,
+    timeout: float,
+    headers: dict[str, str] | None = None,
+) -> None:
+    deadline = asyncio.get_running_loop().time() + timeout
+    url = f"{base_url.rstrip('/')}/health"
+    async with httpx.AsyncClient() as client:
+        while True:
+            try:
+                response = await client.get(url, headers=headers, timeout=5.0)
+                if response.status_code == 200:
+                    return
+            except httpx.HTTPError:
+                pass
+            if asyncio.get_running_loop().time() >= deadline:
+                raise TimeoutError(
+                    f"vLLM runtime did not become ready within {math.ceil(timeout)}s"
+                )
+            await asyncio.sleep(0.5)
 
 
 def _drop_tilelang_env_paths(value: str | None) -> str | None:
@@ -615,18 +711,24 @@ def _runtime_command_prefix() -> list[str]:
 
 
 def build_vllm_runtime_server_cmd(config: VllmRuntimeLaunchConfig) -> list[str]:
-    return [
+    command = [
         *_runtime_command_prefix(),
         f"--model={config.base_model}",
         f"--port={config.port}",
         f"--host={config.host}",
         f"--cuda-visible-devices={config.cuda_visible_devices}",
-        f"--lora-path={config.lora_path}",
-        f"--served-model-name={config.served_model_name}",
-        f"--rollout-weights-mode={config.rollout_weights_mode}",
-        f"--engine-args-json={json.dumps(config.engine_args)}",
-        f"--server-args-json={json.dumps(config.server_args)}",
     ]
+    if config.lora_path is not None:
+        command.append(f"--lora-path={config.lora_path}")
+    command.extend(
+        [
+            f"--served-model-name={config.served_model_name}",
+            f"--rollout-weights-mode={config.rollout_weights_mode}",
+            f"--engine-args-json={json.dumps(config.engine_args)}",
+            f"--server-args-json={json.dumps(config.server_args)}",
+        ]
+    )
+    return command
 
 
 async def wait_for_vllm_runtime(
