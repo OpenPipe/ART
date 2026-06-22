@@ -491,6 +491,269 @@ def _apply_lora_to_existing_linear_output(
     return module._apply_lora_to_output(x, output)
 
 
+def _register_dsv4_lora_expand_fp32_output_op() -> None:
+    if getattr(_register_dsv4_lora_expand_fp32_output_op, "_registered", False):
+        return
+
+    import torch
+    from vllm import envs
+    from vllm.lora.ops.triton_ops.utils import get_lora_op_configs, supports_pdl
+    from vllm.triton_utils import tl, triton
+    from vllm.utils.torch_utils import direct_register_custom_op
+
+    @triton.jit
+    def _kernel(
+        input_ptr,
+        lora_b_ptr,
+        output_ptr,
+        token_indices_sorted_by_lora_ids,
+        num_tokens_per_lora,
+        lora_token_start_loc,
+        lora_ids,
+        M,
+        slice_offset,
+        input_stride_m,
+        input_stride_k,
+        lora_stride_lora,
+        lora_stride_out,
+        lora_stride_k,
+        output_stride_m,
+        output_stride_n,
+        RANK: tl.constexpr,
+        OUT_WIDTH: tl.constexpr,
+        BLOCK_M: tl.constexpr,
+        BLOCK_N: tl.constexpr,
+        BLOCK_K: tl.constexpr,
+        USE_GDC: tl.constexpr,
+        launch_pdl: tl.constexpr,
+    ):
+        cta_n_num = tl.cdiv(OUT_WIDTH, BLOCK_N)
+        cta_m_num = tl.cdiv(M, BLOCK_M)
+        pid_mn = tl.program_id(0)
+        pid_m = pid_mn % cta_m_num
+        pid_n = (pid_mn // cta_m_num) % cta_n_num
+        lora_idx = tl.program_id(1)
+
+        lora_id = tl.load(lora_ids + lora_idx)
+        if lora_id == -1:
+            return
+
+        lora_m_size = tl.load(num_tokens_per_lora + lora_idx)
+        cta_m_offset = pid_m * BLOCK_M
+        if cta_m_offset >= lora_m_size:
+            return
+
+        cta_m_len = min(BLOCK_M, lora_m_size - cta_m_offset)
+        lora_m_start = tl.load(lora_token_start_loc + lora_idx)
+        row_ptr = token_indices_sorted_by_lora_ids + lora_m_start + cta_m_offset
+        row_offsets = tl.arange(0, BLOCK_M) % cta_m_len
+        rows = tl.load(row_ptr + row_offsets)
+
+        offs_n = tl.arange(0, BLOCK_N) + pid_n * BLOCK_N
+        accumulator = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+        for k_start in range(0, RANK, BLOCK_K):
+            offs_k = tl.arange(0, BLOCK_K) + k_start
+            x = tl.load(
+                input_ptr
+                + rows[:, None] * input_stride_m
+                + offs_k[None, :] * input_stride_k,
+                mask=(row_offsets[:, None] < cta_m_len) & (offs_k[None, :] < RANK),
+                other=0.0,
+            )
+            if USE_GDC:
+                tl.extra.cuda.gdc_wait()
+            b = tl.load(
+                lora_b_ptr
+                + lora_id * lora_stride_lora
+                + offs_n[None, :] * lora_stride_out
+                + offs_k[:, None] * lora_stride_k,
+                mask=(offs_k[:, None] < RANK) & (offs_n[None, :] < OUT_WIDTH),
+                other=0.0,
+            ).to(tl.float32)
+            accumulator += tl.dot(x, b)
+
+        out_cols = slice_offset + offs_n
+        out_ptrs = (
+            output_ptr
+            + rows[:, None] * output_stride_m
+            + out_cols[None, :] * output_stride_n
+        )
+        mask = (row_offsets[:, None] < cta_m_len) & (offs_n[None, :] < OUT_WIDTH)
+        old = tl.load(out_ptrs, mask=mask)
+        tl.store(out_ptrs, old + accumulator, mask=mask)
+
+    @torch.inference_mode()
+    def _impl(
+        inputs: torch.Tensor,
+        lora_b_weight: torch.Tensor,
+        output_tensor: torch.Tensor,
+        token_indices_sorted_by_lora_ids: torch.Tensor,
+        num_tokens_per_lora: torch.Tensor,
+        lora_token_start_loc: torch.Tensor,
+        lora_ids: torch.Tensor,
+        no_lora_flag_cpu: torch.Tensor,
+        num_active_loras: torch.Tensor,
+        slice_offset: int,
+    ) -> None:
+        assert no_lora_flag_cpu.numel() == 1
+        if no_lora_flag_cpu.item():
+            return
+        assert inputs.dtype == torch.float32
+        assert output_tensor.dtype == torch.float32
+        assert output_tensor.is_contiguous()
+        assert lora_b_weight.ndim == 4
+        assert lora_b_weight.size(1) == 1
+        assert lora_b_weight.is_contiguous()
+
+        m = inputs.size(0)
+        out_width = lora_b_weight.size(2)
+        rank = lora_b_weight.size(3)
+        kernel_config = get_lora_op_configs(
+            op_type="expand",
+            max_loras=lora_ids.size(0),
+            batch=m,
+            hidden_size=out_width,
+            rank=rank,
+            num_slices=1,
+            add_inputs=True,
+        )
+        block_m = kernel_config["block_m"]
+        block_n = kernel_config["block_n"]
+        block_k = kernel_config["block_k"]
+        use_gdc = supports_pdl(inputs.device) and envs.VLLM_LORA_ENABLE_DUAL_STREAM
+        grid = (
+            triton.cdiv(m, block_m) * triton.cdiv(out_width, block_n),
+            num_active_loras.item(),
+        )
+        _kernel[grid](
+            inputs,
+            lora_b_weight,
+            output_tensor,
+            token_indices_sorted_by_lora_ids,
+            num_tokens_per_lora,
+            lora_token_start_loc,
+            lora_ids,
+            m,
+            slice_offset,
+            inputs.stride(0),
+            inputs.stride(1),
+            lora_b_weight.stride(0),
+            lora_b_weight.stride(2),
+            lora_b_weight.stride(3),
+            output_tensor.stride(0),
+            output_tensor.stride(1),
+            RANK=rank,
+            OUT_WIDTH=out_width,
+            BLOCK_M=block_m,
+            BLOCK_N=block_n,
+            BLOCK_K=block_k,
+            USE_GDC=use_gdc,
+            num_warps=kernel_config["num_warps"],
+            num_ctas=kernel_config["num_ctas"],
+            num_stages=kernel_config["num_stages"],
+            launch_pdl=use_gdc,
+        )
+
+    def _fake(
+        inputs: torch.Tensor,
+        lora_b_weight: torch.Tensor,
+        output_tensor: torch.Tensor,
+        token_indices_sorted_by_lora_ids: torch.Tensor,
+        num_tokens_per_lora: torch.Tensor,
+        lora_token_start_loc: torch.Tensor,
+        lora_ids: torch.Tensor,
+        no_lora_flag_cpu: torch.Tensor,
+        num_active_loras: torch.Tensor,
+        slice_offset: int,
+    ) -> None:
+        return None
+
+    direct_register_custom_op(
+        op_name="art_dsv4_lora_expand_fp32_output",
+        op_func=_impl,
+        mutates_args=["output_tensor"],
+        fake_impl=_fake,
+    )
+    _register_dsv4_lora_expand_fp32_output_op._registered = True  # type: ignore[attr-defined]
+
+
+def _apply_dsv4_compressor_lora_to_existing_output(
+    module: Any,
+    x: Any,
+    output: Any,
+) -> Any:
+    if not _is_active_lora_wrapped_linear(module):
+        return output
+
+    import torch
+    from vllm.platforms import current_platform
+
+    _register_dsv4_lora_expand_fp32_output_op()
+    original_shape = output.shape if output.ndim == 3 else None
+    if x.ndim == 3 and output.ndim == 3:
+        x = x.flatten(0, 1)
+        output = output.flatten(0, 1)
+    if x.ndim != 2 or output.ndim != 2:
+        raise RuntimeError(
+            "DSV4 compressor LoRA expects 2D hidden/output tensors, got "
+            f"x={tuple(x.shape)}, output={tuple(output.shape)}."
+        )
+    if output.dtype != torch.float32:
+        raise RuntimeError(
+            "DSV4 compressor LoRA must preserve the fp32 compressor projection, "
+            f"got output dtype {output.dtype}."
+        )
+    if getattr(module, "tp_size", 1) != 1:
+        raise RuntimeError(
+            "DSV4 compressor LoRA expects disable_tp compressor linears."
+        )
+
+    wrapper = module.punica_wrapper
+    local_rank = module.lora_a_stacked[0].shape[2]
+    buffers = torch.empty_strided(
+        (len(module.output_slices), x.shape[0], local_rank),
+        (x.shape[0] * local_rank, local_rank, 1),
+        dtype=torch.float32,
+        device=x.device,
+    )
+    shrunk = wrapper.add_shrink(buffers, x, module.lora_a_stacked, 1.0)
+    if not current_platform.can_update_inplace():
+        buffers = shrunk
+
+    (
+        _,
+        token_indices_sorted_by_lora_ids,
+        num_tokens_per_lora,
+        lora_token_start_loc,
+        lora_ids,
+        no_lora_flag_cpu,
+        num_active_loras,
+    ) = wrapper.token_mapping_meta.meta_args(
+        x.shape[0], wrapper.lora_config.specialize_active_lora
+    )
+    offset = 0
+    for idx, width in enumerate(module.output_slices):
+        torch.ops.vllm.art_dsv4_lora_expand_fp32_output(
+            buffers[idx],
+            module.lora_b_stacked[idx],
+            output,
+            token_indices_sorted_by_lora_ids,
+            num_tokens_per_lora,
+            lora_token_start_loc,
+            lora_ids,
+            no_lora_flag_cpu,
+            num_active_loras,
+            offset,
+        )
+        offset += width
+    if offset != output.shape[-1]:
+        raise RuntimeError(
+            "DSV4 compressor LoRA output slice width mismatch: "
+            f"slices={module.output_slices}, output={tuple(output.shape)}."
+        )
+    return output.reshape(original_shape) if original_shape is not None else output
+
+
 def _is_active_lora_wrapped_linear(module: Any) -> bool:
     if not _is_lora_wrapped_linear(module):
         return False
@@ -878,6 +1141,7 @@ def patch_dsv4_fast_path_lora() -> None:
     if wrapper_cls is None:
         return
     _register_dsv4_inv_rope_lora_input_op()
+    _register_dsv4_lora_expand_fp32_output_op()
     if getattr(wrapper_cls, "_art_fast_path_lora_patched", False):
         return
 
@@ -889,13 +1153,13 @@ def patch_dsv4_fast_path_lora() -> None:
             original_attn_gemm_parallel_execute(self, hidden_states)
         )
         if self.compressor is not None:
-            kv_score = _apply_lora_to_existing_linear_output(
+            kv_score = _apply_dsv4_compressor_lora_to_existing_output(
                 self.compressor.fused_wkv_wgate,
                 hidden_states,
                 kv_score,
             )
         if self.indexer is not None:
-            indexer_kv_score = _apply_lora_to_existing_linear_output(
+            indexer_kv_score = _apply_dsv4_compressor_lora_to_existing_output(
                 self.indexer.compressor.fused_wkv_wgate,
                 hidden_states,
                 indexer_kv_score,
