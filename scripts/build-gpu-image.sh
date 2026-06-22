@@ -391,15 +391,22 @@ if matches:
     print(matches[-1])
 PY
 )"
-prewarm_image="${pull_image_repo}:${image_tag}"
+prewarm_tag_image="${pull_image_repo}:${image_tag}"
+prewarm_image="${prewarm_tag_image}"
+prewarm_refresh_tag_image=""
 if [[ -n "${image_digest}" ]]; then
   if [[ "${pull_image_repo}" == "${image_repo}" ]]; then
     prewarm_image="${pull_image_repo}@${image_digest}"
+    prewarm_refresh_tag_image="${prewarm_tag_image}"
   else
     echo "Prewarm pull repo differs from pushed image repo; using mutable tag for pull-through freshness:"
     echo "  Pushed image digest: ${image_repo}@${image_digest}"
     echo "  Prewarm image: ${prewarm_image}"
   fi
+fi
+prewarm_display="${prewarm_image}"
+if [[ -n "${prewarm_refresh_tag_image}" ]]; then
+  prewarm_display="${prewarm_image} and refreshing ${prewarm_refresh_tag_image}"
 fi
 
 dump_prewarm_diagnostics() {
@@ -427,6 +434,31 @@ sanitize_k8s_name_part() {
     | cut -c1-35
 }
 
+render_prewarm_init_containers() {
+  cat <<EOF
+    - name: prepull
+      image: ${prewarm_image}
+      imagePullPolicy: Always
+      command: ["bash", "-lc", "true"]
+      resources:
+        requests:
+          cpu: 10m
+          memory: 16Mi
+EOF
+  if [[ -n "${prewarm_refresh_tag_image}" && "${prewarm_refresh_tag_image}" != "${prewarm_image}" ]]; then
+    cat <<EOF
+    - name: refresh-tag
+      image: ${prewarm_refresh_tag_image}
+      imagePullPolicy: Always
+      command: ["bash", "-lc", "true"]
+      resources:
+        requests:
+          cpu: 10m
+          memory: 16Mi
+EOF
+  fi
+}
+
 prewarm_single_node() {
   local node="$1"
   local node_slug
@@ -441,7 +473,7 @@ prewarm_single_node() {
   pod="${prewarm_name}-${node_slug}"
 
   for attempt in $(seq 1 "${prewarm_node_retries}"); do
-    echo "Prewarming ${prewarm_image} on GPU node ${node} (attempt ${attempt}/${prewarm_node_retries})"
+    echo "Prewarming ${prewarm_display} on GPU node ${node} (attempt ${attempt}/${prewarm_node_retries})"
     "${kubectl_cmd[@]}" delete pod -n "${prewarm_namespace}" "${pod}" \
       --ignore-not-found --wait=true >/dev/null 2>&1 || true
     "${kubectl_cmd[@]}" apply -n "${prewarm_namespace}" -f - <<EOF
@@ -461,14 +493,7 @@ spec:
   tolerations:
     - operator: Exists
   initContainers:
-    - name: prepull
-      image: ${prewarm_image}
-      imagePullPolicy: Always
-      command: ["bash", "-lc", "true"]
-      resources:
-        requests:
-          cpu: 10m
-          memory: 16Mi
+$(render_prewarm_init_containers)
   containers:
     - name: pause
       image: registry.k8s.io/pause:3.10
@@ -509,7 +534,7 @@ if [[ "${prewarm_nodes}" == "true" ]]; then
   if [[ "${gpu_node_count}" == "0" ]]; then
     echo "Skipping GPU node prewarm: no nodes match ${prewarm_node_selector}"
   else
-    echo "Prewarming ${prewarm_image} on ${gpu_node_count} GPU node(s)"
+    echo "Prewarming ${prewarm_display} on ${gpu_node_count} GPU node(s)"
     "${kubectl_cmd[@]}" create secret generic "${prewarm_image_pull_secret}" \
       -n "${prewarm_namespace}" \
       --from-file=.dockerconfigjson="${registry_auth_json_path}" \
@@ -574,14 +599,7 @@ spec:
       tolerations:
         - operator: Exists
       initContainers:
-        - name: prepull
-          image: ${prewarm_image}
-          imagePullPolicy: Always
-          command: ["bash", "-lc", "true"]
-          resources:
-            requests:
-              cpu: 10m
-              memory: 16Mi
+$(render_prewarm_init_containers | sed 's/^/    /')
       containers:
         - name: pause
           image: registry.k8s.io/pause:3.10
