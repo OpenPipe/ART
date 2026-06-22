@@ -181,10 +181,10 @@ jobs:
 
           bash scripts/build-gpu-image.sh "${args[@]}"
 
-      - name: Smoke launch pushed image
+      - name: Smoke launch prewarmed image
         if: ${{ github.event_name != 'workflow_dispatch' || inputs.smoke_launch }}
         env:
-          SMOKE_IMAGE_REPO: ${{ inputs.image_repo || 'docker.io/bradhiltonnw/art-gpu' }}
+          SMOKE_IMAGE_REPO: ${{ inputs.pull_image_repo || 'images.coreweave.com/cluster-images/bradhiltonnw/art-gpu' }}
           IMAGE_TAG: ${{ inputs.tag }}
           SMOKE_GPUS: ${{ inputs.smoke_gpus }}
         run: |
