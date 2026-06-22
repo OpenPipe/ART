@@ -390,8 +390,30 @@ PY
 )"
 prewarm_image="${pull_image_repo}:${image_tag}"
 if [[ -n "${image_digest}" ]]; then
-  prewarm_image="${pull_image_repo}@${image_digest}"
+  if [[ "${pull_image_repo}" == "${image_repo}" ]]; then
+    prewarm_image="${pull_image_repo}@${image_digest}"
+  else
+    echo "Prewarm pull repo differs from pushed image repo; using mutable tag for pull-through freshness:"
+    echo "  Pushed image digest: ${image_repo}@${image_digest}"
+    echo "  Prewarm image: ${prewarm_image}"
+  fi
 fi
+
+dump_prewarm_diagnostics() {
+  echo "::group::Prewarm diagnostics"
+  "${kubectl_cmd[@]}" get daemonset -n "${prewarm_namespace}" "${prewarm_name}" -o wide || true
+  "${kubectl_cmd[@]}" get pods -n "${prewarm_namespace}" -l "app=${prewarm_name}" -o wide || true
+  "${kubectl_cmd[@]}" describe daemonset -n "${prewarm_namespace}" "${prewarm_name}" || true
+  first_prewarm_pod="$(
+    "${kubectl_cmd[@]}" get pods -n "${prewarm_namespace}" -l "app=${prewarm_name}" \
+      -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || true
+  )"
+  if [[ -n "${first_prewarm_pod}" ]]; then
+    "${kubectl_cmd[@]}" describe pod -n "${prewarm_namespace}" "${first_prewarm_pod}" || true
+  fi
+  "${kubectl_cmd[@]}" get events -n "${prewarm_namespace}" --sort-by=.lastTimestamp | tail -n 80 || true
+  echo "::endgroup::"
+}
 
 if [[ "${prewarm_nodes}" == "true" ]]; then
   gpu_node_count="$("${kubectl_cmd[@]}" get nodes -l "${prewarm_node_selector}" --no-headers 2>/dev/null | wc -l | tr -d ' ')"
@@ -450,7 +472,10 @@ spec:
               cpu: 10m
               memory: 16Mi
 EOF
-    "${kubectl_cmd[@]}" rollout status -n "${prewarm_namespace}" "daemonset/${prewarm_name}" --timeout="${prewarm_timeout}"
+    if ! "${kubectl_cmd[@]}" rollout status -n "${prewarm_namespace}" "daemonset/${prewarm_name}" --timeout="${prewarm_timeout}"; then
+      dump_prewarm_diagnostics
+      exit 1
+    fi
   fi
 else
   echo "Skipping GPU node prewarm"
