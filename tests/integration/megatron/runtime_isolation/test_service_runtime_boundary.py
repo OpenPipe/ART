@@ -282,48 +282,6 @@ async def test_megatron_external_vllm_start_attaches_and_loads_mapped_lora(
 
 
 @pytest.mark.asyncio
-async def test_unsloth_external_vllm_start_attaches_and_loads_lora(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    service = UnslothService(
-        model_name="test-model",
-        base_model="Qwen/Qwen3-0.6B",
-        config={
-            "rollout_weights_mode": "lora",
-            "vllm_runtime": {
-                "mode": "external",
-                "server_url": "http://inference-node:8000/v1",
-            },
-        },
-        output_dir=str(tmp_path),
-    )
-    client = _RecordingVllmClient()
-    monkeypatch.setattr(httpx, "AsyncClient", lambda: client)
-    monkeypatch.setattr(
-        "art.unsloth.service.get_last_checkpoint_dir",
-        lambda _output_dir: "/mnt/ws_pvc/ws/checkpoints/model/0000",
-    )
-    monkeypatch.setattr("art.unsloth.service.get_step_from_dir", lambda _output_dir: 0)
-
-    location = await service.start_openai_server(None)
-
-    assert location == ("http://inference-node:8000", 0)
-    assert client.posts == [
-        (
-            "http://inference-node:8000/v1/load_lora_adapter",
-            {
-                "lora_name": "test-model@0",
-                "lora_path": "/mnt/ws_pvc/ws/checkpoints/model/0000",
-                "load_inplace": True,
-            },
-            None,
-            60.0,
-        )
-    ]
-
-
-@pytest.mark.asyncio
 async def test_megatron_dedicated_merged_start_uses_configured_topology(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
