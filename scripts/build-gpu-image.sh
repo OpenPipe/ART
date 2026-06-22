@@ -36,6 +36,8 @@ prewarm_name="${PREWARM_NAME:-art-gpu-image-prewarm}"
 prewarm_image_pull_secret="${PREWARM_IMAGE_PULL_SECRET:-art-gpu-registry-auth}"
 prewarm_node_selector="${PREWARM_NODE_SELECTOR:-node.coreweave.cloud/class=gpu}"
 prewarm_timeout="${PREWARM_TIMEOUT:-30m}"
+prewarm_node_timeout="${PREWARM_NODE_TIMEOUT:-10m}"
+prewarm_node_retries="${PREWARM_NODE_RETRIES:-3}"
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -403,6 +405,7 @@ dump_prewarm_diagnostics() {
   echo "::group::Prewarm diagnostics"
   "${kubectl_cmd[@]}" get daemonset -n "${prewarm_namespace}" "${prewarm_name}" -o wide || true
   "${kubectl_cmd[@]}" get pods -n "${prewarm_namespace}" -l "app=${prewarm_name}" -o wide || true
+  "${kubectl_cmd[@]}" get pods -n "${prewarm_namespace}" -l "art.openpipe/prewarm-name=${prewarm_name}" -o wide || true
   "${kubectl_cmd[@]}" describe daemonset -n "${prewarm_namespace}" "${prewarm_name}" || true
   first_prewarm_pod="$(
     "${kubectl_cmd[@]}" get pods -n "${prewarm_namespace}" -l "app=${prewarm_name}" \
@@ -415,8 +418,89 @@ dump_prewarm_diagnostics() {
   echo "::endgroup::"
 }
 
+sanitize_k8s_name_part() {
+  printf '%s' "$1" \
+    | tr '[:upper:]' '[:lower:]' \
+    | tr -c 'a-z0-9-' '-' \
+    | sed -E 's/^-+//; s/-+$//; s/-+/-/g' \
+    | cut -c1-35
+}
+
+prewarm_single_node() {
+  local node="$1"
+  local node_slug
+  local pod
+  local attempt
+
+  node_slug="$(sanitize_k8s_name_part "${node}")"
+  if [[ -z "${node_slug}" ]]; then
+    echo "Could not derive Kubernetes pod name for node ${node}" >&2
+    return 1
+  fi
+  pod="${prewarm_name}-${node_slug}"
+
+  for attempt in $(seq 1 "${prewarm_node_retries}"); do
+    echo "Prewarming ${prewarm_image} on GPU node ${node} (attempt ${attempt}/${prewarm_node_retries})"
+    "${kubectl_cmd[@]}" delete pod -n "${prewarm_namespace}" "${pod}" \
+      --ignore-not-found --wait=true >/dev/null 2>&1 || true
+    "${kubectl_cmd[@]}" apply -n "${prewarm_namespace}" -f - <<EOF
+apiVersion: v1
+kind: Pod
+metadata:
+  name: ${pod}
+  labels:
+    app: ${prewarm_name}-oneshot
+    art.openpipe/prewarm-name: ${prewarm_name}
+    art.openpipe/prewarm-token: "${timestamp}-${art_short_sha}"
+spec:
+  restartPolicy: Never
+  nodeName: ${node}
+  imagePullSecrets:
+    - name: ${prewarm_image_pull_secret}
+  tolerations:
+    - operator: Exists
+  initContainers:
+    - name: prepull
+      image: ${prewarm_image}
+      imagePullPolicy: Always
+      command: ["bash", "-lc", "true"]
+      resources:
+        requests:
+          cpu: 10m
+          memory: 16Mi
+  containers:
+    - name: pause
+      image: registry.k8s.io/pause:3.10
+      resources:
+        requests:
+          cpu: 10m
+          memory: 16Mi
+EOF
+    if "${kubectl_cmd[@]}" wait -n "${prewarm_namespace}" \
+      --for=condition=Ready "pod/${pod}" \
+      --timeout="${prewarm_node_timeout}"; then
+      "${kubectl_cmd[@]}" delete pod -n "${prewarm_namespace}" "${pod}" \
+        --ignore-not-found --wait=true >/dev/null 2>&1 || true
+      return 0
+    fi
+
+    echo "Prewarm failed on node ${node}; pod diagnostics:"
+    "${kubectl_cmd[@]}" describe pod -n "${prewarm_namespace}" "${pod}" || true
+    "${kubectl_cmd[@]}" delete pod -n "${prewarm_namespace}" "${pod}" \
+      --ignore-not-found --wait=true >/dev/null 2>&1 || true
+    sleep "$((attempt * 10))"
+  done
+
+  echo "Failed to prewarm ${prewarm_image} on node ${node}" >&2
+  return 1
+}
+
 if [[ "${prewarm_nodes}" == "true" ]]; then
-  gpu_node_count="$("${kubectl_cmd[@]}" get nodes -l "${prewarm_node_selector}" --no-headers 2>/dev/null | wc -l | tr -d ' ')"
+  mapfile -t gpu_nodes < <(
+    "${kubectl_cmd[@]}" get nodes -l "${prewarm_node_selector}" \
+      -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}' 2>/dev/null
+  )
+  gpu_node_count="${#gpu_nodes[@]}"
   if [[ "${gpu_node_count}" == "0" ]]; then
     echo "Skipping GPU node prewarm: no nodes match ${prewarm_node_selector}"
   else
@@ -427,6 +511,19 @@ if [[ "${prewarm_nodes}" == "true" ]]; then
       --type=kubernetes.io/dockerconfigjson \
       --dry-run=client -o yaml \
       | "${kubectl_cmd[@]}" apply -n "${prewarm_namespace}" -f -
+
+    echo "Stopping existing ${prewarm_name} DaemonSet before serialized node prewarm"
+    "${kubectl_cmd[@]}" delete daemonset -n "${prewarm_namespace}" "${prewarm_name}" \
+      --ignore-not-found --wait=true >/dev/null 2>&1 || true
+
+    for gpu_node in "${gpu_nodes[@]}"; do
+      if ! prewarm_single_node "${gpu_node}"; then
+        dump_prewarm_diagnostics
+        exit 1
+      fi
+    done
+
+    echo "Installing steady-state ${prewarm_name} DaemonSet"
     "${kubectl_cmd[@]}" apply -n "${prewarm_namespace}" -f - <<EOF
 apiVersion: apps/v1
 kind: DaemonSet
@@ -441,7 +538,7 @@ spec:
   updateStrategy:
     type: RollingUpdate
     rollingUpdate:
-      maxUnavailable: 100%
+      maxUnavailable: 1
   template:
     metadata:
       labels:
