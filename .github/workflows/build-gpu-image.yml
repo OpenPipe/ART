@@ -13,7 +13,7 @@ on:
       pull_image_repo:
         description: "Image repository for cluster pulls/prewarm"
         required: true
-        default: "images.coreweave.com/cluster-images/bradhiltonnw/art-gpu"
+        default: "docker.io/bradhiltonnw/art-gpu"
         type: string
       tag:
         description: "Image tag to push"
@@ -152,7 +152,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           IMAGE_REPO: ${{ inputs.image_repo || 'docker.io/bradhiltonnw/art-gpu' }}
-          PULL_IMAGE_REPO: ${{ inputs.pull_image_repo || 'images.coreweave.com/cluster-images/bradhiltonnw/art-gpu' }}
+          PULL_IMAGE_REPO: ${{ inputs.pull_image_repo || 'docker.io/bradhiltonnw/art-gpu' }}
           IMAGE_TAG: ${{ inputs.tag }}
           NO_CACHE: ${{ inputs.no_cache }}
           PREWARM_NODES: ${{ inputs.prewarm_nodes }}
@@ -184,7 +184,7 @@ jobs:
       - name: Smoke launch prewarmed image
         if: ${{ github.event_name != 'workflow_dispatch' || inputs.smoke_launch }}
         env:
-          SMOKE_IMAGE_REPO: ${{ inputs.pull_image_repo || 'images.coreweave.com/cluster-images/bradhiltonnw/art-gpu' }}
+          SMOKE_IMAGE_REPO: ${{ inputs.pull_image_repo || 'docker.io/bradhiltonnw/art-gpu' }}
           IMAGE_TAG: ${{ inputs.tag }}
           SMOKE_GPUS: ${{ inputs.smoke_gpus }}
         run: |
@@ -220,6 +220,8 @@ jobs:
 
           "${sky_cmd[@]}" check kubernetes
 
+          smoke_code='import os, pathlib, subprocess, sys; expected = os.environ["EXPECTED_ART_IMAGE_REVISION"]; actual = os.environ.get("ART_IMAGE_REVISION"); print("ART_IMAGE_REVISION", actual); sys.exit(f"ART_IMAGE_REVISION mismatch: expected {expected}, got {actual}") if actual != expected else None; print("ART_IMAGE_SMOKE_OK"); print("SKY_PYTHON_PATH", pathlib.Path.home().joinpath(".sky/python_path").read_text().strip()); print("RAY_PATH", pathlib.Path.home().joinpath(".sky/ray_path").read_text().strip()); print("UV", subprocess.check_output(["uv", "--version"], text=True).strip())'
+
           /usr/bin/time -p "${sky_cmd[@]}" launch -y \
               -c "${cluster}" \
               --infra "${SKY_INFRA}" \
@@ -227,7 +229,7 @@ jobs:
               --image-id "docker:${SMOKE_IMAGE_REPO}:${IMAGE_TAG}" \
               --config kubernetes.pod_config.spec.schedulerName=binpack-scheduler \
               --config kubernetes.pod_config.spec.activeDeadlineSeconds=604800 \
-              'python -c "import pathlib, subprocess; print(\"ART_IMAGE_SMOKE_OK\"); print(\"SKY_PYTHON_PATH\", pathlib.Path.home().joinpath(\".sky/python_path\").read_text().strip()); print(\"RAY_PATH\", pathlib.Path.home().joinpath(\".sky/ray_path\").read_text().strip()); print(\"UV\", subprocess.check_output([\"uv\", \"--version\"], text=True).strip())"'
+              "EXPECTED_ART_IMAGE_REVISION=${GITHUB_SHA} python -c '${smoke_code}'"
 
           kubectl --context cks-wb3 get pods -n default \
             -l "skypilot-cluster=${cluster}" \

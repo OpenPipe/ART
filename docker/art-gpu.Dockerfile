@@ -82,6 +82,7 @@ ARG SKYPILOT_VERSION
 ARG SKY_REMOTE_RAY_VERSION
 
 ENV CUDA_HOME=/usr/local/cuda-12.8 \
+    ART_IMAGE_REVISION=${ART_SHA} \
     PATH=/home/sky/.local/bin:/opt/conda/bin:${PATH} \
     UV_CACHE_DIR=/opt/uv-cache \
     UV_PYTHON_INSTALL_DIR=/opt/uv-python \
