@@ -152,6 +152,7 @@ DSV4_SPEC = ModelSupportSpec(
         "deepseek-ai/DeepSeek-V4-Pro-Base",
     ),
     default_target_modules=_DSV4_TARGET_MODULES,
+    default_vllm_max_loras=1,
     native_vllm_lora_status=_VALIDATED_NATIVE_VLLM_LORA_STATUS,
 )
 
@@ -309,6 +310,17 @@ def default_target_modules_for_model(
             allow_unvalidated_arch=allow_unvalidated_arch,
         ).default_target_modules
     )
+
+
+def default_vllm_max_loras_for_model(
+    base_model: str,
+    *,
+    allow_unvalidated_arch: bool = False,
+) -> int:
+    return get_model_support_spec(
+        base_model,
+        allow_unvalidated_arch=allow_unvalidated_arch,
+    ).default_vllm_max_loras
 
 
 def vllm_lora_config_for_model(

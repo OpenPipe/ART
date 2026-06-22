@@ -14,6 +14,7 @@ from art.megatron.flex_attn.attention import FlexDotProductAttention
 from art.megatron.lora import default_lora_rank_for_handler
 from art.megatron.model_support.registry import (
     UnsupportedModelArchitectureError,
+    default_vllm_max_loras_for_model,
     get_model_support_handler,
     get_model_support_spec,
     model_requires_merged_rollout,
@@ -122,6 +123,8 @@ def test_dsv4_prefers_validated_native_lora_rollout() -> None:
 
     assert spec.native_vllm_lora_status == "validated"
     assert model_requires_merged_rollout("deepseek-ai/DeepSeek-V4-Flash") is False
+    assert default_vllm_max_loras_for_model("deepseek-ai/DeepSeek-V4-Flash") == 1
+    assert default_vllm_max_loras_for_model("OpenPipe/Qwen3-14B-Instruct") == 2
 
 
 def test_dsv4_provider_disables_shared_expert_overlap(

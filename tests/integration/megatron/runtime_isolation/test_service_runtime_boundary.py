@@ -166,6 +166,22 @@ async def test_megatron_runtime_sleep_and_wake_use_runtime_routes(
     assert service._is_sleeping is False
 
 
+def test_megatron_dsv4_runtime_engine_args_use_single_lora_slot(
+    tmp_path: Path,
+) -> None:
+    service = MegatronService(
+        model_name="test-model",
+        base_model="deepseek-ai/DeepSeek-V4-Flash",
+        config={"rollout_weights_mode": "lora"},
+        output_dir=str(tmp_path),
+    )
+
+    engine_args = service._runtime_engine_args(None)
+
+    assert engine_args["enable_lora"] is True
+    assert engine_args["max_loras"] == 1
+
+
 @pytest.mark.asyncio
 async def test_unsloth_runtime_sleep_and_wake_use_runtime_routes(
     tmp_path: Path,

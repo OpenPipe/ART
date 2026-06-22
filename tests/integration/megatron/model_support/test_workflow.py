@@ -77,6 +77,7 @@ def test_dsv4_runtime_stages_use_full_model_resources() -> None:
         assert "hf_overrides" not in engine_args
         assert engine_args.get("load_format") != "dummy"
         assert engine_args["moe_backend"] == "triton_unfused"
+        assert engine_args["max_loras"] == 1
     assert resources.train_inf_mismatch is not None
     assert resources.train_inf_mismatch.megatron_env == {}
     assert resources.yes_no_trainability is not None
@@ -101,6 +102,7 @@ def test_dsv4_runtime_stages_use_full_model_resources() -> None:
     assert (
         resources.native_vllm_lora.vllm.engine_args()["moe_backend"] == "triton_unfused"
     )
+    assert resources.native_vllm_lora.vllm.engine_args()["max_loras"] == 1
 
 
 def test_dsv4_resources_remap_to_four_high_vram_gpus(monkeypatch) -> None:
