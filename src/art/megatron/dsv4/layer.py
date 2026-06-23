@@ -55,11 +55,13 @@ class Dsv4Router(TopKRouter):
     def __init__(self, config: TransformerConfig, *args: Any, **kwargs: Any) -> None:
         super().__init__(config, *args, **kwargs)
         self._dsv4_input_ids: Tensor | None = None
+        self._dsv4_is_hash_layer = False
         if self.topk == 1:
             freeze_parameters_as_buffers(self)
 
     def set_layer_number(self, layer_number: int):
         super().set_layer_number(layer_number)
+        self._dsv4_is_hash_layer = self._compute_is_hash_layer(layer_number)
         cfg = cast(Any, self.config)
         if self._is_hash_layer():
             if "tid2eid" not in self._buffers:
@@ -85,11 +87,12 @@ class Dsv4Router(TopKRouter):
     def set_input_ids(self, input_ids: Tensor | None) -> None:
         self._dsv4_input_ids = input_ids
 
-    def _is_hash_layer(self) -> bool:
+    def _compute_is_hash_layer(self, layer_number: int | None) -> bool:
         cfg = cast(Any, self.config)
-        return self.layer_number is not None and self.layer_number <= int(
-            cfg.dsv4_n_hash_layers
-        )
+        return layer_number is not None and layer_number <= int(cfg.dsv4_n_hash_layers)
+
+    def _is_hash_layer(self) -> bool:
+        return self._dsv4_is_hash_layer
 
     def _scores(self, logits: Tensor) -> Tensor:
         if self.score_function == "sigmoid":
