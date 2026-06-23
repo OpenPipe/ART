@@ -351,7 +351,15 @@ class MoeRoutingReplayBundle(BaseModel):
         steps: dict[int, StepRoutes] = {}
         for step_index_str, step_info in manifest["steps"].items():
             step_index = int(step_index_str)
-            step_tensors = load_file(str(base_dir / step_info["file"]))
+            loaded_tensors = load_file(str(base_dir / step_info["file"]))
+            # Own CPU storage immediately. Safetensors CPU loads can keep
+            # file-backed storage alive, which makes shared-filesystem cleanup
+            # fail while long-lived Megatron ranks still hold replay bundles.
+            step_tensors = {
+                key: tensor.detach().clone().contiguous()
+                for key, tensor in loaded_tensors.items()
+            }
+            del loaded_tensors
             if GLOBAL_TOKEN_UIDS_KEY not in step_tensors:
                 raise RuntimeError(
                     f"Missing tensor key '{GLOBAL_TOKEN_UIDS_KEY}' for step={step_index}"
