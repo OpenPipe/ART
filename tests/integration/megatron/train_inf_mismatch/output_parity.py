@@ -863,6 +863,14 @@ def _merge_sharded_lora(shards_by_rank: list[dict[str, Any]]) -> dict[str, Any]:
     return merge_sharded_adapter_entries(entries_by_key)
 
 
+def _new_object_collective_group() -> Any:
+    import torch
+
+    if torch.distributed.get_world_size() <= 1:  # type: ignore[possibly-missing-attribute]
+        return None
+    return torch.distributed.new_group(backend="gloo")  # type: ignore[possibly-missing-attribute]
+
+
 def _collect_full_lora_state(model_chunks: list[Any]) -> dict[str, Any] | None:
     import torch
 
@@ -882,11 +890,17 @@ def _collect_full_lora_state(model_chunks: list[Any]) -> dict[str, Any] | None:
     rank = torch.distributed.get_rank()  # type: ignore[possibly-missing-attribute]
     world_size = torch.distributed.get_world_size()  # type: ignore[possibly-missing-attribute]
     gathered = [None for _ in range(world_size)] if rank == 0 else None
-    torch.distributed.gather_object(  # type: ignore[possibly-missing-attribute]
-        {"state": local_state, "manifest": local_manifest},
-        gathered,
-        dst=0,
-    )
+    group = _new_object_collective_group()
+    try:
+        torch.distributed.gather_object(  # type: ignore[possibly-missing-attribute]
+            {"state": local_state, "manifest": local_manifest},
+            gathered,
+            dst=0,
+            group=group,
+        )
+    finally:
+        if group is not None:
+            torch.distributed.destroy_process_group(group)  # type: ignore[possibly-missing-attribute]
     if rank != 0:
         return None
     assert gathered is not None
@@ -1191,7 +1205,12 @@ def _score_context_parallel_once(
     gathered_records: list[dict[int, ScoreRecord]] = [
         {} for _ in range(dist.get_world_size())
     ]
-    dist.all_gather_object(gathered_records, local_records)
+    group = _new_object_collective_group()
+    try:
+        dist.all_gather_object(gathered_records, local_records, group=group)
+    finally:
+        if group is not None:
+            dist.destroy_process_group(group)
     return _score_bundle_from_records(
         records=_merge_score_records(gathered_records),
         logical_tokens=logical_tokens,
