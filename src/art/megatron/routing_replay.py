@@ -727,6 +727,26 @@ class MoeRoutingReplayController:
         self._target_copy_waited: bool = True
         self._active_token_uid_key: str | None = None
 
+    def update_bundle(self, *, bundle: MoeRoutingReplayBundle, strict: bool) -> None:
+        self.bundle = bundle
+        self.strict = strict
+        self.clear_replay_state()
+        if self.strict:
+            missing = sorted(
+                router_key
+                for router_key in self._local_router_keys
+                if router_key not in self.bundle.router_keys
+            )
+            if missing:
+                raise RuntimeError(
+                    "Router keys from model are missing in replay bundle: "
+                    f"router_keys={missing}"
+                )
+
+    def clear_replay_state(self) -> None:
+        self._clear_native_router_replay_state()
+        self._reset_step_state()
+
     def _target_device(self) -> torch.device:
         if self._device is not None:
             return self._device

@@ -276,16 +276,28 @@ def configure_moe_routing_replay(
     replay_bundle_path: str | None = None,
     replay_bundle: MoeRoutingReplayBundle | None = None,
     strict: bool = True,
+    preserve_installed: bool = False,
 ) -> None:
-    if runtime.moe_routing_replay_controller is not None:
-        runtime.moe_routing_replay_controller.remove_router_patches()
-        runtime.moe_routing_replay_controller = None
+    """Configure MoE replay while avoiding repeated compiled-router monkeypatch churn.
 
+    Long-lived Megatron workers can execute many RL jobs against the same model.
+    Replacing router methods after every completed job leaves compiled graphs and
+    Dynamo weakrefs to old bound methods alive; completed RL jobs therefore keep
+    patches installed and only clear/swap replay state. Failed jobs and no-replay
+    jobs still remove patches so later forwards cannot silently use stale replay.
+    """
     if replay_bundle is not None and replay_bundle_path is not None:
         raise RuntimeError(
             "Provide either replay_bundle_path or replay_bundle, not both"
         )
     if replay_bundle is None and replay_bundle_path is None:
+        if runtime.moe_routing_replay_controller is None:
+            return
+        if preserve_installed:
+            runtime.moe_routing_replay_controller.clear_replay_state()
+            return
+        runtime.moe_routing_replay_controller.remove_router_patches()
+        runtime.moe_routing_replay_controller = None
         return
 
     if replay_bundle is None:
@@ -294,6 +306,13 @@ def configure_moe_routing_replay(
                 "replay_bundle_path is required when replay_bundle is None"
             )
         replay_bundle = MoeRoutingReplayBundle.from_dir(replay_bundle_path)
+
+    if runtime.moe_routing_replay_controller is not None:
+        runtime.moe_routing_replay_controller.update_bundle(
+            bundle=replay_bundle,
+            strict=strict,
+        )
+        return
 
     controller = MoeRoutingReplayController(
         bundle=replay_bundle,
@@ -584,7 +603,7 @@ def run_megatron_rl_job(
         )
         job_completed = True
     finally:
-        configure_moe_routing_replay(runtime)
+        configure_moe_routing_replay(runtime, preserve_installed=job_completed)
         if packed_tensors is not None:
             del packed_tensors
         if adapter_model is not None:
