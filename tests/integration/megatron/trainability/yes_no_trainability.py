@@ -35,6 +35,8 @@ from ..model_support.workflow_resources import (
 _TRAINER_GPU_IDS_ENV = "ART_MODEL_SUPPORT_TRAINER_GPU_IDS"
 _INFERENCE_GPU_IDS_ENV = "ART_MODEL_SUPPORT_INFERENCE_GPU_IDS"
 _SHARED_GPU_IDS_ENV = "ART_MODEL_SUPPORT_SHARED_GPU_IDS"
+_EXTERNAL_VLLM_URL_ENV = "ART_MODEL_SUPPORT_EXTERNAL_VLLM_URL"
+_EXTERNAL_VLLM_API_KEY_ENV = "ART_MODEL_SUPPORT_EXTERNAL_VLLM_API_KEY"
 _TRAINABILITY_ROOT = (
     Path(__file__).resolve().parents[4] / ".local" / "model_support_validation"
 )
@@ -126,6 +128,50 @@ def _parse_gpu_id_env(name: str) -> list[int] | None:
     if raw is None or raw.strip() == "":
         return None
     return [int(part.strip()) for part in raw.split(",") if part.strip()]
+
+
+def _external_vllm_runtime_config() -> dev.VllmRuntimeArgs | None:
+    server_url = os.environ.get(_EXTERNAL_VLLM_URL_ENV)
+    if server_url is None or server_url.strip() == "":
+        return None
+    return {
+        "mode": "external",
+        "server_url": server_url,
+        "api_key": os.environ.get(_EXTERNAL_VLLM_API_KEY_ENV, "art-external-vllm"),
+    }
+
+
+def _topology_with_env_overrides(topology: Topology) -> Topology:
+    updates: dict[str, int | bool] = {}
+    for env_name, attr in (
+        ("ART_MODEL_SUPPORT_TP", "tp"),
+        ("ART_MODEL_SUPPORT_EP", "ep"),
+        ("ART_MODEL_SUPPORT_ETP", "etp"),
+        ("ART_MODEL_SUPPORT_DP", "dp"),
+        ("ART_MODEL_SUPPORT_CP", "cp"),
+        ("ART_MODEL_SUPPORT_PP", "pp"),
+        ("ART_MODEL_SUPPORT_VPP", "vpp"),
+    ):
+        if raw_value := os.environ.get(env_name):
+            updates[attr] = int(raw_value)
+    if raw_sp := os.environ.get("ART_MODEL_SUPPORT_SP"):
+        updates["sp"] = raw_sp.strip().lower() in {"1", "true", "yes", "on"}
+    return topology.model_copy(update=updates) if updates else topology
+
+
+def _variant_with_env_overrides(
+    variant: _TrainabilityVariant,
+) -> _TrainabilityVariant:
+    trainer_gpu_ids = _parse_gpu_id_env(_TRAINER_GPU_IDS_ENV)
+    inference_gpu_ids = _parse_gpu_id_env(_INFERENCE_GPU_IDS_ENV)
+    updates: dict[str, object] = {}
+    if trainer_gpu_ids is not None:
+        updates["trainer_gpu_ids"] = trainer_gpu_ids
+    if inference_gpu_ids is not None:
+        updates["inference_gpu_ids"] = inference_gpu_ids
+    if variant.topology is not None:
+        updates["topology"] = _topology_with_env_overrides(variant.topology)
+    return variant.model_copy(update=updates) if updates else variant
 
 
 def _resolve_shared_gpu_ids() -> list[int]:
@@ -382,30 +428,36 @@ def _build_variant(
             shared_gpu_ids = _resolve_shared_gpu_ids()
         if not cp_supported:
             shared_world_size = len(shared_gpu_ids)
-            return _TrainabilityVariant(
+            return _variant_with_env_overrides(
+                _TrainabilityVariant(
+                    name=variant_name,
+                    backend_name="megatron",
+                    placement_mode="shared",
+                    topology=Topology(
+                        tp=shared_world_size,
+                        ep=shared_world_size if is_moe else 1,
+                        etp=1,
+                        dp=1,
+                        cp=1,
+                        sp=shared_world_size > 1,
+                    ),
+                    trainer_gpu_ids=shared_gpu_ids,
+                    inference_gpu_ids=shared_gpu_ids,
+                )
+            )
+        return _variant_with_env_overrides(
+            _TrainabilityVariant(
                 name=variant_name,
                 backend_name="megatron",
                 placement_mode="shared",
-                topology=Topology(
-                    tp=shared_world_size,
-                    ep=shared_world_size if is_moe else 1,
-                    etp=1,
-                    dp=1,
-                    cp=1,
-                    sp=shared_world_size > 1,
+                topology=(
+                    _SHARED_MEGATRON_TOPOLOGY
+                    if is_moe
+                    else _DENSE_SHARED_MEGATRON_TOPOLOGY
                 ),
                 trainer_gpu_ids=shared_gpu_ids,
                 inference_gpu_ids=shared_gpu_ids,
             )
-        return _TrainabilityVariant(
-            name=variant_name,
-            backend_name="megatron",
-            placement_mode="shared",
-            topology=(
-                _SHARED_MEGATRON_TOPOLOGY if is_moe else _DENSE_SHARED_MEGATRON_TOPOLOGY
-            ),
-            trainer_gpu_ids=shared_gpu_ids,
-            inference_gpu_ids=shared_gpu_ids,
         )
     if (
         variant_name == "megatron_dedicated"
@@ -414,38 +466,44 @@ def _build_variant(
         and stage_resources.vllm is not None
     ):
         workflow_topology = stage_resources.megatron.topology
-        return _TrainabilityVariant(
-            name=variant_name,
-            backend_name="megatron",
-            placement_mode="dedicated",
-            topology=Topology(
-                tp=workflow_topology.tp,
-                ep=workflow_topology.ep,
-                etp=workflow_topology.etp,
-                dp=workflow_topology.dp,
-                sp=workflow_topology.sp,
-                cp=workflow_topology.cp,
-                pp=workflow_topology.pp,
-            ),
-            trainer_gpu_ids=list(stage_resources.megatron.gpu_ids),
-            inference_gpu_ids=list(stage_resources.vllm.gpu_ids),
+        return _variant_with_env_overrides(
+            _TrainabilityVariant(
+                name=variant_name,
+                backend_name="megatron",
+                placement_mode="dedicated",
+                topology=Topology(
+                    tp=workflow_topology.tp,
+                    ep=workflow_topology.ep,
+                    etp=workflow_topology.etp,
+                    dp=workflow_topology.dp,
+                    sp=workflow_topology.sp,
+                    cp=workflow_topology.cp,
+                    pp=workflow_topology.pp,
+                ),
+                trainer_gpu_ids=list(stage_resources.megatron.gpu_ids),
+                inference_gpu_ids=list(stage_resources.vllm.gpu_ids),
+            )
         )
     trainer_gpu_ids, inference_gpu_ids = _resolve_dedicated_gpu_ids()
     if variant_name == "megatron_dedicated":
-        return _TrainabilityVariant(
+        return _variant_with_env_overrides(
+            _TrainabilityVariant(
+                name=variant_name,
+                backend_name="megatron",
+                placement_mode="dedicated",
+                topology=oracle_topology(is_moe=is_moe),
+                trainer_gpu_ids=trainer_gpu_ids,
+                inference_gpu_ids=inference_gpu_ids,
+            )
+        )
+    return _variant_with_env_overrides(
+        _TrainabilityVariant(
             name=variant_name,
-            backend_name="megatron",
+            backend_name="local",
             placement_mode="dedicated",
-            topology=oracle_topology(is_moe=is_moe),
             trainer_gpu_ids=trainer_gpu_ids,
             inference_gpu_ids=inference_gpu_ids,
         )
-    return _TrainabilityVariant(
-        name=variant_name,
-        backend_name="local",
-        placement_mode="dedicated",
-        trainer_gpu_ids=trainer_gpu_ids,
-        inference_gpu_ids=inference_gpu_ids,
     )
 
 
@@ -598,6 +656,8 @@ def _build_internal_config(
         init_args=_variant_init_args(variant),
         allow_unvalidated_arch=allow_unvalidated_arch,
     )
+    if external_runtime := _external_vllm_runtime_config():
+        internal_config["vllm_runtime"] = external_runtime
     if not shared:
         internal_config["trainer_gpu_ids"] = variant.trainer_gpu_ids
         internal_config["inference_gpu_ids"] = variant.inference_gpu_ids

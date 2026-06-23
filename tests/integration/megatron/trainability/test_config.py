@@ -251,3 +251,56 @@ def test_dsv4_trainability_uses_large_model_dedicated_resources(
         "cp": 1,
         "pp": 1,
     }
+
+
+def test_dsv4_trainability_external_vllm_env_overrides(
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(torch.cuda, "device_count", lambda: 8)
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(
+        torch.cuda,
+        "get_device_properties",
+        lambda device: SimpleNamespace(total_memory=140 * 1024**3),
+    )
+    monkeypatch.setattr(
+        "tests.integration.megatron.trainability.yes_no_trainability._safe_gpu_memory_utilization",
+        lambda device_ids: 0.5,
+    )
+    monkeypatch.setenv(
+        "ART_MODEL_SUPPORT_EXTERNAL_VLLM_URL",
+        "http://10.0.5.155:8000",
+    )
+    monkeypatch.setenv("ART_MODEL_SUPPORT_EXTERNAL_VLLM_API_KEY", "test-key")
+    monkeypatch.setenv("ART_MODEL_SUPPORT_TRAINER_GPU_IDS", "0,1,2,3,4,5,6,7")
+    monkeypatch.setenv("ART_MODEL_SUPPORT_INFERENCE_GPU_IDS", "0")
+    monkeypatch.setenv("ART_MODEL_SUPPORT_TP", "4")
+    monkeypatch.setenv("ART_MODEL_SUPPORT_EP", "8")
+    monkeypatch.setenv("ART_MODEL_SUPPORT_DP", "2")
+    monkeypatch.setenv("ART_MODEL_SUPPORT_CP", "1")
+    monkeypatch.setenv("ART_MODEL_SUPPORT_SP", "1")
+
+    variant = _build_variant(
+        "megatron_dedicated",
+        base_model="deepseek-ai/DeepSeek-V4-Flash",
+    )
+    config = _build_internal_config(
+        variant,
+        base_model="deepseek-ai/DeepSeek-V4-Flash",
+    )
+
+    assert variant.topology is not None
+    assert variant.topology.tp == 4
+    assert variant.topology.ep == 8
+    assert variant.topology.dp == 2
+    assert variant.topology.cp == 1
+    assert variant.topology.sp is True
+    assert variant.trainer_gpu_ids == [0, 1, 2, 3, 4, 5, 6, 7]
+    assert variant.inference_gpu_ids == [0]
+    assert config["trainer_gpu_ids"] == [0, 1, 2, 3, 4, 5, 6, 7]
+    assert config["inference_gpu_ids"] == [0]
+    assert config["vllm_runtime"] == {
+        "mode": "external",
+        "server_url": "http://10.0.5.155:8000",
+        "api_key": "test-key",
+    }
