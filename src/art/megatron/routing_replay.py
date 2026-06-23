@@ -821,6 +821,28 @@ class MoeRoutingReplayController:
                     _prepare_native_target_for_bound_router
                 )
 
+                def _hash_routing_with_replay_target(
+                    router_module: Any,
+                    *args: Any,
+                    _original_routing: Any = original_routing,
+                    _prepare_native_target: Any = prepare_native_target,
+                    **kwargs: Any,
+                ) -> Any:
+                    del router_module
+                    _prepare_native_target()
+                    return _original_routing(*args, **kwargs)
+
+                def _moe_routing_with_replay_target(
+                    router_module: Any,
+                    *args: Any,
+                    _original_routing: Any = original_routing,
+                    _prepare_native_target: Any = prepare_native_target,
+                    **kwargs: Any,
+                ) -> Any:
+                    del router_module
+                    _prepare_native_target()
+                    return _original_routing(*args, **kwargs)
+
                 def _routing_with_replay_target(
                     router_module: Any,
                     *args: Any,
@@ -835,7 +857,16 @@ class MoeRoutingReplayController:
                     _prepare_native_target()
                     return _original_routing(*args, **kwargs)
 
-                module.routing = types.MethodType(_routing_with_replay_target, module)
+                original_routing_name = getattr(
+                    getattr(original_routing, "__func__", None), "__name__", ""
+                )
+                if original_routing_name == "_hash_routing":
+                    routing_wrapper = _hash_routing_with_replay_target
+                elif original_routing_name == "_moe_routing":
+                    routing_wrapper = _moe_routing_with_replay_target
+                else:
+                    routing_wrapper = _routing_with_replay_target
+                module.routing = types.MethodType(routing_wrapper, module)
                 setattr(module, "_art_routing_replay_target_patched", True)
                 self._router_bindings[router_key] = {
                     "module": module,
