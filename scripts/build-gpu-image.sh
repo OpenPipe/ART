@@ -416,16 +416,21 @@ if [[ -n "${prewarm_refresh_tag_image}" ]]; then
   prewarm_display="${prewarm_image} and refreshing ${prewarm_refresh_tag_image}"
 fi
 prewarm_clear_tag_images=()
+prewarm_short_tag_image=""
 if [[ -n "${prewarm_refresh_tag_image}" ]]; then
   prewarm_clear_tag_images+=("${prewarm_refresh_tag_image}")
   case "${prewarm_refresh_tag_image}" in
     docker.io/*)
+      prewarm_short_tag_image="${prewarm_refresh_tag_image#docker.io/}"
       prewarm_clear_tag_images+=(
+        "${prewarm_short_tag_image}"
         "images.coreweave.com/cluster-images/${prewarm_refresh_tag_image#docker.io/}"
       )
       ;;
     registry-1.docker.io/*)
+      prewarm_short_tag_image="${prewarm_refresh_tag_image#registry-1.docker.io/}"
       prewarm_clear_tag_images+=(
+        "${prewarm_short_tag_image}"
         "images.coreweave.com/cluster-images/${prewarm_refresh_tag_image#registry-1.docker.io/}"
       )
       ;;
@@ -504,6 +509,18 @@ EOF
           memory: 16Mi
 EOF
   fi
+  if [[ -n "${prewarm_short_tag_image}" ]]; then
+    cat <<EOF
+    - name: refresh-short-tag
+      image: ${prewarm_short_tag_image}
+      imagePullPolicy: Always
+      command: ["bash", "-lc", "true"]
+      resources:
+        requests:
+          cpu: 10m
+          memory: 16Mi
+EOF
+  fi
 }
 
 render_prewarm_host_volumes() {
@@ -564,6 +581,18 @@ EOF
           cpu: 10m
           memory: 16Mi
 EOF
+  if [[ -n "${prewarm_short_tag_image}" ]]; then
+    cat <<EOF
+    - name: refresh-short-tag
+      image: ${prewarm_short_tag_image}
+      imagePullPolicy: Always
+      command: ["bash", "-lc", "true"]
+      resources:
+        requests:
+          cpu: 10m
+          memory: 16Mi
+EOF
+  fi
 }
 
 pod_init_image_id() {
@@ -578,6 +607,7 @@ pod_init_image_id() {
 verify_prewarm_refresh_tag_digest() {
   local pod="$1"
   local image_id
+  local failed=0
 
   if [[ -z "${prewarm_refresh_tag_image}" || -z "${image_digest}" ]]; then
     return 0
@@ -586,11 +616,22 @@ verify_prewarm_refresh_tag_digest() {
   image_id="$(pod_init_image_id "${pod}" refresh-tag)"
   if [[ "${image_id}" == *"@${image_digest}" ]]; then
     echo "Mutable tag ${prewarm_refresh_tag_image} resolved to ${image_id} in pod ${pod}"
-    return 0
+  else
+    echo "Mutable tag ${prewarm_refresh_tag_image} resolved to ${image_id:-<missing>} in pod ${pod}; expected @${image_digest}" >&2
+    failed=1
   fi
 
-  echo "Mutable tag ${prewarm_refresh_tag_image} resolved to ${image_id:-<missing>} in pod ${pod}; expected @${image_digest}" >&2
-  return 1
+  if [[ -n "${prewarm_short_tag_image}" ]]; then
+    image_id="$(pod_init_image_id "${pod}" refresh-short-tag)"
+    if [[ "${image_id}" == *"@${image_digest}" ]]; then
+      echo "Mutable tag ${prewarm_short_tag_image} resolved to ${image_id} in pod ${pod}"
+    else
+      echo "Mutable tag ${prewarm_short_tag_image} resolved to ${image_id:-<missing>} in pod ${pod}; expected @${image_digest}" >&2
+      failed=1
+    fi
+  fi
+
+  return "${failed}"
 }
 
 verify_steady_prewarm_daemonset() {
@@ -689,14 +730,13 @@ EOF
     if "${kubectl_cmd[@]}" wait -n "${prewarm_namespace}" \
       --for=condition=Ready "pod/${pod}" \
       --timeout="${prewarm_node_timeout}" >/dev/null 2>&1; then
-      image_id="$(pod_init_image_id "${pod}" refresh-tag)"
-      if [[ "${image_id}" == *"@${image_digest}" ]]; then
-        echo "Mutable tag ${prewarm_refresh_tag_image} converged to ${image_id}"
+      if verify_prewarm_refresh_tag_digest "${pod}"; then
+        echo "Mutable tags converged to ${image_digest}"
         "${kubectl_cmd[@]}" delete pod -n "${prewarm_namespace}" "${pod}" \
           --ignore-not-found --wait=true >/dev/null 2>&1 || true
         return 0
       fi
-      echo "Mutable tag check ${attempt}/${prewarm_tag_convergence_attempts} saw ${image_id:-<missing>}; expected @${image_digest}"
+      echo "Mutable tag check ${attempt}/${prewarm_tag_convergence_attempts} has not converged to ${image_digest}"
     else
       echo "Mutable tag check ${attempt}/${prewarm_tag_convergence_attempts} did not become ready"
       "${kubectl_cmd[@]}" describe pod -n "${prewarm_namespace}" "${pod}" || true
