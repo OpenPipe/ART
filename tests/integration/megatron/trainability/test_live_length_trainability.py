@@ -492,7 +492,12 @@ async def test_megatron_dedicated_length_trainability_live(artifact_dir: Path) -
     async with _backend_context(
         variant,
         backend_root=backend_root,
-        extra_env={"ART_MEGATRON_STREAMING_WEIGHT_OFFLOAD": "1"},
+        extra_env={
+            "ART_MEGATRON_STREAMING_WEIGHT_OFFLOAD": os.environ.get(
+                "ART_MEGATRON_STREAMING_WEIGHT_OFFLOAD",
+                "1",
+            )
+        },
     ) as backend:
         model = art.TrainableModel(
             name=f"length-{uuid.uuid4().hex[:8]}",
