@@ -593,6 +593,44 @@ verify_prewarm_refresh_tag_digest() {
   return 1
 }
 
+verify_steady_prewarm_daemonset() {
+  local attempt
+  local steady_pod
+  local -a steady_pods
+  local -a stale_pods
+
+  for attempt in $(seq 1 "${prewarm_node_retries}"); do
+    if ! "${kubectl_cmd[@]}" rollout status -n "${prewarm_namespace}" "daemonset/${prewarm_name}" --timeout="${prewarm_timeout}"; then
+      return 1
+    fi
+
+    mapfile -t steady_pods < <(
+      "${kubectl_cmd[@]}" get pods -n "${prewarm_namespace}" -l "app=${prewarm_name}" \
+        -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}' 2>/dev/null
+    )
+    stale_pods=()
+    for steady_pod in "${steady_pods[@]}"; do
+      if ! verify_prewarm_refresh_tag_digest "${steady_pod}"; then
+        stale_pods+=("${steady_pod}")
+      fi
+    done
+
+    if (( ${#stale_pods[@]} == 0 )); then
+      return 0
+    fi
+
+    if (( attempt == prewarm_node_retries )); then
+      echo "Steady-state ${prewarm_name} mutable tag verification failed after ${prewarm_node_retries} attempt(s)" >&2
+      return 1
+    fi
+
+    echo "Steady-state ${prewarm_name} has ${#stale_pods[@]} pod(s) with stale ${prewarm_refresh_tag_image}; recreating them (attempt ${attempt}/${prewarm_node_retries})"
+    "${kubectl_cmd[@]}" delete pod -n "${prewarm_namespace}" "${stale_pods[@]}" \
+      --wait=true >/dev/null 2>&1 || true
+    sleep "$((attempt * 10))"
+  done
+}
+
 wait_for_mutable_tag_convergence() {
   local node="$1"
   local pod="${prewarm_name}-tag-check"
@@ -837,21 +875,7 @@ $(render_prewarm_init_containers | sed 's/^/    /')
               memory: 16Mi
 $(render_prewarm_host_volumes | sed 's/^/      /')
 EOF
-    if ! "${kubectl_cmd[@]}" rollout status -n "${prewarm_namespace}" "daemonset/${prewarm_name}" --timeout="${prewarm_timeout}"; then
-      dump_prewarm_diagnostics
-      exit 1
-    fi
-    mapfile -t steady_pods < <(
-      "${kubectl_cmd[@]}" get pods -n "${prewarm_namespace}" -l "app=${prewarm_name}" \
-        -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}' 2>/dev/null
-    )
-    steady_failures=0
-    for steady_pod in "${steady_pods[@]}"; do
-      if ! verify_prewarm_refresh_tag_digest "${steady_pod}"; then
-        steady_failures=1
-      fi
-    done
-    if [[ "${steady_failures}" != "0" ]]; then
+    if ! verify_steady_prewarm_daemonset; then
       dump_prewarm_diagnostics
       exit 1
     fi
