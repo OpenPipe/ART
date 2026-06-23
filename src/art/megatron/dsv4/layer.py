@@ -1,3 +1,4 @@
+import types
 from typing import Any, cast
 
 from megatron.core.transformer.module import MegatronModule
@@ -77,12 +78,16 @@ class Dsv4Router(TopKRouter):
                     torch.arange(self.topk, dtype=torch.long) % int(cfg.num_moe_experts)
                 ).expand(int(vocab_size), -1)
                 cast(Tensor, self.tid2eid).copy_(expert_pattern)
-        elif "e_score_correction_bias" not in self._buffers:
-            self.register_buffer(
-                "e_score_correction_bias",
-                torch.zeros(int(cfg.num_moe_experts), dtype=torch.float32),
-                persistent=True,
-            )
+            routing_fn = Dsv4Router._hash_routing
+        else:
+            if "e_score_correction_bias" not in self._buffers:
+                self.register_buffer(
+                    "e_score_correction_bias",
+                    torch.zeros(int(cfg.num_moe_experts), dtype=torch.float32),
+                    persistent=True,
+                )
+            routing_fn = Dsv4Router._moe_routing
+        object.__setattr__(self, "routing", types.MethodType(routing_fn, self))
 
     def set_input_ids(self, input_ids: Tensor | None) -> None:
         self._dsv4_input_ids = input_ids
@@ -105,53 +110,40 @@ class Dsv4Router(TopKRouter):
             f"Unsupported DSV4 router score function {self.score_function!r}."
         )
 
-    def routing(self, logits: Tensor, padding_mask: Tensor | None = None):
+    def _select_indices(
+        self, selection_scores: Tensor, default_indices: Tensor
+    ) -> Tensor:
+        router_replay = getattr(self, "router_replay", None)
+        if router_replay is None:
+            return default_indices.long()
+
+        def default_compute_topk(
+            local_scores: Tensor,
+            topk: int,
+            num_groups: int | None = None,
+            group_topk: int | None = None,
+        ) -> tuple[Tensor, Tensor]:
+            del num_groups, group_topk
+            del topk
+            return local_scores.gather(1, default_indices), default_indices
+
+        _selected_scores, indices = router_replay.get_replay_topk(
+            selection_scores,
+            self.topk,
+            None,
+            None,
+            default_compute_topk,
+        )
+        return indices.long()
+
+    def _finish_routing(
+        self,
+        scores: Tensor,
+        indices: Tensor,
+        padding_mask: Tensor | None,
+        num_moe_experts: int,
+    ) -> tuple[Tensor, Tensor]:
         cfg = cast(Any, self.config)
-        num_moe_experts = int(cfg.num_moe_experts)
-        logits = logits.view(-1, num_moe_experts)
-        scores = self._scores(logits)
-
-        def select_indices(selection_scores: Tensor, default_indices: Tensor) -> Tensor:
-            router_replay = getattr(self, "router_replay", None)
-            if router_replay is None:
-                return default_indices.long()
-
-            def default_compute_topk(
-                local_scores: Tensor,
-                topk: int,
-                num_groups: int | None = None,
-                group_topk: int | None = None,
-            ) -> tuple[Tensor, Tensor]:
-                del num_groups, group_topk
-                del topk
-                return local_scores.gather(1, default_indices), default_indices
-
-            _selected_scores, indices = router_replay.get_replay_topk(
-                selection_scores,
-                self.topk,
-                None,
-                None,
-                default_compute_topk,
-            )
-            return indices.long()
-
-        if self._is_hash_layer():
-            if self._dsv4_input_ids is None:
-                raise RuntimeError(
-                    "DSV4 hash router requires input_ids for hash-moe layers."
-                )
-            tid2eid = cast(Tensor, self.tid2eid)
-            default_indices = tid2eid[self._dsv4_input_ids.reshape(-1)].long()
-            indices = select_indices(scores, default_indices)
-        else:
-            selection_scores = scores
-            e_score_correction_bias = getattr(self, "e_score_correction_bias", None)
-            if e_score_correction_bias is not None:
-                selection_scores = selection_scores + e_score_correction_bias
-            default_indices = selection_scores.topk(
-                self.topk, dim=-1, sorted=False
-            ).indices
-            indices = select_indices(selection_scores, default_indices)
         if indices.shape[-1] != self.topk:
             raise RuntimeError(
                 "DSV4 router selected an invalid number of experts: "
@@ -170,6 +162,36 @@ class Dsv4Router(TopKRouter):
             probs = torch.where(valid.unsqueeze(-1), probs, torch.zeros_like(probs))
             routing_map = routing_map & valid.unsqueeze(-1)
         return probs, routing_map
+
+    def _hash_routing(self, logits: Tensor, padding_mask: Tensor | None = None):
+        cfg = cast(Any, self.config)
+        num_moe_experts = int(cfg.num_moe_experts)
+        scores = self._scores(logits.view(-1, num_moe_experts))
+        if self._dsv4_input_ids is None:
+            raise RuntimeError(
+                "DSV4 hash router requires input_ids for hash-moe layers."
+            )
+        tid2eid = cast(Tensor, self.tid2eid)
+        default_indices = tid2eid[self._dsv4_input_ids.reshape(-1)].long()
+        indices = self._select_indices(scores, default_indices)
+        return self._finish_routing(scores, indices, padding_mask, num_moe_experts)
+
+    def _moe_routing(self, logits: Tensor, padding_mask: Tensor | None = None):
+        cfg = cast(Any, self.config)
+        num_moe_experts = int(cfg.num_moe_experts)
+        scores = self._scores(logits.view(-1, num_moe_experts))
+        selection_scores = scores
+        e_score_correction_bias = getattr(self, "e_score_correction_bias", None)
+        if e_score_correction_bias is not None:
+            selection_scores = selection_scores + e_score_correction_bias
+        default_indices = selection_scores.topk(self.topk, dim=-1, sorted=False).indices
+        indices = self._select_indices(selection_scores, default_indices)
+        return self._finish_routing(scores, indices, padding_mask, num_moe_experts)
+
+    def routing(self, logits: Tensor, padding_mask: Tensor | None = None):
+        if self._is_hash_layer():
+            return self._hash_routing(logits, padding_mask)
+        return self._moe_routing(logits, padding_mask)
 
 
 class Dsv4MoELayer(MoELayer):
