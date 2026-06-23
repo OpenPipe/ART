@@ -1271,27 +1271,34 @@ async def run_real_path_train_inf_mismatch(
         enable_expert_replay=is_moe,
     )
     backend_open = False
+    internal_config: dict[str, Any] = {
+        "trainer_gpu_ids": parity_config.trainer_gpu_ids,
+        "inference_gpu_ids": parity_config.inference_gpu_ids,
+        "rollout_weights_mode": rollout_weights_mode,
+        "allow_unvalidated_arch": parity_config.allow_unvalidated_arch,
+        "engine_args": {
+            "tensor_parallel_size": len(parity_config.inference_gpu_ids),
+            "enable_expert_parallel": is_moe
+            and len(parity_config.inference_gpu_ids) > 1,
+            "max_model_len": parity_config.packed.sequence_length + 8,
+            "max_logprobs": TOP_K,
+            **parity_config.engine_args,
+        },
+        "init_args": {
+            "max_seq_length": parity_config.packed.sequence_length,
+        },
+    }
+    if parity_config.external_vllm_server_url is not None:
+        internal_config["vllm_runtime"] = {
+            "mode": "external",
+            "server_url": parity_config.external_vllm_server_url,
+            "api_key": parity_config.external_vllm_api_key,
+        }
     model = art.TrainableModel(
         name=f"train-inf-real-{uuid.uuid4().hex[:8]}",
         project="train_inf_mismatch",
         base_model=parity_config.base_model,
-        _internal_config={
-            "trainer_gpu_ids": parity_config.trainer_gpu_ids,
-            "inference_gpu_ids": parity_config.inference_gpu_ids,
-            "rollout_weights_mode": rollout_weights_mode,
-            "allow_unvalidated_arch": parity_config.allow_unvalidated_arch,
-            "engine_args": {
-                "tensor_parallel_size": len(parity_config.inference_gpu_ids),
-                "enable_expert_parallel": is_moe
-                and len(parity_config.inference_gpu_ids) > 1,
-                "max_model_len": parity_config.packed.sequence_length + 8,
-                "max_logprobs": TOP_K,
-                **parity_config.engine_args,
-            },
-            "init_args": {
-                "max_seq_length": parity_config.packed.sequence_length,
-            },
-        },
+        _internal_config=cast(Any, internal_config),
     )
     _move_adapter_to_step_zero(adapter_path=adapter_path, model=model, backend=backend)
 

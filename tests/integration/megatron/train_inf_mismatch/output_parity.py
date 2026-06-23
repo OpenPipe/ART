@@ -112,6 +112,8 @@ class TrainInfOutputParityConfig(BaseModel):
     server_args: dict[str, Any] = Field(default_factory=dict)
     megatron_env: dict[str, str] = Field(default_factory=dict)
     replay_vllm_routing: bool = False
+    external_vllm_server_url: str | None = None
+    external_vllm_api_key: str | None = None
 
     @model_validator(mode="after")
     def _set_default_rollout_modes(self) -> "TrainInfOutputParityConfig":
@@ -323,7 +325,7 @@ def model_supports_context_parallel(
         base_model,
         allow_unvalidated_arch=allow_unvalidated_arch,
     )
-    return get_model_support_handler_for_spec(spec).cp_supported
+    return bool(getattr(get_model_support_handler_for_spec(spec), "cp_supported", True))
 
 
 def config_from_env() -> TrainInfOutputParityConfig:
@@ -417,6 +419,12 @@ def config_from_env() -> TrainInfOutputParityConfig:
         config.topology = config.topology.model_copy(update=updates)
     if raw_targets := os.environ.get("ART_TRAIN_INF_MISMATCH_LORA_TARGET_MODULES"):
         config.lora_target_modules = _parse_str_list(raw_targets)
+    if raw_url := os.environ.get("ART_TRAIN_INF_MISMATCH_EXTERNAL_VLLM_URL"):
+        config.external_vllm_server_url = raw_url
+        config.external_vllm_api_key = os.environ.get(
+            "ART_TRAIN_INF_MISMATCH_EXTERNAL_VLLM_API_KEY",
+            "art-external-vllm",
+        )
     return config
 
 
