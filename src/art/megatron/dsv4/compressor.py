@@ -26,6 +26,37 @@ class Dsv4CompressionLayout(NamedTuple):
     entry_valid: torch.Tensor
 
 
+def move_compression_layout_to_device(
+    layout: Dsv4CompressionLayout,
+    device: torch.device,
+) -> Dsv4CompressionLayout:
+    return Dsv4CompressionLayout(
+        *(tensor.to(device=device, non_blocking=True) for tensor in layout)
+    )
+
+
+def build_shared_prefix_compression_layouts(
+    *,
+    position_ids: torch.Tensor,
+    group_ids: torch.Tensor,
+    parent_ids: torch.Tensor,
+    device: torch.device,
+) -> dict[int, Dsv4CompressionLayout]:
+    return {
+        ratio: move_compression_layout_to_device(
+            build_shared_prefix_compression_layout(
+                position_ids=position_ids,
+                group_ids=group_ids,
+                parent_ids=parent_ids,
+                ratio=ratio,
+                duplicate_prompt_entries=ratio == 4,
+            ),
+            device,
+        )
+        for ratio in (4, 128)
+    }
+
+
 def _logical_window_indices(
     *,
     prompt_start: int,

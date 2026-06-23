@@ -49,6 +49,7 @@ class Dsv4Handler(DefaultMoeHandler):
     key = "dsv4"
     is_moe = True
     cp_supported = False
+    build_dsv4_compression_layouts = True
     native_vllm_lora_status = "validated"
 
     def identity_lora_model_config(self, base_config: Any) -> Any:

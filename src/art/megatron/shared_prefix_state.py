@@ -29,6 +29,7 @@ class SharedPrefixAttentionState(FlexSharedPrefixAttentionState):
 
     group_ids: Tensor
     parent_ids: Tensor
+    dsv4_compression_layouts: dict[int, Any] = Field(default_factory=dict)
     gdn_execution_spec: GdnPackedExecutionSpec | None = None
     gdn_execution_plan: GdnRankExecutionPlan | None = None
     gdn_hidden_layout: str = "attention"
@@ -50,6 +51,10 @@ def create_shared_prefix_state(
     parent_ids: Tensor,
     *,
     build_gdn_execution_spec: bool = False,
+    build_dsv4_compression_layouts: bool = False,
+    dsv4_position_ids: Tensor | None = None,
+    dsv4_group_ids: Tensor | None = None,
+    dsv4_parent_ids: Tensor | None = None,
     attention_token_layout_index: TokenLayoutIndex | None = None,
     attention_head_dim: int | None = None,
     attention_value_head_dim: int | None = None,
@@ -93,6 +98,13 @@ def create_shared_prefix_state(
         block_mask=block_mask,
         group_ids=group_ids,
         parent_ids=parent_ids,
+        dsv4_compression_layouts=_build_dsv4_compression_layouts_once(
+            position_ids=dsv4_position_ids,
+            group_ids=group_ids if dsv4_group_ids is None else dsv4_group_ids,
+            parent_ids=parent_ids if dsv4_parent_ids is None else dsv4_parent_ids,
+            build=build_dsv4_compression_layouts,
+            device=group_ids.device,
+        ),
         gdn_execution_spec=gdn_execution_spec,
         gdn_execution_plan=_build_gdn_execution_plan_once(
             gdn_execution_spec,
@@ -102,6 +114,30 @@ def create_shared_prefix_state(
             cp_group=cp_group,
             attention_token_layout_index=attention_token_layout_index,
         ),
+    )
+
+
+def _build_dsv4_compression_layouts_once(
+    *,
+    position_ids: Tensor | None,
+    group_ids: Tensor,
+    parent_ids: Tensor,
+    build: bool,
+    device: torch.device,
+) -> dict[int, Any]:
+    if not build:
+        return {}
+    if position_ids is None:
+        raise RuntimeError(
+            "DSV4 shared-prefix compression layouts require position ids."
+        )
+    from art.megatron.dsv4.compressor import build_shared_prefix_compression_layouts
+
+    return build_shared_prefix_compression_layouts(
+        position_ids=position_ids,
+        group_ids=group_ids,
+        parent_ids=parent_ids,
+        device=device,
     )
 
 

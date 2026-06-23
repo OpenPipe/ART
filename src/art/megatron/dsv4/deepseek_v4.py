@@ -33,7 +33,6 @@ from megatron.core.transformer.utils import make_sharded_tensors_for_checkpoint
 from art.megatron.dsv4.compressor import (
     DeepSeekV4Compressor,
     Dsv4CompressionLayout,
-    build_shared_prefix_compression_layout,
     compressed_layout_topk_idxs,
 )
 from art.megatron.dsv4.kernel.tilelang_sparse_mla import sparse_attn_tilelang
@@ -130,6 +129,25 @@ def _shared_prefix_window_topk_idxs(
         & (k_idx < seqlen)
     )
     return torch.where(valid, k_idx, torch.full_like(k_idx, -1))
+
+
+def _shared_prefix_compression_layout(
+    attention_bias: Any,
+    *,
+    ratio: int,
+) -> Dsv4CompressionLayout:
+    layouts = getattr(attention_bias, "dsv4_compression_layouts", None)
+    if not isinstance(layouts, dict) or ratio not in layouts:
+        raise RuntimeError(
+            "DSV4 shared-prefix compression layout was not prepared on the "
+            f"attention state for ratio={ratio}. Build it once per packed "
+            "sequence via create_shared_prefix_state(..., "
+            "build_dsv4_compression_layouts=True)."
+        )
+    layout = layouts[ratio]
+    if not isinstance(layout, Dsv4CompressionLayout):
+        raise TypeError(f"Expected Dsv4CompressionLayout for ratio={ratio}.")
+    return layout
 
 
 def _add_lora_if_present(
@@ -375,13 +393,9 @@ class DeepSeekV4Attention(MegatronModule):
             and shared_prefix is not None
             and position_ids is not None
         ):
-            group_ids, parent_ids = shared_prefix
-            shared_layout = build_shared_prefix_compression_layout(
-                position_ids=position_ids,
-                group_ids=group_ids,
-                parent_ids=parent_ids,
+            shared_layout = _shared_prefix_compression_layout(
+                attention_bias,
                 ratio=ratio,
-                duplicate_prompt_entries=ratio == 4,
             )
 
         q_after_wq_a = _add_lora_if_present(self, "wq_a_lora", self.wq_a(x)[0], x)
