@@ -24,7 +24,7 @@ backend = [
     "bitsandbytes>=0.45.2",
     "unsloth==2026.3.3",
     "unsloth-zoo==2026.3.1",
-    "torch>=2.11.0",
+    "torch==2.11.0",
     "torchao==0.16.0",
     "accelerate==1.7.0",
     "awscli>=1.38.1",
@@ -67,7 +67,7 @@ backend-cu130 = [
 ]
 megatron = [
     "numpy<2",
-    "torch>=2.11.0",
+    "torch==2.11.0",
     "flash-attn-4==4.0.0b5",
     "ninja>=1.11.1",
     "quack-kernels==0.3.7",
@@ -126,7 +126,7 @@ tinker = [
     "pydantic>=2.12.5",
     "tinker-cookbook>=0.3.0,<0.4",
     "tinker>=0.18.2,<0.19",
-    "torch>=2.11.0",
+    "torch==2.11.0",
     "transformers==5.2.0",
     "uvicorn>=0.35.0",
     "datrie>=0.8.3",
@@ -230,7 +230,6 @@ override-dependencies = [
     "nvidia-resiliency-ext<0.5",
     "quack-kernels==0.3.7",
     "transformers==5.2.0",
-    "torch==2.11.0",
 ]
 exclude-dependencies = ["pynvml", "emerging-optimizers", "torchvision"]
 no-build-isolation-package = ["apex", "transformer-engine", "transformer-engine-cu12", "transformer-engine-cu13", "transformer-engine-torch", "megatron-bridge", "deep-ep", "nv-grouped-gemm"]
@@ -254,6 +253,29 @@ requires-dist = ["packaging"]
 name = "deep-ep"
 version = "1.2.1+9af0e0d"
 requires-dist = []
+
+[[tool.uv.dependency-metadata]]
+name = "transformer-engine"
+version = "2.11.0"
+requires-dist = []
+
+[[tool.uv.dependency-metadata]]
+name = "transformer-engine"
+version = "2.14.0"
+requires-dist = []
+
+[[tool.uv.dependency-metadata]]
+name = "transformer-engine-torch"
+version = "2.11.0"
+requires-dist = [
+    "einops",
+    "onnx",
+    "onnxscript",
+    "packaging",
+    "pydantic",
+    "torch",
+    "transformer-engine-cu12",
+]
 
 [tool.ty.environment]
 python-version = "3.12"
