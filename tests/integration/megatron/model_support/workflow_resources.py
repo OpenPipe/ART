@@ -138,6 +138,7 @@ _DSV4_HF_OVERRIDES = {
     "mlp_layer_types": _DSV4_REPRESENTATIVE_MLP_LAYER_TYPES,
 }
 _DSV4_COMMON_VLLM_ENGINE_ARGS = {
+    "compilation_config": {"pass_config": {"fuse_allreduce_rms": False}},
     "disable_custom_all_reduce": True,
     "gpu_memory_utilization": 0.82,
     "kv_cache_dtype": "fp8",
