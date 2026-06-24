@@ -13,6 +13,10 @@ from art.megatron.dsv4.compressor import (
     Dsv4CompressionLayout,
     compressed_layout_visibility,
 )
+from art.megatron.dsv4.kernel.tilelang_indexer_fwd import (
+    indexer_fwd_interface,
+    shared_prefix_indexer_fwd_interface,
+)
 from art.megatron.dsv4.rope import (
     apply_rotary_emb,
     configure_rope_cache,
@@ -21,7 +25,7 @@ from art.megatron.dsv4.rope import (
 )
 from art.megatron.dsv4.utils import freeze_parameters_as_buffers, rotate_activation
 
-_INDEXER_QUERY_BLOCK = 256
+_INDEXER_QUERY_BLOCK = 512
 _INDEXER_HEAD_BLOCK = 8
 
 
@@ -109,6 +113,104 @@ def _exact_indexer_topk(
                     torch.full_like(top_indices, -1),
                     top_indices,
                 )
+    return out
+
+
+@torch.compiler.disable
+def _tilelang_indexer_topk(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    weights: torch.Tensor,
+    cu_seqlen_ks: torch.Tensor,
+    cu_seqlen_ke: torch.Tensor,
+    topk: int,
+    *,
+    shared_layout: Dsv4CompressionLayout | None = None,
+    position_ids: torch.Tensor | None = None,
+    group_ids: torch.Tensor | None = None,
+    parent_ids: torch.Tensor | None = None,
+) -> torch.Tensor:
+    seqlen, batch, heads, _ = q.shape
+    seqlen_kv = k.shape[0]
+    actual_topk = min(topk, seqlen_kv)
+    out = torch.empty(batch, seqlen, actual_topk, device=q.device, dtype=torch.long)
+    if actual_topk == 0:
+        return out
+
+    internal_q_block = max(1, 128 // heads)
+    q_block = (_INDEXER_QUERY_BLOCK // internal_q_block) * internal_q_block
+    q_block = max(internal_q_block, q_block)
+    fast_seqlen = (seqlen // internal_q_block) * internal_q_block
+
+    with torch.no_grad():
+        for b in range(batch):
+            if shared_layout is not None:
+                if position_ids is None or group_ids is None or parent_ids is None:
+                    raise ValueError(
+                        "DSV4 shared-prefix indexer requires position/group metadata."
+                    )
+                position_b = position_ids[b].to(torch.int32).contiguous()
+                group_b = group_ids[b].to(torch.int32).contiguous()
+                parent_b = parent_ids[b].to(torch.int32).contiguous()
+                entry_group_b = (
+                    shared_layout.entry_group_ids[b].to(torch.int32).contiguous()
+                )
+                entry_parent_visible_b = (
+                    shared_layout.entry_parent_visible[b].to(torch.int32).contiguous()
+                )
+                entry_end_b = (
+                    shared_layout.entry_end_positions[b].to(torch.int32).contiguous()
+                )
+                entry_valid_b = (
+                    shared_layout.entry_valid[b].to(torch.int32).contiguous()
+                )
+            for q_start in range(0, fast_seqlen, q_block):
+                q_end = min(q_start + q_block, fast_seqlen)
+                q_slice = q[q_start:q_end, b].contiguous()
+                k_slice = k[:, b].contiguous()
+                weights_slice = weights[q_start:q_end, b].contiguous()
+                if shared_layout is None:
+                    logits = indexer_fwd_interface(
+                        q_slice,
+                        k_slice,
+                        weights_slice,
+                        cu_seqlen_ks[q_start:q_end].contiguous(),
+                        cu_seqlen_ke[q_start:q_end].contiguous(),
+                    )
+                else:
+                    logits = shared_prefix_indexer_fwd_interface(
+                        q_slice,
+                        k_slice,
+                        weights_slice,
+                        position_b[q_start:q_end],
+                        group_b[q_start:q_end],
+                        parent_b[q_start:q_end],
+                        entry_group_b,
+                        entry_parent_visible_b,
+                        entry_end_b,
+                        entry_valid_b,
+                    )
+                top_scores, top_indices = logits.topk(actual_topk, dim=-1)
+                out[b, q_start:q_end] = torch.where(
+                    torch.isneginf(top_scores),
+                    torch.full_like(top_indices, -1),
+                    top_indices,
+                )
+        if fast_seqlen != seqlen:
+            out[:, fast_seqlen:] = _exact_indexer_topk(
+                q[fast_seqlen:],
+                k,
+                weights[fast_seqlen:],
+                cu_seqlen_ks[fast_seqlen:],
+                cu_seqlen_ke[fast_seqlen:],
+                topk,
+                shared_layout=shared_layout,
+                position_ids=None
+                if position_ids is None
+                else position_ids[:, fast_seqlen:],
+                group_ids=None if group_ids is None else group_ids[:, fast_seqlen:],
+                parent_ids=None if parent_ids is None else parent_ids[:, fast_seqlen:],
+            )
     return out
 
 
@@ -253,7 +355,7 @@ class V4Indexer(MegatronModule):
         cu_ks, cu_ke = _make_causal_cu_seqlens(
             seqlen_global, seqlen_kv, self.compress_ratio, q.device
         )
-        return _exact_indexer_topk(
+        return _tilelang_indexer_topk(
             q,
             k,
             weights.float(),

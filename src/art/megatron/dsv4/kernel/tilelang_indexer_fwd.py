@@ -182,6 +182,12 @@ def indexer_fwd_interface(
         )
     seq_len, heads, index_dim = q.shape
     seq_len_kv = kv.shape[0]
+    block_q = max(1, 128 // heads)
+    if seq_len % block_q != 0:
+        raise ValueError(
+            f"DSV4 indexer TileLang query length must be divisible by {block_q}, "
+            f"got {seq_len}."
+        )
 
     logits = torch.empty([seq_len, seq_len_kv], device=q.device, dtype=torch.float32)
     with preserve_tilelang_env():
@@ -197,6 +203,175 @@ def indexer_fwd_interface(
         )
         if clean_logits:
             clean_logits_kernel(logits, cu_seqlen_ks, cu_seqlen_ke)
+    return logits
+
+
+@tilelang.jit(
+    pass_configs={
+        tilelang.PassConfigKey.TL_ENABLE_FAST_MATH: True,
+        tilelang.PassConfigKey.TL_DISABLE_DATA_RACE_CHECK: True,
+    },
+)
+def tl_shared_prefix_indexer_fwd_impl(
+    heads,
+    index_dim,
+    block_N=256,
+    num_stages=3,
+    threads=512,
+    block_Q=None,
+):
+    if block_Q is None:
+        block_Q = 128 // heads
+    dtype = T.bfloat16
+    accum_dtype = T.float32
+    index_dtype = T.int32
+
+    seq_len = T.dynamic("seq_len")
+    seq_len_kv = T.dynamic("seq_len_kv")
+
+    index_q_shape = [seq_len * heads, index_dim]
+    index_k_shape = [seq_len_kv, index_dim]
+    logits_shape = [seq_len, seq_len_kv]
+
+    @T.prim_func
+    def tl_shared_prefix_indexer_fwd_kernel(
+        IndexQ: T.Tensor(index_q_shape, dtype),  # type: ignore
+        IndexK: T.Tensor(index_k_shape, dtype),  # type: ignore
+        Logits: T.Tensor(logits_shape, accum_dtype),  # type: ignore
+        Weights: T.Tensor([seq_len, heads], accum_dtype),  # type: ignore
+        QPosition: T.Tensor([seq_len], index_dtype),  # type: ignore
+        QGroup: T.Tensor([seq_len], index_dtype),  # type: ignore
+        QParent: T.Tensor([seq_len], index_dtype),  # type: ignore
+        EntryGroup: T.Tensor([seq_len_kv], index_dtype),  # type: ignore
+        EntryParentVisible: T.Tensor([seq_len_kv], index_dtype),  # type: ignore
+        EntryEndPosition: T.Tensor([seq_len_kv], index_dtype),  # type: ignore
+        EntryValid: T.Tensor([seq_len_kv], index_dtype),  # type: ignore
+    ):
+        with T.Kernel(T.ceildiv(seq_len, block_Q), threads=threads) as bx:
+            index_q_shared = T.alloc_shared([block_Q * heads, index_dim], dtype)
+            index_k_shared = T.alloc_shared([block_N, index_dim], dtype)
+            s = T.alloc_fragment([block_N, block_Q * heads], accum_dtype)
+            s_reshaped = T.reshape(s, (block_N, block_Q, heads))
+            logits = T.alloc_fragment([block_N, block_Q], accum_dtype)
+            weights = T.alloc_fragment([block_Q, heads], accum_dtype)
+
+            seq_len_i = bx * block_Q
+
+            T.copy(IndexQ[seq_len_i * heads, 0], index_q_shared)
+            T.copy(Weights[seq_len_i, 0], weights)
+
+            for nbn_i in T.Pipelined(
+                T.ceildiv(seq_len_kv, block_N), num_stages=num_stages
+            ):
+                for bn_i, d_i in T.Parallel(block_N, index_dim):
+                    k_i = nbn_i * block_N + bn_i
+                    index_k_shared[bn_i, d_i] = T.if_then_else(
+                        k_i < seq_len_kv,
+                        IndexK[k_i, d_i],
+                        0,
+                    )
+
+                T.gemm(
+                    index_k_shared,
+                    index_q_shared,
+                    s,
+                    transpose_B=True,
+                    clear_accum=True,
+                    policy=T.GemmWarpPolicy.FullCol,
+                )
+
+                for bn_i, bq_i, h_i in T.Parallel(block_N, block_Q, heads):
+                    s_reshaped[bn_i, bq_i, h_i] = (
+                        T.max(s_reshaped[bn_i, bq_i, h_i], 0) * weights[bq_i, h_i]
+                    )
+
+                T.reduce_sum(s_reshaped, logits, dim=-1, clear=True)
+
+                for bq_i, bn_i in T.Parallel(block_Q, block_N):
+                    q_i = seq_len_i + bq_i
+                    k_i = nbn_i * block_N + bn_i
+                    if k_i < seq_len_kv:
+                        entry_group = EntryGroup[k_i]
+                        visible = (
+                            (EntryValid[k_i] != 0)
+                            and (EntryEndPosition[k_i] <= QPosition[q_i])
+                            and (
+                                (entry_group == QGroup[q_i])
+                                or (
+                                    (EntryParentVisible[k_i] != 0)
+                                    and (entry_group == QParent[q_i])
+                                )
+                            )
+                        )
+                        Logits[q_i, k_i] = T.if_then_else(
+                            visible,
+                            logits[bn_i, bq_i],
+                            -T.infinity(accum_dtype),
+                        )
+
+    return tl_shared_prefix_indexer_fwd_kernel
+
+
+def _i32_contiguous(tensor):
+    if tensor.dtype != torch.int32:
+        tensor = tensor.to(torch.int32)
+    return tensor.contiguous()
+
+
+def shared_prefix_indexer_fwd_interface(
+    q,
+    kv,
+    weights,
+    position_ids,
+    group_ids,
+    parent_ids,
+    entry_group_ids,
+    entry_parent_visible,
+    entry_end_positions,
+    entry_valid,
+):
+    """Compute shared-prefix-aware indexer logits for one batch element.
+
+    The output is intentionally block-local [query_block, compressed_kv] fp32.
+    Callers run topk on this block to avoid materializing full [S, compressed_kv]
+    logits for long shared-prefix packed sequences.
+    """
+    if q.dtype is torch.float32:
+        q = q.to(torch.bfloat16)
+    if kv.dtype is torch.float32:
+        kv = kv.to(torch.bfloat16)
+    if q.dtype != torch.bfloat16 or kv.dtype != torch.bfloat16:
+        raise TypeError(
+            f"DSV4 indexer TileLang launch requires bf16, got {q.dtype=}, {kv.dtype=}"
+        )
+    seq_len, heads, index_dim = q.shape
+    seq_len_kv = kv.shape[0]
+    block_q = max(1, 128 // heads)
+    if seq_len % block_q != 0:
+        raise ValueError(
+            "DSV4 shared-prefix indexer TileLang query length must be divisible "
+            f"by {block_q}, got {seq_len}."
+        )
+
+    logits = torch.empty([seq_len, seq_len_kv], device=q.device, dtype=torch.float32)
+    with preserve_tilelang_env():
+        tl_indexer_fwd_kernel = tl_shared_prefix_indexer_fwd_impl(
+            heads=heads,
+            index_dim=index_dim,
+        )
+        tl_indexer_fwd_kernel(
+            q.view(seq_len * heads, index_dim),
+            kv,
+            logits,
+            weights.float(),
+            _i32_contiguous(position_ids),
+            _i32_contiguous(group_ids),
+            _i32_contiguous(parent_ids),
+            _i32_contiguous(entry_group_ids),
+            _i32_contiguous(entry_parent_visible),
+            _i32_contiguous(entry_end_positions),
+            _i32_contiguous(entry_valid),
+        )
     return logits
 
 
