@@ -25,10 +25,8 @@ def rotate_activation(x: torch.Tensor) -> torch.Tensor:
     h = 1
     while h < width:
         y = y.reshape(*x.shape[:-1], width // (2 * h), 2, h)
-        left = y[..., 0, :].clone()
-        right = y[..., 1, :].clone()
-        y[..., 0, :] = left + right
-        y[..., 1, :] = left - right
+        left, right = y.unbind(dim=-2)
+        y = torch.stack((left + right, left - right), dim=-2)
         y = y.reshape(*x.shape[:-1], width)
         h *= 2
     return (y * (width**-0.5)).to(x.dtype)

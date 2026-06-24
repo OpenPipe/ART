@@ -63,7 +63,7 @@ def _exact_indexer_topk(
     seqlen, batch, heads, _ = q.shape
     seqlen_kv = k.shape[0]
     actual_topk = min(topk, seqlen_kv)
-    out = torch.empty(batch, seqlen, actual_topk, device=q.device, dtype=torch.long)
+    out = torch.empty(batch, seqlen, actual_topk, device=q.device, dtype=torch.int32)
     if actual_topk == 0:
         return out
 
@@ -129,11 +129,13 @@ def _tilelang_indexer_topk(
     position_ids: torch.Tensor | None = None,
     group_ids: torch.Tensor | None = None,
     parent_ids: torch.Tensor | None = None,
+    shared_layout_i32: tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]
+    | None = None,
 ) -> torch.Tensor:
     seqlen, batch, heads, _ = q.shape
     seqlen_kv = k.shape[0]
     actual_topk = min(topk, seqlen_kv)
-    out = torch.empty(batch, seqlen, actual_topk, device=q.device, dtype=torch.long)
+    out = torch.empty(batch, seqlen, actual_topk, device=q.device, dtype=torch.int32)
     if actual_topk == 0:
         return out
 
@@ -149,21 +151,29 @@ def _tilelang_indexer_topk(
                     raise ValueError(
                         "DSV4 shared-prefix indexer requires position/group metadata."
                     )
+                if shared_layout_i32 is None:
+                    entry_group_ids = shared_layout.entry_group_ids.to(torch.int32)
+                    entry_parent_visible = shared_layout.entry_parent_visible.to(
+                        torch.int32
+                    )
+                    entry_end_positions = shared_layout.entry_end_positions.to(
+                        torch.int32
+                    )
+                    entry_valid = shared_layout.entry_valid.to(torch.int32)
+                else:
+                    (
+                        entry_group_ids,
+                        entry_parent_visible,
+                        entry_end_positions,
+                        entry_valid,
+                    ) = shared_layout_i32
                 position_b = position_ids[b].to(torch.int32).contiguous()
                 group_b = group_ids[b].to(torch.int32).contiguous()
                 parent_b = parent_ids[b].to(torch.int32).contiguous()
-                entry_group_b = (
-                    shared_layout.entry_group_ids[b].to(torch.int32).contiguous()
-                )
-                entry_parent_visible_b = (
-                    shared_layout.entry_parent_visible[b].to(torch.int32).contiguous()
-                )
-                entry_end_b = (
-                    shared_layout.entry_end_positions[b].to(torch.int32).contiguous()
-                )
-                entry_valid_b = (
-                    shared_layout.entry_valid[b].to(torch.int32).contiguous()
-                )
+                entry_group_b = entry_group_ids[b].contiguous()
+                entry_parent_visible_b = entry_parent_visible[b].contiguous()
+                entry_end_b = entry_end_positions[b].contiguous()
+                entry_valid_b = entry_valid[b].contiguous()
             for q_start in range(0, fast_seqlen, q_block):
                 q_end = min(q_start + q_block, fast_seqlen)
                 q_slice = q[q_start:q_end, b].contiguous()
@@ -288,6 +298,8 @@ class V4Indexer(MegatronModule):
         shared_layout: Dsv4CompressionLayout | None = None,
         group_ids: torch.Tensor | None = None,
         parent_ids: torch.Tensor | None = None,
+        shared_layout_i32: tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]
+        | None = None,
     ):
         """Forward pass.
 
@@ -366,4 +378,5 @@ class V4Indexer(MegatronModule):
             position_ids=position_ids,
             group_ids=group_ids,
             parent_ids=parent_ids,
+            shared_layout_i32=shared_layout_i32,
         )

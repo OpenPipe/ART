@@ -54,7 +54,7 @@ def _window_topk_idxs(
     )
     k_pos = (base - window_size + 1).clamp(0) + offsets
     topk = torch.where(k_pos > base, -1, k_pos)
-    return topk.unsqueeze(0).expand(bsz, -1, -1)
+    return topk.unsqueeze(0).expand(bsz, -1, -1).to(torch.int32)
 
 
 def _compress_topk_idxs(
@@ -69,7 +69,7 @@ def _compress_topk_idxs(
     compress = torch.where(
         k_group_idx >= q_first_invalid_group, -1, k_group_idx + offset
     )
-    return compress.unsqueeze(0).expand(bsz, -1, -1)
+    return compress.unsqueeze(0).expand(bsz, -1, -1).to(torch.int32)
 
 
 def _shared_prefix_tensors(
@@ -128,7 +128,104 @@ def _shared_prefix_window_topk_idxs(
         & (k_idx >= 0)
         & (k_idx < seqlen)
     )
-    return torch.where(valid, k_idx, torch.full_like(k_idx, -1))
+    return torch.where(valid, k_idx, torch.full_like(k_idx, -1)).to(torch.int32)
+
+
+def _dsv4_topk_cache(attention_bias: Any) -> dict[Any, Any]:
+    cache = getattr(attention_bias, "dsv4_topk_idx_cache", None)
+    if not isinstance(cache, dict):
+        raise RuntimeError("DSV4 shared-prefix attention state is missing topk cache.")
+    return cache
+
+
+def _shared_prefix_window_topk_idxs_cached(
+    attention_bias: Any,
+    position_ids: torch.Tensor,
+    group_ids: torch.Tensor,
+    parent_ids: torch.Tensor,
+    *,
+    window_size: int,
+) -> torch.Tensor:
+    cache = _dsv4_topk_cache(attention_bias)
+    key = ("raw_swa", int(window_size))
+    cached = cache.get(key)
+    if cached is None:
+        cached = _shared_prefix_window_topk_idxs(
+            position_ids,
+            group_ids,
+            parent_ids,
+            window_size=window_size,
+        ).contiguous()
+        cache[key] = cached
+    return cached
+
+
+def _shared_prefix_compressed_topk_idxs_cached(
+    attention_bias: Any,
+    layout: Dsv4CompressionLayout,
+    *,
+    position_ids: torch.Tensor,
+    group_ids: torch.Tensor,
+    parent_ids: torch.Tensor,
+    ratio: int,
+    offset: int,
+) -> torch.Tensor:
+    cache = _dsv4_topk_cache(attention_bias)
+    key = ("compressed", int(ratio), int(offset))
+    cached = cache.get(key)
+    if cached is None:
+        cached = (
+            compressed_layout_topk_idxs(
+                layout,
+                position_ids=position_ids,
+                group_ids=group_ids,
+                parent_ids=parent_ids,
+                offset=offset,
+            )
+            .to(torch.int32)
+            .contiguous()
+        )
+        cache[key] = cached
+    return cached
+
+
+def _shared_prefix_i32_metadata_cached(
+    attention_bias: Any,
+    position_ids: torch.Tensor,
+    group_ids: torch.Tensor,
+    parent_ids: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    cache = _dsv4_topk_cache(attention_bias)
+    key = "indexer_q_metadata_i32"
+    cached = cache.get(key)
+    if cached is None:
+        cached = (
+            position_ids.to(torch.int32).contiguous(),
+            group_ids.to(torch.int32).contiguous(),
+            parent_ids.to(torch.int32).contiguous(),
+        )
+        cache[key] = cached
+    return cached
+
+
+def _shared_layout_indexer_metadata_cached(
+    attention_bias: Any,
+    layout: Dsv4CompressionLayout,
+    *,
+    ratio: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    cache = _dsv4_topk_cache(attention_bias)
+    key = ("indexer_layout_i32", int(ratio))
+    cached = cache.get(key)
+    if cached is None:
+        cached = (
+            layout.entry_group_ids.to(torch.int32).contiguous(),
+            layout.entry_parent_visible.to(torch.int32).contiguous(),
+            layout.entry_end_positions.to(torch.int32).contiguous(),
+            layout.entry_valid.to(torch.int32).contiguous(),
+        )
+        cache[key] = cached
+    return cached
 
 
 def _shared_prefix_compression_layout(
@@ -419,7 +516,8 @@ class DeepSeekV4Attention(MegatronModule):
 
         if shared_prefix is not None and position_ids is not None:
             group_ids, parent_ids = shared_prefix
-            topk_idxs = _shared_prefix_window_topk_idxs(
+            topk_idxs = _shared_prefix_window_topk_idxs_cached(
+                attention_bias,
                 position_ids,
                 group_ids,
                 parent_ids,
@@ -442,15 +540,32 @@ class DeepSeekV4Attention(MegatronModule):
                     )
                 if isinstance(self.indexer, V4Indexer):
                     group_ids = parent_ids = None
+                    shared_layout_i32 = None
+                    index_position_ids = position_ids
                     if shared_prefix is not None:
                         group_ids, parent_ids = shared_prefix
+                        if position_ids is not None and shared_layout is not None:
+                            index_position_ids, group_ids, parent_ids = (
+                                _shared_prefix_i32_metadata_cached(
+                                    attention_bias,
+                                    position_ids,
+                                    group_ids,
+                                    parent_ids,
+                                )
+                            )
+                            shared_layout_i32 = _shared_layout_indexer_metadata_cached(
+                                attention_bias,
+                                shared_layout,
+                                ratio=ratio,
+                            )
                     compress_topk_idxs = self.indexer(
                         x_sbd,
                         qr_sbd,
-                        position_ids=position_ids,
+                        position_ids=index_position_ids,
                         shared_layout=shared_layout,
                         group_ids=group_ids,
                         parent_ids=parent_ids,
+                        shared_layout_i32=shared_layout_i32,
                     )
                 else:
                     indexer_mask = self._compute_indexer_mask(
@@ -484,15 +599,17 @@ class DeepSeekV4Attention(MegatronModule):
                     )
                 else:
                     group_ids, parent_ids = shared_prefix
-                    compress_topk_idxs = compressed_layout_topk_idxs(
+                    compress_topk_idxs = _shared_prefix_compressed_topk_idxs_cached(
+                        attention_bias,
                         shared_layout,
                         position_ids=position_ids,
                         group_ids=group_ids,
                         parent_ids=parent_ids,
+                        ratio=ratio,
                         offset=kv_compress_offset,
                     )
             topk_idxs = torch.cat([topk_idxs, compress_topk_idxs], dim=-1)
-        topk_idxs = topk_idxs.int()
+        topk_idxs = topk_idxs.to(torch.int32)
 
         kv_compress = None
         if self.compress_ratio:

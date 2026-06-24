@@ -30,6 +30,7 @@ class SharedPrefixAttentionState(FlexSharedPrefixAttentionState):
     group_ids: Tensor
     parent_ids: Tensor
     dsv4_compression_layouts: dict[int, Any] = Field(default_factory=dict)
+    dsv4_topk_idx_cache: dict[Any, Any] = Field(default_factory=dict)
     gdn_execution_spec: GdnPackedExecutionSpec | None = None
     gdn_execution_plan: GdnRankExecutionPlan | None = None
     gdn_hidden_layout: str = "attention"

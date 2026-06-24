@@ -24,6 +24,20 @@ def _sparse_attn_torch(q, kv, attn_sink, topk_idxs, sm_scale):
     return torch.einsum("bshk,bskd->bshd", attn_probs, selected_kv.float())
 
 
+def _pad_topk_idxs(topk_idxs: torch.Tensor, block_size: int = 64) -> torch.Tensor:
+    topk = int(topk_idxs.shape[-1])
+    padded_topk = (topk + block_size - 1) // block_size * block_size
+    if padded_topk == topk:
+        return topk_idxs
+    pad = torch.full(
+        (*topk_idxs.shape[:-1], padded_topk - topk),
+        -1,
+        device=topk_idxs.device,
+        dtype=topk_idxs.dtype,
+    )
+    return torch.cat([topk_idxs, pad], dim=-1).contiguous()
+
+
 class DeepSeekV4SparseAttention(torch.autograd.Function):
     @staticmethod
     def forward(ctx, q, kv, attn_sink, topk_idxs, sm_scale=None, output_dtype=None):
@@ -82,7 +96,7 @@ def sparse_attn_tilelang(q, kv, attn_sink, topk_idxs, sm_scale=None):
         kv = kv.to(q.dtype)
     q = q.contiguous()
     kv = kv.contiguous()
-    topk_idxs = topk_idxs.contiguous()
+    topk_idxs = _pad_topk_idxs(topk_idxs.contiguous())
     head_count = int(q.shape[2])
     if head_count < 16:
         pad_heads = 16 - head_count
