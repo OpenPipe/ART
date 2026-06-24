@@ -206,6 +206,28 @@ def indexer_fwd_interface(
     return logits
 
 
+def _topk_indices_from_logits(logits, topk):
+    actual_topk = min(int(topk), int(logits.shape[-1]))
+    top_scores, top_indices = logits.topk(actual_topk, dim=-1)
+    return torch.where(
+        torch.isneginf(top_scores),
+        torch.full_like(top_indices, -1),
+        top_indices,
+    ).to(torch.int32)
+
+
+def indexer_topk_interface(q, kv, weights, cu_seqlen_ks, cu_seqlen_ke, topk):
+    """Compute DSV4 indexer scores and return top-k compressed ids.
+
+    Keep topk owned by the indexer wrapper so callers do not materialize or
+    inspect dense logits.
+    """
+    return _topk_indices_from_logits(
+        indexer_fwd_interface(q, kv, weights, cu_seqlen_ks, cu_seqlen_ke),
+        topk,
+    )
+
+
 @tilelang.jit(
     pass_configs={
         tilelang.PassConfigKey.TL_ENABLE_FAST_MATH: True,
@@ -373,6 +395,37 @@ def shared_prefix_indexer_fwd_interface(
             _i32_contiguous(entry_valid),
         )
     return logits
+
+
+def shared_prefix_indexer_topk_interface(
+    q,
+    kv,
+    weights,
+    position_ids,
+    group_ids,
+    parent_ids,
+    entry_group_ids,
+    entry_parent_visible,
+    entry_end_positions,
+    entry_valid,
+    topk,
+):
+    """Compute shared-prefix-aware DSV4 indexer top-k compressed ids."""
+    return _topk_indices_from_logits(
+        shared_prefix_indexer_fwd_interface(
+            q,
+            kv,
+            weights,
+            position_ids,
+            group_ids,
+            parent_ids,
+            entry_group_ids,
+            entry_parent_visible,
+            entry_end_positions,
+            entry_valid,
+        ),
+        topk,
+    )
 
 
 @torch.compiler.disable

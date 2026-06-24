@@ -14,8 +14,8 @@ from art.megatron.dsv4.compressor import (
     compressed_layout_visibility,
 )
 from art.megatron.dsv4.kernel.tilelang_indexer_fwd import (
-    indexer_fwd_interface,
-    shared_prefix_indexer_fwd_interface,
+    indexer_topk_interface,
+    shared_prefix_indexer_topk_interface,
 )
 from art.megatron.dsv4.rope import (
     apply_rotary_emb,
@@ -180,15 +180,16 @@ def _tilelang_indexer_topk(
                 k_slice = k[:, b].contiguous()
                 weights_slice = weights[q_start:q_end, b].contiguous()
                 if shared_layout is None:
-                    logits = indexer_fwd_interface(
+                    out[b, q_start:q_end] = indexer_topk_interface(
                         q_slice,
                         k_slice,
                         weights_slice,
                         cu_seqlen_ks[q_start:q_end].contiguous(),
                         cu_seqlen_ke[q_start:q_end].contiguous(),
+                        topk,
                     )
                 else:
-                    logits = shared_prefix_indexer_fwd_interface(
+                    out[b, q_start:q_end] = shared_prefix_indexer_topk_interface(
                         q_slice,
                         k_slice,
                         weights_slice,
@@ -199,13 +200,8 @@ def _tilelang_indexer_topk(
                         entry_parent_visible_b,
                         entry_end_b,
                         entry_valid_b,
+                        topk,
                     )
-                top_scores, top_indices = logits.topk(actual_topk, dim=-1)
-                out[b, q_start:q_end] = torch.where(
-                    torch.isneginf(top_scores),
-                    torch.full_like(top_indices, -1),
-                    top_indices,
-                )
         if fast_seqlen != seqlen:
             out[:, fast_seqlen:] = _exact_indexer_topk(
                 q[fast_seqlen:],
