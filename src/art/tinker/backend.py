@@ -5,9 +5,10 @@ from mp_actors import move_to_child_process
 
 from .. import dev
 from ..backend import AnyTrainableModel
+from ..costs import build_cost_calculator, get_model_pricing
 from ..local.backend import LocalBackend
 from ..local.service import ModelService
-from ..model import TrainableModel
+from ..model import Model, TrainableModel
 from ..utils.output_dirs import get_model_dir
 from .renderers import get_renderer_name
 
@@ -27,6 +28,15 @@ class TinkerBackend(LocalBackend):
             print("Setting TINKER_API_KEY to", tinker_api_key, "in environment")
             os.environ["TINKER_API_KEY"] = tinker_api_key
         super().__init__(in_process=in_process, path=path)
+
+    async def register(self, model: Model) -> None:
+        await super().register(model)
+        if not model.trainable:
+            return
+        trainable_model = cast(TrainableModel, model)
+        pricing = get_model_pricing(trainable_model.base_model)
+        if pricing is not None:
+            trainable_model.set_cost_calculator(build_cost_calculator(pricing))
 
     async def _prepare_backend_for_training(
         self,

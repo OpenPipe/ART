@@ -51,7 +51,6 @@ from .._backend_training import (
     build_rl_train_configs,
 )
 from ..backend import AnyTrainableModel, Backend
-from ..costs import build_cost_calculator, get_model_pricing
 from ..metrics_taxonomy import (
     TRAIN_GRADIENT_STEPS_KEY,
     build_training_summary_metrics,
@@ -358,11 +357,6 @@ class LocalBackend(Backend):
         # (wandb initialization is now handled by the model's _get_wandb_run method)
         if model.trainable and "WANDB_API_KEY" in os.environ:
             _ = model._get_wandb_run()
-        if model.trainable:
-            trainable_model = cast(TrainableModel, model)
-            pricing = get_model_pricing(trainable_model.base_model)
-            if pricing is not None:
-                trainable_model.set_cost_calculator(build_cost_calculator(pricing))
 
     def _model_inference_name(self, model: Model, step: int | None = None) -> str:
         """Return the inference name for a model checkpoint.

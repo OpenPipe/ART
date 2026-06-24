@@ -3,7 +3,8 @@ from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 import json
 from pathlib import Path
-from types import SimpleNamespace
+import sys
+from types import ModuleType, SimpleNamespace
 from typing import Any, cast
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -756,6 +757,76 @@ def test_local_backend_get_packed_tensors_warns_and_drops_overlong_results(
 
     assert packed_tensors is not None
     assert packed_tensors["tokens"].shape == (1, 4)
+
+
+@pytest.mark.asyncio
+async def test_local_backend_register_leaves_token_priced_generation_costs_disabled(
+    tmp_path: Path,
+) -> None:
+    model = TrainableModel(
+        name="local-backend-cost-accounting",
+        project="pipeline-tests",
+        base_model="openai/gpt-oss-20b",
+        base_path=str(tmp_path),
+    )
+    backend = LocalBackend(path=str(tmp_path))
+
+    with patch.object(model, "_get_wandb_run", return_value=None):
+        await backend.register(model)
+
+    assert model.cost_calculator(1_000, 2_000, "train") == {}
+
+
+@pytest.mark.asyncio
+async def test_megatron_backend_register_disables_token_priced_generation_costs(
+    tmp_path: Path,
+) -> None:
+    model = TrainableModel(
+        name="megatron-backend-cost-accounting",
+        project="pipeline-tests",
+        base_model="openai/gpt-oss-20b",
+        base_path=str(tmp_path),
+    )
+    backend = MegatronBackend(path=str(tmp_path))
+
+    with patch.object(model, "_get_wandb_run", return_value=None):
+        await backend.register(model)
+
+    assert model.cost_calculator(1_000, 2_000, "train") == {}
+
+
+@pytest.mark.asyncio
+async def test_tinker_backend_register_enables_tinker_token_priced_generation_costs(
+    tmp_path: Path,
+) -> None:
+    fake_tinker_server = ModuleType("art.tinker.server")
+    setattr(fake_tinker_server, "OpenAICompatibleTinkerServer", object)
+    had_tinker_module = "art.tinker" in sys.modules
+    had_tinker_backend_module = "art.tinker.backend" in sys.modules
+    with patch.dict("sys.modules", {"art.tinker.server": fake_tinker_server}):
+        from art.tinker.backend import TinkerBackend
+
+    if not had_tinker_backend_module:
+        sys.modules.pop("art.tinker.backend", None)
+    if not had_tinker_module:
+        sys.modules.pop("art.tinker", None)
+
+    model = TrainableModel(
+        name="tinker-backend-cost-accounting",
+        project="pipeline-tests",
+        base_model="openai/gpt-oss-20b",
+        base_path=str(tmp_path),
+    )
+    with patch.dict("os.environ", {}, clear=True):
+        backend = TinkerBackend(tinker_api_key="test-key", path=str(tmp_path))
+
+    with patch.object(model, "_get_wandb_run", return_value=None):
+        await backend.register(model)
+
+    assert model.cost_calculator(1_000, 2_000, "train") == {
+        "costs/train/tinker_prefill": pytest.approx(0.00012),
+        "costs/train/tinker_sample": pytest.approx(0.0006),
+    }
 
 
 @pytest.mark.asyncio
