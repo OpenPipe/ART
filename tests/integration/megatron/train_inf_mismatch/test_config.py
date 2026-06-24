@@ -42,7 +42,8 @@ def test_cp_unsupported_model_uses_non_cp_default_topology(monkeypatch) -> None:
     assert config.engine_args["moe_backend"] == "triton_unfused"
     assert config.engine_args["disable_custom_all_reduce"] is True
     assert config.engine_args["compilation_config"] == {
-        "pass_config": {"fuse_allreduce_rms": False}
+        "cudagraph_mode": "NONE",
+        "pass_config": {"fuse_allreduce_rms": False},
     }
 
 

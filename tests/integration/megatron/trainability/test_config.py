@@ -246,7 +246,8 @@ def test_dsv4_trainability_uses_large_model_dedicated_resources(
     assert config["engine_args"].get("moe_backend") == "triton_unfused"
     assert config["engine_args"]["disable_custom_all_reduce"] is True
     assert config["engine_args"].get("compilation_config") == {
-        "pass_config": {"fuse_allreduce_rms": False}
+        "cudagraph_mode": "NONE",
+        "pass_config": {"fuse_allreduce_rms": False},
     }
     assert config["megatron_topology"] == {
         "tp": 2,
