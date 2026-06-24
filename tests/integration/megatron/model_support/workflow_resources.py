@@ -143,6 +143,7 @@ _DSV4_COMMON_VLLM_ENGINE_ARGS = {
         "pass_config": {"fuse_allreduce_rms": False},
     },
     "disable_custom_all_reduce": True,
+    "enforce_eager": True,
     "gpu_memory_utilization": 0.82,
     "kv_cache_dtype": "fp8",
     "max_num_batched_tokens": 1032,
@@ -219,6 +220,7 @@ HANDLER_WORKFLOW_RESOURCES: dict[str, HandlerWorkflowResources] = {
             vllm=_DSV4_FULL_VLLM_EP4,
             high_vram_megatron=_DSV4_HIGH_VRAM_MEGATRON,
             high_vram_vllm=_DSV4_FULL_VLLM_EP2,
+            megatron_env=_DSV4_STREAMING_OFFLOAD_ENV,
         ),
         merged_vllm_serving=WorkflowStageResources(
             required_world_size=8,

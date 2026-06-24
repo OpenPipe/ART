@@ -78,13 +78,16 @@ def test_dsv4_runtime_stages_use_full_model_resources() -> None:
         assert engine_args.get("load_format") != "dummy"
         assert engine_args["moe_backend"] == "triton_unfused"
         assert engine_args["disable_custom_all_reduce"] is True
+        assert engine_args["enforce_eager"] is True
         assert engine_args["compilation_config"] == {
             "cudagraph_mode": "NONE",
             "pass_config": {"fuse_allreduce_rms": False},
         }
         assert engine_args.get("max_loras", 2) == 2
     assert resources.train_inf_mismatch is not None
-    assert resources.train_inf_mismatch.megatron_env == {}
+    assert resources.train_inf_mismatch.megatron_env == {
+        "ART_MEGATRON_STREAMING_WEIGHT_OFFLOAD": "1"
+    }
     assert resources.yes_no_trainability is not None
     assert resources.yes_no_trainability.megatron_env == {
         "ART_MEGATRON_STREAMING_WEIGHT_OFFLOAD": "1"
@@ -139,6 +142,7 @@ def test_dsv4_resources_remap_to_four_high_vram_gpus(monkeypatch) -> None:
     assert stage.vllm.engine_args()["gpu_memory_utilization"] == 0.82
     assert stage.vllm.engine_args()["moe_backend"] == "triton_unfused"
     assert stage.vllm.engine_args()["disable_custom_all_reduce"] is True
+    assert stage.vllm.engine_args()["enforce_eager"] is True
     assert stage.vllm.engine_args()["compilation_config"] == {
         "cudagraph_mode": "NONE",
         "pass_config": {"fuse_allreduce_rms": False},

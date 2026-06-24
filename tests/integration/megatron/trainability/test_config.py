@@ -245,6 +245,7 @@ def test_dsv4_trainability_uses_large_model_dedicated_resources(
     assert config["engine_args"]["max_num_batched_tokens"] == 1032
     assert config["engine_args"].get("moe_backend") == "triton_unfused"
     assert config["engine_args"]["disable_custom_all_reduce"] is True
+    assert config["engine_args"]["enforce_eager"] is True
     assert config["engine_args"].get("compilation_config") == {
         "cudagraph_mode": "NONE",
         "pass_config": {"fuse_allreduce_rms": False},
