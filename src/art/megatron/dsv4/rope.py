@@ -6,6 +6,8 @@ from megatron.core.transformer import TransformerConfig
 import torch
 from torch import nn
 
+_DEVICE_ROPE_CACHES: dict[tuple[object, ...], torch.Tensor] = {}
+
 
 @lru_cache(2)
 def precompute_freqs_cis(
@@ -84,8 +86,8 @@ def wrapped_precompute_freqs_cis(
     rope_head_dim: int,
     base: float,
     yarn_disabled: bool = False,
+    seqlen: int = 65536,
 ):
-    max_seq_len = 65536
     cfg = cast(Any, config)
 
     # yarn_disabled=True makes precompute_freqs_cis skip YaRN interpolation.
@@ -94,7 +96,7 @@ def wrapped_precompute_freqs_cis(
 
     inputs = dict(
         dim=rope_head_dim,
-        seqlen=max_seq_len,
+        seqlen=seqlen,
         original_seq_len=original_seq_len,
         base=base,
         factor=cfg.rotary_scaling_factor,
@@ -108,7 +110,7 @@ def wrapped_precompute_freqs_cis(
     expected_original = 0 if yarn_disabled else 65536
     assert inputs == dict(
         dim=rope_head_dim,
-        seqlen=max_seq_len,
+        seqlen=seqlen,
         original_seq_len=expected_original,
         base=base,
         factor=cfg.rotary_scaling_factor,
@@ -117,6 +119,63 @@ def wrapped_precompute_freqs_cis(
     )
 
     return precompute_freqs_cis(**inputs)
+
+
+def _rope_cache_key(
+    config: TransformerConfig,
+    *,
+    rope_head_dim: int,
+    base: float,
+    yarn_disabled: bool,
+    device: torch.device,
+) -> tuple[object, ...]:
+    cfg = cast(Any, config)
+    device_index = (
+        torch.cuda.current_device()
+        if device.type == "cuda" and device.index is None
+        else device.index
+    )
+    original_seq_len = 0 if yarn_disabled else cfg.original_max_position_embeddings
+    return (
+        device.type,
+        device_index,
+        int(rope_head_dim),
+        int(original_seq_len),
+        float(base),
+        float(cfg.rotary_scaling_factor),
+        int(cfg.beta_fast),
+        int(cfg.beta_slow),
+    )
+
+
+def _get_device_rope_cache(
+    config: TransformerConfig,
+    *,
+    rope_head_dim: int,
+    base: float,
+    yarn_disabled: bool,
+    device: torch.device,
+    seqlen: int,
+) -> torch.Tensor:
+    seqlen = max(1, int(seqlen))
+    key = _rope_cache_key(
+        config,
+        rope_head_dim=rope_head_dim,
+        base=base,
+        yarn_disabled=yarn_disabled,
+        device=device,
+    )
+    cached = _DEVICE_ROPE_CACHES.get(key)
+    if cached is None or cached.shape[0] < seqlen:
+        cached = wrapped_precompute_freqs_cis(
+            config,
+            rope_head_dim=rope_head_dim,
+            base=base,
+            yarn_disabled=yarn_disabled,
+            seqlen=seqlen,
+        ).to(device)
+        _DEVICE_ROPE_CACHES[key] = cached
+    return cached
 
 
 def configure_rope_cache(
@@ -137,7 +196,7 @@ def configure_rope_cache(
 
 
 def materialize_rope_cache(
-    module: nn.Module, device: torch.device | None = None
+    module: nn.Module, device: torch.device | None = None, seqlen: int = 65536
 ) -> bool:
     config = getattr(module, "_dsv4_rope_config", None)
     if config is None:
@@ -149,12 +208,14 @@ def materialize_rope_cache(
             device = torch.device("cpu")
     if device.type == "meta":
         return False
-    freqs_cis = wrapped_precompute_freqs_cis(
+    freqs_cis = _get_device_rope_cache(
         config,
         rope_head_dim=int(getattr(module, "_dsv4_rope_head_dim")),
         base=float(getattr(module, "_dsv4_rope_base")),
         yarn_disabled=bool(getattr(module, "_dsv4_rope_yarn_disabled")),
-    ).to(device)
+        device=device,
+        seqlen=seqlen,
+    )
     module.freqs_cis = freqs_cis
     return True
 
@@ -163,8 +224,12 @@ def get_rope_cache(
     module: nn.Module, *, seqlen: int, device: torch.device
 ) -> torch.Tensor:
     freqs_cis = cast(torch.Tensor, module.freqs_cis)
-    if freqs_cis.numel() == 0 or freqs_cis.device != device:
-        materialize_rope_cache(module, device)
+    if (
+        freqs_cis.numel() == 0
+        or freqs_cis.device != device
+        or freqs_cis.shape[0] < seqlen
+    ):
+        materialize_rope_cache(module, device, seqlen=seqlen)
         freqs_cis = cast(torch.Tensor, module.freqs_cis)
     return freqs_cis[:seqlen]
 
@@ -173,10 +238,15 @@ def get_rope_cache_at_positions(
     module: nn.Module, *, position_ids: torch.Tensor, device: torch.device
 ) -> torch.Tensor:
     freqs_cis = cast(torch.Tensor, module.freqs_cis)
-    if freqs_cis.numel() == 0 or freqs_cis.device != device:
-        materialize_rope_cache(module, device)
-        freqs_cis = cast(torch.Tensor, module.freqs_cis)
     safe_positions = position_ids.to(device=device, dtype=torch.long).clamp_min(0)
+    seqlen = max(1, safe_positions.numel())
+    if (
+        freqs_cis.numel() == 0
+        or freqs_cis.device != device
+        or freqs_cis.shape[0] < seqlen
+    ):
+        materialize_rope_cache(module, device, seqlen=seqlen)
+        freqs_cis = cast(torch.Tensor, module.freqs_cis)
     return freqs_cis.index_select(0, safe_positions.reshape(-1)).view(
         *safe_positions.shape,
         freqs_cis.shape[-1],
