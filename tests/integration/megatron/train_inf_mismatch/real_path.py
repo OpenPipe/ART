@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 from contextlib import asynccontextmanager, contextmanager
+import gc
 import hashlib
 import json
 import os
@@ -985,6 +986,18 @@ def _score_megatron_runtime(
     )
 
 
+def _cpu_barrier() -> None:
+    import torch
+
+    if torch.distributed.get_world_size() <= 1:  # type: ignore[possibly-missing-attribute]
+        return
+    group = torch.distributed.new_group(backend="gloo")  # type: ignore[possibly-missing-attribute]
+    try:
+        torch.distributed.barrier(group=group)  # type: ignore[possibly-missing-attribute]
+    finally:
+        torch.distributed.destroy_process_group(group)  # type: ignore[possibly-missing-attribute]
+
+
 def _real_path_megatron_worker(
     request: RealPathMegatronWorkerRequest,
     *,
@@ -1046,6 +1059,7 @@ def _real_path_megatron_worker(
     artifact_dir = Path(request.artifact_dir)
     adapter_path: Path | None = None
     job_completed = False
+    runtime_released = False
     try:
         if request.weight_state == "lora":
             if request.adapter_path is None:
@@ -1062,10 +1076,32 @@ def _real_path_megatron_worker(
                         runtime=runtime,
                         config=request.config,
                     )
-                torch.distributed.barrier()  # type: ignore[possibly-missing-attribute]
+                if adapter_only:
+                    del runtime
+                    runtime_released = True
+                    gc.collect()
+                    torch.cuda.empty_cache()
+                _cpu_barrier()
                 adapter_path = artifact_dir / "real_path_active_lora"
             else:
                 adapter_path = Path(request.adapter_path)
+            if adapter_only:
+                if not runtime_released:
+                    del runtime
+                    gc.collect()
+                    torch.cuda.empty_cache()
+                if torch.distributed.get_rank() == 0:  # type: ignore[possibly-missing-attribute]
+                    result = RealPathMegatronWorkerResult(
+                        score_path="",
+                        adapter_path=str(adapter_path),
+                    )
+                    _write_json(
+                        artifact_dir / "real_path_adapter_worker_result.json",
+                        result.model_dump(mode="json"),
+                    )
+                _cpu_barrier()
+                torch.distributed.destroy_process_group()  # type: ignore[possibly-missing-attribute]
+                return
             adapter_model = load_lora_tensors_for_megatron(
                 str(adapter_path),
                 handler=runtime.model_support_handler,
