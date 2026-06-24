@@ -78,10 +78,36 @@ def test_overlapping_gpu_ids():
 
 
 def test_multi_gpu_inference():
-    with pytest.raises(ValueError, match="Multi-GPU inference not yet supported"):
+    validate_dedicated_config(
+        InternalModelConfig(trainer_gpu_ids=[0], inference_gpu_ids=[1, 2])
+    )
+
+
+def test_three_gpu_inference():
+    validate_dedicated_config(
+        InternalModelConfig(trainer_gpu_ids=[0], inference_gpu_ids=[1, 2, 3])
+    )
+
+
+def test_dedicated_inference_parallel_size_must_match_gpu_count():
+    with pytest.raises(ValueError, match="GPU count must match"):
         validate_dedicated_config(
-            InternalModelConfig(trainer_gpu_ids=[0], inference_gpu_ids=[1, 2])
+            InternalModelConfig(
+                trainer_gpu_ids=[0],
+                inference_gpu_ids=[1, 2],
+                engine_args={"tensor_parallel_size": 1},  # type: ignore[typeddict-item]
+            )
         )
+
+
+def test_dedicated_inference_accepts_explicit_matching_parallel_size():
+    validate_dedicated_config(
+        InternalModelConfig(
+            trainer_gpu_ids=[0],
+            inference_gpu_ids=[1, 2],
+            engine_args={"pipeline_parallel_size": 2},  # type: ignore[typeddict-item]
+        )
+    )
 
 
 def test_trainer_not_starting_at_zero():
@@ -222,6 +248,29 @@ def test_get_model_config_dedicated_preserves_user_engine_args():
         assert result["engine_args"]["max_model_len"] == 4096
         # Sleep mode should still be disabled even if user didn't set it
         assert result["engine_args"]["enable_sleep_mode"] is False
+
+
+def test_get_model_config_multi_gpu_inference_defaults_tensor_parallel():
+    with tempfile.TemporaryDirectory() as tmpdir:
+        config = InternalModelConfig(
+            trainer_gpu_ids=[0],
+            inference_gpu_ids=[1, 2, 3],
+        )
+        result = get_model_config("test-model", tmpdir, config)
+        assert result["inference_gpu_ids"] == [1, 2, 3]
+        assert result["engine_args"]["tensor_parallel_size"] == 3
+
+
+def test_get_model_config_two_gpu_inference_preserves_user_parallel_args():
+    with tempfile.TemporaryDirectory() as tmpdir:
+        config = InternalModelConfig(
+            trainer_gpu_ids=[0],
+            inference_gpu_ids=[1, 2],
+            engine_args={"pipeline_parallel_size": 2},  # type: ignore[typeddict-item]
+        )
+        result = get_model_config("test-model", tmpdir, config)
+        assert result["engine_args"]["pipeline_parallel_size"] == 2
+        assert "tensor_parallel_size" not in result["engine_args"]
 
 
 def test_get_model_config_preserves_rollout_weights_mode():

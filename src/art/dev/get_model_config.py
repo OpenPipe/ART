@@ -48,6 +48,13 @@ def get_model_config(
         model=base_model,
     )
     engine_args.update(config.get("engine_args", {}))
+    if (
+        dedicated
+        and len(config["inference_gpu_ids"]) > 1
+        and "tensor_parallel_size" not in engine_args
+        and "pipeline_parallel_size" not in engine_args
+    ):
+        engine_args["tensor_parallel_size"] = len(config["inference_gpu_ids"])
     init_args.update(config.get("init_args", {}))
     if last_checkpoint_dir := get_last_checkpoint_dir(output_dir):
         init_args["model_name"] = last_checkpoint_dir

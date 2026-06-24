@@ -15,6 +15,19 @@ def _rollout_weights_mode(config: InternalModelConfig) -> RolloutWeightsMode:
     raise ValueError("rollout_weights_mode must be either 'lora' or 'merged'")
 
 
+def _engine_parallel_size(config: InternalModelConfig) -> int:
+    engine_args = config.get("engine_args", {})
+    tensor_parallel_size = engine_args.get("tensor_parallel_size", 1)
+    pipeline_parallel_size = engine_args.get("pipeline_parallel_size", 1)
+    tp = 1 if tensor_parallel_size is None else int(tensor_parallel_size)
+    pp = 1 if pipeline_parallel_size is None else int(pipeline_parallel_size)
+    if tp < 1 or pp < 1:
+        raise ValueError(
+            "engine_args tensor_parallel_size and pipeline_parallel_size must be positive"
+        )
+    return tp * pp
+
+
 def validate_dedicated_config(config: InternalModelConfig) -> None:
     """Validate dedicated mode GPU configuration.
 
@@ -57,10 +70,14 @@ def validate_dedicated_config(config: InternalModelConfig) -> None:
     if set(trainer_gpu_ids) & set(inference_gpu_ids):
         raise ValueError("trainer_gpu_ids and inference_gpu_ids must not overlap")
 
-    if len(inference_gpu_ids) > 1:
-        raise ValueError(
-            "Multi-GPU inference not yet supported; inference_gpu_ids must have exactly one GPU"
-        )
+    engine_args = config.get("engine_args", {})
+    if "tensor_parallel_size" in engine_args or "pipeline_parallel_size" in engine_args:
+        inference_parallel_size = _engine_parallel_size(config)
+        if inference_parallel_size != len(inference_gpu_ids):
+            raise ValueError(
+                "Dedicated inference GPU count must match engine_args "
+                "tensor_parallel_size * pipeline_parallel_size"
+            )
 
     if trainer_gpu_ids[0] != 0:
         raise ValueError(
