@@ -431,6 +431,11 @@ def _append_step_summary(
     _copy_latest_summary_log(path)
 
 
+def _cleanup_generated_trainability_state(backend_root: Path) -> None:
+    if backend_root.exists():
+        shutil.rmtree(backend_root)
+
+
 @pytest.mark.skipif(
     not torch.cuda.is_available() or torch.cuda.device_count() < 3,
     reason="Need at least 3 CUDA GPUs for live dedicated length trainability",
@@ -634,6 +639,7 @@ async def test_megatron_dedicated_length_trainability_live(artifact_dir: Path) -
         json.dumps(report.model_dump(mode="json"), indent=2, sort_keys=True) + "\n",
         encoding="utf-8",
     )
+    _cleanup_generated_trainability_state(backend_root)
 
     assert train_samples
     assert latest_step <= max_steps

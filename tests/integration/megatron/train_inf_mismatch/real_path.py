@@ -1235,6 +1235,34 @@ def _delete_adapter_safetensors_on_pass(artifact_dir: Path, *, passed: bool) -> 
         path.unlink()
 
 
+def _remove_generated_dir(path: Path) -> None:
+    if path.exists() and path.is_dir() and not path.is_symlink():
+        shutil.rmtree(path)
+
+
+def _cleanup_real_path_generated_artifacts(
+    artifact_dir: Path,
+    *,
+    adapter_path: str | None,
+) -> None:
+    for name in (
+        "art_path",
+        "base_art_path",
+        "real_path_active_lora",
+        "real_path_base_moe_routing_replay",
+        "real_path_base_packed_tensors",
+        "real_path_moe_routing_replay",
+        "real_path_packed_tensors",
+        "unused_base_lora_placeholder",
+    ):
+        _remove_generated_dir(artifact_dir / name)
+    if adapter_path is None:
+        return
+    adapter_dir = Path(adapter_path)
+    if _adapter_cache_manifest_path(adapter_dir).exists():
+        _remove_generated_dir(adapter_dir)
+
+
 async def run_real_path_train_inf_mismatch(
     *,
     config: RealPathConfig,
@@ -1511,6 +1539,10 @@ async def run_real_path_train_inf_mismatch(
             report.model_dump(mode="json"),
         )
         _delete_adapter_safetensors_on_pass(artifact_dir, passed=report.passed)
+        _cleanup_real_path_generated_artifacts(
+            artifact_dir,
+            adapter_path=adapter_path,
+        )
         return report
     finally:
         if backend_open:
