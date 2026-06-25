@@ -322,11 +322,8 @@ class DeepSeekV4Attention(MegatronModule):
         attn_sink = torch.empty(self.n_local_heads, dtype=torch.float32)
         self._keep_fp32_parameters = ("attn_sink",)
         self._keep_fp32_buffers = ("attn_sink",)
-        if bool(getattr(cfg, "dsv4_oracle_freeze_attn_sink", False)):
-            self.register_buffer("attn_sink", attn_sink, persistent=True)
-        else:
-            self.attn_sink = nn.Parameter(attn_sink)
-            setattr(self.attn_sink, "_keep_fp32", True)
+        self.attn_sink = nn.Parameter(attn_sink)
+        setattr(self.attn_sink, "_keep_fp32", True)
 
         self.wq_a = TELinear(
             self.dim,

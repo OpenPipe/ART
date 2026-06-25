@@ -385,7 +385,7 @@ class Dsv4Handler(DefaultMoeHandler):
         ensure_dsv4_hf_model_registered()
 
     def prepare_hf_reference_config(self, config: Any) -> None:
-        """Puts the HF parity oracle in eager training mode with reduced fit-only axes."""
+        """Puts native HF parity in eager training mode with reduced fit-only axes."""
         if hasattr(config, "quantization_config"):
             delattr(config, "quantization_config")
         config._experts_implementation = "eager"
@@ -438,7 +438,6 @@ class Dsv4Handler(DefaultMoeHandler):
         provider.dsa_indexer_n_heads = _ORACLE_INDEX_HEADS
         provider.dsa_indexer_head_dim = 128
         provider.dsa_indexer_topk = _ORACLE_INDEX_TOPK
-        provider.dsv4_oracle_freeze_attn_sink = True
 
     @staticmethod
     def _is_bridge_hf_load_hook(hook: Any) -> bool:
@@ -462,9 +461,6 @@ class Dsv4Handler(DefaultMoeHandler):
         config.index_n_heads = _ORACLE_INDEX_HEADS
         config.index_head_dim = 128
         config.index_topk = _ORACLE_INDEX_TOPK
-        config.dsv4_oracle_freeze_attn_sink = True
-        config.dsv4_oracle_source_aliases = True
-        config.dsv4_oracle_precision_aligned_compressor = True
 
     def _initialize_oracle_base_weights(
         self,
