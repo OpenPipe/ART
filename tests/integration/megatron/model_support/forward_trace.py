@@ -1118,6 +1118,7 @@ class ForwardTraceCapture:
     def _canonicalize_call_row_token_order(cls, call: dict[str, Any]) -> None:
         """Canonicalizes all row-aligned call tensors to global token order."""
         cls._align_exact_zero_padding_row_token_uids(call)
+        cls._drop_exact_zero_padding_rows(call)
         row_token_uids = call.get("row_token_uids")
         if not isinstance(row_token_uids, torch.Tensor) or row_token_uids.ndim != 1:
             return
@@ -1137,6 +1138,38 @@ class ForwardTraceCapture:
                 total_rows=total_rows,
             )
         call["row_token_uids"] = row_token_uids.index_select(0, order).contiguous()
+
+    @classmethod
+    def _drop_exact_zero_padding_rows(cls, call: dict[str, Any]) -> None:
+        """Removes traced sequence-padding rows before comparing compact CP traces."""
+        row_token_uids = call.get("row_token_uids")
+        tensor = call.get("primary_output")
+        if (
+            not isinstance(row_token_uids, torch.Tensor)
+            or row_token_uids.ndim != 1
+            or not isinstance(tensor, torch.Tensor)
+            or tensor.ndim == 0
+            or int(tensor.shape[0]) != int(row_token_uids.numel())
+        ):
+            return
+        row_count = int(row_token_uids.numel())
+        padding_rows = row_token_uids < 0
+        if row_count == 0 or not bool(padding_rows.any().item()):
+            return
+        flat = tensor.detach().reshape(row_count, -1)
+        if not bool((flat[padding_rows] == 0).all().item()):
+            return
+        valid_rows = torch.nonzero(~padding_rows, as_tuple=False).reshape(-1)
+        original_call = dict(call)
+        for key, value in original_call.items():
+            if key == "row_token_uids":
+                continue
+            call[key] = cls._slice_row_aligned_value(
+                value,
+                row_indices=valid_rows,
+                total_rows=row_count,
+            )
+        call["row_token_uids"] = row_token_uids.index_select(0, valid_rows).contiguous()
 
     @staticmethod
     def _align_exact_zero_padding_row_token_uids(call: dict[str, Any]) -> None:

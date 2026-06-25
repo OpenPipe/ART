@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 from pathlib import Path
-import socket
 from typing import cast
 
 import pytest
@@ -37,6 +36,7 @@ from art.megatron.gdn.operator import (  # noqa: E402
 )
 
 from .cases import GdnFamilyShape, GdnPackedRowShape, GdnPhase0Case  # noqa: E402
+from .distributed_init import file_init_method  # noqa: E402
 from .metrics import (  # noqa: E402
     GDN_CORRECTNESS_DTYPE,
     MEAN_ABS_PCT_THRESHOLD,
@@ -70,10 +70,10 @@ _CP_SIZES = (
 def test_real_qwen35_gdn_native_fla_cp_prepared_varlen_batch_matches_single_rank(
     cp_size: int, tmp_path: Path
 ) -> None:
-    port = _find_free_port()
+    init_method = file_init_method(tmp_path, f"native_gdn_prepared_cp{cp_size}")
     mp.spawn(
         _native_gdn_cp_prepared_varlen_worker,
-        args=(cp_size, port, str(tmp_path)),
+        args=(cp_size, init_method, str(tmp_path)),
         nprocs=cp_size,
         join=True,
     )
@@ -89,10 +89,10 @@ def test_real_qwen35_gdn_native_fla_cp_prepared_varlen_batch_matches_single_rank
 def test_real_qwen35_gdn_native_cp_packed_layer_matches_cp1(
     cp_size: int, tmp_path: Path
 ) -> None:
-    port = _find_free_port()
+    init_method = file_init_method(tmp_path, f"native_gdn_packed_cp{cp_size}")
     mp.spawn(
         _native_gdn_cp_packed_layer_worker,
-        args=(cp_size, port, str(tmp_path)),
+        args=(cp_size, init_method, str(tmp_path)),
         nprocs=cp_size,
         join=True,
     )
@@ -103,13 +103,13 @@ def test_real_qwen35_gdn_native_cp_packed_layer_matches_cp1(
 def _native_gdn_cp_packed_layer_worker(
     rank: int,
     cp_size: int,
-    port: int,
+    init_method: str,
     output_dir: str,
 ) -> None:
     torch.cuda.set_device(rank)
     init_process_group(
         backend="nccl",
-        init_method=f"tcp://127.0.0.1:{port}",
+        init_method=init_method,
         rank=rank,
         world_size=cp_size,
     )
@@ -127,9 +127,7 @@ def _native_gdn_cp_packed_layer_worker(
         tensors = build_phase0_packed_tensors(case)
         group_ids = tensors["group_ids"].cuda()
         parent_ids = tensors["parent_ids"].cuda()
-        spec = parse_gdn_shared_prefix_segments(
-            group_ids, parent_ids, min_completions_per_family=0
-        )
+        spec = parse_gdn_shared_prefix_segments(group_ids, parent_ids)
         plan = build_gdn_rank_execution_plan(
             spec,
             device=group_ids.device,
@@ -139,17 +137,9 @@ def _native_gdn_cp_packed_layer_worker(
                 cp_chain_min_tokens_per_rank=16,
                 cp_chain_min_total_tokens=128,
                 cp_chain_min_prefix_only_tokens=128,
-                # This test is the native chain correctness guard, so force the
-                # planner onto chain prefix and completion buckets.
-                planner_chain_bucket_ms=0.0,
-                planner_chain_token_ms=0.0,
-                planner_local_bucket_ms=1.0,
-                planner_local_token_ms=1.0,
-                cp_chain_min_score_delta_ms=0.0,
             ),
         )
-        assert plan.chain_prefix_buckets
-        assert plan.chain_completion_buckets
+        assert any(plan.tree_chain_buckets_by_depth)
         hidden, output_grad = _packed_hidden_and_grad(case, cp_size)
         ref_hidden = hidden.clone().detach().requires_grad_(True)
         ref_out, _ = run_gdn_layer(
@@ -215,13 +205,13 @@ def _native_gdn_cp_packed_layer_worker(
 def _native_gdn_cp_prepared_varlen_worker(
     rank: int,
     cp_size: int,
-    port: int,
+    init_method: str,
     output_dir: str,
 ) -> None:
     torch.cuda.set_device(rank)
     init_process_group(
         backend="nccl",
-        init_method=f"tcp://127.0.0.1:{port}",
+        init_method=init_method,
         rank=rank,
         world_size=cp_size,
     )
@@ -599,9 +589,3 @@ def _all_reduce_parameter_grads(module: torch.nn.Module) -> None:
         main_grad = getattr(parameter, "main_grad", None)
         if main_grad is not None:
             torch.distributed.all_reduce(main_grad)
-
-
-def _find_free_port() -> int:
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
-        sock.bind(("127.0.0.1", 0))
-        return int(sock.getsockname()[1])

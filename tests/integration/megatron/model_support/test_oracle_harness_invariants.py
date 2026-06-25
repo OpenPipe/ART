@@ -314,6 +314,37 @@ def test_forward_trace_canonicalizes_row_outputs_by_token_uid() -> None:
     )
 
 
+def test_forward_trace_drops_exact_zero_padding_rows() -> None:
+    trace: dict[str, list[dict[str, Any]]] = {
+        "chunk0.module.decoder.layers.0.self_attention.out_proj": [
+            {
+                "primary_output": torch.tensor(
+                    [[0.0, 0.0], [30.0, 31.0], [10.0, 11.0], [20.0, 21.0]]
+                ),
+                "output": {
+                    "hidden": torch.tensor(
+                        [[0.0, 0.0], [3.0, 3.1], [1.0, 1.1], [2.0, 2.1]]
+                    )
+                },
+                "row_token_uids": torch.tensor([-1, 3, 1, 2]),
+            }
+        ]
+    }
+
+    ForwardTraceCapture.canonicalize_trace(trace)
+
+    call = trace["chunk0.module.decoder.layers.0.self_attention.out_proj"][0]
+    assert torch.equal(call["row_token_uids"], torch.tensor([1, 2, 3]))
+    assert torch.equal(
+        call["primary_output"],
+        torch.tensor([[10.0, 11.0], [20.0, 21.0], [30.0, 31.0]]),
+    )
+    assert torch.equal(
+        call["output"]["hidden"],
+        torch.tensor([[1.0, 1.1], [2.0, 2.1], [3.0, 3.1]]),
+    )
+
+
 def test_forward_trace_expands_attention_output_uids_for_out_norm_heads() -> None:
     trace: dict[str, list[dict[str, Any]]] = {
         "chunk0.module.decoder.layers.0.self_attention": [

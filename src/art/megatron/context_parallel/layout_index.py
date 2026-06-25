@@ -1,10 +1,9 @@
 from __future__ import annotations
 
-from pydantic import BaseModel, ConfigDict
+from dataclasses import dataclass
 
 
-class TokenLayoutIndex(BaseModel):
-    model_config = ConfigDict(frozen=True)
-
+@dataclass(frozen=True)
+class TokenLayoutIndex:
     ownership_ranges_by_rank: tuple[tuple[tuple[int, int, int], ...], ...]
     token_counts_by_rank: tuple[int, ...]

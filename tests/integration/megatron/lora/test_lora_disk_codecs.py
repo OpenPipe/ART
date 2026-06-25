@@ -1,11 +1,16 @@
 import json
+import os
 from pathlib import Path
+import shutil
 import subprocess
 import sys
 from typing import Any, cast
 
+import pytest
 from safetensors.torch import load_file, save_file
 import torch
+
+pytest.importorskip("megatron.bridge.models.gpt_provider")
 
 from art.megatron import lora as lora_module
 from art.megatron.lora import LoRA, LoRAParallelSpec, LoRAPublishPlanner
@@ -29,6 +34,66 @@ from art.utils.convert_moe_lora import convert_checkpoint_if_needed
 
 REPO_ROOT = Path(__file__).parents[4]
 VLLM_PYTHON = REPO_ROOT / "vllm_runtime/.venv/bin/python"
+_VLLM_RUNTIME_UNAVAILABLE_REASON: str | None | object = object()
+
+
+def _vllm_python_cmd() -> list[str]:
+    override = os.environ.get("ART_TEST_VLLM_PYTHON")
+    if override:
+        return [override]
+    if VLLM_PYTHON.exists():
+        return [str(VLLM_PYTHON)]
+    uv = shutil.which("uv")
+    if uv is None:
+        raise RuntimeError(
+            f"{VLLM_PYTHON} does not exist and uv is not available to run "
+            "the locked vLLM runtime project"
+        )
+    return [
+        uv,
+        "run",
+        "--project",
+        str(REPO_ROOT / "vllm_runtime"),
+        "--frozen",
+        "--no-dev",
+        "python",
+    ]
+
+
+def _vllm_runtime_unavailable_reason() -> str | None:
+    global _VLLM_RUNTIME_UNAVAILABLE_REASON
+    if isinstance(_VLLM_RUNTIME_UNAVAILABLE_REASON, str):
+        return _VLLM_RUNTIME_UNAVAILABLE_REASON
+    if _VLLM_RUNTIME_UNAVAILABLE_REASON is None:
+        return None
+    try:
+        subprocess.run(
+            [
+                *_vllm_python_cmd(),
+                "-c",
+                "import vllm; from vllm.lora.lora_model import LoRAModel",
+            ],
+            check=True,
+            text=True,
+            capture_output=True,
+            timeout=120,
+        )
+    except Exception as exc:
+        _VLLM_RUNTIME_UNAVAILABLE_REASON = (
+            "Stock vLLM loader runtime is unavailable. Run "
+            "`uv sync --project vllm_runtime --frozen --no-dev`, or set "
+            "`ART_TEST_VLLM_PYTHON` to a Python environment with vLLM installed. "
+            f"Original error: {exc}"
+        )
+        return _VLLM_RUNTIME_UNAVAILABLE_REASON
+    _VLLM_RUNTIME_UNAVAILABLE_REASON = None
+    return None
+
+
+def test_stock_vllm_loader_runtime_is_available() -> None:
+    reason = _vllm_runtime_unavailable_reason()
+    if reason is not None:
+        pytest.fail(reason)
 
 
 def _config(base_model: str, rank: int = 2, alpha: int = 4) -> dict:
@@ -116,6 +181,8 @@ def _assert_stock_vllm_loads(
     expected_modules: set[str],
     mapper: str = "none",
 ) -> list[str]:
+    if reason := _vllm_runtime_unavailable_reason():
+        pytest.skip(reason)
     script = r"""
 import json
 import sys
@@ -142,7 +209,7 @@ print(json.dumps(sorted(lora.loras)))
 """
     result = subprocess.run(
         [
-            str(VLLM_PYTHON),
+            *_vllm_python_cmd(),
             "-c",
             script,
             str(path),

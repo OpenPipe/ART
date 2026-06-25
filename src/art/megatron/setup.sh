@@ -36,3 +36,7 @@ if [ -x "${HOME}/.local/bin/uv" ]; then
     uv_bin="${HOME}/.local/bin/uv"
 fi
 "${uv_bin}" sync --extra backend --extra megatron --frozen --active
+
+if [ "${INSTALL_VLLM_RUNTIME:-true}" = "true" ]; then
+    "${uv_bin}" sync --project vllm_runtime --frozen --no-dev
+fi

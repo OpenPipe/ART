@@ -24,6 +24,5 @@ def _load_parser_module() -> ModuleType:
 _MODULE = _load_parser_module()
 
 GdnPackedExecutionSpec: Any = _MODULE.GdnPackedExecutionSpec
-build_gdn_cp_segment_schedule: Any = _MODULE.build_gdn_cp_segment_schedule
 build_gdn_rank_execution_plan: Any = _MODULE.build_gdn_rank_execution_plan
 parse_gdn_shared_prefix_segments: Any = _MODULE.parse_gdn_shared_prefix_segments

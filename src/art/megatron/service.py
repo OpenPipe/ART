@@ -242,10 +242,6 @@ class MegatronService:
         return self._vllm_runtime.base_url
 
     @property
-    def _vllm_host(self) -> str:
-        return self._vllm_runtime.host
-
-    @property
     def _vllm_port(self) -> int:
         return self._vllm_runtime.port
 

@@ -10,10 +10,12 @@ Options:
   --image-repo REPO      Image repository to publish
   --infra INFRA          Kubernetes-backed SkyPilot infra (default: k8s/cks-wb3)
   --no-cache             Disable registry-backed BuildKit cache
+  --no-prewarm-modal     Skip prebuilding the pushed image in Modal
   --no-prewarm-nodes     Skip pre-pulling the pushed image on GPU nodes
   --pull-image-repo REPO Image repository for cluster pulls/prewarm
+  --prewarm-modal        Require prebuilding the pushed image in Modal
   --prewarm-timeout DUR  Timeout for the prewarm DaemonSet rollout (default: 30m)
-  --tag TAG              Image tag to publish
+  --tag TAG              Image tag to publish (default: latest)
   --help                 Show this help
 EOF
 }
@@ -24,12 +26,13 @@ cluster_name=""
 infra="${SKY_INFRA:-k8s/cks-wb3}"
 image_repo="${ART_IMAGE_REPO:-}"
 pull_image_repo="${ART_PULL_IMAGE_REPO:-}"
-image_tag=""
+image_tag="${IMAGE_TAG:-latest}"
 docker_config_path="${DOCKER_CONFIG_PATH:-${HOME}/.docker/config.json}"
 buildkit_image="${BUILDKIT_IMAGE:-moby/buildkit:v0.29.0-rootless}"
 buildkit_namespace="${KUBECTL_NAMESPACE:-default}"
 buildkit_wait_timeout="${BUILDKIT_WAIT_TIMEOUT:-300s}"
 no_cache="${NO_CACHE:-false}"
+prewarm_modal="${PREWARM_MODAL:-auto}"
 prewarm_nodes="${PREWARM_NODES:-true}"
 prewarm_namespace="${PREWARM_NAMESPACE:-default}"
 prewarm_name="${PREWARM_NAME:-art-gpu-image-prewarm}"
@@ -65,6 +68,10 @@ while [[ $# -gt 0 ]]; do
       no_cache=true
       shift
       ;;
+    --no-prewarm-modal)
+      prewarm_modal=false
+      shift
+      ;;
     --no-prewarm-nodes)
       prewarm_nodes=false
       shift
@@ -72,6 +79,10 @@ while [[ $# -gt 0 ]]; do
     --pull-image-repo)
       pull_image_repo="$2"
       shift 2
+      ;;
+    --prewarm-modal)
+      prewarm_modal=true
+      shift
       ;;
     --prewarm-timeout)
       prewarm_timeout="$2"
@@ -92,6 +103,14 @@ while [[ $# -gt 0 ]]; do
       ;;
   esac
 done
+
+case "${prewarm_modal}" in
+  auto|true|false) ;;
+  *)
+    echo "PREWARM_MODAL must be one of: auto, true, false" >&2
+    exit 1
+    ;;
+esac
 
 case "${infra}" in
   k8s/*)
@@ -117,10 +136,6 @@ prewarm_node_selector_value="${prewarm_node_selector#*=}"
 art_sha="$(git -C "${repo_root}" rev-parse HEAD)"
 art_short_sha="$(git -C "${repo_root}" rev-parse --short=12 HEAD)"
 timestamp="$(date +%m%d-%H%M%S)"
-
-if [[ -z "${image_tag}" ]]; then
-  image_tag="skypilot-${art_short_sha}"
-fi
 
 if [[ -z "${cluster_name}" ]]; then
   cluster_name="art-gpu-build-${timestamp}"
@@ -435,6 +450,38 @@ if [[ -n "${prewarm_refresh_tag_image}" ]]; then
       )
       ;;
   esac
+fi
+
+modal_auth_available=false
+if [[ "${prewarm_modal}" != "false" ]]; then
+  if uv run --with 'modal>=1.5.0' python - <<'PY' >/dev/null 2>&1; then
+import modal
+
+modal.Workspace.from_context().hydrate()
+PY
+    modal_auth_available=true
+  fi
+fi
+
+if [[ "${prewarm_modal}" == "true" || "${modal_auth_available}" == "true" ]]; then
+  echo "Prewarming ${image_repo}:${image_tag} in Modal image cache"
+  MODAL_FORCE_BUILD=1 uv run --with 'modal>=1.5.0' python - "${image_repo}:${image_tag}" <<'PY'
+import sys
+
+import modal
+
+image = (
+    modal.Image.from_registry(sys.argv[1], add_python="3.12")
+    .apt_install("openssh-server", "sudo", "rsync", "curl", "procps", "patch", "lsof")
+)
+app = modal.App.lookup("skypilot-modal", create_if_missing=True)
+with modal.enable_output():
+    image.build(app)
+PY
+elif [[ "${prewarm_modal}" == "auto" ]]; then
+  echo "Skipping Modal image prewarm: Modal auth unavailable"
+else
+  echo "Skipping Modal image prewarm"
 fi
 
 dump_prewarm_diagnostics() {

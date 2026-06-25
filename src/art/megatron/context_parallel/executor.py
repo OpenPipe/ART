@@ -19,7 +19,7 @@ from art.megatron.flex_attn.compiled import (
     sparse_compiled_flex_attention,
 )
 
-from .block_mask import build_block_mask
+from .block_mask import build_block_mask_from_context, prepare_block_mask_context
 from .comm import A2AVCommunicator
 from .range_ops import (
     range_gather_head_major,
@@ -684,17 +684,24 @@ def _build_stage_block_mask(
         raise RuntimeError(
             f"Stage {stage_plan.stage_index} is missing exact mask metadata"
         )
-    mask = build_block_mask(
+    block_mask_context = state.execution_cache.block_mask_context
+    if block_mask_context is None:
+        block_mask_context = prepare_block_mask_context(
+            group_ids=state.group_ids,
+            parent_ids=state.parent_ids,
+        )
+        state.execution_cache.block_mask_context = block_mask_context
+    mask = build_block_mask_from_context(
         FlexMaskSpec(
             q_len=int(execution_spec.q_len),
             k_len=int(execution_spec.k_len),
             block_size=resolved_block_size,
             slices=stage_plan.slices,
-            exact_mask=mask_metadata.model_dump(mode="python"),
+            exact_mask=mask_metadata,
         ),
-        group_ids=state.group_ids,
-        parent_ids=state.parent_ids,
+        context=block_mask_context,
         device=device,
+        validate=False,
     )
     cache[cache_key] = mask
     return mask
@@ -772,30 +779,6 @@ def prepare_context_parallel_execution_state(
             execution_spec=execution_spec,
             block_size=block_size,
         )
-
-
-def _causal_slice_pair_count(slice_: AttnSlice) -> int:
-    q_start = int(slice_.q_range.start)
-    q_end = int(slice_.q_range.end)
-    k_start = int(slice_.k_range.start)
-    k_end = int(slice_.k_range.end)
-    if q_end <= q_start or k_end <= k_start:
-        return 0
-
-    k_len = k_end - k_start
-    partial_q_start = max(q_start, k_start)
-    partial_q_end = min(q_end - 1, k_end - 2)
-    partial = 0
-    if partial_q_start <= partial_q_end:
-        count = partial_q_end - partial_q_start + 1
-        partial = count * (partial_q_start + partial_q_end + 2 - 2 * k_start) // 2
-
-    full_q_start = max(q_start, k_end - 1)
-    full_q_end = q_end - 1
-    full = 0
-    if full_q_start <= full_q_end:
-        full = (full_q_end - full_q_start + 1) * k_len
-    return int(partial + full)
 
 
 def _validate_stage_block_alignment(

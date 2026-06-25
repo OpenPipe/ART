@@ -1,4 +1,3 @@
-from collections import defaultdict
 from collections.abc import Iterable
 from typing import Any, Literal, cast
 
@@ -16,7 +15,6 @@ EXPERT_TP_GRAD_SYNC_DOMAIN: GradSyncDomain = "expert_tp"
 GRAD_SYNC_OP_NONE: GradSyncOp = "none"
 GRAD_SYNC_OP_SUM: GradSyncOp = "sum"
 GRAD_SYNC_OP_AVG: GradSyncOp = "avg"
-VALID_DOMAINS = (TP_DEFAULT_GRAD_SYNC_DOMAIN, EXPERT_TP_GRAD_SYNC_DOMAIN)
 VALID_SYNC_OPS = (GRAD_SYNC_OP_NONE, GRAD_SYNC_OP_SUM, GRAD_SYNC_OP_AVG)
 
 
@@ -27,6 +25,8 @@ def _iter_named_trainable_parameters(
     for chunk_index, model_chunk in enumerate(model):
         for name, param in model_chunk.named_parameters():
             if not param.requires_grad:
+                continue
+            if getattr(param, "_art_dynamic_lora_slot", False):
                 continue
             param_id = id(param)
             if param_id in seen:
@@ -58,6 +58,48 @@ def _resolve_reduce_op(op: GradSyncOp) -> Any:
     if op == GRAD_SYNC_OP_AVG:
         return torch.distributed.ReduceOp.AVG  # ty: ignore[possibly-missing-attribute]
     raise RuntimeError(f"Unknown grad sync op: {op}")
+
+
+def tensor_parallel_grad_sync(
+    param: torch.nn.Parameter,
+    *,
+    name: str,
+) -> tuple[Any, Any] | None:
+    domain: GradSyncDomain = getattr(
+        param, "grad_sync_domain", TP_DEFAULT_GRAD_SYNC_DOMAIN
+    )
+    group = _resolve_domain_group(domain)
+    if group is None:
+        return None
+    op: GradSyncOp = getattr(param, "grad_sync_op", GRAD_SYNC_OP_NONE)
+    if op not in VALID_SYNC_OPS:
+        raise RuntimeError(f"{name}: unsupported grad_sync_op={op}")
+    if op == GRAD_SYNC_OP_NONE:
+        return None
+    return group, _resolve_reduce_op(op)
+
+
+def coalesced_all_reduce(
+    grads: list[torch.Tensor],
+    *,
+    group: Any,
+    op: Any,
+) -> None:
+    coalesced = _flatten_dense_tensors(grads)
+    reduced = (
+        coalesced.float()
+        if torch.is_floating_point(coalesced) and coalesced.dtype != torch.float32
+        else coalesced
+    )
+    torch.distributed.all_reduce(  # ty: ignore[possibly-missing-attribute]
+        reduced,
+        op=op,
+        group=group,
+    )
+    if reduced is not coalesced:
+        reduced = reduced.to(dtype=coalesced.dtype)
+    for grad, synced in zip(grads, _unflatten_dense_tensors(reduced, grads)):
+        grad.copy_(synced)
 
 
 def flush_param_grads_to_main_grads(model_chunks: Iterable[torch.nn.Module]) -> None:
@@ -100,57 +142,30 @@ def finalize_model_grads_extended(
     )
 
     buckets: dict[
-        tuple[GradSyncDomain, GradSyncOp, torch.dtype, torch.device],
-        list[tuple[str, torch.Tensor]],
-    ] = defaultdict(list)
+        tuple[int, str, torch.dtype, torch.device],
+        tuple[Any, Any, list[torch.Tensor]],
+    ] = {}
 
     for name, param in _iter_named_trainable_parameters(model):
-        domain: GradSyncDomain = getattr(
-            param, "grad_sync_domain", TP_DEFAULT_GRAD_SYNC_DOMAIN
-        )
-        if _resolve_domain_group(domain) is None:
-            continue
-
-        op: GradSyncOp = getattr(param, "grad_sync_op", GRAD_SYNC_OP_NONE)
-        if op not in VALID_SYNC_OPS:
-            raise RuntimeError(f"{name}: unsupported grad_sync_op={op}")
-        if op == GRAD_SYNC_OP_NONE:
+        sync = tensor_parallel_grad_sync(param, name=name)
+        if sync is None:
             continue
 
         if not hasattr(param, "main_grad"):
             raise RuntimeError(
-                f"{name}: expected main_grad for domain={domain} reduce_op={op}, but attribute is missing"
+                f"{name}: expected main_grad for tensor-parallel grad sync, but attribute is missing"
             )
         grad = param.main_grad
         if grad is None:
             raise RuntimeError(
-                f"{name}: expected non-None main_grad for domain={domain} reduce_op={op}"
+                f"{name}: expected non-None main_grad for tensor-parallel grad sync"
             )
         local_grad = cast(  # local part of dtensor
             torch.Tensor, grad._local_tensor if hasattr(grad, "_local_tensor") else grad
         )
-        buckets[(domain, op, local_grad.dtype, local_grad.device)].append(
-            (name, local_grad)
-        )
+        group, reduce_op = sync
+        key = (id(group), str(reduce_op), local_grad.dtype, local_grad.device)
+        buckets.setdefault(key, (group, reduce_op, []))[2].append(local_grad)
 
-    for (domain, op, _dtype, _device), entries in buckets.items():
-        group = _resolve_domain_group(
-            domain
-        )  # already checked if the domain is one we are handling
-
-        grads = [grad for _name, grad in entries]
-        coalesced = _flatten_dense_tensors(grads)
-        reduced = (
-            coalesced.float()
-            if torch.is_floating_point(coalesced) and coalesced.dtype != torch.float32
-            else coalesced
-        )
-        torch.distributed.all_reduce(  # ty: ignore[possibly-missing-attribute]
-            reduced,
-            op=_resolve_reduce_op(op),
-            group=group,
-        )
-        if reduced is not coalesced:
-            reduced = reduced.to(dtype=coalesced.dtype)
-        for grad, synced in zip(grads, _unflatten_dense_tensors(reduced, grads)):
-            grad.copy_(synced)
+    for group, op, grads in buckets.values():
+        coalesced_all_reduce(grads, group=group, op=op)
