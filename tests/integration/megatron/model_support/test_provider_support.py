@@ -185,7 +185,7 @@ def test_get_provider_accepts_registry_supported_models(
     )
 
 
-def test_gpt_oss_provider_uses_handler_cp_runtime_default(
+def test_gpt_oss_provider_uses_art_cp_attention(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     provider = _FakeProvider()
@@ -205,7 +205,6 @@ def test_gpt_oss_provider_uses_handler_cp_runtime_default(
 
     assert resolved is provider
     assert resolved.context_parallel_size == 2
-    assert resolved.cp_comm_type == "a2a"
     assert resolved.moe_shared_expert_overlap is False
     layer_spec = cast(Any, resolved.transformer_layer_spec)(resolved, vp_stage=0)
     assert (

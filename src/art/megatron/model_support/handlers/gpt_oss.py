@@ -56,7 +56,6 @@ class GptOssMoeHandler(DefaultMoeHandler):
         return tuple(dict.fromkeys(suffixes))
 
     def configure_provider_for_runtime(self, provider: Any) -> None:
-        provider.cp_comm_type = "a2a"
         provider.moe_shared_expert_overlap = False
 
     def collect_layer_families(self, provider: Any) -> list[LayerFamilyInstance]:
