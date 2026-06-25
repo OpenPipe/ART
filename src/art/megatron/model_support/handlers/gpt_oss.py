@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import re
-from typing import Any, Sequence
+from typing import Any, Sequence, cast
 
 import torch
 
@@ -9,6 +9,9 @@ from art.megatron.model_support.handlers.default_dense import (
     DefaultMoeHandler,
     _compile_workaround_flags_for_provider,
     _require_moe_experts,
+)
+from art.megatron.model_support.handlers.qwen3_common import (
+    _context_parallel_world_size,
 )
 from art.megatron.model_support.spec import (
     CompileWorkaroundConfig,
@@ -69,12 +72,17 @@ class GptOssMoeHandler(DefaultMoeHandler):
         *,
         rollout_weights_mode: RolloutWeightsMode,
     ) -> dict[str, object]:
-        if rollout_weights_mode != "lora":
-            return {}
+        del rollout_weights_mode
         return {"moe_backend": "triton_unfused"}
 
     def vllm_server_args(self) -> dict[str, object]:
         return {"tool_call_parser": "openai"}
+
+    def install_preprocess_patch(self, model_chunks: Sequence[Any]) -> None:
+        _install_gpt_oss_preprocess_patch(model_chunks)
+
+    def get_forward_kwargs(self, model: Any, **kwargs: Any) -> dict[str, Any]:
+        return _gpt_oss_forward_kwargs(model, **kwargs)
 
     def collect_layer_families(self, provider: Any) -> list[LayerFamilyInstance]:
         if int(getattr(provider, "num_moe_experts", 0) or 0) <= 0:
@@ -292,6 +300,115 @@ def _gpt_oss_flex_core_attention_wrapper(
             )
 
     return GptOssArtFlexCoreAttention
+
+
+def _gpt_oss_forward_kwargs(model: Any, **kwargs: Any) -> dict[str, Any]:
+    attention_bias = kwargs.get("attention_bias")
+    from art.megatron.context_parallel.types import ArtContextParallelState
+
+    module = model
+    while hasattr(module, "module"):
+        module = module.module
+    gpt_module = getattr(module, "language_model", module)
+    if isinstance(attention_bias, ArtContextParallelState):
+        setattr(
+            gpt_module,
+            "_art_gpt_oss_rotary_seq_len",
+            int(attention_bias.rank_plan.original_seq_len),
+        )
+    else:
+        setattr(gpt_module, "_art_gpt_oss_rotary_seq_len", None)
+    return {"extra_block_kwargs": kwargs}
+
+
+def _gather_absolute_rotary_pos_emb(
+    table_source: torch.Tensor,
+    *,
+    position_ids: torch.Tensor,
+) -> torch.Tensor:
+    embedding_dim = int(table_source.shape[-1])
+    batch_size, sequence_length = position_ids.shape
+    gathered = table_source.view(table_source.shape[0], embedding_dim).index_select(
+        0,
+        position_ids.reshape(-1),
+    )
+    return (
+        gathered.view(batch_size, sequence_length, embedding_dim)
+        .permute(1, 0, 2)
+        .contiguous()
+        .unsqueeze(2)
+    )
+
+
+def _gpt_oss_absolute_rotary_pos_emb(
+    gpt_module: Any,
+    *,
+    seq_len: int,
+) -> torch.Tensor:
+    rotary_output = gpt_module.rotary_pos_emb(seq_len, packed_seq=True)
+    rotary_pos_emb = (
+        rotary_output[0] if isinstance(rotary_output, tuple) else rotary_output
+    )
+    if not torch.is_tensor(rotary_pos_emb):
+        raise TypeError(
+            "GPT OSS YaRN rotary embedding returned "
+            f"{type(rotary_pos_emb).__name__}, expected Tensor"
+        )
+    return rotary_pos_emb
+
+
+def _install_gpt_oss_preprocess_patch(model_chunks: Sequence[Any]) -> None:
+    from megatron.core.models.gpt.gpt_model import GPTModel
+
+    for chunk in list(model_chunks):
+        module: Any = chunk
+        while hasattr(module, "module"):
+            module = module.module
+        gpt_module = (
+            module
+            if isinstance(module, GPTModel)
+            else cast(GPTModel, getattr(module, "language_model"))
+        )
+        preprocess = gpt_module._preprocess
+
+        def preprocess_hook(
+            *args: Any,
+            _gpt_module: Any = gpt_module,
+            _preprocess: Any = preprocess,
+            **kwargs: Any,
+        ) -> tuple[Any, ...]:
+            position_ids = kwargs.get("position_ids")
+            preproc_output = list(_preprocess(*args, **kwargs))
+            decoder_input = cast(torch.Tensor, preproc_output[0])
+            if not decoder_input.requires_grad and decoder_input.is_leaf:
+                decoder_input.requires_grad_(True)
+            rotary_pos_emb = preproc_output[1]
+            if not isinstance(position_ids, torch.Tensor) or not torch.is_tensor(
+                rotary_pos_emb,
+            ):
+                return tuple(preproc_output)
+            if position_ids.ndim != 2:
+                raise RuntimeError(
+                    "GPT OSS expected 2D position_ids for YaRN rotary gathering, "
+                    f"got shape {tuple(position_ids.shape)}"
+                )
+            cp_world_size = _context_parallel_world_size(
+                getattr(_gpt_module, "config", None),
+            )
+            rotary_seq_len = getattr(_gpt_module, "_art_gpt_oss_rotary_seq_len", None)
+            if rotary_seq_len is None:
+                rotary_seq_len = int(position_ids.shape[-1]) * max(cp_world_size, 1)
+            table_source = _gpt_oss_absolute_rotary_pos_emb(
+                _gpt_module,
+                seq_len=int(rotary_seq_len),
+            )
+            preproc_output[1] = _gather_absolute_rotary_pos_emb(
+                table_source,
+                position_ids=position_ids,
+            )
+            return tuple(preproc_output)
+
+        gpt_module._preprocess = preprocess_hook  # type: ignore[attr-defined]
 
 
 def _install_weighted_bias_quick_geglu_patch() -> None:
