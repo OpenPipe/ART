@@ -25,6 +25,7 @@ from openai.types.chat.completion_create_params import CompletionCreateParams
 from openai.types.completion_usage import CompletionUsage
 import tinker
 from tinker_cookbook import renderers, tokenizer_utils
+import torch
 import uvicorn
 
 from .. import dev
@@ -79,6 +80,76 @@ def _canonicalize_upstream_metric_key(metric: str) -> str:
     if metric.startswith("group_metric_"):
         return f"group_{metric[len('group_metric_') :]}"
     return _UPSTREAM_TRAIN_METRIC_KEYS.get(metric, metric)
+
+
+async def _apply_kl_penalty(
+    datums: list[tinker.Datum],
+    reference_sampling_client: tinker.SamplingClient,
+    kl_penalty_coef: float,
+) -> dict[str, float]:
+    assert datums
+    assert kl_penalty_coef > 0.0
+
+    full_sequences: list[tinker.ModelInput] = []
+    sampled_logprobs_by_datum: list[torch.Tensor] = []
+    masks_by_datum: list[torch.Tensor] = []
+    advantages_by_datum: list[torch.Tensor] = []
+    for datum in datums:
+        target_tokens = datum.loss_fn_inputs["target_tokens"].to_torch()
+        assert target_tokens.numel() > 0
+        full_sequences.append(
+            datum.model_input.append_int(int(target_tokens[-1].item()))
+        )
+        sampled_logprobs_by_datum.append(datum.loss_fn_inputs["logprobs"].to_torch())
+        masks_by_datum.append(datum.loss_fn_inputs["mask"].to_torch().float())
+        advantages_by_datum.append(datum.loss_fn_inputs["advantages"].to_torch())
+
+    reference_logprobs_by_datum = await asyncio.gather(
+        *[
+            reference_sampling_client.compute_logprobs_async(full_sequence)
+            for full_sequence in full_sequences
+        ]
+    )
+
+    logprob_diffs_by_datum: list[torch.Tensor] = []
+    for reference_logprobs, sampled_logprobs, mask in zip(
+        reference_logprobs_by_datum,
+        sampled_logprobs_by_datum,
+        masks_by_datum,
+        strict=True,
+    ):
+        reference_values = reference_logprobs[1:]
+        assert len(reference_values) == sampled_logprobs.numel()
+        assert all(value is not None for value in reference_values)
+        reference_logprobs_tensor = torch.tensor(
+            reference_values,
+            dtype=sampled_logprobs.dtype,
+        )
+        logprob_diffs_by_datum.append(
+            (sampled_logprobs - reference_logprobs_tensor) * mask
+        )
+
+    total_tokens = torch.stack([mask.sum() for mask in masks_by_datum]).sum()
+    assert total_tokens.item() > 0
+    avg_logprob_diff = (
+        torch.stack(
+            [logprob_diff.sum() for logprob_diff in logprob_diffs_by_datum]
+        ).sum()
+        / total_tokens
+    )
+
+    for datum, advantages, mask, logprob_diff in zip(
+        datums,
+        advantages_by_datum,
+        masks_by_datum,
+        logprob_diffs_by_datum,
+        strict=True,
+    ):
+        datum.loss_fn_inputs["advantages"] = tinker.TensorData.from_torch(
+            advantages + kl_penalty_coef * (avg_logprob_diff - logprob_diff) * mask
+        )
+
+    return {"loss/kl_policy_ref": float(avg_logprob_diff)}
 
 
 @dataclass
@@ -243,8 +314,15 @@ class TinkerNativeBackend(Backend):
         save_checkpoint: bool = False,
         loss_fn_config: dict | None = None,
         adam_params: tinker.AdamParams | None = None,
+        kl_penalty_coef: float = 0.0,
+        kl_penalty_reference_step: int | None = None,
+        kl_penalty_source: Literal["sample"] = "sample",
         **kwargs: Any,
     ) -> TrainResult:
+        assert kl_penalty_source == "sample", (
+            "TinkerNativeBackend only supports kl_penalty_source='sample'."
+        )
+
         state = self._model_state[model.name]
         groups_list = list(trajectory_groups)
         summary = summarize_trajectory_groups(groups_list)
@@ -277,6 +355,23 @@ class TinkerNativeBackend(Backend):
                 train_tokens, pricing
             )
         trainer_started = time.monotonic()
+        sampled_kl_policy_ref: float | None = None
+
+        if kl_penalty_coef > 0:
+            kl_metrics = await self._tinker_sample_call(
+                "apply_kl_penalty",
+                _apply_kl_penalty(
+                    datums,
+                    await self._get_kl_reference_sampling_client(
+                        state,
+                        model.base_model,
+                        kl_penalty_reference_step,
+                    ),
+                    kl_penalty_coef,
+                ),
+            )
+            sampled_kl_policy_ref = kl_metrics["loss/kl_policy_ref"]
+            metrics.update(kl_metrics)
 
         if adam_params is None:
             adam_params = tinker.AdamParams(
@@ -315,6 +410,11 @@ class TinkerNativeBackend(Backend):
                 if value is None:
                     continue
                 canonical_key = _canonicalize_upstream_metric_key(key)
+                if (
+                    sampled_kl_policy_ref is not None
+                    and canonical_key == "loss/kl_policy_ref"
+                ):
+                    continue
                 if canonical_key:
                     metrics[canonical_key] = float(value)
         if optim_output.metrics:
@@ -322,6 +422,11 @@ class TinkerNativeBackend(Backend):
                 if value is None:
                     continue
                 canonical_key = _canonicalize_upstream_metric_key(key)
+                if (
+                    sampled_kl_policy_ref is not None
+                    and canonical_key == "loss/kl_policy_ref"
+                ):
+                    continue
                 if canonical_key:
                     metrics[canonical_key] = float(value)
 
@@ -714,6 +819,19 @@ class TinkerNativeBackend(Backend):
         )
         state.sampler_clients[actual_step] = sampler_client
         return sampler_client
+
+    async def _get_kl_reference_sampling_client(
+        self,
+        state: ModelState,
+        base_model: str,
+        step: int | None,
+    ) -> tinker.SamplingClient:
+        if step is not None:
+            return await self._get_sampler_client(state, step)
+        return await self._tinker_sample_call(
+            "create_sampling_client_async",
+            state.service_client.create_sampling_client_async(base_model=base_model),
+        )
 
     def _normalize_messages(self, messages: Iterable[Any]) -> list[dict[str, Any]]:
         normalized: list[dict[str, Any]] = []

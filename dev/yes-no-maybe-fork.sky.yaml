@@ -4,13 +4,14 @@ workdir: .
 
 resources:
   accelerators: ["H200:1", "H100-SXM:1", "H100:1", "A100-80GB:1"]
-  image_id: docker:pytorch/pytorch:2.9.0-cuda12.8-cudnn9-devel
+  image_id: docker:docker.io/bradhiltonnw/art-gpu:latest
   ports:
     - 7999 # main ART server
     - 8000 # vLLM server
 
 envs:
   GIT_RESET_CLEAN: "false" # preserve workdir files synced by SkyPilot
+  INSTALL_EXTRAS: "false"
   PYTHONUTF8: "1"
   GIT_USER_NAME: "Your Name"
   GIT_USER_EMAIL: "your.email@example.com"
@@ -27,9 +28,11 @@ config:
   kubernetes:
     pod_config:
       spec:
-        schedulerName: gpu-binpack
+        schedulerName: binpack-scheduler
+        activeDeadlineSeconds: 604800
         containers:
           - name: ray-node
+            imagePullPolicy: Always
             env:
               - name: UV_LINK_MODE
                 value: copy

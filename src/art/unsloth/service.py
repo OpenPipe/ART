@@ -45,6 +45,20 @@ from .train import (
 logger = logging.getLogger(__name__)
 
 
+def _peft_args_from_lora_config(lora_config: dev.LoRAConfig) -> dict[str, Any]:
+    aliases = {
+        "rank": "r",
+        "alpha": "lora_alpha",
+        "dropout": "lora_dropout",
+        "init_weights": "init_lora_weights",
+    }
+    return {
+        "r": 8,
+        "lora_alpha": 16,
+        **{aliases.get(k, k): v for k, v in lora_config.items()},
+    }
+
+
 class _RuntimeRequestKwargs(TypedDict, total=False):
     headers: dict[str, str]
 
@@ -820,6 +834,8 @@ class UnslothService:
         init_args["model_name"] = checkpoint_dir or self.base_model
         return create_unsloth_train_context(
             init_args=init_args,
-            peft_args=cast(dict[str, Any], self.config.get("peft_args", {})),
+            peft_args=_peft_args_from_lora_config(
+                cast(dev.BackendModelConfig, self.config).get("lora_config", {})
+            ),
             trainer_args=cast(dict[str, Any], self.config.get("trainer_args", {})),
         )

@@ -1,6 +1,5 @@
 from collections.abc import Iterator
 from dataclasses import dataclass, field
-import gc
 import logging
 from typing import Any, Sequence, cast
 
@@ -104,8 +103,6 @@ def offload_to_cpu(
             param.data = pinned_buffers[key]
 
     torch.cuda.synchronize()
-    gc.collect()
-    torch.cuda.empty_cache()
     offload_state.is_offloaded = True
     _rank0_info(rank, OFFLOADED_FROZEN_PARAMS_MESSAGE)
 

@@ -4,12 +4,12 @@ import asyncio
 import random
 
 import art
-from art.local import LocalBackend
+from art.megatron import MegatronBackend
 from art.utils.sft import train_sft_from_file
 
 
 async def main():
-    backend = LocalBackend()
+    backend = MegatronBackend()
 
     model_name = "run-" + "".join(
         random.choices("abcdefghijklmnopqrstuvwxyz0123456789", k=8)
@@ -17,7 +17,7 @@ async def main():
     model = art.TrainableModel(
         name=model_name,
         project="sft-from-file",
-        base_model="meta-llama/Llama-3.1-8B-Instruct",
+        base_model="Qwen/Qwen3.6-35B-A3B",
     )
     await model.register(backend)
 

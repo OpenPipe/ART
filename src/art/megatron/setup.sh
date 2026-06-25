@@ -25,8 +25,7 @@ if [ "${#missing_packages[@]}" -gt 0 ]; then
     fi
 fi
 
-# Python dependencies are declared in pyproject.toml extras.
-# Megatron setup still needs the shared backend extras, but the vLLM runtime now
+# Python dependencies are declared in pyproject.toml extras. The vLLM runtime
 # lives in its own project and venv under vllm_runtime/.
 script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 repo_root="$(cd -- "${script_dir}/../../.." && pwd)"
@@ -35,4 +34,4 @@ uv_bin="uv"
 if [ -x "${HOME}/.local/bin/uv" ]; then
     uv_bin="${HOME}/.local/bin/uv"
 fi
-"${uv_bin}" sync --extra backend --extra megatron --frozen --active
+"${uv_bin}" sync --extra megatron --frozen --active

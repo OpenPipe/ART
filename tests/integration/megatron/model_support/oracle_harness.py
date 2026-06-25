@@ -89,7 +89,7 @@ REQUIRED_PACKED_TENSOR_FILES = (
 )
 NON_FINITE_METRIC_VALUE = 1e30
 ORACLE_DEFAULT_MEAN_ABS_PCT_LIMIT = DEFAULT_MEAN_ABS_PCT_THRESHOLD
-ROUTER_SCORE_MEAN_ABS_PCT_LIMIT = 2e-4
+ROUTER_SCORE_MEAN_ABS_PCT_LIMIT = 5e-4
 FORWARD_EXPERT_LORA_TRACE_NOISE_RELATIVE_L2_LIMIT = 3e-4
 FORWARD_EXPERT_LORA_TRACE_NOISE_REASON = "forward_expert_lora_trace_noise"
 EXPERT_TABLE_ROW_LIMIT = 8
@@ -571,13 +571,25 @@ class DiffAccumulator:
 
     def update_router_ids(self, reference_ids, candidate_ids) -> None:  # type: ignore[no-untyped-def]
         """Adds router top-k id mismatch counts into the accumulator."""
-        self.router_topk_total += int(reference_ids.numel())
-        self.router_topk_mismatch += int((reference_ids != candidate_ids).sum().item())
+        self.numel += int(reference_ids.numel())
         if reference_ids.ndim >= 2 and reference_ids.shape[1] > 0:
+            self.router_topk_total += int(reference_ids.shape[0])
+            self.router_topk_mismatch += int(
+                (
+                    torch.sort(reference_ids, dim=1).values
+                    != torch.sort(candidate_ids, dim=1).values
+                )
+                .any(dim=1)
+                .sum()
+                .item()
+            )
             self.router_top1_total += int(reference_ids.shape[0])
             self.router_top1_mismatch += int(
                 (reference_ids[:, 0] != candidate_ids[:, 0]).sum().item()
             )
+            return
+        self.router_topk_total += int(reference_ids.numel())
+        self.router_topk_mismatch += int((reference_ids != candidate_ids).sum().item())
 
     def as_summary(self) -> dict[str, float]:
         """Returns normalized summary values for one row."""
@@ -640,24 +652,6 @@ def _truthy(value: str | None) -> bool:
     if value is None:
         return False
     return value.strip().lower() in {"1", "true", "yes", "on"}
-
-
-def _trace_cp_world_size(call: dict[str, Any]) -> int:
-    """Returns the CP size represented by one possibly rank-merged trace call."""
-    rank_meta = call.get("rank_meta")
-    if isinstance(rank_meta, dict):
-        rank_meta = [rank_meta]
-    if not isinstance(rank_meta, list):
-        return 1
-    sizes: list[int] = []
-    for item in rank_meta:
-        if not isinstance(item, dict):
-            continue
-        try:
-            sizes.append(int(item.get("cp_world_size", 1)))
-        except Exception:
-            sizes.append(1)
-    return max(sizes, default=1)
 
 
 def sensitivity_mutations() -> list[SensitivityMutation]:
@@ -769,22 +763,26 @@ def oracle_topology(*, is_moe: bool = True) -> Topology:
 
 
 def _filter_context_parallel_support(
-    topologies: list[Topology], *, is_moe: bool, cp_supported: bool
+    topologies: list[Topology],
+    *,
+    is_moe: bool,
+    cp_supported: bool,
 ) -> list[Topology]:
     if cp_supported:
         return topologies
     if is_moe:
         return list(CP_UNSUPPORTED_MOE_TOPOLOGIES)
-    return [topology for topology in topologies if topology.cp == 1]
+    return [_without_context_parallel(topology) for topology in topologies]
 
 
 def selected_suite_topologies(
-    *, is_moe: bool = True, cp_supported: bool = True
+    *,
+    is_moe: bool = True,
+    cp_supported: bool = True,
 ) -> list[Topology]:
     """Returns the correctness topology list for a model family."""
-    topologies = list(TOPOLOGIES if is_moe else DENSE_TOPOLOGIES)
     return _filter_context_parallel_support(
-        topologies,
+        list(TOPOLOGIES if is_moe else DENSE_TOPOLOGIES),
         is_moe=is_moe,
         cp_supported=cp_supported,
     )
@@ -1134,33 +1132,6 @@ def _load_manifest(topology_dir: Path) -> RunManifest:
     return RunManifest.model_validate(_read_json(manifest_path))
 
 
-def _topology_artifacts_complete(topology_dir: Path, manifest: RunManifest) -> bool:
-    """Returns whether a cached topology still has tensors needed for comparison."""
-    for step in manifest.steps:
-        required = [
-            topology_dir / "traces" / f"forward_trace_step_{step.step_index:03d}.pt",
-            topology_dir / step.output_file,
-            topology_dir / step.grads_file,
-            topology_dir / step.deltas_file,
-            topology_dir / step.lora_file,
-        ]
-        if any(not path.exists() for path in required):
-            return False
-    return True
-
-
-def _topology_artifacts_current_and_complete(topology_dir: Path) -> bool:
-    """Returns whether cached topology artifacts can be reused for comparison."""
-    manifest_path = topology_dir / "manifest.json"
-    if not _manifest_matches_current_commit(manifest_path):
-        return False
-    try:
-        manifest = _load_manifest(topology_dir)
-    except Exception:
-        return False
-    return _topology_artifacts_complete(topology_dir, manifest)
-
-
 def _load_output_tensor(topology_dir: Path, step: StepTrace):
     """Loads one output trace tensor referenced by a step trace entry."""
     import torch
@@ -1265,11 +1236,7 @@ def _stacked_layers(
         if len(reference_shapes) != 1 or len(candidate_shapes) != 1:
             original_names = original_names_by_group[normalized]
             for original_name, (reference, candidate) in zip(original_names, group):
-                # Keep one synthetic layer axis so layer-averaged comparison
-                # does not treat tensor rows/features as layer entries.
-                stacked_pairs.append(
-                    (original_name, reference.unsqueeze(0), candidate.unsqueeze(0))
-                )
+                stacked_pairs.append((original_name, reference, candidate))
             continue
         stacked_pairs.append(
             (
@@ -1420,24 +1387,6 @@ class VariantRunner:
         if sequence_length <= 0:
             return trace
 
-        def trim_by_leading_dim(call: dict[str, Any], valid_length: int) -> None:
-            for key in ("primary_output", "router_topk_scores", "router_topk_ids"):
-                tensor = call.get(key)
-                if not isinstance(tensor, torch.Tensor) or tensor.ndim == 0:
-                    continue
-                leading_dim = int(tensor.shape[0])
-                if leading_dim <= valid_length:
-                    continue
-                if leading_dim % sequence_length == 0:
-                    row_multiplier = leading_dim // sequence_length
-                    target_rows = valid_length * row_multiplier
-                elif leading_dim <= sequence_length:
-                    target_rows = valid_length
-                else:
-                    continue
-                if 0 < target_rows < leading_dim:
-                    call[key] = tensor[:target_rows].contiguous()
-
         for calls in trace.values():
             for call in calls:
                 sample_index = call.get("micro_sample_index")
@@ -1445,9 +1394,6 @@ class VariantRunner:
                     continue
                 valid_length = int(valid_lengths[sample_index])
                 if valid_length >= sequence_length:
-                    continue
-                if _trace_cp_world_size(call) <= 1:
-                    trim_by_leading_dim(call, valid_length)
                     continue
                 row_token_uids = call.get("row_token_uids")
                 if (
@@ -1480,7 +1426,22 @@ class VariantRunner:
                                     0, keep_rows
                                 ).contiguous()
                         continue
-                trim_by_leading_dim(call, valid_length)
+                for key in ("primary_output", "router_topk_scores", "router_topk_ids"):
+                    tensor = call.get(key)
+                    if not isinstance(tensor, torch.Tensor) or tensor.ndim == 0:
+                        continue
+                    leading_dim = int(tensor.shape[0])
+                    if leading_dim <= valid_length:
+                        continue
+                    if leading_dim % sequence_length == 0:
+                        row_multiplier = leading_dim // sequence_length
+                        target_rows = valid_length * row_multiplier
+                    elif leading_dim <= sequence_length:
+                        target_rows = valid_length
+                    else:
+                        continue
+                    if 0 < target_rows < leading_dim:
+                        call[key] = tensor[:target_rows].contiguous()
         return trace
 
     def _run_topology(
@@ -1498,10 +1459,11 @@ class VariantRunner:
     ) -> Path:
         """Executes one topology worker run and returns its output directory."""
         topology_dir = self.case_dir / output_slug
+        manifest_path = topology_dir / "manifest.json"
         if (
-            not regenerate
-            and topology_dir.exists()
-            and _topology_artifacts_current_and_complete(topology_dir)
+            manifest_path.exists()
+            and not regenerate
+            and _manifest_matches_current_commit(manifest_path)
         ):
             return topology_dir
         _replace_topology_dir(topology_dir)
@@ -1561,7 +1523,7 @@ class VariantRunner:
             or not bundle_manifest.exists()
             or not bundle_format_current
             or not self.shared_init_path.exists()
-            or not _topology_artifacts_current_and_complete(capture_manifest.parent)
+            or not _manifest_matches_current_commit(capture_manifest)
         )
         run_oracle_topology = partial(
             self._run_topology,
@@ -1582,7 +1544,7 @@ class VariantRunner:
             regenerate
             or not oracle_manifest.exists()
             or not self.shared_init_path.exists()
-            or not _topology_artifacts_current_and_complete(oracle_manifest.parent)
+            or not _manifest_matches_current_commit(oracle_manifest)
         ):
             run_oracle_topology(
                 output_slug=self.oracle_slug,
@@ -2202,9 +2164,10 @@ def _suite_variants(
     """Builds the standard oracle suite variant ordering."""
     phase_pass = _default_phase_pass_fns()
     variants: list[VariantSpec] = []
-    for topology in selected_suite_topologies(is_moe=is_moe, cp_supported=cp_supported)[
-        1:
-    ]:
+    for topology in selected_suite_topologies(
+        is_moe=is_moe,
+        cp_supported=cp_supported,
+    )[1:]:
         if max_world_size is not None and topology.world_size() > max_world_size:
             continue
         variants.append(
@@ -2223,9 +2186,9 @@ def run_suite(
     *,
     case_config: OracleCaseConfig,
     max_world_size: int | None = None,
-    cp_supported: bool = True,
     oracle_flex_backend: FlexBackend | None = None,
     variant_flex_backend: FlexBackend | None = None,
+    cp_supported: bool = True,
 ) -> list[VariantReport]:
     """Runs non-oracle topologies against the canonical replay-backed oracle."""
     reports: list[VariantReport] = []

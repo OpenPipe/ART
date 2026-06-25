@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from typing import cast
+
 import numpy as np
 import torch
 from torch.nn.attention.flex_attention import BlockMask
@@ -11,6 +13,7 @@ from .types import AttnMaskKind, FlexMaskSpec
 _INVALID_Q_GROUP = -(1 << 63)
 _INVALID_Q_PARENT = _INVALID_Q_GROUP + 1
 _INVALID_K_GROUP = _INVALID_Q_GROUP + 2
+_INVALID_POSITION = _INVALID_Q_GROUP + 3
 
 
 def _build_exact_mask_mod(
@@ -20,13 +23,39 @@ def _build_exact_mask_mod(
     q_group: np.ndarray,
     q_parent: np.ndarray,
     k_group: np.ndarray,
+    q_pos: np.ndarray | None,
+    k_pos: np.ndarray | None,
+    sliding_window: int | None,
     device: torch.device,
 ):
-    q_abs_tensor = torch.as_tensor(q_abs, device=device, dtype=torch.int64)
-    k_abs_tensor = torch.as_tensor(k_abs, device=device, dtype=torch.int64)
     q_group_tensor = torch.as_tensor(q_group, device=device, dtype=torch.int64)
     q_parent_tensor = torch.as_tensor(q_parent, device=device, dtype=torch.int64)
     k_group_tensor = torch.as_tensor(k_group, device=device, dtype=torch.int64)
+
+    if sliding_window is not None:
+        q_pos_tensor = torch.as_tensor(q_pos, device=device, dtype=torch.int64)
+        k_pos_tensor = torch.as_tensor(k_pos, device=device, dtype=torch.int64)
+
+        def sliding_mask_mod(
+            batch_idx: torch.Tensor,
+            head_idx: torch.Tensor,
+            query_idx: torch.Tensor,
+            kv_idx: torch.Tensor,
+        ) -> torch.Tensor:
+            del batch_idx, head_idx
+            same_group = q_group_tensor[query_idx] == k_group_tensor[kv_idx]
+            parent_prefix = q_parent_tensor[query_idx] == k_group_tensor[kv_idx]
+            delta = q_pos_tensor[query_idx] - k_pos_tensor[kv_idx]
+            return (
+                (same_group | parent_prefix)
+                & (delta >= 0)
+                & (delta < int(sliding_window))
+            )
+
+        return sliding_mask_mod
+
+    q_abs_tensor = torch.as_tensor(q_abs, device=device, dtype=torch.int64)
+    k_abs_tensor = torch.as_tensor(k_abs, device=device, dtype=torch.int64)
 
     def mask_mod(
         batch_idx: torch.Tensor,
@@ -153,12 +182,62 @@ def _exact_block_state(
     )
 
 
+def _range_min_max(
+    values: np.ndarray,
+    starts: np.ndarray,
+    ends: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray]:
+    mins = np.empty((int(starts.size),), dtype=np.int64)
+    maxes = np.empty((int(starts.size),), dtype=np.int64)
+    for index, (start, end) in enumerate(zip(starts, ends, strict=True)):
+        block = values[int(start) : int(end)]
+        mins[index] = int(block.min()) if int(block.size) else 0
+        maxes[index] = int(block.max()) if int(block.size) else 0
+    return mins, maxes
+
+
+def _exact_sliding_block_state(
+    *,
+    q_idx: int,
+    k_idx: int,
+    q_block: int,
+    k_block: int,
+    q_len: int,
+    k_len: int,
+    q_group: np.ndarray,
+    q_parent: np.ndarray,
+    k_group: np.ndarray,
+    q_pos: np.ndarray,
+    k_pos: np.ndarray,
+    sliding_window: int,
+) -> tuple[bool, bool]:
+    q_start = int(q_idx) * int(q_block)
+    q_end = min(q_start + int(q_block), int(q_len))
+    k_start = int(k_idx) * int(k_block)
+    k_end = min(k_start + int(k_block), int(k_len))
+    q_group_block = q_group[q_start:q_end]
+    q_parent_block = q_parent[q_start:q_end]
+    k_group_block = k_group[k_start:k_end]
+    delta = q_pos[q_start:q_end, None] - k_pos[None, k_start:k_end]
+    allowed = (
+        (
+            (q_group_block[:, None] == k_group_block[None, :])
+            | (q_parent_block[:, None] == k_group_block[None, :])
+        )
+        & (delta >= 0)
+        & (delta < int(sliding_window))
+    )
+    return bool(allowed.any()), bool(allowed.all())
+
+
 def _build_sparse_block_mask(
     spec: FlexMaskSpec,
     *,
     device: torch.device,
     group_ids: torch.Tensor,
     parent_ids: torch.Tensor,
+    input_pos: torch.Tensor | None,
+    sliding_window: int | None,
     block_size: tuple[int, int],
 ) -> BlockMask:
     q_block, k_block = block_size
@@ -183,6 +262,15 @@ def _build_sparse_block_mask(
     )
     flat_group_ids_np = flat_group_ids.numpy()
     flat_parent_ids_np = flat_parent_ids.numpy()
+    input_pos_for_window = cast(torch.Tensor, input_pos)
+    flat_input_pos_np = (
+        input_pos_for_window.detach()
+        .to(device="cpu", dtype=torch.int64)
+        .reshape(-1)
+        .numpy()
+        if sliding_window is not None
+        else None
+    )
     q_group = _select_with_invalid_np(
         flat_group_ids_np,
         q_abs,
@@ -198,12 +286,33 @@ def _build_sparse_block_mask(
         k_abs,
         invalid_value=_INVALID_K_GROUP,
     )
+    q_pos = (
+        _select_with_invalid_np(
+            cast(np.ndarray, flat_input_pos_np),
+            q_abs,
+            invalid_value=_INVALID_POSITION,
+        )
+        if sliding_window is not None
+        else None
+    )
+    k_pos = (
+        _select_with_invalid_np(
+            cast(np.ndarray, flat_input_pos_np),
+            k_abs,
+            invalid_value=_INVALID_POSITION,
+        )
+        if sliding_window is not None
+        else None
+    )
     mask_mod = _build_exact_mask_mod(
         q_abs=q_abs,
         k_abs=k_abs,
         q_group=q_group,
         q_parent=q_parent,
         k_group=k_group,
+        q_pos=q_pos,
+        k_pos=k_pos,
+        sliding_window=sliding_window,
         device=device,
     )
     q_min_by_block, q_allowed_max_by_group, q_all_allowed_groups = (
@@ -273,10 +382,32 @@ def _build_sparse_block_mask(
         q_max = q_abs[q_overlap_end - 1]
         k_min = k_abs[k_overlap_start]
         k_max = k_abs[k_overlap_end - 1]
+        if sliding_window is not None:
+            q_pos_for_window = cast(np.ndarray, q_pos)
+            k_pos_for_window = cast(np.ndarray, k_pos)
+            q_pos_min, q_pos_max = _range_min_max(
+                q_pos_for_window,
+                q_overlap_start,
+                q_overlap_end,
+            )
+            k_pos_min, k_pos_max = _range_min_max(
+                k_pos_for_window,
+                k_overlap_start,
+                k_overlap_end,
+            )
+            window_has_any = (q_pos_max[:, None] >= k_pos_min[None, :]) & (
+                q_pos_min[:, None] - k_pos_max[None, :] < int(sliding_window)
+            )
+            window_is_full = (q_pos_min[:, None] >= k_pos_max[None, :]) & (
+                q_pos_max[:, None] - k_pos_min[None, :] < int(sliding_window)
+            )
         q_is_full = (q_overlap_start == q_block_start) & (q_overlap_end == q_block_end)
         k_is_full = (k_overlap_start == k_block_start) & (k_overlap_end == k_block_end)
         covers_block = q_is_full[:, None] & k_is_full[None, :]
-        if slice_.mask_kind == AttnMaskKind.FULL:
+        if sliding_window is not None:
+            has_any = window_has_any
+            is_full = covers_block & window_is_full
+        elif slice_.mask_kind == AttnMaskKind.FULL:
             has_any = np.ones(
                 (int(q_block_indices.size), int(k_block_indices.size)), dtype=bool
             )
@@ -293,16 +424,32 @@ def _build_sparse_block_mask(
 
     ambiguous = (touch_counts > 1) & partial_blocks & ~full_blocks
     for q_idx, k_idx in np.argwhere(ambiguous):
-        has_any, is_full = _exact_block_state(
-            q_idx=int(q_idx),
-            k_idx=int(k_idx),
-            q_min_by_block=q_min_by_block,
-            q_allowed_max_by_group=q_allowed_max_by_group,
-            q_all_allowed_groups=q_all_allowed_groups,
-            k_max_by_block=k_max_by_block,
-            k_min_by_group=k_min_by_group,
-            k_groups_by_block=k_groups_by_block,
-        )
+        if sliding_window is None:
+            has_any, is_full = _exact_block_state(
+                q_idx=int(q_idx),
+                k_idx=int(k_idx),
+                q_min_by_block=q_min_by_block,
+                q_allowed_max_by_group=q_allowed_max_by_group,
+                q_all_allowed_groups=q_all_allowed_groups,
+                k_max_by_block=k_max_by_block,
+                k_min_by_group=k_min_by_group,
+                k_groups_by_block=k_groups_by_block,
+            )
+        else:
+            has_any, is_full = _exact_sliding_block_state(
+                q_idx=int(q_idx),
+                k_idx=int(k_idx),
+                q_block=q_block,
+                k_block=k_block,
+                q_len=int(spec.q_len),
+                k_len=int(spec.k_len),
+                q_group=q_group,
+                q_parent=q_parent,
+                k_group=k_group,
+                q_pos=cast(np.ndarray, q_pos),
+                k_pos=cast(np.ndarray, k_pos),
+                sliding_window=int(sliding_window),
+            )
         partial_blocks[q_idx, k_idx] = False
         full_blocks[q_idx, k_idx] = False
         if is_full:
@@ -335,6 +482,8 @@ def build_block_mask(
     *,
     group_ids: torch.Tensor,
     parent_ids: torch.Tensor,
+    input_pos: torch.Tensor | None = None,
+    sliding_window: int | None = None,
     device: torch.device,
 ) -> BlockMask | None:
     if spec.q_len <= 0 or spec.k_len <= 0:
@@ -355,5 +504,7 @@ def build_block_mask(
         device=device,
         group_ids=group_ids,
         parent_ids=parent_ids,
+        input_pos=input_pos,
+        sliding_window=sliding_window,
         block_size=block_size,
     )

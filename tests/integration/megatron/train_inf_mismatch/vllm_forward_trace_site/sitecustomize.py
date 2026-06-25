@@ -17,15 +17,6 @@ _CALL_INDEX = 0
 _LAYER_RE = re.compile(r"model\.layers\.\d+")
 
 
-def _layer_index(name: str) -> int | None:
-    marker = "model.layers."
-    marker_index = name.find(marker)
-    if marker_index < 0:
-        return None
-    raw = name[marker_index + len(marker) :].split(".", 1)[0]
-    return int(raw) if raw.isdigit() else None
-
-
 def _trace_dir() -> Path | None:
     raw = os.environ.get("ART_VLLM_FORWARD_TRACE_DIR")
     return Path(raw) if raw else None
@@ -93,15 +84,10 @@ def _save_tensor(
 
     if not isinstance(tensor, torch.Tensor):
         return None
-    try:
-        if torch.cuda.is_available() and torch.cuda.is_current_stream_capturing():
-            return None
-    except Exception:
-        return None
     max_rows = int(os.environ.get("ART_VLLM_FORWARD_TRACE_MAX_ROWS", "768"))
     if tensor.ndim > 0 and int(tensor.shape[0]) > max_rows:
         return None
-    rel_path = Path("tensors") / f"{call_index:06d}_{os.getpid()}_{field}.pt"
+    rel_path = Path("tensors") / f"{call_index:06d}_{field}.pt"
     path = trace_dir / rel_path
     path.parent.mkdir(parents=True, exist_ok=True)
     torch.save(tensor.detach().cpu(), path)
@@ -109,28 +95,14 @@ def _save_tensor(
 
 
 def _should_capture(name: str) -> bool:
-    raw_max_layer = os.environ.get("ART_VLLM_FORWARD_TRACE_MAX_LAYER_INDEX")
-    if raw_max_layer is not None:
-        layer_index = _layer_index(name)
-        if layer_index is not None and layer_index > int(raw_max_layer):
-            return False
     if name == "model.embed_tokens" or name == "model.norm":
         return True
     if _LAYER_RE.fullmatch(name):
-        return os.environ.get("ART_VLLM_FORWARD_TRACE_LAYER_OUTPUTS", "1") != "0"
+        return True
     if os.environ.get("ART_VLLM_FORWARD_TRACE_DETAIL") != "1":
         return False
     return (
-        name.endswith(".attn")
-        or name.endswith(".attn.mla_attn")
-        or name.endswith(".attn.fused_wqa_wkv")
-        or name.endswith(".attn.wq_b")
-        or name.endswith(".attn.wo_a")
-        or name.endswith(".attn.wo_b")
-        or name.endswith(".ffn")
-        or name.endswith(".ffn.gate")
-        or name.endswith(".ffn.experts")
-        or name.endswith(".input_layernorm")
+        name.endswith(".input_layernorm")
         or name.endswith(".self_attn")
         or name.endswith(".qkv_proj")
         or name.endswith(".q_norm")
@@ -240,8 +212,6 @@ def _maybe_patch(name: str, module: Any) -> None:
         _patch_causal_lm_class(module, "Qwen3ForCausalLM")
     elif name == "vllm.model_executor.models.qwen3_moe":
         _patch_causal_lm_class(module, "Qwen3MoeForCausalLM")
-    elif name == "vllm.model_executor.models.deepseek_v4":
-        _patch_causal_lm_class(module, "DeepseekV4ForCausalLM")
 
 
 def _import(name, globals=None, locals=None, fromlist=(), level=0):

@@ -91,8 +91,8 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
         loss_fn_config: dict | None = None,
         normalize_advantages: bool = True,
         adam_params: object | None = None,
-        packed_sequence_length: int | None = None,
-        megatron_topology: art.MegatronTopologyConfig | None = None,
+        kl_penalty_coef: float = 0.0,
+        kl_penalty_step_lag: int | None = None,
         max_steps: int | None = None,
         # Discard handling
         discard_queue_multiplier: int = 100,
@@ -131,6 +131,8 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
             raise ValueError("discard_queue_multiplier must be > 0")
         if checkpoint_retention_interval <= 0:
             raise ValueError("checkpoint_retention_interval must be > 0")
+        if kl_penalty_step_lag is not None and kl_penalty_step_lag < 1:
+            raise ValueError("kl_penalty_step_lag must be >= 1")
         self.model = model
         self.backend = backend
         self.rollout_fn = rollout_fn
@@ -148,8 +150,8 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
         self.loss_fn_config = loss_fn_config
         self.normalize_advantages = normalize_advantages
         self.adam_params = adam_params
-        self.packed_sequence_length = packed_sequence_length
-        self.megatron_topology = megatron_topology
+        self.kl_penalty_coef = kl_penalty_coef
+        self.kl_penalty_step_lag = kl_penalty_step_lag
         self.max_steps = max_steps
         self._status_log_interval_seconds = log_interval_seconds
         self.eval_every_n_steps = eval_every_n_steps
@@ -448,6 +450,11 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
         min_step = max(0, current_step - self.max_steps_off_policy)
         return set(range(min_step, current_step + 1))
 
+    def _kl_penalty_reference_step(self, current_step: int) -> int:
+        if self.kl_penalty_step_lag is None:
+            return 0
+        return max(0, current_step - self.kl_penalty_step_lag)
+
     async def _prune_model_adapters(self, current_step: int) -> None:
         if not hasattr(type(self.backend), "prune_model_adapters"):
             return
@@ -572,10 +579,15 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
                     "save_checkpoint": should_checkpoint,
                     "adam_params": self.adam_params,
                 }
-                if self.packed_sequence_length is not None:
-                    train_kwargs["packed_sequence_length"] = self.packed_sequence_length
-                if self.megatron_topology is not None:
-                    train_kwargs["megatron_topology"] = self.megatron_topology
+                if self.kl_penalty_coef > 0.0:
+                    kl_penalty_reference_step = self._kl_penalty_reference_step(
+                        current_step
+                    )
+                    train_kwargs["kl_penalty_coef"] = self.kl_penalty_coef
+                    train_kwargs["kl_penalty_source"] = "sample"
+                    train_kwargs["kl_penalty_reference_step"] = (
+                        kl_penalty_reference_step
+                    )
                 result = await self.backend.train(
                     self.model,
                     batch,
@@ -1066,7 +1078,22 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
         return sorted(checkpoints, key=lambda checkpoint: checkpoint.step)
 
     def _protected_checkpoint_steps(self, current_step: int) -> set[int]:
-        return {current_step} | set(self._checkpoint_lease_counts)
+        protected_steps = (
+            {current_step}
+            | set(self._checkpoint_lease_counts)
+            | set(self._scheduled_eval_steps)
+        )
+        if self.kl_penalty_coef > 0.0:
+            if self.kl_penalty_step_lag is None:
+                protected_steps.add(0)
+            else:
+                kl_penalty_reference_step = self._kl_penalty_reference_step(
+                    current_step
+                )
+                protected_steps.update(
+                    range(kl_penalty_reference_step, current_step + 1)
+                )
+        return protected_steps
 
     async def _run_checkpoint_retention(self, current_step: int) -> None:
         strategy = self.checkpoint_retention_strategy

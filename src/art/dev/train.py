@@ -2,6 +2,8 @@ from typing import TYPE_CHECKING, Literal
 
 from typing_extensions import TypedDict
 
+from art.types import SFTMetricLoggingConfig
+
 if TYPE_CHECKING:
     from art.megatron.routing_replay import MoeRoutingReplayBundle
 
@@ -21,6 +23,9 @@ positive advantages. Defaults to 0.0 (perfectly balanced)."""
     ]
     kimi_k2_tau: float | None
     kl_penalty_coef: float
+    kl_penalty_reference_step: int | None
+    kl_penalty_source: Literal["current_learner", "sample"]
+    kl_penalty_step_lag: int | None
     kl_ref_adapter_path: str | None
     logprob_calculation_chunk_size: int
     mask_prob_ratio: bool
@@ -44,3 +49,9 @@ positive advantages. Defaults to 0.0 (perfectly balanced)."""
 
 class TrainSFTConfig(TypedDict, total=False):
     """Experimental SFT configuration options. Use at your own risk."""
+
+    megatron_topology: dict[
+        Literal["tp", "cp", "ep", "pp", "vpp", "etp"],
+        int | None,
+    ]
+    metric_logging: SFTMetricLoggingConfig

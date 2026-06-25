@@ -276,14 +276,7 @@ def _wrap_with_mp_wrapper(
 def _collect_fp32_preserved_tensors(
     model: list[MegatronModule],
 ) -> list[_Fp32PreservedTensor]:
-    """Snapshot tensors that must survive Megatron mixed precision as fp32.
-
-    Megatron's Float16Module casts module parameters and buffers to the configured
-    dtype. DSV4 marks small numerically-sensitive tensors with ``_keep_fp32``;
-    silently casting them changes model math and can also break compiled forward
-    guards that require fp32. This helper is intentionally narrow: it only
-    snapshots explicitly marked tensors plus the existing expert-bias marker.
-    """
+    """Snapshot tensors explicitly marked to survive Megatron fp16/bf16 casts."""
 
     keep_in_fp32: list[_Fp32PreservedTensor] = []
     for model_module in model:
@@ -323,8 +316,7 @@ def _restore_fp32_preserved_tensors(
 ) -> None:
     for submodule, name, fp32_data, is_parameter in keep_in_fp32:
         if is_parameter:
-            param = getattr(submodule, name)
-            param.data = fp32_data
+            getattr(submodule, name).data = fp32_data
         else:
             submodule._buffers[name] = fp32_data
 
@@ -426,13 +418,11 @@ def _column_parallel_hf_to_megatron(
         splits = list(torch.chunk(hf_weights, self.tp_size, dim=0))
     else:
         splits = None
-    return _scatter_to_tp_ranks(
-        self,
+    return self.scatter_to_tp_ranks(
         splits,
         target_param.shape,
         target_param.dtype,
         target_param.device,
-        output_tensor=target_param.data,
     )
 
 
@@ -443,50 +433,20 @@ def _scatter_to_tp_ranks(
     dtype: torch.dtype,
     device: torch.device,
     src_rank: int = 0,
-    output_tensor: torch.Tensor | None = None,
 ) -> torch.Tensor:
     if self.tp_size == 1:
-        shard = cast(list[torch.Tensor], splits)[0]
-        if output_tensor is None:
-            return shard.to(device=device, dtype=dtype, non_blocking=True)
-        output_tensor.copy_(shard, non_blocking=True)
-        if output_tensor.device.type == "cuda":
-            torch.cuda.synchronize(output_tensor.device)
-        return output_tensor
-    output = (
-        torch.empty(output_shape, dtype=dtype, device=device)
-        if output_tensor is None
-        else output_tensor
-    )
+        return cast(list[torch.Tensor], splits)[0].to(
+            device=device, dtype=dtype, non_blocking=True
+        )
+    output = torch.empty(output_shape, dtype=dtype, device=device)
     dist = cast(Any, torch.distributed)
     global_src = dist.get_global_rank(group=self.tp_group, group_rank=src_rank)
-    if self.tp_rank == src_rank:
-        if not splits:
-            raise RuntimeError("source TP rank must provide tensor splits")
-        if len(splits) != self.tp_size:
-            raise RuntimeError(
-                f"source TP rank got {len(splits)} tensor splits for TP size "
-                f"{self.tp_size}"
-            )
-        for peer_rank, shard in enumerate(splits):
-            if peer_rank == src_rank:
-                output.copy_(shard, non_blocking=True)
-                continue
-            send_buffer = torch.empty(output_shape, dtype=dtype, device=device)
-            send_buffer.copy_(shard, non_blocking=True)
-            if send_buffer.device.type == "cuda":
-                torch.cuda.current_stream(send_buffer.device).synchronize()
-            dist.send(
-                send_buffer,
-                dst=dist.get_global_rank(group=self.tp_group, group_rank=peer_rank),
-                group=self.tp_group,
-            )
-            if send_buffer.device.type == "cuda":
-                torch.cuda.synchronize(send_buffer.device)
-    else:
-        dist.recv(output, src=global_src, group=self.tp_group)
-    if output.device.type == "cuda":
-        torch.cuda.synchronize(output.device)
+    scatter_list = None
+    if self.tp_rank == src_rank and splits:
+        scatter_list = [
+            shard.to(device=device, dtype=dtype, non_blocking=True) for shard in splits
+        ]
+    dist.scatter(output, scatter_list, src=global_src, group=self.tp_group)
     return output
 
 

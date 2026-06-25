@@ -5,7 +5,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 
 BASE_IMAGE="${BASE_IMAGE:-pytorch/pytorch:2.9.0-cuda12.8-cudnn9-devel}"
-PYTHON_MM="${PYTHON_MM:-3.11}"
+PYTHON_MM="${PYTHON_MM:-3.12}"
 UV_CACHE_RELEASE_TAG="${UV_CACHE_RELEASE_TAG:-prek-uv-cache}"
 UV_CACHE_ASSET_PREFIX="${UV_CACHE_ASSET_PREFIX:-prek-uv-cache}"
 BUILD_JOBS="${BUILD_JOBS:-auto}"
@@ -36,7 +36,7 @@ Description:
 
 Options:
   --base-image <image>     CI base image metadata for fingerprint computation
-  --python-mm <mm>         Python major.minor used in CI (default: 3.11)
+  --python-mm <mm>         Python major.minor used in CI (default: 3.12)
   --build-jobs <n|auto>    Parallel native-build jobs while prebuilding cache (default: auto)
   --release-tag <tag>      GitHub release tag used to store cache assets (default: prek-uv-cache)
   --asset-prefix <prefix>  Asset prefix for cache archive names (default: prek-uv-cache)
@@ -283,8 +283,9 @@ build_cache_archive() {
   export LIBRARY_PATH="${CUDNN_LIBRARY_PATH}${LIBRARY_PATH:+:${LIBRARY_PATH}}"
   export LD_LIBRARY_PATH="${CUDNN_LIBRARY_PATH}${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}"
 
-  log "Building full uv cache with compile_jobs=${compile_jobs}, apex_parallel_build=${apex_parallel_build}, nvcc_threads=${CI_APEX_NVCC_THREADS}, cuda_arch_list=${TORCH_CUDA_ARCH_LIST}, and uv_concurrent_builds=${UV_BUILD_SLOTS}."
-  uv sync --frozen --all-extras --group dev --no-install-project --python "${PYTHON_MM}"
+  log "Building split uv cache with compile_jobs=${compile_jobs}, apex_parallel_build=${apex_parallel_build}, nvcc_threads=${CI_APEX_NVCC_THREADS}, cuda_arch_list=${TORCH_CUDA_ARCH_LIST}, and uv_concurrent_builds=${UV_BUILD_SLOTS}."
+  uv sync --frozen --extra megatron --extra langgraph --extra plotting --group dev --no-install-project --python "${PYTHON_MM}"
+  uv sync --frozen --extra backend --extra tinker --extra langgraph --extra plotting --group dev --no-install-project --python "${PYTHON_MM}"
   rm -rf .venv
 
   log "Packing uv cache archive to ${archive_path}."

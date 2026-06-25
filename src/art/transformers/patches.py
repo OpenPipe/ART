@@ -1,4 +1,4 @@
-from typing import TYPE_CHECKING, Optional, Union
+from typing import TYPE_CHECKING, Any, Optional, Union
 
 import torch
 from transformers import masking_utils
@@ -13,21 +13,23 @@ _preprocess_mask_arguments = masking_utils._preprocess_mask_arguments
 
 def _patched_preprocess_mask_arguments(
     config: PretrainedConfig,
-    input_embeds: torch.Tensor,
+    inputs_embeds: torch.Tensor,
     attention_mask: Optional[Union[torch.Tensor, "BlockMask"]],
     past_key_values: Optional[Cache],
     position_ids: Optional[torch.Tensor],
     layer_idx: Optional[int],
-) -> tuple[bool, Optional[Union[torch.Tensor, "BlockMask"]], int, int]:
+    encoder_hidden_states: Optional[torch.Tensor] = None,
+) -> tuple[Any, ...]:
     if position_ids is not None and len(position_ids.shape) == 3:
         position_ids = position_ids[0]
     return _preprocess_mask_arguments(
         config,
-        input_embeds,
+        inputs_embeds,
         attention_mask,
         past_key_values,
         position_ids,
         layer_idx,
+        encoder_hidden_states,
     )
 
 
@@ -37,7 +39,7 @@ def patch_preprocess_mask_arguments() -> None:
 
 def disable_broken_torchvision_for_transformers() -> None:
     try:
-        import torchvision  # noqa: F401  # ty: ignore[unresolved-import]
+        import torchvision  # noqa: F401
 
         return
     except Exception:

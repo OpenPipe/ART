@@ -10,6 +10,8 @@ Uses meta-llama/Meta-Llama-3.1-8B-Instruct as the base model (trained locally).
 import asyncio
 from itertools import permutations
 import os
+import random
+import string
 
 from dotenv import load_dotenv
 import openai
@@ -54,8 +56,9 @@ async def main():
     backend = LocalBackend()
     base_model = os.environ.get("BASE_MODEL", "meta-llama/Meta-Llama-3.1-8B-Instruct")
     kl_penalty_coef = float(os.environ.get("KL_PENALTY_COEF", "0.1"))
+    random_suffix = "".join(random.choices(string.ascii_lowercase, k=4))
     model = art.TrainableModel(
-        name=os.environ.get("MODEL_NAME", f"kl-{kl_penalty_coef}"),
+        name=os.environ.get("MODEL_NAME", f"local-{random_suffix}-{kl_penalty_coef}"),
         project="yes-no-maybe",
         base_model=base_model,
     )

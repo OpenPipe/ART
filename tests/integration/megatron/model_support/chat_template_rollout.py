@@ -5,8 +5,7 @@ from pathlib import Path
 from pydantic import BaseModel, Field
 
 import art
-from art.megatron.backend import MegatronBackend
-from art.megatron.model_support.tokenizer import configure_tokenizer_for_model_support
+from art.local import LocalBackend
 from art.preprocessing.pack import PackedTensors
 from art.preprocessing.tokenize import (
     TokenizedResult,
@@ -40,7 +39,7 @@ def _history(trajectory: art.Trajectory) -> History:
 
 
 def _pack_trajectory_group(
-    backend: MegatronBackend,
+    backend: LocalBackend,
     model: art.TrainableModel,
     trajectory_group: art.TrajectoryGroup,
 ) -> PackedTensors:
@@ -95,7 +94,7 @@ class ChatTemplateRolloutReport(BaseModel):
 
 def run_chat_template_rollout(base_model: str) -> ChatTemplateRolloutReport:
     output_dir = _artifact_dir(base_model)
-    backend = MegatronBackend(path=str(output_dir))
+    backend = LocalBackend(path=str(output_dir))
     model = art.TrainableModel(
         name="model-support-chat-template",
         project="model-support-validation",
@@ -107,13 +106,7 @@ def run_chat_template_rollout(base_model: str) -> ChatTemplateRolloutReport:
     if tokenizer is None:
         from transformers import AutoTokenizer
 
-        internal_config = model._internal_config
-        assert internal_config is not None
-        tokenizer = configure_tokenizer_for_model_support(
-            AutoTokenizer.from_pretrained(base_model),
-            base_model=base_model,
-            internal_config=internal_config,
-        )
+        tokenizer = AutoTokenizer.from_pretrained(base_model)
         backend._tokenizers[tokenizer_key] = tokenizer
 
     inputs = build_chat_template_conformance_inputs(tokenizer)
@@ -253,26 +246,25 @@ def run_chat_template_rollout(base_model: str) -> ChatTemplateRolloutReport:
         )
     )
 
-    expected_error = "Assistant message has tool_calls"
-    observed_error: str | None = None
-    try:
-        tokenize_trajectory(
-            tokenizer=tokenizer,
-            image_processor=None,
-            history=_history(inputs.unsupported_assistant_tool_calls),
-            advantage=1.0,
-            allow_training_without_logprobs=True,
-            trajectory=inputs.unsupported_assistant_tool_calls,
-        )
-    except ValueError as exc:
-        observed_error = str(exc)
+    unsupported_result = tokenize_trajectory(
+        tokenizer=tokenizer,
+        image_processor=None,
+        history=_history(inputs.unsupported_assistant_tool_calls),
+        advantage=1.0,
+        allow_training_without_logprobs=True,
+        trajectory=inputs.unsupported_assistant_tool_calls,
+    )
     scenarios.append(
         ChatTemplateScenarioReport(
-            name="unsupported_assistant_tool_calls_without_logprobs",
+            name="rl_dict_assistant_tool_calls_without_choice_is_not_trainable",
             entrypoint="tokenize_trajectory",
-            passed=observed_error is not None and expected_error in observed_error,
-            expected_error_substring=expected_error,
-            observed_error=observed_error,
+            passed=unsupported_result is None,
+            result_count=int(unsupported_result is not None),
+            assistant_token_count=(
+                0
+                if unsupported_result is None
+                else int(sum(unsupported_result.assistant_mask))
+            ),
         )
     )
 

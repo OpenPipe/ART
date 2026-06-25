@@ -112,6 +112,9 @@ async def ruler(
             - "openai/gpt-4o-mini" - Fast and cost-effective
             - "openai/o3" - Most capable but expensive (default)
             - "anthropic/claude-3-opus-20240229" - Alternative judge
+            - "ollama/qwen3:32b" - Local Ollama judge via LiteLLM
+            The default calls OpenAI through LiteLLM. Set this explicitly for
+            local or custom judge backends.
         extra_litellm_params: Additional parameters to pass to LiteLLM completion.
             Can include temperature, max_tokens, etc.
         rubric: The grading rubric. The default rubric works well for most tasks.

@@ -1,14 +1,14 @@
 from collections.abc import Sequence
-from typing import Any, cast
+from typing import Any, TypeAlias
 
 from megatron.core.transformer.module import MegatronModule
 import torch
 
-ModelChunk = torch.nn.Module
-ModelChunks = list[ModelChunk]
+ModelChunk: TypeAlias = MegatronModule
+ModelChunks: TypeAlias = list[ModelChunk]
 
 
-def unwrap_megatron_chunk(module: ModelChunk) -> MegatronModule:
+def unwrap_megatron_chunk(module: torch.nn.Module) -> MegatronModule:
     current: Any = module
     seen: set[int] = set()
     while True:
@@ -29,7 +29,7 @@ def unwrap_megatron_chunk(module: ModelChunk) -> MegatronModule:
     )
 
 
-def validate_model_chunks(model_chunks: Sequence[ModelChunk]) -> None:
+def validate_model_chunks(model_chunks: Sequence[torch.nn.Module]) -> None:
     for chunk in model_chunks:
         try:
             unwrap_megatron_chunk(chunk)
@@ -39,4 +39,4 @@ def validate_model_chunks(model_chunks: Sequence[ModelChunk]) -> None:
 
 def as_megatron_api_chunks(model_chunks: Sequence[ModelChunk]) -> list[MegatronModule]:
     validate_model_chunks(model_chunks)
-    return cast(list[MegatronModule], list(model_chunks))
+    return list(model_chunks)

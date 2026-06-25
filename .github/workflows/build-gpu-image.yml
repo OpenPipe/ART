@@ -1,0 +1,236 @@
+name: Build GPU Image
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      image_repo:
+        description: "Image repository to push"
+        required: true
+        default: "docker.io/bradhiltonnw/art-gpu"
+        type: string
+      pull_image_repo:
+        description: "Image repository for cluster pulls/prewarm"
+        required: true
+        default: "docker.io/bradhiltonnw/art-gpu"
+        type: string
+      tag:
+        description: "Image tag to push"
+        required: true
+        default: "latest"
+        type: string
+      no_cache:
+        description: "Disable registry-backed BuildKit cache"
+        required: true
+        default: false
+        type: boolean
+      prewarm_nodes:
+        description: "Pre-pull the pushed image on GPU nodes"
+        required: true
+        default: true
+        type: boolean
+      prewarm_timeout:
+        description: "Timeout for GPU node prewarm rollout"
+        required: true
+        default: "30m"
+        type: string
+      smoke_launch:
+        description: "Launch a minimal SkyPilot task with the pushed image"
+        required: true
+        default: true
+        type: boolean
+      smoke_gpus:
+        description: "GPU request for the smoke launch"
+        required: true
+        default: "H200:1"
+        type: string
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: build-gpu-image-cks-wb3
+  cancel-in-progress: false
+
+jobs:
+  build-gpu-image:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+
+    env:
+      SKY_INFRA: k8s/cks-wb3
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        run: |
+          curl -LsSf https://astral.sh/uv/install.sh | sh
+          echo "${HOME}/.local/bin" >> "${GITHUB_PATH}"
+          echo "${HOME}/.cargo/bin" >> "${GITHUB_PATH}"
+
+      - name: Install kubectl
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends socat
+          kubectl_version="$(curl -LsSf https://dl.k8s.io/release/stable.txt)"
+          curl -LsSf -o kubectl "https://dl.k8s.io/release/${kubectl_version}/bin/linux/amd64/kubectl"
+          sudo install -m 0755 kubectl /usr/local/bin/kubectl
+          kubectl version --client=true
+
+      - name: Configure cks-wb3 kubeconfig
+        env:
+          CKS_WB3_KUBECONFIG: ${{ secrets.CKS_WB3_KUBECONFIG }}
+        run: |
+          if [ -z "${CKS_WB3_KUBECONFIG}" ]; then
+            echo "::error::Missing required CKS_WB3_KUBECONFIG secret."
+            exit 1
+          fi
+
+          mkdir -p "${HOME}/.kube"
+          export KUBECONFIG_PATH="${HOME}/.kube/config"
+          python3 - <<'PY'
+          import base64
+          import binascii
+          import os
+          from pathlib import Path
+
+          value = os.environ["CKS_WB3_KUBECONFIG"].encode()
+          compact_value = b"".join(value.split())
+          try:
+              decoded = base64.b64decode(compact_value, validate=True)
+              data = decoded if decoded.lstrip().startswith(b"apiVersion:") else value
+          except binascii.Error:
+              data = value
+
+          Path(os.environ["KUBECONFIG_PATH"]).write_bytes(data)
+          PY
+          chmod 600 "${KUBECONFIG_PATH}"
+          kubectl --context cks-wb3 get nodes >/dev/null
+
+      - name: Configure registry auth
+        env:
+          IMAGE_REPO: ${{ inputs.image_repo || 'docker.io/bradhiltonnw/art-gpu' }}
+          REGISTRY_AUTH_JSON_B64_SECRET: ${{ secrets.REGISTRY_AUTH_JSON_B64 }}
+          DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+          DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+          DOCKERHUB_PASSWORD: ${{ secrets.DOCKERHUB_PASSWORD }}
+        run: |
+          if [ -n "${REGISTRY_AUTH_JSON_B64_SECRET}" ]; then
+            echo "REGISTRY_AUTH_JSON_B64=${REGISTRY_AUTH_JSON_B64_SECRET}" >> "${GITHUB_ENV}"
+            exit 0
+          fi
+
+          registry_host="${IMAGE_REPO%%/*}"
+          if [ -z "${registry_host}" ] || [ "${registry_host}" = "${IMAGE_REPO}" ]; then
+            registry_host="docker.io"
+          fi
+
+          if [ "${registry_host}" != "docker.io" ]; then
+            echo "Using script-managed auth for ${registry_host}."
+            exit 0
+          fi
+
+          dockerhub_password="${DOCKERHUB_TOKEN:-${DOCKERHUB_PASSWORD:-}}"
+          if [ -z "${DOCKERHUB_USERNAME}" ] || [ -z "${dockerhub_password}" ]; then
+            echo "::error::Docker Hub pushes require REGISTRY_AUTH_JSON_B64 or DOCKERHUB_USERNAME plus DOCKERHUB_TOKEN."
+            exit 1
+          fi
+
+          printf '%s' "${dockerhub_password}" | docker login docker.io \
+            --username "${DOCKERHUB_USERNAME}" \
+            --password-stdin
+          {
+            printf 'REGISTRY_AUTH_JSON_B64='
+            base64 -w 0 "${HOME}/.docker/config.json"
+            printf '\n'
+          } >> "${GITHUB_ENV}"
+
+      - name: Build, push, and prewarm GPU image
+        env:
+          GH_TOKEN: ${{ github.token }}
+          IMAGE_REPO: ${{ inputs.image_repo || 'docker.io/bradhiltonnw/art-gpu' }}
+          PULL_IMAGE_REPO: ${{ inputs.pull_image_repo || 'docker.io/bradhiltonnw/art-gpu' }}
+          IMAGE_TAG: ${{ inputs.tag }}
+          NO_CACHE: ${{ inputs.no_cache }}
+          PREWARM_NODES: ${{ inputs.prewarm_nodes }}
+          PREWARM_TIMEOUT: ${{ inputs.prewarm_timeout }}
+        run: |
+          IMAGE_TAG="${IMAGE_TAG:-latest}"
+          NO_CACHE="${NO_CACHE:-false}"
+          PREWARM_NODES="${PREWARM_NODES:-true}"
+          PREWARM_TIMEOUT="${PREWARM_TIMEOUT:-30m}"
+
+          args=(
+            --infra "${SKY_INFRA}"
+            --image-repo "${IMAGE_REPO}"
+            --pull-image-repo "${PULL_IMAGE_REPO}"
+            --tag "${IMAGE_TAG}"
+            --prewarm-timeout "${PREWARM_TIMEOUT}"
+          )
+
+          if [ "${NO_CACHE}" = "true" ]; then
+            args+=(--no-cache)
+          fi
+
+          if [ "${PREWARM_NODES}" != "true" ]; then
+            args+=(--no-prewarm-nodes)
+          fi
+
+          bash scripts/build-gpu-image.sh "${args[@]}"
+
+      - name: Smoke launch prewarmed image
+        if: ${{ github.event_name != 'workflow_dispatch' || inputs.smoke_launch }}
+        env:
+          SMOKE_IMAGE_REPO: ${{ inputs.pull_image_repo || 'docker.io/bradhiltonnw/art-gpu' }}
+          IMAGE_TAG: ${{ inputs.tag }}
+          SMOKE_GPUS: ${{ inputs.smoke_gpus }}
+        run: |
+          IMAGE_TAG="${IMAGE_TAG:-latest}"
+          SMOKE_GPUS="${SMOKE_GPUS:-H200:1}"
+          cluster="art-gpu-smoke-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          sky_venv="${RUNNER_TEMP}/skypilot-smoke"
+          uv venv --python 3.10 "${sky_venv}"
+          uv pip install --python "${sky_venv}/bin/python" 'skypilot[kubernetes,remote]==0.12.0' 'kubernetes==34.1.0'
+          sky_cmd=("${sky_venv}/bin/sky")
+          dump_diagnostics() {
+            echo "::group::Smoke diagnostics"
+            free -h || true
+            ps -eo pid,ppid,stat,rss,comm,args | grep -E 'SkyPilot|sky|python' || true
+            "${sky_cmd[@]}" api status || true
+            if [ -f "${HOME}/.sky/api_server/server.log" ]; then
+              tail -n 240 "${HOME}/.sky/api_server/server.log" || true
+            fi
+            echo "::endgroup::"
+          }
+          cleanup() {
+            "${sky_cmd[@]}" down -y "${cluster}" || true
+          }
+          finish() {
+            status=$?
+            if [ "${status}" -ne 0 ]; then
+              dump_diagnostics
+            fi
+            cleanup
+            exit "${status}"
+          }
+          trap finish EXIT
+
+          "${sky_cmd[@]}" check kubernetes
+
+          smoke_code='import os, pathlib, subprocess, sys; expected = os.environ["EXPECTED_ART_IMAGE_REVISION"]; actual = os.environ.get("ART_IMAGE_REVISION"); print("ART_IMAGE_REVISION", actual); sys.exit(f"ART_IMAGE_REVISION mismatch: expected {expected}, got {actual}") if actual != expected else None; print("ART_IMAGE_SMOKE_OK"); print("SKY_PYTHON_PATH", pathlib.Path.home().joinpath(".sky/python_path").read_text().strip()); print("RAY_PATH", pathlib.Path.home().joinpath(".sky/ray_path").read_text().strip()); print("UV", subprocess.check_output(["uv", "--version"], text=True).strip())'
+
+          /usr/bin/time -p "${sky_cmd[@]}" launch -y \
+              -c "${cluster}" \
+              --infra "${SKY_INFRA}" \
+              --gpus "${SMOKE_GPUS}" \
+              --image-id "docker:${SMOKE_IMAGE_REPO}:${IMAGE_TAG}" \
+              --config kubernetes.pod_config.spec.schedulerName=binpack-scheduler \
+              --config kubernetes.pod_config.spec.activeDeadlineSeconds=604800 \
+              "EXPECTED_ART_IMAGE_REVISION=${GITHUB_SHA} python -c '${smoke_code}'"
+
+          kubectl --context cks-wb3 get pods -n default \
+            -l "skypilot-cluster=${cluster}" \
+            -o jsonpath='{range .items[*]}{.metadata.name} {.spec.containers[0].image}{"\n"}{end}'

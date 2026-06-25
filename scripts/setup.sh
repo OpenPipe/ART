@@ -8,8 +8,15 @@ if [ -f .env ]; then
         [[ $line =~ ^#.*$ ]] && continue
         [[ -z $line ]] && continue
         
-        # Export the variable
-        export "$line"
+        key="${line%%=*}"
+        current_value="${!key-}"
+        if [ -z "${!key+x}" ] ||
+            [ -z "${current_value}" ] ||
+            { [ "${key}" = "GIT_USER_NAME" ] && [ "${current_value}" = "Your Name" ]; } ||
+            { [ "${key}" = "GIT_USER_EMAIL" ] && [ "${current_value}" = "your.email@example.com" ]; } ||
+            { [ "${key}" = "INSTALL_EXTRAS" ] && [ "${current_value}" = "false" ]; }; then
+            export "$line"
+        fi
     done < .env
 fi
 
@@ -41,7 +48,7 @@ fi
 # Configure git user name and email
 git config --global user.name "${GIT_USER_NAME}"
 git config --global user.email "${GIT_USER_EMAIL}"
-git config --global --add safe.directory /root/sky_workdir
+git config --global --add safe.directory "$(pwd)"
 
 if [ "${GIT_RESET_CLEAN:-true}" = "true" ]; then
     # Reset any uncommitted changes to the last commit
@@ -56,14 +63,16 @@ fi
 # Install astral-uv (standalone version)
 # Always prepend standalone install path so it takes precedence over system/conda uv
 export PATH="$HOME/.local/bin:$HOME/.cargo/bin:$PATH"
-if ! curl -LsSf https://astral.sh/uv/install.sh | sh; then
+if command -v uv >/dev/null 2>&1; then
+    echo "Using $(uv --version)"
+elif ! curl -LsSf https://astral.sh/uv/install.sh | sh; then
     echo "Failed to install uv." >&2
     exit 1
 fi
 
 # Sync the dependencies
 if [ "${INSTALL_EXTRAS:-false}" = "true" ]; then
-    uv sync --all-extras
+    uv sync --extra backend --extra tinker --extra langgraph --extra plotting --frozen
 else
-    uv sync --extra backend
+    uv sync --extra backend --frozen
 fi

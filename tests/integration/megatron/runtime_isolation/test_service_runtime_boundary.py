@@ -1,4 +1,5 @@
 import asyncio
+import json
 from pathlib import Path
 import sys
 from types import SimpleNamespace
@@ -8,14 +9,19 @@ from unittest.mock import AsyncMock
 import httpx
 import pytest
 
+import art
 from art.megatron.service import MegatronService
-from art.types import MegatronTopologyConfig
-from art.unsloth.service import UnslothService
+
+
+@pytest.fixture(autouse=True)
+def _init_megatron_runtime_config() -> None:
+    art.init_megatron_runtime_config(
+        topology=art.MegatronTopologyConfig(tp=1, cp=2, ep=2, etp=1),
+        packed_sequence_length=1024,
+    )
 
 
 class _AsyncOkResponse:
-    status_code = 200
-
     def raise_for_status(self) -> None:
         return None
 
@@ -43,47 +49,33 @@ class _RecordingAsyncClient:
         return _AsyncOkResponse()
 
 
-class _RecordingVllmClient:
-    def __init__(self) -> None:
-        self.gets: list[tuple[str, dict[str, str] | None, float]] = []
-        self.posts: list[
-            tuple[str, dict[str, object], dict[str, str] | None, float]
-        ] = []
-
-    async def __aenter__(self):
-        return self
-
-    async def __aexit__(self, exc_type, exc, tb):
-        return None
-
-    async def get(
-        self,
-        url: str,
-        *,
-        headers: dict[str, str] | None = None,
-        timeout: float,
-    ) -> _AsyncOkResponse:
-        self.gets.append((url, headers, timeout))
-        return _AsyncOkResponse()
-
-    async def post(
-        self,
-        url: str,
-        *,
-        json: dict[str, object],
-        headers: dict[str, str] | None = None,
-        timeout: float,
-    ) -> _AsyncOkResponse:
-        self.posts.append((url, json, headers, timeout))
-        return _AsyncOkResponse()
-
-
 class _FakeAsyncioProcess:
     returncode: int | None = None
 
     async def wait(self) -> int:
         await asyncio.Event().wait()
         return 0
+
+
+def test_megatron_default_lora_adapter_config_uses_model_lora_config(
+    tmp_path: Path,
+) -> None:
+    service = MegatronService(
+        model_name="test-model",
+        base_model="Qwen/Qwen3-0.6B",
+        config={
+            "lora_config": {
+                "rank": 8,
+                "target_modules": ["q_proj", "down_proj"],
+            },
+        },
+        output_dir=str(tmp_path),
+    )
+
+    config = service._default_lora_adapter_config()
+
+    assert config.r == 8
+    assert config.target_modules == {"q_proj", "down_proj"}
 
 
 @pytest.mark.asyncio
@@ -115,7 +107,8 @@ async def test_unsloth_shared_start_requires_runtime_sleep_mode(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    service = UnslothService(
+    unsloth_service = pytest.importorskip("art.unsloth.service")
+    service = unsloth_service.UnslothService(
         model_name="test-model",
         base_model="Qwen/Qwen3-0.6B",
         config={
@@ -166,28 +159,13 @@ async def test_megatron_runtime_sleep_and_wake_use_runtime_routes(
     assert service._is_sleeping is False
 
 
-def test_megatron_dsv4_runtime_engine_args_use_standard_lora_slots(
-    tmp_path: Path,
-) -> None:
-    service = MegatronService(
-        model_name="test-model",
-        base_model="deepseek-ai/DeepSeek-V4-Flash",
-        config={"rollout_weights_mode": "lora"},
-        output_dir=str(tmp_path),
-    )
-
-    engine_args = service._runtime_engine_args(None)
-
-    assert engine_args["enable_lora"] is True
-    assert engine_args["max_loras"] == 2
-
-
 @pytest.mark.asyncio
 async def test_unsloth_runtime_sleep_and_wake_use_runtime_routes(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    service = UnslothService(
+    unsloth_service = pytest.importorskip("art.unsloth.service")
+    service = unsloth_service.UnslothService(
         model_name="test-model",
         base_model="Qwen/Qwen3-0.6B",
         config={"rollout_weights_mode": "lora"},
@@ -235,66 +213,7 @@ async def test_megatron_dedicated_merged_start_syncs_initial_weights(
     sync_merged.assert_awaited_once_with(
         lora_path="/tmp/lora",
         step=0,
-        megatron_topology=None,
     )
-
-
-@pytest.mark.asyncio
-async def test_megatron_external_vllm_start_attaches_and_loads_mapped_lora(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    service = MegatronService(
-        model_name="test-model",
-        base_model="Qwen/Qwen3-0.6B",
-        config={
-            "trainer_gpu_ids": [2, 3],
-            "rollout_weights_mode": "lora",
-            "vllm_runtime": {
-                "mode": "external",
-                "server_url": "http://inference-node:8000",
-                "api_key": "secret",
-                "local_checkpoint_root": "/mnt/ws_pvc/ws",
-                "server_checkpoint_root": "/remote/ws",
-            },
-        },
-        output_dir=str(tmp_path),
-    )
-    client = _RecordingVllmClient()
-    monkeypatch.setattr(httpx, "AsyncClient", lambda: client)
-    monkeypatch.setattr(
-        service,
-        "_resolve_active_lora_path",
-        lambda: "/mnt/ws_pvc/ws/checkpoints/model/0000",
-    )
-
-    location = await service.start_openai_server(None)
-
-    assert location == ("http://inference-node:8000", 0)
-    assert client.gets == [
-        (
-            "http://inference-node:8000/health",
-            {"Authorization": "Bearer secret"},
-            5.0,
-        ),
-        (
-            "http://inference-node:8000/v1/models",
-            {"Authorization": "Bearer secret"},
-            5.0,
-        ),
-    ]
-    assert client.posts == [
-        (
-            "http://inference-node:8000/v1/load_lora_adapter",
-            {
-                "lora_name": "test-model@0",
-                "lora_path": "/remote/ws/checkpoints/model/0000",
-                "load_inplace": True,
-            },
-            {"Authorization": "Bearer secret"},
-            60.0,
-        )
-    ]
 
 
 @pytest.mark.asyncio
@@ -309,7 +228,6 @@ async def test_megatron_dedicated_merged_start_uses_configured_topology(
             "trainer_gpu_ids": [0],
             "inference_gpu_ids": [1],
             "rollout_weights_mode": "merged",
-            "megatron_topology": {"tp": 1, "cp": 2, "ep": 2, "etp": 1},
         },
         output_dir=str(tmp_path),
     )
@@ -324,8 +242,8 @@ async def test_megatron_dedicated_merged_start_uses_configured_topology(
     sync_merged.assert_awaited_once_with(
         lora_path="/tmp/lora",
         step=0,
-        megatron_topology=MegatronTopologyConfig(tp=1, cp=2, ep=2, etp=1),
     )
+    assert service.runtime_config.topology.cp == 2
 
 
 @pytest.mark.asyncio
@@ -341,6 +259,10 @@ async def test_megatron_worker_uses_active_python_for_torchrun(
             "trainer_gpu_ids": [0],
             "inference_gpu_ids": [1],
             "rollout_weights_mode": "lora",
+            "lora_config": {
+                "rank": 8,
+                "target_modules": ["q_proj", "down_proj"],
+            },
         },
         output_dir=str(tmp_path),
     )
@@ -382,5 +304,11 @@ async def test_megatron_worker_uses_active_python_for_torchrun(
     ]
     assert "uv run" not in command
     assert recorded["cwd"] == str(Path(__file__).resolve().parents[4])
+    env = cast(dict[str, str], recorded["env"])
+    assert env["ART_MEGATRON_LORA_RANK"] == "8"
+    assert json.loads(env["ART_MEGATRON_LORA_TARGET_MODULES"]) == [
+        "q_proj",
+        "down_proj",
+    ]
     service._child_processes.close()
     service._megatron_log_file.close()

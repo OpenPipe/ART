@@ -7,6 +7,7 @@ from .workflow import (
     run_chat_template_rollout_stage,
     run_correctness_sensitivity_stage,
     run_hf_parity_stage,
+    run_length_trainability_stage,
     run_lora_coverage_stage,
     run_merged_vllm_serving_stage,
     run_native_vllm_lora_stage,
@@ -23,6 +24,7 @@ _STAGE_RUNNERS = {
     "correctness_sensitivity": run_correctness_sensitivity_stage,
     "chat_template_rollout": run_chat_template_rollout_stage,
     "packed_position_ids": run_packed_position_ids_stage,
+    "length_trainability": run_length_trainability_stage,
     "yes_no_trainability": run_yes_no_trainability_stage,
     "native_vllm_lora": run_native_vllm_lora_stage,
 }

@@ -28,6 +28,7 @@ def build_rl_train_configs(
     max_negative_advantage_importance_sampling_weight: float | None = None,
     kimi_k2_tau: float | None = None,
     kl_penalty_coef: float = 0.0,
+    kl_penalty_source: Literal["current_learner", "sample"] = "current_learner",
     allow_training_without_logprobs: bool | None = None,
     plot_tensors: bool | None = None,
     truncated_importance_sampling: float | None = None,
@@ -41,11 +42,13 @@ def build_rl_train_configs(
     config = TrainConfig(
         learning_rate=learning_rate,
         kl_penalty_coef=kl_penalty_coef,
+        kl_penalty_source=kl_penalty_source,
     )
     dev_config: dev.TrainConfig = {
         "advantage_balance": advantage_balance,
         "importance_sampling_level": importance_sampling_level,
         "kl_penalty_coef": kl_penalty_coef,
+        "kl_penalty_source": kl_penalty_source,
         "mask_prob_ratio": mask_prob_ratio,
         "ppo": ppo,
         "precalculate_logprobs": precalculate_logprobs,

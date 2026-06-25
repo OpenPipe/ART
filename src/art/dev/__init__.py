@@ -1,7 +1,9 @@
 from .engine import EngineArgs
 from .model import (
+    BackendModelConfig,
     InitArgs,
     InternalModelConfig,
+    LoRAConfig,
     PeftArgs,
     TinkerArgs,
     TinkerNativeArgs,
@@ -19,8 +21,10 @@ from .validate import (
 
 __all__ = [
     "EngineArgs",
+    "BackendModelConfig",
     "InternalModelConfig",
     "InitArgs",
+    "LoRAConfig",
     "PeftArgs",
     "TinkerArgs",
     "TinkerNativeArgs",

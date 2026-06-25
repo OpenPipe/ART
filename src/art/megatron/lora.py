@@ -1,5 +1,7 @@
 from collections.abc import Sequence
+import json
 import math
+import os
 import re
 from typing import Any, Literal, NamedTuple, cast
 
@@ -33,6 +35,8 @@ from .kernels.cute_grouped_lora_quack import (
 MOE_LORA_RANK = 1
 DENSE_LORA_RANK = 8
 LORA_ALPHA = 32
+MEGATRON_LORA_RANK_ENV = "ART_MEGATRON_LORA_RANK"
+MEGATRON_LORA_TARGET_MODULES_ENV = "ART_MEGATRON_LORA_TARGET_MODULES"
 _LAYER_BLOCK_RE = re.compile(r"^(?P<block>.*\.layers\.\d+)\.")
 
 ShardDomain = Literal["tp", "expert_tp"]
@@ -194,6 +198,26 @@ def default_lora_rank_for_handler(handler: Any) -> int:
     return MOE_LORA_RANK if bool(getattr(handler, "is_moe", False)) else DENSE_LORA_RANK
 
 
+def _configured_lora_rank(provider: Any, handler: Any) -> int:
+    rank = getattr(provider, "_art_lora_rank", None)
+    if rank is None:
+        rank = os.environ.get(MEGATRON_LORA_RANK_ENV)
+    if rank is None:
+        return default_lora_rank_for_handler(handler)
+    return int(rank)
+
+
+def _configured_lora_target_modules(provider: Any, spec: Any) -> list[str]:
+    target_modules = getattr(provider, "_art_lora_target_modules", None)
+    if target_modules is None and (
+        raw_target_modules := os.environ.get(MEGATRON_LORA_TARGET_MODULES_ENV)
+    ):
+        target_modules = json.loads(raw_target_modules)
+    if target_modules is None:
+        target_modules = spec.default_target_modules
+    return [str(target_module) for target_module in target_modules]
+
+
 def _column_parallel_lora_input(x: torch.Tensor, linear: Any) -> torch.Tensor:
     if _linear_disables_tensor_parallel_comm(linear):
         return x
@@ -331,10 +355,6 @@ class LoRA(torch.nn.Module):
     def num_local_experts(self) -> int:
         return self.A_T.shape[0] if self.A_T.ndim == 3 else 1
 
-    @property
-    def _uses_expert_keys(self) -> bool:
-        return "{expert}" in self.adapter_model_prefix
-
     def _broadcast_if_replicated(self, param: torch.nn.Parameter) -> None:
         if not param.lora_tp_replicated:  # ty: ignore[unresolved-attribute]
             return
@@ -368,7 +388,7 @@ class LoRA(torch.nn.Module):
         self._broadcast_if_replicated(self.B_T)
 
     def _expected_weight_keys(self, suffix: str) -> list[str]:
-        if self._uses_expert_keys:
+        if self.num_local_experts > 1:
             return [
                 f"{self.adapter_model_prefix.format(expert=expert + self._expert_offset)}.{suffix}.weight"
                 for expert in range(self.num_local_experts)
@@ -405,7 +425,7 @@ class LoRA(torch.nn.Module):
         into: torch.nn.Parameter,
     ) -> None:
         keys = self._expected_weight_keys(suffix)
-        if self._uses_expert_keys and self.num_local_experts > 1:
+        if self.num_local_experts > 1:
             weight = torch.stack([adapter_model[key].T for key in keys])
         else:
             weight = adapter_model[keys[0]].T
@@ -468,7 +488,7 @@ class LoRA(torch.nn.Module):
         Determine if the given LoRA param should be exported in the sharded LoRA state dict
         (drop replicated ranks/params).
         """
-        if self._uses_expert_keys:  # self is a MoE layer
+        if self.num_local_experts > 1:  # self is a MoE layer
             if ps.get_expert_data_parallel_rank() != 0:
                 return False
         else:  # self is a non-MoE layer
@@ -519,12 +539,10 @@ class LoRA(torch.nn.Module):
         for key, param in self._lora_params():
             if not self._should_export_parameter(param):
                 continue
-            if self._uses_expert_keys:
+            if self.num_local_experts > 1:
                 for expert in range(self.num_local_experts):
                     full_key = f"{self.adapter_model_prefix.format(expert=expert + self._expert_offset)}.{key}"
-                    export_items.append(
-                        (full_key, param, expert if param.ndim == 3 else None)
-                    )
+                    export_items.append((full_key, param, expert))
             else:
                 export_items.append((f"{self.adapter_model_prefix}.{key}", param, None))
         return export_items
@@ -649,7 +667,7 @@ class LoRAPublishPlanner:
         template: _LoraPublishTemplate,
         adapter_model: dict[str, torch.Tensor],
     ) -> list[LoraShardMeta]:
-        if "{expert}" in template.adapter_model_prefix:
+        if template.num_local_experts > 1:
             return self._expert_metadata_for_template(template, adapter_model)
         return self._dense_metadata_for_template(template, adapter_model)
 
@@ -1693,8 +1711,8 @@ def apply_lora_adapters(
     provider = cast(Any, provider)
     handler = provider._art_model_support_handler
     spec = provider._art_model_support_spec
-    target_modules = list(spec.default_target_modules)
-    rank = default_lora_rank_for_handler(handler)
+    target_modules = _configured_lora_target_modules(provider, spec)
+    rank = _configured_lora_rank(provider, handler)
     handler.apply_lora_adapters(
         model,
         provider,

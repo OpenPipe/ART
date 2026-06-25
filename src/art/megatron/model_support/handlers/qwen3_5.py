@@ -448,9 +448,6 @@ class Qwen35MoeHandler(Qwen35BaseHandler):
     ) -> tuple[dict[str, torch.Tensor], dict[str, Any]]:
         return _to_vllm_lora_tensors(tensors, adapter_config=adapter_config)
 
-    def to_vllm_lora_config(self, adapter_config: dict[str, Any]) -> dict[str, Any]:
-        return _vllm_moe_config(adapter_config)
-
     def from_vllm_lora_tensors(
         self,
         tensors: dict[str, torch.Tensor],
@@ -486,7 +483,10 @@ class Qwen35MoeHandler(Qwen35BaseHandler):
         rank: int,
         alpha: int,
     ) -> None:
-        from art.megatron.lora import wrap_grouped_moe_experts_3d
+        from art.megatron.lora import (
+            wrap_grouped_moe_experts_3d,
+            wrap_shared_experts_mlp,
+        )
 
         wrap_grouped_moe_experts_3d(
             _require_moe_experts(module),
@@ -495,6 +495,16 @@ class Qwen35MoeHandler(Qwen35BaseHandler):
             rank=rank,
             alpha=alpha,
         )
+        shared_experts = getattr(module.mlp, "shared_experts", None)
+        if shared_experts is not None:
+            wrap_shared_experts_mlp(
+                shared_experts,
+                adapter_model_prefix=adapter_model_prefix,
+                provider=provider,
+                target_modules=target_modules,
+                rank=rank,
+                alpha=alpha,
+            )
 
     def _add_mlp_adapter_weights(
         self,
@@ -505,6 +515,7 @@ class Qwen35MoeHandler(Qwen35BaseHandler):
     ) -> None:
         from art.megatron.weights.adapter_export import (
             add_grouped_moe_adapter_weights,
+            add_shared_experts_adapter_weights,
         )
 
         add_grouped_moe_adapter_weights(
@@ -512,6 +523,13 @@ class Qwen35MoeHandler(Qwen35BaseHandler):
             layer_prefix=layer_prefix,
             experts=_require_moe_experts(module),
         )
+        shared_experts = getattr(module.mlp, "shared_experts", None)
+        if shared_experts is not None:
+            add_shared_experts_adapter_weights(
+                adapter_weights_by_base,
+                layer_prefix=layer_prefix,
+                shared_experts=shared_experts,
+            )
 
     def compile_workaround_config(
         self,
@@ -683,12 +701,23 @@ def _clone(tensor: torch.Tensor) -> torch.Tensor:
     return tensor.clone().contiguous()
 
 
-def _vllm_moe_config(adapter_config: dict[str, Any]) -> dict[str, Any]:
+def _has_shared_expert_lora_tensors(tensors: dict[str, torch.Tensor]) -> bool:
+    return any(".mlp.shared_expert." in key for key in tensors)
+
+
+def _vllm_moe_config(
+    adapter_config: dict[str, Any],
+    *,
+    has_shared_experts: bool = False,
+) -> dict[str, Any]:
     config = dict(adapter_config)
+    stripped_modules = {"gate_up_proj"}
+    if not has_shared_experts:
+        stripped_modules.update({"gate_proj", "up_proj", "down_proj"})
     target_modules = [
         module
         for module in list(config.get("target_modules") or [])
-        if module not in {"gate_proj", "up_proj", "down_proj", "gate_up_proj"}
+        if module not in stripped_modules
     ]
     if "experts" not in target_modules:
         target_modules.append("experts")
@@ -717,9 +746,10 @@ def _to_vllm_lora_tensors(
     adapter_config: dict[str, Any],
 ) -> tuple[dict[str, torch.Tensor], dict[str, Any]]:
     grouped = _group_art_moe_tensors(tensors)
+    has_shared_experts = _has_shared_expert_lora_tensors(tensors)
+    transformed: dict[str, torch.Tensor] = {}
     if not grouped:
         has_fused_experts = any(_VLLM_MOE_KEY_RE.match(key) for key in tensors)
-        transformed: dict[str, torch.Tensor] = {}
         for key, tensor in tensors.items():
             vllm_key, tensor = _to_vllm_lora_tensor(
                 key,
@@ -731,10 +761,14 @@ def _to_vllm_lora_tensors(
                     f"Duplicate Qwen3.5 LoRA tensor after conversion: {vllm_key}"
                 )
             transformed[vllm_key] = tensor
-        return transformed, _vllm_moe_config(
-            adapter_config
-        ) if has_fused_experts else adapter_config
-    transformed: dict[str, torch.Tensor] = {}
+        return transformed, (
+            _vllm_moe_config(
+                adapter_config,
+                has_shared_experts=has_shared_experts,
+            )
+            if has_fused_experts
+            else adapter_config
+        )
     used_keys: set[str] = set()
     for prefix, experts in grouped.items():
         vllm_prefix = _to_vllm_key(prefix)
@@ -786,7 +820,10 @@ def _to_vllm_lora_tensors(
             adapter_config=adapter_config,
         )
         transformed[vllm_key] = tensor
-    return transformed, _vllm_moe_config(adapter_config)
+    return transformed, _vllm_moe_config(
+        adapter_config,
+        has_shared_experts=has_shared_experts,
+    )
 
 
 def _from_vllm_lora_tensors(

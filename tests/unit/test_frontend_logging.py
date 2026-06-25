@@ -11,12 +11,14 @@ Tests verify:
 import json
 import os
 from pathlib import Path
+from typing import cast
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import polars as pl
 import pytest
 
 from art import Model, TrainableModel, Trajectory, TrajectoryGroup
+from art.backend import Backend
 from art.local.backend import LocalBackend
 from art.metrics_taxonomy import TRAIN_GRADIENT_STEPS_KEY
 from art.utils.trajectory_logging import read_trajectory_groups_parquet
@@ -1011,11 +1013,11 @@ class TestModelAttributes:
 
 
 class TestTrainSFTMetricsAggregation:
-    """Test that train_sft aggregates metrics and logs once (same as RL)."""
+    """Test that train_sft logs SFT progress and one checkpoint summary."""
 
     @pytest.mark.asyncio
     async def test_train_sft_aggregates_metrics(self, tmp_path: Path):
-        """Verify train_sft aggregates metrics from multiple batches into one log entry."""
+        """Verify train_sft logs batch metrics plus an aggregate checkpoint row."""
         model = TrainableModel(
             name="test-sft",
             project="test-project",
@@ -1045,7 +1047,7 @@ class TestTrainSFTMetricsAggregation:
             }
 
         mock_backend._train_sft = mock_train_sft
-        mock_backend._get_step = AsyncMock(return_value=1)  # Step after training
+        mock_backend._get_step = AsyncMock(side_effect=[0, 1])
         model._backend = mock_backend
 
         # Create dummy trajectories
@@ -1063,25 +1065,29 @@ class TestTrainSFTMetricsAggregation:
         # Run train_sft
         await model.train_sft(trajectories)
 
-        # Verify history.jsonl has exactly ONE entry (not 3)
         history_path = tmp_path / "test-project/models/test-sft/history.jsonl"
         assert history_path.exists(), "history.jsonl should be created"
 
         with open(history_path) as f:
             lines = f.readlines()
 
-        assert len(lines) == 1, f"Expected 1 log entry, got {len(lines)}"
-
         entries = [json.loads(line) for line in lines]
-        merged: dict[str, float] = {}
-        for entry in entries:
-            merged.update(entry)
+        sft_entries = [entry for entry in entries if "sft/gradient_step" in entry]
+        summary_entries = [entry for entry in entries if "loss/train" in entry]
 
+        assert len(entries) == 4
+        assert len(sft_entries) == 3
+        assert len(summary_entries) == 1
+        assert [entry["sft/gradient_step"] for entry in sft_entries] == [1.0, 2.0, 3.0]
+        assert [entry["sft/loss/train"] for entry in sft_entries] == [1.0, 0.8, 0.6]
         assert all(entry["step"] == 1 for entry in entries)
-        assert merged["loss/train"] == pytest.approx(0.8)  # (1.0 + 0.8 + 0.6) / 3
-        assert merged["loss/grad_norm"] == pytest.approx(0.4)  # (0.5 + 0.4 + 0.3) / 3
-        assert merged["time/step_trainer_s"] >= 0
-        assert merged["time/cum/trainer_s"] >= 0
+        assert all(entry["training_step"] == 1 for entry in entries)
+
+        summary = summary_entries[0]
+        assert summary["loss/train"] == pytest.approx(0.8)  # (1.0 + 0.8 + 0.6) / 3
+        assert summary["loss/grad_norm"] == pytest.approx(0.4)  # (0.5 + 0.4 + 0.3) / 3
+        assert summary["time/step_trainer_s"] >= 0
+        assert summary["time/cum/trainer_s"] >= 0
 
     @pytest.mark.asyncio
     async def test_train_sft_single_step_increment(self, tmp_path: Path):
@@ -1101,7 +1107,7 @@ class TestTrainSFTMetricsAggregation:
                 yield {"loss": 1.0 - i * 0.1}
 
         mock_backend._train_sft = mock_train_sft
-        mock_backend._get_step = AsyncMock(return_value=1)  # Step is 1 after training
+        mock_backend._get_step = AsyncMock(side_effect=[0, 1])
         model._backend = mock_backend
 
         trajectories = [
@@ -1114,12 +1120,19 @@ class TestTrainSFTMetricsAggregation:
 
         await model.train_sft(trajectories)
 
-        # Verify only one log entry at step 1
         history_path = tmp_path / "test-project/models/test-sft-step/history.jsonl"
         df = pl.read_ndjson(str(history_path))
 
-        assert len(df) == 1, "Should have exactly 1 log entry"
+        assert len(df) == 6, "Should log 5 SFT rows plus 1 summary row"
         assert set(df["step"].to_list()) == {1}, "Step should be 1 (single increment)"
+        assert set(df["training_step"].to_list()) == {1}
+        assert df.drop_nulls("sft/gradient_step")["sft/gradient_step"].to_list() == [
+            1.0,
+            2.0,
+            3.0,
+            4.0,
+            5.0,
+        ]
 
     @pytest.mark.asyncio
     async def test_train_sft_no_metrics_when_empty(self, tmp_path: Path):
@@ -1150,6 +1163,84 @@ class TestTrainSFTMetricsAggregation:
         assert not history_path.exists(), (
             "No history.jsonl should be created for empty training"
         )
+
+    @pytest.mark.asyncio
+    async def test_train_sft_logs_every_gradient_step(self, tmp_path: Path):
+        """Verify train_sft logs every SFT optimizer metric row."""
+        model = TrainableModel(
+            name="test-sft-every-step",
+            project="test-project",
+            base_model="gpt-4",
+            base_path=str(tmp_path),
+        )
+
+        mock_backend = MagicMock()
+
+        async def mock_train_sft(*args, **kwargs):
+            for i in range(5):
+                yield {"loss/train": 1.0 - i * 0.1}
+
+        mock_backend._train_sft = mock_train_sft
+        mock_backend._get_step = AsyncMock(side_effect=[0, 1])
+        model._backend = mock_backend
+
+        await model.train_sft([])
+
+        history_path = (
+            tmp_path / "test-project/models/test-sft-every-step/history.jsonl"
+        )
+        rows = [json.loads(line) for line in history_path.read_text().splitlines()]
+        sft_rows = [row for row in rows if "sft/gradient_step" in row]
+
+        assert [row["sft/gradient_step"] for row in sft_rows] == [
+            1.0,
+            2.0,
+            3.0,
+            4.0,
+            5.0,
+        ]
+        assert len([row for row in rows if "loss/train" in row]) == 1
+
+    @pytest.mark.asyncio
+    async def test_train_sft_remote_logging_does_not_write_local_history(
+        self, tmp_path: Path
+    ):
+        """Verify remote SFT metric owners suppress client-side metric logging."""
+
+        class RemoteLoggingBackend:
+            def __init__(self) -> None:
+                self.dev_config = None
+
+            def logs_sft_metrics_remotely(self) -> bool:
+                return True
+
+            async def _get_step(self, _model):
+                return 0
+
+            async def _train_sft(
+                self, _model, _trajectories, _config, dev_config, _verbose
+            ):
+                self.dev_config = dev_config
+                yield {"loss/train": 1.0}
+                yield {"loss/train": 0.5}
+
+        backend = RemoteLoggingBackend()
+        model = TrainableModel(
+            name="test-sft-remote",
+            project="test-project",
+            base_model="gpt-4",
+            base_path=str(tmp_path),
+        )
+        model._backend = cast(Backend, backend)
+
+        await model.train_sft([])
+
+        history_path = tmp_path / "test-project/models/test-sft-remote/history.jsonl"
+        assert not history_path.exists()
+        assert backend.dev_config is not None
+        metric_logging = backend.dev_config["metric_logging"]
+        assert metric_logging["enabled"] is True
+        assert metric_logging["target_training_step"] == 1
 
 
 class TestGradientStepMetrics:

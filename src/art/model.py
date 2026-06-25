@@ -17,14 +17,18 @@ from . import dev
 from .costs import CostCalculator
 from .metrics import MetricsBuilder, is_builder_managed_metric
 from .metrics_taxonomy import (
+    SFT_GRADIENT_STEP_KEY,
+    SFT_METRIC_PREFIX,
+    SFT_WANDB_GRADIENT_STEP_KEY,
     TRAIN_GRADIENT_STEPS_KEY,
     average_metric_samples,
     build_data_metrics_from_summary,
     summarize_trajectory_groups,
 )
 from .preprocessing.moe_routing import attach_moe_routing_metadata_to_choice
+from .preprocessing.vllm_tokens import attach_vllm_token_metadata_to_choice
 from .trajectories import Trajectory, TrajectoryGroup
-from .types import TrainSFTConfig
+from .types import SFTMetricLoggingConfig, TrainSFTConfig
 from .utils.trajectory_logging import write_trajectory_groups_parquet
 
 if TYPE_CHECKING:
@@ -57,13 +61,18 @@ def _merge_extra_body_defaults(
     return merged
 
 
-def _attach_response_moe_routing_metadata(response: Any) -> None:
+def _attach_response_art_metadata(response: Any) -> None:
     choices = getattr(response, "choices", None)
     model_dump = getattr(response, "model_dump", None)
     if not choices or not callable(model_dump):
         return
     response_payload = model_dump(mode="python")
     for choice_index, choice in enumerate(choices):
+        attach_vllm_token_metadata_to_choice(
+            choice=choice,
+            response_payload=response_payload,
+            choice_index=choice_index,
+        )
         attach_moe_routing_metadata_to_choice(
             choice=choice,
             response_payload=response_payload,
@@ -89,7 +98,7 @@ class _OpenAIChatCompletionsProxy:
                 kwargs.get("extra_body"),
             )
         response = await self._completions.create(*args, **kwargs)
-        _attach_response_moe_routing_metadata(response)
+        _attach_response_art_metadata(response)
         self._record_costs(response)
         return response
 
@@ -382,12 +391,22 @@ class Model(
 
     def _default_chat_completion_extra_body(self) -> dict[str, Any] | None:
         internal_config = getattr(self, "_internal_config", None)
-        if internal_config is None:
+        if internal_config is None and not self.trainable:
             return None
-        chat_template_kwargs = internal_config.get("chat_template_kwargs")
-        if chat_template_kwargs is None:
+        body: dict[str, Any] = {}
+        if self.trainable:
+            body["return_token_ids"] = True
+            body["return_tokens_as_token_ids"] = True
+        chat_template_kwargs = (
+            internal_config.get("chat_template_kwargs")
+            if internal_config is not None
+            else None
+        )
+        if chat_template_kwargs is not None:
+            body["chat_template_kwargs"] = dict(chat_template_kwargs)
+        if not body:
             return None
-        return {"chat_template_kwargs": dict(chat_template_kwargs)}
+        return body
 
     def litellm_completion_params(self, step: int | None = None) -> dict:
         """Return the parameters that should be sent to litellm.completion.
@@ -625,6 +644,7 @@ class Model(
                 self,
                 "_wandb_defined_metrics",
                 {
+                    SFT_WANDB_GRADIENT_STEP_KEY,
                     "training_step",
                     "time/wall_clock_sec",
                 },
@@ -634,12 +654,16 @@ class Model(
             # This allows out-of-order logging (e.g., async validation for previous steps).
             run.define_metric("training_step")
             run.define_metric("time/wall_clock_sec")
+            run.define_metric(SFT_WANDB_GRADIENT_STEP_KEY)
             run.define_metric("reward/*", step_metric="training_step")
             run.define_metric("loss/*", step_metric="training_step")
             run.define_metric("throughput/*", step_metric="training_step")
             run.define_metric("costs/*", step_metric="training_step")
             run.define_metric("time/*", step_metric="training_step")
             run.define_metric("data/*", step_metric="training_step")
+            run.define_metric(
+                f"{SFT_METRIC_PREFIX}/*", step_metric=SFT_WANDB_GRADIENT_STEP_KEY
+            )
             run.define_metric("train/*", step_metric="training_step")
             run.define_metric("val/*", step_metric="training_step")
             run.define_metric("test/*", step_metric="training_step")
@@ -1028,6 +1052,7 @@ class Model(
 
 class TrainableModel(Model[ModelConfig, StateType], Generic[ModelConfig, StateType]):
     base_model: str
+    lora_config: dev.LoRAConfig | None = None
     # Override discriminator field for FastAPI serialization
     trainable: bool = True
 
@@ -1045,6 +1070,7 @@ class TrainableModel(Model[ModelConfig, StateType], Generic[ModelConfig, StateTy
         run_id: str | None = None,
         config: ModelConfig | None = None,
         base_model: str,
+        lora_config: dev.LoRAConfig | None = None,
         base_path: str = ".art",
         report_metrics: list[str] | None = None,
         _internal_config: dev.InternalModelConfig | None = None,
@@ -1058,6 +1084,7 @@ class TrainableModel(Model[ModelConfig, StateType], Generic[ModelConfig, StateTy
             id=id,
             config=config,
             base_model=base_model,
+            lora_config=lora_config,
             base_path=base_path,
             report_metrics=report_metrics,
             **kwargs,
@@ -1125,6 +1152,7 @@ class TrainableModel(Model[ModelConfig, StateType], Generic[ModelConfig, StateTy
         id: str | None = None,
         config: None = None,
         base_model: str,
+        lora_config: dev.LoRAConfig | None = None,
         base_path: str = ".art",
         report_metrics: list[str] | None = None,
         _internal_config: dev.InternalModelConfig | None = None,
@@ -1140,6 +1168,7 @@ class TrainableModel(Model[ModelConfig, StateType], Generic[ModelConfig, StateTy
         id: str | None = None,
         config: ModelConfig,
         base_model: str,
+        lora_config: dev.LoRAConfig | None = None,
         base_path: str = ".art",
         report_metrics: list[str] | None = None,
         _internal_config: dev.InternalModelConfig | None = None,
@@ -1225,6 +1254,7 @@ class TrainableModel(Model[ModelConfig, StateType], Generic[ModelConfig, StateTy
         config: TrainSFTConfig | None = None,
         _config: dev.TrainSFTConfig | None = None,
         verbose: bool = False,
+        log_metrics: bool = True,
     ) -> None:
         """
         Supervised fine-tune the model with an iterable of trajectories.
@@ -1236,16 +1266,35 @@ class TrainableModel(Model[ModelConfig, StateType], Generic[ModelConfig, StateTy
             _config: Additional experimental configuration that is subject to change and
                 not yet part of the public API. Use at your own risk.
             verbose: Whether to print verbose output.
+            log_metrics: Whether to log SFT optimizer metrics. Defaults to True.
         """
         if config is None:
             config = TrainSFTConfig()
 
+        backend = self.backend()
+        backend_logs_sft_metrics = (
+            log_metrics and self._backend_logs_sft_metrics_remotely(backend)
+        )
+
+        _config = cast(dev.TrainSFTConfig, {**(_config or {})})
+        if log_metrics:
+            metric_logging_config: SFTMetricLoggingConfig = {
+                "enabled": True,
+            }
+            if backend_logs_sft_metrics:
+                metric_logging_config["target_training_step"] = (
+                    await self.get_step()
+                ) + 1
+            _config["metric_logging"] = metric_logging_config
+        else:
+            _config["metric_logging"] = {"enabled": False}
+
         # Train (backend yields metrics for each batch without logging)
-        # Collect all metrics and aggregate them at the end (same as RL)
-        _config = _config or {}  # ty:ignore[invalid-assignment]
+        # Collect all metrics and aggregate them at the end for the checkpoint summary.
         training_metrics: list[dict[str, float]] = []
+        local_sft_checkpoint_step: int | None = None
         trainer_started = time.monotonic()
-        async for metrics in self.backend()._train_sft(
+        async for metrics in backend._train_sft(
             self,
             trajectories,
             config,
@@ -1253,10 +1302,20 @@ class TrainableModel(Model[ModelConfig, StateType], Generic[ModelConfig, StateTy
             verbose,
         ):
             training_metrics.append(metrics)
+            gradient_step = len(training_metrics)
+            if log_metrics and not backend_logs_sft_metrics:
+                if local_sft_checkpoint_step is None:
+                    local_sft_checkpoint_step = await self.get_step() + 1
+                await self._log_sft_metric_sample(
+                    metrics,
+                    checkpoint_step=local_sft_checkpoint_step,
+                    gradient_step=gradient_step,
+                )
         trainer_elapsed = time.monotonic() - trainer_started
 
-        # Log aggregated training metrics once (same as RL)
-        if training_metrics:
+        # Log aggregated training metrics once at the checkpoint step. For
+        # remote-logging backends, the remote SFT job owns this row too.
+        if training_metrics and log_metrics and not backend_logs_sft_metrics:
             avg_metrics = average_metric_samples(training_metrics)
             avg_metrics["time/step_trainer_s"] = trainer_elapsed
             # Get the current step after training
@@ -1264,3 +1323,27 @@ class TrainableModel(Model[ModelConfig, StateType], Generic[ModelConfig, StateTy
             await self.log(
                 trajectories=None, split="train", metrics=avg_metrics, step=step
             )
+
+    @staticmethod
+    def _backend_logs_sft_metrics_remotely(backend: "Backend") -> bool:
+        remote_logger = getattr(type(backend), "logs_sft_metrics_remotely", None)
+        if not callable(remote_logger):
+            return False
+        return bool(remote_logger(backend))
+
+    async def _log_sft_metric_sample(
+        self,
+        metrics: dict[str, float],
+        *,
+        checkpoint_step: int,
+        gradient_step: int,
+    ) -> None:
+        await self.log(
+            trajectories=None,
+            split=SFT_METRIC_PREFIX,
+            metrics={
+                SFT_GRADIENT_STEP_KEY: float(gradient_step),
+                **metrics,
+            },
+            step=checkpoint_step,
+        )

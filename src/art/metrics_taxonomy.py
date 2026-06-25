@@ -6,6 +6,9 @@ from typing import Any, Iterable
 from .trajectories import TrajectoryGroup
 
 TRAIN_GRADIENT_STEPS_KEY = "data/step_num_gradient_steps"
+SFT_METRIC_PREFIX = "sft"
+SFT_GRADIENT_STEP_KEY = "gradient_step"
+SFT_WANDB_GRADIENT_STEP_KEY = f"{SFT_METRIC_PREFIX}/{SFT_GRADIENT_STEP_KEY}"
 _INVARIANT_METRIC_KEYS = frozenset({TRAIN_GRADIENT_STEPS_KEY})
 
 

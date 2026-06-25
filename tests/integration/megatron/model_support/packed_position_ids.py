@@ -44,6 +44,17 @@ _DEBUG_ENV = "ART_PACKED_POSITION_IDS_DEBUG"
 PACKED_POSITION_IDS_REPORT_FILENAME = "report.json"
 PACKED_POSITION_IDS_ARTIFACT_SUITE_NAME = "Megatron packed-position-id artifacts"
 REPO_ROOT = Path(__file__).resolve().parents[4]
+_SINGLE_ROTARY_OUTPUT_HANDLER_KEYS = frozenset(
+    {
+        "default_dense",
+        "default_moe",
+        "qwen3_dense",
+        "qwen3_moe",
+        "qwen3_5_dense",
+        "qwen3_5_moe",
+    }
+)
+_TUPLE_ROTARY_OUTPUT_HANDLER_KEYS = frozenset({"gemma4_dense", "gemma4_moe"})
 
 
 def _slugify(value: str) -> str:
@@ -246,6 +257,26 @@ def _rotary_grouping_check(
         if not torch.equal(reference, vector):
             return True, False, repeated_position_key_count
     return True, True, repeated_position_key_count
+
+
+def _rotary_outputs_for_validation(
+    *,
+    handler_key: str,
+    preprocess_output: Any,
+) -> tuple[torch.Tensor | None, ...]:
+    rotary_output = preprocess_output[1]
+    if handler_key in _SINGLE_ROTARY_OUTPUT_HANDLER_KEYS:
+        return (
+            cast(torch.Tensor | None, rotary_output)
+            if torch.is_tensor(rotary_output)
+            else None,
+        )
+    if handler_key in _TUPLE_ROTARY_OUTPUT_HANDLER_KEYS:
+        local_rotary, global_rotary = rotary_output
+        return local_rotary, global_rotary
+    raise RuntimeError(
+        f"Packed position validation has no rotary output mapping for {handler_key!r}"
+    )
 
 
 def _build_art_realistic_packed_tensors(
@@ -544,6 +575,7 @@ def _logits_equivalence_check(
     *,
     model: Any,
     handler: Any,
+    provider: Any,
     input_ids: torch.Tensor,
     position_ids: torch.Tensor,
     group_ids: torch.Tensor,
@@ -558,6 +590,11 @@ def _logits_equivalence_check(
     logits_abs_sum = 0.0
     logits_ref_abs_sum = 0.0
     logits_numel = 0
+    sliding_windows = tuple(
+        dict.fromkeys(
+            int(window) for window in getattr(provider, "art_flex_sliding_windows", ())
+        )
+    )
     for row_index in range(int(input_ids.shape[0])):
         row_group_ids = group_ids[row_index : row_index + 1]
         row_parent_ids = parent_ids[row_index : row_index + 1]
@@ -570,9 +607,13 @@ def _logits_equivalence_check(
         packed_bias = create_shared_prefix_state(
             group_ids=row_group_ids,
             parent_ids=row_parent_ids,
+            input_pos=row_position_ids,
+            sliding_windows=sliding_windows,
             build_gdn_execution_spec=bool(
                 getattr(handler, "build_gdn_execution_spec", False)
             ),
+            attention_head_dim=getattr(provider, "kv_channels", None),
+            attention_value_head_dim=getattr(provider, "kv_channels", None),
         )
         _debug_log(f"logits_check row={row_index} families={len(families)}")
         packed_logits = _time_block(
@@ -616,9 +657,13 @@ def _logits_equivalence_check(
                 reference_bias = create_shared_prefix_state(
                     group_ids=reference_group_ids,
                     parent_ids=reference_parent_ids,
+                    input_pos=reference_position_ids,
+                    sliding_windows=sliding_windows,
                     build_gdn_execution_spec=bool(
                         getattr(handler, "build_gdn_execution_spec", False)
                     ),
+                    attention_head_dim=getattr(provider, "kv_channels", None),
+                    attention_value_head_dim=getattr(provider, "kv_channels", None),
                 )
                 _debug_log(
                     "logits_check row="
@@ -742,7 +787,7 @@ def _run_packed_position_ids_worker(
             PackedTensorConfig(
                 num_sequences=4,
                 sequence_length=_env_int(
-                    "ART_PACKED_POSITION_IDS_STOP_EARLY_SEQUENCE_LENGTH", 1024
+                    "ART_PACKED_POSITION_IDS_STOP_EARLY_SEQUENCE_LENGTH", 2048
                 ),
                 prefill_tokens=_env_int(
                     "ART_PACKED_POSITION_IDS_STOP_EARLY_PREFILL_TOKENS", 256
@@ -762,7 +807,7 @@ def _run_packed_position_ids_worker(
             PackedTensorConfig(
                 num_sequences=4,
                 sequence_length=_env_int(
-                    "ART_PACKED_POSITION_IDS_TRUNCATE_SEQUENCE_LENGTH", 1024
+                    "ART_PACKED_POSITION_IDS_TRUNCATE_SEQUENCE_LENGTH", 2048
                 ),
                 prefill_tokens=_env_int(
                     "ART_PACKED_POSITION_IDS_TRUNCATE_PREFILL_TOKENS", 256
@@ -858,20 +903,28 @@ def _run_packed_position_ids_worker(
                     ),
                     device=row_input_ids.device,
                 )
-                rotary_output = hooked_output[1]
-                checked, respected, repeated_count = _rotary_grouping_check(
-                    cast(torch.Tensor | None, rotary_output)
-                    if torch.is_tensor(rotary_output)
-                    else None,
-                    position_ids=row_position_ids,
+                row_checked = False
+                row_respected = True
+                row_repeated_count = 0
+                rotary_outputs = _rotary_outputs_for_validation(
+                    handler_key=runtime.model_support_handler.key,
+                    preprocess_output=hooked_output,
                 )
-                rotary_grouping_checked = rotary_grouping_checked or checked
-                rotary_grouping_respected = rotary_grouping_respected and respected
-                repeated_position_key_count += repeated_count
+                for rotary_output in rotary_outputs:
+                    checked, respected, repeated_count = _rotary_grouping_check(
+                        rotary_output,
+                        position_ids=row_position_ids,
+                    )
+                    row_checked = row_checked or checked
+                    row_respected = row_respected and respected
+                    row_repeated_count = repeated_count
+                rotary_grouping_checked = rotary_grouping_checked or row_checked
+                rotary_grouping_respected = rotary_grouping_respected and row_respected
+                repeated_position_key_count += row_repeated_count
                 _debug_log(
                     f"scenario {scenario_name} row={row_index} "
-                    f"checked={checked} respected={respected} "
-                    f"repeated_keys={repeated_count}"
+                    f"checked={row_checked} respected={row_respected} "
+                    f"repeated_keys={row_repeated_count}"
                 )
             (
                 completion_pair_count,
@@ -883,6 +936,7 @@ def _run_packed_position_ids_worker(
                 lambda: _logits_equivalence_check(
                     model=model_chunks[0],
                     handler=runtime.model_support_handler,
+                    provider=runtime.provider,
                     input_ids=input_ids,
                     position_ids=position_ids,
                     group_ids=group_ids,

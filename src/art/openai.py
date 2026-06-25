@@ -1,4 +1,4 @@
-from typing import Any, Callable
+from typing import Any, Callable, cast
 
 from openai import AsyncStream, Stream
 from openai.types.chat.chat_completion import ChatCompletion, Choice, ChoiceLogprobs
@@ -82,7 +82,21 @@ def init_chat_completion(chunk: ChatCompletionChunk) -> ChatCompletion:
 def update_chat_completion(
     chat_completion: ChatCompletion, chunk: ChatCompletionChunk
 ) -> None:
+    chat_completion_extra = cast(dict[str, Any], chat_completion.model_extra)
+    prompt_token_ids = getattr(chunk, "prompt_token_ids", None)
+    if prompt_token_ids is not None:
+        chat_completion_extra["prompt_token_ids"] = prompt_token_ids
+    completion_prompt_token_ids = chat_completion_extra.get("prompt_token_ids")
     for choice, chunk_choice in zip(chat_completion.choices, chunk.choices):
+        choice_extra = cast(dict[str, Any], choice.model_extra)
+        if completion_prompt_token_ids is not None:
+            choice_extra["prompt_token_ids"] = completion_prompt_token_ids
+        token_ids = getattr(chunk_choice, "token_ids", None)
+        if token_ids:
+            choice_extra["token_ids"] = [
+                *choice_extra.get("token_ids", []),
+                *token_ids,
+            ]
         choice.finish_reason = chunk_choice.finish_reason or "stop"
         if chunk_choice.logprobs:
             if choice.logprobs is None:

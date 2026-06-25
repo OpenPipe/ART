@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import base64
+import io
 from typing import Any
 
 from openai.types.chat.chat_completion import Choice
@@ -171,8 +173,11 @@ def align_choice_routes_to_tokenized_result(
         stats.choices_with_routing += 1
         prompt_token_ids = _normalize_token_ids(metadata.get(PROMPT_TOKEN_IDS_KEY))
         completion_token_ids = _completion_token_ids(metadata)
-        prompt_routes = _prompt_routes(metadata)
-        completion_routes = _completion_routes(metadata)
+        prompt_routes, completion_routes = _choice_routes(
+            metadata,
+            prompt_token_count=len(prompt_token_ids),
+            completion_token_count=len(completion_token_ids),
+        )
         expected_prompt_ids = token_ids[:offset]
         expected_completion_ids = token_ids[offset : offset + token_length]
         if prompt_token_ids != expected_prompt_ids:
@@ -253,6 +258,8 @@ def _normalize_token_ids(raw: Any) -> list[int]:
 
 
 def _normalize_routes(raw: Any, *, field_name: str) -> list[TokenRoute]:
+    if isinstance(raw, str):
+        raw = _decode_vllm_routed_experts(raw, field_name=field_name)
     if raw is None:
         raise RuntimeError(f"Missing {field_name}")
     if not isinstance(raw, list):
@@ -269,6 +276,20 @@ def _normalize_routes(raw: Any, *, field_name: str) -> list[TokenRoute]:
         _validate_route_shape(route)
         routes.append(route)
     return routes
+
+
+def _decode_vllm_routed_experts(raw: str, *, field_name: str) -> list[Any]:
+    import numpy as np
+
+    try:
+        array = np.load(io.BytesIO(base64.b64decode(raw)), allow_pickle=False)
+    except Exception as exc:
+        raise RuntimeError(f"Failed to decode {field_name} as base64 .npy") from exc
+    if array.ndim != 3:
+        raise RuntimeError(
+            f"Expected {field_name} array with rank 3, got shape {array.shape}"
+        )
+    return array.tolist()
 
 
 def _validate_route_shape(route: TokenRoute) -> None:
@@ -288,11 +309,35 @@ def _completion_token_ids(metadata: dict[str, Any]) -> list[int]:
     raise RuntimeError("Missing routed completion token ids")
 
 
-def _prompt_routes(metadata: dict[str, Any]) -> list[TokenRoute]:
-    return _normalize_routes(
-        metadata.get(PROMPT_ROUTED_EXPERTS_KEY),
-        field_name=PROMPT_ROUTED_EXPERTS_KEY,
+def _choice_routes(
+    metadata: dict[str, Any],
+    *,
+    prompt_token_count: int,
+    completion_token_count: int,
+) -> tuple[list[TokenRoute], list[TokenRoute]]:
+    if PROMPT_ROUTED_EXPERTS_KEY in metadata:
+        return (
+            _normalize_routes(
+                metadata.get(PROMPT_ROUTED_EXPERTS_KEY),
+                field_name=PROMPT_ROUTED_EXPERTS_KEY,
+            ),
+            _completion_routes(metadata),
+        )
+
+    routes = _normalize_routes(
+        metadata.get(ROUTED_EXPERTS_KEY),
+        field_name=ROUTED_EXPERTS_KEY,
     )
+    expected_lengths = {
+        prompt_token_count + completion_token_count,
+        prompt_token_count + max(completion_token_count - 1, 0),
+    }
+    if len(routes) not in expected_lengths:
+        raise RuntimeError(
+            "routed_experts length does not match prompt/completion token ids: "
+            f"{len(routes)} not in {sorted(expected_lengths)}"
+        )
+    return routes[:prompt_token_count], routes[prompt_token_count:]
 
 
 def _completion_routes(metadata: dict[str, Any]) -> list[TokenRoute]:

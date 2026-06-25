@@ -1,11 +1,14 @@
 from ..megatron.model_support import default_target_modules_for_model
 from .engine import EngineArgs
 from .model import (
+    PEFT_ARGS_MIGRATION_MESSAGE,
+    BackendModelConfig,
     InitArgs,
     InternalModelConfig,
-    PeftArgs,
+    LoRAConfig,
     TrainerArgs,
 )
+from .sequence_lengths import max_seq_length_from_model_config
 from .validate import is_dedicated_mode
 
 
@@ -17,11 +20,14 @@ def get_model_config(
     base_model: str,
     output_dir: str,
     config: "InternalModelConfig | None",
-) -> "InternalModelConfig":
+    lora_config: "LoRAConfig | None" = None,
+) -> "BackendModelConfig":
     from ..local.checkpoints import get_last_checkpoint_dir
 
     if config is None:
         config = InternalModelConfig()
+    if "peft_args" in config:
+        raise ValueError(PEFT_ARGS_MIGRATION_MESSAGE)
 
     dedicated = is_dedicated_mode(config)
     rollout_weights_mode = config.get("rollout_weights_mode", "lora")
@@ -31,12 +37,16 @@ def get_model_config(
     else:
         enable_sleep_mode = config.get("engine_args", {}).get("enable_sleep_mode", True)
 
+    configured_init_args = config.get("init_args", {})
     init_args = InitArgs(
         load_in_4bit=True,
-        max_seq_length=32768,
+        max_seq_length=max_seq_length_from_model_config(
+            base_model,
+            revision=configured_init_args.get("revision"),
+            token=configured_init_args.get("token"),
+        ),
         model_name=base_model,
     )
-    target_modules = default_target_modules(base_model)
     engine_args = EngineArgs(
         allowed_local_media_path="/tmp",
         enable_sleep_mode=enable_sleep_mode,
@@ -44,21 +54,20 @@ def get_model_config(
         model=base_model,
     )
     engine_args.update(config.get("engine_args", {}))
-    init_args.update(config.get("init_args", {}))
+    init_args.update(configured_init_args)
     if last_checkpoint_dir := get_last_checkpoint_dir(output_dir):
         init_args["model_name"] = last_checkpoint_dir
-    peft_args = PeftArgs(
-        lora_alpha=16,
-        r=8,
+    merged_lora_config = LoRAConfig(
         random_state=3407,
-        target_modules=target_modules,
+        target_modules=default_target_modules(base_model),
         use_gradient_checkpointing="unsloth",
     )
-    peft_args.update(config.get("peft_args", {}))
+    if lora_config:
+        merged_lora_config.update(lora_config)
     if rollout_weights_mode == "lora" and "lora_target_modules" not in config.get(
         "engine_args", {}
     ):
-        engine_args["lora_target_modules"] = peft_args["target_modules"]
+        engine_args["lora_target_modules"] = merged_lora_config["target_modules"]
     trainer_args = TrainerArgs(
         adam_beta1=0.9,
         adam_beta2=0.99,
@@ -78,10 +87,10 @@ def get_model_config(
         weight_decay=0.1,
     )
     trainer_args.update(config.get("trainer_args", {}))
-    result = InternalModelConfig(
+    result = BackendModelConfig(
         init_args=init_args,
         engine_args=engine_args,
-        peft_args=peft_args,
+        lora_config=merged_lora_config,
         rollout_weights_mode=rollout_weights_mode,
         tinker_args=config.get("tinker_args"),
         trainer_args=trainer_args,

@@ -9,6 +9,7 @@ from openai.types.chat.chat_completion_chunk import ChatCompletionChunk
 
 from .openai import init_chat_completion, update_chat_completion
 from .preprocessing.moe_routing import attach_moe_routing_metadata_to_choice
+from .preprocessing.vllm_tokens import attach_vllm_token_metadata_to_choice
 from .trajectories import History, Trajectory
 
 logger = logging.getLogger(__name__)
@@ -105,9 +106,25 @@ class AutoTrajectoryContext:
                 # Parse SSE content directly from buffered bytes
                 chat_completion = parse_sse_to_chat_completion(content)
                 choice = chat_completion.choices[0]
+                response_payload = chat_completion.model_dump(mode="python")
+                attach_vllm_token_metadata_to_choice(
+                    choice=choice,
+                    response_payload=response_payload,
+                    choice_index=0,
+                )
+                attach_moe_routing_metadata_to_choice(
+                    choice=choice,
+                    response_payload=response_payload,
+                    choice_index=0,
+                )
             else:
                 response_payload = json.loads(content)
                 choice = Choice(**response_payload["choices"][0])
+                attach_vllm_token_metadata_to_choice(
+                    choice=choice,
+                    response_payload=response_payload,
+                    choice_index=0,
+                )
                 attach_moe_routing_metadata_to_choice(
                     choice=choice,
                     response_payload=response_payload,

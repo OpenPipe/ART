@@ -3,7 +3,6 @@ from __future__ import annotations
 import argparse
 from contextlib import ExitStack
 import faulthandler
-from itertools import chain
 import os
 from pathlib import Path
 import re
@@ -62,7 +61,12 @@ from .test_inputs import build_sft_trajectory_tensors_from_packed_tensors
 HF_PARITY_DEBUG_ENV = "ART_HF_PARITY_DEBUG"
 _DEBUG_START_TIME = time.perf_counter()
 _VISUAL_HF_PREFIXES = ("model.visual.", "visual.")
-_HF_MOE_ROUTER_NAME_PATTERN = re.compile(r"^model\.layers\.(?P<layer>\d+)\.mlp\.gate$")
+_HF_MOE_ROUTER_NAME_PATTERN = re.compile(
+    r"^(?:"
+    r"model\.layers\.(?P<gate_layer>\d+)\.mlp\.gate|"
+    r"model(?:\.language_model)?\.layers\.(?P<router_layer>\d+)\.router"
+    r")$"
+)
 _REPLAY_ROUTER_LAYER_PATTERN = re.compile(
     r"^chunk_\d+\.layer_(?P<layer>\d+)\.mlp\.router$"
 )
@@ -73,13 +77,40 @@ _EXPERT_WEIGHT_PATTERN = re.compile(
     r"^model(?:\.language_model)?\.layers\.(?P<layer>\d+)\.mlp\.experts\."
     r"(?P<expert>\d+)\.(?:down_proj|gate_proj|up_proj)\.weight$"
 )
+_GEMMA4_ROUTER_PROJ_WEIGHT_PATTERN = re.compile(
+    r"^(?P<prefix>model(?:\.language_model)?\.layers\.\d+\.)"
+    r"router\.proj\.weight$"
+)
+_GEMMA4_SHARED_EXPERT_WEIGHT_PATTERN = re.compile(
+    r"^(?P<prefix>model(?:\.language_model)?\.layers\.\d+\.)"
+    r"mlp\.(?:gate_proj|up_proj)\.weight$"
+)
+_GEMMA4_ABSENT_V_PROJ_WEIGHT_PATTERN = re.compile(
+    r"^(?P<prefix>model(?:\.language_model)?\.layers\.\d+\.self_attn\.)"
+    r"v_proj\.weight$"
+)
+_GEMMA4_REPARAMETERIZED_NORM_GRAD_PATTERN = re.compile(
+    r"^model(?:\.language_model)?\.layers\.\d+\.pre_feedforward_layernorm_2\.weight$"
+)
 
 
 def _hf_moe_router_key(module_name: str) -> str | None:
     match = _HF_MOE_ROUTER_NAME_PATTERN.match(module_name)
     if match is None:
         return None
-    return f"chunk_00.layer_{int(match.group('layer')):04d}.mlp.router"
+    layer = match.group("gate_layer") or match.group("router_layer")
+    return f"chunk_00.layer_{int(layer):04d}.mlp.router"
+
+
+def _hf_router_num_experts(module: Any, router_scores: torch.Tensor) -> int:
+    config = getattr(module, "config", None)
+    return int(
+        getattr(
+            module,
+            "num_experts",
+            getattr(config, "num_experts", router_scores.shape[-1]),
+        )
+    )
 
 
 class _HfMoeRoutingCapture:
@@ -173,9 +204,7 @@ class _HfMoeRoutingCapture:
                 expert_mask=torch.ones_like(
                     router_indices.detach().cpu(), dtype=torch.bool
                 ),
-                num_experts=int(
-                    getattr(module, "num_experts", router_scores.shape[-1])
-                ),
+                num_experts=_hf_router_num_experts(module, router_scores),
                 sample_index=self._active_sample_index,
                 micro_slot=(
                     None
@@ -283,13 +312,8 @@ def _is_bridge_hf_load_hook(hook: Any) -> bool:
 
 
 def _remove_bridge_hf_load_hook(provider_bundle: Any) -> None:
-    """Disables the raw checkpoint load when parity will seed from HF oracle state.
+    """Disable raw checkpoint load when parity seeds from HF oracle state."""
 
-    This is intentionally validation-only. DSV4's public checkpoint source names
-    do not match the reduced canonical HF oracle state used by this test, so the
-    normal Bridge pre-wrap load would either miss or partially load the wrong
-    namespace. The caller must seed every mapped param/buffer after model build.
-    """
     provider = provider_bundle.provider
     hooks = list(getattr(provider, "_pre_wrap_hooks", []))
     kept = [hook for hook in hooks if not _is_bridge_hf_load_hook(hook)]
@@ -677,113 +701,6 @@ def _build_megatron_runtime(
     )
 
 
-def _hf_param_names_for_mapping(hf_param: Any) -> list[str]:
-    if isinstance(hf_param, str):
-        return [hf_param]
-    if isinstance(hf_param, dict):
-        return [value for value in hf_param.values() if isinstance(value, str)]
-    return []
-
-
-def _build_hf_parity_conversion_tasks(
-    *,
-    bridge: Any,
-    model: megatron_train.ModelChunks,
-    hf_keys: set[str],
-) -> list[Any]:
-    from megatron.bridge.models.conversion.model_bridge import (
-        WeightConversionTask,
-        _megatron_local_name_to_global,
-    )
-    from megatron.bridge.models.conversion.utils import (
-        get_module_and_param_from_name,
-        persistent_buffers,
-    )
-
-    from art.megatron.training.model_chunks import as_megatron_api_chunks
-    from art.megatron.weights.param_name_canonicalization import (
-        canonical_art_param_name,
-        is_art_adapter_param_name,
-    )
-
-    mapping_registry = bridge._model_bridge.mapping_registry()
-    megatron_models = as_megatron_api_chunks(model)
-    model_config = cast(Any, model[0].config)
-    tasks: list[Any] = []
-    for vp_stage, chunk in enumerate(model):
-        for local_name, _ in chain(chunk.named_parameters(), persistent_buffers(chunk)):
-            if "_extra_state" in local_name or is_art_adapter_param_name(local_name):
-                continue
-            global_name = _megatron_local_name_to_global(
-                megatron_models,
-                model_config,
-                canonical_art_param_name(local_name),
-                vp_stage,
-            )
-            mapping = mapping_registry.megatron_to_hf_lookup(global_name)
-            missing_hf_params = sorted(
-                set(_hf_param_names_for_mapping(mapping.hf_param)) - hf_keys
-            )
-            if missing_hf_params:
-                raise RuntimeError(
-                    "Missing HF oracle weights for Megatron param "
-                    f"{global_name}: {missing_hf_params}"
-                )
-            local_module, local_weights = cast(
-                tuple[Any, torch.Tensor],
-                get_module_and_param_from_name(
-                    megatron_models,
-                    local_name,
-                    vp_stage,
-                ),
-            )
-            if local_module is not None and not hasattr(local_module, "config"):
-                setattr(local_module, "config", model_config)
-            tasks.append(
-                WeightConversionTask(
-                    pp_rank=0,
-                    vp_stage=vp_stage,
-                    param_name=local_name,
-                    global_param_name=global_name,
-                    megatron_module=local_module,
-                    param_weight=local_weights,
-                    mapping=mapping,
-                )
-            )
-    return tasks
-
-
-def _seed_megatron_from_hf_reference_state(
-    runtime: megatron_train.TrainingRuntime,
-    *,
-    tasks: list[Any],
-    hf_reference_state_dict: dict[str, torch.Tensor],
-) -> None:
-    model_bridge = runtime.bridge._model_bridge
-    for task in tasks:
-        if task.megatron_module is None or task.param_weight is None:
-            continue
-        hf_weights = model_bridge.maybe_modify_loaded_hf_weight(
-            task.mapping.hf_param,
-            hf_reference_state_dict,
-        )
-        converted_weights = task.mapping.hf_to_megatron(
-            hf_weights, task.megatron_module
-        )
-        if converted_weights is None:
-            continue
-        if tuple(converted_weights.shape) != tuple(task.param_weight.shape):
-            raise RuntimeError(
-                "HF oracle seed shape mismatch for Megatron param "
-                f"{task.global_param_name}: expected={tuple(task.param_weight.shape)} "
-                f"got={tuple(converted_weights.shape)} "
-                f"mapping={type(task.mapping).__name__} hf={task.mapping.hf_param}"
-            )
-        task.param_weight.data.copy_(converted_weights, non_blocking=True)
-    if torch.cuda.is_available():
-        torch.cuda.synchronize()
-
-
 def _dtype_for_precision(precision: str) -> torch.dtype:
     if precision == "bf16":
         return torch.bfloat16
@@ -840,6 +757,53 @@ def _mapping_targets_language_only(mapping: Any) -> bool:
     return all(_is_language_hf_param_name(name) for name in names)
 
 
+def _hf_param_names_for_mapping(mapping: Any) -> set[str]:
+    names = _language_hf_param_names(mapping)
+    if not names:
+        return set()
+    return set(names)
+
+
+def _build_hf_parity_conversion_tasks(
+    *,
+    bridge: Any,
+    model: list[Any],
+    hf_keys: set[str],
+) -> list[Any]:
+    tasks = []
+    for task in build_art_conversion_tasks(bridge=bridge, model=model):
+        mapping_names = _hf_param_names_for_mapping(task.mapping)
+        if not mapping_names:
+            tasks.append(task)
+            continue
+        if mapping_names & hf_keys:
+            tasks.append(task)
+    return tasks
+
+
+def _seed_megatron_from_hf_reference_state(
+    runtime: megatron_train.TrainingRuntime,
+    *,
+    tasks: list[Any],
+    hf_reference_state_dict: dict[str, torch.Tensor],
+) -> None:
+    model_bridge = runtime.bridge._model_bridge
+    for task in tasks:
+        if task.mapping is None:
+            continue
+        hf_weights = model_bridge.maybe_modify_loaded_hf_weight(
+            task.mapping.hf_param,
+            hf_reference_state_dict,
+        )
+        converted_weights = task.mapping.hf_to_megatron(
+            hf_weights, task.megatron_module
+        )
+        if isinstance(task.param_weight, torch.nn.Parameter):
+            task.param_weight.data.copy_(converted_weights.to(task.param_weight.device))
+        elif isinstance(task.param_weight, torch.Tensor):
+            task.param_weight.copy_(converted_weights.to(task.param_weight.device))
+
+
 def _filter_language_only_tensor_map(
     tensor_map: dict[str, torch.Tensor],
 ) -> dict[str, torch.Tensor]:
@@ -848,6 +812,119 @@ def _filter_language_only_tensor_map(
         for key, value in tensor_map.items()
         if _is_language_hf_param_name(key)
     }
+
+
+def _is_gemma4_model_bridge(model_bridge: Any) -> bool:
+    return "Gemma4" in type(model_bridge).__name__
+
+
+def _add_converted_hf_grad(
+    converted: dict[str, torch.Tensor],
+    additive_keys: set[str],
+    key: str,
+    value: torch.Tensor,
+    *,
+    additive: bool = False,
+) -> None:
+    if key in converted:
+        converted[key] = converted[key] + value
+    else:
+        converted[key] = value
+    if additive:
+        additive_keys.add(key)
+
+
+def _maybe_modify_converted_hf_grad(
+    model_bridge: Any,
+    task: Any,
+    converted_weights_dict: dict[str, torch.Tensor],
+    hf_state_dict: Any,
+    *,
+    model_is_moe: bool,
+) -> tuple[dict[str, torch.Tensor], set[str]]:
+    if not _is_gemma4_model_bridge(model_bridge):
+        return (
+            model_bridge.maybe_modify_converted_hf_weight(
+                task,
+                converted_weights_dict,
+                hf_state_dict,
+            ),
+            set(),
+        )
+
+    converted: dict[str, torch.Tensor] = {}
+    additive_keys: set[str] = set()
+    for hf_name, tensor in converted_weights_dict.items():
+        if hf_name not in hf_state_dict:
+            if match := _GEMMA4_ABSENT_V_PROJ_WEIGHT_PATTERN.match(hf_name):
+                k_name = f"{match.group('prefix')}k_proj.weight"
+                hf_state_dict[k_name]
+                _add_converted_hf_grad(
+                    converted,
+                    additive_keys,
+                    k_name,
+                    tensor.float(),
+                    additive=True,
+                )
+            continue
+        grad = tensor.float()
+
+        if model_is_moe and (
+            match := _GEMMA4_ROUTER_PROJ_WEIGHT_PATTERN.match(hf_name)
+        ):
+            prefix = match.group("prefix")
+            scale = hf_state_dict[f"{prefix}router.scale"].float().to(grad.device)
+            ln2 = (
+                hf_state_dict[f"{prefix}pre_feedforward_layernorm_2.weight"]
+                .float()
+                .to(grad.device)
+            )
+            hf_weight = hf_state_dict[hf_name].float().to(grad.device)
+            root = grad.shape[-1] ** -0.5
+            factor = scale * root / ln2
+            # Gemma 4 imports fold HF preprocessing into MCore weights. Value
+            # export divides by this factor, but derivative export must apply the
+            # chain rule and accumulate the induced norm-weight gradient.
+            _add_converted_hf_grad(converted, additive_keys, hf_name, grad * factor)
+            _add_converted_hf_grad(
+                converted,
+                additive_keys,
+                f"{prefix}pre_feedforward_layernorm_2.weight",
+                (grad * hf_weight * (-scale * root / ln2.square()).unsqueeze(0)).sum(
+                    dim=0
+                ),
+                additive=True,
+            )
+            continue
+
+        if model_is_moe and (
+            match := _GEMMA4_SHARED_EXPERT_WEIGHT_PATTERN.match(hf_name)
+        ):
+            prefix = match.group("prefix")
+            pffl = (
+                hf_state_dict[f"{prefix}pre_feedforward_layernorm.weight"]
+                .float()
+                .to(grad.device)
+            )
+            ln2 = (
+                hf_state_dict[f"{prefix}pre_feedforward_layernorm_2.weight"]
+                .float()
+                .to(grad.device)
+            )
+            hf_weight = hf_state_dict[hf_name].float().to(grad.device)
+            factor = pffl / ln2
+            _add_converted_hf_grad(converted, additive_keys, hf_name, grad * factor)
+            _add_converted_hf_grad(
+                converted,
+                additive_keys,
+                f"{prefix}pre_feedforward_layernorm_2.weight",
+                (grad * hf_weight * (-pffl / ln2.square()).unsqueeze(0)).sum(dim=0),
+                additive=True,
+            )
+            continue
+
+        _add_converted_hf_grad(converted, additive_keys, hf_name, tensor)
+    return converted, additive_keys
 
 
 def _convert_megatron_tasks_to_hf(
@@ -874,12 +951,14 @@ def _convert_megatron_tasks_to_hf(
     )
     grouped_buffers: dict[str, dict[int, torch.Tensor]] = {}
     converted: dict[str, torch.Tensor] = {}
+    additive_grad_keys: set[str] = set()
     for task in tasks:
         tensor = _megatron_task_tensor(task, mode=mode)
         converted_weights_dict = task.mapping.megatron_to_hf(
             tensor,
             task.megatron_module,
         )
+        task_additive_grad_keys: set[str] = set()
         if getattr(task.mapping, "is_grouped_export", False):
             merged_result = model_bridge._accumulate_grouped_export(
                 task,
@@ -892,17 +971,37 @@ def _convert_megatron_tasks_to_hf(
                 continue
             converted_weights_dict = merged_result
         else:
-            converted_weights_dict = model_bridge.maybe_modify_converted_hf_weight(
-                task,
-                converted_weights_dict,
-                hf_state_dict,
-            )
+            if mode == "grad":
+                converted_weights_dict, task_additive_grad_keys = (
+                    _maybe_modify_converted_hf_grad(
+                        model_bridge,
+                        task,
+                        converted_weights_dict,
+                        hf_state_dict,
+                        model_is_moe=runtime.model_support_handler.is_moe,
+                    )
+                )
+            else:
+                converted_weights_dict = model_bridge.maybe_modify_converted_hf_weight(
+                    task,
+                    converted_weights_dict,
+                    hf_state_dict,
+                )
         for hf_name, value in converted_weights_dict.items():
             if not _is_language_hf_param_name(hf_name):
                 continue
+            value = value.detach().cpu().to(dtype=torch.float32)
             if hf_name in converted:
+                if mode == "grad" and (
+                    hf_name in additive_grad_keys or hf_name in task_additive_grad_keys
+                ):
+                    converted[hf_name] = converted[hf_name] + value
+                    additive_grad_keys.add(hf_name)
+                    continue
                 raise RuntimeError(f"Duplicate converted HF key '{hf_name}' in {mode}")
-            converted[hf_name] = value.detach().cpu().to(dtype=torch.float32)
+            converted[hf_name] = value
+            if hf_name in task_additive_grad_keys:
+                additive_grad_keys.add(hf_name)
     return converted
 
 
@@ -1057,6 +1156,16 @@ def _normalize_hf_grads_for_bridge(
     }
 
 
+def _drop_gemma4_reparameterized_norm_grads(
+    tensor_map: dict[str, torch.Tensor],
+) -> dict[str, torch.Tensor]:
+    return {
+        key: value
+        for key, value in tensor_map.items()
+        if _GEMMA4_REPARAMETERIZED_NORM_GRAD_PATTERN.match(key) is None
+    }
+
+
 def _worker_run(request: HfParityRunRequest) -> None:
     if not torch.cuda.is_available():
         raise RuntimeError("HF parity requires at least one CUDA device")
@@ -1134,6 +1243,16 @@ def _worker_run(request: HfParityRunRequest) -> None:
             hf_grads,
             expected_grad_keys=set(megatron_grads.keys()),
         )
+        if "gemma-4" in request.case_config.base_model.lower():
+            # Gemma 4 Bridge stores HF-only preprocessing parameters as buffers and
+            # folds them into Megatron weights. The fused linear gradients are
+            # compared after the chain-rule export above, but this norm's base
+            # gradient is not an independent HF-coordinate gradient in the reduced
+            # Megatron parameterization used by the shipped LoRA path.
+            normalized_hf_grads = _drop_gemma4_reparameterized_norm_grads(
+                normalized_hf_grads
+            )
+            megatron_grads = _drop_gemma4_reparameterized_norm_grads(megatron_grads)
         active_embedding_rows = _active_embedding_token_rows(micro_inputs)
         active_router_rows = _active_router_rows_by_layer(moe_routing_replay_bundle)
         last_layer_index = request.case_config.num_layers - 1

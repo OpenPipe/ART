@@ -1,13 +1,15 @@
-from transformers.tokenization_utils_base import PreTrainedTokenizerBase
+from typing import Any, Iterable
 
 from mp_actors import move_to_child_process
 
-from .. import dev
 from ..backend import AnyTrainableModel
 from ..local.backend import LocalBackend
 from ..local.service import ModelService
 from ..model import TrainableModel
+from ..trajectories import TrajectoryGroup
+from ..types import LocalTrainResult
 from ..utils.output_dirs import get_model_dir
+from .runtime_config import get_megatron_runtime_config
 
 
 class MegatronBackend(LocalBackend):
@@ -27,19 +29,23 @@ class MegatronBackend(LocalBackend):
         self._packed_sequence_length_requires_chunk_alignment = False
         self._supports_result_packing = True
 
-    def _configure_backend_training_tokenizer(
+    async def train(
         self,
-        tokenizer: PreTrainedTokenizerBase,
-        *,
         model: AnyTrainableModel,
-        internal_config: dev.InternalModelConfig,
-    ) -> PreTrainedTokenizerBase:
-        from .model_support.tokenizer import configure_tokenizer_for_model_support
-
-        return configure_tokenizer_for_model_support(
-            tokenizer,
-            base_model=model.base_model,
-            internal_config=internal_config,
+        trajectory_groups: Iterable[TrajectoryGroup],
+        **kwargs: Any,
+    ) -> LocalTrainResult:
+        for removed_kwarg in ("packed_sequence_length", "megatron_topology"):
+            if removed_kwarg in kwargs:
+                raise TypeError(
+                    f"MegatronBackend.train gets {removed_kwarg} from "
+                    "art.init_megatron_runtime_config(...)."
+                )
+        return await super().train(
+            model,
+            trajectory_groups,
+            packed_sequence_length=get_megatron_runtime_config().packed_sequence_length,
+            **kwargs,
         )
 
     async def _get_service(self, model: TrainableModel) -> ModelService:
@@ -51,6 +57,7 @@ class MegatronBackend(LocalBackend):
                 base_model=model.base_model,
                 output_dir=get_model_dir(model=model, art_path=self._path),
                 config=model._internal_config,
+                lora_config=model.lora_config,
             )
             self._services[model.name] = MegatronService(
                 model_name=model.name,

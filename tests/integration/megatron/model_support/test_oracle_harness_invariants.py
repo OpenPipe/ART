@@ -1,4 +1,4 @@
-from typing import Any, cast
+from typing import Any
 
 import pytest
 import torch
@@ -6,7 +6,6 @@ import torch
 from .forward_trace import ForwardTraceCapture, _extract_router_topk
 from .oracle_harness import (
     CP_ATTENTION_SENSITIVITY_MUTATIONS,
-    CP_UNSUPPORTED_MOE_TOPOLOGIES,
     DENSE_CP_ATTENTION_SENSITIVITY_TOPOLOGY,
     DENSE_DP_SENSITIVITY_TOPOLOGY,
     DENSE_ORACLE_TOPOLOGY,
@@ -29,7 +28,6 @@ from .oracle_harness import (
     _suite_variants,
     case_config,
     selected_sensitivity_mutations_for_objective,
-    selected_suite_topologies,
     sensitivity_topology_for_mutation,
 )
 
@@ -169,6 +167,8 @@ def test_production_compiled_flex_default_stays_flash() -> None:
     from art.megatron.flex_attn import compiled as compiled_flex_attention
 
     assert compiled_flex_attention._FORCED_FLEX_BACKEND == "FLASH"
+    assert compiled_flex_attention._FLASH_FLEX_KERNEL_OPTIONS == {"BACKEND": "FLASH"}
+    assert compiled_flex_attention._TRITON_FLEX_KERNEL_OPTIONS == {"BACKEND": "TRITON"}
     assert compiled_flex_attention._FORCED_FLEX_KERNEL_OPTIONS == {"BACKEND": "FLASH"}
 
 
@@ -200,65 +200,6 @@ def test_forward_trace_prefers_local_tensor_uids_over_module_fallback() -> None:
 
     assert row_uids is not None
     assert torch.equal(row_uids, torch.tensor([4, 7]))
-
-
-def test_forward_trace_capture_prefers_dense_module_uids_for_sequence_modules() -> None:
-    module = type("ModuleWithDenseTraceUids", (), {})()
-    output = torch.zeros((2, 1), dtype=torch.float32)
-    setattr(module, "_art_trace_row_token_uids", torch.tensor([10, 11]))
-    setattr(output, "_art_trace_row_token_uids", torch.tensor([4, 7]))
-
-    row_uids, _uid_span = ForwardTraceCapture._row_token_uids_for_capture(
-        module_name="chunk0.module.decoder.layers.0.self_attention",
-        inputs=(),
-        output=output,
-        module=module,
-        row_count=2,
-    )
-
-    assert row_uids is not None
-    assert torch.equal(row_uids, torch.tensor([10, 11]))
-
-
-def test_forward_trace_capture_keeps_expert_uid_span_for_expert_modules() -> None:
-    module = type("ModuleWithDenseTraceUids", (), {})()
-    output = torch.zeros((2, 1), dtype=torch.float32)
-    setattr(module, "_art_trace_row_token_uids", torch.tensor([10, 11]))
-    setattr(output, "_art_trace_row_token_uids", torch.tensor([4, 7]))
-    setattr(output, "_art_trace_uid_span", 16)
-
-    row_uids, uid_span = ForwardTraceCapture._row_token_uids_for_capture(
-        module_name="chunk0.module.decoder.layers.0.mlp.experts.linear_fc1",
-        inputs=(),
-        output=output,
-        module=module,
-        row_count=2,
-    )
-
-    assert uid_span == 16
-    assert row_uids is not None
-    assert torch.equal(row_uids, torch.tensor([4, 7]))
-
-
-def test_forward_trace_restores_dense_non_cp_sequence_uids_before_sorting() -> None:
-    trace: dict[str, list[dict[str, Any]]] = {
-        "chunk0.module.decoder.layers.0.self_attention": [
-            {
-                "primary_output": torch.tensor([[1.0], [2.0], [3.0]]),
-                "row_token_uids": torch.tensor([10, 30, 20]),
-                "rank_meta": [
-                    {"cp_world_size": 1, "tp_rank": 0},
-                    {"cp_world_size": 1, "tp_rank": 1},
-                ],
-            }
-        ]
-    }
-
-    ForwardTraceCapture.canonicalize_trace(trace)
-
-    call = trace["chunk0.module.decoder.layers.0.self_attention"][0]
-    assert torch.equal(call["row_token_uids"], torch.tensor([0, 1, 2]))
-    assert torch.equal(call["primary_output"], torch.tensor([[1.0], [2.0], [3.0]]))
 
 
 def test_forward_trace_extracts_empty_router_topk_with_config_hint() -> None:
@@ -313,27 +254,6 @@ def test_megatron_empty_unpermute_patch_allows_view_then_inplace_add() -> None:
     output.sum().backward()
 
     assert tokens.grad is not None
-
-
-def test_fp32_preservation_handles_declared_parameter_frozen_as_buffer() -> None:
-    from art.megatron.runtime.bridge_runtime import (
-        _collect_fp32_preserved_tensors,
-        _restore_fp32_preserved_tensors,
-    )
-
-    module = torch.nn.Module()
-    module.ape = torch.nn.Parameter(torch.arange(4, dtype=torch.float32))
-    setattr(module, "_keep_fp32_parameters", ("ape",))
-    param = module.ape
-    del module._parameters["ape"]
-    module.register_buffer("ape", param.detach(), persistent=True)
-
-    keep = _collect_fp32_preserved_tensors(cast(Any, [module]))
-    module._buffers["ape"] = module.ape.to(torch.bfloat16)
-    _restore_fp32_preserved_tensors(keep)
-
-    assert module.ape.dtype == torch.float32
-    assert torch.equal(module.ape, torch.arange(4, dtype=torch.float32))
 
 
 def test_forward_trace_splits_expert_rows_with_input_uid_span() -> None:
@@ -850,30 +770,6 @@ def test_dense_suite_variants_preserve_dense_and_cp_topologies() -> None:
         variant.topology.tp == 2
         and variant.topology.dp == 2
         and variant.topology.cp == 2
-        for variant in variants
-    )
-
-
-def test_cp_unsupported_moe_suite_uses_cp_free_parallel_topology() -> None:
-    topologies = selected_suite_topologies(is_moe=True, cp_supported=False)
-    variants = _suite_variants("rl", is_moe=True, cp_supported=False)
-
-    assert topologies == CP_UNSUPPORTED_MOE_TOPOLOGIES
-    assert topologies == [
-        Topology(tp=1, ep=1, etp=1, dp=1, cp=1, sp=False),
-        Topology(tp=1, ep=2, etp=1, dp=2, cp=1, sp=False),
-        Topology(tp=2, ep=2, etp=1, dp=2, cp=1, sp=True),
-        Topology(tp=2, ep=2, etp=2, dp=2, cp=1, sp=True),
-    ]
-    assert [topology.world_size() for topology in topologies] == [1, 2, 4, 4]
-    assert all(topology.cp == 1 for topology in topologies)
-    assert variants
-    assert all(variant.topology.cp == 1 for variant in variants)
-    assert any(
-        variant.topology.tp == 2
-        and variant.topology.ep == 2
-        and variant.topology.etp == 2
-        and variant.topology.dp == 2
         for variant in variants
     )
 

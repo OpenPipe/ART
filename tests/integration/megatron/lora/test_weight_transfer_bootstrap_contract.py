@@ -14,12 +14,19 @@ def test_trainer_nccl_unique_id_round_trips_as_raw_bytes() -> None:
     assert nccl._nccl_unique_id_to_bytes(unique_id) == payload
 
 
-def test_trainer_nccl_communicator_retains_bootstrap_group(
+def test_trainer_nccl_communicator_releases_bootstrap_group_after_init(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     payload = bytes(range(128))
+    bootstrap_closed = False
+
+    def close_bootstrap() -> None:
+        nonlocal bootstrap_closed
+        bootstrap_closed = True
+
     bootstrap_group = SimpleNamespace(
-        broadcast_obj=lambda obj, src: obj if obj is not None else payload
+        broadcast_obj=lambda obj, src: obj if obj is not None else payload,
+        close=close_bootstrap,
     )
     loaded_so_paths: list[str | None] = []
 
@@ -63,7 +70,8 @@ def test_trainer_nccl_communicator_retains_bootstrap_group(
         device=0,
         nccl_so_path="/runtime/libnccl.so.2",
     )
-    assert communicator._bootstrap_group is bootstrap_group
+    assert communicator._bootstrap_group is None
+    assert bootstrap_closed is True
     assert loaded_so_paths == ["/runtime/libnccl.so.2"]
 
 

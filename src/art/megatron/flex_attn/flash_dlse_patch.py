@@ -31,7 +31,7 @@ def _apply_flash_flex_block_sparse_tile_patch() -> None:
         return
 
     try:
-        import flash_attn.cute.interface as cute_interface
+        import flash_attn.cute.interface as cute_interface  # ty: ignore[unresolved-import]
     except ModuleNotFoundError:
         _TILE_PATCH_APPLIED = True
         return
@@ -112,6 +112,9 @@ def apply_flash_flex_dlse_patch() -> None:
     import torch._inductor.kernel.flex.flex_flash_attention as flex_flash_mod
     from torch._inductor.lowering import lowerings
 
+    flex_attention_any = cast(Any, flex_attention_mod)
+    flex_flash_any = cast(Any, flex_flash_mod)
+
     if (
         "grad_logsumexp"
         in inspect.signature(
@@ -128,7 +131,7 @@ def apply_flash_flex_dlse_patch() -> None:
         ),
     )
     original_lowering = flex_attention_mod.flex_attention_backward
-    original_flash_builder = flex_flash_mod.create_flex_flash_attention_backward_kernel
+    original_flash_builder = flex_flash_any.create_flex_flash_attention_backward_kernel
 
     def create_flex_flash_attention_backward_kernel_with_dlse(
         query,
@@ -216,10 +219,10 @@ def apply_flash_flex_dlse_patch() -> None:
             stride=[flex_flash_mod.sympy.sympify(s) for s in grad_query.get_stride()],
         )
 
-        sparse_q_block_size = flex_flash_mod.V.graph.sizevars.guard_int(
+        sparse_q_block_size = flex_flash_any.V.graph.sizevars.guard_int(
             sparse_q_block_size
         )
-        sparse_kv_block_size = flex_flash_mod.V.graph.sizevars.guard_int(
+        sparse_kv_block_size = flex_flash_any.V.graph.sizevars.guard_int(
             sparse_kv_block_size
         )
 
@@ -436,7 +439,7 @@ def apply_flash_flex_dlse_patch() -> None:
         )
         flex_attention_mod.freeze_irnodes(mask_graph_buffer)
 
-        if not flex_flash_mod._use_flex_flash_attention_backward(
+        if not flex_flash_any._use_flex_flash_attention_backward(
             fw_graph,
             mask_graph,
             backend=backend,
@@ -458,7 +461,7 @@ def apply_flash_flex_dlse_patch() -> None:
                 "is not yet implemented. The TRITON backend supports deterministic backward."
             )
         if torch.is_deterministic_algorithms_warn_only_enabled() and needs_block_mask:
-            flex_attention_mod.warnings.warn(
+            flex_attention_any.warnings.warn(
                 "Deterministic backward for flex_attention with block_mask using the FLASH backend "
                 "is not yet implemented. Running non-deterministic backward.",
             )
@@ -488,9 +491,7 @@ def apply_flash_flex_dlse_patch() -> None:
             full_q_indices=full_q_indices if needs_block_mask else None,
         )
 
-    cast(
-        Any, flex_flash_mod
-    ).create_flex_flash_attention_backward_kernel_with_dlse = (
+    flex_flash_any.create_flex_flash_attention_backward_kernel_with_dlse = (
         create_flex_flash_attention_backward_kernel_with_dlse
     )
     flex_attention_mod.flex_attention_backward = flex_attention_backward_with_flash_dlse

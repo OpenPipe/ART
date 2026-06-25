@@ -20,9 +20,13 @@ from .hf_parity import (
 )
 from .hf_parity_worker import (
     _build_megatron_runtime,
+    _drop_gemma4_reparameterized_norm_grads,
     _filter_language_only_tensor_map,
+    _hf_moe_router_key,
+    _hf_router_num_experts,
     _is_language_hf_param_name,
     _mapping_supports_derivative_parity,
+    _maybe_modify_converted_hf_grad,
     _normalize_hf_grads_for_bridge,
     _normalize_hf_tensor_map_for_bridge,
 )
@@ -307,6 +311,26 @@ def test_normalize_hf_grads_for_bridge_keeps_expected_key_set() -> None:
     }
 
 
+def test_hf_moe_routing_capture_recognizes_gemma4_router_names() -> None:
+    assert (
+        _hf_moe_router_key("model.layers.3.mlp.gate")
+        == "chunk_00.layer_0003.mlp.router"
+    )
+    assert (
+        _hf_moe_router_key("model.language_model.layers.5.router")
+        == "chunk_00.layer_0005.mlp.router"
+    )
+    assert _hf_moe_router_key("model.layers.7.router") == (
+        "chunk_00.layer_0007.mlp.router"
+    )
+    assert _hf_moe_router_key("model.language_model.layers.5.mlp.gate") is None
+
+
+def test_hf_router_num_experts_uses_nested_config() -> None:
+    module = SimpleNamespace(config=SimpleNamespace(num_experts=128))
+    assert _hf_router_num_experts(module, torch.ones(2, 8)) == 128
+
+
 def test_build_megatron_runtime_uses_training_provider_bundle(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -369,3 +393,106 @@ def test_mapping_supports_derivative_parity_rejects_affine_weight_exports() -> N
         )
         is False
     )
+
+
+class Gemma4BridgeForTest:
+    pass
+
+
+def test_gemma4_router_grad_export_applies_chain_rule() -> None:
+    key = "model.language_model.layers.0.router.proj.weight"
+    prefix = "model.language_model.layers.0."
+    grad = torch.tensor([[1.0, 2.0], [3.0, 4.0]])
+    hf_weight = torch.tensor([[5.0, 7.0], [11.0, 13.0]])
+    scale = torch.tensor([3.0, 5.0])
+    ln2 = torch.tensor([2.0, 4.0])
+
+    converted, additive = _maybe_modify_converted_hf_grad(
+        Gemma4BridgeForTest(),
+        SimpleNamespace(),
+        {key: grad},
+        {
+            key: hf_weight,
+            f"{prefix}router.scale": scale,
+            f"{prefix}pre_feedforward_layernorm_2.weight": ln2,
+        },
+        model_is_moe=True,
+    )
+
+    root = grad.shape[-1] ** -0.5
+    factor = scale * root / ln2
+    assert torch.allclose(converted[key], grad * factor)
+    assert torch.allclose(
+        converted[f"{prefix}pre_feedforward_layernorm_2.weight"],
+        (grad * hf_weight * (-scale * root / ln2.square()).unsqueeze(0)).sum(dim=0),
+    )
+    assert additive == {f"{prefix}pre_feedforward_layernorm_2.weight"}
+
+
+def test_gemma4_absent_v_grad_export_adds_to_k() -> None:
+    prefix = "model.language_model.layers.5.self_attn."
+    k_key = f"{prefix}k_proj.weight"
+    v_key = f"{prefix}v_proj.weight"
+    k_grad = torch.tensor([[1.0, 2.0]])
+    v_grad = torch.tensor([[3.0, 4.0]])
+
+    converted, additive = _maybe_modify_converted_hf_grad(
+        Gemma4BridgeForTest(),
+        SimpleNamespace(),
+        {k_key: k_grad, v_key: v_grad},
+        {k_key: torch.ones_like(k_grad)},
+        model_is_moe=False,
+    )
+
+    assert torch.equal(converted[k_key], k_grad + v_grad)
+    assert additive == {k_key}
+
+
+def test_drop_gemma4_reparameterized_norm_grads_is_exact() -> None:
+    kept_key = "model.language_model.layers.0.self_attn.q_norm.weight"
+    dropped_key = "model.language_model.layers.0.pre_feedforward_layernorm_2.weight"
+    filtered = _drop_gemma4_reparameterized_norm_grads(
+        {
+            kept_key: torch.ones(1),
+            dropped_key: torch.ones(1),
+        }
+    )
+
+    assert set(filtered) == {kept_key}
+
+
+def test_gemma4_shared_expert_grad_export_applies_chain_rule() -> None:
+    prefix = "model.language_model.layers.0."
+    gate_key = f"{prefix}mlp.gate_proj.weight"
+    up_key = f"{prefix}mlp.up_proj.weight"
+    gate_grad = torch.tensor([[1.0, 2.0], [3.0, 4.0]])
+    up_grad = torch.tensor([[5.0, 6.0], [7.0, 8.0]])
+    gate_weight = torch.tensor([[2.0, 3.0], [5.0, 7.0]])
+    up_weight = torch.tensor([[11.0, 13.0], [17.0, 19.0]])
+    pffl = torch.tensor([3.0, 5.0])
+    ln2 = torch.tensor([2.0, 4.0])
+
+    converted, additive = _maybe_modify_converted_hf_grad(
+        Gemma4BridgeForTest(),
+        SimpleNamespace(),
+        {gate_key: gate_grad, up_key: up_grad},
+        {
+            gate_key: gate_weight,
+            up_key: up_weight,
+            f"{prefix}pre_feedforward_layernorm.weight": pffl,
+            f"{prefix}pre_feedforward_layernorm_2.weight": ln2,
+        },
+        model_is_moe=True,
+    )
+
+    factor = pffl / ln2
+    assert torch.allclose(converted[gate_key], gate_grad * factor)
+    assert torch.allclose(converted[up_key], up_grad * factor)
+    expected_ln2 = (gate_grad * gate_weight * (-pffl / ln2.square()).unsqueeze(0)).sum(
+        dim=0
+    ) + (up_grad * up_weight * (-pffl / ln2.square()).unsqueeze(0)).sum(dim=0)
+    assert torch.allclose(
+        converted[f"{prefix}pre_feedforward_layernorm_2.weight"],
+        expected_ln2,
+    )
+    assert additive == {f"{prefix}pre_feedforward_layernorm_2.weight"}

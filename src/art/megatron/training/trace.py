@@ -98,19 +98,17 @@ def _routing_replay_token_uid_sets(
     *,
     attention_state: Any | None,
 ) -> dict[str, torch.Tensor | None]:
+    attention_token_uids = flatten_local_token_uids(token_uids)
     plan = getattr(attention_state, "gdn_execution_plan", None)
     if plan is not None:
         return {
-            "attention": torch.tensor(
-                tuple(getattr(plan, "attention_token_indices")),
-                dtype=torch.int64,
-            ),
+            "attention": attention_token_uids,
             "gdn": torch.tensor(
                 tuple(getattr(plan, "gdn_token_indices")),
                 dtype=torch.int64,
             ),
         }
-    return {"attention": flatten_local_token_uids(token_uids)}
+    return {"attention": attention_token_uids}
 
 
 def _set_root_output_trace_token_uids(

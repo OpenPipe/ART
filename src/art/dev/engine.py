@@ -34,7 +34,6 @@ class EngineArgs(TypedDict, total=False):
     block_size: int | None
     enable_prefix_caching: bool | None
     disable_sliding_window: bool
-    use_v2_block_manager: bool
     swap_space: float  # GiB
     cpu_offload_gb: float  # GiB
     gpu_memory_utilization: float
@@ -78,8 +77,6 @@ class EngineArgs(TypedDict, total=False):
     lora_dtype: str | None
     max_cpu_loras: int | None
     device: str
-    num_scheduler_steps: int
-    multi_step_stream_outputs: bool
     ray_workers_use_nsight: bool
     num_gpu_blocks_override: int | None
     num_lookahead_slots: int

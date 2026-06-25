@@ -95,6 +95,7 @@ class ContextParallelConfig(BaseModel):
     model_config = ConfigDict(frozen=True, extra="forbid")
 
     block_size: int = 128
+    attention_sparse_block_size: tuple[int, int] | None = None
     planner_chunk_size: int = 512
     planner_chunk_budget_base: int = 128
     planner_chunk_budget_per_cp_rank: int = 16
@@ -230,6 +231,13 @@ class ContextParallelExecutionCache(BaseModel):
     stage_execution_specs: dict[Any, "StageExecutionSpec"] = Field(default_factory=dict)
 
 
+class CpBlockMaskVariant(BaseModel):
+    model_config = ConfigDict(frozen=True)
+
+    sliding_window: int | None = None
+    block_size: tuple[int, int]
+
+
 class StageExecutionSpec(BaseModel):
     model_config = ConfigDict(frozen=True)
 
@@ -265,6 +273,8 @@ class ArtContextParallelState(BaseModel):
     config: ContextParallelConfig
     group_ids: torch.Tensor
     parent_ids: torch.Tensor
+    input_pos: torch.Tensor
+    block_mask_variants: tuple[CpBlockMaskVariant, ...] = ()
     gdn_execution_spec: Any | None = None
     gdn_execution_plan: Any | None = None
     gdn_hidden_layout: str = "attention"

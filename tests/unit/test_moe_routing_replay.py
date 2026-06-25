@@ -2,7 +2,6 @@ from __future__ import annotations
 
 from pathlib import Path
 import tempfile
-from types import SimpleNamespace
 from typing import Any, cast
 
 import pytest
@@ -17,10 +16,9 @@ from art.megatron.routing_replay import (
     StepRouterRoutes,
     StepRoutes,
     TopologyAwareLocalTokenIndexer,
-    build_moe_routing_replay_bundle_from_packed_tensors,
     build_router_key_from_module_name,
 )
-from art.preprocessing.moe_routing import MoeRoutingPackStats, PackedMoeRoutingReplay
+from art.megatron.training.trace import _routing_replay_token_uid_sets
 
 
 def _make_route(
@@ -124,6 +122,15 @@ class _FakeParallelState:
 
     def get_tensor_model_parallel_rank(self) -> int:
         return self._tp_rank
+
+
+class _FakeGdnExecutionPlan:
+    attention_token_indices = (0, 1, 2, 3)
+    gdn_token_indices = (0, 2)
+
+
+class _FakeAttentionState:
+    gdn_execution_plan = _FakeGdnExecutionPlan()
 
 
 class _FakeRouterReplay:
@@ -245,28 +252,28 @@ def _expected_routing_map(route: RouterCallRoute) -> torch.Tensor:
     return routing_map
 
 
-def _packed_tensors_with_missing_branch_tail(*, future_scored: bool) -> dict[str, Any]:
-    token_mask = torch.tensor([[True, True, True, True, False, False]])
-    return {
-        "tokens": torch.tensor([[10, 11, 12, 13, 14, 15]]),
-        "group_ids": torch.tensor([[1, 1, 2, 2, 2, 2]]),
-        "parent_ids": torch.tensor([[1, 1, 1, 1, 1, 1]]),
-        "input_pos": torch.arange(6).view(1, 6),
-        "assistant_mask": torch.tensor([[False, False, False, True, True, False]]),
-        "logprobs": torch.tensor(
-            [[float("nan"), float("nan"), float("nan"), -0.3, -0.4, -0.5]]
-            if future_scored
-            else [[float("nan"), float("nan"), float("nan"), -0.3, -0.4, float("nan")]]
-        ),
-        "moe_routing_replay": PackedMoeRoutingReplay(
-            expert_indices=torch.zeros((1, 6, 1, 1), dtype=torch.int32),
-            token_mask=token_mask,
-            num_layers=1,
-            topk=1,
-            num_experts=1,
-            pack_stats=MoeRoutingPackStats(),
-        ),
-    }
+def test_routing_replay_token_uid_sets_keep_full_attention_layout_with_gdn_plan() -> (
+    None
+):
+    token_uids = torch.tensor([[0, 1, 2, 3, 4, 5]], dtype=torch.int64)
+
+    token_uid_sets = _routing_replay_token_uid_sets(
+        token_uids,
+        attention_state=_FakeAttentionState(),
+    )
+    attention_token_uids = token_uid_sets["attention"]
+    gdn_token_uids = token_uid_sets["gdn"]
+
+    assert attention_token_uids is not None
+    assert torch.equal(
+        attention_token_uids,
+        torch.tensor([0, 1, 2, 3, 4, 5], dtype=torch.int64),
+    )
+    assert gdn_token_uids is not None
+    assert torch.equal(
+        gdn_token_uids,
+        torch.tensor([0, 2], dtype=torch.int64),
+    )
 
 
 def test_build_router_key_from_compiled_module_name() -> None:
@@ -323,28 +330,6 @@ def test_topology_aware_local_token_indexer_slices_sequence_parallel_rows() -> N
     assert torch.equal(local_uids, torch.arange(128, 256, dtype=torch.int64))
 
 
-def test_build_bundle_allows_missing_branch_tail_without_future_scored_token() -> None:
-    bundle = build_moe_routing_replay_bundle_from_packed_tensors(
-        packed_tensors=cast(
-            Any, _packed_tensors_with_missing_branch_tail(future_scored=False)
-        ),
-        global_grad_accumulation_sequences=1,
-    )
-
-    route = bundle.steps[0].routers[bundle.router_keys[0]].calls[0]
-    assert route.expert_indices.shape == (6, 1)
-
-
-def test_build_bundle_rejects_missing_route_before_future_scored_token() -> None:
-    with pytest.raises(RuntimeError, match="missing MoE routes"):
-        build_moe_routing_replay_bundle_from_packed_tensors(
-            packed_tensors=cast(
-                Any, _packed_tensors_with_missing_branch_tail(future_scored=True)
-            ),
-            global_grad_accumulation_sequences=1,
-        )
-
-
 def test_bundle_roundtrip_disk() -> None:
     bundle, route = _make_bundle()
     with tempfile.TemporaryDirectory() as tmp_dir:
@@ -381,51 +366,6 @@ def test_controller_uses_native_router_replay_target_indices() -> None:
 
     controller.finalize_step()
     controller.remove_router_patches()
-
-
-def test_controller_replays_dsv4_router_target_indices() -> None:
-    from megatron.core.transformer.moe.router_replay import RouterReplay
-    from megatron.core.transformer.transformer_config import TransformerConfig
-
-    from art.megatron.dsv4.layer import Dsv4Router
-
-    RouterReplay.clear_global_router_replay_instances()
-    cfg = TransformerConfig(
-        num_layers=2,
-        hidden_size=8,
-        num_attention_heads=1,
-        num_moe_experts=3,
-        moe_router_topk=2,
-        moe_enable_routing_replay=True,
-        moe_router_load_balancing_type="none",
-        moe_router_score_function="sigmoid",
-        moe_router_topk_scaling_factor=1.0,
-        add_bias_linear=False,
-        perform_initialization=False,
-        transformer_impl="local",
-    )
-    setattr(cfg, "dsv4_n_hash_layers", 1)
-    setattr(cfg, "vocab_size", 32)
-    router = Dsv4Router(
-        cfg,
-        pg_collection=SimpleNamespace(tp=None, cp=None, tp_cp=None, tp_dp_cp=None),
-    )
-    router.set_layer_number(1)
-    chunk = _FakeChunk(router=cast(Any, router))
-    bundle, route = _make_bundle()
-    controller = MoeRoutingReplayController(bundle=bundle, strict=True, device="cpu")
-
-    controller.install_router_patches([chunk])
-    controller.set_step(step_index=0, sample_index=[0])
-    controller.begin_micro(0, 0)
-    controller.set_local_input_token_uids(torch.arange(4, dtype=torch.int64))
-    router.set_input_ids(torch.tensor([[7, 8, 9, 10]], dtype=torch.long))
-    _probs, routing_map = router.routing(torch.randn((4, 3), dtype=torch.float32))
-
-    assert torch.equal(routing_map.cpu(), _expected_routing_map(route))
-    controller.finalize_step()
-    controller.remove_router_patches()
-    RouterReplay.clear_global_router_replay_instances()
 
 
 def test_controller_explicit_token_uids_refresh_native_router_replay() -> None:

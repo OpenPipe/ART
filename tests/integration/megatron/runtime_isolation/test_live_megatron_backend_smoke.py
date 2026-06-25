@@ -198,6 +198,17 @@ async def _megatron_backend_context(
 ) -> AsyncIterator[MegatronBackend]:
     with _wandb_disabled():
         with provider_topology_env(topology):
+            art.init_megatron_runtime_config(
+                topology=art.MegatronTopologyConfig(
+                    tp=topology.tp,
+                    cp=topology.cp,
+                    ep=topology.ep,
+                    pp=topology.pp,
+                    vpp=topology.vpp if topology.vpp != 1 else None,
+                    etp=topology.etp,
+                ),
+                packed_sequence_length=_packed_sequence_length(),
+            )
             async with MegatronBackend(
                 path=str(backend_root), in_process=False
             ) as backend:
@@ -286,7 +297,6 @@ async def test_megatron_backend_shared_lora_runtime_sleep_wake_live_smoke(
                 train_groups,
                 learning_rate=float(os.environ.get("ART_TEST_MEGATRON_LR", "1e-4")),
                 loss_fn="cispo",
-                packed_sequence_length=_packed_sequence_length(),
             )
         )
         observed_sleep = False
@@ -379,7 +389,6 @@ async def test_megatron_backend_dedicated_merged_live_smoke(
             train_groups,
             learning_rate=float(os.environ.get("ART_TEST_MEGATRON_LR", "1e-4")),
             loss_fn="cispo",
-            packed_sequence_length=_packed_sequence_length(),
         )
         latest_step = int(result.step)
         latest_name = model.get_inference_name(step=latest_step)
@@ -453,7 +462,6 @@ async def test_megatron_backend_dedicated_multirank_merged_live_smoke(
             train_groups,
             learning_rate=float(os.environ.get("ART_TEST_MEGATRON_LR", "1e-4")),
             loss_fn="cispo",
-            packed_sequence_length=_packed_sequence_length(),
         )
         latest_step = int(result.step)
         latest_name = model.get_inference_name(step=latest_step)
@@ -535,7 +543,6 @@ async def test_megatron_backend_shared_lora_ten_step_live_smoke(
                     train_groups,
                     learning_rate=float(os.environ.get("ART_TEST_MEGATRON_LR", "1e-4")),
                     loss_fn="cispo",
-                    packed_sequence_length=_packed_sequence_length(),
                 )
             )
             observed_sleep = False

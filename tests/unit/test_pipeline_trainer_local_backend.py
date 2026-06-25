@@ -3,7 +3,8 @@ from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 import json
 from pathlib import Path
-from types import SimpleNamespace
+import sys
+from types import ModuleType, SimpleNamespace
 from typing import Any, cast
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -23,7 +24,7 @@ from art.pipeline_trainer import (
 )
 from art.pipeline_trainer.trainer import PipelineTrainer
 from art.preprocessing.tokenize import TokenizedResult
-from art.utils.output_dirs import get_model_dir
+from art.utils.output_dirs import get_model_dir, get_step_checkpoint_dir
 
 
 def _make_group(rewards: list[float]) -> TrajectoryGroup:
@@ -102,11 +103,11 @@ async def test_pipeline_trainer_preserves_backend_train_kwargs(tmp_path: Path) -
 
 
 @pytest.mark.asyncio
-async def test_pipeline_trainer_forwards_packed_sequence_length_when_set(
+async def test_pipeline_trainer_forwards_default_kl_step_zero_for_generic_backend(
     tmp_path: Path,
 ) -> None:
     model = TrainableModel(
-        name="pipeline-packed-sequence-length",
+        name="pipeline-generic-backend-kl-kwargs",
         project="pipeline-tests",
         base_model="test-model",
         base_path=str(tmp_path),
@@ -117,7 +118,7 @@ async def test_pipeline_trainer_forwards_packed_sequence_length_when_set(
     trainer = _make_trainer(
         model=model,
         backend=backend,
-        packed_sequence_length=4096,
+        kl_penalty_coef=0.25,
     )
     trainer._output_queue = asyncio.Queue()
     await trainer._output_queue.put(_make_group([0.0, 1.0]))
@@ -125,7 +126,94 @@ async def test_pipeline_trainer_forwards_packed_sequence_length_when_set(
 
     await trainer._training_stage()
 
-    assert backend.train.await_args.kwargs["packed_sequence_length"] == 4096
+    assert backend.train.await_args.kwargs == {
+        "learning_rate": 1e-5,
+        "loss_fn": "cispo",
+        "loss_fn_config": None,
+        "normalize_advantages": True,
+        "save_checkpoint": False,
+        "adam_params": None,
+        "kl_penalty_coef": 0.25,
+        "kl_penalty_reference_step": 0,
+        "kl_penalty_source": "sample",
+    }
+
+
+@pytest.mark.asyncio
+async def test_pipeline_trainer_kl_step_lag_floors_at_zero(
+    tmp_path: Path,
+) -> None:
+    model = TrainableModel(
+        name="pipeline-kl-step-lag-floor",
+        project="pipeline-tests",
+        base_model="test-model",
+        base_path=str(tmp_path),
+    )
+    backend = MagicMock()
+    backend.train = AsyncMock(return_value=SimpleNamespace(step=2, metrics={}))
+
+    trainer = _make_trainer(
+        model=model,
+        backend=backend,
+        kl_penalty_coef=0.25,
+        kl_penalty_step_lag=5,
+    )
+    trainer._output_queue = asyncio.Queue()
+    await trainer._output_queue.put(_make_group([0.0, 1.0]))
+    await trainer._output_queue.put(None)
+
+    trainer.state.next_training_step = 1
+
+    await trainer._training_stage()
+
+    assert backend.train.await_args.kwargs["kl_penalty_reference_step"] == 0
+
+
+@pytest.mark.asyncio
+async def test_pipeline_trainer_kl_step_lag_computes_reference(
+    tmp_path: Path,
+) -> None:
+    model = TrainableModel(
+        name="pipeline-kl-step-lag",
+        project="pipeline-tests",
+        base_model="test-model",
+        base_path=str(tmp_path),
+    )
+    backend = MagicMock()
+    backend.train = AsyncMock(return_value=SimpleNamespace(step=4, metrics={}))
+
+    trainer = _make_trainer(
+        model=model,
+        backend=backend,
+        kl_penalty_coef=0.25,
+        kl_penalty_step_lag=2,
+    )
+    trainer._output_queue = asyncio.Queue()
+    await trainer._output_queue.put(_make_group([0.0, 1.0]))
+    await trainer._output_queue.put(None)
+
+    trainer.state.next_training_step = 3
+
+    await trainer._training_stage()
+
+    assert backend.train.await_args.kwargs["kl_penalty_reference_step"] == 1
+
+
+def test_pipeline_trainer_rejects_zero_kl_step_lag(tmp_path: Path) -> None:
+    model = TrainableModel(
+        name="pipeline-kl-zero-step-lag",
+        project="pipeline-tests",
+        base_model="test-model",
+        base_path=str(tmp_path),
+    )
+
+    with pytest.raises(ValueError, match="kl_penalty_step_lag must be >= 1"):
+        _make_trainer(
+            model=model,
+            backend=MagicMock(),
+            kl_penalty_coef=0.25,
+            kl_penalty_step_lag=0,
+        )
 
 
 @pytest.mark.asyncio
@@ -205,6 +293,89 @@ async def test_local_backend_train_translates_loss_fn(tmp_path: Path) -> None:
     assert seen["config"].learning_rate == 5e-6
     assert seen["dev_config"]["ppo"] is True
     assert seen["dev_config"]["packed_sequence_length"] == 2048
+
+
+@pytest.mark.asyncio
+async def test_local_backend_train_passes_kl_penalty_source(tmp_path: Path) -> None:
+    model = TrainableModel(
+        name="local-backend-kl-source",
+        project="pipeline-tests",
+        base_model="test-model",
+        base_path=str(tmp_path),
+    )
+    backend = LocalBackend(path=str(tmp_path))
+    seen: dict[str, Any] = {}
+
+    async def fake_train_model(
+        _model: TrainableModel,
+        _groups: list[TrajectoryGroup],
+        config: Any,
+        dev_config: dict[str, Any],
+        verbose: bool = False,
+    ):
+        seen["config"] = config
+        seen["dev_config"] = dev_config
+        seen["verbose"] = verbose
+        yield {}
+
+    backend._train_model = fake_train_model  # type: ignore[method-assign]
+    backend._get_step = AsyncMock(return_value=1)  # type: ignore[method-assign]
+    with patch.object(model, "_get_wandb_run", return_value=None):
+        result = await backend.train(
+            model,
+            [_make_group([1.0])],
+            kl_penalty_coef=0.25,
+            kl_penalty_source="sample",
+            save_checkpoint=False,
+        )
+
+    assert result.step == 1
+    assert seen["config"].kl_penalty_source == "sample"
+    assert seen["dev_config"]["kl_penalty_source"] == "sample"
+
+
+@pytest.mark.asyncio
+async def test_megatron_backend_defaults_kl_reference_to_step_zero(
+    tmp_path: Path,
+) -> None:
+    model = TrainableModel(
+        name="megatron-default-kl-reference",
+        project="pipeline-tests",
+        base_model="test-model",
+        base_path=str(tmp_path),
+    )
+    backend = LocalBackend(path=str(tmp_path))
+    backend._requires_explicit_packed_sequence_length = True
+    seen: dict[str, Any] = {}
+
+    async def fake_train_model(
+        _model: TrainableModel,
+        _groups: list[TrajectoryGroup],
+        _config: Any,
+        dev_config: dict[str, Any],
+        verbose: bool = False,
+    ):
+        del verbose
+        seen["dev_config"] = dev_config
+        yield {}
+
+    backend._train_model = fake_train_model  # type: ignore[method-assign]
+    backend._get_step = AsyncMock(return_value=1)  # type: ignore[method-assign]
+
+    with patch.object(model, "_get_wandb_run", return_value=None):
+        await backend.train(
+            model,
+            [_make_group([1.0])],
+            kl_penalty_coef=0.25,
+            packed_sequence_length=4096,
+            save_checkpoint=False,
+        )
+
+    expected_ref_path = get_step_checkpoint_dir(
+        get_model_dir(model=model, art_path=str(tmp_path)),
+        0,
+    )
+    assert seen["dev_config"]["kl_ref_adapter_path"] == expected_ref_path
 
 
 @pytest.mark.asyncio
@@ -306,6 +477,119 @@ async def test_pipeline_trainer_checkpoint_retention_only_passes_unprotected_ste
 
 
 @pytest.mark.asyncio
+async def test_pipeline_trainer_checkpoint_retention_protects_default_kl_reference(
+    tmp_path: Path,
+) -> None:
+    model = TrainableModel(
+        name="pipeline-checkpoint-retention-default-kl-ref",
+        project="pipeline-tests",
+        base_model="test-model",
+        base_path=str(tmp_path),
+    )
+    checkpoint_dir = Path(model._get_output_dir()) / "checkpoints"
+    for step in range(4):
+        (checkpoint_dir / f"{step:04d}").mkdir(parents=True)
+
+    backend = MagicMock()
+    backend._delete_checkpoint_files = AsyncMock()
+    contexts: list[CheckpointRetentionContext] = []
+
+    def strategy(context: CheckpointRetentionContext) -> set[int]:
+        contexts.append(context)
+        return set()
+
+    trainer = _make_trainer(
+        model=model,
+        backend=backend,
+        checkpoint_retention_strategy=strategy,
+        kl_penalty_coef=0.25,
+    )
+
+    await trainer._run_checkpoint_retention(3)
+
+    assert [checkpoint.step for checkpoint in contexts[0].checkpoints] == [1, 2]
+    backend._delete_checkpoint_files.assert_awaited_once_with(  # type: ignore[attr-defined]
+        model,
+        [0, 3],
+    )
+
+
+@pytest.mark.asyncio
+async def test_pipeline_trainer_checkpoint_retention_protects_lagged_kl_reference(
+    tmp_path: Path,
+) -> None:
+    model = TrainableModel(
+        name="pipeline-checkpoint-retention-lagged-kl-ref",
+        project="pipeline-tests",
+        base_model="test-model",
+        base_path=str(tmp_path),
+    )
+    checkpoint_dir = Path(model._get_output_dir()) / "checkpoints"
+    for step in range(7):
+        (checkpoint_dir / f"{step:04d}").mkdir(parents=True)
+
+    backend = MagicMock()
+    backend._delete_checkpoint_files = AsyncMock()
+    contexts: list[CheckpointRetentionContext] = []
+
+    def strategy(context: CheckpointRetentionContext) -> set[int]:
+        contexts.append(context)
+        return set()
+
+    trainer = _make_trainer(
+        model=model,
+        backend=backend,
+        checkpoint_retention_strategy=strategy,
+        kl_penalty_coef=0.25,
+        kl_penalty_step_lag=5,
+    )
+
+    await trainer._run_checkpoint_retention(6)
+
+    assert [checkpoint.step for checkpoint in contexts[0].checkpoints] == [0]
+    backend._delete_checkpoint_files.assert_awaited_once_with(  # type: ignore[attr-defined]
+        model,
+        [1, 2, 3, 4, 5, 6],
+    )
+
+
+@pytest.mark.asyncio
+async def test_pipeline_trainer_checkpoint_retention_lag_warmup_protects_window(
+    tmp_path: Path,
+) -> None:
+    model = TrainableModel(
+        name="pipeline-checkpoint-retention-lag-floor-zero",
+        project="pipeline-tests",
+        base_model="test-model",
+        base_path=str(tmp_path),
+    )
+    checkpoint_dir = Path(model._get_output_dir()) / "checkpoints"
+    for step in range(5):
+        (checkpoint_dir / f"{step:04d}").mkdir(parents=True)
+
+    backend = MagicMock()
+    backend._delete_checkpoint_files = AsyncMock()
+    contexts: list[CheckpointRetentionContext] = []
+
+    def strategy(context: CheckpointRetentionContext) -> set[int]:
+        contexts.append(context)
+        return set()
+
+    trainer = _make_trainer(
+        model=model,
+        backend=backend,
+        checkpoint_retention_strategy=strategy,
+        kl_penalty_coef=0.25,
+        kl_penalty_step_lag=5,
+    )
+
+    await trainer._run_checkpoint_retention(4)
+
+    assert contexts == []
+    backend._delete_checkpoint_files.assert_not_awaited()  # type: ignore[attr-defined]
+
+
+@pytest.mark.asyncio
 async def test_pipeline_trainer_checkpoint_retention_honors_interval(
     tmp_path: Path,
 ) -> None:
@@ -401,6 +685,7 @@ def test_local_backend_get_packed_tensors_warns_and_drops_overlong_results(
         project="pipeline-tests",
         base_model="test-model",
         base_path=str(tmp_path),
+        _internal_config=InternalModelConfig(init_args={"max_seq_length": 4}),
     )
     short_trajectory = Trajectory(
         reward=1.0,
@@ -426,9 +711,7 @@ def test_local_backend_get_packed_tensors_warns_and_drops_overlong_results(
             "art.local.backend.AutoTokenizer.from_pretrained",
             return_value=short_result._tokenizer,
         ),
-        patch(
-            "art.local.backend.AutoImageProcessor.from_pretrained", return_value=None
-        ),
+        patch("transformers.AutoImageProcessor.from_pretrained", return_value=None),
         patch(
             "art.local.backend.tokenize_trajectory_groups",
             return_value=iter([short_result, long_result]),
@@ -451,7 +734,77 @@ def test_local_backend_get_packed_tensors_warns_and_drops_overlong_results(
 
 
 @pytest.mark.asyncio
-async def test_megatron_backend_train_requires_packed_sequence_length(
+async def test_local_backend_register_leaves_token_priced_generation_costs_disabled(
+    tmp_path: Path,
+) -> None:
+    model = TrainableModel(
+        name="local-backend-cost-accounting",
+        project="pipeline-tests",
+        base_model="openai/gpt-oss-20b",
+        base_path=str(tmp_path),
+    )
+    backend = LocalBackend(path=str(tmp_path))
+
+    with patch.object(model, "_get_wandb_run", return_value=None):
+        await backend.register(model)
+
+    assert model.cost_calculator(1_000, 2_000, "train") == {}
+
+
+@pytest.mark.asyncio
+async def test_megatron_backend_register_disables_token_priced_generation_costs(
+    tmp_path: Path,
+) -> None:
+    model = TrainableModel(
+        name="megatron-backend-cost-accounting",
+        project="pipeline-tests",
+        base_model="openai/gpt-oss-20b",
+        base_path=str(tmp_path),
+    )
+    backend = MegatronBackend(path=str(tmp_path))
+
+    with patch.object(model, "_get_wandb_run", return_value=None):
+        await backend.register(model)
+
+    assert model.cost_calculator(1_000, 2_000, "train") == {}
+
+
+@pytest.mark.asyncio
+async def test_tinker_backend_register_enables_tinker_token_priced_generation_costs(
+    tmp_path: Path,
+) -> None:
+    fake_tinker_server = ModuleType("art.tinker.server")
+    setattr(fake_tinker_server, "OpenAICompatibleTinkerServer", object)
+    had_tinker_module = "art.tinker" in sys.modules
+    had_tinker_backend_module = "art.tinker.backend" in sys.modules
+    with patch.dict("sys.modules", {"art.tinker.server": fake_tinker_server}):
+        from art.tinker.backend import TinkerBackend
+
+    if not had_tinker_backend_module:
+        sys.modules.pop("art.tinker.backend", None)
+    if not had_tinker_module:
+        sys.modules.pop("art.tinker", None)
+
+    model = TrainableModel(
+        name="tinker-backend-cost-accounting",
+        project="pipeline-tests",
+        base_model="openai/gpt-oss-20b",
+        base_path=str(tmp_path),
+    )
+    with patch.dict("os.environ", {}, clear=True):
+        backend = TinkerBackend(tinker_api_key="test-key", path=str(tmp_path))
+
+    with patch.object(model, "_get_wandb_run", return_value=None):
+        await backend.register(model)
+
+    assert model.cost_calculator(1_000, 2_000, "train") == {
+        "costs/train/tinker_prefill": pytest.approx(0.00012),
+        "costs/train/tinker_sample": pytest.approx(0.0006),
+    }
+
+
+@pytest.mark.asyncio
+async def test_megatron_backend_train_requires_runtime_config(
     tmp_path: Path,
 ) -> None:
     model = TrainableModel(
@@ -464,7 +817,8 @@ async def test_megatron_backend_train_requires_packed_sequence_length(
 
     with patch.object(model, "_get_wandb_run", return_value=None):
         with pytest.raises(
-            ValueError, match="MegatronBackend\\.train requires packed_sequence_length"
+            RuntimeError,
+            match="Call art\\.init_megatron_runtime_config\\(\\.\\.\\.\\) before using MegatronBackend",
         ):
             await backend.train(
                 model,
@@ -493,7 +847,7 @@ def test_load_adapter_into_model_reloads_optimizer_when_provided() -> None:
     optimizer = FakeOptimizer()
     adapter_model = {"weight": torch.tensor([1.0])}
 
-    load_adapter_into_model([module], adapter_model, optimizer)
+    load_adapter_into_model(cast(Any, [module]), adapter_model, optimizer)
 
     assert module.loaded_adapter is adapter_model
     assert optimizer.reload_calls == 1

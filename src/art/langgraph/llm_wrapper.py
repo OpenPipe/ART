@@ -1,6 +1,7 @@
 """LLM wrapper with logging functionality."""
 
 import asyncio
+from collections.abc import Callable
 import contextvars
 import json
 import os
@@ -22,23 +23,27 @@ CURRENT_CONFIG = contextvars.ContextVar("CURRENT_CONFIG")
 
 mappings = {}
 
+DEFAULT_INVOKE_TIMEOUT = 10 * 60
+OPENAI_COMPATIBLE_PROVIDERS = {None, "openai", "openai-compatible", "openai_compatible"}
+
 
 def add_thread(thread_id, base_url, api_key, model):
     log_path = f".art/langgraph/{thread_id}"
     os.makedirs(os.path.dirname(log_path), exist_ok=True)
+    logger = FileLogger(log_path)
     CURRENT_CONFIG.set(
         {
-            "logger": FileLogger(log_path),
+            "logger": logger,
             "base_url": base_url,
             "api_key": api_key,
             "model": model,
         }
     )
-    return log_path
+    return logger
 
 
-def create_messages_from_logs(log_path: str, trajectory: Trajectory):
-    logs = FileLogger(log_path).load_logs()
+def create_messages_from_logs(logger: FileLogger, trajectory: Trajectory):
+    logs = logger.load_logs()
     conversations = []
     tools = []
 
@@ -95,44 +100,95 @@ def create_messages_from_logs(log_path: str, trajectory: Trajectory):
 def wrap_rollout(model, fn):
     async def wrapper(*args, **kwargs):
         thread_id = str(uuid.uuid4())
-        log_path = add_thread(
+        logger = add_thread(
             thread_id,
             model.inference_base_url,
             model.inference_api_key,
             model.inference_model_name,
         )
         result = await fn(*args, **kwargs)
-        return create_messages_from_logs(log_path, result)
+        return create_messages_from_logs(logger, result)
 
     return wrapper
 
 
 def init_chat_model(
-    model: Literal[None] = None,
+    model: str | Runnable | None = None,
     *,
     model_provider: str | None = None,
     configurable_fields: Literal[None] = None,
     config_prefix: str | None = None,
+    invoke_timeout: float | None = DEFAULT_INVOKE_TIMEOUT,
     **kwargs: Any,
 ):
+    """Create a logged LangChain chat model for ART LangGraph rollouts.
+
+    By default ART constructs a ChatOpenAI client pointed at the
+    OpenAI-compatible endpoint from the active rollout context. For other
+    LangChain providers, pass an already constructed chat model instance as
+    ``model``. Provider kwargs such as ``temperature`` and ``timeout`` are
+    forwarded to ChatOpenAI; ``invoke_timeout`` controls only ART's outer
+    ``asyncio.wait_for`` timeout.
+    """
     config = CURRENT_CONFIG.get()
+
+    if configurable_fields is not None:
+        raise ValueError(
+            "configurable_fields is not supported by ART's init_chat_model"
+        )
+    if config_prefix is not None:
+        raise ValueError("config_prefix is not supported by ART's init_chat_model")
+
+    if model is not None and not isinstance(model, str):
+        return LoggingLLM(
+            model,
+            config["logger"],
+            invoke_timeout=invoke_timeout,
+        )
+
+    if model_provider not in OPENAI_COMPATIBLE_PROVIDERS:
+        raise ValueError(
+            "ART's init_chat_model can construct only OpenAI-compatible chat "
+            "models. Pass a LangChain chat model instance as `model` to use "
+            f"provider {model_provider!r}."
+        )
+
+    model_name = model
+
+    def chat_openai_factory(art_config: dict[str, Any]):
+        chat_model_kwargs: dict[str, Any] = {
+            "base_url": art_config["base_url"],
+            "api_key": art_config["api_key"],
+            "model": model_name or art_config["model"],
+            "temperature": 1.0,
+        }
+        chat_model_kwargs.update(kwargs)
+        return ChatOpenAI(**chat_model_kwargs)
+
     return LoggingLLM(
-        ChatOpenAI(
-            base_url=config["base_url"],  # ty:ignore[unknown-argument]
-            api_key=config["api_key"],  # ty:ignore[unknown-argument]
-            model=config["model"],  # ty:ignore[unknown-argument]
-            temperature=1.0,
-        ),
+        chat_openai_factory(config),
         config["logger"],
+        invoke_timeout=invoke_timeout,
+        chat_model_factory=chat_openai_factory,
     )
 
 
 class LoggingLLM(Runnable):
-    def __init__(self, llm, logger, structured_output=None, tools=None):
+    def __init__(
+        self,
+        llm,
+        logger,
+        structured_output=None,
+        tools=None,
+        invoke_timeout: float | None = DEFAULT_INVOKE_TIMEOUT,
+        chat_model_factory: Callable[[dict[str, Any]], Any] | None = None,
+    ):
         self.llm = llm
         self.logger = logger
         self.structured_output = structured_output
         self.tools = [convert_to_openai_tool(t) for t in tools] if tools else None
+        self.invoke_timeout = invoke_timeout
+        self.chat_model_factory = chat_model_factory
 
     def _log(self, completion_id, input, output):
         if self.logger:
@@ -143,7 +199,7 @@ class LoggingLLM(Runnable):
         completion_id = str(uuid.uuid4())
 
         def execute():
-            result = self.llm.invoke(input, config=config)
+            result = self.llm.invoke(input, config=config, **kwargs)
             self._log(completion_id, input, result)
             return result
 
@@ -166,9 +222,11 @@ class LoggingLLM(Runnable):
 
         async def execute():
             try:
-                result = await asyncio.wait_for(
-                    self.llm.ainvoke(input, config=config), timeout=10 * 60
-                )
+                call = self.llm.ainvoke(input, config=config, **kwargs)
+                if self.invoke_timeout is None:
+                    result = await call
+                else:
+                    result = await asyncio.wait_for(call, timeout=self.invoke_timeout)
                 self._log(completion_id, input, result)
             except asyncio.TimeoutError as e:
                 raise e
@@ -194,10 +252,18 @@ class LoggingLLM(Runnable):
             self.logger,
             structured_output=tools,
             tools=[tools],
+            invoke_timeout=self.invoke_timeout,
+            chat_model_factory=self.chat_model_factory,
         )
 
     def bind_tools(self, tools):
-        return LoggingLLM(self.llm.bind_tools(tools), self.logger, tools=tools)
+        return LoggingLLM(
+            self.llm.bind_tools(tools),
+            self.logger,
+            tools=tools,
+            invoke_timeout=self.invoke_timeout,
+            chat_model_factory=self.chat_model_factory,
+        )
 
     def with_retry(
         self,
@@ -217,23 +283,13 @@ class LoggingLLM(Runnable):
         art_config = CURRENT_CONFIG.get()
         self.logger = art_config["logger"]
 
-        if hasattr(self.llm, "bound"):
-            setattr(
-                self.llm,
-                "bound",
-                ChatOpenAI(
-                    base_url=art_config["base_url"],  # ty:ignore[unknown-argument]
-                    api_key=art_config["api_key"],  # ty:ignore[unknown-argument]
-                    model=art_config["model"],  # ty:ignore[unknown-argument]
-                    temperature=1.0,
-                ),
-            )
-        else:
-            self.llm = ChatOpenAI(
-                base_url=art_config["base_url"],  # ty:ignore[unknown-argument]
-                api_key=art_config["api_key"],  # ty:ignore[unknown-argument]
-                model=art_config["model"],  # ty:ignore[unknown-argument]
-                temperature=1.0,
-            )
+        if self.chat_model_factory is not None:
+            configured_llm = self.chat_model_factory(art_config)
+            if hasattr(self.llm, "bound"):
+                setattr(self.llm, "bound", configured_llm)
+            else:
+                self.llm = configured_llm
+        elif hasattr(self.llm, "with_config"):
+            self.llm = self.llm.with_config(config=config, **kwargs)
 
         return self

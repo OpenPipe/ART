@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import math
 import os
@@ -26,7 +27,6 @@ from .yes_no_trainability import (
     _get_env_int,
     _init_megatron_runtime_config,
     _list_model_ids,
-    _variant_packed_sequence_length,
 )
 
 torch = pytest.importorskip("torch")
@@ -37,6 +37,8 @@ TRAINER_GPU_IDS_ENV = "ART_MODEL_SUPPORT_TRAINER_GPU_IDS"
 INFERENCE_GPU_IDS_ENV = "ART_MODEL_SUPPORT_INFERENCE_GPU_IDS"
 REPO_ROOT = Path(__file__).resolve().parents[4]
 LATEST_SUMMARY_LOG_PATH = REPO_ROOT / ".local" / "length_trainability.log"
+INITIAL_ABS_ERROR_MIN = 5.0
+SUCCESS_ABS_ERROR_MAX = 1.5
 MOE_DEDICATED_TRAINING_TOPOLOGY = Topology(
     tp=1,
     cp=2,
@@ -163,6 +165,22 @@ def _base_model() -> str:
     )
 
 
+def _slugify(value: str) -> str:
+    return value.lower().replace("/", "_").replace(".", "_").replace("-", "_")
+
+
+def _artifact_dir(base_model: str) -> Path:
+    path = (
+        REPO_ROOT
+        / ".local"
+        / "model_support_validation"
+        / _slugify(base_model)
+        / "length_trainability"
+    )
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
 def _word_count(text: str) -> int:
     return len(text.split())
 
@@ -172,8 +190,6 @@ def _target_tokens() -> int:
 
 
 def _use_default_moe_dedicated_placement(variant: Any, *, base_model: str) -> None:
-    if variant.trainer_gpu_ids and variant.inference_gpu_ids:
-        return
     if not model_uses_expert_parallel(base_model, allow_unvalidated_arch=True):
         return
     if os.environ.get(TRAINER_GPU_IDS_ENV) or os.environ.get(INFERENCE_GPU_IDS_ENV):
@@ -431,11 +447,6 @@ def _append_step_summary(
     _copy_latest_summary_log(path)
 
 
-def _cleanup_generated_trainability_state(backend_root: Path) -> None:
-    if backend_root.exists():
-        shutil.rmtree(backend_root)
-
-
 @pytest.mark.skipif(
     not torch.cuda.is_available() or torch.cuda.device_count() < 3,
     reason="Need at least 3 CUDA GPUs for live dedicated length trainability",
@@ -443,11 +454,25 @@ def _cleanup_generated_trainability_state(backend_root: Path) -> None:
 @pytest.mark.asyncio
 async def test_megatron_dedicated_length_trainability_live(artifact_dir: Path) -> None:
     _require_opt_in()
-    base_model = _base_model()
+    report = await run_length_trainability_async(
+        base_model=_base_model(),
+        artifact_dir=artifact_dir,
+        allow_unvalidated_arch=True,
+    )
+    assert_length_trainability_passed(report)
+
+
+async def run_length_trainability_async(
+    *,
+    base_model: str = DEFAULT_BASE_MODEL,
+    artifact_dir: Path | None = None,
+    allow_unvalidated_arch: bool = False,
+) -> LengthTrainabilityReport:
+    artifact_dir = artifact_dir or _artifact_dir(base_model)
     variant = _build_variant(
         "megatron_dedicated",
         base_model=base_model,
-        allow_unvalidated_arch=True,
+        allow_unvalidated_arch=allow_unvalidated_arch,
     )
     _use_default_moe_dedicated_placement(variant, base_model=base_model)
     max_steps = _get_env_int("ART_MODEL_SUPPORT_LENGTH_MAX_STEPS", 10)
@@ -471,8 +496,6 @@ async def test_megatron_dedicated_length_trainability_live(artifact_dir: Path) -
         "ART_MODEL_SUPPORT_LENGTH_SCENARIOS",
         max_steps * max(rollouts_per_prompt, 2) + rollout_workers + 4,
     )
-    initial_abs_error_min = 5.0
-    success_abs_error_max = 1.5
     success_hit = False
     samples: list[LengthSampleReport] = []
     backend_root = artifact_dir / "megatron_dedicated_workspace"
@@ -481,7 +504,7 @@ async def test_megatron_dedicated_length_trainability_live(artifact_dir: Path) -
     internal_config = _build_internal_config(
         variant,
         base_model=base_model,
-        allow_unvalidated_arch=True,
+        allow_unvalidated_arch=allow_unvalidated_arch,
     )
     internal_config["engine_args"]["max_model_len"] = _get_env_int(
         "ART_MODEL_SUPPORT_LENGTH_MAX_MODEL_LEN",
@@ -494,16 +517,7 @@ async def test_megatron_dedicated_length_trainability_live(artifact_dir: Path) -
     rollout_weights_mode = internal_config["rollout_weights_mode"]
     _init_megatron_runtime_config(variant)
 
-    async with _backend_context(
-        variant,
-        backend_root=backend_root,
-        extra_env={
-            "ART_MEGATRON_STREAMING_WEIGHT_OFFLOAD": os.environ.get(
-                "ART_MEGATRON_STREAMING_WEIGHT_OFFLOAD",
-                "1",
-            )
-        },
-    ) as backend:
+    async with _backend_context(variant, backend_root=backend_root) as backend:
         model = art.TrainableModel(
             name=f"length-{uuid.uuid4().hex[:8]}",
             project="integration-tests",
@@ -547,7 +561,7 @@ async def test_megatron_dedicated_length_trainability_live(artifact_dir: Path) -
                 _mean_abs_error_by_step(
                     [sample for sample in samples if sample.split == "train"]
                 )[target_step]
-                <= success_abs_error_max
+                <= SUCCESS_ABS_ERROR_MAX
             ):
                 success_hit = True
             return group
@@ -568,7 +582,6 @@ async def test_megatron_dedicated_length_trainability_live(artifact_dir: Path) -
             ),
             loss_fn="cispo",
             normalize_advantages=normalize_advantages,
-            packed_sequence_length=_variant_packed_sequence_length(variant),
             max_steps=max_steps,
             eval_every_n_steps=0,
             eval_at_start=False,
@@ -597,7 +610,7 @@ async def test_megatron_dedicated_length_trainability_live(artifact_dir: Path) -
         (
             step
             for step, abs_error in train_abs_error_by_step.items()
-            if abs_error <= success_abs_error_max
+            if abs_error <= SUCCESS_ABS_ERROR_MAX
         ),
         None,
     )
@@ -612,7 +625,7 @@ async def test_megatron_dedicated_length_trainability_live(artifact_dir: Path) -
         if final_train_samples
         else None
     )
-    assert variant.topology is not None
+    topology = cast(Topology, variant.topology)
     report = LengthTrainabilityReport(
         base_model=base_model,
         max_steps=max_steps,
@@ -621,7 +634,7 @@ async def test_megatron_dedicated_length_trainability_live(artifact_dir: Path) -
         variant_name=variant.name,
         trainer_gpu_ids=variant.trainer_gpu_ids,
         inference_gpu_ids=variant.inference_gpu_ids,
-        training_topology=cast(dict[str, int | bool], variant.topology.model_dump()),
+        training_topology=cast(dict[str, int | bool], topology.model_dump()),
         rollout_weights_mode=rollout_weights_mode,
         rollouts_per_prompt=rollouts_per_prompt,
         normalize_advantages=normalize_advantages,
@@ -639,17 +652,63 @@ async def test_megatron_dedicated_length_trainability_live(artifact_dir: Path) -
         json.dumps(report.model_dump(mode="json"), indent=2, sort_keys=True) + "\n",
         encoding="utf-8",
     )
-    _cleanup_generated_trainability_state(backend_root)
+    return report
 
+
+def run_length_trainability(
+    *,
+    base_model: str = DEFAULT_BASE_MODEL,
+    allow_unvalidated_arch: bool = False,
+) -> LengthTrainabilityReport:
+    return asyncio.run(
+        run_length_trainability_async(
+            base_model=base_model,
+            allow_unvalidated_arch=allow_unvalidated_arch,
+        )
+    )
+
+
+def length_trainability_passed(report: LengthTrainabilityReport) -> bool:
+    train_samples = [sample for sample in report.samples if sample.split == "train"]
+    train_rewards_by_step = {
+        step: [sample.reward for sample in train_samples if sample.step == step]
+        for step in {sample.step for sample in train_samples}
+    }
+    return (
+        bool(train_samples)
+        and report.latest_step <= report.max_steps
+        and report.initial_train_abs_error is not None
+        and report.initial_train_abs_error >= INITIAL_ABS_ERROR_MIN
+        and report.best_train_abs_error is not None
+        and report.best_train_abs_error <= SUCCESS_ABS_ERROR_MAX
+        and report.success_step is not None
+        and len(train_rewards_by_step) <= report.max_steps
+        and all(sample.max_tokens > sample.target_tokens for sample in train_samples)
+        and any(sample.generated_tokens < sample.max_tokens for sample in train_samples)
+        and any(len(set(rewards)) > 1 for rewards in train_rewards_by_step.values())
+        and any(
+            name.endswith(f"@{report.latest_step}") for name in report.model_ids_after
+        )
+    )
+
+
+def assert_length_trainability_passed(report: LengthTrainabilityReport) -> None:
+    train_samples = [sample for sample in report.samples if sample.split == "train"]
+    train_rewards_by_step = {
+        step: [sample.reward for sample in train_samples if sample.step == step]
+        for step in {sample.step for sample in train_samples}
+    }
     assert train_samples
-    assert latest_step <= max_steps
-    assert initial_train_abs_error is not None
-    assert initial_train_abs_error >= initial_abs_error_min
-    assert best_train_abs_error is not None
-    assert best_train_abs_error <= success_abs_error_max
-    assert success_step is not None
-    assert len(train_rewards_by_step) <= max_steps
+    assert report.latest_step <= report.max_steps
+    assert report.initial_train_abs_error is not None
+    assert report.initial_train_abs_error >= INITIAL_ABS_ERROR_MIN
+    assert report.best_train_abs_error is not None
+    assert report.best_train_abs_error <= SUCCESS_ABS_ERROR_MAX
+    assert report.success_step is not None
+    assert len(train_rewards_by_step) <= report.max_steps
     assert all(sample.max_tokens > sample.target_tokens for sample in train_samples)
     assert any(sample.generated_tokens < sample.max_tokens for sample in train_samples)
     assert any(len(set(rewards)) > 1 for rewards in train_rewards_by_step.values())
-    assert f"{model.name}@{latest_step}" in model_ids_after
+    assert any(
+        name.endswith(f"@{report.latest_step}") for name in report.model_ids_after
+    )

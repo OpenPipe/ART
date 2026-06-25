@@ -15,6 +15,7 @@ from torch.nn.attention.flex_attention import BlockMask
 from art.megatron.flex_attn.attention import (
     FlexAttentionWrapper,
     SharedPrefixAttentionState,
+    _triton_num_stages_2_head_dims,
 )
 
 from .executor import run_context_parallel
@@ -34,15 +35,13 @@ class ArtContextParallelCoreAttention(torch.nn.Module):
         pg_collection: ProcessGroupCollection | None = None,
     ):
         super().__init__()
-        del (
-            layer_number,
-            attn_mask_type,
-            attention_type,
-            attention_dropout,
-            cp_comm_type,
-        )
+        del attn_mask_type, attention_type, attention_dropout, cp_comm_type
+        self.layer_number = int(layer_number)
         self.config = config
-        self.dense_kernel = FlexAttentionWrapper()
+        self.triton_num_stages_2_head_dims = _triton_num_stages_2_head_dims(config)
+        self.dense_kernel = FlexAttentionWrapper(
+            triton_num_stages_2_head_dims=self.triton_num_stages_2_head_dims
+        )
 
         if pg_collection is None:
             tp_world_size = self.config.tensor_model_parallel_size
@@ -99,10 +98,14 @@ class ArtContextParallelCoreAttention(torch.nn.Module):
                 enable_gqa=self.num_attention_heads_per_partition
                 != self.num_query_groups_per_partition,
                 compile_enabled=True,
+                sliding_window=getattr(self, "art_sliding_window", None),
+                triton_num_stages_2_head_dims=self.triton_num_stages_2_head_dims,
             )
         else:
             if isinstance(attention_bias, SharedPrefixAttentionState):
-                block_mask = attention_bias.block_mask
+                block_mask = attention_bias.block_mask_for_window(
+                    getattr(self, "art_sliding_window", None)
+                )
             else:
                 assert isinstance(attention_bias, BlockMask), (
                     "Expected ArtContextParallelState, SharedPrefixAttentionState, or BlockMask in attention_bias."
