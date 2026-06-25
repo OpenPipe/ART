@@ -371,6 +371,21 @@ def _collect_hf_state_dict(model: Any) -> dict[str, torch.Tensor]:
     }
 
 
+def _normalize_hf_reference_state_for_hf_parity(
+    *,
+    base_model: str,
+    model: Any,
+    state: dict[str, torch.Tensor],
+) -> dict[str, torch.Tensor]:
+    from art.megatron.model_support.registry import get_model_support_handler
+
+    handler = get_model_support_handler(base_model)
+    normalize = getattr(handler, "normalize_hf_reference_state_for_hf_parity", None)
+    if normalize is not None:
+        normalize(state, config=model.config)
+    return state
+
+
 def _use_hf_reference_state_for_hf_parity(base_model: str) -> bool:
     from art.megatron.model_support.registry import get_model_support_handler
 
@@ -582,7 +597,11 @@ def _run_hf_sft_step(
         (masked_losses.sum() / total_token_count).backward()
     grads = _collect_hf_grads(model)
     hf_reference_state_dict = (
-        _collect_hf_state_dict(model)
+        _normalize_hf_reference_state_for_hf_parity(
+            base_model=base_model,
+            model=model,
+            state=_collect_hf_state_dict(model),
+        )
         if _use_hf_reference_state_for_hf_parity(base_model)
         else None
     )

@@ -411,6 +411,14 @@ class Dsv4Handler(DefaultMoeHandler):
         """
         return True
 
+    def normalize_hf_reference_state_for_hf_parity(
+        self,
+        state: dict[str, torch.Tensor],
+        *,
+        config: Any,
+    ) -> None:
+        _add_dsv4_hf_reference_source_aliases(state, config)
+
     def configure_oracle_provider(self, provider: Any, *, case_config: Any) -> None:
         """Mirrors HF oracle reductions while keeping DSV4 hard kernel invariants."""
         hooks = list(getattr(provider, "_pre_wrap_hooks", []))
@@ -801,7 +809,7 @@ def _dsv4_source_to_hf_key_mapping() -> dict[str, str]:
             rf"{target}.self_attn.compressor.indexer.q_b_proj.weight"
         ),
         rf"^{layer}\.attn\.indexer\.weights_proj\.weight$": (
-            rf"{target}.self_attn.compressor.indexer.weights_proj.weight"
+            rf"{target}.self_attn.compressor.indexer.scorer.weights_proj.weight"
         ),
         rf"^{layer}\.attn\.indexer\.compressor\.ape$": (
             rf"{target}.self_attn.compressor.indexer.position_bias"
@@ -816,6 +824,117 @@ def _dsv4_source_to_hf_key_mapping() -> dict[str, str]:
             rf"{target}.self_attn.compressor.indexer.kv_norm.weight"
         ),
     }
+
+
+def _add_dsv4_hf_reference_source_aliases(
+    state: dict[str, torch.Tensor],
+    config: Any,
+) -> None:
+    def add(source: str, canonical: str) -> None:
+        if canonical in state and source not in state:
+            state[source] = state[canonical]
+
+    add("embed.weight", "model.embed_tokens.weight")
+    add("head.weight", "lm_head.weight")
+    add("hc_head_fn", "model.hc_head.hc_fn")
+    add("hc_head_base", "model.hc_head.hc_base")
+    add("hc_head_scale", "model.hc_head.hc_scale")
+    for layer_idx in range(int(config.num_hidden_layers)):
+        source = f"layers.{layer_idx}"
+        canonical = f"model.layers.{layer_idx}"
+        add(f"{source}.attn_norm.weight", f"{canonical}.input_layernorm.weight")
+        add(f"{source}.ffn_norm.weight", f"{canonical}.post_attention_layernorm.weight")
+        add(f"{source}.hc_attn_fn", f"{canonical}.attn_hc.fn")
+        add(f"{source}.hc_attn_base", f"{canonical}.attn_hc.base")
+        add(f"{source}.hc_attn_scale", f"{canonical}.attn_hc.scale")
+        add(f"{source}.hc_ffn_fn", f"{canonical}.ffn_hc.fn")
+        add(f"{source}.hc_ffn_base", f"{canonical}.ffn_hc.base")
+        add(f"{source}.hc_ffn_scale", f"{canonical}.ffn_hc.scale")
+        add(f"{source}.attn.wq_a.weight", f"{canonical}.self_attn.q_a_proj.weight")
+        add(f"{source}.attn.q_norm.weight", f"{canonical}.self_attn.q_a_norm.weight")
+        add(f"{source}.attn.wq_b.weight", f"{canonical}.self_attn.q_b_proj.weight")
+        add(f"{source}.attn.wkv.weight", f"{canonical}.self_attn.kv_proj.weight")
+        add(f"{source}.attn.kv_norm.weight", f"{canonical}.self_attn.kv_norm.weight")
+        add(f"{source}.attn.wo_a.weight", f"{canonical}.self_attn.o_a_proj.weight")
+        add(f"{source}.attn.wo_b.weight", f"{canonical}.self_attn.o_b_proj.weight")
+        add(f"{source}.attn.attn_sink", f"{canonical}.self_attn.sinks")
+        add(f"{source}.ffn.gate.weight", f"{canonical}.mlp.gate.weight")
+        add(f"{source}.ffn.gate.tid2eid", f"{canonical}.mlp.gate.tid2eid")
+        add(
+            f"{source}.ffn.gate.bias",
+            f"{canonical}.mlp.gate.e_score_correction_bias",
+        )
+        add(
+            f"{source}.ffn.shared_experts.w1.weight",
+            f"{canonical}.mlp.shared_experts.gate_proj.weight",
+        )
+        add(
+            f"{source}.ffn.shared_experts.w3.weight",
+            f"{canonical}.mlp.shared_experts.up_proj.weight",
+        )
+        add(
+            f"{source}.ffn.shared_experts.w2.weight",
+            f"{canonical}.mlp.shared_experts.down_proj.weight",
+        )
+        add(
+            f"{source}.attn.compressor.ape",
+            f"{canonical}.self_attn.compressor.position_bias",
+        )
+        add(
+            f"{source}.attn.compressor.wkv.weight",
+            f"{canonical}.self_attn.compressor.kv_proj.weight",
+        )
+        add(
+            f"{source}.attn.compressor.wgate.weight",
+            f"{canonical}.self_attn.compressor.gate_proj.weight",
+        )
+        add(
+            f"{source}.attn.compressor.norm.weight",
+            f"{canonical}.self_attn.compressor.kv_norm.weight",
+        )
+        add(
+            f"{source}.attn.indexer.wq_b.weight",
+            f"{canonical}.self_attn.compressor.indexer.q_b_proj.weight",
+        )
+        add(
+            f"{source}.attn.indexer.weights_proj.weight",
+            f"{canonical}.self_attn.compressor.indexer.scorer.weights_proj.weight",
+        )
+        add(
+            f"{source}.attn.indexer.compressor.ape",
+            f"{canonical}.self_attn.compressor.indexer.position_bias",
+        )
+        add(
+            f"{source}.attn.indexer.compressor.wkv.weight",
+            f"{canonical}.self_attn.compressor.indexer.kv_proj.weight",
+        )
+        add(
+            f"{source}.attn.indexer.compressor.wgate.weight",
+            f"{canonical}.self_attn.compressor.indexer.gate_proj.weight",
+        )
+        add(
+            f"{source}.attn.indexer.compressor.norm.weight",
+            f"{canonical}.self_attn.compressor.indexer.kv_norm.weight",
+        )
+        gate_up = state.get(f"{canonical}.mlp.experts.gate_up_proj")
+        if gate_up is not None:
+            gate, up = gate_up.chunk(2, dim=1)
+            for expert_idx in range(int(gate.shape[0])):
+                state.setdefault(
+                    f"{source}.ffn.experts.{expert_idx}.w1.weight",
+                    gate[expert_idx].contiguous(),
+                )
+                state.setdefault(
+                    f"{source}.ffn.experts.{expert_idx}.w3.weight",
+                    up[expert_idx].contiguous(),
+                )
+        down = state.get(f"{canonical}.mlp.experts.down_proj")
+        if down is not None:
+            for expert_idx in range(int(down.shape[0])):
+                state.setdefault(
+                    f"{source}.ffn.experts.{expert_idx}.w2.weight",
+                    down[expert_idx].contiguous(),
+                )
 
 
 def _dsv4_unpack_vllm_3d_lora_b(

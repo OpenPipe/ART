@@ -90,7 +90,7 @@ _DSV4_RENAMED_EXPORT_SUFFIXES = (
         ".attn.indexer.wq_b.weight",
     ),
     (
-        ".self_attn.compressor.indexer.weights_proj.weight",
+        ".self_attn.compressor.indexer.scorer.weights_proj.weight",
         ".attn.indexer.weights_proj.weight",
     ),
     (
@@ -1014,7 +1014,7 @@ def _dsv4_mapping_registry() -> MegatronMappingRegistry:
         _Dsv4AutoMapping(
             "decoder.layers.*.self_attention.indexer.linear_weights_proj.weight",
             "layers.*.attn.indexer.weights_proj.weight",
-            "model.layers.*.self_attn.compressor.indexer.weights_proj.weight",
+            "model.layers.*.self_attn.compressor.indexer.scorer.weights_proj.weight",
         ),
         _Dsv4AutoMapping(
             "decoder.layers.*.self_attention.indexer.compressor.ape",
