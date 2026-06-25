@@ -485,6 +485,7 @@ def _enforce_ep_overlap_recompute_contract(provider: GPTModelProvider) -> None:
 
 
 def _install_art_training_flex_attention(provider: GPTModelProvider) -> None:
+    _register_art_flex_attention_mapping_types()
     base_layer_spec = provider.transformer_layer_spec
 
     def _flex_attention_layer_spec(
@@ -495,6 +496,13 @@ def _install_art_training_flex_attention(provider: GPTModelProvider) -> None:
         return layer_spec
 
     provider.transformer_layer_spec = cast(Any, _flex_attention_layer_spec)
+
+
+def _register_art_flex_attention_mapping_types() -> None:
+    from megatron.bridge.models.conversion.param_mapping import AutoMapping
+
+    AutoMapping.register_module_type("FlexDotProductAttention", "column")
+    AutoMapping.register_module_type("ArtContextParallelCoreAttention", "column")
 
 
 def _build_provider_bundle(
