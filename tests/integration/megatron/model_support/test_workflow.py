@@ -691,7 +691,7 @@ def test_run_correctness_sensitivity_stage_runs_dense_models(monkeypatch) -> Non
     case_configs: list[SimpleNamespace] = []
     oracle_module = SimpleNamespace(
         OracleCaseConfig=lambda **kwargs: SimpleNamespace(**kwargs),
-        selected_suite_topologies=lambda *, is_moe: [
+        selected_suite_topologies=lambda *, is_moe, cp_supported=True: [
             SimpleNamespace(world_size=lambda: 1, slug=lambda: "tp1"),
             SimpleNamespace(world_size=lambda: 2, slug=lambda: "tp2"),
             SimpleNamespace(world_size=lambda: 2, slug=lambda: "dp2"),
@@ -706,7 +706,7 @@ def test_run_correctness_sensitivity_stage_runs_dense_models(monkeypatch) -> Non
             world_size=lambda: 2
         ),
         available_gpu_count=lambda: 4,
-        run_suite=lambda case_config, max_world_size: (
+        run_suite=lambda case_config, max_world_size, cp_supported=True: (
             case_configs.append(case_config)
             or [
                 SimpleNamespace(
@@ -1054,7 +1054,7 @@ def test_run_correctness_sensitivity_stage_summarizes_reports(monkeypatch) -> No
     )
     oracle_module = SimpleNamespace(
         OracleCaseConfig=lambda **kwargs: SimpleNamespace(**kwargs),
-        selected_suite_topologies=lambda *, is_moe: [
+        selected_suite_topologies=lambda *, is_moe, cp_supported=True: [
             SimpleNamespace(world_size=lambda: 1, slug=lambda: "tp1"),
             SimpleNamespace(world_size=lambda: 2, slug=lambda: "tp2"),
         ],
@@ -1067,7 +1067,7 @@ def test_run_correctness_sensitivity_stage_summarizes_reports(monkeypatch) -> No
             world_size=lambda: 2
         ),
         available_gpu_count=lambda: 2,
-        run_suite=lambda case_config, max_world_size: [
+        run_suite=lambda case_config, max_world_size, cp_supported=True: [
             SimpleNamespace(
                 variant="sft_topology_tp2",
                 topology="tp2",
@@ -1126,7 +1126,7 @@ def test_run_correctness_sensitivity_stage_can_skip_sensitivity_only(
     )
     oracle_module = SimpleNamespace(
         OracleCaseConfig=lambda **kwargs: SimpleNamespace(**kwargs),
-        selected_suite_topologies=lambda *, is_moe: [
+        selected_suite_topologies=lambda *, is_moe, cp_supported=True: [
             SimpleNamespace(world_size=lambda: 1, slug=lambda: "tp1"),
             SimpleNamespace(world_size=lambda: 2, slug=lambda: "tp2"),
         ],
@@ -1139,7 +1139,7 @@ def test_run_correctness_sensitivity_stage_can_skip_sensitivity_only(
             world_size=lambda: 4
         ),
         available_gpu_count=lambda: 2,
-        run_suite=lambda case_config, max_world_size: [
+        run_suite=lambda case_config, max_world_size, cp_supported=True: [
             SimpleNamespace(
                 variant="sft_topology_tp2",
                 topology="tp2",
@@ -1217,8 +1217,7 @@ def test_run_merged_vllm_serving_stage_reports_served_model(monkeypatch) -> None
 
     assert stage.name == "merged_vllm_serving"
     assert stage.passed is True
-    assert stage.metrics == {
-        "base_model": "Qwen/Qwen3.5-35B-A3B",
-        "served_model_name": "validation@0",
-    }
+    assert stage.metrics["base_model"] == "Qwen/Qwen3.5-35B-A3B"
+    assert stage.metrics["served_model_name"] == "validation@0"
+    assert "readable_summary" in stage.metrics
     assert stage.artifact_dir == "/tmp/merged-serving"

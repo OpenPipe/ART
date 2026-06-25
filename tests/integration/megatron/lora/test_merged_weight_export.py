@@ -282,34 +282,28 @@ def test_sync_merged_weights_to_vllm_sender_controls_runtime_and_sends(
     assert barrier_calls == [2]
 
 
-def test_sync_merged_weights_to_vllm_sender_uses_metadata_hook_for_first_pass(
+def test_sync_merged_weights_to_vllm_sender_sends_lora_delta_metadata(
     monkeypatch,
 ) -> None:
     spec = _spec()
-    iter_passes: list[int] = []
     sent_items: list[list[tuple[str, torch.Tensor]]] = []
     posts: list[tuple[str, dict[str, object] | None]] = []
-    handler = SimpleNamespace(
-        iter_merged_vllm_weight_metadata=lambda _weight_export: [
-            ("layer.weight", torch.float16, [2, 3]),
-            ("layer.bias", torch.float32, [3]),
-        ]
-    )
-    weight_export = SimpleNamespace(model_support_handler=handler)
+    published_config = {"r": 2, "lora_alpha": 4}
 
     monkeypatch.setattr(
         export,
         "ensure_merged_weight_transfer_group",
         lambda **kwargs: ("trainer-group", spec.init_info),
     )
-    monkeypatch.setattr(
-        export, "build_merged_weight_export", lambda **kwargs: weight_export
-    )
 
-    def fake_iter(_weight_export: object):
-        iter_passes.append(len(iter_passes) + 1)
-        yield ("layer.weight", torch.zeros((2, 3), dtype=torch.float16))
-        yield ("layer.bias", torch.zeros((3,), dtype=torch.float32))
+    def fake_build(**kwargs):
+        return (
+            {
+                "layer.b.lora_B.weight": torch.zeros((3,), dtype=torch.float32),
+                "layer.a.lora_A.weight": torch.zeros((2, 3), dtype=torch.float16),
+            },
+            published_config,
+        )
 
     def fake_send(iterator, trainer_args):
         del trainer_args
@@ -334,7 +328,7 @@ def test_sync_merged_weights_to_vllm_sender_uses_metadata_hook_for_first_pass(
             posts.append((url, json))
             return _OkResponse()
 
-    monkeypatch.setattr(export, "iter_merged_vllm_weights", fake_iter)
+    monkeypatch.setattr(export, "build_vllm_lora_tensors_from_model", fake_build)
     monkeypatch.setattr(export, "trainer_send_weights", fake_send)
     monkeypatch.setattr(export, "_maybe_distributed_barrier", lambda _world_size: None)
     monkeypatch.setattr(torch.cuda, "synchronize", lambda: None)
@@ -354,12 +348,16 @@ def test_sync_merged_weights_to_vllm_sender_uses_metadata_hook_for_first_pass(
         pause_generation=False,
     )
 
-    assert iter_passes == [1]
-    assert [name for name, _ in sent_items[0]] == ["layer.weight", "layer.bias"]
+    assert [name for name, _ in sent_items[0]] == [
+        "layer.a.lora_A.weight",
+        "layer.b.lora_B.weight",
+    ]
     update_post = next(post for post in posts if post[0].endswith("/update_weights"))
     assert update_post[1] == {
         "update_info": {
-            "names": ["layer.weight", "layer.bias"],
+            "art_weight_update_kind": "lora_delta",
+            "art_lora_config": published_config,
+            "names": ["layer.a.lora_A.weight", "layer.b.lora_B.weight"],
             "dtype_names": ["float16", "float32"],
             "shapes": [[2, 3], [3]],
             "packed": True,
