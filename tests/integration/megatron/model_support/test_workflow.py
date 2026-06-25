@@ -70,6 +70,7 @@ def test_validated_architecture_representative_models_are_fixed() -> None:
         "Qwen/Qwen3.5-27B",
         "google/gemma-4-26B-A4B-it",
         "google/gemma-4-31B-it",
+        "openai/gpt-oss-20b",
     ]
 
 
