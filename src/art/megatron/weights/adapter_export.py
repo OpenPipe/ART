@@ -182,6 +182,20 @@ def _set_lora_weights(
     )
 
 
+def layer_base_prefix(
+    module: TransformerLayer,
+    *,
+    module_name: str | None = None,
+) -> str:
+    if module_name is not None:
+        canonical_name = canonical_art_param_name(module_name)
+        if canonical_name.startswith(
+            ("decoder.layers.", "language_model.decoder.layers.")
+        ):
+            return canonical_name
+    return f"language_model.decoder.layers.{module.layer_number - 1}"
+
+
 def build_transformer_layer_adapter_weights(
     model_chunks: Sequence[Any],
     grouped_moe: bool = False,
@@ -205,14 +219,7 @@ def build_transformer_layer_adapter_weights(
                 continue
             if layer_filter is not None and not layer_filter(module_name):
                 continue
-            canonical_name = canonical_art_param_name(module_name)
-            layer_prefix = (
-                canonical_name
-                if canonical_name.startswith(
-                    ("decoder.layers.", "language_model.decoder.layers.")
-                )
-                else f"language_model.decoder.layers.{module.layer_number - 1}"
-            )
+            layer_prefix = layer_base_prefix(module, module_name=module_name)
             add_self_attention_adapter_weights(
                 adapter_weights_by_base,
                 layer_prefix=layer_prefix,
@@ -274,6 +281,19 @@ def add_self_attention_adapter_weights(
                 for adapter_key in ("adapter_b", "adapter_a")
             ),
         )
+
+
+def add_standard_self_attention_adapter_weights(
+    adapter_weights_by_base: dict[str, list[Any]],
+    *,
+    layer_prefix: str,
+    self_attention: Any,
+) -> None:
+    add_self_attention_adapter_weights(
+        adapter_weights_by_base,
+        layer_prefix=layer_prefix,
+        self_attention=self_attention,
+    )
 
 
 def _add_dense_mlp_adapter_weights_for_layer(
@@ -357,6 +377,32 @@ def add_grouped_moe_adapter_weights(
                 expert_idx=local_expert_idx,
             ),
         )
+
+
+def add_dense_mlp_adapter_weights(
+    adapter_weights_by_base: dict[str, list[Any]],
+    *,
+    layer_prefix: str,
+    mlp: Any,
+) -> None:
+    add_split_mlp_adapter_weights(
+        adapter_weights_by_base,
+        f"{layer_prefix}.mlp",
+        mlp,
+    )
+
+
+def add_shared_experts_adapter_weights(
+    adapter_weights_by_base: dict[str, list[Any]],
+    *,
+    layer_prefix: str,
+    shared_experts: Any,
+) -> None:
+    add_split_mlp_adapter_weights(
+        adapter_weights_by_base,
+        f"{layer_prefix}.mlp.shared_experts",
+        shared_experts,
+    )
 
 
 def add_split_mlp_adapter_weights(

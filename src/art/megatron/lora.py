@@ -1704,6 +1704,62 @@ def wrap_split_mlp_lora(
         )
 
 
+def wrap_grouped_moe_experts_3d(
+    experts: TEGroupedMLP,
+    *,
+    adapter_model_prefix: str,
+    target_modules: set[str],
+    rank: int,
+    alpha: int,
+) -> None:
+    wrap_grouped_moe_experts(
+        experts,
+        adapter_model_prefix=adapter_model_prefix,
+        target_modules=target_modules,
+        rank=rank,
+        alpha=alpha,
+        fused_gate_up=True,
+    )
+
+
+def wrap_dense_mlp(
+    mlp: Any,
+    *,
+    adapter_model_prefix: str,
+    provider: GPTModelProvider,
+    target_modules: set[str],
+    rank: int,
+    alpha: int,
+) -> None:
+    wrap_split_mlp_lora(
+        mlp,
+        adapter_model_prefix=f"{adapter_model_prefix}.mlp",
+        provider=provider,
+        target_modules=target_modules,
+        rank=rank,
+        alpha=alpha,
+    )
+
+
+def wrap_shared_experts_mlp(
+    shared_experts: Any,
+    *,
+    adapter_model_prefix: str,
+    provider: GPTModelProvider,
+    target_modules: set[str],
+    rank: int,
+    alpha: int,
+) -> None:
+    wrap_split_mlp_lora(
+        shared_experts,
+        adapter_model_prefix=f"{adapter_model_prefix}.mlp.shared_experts",
+        provider=provider,
+        target_modules=target_modules,
+        rank=rank,
+        alpha=alpha,
+    )
+
+
 def apply_lora_adapters(
     model: Sequence[torch.nn.Module],
     provider: GPTModelProvider,

@@ -782,6 +782,7 @@ def _run_megatron_job(runtime: TrainingRuntime, job: MegatronJob) -> None:
         _sync_merged_weights_to_vllm(
             runtime,
             job.merged_weight_transfer,
+            lora_path=job.lora_path,
             pause_generation=False,
         )
         return
@@ -793,6 +794,7 @@ def _run_megatron_job(runtime: TrainingRuntime, job: MegatronJob) -> None:
         _sync_merged_weights_to_vllm(
             runtime,
             job.merged_weight_transfer,
+            lora_path=job.lora_path,
             pause_generation=True,
         )
 
@@ -1623,8 +1625,13 @@ def _sync_merged_weights_to_vllm(
     runtime: TrainingRuntime,
     spec: MergedWeightTransferSpec,
     *,
+    lora_path: str,
     pause_generation: bool,
 ) -> None:
+    adapter_model = load_lora_tensors_for_megatron(
+        lora_path,
+        handler=runtime.model_support_handler,
+    )
     (
         runtime.merged_weight_transfer_group,
         runtime.merged_weight_transfer_init_info,
@@ -1632,6 +1639,8 @@ def _sync_merged_weights_to_vllm(
         bridge=runtime.bridge,
         model=runtime.model,
         model_support_handler=runtime.model_support_handler,
+        adapter_model=adapter_model,
+        adapter_config=load_adapter_config(lora_path),
         rank=runtime.rank,
         world_size=runtime.world_size,
         merged_weight_transfer_group=runtime.merged_weight_transfer_group,
@@ -1641,15 +1650,19 @@ def _sync_merged_weights_to_vllm(
     )
 
 
-def _close_merged_weight_transfer_group(runtime: TrainingRuntime) -> None:
+def _close_merged_weight_transfer_group(
+    runtime: TrainingRuntime, *, abort: bool = False
+) -> None:
     weight_transfer_group = runtime.merged_weight_transfer_group
     runtime.merged_weight_transfer_group = None
     runtime.merged_weight_transfer_init_info = None
     if weight_transfer_group is None:
         return
-    close = getattr(weight_transfer_group, "close", None)
-    if close is not None:
-        close()
+    shutdown = getattr(weight_transfer_group, "abort" if abort else "close", None)
+    if shutdown is None and abort:
+        shutdown = getattr(weight_transfer_group, "close", None)
+    if shutdown is not None:
+        shutdown()
 
 
 def _run_service_loop(runtime: TrainingRuntime) -> None:
@@ -1674,6 +1687,7 @@ def _run_service_loop(runtime: TrainingRuntime) -> None:
         runtime.optimizer = None
         weight_offload.after_job()
 
+    worker_error = False
     try:
         after_job()
         run_megatron_worker_loop(
@@ -1683,8 +1697,11 @@ def _run_service_loop(runtime: TrainingRuntime) -> None:
             before_job=before_job,
             after_job=after_job,
         )
+    except BaseException:
+        worker_error = True
+        raise
     finally:
-        _close_merged_weight_transfer_group(runtime)
+        _close_merged_weight_transfer_group(runtime, abort=worker_error)
 
 
 def main() -> None:

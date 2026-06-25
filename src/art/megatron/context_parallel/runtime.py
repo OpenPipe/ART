@@ -18,6 +18,7 @@ from .types import (
     AttnMaskKind,
     AttnSlice,
     ContextParallelConfig,
+    CpBlockMaskVariant,
     DispatchedPackedTensors,
     DkvReducePlan,
     ExactMaskMetadata,
@@ -677,11 +678,13 @@ def _stage_cost_ms(
     pair_ms = (
         config.planner_local_backward_pair_ms
         if backward and local
-        else config.planner_remote_backward_pair_ms
-        if backward
-        else config.planner_local_pair_ms
-        if local
-        else config.planner_remote_pair_ms
+        else (
+            config.planner_remote_backward_pair_ms
+            if backward
+            else (
+                config.planner_local_pair_ms if local else config.planner_remote_pair_ms
+            )
+        )
     )
     remote_underfill_ms = 0.0
     if not local and (pair_count > 0 or q_tokens > 0 or k_tokens > 0):
@@ -819,21 +822,27 @@ def _evaluate_plan(
     empty_pair_counts = pair_counts.new_zeros((0, chunk_count))
     empty_pair_positive = pair_positive.new_zeros((0, chunk_count))
     pair_counts_by_rank_rows = [
-        empty_pair_counts
-        if int(owner_index.numel()) == 0
-        else pair_counts.index_select(0, owner_index)
+        (
+            empty_pair_counts
+            if int(owner_index.numel()) == 0
+            else pair_counts.index_select(0, owner_index)
+        )
         for owner_index in owner_indices
     ]
     pair_positive_by_rank_rows = [
-        empty_pair_positive
-        if int(owner_index.numel()) == 0
-        else pair_positive.index_select(0, owner_index)
+        (
+            empty_pair_positive
+            if int(owner_index.numel()) == 0
+            else pair_positive.index_select(0, owner_index)
+        )
         for owner_index in owner_indices
     ]
     pair_positive_by_rank_cols = [
-        torch.zeros(chunk_count, dtype=torch.bool)
-        if int(rank_rows.numel()) == 0
-        else rank_rows.any(dim=0)
+        (
+            torch.zeros(chunk_count, dtype=torch.bool)
+            if int(rank_rows.numel()) == 0
+            else rank_rows.any(dim=0)
+        )
         for rank_rows in pair_positive_by_rank_rows
     ]
     wave_masks = [wave_tensor == wave_index for wave_index in range(wave_count)]
@@ -1389,27 +1398,37 @@ def _build_rank_runtime_plan(
 
     for wave_index in range(wave_count):
         request_ranges_by_source = tuple(
-            _merge_ranges(recv_request_ranges[wave_index][source_rank])
-            if source_rank != target_rank
-            else tuple()
+            (
+                _merge_ranges(recv_request_ranges[wave_index][source_rank])
+                if source_rank != target_rank
+                else tuple()
+            )
             for source_rank in range(cp_size)
         )
         send_global_ranges_by_peer = tuple(
-            _merge_ranges(send_request_ranges[wave_index][peer_rank])
-            if peer_rank != target_rank
-            else tuple()
+            (
+                _merge_ranges(send_request_ranges[wave_index][peer_rank])
+                if peer_rank != target_rank
+                else tuple()
+            )
             for peer_rank in range(cp_size)
         )
         send_ranges_by_peer = tuple(
-            tuple(_remap_subrange(range_, host_local_ranges) for range_ in peer_ranges)
-            if peer_rank != target_rank
-            else tuple()
+            (
+                tuple(
+                    _remap_subrange(range_, host_local_ranges) for range_ in peer_ranges
+                )
+                if peer_rank != target_rank
+                else tuple()
+            )
             for peer_rank, peer_ranges in enumerate(send_global_ranges_by_peer)
         )
         recv_splits = tuple(
-            _ranges_size(request_ranges_by_source[source_rank])
-            if source_rank != target_rank
-            else 0
+            (
+                _ranges_size(request_ranges_by_source[source_rank])
+                if source_rank != target_rank
+                else 0
+            )
             for source_rank in range(cp_size)
         )
         send_splits = tuple(
@@ -1493,6 +1512,7 @@ def prepare_cp_micro(
     build_gdn_execution_spec: bool = False,
     trace_token_uids: bool = False,
     prepare_execution_state: bool = True,
+    block_mask_variants: tuple[CpBlockMaskVariant, ...] = (),
     target_device: torch.device | None = None,
     ref_logprobs: torch.Tensor | None = None,
 ) -> PreparedMegatronBatch:
@@ -1511,6 +1531,7 @@ def prepare_cp_micro(
         cp_group=cp_group,
         cp_rank=cp_rank,
         build_gdn_execution_spec=build_gdn_execution_spec,
+        block_mask_variants=block_mask_variants,
         target_device=target_device,
     )
     tensors = dispatch_megatron_context_parallel_training_tensors(
@@ -1549,6 +1570,7 @@ def prepare_megatron_context_parallel_state(
     cp_group: Any,
     cp_rank: int,
     build_gdn_execution_spec: bool = False,
+    block_mask_variants: tuple[CpBlockMaskVariant, ...] = (),
     target_device: torch.device | None = None,
 ) -> tuple[ArtContextParallelState, RankRuntimePlan, PackedBatchAttentionSpec, int]:
     """Build CP runtime state from CPU metadata.
@@ -1574,6 +1596,7 @@ def prepare_megatron_context_parallel_state(
         )
     group_ids_cpu = _planning_metadata_cpu(micro["group_ids"])
     parent_ids_cpu = _planning_metadata_cpu(micro["parent_ids"])
+    input_pos_cpu = _planning_metadata_cpu(micro["input_pos"])
     planning_key = _planning_bundle_cache_key(
         group_ids=group_ids_cpu,
         parent_ids=parent_ids_cpu,
@@ -1601,7 +1624,8 @@ def prepare_megatron_context_parallel_state(
             )
 
             gdn_execution_spec = parse_gdn_shared_prefix_segments(
-                group_ids_cpu, parent_ids_cpu
+                group_ids_cpu,
+                parent_ids_cpu,
             )
         bundle = _PlanningBundle(
             spec=spec,
@@ -1644,6 +1668,8 @@ def prepare_megatron_context_parallel_state(
         config=config,
         group_ids=group_ids_cpu[0].contiguous(),
         parent_ids=parent_ids_cpu[0].contiguous(),
+        input_pos=input_pos_cpu[0].contiguous(),
+        block_mask_variants=block_mask_variants,
         gdn_execution_spec=bundle.gdn_execution_spec,
         gdn_execution_plan=gdn_execution_plan,
         trace_token_uids=None,
@@ -2044,11 +2070,13 @@ def _dispatch_tensor(
     rank_plan: RankRuntimePlan,
     pad_value: int | float | bool,
     pad_multiple: int = 1,
-    dispatch_meta_cache: dict[
-        tuple[tuple[tuple[int, int], ...], int, str, int | None],
-        tuple[torch.Tensor, torch.Tensor],
-    ]
-    | None = None,
+    dispatch_meta_cache: (
+        dict[
+            tuple[tuple[tuple[int, int], ...], int, str, int | None],
+            tuple[torch.Tensor, torch.Tensor],
+        ]
+        | None
+    ) = None,
 ) -> torch.Tensor:
     """Gather local rows without branching on CUDA tensor values.
 
@@ -2092,11 +2120,13 @@ def _dispatch_meta(
     rank_plan: RankRuntimePlan,
     max_local_len: int,
     device: torch.device,
-    dispatch_meta_cache: dict[
-        tuple[tuple[tuple[int, int], ...], int, str, int | None],
-        tuple[torch.Tensor, torch.Tensor],
-    ]
-    | None = None,
+    dispatch_meta_cache: (
+        dict[
+            tuple[tuple[tuple[int, int], ...], int, str, int | None],
+            tuple[torch.Tensor, torch.Tensor],
+        ]
+        | None
+    ) = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     owner_ranges = tuple(
         range_

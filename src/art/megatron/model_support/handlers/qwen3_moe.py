@@ -9,6 +9,7 @@ from art.megatron.model_support.handlers.default_dense import (
 )
 from art.megatron.model_support.handlers.qwen3_common import (
     install_qwen3_text_preprocess_patch,
+    qwen3_forward_kwargs,
 )
 from art.megatron.model_support.spec import CompileWorkaroundConfig
 
@@ -36,6 +37,9 @@ class Qwen3MoeHandler(DefaultMoeHandler):
 
     def install_preprocess_patch(self, model_chunks: Sequence[Any]) -> None:
         install_qwen3_text_preprocess_patch(model_chunks)
+
+    def get_forward_kwargs(self, model: Any, **kwargs: Any) -> dict[str, Any]:
+        return qwen3_forward_kwargs(model, **kwargs)
 
     def compile_workaround_config(
         self,

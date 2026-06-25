@@ -9,6 +9,14 @@ from art.dev.model import InternalModelConfig, LoRAConfig, PeftArgs
 from art.dev.validate import is_dedicated_mode, validate_dedicated_config
 
 
+@pytest.fixture(autouse=True)
+def _stub_model_max_seq_length(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        "art.dev.get_model_config.max_seq_length_from_model_config",
+        lambda *_args, **_kwargs: 2048,
+    )
+
+
 def test_shared_mode_empty_config():
     config = InternalModelConfig()
     assert is_dedicated_mode(config) is False

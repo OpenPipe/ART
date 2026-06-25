@@ -111,7 +111,7 @@ def test_qwen3_5_parse_response_handles_xml_tool_calls() -> None:
 
     message, success = renderer.parse_response(response)
 
-    assert success is True
+    assert success == renderers.ParseTermination.STOP_SEQUENCE
     assert message["content"] == [
         {"type": "thinking", "thinking": "reasoning"},
         {"type": "text", "text": "Answer first.\n\n"},

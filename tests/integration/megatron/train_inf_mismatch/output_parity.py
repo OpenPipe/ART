@@ -24,10 +24,18 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 # 4.606% mean_abs_pct while staying under the KL gate, so its gate is 5%.
 BF16_FWD_MEAN_ABS_PCT_LIMIT = 4.0
 BF16_FWD_MEAN_ABS_PCT_LIMIT_BY_MODEL_KEY = {
-    "qwen3_moe": 8.0,
+    # Gemma 4 MoE long-prompt SWA native-LoRA runs showed high variation, with
+    # repeated samples reaching 7.6% mean_abs_pct and 0.0076 KL.
+    "gemma4_dense": 8.0,
+    "gemma4_moe": 8.0,
+    "qwen3_moe": 7.0,
     "qwen3_5_moe": 5.0,
 }
 TOP20_KL_CANDIDATE_TO_TARGET_LIMIT = 0.002
+TOP20_KL_CANDIDATE_TO_TARGET_LIMIT_BY_MODEL_KEY = {
+    "gemma4_dense": 0.003,
+    "gemma4_moe": 0.008,
+}
 MEAN_ABS_PCT_DENOMINATOR_EPS = 1e-18
 TOP_K = 20
 ScoreRecord = tuple[int, float, list[int], list[float]]
@@ -96,7 +104,6 @@ class TrainInfOutputParityConfig(BaseModel):
     lora_target_modules: list[str] | None = None
     engine_args: dict[str, Any] = Field(default_factory=dict)
     server_args: dict[str, Any] = Field(default_factory=dict)
-    replay_vllm_routing: bool = False
 
     @model_validator(mode="after")
     def _set_default_rollout_modes(self) -> "TrainInfOutputParityConfig":
@@ -267,11 +274,14 @@ def top20_kl_candidate_to_target_limit_for_model(
 ) -> float:
     from art.megatron.model_support.registry import get_model_support_spec
 
-    get_model_support_spec(
+    spec = get_model_support_spec(
         base_model,
         allow_unvalidated_arch=allow_unvalidated_arch,
     )
-    return TOP20_KL_CANDIDATE_TO_TARGET_LIMIT
+    return TOP20_KL_CANDIDATE_TO_TARGET_LIMIT_BY_MODEL_KEY.get(
+        spec.key,
+        TOP20_KL_CANDIDATE_TO_TARGET_LIMIT,
+    )
 
 
 def model_support_is_moe(
@@ -865,6 +875,11 @@ def _run_logits(
     attention_state = create_shared_prefix_state(
         group_ids=group_ids,
         parent_ids=parent_ids,
+        input_pos=position_ids,
+        sliding_windows=tuple(
+            int(window)
+            for window in getattr(runtime.provider, "art_flex_sliding_windows", ())
+        ),
         build_gdn_execution_spec=bool(
             getattr(runtime.model_support_handler, "build_gdn_execution_spec", False)
         ),
@@ -1023,6 +1038,7 @@ def _score_context_parallel_once(
     import torch
     import torch.distributed as dist
 
+    dist_any = cast(Any, dist)
     from art.megatron.context_parallel.types import ParallelTopology
     from art.megatron.training.microbatches import _prepare_current_rl_micro
     from art.megatron.training.trace import (
@@ -1090,9 +1106,9 @@ def _score_context_parallel_once(
             desired_uids=set(logical_uids),
         )
     gathered_records: list[dict[int, ScoreRecord]] = [
-        {} for _ in range(dist.get_world_size())
+        {} for _ in range(dist_any.get_world_size())
     ]
-    dist.all_gather_object(gathered_records, local_records)
+    dist_any.all_gather_object(gathered_records, local_records)
     return _score_bundle_from_records(
         records=_merge_score_records(gathered_records),
         logical_tokens=logical_tokens,
@@ -1112,55 +1128,65 @@ def score_context_parallel_runtime(
     rollout_mode: RolloutMode | None = "native_lora",
     global_grad_accumulation_sequences: int,
 ) -> ScoreBundle:
-    import torch
+    from art.megatron.training.microbatches import (
+        _clone_packed_tensors,
+        _zero_contribution_inputs,
+        build_micro_sample_indices,
+        select_indexed_inputs,
+        select_micro_inputs,
+    )
 
     controller = runtime.moe_routing_replay_controller
-    if controller is None:
-        return _score_context_parallel_once(
-            runtime=runtime,
-            packed_tensors=packed_tensors,
-            logical_tokens=logical_map.tokens,
-            sample_id_to_row=None,
-            side="megatron",
-            weight_state=weight_state,
-            rollout_mode=rollout_mode,
-        )
-
     target_logprobs: list[float] = []
     topk: list[TokenTopK] = []
     tokens_by_sample: dict[int, list[LogicalToken]] = {}
     for token in logical_map.tokens:
         tokens_by_sample.setdefault(token.sample_id, []).append(token)
     num_sequences = int(packed_tensors["tokens"].shape[0])
-    for sample_index in range(num_sequences):
-        sample_tensors = {
-            key: (
-                value[sample_index : sample_index + 1]
-                if isinstance(value, torch.Tensor)
-                and value.shape[:1] == packed_tensors["tokens"].shape[:1]
-                else value
-            )
-            for key, value in packed_tensors.items()
-        }
-        step_index = sample_index // global_grad_accumulation_sequences
-        controller.set_step(
+    template = _clone_packed_tensors(
+        select_indexed_inputs(cast(Any, packed_tensors), 0)
+    )
+    zero_template = _zero_contribution_inputs(template)
+    num_steps = math.ceil(num_sequences / global_grad_accumulation_sequences)
+    for step_index in range(num_steps):
+        micro_indices = build_micro_sample_indices(
             step_index=step_index,
-            sample_index=sample_index,
+            num_sequences=num_sequences,
             global_grad_accumulation_sequences=global_grad_accumulation_sequences,
         )
-        controller.begin_micro(sample_index, sample_index)
-        sample_score = _score_context_parallel_once(
-            runtime=runtime,
-            packed_tensors=sample_tensors,
-            logical_tokens=tokens_by_sample.get(sample_index, []),
-            sample_id_to_row={sample_index: 0},
-            side="megatron",
-            weight_state=weight_state,
-            rollout_mode=rollout_mode,
+        micro_inputs = select_micro_inputs(
+            cast(Any, packed_tensors),
+            micro_indices,
+            zero_template,
         )
-        controller.finalize_step()
-        target_logprobs.extend(sample_score.target_logprobs)
-        topk.extend(sample_score.topk)
+        if controller is not None:
+            controller.set_step(
+                step_index=step_index,
+                sample_index=micro_indices,
+                global_grad_accumulation_sequences=global_grad_accumulation_sequences,
+            )
+        for micro_order, (sample_index, micro_input) in enumerate(
+            zip(micro_indices, micro_inputs, strict=True)
+        ):
+            if controller is not None:
+                controller.begin_micro(sample_index, micro_order)
+            sample_score = _score_context_parallel_once(
+                runtime=runtime,
+                packed_tensors=cast(dict[str, Any], micro_input),
+                logical_tokens=(
+                    []
+                    if sample_index is None
+                    else tokens_by_sample.get(sample_index, [])
+                ),
+                sample_id_to_row=({} if sample_index is None else {sample_index: 0}),
+                side="megatron",
+                weight_state=weight_state,
+                rollout_mode=rollout_mode,
+            )
+            target_logprobs.extend(sample_score.target_logprobs)
+            topk.extend(sample_score.topk)
+        if controller is not None:
+            controller.finalize_step()
     return ScoreBundle(
         side="megatron",
         weight_state=weight_state,

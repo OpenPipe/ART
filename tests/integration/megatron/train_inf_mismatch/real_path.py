@@ -16,7 +16,12 @@ import uuid
 from openai.types.chat.chat_completion import Choice
 from pydantic import BaseModel, ConfigDict, Field
 
-from art.preprocessing.moe_routing import choice_moe_routing_metadata
+from art.dev.model import RolloutWeightsMode
+from art.preprocessing.moe_routing import (
+    MoeRoutingPackStats,
+    PackedMoeRoutingReplay,
+    choice_moe_routing_metadata,
+)
 from art.preprocessing.pack import DiskPackedTensors
 
 from .artifacts import REPO_ROOT
@@ -24,6 +29,7 @@ from .output_parity import (
     TOP_K,
     LogicalTokenMap,
     PairComparison,
+    RolloutMode,
     ScoreBundle,
     TokenTopK,
     TopKComparison,
@@ -60,6 +66,8 @@ class RealPathConfig(BaseModel):
     rollouts_per_prompt: int = 2
     max_completion_tokens: int = 16
     prompt_sentence_count: int = 28
+    prompt_target_tokens: int | None = None
+    sliding_window: int | None = None
     diagnose_base: bool = False
     trace_layers: bool = False
     trace_enforce_eager: bool = False
@@ -127,6 +135,16 @@ class RealPathTrainInfReport(BaseModel):
     passed: bool
 
 
+def _real_path_rollout_mode(config: TrainInfOutputParityConfig) -> RolloutMode:
+    return config.rollout_modes[0]
+
+
+def _real_path_rollout_weights_mode(
+    config: TrainInfOutputParityConfig,
+) -> RolloutWeightsMode:
+    return "lora" if _real_path_rollout_mode(config) == "native_lora" else "merged"
+
+
 _PROMPT_SENTENCES = [
     "A careful systems engineer checks assumptions before changing thresholds.",
     "The training batch contains shared prefixes and divergent completions.",
@@ -153,6 +171,7 @@ _PROMPT_SENTENCES = [
     "The run should not update weights just to measure a forward mismatch.",
     "Validation code belongs in tests unless production needs the behavior.",
 ]
+_PROMPT_TOKENS_PER_SENTENCE_ESTIMATE = 12
 
 
 def config_from_env() -> RealPathConfig:
@@ -167,6 +186,8 @@ def config_from_env() -> RealPathConfig:
         config.max_completion_tokens = int(raw)
     if raw := os.environ.get("ART_REAL_PATH_PROMPT_SENTENCE_COUNT"):
         config.prompt_sentence_count = int(raw)
+    if raw := os.environ.get("ART_REAL_PATH_PROMPT_TARGET_TOKENS"):
+        config.prompt_target_tokens = int(raw)
     if raw := os.environ.get("ART_REAL_PATH_DIAGNOSE_BASE"):
         config.diagnose_base = raw == "1"
     if raw := os.environ.get("ART_REAL_PATH_TRACE_LAYERS"):
@@ -178,6 +199,59 @@ def config_from_env() -> RealPathConfig:
     return config
 
 
+def _round_up(value: int, multiple: int) -> int:
+    return ((value + multiple - 1) // multiple) * multiple
+
+
+def _config_sliding_window(config: TrainInfOutputParityConfig) -> int | None:
+    from huggingface_hub import hf_hub_download
+
+    local_config_path = Path(config.base_model) / "config.json"
+    config_path = (
+        local_config_path
+        if local_config_path.exists()
+        else Path(hf_hub_download(config.base_model, "config.json"))
+    )
+    hf_config = _read_json(config_path)
+    text_config = hf_config.get("text_config", hf_config)
+    if not isinstance(text_config, dict):
+        return None
+    layer_types = tuple(str(value) for value in text_config.get("layer_types", ()))
+    if not any("sliding" in layer_type for layer_type in layer_types):
+        return None
+    window = text_config.get("sliding_window")
+    if window is None:
+        return None
+    return int(window)
+
+
+def _apply_sliding_window_prompt_defaults(config: RealPathConfig) -> None:
+    window = _config_sliding_window(config.output_parity)
+    if window is None:
+        return
+    config.sliding_window = window
+    if config.prompt_target_tokens is None:
+        config.prompt_target_tokens = 2 * window
+    config.prompt_sentence_count = max(
+        config.prompt_sentence_count,
+        (config.prompt_target_tokens + _PROMPT_TOKENS_PER_SENTENCE_ESTIMATE - 1)
+        // _PROMPT_TOKENS_PER_SENTENCE_ESTIMATE,
+    )
+    min_sequence_length = _round_up(
+        config.prompt_target_tokens + config.max_completion_tokens + 256,
+        128,
+    )
+    if config.output_parity.packed.sequence_length < min_sequence_length:
+        config.output_parity.packed.sequence_length = min_sequence_length
+
+
+def _build_prompt_from_sentences(index: int, sentences: list[str]) -> str:
+    return (
+        "Write a concise continuation for probe "
+        f"{index}. Preserve the technical tone.\n\n" + " ".join(sentences)
+    )
+
+
 def _build_prompts(config: RealPathConfig) -> list[str]:
     rng = random.Random(config.output_parity.seed)
     prompts: list[str] = []
@@ -185,10 +259,7 @@ def _build_prompts(config: RealPathConfig) -> list[str]:
         sentences = [
             rng.choice(_PROMPT_SENTENCES) for _ in range(config.prompt_sentence_count)
         ]
-        prompts.append(
-            "Write a concise continuation for probe "
-            f"{index}. Preserve the technical tone.\n\n" + " ".join(sentences)
-        )
+        prompts.append(_build_prompt_from_sentences(index, sentences))
     return prompts
 
 
@@ -411,6 +482,7 @@ def _vllm_scores_from_real_choices(
     logical_map: LogicalTokenMap,
     require_routing_metadata: bool,
     weight_state: WeightState,
+    rollout_mode: RolloutMode,
 ) -> ScoreBundle:
     choices_by_tokens = _choice_score_index(
         trajectory_groups,
@@ -470,7 +542,7 @@ def _vllm_scores_from_real_choices(
     return ScoreBundle(
         side="vllm",
         weight_state=weight_state,
-        rollout_mode="native_lora",
+        rollout_mode=rollout_mode,
         target_logprobs=target_logprobs,
         topk=topk,
     )
@@ -484,7 +556,6 @@ async def _score_base_real_generation_path(
 ) -> RealPathBaseDiagnosticBundle:
     import art
     from art.megatron.backend import MegatronBackend
-    from art.preprocessing.moe_routing import MoeRoutingPackStats
     from art.preprocessing.pack import packed_tensors_to_dir
 
     parity_config = config.output_parity
@@ -503,7 +574,6 @@ async def _score_base_real_generation_path(
     engine_args.pop("lora_target_modules", None)
     if is_moe:
         engine_args["enable_return_routed_experts"] = True
-        engine_args["async_scheduling"] = False
     vllm_forward_trace_dir = (
         artifact_dir / "real_path_base_vllm_forward_trace"
         if config.trace_layers
@@ -570,6 +640,7 @@ async def _score_base_real_generation_path(
         logical_map=logical_map,
         require_routing_metadata=is_moe,
         weight_state="base",
+        rollout_mode="merged",
     )
     vllm_score_path = artifact_dir / "real_path_vllm_base_scores.json"
     _write_json(vllm_score_path, vllm_base.model_dump(mode="json"))
@@ -584,7 +655,10 @@ async def _score_base_real_generation_path(
             global_grad_accumulation_sequences=global_grad_accumulation_sequences,
         ).to_dir(routing_replay_dir)
         routing_replay_path = str(routing_replay_dir)
-        stats = packed_tensors["moe_routing_replay"].pack_stats
+        routing_replay = cast(
+            PackedMoeRoutingReplay, packed_tensors["moe_routing_replay"]
+        )
+        stats = routing_replay.pack_stats
     else:
         stats = MoeRoutingPackStats()
 
@@ -665,6 +739,21 @@ def _routing_topology_from_config(config: TrainInfOutputParityConfig) -> Any:
         sp=config.topology.tp > 1,
         cp=config.topology.cp,
         pp=config.topology.pp,
+    )
+
+
+def _init_art_megatron_runtime_config(config: TrainInfOutputParityConfig) -> None:
+    import art
+
+    art.init_megatron_runtime_config(
+        topology=art.MegatronTopologyConfig(
+            tp=config.topology.tp,
+            cp=config.topology.cp,
+            ep=config.topology.ep,
+            pp=config.topology.pp,
+            etp=config.topology.etp,
+        ),
+        packed_sequence_length=config.packed.sequence_length,
     )
 
 
@@ -754,6 +843,7 @@ def _score_megatron_runtime(
     packed_tensors: dict[str, Any],
     logical_map: LogicalTokenMap,
     weight_state: WeightState,
+    rollout_mode: RolloutMode,
     global_grad_accumulation_sequences: int,
     forward_trace_capture: Any | None,
     forward_trace_dir: str | None,
@@ -774,7 +864,7 @@ def _score_megatron_runtime(
             packed_tensors=packed_tensors,
             logical_map=logical_map,
             weight_state=weight_state,
-            rollout_mode="native_lora",
+            rollout_mode=rollout_mode,
             global_grad_accumulation_sequences=global_grad_accumulation_sequences,
         )
 
@@ -796,7 +886,7 @@ def _score_megatron_runtime(
         logical_map=logical_map,
         side="megatron",
         weight_state=weight_state,
-        rollout_mode="native_lora",
+        rollout_mode=rollout_mode,
     )
 
 
@@ -913,6 +1003,7 @@ def _real_path_megatron_worker(
         packed_tensors=cast(dict[str, Any], packed_tensors),
         logical_map=logical_map,
         weight_state=request.weight_state,
+        rollout_mode=_real_path_rollout_mode(request.config),
         global_grad_accumulation_sequences=request.global_grad_accumulation_sequences,
         forward_trace_capture=forward_trace_capture,
         forward_trace_dir=request.forward_trace_dir,
@@ -1020,6 +1111,8 @@ async def run_real_path_train_inf_mismatch(
     from art.preprocessing.pack import packed_tensors_to_dir
 
     parity_config = config.output_parity
+    _apply_sliding_window_prompt_defaults(config)
+    rollout_mode = _real_path_rollout_mode(parity_config)
     is_moe = model_support_is_moe(
         parity_config.base_model,
         allow_unvalidated_arch=parity_config.allow_unvalidated_arch,
@@ -1031,6 +1124,7 @@ async def run_real_path_train_inf_mismatch(
     if not adapter_path:
         raise RuntimeError("Real-path adapter worker did not create an adapter")
 
+    _init_art_megatron_runtime_config(parity_config)
     backend = MegatronBackend(
         path=str(artifact_dir / "art_path"),
         enable_expert_replay=is_moe,
@@ -1040,10 +1134,15 @@ async def run_real_path_train_inf_mismatch(
         name=f"train-inf-real-{uuid.uuid4().hex[:8]}",
         project="train_inf_mismatch",
         base_model=parity_config.base_model,
+        lora_config=(
+            {"target_modules": _lora_target_modules(parity_config)}
+            if parity_config.lora_target_modules is not None
+            else None
+        ),
         _internal_config={
             "trainer_gpu_ids": parity_config.trainer_gpu_ids,
             "inference_gpu_ids": parity_config.inference_gpu_ids,
-            "rollout_weights_mode": "lora",
+            "rollout_weights_mode": _real_path_rollout_weights_mode(parity_config),
             "allow_unvalidated_arch": parity_config.allow_unvalidated_arch,
             "engine_args": {
                 "tensor_parallel_size": len(parity_config.inference_gpu_ids),
@@ -1103,11 +1202,11 @@ async def run_real_path_train_inf_mismatch(
             cast(dict[str, Any], disk_packed_tensors),
         )
         if is_moe:
-            routing_replay = packed_tensors["moe_routing_replay"]
+            routing_replay = cast(
+                PackedMoeRoutingReplay, packed_tensors["moe_routing_replay"]
+            )
             stats = routing_replay.pack_stats
         else:
-            from art.preprocessing.moe_routing import MoeRoutingPackStats
-
             stats = MoeRoutingPackStats()
 
         vllm_lora = _vllm_scores_from_real_choices(
@@ -1115,6 +1214,7 @@ async def run_real_path_train_inf_mismatch(
             logical_map=logical_map,
             require_routing_metadata=is_moe,
             weight_state="lora",
+            rollout_mode=rollout_mode,
         )
         _write_json(
             artifact_dir / "real_path_vllm_lora_scores.json",

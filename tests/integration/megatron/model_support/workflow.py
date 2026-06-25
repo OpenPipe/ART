@@ -49,14 +49,17 @@ MANDATORY_VALIDATION_STAGES = (
     "correctness_sensitivity",
     "chat_template_rollout",
     "packed_position_ids",
-    "yes_no_trainability",
+    "length_trainability",
 )
 NATIVE_VLLM_LORA_STAGE = "native_vllm_lora"
+YES_NO_TRAINABILITY_STAGE = "yes_no_trainability"
 ARCHITECTURE_REPRESENTATIVE_MODELS = {
     "qwen3_moe": "Qwen/Qwen3-30B-A3B",
     "qwen3_dense": "Qwen/Qwen3-32B",
     "qwen3_5_moe": "Qwen/Qwen3.5-35B-A3B",
     "qwen3_5_dense": "Qwen/Qwen3.5-27B",
+    "gemma4_moe": "google/gemma-4-26B-A4B-it",
+    "gemma4_dense": "google/gemma-4-31B-it",
 }
 SUBPROCESS_VALIDATION_STAGES = frozenset(
     {
@@ -67,7 +70,8 @@ SUBPROCESS_VALIDATION_STAGES = frozenset(
         "correctness_sensitivity",
         "chat_template_rollout",
         "packed_position_ids",
-        "yes_no_trainability",
+        "length_trainability",
+        YES_NO_TRAINABILITY_STAGE,
         NATIVE_VLLM_LORA_STAGE,
     }
 )
@@ -81,9 +85,12 @@ class AllArchitecturesValidationReport(BaseModel):
 def build_validation_stage_names(
     *,
     include_native_vllm_lora: bool = False,
+    include_yes_no_trainability: bool = False,
     native_vllm_lora_status: NativeVllmLoraStatus | None = None,
 ) -> list[str]:
     stages = list(MANDATORY_VALIDATION_STAGES)
+    if include_yes_no_trainability:
+        stages.append(YES_NO_TRAINABILITY_STAGE)
     if include_native_vllm_lora or native_vllm_lora_status not in {None, "disabled"}:
         stages.append(NATIVE_VLLM_LORA_STAGE)
     return stages
@@ -103,6 +110,7 @@ def initialize_validation_report(
     *,
     base_model: str,
     include_native_vllm_lora: bool = False,
+    include_yes_no_trainability: bool = False,
     allow_unvalidated_arch: bool = False,
 ) -> ValidationReport:
     spec = get_model_support_spec(
@@ -119,6 +127,7 @@ def initialize_validation_report(
             ValidationStageResult(name=stage_name)
             for stage_name in build_validation_stage_names(
                 include_native_vllm_lora=include_native_vllm_lora,
+                include_yes_no_trainability=include_yes_no_trainability,
                 native_vllm_lora_status=handler.native_vllm_lora_status,
             )
         ],
@@ -417,11 +426,13 @@ def run_train_inf_mismatch_stage(
     allow_unvalidated_arch: bool = False,
 ) -> ValidationStageResult:
     del architecture
-    del allow_unvalidated_arch
     train_inf_mismatch = _import_integration_module(
         "integration.megatron.train_inf_mismatch.workflow_stage"
     )
-    report = train_inf_mismatch.run_train_inf_mismatch(base_model=base_model)
+    report = train_inf_mismatch.run_train_inf_mismatch(
+        base_model=base_model,
+        allow_unvalidated_arch=allow_unvalidated_arch,
+    )
     return ValidationStageResult(
         name="train_inf_mismatch",
         passed=report.passed,
@@ -666,10 +677,32 @@ def run_yes_no_trainability_stage(
         and report.final_eval_reward > report.initial_eval_reward
     )
     return ValidationStageResult(
-        name="yes_no_trainability",
+        name=YES_NO_TRAINABILITY_STAGE,
         passed=passed,
         metrics=report.model_dump(mode="json"),
         artifact_dir=report.output_dir,
+    )
+
+
+def run_length_trainability_stage(
+    *,
+    base_model: str,
+    architecture: ArchitectureReport,
+    allow_unvalidated_arch: bool = False,
+) -> ValidationStageResult:
+    del architecture
+    length_trainability = _import_integration_module(
+        "integration.megatron.trainability.test_live_length_trainability"
+    )
+    report = length_trainability.run_length_trainability(
+        base_model=base_model,
+        allow_unvalidated_arch=allow_unvalidated_arch,
+    )
+    return ValidationStageResult(
+        name="length_trainability",
+        passed=length_trainability.length_trainability_passed(report),
+        metrics=report.model_dump(mode="json"),
+        artifact_dir=str(Path(report.summary_log_path).parent),
     )
 
 
@@ -747,6 +780,7 @@ def build_validation_report(
     *,
     base_model: str,
     include_native_vllm_lora: bool = False,
+    include_yes_no_trainability: bool = False,
     include_sensitivity: bool | None = None,
     output_json: str | Path | None = None,
     skip_stages: set[str] | None = None,
@@ -756,6 +790,7 @@ def build_validation_report(
     report = initialize_validation_report(
         base_model=base_model,
         include_native_vllm_lora=include_native_vllm_lora,
+        include_yes_no_trainability=include_yes_no_trainability,
         allow_unvalidated_arch=allow_unvalidated_arch,
     )
     stage_runners = {
@@ -766,7 +801,8 @@ def build_validation_report(
         "correctness_sensitivity": run_correctness_sensitivity_stage,
         "chat_template_rollout": run_chat_template_rollout_stage,
         "packed_position_ids": run_packed_position_ids_stage,
-        "yes_no_trainability": run_yes_no_trainability_stage,
+        "length_trainability": run_length_trainability_stage,
+        YES_NO_TRAINABILITY_STAGE: run_yes_no_trainability_stage,
         NATIVE_VLLM_LORA_STAGE: run_native_vllm_lora_stage,
     }
     env = (
@@ -851,6 +887,7 @@ def build_validation_report(
 
 def build_all_architectures_validation_report(
     *,
+    include_yes_no_trainability: bool = False,
     include_sensitivity: bool | None = None,
     output_json: str | Path | None = None,
     skip_stages: set[str] | None = None,
@@ -866,6 +903,7 @@ def build_all_architectures_validation_report(
         ).key
         report = build_validation_report(
             base_model=base_model,
+            include_yes_no_trainability=include_yes_no_trainability,
             include_sensitivity=include_sensitivity,
             output_json=(
                 _per_architecture_output_json(output_json, model_key)
@@ -897,6 +935,7 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--output-json", required=True)
     parser.add_argument("--allow-unsupported-arch", action="store_true")
     parser.add_argument("--include-sensitivity", action="store_true")
+    parser.add_argument("--include-yes-no-trainability", action="store_true")
     parser.add_argument("--skip-stage", action="append", default=[])
     parser.add_argument("--stop-on-failure", action="store_true")
     return parser.parse_args(argv)
@@ -906,6 +945,7 @@ def main(argv: list[str] | None = None) -> int:
     args = _parse_args(argv)
     if args.all_architectures:
         all_report = build_all_architectures_validation_report(
+            include_yes_no_trainability=args.include_yes_no_trainability,
             include_sensitivity=args.include_sensitivity,
             output_json=args.output_json,
             skip_stages=set(args.skip_stage),
@@ -925,6 +965,7 @@ def main(argv: list[str] | None = None) -> int:
         return 0 if all_report.passed else 1
     report = build_validation_report(
         base_model=args.base_model,
+        include_yes_no_trainability=args.include_yes_no_trainability,
         include_sensitivity=args.include_sensitivity,
         output_json=args.output_json,
         skip_stages=set(args.skip_stage),

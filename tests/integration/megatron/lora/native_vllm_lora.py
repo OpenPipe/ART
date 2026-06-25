@@ -10,6 +10,7 @@ import tempfile
 from pydantic import BaseModel, Field
 import torch
 
+import art
 from art import dev
 from art.megatron.service import MegatronService
 from art.utils.output_dirs import get_step_checkpoint_dir
@@ -105,6 +106,19 @@ def _copy_adapter_checkpoint(source_dir: str, dest_dir: str) -> None:
         shutil.copy(Path(source_dir) / filename, Path(dest_dir) / filename)
 
 
+def _init_runtime_config(case_config: OracleCaseConfig) -> None:
+    art.init_megatron_runtime_config(
+        topology=art.MegatronTopologyConfig(
+            tp=ORACLE_TOPOLOGY.tp,
+            cp=ORACLE_TOPOLOGY.cp,
+            ep=ORACLE_TOPOLOGY.ep,
+            pp=ORACLE_TOPOLOGY.pp,
+            etp=ORACLE_TOPOLOGY.etp,
+        ),
+        packed_sequence_length=case_config.packed_tensors.sequence_length,
+    )
+
+
 async def _run_native_vllm_lora(
     case_config: OracleCaseConfig,
 ) -> NativeVllmLoraServingReport:
@@ -122,6 +136,7 @@ async def _run_native_vllm_lora(
     )
     dev.validate_dedicated_config(internal_config)
     with provider_topology_env(ORACLE_TOPOLOGY):
+        _init_runtime_config(case_config)
         service = MegatronService(
             model_name=service_name,
             base_model=case_config.base_model,

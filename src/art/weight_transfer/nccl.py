@@ -221,20 +221,32 @@ class _BootstrapGroup:
             listen_fd = listen_socket.fileno()
         self.rank = rank
         self.world_size = world_size
-        self.socket = listen_socket
-        self.store = TCPStore(
-            host_name=host,
-            port=port,
-            world_size=world_size,
-            is_master=launch_server,
-            timeout=timedelta(seconds=store_timeout),
-            use_libuv=False,
-            master_listen_fd=listen_fd,
-        )
+        self.store: TCPStore | None = None
+        try:
+            self.store = TCPStore(
+                host_name=host,
+                port=port,
+                world_size=world_size,
+                is_master=launch_server,
+                timeout=timedelta(seconds=store_timeout),
+                use_libuv=False,
+                master_listen_fd=listen_fd,
+            )
+            if listen_socket is not None:
+                # TCPStore owns master_listen_fd after construction. Detach the
+                # Python socket so its close/finalizer cannot invalidate the
+                # store's listening fd while the bootstrap server is alive.
+                listen_socket.detach()
+                listen_socket = None
+        finally:
+            if listen_socket is not None:
+                listen_socket.close()
         self._broadcast_send_counter = 0
         self._broadcast_recv_counter = {value: 0 for value in range(world_size)}
 
     def broadcast_obj(self, obj: Any | None, *, src: int) -> Any:
+        if self.store is None:
+            raise RuntimeError("NCCL bootstrap group is closed")
         if self.rank == src:
             key = f"broadcast_from/{src}/{self._broadcast_send_counter}"
             self.store.set(key, cast(Any, pickle.dumps(obj)))
@@ -246,9 +258,7 @@ class _BootstrapGroup:
         return received
 
     def close(self) -> None:
-        if self.socket is not None:
-            self.socket.close()
-            self.socket = None
+        self.store = None
 
 
 def _canonical_cuda_device(device: int | torch.device) -> torch.device:
@@ -282,18 +292,28 @@ class TrainerNcclCommunicator:
         self.rank = rank
         self.world_size = world_size
         self._nccl = _NcclLibrary(nccl_so_path)
+        self._comm = None
         unique_id_bytes = (
             _nccl_unique_id_to_bytes(self._nccl.get_unique_id()) if rank == 0 else None
         )
-        unique_id = _nccl_unique_id_from_bytes(
-            bootstrap_group.broadcast_obj(unique_id_bytes, src=0)
-        )
-        with torch.cuda.device(self.device):
-            self._comm = self._nccl.init_rank(world_size, unique_id, rank)
-            stream = torch.cuda.current_stream(self.device)
-            warmup = torch.zeros(1, device=self.device)
-            self.all_reduce(warmup, stream=stream)
-            stream.synchronize()
+        try:
+            unique_id = _nccl_unique_id_from_bytes(
+                bootstrap_group.broadcast_obj(unique_id_bytes, src=0)
+            )
+            with torch.cuda.device(self.device):
+                self._comm = self._nccl.init_rank(world_size, unique_id, rank)
+                stream = torch.cuda.current_stream(self.device)
+                warmup = torch.zeros(1, device=self.device)
+                self.all_reduce(warmup, stream=stream)
+                stream.synchronize()
+        finally:
+            self._close_bootstrap_group()
+
+    def _close_bootstrap_group(self) -> None:
+        bootstrap_group = self._bootstrap_group
+        self._bootstrap_group = None
+        if bootstrap_group is not None:
+            bootstrap_group.close()
 
     def _require_comm(self) -> Any:
         if self._comm is None:
@@ -321,7 +341,7 @@ class TrainerNcclCommunicator:
         try:
             self._nccl.destroy_comm(comm)
         finally:
-            self._bootstrap_group.close()
+            self._close_bootstrap_group()
 
     def abort(self) -> None:
         comm = self._comm
@@ -331,7 +351,7 @@ class TrainerNcclCommunicator:
         try:
             self._nccl.abort_comm(comm)
         finally:
-            self._bootstrap_group.close()
+            self._close_bootstrap_group()
 
     def all_reduce(
         self,

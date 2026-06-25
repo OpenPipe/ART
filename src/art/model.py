@@ -26,6 +26,7 @@ from .metrics_taxonomy import (
     summarize_trajectory_groups,
 )
 from .preprocessing.moe_routing import attach_moe_routing_metadata_to_choice
+from .preprocessing.vllm_tokens import attach_vllm_token_metadata_to_choice
 from .trajectories import Trajectory, TrajectoryGroup
 from .types import SFTMetricLoggingConfig, TrainSFTConfig
 from .utils.trajectory_logging import write_trajectory_groups_parquet
@@ -60,13 +61,18 @@ def _merge_extra_body_defaults(
     return merged
 
 
-def _attach_response_moe_routing_metadata(response: Any) -> None:
+def _attach_response_art_metadata(response: Any) -> None:
     choices = getattr(response, "choices", None)
     model_dump = getattr(response, "model_dump", None)
     if not choices or not callable(model_dump):
         return
     response_payload = model_dump(mode="python")
     for choice_index, choice in enumerate(choices):
+        attach_vllm_token_metadata_to_choice(
+            choice=choice,
+            response_payload=response_payload,
+            choice_index=choice_index,
+        )
         attach_moe_routing_metadata_to_choice(
             choice=choice,
             response_payload=response_payload,
@@ -92,7 +98,7 @@ class _OpenAIChatCompletionsProxy:
                 kwargs.get("extra_body"),
             )
         response = await self._completions.create(*args, **kwargs)
-        _attach_response_moe_routing_metadata(response)
+        _attach_response_art_metadata(response)
         self._record_costs(response)
         return response
 
@@ -385,12 +391,22 @@ class Model(
 
     def _default_chat_completion_extra_body(self) -> dict[str, Any] | None:
         internal_config = getattr(self, "_internal_config", None)
-        if internal_config is None:
+        if internal_config is None and not self.trainable:
             return None
-        chat_template_kwargs = internal_config.get("chat_template_kwargs")
-        if chat_template_kwargs is None:
+        body: dict[str, Any] = {}
+        if self.trainable:
+            body["return_token_ids"] = True
+            body["return_tokens_as_token_ids"] = True
+        chat_template_kwargs = (
+            internal_config.get("chat_template_kwargs")
+            if internal_config is not None
+            else None
+        )
+        if chat_template_kwargs is not None:
+            body["chat_template_kwargs"] = dict(chat_template_kwargs)
+        if not body:
             return None
-        return {"chat_template_kwargs": dict(chat_template_kwargs)}
+        return body
 
     def litellm_completion_params(self, step: int | None = None) -> dict:
         """Return the parameters that should be sent to litellm.completion.

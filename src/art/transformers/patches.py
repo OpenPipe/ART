@@ -13,23 +13,31 @@ _preprocess_mask_arguments = masking_utils._preprocess_mask_arguments
 
 def _patched_preprocess_mask_arguments(
     config: PretrainedConfig,
-    input_embeds: torch.Tensor,
+    inputs_embeds: torch.Tensor,
     attention_mask: Optional[Union[torch.Tensor, "BlockMask"]],
-    cache_position: torch.Tensor,
     past_key_values: Optional[Cache],
     position_ids: Optional[torch.Tensor],
     layer_idx: Optional[int],
-) -> tuple[bool, Optional[Union[torch.Tensor, "BlockMask"]], int, int]:
+    encoder_hidden_states: Optional[torch.Tensor] = None,
+) -> tuple[
+    bool,
+    Optional[Union[torch.Tensor, "BlockMask"]],
+    Optional[torch.Tensor],
+    int,
+    int,
+    int,
+    int,
+]:
     if position_ids is not None and len(position_ids.shape) == 3:
         position_ids = position_ids[0]
     return _preprocess_mask_arguments(
         config,
-        input_embeds,
+        inputs_embeds,
         attention_mask,
-        cache_position,
         past_key_values,
         position_ids,
         layer_idx,
+        encoder_hidden_states,
     )
 
 

@@ -12,6 +12,7 @@ import triton.language as tl
 from art.megatron.flex_attn.compiled import (
     SparseBlockSize,
     flash_sparse_block_size_for_head_dim,
+    flex_backend_for_head_dims,
     get_sparse_compiled_flex_attention,
     normalize_flex_lse,
     normalize_sparse_block_size,
@@ -29,6 +30,7 @@ from .range_ops import (
 from .types import (
     ArtContextParallelState,
     AttnSlice,
+    CpBlockMaskVariant,
     DkvReducePlan,
     ExactMaskMetadata,
     FlexMaskSpec,
@@ -55,10 +57,6 @@ def _stage_sparse_block_size(
         head_dim_v=int(v_stage.shape[-1]),
         device=q_stage.device,
     )
-
-
-def _execution_sparse_block_size(state: ArtContextParallelState) -> SparseBlockSize:
-    return state.config.attention_sparse_block_size or state.config.block_size
 
 
 def _pad_exact_indices(indices: torch.Tensor, target_len: int) -> torch.Tensor:
@@ -581,11 +579,19 @@ def unflatten_valid_sequence_head_major(
 
 
 class FlexAttentionKernel:
-    def __init__(self, *, compile_enabled: bool) -> None:
+    def __init__(
+        self,
+        *,
+        compile_enabled: bool,
+        triton_num_stages_2_head_dims: tuple[int, ...] = (),
+    ) -> None:
         if not compile_enabled:
             raise RuntimeError(
                 "ART context parallel attention requires compiled flex attention."
             )
+        self.triton_num_stages_2_head_dims = tuple(
+            int(dim) for dim in triton_num_stages_2_head_dims
+        )
 
     def run(
         self,
@@ -612,6 +618,10 @@ class FlexAttentionKernel:
             raise RuntimeError(
                 "ART context parallel attention requires a concrete block mask for compiled flex attention."
             )
+        backend = flex_backend_for_head_dims(
+            head_dim=int(q.shape[-1]),
+            head_dim_v=int(v.shape[-1]),
+        )
         if compile_key is None:
             _q_len, _k_len, compile_key = select_sparse_execution_family(
                 is_local_stage=bool(is_local_stage),
@@ -621,9 +631,13 @@ class FlexAttentionKernel:
             )
         compiled_flex_attention = (
             sparse_compiled_flex_attention
-            if str(compile_key) == "sparse"
+            if str(compile_key) == "sparse" and backend == "FLASH"
             else get_sparse_compiled_flex_attention(
                 family_key=str(compile_key),
+                backend=backend,
+                head_dim=int(q.shape[-1]),
+                head_dim_v=int(v.shape[-1]),
+                triton_num_stages_2_head_dims=self.triton_num_stages_2_head_dims,
             )
         )
         out, aux = cast(
@@ -641,7 +655,7 @@ class FlexAttentionKernel:
         lse = aux.lse
         if lse is None:
             raise RuntimeError("Compiled flex attention did not return lse.")
-        lse = normalize_flex_lse(lse)
+        lse = normalize_flex_lse(lse, backend=backend)
         return out, lse
 
 
@@ -652,10 +666,11 @@ def _build_stage_block_mask(
     device: torch.device,
     execution_spec: StageExecutionSpec | None = None,
     block_size: SparseBlockSize | None = None,
+    sliding_window: int | None = None,
 ) -> BlockMask | None:
-    resolved_block_size = normalize_sparse_block_size(
-        _execution_sparse_block_size(state) if block_size is None else block_size
-    )
+    if block_size is None:
+        block_size = state.config.attention_sparse_block_size or state.config.block_size
+    resolved_block_size = normalize_sparse_block_size(block_size)
     execution_spec = (
         _resolve_stage_execution_spec(
             stage_plan=stage_plan,
@@ -669,6 +684,7 @@ def _build_stage_block_mask(
         stage_plan=stage_plan,
         execution_spec=execution_spec,
         block_size=resolved_block_size,
+        sliding_window=sliding_window,
         device=device,
     )
     cache = state.execution_cache.block_masks
@@ -689,6 +705,7 @@ def _build_stage_block_mask(
         block_mask_context = prepare_block_mask_context(
             group_ids=state.group_ids,
             parent_ids=state.parent_ids,
+            input_pos=state.input_pos,
         )
         state.execution_cache.block_mask_context = block_mask_context
     mask = build_block_mask_from_context(
@@ -700,6 +717,7 @@ def _build_stage_block_mask(
             exact_mask=mask_metadata,
         ),
         context=block_mask_context,
+        sliding_window=sliding_window,
         device=device,
         validate=False,
     )
@@ -714,12 +732,13 @@ def _get_prepared_stage_block_mask(
     device: torch.device,
     execution_spec: StageExecutionSpec,
     block_size: SparseBlockSize,
+    sliding_window: int | None,
 ) -> BlockMask:
-    resolved_block_size = normalize_sparse_block_size(block_size)
     cache_key = _stage_block_mask_cache_key(
         stage_plan=stage_plan,
         execution_spec=execution_spec,
-        block_size=resolved_block_size,
+        block_size=normalize_sparse_block_size(block_size),
+        sliding_window=sliding_window,
         device=device,
     )
     cache = state.execution_cache.block_masks
@@ -728,15 +747,16 @@ def _get_prepared_stage_block_mask(
             "ART context parallel forward hit an unprepared stage block-mask cache key. "
             "Mask construction is CPU planning work and must finish before model forward. "
             f"stage={int(stage_plan.stage_index)} q_len={int(execution_spec.q_len)} "
-            f"k_len={int(execution_spec.k_len)} block_size={resolved_block_size} "
-            f"device={device}"
+            f"k_len={int(execution_spec.k_len)} "
+            f"block_size={normalize_sparse_block_size(block_size)} "
+            f"sliding_window={sliding_window} device={device}"
         )
     block_mask = cache[cache_key]
     if block_mask is None:
         raise RuntimeError(
             "ART context parallel forward found an empty prepared block mask for a non-empty stage. "
             f"stage={int(stage_plan.stage_index)} q_len={int(execution_spec.q_len)} "
-            f"k_len={int(execution_spec.k_len)}"
+            f"k_len={int(execution_spec.k_len)} sliding_window={sliding_window}"
         )
     return cast(BlockMask, block_mask)
 
@@ -746,13 +766,15 @@ def _stage_block_mask_cache_key(
     stage_plan: StagePlan,
     execution_spec: StageExecutionSpec,
     block_size: tuple[int, int],
+    sliding_window: int | None,
     device: torch.device,
-) -> tuple[int, int, int, tuple[int, int], str, int | None]:
+) -> tuple[int, int, int, tuple[int, int], int | None, str, int | None]:
     return (
         int(stage_plan.stage_index),
         int(execution_spec.q_len),
         int(execution_spec.k_len),
         block_size,
+        None if sliding_window is None else int(sliding_window),
         device.type,
         device.index,
     )
@@ -763,22 +785,29 @@ def prepare_context_parallel_execution_state(
     state: ArtContextParallelState,
     device: torch.device,
 ) -> None:
-    block_size = _execution_sparse_block_size(state)
+    variants = state.block_mask_variants or (
+        CpBlockMaskVariant(
+            sliding_window=None,
+            block_size=normalize_sparse_block_size(state.config.block_size),
+        ),
+    )
     for stage_plan in state.rank_plan.stage_plans:
         if stage_plan.q_len <= 0 or stage_plan.k_len <= 0 or not stage_plan.slices:
             continue
-        execution_spec = _resolve_stage_execution_spec(
-            stage_plan=stage_plan,
-            state=state,
-            block_size=block_size,
-        )
-        _build_stage_block_mask(
-            stage_plan=stage_plan,
-            state=state,
-            device=device,
-            execution_spec=execution_spec,
-            block_size=block_size,
-        )
+        for variant in variants:
+            execution_spec = _resolve_stage_execution_spec(
+                stage_plan=stage_plan,
+                state=state,
+                block_size=variant.block_size,
+            )
+            _build_stage_block_mask(
+                stage_plan=stage_plan,
+                state=state,
+                device=device,
+                execution_spec=execution_spec,
+                block_size=variant.block_size,
+                sliding_window=variant.sliding_window,
+            )
 
 
 def _validate_stage_block_alignment(
@@ -835,63 +864,53 @@ def _resolve_stage_execution_spec(
     resolved_block_size = normalize_sparse_block_size(
         state.config.block_size if block_size is None else block_size
     )
-    cache_key = _stage_execution_spec_cache_key(
-        stage_plan=stage_plan,
-        block_size=resolved_block_size,
-    )
-    cache = state.execution_cache.stage_execution_specs
+    cache_key = (int(stage_plan.stage_index), resolved_block_size)
+    execution_cache = getattr(state, "execution_cache", None)
+    if execution_cache is None:
+        target_q_len, target_k_len, compile_key = select_sparse_execution_family(
+            is_local_stage=bool(stage_plan.is_local_stage),
+            q_len=int(stage_plan.q_len),
+            k_len=int(stage_plan.k_len),
+            block_size=resolved_block_size,
+        )
+        return StageExecutionSpec(
+            q_len=int(target_q_len),
+            k_len=int(target_k_len),
+            compile_key=str(compile_key),
+            mask_metadata=_resize_exact_mask_metadata(
+                stage_plan.mask_metadata,
+                q_len=int(target_q_len),
+                k_len=int(target_k_len),
+            ),
+        )
+    cache = getattr(execution_cache, "stage_execution_specs", None)
+    if cache is None:
+        target_q_len, target_k_len, compile_key = select_sparse_execution_family(
+            is_local_stage=bool(stage_plan.is_local_stage),
+            q_len=int(stage_plan.q_len),
+            k_len=int(stage_plan.k_len),
+            block_size=resolved_block_size,
+        )
+        return StageExecutionSpec(
+            q_len=int(target_q_len),
+            k_len=int(target_k_len),
+            compile_key=str(compile_key),
+            mask_metadata=_resize_exact_mask_metadata(
+                stage_plan.mask_metadata,
+                q_len=int(target_q_len),
+                k_len=int(target_k_len),
+            ),
+        )
     cached = cache.get(cache_key)
     if cached is not None:
         return cached
-    resolved = _build_stage_execution_spec(
-        stage_plan=stage_plan,
-        block_size=resolved_block_size,
-    )
-    cache[cache_key] = resolved
-    return resolved
-
-
-def _get_prepared_stage_execution_spec(
-    *,
-    stage_plan: StagePlan,
-    state: ArtContextParallelState,
-    block_size: SparseBlockSize,
-) -> StageExecutionSpec:
-    resolved_block_size = normalize_sparse_block_size(block_size)
-    cache_key = _stage_execution_spec_cache_key(
-        stage_plan=stage_plan,
-        block_size=resolved_block_size,
-    )
-    cached = state.execution_cache.stage_execution_specs.get(cache_key)
-    if cached is None:
-        raise RuntimeError(
-            "ART context parallel forward hit an unprepared stage execution-spec cache key. "
-            "Execution planning must finish before model forward. "
-            f"stage={int(stage_plan.stage_index)} block_size={resolved_block_size}"
-        )
-    return cached
-
-
-def _stage_execution_spec_cache_key(
-    *,
-    stage_plan: StagePlan,
-    block_size: tuple[int, int],
-) -> tuple[int, tuple[int, int]]:
-    return (int(stage_plan.stage_index), block_size)
-
-
-def _build_stage_execution_spec(
-    *,
-    stage_plan: StagePlan,
-    block_size: tuple[int, int],
-) -> StageExecutionSpec:
     target_q_len, target_k_len, compile_key = select_sparse_execution_family(
         is_local_stage=bool(stage_plan.is_local_stage),
         q_len=int(stage_plan.q_len),
         k_len=int(stage_plan.k_len),
-        block_size=block_size,
+        block_size=resolved_block_size,
     )
-    return StageExecutionSpec(
+    resolved = StageExecutionSpec(
         q_len=int(target_q_len),
         k_len=int(target_k_len),
         compile_key=str(compile_key),
@@ -901,6 +920,8 @@ def _build_stage_execution_spec(
             k_len=int(target_k_len),
         ),
     )
+    cache[cache_key] = resolved
+    return resolved
 
 
 def _run_stage_attention(
@@ -913,9 +934,10 @@ def _run_stage_attention(
     kernel: FlexAttentionKernel,
     scale: float,
     enable_gqa: bool,
+    sliding_window: int | None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     sparse_block_size = _stage_sparse_block_size(q_stage, v_stage)
-    execution_spec = _get_prepared_stage_execution_spec(
+    execution_spec = _resolve_stage_execution_spec(
         stage_plan=stage_plan,
         state=state,
         block_size=sparse_block_size,
@@ -926,6 +948,7 @@ def _run_stage_attention(
         device=q_stage.device,
         execution_spec=execution_spec,
         block_size=sparse_block_size,
+        sliding_window=sliding_window,
     )
     _validate_stage_block_alignment(
         q_len=int(execution_spec.q_len),
@@ -969,12 +992,16 @@ def _run_stage_attention(
         out_tokens = out.squeeze(0)
         lse_tokens = lse.squeeze(0).to(dtype=torch.float32)
         return (
-            out_tokens[:, :logical_q_len]
-            if int(execution_spec.q_len) == logical_q_len
-            else out_tokens[:, :logical_q_len].contiguous(),
-            lse_tokens[:, :logical_q_len]
-            if int(execution_spec.q_len) == logical_q_len
-            else lse_tokens[:, :logical_q_len].contiguous(),
+            (
+                out_tokens[:, :logical_q_len]
+                if int(execution_spec.q_len) == logical_q_len
+                else out_tokens[:, :logical_q_len].contiguous()
+            ),
+            (
+                lse_tokens[:, :logical_q_len]
+                if int(execution_spec.q_len) == logical_q_len
+                else lse_tokens[:, :logical_q_len].contiguous()
+            ),
         )
     out_tokens = out.squeeze(0).permute(1, 0, 2).contiguous()
     lse_tokens = lse.squeeze(0).permute(1, 0).contiguous().to(dtype=torch.float32)
@@ -1474,6 +1501,7 @@ def _forward_stage_records(
     kernel: FlexAttentionKernel,
     scale: float,
     enable_gqa: bool,
+    sliding_window: int | None,
     record_for_backward: bool,
 ) -> tuple[torch.Tensor, list[dict[str, Any]]]:
     q_source = q_flat.detach() if record_for_backward else q_flat
@@ -1568,6 +1596,7 @@ def _forward_stage_records(
                 kernel=kernel,
                 scale=scale,
                 enable_gqa=enable_gqa,
+                sliding_window=sliding_window,
             )
             replay_records.append(
                 {
@@ -1589,6 +1618,7 @@ def _forward_stage_records(
                 kernel=kernel,
                 scale=scale,
                 enable_gqa=enable_gqa,
+                sliding_window=sliding_window,
             )
         stage_out_value = stage_out.detach() if record_for_backward else stage_out
         stage_lse_value = stage_lse.detach() if record_for_backward else stage_lse
@@ -1697,6 +1727,7 @@ def _forward_stage_records(
                     kernel=kernel,
                     scale=scale,
                     enable_gqa=enable_gqa,
+                    sliding_window=sliding_window,
                 )
                 replay_records.append(
                     {
@@ -1718,6 +1749,7 @@ def _forward_stage_records(
                     kernel=kernel,
                     scale=scale,
                     enable_gqa=enable_gqa,
+                    sliding_window=sliding_window,
                 )
             stage_out_value = stage_out.detach() if record_for_backward else stage_out
             stage_lse_value = stage_lse.detach() if record_for_backward else stage_lse
@@ -1782,9 +1814,10 @@ def _forward_stage_records(
 
     if not produced_output:
         if int(q_flat.shape[1]) == 0:
-            return q_flat.new_empty(
-                (q_flat.shape[0], 0, q_flat.shape[2])
-            ), replay_records
+            return (
+                q_flat.new_empty((q_flat.shape[0], 0, q_flat.shape[2])),
+                replay_records,
+            )
         raise RuntimeError("Sparse attention produced no stage outputs")
     if accum_out is None:
         raise RuntimeError("Sparse attention produced no accumulated output")
@@ -1814,8 +1847,13 @@ def _run_context_parallel_forward(
     scale: float,
     enable_gqa: bool,
     compile_enabled: bool,
+    sliding_window: int | None,
+    triton_num_stages_2_head_dims: tuple[int, ...],
 ) -> torch.Tensor:
-    kernel = FlexAttentionKernel(compile_enabled=compile_enabled)
+    kernel = FlexAttentionKernel(
+        compile_enabled=compile_enabled,
+        triton_num_stages_2_head_dims=triton_num_stages_2_head_dims,
+    )
     q_flat, k_flat, v_flat = _flatten_qkv(
         query=query,
         key=key,
@@ -1830,6 +1868,7 @@ def _run_context_parallel_forward(
         kernel=kernel,
         scale=scale,
         enable_gqa=enable_gqa,
+        sliding_window=sliding_window,
         record_for_backward=False,
     )
     return unflatten_valid_sequence_head_major(
@@ -1848,8 +1887,13 @@ def _run_context_parallel_forward_recorded(
     scale: float,
     enable_gqa: bool,
     compile_enabled: bool,
+    sliding_window: int | None,
+    triton_num_stages_2_head_dims: tuple[int, ...],
 ) -> tuple[torch.Tensor, torch.Tensor, list[dict[str, Any]]]:
-    kernel = FlexAttentionKernel(compile_enabled=compile_enabled)
+    kernel = FlexAttentionKernel(
+        compile_enabled=compile_enabled,
+        triton_num_stages_2_head_dims=triton_num_stages_2_head_dims,
+    )
     q_flat, k_flat, v_flat = _flatten_qkv(
         query=query,
         key=key,
@@ -1864,6 +1908,7 @@ def _run_context_parallel_forward_recorded(
         kernel=kernel,
         scale=scale,
         enable_gqa=enable_gqa,
+        sliding_window=sliding_window,
         record_for_backward=True,
     )
     return (
@@ -1945,9 +1990,14 @@ def _run_context_parallel_backward(
     scale: float,
     enable_gqa: bool,
     compile_enabled: bool,
+    sliding_window: int | None,
+    triton_num_stages_2_head_dims: tuple[int, ...],
     replay_records: list[dict[str, Any]] | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    kernel = FlexAttentionKernel(compile_enabled=compile_enabled)
+    kernel = FlexAttentionKernel(
+        compile_enabled=compile_enabled,
+        triton_num_stages_2_head_dims=triton_num_stages_2_head_dims,
+    )
     comm_async_enabled = _distributed_cp_comm_enabled(state)
     q_flat, k_flat, v_flat = _flatten_qkv(
         query=query,
@@ -1968,6 +2018,7 @@ def _run_context_parallel_backward(
             kernel=kernel,
             scale=scale,
             enable_gqa=enable_gqa,
+            sliding_window=sliding_window,
             record_for_backward=True,
         )
     stage_out_grads, stage_lse_grads = _merge_stage_output_grads_from_tape(
@@ -1987,12 +2038,16 @@ def _run_context_parallel_backward(
     ):
         stage_plan = cast(StagePlan, record["stage_plan"])
         grad_by_stage_index[int(stage_plan.stage_index)] = (
-            _zero_stage_grads_like(record["stage_out"])
-            if stage_out_grad is None
-            else stage_out_grad,
-            _zero_stage_grads_like(record["stage_lse"])
-            if stage_lse_grad is None
-            else stage_lse_grad,
+            (
+                _zero_stage_grads_like(record["stage_out"])
+                if stage_out_grad is None
+                else stage_out_grad
+            ),
+            (
+                _zero_stage_grads_like(record["stage_lse"])
+                if stage_lse_grad is None
+                else stage_lse_grad
+            ),
         )
     del stage_out_grads, stage_lse_grads
 
@@ -2194,11 +2249,17 @@ class ArtContextParallelFn(torch.autograd.Function):
         scale: float,
         enable_gqa: bool,
         compile_enabled: bool,
+        sliding_window: int | None,
+        triton_num_stages_2_head_dims: tuple[int, ...],
     ) -> torch.Tensor:
         ctx.state = state
         ctx.scale = float(scale)
         ctx.enable_gqa = bool(enable_gqa)
         ctx.compile_enabled = bool(compile_enabled)
+        ctx.sliding_window = sliding_window
+        ctx.triton_num_stages_2_head_dims = tuple(
+            int(dim) for dim in triton_num_stages_2_head_dims
+        )
         ctx.save_for_backward(query, key, value)
         with torch.enable_grad():
             query_record = query.detach().requires_grad_(bool(query.requires_grad))
@@ -2213,6 +2274,8 @@ class ArtContextParallelFn(torch.autograd.Function):
                     scale=float(scale),
                     enable_gqa=bool(enable_gqa),
                     compile_enabled=bool(compile_enabled),
+                    sliding_window=sliding_window,
+                    triton_num_stages_2_head_dims=ctx.triton_num_stages_2_head_dims,
                 )
             )
         ctx.replay_records = replay_records
@@ -2232,11 +2295,13 @@ class ArtContextParallelFn(torch.autograd.Function):
                 scale=ctx.scale,
                 enable_gqa=ctx.enable_gqa,
                 compile_enabled=ctx.compile_enabled,
+                sliding_window=ctx.sliding_window,
+                triton_num_stages_2_head_dims=ctx.triton_num_stages_2_head_dims,
                 replay_records=cast(list[dict[str, Any]], ctx.replay_records),
             )
         finally:
             ctx.replay_records = None
-        return dq, dk, dv, None, None, None, None
+        return dq, dk, dv, None, None, None, None, None, None
 
 
 def run_context_parallel(
@@ -2248,6 +2313,8 @@ def run_context_parallel(
     scale: float,
     enable_gqa: bool,
     compile_enabled: bool,
+    sliding_window: int | None = None,
+    triton_num_stages_2_head_dims: tuple[int, ...] = (),
 ) -> torch.Tensor:
     if torch.is_grad_enabled() and (
         query.requires_grad or key.requires_grad or value.requires_grad
@@ -2260,6 +2327,8 @@ def run_context_parallel(
             float(scale),
             bool(enable_gqa),
             bool(compile_enabled),
+            None if sliding_window is None else int(sliding_window),
+            tuple(int(dim) for dim in triton_num_stages_2_head_dims),
         )
     return _run_context_parallel_forward(
         query=query,
@@ -2269,4 +2338,8 @@ def run_context_parallel(
         scale=scale,
         enable_gqa=enable_gqa,
         compile_enabled=compile_enabled,
+        sliding_window=sliding_window,
+        triton_num_stages_2_head_dims=tuple(
+            int(dim) for dim in triton_num_stages_2_head_dims
+        ),
     )

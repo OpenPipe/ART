@@ -600,6 +600,31 @@ def _save_rank0_vllm_lora(
     adapter_config: dict[str, Any],
     output_dir: str,
 ) -> None:
+    vllm_tensors, published_config = _rank0_vllm_lora_tensors(
+        metadata=metadata,
+        tensors_by_owner_key=tensors_by_owner_key,
+        packed_expert_metadata=packed_expert_metadata,
+        packed_expert_tensors_by_owner_key=packed_expert_tensors_by_owner_key,
+        handler=handler,
+        adapter_config=adapter_config,
+    )
+    stager = _PinnedCpuStager()
+    published_tensors = _stage_published_tensors(vllm_tensors, stager)
+    stager.finish()
+    save_vllm_lora_tensors(output_dir, published_tensors, published_config)
+
+
+def _rank0_vllm_lora_tensors(
+    *,
+    metadata: list[LoraShardMeta],
+    tensors_by_owner_key: dict[tuple[int, str], torch.Tensor],
+    packed_expert_metadata: list[PackedExpertShardMeta] | None = None,
+    packed_expert_tensors_by_owner_key: (
+        dict[tuple[int, str], torch.Tensor] | None
+    ) = None,
+    handler: Any,
+    adapter_config: dict[str, Any],
+) -> tuple[dict[str, torch.Tensor], dict[str, Any]]:
     merged_tensors = merge_sharded_adapter_entries(
         _entries_by_key(metadata, tensors_by_owner_key)
     )
@@ -614,26 +639,21 @@ def _save_rank0_vllm_lora(
             if key in merged_tensors:
                 raise RuntimeError(f"Duplicate LoRA tensor after packed publish: {key}")
             merged_tensors[key] = tensor
-    vllm_tensors, published_config = handler.to_vllm_lora_tensors(
+    return handler.to_vllm_lora_tensors(
         merged_tensors,
         adapter_config=dict(adapter_config),
     )
-    stager = _PinnedCpuStager()
-    published_tensors = _stage_published_tensors(vllm_tensors, stager)
-    stager.finish()
-    save_vllm_lora_tensors(output_dir, published_tensors, published_config)
 
 
-def save_vllm_lora_from_model(
+def build_vllm_lora_tensors_from_model(
     *,
     model: ModelChunks,
     adapter_model: dict[str, torch.Tensor],
     handler: Any,
     adapter_config: dict[str, Any],
-    output_dir: str,
     rank: int,
     world_size: int,
-) -> None:
+) -> tuple[dict[str, torch.Tensor], dict[str, Any]] | None:
     actual_rank, device = _rank_and_device()
     if _distributed_ready():
         actual_world_size = torch.distributed.get_world_size()  # type: ignore[possibly-missing-attribute]
@@ -690,14 +710,40 @@ def save_vllm_lora_from_model(
     )
 
     if rank != 0:
-        return
+        return None
 
-    _save_rank0_vllm_lora(
+    return _rank0_vllm_lora_tensors(
         metadata=all_metadata,
         tensors_by_owner_key=exchanged_tensors,
         packed_expert_metadata=all_packed_metadata,
         packed_expert_tensors_by_owner_key=exchanged_packed_tensors,
         handler=handler,
         adapter_config=adapter_config,
-        output_dir=output_dir,
     )
+
+
+def save_vllm_lora_from_model(
+    *,
+    model: ModelChunks,
+    adapter_model: dict[str, torch.Tensor],
+    handler: Any,
+    adapter_config: dict[str, Any],
+    output_dir: str,
+    rank: int,
+    world_size: int,
+) -> None:
+    result = build_vllm_lora_tensors_from_model(
+        model=model,
+        adapter_model=adapter_model,
+        handler=handler,
+        adapter_config=adapter_config,
+        rank=rank,
+        world_size=world_size,
+    )
+    if result is None:
+        return
+    vllm_tensors, published_config = result
+    stager = _PinnedCpuStager()
+    published_tensors = _stage_published_tensors(vllm_tensors, stager)
+    stager.finish()
+    save_vllm_lora_tensors(output_dir, published_tensors, published_config)

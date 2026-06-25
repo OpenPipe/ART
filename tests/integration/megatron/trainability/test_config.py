@@ -17,7 +17,6 @@ from .yes_no_trainability import (
     _variant_max_steps,
     _variant_packed_sequence_length,
     _variant_rollouts_per_prompt,
-    _variant_train_kwargs,
 )
 
 
@@ -106,7 +105,6 @@ def test_megatron_variants_keep_short_packed_sequence_default(monkeypatch) -> No
     )
 
     assert _variant_packed_sequence_length(variant) == 1024
-    assert _variant_train_kwargs(variant) == {"packed_sequence_length": 1024}
     config = _build_internal_config(
         variant, base_model="Qwen/Qwen3-30B-A3B-Instruct-2507"
     )
@@ -130,7 +128,6 @@ def test_unsloth_variant_uses_chunk_aligned_training_length(monkeypatch) -> None
     )
 
     assert _variant_packed_sequence_length(variant) == 1024
-    assert _variant_train_kwargs(variant) == {"packed_sequence_length": 1024}
     assert _variant_init_args(variant) == {"max_seq_length": 1024}
     assert _build_internal_config(
         variant, base_model="Qwen/Qwen3-30B-A3B-Instruct-2507"
@@ -165,7 +162,7 @@ def test_validated_dense_model_uses_dense_shared_topology(
         base_model="Qwen/Qwen3.5-4B",
     )
     assert built_variant.topology is not None
-    assert built_variant.topology.tp == 2
+    assert built_variant.topology.cp == 2
     assert built_variant.topology.ep == 1
     assert built_variant.topology.etp == 1
 

@@ -8,12 +8,15 @@ from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer.enums import AttnMaskType
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import divide
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, Field
 import torch
 from torch import Tensor
 from torch.nn.attention.flex_attention import BlockMask
 
-from art.megatron.flex_attn.compiled import dense_compiled_flex_attention
+from art.megatron.flex_attn.compiled import (
+    flex_backend_for_head_dims,
+    get_dense_compiled_flex_attention,
+)
 
 
 class SharedPrefixAttentionState(BaseModel):
@@ -21,10 +24,26 @@ class SharedPrefixAttentionState(BaseModel):
 
     model_config = ConfigDict(arbitrary_types_allowed=True)
     block_mask: BlockMask
+    sliding_block_masks: dict[int, BlockMask] = Field(default_factory=dict)
+
+    def block_mask_for_window(self, window: int | None) -> BlockMask:
+        if window is None:
+            return self.block_mask
+        return self.sliding_block_masks[int(window)]
 
 
 class FlexAttentionWrapper(torch.nn.Module):
     """Compiled `flex_attention` wrapper with Torchtitan-style inductor options."""
+
+    def __init__(
+        self,
+        *,
+        triton_num_stages_2_head_dims: tuple[int, ...] = (),
+    ) -> None:
+        super().__init__()
+        self.triton_num_stages_2_head_dims = tuple(
+            int(dim) for dim in triton_num_stages_2_head_dims
+        )
 
     def forward(
         self,
@@ -37,9 +56,18 @@ class FlexAttentionWrapper(torch.nn.Module):
         enable_gqa: bool,
     ) -> Tensor:
         # q, k, v are [B, H, S, D] tensors expected by torch.flex_attention.
+        backend = flex_backend_for_head_dims(
+            head_dim=int(q.shape[-1]),
+            head_dim_v=int(v.shape[-1]),
+        )
         return cast(
             Tensor,
-            dense_compiled_flex_attention(
+            get_dense_compiled_flex_attention(
+                backend=backend,
+                head_dim=int(q.shape[-1]),
+                head_dim_v=int(v.shape[-1]),
+                triton_num_stages_2_head_dims=self.triton_num_stages_2_head_dims,
+            )(
                 q,
                 k,
                 v,
@@ -53,6 +81,9 @@ class FlexAttentionWrapper(torch.nn.Module):
 def create_shared_prefix_attention_state(
     group_ids: Tensor,
     parent_ids: Tensor,
+    *,
+    input_pos: Tensor | None = None,
+    sliding_windows: tuple[int, ...] = (),
 ) -> SharedPrefixAttentionState:
     """Build a compiled block mask for ART shared-prefix packing.
 
@@ -65,7 +96,12 @@ def create_shared_prefix_attention_state(
 
     from art.megatron.shared_prefix_state import create_shared_prefix_state
 
-    return create_shared_prefix_state(group_ids, parent_ids)
+    return create_shared_prefix_state(
+        group_ids,
+        parent_ids,
+        input_pos=input_pos,
+        sliding_windows=sliding_windows,
+    )
 
 
 class FlexDotProductAttention(torch.nn.Module):
@@ -86,15 +122,12 @@ class FlexDotProductAttention(torch.nn.Module):
         pg_collection: ProcessGroupCollection | None = None,
     ):
         super().__init__()
-        del (
-            layer_number,
-            attn_mask_type,
-            attention_type,
-            attention_dropout,
-            cp_comm_type,
-        )
+        del attn_mask_type, attention_type, attention_dropout, cp_comm_type
+        self.layer_number = int(layer_number)
         self.config = config
-        self.flex_attention = FlexAttentionWrapper()
+        self.flex_attention = FlexAttentionWrapper(
+            triton_num_stages_2_head_dims=_triton_num_stages_2_head_dims(config)
+        )
 
         if pg_collection is None:
             tp_world_size = self.config.tensor_model_parallel_size
@@ -145,7 +178,9 @@ class FlexDotProductAttention(torch.nn.Module):
         )
 
         if isinstance(attention_bias, SharedPrefixAttentionState):
-            block_mask = attention_bias.block_mask
+            block_mask = attention_bias.block_mask_for_window(
+                getattr(self, "art_sliding_window", None)
+            )
         else:
             assert isinstance(attention_bias, BlockMask), (
                 "Expected a flex BlockMask in attention_bias."
@@ -171,3 +206,15 @@ class FlexDotProductAttention(torch.nn.Module):
         out = out.permute(2, 0, 1, 3).contiguous()
         out = out.view(out.size(0), out.size(1), self.hidden_size_per_partition)
         return out
+
+
+def _triton_num_stages_2_head_dims(config: Any) -> tuple[int, ...]:
+    compile_crash_config = getattr(config, "art_flex_compile_crash_config", None)
+    return tuple(
+        int(dim)
+        for dim in getattr(
+            compile_crash_config,
+            "triton_num_stages_2_head_dims",
+            (),
+        )
+    )

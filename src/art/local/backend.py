@@ -51,6 +51,7 @@ from .._backend_training import (
     build_rl_train_configs,
 )
 from ..backend import AnyTrainableModel, Backend
+from ..dev.sequence_lengths import max_seq_length_from_model_config
 from ..metrics_taxonomy import (
     TRAIN_GRADIENT_STEPS_KEY,
     build_training_summary_metrics,
@@ -71,7 +72,6 @@ from ..preprocessing.tokenize import (
 from ..trajectories import Trajectory, TrajectoryGroup
 from ..types import (
     LocalTrainResult,
-    MegatronTopologyConfig,
     Message,
     TrainConfig,
     TrainSFTConfig,
@@ -187,6 +187,9 @@ class LocalBackend(Backend):
         self._services: dict[str, ModelService] = {}
         self._adapter_leases: dict[str, AdapterLeaseManager] = {}
         self._tokenizers: dict[tuple[str, str | None], PreTrainedTokenizerBase] = {}
+        self._model_max_sequence_lengths: dict[
+            tuple[str, str | None, str | None], int
+        ] = {}
         self._image_processors: dict[str, BaseImageProcessor | None] = {}
         self._requires_explicit_packed_sequence_length = False
         self._packed_sequence_length_requires_chunk_alignment = True
@@ -215,6 +218,27 @@ class LocalBackend(Backend):
             )
         except UnsupportedModelArchitectureError:
             return False
+
+    def _model_max_sequence_length(self, model: AnyTrainableModel) -> int:
+        internal_config = cast(dev.InternalModelConfig, model._internal_config or {})
+        configured = internal_config.get("init_args", {}).get("max_seq_length")
+        if configured is not None:
+            return int(configured)
+        init_args = internal_config.get("init_args", {})
+        cache_key = (
+            model.base_model,
+            init_args.get("revision"),
+            init_args.get("token"),
+        )
+        if cache_key not in self._model_max_sequence_lengths:
+            self._model_max_sequence_lengths[cache_key] = (
+                max_seq_length_from_model_config(
+                    model.base_model,
+                    revision=cache_key[1],
+                    token=cache_key[2],
+                )
+            )
+        return self._model_max_sequence_lengths[cache_key]
 
     def supports_automatic_train_step_metrics(self) -> bool:
         return True
@@ -530,9 +554,28 @@ class LocalBackend(Backend):
         )
         if not tokenized_results:
             return None
-        model_max_sequence_length = internal_config.get("init_args", {}).get(
-            "max_seq_length", 32_768
-        )
+        model_max_sequence_length = self._model_max_sequence_length(model)
+        too_long_for_model = [
+            result
+            for result in tokenized_results
+            if len(result.token_ids) > model_max_sequence_length
+        ]
+        if too_long_for_model:
+            warnings.warn(
+                "Dropping "
+                f"{len(too_long_for_model)} tokenized results from "
+                f"{len({id(result.trajectory) for result in too_long_for_model})} "
+                f"trajectories longer than model max_seq_length={model_max_sequence_length} "
+                f"(max seen {max(len(result.token_ids) for result in too_long_for_model)}).",
+                stacklevel=2,
+            )
+            tokenized_results = [
+                result
+                for result in tokenized_results
+                if len(result.token_ids) <= model_max_sequence_length
+            ]
+            if not tokenized_results:
+                return None
         if packed_sequence_length is None:
             assert not self._requires_explicit_packed_sequence_length, (
                 f"{type(self).__name__} requires packed_sequence_length to be set."
@@ -545,11 +588,6 @@ class LocalBackend(Backend):
         else:
             sequence_length = packed_sequence_length
 
-        if sequence_length > model_max_sequence_length:
-            raise ValueError(
-                f"packed_sequence_length ({sequence_length}) exceeds model max_seq_length "
-                f"({model_max_sequence_length})"
-            )
         if (
             packed_sequence_length is not None
             and self._packed_sequence_length_requires_chunk_alignment
@@ -570,7 +608,7 @@ class LocalBackend(Backend):
                 "Dropping "
                 f"{len(too_long_results)} tokenized results from "
                 f"{len({id(result.trajectory) for result in too_long_results})} "
-                f"trajectories longer than packed_sequence_length={sequence_length} "
+                f"trajectories that do not fit packed_sequence_length={sequence_length} "
                 f"(max seen {max(len(result.token_ids) for result in too_long_results)}). "
                 "This affects training, but your model may still learn.",
                 stacklevel=2,
@@ -650,7 +688,6 @@ class LocalBackend(Backend):
         if self._model_uses_expert_replay(model):
             engine_args = dict(config_dict.get("engine_args", {}))
             engine_args["enable_return_routed_experts"] = True
-            engine_args["async_scheduling"] = False
             config_dict["engine_args"] = engine_args
         server_args = dict(config_dict.get("server_args", {}))
 
@@ -721,7 +758,6 @@ class LocalBackend(Backend):
         scale_learning_rate_by_reward_std_dev: bool = False,
         logprob_calculation_chunk_size: int = 1024,
         packed_sequence_length: int | None = None,
-        megatron_topology: MegatronTopologyConfig | None = None,
         num_trajectories_learning_rate_multiplier_power: float = 0.0,
         # Checkpoint behavior
         save_checkpoint: bool = True,
@@ -787,9 +823,6 @@ class LocalBackend(Backend):
             packed_sequence_length: Packed sequence length to use for training.
                 When unset, Unsloth keeps the current max-length-rounded-to-2048
                 behavior. Required for Megatron.
-            megatron_topology: Parallel topology for Megatron training. When
-                provided, ART uses it to configure Megatron TP/CP/EP/PP/VPP/ETP
-                before launching the Megatron runtime.
             num_trajectories_learning_rate_multiplier_power: Power for learning
                 rate multiplier based on number of trajectories.
             save_checkpoint: Whether to save a checkpoint after training.
@@ -861,7 +894,6 @@ class LocalBackend(Backend):
             scale_learning_rate_by_reward_std_dev=scale_learning_rate_by_reward_std_dev,
             logprob_calculation_chunk_size=logprob_calculation_chunk_size,
             packed_sequence_length=packed_sequence_length,
-            megatron_topology=megatron_topology,
             num_trajectories_learning_rate_multiplier_power=num_trajectories_learning_rate_multiplier_power,
             kl_ref_adapter_path=resolved_kl_ref_adapter_path,
         )
@@ -1126,10 +1158,7 @@ class LocalBackend(Backend):
             print(f"Using instruction_part: {instruction_part!r}")
             print(f"Using response_part: {response_part!r}")
 
-        max_seq_length = internal_config.get("init_args", {}).get(
-            "max_seq_length", 32_768
-        )
-        max_seq_length = int(max_seq_length) if max_seq_length is not None else None
+        max_seq_length = self._model_max_sequence_length(model)
 
         import itertools
         from typing import Iterator

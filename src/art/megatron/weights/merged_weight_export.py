@@ -13,6 +13,7 @@ from art.megatron.runtime.jobs import (
     MergedWeightTransferSpec,
 )
 from art.megatron.training.model_chunks import ModelChunks, as_megatron_api_chunks
+from art.megatron.weights.lora_publish import build_vllm_lora_tensors_from_model
 from art.megatron.weights.param_name_canonicalization import (
     canonical_art_param_name,
     is_art_adapter_param_name,
@@ -331,6 +332,8 @@ def sync_merged_weights_to_vllm(
     bridge: Any,
     model: ModelChunks,
     model_support_handler: Any,
+    adapter_model: dict[str, torch.Tensor],
+    adapter_config: dict[str, Any],
     rank: int,
     world_size: int,
     merged_weight_transfer_group: TrainerNcclCommunicator | None,
@@ -350,16 +353,26 @@ def sync_merged_weights_to_vllm(
         merged_weight_transfer_init_info=merged_weight_transfer_init_info,
         spec=spec,
     )
-    weight_export = build_merged_weight_export(
-        bridge=bridge,
+    _ = bridge
+    lora_result = build_vllm_lora_tensors_from_model(
         model=model,
-        model_support_handler=model_support_handler,
+        adapter_model=adapter_model,
+        handler=model_support_handler,
+        adapter_config=adapter_config,
+        rank=rank,
+        world_size=world_size,
     )
+    lora_weights: list[tuple[str, torch.Tensor]] = []
+    published_config: dict[str, Any] = {}
+    if _is_sender_rank(rank):
+        assert lora_result is not None
+        vllm_lora_tensors, published_config = lora_result
+        lora_weights = sorted(vllm_lora_tensors.items())
 
     def _send_weights() -> None:
         assert merged_weight_transfer_group is not None
         trainer_send_weights(
-            iter_merged_vllm_weights(weight_export),
+            iter(lora_weights),
             {
                 "group": merged_weight_transfer_group,
                 "packed": True,
@@ -369,15 +382,11 @@ def sync_merged_weights_to_vllm(
         )
 
     torch.cuda.synchronize()
-    names: list[str] = []
-    dtype_names: list[str] = []
-    shapes: list[list[int]] = []
-    _drain_merged_vllm_weights(
-        weight_export,
-        names=names if _is_sender_rank(rank) else None,
-        dtype_names=dtype_names if _is_sender_rank(rank) else None,
-        shapes=shapes if _is_sender_rank(rank) else None,
-    )
+    names = [name for name, _tensor in lora_weights]
+    dtype_names = [
+        str(tensor.dtype).removeprefix("torch.") for _name, tensor in lora_weights
+    ]
+    shapes = [list(tensor.shape) for _name, tensor in lora_weights]
     _maybe_distributed_barrier(world_size)
 
     pause_error: BaseException | None = None
@@ -410,7 +419,7 @@ def sync_merged_weights_to_vllm(
                     client.post,
                     f"{spec.vllm_base_url}/start_weight_update",
                     phase="start merged weight update",
-                    json={"is_checkpoint_format": True},
+                    json={"is_checkpoint_format": False},
                     headers=_runtime_headers(spec),
                     timeout=300.0,
                 )
@@ -422,6 +431,8 @@ def sync_merged_weights_to_vllm(
                         phase="update merged weights",
                         json={
                             "update_info": {
+                                "art_weight_update_kind": "lora_delta",
+                                "art_lora_config": published_config,
                                 "names": names,
                                 "dtype_names": dtype_names,
                                 "shapes": shapes,
@@ -483,7 +494,6 @@ def sync_merged_weights_to_vllm(
             phase="pause generation",
             error=None,
         )
-        _drain_merged_vllm_weights(weight_export)
         _sync_rank_zero_status(
             rank=rank,
             world_size=world_size,

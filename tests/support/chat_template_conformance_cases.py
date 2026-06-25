@@ -7,7 +7,8 @@ from openai.types.chat.chat_completion import Choice
 from pydantic import BaseModel
 from transformers.tokenization_utils_base import PreTrainedTokenizerBase
 
-from art.trajectories import History, Trajectory, TrajectoryGroup
+from art.preprocessing.tokenize import _apply_chat_template_token_ids
+from art.trajectories import History, Trajectory, TrajectoryGroup, get_messages
 from art.types import MessagesAndChoices, Tools
 
 
@@ -76,7 +77,7 @@ def _choice_for_text(
                 "refusal": None,
             },
             "message": {
-                "content": text,
+                "content": "" if tool_calls else text,
                 "refusal": None,
                 "role": "assistant",
                 "annotations": None,
@@ -86,6 +87,85 @@ def _choice_for_text(
             },
         }
     )
+
+
+def _logprob_content(token_ids: list[int]) -> list[dict[str, Any]]:
+    return [
+        {
+            "token": f"token_id:{token_id}",
+            "bytes": list(str(token_id).encode("utf-8")),
+            "logprob": -0.1,
+            "top_logprobs": [],
+        }
+        for token_id in token_ids
+    ]
+
+
+def _choice_with_token_metadata(
+    choice: Choice,
+    *,
+    prompt_token_ids: list[int],
+    completion_token_ids: list[int],
+) -> Choice:
+    payload = choice.model_dump(mode="python")
+    payload["logprobs"]["content"] = _logprob_content(completion_token_ids)
+    payload["prompt_token_ids"] = prompt_token_ids
+    payload["token_ids"] = completion_token_ids
+    return Choice.model_validate(payload)
+
+
+def _rendered_ids(
+    tokenizer: PreTrainedTokenizerBase,
+    messages_and_choices: MessagesAndChoices,
+    tools: Tools | None,
+) -> list[int]:
+    return _apply_chat_template_token_ids(
+        tokenizer,
+        cast(list[dict[str, Any]], get_messages(messages_and_choices)),
+        tools=tools,
+        tokenize=True,
+        add_generation_prompt=False,
+    )
+
+
+def _attach_token_metadata_to_history(
+    tokenizer: PreTrainedTokenizerBase,
+    history: Trajectory | History,
+) -> None:
+    items = history.messages_and_choices
+    for index, item in enumerate(items):
+        if not isinstance(item, Choice):
+            continue
+        prompt_token_ids = _rendered_ids(tokenizer, items[:index], history.tools)
+        rendered_ids = _rendered_ids(tokenizer, items[: index + 1], history.tools)
+        completion_token_ids = rendered_ids[len(prompt_token_ids) :]
+        items[index] = _choice_with_token_metadata(
+            item,
+            prompt_token_ids=prompt_token_ids,
+            completion_token_ids=completion_token_ids,
+        )
+
+
+def _attach_token_metadata(
+    tokenizer: PreTrainedTokenizerBase,
+    inputs: "ChatTemplateConformanceInputs",
+) -> "ChatTemplateConformanceInputs":
+    groups = (
+        inputs.text_pack_group,
+        inputs.tool_conversation_group,
+        inputs.additional_histories_group,
+    )
+    trajectories = [
+        inputs.non_final_tool_call_base,
+        inputs.non_final_tool_call_mutated,
+        inputs.unsupported_assistant_tool_calls,
+        *(trajectory for group in groups for trajectory in group.trajectories),
+    ]
+    for trajectory in trajectories:
+        _attach_token_metadata_to_history(tokenizer, trajectory)
+        for history in trajectory.additional_histories:
+            _attach_token_metadata_to_history(tokenizer, history)
+    return inputs
 
 
 def _messages_and_choices(*items: Any) -> MessagesAndChoices:
@@ -115,7 +195,7 @@ def build_chat_template_conformance_inputs(
 
     tools = _tool_schema()
 
-    return ChatTemplateConformanceInputs(
+    inputs = ChatTemplateConformanceInputs(
         text_pack_group=TrajectoryGroup(
             [
                 Trajectory(
@@ -278,3 +358,4 @@ def build_chat_template_conformance_inputs(
             tools=tools,
         ),
     )
+    return _attach_token_metadata(tokenizer, inputs)

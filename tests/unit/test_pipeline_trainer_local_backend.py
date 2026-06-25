@@ -103,33 +103,6 @@ async def test_pipeline_trainer_preserves_backend_train_kwargs(tmp_path: Path) -
 
 
 @pytest.mark.asyncio
-async def test_pipeline_trainer_forwards_packed_sequence_length_when_set(
-    tmp_path: Path,
-) -> None:
-    model = TrainableModel(
-        name="pipeline-packed-sequence-length",
-        project="pipeline-tests",
-        base_model="test-model",
-        base_path=str(tmp_path),
-    )
-    backend = MagicMock()
-    backend.train = AsyncMock(return_value=SimpleNamespace(step=1, metrics={}))
-
-    trainer = _make_trainer(
-        model=model,
-        backend=backend,
-        packed_sequence_length=4096,
-    )
-    trainer._output_queue = asyncio.Queue()
-    await trainer._output_queue.put(_make_group([0.0, 1.0]))
-    await trainer._output_queue.put(None)
-
-    await trainer._training_stage()
-
-    assert backend.train.await_args.kwargs["packed_sequence_length"] == 4096
-
-
-@pytest.mark.asyncio
 async def test_pipeline_trainer_forwards_default_kl_step_zero_for_generic_backend(
     tmp_path: Path,
 ) -> None:
@@ -712,6 +685,7 @@ def test_local_backend_get_packed_tensors_warns_and_drops_overlong_results(
         project="pipeline-tests",
         base_model="test-model",
         base_path=str(tmp_path),
+        _internal_config=InternalModelConfig(init_args={"max_seq_length": 4}),
     )
     short_trajectory = Trajectory(
         reward=1.0,
@@ -830,7 +804,7 @@ async def test_tinker_backend_register_enables_tinker_token_priced_generation_co
 
 
 @pytest.mark.asyncio
-async def test_megatron_backend_train_requires_packed_sequence_length(
+async def test_megatron_backend_train_requires_runtime_config(
     tmp_path: Path,
 ) -> None:
     model = TrainableModel(
@@ -843,7 +817,8 @@ async def test_megatron_backend_train_requires_packed_sequence_length(
 
     with patch.object(model, "_get_wandb_run", return_value=None):
         with pytest.raises(
-            ValueError, match="MegatronBackend\\.train requires packed_sequence_length"
+            RuntimeError,
+            match="Call art\\.init_megatron_runtime_config\\(\\.\\.\\.\\) before using MegatronBackend",
         ):
             await backend.train(
                 model,

@@ -113,26 +113,24 @@ def test_ensure_merged_weight_transfer_group_non_sender_skips_runtime_init(
     assert barriers == []
 
 
-def test_sync_merged_weights_to_vllm_non_sender_only_drains_export(
+def test_sync_merged_weights_to_vllm_non_sender_only_builds_lora_payload(
     monkeypatch,
 ) -> None:
     spec = _spec()
     barrier_calls: list[int] = []
-    iter_passes: list[int] = []
+    build_ranks: list[int] = []
 
     monkeypatch.setattr(
         export,
         "ensure_merged_weight_transfer_group",
         lambda **kwargs: (None, spec.init_info),
     )
-    monkeypatch.setattr(export, "build_merged_weight_export", lambda **kwargs: object())
+    monkeypatch.setattr(
+        export,
+        "build_vllm_lora_tensors_from_model",
+        lambda **kwargs: build_ranks.append(kwargs["rank"]) or None,
+    )
 
-    def fake_iter(_weight_export: object):
-        iter_passes.append(len(iter_passes) + 1)
-        yield ("layer.weight", torch.zeros((2, 3), dtype=torch.float16))
-        yield ("layer.bias", torch.zeros((3,), dtype=torch.float32))
-
-    monkeypatch.setattr(export, "iter_merged_vllm_weights", fake_iter)
     monkeypatch.setattr(export, "_maybe_distributed_barrier", barrier_calls.append)
     monkeypatch.setattr(torch.cuda, "synchronize", lambda: None)
     monkeypatch.setattr(
@@ -152,6 +150,8 @@ def test_sync_merged_weights_to_vllm_non_sender_only_drains_export(
         bridge=object(),
         model=cast(Any, object()),
         model_support_handler=object(),
+        adapter_model={},
+        adapter_config={},
         rank=1,
         world_size=2,
         merged_weight_transfer_group=None,
@@ -162,7 +162,7 @@ def test_sync_merged_weights_to_vllm_non_sender_only_drains_export(
 
     assert group is None
     assert init_info == spec.init_info
-    assert iter_passes == [1, 2]
+    assert build_ranks == [1]
     assert barrier_calls == [2]
 
 
@@ -181,11 +181,16 @@ def test_sync_merged_weights_to_vllm_sender_controls_runtime_and_sends(
         "ensure_merged_weight_transfer_group",
         lambda **kwargs: ("trainer-group", spec.init_info),
     )
-    monkeypatch.setattr(export, "build_merged_weight_export", lambda **kwargs: object())
+    published_config = {"r": 2, "lora_alpha": 4}
 
-    def fake_iter(_weight_export: object):
-        yield ("layer.weight", torch.zeros((2, 3), dtype=torch.float16))
-        yield ("layer.bias", torch.zeros((3,), dtype=torch.float32))
+    def fake_build(**kwargs):
+        return (
+            {
+                "layer.b.lora_B.weight": torch.zeros((3,), dtype=torch.float32),
+                "layer.a.lora_A.weight": torch.zeros((2, 3), dtype=torch.float16),
+            },
+            published_config,
+        )
 
     def fake_send(iterator, trainer_args):
         sent_items.append(list(iterator))
@@ -210,7 +215,7 @@ def test_sync_merged_weights_to_vllm_sender_controls_runtime_and_sends(
             posts.append((url, json, params, timeout))
             return _OkResponse()
 
-    monkeypatch.setattr(export, "iter_merged_vllm_weights", fake_iter)
+    monkeypatch.setattr(export, "build_vllm_lora_tensors_from_model", fake_build)
     monkeypatch.setattr(export, "trainer_send_weights", fake_send)
     monkeypatch.setattr(export, "_maybe_distributed_barrier", barrier_calls.append)
     monkeypatch.setattr(torch.cuda, "synchronize", lambda: None)
@@ -220,6 +225,8 @@ def test_sync_merged_weights_to_vllm_sender_controls_runtime_and_sends(
         bridge=object(),
         model=cast(Any, object()),
         model_support_handler=object(),
+        adapter_model={},
+        adapter_config=published_config,
         rank=0,
         world_size=2,
         merged_weight_transfer_group=None,
@@ -230,12 +237,15 @@ def test_sync_merged_weights_to_vllm_sender_controls_runtime_and_sends(
 
     assert group == "trainer-group"
     assert init_info == spec.init_info
-    assert [name for name, _ in sent_items[0]] == ["layer.weight", "layer.bias"]
+    assert [name for name, _ in sent_items[0]] == [
+        "layer.a.lora_A.weight",
+        "layer.b.lora_B.weight",
+    ]
     assert posts == [
         ("http://runtime.test/pause", None, {"mode": "wait"}, 300.0),
         (
             "http://runtime.test/start_weight_update",
-            {"is_checkpoint_format": True},
+            {"is_checkpoint_format": False},
             None,
             300.0,
         ),
@@ -243,7 +253,12 @@ def test_sync_merged_weights_to_vllm_sender_controls_runtime_and_sends(
             "http://runtime.test/update_weights",
             {
                 "update_info": {
-                    "names": ["layer.weight", "layer.bias"],
+                    "art_weight_update_kind": "lora_delta",
+                    "art_lora_config": published_config,
+                    "names": [
+                        "layer.a.lora_A.weight",
+                        "layer.b.lora_B.weight",
+                    ],
                     "dtype_names": ["float16", "float32"],
                     "shapes": [[2, 3], [3]],
                     "packed": True,

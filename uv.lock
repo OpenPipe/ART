@@ -2,29 +2,51 @@ version = 1
 revision = 3
 requires-python = ">=3.12"
 resolution-markers = [
-    "python_full_version >= '3.14' and platform_machine != 's390x' and sys_platform == 'linux'",
-    "python_full_version == '3.13.*' and platform_machine != 's390x' and sys_platform == 'linux'",
-    "python_full_version < '3.13' and platform_machine != 's390x' and sys_platform == 'linux'",
-    "python_full_version >= '3.14' and platform_machine == 's390x' and sys_platform == 'linux'",
-    "python_full_version == '3.13.*' and platform_machine == 's390x' and sys_platform == 'linux'",
-    "python_full_version < '3.13' and platform_machine == 's390x' and sys_platform == 'linux'",
-    "python_full_version >= '3.14' and platform_machine != 's390x' and sys_platform == 'win32'",
-    "python_full_version >= '3.14' and platform_machine != 's390x' and sys_platform != 'linux' and sys_platform != 'win32'",
-    "python_full_version == '3.13.*' and platform_machine != 's390x' and sys_platform == 'win32'",
-    "python_full_version == '3.13.*' and platform_machine != 's390x' and sys_platform != 'linux' and sys_platform != 'win32'",
-    "python_full_version < '3.13' and platform_machine != 's390x' and sys_platform == 'win32'",
-    "python_full_version < '3.13' and platform_machine != 's390x' and sys_platform != 'linux' and sys_platform != 'win32'",
-    "python_full_version >= '3.14' and platform_machine == 's390x' and sys_platform == 'win32'",
-    "python_full_version >= '3.14' and platform_machine == 's390x' and sys_platform != 'linux' and sys_platform != 'win32'",
-    "python_full_version == '3.13.*' and platform_machine == 's390x' and sys_platform == 'win32'",
-    "python_full_version == '3.13.*' and platform_machine == 's390x' and sys_platform != 'linux' and sys_platform != 'win32'",
-    "python_full_version < '3.13' and platform_machine == 's390x' and sys_platform == 'win32'",
-    "python_full_version < '3.13' and platform_machine == 's390x' and sys_platform != 'linux' and sys_platform != 'win32'",
+    "python_full_version >= '3.14' and platform_machine != 's390x' and sys_platform == 'linux' and extra != 'extra-12-openpipe-art-backend' and extra == 'extra-12-openpipe-art-megatron' and extra != 'extra-12-openpipe-art-tinker'",
+    "python_full_version >= '3.14' and platform_machine == 's390x' and sys_platform == 'linux' and extra != 'extra-12-openpipe-art-backend' and extra == 'extra-12-openpipe-art-megatron' and extra != 'extra-12-openpipe-art-tinker'",
+    "python_full_version >= '3.14' and platform_machine != 's390x' and sys_platform == 'win32' and extra != 'extra-12-openpipe-art-backend' and extra == 'extra-12-openpipe-art-megatron' and extra != 'extra-12-openpipe-art-tinker'",
+    "python_full_version >= '3.14' and platform_machine == 's390x' and sys_platform == 'win32' and extra != 'extra-12-openpipe-art-backend' and extra == 'extra-12-openpipe-art-megatron' and extra != 'extra-12-openpipe-art-tinker'",
+    "python_full_version == '3.13.*' and platform_machine != 's390x' and sys_platform == 'linux' and extra != 'extra-12-openpipe-art-backend' and extra == 'extra-12-openpipe-art-megatron' and extra != 'extra-12-openpipe-art-tinker'",
+    "python_full_version < '3.13' and platform_machine != 's390x' and sys_platform == 'linux' and extra != 'extra-12-openpipe-art-backend' and extra == 'extra-12-openpipe-art-megatron' and extra != 'extra-12-openpipe-art-tinker'",
+    "python_full_version == '3.13.*' and platform_machine == 's390x' and sys_platform == 'linux' and extra != 'extra-12-openpipe-art-backend' and extra == 'extra-12-openpipe-art-megatron' and extra != 'extra-12-openpipe-art-tinker'",
+    "python_full_version < '3.13' and platform_machine == 's390x' and sys_platform == 'linux' and extra != 'extra-12-openpipe-art-backend' and extra == 'extra-12-openpipe-art-megatron' and extra != 'extra-12-openpipe-art-tinker'",
+    "python_full_version == '3.13.*' and platform_machine != 's390x' and sys_platform == 'win32' and extra != 'extra-12-openpipe-art-backend' and extra == 'extra-12-openpipe-art-megatron' and extra != 'extra-12-openpipe-art-tinker'",
+    "python_full_version < '3.13' and platform_machine != 's390x' and sys_platform == 'win32' and extra != 'extra-12-openpipe-art-backend' and extra == 'extra-12-openpipe-art-megatron' and extra != 'extra-12-openpipe-art-tinker'",
+    "python_full_version == '3.13.*' and platform_machine == 's390x' and sys_platform == 'win32' and extra != 'extra-12-openpipe-art-backend' and extra == 'extra-12-openpipe-art-megatron' and extra != 'extra-12-openpipe-art-tinker'",
+    "python_full_version < '3.13' and platform_machine == 's390x' and sys_platform == 'win32' and extra != 'extra-12-openpipe-art-backend' and extra == 'extra-12-openpipe-art-megatron' and extra != 'extra-12-openpipe-art-tinker'",
+    "python_full_version >= '3.14' and platform_machine != 's390x' and sys_platform != 'linux' and sys_platform != 'win32' and extra != 'extra-12-openpipe-art-backend' and extra == 'extra-12-openpipe-art-megatron' and extra != 'extra-12-openpipe-art-tinker'",
+    "python_full_version >= '3.14' and platform_machine == 's390x' and sys_platform != 'linux' and sys_platform != 'win32' and extra != 'extra-12-openpipe-art-backend' and extra == 'extra-12-openpipe-art-megatron' and extra != 'extra-12-openpipe-art-tinker'",
+    "python_full_version == '3.13.*' and platform_machine != 's390x' and sys_platform != 'linux' and sys_platform != 'win32' and extra != 'extra-12-openpipe-art-backend' and extra == 'extra-12-openpipe-art-megatron' and extra != 'extra-12-openpipe-art-tinker'",
+    "python_full_version < '3.13' and platform_machine != 's390x' and sys_platform != 'linux' and sys_platform != 'win32' and extra != 'extra-12-openpipe-art-backend' and extra == 'extra-12-openpipe-art-megatron' and extra != 'extra-12-openpipe-art-tinker'",
+    "python_full_version == '3.13.*' and platform_machine == 's390x' and sys_platform != 'linux' and sys_platform != 'win32' and extra != 'extra-12-openpipe-art-backend' and extra == 'extra-12-openpipe-art-megatron' and extra != 'extra-12-openpipe-art-tinker'",
+    "python_full_version < '3.13' and platform_machine == 's390x' and sys_platform != 'linux' and sys_platform != 'win32' and extra != 'extra-12-openpipe-art-backend' and extra == 'extra-12-openpipe-art-megatron' and extra != 'extra-12-openpipe-art-tinker'",
+    "python_full_version >= '3.14' and sys_platform == 'linux' and extra == 'extra-12-openpipe-art-backend' and extra != 'extra-12-openpipe-art-megatron'",
+    "python_full_version == '3.13.*' and sys_platform == 'linux' and extra == 'extra-12-openpipe-art-backend' and extra != 'extra-12-openpipe-art-megatron'",
+    "python_full_version < '3.13' and sys_platform == 'linux' and extra == 'extra-12-openpipe-art-backend' and extra != 'extra-12-openpipe-art-megatron'",
+    "python_full_version >= '3.14' and sys_platform == 'win32' and extra == 'extra-12-openpipe-art-backend' and extra != 'extra-12-openpipe-art-megatron'",
+    "python_full_version == '3.13.*' and sys_platform == 'win32' and extra == 'extra-12-openpipe-art-backend' and extra != 'extra-12-openpipe-art-megatron'",
+    "python_full_version < '3.13' and sys_platform == 'win32' and extra == 'extra-12-openpipe-art-backend' and extra != 'extra-12-openpipe-art-megatron'",
+    "python_full_version >= '3.14' and sys_platform != 'linux' and sys_platform != 'win32' and extra == 'extra-12-openpipe-art-backend' and extra != 'extra-12-openpipe-art-megatron'",
+    "python_full_version == '3.13.*' and sys_platform != 'linux' and sys_platform != 'win32' and extra == 'extra-12-openpipe-art-backend' and extra != 'extra-12-openpipe-art-megatron'",
+    "python_full_version < '3.13' and sys_platform != 'linux' and sys_platform != 'win32' and extra == 'extra-12-openpipe-art-backend' and extra != 'extra-12-openpipe-art-megatron'",
+    "(python_full_version >= '3.14' and sys_platform == 'linux' and extra != 'extra-12-openpipe-art-backend' and extra != 'extra-12-openpipe-art-megatron') or (python_full_version >= '3.14' and sys_platform == 'win32' and extra != 'extra-12-openpipe-art-backend' and extra != 'extra-12-openpipe-art-megatron')",
+    "(python_full_version == '3.13.*' and sys_platform == 'linux' and extra != 'extra-12-openpipe-art-backend' and extra != 'extra-12-openpipe-art-megatron') or (python_full_version == '3.13.*' and sys_platform == 'win32' and extra != 'extra-12-openpipe-art-backend' and extra != 'extra-12-openpipe-art-megatron')",
+    "(python_full_version < '3.13' and sys_platform == 'linux' and extra != 'extra-12-openpipe-art-backend' and extra != 'extra-12-openpipe-art-megatron') or (python_full_version < '3.13' and sys_platform == 'win32' and extra != 'extra-12-openpipe-art-backend' and extra != 'extra-12-openpipe-art-megatron')",
+    "python_full_version >= '3.14' and sys_platform != 'linux' and sys_platform != 'win32' and extra != 'extra-12-openpipe-art-backend' and extra != 'extra-12-openpipe-art-megatron'",
+    "python_full_version == '3.13.*' and sys_platform != 'linux' and sys_platform != 'win32' and extra != 'extra-12-openpipe-art-backend' and extra != 'extra-12-openpipe-art-megatron'",
+    "python_full_version < '3.13' and sys_platform != 'linux' and sys_platform != 'win32' and extra != 'extra-12-openpipe-art-backend' and extra != 'extra-12-openpipe-art-megatron'",
 ]
+conflicts = [[
+    { package = "openpipe-art", extra = "backend" },
+    { package = "openpipe-art", extra = "megatron" },
+], [
+    { package = "openpipe-art", extra = "megatron" },
+    { package = "openpipe-art", extra = "tinker" },
+]]
 
 [manifest]
 overrides = [
-    { name = "flashinfer-python", specifier = "==0.6.1" },
+    { name = "flashinfer-python", specifier = "==0.6.8.post1" },
     { name = "megatron-core", specifier = "==0.17.0" },
     { name = "numpy", specifier = "<2" },
     { name = "nvidia-resiliency-ext", specifier = "<0.5" },
@@ -32,7 +54,6 @@ overrides = [
     { name = "torch", marker = "sys_platform != 'linux' and sys_platform != 'win32'", specifier = "==2.11.0" },
     { name = "torch", marker = "sys_platform == 'linux' or sys_platform == 'win32'", specifier = "==2.11.0", index = "https://download.pytorch.org/whl/cu128" },
     { name = "transformer-engine", specifier = "==2.11.0" },
-    { name = "transformers", specifier = "==5.2.0" },
 ]
 excludes = [
     "causal-conv1d",
@@ -49,6 +70,11 @@ requires-dist = ["packaging"]
 [[manifest.dependency-metadata]]
 name = "deep-ep"
 version = "1.2.1+9af0e0d"
+
+[[manifest.dependency-metadata]]
+name = "megatron-bridge"
+version = "0.5.0+e1a207ac"
+requires-dist = ["accelerate", "comet-ml", "datasets", "diffusers", "einops", "flash-linear-attention", "flashinfer-cubin", "flashinfer-python", "hydra-core", "imageio", "imageio-ffmpeg", "megatron-core", "mistral-common", "mlflow", "nvidia-resiliency-ext", "omegaconf", "open-clip-torch", "peft", "pyyaml", "qwen-vl-utils", "regex", "rich", "six", "tensorboard", "timm", "torch", "tqdm", "transformers", "typing-extensions", "wandb"]
 
 [[manifest.dependency-metadata]]
 name = "transformer-engine-torch"
@@ -87,8 +113,8 @@ dependencies = [
     { name = "psutil" },
     { name = "pyyaml" },
     { name = "safetensors" },
-    { name = "torch", version = "2.11.0", source = { registry = "https://pypi.org/simple" }, marker = "sys_platform != 'linux' and sys_platform != 'win32'" },
-    { name = "torch", version = "2.11.0+cu128", source = { registry = "https://download.pytorch.org/whl/cu128" }, marker = "sys_platform == 'linux' or sys_platform == 'win32'" },
+    { name = "torch", version = "2.11.0", source = { registry = "https://pypi.org/simple" }, marker = "(sys_platform != 'linux' and sys_platform != 'win32' and extra == 'extra-12-openpipe-art-backend') or (sys_platform != 'linux' and sys_platform != 'win32' and extra == 'extra-12-openpipe-art-megatron') or (sys_platform == 'linux' and extra == 'extra-12-openpipe-art-backend' and extra == 'extra-12-openpipe-art-megatron') or (sys_platform == 'linux' and extra == 'extra-12-openpipe-art-megatron' and extra == 'extra-12-openpipe-art-tinker') or (sys_platform == 'win32' and extra == 'extra-12-openpipe-art-backend' and extra == 'extra-12-openpipe-art-megatron') or (sys_platform == 'win32' and extra == 'extra-12-openpipe-art-megatron' and extra == 'extra-12-openpipe-art-tinker')" },
+    { name = "torch", version = "2.11.0+cu128", source = { registry = "https://download.pytorch.org/whl/cu128" }, marker = "(sys_platform == 'linux' and extra == 'extra-12-openpipe-art-backend') or (sys_platform == 'linux' and extra == 'extra-12-openpipe-art-megatron') or (sys_platform == 'win32' and extra == 'extra-12-openpipe-art-backend') or (sys_platform == 'win32' and extra == 'extra-12-openpipe-art-megatron') or (extra == 'extra-12-openpipe-art-backend' and extra == 'extra-12-openpipe-art-megatron') or (extra == 'extra-12-openpipe-art-megatron' and extra == 'extra-12-openpipe-art-tinker')" },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/97/33/47bbd507e3a851d33d19ce7b2141c5ea3689bfae91ba168044d7db24b0e9/accelerate-1.7.0.tar.gz", hash = "sha256:e8a2a5503d6237b9eee73cc8d36cf543f9c2d8dd2c6713450b322f5e6d53a610", size = 376026, upload-time = "2025-05-15T10:00:52.117Z" }
 wheels = [
@@ -213,9 +239,9 @@ wheels = [
 [package.optional-dependencies]
 speedups = [
     { name = "aiodns" },
-    { name = "backports-zstd", marker = "python_full_version < '3.14' and platform_python_implementation == 'CPython'" },
-    { name = "brotli", marker = "platform_python_implementation == 'CPython'" },
-    { name = "brotlicffi", marker = "platform_python_implementation != 'CPython'" },
+    { name = "backports-zstd", marker = "(python_full_version < '3.14' and platform_python_implementation == 'CPython') or (python_full_version >= '3.14' and extra == 'extra-12-openpipe-art-backend' and extra == 'extra-12-openpipe-art-megatron') or (python_full_version >= '3.14' and extra == 'extra-12-openpipe-art-megatron' and extra == 'extra-12-openpipe-art-tinker') or (platform_python_implementation != 'CPython' and extra == 'extra-12-openpipe-art-backend' and extra == 'extra-12-openpipe-art-megatron') or (platform_python_implementation != 'CPython' and extra == 'extra-12-openpipe-art-megatron' and extra == 'extra-12-openpipe-art-tinker')" },
+    { name = "brotli", marker = "platform_python_implementation == 'CPython' or (extra == 'extra-12-openpipe-art-backend' and extra == 'extra-12-openpipe-art-megatron') or (extra == 'extra-12-openpipe-art-megatron' and extra == 'extra-12-openpipe-art-tinker')" },
+    { name = "brotlicffi", marker = "platform_python_implementation != 'CPython' or (extra == 'extra-12-openpipe-art-backend' and extra == 'extra-12-openpipe-art-megatron') or (extra == 'extra-12-openpipe-art-megatron' and extra == 'extra-12-openpipe-art-tinker')" },
 ]
 
 [[package]]
@@ -236,7 +262,7 @@ version = "1.4.0"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "frozenlist" },
-    { name = "typing-extensions", marker = "python_full_version < '3.13'" },
+    { name = "typing-extensions", marker = "python_full_version < '3.13' or (extra == 'extra-12-openpipe-art-backend' and extra == 'extra-12-openpipe-art-megatron') or (extra == 'extra-12-openpipe-art-megatron' and extra == 'extra-12-openpipe-art-tinker')" },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/61/62/06741b579156360248d1ec624842ad0edf697050bbaf7c3e46394e106ad1/aiosignal-1.4.0.tar.gz", hash = "sha256:f47eecd9468083c2029cc99945502cb7708b082c232f9aca65da147157b251c7", size = 25007, upload-time = "2025-07-03T22:54:43.528Z" }
 wheels = [
@@ -296,7 +322,7 @@ version = "4.13.0"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "idna" },
-    { name = "typing-extensions", marker = "python_full_version < '3.13'" },
+    { name = "typing-extensions", marker = "python_full_version < '3.13' or (extra == 'extra-12-openpipe-art-backend' and extra == 'extra-12-openpipe-art-megatron') or (extra == 'extra-12-openpipe-art-megatron' and extra == 'extra-12-openpipe-art-tinker')" },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/19/14/2c5dd9f512b66549ae92767a9c7b330ae88e1932ca57876909410251fe13/anyio-4.13.0.tar.gz", hash = "sha256:334b70e641fd2221c1505b3890c69882fe4a2df910cba14d97019b90b24439dc", size = 231622, upload-time = "2026-03-24T12:59:09.671Z" }
 wheels = [
@@ -562,8 +588,8 @@ source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "numpy" },
     { name = "packaging" },
-    { name = "torch", version = "2.11.0", source = { registry = "https://pypi.org/simple" }, marker = "sys_platform != 'linux' and sys_platform != 'win32'" },
-    { name = "torch", version = "2.11.0+cu128", source = { registry = "https://download.pytorch.org/whl/cu128" }, marker = "sys_platform == 'linux' or sys_platform == 'win32'" },
+    { name = "torch", version = "2.11.0", source = { registry = "https://pypi.org/simple" }, marker = "(sys_platform != 'linux' and sys_platform != 'win32' and extra == 'extra-12-openpipe-art-backend') or (sys_platform == 'linux' and extra == 'extra-12-openpipe-art-backend' and extra == 'extra-12-openpipe-art-megatron') or (sys_platform == 'win32' and extra == 'extra-12-openpipe-art-backend' and extra == 'extra-12-openpipe-art-megatron') or (extra != 'extra-12-openpipe-art-backend' and extra == 'extra-12-openpipe-art-megatron' and extra == 'extra-12-openpipe-art-tinker')" },
+    { name = "torch", version = "2.11.0+cu128", source = { registry = "https://download.pytorch.org/whl/cu128" }, marker = "(sys_platform == 'linux' and extra == 'extra-12-openpipe-art-backend') or (sys_platform == 'win32' and extra == 'extra-12-openpipe-art-backend') or (extra == 'extra-12-openpipe-art-backend' and extra == 'extra-12-openpipe-art-megatron') or (extra == 'extra-12-openpipe-art-megatron' and extra == 'extra-12-openpipe-art-tinker')" },
 ]
 wheels = [
     { url = "https://files.pythonhosted.org/packages/d8/7d/f1fe0992334b18cd8494f89aeec1dcc674635584fcd9f115784fea3a1d05/bitsandbytes-0.49.2-py3-none-macosx_14_0_arm64.whl", hash = "sha256:87be5975edeac5396d699ecbc39dfc47cf2c026daaf2d5852a94368611a6823f", size = 131940, upload-time = "2026-02-16T21:26:04.572Z" },
@@ -759,7 +785,7 @@ name = "cffi"
 version = "2.0.0"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
-    { name = "pycparser", marker = "implementation_name != 'PyPy'" },
+    { name = "pycparser", marker = "implementation_name != 'PyPy' or (extra == 'extra-12-openpipe-art-backend' and extra == 'extra-12-openpipe-art-megatron') or (extra == 'extra-12-openpipe-art-megatron' and extra == 'extra-12-openpipe-art-tinker')" },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/eb/56/b1ba7935a17738ae8453301356628e8147c79dbb825bcbc73dc7401f9846/cffi-2.0.0.tar.gz", hash = "sha256:44d1b5909021139fe36001ae048dbdde8214afa20200eda0f64c068cac5d5529", size = 523588, upload-time = "2025-09-08T23:24:04.541Z" }
 wheels = [
@@ -941,7 +967,7 @@ name = "click"
 version = "8.1.8"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
-    { name = "colorama", marker = "sys_platform == 'win32'" },
+    { name = "colorama", marker = "sys_platform == 'win32' or (extra == 'extra-12-openpipe-art-backend' and extra == 'extra-12-openpipe-art-megatron') or (extra == 'extra-12-openpipe-art-megatron' and extra == 'extra-12-openpipe-art-tinker')" },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/b9/2e/0090cbf739cee7d23781ad4b89a9894a41538e4fcf4c31dcdd705b78eb8b/click-8.1.8.tar.gz", hash = "sha256:ed53c9d8990d83c2a27deae68e4ee337473f6330c040a31d4225c9574d16096a", size = 226593, upload-time = "2024-12-21T18:38:44.339Z" }
 wheels = [
@@ -972,7 +998,7 @@ version = "3.58.0"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "dulwich" },
-    { name = "everett", extra = ["ini"] },
+    { name = "everett", extra = ["ini"], marker = "extra == 'extra-12-openpipe-art-megatron'" },
     { name = "jsonschema" },
     { name = "psutil" },
     { name = "python-box" },
@@ -1165,7 +1191,7 @@ name = "cryptography"
 version = "43.0.3"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
-    { name = "cffi", marker = "platform_python_implementation != 'PyPy'" },
+    { name = "cffi", marker = "platform_python_implementation != 'PyPy' or (extra == 'extra-12-openpipe-art-backend' and extra == 'extra-12-openpipe-art-megatron') or (extra == 'extra-12-openpipe-art-megatron' and extra == 'extra-12-openpipe-art-tinker')" },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/0d/05/07b55d1fa21ac18c3a8c79f764e2514e6f6a9698f1be44994f5adf0d29db/cryptography-43.0.3.tar.gz", hash = "sha256:315b9001266a492a6ff443b61238f956b214dbec9910a081ba5b6646a055a805", size = 686989, upload-time = "2024-10-18T15:58:32.918Z" }
 wheels = [
@@ -1194,7 +1220,7 @@ name = "cuda-bindings"
 version = "12.9.7"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
-    { name = "cuda-pathfinder" },
+    { name = "cuda-pathfinder", marker = "sys_platform == 'linux' or sys_platform == 'win32' or extra == 'extra-12-openpipe-art-megatron'" },
 ]
 wheels = [
     { url = "https://files.pythonhosted.org/packages/32/45/557d4ed1fa54f0c7db8aee083229f624990d69f7d00f55477eed5c7e169a/cuda_bindings-12.9.7-cp312-cp312-manylinux_2_24_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:0666d3c082ef8f4b2d670950589373550e9f3bf564d635dd883f24a0b40402ff", size = 7071026, upload-time = "2026-05-27T18:44:13.356Z" },
@@ -1234,6 +1260,28 @@ wheels = [
 ]
 
 [[package]]
+name = "cuda-tile"
+version = "1.4.0"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "typing-extensions" },
+]
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/42/93/64ef40d3982dcda7a97ebfa3e3bb9045b573d4eb3877fa5d1fa3cd2541d3/cuda_tile-1.4.0-cp312-cp312-manylinux2014_aarch64.whl", hash = "sha256:9e358a85a153820aa0a51d0e09346d884a3c14b88c0313d20d0fb9f53952abae", size = 280953, upload-time = "2026-05-27T17:46:53.03Z" },
+    { url = "https://files.pythonhosted.org/packages/d7/9a/7fbdbdb30c375f80818941165adfc4f1dc6cebaf937c6a9081a02d5871f0/cuda_tile-1.4.0-cp312-cp312-manylinux2014_x86_64.whl", hash = "sha256:1d9d99b6fa57366af3f8707ac4fd91411275af2ee736996a60620240fcf92070", size = 282503, upload-time = "2026-05-27T17:45:05.543Z" },
+    { url = "https://files.pythonhosted.org/packages/6f/bb/4152dc08a8de5bcdc4b9d80b6917216289526f6e786b09ee80d4df27bcfb/cuda_tile-1.4.0-cp312-cp312-win_amd64.whl", hash = "sha256:616f13cbc7af6caa7b92430b85ba0a429d1f96ca9e7e04a29d89114cfe859663", size = 269813, upload-time = "2026-05-27T17:46:20.583Z" },
+    { url = "https://files.pythonhosted.org/packages/5e/ad/42f0655e6aee5c59015634b46d7f13bc22e74af28d10fb2008a062b37349/cuda_tile-1.4.0-cp313-cp313-manylinux2014_aarch64.whl", hash = "sha256:fc74185efd81f6153af0a19549d111dec6861ee9b9bc27927a2cef6e19173eb5", size = 280958, upload-time = "2026-05-27T17:46:53.061Z" },
+    { url = "https://files.pythonhosted.org/packages/11/0b/4770f9e36b8108ce8c9078f71eb21c65e594d79c0770dd38daa045cfbd6c/cuda_tile-1.4.0-cp313-cp313-manylinux2014_x86_64.whl", hash = "sha256:45be74f6568c440446f510bc7799b953858e64c6abf26e96f2c9598a79084860", size = 282508, upload-time = "2026-05-27T17:45:18.515Z" },
+    { url = "https://files.pythonhosted.org/packages/a1/67/41f1acdf21bf6214a3a1c3b46d39b8eb0f9eba7aecc6b57005db35d56f9a/cuda_tile-1.4.0-cp313-cp313-win_amd64.whl", hash = "sha256:edd1df4d7955032c7be2a26c6d7e47261415ba7c87587705e0f4f1fd0d61650a", size = 269783, upload-time = "2026-05-27T17:47:16.631Z" },
+    { url = "https://files.pythonhosted.org/packages/0d/c6/46a329f4c56ce54471784366394e235804423df2531307e14112e4636c76/cuda_tile-1.4.0-cp314-cp314-manylinux2014_aarch64.whl", hash = "sha256:738593650784ebb3c601486914b563e7569144fe596048766ea9e12280ac3bb9", size = 281208, upload-time = "2026-05-27T17:46:48.325Z" },
+    { url = "https://files.pythonhosted.org/packages/8f/fb/bf3849ad68b1858ba50e6992863d266892d7d7db02d11c485c26cd090a1b/cuda_tile-1.4.0-cp314-cp314-manylinux2014_x86_64.whl", hash = "sha256:4b1a591c26836a550c2bf87c22d31c4716e5f83d24d255f843d9429625cca973", size = 282630, upload-time = "2026-05-27T17:45:10.789Z" },
+    { url = "https://files.pythonhosted.org/packages/61/bb/211c0d5121230ee76cfc1a9ee107ec28aaae9e6ffb43a04aa172d0d4f4dc/cuda_tile-1.4.0-cp314-cp314-win_amd64.whl", hash = "sha256:c19e10fe70ba92709b6ca446d1c52a8a346b56f4f8ad7c8941736f60e32f3c87", size = 270644, upload-time = "2026-05-27T17:45:01.914Z" },
+    { url = "https://files.pythonhosted.org/packages/ab/df/f7f1dfa4d1ee7cc5b69e11d756be6ffec1561a5c7e3836fd0f71ca49adcf/cuda_tile-1.4.0-cp314-cp314t-manylinux2014_aarch64.whl", hash = "sha256:b3cbeffbe0fedac4936edcf00b6ba13ab5ddb74d3b7ce4a287dfc04491b5f6af", size = 283249, upload-time = "2026-05-27T17:46:12.032Z" },
+    { url = "https://files.pythonhosted.org/packages/18/c0/fee527a085fca414fc993769912eb8ba2e15ce388f3168b868706e6d4c61/cuda_tile-1.4.0-cp314-cp314t-manylinux2014_x86_64.whl", hash = "sha256:675b2afff62af5d4e72c34bc72d0be27b0933a44933b8a449f590fbded8c1107", size = 284336, upload-time = "2026-05-27T17:44:59.489Z" },
+    { url = "https://files.pythonhosted.org/packages/0d/ab/0883194457932150a5ad334d609ac17bd704345974d21c8bae6ea251e7ed/cuda_tile-1.4.0-cp314-cp314t-win_amd64.whl", hash = "sha256:3f58eac5577ea3ed7c17bfcab015a506fd2cf61f8848407c5b403f1bf46c55ca", size = 275861, upload-time = "2026-05-27T17:46:36.285Z" },
+]
+
+[[package]]
 name = "cuda-toolkit"
 version = "12.8.1"
 source = { registry = "https://pypi.org/simple" }
@@ -1243,37 +1291,37 @@ wheels = [
 
 [package.optional-dependencies]
 cublas = [
-    { name = "nvidia-cublas-cu12", marker = "sys_platform == 'linux'" },
+    { name = "nvidia-cublas-cu12", marker = "sys_platform == 'linux' or sys_platform == 'win32' or (extra == 'extra-12-openpipe-art-backend' and extra == 'extra-12-openpipe-art-megatron') or (extra == 'extra-12-openpipe-art-megatron' and extra == 'extra-12-openpipe-art-tinker')" },
 ]
 cudart = [
-    { name = "nvidia-cuda-runtime-cu12", marker = "sys_platform == 'linux'" },
+    { name = "nvidia-cuda-runtime-cu12", marker = "sys_platform == 'linux' or sys_platform == 'win32' or (extra == 'extra-12-openpipe-art-backend' and extra == 'extra-12-openpipe-art-megatron') or (extra == 'extra-12-openpipe-art-megatron' and extra == 'extra-12-openpipe-art-tinker')" },
 ]
 cufft = [
-    { name = "nvidia-cufft-cu12", marker = "sys_platform == 'linux'" },
+    { name = "nvidia-cufft-cu12", marker = "sys_platform == 'linux' or sys_platform == 'win32' or (extra == 'extra-12-openpipe-art-backend' and extra == 'extra-12-openpipe-art-megatron') or (extra == 'extra-12-openpipe-art-megatron' and extra == 'extra-12-openpipe-art-tinker')" },
 ]
 cufile = [
-    { name = "nvidia-cufile-cu12", marker = "sys_platform == 'linux'" },
+    { name = "nvidia-cufile-cu12", marker = "sys_platform == 'linux' or (extra == 'extra-12-openpipe-art-backend' and extra == 'extra-12-openpipe-art-megatron') or (extra == 'extra-12-openpipe-art-megatron' and extra == 'extra-12-openpipe-art-tinker')" },
 ]
 cupti = [
-    { name = "nvidia-cuda-cupti-cu12", marker = "sys_platform == 'linux'" },
+    { name = "nvidia-cuda-cupti-cu12", marker = "sys_platform == 'linux' or sys_platform == 'win32' or (extra == 'extra-12-openpipe-art-backend' and extra == 'extra-12-openpipe-art-megatron') or (extra == 'extra-12-openpipe-art-megatron' and extra == 'extra-12-openpipe-art-tinker')" },
 ]
 curand = [
-    { name = "nvidia-curand-cu12", marker = "sys_platform == 'linux'" },
+    { name = "nvidia-curand-cu12", marker = "sys_platform == 'linux' or sys_platform == 'win32' or (extra == 'extra-12-openpipe-art-backend' and extra == 'extra-12-openpipe-art-megatron') or (extra == 'extra-12-openpipe-art-megatron' and extra == 'extra-12-openpipe-art-tinker')" },
 ]
 cusolver = [
-    { name = "nvidia-cusolver-cu12", marker = "sys_platform == 'linux'" },
+    { name = "nvidia-cusolver-cu12", marker = "sys_platform == 'linux' or sys_platform == 'win32' or (extra == 'extra-12-openpipe-art-backend' and extra == 'extra-12-openpipe-art-megatron') or (extra == 'extra-12-openpipe-art-megatron' and extra == 'extra-12-openpipe-art-tinker')" },
 ]
 cusparse = [
-    { name = "nvidia-cusparse-cu12", marker = "sys_platform == 'linux'" },
+    { name = "nvidia-cusparse-cu12", marker = "sys_platform == 'linux' or sys_platform == 'win32' or (extra == 'extra-12-openpipe-art-backend' and extra == 'extra-12-openpipe-art-megatron') or (extra == 'extra-12-openpipe-art-megatron' and extra == 'extra-12-openpipe-art-tinker')" },
 ]
 nvjitlink = [
-    { name = "nvidia-nvjitlink-cu12", marker = "sys_platform == 'linux'" },
+    { name = "nvidia-nvjitlink-cu12", marker = "sys_platform == 'linux' or sys_platform == 'win32' or (extra == 'extra-12-openpipe-art-backend' and extra == 'extra-12-openpipe-art-megatron') or (extra == 'extra-12-openpipe-art-megatron' and extra == 'extra-12-openpipe-art-tinker')" },
 ]
 nvrtc = [
-    { name = "nvidia-cuda-nvrtc-cu12", marker = "sys_platform == 'linux'" },
+    { name = "nvidia-cuda-nvrtc-cu12", marker = "sys_platform == 'linux' or sys_platform == 'win32' or (extra == 'extra-12-openpipe-art-backend' and extra == 'extra-12-openpipe-art-megatron') or (extra == 'extra-12-openpipe-art-megatron' and extra == 'extra-12-openpipe-art-tinker')" },
 ]
 nvtx = [
-    { name = "nvidia-nvtx-cu12", marker = "sys_platform == 'linux'" },
+    { name = "nvidia-nvtx-cu12", marker = "sys_platform == 'linux' or sys_platform == 'win32' or (extra == 'extra-12-openpipe-art-backend' and extra == 'extra-12-openpipe-art-megatron') or (extra == 'extra-12-openpipe-art-megatron' and extra == 'extra-12-openpipe-art-tinker')" },
 ]
 
 [[package]]
@@ -1297,8 +1345,8 @@ name = "cut-cross-entropy"
 version = "25.1.1"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
-    { name = "torch", version = "2.11.0", source = { registry = "https://pypi.org/simple" }, marker = "sys_platform != 'linux' and sys_platform != 'win32'" },
-    { name = "torch", version = "2.11.0+cu128", source = { registry = "https://download.pytorch.org/whl/cu128" }, marker = "sys_platform == 'linux' or sys_platform == 'win32'" },
+    { name = "torch", version = "2.11.0", source = { registry = "https://pypi.org/simple" }, marker = "(sys_platform != 'linux' and sys_platform != 'win32' and extra == 'extra-12-openpipe-art-backend') or (sys_platform == 'linux' and extra == 'extra-12-openpipe-art-backend' and extra == 'extra-12-openpipe-art-megatron') or (sys_platform == 'win32' and extra == 'extra-12-openpipe-art-backend' and extra == 'extra-12-openpipe-art-megatron') or (extra != 'extra-12-openpipe-art-backend' and extra == 'extra-12-openpipe-art-megatron' and extra == 'extra-12-openpipe-art-tinker')" },
+    { name = "torch", version = "2.11.0+cu128", source = { registry = "https://download.pytorch.org/whl/cu128" }, marker = "(sys_platform == 'linux' and extra == 'extra-12-openpipe-art-backend') or (sys_platform == 'win32' and extra == 'extra-12-openpipe-art-backend') or (extra == 'extra-12-openpipe-art-backend' and extra == 'extra-12-openpipe-art-megatron') or (extra == 'extra-12-openpipe-art-megatron' and extra == 'extra-12-openpipe-art-tinker')" },
     { name = "triton", marker = "sys_platform == 'linux'" },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/7e/97/45ff09cfcda7b200389204daa0125168e6544fba257adbbcdf728501d4f9/cut_cross_entropy-25.1.1.tar.gz", hash = "sha256:5fe5924509248b1aea5c890f8887c6a7759f7c8b1ebc0490e42c247c4f7c1e34", size = 22972, upload-time = "2025-01-07T12:21:53.896Z" }
@@ -1844,8 +1892,8 @@ version = "0.5.0"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "einops" },
-    { name = "torch", version = "2.11.0", source = { registry = "https://pypi.org/simple" }, marker = "sys_platform != 'linux' and sys_platform != 'win32'" },
-    { name = "torch", version = "2.11.0+cu128", source = { registry = "https://download.pytorch.org/whl/cu128" }, marker = "sys_platform == 'linux' or sys_platform == 'win32'" },
+    { name = "torch", version = "2.11.0", source = { registry = "https://pypi.org/simple" }, marker = "(sys_platform != 'linux' and sys_platform != 'win32' and extra == 'extra-12-openpipe-art-megatron') or (sys_platform == 'linux' and extra == 'extra-12-openpipe-art-backend' and extra == 'extra-12-openpipe-art-megatron') or (sys_platform == 'linux' and extra == 'extra-12-openpipe-art-megatron' and extra == 'extra-12-openpipe-art-tinker') or (sys_platform == 'win32' and extra == 'extra-12-openpipe-art-backend' and extra == 'extra-12-openpipe-art-megatron') or (sys_platform == 'win32' and extra == 'extra-12-openpipe-art-megatron' and extra == 'extra-12-openpipe-art-tinker')" },
+    { name = "torch", version = "2.11.0+cu128", source = { registry = "https://download.pytorch.org/whl/cu128" }, marker = "(sys_platform == 'linux' and extra == 'extra-12-openpipe-art-megatron') or (sys_platform == 'win32' and extra == 'extra-12-openpipe-art-megatron') or (extra == 'extra-12-openpipe-art-backend' and extra == 'extra-12-openpipe-art-megatron') or (extra == 'extra-12-openpipe-art-megatron' and extra == 'extra-12-openpipe-art-tinker')" },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/03/14/2aabd37839b9f3c6a67fbc5678f906d04d0c242c603ac234eefe02df99a6/fla_core-0.5.0.tar.gz", hash = "sha256:476dd94711702af81cc4827010d9209f6053d8cdceac8e43d3c8497071f07a81", size = 418171, upload-time = "2026-04-21T20:25:40.948Z" }
 wheels = [
@@ -1861,8 +1909,8 @@ dependencies = [
     { name = "einops" },
     { name = "nvidia-cutlass-dsl" },
     { name = "quack-kernels" },
-    { name = "torch", version = "2.11.0", source = { registry = "https://pypi.org/simple" }, marker = "sys_platform != 'linux' and sys_platform != 'win32'" },
-    { name = "torch", version = "2.11.0+cu128", source = { registry = "https://download.pytorch.org/whl/cu128" }, marker = "sys_platform == 'linux' or sys_platform == 'win32'" },
+    { name = "torch", version = "2.11.0", source = { registry = "https://pypi.org/simple" }, marker = "(sys_platform != 'linux' and sys_platform != 'win32' and extra == 'extra-12-openpipe-art-megatron') or (sys_platform == 'linux' and extra == 'extra-12-openpipe-art-backend' and extra == 'extra-12-openpipe-art-megatron') or (sys_platform == 'linux' and extra == 'extra-12-openpipe-art-megatron' and extra == 'extra-12-openpipe-art-tinker') or (sys_platform == 'win32' and extra == 'extra-12-openpipe-art-backend' and extra == 'extra-12-openpipe-art-megatron') or (sys_platform == 'win32' and extra == 'extra-12-openpipe-art-megatron' and extra == 'extra-12-openpipe-art-tinker')" },
+    { name = "torch", version = "2.11.0+cu128", source = { registry = "https://download.pytorch.org/whl/cu128" }, marker = "(sys_platform == 'linux' and extra == 'extra-12-openpipe-art-megatron') or (sys_platform == 'win32' and extra == 'extra-12-openpipe-art-megatron') or (extra == 'extra-12-openpipe-art-backend' and extra == 'extra-12-openpipe-art-megatron') or (extra == 'extra-12-openpipe-art-megatron' and extra == 'extra-12-openpipe-art-tinker')" },
     { name = "torch-c-dlpack-ext" },
     { name = "typing-extensions" },
 ]
@@ -1890,11 +1938,45 @@ version = "0.5.0"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "fla-core" },
-    { name = "transformers" },
+    { name = "transformers", version = "5.6.2", source = { registry = "https://pypi.org/simple" } },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/79/5c/1db76cc829c951117a3112f306d50333bd71399d2e35807fe7c99ffc2007/flash_linear_attention-0.5.0.tar.gz", hash = "sha256:22b789a47f07738b4382ecdf775d7bb40e0d803c467c34f8e2ecd6a1dc780938", size = 160419, upload-time = "2026-04-21T20:25:42.344Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/cc/16/7736db08806981562c728f32ea1dcb4565948fa9faffdbf4ffbf72522fbf/flash_linear_attention-0.5.0-py3-none-any.whl", hash = "sha256:92e64e989ed34355c1f838232597b2e39783ee0494ada3199b58e156aa1d8eb8", size = 319037, upload-time = "2026-04-21T20:25:39.473Z" },
+]
+
+[[package]]
+name = "flashinfer-cubin"
+version = "0.6.8.post1"
+source = { registry = "https://pypi.org/simple" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/11/b7/5e3b1a8c67031b421a8bd29c2bc29b900a550bb3392e8bda18bb15b5e476/flashinfer_cubin-0.6.8.post1-py3-none-any.whl", hash = "sha256:43636d4cd39e694a83d76a89f87fefcdf4cecb4c4f7dd22dac25ec368c1e901f", size = 295154113, upload-time = "2026-04-18T18:28:21.738Z" },
+]
+
+[[package]]
+name = "flashinfer-python"
+version = "0.6.8.post1"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "apache-tvm-ffi" },
+    { name = "click" },
+    { name = "cuda-tile" },
+    { name = "einops" },
+    { name = "ninja" },
+    { name = "numpy" },
+    { name = "nvidia-cudnn-frontend" },
+    { name = "nvidia-cutlass-dsl" },
+    { name = "nvidia-ml-py" },
+    { name = "packaging" },
+    { name = "requests" },
+    { name = "tabulate" },
+    { name = "torch", version = "2.11.0", source = { registry = "https://pypi.org/simple" }, marker = "(sys_platform != 'linux' and sys_platform != 'win32' and extra == 'extra-12-openpipe-art-megatron') or (sys_platform == 'linux' and extra == 'extra-12-openpipe-art-backend' and extra == 'extra-12-openpipe-art-megatron') or (sys_platform == 'linux' and extra == 'extra-12-openpipe-art-megatron' and extra == 'extra-12-openpipe-art-tinker') or (sys_platform == 'win32' and extra == 'extra-12-openpipe-art-backend' and extra == 'extra-12-openpipe-art-megatron') or (sys_platform == 'win32' and extra == 'extra-12-openpipe-art-megatron' and extra == 'extra-12-openpipe-art-tinker')" },
+    { name = "torch", version = "2.11.0+cu128", source = { registry = "https://download.pytorch.org/whl/cu128" }, marker = "(sys_platform == 'linux' and extra == 'extra-12-openpipe-art-megatron') or (sys_platform == 'win32' and extra == 'extra-12-openpipe-art-megatron') or (extra == 'extra-12-openpipe-art-backend' and extra == 'extra-12-openpipe-art-megatron') or (extra == 'extra-12-openpipe-art-megatron' and extra == 'extra-12-openpipe-art-tinker')" },
+    { name = "tqdm" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/53/1e/2760fef9e74abc4480961048e5790b4c9e955872fb4d7d97900cfddced5a/flashinfer_python-0.6.8.post1.tar.gz", hash = "sha256:b18e4121baf9b93fa9a9f368ba9b981a0342895f50ab9dddc224aeb964ed346f", size = 6675885, upload-time = "2026-04-18T18:28:13.299Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/73/6d/1e8a8533913e33a50a486332ce0673f4fdb860f6eb9ed450327c5c1762cb/flashinfer_python-0.6.8.post1-py3-none-any.whl", hash = "sha256:818f9b8cc2fe66c42a1f6264be4841ac8821ada703685a02cfccb2b5124a710b", size = 9385316, upload-time = "2026-04-18T18:28:10.285Z" },
 ]
 
 [[package]]
@@ -2420,7 +2502,7 @@ name = "gunicorn"
 version = "25.3.0"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
-    { name = "packaging", marker = "sys_platform != 'win32'" },
+    { name = "packaging" },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/c4/f4/e78fa054248fab913e2eab0332c6c2cb07421fca1ce56d8fe43b6aef57a4/gunicorn-25.3.0.tar.gz", hash = "sha256:f74e1b2f9f76f6cd1ca01198968bd2dd65830edc24b6e8e4d78de8320e2fe889", size = 634883, upload-time = "2026-03-27T00:00:26.092Z" }
 wheels = [
@@ -2454,7 +2536,7 @@ name = "hatch"
 version = "1.16.5"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
-    { name = "backports-zstd", marker = "python_full_version < '3.14'" },
+    { name = "backports-zstd", marker = "python_full_version < '3.14' or (extra == 'extra-12-openpipe-art-backend' and extra == 'extra-12-openpipe-art-megatron') or (extra == 'extra-12-openpipe-art-megatron' and extra == 'extra-12-openpipe-art-tinker')" },
     { name = "click" },
     { name = "hatchling" },
     { name = "httpx" },
@@ -2663,7 +2745,7 @@ source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "filelock" },
     { name = "fsspec" },
-    { name = "hf-xet", marker = "platform_machine == 'AMD64' or platform_machine == 'aarch64' or platform_machine == 'amd64' or platform_machine == 'arm64' or platform_machine == 'x86_64'" },
+    { name = "hf-xet", marker = "platform_machine == 'AMD64' or platform_machine == 'aarch64' or platform_machine == 'amd64' or platform_machine == 'arm64' or platform_machine == 'x86_64' or (extra == 'extra-12-openpipe-art-backend' and extra == 'extra-12-openpipe-art-megatron') or (extra == 'extra-12-openpipe-art-megatron' and extra == 'extra-12-openpipe-art-tinker')" },
     { name = "httpx" },
     { name = "packaging" },
     { name = "pyyaml" },
@@ -2870,7 +2952,7 @@ name = "ipykernel"
 version = "7.2.0"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
-    { name = "appnope", marker = "sys_platform == 'darwin'" },
+    { name = "appnope", marker = "sys_platform == 'darwin' or (extra == 'extra-12-openpipe-art-backend' and extra == 'extra-12-openpipe-art-megatron') or (extra == 'extra-12-openpipe-art-megatron' and extra == 'extra-12-openpipe-art-tinker')" },
     { name = "comm" },
     { name = "debugpy" },
     { name = "ipython" },
@@ -2894,12 +2976,12 @@ name = "ipython"
 version = "9.13.0"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
-    { name = "colorama", marker = "sys_platform == 'win32'" },
+    { name = "colorama", marker = "sys_platform == 'win32' or (extra == 'extra-12-openpipe-art-backend' and extra == 'extra-12-openpipe-art-megatron') or (extra == 'extra-12-openpipe-art-megatron' and extra == 'extra-12-openpipe-art-tinker')" },
     { name = "decorator" },
     { name = "ipython-pygments-lexers" },
     { name = "jedi" },
     { name = "matplotlib-inline" },
-    { name = "pexpect", marker = "sys_platform != 'emscripten' and sys_platform != 'win32'" },
+    { name = "pexpect", marker = "(sys_platform != 'emscripten' and sys_platform != 'win32') or (sys_platform == 'emscripten' and extra == 'extra-12-openpipe-art-backend' and extra == 'extra-12-openpipe-art-megatron') or (sys_platform == 'emscripten' and extra == 'extra-12-openpipe-art-megatron' and extra == 'extra-12-openpipe-art-tinker') or (sys_platform == 'win32' and extra == 'extra-12-openpipe-art-backend' and extra == 'extra-12-openpipe-art-megatron') or (sys_platform == 'win32' and extra == 'extra-12-openpipe-art-megatron' and extra == 'extra-12-openpipe-art-tinker')" },
     { name = "prompt-toolkit" },
     { name = "psutil" },
     { name = "pygments" },
@@ -3216,9 +3298,9 @@ dependencies = [
     { name = "jaraco-classes" },
     { name = "jaraco-context" },
     { name = "jaraco-functools" },
-    { name = "jeepney", marker = "sys_platform == 'linux'" },
-    { name = "pywin32-ctypes", marker = "sys_platform == 'win32'" },
-    { name = "secretstorage", marker = "sys_platform == 'linux'" },
+    { name = "jeepney", marker = "sys_platform == 'linux' or (extra == 'extra-12-openpipe-art-backend' and extra == 'extra-12-openpipe-art-megatron') or (extra == 'extra-12-openpipe-art-megatron' and extra == 'extra-12-openpipe-art-tinker')" },
+    { name = "pywin32-ctypes", marker = "sys_platform == 'win32' or (extra == 'extra-12-openpipe-art-backend' and extra == 'extra-12-openpipe-art-megatron') or (extra == 'extra-12-openpipe-art-megatron' and extra == 'extra-12-openpipe-art-tinker')" },
+    { name = "secretstorage", marker = "sys_platform == 'linux' or (extra == 'extra-12-openpipe-art-backend' and extra == 'extra-12-openpipe-art-megatron') or (extra == 'extra-12-openpipe-art-megatron' and extra == 'extra-12-openpipe-art-tinker')" },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/43/4b/674af6ef2f97d56f0ab5153bf0bfa28ccb6c3ed4d1babf4305449668807b/keyring-25.7.0.tar.gz", hash = "sha256:fe01bd85eb3f8fb3dd0405defdeac9a5b4f6f0439edbb3149577f244a2e8245b", size = 63516, upload-time = "2025-11-16T16:26:09.482Z" }
 wheels = [
@@ -3440,7 +3522,7 @@ version = "0.8.6"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "httpx" },
-    { name = "orjson", marker = "platform_python_implementation != 'PyPy'" },
+    { name = "orjson", marker = "platform_python_implementation != 'PyPy' or (extra == 'extra-12-openpipe-art-backend' and extra == 'extra-12-openpipe-art-megatron') or (extra == 'extra-12-openpipe-art-megatron' and extra == 'extra-12-openpipe-art-tinker')" },
     { name = "packaging" },
     { name = "pydantic" },
     { name = "requests" },
@@ -3731,8 +3813,8 @@ wheels = [
 
 [[package]]
 name = "megatron-bridge"
-version = "0.4.0rc0"
-source = { git = "https://github.com/NVIDIA-NeMo/Megatron-Bridge.git?rev=e049cc00c24d03e2ae45d2608c7a44e2d2364e3d#e049cc00c24d03e2ae45d2608c7a44e2d2364e3d" }
+version = "0.5.0+e1a207ac"
+source = { git = "https://github.com/NVIDIA-NeMo/Megatron-Bridge.git?rev=e1a207ac757e5d0ed94d8ffbe1cbd28e81d8c084#e1a207ac757e5d0ed94d8ffbe1cbd28e81d8c084" }
 dependencies = [
     { name = "accelerate" },
     { name = "comet-ml" },
@@ -3740,10 +3822,13 @@ dependencies = [
     { name = "diffusers" },
     { name = "einops" },
     { name = "flash-linear-attention" },
+    { name = "flashinfer-cubin" },
+    { name = "flashinfer-python" },
     { name = "hydra-core" },
     { name = "imageio" },
     { name = "imageio-ffmpeg" },
     { name = "megatron-core" },
+    { name = "mistral-common" },
     { name = "mlflow" },
     { name = "nvidia-resiliency-ext" },
     { name = "omegaconf" },
@@ -3756,11 +3841,10 @@ dependencies = [
     { name = "six" },
     { name = "tensorboard" },
     { name = "timm" },
-    { name = "torch", version = "2.11.0", source = { registry = "https://pypi.org/simple" }, marker = "sys_platform != 'linux' and sys_platform != 'win32'" },
-    { name = "torch", version = "2.11.0+cu128", source = { registry = "https://download.pytorch.org/whl/cu128" }, marker = "sys_platform == 'linux' or sys_platform == 'win32'" },
+    { name = "torch", version = "2.11.0", source = { registry = "https://pypi.org/simple" }, marker = "(sys_platform != 'linux' and sys_platform != 'win32' and extra == 'extra-12-openpipe-art-megatron') or (sys_platform == 'linux' and extra == 'extra-12-openpipe-art-backend' and extra == 'extra-12-openpipe-art-megatron') or (sys_platform == 'linux' and extra == 'extra-12-openpipe-art-megatron' and extra == 'extra-12-openpipe-art-tinker') or (sys_platform == 'win32' and extra == 'extra-12-openpipe-art-backend' and extra == 'extra-12-openpipe-art-megatron') or (sys_platform == 'win32' and extra == 'extra-12-openpipe-art-megatron' and extra == 'extra-12-openpipe-art-tinker')" },
+    { name = "torch", version = "2.11.0+cu128", source = { registry = "https://download.pytorch.org/whl/cu128" }, marker = "(sys_platform == 'linux' and extra == 'extra-12-openpipe-art-megatron') or (sys_platform == 'win32' and extra == 'extra-12-openpipe-art-megatron') or (extra == 'extra-12-openpipe-art-backend' and extra == 'extra-12-openpipe-art-megatron') or (extra == 'extra-12-openpipe-art-megatron' and extra == 'extra-12-openpipe-art-tinker')" },
     { name = "tqdm" },
-    { name = "transformer-engine" },
-    { name = "transformers" },
+    { name = "transformers", version = "5.6.2", source = { registry = "https://pypi.org/simple" } },
     { name = "typing-extensions" },
     { name = "wandb" },
 ]
@@ -3772,8 +3856,8 @@ source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "numpy" },
     { name = "packaging" },
-    { name = "torch", version = "2.11.0", source = { registry = "https://pypi.org/simple" }, marker = "sys_platform != 'linux' and sys_platform != 'win32'" },
-    { name = "torch", version = "2.11.0+cu128", source = { registry = "https://download.pytorch.org/whl/cu128" }, marker = "sys_platform == 'linux' or sys_platform == 'win32'" },
+    { name = "torch", version = "2.11.0", source = { registry = "https://pypi.org/simple" }, marker = "(sys_platform != 'linux' and sys_platform != 'win32' and extra == 'extra-12-openpipe-art-megatron') or (sys_platform == 'linux' and extra == 'extra-12-openpipe-art-backend' and extra == 'extra-12-openpipe-art-megatron') or (sys_platform == 'linux' and extra == 'extra-12-openpipe-art-megatron' and extra == 'extra-12-openpipe-art-tinker') or (sys_platform == 'win32' and extra == 'extra-12-openpipe-art-backend' and extra == 'extra-12-openpipe-art-megatron') or (sys_platform == 'win32' and extra == 'extra-12-openpipe-art-megatron' and extra == 'extra-12-openpipe-art-tinker')" },
+    { name = "torch", version = "2.11.0+cu128", source = { registry = "https://download.pytorch.org/whl/cu128" }, marker = "(sys_platform == 'linux' and extra == 'extra-12-openpipe-art-megatron') or (sys_platform == 'win32' and extra == 'extra-12-openpipe-art-megatron') or (extra == 'extra-12-openpipe-art-backend' and extra == 'extra-12-openpipe-art-megatron') or (extra == 'extra-12-openpipe-art-megatron' and extra == 'extra-12-openpipe-art-tinker')" },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/bc/89/f690c7d282200d6e36078f4bfbb9e6862102105c062fbf9b518c5b72df38/megatron_core-0.17.0.tar.gz", hash = "sha256:ff66c206ed164bc602ff00310388605fac41f284262176e17246a9e94163b205", size = 1385595, upload-time = "2026-04-16T20:22:32.079Z" }
 wheels = [
@@ -3781,6 +3865,25 @@ wheels = [
     { url = "https://files.pythonhosted.org/packages/4e/ad/1c15b4078ad9fc99ba347e112bdf5082d182473f729d906e0c99b8a1f5fb/megatron_core-0.17.0-cp312-cp312-manylinux_2_24_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:0cbacf043603f9dc2735310e1b1dcd5c076c02caab13849c2d2fe6a99cbea4f6", size = 1725087, upload-time = "2026-04-16T20:22:27.517Z" },
     { url = "https://files.pythonhosted.org/packages/42/37/922434ed189ceaef037e4d40ff1f0e2af3026ceeff9516da766a179446f7/megatron_core-0.17.0-cp313-cp313-manylinux_2_24_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:7d60377cb8bc54037027176a65c65105239474f51ff5b26d034bfe112956e03c", size = 1717170, upload-time = "2026-04-16T20:22:26.079Z" },
     { url = "https://files.pythonhosted.org/packages/dc/44/0ee6bca0e8056d6daf0c21f15f74e36b2628318e19dd78dfaac185c6b547/megatron_core-0.17.0-cp313-cp313-manylinux_2_24_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:7a54ad8a8e221ba989a721da73496cc86ecd84ec79a711449060a15d690005b5", size = 1725175, upload-time = "2026-04-16T20:22:30.032Z" },
+]
+
+[[package]]
+name = "mistral-common"
+version = "1.11.3"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "jsonschema" },
+    { name = "numpy" },
+    { name = "pillow" },
+    { name = "pydantic" },
+    { name = "pydantic-extra-types", extra = ["pycountry"], marker = "extra == 'extra-12-openpipe-art-megatron'" },
+    { name = "requests" },
+    { name = "tiktoken" },
+    { name = "typing-extensions" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/2e/03/3c5d4c9430da406f8444f9a7b058a6aa89c525fb068a57fe2ab8b04a6d08/mistral_common-1.11.3.tar.gz", hash = "sha256:6437e128fc8a307318440839ca14ddf2e8060056b062233ec0db10352651374c", size = 6360629, upload-time = "2026-06-04T09:01:11.131Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/7b/76/dbfdf9c59e2a4b0116587626a3768c2a3b2ba1758b5756743918c2337fdc/mistral_common-1.11.3-py3-none-any.whl", hash = "sha256:dbfcef9d0c892727ee08a080f0c1039baed5430b291f5425ffd88892bf09e52c", size = 6533154, upload-time = "2026-06-04T09:01:14.186Z" },
 ]
 
 [[package]]
@@ -4253,6 +4356,7 @@ source = { registry = "https://pypi.org/simple" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/29/99/db44d685f0e257ff0e213ade1964fc459b4a690a73293220e98feb3307cf/nvidia_cublas_cu12-12.8.4.1-py3-none-manylinux_2_27_aarch64.whl", hash = "sha256:b86f6dd8935884615a0683b663891d43781b819ac4f2ba2b0c9604676af346d0", size = 590537124, upload-time = "2025-03-07T01:43:53.556Z" },
     { url = "https://files.pythonhosted.org/packages/dc/61/e24b560ab2e2eaeb3c839129175fb330dfcfc29e5203196e5541a4c44682/nvidia_cublas_cu12-12.8.4.1-py3-none-manylinux_2_27_x86_64.whl", hash = "sha256:8ac4e771d5a348c551b2a426eda6193c19aa630236b418086020df5ba9667142", size = 594346921, upload-time = "2025-03-07T01:44:31.254Z" },
+    { url = "https://files.pythonhosted.org/packages/70/61/7d7b3c70186fb651d0fbd35b01dbfc8e755f69fd58f817f3d0f642df20c3/nvidia_cublas_cu12-12.8.4.1-py3-none-win_amd64.whl", hash = "sha256:47e9b82132fa8d2b4944e708049229601448aaad7e6f296f630f2d1a32de35af", size = 567544208, upload-time = "2025-03-07T01:53:30.535Z" },
 ]
 
 [[package]]
@@ -4262,6 +4366,7 @@ source = { registry = "https://pypi.org/simple" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/d5/1f/b3bd73445e5cb342727fd24fe1f7b748f690b460acadc27ea22f904502c8/nvidia_cuda_cupti_cu12-12.8.90-py3-none-manylinux2014_aarch64.manylinux_2_17_aarch64.whl", hash = "sha256:4412396548808ddfed3f17a467b104ba7751e6b58678a4b840675c56d21cf7ed", size = 9533318, upload-time = "2025-03-07T01:40:10.421Z" },
     { url = "https://files.pythonhosted.org/packages/f8/02/2adcaa145158bf1a8295d83591d22e4103dbfd821bcaf6f3f53151ca4ffa/nvidia_cuda_cupti_cu12-12.8.90-py3-none-manylinux2014_x86_64.manylinux_2_17_x86_64.whl", hash = "sha256:ea0cb07ebda26bb9b29ba82cda34849e73c166c18162d3913575b0c9db9a6182", size = 10248621, upload-time = "2025-03-07T01:40:21.213Z" },
+    { url = "https://files.pythonhosted.org/packages/41/bc/83f5426095d93694ae39fe1311431b5d5a9bb82e48bf0dd8e19be2765942/nvidia_cuda_cupti_cu12-12.8.90-py3-none-win_amd64.whl", hash = "sha256:bb479dcdf7e6d4f8b0b01b115260399bf34154a1a2e9fe11c85c517d87efd98e", size = 7015759, upload-time = "2025-03-07T01:51:11.355Z" },
 ]
 
 [[package]]
@@ -4271,6 +4376,7 @@ source = { registry = "https://pypi.org/simple" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/05/6b/32f747947df2da6994e999492ab306a903659555dddc0fbdeb9d71f75e52/nvidia_cuda_nvrtc_cu12-12.8.93-py3-none-manylinux2010_x86_64.manylinux_2_12_x86_64.whl", hash = "sha256:a7756528852ef889772a84c6cd89d41dfa74667e24cca16bb31f8f061e3e9994", size = 88040029, upload-time = "2025-03-07T01:42:13.562Z" },
     { url = "https://files.pythonhosted.org/packages/eb/d1/e50d0acaab360482034b84b6e27ee83c6738f7d32182b987f9c7a4e32962/nvidia_cuda_nvrtc_cu12-12.8.93-py3-none-manylinux2014_aarch64.manylinux_2_17_aarch64.whl", hash = "sha256:fc1fec1e1637854b4c0a65fb9a8346b51dd9ee69e61ebaccc82058441f15bce8", size = 43106076, upload-time = "2025-03-07T01:41:59.817Z" },
+    { url = "https://files.pythonhosted.org/packages/45/51/52a3d84baa2136cc8df15500ad731d74d3a1114d4c123e043cb608d4a32b/nvidia_cuda_nvrtc_cu12-12.8.93-py3-none-win_amd64.whl", hash = "sha256:7a4b6b2904850fe78e0bd179c4b655c404d4bb799ef03ddc60804247099ae909", size = 73586838, upload-time = "2025-03-07T01:52:13.483Z" },
 ]
 
 [[package]]
@@ -4280,6 +4386,7 @@ source = { registry = "https://pypi.org/simple" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/7c/75/f865a3b236e4647605ea34cc450900854ba123834a5f1598e160b9530c3a/nvidia_cuda_runtime_cu12-12.8.90-py3-none-manylinux2014_aarch64.manylinux_2_17_aarch64.whl", hash = "sha256:52bf7bbee900262ffefe5e9d5a2a69a30d97e2bc5bb6cc866688caa976966e3d", size = 965265, upload-time = "2025-03-07T01:39:43.533Z" },
     { url = "https://files.pythonhosted.org/packages/0d/9b/a997b638fcd068ad6e4d53b8551a7d30fe8b404d6f1804abf1df69838932/nvidia_cuda_runtime_cu12-12.8.90-py3-none-manylinux2014_x86_64.manylinux_2_17_x86_64.whl", hash = "sha256:adade8dcbd0edf427b7204d480d6066d33902cab2a4707dcfc48a2d0fd44ab90", size = 954765, upload-time = "2025-03-07T01:40:01.615Z" },
+    { url = "https://files.pythonhosted.org/packages/30/a5/a515b7600ad361ea14bfa13fb4d6687abf500adc270f19e89849c0590492/nvidia_cuda_runtime_cu12-12.8.90-py3-none-win_amd64.whl", hash = "sha256:c0c6027f01505bfed6c3b21ec546f69c687689aad5f1a377554bc6ca4aa993a8", size = 944318, upload-time = "2025-03-07T01:51:01.794Z" },
 ]
 
 [[package]]
@@ -4287,11 +4394,12 @@ name = "nvidia-cudnn-cu12"
 version = "9.19.0.56"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
-    { name = "nvidia-cublas-cu12", marker = "sys_platform == 'linux'" },
+    { name = "nvidia-cublas-cu12", marker = "sys_platform == 'linux' or sys_platform == 'win32' or (extra == 'extra-12-openpipe-art-backend' and extra == 'extra-12-openpipe-art-megatron') or (extra == 'extra-12-openpipe-art-megatron' and extra == 'extra-12-openpipe-art-tinker')" },
 ]
 wheels = [
     { url = "https://files.pythonhosted.org/packages/09/b8/277c51962ee46fa3e5b203ac5f76107c650f781d6891e681e28e6f3e9fe6/nvidia_cudnn_cu12-9.19.0.56-py3-none-manylinux_2_27_aarch64.whl", hash = "sha256:08caaf27fe556aca82a3ee3b5aa49a77e7de0cfcb7ff4e5c29da426387a8267e", size = 656910700, upload-time = "2026-02-03T20:40:25.508Z" },
     { url = "https://files.pythonhosted.org/packages/c5/41/65225d42fba06fb3dd3972485ea258e7dd07a40d6e01c95da6766ad87354/nvidia_cudnn_cu12-9.19.0.56-py3-none-manylinux_2_27_x86_64.whl", hash = "sha256:ac6ad90a075bb33a94f2b4cf4622eac13dd4dc65cf6dd9c7572a318516a36625", size = 657906812, upload-time = "2026-02-03T20:44:12.638Z" },
+    { url = "https://files.pythonhosted.org/packages/a7/a5/48f07449fc9c6cc146dcafe6149fa5d69630137d2ec5b7d9e09f255fadd7/nvidia_cudnn_cu12-9.19.0.56-py3-none-win_amd64.whl", hash = "sha256:cec70596b9ce878fab83810c3f5a2e606d35f510e5fee579759e4cbc68a23750", size = 644003014, upload-time = "2026-02-03T20:46:25.768Z" },
 ]
 
 [[package]]
@@ -4301,10 +4409,13 @@ source = { registry = "https://pypi.org/simple" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/0e/eb/22b4cad479206a3824edf494582e19fc4a291b9c14febdb859e56b82c03f/nvidia_cudnn_frontend-1.20.0-cp312-cp312-manylinux_2_27_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:bb891643598ac7b3734b82e5a459cbf778e467ebf7a5b586840003fb66df0ef3", size = 2371995, upload-time = "2026-03-16T18:29:29.024Z" },
     { url = "https://files.pythonhosted.org/packages/aa/83/ee43fc097f475367f1ff5d5e3e1d8191d253f486cdd502d13600759fb845/nvidia_cudnn_frontend-1.20.0-cp312-cp312-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:ce50afe3d1efda07f52e8df5e992f33e92dbb443d0e61e2de703ad5762edc53c", size = 2521021, upload-time = "2026-03-16T18:25:37.316Z" },
+    { url = "https://files.pythonhosted.org/packages/cc/03/d2d725c9c6eb04cd4a3216a7d1a37ab825d2ae8822b79a78b458ab703607/nvidia_cudnn_frontend-1.20.0-cp312-cp312-win_amd64.whl", hash = "sha256:f2449b0cfc547688e27f975c6ad5101257ae86df0315a80f28af78995adf55b6", size = 1944734, upload-time = "2026-03-16T18:33:02.866Z" },
     { url = "https://files.pythonhosted.org/packages/d7/26/e5a309fe92ad67f2dc1ea85b2615f40db6c19f6a7b36b40036d57ae23a66/nvidia_cudnn_frontend-1.20.0-cp313-cp313-manylinux_2_27_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:651fdc9a61b0a4456b557d5f82fab72739b0a6ee61384a4cb23767191e2640cd", size = 2371699, upload-time = "2026-03-16T18:30:19.865Z" },
     { url = "https://files.pythonhosted.org/packages/2d/6f/a9f5df2e003ce6f57b6e609e323fc13379a0f7966d2e044de4ceb87ec4b4/nvidia_cudnn_frontend-1.20.0-cp313-cp313-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:f317548e700f74c167fa4988de5f0ac06931820e4d0c35b5c7dfe629dd191be4", size = 2521383, upload-time = "2026-03-16T18:26:12.09Z" },
+    { url = "https://files.pythonhosted.org/packages/90/8f/cba72a4deb5168bba97d0094dbfe05591a12bc9cc9432bbfd0c107ddca33/nvidia_cudnn_frontend-1.20.0-cp313-cp313-win_amd64.whl", hash = "sha256:64e5c21853732a2f6ecf031d95d100656514d43fd2260f64266b5f8536f46434", size = 1944767, upload-time = "2026-03-16T18:33:25.204Z" },
     { url = "https://files.pythonhosted.org/packages/f9/a0/d2634d910257e6827d178dcebdf109f7f2bd8003659675dffc82fa101077/nvidia_cudnn_frontend-1.20.0-cp314-cp314-manylinux_2_27_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:6a1cf3e86664fb64e4752d3936d9cebd0afa6c4b5f6ccde19b6ee4d65fcd9d17", size = 2373944, upload-time = "2026-03-16T18:31:06.31Z" },
     { url = "https://files.pythonhosted.org/packages/79/a2/dd2a75942b0311a50bfef3173b240695a5ebdbcbd3c5154d8f333ef6dac6/nvidia_cudnn_frontend-1.20.0-cp314-cp314-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:f4da0e9ed299843abdcccdde73392577809403d4ef2ad26b4335a3eaee42423f", size = 2522596, upload-time = "2026-03-16T18:26:34.249Z" },
+    { url = "https://files.pythonhosted.org/packages/ce/af/7110cea67a8cc8f3cd129cead952f5d50078c8bb99cf35e9f78c74a27097/nvidia_cudnn_frontend-1.20.0-cp314-cp314-win_amd64.whl", hash = "sha256:3f596e54398efab24727fc47291c61f969051f37e57e186ffe0fb6df06db19fd", size = 1946060, upload-time = "2026-03-16T18:33:47.963Z" },
 ]
 
 [[package]]
@@ -4312,11 +4423,12 @@ name = "nvidia-cufft-cu12"
 version = "11.3.3.83"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
-    { name = "nvidia-nvjitlink-cu12", marker = "sys_platform == 'linux'" },
+    { name = "nvidia-nvjitlink-cu12", marker = "sys_platform == 'linux' or sys_platform == 'win32' or (extra == 'extra-12-openpipe-art-backend' and extra == 'extra-12-openpipe-art-megatron') or (extra == 'extra-12-openpipe-art-megatron' and extra == 'extra-12-openpipe-art-tinker')" },
 ]
 wheels = [
     { url = "https://files.pythonhosted.org/packages/60/bc/7771846d3a0272026c416fbb7e5f4c1f146d6d80704534d0b187dd6f4800/nvidia_cufft_cu12-11.3.3.83-py3-none-manylinux2014_aarch64.manylinux_2_17_aarch64.whl", hash = "sha256:848ef7224d6305cdb2a4df928759dca7b1201874787083b6e7550dd6765ce69a", size = 193109211, upload-time = "2025-03-07T01:44:56.873Z" },
     { url = "https://files.pythonhosted.org/packages/1f/13/ee4e00f30e676b66ae65b4f08cb5bcbb8392c03f54f2d5413ea99a5d1c80/nvidia_cufft_cu12-11.3.3.83-py3-none-manylinux2014_x86_64.manylinux_2_17_x86_64.whl", hash = "sha256:4d2dd21ec0b88cf61b62e6b43564355e5222e4a3fb394cac0db101f2dd0d4f74", size = 193118695, upload-time = "2025-03-07T01:45:27.821Z" },
+    { url = "https://files.pythonhosted.org/packages/7d/ec/ce1629f1e478bb5ccd208986b5f9e0316a78538dd6ab1d0484f012f8e2a1/nvidia_cufft_cu12-11.3.3.83-py3-none-win_amd64.whl", hash = "sha256:7a64a98ef2a7c47f905aaf8931b69a3a43f27c55530c698bb2ed7c75c0b42cb7", size = 192216559, upload-time = "2025-03-07T01:53:57.106Z" },
 ]
 
 [[package]]
@@ -4335,6 +4447,7 @@ source = { registry = "https://pypi.org/simple" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/45/5e/92aa15eca622a388b80fbf8375d4760738df6285b1e92c43d37390a33a9a/nvidia_curand_cu12-10.3.9.90-py3-none-manylinux_2_27_aarch64.whl", hash = "sha256:dfab99248034673b779bc6decafdc3404a8a6f502462201f2f31f11354204acd", size = 63625754, upload-time = "2025-03-07T01:46:10.735Z" },
     { url = "https://files.pythonhosted.org/packages/fb/aa/6584b56dc84ebe9cf93226a5cde4d99080c8e90ab40f0c27bda7a0f29aa1/nvidia_curand_cu12-10.3.9.90-py3-none-manylinux_2_27_x86_64.whl", hash = "sha256:b32331d4f4df5d6eefa0554c565b626c7216f87a06a4f56fab27c3b68a830ec9", size = 63619976, upload-time = "2025-03-07T01:46:23.323Z" },
+    { url = "https://files.pythonhosted.org/packages/b9/75/70c05b2f3ed5be3bb30b7102b6eb78e100da4bbf6944fd6725c012831cab/nvidia_curand_cu12-10.3.9.90-py3-none-win_amd64.whl", hash = "sha256:f149a8ca457277da854f89cf282d6ef43176861926c7ac85b2a0fbd237c587ec", size = 62765309, upload-time = "2025-03-07T01:54:20.478Z" },
 ]
 
 [[package]]
@@ -4342,13 +4455,14 @@ name = "nvidia-cusolver-cu12"
 version = "11.7.3.90"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
-    { name = "nvidia-cublas-cu12", marker = "sys_platform == 'linux'" },
-    { name = "nvidia-cusparse-cu12", marker = "sys_platform == 'linux'" },
-    { name = "nvidia-nvjitlink-cu12", marker = "sys_platform == 'linux'" },
+    { name = "nvidia-cublas-cu12", marker = "sys_platform == 'linux' or sys_platform == 'win32' or (extra == 'extra-12-openpipe-art-backend' and extra == 'extra-12-openpipe-art-megatron') or (extra == 'extra-12-openpipe-art-megatron' and extra == 'extra-12-openpipe-art-tinker')" },
+    { name = "nvidia-cusparse-cu12", marker = "sys_platform == 'linux' or sys_platform == 'win32' or (extra == 'extra-12-openpipe-art-backend' and extra == 'extra-12-openpipe-art-megatron') or (extra == 'extra-12-openpipe-art-megatron' and extra == 'extra-12-openpipe-art-tinker')" },
+    { name = "nvidia-nvjitlink-cu12", marker = "sys_platform == 'linux' or sys_platform == 'win32' or (extra == 'extra-12-openpipe-art-backend' and extra == 'extra-12-openpipe-art-megatron') or (extra == 'extra-12-openpipe-art-megatron' and extra == 'extra-12-openpipe-art-tinker')" },
 ]
 wheels = [
     { url = "https://files.pythonhosted.org/packages/c8/32/f7cd6ce8a7690544d084ea21c26e910a97e077c9b7f07bf5de623ee19981/nvidia_cusolver_cu12-11.7.3.90-py3-none-manylinux_2_27_aarch64.whl", hash = "sha256:db9ed69dbef9715071232caa9b69c52ac7de3a95773c2db65bdba85916e4e5c0", size = 267229841, upload-time = "2025-03-07T01:46:54.356Z" },
     { url = "https://files.pythonhosted.org/packages/85/48/9a13d2975803e8cf2777d5ed57b87a0b6ca2cc795f9a4f59796a910bfb80/nvidia_cusolver_cu12-11.7.3.90-py3-none-manylinux_2_27_x86_64.whl", hash = "sha256:4376c11ad263152bd50ea295c05370360776f8c3427b30991df774f9fb26c450", size = 267506905, upload-time = "2025-03-07T01:47:16.273Z" },
+    { url = "https://files.pythonhosted.org/packages/13/c0/76ca8551b8a84146ffa189fec81c26d04adba4bc0dbe09cd6e6fd9b7de04/nvidia_cusolver_cu12-11.7.3.90-py3-none-win_amd64.whl", hash = "sha256:4a550db115fcabc4d495eb7d39ac8b58d4ab5d8e63274d3754df1c0ad6a22d34", size = 256720438, upload-time = "2025-03-07T01:54:39.898Z" },
 ]
 
 [[package]]
@@ -4356,11 +4470,12 @@ name = "nvidia-cusparse-cu12"
 version = "12.5.8.93"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
-    { name = "nvidia-nvjitlink-cu12", marker = "sys_platform == 'linux'" },
+    { name = "nvidia-nvjitlink-cu12", marker = "sys_platform == 'linux' or sys_platform == 'win32' or (extra == 'extra-12-openpipe-art-backend' and extra == 'extra-12-openpipe-art-megatron') or (extra == 'extra-12-openpipe-art-megatron' and extra == 'extra-12-openpipe-art-tinker')" },
 ]
 wheels = [
     { url = "https://files.pythonhosted.org/packages/bc/f7/cd777c4109681367721b00a106f491e0d0d15cfa1fd59672ce580ce42a97/nvidia_cusparse_cu12-12.5.8.93-py3-none-manylinux2014_aarch64.manylinux_2_17_aarch64.whl", hash = "sha256:9b6c161cb130be1a07a27ea6923df8141f3c295852f4b260c65f18f3e0a091dc", size = 288117129, upload-time = "2025-03-07T01:47:40.407Z" },
     { url = "https://files.pythonhosted.org/packages/c2/f5/e1854cb2f2bcd4280c44736c93550cc300ff4b8c95ebe370d0aa7d2b473d/nvidia_cusparse_cu12-12.5.8.93-py3-none-manylinux2014_x86_64.manylinux_2_17_x86_64.whl", hash = "sha256:1ec05d76bbbd8b61b06a80e1eaf8cf4959c3d4ce8e711b65ebd0443bb0ebb13b", size = 288216466, upload-time = "2025-03-07T01:48:13.779Z" },
+    { url = "https://files.pythonhosted.org/packages/62/07/f3b2ad63f8e3d257a599f422ae34eb565e70c41031aecefa3d18b62cabd1/nvidia_cusparse_cu12-12.5.8.93-py3-none-win_amd64.whl", hash = "sha256:9a33604331cb2cac199f2e7f5104dfbb8a5a898c367a53dfda9ff2acb6b6b4dd", size = 284937404, upload-time = "2025-03-07T01:55:07.742Z" },
 ]
 
 [[package]]
@@ -4370,6 +4485,7 @@ source = { registry = "https://pypi.org/simple" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/73/b9/598f6ff36faaece4b3c50d26f50e38661499ff34346f00e057760b35cc9d/nvidia_cusparselt_cu12-0.7.1-py3-none-manylinux2014_aarch64.whl", hash = "sha256:8878dce784d0fac90131b6817b607e803c36e629ba34dc5b433471382196b6a5", size = 283835557, upload-time = "2025-02-26T00:16:54.265Z" },
     { url = "https://files.pythonhosted.org/packages/56/79/12978b96bd44274fe38b5dde5cfb660b1d114f70a65ef962bcbbed99b549/nvidia_cusparselt_cu12-0.7.1-py3-none-manylinux2014_x86_64.whl", hash = "sha256:f1bb701d6b930d5a7cea44c19ceb973311500847f81b634d802b7b539dc55623", size = 287193691, upload-time = "2025-02-26T00:15:44.104Z" },
+    { url = "https://files.pythonhosted.org/packages/2f/d8/a6b0d0d0c2435e9310f3e2bb0d9c9dd4c33daef86aa5f30b3681defd37ea/nvidia_cusparselt_cu12-0.7.1-py3-none-win_amd64.whl", hash = "sha256:f67fbb5831940ec829c9117b7f33807db9f9678dc2a617fbe781cac17b4e1075", size = 271020911, upload-time = "2025-02-26T00:14:47.204Z" },
 ]
 
 [[package]]
@@ -4430,8 +4546,8 @@ dependencies = [
     { name = "safetensors" },
     { name = "scipy" },
     { name = "setuptools" },
-    { name = "torch", version = "2.11.0", source = { registry = "https://pypi.org/simple" }, marker = "sys_platform != 'linux' and sys_platform != 'win32'" },
-    { name = "torch", version = "2.11.0+cu128", source = { registry = "https://download.pytorch.org/whl/cu128" }, marker = "sys_platform == 'linux' or sys_platform == 'win32'" },
+    { name = "torch", version = "2.11.0", source = { registry = "https://pypi.org/simple" }, marker = "(sys_platform != 'linux' and sys_platform != 'win32' and extra == 'extra-12-openpipe-art-megatron') or (sys_platform == 'linux' and extra == 'extra-12-openpipe-art-backend' and extra == 'extra-12-openpipe-art-megatron') or (sys_platform == 'linux' and extra == 'extra-12-openpipe-art-megatron' and extra == 'extra-12-openpipe-art-tinker') or (sys_platform == 'win32' and extra == 'extra-12-openpipe-art-backend' and extra == 'extra-12-openpipe-art-megatron') or (sys_platform == 'win32' and extra == 'extra-12-openpipe-art-megatron' and extra == 'extra-12-openpipe-art-tinker')" },
+    { name = "torch", version = "2.11.0+cu128", source = { registry = "https://download.pytorch.org/whl/cu128" }, marker = "(sys_platform == 'linux' and extra == 'extra-12-openpipe-art-megatron') or (sys_platform == 'win32' and extra == 'extra-12-openpipe-art-megatron') or (extra == 'extra-12-openpipe-art-backend' and extra == 'extra-12-openpipe-art-megatron') or (extra == 'extra-12-openpipe-art-megatron' and extra == 'extra-12-openpipe-art-tinker')" },
     { name = "tqdm" },
 ]
 wheels = [
@@ -4454,6 +4570,7 @@ source = { registry = "https://pypi.org/simple" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/f6/74/86a07f1d0f42998ca31312f998bd3b9a7eff7f52378f4f270c8679c77fb9/nvidia_nvjitlink_cu12-12.8.93-py3-none-manylinux2010_x86_64.manylinux_2_12_x86_64.whl", hash = "sha256:81ff63371a7ebd6e6451970684f916be2eab07321b73c9d244dc2b4da7f73b88", size = 39254836, upload-time = "2025-03-07T01:49:55.661Z" },
     { url = "https://files.pythonhosted.org/packages/2a/a2/8cee5da30d13430e87bf99bb33455d2724d0a4a9cb5d7926d80ccb96d008/nvidia_nvjitlink_cu12-12.8.93-py3-none-manylinux2014_aarch64.manylinux_2_17_aarch64.whl", hash = "sha256:adccd7161ace7261e01bb91e44e88da350895c270d23f744f0820c818b7229e7", size = 38386204, upload-time = "2025-03-07T01:49:43.612Z" },
+    { url = "https://files.pythonhosted.org/packages/ed/d7/34f02dad2e30c31b10a51f6b04e025e5dd60e5f936af9045a9b858a05383/nvidia_nvjitlink_cu12-12.8.93-py3-none-win_amd64.whl", hash = "sha256:bd93fbeeee850917903583587f4fc3a4eafa022e34572251368238ab5e6bd67f", size = 268553710, upload-time = "2025-03-07T01:56:24.13Z" },
 ]
 
 [[package]]
@@ -4472,6 +4589,7 @@ source = { registry = "https://pypi.org/simple" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/10/c0/1b303feea90d296f6176f32a2a70b5ef230f9bdeb3a72bddb0dc922dc137/nvidia_nvtx_cu12-12.8.90-py3-none-manylinux2014_aarch64.manylinux_2_17_aarch64.whl", hash = "sha256:d7ad891da111ebafbf7e015d34879f7112832fc239ff0d7d776b6cb685274615", size = 91161, upload-time = "2025-03-07T01:42:23.922Z" },
     { url = "https://files.pythonhosted.org/packages/a2/eb/86626c1bbc2edb86323022371c39aa48df6fd8b0a1647bc274577f72e90b/nvidia_nvtx_cu12-12.8.90-py3-none-manylinux2014_x86_64.manylinux_2_17_x86_64.whl", hash = "sha256:5b17e2001cc0d751a5bc2c6ec6d26ad95913324a4adb86788c944f8ce9ba441f", size = 89954, upload-time = "2025-03-07T01:42:44.131Z" },
+    { url = "https://files.pythonhosted.org/packages/9f/99/4c9c0c329bf9fc125008c3b54c7c94c0023518d06fc025ae36431375e1fe/nvidia_nvtx_cu12-12.8.90-py3-none-win_amd64.whl", hash = "sha256:619c8304aedc69f02ea82dd244541a83c3d9d40993381b3b590f1adaed3db41e", size = 56492, upload-time = "2025-03-07T01:52:24.69Z" },
 ]
 
 [[package]]
@@ -4484,8 +4602,8 @@ dependencies = [
     { name = "packaging" },
     { name = "psutil" },
     { name = "pyyaml" },
-    { name = "torch", version = "2.11.0", source = { registry = "https://pypi.org/simple" }, marker = "sys_platform != 'linux' and sys_platform != 'win32'" },
-    { name = "torch", version = "2.11.0+cu128", source = { registry = "https://download.pytorch.org/whl/cu128" }, marker = "sys_platform == 'linux' or sys_platform == 'win32'" },
+    { name = "torch", version = "2.11.0", source = { registry = "https://pypi.org/simple" }, marker = "(sys_platform != 'linux' and sys_platform != 'win32' and extra == 'extra-12-openpipe-art-backend') or (sys_platform != 'linux' and sys_platform != 'win32' and extra == 'extra-12-openpipe-art-megatron') or (sys_platform == 'linux' and extra == 'extra-12-openpipe-art-backend' and extra == 'extra-12-openpipe-art-megatron') or (sys_platform == 'linux' and extra == 'extra-12-openpipe-art-megatron' and extra == 'extra-12-openpipe-art-tinker') or (sys_platform == 'win32' and extra == 'extra-12-openpipe-art-backend' and extra == 'extra-12-openpipe-art-megatron') or (sys_platform == 'win32' and extra == 'extra-12-openpipe-art-megatron' and extra == 'extra-12-openpipe-art-tinker')" },
+    { name = "torch", version = "2.11.0+cu128", source = { registry = "https://download.pytorch.org/whl/cu128" }, marker = "(sys_platform == 'linux' and extra == 'extra-12-openpipe-art-backend') or (sys_platform == 'linux' and extra == 'extra-12-openpipe-art-megatron') or (sys_platform == 'win32' and extra == 'extra-12-openpipe-art-backend') or (sys_platform == 'win32' and extra == 'extra-12-openpipe-art-megatron') or (extra == 'extra-12-openpipe-art-backend' and extra == 'extra-12-openpipe-art-megatron') or (extra == 'extra-12-openpipe-art-megatron' and extra == 'extra-12-openpipe-art-tinker')" },
 ]
 wheels = [
     { url = "https://files.pythonhosted.org/packages/70/05/38d491962273c7905708762279f440520eb79f3c00b67a023497215ad023/nvidia_resiliency_ext-0.4.1-cp312-cp312-manylinux_2_31_aarch64.whl", hash = "sha256:b3bd5f01535574b16d0f38bca6e39afe3806c4a2896eee1b321cd944e00025a7", size = 444570, upload-time = "2025-07-17T03:50:58.877Z" },
@@ -4587,8 +4705,8 @@ dependencies = [
     { name = "regex" },
     { name = "safetensors" },
     { name = "timm" },
-    { name = "torch", version = "2.11.0", source = { registry = "https://pypi.org/simple" }, marker = "sys_platform != 'linux' and sys_platform != 'win32'" },
-    { name = "torch", version = "2.11.0+cu128", source = { registry = "https://download.pytorch.org/whl/cu128" }, marker = "sys_platform == 'linux' or sys_platform == 'win32'" },
+    { name = "torch", version = "2.11.0", source = { registry = "https://pypi.org/simple" }, marker = "(sys_platform != 'linux' and sys_platform != 'win32' and extra == 'extra-12-openpipe-art-megatron') or (sys_platform == 'linux' and extra == 'extra-12-openpipe-art-backend' and extra == 'extra-12-openpipe-art-megatron') or (sys_platform == 'linux' and extra == 'extra-12-openpipe-art-megatron' and extra == 'extra-12-openpipe-art-tinker') or (sys_platform == 'win32' and extra == 'extra-12-openpipe-art-backend' and extra == 'extra-12-openpipe-art-megatron') or (sys_platform == 'win32' and extra == 'extra-12-openpipe-art-megatron' and extra == 'extra-12-openpipe-art-tinker')" },
+    { name = "torch", version = "2.11.0+cu128", source = { registry = "https://download.pytorch.org/whl/cu128" }, marker = "(sys_platform == 'linux' and extra == 'extra-12-openpipe-art-megatron') or (sys_platform == 'win32' and extra == 'extra-12-openpipe-art-megatron') or (extra == 'extra-12-openpipe-art-backend' and extra == 'extra-12-openpipe-art-megatron') or (extra == 'extra-12-openpipe-art-megatron' and extra == 'extra-12-openpipe-art-tinker')" },
     { name = "torchvision" },
     { name = "tqdm" },
 ]
@@ -4647,10 +4765,10 @@ backend = [
     { name = "pyarrow" },
     { name = "pytest" },
     { name = "setuptools" },
-    { name = "torch", version = "2.11.0", source = { registry = "https://pypi.org/simple" }, marker = "sys_platform != 'linux' and sys_platform != 'win32'" },
-    { name = "torch", version = "2.11.0+cu128", source = { registry = "https://download.pytorch.org/whl/cu128" }, marker = "sys_platform == 'linux' or sys_platform == 'win32'" },
+    { name = "torch", version = "2.11.0", source = { registry = "https://pypi.org/simple" }, marker = "(sys_platform != 'linux' and sys_platform != 'win32' and extra == 'extra-12-openpipe-art-backend') or (sys_platform == 'linux' and extra == 'extra-12-openpipe-art-backend' and extra == 'extra-12-openpipe-art-megatron') or (sys_platform == 'win32' and extra == 'extra-12-openpipe-art-backend' and extra == 'extra-12-openpipe-art-megatron') or (extra != 'extra-12-openpipe-art-backend' and extra == 'extra-12-openpipe-art-megatron' and extra == 'extra-12-openpipe-art-tinker')" },
+    { name = "torch", version = "2.11.0+cu128", source = { registry = "https://download.pytorch.org/whl/cu128" }, marker = "(sys_platform == 'linux' and extra == 'extra-12-openpipe-art-backend') or (sys_platform == 'win32' and extra == 'extra-12-openpipe-art-backend') or (extra == 'extra-12-openpipe-art-backend' and extra == 'extra-12-openpipe-art-megatron') or (extra == 'extra-12-openpipe-art-megatron' and extra == 'extra-12-openpipe-art-tinker')" },
     { name = "torchao" },
-    { name = "transformers" },
+    { name = "transformers", version = "5.2.0", source = { registry = "https://pypi.org/simple" } },
     { name = "trl" },
     { name = "unsloth" },
     { name = "unsloth-zoo" },
@@ -4676,11 +4794,12 @@ megatron = [
     { name = "pybind11" },
     { name = "quack-kernels" },
     { name = "tilelang", marker = "platform_machine == 'x86_64' and sys_platform == 'linux'" },
-    { name = "torch", version = "2.11.0", source = { registry = "https://pypi.org/simple" }, marker = "sys_platform != 'linux' and sys_platform != 'win32'" },
-    { name = "torch", version = "2.11.0+cu128", source = { registry = "https://download.pytorch.org/whl/cu128" }, marker = "sys_platform == 'linux' or sys_platform == 'win32'" },
+    { name = "torch", version = "2.11.0", source = { registry = "https://pypi.org/simple" }, marker = "(sys_platform != 'linux' and sys_platform != 'win32' and extra == 'extra-12-openpipe-art-megatron') or (sys_platform == 'linux' and extra == 'extra-12-openpipe-art-backend' and extra == 'extra-12-openpipe-art-megatron') or (sys_platform == 'linux' and extra == 'extra-12-openpipe-art-megatron' and extra == 'extra-12-openpipe-art-tinker') or (sys_platform == 'win32' and extra == 'extra-12-openpipe-art-backend' and extra == 'extra-12-openpipe-art-megatron') or (sys_platform == 'win32' and extra == 'extra-12-openpipe-art-megatron' and extra == 'extra-12-openpipe-art-tinker')" },
+    { name = "torch", version = "2.11.0+cu128", source = { registry = "https://download.pytorch.org/whl/cu128" }, marker = "(sys_platform == 'linux' and extra == 'extra-12-openpipe-art-megatron') or (sys_platform == 'win32' and extra == 'extra-12-openpipe-art-megatron') or (extra == 'extra-12-openpipe-art-backend' and extra == 'extra-12-openpipe-art-megatron') or (extra == 'extra-12-openpipe-art-megatron' and extra == 'extra-12-openpipe-art-tinker')" },
     { name = "transformer-engine" },
     { name = "transformer-engine-cu12" },
     { name = "transformer-engine-torch" },
+    { name = "transformers", version = "5.6.2", source = { registry = "https://pypi.org/simple" } },
 ]
 plotting = [
     { name = "matplotlib" },
@@ -4697,9 +4816,9 @@ tinker = [
     { name = "pydantic" },
     { name = "tinker" },
     { name = "tinker-cookbook" },
-    { name = "torch", version = "2.11.0", source = { registry = "https://pypi.org/simple" }, marker = "sys_platform != 'linux' and sys_platform != 'win32'" },
-    { name = "torch", version = "2.11.0+cu128", source = { registry = "https://download.pytorch.org/whl/cu128" }, marker = "sys_platform == 'linux' or sys_platform == 'win32'" },
-    { name = "transformers" },
+    { name = "torch", version = "2.11.0", source = { registry = "https://pypi.org/simple" }, marker = "(sys_platform != 'linux' and sys_platform != 'win32' and extra == 'extra-12-openpipe-art-backend') or (sys_platform != 'linux' and sys_platform != 'win32' and extra != 'extra-12-openpipe-art-megatron') or (sys_platform == 'linux' and extra == 'extra-12-openpipe-art-backend' and extra == 'extra-12-openpipe-art-megatron') or (sys_platform == 'win32' and extra == 'extra-12-openpipe-art-backend' and extra == 'extra-12-openpipe-art-megatron') or (extra != 'extra-12-openpipe-art-backend' and extra == 'extra-12-openpipe-art-megatron' and extra == 'extra-12-openpipe-art-tinker')" },
+    { name = "torch", version = "2.11.0+cu128", source = { registry = "https://download.pytorch.org/whl/cu128" }, marker = "(sys_platform == 'linux' and extra == 'extra-12-openpipe-art-backend') or (sys_platform == 'linux' and extra != 'extra-12-openpipe-art-megatron') or (sys_platform == 'win32' and extra == 'extra-12-openpipe-art-backend') or (sys_platform == 'win32' and extra != 'extra-12-openpipe-art-megatron') or (extra == 'extra-12-openpipe-art-backend' and extra == 'extra-12-openpipe-art-megatron') or (extra == 'extra-12-openpipe-art-megatron' and extra == 'extra-12-openpipe-art-tinker')" },
+    { name = "transformers", version = "5.2.0", source = { registry = "https://pypi.org/simple" } },
     { name = "uvicorn" },
 ]
 
@@ -4743,7 +4862,7 @@ requires-dist = [
     { name = "litellm", specifier = ">=1.71.1,<=1.82.0" },
     { name = "mamba-ssm", marker = "python_full_version < '3.12' and platform_machine == 'x86_64' and sys_platform == 'linux' and extra == 'megatron'", specifier = "==2.3.1" },
     { name = "matplotlib", marker = "extra == 'plotting'", specifier = ">=3.10.1" },
-    { name = "megatron-bridge", marker = "extra == 'megatron'", git = "https://github.com/NVIDIA-NeMo/Megatron-Bridge.git?rev=e049cc00c24d03e2ae45d2608c7a44e2d2364e3d" },
+    { name = "megatron-bridge", marker = "extra == 'megatron'", git = "https://github.com/NVIDIA-NeMo/Megatron-Bridge.git?rev=e1a207ac757e5d0ed94d8ffbe1cbd28e81d8c084" },
     { name = "megatron-core", marker = "extra == 'megatron'", specifier = "==0.17.0" },
     { name = "ml-dtypes", marker = "python_full_version < '3.13' and extra == 'megatron'", specifier = ">=0.5.0" },
     { name = "nbclient", marker = "extra == 'backend'", specifier = ">=0.10.1" },
@@ -4775,18 +4894,19 @@ requires-dist = [
     { name = "tilelang", marker = "platform_machine == 'x86_64' and sys_platform == 'linux' and extra == 'megatron'", specifier = "==0.1.10" },
     { name = "tinker", marker = "extra == 'tinker'", specifier = ">=0.21.0,<0.22" },
     { name = "tinker-cookbook", marker = "extra == 'tinker'", specifier = ">=0.4.1,<0.5" },
-    { name = "torch", marker = "(sys_platform == 'linux' and extra == 'backend') or (sys_platform == 'win32' and extra == 'backend')", specifier = ">=2.11.0", index = "https://download.pytorch.org/whl/cu128" },
-    { name = "torch", marker = "(sys_platform == 'linux' and extra == 'megatron') or (sys_platform == 'win32' and extra == 'megatron')", specifier = ">=2.11.0", index = "https://download.pytorch.org/whl/cu128" },
-    { name = "torch", marker = "(sys_platform == 'linux' and extra == 'tinker') or (sys_platform == 'win32' and extra == 'tinker')", specifier = ">=2.11.0", index = "https://download.pytorch.org/whl/cu128" },
-    { name = "torch", marker = "sys_platform != 'linux' and sys_platform != 'win32' and extra == 'backend'", specifier = ">=2.11.0" },
-    { name = "torch", marker = "sys_platform != 'linux' and sys_platform != 'win32' and extra == 'megatron'", specifier = ">=2.11.0" },
-    { name = "torch", marker = "sys_platform != 'linux' and sys_platform != 'win32' and extra == 'tinker'", specifier = ">=2.11.0" },
+    { name = "torch", marker = "(sys_platform == 'linux' and extra == 'backend') or (sys_platform == 'win32' and extra == 'backend')", specifier = "==2.11.0", index = "https://download.pytorch.org/whl/cu128" },
+    { name = "torch", marker = "(sys_platform == 'linux' and extra == 'megatron') or (sys_platform == 'win32' and extra == 'megatron')", specifier = "==2.11.0", index = "https://download.pytorch.org/whl/cu128" },
+    { name = "torch", marker = "(sys_platform == 'linux' and extra == 'tinker') or (sys_platform == 'win32' and extra == 'tinker')", specifier = "==2.11.0", index = "https://download.pytorch.org/whl/cu128" },
+    { name = "torch", marker = "sys_platform != 'linux' and sys_platform != 'win32' and extra == 'backend'", specifier = "==2.11.0" },
+    { name = "torch", marker = "sys_platform != 'linux' and sys_platform != 'win32' and extra == 'megatron'", specifier = "==2.11.0" },
+    { name = "torch", marker = "sys_platform != 'linux' and sys_platform != 'win32' and extra == 'tinker'", specifier = "==2.11.0" },
     { name = "torchao", marker = "extra == 'backend'", specifier = "==0.16.0" },
     { name = "transformer-engine", marker = "extra == 'megatron'", specifier = "==2.11.0" },
     { name = "transformer-engine-cu12", marker = "extra == 'megatron'", specifier = "==2.11.0" },
     { name = "transformer-engine-torch", marker = "extra == 'megatron'", git = "https://github.com/NVIDIA/TransformerEngine.git?subdirectory=transformer_engine%2Fpytorch&rev=v2.11" },
     { name = "transformers", marker = "extra == 'backend'", specifier = "==5.2.0" },
-    { name = "transformers", marker = "extra == 'tinker'", specifier = "==5.2.0" },
+    { name = "transformers", marker = "extra == 'megatron'", specifier = "==5.6.2" },
+    { name = "transformers", marker = "extra == 'tinker'", specifier = ">=5.2.0,<=5.5.3" },
     { name = "trl", marker = "extra == 'backend'", specifier = "==0.20.0" },
     { name = "typer", specifier = ">=0.15.2" },
     { name = "unsloth", marker = "extra == 'backend'", specifier = "==2026.3.3" },
@@ -5112,10 +5232,11 @@ dependencies = [
     { name = "psutil" },
     { name = "pyyaml" },
     { name = "safetensors" },
-    { name = "torch", version = "2.11.0", source = { registry = "https://pypi.org/simple" }, marker = "sys_platform != 'linux' and sys_platform != 'win32'" },
-    { name = "torch", version = "2.11.0+cu128", source = { registry = "https://download.pytorch.org/whl/cu128" }, marker = "sys_platform == 'linux' or sys_platform == 'win32'" },
+    { name = "torch", version = "2.11.0", source = { registry = "https://pypi.org/simple" }, marker = "(sys_platform != 'linux' and sys_platform != 'win32' and extra == 'extra-12-openpipe-art-backend') or (sys_platform != 'linux' and sys_platform != 'win32' and extra == 'extra-12-openpipe-art-megatron') or (sys_platform == 'linux' and extra == 'extra-12-openpipe-art-backend' and extra == 'extra-12-openpipe-art-megatron') or (sys_platform == 'linux' and extra == 'extra-12-openpipe-art-megatron' and extra == 'extra-12-openpipe-art-tinker') or (sys_platform == 'win32' and extra == 'extra-12-openpipe-art-backend' and extra == 'extra-12-openpipe-art-megatron') or (sys_platform == 'win32' and extra == 'extra-12-openpipe-art-megatron' and extra == 'extra-12-openpipe-art-tinker')" },
+    { name = "torch", version = "2.11.0+cu128", source = { registry = "https://download.pytorch.org/whl/cu128" }, marker = "(sys_platform == 'linux' and extra == 'extra-12-openpipe-art-backend') or (sys_platform == 'linux' and extra == 'extra-12-openpipe-art-megatron') or (sys_platform == 'win32' and extra == 'extra-12-openpipe-art-backend') or (sys_platform == 'win32' and extra == 'extra-12-openpipe-art-megatron') or (extra == 'extra-12-openpipe-art-backend' and extra == 'extra-12-openpipe-art-megatron') or (extra == 'extra-12-openpipe-art-megatron' and extra == 'extra-12-openpipe-art-tinker')" },
     { name = "tqdm" },
-    { name = "transformers" },
+    { name = "transformers", version = "5.2.0", source = { registry = "https://pypi.org/simple" }, marker = "extra == 'extra-12-openpipe-art-backend' or (extra == 'extra-12-openpipe-art-megatron' and extra == 'extra-12-openpipe-art-tinker')" },
+    { name = "transformers", version = "5.6.2", source = { registry = "https://pypi.org/simple" }, marker = "extra == 'extra-12-openpipe-art-megatron'" },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/86/cf/037f1e3d5186496c05513a6754639e2dab3038a05f384284d49a9bd06a2d/peft-0.19.1.tar.gz", hash = "sha256:0d97542fe96dcdaa20d3b81c06f26f988618f416a73544ab23c3618ccb674a40", size = 763738, upload-time = "2026-04-16T15:46:45.105Z" }
 wheels = [
@@ -5327,7 +5448,7 @@ dependencies = [
     { name = "networkx" },
     { name = "pdfminer-six" },
     { name = "pillow" },
-    { name = "pyreadline3", marker = "sys_platform == 'win32'" },
+    { name = "pyreadline3", marker = "sys_platform == 'win32' or (extra == 'extra-12-openpipe-art-backend' and extra == 'extra-12-openpipe-art-megatron') or (extra == 'extra-12-openpipe-art-megatron' and extra == 'extra-12-openpipe-art-tinker')" },
     { name = "pyyaml" },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/70/55/e5400762e3884f743d59291e71eaaa9c52dd7e144b75a11911e74ec1bac9/polyfile_weave-0.5.9.tar.gz", hash = "sha256:12341fab03e06ede1bfebbd3627dd24015fde5353ea74ece2da186321b818bdb", size = 6024974, upload-time = "2026-01-22T22:08:48.081Z" }
@@ -5764,6 +5885,15 @@ wheels = [
 ]
 
 [[package]]
+name = "pycountry"
+version = "26.2.16"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/de/1d/061b9e7a48b85cfd69f33c33d2ef784a531c359399ad764243399673c8f5/pycountry-26.2.16.tar.gz", hash = "sha256:5b6027d453fcd6060112b951dd010f01f168b51b4bf8a1f1fc8c95c8d94a0801", size = 7711342, upload-time = "2026-02-17T03:42:52.367Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/9c/42/7703bd45b62fecd44cd7d3495423097e2f7d28bc2e99e7c1af68892ab157/pycountry-26.2.16-py3-none-any.whl", hash = "sha256:115c4baf7cceaa30f59a4694d79483c9167dbce7a9de4d3d571c5f3ea77c305a", size = 8044600, upload-time = "2026-02-17T03:42:49.777Z" },
+]
+
+[[package]]
 name = "pycparser"
 version = "3.0"
 source = { registry = "https://pypi.org/simple" }
@@ -5910,6 +6040,11 @@ wheels = [
     { url = "https://files.pythonhosted.org/packages/17/c1/3226e6d7f5a4f736f38ac11a6fbb262d701889802595cdb0f53a885ac2e0/pydantic_extra_types-2.11.1-py3-none-any.whl", hash = "sha256:1722ea2bddae5628ace25f2aa685b69978ef533123e5638cfbddb999e0100ec1", size = 79526, upload-time = "2026-03-16T08:08:02.533Z" },
 ]
 
+[package.optional-dependencies]
+pycountry = [
+    { name = "pycountry" },
+]
+
 [[package]]
 name = "pydantic-settings"
 version = "2.14.1"
@@ -5968,7 +6103,7 @@ name = "pynacl"
 version = "1.6.2"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
-    { name = "cffi", marker = "platform_python_implementation != 'PyPy'" },
+    { name = "cffi", marker = "platform_python_implementation != 'PyPy' or (extra == 'extra-12-openpipe-art-backend' and extra == 'extra-12-openpipe-art-megatron') or (extra == 'extra-12-openpipe-art-megatron' and extra == 'extra-12-openpipe-art-tinker')" },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/d9/9a/4019b524b03a13438637b11538c82781a5eda427394380381af8f04f467a/pynacl-1.6.2.tar.gz", hash = "sha256:018494d6d696ae03c7e656e5e74cdfd8ea1326962cc401bcf018f1ed8436811c", size = 3511692, upload-time = "2026-01-01T17:48:10.851Z" }
 wheels = [
@@ -6042,7 +6177,7 @@ name = "pytest"
 version = "9.0.3"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
-    { name = "colorama", marker = "sys_platform == 'win32'" },
+    { name = "colorama", marker = "sys_platform == 'win32' or (extra == 'extra-12-openpipe-art-backend' and extra == 'extra-12-openpipe-art-megatron') or (extra == 'extra-12-openpipe-art-megatron' and extra == 'extra-12-openpipe-art-tinker')" },
     { name = "iniconfig" },
     { name = "packaging" },
     { name = "pluggy" },
@@ -6059,7 +6194,7 @@ version = "1.4.0"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "pytest" },
-    { name = "typing-extensions", marker = "python_full_version < '3.13'" },
+    { name = "typing-extensions", marker = "python_full_version < '3.13' or (extra == 'extra-12-openpipe-art-backend' and extra == 'extra-12-openpipe-art-megatron') or (extra == 'extra-12-openpipe-art-megatron' and extra == 'extra-12-openpipe-art-tinker')" },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/43/7c/d36d04db312ecf4298932ef77e6e4a9e8ad017906e24e34f0b0c361a2473/pytest_asyncio-1.4.0.tar.gz", hash = "sha256:c6c0d2259945122819f171a32ecea2c349ead889ee28176caaf492143424be42", size = 58514, upload-time = "2026-05-26T09:56:04.083Z" }
 wheels = [
@@ -6245,7 +6380,7 @@ name = "pyzmq"
 version = "27.1.0"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
-    { name = "cffi", marker = "implementation_name == 'pypy'" },
+    { name = "cffi", marker = "implementation_name == 'pypy' or (extra == 'extra-12-openpipe-art-backend' and extra == 'extra-12-openpipe-art-megatron') or (extra == 'extra-12-openpipe-art-megatron' and extra == 'extra-12-openpipe-art-tinker')" },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/04/0b/3c9baedbdf613ecaa7aa07027780b8867f57b6293b6ee50de316c9f3222b/pyzmq-27.1.0.tar.gz", hash = "sha256:ac0765e3d44455adb6ddbf4417dcce460fc40a05978c08efdf2948072f6db540", size = 281750, upload-time = "2025-09-08T23:10:18.157Z" }
 wheels = [
@@ -6290,8 +6425,8 @@ source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "apache-tvm-ffi" },
     { name = "nvidia-cutlass-dsl" },
-    { name = "torch", version = "2.11.0", source = { registry = "https://pypi.org/simple" }, marker = "sys_platform != 'linux' and sys_platform != 'win32'" },
-    { name = "torch", version = "2.11.0+cu128", source = { registry = "https://download.pytorch.org/whl/cu128" }, marker = "sys_platform == 'linux' or sys_platform == 'win32'" },
+    { name = "torch", version = "2.11.0", source = { registry = "https://pypi.org/simple" }, marker = "(sys_platform != 'linux' and sys_platform != 'win32' and extra == 'extra-12-openpipe-art-megatron') or (sys_platform == 'linux' and extra == 'extra-12-openpipe-art-backend' and extra == 'extra-12-openpipe-art-megatron') or (sys_platform == 'linux' and extra == 'extra-12-openpipe-art-megatron' and extra == 'extra-12-openpipe-art-tinker') or (sys_platform == 'win32' and extra == 'extra-12-openpipe-art-backend' and extra == 'extra-12-openpipe-art-megatron') or (sys_platform == 'win32' and extra == 'extra-12-openpipe-art-megatron' and extra == 'extra-12-openpipe-art-tinker')" },
+    { name = "torch", version = "2.11.0+cu128", source = { registry = "https://download.pytorch.org/whl/cu128" }, marker = "(sys_platform == 'linux' and extra == 'extra-12-openpipe-art-megatron') or (sys_platform == 'win32' and extra == 'extra-12-openpipe-art-megatron') or (extra == 'extra-12-openpipe-art-backend' and extra == 'extra-12-openpipe-art-megatron') or (extra == 'extra-12-openpipe-art-megatron' and extra == 'extra-12-openpipe-art-tinker')" },
     { name = "torch-c-dlpack-ext" },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/95/11/6b1664d0e85f91f4549403d4ca6c9248857080f571397da7cb7570338dcd/quack_kernels-0.3.7.tar.gz", hash = "sha256:1c35a3f6f8c06b38cdf6a68d95fbb52e2b75cd261d0f01abcb7cec5d1bd80ca1", size = 193338, upload-time = "2026-03-27T19:55:55.544Z" }
@@ -6321,7 +6456,7 @@ source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "attrs" },
     { name = "rpds-py" },
-    { name = "typing-extensions", marker = "python_full_version < '3.13'" },
+    { name = "typing-extensions", marker = "python_full_version < '3.13' or (extra == 'extra-12-openpipe-art-backend' and extra == 'extra-12-openpipe-art-megatron') or (extra == 'extra-12-openpipe-art-megatron' and extra == 'extra-12-openpipe-art-tinker')" },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/22/f5/df4e9027acead3ecc63e50fe1e36aca1523e1719559c499951bb4b53188f/referencing-0.37.0.tar.gz", hash = "sha256:44aefc3142c5b842538163acb373e24cce6632bd54bdb01b21ad5863489f50d8", size = 78036, upload-time = "2025-10-13T15:30:48.871Z" }
 wheels = [
@@ -6896,8 +7031,8 @@ name = "secretstorage"
 version = "3.5.0"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
-    { name = "cryptography", marker = "sys_platform == 'linux'" },
-    { name = "jeepney", marker = "sys_platform == 'linux'" },
+    { name = "cryptography", marker = "sys_platform == 'linux' or (sys_platform == 'win32' and extra != 'extra-12-openpipe-art-backend' and extra != 'extra-12-openpipe-art-megatron') or (extra == 'extra-12-openpipe-art-backend' and extra == 'extra-12-openpipe-art-megatron') or (extra == 'extra-12-openpipe-art-megatron' and extra == 'extra-12-openpipe-art-tinker')" },
+    { name = "jeepney", marker = "sys_platform == 'linux' or (sys_platform == 'win32' and extra != 'extra-12-openpipe-art-backend' and extra != 'extra-12-openpipe-art-megatron') or (extra == 'extra-12-openpipe-art-backend' and extra == 'extra-12-openpipe-art-megatron') or (extra == 'extra-12-openpipe-art-megatron' and extra == 'extra-12-openpipe-art-tinker')" },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/1c/03/e834bcd866f2f8a49a85eaff47340affa3bfa391ee9912a952a1faa68c7b/secretstorage-3.5.0.tar.gz", hash = "sha256:f04b8e4689cbce351744d5537bf6b1329c6fc68f91fa666f60a380edddcd11be", size = 19884, upload-time = "2025-11-23T19:02:53.191Z" }
 wheels = [
@@ -7337,7 +7472,7 @@ name = "sqlalchemy"
 version = "2.0.50"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
-    { name = "greenlet", marker = "platform_machine == 'AMD64' or platform_machine == 'WIN32' or platform_machine == 'aarch64' or platform_machine == 'amd64' or platform_machine == 'ppc64le' or platform_machine == 'win32' or platform_machine == 'x86_64'" },
+    { name = "greenlet", marker = "platform_machine == 'AMD64' or platform_machine == 'WIN32' or platform_machine == 'aarch64' or platform_machine == 'amd64' or platform_machine == 'ppc64le' or platform_machine == 'win32' or platform_machine == 'x86_64' or (extra == 'extra-12-openpipe-art-backend' and extra == 'extra-12-openpipe-art-megatron') or (extra == 'extra-12-openpipe-art-megatron' and extra == 'extra-12-openpipe-art-tinker')" },
     { name = "typing-extensions" },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/57/da/6fbf010c8ebb347679d0d100b22fe9ba5e13fd04046c5df7280d2f0bf706/sqlalchemy-2.0.50.tar.gz", hash = "sha256:af5607d11ef90fd6a5c0549fe0045dce1663d427426bcfb506dcb5346a85a3b9", size = 9907424, upload-time = "2026-05-24T19:20:04.018Z" }
@@ -7415,7 +7550,7 @@ version = "0.52.1"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "anyio" },
-    { name = "typing-extensions", marker = "python_full_version < '3.13'" },
+    { name = "typing-extensions", marker = "python_full_version < '3.13' or (extra == 'extra-12-openpipe-art-backend' and extra == 'extra-12-openpipe-art-megatron') or (extra == 'extra-12-openpipe-art-megatron' and extra == 'extra-12-openpipe-art-tinker')" },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/c4/68/79977123bb7be889ad680d79a40f339082c1978b5cfcf62c2d8d196873ac/starlette-0.52.1.tar.gz", hash = "sha256:834edd1b0a23167694292e94f597773bc3f89f362be6effee198165a35d62933", size = 2653702, upload-time = "2026-01-18T13:34:11.062Z" }
 wheels = [
@@ -7561,20 +7696,23 @@ name = "tilelang"
 version = "0.1.10"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
-    { name = "apache-tvm-ffi", marker = "platform_machine != 's390x' and sys_platform == 'linux'" },
-    { name = "cloudpickle", marker = "platform_machine != 's390x' and sys_platform == 'linux'" },
-    { name = "ml-dtypes", marker = "platform_machine != 's390x' and sys_platform == 'linux'" },
-    { name = "numpy", marker = "platform_machine != 's390x' and sys_platform == 'linux'" },
-    { name = "psutil", marker = "platform_machine != 's390x' and sys_platform == 'linux'" },
-    { name = "torch", version = "2.11.0+cu128", source = { registry = "https://download.pytorch.org/whl/cu128" }, marker = "platform_machine != 's390x' and sys_platform == 'linux'" },
-    { name = "torch-c-dlpack-ext", marker = "python_full_version < '3.14' and platform_machine != 's390x' and sys_platform == 'linux'" },
-    { name = "tqdm", marker = "platform_machine != 's390x' and sys_platform == 'linux'" },
-    { name = "typing-extensions", marker = "platform_machine != 's390x' and sys_platform == 'linux'" },
-    { name = "z3-solver", marker = "platform_machine != 's390x' and sys_platform == 'linux'" },
+    { name = "apache-tvm-ffi", marker = "sys_platform == 'linux' or sys_platform == 'win32'" },
+    { name = "cloudpickle", marker = "sys_platform == 'linux' or sys_platform == 'win32'" },
+    { name = "ml-dtypes", marker = "sys_platform == 'linux' or sys_platform == 'win32'" },
+    { name = "numpy", marker = "sys_platform == 'linux' or sys_platform == 'win32'" },
+    { name = "psutil", marker = "sys_platform == 'linux' or sys_platform == 'win32'" },
+    { name = "torch", version = "2.11.0+cu128", source = { registry = "https://download.pytorch.org/whl/cu128" }, marker = "sys_platform == 'linux' or sys_platform == 'win32'" },
+    { name = "torch-c-dlpack-ext", marker = "(python_full_version < '3.14' and sys_platform == 'linux') or (python_full_version < '3.14' and sys_platform == 'win32')" },
+    { name = "tqdm", marker = "sys_platform == 'linux' or sys_platform == 'win32'" },
+    { name = "typing-extensions", marker = "sys_platform == 'linux' or sys_platform == 'win32'" },
+    { name = "z3-solver", marker = "sys_platform == 'linux' or sys_platform == 'win32'" },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/77/5c/07146b4527656102e48d21c2599aa80477e83ea3f149ac0df3b15a247bd4/tilelang-0.1.10.tar.gz", hash = "sha256:d8813e668fcf75843bc2d68c633c352b419c1e292895a6038a4aadd943e56c2b", size = 93184128, upload-time = "2026-05-25T03:58:57.006Z" }
 wheels = [
+    { url = "https://files.pythonhosted.org/packages/76/0f/e5e01399adb5110bf885e19e879229e3fc578e1e035939f601365305c825/tilelang-0.1.10-cp38-abi3-macosx_11_0_arm64.whl", hash = "sha256:246084babf0f6801ad2b8ac1d58cead37520974ae399247c89d42b68872d2cf9", size = 38492226, upload-time = "2026-05-25T03:55:30.729Z" },
     { url = "https://files.pythonhosted.org/packages/b0/66/ab4301dc38ca9f09832df2936c73388c611c198dc938634acb6ce80dfa74/tilelang-0.1.10-cp38-abi3-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:85180d1a96defeecdf52d5d075a31c3fc551d8485981e6b636762a9cd7eb02fe", size = 49768455, upload-time = "2026-05-25T03:56:17.081Z" },
+    { url = "https://files.pythonhosted.org/packages/92/af/a3dfc43dad228a6e560863f071865d5a27c35b050a9fc431641cb07135d1/tilelang-0.1.10-cp38-abi3-manylinux_2_34_aarch64.whl", hash = "sha256:15437e5f0daa0863ac9a5386007847c94070f5ab3234d040bc947afdf2f57100", size = 45629488, upload-time = "2026-05-25T03:57:00.374Z" },
+    { url = "https://files.pythonhosted.org/packages/c3/36/2096dce95c20e13be5b5ce852190ca4b4ac41c7fd9b91a0be98353598153/tilelang-0.1.10-cp38-abi3-win_amd64.whl", hash = "sha256:93dd078113d275352698a6e72a91e80e5b0263d22a005109b3db2c1c016ea105", size = 33692452, upload-time = "2026-05-25T03:57:32.576Z" },
 ]
 
 [[package]]
@@ -7585,8 +7723,8 @@ dependencies = [
     { name = "huggingface-hub" },
     { name = "pyyaml" },
     { name = "safetensors" },
-    { name = "torch", version = "2.11.0", source = { registry = "https://pypi.org/simple" }, marker = "sys_platform != 'linux' and sys_platform != 'win32'" },
-    { name = "torch", version = "2.11.0+cu128", source = { registry = "https://download.pytorch.org/whl/cu128" }, marker = "sys_platform == 'linux' or sys_platform == 'win32'" },
+    { name = "torch", version = "2.11.0", source = { registry = "https://pypi.org/simple" }, marker = "(sys_platform != 'linux' and sys_platform != 'win32' and extra == 'extra-12-openpipe-art-megatron') or (sys_platform == 'linux' and extra == 'extra-12-openpipe-art-backend' and extra == 'extra-12-openpipe-art-megatron') or (sys_platform == 'linux' and extra == 'extra-12-openpipe-art-megatron' and extra == 'extra-12-openpipe-art-tinker') or (sys_platform == 'win32' and extra == 'extra-12-openpipe-art-backend' and extra == 'extra-12-openpipe-art-megatron') or (sys_platform == 'win32' and extra == 'extra-12-openpipe-art-megatron' and extra == 'extra-12-openpipe-art-tinker')" },
+    { name = "torch", version = "2.11.0+cu128", source = { registry = "https://download.pytorch.org/whl/cu128" }, marker = "(sys_platform == 'linux' and extra == 'extra-12-openpipe-art-megatron') or (sys_platform == 'win32' and extra == 'extra-12-openpipe-art-megatron') or (extra == 'extra-12-openpipe-art-backend' and extra == 'extra-12-openpipe-art-megatron') or (extra == 'extra-12-openpipe-art-megatron' and extra == 'extra-12-openpipe-art-tinker')" },
     { name = "torchvision" },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/08/54/ece85b0eef3700c90db8271a43669b05a0ebbe2edb1962329c34374a297e/timm-1.0.27.tar.gz", hash = "sha256:315dfe63186ca9fb7ff941268941231fd5be259f2b4bb4afa28560ae1015cb9a", size = 2439861, upload-time = "2026-05-08T19:38:36.844Z" }
@@ -7603,14 +7741,14 @@ dependencies = [
     { name = "click" },
     { name = "distro" },
     { name = "grpcio" },
-    { name = "httpx", extra = ["http2"] },
+    { name = "httpx", extra = ["http2"], marker = "extra == 'extra-12-openpipe-art-backend' or extra != 'extra-12-openpipe-art-megatron' or (extra == 'extra-12-openpipe-art-megatron' and extra == 'extra-12-openpipe-art-tinker')" },
     { name = "numpy" },
     { name = "orjson" },
     { name = "protobuf" },
     { name = "pydantic" },
     { name = "rich" },
     { name = "sniffio" },
-    { name = "transformers" },
+    { name = "transformers", version = "5.2.0", source = { registry = "https://pypi.org/simple" } },
     { name = "typing-extensions" },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/bc/7a/a72cb2b487a7581cc192f73fd64250d14434702c4e83b2da3d5924d5ecbc/tinker-0.21.0.tar.gz", hash = "sha256:8d72709fb639f74bf90f1d1fd57beec53bfc147a768a8f42e5d6b4404eeccce9", size = 251660, upload-time = "2026-05-19T00:24:02.569Z" }
@@ -7638,10 +7776,10 @@ dependencies = [
     { name = "termcolor" },
     { name = "tiktoken" },
     { name = "tinker" },
-    { name = "torch", version = "2.11.0", source = { registry = "https://pypi.org/simple" }, marker = "sys_platform != 'linux' and sys_platform != 'win32'" },
-    { name = "torch", version = "2.11.0+cu128", source = { registry = "https://download.pytorch.org/whl/cu128" }, marker = "sys_platform == 'linux' or sys_platform == 'win32'" },
+    { name = "torch", version = "2.11.0", source = { registry = "https://pypi.org/simple" }, marker = "(sys_platform != 'linux' and sys_platform != 'win32' and extra == 'extra-12-openpipe-art-backend') or (sys_platform != 'linux' and sys_platform != 'win32' and extra != 'extra-12-openpipe-art-megatron') or (sys_platform == 'linux' and extra == 'extra-12-openpipe-art-backend' and extra == 'extra-12-openpipe-art-megatron') or (sys_platform == 'win32' and extra == 'extra-12-openpipe-art-backend' and extra == 'extra-12-openpipe-art-megatron') or (extra != 'extra-12-openpipe-art-backend' and extra == 'extra-12-openpipe-art-megatron' and extra == 'extra-12-openpipe-art-tinker')" },
+    { name = "torch", version = "2.11.0+cu128", source = { registry = "https://download.pytorch.org/whl/cu128" }, marker = "(sys_platform == 'linux' and extra == 'extra-12-openpipe-art-backend') or (sys_platform == 'linux' and extra != 'extra-12-openpipe-art-megatron') or (sys_platform == 'win32' and extra == 'extra-12-openpipe-art-backend') or (sys_platform == 'win32' and extra != 'extra-12-openpipe-art-megatron') or (extra == 'extra-12-openpipe-art-backend' and extra == 'extra-12-openpipe-art-megatron') or (extra == 'extra-12-openpipe-art-megatron' and extra == 'extra-12-openpipe-art-tinker')" },
     { name = "tqdm" },
-    { name = "transformers" },
+    { name = "transformers", version = "5.2.0", source = { registry = "https://pypi.org/simple" } },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/e5/9c/37af9804cb3f1d88f5e67512aa1aeafeb49ef9012532d056d92c96194320/tinker_cookbook-0.4.1.tar.gz", hash = "sha256:1f9ad977317529bbf796f40ef13de59b2c93a0a257469bd80a7ffcfed5beb8b2", size = 4517724, upload-time = "2026-05-12T03:49:19.6Z" }
 wheels = [
@@ -7742,12 +7880,18 @@ name = "torch"
 version = "2.11.0"
 source = { registry = "https://pypi.org/simple" }
 resolution-markers = [
-    "python_full_version >= '3.14' and platform_machine != 's390x' and sys_platform != 'linux' and sys_platform != 'win32'",
-    "python_full_version == '3.13.*' and platform_machine != 's390x' and sys_platform != 'linux' and sys_platform != 'win32'",
-    "python_full_version < '3.13' and platform_machine != 's390x' and sys_platform != 'linux' and sys_platform != 'win32'",
-    "python_full_version >= '3.14' and platform_machine == 's390x' and sys_platform != 'linux' and sys_platform != 'win32'",
-    "python_full_version == '3.13.*' and platform_machine == 's390x' and sys_platform != 'linux' and sys_platform != 'win32'",
-    "python_full_version < '3.13' and platform_machine == 's390x' and sys_platform != 'linux' and sys_platform != 'win32'",
+    "python_full_version >= '3.14' and platform_machine != 's390x' and sys_platform != 'linux' and sys_platform != 'win32' and extra != 'extra-12-openpipe-art-backend' and extra == 'extra-12-openpipe-art-megatron' and extra != 'extra-12-openpipe-art-tinker'",
+    "python_full_version >= '3.14' and platform_machine == 's390x' and sys_platform != 'linux' and sys_platform != 'win32' and extra != 'extra-12-openpipe-art-backend' and extra == 'extra-12-openpipe-art-megatron' and extra != 'extra-12-openpipe-art-tinker'",
+    "python_full_version == '3.13.*' and platform_machine != 's390x' and sys_platform != 'linux' and sys_platform != 'win32' and extra != 'extra-12-openpipe-art-backend' and extra == 'extra-12-openpipe-art-megatron' and extra != 'extra-12-openpipe-art-tinker'",
+    "python_full_version < '3.13' and platform_machine != 's390x' and sys_platform != 'linux' and sys_platform != 'win32' and extra != 'extra-12-openpipe-art-backend' and extra == 'extra-12-openpipe-art-megatron' and extra != 'extra-12-openpipe-art-tinker'",
+    "python_full_version == '3.13.*' and platform_machine == 's390x' and sys_platform != 'linux' and sys_platform != 'win32' and extra != 'extra-12-openpipe-art-backend' and extra == 'extra-12-openpipe-art-megatron' and extra != 'extra-12-openpipe-art-tinker'",
+    "python_full_version < '3.13' and platform_machine == 's390x' and sys_platform != 'linux' and sys_platform != 'win32' and extra != 'extra-12-openpipe-art-backend' and extra == 'extra-12-openpipe-art-megatron' and extra != 'extra-12-openpipe-art-tinker'",
+    "python_full_version >= '3.14' and sys_platform != 'linux' and sys_platform != 'win32' and extra == 'extra-12-openpipe-art-backend' and extra != 'extra-12-openpipe-art-megatron'",
+    "python_full_version == '3.13.*' and sys_platform != 'linux' and sys_platform != 'win32' and extra == 'extra-12-openpipe-art-backend' and extra != 'extra-12-openpipe-art-megatron'",
+    "python_full_version < '3.13' and sys_platform != 'linux' and sys_platform != 'win32' and extra == 'extra-12-openpipe-art-backend' and extra != 'extra-12-openpipe-art-megatron'",
+    "python_full_version >= '3.14' and sys_platform != 'linux' and sys_platform != 'win32' and extra != 'extra-12-openpipe-art-backend' and extra != 'extra-12-openpipe-art-megatron'",
+    "python_full_version == '3.13.*' and sys_platform != 'linux' and sys_platform != 'win32' and extra != 'extra-12-openpipe-art-backend' and extra != 'extra-12-openpipe-art-megatron'",
+    "python_full_version < '3.13' and sys_platform != 'linux' and sys_platform != 'win32' and extra != 'extra-12-openpipe-art-backend' and extra != 'extra-12-openpipe-art-megatron'",
 ]
 dependencies = [
     { name = "filelock", marker = "sys_platform != 'linux' and sys_platform != 'win32'" },
@@ -7760,10 +7904,25 @@ dependencies = [
 ]
 wheels = [
     { url = "https://files.pythonhosted.org/packages/6f/8b/69e3008d78e5cee2b30183340cc425081b78afc5eff3d080daab0adda9aa/torch-2.11.0-cp312-cp312-macosx_11_0_arm64.whl", hash = "sha256:4b5866312ee6e52ea625cd211dcb97d6a2cdc1131a5f15cc0d87eec948f6dd34", size = 80606338, upload-time = "2026-03-23T18:11:34.781Z" },
+    { url = "https://files.pythonhosted.org/packages/13/16/42e5915ebe4868caa6bac83a8ed59db57f12e9a61b7d749d584776ed53d5/torch-2.11.0-cp312-cp312-manylinux_2_28_aarch64.whl", hash = "sha256:f99924682ef0aa6a4ab3b1b76f40dc6e273fca09f367d15a524266db100a723f", size = 419731115, upload-time = "2026-03-23T18:11:06.944Z" },
+    { url = "https://files.pythonhosted.org/packages/1a/c9/82638ef24d7877510f83baf821f5619a61b45568ce21c0a87a91576510aa/torch-2.11.0-cp312-cp312-manylinux_2_28_x86_64.whl", hash = "sha256:0f68f4ac6d95d12e896c3b7a912b5871619542ec54d3649cf48cc1edd4dd2756", size = 530712279, upload-time = "2026-03-23T18:10:31.481Z" },
+    { url = "https://files.pythonhosted.org/packages/1c/ff/6756f1c7ee302f6d202120e0f4f05b432b839908f9071157302cedfc5232/torch-2.11.0-cp312-cp312-win_amd64.whl", hash = "sha256:fbf39280699d1b869f55eac536deceaa1b60bd6788ba74f399cc67e60a5fab10", size = 114556047, upload-time = "2026-03-23T18:10:55.931Z" },
     { url = "https://files.pythonhosted.org/packages/87/89/5ea6722763acee56b045435fb84258db7375c48165ec8be7880ab2b281c5/torch-2.11.0-cp313-cp313-macosx_11_0_arm64.whl", hash = "sha256:1e6debd97ccd3205bbb37eb806a9d8219e1139d15419982c09e23ef7d4369d18", size = 80606801, upload-time = "2026-03-23T18:10:18.649Z" },
+    { url = "https://files.pythonhosted.org/packages/32/d1/8ed2173589cbfe744ed54e5a73efc107c0085ba5777ee93a5f4c1ab90553/torch-2.11.0-cp313-cp313-manylinux_2_28_aarch64.whl", hash = "sha256:63a68fa59de8f87acc7e85a5478bb2dddbb3392b7593ec3e78827c793c4b73fd", size = 419732382, upload-time = "2026-03-23T18:08:30.835Z" },
+    { url = "https://files.pythonhosted.org/packages/3d/e1/b73f7c575a4b8f87a5928f50a1e35416b5e27295d8be9397d5293e7e8d4c/torch-2.11.0-cp313-cp313-manylinux_2_28_x86_64.whl", hash = "sha256:cc89b9b173d9adfab59fd227f0ab5e5516d9a52b658ae41d64e59d2e55a418db", size = 530711509, upload-time = "2026-03-23T18:08:47.213Z" },
+    { url = "https://files.pythonhosted.org/packages/66/82/3e3fcdd388fbe54e29fd3f991f36846ff4ac90b0d0181e9c8f7236565f82/torch-2.11.0-cp313-cp313-win_amd64.whl", hash = "sha256:4dda3b3f52d121063a731ddb835f010dc137b920d7fec2778e52f60d8e4bf0cd", size = 114555842, upload-time = "2026-03-23T18:09:52.111Z" },
     { url = "https://files.pythonhosted.org/packages/db/38/8ac78069621b8c2b4979c2f96dc8409ef5e9c4189f6aac629189a78677ca/torch-2.11.0-cp313-cp313t-macosx_11_0_arm64.whl", hash = "sha256:8b394322f49af4362d4f80e424bcaca7efcd049619af03a4cf4501520bdf0fb4", size = 80959574, upload-time = "2026-03-23T18:10:14.214Z" },
+    { url = "https://files.pythonhosted.org/packages/6d/6c/56bfb37073e7136e6dd86bfc6af7339946dd684e0ecf2155ac0eee687ae1/torch-2.11.0-cp313-cp313t-manylinux_2_28_aarch64.whl", hash = "sha256:2658f34ce7e2dabf4ec73b45e2ca68aedad7a5be87ea756ad656eaf32bf1e1ea", size = 419732324, upload-time = "2026-03-23T18:09:36.604Z" },
+    { url = "https://files.pythonhosted.org/packages/07/f4/1b666b6d61d3394cca306ea543ed03a64aad0a201b6cd159f1d41010aeb1/torch-2.11.0-cp313-cp313t-manylinux_2_28_x86_64.whl", hash = "sha256:98bb213c3084cfe176302949bdc360074b18a9da7ab59ef2edc9d9f742504778", size = 530596026, upload-time = "2026-03-23T18:09:20.842Z" },
+    { url = "https://files.pythonhosted.org/packages/48/6b/30d1459fa7e4b67e9e3fe1685ca1d8bb4ce7c62ef436c3a615963c6c866c/torch-2.11.0-cp313-cp313t-win_amd64.whl", hash = "sha256:a97b94bbf62992949b4730c6cd2cc9aee7b335921ee8dc207d930f2ed09ae2db", size = 114793702, upload-time = "2026-03-23T18:09:47.304Z" },
     { url = "https://files.pythonhosted.org/packages/26/0d/8603382f61abd0db35841148ddc1ffd607bf3100b11c6e1dab6d2fc44e72/torch-2.11.0-cp314-cp314-macosx_11_0_arm64.whl", hash = "sha256:01018087326984a33b64e04c8cb5c2795f9120e0d775ada1f6638840227b04d7", size = 80573442, upload-time = "2026-03-23T18:09:10.117Z" },
+    { url = "https://files.pythonhosted.org/packages/c7/86/7cd7c66cb9cec6be330fff36db5bd0eef386d80c031b581ec81be1d4b26c/torch-2.11.0-cp314-cp314-manylinux_2_28_aarch64.whl", hash = "sha256:2bb3cc54bd0dea126b0060bb1ec9de0f9c7f7342d93d436646516b0330cd5be7", size = 419749385, upload-time = "2026-03-23T18:07:33.77Z" },
+    { url = "https://files.pythonhosted.org/packages/47/e8/b98ca2d39b2e0e4730c0ee52537e488e7008025bc77ca89552ff91021f7c/torch-2.11.0-cp314-cp314-manylinux_2_28_x86_64.whl", hash = "sha256:4dc8b3809469b6c30b411bb8c4cad3828efd26236153d9beb6a3ec500f211a60", size = 530716756, upload-time = "2026-03-23T18:07:50.02Z" },
+    { url = "https://files.pythonhosted.org/packages/78/88/d4a4cda8362f8a30d1ed428564878c3cafb0d87971fbd3947d4c84552095/torch-2.11.0-cp314-cp314-win_amd64.whl", hash = "sha256:2b4e811728bd0cc58fb2b0948fe939a1ee2bf1422f6025be2fca4c7bd9d79718", size = 114552300, upload-time = "2026-03-23T18:09:05.617Z" },
     { url = "https://files.pythonhosted.org/packages/bf/46/4419098ed6d801750f26567b478fc185c3432e11e2cad712bc6b4c2ab0d0/torch-2.11.0-cp314-cp314t-macosx_11_0_arm64.whl", hash = "sha256:8245477871c3700d4370352ffec94b103cfcb737229445cf9946cddb7b2ca7cd", size = 80959460, upload-time = "2026-03-23T18:09:00.818Z" },
+    { url = "https://files.pythonhosted.org/packages/fd/66/54a56a4a6ceaffb567231994a9745821d3af922a854ed33b0b3a278e0a99/torch-2.11.0-cp314-cp314t-manylinux_2_28_aarch64.whl", hash = "sha256:ab9a8482f475f9ba20e12db84b0e55e2f58784bdca43a854a6ccd3fd4b9f75e6", size = 419735835, upload-time = "2026-03-23T18:07:18.974Z" },
+    { url = "https://files.pythonhosted.org/packages/b1/e7/0b6665f533aa9e337662dc190425abc0af1fe3234088f4454c52393ded61/torch-2.11.0-cp314-cp314t-manylinux_2_28_x86_64.whl", hash = "sha256:563ed3d25542d7e7bbc5b235ccfacfeb97fb470c7fee257eae599adb8005c8a2", size = 530613405, upload-time = "2026-03-23T18:08:07.014Z" },
+    { url = "https://files.pythonhosted.org/packages/cf/bf/c8d12a2c86dbfd7f40fb2f56fbf5a505ccf2d9ce131eb559dfc7c51e1a04/torch-2.11.0-cp314-cp314t-win_amd64.whl", hash = "sha256:b2a43985ff5ef6ddd923bbcf99943e5f58059805787c5c9a2622bf05ca2965b0", size = 114792991, upload-time = "2026-03-23T18:08:19.216Z" },
 ]
 
 [[package]]
@@ -7771,34 +7930,43 @@ name = "torch"
 version = "2.11.0+cu128"
 source = { registry = "https://download.pytorch.org/whl/cu128" }
 resolution-markers = [
-    "python_full_version >= '3.14' and platform_machine != 's390x' and sys_platform == 'linux'",
-    "python_full_version == '3.13.*' and platform_machine != 's390x' and sys_platform == 'linux'",
-    "python_full_version < '3.13' and platform_machine != 's390x' and sys_platform == 'linux'",
-    "python_full_version >= '3.14' and platform_machine == 's390x' and sys_platform == 'linux'",
-    "python_full_version == '3.13.*' and platform_machine == 's390x' and sys_platform == 'linux'",
-    "python_full_version < '3.13' and platform_machine == 's390x' and sys_platform == 'linux'",
-    "python_full_version >= '3.14' and platform_machine != 's390x' and sys_platform == 'win32'",
-    "python_full_version == '3.13.*' and platform_machine != 's390x' and sys_platform == 'win32'",
-    "python_full_version < '3.13' and platform_machine != 's390x' and sys_platform == 'win32'",
-    "python_full_version >= '3.14' and platform_machine == 's390x' and sys_platform == 'win32'",
-    "python_full_version == '3.13.*' and platform_machine == 's390x' and sys_platform == 'win32'",
-    "python_full_version < '3.13' and platform_machine == 's390x' and sys_platform == 'win32'",
+    "python_full_version >= '3.14' and platform_machine != 's390x' and sys_platform == 'linux' and extra != 'extra-12-openpipe-art-backend' and extra == 'extra-12-openpipe-art-megatron' and extra != 'extra-12-openpipe-art-tinker'",
+    "python_full_version >= '3.14' and platform_machine == 's390x' and sys_platform == 'linux' and extra != 'extra-12-openpipe-art-backend' and extra == 'extra-12-openpipe-art-megatron' and extra != 'extra-12-openpipe-art-tinker'",
+    "python_full_version >= '3.14' and platform_machine != 's390x' and sys_platform == 'win32' and extra != 'extra-12-openpipe-art-backend' and extra == 'extra-12-openpipe-art-megatron' and extra != 'extra-12-openpipe-art-tinker'",
+    "python_full_version >= '3.14' and platform_machine == 's390x' and sys_platform == 'win32' and extra != 'extra-12-openpipe-art-backend' and extra == 'extra-12-openpipe-art-megatron' and extra != 'extra-12-openpipe-art-tinker'",
+    "python_full_version == '3.13.*' and platform_machine != 's390x' and sys_platform == 'linux' and extra != 'extra-12-openpipe-art-backend' and extra == 'extra-12-openpipe-art-megatron' and extra != 'extra-12-openpipe-art-tinker'",
+    "python_full_version < '3.13' and platform_machine != 's390x' and sys_platform == 'linux' and extra != 'extra-12-openpipe-art-backend' and extra == 'extra-12-openpipe-art-megatron' and extra != 'extra-12-openpipe-art-tinker'",
+    "python_full_version == '3.13.*' and platform_machine == 's390x' and sys_platform == 'linux' and extra != 'extra-12-openpipe-art-backend' and extra == 'extra-12-openpipe-art-megatron' and extra != 'extra-12-openpipe-art-tinker'",
+    "python_full_version < '3.13' and platform_machine == 's390x' and sys_platform == 'linux' and extra != 'extra-12-openpipe-art-backend' and extra == 'extra-12-openpipe-art-megatron' and extra != 'extra-12-openpipe-art-tinker'",
+    "python_full_version == '3.13.*' and platform_machine != 's390x' and sys_platform == 'win32' and extra != 'extra-12-openpipe-art-backend' and extra == 'extra-12-openpipe-art-megatron' and extra != 'extra-12-openpipe-art-tinker'",
+    "python_full_version < '3.13' and platform_machine != 's390x' and sys_platform == 'win32' and extra != 'extra-12-openpipe-art-backend' and extra == 'extra-12-openpipe-art-megatron' and extra != 'extra-12-openpipe-art-tinker'",
+    "python_full_version == '3.13.*' and platform_machine == 's390x' and sys_platform == 'win32' and extra != 'extra-12-openpipe-art-backend' and extra == 'extra-12-openpipe-art-megatron' and extra != 'extra-12-openpipe-art-tinker'",
+    "python_full_version < '3.13' and platform_machine == 's390x' and sys_platform == 'win32' and extra != 'extra-12-openpipe-art-backend' and extra == 'extra-12-openpipe-art-megatron' and extra != 'extra-12-openpipe-art-tinker'",
+    "python_full_version >= '3.14' and sys_platform == 'linux' and extra == 'extra-12-openpipe-art-backend' and extra != 'extra-12-openpipe-art-megatron'",
+    "python_full_version == '3.13.*' and sys_platform == 'linux' and extra == 'extra-12-openpipe-art-backend' and extra != 'extra-12-openpipe-art-megatron'",
+    "python_full_version < '3.13' and sys_platform == 'linux' and extra == 'extra-12-openpipe-art-backend' and extra != 'extra-12-openpipe-art-megatron'",
+    "python_full_version >= '3.14' and sys_platform == 'win32' and extra == 'extra-12-openpipe-art-backend' and extra != 'extra-12-openpipe-art-megatron'",
+    "python_full_version == '3.13.*' and sys_platform == 'win32' and extra == 'extra-12-openpipe-art-backend' and extra != 'extra-12-openpipe-art-megatron'",
+    "python_full_version < '3.13' and sys_platform == 'win32' and extra == 'extra-12-openpipe-art-backend' and extra != 'extra-12-openpipe-art-megatron'",
+    "(python_full_version >= '3.14' and sys_platform == 'linux' and extra != 'extra-12-openpipe-art-backend' and extra != 'extra-12-openpipe-art-megatron') or (python_full_version >= '3.14' and sys_platform == 'win32' and extra != 'extra-12-openpipe-art-backend' and extra != 'extra-12-openpipe-art-megatron')",
+    "(python_full_version == '3.13.*' and sys_platform == 'linux' and extra != 'extra-12-openpipe-art-backend' and extra != 'extra-12-openpipe-art-megatron') or (python_full_version == '3.13.*' and sys_platform == 'win32' and extra != 'extra-12-openpipe-art-backend' and extra != 'extra-12-openpipe-art-megatron')",
+    "(python_full_version < '3.13' and sys_platform == 'linux' and extra != 'extra-12-openpipe-art-backend' and extra != 'extra-12-openpipe-art-megatron') or (python_full_version < '3.13' and sys_platform == 'win32' and extra != 'extra-12-openpipe-art-backend' and extra != 'extra-12-openpipe-art-megatron')",
 ]
 dependencies = [
-    { name = "cuda-bindings", marker = "sys_platform == 'linux'" },
-    { name = "cuda-toolkit", extra = ["cublas", "cudart", "cufft", "cufile", "cupti", "curand", "cusolver", "cusparse", "nvjitlink", "nvrtc", "nvtx"], marker = "sys_platform == 'linux'" },
-    { name = "filelock", marker = "sys_platform == 'linux' or sys_platform == 'win32'" },
-    { name = "fsspec", marker = "sys_platform == 'linux' or sys_platform == 'win32'" },
-    { name = "jinja2", marker = "sys_platform == 'linux' or sys_platform == 'win32'" },
-    { name = "networkx", marker = "sys_platform == 'linux' or sys_platform == 'win32'" },
-    { name = "nvidia-cudnn-cu12", marker = "sys_platform == 'linux'" },
-    { name = "nvidia-cusparselt-cu12", marker = "sys_platform == 'linux'" },
-    { name = "nvidia-nccl-cu12", marker = "sys_platform == 'linux'" },
-    { name = "nvidia-nvshmem-cu12", marker = "sys_platform == 'linux'" },
-    { name = "setuptools", marker = "sys_platform == 'linux' or sys_platform == 'win32'" },
-    { name = "sympy", marker = "sys_platform == 'linux' or sys_platform == 'win32'" },
-    { name = "triton", marker = "sys_platform == 'linux'" },
-    { name = "typing-extensions", marker = "sys_platform == 'linux' or sys_platform == 'win32'" },
+    { name = "cuda-bindings", marker = "sys_platform == 'linux' or (extra == 'extra-12-openpipe-art-backend' and extra == 'extra-12-openpipe-art-megatron') or (extra == 'extra-12-openpipe-art-megatron' and extra == 'extra-12-openpipe-art-tinker')" },
+    { name = "cuda-toolkit", extra = ["cublas", "cudart", "cufft", "cufile", "cupti", "curand", "cusolver", "cusparse", "nvjitlink", "nvrtc", "nvtx"], marker = "sys_platform == 'linux' or (extra == 'extra-12-openpipe-art-backend' and extra == 'extra-12-openpipe-art-megatron') or (extra == 'extra-12-openpipe-art-megatron' and extra == 'extra-12-openpipe-art-tinker')" },
+    { name = "filelock", marker = "sys_platform == 'linux' or sys_platform == 'win32' or (extra == 'extra-12-openpipe-art-backend' and extra == 'extra-12-openpipe-art-megatron') or (extra == 'extra-12-openpipe-art-megatron' and extra == 'extra-12-openpipe-art-tinker')" },
+    { name = "fsspec", marker = "sys_platform == 'linux' or sys_platform == 'win32' or (extra == 'extra-12-openpipe-art-backend' and extra == 'extra-12-openpipe-art-megatron') or (extra == 'extra-12-openpipe-art-megatron' and extra == 'extra-12-openpipe-art-tinker')" },
+    { name = "jinja2", marker = "sys_platform == 'linux' or sys_platform == 'win32' or (extra == 'extra-12-openpipe-art-backend' and extra == 'extra-12-openpipe-art-megatron') or (extra == 'extra-12-openpipe-art-megatron' and extra == 'extra-12-openpipe-art-tinker')" },
+    { name = "networkx", marker = "sys_platform == 'linux' or sys_platform == 'win32' or (extra == 'extra-12-openpipe-art-backend' and extra == 'extra-12-openpipe-art-megatron') or (extra == 'extra-12-openpipe-art-megatron' and extra == 'extra-12-openpipe-art-tinker')" },
+    { name = "nvidia-cudnn-cu12", marker = "sys_platform == 'linux' or (extra == 'extra-12-openpipe-art-backend' and extra == 'extra-12-openpipe-art-megatron') or (extra == 'extra-12-openpipe-art-megatron' and extra == 'extra-12-openpipe-art-tinker')" },
+    { name = "nvidia-cusparselt-cu12", marker = "sys_platform == 'linux' or (extra == 'extra-12-openpipe-art-backend' and extra == 'extra-12-openpipe-art-megatron') or (extra == 'extra-12-openpipe-art-megatron' and extra == 'extra-12-openpipe-art-tinker')" },
+    { name = "nvidia-nccl-cu12", marker = "sys_platform == 'linux' or (extra == 'extra-12-openpipe-art-backend' and extra == 'extra-12-openpipe-art-megatron') or (extra == 'extra-12-openpipe-art-megatron' and extra == 'extra-12-openpipe-art-tinker')" },
+    { name = "nvidia-nvshmem-cu12", marker = "sys_platform == 'linux' or (extra == 'extra-12-openpipe-art-backend' and extra == 'extra-12-openpipe-art-megatron') or (extra == 'extra-12-openpipe-art-megatron' and extra == 'extra-12-openpipe-art-tinker')" },
+    { name = "setuptools", marker = "sys_platform == 'linux' or sys_platform == 'win32' or (extra == 'extra-12-openpipe-art-backend' and extra == 'extra-12-openpipe-art-megatron') or (extra == 'extra-12-openpipe-art-megatron' and extra == 'extra-12-openpipe-art-tinker')" },
+    { name = "sympy", marker = "sys_platform == 'linux' or sys_platform == 'win32' or (extra == 'extra-12-openpipe-art-backend' and extra == 'extra-12-openpipe-art-megatron') or (extra == 'extra-12-openpipe-art-megatron' and extra == 'extra-12-openpipe-art-tinker')" },
+    { name = "triton", marker = "sys_platform == 'linux' or (extra == 'extra-12-openpipe-art-backend' and extra == 'extra-12-openpipe-art-megatron') or (extra == 'extra-12-openpipe-art-megatron' and extra == 'extra-12-openpipe-art-tinker')" },
+    { name = "typing-extensions", marker = "sys_platform == 'linux' or sys_platform == 'win32' or (extra == 'extra-12-openpipe-art-backend' and extra == 'extra-12-openpipe-art-megatron') or (extra == 'extra-12-openpipe-art-megatron' and extra == 'extra-12-openpipe-art-tinker')" },
 ]
 wheels = [
     { url = "https://download-r2.pytorch.org/whl/cu128/torch-2.11.0%2Bcu128-cp312-cp312-manylinux_2_28_aarch64.whl", hash = "sha256:9c8f38efee365cb9d334de8a83ce52fc7e5fc9e5a7b0853285efa1b69e00b0f2", upload-time = "2026-04-27T17:41:30Z" },
@@ -7823,8 +7991,8 @@ name = "torch-c-dlpack-ext"
 version = "0.1.5"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
-    { name = "torch", version = "2.11.0", source = { registry = "https://pypi.org/simple" }, marker = "sys_platform != 'linux' and sys_platform != 'win32'" },
-    { name = "torch", version = "2.11.0+cu128", source = { registry = "https://download.pytorch.org/whl/cu128" }, marker = "sys_platform == 'linux' or sys_platform == 'win32'" },
+    { name = "torch", version = "2.11.0", source = { registry = "https://pypi.org/simple" }, marker = "(sys_platform != 'linux' and sys_platform != 'win32' and extra == 'extra-12-openpipe-art-megatron') or (sys_platform == 'linux' and extra == 'extra-12-openpipe-art-backend' and extra == 'extra-12-openpipe-art-megatron') or (sys_platform == 'linux' and extra == 'extra-12-openpipe-art-megatron' and extra == 'extra-12-openpipe-art-tinker') or (sys_platform == 'win32' and extra == 'extra-12-openpipe-art-backend' and extra == 'extra-12-openpipe-art-megatron') or (sys_platform == 'win32' and extra == 'extra-12-openpipe-art-megatron' and extra == 'extra-12-openpipe-art-tinker')" },
+    { name = "torch", version = "2.11.0+cu128", source = { registry = "https://download.pytorch.org/whl/cu128" }, marker = "(sys_platform == 'linux' and extra == 'extra-12-openpipe-art-megatron') or (sys_platform == 'win32' and extra == 'extra-12-openpipe-art-megatron') or (extra == 'extra-12-openpipe-art-backend' and extra == 'extra-12-openpipe-art-megatron') or (extra == 'extra-12-openpipe-art-megatron' and extra == 'extra-12-openpipe-art-tinker')" },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/37/de/921b6491efce5c389a5ef9bbed3d2d6660005840dae488124173180859ab/torch_c_dlpack_ext-0.1.5.tar.gz", hash = "sha256:d06f0357d575d22a168cc77acb9020fc4bae30968ceb6718a055dcbe92bacabe", size = 12913, upload-time = "2026-01-12T11:25:08.484Z" }
 wheels = [
@@ -7858,8 +8026,8 @@ source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "numpy" },
     { name = "pillow" },
-    { name = "torch", version = "2.11.0", source = { registry = "https://pypi.org/simple" }, marker = "sys_platform != 'linux' and sys_platform != 'win32'" },
-    { name = "torch", version = "2.11.0+cu128", source = { registry = "https://download.pytorch.org/whl/cu128" }, marker = "sys_platform == 'linux' or sys_platform == 'win32'" },
+    { name = "torch", version = "2.11.0", source = { registry = "https://pypi.org/simple" }, marker = "(sys_platform != 'linux' and sys_platform != 'win32' and extra == 'extra-12-openpipe-art-backend') or (sys_platform != 'linux' and sys_platform != 'win32' and extra == 'extra-12-openpipe-art-megatron') or (sys_platform == 'linux' and extra == 'extra-12-openpipe-art-backend' and extra == 'extra-12-openpipe-art-megatron') or (sys_platform == 'linux' and extra == 'extra-12-openpipe-art-megatron' and extra == 'extra-12-openpipe-art-tinker') or (sys_platform == 'win32' and extra == 'extra-12-openpipe-art-backend' and extra == 'extra-12-openpipe-art-megatron') or (sys_platform == 'win32' and extra == 'extra-12-openpipe-art-megatron' and extra == 'extra-12-openpipe-art-tinker')" },
+    { name = "torch", version = "2.11.0+cu128", source = { registry = "https://download.pytorch.org/whl/cu128" }, marker = "(sys_platform == 'linux' and extra == 'extra-12-openpipe-art-backend') or (sys_platform == 'linux' and extra == 'extra-12-openpipe-art-megatron') or (sys_platform == 'win32' and extra == 'extra-12-openpipe-art-backend') or (sys_platform == 'win32' and extra == 'extra-12-openpipe-art-megatron') or (extra == 'extra-12-openpipe-art-backend' and extra == 'extra-12-openpipe-art-megatron') or (extra == 'extra-12-openpipe-art-megatron' and extra == 'extra-12-openpipe-art-tinker')" },
 ]
 wheels = [
     { url = "https://files.pythonhosted.org/packages/9e/c8/5cd91932f7f3671b0743dc4ae1a4c16b1d0b45bf4087976277d325bda718/torchvision-0.27.0-cp312-cp312-macosx_14_0_arm64.whl", hash = "sha256:1a6dd742a150645126df9e0b2e449874c1d635897c773b322c2e067e98382dfe", size = 1758824, upload-time = "2026-05-13T14:57:15.227Z" },
@@ -7906,7 +8074,7 @@ name = "tqdm"
 version = "4.67.3"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
-    { name = "colorama", marker = "sys_platform == 'win32'" },
+    { name = "colorama", marker = "sys_platform == 'win32' or (extra == 'extra-12-openpipe-art-backend' and extra == 'extra-12-openpipe-art-megatron') or (extra == 'extra-12-openpipe-art-megatron' and extra == 'extra-12-openpipe-art-tinker')" },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/09/a9/6ba95a270c6f1fbcd8dac228323f2777d886cb206987444e4bce66338dd4/tqdm-4.67.3.tar.gz", hash = "sha256:7d825f03f89244ef73f1d4ce193cb1774a8179fd96f31d7e1dcde62092b960bb", size = 169598, upload-time = "2026-02-03T17:35:53.048Z" }
 wheels = [
@@ -7966,8 +8134,8 @@ dependencies = [
     { name = "onnxscript" },
     { name = "packaging" },
     { name = "pydantic" },
-    { name = "torch", version = "2.11.0", source = { registry = "https://pypi.org/simple" }, marker = "sys_platform != 'linux' and sys_platform != 'win32'" },
-    { name = "torch", version = "2.11.0+cu128", source = { registry = "https://download.pytorch.org/whl/cu128" }, marker = "sys_platform == 'linux' or sys_platform == 'win32'" },
+    { name = "torch", version = "2.11.0", source = { registry = "https://pypi.org/simple" }, marker = "(sys_platform != 'linux' and sys_platform != 'win32' and extra == 'extra-12-openpipe-art-megatron') or (sys_platform == 'linux' and extra == 'extra-12-openpipe-art-backend' and extra == 'extra-12-openpipe-art-megatron') or (sys_platform == 'linux' and extra == 'extra-12-openpipe-art-megatron' and extra == 'extra-12-openpipe-art-tinker') or (sys_platform == 'win32' and extra == 'extra-12-openpipe-art-backend' and extra == 'extra-12-openpipe-art-megatron') or (sys_platform == 'win32' and extra == 'extra-12-openpipe-art-megatron' and extra == 'extra-12-openpipe-art-tinker')" },
+    { name = "torch", version = "2.11.0+cu128", source = { registry = "https://download.pytorch.org/whl/cu128" }, marker = "(sys_platform == 'linux' and extra == 'extra-12-openpipe-art-megatron') or (sys_platform == 'win32' and extra == 'extra-12-openpipe-art-megatron') or (extra == 'extra-12-openpipe-art-backend' and extra == 'extra-12-openpipe-art-megatron') or (extra == 'extra-12-openpipe-art-megatron' and extra == 'extra-12-openpipe-art-tinker')" },
     { name = "transformer-engine-cu12" },
 ]
 
@@ -7975,20 +8143,77 @@ dependencies = [
 name = "transformers"
 version = "5.2.0"
 source = { registry = "https://pypi.org/simple" }
+resolution-markers = [
+    "python_full_version >= '3.14' and sys_platform == 'linux' and extra == 'extra-12-openpipe-art-backend' and extra != 'extra-12-openpipe-art-megatron'",
+    "python_full_version == '3.13.*' and sys_platform == 'linux' and extra == 'extra-12-openpipe-art-backend' and extra != 'extra-12-openpipe-art-megatron'",
+    "python_full_version < '3.13' and sys_platform == 'linux' and extra == 'extra-12-openpipe-art-backend' and extra != 'extra-12-openpipe-art-megatron'",
+    "python_full_version >= '3.14' and sys_platform == 'win32' and extra == 'extra-12-openpipe-art-backend' and extra != 'extra-12-openpipe-art-megatron'",
+    "python_full_version == '3.13.*' and sys_platform == 'win32' and extra == 'extra-12-openpipe-art-backend' and extra != 'extra-12-openpipe-art-megatron'",
+    "python_full_version < '3.13' and sys_platform == 'win32' and extra == 'extra-12-openpipe-art-backend' and extra != 'extra-12-openpipe-art-megatron'",
+    "python_full_version >= '3.14' and sys_platform != 'linux' and sys_platform != 'win32' and extra == 'extra-12-openpipe-art-backend' and extra != 'extra-12-openpipe-art-megatron'",
+    "python_full_version == '3.13.*' and sys_platform != 'linux' and sys_platform != 'win32' and extra == 'extra-12-openpipe-art-backend' and extra != 'extra-12-openpipe-art-megatron'",
+    "python_full_version < '3.13' and sys_platform != 'linux' and sys_platform != 'win32' and extra == 'extra-12-openpipe-art-backend' and extra != 'extra-12-openpipe-art-megatron'",
+    "(python_full_version >= '3.14' and sys_platform == 'linux' and extra != 'extra-12-openpipe-art-backend' and extra != 'extra-12-openpipe-art-megatron') or (python_full_version >= '3.14' and sys_platform == 'win32' and extra != 'extra-12-openpipe-art-backend' and extra != 'extra-12-openpipe-art-megatron')",
+    "(python_full_version == '3.13.*' and sys_platform == 'linux' and extra != 'extra-12-openpipe-art-backend' and extra != 'extra-12-openpipe-art-megatron') or (python_full_version == '3.13.*' and sys_platform == 'win32' and extra != 'extra-12-openpipe-art-backend' and extra != 'extra-12-openpipe-art-megatron')",
+    "(python_full_version < '3.13' and sys_platform == 'linux' and extra != 'extra-12-openpipe-art-backend' and extra != 'extra-12-openpipe-art-megatron') or (python_full_version < '3.13' and sys_platform == 'win32' and extra != 'extra-12-openpipe-art-backend' and extra != 'extra-12-openpipe-art-megatron')",
+    "python_full_version >= '3.14' and sys_platform != 'linux' and sys_platform != 'win32' and extra != 'extra-12-openpipe-art-backend' and extra != 'extra-12-openpipe-art-megatron'",
+    "python_full_version == '3.13.*' and sys_platform != 'linux' and sys_platform != 'win32' and extra != 'extra-12-openpipe-art-backend' and extra != 'extra-12-openpipe-art-megatron'",
+    "python_full_version < '3.13' and sys_platform != 'linux' and sys_platform != 'win32' and extra != 'extra-12-openpipe-art-backend' and extra != 'extra-12-openpipe-art-megatron'",
+]
 dependencies = [
-    { name = "huggingface-hub" },
-    { name = "numpy" },
-    { name = "packaging" },
-    { name = "pyyaml" },
-    { name = "regex" },
-    { name = "safetensors" },
-    { name = "tokenizers" },
-    { name = "tqdm" },
-    { name = "typer-slim" },
+    { name = "huggingface-hub", marker = "extra == 'extra-12-openpipe-art-backend' or extra != 'extra-12-openpipe-art-megatron' or (extra == 'extra-12-openpipe-art-megatron' and extra == 'extra-12-openpipe-art-tinker')" },
+    { name = "numpy", marker = "extra == 'extra-12-openpipe-art-backend' or extra != 'extra-12-openpipe-art-megatron' or (extra == 'extra-12-openpipe-art-megatron' and extra == 'extra-12-openpipe-art-tinker')" },
+    { name = "packaging", marker = "extra == 'extra-12-openpipe-art-backend' or extra != 'extra-12-openpipe-art-megatron' or (extra == 'extra-12-openpipe-art-megatron' and extra == 'extra-12-openpipe-art-tinker')" },
+    { name = "pyyaml", marker = "extra == 'extra-12-openpipe-art-backend' or extra != 'extra-12-openpipe-art-megatron' or (extra == 'extra-12-openpipe-art-megatron' and extra == 'extra-12-openpipe-art-tinker')" },
+    { name = "regex", marker = "extra == 'extra-12-openpipe-art-backend' or extra != 'extra-12-openpipe-art-megatron' or (extra == 'extra-12-openpipe-art-megatron' and extra == 'extra-12-openpipe-art-tinker')" },
+    { name = "safetensors", marker = "extra == 'extra-12-openpipe-art-backend' or extra != 'extra-12-openpipe-art-megatron' or (extra == 'extra-12-openpipe-art-megatron' and extra == 'extra-12-openpipe-art-tinker')" },
+    { name = "tokenizers", marker = "extra == 'extra-12-openpipe-art-backend' or extra != 'extra-12-openpipe-art-megatron' or (extra == 'extra-12-openpipe-art-megatron' and extra == 'extra-12-openpipe-art-tinker')" },
+    { name = "tqdm", marker = "extra == 'extra-12-openpipe-art-backend' or extra != 'extra-12-openpipe-art-megatron' or (extra == 'extra-12-openpipe-art-megatron' and extra == 'extra-12-openpipe-art-tinker')" },
+    { name = "typer-slim", marker = "extra == 'extra-12-openpipe-art-backend' or extra != 'extra-12-openpipe-art-megatron' or (extra == 'extra-12-openpipe-art-megatron' and extra == 'extra-12-openpipe-art-tinker')" },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/bd/7e/8a0c57d562015e5b16c97c1f0b8e0e92ead2c7c20513225dc12c2043ba9f/transformers-5.2.0.tar.gz", hash = "sha256:0088b8b46ccc9eff1a1dca72b5d618a5ee3b1befc3e418c9512b35dea9f9a650", size = 8618176, upload-time = "2026-02-16T18:54:02.867Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/4e/93/79754b0ca486e556c2b95d4f5afc66aaf4b260694f3d6e1b51da2d036691/transformers-5.2.0-py3-none-any.whl", hash = "sha256:9ecaf243dc45bee11a7d93f8caf03746accc0cb069181bbf4ad8566c53e854b4", size = 10403304, upload-time = "2026-02-16T18:53:59.699Z" },
+]
+
+[[package]]
+name = "transformers"
+version = "5.6.2"
+source = { registry = "https://pypi.org/simple" }
+resolution-markers = [
+    "python_full_version >= '3.14' and platform_machine != 's390x' and sys_platform == 'linux'",
+    "python_full_version >= '3.14' and platform_machine == 's390x' and sys_platform == 'linux'",
+    "python_full_version >= '3.14' and platform_machine != 's390x' and sys_platform == 'win32'",
+    "python_full_version >= '3.14' and platform_machine == 's390x' and sys_platform == 'win32'",
+    "python_full_version == '3.13.*' and platform_machine != 's390x' and sys_platform == 'linux'",
+    "python_full_version < '3.13' and platform_machine != 's390x' and sys_platform == 'linux'",
+    "python_full_version == '3.13.*' and platform_machine == 's390x' and sys_platform == 'linux'",
+    "python_full_version < '3.13' and platform_machine == 's390x' and sys_platform == 'linux'",
+    "python_full_version == '3.13.*' and platform_machine != 's390x' and sys_platform == 'win32'",
+    "python_full_version < '3.13' and platform_machine != 's390x' and sys_platform == 'win32'",
+    "python_full_version == '3.13.*' and platform_machine == 's390x' and sys_platform == 'win32'",
+    "python_full_version < '3.13' and platform_machine == 's390x' and sys_platform == 'win32'",
+    "python_full_version >= '3.14' and platform_machine != 's390x' and sys_platform != 'linux' and sys_platform != 'win32'",
+    "python_full_version >= '3.14' and platform_machine == 's390x' and sys_platform != 'linux' and sys_platform != 'win32'",
+    "python_full_version == '3.13.*' and platform_machine != 's390x' and sys_platform != 'linux' and sys_platform != 'win32'",
+    "python_full_version < '3.13' and platform_machine != 's390x' and sys_platform != 'linux' and sys_platform != 'win32'",
+    "python_full_version == '3.13.*' and platform_machine == 's390x' and sys_platform != 'linux' and sys_platform != 'win32'",
+    "python_full_version < '3.13' and platform_machine == 's390x' and sys_platform != 'linux' and sys_platform != 'win32'",
+]
+dependencies = [
+    { name = "huggingface-hub", marker = "extra == 'extra-12-openpipe-art-megatron'" },
+    { name = "numpy", marker = "extra == 'extra-12-openpipe-art-megatron'" },
+    { name = "packaging", marker = "extra == 'extra-12-openpipe-art-megatron'" },
+    { name = "pyyaml", marker = "extra == 'extra-12-openpipe-art-megatron'" },
+    { name = "regex", marker = "extra == 'extra-12-openpipe-art-megatron'" },
+    { name = "safetensors", marker = "extra == 'extra-12-openpipe-art-megatron'" },
+    { name = "tokenizers", marker = "extra == 'extra-12-openpipe-art-megatron'" },
+    { name = "tqdm", marker = "extra == 'extra-12-openpipe-art-megatron'" },
+    { name = "typer", marker = "extra == 'extra-12-openpipe-art-megatron'" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/a4/e9/c6c80a07690142a7d05444271f47b9f3c8aac7dea01d52e1137ee480ad78/transformers-5.6.2.tar.gz", hash = "sha256:e657134c3e5a6bc00a3c35f4e2674bb51adfcd89898495b788a18552bac2b91a", size = 8311867, upload-time = "2026-04-23T18:33:29.332Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/5d/95/0b0218149b0d6f14df35f5b8f676fa83df4f19ed253c3cc447107ef86eca/transformers-5.6.2-py3-none-any.whl", hash = "sha256:f8d3a1bb96778fed9b8aabfd0dd6e19843e4b0f2bb6b59f32b8a92051b0f348f", size = 10364898, upload-time = "2026-04-23T18:33:26.081Z" },
 ]
 
 [[package]]
@@ -8025,7 +8250,7 @@ source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "accelerate" },
     { name = "datasets" },
-    { name = "transformers" },
+    { name = "transformers", version = "5.2.0", source = { registry = "https://pypi.org/simple" } },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/60/11/95cf1210df9f241b7b1084abe1032e322374f667c4587c09af8d14a1d76f/trl-0.20.0.tar.gz", hash = "sha256:3f949b009b79dc609cd8f5469d67209ab8f71c5cb4d8d979f7b568ef054922fa", size = 461791, upload-time = "2025-07-29T04:10:06.305Z" }
 wheels = [
@@ -8083,7 +8308,7 @@ version = "0.26.3"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "annotated-doc" },
-    { name = "colorama", marker = "sys_platform == 'win32'" },
+    { name = "colorama", marker = "sys_platform == 'win32' or (extra == 'extra-12-openpipe-art-backend' and extra == 'extra-12-openpipe-art-megatron') or (extra == 'extra-12-openpipe-art-megatron' and extra == 'extra-12-openpipe-art-tinker')" },
     { name = "rich" },
     { name = "shellingham" },
 ]
@@ -8097,7 +8322,7 @@ name = "typer-slim"
 version = "0.24.0"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
-    { name = "typer" },
+    { name = "typer", marker = "extra == 'extra-12-openpipe-art-backend' or extra != 'extra-12-openpipe-art-megatron' or (extra == 'extra-12-openpipe-art-megatron' and extra == 'extra-12-openpipe-art-tinker')" },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/a7/a7/e6aecc4b4eb59598829a3b5076a93aff291b4fdaa2ded25efc4e1f4d219c/typer_slim-0.24.0.tar.gz", hash = "sha256:f0ed36127183f52ae6ced2ecb2521789995992c521a46083bfcdbb652d22ad34", size = 4776, upload-time = "2026-02-16T22:08:51.2Z" }
 wheels = [
@@ -8177,11 +8402,11 @@ dependencies = [
     { name = "protobuf" },
     { name = "psutil" },
     { name = "sentencepiece" },
-    { name = "torch", version = "2.11.0", source = { registry = "https://pypi.org/simple" }, marker = "sys_platform != 'linux' and sys_platform != 'win32'" },
-    { name = "torch", version = "2.11.0+cu128", source = { registry = "https://download.pytorch.org/whl/cu128" }, marker = "sys_platform == 'linux' or sys_platform == 'win32'" },
+    { name = "torch", version = "2.11.0", source = { registry = "https://pypi.org/simple" }, marker = "(sys_platform != 'linux' and sys_platform != 'win32' and extra == 'extra-12-openpipe-art-backend') or (sys_platform == 'linux' and extra == 'extra-12-openpipe-art-backend' and extra == 'extra-12-openpipe-art-megatron') or (sys_platform == 'win32' and extra == 'extra-12-openpipe-art-backend' and extra == 'extra-12-openpipe-art-megatron') or (extra != 'extra-12-openpipe-art-backend' and extra == 'extra-12-openpipe-art-megatron' and extra == 'extra-12-openpipe-art-tinker')" },
+    { name = "torch", version = "2.11.0+cu128", source = { registry = "https://download.pytorch.org/whl/cu128" }, marker = "(sys_platform == 'linux' and extra == 'extra-12-openpipe-art-backend') or (sys_platform == 'win32' and extra == 'extra-12-openpipe-art-backend') or (extra == 'extra-12-openpipe-art-backend' and extra == 'extra-12-openpipe-art-megatron') or (extra == 'extra-12-openpipe-art-megatron' and extra == 'extra-12-openpipe-art-tinker')" },
     { name = "torchvision" },
     { name = "tqdm" },
-    { name = "transformers" },
+    { name = "transformers", version = "5.2.0", source = { registry = "https://pypi.org/simple" } },
     { name = "triton", marker = "'linux' in sys_platform" },
     { name = "triton-windows", marker = "(platform_machine == 'AMD64' and sys_platform == 'win32') or (platform_machine == 'x86_64' and sys_platform == 'win32')" },
     { name = "trl" },
@@ -8215,11 +8440,11 @@ dependencies = [
     { name = "psutil" },
     { name = "regex" },
     { name = "sentencepiece" },
-    { name = "torch", version = "2.11.0", source = { registry = "https://pypi.org/simple" }, marker = "sys_platform != 'linux' and sys_platform != 'win32'" },
-    { name = "torch", version = "2.11.0+cu128", source = { registry = "https://download.pytorch.org/whl/cu128" }, marker = "sys_platform == 'linux' or sys_platform == 'win32'" },
+    { name = "torch", version = "2.11.0", source = { registry = "https://pypi.org/simple" }, marker = "(sys_platform != 'linux' and sys_platform != 'win32' and extra == 'extra-12-openpipe-art-backend') or (sys_platform == 'linux' and extra == 'extra-12-openpipe-art-backend' and extra == 'extra-12-openpipe-art-megatron') or (sys_platform == 'win32' and extra == 'extra-12-openpipe-art-backend' and extra == 'extra-12-openpipe-art-megatron') or (extra != 'extra-12-openpipe-art-backend' and extra == 'extra-12-openpipe-art-megatron' and extra == 'extra-12-openpipe-art-tinker')" },
+    { name = "torch", version = "2.11.0+cu128", source = { registry = "https://download.pytorch.org/whl/cu128" }, marker = "(sys_platform == 'linux' and extra == 'extra-12-openpipe-art-backend') or (sys_platform == 'win32' and extra == 'extra-12-openpipe-art-backend') or (extra == 'extra-12-openpipe-art-backend' and extra == 'extra-12-openpipe-art-megatron') or (extra == 'extra-12-openpipe-art-megatron' and extra == 'extra-12-openpipe-art-tinker')" },
     { name = "torchao" },
     { name = "tqdm" },
-    { name = "transformers" },
+    { name = "transformers", version = "5.2.0", source = { registry = "https://pypi.org/simple" } },
     { name = "triton", marker = "'linux' in sys_platform" },
     { name = "trl" },
     { name = "typing-extensions" },
@@ -8380,11 +8605,11 @@ wheels = [
 
 [package.optional-dependencies]
 standard = [
-    { name = "colorama", marker = "sys_platform == 'win32'" },
+    { name = "colorama", marker = "sys_platform == 'win32' or (extra == 'extra-12-openpipe-art-backend' and extra == 'extra-12-openpipe-art-megatron') or (extra == 'extra-12-openpipe-art-megatron' and extra == 'extra-12-openpipe-art-tinker')" },
     { name = "httptools" },
     { name = "python-dotenv" },
     { name = "pyyaml" },
-    { name = "uvloop", marker = "platform_python_implementation != 'PyPy' and sys_platform != 'cygwin' and sys_platform != 'win32'" },
+    { name = "uvloop", marker = "(platform_python_implementation != 'PyPy' and sys_platform != 'cygwin' and sys_platform != 'win32') or (platform_python_implementation == 'PyPy' and extra == 'extra-12-openpipe-art-backend' and extra == 'extra-12-openpipe-art-megatron') or (platform_python_implementation == 'PyPy' and extra == 'extra-12-openpipe-art-megatron' and extra == 'extra-12-openpipe-art-tinker') or (sys_platform == 'cygwin' and extra == 'extra-12-openpipe-art-backend' and extra == 'extra-12-openpipe-art-megatron') or (sys_platform == 'cygwin' and extra == 'extra-12-openpipe-art-megatron' and extra == 'extra-12-openpipe-art-tinker') or (sys_platform == 'win32' and extra == 'extra-12-openpipe-art-backend' and extra == 'extra-12-openpipe-art-megatron') or (sys_platform == 'win32' and extra == 'extra-12-openpipe-art-megatron' and extra == 'extra-12-openpipe-art-tinker')" },
     { name = "watchfiles" },
     { name = "websockets" },
 ]
@@ -8623,7 +8848,7 @@ dependencies = [
     { name = "pydantic" },
     { name = "sentry-sdk" },
     { name = "tenacity" },
-    { name = "tzdata", marker = "sys_platform == 'win32'" },
+    { name = "tzdata", marker = "sys_platform == 'win32' or (extra == 'extra-12-openpipe-art-backend' and extra == 'extra-12-openpipe-art-megatron') or (extra == 'extra-12-openpipe-art-megatron' and extra == 'extra-12-openpipe-art-tinker')" },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/96/7c/f0c54919dc390beaf33086e15abdc1b8499c6273c2035d73703ed8a0b9d6/weave-0.52.41.tar.gz", hash = "sha256:59159952f9c7c65d78dd4f7a96bfc13accb2f3d93cb43583af6c6d05c5036b4d", size = 937328, upload-time = "2026-05-19T22:03:03.124Z" }
 wheels = [
@@ -8792,9 +9017,9 @@ name = "xformers"
 version = "0.0.35"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
-    { name = "numpy", marker = "platform_machine != 's390x'" },
-    { name = "torch", version = "2.11.0", source = { registry = "https://pypi.org/simple" }, marker = "platform_machine != 's390x' and sys_platform != 'linux' and sys_platform != 'win32'" },
-    { name = "torch", version = "2.11.0+cu128", source = { registry = "https://download.pytorch.org/whl/cu128" }, marker = "(platform_machine != 's390x' and sys_platform == 'linux') or (platform_machine != 's390x' and sys_platform == 'win32')" },
+    { name = "numpy" },
+    { name = "torch", version = "2.11.0", source = { registry = "https://pypi.org/simple" }, marker = "(sys_platform != 'linux' and sys_platform != 'win32' and extra == 'extra-12-openpipe-art-backend') or (sys_platform == 'linux' and extra == 'extra-12-openpipe-art-backend' and extra == 'extra-12-openpipe-art-megatron') or (sys_platform == 'win32' and extra == 'extra-12-openpipe-art-backend' and extra == 'extra-12-openpipe-art-megatron') or (extra != 'extra-12-openpipe-art-backend' and extra == 'extra-12-openpipe-art-megatron' and extra == 'extra-12-openpipe-art-tinker')" },
+    { name = "torch", version = "2.11.0+cu128", source = { registry = "https://download.pytorch.org/whl/cu128" }, marker = "(sys_platform == 'linux' and extra == 'extra-12-openpipe-art-backend') or (sys_platform == 'win32' and extra == 'extra-12-openpipe-art-backend') or (extra == 'extra-12-openpipe-art-backend' and extra == 'extra-12-openpipe-art-megatron') or (extra == 'extra-12-openpipe-art-megatron' and extra == 'extra-12-openpipe-art-tinker')" },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/de/5a/6e27734bd793adc44d0b8d294e67cfacf4ec590572c1aef51d683fc7a791/xformers-0.0.35.tar.gz", hash = "sha256:f7fc183a58e4bf0e2ae339a18fb1b1d4a37854c0f2545b4f360fef001646ab76", size = 4258182, upload-time = "2026-02-20T20:33:05.417Z" }
 wheels = [
@@ -9003,7 +9228,12 @@ version = "4.15.4.0"
 source = { registry = "https://pypi.org/simple" }
 sdist = { url = "https://files.pythonhosted.org/packages/8a/8e/0c8f17309549d2e5cde9a3ccefa6365437f1e7bafe71878eaf9478e47b18/z3_solver-4.15.4.0.tar.gz", hash = "sha256:928c29b58c4eb62106da51c1914f6a4a55d0441f8f48a81b9da07950434a8946", size = 5018600, upload-time = "2025-10-29T18:12:03.062Z" }
 wheels = [
+    { url = "https://files.pythonhosted.org/packages/63/33/a3d5d2eaeb0f7b3174d57d405437eabb2075d4d50bd9ea0957696c435c7b/z3_solver-4.15.4.0-py3-none-macosx_13_0_arm64.whl", hash = "sha256:407e825cc9211f95ef46bdc8d151bf630e7ab2d62a21d24cd74c09cc5b73f3aa", size = 37052538, upload-time = "2025-10-29T18:11:46.233Z" },
+    { url = "https://files.pythonhosted.org/packages/47/84/fd7ffac1551cd9f8d44fe41358f738be670fc4c24dfd514fab503f2cf3e7/z3_solver-4.15.4.0-py3-none-macosx_13_0_x86_64.whl", hash = "sha256:00bd10c5a6a5f6112d3a9a810d0799227e52f76caa860dafa5e00966bb47eb13", size = 39807925, upload-time = "2025-10-29T18:11:49.81Z" },
     { url = "https://files.pythonhosted.org/packages/21/c9/bb51a96af0091324c81b803f16c49f719f9f6ea0b0bb52200f5c97ec4892/z3_solver-4.15.4.0-py3-none-manylinux_2_17_x86_64.manylinux2014_x86_64.whl", hash = "sha256:7e103a6f203f505b8b8b8e5c931cc407c95b61556512d4921c1ddc0b3f41b08e", size = 29268352, upload-time = "2025-10-29T18:11:53.032Z" },
+    { url = "https://files.pythonhosted.org/packages/bf/2e/0b49f7e4e53817cfb09a0f6585012b782dfe0b666e8abefcb4fac0570606/z3_solver-4.15.4.0-py3-none-manylinux_2_34_aarch64.whl", hash = "sha256:62c7e9cbdd711932301f29919ad9158de9b2f58b4d281dd259bbcd0a2f408ba1", size = 27226534, upload-time = "2025-10-29T18:11:55.59Z" },
+    { url = "https://files.pythonhosted.org/packages/26/91/33de49538444d4aafbe47415c450c2f9abab1733e1226f276b496672f46c/z3_solver-4.15.4.0-py3-none-win32.whl", hash = "sha256:be3bc916545c96ffbf89e00d07104ff14f78336e55db069177a1bfbcc01b269d", size = 13191672, upload-time = "2025-10-29T18:11:58.424Z" },
+    { url = "https://files.pythonhosted.org/packages/03/d6/a0b135e4419df475177ae78fc93c422430b0fd8875649486f9a5989772e6/z3_solver-4.15.4.0-py3-none-win_amd64.whl", hash = "sha256:00e35b02632ed085ea8199fb230f6015e6fc40554a6680c097bd5f060e827431", size = 16259597, upload-time = "2025-10-29T18:12:01.14Z" },
 ]
 
 [[package]]

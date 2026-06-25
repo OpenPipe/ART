@@ -283,8 +283,9 @@ build_cache_archive() {
   export LIBRARY_PATH="${CUDNN_LIBRARY_PATH}${LIBRARY_PATH:+:${LIBRARY_PATH}}"
   export LD_LIBRARY_PATH="${CUDNN_LIBRARY_PATH}${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}"
 
-  log "Building full uv cache with compile_jobs=${compile_jobs}, apex_parallel_build=${apex_parallel_build}, nvcc_threads=${CI_APEX_NVCC_THREADS}, cuda_arch_list=${TORCH_CUDA_ARCH_LIST}, and uv_concurrent_builds=${UV_BUILD_SLOTS}."
-  uv sync --frozen --all-extras --group dev --no-install-project --python "${PYTHON_MM}"
+  log "Building split uv cache with compile_jobs=${compile_jobs}, apex_parallel_build=${apex_parallel_build}, nvcc_threads=${CI_APEX_NVCC_THREADS}, cuda_arch_list=${TORCH_CUDA_ARCH_LIST}, and uv_concurrent_builds=${UV_BUILD_SLOTS}."
+  uv sync --frozen --extra megatron --extra langgraph --extra plotting --group dev --no-install-project --python "${PYTHON_MM}"
+  uv sync --frozen --extra backend --extra tinker --extra langgraph --extra plotting --group dev --no-install-project --python "${PYTHON_MM}"
   rm -rf .venv
 
   log "Packing uv cache archive to ${archive_path}."

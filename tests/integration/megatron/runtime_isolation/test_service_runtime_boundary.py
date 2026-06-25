@@ -9,9 +9,16 @@ from unittest.mock import AsyncMock
 import httpx
 import pytest
 
+import art
 from art.megatron.service import MegatronService
-from art.types import MegatronTopologyConfig
-from art.unsloth.service import UnslothService
+
+
+@pytest.fixture(autouse=True)
+def _init_megatron_runtime_config() -> None:
+    art.init_megatron_runtime_config(
+        topology=art.MegatronTopologyConfig(tp=1, cp=2, ep=2, etp=1),
+        packed_sequence_length=1024,
+    )
 
 
 class _AsyncOkResponse:
@@ -100,7 +107,8 @@ async def test_unsloth_shared_start_requires_runtime_sleep_mode(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    service = UnslothService(
+    unsloth_service = pytest.importorskip("art.unsloth.service")
+    service = unsloth_service.UnslothService(
         model_name="test-model",
         base_model="Qwen/Qwen3-0.6B",
         config={
@@ -156,7 +164,8 @@ async def test_unsloth_runtime_sleep_and_wake_use_runtime_routes(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    service = UnslothService(
+    unsloth_service = pytest.importorskip("art.unsloth.service")
+    service = unsloth_service.UnslothService(
         model_name="test-model",
         base_model="Qwen/Qwen3-0.6B",
         config={"rollout_weights_mode": "lora"},
@@ -204,7 +213,6 @@ async def test_megatron_dedicated_merged_start_syncs_initial_weights(
     sync_merged.assert_awaited_once_with(
         lora_path="/tmp/lora",
         step=0,
-        megatron_topology=None,
     )
 
 
@@ -220,7 +228,6 @@ async def test_megatron_dedicated_merged_start_uses_configured_topology(
             "trainer_gpu_ids": [0],
             "inference_gpu_ids": [1],
             "rollout_weights_mode": "merged",
-            "megatron_topology": {"tp": 1, "cp": 2, "ep": 2, "etp": 1},
         },
         output_dir=str(tmp_path),
     )
@@ -235,8 +242,8 @@ async def test_megatron_dedicated_merged_start_uses_configured_topology(
     sync_merged.assert_awaited_once_with(
         lora_path="/tmp/lora",
         step=0,
-        megatron_topology=MegatronTopologyConfig(tp=1, cp=2, ep=2, etp=1),
     )
+    assert service.runtime_config.topology.cp == 2
 
 
 @pytest.mark.asyncio

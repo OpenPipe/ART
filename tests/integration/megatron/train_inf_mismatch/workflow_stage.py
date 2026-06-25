@@ -61,13 +61,20 @@ def _attempt_limit() -> int:
     return min(attempts, MAX_ATTEMPTS)
 
 
-def run_train_inf_mismatch(*, base_model: str) -> TrainInfMismatchReport:
+def run_train_inf_mismatch(
+    *,
+    base_model: str,
+    allow_unvalidated_arch: bool = False,
+) -> TrainInfMismatchReport:
     artifact_dir = create_artifact_dir("workflow::train_inf_mismatch")
     max_attempts = _attempt_limit()
     env = os.environ.copy()
     env["BASE_MODEL"] = base_model
     env["ART_RUN_TRAIN_INF_MISMATCH_LIVE"] = "1"
     env["ART_TRAIN_INF_MISMATCH_BASE_MODEL"] = base_model
+    env["ART_TRAIN_INF_MISMATCH_ALLOW_UNVALIDATED_ARCH"] = (
+        "1" if allow_unvalidated_arch else "0"
+    )
     env["ART_REAL_PATH_MAX_COMPLETION_TOKENS"] = "16"
     existing_pythonpath = env.get("PYTHONPATH")
     tests_dir = str(REPO_ROOT / "tests")

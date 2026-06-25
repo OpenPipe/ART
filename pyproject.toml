@@ -24,7 +24,7 @@ backend = [
     "bitsandbytes>=0.45.2",
     "unsloth==2026.3.3",
     "unsloth-zoo==2026.3.1",
-    "torch>=2.11.0",
+    "torch==2.11.0",
     "torchao==0.16.0",
     "accelerate==1.7.0",
     "awscli>=1.38.1",
@@ -43,7 +43,7 @@ backend = [
 ]
 megatron = [
     "numpy<2",
-    "torch>=2.11.0",
+    "torch==2.11.0",
     "flash-attn-4==4.0.0b5",
     "ninja>=1.11.1",
     "quack-kernels==0.3.7",
@@ -61,6 +61,7 @@ megatron = [
     "nvidia-ml-py==13.580.82",
     "nvidia-modelopt>=0.42.0a0 ; sys_platform != 'darwin'",
     "nvidia-resiliency-ext<0.5 ; sys_platform == 'linux'",
+    "transformers==5.6.2",
     "ml-dtypes>=0.5.0 ; python_full_version < '3.13'",
 ]
 
@@ -79,8 +80,8 @@ tinker = [
     "protobuf>=6.31.1",
     "tinker-cookbook>=0.4.1,<0.5",
     "tinker>=0.21.0,<0.22",
-    "torch>=2.11.0",
-    "transformers==5.2.0",
+    "torch==2.11.0",
+    "transformers>=5.2.0,<=5.5.3",
     "uvicorn>=0.35.0",
     "datrie>=0.8.3",
 ]
@@ -150,14 +151,23 @@ markers = [
 
 [tool.uv]
 required-version = ">=0.11.7"
+conflicts = [
+    [
+        { extra = "backend" },
+        { extra = "megatron" },
+    ],
+    [
+        { extra = "tinker" },
+        { extra = "megatron" },
+    ],
+]
 override-dependencies = [
-    "flashinfer-python==0.6.1",
+    "flashinfer-python==0.6.8.post1",
     "megatron-core==0.17.0",
     "numpy<2",
     "nvidia-resiliency-ext<0.5",
     "quack-kernels==0.3.7",
     "transformer-engine==2.11.0",
-    "transformers==5.2.0",
     "torch==2.11.0",
 ]
 exclude-dependencies = ["pynvml", "emerging-optimizers", "causal-conv1d", "mamba-ssm"]
@@ -183,6 +193,46 @@ requires-dist = ["packaging"]
 name = "deep-ep"
 version = "1.2.1+9af0e0d"
 requires-dist = []
+
+# The Megatron Bridge source metadata currently requires Transformers 5.8.x,
+# but this branch is validated against Transformers 5.6.2 for Gemma 4.
+# Keep Bridge's runtime deps explicit here and let ART's megatron extra own the
+# Transformers pin.
+[[tool.uv.dependency-metadata]]
+name = "megatron-bridge"
+version = "0.5.0+e1a207ac"
+requires-dist = [
+    "accelerate",
+    "comet-ml",
+    "datasets",
+    "diffusers",
+    "einops",
+    "flash-linear-attention",
+    "flashinfer-cubin",
+    "flashinfer-python",
+    "hydra-core",
+    "imageio",
+    "imageio-ffmpeg",
+    "megatron-core",
+    "mistral-common",
+    "mlflow",
+    "nvidia-resiliency-ext",
+    "omegaconf",
+    "open-clip-torch",
+    "peft",
+    "pyyaml",
+    "qwen-vl-utils",
+    "regex",
+    "rich",
+    "six",
+    "tensorboard",
+    "timm",
+    "torch",
+    "tqdm",
+    "transformers",
+    "typing-extensions",
+    "wandb",
+]
 
 [[tool.uv.dependency-metadata]]
 name = "transformer-engine-torch"
@@ -278,7 +328,7 @@ torch = [{ index = "pytorch-cu128", marker = "sys_platform == 'linux' or sys_pla
 apex = { git = "https://github.com/NVIDIA/apex.git", rev = "25.09" }
 deep-ep = { git = "https://github.com/deepseek-ai/DeepEP.git", rev = "v1.2.1" }
 flash-attn-4 = { url = "https://files.pythonhosted.org/packages/24/f7/01ee2576ce41f9884d291ee21861ef194afc0b2b1ce3bd175fc7a6e1b133/flash_attn_4-4.0.0b5-py3-none-any.whl" }
-megatron-bridge = { git = "https://github.com/NVIDIA-NeMo/Megatron-Bridge.git", rev = "e049cc00c24d03e2ae45d2608c7a44e2d2364e3d" }
+megatron-bridge = { git = "https://github.com/NVIDIA-NeMo/Megatron-Bridge.git", rev = "e1a207ac757e5d0ed94d8ffbe1cbd28e81d8c084" }
 panza = { git = "https://github.com/corbt/panza.git" }
 transformer-engine-torch = { git = "https://github.com/NVIDIA/TransformerEngine.git", rev = "v2.11", subdirectory = "transformer_engine/pytorch" }
 

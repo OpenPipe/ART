@@ -8,7 +8,7 @@ import os
 from pathlib import Path
 import re
 import time
-from typing import Any, AsyncIterator, Iterator, Literal, TypedDict, cast
+from typing import Any, AsyncIterator, Iterator, Literal, cast
 import uuid
 
 from pydantic import BaseModel, Field
@@ -40,10 +40,6 @@ _VARIANT_NAME = Literal[
     "megatron_dedicated",
     "unsloth_dedicated",
 ]
-
-
-class _TrainKwargs(TypedDict):
-    packed_sequence_length: int
 
 
 class TrainabilityStepReport(BaseModel):
@@ -286,6 +282,7 @@ def _engine_args_for_yes_no_trainability(
         "max_num_seqs": _get_env_int("ART_MODEL_SUPPORT_YES_NO_MAX_NUM_SEQS", 4),
         "enforce_eager": True,
         "tensor_parallel_size": tensor_parallel_size,
+        "limit_mm_per_prompt": {"image": 0, "video": 0, "audio": 0},
     }
     if enable_expert_parallel:
         engine_args["enable_expert_parallel"] = True
@@ -379,12 +376,22 @@ def _variant_packed_sequence_length(variant: _TrainabilityVariant) -> int:
     return _get_env_int("ART_MODEL_SUPPORT_YES_NO_PACKED_SEQUENCE_LENGTH", 1024)
 
 
-def _variant_train_kwargs(variant: _TrainabilityVariant) -> _TrainKwargs:
-    return {"packed_sequence_length": _variant_packed_sequence_length(variant)}
-
-
 def _variant_init_args(variant: _TrainabilityVariant) -> dev.InitArgs:
     return {"max_seq_length": _variant_packed_sequence_length(variant)}
+
+
+def _init_megatron_runtime_config(variant: _TrainabilityVariant) -> None:
+    if variant.topology is None:
+        return
+    art.init_megatron_runtime_config(
+        topology=art.MegatronTopologyConfig(
+            tp=variant.topology.tp,
+            cp=variant.topology.cp,
+            ep=variant.topology.ep,
+            etp=variant.topology.etp,
+        ),
+        packed_sequence_length=_variant_packed_sequence_length(variant),
+    )
 
 
 def _variant_max_steps(variant: _TrainabilityVariant) -> int:
@@ -689,6 +696,7 @@ async def run_yes_no_trainability_async(
         allow_unvalidated_arch=allow_unvalidated_arch,
     )
     rollout_weights_mode = internal_config["rollout_weights_mode"]
+    _init_megatron_runtime_config(variant)
     model = art.TrainableModel(
         name=f"{variant.name}-{uuid.uuid4().hex[:8]}",
         project="model-support-validation",
@@ -696,8 +704,6 @@ async def run_yes_no_trainability_async(
         _internal_config=internal_config,
         report_metrics=[],
     )
-    train_kwargs = _variant_train_kwargs(variant)
-
     async with _backend_context(
         variant, backend_root=backend_root, extra_env=extra_env
     ) as backend:
@@ -750,7 +756,6 @@ async def run_yes_no_trainability_async(
                     1e-4,
                 ),
                 loss_fn="cispo",
-                packed_sequence_length=train_kwargs["packed_sequence_length"],
             )
             await model.log(
                 train_groups,

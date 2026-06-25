@@ -60,6 +60,8 @@ def create_shared_prefix_state(
     parent_ids: Tensor,
     *,
     target_device: torch.device | None = None,
+    input_pos: Tensor | None = None,
+    sliding_windows: tuple[int, ...] = (),
     build_gdn_execution_spec: bool = False,
     attention_token_layout_index: TokenLayoutIndex | None = None,
     attention_head_dim: int | None = None,
@@ -69,24 +71,43 @@ def create_shared_prefix_state(
     device = group_ids.device if target_device is None else torch.device(target_device)
     group_ids_cpu = _metadata_cpu(group_ids)
     parent_ids_cpu = _metadata_cpu(parent_ids)
+    input_pos_cpu = None if input_pos is None else _metadata_cpu(input_pos)
+    block_size = _shared_prefix_block_size(
+        device,
+        attention_head_dim=attention_head_dim,
+        attention_value_head_dim=attention_value_head_dim,
+    )
     block_mask = _build_sparse_shared_prefix_block_mask(
         group_ids_cpu=group_ids_cpu,
         parent_ids_cpu=parent_ids_cpu,
+        input_pos_cpu=input_pos_cpu,
+        sliding_window=None,
         device=device,
-        block_size=_shared_prefix_block_size(
-            device,
-            attention_head_dim=attention_head_dim,
-            attention_value_head_dim=attention_value_head_dim,
-        ),
+        block_size=block_size,
     )
+    sliding_block_masks = {
+        window: _build_sparse_shared_prefix_block_mask(
+            group_ids_cpu=group_ids_cpu,
+            parent_ids_cpu=parent_ids_cpu,
+            input_pos_cpu=input_pos_cpu,
+            sliding_window=window,
+            device=device,
+            block_size=block_size,
+        )
+        for window in tuple(dict.fromkeys(int(window) for window in sliding_windows))
+    }
     cp_rank, cp_size = _gdn_cp_rank_size()
     gdn_execution_spec = (
-        parse_gdn_shared_prefix_segments(group_ids_cpu, parent_ids_cpu)
+        parse_gdn_shared_prefix_segments(
+            group_ids_cpu,
+            parent_ids_cpu,
+        )
         if build_gdn_execution_spec
         else None
     )
     return SharedPrefixAttentionState(
         block_mask=block_mask,
+        sliding_block_masks=sliding_block_masks,
         group_ids=group_ids_cpu,
         parent_ids=parent_ids_cpu,
         gdn_execution_spec=gdn_execution_spec,
@@ -111,6 +132,8 @@ def _build_sparse_shared_prefix_block_mask(
     *,
     group_ids_cpu: Tensor,
     parent_ids_cpu: Tensor,
+    input_pos_cpu: Tensor | None,
+    sliding_window: int | None,
     device: torch.device,
     block_size: tuple[int, int],
 ):
@@ -151,13 +174,21 @@ def _build_sparse_shared_prefix_block_mask(
                     exact_mask=ExactMaskMetadata(
                         q_token_indices=token_indices,
                         k_token_indices=token_indices,
-                        cache_key=f"identity:{seq_len}",
+                        cache_key=(
+                            f"identity:{seq_len}"
+                            if sliding_window is None
+                            else f"identity:{seq_len}:sliding:{int(sliding_window)}"
+                        ),
                     ),
                 ),
                 context=prepare_block_mask_context(
                     group_ids=group_ids_cpu[row_index],
                     parent_ids=parent_ids_cpu[row_index],
+                    input_pos=None
+                    if input_pos_cpu is None
+                    else input_pos_cpu[row_index],
                 ),
+                sliding_window=sliding_window,
                 device=device,
             )
         )

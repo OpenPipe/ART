@@ -8,6 +8,7 @@ from .model import (
     LoRAConfig,
     TrainerArgs,
 )
+from .sequence_lengths import max_seq_length_from_model_config
 from .validate import is_dedicated_mode
 
 
@@ -36,9 +37,14 @@ def get_model_config(
     else:
         enable_sleep_mode = config.get("engine_args", {}).get("enable_sleep_mode", True)
 
+    configured_init_args = config.get("init_args", {})
     init_args = InitArgs(
         load_in_4bit=True,
-        max_seq_length=32768,
+        max_seq_length=max_seq_length_from_model_config(
+            base_model,
+            revision=configured_init_args.get("revision"),
+            token=configured_init_args.get("token"),
+        ),
         model_name=base_model,
     )
     engine_args = EngineArgs(
@@ -48,7 +54,7 @@ def get_model_config(
         model=base_model,
     )
     engine_args.update(config.get("engine_args", {}))
-    init_args.update(config.get("init_args", {}))
+    init_args.update(configured_init_args)
     if last_checkpoint_dir := get_last_checkpoint_dir(output_dir):
         init_args["model_name"] = last_checkpoint_dir
     merged_lora_config = LoRAConfig(
@@ -95,6 +101,4 @@ def get_model_config(
         result["trainer_gpu_ids"] = config["trainer_gpu_ids"]
     if "inference_gpu_ids" in config:
         result["inference_gpu_ids"] = config["inference_gpu_ids"]
-    if "megatron_topology" in config:
-        result["megatron_topology"] = config["megatron_topology"]
     return result

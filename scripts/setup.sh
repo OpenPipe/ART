@@ -72,7 +72,7 @@ fi
 
 # Sync the dependencies
 if [ "${INSTALL_EXTRAS:-false}" = "true" ]; then
-    uv sync --all-extras --frozen
+    uv sync --extra backend --extra tinker --extra langgraph --extra plotting --frozen
 else
     uv sync --extra backend --frozen
 fi

@@ -202,7 +202,7 @@ jobs:
           done < "${part_paths_file}" | zstd -d -c | tar -xf - -C "${UV_CACHE_DIR}"
           du -sh "${UV_CACHE_DIR}"
 
-      - name: Install dependencies (with all optional extras for complete type checking)
+      - name: Install Megatron dependencies
         run: |
           original_pyproject="$(mktemp)"
           cp pyproject.toml "${original_pyproject}"
@@ -229,12 +229,31 @@ jobs:
             --apex-nvcc-threads "${CI_APEX_NVCC_THREADS}"
           echo "CI uv build overrides: APEX_PARALLEL_BUILD=${CI_APEX_PARALLEL_BUILD}, NVCC_APPEND_FLAGS=--threads ${CI_APEX_NVCC_THREADS}, UV_CONCURRENT_BUILDS=${CI_UV_BUILD_SLOTS}"
           uv --version
-          uv sync --all-extras --group dev --frozen --python "${CI_PYTHON_MM}"
+          uv sync --extra megatron --extra langgraph --extra plotting --group dev --frozen --python "${CI_PYTHON_MM}"
 
-      - name: Run prek hooks (lint, format, typecheck, uv.lock, tests)
+      - name: Run prek hooks (lint, format, typecheck, uv.lock)
         run: |
-          uv run --no-sync prek run --all-files
+          uv run --no-sync prek run ruff --all-files
+          uv run --no-sync prek run ruff-format --all-files
+          uv run --no-sync prek run ty --all-files
+          uv run --no-sync prek run uv-lock-check --all-files
 
-      - name: Run unit tests (via prek)
+      - name: Run Megatron unit tests
         run: |
-          uv run --no-sync prek run pytest
+          uv run --no-sync pytest --nbval --current-env --tb=short \
+            tests/unit/test_megatron_reference_logprobs.py \
+            tests/unit/test_moe_routing_replay.py \
+            tests/unit/test_moe_routing_real_path.py \
+            tests/unit/test_pipeline_trainer_local_backend.py
+
+      - name: Install backend dependencies
+        run: |
+          uv sync --extra backend --extra tinker --extra langgraph --extra plotting --group dev --frozen --python "${CI_PYTHON_MM}"
+
+      - name: Run unit tests
+        run: |
+          uv run --no-sync pytest --nbval --current-env --tb=short tests/unit \
+            --ignore=tests/unit/test_megatron_reference_logprobs.py \
+            --ignore=tests/unit/test_moe_routing_replay.py \
+            --ignore=tests/unit/test_moe_routing_real_path.py \
+            --ignore=tests/unit/test_pipeline_trainer_local_backend.py

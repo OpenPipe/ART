@@ -14,6 +14,7 @@ from .types import AttnMaskKind, FlexMaskSpec
 _INVALID_ABS = -(1 << 63)
 _INVALID_ENTER = -1
 _INVALID_EXIT = -1
+_INVALID_POS = -(1 << 63)
 
 
 @dataclass(frozen=True, slots=True)
@@ -21,6 +22,7 @@ class PreparedBlockMaskContext:
     source_len: int
     group_enter_np: np.ndarray
     group_exit_np: np.ndarray
+    input_pos_np: np.ndarray | None = None
 
 
 def _build_interval_mask_mod(
@@ -30,13 +32,40 @@ def _build_interval_mask_mod(
     q_enter: np.ndarray,
     k_enter: np.ndarray,
     k_exit: np.ndarray,
+    q_pos: np.ndarray | None,
+    k_pos: np.ndarray | None,
+    sliding_window: int | None,
     device: torch.device,
 ):
-    q_abs_tensor = torch.as_tensor(q_abs, device=device, dtype=torch.int64)
-    k_abs_tensor = torch.as_tensor(k_abs, device=device, dtype=torch.int64)
-    q_enter_tensor = torch.as_tensor(q_enter, device=device, dtype=torch.int64)
-    k_enter_tensor = torch.as_tensor(k_enter, device=device, dtype=torch.int64)
-    k_exit_tensor = torch.as_tensor(k_exit, device=device, dtype=torch.int64)
+    metadata_dtype = _smallest_mask_metadata_dtype(
+        q_abs,
+        k_abs,
+        q_enter,
+        k_enter,
+        k_exit,
+        *((q_pos, k_pos) if sliding_window is not None else ()),
+    )
+    q_abs_tensor = torch.as_tensor(q_abs, device=device, dtype=metadata_dtype)
+    k_abs_tensor = torch.as_tensor(k_abs, device=device, dtype=metadata_dtype)
+    q_enter_tensor = torch.as_tensor(q_enter, device=device, dtype=metadata_dtype)
+    k_enter_tensor = torch.as_tensor(k_enter, device=device, dtype=metadata_dtype)
+    k_exit_tensor = torch.as_tensor(k_exit, device=device, dtype=metadata_dtype)
+    q_pos_tensor_or_none = (
+        None
+        if q_pos is None
+        else torch.as_tensor(q_pos, device=device, dtype=metadata_dtype)
+    )
+    k_pos_tensor_or_none = (
+        None
+        if k_pos is None
+        else torch.as_tensor(k_pos, device=device, dtype=metadata_dtype)
+    )
+    if sliding_window is not None and (
+        q_pos_tensor_or_none is None or k_pos_tensor_or_none is None
+    ):
+        raise RuntimeError("Sliding-window shared-prefix masks require input_pos.")
+    q_pos_tensor = q_pos_tensor_or_none
+    k_pos_tensor = k_pos_tensor_or_none
 
     def mask_mod(
         batch_idx: torch.Tensor,
@@ -53,9 +82,24 @@ def _build_interval_mask_mod(
         in_key_subtree = (k_enter_local <= q_enter_local) & (
             q_enter_local < k_exit_local
         )
-        return (q_abs_local >= k_abs_local) & in_key_subtree
+        allowed = (q_abs_local >= k_abs_local) & in_key_subtree
+        if sliding_window is None:
+            return allowed
+        assert q_pos_tensor is not None and k_pos_tensor is not None
+        delta = q_pos_tensor[query_idx] - k_pos_tensor[kv_idx]
+        return allowed & (delta >= 0) & (delta < int(sliding_window))
 
     return mask_mod
+
+
+def _smallest_mask_metadata_dtype(*arrays: np.ndarray | None) -> torch.dtype:
+    int32 = np.iinfo(np.int32)
+    for array in arrays:
+        if array is None or int(array.size) == 0:
+            continue
+        if int(array.min()) < int32.min or int(array.max()) > int32.max:
+            return torch.int64
+    return torch.int32
 
 
 def _dense_blocks_to_ordered(
@@ -337,6 +381,7 @@ def _build_sparse_block_mask(
     *,
     device: torch.device,
     context: PreparedBlockMaskContext,
+    sliding_window: int | None,
     block_size: tuple[int, int],
 ) -> BlockMask:
     q_block, k_block = block_size
@@ -372,12 +417,33 @@ def _build_sparse_block_mask(
         k_abs,
         invalid_value=_INVALID_EXIT,
     )
+    q_pos = (
+        _select_with_invalid_np(
+            _require_input_pos(context),
+            q_abs,
+            invalid_value=_INVALID_POS,
+        )
+        if sliding_window is not None
+        else None
+    )
+    k_pos = (
+        _select_with_invalid_np(
+            _require_input_pos(context),
+            k_abs,
+            invalid_value=_INVALID_POS,
+        )
+        if sliding_window is not None
+        else None
+    )
     mask_mod = _build_interval_mask_mod(
         q_abs=q_abs,
         k_abs=k_abs,
         q_enter=q_enter,
         k_enter=k_enter,
         k_exit=k_exit,
+        q_pos=q_pos,
+        k_pos=k_pos,
+        sliding_window=sliding_window,
         device=device,
     )
     if not spec.slices:
@@ -474,6 +540,9 @@ def _build_sparse_block_mask(
         )
         partial_blocks = (partial_blocks & ~needs_refine) | refined_partial
         full_blocks = (full_blocks & ~needs_refine) | refined_full
+    if sliding_window is not None:
+        partial_blocks |= full_blocks
+        full_blocks = np.zeros_like(full_blocks)
     kv_num_blocks, kv_indices = _dense_blocks_to_ordered(
         partial_blocks,
         device=device,
@@ -509,6 +578,7 @@ def prepare_block_mask_context(
     *,
     group_ids: torch.Tensor,
     parent_ids: torch.Tensor,
+    input_pos: torch.Tensor | None = None,
 ) -> PreparedBlockMaskContext:
     if group_ids.ndim != 1 or parent_ids.ndim != 1:
         raise RuntimeError(
@@ -518,9 +588,18 @@ def prepare_block_mask_context(
         raise RuntimeError(
             "Shared-prefix sparse block masks require equal group_ids and parent_ids lengths."
         )
+    if input_pos is not None and int(input_pos.numel()) != int(group_ids.numel()):
+        raise RuntimeError(
+            "Shared-prefix sparse block masks require input_pos to match group_ids length."
+        )
     flat_group_ids = group_ids.detach().to(device="cpu", dtype=torch.int64).reshape(-1)
     flat_parent_ids = (
         parent_ids.detach().to(device="cpu", dtype=torch.int64).reshape(-1)
+    )
+    flat_input_pos = (
+        None
+        if input_pos is None
+        else input_pos.detach().to(device="cpu", dtype=torch.int64).reshape(-1)
     )
     row_tree = parse_shared_prefix_row(
         group_ids=flat_group_ids,
@@ -534,7 +613,16 @@ def prepare_block_mask_context(
         source_len=int(flat_group_ids.numel()),
         group_enter_np=group_enter_np,
         group_exit_np=group_exit_np,
+        input_pos_np=None if flat_input_pos is None else flat_input_pos.numpy(),
     )
+
+
+def _require_input_pos(context: PreparedBlockMaskContext) -> np.ndarray:
+    if context.input_pos_np is None:
+        raise RuntimeError(
+            "Sliding-window shared-prefix block masks require input_pos."
+        )
+    return context.input_pos_np
 
 
 def _validate_exact_indices(
@@ -611,6 +699,7 @@ def build_block_mask_from_context(
     *,
     context: PreparedBlockMaskContext,
     device: torch.device,
+    sliding_window: int | None = None,
     validate: bool = True,
 ) -> BlockMask | None:
     if spec.q_len <= 0 or spec.k_len <= 0:
@@ -635,5 +724,6 @@ def build_block_mask_from_context(
         spec,
         device=device,
         context=context,
+        sliding_window=sliding_window,
         block_size=block_size,
     )

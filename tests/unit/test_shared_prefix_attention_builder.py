@@ -235,6 +235,7 @@ def test_sparse_block_mask_prunes_exact_blocks_rejected_by_group_tree() -> None:
 
     assert block_mask is not None
     assert int(block_mask.kv_num_blocks.sum().item()) == 0
+    assert block_mask.full_kv_num_blocks is not None
     assert int(block_mask.full_kv_num_blocks.sum().item()) == 0
     _assert_matches_torch_block_mask(block_mask)
 

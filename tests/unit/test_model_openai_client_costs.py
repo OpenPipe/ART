@@ -204,8 +204,10 @@ class TestModelOpenAIClientCosts:
         )
 
         assert model._default_chat_completion_extra_body() == {
+            "return_token_ids": True,
+            "return_tokens_as_token_ids": True,
             "chat_template_kwargs": {
                 "enable_thinking": False,
                 "preserve_thinking": True,
-            }
+            },
         }

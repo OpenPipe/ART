@@ -25,6 +25,9 @@ class TokenRange:
     def size(self) -> int:
         return self.end - self.start
 
+    def is_empty(self) -> bool:
+        return self.end <= self.start
+
 
 @dataclass(frozen=True)
 class AttnSlice:
@@ -157,6 +160,12 @@ class ContextParallelExecutionCache:
 
 
 @dataclass(frozen=True)
+class CpBlockMaskVariant:
+    block_size: tuple[int, int]
+    sliding_window: int | None = None
+
+
+@dataclass(frozen=True)
 class StageExecutionSpec:
     q_len: int
     k_len: int
@@ -171,6 +180,8 @@ class ArtContextParallelState:
     config: ContextParallelConfig
     group_ids: torch.Tensor
     parent_ids: torch.Tensor
+    input_pos: torch.Tensor
+    block_mask_variants: tuple[CpBlockMaskVariant, ...] = ()
     gdn_execution_spec: Any | None = None
     gdn_execution_plan: Any | None = None
     gdn_hidden_layout: str = "attention"

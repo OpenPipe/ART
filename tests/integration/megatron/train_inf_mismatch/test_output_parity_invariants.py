@@ -21,8 +21,14 @@ from .output_parity import (
     compare_topk,
     config_from_env,
     fwd_mean_abs_pct_limit_for_model,
+    top20_kl_candidate_to_target_limit_for_model,
 )
-from .real_path import RealPathConfig, _delete_adapter_safetensors_on_pass
+from .real_path import (
+    RealPathConfig,
+    _delete_adapter_safetensors_on_pass,
+    _real_path_rollout_mode,
+    _real_path_rollout_weights_mode,
+)
 
 
 def test_logical_map_flattens_shared_prefix_branches() -> None:
@@ -131,6 +137,21 @@ def test_real_path_default_generates_16_tokens_per_rollout() -> None:
     assert RealPathConfig().max_completion_tokens == 16
 
 
+def test_real_path_rollout_mode_follows_config() -> None:
+    native_config = TrainInfOutputParityConfig(
+        base_model="Qwen/Qwen3.5-35B-A3B",
+    )
+    merged_config = TrainInfOutputParityConfig(
+        base_model="unvalidated/native-disabled",
+        allow_unvalidated_arch=True,
+    )
+
+    assert _real_path_rollout_mode(native_config) == "native_lora"
+    assert _real_path_rollout_weights_mode(native_config) == "lora"
+    assert _real_path_rollout_mode(merged_config) == "merged"
+    assert _real_path_rollout_weights_mode(merged_config) == "merged"
+
+
 def test_real_path_deletes_only_adapter_safetensors_on_pass(tmp_path) -> None:
     run_dir = tmp_path / "run"
     active_lora = run_dir / "real_path_active_lora"
@@ -157,6 +178,38 @@ def test_real_path_deletes_only_adapter_safetensors_on_pass(tmp_path) -> None:
 def test_architecture_specific_real_path_limits() -> None:
     assert fwd_mean_abs_pct_limit_for_model("Qwen/Qwen3-30B-A3B") == 7.0
     assert fwd_mean_abs_pct_limit_for_model("Qwen/Qwen3.5-35B-A3B") == 5.0
+    assert TOP20_KL_CANDIDATE_TO_TARGET_LIMIT == 0.002
+
+
+def test_gemma4_real_path_limits() -> None:
+    assert (
+        fwd_mean_abs_pct_limit_for_model(
+            "google/gemma-4-31B-it",
+            allow_unvalidated_arch=True,
+        )
+        == 8.0
+    )
+    assert (
+        top20_kl_candidate_to_target_limit_for_model(
+            "google/gemma-4-31B-it",
+            allow_unvalidated_arch=True,
+        )
+        == 0.003
+    )
+    assert (
+        fwd_mean_abs_pct_limit_for_model(
+            "google/gemma-4-26B-A4B-it",
+            allow_unvalidated_arch=True,
+        )
+        == 8.0
+    )
+    assert (
+        top20_kl_candidate_to_target_limit_for_model(
+            "google/gemma-4-26B-A4B-it",
+            allow_unvalidated_arch=True,
+        )
+        == 0.008
+    )
     assert TOP20_KL_CANDIDATE_TO_TARGET_LIMIT == 0.002
 
 
@@ -239,8 +292,11 @@ def test_workflow_stage_enables_live_train_inf_mismatch(
     import subprocess
 
     captured_env = {}
+    real_run = workflow_stage.subprocess.run
 
     def fake_run(*args, **kwargs):
+        if "env" not in kwargs:
+            return real_run(*args, **kwargs)
         captured_env.update(kwargs["env"])
         return subprocess.CompletedProcess(
             args=args,
@@ -252,8 +308,12 @@ def test_workflow_stage_enables_live_train_inf_mismatch(
     monkeypatch.setattr(workflow_stage, "create_artifact_dir", lambda _nodeid: tmp_path)
     monkeypatch.setattr(workflow_stage.subprocess, "run", fake_run)
 
-    report = workflow_stage.run_train_inf_mismatch(base_model="Qwen/Qwen3.5-35B-A3B")
+    report = workflow_stage.run_train_inf_mismatch(
+        base_model="Qwen/Qwen3.5-35B-A3B",
+        allow_unvalidated_arch=True,
+    )
 
     assert report.passed is True
     assert captured_env["ART_RUN_TRAIN_INF_MISMATCH_LIVE"] == "1"
+    assert captured_env["ART_TRAIN_INF_MISMATCH_ALLOW_UNVALIDATED_ARCH"] == "1"
     assert captured_env["ART_REAL_PATH_MAX_COMPLETION_TOKENS"] == "16"

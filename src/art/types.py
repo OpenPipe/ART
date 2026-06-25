@@ -39,10 +39,16 @@ class MegatronTopologyConfig(pydantic.BaseModel):
     etp: int = pydantic.Field(default=1, ge=1)
 
 
+class MegatronRuntimeConfig(pydantic.BaseModel):
+    model_config = pydantic.ConfigDict(frozen=True)
+
+    topology: MegatronTopologyConfig
+    packed_sequence_length: int = pydantic.Field(ge=1)
+
+
 class TrainSFTConfig(pydantic.BaseModel):
     learning_rate: float | list[float] = 5e-5  # Single value or per-batch list
     batch_size: int | Literal["auto"] = "auto"
-    megatron_topology: MegatronTopologyConfig | None = None
 
 
 class SFTMetricLoggingConfig(TypedDict, total=False):

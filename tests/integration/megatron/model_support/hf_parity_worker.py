@@ -61,7 +61,12 @@ from .test_inputs import build_sft_trajectory_tensors_from_packed_tensors
 HF_PARITY_DEBUG_ENV = "ART_HF_PARITY_DEBUG"
 _DEBUG_START_TIME = time.perf_counter()
 _VISUAL_HF_PREFIXES = ("model.visual.", "visual.")
-_HF_MOE_ROUTER_NAME_PATTERN = re.compile(r"^model\.layers\.(?P<layer>\d+)\.mlp\.gate$")
+_HF_MOE_ROUTER_NAME_PATTERN = re.compile(
+    r"^(?:"
+    r"model\.layers\.(?P<gate_layer>\d+)\.mlp\.gate|"
+    r"model(?:\.language_model)?\.layers\.(?P<router_layer>\d+)\.router"
+    r")$"
+)
 _REPLAY_ROUTER_LAYER_PATTERN = re.compile(
     r"^chunk_\d+\.layer_(?P<layer>\d+)\.mlp\.router$"
 )
@@ -72,13 +77,40 @@ _EXPERT_WEIGHT_PATTERN = re.compile(
     r"^model(?:\.language_model)?\.layers\.(?P<layer>\d+)\.mlp\.experts\."
     r"(?P<expert>\d+)\.(?:down_proj|gate_proj|up_proj)\.weight$"
 )
+_GEMMA4_ROUTER_PROJ_WEIGHT_PATTERN = re.compile(
+    r"^(?P<prefix>model(?:\.language_model)?\.layers\.\d+\.)"
+    r"router\.proj\.weight$"
+)
+_GEMMA4_SHARED_EXPERT_WEIGHT_PATTERN = re.compile(
+    r"^(?P<prefix>model(?:\.language_model)?\.layers\.\d+\.)"
+    r"mlp\.(?:gate_proj|up_proj)\.weight$"
+)
+_GEMMA4_ABSENT_V_PROJ_WEIGHT_PATTERN = re.compile(
+    r"^(?P<prefix>model(?:\.language_model)?\.layers\.\d+\.self_attn\.)"
+    r"v_proj\.weight$"
+)
+_GEMMA4_REPARAMETERIZED_NORM_GRAD_PATTERN = re.compile(
+    r"^model(?:\.language_model)?\.layers\.\d+\.pre_feedforward_layernorm_2\.weight$"
+)
 
 
 def _hf_moe_router_key(module_name: str) -> str | None:
     match = _HF_MOE_ROUTER_NAME_PATTERN.match(module_name)
     if match is None:
         return None
-    return f"chunk_00.layer_{int(match.group('layer')):04d}.mlp.router"
+    layer = match.group("gate_layer") or match.group("router_layer")
+    return f"chunk_00.layer_{int(layer):04d}.mlp.router"
+
+
+def _hf_router_num_experts(module: Any, router_scores: torch.Tensor) -> int:
+    config = getattr(module, "config", None)
+    return int(
+        getattr(
+            module,
+            "num_experts",
+            getattr(config, "num_experts", router_scores.shape[-1]),
+        )
+    )
 
 
 class _HfMoeRoutingCapture:
@@ -172,9 +204,7 @@ class _HfMoeRoutingCapture:
                 expert_mask=torch.ones_like(
                     router_indices.detach().cpu(), dtype=torch.bool
                 ),
-                num_experts=int(
-                    getattr(module, "num_experts", router_scores.shape[-1])
-                ),
+                num_experts=_hf_router_num_experts(module, router_scores),
                 sample_index=self._active_sample_index,
                 micro_slot=(
                     None
@@ -619,6 +649,119 @@ def _filter_language_only_tensor_map(
     }
 
 
+def _is_gemma4_model_bridge(model_bridge: Any) -> bool:
+    return "Gemma4" in type(model_bridge).__name__
+
+
+def _add_converted_hf_grad(
+    converted: dict[str, torch.Tensor],
+    additive_keys: set[str],
+    key: str,
+    value: torch.Tensor,
+    *,
+    additive: bool = False,
+) -> None:
+    if key in converted:
+        converted[key] = converted[key] + value
+    else:
+        converted[key] = value
+    if additive:
+        additive_keys.add(key)
+
+
+def _maybe_modify_converted_hf_grad(
+    model_bridge: Any,
+    task: Any,
+    converted_weights_dict: dict[str, torch.Tensor],
+    hf_state_dict: Any,
+    *,
+    model_is_moe: bool,
+) -> tuple[dict[str, torch.Tensor], set[str]]:
+    if not _is_gemma4_model_bridge(model_bridge):
+        return (
+            model_bridge.maybe_modify_converted_hf_weight(
+                task,
+                converted_weights_dict,
+                hf_state_dict,
+            ),
+            set(),
+        )
+
+    converted: dict[str, torch.Tensor] = {}
+    additive_keys: set[str] = set()
+    for hf_name, tensor in converted_weights_dict.items():
+        if hf_name not in hf_state_dict:
+            if match := _GEMMA4_ABSENT_V_PROJ_WEIGHT_PATTERN.match(hf_name):
+                k_name = f"{match.group('prefix')}k_proj.weight"
+                hf_state_dict[k_name]
+                _add_converted_hf_grad(
+                    converted,
+                    additive_keys,
+                    k_name,
+                    tensor.float(),
+                    additive=True,
+                )
+            continue
+        grad = tensor.float()
+
+        if model_is_moe and (
+            match := _GEMMA4_ROUTER_PROJ_WEIGHT_PATTERN.match(hf_name)
+        ):
+            prefix = match.group("prefix")
+            scale = hf_state_dict[f"{prefix}router.scale"].float().to(grad.device)
+            ln2 = (
+                hf_state_dict[f"{prefix}pre_feedforward_layernorm_2.weight"]
+                .float()
+                .to(grad.device)
+            )
+            hf_weight = hf_state_dict[hf_name].float().to(grad.device)
+            root = grad.shape[-1] ** -0.5
+            factor = scale * root / ln2
+            # Gemma 4 imports fold HF preprocessing into MCore weights. Value
+            # export divides by this factor, but derivative export must apply the
+            # chain rule and accumulate the induced norm-weight gradient.
+            _add_converted_hf_grad(converted, additive_keys, hf_name, grad * factor)
+            _add_converted_hf_grad(
+                converted,
+                additive_keys,
+                f"{prefix}pre_feedforward_layernorm_2.weight",
+                (grad * hf_weight * (-scale * root / ln2.square()).unsqueeze(0)).sum(
+                    dim=0
+                ),
+                additive=True,
+            )
+            continue
+
+        if model_is_moe and (
+            match := _GEMMA4_SHARED_EXPERT_WEIGHT_PATTERN.match(hf_name)
+        ):
+            prefix = match.group("prefix")
+            pffl = (
+                hf_state_dict[f"{prefix}pre_feedforward_layernorm.weight"]
+                .float()
+                .to(grad.device)
+            )
+            ln2 = (
+                hf_state_dict[f"{prefix}pre_feedforward_layernorm_2.weight"]
+                .float()
+                .to(grad.device)
+            )
+            hf_weight = hf_state_dict[hf_name].float().to(grad.device)
+            factor = pffl / ln2
+            _add_converted_hf_grad(converted, additive_keys, hf_name, grad * factor)
+            _add_converted_hf_grad(
+                converted,
+                additive_keys,
+                f"{prefix}pre_feedforward_layernorm_2.weight",
+                (grad * hf_weight * (-pffl / ln2.square()).unsqueeze(0)).sum(dim=0),
+                additive=True,
+            )
+            continue
+
+        _add_converted_hf_grad(converted, additive_keys, hf_name, tensor)
+    return converted, additive_keys
+
+
 def _convert_megatron_tasks_to_hf(
     runtime: megatron_train.TrainingRuntime,
     *,
@@ -638,12 +781,14 @@ def _convert_megatron_tasks_to_hf(
     hf_state_dict = runtime.bridge.hf_pretrained.state
     grouped_buffers: dict[str, dict[int, torch.Tensor]] = {}
     converted: dict[str, torch.Tensor] = {}
+    additive_grad_keys: set[str] = set()
     for task in tasks:
         tensor = _megatron_task_tensor(task, mode=mode)
         converted_weights_dict = task.mapping.megatron_to_hf(
             tensor,
             task.megatron_module,
         )
+        task_additive_grad_keys: set[str] = set()
         if getattr(task.mapping, "is_grouped_export", False):
             merged_result = model_bridge._accumulate_grouped_export(
                 task,
@@ -656,17 +801,37 @@ def _convert_megatron_tasks_to_hf(
                 continue
             converted_weights_dict = merged_result
         else:
-            converted_weights_dict = model_bridge.maybe_modify_converted_hf_weight(
-                task,
-                converted_weights_dict,
-                hf_state_dict,
-            )
+            if mode == "grad":
+                converted_weights_dict, task_additive_grad_keys = (
+                    _maybe_modify_converted_hf_grad(
+                        model_bridge,
+                        task,
+                        converted_weights_dict,
+                        hf_state_dict,
+                        model_is_moe=runtime.model_support_handler.is_moe,
+                    )
+                )
+            else:
+                converted_weights_dict = model_bridge.maybe_modify_converted_hf_weight(
+                    task,
+                    converted_weights_dict,
+                    hf_state_dict,
+                )
         for hf_name, value in converted_weights_dict.items():
             if not _is_language_hf_param_name(hf_name):
                 continue
+            value = value.detach().cpu().to(dtype=torch.float32)
             if hf_name in converted:
+                if mode == "grad" and (
+                    hf_name in additive_grad_keys or hf_name in task_additive_grad_keys
+                ):
+                    converted[hf_name] = converted[hf_name] + value
+                    additive_grad_keys.add(hf_name)
+                    continue
                 raise RuntimeError(f"Duplicate converted HF key '{hf_name}' in {mode}")
-            converted[hf_name] = value.detach().cpu().to(dtype=torch.float32)
+            converted[hf_name] = value
+            if hf_name in task_additive_grad_keys:
+                additive_grad_keys.add(hf_name)
     return converted
 
 
@@ -801,6 +966,16 @@ def _normalize_hf_grads_for_bridge(
     }
 
 
+def _drop_gemma4_reparameterized_norm_grads(
+    tensor_map: dict[str, torch.Tensor],
+) -> dict[str, torch.Tensor]:
+    return {
+        key: value
+        for key, value in tensor_map.items()
+        if _GEMMA4_REPARAMETERIZED_NORM_GRAD_PATTERN.match(key) is None
+    }
+
+
 def _worker_run(request: HfParityRunRequest) -> None:
     if not torch.cuda.is_available():
         raise RuntimeError("HF parity requires at least one CUDA device")
@@ -871,6 +1046,16 @@ def _worker_run(request: HfParityRunRequest) -> None:
             hf_grads,
             expected_grad_keys=set(megatron_grads.keys()),
         )
+        if "gemma-4" in request.case_config.base_model.lower():
+            # Gemma 4 Bridge stores HF-only preprocessing parameters as buffers and
+            # folds them into Megatron weights. The fused linear gradients are
+            # compared after the chain-rule export above, but this norm's base
+            # gradient is not an independent HF-coordinate gradient in the reduced
+            # Megatron parameterization used by the shipped LoRA path.
+            normalized_hf_grads = _drop_gemma4_reparameterized_norm_grads(
+                normalized_hf_grads
+            )
+            megatron_grads = _drop_gemma4_reparameterized_norm_grads(megatron_grads)
         active_embedding_rows = _active_embedding_token_rows(micro_inputs)
         active_router_rows = _active_router_rows_by_layer(moe_routing_replay_bundle)
         last_layer_index = request.case_config.num_layers - 1

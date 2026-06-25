@@ -561,7 +561,7 @@ class OpenAICompatibleTinkerServerWorker:
             **chat_template_kwargs,
         )
         if isinstance(encoding, BatchEncoding):
-            return encoding.input_ids
+            return list(cast(list[int], encoding.input_ids))
         else:
             return encoding  # type: ignore
 

@@ -9,7 +9,7 @@ from .metrics_taxonomy import (
     summarize_trajectory_groups,
 )
 from .trajectories import TrajectoryGroup
-from .types import MegatronTopologyConfig, TrainConfig
+from .types import TrainConfig
 
 
 def build_rl_train_configs(
@@ -35,7 +35,6 @@ def build_rl_train_configs(
     scale_learning_rate_by_reward_std_dev: bool | None = None,
     logprob_calculation_chunk_size: int | None = None,
     packed_sequence_length: int | None = None,
-    megatron_topology: MegatronTopologyConfig | dict[str, int | None] | None = None,
     num_trajectories_learning_rate_multiplier_power: float | None = None,
     kl_ref_adapter_path: str | None = None,
 ) -> tuple[TrainConfig, dev.TrainConfig]:
@@ -69,10 +68,6 @@ def build_rl_train_configs(
         dev_config["logprob_calculation_chunk_size"] = logprob_calculation_chunk_size
     if packed_sequence_length is not None:
         dev_config["packed_sequence_length"] = packed_sequence_length
-    if megatron_topology is not None:
-        dev_config["megatron_topology"] = MegatronTopologyConfig.model_validate(
-            megatron_topology
-        ).model_dump(mode="json")
     if num_trajectories_learning_rate_multiplier_power is not None:
         dev_config["num_trajectories_learning_rate_multiplier_power"] = (
             num_trajectories_learning_rate_multiplier_power

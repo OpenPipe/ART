@@ -91,10 +91,8 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
         loss_fn_config: dict | None = None,
         normalize_advantages: bool = True,
         adam_params: object | None = None,
-        packed_sequence_length: int | None = None,
         kl_penalty_coef: float = 0.0,
         kl_penalty_step_lag: int | None = None,
-        megatron_topology: art.MegatronTopologyConfig | None = None,
         max_steps: int | None = None,
         # Discard handling
         discard_queue_multiplier: int = 100,
@@ -152,10 +150,8 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
         self.loss_fn_config = loss_fn_config
         self.normalize_advantages = normalize_advantages
         self.adam_params = adam_params
-        self.packed_sequence_length = packed_sequence_length
         self.kl_penalty_coef = kl_penalty_coef
         self.kl_penalty_step_lag = kl_penalty_step_lag
-        self.megatron_topology = megatron_topology
         self.max_steps = max_steps
         self._status_log_interval_seconds = log_interval_seconds
         self.eval_every_n_steps = eval_every_n_steps
@@ -583,8 +579,6 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
                     "save_checkpoint": should_checkpoint,
                     "adam_params": self.adam_params,
                 }
-                if self.packed_sequence_length is not None:
-                    train_kwargs["packed_sequence_length"] = self.packed_sequence_length
                 if self.kl_penalty_coef > 0.0:
                     kl_penalty_reference_step = self._kl_penalty_reference_step(
                         current_step
@@ -594,8 +588,6 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
                     train_kwargs["kl_penalty_reference_step"] = (
                         kl_penalty_reference_step
                     )
-                if self.megatron_topology is not None:
-                    train_kwargs["megatron_topology"] = self.megatron_topology
                 result = await self.backend.train(
                     self.model,
                     batch,

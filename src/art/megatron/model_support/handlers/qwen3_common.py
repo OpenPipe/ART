@@ -47,6 +47,25 @@ def _build_absolute_rotary_pos_emb(
     return absolute_rotary_pos_emb
 
 
+def qwen3_forward_kwargs(model: Any, **kwargs: Any) -> dict[str, Any]:
+    attention_bias = kwargs.get("attention_bias")
+    from art.megatron.context_parallel.types import ArtContextParallelState
+
+    module = model
+    while hasattr(module, "module"):
+        module = module.module
+    gpt_module = getattr(module, "language_model", module)
+    if isinstance(attention_bias, ArtContextParallelState):
+        setattr(
+            gpt_module,
+            "_art_qwen3_rotary_seq_len",
+            int(attention_bias.rank_plan.original_seq_len),
+        )
+    else:
+        setattr(gpt_module, "_art_qwen3_rotary_seq_len", None)
+    return {"extra_block_kwargs": kwargs}
+
+
 def install_qwen3_text_preprocess_patch(model_chunks: Sequence[Any]) -> None:
     from megatron.core.models.gpt.gpt_model import GPTModel
     import torch
@@ -94,9 +113,13 @@ def install_qwen3_text_preprocess_patch(model_chunks: Sequence[Any]) -> None:
                 and getattr(gpt_module, "position_embedding_type", None) == "rope"
                 and cp_world_size > 1
             ):
+                rotary_seq_len = cast(
+                    int,
+                    getattr(gpt_module, "_art_qwen3_rotary_seq_len", None),
+                )
                 table_source = _build_absolute_rotary_pos_emb(
                     gpt_module,
-                    max_position=int(position_ids.max().item()),
+                    max_position=int(rotary_seq_len) - 1,
                     dtype=table.dtype,
                     device=table.device,
                 )

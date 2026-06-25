@@ -1,5 +1,4 @@
 import asyncio
-from collections.abc import Mapping
 from dataclasses import dataclass, field
 import importlib
 import json
@@ -20,7 +19,7 @@ from ..dev.validate import is_dedicated_mode
 from ..local.checkpoints import get_last_checkpoint_dir
 from ..preprocessing.pack import DiskPackedTensors
 from ..preprocessing.tokenize import SFTBatch
-from ..types import MegatronTopologyConfig
+from ..types import MegatronRuntimeConfig, MegatronTopologyConfig
 from ..utils.get_model_step import get_step_from_dir
 from ..utils.lifecycle import (
     ChildProcessSupervisor,
@@ -57,6 +56,7 @@ from .runtime.jobs import (
     MergedWeightTransferInitInfo,
     MergedWeightTransferSpec,
 )
+from .runtime_config import get_megatron_runtime_config
 from .training.sft_batches import materialize_sft_batches
 
 safetensors = importlib.import_module("safetensors")
@@ -186,6 +186,9 @@ class MegatronService:
     config: dev.InternalModelConfig | dev.BackendModelConfig
     output_dir: str
     enable_expert_replay: bool = True
+    runtime_config: MegatronRuntimeConfig = field(
+        default_factory=get_megatron_runtime_config
+    )
     _is_sleeping: bool = False
     _latest_step: int = 0
     _megatron_process: asyncio.subprocess.Process | None = None
@@ -343,16 +346,6 @@ class MegatronService:
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
             sock.bind(("", 0))
             return int(sock.getsockname()[1])
-
-    @staticmethod
-    def _resolve_megatron_topology(
-        raw_topology: Mapping[str, int | None] | MegatronTopologyConfig | None,
-    ) -> MegatronTopologyConfig | None:
-        if raw_topology is None:
-            return None
-        if isinstance(raw_topology, MegatronTopologyConfig):
-            return raw_topology
-        return MegatronTopologyConfig.model_validate(raw_topology)
 
     @staticmethod
     def _megatron_topology_env(topology: MegatronTopologyConfig) -> dict[str, str]:
@@ -650,10 +643,9 @@ class MegatronService:
         *,
         lora_path: str,
         step: int,
-        megatron_topology: MegatronTopologyConfig | None = None,
     ) -> None:
         self._raise_if_child_failed()
-        await self._ensure_megatron_running(megatron_topology=megatron_topology)
+        await self._ensure_megatron_running()
         await self._init_merged_weight_transfer()
         self._clear_pending_jobs()
         job_path, log_path = self._create_megatron_job_paths()
@@ -719,17 +711,14 @@ class MegatronService:
             raise RuntimeError(
                 "Megatron dependencies are not available in the active ART environment. "
                 "Run `setup.sh` for this worktree and build the project venv with "
-                "`uv sync --extra backend --extra megatron` before starting Megatron "
+                "`uv sync --extra megatron` before starting Megatron "
                 "training."
             ) from exc
 
-    async def _ensure_megatron_running(
-        self,
-        *,
-        megatron_topology: MegatronTopologyConfig | None = None,
-    ) -> None:
+    async def _ensure_megatron_running(self) -> None:
         """Lazily start Megatron training process if not running."""
         self._raise_if_child_failed()
+        megatron_topology = self.runtime_config.topology
         if self._megatron_process is not None:
             if self._megatron_process.returncode is None:
                 assert self._active_megatron_topology == megatron_topology
@@ -771,10 +760,9 @@ class MegatronService:
             env[MEGATRON_LORA_RANK_ENV] = str(int(rank))
         if target_modules := lora_config.get("target_modules"):
             env[MEGATRON_LORA_TARGET_MODULES_ENV] = json.dumps(list(target_modules))
-        if megatron_topology is not None:
-            for env_name in self._megatron_topology_env_names():
-                env.pop(env_name, None)
-            env.update(self._megatron_topology_env(megatron_topology))
+        for env_name in self._megatron_topology_env_names():
+            env.pop(env_name, None)
+        env.update(self._megatron_topology_env(megatron_topology))
 
         command = [
             sys.executable,
@@ -841,16 +829,12 @@ class MegatronService:
         self._ensure_lora_adapter_config(lora_path)
         return lora_path
 
-    async def _prepare_for_training(
-        self,
-        *,
-        megatron_topology: MegatronTopologyConfig | None = None,
-    ) -> str:
+    async def _prepare_for_training(self) -> str:
         self._raise_if_child_failed()
         self._validate_megatron_dependencies()
         # Shared-GPU Megatron must start after vLLM has released GPU memory.
         await self._sleep_runtime()
-        await self._ensure_megatron_running(megatron_topology=megatron_topology)
+        await self._ensure_megatron_running()
 
         lora_path = self._resolve_training_lora_path()
         self._clear_pending_jobs()
@@ -920,9 +904,6 @@ class MegatronService:
                 await self._sync_dedicated_merged_weights(
                     lora_path=lora_path,
                     step=self._latest_step,
-                    megatron_topology=self._resolve_megatron_topology(
-                        self.config.get("megatron_topology")
-                    ),
                 )
         except BaseException:
             await self.aclose()
@@ -946,16 +927,8 @@ class MegatronService:
                     "moe_routing_replay_bundle is only supported for in-process/runtime APIs; "
                     "MegatronService subprocess jobs must use moe_routing_replay_path."
                 )
-            megatron_topology = self._resolve_megatron_topology(
-                cast(
-                    Mapping[str, int | None] | MegatronTopologyConfig | None,
-                    _config.get(
-                        "megatron_topology", self.config.get("megatron_topology")
-                    ),
-                )
-            )
             if self.is_dedicated:
-                await self._ensure_megatron_running(megatron_topology=megatron_topology)
+                await self._ensure_megatron_running()
                 lora_path = self._resolve_active_lora_path()
                 self._clear_pending_jobs()
                 next_step = self._latest_step + 1
@@ -1021,9 +994,7 @@ class MegatronService:
                     await self._reload_adapter(new_checkpoint_dir, next_step)
                 return
 
-            lora_path = await self._prepare_for_training(
-                megatron_topology=megatron_topology
-            )
+            lora_path = await self._prepare_for_training()
             next_step = self._latest_step + 1
             staging_lora_path = self._prepare_training_lora_dir(
                 lora_path,
@@ -1077,9 +1048,7 @@ class MegatronService:
                 raise NotImplementedError(
                     "train_sft is not yet supported in dedicated mode"
                 )
-            lora_path = await self._prepare_for_training(
-                megatron_topology=config.megatron_topology
-            )
+            lora_path = await self._prepare_for_training()
             next_step = self._latest_step + 1
             staging_lora_path = self._prepare_training_lora_dir(
                 lora_path,

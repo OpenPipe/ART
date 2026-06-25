@@ -8,6 +8,7 @@ import socket
 from pydantic import BaseModel, Field
 import torch
 
+import art
 from art import dev
 from art.megatron.service import MegatronService
 
@@ -65,6 +66,19 @@ def _resolve_dedicated_gpu_ids() -> tuple[list[int], list[int]]:
     return [0], [1]
 
 
+def _init_runtime_config(case_config: OracleCaseConfig) -> None:
+    art.init_megatron_runtime_config(
+        topology=art.MegatronTopologyConfig(
+            tp=ORACLE_TOPOLOGY.tp,
+            cp=ORACLE_TOPOLOGY.cp,
+            ep=ORACLE_TOPOLOGY.ep,
+            pp=ORACLE_TOPOLOGY.pp,
+            etp=ORACLE_TOPOLOGY.etp,
+        ),
+        packed_sequence_length=case_config.packed_tensors.sequence_length,
+    )
+
+
 async def _run_merged_vllm_serving(
     case_config: OracleCaseConfig,
 ) -> MergedVllmServingReport:
@@ -81,6 +95,7 @@ async def _run_merged_vllm_serving(
     )
     dev.validate_dedicated_config(internal_config)
     with provider_topology_env(ORACLE_TOPOLOGY):
+        _init_runtime_config(case_config)
         service = MegatronService(
             model_name=service_name,
             base_model=case_config.base_model,

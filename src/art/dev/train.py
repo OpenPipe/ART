@@ -30,10 +30,6 @@ positive advantages. Defaults to 0.0 (perfectly balanced)."""
     logprob_calculation_chunk_size: int
     mask_prob_ratio: bool
     max_negative_advantage_importance_sampling_weight: float
-    megatron_topology: dict[
-        Literal["tp", "cp", "ep", "pp", "vpp", "etp"],
-        int | None,
-    ]
     moe_routing_replay_bundle: "MoeRoutingReplayBundle | None"
     moe_routing_replay_path: str | None
     moe_routing_replay_strict: bool

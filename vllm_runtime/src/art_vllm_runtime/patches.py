@@ -11,17 +11,25 @@ logger = logging.getLogger(__name__)
 
 
 def apply_vllm_runtime_patches() -> None:
+    from art_vllm_runtime.gemma4_moe_lora_patch import (
+        patch_gemma4_moe_lora_support,
+    )
+
     patch_transformers_v5_compat()
+    patch_gemma4_moe_lora_support()
     subclass_chat_completion_request()
     patch_listen_for_disconnect()
     patch_tool_parser_manager()
     patch_nccl_unique_id_bootstrap()
+    patch_art_lora_delta_weight_update()
+    patch_gemma4_checkpoint_weight_update_reload()
     patch_routed_experts_prefix_cache_sidecar()
 
 
 def patch_transformers_v5_compat() -> None:
     _patch_rope_validation_ignore_keys()
     _patch_qwen3_vl_moe_tie_word_embeddings()
+    _patch_gemma4_moe_experts_per_tok_alias()
 
 
 def _patch_rope_validation_ignore_keys() -> None:
@@ -50,6 +58,20 @@ def _patch_qwen3_vl_moe_tie_word_embeddings() -> None:
     setattr(Qwen3VLMoeTextConfig, "tie_word_embeddings", False)
 
 
+def _patch_gemma4_moe_experts_per_tok_alias() -> None:
+    from transformers import Gemma4TextConfig
+
+    if hasattr(Gemma4TextConfig, "num_experts_per_tok"):
+        return
+
+    def num_experts_per_tok(self: Any) -> Any:
+        # vLLM's routed-expert sidecar uses the Mistral MoE field name, while
+        # HF Gemma4 stores the same router top-k value as top_k_experts.
+        return self.top_k_experts
+
+    Gemma4TextConfig.num_experts_per_tok = property(num_experts_per_tok)  # type: ignore[attr-defined]
+
+
 def subclass_chat_completion_request() -> None:
     from vllm.entrypoints.openai.chat_completion import protocol
 
@@ -69,9 +91,9 @@ def subclass_chat_completion_request() -> None:
 
 
 def patch_listen_for_disconnect() -> None:
-    import vllm.entrypoints.utils
+    from vllm.entrypoints.serve.utils import api_utils
 
-    if getattr(vllm.entrypoints.utils, "_art_listen_for_disconnect_patched", False):
+    if getattr(api_utils, "_art_listen_for_disconnect_patched", False):
         return
 
     async def patched_listen_for_disconnect(request: Any) -> None:
@@ -79,12 +101,16 @@ def patch_listen_for_disconnect() -> None:
             while True:
                 message = await request.receive()
                 if message["type"] == "http.disconnect":
+                    if getattr(
+                        request.app.state, "enable_server_load_tracking", False
+                    ) and hasattr(request.app.state, "server_load_metrics"):
+                        request.app.state.server_load_metrics -= 1
                     break
         except UnboundLocalError:
             pass
 
-    vllm.entrypoints.utils.listen_for_disconnect = patched_listen_for_disconnect  # ty:ignore[invalid-assignment]
-    setattr(vllm.entrypoints.utils, "_art_listen_for_disconnect_patched", True)
+    api_utils.listen_for_disconnect = patched_listen_for_disconnect  # ty:ignore[invalid-assignment]
+    setattr(api_utils, "_art_listen_for_disconnect_patched", True)
 
 
 def patch_tool_parser_manager() -> None:
@@ -170,6 +196,124 @@ def patch_nccl_unique_id_bootstrap() -> None:
     NCCLLibrary.ncclCommInitRank = patched_comm_init_rank  # type: ignore[method-assign]
 
 
+def _is_gemma4_conditional_worker(worker: Any) -> bool:
+    hf_config = worker.model_config.hf_config
+    return hf_config.architectures == ["Gemma4ForConditionalGeneration"]
+
+
+def patch_gemma4_checkpoint_weight_update_reload() -> None:
+    from vllm.v1.worker.gpu_worker import Worker
+
+    original_start_weight_update = Worker.start_weight_update
+    if getattr(original_start_weight_update, "__art_patched__", False):
+        return
+    original_finish_weight_update = Worker.finish_weight_update
+
+    def start_weight_update(
+        self: Any,
+        is_checkpoint_format: bool = True,
+    ) -> None:
+        if not is_checkpoint_format or not _is_gemma4_conditional_worker(self):
+            return original_start_weight_update(
+                self,
+                is_checkpoint_format=is_checkpoint_format,
+            )
+        self._check_weight_transfer_engine()
+        if self._weight_update_active:
+            raise RuntimeError(
+                "start_weight_update called while a weight update is "
+                "already active. Call finish_weight_update first."
+            )
+        # vLLM's layerwise checkpoint reload corrupts Gemma4 after reloading
+        # the original checkpoint. Direct model.load_weights keeps the update
+        # path identical to initial checkpoint loading while preserving the
+        # streaming NCCL transfer used by ART merged serving.
+        self._is_checkpoint_format = True
+        self._weight_update_active = True
+
+    def finish_weight_update(self: Any) -> None:
+        if not _is_gemma4_conditional_worker(self):
+            return original_finish_weight_update(self)
+        self._check_weight_transfer_engine()
+        if not self._weight_update_active:
+            raise RuntimeError(
+                "start_weight_update must be called before finish_weight_update."
+            )
+        if not self._is_checkpoint_format:
+            return original_finish_weight_update(self)
+        self._weight_update_active = False
+        self._is_checkpoint_format = True
+
+    start_weight_update.__art_patched__ = True  # type: ignore[attr-defined]
+    start_weight_update.__art_original__ = original_start_weight_update  # type: ignore[attr-defined]
+    finish_weight_update.__art_patched__ = True  # type: ignore[attr-defined]
+    finish_weight_update.__art_original__ = original_finish_weight_update  # type: ignore[attr-defined]
+    Worker.start_weight_update = start_weight_update  # type: ignore[method-assign]
+    Worker.finish_weight_update = finish_weight_update  # type: ignore[method-assign]
+
+
+def patch_art_lora_delta_weight_update() -> None:
+    import torch
+    from vllm.v1.worker.gpu_worker import Worker
+
+    from art_vllm_runtime.lora_delta import (
+        ART_LORA_DELTA_UPDATE_KIND,
+        apply_lora_delta_update,
+    )
+
+    original_update_weights = Worker.update_weights
+    if getattr(original_update_weights, "__art_lora_delta_patched__", False):
+        return
+
+    def update_weights(self: Any, update_info: dict) -> None:
+        if update_info.get("art_weight_update_kind") != ART_LORA_DELTA_UPDATE_KIND:
+            return original_update_weights(self, update_info)
+
+        self._check_weight_transfer_engine()
+        assert self.weight_transfer_engine is not None
+        if not self._weight_update_active:
+            raise RuntimeError(
+                "start_weight_update must be called before update_weights."
+            )
+
+        adapter_config = update_info["art_lora_config"]
+        transfer_update_info = dict(update_info)
+        del transfer_update_info["art_weight_update_kind"]
+        del transfer_update_info["art_lora_config"]
+        typed_update_info = self.weight_transfer_engine.parse_update_info(
+            transfer_update_info
+        )
+        lora_tensors: dict[str, torch.Tensor] = {}
+
+        def collect_lora_tensors(weights: list[tuple[str, torch.Tensor]]) -> None:
+            for name, tensor in weights:
+                if name in lora_tensors:
+                    raise RuntimeError(f"Duplicate LoRA tensor in update: {name}")
+                lora_tensors[name] = tensor.detach().contiguous().clone()
+
+        with torch.device(self.device):
+            self.weight_transfer_engine.receive_weights(
+                typed_update_info,
+                load_weights=collect_lora_tensors,
+            )
+            self._art_previous_lora_tensors = apply_lora_delta_update(
+                model=self.model_runner.model,
+                lora_tensors=lora_tensors,
+                adapter_config=adapter_config,
+                previous_lora_tensors=getattr(
+                    self,
+                    "_art_previous_lora_tensors",
+                    None,
+                ),
+            )
+
+        torch.accelerator.synchronize()
+
+    update_weights.__art_lora_delta_patched__ = True  # type: ignore[attr-defined]
+    update_weights.__art_original__ = original_update_weights  # type: ignore[attr-defined]
+    Worker.update_weights = update_weights  # type: ignore[method-assign]
+
+
 def _lora_cache_key(lora_request: Any) -> tuple[Any, ...]:
     if lora_request is None:
         return ()
@@ -226,6 +370,13 @@ def patch_routed_experts_prefix_cache_sidecar() -> None:
     from vllm.model_executor.layers.fused_moe import routed_experts_capturer
 
     if getattr(routed_experts_capturer, "_art_prefix_route_sidecar_patched", False):
+        return
+
+    if hasattr(routed_experts_capturer, "RoutedExpertsManager"):
+        # vLLM 0.23 stores routed experts by physical KV-cache slot, so prefix
+        # cache hits recover routes from the shared slot buffer without ART's
+        # old per-request host-cache sidecar.
+        setattr(routed_experts_capturer, "_art_prefix_route_sidecar_patched", True)
         return
 
     host_cls = routed_experts_capturer._RoutedExpertsHostCache

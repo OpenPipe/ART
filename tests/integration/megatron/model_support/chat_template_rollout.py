@@ -246,26 +246,25 @@ def run_chat_template_rollout(base_model: str) -> ChatTemplateRolloutReport:
         )
     )
 
-    expected_error = "Assistant message has tool_calls"
-    observed_error: str | None = None
-    try:
-        tokenize_trajectory(
-            tokenizer=tokenizer,
-            image_processor=None,
-            history=_history(inputs.unsupported_assistant_tool_calls),
-            advantage=1.0,
-            allow_training_without_logprobs=True,
-            trajectory=inputs.unsupported_assistant_tool_calls,
-        )
-    except ValueError as exc:
-        observed_error = str(exc)
+    unsupported_result = tokenize_trajectory(
+        tokenizer=tokenizer,
+        image_processor=None,
+        history=_history(inputs.unsupported_assistant_tool_calls),
+        advantage=1.0,
+        allow_training_without_logprobs=True,
+        trajectory=inputs.unsupported_assistant_tool_calls,
+    )
     scenarios.append(
         ChatTemplateScenarioReport(
-            name="unsupported_assistant_tool_calls_without_logprobs",
+            name="rl_dict_assistant_tool_calls_without_choice_is_not_trainable",
             entrypoint="tokenize_trajectory",
-            passed=observed_error is not None and expected_error in observed_error,
-            expected_error_substring=expected_error,
-            observed_error=observed_error,
+            passed=unsupported_result is None,
+            result_count=int(unsupported_result is not None),
+            assistant_token_count=(
+                0
+                if unsupported_result is None
+                else int(sum(unsupported_result.assistant_mask))
+            ),
         )
     )
 

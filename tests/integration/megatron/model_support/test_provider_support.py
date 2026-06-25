@@ -338,8 +338,7 @@ def test_get_provider_bundle_honors_single_gpu_env_topology(
     assert resolved.recompute_method == "uniform"
     assert resolved.recompute_num_layers == 1
 
-    transformer_layer_spec = cast(Any, resolved.transformer_layer_spec)
-    layer_spec = transformer_layer_spec(resolved, vp_stage=0)
+    layer_spec = resolved.transformer_layer_spec(resolved, vp_stage=0)
     assert (
         layer_spec.submodules.self_attention.submodules.core_attention
         is FlexDotProductAttention

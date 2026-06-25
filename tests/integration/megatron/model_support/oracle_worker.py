@@ -1043,7 +1043,7 @@ def _apply_attention_lse_normalize_mutation(mutation: SensitivityMutation | None
     original_compiled = compiled_flex_attention.normalize_flex_lse
     original_executor = executor.normalize_flex_lse
 
-    def _identity(lse: torch.Tensor) -> torch.Tensor:
+    def _identity(lse: torch.Tensor, **_kwargs: Any) -> torch.Tensor:
         return lse
 
     compiled_flex_attention.normalize_flex_lse = _identity  # type: ignore[invalid-assignment]
