@@ -315,6 +315,7 @@ def _install_weighted_bias_quick_geglu_patch() -> None:
             raise AssertionError(
                 "weighted_bias_quick_geglu_impl expects 2D or 3D input"
             )
+        input_dtype = input.dtype
         input = input.view(-1, ori_shape[-1])
         if bias is not None:
             input = input + bias
@@ -323,7 +324,7 @@ def _install_weighted_bias_quick_geglu_patch() -> None:
             gate = gate.clamp(min=None, max=clamp_value)
             up = up.clamp(min=-clamp_value, max=clamp_value)
         output = fused_bias_geglu.quick_gelu(gate) * (up + linear_offset)
-        output = output * weights
+        output = (output * weights).to(input_dtype)
         return (
             output
             if len(ori_shape) == 2
