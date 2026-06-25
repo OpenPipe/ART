@@ -46,6 +46,24 @@ class ExpertTensorSlice:
             )
         return self.tensor[global_expert - self.global_start]
 
+    @property
+    def ndim(self) -> int:
+        return self.tensor.ndim
+
+    @property
+    def shape(self) -> torch.Size:
+        return self.tensor.shape
+
+    def __getitem__(self, index: Any) -> torch.Tensor:
+        if isinstance(index, int):
+            return self.get(index)
+        if isinstance(index, tuple) and index and isinstance(index[0], int):
+            return self.get(index[0])[index[1:]]
+        return self.tensor[index]
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self.tensor, name)
+
 
 def _pin_cpu_tensor(tensor: torch.Tensor) -> torch.Tensor:
     if tensor.device.type != "cpu" or not torch.cuda.is_available():
@@ -145,6 +163,8 @@ def _load_hf_tensor_slice(
 def load_unique_hf_keys_once(
     tasks: Iterable[Any],
     hf_state_dict: Mapping[str, torch.Tensor],
+    *,
+    bridge: MegatronModelBridge | None = None,
 ) -> dict[str, torch.Tensor | ExpertTensorSlice]:
     task_list = list(tasks)
     keys = sorted(
@@ -170,22 +190,46 @@ def load_unique_hf_keys_once(
             else (min(previous[0], start), max(previous[1], stop))
         )
     cache: dict[str, torch.Tensor | ExpertTensorSlice] = {}
-    if keys and hasattr(hf_state_dict, "__getitem__"):
+    existing_keys = [key for key in keys if key in hf_state_dict]
+    missing_keys = [key for key in keys if key not in hf_state_dict]
+    if existing_keys and hasattr(hf_state_dict, "__getitem__"):
         hf_state_dict_getter = cast(Any, hf_state_dict)
         loaded = (
-            hf_state_dict_getter[keys]
+            hf_state_dict_getter[existing_keys]
             if not isinstance(hf_state_dict, dict)
-            else {key: hf_state_dict[key] for key in keys}
+            else {key: hf_state_dict[key] for key in existing_keys}
         )
     else:
-        loaded = {key: hf_state_dict[key] for key in keys}
+        loaded = {key: hf_state_dict[key] for key in existing_keys}
     cache.update(
         {
             key: _pin_cpu_tensor(value)
             for key, value in cast(Mapping[str, torch.Tensor], loaded).items()
         }
     )
+    if missing_keys and bridge is None:
+        raise KeyError(f"Keys not found: {missing_keys}")
+    for key in missing_keys:
+        assert bridge is not None
+        cache[key] = _pin_cpu_tensor(
+            bridge.maybe_modify_loaded_hf_weight(key, hf_state_dict)
+        )
     for key, (start, stop) in expert_slice_ranges.items():
+        if key not in hf_state_dict:
+            if bridge is None:
+                raise KeyError(f"HF tensor key {key!r} not found")
+            tensor = bridge.maybe_modify_loaded_hf_weight(key, hf_state_dict)
+            if not tensor.ndim or start < 0 or stop > tensor.shape[0] or start >= stop:
+                raise RuntimeError(
+                    f"invalid expert slice [{start}, {stop}) for {key!r} "
+                    f"with shape {tuple(tensor.shape)}"
+                )
+            cache[key] = ExpertTensorSlice(
+                _pin_cpu_tensor(tensor[start:stop]),
+                global_start=start,
+                global_stop=stop,
+            )
+            continue
         cache[key] = ExpertTensorSlice(
             _pin_cpu_tensor(
                 _load_hf_tensor_slice(
@@ -443,16 +487,24 @@ def _optimized_load_weights_hf_to_megatron(
             stack.enter_context(megatron_model[0].hide_loss_modules())
         tasks = self.build_conversion_tasks(hf_pretrained, megatron_model)
     hf_state_dict = hf_pretrained.state
-    raw_cache = load_unique_hf_keys_once(tasks, hf_state_dict)
+    raw_cache = load_unique_hf_keys_once(tasks, hf_state_dict, bridge=self)
     cached_state = _CachedStateLookup(cache=raw_cache, source=hf_state_dict)
     description = f"Loading from {hf_pretrained.model_name_or_path}"
     pending_device_copy = False
     for task in self._with_progress_tracking(tasks, description):
         if task is None or task.megatron_module is None:
             continue
-        hf_weights = self.maybe_modify_loaded_hf_weight(
-            task.mapping.hf_param, cast(Mapping[str, torch.Tensor], cached_state)
-        )
+        hf_param = task.mapping.hf_param
+        if (
+            isinstance(hf_param, str)
+            and hf_param in raw_cache
+            and hf_param not in hf_state_dict
+        ):
+            hf_weights = raw_cache[hf_param]
+        else:
+            hf_weights = self.maybe_modify_loaded_hf_weight(
+                hf_param, cast(Mapping[str, torch.Tensor], cached_state)
+            )
         converted_weights = task.mapping.hf_to_megatron(
             hf_weights, task.megatron_module
         )
