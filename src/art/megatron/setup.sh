@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-export CUDA_HOME="${CUDA_HOME:-/usr/local/cuda-12.8}"
+export CUDA_HOME="${CUDA_HOME:-/usr/local/cuda-13.0}"
 export TORCH_CUDA_ARCH_LIST="${TORCH_CUDA_ARCH_LIST:-9.0}"
 # Install missing cudnn headers, DeepEP RDMA headers, and ninja build tools.
 missing_packages=()
-for package in libcudnn9-headers-cuda-12 libibverbs-dev ninja-build; do
+for package in libcudnn9-headers-cuda-13 libibverbs-dev ninja-build; do
     if ! dpkg-query -W "${package}" >/dev/null 2>&1; then
         missing_packages+=("${package}")
     fi

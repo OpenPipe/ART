@@ -34,7 +34,7 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--base-image",
-        default="pytorch/pytorch:2.9.0-cuda12.8-cudnn9-devel",
+        default="pytorch/pytorch:2.11.0-cuda13.0-cudnn9-devel",
         help="Base image reference used for CI runtime/build cache compatibility",
     )
     parser.add_argument(

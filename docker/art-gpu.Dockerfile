@@ -1,4 +1,4 @@
-ARG BASE_IMAGE=docker.io/pytorch/pytorch:2.9.0-cuda12.8-cudnn9-devel
+ARG BASE_IMAGE=docker.io/pytorch/pytorch:2.11.0-cuda13.0-cudnn9-devel
 ARG ART_SHA=unknown
 ARG UV_VERSION=0.11.7
 ARG BUILD_JOBS=2
@@ -6,7 +6,7 @@ ARG UV_CONCURRENT_BUILDS=1
 ARG APEX_PARALLEL_BUILD=2
 ARG APEX_NVCC_THREADS=1
 ARG TORCH_CUDA_ARCH_LIST=9.0
-ARG CUDNN_PACKAGE_VERSION=9.10.2.21
+ARG CUDNN_PACKAGE_VERSION=9.19.0.56
 ARG SKYPILOT_VERSION=0.12.0
 ARG SKY_REMOTE_RAY_VERSION=2.9.3
 
@@ -20,8 +20,8 @@ ARG APEX_NVCC_THREADS
 ARG TORCH_CUDA_ARCH_LIST
 ARG CUDNN_PACKAGE_VERSION
 
-ENV CUDA_HOME=/usr/local/cuda-12.8 \
-    PATH=/opt/conda/bin:${PATH} \
+ENV CUDA_HOME=/usr/local/cuda-13.0 \
+    PATH=/usr/local/bin:${PATH} \
     UV_CACHE_DIR=/opt/uv-cache \
     UV_PYTHON_INSTALL_DIR=/opt/uv-python \
     UV_LINK_MODE=copy \
@@ -41,33 +41,47 @@ RUN if ! getent group messagebus >/dev/null; then groupadd -r messagebus; fi \
  && apt-get update \
  && apt-get install -y --no-install-recommends git libibverbs-dev \
  && rm -rf /var/lib/apt/lists/* \
- && /opt/conda/bin/python -m pip install --no-cache-dir --upgrade "uv==${UV_VERSION}" \
- && /opt/conda/bin/conda clean -afy \
- && /opt/conda/bin/uv --version \
+ && python -m pip install --break-system-packages --no-cache-dir --upgrade "uv==${UV_VERSION}" \
+ && uv --version \
  && mkdir -p "${UV_CACHE_DIR}" "${UV_PYTHON_INSTALL_DIR}"
 
 WORKDIR /opt/src/art
 COPY pyproject.toml uv.lock ./
 COPY vllm_runtime/pyproject.toml vllm_runtime/uv.lock ./vllm_runtime/
 
-RUN /opt/conda/bin/python -m pip install --no-cache-dir "nvidia-cudnn-cu12==${CUDNN_PACKAGE_VERSION}" \
- && mkdir -p /usr/local/cuda-12.8/include /usr/local/cuda-12.8/lib64 \
- && : > /tmp/art-cudnn-symlinks.txt \
- && for src in /opt/conda/lib/python3.11/site-packages/nvidia/cudnn/include/*; do \
-      dst="/usr/local/cuda-12.8/include/$(basename "$src")"; \
-      if [ ! -e "$dst" ]; then ln -s "$src" "$dst" && printf '%s\n' "$dst" >> /tmp/art-cudnn-symlinks.txt; fi; \
+RUN python -m pip install --break-system-packages --no-cache-dir "nvidia-cudnn-cu13==${CUDNN_PACKAGE_VERSION}" \
+ && mkdir -p /usr/local/cuda-13.0/include /usr/local/cuda-13.0/lib64 \
+ && for cccl_dir in cuda cub thrust; do \
+      src="/usr/local/cuda-13.0/targets/x86_64-linux/include/cccl/${cccl_dir}"; \
+      dst="/usr/local/cuda-13.0/include/${cccl_dir}"; \
+      if [ -e "$src" ] && [ ! -e "$dst" ]; then ln -s "$src" "$dst"; fi; \
     done \
- && for src in /opt/conda/lib/python3.11/site-packages/nvidia/cudnn/lib/*; do \
-      dst="/usr/local/cuda-12.8/lib64/$(basename "$src")"; \
-      if [ ! -e "$dst" ]; then ln -s "$src" "$dst" && printf '%s\n' "$dst" >> /tmp/art-cudnn-symlinks.txt; fi; \
+ && cudnn_path="$(python -c 'from pathlib import Path; import site; paths = [Path(p) / "nvidia" / "cudnn" for p in site.getsitepackages() + [site.getusersitepackages()]]; matches = [p for p in paths if p.exists()]; print(matches[0] if matches else ""); raise SystemExit(0 if matches else 1)')" \
+ && : > /tmp/art-cuda-symlinks.txt \
+ && for src in "${cudnn_path}"/include/*; do \
+      dst="/usr/local/cuda-13.0/include/$(basename "$src")"; \
+      if [ ! -e "$dst" ]; then ln -s "$src" "$dst" && printf '%s\n' "$dst" >> /tmp/art-cuda-symlinks.txt; fi; \
+    done \
+ && for src in "${cudnn_path}"/lib/*; do \
+      dst="/usr/local/cuda-13.0/lib64/$(basename "$src")"; \
+      if [ ! -e "$dst" ]; then ln -s "$src" "$dst" && printf '%s\n' "$dst" >> /tmp/art-cuda-symlinks.txt; fi; \
+    done \
+ && nccl_path="$(python -c 'from pathlib import Path; import site; paths = [Path(p) / "nvidia" / "nccl" for p in site.getsitepackages() + [site.getusersitepackages()]]; matches = [p for p in paths if p.exists()]; print(matches[0] if matches else ""); raise SystemExit(0 if matches else 1)')" \
+ && for src in "${nccl_path}"/include/*; do \
+      dst="/usr/local/cuda-13.0/include/$(basename "$src")"; \
+      if [ ! -e "$dst" ]; then ln -s "$src" "$dst" && printf '%s\n' "$dst" >> /tmp/art-cuda-symlinks.txt; fi; \
+    done \
+ && for src in "${nccl_path}"/lib/*; do \
+      dst="/usr/local/cuda-13.0/lib64/$(basename "$src")"; \
+      if [ ! -e "$dst" ]; then ln -s "$src" "$dst" && printf '%s\n' "$dst" >> /tmp/art-cuda-symlinks.txt; fi; \
     done \
  && UV_LINK_MODE=hardlink uv sync --frozen --extra backend --extra megatron --extra tinker --no-install-project --python 3.12 \
  && rm -rf .venv \
  && cd vllm_runtime \
  && UV_LINK_MODE=hardlink uv sync --frozen --no-install-project --no-dev --python 3.12 \
  && rm -rf .venv \
- && if [ -f /tmp/art-cudnn-symlinks.txt ]; then while IFS= read -r link; do [ -L "$link" ] && rm "$link"; done < /tmp/art-cudnn-symlinks.txt; fi \
- && rm -f /tmp/art-cudnn-symlinks.txt
+ && if [ -f /tmp/art-cuda-symlinks.txt ]; then while IFS= read -r link; do [ -L "$link" ] && rm "$link"; done < /tmp/art-cuda-symlinks.txt; fi \
+ && rm -f /tmp/art-cuda-symlinks.txt
 
 FROM ${BASE_IMAGE}
 
@@ -81,8 +95,8 @@ ARG TORCH_CUDA_ARCH_LIST
 ARG SKYPILOT_VERSION
 ARG SKY_REMOTE_RAY_VERSION
 
-ENV CUDA_HOME=/usr/local/cuda-12.8 \
-    PATH=/home/sky/.local/bin:/opt/conda/bin:${PATH} \
+ENV CUDA_HOME=/usr/local/cuda-13.0 \
+    PATH=/home/sky/.local/bin:/usr/local/bin:${PATH} \
     UV_CACHE_DIR=/opt/uv-cache \
     UV_PYTHON_INSTALL_DIR=/opt/uv-python \
     UV_LINK_MODE=copy \
@@ -116,7 +130,7 @@ RUN if ! getent group messagebus >/dev/null; then groupadd -r messagebus; fi \
       git \
       htop \
       jq \
-      libcudnn9-headers-cuda-12 \
+      libcudnn9-headers-cuda-13 \
       libibverbs-dev \
       nano \
       netcat-openbsd \
@@ -131,6 +145,21 @@ RUN if ! getent group messagebus >/dev/null; then groupadd -r messagebus; fi \
       tmux \
       unzip \
       wget \
+ && for cccl_dir in cuda cub thrust; do \
+      src="/usr/local/cuda-13.0/targets/x86_64-linux/include/cccl/${cccl_dir}"; \
+      dst="/usr/local/cuda-13.0/include/${cccl_dir}"; \
+      if [ -e "$src" ] && [ ! -e "$dst" ]; then ln -s "$src" "$dst"; fi; \
+    done \
+ && nccl_path="$(python -c 'from pathlib import Path; import site; paths = [Path(p) / "nvidia" / "nccl" for p in site.getsitepackages() + [site.getusersitepackages()]]; matches = [p for p in paths if p.exists()]; print(matches[0] if matches else ""); raise SystemExit(0 if matches else 1)')" \
+ && for src in "${nccl_path}"/include/*; do \
+      dst="/usr/local/cuda-13.0/include/$(basename "$src")"; \
+      if [ ! -e "$dst" ]; then ln -s "$src" "$dst"; fi; \
+    done \
+ && for src in "${nccl_path}"/lib/*; do \
+      dst="/usr/local/cuda-13.0/lib64/$(basename "$src")"; \
+      if [ ! -e "$dst" ]; then ln -s "$src" "$dst"; fi; \
+    done \
+ && ldconfig \
  && mkdir -p /var/run/sshd "${UV_CACHE_DIR}" "${UV_PYTHON_INSTALL_DIR}" \
  && sed -i 's/PermitRootLogin prohibit-password/PermitRootLogin yes/' /etc/ssh/sshd_config \
  && sed -i 's@session\s*required\s*pam_loginuid.so@session optional pam_loginuid.so@g' /etc/pam.d/sshd \
@@ -138,11 +167,10 @@ RUN if ! getent group messagebus >/dev/null; then groupadd -r messagebus; fi \
  && useradd -m -s /bin/bash sky \
  && mkdir -p /home/sky/.local/bin /home/sky/.sky/sky_app \
  && /bin/bash -c 'echo "sky ALL=(ALL) NOPASSWD:ALL" >> /etc/sudoers' \
- && /bin/bash -c 'echo '\''Defaults secure_path="/opt/conda/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"'\'' > /etc/sudoers.d/sky' \
- && /opt/conda/bin/python -m pip install --no-cache-dir --upgrade "uv==${UV_VERSION}" \
- && /opt/conda/bin/conda clean -afy \
- && ln -sf /opt/conda/bin/uv /home/sky/.local/bin/uv \
- && /opt/conda/bin/uv --version \
+ && /bin/bash -c 'echo '\''Defaults secure_path="/usr/local/bin:/usr/local/sbin:/usr/sbin:/usr/bin:/sbin:/bin"'\'' > /etc/sudoers.d/sky' \
+ && python -m pip install --break-system-packages --no-cache-dir --upgrade "uv==${UV_VERSION}" \
+ && ln -sf /usr/local/bin/uv /home/sky/.local/bin/uv \
+ && uv --version \
  && chown -R sky:sky /home/sky "${UV_CACHE_DIR}" "${UV_PYTHON_INSTALL_DIR}"
 
 COPY --from=builder --chown=sky:sky /opt/uv-cache /opt/uv-cache
@@ -152,7 +180,7 @@ USER sky
 WORKDIR /home/sky
 
 RUN mkdir -p "${HOME}/.local/bin" "${HOME}/.sky/sky_app" "${HOME}/sky_workdir" \
- && ln -sf /opt/conda/bin/uv "${HOME}/.local/bin/uv" \
+ && ln -sf /usr/local/bin/uv "${HOME}/.local/bin/uv" \
  && uv venv --seed "${HOME}/skypilot-runtime" --python 3.10 \
  && VIRTUAL_ENV="${HOME}/skypilot-runtime" UV_LINK_MODE=copy UV_SYSTEM_PYTHON=false env -u PYTHONPATH -C "${HOME}" uv pip install \
       "setuptools<70" \

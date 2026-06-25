@@ -4,7 +4,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 
-BASE_IMAGE="${BASE_IMAGE:-pytorch/pytorch:2.9.0-cuda12.8-cudnn9-devel}"
+BASE_IMAGE="${BASE_IMAGE:-pytorch/pytorch:2.11.0-cuda13.0-cudnn9-devel}"
 PYTHON_MM="${PYTHON_MM:-3.12}"
 UV_CACHE_RELEASE_TAG="${UV_CACHE_RELEASE_TAG:-prek-uv-cache}"
 UV_CACHE_ASSET_PREFIX="${UV_CACHE_ASSET_PREFIX:-prek-uv-cache}"
@@ -275,13 +275,16 @@ build_cache_archive() {
   export TORCH_CUDA_ARCH_LIST
 
   local cudnn_path="${TMP_DIR}/.venv/lib/python${PYTHON_MM}/site-packages/nvidia/cudnn"
+  local nccl_path="${TMP_DIR}/.venv/lib/python${PYTHON_MM}/site-packages/nvidia/nccl"
   export CUDNN_PATH="${cudnn_path}"
   export CUDNN_HOME="${cudnn_path}"
   export CUDNN_INCLUDE_PATH="${cudnn_path}/include"
   export CUDNN_LIBRARY_PATH="${cudnn_path}/lib"
-  export CPLUS_INCLUDE_PATH="${CUDNN_INCLUDE_PATH}${CPLUS_INCLUDE_PATH:+:${CPLUS_INCLUDE_PATH}}"
-  export LIBRARY_PATH="${CUDNN_LIBRARY_PATH}${LIBRARY_PATH:+:${LIBRARY_PATH}}"
-  export LD_LIBRARY_PATH="${CUDNN_LIBRARY_PATH}${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}"
+  export NCCL_INCLUDE_PATH="${nccl_path}/include"
+  export NCCL_LIBRARY_PATH="${nccl_path}/lib"
+  export CPLUS_INCLUDE_PATH="${CUDNN_INCLUDE_PATH}:${NCCL_INCLUDE_PATH}${CPLUS_INCLUDE_PATH:+:${CPLUS_INCLUDE_PATH}}"
+  export LIBRARY_PATH="${CUDNN_LIBRARY_PATH}:${NCCL_LIBRARY_PATH}${LIBRARY_PATH:+:${LIBRARY_PATH}}"
+  export LD_LIBRARY_PATH="${CUDNN_LIBRARY_PATH}:${NCCL_LIBRARY_PATH}${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}"
 
   log "Building full uv cache with compile_jobs=${compile_jobs}, apex_parallel_build=${apex_parallel_build}, nvcc_threads=${CI_APEX_NVCC_THREADS}, cuda_arch_list=${TORCH_CUDA_ARCH_LIST}, and uv_concurrent_builds=${UV_BUILD_SLOTS}."
   uv sync --frozen --all-extras --group dev --no-install-project --python "${PYTHON_MM}"

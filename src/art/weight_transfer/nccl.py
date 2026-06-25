@@ -370,13 +370,13 @@ def _find_nccl_library() -> str:
         spec = importlib.util.find_spec("nvidia.nccl")
         if spec is None or spec.submodule_search_locations is None:
             raise RuntimeError(
-                "CUDA weight transfer requires the nvidia-nccl-cu12 package."
+                "CUDA weight transfer requires the nvidia-nccl-cu13 package."
             )
         nccl_library = (
             Path(next(iter(spec.submodule_search_locations))) / "lib" / "libnccl.so.2"
         )
         if not nccl_library.exists():
-            raise RuntimeError(f"nvidia-nccl-cu12 is missing {nccl_library}")
+            raise RuntimeError(f"nvidia-nccl-cu13 is missing {nccl_library}")
         return str(nccl_library)
     if torch.version.hip is not None:
         return "librccl.so.1"

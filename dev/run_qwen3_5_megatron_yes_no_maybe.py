@@ -10,7 +10,7 @@ from sky import ClusterStatus
 
 load_dotenv()
 
-DEFAULT_IMAGE_ID = "docker:nvidia/cuda:12.8.1-devel-ubuntu22.04"
+DEFAULT_IMAGE_ID = "docker:nvidia/cuda:13.0.2-devel-ubuntu22.04"
 
 
 def _format_env_bool(value: bool) -> str:

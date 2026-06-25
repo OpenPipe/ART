@@ -529,7 +529,7 @@ def get_vllm_runtime_nccl_so_path() -> Path:
         "import importlib.util\n"
         "spec = importlib.util.find_spec('nvidia.nccl')\n"
         "if spec is None or spec.submodule_search_locations is None:\n"
-        "    raise SystemExit('vLLM runtime is missing nvidia-nccl-cu12')\n"
+        "    raise SystemExit('vLLM runtime is missing nvidia-nccl-cu13')\n"
         "package_dir = Path(next(iter(spec.submodule_search_locations)))\n"
         "path = package_dir / 'lib' / 'libnccl.so.2'\n"
         "if not path.exists():\n"

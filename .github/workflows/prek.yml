@@ -9,7 +9,7 @@ permissions:
   contents: write
 
 env:
-  CI_BASE_IMAGE: "pytorch/pytorch:2.9.0-cuda12.8-cudnn9-devel"
+  CI_BASE_IMAGE: "pytorch/pytorch:2.11.0-cuda13.0-cudnn9-devel"
   CI_PYTHON_MM: "3.12"
   CI_UV_CACHE_RELEASE_TAG: "prek-uv-cache"
   CI_UV_CACHE_ASSET_PREFIX: "prek-uv-cache"
@@ -85,7 +85,7 @@ jobs:
     if: needs.cache-status.outputs.cache-hit != 'true'
     runs-on: art-cache-builder
     container:
-      image: pytorch/pytorch:2.9.0-cuda12.8-cudnn9-devel
+      image: pytorch/pytorch:2.11.0-cuda13.0-cudnn9-devel
     steps:
       - name: Install CI dependencies
         run: |
@@ -126,7 +126,7 @@ jobs:
     if: ${{ !failure() && !cancelled() }}
     runs-on: art-large-runner
     container:
-      image: pytorch/pytorch:2.9.0-cuda12.8-cudnn9-devel
+      image: pytorch/pytorch:2.11.0-cuda13.0-cudnn9-devel
     steps:
       - name: Install CI dependencies
         run: |
@@ -216,9 +216,12 @@ jobs:
           export CUDNN_HOME="${cudnn_path}"
           export CUDNN_INCLUDE_PATH="${cudnn_path}/include"
           export CUDNN_LIBRARY_PATH="${cudnn_path}/lib"
-          export CPLUS_INCLUDE_PATH="${CUDNN_INCLUDE_PATH}${CPLUS_INCLUDE_PATH:+:${CPLUS_INCLUDE_PATH}}"
-          export LIBRARY_PATH="${CUDNN_LIBRARY_PATH}${LIBRARY_PATH:+:${LIBRARY_PATH}}"
-          export LD_LIBRARY_PATH="${CUDNN_LIBRARY_PATH}${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}"
+          nccl_path="${GITHUB_WORKSPACE}/.venv/lib/python${CI_PYTHON_MM}/site-packages/nvidia/nccl"
+          export NCCL_INCLUDE_PATH="${nccl_path}/include"
+          export NCCL_LIBRARY_PATH="${nccl_path}/lib"
+          export CPLUS_INCLUDE_PATH="${CUDNN_INCLUDE_PATH}:${NCCL_INCLUDE_PATH}${CPLUS_INCLUDE_PATH:+:${CPLUS_INCLUDE_PATH}}"
+          export LIBRARY_PATH="${CUDNN_LIBRARY_PATH}:${NCCL_LIBRARY_PATH}${LIBRARY_PATH:+:${LIBRARY_PATH}}"
+          export LD_LIBRARY_PATH="${CUDNN_LIBRARY_PATH}:${NCCL_LIBRARY_PATH}${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}"
           export UV_CONCURRENT_BUILDS="${CI_UV_BUILD_SLOTS}"
           export CMAKE_BUILD_PARALLEL_LEVEL="${CI_APEX_PARALLEL_BUILD}"
           export MAX_JOBS="${CI_APEX_PARALLEL_BUILD}"

@@ -25,7 +25,7 @@ backend = [
     "unsloth==2026.3.3",
     "unsloth-zoo==2026.3.1",
     "torch>=2.11.0",
-    "torchao==0.16.0",
+    "torchao==0.17.0",
     "accelerate==1.7.0",
     "awscli>=1.38.1",
     "setuptools>=78.1.0",
@@ -49,7 +49,7 @@ megatron = [
     "quack-kernels==0.3.7",
     "apex",
     "transformer-engine==2.11.0",
-    "transformer-engine-cu12==2.11.0",
+    "transformer-engine-cu13==2.11.0",
     "transformer-engine-torch==2.11.0",
     "megatron-core==0.17.0",
     "pybind11>=2.13.6",
@@ -159,9 +159,10 @@ override-dependencies = [
     "transformer-engine==2.11.0",
     "transformers==5.2.0",
     "torch==2.11.0",
+    "torchvision==0.26.0",
 ]
 exclude-dependencies = ["pynvml", "emerging-optimizers", "causal-conv1d", "mamba-ssm"]
-no-build-isolation-package = ["apex", "transformer-engine", "transformer-engine-cu12", "transformer-engine-torch", "megatron-bridge", "deep-ep", "nv-grouped-gemm"]
+no-build-isolation-package = ["apex", "transformer-engine", "transformer-engine-cu13", "transformer-engine-torch", "megatron-bridge", "deep-ep", "nv-grouped-gemm"]
 
 [tool.uv.extra-build-dependencies]
 apex = ["torch>=2.11.0"]
@@ -194,7 +195,7 @@ requires-dist = [
     "packaging",
     "pydantic",
     "torch",
-    "transformer-engine-cu12",
+    "transformer-engine-cu13",
 ]
 
 [tool.ty.environment]
@@ -272,8 +273,10 @@ dev = [
 ]
 
 [tool.uv.sources]
-torch = [{ index = "pytorch-cu128", marker = "sys_platform == 'linux' or sys_platform == 'win32'" }]
-apex = { git = "https://github.com/NVIDIA/apex.git", rev = "25.09" }
+torch = [{ index = "pytorch-cu130", marker = "sys_platform == 'linux' or sys_platform == 'win32'" }]
+torchao = [{ index = "pytorch-cu130", marker = "sys_platform == 'linux' or sys_platform == 'win32'" }]
+torchvision = [{ index = "pytorch-cu130", marker = "sys_platform == 'linux' or sys_platform == 'win32'" }]
+apex = { git = "https://github.com/NVIDIA/apex.git", rev = "26bba57d62553d268319b4a20cc3d8aa990249ec" }
 deep-ep = { git = "https://github.com/deepseek-ai/DeepEP.git", rev = "v1.2.1" }
 flash-attn-4 = { url = "https://files.pythonhosted.org/packages/24/f7/01ee2576ce41f9884d291ee21861ef194afc0b2b1ce3bd175fc7a6e1b133/flash_attn_4-4.0.0b5-py3-none-any.whl" }
 megatron-bridge = { git = "https://github.com/NVIDIA-NeMo/Megatron-Bridge.git", rev = "e049cc00c24d03e2ae45d2608c7a44e2d2364e3d" }
@@ -281,6 +284,6 @@ panza = { git = "https://github.com/corbt/panza.git" }
 transformer-engine-torch = { git = "https://github.com/NVIDIA/TransformerEngine.git", rev = "v2.11", subdirectory = "transformer_engine/pytorch" }
 
 [[tool.uv.index]]
-name = "pytorch-cu128"
-url = "https://download.pytorch.org/whl/cu128"
+name = "pytorch-cu130"
+url = "https://download.pytorch.org/whl/cu130"
 explicit = true
