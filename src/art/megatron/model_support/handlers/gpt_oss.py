@@ -57,6 +57,7 @@ class GptOssMoeHandler(DefaultMoeHandler):
 
     def configure_provider_for_runtime(self, provider: Any) -> None:
         provider.moe_shared_expert_overlap = False
+        _install_weighted_bias_quick_geglu_patch()
 
     def collect_layer_families(self, provider: Any) -> list[LayerFamilyInstance]:
         if int(getattr(provider, "num_moe_experts", 0) or 0) <= 0:
@@ -216,6 +217,65 @@ class GptOssMoeHandler(DefaultMoeHandler):
 
 
 GPT_OSS_MOE_HANDLER = GptOssMoeHandler()
+
+
+def _install_weighted_bias_quick_geglu_patch() -> None:
+    import megatron.core.fusions.fused_bias_geglu as fused_bias_geglu
+    import megatron.core.transformer.moe.experts as moe_experts
+
+    original = fused_bias_geglu.weighted_bias_quick_geglu_impl
+    if getattr(original, "_art_gpt_oss_bias_before_clamp", False):
+        return
+
+    def _weighted_bias_quick_geglu_impl(
+        input: torch.Tensor,
+        bias: torch.Tensor | None,
+        weights: torch.Tensor,
+        fp8_input_store: bool = False,
+        linear_offset: float = 0.0,
+        clamp_value: float | None = None,
+    ) -> torch.Tensor:
+        ori_shape = input.shape
+        if len(ori_shape) not in {2, 3}:
+            raise AssertionError(
+                "weighted_bias_quick_geglu_impl expects 2D or 3D input"
+            )
+        input = input.view(-1, ori_shape[-1])
+        if bias is not None:
+            input = input + bias
+        if clamp_value is not None:
+            gate, up = input.chunk(2, -1)
+            input = torch.cat(
+                (
+                    gate.clamp(min=None, max=clamp_value),
+                    up.clamp(min=-clamp_value, max=clamp_value),
+                ),
+                -1,
+            )
+        offset = torch.tensor(linear_offset, dtype=input.dtype, device=input.device)
+        output = fused_bias_geglu.WeightedQuickGeGLUFunction.apply(
+            input,
+            weights,
+            fp8_input_store,
+            offset,
+        )
+        return (
+            output
+            if len(ori_shape) == 2
+            else output.view(ori_shape[0], ori_shape[1], -1)
+        )
+
+    setattr(_weighted_bias_quick_geglu_impl, "_art_gpt_oss_bias_before_clamp", True)
+    setattr(
+        fused_bias_geglu,
+        "weighted_bias_quick_geglu_impl",
+        _weighted_bias_quick_geglu_impl,
+    )
+    setattr(
+        moe_experts,
+        "weighted_bias_quick_geglu_impl",
+        _weighted_bias_quick_geglu_impl,
+    )
 
 
 def _to_vllm_key(key: str) -> str:
