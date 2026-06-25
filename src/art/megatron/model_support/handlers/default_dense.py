@@ -93,6 +93,9 @@ class DefaultDenseHandler:
         del rollout_weights_mode
         return {}
 
+    def vllm_server_args(self) -> dict[str, object]:
+        return {}
+
     def install_preprocess_patch(self, model_chunks: Sequence[Any]) -> None:
         del model_chunks
         return None

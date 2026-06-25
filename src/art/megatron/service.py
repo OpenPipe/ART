@@ -419,11 +419,18 @@ class MegatronService:
     def _runtime_server_args(
         self, config: dev.OpenAIServerConfig | None
     ) -> dict[str, object]:
+        from .model_support import get_model_support_handler
+
         server_args: dict[str, object] = {
             "return_tokens_as_token_ids": True,
             "enable_auto_tool_choice": True,
             "tool_call_parser": "hermes",
         }
+        handler = get_model_support_handler(
+            self.base_model,
+            allow_unvalidated_arch=self._allow_unvalidated_arch,
+        )
+        server_args.update(handler.vllm_server_args())
         if config and "server_args" in config:
             server_args.update(dict(config["server_args"]))
         for key in ("port", "host", "lora_modules"):

@@ -73,6 +73,9 @@ class GptOssMoeHandler(DefaultMoeHandler):
             return {}
         return {"moe_backend": "triton_unfused"}
 
+    def vllm_server_args(self) -> dict[str, object]:
+        return {"tool_call_parser": "openai"}
+
     def collect_layer_families(self, provider: Any) -> list[LayerFamilyInstance]:
         if int(getattr(provider, "num_moe_experts", 0) or 0) <= 0:
             raise TypeError("GPT OSS MoE handler received a dense provider")
