@@ -102,6 +102,30 @@ _DSV4_RENAMED_EXPORT_SUFFIXES = (
         ".attn.indexer.compressor.norm.weight",
     ),
 )
+_DSV4_LAYER_TYPE_TO_COMPRESS_RATIO = {
+    "sliding_attention": 0,
+    "compressed_sparse_attention": 4,
+    "heavily_compressed_attention": 128,
+}
+
+
+def _dsv4_compress_ratios_from_hf_config(hf_config: Any) -> list[int] | None:
+    ratios = getattr(hf_config, "compress_ratios", None)
+    if ratios is not None:
+        return [int(ratio) for ratio in ratios]
+    layer_types = getattr(hf_config, "layer_types", None)
+    if layer_types is None:
+        return None
+    compress_rates = getattr(hf_config, "compress_rates", None) or {}
+    return [
+        int(
+            compress_rates.get(
+                layer_type,
+                _DSV4_LAYER_TYPE_TO_COMPRESS_RATIO[layer_type],
+            )
+        )
+        for layer_type in layer_types
+    ]
 
 
 def _dequant_dsv4_mxfp4(weight: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
@@ -1085,7 +1109,7 @@ class ArtDeepSeekV4Bridge(DeepSeekV3Bridge):
         provider.dsv4_hc_mult = getattr(hf_config, "hc_mult", 4)
         provider.dsv4_hc_sinkhorn_iters = getattr(hf_config, "hc_sinkhorn_iters", 20)
         provider.dsv4_hc_eps = getattr(hf_config, "hc_eps", 1e-6)
-        provider.dsv4_compress_ratios = getattr(hf_config, "compress_ratios", None)
+        provider.dsv4_compress_ratios = _dsv4_compress_ratios_from_hf_config(hf_config)
         provider.dsv4_compress_rope_theta = getattr(
             hf_config, "compress_rope_theta", 160000
         )
