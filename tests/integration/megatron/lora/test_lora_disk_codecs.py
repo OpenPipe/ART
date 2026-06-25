@@ -1419,7 +1419,14 @@ def test_direct_gpt_oss_packed_expert_publish_matches_handler_vllm_exactly(
     hidden = 3
     intermediate = 4
     group_prefix = "base_model.model.model.layers.0.mlp.experts"
-    full = _gpt_oss_moe_art_tensors("base_model.model.model.layers.0", rank=rank)
+    full = {
+        key: tensor
+        for key, tensor in _gpt_oss_moe_art_tensors(
+            "base_model.model.model.layers.0",
+            rank=rank,
+        ).items()
+        if ".mlp.experts." in key
+    }
     gate_up_lora = LoRA(
         adapter_model_prefix=f"{group_prefix}.{{expert}}.gate_up_proj",
         in_features=hidden,
