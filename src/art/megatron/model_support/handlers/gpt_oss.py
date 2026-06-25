@@ -56,6 +56,10 @@ class GptOssMoeHandler(DefaultMoeHandler):
         return tuple(dict.fromkeys(suffixes))
 
     def configure_provider_for_runtime(self, provider: Any) -> None:
+        _register_gpt_oss_attention_mapping_types()
+        sliding_window = _gpt_oss_sliding_window(provider)
+        provider.art_flex_core_attention_wrapper = _gpt_oss_flex_core_attention_wrapper
+        provider.art_flex_sliding_windows = (sliding_window,)
         provider.moe_shared_expert_overlap = False
         _install_weighted_bias_quick_geglu_patch()
 
@@ -217,6 +221,64 @@ class GptOssMoeHandler(DefaultMoeHandler):
 
 
 GPT_OSS_MOE_HANDLER = GptOssMoeHandler()
+
+
+def _register_gpt_oss_attention_mapping_types() -> None:
+    from megatron.bridge.models.conversion.param_mapping import AutoMapping
+
+    AutoMapping.register_module_type("GptOssArtFlexCoreAttention", "column")
+
+
+def _gpt_oss_sliding_window(provider: Any) -> int:
+    window_size = getattr(provider, "window_size", None)
+    if window_size is None:
+        raise RuntimeError("GPT OSS provider is missing window_size")
+    if isinstance(window_size, tuple | list):
+        if len(window_size) != 2:
+            raise RuntimeError(f"Unsupported GPT OSS window_size: {window_size}")
+        left, right = (int(window_size[0]), int(window_size[1]))
+        if right != 0:
+            raise RuntimeError(f"Unsupported GPT OSS right window: {window_size}")
+        return left + 1
+    return int(window_size)
+
+
+def _gpt_oss_sliding_window_for_layer(provider: Any, layer_number: int) -> int | None:
+    layer_types = getattr(provider, "layer_types", None)
+    layer_index = int(layer_number) - 1
+    if layer_types is not None:
+        return (
+            _gpt_oss_sliding_window(provider)
+            if layer_types[layer_index] == "sliding_attention"
+            else None
+        )
+    skip_freq = int(getattr(provider, "window_attn_skip_freq", 0) or 0)
+    if skip_freq <= 0:
+        return None
+    if layer_index % skip_freq != 0:
+        return None
+    return _gpt_oss_sliding_window(provider)
+
+
+def _gpt_oss_flex_core_attention_wrapper(
+    provider: Any,
+    base_cls: type[Any],
+) -> type[Any]:
+    class GptOssArtFlexCoreAttention(base_cls):  # type: ignore[misc, valid-type]
+        def __init__(
+            self,
+            config: Any,
+            layer_number: int,
+            *args: Any,
+            **kwargs: Any,
+        ) -> None:
+            super().__init__(config, layer_number, *args, **kwargs)
+            self.art_sliding_window = _gpt_oss_sliding_window_for_layer(
+                provider,
+                layer_number,
+            )
+
+    return GptOssArtFlexCoreAttention
 
 
 def _install_weighted_bias_quick_geglu_patch() -> None:
