@@ -509,11 +509,21 @@ def _focus_derivative_tensor_map(
     loss_active_last_layer_experts: set[int],
 ) -> dict[str, torch.Tensor]:
     focused: dict[str, torch.Tensor] = {}
+    active_router_expert_sets = {
+        layer_index: set(int(row) for row in rows.reshape(-1).tolist())
+        for layer_index, rows in active_router_rows.items()
+        if rows.numel() > 0
+    }
     for key, value in tensor_map.items():
         if match := _EXPERT_WEIGHT_PATTERN.match(key):
+            layer_index = int(match.group("layer"))
+            expert_index = int(match.group("expert"))
+            active_experts = active_router_expert_sets.get(layer_index)
+            if active_experts is not None and expert_index not in active_experts:
+                continue
             if (
-                int(match.group("layer")) == last_layer_index
-                and int(match.group("expert")) not in loss_active_last_layer_experts
+                layer_index == last_layer_index
+                and expert_index not in loss_active_last_layer_experts
             ):
                 continue
         focused_value = value
