@@ -975,12 +975,19 @@ def _run_logits(
     position_ids = packed_tensors["input_pos"].to(device=device)
     group_ids = packed_tensors["group_ids"].to(device=device)
     parent_ids = packed_tensors["parent_ids"].to(device=device)
+    build_dsv4_layouts = bool(
+        getattr(runtime.model_support_handler, "build_dsv4_compression_layouts", False)
+    )
     attention_state = create_shared_prefix_state(
         group_ids=group_ids,
         parent_ids=parent_ids,
         build_gdn_execution_spec=bool(
             getattr(runtime.model_support_handler, "build_gdn_execution_spec", False)
         ),
+        build_dsv4_compression_layouts=build_dsv4_layouts,
+        dsv4_position_ids=position_ids if build_dsv4_layouts else None,
+        dsv4_group_ids=group_ids if build_dsv4_layouts else None,
+        dsv4_parent_ids=parent_ids if build_dsv4_layouts else None,
         attention_head_dim=getattr(runtime.provider, "kv_channels", None),
         attention_value_head_dim=getattr(runtime.provider, "kv_channels", None),
     )
