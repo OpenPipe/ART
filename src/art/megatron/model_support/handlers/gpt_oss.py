@@ -15,6 +15,7 @@ from art.megatron.model_support.spec import (
     ExpertPackedLoraGroup,
     ExpertPackedLoraSlot,
     LayerFamilyInstance,
+    RolloutWeightsMode,
 )
 
 _GPT_OSS_MOE_COMPILE_WORKAROUND_FLAGS = (
@@ -62,6 +63,15 @@ class GptOssMoeHandler(DefaultMoeHandler):
         provider.art_flex_sliding_windows = (sliding_window,)
         provider.moe_shared_expert_overlap = False
         _install_weighted_bias_quick_geglu_patch()
+
+    def vllm_engine_args(
+        self,
+        *,
+        rollout_weights_mode: RolloutWeightsMode,
+    ) -> dict[str, object]:
+        if rollout_weights_mode != "lora":
+            return {}
+        return {"moe_backend": "triton_unfused"}
 
     def collect_layer_families(self, provider: Any) -> list[LayerFamilyInstance]:
         if int(getattr(provider, "num_moe_experts", 0) or 0) <= 0:

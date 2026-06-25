@@ -106,6 +106,12 @@ class ModelSupportHandler(Protocol):
 
     def configure_provider_for_runtime(self, provider: "GPTModelProvider") -> None: ...
 
+    def vllm_engine_args(
+        self,
+        *,
+        rollout_weights_mode: RolloutWeightsMode,
+    ) -> dict[str, object]: ...
+
     def install_preprocess_patch(self, model_chunks: Sequence[Any]) -> None: ...
 
     def collect_layer_families(

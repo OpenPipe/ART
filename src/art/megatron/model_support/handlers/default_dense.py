@@ -7,6 +7,7 @@ from art.megatron.model_support.spec import (
     ExpertPackedLoraGroup,
     FlexAttentionCompileCrashConfig,
     LayerFamilyInstance,
+    RolloutWeightsMode,
     SharedExpertCompileState,
 )
 
@@ -83,6 +84,14 @@ class DefaultDenseHandler:
     def configure_provider_for_runtime(self, provider: Any) -> None:
         del provider
         return None
+
+    def vllm_engine_args(
+        self,
+        *,
+        rollout_weights_mode: RolloutWeightsMode,
+    ) -> dict[str, object]:
+        del rollout_weights_mode
+        return {}
 
     def install_preprocess_patch(self, model_chunks: Sequence[Any]) -> None:
         del model_chunks
