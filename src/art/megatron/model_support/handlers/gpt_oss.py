@@ -224,7 +224,7 @@ def _install_weighted_bias_quick_geglu_patch() -> None:
     import megatron.core.transformer.moe.experts as moe_experts
 
     original = fused_bias_geglu.weighted_bias_quick_geglu_impl
-    if getattr(original, "_art_gpt_oss_bias_before_clamp", False):
+    if getattr(original, "_art_gpt_oss_compile_safe", False):
         return
 
     def _weighted_bias_quick_geglu_impl(
@@ -243,29 +243,19 @@ def _install_weighted_bias_quick_geglu_patch() -> None:
         input = input.view(-1, ori_shape[-1])
         if bias is not None:
             input = input + bias
+        gate, up = input.chunk(2, -1)
         if clamp_value is not None:
-            gate, up = input.chunk(2, -1)
-            input = torch.cat(
-                (
-                    gate.clamp(min=None, max=clamp_value),
-                    up.clamp(min=-clamp_value, max=clamp_value),
-                ),
-                -1,
-            )
-        offset = torch.tensor(linear_offset, dtype=input.dtype, device=input.device)
-        output = fused_bias_geglu.WeightedQuickGeGLUFunction.apply(
-            input,
-            weights,
-            fp8_input_store,
-            offset,
-        )
+            gate = gate.clamp(min=None, max=clamp_value)
+            up = up.clamp(min=-clamp_value, max=clamp_value)
+        output = fused_bias_geglu.quick_gelu(gate) * (up + linear_offset)
+        output = output * weights
         return (
             output
             if len(ori_shape) == 2
             else output.view(ori_shape[0], ori_shape[1], -1)
         )
 
-    setattr(_weighted_bias_quick_geglu_impl, "_art_gpt_oss_bias_before_clamp", True)
+    setattr(_weighted_bias_quick_geglu_impl, "_art_gpt_oss_compile_safe", True)
     setattr(
         fused_bias_geglu,
         "weighted_bias_quick_geglu_impl",
