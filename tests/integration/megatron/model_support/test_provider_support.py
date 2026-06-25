@@ -109,18 +109,38 @@ def test_openpipe_qwen3_14b_instruct_uses_qwen3_dense_support() -> None:
     assert handler.key == "qwen3_dense"
 
 
+def test_openai_gpt_oss_20b_uses_gpt_oss_moe_support() -> None:
+    spec = get_model_support_spec("openai/gpt-oss-20b")
+    handler = get_model_support_handler("openai/gpt-oss-20b")
+
+    assert spec.key == "gpt_oss_moe"
+    assert spec.is_moe is True
+    assert spec.native_vllm_lora_status == "validated"
+    assert spec.default_target_modules == (
+        "q_proj",
+        "k_proj",
+        "v_proj",
+        "o_proj",
+        "experts",
+    )
+    assert handler.key == "gpt_oss_moe"
+
+
 def test_model_support_specs_own_moe_metadata() -> None:
     assert model_uses_expert_parallel("OpenPipe/Qwen3-14B-Instruct") is False
     assert model_uses_expert_parallel("Qwen/Qwen3-30B-A3B-Instruct-2507") is True
     assert model_uses_expert_parallel("Qwen/Qwen3.5-35B-A3B") is True
+    assert model_uses_expert_parallel("openai/gpt-oss-20b") is True
 
 
 def test_megatron_lora_rank_defaults_by_architecture() -> None:
     dense_handler = get_model_support_handler("OpenPipe/Qwen3-14B-Instruct")
     moe_handler = get_model_support_handler("Qwen/Qwen3-30B-A3B-Instruct-2507")
+    gpt_oss_handler = get_model_support_handler("openai/gpt-oss-20b")
 
     assert default_lora_rank_for_handler(dense_handler) == 8
     assert default_lora_rank_for_handler(moe_handler) == 1
+    assert default_lora_rank_for_handler(gpt_oss_handler) == 1
 
 
 def test_get_provider_accepts_registry_supported_models(
@@ -159,6 +179,35 @@ def test_get_provider_accepts_registry_supported_models(
     assert resolved.calculate_per_token_loss is True
 
     layer_spec = cast(Any, resolved.transformer_layer_spec)(resolved, vp_stage=7)
+    assert (
+        layer_spec.submodules.self_attention.submodules.core_attention
+        is ArtContextParallelCoreAttention
+    )
+
+
+def test_gpt_oss_provider_uses_handler_cp_runtime_default(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    provider = _FakeProvider()
+    provider.num_moe_experts = 128
+    fake_bridge = _FakeBridge(
+        model_bridge=object(),
+        provider=provider,
+    )
+    monkeypatch.setattr(
+        provider_module.AutoBridge,
+        "from_hf_pretrained",
+        lambda *args, **kwargs: fake_bridge,
+    )
+    monkeypatch.setattr(provider_module.torch.cuda, "device_count", lambda: 2)
+
+    resolved = provider_module.get_provider("openai/gpt-oss-20b")
+
+    assert resolved is provider
+    assert resolved.context_parallel_size == 2
+    assert resolved.cp_comm_type == "a2a"
+    assert resolved.moe_shared_expert_overlap is False
+    layer_spec = cast(Any, resolved.transformer_layer_spec)(resolved, vp_stage=0)
     assert (
         layer_spec.submodules.self_attention.submodules.core_attention
         is ArtContextParallelCoreAttention

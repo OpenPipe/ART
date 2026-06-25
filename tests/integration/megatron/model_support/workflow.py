@@ -60,6 +60,7 @@ ARCHITECTURE_REPRESENTATIVE_MODELS = {
     "qwen3_5_dense": "Qwen/Qwen3.5-27B",
     "gemma4_moe": "google/gemma-4-26B-A4B-it",
     "gemma4_dense": "google/gemma-4-31B-it",
+    "gpt_oss_moe": "openai/gpt-oss-20b",
 }
 SUBPROCESS_VALIDATION_STAGES = frozenset(
     {

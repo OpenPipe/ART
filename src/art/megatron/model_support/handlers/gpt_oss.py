@@ -1,0 +1,446 @@
+from __future__ import annotations
+
+import re
+from typing import Any, Sequence
+
+import torch
+
+from art.megatron.model_support.handlers.default_dense import (
+    DefaultMoeHandler,
+    _compile_workaround_flags_for_provider,
+    _require_moe_experts,
+)
+from art.megatron.model_support.spec import (
+    CompileWorkaroundConfig,
+    ExpertPackedLoraGroup,
+    ExpertPackedLoraSlot,
+    LayerFamilyInstance,
+)
+
+_GPT_OSS_MOE_COMPILE_WORKAROUND_FLAGS = (
+    "alltoall_dtoh",
+    "alltoall_dispatch_preprocess",
+    "deepep_dispatch_combine",
+    "deepep_permute_restore",
+    "flex_token_dispatch_combine",
+    "te_triton_permute_with_mask_map",
+)
+_ART_MOE_EXPERT_KEY_RE = re.compile(
+    r"^(?P<prefix>.*\.mlp\.experts)\.(?P<expert>\d+)\."
+    r"(?P<module>gate_up_proj|down_proj)\.(?P<lora>lora_[AB])\.weight$"
+)
+_VLLM_MOE_KEY_RE = re.compile(
+    r"^(?P<prefix>.*\.mlp\.experts)\."
+    r"(?:(?P<base_layer>base_layer)\.)?(?P<lora>lora_[AB])\.weight$"
+)
+
+
+class GptOssMoeHandler(DefaultMoeHandler):
+    key = "gpt_oss_moe"
+    is_moe = True
+    native_vllm_lora_status = "validated"
+
+    def identity_lora_model_config(self, base_config: Any) -> Any:
+        return getattr(base_config, "text_config", base_config)
+
+    def _identity_lora_parameter_suffixes(
+        self,
+        target_modules: list[str],
+    ) -> tuple[str, ...]:
+        suffixes = list(super()._identity_lora_parameter_suffixes(target_modules))
+        target_set = set(target_modules)
+        if {"experts", "gate_proj", "up_proj"} & target_set:
+            suffixes.append("experts.gate_up_proj")
+        if {"experts", "down_proj"} & target_set:
+            suffixes.append("experts.down_proj")
+        return tuple(dict.fromkeys(suffixes))
+
+    def configure_provider_for_runtime(self, provider: Any) -> None:
+        provider.cp_comm_type = "a2a"
+        provider.moe_shared_expert_overlap = False
+
+    def collect_layer_families(self, provider: Any) -> list[LayerFamilyInstance]:
+        if int(getattr(provider, "num_moe_experts", 0) or 0) <= 0:
+            raise TypeError("GPT OSS MoE handler received a dense provider")
+        families = [
+            LayerFamilyInstance(key="gpt_oss_sliding_attention", layer_index=0),
+            LayerFamilyInstance(key="grouped_moe_mlp", layer_index=0),
+        ]
+        if int(getattr(provider, "num_layers", 2) or 2) > 1:
+            families.append(
+                LayerFamilyInstance(key="gpt_oss_full_attention", layer_index=1)
+            )
+        return families
+
+    def apply_lora_adapters(
+        self,
+        model_chunks: Sequence[Any],
+        provider: Any,
+        *,
+        target_modules: list[str],
+        rank: int,
+        alpha: int,
+    ) -> None:
+        from megatron.core.transformer.attention import SelfAttention
+        from megatron.core.transformer.transformer_layer import TransformerLayer
+
+        from art.megatron.lora import (
+            _adapter_model_prefix,
+            _is_language_transformer_layer_name,
+            wrap_grouped_moe_experts_3d,
+            wrap_standard_self_attention,
+        )
+
+        target_set = set(target_modules)
+        for chunk in model_chunks:
+            for module_name, module in chunk.named_modules():
+                if not isinstance(module, TransformerLayer):
+                    continue
+                if not _is_language_transformer_layer_name(module_name):
+                    continue
+                if not isinstance(module.self_attention, SelfAttention):
+                    raise TypeError(
+                        "GPT OSS expected a SelfAttention module, got "
+                        f"{type(module.self_attention)}"
+                    )
+                adapter_model_prefix = _adapter_model_prefix(module)
+                wrap_standard_self_attention(
+                    module.self_attention,
+                    adapter_model_prefix=adapter_model_prefix,
+                    provider=provider,
+                    target_modules=target_set,
+                    rank=rank,
+                    alpha=alpha,
+                )
+                wrap_grouped_moe_experts_3d(
+                    _require_moe_experts(module),
+                    adapter_model_prefix=adapter_model_prefix,
+                    target_modules=target_set,
+                    rank=rank,
+                    alpha=alpha,
+                )
+
+    def build_adapter_weights_by_base(
+        self,
+        model_chunks: Sequence[Any],
+    ) -> dict[str, list[Any]]:
+        from megatron.core.transformer.transformer_layer import TransformerLayer
+
+        from art.megatron.lora import _is_language_transformer_layer_name
+        from art.megatron.weights.adapter_export import (
+            add_grouped_moe_adapter_weights,
+            add_standard_self_attention_adapter_weights,
+            layer_base_prefix,
+        )
+
+        adapter_weights_by_base: dict[str, list[Any]] = {}
+        for chunk in model_chunks:
+            for module_name, module in chunk.named_modules():
+                if not isinstance(module, TransformerLayer):
+                    continue
+                if not _is_language_transformer_layer_name(module_name):
+                    continue
+                layer_prefix = layer_base_prefix(module, module_name=module_name)
+                add_standard_self_attention_adapter_weights(
+                    adapter_weights_by_base,
+                    layer_prefix=layer_prefix,
+                    self_attention=module.self_attention,
+                )
+                add_grouped_moe_adapter_weights(
+                    adapter_weights_by_base,
+                    layer_prefix=layer_prefix,
+                    experts=_require_moe_experts(module),
+                )
+        return adapter_weights_by_base
+
+    def expert_packed_lora_groups(self) -> tuple[ExpertPackedLoraGroup, ...]:
+        return (
+            ExpertPackedLoraGroup(
+                art_group_suffix=".mlp.experts",
+                slots=(
+                    ExpertPackedLoraSlot(
+                        source_projection="gate_up_proj",
+                        source_lora="lora_A",
+                        output_suffix="base_layer.lora_A.weight",
+                        pack_layout="expert_rows",
+                    ),
+                    ExpertPackedLoraSlot(
+                        source_projection="gate_up_proj",
+                        source_lora="lora_B",
+                        output_suffix="base_layer.lora_B.weight",
+                        pack_layout="interleaved_gate_up_rank_major_expert_cols",
+                    ),
+                    ExpertPackedLoraSlot(
+                        source_projection="down_proj",
+                        source_lora="lora_A",
+                        output_suffix="lora_A.weight",
+                        pack_layout="expert_rows",
+                    ),
+                    ExpertPackedLoraSlot(
+                        source_projection="down_proj",
+                        source_lora="lora_B",
+                        output_suffix="lora_B.weight",
+                        pack_layout="rank_major_expert_cols",
+                    ),
+                ),
+            ),
+        )
+
+    def to_vllm_lora_tensors(
+        self,
+        tensors: dict[str, torch.Tensor],
+        *,
+        adapter_config: dict[str, Any],
+    ) -> tuple[dict[str, torch.Tensor], dict[str, Any]]:
+        return _to_vllm_lora_tensors(tensors, adapter_config=adapter_config)
+
+    def from_vllm_lora_tensors(
+        self,
+        tensors: dict[str, torch.Tensor],
+        *,
+        adapter_config: dict[str, Any],
+    ) -> dict[str, torch.Tensor]:
+        return _from_vllm_lora_tensors(tensors, adapter_config=adapter_config)
+
+    def compile_workaround_config(
+        self,
+        provider: Any,
+    ) -> CompileWorkaroundConfig:
+        return CompileWorkaroundConfig(
+            flags=_compile_workaround_flags_for_provider(
+                provider,
+                _GPT_OSS_MOE_COMPILE_WORKAROUND_FLAGS,
+            ),
+            shared_expert_state="none",
+            disable_compile=False,
+        )
+
+
+GPT_OSS_MOE_HANDLER = GptOssMoeHandler()
+
+
+def _to_vllm_key(key: str) -> str:
+    return key.replace(".self_attn.", ".attn.", 1)
+
+
+def _from_vllm_key(key: str) -> str:
+    return key.replace(".attn.", ".self_attn.", 1)
+
+
+def _pack_vllm_3d_lora_b(blocks: list[torch.Tensor]) -> torch.Tensor:
+    stacked = torch.stack(blocks, dim=0)
+    return stacked.permute(1, 2, 0).reshape(stacked.shape[1], -1).contiguous()
+
+
+def _unpack_vllm_3d_lora_b(
+    tensor: torch.Tensor,
+    *,
+    num_experts: int,
+    rank: int,
+) -> torch.Tensor:
+    return tensor.reshape(tensor.shape[0], rank, num_experts).permute(2, 0, 1)
+
+
+def _gate_up_b_to_vllm(tensor: torch.Tensor) -> torch.Tensor:
+    if tensor.shape[0] % 2 != 0:
+        raise RuntimeError(
+            f"GPT OSS gate/up lora_B rows {tensor.shape[0]} are not even"
+        )
+    gate, up = tensor.split(tensor.shape[0] // 2, dim=0)
+    return torch.stack((gate, up), dim=1).flatten(0, 1).contiguous()
+
+
+def _gate_up_b_from_vllm(tensor: torch.Tensor) -> torch.Tensor:
+    if tensor.shape[0] % 2 != 0:
+        raise RuntimeError(
+            f"GPT OSS gate/up lora_B rows {tensor.shape[0]} are not even"
+        )
+    return torch.cat((tensor[::2], tensor[1::2]), dim=0).contiguous()
+
+
+def _group_art_moe_tensors(
+    tensors: dict[str, torch.Tensor],
+) -> dict[str, dict[int, dict[str, dict[str, torch.Tensor]]]]:
+    grouped: dict[str, dict[int, dict[str, dict[str, torch.Tensor]]]] = {}
+    for key, tensor in tensors.items():
+        match = _ART_MOE_EXPERT_KEY_RE.match(key)
+        if match is None:
+            continue
+        grouped.setdefault(match.group("prefix"), {}).setdefault(
+            int(match.group("expert")),
+            {},
+        ).setdefault(match.group("module"), {})[match.group("lora")] = tensor
+    return grouped
+
+
+def _vllm_moe_config(adapter_config: dict[str, Any]) -> dict[str, Any]:
+    config = dict(adapter_config)
+    target_modules = [
+        module
+        for module in list(config.get("target_modules") or [])
+        if module not in {"gate_proj", "up_proj", "down_proj", "gate_up_proj"}
+    ]
+    if "experts" not in target_modules:
+        target_modules.append("experts")
+    config["target_modules"] = target_modules
+    return config
+
+
+def _to_vllm_lora_tensors(
+    tensors: dict[str, torch.Tensor],
+    *,
+    adapter_config: dict[str, Any],
+) -> tuple[dict[str, torch.Tensor], dict[str, Any]]:
+    grouped = _group_art_moe_tensors(tensors)
+    transformed: dict[str, torch.Tensor] = {}
+    if not grouped:
+        has_fused_experts = False
+        for key, tensor in tensors.items():
+            vllm_key = _to_vllm_key(key)
+            if vllm_key in transformed:
+                raise RuntimeError(
+                    f"Duplicate GPT OSS LoRA tensor after conversion: {vllm_key}"
+                )
+            transformed[vllm_key] = tensor
+            has_fused_experts = has_fused_experts or (
+                _VLLM_MOE_KEY_RE.match(vllm_key) is not None
+            )
+        return (
+            transformed,
+            _vllm_moe_config(adapter_config) if has_fused_experts else adapter_config,
+        )
+
+    used_keys: set[str] = set()
+    for prefix, experts in grouped.items():
+        vllm_prefix = _to_vllm_key(prefix)
+        gate_up_a: list[torch.Tensor] = []
+        gate_up_b: list[torch.Tensor] = []
+        down_a: list[torch.Tensor] = []
+        down_b: list[torch.Tensor] = []
+        for expert in sorted(experts):
+            modules = experts[expert]
+            try:
+                gate_up_a_tensor = modules["gate_up_proj"]["lora_A"]
+                gate_up_b_tensor = modules["gate_up_proj"]["lora_B"]
+                down_a_tensor = modules["down_proj"]["lora_A"]
+                down_b_tensor = modules["down_proj"]["lora_B"]
+            except KeyError as exc:
+                raise RuntimeError(
+                    f"Incomplete GPT OSS MoE LoRA block for {prefix}.{expert}"
+                ) from exc
+            gate_up_a.append(gate_up_a_tensor.contiguous())
+            gate_up_b.append(_gate_up_b_to_vllm(gate_up_b_tensor))
+            down_a.append(down_a_tensor.contiguous())
+            down_b.append(down_b_tensor.contiguous())
+            for module_name in ("gate_up_proj", "down_proj"):
+                for lora_name in ("lora_A", "lora_B"):
+                    used_keys.add(f"{prefix}.{expert}.{module_name}.{lora_name}.weight")
+
+        transformed[f"{vllm_prefix}.base_layer.lora_A.weight"] = torch.cat(
+            gate_up_a,
+            dim=0,
+        ).contiguous()
+        transformed[f"{vllm_prefix}.base_layer.lora_B.weight"] = _pack_vllm_3d_lora_b(
+            gate_up_b
+        )
+        transformed[f"{vllm_prefix}.lora_A.weight"] = torch.cat(
+            down_a,
+            dim=0,
+        ).contiguous()
+        transformed[f"{vllm_prefix}.lora_B.weight"] = _pack_vllm_3d_lora_b(down_b)
+
+    for key, tensor in tensors.items():
+        if key in used_keys:
+            continue
+        vllm_key = _to_vllm_key(key)
+        if vllm_key in transformed:
+            raise RuntimeError(
+                f"Duplicate GPT OSS LoRA tensor after conversion: {vllm_key}"
+            )
+        transformed[vllm_key] = tensor
+    return transformed, _vllm_moe_config(adapter_config)
+
+
+def _from_vllm_lora_tensors(
+    tensors: dict[str, torch.Tensor],
+    *,
+    adapter_config: dict[str, Any],
+) -> dict[str, torch.Tensor]:
+    grouped: dict[str, dict[str, torch.Tensor]] = {}
+    for key, tensor in tensors.items():
+        match = _VLLM_MOE_KEY_RE.match(key)
+        if match is None:
+            continue
+        slot = (
+            f"{'base_layer.' if match.group('base_layer') else ''}{match.group('lora')}"
+        )
+        grouped.setdefault(match.group("prefix"), {})[slot] = tensor
+    if not grouped:
+        transformed = {_from_vllm_key(key): tensor for key, tensor in tensors.items()}
+        if len(transformed) != len(tensors):
+            raise RuntimeError("Duplicate GPT OSS LoRA tensor after vLLM conversion")
+        return transformed
+
+    rank = int(adapter_config["r"])
+    transformed: dict[str, torch.Tensor] = {}
+    used_keys: set[str] = set()
+    for prefix, slots in grouped.items():
+        try:
+            gate_up_a = slots["base_layer.lora_A"]
+            gate_up_b = slots["base_layer.lora_B"]
+            down_a = slots["lora_A"]
+            down_b = slots["lora_B"]
+        except KeyError as exc:
+            raise RuntimeError(
+                f"Incomplete GPT OSS vLLM MoE LoRA block for {prefix}"
+            ) from exc
+        if gate_up_a.shape[0] % rank != 0:
+            raise RuntimeError(
+                f"{prefix}: gate/up lora_A shape {tuple(gate_up_a.shape)} "
+                f"is not divisible by rank {rank}"
+            )
+        num_experts = gate_up_a.shape[0] // rank
+        art_prefix = _from_vllm_key(prefix)
+        gate_up_b_by_expert = _unpack_vllm_3d_lora_b(
+            gate_up_b,
+            num_experts=num_experts,
+            rank=rank,
+        )
+        down_b_by_expert = _unpack_vllm_3d_lora_b(
+            down_b,
+            num_experts=num_experts,
+            rank=rank,
+        )
+        for expert in range(num_experts):
+            row = expert * rank
+            transformed[f"{art_prefix}.{expert}.gate_up_proj.lora_A.weight"] = (
+                gate_up_a[row : row + rank].contiguous()
+            )
+            transformed[f"{art_prefix}.{expert}.gate_up_proj.lora_B.weight"] = (
+                _gate_up_b_from_vllm(gate_up_b_by_expert[expert])
+            )
+            transformed[f"{art_prefix}.{expert}.down_proj.lora_A.weight"] = down_a[
+                row : row + rank
+            ].contiguous()
+            transformed[f"{art_prefix}.{expert}.down_proj.lora_B.weight"] = (
+                down_b_by_expert[expert].contiguous()
+            )
+        used_keys.update(
+            {
+                f"{prefix}.base_layer.lora_A.weight",
+                f"{prefix}.base_layer.lora_B.weight",
+                f"{prefix}.lora_A.weight",
+                f"{prefix}.lora_B.weight",
+            }
+        )
+
+    for key, tensor in tensors.items():
+        if key in used_keys:
+            continue
+        art_key = _from_vllm_key(key)
+        if art_key in transformed:
+            raise RuntimeError(
+                f"Duplicate GPT OSS LoRA tensor after conversion: {art_key}"
+            )
+        transformed[art_key] = tensor
+    return transformed

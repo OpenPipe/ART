@@ -596,6 +596,26 @@ def _pack_merged_expert_blocks(
             )
             .contiguous()
         )
+    if first_layout == "interleaved_gate_up_rank_major_expert_cols":
+        if joined.ndim != 3:
+            raise RuntimeError(
+                f"{key}: interleaved_gate_up_rank_major_expert_cols layout "
+                "requires 3D blocks"
+            )
+        if joined.shape[1] % 2 != 0:
+            raise RuntimeError(
+                f"{key}: interleaved gate/up layout requires an even output dim"
+            )
+        gate, up = joined.split(joined.shape[1] // 2, dim=1)
+        interleaved = torch.stack((gate, up), dim=2).flatten(1, 2)
+        return (
+            interleaved.permute(1, 2, 0)
+            .reshape(
+                interleaved.shape[1],
+                interleaved.shape[2] * interleaved.shape[0],
+            )
+            .contiguous()
+        )
     raise RuntimeError(f"Unsupported packed expert LoRA layout={first_layout!r}")
 
 

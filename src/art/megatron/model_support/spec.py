@@ -13,7 +13,11 @@ SharedExpertCompileState = Literal[
     "shared_experts",
     "shared_expert_overlap",
 ]
-ExpertPackedLoraLayout = Literal["expert_rows", "rank_major_expert_cols"]
+ExpertPackedLoraLayout = Literal[
+    "expert_rows",
+    "rank_major_expert_cols",
+    "interleaved_gate_up_rank_major_expert_cols",
+]
 
 
 class DependencyFloor(BaseModel):
