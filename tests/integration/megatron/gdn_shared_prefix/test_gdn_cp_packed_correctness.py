@@ -106,6 +106,20 @@ def test_gdn_cp_tree_fuzz_matches_cp1_oracle(tmp_path: Path) -> None:
         assert (tmp_path / f"tree_fuzz_rank_{rank}.ok").read_text() == "ok\n"
 
 
+@pytest.mark.parametrize("cp_size", (2, 4))
+def test_gdn_cp_tree_trainability_loss_decreases(cp_size: int, tmp_path: Path) -> None:
+    _skip_without_gpus(cp_size)
+    init_method = file_init_method(tmp_path, f"tree_trainability_cp{cp_size}")
+    mp.spawn(
+        _tree_trainability_worker,
+        args=(cp_size, init_method, str(tmp_path)),
+        nprocs=cp_size,
+        join=True,
+    )
+    for rank in range(cp_size):
+        assert (tmp_path / f"tree_trainability_rank_{rank}.ok").read_text() == "ok\n"
+
+
 def _cp1_oracle_worker(
     rank: int,
     cp_size: int,
@@ -229,6 +243,84 @@ def _tree_fuzz_oracle_worker(
             )
             torch.distributed.barrier()
         Path(output_dir, f"tree_fuzz_rank_{rank}.ok").write_text("ok\n")
+    finally:
+        if getattr(ps, "model_parallel_is_initialized", lambda: False)():
+            ps.destroy_model_parallel()
+        destroy_process_group()
+
+
+def _tree_trainability_worker(
+    rank: int,
+    cp_size: int,
+    init_method: str,
+    output_dir: str,
+) -> None:
+    torch.cuda.set_device(rank)
+    init_process_group(
+        backend="nccl",
+        init_method=init_method,
+        rank=rank,
+        world_size=cp_size,
+    )
+    try:
+        ps.initialize_model_parallel(
+            tensor_model_parallel_size=1,
+            pipeline_model_parallel_size=1,
+            context_parallel_size=cp_size,
+            expert_model_parallel_size=1,
+        )
+        _, cp_gdn = _make_matching_gdn_pair(cp_size=cp_size, params_dtype=torch.float32)
+        pack = _tree_chain_pack()
+        group_ids = pack.group_ids.cuda()
+        parent_ids = pack.parent_ids.cuda()
+        spec = parse_gdn_shared_prefix_segments(group_ids, parent_ids)
+        plan = build_gdn_rank_execution_plan(
+            spec,
+            device=group_ids.device,
+            cp_rank=rank,
+            cp_size=cp_size,
+            planner_config=_tree_chain_planner_config(),
+        )
+        assert any(plan.tree_chain_buckets_by_depth)
+        hidden = _tree_trainability_hidden(spec.real_token_count, cp_size=cp_size)
+        flat_hidden = hidden.transpose(0, 1).reshape(-1, hidden.shape[-1])
+        local_index = torch.tensor(
+            plan.attention_token_indices, device=hidden.device, dtype=torch.long
+        )
+        local_hidden = flat_hidden.index_select(0, local_index).unsqueeze(1)
+        optimizer = torch.optim.SGD(cp_gdn.parameters(), lr=5e-3)
+
+        initial_loss = _tree_training_loss(
+            cp_gdn,
+            local_hidden,
+            group_ids,
+            parent_ids,
+            spec,
+            plan,
+        ).detach()
+        for _ in range(3):
+            optimizer.zero_grad(set_to_none=True)
+            loss = _tree_training_loss(
+                cp_gdn,
+                local_hidden,
+                group_ids,
+                parent_ids,
+                spec,
+                plan,
+            )
+            loss.backward()
+            all_reduce_parameter_grads_coalesced(cp_gdn)
+            optimizer.step()
+        final_loss = _tree_training_loss(
+            cp_gdn,
+            local_hidden,
+            group_ids,
+            parent_ids,
+            spec,
+            plan,
+        ).detach()
+        assert final_loss < initial_loss, (initial_loss.item(), final_loss.item())
+        Path(output_dir, f"tree_trainability_rank_{rank}.ok").write_text("ok\n")
     finally:
         if getattr(ps, "model_parallel_is_initialized", lambda: False)():
             ps.destroy_model_parallel()
@@ -529,6 +621,30 @@ def _assert_cp_matches_reference(
     torch.cuda.synchronize()
 
 
+def _tree_training_loss(
+    gdn: torch.nn.Module,
+    local_hidden: torch.Tensor,
+    group_ids: torch.Tensor,
+    parent_ids: torch.Tensor,
+    spec: Any,
+    plan: Any,
+) -> torch.Tensor:
+    out, _ = run_gdn_layer(
+        gdn,
+        local_hidden,
+        group_ids=group_ids,
+        parent_ids=parent_ids,
+        execution_spec=spec,
+        execution_plan=plan,
+        cp_group=torch.distributed.group.WORLD,
+    )
+    local_sum = out.float().square().sum()
+    denom = torch.tensor(out.numel(), device=out.device, dtype=torch.float32)
+    torch.distributed.all_reduce(local_sum, op=torch.distributed.ReduceOp.SUM)
+    torch.distributed.all_reduce(denom, op=torch.distributed.ReduceOp.SUM)
+    return local_sum / denom.clamp_min(1.0)
+
+
 class _TensorGradView:
     def __init__(self, grad: torch.Tensor) -> None:
         self.grad = grad
@@ -578,6 +694,20 @@ def _tree_hidden_and_grad(
     torch.distributed.broadcast(hidden, src=0)
     torch.distributed.broadcast(grad, src=0)
     return hidden, grad
+
+
+def _tree_trainability_hidden(sequence_length: int, *, cp_size: int) -> torch.Tensor:
+    generator = torch.Generator(device="cuda").manual_seed(6262026 + cp_size)
+    hidden = torch.randn(
+        sequence_length,
+        1,
+        64,
+        device="cuda",
+        dtype=torch.float32,
+        generator=generator,
+    )
+    torch.distributed.broadcast(hidden, src=0)
+    return hidden
 
 
 def _tree_chain_pack():
