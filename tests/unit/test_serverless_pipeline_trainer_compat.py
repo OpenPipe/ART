@@ -1,4 +1,3 @@
-import sys
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -250,12 +249,6 @@ async def test_serverless_train_sft_forwards_metric_logging_config() -> None:
         def finish(self) -> None:
             pass
 
-    fake_wandb = SimpleNamespace(
-        Artifact=FakeArtifact,
-        init=MagicMock(return_value=FakeRun()),
-        Settings=lambda **kwargs: kwargs,
-    )
-
     trajectory = Trajectory(
         messages_and_choices=[
             {"role": "user", "content": "prompt"},
@@ -264,7 +257,11 @@ async def test_serverless_train_sft_forwards_metric_logging_config() -> None:
     )
 
     with patch.object(model, "_get_wandb_run", return_value=None):
-        with patch.dict(sys.modules, {"wandb": fake_wandb}):
+        with (
+            patch("art.serverless.backend.wandb_sdk.artifact", FakeArtifact),
+            patch("art.serverless.backend.wandb_sdk.init", return_value=FakeRun()),
+            patch("art.serverless.backend.wandb_sdk.settings", lambda **kwargs: kwargs),
+        ):
             with patch("art.serverless.backend.asyncio.sleep", no_sleep):
                 async for _ in backend._train_sft(
                     model,
