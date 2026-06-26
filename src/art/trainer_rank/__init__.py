@@ -281,7 +281,6 @@ class TrainerRank:
         ] = {}
         self._memory_profiles: dict[_MemorySignature, _MemoryProfile] = {}
         self._adaptive_plan_cache: dict[_AdaptivePlanCacheKey, _FlatForwardPlan] = {}
-        self._adaptive_plan_cache_top_level_ids: tuple[int, ...] = ()
         self._adaptive_estimate_cache: dict[
             _AdaptivePlanCacheKey, tuple[int, int, _MemorySignature] | None
         ] = {}
@@ -454,6 +453,8 @@ class TrainerRank:
         inputs: Iterable[ForwardInputsT],
     ) -> Iterator[MicroBatch[ForwardInputsT]]:
         items = list(inputs)
+        self._adaptive_plan_cache.clear()
+        self._adaptive_estimate_cache.clear()
         self._validate_replicated_top_level_count(len(items))
         start = 0
         while start < len(items):
@@ -704,11 +705,6 @@ class TrainerRank:
         min_width = min(dp_size, remaining)
         if min_width <= 0:
             raise RuntimeError("cannot select an empty microbatch window")
-        top_level_ids = tuple(id(item) for item in items)
-        if top_level_ids != self._adaptive_plan_cache_top_level_ids:
-            self._adaptive_plan_cache.clear()
-            self._adaptive_estimate_cache.clear()
-            self._adaptive_plan_cache_top_level_ids = top_level_ids
 
         def clamp_width(width: int) -> int:
             return max(min_width, min(width, remaining))

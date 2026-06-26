@@ -332,7 +332,7 @@ def test_forward_micro_batches_grows_small_stable_window_when_work_remains(
     assert candidate.stats_global_count == 256
 
 
-def test_forward_micro_batches_reuses_cached_candidate_plans(
+def test_forward_micro_batches_avoids_packing_rejected_candidates(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     trainer = TrainerRank(_runtime())  # type: ignore[arg-type]
@@ -370,15 +370,44 @@ def test_forward_micro_batches_reuses_cached_candidate_plans(
     monkeypatch.setattr(trainer, "_memory_check", memory_check)
     inputs = [_target_request(i) for i in range(8)]
 
+    batches = list(trainer.forward_micro_batches(inputs))
+
+    assert [batch.stats.global_count for batch in batches] == [8]
+    assert plan_calls == 1
+    assert memory_checks == 0
+
+
+def test_forward_micro_batches_replans_reused_input_list(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    trainer = TrainerRank(_runtime())  # type: ignore[arg-type]
+    monkeypatch.setattr(trainer, "_dp_rank_and_size", lambda: (0, 1))
+    monkeypatch.setattr(
+        trainer, "_all_ranks_have_memory_profile", lambda **_kwargs: True
+    )
+    original_plan = trainer._plan_flat_forward
+    plan_calls = 0
+
+    def plan(requests):
+        nonlocal plan_calls
+        plan_calls += 1
+        return original_plan(requests)
+
+    monkeypatch.setattr(trainer, "_plan_flat_forward", plan)
+    monkeypatch.setattr(
+        trainer,
+        "_run_flat_plan_with_memory_tracking",
+        lambda plan, **_kwargs: [
+            ForwardOutput(None, None, None, None) for _ in range(plan.request_count)
+        ],
+    )
+    inputs = [_target_request(1)]
+
     list(trainer.forward_micro_batches(inputs))
-    first_plan_calls = plan_calls
-    first_memory_checks = memory_checks
+    inputs[0] = _target_request(10)
     list(trainer.forward_micro_batches(inputs))
 
-    assert first_plan_calls > 0
-    assert first_plan_calls == 1
-    assert plan_calls == first_plan_calls
-    assert memory_checks == first_memory_checks == 0
+    assert plan_calls == 2
 
 
 def test_cached_adaptive_estimate_rechecks_current_memory(
