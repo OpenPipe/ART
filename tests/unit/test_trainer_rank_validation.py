@@ -85,6 +85,16 @@ def test_trainer_rank_pop_rejects_empty_adapter_stack() -> None:
         trainer.pop_pushed_lora_or_checkpoint()
 
 
+def test_trainer_rank_load_rejects_active_adapter_stack() -> None:
+    trainer = TrainerRank(_runtime())  # type: ignore[arg-type]
+    trainer._slot_stack.append(object())  # type: ignore[arg-type]
+
+    with pytest.raises(RuntimeError, match="Cannot load a LoRA/checkpoint"):
+        trainer.load_checkpoint_slot("teacher", {})
+    with pytest.raises(RuntimeError, match="Cannot load a LoRA/checkpoint"):
+        trainer.load_lora_slot("teacher", {})
+
+
 def test_dp_rank_forward_preserves_nested_shape_for_inactive_requests() -> None:
     trainer = TrainerRank(_runtime())  # type: ignore[arg-type]
     request_a = ForwardInput(input_tokens=torch.tensor([1]))

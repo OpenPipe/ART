@@ -364,6 +364,8 @@ class TrainerRank:
         trainable: bool,
         alpha: float | None,
     ) -> int:
+        if self._slot_stack:
+            raise RuntimeError("Cannot load a LoRA/checkpoint while a slot is pushed")
         from art.megatron.lora import LORA_ALPHA, load_lora_slot_into_model
 
         return load_lora_slot_into_model(
@@ -1352,12 +1354,15 @@ class TrainerRank:
                     dtype=torch.float32,
                 )
                 if item.request.top_k is None and not item.request.logits:
-                    valid = labels != -100
-                    if labels.ndim > 1:
-                        valid = valid.reshape(int(labels.shape[0]), -1).any(dim=1)
-                    valid_offsets = torch.nonzero(valid, as_tuple=False).reshape(-1)
-                    if int(valid_offsets.numel()):
-                        projected_rows.append(positions.index_select(0, valid_offsets))
+                    if int(labels.shape[0]):
+                        valid = labels != -100
+                        if labels.ndim > 1:
+                            valid = valid.reshape(int(labels.shape[0]), -1).any(dim=1)
+                        valid_offsets = torch.nonzero(valid, as_tuple=False).reshape(-1)
+                        if int(valid_offsets.numel()):
+                            projected_rows.append(
+                                positions.index_select(0, valid_offsets)
+                            )
             if item.request.logits:
                 logits[index] = torch.empty(
                     (int(positions.numel()), _padded_vocab_size(model)),
