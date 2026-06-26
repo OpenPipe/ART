@@ -138,6 +138,14 @@ class MicroBatchStats:
     cold_start: bool
 
 
+class TrainerRankMemoryError(RuntimeError):
+    pass
+
+
+class TrainerRankSlotStateError(RuntimeError):
+    pass
+
+
 @dataclass(frozen=True)
 class _MemoryCheck:
     estimated_required_bytes: int
@@ -160,14 +168,6 @@ class _CandidateMicroBatch(Generic[ForwardInputsT]):
     stats_global_count: int
     rejected_candidates: int
     cold_start: bool
-
-
-class TrainerRankMemoryError(RuntimeError):
-    pass
-
-
-class TrainerRankSlotStateError(RuntimeError):
-    pass
 
 
 @dataclass
@@ -318,12 +318,6 @@ class TrainerRank:
                 param.grad = None
         self._pending_slot_graphs.clear()
 
-    def _optimizer(self) -> "MegatronOptimizer":
-        optimizer = cast("MegatronOptimizer | None", self.runtime.optimizer)
-        if optimizer is None:
-            raise RuntimeError("TrainerRank requires a runtime with an optimizer")
-        return optimizer
-
     def set_checkpoint(self, name: str | None) -> None:
         self._set_default_slot(self._slot_ref("checkpoint", name))
 
@@ -373,103 +367,6 @@ class TrainerRank:
         )
         self._validate_dynamic_slot_consistency("lora", name, loaded)
         return loaded
-
-    def _load_slot(
-        self,
-        kind: Literal["checkpoint", "lora"],
-        name: str,
-        adapter_model: dict[str, torch.Tensor],
-        *,
-        trainable: bool,
-        alpha: float | None,
-    ) -> int:
-        if self._slot_stack:
-            raise RuntimeError("Cannot load a LoRA/checkpoint while a slot is pushed")
-        from art.megatron.lora import LORA_ALPHA, load_lora_slot_into_model
-
-        ref = self._slot_ref(kind, name)
-        self._guard_slot_can_load(ref)
-        return load_lora_slot_into_model(
-            self.runtime.model,
-            ref,
-            adapter_model,
-            alpha=LORA_ALPHA if alpha is None else alpha,
-            requires_grad=trainable,
-        )
-
-    def _set_default_slot(self, ref: "LoRASlotRef") -> None:
-        if self._slot_stack:
-            raise RuntimeError("Cannot set a LoRA/checkpoint while a slot is pushed")
-        self._default_slot_ref = ref
-
-    @staticmethod
-    def _slot_ref(
-        kind: Literal["checkpoint", "lora"], name: str | None
-    ) -> "LoRASlotRef":
-        from art.megatron.lora import LoRASlotRef
-
-        return LoRASlotRef(kind=kind, name=name)
-
-    def _validate_dynamic_slot_consistency(
-        self,
-        kind: Literal["checkpoint", "lora"],
-        name: str,
-        loaded_sites: int,
-    ) -> tuple[torch.nn.Parameter, ...]:
-        from art.megatron.lora import iter_lora_slot_parameters
-
-        ref = self._slot_ref(kind, name)
-        params = tuple(iter_lora_slot_parameters(self.runtime.model, ref))
-        if not (dist.is_available() and dist.is_initialized()):
-            return params
-
-        local = {
-            "rank": dist.get_rank(),
-            "loaded_sites": int(loaded_sites),
-            "param_count": len(params),
-            "numel": sum(int(param.numel()) for param in params),
-            "signature": [
-                (
-                    tuple(int(dim) for dim in param.shape),
-                    str(param.dtype),
-                    bool(getattr(param, "allreduce", True)),
-                    str(getattr(param, "grad_sync_domain", "tp_default")),
-                    str(getattr(param, "grad_sync_op", "none")),
-                )
-                for param in params
-            ],
-        }
-        gathered: list[dict[str, object] | None] = [None] * dist.get_world_size()
-        dist.all_gather_object(gathered, local)
-        ranks = [rank for rank in gathered if rank is not None]
-        reference = ranks[0]
-        if all(
-            rank["loaded_sites"] == reference["loaded_sites"]
-            and rank["signature"] == reference["signature"]
-            for rank in ranks
-        ):
-            return params
-
-        summary = [
-            {key: rank[key] for key in ("rank", "loaded_sites", "param_count", "numel")}
-            for rank in ranks
-        ]
-        raise RuntimeError(
-            f"Dynamic LoRA slot {kind}:{name} is not loaded consistently across "
-            "distributed ranks. This usually means a sharded/exported LoRA state "
-            "dict was passed directly to TrainerRank; gather or materialize the "
-            "full adapter state before loading a dynamic slot. "
-            f"Rank summary: {summary}."
-        )
-
-    def _resolve_slot_ref(self, request: AnyForwardInput) -> "LoRASlotRef | None":
-        if request.checkpoint is not Unset:
-            return self._slot_ref("checkpoint", cast(str | None, request.checkpoint))
-        if request.lora is not Unset:
-            return self._slot_ref("lora", cast(str | None, request.lora))
-        if self._slot_stack:
-            return self._slot_stack[-1]
-        return self._default_slot_ref
 
     def forward_micro_batches(
         self,
@@ -601,6 +498,109 @@ class TrainerRank:
             "update_successful": float(bool(update_successful)),
             "num_zeros_in_grad": float(num_zeros or 0),
         }
+
+    def _optimizer(self) -> "MegatronOptimizer":
+        optimizer = cast("MegatronOptimizer | None", self.runtime.optimizer)
+        if optimizer is None:
+            raise RuntimeError("TrainerRank requires a runtime with an optimizer")
+        return optimizer
+
+    def _load_slot(
+        self,
+        kind: Literal["checkpoint", "lora"],
+        name: str,
+        adapter_model: dict[str, torch.Tensor],
+        *,
+        trainable: bool,
+        alpha: float | None,
+    ) -> int:
+        if self._slot_stack:
+            raise RuntimeError("Cannot load a LoRA/checkpoint while a slot is pushed")
+        from art.megatron.lora import LORA_ALPHA, load_lora_slot_into_model
+
+        ref = self._slot_ref(kind, name)
+        self._guard_slot_can_load(ref)
+        return load_lora_slot_into_model(
+            self.runtime.model,
+            ref,
+            adapter_model,
+            alpha=LORA_ALPHA if alpha is None else alpha,
+            requires_grad=trainable,
+        )
+
+    def _set_default_slot(self, ref: "LoRASlotRef") -> None:
+        if self._slot_stack:
+            raise RuntimeError("Cannot set a LoRA/checkpoint while a slot is pushed")
+        self._default_slot_ref = ref
+
+    @staticmethod
+    def _slot_ref(
+        kind: Literal["checkpoint", "lora"], name: str | None
+    ) -> "LoRASlotRef":
+        from art.megatron.lora import LoRASlotRef
+
+        return LoRASlotRef(kind=kind, name=name)
+
+    def _validate_dynamic_slot_consistency(
+        self,
+        kind: Literal["checkpoint", "lora"],
+        name: str,
+        loaded_sites: int,
+    ) -> tuple[torch.nn.Parameter, ...]:
+        from art.megatron.lora import iter_lora_slot_parameters
+
+        ref = self._slot_ref(kind, name)
+        params = tuple(iter_lora_slot_parameters(self.runtime.model, ref))
+        if not (dist.is_available() and dist.is_initialized()):
+            return params
+
+        local = {
+            "rank": dist.get_rank(),
+            "loaded_sites": int(loaded_sites),
+            "param_count": len(params),
+            "numel": sum(int(param.numel()) for param in params),
+            "signature": [
+                (
+                    tuple(int(dim) for dim in param.shape),
+                    str(param.dtype),
+                    bool(getattr(param, "allreduce", True)),
+                    str(getattr(param, "grad_sync_domain", "tp_default")),
+                    str(getattr(param, "grad_sync_op", "none")),
+                )
+                for param in params
+            ],
+        }
+        gathered: list[dict[str, object] | None] = [None] * dist.get_world_size()
+        dist.all_gather_object(gathered, local)
+        ranks = [rank for rank in gathered if rank is not None]
+        reference = ranks[0]
+        if all(
+            rank["loaded_sites"] == reference["loaded_sites"]
+            and rank["signature"] == reference["signature"]
+            for rank in ranks
+        ):
+            return params
+
+        summary = [
+            {key: rank[key] for key in ("rank", "loaded_sites", "param_count", "numel")}
+            for rank in ranks
+        ]
+        raise RuntimeError(
+            f"Dynamic LoRA slot {kind}:{name} is not loaded consistently across "
+            "distributed ranks. This usually means a sharded/exported LoRA state "
+            "dict was passed directly to TrainerRank; gather or materialize the "
+            "full adapter state before loading a dynamic slot. "
+            f"Rank summary: {summary}."
+        )
+
+    def _resolve_slot_ref(self, request: AnyForwardInput) -> "LoRASlotRef | None":
+        if request.checkpoint is not Unset:
+            return self._slot_ref("checkpoint", cast(str | None, request.checkpoint))
+        if request.lora is not Unset:
+            return self._slot_ref("lora", cast(str | None, request.lora))
+        if self._slot_stack:
+            return self._slot_stack[-1]
+        return self._default_slot_ref
 
     def _selected_dynamic_checkpoints(
         self,
