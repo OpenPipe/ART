@@ -270,7 +270,7 @@ def _tree_trainability_worker(
             expert_model_parallel_size=1,
         )
         _, cp_gdn = _make_matching_gdn_pair(cp_size=cp_size, params_dtype=torch.float32)
-        pack = _tree_chain_pack()
+        pack = _tree_trainability_pack()
         group_ids = pack.group_ids.cuda()
         parent_ids = pack.parent_ids.cuda()
         spec = parse_gdn_shared_prefix_segments(group_ids, parent_ids)
@@ -290,35 +290,34 @@ def _tree_trainability_worker(
         local_hidden = flat_hidden.index_select(0, local_index).unsqueeze(1)
         optimizer = torch.optim.SGD(cp_gdn.parameters(), lr=5e-3)
 
-        initial_loss = _tree_training_loss(
+        initial_loss = _tree_training_loss_value(
             cp_gdn,
             local_hidden,
             group_ids,
             parent_ids,
             spec,
             plan,
-        ).detach()
-        for _ in range(3):
-            optimizer.zero_grad(set_to_none=True)
-            loss = _tree_training_loss(
-                cp_gdn,
-                local_hidden,
-                group_ids,
-                parent_ids,
-                spec,
-                plan,
-            )
-            loss.backward()
-            all_reduce_parameter_grads_coalesced(cp_gdn)
-            optimizer.step()
-        final_loss = _tree_training_loss(
+        )
+        optimizer.zero_grad(set_to_none=True)
+        loss = _tree_training_local_loss(
             cp_gdn,
             local_hidden,
             group_ids,
             parent_ids,
             spec,
             plan,
-        ).detach()
+        )
+        loss.backward()
+        all_reduce_parameter_grads_coalesced(cp_gdn)
+        optimizer.step()
+        final_loss = _tree_training_loss_value(
+            cp_gdn,
+            local_hidden,
+            group_ids,
+            parent_ids,
+            spec,
+            plan,
+        )
         assert final_loss < initial_loss, (initial_loss.item(), final_loss.item())
         Path(output_dir, f"tree_trainability_rank_{rank}.ok").write_text("ok\n")
     finally:
@@ -621,7 +620,28 @@ def _assert_cp_matches_reference(
     torch.cuda.synchronize()
 
 
-def _tree_training_loss(
+def _tree_training_local_loss(
+    gdn: torch.nn.Module,
+    local_hidden: torch.Tensor,
+    group_ids: torch.Tensor,
+    parent_ids: torch.Tensor,
+    spec: Any,
+    plan: Any,
+) -> torch.Tensor:
+    out, _ = run_gdn_layer(
+        gdn,
+        local_hidden,
+        group_ids=group_ids,
+        parent_ids=parent_ids,
+        execution_spec=spec,
+        execution_plan=plan,
+        cp_group=torch.distributed.group.WORLD,
+    )
+    return out.float().square().mean()
+
+
+@torch.no_grad()
+def _tree_training_loss_value(
     gdn: torch.nn.Module,
     local_hidden: torch.Tensor,
     group_ids: torch.Tensor,
@@ -639,10 +659,10 @@ def _tree_training_loss(
         cp_group=torch.distributed.group.WORLD,
     )
     local_sum = out.float().square().sum()
-    denom = torch.tensor(out.numel(), device=out.device, dtype=torch.float32)
+    denominator = torch.tensor(out.numel(), device=out.device, dtype=torch.float32)
     torch.distributed.all_reduce(local_sum, op=torch.distributed.ReduceOp.SUM)
-    torch.distributed.all_reduce(denom, op=torch.distributed.ReduceOp.SUM)
-    return local_sum / denom.clamp_min(1.0)
+    torch.distributed.all_reduce(denominator, op=torch.distributed.ReduceOp.SUM)
+    return local_sum / denominator.clamp_min(1.0)
 
 
 class _TensorGradView:
@@ -708,6 +728,20 @@ def _tree_trainability_hidden(sequence_length: int, *, cp_size: int) -> torch.Te
     )
     torch.distributed.broadcast(hidden, src=0)
     return hidden
+
+
+def _tree_trainability_pack():
+    root = torch.arange(11, 107)
+    mid = torch.arange(1001, 1161)
+    sibling = torch.arange(2001, 2081)
+    return pack_shared_prefixes(
+        (
+            torch.cat((root, mid, torch.tensor([301, 302]))),
+            torch.cat((root, mid, torch.tensor([303, 304, 305]))),
+            torch.cat((root, sibling, torch.tensor([401]))),
+        ),
+        max_depth=2,
+    )
 
 
 def _tree_chain_pack():
