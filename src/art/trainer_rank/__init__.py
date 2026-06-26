@@ -655,7 +655,7 @@ class TrainerRank:
             optimizer = self._dynamic_optimizer(name, params)
             optimizer.step()
             optimizer.zero_grad(set_to_none=True)
-            self._pending_slot_graphs.pop(self._slot_ref("checkpoint", name), None)
+            self._slot_graphs().pop(self._slot_ref("checkpoint", name), None)
         return {
             "learning_rate": float(params.learning_rate),
             "grad_norm": float(grad_norm),
@@ -1079,7 +1079,8 @@ class TrainerRank:
         if not tensors:
             return
 
-        self._pending_slot_graphs[ref] = self._pending_slot_graphs.get(ref, 0) + 1
+        graphs = self._slot_graphs()
+        graphs[ref] = graphs.get(ref, 0) + 1
         lease = _SlotGraphLease(self, ref)
 
         def release(grad: torch.Tensor) -> torch.Tensor:
@@ -1090,14 +1091,22 @@ class TrainerRank:
             tensor.register_hook(release)
 
     def _release_slot_graph(self, ref: "LoRASlotRef") -> None:
-        count = self._pending_slot_graphs.get(ref, 0)
+        graphs = self._slot_graphs()
+        count = graphs.get(ref, 0)
         if count <= 1:
-            self._pending_slot_graphs.pop(ref, None)
+            graphs.pop(ref, None)
         else:
-            self._pending_slot_graphs[ref] = count - 1
+            graphs[ref] = count - 1
+
+    def _slot_graphs(self) -> dict["LoRASlotRef", int]:
+        graphs = getattr(self, "_pending_slot_graphs", None)
+        if graphs is None:
+            graphs = {}
+            self._pending_slot_graphs = graphs
+        return graphs
 
     def _guard_slot_can_load(self, ref: "LoRASlotRef") -> None:
-        if self._pending_slot_graphs.get(ref, 0) <= 0:
+        if self._slot_graphs().get(ref, 0) <= 0:
             return
         raise TrainerRankSlotStateError(
             f"Cannot load {ref.kind} slot {ref.name!r} while outputs from an "
@@ -1111,7 +1120,7 @@ class TrainerRank:
 
     def _guard_checkpoint_can_step(self, name: str) -> None:
         ref = self._slot_ref("checkpoint", name)
-        if self._pending_slot_graphs.get(ref, 0) <= 0:
+        if self._slot_graphs().get(ref, 0) <= 0:
             return
         raise TrainerRankSlotStateError(
             f"Cannot optim_step checkpoint slot {name!r} while outputs from an "

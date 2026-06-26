@@ -136,6 +136,15 @@ def test_trainer_rank_step_rejects_pending_checkpoint_graph(
     trainer._guard_checkpoint_can_step("student")
 
 
+def test_trainer_rank_step_allows_missing_slot_graph_bookkeeping(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    trainer = TrainerRank.__new__(TrainerRank)
+    monkeypatch.setattr(trainer, "_slot_ref", lambda kind, name: _SlotRef(kind, name))
+
+    trainer._guard_checkpoint_can_step("student")
+
+
 def test_trainer_rank_zero_grad_clears_abandoned_slot_graphs() -> None:
     trainer = TrainerRank(_runtime())  # type: ignore[arg-type]
     ref = _SlotRef("lora", "teacher")
