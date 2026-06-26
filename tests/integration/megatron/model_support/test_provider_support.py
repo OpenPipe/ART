@@ -33,6 +33,7 @@ class _FakeProvider:
         self.recompute_num_layers: int | None = None
         self.expert_model_parallel_size = 1
         self.expert_tensor_parallel_size = 1
+        self.window_size: tuple[int, int] | int | None = None
 
     def _base_layer_spec(
         self, config: object, vp_stage: int | None = None
@@ -190,6 +191,7 @@ def test_gpt_oss_provider_uses_art_cp_attention(
 ) -> None:
     provider = _FakeProvider()
     provider.num_moe_experts = 128
+    provider.window_size = (128, 0)
     fake_bridge = _FakeBridge(
         model_bridge=object(),
         provider=provider,
