@@ -304,7 +304,7 @@ def _tensorize_moe_routes(
         torch.tensor(route_masks, dtype=torch.bool),
         num_layers,
         topk,
-        max_expert_id + 1,
+        max(topk, max_expert_id + 1),
     )
 
 
