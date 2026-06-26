@@ -34,6 +34,8 @@ def build_block_mask(
     *,
     group_ids: torch.Tensor,
     parent_ids: torch.Tensor,
+    input_pos: torch.Tensor | None = None,
+    sliding_window: int | None = None,
     device: torch.device,
 ) -> BlockMask | None:
     return build_block_mask_from_context(
@@ -41,7 +43,9 @@ def build_block_mask(
         context=prepare_block_mask_context(
             group_ids=group_ids,
             parent_ids=parent_ids,
+            input_pos=input_pos,
         ),
+        sliding_window=sliding_window,
         device=device,
     )
 
@@ -278,12 +282,54 @@ def test_shared_prefix_state_builds_batched_block_mask() -> None:
     assert int(state.block_mask.kv_num_blocks.shape[0]) == 2
     for row_index, row_spec in enumerate(spec.rows):
         valid_tokens = int(row_spec.valid_tokens)
-        assert actual[
-            row_index,
-            :valid_tokens,
-            :valid_tokens,
-        ].equal(build_dense_reference_mask(row_spec=row_spec))
+        expected = torch.zeros((seq_len, seq_len), dtype=torch.bool)
+        expected[:valid_tokens, :valid_tokens] = build_dense_reference_mask(
+            row_spec=row_spec
+        )
+        if valid_tokens < seq_len:
+            padding_len = seq_len - valid_tokens
+            expected[valid_tokens:, valid_tokens:] = torch.tril(
+                torch.ones((padding_len, padding_len), dtype=torch.bool)
+            )
+        assert actual[row_index].equal(expected)
     _assert_matches_torch_block_mask(state.block_mask, batch_size=2)
+
+
+def test_sparse_block_mask_matches_torch_for_sliding_window_metadata() -> None:
+    seq_len = 128
+    group_ids = torch.ones(seq_len, dtype=torch.long)
+    parent_ids = torch.ones(seq_len, dtype=torch.long)
+    input_pos = torch.arange(seq_len, dtype=torch.long)
+    block_mask = build_block_mask(
+        FlexMaskSpec(
+            q_len=seq_len,
+            k_len=seq_len,
+            block_size=(8, 8),
+            slices=(
+                AttnSlice(
+                    q_range=TokenRange(start=0, end=seq_len),
+                    k_range=TokenRange(start=0, end=seq_len),
+                    mask_kind=AttnMaskKind.CAUSAL,
+                    row_index=0,
+                ),
+            ),
+            exact_mask=ExactMaskMetadata(
+                q_token_indices=torch.arange(seq_len, dtype=torch.long),
+                k_token_indices=torch.arange(seq_len, dtype=torch.long),
+                cache_key="sliding-window",
+            ),
+        ),
+        group_ids=group_ids,
+        parent_ids=parent_ids,
+        input_pos=input_pos,
+        sliding_window=8,
+        device=torch.device("cpu"),
+    )
+
+    assert block_mask is not None
+    _assert_matches_torch_block_mask(block_mask)
+    full_causal_blocks = (seq_len // 8) * (seq_len // 8 + 1) // 2
+    assert int(block_mask.kv_num_blocks.sum().item()) < full_causal_blocks
 
 
 def test_context_parallel_stage_masks_match_dense_nested_tree() -> None:
