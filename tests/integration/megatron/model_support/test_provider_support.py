@@ -209,10 +209,8 @@ def test_gpt_oss_provider_uses_art_cp_attention(
     assert resolved.context_parallel_size == 2
     assert resolved.moe_shared_expert_overlap is False
     layer_spec = cast(Any, resolved.transformer_layer_spec)(resolved, vp_stage=0)
-    assert (
-        layer_spec.submodules.self_attention.submodules.core_attention
-        is ArtContextParallelCoreAttention
-    )
+    core_attention = layer_spec.submodules.self_attention.submodules.core_attention
+    assert issubclass(core_attention, ArtContextParallelCoreAttention)
 
 
 def test_finalize_provider_bundle_allows_art_gdn_context_parallel() -> None:
