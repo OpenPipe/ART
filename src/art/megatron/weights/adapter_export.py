@@ -178,23 +178,36 @@ def add_standard_self_attention_adapter_weights(
     linear_qkv = getattr(self_attention, "linear_qkv", None)
     if isinstance(linear_qkv, SelfAttentionLinearQKVLoRA):
         base_prefix = f"{layer_prefix}.self_attention.linear_qkv"
-        adapter_weights_by_base[f"{base_prefix}.weight"] = [
-            _simple_adapter_weight(
-                base_prefix,
-                linear_qkv.q_proj_lora,
-                adapter_key="adapter_q",
-            ),
-            _simple_adapter_weight(
-                base_prefix,
-                linear_qkv.k_proj_lora,
-                adapter_key="adapter_k",
-            ),
-            _simple_adapter_weight(
-                base_prefix,
-                linear_qkv.v_proj_lora,
-                adapter_key="adapter_v",
-            ),
-        ]
+        adapter_weights = []
+        q_proj_lora = getattr(linear_qkv, "q_proj_lora", None)
+        k_proj_lora = getattr(linear_qkv, "k_proj_lora", None)
+        v_proj_lora = getattr(linear_qkv, "v_proj_lora", None)
+        if q_proj_lora is not None:
+            adapter_weights.append(
+                _simple_adapter_weight(
+                    base_prefix,
+                    q_proj_lora,
+                    adapter_key="adapter_q",
+                )
+            )
+        if k_proj_lora is not None:
+            adapter_weights.append(
+                _simple_adapter_weight(
+                    base_prefix,
+                    k_proj_lora,
+                    adapter_key="adapter_k",
+                )
+            )
+        if v_proj_lora is not None:
+            adapter_weights.append(
+                _simple_adapter_weight(
+                    base_prefix,
+                    v_proj_lora,
+                    adapter_key="adapter_v",
+                )
+            )
+        if adapter_weights:
+            adapter_weights_by_base[f"{base_prefix}.weight"] = adapter_weights
 
 
 def add_gated_delta_net_adapter_weights(

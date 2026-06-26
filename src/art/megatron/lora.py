@@ -911,6 +911,7 @@ class SelfAttentionLinearQKVLoRA(torch.nn.Module):
         rank: int,
         alpha: float,
         provider: GPTModelProvider,
+        target_modules: set[str],
     ) -> None:
         super().__init__()
         self.provider = provider
@@ -950,6 +951,8 @@ class SelfAttentionLinearQKVLoRA(torch.nn.Module):
         assert q_and_gate_out_features_per_rank == expected_q_out_features_per_rank, (
             "Unexpected per-rank QKV packing for this attention layout"
         )
+        self.q_and_gate_out_features_per_rank = q_and_gate_out_features_per_rank
+        self.kv_out_features_per_rank = kv_out_features_per_rank
         self.num_query_groups_per_partition = (
             self.provider.num_query_groups // tp_world_size
         )
@@ -957,26 +960,38 @@ class SelfAttentionLinearQKVLoRA(torch.nn.Module):
             self.provider.num_attention_heads // self.provider.num_query_groups
         )
         self.hidden_size_per_attention_head = self.provider.kv_channels
-        self.q_proj_lora = self._build_qkv_lora(
-            adapter_model_prefix=f"{adapter_model_prefix}.q_proj",
-            linear_qkv=linear_qkv,
-            rank=rank,
-            alpha=alpha,
-            out_features=q_and_gate_out_features_per_rank,
+        self.q_proj_lora = (
+            self._build_qkv_lora(
+                adapter_model_prefix=f"{adapter_model_prefix}.q_proj",
+                linear_qkv=linear_qkv,
+                rank=rank,
+                alpha=alpha,
+                out_features=q_and_gate_out_features_per_rank,
+            )
+            if _targets_include(target_modules, "q_proj")
+            else None
         )
-        self.k_proj_lora = self._build_qkv_lora(
-            adapter_model_prefix=f"{adapter_model_prefix}.k_proj",
-            linear_qkv=linear_qkv,
-            rank=rank,
-            alpha=alpha,
-            out_features=kv_out_features_per_rank,
+        self.k_proj_lora = (
+            self._build_qkv_lora(
+                adapter_model_prefix=f"{adapter_model_prefix}.k_proj",
+                linear_qkv=linear_qkv,
+                rank=rank,
+                alpha=alpha,
+                out_features=kv_out_features_per_rank,
+            )
+            if _targets_include(target_modules, "k_proj")
+            else None
         )
-        self.v_proj_lora = self._build_qkv_lora(
-            adapter_model_prefix=f"{adapter_model_prefix}.v_proj",
-            linear_qkv=linear_qkv,
-            rank=rank,
-            alpha=alpha,
-            out_features=kv_out_features_per_rank,
+        self.v_proj_lora = (
+            self._build_qkv_lora(
+                adapter_model_prefix=f"{adapter_model_prefix}.v_proj",
+                linear_qkv=linear_qkv,
+                rank=rank,
+                alpha=alpha,
+                out_features=kv_out_features_per_rank,
+            )
+            if _targets_include(target_modules, "v_proj")
+            else None
         )
 
     @staticmethod
@@ -1017,6 +1032,18 @@ class SelfAttentionLinearQKVLoRA(torch.nn.Module):
             allreduce=True,
         )
 
+    def _qkv_lora_output(
+        self,
+        lora: LoRA | None,
+        layernorm_output: torch.Tensor,
+        out_features: int,
+    ) -> torch.Tensor:
+        if lora is not None:
+            return lora(layernorm_output)
+        return layernorm_output.new_zeros(
+            (*layernorm_output.shape[:-1], out_features),
+        )
+
     def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor | None]:
         (
             linear_output_and_layernorm_output,
@@ -1027,9 +1054,21 @@ class SelfAttentionLinearQKVLoRA(torch.nn.Module):
         assert isinstance(layernorm_output, torch.Tensor)
         assert isinstance(bias, (torch.Tensor, type(None)))
 
-        query_and_gate = self.q_proj_lora(layernorm_output)
-        key = self.k_proj_lora(layernorm_output)
-        value = self.v_proj_lora(layernorm_output)
+        query_and_gate = self._qkv_lora_output(
+            self.q_proj_lora,
+            layernorm_output,
+            self.q_and_gate_out_features_per_rank,
+        )
+        key = self._qkv_lora_output(
+            self.k_proj_lora,
+            layernorm_output,
+            self.kv_out_features_per_rank,
+        )
+        value = self._qkv_lora_output(
+            self.v_proj_lora,
+            layernorm_output,
+            self.kv_out_features_per_rank,
+        )
         query_and_gate_5d = query_and_gate.reshape(
             query_and_gate.shape[0],
             query_and_gate.shape[1],
@@ -1521,6 +1560,7 @@ def wrap_standard_self_attention(
             rank=rank,
             alpha=alpha,
             provider=provider,
+            target_modules=target_modules,
         )
 
 
