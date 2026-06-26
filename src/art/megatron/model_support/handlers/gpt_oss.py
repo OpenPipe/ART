@@ -260,7 +260,7 @@ def _gpt_oss_sliding_window(provider: Any) -> int:
         left, right = (int(window_size[0]), int(window_size[1]))
         if right != 0:
             raise RuntimeError(f"Unsupported GPT OSS right window: {window_size}")
-        return left
+        return left + 1
     return int(window_size)
 
 
