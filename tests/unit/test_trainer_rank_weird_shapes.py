@@ -188,7 +188,9 @@ def test_forward_micro_batches_preserves_nested_vineppo_groups(
     monkeypatch.setattr(
         rank,
         "_memory_check",
-        lambda plan: _MemoryCheck(plan.packed_tokens, 10_000, True),
+        lambda plan, *, sync_across_dp=False: _MemoryCheck(
+            plan.packed_tokens, 10_000, True
+        ),
     )
     monkeypatch.setattr(
         rank,
@@ -247,7 +249,7 @@ def test_adaptive_planner_materializes_only_final_large_candidate(
     def required_memory(**kwargs):
         return kwargs["packed_tokens"]
 
-    def check(required):
+    def check(required, *, sync_across_dp=False):
         return _MemoryCheck(
             estimated_required_bytes=required,
             available_bytes=limit_packed_tokens,
@@ -284,7 +286,7 @@ def test_adaptive_planner_reuses_large_stable_window(
     monkeypatch.setattr(
         rank,
         "_memory_check_required",
-        lambda required: _MemoryCheck(
+        lambda required, *, sync_across_dp=False: _MemoryCheck(
             estimated_required_bytes=required,
             available_bytes=700,
             fits=required <= 700,
@@ -325,7 +327,7 @@ def test_forward_micro_batches_shrinks_when_memory_budget_drops(
     def required_memory(**kwargs):
         return kwargs["packed_tokens"]
 
-    def check(required):
+    def check(required, *, sync_across_dp=False):
         limit = available["packed_tokens"]
         return _MemoryCheck(
             estimated_required_bytes=required,
@@ -427,7 +429,7 @@ def test_dp_rank_forward_raises_before_expected_oom(
     monkeypatch.setattr(
         rank,
         "_memory_check",
-        lambda plan: _MemoryCheck(
+        lambda plan, *, sync_across_dp=False: _MemoryCheck(
             estimated_required_bytes=plan.output_bytes + 1,
             available_bytes=plan.output_bytes,
             fits=False,
@@ -453,7 +455,7 @@ def test_memory_error_includes_actionable_shape_context(
     monkeypatch.setattr(
         rank,
         "_memory_check_required",
-        lambda required: _MemoryCheck(required, 1, False),
+        lambda required, *, sync_across_dp=False: _MemoryCheck(required, 1, False),
     )
 
     with pytest.raises(TrainerRankMemoryError) as exc_info:

@@ -121,6 +121,39 @@ def test_forward_micro_batches_uses_deterministic_dp_windows(
     assert [len(batch.outputs) for batch in batches] == [1, 1, 0]
 
 
+def test_forward_micro_batches_syncs_fit_decision_across_dp(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    trainer = TrainerRank(_runtime())  # type: ignore[arg-type]
+    monkeypatch.setattr(trainer, "_dp_rank_and_size", lambda: (1, 2))
+    monkeypatch.setattr(
+        trainer, "_all_ranks_have_memory_profile", lambda **_kwargs: True
+    )
+    sync_flags: list[bool] = []
+
+    def memory_check(required: int, *, sync_across_dp: bool = False) -> _MemoryCheck:
+        sync_flags.append(sync_across_dp)
+        return _MemoryCheck(
+            estimated_required_bytes=required,
+            available_bytes=1 << 30,
+            fits=True,
+        )
+
+    monkeypatch.setattr(trainer, "_memory_check_required", memory_check)
+    monkeypatch.setattr(
+        trainer,
+        "_run_flat_plan_with_memory_tracking",
+        lambda plan, **_kwargs: [
+            ForwardOutput(None, None, None, None) for _ in range(plan.request_count)
+        ],
+    )
+
+    next(iter(trainer.forward_micro_batches([_target_request(i) for i in range(6)])))
+
+    assert sync_flags
+    assert all(sync_flags)
+
+
 def test_forward_micro_batches_outputs_match_top_level_nested_inputs(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -200,7 +233,8 @@ def test_forward_micro_batches_shrinks_to_largest_fitting_window(
     def required_memory(**kwargs):
         return kwargs["packed_tokens"]
 
-    def memory_check(required):
+    def memory_check(required, *, sync_across_dp=False):
+        assert sync_across_dp
         return _MemoryCheck(
             estimated_required_bytes=required,
             available_bytes=6,
@@ -244,7 +278,7 @@ def test_forward_micro_batches_tail_does_not_reset_stable_window(
     monkeypatch.setattr(
         trainer,
         "_memory_check_required",
-        lambda required: _MemoryCheck(
+        lambda required, *, sync_across_dp=False: _MemoryCheck(
             estimated_required_bytes=required,
             available_bytes=128,
             fits=required <= 128,
@@ -283,7 +317,7 @@ def test_forward_micro_batches_grows_small_stable_window_when_work_remains(
     monkeypatch.setattr(
         trainer,
         "_memory_check_required",
-        lambda required: _MemoryCheck(
+        lambda required, *, sync_across_dp=False: _MemoryCheck(
             estimated_required_bytes=required,
             available_bytes=512,
             fits=required <= 512,
@@ -322,7 +356,8 @@ def test_forward_micro_batches_reuses_cached_candidate_plans(
         plan_calls += 1
         return original_plan(requests)
 
-    def memory_check(plan):
+    def memory_check(plan, *, sync_across_dp=False):
+        assert sync_across_dp
         nonlocal memory_checks
         memory_checks += 1
         return _MemoryCheck(
@@ -359,7 +394,7 @@ def test_forward_micro_batches_raises_when_smallest_batch_will_not_fit(
     monkeypatch.setattr(
         trainer,
         "_memory_check_required",
-        lambda required: _MemoryCheck(
+        lambda required, *, sync_across_dp=False: _MemoryCheck(
             estimated_required_bytes=required,
             available_bytes=3,
             fits=False,

@@ -745,7 +745,7 @@ class TrainerRank:
                 inputs=local_inputs,
                 indices=indices,
                 plan=plan,
-                check=estimated_check or self._memory_check(plan),
+                check=estimated_check or self._memory_check(plan, sync_across_dp=True),
                 stats_global_count=width,
                 rejected_candidates=rejected,
                 cold_start=not self._all_ranks_have_memory_profile(
@@ -873,7 +873,8 @@ class TrainerRank:
                         packed_tokens=packed_tokens,
                         output_bytes=output_bytes,
                         signature=signature,
-                    )
+                    ),
+                    sync_across_dp=True,
                 ),
                 self._all_ranks_have_memory_profile(
                     packed_tokens=packed_tokens,
@@ -1093,19 +1094,27 @@ class TrainerRank:
     def _memory_check(
         self,
         forward: _FlatForwardPlan,
+        *,
+        sync_across_dp: bool = False,
     ) -> _MemoryCheck:
         return self._memory_check_required(
             self._estimate_required_memory_bytes_from_values(
                 packed_tokens=forward.packed_tokens,
                 output_bytes=forward.output_bytes,
                 signature=forward.signature,
-            )
+            ),
+            sync_across_dp=sync_across_dp,
         )
 
-    def _memory_check_required(self, required: int) -> _MemoryCheck:
+    def _memory_check_required(
+        self,
+        required: int,
+        *,
+        sync_across_dp: bool = False,
+    ) -> _MemoryCheck:
         available = self._available_memory_bytes()
         if dist.is_available() and dist.is_initialized():
-            group = self._forward_memory_group()
+            group = None if sync_across_dp else self._forward_memory_group()
             values = torch.tensor(
                 [float(required), float(available)],
                 device=self.device if self.device.type == "cuda" else "cpu",
