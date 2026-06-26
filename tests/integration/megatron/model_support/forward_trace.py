@@ -25,8 +25,11 @@ CAPTURE_NAME_TOKENS = (
     ".self_attention.linear_qkv.q_proj_lora",
     ".self_attention.linear_qkv.k_proj_lora",
     ".self_attention.linear_qkv.v_proj_lora",
+    ".self_attention.core_attention",
     ".self_attention.linear_proj",
     ".self_attention.linear_proj.lora",
+    ".pre_mlp_layernorm",
+    ".mlp",
     ".mlp.router",
     ".mlp.experts.linear_fc1",
     ".mlp.experts.linear_fc1.gate_lora",
@@ -41,6 +44,7 @@ CAPTURE_NAME_TOKENS = (
     ".mlp.linear_fc2.row_parallel_lora.lora",
 )
 ROUTER_NAME_TOKEN = ".mlp.router"
+CORE_ATTENTION_NAME_TOKEN = ".self_attention.core_attention"
 PRIMARY_OUTPUT_CANONICAL_KEY = "primary_output__is_canonical"
 
 
@@ -232,6 +236,23 @@ def _extract_router_output(output: Any) -> dict[str, torch.Tensor] | None:
     return {
         "probs": _materialize_tensor(probs.float()),
         "routing_map": _materialize_tensor(routing_map.bool()),
+    }
+
+
+def _extract_core_attention_inputs(inputs: Any) -> dict[str, torch.Tensor] | None:
+    if not isinstance(inputs, tuple) or len(inputs) < 3:
+        return None
+    query, key, value = inputs[:3]
+    if not (
+        isinstance(query, torch.Tensor)
+        and isinstance(key, torch.Tensor)
+        and isinstance(value, torch.Tensor)
+    ):
+        return None
+    return {
+        "core_attention_query": _materialize_tensor(query),
+        "core_attention_key": _materialize_tensor(key),
+        "core_attention_value": _materialize_tensor(value),
     }
 
 
@@ -450,6 +471,8 @@ class ForwardTraceCapture:
 
         if ".self_attention.linear_qkv" in name:
             return {"op": "concat", "dim": -1}
+        if ".self_attention.core_attention" in name:
+            return {"op": "concat", "dim": -1}
         if name.endswith(".self_attention.in_proj"):
             return {"op": "concat", "dim": -1}
         if name.endswith(
@@ -502,6 +525,11 @@ class ForwardTraceCapture:
             hints["output"] = concat_dim0
             hints["router_topk_ids"] = concat_dim0
             hints["router_topk_scores"] = concat_dim0
+        if CORE_ATTENTION_NAME_TOKEN in name:
+            concat_heads = {"op": "concat", "dim": 2}
+            hints["core_attention_query"] = concat_heads
+            hints["core_attention_key"] = concat_heads
+            hints["core_attention_value"] = concat_heads
         return hints
 
     def _make_hook(self, name: str, module: Any):
@@ -537,6 +565,10 @@ class ForwardTraceCapture:
                     topk_ids, topk_scores = router_topk
                     trace_item["router_topk_ids"] = topk_ids
                     trace_item["router_topk_scores"] = topk_scores
+            if CORE_ATTENTION_NAME_TOKEN in name:
+                core_inputs = _extract_core_attention_inputs(inputs)
+                if core_inputs is not None:
+                    trace_item.update(core_inputs)
             primary_output = trace_item.get("primary_output")
             primary_row_count = (
                 int(primary_output.shape[0])

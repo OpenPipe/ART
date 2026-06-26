@@ -895,7 +895,12 @@ def _score_megatron_runtime(
         if forward_trace_capture is not None and forward_trace_dir is not None:
             trace_dir = Path(forward_trace_dir)
             forward_trace_capture.save_current_step(trace_dir)
-            torch.save(logits.detach().cpu(), trace_dir / "logits.pt")
+            if (
+                not torch.distributed.is_initialized()  # ty: ignore[possibly-missing-attribute]
+                or torch.distributed.get_rank() == 0  # ty: ignore[possibly-missing-attribute]
+            ):
+                trace_dir.mkdir(parents=True, exist_ok=True)
+                torch.save(logits.detach().cpu(), trace_dir / "logits.pt")
     finally:
         if forward_trace_capture is not None:
             forward_trace_capture.close()

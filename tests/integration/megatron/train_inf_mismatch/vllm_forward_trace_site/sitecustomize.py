@@ -87,7 +87,7 @@ def _save_tensor(
     max_rows = int(os.environ.get("ART_VLLM_FORWARD_TRACE_MAX_ROWS", "768"))
     if tensor.ndim > 0 and int(tensor.shape[0]) > max_rows:
         return None
-    rel_path = Path("tensors") / f"{call_index:06d}_{field}.pt"
+    rel_path = Path("tensors") / f"{os.getpid()}_{call_index:06d}_{field}.pt"
     path = trace_dir / rel_path
     path.parent.mkdir(parents=True, exist_ok=True)
     torch.save(tensor.detach().cpu(), path)
@@ -104,12 +104,14 @@ def _should_capture(name: str) -> bool:
     return (
         name.endswith(".input_layernorm")
         or name.endswith(".self_attn")
+        or name.endswith(".attn.attn")
         or name.endswith(".qkv_proj")
         or name.endswith(".q_norm")
         or name.endswith(".k_norm")
         or name.endswith(".o_proj")
         or name.endswith(".post_attention_layernorm")
         or name.endswith(".mlp")
+        or name.endswith(".mlp.router")
         or name.endswith(".gate_up_proj")
         or name.endswith(".down_proj")
     )
@@ -117,6 +119,25 @@ def _should_capture(name: str) -> bool:
 
 def _shape(value: Any) -> list[int] | None:
     return list(value.shape) if hasattr(value, "shape") else None
+
+
+def _attention_input_paths(
+    trace_dir: Path, call_index: int, name: str, inputs: Any
+) -> dict[str, Any]:
+    if not name.endswith(".attn.attn") or not isinstance(inputs, tuple):
+        return {}
+    fields: dict[str, Any] = {}
+    for index, field in enumerate(("query", "key", "value")):
+        if index >= len(inputs):
+            break
+        fields[f"{field}_input_path"] = _save_tensor(
+            trace_dir,
+            call_index,
+            f"{field}_input",
+            inputs[index],
+        )
+        fields[f"{field}_input_shape"] = _shape(inputs[index])
+    return fields
 
 
 def _make_hook(name: str):
@@ -140,6 +161,7 @@ def _make_hook(name: str):
             primary_output_path=_save_tensor(
                 trace_dir, call_index, "primary_output", primary_output
             ),
+            **_attention_input_paths(trace_dir, call_index, name, inputs),
         )
 
     return _hook
@@ -177,6 +199,8 @@ def _patch_causal_lm_class(module: Any, class_name: str) -> None:
 
         @functools.wraps(original_compute_logits)
         def compute_logits(self: Any, hidden_states: Any, *args: Any, **kwargs: Any):
+            if _trace_dir() is not None:
+                _register_model_hooks(self)
             output = original_compute_logits(self, hidden_states, *args, **kwargs)
             trace_dir = _trace_dir()
             if trace_dir is not None:
@@ -212,6 +236,8 @@ def _maybe_patch(name: str, module: Any) -> None:
         _patch_causal_lm_class(module, "Qwen3ForCausalLM")
     elif name == "vllm.model_executor.models.qwen3_moe":
         _patch_causal_lm_class(module, "Qwen3MoeForCausalLM")
+    elif name == "vllm.model_executor.models.gpt_oss":
+        _patch_causal_lm_class(module, "GptOssForCausalLM")
 
 
 def _import(name, globals=None, locals=None, fromlist=(), level=0):
