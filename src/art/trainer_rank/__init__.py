@@ -113,12 +113,14 @@ type ForwardInputs = AnyForwardInput | Iterable["ForwardInputs"]
 type ForwardOutputs = AnyForwardOutput | Sequence["ForwardOutputs"]
 ForwardInputsT = TypeVar("ForwardInputsT", bound=ForwardInputs)
 ForwardOutputsT = TypeVar("ForwardOutputsT", bound=ForwardOutputs)
+MicroBatchInputsT = TypeVar("MicroBatchInputsT", bound=ForwardInputs, covariant=True)
+MicroBatchOutputsT = TypeVar("MicroBatchOutputsT", bound=ForwardOutputs, covariant=True)
 
 
 @dataclass(frozen=True)
-class MicroBatch(Generic[ForwardInputsT, ForwardOutputsT]):
-    inputs: Sequence[ForwardInputsT]
-    outputs: Sequence[ForwardOutputsT]
+class MicroBatch(Generic[MicroBatchInputsT, MicroBatchOutputsT]):
+    inputs: Sequence[MicroBatchInputsT]
+    outputs: Sequence[MicroBatchOutputsT]
     indices: Sequence[int]
     stats: "MicroBatchStats"
 
