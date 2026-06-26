@@ -378,7 +378,32 @@ def _install_gpt_oss_preprocess_patch(model_chunks: Sequence[Any]) -> None:
             **kwargs: Any,
         ) -> tuple[Any, ...]:
             position_ids = kwargs.get("position_ids")
-            preproc_output = list(_preprocess(*args, **kwargs))
+            cp_world_size = _context_parallel_world_size(
+                getattr(_gpt_module, "config", None),
+            )
+            packed_seq_params = kwargs.get("packed_seq_params")
+            rotary_module = getattr(_gpt_module, "rotary_pos_emb", None)
+            rotary_cp_group = getattr(rotary_module, "cp_group", None)
+            packed_cp_group = getattr(packed_seq_params, "cp_group", None)
+            uses_local_cp_positions = (
+                isinstance(position_ids, torch.Tensor)
+                and position_ids.ndim == 2
+                and cp_world_size > 1
+                and (rotary_cp_group is not None or packed_cp_group is not None)
+            )
+            if uses_local_cp_positions:
+                if rotary_cp_group is not None:
+                    setattr(rotary_module, "cp_group", None)
+                if packed_cp_group is not None:
+                    setattr(packed_seq_params, "cp_group", None)
+            try:
+                preproc_output = list(_preprocess(*args, **kwargs))
+            finally:
+                if uses_local_cp_positions:
+                    if rotary_cp_group is not None:
+                        setattr(rotary_module, "cp_group", rotary_cp_group)
+                    if packed_cp_group is not None:
+                        setattr(packed_seq_params, "cp_group", packed_cp_group)
             decoder_input = cast(torch.Tensor, preproc_output[0])
             if not decoder_input.requires_grad and decoder_input.is_leaf:
                 decoder_input.requires_grad_(True)
@@ -392,9 +417,6 @@ def _install_gpt_oss_preprocess_patch(model_chunks: Sequence[Any]) -> None:
                     "GPT OSS expected 2D position_ids for YaRN rotary gathering, "
                     f"got shape {tuple(position_ids.shape)}"
                 )
-            cp_world_size = _context_parallel_world_size(
-                getattr(_gpt_module, "config", None),
-            )
             rotary_seq_len = getattr(_gpt_module, "_art_gpt_oss_rotary_seq_len", None)
             if rotary_seq_len is None:
                 rotary_seq_len = int(position_ids.shape[-1]) * max(cp_world_size, 1)
