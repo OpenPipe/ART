@@ -283,7 +283,7 @@ class TrainerRank:
         self._adaptive_plan_cache: dict[_AdaptivePlanCacheKey, _FlatForwardPlan] = {}
         self._adaptive_plan_cache_top_level_ids: tuple[int, ...] = ()
         self._adaptive_estimate_cache: dict[
-            _AdaptivePlanCacheKey, tuple[_MemoryCheck, bool] | None
+            _AdaptivePlanCacheKey, tuple[int, int, _MemorySignature] | None
         ] = {}
         self._last_global_micro_batch_size: int | None = None
         self.zero_grad()
@@ -863,26 +863,27 @@ class TrainerRank:
     ) -> tuple[_MemoryCheck, bool] | None:
         key = self._adaptive_cache_key(indices)
         if key in self._adaptive_estimate_cache:
-            return self._adaptive_estimate_cache[key]
-        estimate = self._estimate_flat_forward(list(_flatten(local_inputs)))
-        if estimate is not None:
-            packed_tokens, output_bytes, signature = estimate
-            estimate = (
-                self._memory_check_required(
-                    self._estimate_required_memory_bytes_from_values(
-                        packed_tokens=packed_tokens,
-                        output_bytes=output_bytes,
-                        signature=signature,
-                    ),
-                    sync_across_dp=True,
-                ),
-                self._all_ranks_have_memory_profile(
+            estimate = self._adaptive_estimate_cache[key]
+        else:
+            estimate = self._estimate_flat_forward(list(_flatten(local_inputs)))
+            self._adaptive_estimate_cache[key] = estimate
+        if estimate is None:
+            return None
+        packed_tokens, output_bytes, signature = estimate
+        return (
+            self._memory_check_required(
+                self._estimate_required_memory_bytes_from_values(
                     packed_tokens=packed_tokens,
+                    output_bytes=output_bytes,
                     signature=signature,
                 ),
-            )
-        self._adaptive_estimate_cache[key] = estimate
-        return estimate
+                sync_across_dp=True,
+            ),
+            self._all_ranks_have_memory_profile(
+                packed_tokens=packed_tokens,
+                signature=signature,
+            ),
+        )
 
     def _adaptive_cache_key(
         self,

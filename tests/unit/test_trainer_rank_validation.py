@@ -381,6 +381,48 @@ def test_forward_micro_batches_reuses_cached_candidate_plans(
     assert memory_checks == first_memory_checks == 0
 
 
+def test_cached_adaptive_estimate_rechecks_current_memory(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    trainer = TrainerRank(_runtime())  # type: ignore[arg-type]
+    monkeypatch.setattr(
+        trainer,
+        "_estimate_required_memory_bytes_from_values",
+        lambda **kwargs: kwargs["packed_tokens"],
+    )
+    monkeypatch.setattr(
+        trainer, "_all_ranks_have_memory_profile", lambda **_kwargs: True
+    )
+    original_estimate = trainer._estimate_flat_forward
+    estimate_calls = 0
+    available = [1 << 30, 1]
+
+    def estimate(requests):
+        nonlocal estimate_calls
+        estimate_calls += 1
+        return original_estimate(requests)
+
+    def memory_check(required: int, *, sync_across_dp: bool = False) -> _MemoryCheck:
+        assert sync_across_dp
+        current = available.pop(0)
+        return _MemoryCheck(
+            estimated_required_bytes=required,
+            available_bytes=current,
+            fits=required <= current,
+        )
+
+    monkeypatch.setattr(trainer, "_estimate_flat_forward", estimate)
+    monkeypatch.setattr(trainer, "_memory_check_required", memory_check)
+    inputs = [_target_request(1), _target_request(2)]
+
+    first = trainer._cached_adaptive_estimate((0, 1), inputs)
+    second = trainer._cached_adaptive_estimate((0, 1), inputs)
+
+    assert first is not None and first[0].fits
+    assert second is not None and not second[0].fits
+    assert estimate_calls == 1
+
+
 def test_forward_micro_batches_raises_when_smallest_batch_will_not_fit(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
