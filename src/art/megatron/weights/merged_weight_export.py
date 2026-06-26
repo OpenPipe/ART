@@ -27,44 +27,6 @@ from art.weight_transfer import (
 )
 
 
-def _merge_single_canonical_adapter_weight(
-    *,
-    model_bridge: Any,
-    converted_weights_dict: dict[str, torch.Tensor],
-    adapter_weights: list[Any],
-) -> dict[str, torch.Tensor] | None:
-    if len(adapter_weights) != 1:
-        return None
-    adapter_weight = adapter_weights[0]
-    adapter_key = getattr(adapter_weight, "adapter_key", None)
-    if adapter_key is None or len(converted_weights_dict) <= 1:
-        return None
-    try:
-        from megatron.bridge.models.conversion.peft_bridge import (
-            ADAPTER_KEY_TO_SUFFIX,
-        )
-    except ImportError:
-        return None
-    suffix = ADAPTER_KEY_TO_SUFFIX.get(adapter_key)
-    if suffix is None:
-        return None
-    matched_names = [
-        name for name in converted_weights_dict.keys() if name.endswith(suffix)
-    ]
-    if not matched_names:
-        return None
-    merged = dict(converted_weights_dict)
-    for name in matched_names:
-        merged[name] = model_bridge._merge_single_adapter_weight(
-            merged[name],
-            adapter_weight.alpha,
-            adapter_weight.dim,
-            adapter_weight.linear_in_weight.weight,
-            adapter_weight.linear_out_weight.weight,
-        )
-    return merged
-
-
 class MergedWeightExport(BaseModel):
     model_config = ConfigDict(arbitrary_types_allowed=True)
 
@@ -187,11 +149,7 @@ def iter_merged_vllm_weights(
         )
         if adapter_weights is not None:
             try:
-                converted_weights_dict = _merge_single_canonical_adapter_weight(
-                    model_bridge=model_bridge,
-                    converted_weights_dict=converted_weights_dict,
-                    adapter_weights=adapter_weights,
-                ) or model_bridge._merge_lora_adapter_weights(
+                converted_weights_dict = model_bridge._merge_lora_adapter_weights(
                     weight_export.model,
                     converted_weights_dict,
                     adapter_weights,
