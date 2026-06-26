@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import dataclass
 from types import SimpleNamespace
 
 import pytest
@@ -11,6 +12,7 @@ from art.trainer_rank import (
     TopK,
     TrainerRank,
     TrainerRankMemoryError,
+    TrainerRankSlotStateError,
     Unset,
     _anchor_disconnected_outputs,
     _MemoryCheck,
@@ -21,6 +23,12 @@ from art.trainer_rank import (
 
 class _Model:
     vocab_size = 8
+
+
+@dataclass(frozen=True)
+class _SlotRef:
+    kind: str
+    name: str | None
 
 
 def _runtime(model: torch.nn.Module | None = None) -> SimpleNamespace:
@@ -93,6 +101,58 @@ def test_trainer_rank_load_rejects_active_adapter_stack() -> None:
         trainer.load_checkpoint_slot("teacher", {})
     with pytest.raises(RuntimeError, match="Cannot load a LoRA/checkpoint"):
         trainer.load_lora_slot("teacher", {})
+
+
+def test_trainer_rank_load_rejects_pending_checkpoint_graph() -> None:
+    trainer = TrainerRank(_runtime())  # type: ignore[arg-type]
+    ref = _SlotRef("checkpoint", "teacher")
+    output = ForwardOutput(torch.ones(1, requires_grad=True) * 2, None, None, None)
+
+    trainer._track_slot_graph_outputs(ref, [output])  # type: ignore[arg-type]
+
+    with pytest.raises(TrainerRankSlotStateError, match="Cannot load checkpoint slot"):
+        trainer._guard_slot_can_load(ref)  # type: ignore[arg-type]
+
+    output.target_logprobs.sum().backward()
+
+    trainer._guard_slot_can_load(ref)  # type: ignore[arg-type]
+
+
+def test_trainer_rank_step_rejects_pending_checkpoint_graph(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    trainer = TrainerRank(_runtime())  # type: ignore[arg-type]
+    monkeypatch.setattr(trainer, "_slot_ref", lambda kind, name: _SlotRef(kind, name))
+    ref = _SlotRef("checkpoint", "student")
+    output = ForwardOutput(torch.ones(1, requires_grad=True) * 2, None, None, None)
+
+    trainer._track_slot_graph_outputs(ref, [output])  # type: ignore[arg-type]
+
+    with pytest.raises(TrainerRankSlotStateError, match="Cannot optim_step"):
+        trainer._guard_checkpoint_can_step("student")
+
+    output.target_logprobs.sum().backward()
+
+    trainer._guard_checkpoint_can_step("student")
+
+
+def test_trainer_rank_zero_grad_clears_abandoned_slot_graphs() -> None:
+    trainer = TrainerRank(_runtime())  # type: ignore[arg-type]
+    ref = _SlotRef("lora", "teacher")
+    output = ForwardOutput(
+        None,
+        TopK(
+            torch.ones(1, requires_grad=True) * 2,
+            torch.ones(1, dtype=torch.long),
+        ),
+        None,
+        None,
+    )
+
+    trainer._track_slot_graph_outputs(ref, [output])  # type: ignore[arg-type]
+    trainer.zero_grad()
+
+    trainer._guard_slot_can_load(ref)  # type: ignore[arg-type]
 
 
 def test_dp_rank_forward_preserves_nested_shape_for_inactive_requests() -> None:

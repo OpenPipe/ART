@@ -166,6 +166,23 @@ class TrainerRankMemoryError(RuntimeError):
     pass
 
 
+class TrainerRankSlotStateError(RuntimeError):
+    pass
+
+
+@dataclass
+class _SlotGraphLease:
+    trainer: "TrainerRank"
+    ref: "LoRASlotRef"
+    active: bool = True
+
+    def release(self) -> None:
+        if not self.active:
+            return
+        self.active = False
+        self.trainer._release_slot_graph(self.ref)
+
+
 @dataclass(frozen=True)
 class _PushedSlot:
     trainer: "TrainerRank"
@@ -279,6 +296,7 @@ class TrainerRank:
         self._checkpoint_slot_params_by_name: dict[
             str, tuple[torch.nn.Parameter, ...]
         ] = {}
+        self._pending_slot_graphs: dict[LoRASlotRef, int] = {}
         self._memory_profiles: dict[_MemorySignature, _MemoryProfile] = {}
         self._adaptive_plan_cache: dict[_AdaptivePlanCacheKey, _FlatForwardPlan] = {}
         self._adaptive_estimate_cache: dict[
@@ -298,6 +316,7 @@ class TrainerRank:
         for params in self._checkpoint_slot_params_by_name.values():
             for param in params:
                 param.grad = None
+        self._pending_slot_graphs.clear()
 
     def _optimizer(self) -> "MegatronOptimizer":
         optimizer = cast("MegatronOptimizer | None", self.runtime.optimizer)
@@ -368,9 +387,11 @@ class TrainerRank:
             raise RuntimeError("Cannot load a LoRA/checkpoint while a slot is pushed")
         from art.megatron.lora import LORA_ALPHA, load_lora_slot_into_model
 
+        ref = self._slot_ref(kind, name)
+        self._guard_slot_can_load(ref)
         return load_lora_slot_into_model(
             self.runtime.model,
-            self._slot_ref(kind, name),
+            ref,
             adapter_model,
             alpha=LORA_ALPHA if alpha is None else alpha,
             requires_grad=trainable,
@@ -616,6 +637,7 @@ class TrainerRank:
     ) -> dict[str, float]:
         all_params: list[torch.nn.Parameter] = []
         for name in checkpoint_names:
+            self._guard_checkpoint_can_step(name)
             slot_params = self._checkpoint_slot_params_by_name[name]
             for param in slot_params:
                 if param.grad is None:
@@ -633,6 +655,7 @@ class TrainerRank:
             optimizer = self._dynamic_optimizer(name, params)
             optimizer.step()
             optimizer.zero_grad(set_to_none=True)
+            self._pending_slot_graphs.pop(self._slot_ref("checkpoint", name), None)
         return {
             "learning_rate": float(params.learning_rate),
             "grad_norm": float(grad_norm),
@@ -1036,9 +1059,66 @@ class TrainerRank:
             with use_lora_slot(group.slot_ref):
                 prepared = self._prepare_packed_forward(group.packed)
                 item_outputs = self._forward_packed(group.items, prepared)
+            self._track_slot_graph_outputs(group.slot_ref, item_outputs)
             for index, output in zip(group.request_indices, item_outputs, strict=True):
                 outputs[index] = output
         return outputs
+
+    def _track_slot_graph_outputs(
+        self,
+        ref: "LoRASlotRef | None",
+        outputs: Sequence[AnyForwardOutput],
+    ) -> None:
+        if ref is None or ref.name is None:
+            return
+        tensors = [
+            tensor
+            for output in outputs
+            for tensor in _forward_output_grad_tensors(output)
+        ]
+        if not tensors:
+            return
+
+        self._pending_slot_graphs[ref] = self._pending_slot_graphs.get(ref, 0) + 1
+        lease = _SlotGraphLease(self, ref)
+
+        def release(grad: torch.Tensor) -> torch.Tensor:
+            lease.release()
+            return grad
+
+        for tensor in tensors:
+            tensor.register_hook(release)
+
+    def _release_slot_graph(self, ref: "LoRASlotRef") -> None:
+        count = self._pending_slot_graphs.get(ref, 0)
+        if count <= 1:
+            self._pending_slot_graphs.pop(ref, None)
+        else:
+            self._pending_slot_graphs[ref] = count - 1
+
+    def _guard_slot_can_load(self, ref: "LoRASlotRef") -> None:
+        if self._pending_slot_graphs.get(ref, 0) <= 0:
+            return
+        raise TrainerRankSlotStateError(
+            f"Cannot load {ref.kind} slot {ref.name!r} while outputs from an "
+            "earlier forward using that slot still have a live backward graph. "
+            "Activation checkpoint recompute resolves slots by name, so replacing "
+            "the slot before backward can compute gradients with different LoRA "
+            "weights than the original forward. Call loss.backward() first, or "
+            "call zero_grad() if the forward was abandoned, or load the new "
+            "weights under a different slot name."
+        )
+
+    def _guard_checkpoint_can_step(self, name: str) -> None:
+        ref = self._slot_ref("checkpoint", name)
+        if self._pending_slot_graphs.get(ref, 0) <= 0:
+            return
+        raise TrainerRankSlotStateError(
+            f"Cannot optim_step checkpoint slot {name!r} while outputs from an "
+            "earlier forward using that slot have not been backpropagated. Call "
+            "loss.backward() before optim_step(), or call zero_grad() if that "
+            "forward was abandoned."
+        )
 
     def _estimate_group_request_output_bytes(
         self,
@@ -2156,6 +2236,17 @@ def _batch_seq_logits(logits: torch.Tensor, *, seq_len: int) -> torch.Tensor:
     )
 
 
+def _forward_output_grad_tensors(output: AnyForwardOutput) -> Iterator[torch.Tensor]:
+    if output.target_logprobs is not None and output.target_logprobs.requires_grad:
+        yield output.target_logprobs
+    if output.top_k is not None and output.top_k.logprobs.requires_grad:
+        yield output.top_k.logprobs
+    if output.logits is not None and output.logits.requires_grad:
+        yield output.logits
+    if output.hidden_states is not None and output.hidden_states.requires_grad:
+        yield output.hidden_states
+
+
 def _materialize(inputs: ForwardInputs) -> ForwardInputs:
     if isinstance(inputs, ForwardInput):
         return inputs
@@ -2207,4 +2298,5 @@ __all__ = [
     "TopK",
     "TrainerRank",
     "TrainerRankMemoryError",
+    "TrainerRankSlotStateError",
 ]
