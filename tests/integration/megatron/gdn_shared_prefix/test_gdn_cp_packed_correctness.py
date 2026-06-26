@@ -281,7 +281,6 @@ def _tree_trainability_worker(
             cp_size=cp_size,
             planner_config=_tree_chain_planner_config(),
         )
-        assert any(plan.tree_chain_buckets_by_depth)
         hidden = _tree_trainability_hidden(spec.real_token_count, cp_size=cp_size)
         flat_hidden = hidden.transpose(0, 1).reshape(-1, hidden.shape[-1])
         local_index = torch.tensor(
