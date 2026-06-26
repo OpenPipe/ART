@@ -108,15 +108,17 @@ type AnyForwardOutput = ForwardOutput[
     torch.Tensor | None,
     torch.Tensor | None,
 ]
+type AnyMicroBatch = MicroBatch[AnyForwardInput, AnyForwardOutput]
 type ForwardInputs = AnyForwardInput | Iterable["ForwardInputs"]
 type ForwardOutputs = AnyForwardOutput | Sequence["ForwardOutputs"]
 ForwardInputsT = TypeVar("ForwardInputsT", bound=ForwardInputs)
+ForwardOutputsT = TypeVar("ForwardOutputsT", bound=ForwardOutputs)
 
 
 @dataclass(frozen=True)
-class MicroBatch(Generic[ForwardInputsT]):
+class MicroBatch(Generic[ForwardInputsT, ForwardOutputsT]):
     inputs: Sequence[ForwardInputsT]
-    outputs: Sequence[ForwardOutputs]
+    outputs: Sequence[ForwardOutputsT]
     indices: Sequence[int]
     stats: "MicroBatchStats"
 
@@ -368,11 +370,73 @@ class TrainerRank:
         self._validate_dynamic_slot_consistency("lora", name, loaded)
         return loaded
 
+    @overload
     def forward_micro_batches(
         self,
-        inputs: Iterable[ForwardInputsT],
-    ) -> Iterator[MicroBatch[ForwardInputsT]]:
-        items = list(inputs)
+        inputs: Iterable[ForwardInput[LogprobsT, TopKT, LogitsT, HiddenStatesT]],
+    ) -> Iterator[
+        MicroBatch[
+            ForwardInput[LogprobsT, TopKT, LogitsT, HiddenStatesT],
+            ForwardOutput[LogprobsT, TopKT, LogitsT, HiddenStatesT],
+        ]
+    ]: ...
+
+    @overload
+    def forward_micro_batches(
+        self,
+        inputs: Iterable[
+            Iterable[ForwardInput[LogprobsT, TopKT, LogitsT, HiddenStatesT]]
+        ],
+    ) -> Iterator[
+        MicroBatch[
+            Sequence[ForwardInput[LogprobsT, TopKT, LogitsT, HiddenStatesT]],
+            Sequence[ForwardOutput[LogprobsT, TopKT, LogitsT, HiddenStatesT]],
+        ]
+    ]: ...
+
+    @overload
+    def forward_micro_batches(
+        self,
+        inputs: Iterable[
+            Iterable[Iterable[ForwardInput[LogprobsT, TopKT, LogitsT, HiddenStatesT]]]
+        ],
+    ) -> Iterator[
+        MicroBatch[
+            Sequence[Sequence[ForwardInput[LogprobsT, TopKT, LogitsT, HiddenStatesT]]],
+            Sequence[Sequence[ForwardOutput[LogprobsT, TopKT, LogitsT, HiddenStatesT]]],
+        ]
+    ]: ...
+
+    @overload
+    def forward_micro_batches(
+        self,
+        inputs: Iterable[
+            Iterable[
+                Iterable[
+                    Iterable[ForwardInput[LogprobsT, TopKT, LogitsT, HiddenStatesT]]
+                ]
+            ]
+        ],
+    ) -> Iterator[
+        MicroBatch[
+            Sequence[
+                Sequence[
+                    Sequence[ForwardInput[LogprobsT, TopKT, LogitsT, HiddenStatesT]]
+                ]
+            ],
+            Sequence[
+                Sequence[
+                    Sequence[ForwardOutput[LogprobsT, TopKT, LogitsT, HiddenStatesT]]
+                ]
+            ],
+        ]
+    ]: ...
+
+    def forward_micro_batches(
+        self,
+        inputs: Iterable[ForwardInputs],
+    ) -> Iterator[MicroBatch[ForwardInputs, ForwardOutputs]]:
+        items: list[ForwardInputs] = list(inputs)
         self._adaptive_plan_cache.clear()
         self._adaptive_estimate_cache.clear()
         self._validate_replicated_top_level_count(len(items))
@@ -425,6 +489,32 @@ class TrainerRank:
         ],
     ) -> Sequence[
         Sequence[ForwardOutput[LogprobsT, TopKT, LogitsT, HiddenStatesT]]
+    ]: ...
+
+    @overload
+    def dp_rank_forward(
+        self,
+        inputs: Iterable[
+            Iterable[Iterable[ForwardInput[LogprobsT, TopKT, LogitsT, HiddenStatesT]]]
+        ],
+    ) -> Sequence[
+        Sequence[Sequence[ForwardOutput[LogprobsT, TopKT, LogitsT, HiddenStatesT]]]
+    ]: ...
+
+    @overload
+    def dp_rank_forward(
+        self,
+        inputs: Iterable[
+            Iterable[
+                Iterable[
+                    Iterable[ForwardInput[LogprobsT, TopKT, LogitsT, HiddenStatesT]]
+                ]
+            ]
+        ],
+    ) -> Sequence[
+        Sequence[
+            Sequence[Sequence[ForwardOutput[LogprobsT, TopKT, LogitsT, HiddenStatesT]]]
+        ]
     ]: ...
 
     def dp_rank_forward(self, inputs: ForwardInputs) -> ForwardOutputs:
@@ -2020,11 +2110,13 @@ def _anchor_disconnected_outputs(
             for item_logprobs in target_logprobs
         ],
         [
-            None
-            if item_top_k is None
-            else TopK(
-                logprobs=anchor_tensor(item_top_k.logprobs),
-                tokens=item_top_k.tokens,
+            (
+                None
+                if item_top_k is None
+                else TopK(
+                    logprobs=anchor_tensor(item_top_k.logprobs),
+                    tokens=item_top_k.tokens,
+                )
             )
             for item_top_k in top_k
         ],

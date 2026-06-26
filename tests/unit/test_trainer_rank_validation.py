@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from types import SimpleNamespace
+from typing import Any, cast
 
 import pytest
 import torch
@@ -43,6 +44,30 @@ def _runtime(model: torch.nn.Module | None = None) -> SimpleNamespace:
 def _target_request(token: int) -> ForwardInput[torch.Tensor, None, None, None]:
     tokens = torch.tensor([token, token + 1], dtype=torch.long)
     return ForwardInput(input_tokens=tokens, target_tokens=tokens)
+
+
+def _indexed_outputs(plan: object, **_kwargs: object) -> list[ForwardOutput]:
+    return [
+        ForwardOutput(torch.tensor([index], dtype=torch.float32), None, None, None)
+        for index in range(int(getattr(plan, "request_count")))
+    ]
+
+
+def _output_values(outputs: object) -> list[int]:
+    if isinstance(outputs, ForwardOutput):
+        target_logprobs = outputs.target_logprobs
+        assert isinstance(target_logprobs, torch.Tensor)
+        return [int(target_logprobs.item())]
+    values: list[int] = []
+    for item in outputs:  # type: ignore[union-attr]
+        values.extend(_output_values(item))
+    return values
+
+
+def _output_shape(outputs: object) -> object:
+    if isinstance(outputs, ForwardOutput):
+        return "output"
+    return [_output_shape(item) for item in outputs]  # type: ignore[union-attr]
 
 
 def test_forward_input_rejects_non_positive_top_k() -> None:
@@ -179,6 +204,27 @@ def test_dp_rank_forward_preserves_nested_shape_for_inactive_requests() -> None:
     assert not hasattr(trainer, "micro_batches")
 
 
+def test_dp_rank_forward_supports_arbitrary_nested_depth(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    trainer = TrainerRank(_runtime())  # type: ignore[arg-type]
+    monkeypatch.setattr(
+        trainer, "_run_flat_plan_with_memory_tracking", _indexed_outputs
+    )
+    nested = [
+        [[[[[_target_request(1)]]]]],
+        [[[[[_target_request(3), _target_request(5)]]]]],
+    ]
+
+    outputs = cast(Any, trainer).dp_rank_forward(nested)
+
+    assert _output_shape(outputs) == [
+        [[[[["output"]]]]],
+        [[[[["output", "output"]]]]],
+    ]
+    assert _output_values(outputs) == [0, 1, 2]
+
+
 def test_forward_micro_batches_uses_deterministic_dp_windows(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -252,6 +298,34 @@ def test_forward_micro_batches_outputs_match_top_level_nested_inputs(
     assert batch.inputs == nested
     assert len(batch.outputs) == 1
     assert len(batch.outputs[0]) == 2
+
+
+def test_forward_micro_batches_supports_arbitrary_nested_depth(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    trainer = TrainerRank(_runtime())  # type: ignore[arg-type]
+    monkeypatch.setattr(trainer, "_dp_rank_and_size", lambda: (0, 1))
+    monkeypatch.setattr(
+        trainer, "_all_ranks_have_memory_profile", lambda **_kwargs: True
+    )
+    monkeypatch.setattr(
+        trainer, "_run_flat_plan_with_memory_tracking", _indexed_outputs
+    )
+    nested = [
+        [[[[[_target_request(1)]]]]],
+        [[[[[_target_request(3), _target_request(5)]]]]],
+    ]
+
+    batches = list(cast(Any, trainer).forward_micro_batches(nested))
+
+    assert len(batches) == 1
+    assert batches[0].inputs == nested
+    assert batches[0].select(nested) == nested
+    assert _output_shape(batches[0].outputs) == [
+        [[[[["output"]]]]],
+        [[[[["output", "output"]]]]],
+    ]
+    assert _output_values(batches[0].outputs) == [0, 1, 2]
 
 
 def test_forward_micro_batches_ramps_after_first_success(
