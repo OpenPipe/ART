@@ -1,7 +1,6 @@
 import json
 import os
 from pathlib import Path
-import types
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -46,13 +45,13 @@ class TestMetricRoutingBaseline:
         fake_run = MagicMock()
         fake_run._is_finished = False
 
-        fake_wandb = types.SimpleNamespace()
-        fake_wandb.init = MagicMock(return_value=fake_run)
-        fake_wandb.define_metric = MagicMock()
-        fake_wandb.Settings = lambda **kwargs: kwargs
+        fake_init = MagicMock(return_value=fake_run)
 
         with patch.dict(os.environ, {"WANDB_API_KEY": "test-key"}, clear=False):
-            with patch.dict("sys.modules", {"wandb": fake_wandb}):
+            with (
+                patch("art.model.wandb_sdk.init", fake_init),
+                patch("art.model.wandb_sdk.settings", lambda **kwargs: kwargs),
+            ):
                 model = Model(
                     name="test-model",
                     project="test-project",
@@ -88,13 +87,13 @@ class TestMetricRoutingBaseline:
         fake_run._is_finished = False
         fake_run.config = MagicMock()
 
-        fake_wandb = types.SimpleNamespace()
-        fake_wandb.init = MagicMock(return_value=fake_run)
-        fake_wandb.define_metric = MagicMock()
-        fake_wandb.Settings = lambda **kwargs: kwargs
+        fake_init = MagicMock(return_value=fake_run)
 
         with patch.dict(os.environ, {"WANDB_API_KEY": "test-key"}, clear=False):
-            with patch.dict("sys.modules", {"wandb": fake_wandb}):
+            with (
+                patch("art.model.wandb_sdk.init", fake_init),
+                patch("art.model.wandb_sdk.settings", lambda **kwargs: kwargs),
+            ):
                 model = Model(
                     name="test-model",
                     project="test-project",
@@ -134,10 +133,7 @@ class TestMetricRoutingBaseline:
         fake_run._is_finished = False
         fake_run.config = MagicMock()
 
-        fake_wandb = types.SimpleNamespace()
-        fake_wandb.init = MagicMock(return_value=fake_run)
-        fake_wandb.define_metric = MagicMock()
-        fake_wandb.Settings = lambda **kwargs: kwargs
+        fake_init = MagicMock(return_value=fake_run)
 
         payload = {
             "experiment": {"learning_rate": 1e-5, "batch_size": 4},
@@ -145,7 +141,10 @@ class TestMetricRoutingBaseline:
         }
 
         with patch.dict(os.environ, {"WANDB_API_KEY": "test-key"}, clear=False):
-            with patch.dict("sys.modules", {"wandb": fake_wandb}):
+            with (
+                patch("art.model.wandb_sdk.init", fake_init),
+                patch("art.model.wandb_sdk.settings", lambda **kwargs: kwargs),
+            ):
                 model = Model(
                     name="test-model",
                     project="test-project",
@@ -155,7 +154,7 @@ class TestMetricRoutingBaseline:
                 run = model._get_wandb_run()
 
         assert run is fake_run
-        init_kwargs = fake_wandb.init.call_args.kwargs
+        init_kwargs = fake_init.call_args.kwargs
         assert init_kwargs["config"] == payload
         assert "allow_val_change" not in init_kwargs
         fake_run.config.update.assert_called_once_with(payload)
@@ -165,13 +164,13 @@ class TestMetricRoutingBaseline:
         fake_run._is_finished = False
         fake_run.config = MagicMock()
 
-        fake_wandb = types.SimpleNamespace()
-        fake_wandb.init = MagicMock(return_value=fake_run)
-        fake_wandb.define_metric = MagicMock()
-        fake_wandb.Settings = lambda **kwargs: kwargs
+        fake_init = MagicMock(return_value=fake_run)
 
         with patch.dict(os.environ, {"WANDB_API_KEY": "test-key"}, clear=False):
-            with patch.dict("sys.modules", {"wandb": fake_wandb}):
+            with (
+                patch("art.model.wandb_sdk.init", fake_init),
+                patch("art.model.wandb_sdk.settings", lambda **kwargs: kwargs),
+            ):
                 model = Model(
                     name="test-model",
                     project="test-project",

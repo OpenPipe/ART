@@ -154,9 +154,9 @@ async def test_fork_checkpoint_from_wandb():
         # Verify the forked checkpoint matches model A's checkpoint.
         # Pull both via W&B directly (the fork uploaded the artifact
         # with a step{N} alias matching the source step).
-        import wandb
+        from art.utils import wandb_sdk
 
-        api = wandb.Api(api_key=backend._client.api_key)  # ty:ignore[possibly-missing-attribute]
+        api = wandb_sdk.api(api_key=backend._client.api_key)
         with tempfile.TemporaryDirectory() as tmpdir:
             dir_a = os.path.join(tmpdir, "a")
             dir_b = os.path.join(tmpdir, "b")

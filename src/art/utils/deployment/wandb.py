@@ -5,6 +5,7 @@ from typing import TYPE_CHECKING
 
 from art.errors import UnsupportedBaseModelDeploymentError
 
+from .. import wandb_sdk
 from .common import DeploymentConfig
 
 if TYPE_CHECKING:
@@ -52,8 +53,6 @@ def deploy_wandb(
     Returns:
         The model name for inference: wandb-artifact:///{entity}/{project}/{name}:step{step}
     """
-    import wandb
-
     if model.base_model not in WANDB_SUPPORTED_BASE_MODELS:
         raise UnsupportedBaseModelDeploymentError(
             message=f"Base model {model.base_model} is not supported for serverless LoRA deployment by W&B. Supported models: {WANDB_SUPPORTED_BASE_MODELS}"
@@ -64,23 +63,23 @@ def deploy_wandb(
 
     # Get the user's default entity from W&B if not set
     if model.entity is None:
-        api = wandb.Api()
+        api = wandb_sdk.api()
         model.entity = api.default_entity
 
     if verbose:
         print(f"Uploading checkpoint from {checkpoint_path} to W&B...")
 
-    run = wandb.init(
+    run = wandb_sdk.init(
         name=model.name + " (deployment)",
         entity=model.entity,
         project=model.project,
-        settings=wandb.Settings(api_key=os.environ["WANDB_API_KEY"]),
+        settings=wandb_sdk.settings(api_key=os.environ["WANDB_API_KEY"]),
     )
     try:
         metadata: dict[str, object] = {"wandb.base_model": model.base_model}
         if config is not None:
             metadata["wandb.provenance"] = config.provenance
-        artifact = wandb.Artifact(
+        artifact = wandb_sdk.artifact(
             model.name,
             type="lora",
             metadata=metadata,
