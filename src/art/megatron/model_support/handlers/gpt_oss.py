@@ -42,7 +42,7 @@ _VLLM_MOE_KEY_RE = re.compile(
 class GptOssMoeHandler(DefaultMoeHandler):
     key = "gpt_oss_moe"
     is_moe = True
-    native_vllm_lora_status = "validated"
+    native_vllm_lora_status = "wip"
 
     def identity_lora_model_config(self, base_config: Any) -> Any:
         return getattr(base_config, "text_config", base_config)

@@ -175,7 +175,7 @@ GPT_OSS_MOE_SPEC = ModelSupportSpec(
         "openai/gpt-oss-120b",
     ),
     default_target_modules=_GPT_OSS_MOE_TARGET_MODULES,
-    native_vllm_lora_status=_VALIDATED_NATIVE_VLLM_LORA_STATUS,
+    native_vllm_lora_status=_WIP_NATIVE_VLLM_LORA_STATUS,
     dependency_floor=DependencyFloor(
         transformers="5.6.2",
         megatron_bridge="e1a207ac757e5d0ed94d8ffbe1cbd28e81d8c084",

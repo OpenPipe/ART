@@ -115,7 +115,7 @@ def test_openai_gpt_oss_20b_uses_gpt_oss_moe_support() -> None:
 
     assert spec.key == "gpt_oss_moe"
     assert spec.is_moe is True
-    assert spec.native_vllm_lora_status == "validated"
+    assert spec.native_vllm_lora_status == "wip"
     assert spec.default_target_modules == (
         "q_proj",
         "k_proj",
