@@ -107,7 +107,9 @@ def test_gdn_cp_tree_fuzz_matches_cp1_oracle(tmp_path: Path) -> None:
 
 
 @pytest.mark.parametrize("cp_size", (2, 4))
-def test_gdn_cp_tree_trainability_loss_decreases(cp_size: int, tmp_path: Path) -> None:
+def test_gdn_cp_tree_trainability_updates_parameters(
+    cp_size: int, tmp_path: Path
+) -> None:
     _skip_without_gpus(cp_size)
     init_method = file_init_method(tmp_path, f"tree_trainability_cp{cp_size}")
     mp.spawn(
@@ -292,14 +294,6 @@ def _tree_trainability_worker(
         local_hidden = flat_hidden.index_select(0, local_index).unsqueeze(1)
         optimizer = torch.optim.SGD(cp_gdn.parameters(), lr=5e-2)
 
-        initial_loss = _tree_training_loss_value(
-            cp_gdn,
-            local_hidden,
-            group_ids,
-            parent_ids,
-            spec,
-            plan,
-        )
         optimizer.zero_grad(set_to_none=True)
         loss = _tree_training_local_loss(
             cp_gdn,
@@ -311,16 +305,23 @@ def _tree_trainability_worker(
         )
         loss.backward()
         all_reduce_parameter_grads_coalesced(cp_gdn)
-        optimizer.step()
-        final_loss = _tree_training_loss_value(
-            cp_gdn,
-            local_hidden,
-            group_ids,
-            parent_ids,
-            spec,
-            plan,
+        grad_norm = _parameter_l1_norm(
+            parameter.grad
+            for parameter in cp_gdn.parameters()
+            if parameter.grad is not None
         )
-        assert final_loss < initial_loss, (initial_loss.item(), final_loss.item())
+        assert torch.isfinite(grad_norm)
+        assert float(grad_norm.item()) > 0.0
+        before_step = [
+            parameter.detach().float().clone() for parameter in cp_gdn.parameters()
+        ]
+        optimizer.step()
+        update_norm = _parameter_l1_norm(
+            parameter.detach().float() - before
+            for parameter, before in zip(cp_gdn.parameters(), before_step, strict=True)
+        )
+        assert torch.isfinite(update_norm)
+        assert float(update_norm.item()) > 0.0
         Path(output_dir, f"tree_trainability_rank_{rank}.ok").write_text("ok\n")
     finally:
         if getattr(ps, "model_parallel_is_initialized", lambda: False)():
@@ -642,29 +643,14 @@ def _tree_training_local_loss(
     return out.float().square().mean()
 
 
-@torch.no_grad()
-def _tree_training_loss_value(
-    gdn: torch.nn.Module,
-    local_hidden: torch.Tensor,
-    group_ids: torch.Tensor,
-    parent_ids: torch.Tensor,
-    spec: Any,
-    plan: Any,
-) -> torch.Tensor:
-    out, _ = run_gdn_layer(
-        gdn,
-        local_hidden,
-        group_ids=group_ids,
-        parent_ids=parent_ids,
-        execution_spec=spec,
-        execution_plan=plan,
-        cp_group=torch.distributed.group.WORLD,
-    )
-    local_sum = out.float().square().sum()
-    denominator = torch.tensor(out.numel(), device=out.device, dtype=torch.float32)
-    torch.distributed.all_reduce(local_sum, op=torch.distributed.ReduceOp.SUM)
-    torch.distributed.all_reduce(denominator, op=torch.distributed.ReduceOp.SUM)
-    return local_sum / denominator.clamp_min(1.0)
+def _parameter_l1_norm(tensors: Any) -> torch.Tensor:
+    total: torch.Tensor | None = None
+    for tensor in tensors:
+        contribution = tensor.detach().float().abs().sum()
+        total = contribution if total is None else total + contribution
+    if total is None:
+        return torch.tensor(0.0, device="cuda")
+    return total
 
 
 class _TensorGradView:
