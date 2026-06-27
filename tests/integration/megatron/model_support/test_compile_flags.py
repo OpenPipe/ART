@@ -1,4 +1,7 @@
-from art.megatron.model_support.handlers.qwen3_5 import QWEN3_5_MOE_HANDLER
+from art.megatron.model_support.handlers.qwen3_5 import (
+    QWEN3_5_DENSE_HANDLER,
+    QWEN3_5_MOE_HANDLER,
+)
 from art.megatron.model_support.handlers.qwen3_moe import QWEN3_MOE_HANDLER
 
 _QWEN3_MOE_COMPILE_FLAGS = (
@@ -17,6 +20,14 @@ _QWEN35_MOE_COMPILE_FLAGS = (
     "te_triton_permute_with_mask_map",
     "weighted_bias_swiglu_no_inner_forward_cast",
 )
+_QWEN35_DENSE_COMPILE_FLAGS = ("te_layernorm_column_parallel_linear",)
+
+
+def test_qwen35_dense_compile_workarounds_cover_te_layernorm_linear() -> None:
+    provider = type("Provider", (), {"context_parallel_size": 1})()
+    config = QWEN3_5_DENSE_HANDLER.compile_workaround_config(provider)
+    assert config.flags == _QWEN35_DENSE_COMPILE_FLAGS
+    assert config.unconditional_flags == ()
 
 
 def test_qwen3_moe_compile_workarounds_cover_deepep_permute_restore() -> None:
