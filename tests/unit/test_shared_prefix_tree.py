@@ -80,7 +80,18 @@ def test_gdn_tree_parser_accepts_nested_tree() -> None:
     assert [
         sum(bucket.segment_count for bucket in buckets)
         for buckets in plan.tree_segment_buckets_by_depth
-    ] == [1, 2, 2]
+    ] == [0, 2, 2]
+    first_child_bucket, second_child_bucket = plan.tree_segment_buckets_by_depth[1]
+    assert first_child_bucket.parent_indices is not None
+    assert first_child_bucket.parent_indices.tolist() == [-1]
+    assert first_child_bucket.position_indices.tolist() == [[0], [1], [2]]
+    assert first_child_bucket.output_mask is not None
+    assert first_child_bucket.output_mask.tolist() == [[True], [True], [True]]
+    assert second_child_bucket.parent_indices is not None
+    assert second_child_bucket.parent_indices.tolist() == [-1]
+    assert second_child_bucket.position_indices.tolist() == [[0], [5]]
+    assert second_child_bucket.output_mask is not None
+    assert second_child_bucket.output_mask.tolist() == [[False], [True]]
 
 
 def test_gdn_tree_parser_accepts_zero_depth_roots() -> None:
