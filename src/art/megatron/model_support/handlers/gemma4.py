@@ -1108,9 +1108,10 @@ def _wrap_gemma4_attention_output_lora(
 
 
 def _to_vllm_key(key: str) -> str:
-    key = key.replace(".mlp.shared_expert.", ".mlp.").replace(
-        ".mlp.experts",
-        ".moe.experts",
+    key = (
+        key.replace(".mlp.shared_experts.", ".mlp.")
+        .replace(".mlp.shared_expert.", ".mlp.")
+        .replace(".mlp.experts", ".moe.experts")
     )
     return _HF_TEXT_EXPERT_KEY_RE.sub(r"\g<layer>.moe.experts", key)
 

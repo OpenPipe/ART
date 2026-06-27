@@ -19,6 +19,7 @@ from art.megatron.model_support.handlers import (
     QWEN3_5_MOE_HANDLER,
     QWEN3_MOE_HANDLER,
 )
+from art.megatron.model_support.handlers.gemma4 import GEMMA4_MOE_HANDLER
 from art.megatron.model_support.lora_disk import (
     load_lora_tensors_for_megatron,
     normalize_lora_checkpoint_to_vllm,
@@ -707,6 +708,42 @@ def test_qwen35_vllm_config_preserves_shared_expert_targets_when_present():
         adapter_config=vllm_config,
     )
     _assert_tensors_equal(roundtrip, original)
+
+
+def test_gemma4_shared_experts_plural_keys_map_to_vllm_dense_mlp():
+    art_prefix = "base_model.model.model.layers.0"
+    hidden_size = 2816
+    original = {
+        f"{art_prefix}.mlp.shared_experts.gate_proj.lora_A.weight": torch.ones(
+            2,
+            hidden_size,
+        ),
+        f"{art_prefix}.mlp.shared_experts.gate_proj.lora_B.weight": torch.ones(4, 2),
+        f"{art_prefix}.mlp.shared_experts.up_proj.lora_A.weight": torch.ones(
+            2,
+            hidden_size,
+        ),
+        f"{art_prefix}.mlp.shared_experts.up_proj.lora_B.weight": torch.ones(4, 2),
+        f"{art_prefix}.mlp.shared_experts.down_proj.lora_A.weight": torch.ones(2, 4),
+        f"{art_prefix}.mlp.shared_experts.down_proj.lora_B.weight": torch.ones(
+            hidden_size,
+            2,
+        ),
+    }
+    vllm_tensors, _ = GEMMA4_MOE_HANDLER.to_vllm_lora_tensors(
+        original,
+        adapter_config=_config("google/gemma-4-26B-A4B-it"),
+    )
+
+    assert set(vllm_tensors) == {
+        f"{art_prefix}.mlp.gate_proj.lora_A.weight",
+        f"{art_prefix}.mlp.gate_proj.lora_B.weight",
+        f"{art_prefix}.mlp.up_proj.lora_A.weight",
+        f"{art_prefix}.mlp.up_proj.lora_B.weight",
+        f"{art_prefix}.mlp.down_proj.lora_A.weight",
+        f"{art_prefix}.mlp.down_proj.lora_B.weight",
+    }
+    assert not any("shared_expert" in key for key in vllm_tensors)
 
 
 def test_qwen35_target_parameter_identity_normalizes_to_fused_vllm_layout(
