@@ -348,6 +348,10 @@ def config_from_env() -> TrainInfOutputParityConfig:
         "ART_TRAIN_INF_MISMATCH_VLLM_GPU_MEMORY_UTILIZATION"
     ):
         config.engine_args["gpu_memory_utilization"] = float(raw_vllm_memory)
+    if raw_gdn_backend := os.environ.get("ART_TRAIN_INF_MISMATCH_GDN_PREFILL_BACKEND"):
+        config.engine_args.setdefault("additional_config", {})[
+            "gdn_prefill_backend"
+        ] = raw_gdn_backend
     return config
 
 

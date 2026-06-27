@@ -270,6 +270,16 @@ def test_config_from_env_accepts_vllm_memory_utilization_override(
     assert config.engine_args["gpu_memory_utilization"] == 0.5
 
 
+def test_config_from_env_accepts_gdn_prefill_backend_override(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("ART_TRAIN_INF_MISMATCH_GDN_PREFILL_BACKEND", "triton")
+
+    config = config_from_env()
+
+    assert config.engine_args["additional_config"] == {"gdn_prefill_backend": "triton"}
+
+
 def test_default_rollout_modes_follow_model_support_native_lora_status() -> None:
     assert TrainInfOutputParityConfig(
         base_model="Qwen/Qwen3.5-35B-A3B"
