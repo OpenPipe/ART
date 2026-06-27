@@ -11,6 +11,7 @@ from art.megatron.shared_prefix_packing import (
     pack_shared_prefixes,
 )
 from art.trainer_rank import (
+    AdapterSelection,
     ForwardInput,
     ForwardOutput,
     TopK,
@@ -57,8 +58,8 @@ def _target_request(
     top_k: int | None = None,
     logits: bool = False,
     hidden_states: bool = False,
-    checkpoint: object = Unset,
-    lora: object = Unset,
+    checkpoint: AdapterSelection = Unset,
+    lora: AdapterSelection = Unset,
 ) -> ForwardInput:
     labels = (
         tokens
@@ -74,8 +75,8 @@ def _target_request(
         top_k=top_k,
         logits=logits,
         hidden_states=hidden_states,
-        checkpoint=checkpoint,  # type: ignore[arg-type]
-        lora=lora,  # type: ignore[arg-type]
+        checkpoint=checkpoint,
+        lora=lora,
     )
 
 

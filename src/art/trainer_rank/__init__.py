@@ -10,7 +10,16 @@ from collections.abc import (
 )
 from dataclasses import dataclass
 import os
-from typing import TYPE_CHECKING, Generic, Literal, ParamSpec, TypeVar, cast, overload
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    Generic,
+    Literal,
+    ParamSpec,
+    TypeVar,
+    cast,
+    overload,
+)
 
 import torch
 import torch.distributed as dist
@@ -79,7 +88,7 @@ class ForwardOutput(Generic[LogprobsT, TopKT, LogitsT, HiddenStatesT]):
     hidden_states: HiddenStatesT
 
 
-@dataclass(slots=True)
+@dataclass(slots=True, init=False)
 class ForwardInput(Generic[LogprobsT, TopKT, LogitsT, HiddenStatesT]):
     input_tokens: torch.Tensor
     target_tokens: torch.Tensor | None = None
@@ -88,6 +97,260 @@ class ForwardInput(Generic[LogprobsT, TopKT, LogitsT, HiddenStatesT]):
     hidden_states: bool = False
     checkpoint: AdapterSelection = Unset
     lora: AdapterSelection = Unset
+
+    @overload
+    def __new__(
+        cls,
+        *,
+        input_tokens: torch.Tensor,
+        target_tokens: None = None,
+        top_k: None = None,
+        logits: Literal[False] = False,
+        hidden_states: Literal[False] = False,
+        checkpoint: AdapterSelection = Unset,
+        lora: AdapterSelection = Unset,
+    ) -> "ForwardInput[None, None, None, None]": ...
+
+    @overload
+    def __new__(
+        cls,
+        *,
+        input_tokens: torch.Tensor,
+        target_tokens: torch.Tensor,
+        top_k: None = None,
+        logits: Literal[False] = False,
+        hidden_states: Literal[False] = False,
+        checkpoint: AdapterSelection = Unset,
+        lora: AdapterSelection = Unset,
+    ) -> "ForwardInput[torch.Tensor, None, None, None]": ...
+
+    @overload
+    def __new__(
+        cls,
+        *,
+        input_tokens: torch.Tensor,
+        target_tokens: None = None,
+        top_k: int,
+        logits: Literal[False] = False,
+        hidden_states: Literal[False] = False,
+        checkpoint: AdapterSelection = Unset,
+        lora: AdapterSelection = Unset,
+    ) -> "ForwardInput[None, TopK, None, None]": ...
+
+    @overload
+    def __new__(
+        cls,
+        *,
+        input_tokens: torch.Tensor,
+        target_tokens: None = None,
+        top_k: None = None,
+        logits: Literal[True],
+        hidden_states: Literal[False] = False,
+        checkpoint: AdapterSelection = Unset,
+        lora: AdapterSelection = Unset,
+    ) -> "ForwardInput[None, None, torch.Tensor, None]": ...
+
+    @overload
+    def __new__(
+        cls,
+        *,
+        input_tokens: torch.Tensor,
+        target_tokens: None = None,
+        top_k: None = None,
+        logits: Literal[False] = False,
+        hidden_states: Literal[True],
+        checkpoint: AdapterSelection = Unset,
+        lora: AdapterSelection = Unset,
+    ) -> "ForwardInput[None, None, None, torch.Tensor]": ...
+
+    @overload
+    def __new__(
+        cls,
+        *,
+        input_tokens: torch.Tensor,
+        target_tokens: torch.Tensor,
+        top_k: int,
+        logits: Literal[False] = False,
+        hidden_states: Literal[False] = False,
+        checkpoint: AdapterSelection = Unset,
+        lora: AdapterSelection = Unset,
+    ) -> "ForwardInput[torch.Tensor, TopK, None, None]": ...
+
+    @overload
+    def __new__(
+        cls,
+        *,
+        input_tokens: torch.Tensor,
+        target_tokens: torch.Tensor,
+        top_k: None = None,
+        logits: Literal[True],
+        hidden_states: Literal[False] = False,
+        checkpoint: AdapterSelection = Unset,
+        lora: AdapterSelection = Unset,
+    ) -> "ForwardInput[torch.Tensor, None, torch.Tensor, None]": ...
+
+    @overload
+    def __new__(
+        cls,
+        *,
+        input_tokens: torch.Tensor,
+        target_tokens: torch.Tensor,
+        top_k: None = None,
+        logits: Literal[False] = False,
+        hidden_states: Literal[True],
+        checkpoint: AdapterSelection = Unset,
+        lora: AdapterSelection = Unset,
+    ) -> "ForwardInput[torch.Tensor, None, None, torch.Tensor]": ...
+
+    @overload
+    def __new__(
+        cls,
+        *,
+        input_tokens: torch.Tensor,
+        target_tokens: None = None,
+        top_k: int,
+        logits: Literal[True],
+        hidden_states: Literal[False] = False,
+        checkpoint: AdapterSelection = Unset,
+        lora: AdapterSelection = Unset,
+    ) -> "ForwardInput[None, TopK, torch.Tensor, None]": ...
+
+    @overload
+    def __new__(
+        cls,
+        *,
+        input_tokens: torch.Tensor,
+        target_tokens: None = None,
+        top_k: int,
+        logits: Literal[False] = False,
+        hidden_states: Literal[True],
+        checkpoint: AdapterSelection = Unset,
+        lora: AdapterSelection = Unset,
+    ) -> "ForwardInput[None, TopK, None, torch.Tensor]": ...
+
+    @overload
+    def __new__(
+        cls,
+        *,
+        input_tokens: torch.Tensor,
+        target_tokens: None = None,
+        top_k: None = None,
+        logits: Literal[True],
+        hidden_states: Literal[True],
+        checkpoint: AdapterSelection = Unset,
+        lora: AdapterSelection = Unset,
+    ) -> "ForwardInput[None, None, torch.Tensor, torch.Tensor]": ...
+
+    @overload
+    def __new__(
+        cls,
+        *,
+        input_tokens: torch.Tensor,
+        target_tokens: torch.Tensor,
+        top_k: int,
+        logits: Literal[True],
+        hidden_states: Literal[False] = False,
+        checkpoint: AdapterSelection = Unset,
+        lora: AdapterSelection = Unset,
+    ) -> "ForwardInput[torch.Tensor, TopK, torch.Tensor, None]": ...
+
+    @overload
+    def __new__(
+        cls,
+        *,
+        input_tokens: torch.Tensor,
+        target_tokens: torch.Tensor,
+        top_k: int,
+        logits: Literal[False] = False,
+        hidden_states: Literal[True],
+        checkpoint: AdapterSelection = Unset,
+        lora: AdapterSelection = Unset,
+    ) -> "ForwardInput[torch.Tensor, TopK, None, torch.Tensor]": ...
+
+    @overload
+    def __new__(
+        cls,
+        *,
+        input_tokens: torch.Tensor,
+        target_tokens: torch.Tensor,
+        top_k: None = None,
+        logits: Literal[True],
+        hidden_states: Literal[True],
+        checkpoint: AdapterSelection = Unset,
+        lora: AdapterSelection = Unset,
+    ) -> "ForwardInput[torch.Tensor, None, torch.Tensor, torch.Tensor]": ...
+
+    @overload
+    def __new__(
+        cls,
+        *,
+        input_tokens: torch.Tensor,
+        target_tokens: None = None,
+        top_k: int,
+        logits: Literal[True],
+        hidden_states: Literal[True],
+        checkpoint: AdapterSelection = Unset,
+        lora: AdapterSelection = Unset,
+    ) -> "ForwardInput[None, TopK, torch.Tensor, torch.Tensor]": ...
+
+    @overload
+    def __new__(
+        cls,
+        *,
+        input_tokens: torch.Tensor,
+        target_tokens: torch.Tensor,
+        top_k: int,
+        logits: Literal[True],
+        hidden_states: Literal[True],
+        checkpoint: AdapterSelection = Unset,
+        lora: AdapterSelection = Unset,
+    ) -> "ForwardInput[torch.Tensor, TopK, torch.Tensor, torch.Tensor]": ...
+
+    @overload
+    def __new__(
+        cls,
+        *,
+        input_tokens: torch.Tensor,
+        target_tokens: torch.Tensor | None = None,
+        top_k: int | None = None,
+        logits: bool = False,
+        hidden_states: bool = False,
+        checkpoint: AdapterSelection = Unset,
+        lora: AdapterSelection = Unset,
+    ) -> "ForwardInput[torch.Tensor | None, TopK | None, torch.Tensor | None, torch.Tensor | None]": ...
+
+    def __new__(
+        cls,
+        *,
+        input_tokens: torch.Tensor,
+        target_tokens: torch.Tensor | None = None,
+        top_k: int | None = None,
+        logits: bool = False,
+        hidden_states: bool = False,
+        checkpoint: AdapterSelection = Unset,
+        lora: AdapterSelection = Unset,
+    ) -> Any:
+        return object.__new__(cls)
+
+    def __init__(
+        self,
+        *,
+        input_tokens: torch.Tensor,
+        target_tokens: torch.Tensor | None = None,
+        top_k: int | None = None,
+        logits: bool = False,
+        hidden_states: bool = False,
+        checkpoint: AdapterSelection = Unset,
+        lora: AdapterSelection = Unset,
+    ) -> None:
+        self.input_tokens = input_tokens
+        self.target_tokens = target_tokens
+        self.top_k = top_k
+        self.logits = logits
+        self.hidden_states = hidden_states
+        self.checkpoint = checkpoint
+        self.lora = lora
+        self.__post_init__()
 
     def __post_init__(self) -> None:
         if self.top_k is not None and self.top_k < 1:
