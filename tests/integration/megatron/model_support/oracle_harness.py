@@ -2193,12 +2193,6 @@ def run_sensitivity_suite(
     reports: list[VariantReport] = []
     ran_any_variants = False
     for objective in selected_oracle_objectives():
-        runner = VariantRunner(
-            objective=objective,
-            case_config=case_config,
-            oracle_flex_backend=oracle_flex_backend,
-            variant_flex_backend=variant_flex_backend,
-        )
         objective_mutations = selected_sensitivity_mutations_for_objective(
             objective,
             mutations,
@@ -2206,29 +2200,86 @@ def run_sensitivity_suite(
         )
         if not objective_mutations:
             continue
-        variants = []
-        for mutation in objective_mutations:
-            topology = sensitivity_topology_for_mutation(
-                mutation,
-                is_moe=case_config.is_moe,
-            )
-            if max_world_size is not None and topology.world_size() > max_world_size:
+        for flex_backend, flex_mutations in (
+            (
+                None,
+                [
+                    mutation
+                    for mutation in objective_mutations
+                    if mutation != "attn_skip_flash_lse_normalize"
+                ],
+            ),
+            (
+                "FLASH",
+                [
+                    mutation
+                    for mutation in objective_mutations
+                    if mutation == "attn_skip_flash_lse_normalize"
+                ],
+            ),
+        ):
+            if not flex_mutations:
                 continue
-            variants.append(
-                VariantSpec(
-                    name=f"{objective}_sensitivity_{mutation}",
-                    objective=objective,
-                    topology=topology,
-                    mutation=mutation,
-                    expected_signal="fail",
-                    pass_fn_by_phase=phase_pass,
-                    flex_backend=variant_flex_backend,
+            oracle_slug = (
+                None
+                if flex_backend is None
+                else oracle_output_slug(
+                    objective,
+                    oracle_topology(is_moe=case_config.is_moe),
+                    "flash",
                 )
             )
-        if not variants:
-            continue
-        ran_any_variants = True
-        reports.extend(runner.run_suite(variants))
+            runner = VariantRunner(
+                objective=objective,
+                case_config=case_config,
+                oracle_flex_backend=(
+                    oracle_flex_backend if flex_backend is None else flex_backend
+                ),
+                variant_flex_backend=(
+                    variant_flex_backend if flex_backend is None else flex_backend
+                ),
+                oracle_slug_override=oracle_slug,
+            )
+            variants = []
+            for mutation in flex_mutations:
+                topology = sensitivity_topology_for_mutation(
+                    mutation,
+                    is_moe=case_config.is_moe,
+                )
+                if (
+                    max_world_size is not None
+                    and topology.world_size() > max_world_size
+                ):
+                    continue
+                variants.append(
+                    VariantSpec(
+                        name=f"{objective}_sensitivity_{mutation}",
+                        objective=objective,
+                        topology=topology,
+                        output_slug=(
+                            None
+                            if flex_backend is None
+                            else oracle_output_slug(
+                                objective,
+                                topology,
+                                f"{mutation}_flash",
+                            )
+                        ),
+                        reference_slug=oracle_slug,
+                        mutation=mutation,
+                        expected_signal="fail",
+                        pass_fn_by_phase=phase_pass,
+                        flex_backend=(
+                            variant_flex_backend
+                            if flex_backend is None
+                            else flex_backend
+                        ),
+                    )
+                )
+            if not variants:
+                continue
+            ran_any_variants = True
+            reports.extend(runner.run_suite(variants))
     if ran_any_variants:
         return reports
     requested = ", ".join(mutations)
