@@ -76,6 +76,7 @@ def run_train_inf_mismatch(
         "1" if allow_unvalidated_arch else "0"
     )
     env["ART_REAL_PATH_MAX_COMPLETION_TOKENS"] = "16"
+    env.setdefault("ART_TRAIN_INF_MISMATCH_VLLM_GPU_MEMORY_UTILIZATION", "0.50")
     existing_pythonpath = env.get("PYTHONPATH")
     tests_dir = str(REPO_ROOT / "tests")
     env["PYTHONPATH"] = (

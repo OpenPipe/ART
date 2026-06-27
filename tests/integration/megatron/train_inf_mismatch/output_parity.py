@@ -344,6 +344,10 @@ def config_from_env() -> TrainInfOutputParityConfig:
         config.topology = config.topology.model_copy(update={"ep": 1, "etp": 1})
     if raw_targets := os.environ.get("ART_TRAIN_INF_MISMATCH_LORA_TARGET_MODULES"):
         config.lora_target_modules = _parse_str_list(raw_targets)
+    if raw_vllm_memory := os.environ.get(
+        "ART_TRAIN_INF_MISMATCH_VLLM_GPU_MEMORY_UTILIZATION"
+    ):
+        config.engine_args["gpu_memory_utilization"] = float(raw_vllm_memory)
     return config
 
 

@@ -260,6 +260,16 @@ def test_config_from_env_accepts_lora_target_module_override(
     assert config.lora_target_modules == ["experts", "in_proj_qkv", "in_proj_z"]
 
 
+def test_config_from_env_accepts_vllm_memory_utilization_override(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("ART_TRAIN_INF_MISMATCH_VLLM_GPU_MEMORY_UTILIZATION", "0.5")
+
+    config = config_from_env()
+
+    assert config.engine_args["gpu_memory_utilization"] == 0.5
+
+
 def test_default_rollout_modes_follow_model_support_native_lora_status() -> None:
     assert TrainInfOutputParityConfig(
         base_model="Qwen/Qwen3.5-35B-A3B"
@@ -317,3 +327,4 @@ def test_workflow_stage_enables_live_train_inf_mismatch(
     assert captured_env["ART_RUN_TRAIN_INF_MISMATCH_LIVE"] == "1"
     assert captured_env["ART_TRAIN_INF_MISMATCH_ALLOW_UNVALIDATED_ARCH"] == "1"
     assert captured_env["ART_REAL_PATH_MAX_COMPLETION_TOKENS"] == "16"
+    assert captured_env["ART_TRAIN_INF_MISMATCH_VLLM_GPU_MEMORY_UTILIZATION"] == "0.50"
