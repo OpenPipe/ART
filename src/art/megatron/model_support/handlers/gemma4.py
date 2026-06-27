@@ -62,6 +62,10 @@ _DENSE_MLP_LORA_KEY_RE = re.compile(
     r"(?P<prefix>\.mlp)\.(?P<module>gate_proj|up_proj|down_proj)\."
     r"(?P<lora>lora_[AB])\.weight$"
 )
+_SHARED_EXPERT_FC1_LORA_A_KEY_RE = re.compile(
+    r"^.*\.layers\.(?P<layer>\d+)\.mlp\.(?:shared_experts\.)?"
+    r"(?:gate_proj|up_proj)\.lora_A\.weight$"
+)
 _SELF_ATTN_V_LORA_KEY_RE = re.compile(
     r"^(?P<prefix>.*\.layers\.(?P<layer>\d+)\.self_attn\.)v_proj\."
     r"(?P<suffix>lora_[AB]\.weight)$"
@@ -1108,7 +1112,7 @@ def _to_vllm_key(key: str) -> str:
 def _from_vllm_key(key: str) -> str:
     key = key.replace(".moe.experts", ".mlp.experts")
     return _DENSE_MLP_LORA_KEY_RE.sub(
-        r"\g<prefix>.shared_expert.\g<module>.\g<lora>.weight",
+        r"\g<prefix>.shared_experts.\g<module>.\g<lora>.weight",
         key,
     )
 
@@ -1158,6 +1162,85 @@ def _gemma4_k_eq_v_layers(adapter_config: dict[str, Any]) -> set[int]:
         for layer_idx, layer_type in enumerate(config["layer_types"])
         if layer_type == "full_attention"
     }
+
+
+def _gemma4_hf_file(base_model_name_or_path: str, filename: str) -> Path:
+    base_path = Path(base_model_name_or_path)
+    if base_path.exists():
+        return base_path / filename
+    from huggingface_hub import hf_hub_download
+
+    return Path(
+        hf_hub_download(
+            base_model_name_or_path,
+            filename,
+            local_files_only=True,
+        )
+    )
+
+
+@lru_cache(maxsize=8)
+def _gemma4_shared_expert_prenorm_corrections(
+    base_model_name_or_path: str,
+) -> tuple[torch.Tensor, ...]:
+    from safetensors import safe_open
+
+    index = json.loads(
+        _gemma4_hf_file(
+            base_model_name_or_path,
+            "model.safetensors.index.json",
+        ).read_text(encoding="utf-8")
+    )
+    weight_map = dict(index["weight_map"])
+    text_config = _gemma4_text_config_dict(base_model_name_or_path)
+    norm_keys_by_file: dict[str, list[tuple[int, str, str]]] = {}
+    for layer in range(int(text_config["num_hidden_layers"])):
+        for suffix in (
+            "pre_feedforward_layernorm",
+            "pre_feedforward_layernorm_2",
+        ):
+            candidates = (
+                f"model.language_model.layers.{layer}.{suffix}.weight",
+                f"model.layers.{layer}.{suffix}.weight",
+            )
+            key = next(candidate for candidate in candidates if candidate in weight_map)
+            norm_keys_by_file.setdefault(weight_map[key], []).append(
+                (layer, suffix, key)
+            )
+
+    norm_weights: dict[tuple[int, str], torch.Tensor] = {}
+    for filename, entries in norm_keys_by_file.items():
+        with safe_open(
+            _gemma4_hf_file(base_model_name_or_path, filename),
+            framework="pt",
+            device="cpu",
+        ) as handle:
+            for layer, suffix, key in entries:
+                norm_weights[(layer, suffix)] = handle.get_tensor(key).float()
+
+    return tuple(
+        norm_weights[(layer, "pre_feedforward_layernorm")]
+        / norm_weights[(layer, "pre_feedforward_layernorm_2")]
+        for layer in range(int(text_config["num_hidden_layers"]))
+    )
+
+
+def _rescale_shared_expert_fc1_lora_a(
+    key: str,
+    tensor: torch.Tensor,
+    *,
+    adapter_config: dict[str, Any],
+    to_vllm: bool,
+) -> torch.Tensor:
+    match = _SHARED_EXPERT_FC1_LORA_A_KEY_RE.match(key)
+    if match is None:
+        return tensor
+    corrections = _gemma4_shared_expert_prenorm_corrections(
+        str(adapter_config["base_model_name_or_path"])
+    )
+    correction = corrections[int(match.group("layer"))].to(device=tensor.device)
+    factor = correction.reciprocal() if to_vllm else correction
+    return (tensor.float() * factor.unsqueeze(0)).to(tensor.dtype).contiguous()
 
 
 def _drop_gemma4_k_eq_v_v_lora_tensors(
@@ -1229,7 +1312,12 @@ def _to_vllm_lora_tensors(
     grouped = _group_art_moe_tensors(tensors)
     if not grouped:
         transformed = {
-            vllm_key: tensor
+            vllm_key: _rescale_shared_expert_fc1_lora_a(
+                vllm_key,
+                tensor,
+                adapter_config=adapter_config,
+                to_vllm=True,
+            )
             for key, tensor in tensors.items()
             for vllm_key in (_to_vllm_key(key),)
         }
@@ -1292,7 +1380,12 @@ def _to_vllm_lora_tensors(
             raise RuntimeError(
                 f"Duplicate Gemma 4 LoRA tensor after conversion: {vllm_key}"
             )
-        transformed[vllm_key] = tensor
+        transformed[vllm_key] = _rescale_shared_expert_fc1_lora_a(
+            vllm_key,
+            tensor,
+            adapter_config=adapter_config,
+            to_vllm=True,
+        )
     transformed = _add_gemma4_k_eq_v_v_lora_tensors(
         transformed,
         adapter_config=adapter_config,
@@ -1336,7 +1429,12 @@ def _from_vllm_lora_tensors(
     if not grouped:
         return _drop_gemma4_k_eq_v_v_lora_tensors(
             {
-                art_key: tensor
+                art_key: _rescale_shared_expert_fc1_lora_a(
+                    art_key,
+                    tensor,
+                    adapter_config=adapter_config,
+                    to_vllm=False,
+                )
                 for key, tensor in tensors.items()
                 for art_key in (_from_vllm_key(key),)
             },
@@ -1403,7 +1501,12 @@ def _from_vllm_lora_tensors(
             raise RuntimeError(
                 f"Duplicate Gemma 4 LoRA tensor after conversion: {art_key}"
             )
-        transformed[art_key] = tensor
+        transformed[art_key] = _rescale_shared_expert_fc1_lora_a(
+            art_key,
+            tensor,
+            adapter_config=adapter_config,
+            to_vllm=False,
+        )
     return _drop_gemma4_k_eq_v_v_lora_tensors(
         transformed,
         adapter_config=adapter_config,
@@ -1460,7 +1563,12 @@ def _from_vllm_per_expert_lora_tensors(
                 "Mixed fused and per-expert Gemma 4 vLLM MoE LoRA tensors"
             )
         art_key = _from_vllm_key(key)
-        transformed[art_key] = tensor
+        transformed[art_key] = _rescale_shared_expert_fc1_lora_a(
+            art_key,
+            tensor,
+            adapter_config=adapter_config,
+            to_vllm=False,
+        )
     return transformed
 
 

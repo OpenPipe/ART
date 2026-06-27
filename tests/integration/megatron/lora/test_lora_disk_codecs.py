@@ -710,9 +710,41 @@ def test_qwen35_vllm_config_preserves_shared_expert_targets_when_present():
     _assert_tensors_equal(roundtrip, original)
 
 
-def test_gemma4_shared_experts_plural_keys_map_to_vllm_dense_mlp():
+def test_gemma4_shared_experts_plural_keys_map_to_vllm_dense_mlp(tmp_path: Path):
     art_prefix = "base_model.model.model.layers.0"
-    hidden_size = 2816
+    hidden_size = 3
+    model_dir = tmp_path / "gemma4"
+    model_dir.mkdir()
+    (model_dir / "config.json").write_text(
+        json.dumps({"num_hidden_layers": 1}),
+        encoding="utf-8",
+    )
+    save_file(
+        {
+            "model.layers.0.pre_feedforward_layernorm.weight": torch.tensor(
+                [2.0, 4.0, 8.0]
+            ),
+            "model.layers.0.pre_feedforward_layernorm_2.weight": torch.tensor(
+                [1.0, 2.0, 4.0]
+            ),
+        },
+        model_dir / "model-00001-of-00001.safetensors",
+    )
+    (model_dir / "model.safetensors.index.json").write_text(
+        json.dumps(
+            {
+                "weight_map": {
+                    "model.layers.0.pre_feedforward_layernorm.weight": (
+                        "model-00001-of-00001.safetensors"
+                    ),
+                    "model.layers.0.pre_feedforward_layernorm_2.weight": (
+                        "model-00001-of-00001.safetensors"
+                    ),
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
     original = {
         f"{art_prefix}.mlp.shared_experts.gate_proj.lora_A.weight": torch.ones(
             2,
@@ -730,9 +762,10 @@ def test_gemma4_shared_experts_plural_keys_map_to_vllm_dense_mlp():
             2,
         ),
     }
+    adapter_config = _config(str(model_dir))
     vllm_tensors, _ = GEMMA4_MOE_HANDLER.to_vllm_lora_tensors(
         original,
-        adapter_config=_config("google/gemma-4-26B-A4B-it"),
+        adapter_config=adapter_config,
     )
 
     assert set(vllm_tensors) == {
@@ -744,6 +777,15 @@ def test_gemma4_shared_experts_plural_keys_map_to_vllm_dense_mlp():
         f"{art_prefix}.mlp.down_proj.lora_B.weight",
     }
     assert not any("shared_expert" in key for key in vllm_tensors)
+    assert torch.equal(
+        vllm_tensors[f"{art_prefix}.mlp.gate_proj.lora_A.weight"],
+        torch.full((2, hidden_size), 0.5),
+    )
+    roundtrip = GEMMA4_MOE_HANDLER.from_vllm_lora_tensors(
+        vllm_tensors,
+        adapter_config=adapter_config,
+    )
+    _assert_tensors_equal(roundtrip, original)
 
 
 def test_qwen35_target_parameter_identity_normalizes_to_fused_vllm_layout(
