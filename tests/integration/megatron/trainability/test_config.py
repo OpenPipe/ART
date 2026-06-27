@@ -155,7 +155,7 @@ def test_qwen3_5_defaults_to_shared_lora_rollout() -> None:
 
 
 def test_qwen3_5_length_trainability_uses_stable_learning_rate() -> None:
-    assert _default_learning_rate("Qwen/Qwen3.5-35B-A3B") == 5e-5
+    assert _default_learning_rate("Qwen/Qwen3.5-35B-A3B") == 7e-5
     assert _default_learning_rate("Qwen/Qwen3-30B-A3B-Instruct-2507") == 1e-4
 
 
