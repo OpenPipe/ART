@@ -269,7 +269,10 @@ def _tree_trainability_worker(
             context_parallel_size=cp_size,
             expert_model_parallel_size=1,
         )
-        _, cp_gdn = _make_matching_gdn_pair(cp_size=cp_size, params_dtype=torch.float32)
+        _, cp_gdn = _make_matching_gdn_pair(
+            cp_size=cp_size,
+            params_dtype=GDN_CORRECTNESS_DTYPE,
+        )
         pack = _tree_trainability_pack()
         group_ids = pack.group_ids.cuda()
         parent_ids = pack.parent_ids.cuda()
@@ -287,7 +290,7 @@ def _tree_trainability_worker(
             plan.attention_token_indices, device=hidden.device, dtype=torch.long
         )
         local_hidden = flat_hidden.index_select(0, local_index).unsqueeze(1)
-        optimizer = torch.optim.SGD(cp_gdn.parameters(), lr=5e-3)
+        optimizer = torch.optim.SGD(cp_gdn.parameters(), lr=5e-2)
 
         initial_loss = _tree_training_loss_value(
             cp_gdn,
@@ -722,7 +725,7 @@ def _tree_trainability_hidden(sequence_length: int, *, cp_size: int) -> torch.Te
         1,
         64,
         device="cuda",
-        dtype=torch.float32,
+        dtype=GDN_CORRECTNESS_DTYPE,
         generator=generator,
     )
     torch.distributed.broadcast(hidden, src=0)
