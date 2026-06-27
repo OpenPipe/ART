@@ -10,6 +10,7 @@ from art.megatron.model_support.spec import (
 
 from .validation_spec import ValidationReport, ValidationStageResult
 from .workflow import (
+    INCLUDE_FLASH_SENSITIVITY_ENV,
     KEEP_TOPOLOGY_ARTIFACTS_ENV,
     MANDATORY_VALIDATION_STAGES,
     NATIVE_VLLM_LORA_STAGE,
@@ -34,6 +35,7 @@ from .workflow import (
 
 @pytest.fixture(autouse=True)
 def _stub_pinned_git_state(monkeypatch) -> None:
+    monkeypatch.delenv(INCLUDE_FLASH_SENSITIVITY_ENV, raising=False)
     monkeypatch.setattr(
         "tests.integration.megatron.model_support.workflow.pinned_git_state",
         lambda suite_name: SimpleNamespace(
@@ -698,6 +700,9 @@ def test_run_correctness_sensitivity_stage_runs_dense_models(monkeypatch) -> Non
     assert result.metrics["correctness_variant_count"] == 1
     assert result.metrics["correctness_excluded_topologies"] == []
     assert result.metrics["sensitivity_mutations"] == ["skip_finalize"]
+    assert result.metrics["default_excluded_sensitivity_mutations"] == [
+        "attn_skip_flash_lse_normalize"
+    ]
     assert case_configs[0].is_moe is False
 
 
@@ -721,7 +726,10 @@ def test_run_yes_no_trainability_stage(monkeypatch) -> None:
                         "saturated_step": 2,
                     },
                 )
-            )
+            ),
+            yes_no_trainability_passed=lambda report: (
+                report.final_eval_reward >= report.reward_threshold
+            ),
         ),
     )
 
@@ -1043,6 +1051,9 @@ def test_run_correctness_sensitivity_stage_summarizes_reports(monkeypatch) -> No
     assert stage.metrics["is_moe"] is True
     assert stage.metrics["objectives"] == ["sft"]
     assert stage.metrics["sensitivity_mutations"] == ["skip_finalize"]
+    assert stage.metrics["default_excluded_sensitivity_mutations"] == [
+        "attn_skip_flash_lse_normalize"
+    ]
     assert stage.metrics["available_gpu_count"] == 2
     assert stage.metrics["required_gpu_count"] == 1
     assert stage.metrics["correctness_variant_count"] == 1
@@ -1109,6 +1120,7 @@ def test_run_correctness_sensitivity_stage_can_skip_sensitivity_only(
     assert stage.metrics["required_gpu_count"] == 1
     assert stage.metrics["correctness_variant_count"] == 1
     assert stage.metrics["sensitivity_mutations"] == []
+    assert stage.metrics["default_excluded_sensitivity_mutations"] == []
     assert stage.metrics["sensitivity_skipped"] is True
     assert stage.metrics["sensitivity_skip_reason"] == f"{SKIP_SENSITIVITY_ENV}=1"
     assert stage.metrics["sensitivity_variant_count"] == 0

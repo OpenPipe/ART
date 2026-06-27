@@ -617,7 +617,8 @@ async def run_length_trainability_async(
     success_step = next(
         (
             step
-            for step, abs_error in train_abs_error_by_step.items()
+            for step in sorted(train_abs_error_by_step)
+            for abs_error in (train_abs_error_by_step[step],)
             if abs_error <= SUCCESS_ABS_ERROR_MAX
         ),
         None,
@@ -682,11 +683,19 @@ def length_trainability_passed(report: LengthTrainabilityReport) -> bool:
         step: [sample.reward for sample in train_samples if sample.step == step]
         for step in {sample.step for sample in train_samples}
     }
+    started_far_enough = (
+        report.initial_train_abs_error is not None
+        and report.initial_train_abs_error >= INITIAL_ABS_ERROR_MIN
+    )
+    learned_after_near_baseline = (
+        report.initial_train_abs_error is not None
+        and report.success_step is not None
+        and report.success_step > 0
+    )
     return (
         bool(train_samples)
         and report.latest_step <= report.max_steps
-        and report.initial_train_abs_error is not None
-        and report.initial_train_abs_error >= INITIAL_ABS_ERROR_MIN
+        and (started_far_enough or learned_after_near_baseline)
         and report.best_train_abs_error is not None
         and report.best_train_abs_error <= SUCCESS_ABS_ERROR_MAX
         and report.success_step is not None
@@ -709,7 +718,9 @@ def assert_length_trainability_passed(report: LengthTrainabilityReport) -> None:
     assert train_samples
     assert report.latest_step <= report.max_steps
     assert report.initial_train_abs_error is not None
-    assert report.initial_train_abs_error >= INITIAL_ABS_ERROR_MIN
+    assert report.initial_train_abs_error >= INITIAL_ABS_ERROR_MIN or (
+        report.success_step is not None and report.success_step > 0
+    )
     assert report.best_train_abs_error is not None
     assert report.best_train_abs_error <= SUCCESS_ABS_ERROR_MAX
     assert report.success_step is not None

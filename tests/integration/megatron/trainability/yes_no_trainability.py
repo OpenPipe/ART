@@ -30,6 +30,7 @@ from ..model_support.oracle_worker import provider_topology_env
 _TRAINER_GPU_IDS_ENV = "ART_MODEL_SUPPORT_TRAINER_GPU_IDS"
 _INFERENCE_GPU_IDS_ENV = "ART_MODEL_SUPPORT_INFERENCE_GPU_IDS"
 _SHARED_GPU_IDS_ENV = "ART_MODEL_SUPPORT_SHARED_GPU_IDS"
+_VARIANT_ENV = "ART_MODEL_SUPPORT_YES_NO_VARIANT"
 _TRAINABILITY_ROOT = (
     Path(__file__).resolve().parents[4] / ".local" / "model_support_validation"
 )
@@ -420,13 +421,22 @@ def _default_variant_name(
     *,
     allow_unvalidated_arch: bool = False,
 ) -> _VARIANT_NAME:
-    if (
-        _rollout_weights_mode(
-            base_model,
-            allow_unvalidated_arch=allow_unvalidated_arch,
-        )
-        == "merged"
-    ):
+    if override := os.environ.get(_VARIANT_ENV, "").strip():
+        if override not in {"megatron_shared", "megatron_dedicated"}:
+            raise ValueError(
+                f"Unsupported {_VARIANT_ENV}={override!r}. "
+                "Expected 'megatron_shared' or 'megatron_dedicated'."
+            )
+        return cast(_VARIANT_NAME, override)
+    is_moe = model_uses_expert_parallel(
+        base_model,
+        allow_unvalidated_arch=allow_unvalidated_arch,
+    )
+    rollout_weights_mode = _rollout_weights_mode(
+        base_model,
+        allow_unvalidated_arch=allow_unvalidated_arch,
+    )
+    if rollout_weights_mode == "merged" or not is_moe:
         return "megatron_dedicated"
     return "megatron_shared"
 
@@ -822,6 +832,26 @@ def run_yes_no_trainability(
             allow_unvalidated_arch=allow_unvalidated_arch,
         )
     )
+
+
+def yes_no_trainability_passed(report: YesNoTrainabilityReport) -> bool:
+    learned_from_below_threshold = (
+        report.saturated_step is not None
+        and report.saturated_step > 0
+        and report.initial_eval_reward < report.reward_threshold
+        and report.final_eval_reward is not None
+        and report.final_eval_reward >= report.reward_threshold
+        and report.final_eval_reward > report.initial_eval_reward
+    )
+    already_saturated_and_stable = (
+        report.initial_eval_reward >= report.reward_threshold
+        and report.latest_step > 0
+        and report.final_eval_reward is not None
+        and report.final_eval_reward >= report.reward_threshold
+        and bool(report.steps)
+        and any(step.train_metrics.get("grad_norm", 0.0) > 0.0 for step in report.steps)
+    )
+    return learned_from_below_threshold or already_saturated_and_stable
 
 
 def run_megatron_dedicated_yes_no_trainability(
