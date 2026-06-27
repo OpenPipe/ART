@@ -32,6 +32,8 @@ from .yes_no_trainability import (
 torch = pytest.importorskip("torch")
 
 DEFAULT_BASE_MODEL = "Qwen/Qwen3.5-35B-A3B"
+DEFAULT_LENGTH_LEARNING_RATE = 1e-4
+LARGE_MOE_LENGTH_LEARNING_RATE = 5e-5
 LIVE_ENV = "ART_RUN_LIVE_LENGTH_TRAINABILITY"
 TRAINER_GPU_IDS_ENV = "ART_MODEL_SUPPORT_TRAINER_GPU_IDS"
 INFERENCE_GPU_IDS_ENV = "ART_MODEL_SUPPORT_INFERENCE_GPU_IDS"
@@ -187,6 +189,12 @@ def _word_count(text: str) -> int:
 
 def _target_tokens() -> int:
     return _get_env_int("ART_MODEL_SUPPORT_LENGTH_TARGET_TOKENS", 10)
+
+
+def _default_learning_rate(base_model: str) -> float:
+    if base_model == DEFAULT_BASE_MODEL:
+        return LARGE_MOE_LENGTH_LEARNING_RATE
+    return DEFAULT_LENGTH_LEARNING_RATE
 
 
 def _use_default_moe_dedicated_placement(variant: Any, *, base_model: str) -> None:
@@ -578,7 +586,7 @@ async def run_length_trainability_async(
             max_steps_off_policy=max_steps_off_policy,
             learning_rate=_get_env_float(
                 "ART_MODEL_SUPPORT_LENGTH_LEARNING_RATE",
-                1e-4,
+                _default_learning_rate(base_model),
             ),
             loss_fn="cispo",
             normalize_advantages=normalize_advantages,

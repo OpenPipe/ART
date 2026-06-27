@@ -7,6 +7,7 @@ import pytest
 
 import art
 
+from .test_live_length_trainability import _default_learning_rate
 from .yes_no_trainability import (
     _build_internal_config,
     _build_variant,
@@ -151,6 +152,11 @@ def test_qwen3_5_defaults_to_shared_lora_rollout() -> None:
     assert config["rollout_weights_mode"] == "lora"
     assert "trainer_gpu_ids" not in config
     assert "inference_gpu_ids" not in config
+
+
+def test_qwen3_5_length_trainability_uses_stable_learning_rate() -> None:
+    assert _default_learning_rate("Qwen/Qwen3.5-35B-A3B") == 5e-5
+    assert _default_learning_rate("Qwen/Qwen3-30B-A3B-Instruct-2507") == 1e-4
 
 
 def test_validated_dense_model_uses_dense_shared_topology(
