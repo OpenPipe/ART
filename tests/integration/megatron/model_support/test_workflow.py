@@ -10,6 +10,7 @@ from art.megatron.model_support.spec import (
 
 from .validation_spec import ValidationReport, ValidationStageResult
 from .workflow import (
+    KEEP_TOPOLOGY_ARTIFACTS_ENV,
     MANDATORY_VALIDATION_STAGES,
     NATIVE_VLLM_LORA_STAGE,
     SKIP_SENSITIVITY_ENV,
@@ -368,6 +369,49 @@ def test_build_validation_report_populates_architecture_stage(
         "step1_served": True,
     }
     assert native_vllm_lora_stage.artifact_dir == "/tmp/native-vllm-lora"
+
+
+def test_build_validation_report_preserves_traces_when_sensitivity_runs(
+    monkeypatch,
+) -> None:
+    seen_keep_env: list[str | None] = []
+
+    monkeypatch.delenv(KEEP_TOPOLOGY_ARTIFACTS_ENV, raising=False)
+    monkeypatch.setattr(
+        "tests.integration.megatron.model_support.workflow.inspect_architecture",
+        lambda base_model: ArchitectureReport(
+            base_model=base_model,
+            model_key="qwen3_5_moe",
+            handler_key="qwen3_5_moe",
+            layer_families=[LayerFamilyInstance(key="standard_attention", count=1)],
+            recommended_min_layers=1,
+        ),
+    )
+
+    def _run_stage_in_subprocess(
+        *,
+        stage_name,
+        base_model,
+        architecture,
+        allow_unvalidated_arch=False,
+    ) -> ValidationStageResult:
+        del base_model, architecture, allow_unvalidated_arch
+        if stage_name == "correctness_sensitivity":
+            seen_keep_env.append(os.environ.get(KEEP_TOPOLOGY_ARTIFACTS_ENV))
+        return ValidationStageResult(name=stage_name, passed=True, metrics={})
+
+    monkeypatch.setattr(
+        "tests.integration.megatron.model_support.workflow._run_stage_in_subprocess",
+        _run_stage_in_subprocess,
+    )
+
+    build_validation_report(
+        base_model="Qwen/Qwen3.5-35B-A3B",
+        include_sensitivity=True,
+    )
+
+    assert seen_keep_env == ["1"]
+    assert os.environ.get(KEEP_TOPOLOGY_ARTIFACTS_ENV) is None
 
 
 def test_build_validation_report_captures_hf_parity_failure(monkeypatch) -> None:

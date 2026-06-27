@@ -37,6 +37,7 @@ SENSITIVITY_LOG_PATH = LOCAL_LOG_DIR / "sensitivity.log"
 LIVE_TRAINING_LOG_PATH = LOCAL_LOG_DIR / "live_training.log"
 ORACLE_LIVE_TRAINING_LOG_ENV = "ART_ORACLE_LIVE_TRAINING_LOG"
 SKIP_SENSITIVITY_ENV = "ART_MODEL_SUPPORT_SKIP_SENSITIVITY"
+KEEP_TOPOLOGY_ARTIFACTS_ENV = "ART_ORACLE_KEEP_TOPOLOGY_ARTIFACTS"
 WORKFLOW_ARTIFACT_SUITE_NAME = "Megatron model-support validation workflow"
 
 MANDATORY_VALIDATION_STAGES = (
@@ -805,11 +806,11 @@ def build_validation_report(
         YES_NO_TRAINABILITY_STAGE: run_yes_no_trainability_stage,
         NATIVE_VLLM_LORA_STAGE: run_native_vllm_lora_stage,
     }
-    env = (
-        {SKIP_SENSITIVITY_ENV: "0" if include_sensitivity else "1"}
-        if include_sensitivity is not None
-        else {}
-    )
+    env = {}
+    if include_sensitivity is not None:
+        env[SKIP_SENSITIVITY_ENV] = "0" if include_sensitivity else "1"
+    if include_sensitivity:
+        env[KEEP_TOPOLOGY_ARTIFACTS_ENV] = "1"
     skip_stages = skip_stages or set()
     architecture: ArchitectureReport | None = None
     context = _temporary_env(**env) if env else nullcontext()

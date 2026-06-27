@@ -1503,6 +1503,15 @@ class SharedExpertsLinearFC1LoRA(torch.nn.Module):
         )
 
     def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor | None]:
+        if int(x.numel()) == 0:
+            zero = x.sum() * 0.0
+            weight = getattr(self.linear_fc1, "weight", None)
+            if isinstance(weight, torch.Tensor):
+                zero = zero + weight.to(dtype=x.dtype).sum() * 0.0
+            for lora in (self.gate_lora, self.up_lora):
+                zero = zero + lora.A_T.to(dtype=x.dtype).sum() * 0.0
+                zero = zero + lora.B_T.to(dtype=x.dtype).sum() * 0.0
+            return zero.expand(*x.shape[:-1], self.linear_fc1.out_features).clone(), None
         base_output, bias_out = self.linear_fc1(x)
         if isinstance(base_output, tuple):
             base_out, lora_input = base_output

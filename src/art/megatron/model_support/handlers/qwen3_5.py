@@ -37,7 +37,6 @@ _QWEN35_MOE_COMPILE_WORKAROUND_FLAGS = (
     "weighted_bias_swiglu_no_inner_forward_cast",
 )
 _QWEN35_MOE_UNCONDITIONAL_COMPILE_WORKAROUND_FLAGS: tuple[str, ...] = ()
-_QWEN35_DENSE_COMPILE_WORKAROUND_FLAGS = ("te_layernorm_column_parallel_linear",)
 _ART_LAYER_PREFIX = "base_model.model.model.layers."
 _VLLM_LAYER_PREFIX = "base_model.model.model.language_model.layers."
 _ART_MOE_EXPERT_KEY_RE = re.compile(
@@ -360,17 +359,6 @@ class Qwen35BaseHandler(DefaultDenseHandler):
 
 class Qwen35DenseHandler(Qwen35BaseHandler):
     key = "qwen3_5_dense"
-
-    def compile_workaround_config(
-        self,
-        provider: Any,
-    ) -> CompileWorkaroundConfig:
-        return CompileWorkaroundConfig(
-            flags=_compile_workaround_flags_for_provider(
-                provider,
-                _QWEN35_DENSE_COMPILE_WORKAROUND_FLAGS,
-            ),
-        )
 
 
 class Qwen35MoeHandler(Qwen35BaseHandler):

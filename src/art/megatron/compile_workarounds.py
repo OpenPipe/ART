@@ -211,19 +211,6 @@ def install_torch_compile_workarounds(
         _install_self_attn_linear_proj_reduce_scatter_workaround()
     if "weighted_bias_swiglu_no_inner_forward_cast" in flags:
         _install_weighted_bias_swiglu_no_inner_forward_cast_workaround()
-    if "te_layernorm_column_parallel_linear" in flags:
-        from transformer_engine.pytorch.module.layernorm_linear import LayerNormLinear
-
-        from art.megatron import lora as art_lora
-
-        art_lora.SharedExpertsLinearFC1LoRA.forward = _disable(
-            art_lora.SharedExpertsLinearFC1LoRA.forward
-        )
-        te_ext.TELayerNormColumnParallelLinear.forward = _disable(
-            te_ext.TELayerNormColumnParallelLinear.forward
-        )
-        LayerNormLinear.forward = _disable(LayerNormLinear.forward)
-
     deepep_flags = {"deepep_permute_restore", "deepep_dispatch_combine"} & flags
     if deepep_flags:
         deepep_manager = _require_attr(token_dispatcher, "_DeepepManager")
