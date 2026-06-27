@@ -599,8 +599,10 @@ class LoRA(torch.nn.Module):
         )
 
     def load_lora(self, adapter_model: dict[str, torch.Tensor]) -> None:
-        weights = self._adapter_weights(adapter_model, require=True)
-        assert weights is not None
+        weights = self._adapter_weights(adapter_model, require=False)
+        if weights is None:
+            self.reset_lora_parameters()
+            return
         self._load_weight(weights[0], into=self.A_T)
         self._load_weight(weights[1], into=self.B_T)
 
