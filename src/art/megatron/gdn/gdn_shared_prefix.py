@@ -93,6 +93,20 @@ class GdnStateExchangePlan:
 
 
 @dataclass(frozen=True)
+class _ExplicitBucketColumn:
+    row_index: int
+    family_index: int
+    parent_index: int
+    positions: tuple[int, ...]
+    output_mask: tuple[bool, ...]
+    needs_final_state: bool
+
+    @property
+    def length(self) -> int:
+        return len(self.positions)
+
+
+@dataclass(frozen=True)
 class GdnPlannerConfig:
     """Tunable cost coefficients for one packed-row GDN execution plan."""
 
@@ -347,18 +361,26 @@ def _build_tree_rank_execution_plan(
         cross_rank_token_count=cross_rank_token_count,
     )
     local_token_ranges = gdn_ranges_by_rank_by_source[cp_rank]
-    tree_segment_buckets_by_depth = tuple(
-        _build_tree_bucket_plans(
-            tuple(segments_by_rank_depth[cp_rank][depth]),
-            spec.tree_parent_indices,
+    if cp_size == 1:
+        tree_segment_buckets_by_depth = _build_chunk_aligned_cp1_tree_buckets(
+            spec,
             tuple(tree_has_children),
-            local_token_ranges=None if cp_size == 1 else local_token_ranges,
-            sequence_length=spec.sequence_length,
             device=device,
             planner_config=planner_config,
         )
-        for depth in range(depth_count)
-    )
+    else:
+        tree_segment_buckets_by_depth = tuple(
+            _build_tree_bucket_plans(
+                tuple(segments_by_rank_depth[cp_rank][depth]),
+                spec.tree_parent_indices,
+                tuple(tree_has_children),
+                local_token_ranges=local_token_ranges,
+                sequence_length=spec.sequence_length,
+                device=device,
+                planner_config=planner_config,
+            )
+            for depth in range(depth_count)
+        )
     tree_chain_buckets_by_depth = (
         tuple(
             _build_tree_bucket_plans(
@@ -1072,6 +1094,217 @@ def _build_tree_bucket_plans(
         )
         for bucket in segment_buckets
     )
+
+
+def _build_chunk_aligned_cp1_tree_buckets(
+    spec: GdnPackedExecutionSpec,
+    tree_has_children: tuple[bool, ...],
+    *,
+    device: torch.device | str,
+    planner_config: GdnPlannerConfig,
+) -> tuple[tuple[GdnSegmentBucketPlan, ...], ...]:
+    depth_count = max(spec.tree_depths, default=0) + 1
+    children_by_node: list[list[int]] = [[] for _ in spec.tree_segments]
+    for node_index, parent_index in enumerate(spec.tree_parent_indices):
+        if parent_index >= 0:
+            children_by_node[parent_index].append(node_index)
+
+    regular_by_depth: list[list[GdnSegmentSpec]] = [[] for _ in range(depth_count)]
+    boundary_by_depth: list[list[GdnSegmentSpec]] = [[] for _ in range(depth_count)]
+    child_columns_by_depth: list[list[_ExplicitBucketColumn]] = [
+        [] for _ in range(depth_count)
+    ]
+
+    for node_index, segment in enumerate(spec.tree_segments):
+        depth = spec.tree_depths[node_index]
+        parent_index = spec.tree_parent_indices[node_index]
+        if parent_index >= 0:
+            continue
+        if not tree_has_children[node_index]:
+            regular_by_depth[depth].append(segment)
+            continue
+        boundary_end = _prefix_chunk_boundary_end(segment)
+        if boundary_end > segment.start:
+            boundary_by_depth[depth].append(
+                replace(segment, start=segment.start, end=boundary_end)
+            )
+
+    for parent_index, child_indices in enumerate(children_by_node):
+        if not child_indices:
+            continue
+        parent = spec.tree_segments[parent_index]
+        parent_depth = spec.tree_depths[parent_index]
+        child_depth = min(parent_depth + 1, depth_count - 1)
+        parent_tree_parent = spec.tree_parent_indices[parent_index]
+        if parent_tree_parent < 0:
+            boundary_end = _prefix_chunk_boundary_end(parent)
+            tail_positions = tuple(range(boundary_end, parent.end))
+            explicit_parent = parent.family_index if boundary_end > parent.start else -1
+        else:
+            tail_positions = ()
+            explicit_parent = parent.family_index
+        for child_offset, child_index in enumerate(child_indices):
+            child = spec.tree_segments[child_index]
+            child_positions = tail_positions + tuple(range(child.start, child.end))
+            child_columns_by_depth[child_depth].append(
+                _ExplicitBucketColumn(
+                    row_index=child.row_index,
+                    family_index=child.family_index,
+                    parent_index=explicit_parent,
+                    positions=child_positions,
+                    output_mask=(
+                        ((child_offset == 0),) * len(tail_positions)
+                        + (True,) * child.length
+                    ),
+                    needs_final_state=tree_has_children[child.family_index],
+                )
+            )
+
+    return tuple(
+        (
+            *_build_tree_bucket_plans(
+                tuple(boundary_by_depth[depth]),
+                spec.tree_parent_indices,
+                tree_has_children,
+                local_token_ranges=None,
+                sequence_length=spec.sequence_length,
+                device=device,
+                planner_config=planner_config,
+            ),
+            *_build_tree_bucket_plans(
+                tuple(regular_by_depth[depth]),
+                spec.tree_parent_indices,
+                tree_has_children,
+                local_token_ranges=None,
+                sequence_length=spec.sequence_length,
+                device=device,
+                planner_config=planner_config,
+            ),
+            *_build_explicit_bucket_plans(
+                tuple(child_columns_by_depth[depth]),
+                device=device,
+                planner_config=planner_config,
+            ),
+        )
+        for depth in range(depth_count)
+    )
+
+
+def _build_explicit_bucket_plans(
+    columns: tuple[_ExplicitBucketColumn, ...],
+    *,
+    device: torch.device | str,
+    planner_config: GdnPlannerConfig,
+) -> tuple[GdnSegmentBucketPlan, ...]:
+    stateful = tuple(column for column in columns if column.needs_final_state)
+    stateless = tuple(column for column in columns if not column.needs_final_state)
+    return (
+        *(
+            _build_explicit_bucket_plan(batch, needs_final_state=True, device=device)
+            for batch in _batch_explicit_columns(
+                stateful,
+                max_padding_ratio=planner_config.max_padding_ratio,
+                max_segments_per_batch=planner_config.max_segments_per_batch,
+            )
+        ),
+        *(
+            _build_explicit_bucket_plan(batch, needs_final_state=False, device=device)
+            for batch in _batch_explicit_columns(
+                stateless,
+                max_padding_ratio=planner_config.max_padding_ratio,
+                max_segments_per_batch=planner_config.max_segments_per_batch,
+            )
+        ),
+    )
+
+
+def _batch_explicit_columns(
+    columns: tuple[_ExplicitBucketColumn, ...],
+    *,
+    max_padding_ratio: float,
+    max_segments_per_batch: int,
+) -> tuple[tuple[_ExplicitBucketColumn, ...], ...]:
+    if not columns:
+        return ()
+    batches: list[list[_ExplicitBucketColumn]] = []
+    current: list[_ExplicitBucketColumn] = []
+    current_tokens = 0
+    current_max = 0
+    for column in columns:
+        next_count = len(current) + 1
+        next_tokens = current_tokens + column.length
+        next_max = max(current_max, column.length)
+        padded = next_max * next_count
+        can_extend = not current or (
+            next_count <= max_segments_per_batch
+            and padded <= max_padding_ratio * next_tokens
+        )
+        if not can_extend:
+            batches.append(current)
+            current = []
+            current_tokens = 0
+            current_max = 0
+        current.append(column)
+        current_tokens += column.length
+        current_max = max(current_max, column.length)
+    if current:
+        batches.append(current)
+    return tuple(tuple(batch) for batch in batches)
+
+
+def _build_explicit_bucket_plan(
+    columns: tuple[_ExplicitBucketColumn, ...],
+    *,
+    needs_final_state: bool,
+    device: torch.device | str,
+) -> GdnSegmentBucketPlan:
+    lengths_cpu = torch.tensor([column.length for column in columns], dtype=torch.long)
+    max_length = int(lengths_cpu.max().item())
+    row_indices_cpu = torch.zeros(max_length, len(columns), dtype=torch.long)
+    position_indices_cpu = torch.zeros(max_length, len(columns), dtype=torch.long)
+    output_mask_cpu = torch.zeros(max_length, len(columns), dtype=torch.bool)
+    for column_index, column in enumerate(columns):
+        length = column.length
+        row_indices_cpu[:length, column_index] = column.row_index
+        position_indices_cpu[:length, column_index] = torch.tensor(
+            column.positions, dtype=torch.long
+        )
+        output_mask_cpu[:length, column_index] = torch.tensor(
+            column.output_mask, dtype=torch.bool
+        )
+    plan = _build_bucket_plan(
+        tuple(
+            GdnSegmentSpec(
+                row_index=column.row_index,
+                family_index=column.family_index,
+                group_id=column.family_index,
+                parent_id=column.parent_index,
+                start=0,
+                end=column.length,
+                kind="completion",
+            )
+            for column in columns
+        ),
+        lengths_cpu=lengths_cpu,
+        row_indices_cpu=row_indices_cpu,
+        position_indices_cpu=position_indices_cpu,
+        device=device,
+    )
+    parent_indices_cpu = torch.tensor(
+        [column.parent_index for column in columns], dtype=torch.long
+    )
+    return replace(
+        plan,
+        parent_indices=_move_planner_tensor(parent_indices_cpu, device),
+        parent_indices_cpu=parent_indices_cpu,
+        output_mask=_move_planner_tensor(output_mask_cpu, device),
+        needs_final_state=needs_final_state,
+    )
+
+
+def _prefix_chunk_boundary_end(segment: GdnSegmentSpec) -> int:
+    aligned_length = (segment.length // FLA_CHUNK_SIZE) * FLA_CHUNK_SIZE
+    return segment.start + aligned_length
 
 
 def _bucket_with_tree_parent_indices(
