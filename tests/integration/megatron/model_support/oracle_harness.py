@@ -2229,9 +2229,14 @@ def run_sensitivity_suite(
                     "flash",
                 )
             )
+            runner_case_config = (
+                case_config
+                if flex_backend is None or case_config.precision == "bf16"
+                else case_config.model_copy(update={"precision": "bf16"})
+            )
             runner = VariantRunner(
                 objective=objective,
-                case_config=case_config,
+                case_config=runner_case_config,
                 oracle_flex_backend=(
                     oracle_flex_backend if flex_backend is None else flex_backend
                 ),
@@ -2244,7 +2249,7 @@ def run_sensitivity_suite(
             for mutation in flex_mutations:
                 topology = sensitivity_topology_for_mutation(
                     mutation,
-                    is_moe=case_config.is_moe,
+                    is_moe=runner_case_config.is_moe,
                 )
                 if (
                     max_world_size is not None
