@@ -1221,14 +1221,11 @@ def _batch_segments_by_padded_work(
 ) -> tuple[tuple[GdnSegmentSpec, ...], ...]:
     if not segments:
         return ()
-    ordered = sorted(
-        segments, key=lambda segment: (segment.length, segment.family_index)
-    )
     batches: list[list[GdnSegmentSpec]] = []
     current: list[GdnSegmentSpec] = []
     current_tokens = 0
     current_max = 0
-    for segment in ordered:
+    for segment in segments:
         next_count = len(current) + 1
         next_tokens = current_tokens + segment.length
         next_max = max(current_max, segment.length)
