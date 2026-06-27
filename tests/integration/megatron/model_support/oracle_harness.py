@@ -245,6 +245,9 @@ SENSITIVITY_TOPOLOGY_BY_MUTATION |= {
     mutation: CP_ATTENTION_SENSITIVITY_TOPOLOGY
     for mutation in CP_ATTENTION_SENSITIVITY_MUTATIONS
 }
+SENSITIVITY_TOPOLOGY_BY_MUTATION["attn_skip_flash_lse_normalize"] = Topology(
+    tp=1, ep=2, etp=1, dp=1, cp=4, sp=False
+)
 SENSITIVITY_TOPOLOGY_BY_MUTATION["bwd_skip_sync_fc1_a"] = Topology(
     tp=2, ep=1, etp=2, dp=1, sp=True
 )
@@ -701,6 +704,8 @@ def sensitivity_topology_for_mutation(
         }:
             return DENSE_DP_SENSITIVITY_TOPOLOGY
         if mutation in CP_ATTENTION_SENSITIVITY_MUTATIONS:
+            if mutation == "attn_skip_flash_lse_normalize":
+                return Topology(tp=1, ep=1, etp=1, dp=1, cp=4, sp=False)
             return DENSE_CP_ATTENTION_SENSITIVITY_TOPOLOGY
         return DENSE_SENSITIVITY_TOPOLOGY
     return SENSITIVITY_TOPOLOGY_BY_MUTATION[mutation]
