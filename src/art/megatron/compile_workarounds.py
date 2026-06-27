@@ -214,6 +214,11 @@ def install_torch_compile_workarounds(
     if "te_layernorm_column_parallel_linear" in flags:
         from transformer_engine.pytorch.module.layernorm_linear import LayerNormLinear
 
+        from art.megatron import lora as art_lora
+
+        art_lora.SharedExpertsLinearFC1LoRA.forward = _disable(
+            art_lora.SharedExpertsLinearFC1LoRA.forward
+        )
         te_ext.TELayerNormColumnParallelLinear.forward = _disable(
             te_ext.TELayerNormColumnParallelLinear.forward
         )
