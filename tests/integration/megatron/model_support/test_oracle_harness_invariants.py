@@ -30,6 +30,7 @@ from .oracle_harness import (
     selected_sensitivity_mutations_for_objective,
     sensitivity_topology_for_mutation,
 )
+from .oracle_worker import _matches_grad_sync_skip_mutation
 
 
 def _metric_row(
@@ -96,6 +97,25 @@ def _expert_trace_call(
             "expert_dp_world_size": 1,
         },
     }
+
+
+def test_fc1_grad_sync_sensitivity_matches_split_and_fused_lora_names() -> None:
+    assert _matches_grad_sync_skip_mutation(
+        "chunk0.module.decoder.layers.0.mlp.experts.linear_fc1.lora.A_T",
+        "bwd_skip_sync_fc1_a",
+    )
+    assert _matches_grad_sync_skip_mutation(
+        "chunk0.module.decoder.layers.0.mlp.experts.linear_fc1.gate_lora.A_T",
+        "bwd_skip_sync_fc1_a",
+    )
+    assert _matches_grad_sync_skip_mutation(
+        "chunk0.module.decoder.layers.0.mlp.experts.linear_fc1.up_lora.A_T",
+        "bwd_skip_sync_fc1_a",
+    )
+    assert not _matches_grad_sync_skip_mutation(
+        "chunk0.module.decoder.layers.0.mlp.experts.linear_fc2.lora.A_T",
+        "bwd_skip_sync_fc1_a",
+    )
 
 
 def test_metric_threshold_rule_can_require_strictly_positive_values() -> None:
