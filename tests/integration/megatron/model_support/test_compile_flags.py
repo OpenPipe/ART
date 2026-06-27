@@ -17,6 +17,8 @@ _QWEN35_MOE_COMPILE_FLAGS = (
     "te_triton_permute_with_mask_map",
     "weighted_bias_swiglu_no_inner_forward_cast",
 )
+
+
 def test_qwen3_moe_compile_workarounds_cover_deepep_permute_restore() -> None:
     provider = type("Provider", (), {"context_parallel_size": 1})()
     config = QWEN3_MOE_HANDLER.compile_workaround_config(provider)

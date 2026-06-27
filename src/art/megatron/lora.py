@@ -1511,7 +1511,9 @@ class SharedExpertsLinearFC1LoRA(torch.nn.Module):
             for lora in (self.gate_lora, self.up_lora):
                 zero = zero + lora.A_T.to(dtype=x.dtype).sum() * 0.0
                 zero = zero + lora.B_T.to(dtype=x.dtype).sum() * 0.0
-            return zero.expand(*x.shape[:-1], self.linear_fc1.out_features).clone(), None
+            return zero.expand(
+                *x.shape[:-1], self.linear_fc1.out_features
+            ).clone(), None
         base_output, bias_out = self.linear_fc1(x)
         if isinstance(base_output, tuple):
             base_out, lora_input = base_output
