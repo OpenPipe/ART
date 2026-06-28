@@ -45,15 +45,16 @@ class PipelineAutotuneConfig(pydantic.BaseModel):
     bootstrap_samples: int = pydantic.Field(default=256, ge=16)
     queue_running_reserve_fraction: float = pydantic.Field(default=0.75, ge=0.0, le=1.0)
     trainer_idle_under_frac: float = pydantic.Field(default=0.20, ge=0.0, le=1.0)
+    trainer_idle_severe_under_frac: float = pydantic.Field(default=0.50, ge=0.0, le=1.0)
     trainer_idle_over_frac: float = pydantic.Field(default=0.08, ge=0.0, le=1.0)
-    vllm_capacity_wait_area_over_frac: float = pydantic.Field(default=0.05, ge=0.0)
-    vllm_running_area_over_frac: float = pydantic.Field(default=0.25, ge=0.0)
-    vllm_idle_over_frac: float = pydantic.Field(default=0.25, ge=0.0, le=1.0)
-    vllm_idle_under_frac: float = pydantic.Field(default=0.30, ge=0.0, le=1.0)
-    vllm_running_under_frac: float = pydantic.Field(default=0.20, ge=0.0)
+    vllm_pressure_over_ratio: float = pydantic.Field(default=0.80, ge=0.0)
+    vllm_pressure_under_ratio: float = pydantic.Field(default=0.50, ge=0.0)
     queue_put_high_frac: float = pydantic.Field(default=0.20, ge=0.0, le=1.0)
     queue_put_severe_frac: float = pydantic.Field(default=0.50, ge=0.0, le=1.0)
     stale_high_frac: float = pydantic.Field(default=0.20, ge=0.0, le=1.0)
+    padding_high_frac: float = pydantic.Field(default=0.25, ge=0.0, le=1.0)
+    recommendation_min_windows: int = pydantic.Field(default=5, ge=1)
+    recommendation_consecutive_holds: int = pydantic.Field(default=2, ge=1)
     batch_underfill_frac: float = pydantic.Field(default=0.95, ge=0.0, le=1.0)
     policy_age_high_fraction: float = pydantic.Field(default=0.60, ge=0.0, le=1.0)
     policy_age_severe_fraction: float = pydantic.Field(default=1.0, ge=0.0, le=1.0)
@@ -104,6 +105,9 @@ class TunerWindowStats(pydantic.BaseModel):
     trainer_idle_frac: float = 0.0
     vllm_capacity_wait_frac: float = 0.0
     vllm_active_frac: float = 0.0
+    vllm_capacity_wait_request_s: float = 0.0
+    vllm_running_request_s: float = 0.0
+    vllm_pressure: float = 0.0
     vllm_capacity_wait_area: float = 0.0
     vllm_running_area: float = 0.0
     vllm_idle_frac: float = 0.0

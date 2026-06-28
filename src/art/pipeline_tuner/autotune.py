@@ -3,6 +3,7 @@ from __future__ import annotations
 from collections import defaultdict
 import math
 import statistics
+import warnings
 
 import pydantic
 
@@ -34,6 +35,9 @@ class PackingProjection(pydantic.BaseModel):
 class VllmLoadStats(pydantic.BaseModel):
     capacity_wait_frac: float = 0.0
     active_frac: float = 0.0
+    capacity_wait_request_s: float = 0.0
+    running_request_s: float = 0.0
+    pressure: float = 0.0
     capacity_wait_area: float = 0.0
     running_area: float = 0.0
     idle_frac: float = 0.0
@@ -65,6 +69,7 @@ class PipelineAutotuner:
         self._last_decision_step = 0
         self._target_candidate: int | None = None
         self._target_candidate_count = 0
+        self._emitted_recommendations: set[str] = set()
 
     def on_metric(self, rec: PipelineMetric) -> TunerDecision | None:
         self.metrics.append(rec)
@@ -86,6 +91,7 @@ class PipelineAutotuner:
         decision = self._decide(stats)
         self._last_decision_step = stats.end_step
         self.decisions.append(decision)
+        self._emit_stable_recommendations(decision)
         if decision.previous != decision.updated:
             self.settings = decision.updated
         return decision
@@ -140,7 +146,7 @@ class PipelineAutotuner:
                 "Pipeline autotuner expected packed-group observations in the "
                 "decision window, but none were recorded."
             )
-        vllm_load = _vllm_load_stats(vllm_metrics)
+        vllm_load = _vllm_load_stats(vllm_metrics, window_start_s=t0, window_end_s=t1)
         return TunerWindowStats(
             start_step=window_steps[0],
             end_step=window_steps[-1],
@@ -151,6 +157,9 @@ class PipelineAutotuner:
             trainer_idle_frac=(collect / wall) if wall > 0 else 0.0,
             vllm_capacity_wait_frac=vllm_load.capacity_wait_frac,
             vllm_active_frac=vllm_load.active_frac,
+            vllm_capacity_wait_request_s=vllm_load.capacity_wait_request_s,
+            vllm_running_request_s=vllm_load.running_request_s,
+            vllm_pressure=vllm_load.pressure,
             vllm_capacity_wait_area=vllm_load.capacity_wait_area,
             vllm_running_area=vllm_load.running_area,
             vllm_idle_frac=vllm_load.idle_frac,
@@ -180,18 +189,12 @@ class PipelineAutotuner:
         )
 
     def _decide(self, stats: TunerWindowStats) -> TunerDecision:
-        capacity_bound = (
-            stats.vllm_capacity_wait_area
-            >= self.config.vllm_capacity_wait_area_over_frac
-            and stats.vllm_running_area >= self.config.vllm_running_area_over_frac
-            and stats.vllm_idle_frac <= self.config.vllm_idle_over_frac
-        )
-        inference_over = capacity_bound
+        inference_over = stats.vllm_pressure > self.config.vllm_pressure_over_ratio
         trainer_under = stats.trainer_idle_frac >= self.config.trainer_idle_under_frac
         trainer_over = stats.trainer_idle_frac <= self.config.trainer_idle_over_frac
-        inference_under = not inference_over and (
-            stats.vllm_idle_frac >= self.config.vllm_idle_under_frac
-            or stats.vllm_running_area < self.config.vllm_running_under_frac
+        inference_under = (
+            not inference_over
+            and stats.vllm_pressure <= self.config.vllm_pressure_under_ratio
         )
         inference_state = (
             "inference_over"
@@ -240,7 +243,7 @@ class PipelineAutotuner:
                 }
             )
             action = "increase_workers"
-            reason = "vLLM and trainer both show idle headroom"
+            reason = "vLLM pressure is low and trainer is underfed"
         elif state in {
             "inference_under_train_under",
             "inference_balanced_train_under",
@@ -259,7 +262,7 @@ class PipelineAutotuner:
                 stats.groups_per_step_mean
                 < updated.target_groups_per_step * self.config.batch_underfill_frac
             )
-            if batch_underfilled and not capacity_bound and not age_severe:
+            if batch_underfilled and not inference_over and not age_severe:
                 updated = updated.model_copy(
                     update={
                         "num_rollout_workers": self._move_workers(
@@ -309,11 +312,6 @@ class PipelineAutotuner:
         elif state == "inference_over_train_over":
             reason = "both sides are loaded; no throughput-safe online change"
 
-        recommendations = self._recommendations(
-            stats,
-            inference_state=inference_state,
-            trainer_state=trainer_state,
-        )
         updated = self._settings_with_recomputed_queue(
             updated, stats, adapt_target=False
         )
@@ -328,32 +326,79 @@ class PipelineAutotuner:
             previous=previous,
             updated=updated,
             stats=stats,
-            recommendations=recommendations,
         )
 
-    def _recommendations(
-        self,
-        stats: TunerWindowStats,
-        *,
-        inference_state: str,
-        trainer_state: str,
-    ) -> list[str]:
-        recommendations: list[str] = []
-        if inference_state == "inference_over" and trainer_state == "train_under":
+    def _emit_stable_recommendations(self, decision: TunerDecision) -> None:
+        recommendations = self._stable_recommendations()
+        decision.recommendations.extend(message for _, message in recommendations)
+        for key, message in recommendations:
+            if key in self._emitted_recommendations:
+                continue
+            self._emitted_recommendations.add(key)
+            warnings.warn(message, UserWarning, stacklevel=2)
+
+    def _stable_recommendations(self) -> list[tuple[str, str]]:
+        hold_count = self.config.recommendation_consecutive_holds
+        if len(self.decisions) < self.config.recommendation_min_windows:
+            return []
+        recent = self.decisions[-hold_count:]
+        if len(recent) < hold_count or any(
+            decision.action != "hold" for decision in recent
+        ):
+            return []
+        current = dict(self._recommendation_candidates(recent[-1]))
+        for decision in recent[:-1]:
+            current = {
+                key: message
+                for key, message in current.items()
+                if key in dict(self._recommendation_candidates(decision))
+            }
+        return list(current.items())
+
+    def _recommendation_candidates(
+        self, decision: TunerDecision
+    ) -> list[tuple[str, str]]:
+        stats = decision.stats
+        if stats is None:
+            return []
+        vllm_saturated = stats.vllm_pressure > self.config.vllm_pressure_over_ratio
+        vllm_underloaded = stats.vllm_pressure <= self.config.vllm_pressure_under_ratio
+        trainer_severely_underloaded = (
+            stats.trainer_idle_frac >= self.config.trainer_idle_severe_under_frac
+        )
+        trainer_saturated = (
+            stats.trainer_idle_frac <= self.config.trainer_idle_over_frac
+        )
+        recommendations: list[tuple[str, str]] = []
+        if vllm_saturated and trainer_severely_underloaded:
             recommendations.append(
-                "vLLM appears capacity-bound while Megatron is underfed; consider "
-                "adding inference GPUs or increasing vLLM serving limits if memory "
-                "and latency permit."
+                (
+                    "increase_inference_gpus",
+                    "Pipeline autotuner observes saturated vLLM request pressure "
+                    "while Megatron is severely underloaded; increase inference GPUs "
+                    "if possible.",
+                )
             )
-        if inference_state == "inference_under" and trainer_state == "train_over":
+        if vllm_underloaded and trainer_saturated:
             recommendations.append(
-                "Megatron appears saturated while vLLM has serving headroom; consider "
-                "adding train GPUs or increasing packed_sequence_length if memory permits."
+                (
+                    "increase_training_gpus",
+                    "Pipeline autotuner observes severely underloaded vLLM request "
+                    "pressure while Megatron is saturated; increase training GPUs if possible.",
+                )
             )
-        if stats.padding_ratio_mean >= 0.25:
+        if (
+            stats.padding_ratio_mean >= self.config.padding_high_frac
+            and trainer_saturated
+            and vllm_saturated
+        ):
             recommendations.append(
-                "Training padding is high; consider a larger packed_sequence_length "
-                "or a workload-specific cap if memory permits."
+                (
+                    "decrease_packed_sequence_length",
+                    "Pipeline autotuner observes high padding while Megatron and vLLM "
+                    "are both saturated; decrease packed_sequence_length to reduce "
+                    "padding waste.",
+                )
             )
         return recommendations
 
@@ -577,7 +622,9 @@ def recommended_queue_size(
     return max(lower, min(max_completed, max_completed - running_reserve))
 
 
-def _vllm_load_stats(metrics: list[PipelineMetric]) -> VllmLoadStats:
+def _vllm_load_stats(
+    metrics: list[PipelineMetric], *, window_start_s: float, window_end_s: float
+) -> VllmLoadStats:
     by_time: dict[float, dict[str, float]] = defaultdict(dict)
     wanted = {
         "vllm/num_requests_running",
@@ -590,31 +637,62 @@ def _vllm_load_stats(metrics: list[PipelineMetric]) -> VllmLoadStats:
             by_time[rec.t_s][rec.name] = rec.value
     if not by_time:
         raise RuntimeError("Pipeline autotuning requires vLLM runtime metric samples.")
-    if not any("vllm/max_num_seqs" in values for values in by_time.values()):
-        raise RuntimeError(
-            "Pipeline autotuning requires vllm/max_num_seqs from the ART vLLM "
-            "runtime metrics endpoint."
-        )
     samples: list[tuple[float, float, float, float]] = []
-    for values in by_time.values():
-        if not wanted.issubset(values):
+    complete_times: list[float] = []
+    for t_s, values in by_time.items():
+        if not {
+            "vllm/num_requests_running",
+            "vllm/num_requests_waiting",
+            "vllm/num_requests_waiting_capacity",
+        }.issubset(values):
             continue
-        max_num_seqs = values["vllm/max_num_seqs"]
-        if max_num_seqs <= 0:
-            continue
+        complete_times.append(t_s)
         samples.append(
             (
                 values["vllm/num_requests_running"],
                 values["vllm/num_requests_waiting"],
                 values["vllm/num_requests_waiting_capacity"],
-                max_num_seqs,
+                values.get("vllm/max_num_seqs", 0.0),
             )
         )
     if not samples:
         raise RuntimeError(
-            "Pipeline autotuning requires complete vLLM running/waiting/max_num_seqs "
+            "Pipeline autotuning requires complete vLLM running/waiting/capacity "
             "samples in each decision window."
         )
+    times = sorted(complete_times)
+    capacity_wait_request_s = 0.0
+    running_request_s = 0.0
+    total_s = 0.0
+    for idx, t_s in enumerate(times):
+        values = by_time[t_s]
+        if not {
+            "vllm/num_requests_running",
+            "vllm/num_requests_waiting_capacity",
+        }.issubset(values):
+            continue
+        next_t_s = times[idx + 1] if idx + 1 < len(times) else window_end_s
+        start_s = max(t_s, window_start_s)
+        end_s = min(next_t_s, window_end_s)
+        if end_s <= start_s:
+            continue
+        duration_s = end_s - start_s
+        total_s += duration_s
+        capacity_wait_request_s += (
+            max(0.0, values["vllm/num_requests_waiting_capacity"]) * duration_s
+        )
+        running_request_s += max(0.0, values["vllm/num_requests_running"]) * duration_s
+    if total_s <= 0.0:
+        raise RuntimeError("Pipeline autotuning requires nonzero vLLM sample duration.")
+    if running_request_s > 0.0:
+        pressure = capacity_wait_request_s / running_request_s
+    elif capacity_wait_request_s > 0.0:
+        pressure = math.inf
+    else:
+        pressure = 0.0
+    max_num_seqs_values = [
+        max_num_seqs for _, _, _, max_num_seqs in samples if max_num_seqs > 0
+    ]
     return VllmLoadStats(
         capacity_wait_frac=_mean(
             [1.0 if wait_capacity > 0 else 0.0 for _, _, wait_capacity, _ in samples]
@@ -622,16 +700,21 @@ def _vllm_load_stats(metrics: list[PipelineMetric]) -> VllmLoadStats:
         active_frac=_mean(
             [1.0 if running > 0 else 0.0 for running, _, _, _ in samples]
         ),
+        capacity_wait_request_s=capacity_wait_request_s,
+        running_request_s=running_request_s,
+        pressure=pressure,
         capacity_wait_area=_mean(
             [
                 max(0.0, wait_capacity) / max_num_seqs
                 for _, _, wait_capacity, max_num_seqs in samples
+                if max_num_seqs > 0
             ]
         ),
         running_area=_mean(
             [
                 max(0.0, running) / max_num_seqs
                 for running, _, _, max_num_seqs in samples
+                if max_num_seqs > 0
             ]
         ),
         idle_frac=_mean(
@@ -640,5 +723,5 @@ def _vllm_load_stats(metrics: list[PipelineMetric]) -> VllmLoadStats:
                 for running, waiting, _, _ in samples
             ]
         ),
-        max_num_seqs_mean=_mean([max_num_seqs for _, _, _, max_num_seqs in samples]),
+        max_num_seqs_mean=_mean(max_num_seqs_values),
     )
