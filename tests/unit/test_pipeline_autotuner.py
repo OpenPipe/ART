@@ -3,6 +3,7 @@ import pytest
 from art.pipeline_tuner import PipelineAutotuneConfig
 from art.pipeline_tuner.autotune import (
     PipelineAutotuner,
+    _group_vllm_metric_rows,
     _vllm_load_stats,
     build_initial_settings,
     recommended_queue_size,
@@ -101,6 +102,29 @@ def test_vllm_load_stats_uses_request_second_pressure() -> None:
     assert stats.capacity_wait_area == 16.0 / 256.0 / 4.0
     assert stats.running_area == (64.0 + 128.0) / 256.0 / 4.0
     assert stats.idle_frac == 0.5
+
+
+def test_vllm_load_stats_groups_scrape_burst_timestamps() -> None:
+    metrics = [
+        PipelineMetric(name="vllm/num_requests_running", value=10.0, t_s=1.000),
+        PipelineMetric(name="vllm/num_requests_waiting", value=8.0, t_s=1.001),
+        PipelineMetric(name="vllm/num_requests_waiting_capacity", value=8.0, t_s=1.002),
+        PipelineMetric(name="vllm/num_requests_running", value=10.0, t_s=2.000),
+        PipelineMetric(name="vllm/num_requests_waiting", value=0.0, t_s=2.001),
+        PipelineMetric(name="vllm/num_requests_waiting_capacity", value=0.0, t_s=2.002),
+    ]
+
+    stats = _vllm_load_stats(metrics, window_start_s=1.0, window_end_s=3.0)
+
+    assert stats.capacity_wait_request_s == 8.0
+    assert stats.running_request_s == 20.0
+    assert stats.pressure == 0.4
+    assert (
+        len(
+            _group_vllm_metric_rows([(rec.t_s, rec.name, rec.value) for rec in metrics])
+        )
+        == 2
+    )
 
 
 def test_low_vllm_pressure_increases_workers_when_trainer_underfed() -> None:

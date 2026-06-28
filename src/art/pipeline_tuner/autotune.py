@@ -26,6 +26,9 @@ def _ceil_to_multiple(value: float, multiple: int, *, minimum: int = 1) -> int:
     return max(minimum, int(math.ceil(value / multiple)) * multiple)
 
 
+_VLLM_SCRAPE_GROUP_TOLERANCE_S = 0.05
+
+
 class PackingProjection(pydantic.BaseModel):
     groups: int
     spill_probability: float
@@ -625,18 +628,19 @@ def recommended_queue_size(
 def _vllm_load_stats(
     metrics: list[PipelineMetric], *, window_start_s: float, window_end_s: float
 ) -> VllmLoadStats:
-    by_time: dict[float, dict[str, float]] = defaultdict(dict)
     wanted = {
         "vllm/num_requests_running",
         "vllm/num_requests_waiting",
         "vllm/num_requests_waiting_capacity",
         "vllm/max_num_seqs",
     }
+    rows: list[tuple[float, str, float]] = []
     for rec in metrics:
         if rec.name in wanted and math.isfinite(rec.value):
-            by_time[rec.t_s][rec.name] = rec.value
-    if not by_time:
+            rows.append((rec.t_s, rec.name, rec.value))
+    if not rows:
         raise RuntimeError("Pipeline autotuning requires vLLM runtime metric samples.")
+    by_time = _group_vllm_metric_rows(rows)
     samples: list[tuple[float, float, float, float]] = []
     complete_times: list[float] = []
     for t_s, values in by_time.items():
@@ -725,3 +729,29 @@ def _vllm_load_stats(
         ),
         max_num_seqs_mean=_mean(max_num_seqs_values),
     )
+
+
+def _group_vllm_metric_rows(
+    rows: list[tuple[float, str, float]],
+) -> dict[float, dict[str, float]]:
+    rows.sort(key=lambda row: row[0])
+    groups: list[list[tuple[float, str, float]]] = []
+    current: list[tuple[float, str, float]] = []
+    last_t_s: float | None = None
+    for row in rows:
+        t_s = row[0]
+        if last_t_s is None or t_s - last_t_s <= _VLLM_SCRAPE_GROUP_TOLERANCE_S:
+            current.append(row)
+        else:
+            groups.append(current)
+            current = [row]
+        last_t_s = t_s
+    if current:
+        groups.append(current)
+    by_time: dict[float, dict[str, float]] = {}
+    for group in groups:
+        values: dict[str, float] = {}
+        for _, name, value in group:
+            values[name] = value
+        by_time[group[0][0]] = values
+    return by_time
