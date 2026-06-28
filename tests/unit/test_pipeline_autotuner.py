@@ -1,5 +1,15 @@
 from art.pipeline_tuner import PipelineAutotuneConfig
-from art.pipeline_tuner.autotune import build_initial_settings, recommended_queue_size
+from art.pipeline_tuner.autotune import (
+    PipelineAutotuner,
+    _vllm_load_stats,
+    build_initial_settings,
+    recommended_queue_size,
+)
+from art.pipeline_tuner.config import (
+    PipelineMetric,
+    PipelineTuneSettings,
+    TunerWindowStats,
+)
 from art.pipeline_tuner.worker_controller import RolloutWorkerController
 
 
@@ -50,3 +60,113 @@ def test_worker_controller_keeps_live_workers_when_at_target() -> None:
     controller._reconcile()
 
     assert controller._retiring == set()
+
+
+def test_vllm_load_stats_uses_normalized_area_and_idle_fraction() -> None:
+    metrics: list[PipelineMetric] = []
+    rows = [
+        (0.0, 0.0, 0.0),
+        (64.0, 0.0, 0.0),
+        (128.0, 16.0, 16.0),
+        (0.0, 0.0, 0.0),
+    ]
+    for idx, (running, waiting, waiting_capacity) in enumerate(rows):
+        t_s = float(idx)
+        metrics.extend(
+            [
+                PipelineMetric(
+                    name="vllm/num_requests_running", value=running, t_s=t_s
+                ),
+                PipelineMetric(
+                    name="vllm/num_requests_waiting", value=waiting, t_s=t_s
+                ),
+                PipelineMetric(
+                    name="vllm/num_requests_waiting_capacity",
+                    value=waiting_capacity,
+                    t_s=t_s,
+                ),
+                PipelineMetric(name="vllm/max_num_seqs", value=256.0, t_s=t_s),
+            ]
+        )
+
+    stats = _vllm_load_stats(metrics)
+
+    assert stats.capacity_wait_frac == 0.25
+    assert stats.capacity_wait_area == 16.0 / 256.0 / 4.0
+    assert stats.running_area == (64.0 + 128.0) / 256.0 / 4.0
+    assert stats.idle_frac == 0.5
+
+
+def test_bursty_vllm_wait_with_high_idle_increases_workers_when_trainer_underfed() -> (
+    None
+):
+    tuner = PipelineAutotuner(
+        config=PipelineAutotuneConfig(),
+        settings=PipelineTuneSettings(
+            num_rollout_workers=16,
+            min_batch_size=8,
+            max_batch_size=8,
+            queue_maxsize=12,
+            target_groups_per_step=8,
+        ),
+        model_name="test",
+        backend_name="MegatronBackend",
+        packed_sequence_length=122880,
+        inference_gpu_count=2,
+        policy_age_limit_steps=3.0,
+    )
+    decision = tuner._decide(
+        TunerWindowStats(
+            start_step=4,
+            end_step=7,
+            trainer_idle_frac=0.30,
+            vllm_capacity_wait_frac=0.20,
+            vllm_active_frac=0.40,
+            vllm_capacity_wait_area=0.014,
+            vllm_running_area=0.05,
+            vllm_idle_frac=0.61,
+            queue_freshness_pressure=0.30,
+            token_weighted_policy_age_steps_mean=1.0,
+            groups_per_step_mean=8.0,
+            group_pack_token_samples=[15000.0] * 32,
+        )
+    )
+
+    assert decision.state == "inference_under_train_under"
+    assert decision.action == "increase_workers"
+    assert decision.updated.num_rollout_workers == 20
+
+
+def test_vllm_overloaded_train_underfed_records_inference_gpu_recommendation() -> None:
+    tuner = PipelineAutotuner(
+        config=PipelineAutotuneConfig(),
+        settings=PipelineTuneSettings(
+            num_rollout_workers=16,
+            min_batch_size=8,
+            max_batch_size=8,
+            queue_maxsize=12,
+            target_groups_per_step=8,
+        ),
+        model_name="test",
+        backend_name="MegatronBackend",
+        packed_sequence_length=122880,
+        inference_gpu_count=2,
+        policy_age_limit_steps=3.0,
+    )
+    decision = tuner._decide(
+        TunerWindowStats(
+            start_step=4,
+            end_step=7,
+            trainer_idle_frac=0.40,
+            vllm_capacity_wait_area=0.08,
+            vllm_running_area=0.60,
+            vllm_idle_frac=0.05,
+            queue_freshness_pressure=0.20,
+            token_weighted_policy_age_steps_mean=1.0,
+            groups_per_step_mean=8.0,
+            group_pack_token_samples=[15000.0] * 32,
+        )
+    )
+
+    assert decision.state == "inference_over_train_under"
+    assert any("inference GPUs" in item for item in decision.recommendations)

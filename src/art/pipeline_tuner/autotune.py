@@ -31,6 +31,15 @@ class PackingProjection(pydantic.BaseModel):
     expected_padding_ratio: float
 
 
+class VllmLoadStats(pydantic.BaseModel):
+    capacity_wait_frac: float = 0.0
+    active_frac: float = 0.0
+    capacity_wait_area: float = 0.0
+    running_area: float = 0.0
+    idle_frac: float = 0.0
+    max_num_seqs_mean: float = 0.0
+
+
 class PipelineAutotuner:
     def __init__(
         self,
@@ -131,6 +140,7 @@ class PipelineAutotuner:
                 "Pipeline autotuner expected packed-group observations in the "
                 "decision window, but none were recorded."
             )
+        vllm_load = _vllm_load_stats(vllm_metrics)
         return TunerWindowStats(
             start_step=window_steps[0],
             end_step=window_steps[-1],
@@ -139,10 +149,12 @@ class PipelineAutotuner:
                 step_values("throughput/accepted_train_tok_per_s")
             ),
             trainer_idle_frac=(collect / wall) if wall > 0 else 0.0,
-            vllm_capacity_wait_frac=_sample_frac(
-                vllm_metrics, ("vllm/num_requests_waiting_capacity",)
-            ),
-            vllm_active_frac=_sample_frac(vllm_metrics, ("vllm/num_requests_running",)),
+            vllm_capacity_wait_frac=vllm_load.capacity_wait_frac,
+            vllm_active_frac=vllm_load.active_frac,
+            vllm_capacity_wait_area=vllm_load.capacity_wait_area,
+            vllm_running_area=vllm_load.running_area,
+            vllm_idle_frac=vllm_load.idle_frac,
+            vllm_max_num_seqs_mean=vllm_load.max_num_seqs_mean,
             queue_put_wait_frac=_mean(step_values("queue/put_wait_frac")),
             stale_frac=(discarded_stale / generated_groups)
             if generated_groups > 0
@@ -169,31 +181,33 @@ class PipelineAutotuner:
 
     def _decide(self, stats: TunerWindowStats) -> TunerDecision:
         capacity_bound = (
-            stats.vllm_capacity_wait_frac >= self.config.vllm_capacity_wait_over_frac
+            stats.vllm_capacity_wait_area
+            >= self.config.vllm_capacity_wait_area_over_frac
+            and stats.vllm_running_area >= self.config.vllm_running_area_over_frac
+            and stats.vllm_idle_frac <= self.config.vllm_idle_over_frac
         )
         inference_over = capacity_bound
         trainer_under = stats.trainer_idle_frac >= self.config.trainer_idle_under_frac
         trainer_over = stats.trainer_idle_frac <= self.config.trainer_idle_over_frac
-        inference_under = not inference_over
-        if (
-            not inference_over
-            and stats.vllm_active_frac < self.config.vllm_active_under_frac
-        ):
-            inference_under = True
-        if inference_under and trainer_under:
-            state = "inference_under_train_under"
-        elif inference_over and trainer_under:
-            state = "inference_over_train_under"
-        elif inference_under and trainer_over:
-            state = "inference_under_train_over"
-        elif inference_over and trainer_over:
-            state = "inference_over_train_over"
-        else:
-            state = (
-                "inference_over_train_over"
-                if inference_over
-                else "inference_under_train_under"
-            )
+        inference_under = not inference_over and (
+            stats.vllm_idle_frac >= self.config.vllm_idle_under_frac
+            or stats.vllm_running_area < self.config.vllm_running_under_frac
+        )
+        inference_state = (
+            "inference_over"
+            if inference_over
+            else "inference_under"
+            if inference_under
+            else "inference_balanced"
+        )
+        trainer_state = (
+            "train_under"
+            if trainer_under
+            else "train_over"
+            if trainer_over
+            else "train_balanced"
+        )
+        state = f"{inference_state}_{trainer_state}"
 
         previous = self.settings
         updated = self._settings_with_recomputed_queue(
@@ -210,7 +224,14 @@ class PipelineAutotuner:
 
         if stats.queue_put_wait_frac >= self.config.queue_put_severe_frac:
             reason = "completed-group queue backpressure is active"
-        elif state == "inference_under_train_under" and not age_severe:
+        elif (
+            state
+            in {
+                "inference_under_train_under",
+                "inference_balanced_train_under",
+            }
+            and not age_severe
+        ):
             updated = updated.model_copy(
                 update={
                     "num_rollout_workers": self._move_workers(
@@ -220,7 +241,10 @@ class PipelineAutotuner:
             )
             action = "increase_workers"
             reason = "vLLM and trainer both show idle headroom"
-        elif state == "inference_under_train_under":
+        elif state in {
+            "inference_under_train_under",
+            "inference_balanced_train_under",
+        }:
             reason = "trainer is underfed but queue freshness is near the policy limit"
         elif state == "inference_over_train_under":
             floor = max(
@@ -251,7 +275,10 @@ class PipelineAutotuner:
                 )
                 action = "lower_min_batch_size"
                 reason = "trainer is underfed and predicted queue freshness is near the policy limit"
-        elif state == "inference_under_train_over":
+        elif state in {
+            "inference_under_train_over",
+            "inference_balanced_train_over",
+        }:
             if updated.min_batch_size < updated.max_batch_size and not age_high:
                 updated = updated.model_copy(
                     update={
@@ -282,6 +309,11 @@ class PipelineAutotuner:
         elif state == "inference_over_train_over":
             reason = "both sides are loaded; no throughput-safe online change"
 
+        recommendations = self._recommendations(
+            stats,
+            inference_state=inference_state,
+            trainer_state=trainer_state,
+        )
         updated = self._settings_with_recomputed_queue(
             updated, stats, adapt_target=False
         )
@@ -296,7 +328,34 @@ class PipelineAutotuner:
             previous=previous,
             updated=updated,
             stats=stats,
+            recommendations=recommendations,
         )
+
+    def _recommendations(
+        self,
+        stats: TunerWindowStats,
+        *,
+        inference_state: str,
+        trainer_state: str,
+    ) -> list[str]:
+        recommendations: list[str] = []
+        if inference_state == "inference_over" and trainer_state == "train_under":
+            recommendations.append(
+                "vLLM appears capacity-bound while Megatron is underfed; consider "
+                "adding inference GPUs or increasing vLLM serving limits if memory "
+                "and latency permit."
+            )
+        if inference_state == "inference_under" and trainer_state == "train_over":
+            recommendations.append(
+                "Megatron appears saturated while vLLM has serving headroom; consider "
+                "adding train GPUs or increasing packed_sequence_length if memory permits."
+            )
+        if stats.padding_ratio_mean >= 0.25:
+            recommendations.append(
+                "Training padding is high; consider a larger packed_sequence_length "
+                "or a workload-specific cap if memory permits."
+            )
+        return recommendations
 
     def _policy_age_ratio(self, stats: TunerWindowStats) -> float:
         limit = max(float(self.policy_age_limit_steps), 1e-9)
@@ -457,8 +516,20 @@ class PipelineAutotuner:
             notes=[
                 "The first warmup_ignore_steps are excluded from throughput decisions.",
                 "queue_maxsize is bounded so queue_size / target_groups_per_step <= the policy-age limit.",
+                *self._profile_recommendations(),
             ],
         )
+
+    def _profile_recommendations(self) -> list[str]:
+        seen: set[str] = set()
+        recommendations: list[str] = []
+        for decision in self.decisions:
+            for recommendation in decision.recommendations:
+                if recommendation in seen:
+                    continue
+                seen.add(recommendation)
+                recommendations.append(recommendation)
+        return recommendations
 
 
 def build_initial_settings(
@@ -506,8 +577,68 @@ def recommended_queue_size(
     return max(lower, min(max_completed, max_completed - running_reserve))
 
 
-def _sample_frac(metrics: list[PipelineMetric], names: tuple[str, ...]) -> float:
-    values = [rec.value for rec in metrics if rec.name in names]
-    if not values:
-        return 0.0
-    return _mean([1.0 if value > 0 else 0.0 for value in values])
+def _vllm_load_stats(metrics: list[PipelineMetric]) -> VllmLoadStats:
+    by_time: dict[float, dict[str, float]] = defaultdict(dict)
+    wanted = {
+        "vllm/num_requests_running",
+        "vllm/num_requests_waiting",
+        "vllm/num_requests_waiting_capacity",
+        "vllm/max_num_seqs",
+    }
+    for rec in metrics:
+        if rec.name in wanted and math.isfinite(rec.value):
+            by_time[rec.t_s][rec.name] = rec.value
+    if not by_time:
+        raise RuntimeError("Pipeline autotuning requires vLLM runtime metric samples.")
+    if not any("vllm/max_num_seqs" in values for values in by_time.values()):
+        raise RuntimeError(
+            "Pipeline autotuning requires vllm/max_num_seqs from the ART vLLM "
+            "runtime metrics endpoint."
+        )
+    samples: list[tuple[float, float, float, float]] = []
+    for values in by_time.values():
+        if not wanted.issubset(values):
+            continue
+        max_num_seqs = values["vllm/max_num_seqs"]
+        if max_num_seqs <= 0:
+            continue
+        samples.append(
+            (
+                values["vllm/num_requests_running"],
+                values["vllm/num_requests_waiting"],
+                values["vllm/num_requests_waiting_capacity"],
+                max_num_seqs,
+            )
+        )
+    if not samples:
+        raise RuntimeError(
+            "Pipeline autotuning requires complete vLLM running/waiting/max_num_seqs "
+            "samples in each decision window."
+        )
+    return VllmLoadStats(
+        capacity_wait_frac=_mean(
+            [1.0 if wait_capacity > 0 else 0.0 for _, _, wait_capacity, _ in samples]
+        ),
+        active_frac=_mean(
+            [1.0 if running > 0 else 0.0 for running, _, _, _ in samples]
+        ),
+        capacity_wait_area=_mean(
+            [
+                max(0.0, wait_capacity) / max_num_seqs
+                for _, _, wait_capacity, max_num_seqs in samples
+            ]
+        ),
+        running_area=_mean(
+            [
+                max(0.0, running) / max_num_seqs
+                for running, _, _, max_num_seqs in samples
+            ]
+        ),
+        idle_frac=_mean(
+            [
+                1.0 if running <= 0 and waiting <= 0 else 0.0
+                for running, waiting, _, _ in samples
+            ]
+        ),
+        max_num_seqs_mean=_mean([max_num_seqs for _, _, _, max_num_seqs in samples]),
+    )

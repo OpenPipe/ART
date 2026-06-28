@@ -46,8 +46,11 @@ class PipelineAutotuneConfig(pydantic.BaseModel):
     queue_running_reserve_fraction: float = pydantic.Field(default=0.75, ge=0.0, le=1.0)
     trainer_idle_under_frac: float = pydantic.Field(default=0.20, ge=0.0, le=1.0)
     trainer_idle_over_frac: float = pydantic.Field(default=0.08, ge=0.0, le=1.0)
-    vllm_capacity_wait_over_frac: float = pydantic.Field(default=0.05, ge=0.0, le=1.0)
-    vllm_active_under_frac: float = pydantic.Field(default=0.50, ge=0.0, le=1.0)
+    vllm_capacity_wait_area_over_frac: float = pydantic.Field(default=0.05, ge=0.0)
+    vllm_running_area_over_frac: float = pydantic.Field(default=0.25, ge=0.0)
+    vllm_idle_over_frac: float = pydantic.Field(default=0.25, ge=0.0, le=1.0)
+    vllm_idle_under_frac: float = pydantic.Field(default=0.30, ge=0.0, le=1.0)
+    vllm_running_under_frac: float = pydantic.Field(default=0.20, ge=0.0)
     queue_put_high_frac: float = pydantic.Field(default=0.20, ge=0.0, le=1.0)
     queue_put_severe_frac: float = pydantic.Field(default=0.50, ge=0.0, le=1.0)
     stale_high_frac: float = pydantic.Field(default=0.20, ge=0.0, le=1.0)
@@ -101,6 +104,10 @@ class TunerWindowStats(pydantic.BaseModel):
     trainer_idle_frac: float = 0.0
     vllm_capacity_wait_frac: float = 0.0
     vllm_active_frac: float = 0.0
+    vllm_capacity_wait_area: float = 0.0
+    vllm_running_area: float = 0.0
+    vllm_idle_frac: float = 0.0
+    vllm_max_num_seqs_mean: float = 0.0
     queue_put_wait_frac: float = 0.0
     stale_frac: float = 0.0
     predicted_stale_frac: float = 0.0
@@ -126,6 +133,7 @@ class TunerDecision(pydantic.BaseModel):
     previous: PipelineTuneSettings
     updated: PipelineTuneSettings
     stats: TunerWindowStats | None = None
+    recommendations: list[str] = pydantic.Field(default_factory=list)
 
 
 class PipelineAutotunerProfile(pydantic.BaseModel):
