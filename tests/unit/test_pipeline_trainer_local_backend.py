@@ -23,6 +23,47 @@ from art.pipeline_trainer.trainer import PipelineTrainer
 from art.utils.output_dirs import get_model_dir, get_step_checkpoint_dir
 
 
+class _FakeArtMetricsResponse:
+    def raise_for_status(self) -> None:
+        return None
+
+    def json(self) -> dict[str, Any]:
+        return {
+            "schema_version": 1,
+            "metrics": {
+                "prompt_tokens_total": 100.0,
+                "generation_tokens_total": 20.0,
+                "prefix_cache_queries_total": 10.0,
+                "prefix_cache_hits_total": 7.0,
+                "num_preempted_reqs_total": 0.0,
+                "num_requests_running": 8.0,
+                "num_requests_waiting": 3.0,
+                "num_requests_waiting_capacity": 2.0,
+                "kv_cache_usage_perc": 0.25,
+            },
+        }
+
+
+class _FakeArtMetricsClient:
+    requested_urls: list[str] = []
+
+    def __init__(self, *, timeout: float) -> None:
+        self.timeout = timeout
+
+    async def __aenter__(self) -> "_FakeArtMetricsClient":
+        return self
+
+    async def __aexit__(self, *_args: object) -> None:
+        return None
+
+    async def get(
+        self, url: str, *, headers: dict[str, str] | None
+    ) -> _FakeArtMetricsResponse:
+        self.requested_urls.append(url)
+        assert headers == {"Authorization": "Bearer token"}
+        return _FakeArtMetricsResponse()
+
+
 def _make_group(rewards: list[float]) -> TrajectoryGroup:
     return TrajectoryGroup(
         [
@@ -60,6 +101,35 @@ def _make_trainer(
         eval_fn=None,
         **kwargs,
     )
+
+
+@pytest.mark.asyncio
+async def test_local_backend_collects_fast_art_vllm_metrics(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _FakeArtMetricsClient.requested_urls.clear()
+    monkeypatch.setattr(
+        "art.local.backend.httpx.AsyncClient",
+        _FakeArtMetricsClient,
+    )
+    model = TrainableModel(
+        name="pipeline-fast-vllm-metrics",
+        project="pipeline-tests",
+        base_model="test-model",
+        base_path=str(tmp_path),
+    )
+    model.inference_base_url = "http://127.0.0.1:9999/v1"
+    model.inference_api_key = "token"
+    metrics = await LocalBackend(
+        path=str(tmp_path / "art")
+    ).collect_train_step_vllm_metrics(model)
+
+    assert _FakeArtMetricsClient.requested_urls == ["http://127.0.0.1:9999/art/metrics"]
+    assert metrics["vllm/num_requests_running"] == 8.0
+    assert metrics["vllm/num_requests_waiting"] == 3.0
+    assert metrics["vllm/num_requests_waiting_capacity"] == 2.0
+    assert metrics["vllm/kv_cache_usage_perc"] == 0.25
+    assert metrics["vllm/prefix_cache_hit_rate"] == 0.7
 
 
 @pytest.mark.asyncio
@@ -234,6 +304,7 @@ async def test_pipeline_trainer_uses_same_train_kwargs_for_local_backend(
     )
     backend = LocalBackend(path=str(tmp_path))
     backend.train = AsyncMock(return_value=SimpleNamespace(step=1, metrics={}))  # type: ignore[method-assign]
+    backend.collect_train_step_vllm_metrics = AsyncMock(return_value={})  # type: ignore[method-assign]
 
     trainer = _make_trainer(
         model=model,

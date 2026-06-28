@@ -7,7 +7,13 @@ from openai.types.chat.chat_completion import Choice
 from openai.types.chat.chat_completion_message import ChatCompletionMessage
 import pytest
 
-from art import PipelineRuntimeConfig, TrainableModel, Trajectory, TrajectoryGroup
+from art import (
+    PipelineAutotuneConfig,
+    PipelineRuntimeConfig,
+    TrainableModel,
+    Trajectory,
+    TrajectoryGroup,
+)
 from art.pipeline_trainer.trainer import PipelineTrainer
 
 
@@ -76,6 +82,49 @@ def _choice_with_policy_spans(
         for idx, (start, end, policy_version) in enumerate(spans)
     ]
     return choice
+
+
+def test_unset_max_batch_size_defaults_to_min_batch_size(tmp_path: Path) -> None:
+    trainer = PipelineTrainer(
+        model=TrainableModel(
+            name="pipeline-default-batch-size-test",
+            project="pipeline-tests",
+            base_model="test-model",
+            base_path=str(tmp_path),
+        ),
+        backend=MagicMock(),  # type: ignore[arg-type]
+        rollout_fn=lambda *_args, **_kwargs: asyncio.sleep(0),
+        scenarios=[],
+        config={},
+        pipeline=PipelineRuntimeConfig(
+            num_rollout_workers=1,
+            min_batch_size=4,
+        ),
+        max_steps=1,
+        eval_fn=None,
+    )
+
+    assert trainer.max_batch_size == 4
+
+
+def test_autotune_rejects_pipeline_runtime_config(tmp_path: Path) -> None:
+    with pytest.raises(ValueError, match="autotuning is enabled"):
+        PipelineTrainer(
+            model=TrainableModel(
+                name="pipeline-autotune-config-test",
+                project="pipeline-tests",
+                base_model="test-model",
+                base_path=str(tmp_path),
+            ),
+            backend=MagicMock(),  # type: ignore[arg-type]
+            rollout_fn=lambda *_args, **_kwargs: asyncio.sleep(0),
+            scenarios=[],
+            config={},
+            pipeline=PipelineRuntimeConfig(num_rollout_workers=1),
+            autotune=PipelineAutotuneConfig(mode="online"),
+            max_steps=1,
+            eval_fn=None,
+        )
 
 
 @pytest.mark.asyncio

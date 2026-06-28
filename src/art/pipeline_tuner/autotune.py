@@ -463,28 +463,16 @@ def build_initial_settings(
     *,
     config: PipelineAutotuneConfig,
     inference_gpu_count: int,
-    limit_mean_steps_off_policy: float | None,
-    max_steps_off_policy: int | None,
-    explicit_workers: int,
-    explicit_min_batch_size: int,
-    explicit_max_batch_size: int,
-    explicit_queue_maxsize: int | None,
 ) -> PipelineTuneSettings:
-    limit = float(
-        limit_mean_steps_off_policy
-        if limit_mean_steps_off_policy is not None
-        else max_steps_off_policy
-        if max_steps_off_policy is not None
-        else 3.0
-    )
-    workers = explicit_workers or _ceil_to_multiple(
+    limit = float(config.initial_limit_mean_steps_off_policy)
+    workers = _ceil_to_multiple(
         config.initial_model_calls_per_inference_gpu * inference_gpu_count,
         config.worker_step,
         minimum=config.worker_step,
     )
-    max_batch = explicit_max_batch_size
-    min_batch = min(explicit_min_batch_size, max_batch)
-    queue = explicit_queue_maxsize or recommended_queue_size(
+    max_batch = int(config.initial_max_batch_size)
+    min_batch = min(int(config.initial_min_batch_size), max_batch)
+    queue = recommended_queue_size(
         target_groups_per_step=max_batch,
         limit_steps_off_policy=limit,
         num_rollout_workers=workers,
@@ -513,7 +501,7 @@ def recommended_queue_size(
     running_reserve = int(
         math.ceil(max(0, num_rollout_workers) * running_reserve_fraction)
     )
-    lower = max(1, int(math.ceil(0.5 * target)))
+    lower = target
     return max(lower, min(max_completed, max_completed - running_reserve))
 
 

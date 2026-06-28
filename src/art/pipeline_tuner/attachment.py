@@ -44,12 +44,6 @@ class PipelineAutotunerAttachment:
             settings = build_initial_settings(
                 config=self.config,
                 inference_gpu_count=inference_gpu_count,
-                limit_mean_steps_off_policy=trainer.limit_mean_steps_off_policy,
-                max_steps_off_policy=trainer.max_steps_off_policy,
-                explicit_workers=trainer.num_rollout_workers,
-                explicit_min_batch_size=trainer.min_batch_size,
-                explicit_max_batch_size=trainer.max_batch_size,
-                explicit_queue_maxsize=trainer.queue_maxsize,
             )
         trainer.apply_pipeline_settings(settings)
         if self.config.mode == "online":

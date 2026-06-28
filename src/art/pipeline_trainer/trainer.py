@@ -135,6 +135,7 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
         max_steps: int | None = None,
         # Discard handling
         discard_queue_multiplier: int = 100,
+        score_reference_groups_per_step: float | None = None,
         # Status output
         log_interval_seconds: float = 60.0,
         status_ewa_alpha: float = 0.2,
@@ -149,6 +150,13 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
         # Resumption
         resume: bool = True,
     ) -> None:
+        autotune = autotune or PipelineAutotuneConfig()
+        if autotune.mode != "off" and pipeline is not None:
+            raise ValueError(
+                "Pipeline runtime config cannot be provided when pipeline autotuning "
+                "is enabled. The autotuner owns the initial and online pipeline "
+                "settings."
+            )
         pipeline = pipeline or PipelineRuntimeConfig()
         if eval_every_n_steps < 0:
             raise ValueError("eval_every_n_steps must be >= 0")
@@ -170,13 +178,13 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
         self.config = config
         self.eval_fn = eval_fn
         self.pipeline = pipeline
-        self.autotune = autotune or PipelineAutotuneConfig()
+        self.autotune = autotune
         self.num_rollout_workers = pipeline.num_rollout_workers
         self.min_batch_size = pipeline.min_batch_size
         self.max_batch_size = (
             pipeline.max_batch_size
             if pipeline.max_batch_size is not None
-            else 10 * pipeline.min_batch_size
+            else pipeline.min_batch_size
         )
         self.max_steps_off_policy = pipeline.max_steps_off_policy
         self.limit_mean_steps_off_policy = pipeline.limit_mean_steps_off_policy
@@ -196,7 +204,11 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
         self.optimizer_save_interval = optimizer_save_interval
         self.checkpoint_retention_strategy = checkpoint_retention_strategy
         self.checkpoint_retention_interval = checkpoint_retention_interval
-        self.score_reference_groups_per_step = pipeline.score_reference_groups_per_step
+        self.score_reference_groups_per_step = (
+            score_reference_groups_per_step
+            if score_reference_groups_per_step is not None
+            else pipeline.score_reference_groups_per_step
+        )
         self.resume = resume
         self.discard_queue_multiplier = discard_queue_multiplier
         self._discard_queue: list[TrajectoryGroup] = []

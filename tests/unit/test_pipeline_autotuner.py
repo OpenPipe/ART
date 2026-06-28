@@ -1,0 +1,37 @@
+from art.pipeline_tuner import PipelineAutotuneConfig
+from art.pipeline_tuner.autotune import build_initial_settings, recommended_queue_size
+
+
+def test_build_initial_settings_uses_art_owned_defaults() -> None:
+    settings = build_initial_settings(
+        config=PipelineAutotuneConfig(),
+        inference_gpu_count=2,
+    )
+
+    assert settings.num_rollout_workers == 16
+    assert settings.min_batch_size == 8
+    assert settings.max_batch_size == 8
+    assert settings.target_groups_per_step == 8
+    assert settings.limit_mean_steps_off_policy == 3.0
+    assert settings.queue_maxsize == 12
+
+
+def test_recommended_queue_keeps_one_batch_and_policy_age_bound() -> None:
+    assert (
+        recommended_queue_size(
+            target_groups_per_step=8,
+            limit_steps_off_policy=3.0,
+            num_rollout_workers=16,
+            running_reserve_fraction=0.75,
+        )
+        == 12
+    )
+    assert (
+        recommended_queue_size(
+            target_groups_per_step=8,
+            limit_steps_off_policy=3.0,
+            num_rollout_workers=64,
+            running_reserve_fraction=0.75,
+        )
+        == 8
+    )

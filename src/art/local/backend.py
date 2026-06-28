@@ -323,7 +323,10 @@ class LocalBackend(Backend):
     async def collect_train_step_vllm_metrics(self, model: Model) -> dict[str, float]:
         base_url = model.inference_base_url
         if not base_url or not base_url.startswith(("http://", "https://")):
-            return {}
+            raise RuntimeError(
+                "ART vLLM metrics require model.inference_base_url to point to the "
+                "dedicated ART vLLM runtime."
+            )
 
         metrics_root = base_url.rstrip("/")
         if metrics_root.endswith("/v1"):
@@ -336,46 +339,47 @@ class LocalBackend(Backend):
         try:
             async with httpx.AsyncClient(timeout=1.0) as client:
                 response = await client.get(
-                    f"{metrics_root}/metrics",
+                    f"{metrics_root}/art/metrics",
                     headers=headers,
                 )
                 response.raise_for_status()
-        except httpx.HTTPError as exc:
-            logger.debug(
-                "Failed to collect vLLM metrics from %s: %s", metrics_root, exc
-            )
-            return {}
+                payload = response.json()
+        except (httpx.HTTPError, ValueError) as exc:
+            raise RuntimeError(
+                "ART vLLM metrics require the dedicated ART runtime endpoint at "
+                f"{metrics_root}/art/metrics."
+            ) from exc
 
-        text = response.text
+        raw_metrics = payload.get("metrics") if isinstance(payload, dict) else None
+        if not isinstance(raw_metrics, dict):
+            raise RuntimeError(
+                "ART vLLM metrics endpoint returned an invalid payload: expected "
+                "a top-level metrics object."
+            )
+
+        def required_metric(name: str) -> float:
+            raw_value = raw_metrics.get(name)
+            if not isinstance(raw_value, (int, float)):
+                raise RuntimeError(
+                    f"ART vLLM metrics endpoint did not provide numeric {name!r}."
+                )
+            return float(raw_value)
+
         snapshot = {
-            "prompt_tokens_total": _prometheus_sum(text, "vllm:prompt_tokens_total"),
-            "generation_tokens_total": _prometheus_sum(
-                text, "vllm:generation_tokens_total"
-            ),
-            "prefix_cache_queries_total": _prometheus_sum(
-                text, "vllm:prefix_cache_queries_total"
-            ),
-            "prefix_cache_hits_total": _prometheus_sum(
-                text, "vllm:prefix_cache_hits_total"
-            ),
-            "num_preemptions_total": _prometheus_sum(
-                text, "vllm:num_preemptions_total"
-            ),
+            "prompt_tokens_total": required_metric("prompt_tokens_total"),
+            "generation_tokens_total": required_metric("generation_tokens_total"),
+            "prefix_cache_queries_total": required_metric("prefix_cache_queries_total"),
+            "prefix_cache_hits_total": required_metric("prefix_cache_hits_total"),
+            "num_preemptions_total": required_metric("num_preempted_reqs_total"),
         }
         metrics: dict[str, float] = {}
         gauges = {
-            "vllm/num_requests_running": _prometheus_sum(
-                text, "vllm:num_requests_running"
+            "vllm/num_requests_running": required_metric("num_requests_running"),
+            "vllm/num_requests_waiting": required_metric("num_requests_waiting"),
+            "vllm/num_requests_waiting_capacity": required_metric(
+                "num_requests_waiting_capacity"
             ),
-            "vllm/num_requests_waiting": _prometheus_sum(
-                text, "vllm:num_requests_waiting"
-            ),
-            "vllm/num_requests_waiting_capacity": _prometheus_sum_with_label(
-                text, "vllm:num_requests_waiting_by_reason", "reason", "capacity"
-            ),
-            "vllm/kv_cache_usage_perc": _prometheus_mean(
-                text, "vllm:kv_cache_usage_perc"
-            ),
+            "vllm/kv_cache_usage_perc": required_metric("kv_cache_usage_perc"),
             "vllm/num_preemptions_total": snapshot["num_preemptions_total"],
         }
         for key, value in gauges.items():
