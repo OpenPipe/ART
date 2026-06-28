@@ -1,4 +1,5 @@
 import asyncio
+from contextlib import contextmanager
 from contextvars import Token
 from datetime import datetime
 import json
@@ -45,6 +46,18 @@ StateType = TypeVar("StateType", bound=dict[str, Any], default=dict[str, Any])
 
 METRICS_BUILDER_STATE_KEY = "_metrics_builder_state"
 LOCAL_INFERENCE_HOSTS = frozenset({"127.0.0.1", "0.0.0.0", "::1", "localhost"})
+
+
+@contextmanager
+def _suppress_weave_trace():
+    try:
+        from weave.trace.settings import override_settings
+    except ModuleNotFoundError:
+        yield
+        return
+
+    with override_settings(disabled=True):
+        yield
 
 
 def _merge_extra_body_defaults(
@@ -118,8 +131,14 @@ class _OpenAIChatCompletionsProxy:
                 self._default_extra_body,
                 kwargs.get("extra_body"),
             )
+        # Local vLLM responses carry token IDs, logprobs, routed experts, and
+        # policy-span metadata that ART needs for training. Weave's OpenAI
+        # integration serializes the whole response by default, which can turn a
+        # long RL run into hundreds of GB of trace payload. Keep the production
+        # training response intact and suppress only this implicit trace.
         try:
-            response = await self._completions.create(*args, **kwargs)
+            with _suppress_weave_trace():
+                response = await self._completions.create(*args, **kwargs)
         except APIConnectionError as exc:
             if self._local_serving_base_url is not None:
                 raise LocalServingUnavailableError(
@@ -200,6 +219,12 @@ METRIC_SECTIONS = frozenset(
     }
 )
 METRIC_SPLITS = frozenset({"train", "val", "test"})
+
+
+def _wandb_run_is_finished(run: "Run") -> bool:
+    # W&B has changed private finished-state attrs across versions. Missing attrs
+    # mean the current run object should remain usable.
+    return bool(getattr(run, "_is_finished", getattr(run, "_finished", False)))
 
 
 class Model(
@@ -643,7 +668,7 @@ class Model(
         merged = self._merge_wandb_config(self._wandb_config, config)
         object.__setattr__(self, "_wandb_config", merged)
 
-        if self._wandb_run is not None and not self._wandb_run._is_finished:
+        if self._wandb_run is not None and not _wandb_run_is_finished(self._wandb_run):
             self._sync_wandb_config(self._wandb_run)
 
     def _sync_wandb_config(
@@ -667,7 +692,7 @@ class Model(
 
         if "WANDB_API_KEY" not in os.environ:
             return None
-        if self._wandb_run is None or self._wandb_run._is_finished:
+        if self._wandb_run is None or _wandb_run_is_finished(self._wandb_run):
             run = wandb.init(
                 project=self.project,
                 name=self.name,
@@ -773,7 +798,7 @@ class Model(
 
     def _define_wandb_step_metrics(self, keys: Iterable[str]) -> None:
         run = self._wandb_run
-        if run is None or run._is_finished:
+        if run is None or _wandb_run_is_finished(run):
             return
 
         for key in keys:
