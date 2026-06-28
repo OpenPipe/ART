@@ -41,6 +41,7 @@ class PipelineAutotuner:
         backend_name: str | None,
         packed_sequence_length: int,
         inference_gpu_count: int,
+        policy_age_limit_steps: float,
     ) -> None:
         self.config = config
         self.settings = settings
@@ -48,6 +49,7 @@ class PipelineAutotuner:
         self.backend_name = backend_name
         self.packed_sequence_length = packed_sequence_length
         self.inference_gpu_count = inference_gpu_count
+        self.policy_age_limit_steps = policy_age_limit_steps
         self.metrics: list[PipelineMetric] = []
         self.packed_groups: list[PackedGroupObservation] = []
         self.decisions: list[TunerDecision] = []
@@ -198,7 +200,7 @@ class PipelineAutotuner:
             previous, stats, adapt_target=True
         )
         freshness_ratio = max(
-            self._policy_age_ratio(updated, stats), stats.queue_freshness_pressure
+            self._policy_age_ratio(stats), stats.queue_freshness_pressure
         )
         age_high = freshness_ratio >= self.config.policy_age_high_fraction
         age_severe = freshness_ratio >= self.config.policy_age_severe_fraction
@@ -296,11 +298,8 @@ class PipelineAutotuner:
             stats=stats,
         )
 
-    @staticmethod
-    def _policy_age_ratio(
-        settings: PipelineTuneSettings, stats: TunerWindowStats
-    ) -> float:
-        limit = max(float(settings.limit_mean_steps_off_policy), 1e-9)
+    def _policy_age_ratio(self, stats: TunerWindowStats) -> float:
+        limit = max(float(self.policy_age_limit_steps), 1e-9)
         return max(0.0, stats.token_weighted_policy_age_steps_mean) / limit
 
     def _move_workers(self, current: int, direction: int) -> int:
@@ -330,9 +329,11 @@ class PipelineAutotuner:
         min_batch = min(settings.min_batch_size, target)
         if adapt_target and target > settings.target_groups_per_step and not was_locked:
             min_batch = max(min_batch, min_floor)
+        # Packed sequence length is the user's cap on target/max batch size. If a
+        # run should never use larger train batches, lower packed_sequence_length.
         queue = recommended_queue_size(
             target_groups_per_step=min_batch,
-            limit_steps_off_policy=settings.limit_mean_steps_off_policy,
+            limit_steps_off_policy=self.policy_age_limit_steps,
             num_rollout_workers=settings.num_rollout_workers,
             running_reserve_fraction=self.config.queue_running_reserve_fraction,
         )
@@ -449,6 +450,7 @@ class PipelineAutotuner:
             backend=self.backend_name,
             packed_sequence_length=self.packed_sequence_length,
             inference_gpu_count=self.inference_gpu_count,
+            policy_age_limit_steps=self.policy_age_limit_steps,
             settings=self.settings,
             config=self.config,
             decisions=self.decisions,
@@ -463,8 +465,8 @@ def build_initial_settings(
     *,
     config: PipelineAutotuneConfig,
     inference_gpu_count: int,
+    policy_age_limit_steps: float,
 ) -> PipelineTuneSettings:
-    limit = float(config.initial_limit_mean_steps_off_policy)
     workers = _ceil_to_multiple(
         config.initial_model_calls_per_inference_gpu * inference_gpu_count,
         config.worker_step,
@@ -474,7 +476,7 @@ def build_initial_settings(
     min_batch = min(int(config.initial_min_batch_size), max_batch)
     queue = recommended_queue_size(
         target_groups_per_step=max_batch,
-        limit_steps_off_policy=limit,
+        limit_steps_off_policy=policy_age_limit_steps,
         num_rollout_workers=workers,
         running_reserve_fraction=config.queue_running_reserve_fraction,
     )
@@ -484,7 +486,6 @@ def build_initial_settings(
         max_batch_size=max_batch,
         queue_maxsize=queue,
         target_groups_per_step=max_batch,
-        limit_mean_steps_off_policy=limit,
     )
 
 

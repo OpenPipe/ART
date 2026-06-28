@@ -10,11 +10,12 @@ PACKED_GROUP_COMPLETION_TOKENS_KEY = "_art_packed_group_completion_tokens"
 
 
 class PipelineRuntimeConfig(pydantic.BaseModel):
+    model_config = pydantic.ConfigDict(extra="forbid")
+
     num_rollout_workers: int = pydantic.Field(default=16, ge=1)
     min_batch_size: int = pydantic.Field(default=4, ge=1)
     max_batch_size: int | None = pydantic.Field(default=None, ge=1)
     max_steps_off_policy: int | None = pydantic.Field(default=4, ge=0)
-    limit_mean_steps_off_policy: float | None = pydantic.Field(default=None, ge=0.0)
     queue_maxsize: int | None = pydantic.Field(default=None, ge=1)
     score_reference_groups_per_step: float | None = pydantic.Field(default=None, gt=0.0)
 
@@ -41,7 +42,6 @@ class PipelineAutotuneConfig(pydantic.BaseModel):
     initial_model_calls_per_inference_gpu: int = pydantic.Field(default=8, ge=1)
     initial_min_batch_size: int = pydantic.Field(default=8, ge=1)
     initial_max_batch_size: int = pydantic.Field(default=8, ge=1)
-    initial_limit_mean_steps_off_policy: float = pydantic.Field(default=3.0, ge=0.0)
     bootstrap_samples: int = pydantic.Field(default=256, ge=16)
     queue_running_reserve_fraction: float = pydantic.Field(default=0.75, ge=0.0, le=1.0)
     trainer_idle_under_frac: float = pydantic.Field(default=0.20, ge=0.0, le=1.0)
@@ -76,7 +76,6 @@ class PipelineTuneSettings(pydantic.BaseModel):
     max_batch_size: int = pydantic.Field(ge=1)
     queue_maxsize: int = pydantic.Field(ge=1)
     target_groups_per_step: int = pydantic.Field(ge=1)
-    limit_mean_steps_off_policy: float = pydantic.Field(default=3.0, ge=0.0)
 
 
 class PipelineMetric(pydantic.BaseModel):
@@ -135,6 +134,7 @@ class PipelineAutotunerProfile(pydantic.BaseModel):
     backend: str | None = None
     packed_sequence_length: int | None = None
     inference_gpu_count: int | None = None
+    policy_age_limit_steps: float | None = None
     settings: PipelineTuneSettings
     config: PipelineAutotuneConfig
     decisions: list[TunerDecision] = pydantic.Field(default_factory=list)

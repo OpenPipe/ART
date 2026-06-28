@@ -6,13 +6,13 @@ def test_build_initial_settings_uses_art_owned_defaults() -> None:
     settings = build_initial_settings(
         config=PipelineAutotuneConfig(),
         inference_gpu_count=2,
+        policy_age_limit_steps=3.0,
     )
 
     assert settings.num_rollout_workers == 16
     assert settings.min_batch_size == 8
     assert settings.max_batch_size == 8
     assert settings.target_groups_per_step == 8
-    assert settings.limit_mean_steps_off_policy == 3.0
     assert settings.queue_maxsize == 12
 
 

@@ -135,6 +135,7 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
         max_steps: int | None = None,
         # Discard handling
         discard_queue_multiplier: int = 100,
+        limit_mean_steps_off_policy: float | None = None,
         score_reference_groups_per_step: float | None = None,
         # Status output
         log_interval_seconds: float = 60.0,
@@ -166,6 +167,8 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
             raise ValueError("log_interval_seconds must be > 0")
         if discard_queue_multiplier <= 0:
             raise ValueError("discard_queue_multiplier must be > 0")
+        if limit_mean_steps_off_policy is not None and limit_mean_steps_off_policy < 0:
+            raise ValueError("limit_mean_steps_off_policy must be >= 0")
         if checkpoint_retention_interval <= 0:
             raise ValueError("checkpoint_retention_interval must be > 0")
         if optimizer_save_interval is not None and optimizer_save_interval <= 0:
@@ -187,7 +190,7 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
             else pipeline.min_batch_size
         )
         self.max_steps_off_policy = pipeline.max_steps_off_policy
-        self.limit_mean_steps_off_policy = pipeline.limit_mean_steps_off_policy
+        self.limit_mean_steps_off_policy = limit_mean_steps_off_policy
         self.queue_maxsize = pipeline.queue_maxsize
         self.learning_rate = learning_rate
         self.loss_fn = loss_fn
@@ -379,7 +382,6 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
         self.min_batch_size = settings.min_batch_size
         self.max_batch_size = settings.max_batch_size
         self.queue_maxsize = settings.queue_maxsize
-        self.limit_mean_steps_off_policy = settings.limit_mean_steps_off_policy
         self._discard_queue_limit = self.discard_queue_multiplier * self.min_batch_size
         self._rollout_worker_controller.set_target(self.num_rollout_workers)
         if self._output_queue is not None:

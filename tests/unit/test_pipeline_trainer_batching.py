@@ -55,8 +55,8 @@ def _make_trainer(
             min_batch_size=1,
             max_batch_size=2,
             max_steps_off_policy=max_steps_off_policy,
-            limit_mean_steps_off_policy=limit_mean_steps_off_policy,
         ),
+        limit_mean_steps_off_policy=limit_mean_steps_off_policy,
         max_steps=1,
         eval_fn=None,
     )
@@ -125,6 +125,32 @@ def test_autotune_rejects_pipeline_runtime_config(tmp_path: Path) -> None:
             max_steps=1,
             eval_fn=None,
         )
+
+
+def test_policy_age_limit_is_not_pipeline_runtime_config() -> None:
+    with pytest.raises(ValueError):
+        PipelineRuntimeConfig.model_validate({"limit_mean_steps_off_policy": 1.0})
+
+
+def test_autotune_allows_user_policy_age_limit_kwarg(tmp_path: Path) -> None:
+    trainer = PipelineTrainer(
+        model=TrainableModel(
+            name="pipeline-autotune-policy-limit-test",
+            project="pipeline-tests",
+            base_model="test-model",
+            base_path=str(tmp_path),
+        ),
+        backend=MagicMock(),  # type: ignore[arg-type]
+        rollout_fn=lambda *_args, **_kwargs: asyncio.sleep(0),
+        scenarios=[],
+        config={},
+        autotune=PipelineAutotuneConfig(mode="online"),
+        limit_mean_steps_off_policy=1.5,
+        max_steps=1,
+        eval_fn=None,
+    )
+
+    assert trainer.limit_mean_steps_off_policy == 1.5
 
 
 @pytest.mark.asyncio
