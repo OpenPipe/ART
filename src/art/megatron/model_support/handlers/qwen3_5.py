@@ -706,68 +706,6 @@ def _has_shared_expert_lora_tensors(tensors: dict[str, torch.Tensor]) -> bool:
     return any(".mlp.shared_expert." in key for key in tensors)
 
 
-def _looks_like_peft_target_parameter_moe_lora(
-    slots: dict[str, torch.Tensor],
-) -> bool:
-    try:
-        gate_up_a = slots["base_layer.lora_A"]
-        gate_up_b = slots["base_layer.lora_B"]
-        down_a = slots["lora_A"]
-        down_b = slots["lora_B"]
-    except KeyError:
-        return False
-    expert_rank = gate_up_a.shape[0]
-    return (
-        down_a.shape[0] == expert_rank
-        and gate_up_b.shape[1] == expert_rank
-        and down_b.shape[1] == expert_rank
-        and gate_up_a.shape[1] == 2 * down_b.shape[0]
-        and down_a.shape[1] == gate_up_b.shape[0]
-    )
-
-
-def _convert_peft_target_parameter_moe_lora(
-    tensors: dict[str, torch.Tensor],
-) -> dict[str, torch.Tensor]:
-    grouped: dict[str, dict[str, torch.Tensor]] = {}
-    for key, tensor in tensors.items():
-        match = _VLLM_MOE_KEY_RE.match(key)
-        if match is None:
-            continue
-        slot = (
-            f"{'base_layer.' if match.group('base_layer') else ''}{match.group('lora')}"
-        )
-        grouped.setdefault(match.group("prefix"), {})[slot] = tensor
-    peft_prefixes = {
-        prefix
-        for prefix, slots in grouped.items()
-        if _looks_like_peft_target_parameter_moe_lora(slots)
-    }
-    if not peft_prefixes:
-        return tensors
-    transformed: dict[str, torch.Tensor] = {}
-    for key, tensor in tensors.items():
-        match = _VLLM_MOE_KEY_RE.match(key)
-        if match is None or match.group("prefix") not in peft_prefixes:
-            transformed[key] = tensor
-            continue
-        prefix = match.group("prefix")
-        slot = (
-            f"{'base_layer.' if match.group('base_layer') else ''}{match.group('lora')}"
-        )
-        if slot == "base_layer.lora_A":
-            transformed[f"{prefix}.base_layer.lora_B.weight"] = tensor.T.contiguous()
-        elif slot == "base_layer.lora_B":
-            transformed[f"{prefix}.base_layer.lora_A.weight"] = tensor.T.contiguous()
-        elif slot == "lora_A":
-            transformed[f"{prefix}.lora_B.weight"] = tensor.T.contiguous()
-        elif slot == "lora_B":
-            transformed[f"{prefix}.lora_A.weight"] = tensor.T.contiguous()
-        else:
-            raise AssertionError(f"Unhandled Qwen3.5 MoE LoRA slot: {slot}")
-    return transformed
-
-
 def _vllm_moe_config(
     adapter_config: dict[str, Any],
     *,
@@ -813,8 +751,6 @@ def _to_vllm_lora_tensors(
     transformed: dict[str, torch.Tensor] = {}
     if not grouped:
         has_fused_experts = any(_VLLM_MOE_KEY_RE.match(key) for key in tensors)
-        if has_fused_experts:
-            tensors = _convert_peft_target_parameter_moe_lora(tensors)
         for key, tensor in tensors.items():
             vllm_key, tensor = _to_vllm_lora_tensor(
                 key,
