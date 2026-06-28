@@ -1331,6 +1331,23 @@ class LocalBackend(Backend):
         base_metrics["data/step_trainer_assistant_tokens"] = base_metrics[
             "data/step_trainer_tokens"
         ]
+        packed_sequences, packed_sequence_length = packed_tensors["tokens"].shape
+        packed_train_tokens = int(packed_sequences * packed_sequence_length)
+        non_padding_tokens = int((packed_tensors["group_ids"] != -1).sum().item())
+        base_metrics.update(
+            {
+                "data/step_packed_sequences": float(packed_sequences),
+                "data/step_packed_train_tokens": float(packed_train_tokens),
+                "data/step_train_tokens": float(packed_train_tokens),
+                "data/step_non_padding_tokens": float(non_padding_tokens),
+                "data/step_padding_ratio": (
+                    float(packed_train_tokens - non_padding_tokens)
+                    / packed_train_tokens
+                    if packed_train_tokens > 0
+                    else 0.0
+                ),
+            }
+        )
         disk_packed_tensors = packed_tensors_to_dir(
             packed_tensors, f"{get_model_dir(model=model, art_path=self._path)}/tensors"
         )

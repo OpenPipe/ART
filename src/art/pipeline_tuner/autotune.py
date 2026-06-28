@@ -22,6 +22,20 @@ def _mean(values: list[float]) -> float:
     return statistics.fmean(values) if values else 0.0
 
 
+def _required_step_values(
+    by_step: dict[int, dict[str, PipelineMetric]],
+    window_steps: list[int],
+    name: str,
+) -> list[float]:
+    missing = [step for step in window_steps if name not in by_step[step]]
+    if missing:
+        raise RuntimeError(
+            "Pipeline autotuning requires metric "
+            f"{name!r} in every decision-window step; missing steps {missing}."
+        )
+    return [by_step[step][name].value for step in window_steps]
+
+
 def _ceil_to_multiple(value: float, multiple: int, *, minimum: int = 1) -> int:
     return max(minimum, int(math.ceil(value / multiple)) * multiple)
 
@@ -125,13 +139,20 @@ class PipelineAutotuner:
                 if name in by_step[step]
             ]
 
-        wall_values = step_values("pipeline_trainer/step_wall_s") or step_values(
-            "time/step_wall_s"
+        wall_values = _required_step_values(
+            by_step, window_steps, "pipeline_trainer/step_wall_s"
         )
-        collect_values = step_values("pipeline_trainer/step_collect_batch_s")
+        collect_values = _required_step_values(
+            by_step, window_steps, "pipeline_trainer/step_collect_batch_s"
+        )
         wall = sum(wall_values)
         collect = sum(collect_values)
-        groups = step_values("data/step_num_groups_trainable")
+        groups = _required_step_values(
+            by_step, window_steps, "data/step_num_groups_trainable"
+        )
+        train_capacity_tokens = _required_step_values(
+            by_step, window_steps, "data/step_train_tokens"
+        )
         discarded_stale = sum(step_values("staleness/discarded_groups"))
         generated_groups = sum(groups) + discarded_stale
         vllm_metrics = [
@@ -139,23 +160,41 @@ class PipelineAutotuner:
             for rec in self.metrics
             if rec.step is None and t0 <= rec.t_s <= max(t1, t0 + 1e-6)
         ]
-        pack_samples = [
-            float(obs.physical_tokens)
-            for obs in self.packed_groups
-            if obs.step in set(window_steps)
+        window_step_set = set(window_steps)
+        pack_by_step: dict[int, list[float]] = defaultdict(list)
+        for obs in self.packed_groups:
+            if obs.step in window_step_set:
+                pack_by_step[obs.step].append(float(obs.physical_tokens))
+        missing_packed_steps = [
+            step
+            for step, group_count in zip(window_steps, groups)
+            if group_count > 0 and not pack_by_step[step]
         ]
-        if not pack_samples:
+        if missing_packed_steps:
             raise RuntimeError(
-                "Pipeline autotuner expected packed-group observations in the "
-                "decision window, but none were recorded."
+                "Pipeline autotuner requires packed-group observations in every "
+                f"trainable decision-window step; missing steps {missing_packed_steps}."
             )
+        pack_samples = [
+            sample for step in window_steps for sample in pack_by_step.get(step, [])
+        ]
+        padding_ratios = []
+        for step, capacity in zip(window_steps, train_capacity_tokens):
+            if capacity <= 0:
+                continue
+            non_padding = sum(pack_by_step.get(step, []))
+            padding_ratios.append(max(0.0, (capacity - non_padding) / capacity))
         vllm_load = _vllm_load_stats(vllm_metrics, window_start_s=t0, window_end_s=t1)
         return TunerWindowStats(
             start_step=window_steps[0],
             end_step=window_steps[-1],
-            score_mean=_mean(step_values("objective/score_default")),
+            score_mean=_mean(
+                _required_step_values(by_step, window_steps, "objective/score_default")
+            ),
             accepted_tok_per_s_mean=_mean(
-                step_values("throughput/accepted_train_tok_per_s")
+                _required_step_values(
+                    by_step, window_steps, "throughput/accepted_train_tok_per_s"
+                )
             ),
             trainer_idle_frac=(collect / wall) if wall > 0 else 0.0,
             vllm_capacity_wait_frac=vllm_load.capacity_wait_frac,
@@ -182,18 +221,18 @@ class PipelineAutotuner:
                 step_values("sample_efficiency/freshness_discount")
             )
             or 1.0,
-            padding_ratio_mean=_mean(step_values("data/step_padding_ratio")),
+            padding_ratio_mean=_mean(padding_ratios),
             groups_per_step_mean=_mean(groups),
             step_wall_s_mean=_mean(wall_values),
             collect_batch_s_mean=_mean(collect_values),
             train_work_s_mean=max(0.0, _mean(wall_values) - _mean(collect_values)),
-            train_capacity_tokens_mean=_mean(step_values("data/step_train_tokens")),
+            train_capacity_tokens_mean=_mean(train_capacity_tokens),
             group_pack_token_samples=pack_samples,
         )
 
     def _decide(self, stats: TunerWindowStats) -> TunerDecision:
         inference_over = stats.vllm_pressure > self.config.vllm_pressure_over_ratio
-        trainer_under = stats.trainer_idle_frac >= self.config.trainer_idle_under_frac
+        trainer_under = stats.trainer_idle_frac > self.config.trainer_idle_under_frac
         trainer_over = stats.trainer_idle_frac <= self.config.trainer_idle_over_frac
         inference_under = (
             not inference_over

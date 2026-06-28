@@ -9,6 +9,7 @@ from art.pipeline_tuner.autotune import (
     recommended_queue_size,
 )
 from art.pipeline_tuner.config import (
+    PackedGroupObservation,
     PipelineMetric,
     PipelineTuneSettings,
     TunerDecision,
@@ -247,3 +248,103 @@ def test_stable_holds_emit_inference_gpu_warning() -> None:
         "increase inference GPUs" in item
         for item in tuner.decisions[-1].recommendations
     )
+
+
+def _append_decision_window_metrics(
+    tuner: PipelineAutotuner, *, include_train_capacity: bool = True
+) -> None:
+    for idx, step in enumerate(range(4, 8)):
+        t_s = float(idx + 1)
+        step_metrics = {
+            "objective/score_default": 100.0,
+            "throughput/accepted_train_tok_per_s": 500.0,
+            "pipeline_trainer/step_wall_s": 10.0,
+            "pipeline_trainer/step_collect_batch_s": 1.0,
+            "data/step_num_groups_trainable": 2.0,
+            "sample_efficiency/freshness_discount": 0.5,
+            "offpolicy/token_weighted_policy_age_steps": 1.0,
+            "queue/predicted_stale_fraction": 0.0,
+            "queue/freshness_pressure": 0.25,
+        }
+        if include_train_capacity:
+            step_metrics["data/step_train_tokens"] = 100.0
+        for name, value in step_metrics.items():
+            tuner.metrics.append(
+                PipelineMetric(name=name, value=value, step=step, t_s=t_s)
+            )
+        tuner.packed_groups.extend(
+            [
+                PackedGroupObservation(
+                    step=step,
+                    physical_tokens=40,
+                    prompt_tokens=30,
+                    completion_tokens=10,
+                ),
+                PackedGroupObservation(
+                    step=step,
+                    physical_tokens=20,
+                    prompt_tokens=10,
+                    completion_tokens=10,
+                ),
+            ]
+        )
+    for idx in range(4):
+        t_s = float(idx + 1)
+        tuner.metrics.extend(
+            [
+                PipelineMetric(name="vllm/num_requests_running", value=8.0, t_s=t_s),
+                PipelineMetric(name="vllm/num_requests_waiting", value=0.0, t_s=t_s),
+                PipelineMetric(
+                    name="vllm/num_requests_waiting_capacity", value=0.0, t_s=t_s
+                ),
+                PipelineMetric(name="vllm/max_num_seqs", value=256.0, t_s=t_s),
+            ]
+        )
+
+
+def test_window_stats_derives_padding_from_packed_group_observations() -> None:
+    tuner = PipelineAutotuner(
+        config=PipelineAutotuneConfig(),
+        settings=PipelineTuneSettings(
+            num_rollout_workers=16,
+            min_batch_size=8,
+            max_batch_size=8,
+            queue_maxsize=12,
+            target_groups_per_step=8,
+        ),
+        model_name="test",
+        backend_name="MegatronBackend",
+        packed_sequence_length=122880,
+        inference_gpu_count=2,
+        policy_age_limit_steps=3.0,
+    )
+    _append_decision_window_metrics(tuner)
+
+    stats = tuner.window_stats()
+
+    assert stats is not None
+    assert stats.padding_ratio_mean == pytest.approx(0.4)
+    assert stats.train_capacity_tokens_mean == 100.0
+    assert stats.group_pack_token_samples == [40.0, 20.0] * 4
+
+
+def test_window_stats_requires_train_capacity_for_padding() -> None:
+    tuner = PipelineAutotuner(
+        config=PipelineAutotuneConfig(),
+        settings=PipelineTuneSettings(
+            num_rollout_workers=16,
+            min_batch_size=8,
+            max_batch_size=8,
+            queue_maxsize=12,
+            target_groups_per_step=8,
+        ),
+        model_name="test",
+        backend_name="MegatronBackend",
+        packed_sequence_length=122880,
+        inference_gpu_count=2,
+        policy_age_limit_steps=3.0,
+    )
+    _append_decision_window_metrics(tuner, include_train_capacity=False)
+
+    with pytest.raises(RuntimeError, match="data/step_train_tokens"):
+        tuner.window_stats()
