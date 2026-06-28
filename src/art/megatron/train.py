@@ -437,6 +437,22 @@ def build_training_runtime(
     return runtime
 
 
+def _poll_next_megatron_job_path(
+    runtime: TrainingRuntime,
+    jobs_dir: str,
+) -> str | None:
+    selected_job: list[str | None] = [None]
+    if runtime.rank == 0:
+        os.makedirs(jobs_dir, exist_ok=True)
+        job_names = sorted(
+            job_name for job_name in os.listdir(jobs_dir) if job_name.endswith(".json")
+        )
+        if job_names:
+            selected_job[0] = os.path.join(jobs_dir, job_names[0])
+    torch.distributed.broadcast_object_list(selected_job, src=0)  # type: ignore[possibly-missing-attribute]
+    return selected_job[0]
+
+
 def run_megatron_worker_loop(
     runtime: TrainingRuntime,
     *,
@@ -447,12 +463,8 @@ def run_megatron_worker_loop(
 ) -> None:
     jobs_dir = os.environ.get("ART_MEGATRON_JOBS_DIR", DEFAULT_JOBS_DIR)
     while True:
-        torch.distributed.barrier()  # type: ignore[possibly-missing-attribute]
-        os.makedirs(jobs_dir, exist_ok=True)
-        job_names = sorted(
-            job_name for job_name in os.listdir(jobs_dir) if job_name.endswith(".json")
-        )
-        if not job_names:
+        job_path = _poll_next_megatron_job_path(runtime, jobs_dir)
+        if job_path is None:
             time.sleep(0.05)
             continue
 
@@ -461,7 +473,6 @@ def run_megatron_worker_loop(
         if before_job is not None:
             before_job()
 
-        job_path = os.path.join(jobs_dir, job_names[0])
         job = _load_megatron_job(job_path, supports_sft=supports_sft)
         print0(runtime.rank, "Loaded job from", job_path)
         print0(runtime.rank, "Job:", job)
