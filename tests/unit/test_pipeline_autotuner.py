@@ -1,5 +1,11 @@
 from art.pipeline_tuner import PipelineAutotuneConfig
 from art.pipeline_tuner.autotune import build_initial_settings, recommended_queue_size
+from art.pipeline_tuner.worker_controller import RolloutWorkerController
+
+
+class _PendingTask:
+    def done(self) -> bool:
+        return False
 
 
 def test_build_initial_settings_uses_art_owned_defaults() -> None:
@@ -35,3 +41,12 @@ def test_recommended_queue_keeps_one_batch_and_policy_age_bound() -> None:
         )
         == 8
     )
+
+
+def test_worker_controller_keeps_live_workers_when_at_target() -> None:
+    controller = RolloutWorkerController(object(), target_workers=2)
+    controller._tasks = {0: _PendingTask(), 1: _PendingTask()}  # type: ignore[dict-item]
+
+    controller._reconcile()
+
+    assert controller._retiring == set()
