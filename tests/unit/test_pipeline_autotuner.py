@@ -4,6 +4,7 @@ from art.pipeline_tuner import PipelineAutotuneConfig
 from art.pipeline_tuner.autotune import (
     PipelineAutotuner,
     _group_vllm_metric_rows,
+    _trainer_load_score,
     _vllm_load_stats,
     build_initial_settings,
     recommended_queue_size,
@@ -128,6 +129,15 @@ def test_vllm_load_stats_groups_scrape_burst_timestamps() -> None:
     )
 
 
+def test_trainer_load_score_accounts_for_padding() -> None:
+    assert _trainer_load_score(idle_frac=0.03, padding_ratio=0.25) == pytest.approx(
+        0.04
+    )
+    assert _trainer_load_score(idle_frac=0.17, padding_ratio=0.20) == pytest.approx(
+        0.2125
+    )
+
+
 def test_low_vllm_pressure_increases_workers_when_trainer_underfed() -> None:
     tuner = PipelineAutotuner(
         config=PipelineAutotuneConfig(),
@@ -149,6 +159,7 @@ def test_low_vllm_pressure_increases_workers_when_trainer_underfed() -> None:
             start_step=4,
             end_step=7,
             trainer_idle_frac=0.30,
+            trainer_load_score=0.30,
             vllm_capacity_wait_frac=0.20,
             vllm_active_frac=0.40,
             vllm_pressure=0.25,
@@ -190,6 +201,7 @@ def test_vllm_pressure_overloaded_train_underfed_holds_without_immediate_warning
             start_step=4,
             end_step=7,
             trainer_idle_frac=0.40,
+            trainer_load_score=0.40,
             vllm_pressure=1.0,
             vllm_capacity_wait_area=0.08,
             vllm_running_area=0.60,
@@ -235,6 +247,7 @@ def test_stable_holds_emit_inference_gpu_warning() -> None:
                     start_step=step + 1,
                     end_step=step + 1,
                     trainer_idle_frac=0.60,
+                    trainer_load_score=0.60,
                     vllm_pressure=1.0,
                     group_pack_token_samples=[15000.0] * 8,
                 ),

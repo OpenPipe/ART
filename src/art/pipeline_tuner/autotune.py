@@ -41,6 +41,7 @@ def _ceil_to_multiple(value: float, multiple: int, *, minimum: int = 1) -> int:
 
 
 _VLLM_SCRAPE_GROUP_TOLERANCE_S = 0.05
+_TRAINER_PADDING_EPSILON = 1e-9
 
 
 class PackingProjection(pydantic.BaseModel):
@@ -59,6 +60,14 @@ class VllmLoadStats(pydantic.BaseModel):
     running_area: float = 0.0
     idle_frac: float = 0.0
     max_num_seqs_mean: float = 0.0
+
+
+def _trainer_load_score(*, idle_frac: float, padding_ratio: float) -> float:
+    denominator = max(
+        _TRAINER_PADDING_EPSILON,
+        1.0 + _TRAINER_PADDING_EPSILON - max(0.0, min(1.0, padding_ratio)),
+    )
+    return max(0.0, idle_frac) / denominator
 
 
 class PipelineAutotuner:
@@ -184,6 +193,8 @@ class PipelineAutotuner:
                 continue
             non_padding = sum(pack_by_step.get(step, []))
             padding_ratios.append(max(0.0, (capacity - non_padding) / capacity))
+        trainer_idle_frac = (collect / wall) if wall > 0 else 0.0
+        padding_ratio_mean = _mean(padding_ratios)
         vllm_load = _vllm_load_stats(vllm_metrics, window_start_s=t0, window_end_s=t1)
         return TunerWindowStats(
             start_step=window_steps[0],
@@ -196,7 +207,11 @@ class PipelineAutotuner:
                     by_step, window_steps, "throughput/accepted_train_tok_per_s"
                 )
             ),
-            trainer_idle_frac=(collect / wall) if wall > 0 else 0.0,
+            trainer_idle_frac=trainer_idle_frac,
+            trainer_load_score=_trainer_load_score(
+                idle_frac=trainer_idle_frac,
+                padding_ratio=padding_ratio_mean,
+            ),
             vllm_capacity_wait_frac=vllm_load.capacity_wait_frac,
             vllm_active_frac=vllm_load.active_frac,
             vllm_capacity_wait_request_s=vllm_load.capacity_wait_request_s,
@@ -221,7 +236,7 @@ class PipelineAutotuner:
                 step_values("sample_efficiency/freshness_discount")
             )
             or 1.0,
-            padding_ratio_mean=_mean(padding_ratios),
+            padding_ratio_mean=padding_ratio_mean,
             groups_per_step_mean=_mean(groups),
             step_wall_s_mean=_mean(wall_values),
             collect_batch_s_mean=_mean(collect_values),
@@ -232,8 +247,8 @@ class PipelineAutotuner:
 
     def _decide(self, stats: TunerWindowStats) -> TunerDecision:
         inference_over = stats.vllm_pressure > self.config.vllm_pressure_over_ratio
-        trainer_under = stats.trainer_idle_frac > self.config.trainer_idle_under_frac
-        trainer_over = stats.trainer_idle_frac <= self.config.trainer_idle_over_frac
+        trainer_under = stats.trainer_load_score > self.config.trainer_load_under_score
+        trainer_over = stats.trainer_load_score <= self.config.trainer_load_over_score
         inference_under = (
             not inference_over
             and stats.vllm_pressure <= self.config.vllm_pressure_under_ratio
@@ -406,10 +421,10 @@ class PipelineAutotuner:
         vllm_saturated = stats.vllm_pressure > self.config.vllm_pressure_over_ratio
         vllm_underloaded = stats.vllm_pressure <= self.config.vllm_pressure_under_ratio
         trainer_severely_underloaded = (
-            stats.trainer_idle_frac >= self.config.trainer_idle_severe_under_frac
+            stats.trainer_load_score >= self.config.trainer_load_severe_under_score
         )
         trainer_saturated = (
-            stats.trainer_idle_frac <= self.config.trainer_idle_over_frac
+            stats.trainer_load_score <= self.config.trainer_load_over_score
         )
         recommendations: list[tuple[str, str]] = []
         if vllm_saturated and trainer_severely_underloaded:
