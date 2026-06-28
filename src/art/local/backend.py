@@ -15,8 +15,10 @@ from types import TracebackType
 from typing import TYPE_CHECKING, Any, AsyncIterator, Iterable, Literal, cast
 import warnings
 
+from art.utils.lifecycle import PROCESS_SHUTDOWN_TIMEOUT_SECONDS
+
 logger = logging.getLogger(__name__)
-_SERVICE_CLOSE_TIMEOUT_SECONDS = 20.0
+_SERVICE_CLOSE_TIMEOUT_SECONDS = PROCESS_SHUTDOWN_TIMEOUT_SECONDS
 
 _AUTO_GPU_HOURLY_PRICING_USD = {
     "H200": 3.0,
@@ -370,6 +372,12 @@ class LocalBackend(Backend):
                 )
             return float(raw_value)
 
+        def optional_metric(name: str) -> float | None:
+            raw_value = raw_metrics.get(name)
+            if not isinstance(raw_value, (int, float)):
+                return None
+            return float(raw_value)
+
         snapshot = {
             "prompt_tokens_total": required_metric("prompt_tokens_total"),
             "generation_tokens_total": required_metric("generation_tokens_total"),
@@ -390,6 +398,15 @@ class LocalBackend(Backend):
         for key, value in gauges.items():
             if value is not None:
                 metrics[key] = value
+        for name in (
+            "max_num_seqs",
+            "max_num_batched_tokens",
+            "max_num_scheduled_tokens",
+            "max_model_len",
+        ):
+            value = optional_metric(name)
+            if value is not None:
+                metrics[f"vllm/{name}"] = value
 
         now = time.monotonic()
         previous = self._vllm_metric_snapshots.get(model.name)

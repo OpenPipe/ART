@@ -15,6 +15,7 @@ class _ArtRuntimeMetricsState:
         self._record_count = 0
         self._last_update_unix_s = 0.0
         self._engine_gauges: dict[int, dict[str, float]] = {}
+        self._engine_configs: dict[int, dict[str, float]] = {}
         self._counters = {
             "prompt_tokens_total": 0.0,
             "prompt_tokens_computed_total": 0.0,
@@ -32,6 +33,30 @@ class _ArtRuntimeMetricsState:
             "policy_cache_waiting_requests_updated_total": 0.0,
             "policy_cache_started_waiting_requests_skipped_total": 0.0,
         }
+
+    def configure(self, vllm_config: Any, *, engine_idx: int) -> None:
+        scheduler_config = getattr(vllm_config, "scheduler_config", None)
+        model_config = getattr(vllm_config, "model_config", None)
+        engine_config: dict[str, float] = {}
+        for metric_name, obj, attr in (
+            ("max_num_seqs", scheduler_config, "max_num_seqs"),
+            ("max_num_batched_tokens", scheduler_config, "max_num_batched_tokens"),
+            ("max_model_len", model_config, "max_model_len"),
+        ):
+            value = getattr(obj, attr, None)
+            if isinstance(value, (int, float)):
+                engine_config[metric_name] = float(value)
+        max_num_scheduled_tokens = getattr(
+            scheduler_config, "max_num_scheduled_tokens", None
+        )
+        if isinstance(max_num_scheduled_tokens, (int, float)):
+            engine_config["max_num_scheduled_tokens"] = float(max_num_scheduled_tokens)
+        elif "max_num_batched_tokens" in engine_config:
+            engine_config["max_num_scheduled_tokens"] = engine_config[
+                "max_num_batched_tokens"
+            ]
+        with self._lock:
+            self._engine_configs[engine_idx] = engine_config
 
     def record(
         self,
@@ -95,9 +120,15 @@ class _ArtRuntimeMetricsState:
     def snapshot(self) -> dict[str, Any]:
         with self._lock:
             gauges = list(self._engine_gauges.values())
+            engine_configs = list(self._engine_configs.values())
             metrics = dict(self._counters)
             prefix_queries = metrics["prefix_cache_queries_total"]
             external_prefix_queries = metrics["external_prefix_cache_queries_total"]
+            max_model_lens = [
+                item["max_model_len"]
+                for item in engine_configs
+                if "max_model_len" in item
+            ]
             metrics.update(
                 {
                     "prefix_cache_hit_rate": (
@@ -122,6 +153,18 @@ class _ArtRuntimeMetricsState:
                     "kv_cache_usage_perc": max(
                         (item["kv_cache_usage"] for item in gauges), default=0.0
                     ),
+                    "max_num_seqs": sum(
+                        item.get("max_num_seqs", 0.0) for item in engine_configs
+                    ),
+                    "max_num_batched_tokens": sum(
+                        item.get("max_num_batched_tokens", 0.0)
+                        for item in engine_configs
+                    ),
+                    "max_num_scheduled_tokens": sum(
+                        item.get("max_num_scheduled_tokens", 0.0)
+                        for item in engine_configs
+                    ),
+                    "max_model_len": max(max_model_lens, default=0.0),
                 }
             )
             return {
@@ -163,8 +206,8 @@ _STATE = _ArtRuntimeMetricsState()
 
 class ArtRuntimeStatLogger(StatLoggerBase):
     def __init__(self, vllm_config: Any, engine_index: int = 0) -> None:
-        del vllm_config
         self.engine_index = engine_index
+        _STATE.configure(vllm_config, engine_idx=engine_index)
 
     def record(
         self,
