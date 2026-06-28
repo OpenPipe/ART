@@ -344,6 +344,11 @@ class LocalBackend(Backend):
                 )
                 response.raise_for_status()
                 payload = response.json()
+        except httpx.TimeoutException:
+            logger.warning(
+                "Timed out collecting ART vLLM metrics from %s", metrics_root
+            )
+            return {"vllm/metrics_scrape_timeout": 1.0}
         except (httpx.HTTPError, ValueError) as exc:
             raise RuntimeError(
                 "ART vLLM metrics require the dedicated ART runtime endpoint at "
