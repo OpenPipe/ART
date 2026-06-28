@@ -5,7 +5,9 @@ from contextlib import contextmanager
 from contextvars import ContextVar, Token
 from dataclasses import dataclass
 import time
-from typing import Any
+from typing import Any, Literal
+
+import pydantic
 
 from .api_costs import (
     CostExtractor,
@@ -22,6 +24,238 @@ _THROUGHPUT_IDLE_MAPPINGS = {
     "throughput/step_trainer_idle_s": "throughput/cum/trainer_idle_s",
     "throughput/step_actor_idle_s": "throughput/cum/actor_idle_s",
 }
+
+
+class MetricDefinition(pydantic.BaseModel):
+    key: str
+    title: str
+    description: str
+    kind: Literal["counter", "duration", "gauge", "rate", "ratio", "score"]
+    unit: str | None = None
+    higher_is_better: bool | None = None
+    dashboard_default: bool = False
+    score_component: bool = False
+
+
+PIPELINE_RL_METRIC_DEFINITIONS: tuple[MetricDefinition, ...] = (
+    MetricDefinition(
+        key="objective/score_default",
+        title="Default score",
+        description=(
+            "accepted trainable assistant tokens per second times freshness "
+            "discount times batch-size discount"
+        ),
+        kind="score",
+        higher_is_better=True,
+        dashboard_default=True,
+        score_component=True,
+    ),
+    MetricDefinition(
+        key="objective/score_raw",
+        title="Raw accepted throughput",
+        description=(
+            "accepted trainable assistant tokens per second before "
+            "sample-efficiency discounts"
+        ),
+        kind="rate",
+        unit="tok/s",
+        higher_is_better=True,
+        score_component=True,
+    ),
+    MetricDefinition(
+        key="objective/score_freshness",
+        title="Freshness-adjusted score",
+        description="accepted trainable assistant tokens per second times freshness discount",
+        kind="score",
+        higher_is_better=True,
+        score_component=True,
+    ),
+    MetricDefinition(
+        key="sample_efficiency/freshness_discount",
+        title="Freshness discount",
+        description="1 / (1 + token-weighted mean policy age in train steps)",
+        kind="ratio",
+        higher_is_better=True,
+        score_component=True,
+    ),
+    MetricDefinition(
+        key="sample_efficiency/batch_discount",
+        title="Batch-size discount",
+        description=(
+            "optional penalty for increasing accepted groups per train step "
+            "above a configured reference"
+        ),
+        kind="ratio",
+        higher_is_better=True,
+        score_component=True,
+    ),
+    MetricDefinition(
+        key="offpolicy/token_weighted_policy_age_steps",
+        title="Token-weighted policy age",
+        description=(
+            "completion-token-weighted mean train-step age of the policy that "
+            "generated accepted data"
+        ),
+        kind="gauge",
+        unit="steps",
+        higher_is_better=False,
+        score_component=True,
+    ),
+    MetricDefinition(
+        key="throughput/accepted_train_tok_per_s",
+        title="Accepted train tokens per second",
+        description=(
+            "accepted trainable assistant tokens divided by PipelineTrainer "
+            "step wall time"
+        ),
+        kind="rate",
+        unit="tok/s",
+        higher_is_better=True,
+        dashboard_default=True,
+        score_component=True,
+    ),
+    MetricDefinition(
+        key="data/step_trainer_assistant_tokens",
+        title="Accepted assistant tokens",
+        description="trainable assistant tokens in accepted groups for this train step",
+        kind="counter",
+        unit="tokens",
+        higher_is_better=None,
+        score_component=True,
+    ),
+    MetricDefinition(
+        key="data/step_padding_ratio",
+        title="Padding ratio",
+        description=(
+            "physical packed-token padding divided by packed sequence length "
+            "for this step"
+        ),
+        kind="ratio",
+        higher_is_better=False,
+        dashboard_default=True,
+    ),
+    MetricDefinition(
+        key="megatron/packed_train_tok_per_s",
+        title="Megatron packed train tokens per second",
+        description=(
+            "physical packed training-token throughput reported by the Megatron worker"
+        ),
+        kind="rate",
+        unit="tok/s",
+        higher_is_better=True,
+        dashboard_default=True,
+    ),
+    MetricDefinition(
+        key="megatron/non_padding_train_tok_per_s",
+        title="Megatron non-padding train tokens per second",
+        description=(
+            "non-padding training-token throughput reported by the Megatron worker"
+        ),
+        kind="rate",
+        unit="tok/s",
+        higher_is_better=True,
+    ),
+    MetricDefinition(
+        key="vllm/prompt_tok_per_s",
+        title="vLLM prompt tokens per second",
+        description="vLLM prompt prefill throughput over time",
+        kind="rate",
+        unit="tok/s",
+        higher_is_better=True,
+        dashboard_default=True,
+    ),
+    MetricDefinition(
+        key="vllm/completion_tok_per_s",
+        title="vLLM completion tokens per second",
+        description="vLLM decode throughput over time",
+        kind="rate",
+        unit="tok/s",
+        higher_is_better=True,
+        dashboard_default=True,
+    ),
+    MetricDefinition(
+        key="vllm/num_requests_running",
+        title="vLLM running requests",
+        description="number of admitted requests currently running in vLLM",
+        kind="gauge",
+        unit="requests",
+        higher_is_better=None,
+        dashboard_default=True,
+    ),
+    MetricDefinition(
+        key="vllm/num_requests_waiting",
+        title="vLLM waiting requests",
+        description="number of queued requests waiting for vLLM admission",
+        kind="gauge",
+        unit="requests",
+        higher_is_better=None,
+        dashboard_default=True,
+    ),
+    MetricDefinition(
+        key="vllm/num_requests_waiting_capacity",
+        title="vLLM capacity-waiting requests",
+        description="number of queued requests waiting because vLLM capacity is exhausted",
+        kind="gauge",
+        unit="requests",
+        higher_is_better=False,
+        dashboard_default=True,
+    ),
+    MetricDefinition(
+        key="vllm/prefix_cache_hit_rate",
+        title="vLLM prefix cache hit rate",
+        description="delta prefix cache hits divided by delta prefix cache queries",
+        kind="ratio",
+        higher_is_better=True,
+        dashboard_default=True,
+    ),
+    MetricDefinition(
+        key="vllm/kv_cache_usage_perc",
+        title="vLLM KV cache usage",
+        description="fraction of vLLM KV cache blocks in use",
+        kind="ratio",
+        higher_is_better=None,
+    ),
+    MetricDefinition(
+        key="vllm/num_preemptions_total",
+        title="vLLM preemptions",
+        description="cumulative vLLM request preemptions",
+        kind="counter",
+        higher_is_better=False,
+    ),
+    MetricDefinition(
+        key="pipeline_trainer/step_collect_batch_s",
+        title="Pipeline collect-batch time",
+        description="time spent waiting for enough accepted rollout groups for a train step",
+        kind="duration",
+        unit="s",
+        higher_is_better=False,
+    ),
+    MetricDefinition(
+        key="queue/freshness_pressure",
+        title="Queue freshness pressure",
+        description="predicted queued policy age divided by the active off-policy limit",
+        kind="ratio",
+        higher_is_better=False,
+    ),
+    MetricDefinition(
+        key="queue/predicted_stale_fraction",
+        title="Predicted stale queue fraction",
+        description="fraction of queued groups predicted stale for the next train step",
+        kind="ratio",
+        higher_is_better=False,
+    ),
+)
+
+PIPELINE_RL_DASHBOARD_DEFAULT_METRICS = tuple(
+    definition.key
+    for definition in PIPELINE_RL_METRIC_DEFINITIONS
+    if definition.dashboard_default
+)
+PIPELINE_RL_SCORE_METRICS = tuple(
+    definition.key
+    for definition in PIPELINE_RL_METRIC_DEFINITIONS
+    if definition.score_component
+)
 
 
 def is_cumulative_metric_key(key: str) -> bool:
@@ -383,8 +617,18 @@ class MetricsBuilder:
             self._shared_state.cum_state[cum_key] = next_value
             result[cum_key] = next_value
 
-        if "data/step_trainer_tokens" in result or "time/step_trainer_s" in result:
-            trainer_tokens = self._shared_state.cum_state.get("data/cum/trainer_tokens")
+        if (
+            "data/step_trainer_tokens" in result
+            or "data/step_trainer_assistant_tokens" in result
+            or "time/step_trainer_s" in result
+        ):
+            trainer_tokens = self._shared_state.cum_state.get(
+                "data/cum/trainer_assistant_tokens"
+            )
+            if trainer_tokens is None:
+                trainer_tokens = self._shared_state.cum_state.get(
+                    "data/cum/trainer_tokens"
+                )
             trainer_seconds = self._shared_state.cum_state.get("time/cum/trainer_s")
             if (
                 trainer_tokens is not None

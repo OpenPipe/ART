@@ -10,7 +10,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 import torch
 
-from art import TrainableModel, Trajectory, TrajectoryGroup
+from art import PipelineRuntimeConfig, TrainableModel, Trajectory, TrajectoryGroup
 from art.dev.model import InternalModelConfig
 from art.local import LocalBackend
 from art.megatron.train import load_adapter_into_model
@@ -51,9 +51,11 @@ def _make_trainer(
         rollout_fn=lambda *_args, **_kwargs: asyncio.sleep(0),
         scenarios=[],
         config={},
-        num_rollout_workers=1,
-        min_batch_size=1,
-        max_batch_size=1,
+        pipeline=PipelineRuntimeConfig(
+            num_rollout_workers=1,
+            min_batch_size=1,
+            max_batch_size=1,
+        ),
         max_steps=1,
         eval_fn=None,
         **kwargs,
@@ -95,6 +97,8 @@ async def test_pipeline_trainer_preserves_backend_train_kwargs(tmp_path: Path) -
         "normalize_advantages": True,
         "save_checkpoint": False,
         "adam_params": adam_params,
+        "optimizer_save_interval": None,
+        "final_training_step": 1,
     }
 
 
@@ -129,6 +133,8 @@ async def test_pipeline_trainer_forwards_default_kl_step_zero_for_generic_backen
         "normalize_advantages": True,
         "save_checkpoint": False,
         "adam_params": None,
+        "optimizer_save_interval": None,
+        "final_training_step": 1,
         "kl_penalty_coef": 0.25,
         "kl_penalty_reference_step": 0,
         "kl_penalty_source": "sample",
@@ -248,6 +254,8 @@ async def test_pipeline_trainer_uses_same_train_kwargs_for_local_backend(
         "normalize_advantages": True,
         "save_checkpoint": False,
         "adam_params": None,
+        "optimizer_save_interval": None,
+        "final_training_step": 1,
     }
 
 

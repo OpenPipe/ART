@@ -5,6 +5,7 @@ from collections import Counter
 from collections.abc import Mapping
 from contextlib import AsyncExitStack, asynccontextmanager
 from datetime import datetime, timezone
+import inspect
 import json
 import math
 import os
@@ -18,6 +19,18 @@ T = TypeVar("T")
 import art
 from art import TrajectoryGroup
 from art.errors import LocalServingUnavailableError
+from art.pipeline_tuner import (
+    PACKED_GROUP_COMPLETION_TOKENS_KEY,
+    PACKED_GROUP_PHYSICAL_TOKENS_KEY,
+    PACKED_GROUP_PROMPT_TOKENS_KEY,
+    PackedGroupObservation,
+    PipelineAutotuneConfig,
+    PipelineAutotunerAttachment,
+    PipelineMetric,
+    PipelineRuntimeConfig,
+    PipelineTuneSettings,
+    RolloutWorkerController,
+)
 
 from .checkpoint_retention import (
     CHECKPOINT_CREATED_AT_METRIC,
@@ -34,6 +47,8 @@ from .types import ConfigT, EvalFn, RolloutFn, ScenarioT, SingleRolloutFn  # noq
 PIPELINE_STATE_KEY = "_pipeline_trainer"
 _ROLLOUT_WALL_TIME_KEY = "_art_rollout_wall_s"
 _ACTOR_IDLE_TIME_KEY = "_art_actor_idle_s"
+_QUEUE_WAIT_TIME_KEY = "_art_queue_wait_s"
+_SCORE_BATCH_EFFICIENCY_ALPHA = 0.5
 
 
 class _ScenarioSourceExhausted(Exception):
@@ -50,6 +65,24 @@ def _to_async_iterator(iterable: Iterable[T] | AsyncIterator[T]) -> AsyncIterato
             yield item
 
     return _iter()
+
+
+def _weighted_percentile(points: list[tuple[float, float]], percentile: float) -> float:
+    if not points:
+        return 0.0
+    if not 0.0 <= percentile <= 1.0:
+        raise ValueError("percentile must be in [0, 1]")
+    ordered = sorted(points, key=lambda item: item[0])
+    total = sum(weight for _value, weight in ordered)
+    if total <= 0:
+        return ordered[-1][0]
+    target = percentile * total
+    running = 0.0
+    for value, weight in ordered:
+        running += weight
+        if running >= target:
+            return value
+    return ordered[-1][0]
 
 
 def make_group_rollout_fn(
@@ -89,13 +122,8 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
         config: ConfigT,
         eval_fn: EvalFn[ConfigT] | None = None,
         *,
-        # Pipeline settings
-        num_rollout_workers: int = 16,
-        min_batch_size: int = 4,
-        max_batch_size: int | None = None,
-        max_steps_off_policy: int | None = 4,
-        limit_mean_steps_off_policy: float | None = None,
-        queue_maxsize: int | None = None,
+        pipeline: PipelineRuntimeConfig | None = None,
+        autotune: PipelineAutotuneConfig | None = None,
         # Training
         learning_rate: float = 1e-5,
         loss_fn: str = "cispo",
@@ -115,25 +143,13 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
         eval_every_n_steps: int = 20,
         eval_at_start: bool = True,
         save_checkpoint: bool = True,
+        optimizer_save_interval: int | None = None,
         checkpoint_retention_strategy: CheckpointRetentionStrategy | None = None,
         checkpoint_retention_interval: int = 1,
         # Resumption
         resume: bool = True,
     ) -> None:
-        if num_rollout_workers <= 0:
-            raise ValueError("num_rollout_workers must be > 0")
-        if min_batch_size <= 0:
-            raise ValueError("min_batch_size must be > 0")
-        if max_batch_size is not None and max_batch_size <= 0:
-            raise ValueError("max_batch_size must be > 0")
-        if max_batch_size is not None and max_batch_size < min_batch_size:
-            raise ValueError("max_batch_size must be >= min_batch_size")
-        if max_steps_off_policy is not None and max_steps_off_policy < 0:
-            raise ValueError("max_steps_off_policy must be >= 0")
-        if limit_mean_steps_off_policy is not None and limit_mean_steps_off_policy < 0:
-            raise ValueError("limit_mean_steps_off_policy must be >= 0")
-        if queue_maxsize is not None and queue_maxsize <= 0:
-            raise ValueError("queue_maxsize must be > 0")
+        pipeline = pipeline or PipelineRuntimeConfig()
         if eval_every_n_steps < 0:
             raise ValueError("eval_every_n_steps must be >= 0")
         if max_steps is not None and max_steps < 0:
@@ -144,6 +160,8 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
             raise ValueError("discard_queue_multiplier must be > 0")
         if checkpoint_retention_interval <= 0:
             raise ValueError("checkpoint_retention_interval must be > 0")
+        if optimizer_save_interval is not None and optimizer_save_interval <= 0:
+            raise ValueError("optimizer_save_interval must be > 0")
         if kl_penalty_step_lag is not None and kl_penalty_step_lag < 1:
             raise ValueError("kl_penalty_step_lag must be >= 1")
         self.model = model
@@ -151,14 +169,18 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
         self.rollout_fn = rollout_fn
         self.config = config
         self.eval_fn = eval_fn
-        self.num_rollout_workers = num_rollout_workers
-        self.min_batch_size = min_batch_size
+        self.pipeline = pipeline
+        self.autotune = autotune or PipelineAutotuneConfig()
+        self.num_rollout_workers = pipeline.num_rollout_workers
+        self.min_batch_size = pipeline.min_batch_size
         self.max_batch_size = (
-            max_batch_size if max_batch_size is not None else 10 * min_batch_size
+            pipeline.max_batch_size
+            if pipeline.max_batch_size is not None
+            else 10 * pipeline.min_batch_size
         )
-        self.max_steps_off_policy = max_steps_off_policy
-        self.limit_mean_steps_off_policy = limit_mean_steps_off_policy
-        self.queue_maxsize = queue_maxsize
+        self.max_steps_off_policy = pipeline.max_steps_off_policy
+        self.limit_mean_steps_off_policy = pipeline.limit_mean_steps_off_policy
+        self.queue_maxsize = pipeline.queue_maxsize
         self.learning_rate = learning_rate
         self.loss_fn = loss_fn
         self.loss_fn_config = loss_fn_config
@@ -171,12 +193,14 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
         self.eval_every_n_steps = eval_every_n_steps
         self.eval_at_start = eval_at_start
         self.save_checkpoint = save_checkpoint
+        self.optimizer_save_interval = optimizer_save_interval
         self.checkpoint_retention_strategy = checkpoint_retention_strategy
         self.checkpoint_retention_interval = checkpoint_retention_interval
+        self.score_reference_groups_per_step = pipeline.score_reference_groups_per_step
         self.resume = resume
         self.discard_queue_multiplier = discard_queue_multiplier
         self._discard_queue: list[TrajectoryGroup] = []
-        self._discard_queue_limit = discard_queue_multiplier * min_batch_size
+        self._discard_queue_limit = discard_queue_multiplier * self.min_batch_size
         self._collapse_triggered = False
         self._checkpoint_lease_counts: Counter[int] = Counter()
         self._scheduled_eval_steps: set[int] = set()
@@ -189,12 +213,19 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
         )
         self._output_queue: asyncio.Queue[TrajectoryGroup | None] | None = None
         self._eval_queue: asyncio.Queue[int] | None = None
+        self._rollout_worker_controller = RolloutWorkerController(
+            self, self.num_rollout_workers
+        )
+        self._attachments: list[PipelineAutotunerAttachment] = []
+        if self.autotune.mode != "off":
+            self._attachments.append(PipelineAutotunerAttachment(self.autotune))
+        self._pipeline_tuner_profile: str | None = None
         self._status = StatusReporter(
             get_scenario_offset=lambda: self.state.scenario_offset,
             log_interval_seconds=log_interval_seconds,
             status_ewa_alpha=status_ewa_alpha,
             total_scenarios=total_scenarios,
-            num_workers=num_rollout_workers,
+            num_workers=self.num_rollout_workers,
         )
         self._validate_backend_support()
 
@@ -227,6 +258,12 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
             skipped = await self._skip_scenarios(self._scenario_iter, scenario_offset)
             self.state.scenario_offset = skipped
             self.state.total_scenarios_consumed = skipped
+
+        try:
+            await self._start_attachments()
+        except Exception:
+            await self._stop_attachments()
+            raise
 
         queue_maxsize = (
             self.queue_maxsize
@@ -295,6 +332,7 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
                             signal.signal(sig, cast(signal.Handlers, previous))
                     except (ValueError, RuntimeError):
                         pass
+            await self._stop_attachments()
             self._status.flush()
             self._status.close()
             await self._release_all_scheduled_eval_leases()
@@ -323,6 +361,95 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
                 self._output_queue.put_nowait(None)
             except asyncio.QueueFull:
                 loop.create_task(self._output_queue.put(None))
+
+    def apply_pipeline_settings(self, settings: PipelineTuneSettings) -> None:
+        self.num_rollout_workers = settings.num_rollout_workers
+        self.min_batch_size = settings.min_batch_size
+        self.max_batch_size = settings.max_batch_size
+        self.queue_maxsize = settings.queue_maxsize
+        self.limit_mean_steps_off_policy = settings.limit_mean_steps_off_policy
+        self._discard_queue_limit = self.discard_queue_multiplier * self.min_batch_size
+        self._rollout_worker_controller.set_target(self.num_rollout_workers)
+        if self._output_queue is not None:
+            cast(Any, self._output_queue)._maxsize = self.queue_maxsize
+        self._status._num_workers = self.num_rollout_workers
+
+    async def _start_attachments(self) -> None:
+        for attachment in self._attachments:
+            await attachment.on_start(self)
+
+    async def _stop_attachments(self) -> None:
+        failures = 0
+        for attachment in reversed(self._attachments):
+            try:
+                await attachment.on_stop()
+            except Exception:
+                failures += 1
+        if failures:
+            print(f"Warning: {failures} pipeline attachment cleanup hook(s) failed.")
+
+    async def _emit_pipeline_metric(
+        self,
+        name: str,
+        value: float,
+        *,
+        step: int | None,
+        tags: dict[str, str] | None = None,
+    ) -> None:
+        if not self._attachments:
+            return
+        metric = PipelineMetric(
+            name=name,
+            value=float(value),
+            step=step,
+            t_s=time.monotonic(),
+            tags=tags or {},
+        )
+        for attachment in self._attachments:
+            await attachment.on_metric(metric)
+
+    async def _emit_pipeline_metrics(
+        self, metrics: Mapping[str, float], *, step: int | None
+    ) -> None:
+        for name, value in metrics.items():
+            if isinstance(value, (int, float)):
+                await self._emit_pipeline_metric(name, float(value), step=step)
+
+    async def _emit_packed_group_observations(
+        self, metrics: Mapping[str, float], *, batch: list[TrajectoryGroup], step: int
+    ) -> None:
+        if not self._attachments:
+            return
+        observations: list[PackedGroupObservation] = []
+        for group in batch:
+            physical_tokens = group.metadata.get(PACKED_GROUP_PHYSICAL_TOKENS_KEY)
+            prompt_tokens = group.metadata.get(PACKED_GROUP_PROMPT_TOKENS_KEY)
+            completion_tokens = group.metadata.get(PACKED_GROUP_COMPLETION_TOKENS_KEY)
+            if (
+                not isinstance(physical_tokens, int)
+                or not isinstance(prompt_tokens, int)
+                or not isinstance(completion_tokens, int)
+            ):
+                continue
+            observations.append(
+                PackedGroupObservation(
+                    step=step,
+                    physical_tokens=physical_tokens,
+                    prompt_tokens=prompt_tokens,
+                    completion_tokens=completion_tokens,
+                )
+            )
+        groups = int(metrics.get("data/step_num_groups_trainable", 0.0) or 0)
+        if groups > 0 and len(observations) != groups:
+            raise RuntimeError(
+                "Pipeline autotuning requires packed-group token observations "
+                "from the backend packer."
+            )
+        if not observations:
+            return
+        for observation in observations:
+            for attachment in self._attachments:
+                await attachment.on_packed_group(observation)
 
     def _validate_backend_support(self) -> None:
         from art.dev.validate import is_dedicated_mode
@@ -486,7 +613,13 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
     async def _rollout_worker(self, worker_id: int) -> None:
         assert self._output_queue is not None
         while not self.state.done:
-            scenario = await self._get_next_scenario()
+            if not self._rollout_worker_controller.worker_allowed(worker_id):
+                break
+            try:
+                scenario = await self._get_next_scenario()
+            except _ScenarioSourceExhausted:
+                self.request_stop()
+                break
             if scenario is None:
                 break
             self._status.note_rollout_started()
@@ -521,6 +654,7 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
                     break
                 queue_wait_s = await self._put_output_group(group)
                 group.metadata[_ROLLOUT_WALL_TIME_KEY] = rollout_wall_s
+                group.metadata[_QUEUE_WAIT_TIME_KEY] = queue_wait_s
                 group.metadata[_ACTOR_IDLE_TIME_KEY] = actor_idle_s + queue_wait_s
             except asyncio.CancelledError:
                 raise
@@ -538,10 +672,8 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
 
     async def _rollout_stage(self) -> None:
         try:
-            async with asyncio.TaskGroup() as tg:
-                for i in range(self.num_rollout_workers):
-                    tg.create_task(self._rollout_worker(i))
-        except* _ScenarioSourceExhausted:
+            await self._rollout_worker_controller.run()
+        except _ScenarioSourceExhausted:
             print("Scenario source exhausted; stopping training.")
             self.request_stop()
         if not self.state.done and self._output_queue is not None:
@@ -579,7 +711,9 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
             if not batch:
                 break
 
-            actor_wall_s, actor_idle_s = self._consume_batch_rollout_timings(batch)
+            actor_wall_s, actor_idle_s, queue_wait_s = (
+                self._consume_batch_rollout_timings(batch)
+            )
 
             training_policy_step = current_step
             expected_step = current_step + 1
@@ -602,6 +736,7 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
                     "normalize_advantages": self.normalize_advantages,
                     "save_checkpoint": should_checkpoint,
                     "adam_params": self.adam_params,
+                    "optimizer_save_interval": self.optimizer_save_interval,
                     "final_training_step": stop_at_step,
                 }
                 if self.kl_penalty_coef > 0.0:
@@ -647,17 +782,52 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
                 )
                 metrics = {
                     "discarded_stale_groups": float(self.state.discarded_stale_groups),
+                    "discarded_zero_variance_groups": float(
+                        self.state.discarded_zero_variance_groups
+                    ),
                     "steps_off_policy": steps_off_policy,
                     "time/step_wall_s": step_seconds,
+                    "pipeline_trainer/step_wall_s": step_seconds,
+                    "pipeline_trainer/step_collect_batch_s": trainer_idle_s,
                     "throughput/step_trainer_idle_s": trainer_idle_s,
                 }
                 metrics.setdefault("time/step_trainer_s", train_call_elapsed)
+                metrics.setdefault(
+                    "pipeline_trainer/step_backend_train_s", train_call_elapsed
+                )
                 if actor_wall_s > 0:
                     metrics["time/step_actor_s"] = actor_wall_s
                 if actor_idle_s > 0:
                     metrics["throughput/step_actor_idle_s"] = actor_idle_s
+                if queue_wait_s > 0 and actor_wall_s > 0:
+                    metrics["queue/put_wait_frac"] = queue_wait_s / actor_wall_s
                 metrics.update(result.metrics)
+                if "data/step_packed_train_tokens" in metrics:
+                    metrics.setdefault(
+                        "data/step_train_tokens",
+                        metrics["data/step_packed_train_tokens"],
+                    )
+                vllm_metrics_collector = getattr(
+                    self.backend, "collect_train_step_vllm_metrics", None
+                )
+                if callable(vllm_metrics_collector):
+                    maybe_metrics = vllm_metrics_collector(self.model)
+                    if inspect.isawaitable(maybe_metrics):
+                        metrics.update(await maybe_metrics)
+                metrics.update(
+                    self._score_metrics(
+                        current_step,
+                        batch,
+                        step_seconds=step_seconds,
+                        result_metrics=metrics,
+                    )
+                )
+                metrics.update(self._queue_freshness_metrics(current_step))
 
+                await self._emit_packed_group_observations(
+                    metrics, batch=batch, step=current_step
+                )
+                await self._emit_pipeline_metrics(metrics, step=current_step)
                 await self.model.log(
                     batch,
                     split="train",
@@ -911,6 +1081,7 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
 
     def _record_zero_variance(self, group: TrajectoryGroup) -> bool:
         self._discard_queue.append(group)
+        self.state.discarded_zero_variance_groups += 1
         self._status.note_zero_variance_discarded(1)
         if len(self._discard_queue) >= self._discard_queue_limit:
             self._trigger_collapse()
@@ -988,6 +1159,55 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
             return math.ceil(self.limit_mean_steps_off_policy)
         return 1
 
+    def _queue_freshness_metrics(self, current_step: int) -> dict[str, float]:
+        if self._output_queue is None:
+            return {}
+        output_queue = cast(Any, self._output_queue)
+        queued = [
+            group
+            for group in list(output_queue._queue)
+            if isinstance(group, TrajectoryGroup)
+        ]
+        limit_raw = (
+            self.limit_mean_steps_off_policy
+            if self.limit_mean_steps_off_policy is not None
+            else self.max_steps_off_policy
+        )
+        if limit_raw is None:
+            limit_raw = 1.0
+        limit = max(float(limit_raw), 1e-9)
+        ages: list[float] = []
+        for group in queued:
+            if self.limit_mean_steps_off_policy is not None:
+                age = self._group_mean_steps_off_policy(current_step, group)
+            else:
+                initial = self._group_initial_version(group)
+                age = None if initial is None else float(current_step - initial)
+            if age is not None:
+                ages.append(float(age))
+        ready = float(len(queued))
+        stale = sum(1 for age in ages if age > limit)
+        return {
+            "queue/ready_groups_est": ready,
+            "queue/completed_backlog_groups": ready,
+            "queue/put_waiting_groups": 0.0,
+            "queue/groups_depth": ready,
+            "queue/groups_depth_max": float(self._output_queue.maxsize),
+            "queue/occupancy": ready / max(float(self._output_queue.maxsize), 1.0),
+            "queue/predicted_policy_age_mean_steps": sum(ages) / len(ages)
+            if ages
+            else 0.0,
+            "queue/predicted_policy_age_p95_steps": _weighted_percentile(
+                [(age, 1.0) for age in ages], 0.95
+            )
+            if ages
+            else 0.0,
+            "queue/freshness_pressure": (sum(ages) / len(ages) / limit)
+            if ages
+            else 0.0,
+            "queue/predicted_stale_fraction": stale / len(ages) if ages else 0.0,
+        }
+
     def _retention_window_steps(self) -> int:
         if self.max_steps_off_policy is not None:
             return self.max_steps_off_policy
@@ -1010,6 +1230,89 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
         if weight_sum <= 0:
             return None
         return weighted_age_sum / weight_sum
+
+    def _score_metrics(
+        self,
+        current_step: int,
+        batch: list[TrajectoryGroup],
+        *,
+        step_seconds: float,
+        result_metrics: dict[str, float],
+    ) -> dict[str, float]:
+        metrics: dict[str, float] = {}
+        accepted_groups = float(len(batch))
+        metrics["sample_efficiency/accepted_groups_per_step"] = accepted_groups
+        if self.score_reference_groups_per_step is None:
+            batch_discount = 1.0
+        else:
+            batch_discount = min(
+                1.0,
+                (self.score_reference_groups_per_step / accepted_groups)
+                ** _SCORE_BATCH_EFFICIENCY_ALPHA,
+            )
+            metrics["sample_efficiency/reference_groups_per_step"] = (
+                self.score_reference_groups_per_step
+            )
+        metrics["sample_efficiency/batch_discount"] = batch_discount
+
+        age_metrics = self._batch_policy_age_metrics(current_step, batch)
+        metrics.update(age_metrics)
+        mean_age = age_metrics.get(
+            "offpolicy/token_weighted_policy_age_steps",
+            result_metrics.get("steps_off_policy", 0.0),
+        )
+        freshness = 1.0 / (1.0 + max(float(mean_age), 0.0))
+        metrics["sample_efficiency/freshness_discount"] = freshness
+        metrics["sample_efficiency/age_discount"] = freshness
+
+        assistant_tokens = result_metrics.get(
+            "data/step_trainer_assistant_tokens",
+            result_metrics.get("data/step_trainer_tokens"),
+        )
+        if assistant_tokens is not None and step_seconds > 0:
+            accepted_tok_per_s = float(assistant_tokens) / step_seconds
+            metrics["throughput/accepted_train_tok_per_s"] = accepted_tok_per_s
+            metrics["objective/score_raw"] = accepted_tok_per_s
+            metrics["objective/score_freshness"] = accepted_tok_per_s * freshness
+            metrics["objective/age_discounted_accepted_tok_per_s"] = (
+                accepted_tok_per_s * freshness
+            )
+            metrics["objective/score_default"] = (
+                accepted_tok_per_s * freshness * batch_discount
+            )
+        return metrics
+
+    def _batch_policy_age_metrics(
+        self, current_step: int, batch: list[TrajectoryGroup]
+    ) -> dict[str, float]:
+        weighted_ages: list[tuple[float, float]] = []
+        unweighted_ages: list[float] = []
+        age_sum = 0.0
+        weight_sum = 0.0
+        for group in batch:
+            for trajectory in group.trajectories:
+                stats = self._trajectory_policy_age_stats(current_step, trajectory)
+                if stats is None:
+                    continue
+                trajectory_age_sum, weight = stats
+                if weight <= 0:
+                    continue
+                age = trajectory_age_sum / weight
+                age_sum += trajectory_age_sum
+                weight_sum += weight
+                weighted_ages.append((age, weight))
+                unweighted_ages.append(age)
+        if weight_sum <= 0 or not weighted_ages:
+            return {}
+        return {
+            "offpolicy/token_weighted_policy_age_steps": age_sum / weight_sum,
+            "offpolicy/mean_policy_age_steps": age_sum / weight_sum,
+            "offpolicy/unweighted_mean_policy_age_steps": sum(unweighted_ages)
+            / len(unweighted_ages),
+            "offpolicy/min_policy_age_steps": min(unweighted_ages),
+            "offpolicy/p95_policy_age_steps": _weighted_percentile(weighted_ages, 0.95),
+            "offpolicy/max_policy_age_steps": max(unweighted_ages),
+        }
 
     def _trajectory_policy_age_stats(
         self, current_step: int, trajectory: art.Trajectory
@@ -1085,6 +1388,8 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
             "last_eval_step": self.state.last_eval_step,
             "completed_eval_steps": sorted(self.state.completed_eval_steps),
         }
+        if self._pipeline_tuner_profile is not None:
+            payload["pipeline_tuner_profile"] = self._pipeline_tuner_profile
         self.model.merge_state({PIPELINE_STATE_KEY: payload})
 
     def _log_checkpoint_history(self, step: int, metrics: dict[str, float]) -> None:
@@ -1260,13 +1565,15 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
 
     def _consume_batch_rollout_timings(
         self, batch: list[TrajectoryGroup]
-    ) -> tuple[float, float]:
+    ) -> tuple[float, float, float]:
         rollout_wall_s = 0.0
         actor_idle_s = 0.0
+        queue_wait_s = 0.0
         for group in batch:
             rollout_wall_s += self._pop_float_metadata(group, _ROLLOUT_WALL_TIME_KEY)
             actor_idle_s += self._pop_float_metadata(group, _ACTOR_IDLE_TIME_KEY)
-        return rollout_wall_s, actor_idle_s
+            queue_wait_s += self._pop_float_metadata(group, _QUEUE_WAIT_TIME_KEY)
+        return rollout_wall_s, actor_idle_s, queue_wait_s
 
     @staticmethod
     def _pop_float_metadata(group: TrajectoryGroup, key: str) -> float:

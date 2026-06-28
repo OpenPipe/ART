@@ -15,7 +15,7 @@ import pytest
 
 import art
 from art.megatron.model_support.registry import model_uses_expert_parallel
-from art.pipeline_trainer import PipelineTrainer
+from art.pipeline_trainer import PipelineRuntimeConfig, PipelineTrainer
 
 from ..model_support.oracle_harness import Topology
 from .yes_no_trainability import (
@@ -572,10 +572,12 @@ async def run_length_trainability_async(
             rollout_fn=rollout_fn,
             scenarios=scenarios(),
             config=None,
-            num_rollout_workers=rollout_workers,
-            min_batch_size=1,
-            max_batch_size=1,
-            max_steps_off_policy=max_steps_off_policy,
+            pipeline=PipelineRuntimeConfig(
+                num_rollout_workers=rollout_workers,
+                min_batch_size=1,
+                max_batch_size=1,
+                max_steps_off_policy=max_steps_off_policy,
+            ),
             learning_rate=_get_env_float(
                 "ART_MODEL_SUPPORT_LENGTH_LEARNING_RATE",
                 1e-4,

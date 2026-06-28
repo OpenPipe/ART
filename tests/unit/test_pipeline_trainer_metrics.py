@@ -6,7 +6,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from art import TrainableModel, Trajectory, TrajectoryGroup
+from art import PipelineRuntimeConfig, TrainableModel, Trajectory, TrajectoryGroup
 from art.pipeline_trainer.trainer import PipelineTrainer
 
 
@@ -48,10 +48,12 @@ async def test_pipeline_trainer_logs_explicit_stale_and_zero_variance_metrics(
         rollout_fn=lambda *_args, **_kwargs: asyncio.sleep(0),
         scenarios=[],
         config={},
-        num_rollout_workers=1,
-        min_batch_size=1,
-        max_batch_size=1,
-        max_steps_off_policy=0,
+        pipeline=PipelineRuntimeConfig(
+            num_rollout_workers=1,
+            min_batch_size=1,
+            max_batch_size=1,
+            max_steps_off_policy=0,
+        ),
         eval_fn=None,
         max_steps=1,
     )

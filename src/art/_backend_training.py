@@ -37,12 +37,14 @@ def build_rl_train_configs(
     packed_sequence_length: int | None = None,
     num_trajectories_learning_rate_multiplier_power: float | None = None,
     kl_ref_adapter_path: str | None = None,
+    optimizer_save_interval: int | None = None,
     final_training_step: int | None = None,
 ) -> tuple[TrainConfig, dev.TrainConfig]:
     config = TrainConfig(
         learning_rate=learning_rate,
         kl_penalty_coef=kl_penalty_coef,
         kl_penalty_source=kl_penalty_source,
+        optimizer_save_interval=optimizer_save_interval,
         final_training_step=final_training_step,
     )
     dev_config: dev.TrainConfig = {

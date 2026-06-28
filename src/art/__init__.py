@@ -69,7 +69,14 @@ from .megatron.runtime_config import (
     get_megatron_runtime_config,
     init_megatron_runtime_config,
 )
+from .metrics import (
+    PIPELINE_RL_DASHBOARD_DEFAULT_METRICS,
+    PIPELINE_RL_METRIC_DEFINITIONS,
+    PIPELINE_RL_SCORE_METRICS,
+    MetricDefinition,
+)
 from .model import Model, TrainableModel
+from .pipeline_tuner import PipelineAutotuneConfig, PipelineRuntimeConfig
 from .serverless import ServerlessBackend
 from .trajectories import Trajectory, TrajectoryGroup
 from .types import (
@@ -100,6 +107,12 @@ __all__ = [
     "LocalServingUnavailableError",
     "MegatronRuntimeConfig",
     "MegatronTopologyConfig",
+    "MetricDefinition",
+    "PipelineAutotuneConfig",
+    "PipelineRuntimeConfig",
+    "PIPELINE_RL_DASHBOARD_DEFAULT_METRICS",
+    "PIPELINE_RL_METRIC_DEFINITIONS",
+    "PIPELINE_RL_SCORE_METRICS",
     "get_megatron_runtime_config",
     "init_megatron_runtime_config",
     "ServerlessBackend",

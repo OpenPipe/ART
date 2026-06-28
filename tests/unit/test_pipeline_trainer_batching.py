@@ -7,7 +7,7 @@ from openai.types.chat.chat_completion import Choice
 from openai.types.chat.chat_completion_message import ChatCompletionMessage
 import pytest
 
-from art import TrainableModel, Trajectory, TrajectoryGroup
+from art import PipelineRuntimeConfig, TrainableModel, Trajectory, TrajectoryGroup
 from art.pipeline_trainer.trainer import PipelineTrainer
 
 
@@ -44,11 +44,13 @@ def _make_trainer(
         rollout_fn=lambda *_args, **_kwargs: asyncio.sleep(0),
         scenarios=[],
         config={},
-        num_rollout_workers=1,
-        min_batch_size=1,
-        max_batch_size=2,
-        max_steps_off_policy=max_steps_off_policy,
-        limit_mean_steps_off_policy=limit_mean_steps_off_policy,
+        pipeline=PipelineRuntimeConfig(
+            num_rollout_workers=1,
+            min_batch_size=1,
+            max_batch_size=2,
+            max_steps_off_policy=max_steps_off_policy,
+            limit_mean_steps_off_policy=limit_mean_steps_off_policy,
+        ),
         max_steps=1,
         eval_fn=None,
     )
@@ -90,9 +92,11 @@ async def test_collect_batch_respects_max_batch_size(tmp_path: Path) -> None:
         rollout_fn=lambda *_args, **_kwargs: asyncio.sleep(0),
         scenarios=[],
         config={},
-        num_rollout_workers=1,
-        min_batch_size=1,
-        max_batch_size=2,
+        pipeline=PipelineRuntimeConfig(
+            num_rollout_workers=1,
+            min_batch_size=1,
+            max_batch_size=2,
+        ),
         max_steps=1,
         eval_fn=None,
     )

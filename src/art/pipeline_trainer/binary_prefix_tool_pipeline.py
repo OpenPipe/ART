@@ -19,7 +19,7 @@ import polars as pl
 import art
 from art.tinker_native import TinkerNativeBackend
 
-from . import PipelineTrainer, make_group_rollout_fn
+from . import PipelineRuntimeConfig, PipelineTrainer, make_group_rollout_fn
 
 Scenario = dict[str, Any]
 
@@ -331,10 +331,12 @@ async def main() -> None:
         scenarios=scenario_iter(),
         config=config,
         eval_fn=eval_fn,
-        num_rollout_workers=num_rollout_workers,
-        min_batch_size=min_batch_size,
-        max_steps_off_policy=max_steps_off_policy,
-        max_batch_size=max_batch_size,
+        pipeline=PipelineRuntimeConfig(
+            num_rollout_workers=num_rollout_workers,
+            min_batch_size=min_batch_size,
+            max_batch_size=max_batch_size,
+            max_steps_off_policy=max_steps_off_policy,
+        ),
         learning_rate=float(os.environ.get("LEARNING_RATE", "1e-4")),
         log_interval_seconds=log_interval_seconds,
         eval_every_n_steps=eval_every_n_steps,
