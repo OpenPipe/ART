@@ -8,12 +8,15 @@ import pytest
 import art
 
 from .test_live_length_trainability import (
+    DEFAULT_LENGTH_MAX_STEPS,
     GPT_OSS_LENGTH_SYSTEM_PROMPT,
     _extra_body,
     _length_chat_template_kwargs,
+    _length_max_steps,
     _max_tokens_for_completion,
     _messages,
     _scenario,
+    _scenario_budget,
     _scenario_for_training_step,
     _scenario_limit,
 )
@@ -216,6 +219,19 @@ def test_length_trainability_scenario_limit_uses_env(monkeypatch) -> None:
     monkeypatch.setenv("ART_MODEL_SUPPORT_LENGTH_SCENARIOS", "7")
 
     assert _scenario_limit() == 7
+
+
+def test_length_trainability_default_max_steps_is_twenty(monkeypatch) -> None:
+    monkeypatch.delenv("ART_MODEL_SUPPORT_LENGTH_MAX_STEPS", raising=False)
+
+    assert DEFAULT_LENGTH_MAX_STEPS == 20
+    assert _length_max_steps() == 20
+
+
+def test_length_trainability_scenario_budget_is_step_bounded() -> None:
+    assert _scenario_budget(max_steps=20, scenario_limit=None) == 20
+    assert _scenario_budget(max_steps=20, scenario_limit=7) == 7
+    assert _scenario_budget(max_steps=20, scenario_limit=100) == 20
 
 
 def test_length_trainability_varies_max_tokens_per_completion() -> None:

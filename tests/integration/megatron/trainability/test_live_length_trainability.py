@@ -43,6 +43,7 @@ REPO_ROOT = Path(__file__).resolve().parents[4]
 LATEST_SUMMARY_LOG_PATH = REPO_ROOT / ".local" / "length_trainability.log"
 INITIAL_ABS_ERROR_MIN = 5.0
 SUCCESS_ABS_ERROR_MAX = 1.5
+DEFAULT_LENGTH_MAX_STEPS = 20
 GPT_OSS_MIN_MAX_TOKENS = 512
 GPT_OSS_LENGTH_SYSTEM_PROMPT = (
     "Use absolutely minimal reasoning. Give only the final answer. "
@@ -370,6 +371,19 @@ def _scenario_limit() -> int | None:
     return _get_env_int("ART_MODEL_SUPPORT_LENGTH_SCENARIOS", 0)
 
 
+def _length_max_steps() -> int:
+    return _get_env_int(
+        "ART_MODEL_SUPPORT_LENGTH_MAX_STEPS",
+        DEFAULT_LENGTH_MAX_STEPS,
+    )
+
+
+def _scenario_budget(*, max_steps: int, scenario_limit: int | None) -> int:
+    if scenario_limit is None:
+        return max_steps
+    return min(max_steps, scenario_limit)
+
+
 def _generated_token_count(choice: object) -> int:
     logprobs = getattr(choice, "logprobs", None)
     content = getattr(logprobs, "content", None)
@@ -587,7 +601,7 @@ async def run_length_trainability_async(
         allow_unvalidated_arch=allow_unvalidated_arch,
     )
     _use_default_moe_dedicated_placement(variant, base_model=base_model)
-    max_steps = _get_env_int("ART_MODEL_SUPPORT_LENGTH_MAX_STEPS", 10)
+    max_steps = _length_max_steps()
     max_steps_off_policy = _get_env_int(
         "ART_MODEL_SUPPORT_LENGTH_MAX_STEPS_OFF_POLICY",
         0,
@@ -605,6 +619,10 @@ async def run_length_trainability_async(
         max(1, max_steps_off_policy + 1),
     )
     scenario_limit = _scenario_limit()
+    scenario_budget = _scenario_budget(
+        max_steps=max_steps,
+        scenario_limit=scenario_limit,
+    )
     success_hit = False
     samples: list[LengthSampleReport] = []
     backend_root = artifact_dir / "megatron_dedicated_workspace"
@@ -642,9 +660,7 @@ async def run_length_trainability_async(
 
         async def scenarios() -> AsyncIterator[dict[str, object]]:
             index = 0
-            while not success_hit and (
-                scenario_limit is None or index < scenario_limit
-            ):
+            while not success_hit and index < scenario_budget:
                 yield _scenario(
                     index,
                     target_step=0,
@@ -707,7 +723,7 @@ async def run_length_trainability_async(
             eval_every_n_steps=0,
             eval_at_start=False,
             save_checkpoint=False,
-            total_scenarios=scenario_limit,
+            total_scenarios=scenario_budget,
             log_interval_seconds=30.0,
             discard_queue_multiplier=1000,
             resume=False,
