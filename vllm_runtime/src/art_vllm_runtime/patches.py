@@ -28,6 +28,7 @@ def apply_vllm_runtime_patches() -> None:
     patch_dsv4_lora_support()
     patch_dsv4_mla_lora_aliases()
     patch_dsv4_fast_path_lora()
+    patch_dsv4_triton_moe_topk6_routing()
     patch_lora_linear_base_attr_proxy()
     patch_marlin_lora_swiglu_limit()
     patch_art_lora_delta_weight_update()
@@ -1550,6 +1551,272 @@ def patch_dsv4_fast_path_lora() -> None:
     wrapper_cls.attn_gemm_parallel_execute = attn_gemm_parallel_execute
     wrapper_cls.forward = forward
     wrapper_cls._art_fast_path_lora_patched = True
+
+
+def _next_power_of_two(value: int) -> int:
+    return 1 << (max(value, 1) - 1).bit_length()
+
+
+def patch_dsv4_triton_moe_topk6_routing() -> None:
+    """Make vLLM's DSV4 Triton MoE routing sort compile for top-k 6.
+
+    Triton's ``tl.arange`` requires a power-of-two range. Current vLLM's
+    DSV4/MXFP4 routing path sorts ``BLOCK_M * num_experts_per_tok`` entries;
+    DSV4 uses top-k 6, so the first profile run tries ``tl.arange(0, 192)`` and
+    the engine exits before serving starts. Keep the original indexing stride at
+    192, but sort over a padded power-of-two vector and mask padded lanes.
+    """
+    try:
+        import torch
+        import triton
+        import triton.language as tl
+        from vllm.third_party.triton_kernels.routing_details._expt_data import (
+            _expt_data_compute,
+        )
+    except ImportError:
+        return
+
+    @triton.jit
+    def _routing_compute_indx_pow2(
+        pid_m,
+        GatherIndx,
+        ScatterIndx,
+        GateScal,
+        ExptScal,
+        ExptIndx,
+        PartialOffs,
+        stride_pm,
+        stride_pn,
+        TokensStart,
+        n_tokens,
+        BLOCK_M: tl.constexpr,
+        N_EXPTS_ACT: tl.constexpr,
+        BLOCK_SIZE_PADDED: tl.constexpr,
+    ):
+        if isinstance(n_tokens, tl.tensor) and n_tokens.dtype.is_ptr():
+            n_tokens = tl.load(n_tokens)
+        n_gates = n_tokens * N_EXPTS_ACT
+        block_size: tl.constexpr = N_EXPTS_ACT * BLOCK_M
+        tl.static_assert(BLOCK_SIZE_PADDED >= block_size)
+        tl.static_assert(BLOCK_SIZE_PADDED <= 32768)
+
+        local_offs = tl.arange(0, BLOCK_SIZE_PADDED)
+        valid_local = local_offs < block_size
+        offs = pid_m * block_size + local_offs
+        expert = tl.load(
+            ExptIndx + offs,
+            mask=valid_local & (offs < n_gates),
+            other=-1,
+        ).to(tl.uint32)
+
+        kv_pairs = ((expert << 16) | local_offs).to(tl.uint32)
+        kv_pairs = tl.sort(kv_pairs, 0)
+        expert = kv_pairs >> 16
+        offs = pid_m * block_size + (kv_pairs & 0xFFFF)
+        mask = expert != 0xFFFF
+        gate_scal = tl.load(ExptScal + offs, mask=mask)
+
+        x = kv_pairs & 0xFFFF0000 | 0x00000001
+        expts_and_inclusive_run_lengths = tl.associative_scan(x, 0, _keyed_add_pow2)
+        exclusive_run_lengths = (expts_and_inclusive_run_lengths - 1) & 0xFFFF
+
+        gates = tl.load(PartialOffs + pid_m * stride_pm + expert * stride_pn, mask=mask)
+        gates += tl.load(TokensStart + expert, mask=mask)
+        gates += exclusive_run_lengths
+
+        tl.store(ScatterIndx + offs, gates, mask=mask)
+        tl.store(GatherIndx + gates, offs, mask=mask)
+        tl.store(GateScal + gates, gate_scal, mask=mask)
+
+    @triton.jit
+    def _keyed_add_pow2(x, y):
+        key_mask: tl.constexpr = 0xFFFF0000
+        kx = x & key_mask
+        ky = y & key_mask
+        return tl.where(kx == ky, x + y - kx, y)
+
+    @triton.jit
+    def _combined_routing_compute_pow2(
+        GatherIndx,
+        ScatterIndx,
+        GateScal,
+        ExptScal,
+        ExptIndx,
+        PartialOffs,
+        stride_pm,
+        stride_pn,
+        TokensStart,
+        n_tokens,
+        BLOCK_M: tl.constexpr,
+        N_EXPTS_ACT: tl.constexpr,
+        Hist,
+        MDTileStarts,
+        tile_starts_stridem,
+        MDTileInfo,
+        tile_info_stridem,
+        first_tile_dim_log2,
+        SIZES: tl.constexpr,
+        BLOCK: tl.constexpr,
+        blocks2a,
+        BLOCK_SIZE_PADDED: tl.constexpr,
+    ):
+        pid = tl.program_id(0)
+        if pid < blocks2a:
+            _expt_data_compute(
+                Hist,
+                MDTileStarts,
+                tile_starts_stridem,
+                MDTileInfo,
+                tile_info_stridem,
+                first_tile_dim_log2,
+                SIZES,
+                BLOCK,
+            )
+        else:
+            pid -= blocks2a
+            _routing_compute_indx_pow2(
+                pid,
+                GatherIndx,
+                ScatterIndx,
+                GateScal,
+                ExptScal,
+                ExptIndx,
+                PartialOffs,
+                stride_pm,
+                stride_pn,
+                TokensStart,
+                n_tokens,
+                BLOCK_M,
+                N_EXPTS_ACT,
+                BLOCK_SIZE_PADDED,
+            )
+
+    for module_name in (
+        "vllm.third_party.triton_kernels.routing",
+        "triton_kernels.routing",
+    ):
+        try:
+            routing = importlib.import_module(module_name)
+        except ImportError:
+            continue
+        original_forward = routing.SortTokens.forward
+        if getattr(original_forward, "__art_dsv4_topk6_pow2_patched__", False):
+            continue
+
+        def forward(
+            ctx: Any,
+            expt_scal: Any,
+            expt_indx: Any,
+            n_expts_tot: int,
+            bitmatrix: Any,
+            _routing: Any = routing,
+        ) -> Any:
+            hist_block_m = 32
+            indx_offs_block_m = 512
+            memset_block = 1024
+            cdiv = triton.cdiv
+
+            device = expt_scal.device
+            dtype = expt_scal.dtype
+            n_tokens_raw, _ = bitmatrix.shape
+            n_tokens_pad, n_expts_act = expt_scal.shape
+            n_gates_pad = n_tokens_pad * n_expts_act
+
+            hist, partial_hist = bitmatrix.sum(partials_block_size=hist_block_m)
+            hist = hist[:n_expts_tot]
+            assert hist.dtype == torch.int32
+            expt_offs = torch.empty(n_expts_tot, dtype=torch.int32, device=device)
+            combined_indx = torch.empty(
+                n_gates_pad * 2, dtype=torch.int32, device=device
+            )
+            topk_indx = combined_indx[:n_gates_pad]
+            gate_indx = combined_indx[n_gates_pad:]
+            gate_scal = torch.empty(n_gates_pad, dtype=dtype, device=device)
+
+            (
+                token_offs_combined,
+                token_offs_raw,
+                token_offs_pad,
+                block_pid_map,
+                blocks1a,
+                blocks2a,
+                memset_block_a,
+                hist2_block_m,
+                block_m_log2_start,
+                block_m_num,
+            ) = _routing._compute_expt_data_internal(hist, n_expts_tot, n_gates_pad)
+
+            blocks1b = cdiv(n_gates_pad * 2, memset_block) + n_expts_tot + 1
+            blocks2b = cdiv(n_tokens_pad, hist_block_m)
+
+            _routing._combined_routing_memset[(blocks1a + blocks1b,)](
+                combined_indx,
+                n_gates_pad * 2,
+                -1,
+                memset_block,
+                hist,
+                expt_offs,
+                hist.shape[0],
+                n_expts_tot,
+                partial_hist,
+                partial_hist.shape[0],
+                partial_hist.stride(0),
+                partial_hist.stride(1),
+                token_offs_combined,
+                token_offs_combined.stride(0),
+                blocks1a,
+                block_pid_map,
+                block_m_log2_start,
+                SIZES=block_m_num,
+                BLOCK_A=memset_block_a,
+                BLOCK_N=512,
+                BLOCK_M=indx_offs_block_m,
+            )
+
+            indx_offs = partial_hist
+            _combined_routing_compute_pow2[(blocks2a + blocks2b,)](
+                topk_indx,
+                gate_indx,
+                gate_scal,
+                expt_scal,
+                expt_indx,
+                indx_offs,
+                indx_offs.stride(0),
+                indx_offs.stride(1),
+                expt_offs,
+                n_tokens_raw,
+                hist_block_m,
+                n_expts_act,
+                hist,
+                token_offs_pad,
+                token_offs_pad.stride(0),
+                block_pid_map,
+                block_pid_map.stride(0),
+                block_m_log2_start,
+                block_m_num,
+                hist2_block_m,
+                blocks2a,
+                BLOCK_SIZE_PADDED=_next_power_of_two(hist_block_m * n_expts_act),
+            )
+
+            ctx.n_tokens_raw = n_tokens_raw
+            ctx.n_tokens_pad = n_tokens_pad
+            ctx.n_expts_act = n_expts_act
+            ctx.save_for_backward(gate_indx)
+            return (
+                hist,
+                topk_indx,
+                gate_indx,
+                gate_scal,
+                token_offs_raw,
+                token_offs_pad,
+                block_pid_map,
+            )
+
+        forward.__art_dsv4_topk6_pow2_patched__ = True  # type: ignore[attr-defined]
+        forward.__art_original__ = original_forward  # type: ignore[attr-defined]
+        routing.SortTokens.forward = staticmethod(forward)
+        routing._combined_routing_compute = _combined_routing_compute_pow2
 
 
 def _base_layer_attr_proxy(name: str) -> property:
