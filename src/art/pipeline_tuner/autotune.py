@@ -315,21 +315,7 @@ class PipelineAutotuner:
                 ),
             )
             new_min = max(floor, round(updated.min_batch_size * 0.85))
-            batch_underfilled = (
-                stats.groups_per_step_mean
-                < updated.target_groups_per_step * self.config.batch_underfill_frac
-            )
-            if batch_underfilled and not inference_over and not age_severe:
-                updated = updated.model_copy(
-                    update={
-                        "num_rollout_workers": self._move_workers(
-                            updated.num_rollout_workers, +1
-                        )
-                    }
-                )
-                action = "increase_workers"
-                reason = "trainer is waiting on underfilled batches"
-            elif age_severe and trainer_under and new_min < updated.min_batch_size:
+            if age_severe and trainer_under and new_min < updated.min_batch_size:
                 updated = updated.model_copy(
                     update={"min_batch_size": min(new_min, updated.max_batch_size)}
                 )
