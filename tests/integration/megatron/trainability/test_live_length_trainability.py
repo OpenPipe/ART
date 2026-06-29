@@ -277,6 +277,27 @@ def _scenario_for_training_step(
     return _scenario(parsed.scenario_index, target_step=step)
 
 
+def _max_tokens_for_completion(
+    *,
+    base_max_tokens: int,
+    completion_index: int,
+    completion_count: int,
+) -> int:
+    if completion_count <= 1:
+        return base_max_tokens
+    return base_max_tokens + round(completion_index * 5 / (completion_count - 1))
+
+
+def _scenario_with_max_tokens(
+    scenario: LengthScenario,
+    *,
+    max_tokens: int,
+) -> LengthScenario:
+    metadata = dict(scenario.metadata)
+    metadata["max_tokens"] = max_tokens
+    return scenario.model_copy(update={"max_tokens": max_tokens, "metadata": metadata})
+
+
 def _messages(scenario: LengthScenario) -> art.Messages:
     return [{"role": "user", "content": scenario.prompt}]
 
@@ -347,23 +368,47 @@ async def _length_group(
     summary_log_path: Path | None = None,
 ) -> art.TrajectoryGroup:
     messages = _messages(scenario)
-    completion = await model.openai_client().chat.completions.create(
-        messages=messages,
-        model=model_name,
-        max_tokens=scenario.max_tokens,
-        n=n,
-        temperature=temperature,
-        extra_body=_extra_body(chat_template_kwargs),
-        logprobs=True,
-        top_logprobs=0,
-        timeout=_get_env_float("ART_MODEL_SUPPORT_LENGTH_REQUEST_TIMEOUT", 900.0),
-    )
+    client = model.openai_client()
+    max_tokens_by_completion = [
+        _max_tokens_for_completion(
+            base_max_tokens=scenario.max_tokens,
+            completion_index=completion_index,
+            completion_count=n,
+        )
+        for completion_index in range(n)
+    ]
     trajectories: list[art.Trajectory] = []
-    for choice in completion.choices:
+    completions = await asyncio.gather(
+        *(
+            client.chat.completions.create(
+                messages=messages,
+                model=model_name,
+                max_tokens=max_tokens,
+                n=1,
+                temperature=temperature,
+                extra_body=_extra_body(chat_template_kwargs),
+                logprobs=True,
+                top_logprobs=0,
+                timeout=_get_env_float(
+                    "ART_MODEL_SUPPORT_LENGTH_REQUEST_TIMEOUT",
+                    900.0,
+                ),
+            )
+            for max_tokens in max_tokens_by_completion
+        )
+    )
+    for max_tokens, completion in zip(
+        max_tokens_by_completion, completions, strict=True
+    ):
+        completion_scenario = _scenario_with_max_tokens(
+            scenario,
+            max_tokens=max_tokens,
+        )
+        choice = completion.choices[0]
         report = _sample_report(
             split=split,
             step=step,
-            scenario=scenario,
+            scenario=completion_scenario,
             choice=choice,
         )
         samples.append(report)
@@ -373,12 +418,12 @@ async def _length_group(
                 reward=report.reward,
                 metrics={
                     "length/generated_tokens": report.generated_tokens,
-                    "length/target_tokens": scenario.target_tokens,
-                    "length/max_tokens": scenario.max_tokens,
-                    "length/prompt_word_count": scenario.prompt_word_count,
+                    "length/target_tokens": report.target_tokens,
+                    "length/max_tokens": report.max_tokens,
+                    "length/prompt_word_count": report.prompt_word_count,
                     "length/abs_error": report.abs_error,
                 },
-                metadata=scenario.metadata,
+                metadata=completion_scenario.metadata,
             )
         )
     _append_step_summary(summary_log_path, samples, split=split, step=step)

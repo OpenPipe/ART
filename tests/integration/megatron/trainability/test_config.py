@@ -7,7 +7,11 @@ import pytest
 
 import art
 
-from .test_live_length_trainability import _extra_body, _scenario_limit
+from .test_live_length_trainability import (
+    _extra_body,
+    _max_tokens_for_completion,
+    _scenario_limit,
+)
 from .yes_no_trainability import (
     _build_internal_config,
     _build_variant,
@@ -207,6 +211,20 @@ def test_length_trainability_scenario_limit_uses_env(monkeypatch) -> None:
     monkeypatch.setenv("ART_MODEL_SUPPORT_LENGTH_SCENARIOS", "7")
 
     assert _scenario_limit() == 7
+
+
+def test_length_trainability_varies_max_tokens_per_completion() -> None:
+    caps = [
+        _max_tokens_for_completion(
+            base_max_tokens=142,
+            completion_index=index,
+            completion_count=4,
+        )
+        for index in range(4)
+    ]
+
+    assert caps == [142, 144, 145, 147]
+    assert max(caps) - min(caps) == 5
 
 
 def test_length_trainability_extra_body_keeps_template_defaults() -> None:
