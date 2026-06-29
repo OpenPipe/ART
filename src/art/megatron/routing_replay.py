@@ -34,6 +34,39 @@ def _active_routing_replay_controller() -> Any | None:
     return _ACTIVE_ROUTING_REPLAY_CONTROLLER
 
 
+def _branch_rows_without_future_scored_tokens(
+    *,
+    group_ids: torch.Tensor,
+    parent_ids: torch.Tensor,
+    logprobs: torch.Tensor,
+) -> torch.Tensor:
+    """Rows whose MoE route cannot affect any later trainable token.
+
+    vLLM returns routes for forwards it actually ran. During generation it does
+    not run a forward for the final generated token, because no later token is
+    sampled from that row. ART shared-prefix packing may still leave a masked
+    suffix token in the same branch, so a physical group boundary is not enough
+    to identify rows that can safely use synthetic replay routes.
+    """
+    non_padding = group_ids != -1
+    branch = non_padding & (group_ids != parent_ids)
+    scored = non_padding & torch.isfinite(logprobs)
+    allowed = torch.zeros_like(branch)
+    for sample_index in range(int(group_ids.shape[0])):
+        future_scored_by_group: dict[int, bool] = {}
+        for position in range(int(group_ids.shape[1]) - 1, -1, -1):
+            group_id = int(group_ids[sample_index, position].item())
+            if group_id == -1:
+                continue
+            has_future_scored = future_scored_by_group.get(group_id, False)
+            allowed[sample_index, position] = (
+                bool(branch[sample_index, position].item()) and not has_future_scored
+            )
+            if bool(scored[sample_index, position].item()):
+                future_scored_by_group[group_id] = True
+    return allowed
+
+
 def _to_tensor_cpu_contiguous(
     tensor: torch.Tensor, *, dtype: torch.dtype
 ) -> torch.Tensor:
@@ -318,7 +351,15 @@ class MoeRoutingReplayBundle(BaseModel):
         steps: dict[int, StepRoutes] = {}
         for step_index_str, step_info in manifest["steps"].items():
             step_index = int(step_index_str)
-            step_tensors = load_file(str(base_dir / step_info["file"]))
+            loaded_tensors = load_file(str(base_dir / step_info["file"]))
+            # Own CPU storage immediately. Safetensors CPU loads can keep
+            # file-backed storage alive, which makes shared-filesystem cleanup
+            # fail while long-lived Megatron ranks still hold replay bundles.
+            step_tensors = {
+                key: tensor.detach().clone().contiguous()
+                for key, tensor in loaded_tensors.items()
+            }
+            del loaded_tensors
             if GLOBAL_TOKEN_UIDS_KEY not in step_tensors:
                 raise RuntimeError(
                     f"Missing tensor key '{GLOBAL_TOKEN_UIDS_KEY}' for step={step_index}"
@@ -450,7 +491,13 @@ def build_moe_routing_replay_bundle_from_packed_tensors(
     terminal_completion = (
         non_padding & (group_ids != parent_ids) & (group_ids != next_group_ids)
     )
-    unexpected_missing = non_padding & ~token_mask & ~terminal_completion
+    no_future_scored = _branch_rows_without_future_scored_tokens(
+        group_ids=group_ids,
+        parent_ids=parent_ids,
+        logprobs=packed_tensors["logprobs"],
+    )
+    allowed_missing = terminal_completion | no_future_scored
+    unexpected_missing = non_padding & ~token_mask & ~allowed_missing
     if bool(unexpected_missing.any().item()):
         raise RuntimeError(
             "Packed tensors are missing MoE routes outside terminal completion "
@@ -478,8 +525,8 @@ def build_moe_routing_replay_bundle_from_packed_tensors(
                     if bool(missing_rows.any().item()):
                         # Megatron Core RouterReplay replays only top-k ids and does
                         # not consume an expert mask. Rows without vLLM routes are
-                        # allowed only for padding or terminal completion query
-                        # positions, whose next-token logits are not scored.
+                        # allowed only for padding or branch-tail query positions
+                        # that cannot affect any later scored token.
                         missing_positions = torch.nonzero(
                             missing_rows, as_tuple=False
                         ).flatten()
@@ -688,6 +735,26 @@ class MoeRoutingReplayController:
         self._target_copy_waited: bool = True
         self._active_token_uid_key: str | None = None
 
+    def update_bundle(self, *, bundle: MoeRoutingReplayBundle, strict: bool) -> None:
+        self.bundle = bundle
+        self.strict = strict
+        self.clear_replay_state()
+        if self.strict:
+            missing = sorted(
+                router_key
+                for router_key in self._local_router_keys
+                if router_key not in self.bundle.router_keys
+            )
+            if missing:
+                raise RuntimeError(
+                    "Router keys from model are missing in replay bundle: "
+                    f"router_keys={missing}"
+                )
+
+    def clear_replay_state(self) -> None:
+        self._clear_native_router_replay_state()
+        self._reset_step_state()
+
     def _target_device(self) -> torch.device:
         if self._device is not None:
             return self._device
@@ -754,6 +821,28 @@ class MoeRoutingReplayController:
                     _prepare_native_target_for_bound_router
                 )
 
+                def _hash_routing_with_replay_target(
+                    router_module: Any,
+                    *args: Any,
+                    _original_routing: Any = original_routing,
+                    _prepare_native_target: Any = prepare_native_target,
+                    **kwargs: Any,
+                ) -> Any:
+                    del router_module
+                    _prepare_native_target()
+                    return _original_routing(*args, **kwargs)
+
+                def _moe_routing_with_replay_target(
+                    router_module: Any,
+                    *args: Any,
+                    _original_routing: Any = original_routing,
+                    _prepare_native_target: Any = prepare_native_target,
+                    **kwargs: Any,
+                ) -> Any:
+                    del router_module
+                    _prepare_native_target()
+                    return _original_routing(*args, **kwargs)
+
                 def _routing_with_replay_target(
                     router_module: Any,
                     *args: Any,
@@ -768,7 +857,16 @@ class MoeRoutingReplayController:
                     _prepare_native_target()
                     return _original_routing(*args, **kwargs)
 
-                module.routing = types.MethodType(_routing_with_replay_target, module)
+                original_routing_name = getattr(
+                    getattr(original_routing, "__func__", None), "__name__", ""
+                )
+                if original_routing_name == "_hash_routing":
+                    routing_wrapper = _hash_routing_with_replay_target
+                elif original_routing_name == "_moe_routing":
+                    routing_wrapper = _moe_routing_with_replay_target
+                else:
+                    routing_wrapper = _routing_with_replay_target
+                module.routing = types.MethodType(routing_wrapper, module)
                 setattr(module, "_art_routing_replay_target_patched", True)
                 self._router_bindings[router_key] = {
                     "module": module,

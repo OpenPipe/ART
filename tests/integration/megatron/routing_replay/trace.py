@@ -21,6 +21,11 @@ def _active_controller() -> Any | None:
     return _CONTROLLER_GETTER()
 
 
+def _trace_hook(fn: Callable[..., Any]) -> Callable[..., Any]:
+    """Keep correctness-only routing trace monkeypatches out of Dynamo graphs."""
+    return torch.compiler.disable(fn)
+
+
 @torch._dynamo.disable
 def _dispatcher_local_token_uids(
     controller: Any,
@@ -220,7 +225,7 @@ def _install_router_output_trace_hooks(controller: Any | None) -> None:
                 )
             return output
 
-        module.routing = types.MethodType(patched_routing, module)
+        module.routing = types.MethodType(_trace_hook(patched_routing), module)
         setattr(module, "_art_oracle_router_trace_patched", True)
 
 
@@ -609,23 +614,27 @@ def install_moe_routing_trace_hooks(
         )
         return original_fc2_forward(self, x, tokens_per_expert)
 
-    setattr(MoEAlltoAllTokenDispatcher, "preprocess", patched_preprocess)
+    setattr(MoEAlltoAllTokenDispatcher, "preprocess", _trace_hook(patched_preprocess))
     setattr(
         MoEAlltoAllTokenDispatcher,
         "dispatch_preprocess",
-        patched_dispatch_preprocess,
+        _trace_hook(patched_dispatch_preprocess),
     )
-    setattr(MoEAlltoAllTokenDispatcher, "token_dispatch", patched_token_dispatch)
+    setattr(
+        MoEAlltoAllTokenDispatcher,
+        "token_dispatch",
+        _trace_hook(patched_token_dispatch),
+    )
     setattr(
         MoEAlltoAllTokenDispatcher,
         "dispatch_postprocess",
-        patched_dispatch_postprocess,
+        _trace_hook(patched_dispatch_postprocess),
     )
     setattr(
         MoEAlltoAllTokenDispatcher,
         "combine_preprocess",
-        patched_combine_preprocess,
+        _trace_hook(patched_combine_preprocess),
     )
-    setattr(TEGroupedMLP, "forward", patched_te_grouped_mlp_forward)
-    setattr(MLPExpertsLinearFC2LoRA, "forward", patched_fc2_forward)
+    setattr(TEGroupedMLP, "forward", _trace_hook(patched_te_grouped_mlp_forward))
+    setattr(MLPExpertsLinearFC2LoRA, "forward", _trace_hook(patched_fc2_forward))
     setattr(MoEAlltoAllTokenDispatcher, "_art_oracle_trace_patched", True)
