@@ -8,9 +8,11 @@ import pytest
 import art
 
 from .test_live_length_trainability import (
+    GPT_OSS_LENGTH_SYSTEM_PROMPT,
     _extra_body,
     _length_chat_template_kwargs,
     _max_tokens_for_completion,
+    _messages,
     _scenario,
     _scenario_for_training_step,
     _scenario_limit,
@@ -245,6 +247,26 @@ def test_scenario_for_training_step_preserves_max_tokens() -> None:
     assert updated.max_tokens == scenario.max_tokens
     assert updated.metadata["target_step"] == 3
     assert updated.metadata["max_tokens"] == scenario.max_tokens
+
+
+def test_gpt_oss_length_trainability_uses_minimal_reasoning_system_prompt() -> None:
+    scenario = _scenario(0, target_step=0, base_model="openai/gpt-oss-20b")
+
+    messages = _messages(scenario, base_model="openai/gpt-oss-20b")
+
+    assert messages[0] == {
+        "role": "system",
+        "content": GPT_OSS_LENGTH_SYSTEM_PROMPT,
+    }
+    assert messages[1] == {"role": "user", "content": scenario.prompt}
+
+
+def test_non_gpt_oss_length_trainability_keeps_user_only_messages() -> None:
+    scenario = _scenario(0, target_step=0, base_model="Qwen/Qwen3.5-35B-A3B")
+
+    assert _messages(scenario, base_model="Qwen/Qwen3.5-35B-A3B") == [
+        {"role": "user", "content": scenario.prompt}
+    ]
 
 
 def test_length_trainability_extra_body_keeps_template_defaults() -> None:

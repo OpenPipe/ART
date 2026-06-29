@@ -44,6 +44,10 @@ LATEST_SUMMARY_LOG_PATH = REPO_ROOT / ".local" / "length_trainability.log"
 INITIAL_ABS_ERROR_MIN = 5.0
 SUCCESS_ABS_ERROR_MAX = 1.5
 GPT_OSS_MIN_MAX_TOKENS = 512
+GPT_OSS_LENGTH_SYSTEM_PROMPT = (
+    "Use absolutely minimal reasoning. Give only the final answer. "
+    "Write no more than one short sentence."
+)
 MOE_DEDICATED_TRAINING_TOPOLOGY = Topology(
     tp=1,
     cp=2,
@@ -325,8 +329,21 @@ def _scenario_with_max_tokens(
     return scenario.model_copy(update={"max_tokens": max_tokens, "metadata": metadata})
 
 
-def _messages(scenario: LengthScenario) -> art.Messages:
-    return [{"role": "user", "content": scenario.prompt}]
+def _messages(
+    scenario: LengthScenario,
+    *,
+    base_model: str | None = None,
+) -> art.Messages:
+    messages: art.Messages = [{"role": "user", "content": scenario.prompt}]
+    if _is_gpt_oss_model(base_model):
+        messages.insert(
+            0,
+            {
+                "role": "system",
+                "content": GPT_OSS_LENGTH_SYSTEM_PROMPT,
+            },
+        )
+    return messages
 
 
 def _extra_body(chat_template_kwargs: dict[str, Any]) -> dict[str, object]:
@@ -396,6 +413,7 @@ def _sample_report(
 async def _length_group(
     model: art.TrainableModel,
     *,
+    base_model: str,
     scenario: LengthScenario,
     model_name: str,
     split: Literal["train"],
@@ -406,7 +424,7 @@ async def _length_group(
     samples: list[LengthSampleReport],
     summary_log_path: Path | None = None,
 ) -> art.TrajectoryGroup:
-    messages = _messages(scenario)
+    messages = _messages(scenario, base_model=base_model)
     client = model.openai_client()
     max_tokens_by_completion = [
         _max_tokens_for_completion(
@@ -646,6 +664,7 @@ async def run_length_trainability_async(
                 target_step = await rollout_model.get_step()
             group = await _length_group(
                 rollout_model,
+                base_model=base_model,
                 scenario=_scenario_for_training_step(scenario, target_step),
                 model_name=model_name,
                 split="train",
