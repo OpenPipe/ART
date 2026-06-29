@@ -203,6 +203,65 @@ def test_forward_trace_prefers_local_tensor_uids_over_module_fallback() -> None:
     assert torch.equal(row_uids, torch.tensor([4, 7]))
 
 
+def test_forward_trace_capture_prefers_dense_module_uids_for_sequence_modules() -> None:
+    module = type("ModuleWithDenseTraceUids", (), {})()
+    output = torch.zeros((2, 1), dtype=torch.float32)
+    setattr(module, "_art_trace_row_token_uids", torch.tensor([10, 11]))
+    setattr(output, "_art_trace_row_token_uids", torch.tensor([4, 7]))
+
+    row_uids, _uid_span = ForwardTraceCapture._row_token_uids_for_capture(
+        module_name="chunk0.module.decoder.layers.0.self_attention",
+        inputs=(),
+        output=output,
+        module=module,
+        row_count=2,
+    )
+
+    assert row_uids is not None
+    assert torch.equal(row_uids, torch.tensor([10, 11]))
+
+
+def test_forward_trace_capture_keeps_expert_uid_span_for_expert_modules() -> None:
+    module = type("ModuleWithDenseTraceUids", (), {})()
+    output = torch.zeros((2, 1), dtype=torch.float32)
+    setattr(module, "_art_trace_row_token_uids", torch.tensor([10, 11]))
+    setattr(output, "_art_trace_row_token_uids", torch.tensor([4, 7]))
+    setattr(output, "_art_trace_uid_span", 16)
+
+    row_uids, uid_span = ForwardTraceCapture._row_token_uids_for_capture(
+        module_name="chunk0.module.decoder.layers.0.mlp.experts.linear_fc1",
+        inputs=(),
+        output=output,
+        module=module,
+        row_count=2,
+    )
+
+    assert uid_span == 16
+    assert row_uids is not None
+    assert torch.equal(row_uids, torch.tensor([4, 7]))
+
+
+def test_forward_trace_restores_dense_non_cp_sequence_uids_before_sorting() -> None:
+    trace: dict[str, list[dict[str, Any]]] = {
+        "chunk0.module.decoder.layers.0.self_attention": [
+            {
+                "primary_output": torch.tensor([[1.0], [2.0], [3.0]]),
+                "row_token_uids": torch.tensor([10, 30, 20]),
+                "rank_meta": [
+                    {"cp_world_size": 1, "tp_rank": 0},
+                    {"cp_world_size": 1, "tp_rank": 1},
+                ],
+            }
+        ]
+    }
+
+    ForwardTraceCapture.canonicalize_trace(trace)
+
+    call = trace["chunk0.module.decoder.layers.0.self_attention"][0]
+    assert torch.equal(call["row_token_uids"], torch.tensor([0, 1, 2]))
+    assert torch.equal(call["primary_output"], torch.tensor([[1.0], [2.0], [3.0]]))
+
+
 def test_forward_trace_extracts_empty_router_topk_with_config_hint() -> None:
     topk = _extract_router_topk(
         (

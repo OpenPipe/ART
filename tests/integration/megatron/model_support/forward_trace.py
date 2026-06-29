@@ -7,8 +7,11 @@ from typing import Any, Callable, cast
 import torch
 
 from .trace_uids import (
+    TRACE_ROW_TOKEN_UIDS_ATTR,
+    TRACE_UID_SPAN_ATTR,
     expand_token_uids_for_heads,
     extract_tensor_attr,
+    normalize_row_token_uids,
     row_token_uids_from_trace_sources,
 )
 
@@ -44,6 +47,15 @@ ROUTER_NAME_TOKEN = ".mlp.router"
 PRIMARY_OUTPUT_CANONICAL_KEY = "primary_output__is_canonical"
 
 
+def _module_layer_index(module_name: str) -> int | None:
+    marker = "decoder.layers."
+    marker_index = module_name.find(marker)
+    if marker_index < 0:
+        return None
+    raw = module_name[marker_index + len(marker) :].split(".", 1)[0]
+    return int(raw) if raw.isdigit() else None
+
+
 def _trace_hook(fn: Callable[..., Any]) -> Callable[..., Any]:
     return torch.compiler.disable(fn)
 
@@ -59,6 +71,15 @@ def _safe_int(value: Any, default: int = 0) -> int:
         return int(value)
     except Exception:
         return default
+
+
+def _call_cp_world_size(call: dict[str, Any]) -> int:
+    rank_meta = call.get("rank_meta")
+    if isinstance(rank_meta, list) and rank_meta:
+        rank_meta = rank_meta[0]
+    if not isinstance(rank_meta, dict):
+        return 1
+    return _safe_int(rank_meta.get("cp_world_size"), 1)
 
 
 def _safe_ps_stat(name: str, default: int) -> int:
@@ -242,11 +263,15 @@ class ForwardTraceCapture:
         *,
         enabled: bool,
         capture_name_tokens: tuple[str, ...] = CAPTURE_NAME_TOKENS,
+        capture_layer_outputs: bool = True,
+        max_layer_index: int | None = None,
         micro_start_callback: Callable[[int | None, int], None] | None = None,
         strict_output_match: bool = True,
     ) -> None:
         self.enabled = enabled
         self.capture_name_tokens = capture_name_tokens
+        self.capture_layer_outputs = capture_layer_outputs
+        self.max_layer_index = max_layer_index
         self.micro_start_callback = micro_start_callback
         self.strict_output_match = strict_output_match
         self.current_step_index: int | None = None
@@ -280,6 +305,13 @@ class ForwardTraceCapture:
             named_modules = list(chunk.named_modules())
             module_by_name = dict(named_modules)
             for module_name, module in named_modules:
+                layer_index = _module_layer_index(module_name)
+                if (
+                    self.max_layer_index is not None
+                    and layer_index is not None
+                    and layer_index > self.max_layer_index
+                ):
+                    continue
                 trace_module_name = _normalize_trace_module_name(
                     f"chunk{chunk_index}.{module_name}"
                 )
@@ -291,7 +323,8 @@ class ForwardTraceCapture:
                 if metadata:
                     self._trace_metadata_by_name[trace_module_name] = metadata
                 is_layer_output = (
-                    ".decoder.layers." in module_name
+                    self.capture_layer_outputs
+                    and ".decoder.layers." in module_name
                     and module_name.rsplit(".", 1)[-1].isdigit()
                 )
                 if not is_layer_output and not any(
@@ -543,7 +576,8 @@ class ForwardTraceCapture:
                 if isinstance(primary_output, torch.Tensor) and primary_output.ndim > 0
                 else None
             )
-            row_token_uids, _uid_span = self._row_token_uids_for_trace(
+            row_token_uids, _uid_span = self._row_token_uids_for_capture(
+                module_name=name,
                 inputs=inputs,
                 output=output,
                 module=module,
@@ -652,6 +686,47 @@ class ForwardTraceCapture:
             module=module,
             row_count=row_count,
             prefer_uid_span=prefer_uid_span,
+        )
+
+    @staticmethod
+    def _module_row_token_uids(
+        module: Any,
+        *,
+        row_count: int,
+    ) -> tuple[torch.Tensor | None, int | None]:
+        row_token_uids = normalize_row_token_uids(
+            getattr(module, TRACE_ROW_TOKEN_UIDS_ATTR, None)
+        )
+        if row_token_uids is None or int(row_token_uids.numel()) != int(row_count):
+            return None, None
+        uid_span = getattr(module, TRACE_UID_SPAN_ATTR, None)
+        return (
+            row_token_uids,
+            uid_span if isinstance(uid_span, int) and uid_span > 0 else None,
+        )
+
+    @classmethod
+    def _row_token_uids_for_capture(
+        cls,
+        *,
+        module_name: str,
+        inputs: Any,
+        output: Any,
+        module: Any,
+        row_count: int | None,
+    ) -> tuple[torch.Tensor | None, int | None]:
+        if row_count is not None and not cls._is_moe_expert_forward_module(module_name):
+            row_token_uids, uid_span = cls._module_row_token_uids(
+                module,
+                row_count=row_count,
+            )
+            if row_token_uids is not None:
+                return row_token_uids, uid_span
+        return cls._row_token_uids_for_trace(
+            inputs=inputs,
+            output=output,
+            module=module,
+            row_count=row_count,
         )
 
     @classmethod
@@ -1355,6 +1430,39 @@ class ForwardTraceCapture:
                     )
 
     @classmethod
+    def _restore_non_cp_sequence_row_token_uids(
+        cls,
+        trace: dict[str, list[dict[str, Any]]],
+    ) -> None:
+        for module_name, calls in trace.items():
+            if cls._is_moe_expert_forward_module(module_name):
+                continue
+            for call in calls:
+                if (
+                    "rank_meta" not in call
+                    or _call_cp_world_size(call) > 1
+                    or "row_uid_span" in call
+                ):
+                    continue
+                tensor = call.get("primary_output")
+                row_token_uids = call.get("row_token_uids")
+                if (
+                    not isinstance(tensor, torch.Tensor)
+                    or tensor.ndim == 0
+                    or not isinstance(row_token_uids, torch.Tensor)
+                    or row_token_uids.ndim != 1
+                    or int(row_token_uids.numel()) != int(tensor.shape[0])
+                    or not bool((row_token_uids >= 0).all().item())
+                    or int(row_token_uids.unique().numel())
+                    != int(row_token_uids.numel())
+                ):
+                    continue
+                call["row_token_uids"] = torch.arange(
+                    row_token_uids.numel(),
+                    dtype=torch.int64,
+                )
+
+    @classmethod
     def canonicalize_trace(
         cls,
         trace: dict[str, list[dict[str, Any]]],
@@ -1376,6 +1484,7 @@ class ForwardTraceCapture:
                 call[PRIMARY_OUTPUT_CANONICAL_KEY] = True
         cls._propagate_decoder_row_token_uids(trace)
         cls._propagate_attention_output_row_token_uids(trace)
+        cls._restore_non_cp_sequence_row_token_uids(trace)
         for calls in trace.values():
             for call in calls:
                 cls._canonicalize_call_row_token_order(call)
