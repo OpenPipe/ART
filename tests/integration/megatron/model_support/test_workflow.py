@@ -121,6 +121,7 @@ def test_build_all_architectures_validation_report_stops_on_failure(
         include_sensitivity=None,
         output_json=None,
         skip_stages=None,
+        only_stage=None,
         stop_on_failure=False,
         allow_unvalidated_arch=False,
     ):
@@ -128,6 +129,7 @@ def test_build_all_architectures_validation_report_stops_on_failure(
         del include_sensitivity
         del output_json
         del skip_stages
+        del only_stage
         del stop_on_failure
         del allow_unvalidated_arch
         calls.append(base_model)
@@ -369,6 +371,76 @@ def test_build_validation_report_populates_architecture_stage(
         "step1_served": True,
     }
     assert native_vllm_lora_stage.artifact_dir == "/tmp/native-vllm-lora"
+
+
+def test_build_validation_report_only_stage_runs_prerequisites(
+    monkeypatch,
+) -> None:
+    calls: list[str] = []
+    monkeypatch.setattr(
+        "tests.integration.megatron.model_support.workflow.inspect_architecture",
+        lambda base_model: ArchitectureReport(
+            base_model=base_model,
+            model_key="qwen3_5_moe",
+            handler_key="qwen3_5_moe",
+            layer_families=[LayerFamilyInstance(key="standard_attention", count=2)],
+            recommended_min_layers=1,
+        ),
+    )
+    monkeypatch.setattr(
+        "tests.integration.megatron.model_support.workflow.detect_dependency_versions",
+        lambda: {"transformers": "5.2.0"},
+    )
+
+    def _run_stage_in_subprocess(
+        *,
+        stage_name,
+        base_model,
+        architecture,
+        allow_unvalidated_arch=False,
+    ):
+        del base_model, architecture, allow_unvalidated_arch
+        calls.append(stage_name)
+        return ValidationStageResult(
+            name=stage_name,
+            passed=True,
+            metrics={"stage": stage_name},
+            artifact_dir=f"/tmp/{stage_name}",
+        )
+
+    monkeypatch.setattr(
+        "tests.integration.megatron.model_support.workflow._run_stage_in_subprocess",
+        _run_stage_in_subprocess,
+    )
+
+    report = build_validation_report(
+        base_model="Qwen/Qwen3.5-35B-A3B",
+        only_stage="length_trainability",
+    )
+
+    assert calls == ["length_trainability"]
+    dependency_stage = next(
+        stage for stage in report.stages if stage.name == "dependency_resolution"
+    )
+    architecture_stage = next(
+        stage for stage in report.stages if stage.name == "architecture_discovery"
+    )
+    trainability_stage = next(
+        stage for stage in report.stages if stage.name == "length_trainability"
+    )
+    skipped_stage = next(stage for stage in report.stages if stage.name == "hf_parity")
+
+    assert dependency_stage.passed is True
+    assert dependency_stage.metrics == {"transformers": "5.2.0"}
+    assert architecture_stage.passed is True
+    assert trainability_stage.passed is True
+    assert trainability_stage.metrics == {"stage": "length_trainability"}
+    assert trainability_stage.artifact_dir == "/tmp/length_trainability"
+    assert skipped_stage.passed is True
+    assert skipped_stage.metrics == {
+        "skipped": True,
+        "reason": "--only-stage=length_trainability",
+    }
 
 
 def test_build_validation_report_captures_hf_parity_failure(monkeypatch) -> None:

@@ -53,6 +53,11 @@ MANDATORY_VALIDATION_STAGES = (
 )
 NATIVE_VLLM_LORA_STAGE = "native_vllm_lora"
 YES_NO_TRAINABILITY_STAGE = "yes_no_trainability"
+OPTIONAL_VALIDATION_STAGES = (
+    YES_NO_TRAINABILITY_STAGE,
+    NATIVE_VLLM_LORA_STAGE,
+)
+ALL_VALIDATION_STAGES = (*MANDATORY_VALIDATION_STAGES, *OPTIONAL_VALIDATION_STAGES)
 ARCHITECTURE_REPRESENTATIVE_MODELS = {
     "qwen3_moe": "Qwen/Qwen3-30B-A3B",
     "qwen3_dense": "Qwen/Qwen3-32B",
@@ -267,6 +272,18 @@ def _mark_remaining_stages_skipped(
             }
             continue
         past_failure = stage.name == after_stage_name
+
+
+def _only_stage_run_set(only_stage: str | None) -> set[str] | None:
+    if only_stage is None:
+        return None
+    if only_stage not in ALL_VALIDATION_STAGES:
+        raise ValueError(f"unknown workflow stage: {only_stage}")
+    if only_stage == "dependency_resolution":
+        return {only_stage}
+    if only_stage == "architecture_discovery":
+        return {"dependency_resolution", only_stage}
+    return {"dependency_resolution", "architecture_discovery", only_stage}
 
 
 def _run_stage_in_subprocess(
@@ -785,13 +802,21 @@ def build_validation_report(
     include_sensitivity: bool | None = None,
     output_json: str | Path | None = None,
     skip_stages: set[str] | None = None,
+    only_stage: str | None = None,
     stop_on_failure: bool = False,
     allow_unvalidated_arch: bool = False,
 ) -> ValidationReport:
+    if only_stage is not None and skip_stages:
+        raise ValueError("only_stage cannot be combined with skip_stages")
+    only_stage_run_set = _only_stage_run_set(only_stage)
     report = initialize_validation_report(
         base_model=base_model,
-        include_native_vllm_lora=include_native_vllm_lora,
-        include_yes_no_trainability=include_yes_no_trainability,
+        include_native_vllm_lora=(
+            include_native_vllm_lora or only_stage == NATIVE_VLLM_LORA_STAGE
+        ),
+        include_yes_no_trainability=(
+            include_yes_no_trainability or only_stage == YES_NO_TRAINABILITY_STAGE
+        ),
         allow_unvalidated_arch=allow_unvalidated_arch,
     )
     stage_runners = {
@@ -816,6 +841,14 @@ def build_validation_report(
     context = _temporary_env(**env) if env else nullcontext()
     with context:
         for stage in report.stages:
+            if only_stage_run_set is not None and stage.name not in only_stage_run_set:
+                stage.passed = True
+                stage.metrics = {
+                    "skipped": True,
+                    "reason": f"--only-stage={only_stage}",
+                }
+                _write_validation_report(report, output_json)
+                continue
             if stage.name in skip_stages:
                 stage.passed = True
                 stage.metrics = {"skipped": True, "reason": "--skip-stage"}
@@ -892,6 +925,7 @@ def build_all_architectures_validation_report(
     include_sensitivity: bool | None = None,
     output_json: str | Path | None = None,
     skip_stages: set[str] | None = None,
+    only_stage: str | None = None,
     stop_on_failure: bool = False,
     allow_unvalidated_arch: bool = False,
 ) -> AllArchitecturesValidationReport:
@@ -912,6 +946,7 @@ def build_all_architectures_validation_report(
                 else None
             ),
             skip_stages=skip_stages,
+            only_stage=only_stage,
             stop_on_failure=stop_on_failure,
             allow_unvalidated_arch=allow_unvalidated_arch,
         )
@@ -938,8 +973,12 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--include-sensitivity", action="store_true")
     parser.add_argument("--include-yes-no-trainability", action="store_true")
     parser.add_argument("--skip-stage", action="append", default=[])
+    parser.add_argument("--only-stage", choices=ALL_VALIDATION_STAGES)
     parser.add_argument("--stop-on-failure", action="store_true")
-    return parser.parse_args(argv)
+    args = parser.parse_args(argv)
+    if args.only_stage and args.skip_stage:
+        parser.error("--only-stage cannot be combined with --skip-stage")
+    return args
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -950,6 +989,7 @@ def main(argv: list[str] | None = None) -> int:
             include_sensitivity=args.include_sensitivity,
             output_json=args.output_json,
             skip_stages=set(args.skip_stage),
+            only_stage=args.only_stage,
             stop_on_failure=args.stop_on_failure,
             allow_unvalidated_arch=args.allow_unsupported_arch,
         )
@@ -970,6 +1010,7 @@ def main(argv: list[str] | None = None) -> int:
         include_sensitivity=args.include_sensitivity,
         output_json=args.output_json,
         skip_stages=set(args.skip_stage),
+        only_stage=args.only_stage,
         stop_on_failure=args.stop_on_failure,
         allow_unvalidated_arch=args.allow_unsupported_arch,
     )
