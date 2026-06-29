@@ -144,6 +144,25 @@ def _default_weight_loader(param: torch.Tensor, loaded_weight: torch.Tensor) -> 
     param.data.copy_(loaded_weight)
 
 
+def _call_weight_loader(
+    loader: Any,
+    loader_param: torch.Tensor,
+    loaded_weight: torch.Tensor,
+    *args: Any,
+    **kwargs: Any,
+) -> Any:
+    if not hasattr(loader_param, "load_merged_column_weight"):
+        owner = getattr(loader, "__self__", None)
+        legacy_loader = getattr(owner, "weight_loader", None)
+        if (
+            legacy_loader is not None
+            and legacy_loader is not loader
+            and getattr(loader, "__name__", "") == "weight_loader_v2"
+        ):
+            return legacy_loader(loader_param, loaded_weight, *args, **kwargs)
+    return loader(loader_param, loaded_weight, *args, **kwargs)
+
+
 def _additive_weight_loader(param: torch.Tensor, original_loader: Any) -> Any:
     def load_delta(
         loader_param: torch.Tensor,
@@ -155,7 +174,13 @@ def _additive_weight_loader(param: torch.Tensor, original_loader: Any) -> Any:
         scratch = torch.zeros_like(real_data)
         loader_param.data = scratch
         try:
-            result = original_loader(loader_param, loaded_weight, *args, **kwargs)
+            result = _call_weight_loader(
+                original_loader,
+                loader_param,
+                loaded_weight,
+                *args,
+                **kwargs,
+            )
         finally:
             loader_param.data = real_data
         if result is not False:

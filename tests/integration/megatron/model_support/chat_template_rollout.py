@@ -6,7 +6,7 @@ from pydantic import BaseModel, Field
 
 import art
 from art.local import LocalBackend
-from art.megatron.model_support.tokenizer import configure_tokenizer_for_model_support
+from art.local.backend import _tokenizer_cache_key
 from art.preprocessing.pack import PackedTensors
 from art.preprocessing.tokenize import (
     TokenizedResult,
@@ -102,16 +102,16 @@ def run_chat_template_rollout(base_model: str) -> ChatTemplateRolloutReport:
         base_model=base_model,
         _internal_config={"init_args": {"max_seq_length": 2048}},
     )
-    tokenizer_key = (base_model, None)
+    internal_config = model._internal_config
+    assert internal_config is not None
+    tokenizer_key = _tokenizer_cache_key(base_model, internal_config)
     tokenizer = backend._tokenizers.get(tokenizer_key)
     if tokenizer is None:
         from transformers import AutoTokenizer
 
-        internal_config = model._internal_config
-        assert internal_config is not None
-        tokenizer = configure_tokenizer_for_model_support(
+        tokenizer = backend._configure_training_tokenizer(
             AutoTokenizer.from_pretrained(base_model),
-            base_model=base_model,
+            model=model,
             internal_config=internal_config,
         )
         backend._tokenizers[tokenizer_key] = tokenizer

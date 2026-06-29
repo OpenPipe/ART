@@ -9,11 +9,18 @@ from art.local.backend import (
     _tokenizer_cache_key,
 )
 from art.megatron.backend import MegatronBackend
-from art.megatron.model_support import tokenizer as model_support_tokenizer
+from art.megatron.dsv4.tokenizer import DSV4_CHAT_TEMPLATE_MARKER
 
 
 class _Tokenizer:
     chat_template = "base"
+    vocab_size = 128
+
+    def get_added_vocab(self) -> dict[str, int]:
+        return {}
+
+    def encode(self, text: str, **_kwargs) -> list[int]:
+        return [ord(char) % self.vocab_size for char in text]
 
 
 def test_apply_configured_chat_template_reads_path(tmp_path) -> None:
@@ -60,7 +67,7 @@ def test_apply_configured_chat_template_server_args_dsv4_has_no_default() -> Non
     assert "server_args" not in config_dict
 
 
-def test_local_backend_training_tokenizer_does_not_call_model_support(tmp_path) -> None:
+def test_local_backend_training_tokenizer_calls_model_support(tmp_path) -> None:
     tokenizer = _Tokenizer()
     backend = LocalBackend(path=str(tmp_path))
 
@@ -70,33 +77,13 @@ def test_local_backend_training_tokenizer_does_not_call_model_support(tmp_path) 
         internal_config={},
     )
 
-    assert result is tokenizer
-    assert tokenizer.chat_template == "base"
+    assert result is not tokenizer
+    assert result.chat_template == DSV4_CHAT_TEMPLATE_MARKER
+    assert getattr(result, "_art_dsv4_chat_template_wrapped", False) is True
 
 
-def test_megatron_backend_training_tokenizer_calls_model_support(
-    tmp_path,
-    monkeypatch,
-) -> None:
+def test_megatron_backend_training_tokenizer_calls_model_support(tmp_path) -> None:
     tokenizer = _Tokenizer()
-    calls: list[tuple[str, dict]] = []
-
-    def fake_configure_tokenizer_for_model_support(
-        tokenizer_arg,
-        *,
-        base_model: str,
-        internal_config: dict,
-    ):
-        calls.append((base_model, internal_config))
-        tokenizer_arg.chat_template = "megatron configured"
-        return tokenizer_arg
-
-    monkeypatch.setattr(
-        model_support_tokenizer,
-        "configure_tokenizer_for_model_support",
-        fake_configure_tokenizer_for_model_support,
-    )
-
     backend = MegatronBackend(path=str(tmp_path))
     result = backend._configure_training_tokenizer(
         tokenizer,  # type: ignore[arg-type]
@@ -104,9 +91,9 @@ def test_megatron_backend_training_tokenizer_calls_model_support(
         internal_config={},
     )
 
-    assert result is tokenizer
-    assert calls == [("deepseek-ai/DeepSeek-V4-Flash", {})]
-    assert tokenizer.chat_template == "megatron configured"
+    assert result is not tokenizer
+    assert result.chat_template == DSV4_CHAT_TEMPLATE_MARKER
+    assert getattr(result, "_art_dsv4_chat_template_wrapped", False) is True
 
 
 def test_configured_chat_template_rejects_ambiguous_config(tmp_path) -> None:
