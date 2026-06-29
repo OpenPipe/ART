@@ -9,6 +9,7 @@ import art
 
 from .test_live_length_trainability import (
     _extra_body,
+    _length_chat_template_kwargs,
     _max_tokens_for_completion,
     _scenario_limit,
 )
@@ -234,3 +235,17 @@ def test_length_trainability_extra_body_keeps_template_defaults() -> None:
             "preserve_thinking": True,
         },
     }
+
+
+def test_gpt_oss_length_trainability_requests_low_reasoning() -> None:
+    tokenizer = type("Tokenizer", (), {"chat_template": "{{ reasoning_effort }}"})()
+
+    assert _length_chat_template_kwargs("openai/gpt-oss-20b", tokenizer) == {
+        "reasoning_effort": "low",
+    }
+
+
+def test_non_gpt_oss_length_trainability_keeps_reasoning_template_default() -> None:
+    tokenizer = type("Tokenizer", (), {"chat_template": "{{ reasoning_effort }}"})()
+
+    assert _length_chat_template_kwargs("Qwen/Qwen3.5-35B-A3B", tokenizer) == {}

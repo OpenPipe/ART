@@ -14,7 +14,10 @@ from pydantic import BaseModel, Field
 import pytest
 
 import art
-from art.megatron.model_support.registry import model_uses_expert_parallel
+from art.megatron.model_support.registry import (
+    get_model_support_spec,
+    model_uses_expert_parallel,
+)
 from art.pipeline_trainer import PipelineTrainer
 from art.utils.chat_template import default_chat_template_kwargs_for_tokenizer
 
@@ -308,6 +311,19 @@ def _extra_body(chat_template_kwargs: dict[str, Any]) -> dict[str, object]:
     )
 
 
+def _length_chat_template_kwargs(base_model: str, tokenizer: object) -> dict[str, Any]:
+    kwargs = default_chat_template_kwargs_for_tokenizer(tokenizer)
+    spec = get_model_support_spec(base_model, allow_unvalidated_arch=True)
+    chat_template = getattr(tokenizer, "chat_template", None)
+    if (
+        spec.key == "gpt_oss_moe"
+        and isinstance(chat_template, str)
+        and "reasoning_effort" in chat_template
+    ):
+        kwargs["reasoning_effort"] = "low"
+    return kwargs
+
+
 def _scenario_limit() -> int | None:
     if "ART_MODEL_SUPPORT_LENGTH_SCENARIOS" not in os.environ:
         return None
@@ -569,7 +585,7 @@ async def run_length_trainability_async(
     from transformers import AutoTokenizer
 
     tokenizer = AutoTokenizer.from_pretrained(base_model)
-    chat_template_kwargs = default_chat_template_kwargs_for_tokenizer(tokenizer)
+    chat_template_kwargs = _length_chat_template_kwargs(base_model, tokenizer)
     rollout_weights_mode = internal_config["rollout_weights_mode"]
     _init_megatron_runtime_config(variant)
 
