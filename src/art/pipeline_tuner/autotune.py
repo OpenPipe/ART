@@ -434,9 +434,11 @@ class PipelineAutotuner:
         if vllm_underloaded and trainer_saturated:
             recommendations.append(
                 (
-                    "increase_training_gpus",
+                    "increase_group_size_or_training_gpus",
                     "Pipeline autotuner observes severely underloaded vLLM request "
-                    "pressure while Megatron is saturated; increase training GPUs if possible.",
+                    "pressure while Megatron is saturated; increase rollout group "
+                    "size to use spare inference capacity, or increase training GPUs "
+                    "if possible.",
                 )
             )
         if (

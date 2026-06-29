@@ -69,6 +69,48 @@ def test_pipeline_trainer_score_uses_start_policy_age_and_tau(tmp_path: Path) ->
     )
 
 
+def test_pipeline_trainer_batch_factor_accounts_for_rollout_group_size(
+    tmp_path: Path,
+) -> None:
+    model = TrainableModel(
+        name="pipeline-batch-factor-test",
+        project="pipeline-batch-factor-test",
+        base_model="test-model",
+        base_path=str(tmp_path),
+        report_metrics=[],
+    )
+    trainer = PipelineTrainer(
+        model=model,
+        backend=MagicMock(),
+        rollout_fn=lambda *_args, **_kwargs: asyncio.sleep(0),
+        scenarios=[],
+        config={},
+        pipeline=PipelineRuntimeConfig(
+            num_rollout_workers=1,
+            min_batch_size=1,
+            max_batch_size=1,
+            score_reference_groups_per_step=8,
+            score_reference_rollouts_per_group=8,
+        ),
+        eval_fn=None,
+        max_steps=1,
+    )
+    batch = [_make_group([0.25] * 16, initial_policy_version=10) for _ in range(8)]
+
+    metrics = trainer._score_metrics(
+        10,
+        batch,
+        step_seconds=2.0,
+        result_metrics={"data/step_trainer_assistant_tokens": 800.0},
+    )
+
+    assert metrics["sample_efficiency/rollouts_per_group"] == 16.0
+    assert metrics["sample_efficiency/batch_factor"] == pytest.approx(
+        (8.0 + 300.0 / 8.0) / (8.0 + 300.0 / 16.0)
+    )
+    assert metrics["sample_efficiency/batch_factor"] > 1.0
+
+
 @pytest.mark.asyncio
 async def test_pipeline_trainer_logs_explicit_stale_and_zero_variance_metrics(
     tmp_path: Path,

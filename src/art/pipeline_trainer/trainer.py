@@ -48,8 +48,10 @@ PIPELINE_STATE_KEY = "_pipeline_trainer"
 _ROLLOUT_WALL_TIME_KEY = "_art_rollout_wall_s"
 _ACTOR_IDLE_TIME_KEY = "_art_actor_idle_s"
 _QUEUE_WAIT_TIME_KEY = "_art_queue_wait_s"
-_SCORE_BATCH_EFFICIENCY_ALPHA = 0.5
 _SCORE_FRESHNESS_TAU_STEPS = 4.0
+# Rollout critical batch size from the best current GRPO/RLVR evidence. This is
+# grounded in reported experiments, not a well-validated universal constant.
+_SCORE_CRITICAL_ROLLOUT_BATCH_SIZE = 300.0
 
 
 class _ScenarioSourceExhausted(Exception):
@@ -138,6 +140,7 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
         discard_queue_multiplier: int = 100,
         limit_mean_steps_off_policy: float | None = None,
         score_reference_groups_per_step: float | None = None,
+        score_reference_rollouts_per_group: float | None = None,
         # Status output
         log_interval_seconds: float = 60.0,
         status_ewa_alpha: float = 0.2,
@@ -212,6 +215,11 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
             score_reference_groups_per_step
             if score_reference_groups_per_step is not None
             else pipeline.score_reference_groups_per_step
+        )
+        self.score_reference_rollouts_per_group = (
+            score_reference_rollouts_per_group
+            if score_reference_rollouts_per_group is not None
+            else pipeline.score_reference_rollouts_per_group
         )
         self.resume = resume
         self.discard_queue_multiplier = discard_queue_multiplier
@@ -1257,18 +1265,26 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
         metrics: dict[str, float] = {}
         accepted_groups = float(len(batch))
         metrics["sample_efficiency/accepted_groups_per_step"] = accepted_groups
-        if self.score_reference_groups_per_step is None:
-            batch_discount = 1.0
-        else:
-            batch_discount = min(
-                1.0,
-                (self.score_reference_groups_per_step / accepted_groups)
-                ** _SCORE_BATCH_EFFICIENCY_ALPHA,
-            )
+        rollouts_per_group = self._batch_rollouts_per_group(batch)
+        batch_factor = self._batch_factor(
+            accepted_groups=accepted_groups,
+            rollouts_per_group=rollouts_per_group,
+        )
+        if rollouts_per_group is not None:
+            metrics["sample_efficiency/rollouts_per_group"] = rollouts_per_group
+        if self.score_reference_groups_per_step is not None:
             metrics["sample_efficiency/reference_groups_per_step"] = (
                 self.score_reference_groups_per_step
             )
-        metrics["sample_efficiency/batch_discount"] = batch_discount
+        reference_rollouts = self._reference_rollouts_per_group(rollouts_per_group)
+        if reference_rollouts is not None:
+            metrics["sample_efficiency/reference_rollouts_per_group"] = (
+                reference_rollouts
+            )
+        metrics["sample_efficiency/critical_rollout_batch_size"] = (
+            _SCORE_CRITICAL_ROLLOUT_BATCH_SIZE
+        )
+        metrics["sample_efficiency/batch_factor"] = batch_factor
 
         age_metrics = self._batch_policy_age_metrics(current_step, batch)
         metrics.update(age_metrics)
@@ -1292,9 +1308,47 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
                 accepted_tok_per_s * freshness
             )
             metrics["objective/score_default"] = (
-                accepted_tok_per_s * freshness * batch_discount
+                accepted_tok_per_s * freshness * batch_factor
             )
         return metrics
+
+    def _batch_rollouts_per_group(self, batch: list[TrajectoryGroup]) -> float | None:
+        group_sizes = [len(group.trajectories) for group in batch]
+        if not group_sizes:
+            return None
+        return sum(group_sizes) / len(group_sizes)
+
+    def _reference_rollouts_per_group(
+        self, rollouts_per_group: float | None
+    ) -> float | None:
+        if self.score_reference_rollouts_per_group is not None:
+            return self.score_reference_rollouts_per_group
+        return rollouts_per_group
+
+    def _batch_factor(
+        self,
+        *,
+        accepted_groups: float,
+        rollouts_per_group: float | None,
+    ) -> float:
+        if (
+            self.score_reference_groups_per_step is None
+            or accepted_groups <= 0
+            or rollouts_per_group is None
+            or rollouts_per_group <= 0
+        ):
+            return 1.0
+        reference_rollouts = self._reference_rollouts_per_group(rollouts_per_group)
+        if reference_rollouts is None or reference_rollouts <= 0:
+            return 1.0
+        reference_scenario_data = (
+            self.score_reference_groups_per_step
+            + _SCORE_CRITICAL_ROLLOUT_BATCH_SIZE / reference_rollouts
+        )
+        current_scenario_data = (
+            accepted_groups + _SCORE_CRITICAL_ROLLOUT_BATCH_SIZE / rollouts_per_group
+        )
+        return reference_scenario_data / current_scenario_data
 
     def _batch_policy_age_metrics(
         self, current_step: int, batch: list[TrajectoryGroup]

@@ -334,6 +334,52 @@ def test_stable_holds_emit_inference_gpu_warning() -> None:
     )
 
 
+def test_stable_holds_emit_group_size_or_training_gpu_warning() -> None:
+    settings = PipelineTuneSettings(
+        num_rollout_workers=16,
+        min_batch_size=8,
+        max_batch_size=8,
+        queue_maxsize=12,
+        target_groups_per_step=8,
+    )
+    tuner = PipelineAutotuner(
+        config=PipelineAutotuneConfig(),
+        settings=settings,
+        model_name="test",
+        backend_name="MegatronBackend",
+        packed_sequence_length=122880,
+        inference_gpu_count=2,
+        policy_age_limit_steps=3.0,
+    )
+    for step in range(5):
+        tuner.decisions.append(
+            TunerDecision(
+                step=step + 1,
+                state="inference_under_train_over",
+                action="hold",
+                reason="test",
+                previous=settings,
+                updated=settings,
+                stats=TunerWindowStats(
+                    start_step=step + 1,
+                    end_step=step + 1,
+                    trainer_idle_frac=0.01,
+                    trainer_load_score=0.01,
+                    vllm_pressure=0.25,
+                    group_pack_token_samples=[15000.0] * 8,
+                ),
+            )
+        )
+
+    with pytest.warns(UserWarning, match="increase rollout group size"):
+        tuner._emit_stable_recommendations(tuner.decisions[-1])
+
+    assert any(
+        "increase rollout group size" in item
+        for item in tuner.decisions[-1].recommendations
+    )
+
+
 def _append_decision_window_metrics(
     tuner: PipelineAutotuner, *, include_train_capacity: bool = True
 ) -> None:

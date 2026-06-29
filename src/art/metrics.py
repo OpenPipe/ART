@@ -79,11 +79,11 @@ PIPELINE_RL_METRIC_DEFINITIONS: tuple[MetricDefinition, ...] = (
         score_component=True,
     ),
     MetricDefinition(
-        key="sample_efficiency/batch_discount",
-        title="Batch-size discount",
+        key="sample_efficiency/batch_factor",
+        title="Batch factor",
         description=(
-            "optional penalty for increasing accepted groups per train step "
-            "above a configured reference"
+            "critical-batch factor comparing accepted scenario groups and "
+            "rollouts per group against configured references"
         ),
         kind="ratio",
         higher_is_better=True,
