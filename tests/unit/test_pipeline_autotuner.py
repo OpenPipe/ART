@@ -178,9 +178,7 @@ def test_low_vllm_pressure_increases_workers_when_trainer_underfed() -> None:
     assert decision.updated.num_rollout_workers == 20
 
 
-def test_vllm_pressure_overloaded_train_underfed_holds_without_immediate_warning() -> (
-    None
-):
+def test_vllm_pressure_overloaded_train_underfed_lowers_min_batch() -> None:
     tuner = PipelineAutotuner(
         config=PipelineAutotuneConfig(),
         settings=PipelineTuneSettings(
@@ -214,7 +212,80 @@ def test_vllm_pressure_overloaded_train_underfed_holds_without_immediate_warning
     )
 
     assert decision.state == "inference_over_train_under"
+    assert decision.action == "lower_min_batch_size"
+    assert decision.updated.min_batch_size == 7
+    assert decision.updated.num_rollout_workers == 16
     assert decision.recommendations == []
+
+
+def test_target_increase_preserves_min_to_max_batch_ratio() -> None:
+    tuner = PipelineAutotuner(
+        config=PipelineAutotuneConfig(),
+        settings=PipelineTuneSettings(
+            num_rollout_workers=16,
+            min_batch_size=8,
+            max_batch_size=8,
+            queue_maxsize=12,
+            target_groups_per_step=8,
+        ),
+        model_name="test",
+        backend_name="MegatronBackend",
+        packed_sequence_length=100,
+        inference_gpu_count=2,
+        policy_age_limit_steps=3.0,
+    )
+    decision = tuner._decide(
+        TunerWindowStats(
+            start_step=4,
+            end_step=7,
+            trainer_idle_frac=0.30,
+            trainer_load_score=0.30,
+            vllm_pressure=0.25,
+            queue_freshness_pressure=0.30,
+            token_weighted_policy_age_steps_mean=4.0,
+            groups_per_step_mean=8.0,
+            group_pack_token_samples=[10.0] * 32,
+        )
+    )
+
+    assert decision.action == "increase_workers"
+    assert decision.updated.min_batch_size == 10
+    assert decision.updated.max_batch_size == 10
+
+
+def test_min_batch_raise_replaces_worker_decrease_when_batch_has_room() -> None:
+    tuner = PipelineAutotuner(
+        config=PipelineAutotuneConfig(),
+        settings=PipelineTuneSettings(
+            num_rollout_workers=16,
+            min_batch_size=8,
+            max_batch_size=12,
+            queue_maxsize=12,
+            target_groups_per_step=12,
+        ),
+        model_name="test",
+        backend_name="MegatronBackend",
+        packed_sequence_length=122880,
+        inference_gpu_count=2,
+        policy_age_limit_steps=3.0,
+    )
+    decision = tuner._decide(
+        TunerWindowStats(
+            start_step=4,
+            end_step=7,
+            trainer_idle_frac=0.01,
+            trainer_load_score=0.01,
+            vllm_pressure=0.25,
+            predicted_stale_frac=1.0,
+            groups_per_step_mean=12.0,
+            group_pack_token_samples=[9000.0] * 48,
+        )
+    )
+
+    assert decision.state == "inference_under_train_over"
+    assert decision.action == "raise_min_batch_size"
+    assert decision.updated.num_rollout_workers == 16
+    assert decision.updated.min_batch_size == 9
 
 
 def test_stable_holds_emit_inference_gpu_warning() -> None:

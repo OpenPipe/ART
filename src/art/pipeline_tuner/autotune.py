@@ -273,25 +273,19 @@ class PipelineAutotuner:
         updated = self._settings_with_recomputed_queue(
             previous, stats, adapt_target=True
         )
-        freshness_ratio = max(
-            self._policy_age_ratio(stats), stats.queue_freshness_pressure
+        target_changed = (
+            updated.target_groups_per_step != previous.target_groups_per_step
         )
-        age_high = freshness_ratio >= self.config.policy_age_high_fraction
-        age_severe = freshness_ratio >= self.config.policy_age_severe_fraction
         predicted_stale_high = stats.predicted_stale_frac >= self.config.stale_high_frac
         action = "hold"
         reason = "inside hysteresis band or already balanced"
 
         if stats.queue_put_wait_frac >= self.config.queue_put_severe_frac:
             reason = "completed-group queue backpressure is active"
-        elif (
-            state
-            in {
-                "inference_under_train_under",
-                "inference_balanced_train_under",
-            }
-            and not age_severe
-        ):
+        elif state in {
+            "inference_under_train_under",
+            "inference_balanced_train_under",
+        }:
             updated = updated.model_copy(
                 update={
                     "num_rollout_workers": self._move_workers(
@@ -302,44 +296,10 @@ class PipelineAutotuner:
             action = "increase_workers"
             reason = "vLLM pressure is low and trainer is underfed"
         elif state in {
-            "inference_under_train_under",
-            "inference_balanced_train_under",
-        }:
-            reason = "trainer is underfed but queue freshness is near the policy limit"
-        elif state == "inference_over_train_under":
-            floor = max(
-                1,
-                math.ceil(
-                    updated.target_groups_per_step
-                    * self.config.freshness_min_batch_floor_fraction
-                ),
-            )
-            new_min = max(floor, round(updated.min_batch_size * 0.85))
-            if age_severe and trainer_under and new_min < updated.min_batch_size:
-                updated = updated.model_copy(
-                    update={"min_batch_size": min(new_min, updated.max_batch_size)}
-                )
-                action = "lower_min_batch_size"
-                reason = "trainer is underfed and predicted queue freshness is near the policy limit"
-        elif state in {
             "inference_under_train_over",
             "inference_balanced_train_over",
         }:
-            if updated.min_batch_size < updated.max_batch_size and not age_high:
-                updated = updated.model_copy(
-                    update={
-                        "min_batch_size": min(
-                            updated.max_batch_size,
-                            max(
-                                updated.min_batch_size + 1,
-                                round(updated.min_batch_size * 1.15),
-                            ),
-                        )
-                    }
-                )
-                action = "raise_min_batch_size"
-                reason = "trainer is saturated and policy age has headroom"
-            elif (
+            if (
                 updated.min_batch_size >= updated.max_batch_size
                 and predicted_stale_high
             ):
@@ -354,6 +314,11 @@ class PipelineAutotuner:
                 reason = "trainer saturated with predicted stale backlog"
         elif state == "inference_over_train_over":
             reason = "both sides are loaded; no throughput-safe online change"
+
+        if not target_changed:
+            min_update = self._min_batch_adjustment(updated, stats, state, action)
+            if min_update is not None:
+                updated, action, reason = min_update
 
         updated = self._settings_with_recomputed_queue(
             updated, stats, adapt_target=False
@@ -370,6 +335,50 @@ class PipelineAutotuner:
             updated=updated,
             stats=stats,
         )
+
+    def _min_batch_adjustment(
+        self,
+        settings: PipelineTuneSettings,
+        stats: TunerWindowStats,
+        state: str,
+        action: str,
+    ) -> tuple[PipelineTuneSettings, str, str] | None:
+        if (
+            action != "increase_workers"
+            and stats.trainer_load_score > self.config.trainer_min_batch_lower_score
+        ):
+            floor = max(
+                1,
+                math.ceil(
+                    settings.target_groups_per_step
+                    * self.config.freshness_min_batch_floor_fraction
+                ),
+            )
+            new_min = max(floor, round(settings.min_batch_size * 0.85))
+            if new_min < settings.min_batch_size:
+                return (
+                    settings.model_copy(
+                        update={"min_batch_size": min(new_min, settings.max_batch_size)}
+                    ),
+                    "lower_min_batch_size",
+                    "trainer is severely underfed and rollout workers are not being increased",
+                )
+        should_raise = action == "decrease_workers" or state in {
+            "inference_under_train_over",
+            "inference_balanced_train_over",
+        }
+        if should_raise and settings.min_batch_size < settings.max_batch_size:
+            new_min = min(
+                settings.max_batch_size,
+                max(settings.min_batch_size + 1, round(settings.min_batch_size * 1.15)),
+            )
+            if new_min > settings.min_batch_size:
+                return (
+                    settings.model_copy(update={"min_batch_size": new_min}),
+                    "raise_min_batch_size",
+                    "trainer is saturated enough to use denser batches before reducing workers",
+                )
+        return None
 
     def _emit_stable_recommendations(self, decision: TunerDecision) -> None:
         recommendations = self._stable_recommendations()
@@ -445,10 +454,6 @@ class PipelineAutotuner:
             )
         return recommendations
 
-    def _policy_age_ratio(self, stats: TunerWindowStats) -> float:
-        limit = max(float(self.policy_age_limit_steps), 1e-9)
-        return max(0.0, stats.token_weighted_policy_age_steps_mean) / limit
-
     def _move_workers(self, current: int, direction: int) -> int:
         raw = max(
             self.config.worker_step,
@@ -471,11 +476,10 @@ class PipelineAutotuner:
             if adapt_target
             else settings.target_groups_per_step
         )
-        was_locked = settings.min_batch_size >= settings.max_batch_size
-        min_floor = max(1, math.ceil(target * self.config.min_batch_floor_fraction))
         min_batch = min(settings.min_batch_size, target)
-        if adapt_target and target > settings.target_groups_per_step and not was_locked:
-            min_batch = max(min_batch, min_floor)
+        if adapt_target and target > settings.target_groups_per_step:
+            ratio = settings.min_batch_size / max(1, settings.max_batch_size)
+            min_batch = min(target, max(1, round(target * ratio)))
         # Packed sequence length is the user's cap on target/max batch size. If a
         # run should never use larger train batches, lower packed_sequence_length.
         queue = recommended_queue_size(

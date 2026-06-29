@@ -53,12 +53,9 @@ class PipelineAutotuneConfig(pydantic.BaseModel):
     queue_put_severe_frac: float = pydantic.Field(default=0.50, ge=0.0, le=1.0)
     stale_high_frac: float = pydantic.Field(default=0.20, ge=0.0, le=1.0)
     padding_high_frac: float = pydantic.Field(default=0.25, ge=0.0, le=1.0)
+    trainer_min_batch_lower_score: float = pydantic.Field(default=0.15, ge=0.0)
     recommendation_min_windows: int = pydantic.Field(default=5, ge=1)
     recommendation_consecutive_holds: int = pydantic.Field(default=2, ge=1)
-    batch_underfill_frac: float = pydantic.Field(default=0.95, ge=0.0, le=1.0)
-    policy_age_high_fraction: float = pydantic.Field(default=0.60, ge=0.0, le=1.0)
-    policy_age_severe_fraction: float = pydantic.Field(default=1.0, ge=0.0, le=1.0)
-    min_batch_floor_fraction: float = pydantic.Field(default=0.75, gt=0.0, le=1.0)
     freshness_min_batch_floor_fraction: float = pydantic.Field(
         default=0.50, gt=0.0, le=1.0
     )
