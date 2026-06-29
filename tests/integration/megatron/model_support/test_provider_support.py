@@ -186,6 +186,15 @@ def test_get_provider_accepts_registry_supported_models(
     )
 
 
+def test_provider_runtime_env_can_clear_moe_router_dtype() -> None:
+    runtime_env = provider_module._ProviderRuntimeEnv.from_environ(
+        {"ART_MEGATRON_MOE_ROUTER_DTYPE": "none"}
+    )
+
+    assert runtime_env.is_set("moe_router_dtype")
+    assert runtime_env.moe_router_dtype is None
+
+
 def test_gpt_oss_provider_uses_art_cp_attention(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -208,6 +217,7 @@ def test_gpt_oss_provider_uses_art_cp_attention(
     assert resolved is provider
     assert resolved.context_parallel_size == 2
     assert resolved.moe_shared_expert_overlap is False
+    assert resolved.moe_router_dtype is None
     layer_spec = cast(Any, resolved.transformer_layer_spec)(resolved, vp_stage=0)
     core_attention = layer_spec.submodules.self_attention.submodules.core_attention
     assert issubclass(core_attention, ArtContextParallelCoreAttention)

@@ -65,6 +65,7 @@ class GptOssMoeHandler(DefaultMoeHandler):
         provider.art_flex_core_attention_wrapper = _gpt_oss_flex_core_attention_wrapper
         provider.art_flex_sliding_windows = (sliding_window,)
         provider.moe_shared_expert_overlap = False
+        provider.moe_router_dtype = None
         _install_weighted_bias_quick_geglu_patch()
 
     def vllm_engine_args(

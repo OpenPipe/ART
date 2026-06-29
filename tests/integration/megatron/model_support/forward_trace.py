@@ -46,6 +46,12 @@ CAPTURE_NAME_TOKENS = (
 ROUTER_NAME_TOKEN = ".mlp.router"
 CORE_ATTENTION_NAME_TOKEN = ".self_attention.core_attention"
 PRIMARY_OUTPUT_CANONICAL_KEY = "primary_output__is_canonical"
+CAPTURE_INPUT_NAME_TOKENS = (
+    ".self_attention.linear_qkv",
+    ".self_attention.linear_qkv.q_proj_lora",
+    ".self_attention.linear_qkv.k_proj_lora",
+    ".self_attention.linear_qkv.v_proj_lora",
+)
 
 
 def _trace_hook(fn: Callable[..., Any]) -> Callable[..., Any]:
@@ -334,10 +340,12 @@ class ForwardTraceCapture:
         module_by_name: dict[str, Any],
     ) -> dict[str, Any]:
         if module_name.endswith(".self_attention.in_proj"):
-            return {"component_sizes": cls._gdn_in_proj_component_sizes(module)}
+            sizes = cls._gdn_in_proj_component_sizes(module)
+            return {"component_sizes": sizes} if sizes is not None else {}
         if module_name.endswith(".self_attention.in_proj.in_proj"):
             parent_module = module_by_name[module_name.rsplit(".", 1)[0]]
-            return {"component_sizes": cls._gdn_in_proj_component_sizes(parent_module)}
+            sizes = cls._gdn_in_proj_component_sizes(parent_module)
+            return {"component_sizes": sizes} if sizes is not None else {}
         if module_name.endswith(".self_attention.out_norm"):
             gdn_module = module_by_name[module_name.removesuffix(".out_norm")]
             return {
@@ -346,7 +354,9 @@ class ForwardTraceCapture:
         return {}
 
     @staticmethod
-    def _gdn_in_proj_component_sizes(module: Any) -> tuple[int, ...]:
+    def _gdn_in_proj_component_sizes(module: Any) -> tuple[int, ...] | None:
+        if not hasattr(module, "qkv_lora") or not hasattr(module, "z_lora"):
+            return None
         qkv_sizes = tuple(
             int(size)
             for size in getattr(module.qkv_lora.B_T, "lora_tp_component_sizes")
@@ -550,6 +560,14 @@ class ForwardTraceCapture:
                 # previously perturbed correctness in the real training forward.
                 "primary_output": self.guess_primary_tensor(output),
             }
+            if os.environ.get(
+                "ART_MEGATRON_FORWARD_TRACE_CAPTURE_INPUTS"
+            ) == "1" and any(
+                name.endswith(token) for token in CAPTURE_INPUT_NAME_TOKENS
+            ):
+                primary_input = self.guess_primary_tensor(inputs)
+                if primary_input is not None:
+                    trace_item["primary_input"] = primary_input
             if ROUTER_NAME_TOKEN in name:
                 router_output = _extract_router_output(output)
                 if router_output is not None:

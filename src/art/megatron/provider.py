@@ -30,6 +30,7 @@ _FALSE_ENV_VALUES = {"0", "false", "no", "off"}
 _RECOMPUTE_GRANULARITIES = {"full", "selective"}
 _RECOMPUTE_METHODS = {"uniform", "block"}
 _FLEX_DISPATCHER_BACKENDS = {"deepep", "hybridep"}
+_MOE_ROUTER_DTYPES = {"fp32", "fp64", "none"}
 _BOOL_ENV_FIELDS = (
     (
         "overlap_moe_expert_parallel_comm",
@@ -75,6 +76,7 @@ _CHOICE_ENV_FIELDS = (
         "ART_MEGATRON_MOE_FLEX_DISPATCHER_BACKEND",
         _FLEX_DISPATCHER_BACKENDS,
     ),
+    ("moe_router_dtype", "ART_MEGATRON_MOE_ROUTER_DTYPE", _MOE_ROUTER_DTYPES),
 )
 
 
@@ -192,6 +194,7 @@ class _ProviderRuntimeEnv(BaseModel):
     recompute_modules: list[str] | None = None
     moe_shared_expert_overlap: bool | None = None
     moe_flex_dispatcher_backend: Literal["deepep", "hybridep"] | None = None
+    moe_router_dtype: Literal["fp32", "fp64"] | None = None
 
     @classmethod
     def from_environ(
@@ -448,6 +451,7 @@ def _apply_runtime_env_overrides(
     _apply_provider_attr_if_set(provider, runtime_env, "recompute_num_layers")
     _apply_provider_attr_if_set(provider, runtime_env, "recompute_modules")
     _apply_provider_attr_if_value(provider, runtime_env, "moe_shared_expert_overlap")
+    _apply_provider_attr_if_set(provider, runtime_env, "moe_router_dtype")
     _enforce_ep_overlap_recompute_contract(provider)
     _normalize_recompute_settings(provider)
 

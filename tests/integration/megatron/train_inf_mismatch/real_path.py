@@ -436,6 +436,7 @@ async def _direct_vllm_runtime(
     if forward_trace_dir is not None:
         trace_site = Path(__file__).resolve().parent / "vllm_forward_trace_site"
         env["ART_VLLM_FORWARD_TRACE_DIR"] = str(forward_trace_dir)
+        env["ART_VLLM_FORWARD_TRACE_DETAIL"] = "1"
         env["PYTHONPATH"] = (
             str(trace_site)
             if not env.get("PYTHONPATH")
@@ -1243,6 +1244,10 @@ async def run_real_path_train_inf_mismatch(
             artifact_dir / "real_path_vllm_lora_scores.json",
             vllm_lora.model_dump(mode="json"),
         )
+        # When debugging a suspected ART/Megatron scoring bug, reuse the saved
+        # vLLM scores, tokens, adapter, and routing replay here and rerun only
+        # the Megatron worker below. That keeps the comparison paired and avoids
+        # rerunning vLLM just to iterate on training-side scoring.
         await backend.close()
         backend_open = False
 
