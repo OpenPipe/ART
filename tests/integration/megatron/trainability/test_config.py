@@ -11,6 +11,8 @@ from .test_live_length_trainability import (
     _extra_body,
     _length_chat_template_kwargs,
     _max_tokens_for_completion,
+    _scenario,
+    _scenario_for_training_step,
     _scenario_limit,
 )
 from .yes_no_trainability import (
@@ -226,6 +228,23 @@ def test_length_trainability_varies_max_tokens_per_completion() -> None:
 
     assert caps == [142, 144, 145, 147]
     assert max(caps) - min(caps) == 5
+
+
+def test_gpt_oss_length_trainability_uses_larger_reasoning_cap() -> None:
+    scenario = _scenario(0, target_step=0, base_model="openai/gpt-oss-20b")
+
+    assert scenario.max_tokens == 512
+
+
+def test_scenario_for_training_step_preserves_max_tokens() -> None:
+    scenario = _scenario(0, target_step=0, base_model="openai/gpt-oss-20b")
+
+    updated = _scenario_for_training_step(scenario, 3)
+
+    assert updated.target_step == 3
+    assert updated.max_tokens == scenario.max_tokens
+    assert updated.metadata["target_step"] == 3
+    assert updated.metadata["max_tokens"] == scenario.max_tokens
 
 
 def test_length_trainability_extra_body_keeps_template_defaults() -> None:

@@ -43,6 +43,7 @@ REPO_ROOT = Path(__file__).resolve().parents[4]
 LATEST_SUMMARY_LOG_PATH = REPO_ROOT / ".local" / "length_trainability.log"
 INITIAL_ABS_ERROR_MIN = 5.0
 SUCCESS_ABS_ERROR_MAX = 1.5
+GPT_OSS_MIN_MAX_TOKENS = 512
 MOE_DEDICATED_TRAINING_TOPOLOGY = Topology(
     tp=1,
     cp=2,
@@ -219,6 +220,29 @@ def _check_prompt_hides_target(prompt: str) -> None:
         raise RuntimeError(f"Length prompt leaks target wording: {leaked}")
 
 
+def _is_gpt_oss_model(base_model: str | None) -> bool:
+    if base_model is None:
+        return False
+    return (
+        get_model_support_spec(base_model, allow_unvalidated_arch=True).key
+        == "gpt_oss_moe"
+    )
+
+
+def _base_max_tokens(target_tokens: int, *, base_model: str | None = None) -> int:
+    max_tokens = max(
+        target_tokens + 1,
+        math.ceil(
+            target_tokens
+            * _get_env_float("ART_MODEL_SUPPORT_LENGTH_MAX_TOKENS_MULTIPLIER", 1.4)
+        )
+        + 128,
+    )
+    if _is_gpt_oss_model(base_model):
+        max_tokens = max(max_tokens, GPT_OSS_MIN_MAX_TOKENS)
+    return max_tokens
+
+
 def _prompt_for_index(index: int) -> tuple[str, int]:
     target_words = _get_env_int("ART_MODEL_SUPPORT_LENGTH_PROMPT_WORDS", 300)
     rng = random.Random(index)
@@ -235,16 +259,14 @@ def _prompt_for_index(index: int) -> tuple[str, int]:
     return prompt, _word_count(prompt)
 
 
-def _scenario(index: int, *, target_step: int | None = None) -> LengthScenario:
+def _scenario(
+    index: int,
+    *,
+    target_step: int | None = None,
+    base_model: str | None = None,
+) -> LengthScenario:
     target_tokens = _target_tokens()
-    max_tokens = max(
-        target_tokens + 1,
-        math.ceil(
-            target_tokens
-            * _get_env_float("ART_MODEL_SUPPORT_LENGTH_MAX_TOKENS_MULTIPLIER", 1.4)
-        )
-        + 128,
-    )
+    max_tokens = _base_max_tokens(target_tokens, base_model=base_model)
     prompt, prompt_word_count = _prompt_for_index(index)
     return LengthScenario(
         scenario_index=index,
@@ -277,7 +299,9 @@ def _scenario_for_training_step(
     step: int,
 ) -> LengthScenario:
     parsed = LengthScenario.model_validate(scenario)
-    return _scenario(parsed.scenario_index, target_step=step)
+    metadata = dict(parsed.metadata)
+    metadata["target_step"] = step
+    return parsed.model_copy(update={"target_step": step, "metadata": metadata})
 
 
 def _max_tokens_for_completion(
@@ -313,10 +337,9 @@ def _extra_body(chat_template_kwargs: dict[str, Any]) -> dict[str, object]:
 
 def _length_chat_template_kwargs(base_model: str, tokenizer: object) -> dict[str, Any]:
     kwargs = default_chat_template_kwargs_for_tokenizer(tokenizer)
-    spec = get_model_support_spec(base_model, allow_unvalidated_arch=True)
     chat_template = getattr(tokenizer, "chat_template", None)
     if (
-        spec.key == "gpt_oss_moe"
+        _is_gpt_oss_model(base_model)
         and isinstance(chat_template, str)
         and "reasoning_effort" in chat_template
     ):
@@ -604,7 +627,11 @@ async def run_length_trainability_async(
             while not success_hit and (
                 scenario_limit is None or index < scenario_limit
             ):
-                yield _scenario(index, target_step=0).model_dump()
+                yield _scenario(
+                    index,
+                    target_step=0,
+                    base_model=base_model,
+                ).model_dump()
                 index += 1
 
         async def rollout_fn(
