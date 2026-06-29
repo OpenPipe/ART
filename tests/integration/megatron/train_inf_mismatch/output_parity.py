@@ -970,6 +970,14 @@ def _run_logits(
         build_gdn_execution_spec=bool(
             getattr(runtime.model_support_handler, "build_gdn_execution_spec", False)
         ),
+        build_dsv4_compression_layouts=bool(
+            getattr(
+                runtime.model_support_handler, "build_dsv4_compression_layouts", False
+            )
+        ),
+        dsv4_position_ids=position_ids,
+        dsv4_group_ids=group_ids,
+        dsv4_parent_ids=parent_ids,
         attention_head_dim=getattr(runtime.provider, "kv_channels", None),
         attention_value_head_dim=getattr(runtime.provider, "kv_channels", None),
     )

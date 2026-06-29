@@ -986,6 +986,20 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     return parser.parse_args(argv)
 
 
+def _print_stage_result(stage: ValidationStageResult, *, indent: str = "") -> None:
+    status = "PASS" if stage.passed else "FAIL"
+    print(f"{indent}{stage.name}: {status}", flush=True)
+    child_indent = f"{indent}  "
+    if stage.artifact_dir:
+        print(f"{child_indent}artifact_dir={stage.artifact_dir}", flush=True)
+    summary = stage.metrics.get("readable_summary")
+    if isinstance(summary, list):
+        for line in summary:
+            print(f"{child_indent}{line}", flush=True)
+    if not stage.passed:
+        print(f"{child_indent}metrics={stage.metrics}", flush=True)
+
+
 def main(argv: list[str] | None = None) -> int:
     args = _parse_args(argv)
     if args.all_architectures:
@@ -1000,12 +1014,7 @@ def main(argv: list[str] | None = None) -> int:
         for report in all_report.reports:
             print(f"base_model={report.base_model}", flush=True)
             for stage in report.stages:
-                status = "PASS" if stage.passed else "FAIL"
-                print(f"  {stage.name}: {status}", flush=True)
-                if stage.artifact_dir:
-                    print(f"    artifact_dir={stage.artifact_dir}", flush=True)
-                if not stage.passed:
-                    print(f"    metrics={stage.metrics}", flush=True)
+                _print_stage_result(stage, indent="  ")
         print(f"report_json={args.output_json}", flush=True)
         return 0 if all_report.passed else 1
     report = build_validation_report(
@@ -1018,12 +1027,7 @@ def main(argv: list[str] | None = None) -> int:
         allow_unvalidated_arch=args.allow_unsupported_arch,
     )
     for stage in report.stages:
-        status = "PASS" if stage.passed else "FAIL"
-        print(f"{stage.name}: {status}", flush=True)
-        if stage.artifact_dir:
-            print(f"  artifact_dir={stage.artifact_dir}", flush=True)
-        if not stage.passed:
-            print(f"  metrics={stage.metrics}", flush=True)
+        _print_stage_result(stage)
     print(f"report_json={args.output_json}", flush=True)
     return 0 if all(stage.passed for stage in report.stages) else 1
 

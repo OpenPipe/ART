@@ -98,7 +98,10 @@ def subclass_chat_completion_request() -> None:
 
 
 def patch_listen_for_disconnect() -> None:
-    from vllm.entrypoints.serve.utils import api_utils
+    try:
+        api_utils = importlib.import_module("vllm.entrypoints.serve.utils.api_utils")
+    except ModuleNotFoundError:
+        api_utils = importlib.import_module("vllm.entrypoints.utils")
 
     if getattr(api_utils, "_art_listen_for_disconnect_patched", False):
         return
