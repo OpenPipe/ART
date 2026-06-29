@@ -228,9 +228,9 @@ class PipelineAutotuner:
             predicted_stale_frac=_mean(step_values("queue/predicted_stale_fraction")),
             queue_freshness_pressure=_mean(step_values("queue/freshness_pressure")),
             token_weighted_policy_age_steps_mean=_mean(
-                step_values("offpolicy/token_weighted_policy_age_steps")
-                or step_values("offpolicy/mean_policy_age_steps")
-                or step_values("offpolicy/art_steps_off_policy")
+                _required_step_values(
+                    by_step, window_steps, "offpolicy/token_weighted_policy_age_steps"
+                )
             ),
             freshness_discount_mean=_mean(
                 step_values("sample_efficiency/freshness_discount")

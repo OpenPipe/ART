@@ -49,6 +49,7 @@ _ROLLOUT_WALL_TIME_KEY = "_art_rollout_wall_s"
 _ACTOR_IDLE_TIME_KEY = "_art_actor_idle_s"
 _QUEUE_WAIT_TIME_KEY = "_art_queue_wait_s"
 _SCORE_BATCH_EFFICIENCY_ALPHA = 0.5
+_SCORE_FRESHNESS_TAU_STEPS = 4.0
 
 
 class _ScenarioSourceExhausted(Exception):
@@ -830,7 +831,7 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
                         metrics.update(await maybe_metrics)
                 metrics.update(
                     self._score_metrics(
-                        current_step,
+                        training_policy_step,
                         batch,
                         step_seconds=step_seconds,
                         result_metrics=metrics,
@@ -1271,11 +1272,10 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
 
         age_metrics = self._batch_policy_age_metrics(current_step, batch)
         metrics.update(age_metrics)
-        mean_age = age_metrics.get(
-            "offpolicy/token_weighted_policy_age_steps",
-            result_metrics.get("steps_off_policy", 0.0),
-        )
-        freshness = 1.0 / (1.0 + max(float(mean_age), 0.0))
+        mean_age = age_metrics.get("offpolicy/token_weighted_policy_age_steps")
+        if mean_age is None:
+            return metrics
+        freshness = 1.0 / (1.0 + max(float(mean_age), 0.0) / _SCORE_FRESHNESS_TAU_STEPS)
         metrics["sample_efficiency/freshness_discount"] = freshness
         metrics["sample_efficiency/age_discount"] = freshness
 
