@@ -16,6 +16,7 @@ import pytest
 import art
 from art.megatron.model_support.registry import model_uses_expert_parallel
 from art.pipeline_trainer import PipelineTrainer
+from art.utils.chat_template import default_chat_template_kwargs_for_tokenizer
 
 from ..model_support.oracle_harness import Topology
 from .yes_no_trainability import (
@@ -280,8 +281,16 @@ def _messages(scenario: LengthScenario) -> art.Messages:
     return [{"role": "user", "content": scenario.prompt}]
 
 
-def _extra_body() -> dict[str, object]:
-    return {"chat_template_kwargs": {"enable_thinking": False}}
+def _extra_body(chat_template_kwargs: dict[str, Any]) -> dict[str, object]:
+    return (
+        {"chat_template_kwargs": chat_template_kwargs} if chat_template_kwargs else {}
+    )
+
+
+def _scenario_limit() -> int | None:
+    if "ART_MODEL_SUPPORT_LENGTH_SCENARIOS" not in os.environ:
+        return None
+    return _get_env_int("ART_MODEL_SUPPORT_LENGTH_SCENARIOS", 0)
 
 
 def _generated_token_count(choice: object) -> int:
@@ -333,6 +342,7 @@ async def _length_group(
     step: int | None,
     n: int,
     temperature: float,
+    chat_template_kwargs: dict[str, Any],
     samples: list[LengthSampleReport],
     summary_log_path: Path | None = None,
 ) -> art.TrajectoryGroup:
@@ -343,7 +353,7 @@ async def _length_group(
         max_tokens=scenario.max_tokens,
         n=n,
         temperature=temperature,
-        extra_body=_extra_body(),
+        extra_body=_extra_body(chat_template_kwargs),
         logprobs=True,
         top_logprobs=0,
         timeout=_get_env_float("ART_MODEL_SUPPORT_LENGTH_REQUEST_TIMEOUT", 900.0),
@@ -492,10 +502,7 @@ async def run_length_trainability_async(
         "ART_MODEL_SUPPORT_LENGTH_ROLLOUT_WORKERS",
         max(1, max_steps_off_policy + 1),
     )
-    scenario_count = _get_env_int(
-        "ART_MODEL_SUPPORT_LENGTH_SCENARIOS",
-        max_steps * max(rollouts_per_prompt, 2) + rollout_workers + 4,
-    )
+    scenario_limit = _scenario_limit()
     success_hit = False
     samples: list[LengthSampleReport] = []
     backend_root = artifact_dir / "megatron_dedicated_workspace"
@@ -514,6 +521,10 @@ async def run_length_trainability_async(
         "ART_MODEL_SUPPORT_LENGTH_MAX_NUM_SEQS",
         4,
     )
+    from transformers import AutoTokenizer
+
+    tokenizer = AutoTokenizer.from_pretrained(base_model)
+    chat_template_kwargs = default_chat_template_kwargs_for_tokenizer(tokenizer)
     rollout_weights_mode = internal_config["rollout_weights_mode"]
     _init_megatron_runtime_config(variant)
 
@@ -528,10 +539,12 @@ async def run_length_trainability_async(
         await model.register(backend)
 
         async def scenarios() -> AsyncIterator[dict[str, object]]:
-            for index in range(scenario_count):
-                if success_hit:
-                    break
+            index = 0
+            while not success_hit and (
+                scenario_limit is None or index < scenario_limit
+            ):
                 yield _scenario(index, target_step=0).model_dump()
+                index += 1
 
         async def rollout_fn(
             rollout_model: art.TrainableModel,
@@ -554,6 +567,7 @@ async def run_length_trainability_async(
                     "ART_MODEL_SUPPORT_LENGTH_ROLLOUT_TEMPERATURE",
                     1.1,
                 ),
+                chat_template_kwargs=chat_template_kwargs,
                 samples=samples,
                 summary_log_path=summary_log_path,
             )
@@ -586,7 +600,7 @@ async def run_length_trainability_async(
             eval_every_n_steps=0,
             eval_at_start=False,
             save_checkpoint=False,
-            total_scenarios=scenario_count,
+            total_scenarios=scenario_limit,
             log_interval_seconds=30.0,
             discard_queue_multiplier=1000,
             resume=False,

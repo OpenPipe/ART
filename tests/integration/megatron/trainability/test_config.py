@@ -7,6 +7,7 @@ import pytest
 
 import art
 
+from .test_live_length_trainability import _extra_body, _scenario_limit
 from .yes_no_trainability import (
     _build_internal_config,
     _build_variant,
@@ -194,3 +195,24 @@ def test_qwen3_5_moe_shared_variant_enables_expert_parallel(monkeypatch) -> None
 
     assert config["rollout_weights_mode"] == "lora"
     assert config["engine_args"]["enable_expert_parallel"] is True
+
+
+def test_length_trainability_scenarios_are_unbounded_by_default(monkeypatch) -> None:
+    monkeypatch.delenv("ART_MODEL_SUPPORT_LENGTH_SCENARIOS", raising=False)
+
+    assert _scenario_limit() is None
+
+
+def test_length_trainability_scenario_limit_uses_env(monkeypatch) -> None:
+    monkeypatch.setenv("ART_MODEL_SUPPORT_LENGTH_SCENARIOS", "7")
+
+    assert _scenario_limit() == 7
+
+
+def test_length_trainability_extra_body_keeps_template_defaults() -> None:
+    assert _extra_body({"enable_thinking": False, "preserve_thinking": True}) == {
+        "chat_template_kwargs": {
+            "enable_thinking": False,
+            "preserve_thinking": True,
+        },
+    }
