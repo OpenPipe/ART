@@ -172,6 +172,43 @@ def test_production_compiled_flex_default_stays_flash() -> None:
     assert compiled_flex_attention._FORCED_FLEX_KERNEL_OPTIONS == {"BACKEND": "FLASH"}
 
 
+def test_sm90_block_sparse_dq_postprocess_atom_layout_keeps_wgmma_m64() -> None:
+    from art.megatron.flex_attn.flash_dlse_patch import (
+        _sm90_block_sparse_dq_postprocess_atom_layout,
+    )
+
+    assert (
+        _sm90_block_sparse_dq_postprocess_atom_layout(
+            arch=90,
+            hdim=64,
+            block_size=64,
+            atom_layout=2,
+            swap_ab=False,
+        )
+        == 1
+    )
+    assert (
+        _sm90_block_sparse_dq_postprocess_atom_layout(
+            arch=90,
+            hdim=64,
+            block_size=128,
+            atom_layout=2,
+            swap_ab=False,
+        )
+        == 2
+    )
+    assert (
+        _sm90_block_sparse_dq_postprocess_atom_layout(
+            arch=90,
+            hdim=128,
+            block_size=64,
+            atom_layout=1,
+            swap_ab=False,
+        )
+        == 1
+    )
+
+
 def test_forward_trace_reads_row_uids_from_output_tensor() -> None:
     output = torch.zeros((2, 1), dtype=torch.float32)
     setattr(output, "_art_trace_row_token_uids", torch.tensor([4, 7]))

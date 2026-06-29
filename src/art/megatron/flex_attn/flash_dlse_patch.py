@@ -14,6 +14,7 @@ import torch
 
 _PATCH_APPLIED = False
 _TILE_PATCH_APPLIED = False
+_DQ_POSTPROCESS_PATCH_APPLIED = False
 
 
 def _sm90_block_sparse_fwd_config(cute_interface: Any, head_dim: int, head_dim_v: int):
@@ -64,6 +65,86 @@ def _apply_flash_flex_block_sparse_tile_patch() -> None:
     _TILE_PATCH_APPLIED = True
 
 
+def _sm90_block_sparse_dq_postprocess_atom_layout(
+    *,
+    arch: int,
+    hdim: int,
+    block_size: int,
+    atom_layout: int,
+    swap_ab: bool,
+) -> int:
+    if (
+        int(arch) // 10 == 9
+        and int(hdim) <= 64
+        and int(block_size) == 64
+        and int(atom_layout) == 2
+        and not bool(swap_ab)
+    ):
+        return 1
+    return int(atom_layout)
+
+
+def _apply_flash_block_sparse_dq_postprocess_patch() -> None:
+    global _DQ_POSTPROCESS_PATCH_APPLIED
+    if _DQ_POSTPROCESS_PATCH_APPLIED:
+        return
+
+    try:
+        import flash_attn.cute.interface as cute_interface  # ty: ignore[unresolved-import]
+    except ModuleNotFoundError:
+        _DQ_POSTPROCESS_PATCH_APPLIED = True
+        return
+
+    cute_interface_any = cast(Any, cute_interface)
+    original_bwd_postprocess_convert = cute_interface_any._bwd_postprocess_convert
+
+    def bwd_postprocess_convert_art(
+        accum,
+        output,
+        scale,
+        cu_seqlens,
+        seqused,
+        arch,
+        dtype,
+        hdim,
+        block_size,
+        num_threads,
+        atom_layout,
+        swap_ab,
+        use_2cta_instrs=False,
+        cluster_size=1,
+    ):
+        atom_layout = _sm90_block_sparse_dq_postprocess_atom_layout(
+            arch=int(arch),
+            hdim=int(hdim),
+            block_size=int(block_size),
+            atom_layout=int(atom_layout),
+            swap_ab=bool(swap_ab),
+        )
+        return original_bwd_postprocess_convert(
+            accum,
+            output,
+            scale,
+            cu_seqlens,
+            seqused,
+            arch,
+            dtype,
+            hdim,
+            block_size,
+            num_threads,
+            atom_layout,
+            swap_ab,
+            use_2cta_instrs=use_2cta_instrs,
+            cluster_size=cluster_size,
+        )
+
+    bwd_postprocess_convert_art.compile_cache = (  # type: ignore[attr-defined]
+        original_bwd_postprocess_convert.compile_cache
+    )
+    cute_interface_any._bwd_postprocess_convert = bwd_postprocess_convert_art
+    _DQ_POSTPROCESS_PATCH_APPLIED = True
+
+
 def _patched_flash_backward_template_source(source: str) -> str:
     patched = source
     kernel_replacements = (
@@ -104,6 +185,7 @@ def _patched_flash_backward_template_source(source: str) -> str:
 def apply_flash_flex_dlse_patch() -> None:
     global _PATCH_APPLIED
     _apply_flash_flex_block_sparse_tile_patch()
+    _apply_flash_block_sparse_dq_postprocess_patch()
     if _PATCH_APPLIED:
         return
 
