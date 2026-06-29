@@ -1259,7 +1259,11 @@ def _stacked_layers(
         if len(reference_shapes) != 1 or len(candidate_shapes) != 1:
             original_names = original_names_by_group[normalized]
             for original_name, (reference, candidate) in zip(original_names, group):
-                stacked_pairs.append((original_name, reference, candidate))
+                # Keep one synthetic layer axis so layer-averaged comparison
+                # does not treat tensor rows/features as layer entries.
+                stacked_pairs.append(
+                    (original_name, reference.unsqueeze(0), candidate.unsqueeze(0))
+                )
             continue
         stacked_pairs.append(
             (
