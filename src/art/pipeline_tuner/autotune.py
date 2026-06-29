@@ -48,6 +48,30 @@ class PackingProjection(pydantic.BaseModel):
     groups: int
     spill_probability: float
     expected_padding_ratio: float
+    bootstrap_spill_probability: float = 0.0
+    history_spill_probability_upper: float = 0.0
+    history_trials: float = 0.0
+    history_spills: float = 0.0
+    history_bad_padding_events: float = 0.0
+    history_bad_padding_probability_upper: float = 0.0
+
+
+class PackingOutcome(pydantic.BaseModel):
+    step: int
+    groups: int = pydantic.Field(ge=1)
+    packed_sequences: int = pydantic.Field(ge=1)
+    padding_ratio: float = pydantic.Field(ge=0.0, le=1.0)
+    non_padding_tokens: float = pydantic.Field(ge=0.0)
+    train_tokens: float = pydantic.Field(gt=0.0)
+
+
+class PackingHistoryRisk(pydantic.BaseModel):
+    groups: int
+    trials: float = 0.0
+    spills: float = 0.0
+    spill_probability_upper: float = 0.0
+    bad_padding_events: float = 0.0
+    bad_padding_probability_upper: float = 0.0
 
 
 class VllmLoadStats(pydantic.BaseModel):
@@ -91,6 +115,8 @@ class PipelineAutotuner:
         self.policy_age_limit_steps = policy_age_limit_steps
         self.metrics: list[PipelineMetric] = []
         self.packed_groups: list[PackedGroupObservation] = []
+        self._packing_outcomes: list[PackingOutcome] = []
+        self._packing_outcome_steps: set[int] = set()
         self.decisions: list[TunerDecision] = []
         self._last_decision_step = 0
         self._target_candidate: int | None = None
@@ -195,6 +221,11 @@ class PipelineAutotuner:
             padding_ratios.append(max(0.0, (capacity - non_padding) / capacity))
         trainer_idle_frac = (collect / wall) if wall > 0 else 0.0
         padding_ratio_mean = _mean(padding_ratios)
+        self._record_packing_outcomes(
+            by_step=by_step,
+            window_steps=window_steps,
+            pack_by_step=pack_by_step,
+        )
         vllm_load = _vllm_load_stats(vllm_metrics, window_start_s=t0, window_end_s=t1)
         return TunerWindowStats(
             start_step=window_steps[0],
@@ -244,6 +275,63 @@ class PipelineAutotuner:
             train_capacity_tokens_mean=_mean(train_capacity_tokens),
             group_pack_token_samples=pack_samples,
         )
+
+    def _record_packing_outcomes(
+        self,
+        *,
+        by_step: dict[int, dict[str, PipelineMetric]],
+        window_steps: list[int],
+        pack_by_step: dict[int, list[float]],
+    ) -> None:
+        required = {
+            "data/step_num_groups_trainable",
+            "data/step_packed_sequences",
+            "data/step_train_tokens",
+        }
+        for step in window_steps:
+            if step in self._packing_outcome_steps:
+                continue
+            values = by_step[step]
+            missing = sorted(required.difference(values))
+            if missing:
+                raise RuntimeError(
+                    "Pipeline autotuning requires packing outcome metrics in every "
+                    f"decision-window step; missing {missing} at step {step}."
+                )
+            groups = int(round(values["data/step_num_groups_trainable"].value))
+            if groups <= 0:
+                continue
+            train_tokens = float(values["data/step_train_tokens"].value)
+            if train_tokens <= 0.0:
+                raise RuntimeError(
+                    "Pipeline autotuning requires positive data/step_train_tokens "
+                    f"at step {step}."
+                )
+            non_padding_tokens = sum(pack_by_step.get(step, []))
+            padding_ratio = max(0.0, (train_tokens - non_padding_tokens) / train_tokens)
+            self._packing_outcomes.append(
+                PackingOutcome(
+                    step=step,
+                    groups=groups,
+                    packed_sequences=int(
+                        round(values["data/step_packed_sequences"].value)
+                    ),
+                    padding_ratio=min(1.0, padding_ratio),
+                    non_padding_tokens=non_padding_tokens,
+                    train_tokens=train_tokens,
+                )
+            )
+            self._packing_outcome_steps.add(step)
+        if not self._packing_outcomes:
+            return
+        newest_step = max(outcome.step for outcome in self._packing_outcomes)
+        cutoff_step = newest_step - self.config.packing_history_steps + 1
+        self._packing_outcomes = [
+            outcome for outcome in self._packing_outcomes if outcome.step >= cutoff_step
+        ]
+        self._packing_outcome_steps = {
+            outcome.step for outcome in self._packing_outcomes
+        }
 
     def _decide(self, stats: TunerWindowStats) -> TunerDecision:
         inference_over = stats.vllm_pressure > self.config.vllm_pressure_over_ratio
@@ -524,6 +612,12 @@ class PipelineAutotuner:
                     ),
                 ),
             )
+        selected_projection = next(
+            (projection for projection in projections if projection.groups == observed),
+            None,
+        )
+        if selected_projection is not None:
+            self._record_selected_packing_projection(stats, selected_projection)
         min_delta = max(
             1, math.ceil(current * self.config.target_group_min_relative_change)
         )
@@ -553,7 +647,9 @@ class PipelineAutotuner:
     def _packing_projections(
         self, settings: PipelineTuneSettings, stats: TunerWindowStats
     ) -> list[PackingProjection]:
-        samples = [value for value in stats.group_pack_token_samples if value > 0]
+        samples = [
+            value for value in self._packing_projection_samples(stats) if value > 0
+        ]
         capacity = float(self.packed_sequence_length)
         if not samples:
             return []
@@ -570,6 +666,7 @@ class PipelineAutotuner:
             2000,
         )
         sample_count = min(self.config.bootstrap_samples, max(16, len(samples) * 4))
+        history_risks = self._packing_history_risks(range(lo, hi + 1))
         repeated: list[float] = []
         while len(repeated) < sample_count + hi + 1:
             repeated.extend(samples)
@@ -582,20 +679,125 @@ class PipelineAutotuner:
             packed_counts = [max(1, math.ceil(total / capacity)) for total in totals]
             expected_capacity = _mean([count * capacity for count in packed_counts])
             expected_tokens = _mean(totals)
+            bootstrap_spill_probability = _mean(
+                [1.0 if total > capacity else 0.0 for total in totals]
+            )
+            history_risk = history_risks[groups]
             projections.append(
                 PackingProjection(
                     groups=groups,
-                    spill_probability=_mean(
-                        [1.0 if total > capacity else 0.0 for total in totals]
+                    spill_probability=max(
+                        bootstrap_spill_probability,
+                        history_risk.spill_probability_upper,
                     ),
                     expected_padding_ratio=max(
                         0.0, (expected_capacity - expected_tokens) / expected_capacity
                     )
                     if expected_capacity > 0
                     else 0.0,
+                    bootstrap_spill_probability=bootstrap_spill_probability,
+                    history_spill_probability_upper=history_risk.spill_probability_upper,
+                    history_trials=history_risk.trials,
+                    history_spills=history_risk.spills,
+                    history_bad_padding_events=history_risk.bad_padding_events,
+                    history_bad_padding_probability_upper=(
+                        history_risk.bad_padding_probability_upper
+                    ),
                 )
             )
         return projections
+
+    def _packing_projection_samples(self, stats: TunerWindowStats) -> list[float]:
+        cutoff_step = stats.end_step - self.config.packing_history_steps + 1
+        prior_samples = [
+            float(observation.physical_tokens)
+            for observation in self.packed_groups
+            if cutoff_step <= observation.step < stats.start_step
+        ]
+        return prior_samples + stats.group_pack_token_samples
+
+    def _packing_history_risks(
+        self, groups_range: range
+    ) -> dict[int, PackingHistoryRisk]:
+        risks: dict[int, PackingHistoryRisk] = {}
+        for groups in groups_range:
+            outcomes = [
+                outcome
+                for outcome in self._packing_outcomes
+                if outcome.groups == groups
+            ]
+            trials = float(len(outcomes))
+            spills = float(
+                sum(1 for outcome in outcomes if outcome.packed_sequences > 1)
+            )
+            bad_padding_events = float(
+                sum(
+                    1
+                    for outcome in outcomes
+                    if outcome.padding_ratio >= self.config.packing_bad_padding_ratio
+                )
+            )
+            # Zero-spill samples are useful diagnostics but should not block exploration:
+            # a beta upper bound with sparse clean samples would make target batches
+            # sticky. Actual spills are the hard signal we carry across the horizon.
+            risks[groups] = PackingHistoryRisk(
+                groups=groups,
+                trials=trials,
+                spills=spills,
+                spill_probability_upper=self._packing_probability_upper(
+                    events=spills, trials=trials
+                )
+                if spills > 0.0
+                else 0.0,
+                bad_padding_events=bad_padding_events,
+                bad_padding_probability_upper=self._packing_probability_upper(
+                    events=bad_padding_events, trials=trials
+                )
+                if bad_padding_events > 0.0
+                else 0.0,
+            )
+        inherited_spill_probability = 0.0
+        for groups in sorted(risks):
+            inherited_spill_probability = max(
+                inherited_spill_probability, risks[groups].spill_probability_upper
+            )
+            if inherited_spill_probability > risks[groups].spill_probability_upper:
+                risks[groups] = risks[groups].model_copy(
+                    update={
+                        "spill_probability_upper": inherited_spill_probability,
+                    }
+                )
+        return risks
+
+    def _packing_probability_upper(self, *, events: float, trials: float) -> float:
+        from scipy.stats import beta as beta_distribution
+
+        non_events = max(0.0, trials - events)
+        value = float(
+            beta_distribution.ppf(
+                self.config.packing_spill_confidence,
+                self.config.packing_spill_prior_alpha + events,
+                self.config.packing_spill_prior_beta + non_events,
+            )
+        )
+        if not math.isfinite(value):
+            raise RuntimeError("Failed to compute packing spill beta posterior.")
+        return max(0.0, min(1.0, value))
+
+    @staticmethod
+    def _record_selected_packing_projection(
+        stats: TunerWindowStats, projection: PackingProjection
+    ) -> None:
+        stats.packing_history_groups = projection.groups
+        stats.packing_history_trials = projection.history_trials
+        stats.packing_history_spills = projection.history_spills
+        stats.packing_history_spill_probability_upper = (
+            projection.history_spill_probability_upper
+        )
+        stats.packing_history_bad_padding_events = projection.history_bad_padding_events
+        stats.packing_history_bad_padding_probability_upper = (
+            projection.history_bad_padding_probability_upper
+        )
 
     def profile(self) -> PipelineAutotunerProfile:
         return PipelineAutotunerProfile(

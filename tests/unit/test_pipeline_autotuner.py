@@ -2,6 +2,7 @@ import pytest
 
 from art.pipeline_tuner import PipelineAutotuneConfig
 from art.pipeline_tuner.autotune import (
+    PackingOutcome,
     PipelineAutotuner,
     _group_vllm_metric_rows,
     _trainer_load_score,
@@ -253,6 +254,126 @@ def test_target_increase_preserves_min_to_max_batch_ratio() -> None:
     assert decision.updated.max_batch_size == 10
 
 
+def test_target_group_projection_uses_spill_history_veto() -> None:
+    settings = PipelineTuneSettings(
+        num_rollout_workers=16,
+        min_batch_size=9,
+        max_batch_size=9,
+        queue_maxsize=12,
+        target_groups_per_step=9,
+    )
+    clean_tuner = PipelineAutotuner(
+        config=PipelineAutotuneConfig(),
+        settings=settings,
+        model_name="test",
+        backend_name="MegatronBackend",
+        packed_sequence_length=100,
+        inference_gpu_count=2,
+        policy_age_limit_steps=3.0,
+    )
+    stats = TunerWindowStats(
+        start_step=4,
+        end_step=7,
+        group_pack_token_samples=[10.0] * 32,
+    )
+
+    assert clean_tuner._adaptive_target_groups(settings, stats) == 10
+
+    spilled_tuner = PipelineAutotuner(
+        config=PipelineAutotuneConfig(),
+        settings=settings,
+        model_name="test",
+        backend_name="MegatronBackend",
+        packed_sequence_length=100,
+        inference_gpu_count=2,
+        policy_age_limit_steps=3.0,
+    )
+    spilled_tuner._packing_outcomes.append(
+        PackingOutcome(
+            step=7,
+            groups=10,
+            packed_sequences=2,
+            padding_ratio=0.50,
+            non_padding_tokens=100.0,
+            train_tokens=200.0,
+        )
+    )
+
+    assert spilled_tuner._adaptive_target_groups(settings, stats) == 9
+
+
+def test_spill_history_veto_is_monotone_for_larger_batches() -> None:
+    settings = PipelineTuneSettings(
+        num_rollout_workers=16,
+        min_batch_size=9,
+        max_batch_size=9,
+        queue_maxsize=12,
+        target_groups_per_step=9,
+    )
+    tuner = PipelineAutotuner(
+        config=PipelineAutotuneConfig(),
+        settings=settings,
+        model_name="test",
+        backend_name="MegatronBackend",
+        packed_sequence_length=100,
+        inference_gpu_count=2,
+        policy_age_limit_steps=3.0,
+    )
+    tuner._packing_outcomes.append(
+        PackingOutcome(
+            step=7,
+            groups=10,
+            packed_sequences=2,
+            padding_ratio=0.50,
+            non_padding_tokens=100.0,
+            train_tokens=200.0,
+        )
+    )
+    stats = TunerWindowStats(
+        start_step=4,
+        end_step=7,
+        group_pack_token_samples=[9.0] * 32,
+    )
+
+    assert tuner._adaptive_target_groups(settings, stats) == 9
+
+
+def test_target_group_projection_uses_prior_pack_samples() -> None:
+    settings = PipelineTuneSettings(
+        num_rollout_workers=16,
+        min_batch_size=9,
+        max_batch_size=9,
+        queue_maxsize=12,
+        target_groups_per_step=9,
+    )
+    tuner = PipelineAutotuner(
+        config=PipelineAutotuneConfig(),
+        settings=settings,
+        model_name="test",
+        backend_name="MegatronBackend",
+        packed_sequence_length=100,
+        inference_gpu_count=2,
+        policy_age_limit_steps=3.0,
+    )
+    for step in range(1, 4):
+        for _ in range(8):
+            tuner.on_packed_group(
+                PackedGroupObservation(
+                    step=step,
+                    physical_tokens=11,
+                    prompt_tokens=10,
+                    completion_tokens=1,
+                )
+            )
+    stats = TunerWindowStats(
+        start_step=4,
+        end_step=7,
+        group_pack_token_samples=[9.0] * 32,
+    )
+
+    assert tuner._adaptive_target_groups(settings, stats) == 9
+
+
 def test_min_batch_raise_replaces_worker_decrease_when_batch_has_room() -> None:
     tuner = PipelineAutotuner(
         config=PipelineAutotuneConfig(),
@@ -391,6 +512,7 @@ def _append_decision_window_metrics(
             "pipeline_trainer/step_wall_s": 10.0,
             "pipeline_trainer/step_collect_batch_s": 1.0,
             "data/step_num_groups_trainable": 2.0,
+            "data/step_packed_sequences": 1.0,
             "sample_efficiency/freshness_discount": 0.5,
             "offpolicy/token_weighted_policy_age_steps": 1.0,
             "queue/predicted_stale_fraction": 0.0,

@@ -46,6 +46,11 @@ class PipelineAutotuneConfig(pydantic.BaseModel):
     initial_min_batch_size: int = pydantic.Field(default=8, ge=1)
     initial_max_batch_size: int = pydantic.Field(default=8, ge=1)
     bootstrap_samples: int = pydantic.Field(default=256, ge=16)
+    packing_history_steps: int = pydantic.Field(default=64, ge=1)
+    packing_spill_prior_alpha: float = pydantic.Field(default=1.0, gt=0.0)
+    packing_spill_prior_beta: float = pydantic.Field(default=8.0, gt=0.0)
+    packing_spill_confidence: float = pydantic.Field(default=0.8, gt=0.0, lt=1.0)
+    packing_bad_padding_ratio: float = pydantic.Field(default=0.35, ge=0.0, le=1.0)
     queue_running_reserve_fraction: float = pydantic.Field(default=0.75, ge=0.0, le=1.0)
     trainer_load_under_score: float = pydantic.Field(default=0.08, ge=0.0)
     trainer_load_severe_under_score: float = pydantic.Field(default=0.50, ge=0.0)
@@ -125,6 +130,12 @@ class TunerWindowStats(pydantic.BaseModel):
     collect_batch_s_mean: float = 0.0
     train_work_s_mean: float = 0.0
     train_capacity_tokens_mean: float = 0.0
+    packing_history_groups: int | None = None
+    packing_history_trials: float = 0.0
+    packing_history_spills: float = 0.0
+    packing_history_spill_probability_upper: float = 0.0
+    packing_history_bad_padding_events: float = 0.0
+    packing_history_bad_padding_probability_upper: float = 0.0
     group_pack_token_samples: list[float] = pydantic.Field(
         default_factory=list, exclude=True
     )
