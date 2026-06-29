@@ -90,6 +90,108 @@ def test_dsv4_compressor_patch_uses_fp32_compressor_helper(monkeypatch) -> None:
     ]
 
 
+def test_dsv4_current_vllm_attention_patch_targets_split_modules(monkeypatch) -> None:
+    patches = _load_patches_module()
+    calls: list[tuple[str, object, object]] = []
+    o_proj_calls: list[tuple[object, object, object]] = []
+
+    class FakeAttention:
+        compressor = SimpleNamespace(fused_wkv_wgate=_FakeLoraLinear("compressor"))
+        indexer = SimpleNamespace(
+            compressor=SimpleNamespace(fused_wkv_wgate=_FakeLoraLinear("indexer"))
+        )
+
+        def attn_gemm_parallel_execute(self, hidden):
+            return "qr", "kv", "indexer_kv", "weights"
+
+    class FakeFlashMLA:
+        rotary_emb = SimpleNamespace(cos_sin_cache="cache")
+        wo_a = "wo_a"
+        wo_b = "wo_b"
+        n_local_groups = 2
+        n_local_heads = 4
+        nope_head_dim = 448
+        rope_head_dim = 64
+        o_lora_rank = 512
+        _einsum_recipe = (1, 128, 128)
+        _tma_aligned_scales = False
+
+        def _o_proj(self, o, positions):
+            raise AssertionError("unpatched")
+
+    class FakeFlashInfer(FakeFlashMLA): ...
+
+    fake_attention_mod = types.ModuleType("vllm.models.deepseek_v4.attention")
+    setattr(fake_attention_mod, "DeepseekV4Attention", FakeAttention)
+    fake_o_proj_mod = types.ModuleType("vllm.models.deepseek_v4.nvidia.ops.o_proj")
+    fake_flashmla_mod = types.ModuleType("vllm.models.deepseek_v4.nvidia.flashmla")
+    setattr(fake_flashmla_mod, "DeepseekV4FlashMLAAttention", FakeFlashMLA)
+    fake_flashinfer_mod = types.ModuleType(
+        "vllm.models.deepseek_v4.nvidia.flashinfer_sparse"
+    )
+    setattr(fake_flashinfer_mod, "DeepseekV4FlashInferMLAAttention", FakeFlashInfer)
+    for name, module in {
+        "vllm": types.ModuleType("vllm"),
+        "vllm.models": types.ModuleType("vllm.models"),
+        "vllm.models.deepseek_v4": types.ModuleType("vllm.models.deepseek_v4"),
+        "vllm.models.deepseek_v4.nvidia": types.ModuleType(
+            "vllm.models.deepseek_v4.nvidia"
+        ),
+        "vllm.models.deepseek_v4.nvidia.ops": types.ModuleType(
+            "vllm.models.deepseek_v4.nvidia.ops"
+        ),
+        "vllm.models.deepseek_v4.attention": fake_attention_mod,
+        "vllm.models.deepseek_v4.nvidia.ops.o_proj": fake_o_proj_mod,
+        "vllm.models.deepseek_v4.nvidia.flashmla": fake_flashmla_mod,
+        "vllm.models.deepseek_v4.nvidia.flashinfer_sparse": fake_flashinfer_mod,
+    }.items():
+        monkeypatch.setitem(sys.modules, name, module)
+    monkeypatch.setattr(patches, "_register_dsv4_inv_rope_lora_input_op", lambda: None)
+    monkeypatch.setattr(
+        patches, "_register_dsv4_lora_expand_fp32_output_op", lambda: None
+    )
+
+    def apply_compressor_lora(module, hidden, output):
+        calls.append((module.name, hidden, output))
+        return f"{output}_fp32_lora"
+
+    def apply_o_proj(o_proj_mod, o, positions, cos_sin_cache, *args, **kwargs):
+        o_proj_calls.append((o_proj_mod, o, positions))
+        assert cos_sin_cache == "cache"
+        return "o_proj_out"
+
+    monkeypatch.setattr(
+        patches,
+        "_apply_dsv4_compressor_lora_to_existing_output",
+        apply_compressor_lora,
+    )
+    monkeypatch.setattr(
+        patches,
+        "_dsv4_deep_gemm_fp8_o_proj_with_lora",
+        apply_o_proj,
+    )
+
+    patches.patch_dsv4_fast_path_lora()
+
+    qr_kv, kv_score, indexer_kv_score, indexer_weights = (
+        FakeAttention().attn_gemm_parallel_execute("hidden")
+    )
+
+    assert (qr_kv, kv_score, indexer_kv_score, indexer_weights) == (
+        "qr",
+        "kv_fp32_lora",
+        "indexer_kv_fp32_lora",
+        "weights",
+    )
+    assert calls == [
+        ("compressor", "hidden", "kv"),
+        ("indexer", "hidden", "indexer_kv"),
+    ]
+    assert FakeFlashMLA()._o_proj("o", "pos") == "o_proj_out"
+    assert FakeFlashInfer()._o_proj("o", "pos") == "o_proj_out"
+    assert o_proj_calls == [(fake_o_proj_mod, "o", "pos")] * 2
+
+
 def test_dsv4_compressor_helper_uses_punica_metadata_without_full_batch_lora(
     monkeypatch,
 ) -> None:

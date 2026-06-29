@@ -1265,6 +1265,166 @@ def _apply_dsv4_wo_a_lora_fast(
     return z
 
 
+def _patch_dsv4_compressor_fast_path_lora(attention_cls: Any) -> None:
+    if getattr(attention_cls, "_art_compressor_fast_path_lora_patched", False):
+        return
+
+    original_attn_gemm_parallel_execute = attention_cls.attn_gemm_parallel_execute
+
+    def attn_gemm_parallel_execute(self: Any, hidden_states: Any) -> tuple[Any, ...]:
+        qr_kv, kv_score, indexer_kv_score, indexer_weights = (
+            original_attn_gemm_parallel_execute(self, hidden_states)
+        )
+        if self.compressor is not None:
+            kv_score = _apply_dsv4_compressor_lora_to_existing_output(
+                self.compressor.fused_wkv_wgate,
+                hidden_states,
+                kv_score,
+            )
+        if self.indexer is not None:
+            indexer_kv_score = _apply_dsv4_compressor_lora_to_existing_output(
+                self.indexer.compressor.fused_wkv_wgate,
+                hidden_states,
+                indexer_kv_score,
+            )
+        return qr_kv, kv_score, indexer_kv_score, indexer_weights
+
+    attn_gemm_parallel_execute.__art_patched__ = True  # type: ignore[attr-defined]
+    attention_cls.attn_gemm_parallel_execute = attn_gemm_parallel_execute
+    attention_cls._art_compressor_fast_path_lora_patched = True
+
+
+def _dsv4_deep_gemm_fp8_o_proj_with_lora(
+    o_proj_mod: Any,
+    o: Any,
+    positions: Any,
+    cos_sin_cache: Any,
+    wo_a: Any,
+    wo_b: Any,
+    *,
+    n_groups: int,
+    heads_per_group: int,
+    nope_dim: int,
+    rope_dim: int,
+    o_lora_rank: int,
+    einsum_recipe: tuple[int, int, int],
+    tma_aligned_scales: bool,
+) -> Any:
+    wo_a_lora_input = None
+    if _is_active_lora_wrapped_linear(wo_a):
+        o_fp8, o_scale, wo_a_lora_input = (
+            _dsv4_fused_inv_rope_fp8_quant_with_lora_input(
+                o_proj_mod,
+                o,
+                positions,
+                cos_sin_cache,
+                n_groups=n_groups,
+                heads_per_group=heads_per_group,
+                lora_dtype=wo_a.lora_a_stacked[0].dtype,
+                nope_dim=nope_dim,
+                rope_dim=rope_dim,
+                tma_aligned_scales=tma_aligned_scales,
+            )
+        )
+    else:
+        o_fp8, o_scale = o_proj_mod.fused_inv_rope_fp8_quant(
+            o,
+            positions,
+            cos_sin_cache,
+            n_groups=n_groups,
+            heads_per_group=heads_per_group,
+            nope_dim=nope_dim,
+            rope_dim=rope_dim,
+            tma_aligned_scales=tma_aligned_scales,
+        )
+
+    z = o_proj_mod.torch.empty(
+        (o.shape[0], n_groups, o_lora_rank),
+        device=o.device,
+        dtype=o_proj_mod.torch.bfloat16,
+    )
+    o_proj_mod.fp8_einsum(
+        "bhr,hdr->bhd",
+        (o_fp8, o_scale),
+        (wo_a.weight, wo_a.weight_scale_inv),
+        z,
+        recipe=einsum_recipe,
+    )
+    if wo_a_lora_input is not None:
+        z = _apply_dsv4_wo_a_lora_fast(
+            wo_a,
+            z,
+            lora_input=wo_a_lora_input,
+            n_local_groups=n_groups,
+        )
+    return wo_b(z.flatten(1))
+
+
+def _patch_dsv4_cuda_o_proj_lora(attn_cls: Any, o_proj_mod: Any) -> None:
+    if getattr(attn_cls, "_art_wo_a_fast_path_lora_patched", False):
+        return
+
+    def _o_proj(self: Any, o: Any, positions: Any) -> Any:
+        return _dsv4_deep_gemm_fp8_o_proj_with_lora(
+            o_proj_mod,
+            o,
+            positions,
+            self.rotary_emb.cos_sin_cache,
+            self.wo_a,
+            self.wo_b,
+            n_groups=self.n_local_groups,
+            heads_per_group=self.n_local_heads // self.n_local_groups,
+            nope_dim=self.nope_head_dim,
+            rope_dim=self.rope_head_dim,
+            o_lora_rank=self.o_lora_rank,
+            einsum_recipe=self._einsum_recipe,
+            tma_aligned_scales=self._tma_aligned_scales,
+        )
+
+    _o_proj.__art_patched__ = True  # type: ignore[attr-defined]
+    attn_cls._o_proj = _o_proj
+    attn_cls._art_wo_a_fast_path_lora_patched = True
+
+
+def _patch_current_dsv4_fast_path_lora() -> bool:
+    try:
+        dsv4_attention = importlib.import_module("vllm.models.deepseek_v4.attention")
+    except ModuleNotFoundError:
+        return False
+
+    attention_cls = getattr(dsv4_attention, "DeepseekV4Attention", None)
+    if attention_cls is None:
+        return False
+
+    _patch_dsv4_compressor_fast_path_lora(attention_cls)
+
+    try:
+        o_proj_mod = importlib.import_module(
+            "vllm.models.deepseek_v4.nvidia.ops.o_proj"
+        )
+    except ModuleNotFoundError:
+        return True
+
+    for module_name, class_name in (
+        (
+            "vllm.models.deepseek_v4.nvidia.flashmla",
+            "DeepseekV4FlashMLAAttention",
+        ),
+        (
+            "vllm.models.deepseek_v4.nvidia.flashinfer_sparse",
+            "DeepseekV4FlashInferMLAAttention",
+        ),
+    ):
+        try:
+            module = importlib.import_module(module_name)
+        except ModuleNotFoundError:
+            continue
+        attn_cls = getattr(module, class_name, None)
+        if attn_cls is not None:
+            _patch_dsv4_cuda_o_proj_lora(attn_cls, o_proj_mod)
+    return True
+
+
 def patch_dsv4_fast_path_lora() -> None:
     """Apply LoRA deltas on DSV4 paths that read base weights directly.
 
@@ -1275,14 +1435,17 @@ def patch_dsv4_fast_path_lora() -> None:
     accepts and activates these adapter tensors while silently omitting their
     deltas from generation.
     """
+    _register_dsv4_inv_rope_lora_input_op()
+    _register_dsv4_lora_expand_fp32_output_op()
+    if _patch_current_dsv4_fast_path_lora():
+        return
+
     dsv4_attn = importlib.import_module(
         "vllm.model_executor.layers.deepseek_v4_attention"
     )
     wrapper_cls = getattr(dsv4_attn, "DeepseekV4MultiHeadLatentAttentionWrapper", None)
     if wrapper_cls is None:
         return
-    _register_dsv4_inv_rope_lora_input_op()
-    _register_dsv4_lora_expand_fp32_output_op()
     if getattr(wrapper_cls, "_art_fast_path_lora_patched", False):
         return
 
@@ -1426,9 +1589,17 @@ def patch_marlin_lora_swiglu_limit() -> None:
     directly, so W13 LoRA is skipped and W2 LoRA later misses ``cache2``. Route
     the callback through the same clamp op while preserving Marlin execution.
     """
+    try:
+        marlin_moe = importlib.import_module(
+            "vllm.model_executor.layers.fused_moe.fused_marlin_moe"
+        )
+    except ModuleNotFoundError:
+        return
+
     from vllm.model_executor.layers.fused_moe.activation import MoEActivation
-    from vllm.model_executor.layers.fused_moe.fused_marlin_moe import MarlinExperts
     from vllm.model_executor.layers.fused_moe.utils import swiglu_limit_func
+
+    MarlinExperts = marlin_moe.MarlinExperts
 
     original_apply = MarlinExperts.apply
     if getattr(original_apply, "__art_patched__", False):
@@ -1528,8 +1699,10 @@ def patch_routed_experts_prefix_cache_sidecar() -> None:
     if getattr(routed_experts_capturer, "_art_prefix_route_sidecar_patched", False):
         return
 
-    host_cls = routed_experts_capturer._RoutedExpertsHostCache
-    capturer_cls = routed_experts_capturer._RoutedExpertsCapturerReal
+    host_cls = getattr(routed_experts_capturer, "_RoutedExpertsHostCache", None)
+    capturer_cls = getattr(routed_experts_capturer, "_RoutedExpertsCapturerReal", None)
+    if host_cls is None or capturer_cls is None:
+        return
 
     original_host_init = host_cls.__init__
     original_get_or_grow_buffer = host_cls.get_or_grow_buffer
