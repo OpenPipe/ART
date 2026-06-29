@@ -102,6 +102,7 @@ def test_dsv4_runtime_stages_use_full_model_resources() -> None:
         assert engine_args["moe_backend"] == "triton_unfused"
         assert engine_args["disable_custom_all_reduce"] is True
         assert engine_args["enforce_eager"] is True
+        assert engine_args["kv_cache_dtype"] == "fp8"
         assert engine_args["compilation_config"] == {
             "cudagraph_mode": "NONE",
             "pass_config": {"fuse_allreduce_rms": False},
@@ -128,6 +129,7 @@ def test_dsv4_runtime_stages_use_full_model_resources() -> None:
     assert resources.merged_vllm_serving.vllm.engine_args()["moe_backend"] == (
         "triton_unfused"
     )
+    assert resources.merged_vllm_serving.vllm.engine_args()["kv_cache_dtype"] == "fp8"
     assert resources.native_vllm_lora is not None
     assert resources.native_vllm_lora.vllm is not None
     assert (
@@ -164,6 +166,7 @@ def test_dsv4_resources_remap_to_four_high_vram_gpus(monkeypatch) -> None:
     assert stage.vllm.tensor_parallel_size == 2
     assert stage.vllm.engine_args()["gpu_memory_utilization"] == 0.82
     assert stage.vllm.engine_args()["moe_backend"] == "triton_unfused"
+    assert stage.vllm.engine_args()["kv_cache_dtype"] == "fp8"
     assert stage.vllm.engine_args()["disable_custom_all_reduce"] is True
     assert stage.vllm.engine_args()["enforce_eager"] is True
     assert stage.vllm.engine_args()["compilation_config"] == {
