@@ -1130,6 +1130,7 @@ def test_run_correctness_sensitivity_stage_uses_dsv4_real_path_config(
     captured: dict[str, object] = {}
     oracle_module = SimpleNamespace(
         OracleCaseConfig=lambda **kwargs: SimpleNamespace(**kwargs),
+        MetricAnyThresholdRule=lambda **kwargs: SimpleNamespace(**kwargs),
         MetricThresholdRule=lambda **kwargs: SimpleNamespace(**kwargs),
         selected_suite_topologies=lambda *, is_moe, cp_supported=True: [
             SimpleNamespace(world_size=lambda: 1, slug=lambda: "tp1"),
@@ -1176,7 +1177,9 @@ def test_run_correctness_sensitivity_stage_uses_dsv4_real_path_config(
     assert getattr(case_config, "precision") == "bf16"
     assert suite_kwargs["use_fp32_lora_reference"] is False
     assert getattr(phase_pass_fns["forward"], "limits") == {"mean_abs_pct": 3.0}
-    assert getattr(phase_pass_fns["grads"], "limits") == {"mean_abs_pct": 5.0}
+    grad_rules = getattr(phase_pass_fns["grads"], "rules")
+    assert getattr(grad_rules[0], "limits") == {"mean_abs_pct": 5.0}
+    assert getattr(grad_rules[1], "limits") == {"mean_abs_diff": 1e-9}
     assert stage.metrics["precision"] == "bf16"
     assert stage.metrics["use_fp32_lora_reference"] is False
 

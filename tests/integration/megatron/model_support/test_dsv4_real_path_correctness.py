@@ -11,6 +11,7 @@ torch = pytest.importorskip("torch")
 
 from .oracle_harness import (  # noqa: E402
     LIVE_TRAINING_LOG_PATH,
+    MetricAnyThresholdRule,
     MetricThresholdRule,
     OracleCaseConfig,
     OracleObjective,
@@ -140,9 +141,17 @@ def _dsv4_bf16_phase_pass_fns() -> dict[str, PhasePassFn]:
         minimums=non_zero_scales,
     )
     loss = MetricThresholdRule(limits={"mean_abs_pct": 3.0})
-    grad = MetricThresholdRule(
-        limits={"mean_abs_pct": 5.0},
-        minimums=non_zero_scales,
+    grad = MetricAnyThresholdRule(
+        rules=(
+            MetricThresholdRule(
+                limits={"mean_abs_pct": 5.0},
+                minimums=non_zero_scales,
+            ),
+            MetricThresholdRule(
+                limits={"mean_abs_diff": 1e-9},
+                minimums=non_zero_scales,
+            ),
+        )
     )
     router_topk = MetricThresholdRule(
         limits={"topk_mismatch_fraction": 0.0, "top1_mismatch_fraction": 0.0}

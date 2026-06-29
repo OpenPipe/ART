@@ -18,6 +18,7 @@ from .oracle_harness import (
     TEST_DEFAULT_FLEX_BACKEND,
     TOPOLOGIES,
     DiffAccumulator,
+    MetricAnyThresholdRule,
     MetricRow,
     MetricThresholdRule,
     PackedTensorConfig,
@@ -627,6 +628,23 @@ def test_default_phase_rules_use_default_mean_abs_pct_limit() -> None:
     assert not phase_pass["grads"](failing_summary)
     assert not phase_pass["deltas"](failing_summary)
     assert not phase_pass["losses"](failing_summary)
+
+
+def test_metric_any_threshold_rule_accepts_one_threshold_alternative() -> None:
+    rule = MetricAnyThresholdRule(
+        rules=(
+            MetricThresholdRule(limits={"mean_abs_pct": 5.0}),
+            MetricThresholdRule(limits={"mean_abs_diff": 1e-9}),
+        )
+    )
+
+    assert rule({"mean_abs_pct": 50.0, "mean_abs_diff": 5e-10})
+    assert rule({"mean_abs_pct": 4.0, "mean_abs_diff": 1e-6})
+    assert not rule({"mean_abs_pct": 50.0, "mean_abs_diff": 1e-6})
+    assert (
+        "all threshold alternatives failed"
+        in rule.failure_reasons({"mean_abs_pct": 50.0, "mean_abs_diff": 1e-6})[0]
+    )
 
 
 def test_router_score_rule_uses_tight_dedicated_limit() -> None:
