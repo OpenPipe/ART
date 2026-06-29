@@ -357,7 +357,6 @@ def run_hf_parity_stage(
         allow_unvalidated_arch=allow_unvalidated_arch,
     )
     handler = get_model_support_handler_for_spec(spec)
-    cp_supported = bool(handler.cp_supported)
     case_config = oracle_harness.OracleCaseConfig(
         base_model=base_model,
         is_moe=handler.is_moe,
@@ -404,7 +403,6 @@ def run_lora_coverage_stage(
         allow_unvalidated_arch=allow_unvalidated_arch,
     )
     handler = get_model_support_handler_for_spec(spec)
-    cp_supported = bool(handler.cp_supported)
     case_config = oracle_harness.OracleCaseConfig(
         base_model=base_model,
         is_moe=handler.is_moe,
@@ -459,10 +457,13 @@ def run_correctness_sensitivity_stage(
     )
     handler = get_model_support_handler_for_spec(spec)
     cp_supported = bool(handler.cp_supported)
+    correctness_precision = handler.correctness_precision()
+    correctness_use_fp32_lora_reference = handler.correctness_use_fp32_lora_reference()
+    correctness_phase_pass_fns = handler.correctness_phase_pass_fns(oracle_harness)
     case_config = oracle_harness.OracleCaseConfig(
         base_model=base_model,
         is_moe=handler.is_moe,
-        precision="fp32",
+        precision=correctness_precision,
         num_layers=max(1, architecture.recommended_min_layers),
         num_steps=1,
         allow_unvalidated_arch=allow_unvalidated_arch,
@@ -537,6 +538,8 @@ def run_correctness_sensitivity_stage(
                 case_config=case_config,
                 max_world_size=max_world_size,
                 cp_supported=cp_supported,
+                phase_pass_fns=correctness_phase_pass_fns,
+                use_fp32_lora_reference=correctness_use_fp32_lora_reference,
             )
         sensitivity_reports = []
         if skip_sensitivity:
@@ -570,6 +573,8 @@ def run_correctness_sensitivity_stage(
         passed=True,
         metrics={
             "requested_num_layers": case_config.num_layers,
+            "precision": correctness_precision,
+            "use_fp32_lora_reference": correctness_use_fp32_lora_reference,
             "is_moe": handler.is_moe,
             "cp_supported": cp_supported,
             "allow_unvalidated_arch": allow_unvalidated_arch,

@@ -1,4 +1,4 @@
-from typing import Any, Sequence
+from typing import Any, Literal, Sequence
 
 import torch
 
@@ -99,6 +99,16 @@ class DefaultDenseHandler:
 
     def install_preprocess_patch(self, model_chunks: Sequence[Any]) -> None:
         del model_chunks
+        return None
+
+    def correctness_precision(self) -> Literal["bf16", "fp32"]:
+        return "fp32"
+
+    def correctness_use_fp32_lora_reference(self) -> bool:
+        return True
+
+    def correctness_phase_pass_fns(self, oracle_harness: Any) -> dict[str, Any] | None:
+        del oracle_harness
         return None
 
     def to_vllm_lora_tensors(

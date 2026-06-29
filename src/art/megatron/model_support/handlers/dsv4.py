@@ -3,7 +3,7 @@ from __future__ import annotations
 import hashlib
 import os
 import re
-from typing import Any, Sequence, cast
+from typing import Any, Literal, Sequence, cast
 
 import torch
 
@@ -103,6 +103,36 @@ class Dsv4Handler(DefaultMoeHandler):
         if has_configured_chat_template(internal_config):
             return tokenizer
         return get_dsv4_tokenizer(tokenizer)
+
+    def correctness_precision(self) -> Literal["bf16", "fp32"]:
+        return "bf16"
+
+    def correctness_use_fp32_lora_reference(self) -> bool:
+        return False
+
+    def correctness_phase_pass_fns(self, oracle_harness: Any) -> dict[str, Any]:
+        non_zero_scales = {"typical_abs_scale": 0.0, "candidate_abs_scale": 0.0}
+        fwd = oracle_harness.MetricThresholdRule(
+            limits={"mean_abs_pct": 3.0},
+            minimums=non_zero_scales,
+        )
+        loss = oracle_harness.MetricThresholdRule(limits={"mean_abs_pct": 3.0})
+        grad = oracle_harness.MetricThresholdRule(
+            limits={"mean_abs_pct": 5.0},
+            minimums=non_zero_scales,
+        )
+        router_topk = oracle_harness.MetricThresholdRule(
+            limits={"topk_mismatch_fraction": 0.0, "top1_mismatch_fraction": 0.0}
+        )
+        return {
+            "forward": fwd,
+            "outputs": fwd,
+            "losses": loss,
+            "grads": grad,
+            "deltas": grad,
+            "router_scores": fwd,
+            "router_topk_ids": router_topk,
+        }
 
     def identity_lora_target_parameters(
         self,

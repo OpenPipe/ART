@@ -709,7 +709,7 @@ def test_run_correctness_sensitivity_stage_runs_dense_models(monkeypatch) -> Non
             world_size=lambda: 2
         ),
         available_gpu_count=lambda: 4,
-        run_suite=lambda case_config, max_world_size, cp_supported=True: (
+        run_suite=lambda case_config, max_world_size, cp_supported=True, **kwargs: (
             case_configs.append(case_config)
             or [
                 SimpleNamespace(
@@ -1070,7 +1070,7 @@ def test_run_correctness_sensitivity_stage_summarizes_reports(monkeypatch) -> No
             world_size=lambda: 2
         ),
         available_gpu_count=lambda: 2,
-        run_suite=lambda case_config, max_world_size, cp_supported=True: [
+        run_suite=lambda case_config, max_world_size, cp_supported=True, **kwargs: [
             SimpleNamespace(
                 variant="sft_topology_tp2",
                 topology="tp2",
@@ -1117,6 +1117,70 @@ def test_run_correctness_sensitivity_stage_summarizes_reports(monkeypatch) -> No
     assert stage.artifact_dir == "/tmp/oracle"
 
 
+def test_run_correctness_sensitivity_stage_uses_dsv4_real_path_config(
+    monkeypatch,
+) -> None:
+    architecture = ArchitectureReport(
+        base_model="deepseek-ai/DeepSeek-V4-Flash",
+        model_key="dsv4",
+        handler_key="dsv4",
+        layer_families=[LayerFamilyInstance(key="dsv4_attention", layer_index=0)],
+        recommended_min_layers=4,
+    )
+    captured: dict[str, object] = {}
+    oracle_module = SimpleNamespace(
+        OracleCaseConfig=lambda **kwargs: SimpleNamespace(**kwargs),
+        MetricThresholdRule=lambda **kwargs: SimpleNamespace(**kwargs),
+        selected_suite_topologies=lambda *, is_moe, cp_supported=True: [
+            SimpleNamespace(world_size=lambda: 1, slug=lambda: "tp1"),
+            SimpleNamespace(world_size=lambda: 2, slug=lambda: "tp2"),
+        ],
+        oracle_topology=lambda *, is_moe: SimpleNamespace(world_size=lambda: 1),
+        selected_oracle_objectives=lambda: ["rl"],
+        supported_sensitivity_mutations_for_objective=lambda objective, *, is_moe: [],
+        sensitivity_topology_for_mutation=lambda mutation, *, is_moe: SimpleNamespace(
+            world_size=lambda: 2
+        ),
+        available_gpu_count=lambda: 2,
+        run_suite=lambda case_config, **kwargs: (
+            captured.update(case_config=case_config, suite_kwargs=kwargs)
+            or [
+                SimpleNamespace(
+                    variant="rl_topology_tp2",
+                    topology="tp2",
+                    signal="pass",
+                    fail_count=0,
+                )
+            ]
+        ),
+        run_sensitivity_suite=lambda case_config, mutations, max_world_size: [],
+        ensure_case_artifacts=lambda case_config: SimpleNamespace(
+            case_dir="/tmp/oracle"
+        ),
+        keep_topology_artifacts=lambda: False,
+    )
+    monkeypatch.setattr(
+        "tests.integration.megatron.model_support.workflow._import_integration_module",
+        lambda name: oracle_module,
+    )
+    monkeypatch.setenv(SKIP_SENSITIVITY_ENV, "1")
+
+    stage = run_correctness_sensitivity_stage(
+        base_model="deepseek-ai/DeepSeek-V4-Flash",
+        architecture=architecture,
+    )
+
+    case_config = captured["case_config"]
+    suite_kwargs = cast(dict[str, object], captured["suite_kwargs"])
+    phase_pass_fns = cast(dict[str, object], suite_kwargs["phase_pass_fns"])
+    assert getattr(case_config, "precision") == "bf16"
+    assert suite_kwargs["use_fp32_lora_reference"] is False
+    assert getattr(phase_pass_fns["forward"], "limits") == {"mean_abs_pct": 3.0}
+    assert getattr(phase_pass_fns["grads"], "limits") == {"mean_abs_pct": 5.0}
+    assert stage.metrics["precision"] == "bf16"
+    assert stage.metrics["use_fp32_lora_reference"] is False
+
+
 def test_run_correctness_sensitivity_stage_can_skip_sensitivity_only(
     monkeypatch,
 ) -> None:
@@ -1142,7 +1206,7 @@ def test_run_correctness_sensitivity_stage_can_skip_sensitivity_only(
             world_size=lambda: 4
         ),
         available_gpu_count=lambda: 2,
-        run_suite=lambda case_config, max_world_size, cp_supported=True: [
+        run_suite=lambda case_config, max_world_size, cp_supported=True, **kwargs: [
             SimpleNamespace(
                 variant="sft_topology_tp2",
                 topology="tp2",

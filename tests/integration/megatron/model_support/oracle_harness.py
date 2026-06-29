@@ -2160,9 +2160,10 @@ def _suite_variants(
     cp_supported: bool = True,
     max_world_size: int | None = None,
     variant_flex_backend: FlexBackend | None = None,
+    phase_pass_fns: dict[str, PhasePassFn] | None = None,
 ) -> list[VariantSpec]:
     """Builds the standard oracle suite variant ordering."""
-    phase_pass = _default_phase_pass_fns()
+    phase_pass = phase_pass_fns or _default_phase_pass_fns()
     variants: list[VariantSpec] = []
     for topology in selected_suite_topologies(
         is_moe=is_moe,
@@ -2189,6 +2190,8 @@ def run_suite(
     oracle_flex_backend: FlexBackend | None = None,
     variant_flex_backend: FlexBackend | None = None,
     cp_supported: bool = True,
+    phase_pass_fns: dict[str, PhasePassFn] | None = None,
+    use_fp32_lora_reference: bool = True,
 ) -> list[VariantReport]:
     """Runs non-oracle topologies against the canonical replay-backed oracle."""
     reports: list[VariantReport] = []
@@ -2198,6 +2201,7 @@ def run_suite(
             case_config=case_config,
             oracle_flex_backend=oracle_flex_backend,
             variant_flex_backend=variant_flex_backend,
+            use_fp32_lora_reference=use_fp32_lora_reference,
         )
         reports.extend(
             runner.run_suite(
@@ -2207,6 +2211,7 @@ def run_suite(
                     cp_supported=cp_supported,
                     max_world_size=max_world_size,
                     variant_flex_backend=variant_flex_backend,
+                    phase_pass_fns=phase_pass_fns,
                 )
             )
         )
