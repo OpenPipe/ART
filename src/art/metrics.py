@@ -73,7 +73,9 @@ PIPELINE_RL_METRIC_DEFINITIONS: tuple[MetricDefinition, ...] = (
     MetricDefinition(
         key="sample_efficiency/freshness_discount",
         title="Freshness discount",
-        description="1 / (1 + (token-weighted mean policy age in train steps) / 4)",
+        description=(
+            "1 / token-weighted mean(exp(policy token age in train steps / 8))"
+        ),
         kind="ratio",
         higher_is_better=True,
         score_component=True,

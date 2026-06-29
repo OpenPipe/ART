@@ -1,5 +1,6 @@
 import asyncio
 import json
+import math
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
@@ -61,11 +62,14 @@ def test_pipeline_trainer_score_uses_start_policy_age_and_tau(tmp_path: Path) ->
     )
 
     assert metrics["offpolicy/token_weighted_policy_age_steps"] == 2.0
+    assert metrics["offpolicy/token_weighted_policy_age_exp_tau8"] == pytest.approx(
+        math.exp(2.0 / 8.0)
+    )
     assert metrics["sample_efficiency/freshness_discount"] == pytest.approx(
-        1.0 / (1.0 + 2.0 / 4.0)
+        math.exp(-2.0 / 8.0)
     )
     assert metrics["objective/score_default"] == pytest.approx(
-        50.0 * (1.0 / (1.0 + 2.0 / 4.0))
+        50.0 * math.exp(-2.0 / 8.0)
     )
 
 

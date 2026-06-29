@@ -48,7 +48,7 @@ PIPELINE_STATE_KEY = "_pipeline_trainer"
 _ROLLOUT_WALL_TIME_KEY = "_art_rollout_wall_s"
 _ACTOR_IDLE_TIME_KEY = "_art_actor_idle_s"
 _QUEUE_WAIT_TIME_KEY = "_art_queue_wait_s"
-_SCORE_FRESHNESS_TAU_STEPS = 4.0
+_SCORE_FRESHNESS_TAU_STEPS = 8.0
 # Rollout critical batch size from the best current GRPO/RLVR evidence. This is
 # grounded in reported experiments, not a well-validated universal constant.
 _SCORE_CRITICAL_ROLLOUT_BATCH_SIZE = 300.0
@@ -86,6 +86,13 @@ def _weighted_percentile(points: list[tuple[float, float]], percentile: float) -
         if running >= target:
             return value
     return ordered[-1][0]
+
+
+def _policy_age_exp(age: float) -> float:
+    exponent = max(age, 0.0) / _SCORE_FRESHNESS_TAU_STEPS
+    if exponent >= 700.0:
+        return math.inf
+    return math.exp(exponent)
 
 
 def make_group_rollout_fn(
@@ -1247,7 +1254,7 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
             stats = self._trajectory_policy_age_stats(current_step, trajectory)
             if stats is None:
                 continue
-            age_sum, weight = stats
+            age_sum, weight, _age_exp_sum = stats
             weighted_age_sum += age_sum
             weight_sum += weight
         if weight_sum <= 0:
@@ -1289,9 +1296,10 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
         age_metrics = self._batch_policy_age_metrics(current_step, batch)
         metrics.update(age_metrics)
         mean_age = age_metrics.get("offpolicy/token_weighted_policy_age_steps")
-        if mean_age is None:
+        age_exp_moment = age_metrics.get("offpolicy/token_weighted_policy_age_exp_tau8")
+        if mean_age is None or age_exp_moment is None:
             return metrics
-        freshness = 1.0 / (1.0 + max(float(mean_age), 0.0) / _SCORE_FRESHNESS_TAU_STEPS)
+        freshness = 1.0 / max(float(age_exp_moment), 1e-12)
         metrics["sample_efficiency/freshness_discount"] = freshness
         metrics["sample_efficiency/age_discount"] = freshness
 
@@ -1356,17 +1364,19 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
         weighted_ages: list[tuple[float, float]] = []
         unweighted_ages: list[float] = []
         age_sum = 0.0
+        age_exp_sum = 0.0
         weight_sum = 0.0
         for group in batch:
             for trajectory in group.trajectories:
                 stats = self._trajectory_policy_age_stats(current_step, trajectory)
                 if stats is None:
                     continue
-                trajectory_age_sum, weight = stats
+                trajectory_age_sum, weight, trajectory_age_exp_sum = stats
                 if weight <= 0:
                     continue
                 age = trajectory_age_sum / weight
                 age_sum += trajectory_age_sum
+                age_exp_sum += trajectory_age_exp_sum
                 weight_sum += weight
                 weighted_ages.append((age, weight))
                 unweighted_ages.append(age)
@@ -1374,6 +1384,7 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
             return {}
         return {
             "offpolicy/token_weighted_policy_age_steps": age_sum / weight_sum,
+            "offpolicy/token_weighted_policy_age_exp_tau8": age_exp_sum / weight_sum,
             "offpolicy/mean_policy_age_steps": age_sum / weight_sum,
             "offpolicy/unweighted_mean_policy_age_steps": sum(unweighted_ages)
             / len(unweighted_ages),
@@ -1384,7 +1395,7 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
 
     def _trajectory_policy_age_stats(
         self, current_step: int, trajectory: art.Trajectory
-    ) -> tuple[float, float] | None:
+    ) -> tuple[float, float, float] | None:
         span_stats = self._trajectory_policy_span_age_stats(current_step, trajectory)
         if span_stats is not None:
             return span_stats
@@ -1392,12 +1403,13 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
             return None
         weight = self._trajectory_completion_weight(trajectory)
         age = float(current_step - trajectory.initial_policy_version)
-        return age * weight, weight
+        return age * weight, weight, _policy_age_exp(age) * weight
 
     def _trajectory_policy_span_age_stats(
         self, current_step: int, trajectory: art.Trajectory
-    ) -> tuple[float, float] | None:
+    ) -> tuple[float, float, float] | None:
         age_sum = 0.0
+        age_exp_sum = 0.0
         weight_sum = 0.0
         for item in self._trajectory_messages_and_choices(trajectory):
             extra = getattr(item, "model_extra", None)
@@ -1416,11 +1428,13 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
                     continue
                 if weight <= 0:
                     continue
-                age_sum += float(current_step - policy_version) * weight
+                age = float(current_step - policy_version)
+                age_sum += age * weight
+                age_exp_sum += _policy_age_exp(age) * weight
                 weight_sum += float(weight)
         if weight_sum <= 0:
             return None
-        return age_sum, weight_sum
+        return age_sum, weight_sum, age_exp_sum
 
     @staticmethod
     def _trajectory_messages_and_choices(trajectory: art.Trajectory) -> Iterable[Any]:
