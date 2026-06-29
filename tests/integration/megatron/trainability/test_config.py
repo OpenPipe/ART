@@ -16,9 +16,9 @@ from .test_live_length_trainability import (
     _max_tokens_for_completion,
     _messages,
     _scenario,
-    _scenario_budget,
     _scenario_for_training_step,
     _scenario_limit,
+    _zero_variance_discard_multiplier,
 )
 from .yes_no_trainability import (
     _build_internal_config,
@@ -228,10 +228,26 @@ def test_length_trainability_default_max_steps_is_twenty(monkeypatch) -> None:
     assert _length_max_steps() == 20
 
 
-def test_length_trainability_scenario_budget_is_step_bounded() -> None:
-    assert _scenario_budget(max_steps=20, scenario_limit=None) == 20
-    assert _scenario_budget(max_steps=20, scenario_limit=7) == 7
-    assert _scenario_budget(max_steps=20, scenario_limit=100) == 20
+def test_length_trainability_zero_variance_discard_limit_tracks_steps(
+    monkeypatch,
+) -> None:
+    monkeypatch.delenv(
+        "ART_MODEL_SUPPORT_LENGTH_ZERO_VARIANCE_DISCARD_MULTIPLIER",
+        raising=False,
+    )
+
+    assert _zero_variance_discard_multiplier(20) == 20
+
+
+def test_length_trainability_zero_variance_discard_limit_uses_env(
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv(
+        "ART_MODEL_SUPPORT_LENGTH_ZERO_VARIANCE_DISCARD_MULTIPLIER",
+        "7",
+    )
+
+    assert _zero_variance_discard_multiplier(20) == 7
 
 
 def test_length_trainability_varies_max_tokens_per_completion() -> None:

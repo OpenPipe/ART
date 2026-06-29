@@ -378,10 +378,11 @@ def _length_max_steps() -> int:
     )
 
 
-def _scenario_budget(*, max_steps: int, scenario_limit: int | None) -> int:
-    if scenario_limit is None:
-        return max_steps
-    return min(max_steps, scenario_limit)
+def _zero_variance_discard_multiplier(max_steps: int) -> int:
+    return _get_env_int(
+        "ART_MODEL_SUPPORT_LENGTH_ZERO_VARIANCE_DISCARD_MULTIPLIER",
+        max_steps,
+    )
 
 
 def _generated_token_count(choice: object) -> int:
@@ -619,10 +620,7 @@ async def run_length_trainability_async(
         max(1, max_steps_off_policy + 1),
     )
     scenario_limit = _scenario_limit()
-    scenario_budget = _scenario_budget(
-        max_steps=max_steps,
-        scenario_limit=scenario_limit,
-    )
+    zero_variance_discard_multiplier = _zero_variance_discard_multiplier(max_steps)
     success_hit = False
     samples: list[LengthSampleReport] = []
     backend_root = artifact_dir / "megatron_dedicated_workspace"
@@ -660,7 +658,9 @@ async def run_length_trainability_async(
 
         async def scenarios() -> AsyncIterator[dict[str, object]]:
             index = 0
-            while not success_hit and index < scenario_budget:
+            while not success_hit and (
+                scenario_limit is None or index < scenario_limit
+            ):
                 yield _scenario(
                     index,
                     target_step=0,
@@ -723,9 +723,9 @@ async def run_length_trainability_async(
             eval_every_n_steps=0,
             eval_at_start=False,
             save_checkpoint=False,
-            total_scenarios=scenario_budget,
+            total_scenarios=scenario_limit,
             log_interval_seconds=30.0,
-            discard_queue_multiplier=1000,
+            discard_queue_multiplier=zero_variance_discard_multiplier,
             resume=False,
         )
         await trainer.train(handle_signals=False)
