@@ -107,13 +107,11 @@ def create_shared_prefix_state(
         cp_size=cp_size,
         cp_group=cp_group,
     )
-    state_group_ids = group_ids if target_device is None else group_ids_cpu
-    state_parent_ids = parent_ids if target_device is None else parent_ids_cpu
     return SharedPrefixAttentionState(
         block_mask=block_mask,
         sliding_block_masks=sliding_block_masks,
-        group_ids=state_group_ids,
-        parent_ids=state_parent_ids,
+        group_ids=group_ids_cpu,
+        parent_ids=parent_ids_cpu,
         dsv4_compression_layouts=_build_dsv4_compression_layouts_once(
             position_ids=dsv4_position_ids
             if dsv4_position_ids is not None
