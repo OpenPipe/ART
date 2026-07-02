@@ -133,11 +133,7 @@ def _native_gdn_cp_packed_layer_worker(
             device=group_ids.device,
             cp_rank=rank,
             cp_size=cp_size,
-            planner_config=GdnPlannerConfig(
-                cp_chain_min_tokens_per_rank=16,
-                cp_chain_min_total_tokens=128,
-                cp_chain_min_prefix_only_tokens=128,
-            ),
+            planner_config=GdnPlannerConfig(),
         )
         assert any(plan.tree_chain_buckets_by_depth)
         hidden, output_grad = _packed_hidden_and_grad(case, cp_size)

@@ -751,20 +751,12 @@ def _tree_chain_pack():
 
 def _tree_chain_planner_config() -> GdnPlannerConfig:
     return GdnPlannerConfig(
-        cp_chain_min_tokens_per_rank=16,
-        cp_chain_min_total_tokens=128,
-        cp_chain_min_prefix_only_tokens=128,
         max_padding_ratio=4.0,
     )
 
 
 def _tree_fuzz_planner_config() -> GdnPlannerConfig:
     return GdnPlannerConfig(
-        cp_chain_min_tokens_per_rank=1,
-        cp_chain_min_total_tokens=64,
-        cp_chain_min_prefix_only_tokens=64,
-        cp_tree_chain_min_total_tokens=64,
-        cp_tree_chain_min_prefix_only_tokens=64,
         max_padding_ratio=4.0,
     )
 
@@ -840,11 +832,7 @@ def _packed_correctness_cases() -> tuple[GdnPhase0Case, ...]:
 def _planner_config_for_case(case: GdnPhase0Case) -> GdnPlannerConfig | None:
     if case.name != "mixed_local_chain_edge":
         return None
-    return GdnPlannerConfig(
-        cp_chain_min_tokens_per_rank=16,
-        cp_chain_min_total_tokens=128,
-        cp_chain_min_prefix_only_tokens=128,
-    )
+    return GdnPlannerConfig(max_padding_ratio=4.0)
 
 
 def _mixed_local_chain_case() -> GdnPhase0Case:

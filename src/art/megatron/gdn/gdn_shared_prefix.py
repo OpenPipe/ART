@@ -112,11 +112,6 @@ class GdnPlannerConfig:
 
     max_padding_ratio: float = 2.0
     max_segments_per_batch: int = 4096
-    cp_chain_min_tokens_per_rank: int = 32
-    cp_chain_min_total_tokens: int = 32768
-    cp_chain_min_prefix_only_tokens: int = 32768
-    cp_tree_chain_min_total_tokens: int = 8192
-    cp_tree_chain_min_prefix_only_tokens: int = 8192
     rank_idle_token_cost: float = 1.0
     max_zero_exchange_load_imbalance: float = 1.5
     planner_local_token_ms: float = 0.00065
@@ -312,7 +307,6 @@ def _build_tree_rank_execution_plan(
         and _can_chain_tree_segment(
             segment,
             cp_size=cp_size,
-            planner_config=planner_config,
         )
         for segment in spec.tree_segments
     ]
@@ -633,25 +627,8 @@ def _can_chain_tree_segment(
     segment: GdnSegmentSpec,
     *,
     cp_size: int,
-    planner_config: GdnPlannerConfig,
 ) -> bool:
-    min_total_tokens = (
-        min(
-            planner_config.cp_tree_chain_min_prefix_only_tokens,
-            planner_config.cp_chain_min_prefix_only_tokens,
-        )
-        if segment.kind == "prefix"
-        else min(
-            planner_config.cp_tree_chain_min_total_tokens,
-            planner_config.cp_chain_min_total_tokens,
-        )
-    )
-    return (
-        segment.length >= min_total_tokens
-        and segment.length >= cp_size
-        and segment.length // FLA_CHUNK_SIZE >= cp_size
-        and segment.length / cp_size >= planner_config.cp_chain_min_tokens_per_rank
-    )
+    return segment.length >= cp_size and segment.length // FLA_CHUNK_SIZE >= cp_size
 
 
 def _best_segment_owner(
@@ -935,7 +912,8 @@ def _default_attention_layout_ranges(
         ):
             return False
         return _can_chain_tree_segment(
-            segment, cp_size=cp_size, planner_config=planner_config
+            segment,
+            cp_size=cp_size,
         )
 
     for segment in spec.tree_segments:

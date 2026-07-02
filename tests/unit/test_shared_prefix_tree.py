@@ -310,11 +310,6 @@ def test_gdn_tree_cp_randomized_plans_pass_health_checks() -> None:
     )
 
     config = GdnPlannerConfig(
-        cp_chain_min_tokens_per_rank=1,
-        cp_chain_min_total_tokens=64,
-        cp_chain_min_prefix_only_tokens=64,
-        cp_tree_chain_min_total_tokens=64,
-        cp_tree_chain_min_prefix_only_tokens=64,
         max_padding_ratio=4.0,
     )
     for seed in range(16):
@@ -346,9 +341,6 @@ def _chain_every_legal_segment_config():
     from art.megatron.gdn.gdn_shared_prefix import GdnPlannerConfig
 
     return GdnPlannerConfig(
-        cp_chain_min_tokens_per_rank=1,
-        cp_chain_min_total_tokens=1,
-        cp_chain_min_prefix_only_tokens=1,
         max_padding_ratio=4.0,
     )
 
