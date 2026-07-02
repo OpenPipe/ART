@@ -420,7 +420,6 @@ def install_moe_routing_trace_hooks(
 ) -> None:
     global _CONTROLLER_GETTER
     _CONTROLLER_GETTER = controller_getter
-    _install_router_output_trace_hooks(_active_controller())
     try:
         from megatron.core.transformer.moe.experts import TEGroupedMLP
         from megatron.core.transformer.moe.token_dispatcher import (
