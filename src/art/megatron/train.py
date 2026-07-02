@@ -1584,7 +1584,6 @@ def run_training_step(
     if cp_lookahead_state is not None:
         cp_lookahead_state.pending_prepared_micro = pending_prepared_micro
 
-    torch.cuda.empty_cache()
     token_count = _local_trainable_token_count_tensor(
         loss_inputs_for_count,
         device=device,
