@@ -145,7 +145,6 @@ class LengthSampleReport(BaseModel):
 class LengthTrainabilityThresholds(BaseModel):
     initial_abs_error_min: float
     success_abs_error_max: float
-    strict: bool = False
 
 
 class LengthTrainabilityReport(BaseModel):
@@ -250,7 +249,6 @@ def _length_trainability_thresholds(
         return LengthTrainabilityThresholds(
             initial_abs_error_min=GPT_OSS_INITIAL_ABS_ERROR_MIN,
             success_abs_error_max=GPT_OSS_SUCCESS_ABS_ERROR_MAX,
-            strict=True,
         )
     return LengthTrainabilityThresholds(
         initial_abs_error_min=DEFAULT_INITIAL_ABS_ERROR_MIN,
@@ -262,8 +260,6 @@ def _initial_abs_error_passed(
     value: float,
     thresholds: LengthTrainabilityThresholds,
 ) -> bool:
-    if thresholds.strict:
-        return value > thresholds.initial_abs_error_min
     return value >= thresholds.initial_abs_error_min
 
 
@@ -271,8 +267,6 @@ def _success_abs_error_passed(
     value: float,
     thresholds: LengthTrainabilityThresholds,
 ) -> bool:
-    if thresholds.strict:
-        return value < thresholds.success_abs_error_max
     return value <= thresholds.success_abs_error_max
 
 

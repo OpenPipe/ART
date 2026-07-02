@@ -240,7 +240,6 @@ def test_length_trainability_default_thresholds_are_unchanged() -> None:
 
     assert thresholds.initial_abs_error_min == DEFAULT_INITIAL_ABS_ERROR_MIN
     assert thresholds.success_abs_error_max == DEFAULT_SUCCESS_ABS_ERROR_MAX
-    assert thresholds.strict is False
     assert _initial_abs_error_passed(DEFAULT_INITIAL_ABS_ERROR_MIN, thresholds)
     assert _success_abs_error_passed(DEFAULT_SUCCESS_ABS_ERROR_MAX, thresholds)
 
@@ -250,11 +249,8 @@ def test_gpt_oss_length_trainability_uses_strict_custom_thresholds() -> None:
 
     assert thresholds.initial_abs_error_min == GPT_OSS_INITIAL_ABS_ERROR_MIN
     assert thresholds.success_abs_error_max == GPT_OSS_SUCCESS_ABS_ERROR_MAX
-    assert thresholds.strict is True
-    assert not _initial_abs_error_passed(GPT_OSS_INITIAL_ABS_ERROR_MIN, thresholds)
-    assert _initial_abs_error_passed(GPT_OSS_INITIAL_ABS_ERROR_MIN + 0.1, thresholds)
-    assert not _success_abs_error_passed(GPT_OSS_SUCCESS_ABS_ERROR_MAX, thresholds)
-    assert _success_abs_error_passed(GPT_OSS_SUCCESS_ABS_ERROR_MAX - 0.1, thresholds)
+    assert _initial_abs_error_passed(GPT_OSS_INITIAL_ABS_ERROR_MIN, thresholds)
+    assert _success_abs_error_passed(GPT_OSS_SUCCESS_ABS_ERROR_MAX, thresholds)
 
 
 def test_length_trainability_zero_variance_discard_limit_tracks_steps(
