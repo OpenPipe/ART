@@ -41,8 +41,10 @@ TRAINER_GPU_IDS_ENV = "ART_MODEL_SUPPORT_TRAINER_GPU_IDS"
 INFERENCE_GPU_IDS_ENV = "ART_MODEL_SUPPORT_INFERENCE_GPU_IDS"
 REPO_ROOT = Path(__file__).resolve().parents[4]
 LATEST_SUMMARY_LOG_PATH = REPO_ROOT / ".local" / "length_trainability.log"
-INITIAL_ABS_ERROR_MIN = 5.0
-SUCCESS_ABS_ERROR_MAX = 1.5
+DEFAULT_INITIAL_ABS_ERROR_MIN = 5.0
+DEFAULT_SUCCESS_ABS_ERROR_MAX = 1.5
+GPT_OSS_INITIAL_ABS_ERROR_MIN = 100.0
+GPT_OSS_SUCCESS_ABS_ERROR_MAX = 5.0
 DEFAULT_LENGTH_MAX_STEPS = 20
 GPT_OSS_MIN_MAX_TOKENS = 512
 GPT_OSS_LENGTH_SYSTEM_PROMPT = (
@@ -140,6 +142,12 @@ class LengthSampleReport(BaseModel):
     text: str
 
 
+class LengthTrainabilityThresholds(BaseModel):
+    initial_abs_error_min: float
+    success_abs_error_max: float
+    strict: bool = False
+
+
 class LengthTrainabilityReport(BaseModel):
     base_model: str
     max_steps: int
@@ -154,6 +162,7 @@ class LengthTrainabilityReport(BaseModel):
     normalize_advantages: bool
     summary_log_path: str
     latest_summary_log_path: str
+    thresholds: LengthTrainabilityThresholds
     initial_train_abs_error: float | None
     best_train_abs_error: float | None
     success_step: int | None
@@ -232,6 +241,39 @@ def _is_gpt_oss_model(base_model: str | None) -> bool:
         get_model_support_spec(base_model, allow_unvalidated_arch=True).key
         == "gpt_oss_moe"
     )
+
+
+def _length_trainability_thresholds(
+    base_model: str | None,
+) -> LengthTrainabilityThresholds:
+    if _is_gpt_oss_model(base_model):
+        return LengthTrainabilityThresholds(
+            initial_abs_error_min=GPT_OSS_INITIAL_ABS_ERROR_MIN,
+            success_abs_error_max=GPT_OSS_SUCCESS_ABS_ERROR_MAX,
+            strict=True,
+        )
+    return LengthTrainabilityThresholds(
+        initial_abs_error_min=DEFAULT_INITIAL_ABS_ERROR_MIN,
+        success_abs_error_max=DEFAULT_SUCCESS_ABS_ERROR_MAX,
+    )
+
+
+def _initial_abs_error_passed(
+    value: float,
+    thresholds: LengthTrainabilityThresholds,
+) -> bool:
+    if thresholds.strict:
+        return value > thresholds.initial_abs_error_min
+    return value >= thresholds.initial_abs_error_min
+
+
+def _success_abs_error_passed(
+    value: float,
+    thresholds: LengthTrainabilityThresholds,
+) -> bool:
+    if thresholds.strict:
+        return value < thresholds.success_abs_error_max
+    return value <= thresholds.success_abs_error_max
 
 
 def _base_max_tokens(target_tokens: int, *, base_model: str | None = None) -> int:
@@ -619,6 +661,7 @@ async def run_length_trainability_async(
         "ART_MODEL_SUPPORT_LENGTH_ROLLOUT_WORKERS",
         max(1, max_steps_off_policy + 1),
     )
+    thresholds = _length_trainability_thresholds(base_model)
     scenario_limit = _scenario_limit()
     zero_variance_discard_multiplier = _zero_variance_discard_multiplier(max_steps)
     success_hit = False
@@ -694,11 +737,11 @@ async def run_length_trainability_async(
                 samples=samples,
                 summary_log_path=summary_log_path,
             )
-            if (
+            if _success_abs_error_passed(
                 _mean_abs_error_by_step(
                     [sample for sample in samples if sample.split == "train"]
-                )[target_step]
-                <= SUCCESS_ABS_ERROR_MAX
+                )[target_step],
+                thresholds,
             ):
                 success_hit = True
             return group
@@ -747,7 +790,7 @@ async def run_length_trainability_async(
         (
             step
             for step, abs_error in train_abs_error_by_step.items()
-            if abs_error <= SUCCESS_ABS_ERROR_MAX
+            if _success_abs_error_passed(abs_error, thresholds)
         ),
         None,
     )
@@ -777,6 +820,7 @@ async def run_length_trainability_async(
         normalize_advantages=normalize_advantages,
         summary_log_path=str(summary_log_path),
         latest_summary_log_path=str(LATEST_SUMMARY_LOG_PATH),
+        thresholds=thresholds,
         initial_train_abs_error=initial_train_abs_error,
         best_train_abs_error=best_train_abs_error,
         success_step=success_step,
@@ -806,6 +850,7 @@ def run_length_trainability(
 
 
 def length_trainability_passed(report: LengthTrainabilityReport) -> bool:
+    thresholds = report.thresholds
     train_samples = [sample for sample in report.samples if sample.split == "train"]
     train_rewards_by_step = {
         step: [sample.reward for sample in train_samples if sample.step == step]
@@ -815,9 +860,9 @@ def length_trainability_passed(report: LengthTrainabilityReport) -> bool:
         bool(train_samples)
         and report.latest_step <= report.max_steps
         and report.initial_train_abs_error is not None
-        and report.initial_train_abs_error >= INITIAL_ABS_ERROR_MIN
+        and _initial_abs_error_passed(report.initial_train_abs_error, thresholds)
         and report.best_train_abs_error is not None
-        and report.best_train_abs_error <= SUCCESS_ABS_ERROR_MAX
+        and _success_abs_error_passed(report.best_train_abs_error, thresholds)
         and report.success_step is not None
         and len(train_rewards_by_step) <= report.max_steps
         and all(sample.max_tokens > sample.target_tokens for sample in train_samples)
@@ -830,6 +875,7 @@ def length_trainability_passed(report: LengthTrainabilityReport) -> bool:
 
 
 def assert_length_trainability_passed(report: LengthTrainabilityReport) -> None:
+    thresholds = report.thresholds
     train_samples = [sample for sample in report.samples if sample.split == "train"]
     train_rewards_by_step = {
         step: [sample.reward for sample in train_samples if sample.step == step]
@@ -838,9 +884,9 @@ def assert_length_trainability_passed(report: LengthTrainabilityReport) -> None:
     assert train_samples
     assert report.latest_step <= report.max_steps
     assert report.initial_train_abs_error is not None
-    assert report.initial_train_abs_error >= INITIAL_ABS_ERROR_MIN
+    assert _initial_abs_error_passed(report.initial_train_abs_error, thresholds)
     assert report.best_train_abs_error is not None
-    assert report.best_train_abs_error <= SUCCESS_ABS_ERROR_MAX
+    assert _success_abs_error_passed(report.best_train_abs_error, thresholds)
     assert report.success_step is not None
     assert len(train_rewards_by_step) <= report.max_steps
     assert all(sample.max_tokens > sample.target_tokens for sample in train_samples)

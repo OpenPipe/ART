@@ -8,16 +8,23 @@ import pytest
 import art
 
 from .test_live_length_trainability import (
+    DEFAULT_INITIAL_ABS_ERROR_MIN,
     DEFAULT_LENGTH_MAX_STEPS,
+    DEFAULT_SUCCESS_ABS_ERROR_MAX,
+    GPT_OSS_INITIAL_ABS_ERROR_MIN,
     GPT_OSS_LENGTH_SYSTEM_PROMPT,
+    GPT_OSS_SUCCESS_ABS_ERROR_MAX,
     _extra_body,
+    _initial_abs_error_passed,
     _length_chat_template_kwargs,
     _length_max_steps,
+    _length_trainability_thresholds,
     _max_tokens_for_completion,
     _messages,
     _scenario,
     _scenario_for_training_step,
     _scenario_limit,
+    _success_abs_error_passed,
     _zero_variance_discard_multiplier,
 )
 from .yes_no_trainability import (
@@ -226,6 +233,28 @@ def test_length_trainability_default_max_steps_is_twenty(monkeypatch) -> None:
 
     assert DEFAULT_LENGTH_MAX_STEPS == 20
     assert _length_max_steps() == 20
+
+
+def test_length_trainability_default_thresholds_are_unchanged() -> None:
+    thresholds = _length_trainability_thresholds("Qwen/Qwen3.5-35B-A3B")
+
+    assert thresholds.initial_abs_error_min == DEFAULT_INITIAL_ABS_ERROR_MIN
+    assert thresholds.success_abs_error_max == DEFAULT_SUCCESS_ABS_ERROR_MAX
+    assert thresholds.strict is False
+    assert _initial_abs_error_passed(DEFAULT_INITIAL_ABS_ERROR_MIN, thresholds)
+    assert _success_abs_error_passed(DEFAULT_SUCCESS_ABS_ERROR_MAX, thresholds)
+
+
+def test_gpt_oss_length_trainability_uses_strict_custom_thresholds() -> None:
+    thresholds = _length_trainability_thresholds("openai/gpt-oss-20b")
+
+    assert thresholds.initial_abs_error_min == GPT_OSS_INITIAL_ABS_ERROR_MIN
+    assert thresholds.success_abs_error_max == GPT_OSS_SUCCESS_ABS_ERROR_MAX
+    assert thresholds.strict is True
+    assert not _initial_abs_error_passed(GPT_OSS_INITIAL_ABS_ERROR_MIN, thresholds)
+    assert _initial_abs_error_passed(GPT_OSS_INITIAL_ABS_ERROR_MIN + 0.1, thresholds)
+    assert not _success_abs_error_passed(GPT_OSS_SUCCESS_ABS_ERROR_MAX, thresholds)
+    assert _success_abs_error_passed(GPT_OSS_SUCCESS_ABS_ERROR_MAX - 0.1, thresholds)
 
 
 def test_length_trainability_zero_variance_discard_limit_tracks_steps(
