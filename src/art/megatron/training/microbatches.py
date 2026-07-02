@@ -378,7 +378,6 @@ def _prepare_dense_rl_micro(
             parent_ids=micro["parent_ids"],
             input_pos=micro["input_pos"],
             sliding_windows=_art_flex_sliding_windows(provider),
-            build_attention_block_masks=not build_dsv4_layouts,
             build_gdn_execution_spec=bool(
                 getattr(model_support_handler, "build_gdn_execution_spec", False)
             ),
