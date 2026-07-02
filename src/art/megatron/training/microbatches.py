@@ -358,9 +358,22 @@ def _prepare_dense_rl_micro(
     ref_logprobs: torch.Tensor | None,
 ) -> PreparedRLMicroInputs:
     build_dsv4_layouts = _build_dsv4_compression_layouts(model_support_handler)
-    dsv4_position_ids = micro["input_pos"] if build_dsv4_layouts else None
-    dsv4_group_ids = micro["group_ids"] if build_dsv4_layouts else None
-    dsv4_parent_ids = micro["parent_ids"] if build_dsv4_layouts else None
+    attention_state = create_shared_prefix_state(
+        group_ids=micro["group_ids"],
+        parent_ids=micro["parent_ids"],
+        target_device=device,
+        input_pos=micro["input_pos"],
+        sliding_windows=_art_flex_sliding_windows(provider),
+        build_gdn_execution_spec=bool(
+            getattr(model_support_handler, "build_gdn_execution_spec", False)
+        ),
+        build_dsv4_compression_layouts=build_dsv4_layouts,
+        dsv4_position_ids=micro["input_pos"] if build_dsv4_layouts else None,
+        dsv4_group_ids=micro["group_ids"] if build_dsv4_layouts else None,
+        dsv4_parent_ids=micro["parent_ids"] if build_dsv4_layouts else None,
+        attention_head_dim=getattr(provider, "kv_channels", None),
+        attention_value_head_dim=getattr(provider, "kv_channels", None),
+    )
     _move_inputs_to_device(micro, device)
     shifted_labels = shift_tensor(micro["tokens"], -100)
     shifted_assistant_mask = shift_tensor(micro["assistant_mask"], False)
@@ -373,21 +386,7 @@ def _prepare_dense_rl_micro(
         model_tokens=micro["tokens"],
         model_input_pos=micro["input_pos"],
         model_labels=shifted_labels,
-        attention_state=create_shared_prefix_state(
-            group_ids=micro["group_ids"],
-            parent_ids=micro["parent_ids"],
-            input_pos=micro["input_pos"],
-            sliding_windows=_art_flex_sliding_windows(provider),
-            build_gdn_execution_spec=bool(
-                getattr(model_support_handler, "build_gdn_execution_spec", False)
-            ),
-            build_dsv4_compression_layouts=build_dsv4_layouts,
-            dsv4_position_ids=dsv4_position_ids,
-            dsv4_group_ids=dsv4_group_ids,
-            dsv4_parent_ids=dsv4_parent_ids,
-            attention_head_dim=getattr(provider, "kv_channels", None),
-            attention_value_head_dim=getattr(provider, "kv_channels", None),
-        ),
+        attention_state=attention_state,
         loss_inputs=LossInputs(inputs=micro),
         ref_logprobs=ref_logprobs,
         local_token_uids=packed_sequence_token_uids(micro, device=device),
