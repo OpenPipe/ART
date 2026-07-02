@@ -60,6 +60,7 @@ def create_shared_prefix_state(
     target_device: torch.device | None = None,
     input_pos: Tensor | None = None,
     sliding_windows: tuple[int, ...] = (),
+    build_attention_block_masks: bool = True,
     build_gdn_execution_spec: bool = False,
     build_dsv4_compression_layouts: bool = False,
     dsv4_position_ids: Tensor | None = None,
@@ -79,25 +80,39 @@ def create_shared_prefix_state(
         attention_head_dim=attention_head_dim,
         attention_value_head_dim=attention_value_head_dim,
     )
-    block_mask = _build_sparse_shared_prefix_block_mask(
-        group_ids_cpu=group_ids_cpu,
-        parent_ids_cpu=parent_ids_cpu,
-        input_pos_cpu=input_pos_cpu,
-        sliding_window=None,
-        device=device,
-        block_size=block_size,
-    )
-    sliding_block_masks = {
-        window: _build_sparse_shared_prefix_block_mask(
+    block_mask = (
+        _build_sparse_shared_prefix_block_mask(
             group_ids_cpu=group_ids_cpu,
             parent_ids_cpu=parent_ids_cpu,
             input_pos_cpu=input_pos_cpu,
-            sliding_window=window,
+            sliding_window=None,
             device=device,
             block_size=block_size,
         )
-        for window in tuple(dict.fromkeys(int(window) for window in sliding_windows))
-    }
+        if build_attention_block_masks
+        else _empty_block_mask(
+            seq_len=int(group_ids_cpu.shape[1]),
+            block_size=block_size,
+            device=torch.device("cpu"),
+        )
+    )
+    sliding_block_masks = (
+        {
+            window: _build_sparse_shared_prefix_block_mask(
+                group_ids_cpu=group_ids_cpu,
+                parent_ids_cpu=parent_ids_cpu,
+                input_pos_cpu=input_pos_cpu,
+                sliding_window=window,
+                device=device,
+                block_size=block_size,
+            )
+            for window in tuple(
+                dict.fromkeys(int(window) for window in sliding_windows)
+            )
+        }
+        if build_attention_block_masks
+        else {}
+    )
     cp_rank, cp_size, cp_group = _gdn_cp_rank_size_group()
     gdn_execution_spec = _build_gdn_execution_spec_once(
         group_ids_cpu,
