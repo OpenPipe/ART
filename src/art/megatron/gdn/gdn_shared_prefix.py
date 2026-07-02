@@ -307,40 +307,54 @@ def _build_tree_rank_execution_plan(
     for node_index in reversed(range(len(spec.tree_segments))):
         for child_index in children_by_node[node_index]:
             subtree_token_counts[node_index] += subtree_token_counts[child_index]
+    chainable_nodes = [
+        cp_size > 1
+        and _can_chain_tree_segment(
+            segment,
+            cp_size=cp_size,
+            planner_config=planner_config,
+        )
+        for segment in spec.tree_segments
+    ]
+    subtree_has_chainable_node = list(chainable_nodes)
+    for node_index in reversed(range(len(spec.tree_segments))):
+        subtree_has_chainable_node[node_index] = subtree_has_chainable_node[
+            node_index
+        ] or any(
+            subtree_has_chainable_node[child_index]
+            for child_index in children_by_node[node_index]
+        )
     target_rank_load = spec.real_token_count / max(1, cp_size)
     max_local_group_tokens = max(1, int(target_rank_load))
 
-    def assign_tree(root_index: int) -> None:
+    def assign_tree(node_index: int) -> None:
         nonlocal cross_rank_token_count
-        root = spec.tree_segments[root_index]
-        if (
-            spec.tree_parent_indices[root_index] < 0
-            and cp_size > 1
-            and _can_chain_tree_segment(
-                root,
-                cp_size=cp_size,
-                planner_config=planner_config,
+        segment = spec.tree_segments[node_index]
+        if chainable_nodes[node_index]:
+            chained_nodes[segment.family_index] = True
+            chain_segments_by_depth[spec.tree_depths[segment.family_index]].append(
+                segment
             )
-        ):
-            chained_nodes[root.family_index] = True
-            chain_segments_by_depth[spec.tree_depths[root.family_index]].append(root)
             cross_rank_token_count += _append_chain_segment(
                 gdn_ranges_by_rank,
                 rank_loads,
-                root,
+                segment,
                 spec,
                 attention_layout_index=attention_layout_index,
             )
-            for child_index in children_by_node[root_index]:
+            for child_index in children_by_node[node_index]:
                 assign_tree(child_index)
             return
 
-        if subtree_token_counts[root_index] <= max_local_group_tokens:
-            assign_local_group(subtree_indices(root_index))
+        if (
+            not subtree_has_chainable_node[node_index]
+            and subtree_token_counts[node_index] <= max_local_group_tokens
+        ):
+            assign_local_group(subtree_indices(node_index))
             return
 
-        assign_local_group((root_index,))
-        for child_index in children_by_node[root_index]:
+        assign_local_group((node_index,))
+        for child_index in children_by_node[node_index]:
             assign_tree(child_index)
 
     for root_index in root_indices:
@@ -720,15 +734,28 @@ def _build_tree_state_exchanges_by_depth(
         if parent_index < 0 or chained_nodes[parent_index]:
             continue
         source_rank = owner_by_node[parent_index]
-        dest_rank = owner_by_node[child_index]
-        if source_rank < 0 or dest_rank < 0:
-            raise ValueError("tree state exchange requires every node to have an owner")
-        if source_rank == dest_rank:
-            continue
         depth = spec.tree_depths[child_index]
-        families_by_depth_pair[depth].setdefault((source_rank, dest_rank), set()).add(
-            parent_index
-        )
+        if source_rank < 0:
+            raise ValueError(
+                "tree state exchange requires every local parent to have an owner"
+            )
+        if chained_nodes[child_index]:
+            for dest_rank in range(cp_size):
+                if source_rank == dest_rank:
+                    continue
+                families_by_depth_pair[depth].setdefault(
+                    (source_rank, dest_rank), set()
+                ).add(parent_index)
+            continue
+        dest_rank = owner_by_node[child_index]
+        if dest_rank < 0:
+            raise ValueError(
+                "tree state exchange requires every local child to have an owner"
+            )
+        if source_rank != dest_rank:
+            families_by_depth_pair[depth].setdefault(
+                (source_rank, dest_rank), set()
+            ).add(parent_index)
 
     state_exchanges: list[GdnStateExchangePlan | None] = []
     for pair_families in families_by_depth_pair:

@@ -203,7 +203,7 @@ def test_gdn_tree_cp_plan_chains_long_nodes() -> None:
 
     assert _covered_token_indices(plans) == set(range(spec.real_token_count))
     assert any(plans[0].tree_chain_buckets_by_depth[0])
-    assert not any(
+    assert any(
         bucket
         for plan in plans
         for depth_buckets in plan.tree_chain_buckets_by_depth[1:]
@@ -251,7 +251,7 @@ def test_gdn_tree_cp_plan_exchanges_remote_parent_states() -> None:
         for rank in range(4)
     )
     assert _covered_token_indices(plans) == set(range(spec.real_token_count))
-    assert not any(
+    assert any(
         bucket
         for plan in plans
         for depth_buckets in plan.tree_chain_buckets_by_depth[1:]
@@ -373,16 +373,23 @@ def _local_owner_by_family(plans) -> dict[int, int]:
     return owner_by_family
 
 
+def _chained_families(plans) -> set[int]:
+    return {
+        int(family_index)
+        for plan in plans
+        for depth_buckets in plan.tree_chain_buckets_by_depth
+        for bucket in depth_buckets
+        for family_index in bucket.family_indices.tolist()
+    }
+
+
 def _assert_remote_parent_state_transfers_cover(spec, plans) -> None:
     owner_by_family = _local_owner_by_family(plans)
-    for family_index, parent_index in enumerate(spec.tree_parent_indices):
-        if parent_index < 0 or parent_index not in owner_by_family:
-            continue
-        source_rank = owner_by_family[parent_index]
-        dest_rank = owner_by_family[family_index]
-        if source_rank == dest_rank:
-            continue
-        depth = spec.tree_depths[family_index]
+    chained_families = _chained_families(plans)
+
+    def assert_transfer(
+        parent_index: int, source_rank: int, dest_rank: int, depth: int
+    ) -> None:
         source_exchange = plans[source_rank].tree_state_exchanges_by_depth[depth]
         dest_exchange = plans[dest_rank].tree_state_exchanges_by_depth[depth]
         assert source_exchange is not None
@@ -395,6 +402,21 @@ def _assert_remote_parent_state_transfers_cover(spec, plans) -> None:
             if transfer.source_rank == source_rank and transfer.dest_rank == dest_rank
         ]
         assert matching
+
+    for family_index, parent_index in enumerate(spec.tree_parent_indices):
+        if parent_index < 0 or parent_index not in owner_by_family:
+            continue
+        source_rank = owner_by_family[parent_index]
+        depth = spec.tree_depths[family_index]
+        if family_index in chained_families:
+            for dest_rank in range(len(plans)):
+                if source_rank != dest_rank:
+                    assert_transfer(parent_index, source_rank, dest_rank, depth)
+            continue
+        assert family_index in owner_by_family
+        dest_rank = owner_by_family[family_index]
+        if source_rank != dest_rank:
+            assert_transfer(parent_index, source_rank, dest_rank, depth)
 
 
 def _remote_parent_state_transfer_count(plans) -> int:
