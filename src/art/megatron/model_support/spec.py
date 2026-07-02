@@ -1,3 +1,4 @@
+from collections.abc import Mapping
 from typing import TYPE_CHECKING, Any, Literal, Protocol, Sequence, runtime_checkable
 
 from pydantic import BaseModel, Field
@@ -97,6 +98,15 @@ class ModelSupportHandler(Protocol):
     ) -> list[str]: ...
 
     def patch_bridge(self, bridge: "AutoBridge") -> None: ...
+
+    def resolve_missing_hf_weight(
+        self,
+        bridge: "AutoBridge",
+        hf_param: str,
+        hf_state_dict: Mapping[str, Any],
+        *,
+        task: Any | None = None,
+    ) -> Any: ...
 
     def patch_provider(
         self,

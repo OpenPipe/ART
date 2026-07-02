@@ -160,6 +160,26 @@ def _load_hf_tensor_slice(
         return tensor_slice[index]
 
 
+def _resolve_missing_hf_weight(
+    bridge: MegatronModelBridge | None,
+    key: str,
+    hf_state_dict: Mapping[str, torch.Tensor],
+    *,
+    task: Any | None,
+) -> torch.Tensor:
+    resolver = (
+        None
+        if bridge is None
+        else getattr(bridge, "_art_missing_hf_weight_resolver", None)
+    )
+    if resolver is None:
+        raise KeyError(f"HF tensor key {key!r} not found")
+    return cast(
+        torch.Tensor,
+        resolver(key, hf_state_dict, task=task),
+    )
+
+
 def load_unique_hf_keys_once(
     tasks: Iterable[Any],
     hf_state_dict: Mapping[str, torch.Tensor],
@@ -167,15 +187,15 @@ def load_unique_hf_keys_once(
     bridge: MegatronModelBridge | None = None,
 ) -> dict[str, torch.Tensor | ExpertTensorSlice]:
     task_list = list(tasks)
-    keys = sorted(
-        {
-            key
-            for task in task_list
-            if _needs_local_hf_prefetch(task)
-            for key in _iter_hf_param_names(task.mapping.hf_param)
-        }
-    )
+    prefetch_task_by_key: dict[str, Any] = {}
+    for task in task_list:
+        if not _needs_local_hf_prefetch(task):
+            continue
+        for key in _iter_hf_param_names(task.mapping.hf_param):
+            prefetch_task_by_key.setdefault(key, task)
+    keys = sorted(prefetch_task_by_key)
     expert_slice_ranges: dict[str, tuple[int, int]] = {}
+    expert_slice_task_by_key: dict[str, Any] = {}
     for task in task_list:
         if task is None or task.megatron_module is None:
             continue
@@ -189,6 +209,7 @@ def load_unique_hf_keys_once(
             if previous is None
             else (min(previous[0], start), max(previous[1], stop))
         )
+        expert_slice_task_by_key.setdefault(key, task)
     cache: dict[str, torch.Tensor | ExpertTensorSlice] = {}
     existing_keys = [key for key in keys if key in hf_state_dict]
     missing_keys = [key for key in keys if key not in hf_state_dict]
@@ -207,18 +228,23 @@ def load_unique_hf_keys_once(
             for key, value in cast(Mapping[str, torch.Tensor], loaded).items()
         }
     )
-    if missing_keys and bridge is None:
-        raise KeyError(f"Keys not found: {missing_keys}")
     for key in missing_keys:
-        assert bridge is not None
         cache[key] = _pin_cpu_tensor(
-            bridge.maybe_modify_loaded_hf_weight(key, hf_state_dict)
+            _resolve_missing_hf_weight(
+                bridge,
+                key,
+                hf_state_dict,
+                task=prefetch_task_by_key.get(key),
+            )
         )
     for key, (start, stop) in expert_slice_ranges.items():
         if key not in hf_state_dict:
-            if bridge is None:
-                raise KeyError(f"HF tensor key {key!r} not found")
-            tensor = bridge.maybe_modify_loaded_hf_weight(key, hf_state_dict)
+            tensor = _resolve_missing_hf_weight(
+                bridge,
+                key,
+                hf_state_dict,
+                task=expert_slice_task_by_key.get(key),
+            )
             if not tensor.ndim or start < 0 or stop > tensor.shape[0] or start >= stop:
                 raise RuntimeError(
                     f"invalid expert slice [{start}, {stop}) for {key!r} "

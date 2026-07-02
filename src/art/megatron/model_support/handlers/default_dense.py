@@ -1,3 +1,4 @@
+from collections.abc import Mapping
 from typing import Any, Sequence
 
 import torch
@@ -80,6 +81,19 @@ class DefaultDenseHandler:
     def patch_bridge(self, bridge: Any) -> None:
         del bridge
         return None
+
+    def resolve_missing_hf_weight(
+        self,
+        bridge: Any,
+        hf_param: str,
+        hf_state_dict: Mapping[str, Any],
+        *,
+        task: Any | None = None,
+    ) -> Any:
+        del bridge, hf_state_dict, task
+        raise KeyError(
+            f"{self.key} does not resolve missing HF checkpoint key {hf_param!r}"
+        )
 
     def configure_provider_for_runtime(self, provider: Any) -> None:
         del provider

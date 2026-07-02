@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Mapping
 import re
 from typing import Any, Sequence, cast
 
@@ -37,6 +38,9 @@ _VLLM_MOE_KEY_RE = re.compile(
     r"^(?P<prefix>.*\.mlp\.experts)\."
     r"(?:(?P<base_layer>base_layer)\.)?(?P<lora>lora_[AB])\.weight$"
 )
+_GPT_OSS_MXFP4_EXPERT_WEIGHT_RE = re.compile(
+    r"^model\.layers\.\d+\.mlp\.experts\.(?:gate_up_proj|down_proj)$"
+)
 
 
 class GptOssMoeHandler(DefaultMoeHandler):
@@ -67,6 +71,47 @@ class GptOssMoeHandler(DefaultMoeHandler):
         provider.moe_shared_expert_overlap = False
         provider.moe_router_dtype = None
         _install_weighted_bias_quick_geglu_patch()
+
+    def patch_bridge(self, bridge: Any) -> None:
+        def _resolve_missing_hf_weight(
+            hf_param: str,
+            hf_state_dict: Mapping[str, torch.Tensor],
+            *,
+            task: Any | None = None,
+        ) -> torch.Tensor:
+            return self.resolve_missing_hf_weight(
+                bridge,
+                hf_param,
+                hf_state_dict,
+                task=task,
+            )
+
+        setattr(bridge, "_art_missing_hf_weight_resolver", _resolve_missing_hf_weight)
+
+    def resolve_missing_hf_weight(
+        self,
+        bridge: Any,
+        hf_param: str,
+        hf_state_dict: Mapping[str, torch.Tensor],
+        *,
+        task: Any | None = None,
+    ) -> torch.Tensor:
+        del task
+        if _GPT_OSS_MXFP4_EXPERT_WEIGHT_RE.match(hf_param) is None:
+            raise KeyError(
+                f"GPT OSS only resolves missing MXFP4 expert weights, got {hf_param!r}"
+            )
+        blocks_key = f"{hf_param}_blocks"
+        scales_key = f"{hf_param}_scales"
+        if blocks_key not in hf_state_dict or scales_key not in hf_state_dict:
+            raise KeyError(
+                f"Missing GPT OSS MXFP4 tensors for {hf_param!r}: "
+                f"{blocks_key!r}, {scales_key!r}"
+            )
+        return cast(
+            torch.Tensor,
+            bridge.maybe_modify_loaded_hf_weight(hf_param, hf_state_dict),
+        )
 
     def vllm_engine_args(
         self,
