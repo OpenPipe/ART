@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-from collections.abc import Mapping
 import re
 from typing import Any, Sequence, cast
 
@@ -18,6 +17,7 @@ from art.megatron.model_support.spec import (
     CompileWorkaroundConfig,
     ExpertPackedLoraGroup,
     ExpertPackedLoraSlot,
+    HfWeightSource,
     LayerFamilyInstance,
     RolloutWeightsMode,
 )
@@ -73,44 +73,36 @@ class GptOssMoeHandler(DefaultMoeHandler):
         _install_weighted_bias_quick_geglu_patch()
 
     def patch_bridge(self, bridge: Any) -> None:
-        def _resolve_missing_hf_weight(
+        def _hf_weight_source(
             hf_param: str,
-            hf_state_dict: Mapping[str, torch.Tensor],
             *,
             task: Any | None = None,
-        ) -> torch.Tensor:
-            return self.resolve_missing_hf_weight(
+        ) -> HfWeightSource | None:
+            return self.hf_weight_source(
                 bridge,
                 hf_param,
-                hf_state_dict,
                 task=task,
             )
 
-        setattr(bridge, "_art_missing_hf_weight_resolver", _resolve_missing_hf_weight)
+        setattr(bridge, "_art_hf_weight_source", _hf_weight_source)
 
-    def resolve_missing_hf_weight(
+    def hf_weight_source(
         self,
         bridge: Any,
         hf_param: str,
-        hf_state_dict: Mapping[str, torch.Tensor],
         *,
         task: Any | None = None,
-    ) -> torch.Tensor:
-        del task
+    ) -> HfWeightSource | None:
+        del bridge, task
         if _GPT_OSS_MXFP4_EXPERT_WEIGHT_RE.match(hf_param) is None:
-            raise KeyError(
-                f"GPT OSS only resolves missing MXFP4 expert weights, got {hf_param!r}"
-            )
-        blocks_key = f"{hf_param}_blocks"
-        scales_key = f"{hf_param}_scales"
-        if blocks_key not in hf_state_dict or scales_key not in hf_state_dict:
-            raise KeyError(
-                f"Missing GPT OSS MXFP4 tensors for {hf_param!r}: "
-                f"{blocks_key!r}, {scales_key!r}"
-            )
-        return cast(
-            torch.Tensor,
-            bridge.maybe_modify_loaded_hf_weight(hf_param, hf_state_dict),
+            return None
+        return HfWeightSource(
+            logical_key=hf_param,
+            physical_key_options=(
+                (hf_param,),
+                (f"{hf_param}_blocks", f"{hf_param}_scales"),
+            ),
+            kind="bridge_materialized",
         )
 
     def vllm_engine_args(

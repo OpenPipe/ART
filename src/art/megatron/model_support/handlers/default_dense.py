@@ -1,4 +1,3 @@
-from collections.abc import Mapping
 from typing import Any, Sequence
 
 import torch
@@ -7,6 +6,7 @@ from art.megatron.model_support.spec import (
     CompileWorkaroundConfig,
     ExpertPackedLoraGroup,
     FlexAttentionCompileCrashConfig,
+    HfWeightSource,
     LayerFamilyInstance,
     RolloutWeightsMode,
     SharedExpertCompileState,
@@ -82,18 +82,15 @@ class DefaultDenseHandler:
         del bridge
         return None
 
-    def resolve_missing_hf_weight(
+    def hf_weight_source(
         self,
         bridge: Any,
         hf_param: str,
-        hf_state_dict: Mapping[str, Any],
         *,
         task: Any | None = None,
-    ) -> Any:
-        del bridge, hf_state_dict, task
-        raise KeyError(
-            f"{self.key} does not resolve missing HF checkpoint key {hf_param!r}"
-        )
+    ) -> HfWeightSource | None:
+        del bridge, hf_param, task
+        return None
 
     def configure_provider_for_runtime(self, provider: Any) -> None:
         del provider

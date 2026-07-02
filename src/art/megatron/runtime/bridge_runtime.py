@@ -21,6 +21,8 @@ from megatron.core.transformer.module import Float16Module, MegatronModule
 from megatron.core.utils import get_model_config
 import torch
 
+from art.megatron.model_support.spec import HfWeightSource
+
 
 class ExpertTensorSlice:
     __slots__ = ("global_start", "global_stop", "tensor")
@@ -160,23 +162,76 @@ def _load_hf_tensor_slice(
         return tensor_slice[index]
 
 
-def _resolve_missing_hf_weight(
+def _direct_hf_weight_source(key: str) -> HfWeightSource:
+    return HfWeightSource(logical_key=key, physical_key_options=((key,),))
+
+
+def _planned_hf_weight_source(
     bridge: MegatronModelBridge | None,
     key: str,
-    hf_state_dict: Mapping[str, torch.Tensor],
     *,
     task: Any | None,
-) -> torch.Tensor:
-    resolver = (
-        None
-        if bridge is None
-        else getattr(bridge, "_art_missing_hf_weight_resolver", None)
+) -> HfWeightSource:
+    source_fn = (
+        None if bridge is None else getattr(bridge, "_art_hf_weight_source", None)
     )
-    if resolver is None:
-        raise KeyError(f"HF tensor key {key!r} not found")
-    return cast(
-        torch.Tensor,
-        resolver(key, hf_state_dict, task=task),
+    source = (
+        None
+        if source_fn is None
+        else cast(HfWeightSource | None, source_fn(key, task=task))
+    )
+    if source is None:
+        return _direct_hf_weight_source(key)
+    if source.logical_key != key:
+        raise RuntimeError(
+            f"handler returned HF source for {source.logical_key!r} while loading {key!r}"
+        )
+    if not source.physical_key_options or any(
+        not option for option in source.physical_key_options
+    ):
+        raise RuntimeError(f"handler returned empty HF source options for {key!r}")
+    return source
+
+
+def _source_options_message(source: HfWeightSource) -> str:
+    return ", ".join(str(option) for option in source.physical_key_options)
+
+
+def _select_physical_key_option(
+    source: HfWeightSource,
+    hf_state_dict: Mapping[str, torch.Tensor],
+) -> tuple[str, ...]:
+    for option in source.physical_key_options:
+        if all(key in hf_state_dict for key in option):
+            return option
+    raise KeyError(
+        f"HF tensor source for {source.logical_key!r} not found; "
+        f"tried {_source_options_message(source)}"
+    )
+
+
+def _materialize_hf_weight_source(
+    bridge: MegatronModelBridge | None,
+    source: HfWeightSource,
+    hf_state_dict: Mapping[str, torch.Tensor],
+    *,
+    selected_option: tuple[str, ...],
+) -> torch.Tensor:
+    if source.kind == "direct":
+        if len(selected_option) != 1:
+            raise RuntimeError(
+                "direct HF source must select exactly one physical key for "
+                f"{source.logical_key!r}; got {selected_option!r}"
+            )
+        return hf_state_dict[selected_option[0]]
+    if source.kind == "bridge_materialized":
+        if bridge is None:
+            raise RuntimeError(
+                f"HF source for {source.logical_key!r} requires Megatron Bridge"
+            )
+        return bridge.maybe_modify_loaded_hf_weight(source.logical_key, hf_state_dict)
+    raise RuntimeError(
+        f"unknown HF source kind {source.kind!r} for {source.logical_key!r}"
     )
 
 
@@ -211,39 +266,64 @@ def load_unique_hf_keys_once(
         )
         expert_slice_task_by_key.setdefault(key, task)
     cache: dict[str, torch.Tensor | ExpertTensorSlice] = {}
-    existing_keys = [key for key in keys if key in hf_state_dict]
-    missing_keys = [key for key in keys if key not in hf_state_dict]
-    if existing_keys and hasattr(hf_state_dict, "__getitem__"):
+    direct_physical_by_logical: dict[str, str] = {}
+    materialized_source_by_key: dict[str, tuple[HfWeightSource, tuple[str, ...]]] = {}
+    for key in keys:
+        source = _planned_hf_weight_source(
+            bridge,
+            key,
+            task=prefetch_task_by_key.get(key),
+        )
+        selected_option = _select_physical_key_option(source, hf_state_dict)
+        if source.kind == "direct":
+            if len(selected_option) != 1:
+                raise RuntimeError(
+                    "direct HF source must select exactly one physical key for "
+                    f"{source.logical_key!r}; got {selected_option!r}"
+                )
+            direct_physical_by_logical[key] = selected_option[0]
+        else:
+            materialized_source_by_key[key] = (source, selected_option)
+
+    physical_direct_keys = sorted(set(direct_physical_by_logical.values()))
+    if physical_direct_keys and hasattr(hf_state_dict, "__getitem__"):
         hf_state_dict_getter = cast(Any, hf_state_dict)
         loaded = (
-            hf_state_dict_getter[existing_keys]
+            hf_state_dict_getter[physical_direct_keys]
             if not isinstance(hf_state_dict, dict)
-            else {key: hf_state_dict[key] for key in existing_keys}
+            else {key: hf_state_dict[key] for key in physical_direct_keys}
         )
     else:
-        loaded = {key: hf_state_dict[key] for key in existing_keys}
+        loaded = {key: hf_state_dict[key] for key in physical_direct_keys}
+    loaded_direct = cast(Mapping[str, torch.Tensor], loaded)
     cache.update(
         {
-            key: _pin_cpu_tensor(value)
-            for key, value in cast(Mapping[str, torch.Tensor], loaded).items()
+            logical_key: _pin_cpu_tensor(loaded_direct[physical_key])
+            for logical_key, physical_key in direct_physical_by_logical.items()
         }
     )
-    for key in missing_keys:
+    for key, (source, selected_option) in materialized_source_by_key.items():
         cache[key] = _pin_cpu_tensor(
-            _resolve_missing_hf_weight(
+            _materialize_hf_weight_source(
                 bridge,
-                key,
+                source,
                 hf_state_dict,
-                task=prefetch_task_by_key.get(key),
+                selected_option=selected_option,
             )
         )
     for key, (start, stop) in expert_slice_ranges.items():
-        if key not in hf_state_dict:
-            tensor = _resolve_missing_hf_weight(
+        source = _planned_hf_weight_source(
+            bridge,
+            key,
+            task=expert_slice_task_by_key.get(key),
+        )
+        selected_option = _select_physical_key_option(source, hf_state_dict)
+        if source.kind != "direct":
+            tensor = _materialize_hf_weight_source(
                 bridge,
-                key,
+                source,
                 hf_state_dict,
-                task=expert_slice_task_by_key.get(key),
+                selected_option=selected_option,
             )
             if not tensor.ndim or start < 0 or stop > tensor.shape[0] or start >= stop:
                 raise RuntimeError(
@@ -256,11 +336,16 @@ def load_unique_hf_keys_once(
                 global_stop=stop,
             )
             continue
+        if len(selected_option) != 1:
+            raise RuntimeError(
+                "direct HF source must select exactly one physical key for "
+                f"{source.logical_key!r}; got {selected_option!r}"
+            )
         cache[key] = ExpertTensorSlice(
             _pin_cpu_tensor(
                 _load_hf_tensor_slice(
                     hf_state_dict,
-                    key,
+                    selected_option[0],
                     start=start,
                     stop=stop,
                 )

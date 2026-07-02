@@ -19,6 +19,7 @@ from art.megatron.model_support.registry import (
     get_model_support_spec,
     model_uses_expert_parallel,
 )
+from art.megatron.model_support.spec import HfWeightSource
 import art.megatron.provider as provider_module
 from art.megatron.runtime.bridge_runtime import load_unique_hf_keys_once
 
@@ -240,7 +241,7 @@ def test_gpt_oss_provider_uses_art_cp_attention(
     assert issubclass(core_attention, ArtContextParallelCoreAttention)
 
 
-def test_missing_hf_prefetch_requires_handler_resolver() -> None:
+def test_missing_hf_prefetch_requires_available_source() -> None:
     task = SimpleNamespace(
         megatron_module=object(),
         mapping=SimpleNamespace(hf_param="missing.weight", tp_size=1),
@@ -254,23 +255,46 @@ def test_missing_hf_prefetch_requires_handler_resolver() -> None:
         )
 
 
-def test_gpt_oss_handler_resolves_only_mxfp4_expert_weights() -> None:
+def test_gpt_oss_handler_plans_only_mxfp4_expert_weights() -> None:
+    handler = get_model_support_handler("openai/gpt-oss-20b")
+    bridge = SimpleNamespace()
+
+    handler.patch_bridge(cast(Any, bridge))
+    source_fn = getattr(bridge, "_art_hf_weight_source")
+    hf_param = "model.layers.0.mlp.experts.down_proj"
+
+    assert source_fn(hf_param, task=None) == HfWeightSource(
+        logical_key=hf_param,
+        physical_key_options=(
+            (hf_param,),
+            (f"{hf_param}_blocks", f"{hf_param}_scales"),
+        ),
+        kind="bridge_materialized",
+    )
+    assert source_fn("model.layers.0.mlp.experts.down_proj_bias", task=None) is None
+
+
+def test_gpt_oss_mxfp4_weight_source_materializes_once() -> None:
     handler = get_model_support_handler("openai/gpt-oss-20b")
     resolved = torch.ones(2, 3)
     bridge = _FakeWeightBridge(resolved)
-
-    handler.patch_bridge(cast(Any, bridge))
-    resolver = getattr(bridge, "_art_missing_hf_weight_resolver")
     hf_param = "model.layers.0.mlp.experts.down_proj"
+    task = SimpleNamespace(
+        megatron_module=object(),
+        mapping=SimpleNamespace(hf_param=hf_param, tp_size=1),
+    )
     state = {
         f"{hf_param}_blocks": torch.zeros(1),
         f"{hf_param}_scales": torch.zeros(1),
     }
 
-    assert resolver(hf_param, state, task=None) is resolved
+    handler.patch_bridge(cast(Any, bridge))
+    cache = load_unique_hf_keys_once([task], state, bridge=cast(Any, bridge))
+    loaded = cache[hf_param]
+
+    assert isinstance(loaded, torch.Tensor)
+    assert torch.equal(loaded, resolved)
     assert bridge.calls == [hf_param]
-    with pytest.raises(KeyError, match="down_proj_bias"):
-        resolver("model.layers.0.mlp.experts.down_proj_bias", state, task=None)
 
 
 def test_finalize_provider_bundle_allows_art_gdn_context_parallel() -> None:

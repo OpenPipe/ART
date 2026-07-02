@@ -1,4 +1,3 @@
-from collections.abc import Mapping
 from typing import TYPE_CHECKING, Any, Literal, Protocol, Sequence, runtime_checkable
 
 from pydantic import BaseModel, Field
@@ -19,6 +18,7 @@ ExpertPackedLoraLayout = Literal[
     "rank_major_expert_cols",
     "interleaved_gate_up_rank_major_expert_cols",
 ]
+HfWeightSourceKind = Literal["direct", "bridge_materialized"]
 
 
 class DependencyFloor(BaseModel):
@@ -71,6 +71,12 @@ class ExpertPackedLoraGroup(BaseModel):
     slots: tuple[ExpertPackedLoraSlot, ...]
 
 
+class HfWeightSource(BaseModel):
+    logical_key: str
+    physical_key_options: tuple[tuple[str, ...], ...]
+    kind: HfWeightSourceKind = "direct"
+
+
 class ModelSupportSpec(BaseModel):
     key: str
     handler_key: str
@@ -99,14 +105,13 @@ class ModelSupportHandler(Protocol):
 
     def patch_bridge(self, bridge: "AutoBridge") -> None: ...
 
-    def resolve_missing_hf_weight(
+    def hf_weight_source(
         self,
         bridge: "AutoBridge",
         hf_param: str,
-        hf_state_dict: Mapping[str, Any],
         *,
         task: Any | None = None,
-    ) -> Any: ...
+    ) -> HfWeightSource | None: ...
 
     def patch_provider(
         self,
