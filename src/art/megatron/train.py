@@ -1502,27 +1502,12 @@ def run_training_step(
             prepared_micro.attention_state,
         )
 
-        model_forward_kwargs = dict(
-            input_ids=prepared_micro.model_tokens,
-            position_ids=prepared_micro.model_input_pos,
-            attention_mask=_placeholder_attention_mask(device),
-            packed_seq_params=prepared_micro.packed_seq_params,
-            **model_support_handler.get_forward_kwargs(
-                model_chunks[0],
-                attention_bias=prepared_micro.attention_state,
-            ),
+        new_logprobs = _forward_prepared_rl_micro(
+            model_chunks=model_chunks,
+            model_support_handler=model_support_handler,
+            prepared_micro=prepared_micro,
+            device=device,
         )
-        with attach_trace_token_uids(model_chunks, prepared_micro.local_token_uids):
-            if int(prepared_micro.model_tokens.numel()) == 0:
-                logits = model_chunks[0](**model_forward_kwargs, labels=None)
-                new_logprobs = _empty_new_logprobs_from_logits(
-                    logits, prepared_micro.model_labels
-                )
-            else:
-                new_logprobs = -model_chunks[0](
-                    **model_forward_kwargs,
-                    labels=prepared_micro.model_labels,
-                )
 
         loss_info = loss_fn(
             prepared_micro.loss_inputs,
@@ -1555,7 +1540,6 @@ def run_training_step(
             )
         micro_loss.backward()
         loss_inputs_for_count.append(prepared_micro.loss_inputs)
-        del model_forward_kwargs
         del prepared_micro
         pending_prepared_micro = _prepare_next_rl_cp_micro(
             _next_micro_lookahead(
