@@ -1180,9 +1180,6 @@ def test_run_correctness_sensitivity_stage_uses_dsv4_real_path_config(
     grad_rules = getattr(phase_pass_fns["grads"], "rules")
     assert getattr(grad_rules[0], "limits") == {"mean_abs_pct": 5.0}
     assert getattr(grad_rules[1], "limits") == {"mean_abs_diff": 1e-9}
-    delta_rules = getattr(phase_pass_fns["deltas"], "rules")
-    assert getattr(delta_rules[0], "limits") == {"mean_abs_pct": 5.0}
-    assert getattr(delta_rules[1], "limits") == {"mean_abs_diff": 1e-7}
     assert stage.metrics["precision"] == "bf16"
     assert stage.metrics["use_fp32_lora_reference"] is False
 
