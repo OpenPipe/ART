@@ -79,11 +79,7 @@ def build_art_conversion_tasks(*, bridge: AutoBridge, model: ModelChunks) -> lis
                 )
             hf_params = _hf_param_names(mapping.hf_param)
             missing_hf_params = sorted(set(hf_params) - hf_keys)
-            if missing_hf_params and not getattr(
-                mapping,
-                "allow_hf_name_mismatch",
-                False,
-            ):
+            if missing_hf_params:
                 raise RuntimeError(
                     f"Missing HF checkpoint weights for Megatron param {global_name}: "
                     f"{missing_hf_params}"
