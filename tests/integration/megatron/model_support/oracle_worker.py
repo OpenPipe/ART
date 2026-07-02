@@ -257,6 +257,47 @@ def _collect_lora_state(
     return _gather_full_state(local_state, local_manifest)
 
 
+def _collect_lora_main_state(
+    model_chunks: list[Any],
+) -> dict[str, Any] | None:
+    """Collects LoRA optimizer-main params for delta validation.
+
+    In bf16 correctness runs the model copy is bf16, but Megatron applies Adam
+    to an fp32 main param. Deltas should validate that fp32 optimizer update,
+    not the rounded bf16 copy-back artifact.
+    """
+    local_state: dict[str, Any] = {}
+    local_manifest: dict[str, Any] = {}
+    for chunk in model_chunks:
+        for module in chunk.modules():
+            export_items = getattr(module, "_export_items", None)
+            manifest_for_param = getattr(module, "_manifest_for_param", None)
+            if not callable(export_items) or not callable(manifest_for_param):
+                continue
+            for key, param, expert in export_items():
+                if key in local_state:
+                    raise RuntimeError(
+                        f"Duplicate LoRA key while collecting main state: {key}"
+                    )
+                main_param = getattr(param, "main_param", None)
+                if main_param is None:
+                    if param.dtype != torch.float32:
+                        raise RuntimeError(
+                            "bf16/fp16 LoRA param is missing optimizer main_param for "
+                            f"key '{key}'. Delta validation would otherwise compare "
+                            "rounded model-copy updates."
+                        )
+                    main_param = param
+                tensor = (
+                    main_param.data[expert].T
+                    if expert is not None
+                    else main_param.data.T
+                )
+                local_state[key] = tensor.detach().cpu().contiguous()
+                local_manifest[key] = manifest_for_param(param)
+    return _gather_full_state(local_state, local_manifest)
+
+
 def _collect_lora_grads(
     model_chunks: list[Any],
 ) -> dict[str, Any] | None:
@@ -1421,11 +1462,21 @@ def _worker_run(request: WorkerRunRequest) -> None:
     megatron_train.load_adapter_into_model(model_chunks, adapter_model, optimizer)
     _debug("collecting loaded lora state")
     loaded_state = _collect_lora_state(model_chunks)
+    _debug("collecting loaded lora main state")
+    loaded_main_state = _collect_lora_main_state(model_chunks)
     if torch.distributed.get_rank() == 0:  # ty: ignore[possibly-missing-attribute]
         _debug("validating loaded lora state")
         _validate_loaded_state_matches_adapter(
             _require_not_none(loaded_state, "loaded_state"), adapter_model
         )
+        loaded_main = _require_not_none(loaded_main_state, "loaded_main_state")
+        loaded_keys = set(_require_not_none(loaded_state, "loaded_state"))
+        if set(loaded_main) != loaded_keys:
+            raise RuntimeError(
+                "LoRA model/main state keys differ after adapter load: "
+                f"missing={sorted(loaded_keys - set(loaded_main))[:3]} "
+                f"extra={sorted(set(loaded_main) - loaded_keys)[:3]}"
+            )
     _debug("waiting after loaded lora validation")
     torch.distributed.barrier()  # ty: ignore[possibly-missing-attribute]
 
@@ -1447,6 +1498,7 @@ def _worker_run(request: WorkerRunRequest) -> None:
             sft_trajectory_tensors[0]
         )
     initial_lora_state = loaded_state
+    initial_lora_main_state = loaded_main_state
     global_grad_accumulation_sequences = request.case_config.grad_accumulation_sequences
 
     train_config = types.TrainConfig(
@@ -1545,16 +1597,20 @@ def _worker_run(request: WorkerRunRequest) -> None:
             forward_trace_capture.save_current_step(traces_dir)
             torch.distributed.barrier()  # ty: ignore[possibly-missing-attribute]
             current_lora_state = _collect_lora_state(model_chunks)
+            current_lora_main_state = _collect_lora_main_state(model_chunks)
 
             if torch.distributed.get_rank() == 0:  # ty: ignore[possibly-missing-attribute]
                 grads = _require_not_none(captured_grads, "captured_grads")
-                initial_state = _require_not_none(
-                    initial_lora_state, "initial_lora_state"
+                initial_main_state = _require_not_none(
+                    initial_lora_main_state, "initial_lora_main_state"
                 )
                 current_state = _require_not_none(
                     current_lora_state, "current_lora_state"
                 )
-                deltas = _delta_state(initial_state, current_state)
+                current_main_state = _require_not_none(
+                    current_lora_main_state, "current_lora_main_state"
+                )
+                deltas = _delta_state(initial_main_state, current_main_state)
                 saved_deltas = _apply_save_mutation_to_tensor_map(
                     deltas,
                     mutation=request.mutation,
