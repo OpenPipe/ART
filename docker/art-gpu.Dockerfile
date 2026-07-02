@@ -61,7 +61,9 @@ RUN /opt/conda/bin/python -m pip install --no-cache-dir "nvidia-cudnn-cu12==${CU
       dst="/usr/local/cuda-12.8/lib64/$(basename "$src")"; \
       if [ ! -e "$dst" ]; then ln -s "$src" "$dst" && printf '%s\n' "$dst" >> /tmp/art-cudnn-symlinks.txt; fi; \
     done \
- && UV_LINK_MODE=hardlink uv sync --frozen --extra backend --extra megatron --extra tinker --no-install-project --python 3.12 \
+ && UV_LINK_MODE=hardlink uv sync --frozen --extra megatron --no-install-project --python 3.12 \
+ && rm -rf .venv \
+ && UV_LINK_MODE=hardlink uv sync --frozen --extra backend --extra tinker --no-install-project --python 3.12 \
  && rm -rf .venv \
  && cd vllm_runtime \
  && UV_LINK_MODE=hardlink uv sync --frozen --no-install-project --no-dev --python 3.12 \
