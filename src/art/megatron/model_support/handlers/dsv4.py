@@ -117,17 +117,9 @@ class Dsv4Handler(DefaultMoeHandler):
             minimums=non_zero_scales,
         )
         loss = oracle_harness.MetricThresholdRule(limits={"mean_abs_pct": 3.0})
-        grad = oracle_harness.MetricAnyThresholdRule(
-            rules=(
-                oracle_harness.MetricThresholdRule(
-                    limits={"mean_abs_pct": 5.0},
-                    minimums=non_zero_scales,
-                ),
-                oracle_harness.MetricThresholdRule(
-                    limits={"mean_abs_diff": 1e-9},
-                    minimums=non_zero_scales,
-                ),
-            )
+        grad = oracle_harness.MetricThresholdRule(
+            limits={"mean_abs_pct": 5.0},
+            minimums=non_zero_scales,
         )
         router_topk = oracle_harness.MetricThresholdRule(
             limits={"topk_mismatch_fraction": 0.0, "top1_mismatch_fraction": 0.0}

@@ -334,29 +334,6 @@ class MetricThresholdRule(BaseModel):
         return len(self.failure_reasons(summary)) == 0
 
 
-class MetricAnyThresholdRule(BaseModel):
-    """Callable row pass rule that accepts any one configured threshold rule."""
-
-    rules: tuple[MetricThresholdRule, ...]
-
-    def failure_reasons(self, summary: MetricSummary) -> list[str]:
-        """Builds readable failure reasons when no threshold alternative passes."""
-        failures = [rule.failure_reasons(summary) for rule in self.rules]
-        if any(not failure for failure in failures):
-            return []
-        return [
-            "all threshold alternatives failed: "
-            + "; ".join(
-                f"rule{index}({', '.join(reasons) or 'returned false'})"
-                for index, reasons in enumerate(failures)
-            )
-        ]
-
-    def __call__(self, summary: MetricSummary) -> bool:
-        """Evaluates whether the summary satisfies at least one configured rule."""
-        return len(self.failure_reasons(summary)) == 0
-
-
 class OracleCaseConfig(BaseModel):
     """Contains all deterministic run parameters for one oracle case."""
 
