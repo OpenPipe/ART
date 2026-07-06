@@ -1736,9 +1736,7 @@ def _gather_bucket_streams(
         recurrent_g.reshape(-1, int(recurrent_g.shape[-1])),
         bucket.row_indices,
         bucket.position_indices,
-        bucket.cu_seqlens,
         token_count=int(bucket.real_token_count),
-        segment_count=int(bucket.segment_count),
         sequence_length=int(qkv.shape[1]),
     )
 
@@ -2202,7 +2200,6 @@ def _scatter_bucket_recurrent_output(
         bucket.row_indices,
         bucket.position_indices,
         _bucket_output_mask(bucket),
-        bucket.cu_seqlens,
     )
 
 

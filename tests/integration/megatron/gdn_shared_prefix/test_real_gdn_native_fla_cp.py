@@ -478,8 +478,25 @@ def _varlen_bucket(
     cu_seqlens_cpu = torch.cat(
         [lengths_cpu.new_zeros(1), torch.cumsum(lengths_cpu, dim=0)]
     )
-    offsets = torch.arange(max_len, device=device, dtype=torch.long).unsqueeze(1)
-    real_mask = offsets < lengths.unsqueeze(0)
+    row_indices = torch.cat(
+        [
+            torch.full((int(length),), row, device=device, dtype=torch.long)
+            for row, length in enumerate(lengths_cpu.tolist())
+            if int(length) > 0
+        ],
+        dim=0,
+    )
+    position_indices = torch.cat(
+        [
+            torch.arange(int(length), device=device, dtype=torch.long)
+            for length in lengths_cpu.tolist()
+            if int(length) > 0
+        ],
+        dim=0,
+    )
+    real_mask = torch.ones(
+        int(lengths_cpu.sum().item()), device=device, dtype=torch.bool
+    )
     return GdnSegmentBucketPlan(
         length=max_len,
         lengths=lengths,
@@ -488,11 +505,8 @@ def _varlen_bucket(
         real_mask=real_mask,
         cu_seqlens=cu_seqlens_cpu.to(device=device),
         cu_seqlens_cpu=cu_seqlens_cpu,
-        row_indices=torch.arange(int(lengths.numel()), device=device, dtype=torch.long)
-        .unsqueeze(0)
-        .expand(max_len, -1)
-        .contiguous(),
-        position_indices=offsets.expand(-1, int(lengths.numel())).contiguous(),
+        row_indices=row_indices.contiguous(),
+        position_indices=position_indices.contiguous(),
         family_indices=torch.arange(
             int(lengths.numel()), device=device, dtype=torch.long
         ),

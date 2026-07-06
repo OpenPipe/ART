@@ -1201,60 +1201,30 @@ def _build_explicit_bucket_plans(
     device: torch.device | str,
     planner_config: GdnPlannerConfig,
 ) -> tuple[GdnSegmentBucketPlan, ...]:
-    stateful = tuple(column for column in columns if column.needs_final_state)
-    stateless = tuple(column for column in columns if not column.needs_final_state)
-    return (
-        *(
-            _build_explicit_bucket_plan(batch, needs_final_state=True, device=device)
-            for batch in _batch_explicit_columns(
-                stateful,
-                max_padding_ratio=planner_config.max_padding_ratio,
-                max_segments_per_batch=planner_config.max_segments_per_batch,
-            )
-        ),
-        *(
-            _build_explicit_bucket_plan(batch, needs_final_state=False, device=device)
-            for batch in _batch_explicit_columns(
-                stateless,
-                max_padding_ratio=planner_config.max_padding_ratio,
-                max_segments_per_batch=planner_config.max_segments_per_batch,
-            )
-        ),
+    return tuple(
+        _build_explicit_bucket_plan(
+            batch,
+            needs_final_state=any(column.needs_final_state for column in batch),
+            device=device,
+        )
+        for batch in _batch_explicit_columns(
+            columns,
+            max_segments_per_batch=planner_config.max_segments_per_batch,
+        )
     )
 
 
 def _batch_explicit_columns(
     columns: tuple[_ExplicitBucketColumn, ...],
     *,
-    max_padding_ratio: float,
     max_segments_per_batch: int,
 ) -> tuple[tuple[_ExplicitBucketColumn, ...], ...]:
     if not columns:
         return ()
-    batches: list[list[_ExplicitBucketColumn]] = []
-    current: list[_ExplicitBucketColumn] = []
-    current_tokens = 0
-    current_max = 0
-    for column in columns:
-        next_count = len(current) + 1
-        next_tokens = current_tokens + column.length
-        next_max = max(current_max, column.length)
-        padded = next_max * next_count
-        can_extend = not current or (
-            next_count <= max_segments_per_batch
-            and padded <= max_padding_ratio * next_tokens
-        )
-        if not can_extend:
-            batches.append(current)
-            current = []
-            current_tokens = 0
-            current_max = 0
-        current.append(column)
-        current_tokens += column.length
-        current_max = max(current_max, column.length)
-    if current:
-        batches.append(current)
-    return tuple(tuple(batch) for batch in batches)
+    return tuple(
+        tuple(columns[start : start + int(max_segments_per_batch)])
+        for start in range(0, len(columns), int(max_segments_per_batch))
+    )
 
 
 def _build_explicit_bucket_plan(
@@ -1302,7 +1272,10 @@ def _build_explicit_bucket_plan(
         plan,
         parent_indices=_move_planner_tensor(parent_indices_cpu, device),
         parent_indices_cpu=parent_indices_cpu,
-        output_mask=_move_planner_tensor(output_mask_cpu, device),
+        output_mask=_move_planner_tensor(
+            _pack_bucket_column_major(output_mask_cpu, lengths_cpu),
+            device,
+        ),
         needs_final_state=needs_final_state,
     )
 
@@ -1462,30 +1435,11 @@ def _batch_segments_by_padded_work(
     ordered = sorted(
         segments, key=lambda segment: (segment.length, segment.family_index)
     )
-    batches: list[list[GdnSegmentSpec]] = []
-    current: list[GdnSegmentSpec] = []
-    current_tokens = 0
-    current_max = 0
-    for segment in ordered:
-        next_count = len(current) + 1
-        next_tokens = current_tokens + segment.length
-        next_max = max(current_max, segment.length)
-        padded = next_max * next_count
-        can_extend = not current or (
-            next_count <= max_segments_per_batch
-            and padded <= max_padding_ratio * next_tokens
-        )
-        if not can_extend:
-            batches.append(current)
-            current = []
-            current_tokens = 0
-            current_max = 0
-        current.append(segment)
-        current_tokens += segment.length
-        current_max = max(current_max, segment.length)
-    if current:
-        batches.append(current)
-    return tuple(tuple(batch) for batch in batches)
+    del max_padding_ratio
+    return tuple(
+        tuple(ordered[start : start + int(max_segments_per_batch)])
+        for start in range(0, len(ordered), int(max_segments_per_batch))
+    )
 
 
 def _batch_tree_segments_by_padded_work(
@@ -1495,23 +1449,11 @@ def _batch_tree_segments_by_padded_work(
     max_padding_ratio: float = 1.25,
     max_segments_per_batch: int = 128,
 ) -> tuple[tuple[GdnSegmentSpec, ...], ...]:
-    stateful = tuple(
-        segment for segment in segments if tree_has_children[segment.family_index]
-    )
-    stateless = tuple(
-        segment for segment in segments if not tree_has_children[segment.family_index]
-    )
-    return (
-        *_batch_segments_by_padded_work(
-            stateful,
-            max_padding_ratio=max_padding_ratio,
-            max_segments_per_batch=max_segments_per_batch,
-        ),
-        *_batch_segments_by_padded_work(
-            stateless,
-            max_padding_ratio=max_padding_ratio,
-            max_segments_per_batch=max_segments_per_batch,
-        ),
+    del tree_has_children
+    return _batch_segments_by_padded_work(
+        segments,
+        max_padding_ratio=max_padding_ratio,
+        max_segments_per_batch=max_segments_per_batch,
     )
 
 
@@ -1546,8 +1488,14 @@ def _build_bucket_plan(
     lengths_by_rank_cpu: torch.Tensor | None = None,
 ) -> GdnSegmentBucketPlan:
     max_length = int(lengths_cpu.max().item())
-    offsets_cpu = torch.arange(max_length, dtype=torch.long).unsqueeze(1)
-    real_mask_cpu = offsets_cpu < lengths_cpu.unsqueeze(0)
+    if (
+        int(row_indices_cpu.shape[0]) < max_length
+        or int(position_indices_cpu.shape[0]) < max_length
+    ):
+        raise ValueError("bucket index tensors are shorter than max segment length")
+    row_indices_cpu = _pack_bucket_column_major(row_indices_cpu, lengths_cpu)
+    position_indices_cpu = _pack_bucket_column_major(position_indices_cpu, lengths_cpu)
+    real_mask_cpu = torch.ones(int(lengths_cpu.sum().item()), dtype=torch.bool)
     cu_seqlens_cpu = torch.cat(
         [lengths_cpu.new_zeros(1), torch.cumsum(lengths_cpu, dim=0)]
     )
@@ -1569,6 +1517,20 @@ def _build_bucket_plan(
         family_indices_cpu=family_indices_cpu,
         real_token_count_static=int(lengths_cpu.sum().item()),
     )
+
+
+def _pack_bucket_column_major(
+    values_cpu: torch.Tensor,
+    lengths_cpu: torch.Tensor,
+) -> torch.Tensor:
+    pieces = [
+        values_cpu[: int(length), column]
+        for column, length in enumerate(lengths_cpu.tolist())
+        if int(length) > 0
+    ]
+    if not pieces:
+        return values_cpu.new_empty((0,))
+    return torch.cat(pieces, dim=0).contiguous()
 
 
 def _segment_token_start(segment: GdnSegmentSpec, sequence_length: int) -> int:
