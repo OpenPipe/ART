@@ -111,7 +111,6 @@ class GdnPlannerConfig:
     """Tunable cost coefficients for one packed-row GDN execution plan."""
 
     max_padding_ratio: float = 2.0
-    max_segments_per_batch: int = 4096
     rank_idle_token_cost: float = 1.0
     max_zero_exchange_load_imbalance: float = 1.5
     planner_local_token_ms: float = 0.00065
@@ -1070,13 +1069,11 @@ def _build_tree_bucket_plans(
             segments,
             tree_has_children,
             max_padding_ratio=planner_config.max_padding_ratio,
-            max_segments_per_batch=planner_config.max_segments_per_batch,
         )
         if split_by_final_state
         else _batch_segments_by_padded_work(
             segments,
             max_padding_ratio=planner_config.max_padding_ratio,
-            max_segments_per_batch=planner_config.max_segments_per_batch,
         )
     )
     return tuple(
@@ -1209,22 +1206,16 @@ def _build_explicit_bucket_plans(
         )
         for batch in _batch_explicit_columns(
             columns,
-            max_segments_per_batch=planner_config.max_segments_per_batch,
         )
     )
 
 
 def _batch_explicit_columns(
     columns: tuple[_ExplicitBucketColumn, ...],
-    *,
-    max_segments_per_batch: int,
 ) -> tuple[tuple[_ExplicitBucketColumn, ...], ...]:
     if not columns:
         return ()
-    return tuple(
-        tuple(columns[start : start + int(max_segments_per_batch)])
-        for start in range(0, len(columns), int(max_segments_per_batch))
-    )
+    return (columns,)
 
 
 def _build_explicit_bucket_plan(
@@ -1428,7 +1419,6 @@ def _batch_segments_by_padded_work(
     segments: tuple[GdnSegmentSpec, ...],
     *,
     max_padding_ratio: float = 1.25,
-    max_segments_per_batch: int = 128,
 ) -> tuple[tuple[GdnSegmentSpec, ...], ...]:
     if not segments:
         return ()
@@ -1436,10 +1426,7 @@ def _batch_segments_by_padded_work(
         segments, key=lambda segment: (segment.length, segment.family_index)
     )
     del max_padding_ratio
-    return tuple(
-        tuple(ordered[start : start + int(max_segments_per_batch)])
-        for start in range(0, len(ordered), int(max_segments_per_batch))
-    )
+    return (tuple(ordered),)
 
 
 def _batch_tree_segments_by_padded_work(
@@ -1447,13 +1434,11 @@ def _batch_tree_segments_by_padded_work(
     tree_has_children: tuple[bool, ...],
     *,
     max_padding_ratio: float = 1.25,
-    max_segments_per_batch: int = 128,
 ) -> tuple[tuple[GdnSegmentSpec, ...], ...]:
     del tree_has_children
     return _batch_segments_by_padded_work(
         segments,
         max_padding_ratio=max_padding_ratio,
-        max_segments_per_batch=max_segments_per_batch,
     )
 
 
