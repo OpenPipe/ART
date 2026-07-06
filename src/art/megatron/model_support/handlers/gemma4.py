@@ -16,16 +16,15 @@ from megatron.core.extensions.transformer_engine import (
 )
 from megatron.core.fp4_utils import get_fp4_context
 from megatron.core.fp8_utils import get_fp8_context
-from megatron.core.tensor_parallel.mappings import (
-    reduce_from_tensor_model_parallel_region,
-    reduce_scatter_to_sequence_parallel_region,
-)
 import torch
 
+from art.megatron import lora as art_lora
 from art.megatron.lora import SelfAttentionLinearProjLoRA
 from art.megatron.model_support.handlers.default_dense import (
+    DefaultDenseHandler,
     DefaultMoeHandler,
     _compile_workaround_flags_for_provider,
+    _require_dense_mlp,
     _require_moe_experts,
 )
 from art.megatron.model_support.handlers.qwen3_common import (
@@ -35,6 +34,7 @@ from art.megatron.model_support.spec import (
     CompileWorkaroundConfig,
     ExpertPackedLoraGroup,
     ExpertPackedLoraSlot,
+    FlexAttentionCompileCrashConfig,
     LayerFamilyInstance,
 )
 
@@ -47,6 +47,14 @@ _GEMMA4_MOE_COMPILE_WORKAROUND_FLAGS = (
     "moe_postprocess",
     "te_triton_permute_with_mask_map",
 )
+_GEMMA4_TRITON_NUM_STAGES_2_SIGNATURES = {
+    # google/gemma-4-31B-it: Triton flex attention raises "No valid triton
+    # configs" for global attention head_dim=512 with backend-only options.
+    ("dense", 60, 5376, 32, 256, 512, 4),
+    # google/gemma-4-26B-A4B-it hits the same Triton resource limit on global
+    # attention head_dim=512 with backend-only options.
+    ("moe", 30, 2816, 16, 256, 512, 2),
+}
 _ART_MOE_EXPERT_KEY_RE = re.compile(
     r"^(?P<prefix>.*\.mlp\.experts)\.(?P<expert>\d+)\."
     r"(?P<module>gate_up_proj|down_proj)\.(?P<lora>lora_[AB])\.weight$"
@@ -79,6 +87,25 @@ _MEGATRON_LAYER_RE = re.compile(r"(?:^|\.)layers\.(?P<layer>\d+)\.")
 _HF_TEXT_EXPERT_KEY_RE = re.compile(r"(?P<layer>\.layers\.\d+)\.experts")
 
 
+def _gemma4_forward_kwargs(model: Any, **kwargs: Any) -> dict[str, Any]:
+    attention_bias = kwargs.get("attention_bias")
+    from art.megatron.context_parallel.types import ArtContextParallelState
+
+    module = model
+    while hasattr(module, "module"):
+        module = module.module
+    gpt_module = getattr(module, "language_model", module)
+    if isinstance(attention_bias, ArtContextParallelState):
+        setattr(
+            gpt_module,
+            "_art_gemma4_rotary_seq_len",
+            int(attention_bias.rank_plan.original_seq_len),
+        )
+    else:
+        setattr(gpt_module, "_art_gemma4_rotary_seq_len", None)
+    return {"extra_block_kwargs": kwargs}
+
+
 class Gemma4MoeHandler(DefaultMoeHandler):
     key = "gemma4_moe"
     is_moe = True
@@ -88,22 +115,7 @@ class Gemma4MoeHandler(DefaultMoeHandler):
         return getattr(base_config, "text_config", base_config)
 
     def get_forward_kwargs(self, model: Any, **kwargs: Any) -> dict[str, Any]:
-        attention_bias = kwargs.get("attention_bias")
-        from art.megatron.context_parallel.types import ArtContextParallelState
-
-        module = model
-        while hasattr(module, "module"):
-            module = module.module
-        gpt_module = getattr(module, "language_model", module)
-        if isinstance(attention_bias, ArtContextParallelState):
-            setattr(
-                gpt_module,
-                "_art_gemma4_rotary_seq_len",
-                int(attention_bias.rank_plan.original_seq_len),
-            )
-        else:
-            setattr(gpt_module, "_art_gemma4_rotary_seq_len", None)
-        return {"extra_block_kwargs": kwargs}
+        return _gemma4_forward_kwargs(model, **kwargs)
 
     def _identity_lora_parameter_suffixes(
         self,
@@ -122,7 +134,7 @@ class Gemma4MoeHandler(DefaultMoeHandler):
         _patch_gemma4_rotary_for_hf_proportional()
         _patch_gemma4_qkv_for_hf_tied_value()
         window_size = int(getattr(provider, "window_size", 1024))
-        provider.art_flex_core_attention_wrapper = _gemma4_flex_core_attention_wrapper
+        _install_gemma4_flex_core_attention_wrapper(provider)
         provider.art_flex_sliding_windows = (window_size,)
         provider.art_flex_head_dims_by_window = {
             None: int(getattr(provider, "global_head_dim", provider.kv_channels)),
@@ -341,8 +353,221 @@ class Gemma4MoeHandler(DefaultMoeHandler):
             disable_compile=False,
         )
 
+    def flex_attention_compile_crash_config(
+        self,
+        provider: Any,
+    ) -> FlexAttentionCompileCrashConfig:
+        if (
+            _gemma4_compile_crash_signature(provider)
+            in _GEMMA4_TRITON_NUM_STAGES_2_SIGNATURES
+        ):
+            return FlexAttentionCompileCrashConfig(
+                triton_num_stages_2_head_dims=(int(provider.global_head_dim),)
+            )
+        return FlexAttentionCompileCrashConfig()
+
 
 GEMMA4_MOE_HANDLER = Gemma4MoeHandler()
+
+
+class Gemma4DenseHandler(DefaultDenseHandler):
+    key = "gemma4_dense"
+    native_vllm_lora_status = "validated"
+
+    def identity_lora_model_config(self, base_config: Any) -> Any:
+        return getattr(base_config, "text_config", base_config)
+
+    def configure_provider_for_runtime(self, provider: Any) -> None:
+        _patch_gemma4_rotary_for_hf_proportional()
+        _patch_gemma4_qkv_for_hf_tied_value()
+        window_size = int(getattr(provider, "window_size", 1024))
+        _install_gemma4_flex_core_attention_wrapper(provider)
+        provider.art_flex_sliding_windows = (window_size,)
+        provider.art_flex_head_dims_by_window = {
+            None: int(getattr(provider, "global_head_dim", provider.kv_channels)),
+            window_size: int(provider.kv_channels),
+        }
+
+    def install_preprocess_patch(self, model_chunks: Sequence[Any]) -> None:
+        _install_gemma4_preprocess_patch(model_chunks)
+        _install_gemma4_full_recompute_patch(model_chunks)
+
+    def collect_layer_families(self, provider: Any) -> list[LayerFamilyInstance]:
+        if int(getattr(provider, "num_moe_experts", 0) or 0) > 0:
+            raise TypeError("Gemma 4 dense handler received a MoE provider")
+        sliding_count, global_count = _gemma4_attention_pattern(provider)
+        families = [
+            LayerFamilyInstance(key="gemma4_sliding_attention", layer_index=0),
+            LayerFamilyInstance(key="dense_mlp", layer_index=0),
+        ]
+        if global_count > 0:
+            families.append(
+                LayerFamilyInstance(
+                    key="gemma4_global_attention",
+                    layer_index=sliding_count,
+                )
+            )
+        return families
+
+    def apply_lora_adapters(
+        self,
+        model_chunks: Sequence[Any],
+        provider: Any,
+        *,
+        target_modules: list[str],
+        rank: int,
+        alpha: int,
+    ) -> None:
+        from megatron.core.transformer.attention import SelfAttention
+        from megatron.core.transformer.transformer_layer import TransformerLayer
+
+        from art.megatron.lora import (
+            _adapter_model_prefix,
+            _is_language_transformer_layer_name,
+            wrap_dense_mlp,
+            wrap_standard_self_attention,
+        )
+
+        target_set = set(target_modules)
+        for chunk in model_chunks:
+            for module_name, module in chunk.named_modules():
+                if not isinstance(module, TransformerLayer):
+                    continue
+                if not _is_language_transformer_layer_name(module_name):
+                    continue
+                adapter_model_prefix = _adapter_model_prefix(module)
+                if not isinstance(module.self_attention, SelfAttention):
+                    raise TypeError(
+                        "Gemma 4 expected a SelfAttention module, got "
+                        f"{type(module.self_attention)}"
+                    )
+                attention_provider = _attention_provider_for_layer(provider, module)
+                qkv_targets = (
+                    {"q_proj", "k_proj", "v_proj"}
+                    if not target_set
+                    else target_set - {"o_proj"}
+                )
+                if qkv_targets:
+                    wrap_standard_self_attention(
+                        module.self_attention,
+                        adapter_model_prefix=adapter_model_prefix,
+                        provider=attention_provider,
+                        target_modules=qkv_targets,
+                        rank=rank,
+                        alpha=alpha,
+                    )
+                if (
+                    not target_set or {"q_proj", "k_proj", "v_proj"} & target_set
+                ) and _is_gemma4_global_layer(int(module.layer_number), provider):
+                    _tie_global_value_lora_to_key(module.self_attention)
+                _wrap_gemma4_attention_output_lora(
+                    module.self_attention,
+                    adapter_model_prefix=adapter_model_prefix,
+                    provider=attention_provider,
+                    target_modules=target_set,
+                    rank=rank,
+                    alpha=alpha,
+                )
+                _require_dense_mlp(module)
+                wrap_dense_mlp(
+                    module.mlp,
+                    adapter_model_prefix=adapter_model_prefix,
+                    provider=provider,
+                    target_modules=target_set,
+                    rank=rank,
+                    alpha=alpha,
+                )
+
+    def build_adapter_weights_by_base(
+        self,
+        model_chunks: Sequence[Any],
+    ) -> dict[str, list[Any]]:
+        from megatron.core.transformer.transformer_layer import TransformerLayer
+
+        from art.megatron.lora import _is_language_transformer_layer_name
+        from art.megatron.weights.adapter_export import (
+            add_dense_mlp_adapter_weights,
+            add_standard_self_attention_adapter_weights,
+            layer_base_prefix,
+        )
+
+        adapter_weights_by_base: dict[str, list[Any]] = {}
+        for chunk in model_chunks:
+            for module_name, module in chunk.named_modules():
+                if not isinstance(module, TransformerLayer):
+                    continue
+                if not _is_language_transformer_layer_name(module_name):
+                    continue
+                layer_prefix = layer_base_prefix(module, module_name=module_name)
+                _require_dense_mlp(module)
+                add_standard_self_attention_adapter_weights(
+                    adapter_weights_by_base,
+                    layer_prefix=layer_prefix,
+                    self_attention=module.self_attention,
+                )
+                add_dense_mlp_adapter_weights(
+                    adapter_weights_by_base,
+                    layer_prefix=layer_prefix,
+                    mlp=module.mlp,
+                )
+        return adapter_weights_by_base
+
+    def to_vllm_lora_tensors(
+        self,
+        tensors: dict[str, torch.Tensor],
+        *,
+        adapter_config: dict[str, Any],
+    ) -> tuple[dict[str, torch.Tensor], dict[str, Any]]:
+        transformed = {_to_vllm_key(key): tensor for key, tensor in tensors.items()}
+        if len(transformed) != len(tensors):
+            raise RuntimeError("Duplicate Gemma 4 LoRA tensor after vLLM conversion")
+        return (
+            _add_gemma4_k_eq_v_v_lora_tensors(
+                transformed,
+                adapter_config=adapter_config,
+            ),
+            adapter_config,
+        )
+
+    def from_vllm_lora_tensors(
+        self,
+        tensors: dict[str, torch.Tensor],
+        *,
+        adapter_config: dict[str, Any],
+    ) -> dict[str, torch.Tensor]:
+        return _drop_gemma4_k_eq_v_v_lora_tensors(
+            dict(tensors),
+            adapter_config=adapter_config,
+        )
+
+    def compile_workaround_config(
+        self,
+        provider: Any,
+    ) -> CompileWorkaroundConfig:
+        return CompileWorkaroundConfig(
+            flags=_compile_workaround_flags_for_provider(provider),
+            shared_expert_state="none",
+            disable_compile=False,
+        )
+
+    def flex_attention_compile_crash_config(
+        self,
+        provider: Any,
+    ) -> FlexAttentionCompileCrashConfig:
+        if (
+            _gemma4_compile_crash_signature(provider)
+            in _GEMMA4_TRITON_NUM_STAGES_2_SIGNATURES
+        ):
+            return FlexAttentionCompileCrashConfig(
+                triton_num_stages_2_head_dims=(int(provider.global_head_dim),)
+            )
+        return FlexAttentionCompileCrashConfig()
+
+    def get_forward_kwargs(self, model: Any, **kwargs: Any) -> dict[str, Any]:
+        return _gemma4_forward_kwargs(model, **kwargs)
+
+
+GEMMA4_DENSE_HANDLER = Gemma4DenseHandler()
 
 _GEMMA4_ROUTER_PATCHED = False
 _GEMMA4_ROTARY_PATCHED = False
@@ -767,6 +992,18 @@ def _gemma4_attention_pattern(provider: Any) -> tuple[int, int]:
     return (int(pattern[0]), int(pattern[1]))
 
 
+def _gemma4_compile_crash_signature(provider: Any) -> tuple[Any, ...]:
+    return (
+        "moe" if int(getattr(provider, "num_moe_experts", 0) or 0) > 0 else "dense",
+        int(provider.num_layers),
+        int(provider.hidden_size),
+        int(provider.num_attention_heads),
+        int(provider.kv_channels),
+        int(getattr(provider, "global_head_dim", 0) or 0),
+        int(getattr(provider, "num_global_key_value_heads", 0) or 0),
+    )
+
+
 def _is_gemma4_global_layer(layer_number: int, provider: Any) -> bool:
     layer_types = getattr(provider, "art_gemma4_layer_types", None)
     if layer_types is not None:
@@ -786,6 +1023,13 @@ def _gemma4_sliding_window_for_layer(provider: Any, layer_number: int) -> int | 
     return int(provider.window_size)
 
 
+def _install_gemma4_flex_core_attention_wrapper(provider: Any) -> None:
+    def _wrapper(_config: Any, base_cls: type[Any]) -> type[Any]:
+        return _gemma4_flex_core_attention_wrapper(provider, base_cls)
+
+    provider.art_flex_core_attention_wrapper = _wrapper
+
+
 def _gemma4_flex_core_attention_wrapper(
     provider: Any, base_cls: type[Any]
 ) -> type[Any]:
@@ -797,6 +1041,11 @@ def _gemma4_flex_core_attention_wrapper(
             *args: Any,
             **kwargs: Any,
         ) -> None:
+            compile_crash_config = getattr(
+                provider, "art_flex_compile_crash_config", None
+            )
+            if compile_crash_config is not None:
+                config.art_flex_compile_crash_config = compile_crash_config
             super().__init__(config, layer_number, *args, **kwargs)
             self.art_sliding_window = _gemma4_sliding_window_for_layer(
                 provider,
@@ -844,9 +1093,13 @@ class _Gemma4SelfAttentionLinearProjLoRA(SelfAttentionLinearProjLoRA):
         lora_output = self.lora(x)
         if self.reduce_output and self.provider.tensor_model_parallel_size > 1:
             if self.provider.sequence_parallel:
-                lora_output = reduce_scatter_to_sequence_parallel_region(lora_output)
+                lora_output = art_lora.reduce_scatter_to_sequence_parallel_region(
+                    lora_output
+                )
             else:
-                lora_output = reduce_from_tensor_model_parallel_region(lora_output)
+                lora_output = art_lora.reduce_from_tensor_model_parallel_region(
+                    lora_output
+                )
         output = base_output + lora_output
         post_layernorm = getattr(linear_proj, "post_layernorm", None)
         if post_layernorm is not None:
@@ -1429,8 +1682,13 @@ def _gemma4_text_only_mapping_registry(hf_config: Any | None = None) -> Any:
             finally:
                 self.hf_param = import_hf_param
 
-    language_mappings = [
-        _text_only_gemma4_mapping(
+    text_config = getattr(hf_config, "text_config", hf_config)
+    is_moe = bool(getattr(text_config, "enable_moe_block", False))
+    language_mappings = []
+    for mapping in upstream_registry.mappings:
+        if not mapping.megatron_param.startswith("language_model."):
+            continue
+        text_mapping = _text_only_gemma4_mapping(
             mapping,
             qkv_mapping_type=_ArtGemma4TextOnlyQKVMapping,
             bridge_gate_up_mapping=bridge_gate_up_mapping,
@@ -1439,10 +1697,65 @@ def _gemma4_text_only_mapping_registry(hf_config: Any | None = None) -> Any:
             art_down_mapping=art_down_mapping,
             global_layer_indices=global_layer_indices,
         )
-        for mapping in upstream_registry.mappings
-        if mapping.megatron_param.startswith("language_model.")
-    ]
+        if not is_moe:
+            if _is_gemma4_moe_mapping(text_mapping):
+                continue
+            text_mapping = _gemma4_dense_mapping(text_mapping)
+        language_mappings.append(text_mapping)
     return MegatronMappingRegistry(*language_mappings)
+
+
+class _ImportOnlyMapping:
+    def __init__(self, mapping: Any) -> None:
+        self._mapping = mapping
+        self.megatron_param = mapping.megatron_param
+        self.hf_param = mapping.hf_param
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._mapping, name)
+
+    def resolve(self, captures: tuple[str, ...]) -> Any:
+        return type(self)(self._mapping.resolve(captures))
+
+    def hf_to_megatron(self, hf_weights: Any, megatron_module: Any) -> Any:
+        return self._mapping.hf_to_megatron(hf_weights, megatron_module)
+
+    def megatron_to_hf(
+        self,
+        megatron_weights: torch.Tensor | None,
+        megatron_module: Any | None,
+    ) -> dict[str, torch.Tensor]:
+        return {}
+
+
+def _gemma4_dense_mapping(mapping: Any) -> Any:
+    megatron_param = str(getattr(mapping, "megatron_param", ""))
+    hf_param = getattr(mapping, "hf_param", None)
+    if megatron_param.endswith(".mlp.linear_fc1.layer_norm_weight") and isinstance(
+        hf_param, str
+    ):
+        cloned = copy(mapping)
+        cloned.hf_param = hf_param.replace(
+            ".post_attention_layernorm.weight",
+            ".pre_feedforward_layernorm.weight",
+        )
+        return cloned
+    if megatron_param.endswith(".pffl_weight"):
+        return _ImportOnlyMapping(mapping)
+    return mapping
+
+
+def _is_gemma4_moe_mapping(mapping: Any) -> bool:
+    megatron_param = str(getattr(mapping, "megatron_param", ""))
+    return any(
+        part in megatron_param
+        for part in (
+            ".mlp.shared_experts.",
+            ".mlp.router.",
+            ".mlp.experts.",
+            ".mlp.post_moe_layernorm.",
+        )
+    )
 
 
 def _text_only_gemma4_mapping(
@@ -1708,14 +2021,12 @@ def ensure_gemma4_text_only_bridge_registered() -> None:
                 "text_config",
                 hf_pretrained.config,
             )
-            if (
-                not getattr(text_config, "enable_moe_block", False)
-                or int(getattr(text_config, "hidden_size_per_layer_input", 0) or 0) > 0
-            ):
+            if int(getattr(text_config, "hidden_size_per_layer_input", 0) or 0) > 0:
                 raise ValueError(
-                    "ART Gemma 4 support currently targets the MoE text backbone "
-                    "without per-layer embeddings."
+                    "ART Gemma 4 support currently targets text backbones without "
+                    "per-layer embeddings."
                 )
+            is_moe = bool(getattr(text_config, "enable_moe_block", False))
 
             provider_kwargs = self.hf_config_to_provider_kwargs(text_config)
             provider = Gemma4ModelProvider(**provider_kwargs)
@@ -1746,21 +2057,27 @@ def ensure_gemma4_text_only_bridge_registered() -> None:
                 setattr(provider, "art_gemma4_layer_types", tuple(layer_types))
                 provider.interleaved_attn_pattern = _infer_attn_pattern(layer_types)
 
-            provider.num_moe_experts = getattr(text_config, "num_experts", 128)
-            provider.moe_router_topk = getattr(text_config, "top_k_experts", 8)
-            provider.moe_ffn_hidden_size = getattr(
-                text_config,
-                "moe_intermediate_size",
-                704,
-            )
-            provider.moe_shared_expert_intermediate_size = getattr(
-                text_config,
-                "intermediate_size",
-                2112,
-            )
-            provider.moe_shared_expert_overlap = False
-            provider.moe_shared_expert_gate = False
-            provider.moe_layer_freq = 1
+            if is_moe:
+                provider.num_moe_experts = getattr(text_config, "num_experts", 128)
+                provider.moe_router_topk = getattr(text_config, "top_k_experts", 8)
+                provider.moe_ffn_hidden_size = getattr(
+                    text_config,
+                    "moe_intermediate_size",
+                    704,
+                )
+                provider.moe_shared_expert_intermediate_size = getattr(
+                    text_config,
+                    "intermediate_size",
+                    2112,
+                )
+                provider.moe_shared_expert_overlap = False
+                provider.moe_shared_expert_gate = False
+                provider.moe_layer_freq = 1
+            else:
+                setattr(provider, "num_moe_experts", None)
+                setattr(provider, "moe_ffn_hidden_size", None)
+                setattr(provider, "moe_shared_expert_intermediate_size", None)
+                provider.ffn_hidden_size = getattr(text_config, "intermediate_size")
             provider.final_logit_softcapping = getattr(
                 text_config,
                 "final_logit_softcapping",

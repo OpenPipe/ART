@@ -35,6 +35,16 @@ class SharedPrefixAttentionState(BaseModel):
 class FlexAttentionWrapper(torch.nn.Module):
     """Compiled `flex_attention` wrapper with Torchtitan-style inductor options."""
 
+    def __init__(
+        self,
+        *,
+        triton_num_stages_2_head_dims: tuple[int, ...] = (),
+    ) -> None:
+        super().__init__()
+        self.triton_num_stages_2_head_dims = tuple(
+            int(dim) for dim in triton_num_stages_2_head_dims
+        )
+
     def forward(
         self,
         q: Tensor,
@@ -52,7 +62,12 @@ class FlexAttentionWrapper(torch.nn.Module):
         )
         return cast(
             Tensor,
-            get_dense_compiled_flex_attention(backend=backend)(
+            get_dense_compiled_flex_attention(
+                backend=backend,
+                head_dim=int(q.shape[-1]),
+                head_dim_v=int(v.shape[-1]),
+                triton_num_stages_2_head_dims=self.triton_num_stages_2_head_dims,
+            )(
                 q,
                 k,
                 v,
@@ -110,7 +125,9 @@ class FlexDotProductAttention(torch.nn.Module):
         del attn_mask_type, attention_type, attention_dropout, cp_comm_type
         self.layer_number = int(layer_number)
         self.config = config
-        self.flex_attention = FlexAttentionWrapper()
+        self.flex_attention = FlexAttentionWrapper(
+            triton_num_stages_2_head_dims=_triton_num_stages_2_head_dims(config)
+        )
 
         if pg_collection is None:
             tp_world_size = self.config.tensor_model_parallel_size
@@ -189,3 +206,15 @@ class FlexDotProductAttention(torch.nn.Module):
         out = out.permute(2, 0, 1, 3).contiguous()
         out = out.view(out.size(0), out.size(1), self.hidden_size_per_partition)
         return out
+
+
+def _triton_num_stages_2_head_dims(config: Any) -> tuple[int, ...]:
+    compile_crash_config = getattr(config, "art_flex_compile_crash_config", None)
+    return tuple(
+        int(dim)
+        for dim in getattr(
+            compile_crash_config,
+            "triton_num_stages_2_head_dims",
+            (),
+        )
+    )

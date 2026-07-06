@@ -674,6 +674,8 @@ def _maybe_modify_converted_hf_grad(
     task: Any,
     converted_weights_dict: dict[str, torch.Tensor],
     hf_state_dict: Any,
+    *,
+    model_is_moe: bool,
 ) -> tuple[dict[str, torch.Tensor], set[str]]:
     if not _is_gemma4_model_bridge(model_bridge):
         return (
@@ -702,7 +704,9 @@ def _maybe_modify_converted_hf_grad(
             continue
         grad = tensor.float()
 
-        if match := _GEMMA4_ROUTER_PROJ_WEIGHT_PATTERN.match(hf_name):
+        if model_is_moe and (
+            match := _GEMMA4_ROUTER_PROJ_WEIGHT_PATTERN.match(hf_name)
+        ):
             prefix = match.group("prefix")
             scale = hf_state_dict[f"{prefix}router.scale"].float().to(grad.device)
             ln2 = (
@@ -728,7 +732,9 @@ def _maybe_modify_converted_hf_grad(
             )
             continue
 
-        if match := _GEMMA4_SHARED_EXPERT_WEIGHT_PATTERN.match(hf_name):
+        if model_is_moe and (
+            match := _GEMMA4_SHARED_EXPERT_WEIGHT_PATTERN.match(hf_name)
+        ):
             prefix = match.group("prefix")
             pffl = (
                 hf_state_dict[f"{prefix}pre_feedforward_layernorm.weight"]
@@ -802,6 +808,7 @@ def _convert_megatron_tasks_to_hf(
                         task,
                         converted_weights_dict,
                         hf_state_dict,
+                        model_is_moe=runtime.model_support_handler.is_moe,
                     )
                 )
             else:

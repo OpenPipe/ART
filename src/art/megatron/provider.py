@@ -568,6 +568,9 @@ def prepare_provider_bundle(
     _apply_art_training_runtime_prepare_defaults(provider)
     bundle.handler.configure_provider_for_runtime(provider)
     _apply_runtime_env_overrides(provider, runtime_env)
+    provider.art_flex_compile_crash_config = (
+        bundle.handler.flex_attention_compile_crash_config(provider)
+    )
     provider.sequence_parallel = provider.tensor_model_parallel_size > 1
     _install_art_training_flex_attention(provider)
     bundle.handler.patch_provider(provider, bundle.bridge)

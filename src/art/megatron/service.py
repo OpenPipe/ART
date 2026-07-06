@@ -20,6 +20,7 @@ from ..dev.validate import is_dedicated_mode
 from ..preprocessing.pack import DiskPackedTensors
 from ..preprocessing.tokenize import SFTBatch
 from ..types import MegatronRuntimeConfig, MegatronTopologyConfig
+from ..utils.get_model_step import get_step_from_dir
 from ..utils.lifecycle import (
     ChildProcessSupervisor,
     ServiceLifecycle,

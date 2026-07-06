@@ -579,11 +579,19 @@ def unflatten_valid_sequence_head_major(
 
 
 class FlexAttentionKernel:
-    def __init__(self, *, compile_enabled: bool) -> None:
+    def __init__(
+        self,
+        *,
+        compile_enabled: bool,
+        triton_num_stages_2_head_dims: tuple[int, ...] = (),
+    ) -> None:
         if not compile_enabled:
             raise RuntimeError(
                 "ART context parallel attention requires compiled flex attention."
             )
+        self.triton_num_stages_2_head_dims = tuple(
+            int(dim) for dim in triton_num_stages_2_head_dims
+        )
 
     def run(
         self,
@@ -627,6 +635,9 @@ class FlexAttentionKernel:
             else get_sparse_compiled_flex_attention(
                 family_key=str(compile_key),
                 backend=backend,
+                head_dim=int(q.shape[-1]),
+                head_dim_v=int(v.shape[-1]),
+                triton_num_stages_2_head_dims=self.triton_num_stages_2_head_dims,
             )
         )
         out, aux = cast(
@@ -1854,8 +1865,12 @@ def _run_context_parallel_forward(
     enable_gqa: bool,
     compile_enabled: bool,
     sliding_window: int | None,
+    triton_num_stages_2_head_dims: tuple[int, ...],
 ) -> torch.Tensor:
-    kernel = FlexAttentionKernel(compile_enabled=compile_enabled)
+    kernel = FlexAttentionKernel(
+        compile_enabled=compile_enabled,
+        triton_num_stages_2_head_dims=triton_num_stages_2_head_dims,
+    )
     q_flat, k_flat, v_flat = _flatten_qkv(
         query=query,
         key=key,
@@ -1890,8 +1905,12 @@ def _run_context_parallel_forward_recorded(
     enable_gqa: bool,
     compile_enabled: bool,
     sliding_window: int | None,
+    triton_num_stages_2_head_dims: tuple[int, ...],
 ) -> tuple[torch.Tensor, torch.Tensor, list[dict[str, Any]]]:
-    kernel = FlexAttentionKernel(compile_enabled=compile_enabled)
+    kernel = FlexAttentionKernel(
+        compile_enabled=compile_enabled,
+        triton_num_stages_2_head_dims=triton_num_stages_2_head_dims,
+    )
     q_flat, k_flat, v_flat = _flatten_qkv(
         query=query,
         key=key,
@@ -1989,9 +2008,13 @@ def _run_context_parallel_backward(
     enable_gqa: bool,
     compile_enabled: bool,
     sliding_window: int | None,
+    triton_num_stages_2_head_dims: tuple[int, ...],
     replay_records: list[dict[str, Any]] | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    kernel = FlexAttentionKernel(compile_enabled=compile_enabled)
+    kernel = FlexAttentionKernel(
+        compile_enabled=compile_enabled,
+        triton_num_stages_2_head_dims=triton_num_stages_2_head_dims,
+    )
     comm_async_enabled = _distributed_cp_comm_enabled(state)
     q_flat, k_flat, v_flat = _flatten_qkv(
         query=query,
@@ -2244,12 +2267,16 @@ class ArtContextParallelFn(torch.autograd.Function):
         enable_gqa: bool,
         compile_enabled: bool,
         sliding_window: int | None,
+        triton_num_stages_2_head_dims: tuple[int, ...],
     ) -> torch.Tensor:
         ctx.state = state
         ctx.scale = float(scale)
         ctx.enable_gqa = bool(enable_gqa)
         ctx.compile_enabled = bool(compile_enabled)
         ctx.sliding_window = sliding_window
+        ctx.triton_num_stages_2_head_dims = tuple(
+            int(dim) for dim in triton_num_stages_2_head_dims
+        )
         ctx.save_for_backward(query, key, value)
         with torch.enable_grad():
             query_record = query.detach().requires_grad_(bool(query.requires_grad))
@@ -2265,6 +2292,7 @@ class ArtContextParallelFn(torch.autograd.Function):
                     enable_gqa=bool(enable_gqa),
                     compile_enabled=bool(compile_enabled),
                     sliding_window=sliding_window,
+                    triton_num_stages_2_head_dims=ctx.triton_num_stages_2_head_dims,
                 )
             )
         ctx.replay_records = replay_records
@@ -2285,11 +2313,12 @@ class ArtContextParallelFn(torch.autograd.Function):
                 enable_gqa=ctx.enable_gqa,
                 compile_enabled=ctx.compile_enabled,
                 sliding_window=ctx.sliding_window,
+                triton_num_stages_2_head_dims=ctx.triton_num_stages_2_head_dims,
                 replay_records=cast(list[dict[str, Any]], ctx.replay_records),
             )
         finally:
             ctx.replay_records = None
-        return dq, dk, dv, None, None, None, None, None
+        return dq, dk, dv, None, None, None, None, None, None
 
 
 def run_context_parallel(
@@ -2302,6 +2331,7 @@ def run_context_parallel(
     enable_gqa: bool,
     compile_enabled: bool,
     sliding_window: int | None = None,
+    triton_num_stages_2_head_dims: tuple[int, ...] = (),
 ) -> torch.Tensor:
     if torch.is_grad_enabled() and (
         query.requires_grad or key.requires_grad or value.requires_grad
@@ -2315,6 +2345,7 @@ def run_context_parallel(
             bool(enable_gqa),
             bool(compile_enabled),
             None if sliding_window is None else int(sliding_window),
+            tuple(int(dim) for dim in triton_num_stages_2_head_dims),
         )
     return _run_context_parallel_forward(
         query=query,
@@ -2325,4 +2356,7 @@ def run_context_parallel(
         enable_gqa=enable_gqa,
         compile_enabled=compile_enabled,
         sliding_window=sliding_window,
+        triton_num_stages_2_head_dims=tuple(
+            int(dim) for dim in triton_num_stages_2_head_dims
+        ),
     )

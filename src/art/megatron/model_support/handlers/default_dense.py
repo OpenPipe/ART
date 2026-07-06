@@ -5,6 +5,7 @@ import torch
 from art.megatron.model_support.spec import (
     CompileWorkaroundConfig,
     ExpertPackedLoraGroup,
+    FlexAttentionCompileCrashConfig,
     LayerFamilyInstance,
     SharedExpertCompileState,
 )
@@ -203,6 +204,13 @@ class DefaultDenseHandler:
             flags=_compile_workaround_flags_for_provider(provider),
             shared_expert_state=self._shared_expert_compile_state(provider),
         )
+
+    def flex_attention_compile_crash_config(
+        self,
+        provider: Any,
+    ) -> FlexAttentionCompileCrashConfig:
+        del provider
+        return FlexAttentionCompileCrashConfig()
 
     def get_forward_kwargs(self, model: Any, **kwargs: Any) -> dict[str, Any]:
         del model

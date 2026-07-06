@@ -184,6 +184,20 @@ def test_architecture_specific_real_path_limits() -> None:
 def test_gemma4_real_path_limits() -> None:
     assert (
         fwd_mean_abs_pct_limit_for_model(
+            "google/gemma-4-31B-it",
+            allow_unvalidated_arch=True,
+        )
+        == 8.0
+    )
+    assert (
+        top20_kl_candidate_to_target_limit_for_model(
+            "google/gemma-4-31B-it",
+            allow_unvalidated_arch=True,
+        )
+        == 0.003
+    )
+    assert (
+        fwd_mean_abs_pct_limit_for_model(
             "google/gemma-4-26B-A4B-it",
             allow_unvalidated_arch=True,
         )

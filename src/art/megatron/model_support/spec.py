@@ -48,6 +48,12 @@ class CompileWorkaroundConfig(BaseModel):
     disable_compile: bool = False
 
 
+class FlexAttentionCompileCrashConfig(BaseModel):
+    # Fatal compile workarounds only. Do not add entries for autotuning noise or
+    # performance tuning; entries require Inductor to raise after config search.
+    triton_num_stages_2_head_dims: tuple[int, ...] = ()
+
+
 class ExpertPackedLoraSlot(BaseModel):
     source_projection: str
     source_lora: Literal["lora_A", "lora_B"]
@@ -138,5 +144,10 @@ class ModelSupportHandler(Protocol):
         self,
         provider: "GPTModelProvider",
     ) -> CompileWorkaroundConfig: ...
+
+    def flex_attention_compile_crash_config(
+        self,
+        provider: "GPTModelProvider",
+    ) -> FlexAttentionCompileCrashConfig: ...
 
     def get_forward_kwargs(self, model: Any, **kwargs: Any) -> dict[str, Any]: ...

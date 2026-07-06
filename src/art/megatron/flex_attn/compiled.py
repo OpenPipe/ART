@@ -16,7 +16,7 @@ apply_flash_flex_dlse_patch()
 
 
 # Integration tests patch this module in-process when they need a non-default
-# backend; production ART always uses FLASH here.
+# backend; production ART uses FLASH except for unsupported wide-head cases.
 _FORCED_FLEX_BACKEND = "FLASH"
 _FLASH_LSE_RESCALE = math.log(2.0)
 FlexBackend: TypeAlias = Literal["FLASH", "TRITON"]
@@ -43,6 +43,10 @@ def normalize_flex_lse(
 
 _FLASH_FLEX_KERNEL_OPTIONS = cast(FlexKernelOptions, {"BACKEND": "FLASH"})
 _TRITON_FLEX_KERNEL_OPTIONS = cast(FlexKernelOptions, {"BACKEND": "TRITON"})
+_TRITON_NUM_STAGES_2_FLEX_KERNEL_OPTIONS = cast(
+    FlexKernelOptions,
+    {"BACKEND": "TRITON", "num_stages": 2},
+)
 _FORCED_FLEX_KERNEL_OPTIONS = cast(
     FlexKernelOptions,
     {"BACKEND": _FORCED_FLEX_BACKEND},
@@ -166,7 +170,35 @@ def select_sparse_execution_family(
     return int(target_q_len), int(target_k_len), "sparse"
 
 
-def get_dense_compiled_flex_attention(*, backend: FlexBackend) -> Any:
+def _needs_triton_num_stages_2(
+    *,
+    backend: FlexBackend,
+    head_dim: int,
+    head_dim_v: int,
+    triton_num_stages_2_head_dims: tuple[int, ...],
+) -> bool:
+    if backend != "TRITON":
+        return False
+    return (
+        int(head_dim) in triton_num_stages_2_head_dims
+        or int(head_dim_v) in triton_num_stages_2_head_dims
+    )
+
+
+def get_dense_compiled_flex_attention(
+    *,
+    backend: FlexBackend,
+    head_dim: int,
+    head_dim_v: int,
+    triton_num_stages_2_head_dims: tuple[int, ...] = (),
+) -> Any:
+    if _needs_triton_num_stages_2(
+        backend=backend,
+        head_dim=head_dim,
+        head_dim_v=head_dim_v,
+        triton_num_stages_2_head_dims=triton_num_stages_2_head_dims,
+    ):
+        return triton_num_stages_2_dense_compiled_flex_attention
     if backend == _FORCED_FLEX_BACKEND:
         return dense_compiled_flex_attention
     if backend == "FLASH":
@@ -178,8 +210,18 @@ def get_sparse_compiled_flex_attention(
     *,
     family_key: str,
     backend: FlexBackend,
+    head_dim: int,
+    head_dim_v: int,
+    triton_num_stages_2_head_dims: tuple[int, ...] = (),
 ) -> Any:
     del family_key
+    if _needs_triton_num_stages_2(
+        backend=backend,
+        head_dim=head_dim,
+        head_dim_v=head_dim_v,
+        triton_num_stages_2_head_dims=triton_num_stages_2_head_dims,
+    ):
+        return triton_num_stages_2_sparse_compiled_flex_attention
     if backend == _FORCED_FLEX_BACKEND:
         return sparse_compiled_flex_attention
     if backend == "FLASH":
@@ -196,6 +238,9 @@ flash_dense_compiled_flex_attention = torch.compile(
 triton_dense_compiled_flex_attention = torch.compile(
     _flex_attention_with_options(_TRITON_FLEX_KERNEL_OPTIONS),
 )
+triton_num_stages_2_dense_compiled_flex_attention = torch.compile(
+    _flex_attention_with_options(_TRITON_NUM_STAGES_2_FLEX_KERNEL_OPTIONS),
+)
 
 sparse_compiled_flex_attention = torch.compile(
     _forced_flex_attention_sparse,
@@ -205,4 +250,7 @@ flash_sparse_compiled_flex_attention = torch.compile(
 )
 triton_sparse_compiled_flex_attention = torch.compile(
     _flex_attention_with_options(_TRITON_FLEX_KERNEL_OPTIONS),
+)
+triton_num_stages_2_sparse_compiled_flex_attention = torch.compile(
+    _flex_attention_with_options(_TRITON_NUM_STAGES_2_FLEX_KERNEL_OPTIONS),
 )

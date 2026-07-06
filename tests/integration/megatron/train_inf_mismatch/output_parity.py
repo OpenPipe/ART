@@ -16,20 +16,24 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 # vLLM generation vs Megatron: 2.916% mean_abs_pct, 0.0123 MAE, 0.883 top1,
 # 0.976 top20; vLLM prompt_logprobs vs Megatron: 7.896%, 0.0334 MAE, 0.969
 # top1, 0.941 top20; vLLM generation vs vLLM prompt_logprobs: 7.517%, 0.0322
-# MAE, 0.879 top1, 0.941 top20. Do not tighten these thresholds without
-# rechecking vLLM self-mismatch on the measured path. With the workflow's 16-token
-# completions, Qwen3.5 MoE reruns on 2026-05-25 measured 4.169% and 4.606%
-# mean_abs_pct while staying under the KL gate, so its gate is 5%.
+# MAE, 0.879 top1, 0.941 top20. The real ART path also canonicalizes shared
+# prefix routes when vLLM produced different routes for the same prefix. Do not
+# tighten these thresholds without rechecking both vLLM self-mismatch and shared
+# prefix route-conflict behavior on the measured path. With the workflow's
+# 16-token completions, Qwen3.5 MoE reruns on 2026-05-25 measured 4.169% and
+# 4.606% mean_abs_pct while staying under the KL gate, so its gate is 5%.
 BF16_FWD_MEAN_ABS_PCT_LIMIT = 4.0
 BF16_FWD_MEAN_ABS_PCT_LIMIT_BY_MODEL_KEY = {
     # Gemma 4 MoE long-prompt SWA native-LoRA runs showed high variation, with
     # repeated samples reaching 7.6% mean_abs_pct and 0.0076 KL.
+    "gemma4_dense": 8.0,
     "gemma4_moe": 8.0,
     "qwen3_moe": 7.0,
     "qwen3_5_moe": 5.0,
 }
 TOP20_KL_CANDIDATE_TO_TARGET_LIMIT = 0.002
 TOP20_KL_CANDIDATE_TO_TARGET_LIMIT_BY_MODEL_KEY = {
+    "gemma4_dense": 0.003,
     "gemma4_moe": 0.008,
 }
 MEAN_ABS_PCT_DENOMINATOR_EPS = 1e-18
@@ -1124,55 +1128,65 @@ def score_context_parallel_runtime(
     rollout_mode: RolloutMode | None = "native_lora",
     global_grad_accumulation_sequences: int,
 ) -> ScoreBundle:
-    import torch
+    from art.megatron.training.microbatches import (
+        _clone_packed_tensors,
+        _zero_contribution_inputs,
+        build_micro_sample_indices,
+        select_indexed_inputs,
+        select_micro_inputs,
+    )
 
     controller = runtime.moe_routing_replay_controller
-    if controller is None:
-        return _score_context_parallel_once(
-            runtime=runtime,
-            packed_tensors=packed_tensors,
-            logical_tokens=logical_map.tokens,
-            sample_id_to_row=None,
-            side="megatron",
-            weight_state=weight_state,
-            rollout_mode=rollout_mode,
-        )
-
     target_logprobs: list[float] = []
     topk: list[TokenTopK] = []
     tokens_by_sample: dict[int, list[LogicalToken]] = {}
     for token in logical_map.tokens:
         tokens_by_sample.setdefault(token.sample_id, []).append(token)
     num_sequences = int(packed_tensors["tokens"].shape[0])
-    for sample_index in range(num_sequences):
-        sample_tensors = {
-            key: (
-                value[sample_index : sample_index + 1]
-                if isinstance(value, torch.Tensor)
-                and value.shape[:1] == packed_tensors["tokens"].shape[:1]
-                else value
-            )
-            for key, value in packed_tensors.items()
-        }
-        step_index = sample_index // global_grad_accumulation_sequences
-        controller.set_step(
+    template = _clone_packed_tensors(
+        select_indexed_inputs(cast(Any, packed_tensors), 0)
+    )
+    zero_template = _zero_contribution_inputs(template)
+    num_steps = math.ceil(num_sequences / global_grad_accumulation_sequences)
+    for step_index in range(num_steps):
+        micro_indices = build_micro_sample_indices(
             step_index=step_index,
-            sample_index=sample_index,
+            num_sequences=num_sequences,
             global_grad_accumulation_sequences=global_grad_accumulation_sequences,
         )
-        controller.begin_micro(sample_index, sample_index)
-        sample_score = _score_context_parallel_once(
-            runtime=runtime,
-            packed_tensors=sample_tensors,
-            logical_tokens=tokens_by_sample.get(sample_index, []),
-            sample_id_to_row={sample_index: 0},
-            side="megatron",
-            weight_state=weight_state,
-            rollout_mode=rollout_mode,
+        micro_inputs = select_micro_inputs(
+            cast(Any, packed_tensors),
+            micro_indices,
+            zero_template,
         )
-        controller.finalize_step()
-        target_logprobs.extend(sample_score.target_logprobs)
-        topk.extend(sample_score.topk)
+        if controller is not None:
+            controller.set_step(
+                step_index=step_index,
+                sample_index=micro_indices,
+                global_grad_accumulation_sequences=global_grad_accumulation_sequences,
+            )
+        for micro_order, (sample_index, micro_input) in enumerate(
+            zip(micro_indices, micro_inputs, strict=True)
+        ):
+            if controller is not None:
+                controller.begin_micro(sample_index, micro_order)
+            sample_score = _score_context_parallel_once(
+                runtime=runtime,
+                packed_tensors=cast(dict[str, Any], micro_input),
+                logical_tokens=(
+                    []
+                    if sample_index is None
+                    else tokens_by_sample.get(sample_index, [])
+                ),
+                sample_id_to_row=({} if sample_index is None else {sample_index: 0}),
+                side="megatron",
+                weight_state=weight_state,
+                rollout_mode=rollout_mode,
+            )
+            target_logprobs.extend(sample_score.target_logprobs)
+            topk.extend(sample_score.topk)
+        if controller is not None:
+            controller.finalize_step()
     return ScoreBundle(
         side="megatron",
         weight_state=weight_state,

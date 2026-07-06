@@ -54,7 +54,7 @@ _SINGLE_ROTARY_OUTPUT_HANDLER_KEYS = frozenset(
         "qwen3_5_moe",
     }
 )
-_TUPLE_ROTARY_OUTPUT_HANDLER_KEYS = frozenset({"gemma4_moe"})
+_TUPLE_ROTARY_OUTPUT_HANDLER_KEYS = frozenset({"gemma4_dense", "gemma4_moe"})
 
 
 def _slugify(value: str) -> str:

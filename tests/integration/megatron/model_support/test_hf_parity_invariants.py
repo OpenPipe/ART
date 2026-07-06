@@ -416,6 +416,7 @@ def test_gemma4_router_grad_export_applies_chain_rule() -> None:
             f"{prefix}router.scale": scale,
             f"{prefix}pre_feedforward_layernorm_2.weight": ln2,
         },
+        model_is_moe=True,
     )
 
     root = grad.shape[-1] ** -0.5
@@ -440,6 +441,7 @@ def test_gemma4_absent_v_grad_export_adds_to_k() -> None:
         SimpleNamespace(),
         {k_key: k_grad, v_key: v_grad},
         {k_key: torch.ones_like(k_grad)},
+        model_is_moe=False,
     )
 
     assert torch.equal(converted[k_key], k_grad + v_grad)
@@ -480,6 +482,7 @@ def test_gemma4_shared_expert_grad_export_applies_chain_rule() -> None:
             f"{prefix}pre_feedforward_layernorm.weight": pffl,
             f"{prefix}pre_feedforward_layernorm_2.weight": ln2,
         },
+        model_is_moe=True,
     )
 
     factor = pffl / ln2

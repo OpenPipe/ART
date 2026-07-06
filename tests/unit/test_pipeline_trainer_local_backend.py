@@ -3,16 +3,19 @@ from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 import json
 from pathlib import Path
-from types import SimpleNamespace
+import sys
+from types import ModuleType, SimpleNamespace
 from typing import Any, cast
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 import torch
+from transformers.tokenization_utils_base import PreTrainedTokenizerBase
 
 from art import PipelineRuntimeConfig, TrainableModel, Trajectory, TrajectoryGroup
 from art.dev.model import InternalModelConfig
 from art.local import LocalBackend
+from art.megatron import MegatronBackend
 from art.megatron.train import load_adapter_into_model
 from art.pipeline_trainer import (
     CHECKPOINT_CREATED_AT_METRIC,
@@ -20,6 +23,7 @@ from art.pipeline_trainer import (
     CheckpointRetentionContext,
 )
 from art.pipeline_trainer.trainer import PipelineTrainer
+from art.preprocessing.tokenize import TokenizedResult
 from art.utils.output_dirs import get_model_dir, get_step_checkpoint_dir
 
 
@@ -722,6 +726,184 @@ async def test_pipeline_trainer_logs_checkpoint_retention_metadata(
     assert rows[0]["checkpoint/saved"] == 1.0
     assert rows[0][CHECKPOINT_CREATED_AT_METRIC] > 0.0
     assert rows[1][CHECKPOINT_EVAL_COMPLETED_METRIC] == 1.0
+
+
+def _make_tokenized_result(
+    trajectory: Trajectory,
+    token_ids: list[int],
+) -> TokenizedResult:
+    tokenizer = cast(
+        PreTrainedTokenizerBase,
+        SimpleNamespace(eos_token_id=0, decode=lambda token_id: str(token_id)),
+    )
+    return TokenizedResult(
+        advantage=1.0,
+        chat="",
+        token_ids=token_ids,
+        input_pos=list(range(len(token_ids))),
+        assistant_mask=[0] * (len(token_ids) - 1) + [1],
+        logprobs=[float("nan")] * (len(token_ids) - 1) + [-0.1],
+        pixel_values=None,
+        image_grid_thw=None,
+        trajectory=trajectory,
+        choice_offsets=[],
+        extra_logprobs={},
+        _tokenizer=tokenizer,
+        weight=1.0,
+        prompt_id=123,
+        prompt_length=1,
+    )
+
+
+def test_local_backend_get_packed_tensors_warns_and_drops_overlong_results(
+    tmp_path: Path,
+) -> None:
+    backend = LocalBackend(path=str(tmp_path))
+    model = TrainableModel(
+        name="local-backend-packed-sequence-length",
+        project="pipeline-tests",
+        base_model="test-model",
+        base_path=str(tmp_path),
+        _internal_config=InternalModelConfig(init_args={"max_seq_length": 4}),
+    )
+    short_trajectory = Trajectory(
+        reward=1.0,
+        initial_policy_version=0,
+        messages_and_choices=[
+            {"role": "user", "content": "short"},
+            {"role": "assistant", "content": "answer"},
+        ],
+    )
+    long_trajectory = Trajectory(
+        reward=1.0,
+        initial_policy_version=0,
+        messages_and_choices=[
+            {"role": "user", "content": "long"},
+            {"role": "assistant", "content": "answer"},
+        ],
+    )
+    short_result = _make_tokenized_result(short_trajectory, [1, 2, 3, 4])
+    long_result = _make_tokenized_result(long_trajectory, list(range(10)))
+
+    with (
+        patch(
+            "art.local.backend.AutoTokenizer.from_pretrained",
+            return_value=short_result._tokenizer,
+        ),
+        patch("transformers.AutoImageProcessor.from_pretrained", return_value=None),
+        patch(
+            "art.local.backend.tokenize_trajectory_groups",
+            return_value=iter([short_result, long_result]),
+        ),
+        pytest.warns(UserWarning, match="Dropping 1 tokenized results"),
+    ):
+        packed_tensors = backend._get_packed_tensors(
+            model,
+            [_make_group([0.0, 1.0])],
+            advantage_balance=0.0,
+            allow_training_without_logprobs=False,
+            scale_rewards=True,
+            plot_tensors=False,
+            packed_sequence_length=4,
+            logprob_calculation_chunk_size=2,
+        )
+
+    assert packed_tensors is not None
+    assert packed_tensors["tokens"].shape == (1, 4)
+
+
+@pytest.mark.asyncio
+async def test_local_backend_register_leaves_token_priced_generation_costs_disabled(
+    tmp_path: Path,
+) -> None:
+    model = TrainableModel(
+        name="local-backend-cost-accounting",
+        project="pipeline-tests",
+        base_model="openai/gpt-oss-20b",
+        base_path=str(tmp_path),
+    )
+    backend = LocalBackend(path=str(tmp_path))
+
+    with patch.object(model, "_get_wandb_run", return_value=None):
+        await backend.register(model)
+
+    assert model.cost_calculator(1_000, 2_000, "train") == {}
+
+
+@pytest.mark.asyncio
+async def test_megatron_backend_register_disables_token_priced_generation_costs(
+    tmp_path: Path,
+) -> None:
+    model = TrainableModel(
+        name="megatron-backend-cost-accounting",
+        project="pipeline-tests",
+        base_model="openai/gpt-oss-20b",
+        base_path=str(tmp_path),
+    )
+    backend = MegatronBackend(path=str(tmp_path))
+
+    with patch.object(model, "_get_wandb_run", return_value=None):
+        await backend.register(model)
+
+    assert model.cost_calculator(1_000, 2_000, "train") == {}
+
+
+@pytest.mark.asyncio
+async def test_tinker_backend_register_enables_tinker_token_priced_generation_costs(
+    tmp_path: Path,
+) -> None:
+    fake_tinker_server = ModuleType("art.tinker.server")
+    setattr(fake_tinker_server, "OpenAICompatibleTinkerServer", object)
+    had_tinker_module = "art.tinker" in sys.modules
+    had_tinker_backend_module = "art.tinker.backend" in sys.modules
+    with patch.dict("sys.modules", {"art.tinker.server": fake_tinker_server}):
+        from art.tinker.backend import TinkerBackend
+
+    if not had_tinker_backend_module:
+        sys.modules.pop("art.tinker.backend", None)
+    if not had_tinker_module:
+        sys.modules.pop("art.tinker", None)
+
+    model = TrainableModel(
+        name="tinker-backend-cost-accounting",
+        project="pipeline-tests",
+        base_model="openai/gpt-oss-20b",
+        base_path=str(tmp_path),
+    )
+    with patch.dict("os.environ", {}, clear=True):
+        backend = TinkerBackend(tinker_api_key="test-key", path=str(tmp_path))
+
+    with patch.object(model, "_get_wandb_run", return_value=None):
+        await backend.register(model)
+
+    assert model.cost_calculator(1_000, 2_000, "train") == {
+        "costs/train/tinker_prefill": pytest.approx(0.00012),
+        "costs/train/tinker_sample": pytest.approx(0.0006),
+    }
+
+
+@pytest.mark.asyncio
+async def test_megatron_backend_train_requires_runtime_config(
+    tmp_path: Path,
+) -> None:
+    model = TrainableModel(
+        name="megatron-backend-packed-sequence-length",
+        project="pipeline-tests",
+        base_model="test-model",
+        base_path=str(tmp_path),
+    )
+    backend = MegatronBackend(path=str(tmp_path))
+
+    with patch.object(model, "_get_wandb_run", return_value=None):
+        with pytest.raises(
+            RuntimeError,
+            match="Call art\\.init_megatron_runtime_config\\(\\.\\.\\.\\) before using MegatronBackend",
+        ):
+            await backend.train(
+                model,
+                [_make_group([1.0])],
+                save_checkpoint=False,
+            )
 
 
 def test_load_adapter_into_model_reloads_optimizer_when_provided() -> None:
