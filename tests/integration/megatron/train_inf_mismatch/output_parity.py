@@ -403,6 +403,7 @@ def config_from_env() -> TrainInfOutputParityConfig:
         ("ART_TRAIN_INF_MISMATCH_TP", "tp"),
         ("ART_TRAIN_INF_MISMATCH_EP", "ep"),
         ("ART_TRAIN_INF_MISMATCH_ETP", "etp"),
+        ("ART_TRAIN_INF_MISMATCH_DP", "dp"),
         ("ART_TRAIN_INF_MISMATCH_CP", "cp"),
         ("ART_TRAIN_INF_MISMATCH_PP", "pp"),
     ):

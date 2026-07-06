@@ -18,7 +18,7 @@ import uuid
 from openai.types.chat.chat_completion import Choice
 from pydantic import BaseModel, ConfigDict, Field
 
-from art.dev.model import RolloutWeightsMode
+from art.dev.model import InternalModelConfig, RolloutWeightsMode
 from art.preprocessing.moe_routing import (
     MoeRoutingPackStats,
     PackedMoeRoutingReplay,
@@ -1269,16 +1269,9 @@ async def run_real_path_train_inf_mismatch(
         enable_expert_replay=is_moe,
     )
     backend_open = False
-    model = art.TrainableModel(
-        name=f"train-inf-real-{uuid.uuid4().hex[:8]}",
-        project="train_inf_mismatch",
-        base_model=parity_config.base_model,
-        lora_config=(
-            {"target_modules": _lora_target_modules(parity_config)}
-            if parity_config.lora_target_modules is not None
-            else None
-        ),
-        _internal_config={
+    internal_config = cast(
+        InternalModelConfig,
+        {
             "trainer_gpu_ids": parity_config.trainer_gpu_ids,
             "inference_gpu_ids": parity_config.inference_gpu_ids,
             "rollout_weights_mode": _real_path_rollout_weights_mode(parity_config),
@@ -1295,6 +1288,23 @@ async def run_real_path_train_inf_mismatch(
                 "max_seq_length": parity_config.packed.sequence_length,
             },
         },
+    )
+    if parity_config.external_vllm_server_url is not None:
+        internal_config["vllm_runtime"] = {
+            "mode": "external",
+            "server_url": parity_config.external_vllm_server_url,
+            "api_key": parity_config.external_vllm_api_key,
+        }
+    model = art.TrainableModel(
+        name=f"train-inf-real-{uuid.uuid4().hex[:8]}",
+        project="train_inf_mismatch",
+        base_model=parity_config.base_model,
+        lora_config=(
+            {"target_modules": _lora_target_modules(parity_config)}
+            if parity_config.lora_target_modules is not None
+            else None
+        ),
+        _internal_config=internal_config,
     )
     _move_adapter_to_step_zero(adapter_path=adapter_path, model=model, backend=backend)
 
