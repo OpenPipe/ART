@@ -35,6 +35,9 @@ TOP20_KL_CANDIDATE_TO_TARGET_LIMIT = 0.002
 TOP20_KL_CANDIDATE_TO_TARGET_LIMIT_BY_MODEL_KEY = {
     "gemma4_dense": 0.003,
     "gemma4_moe": 0.008,
+    # GPT OSS MXFP4/native-LoRA repeats on 2026-07-06 stayed under the 4%
+    # mean_abs_pct gate but measured 0.00186-0.00256 top20 KL.
+    "gpt_oss_moe": 0.003,
 }
 MEAN_ABS_PCT_DENOMINATOR_EPS = 1e-18
 TOP_K = 20
