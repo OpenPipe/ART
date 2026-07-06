@@ -110,14 +110,15 @@ class PipelineAutotunerAttachment:
         if self.tuner is not None:
             self.tuner.on_packed_group(observation)
 
-    async def on_stop(self) -> None:
+    async def on_stop(self, *, training_failed: bool = False) -> None:
         if self._sampler_task is not None:
             self._sampler_task.cancel()
             await asyncio.gather(self._sampler_task, return_exceptions=True)
             self._sampler_task = None
         if self._started and self.tuner is not None:
             self._save_profile()
-        self._raise_sampler_error()
+        if not training_failed:
+            self._raise_sampler_error()
 
     async def _wait_for_initial_serving_metrics(self) -> None:
         deadline = time.monotonic() + max(5.0, 2.0 * self.config.vllm_metric_interval_s)

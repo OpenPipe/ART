@@ -337,6 +337,7 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
                         installed_handlers.append(("signal", sig))
                     except (ValueError, RuntimeError):
                         continue
+        training_failed = False
         try:
             async with asyncio.TaskGroup() as tg:
                 tg.create_task(self._rollout_stage(), name="rollout_stage")
@@ -344,6 +345,7 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
                 tg.create_task(self._eval_stage(), name="eval_stage")
                 tg.create_task(self._status_loop(), name="status_loop")
         except* Exception as eg:
+            training_failed = True
             self.request_stop()
             for exc in eg.exceptions:
                 if not isinstance(exc, asyncio.CancelledError):
@@ -365,7 +367,7 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
                         pass
             attachment_failure: Exception | None = None
             try:
-                await self._stop_attachments()
+                await self._stop_attachments(training_failed=training_failed)
             except Exception as exc:
                 attachment_failure = exc
             self._status.flush()
@@ -414,11 +416,11 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
         for attachment in self._attachments:
             await attachment.on_start(self)
 
-    async def _stop_attachments(self) -> None:
+    async def _stop_attachments(self, *, training_failed: bool = False) -> None:
         failures: list[Exception] = []
         for attachment in reversed(self._attachments):
             try:
-                await attachment.on_stop()
+                await attachment.on_stop(training_failed=training_failed)
             except Exception as exc:
                 failures.append(exc)
         if failures:

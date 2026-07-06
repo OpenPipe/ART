@@ -648,6 +648,25 @@ async def test_autotuner_attachment_requires_vllm_metric_contract() -> None:
         await attachment._collect_required_serving_metrics()
 
 
+@pytest.mark.asyncio
+async def test_autotuner_attachment_stop_preserves_primary_training_failure() -> None:
+    attachment = PipelineAutotunerAttachment(PipelineAutotuneConfig())
+    attachment._sampler_error = RuntimeError("metrics endpoint closed")
+
+    await attachment.on_stop(training_failed=True)
+
+
+@pytest.mark.asyncio
+async def test_autotuner_attachment_stop_raises_sampler_failure_without_training_failure() -> (
+    None
+):
+    attachment = PipelineAutotunerAttachment(PipelineAutotuneConfig())
+    attachment._sampler_error = RuntimeError("metrics endpoint closed")
+
+    with pytest.raises(RuntimeError, match="metrics sampler failed"):
+        await attachment.on_stop(training_failed=False)
+
+
 def test_window_stats_requires_train_capacity_for_padding() -> None:
     tuner = PipelineAutotuner(
         config=PipelineAutotuneConfig(),
