@@ -68,6 +68,24 @@ def test_build_runtime_server_cmd_honors_runtime_bin_override(monkeypatch) -> No
     assert command[:2] == ["/opt/art/bin/runtime", "--wrapped"]
 
 
+def test_managed_runtime_close_waits_for_wrapper_child_sweep(monkeypatch) -> None:
+    process = object()
+    calls: list[tuple[object, float]] = []
+
+    def fake_terminate(candidate: object, *, timeout: float = 5.0) -> None:
+        calls.append((candidate, timeout))
+
+    managed = runtime.ManagedVllmRuntime()
+    managed.process = cast(Any, process)
+    managed.log_file = SimpleNamespace(close=lambda: None)
+    monkeypatch.setattr(runtime, "terminate_popen_process_group", fake_terminate)
+
+    managed.close()
+
+    assert calls == [(process, runtime.VLLM_RUNTIME_CLOSE_TIMEOUT)]
+    assert managed.process is None
+
+
 def test_get_vllm_runtime_nccl_so_path_queries_runtime_python(
     monkeypatch,
     tmp_path: Path,

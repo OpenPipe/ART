@@ -25,6 +25,7 @@ RUNTIME_SERVER = "art-vllm-runtime-server"
 RUNTIME_PACKAGE = "art-vllm-runtime"
 RUNTIME_PROTOCOL_VERSION = 1
 RUNTIME_INSTALL_MARKER = "openpipe-art-vllm-runtime"
+VLLM_RUNTIME_CLOSE_TIMEOUT = 15.0
 
 
 class VllmRuntimeLaunchConfig(BaseModel):
@@ -184,7 +185,9 @@ class ManagedVllmRuntime:
 
     def close(self) -> None:
         if self.process is not None:
-            terminate_popen_process_group(self.process)
+            terminate_popen_process_group(
+                self.process, timeout=VLLM_RUNTIME_CLOSE_TIMEOUT
+            )
             self.process = None
         if self.log_file is not None:
             self.log_file.close()
