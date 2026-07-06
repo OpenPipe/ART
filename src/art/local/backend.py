@@ -15,11 +15,14 @@ from types import TracebackType
 from typing import TYPE_CHECKING, Any, AsyncIterator, Iterable, Literal, cast
 import warnings
 
-from art.utils.lifecycle import PROCESS_SHUTDOWN_TIMEOUT_SECONDS
+from art.utils.lifecycle import (
+    PROCESS_SHUTDOWN_TIMEOUT_SECONDS,
+    process_shutdown_timeout,
+)
 
 logger = logging.getLogger(__name__)
 _SERVICE_CLOSE_TIMEOUT_SECONDS = PROCESS_SHUTDOWN_TIMEOUT_SECONDS
-_PROVENANCE_UPDATE_TIMEOUT_SECONDS = 2.0
+_PROVENANCE_UPDATE_TIMEOUT_SECONDS = process_shutdown_timeout(9)
 
 _AUTO_GPU_HOURLY_PRICING_USD = {
     "H200": 3.0,
