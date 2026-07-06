@@ -52,6 +52,7 @@ _SINGLE_ROTARY_OUTPUT_HANDLER_KEYS = frozenset(
         "qwen3_moe",
         "qwen3_5_dense",
         "qwen3_5_moe",
+        "gpt_oss_moe",
     }
 )
 _TUPLE_ROTARY_OUTPUT_HANDLER_KEYS = frozenset({"gemma4_dense", "gemma4_moe"})
