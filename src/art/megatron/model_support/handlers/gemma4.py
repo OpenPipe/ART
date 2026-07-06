@@ -1180,7 +1180,6 @@ def _gemma4_text_config_dict(base_model_name_or_path: str) -> dict[str, Any]:
             hf_hub_download(
                 base_model_name_or_path,
                 "config.json",
-                local_files_only=True,
             )
         )
     config = json.loads(config_path.read_text(encoding="utf-8"))
@@ -1209,7 +1208,6 @@ def _gemma4_hf_file(base_model_name_or_path: str, filename: str) -> Path:
         hf_hub_download(
             base_model_name_or_path,
             filename,
-            local_files_only=True,
         )
     )
 

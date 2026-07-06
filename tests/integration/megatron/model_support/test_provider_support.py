@@ -28,6 +28,8 @@ class _FakeProvider:
         self.overlap_moe_expert_parallel_comm = False
         self.moe_shared_expert_overlap = False
         self.num_moe_experts = 0
+        self.hidden_size = 2048
+        self.moe_ffn_hidden_size = 768
         self.add_bias_linear = True
         self.bias_activation_fusion = True
         self.recompute_granularity: str | None = None
@@ -553,6 +555,28 @@ def test_ep_overlap_recompute_contract_disables_full_recompute() -> None:
     assert provider.recompute_granularity is None
     assert provider.recompute_method is None
     assert provider.recompute_num_layers is None
+
+
+def test_moe_grouped_gemm_fast_path_accepts_128_aligned_dimensions() -> None:
+    provider = _FakeProvider()
+    provider.num_moe_experts = 128
+    provider.hidden_size = 2048
+    provider.moe_ffn_hidden_size = 768
+
+    provider_module._enforce_art_moe_grouped_gemm_fast_path(cast(Any, provider))
+
+    assert provider.add_bias_linear is False
+    assert provider.bias_activation_fusion is False
+
+
+def test_moe_grouped_gemm_fast_path_rejects_unaligned_dimensions() -> None:
+    provider = _FakeProvider()
+    provider.num_moe_experts = 128
+    provider.hidden_size = 2816
+    provider.moe_ffn_hidden_size = 704
+
+    with pytest.raises(RuntimeError, match="moe_ffn_hidden_size=704"):
+        provider_module._enforce_art_moe_grouped_gemm_fast_path(cast(Any, provider))
 
 
 def test_finalize_provider_bundle_can_disable_flex_dispatcher_backend(

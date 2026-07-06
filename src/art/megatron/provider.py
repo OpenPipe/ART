@@ -365,6 +365,7 @@ def _apply_art_training_runtime_prepare_defaults(provider: GPTModelProvider) -> 
 def _enforce_art_moe_grouped_gemm_fast_path(provider: GPTModelProvider) -> None:
     if int(getattr(provider, "num_moe_experts", 0) or 0) <= 0:
         return
+    _require_te_cutlass_grouped_gemm_dimensions(provider)
     # ART's MoE path relies on TE CUTLASS grouped GEMM. TE's cuBLAS grouped
     # fallback builds a cache keyed by routed shapes and warms up slowly as
     # routing changes; the CUTLASS grouped path uses explicit problem
@@ -377,6 +378,27 @@ def _enforce_art_moe_grouped_gemm_fast_path(provider: GPTModelProvider) -> None:
     # while ART keeps this same central fast-path contract.
     provider.add_bias_linear = False
     provider.bias_activation_fusion = False
+
+
+def _require_te_cutlass_grouped_gemm_dimensions(provider: GPTModelProvider) -> None:
+    hidden_size = int(getattr(provider, "hidden_size", 0) or 0)
+    moe_ffn_hidden_size = int(getattr(provider, "moe_ffn_hidden_size", 0) or 0)
+    invalid = [
+        f"{name}={value}"
+        for name, value in (
+            ("hidden_size", hidden_size),
+            ("moe_ffn_hidden_size", moe_ffn_hidden_size),
+        )
+        if value <= 0 or value % 128 != 0
+    ]
+    if invalid:
+        raise RuntimeError(
+            "ART Megatron MoE training requires Transformer Engine CUTLASS "
+            "grouped GEMM-compatible expert dimensions; "
+            f"{', '.join(invalid)} is not 128-aligned. This avoids TE's "
+            "cuBLAS grouped GEMM fallback, whose routed-shape cache warms "
+            "slowly and destabilizes pipeline throughput."
+        )
 
 
 def _apply_art_training_runtime_finalize_defaults(
