@@ -8,12 +8,14 @@ from types import ModuleType, SimpleNamespace
 from typing import Any, cast
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import httpx
 import pytest
 import torch
 from transformers.tokenization_utils_base import PreTrainedTokenizerBase
 
 from art import PipelineRuntimeConfig, TrainableModel, Trajectory, TrajectoryGroup
 from art.dev.model import InternalModelConfig
+from art.errors import ArtVllmMetricsTimeoutError
 from art.local import LocalBackend
 from art.megatron import MegatronBackend
 from art.megatron.train import load_adapter_into_model
@@ -66,6 +68,21 @@ class _FakeArtMetricsClient:
         self.requested_urls.append(url)
         assert headers == {"Authorization": "Bearer token"}
         return _FakeArtMetricsResponse()
+
+
+class _TimeoutArtMetricsClient:
+    def __init__(self, *, timeout: float) -> None:
+        self.timeout = timeout
+
+    async def __aenter__(self) -> "_TimeoutArtMetricsClient":
+        return self
+
+    async def __aexit__(self, *_args: object) -> None:
+        return None
+
+    async def get(self, url: str, *, headers: dict[str, str] | None) -> None:
+        del url, headers
+        raise httpx.TimeoutException("timeout")
 
 
 def _make_group(rewards: list[float]) -> TrajectoryGroup:
@@ -134,6 +151,25 @@ async def test_local_backend_collects_fast_art_vllm_metrics(
     assert metrics["vllm/num_requests_waiting_capacity"] == 2.0
     assert metrics["vllm/kv_cache_usage_perc"] == 0.25
     assert metrics["vllm/prefix_cache_hit_rate"] == 0.7
+
+
+@pytest.mark.asyncio
+async def test_local_backend_vllm_metric_timeout_raises(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr("art.local.backend.httpx.AsyncClient", _TimeoutArtMetricsClient)
+    model = TrainableModel(
+        name="pipeline-fast-vllm-metrics-timeout",
+        project="pipeline-tests",
+        base_model="test-model",
+        base_path=str(tmp_path),
+    )
+    model.inference_base_url = "http://127.0.0.1:9999/v1"
+
+    with pytest.raises(ArtVllmMetricsTimeoutError):
+        await LocalBackend(path=str(tmp_path / "art")).collect_train_step_vllm_metrics(
+            model
+        )
 
 
 @pytest.mark.asyncio
@@ -952,6 +988,25 @@ async def test_local_backend_async_context_manager_awaits_async_cleanup(
 
     assert calls == ["aclose"]
     close_proxy.assert_called_once_with(service)
+
+
+@pytest.mark.asyncio
+async def test_local_backend_close_drains_provenance_update_tasks(
+    tmp_path: Path,
+) -> None:
+    backend = LocalBackend(path=str(tmp_path))
+    completed: list[str] = []
+
+    async def record() -> None:
+        completed.append("done")
+
+    task = asyncio.create_task(record())
+    backend._provenance_update_tasks.add(task)
+
+    await backend.close()
+
+    assert completed == ["done"]
+    assert not backend._provenance_update_tasks
 
 
 @pytest.mark.parametrize(

@@ -1,4 +1,3 @@
-import asyncio
 import json
 from pathlib import Path
 import sys
@@ -48,14 +47,6 @@ class _RecordingAsyncClient:
     ) -> _AsyncOkResponse:
         self._posts.append((url, json if json is not None else params, timeout))
         return _AsyncOkResponse()
-
-
-class _FakeAsyncioProcess:
-    returncode: int | None = None
-
-    async def wait(self) -> int:
-        await asyncio.Event().wait()
-        return 0
 
 
 def test_megatron_default_lora_adapter_config_uses_model_lora_config(
@@ -321,25 +312,33 @@ async def test_megatron_worker_uses_active_python_for_torchrun(
     )
     recorded: dict[str, object] = {}
 
-    async def _fake_create_subprocess_exec(
-        *command: str,
+    def _fake_popen(
+        command: list[str],
+        *,
         cwd: str,
         env: dict[str, str],
         stdout,
         stderr,
         start_new_session: bool,
-    ) -> _FakeAsyncioProcess:
-        recorded["command"] = list(command)
+    ) -> SimpleNamespace:
+        recorded["command"] = command
         recorded["cwd"] = cwd
         recorded["env"] = env
         recorded["stdout"] = stdout
         recorded["stderr"] = stderr
         recorded["start_new_session"] = start_new_session
-        return _FakeAsyncioProcess()
+        return SimpleNamespace(pid=12345, wait=lambda: 0)
 
     monkeypatch.setattr(
-        "art.megatron.service.asyncio.create_subprocess_exec",
-        _fake_create_subprocess_exec,
+        "art.megatron.service.subprocess.Popen",
+        _fake_popen,
+    )
+    monkeypatch.setattr(
+        service._child_processes,
+        "watch_popen",
+        lambda name, process, *, log_path: recorded.update(
+            {"watch_name": name, "watch_process": process, "watch_log_path": log_path}
+        ),
     )
     monkeypatch.setattr(service, "_install_parent_signal_cleanup", lambda: None)
     monkeypatch.setattr(service, "_allocate_master_port", lambda: 12345)
@@ -363,5 +362,6 @@ async def test_megatron_worker_uses_active_python_for_torchrun(
         "q_proj",
         "down_proj",
     ]
+    assert recorded["watch_name"] == "Megatron worker"
     service._child_processes.close()
     service._megatron_log_file.close()

@@ -1,9 +1,14 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 import time
 from typing import Any
 import warnings
+
+import pydantic
+
+from art.errors import ArtVllmMetricsTimeoutError
 
 from .autotune import PipelineAutotuner, build_initial_settings, recommended_queue_size
 from .config import (
@@ -12,8 +17,24 @@ from .config import (
     PipelineAutotunerProfile,
     PipelineMetric,
     PipelineTuneSettings,
+    TunerDecision,
 )
 from .store import PipelineTunerProfileStore
+
+_REQUIRED_AUTOTUNE_VLLM_METRICS = frozenset(
+    {
+        "vllm/num_requests_running",
+        "vllm/num_requests_waiting",
+        "vllm/num_requests_waiting_capacity",
+        "vllm/kv_cache_usage_perc",
+        "vllm/num_preemptions_total",
+    }
+)
+
+
+class VllmMetricPollHealth(pydantic.BaseModel):
+    t_s: float
+    timed_out: bool = False
 
 
 class PipelineAutotunerAttachment:
@@ -24,6 +45,8 @@ class PipelineAutotunerAttachment:
         self.tuner: PipelineAutotuner | None = None
         self.profile_name = config.output_name
         self._sampler_task: asyncio.Task[None] | None = None
+        self._poll_health: list[VllmMetricPollHealth] = []
+        self._sampler_error: BaseException | None = None
         self._started = False
 
     async def on_start(self, trainer: Any) -> None:
@@ -63,6 +86,7 @@ class PipelineAutotunerAttachment:
                 inference_gpu_count=inference_gpu_count,
                 policy_age_limit_steps=policy_age_limit_steps,
             )
+            await self._wait_for_initial_serving_metrics()
             self._sampler_task = asyncio.create_task(
                 self._sample_serving_metrics(),
                 name="art_pipeline_autotuner_vllm_sampler",
@@ -73,9 +97,11 @@ class PipelineAutotunerAttachment:
     async def on_metric(self, metric: PipelineMetric) -> None:
         if self.tuner is None:
             return
+        self._raise_sampler_error()
         decision = self.tuner.on_metric(metric)
         if decision is None:
             return
+        self._raise_if_unhealthy_metric_window(decision)
         assert self.trainer is not None
         self.trainer.apply_pipeline_settings(decision.updated)
         self._save_profile()
@@ -91,23 +117,109 @@ class PipelineAutotunerAttachment:
             self._sampler_task = None
         if self._started and self.tuner is not None:
             self._save_profile()
+        self._raise_sampler_error()
+
+    async def _wait_for_initial_serving_metrics(self) -> None:
+        deadline = time.monotonic() + max(5.0, 2.0 * self.config.vllm_metric_interval_s)
+        while True:
+            try:
+                metrics = await self._collect_required_serving_metrics()
+            except ArtVllmMetricsTimeoutError as exc:
+                self._record_poll_timeout()
+                remaining = deadline - time.monotonic()
+                if remaining <= 0.0:
+                    raise RuntimeError(
+                        "Pipeline autotuning could not collect an initial ART vLLM "
+                        "metrics sample before startup timeout."
+                    ) from exc
+                await asyncio.sleep(min(self.config.vllm_metric_interval_s, remaining))
+                continue
+            self._record_poll_success()
+            await self._emit_metrics(metrics, step=None)
+            return
 
     async def _sample_serving_metrics(self) -> None:
+        assert self.trainer is not None
+        while not self.trainer.state.done:
+            try:
+                metrics = await self._collect_required_serving_metrics()
+                self._record_poll_success()
+                await self._emit_metrics(metrics, step=None)
+            except asyncio.CancelledError:
+                raise
+            except ArtVllmMetricsTimeoutError:
+                self._record_poll_timeout()
+            except Exception as exc:
+                self._sampler_error = exc
+                self.trainer.request_stop()
+                return
+            await asyncio.sleep(self.config.vllm_metric_interval_s)
+
+    async def _collect_required_serving_metrics(self) -> dict[str, float]:
         assert self.trainer is not None
         collector = getattr(
             self.trainer.backend, "collect_train_step_vllm_metrics", None
         )
         if not callable(collector):
+            raise RuntimeError(
+                "Pipeline autotuning requires ART vLLM metrics collection."
+            )
+        maybe_metrics = collector(self.trainer.model)
+        metrics = (
+            await maybe_metrics if inspect.isawaitable(maybe_metrics) else maybe_metrics
+        )
+        if not isinstance(metrics, dict):
+            raise RuntimeError(
+                "Pipeline autotuning expected ART vLLM metrics as a dictionary."
+            )
+        missing = sorted(_REQUIRED_AUTOTUNE_VLLM_METRICS.difference(metrics))
+        if missing:
+            raise RuntimeError(
+                f"Pipeline autotuning requires ART vLLM metrics; missing {missing}."
+            )
+        for name in _REQUIRED_AUTOTUNE_VLLM_METRICS:
+            if not isinstance(metrics[name], (int, float)):
+                raise RuntimeError(
+                    f"Pipeline autotuning requires numeric ART vLLM metric {name!r}."
+                )
+        return metrics
+
+    def _record_poll_success(self) -> None:
+        self._poll_health.append(VllmMetricPollHealth(t_s=time.monotonic()))
+
+    def _record_poll_timeout(self) -> None:
+        self._poll_health.append(
+            VllmMetricPollHealth(t_s=time.monotonic(), timed_out=True)
+        )
+
+    def _raise_if_unhealthy_metric_window(self, decision: TunerDecision) -> None:
+        stats = decision.stats
+        if stats is None:
             return
-        while not self.trainer.state.done:
-            try:
-                metrics = await collector(self.trainer.model)
-                await self._emit_metrics(metrics, step=None)
-            except asyncio.CancelledError:
-                raise
-            except Exception:
-                pass
-            await asyncio.sleep(self.config.vllm_metric_interval_s)
+        end_s = max(stats.window_end_s, stats.window_start_s + 1e-6)
+        polls = [
+            poll
+            for poll in self._poll_health
+            if stats.window_start_s <= poll.t_s <= end_s
+        ]
+        if not polls:
+            raise RuntimeError(
+                "Pipeline autotuning did not collect any ART vLLM metrics polls "
+                f"during decision window steps {stats.start_step}-{stats.end_step}."
+            )
+        timeout_frac = sum(poll.timed_out for poll in polls) / len(polls)
+        if timeout_frac > self.config.vllm_metric_timeout_window_frac:
+            raise RuntimeError(
+                "Pipeline autotuning cannot rely on ART vLLM metrics: "
+                f"{timeout_frac:.1%} of metric polls timed out during decision "
+                f"window steps {stats.start_step}-{stats.end_step}."
+            )
+
+    def _raise_sampler_error(self) -> None:
+        if self._sampler_error is not None:
+            raise RuntimeError(
+                "Pipeline autotuning ART vLLM metrics sampler failed."
+            ) from self._sampler_error
 
     async def _emit_metrics(self, metrics: dict[str, float], step: int | None) -> None:
         now = time.monotonic()

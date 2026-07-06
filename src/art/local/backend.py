@@ -19,6 +19,7 @@ from art.utils.lifecycle import PROCESS_SHUTDOWN_TIMEOUT_SECONDS
 
 logger = logging.getLogger(__name__)
 _SERVICE_CLOSE_TIMEOUT_SECONDS = PROCESS_SHUTDOWN_TIMEOUT_SECONDS
+_PROVENANCE_UPDATE_TIMEOUT_SECONDS = 2.0
 
 _AUTO_GPU_HOURLY_PRICING_USD = {
     "H200": 3.0,
@@ -57,6 +58,7 @@ from .._backend_training import (
 )
 from ..backend import AnyTrainableModel, Backend
 from ..dev.sequence_lengths import max_seq_length_from_model_config
+from ..errors import ArtVllmMetricsTimeoutError
 from ..metrics_taxonomy import (
     TRAIN_GRADIENT_STEPS_KEY,
     build_training_summary_metrics,
@@ -346,10 +348,9 @@ class LocalBackend(Backend):
                 response.raise_for_status()
                 payload = response.json()
         except httpx.TimeoutException:
-            logger.warning(
-                "Timed out collecting ART vLLM metrics from %s", metrics_root
+            raise ArtVllmMetricsTimeoutError(
+                f"Timed out collecting ART vLLM metrics from {metrics_root}."
             )
-            return {"vllm/metrics_scrape_timeout": 1.0}
         except (httpx.HTTPError, ValueError) as exc:
             raise RuntimeError(
                 "ART vLLM metrics require the dedicated ART runtime endpoint at "
@@ -564,12 +565,14 @@ class LocalBackend(Backend):
                     logger.exception("Failed to close local backend service proxy.")
         self._services.clear()
         self._adapter_leases.clear()
+        await self._drain_provenance_update_tasks()
         gc.collect()
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
             torch.cuda.ipc_collect()
 
     def _close(self) -> None:
+        self._cancel_provenance_update_tasks()
         for service in self._services.values():
             try:
                 close = getattr(service, "close", None)
@@ -588,6 +591,31 @@ class LocalBackend(Backend):
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
             torch.cuda.ipc_collect()
+
+    async def _drain_provenance_update_tasks(self) -> None:
+        if not self._provenance_update_tasks:
+            return
+        tasks = set(self._provenance_update_tasks)
+        done, pending = await asyncio.wait(
+            tasks, timeout=_PROVENANCE_UPDATE_TIMEOUT_SECONDS
+        )
+        for task in pending:
+            task.cancel()
+        if pending:
+            await asyncio.gather(*pending, return_exceptions=True)
+        for task in done:
+            try:
+                task.result()
+            except asyncio.CancelledError:
+                pass
+            except Exception:
+                logger.debug("Failed to record W&B provenance", exc_info=True)
+        self._provenance_update_tasks.difference_update(tasks)
+
+    def _cancel_provenance_update_tasks(self) -> None:
+        for task in tuple(self._provenance_update_tasks):
+            task.cancel()
+        self._provenance_update_tasks.clear()
 
     async def register(
         self,

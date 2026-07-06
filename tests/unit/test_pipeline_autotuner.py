@@ -1,6 +1,12 @@
+from types import SimpleNamespace
+
 import pytest
 
 from art.pipeline_tuner import PipelineAutotuneConfig
+from art.pipeline_tuner.attachment import (
+    PipelineAutotunerAttachment,
+    VllmMetricPollHealth,
+)
 from art.pipeline_tuner.autotune import (
     PackingOutcome,
     PipelineAutotuner,
@@ -577,7 +583,69 @@ def test_window_stats_derives_padding_from_packed_group_observations() -> None:
     assert stats is not None
     assert stats.padding_ratio_mean == pytest.approx(0.4)
     assert stats.train_capacity_tokens_mean == 100.0
+    assert stats.window_start_s == 1.0
+    assert stats.window_end_s == 4.0
     assert stats.group_pack_token_samples == [40.0, 20.0] * 4
+
+
+def _decision_for_timeout_window() -> TunerDecision:
+    settings = PipelineTuneSettings(
+        num_rollout_workers=16,
+        min_batch_size=8,
+        max_batch_size=8,
+        queue_maxsize=12,
+        target_groups_per_step=8,
+    )
+    return TunerDecision(
+        step=7,
+        state="inference_under_train_under",
+        action="hold",
+        reason="test",
+        previous=settings,
+        updated=settings,
+        stats=TunerWindowStats(
+            start_step=4,
+            end_step=7,
+            window_start_s=1.0,
+            window_end_s=5.0,
+        ),
+    )
+
+
+def test_autotuner_attachment_allows_sparse_vllm_metric_timeouts() -> None:
+    attachment = PipelineAutotunerAttachment(PipelineAutotuneConfig())
+    attachment._poll_health = [
+        VllmMetricPollHealth(t_s=1.1, timed_out=True),
+        VllmMetricPollHealth(t_s=2.1),
+        VllmMetricPollHealth(t_s=3.1),
+    ]
+
+    attachment._raise_if_unhealthy_metric_window(_decision_for_timeout_window())
+
+
+def test_autotuner_attachment_rejects_unreliable_vllm_metric_timeouts() -> None:
+    attachment = PipelineAutotunerAttachment(PipelineAutotuneConfig())
+    attachment._poll_health = [
+        VllmMetricPollHealth(t_s=1.1, timed_out=True),
+        VllmMetricPollHealth(t_s=2.1, timed_out=True),
+        VllmMetricPollHealth(t_s=3.1),
+    ]
+
+    with pytest.raises(RuntimeError, match="metric polls timed out"):
+        attachment._raise_if_unhealthy_metric_window(_decision_for_timeout_window())
+
+
+@pytest.mark.asyncio
+async def test_autotuner_attachment_requires_vllm_metric_contract() -> None:
+    class Backend:
+        async def collect_train_step_vllm_metrics(self, _model: object):
+            return {"vllm/num_requests_running": 1.0}
+
+    attachment = PipelineAutotunerAttachment(PipelineAutotuneConfig())
+    attachment.trainer = SimpleNamespace(backend=Backend(), model=object())
+
+    with pytest.raises(RuntimeError, match="missing"):
+        await attachment._collect_required_serving_metrics()
 
 
 def test_window_stats_requires_train_capacity_for_padding() -> None:

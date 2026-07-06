@@ -77,6 +77,9 @@ class PipelineAutotuneConfig(pydantic.BaseModel):
         default=0.25, ge=0.0, le=1.0
     )
     vllm_metric_interval_s: float = pydantic.Field(default=1.0, gt=0.0)
+    vllm_metric_timeout_window_frac: float = pydantic.Field(
+        default=0.35, ge=0.0, le=1.0
+    )
 
 
 class PipelineTuneSettings(pydantic.BaseModel):
@@ -105,6 +108,8 @@ class PackedGroupObservation(pydantic.BaseModel):
 class TunerWindowStats(pydantic.BaseModel):
     start_step: int
     end_step: int
+    window_start_s: float = 0.0
+    window_end_s: float = 0.0
     score_mean: float = 0.0
     accepted_tok_per_s_mean: float = 0.0
     trainer_idle_frac: float = 0.0

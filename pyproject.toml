@@ -61,6 +61,7 @@ megatron = [
     "nvidia-ml-py==13.580.82",
     "nvidia-modelopt>=0.42.0a0 ; sys_platform != 'darwin'",
     "nvidia-resiliency-ext<0.5 ; sys_platform == 'linux'",
+    "scipy>=1.17.0",
     "transformers==5.6.2",
     "ml-dtypes>=0.5.0 ; python_full_version < '3.13'",
 ]

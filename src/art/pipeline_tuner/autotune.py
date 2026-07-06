@@ -230,6 +230,8 @@ class PipelineAutotuner:
         return TunerWindowStats(
             start_step=window_steps[0],
             end_step=window_steps[-1],
+            window_start_s=t0,
+            window_end_s=t1,
             score_mean=_mean(
                 _required_step_values(by_step, window_steps, "objective/score_default")
             ),

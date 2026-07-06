@@ -409,14 +409,14 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
             await attachment.on_start(self)
 
     async def _stop_attachments(self) -> None:
-        failures = 0
+        failures: list[Exception] = []
         for attachment in reversed(self._attachments):
             try:
                 await attachment.on_stop()
-            except Exception:
-                failures += 1
+            except Exception as exc:
+                failures.append(exc)
         if failures:
-            print(f"Warning: {failures} pipeline attachment cleanup hook(s) failed.")
+            raise ExceptionGroup("Pipeline attachment cleanup failed.", failures)
 
     async def _emit_pipeline_metric(
         self,
