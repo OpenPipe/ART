@@ -604,9 +604,16 @@ class LocalBackend(Backend):
         )
         for task in pending:
             task.cancel()
+        cancelled_done: set[asyncio.Task[Any]] = set()
         if pending:
-            await asyncio.gather(*pending, return_exceptions=True)
-        for task in done:
+            cancelled_done, pending = await asyncio.wait(
+                pending, timeout=_PROVENANCE_UPDATE_TIMEOUT_SECONDS
+            )
+            if pending:
+                logger.debug(
+                    "Timed out waiting for cancelled W&B provenance tasks to finish."
+                )
+        for task in done | cancelled_done:
             try:
                 task.result()
             except asyncio.CancelledError:

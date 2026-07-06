@@ -363,10 +363,16 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
                             signal.signal(sig, cast(signal.Handlers, previous))
                     except (ValueError, RuntimeError):
                         pass
-            await self._stop_attachments()
+            attachment_failure: Exception | None = None
+            try:
+                await self._stop_attachments()
+            except Exception as exc:
+                attachment_failure = exc
             self._status.flush()
             self._status.close()
             await self._release_all_scheduled_eval_leases()
+            if attachment_failure is not None:
+                raise attachment_failure
 
     def request_stop(self) -> None:
         """Request a clean shutdown of the pipeline stages."""

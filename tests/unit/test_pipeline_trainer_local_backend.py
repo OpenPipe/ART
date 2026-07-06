@@ -1009,6 +1009,32 @@ async def test_local_backend_close_drains_provenance_update_tasks(
     assert not backend._provenance_update_tasks
 
 
+@pytest.mark.asyncio
+async def test_local_backend_close_bounds_cancelled_provenance_tasks(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("art.local.backend._PROVENANCE_UPDATE_TIMEOUT_SECONDS", 0.01)
+    backend = LocalBackend(path=str(tmp_path))
+    release = asyncio.Event()
+
+    async def ignore_cancel() -> None:
+        while not release.is_set():
+            try:
+                await release.wait()
+            except asyncio.CancelledError:
+                continue
+
+    task = asyncio.create_task(ignore_cancel())
+    backend._provenance_update_tasks.add(task)
+
+    await backend.close()
+
+    assert not backend._provenance_update_tasks
+    release.set()
+    await asyncio.wait_for(task, timeout=1.0)
+
+
 @pytest.mark.parametrize(
     ("trainer_kwargs", "match"),
     [
