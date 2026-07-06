@@ -375,6 +375,44 @@ def test_forward_trace_canonicalizes_row_outputs_by_token_uid() -> None:
     )
 
 
+def test_forward_trace_canonicalizes_router_outputs_without_output_attrs() -> None:
+    module = type("RouterWithDenseTraceUids", (), {})()
+    probs = torch.tensor([[3.0], [1.0], [2.0]])
+    routing_map = torch.tensor([[True], [False], [True]])
+    setattr(module, "_art_trace_row_token_uids", torch.tensor([3, 1, 2]))
+
+    row_uids, _uid_span = ForwardTraceCapture._row_token_uids_for_capture(
+        module_name="chunk0.module.decoder.layers.0.mlp.router",
+        inputs=(),
+        output=(probs, routing_map),
+        module=module,
+        row_count=3,
+    )
+    assert row_uids is not None
+
+    trace: dict[str, list[dict[str, Any]]] = {
+        "chunk0.module.decoder.layers.0.mlp.router": [
+            {
+                "primary_output": probs,
+                "router_topk_scores": probs,
+                "router_topk_ids": torch.tensor([[3], [1], [2]]),
+                "output": {"probs": probs, "routing_map": routing_map},
+                "row_token_uids": row_uids,
+            }
+        ]
+    }
+
+    ForwardTraceCapture.canonicalize_trace(trace)
+
+    call = trace["chunk0.module.decoder.layers.0.mlp.router"][0]
+    assert torch.equal(call["row_token_uids"], torch.tensor([1, 2, 3]))
+    assert torch.equal(call["output"]["probs"], torch.tensor([[1.0], [2.0], [3.0]]))
+    assert torch.equal(
+        call["output"]["routing_map"],
+        torch.tensor([[False], [True], [True]]),
+    )
+
+
 def test_forward_trace_expands_attention_output_uids_for_out_norm_heads() -> None:
     trace: dict[str, list[dict[str, Any]]] = {
         "chunk0.module.decoder.layers.0.self_attention": [
