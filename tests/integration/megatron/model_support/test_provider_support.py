@@ -118,6 +118,16 @@ class _FakeWeightBridge:
         return self.resolved
 
 
+class _TransientMegatronBridge:
+    __module__ = "megatron.bridge.models.fake"
+
+
+class _TransientAutoBridge:
+    @property
+    def _model_bridge(self) -> _TransientMegatronBridge:
+        return _TransientMegatronBridge()
+
+
 def test_openpipe_qwen3_14b_instruct_uses_qwen3_dense_support() -> None:
     spec = get_model_support_spec("OpenPipe/Qwen3-14B-Instruct")
     handler = get_model_support_handler("OpenPipe/Qwen3-14B-Instruct")
@@ -283,6 +293,24 @@ def test_gpt_oss_handler_patches_inner_model_bridge_weight_source() -> None:
     handler.patch_bridge(cast(Any, bridge))
 
     source_fn = getattr(inner_bridge, "_art_hf_weight_source")
+    assert source_fn(hf_param, task=None) == HfWeightSource(
+        logical_key=hf_param,
+        physical_key_options=(
+            (hf_param,),
+            (f"{hf_param}_blocks", f"{hf_param}_scales"),
+        ),
+        kind="bridge_materialized",
+    )
+
+
+def test_gpt_oss_handler_patches_transient_megatron_bridge_class() -> None:
+    handler = get_model_support_handler("openai/gpt-oss-20b")
+    bridge = _TransientAutoBridge()
+    hf_param = "model.layers.0.mlp.experts.down_proj"
+
+    handler.patch_bridge(cast(Any, bridge))
+
+    source_fn = getattr(bridge._model_bridge, "_art_hf_weight_source")
     assert source_fn(hf_param, task=None) == HfWeightSource(
         logical_key=hf_param,
         physical_key_options=(

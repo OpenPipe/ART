@@ -89,6 +89,13 @@ class GptOssMoeHandler(DefaultMoeHandler):
         if model_bridge is not None and model_bridge is not bridge:
             if type(model_bridge) is object:
                 return
+            if type(model_bridge).__module__.startswith("megatron.bridge."):
+                setattr(
+                    type(model_bridge),
+                    "_art_hf_weight_source",
+                    staticmethod(_hf_weight_source),
+                )
+                return
             setattr(model_bridge, "_art_hf_weight_source", _hf_weight_source)
 
     def hf_weight_source(
