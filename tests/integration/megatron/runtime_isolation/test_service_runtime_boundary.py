@@ -1,8 +1,9 @@
 import json
 from pathlib import Path
+import subprocess
 import sys
 from types import SimpleNamespace
-from typing import cast
+from typing import Any, cast
 from unittest.mock import AsyncMock
 
 import httpx
@@ -311,22 +312,21 @@ async def test_megatron_worker_uses_active_python_for_torchrun(
         output_dir=str(tmp_path),
     )
     recorded: dict[str, object] = {}
+    real_popen = subprocess.Popen
 
-    def _fake_popen(
-        command: list[str],
-        *,
-        cwd: str,
-        env: dict[str, str],
-        stdout,
-        stderr,
-        start_new_session: bool,
-    ) -> SimpleNamespace:
+    def _fake_popen(command: Any, *args: Any, **kwargs: Any) -> Any:
+        if not (
+            isinstance(command, list)
+            and len(command) > 2
+            and command[1].endswith("managed_process.py")
+        ):
+            return real_popen(command, *args, **kwargs)
         recorded["command"] = command
-        recorded["cwd"] = cwd
-        recorded["env"] = env
-        recorded["stdout"] = stdout
-        recorded["stderr"] = stderr
-        recorded["start_new_session"] = start_new_session
+        recorded["cwd"] = kwargs["cwd"]
+        recorded["env"] = kwargs["env"]
+        recorded["stdout"] = kwargs["stdout"]
+        recorded["stderr"] = kwargs["stderr"]
+        recorded["start_new_session"] = kwargs["start_new_session"]
         return SimpleNamespace(pid=12345, wait=lambda: 0)
 
     monkeypatch.setattr(
