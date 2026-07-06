@@ -2099,8 +2099,17 @@ class VariantRunner:
     def run_suite(
         self,
         variants: list[VariantSpec],
+        *,
+        prune_reference_artifacts: bool = True,
+        prune_case_artifacts: bool = True,
     ) -> list[VariantReport]:
-        """Runs variants in order and stops at the first unexpected signal."""
+        """Runs variants in order and stops at the first unexpected signal.
+
+        Reference and case artifacts are normally pruned when the suite exits.
+        Callers that immediately run another comparison suite against the same
+        reference can defer that pruning so the second suite does not have to
+        regenerate or fail on missing forward traces.
+        """
         reports: list[VariantReport] = []
         try:
             for variant in variants:
@@ -2114,8 +2123,10 @@ class VariantRunner:
                     / "variant_report.json",
                 )
         finally:
-            self._prune_reference_artifacts()
-            _prune_case_artifacts(self.case_dir)
+            if prune_reference_artifacts:
+                self._prune_reference_artifacts()
+            if prune_case_artifacts:
+                _prune_case_artifacts(self.case_dir)
         return reports
 
 
@@ -2196,6 +2207,8 @@ def run_suite(
     cp_supported: bool = True,
     phase_pass_fns: dict[str, PhasePassFn] | None = None,
     use_fp32_lora_reference: bool = True,
+    prune_reference_artifacts: bool = True,
+    prune_case_artifacts: bool = True,
 ) -> list[VariantReport]:
     """Runs non-oracle topologies against the canonical replay-backed oracle."""
     reports: list[VariantReport] = []
@@ -2216,7 +2229,9 @@ def run_suite(
                     max_world_size=max_world_size,
                     variant_flex_backend=variant_flex_backend,
                     phase_pass_fns=phase_pass_fns,
-                )
+                ),
+                prune_reference_artifacts=prune_reference_artifacts,
+                prune_case_artifacts=prune_case_artifacts,
             )
         )
     return reports

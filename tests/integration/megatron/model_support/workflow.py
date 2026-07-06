@@ -540,6 +540,8 @@ def run_correctness_sensitivity_stage(
                 cp_supported=cp_supported,
                 phase_pass_fns=correctness_phase_pass_fns,
                 use_fp32_lora_reference=correctness_use_fp32_lora_reference,
+                prune_reference_artifacts=skip_sensitivity or not mutations,
+                prune_case_artifacts=skip_sensitivity or not mutations,
             )
         sensitivity_reports = []
         if skip_sensitivity:
