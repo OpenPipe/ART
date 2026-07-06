@@ -597,6 +597,7 @@ def _vllm_moe_config(adapter_config: dict[str, Any]) -> dict[str, Any]:
     if "experts" not in target_modules:
         target_modules.append("experts")
     config["target_modules"] = target_modules
+    config["art_merged_lora_delta_unsupported_target_modules"] = ["experts"]
     return config
 
 

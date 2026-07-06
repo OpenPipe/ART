@@ -1,3 +1,4 @@
+import importlib.util
 import json
 from pathlib import Path
 import subprocess
@@ -30,6 +31,7 @@ from art.utils.convert_moe_lora import convert_checkpoint_if_needed
 
 REPO_ROOT = Path(__file__).parents[4]
 VLLM_PYTHON = REPO_ROOT / "vllm_runtime/.venv/bin/python"
+VLLM_RUNTIME_SRC = REPO_ROOT / "vllm_runtime/src"
 
 
 def _config(base_model: str, rank: int = 2, alpha: int = 4) -> dict:
@@ -763,6 +765,34 @@ def test_gpt_oss_vllm_canonical_roundtrip_and_stock_loader(tmp_path: Path):
     assert "model.layers.0.attn.q_proj" in loaded_modules
     assert "model.layers.0.mlp.experts" in loaded_modules
     assert "model.layers.0.mlp.experts.base_layer" in loaded_modules
+
+
+def test_gpt_oss_expert_lora_is_not_emitted_as_merged_delta() -> None:
+    module_path = VLLM_RUNTIME_SRC / "art_vllm_runtime/lora_delta.py"
+    spec = importlib.util.spec_from_file_location("art_vllm_lora_delta", module_path)
+    assert spec is not None and spec.loader is not None
+    lora_delta = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(lora_delta)
+    original = _gpt_oss_moe_art_tensors("base_model.model.model.layers.0")
+    vllm_tensors, adapter_config = GPT_OSS_MOE_HANDLER.to_vllm_lora_tensors(
+        original,
+        adapter_config=_gpt_oss_config("openai/gpt-oss-20b"),
+    )
+
+    names = [
+        name
+        for name, _tensor in lora_delta._iter_lora_checkpoint_deltas(
+            vllm_tensors,
+            adapter_config=adapter_config,
+            previous_lora_tensors=None,
+        )
+    ]
+
+    assert adapter_config["art_merged_lora_delta_unsupported_target_modules"] == [
+        "experts"
+    ]
+    assert "model.layers.0.attn.q_proj.weight" in names
+    assert not any(".mlp.experts" in name for name in names)
 
 
 def test_qwen35_target_parameter_identity_normalizes_to_fused_vllm_layout(
