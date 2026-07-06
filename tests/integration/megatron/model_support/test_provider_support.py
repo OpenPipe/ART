@@ -274,6 +274,25 @@ def test_gpt_oss_handler_plans_only_mxfp4_expert_weights() -> None:
     assert source_fn("model.layers.0.mlp.experts.down_proj_bias", task=None) is None
 
 
+def test_gpt_oss_handler_patches_inner_model_bridge_weight_source() -> None:
+    handler = get_model_support_handler("openai/gpt-oss-20b")
+    inner_bridge = SimpleNamespace()
+    bridge = SimpleNamespace(_model_bridge=inner_bridge)
+    hf_param = "model.layers.0.mlp.experts.down_proj"
+
+    handler.patch_bridge(cast(Any, bridge))
+
+    source_fn = getattr(inner_bridge, "_art_hf_weight_source")
+    assert source_fn(hf_param, task=None) == HfWeightSource(
+        logical_key=hf_param,
+        physical_key_options=(
+            (hf_param,),
+            (f"{hf_param}_blocks", f"{hf_param}_scales"),
+        ),
+        kind="bridge_materialized",
+    )
+
+
 def test_gpt_oss_mxfp4_weight_source_materializes_once() -> None:
     handler = get_model_support_handler("openai/gpt-oss-20b")
     resolved = torch.ones(2, 3)
