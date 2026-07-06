@@ -53,16 +53,18 @@ def _segment_for_token(
     cu_seqlens,
     token,
     SEGMENTS,
-    SEARCH_STEPS: tl.constexpr,
+    SEARCH_STEPS,
 ):
     lo = tl.zeros(token.shape, dtype=tl.int64)
     hi = lo + SEGMENTS.to(tl.int64) - 1
-    for _ in tl.static_range(0, SEARCH_STEPS):
+    step = 0
+    while step < SEARCH_STEPS:
         mid = (lo + hi + 1) // 2
         mid_start = tl.load(cu_seqlens + mid)
         take_upper = mid_start <= token
         lo = tl.where(take_upper, mid, lo)
         hi = tl.where(take_upper, hi, mid - 1)
+        step += 1
     return lo
 
 
@@ -73,7 +75,7 @@ def _packed_conv_token_metadata_kernel(
     token_local_t,
     TOTAL_TOKENS,
     SEGMENTS,
-    SEARCH_STEPS: tl.constexpr,
+    SEARCH_STEPS,
     BLOCK_N: tl.constexpr,
 ):
     pid_n = tl.program_id(0)
