@@ -526,9 +526,10 @@ def _build_provider_bundle(
         dtype=torch_dtype,
         trust_remote_code=True,
     )
+    provider = bridge.to_megatron_provider()
     handler.patch_bridge(bridge)
     return ProviderBundle(
-        provider=bridge.to_megatron_provider(),
+        provider=provider,
         bridge=bridge,
         handler=handler,
         spec=spec,

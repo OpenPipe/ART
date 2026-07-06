@@ -293,6 +293,29 @@ def test_gpt_oss_handler_patches_inner_model_bridge_weight_source() -> None:
     )
 
 
+def test_gpt_oss_provider_patches_inner_model_bridge_after_materialization(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    provider = _FakeProvider()
+    provider.num_moe_experts = 128
+    provider.window_size = (128, 0)
+    inner_bridge = SimpleNamespace()
+    fake_bridge = _FakeBridge(
+        model_bridge=inner_bridge,
+        provider=provider,
+    )
+    monkeypatch.setattr(
+        provider_module.AutoBridge,
+        "from_hf_pretrained",
+        lambda *args, **kwargs: fake_bridge,
+    )
+    monkeypatch.setattr(provider_module.torch.cuda, "device_count", lambda: 2)
+
+    provider_module.prepare_provider_bundle("openai/gpt-oss-20b")
+
+    assert hasattr(inner_bridge, "_art_hf_weight_source")
+
+
 def test_gpt_oss_mxfp4_weight_source_materializes_once() -> None:
     handler = get_model_support_handler("openai/gpt-oss-20b")
     resolved = torch.ones(2, 3)
