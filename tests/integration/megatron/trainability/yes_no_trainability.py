@@ -675,14 +675,6 @@ def _build_internal_config(
     if not shared:
         internal_config["trainer_gpu_ids"] = variant.trainer_gpu_ids
         internal_config["inference_gpu_ids"] = variant.inference_gpu_ids
-        if (
-            stage_resources_apply
-            and stage_resources is not None
-            and stage_resources.megatron is not None
-        ):
-            internal_config["megatron_topology"] = (
-                stage_resources.megatron.topology.to_megatron_config()
-            )
     if not stage_resources_apply:
         dev.validate_dedicated_config(internal_config)
     return internal_config

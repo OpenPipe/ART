@@ -253,13 +253,7 @@ def test_dsv4_trainability_uses_large_model_dedicated_resources(
         "cudagraph_mode": "NONE",
         "pass_config": {"fuse_allreduce_rms": False},
     }
-    assert config["megatron_topology"] == {
-        "tp": 2,
-        "ep": 2,
-        "etp": 1,
-        "cp": 1,
-        "pp": 1,
-    }
+    assert "megatron_topology" not in config
     assert config["vllm_runtime"] == {
         "mode": "external",
         "server_url": "http://127.0.0.1:8000",

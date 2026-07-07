@@ -1,12 +1,9 @@
 from enum import Enum
-from typing import TYPE_CHECKING, Literal, NoReturn
+from typing import Literal, NoReturn
 
 from typing_extensions import Required, TypedDict
 
 from .engine import EngineArgs
-
-if TYPE_CHECKING:
-    from ..types import MegatronTopologyConfig
 
 RolloutWeightsMode = Literal["lora", "merged"]
 VllmRuntimeMode = Literal["managed", "external"]
@@ -150,7 +147,6 @@ class InternalModelConfig(TypedDict, total=False):
             local training tokenization.
         vllm_runtime: vLLM runtime location. Omit for ART-managed local runtime;
             set mode="external" to attach to a pre-launched vLLM server.
-        megatron_topology: Fixed Megatron parallel topology for this model.
         allow_unvalidated_arch: Permit model-support validation workflows to run
             architectures that are not yet in the supported-model registry.
     """
@@ -169,7 +165,6 @@ class InternalModelConfig(TypedDict, total=False):
     chat_template_content_format: str
     chat_template_tool_schema_format: Literal["default", "vllm_openai"]
     vllm_runtime: VllmRuntimeArgs
-    megatron_topology: "MegatronTopologyConfig | dict[str, int | None]"
     allow_unvalidated_arch: bool
 
 

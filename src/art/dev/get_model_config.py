@@ -108,8 +108,6 @@ def get_model_config(
         result["trainer_gpu_ids"] = config["trainer_gpu_ids"]
     if "inference_gpu_ids" in config:
         result["inference_gpu_ids"] = config["inference_gpu_ids"]
-    if "megatron_topology" in config:
-        result["megatron_topology"] = config["megatron_topology"]
     if "vllm_runtime" in config:
         result["vllm_runtime"] = config["vllm_runtime"]
     return result
