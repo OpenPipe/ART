@@ -752,6 +752,9 @@ def _tree_chain_pack():
 def _tree_chain_planner_config() -> GdnPlannerConfig:
     return GdnPlannerConfig(
         max_padding_ratio=4.0,
+        planner_local_token_ms=0.1,
+        planner_chain_token_ms=0.0,
+        planner_chain_bucket_ms=0.0,
     )
 
 

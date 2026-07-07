@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from bisect import bisect_left
 from dataclasses import dataclass, replace
-from typing import Any, Literal
+from typing import Any, Literal, NamedTuple
 
 import torch
 
@@ -113,8 +113,18 @@ class GdnPlannerConfig:
     max_padding_ratio: float = 2.0
     rank_idle_token_cost: float = 1.0
     max_zero_exchange_load_imbalance: float = 1.5
-    planner_local_token_ms: float = 0.00065
+    cp_chain_beam_width: int = 2
+    cp_chain_beam_branch_factor: int = 4
+    cp_chain_beam_candidate_limit: int = 16
+    cp_chain_beam_max_steps: int = 4
+    cp_chain_min_score_delta_ms: float = 0.25
+    planner_local_token_ms: float = 0.0012
+    planner_chain_token_ms: float = 0.00055
+    planner_local_bucket_ms: float = 0.25
+    planner_chain_bucket_ms: float = 22.0
+    planner_local_segment_ms: float = 0.010
     planner_layout_cross_rank_token_ms: float = 0.00008
+    planner_parent_state_exchange_ms: float = 0.5
     planner_empty_rank_ms: float = 32.0
 
 
@@ -154,6 +164,27 @@ class _AttentionLayoutIndex:
 
     token_ranges_by_rank: tuple[tuple[tuple[int, int], ...], ...]
     token_range_ends_by_rank: tuple[tuple[int, ...], ...]
+
+
+GdnSegmentDecisionKey = tuple[int, int, int]
+
+
+class _GdnChainSearchDecision(NamedTuple):
+    chain_segment_keys: frozenset[GdnSegmentDecisionKey]
+    score: float
+
+
+class _GdnChainSearchMetadata(NamedTuple):
+    depth_count: int
+    children_by_node: tuple[tuple[int, ...], ...]
+    root_indices: tuple[int, ...]
+    subtree_token_counts: tuple[int, ...]
+    subtree_indices_by_node: tuple[tuple[int, ...], ...]
+    subtree_attention_counts: tuple[tuple[int, ...], ...]
+    segment_keys: tuple[GdnSegmentDecisionKey, ...]
+    segment_lengths: tuple[int, ...]
+    segment_depths: tuple[int, ...]
+    segment_attention_counts: tuple[tuple[int, ...], ...]
 
 
 def _tokens_from_rank_ranges(
@@ -239,6 +270,13 @@ def _build_tree_rank_execution_plan(
         cp_size=cp_size,
         attention_layout_index=attention_layout_index,
     )
+    chain_segment_keys = _select_chain_segment_keys(
+        spec,
+        cp_size=cp_size,
+        attention_layout_index=attention_layout_index,
+        segment_attention_counts=segment_attention_counts,
+        planner_config=planner_config,
+    )
 
     depth_count = max(spec.tree_depths, default=0) + 1
     rank_loads = [0] * cp_size
@@ -301,20 +339,15 @@ def _build_tree_rank_execution_plan(
     for node_index in reversed(range(len(spec.tree_segments))):
         for child_index in children_by_node[node_index]:
             subtree_token_counts[node_index] += subtree_token_counts[child_index]
-    chainable_nodes = [
-        cp_size > 1
-        and _can_chain_tree_segment(
-            segment,
-            cp_size=cp_size,
-        )
-        for segment in spec.tree_segments
+    chain_nodes = [
+        _segment_key(segment) in chain_segment_keys for segment in spec.tree_segments
     ]
-    subtree_has_chainable_node = list(chainable_nodes)
+    subtree_has_chained_node = list(chain_nodes)
     for node_index in reversed(range(len(spec.tree_segments))):
-        subtree_has_chainable_node[node_index] = subtree_has_chainable_node[
+        subtree_has_chained_node[node_index] = subtree_has_chained_node[
             node_index
         ] or any(
-            subtree_has_chainable_node[child_index]
+            subtree_has_chained_node[child_index]
             for child_index in children_by_node[node_index]
         )
     target_rank_load = spec.real_token_count / max(1, cp_size)
@@ -323,7 +356,7 @@ def _build_tree_rank_execution_plan(
     def assign_tree(node_index: int) -> None:
         nonlocal cross_rank_token_count
         segment = spec.tree_segments[node_index]
-        if chainable_nodes[node_index]:
+        if chain_nodes[node_index]:
             chained_nodes[segment.family_index] = True
             chain_segments_by_depth[spec.tree_depths[segment.family_index]].append(
                 segment
@@ -340,7 +373,7 @@ def _build_tree_rank_execution_plan(
             return
 
         if (
-            not subtree_has_chainable_node[node_index]
+            not subtree_has_chained_node[node_index]
             and subtree_token_counts[node_index] <= max_local_group_tokens
         ):
             assign_local_group(subtree_indices(node_index))
@@ -648,19 +681,61 @@ def _best_segment_owner(
             for rank in range(rank_count):
                 counts_by_rank[rank] += segment_counts[rank]
         on_rank_tokens = tuple(counts_by_rank)
+    return _best_search_owner(
+        segment_length,
+        on_rank_tokens,
+        rank_loads,
+        planner_config=planner_config,
+    )
+
+
+def _best_search_owner(
+    segment_length: int,
+    on_rank_tokens: tuple[int, ...],
+    rank_loads: list[int],
+    *,
+    planner_config: GdnPlannerConfig,
+) -> int:
+    rank_count = len(rank_loads)
+    total_load = segment_length
+    current_empty_ranks = 0
+    current_max_load = 0
+    current_second_max_load = 0
+    current_max_count = 0
+    for load in rank_loads:
+        total_load += load
+        current_empty_ranks += int(load == 0)
+        if load > current_max_load:
+            current_second_max_load = current_max_load
+            current_max_load = load
+            current_max_count = 1
+        elif load == current_max_load:
+            current_max_count += 1
+        elif load > current_second_max_load:
+            current_second_max_load = load
+    if current_max_count != 1:
+        current_second_max_load = current_max_load
     best: tuple[float, float, int, int, int, int] | None = None
     for rank, tokens in enumerate(on_rank_tokens):
-        projected_loads = list(rank_loads)
-        projected_loads[rank] += segment_length
-        max_load = max(projected_loads, default=0)
-        target_load = sum(projected_loads) / max(1, len(projected_loads))
+        projected_rank_load = rank_loads[rank] + segment_length
+        max_other_rank_load = (
+            current_second_max_load
+            if rank_loads[rank] == current_max_load and current_max_count == 1
+            else current_max_load
+        )
+        max_load = (
+            projected_rank_load
+            if projected_rank_load > max_other_rank_load
+            else max_other_rank_load
+        )
+        target_load = total_load / max(1, rank_count)
         overload = max(
             0.0,
             max_load - planner_config.max_zero_exchange_load_imbalance * target_load,
         )
-        idle_tokens = sum(max_load - load for load in projected_loads)
+        idle_tokens = max_load * rank_count - total_load
         cross_rank_tokens = segment_length - int(tokens)
-        empty_rank_count = sum(1 for load in projected_loads if load == 0)
+        empty_rank_count = current_empty_ranks - int(rank_loads[rank] == 0)
         score = (
             max_load * planner_config.planner_local_token_ms
             + idle_tokens
@@ -682,6 +757,561 @@ def _best_segment_owner(
     if best is None:
         return _least_loaded_rank(rank_loads)
     return best[-1]
+
+
+def _select_chain_segment_keys(
+    spec: GdnPackedExecutionSpec,
+    *,
+    cp_size: int,
+    attention_layout_index: _AttentionLayoutIndex,
+    segment_attention_counts: dict[tuple[int, int, int], tuple[int, ...]],
+    planner_config: GdnPlannerConfig,
+) -> frozenset[GdnSegmentDecisionKey]:
+    if cp_size <= 1:
+        return frozenset()
+    legal_chain_segments = tuple(
+        segment
+        for segment in spec.tree_segments
+        if _can_chain_tree_segment(segment, cp_size=cp_size)
+    )
+    if not legal_chain_segments:
+        return frozenset()
+    chain_rank_counts_by_key: dict[GdnSegmentDecisionKey, tuple[int, ...]] = {}
+    chain_cross_rank_tokens_by_key: dict[GdnSegmentDecisionKey, int] = {}
+    for segment in legal_chain_segments:
+        key = _segment_key(segment)
+        (
+            chain_rank_counts_by_key[key],
+            chain_cross_rank_tokens_by_key[key],
+        ) = _chain_segment_rank_counts_and_cross_rank_tokens(
+            segment,
+            spec,
+            cp_size=cp_size,
+            attention_layout_index=attention_layout_index,
+        )
+
+    search_metadata = _build_chain_search_metadata(
+        spec,
+        segment_attention_counts=segment_attention_counts,
+    )
+    score_cache: dict[frozenset[GdnSegmentDecisionKey], _GdnChainSearchDecision] = {}
+
+    def decision_for(
+        chain_segment_keys: frozenset[GdnSegmentDecisionKey],
+    ) -> _GdnChainSearchDecision:
+        cached = score_cache.get(chain_segment_keys)
+        if cached is not None:
+            return cached
+        decision = _GdnChainSearchDecision(
+            chain_segment_keys=chain_segment_keys,
+            score=_score_chain_segment_keys(
+                spec,
+                cp_size=cp_size,
+                search_metadata=search_metadata,
+                chain_rank_counts_by_key=chain_rank_counts_by_key,
+                chain_cross_rank_tokens_by_key=chain_cross_rank_tokens_by_key,
+                chain_segment_keys=chain_segment_keys,
+                planner_config=planner_config,
+            ),
+        )
+        score_cache[chain_segment_keys] = decision
+        return decision
+
+    legal_chain_keys = frozenset(
+        _segment_key(segment) for segment in legal_chain_segments
+    )
+    best = decision_for(frozenset())
+    all_chain = decision_for(legal_chain_keys)
+    if best.score - all_chain.score > planner_config.cp_chain_min_score_delta_ms:
+        best = all_chain
+    beam = _best_chain_search_decisions(
+        (decision_for(frozenset()), all_chain),
+        limit=planner_config.cp_chain_beam_width,
+    )
+    candidate_groups = _bounded_chain_candidate_groups(
+        spec,
+        legal_chain_segments,
+        segment_attention_counts=segment_attention_counts,
+        chain_rank_counts_by_key=chain_rank_counts_by_key,
+        planner_config=planner_config,
+    )
+    stale_steps = 0
+    for _ in range(max(0, planner_config.cp_chain_beam_max_steps)):
+        if not candidate_groups:
+            break
+        expanded: dict[frozenset[GdnSegmentDecisionKey], _GdnChainSearchDecision] = {}
+        for decision in beam:
+            neighbors: list[_GdnChainSearchDecision] = []
+            for segment_keys in _chain_beam_neighbor_groups(
+                decision.chain_segment_keys,
+                candidate_groups=candidate_groups,
+                branch_factor=planner_config.cp_chain_beam_branch_factor,
+            ):
+                next_keys = (
+                    decision.chain_segment_keys - segment_keys
+                    if segment_keys.issubset(decision.chain_segment_keys)
+                    else decision.chain_segment_keys | segment_keys
+                )
+                neighbors.append(decision_for(frozenset(next_keys)))
+            for neighbor in _best_chain_search_decisions(
+                neighbors,
+                limit=planner_config.cp_chain_beam_branch_factor,
+            ):
+                expanded[neighbor.chain_segment_keys] = neighbor
+        if not expanded:
+            break
+        beam = _best_chain_search_decisions(
+            (*beam, *expanded.values()),
+            limit=planner_config.cp_chain_beam_width,
+        )
+        step_best = beam[0]
+        if best.score - step_best.score > planner_config.cp_chain_min_score_delta_ms:
+            best = step_best
+            stale_steps = 0
+        else:
+            stale_steps += 1
+            if stale_steps >= 2:
+                break
+    return best.chain_segment_keys
+
+
+def _build_chain_search_metadata(
+    spec: GdnPackedExecutionSpec,
+    *,
+    segment_attention_counts: dict[tuple[int, int, int], tuple[int, ...]],
+) -> _GdnChainSearchMetadata:
+    children_by_node: list[list[int]] = [[] for _ in spec.tree_segments]
+    root_indices: list[int] = []
+    for node_index, parent_index in enumerate(spec.tree_parent_indices):
+        if parent_index < 0:
+            root_indices.append(node_index)
+        else:
+            children_by_node[parent_index].append(node_index)
+    segment_keys = tuple(_segment_key(segment) for segment in spec.tree_segments)
+    segment_lengths = tuple(segment.length for segment in spec.tree_segments)
+    segment_depths = tuple(
+        spec.tree_depths[segment.family_index] for segment in spec.tree_segments
+    )
+    segment_attention_counts_by_node = tuple(
+        segment_attention_counts[key] for key in segment_keys
+    )
+    subtree_token_counts = list(segment_lengths)
+    subtree_indices_by_node: list[tuple[int, ...]] = [
+        (node_index,) for node_index in range(len(spec.tree_segments))
+    ]
+    subtree_attention_counts = [
+        tuple(counts) for counts in segment_attention_counts_by_node
+    ]
+    for node_index in reversed(range(len(spec.tree_segments))):
+        for child_index in children_by_node[node_index]:
+            subtree_token_counts[node_index] += subtree_token_counts[child_index]
+            subtree_indices_by_node[node_index] = (
+                *subtree_indices_by_node[node_index],
+                *subtree_indices_by_node[child_index],
+            )
+            subtree_attention_counts[node_index] = tuple(
+                parent + child
+                for parent, child in zip(
+                    subtree_attention_counts[node_index],
+                    subtree_attention_counts[child_index],
+                    strict=True,
+                )
+            )
+    return _GdnChainSearchMetadata(
+        depth_count=max(spec.tree_depths, default=0) + 1,
+        children_by_node=tuple(tuple(children) for children in children_by_node),
+        root_indices=tuple(root_indices),
+        subtree_token_counts=tuple(subtree_token_counts),
+        subtree_indices_by_node=tuple(subtree_indices_by_node),
+        subtree_attention_counts=tuple(subtree_attention_counts),
+        segment_keys=segment_keys,
+        segment_lengths=segment_lengths,
+        segment_depths=segment_depths,
+        segment_attention_counts=segment_attention_counts_by_node,
+    )
+
+
+def _score_chain_segment_keys(
+    spec: GdnPackedExecutionSpec,
+    *,
+    cp_size: int,
+    search_metadata: _GdnChainSearchMetadata,
+    chain_rank_counts_by_key: dict[GdnSegmentDecisionKey, tuple[int, ...]],
+    chain_cross_rank_tokens_by_key: dict[GdnSegmentDecisionKey, int],
+    chain_segment_keys: frozenset[GdnSegmentDecisionKey],
+    planner_config: GdnPlannerConfig,
+) -> float:
+    chain_nodes = [key in chain_segment_keys for key in search_metadata.segment_keys]
+    subtree_has_chained_node = list(chain_nodes)
+    for node_index in reversed(range(len(spec.tree_segments))):
+        subtree_has_chained_node[node_index] = subtree_has_chained_node[
+            node_index
+        ] or any(
+            subtree_has_chained_node[child_index]
+            for child_index in search_metadata.children_by_node[node_index]
+        )
+
+    rank_loads = [0] * cp_size
+    owner_by_node = [-1] * len(spec.tree_segments)
+    local_lengths_by_rank_depth: list[list[list[int]]] = [
+        [[] for _ in range(search_metadata.depth_count)] for _ in range(cp_size)
+    ]
+    chain_rank_counts_by_depth: list[list[tuple[int, ...]]] = [
+        [] for _ in range(search_metadata.depth_count)
+    ]
+    cross_rank_token_count = 0
+    target_rank_load = spec.real_token_count / max(1, cp_size)
+    max_local_group_tokens = max(1, int(target_rank_load))
+
+    def add_local_group(
+        node_indices: tuple[int, ...],
+        segment_length: int,
+        on_rank_tokens: tuple[int, ...],
+    ) -> None:
+        nonlocal cross_rank_token_count
+        owner = _best_search_owner(
+            segment_length,
+            on_rank_tokens,
+            rank_loads,
+            planner_config=planner_config,
+        )
+        rank_loads[owner] += segment_length
+        cross_rank_token_count += segment_length - on_rank_tokens[owner]
+        for node_index in node_indices:
+            owner_by_node[node_index] = owner
+            local_lengths_by_rank_depth[owner][
+                search_metadata.segment_depths[node_index]
+            ].append(search_metadata.segment_lengths[node_index])
+
+    def add_chain_segment(segment: GdnSegmentSpec) -> None:
+        nonlocal cross_rank_token_count
+        key = _segment_key(segment)
+        chain_rank_counts_by_depth[spec.tree_depths[segment.family_index]].append(
+            chain_rank_counts_by_key[key]
+        )
+        cross_rank_token_count += chain_cross_rank_tokens_by_key[key]
+        for rank, token_count in enumerate(chain_rank_counts_by_key[key]):
+            rank_loads[rank] += token_count
+
+    def assign_tree(node_index: int) -> None:
+        segment = spec.tree_segments[node_index]
+        if chain_nodes[node_index]:
+            add_chain_segment(segment)
+            for child_index in search_metadata.children_by_node[node_index]:
+                assign_tree(child_index)
+            return
+        if (
+            not subtree_has_chained_node[node_index]
+            and search_metadata.subtree_token_counts[node_index]
+            <= max_local_group_tokens
+        ):
+            add_local_group(
+                search_metadata.subtree_indices_by_node[node_index],
+                search_metadata.subtree_token_counts[node_index],
+                search_metadata.subtree_attention_counts[node_index],
+            )
+            return
+        add_local_group(
+            (node_index,),
+            search_metadata.segment_lengths[node_index],
+            search_metadata.segment_attention_counts[node_index],
+        )
+        for child_index in search_metadata.children_by_node[node_index]:
+            assign_tree(child_index)
+
+    for root_index in search_metadata.root_indices:
+        assign_tree(root_index)
+
+    local_work_by_rank, local_bucket_count, local_segment_count = (
+        _estimate_local_rank_kernel_work_from_lengths(
+            tuple(
+                tuple(tuple(depth_segments) for depth_segments in rank_segments)
+                for rank_segments in local_lengths_by_rank_depth
+            )
+        )
+    )
+    chain_work_by_rank, chain_bucket_count = (
+        _estimate_chain_rank_kernel_work_from_counts(
+            tuple(tuple(depth_counts) for depth_counts in chain_rank_counts_by_depth),
+            cp_size=cp_size,
+        )
+    )
+    parent_state_exchange_count = _count_parent_state_exchanges(
+        spec,
+        owner_by_node=tuple(owner_by_node),
+        chain_nodes=tuple(chain_nodes),
+    )
+    rank_kernel_ms = max(
+        (
+            local_work_by_rank[rank] * planner_config.planner_local_token_ms
+            + chain_work_by_rank[rank] * planner_config.planner_chain_token_ms
+        )
+        for rank in range(cp_size)
+    )
+    empty_rank_count = sum(1 for token_count in rank_loads if token_count == 0)
+    return (
+        rank_kernel_ms
+        + local_bucket_count * planner_config.planner_local_bucket_ms
+        + chain_bucket_count * planner_config.planner_chain_bucket_ms
+        + local_segment_count * planner_config.planner_local_segment_ms
+        + cross_rank_token_count * planner_config.planner_layout_cross_rank_token_ms
+        + parent_state_exchange_count * planner_config.planner_parent_state_exchange_ms
+        + empty_rank_count * planner_config.planner_empty_rank_ms
+    )
+
+
+def _add_local_search_load(
+    rank_loads: list[int],
+    owner: int,
+    segment: GdnSegmentSpec,
+    *,
+    segment_attention_counts: dict[tuple[int, int, int], tuple[int, ...]],
+) -> int:
+    rank_loads[owner] += segment.length
+    return segment.length - segment_attention_counts[_segment_key(segment)][owner]
+
+
+def _estimate_local_rank_kernel_work(
+    local_segments_by_rank_depth: tuple[tuple[tuple[GdnSegmentSpec, ...], ...], ...],
+) -> tuple[tuple[int, ...], int, int]:
+    return _estimate_local_rank_kernel_work_from_lengths(
+        tuple(
+            tuple(
+                tuple(segment.length for segment in segments)
+                for segments in rank_segments
+            )
+            for rank_segments in local_segments_by_rank_depth
+        )
+    )
+
+
+def _estimate_local_rank_kernel_work_from_lengths(
+    local_lengths_by_rank_depth: tuple[tuple[tuple[int, ...], ...], ...],
+) -> tuple[tuple[int, ...], int, int]:
+    rank_work: list[int] = []
+    rank_bucket_counts: list[int] = []
+    rank_segment_counts: list[int] = []
+    for lengths_by_depth in local_lengths_by_rank_depth:
+        work = 0
+        bucket_count = 0
+        segment_count = 0
+        for lengths in lengths_by_depth:
+            bucket_work, depth_bucket_count = _padded_work_from_lengths(lengths)
+            work += bucket_work
+            bucket_count += depth_bucket_count
+            segment_count += len(lengths)
+        rank_work.append(work)
+        rank_bucket_counts.append(bucket_count)
+        rank_segment_counts.append(segment_count)
+    return (
+        tuple(rank_work),
+        max(rank_bucket_counts, default=0),
+        max(rank_segment_counts, default=0),
+    )
+
+
+def _estimate_chain_rank_kernel_work(
+    chain_segments_by_depth: tuple[tuple[GdnSegmentSpec, ...], ...],
+    *,
+    chain_rank_counts_by_key: dict[GdnSegmentDecisionKey, tuple[int, ...]],
+    cp_size: int,
+) -> tuple[tuple[int, ...], int]:
+    return _estimate_chain_rank_kernel_work_from_counts(
+        tuple(
+            tuple(
+                chain_rank_counts_by_key[_segment_key(segment)] for segment in segments
+            )
+            for segments in chain_segments_by_depth
+        ),
+        cp_size=cp_size,
+    )
+
+
+def _estimate_chain_rank_kernel_work_from_counts(
+    chain_rank_counts_by_depth: tuple[tuple[tuple[int, ...], ...], ...],
+    *,
+    cp_size: int,
+) -> tuple[tuple[int, ...], int]:
+    rank_work = [0] * cp_size
+    bucket_count = 0
+    for rank_counts_by_segment in chain_rank_counts_by_depth:
+        if not rank_counts_by_segment:
+            continue
+        bucket_count += 1
+        for rank in range(cp_size):
+            lengths = tuple(counts[rank] for counts in rank_counts_by_segment)
+            rank_work[rank] += max(lengths, default=0) * len(lengths)
+    return tuple(rank_work), bucket_count
+
+
+def _padded_work_from_lengths(lengths: tuple[int, ...]) -> tuple[int, int]:
+    real_lengths = tuple(length for length in lengths if length > 0)
+    if not real_lengths:
+        return 0, 0
+    return max(real_lengths) * len(real_lengths), 1
+
+
+def _count_parent_state_exchanges(
+    spec: GdnPackedExecutionSpec,
+    *,
+    owner_by_node: tuple[int, ...],
+    chain_nodes: tuple[bool, ...],
+) -> int:
+    exchange_count = 0
+    for child_index, parent_index in enumerate(spec.tree_parent_indices):
+        if parent_index < 0 or chain_nodes[parent_index]:
+            continue
+        parent_owner = owner_by_node[parent_index]
+        if parent_owner < 0:
+            continue
+        if chain_nodes[child_index] or owner_by_node[child_index] != parent_owner:
+            exchange_count += 1
+    return exchange_count
+
+
+def _chain_beam_neighbor_groups(
+    chain_segment_keys: frozenset[GdnSegmentDecisionKey],
+    *,
+    candidate_groups: tuple[frozenset[GdnSegmentDecisionKey], ...],
+    branch_factor: int,
+) -> tuple[frozenset[GdnSegmentDecisionKey], ...]:
+    selected: list[frozenset[GdnSegmentDecisionKey]] = []
+    for group in candidate_groups:
+        if group and not group.issubset(chain_segment_keys):
+            selected.append(group)
+            if len(selected) >= branch_factor:
+                return tuple(selected)
+    for group in reversed(candidate_groups):
+        if group and group.intersection(chain_segment_keys) and group not in selected:
+            selected.append(group)
+            if len(selected) >= branch_factor:
+                break
+    return tuple(selected)
+
+
+def _best_chain_search_decisions(
+    decisions: Any,
+    *,
+    limit: int,
+) -> tuple[_GdnChainSearchDecision, ...]:
+    return tuple(
+        sorted(
+            decisions,
+            key=lambda decision: (
+                decision.score,
+                len(decision.chain_segment_keys),
+                tuple(sorted(decision.chain_segment_keys)),
+            ),
+        )[: max(1, limit)]
+    )
+
+
+def _bounded_chain_candidate_groups(
+    spec: GdnPackedExecutionSpec,
+    legal_chain_segments: tuple[GdnSegmentSpec, ...],
+    *,
+    segment_attention_counts: dict[tuple[int, int, int], tuple[int, ...]],
+    chain_rank_counts_by_key: dict[GdnSegmentDecisionKey, tuple[int, ...]],
+    planner_config: GdnPlannerConfig,
+) -> tuple[frozenset[GdnSegmentDecisionKey], ...]:
+    legal_key_set = frozenset(_segment_key(segment) for segment in legal_chain_segments)
+    if not legal_key_set:
+        return ()
+    root_keys = frozenset(
+        _segment_key(segment)
+        for segment in legal_chain_segments
+        if spec.tree_parent_indices[segment.family_index] < 0
+    )
+    nonroot_keys = legal_key_set - root_keys
+    groups: list[frozenset[GdnSegmentDecisionKey]] = []
+    for group in (legal_key_set, root_keys, nonroot_keys):
+        if group and group not in groups:
+            groups.append(group)
+    for group in _ranked_chain_beam_groups(
+        spec,
+        legal_chain_segments,
+        segment_attention_counts=segment_attention_counts,
+        chain_rank_counts_by_key=chain_rank_counts_by_key,
+    ):
+        if group and group not in groups:
+            groups.append(group)
+        if len(groups) >= planner_config.cp_chain_beam_candidate_limit:
+            break
+    return tuple(groups[: max(1, planner_config.cp_chain_beam_candidate_limit)])
+
+
+def _ranked_chain_beam_groups(
+    spec: GdnPackedExecutionSpec,
+    legal_chain_segments: tuple[GdnSegmentSpec, ...],
+    *,
+    segment_attention_counts: dict[tuple[int, int, int], tuple[int, ...]],
+    chain_rank_counts_by_key: dict[GdnSegmentDecisionKey, tuple[int, ...]],
+) -> tuple[frozenset[GdnSegmentDecisionKey], ...]:
+    priority_by_key = {
+        _segment_key(segment): _chain_beam_segment_priority(
+            segment,
+            segment_attention_counts=segment_attention_counts,
+            chain_rank_counts_by_key=chain_rank_counts_by_key,
+        )
+        for segment in legal_chain_segments
+    }
+    groups: set[frozenset[GdnSegmentDecisionKey]] = {
+        frozenset((key,)) for key in priority_by_key
+    }
+    children_by_parent: dict[int, list[GdnSegmentDecisionKey]] = {}
+    for segment in legal_chain_segments:
+        parent_index = spec.tree_parent_indices[segment.family_index]
+        if parent_index >= 0:
+            children_by_parent.setdefault(parent_index, []).append(
+                _segment_key(segment)
+            )
+    for child_keys in children_by_parent.values():
+        if len(child_keys) > 1:
+            groups.add(frozenset(child_keys))
+    return tuple(
+        sorted(
+            groups,
+            key=lambda group: _chain_beam_group_priority(
+                group,
+                priority_by_key=priority_by_key,
+            ),
+            reverse=True,
+        )
+    )
+
+
+def _chain_beam_group_priority(
+    group: frozenset[GdnSegmentDecisionKey],
+    *,
+    priority_by_key: dict[GdnSegmentDecisionKey, tuple[int, int, int, int]],
+) -> tuple[int, int, int, int, int]:
+    priorities = tuple(priority_by_key[key] for key in group)
+    return (
+        sum(priority[0] for priority in priorities),
+        sum(priority[1] for priority in priorities),
+        max((priority[2] for priority in priorities), default=0),
+        sum(priority[3] for priority in priorities),
+        len(group),
+    )
+
+
+def _chain_beam_segment_priority(
+    segment: GdnSegmentSpec,
+    *,
+    segment_attention_counts: dict[tuple[int, int, int], tuple[int, ...]],
+    chain_rank_counts_by_key: dict[GdnSegmentDecisionKey, tuple[int, ...]],
+) -> tuple[int, int, int, int]:
+    key = _segment_key(segment)
+    chain_max_load = max(chain_rank_counts_by_key[key], default=0)
+    best_attention_locality = max(segment_attention_counts[key], default=0)
+    chain_load_relief = segment.length - chain_max_load
+    minimum_local_exchange = segment.length - best_attention_locality
+    return (
+        chain_load_relief,
+        segment.length,
+        best_attention_locality,
+        -minimum_local_exchange,
+    )
 
 
 def _build_tree_state_exchanges_by_depth(
@@ -939,8 +1569,50 @@ def _append_chain_segment(
     *,
     attention_layout_index: _AttentionLayoutIndex | None = None,
 ) -> int:
+    rank_ranges, cross_rank_tokens = _chain_segment_rank_ranges_and_cross_rank_tokens(
+        segment,
+        spec,
+        cp_size=len(gdn_ranges_by_rank),
+        attention_layout_index=attention_layout_index,
+    )
+    for rank, (shard_start, shard_end) in enumerate(rank_ranges):
+        shard_length = shard_end - shard_start
+        if shard_length <= 0:
+            raise ValueError(
+                "CP chain planning requires non-empty shards; "
+                f"segment={segment.kind}:{segment.family_index} "
+                f"length={segment.length} cp_size={len(gdn_ranges_by_rank)}"
+            )
+        position_start = rank_loads[rank]
+        gdn_ranges_by_rank[rank].append((shard_start, shard_end, position_start))
+        rank_loads[rank] += shard_length
+    return cross_rank_tokens
+
+
+def _chain_segment_rank_counts_and_cross_rank_tokens(
+    segment: GdnSegmentSpec,
+    spec: GdnPackedExecutionSpec,
+    *,
+    cp_size: int,
+    attention_layout_index: _AttentionLayoutIndex | None,
+) -> tuple[tuple[int, ...], int]:
+    rank_ranges, cross_rank_tokens = _chain_segment_rank_ranges_and_cross_rank_tokens(
+        segment,
+        spec,
+        cp_size=cp_size,
+        attention_layout_index=attention_layout_index,
+    )
+    return tuple(end - start for start, end in rank_ranges), cross_rank_tokens
+
+
+def _chain_segment_rank_ranges_and_cross_rank_tokens(
+    segment: GdnSegmentSpec,
+    spec: GdnPackedExecutionSpec,
+    *,
+    cp_size: int,
+    attention_layout_index: _AttentionLayoutIndex | None,
+) -> tuple[tuple[tuple[int, int], ...], int]:
     token_start = _segment_token_start(segment, spec.sequence_length)
-    cp_size = len(gdn_ranges_by_rank)
     attention_shards = _attention_contiguous_chain_shards(
         token_start,
         segment.length,
@@ -948,13 +1620,10 @@ def _append_chain_segment(
         attention_layout_index=attention_layout_index,
     )
     if attention_shards is not None:
-        for rank, shard in enumerate(attention_shards):
-            position_start = rank_loads[rank]
-            gdn_ranges_by_rank[rank].append((shard.start, shard.stop, position_start))
-            rank_loads[rank] += len(shard)
-        return 0
-    cross_rank_tokens = 0
+        return tuple((shard.start, shard.stop) for shard in attention_shards), 0
     shard_lengths = _fla_aligned_chain_shard_lengths(segment.length, cp_size=cp_size)
+    rank_ranges: list[tuple[int, int]] = []
+    cross_rank_tokens = 0
     start = 0
     for rank, shard_length in enumerate(shard_lengths):
         end = start + shard_length
@@ -965,20 +1634,17 @@ def _append_chain_segment(
                 f"length={segment.length} cp_size={cp_size}"
             )
         shard_start = token_start + start
-        position_start = rank_loads[rank]
-        gdn_ranges_by_rank[rank].append(
-            (shard_start, shard_start + shard_length, position_start)
-        )
-        rank_loads[rank] += shard_length
+        shard_end = shard_start + shard_length
+        rank_ranges.append((shard_start, shard_end))
         if attention_layout_index is not None:
             cross_rank_tokens += shard_length - _range_overlap_count(
                 shard_start,
-                shard_start + shard_length,
+                shard_end,
                 attention_layout_index.token_ranges_by_rank[rank],
                 attention_layout_index.token_range_ends_by_rank[rank],
             )
         start = end
-    return cross_rank_tokens
+    return tuple(rank_ranges), cross_rank_tokens
 
 
 def _fla_aligned_chain_shard_lengths(length: int, *, cp_size: int) -> tuple[int, ...]:
