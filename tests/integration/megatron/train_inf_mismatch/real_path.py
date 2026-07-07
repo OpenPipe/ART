@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, contextmanager
 import hashlib
 import json
 import os
@@ -12,7 +12,7 @@ import shutil
 import socket
 import subprocess
 import sys
-from typing import Any, AsyncIterator, cast
+from typing import Any, AsyncIterator, Iterator, cast
 import uuid
 
 from openai.types.chat.chat_completion import Choice
@@ -107,6 +107,23 @@ class RealPathBaseDiagnosticBundle(BaseModel):
     moe_routing_shared_prefix_compared_slots: int
     vllm_forward_trace_dir: str | None = None
     megatron_forward_trace_dir: str | None = None
+
+
+@contextmanager
+def _temporary_env(updates: dict[str, str] | None) -> Iterator[None]:
+    if not updates:
+        yield
+        return
+    previous = {key: os.environ.get(key) for key in updates}
+    os.environ.update(updates)
+    try:
+        yield
+    finally:
+        for key, value in previous.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
 
 
 class RealPathTrainInfReport(BaseModel):
@@ -1340,8 +1357,9 @@ async def run_real_path_train_inf_mismatch(
     _move_adapter_to_step_zero(adapter_path=adapter_path, model=model, backend=backend)
 
     try:
-        await model.register(backend)
-        backend_open = True
+        with _temporary_env(parity_config.megatron_env):
+            await model.register(backend)
+            backend_open = True
         trajectory_groups = await _collect_real_trajectory_groups(
             model=model,
             config=config,
