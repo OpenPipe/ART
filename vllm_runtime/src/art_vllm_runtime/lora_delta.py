@@ -76,6 +76,7 @@ def _iter_lora_checkpoint_deltas(
                 expert_a = a_tensor[expert_id * rank : (expert_id + 1) * rank]
                 delta = b_expert.float().matmul(expert_a.float()).mul_(scaling)
                 if previous_b is not None:
+                    assert previous_lora_tensors is not None
                     previous_a = previous_lora_tensors[a_key][
                         expert_id * rank : (expert_id + 1) * rank
                     ]
@@ -107,6 +108,7 @@ def _iter_lora_checkpoint_deltas(
                 expert_a = a_tensor[expert_id * rank : (expert_id + 1) * rank]
                 delta = b_expert.float().matmul(expert_a.float()).mul_(scaling)
                 if previous_b is not None:
+                    assert previous_lora_tensors is not None
                     previous_a = previous_lora_tensors[a_key][
                         expert_id * rank : (expert_id + 1) * rank
                     ]
