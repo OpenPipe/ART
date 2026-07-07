@@ -1166,8 +1166,6 @@ class VariantRunner:
                 if not isinstance(sample_index, int):
                     continue
                 valid_length = int(valid_lengths[sample_index])
-                if valid_length >= sequence_length:
-                    continue
                 row_token_uids = call.get("row_token_uids")
                 if (
                     isinstance(row_token_uids, torch.Tensor)
@@ -1178,9 +1176,7 @@ class VariantRunner:
                         (row_token_uids >= 0) & (local_token_uids < valid_length),
                         as_tuple=False,
                     ).reshape(-1)
-                    if int(keep_rows.numel()) > 0 and int(keep_rows.numel()) < int(
-                        row_token_uids.numel()
-                    ):
+                    if int(keep_rows.numel()) < int(row_token_uids.numel()):
                         call["row_token_uids"] = row_token_uids.index_select(
                             0, keep_rows
                         ).contiguous()
@@ -1199,6 +1195,8 @@ class VariantRunner:
                                     0, keep_rows
                                 ).contiguous()
                         continue
+                if valid_length >= sequence_length:
+                    continue
                 for key in ("primary_output", "router_topk_scores", "router_topk_ids"):
                     tensor = call.get(key)
                     if not isinstance(tensor, torch.Tensor) or tensor.ndim == 0:
