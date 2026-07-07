@@ -744,6 +744,7 @@ class LocalBackend(Backend):
         if self._model_uses_expert_replay(model):
             engine_args = dict(config_dict.get("engine_args", {}))
             engine_args["enable_return_routed_experts"] = True
+            engine_args["async_scheduling"] = False
             config_dict["engine_args"] = engine_args
         server_args = dict(config_dict.get("server_args", {}))
 
