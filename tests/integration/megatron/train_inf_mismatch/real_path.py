@@ -1040,6 +1040,7 @@ def _real_path_megatron_worker(
 
     from art.megatron import train as megatron_train
     from art.megatron.model_support.lora_disk import load_lora_tensors_for_megatron
+    from art.megatron.training.weight_offload import WeightOffloadManager
     from art.preprocessing.pack import packed_tensors_from_dir
 
     local_rank = int(os.environ["LOCAL_RANK"])
@@ -1076,92 +1077,113 @@ def _real_path_megatron_worker(
     for chunk in runtime.model:
         chunk.eval()
 
+    weight_offload = None
+    if not adapter_only:
+        weight_offload = WeightOffloadManager.from_env(
+            model=runtime.model,
+            rank=torch.distributed.get_rank(),  # type: ignore[possibly-missing-attribute]
+            compile_enabled=runtime.transformer_layers_compiled,
+        )
+        weight_offload.install()
+        weight_offload.after_job()
+        weight_offload.before_job()
+
     artifact_dir = Path(request.artifact_dir)
     adapter_path: Path | None = None
-    if request.weight_state == "lora":
-        if request.adapter_path is None:
-            initial_state = _collect_full_lora_state(cast(list[Any], runtime.model))
-            if torch.distributed.get_rank() == 0:  # type: ignore[possibly-missing-attribute]
+    job_completed = False
+    try:
+        if request.weight_state == "lora":
+            if request.adapter_path is None:
+                initial_state = _collect_full_lora_state(cast(list[Any], runtime.model))
+                if torch.distributed.get_rank() == 0:  # type: ignore[possibly-missing-attribute]
+                    adapter_path = artifact_dir / "real_path_active_lora"
+                    initialized = _build_deterministic_nonzero_lora(
+                        initial_state or {},
+                        seed=request.config.seed,
+                    )
+                    _save_vllm_lora_adapter(
+                        lora_path=adapter_path,
+                        state=initialized,
+                        runtime=runtime,
+                        config=request.config,
+                    )
+                torch.distributed.barrier()  # type: ignore[possibly-missing-attribute]
                 adapter_path = artifact_dir / "real_path_active_lora"
-                initialized = _build_deterministic_nonzero_lora(
-                    initial_state or {},
-                    seed=request.config.seed,
+            else:
+                adapter_path = Path(request.adapter_path)
+            adapter_model = load_lora_tensors_for_megatron(
+                str(adapter_path),
+                handler=runtime.model_support_handler,
+                allow_unvalidated_arch=request.config.allow_unvalidated_arch,
+            )
+            megatron_train.load_adapter_into_model(runtime.model, adapter_model)
+
+        if adapter_only:
+            if torch.distributed.get_rank() == 0:  # type: ignore[possibly-missing-attribute]
+                result = RealPathMegatronWorkerResult(
+                    score_path="",
+                    adapter_path=str(adapter_path)
+                    if adapter_path is not None
+                    else None,
                 )
-                _save_vllm_lora_adapter(
-                    lora_path=adapter_path,
-                    state=initialized,
-                    runtime=runtime,
-                    config=request.config,
+                _write_json(
+                    artifact_dir / "real_path_adapter_worker_result.json",
+                    result.model_dump(mode="json"),
                 )
             torch.distributed.barrier()  # type: ignore[possibly-missing-attribute]
-            adapter_path = artifact_dir / "real_path_active_lora"
-        else:
-            adapter_path = Path(request.adapter_path)
-        adapter_model = load_lora_tensors_for_megatron(
-            str(adapter_path),
-            handler=runtime.model_support_handler,
-            allow_unvalidated_arch=request.config.allow_unvalidated_arch,
-        )
-        megatron_train.load_adapter_into_model(runtime.model, adapter_model)
+            torch.distributed.destroy_process_group()  # type: ignore[possibly-missing-attribute]
+            return
 
-    if adapter_only:
+        packed_tensors = packed_tensors_from_dir(**request.disk_packed_tensors)
+        logical_map = LogicalTokenMap.model_validate(
+            _read_json(Path(request.logical_map_path))
+        )
+        forward_trace_capture = None
+        if request.forward_trace_dir is not None:
+            from ..model_support.forward_trace import (
+                CAPTURE_NAME_TOKENS,
+                ForwardTraceCapture,
+            )
+
+            forward_trace_capture = ForwardTraceCapture(
+                runtime.model,
+                enabled=True,
+                capture_name_tokens=(*CAPTURE_NAME_TOKENS, ".decoder.final_layernorm"),
+                strict_output_match=True,
+            )
+            forward_trace_capture.set_step(
+                0,
+                list(range(int(packed_tensors["tokens"].shape[0]))),
+            )
+        score = _score_megatron_runtime(
+            runtime=runtime,
+            packed_tensors=cast(dict[str, Any], packed_tensors),
+            logical_map=logical_map,
+            weight_state=request.weight_state,
+            rollout_mode=_real_path_rollout_mode(request.config),
+            global_grad_accumulation_sequences=request.global_grad_accumulation_sequences,
+            forward_trace_capture=forward_trace_capture,
+            forward_trace_dir=request.forward_trace_dir,
+        )
+
         if torch.distributed.get_rank() == 0:  # type: ignore[possibly-missing-attribute]
+            score_path = (
+                artifact_dir / f"real_path_megatron_{request.weight_state}.json"
+            )
+            _write_json(score_path, score.model_dump(mode="json"))
             result = RealPathMegatronWorkerResult(
-                score_path="",
+                score_path=str(score_path),
                 adapter_path=str(adapter_path) if adapter_path is not None else None,
             )
             _write_json(
-                artifact_dir / "real_path_adapter_worker_result.json",
+                artifact_dir
+                / f"real_path_megatron_{request.weight_state}_worker_result.json",
                 result.model_dump(mode="json"),
             )
-        torch.distributed.barrier()  # type: ignore[possibly-missing-attribute]
-        torch.distributed.destroy_process_group()  # type: ignore[possibly-missing-attribute]
-        return
-
-    packed_tensors = packed_tensors_from_dir(**request.disk_packed_tensors)
-    logical_map = LogicalTokenMap.model_validate(
-        _read_json(Path(request.logical_map_path))
-    )
-    forward_trace_capture = None
-    if request.forward_trace_dir is not None:
-        from ..model_support.forward_trace import (
-            CAPTURE_NAME_TOKENS,
-            ForwardTraceCapture,
-        )
-
-        forward_trace_capture = ForwardTraceCapture(
-            runtime.model,
-            enabled=True,
-            capture_name_tokens=(*CAPTURE_NAME_TOKENS, ".decoder.final_layernorm"),
-            strict_output_match=True,
-        )
-        forward_trace_capture.set_step(
-            0,
-            list(range(int(packed_tensors["tokens"].shape[0]))),
-        )
-    score = _score_megatron_runtime(
-        runtime=runtime,
-        packed_tensors=cast(dict[str, Any], packed_tensors),
-        logical_map=logical_map,
-        weight_state=request.weight_state,
-        rollout_mode=_real_path_rollout_mode(request.config),
-        global_grad_accumulation_sequences=request.global_grad_accumulation_sequences,
-        forward_trace_capture=forward_trace_capture,
-        forward_trace_dir=request.forward_trace_dir,
-    )
-
-    if torch.distributed.get_rank() == 0:  # type: ignore[possibly-missing-attribute]
-        score_path = artifact_dir / f"real_path_megatron_{request.weight_state}.json"
-        _write_json(score_path, score.model_dump(mode="json"))
-        result = RealPathMegatronWorkerResult(
-            score_path=str(score_path),
-            adapter_path=str(adapter_path) if adapter_path is not None else None,
-        )
-        _write_json(
-            artifact_dir
-            / f"real_path_megatron_{request.weight_state}_worker_result.json",
-            result.model_dump(mode="json"),
-        )
+        job_completed = True
+    finally:
+        if weight_offload is not None and job_completed:
+            weight_offload.after_job()
     torch.distributed.barrier()  # type: ignore[possibly-missing-attribute]
     torch.distributed.destroy_process_group()  # type: ignore[possibly-missing-attribute]
 
