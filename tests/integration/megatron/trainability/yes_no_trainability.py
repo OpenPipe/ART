@@ -657,7 +657,17 @@ def _build_internal_config(
         init_args=_variant_init_args(variant),
         allow_unvalidated_arch=allow_unvalidated_arch,
     )
-    if external_runtime := _external_vllm_runtime_config():
+    external_runtime = _external_vllm_runtime_config()
+    if (
+        stage_resources is not None
+        and stage_resources.requires_external_vllm
+        and external_runtime is None
+    ):
+        raise RuntimeError(
+            "yes_no_trainability for this model requires an external vLLM server. "
+            f"Set {_EXTERNAL_VLLM_URL_ENV}."
+        )
+    if external_runtime is not None:
         internal_config["vllm_runtime"] = external_runtime
     if not shared:
         internal_config["trainer_gpu_ids"] = variant.trainer_gpu_ids

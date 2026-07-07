@@ -335,6 +335,10 @@ def model_supports_context_parallel(
 
 
 def config_from_env() -> TrainInfOutputParityConfig:
+    train_inf_external_url_env = "ART_TRAIN_INF_MISMATCH_EXTERNAL_VLLM_URL"
+    model_support_external_url_env = "ART_MODEL_SUPPORT_EXTERNAL_VLLM_URL"
+    train_inf_external_key_env = "ART_TRAIN_INF_MISMATCH_EXTERNAL_VLLM_API_KEY"
+    model_support_external_key_env = "ART_MODEL_SUPPORT_EXTERNAL_VLLM_API_KEY"
     config = TrainInfOutputParityConfig(
         base_model=os.environ.get(
             "ART_TRAIN_INF_MISMATCH_BASE_MODEL",
@@ -426,11 +430,26 @@ def config_from_env() -> TrainInfOutputParityConfig:
         config.topology = config.topology.model_copy(update=updates)
     if raw_targets := os.environ.get("ART_TRAIN_INF_MISMATCH_LORA_TARGET_MODULES"):
         config.lora_target_modules = _parse_str_list(raw_targets)
-    if raw_url := os.environ.get("ART_TRAIN_INF_MISMATCH_EXTERNAL_VLLM_URL"):
+    raw_url = os.environ.get(train_inf_external_url_env)
+    if raw_url is None and stage_resources is not None:
+        raw_url = os.environ.get(model_support_external_url_env)
+    if raw_url:
         config.external_vllm_server_url = raw_url
         config.external_vllm_api_key = os.environ.get(
-            "ART_TRAIN_INF_MISMATCH_EXTERNAL_VLLM_API_KEY",
-            "art-external-vllm",
+            train_inf_external_key_env,
+            os.environ.get(
+                model_support_external_key_env,
+                "art-external-vllm",
+            ),
+        )
+    if (
+        stage_resources is not None
+        and stage_resources.requires_external_vllm
+        and not config.external_vllm_server_url
+    ):
+        raise RuntimeError(
+            "train_inf_mismatch for this model requires an external vLLM server. "
+            f"Set {train_inf_external_url_env} or {model_support_external_url_env}."
         )
     return config
 

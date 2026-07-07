@@ -90,6 +90,13 @@ def test_dsv4_runtime_stages_use_full_model_resources() -> None:
         assert stage.required_world_size == 8
         assert stage.required_h200_equivalent_gpus == 8
         assert stage.allow_gpu_overlap is False
+        assert stage.requires_external_vllm is True
+        assert stage.megatron is not None
+        assert stage.megatron.gpu_ids == [0, 1, 2, 3, 4, 5, 6, 7]
+        assert stage.megatron.topology.tp == 2
+        assert stage.megatron.topology.ep == 8
+        assert stage.megatron.topology.dp == 4
+        assert stage.megatron.topology.cp == 1
         assert stage.vllm is not None
         assert stage.vllm.gpu_ids == [4, 5, 6, 7]
         assert stage.high_vram_megatron is not None

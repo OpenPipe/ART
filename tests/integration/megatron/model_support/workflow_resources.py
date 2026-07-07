@@ -76,6 +76,7 @@ class WorkflowStageResources(BaseModel):
     required_world_size: int
     required_h200_equivalent_gpus: int | None = None
     allow_gpu_overlap: bool = False
+    requires_external_vllm: bool = False
     megatron: MegatronWorkflowResources | None = None
     vllm: VllmWorkflowResources | None = None
     high_vram_megatron: MegatronWorkflowResources | None = None
@@ -100,6 +101,15 @@ class HandlerWorkflowResources(BaseModel):
     ) = None
 
 
+_DSV4_TP2_EP8 = MegatronWorkflowTopology(
+    tp=2,
+    ep=8,
+    etp=1,
+    dp=4,
+    cp=1,
+    pp=1,
+    sp=True,
+)
 _DSV4_TP2_EP4 = MegatronWorkflowTopology(
     tp=2,
     ep=4,
@@ -169,8 +179,8 @@ _DSV4_NATIVE_LORA_VLLM_ENGINE_ARGS = {
     "load_format": "dummy",
 }
 _DSV4_MEGATRON = MegatronWorkflowResources(
-    gpu_ids=[0, 1, 2, 3],
-    topology=_DSV4_TP2_EP4,
+    gpu_ids=[0, 1, 2, 3, 4, 5, 6, 7],
+    topology=_DSV4_TP2_EP8,
 )
 _DSV4_HIGH_VRAM_MEGATRON = MegatronWorkflowResources(
     gpu_ids=[0, 1],
@@ -216,6 +226,7 @@ HANDLER_WORKFLOW_RESOURCES: dict[str, HandlerWorkflowResources] = {
         train_inf_mismatch=WorkflowStageResources(
             required_world_size=8,
             required_h200_equivalent_gpus=8,
+            requires_external_vllm=True,
             megatron=_DSV4_MEGATRON,
             vllm=_DSV4_FULL_VLLM_EP4,
             high_vram_megatron=_DSV4_HIGH_VRAM_MEGATRON,
@@ -238,6 +249,7 @@ HANDLER_WORKFLOW_RESOURCES: dict[str, HandlerWorkflowResources] = {
         yes_no_trainability=WorkflowStageResources(
             required_world_size=8,
             required_h200_equivalent_gpus=8,
+            requires_external_vllm=True,
             megatron=_DSV4_MEGATRON,
             vllm=_DSV4_FULL_VLLM_EP4,
             high_vram_megatron=_DSV4_HIGH_VRAM_MEGATRON,

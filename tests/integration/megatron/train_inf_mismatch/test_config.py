@@ -25,6 +25,7 @@ def test_cp_unsupported_model_uses_non_cp_default_topology(monkeypatch) -> None:
     monkeypatch.delenv("ART_TRAIN_INF_MISMATCH_TP", raising=False)
     monkeypatch.delenv("ART_TRAIN_INF_MISMATCH_CP", raising=False)
     monkeypatch.delenv("ART_TRAIN_INF_MISMATCH_EP", raising=False)
+    monkeypatch.setenv("ART_MODEL_SUPPORT_EXTERNAL_VLLM_URL", "http://127.0.0.1:8000")
 
     config = config_from_env()
 
@@ -47,6 +48,7 @@ def test_cp_unsupported_model_uses_non_cp_default_topology(monkeypatch) -> None:
         "pass_config": {"fuse_allreduce_rms": False},
     }
     assert config.megatron_env == {"ART_MEGATRON_STREAMING_WEIGHT_OFFLOAD": "1"}
+    assert config.external_vllm_server_url == "http://127.0.0.1:8000"
 
 
 def test_dsv4_uses_quantized_vllm_noise_train_inf_thresholds() -> None:

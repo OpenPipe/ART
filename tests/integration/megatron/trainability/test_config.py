@@ -217,6 +217,7 @@ def test_dsv4_trainability_uses_large_model_dedicated_resources(
         "_safe_gpu_memory_utilization",
         lambda device_ids: 0.5,
     )
+    monkeypatch.setenv("ART_MODEL_SUPPORT_EXTERNAL_VLLM_URL", "http://127.0.0.1:8000")
 
     default_variant = _default_variant_name(
         "deepseek-ai/DeepSeek-V4-Flash",
@@ -257,4 +258,9 @@ def test_dsv4_trainability_uses_large_model_dedicated_resources(
         "etp": 1,
         "cp": 1,
         "pp": 1,
+    }
+    assert config["vllm_runtime"] == {
+        "mode": "external",
+        "server_url": "http://127.0.0.1:8000",
+        "api_key": "art-external-vllm",
     }
