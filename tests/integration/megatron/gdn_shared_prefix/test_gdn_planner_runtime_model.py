@@ -128,8 +128,8 @@ def test_gdn_planner_runtime_model_tracks_qwen35_shape_axes() -> None:
         qwen35_35b.runtime_cp_summary_bytes_per_segment
     )
     assert qwen35_397b.runtime_local_recurrent_tokens_per_ms == pytest.approx(
-        0.5 * qwen35_35b.runtime_local_recurrent_tokens_per_ms
+        (2**-0.75) * qwen35_35b.runtime_local_recurrent_tokens_per_ms
     )
     assert qwen35_397b.runtime_chain_recurrent_tokens_per_ms == pytest.approx(
-        0.5 * qwen35_35b.runtime_chain_recurrent_tokens_per_ms
+        (2**-0.75) * qwen35_35b.runtime_chain_recurrent_tokens_per_ms
     )

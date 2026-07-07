@@ -12,6 +12,11 @@ from art.megatron.shared_prefix_tree import parse_shared_prefix_tree
 GdnSegmentKind = Literal["prefix", "completion"]
 # FLA's public chunk_gated_delta_rule hard-codes 64-token WY chunks.
 FLA_CHUNK_SIZE = 64
+# Fitted from Qwen3.5 35B/397B GDN lab points. Doubling state elements
+# increases exposed recurrent runtime by about 1.7x, not 2x, because the
+# kernels recover some parallelism at larger state shapes. Communication terms
+# below still use exact bytes moved.
+_RUNTIME_STATE_THROUGHPUT_EXPONENT = 0.75
 
 
 def _dtype_bytes(dtype: Any) -> int:
@@ -234,8 +239,12 @@ class GdnPlannerConfig:
         summary_state_elements = local_value_heads * key_dim * (value_dim + key_dim)
         ref_recurrent_elements = 32 * 128 * 128
         ref_summary_elements = 32 * 128 * (128 + 128)
-        recurrent_scale = ref_recurrent_elements / max(1, recurrent_state_elements)
-        summary_scale = ref_summary_elements / max(1, summary_state_elements)
+        recurrent_scale = (
+            ref_recurrent_elements / max(1, recurrent_state_elements)
+        ) ** _RUNTIME_STATE_THROUGHPUT_EXPONENT
+        summary_scale = (
+            ref_summary_elements / max(1, summary_state_elements)
+        ) ** _RUNTIME_STATE_THROUGHPUT_EXPONENT
         qkv_channels = 2 * local_key_heads * key_dim + local_value_heads * value_dim
         conv_state_bytes = (
             qkv_channels * max(0, int(linear_conv_kernel_dim) - 1) * int(dtype_bytes)
