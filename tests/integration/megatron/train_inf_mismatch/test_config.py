@@ -4,11 +4,40 @@ from types import SimpleNamespace
 
 import torch
 
+from . import output_parity
 from .output_parity import (
     config_from_env,
     fwd_mean_abs_pct_limit_for_model,
     top20_kl_candidate_to_target_limit_for_model,
 )
+
+
+def test_cp_unsupported_default_converts_cp_to_dp_without_changing_tp(
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("BASE_MODEL", "Qwen/Qwen3.5-35B-A3B")
+    monkeypatch.delenv("ART_TRAIN_INF_MISMATCH_TP", raising=False)
+    monkeypatch.delenv("ART_TRAIN_INF_MISMATCH_CP", raising=False)
+    monkeypatch.delenv("ART_TRAIN_INF_MISMATCH_DP", raising=False)
+    monkeypatch.setattr(
+        output_parity,
+        "handler_workflow_resources_for_base_model",
+        lambda base_model, *, allow_unvalidated_arch=False: None,
+    )
+    monkeypatch.setattr(output_parity, "model_support_is_moe", lambda *_, **__: True)
+    monkeypatch.setattr(
+        output_parity,
+        "model_supports_context_parallel",
+        lambda *_, **__: False,
+    )
+
+    config = config_from_env()
+
+    assert config.topology.tp == 1
+    assert config.topology.cp == 1
+    assert config.topology.dp == 2
+    assert config.topology.ep == 2
+    assert config.topology.world_size() == 2
 
 
 def test_cp_unsupported_model_uses_non_cp_default_topology(monkeypatch) -> None:

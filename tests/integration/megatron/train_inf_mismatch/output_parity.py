@@ -425,8 +425,8 @@ def config_from_env() -> TrainInfOutputParityConfig:
         config.topology = config.topology.model_copy(update={"ep": 1, "etp": 1})
     if not cp_supported and "ART_TRAIN_INF_MISMATCH_CP" not in os.environ:
         updates = {"cp": 1}
-        if stage_resources is None and "ART_TRAIN_INF_MISMATCH_TP" not in os.environ:
-            updates["tp"] = max(config.topology.tp, len(config.trainer_gpu_ids))
+        if stage_resources is None and "ART_TRAIN_INF_MISMATCH_DP" not in os.environ:
+            updates["dp"] = config.topology.dp * config.topology.cp
         config.topology = config.topology.model_copy(update=updates)
     if raw_targets := os.environ.get("ART_TRAIN_INF_MISMATCH_LORA_TARGET_MODULES"):
         config.lora_target_modules = _parse_str_list(raw_targets)
