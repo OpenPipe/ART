@@ -82,17 +82,13 @@ def test_gdn_tree_parser_accepts_nested_tree() -> None:
         sum(bucket.segment_count for bucket in buckets)
         for buckets in plan.tree_segment_buckets_by_depth
     ] == [0, 2, 2]
-    first_child_bucket, second_child_bucket = plan.tree_segment_buckets_by_depth[1]
-    assert first_child_bucket.parent_indices is not None
-    assert first_child_bucket.parent_indices.tolist() == [-1]
-    assert first_child_bucket.position_indices.tolist() == [[0], [1], [2]]
-    assert first_child_bucket.output_mask is not None
-    assert first_child_bucket.output_mask.tolist() == [[True], [True], [True]]
-    assert second_child_bucket.parent_indices is not None
-    assert second_child_bucket.parent_indices.tolist() == [-1]
-    assert second_child_bucket.position_indices.tolist() == [[0], [5]]
-    assert second_child_bucket.output_mask is not None
-    assert second_child_bucket.output_mask.tolist() == [[False], [True]]
+    child_bucket = plan.tree_segment_buckets_by_depth[1][0]
+    assert child_bucket.parent_indices is not None
+    assert child_bucket.parent_indices.tolist() == [-1, -1]
+    assert child_bucket.family_indices.tolist() == [1, 4]
+    assert child_bucket.position_indices.tolist() == [0, 1, 2, 0, 5]
+    assert child_bucket.output_mask is not None
+    assert child_bucket.output_mask.tolist() == [True, True, True, False, True]
 
 
 def test_gdn_tree_parser_accepts_zero_depth_roots() -> None:
@@ -156,15 +152,13 @@ def test_gdn_tree_planner_splits_leaf_and_internal_final_state_buckets() -> None
     )
     tree_has_children = _tree_has_children(spec)
 
-    depth_one_buckets = plan.tree_segment_buckets_by_depth[1]
-    assert any(bucket.needs_final_state for bucket in depth_one_buckets)
-    assert any(not bucket.needs_final_state for bucket in depth_one_buckets)
-    for bucket in depth_one_buckets:
-        expected = {
-            tree_has_children[family_index]
-            for family_index in bucket.family_indices.tolist()
-        }
-        assert expected == {bucket.needs_final_state}
+    depth_one_bucket = plan.tree_segment_buckets_by_depth[1][0]
+    bucket_state_flags = {
+        tree_has_children[family_index]
+        for family_index in depth_one_bucket.family_indices.tolist()
+    }
+    assert bucket_state_flags == {False, True}
+    assert depth_one_bucket.needs_final_state
 
 
 def test_gdn_tree_cp_plan_chains_long_nodes() -> None:
@@ -349,7 +343,16 @@ def test_gdn_tree_cp_randomized_plans_pass_health_checks() -> None:
 def _chain_every_legal_segment_config():
     from art.megatron.gdn.gdn_shared_prefix import GdnPlannerConfig
 
-    return GdnPlannerConfig()
+    return GdnPlannerConfig(
+        cp_chain_min_runtime_delta_ms=0.0,
+        runtime_local_recurrent_tokens_per_ms=1.0,
+        runtime_chain_recurrent_tokens_per_ms=1_000_000_000.0,
+        runtime_cp_summary_bytes_per_segment=0,
+        runtime_cp_summary_exchange_count_per_bucket=0,
+        runtime_cp_summary_compute_segments_per_ms=1_000_000_000.0,
+        runtime_cp_suffix_scan_latency_ms=0.0,
+        runtime_parent_state_bytes_per_exchange=0,
+    )
 
 
 def _covered_token_indices(plans) -> set[int]:

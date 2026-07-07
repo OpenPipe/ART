@@ -7,6 +7,7 @@ from art.megatron.shared_prefix_packing import (
     _local_position_pairs,
     estimate_shared_prefix_packed_tokens,
     pack_shared_prefixes,
+    prefix_tree_pack,
 )
 
 
@@ -95,6 +96,26 @@ def test_packing_handles_empty_sequences() -> None:
     assert pack.group_ids.tolist() == [[]]
     assert pack.parent_ids.tolist() == [[]]
     assert [positions.tolist() for positions in pack.positions_by_sequence] == [[], []]
+
+
+def test_prefix_tree_pack_respects_shareable_lengths() -> None:
+    inputs = (
+        torch.tensor([1, 2, 3]),
+        torch.tensor([1, 2, 4]),
+    )
+
+    pack = prefix_tree_pack(inputs, max_depth=4, shareable_lengths=(1, 1))
+
+    assert pack.tokens.tolist() == [[1, 2, 3, 2, 4]]
+    assert [positions.tolist() for positions in pack.positions_by_sequence] == [
+        [0, 1, 2],
+        [0, 3, 4],
+    ]
+    assert estimate_shared_prefix_packed_tokens(
+        inputs,
+        max_depth=4,
+        shareable_lengths=(1, 1),
+    ) == int(pack.tokens.numel())
 
 
 def test_packed_token_estimator_matches_real_packing() -> None:

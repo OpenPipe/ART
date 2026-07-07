@@ -28,6 +28,20 @@ def pack_shared_prefixes(
     sequences: Iterable[torch.Tensor],
     *,
     max_depth: int,
+    shareable_lengths: Iterable[int] | None = None,
+) -> SharedPrefixPack:
+    return prefix_tree_pack(
+        sequences,
+        max_depth=max_depth,
+        shareable_lengths=shareable_lengths,
+    )
+
+
+def prefix_tree_pack(
+    sequences: Iterable[torch.Tensor],
+    *,
+    max_depth: int,
+    shareable_lengths: Iterable[int] | None = None,
 ) -> SharedPrefixPack:
     """Pack token sequences by storing shared prefixes once.
 
@@ -68,10 +82,13 @@ def pack_shared_prefixes(
     tensors = tuple(_sequence_tensor(sequence) for sequence in sequences)
     if not tensors:
         return _empty_pack()
+    share_limits = _shareable_lengths(tensors, shareable_lengths)
 
     device = tensors[0].device
     rows = tuple(tensor.detach().cpu().tolist() for tensor in tensors)
-    segments = _prefix_segments(rows, max_depth=max_depth)
+    segments = _prefix_segments(
+        rows, max_depth=max_depth, shareable_lengths=share_limits
+    )
     if not segments:
         return _empty_pack(len(tensors), device=device)
 
@@ -111,6 +128,7 @@ def estimate_shared_prefix_packed_tokens(
     sequences: Iterable[torch.Tensor],
     *,
     max_depth: int,
+    shareable_lengths: Iterable[int] | None = None,
 ) -> int | None:
     """Return the exact packed token count without building a packed batch.
 
@@ -121,16 +139,23 @@ def estimate_shared_prefix_packed_tokens(
     if max_depth < 0:
         raise ValueError("max_depth must be >= 0")
 
+    tensors: list[torch.Tensor] = []
     rows: list[list[int]] = []
     for sequence in sequences:
         tensor = _sequence_tensor(sequence)
         if tensor.device.type != "cpu":
             return None
+        tensors.append(tensor)
         rows.append(tensor.tolist())
+    share_limits = _shareable_lengths(tuple(tensors), shareable_lengths)
 
     return sum(
         segment.end - segment.start
-        for segment in _prefix_segments(tuple(rows), max_depth=max_depth)
+        for segment in _prefix_segments(
+            tuple(rows),
+            max_depth=max_depth,
+            shareable_lengths=share_limits,
+        )
     )
 
 
@@ -152,6 +177,7 @@ def _prefix_segments(
     rows: tuple[list[int], ...],
     *,
     max_depth: int,
+    shareable_lengths: tuple[int, ...],
 ) -> tuple[_PrefixSegment, ...]:
     lengths = tuple(len(row) for row in rows)
     segments: list[_PrefixSegment] = []
@@ -178,7 +204,7 @@ def _prefix_segments(
         return group_id
 
     def shared_end(indices: tuple[int, ...], start: int) -> int:
-        end = min(lengths[index] for index in indices)
+        end = min(min(lengths[index], shareable_lengths[index]) for index in indices)
         low = high = rows[indices[0]]
         for index in indices[1:]:
             row = rows[index]
@@ -212,20 +238,31 @@ def _prefix_segments(
         active = tuple(index for index in indices if lengths[index] > start)
         if not active:
             return
+        shareable = tuple(index for index in active if shareable_lengths[index] > start)
+        for index in active:
+            if index not in shareable:
+                emit((index,), start, lengths[index], parent_group_id)
+        if not shareable:
+            return
         if (
             max_depth == 0
-            or len(active) == 1
+            or len(shareable) == 1
             or (parent_group_id is not None and depth >= max_depth)
         ):
-            for index in active:
+            for index in shareable:
                 emit((index,), start, lengths[index], parent_group_id)
             return
 
-        end = shared_end(active, start)
+        end = shared_end(shareable, start)
         if end > start:
-            walk(active, end, emit(active, start, end, parent_group_id), depth + 1)
+            walk(
+                shareable,
+                end,
+                emit(shareable, start, end, parent_group_id),
+                depth + 1,
+            )
             return
-        for group in branch_groups(active, start):
+        for group in branch_groups(shareable, start):
             walk(group, start, parent_group_id, depth)
 
     walk(tuple(range(len(rows))), 0, None, 0)
@@ -251,9 +288,27 @@ def _empty_pack(
 def _sequence_tensor(tensor: torch.Tensor) -> torch.Tensor:
     if tensor.ndim != 1:
         raise ValueError(
-            f"pack_shared_prefixes expects 1-D tensors, got {tuple(tensor.shape)}"
+            f"prefix_tree_pack expects 1-D tensors, got {tuple(tensor.shape)}"
         )
     return tensor.detach().to(dtype=torch.long).contiguous()
+
+
+def _shareable_lengths(
+    tensors: tuple[torch.Tensor, ...],
+    lengths: Iterable[int] | None,
+) -> tuple[int, ...]:
+    if lengths is None:
+        return tuple(int(tensor.numel()) for tensor in tensors)
+    values = tuple(int(length) for length in lengths)
+    if len(values) != len(tensors):
+        raise ValueError(
+            "shareable_lengths must have one entry per sequence, "
+            f"got {len(values)} for {len(tensors)} sequences"
+        )
+    return tuple(
+        max(0, min(value, int(tensor.numel())))
+        for value, tensor in zip(values, tensors, strict=True)
+    )
 
 
 def _matching_offsets(
