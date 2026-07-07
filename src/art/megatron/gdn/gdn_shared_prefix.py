@@ -122,21 +122,26 @@ class GdnPlannerConfig:
     cp_chain_beam_branch_factor: int = 4
     cp_chain_beam_candidate_limit: int = 16
     cp_chain_beam_max_steps: int = 4
-    cp_chain_min_runtime_delta_ms: float = 0.25
+    # Chain buckets add extra collectives and kernel shapes; require a
+    # measurable runtime win before selecting them over local execution.
+    cp_chain_min_runtime_delta_ms: float = 4.0
     runtime_hidden_bytes_per_token: int = 4096
     runtime_layout_exchange_count: int = 4
     # Global all-to-all token counts are priced against aggregate CP bandwidth.
     runtime_layout_bandwidth_bytes_per_ms: float = 448_000_000.0
     runtime_layout_collective_latency_ms: float = 0.0
-    # Padded local FLA work is fwd+bwd measured work, not the fwd-only kernel rate.
-    runtime_local_recurrent_tokens_per_ms: float = 900.0
-    runtime_chain_recurrent_tokens_per_ms: float = 3_500.0
+    # Recurrent rates are fitted fwd+bwd exposed runtime, including the CP
+    # recurrent communication work that is not captured by token counts alone.
+    runtime_local_recurrent_tokens_per_ms: float = 1_500.0
+    runtime_chain_recurrent_tokens_per_ms: float = 1_400.0
     runtime_local_bucket_launch_ms: float = 0.20
     runtime_chain_bucket_launch_ms: float = 0.20
     runtime_local_segment_launch_ms: float = 0.005
     runtime_cp_summary_bytes_per_segment: int = 4_194_304
     runtime_cp_summary_exchange_count_per_bucket: int = 8
-    runtime_cp_summary_bandwidth_bytes_per_ms: float = 140_000_000.0
+    # Summary collectives move small state tensors and do not sustain the large
+    # hidden-state all-to-all bandwidth used by the layout exchange term.
+    runtime_cp_summary_bandwidth_bytes_per_ms: float = 80_000_000.0
     runtime_cp_summary_collective_latency_ms: float = 0.0
     runtime_cp_summary_compute_segments_per_ms: float = 320.0
     runtime_cp_suffix_scan_latency_ms: float = 2.0
