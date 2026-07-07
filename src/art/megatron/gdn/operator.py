@@ -7,6 +7,8 @@ import torch
 from torch import Tensor
 import torch.distributed as dist
 import torch.nn.functional as F
+import triton
+import triton.language as tl
 
 from .conv_gelu import packed_varlen_causal_conv
 from .fla_cp import chunk_gated_delta_rule_native_cp
@@ -2434,20 +2436,219 @@ def _scan_conv_tail_batch(
     *,
     stop_rank: int,
 ) -> Tensor:
-    states = []
     tail_width = int(parent_initial.shape[-1])
+    if tail_width <= 0:
+        return parent_initial
+    source_ids_cpu, source_pos_cpu = _conv_tail_source_map(
+        lengths_by_rank_cpu,
+        stop_rank=int(stop_rank),
+        tail_width=tail_width,
+    )
+    return _ConvTailScan.apply(
+        parent_initial,
+        tails_by_rank,
+        source_ids_cpu.to(device=parent_initial.device, non_blocking=True),
+        source_pos_cpu.to(device=parent_initial.device, non_blocking=True),
+    )
+
+
+def _conv_tail_source_map(
+    lengths_by_rank_cpu: Tensor,
+    *,
+    stop_rank: int,
+    tail_width: int,
+) -> tuple[Tensor, Tensor]:
+    if lengths_by_rank_cpu.device.type != "cpu":
+        raise ValueError("conv tail source-map lengths must stay on CPU")
+    segments = int(lengths_by_rank_cpu.shape[1])
+    source_ids = torch.empty((segments, tail_width), dtype=torch.int32)
+    source_pos = torch.empty((segments, tail_width), dtype=torch.int32)
     host_lengths = lengths_by_rank_cpu.tolist()
-    for segment in range(int(parent_initial.shape[0])):
-        state = parent_initial[segment]
-        for peer in range(int(stop_rank)):
-            valid = int(host_lengths[peer][segment])
-            if valid <= 0:
+    for segment in range(segments):
+        total = tail_width + sum(
+            int(host_lengths[peer][segment]) for peer in range(int(stop_rank))
+        )
+        first = total - tail_width
+        for out_pos in range(tail_width):
+            absolute = first + out_pos
+            if absolute < tail_width:
+                source_ids[segment, out_pos] = 0
+                source_pos[segment, out_pos] = absolute
                 continue
-            state = torch.cat([state, tails_by_rank[peer, segment, :, :valid]], dim=-1)[
-                :, -tail_width:
-            ]
-        states.append(state)
-    return torch.stack(states, dim=0)
+            remaining = absolute - tail_width
+            for peer in range(int(stop_rank)):
+                valid = int(host_lengths[peer][segment])
+                if remaining < valid:
+                    source_ids[segment, out_pos] = peer + 1
+                    source_pos[segment, out_pos] = remaining
+                    break
+                remaining -= valid
+            else:
+                raise RuntimeError("conv tail source-map construction fell off history")
+    return source_ids, source_pos
+
+
+@triton.jit(do_not_specialize=["segments"])
+def _conv_tail_scan_kernel(
+    parent_initial,
+    tails_by_rank,
+    source_ids,
+    source_pos,
+    output,
+    segments,
+    channels: tl.constexpr,
+    tail_width: tl.constexpr,
+    BLOCK_C: tl.constexpr,
+) -> None:
+    segment = tl.program_id(0)
+    channel_block = tl.program_id(1)
+    offsets = channel_block * BLOCK_C + tl.arange(0, BLOCK_C)
+    channel_mask = offsets < channels
+    for tail_pos in tl.static_range(0, tail_width):
+        source_id = tl.load(source_ids + segment * tail_width + tail_pos)
+        pos = tl.load(source_pos + segment * tail_width + tail_pos)
+        parent_values = tl.load(
+            parent_initial + (segment * channels + offsets) * tail_width + pos,
+            mask=channel_mask & (source_id == 0),
+            other=0.0,
+        )
+        tail_values = tl.load(
+            tails_by_rank
+            + (((source_id - 1) * segments + segment) * channels + offsets) * tail_width
+            + pos,
+            mask=channel_mask & (source_id != 0),
+            other=0.0,
+        )
+        tl.store(
+            output + (segment * channels + offsets) * tail_width + tail_pos,
+            parent_values + tail_values,
+            mask=channel_mask,
+        )
+
+
+@triton.jit(do_not_specialize=["segments"])
+def _conv_tail_scan_backward_kernel(
+    grad_output,
+    source_ids,
+    source_pos,
+    grad_parent_initial,
+    grad_tails_by_rank,
+    segments,
+    channels: tl.constexpr,
+    tail_width: tl.constexpr,
+    BLOCK_C: tl.constexpr,
+) -> None:
+    segment = tl.program_id(0)
+    channel_block = tl.program_id(1)
+    offsets = channel_block * BLOCK_C + tl.arange(0, BLOCK_C)
+    channel_mask = offsets < channels
+    for tail_pos in tl.static_range(0, tail_width):
+        source_id = tl.load(source_ids + segment * tail_width + tail_pos)
+        pos = tl.load(source_pos + segment * tail_width + tail_pos)
+        values = tl.load(
+            grad_output + (segment * channels + offsets) * tail_width + tail_pos,
+            mask=channel_mask,
+            other=0.0,
+        )
+        tl.store(
+            grad_parent_initial + (segment * channels + offsets) * tail_width + pos,
+            values,
+            mask=channel_mask & (source_id == 0),
+        )
+        tl.store(
+            grad_tails_by_rank
+            + (((source_id - 1) * segments + segment) * channels + offsets) * tail_width
+            + pos,
+            values,
+            mask=channel_mask & (source_id != 0),
+        )
+
+
+class _ConvTailScan(torch.autograd.Function):
+    @staticmethod
+    def forward(
+        ctx: Any,
+        parent_initial: Tensor,
+        tails_by_rank: Tensor,
+        source_ids: Tensor,
+        source_pos: Tensor,
+    ) -> Tensor:
+        if parent_initial.ndim != 3:
+            raise ValueError(
+                f"parent_initial must be [segments, channels, tail], got {tuple(parent_initial.shape)}"
+            )
+        if tails_by_rank.ndim != 4:
+            raise ValueError(
+                f"tails_by_rank must be [cp, segments, channels, tail], got {tuple(tails_by_rank.shape)}"
+            )
+        segments, channels, tail_width = (
+            int(parent_initial.shape[0]),
+            int(parent_initial.shape[1]),
+            int(parent_initial.shape[2]),
+        )
+        if tuple(tails_by_rank.shape[1:]) != tuple(parent_initial.shape):
+            raise ValueError(
+                "tails_by_rank trailing dimensions must match parent_initial, got "
+                f"{tuple(tails_by_rank.shape)} and {tuple(parent_initial.shape)}"
+            )
+        if tuple(source_ids.shape) != (segments, tail_width) or tuple(
+            source_pos.shape
+        ) != (segments, tail_width):
+            raise ValueError(
+                "conv tail source maps must be [segments, tail_width], got "
+                f"{tuple(source_ids.shape)} and {tuple(source_pos.shape)}"
+            )
+        output = torch.empty_like(parent_initial)
+        block_c = 256
+        _conv_tail_scan_kernel[(segments, triton.cdiv(channels, block_c))](
+            parent_initial,
+            tails_by_rank,
+            source_ids.contiguous(),
+            source_pos.contiguous(),
+            output,
+            segments,
+            channels,
+            tail_width,
+            BLOCK_C=block_c,
+            num_warps=8,
+        )
+        ctx.save_for_backward(source_ids, source_pos)
+        ctx.parent_shape = tuple(parent_initial.shape)
+        ctx.tails_shape = tuple(tails_by_rank.shape)
+        return output
+
+    @staticmethod
+    def backward(ctx: Any, *grad_outputs: Tensor | None) -> tuple[Any, ...]:
+        grad_output = grad_outputs[0]
+        if grad_output is None:
+            raise RuntimeError("conv tail scan backward expected output gradient")
+        source_ids, source_pos = ctx.saved_tensors
+        grad_output = grad_output.contiguous()
+        grad_parent = torch.zeros(
+            ctx.parent_shape, device=grad_output.device, dtype=grad_output.dtype
+        )
+        grad_tails = torch.zeros(
+            ctx.tails_shape, device=grad_output.device, dtype=grad_output.dtype
+        )
+        segments, channels, tail_width = (
+            int(ctx.parent_shape[0]),
+            int(ctx.parent_shape[1]),
+            int(ctx.parent_shape[2]),
+        )
+        block_c = 256
+        _conv_tail_scan_backward_kernel[(segments, triton.cdiv(channels, block_c))](
+            grad_output,
+            source_ids,
+            source_pos,
+            grad_parent,
+            grad_tails,
+            segments,
+            channels,
+            tail_width,
+            BLOCK_C=block_c,
+            num_warps=8,
+        )
+        return grad_parent, grad_tails, None, None
 
 
 class _AllGatherReplicated(torch.autograd.Function):
