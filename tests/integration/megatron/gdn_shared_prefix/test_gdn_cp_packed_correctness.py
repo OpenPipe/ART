@@ -752,9 +752,12 @@ def _tree_chain_pack():
 def _tree_chain_planner_config() -> GdnPlannerConfig:
     return GdnPlannerConfig(
         max_padding_ratio=4.0,
-        planner_local_token_ms=0.1,
-        planner_chain_token_ms=0.0,
-        planner_chain_bucket_ms=0.0,
+        runtime_local_recurrent_tokens_per_ms=10.0,
+        runtime_chain_recurrent_tokens_per_ms=1_000_000.0,
+        runtime_cp_summary_bandwidth_bytes_per_ms=1e18,
+        runtime_cp_summary_compute_segments_per_ms=1e18,
+        runtime_cp_suffix_scan_latency_ms=0.0,
+        runtime_cp_suffix_scan_segments_per_ms=1e18,
     )
 
 

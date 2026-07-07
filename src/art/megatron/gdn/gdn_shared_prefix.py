@@ -108,24 +108,42 @@ class _ExplicitBucketColumn:
 
 @dataclass(frozen=True)
 class GdnPlannerConfig:
-    """Tunable cost coefficients for one packed-row GDN execution plan."""
+    """Runtime model for one packed-row GDN execution plan.
+
+    The defaults are measured-throughput estimates from the Qwen3.5-shaped GDN
+    CP lab: hidden=2048, BF16 hidden exchange, 32 value heads, key/value dim 128.
+    The planner scores plans in predicted fwd+bwd milliseconds. The fields are
+    hardware/model-shape defaults, not benchmark-specific workload switches.
+    """
 
     max_padding_ratio: float = 2.0
-    rank_idle_token_cost: float = 1.0
-    max_zero_exchange_load_imbalance: float = 1.5
+    default_layout_split_factor: float = 1.5
     cp_chain_beam_width: int = 2
     cp_chain_beam_branch_factor: int = 4
     cp_chain_beam_candidate_limit: int = 16
     cp_chain_beam_max_steps: int = 4
-    cp_chain_min_score_delta_ms: float = 0.25
-    planner_local_token_ms: float = 0.0012
-    planner_chain_token_ms: float = 0.00055
-    planner_local_bucket_ms: float = 0.25
-    planner_chain_bucket_ms: float = 22.0
-    planner_local_segment_ms: float = 0.010
-    planner_layout_cross_rank_token_ms: float = 0.00008
-    planner_parent_state_exchange_ms: float = 0.5
-    planner_empty_rank_ms: float = 32.0
+    cp_chain_min_runtime_delta_ms: float = 0.25
+    runtime_hidden_bytes_per_token: int = 4096
+    runtime_layout_exchange_count: int = 4
+    # Global all-to-all token counts are priced against aggregate CP bandwidth.
+    runtime_layout_bandwidth_bytes_per_ms: float = 448_000_000.0
+    runtime_layout_collective_latency_ms: float = 0.0
+    # Padded local FLA work is fwd+bwd measured work, not the fwd-only kernel rate.
+    runtime_local_recurrent_tokens_per_ms: float = 900.0
+    runtime_chain_recurrent_tokens_per_ms: float = 3_500.0
+    runtime_local_bucket_launch_ms: float = 0.20
+    runtime_chain_bucket_launch_ms: float = 0.20
+    runtime_local_segment_launch_ms: float = 0.005
+    runtime_cp_summary_bytes_per_segment: int = 4_194_304
+    runtime_cp_summary_exchange_count_per_bucket: int = 8
+    runtime_cp_summary_bandwidth_bytes_per_ms: float = 140_000_000.0
+    runtime_cp_summary_collective_latency_ms: float = 0.0
+    runtime_cp_summary_compute_segments_per_ms: float = 320.0
+    runtime_cp_suffix_scan_latency_ms: float = 2.0
+    runtime_cp_suffix_scan_segments_per_ms: float = 15.0
+    runtime_parent_state_bytes_per_exchange: int = 262_144
+    runtime_parent_state_bandwidth_bytes_per_ms: float = 56_000_000.0
+    runtime_parent_state_latency_ms: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -185,6 +203,18 @@ class _GdnChainSearchMetadata(NamedTuple):
     segment_lengths: tuple[int, ...]
     segment_depths: tuple[int, ...]
     segment_attention_counts: tuple[tuple[int, ...], ...]
+
+
+class _GdnLocalRuntimeEstimate(NamedTuple):
+    rank_work: tuple[int, ...]
+    rank_bucket_counts: tuple[int, ...]
+    rank_segment_counts: tuple[int, ...]
+
+
+class _GdnChainRuntimeEstimate(NamedTuple):
+    rank_work: tuple[int, ...]
+    bucket_count: int
+    segment_count: int
 
 
 def _tokens_from_rank_ranges(
@@ -696,58 +726,22 @@ def _best_search_owner(
     *,
     planner_config: GdnPlannerConfig,
 ) -> int:
-    rank_count = len(rank_loads)
-    total_load = segment_length
-    current_empty_ranks = 0
-    current_max_load = 0
-    current_second_max_load = 0
-    current_max_count = 0
-    for load in rank_loads:
-        total_load += load
-        current_empty_ranks += int(load == 0)
-        if load > current_max_load:
-            current_second_max_load = current_max_load
-            current_max_load = load
-            current_max_count = 1
-        elif load == current_max_load:
-            current_max_count += 1
-        elif load > current_second_max_load:
-            current_second_max_load = load
-    if current_max_count != 1:
-        current_second_max_load = current_max_load
-    best: tuple[float, float, int, int, int, int] | None = None
+    best: tuple[float, float, int, int, int] | None = None
     for rank, tokens in enumerate(on_rank_tokens):
-        projected_rank_load = rank_loads[rank] + segment_length
-        max_other_rank_load = (
-            current_second_max_load
-            if rank_loads[rank] == current_max_load and current_max_count == 1
-            else current_max_load
+        projected_loads = list(rank_loads)
+        projected_loads[rank] += segment_length
+        rank_runtime_ms = max(
+            load / planner_config.runtime_local_recurrent_tokens_per_ms
+            for load in projected_loads
         )
-        max_load = (
-            projected_rank_load
-            if projected_rank_load > max_other_rank_load
-            else max_other_rank_load
-        )
-        target_load = total_load / max(1, rank_count)
-        overload = max(
-            0.0,
-            max_load - planner_config.max_zero_exchange_load_imbalance * target_load,
-        )
-        idle_tokens = max_load * rank_count - total_load
         cross_rank_tokens = segment_length - int(tokens)
-        empty_rank_count = current_empty_ranks - int(rank_loads[rank] == 0)
-        score = (
-            max_load * planner_config.planner_local_token_ms
-            + idle_tokens
-            * planner_config.rank_idle_token_cost
-            * planner_config.planner_local_token_ms
-            + cross_rank_tokens * planner_config.planner_layout_cross_rank_token_ms
-            + empty_rank_count * planner_config.planner_empty_rank_ms
+        exchange_runtime_ms = _predict_layout_exchange_runtime_ms(
+            cross_rank_tokens,
+            planner_config,
         )
         candidate = (
-            overload,
-            score,
-            max_load,
+            rank_runtime_ms + exchange_runtime_ms,
+            exchange_runtime_ms,
             cross_rank_tokens,
             -int(tokens),
             rank,
@@ -822,7 +816,7 @@ def _select_chain_segment_keys(
     )
     best = decision_for(frozenset())
     all_chain = decision_for(legal_chain_keys)
-    if best.score - all_chain.score > planner_config.cp_chain_min_score_delta_ms:
+    if best.score - all_chain.score > planner_config.cp_chain_min_runtime_delta_ms:
         best = all_chain
     beam = _best_chain_search_decisions(
         (decision_for(frozenset()), all_chain),
@@ -865,7 +859,7 @@ def _select_chain_segment_keys(
             limit=planner_config.cp_chain_beam_width,
         )
         step_best = beam[0]
-        if best.score - step_best.score > planner_config.cp_chain_min_score_delta_ms:
+        if best.score - step_best.score > planner_config.cp_chain_min_runtime_delta_ms:
             best = step_best
             stale_steps = 0
         else:
@@ -1022,41 +1016,27 @@ def _score_chain_segment_keys(
     for root_index in search_metadata.root_indices:
         assign_tree(root_index)
 
-    local_work_by_rank, local_bucket_count, local_segment_count = (
-        _estimate_local_rank_kernel_work_from_lengths(
-            tuple(
-                tuple(tuple(depth_segments) for depth_segments in rank_segments)
-                for rank_segments in local_lengths_by_rank_depth
-            )
+    local_runtime = _estimate_local_runtime_from_lengths(
+        tuple(
+            tuple(tuple(depth_segments) for depth_segments in rank_segments)
+            for rank_segments in local_lengths_by_rank_depth
         )
     )
-    chain_work_by_rank, chain_bucket_count = (
-        _estimate_chain_rank_kernel_work_from_counts(
-            tuple(tuple(depth_counts) for depth_counts in chain_rank_counts_by_depth),
-            cp_size=cp_size,
-        )
+    chain_runtime = _estimate_chain_runtime_from_counts(
+        tuple(tuple(depth_counts) for depth_counts in chain_rank_counts_by_depth),
+        cp_size=cp_size,
     )
     parent_state_exchange_count = _count_parent_state_exchanges(
         spec,
         owner_by_node=tuple(owner_by_node),
         chain_nodes=tuple(chain_nodes),
     )
-    rank_kernel_ms = max(
-        (
-            local_work_by_rank[rank] * planner_config.planner_local_token_ms
-            + chain_work_by_rank[rank] * planner_config.planner_chain_token_ms
-        )
-        for rank in range(cp_size)
-    )
-    empty_rank_count = sum(1 for token_count in rank_loads if token_count == 0)
-    return (
-        rank_kernel_ms
-        + local_bucket_count * planner_config.planner_local_bucket_ms
-        + chain_bucket_count * planner_config.planner_chain_bucket_ms
-        + local_segment_count * planner_config.planner_local_segment_ms
-        + cross_rank_token_count * planner_config.planner_layout_cross_rank_token_ms
-        + parent_state_exchange_count * planner_config.planner_parent_state_exchange_ms
-        + empty_rank_count * planner_config.planner_empty_rank_ms
+    return _predict_gdn_plan_runtime_ms(
+        local_runtime,
+        chain_runtime,
+        cross_rank_token_count=cross_rank_token_count,
+        parent_state_exchange_count=parent_state_exchange_count,
+        planner_config=planner_config,
     )
 
 
@@ -1074,7 +1054,7 @@ def _add_local_search_load(
 def _estimate_local_rank_kernel_work(
     local_segments_by_rank_depth: tuple[tuple[tuple[GdnSegmentSpec, ...], ...], ...],
 ) -> tuple[tuple[int, ...], int, int]:
-    return _estimate_local_rank_kernel_work_from_lengths(
+    estimate = _estimate_local_runtime_from_lengths(
         tuple(
             tuple(
                 tuple(segment.length for segment in segments)
@@ -1083,11 +1063,27 @@ def _estimate_local_rank_kernel_work(
             for rank_segments in local_segments_by_rank_depth
         )
     )
+    return (
+        estimate.rank_work,
+        max(estimate.rank_bucket_counts, default=0),
+        max(estimate.rank_segment_counts, default=0),
+    )
 
 
 def _estimate_local_rank_kernel_work_from_lengths(
     local_lengths_by_rank_depth: tuple[tuple[tuple[int, ...], ...], ...],
 ) -> tuple[tuple[int, ...], int, int]:
+    estimate = _estimate_local_runtime_from_lengths(local_lengths_by_rank_depth)
+    return (
+        estimate.rank_work,
+        max(estimate.rank_bucket_counts, default=0),
+        max(estimate.rank_segment_counts, default=0),
+    )
+
+
+def _estimate_local_runtime_from_lengths(
+    local_lengths_by_rank_depth: tuple[tuple[tuple[int, ...], ...], ...],
+) -> _GdnLocalRuntimeEstimate:
     rank_work: list[int] = []
     rank_bucket_counts: list[int] = []
     rank_segment_counts: list[int] = []
@@ -1103,10 +1099,10 @@ def _estimate_local_rank_kernel_work_from_lengths(
         rank_work.append(work)
         rank_bucket_counts.append(bucket_count)
         rank_segment_counts.append(segment_count)
-    return (
-        tuple(rank_work),
-        max(rank_bucket_counts, default=0),
-        max(rank_segment_counts, default=0),
+    return _GdnLocalRuntimeEstimate(
+        rank_work=tuple(rank_work),
+        rank_bucket_counts=tuple(rank_bucket_counts),
+        rank_segment_counts=tuple(rank_segment_counts),
     )
 
 
@@ -1116,7 +1112,7 @@ def _estimate_chain_rank_kernel_work(
     chain_rank_counts_by_key: dict[GdnSegmentDecisionKey, tuple[int, ...]],
     cp_size: int,
 ) -> tuple[tuple[int, ...], int]:
-    return _estimate_chain_rank_kernel_work_from_counts(
+    estimate = _estimate_chain_runtime_from_counts(
         tuple(
             tuple(
                 chain_rank_counts_by_key[_segment_key(segment)] for segment in segments
@@ -1125,6 +1121,7 @@ def _estimate_chain_rank_kernel_work(
         ),
         cp_size=cp_size,
     )
+    return estimate.rank_work, estimate.bucket_count
 
 
 def _estimate_chain_rank_kernel_work_from_counts(
@@ -1132,16 +1129,174 @@ def _estimate_chain_rank_kernel_work_from_counts(
     *,
     cp_size: int,
 ) -> tuple[tuple[int, ...], int]:
+    estimate = _estimate_chain_runtime_from_counts(
+        chain_rank_counts_by_depth,
+        cp_size=cp_size,
+    )
+    return estimate.rank_work, estimate.bucket_count
+
+
+def _estimate_chain_runtime_from_counts(
+    chain_rank_counts_by_depth: tuple[tuple[tuple[int, ...], ...], ...],
+    *,
+    cp_size: int,
+) -> _GdnChainRuntimeEstimate:
     rank_work = [0] * cp_size
     bucket_count = 0
+    segment_count = 0
     for rank_counts_by_segment in chain_rank_counts_by_depth:
         if not rank_counts_by_segment:
             continue
         bucket_count += 1
+        segment_count += len(rank_counts_by_segment)
         for rank in range(cp_size):
             lengths = tuple(counts[rank] for counts in rank_counts_by_segment)
             rank_work[rank] += max(lengths, default=0) * len(lengths)
-    return tuple(rank_work), bucket_count
+    return _GdnChainRuntimeEstimate(
+        rank_work=tuple(rank_work),
+        bucket_count=bucket_count,
+        segment_count=segment_count,
+    )
+
+
+def _predict_gdn_plan_runtime_ms(
+    local_runtime: _GdnLocalRuntimeEstimate,
+    chain_runtime: _GdnChainRuntimeEstimate,
+    *,
+    cross_rank_token_count: int,
+    parent_state_exchange_count: int,
+    planner_config: GdnPlannerConfig,
+) -> float:
+    """Predict exposed fwd+bwd runtime for a GDN CP plan in milliseconds.
+
+    This is a runtime cost model fitted from GDN CP lab measurements. It models
+    the critical per-rank recurrent path separately from exposed communication
+    and chain-summary work, so chain/local decisions compare predicted wall time
+    rather than abstract balance or token-count penalties.
+    """
+
+    rank_runtime_ms = 0.0
+    rank_count = max(
+        len(local_runtime.rank_work),
+        len(chain_runtime.rank_work),
+    )
+    for rank in range(rank_count):
+        local_work = (
+            local_runtime.rank_work[rank] if rank < len(local_runtime.rank_work) else 0
+        )
+        local_bucket_count = (
+            local_runtime.rank_bucket_counts[rank]
+            if rank < len(local_runtime.rank_bucket_counts)
+            else 0
+        )
+        local_segment_count = (
+            local_runtime.rank_segment_counts[rank]
+            if rank < len(local_runtime.rank_segment_counts)
+            else 0
+        )
+        chain_work = (
+            chain_runtime.rank_work[rank] if rank < len(chain_runtime.rank_work) else 0
+        )
+        rank_runtime_ms = max(
+            rank_runtime_ms,
+            _predict_local_rank_runtime_ms(
+                local_work,
+                bucket_count=local_bucket_count,
+                segment_count=local_segment_count,
+                planner_config=planner_config,
+            )
+            + chain_work / planner_config.runtime_chain_recurrent_tokens_per_ms,
+        )
+    return (
+        rank_runtime_ms
+        + _predict_chain_exposed_runtime_ms(
+            chain_runtime,
+            planner_config=planner_config,
+        )
+        + _predict_layout_exchange_runtime_ms(
+            cross_rank_token_count,
+            planner_config,
+        )
+        + _predict_parent_state_exchange_runtime_ms(
+            parent_state_exchange_count,
+            planner_config,
+        )
+    )
+
+
+def _predict_local_rank_runtime_ms(
+    recurrent_work: int,
+    *,
+    bucket_count: int,
+    segment_count: int,
+    planner_config: GdnPlannerConfig,
+) -> float:
+    return (
+        recurrent_work / planner_config.runtime_local_recurrent_tokens_per_ms
+        + bucket_count * planner_config.runtime_local_bucket_launch_ms
+        + segment_count * planner_config.runtime_local_segment_launch_ms
+    )
+
+
+def _predict_chain_exposed_runtime_ms(
+    chain_runtime: _GdnChainRuntimeEstimate,
+    *,
+    planner_config: GdnPlannerConfig,
+) -> float:
+    if chain_runtime.bucket_count == 0:
+        return 0.0
+    summary_bytes = (
+        chain_runtime.segment_count
+        * planner_config.runtime_cp_summary_bytes_per_segment
+        * planner_config.runtime_cp_summary_exchange_count_per_bucket
+    )
+    summary_exchange_ms = (
+        summary_bytes / planner_config.runtime_cp_summary_bandwidth_bytes_per_ms
+        + chain_runtime.bucket_count
+        * planner_config.runtime_cp_summary_exchange_count_per_bucket
+        * planner_config.runtime_cp_summary_collective_latency_ms
+    )
+    return (
+        chain_runtime.bucket_count * planner_config.runtime_chain_bucket_launch_ms
+        + summary_exchange_ms
+        + chain_runtime.segment_count
+        / planner_config.runtime_cp_summary_compute_segments_per_ms
+        + chain_runtime.bucket_count * planner_config.runtime_cp_suffix_scan_latency_ms
+        + chain_runtime.segment_count
+        / planner_config.runtime_cp_suffix_scan_segments_per_ms
+    )
+
+
+def _predict_layout_exchange_runtime_ms(
+    cross_rank_token_count: int,
+    planner_config: GdnPlannerConfig,
+) -> float:
+    if cross_rank_token_count <= 0:
+        return 0.0
+    bytes_moved = (
+        cross_rank_token_count
+        * planner_config.runtime_hidden_bytes_per_token
+        * planner_config.runtime_layout_exchange_count
+    )
+    return (
+        bytes_moved / planner_config.runtime_layout_bandwidth_bytes_per_ms
+        + planner_config.runtime_layout_exchange_count
+        * planner_config.runtime_layout_collective_latency_ms
+    )
+
+
+def _predict_parent_state_exchange_runtime_ms(
+    exchange_count: int,
+    planner_config: GdnPlannerConfig,
+) -> float:
+    if exchange_count <= 0:
+        return 0.0
+    return (
+        exchange_count
+        * planner_config.runtime_parent_state_bytes_per_exchange
+        / planner_config.runtime_parent_state_bandwidth_bytes_per_ms
+        + exchange_count * planner_config.runtime_parent_state_latency_ms
+    )
 
 
 def _padded_work_from_lengths(lengths: tuple[int, ...]) -> tuple[int, int]:
@@ -1536,8 +1691,9 @@ def _default_attention_layout_ranges(
         loads[rank] += token_count
 
     def should_split_segment(segment: GdnSegmentSpec) -> bool:
-        if segment.length <= planner_config.max_zero_exchange_load_imbalance * (
-            target_rank_load
+        if (
+            segment.length
+            <= planner_config.default_layout_split_factor * target_rank_load
         ):
             return False
         return _can_chain_tree_segment(
