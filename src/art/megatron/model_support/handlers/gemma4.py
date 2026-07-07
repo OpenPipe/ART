@@ -67,6 +67,9 @@ _VLLM_MOE_EXPERT_KEY_RE = re.compile(
     r"^(?P<prefix>.*\.moe\.experts)\.(?P<expert>\d+)\."
     r"(?P<module>gate_proj|up_proj|down_proj)\.(?P<lora>lora_[AB])\.weight$"
 )
+_ART_PACKED_MOE_KEY_RE = re.compile(
+    r"^.*\.mlp\.experts\.(?:base_layer\.)?lora_[AB]\.weight$"
+)
 _DENSE_MLP_LORA_KEY_RE = re.compile(
     r"(?P<prefix>\.mlp)\.(?P<module>gate_proj|up_proj|down_proj)\."
     r"(?P<lora>lora_[AB])\.weight$"
@@ -1815,21 +1818,28 @@ def _to_vllm_lora_tensors(
 ) -> tuple[dict[str, torch.Tensor], dict[str, Any]]:
     grouped = _group_art_moe_tensors(tensors)
     if not grouped:
-        # This branch handles PEFT/vLLM fused expert tensors. They already use
-        # external logical Gemma4 dimensions; only ART's grouped branch below
-        # trims padded internal dimensions.
-        transformed = {
-            vllm_key: _rescale_shared_expert_fc1_lora_a(
+        transformed: dict[str, torch.Tensor] = {}
+        for key, tensor in tensors.items():
+            vllm_key = _to_vllm_key(key)
+            # ART's packed expert publisher emits fused `.mlp.experts.*` tensors
+            # in Megatron's padded internal shape. PEFT/vLLM fused expert tensors
+            # arrive under external names and already use logical Gemma4 dims.
+            if _ART_PACKED_MOE_KEY_RE.match(key):
+                tensor = _trim_gemma4_moe_lora_for_vllm(
+                    vllm_key,
+                    tensor,
+                    adapter_config=adapter_config,
+                )
+            if vllm_key in transformed:
+                raise RuntimeError(
+                    f"Duplicate Gemma 4 LoRA tensor after conversion: {vllm_key}"
+                )
+            transformed[vllm_key] = _rescale_shared_expert_fc1_lora_a(
                 vllm_key,
                 tensor,
                 adapter_config=adapter_config,
                 to_vllm=True,
             )
-            for key, tensor in tensors.items()
-            for vllm_key in (_to_vllm_key(key),)
-        }
-        if len(transformed) != len(tensors):
-            raise RuntimeError("Duplicate Gemma 4 LoRA tensor after vLLM conversion")
         transformed = _add_gemma4_k_eq_v_v_lora_tensors(
             transformed,
             adapter_config=adapter_config,
@@ -1898,6 +1908,12 @@ def _to_vllm_lora_tensors(
         if vllm_key in transformed:
             raise RuntimeError(
                 f"Duplicate Gemma 4 LoRA tensor after conversion: {vllm_key}"
+            )
+        if _ART_PACKED_MOE_KEY_RE.match(key):
+            tensor = _trim_gemma4_moe_lora_for_vllm(
+                vllm_key,
+                tensor,
+                adapter_config=adapter_config,
             )
         transformed[vllm_key] = _rescale_shared_expert_fc1_lora_a(
             vllm_key,
