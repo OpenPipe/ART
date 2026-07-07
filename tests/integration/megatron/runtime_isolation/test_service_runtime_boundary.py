@@ -8,8 +8,11 @@ from unittest.mock import AsyncMock
 
 import httpx
 import pytest
+from safetensors.torch import save_file
+import torch
 
 import art
+from art.megatron import service as service_module
 from art.megatron.service import MegatronService
 
 
@@ -69,6 +72,36 @@ def test_megatron_default_lora_adapter_config_uses_model_lora_config(
 
     assert config.r == 8
     assert config.target_modules == {"q_proj", "down_proj"}
+
+
+def test_megatron_reused_step0_identity_adapter_is_normalized(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    lora_path = tmp_path / "checkpoints" / "0000"
+    lora_path.mkdir(parents=True)
+    save_file(
+        {"base_model.model.layers.0.self_attn.q_proj.lora_A.weight": torch.ones(1, 1)},
+        lora_path / "adapter_model.safetensors",
+    )
+    calls: list[tuple[str, bool]] = []
+    monkeypatch.setattr(
+        service_module,
+        "normalize_lora_checkpoint_to_vllm",
+        lambda path, *, allow_unvalidated_arch=False: calls.append(
+            (str(path), allow_unvalidated_arch)
+        ),
+    )
+    service = MegatronService(
+        model_name="test-model",
+        base_model="Qwen/Qwen3-0.6B",
+        config={"allow_unvalidated_arch": True},
+        output_dir=str(tmp_path),
+    )
+
+    service._ensure_identity_lora(str(lora_path), normalize_existing=True)
+
+    assert calls == [(str(lora_path), True)]
 
 
 def test_megatron_in_flight_lora_uses_derived_slot_name(tmp_path: Path) -> None:

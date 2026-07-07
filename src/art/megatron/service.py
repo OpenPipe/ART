@@ -498,7 +498,12 @@ class MegatronService:
             bias="none",
         )
 
-    def _adapter_exists_and_loads(self, lora_path: str) -> bool:
+    def _adapter_exists_and_loads(
+        self,
+        lora_path: str,
+        *,
+        normalize_existing: bool = False,
+    ) -> bool:
         adapter_path = os.path.join(lora_path, "adapter_model.safetensors")
         if not os.path.exists(adapter_path):
             return False
@@ -508,6 +513,11 @@ class MegatronService:
                 raise RuntimeError(f"LoRA adapter contains no tensors: {adapter_path}")
             for key in keys:
                 adapter_file.get_tensor(key)
+        if normalize_existing:
+            normalize_lora_checkpoint_to_vllm(
+                lora_path,
+                allow_unvalidated_arch=self._allow_unvalidated_arch,
+            )
         return True
 
     def _create_identity_lora(self, lora_path: str) -> None:
@@ -526,8 +536,16 @@ class MegatronService:
             allow_unvalidated_arch=self._allow_unvalidated_arch,
         )
 
-    def _ensure_identity_lora(self, lora_path: str) -> None:
-        if self._adapter_exists_and_loads(lora_path):
+    def _ensure_identity_lora(
+        self,
+        lora_path: str,
+        *,
+        normalize_existing: bool = False,
+    ) -> None:
+        if self._adapter_exists_and_loads(
+            lora_path,
+            normalize_existing=normalize_existing,
+        ):
             return
         self._create_identity_lora(lora_path)
 
@@ -565,7 +583,10 @@ class MegatronService:
         lora_path = get_step_checkpoint_dir(self.output_dir, self._latest_step)
         if self._latest_step == 0 and not os.path.exists(lora_path):
             lora_path = get_step_checkpoint_dir(self.output_dir, 0)
-        self._ensure_identity_lora(lora_path)
+        self._ensure_identity_lora(
+            lora_path,
+            normalize_existing=self._latest_step == 0,
+        )
         self._ensure_lora_adapter_config(lora_path)
         return lora_path
 
