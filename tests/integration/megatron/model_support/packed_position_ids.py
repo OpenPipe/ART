@@ -19,6 +19,9 @@ from art.megatron.model_support.discovery import inspect_architecture
 from art.megatron.shared_prefix_state import create_shared_prefix_state
 
 from ..artifacts import GitRepoState, pinned_git_state
+from .fp32_grouped_gemm import (
+    allow_fp32_grouped_gemm_fallback_for_model_support_tests,
+)
 from .oracle_harness import (
     ORACLE_TOPOLOGY,
     TEST_DEFAULT_FLEX_BACKEND,
@@ -34,6 +37,8 @@ from .oracle_worker import (
     _configure_provider,
     provider_topology_env,
 )
+
+allow_fp32_grouped_gemm_fallback_for_model_support_tests()
 
 # Qwen3.5/3.6 hybrid MoE runs show small shape-dependent logit drift between
 # the single packed forward and many shorter reference forwards, even when the

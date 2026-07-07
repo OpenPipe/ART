@@ -24,6 +24,9 @@ from art.preprocessing.pack import PackedTensors
 from ..routing_replay.bundle import build_bundle_from_forward_trace_dir
 from ..routing_replay.trace import install_moe_routing_trace_hooks
 from .forward_trace import ForwardTraceCapture
+from .fp32_grouped_gemm import (
+    allow_fp32_grouped_gemm_fallback_for_model_support_tests,
+)
 from .gdn_fp32_reference import install_megatron_qwen35_gdn_fp32_reference
 from .gdn_trace_uids import install_gdn_trace_token_uid_hooks
 from .oracle_harness import (
@@ -1309,6 +1312,9 @@ def _worker_run(request: WorkerRunRequest) -> None:
     from art.megatron import train as megatron_train
     from art.megatron.training.weight_offload import WeightOffloadManager
     from art.preprocessing.pack import packed_tensors_from_dir
+
+    if request.case_config.precision == "fp32":
+        allow_fp32_grouped_gemm_fallback_for_model_support_tests()
 
     local_rank = int(os.environ["LOCAL_RANK"])
     torch.cuda.set_device(local_rank)

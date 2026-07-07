@@ -27,6 +27,9 @@ from art.megatron.training.trace import prepare_replay_local_input_token_uids
 from art.megatron.weights.merged_weight_export import build_art_conversion_tasks
 from art.preprocessing.pack import packed_tensors_from_dir
 
+from .fp32_grouped_gemm import (
+    allow_fp32_grouped_gemm_fallback_for_model_support_tests,
+)
 from .gdn_fp32_reference import install_megatron_qwen35_gdn_fp32_reference
 from .hf_parity import (
     HF_PARITY_REPORT_FILENAME,
@@ -57,6 +60,8 @@ from .oracle_worker import (
     _set_deterministic_seed,
 )
 from .test_inputs import build_sft_trajectory_tensors_from_packed_tensors
+
+allow_fp32_grouped_gemm_fallback_for_model_support_tests()
 
 HF_PARITY_DEBUG_ENV = "ART_HF_PARITY_DEBUG"
 _DEBUG_START_TIME = time.perf_counter()
