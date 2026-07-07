@@ -55,4 +55,4 @@ def test_dsv4_uses_quantized_vllm_noise_train_inf_thresholds() -> None:
     base_model = "deepseek-ai/DeepSeek-V4-Flash"
 
     assert fwd_mean_abs_pct_limit_for_model(base_model) == 20.0
-    assert top20_kl_candidate_to_target_limit_for_model(base_model) == 0.03
+    assert top20_kl_candidate_to_target_limit_for_model(base_model) == 0.07

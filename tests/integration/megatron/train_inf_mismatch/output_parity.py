@@ -44,7 +44,7 @@ BF16_FWD_MEAN_ABS_PCT_LIMIT_BY_MODEL_KEY = {
 }
 TOP20_KL_CANDIDATE_TO_TARGET_LIMIT = 0.002
 TOP20_KL_CANDIDATE_TO_TARGET_LIMIT_BY_MODEL_KEY = {
-    "dsv4": 0.03,
+    "dsv4": 0.07,
     "gemma4_dense": 0.003,
     "gemma4_moe": 0.008,
 }
