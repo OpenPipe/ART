@@ -1022,12 +1022,19 @@ def load_adapter_into_model(
 def _optimizer_step(
     optimizer: Any,
     learning_rate: float,
+    *,
+    model_support_handler: Any | None = None,
+    model_chunks: ModelChunks | None = None,
 ) -> tuple[bool, float, int | None]:
     for param_group in optimizer.param_groups:
         param_group["lr"] = learning_rate
+    if model_support_handler is not None and model_chunks is not None:
+        model_support_handler.zero_internal_padding_grads(model_chunks)
     update_successful, grad_norm, num_zeros_in_grad = cast(
         tuple[bool, float, int | None], optimizer.step()
     )
+    if model_support_handler is not None and model_chunks is not None:
+        model_support_handler.zero_internal_padding_params(model_chunks)
     optimizer.zero_grad()
     return update_successful, grad_norm, num_zeros_in_grad
 
@@ -1475,6 +1482,8 @@ def run_megatron_sft_step(
     update_successful, grad_norm, num_zeros_in_grad = _optimizer_step(
         optimizer,
         learning_rate,
+        model_support_handler=model_support_handler,
+        model_chunks=model_chunks,
     )
     global_num_tokens = max(num_tokens.item(), 1.0)
     reduced_loss = _reduce_loss(
@@ -1687,6 +1696,8 @@ def run_training_step(
     update_successful, grad_norm, num_zeros_in_grad = _optimizer_step(
         optimizer,
         learning_rate,
+        model_support_handler=model_support_handler,
+        model_chunks=model_chunks,
     )
     global_num_tokens = max(token_count.item(), 1.0)
     reduced_loss = _reduce_loss(

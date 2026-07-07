@@ -88,6 +88,14 @@ class DefaultDenseHandler:
         del model_chunks
         return None
 
+    def zero_internal_padding_grads(self, model_chunks: Sequence[Any]) -> None:
+        del model_chunks
+        return None
+
+    def zero_internal_padding_params(self, model_chunks: Sequence[Any]) -> None:
+        del model_chunks
+        return None
+
     def to_vllm_lora_tensors(
         self,
         tensors: dict[str, torch.Tensor],

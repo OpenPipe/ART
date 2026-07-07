@@ -104,6 +104,10 @@ class ModelSupportHandler(Protocol):
 
     def install_preprocess_patch(self, model_chunks: Sequence[Any]) -> None: ...
 
+    def zero_internal_padding_grads(self, model_chunks: Sequence[Any]) -> None: ...
+
+    def zero_internal_padding_params(self, model_chunks: Sequence[Any]) -> None: ...
+
     def collect_layer_families(
         self,
         provider: "GPTModelProvider",

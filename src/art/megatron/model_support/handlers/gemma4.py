@@ -85,6 +85,9 @@ _SELF_ATTN_K_LORA_KEY_RE = re.compile(
 )
 _MEGATRON_LAYER_RE = re.compile(r"(?:^|\.)layers\.(?P<layer>\d+)\.")
 _HF_TEXT_EXPERT_KEY_RE = re.compile(r"(?P<layer>\.layers\.\d+)\.experts")
+_GEMMA4_MOE_FFN_ALIGNMENT = 128
+_GEMMA4_LOGICAL_MOE_FFN_ATTR = "art_gemma4_logical_moe_ffn_hidden_size"
+_GEMMA4_MAPPING_PADDING_ATTR = "_art_gemma4_moe_padding_sizes"
 
 
 def _gemma4_forward_kwargs(model: Any, **kwargs: Any) -> dict[str, Any]:
@@ -104,6 +107,451 @@ def _gemma4_forward_kwargs(model: Any, **kwargs: Any) -> dict[str, Any]:
     else:
         setattr(gpt_module, "_art_gemma4_rotary_seq_len", None)
     return {"extra_block_kwargs": kwargs}
+
+
+def _round_up_to_multiple(value: int, multiple: int) -> int:
+    return ((value + multiple - 1) // multiple) * multiple
+
+
+def _configure_gemma4_moe_internal_padding(provider: Any) -> None:
+    if int(getattr(provider, "num_moe_experts", 0) or 0) <= 0:
+        return
+    logical = int(
+        getattr(
+            provider,
+            _GEMMA4_LOGICAL_MOE_FFN_ATTR,
+            getattr(provider, "moe_ffn_hidden_size", 0),
+        )
+        or 0
+    )
+    if logical <= 0:
+        raise RuntimeError("Gemma 4 MoE provider is missing moe_ffn_hidden_size")
+    padded = _round_up_to_multiple(logical, _GEMMA4_MOE_FFN_ALIGNMENT)
+    # The external Gemma4 contract remains `logical`; Megatron uses `padded`
+    # internally so TE CUTLASS grouped GEMM stays off the cuBLAS cache path.
+    setattr(provider, _GEMMA4_LOGICAL_MOE_FFN_ATTR, logical)
+    provider.moe_ffn_hidden_size = padded
+
+
+def _gemma4_moe_padding_sizes_from_provider(provider: Any) -> tuple[int, int]:
+    logical = int(
+        getattr(
+            provider,
+            _GEMMA4_LOGICAL_MOE_FFN_ATTR,
+            getattr(provider, "moe_ffn_hidden_size", 0),
+        )
+        or 0
+    )
+    internal = int(getattr(provider, "moe_ffn_hidden_size", 0) or 0)
+    if logical <= 0 or internal <= 0 or internal < logical:
+        raise RuntimeError(
+            f"Invalid Gemma 4 MoE padding sizes: logical={logical} internal={internal}"
+        )
+    return logical, internal
+
+
+def _gemma4_moe_padding_sizes_from_module(module: Any) -> tuple[int, int] | None:
+    config = getattr(module, "config", None)
+    if config is None:
+        return None
+    return _gemma4_moe_padding_sizes_from_provider(config)
+
+
+def _gemma4_moe_padding_sizes_from_hf_config(
+    hf_config: Any | None,
+) -> tuple[int, int] | None:
+    text_config = getattr(hf_config, "text_config", hf_config)
+    if not bool(getattr(text_config, "enable_moe_block", False)):
+        return None
+    logical = int(getattr(text_config, "moe_intermediate_size", 0) or 0)
+    if logical <= 0:
+        return None
+    return logical, _round_up_to_multiple(logical, _GEMMA4_MOE_FFN_ALIGNMENT)
+
+
+def _mapping_gemma4_moe_padding_sizes(
+    mapping: Any,
+    megatron_module: Any | None,
+) -> tuple[int, int] | None:
+    if megatron_module is not None:
+        return _gemma4_moe_padding_sizes_from_module(megatron_module)
+    return getattr(mapping, _GEMMA4_MAPPING_PADDING_ATTR, None)
+
+
+def _copy_gemma4_mapping_padding(source: Any, target: Any) -> Any:
+    if hasattr(source, _GEMMA4_MAPPING_PADDING_ATTR):
+        setattr(
+            target,
+            _GEMMA4_MAPPING_PADDING_ATTR,
+            getattr(source, _GEMMA4_MAPPING_PADDING_ATTR),
+        )
+    return target
+
+
+def _set_gemma4_mapping_padding(
+    mapping: Any,
+    padding_sizes: tuple[int, int] | None,
+) -> Any:
+    if padding_sizes is not None:
+        setattr(mapping, _GEMMA4_MAPPING_PADDING_ATTR, padding_sizes)
+    return mapping
+
+
+def _gemma4_moe_padding_sizes_from_adapter_config(
+    adapter_config: dict[str, Any],
+) -> tuple[int, int] | None:
+    base_model = adapter_config.get("base_model_name_or_path")
+    if not isinstance(base_model, str) or not base_model:
+        raise RuntimeError("Gemma 4 LoRA conversion requires base_model_name_or_path")
+    config = _gemma4_text_config_dict(base_model)
+    if not bool(config.get("enable_moe_block", False)):
+        return None
+    logical = int(config.get("moe_intermediate_size", 0) or 0)
+    if logical <= 0:
+        raise RuntimeError(
+            f"Gemma 4 MoE config is missing moe_intermediate_size: {base_model}"
+        )
+    return logical, _round_up_to_multiple(logical, _GEMMA4_MOE_FFN_ALIGNMENT)
+
+
+def _pad_dim_right(tensor: torch.Tensor, *, dim: int, size: int) -> torch.Tensor:
+    dim = dim if dim >= 0 else tensor.ndim + dim
+    current = int(tensor.shape[dim])
+    if current == size:
+        return tensor.contiguous()
+    if current > size:
+        raise RuntimeError(f"Cannot pad tensor dim {dim} from {current} down to {size}")
+    pad_shape = list(tensor.shape)
+    pad_shape[dim] = size - current
+    padding = tensor.new_zeros(pad_shape)
+    return torch.cat([tensor, padding], dim=dim).contiguous()
+
+
+def _trim_dim_right(tensor: torch.Tensor, *, dim: int, size: int) -> torch.Tensor:
+    dim = dim if dim >= 0 else tensor.ndim + dim
+    current = int(tensor.shape[dim])
+    if current == size:
+        return tensor.contiguous()
+    if current < size:
+        raise RuntimeError(f"Cannot trim tensor dim {dim} from {current} up to {size}")
+    return tensor.narrow(dim, 0, size).contiguous()
+
+
+def _pad_gemma4_gate_up_dim0(
+    tensor: torch.Tensor,
+    *,
+    logical: int,
+    internal: int,
+) -> torch.Tensor:
+    if logical == internal:
+        return tensor.contiguous()
+    if int(tensor.shape[0]) != 2 * logical:
+        raise RuntimeError(
+            "Expected Gemma 4 gate/up logical dim "
+            f"{2 * logical}, got {tuple(tensor.shape)}"
+        )
+    gate, up = torch.split(tensor, logical, dim=0)
+    return torch.cat(
+        [
+            _pad_dim_right(gate, dim=0, size=internal),
+            _pad_dim_right(up, dim=0, size=internal),
+        ],
+        dim=0,
+    ).contiguous()
+
+
+def _trim_gemma4_gate_up_dim0(
+    tensor: torch.Tensor,
+    *,
+    logical: int,
+    internal: int,
+) -> torch.Tensor:
+    if logical == internal:
+        return tensor.contiguous()
+    if int(tensor.shape[0]) != 2 * internal:
+        raise RuntimeError(
+            "Expected Gemma 4 gate/up internal dim "
+            f"{2 * internal}, got {tuple(tensor.shape)}"
+        )
+    return torch.cat(
+        [
+            tensor.narrow(0, 0, logical),
+            tensor.narrow(0, internal, logical),
+        ],
+        dim=0,
+    ).contiguous()
+
+
+def _trim_gemma4_gate_up_weight_from_internal(
+    tensor: torch.Tensor,
+    *,
+    logical: int,
+    internal: int,
+) -> torch.Tensor:
+    if logical == internal:
+        return tensor.contiguous()
+    if tensor.ndim == 3 and int(tensor.shape[0]) == 2:
+        return torch.stack(
+            [
+                _trim_dim_right(tensor[0], dim=0, size=logical),
+                _trim_dim_right(tensor[1], dim=0, size=logical),
+            ],
+            dim=0,
+        ).contiguous()
+    return _trim_gemma4_gate_up_dim0(tensor, logical=logical, internal=internal)
+
+
+def _gemma4_down_padding_axis(shape: Sequence[int], *, internal: int) -> int:
+    matches = [index for index, size in enumerate(shape) if int(size) == internal]
+    if len(matches) != 1:
+        raise RuntimeError(
+            "Expected exactly one Gemma 4 down-proj internal dim "
+            f"{internal}, got {tuple(shape)}"
+        )
+    return matches[0]
+
+
+def _pad_gemma4_down_weight_to_internal(
+    tensor: torch.Tensor,
+    *,
+    axis: int,
+    internal: int,
+) -> torch.Tensor:
+    return _pad_dim_right(tensor, dim=axis, size=internal)
+
+
+def _trim_gemma4_down_weight_from_internal(
+    tensor: torch.Tensor,
+    *,
+    logical: int,
+    internal: int,
+) -> torch.Tensor:
+    return _trim_dim_right(
+        tensor,
+        dim=_gemma4_down_padding_axis(tensor.shape, internal=internal),
+        size=logical,
+    )
+
+
+def _trim_gemma4_moe_lora_for_vllm(
+    key: str,
+    tensor: torch.Tensor,
+    *,
+    adapter_config: dict[str, Any],
+) -> torch.Tensor:
+    sizes = _gemma4_moe_padding_sizes_from_adapter_config(adapter_config)
+    if sizes is None:
+        return tensor.contiguous()
+    logical, internal = sizes
+    fused_match = _VLLM_MOE_KEY_RE.match(key)
+    if fused_match is not None:
+        base_layer = "base_layer." if fused_match.group("base_layer") else ""
+        slot = f"{base_layer}{fused_match.group('lora')}"
+        if slot == "base_layer.lora_B":
+            return _trim_gemma4_gate_up_dim0(
+                tensor,
+                logical=logical,
+                internal=internal,
+            )
+        if slot == "lora_A":
+            return _trim_dim_right(tensor, dim=-1, size=logical)
+    expert_match = _VLLM_MOE_EXPERT_KEY_RE.match(key)
+    if expert_match is not None:
+        module = expert_match.group("module")
+        lora = expert_match.group("lora")
+        if module in {"gate_proj", "up_proj"} and lora == "lora_B":
+            return _trim_dim_right(tensor, dim=0, size=logical)
+        if module == "down_proj" and lora == "lora_A":
+            return _trim_dim_right(tensor, dim=-1, size=logical)
+    return tensor.contiguous()
+
+
+def _pad_gemma4_moe_lora_for_art(
+    key: str,
+    tensor: torch.Tensor,
+    *,
+    adapter_config: dict[str, Any],
+) -> torch.Tensor:
+    sizes = _gemma4_moe_padding_sizes_from_adapter_config(adapter_config)
+    if sizes is None:
+        return tensor.contiguous()
+    logical, internal = sizes
+    match = _ART_MOE_EXPERT_KEY_RE.match(key)
+    if match is None:
+        return tensor.contiguous()
+    module = match.group("module")
+    lora = match.group("lora")
+    if module == "gate_up_proj" and lora == "lora_B":
+        return _pad_gemma4_gate_up_dim0(tensor, logical=logical, internal=internal)
+    if module == "down_proj" and lora == "lora_A":
+        return _pad_dim_right(tensor, dim=-1, size=internal)
+    return tensor.contiguous()
+
+
+def _local_padding_ranges(
+    *,
+    param: torch.nn.Parameter,
+    tensor: torch.Tensor,
+    logical: int,
+    internal: int,
+    components: tuple[int, ...],
+) -> tuple[tuple[int, int], ...]:
+    if logical == internal:
+        return ()
+    sharded = bool(getattr(param, "lora_tp_sharded", False))
+    if not sharded:
+        offset = 0
+        ranges: list[tuple[int, int]] = []
+        for component_size in components:
+            if component_size != internal:
+                raise RuntimeError(
+                    f"Unexpected Gemma 4 padded component size {component_size}; expected {internal}"
+                )
+            ranges.append((offset + logical, offset + internal))
+            offset += internal
+        return tuple(ranges)
+
+    domain = getattr(param, "lora_shard_domain")
+    world_size = art_lora._get_shard_world_size(domain)  # type: ignore[attr-defined]
+    shard_rank = art_lora._get_shard_rank(domain)  # type: ignore[attr-defined]
+    strategy = getattr(param, "lora_tp_shard_strategy", "uniform")
+    if strategy == "uniform":
+        if components != (internal,):
+            raise RuntimeError("Gemma 4 uniform padding mask expects one component")
+        if internal % world_size != 0:
+            raise RuntimeError(
+                f"Gemma 4 internal size {internal} is not divisible by world size {world_size}"
+            )
+        shard_size = internal // world_size
+        shard_start = shard_rank * shard_size
+        start = max(logical, shard_start) - shard_start
+        end = min(internal, shard_start + shard_size) - shard_start
+        return ((start, end),) if end > start else ()
+
+    if strategy != "componentwise":
+        raise RuntimeError(f"Unsupported Gemma 4 padding shard strategy={strategy!r}")
+
+    component_sizes = tuple(
+        int(size) for size in getattr(param, "lora_tp_component_sizes", ())
+    )
+    if component_sizes != components:
+        raise RuntimeError(
+            f"Unexpected Gemma 4 component sizes {component_sizes}; expected {components}"
+        )
+    local_offset = 0
+    ranges = []
+    for component_size in component_sizes:
+        if component_size % world_size != 0:
+            raise RuntimeError(
+                "Gemma 4 component size "
+                f"{component_size} is not divisible by world size {world_size}"
+            )
+        shard_size = component_size // world_size
+        shard_start = shard_rank * shard_size
+        start = max(logical, shard_start) - shard_start
+        end = min(internal, shard_start + shard_size) - shard_start
+        if end > start:
+            ranges.append((local_offset + start, local_offset + end))
+        local_offset += shard_size
+    if local_offset != tensor.shape[-1]:
+        raise RuntimeError(
+            f"Gemma 4 componentwise padding mask expected local extent {local_offset}, got {tensor.shape[-1]}"
+        )
+    return tuple(ranges)
+
+
+def _zero_ranges(
+    tensor: torch.Tensor,
+    *,
+    dim: int,
+    ranges: Sequence[tuple[int, int]],
+) -> None:
+    dim = dim if dim >= 0 else tensor.ndim + dim
+    for start, end in ranges:
+        if end > start:
+            tensor.narrow(dim, start, end - start).zero_()
+
+
+def _tensor_or_local_tensor(value: Any) -> torch.Tensor | None:
+    if torch.is_tensor(value):
+        return value
+    local_tensor = getattr(value, "_local_tensor", None)
+    return local_tensor if torch.is_tensor(local_tensor) else None
+
+
+def _zero_gemma4_moe_lora_padding_tensor_set(
+    param: torch.nn.Parameter,
+    *,
+    dim: int,
+    logical: int,
+    internal: int,
+    components: tuple[int, ...],
+    grads: bool,
+    params: bool,
+) -> None:
+    tensors: list[torch.Tensor] = []
+    if params:
+        tensors.append(param.data)
+    if grads:
+        for grad_value in (param.grad, getattr(param, "main_grad", None)):
+            grad = _tensor_or_local_tensor(grad_value)
+            if grad is not None:
+                tensors.append(grad)
+    if not tensors:
+        return
+    ranges = _local_padding_ranges(
+        param=param,
+        tensor=tensors[0],
+        logical=logical,
+        internal=internal,
+        components=components,
+    )
+    for tensor in tensors:
+        _zero_ranges(tensor, dim=dim, ranges=ranges)
+
+
+def _zero_gemma4_moe_lora_padding(
+    model_chunks: Sequence[Any],
+    *,
+    grads: bool,
+    params: bool,
+) -> None:
+    if not grads and not params:
+        return
+    with torch.no_grad():
+        for chunk in model_chunks:
+            config = getattr(chunk, "config", None)
+            if config is None:
+                config = getattr(getattr(chunk, "module", None), "config", None)
+            if config is None:
+                continue
+            logical, internal = _gemma4_moe_padding_sizes_from_provider(config)
+            if logical == internal:
+                continue
+            for module in chunk.modules():
+                prefix = getattr(module, "adapter_model_prefix", None)
+                if not isinstance(prefix, str) or ".mlp.experts." not in prefix:
+                    continue
+                if prefix.endswith(".gate_up_proj") and hasattr(module, "B_T"):
+                    _zero_gemma4_moe_lora_padding_tensor_set(
+                        cast(torch.nn.Parameter, module.B_T),
+                        dim=-1,
+                        logical=logical,
+                        internal=internal,
+                        components=(internal, internal),
+                        grads=grads,
+                        params=params,
+                    )
+                elif prefix.endswith(".down_proj") and hasattr(module, "A_T"):
+                    _zero_gemma4_moe_lora_padding_tensor_set(
+                        cast(torch.nn.Parameter, module.A_T),
+                        dim=-2,
+                        logical=logical,
+                        internal=internal,
+                        components=(internal,),
+                        grads=grads,
+                        params=params,
+                    )
 
 
 class Gemma4MoeHandler(DefaultMoeHandler):
@@ -130,6 +578,7 @@ class Gemma4MoeHandler(DefaultMoeHandler):
         return tuple(dict.fromkeys(suffixes))
 
     def configure_provider_for_runtime(self, provider: Any) -> None:
+        _configure_gemma4_moe_internal_padding(provider)
         _patch_gemma4_router_for_mcore()
         _patch_gemma4_rotary_for_hf_proportional()
         _patch_gemma4_qkv_for_hf_tied_value()
@@ -145,6 +594,12 @@ class Gemma4MoeHandler(DefaultMoeHandler):
     def install_preprocess_patch(self, model_chunks: Sequence[Any]) -> None:
         _install_gemma4_preprocess_patch(model_chunks)
         _install_gemma4_full_recompute_patch(model_chunks)
+
+    def zero_internal_padding_grads(self, model_chunks: Sequence[Any]) -> None:
+        _zero_gemma4_moe_lora_padding(model_chunks, grads=True, params=False)
+
+    def zero_internal_padding_params(self, model_chunks: Sequence[Any]) -> None:
+        _zero_gemma4_moe_lora_padding(model_chunks, grads=False, params=True)
 
     def collect_layer_families(self, provider: Any) -> list[LayerFamilyInstance]:
         if int(getattr(provider, "num_moe_experts", 0) or 0) <= 0:
@@ -1361,11 +1816,15 @@ def _to_vllm_lora_tensors(
     grouped = _group_art_moe_tensors(tensors)
     if not grouped:
         transformed = {
-            vllm_key: _rescale_shared_expert_fc1_lora_a(
+            vllm_key: _trim_gemma4_moe_lora_for_vllm(
                 vllm_key,
-                tensor,
+                _rescale_shared_expert_fc1_lora_a(
+                    vllm_key,
+                    tensor,
+                    adapter_config=adapter_config,
+                    to_vllm=True,
+                ),
                 adapter_config=adapter_config,
-                to_vllm=True,
             )
             for key, tensor in tensors.items()
             for vllm_key in (_to_vllm_key(key),)
@@ -1402,8 +1861,20 @@ def _to_vllm_lora_tensors(
                     f"Incomplete Gemma 4 MoE LoRA block for {prefix}.{expert}"
                 ) from exc
             gate_up_a.append(gate_up_a_tensor.contiguous())
-            gate_up_b.append(gate_up_b_tensor.contiguous())
-            down_a.append(down_a_tensor.contiguous())
+            gate_up_b.append(
+                _trim_gemma4_moe_lora_for_vllm(
+                    f"{vllm_prefix}.base_layer.lora_B.weight",
+                    gate_up_b_tensor,
+                    adapter_config=adapter_config,
+                )
+            )
+            down_a.append(
+                _trim_gemma4_moe_lora_for_vllm(
+                    f"{vllm_prefix}.lora_A.weight",
+                    down_a_tensor,
+                    adapter_config=adapter_config,
+                )
+            )
             down_b.append(down_b_tensor.contiguous())
             for module_name in ("gate_up_proj", "down_proj"):
                 for lora_name in ("lora_A", "lora_B"):
@@ -1429,11 +1900,15 @@ def _to_vllm_lora_tensors(
             raise RuntimeError(
                 f"Duplicate Gemma 4 LoRA tensor after conversion: {vllm_key}"
             )
-        transformed[vllm_key] = _rescale_shared_expert_fc1_lora_a(
+        transformed[vllm_key] = _trim_gemma4_moe_lora_for_vllm(
             vllm_key,
-            tensor,
+            _rescale_shared_expert_fc1_lora_a(
+                vllm_key,
+                tensor,
+                adapter_config=adapter_config,
+                to_vllm=True,
+            ),
             adapter_config=adapter_config,
-            to_vllm=True,
         )
     transformed = _add_gemma4_k_eq_v_v_lora_tensors(
         transformed,
@@ -1526,11 +2001,19 @@ def _from_vllm_lora_tensors(
                 gate_up_a[row : row + rank].contiguous()
             )
             transformed[f"{art_prefix}.{expert}.gate_up_proj.lora_B.weight"] = (
-                gate_up_b_by_expert[expert].contiguous()
+                _pad_gemma4_moe_lora_for_art(
+                    f"{art_prefix}.{expert}.gate_up_proj.lora_B.weight",
+                    gate_up_b_by_expert[expert],
+                    adapter_config=adapter_config,
+                )
             )
-            transformed[f"{art_prefix}.{expert}.down_proj.lora_A.weight"] = down_a[
-                row : row + rank
-            ].contiguous()
+            transformed[f"{art_prefix}.{expert}.down_proj.lora_A.weight"] = (
+                _pad_gemma4_moe_lora_for_art(
+                    f"{art_prefix}.{expert}.down_proj.lora_A.weight",
+                    down_a[row : row + rank],
+                    adapter_config=adapter_config,
+                )
+            )
             transformed[f"{art_prefix}.{expert}.down_proj.lora_B.weight"] = (
                 down_b_by_expert[expert].contiguous()
             )
@@ -1593,10 +2076,18 @@ def _from_vllm_per_expert_lora_tensors(
                 gate_a
             )
             transformed[f"{art_prefix}.{expert}.gate_up_proj.lora_B.weight"] = (
-                torch.cat([gate_b, up_b], dim=0).contiguous()
+                _pad_gemma4_moe_lora_for_art(
+                    f"{art_prefix}.{expert}.gate_up_proj.lora_B.weight",
+                    torch.cat([gate_b, up_b], dim=0),
+                    adapter_config=adapter_config,
+                )
             )
-            transformed[f"{art_prefix}.{expert}.down_proj.lora_A.weight"] = _clone(
-                down_a
+            transformed[f"{art_prefix}.{expert}.down_proj.lora_A.weight"] = (
+                _pad_gemma4_moe_lora_for_art(
+                    f"{art_prefix}.{expert}.down_proj.lora_A.weight",
+                    down_a,
+                    adapter_config=adapter_config,
+                )
             )
             transformed[f"{art_prefix}.{expert}.down_proj.lora_B.weight"] = _clone(
                 down_b
@@ -1636,6 +2127,7 @@ def _gemma4_text_only_mapping_registry(hf_config: Any | None = None) -> Any:
         art_gate_up_mapping,
         art_down_mapping,
     ) = _art_gemma4_expert_mapping_types()
+    gemma4_moe_padding_sizes = _gemma4_moe_padding_sizes_from_hf_config(hf_config)
 
     class _ArtGemma4TextOnlyQKVMapping(_Gemma4QKVMapping):
         def __init__(
@@ -1694,6 +2186,7 @@ def _gemma4_text_only_mapping_registry(hf_config: Any | None = None) -> Any:
             art_gate_up_mapping=art_gate_up_mapping,
             art_down_mapping=art_down_mapping,
             global_layer_indices=global_layer_indices,
+            gemma4_moe_padding_sizes=gemma4_moe_padding_sizes,
         )
         if not is_moe:
             if _is_gemma4_moe_mapping(text_mapping):
@@ -1765,13 +2258,20 @@ def _text_only_gemma4_mapping(
     art_gate_up_mapping: type[Any],
     art_down_mapping: type[Any],
     global_layer_indices: tuple[int, ...],
+    gemma4_moe_padding_sizes: tuple[int, int] | None,
 ) -> Any:
     megatron_param = mapping.megatron_param.removeprefix("language_model.")
     hf_param = getattr(mapping, "hf_param", None)
     if isinstance(mapping, bridge_gate_up_mapping):
-        return art_gate_up_mapping(megatron_param, hf_param)
+        return _set_gemma4_mapping_padding(
+            art_gate_up_mapping(megatron_param, hf_param),
+            gemma4_moe_padding_sizes,
+        )
     if isinstance(mapping, bridge_down_mapping):
-        return art_down_mapping(megatron_param, hf_param)
+        return _set_gemma4_mapping_padding(
+            art_down_mapping(megatron_param, hf_param),
+            gemma4_moe_padding_sizes,
+        )
     if (
         megatron_param.endswith(".self_attention.linear_qkv.weight")
         and isinstance(hf_param, dict)
@@ -1832,28 +2332,70 @@ def _art_gemma4_expert_mapping_types() -> tuple[
                 raise ValueError(
                     f"Expected even fused dim for {self.megatron_param}, got {full_target_shape}."
                 )
+            padding_sizes = _mapping_gemma4_moe_padding_sizes(
+                self,
+                megatron_module,
+            )
+            if padding_sizes is None:
+                logical, internal = gate_target_shape[0], gate_target_shape[0]
+            else:
+                logical, internal = padding_sizes
+            logical_gate_target_shape = (logical, gate_target_shape[1])
             if (
                 isinstance(expert_weight, torch.Tensor)
                 and expert_weight.ndim == 3
                 and expert_weight.shape[0] == 2
             ):
                 gate = _align_expert_weight_to_shape(
-                    expert_weight[0], torch.Size(gate_target_shape), "gate"
+                    expert_weight[0],
+                    torch.Size(logical_gate_target_shape),
+                    "gate",
                 )
                 up = _align_expert_weight_to_shape(
-                    expert_weight[1], torch.Size(gate_target_shape), "up"
+                    expert_weight[1],
+                    torch.Size(logical_gate_target_shape),
+                    "up",
                 )
             else:
                 fused = _align_expert_weight_to_shape(
                     cast(torch.Tensor, expert_weight),
-                    torch.Size(full_target_shape),
+                    torch.Size((2 * logical, gate_target_shape[1])),
                     "gate_up",
                 )
                 gate, up = torch.chunk(fused, 2, dim=0)
+            gate = _pad_dim_right(gate, dim=0, size=internal)
+            up = _pad_dim_right(up, dim=0, size=internal)
             return self._gated_mapping.hf_to_megatron(
                 {"gate": gate, "up": up},
                 megatron_module,
             )
+
+        def megatron_to_hf(
+            self,
+            megatron_weights: torch.Tensor | None,
+            megatron_module: Any | None,
+        ) -> dict[str, torch.Tensor]:
+            converted = super().megatron_to_hf(megatron_weights, megatron_module)
+            if not converted:
+                return converted
+            padding_sizes = _mapping_gemma4_moe_padding_sizes(
+                self,
+                megatron_module,
+            )
+            if padding_sizes is None:
+                return converted
+            logical, internal = padding_sizes
+            return {
+                key: _trim_gemma4_gate_up_weight_from_internal(
+                    tensor,
+                    logical=logical,
+                    internal=internal,
+                )
+                for key, tensor in converted.items()
+            }
+
+        def resolve(self, captures: tuple[str, ...]) -> Any:
+            return _copy_gemma4_mapping_padding(self, super().resolve(captures))
 
     class _ArtGemma4ExpertDownProjMapping(FusedExpertMapping):
         def hf_to_megatron(
@@ -1886,12 +2428,62 @@ def _art_gemma4_expert_mapping_types() -> tuple[
                 )
             else:
                 full_target_shape = tuple(target_param.shape)
+            padding_sizes = _mapping_gemma4_moe_padding_sizes(
+                self,
+                megatron_module,
+            )
+            if padding_sizes is None:
+                logical_shape = full_target_shape
+                internal = None
+                padding_axis = None
+            else:
+                logical, internal = padding_sizes
+                padding_axis = _gemma4_down_padding_axis(
+                    full_target_shape,
+                    internal=internal,
+                )
+                logical_shape_list = list(full_target_shape)
+                logical_shape_list[padding_axis] = logical
+                logical_shape = tuple(logical_shape_list)
             aligned = _align_expert_weight_to_shape(
                 expert_weight,
-                torch.Size(full_target_shape),
+                torch.Size(logical_shape),
                 "down_proj",
             )
+            if internal is not None and padding_axis is not None:
+                aligned = _pad_gemma4_down_weight_to_internal(
+                    aligned,
+                    axis=padding_axis,
+                    internal=internal,
+                )
             return self._mapping.hf_to_megatron(aligned, megatron_module)
+
+        def megatron_to_hf(
+            self,
+            megatron_weights: torch.Tensor | None,
+            megatron_module: Any | None,
+        ) -> dict[str, torch.Tensor]:
+            converted = super().megatron_to_hf(megatron_weights, megatron_module)
+            if not converted:
+                return converted
+            padding_sizes = _mapping_gemma4_moe_padding_sizes(
+                self,
+                megatron_module,
+            )
+            if padding_sizes is None:
+                return converted
+            logical, internal = padding_sizes
+            return {
+                key: _trim_gemma4_down_weight_from_internal(
+                    tensor,
+                    logical=logical,
+                    internal=internal,
+                )
+                for key, tensor in converted.items()
+            }
+
+        def resolve(self, captures: tuple[str, ...]) -> Any:
+            return _copy_gemma4_mapping_padding(self, super().resolve(captures))
 
     return (
         FusedGatedExpertMapping,
@@ -2058,11 +2650,17 @@ def ensure_gemma4_text_only_bridge_registered() -> None:
             if is_moe:
                 provider.num_moe_experts = getattr(text_config, "num_experts", 128)
                 provider.moe_router_topk = getattr(text_config, "top_k_experts", 8)
+                setattr(
+                    provider,
+                    _GEMMA4_LOGICAL_MOE_FFN_ATTR,
+                    getattr(text_config, "moe_intermediate_size", 704),
+                )
                 provider.moe_ffn_hidden_size = getattr(
                     text_config,
                     "moe_intermediate_size",
                     704,
                 )
+                _configure_gemma4_moe_internal_padding(provider)
                 provider.moe_shared_expert_intermediate_size = getattr(
                     text_config,
                     "intermediate_size",
