@@ -3,6 +3,7 @@ from __future__ import annotations
 import pytest
 import torch
 
+from art.megatron.context_parallel.layout_index import TokenLayoutIndex
 from art.megatron.shared_prefix_packing import pack_shared_prefixes
 from art.megatron.shared_prefix_tree import parse_shared_prefix_row
 
@@ -151,7 +152,7 @@ def test_gdn_tree_planner_splits_leaf_and_internal_final_state_buckets() -> None
     plan = build_gdn_rank_execution_plan(
         spec,
         device="cpu",
-        planner_config=GdnPlannerConfig(max_padding_ratio=4.0),
+        planner_config=GdnPlannerConfig(),
     )
     tree_has_children = _tree_has_children(spec)
 
@@ -196,6 +197,9 @@ def test_gdn_tree_cp_plan_chains_long_nodes() -> None:
             device="cpu",
             cp_rank=rank,
             cp_size=4,
+            attention_token_layout_index=_uniform_attention_layout(
+                spec.real_token_count, 4
+            ),
             planner_config=config,
         )
         for rank in range(4)
@@ -246,6 +250,9 @@ def test_gdn_tree_cp_plan_exchanges_remote_parent_states() -> None:
             device="cpu",
             cp_rank=rank,
             cp_size=4,
+            attention_token_layout_index=_uniform_attention_layout(
+                spec.real_token_count, 4
+            ),
             planner_config=_chain_every_legal_segment_config(),
         )
         for rank in range(4)
@@ -284,6 +291,9 @@ def test_gdn_tree_cp_randomized_plans_cover_each_token_once() -> None:
                 device="cpu",
                 cp_rank=rank,
                 cp_size=4,
+                attention_token_layout_index=_uniform_attention_layout(
+                    spec.real_token_count, 4
+                ),
                 planner_config=config,
             )
             for rank in range(4)
@@ -309,9 +319,7 @@ def test_gdn_tree_cp_randomized_plans_pass_health_checks() -> None:
         parse_gdn_shared_prefix_segments,
     )
 
-    config = GdnPlannerConfig(
-        max_padding_ratio=4.0,
-    )
+    config = GdnPlannerConfig()
     for seed in range(16):
         pack = pack_shared_prefixes(
             _random_tree_sequences(seed + 100, max_depth=5),
@@ -327,22 +335,21 @@ def test_gdn_tree_cp_randomized_plans_pass_health_checks() -> None:
                 device="cpu",
                 cp_rank=rank,
                 cp_size=4,
+                attention_token_layout_index=_uniform_attention_layout(
+                    spec.real_token_count, 4
+                ),
                 planner_config=config,
             )
             for rank in range(4)
         )
 
-        _assert_tree_plan_health(
-            spec, plans, max_padding_ratio=config.max_padding_ratio
-        )
+        _assert_tree_plan_health(spec, plans)
 
 
 def _chain_every_legal_segment_config():
     from art.megatron.gdn.gdn_shared_prefix import GdnPlannerConfig
 
-    return GdnPlannerConfig(
-        max_padding_ratio=4.0,
-    )
+    return GdnPlannerConfig()
 
 
 def _covered_token_indices(plans) -> set[int]:
@@ -428,7 +435,7 @@ def _tree_has_children(spec) -> list[bool]:
     return has_children
 
 
-def _assert_tree_plan_health(spec, plans, *, max_padding_ratio: float) -> None:
+def _assert_tree_plan_health(spec, plans) -> None:
     tree_has_children = _tree_has_children(spec)
     token_counts = [0] * int(spec.real_token_count)
     for plan in plans:
@@ -445,10 +452,6 @@ def _assert_tree_plan_health(spec, plans, *, max_padding_ratio: float) -> None:
                 assert bucket.parent_indices is not None
                 assert int(bucket.parent_indices.numel()) == int(bucket.segment_count)
                 assert int(bucket.real_token_count) > 0
-                padding_ratio = (
-                    bucket.length * bucket.segment_count / bucket.real_token_count
-                )
-                assert padding_ratio <= max_padding_ratio
                 bucket_state_flags = {
                     tree_has_children[family_index]
                     for family_index in bucket.family_indices.tolist()
@@ -467,10 +470,6 @@ def _assert_tree_plan_health(spec, plans, *, max_padding_ratio: float) -> None:
                 assert bucket.parent_indices is not None
                 assert int(bucket.parent_indices.numel()) == int(bucket.segment_count)
                 assert int(bucket.real_token_count) > 0
-                padding_ratio = (
-                    bucket.length * bucket.segment_count / bucket.real_token_count
-                )
-                assert padding_ratio <= max_padding_ratio
                 bucket_state_flags = {
                     tree_has_children[family_index]
                     for family_index in bucket.family_indices.tolist()
@@ -495,6 +494,21 @@ def _assert_tree_plan_health(spec, plans, *, max_padding_ratio: float) -> None:
     assert token_counts == [1] * int(spec.real_token_count)
     rank_tokens = [int(plan.gdn_token_count) for plan in plans]
     assert max(rank_tokens) - min(rank_tokens) <= max(256, spec.real_token_count // 3)
+
+
+def _uniform_attention_layout(real_token_count: int, cp_size: int) -> TokenLayoutIndex:
+    ranges_by_rank: list[tuple[tuple[int, int, int], ...]] = []
+    for rank in range(cp_size):
+        start = (int(real_token_count) * rank) // cp_size
+        end = (int(real_token_count) * (rank + 1)) // cp_size
+        ranges_by_rank.append(((start, end, 0),) if end > start else ())
+    return TokenLayoutIndex(
+        ownership_ranges_by_rank=tuple(ranges_by_rank),
+        token_counts_by_rank=tuple(
+            sum(end - start for start, end, _position in ranges)
+            for ranges in ranges_by_rank
+        ),
+    )
 
 
 def _random_tree_sequences(

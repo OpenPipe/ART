@@ -116,8 +116,6 @@ class GdnPlannerConfig:
     hardware/model-shape defaults, not benchmark-specific workload switches.
     """
 
-    max_padding_ratio: float = 2.0
-    default_layout_split_factor: float = 1.5
     cp_chain_beam_width: int = 2
     cp_chain_beam_branch_factor: int = 4
     cp_chain_beam_candidate_limit: int = 16
@@ -295,7 +293,6 @@ def _build_tree_rank_execution_plan(
         spec,
         cp_size=cp_size,
         attention_token_layout_index=attention_token_layout_index,
-        planner_config=planner_config,
     )
     attention_layout_index = _build_attention_layout_index_from_token_layout(
         source_layout
@@ -452,7 +449,6 @@ def _build_tree_rank_execution_plan(
                 local_token_ranges=local_token_ranges,
                 sequence_length=spec.sequence_length,
                 device=device,
-                planner_config=planner_config,
             )
             for depth in range(depth_count)
         )
@@ -465,7 +461,6 @@ def _build_tree_rank_execution_plan(
                 local_token_ranges=local_token_ranges,
                 sequence_length=spec.sequence_length,
                 device=device,
-                planner_config=planner_config,
                 token_ranges_by_rank=tuple(
                     tuple(ranges) for ranges in gdn_ranges_by_rank_by_source
                 ),
@@ -658,7 +653,6 @@ def _attention_source_layout(
     *,
     cp_size: int,
     attention_token_layout_index: TokenLayoutIndex | None,
-    planner_config: GdnPlannerConfig,
 ) -> TokenLayoutIndex:
     if attention_token_layout_index is not None:
         layout_cp_size = len(attention_token_layout_index.token_counts_by_rank)
@@ -676,11 +670,9 @@ def _attention_source_layout(
                 f"count, got {layout_token_count} and {spec.real_token_count}"
             )
         return attention_token_layout_index
-    ranges_by_rank = _default_attention_layout_ranges(
-        spec,
-        cp_size=cp_size,
-        planner_config=planner_config,
-    )
+    if cp_size != 1:
+        raise ValueError("GDN CP planning requires attention_token_layout_index")
+    ranges_by_rank = (((0, int(spec.real_token_count), 0),),)
     return TokenLayoutIndex(
         ownership_ranges_by_rank=ranges_by_rank,
         token_counts_by_rank=tuple(
@@ -1681,47 +1673,6 @@ def _segment_key(segment: GdnSegmentSpec) -> tuple[int, int, int]:
     return (segment.row_index, segment.start, segment.end)
 
 
-def _default_attention_layout_ranges(
-    spec: GdnPackedExecutionSpec,
-    *,
-    cp_size: int,
-    planner_config: GdnPlannerConfig,
-) -> tuple[tuple[tuple[int, int, int], ...], ...]:
-    ranks: list[list[tuple[int, int, int]]] = [[] for _ in range(cp_size)]
-    loads = [0] * cp_size
-    target_rank_load = spec.real_token_count / cp_size
-
-    def append_segment(rank: int, token_start: int, token_count: int) -> None:
-        ranks[rank].append((token_start, token_start + token_count, loads[rank]))
-        loads[rank] += token_count
-
-    def should_split_segment(segment: GdnSegmentSpec) -> bool:
-        if (
-            segment.length
-            <= planner_config.default_layout_split_factor * target_rank_load
-        ):
-            return False
-        return _can_chain_tree_segment(
-            segment,
-            cp_size=cp_size,
-        )
-
-    for segment in spec.tree_segments:
-        token_start = _segment_token_start(segment, spec.sequence_length)
-        if should_split_segment(segment):
-            for rank in range(cp_size):
-                start = (segment.length * rank) // cp_size
-                end = (segment.length * (rank + 1)) // cp_size
-                ranks[rank].append(
-                    (token_start + start, token_start + end, loads[rank])
-                )
-                loads[rank] += end - start
-            continue
-        owner = _least_loaded_rank(loads)
-        append_segment(owner, token_start, segment.length)
-    return tuple(tuple(ranges) for ranges in ranks)
-
-
 def _append_chain_segment(
     gdn_ranges_by_rank: list[list[tuple[int, int, int]]],
     rank_loads: list[int],
@@ -1887,7 +1838,6 @@ def _build_tree_bucket_plans(
     local_token_ranges: tuple[tuple[int, int, int], ...] | None,
     sequence_length: int,
     device: torch.device | str,
-    planner_config: GdnPlannerConfig,
     token_ranges_by_rank: tuple[tuple[tuple[int, int, int], ...], ...] | None = None,
     split_by_final_state: bool = True,
 ) -> tuple[GdnSegmentBucketPlan, ...]:
@@ -1895,13 +1845,9 @@ def _build_tree_bucket_plans(
         _batch_tree_segments_by_padded_work(
             segments,
             tree_has_children,
-            max_padding_ratio=planner_config.max_padding_ratio,
         )
         if split_by_final_state
-        else _batch_segments_by_padded_work(
-            segments,
-            max_padding_ratio=planner_config.max_padding_ratio,
-        )
+        else _batch_segments_by_padded_work(segments)
     )
     return tuple(
         _bucket_with_tree_parent_indices(
@@ -1998,7 +1944,6 @@ def _build_chunk_aligned_cp1_tree_buckets(
                 local_token_ranges=None,
                 sequence_length=spec.sequence_length,
                 device=device,
-                planner_config=planner_config,
             ),
             *_build_tree_bucket_plans(
                 tuple(regular_by_depth[depth]),
@@ -2007,12 +1952,10 @@ def _build_chunk_aligned_cp1_tree_buckets(
                 local_token_ranges=None,
                 sequence_length=spec.sequence_length,
                 device=device,
-                planner_config=planner_config,
             ),
             *_build_explicit_bucket_plans(
                 tuple(child_columns_by_depth[depth]),
                 device=device,
-                planner_config=planner_config,
             ),
         )
         for depth in range(depth_count)
@@ -2023,7 +1966,6 @@ def _build_explicit_bucket_plans(
     columns: tuple[_ExplicitBucketColumn, ...],
     *,
     device: torch.device | str,
-    planner_config: GdnPlannerConfig,
 ) -> tuple[GdnSegmentBucketPlan, ...]:
     return tuple(
         _build_explicit_bucket_plan(
@@ -2244,29 +2186,21 @@ def _move_planner_tensor(
 
 def _batch_segments_by_padded_work(
     segments: tuple[GdnSegmentSpec, ...],
-    *,
-    max_padding_ratio: float = 1.25,
 ) -> tuple[tuple[GdnSegmentSpec, ...], ...]:
     if not segments:
         return ()
     ordered = sorted(
         segments, key=lambda segment: (segment.length, segment.family_index)
     )
-    del max_padding_ratio
     return (tuple(ordered),)
 
 
 def _batch_tree_segments_by_padded_work(
     segments: tuple[GdnSegmentSpec, ...],
     tree_has_children: tuple[bool, ...],
-    *,
-    max_padding_ratio: float = 1.25,
 ) -> tuple[tuple[GdnSegmentSpec, ...], ...]:
     del tree_has_children
-    return _batch_segments_by_padded_work(
-        segments,
-        max_padding_ratio=max_padding_ratio,
-    )
+    return _batch_segments_by_padded_work(segments)
 
 
 def _build_segment_bucket_plan(

@@ -21,6 +21,7 @@ from megatron.core.tensor_parallel.random import (  # noqa: E402
 from torch.distributed import destroy_process_group, init_process_group  # noqa: E402
 import torch.multiprocessing as mp  # noqa: E402
 
+from art.megatron.context_parallel.layout_index import TokenLayoutIndex  # noqa: E402
 from art.megatron.gdn.gdn_shared_prefix import (  # noqa: E402
     GdnPlannerConfig,
     GdnSegmentBucketPlan,
@@ -133,6 +134,9 @@ def _native_gdn_cp_packed_layer_worker(
             device=group_ids.device,
             cp_rank=rank,
             cp_size=cp_size,
+            attention_token_layout_index=_uniform_attention_layout(
+                spec.real_token_count, cp_size
+            ),
             planner_config=GdnPlannerConfig(),
         )
         assert any(plan.tree_chain_buckets_by_depth)
@@ -449,6 +453,21 @@ def _packed_hidden_and_grad(
     torch.distributed.broadcast(hidden, src=0)
     torch.distributed.broadcast(output_grad, src=0)
     return hidden, output_grad
+
+
+def _uniform_attention_layout(real_token_count: int, cp_size: int) -> TokenLayoutIndex:
+    ranges_by_rank: list[tuple[tuple[int, int, int], ...]] = []
+    for rank in range(cp_size):
+        start = (int(real_token_count) * rank) // cp_size
+        end = (int(real_token_count) * (rank + 1)) // cp_size
+        ranges_by_rank.append(((start, end, 0),) if end > start else ())
+    return TokenLayoutIndex(
+        ownership_ranges_by_rank=tuple(ranges_by_rank),
+        token_counts_by_rank=tuple(
+            sum(end - start for start, end, _position in ranges)
+            for ranges in ranges_by_rank
+        ),
+    )
 
 
 def _varlen_hidden_and_lengths(cp_size: int) -> tuple[torch.Tensor, torch.Tensor]:
