@@ -9,12 +9,15 @@ from types import SimpleNamespace
 import torch
 
 
-def _load_patches_module():
+def _load_dsv4_patches_module():
     path = (
         Path(__file__).resolve().parents[2]
-        / "vllm_runtime/src/art_vllm_runtime/patches.py"
+        / "vllm_runtime/src/art_vllm_runtime/dsv4_patches.py"
     )
-    spec = importlib.util.spec_from_file_location("_art_vllm_runtime_patches", path)
+    spec = importlib.util.spec_from_file_location(
+        "_art_vllm_runtime_dsv4_patches",
+        path,
+    )
     assert spec is not None
     module = importlib.util.module_from_spec(spec)
     assert spec.loader is not None
@@ -31,7 +34,7 @@ class _FakeLoraLinear:
 
 
 def test_dsv4_compressor_patch_uses_fp32_compressor_helper(monkeypatch) -> None:
-    patches = _load_patches_module()
+    patches = _load_dsv4_patches_module()
     calls: list[tuple[str, object, object]] = []
 
     class FakeWrapper:
@@ -91,7 +94,7 @@ def test_dsv4_compressor_patch_uses_fp32_compressor_helper(monkeypatch) -> None:
 
 
 def test_dsv4_current_vllm_attention_patch_targets_split_modules(monkeypatch) -> None:
-    patches = _load_patches_module()
+    patches = _load_dsv4_patches_module()
     calls: list[tuple[str, object, object]] = []
     o_proj_calls: list[tuple[object, object, object]] = []
 
@@ -195,7 +198,7 @@ def test_dsv4_current_vllm_attention_patch_targets_split_modules(monkeypatch) ->
 def test_dsv4_compressor_helper_uses_punica_metadata_without_full_batch_lora(
     monkeypatch,
 ) -> None:
-    patches = _load_patches_module()
+    patches = _load_dsv4_patches_module()
     fake_vllm = types.ModuleType("vllm")
     fake_platforms = types.ModuleType("vllm.platforms")
     setattr(
