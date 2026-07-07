@@ -131,6 +131,30 @@ def build_complex_prefix_tree_packed_tensors(
             + sum(1 + length for length in leaf_lengths)
         )
 
+    def fit_leaf_lengths(
+        leaf_lengths: tuple[int, int, int, int],
+        *,
+        remaining: int,
+    ) -> tuple[int, int, int, int] | None:
+        completion_budget = (
+            remaining - root_len - mid_a_len - mid_b_len - len(leaf_lengths)
+        )
+        if completion_budget < len(leaf_lengths):
+            return None
+        if sum(leaf_lengths) <= completion_budget:
+            return leaf_lengths
+        fitted = list(leaf_lengths)
+        overflow = sum(fitted) - completion_budget
+        while overflow > 0:
+            index = max(range(len(fitted)), key=lambda candidate: fitted[candidate])
+            reducible = fitted[index] - 1
+            if reducible <= 0:
+                return None
+            reduction = min(reducible, overflow)
+            fitted[index] -= reduction
+            overflow -= reduction
+        return (fitted[0], fitted[1], fitted[2], fitted[3])
+
     for sequence_index in range(num_sequences):
         cursor = 0
         next_group_id = 0
@@ -143,21 +167,13 @@ def build_complex_prefix_tree_packed_tensors(
             )
             remaining = sequence_length - cursor
             if tree_token_budget(leaf_lengths) > remaining:
-                if getattr(config, "packing_mode", "stop_early") == "stop_early":
-                    break
-                if remaining < root_len + 4:
-                    break
-                scale = max(
-                    1,
-                    remaining - root_len - mid_a_len - mid_b_len - len(leaf_lengths),
+                fitted_leaf_lengths = fit_leaf_lengths(
+                    leaf_lengths,
+                    remaining=remaining,
                 )
-                per_leaf = max(1, scale // len(leaf_lengths))
-                leaf_lengths = (
-                    min(leaf_lengths[0], per_leaf),
-                    min(leaf_lengths[1], per_leaf),
-                    min(leaf_lengths[2], per_leaf),
-                    min(leaf_lengths[3], per_leaf),
-                )
+                if fitted_leaf_lengths is None:
+                    break
+                leaf_lengths = fitted_leaf_lengths
             root_group = next_group_id
             next_group_id += 1
             cursor = write_segment(

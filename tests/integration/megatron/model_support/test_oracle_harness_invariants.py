@@ -31,6 +31,7 @@ from .oracle_harness import (
     sensitivity_topology_for_mutation,
 )
 from .oracle_worker import _matches_grad_sync_skip_mutation
+from .prefix_tree_workloads import build_complex_prefix_tree_packed_tensors
 
 
 def _metric_row(
@@ -929,3 +930,22 @@ def test_packed_tensor_defaults_match_main_rebase_oracle_tokens() -> None:
     assert config.decode_tokens_jitter == 32
     assert config.packing_mode == "stop_early"
     assert config.vocab_high == 8192
+
+
+def test_prefix_tree_workload_fits_hf_parity_packed_size() -> None:
+    packed_tensors = build_complex_prefix_tree_packed_tensors(
+        PackedTensorConfig(
+            num_sequences=4,
+            sequence_length=256,
+            prefill_tokens=64,
+            completion_branches_per_prefix=2,
+            decode_tokens=64,
+            decode_tokens_jitter=32,
+            packing_mode="stop_early",
+        ),
+        seed=20260304,
+    )
+
+    assert int((packed_tensors["group_ids"] != -1).sum().item()) > 0
+    assert int(packed_tensors["assistant_mask"].sum().item()) > 0
+    assert int((packed_tensors["weights"] != 0).sum().item()) > 0
