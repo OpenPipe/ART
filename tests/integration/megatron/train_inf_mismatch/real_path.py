@@ -319,10 +319,19 @@ async def _collect_real_trajectory_groups(
     from transformers import AutoTokenizer
 
     import art
+    from art.megatron.model_support.tokenizer import (
+        configure_tokenizer_for_model_support,
+    )
 
     if config.rollouts_per_prompt < 2:
         raise ValueError("real-path mismatch requires at least two rollouts per prompt")
-    tokenizer = AutoTokenizer.from_pretrained(config.output_parity.base_model)
+    tokenizer = configure_tokenizer_for_model_support(
+        AutoTokenizer.from_pretrained(config.output_parity.base_model),
+        base_model=config.output_parity.base_model,
+        internal_config={
+            "allow_unvalidated_arch": config.output_parity.allow_unvalidated_arch
+        },
+    )
     chat_template_kwargs: dict[str, Any] = {}
     if isinstance(tokenizer.chat_template, str):
         if "enable_thinking" in tokenizer.chat_template:
