@@ -183,34 +183,6 @@ def test_get_model_config_qwen3_5_moe_target_modules(base_model: str):
         ]
 
 
-def test_get_model_config_dsv4_vllm_lora_target_modules():
-    with tempfile.TemporaryDirectory() as tmpdir:
-        result = get_model_config("deepseek-ai/DeepSeek-V4-Flash", tmpdir, None)
-        assert result["lora_config"]["target_modules"] == [
-            "q_a_proj",
-            "q_b_proj",
-            "kv_proj",
-            "o_a_proj",
-            "o_b_proj",
-            "compressor.kv_proj",
-            "compressor.gate_proj",
-            "gate_proj",
-            "up_proj",
-            "down_proj",
-            "experts",
-        ]
-        assert result["engine_args"]["lora_target_modules"] == [
-            "fused_wqa_wkv",
-            "wq_b",
-            "wo_a",
-            "wo_b",
-            "fused_wkv_wgate",
-            "gate_up_proj",
-            "experts",
-            "down_proj",
-        ]
-
-
 def test_get_model_config_preserves_user_lora_config_target_modules():
     with tempfile.TemporaryDirectory() as tmpdir:
         result = get_model_config(

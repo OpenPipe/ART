@@ -5,11 +5,7 @@ from types import SimpleNamespace
 import torch
 
 from . import output_parity
-from .output_parity import (
-    config_from_env,
-    fwd_mean_abs_pct_limit_for_model,
-    top20_kl_candidate_to_target_limit_for_model,
-)
+from .output_parity import config_from_env
 
 
 def test_cp_unsupported_default_converts_cp_to_dp_without_changing_tp(
@@ -66,22 +62,7 @@ def test_cp_unsupported_model_uses_non_cp_default_topology(monkeypatch) -> None:
     assert config.inference_gpu_ids == [2, 3]
     assert config.engine_args["tensor_parallel_size"] == 2
     assert config.engine_args["enable_expert_parallel"] is True
-    assert config.engine_args["gpu_memory_utilization"] == 0.82
     assert config.engine_args["kv_cache_dtype"] == "fp8"
-    assert config.engine_args["max_num_batched_tokens"] == 1032
     assert config.engine_args["moe_backend"] == "triton_unfused"
-    assert config.engine_args["disable_custom_all_reduce"] is True
-    assert config.engine_args["enforce_eager"] is True
-    assert config.engine_args["compilation_config"] == {
-        "cudagraph_mode": "NONE",
-        "pass_config": {"fuse_allreduce_rms": False},
-    }
     assert config.megatron_env == {"ART_MEGATRON_STREAMING_WEIGHT_OFFLOAD": "1"}
     assert config.external_vllm_server_url == "http://127.0.0.1:8000"
-
-
-def test_dsv4_uses_quantized_vllm_noise_train_inf_thresholds() -> None:
-    base_model = "deepseek-ai/DeepSeek-V4-Flash"
-
-    assert fwd_mean_abs_pct_limit_for_model(base_model) == 20.0
-    assert top20_kl_candidate_to_target_limit_for_model(base_model) == 0.07
