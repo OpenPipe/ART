@@ -614,7 +614,6 @@ async def _score_base_real_generation_path(
     engine_args.pop("lora_target_modules", None)
     if is_moe:
         engine_args["enable_return_routed_experts"] = True
-        engine_args["async_scheduling"] = False
     vllm_forward_trace_dir = (
         artifact_dir / "real_path_base_vllm_forward_trace"
         if config.trace_layers
