@@ -83,3 +83,53 @@ def test_gdn_planner_runtime_model_scales_with_state_shape() -> None:
     assert large.runtime_local_recurrent_tokens_per_ms < (
         reference.runtime_local_recurrent_tokens_per_ms
     )
+
+
+def test_gdn_planner_runtime_model_tracks_qwen35_shape_axes() -> None:
+    qwen35_35b = GdnPlannerConfig.from_model_shape(
+        hidden_size=2048,
+        tensor_model_parallel_size=1,
+        linear_num_key_heads=16,
+        linear_num_value_heads=32,
+        linear_key_head_dim=128,
+        linear_value_head_dim=128,
+    )
+    qwen35_9b = GdnPlannerConfig.from_model_shape(
+        hidden_size=4096,
+        tensor_model_parallel_size=1,
+        linear_num_key_heads=16,
+        linear_num_value_heads=32,
+        linear_key_head_dim=128,
+        linear_value_head_dim=128,
+    )
+    qwen35_397b = GdnPlannerConfig.from_model_shape(
+        hidden_size=4096,
+        tensor_model_parallel_size=1,
+        linear_num_key_heads=16,
+        linear_num_value_heads=64,
+        linear_key_head_dim=128,
+        linear_value_head_dim=128,
+    )
+
+    assert qwen35_9b.runtime_hidden_bytes_per_token == 2 * (
+        qwen35_35b.runtime_hidden_bytes_per_token
+    )
+    assert qwen35_9b.runtime_local_recurrent_tokens_per_ms == pytest.approx(
+        qwen35_35b.runtime_local_recurrent_tokens_per_ms
+    )
+    assert qwen35_9b.runtime_cp_summary_bytes_per_segment == (
+        qwen35_35b.runtime_cp_summary_bytes_per_segment
+    )
+
+    assert qwen35_397b.runtime_hidden_bytes_per_token == 2 * (
+        qwen35_35b.runtime_hidden_bytes_per_token
+    )
+    assert qwen35_397b.runtime_cp_summary_bytes_per_segment == 2 * (
+        qwen35_35b.runtime_cp_summary_bytes_per_segment
+    )
+    assert qwen35_397b.runtime_local_recurrent_tokens_per_ms == pytest.approx(
+        0.5 * qwen35_35b.runtime_local_recurrent_tokens_per_ms
+    )
+    assert qwen35_397b.runtime_chain_recurrent_tokens_per_ms == pytest.approx(
+        0.5 * qwen35_35b.runtime_chain_recurrent_tokens_per_ms
+    )
