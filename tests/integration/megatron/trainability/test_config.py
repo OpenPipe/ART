@@ -9,6 +9,7 @@ import torch
 
 import art
 
+from .test_live_length_trainability import _use_default_moe_dedicated_placement
 from .yes_no_trainability import (
     _build_internal_config,
     _build_variant,
@@ -264,3 +265,31 @@ def test_dsv4_trainability_uses_large_model_dedicated_resources(
         "server_url": "http://127.0.0.1:8000",
         "api_key": "art-external-vllm",
     }
+
+
+def test_dsv4_length_trainability_keeps_handler_resources(monkeypatch) -> None:
+    monkeypatch.setattr(torch.cuda, "device_count", lambda: 8)
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(
+        torch.cuda,
+        "get_device_properties",
+        lambda device: SimpleNamespace(total_memory=140 * 1024**3),
+    )
+
+    variant = _build_variant(
+        "megatron_dedicated",
+        base_model="deepseek-ai/DeepSeek-V4-Flash",
+        resource_stage_name="length_trainability",
+    )
+    _use_default_moe_dedicated_placement(
+        variant,
+        base_model="deepseek-ai/DeepSeek-V4-Flash",
+    )
+
+    assert variant.topology is not None
+    assert variant.trainer_gpu_ids == [0, 1, 2, 3, 4, 5, 6, 7]
+    assert variant.inference_gpu_ids == [4, 5, 6, 7]
+    assert variant.topology.tp == 2
+    assert variant.topology.ep == 8
+    assert variant.topology.dp == 4
+    assert variant.topology.cp == 1

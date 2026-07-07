@@ -47,6 +47,7 @@ _VARIANT_NAME = Literal[
     "megatron_dedicated",
     "unsloth_dedicated",
 ]
+_RESOURCE_STAGE_NAME = Literal["yes_no_trainability", "length_trainability"]
 
 
 class _TrainKwargs(TypedDict):
@@ -388,26 +389,36 @@ def _artifact_dir(base_model: str, variant_name: _VARIANT_NAME) -> Path:
     return path
 
 
+def _trainability_stage_resources(
+    base_model: str,
+    *,
+    stage_name: _RESOURCE_STAGE_NAME,
+    allow_unvalidated_arch: bool = False,
+):
+    workflow_resources = handler_workflow_resources_for_base_model(
+        base_model,
+        allow_unvalidated_arch=allow_unvalidated_arch,
+    )
+    if workflow_resources is None:
+        return None
+    stage_resources = getattr(workflow_resources, stage_name)
+    if stage_resources is None:
+        return None
+    return resolve_stage_resources_for_current_host(stage_name, stage_resources)
+
+
 def _build_variant(
     variant_name: _VARIANT_NAME,
     *,
     base_model: str,
     allow_unvalidated_arch: bool = False,
+    resource_stage_name: _RESOURCE_STAGE_NAME = "yes_no_trainability",
 ) -> _TrainabilityVariant:
-    workflow_resources = handler_workflow_resources_for_base_model(
+    stage_resources = _trainability_stage_resources(
         base_model,
+        stage_name=resource_stage_name,
         allow_unvalidated_arch=allow_unvalidated_arch,
     )
-    stage_resources = (
-        workflow_resources.yes_no_trainability
-        if workflow_resources is not None
-        else None
-    )
-    if stage_resources is not None:
-        stage_resources = resolve_stage_resources_for_current_host(
-            "yes_no_trainability",
-            stage_resources,
-        )
     is_moe = model_uses_expert_parallel(
         base_model,
         allow_unvalidated_arch=allow_unvalidated_arch,
@@ -589,23 +600,15 @@ def _build_internal_config(
     base_model: str,
     rollout_weights_mode: RolloutWeightsMode | None = None,
     allow_unvalidated_arch: bool = False,
+    resource_stage_name: _RESOURCE_STAGE_NAME = "yes_no_trainability",
 ) -> dev.InternalModelConfig:
     shared = variant.placement_mode == "shared"
     inference_gpu_ids = variant.inference_gpu_ids
-    workflow_resources = handler_workflow_resources_for_base_model(
+    stage_resources = _trainability_stage_resources(
         base_model,
+        stage_name=resource_stage_name,
         allow_unvalidated_arch=allow_unvalidated_arch,
     )
-    stage_resources = (
-        workflow_resources.yes_no_trainability
-        if workflow_resources is not None
-        else None
-    )
-    if stage_resources is not None:
-        stage_resources = resolve_stage_resources_for_current_host(
-            "yes_no_trainability",
-            stage_resources,
-        )
     stage_resources_apply = (
         not shared
         and variant.backend_name == "megatron"
@@ -664,7 +667,7 @@ def _build_internal_config(
         and external_runtime is None
     ):
         raise RuntimeError(
-            "yes_no_trainability for this model requires an external vLLM server. "
+            f"{resource_stage_name} for this model requires an external vLLM server. "
             f"Set {_EXTERNAL_VLLM_URL_ENV}."
         )
     if external_runtime is not None:

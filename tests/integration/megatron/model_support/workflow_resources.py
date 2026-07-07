@@ -91,6 +91,7 @@ class HandlerWorkflowResources(BaseModel):
     merged_vllm_serving: WorkflowStageResources | None = None
     native_vllm_lora: WorkflowStageResources | None = None
     yes_no_trainability: WorkflowStageResources | None = None
+    length_trainability: WorkflowStageResources | None = None
     yes_no_trainability_variant: (
         Literal[
             "megatron_shared",
@@ -247,6 +248,16 @@ HANDLER_WORKFLOW_RESOURCES: dict[str, HandlerWorkflowResources] = {
             vllm=_DSV4_REDUCED_NATIVE_VLLM_EP4,
         ),
         yes_no_trainability=WorkflowStageResources(
+            required_world_size=8,
+            required_h200_equivalent_gpus=8,
+            requires_external_vllm=True,
+            megatron=_DSV4_MEGATRON,
+            vllm=_DSV4_FULL_VLLM_EP4,
+            high_vram_megatron=_DSV4_HIGH_VRAM_MEGATRON,
+            high_vram_vllm=_DSV4_FULL_VLLM_EP2,
+            megatron_env=_DSV4_STREAMING_OFFLOAD_ENV,
+        ),
+        length_trainability=WorkflowStageResources(
             required_world_size=8,
             required_h200_equivalent_gpus=8,
             requires_external_vllm=True,

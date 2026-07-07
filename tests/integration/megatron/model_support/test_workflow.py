@@ -85,7 +85,11 @@ def test_dsv4_runtime_stages_use_full_model_resources() -> None:
         "deepseek-ai/DeepSeek-V4-Flash"
     )
     assert resources is not None
-    for stage in (resources.train_inf_mismatch, resources.yes_no_trainability):
+    for stage in (
+        resources.train_inf_mismatch,
+        resources.yes_no_trainability,
+        resources.length_trainability,
+    ):
         assert stage is not None
         assert stage.required_world_size == 8
         assert stage.required_h200_equivalent_gpus == 8
@@ -121,6 +125,10 @@ def test_dsv4_runtime_stages_use_full_model_resources() -> None:
     }
     assert resources.yes_no_trainability is not None
     assert resources.yes_no_trainability.megatron_env == {
+        "ART_MEGATRON_STREAMING_WEIGHT_OFFLOAD": "1"
+    }
+    assert resources.length_trainability is not None
+    assert resources.length_trainability.megatron_env == {
         "ART_MEGATRON_STREAMING_WEIGHT_OFFLOAD": "1"
     }
 
