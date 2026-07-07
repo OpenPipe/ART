@@ -4,12 +4,12 @@ import pytest
 import torch
 
 from art.megatron.context_parallel.layout_index import TokenLayoutIndex
-from art.megatron.shared_prefix_packing import pack_shared_prefixes
+from art.megatron.shared_prefix_packing import prefix_tree_pack
 from art.megatron.shared_prefix_tree import parse_shared_prefix_row
 
 
 def test_parse_shared_prefix_row_tracks_ancestors_and_depth() -> None:
-    pack = pack_shared_prefixes(
+    pack = prefix_tree_pack(
         (
             torch.tensor([1, 2, 3, 4, 8]),
             torch.tensor([1, 2, 3, 4, 9]),
@@ -61,7 +61,7 @@ def test_gdn_tree_parser_accepts_nested_tree() -> None:
         parse_gdn_shared_prefix_segments,
     )
 
-    pack = pack_shared_prefixes(
+    pack = prefix_tree_pack(
         (
             torch.tensor([1, 2, 3, 4]),
             torch.tensor([1, 2, 3, 5]),
@@ -98,7 +98,7 @@ def test_gdn_tree_parser_accepts_zero_depth_roots() -> None:
         parse_gdn_shared_prefix_segments,
     )
 
-    pack = pack_shared_prefixes(
+    pack = prefix_tree_pack(
         (
             torch.tensor([1, 2]),
             torch.tensor([1, 3]),
@@ -132,7 +132,7 @@ def test_gdn_tree_planner_splits_leaf_and_internal_final_state_buckets() -> None
         parse_gdn_shared_prefix_segments,
     )
 
-    pack = pack_shared_prefixes(
+    pack = prefix_tree_pack(
         (
             torch.tensor([1, 2, 3, 4, 7]),
             torch.tensor([1, 2, 3, 4, 8]),
@@ -172,7 +172,7 @@ def test_gdn_tree_cp_plan_chains_long_nodes() -> None:
     root = torch.arange(1, 321)
     mid = torch.arange(1001, 1321)
     other = torch.arange(2001, 2321)
-    pack = pack_shared_prefixes(
+    pack = prefix_tree_pack(
         (
             torch.cat((root, mid, torch.tensor([11]))),
             torch.cat((root, mid, torch.tensor([12]))),
@@ -226,7 +226,7 @@ def test_gdn_tree_cp_plan_exchanges_remote_parent_states() -> None:
 
     root = torch.arange(1, 17)
     mid = torch.arange(1001, 1321)
-    pack = pack_shared_prefixes(
+    pack = prefix_tree_pack(
         (
             torch.cat((root, mid, torch.tensor([11]))),
             torch.cat((root, mid, torch.tensor([12]))),
@@ -271,7 +271,7 @@ def test_gdn_tree_cp_randomized_plans_cover_each_token_once() -> None:
 
     config = _chain_every_legal_segment_config()
     for seed in range(8):
-        pack = pack_shared_prefixes(
+        pack = prefix_tree_pack(
             _random_tree_sequences(seed),
             max_depth=4,
         )
@@ -315,7 +315,7 @@ def test_gdn_tree_cp_randomized_plans_pass_health_checks() -> None:
 
     config = GdnPlannerConfig()
     for seed in range(16):
-        pack = pack_shared_prefixes(
+        pack = prefix_tree_pack(
             _random_tree_sequences(seed + 100, max_depth=5),
             max_depth=5,
         )

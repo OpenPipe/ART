@@ -6,19 +6,18 @@ import torch
 from art.megatron.shared_prefix_packing import (
     _local_position_pairs,
     estimate_shared_prefix_packed_tokens,
-    pack_shared_prefixes,
     prefix_tree_pack,
 )
 
 
-def test_pack_shared_prefixes_support_depth_one() -> None:
+def test_prefix_tree_pack_support_depth_one() -> None:
     inputs = (
         torch.tensor([1, 2, 3, 4]),
         torch.tensor([1, 2, 5]),
         torch.tensor([9]),
     )
 
-    pack = pack_shared_prefixes(inputs, max_depth=1)
+    pack = prefix_tree_pack(inputs, max_depth=1)
 
     assert pack.tokens.tolist() == [[1, 2, 3, 4, 5, 9]]
     assert pack.group_ids.tolist() == [[1, 1, 2, 2, 3, 4]]
@@ -31,8 +30,8 @@ def test_pack_shared_prefixes_support_depth_one() -> None:
     ]
 
 
-def test_pack_shared_prefixes_support_zero_depth_without_sharing() -> None:
-    pack = pack_shared_prefixes(
+def test_prefix_tree_pack_support_zero_depth_without_sharing() -> None:
+    pack = prefix_tree_pack(
         (
             torch.tensor([1, 2]),
             torch.tensor([1, 3]),
@@ -52,8 +51,8 @@ def test_pack_shared_prefixes_support_zero_depth_without_sharing() -> None:
     ]
 
 
-def test_pack_shared_prefixes_support_deeper_trees() -> None:
-    pack = pack_shared_prefixes(
+def test_prefix_tree_pack_support_deeper_trees() -> None:
+    pack = prefix_tree_pack(
         (
             torch.tensor([1, 2, 3, 4]),
             torch.tensor([1, 2, 3, 5]),
@@ -74,7 +73,7 @@ def test_pack_shared_prefixes_support_deeper_trees() -> None:
 
 
 def test_packing_preserves_first_seen_branch_order() -> None:
-    pack = pack_shared_prefixes(
+    pack = prefix_tree_pack(
         (torch.tensor([9]), torch.tensor([1])),
         max_depth=1,
     )
@@ -87,7 +86,7 @@ def test_packing_preserves_first_seen_branch_order() -> None:
 
 
 def test_packing_handles_empty_sequences() -> None:
-    pack = pack_shared_prefixes(
+    pack = prefix_tree_pack(
         (torch.empty(0, dtype=torch.long), torch.empty(0, dtype=torch.long)),
         max_depth=1,
     )
@@ -138,7 +137,7 @@ def test_packed_token_estimator_matches_real_packing() -> None:
 
     for inputs in cases:
         for depth in range(5):
-            pack = pack_shared_prefixes(inputs, max_depth=depth)
+            pack = prefix_tree_pack(inputs, max_depth=depth)
 
             assert estimate_shared_prefix_packed_tokens(inputs, max_depth=depth) == int(
                 pack.tokens.numel()
@@ -156,7 +155,7 @@ def test_packed_token_estimator_matches_randomized_packing() -> None:
             inputs.append(torch.cat((prefix, middle, suffix)))
 
     for depth in range(5):
-        pack = pack_shared_prefixes(inputs, max_depth=depth)
+        pack = prefix_tree_pack(inputs, max_depth=depth)
 
         assert estimate_shared_prefix_packed_tokens(inputs, max_depth=depth) == int(
             pack.tokens.numel()
@@ -165,7 +164,7 @@ def test_packed_token_estimator_matches_randomized_packing() -> None:
 
 def test_packing_rejects_non_1d_sequences() -> None:
     with pytest.raises(ValueError, match="expects 1-D tensors"):
-        pack_shared_prefixes((torch.tensor([[1, 2], [3, 4]]),), max_depth=1)
+        prefix_tree_pack((torch.tensor([[1, 2], [3, 4]]),), max_depth=1)
 
 
 def test_local_position_pairs_preserve_requested_order_without_dense_match() -> None:

@@ -11,7 +11,11 @@ from .test_live_length_trainability import (
     LengthSampleReport,
     LengthTrainabilityReport,
     _default_learning_rate,
+    _prompt_for_index,
     length_trainability_passed,
+)
+from .test_live_length_trainability import (
+    _prompt_tree_shape as _length_prompt_tree_shape,
 )
 from .yes_no_trainability import (
     TrainabilityStepReport,
@@ -25,7 +29,11 @@ from .yes_no_trainability import (
     _variant_max_steps,
     _variant_packed_sequence_length,
     _variant_rollouts_per_prompt,
+    build_prompts,
     yes_no_trainability_passed,
+)
+from .yes_no_trainability import (
+    _prompt_tree_shape as _yes_no_prompt_tree_shape,
 )
 
 
@@ -208,9 +216,24 @@ def test_yes_no_trainability_passes_initially_saturated_stable_report() -> None:
     assert yes_no_trainability_passed(report) is True
 
 
+def test_yes_no_prompts_form_prefix_tree_by_default(monkeypatch) -> None:
+    monkeypatch.delenv("ART_MODEL_SUPPORT_YES_NO_PROMPT", raising=False)
+    monkeypatch.setenv("ART_MODEL_SUPPORT_YES_NO_PROMPT_COUNT", "8")
+
+    prompts = build_prompts()
+
+    assert _yes_no_prompt_tree_shape(prompts) == (3, 6)
+
+
 def test_qwen3_5_length_trainability_uses_stable_learning_rate() -> None:
     assert _default_learning_rate("Qwen/Qwen3.5-35B-A3B") == 7e-5
     assert _default_learning_rate("Qwen/Qwen3-30B-A3B-Instruct-2507") == 1e-4
+
+
+def test_length_prompts_form_prefix_tree_by_default() -> None:
+    prompts = [_prompt_for_index(index)[0] for index in range(4)]
+
+    assert _length_prompt_tree_shape(prompts) == (3, 6)
 
 
 def test_length_trainability_accepts_near_baseline_learning_signal() -> None:

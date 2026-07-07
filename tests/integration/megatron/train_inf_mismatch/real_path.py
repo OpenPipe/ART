@@ -62,7 +62,7 @@ class RealPathConfig(BaseModel):
     output_parity: TrainInfOutputParityConfig = Field(
         default_factory=TrainInfOutputParityConfig
     )
-    prompt_count: int = 2
+    prompt_count: int = 4
     rollouts_per_prompt: int = 2
     max_completion_tokens: int = 16
     prompt_sentence_count: int = 28
@@ -130,6 +130,8 @@ class RealPathTrainInfReport(BaseModel):
     moe_routing_shared_prefix_conflict_rows: int
     moe_routing_shared_prefix_conflict_slots: int
     moe_routing_shared_prefix_compared_slots: int
+    prompt_tree_depth: int = 0
+    prompt_tree_branch_count: int = 0
     mean_abs_pct_limit: float
     top20_kl_candidate_to_target_limit: float
     passed: bool
@@ -172,6 +174,20 @@ _PROMPT_SENTENCES = [
     "Validation code belongs in tests unless production needs the behavior.",
 ]
 _PROMPT_TOKENS_PER_SENTENCE_ESTIMATE = 12
+_PROMPT_TREE_ROOT = (
+    "Write a concise continuation for a validation note. Preserve the technical "
+    "tone and keep the answer concrete."
+)
+_PROMPT_TREE_MIDS = (
+    "Branch alpha: emphasize runtime validation and packed training inputs.",
+    "Branch beta: emphasize serving parity and reproducible comparison artifacts.",
+)
+_PROMPT_TREE_LEAVES = (
+    "Case one: describe a route where a shared prefix splits into two completions.",
+    "Case two: describe a route where the same branch has a longer continuation.",
+    "Case three: describe a route where another branch reaches a different expert.",
+    "Case four: describe a direct leaf that skips the intermediate branch.",
+)
 
 
 def config_from_env() -> RealPathConfig:
@@ -246,10 +262,23 @@ def _apply_sliding_window_prompt_defaults(config: RealPathConfig) -> None:
 
 
 def _build_prompt_from_sentences(index: int, sentences: list[str]) -> str:
-    return (
-        "Write a concise continuation for probe "
-        f"{index}. Preserve the technical tone.\n\n" + " ".join(sentences)
+    mid = _PROMPT_TREE_MIDS[(index // 2) % len(_PROMPT_TREE_MIDS)]
+    leaf = _PROMPT_TREE_LEAVES[index % len(_PROMPT_TREE_LEAVES)]
+    return f"{_PROMPT_TREE_ROOT}\n\n{mid}\n\n{leaf}\n\nNotes: " + " ".join(sentences)
+
+
+def _prompt_tree_shape(prompts: list[str]) -> tuple[int, int]:
+    mid_count = len(
+        {mid for mid in _PROMPT_TREE_MIDS if any(mid in prompt for prompt in prompts)}
     )
+    leaf_count = len(
+        {
+            leaf
+            for leaf in _PROMPT_TREE_LEAVES
+            if any(leaf in prompt for prompt in prompts)
+        }
+    )
+    return (3 if mid_count and leaf_count else 1, mid_count + leaf_count)
 
 
 def _build_prompts(config: RealPathConfig) -> list[str]:
@@ -1278,6 +1307,9 @@ async def run_real_path_train_inf_mismatch(
             parity_config.base_model,
             allow_unvalidated_arch=parity_config.allow_unvalidated_arch,
         )
+        prompt_tree_depth, prompt_tree_branch_count = _prompt_tree_shape(
+            _build_prompts(config)
+        )
         passed = (
             comparison.mean_abs_pct <= mean_abs_pct_limit
             and topk_comparison.top20_intersection_kl_candidate_to_target
@@ -1339,6 +1371,8 @@ async def run_real_path_train_inf_mismatch(
             moe_routing_shared_prefix_compared_slots=int(
                 stats.shared_prefix_compared_slots
             ),
+            prompt_tree_depth=prompt_tree_depth,
+            prompt_tree_branch_count=prompt_tree_branch_count,
             mean_abs_pct_limit=mean_abs_pct_limit,
             top20_kl_candidate_to_target_limit=top20_kl_limit,
             passed=passed,

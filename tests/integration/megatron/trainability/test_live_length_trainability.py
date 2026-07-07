@@ -54,6 +54,16 @@ BASE_PROMPT = (
     "only as background texture. Use one sentence. Do not use bullets, numbering, "
     "code, or a preface."
 )
+LENGTH_PROMPT_MIDS = (
+    "Branch alpha: the harbor office is preparing a routine status note.",
+    "Branch beta: the harbor office is summarizing a quiet maintenance record.",
+)
+LENGTH_PROMPT_LEAVES = (
+    "Case one: mention calm water without adding drama.",
+    "Case two: mention ordinary work near the pier.",
+    "Case three: mention a simple observation from the office.",
+    "Case four: mention a reserved conclusion about the day.",
+)
 FILLER_SENTENCES = (
     "The morning ledger mentioned a bicycle bell near the old customs window.",
     "A folded receipt waited beside three dull pencils and a chipped mug.",
@@ -143,6 +153,8 @@ class LengthTrainabilityReport(BaseModel):
     training_topology: dict[str, int | bool]
     rollout_weights_mode: str
     rollouts_per_prompt: int
+    prompt_tree_depth: int = 0
+    prompt_tree_branch_count: int = 0
     normalize_advantages: bool
     summary_log_path: str
     latest_summary_log_path: str
@@ -229,14 +241,31 @@ def _prompt_for_index(index: int) -> tuple[str, int]:
     sentences = list(FILLER_SENTENCES)
     rng.shuffle(sentences)
     selected: list[str] = []
-    prompt = BASE_PROMPT
+    mid = LENGTH_PROMPT_MIDS[(index // 2) % len(LENGTH_PROMPT_MIDS)]
+    leaf = LENGTH_PROMPT_LEAVES[index % len(LENGTH_PROMPT_LEAVES)]
+    prefix = f"{BASE_PROMPT}\n\n{mid}\n\n{leaf}"
+    prompt = prefix
     for sentence in sentences:
         if _word_count(prompt) >= target_words:
             break
         selected.append(sentence)
-        prompt = f"{BASE_PROMPT}\n\nNotes: {' '.join(selected)}"
+        prompt = f"{prefix}\n\nNotes: {' '.join(selected)}"
     _check_prompt_hides_target(prompt)
     return prompt, _word_count(prompt)
+
+
+def _prompt_tree_shape(prompts: list[str]) -> tuple[int, int]:
+    mid_count = len(
+        {mid for mid in LENGTH_PROMPT_MIDS if any(mid in prompt for prompt in prompts)}
+    )
+    leaf_count = len(
+        {
+            leaf
+            for leaf in LENGTH_PROMPT_LEAVES
+            if any(leaf in prompt for prompt in prompts)
+        }
+    )
+    return (3 if mid_count and leaf_count else 1, mid_count + leaf_count)
 
 
 def _scenario(index: int, *, target_step: int | None = None) -> LengthScenario:
@@ -634,6 +663,9 @@ async def run_length_trainability_async(
         if final_train_samples
         else None
     )
+    prompt_tree_depth, prompt_tree_branch_count = _prompt_tree_shape(
+        [_scenario(index).prompt for index in range(min(4, scenario_count))]
+    )
     topology = cast(Topology, variant.topology)
     report = LengthTrainabilityReport(
         base_model=base_model,
@@ -646,6 +678,8 @@ async def run_length_trainability_async(
         training_topology=cast(dict[str, int | bool], topology.model_dump()),
         rollout_weights_mode=rollout_weights_mode,
         rollouts_per_prompt=rollouts_per_prompt,
+        prompt_tree_depth=prompt_tree_depth,
+        prompt_tree_branch_count=prompt_tree_branch_count,
         normalize_advantages=normalize_advantages,
         summary_log_path=str(summary_log_path),
         latest_summary_log_path=str(LATEST_SUMMARY_LOG_PATH),

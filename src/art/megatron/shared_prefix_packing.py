@@ -24,19 +24,6 @@ class _PrefixSegment:
     parent_id: int
 
 
-def pack_shared_prefixes(
-    sequences: Iterable[torch.Tensor],
-    *,
-    max_depth: int,
-    shareable_lengths: Iterable[int] | None = None,
-) -> SharedPrefixPack:
-    return prefix_tree_pack(
-        sequences,
-        max_depth=max_depth,
-        shareable_lengths=shareable_lengths,
-    )
-
-
 def prefix_tree_pack(
     sequences: Iterable[torch.Tensor],
     *,

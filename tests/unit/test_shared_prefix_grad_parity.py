@@ -7,7 +7,7 @@ import torch
 from torch import nn
 import torch.nn.functional as F
 
-from art.megatron.shared_prefix_packing import SharedPrefixPack, pack_shared_prefixes
+from art.megatron.shared_prefix_packing import SharedPrefixPack, prefix_tree_pack
 
 
 class _ToyCausalLM(nn.Module):
@@ -40,7 +40,7 @@ def test_shared_prefix_ce_parameter_grads_match_independent_sequences(
     target_ids = tuple(
         _targets(tokens, multi_target=multi_target) for tokens in input_ids
     )
-    pack = pack_shared_prefixes(input_ids, max_depth=max_depth)
+    pack = prefix_tree_pack(input_ids, max_depth=max_depth)
 
     assert int(pack.tokens.numel()) < sum(len(row) for row in input_ids)
 
@@ -78,7 +78,7 @@ def test_shared_prefix_ce_parameter_grads_match_independent_sequences(
 
 @pytest.mark.parametrize("max_depth", (1, 2, 3))
 def test_same_layout_mutation_preserves_forward_outputs(max_depth: int) -> None:
-    pack = pack_shared_prefixes(_input_ids(), max_depth=max_depth)
+    pack = prefix_tree_pack(_input_ids(), max_depth=max_depth)
     torch.manual_seed(20260518)
     model = _ToyCausalLM()
     logits = _packed_logits(model, pack)
@@ -101,7 +101,7 @@ def test_same_layout_mutation_preserves_target_loss_grads(
 ) -> None:
     input_ids = _input_ids()
     target_ids = tuple(_targets(tokens, multi_target=True) for tokens in input_ids)
-    pack = pack_shared_prefixes(input_ids, max_depth=max_depth)
+    pack = prefix_tree_pack(input_ids, max_depth=max_depth)
     mutated = _mutated_pack(pack, keep=pack.positions_by_sequence[sequence_index])
 
     torch.manual_seed(20260518)

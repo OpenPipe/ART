@@ -25,7 +25,7 @@ from art.megatron.context_parallel.types import (
     ParallelTopology,
     TokenRange,
 )
-from art.megatron.shared_prefix_packing import SharedPrefixPack, pack_shared_prefixes
+from art.megatron.shared_prefix_packing import SharedPrefixPack, prefix_tree_pack
 from art.megatron.shared_prefix_state import create_shared_prefix_state
 
 
@@ -144,7 +144,7 @@ def test_sparse_block_mask_exact_predicate_matches_dense_reference() -> None:
     (
         (
             "no-sharing",
-            pack_shared_prefixes(
+            prefix_tree_pack(
                 (
                     torch.tensor([1, 2, 3]),
                     torch.tensor([4, 5]),
@@ -155,7 +155,7 @@ def test_sparse_block_mask_exact_predicate_matches_dense_reference() -> None:
         ),
         (
             "depth-one",
-            pack_shared_prefixes(
+            prefix_tree_pack(
                 (
                     torch.tensor([1, 2, 3, 4]),
                     torch.tensor([1, 2, 3, 5]),
@@ -166,7 +166,7 @@ def test_sparse_block_mask_exact_predicate_matches_dense_reference() -> None:
         ),
         (
             "depth-three",
-            pack_shared_prefixes(
+            prefix_tree_pack(
                 (
                     torch.tensor([1, 2, 3, 4, 8]),
                     torch.tensor([1, 2, 3, 4, 9]),
@@ -334,7 +334,7 @@ def test_sparse_block_mask_matches_torch_for_sliding_window_metadata() -> None:
 
 def test_context_parallel_stage_masks_match_dense_nested_tree() -> None:
     _assert_context_parallel_stage_masks_match_dense(
-        pack_shared_prefixes(
+        prefix_tree_pack(
             (
                 torch.tensor([1, 2, 3, 4, 8]),
                 torch.tensor([1, 2, 3, 4, 9]),
@@ -346,7 +346,7 @@ def test_context_parallel_stage_masks_match_dense_nested_tree() -> None:
         require_remote_stage=True,
     )
     _assert_context_parallel_stage_masks_match_dense(
-        pack_shared_prefixes(
+        prefix_tree_pack(
             (
                 torch.tensor([1, 2, 3]),
                 torch.tensor([4, 5, 6]),

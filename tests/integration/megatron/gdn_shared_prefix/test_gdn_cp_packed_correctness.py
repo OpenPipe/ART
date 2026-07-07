@@ -21,7 +21,7 @@ from art.megatron.gdn.gdn_shared_prefix import (  # noqa: E402
     parse_gdn_shared_prefix_segments,
 )
 from art.megatron.gdn.operator import run_gdn_layer  # noqa: E402
-from art.megatron.shared_prefix_packing import pack_shared_prefixes  # noqa: E402
+from art.megatron.shared_prefix_packing import prefix_tree_pack  # noqa: E402
 
 from .cases import (  # noqa: E402
     GdnFamilyShape,
@@ -735,7 +735,7 @@ def _tree_trainability_pack():
     root = torch.arange(11, 107)
     mid = torch.arange(1001, 1161)
     sibling = torch.arange(2001, 2081)
-    return pack_shared_prefixes(
+    return prefix_tree_pack(
         (
             torch.cat((root, mid, torch.tensor([301, 302]))),
             torch.cat((root, mid, torch.tensor([303, 304, 305]))),
@@ -750,7 +750,7 @@ def _tree_chain_pack():
     short_root = torch.arange(1001, 1097)
     long_mid = torch.arange(2001, 2641)
     other_mid = torch.arange(3001, 3065)
-    return pack_shared_prefixes(
+    return prefix_tree_pack(
         (
             torch.cat((long_root, torch.tensor([301]))),
             torch.cat((long_root, torch.tensor([302]))),
@@ -781,15 +781,15 @@ def _tree_fuzz_packs() -> tuple[tuple[str, Any], ...]:
     return (
         (
             "tree_fuzz_duplicates",
-            pack_shared_prefixes(_duplicate_tree_sequences(), max_depth=4),
+            prefix_tree_pack(_duplicate_tree_sequences(), max_depth=4),
         ),
         (
             "tree_fuzz_ragged_depth4",
-            pack_shared_prefixes(_random_tree_sequences(13, max_depth=4), max_depth=4),
+            prefix_tree_pack(_random_tree_sequences(13, max_depth=4), max_depth=4),
         ),
         (
             "tree_fuzz_mixed_tiny_long",
-            pack_shared_prefixes(_random_tree_sequences(29, max_depth=5), max_depth=5),
+            prefix_tree_pack(_random_tree_sequences(29, max_depth=5), max_depth=5),
         ),
     )
 

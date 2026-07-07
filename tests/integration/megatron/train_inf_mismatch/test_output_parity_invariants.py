@@ -59,6 +59,61 @@ def test_logical_map_flattens_shared_prefix_branches() -> None:
     ]
 
 
+def test_logical_map_flattens_nested_prefix_tree_leaves() -> None:
+    packed = {
+        "tokens": torch.tensor(
+            [[10, 11, 20, 30, 31, 32, 33, 34, 35, 40, 50, 51, 52, 60, 61, 62]]
+        ),
+        "group_ids": torch.tensor([[0, 0, 1, 2, 2, 2, 3, 3, 3, 4, 5, 5, 5, 6, 6, 6]]),
+        "parent_ids": torch.tensor([[0, 0, 0, 1, 1, 1, 1, 1, 1, 0, 4, 4, 4, 0, 0, 0]]),
+    }
+
+    logical_map = build_logical_token_map(packed)
+
+    assert [prompt.token_ids for prompt in logical_map.prompts] == [
+        [10, 11, 20, 30, 31, 32],
+        [10, 11, 20, 33, 34, 35],
+        [10, 11, 40, 50, 51, 52],
+        [10, 11, 60, 61, 62],
+    ]
+    assert [prompt.packed_prompt_length for prompt in logical_map.prompts] == [
+        3,
+        3,
+        3,
+        2,
+    ]
+    assert [token.token_id for token in logical_map.tokens] == [
+        31,
+        32,
+        34,
+        35,
+        51,
+        52,
+        61,
+        62,
+    ]
+    assert [token.art_logit_index for token in logical_map.tokens] == [
+        3,
+        4,
+        6,
+        7,
+        10,
+        11,
+        13,
+        14,
+    ]
+    assert [token.vllm_prompt_token_index for token in logical_map.tokens] == [
+        4,
+        5,
+        4,
+        5,
+        4,
+        5,
+        3,
+        4,
+    ]
+
+
 def test_aggregate_mean_abs_pct_uses_vllm_merge_formula() -> None:
     summary = aggregate_mean_abs_pct(
         candidate=torch.tensor([2.0, 4.0]),

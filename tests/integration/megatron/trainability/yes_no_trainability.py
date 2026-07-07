@@ -3,7 +3,6 @@ from __future__ import annotations
 import asyncio
 from contextlib import asynccontextmanager, contextmanager, nullcontext
 import gc
-from itertools import permutations
 import os
 from pathlib import Path
 import re
@@ -64,6 +63,8 @@ class YesNoTrainabilityReport(BaseModel):
     prompt_count: int
     eval_prompt_count: int
     rollouts_per_prompt: int
+    prompt_tree_depth: int = 0
+    prompt_tree_branch_count: int = 0
     latest_step: int
     initial_eval_reward: float
     final_eval_reward: float | None = None
@@ -85,26 +86,52 @@ class _TrainabilityVariant(BaseModel):
     inference_gpu_ids: list[int] = Field(default_factory=list)
 
 
+_YES_NO_PROMPT_ROOT = (
+    "Read the validation card and answer with one word from yes, no, or maybe."
+)
+_YES_NO_PROMPT_MIDS = (
+    "Branch alpha: the card is about deployment readiness.",
+    "Branch beta: the card is about metric interpretation.",
+)
+_YES_NO_PROMPT_LEAVES = (
+    "Case one: the safest answer is uncertain.",
+    "Case two: the report contains a contradiction.",
+    "Case three: the check has partial evidence.",
+    "Case four: the reviewer needs a cautious final word.",
+)
+
+
 def build_prompts() -> list[str]:
     prompt = os.environ.get("ART_MODEL_SUPPORT_YES_NO_PROMPT", "").strip()
     prompt_count = _get_env_int("ART_MODEL_SUPPORT_YES_NO_PROMPT_COUNT", 8)
     if prompt:
         return [prompt] * max(1, prompt_count)
     prompts = [
-        f"{prefix} exactly one of {body}"
-        for prefix in ("respond with", "just respond with")
-        for use_quotes in (True, False)
-        for length in (3, 2)
-        for words in permutations(("yes", "no", "maybe"), length)
-        for body in [
-            ", ".join(f"'{word}'" if use_quotes else word for word in words)
-            if length == 3
-            else " or ".join(f"'{word}'" if use_quotes else word for word in words)
-        ]
+        "\n\n".join(
+            (
+                _YES_NO_PROMPT_ROOT,
+                _YES_NO_PROMPT_MIDS[(index // 2) % len(_YES_NO_PROMPT_MIDS)],
+                _YES_NO_PROMPT_LEAVES[index % len(_YES_NO_PROMPT_LEAVES)],
+                "Return only yes, no, or maybe.",
+            )
+        )
+        for index in range(max(1, prompt_count))
     ]
-    if prompt_count <= len(prompts):
-        return prompts[: max(1, prompt_count)]
-    return [prompts[index % len(prompts)] for index in range(prompt_count)]
+    return prompts
+
+
+def _prompt_tree_shape(prompts: list[str]) -> tuple[int, int]:
+    mid_count = len(
+        {mid for mid in _YES_NO_PROMPT_MIDS if any(mid in prompt for prompt in prompts)}
+    )
+    leaf_count = len(
+        {
+            leaf
+            for leaf in _YES_NO_PROMPT_LEAVES
+            if any(leaf in prompt for prompt in prompts)
+        }
+    )
+    return (3 if mid_count and leaf_count else 1, mid_count + leaf_count)
 
 
 def _slugify(value: str) -> str:
@@ -699,6 +726,7 @@ async def run_yes_no_trainability_async(
     eval_prompt_count = _get_env_int("ART_MODEL_SUPPORT_YES_NO_EVAL_PROMPTS", 8)
     prompts = build_prompts()
     eval_prompts = prompts[:eval_prompt_count]
+    prompt_tree_depth, prompt_tree_branch_count = _prompt_tree_shape(prompts)
     internal_config = _build_internal_config(
         variant,
         base_model=base_model,
@@ -744,6 +772,8 @@ async def run_yes_no_trainability_async(
             prompt_count=len(prompts),
             eval_prompt_count=len(eval_prompts),
             rollouts_per_prompt=rollouts_per_prompt,
+            prompt_tree_depth=prompt_tree_depth,
+            prompt_tree_branch_count=prompt_tree_branch_count,
             latest_step=0,
             initial_eval_reward=initial_eval_reward,
             step0_name=step0_name,
