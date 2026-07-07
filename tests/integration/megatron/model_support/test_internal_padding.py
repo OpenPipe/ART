@@ -122,6 +122,50 @@ def test_gemma4_handler_trims_and_restores_external_moe_lora_padding(
         assert torch.count_nonzero(restored_down_a[:, logical:]) == 0
 
 
+def test_gemma4_handler_preserves_logical_fused_vllm_moe_lora(
+    tmp_path: Path,
+) -> None:
+    logical = 4
+    rank = 2
+    experts = 3
+    adapter_config = _adapter_config(tmp_path, logical=logical)
+    prefix = "base_model.model.model.layers.0.experts"
+    tensors = {
+        f"{prefix}.base_layer.lora_A.weight": torch.arange(
+            experts * rank * 5,
+            dtype=torch.float32,
+        ).reshape(experts * rank, 5),
+        f"{prefix}.base_layer.lora_B.weight": torch.arange(
+            2 * logical * experts * rank,
+            dtype=torch.float32,
+        ).reshape(2 * logical, experts * rank),
+        f"{prefix}.lora_A.weight": torch.arange(
+            experts * rank * logical,
+            dtype=torch.float32,
+        ).reshape(experts * rank, logical),
+        f"{prefix}.lora_B.weight": torch.arange(
+            5 * experts * rank,
+            dtype=torch.float32,
+        ).reshape(5, experts * rank),
+    }
+
+    vllm_tensors, _config = GEMMA4_MOE_HANDLER.to_vllm_lora_tensors(
+        tensors,
+        adapter_config=adapter_config,
+    )
+
+    vllm_prefix = "base_model.model.model.layers.0.moe.experts"
+    assert set(vllm_tensors) == {
+        f"{vllm_prefix}.base_layer.lora_A.weight",
+        f"{vllm_prefix}.base_layer.lora_B.weight",
+        f"{vllm_prefix}.lora_A.weight",
+        f"{vllm_prefix}.lora_B.weight",
+    }
+    for key, tensor in tensors.items():
+        converted_key = key.replace(".experts", ".moe.experts")
+        assert torch.equal(vllm_tensors[converted_key], tensor)
+
+
 class _FakeLora(torch.nn.Module):
     def __init__(
         self,

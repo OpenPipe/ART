@@ -1815,16 +1815,15 @@ def _to_vllm_lora_tensors(
 ) -> tuple[dict[str, torch.Tensor], dict[str, Any]]:
     grouped = _group_art_moe_tensors(tensors)
     if not grouped:
+        # This branch handles PEFT/vLLM fused expert tensors. They already use
+        # external logical Gemma4 dimensions; only ART's grouped branch below
+        # trims padded internal dimensions.
         transformed = {
-            vllm_key: _trim_gemma4_moe_lora_for_vllm(
+            vllm_key: _rescale_shared_expert_fc1_lora_a(
                 vllm_key,
-                _rescale_shared_expert_fc1_lora_a(
-                    vllm_key,
-                    tensor,
-                    adapter_config=adapter_config,
-                    to_vllm=True,
-                ),
+                tensor,
                 adapter_config=adapter_config,
+                to_vllm=True,
             )
             for key, tensor in tensors.items()
             for vllm_key in (_to_vllm_key(key),)
@@ -1900,15 +1899,11 @@ def _to_vllm_lora_tensors(
             raise RuntimeError(
                 f"Duplicate Gemma 4 LoRA tensor after conversion: {vllm_key}"
             )
-        transformed[vllm_key] = _trim_gemma4_moe_lora_for_vllm(
+        transformed[vllm_key] = _rescale_shared_expert_fc1_lora_a(
             vllm_key,
-            _rescale_shared_expert_fc1_lora_a(
-                vllm_key,
-                tensor,
-                adapter_config=adapter_config,
-                to_vllm=True,
-            ),
+            tensor,
             adapter_config=adapter_config,
+            to_vllm=True,
         )
     transformed = _add_gemma4_k_eq_v_v_lora_tensors(
         transformed,
