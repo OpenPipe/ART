@@ -30,6 +30,7 @@ from art.megatron.flex_attn.attention import (
 from art.megatron.flex_attn.compiled import flash_sparse_block_size_for_head_dim
 from art.megatron.gdn.gdn_shared_prefix import (
     GdnPackedExecutionSpec,
+    GdnPlannerConfig,
     GdnRankExecutionPlan,
     build_gdn_rank_execution_plan,
     move_gdn_rank_execution_plan_to_device,
@@ -66,6 +67,7 @@ def create_shared_prefix_state(
     attention_token_layout_index: TokenLayoutIndex | None = None,
     attention_head_dim: int | None = None,
     attention_value_head_dim: int | None = None,
+    gdn_planner_config: GdnPlannerConfig | None = None,
 ) -> SharedPrefixAttentionState:
     """Build shared-prefix attention mask state plus optional reusable GDN plan."""
     device = group_ids.device if target_device is None else torch.device(target_device)
@@ -117,6 +119,7 @@ def create_shared_prefix_state(
             cp_rank=cp_rank,
             cp_size=cp_size,
             attention_token_layout_index=attention_token_layout_index,
+            planner_config=gdn_planner_config,
         ),
     )
 
@@ -313,6 +316,7 @@ def _build_gdn_execution_plan_once(
     cp_rank: int,
     cp_size: int,
     attention_token_layout_index: TokenLayoutIndex | None,
+    planner_config: GdnPlannerConfig | None,
 ) -> GdnRankExecutionPlan | None:
     if spec is None:
         return None
@@ -327,6 +331,7 @@ def _build_gdn_execution_plan_once(
             cp_rank=cp_rank,
             cp_size=cp_size,
             attention_token_layout_index=attention_token_layout_index,
+            planner_config=planner_config,
         )
     finally:
         if gc_was_enabled:

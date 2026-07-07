@@ -313,6 +313,8 @@ def _causal_attention_state(
     seq_len: int,
     device: torch.device,
     *,
+    provider: Any,
+    model_support_handler: Any,
     sliding_windows: tuple[int, ...] = (),
     build_gdn_execution_spec: bool,
     attention_head_dim: int | None = None,
@@ -329,7 +331,21 @@ def _causal_attention_state(
         build_gdn_execution_spec=build_gdn_execution_spec,
         attention_head_dim=attention_head_dim,
         attention_value_head_dim=attention_value_head_dim,
+        gdn_planner_config=_gdn_planner_config_for_provider(
+            provider,
+            model_support_handler,
+        ),
     )
+
+
+def _gdn_planner_config_for_provider(
+    provider: Any, model_support_handler: Any
+) -> Any | None:
+    if not bool(getattr(model_support_handler, "build_gdn_execution_spec", False)):
+        return None
+    from art.megatron.gdn.gdn_shared_prefix import GdnPlannerConfig
+
+    return GdnPlannerConfig.from_provider(provider)
 
 
 def _next_micro_lookahead(
@@ -362,6 +378,10 @@ def _prepare_dense_rl_micro(
         ),
         attention_head_dim=getattr(provider, "kv_channels", None),
         attention_value_head_dim=getattr(provider, "kv_channels", None),
+        gdn_planner_config=_gdn_planner_config_for_provider(
+            provider,
+            model_support_handler,
+        ),
     )
     _move_inputs_to_device(micro, device)
     shifted_labels = shift_tensor(micro["tokens"], -100)
@@ -406,6 +426,10 @@ def _prepare_rl_cp_micro_full(
         cp_rank=ps.get_context_parallel_rank(),
         build_gdn_execution_spec=bool(
             getattr(model_support_handler, "build_gdn_execution_spec", False)
+        ),
+        gdn_planner_config=_gdn_planner_config_for_provider(
+            provider,
+            model_support_handler,
         ),
         trace_token_uids=trace_token_uids,
         block_mask_variants=_art_flex_cp_block_mask_variants(provider, device),
@@ -561,6 +585,8 @@ def _prepare_dense_sft_micro(
             build_gdn_execution_spec=bool(
                 getattr(model_support_handler, "build_gdn_execution_spec", False)
             ),
+            provider=provider,
+            model_support_handler=model_support_handler,
             attention_head_dim=getattr(provider, "kv_channels", None),
             attention_value_head_dim=getattr(provider, "kv_channels", None),
         ),
@@ -636,6 +662,10 @@ def _prepare_sft_cp_micro_full(
         cp_rank=ps.get_context_parallel_rank(),
         build_gdn_execution_spec=bool(
             getattr(model_support_handler, "build_gdn_execution_spec", False)
+        ),
+        gdn_planner_config=_gdn_planner_config_for_provider(
+            provider,
+            model_support_handler,
         ),
         trace_token_uids=trace_token_uids,
         block_mask_variants=_art_flex_cp_block_mask_variants(provider, device),

@@ -50,7 +50,7 @@ class _PlanningBundle:
 
 _PLANNING_BUNDLE_CACHE: dict[str, _PlanningBundle] = {}
 _RUNTIME_PLAN_CACHE: dict[str, tuple[RankRuntimePlan, ...]] = {}
-_GDN_RANK_PLAN_CACHE: dict[tuple[str, str, int | None, int], Any] = {}
+_GDN_RANK_PLAN_CACHE: dict[tuple[str, str, int | None, int, str], Any] = {}
 
 
 def _json_cache_key(payload: Any) -> str:
@@ -1510,6 +1510,7 @@ def prepare_cp_micro(
     cp_group: Any,
     cp_rank: int,
     build_gdn_execution_spec: bool = False,
+    gdn_planner_config: Any | None = None,
     trace_token_uids: bool = False,
     prepare_execution_state: bool = True,
     block_mask_variants: tuple[CpBlockMaskVariant, ...] = (),
@@ -1531,6 +1532,7 @@ def prepare_cp_micro(
         cp_group=cp_group,
         cp_rank=cp_rank,
         build_gdn_execution_spec=build_gdn_execution_spec,
+        gdn_planner_config=gdn_planner_config,
         block_mask_variants=block_mask_variants,
         target_device=target_device,
     )
@@ -1570,6 +1572,7 @@ def prepare_megatron_context_parallel_state(
     cp_group: Any,
     cp_rank: int,
     build_gdn_execution_spec: bool = False,
+    gdn_planner_config: Any | None = None,
     block_mask_variants: tuple[CpBlockMaskVariant, ...] = (),
     target_device: torch.device | None = None,
 ) -> tuple[ArtContextParallelState, RankRuntimePlan, PackedBatchAttentionSpec, int]:
@@ -1646,6 +1649,9 @@ def prepare_megatron_context_parallel_state(
             gdn_plan_device.type,
             gdn_plan_device.index,
             int(cp_rank),
+            _json_cache_key(_dataclass_payload(gdn_planner_config))
+            if gdn_planner_config is not None
+            else "",
         )
         gdn_execution_plan = _GDN_RANK_PLAN_CACHE.get(rank_gdn_key)
         if gdn_execution_plan is None:
@@ -1659,6 +1665,7 @@ def prepare_megatron_context_parallel_state(
                 cp_rank=int(cp_rank),
                 cp_size=int(topology.cp),
                 attention_token_layout_index=rank_plan.token_layout_index,
+                planner_config=gdn_planner_config,
             )
             _cache_put(_GDN_RANK_PLAN_CACHE, rank_gdn_key, gdn_execution_plan)
     pad_multiple = int(topology.tp) if bool(topology.sp) and int(topology.tp) > 1 else 1

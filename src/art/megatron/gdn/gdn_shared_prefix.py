@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from bisect import bisect_left
 from dataclasses import dataclass, replace
-from typing import Any, Literal, NamedTuple
+from typing import Any, Literal, NamedTuple, cast
 
 import torch
 
@@ -12,6 +12,28 @@ from art.megatron.shared_prefix_tree import parse_shared_prefix_tree
 GdnSegmentKind = Literal["prefix", "completion"]
 # FLA's public chunk_gated_delta_rule hard-codes 64-token WY chunks.
 FLA_CHUNK_SIZE = 64
+
+
+def _dtype_bytes(dtype: Any) -> int:
+    if dtype is None:
+        return 2
+    if isinstance(dtype, str):
+        dtype_by_name = {
+            "float16": torch.float16,
+            "fp16": torch.float16,
+            "bfloat16": torch.bfloat16,
+            "bf16": torch.bfloat16,
+            "float32": torch.float32,
+            "fp32": torch.float32,
+        }
+        if dtype not in dtype_by_name:
+            raise ValueError(f"unsupported GDN planner dtype {dtype!r}")
+        dtype = dtype_by_name[dtype]
+    if dtype in (torch.float16, torch.bfloat16):
+        return 2
+    if dtype == torch.float32:
+        return 4
+    return torch.tensor([], dtype=dtype).element_size()
 
 
 @dataclass(frozen=True)
@@ -110,10 +132,11 @@ class _ExplicitBucketColumn:
 class GdnPlannerConfig:
     """Runtime model for one packed-row GDN execution plan.
 
-    The defaults are measured-throughput estimates from the Qwen3.5-shaped GDN
-    CP lab: hidden=2048, BF16 hidden exchange, 32 value heads, key/value dim 128.
-    The planner scores plans in predicted fwd+bwd milliseconds. The fields are
-    hardware/model-shape defaults, not benchmark-specific workload switches.
+    The defaults reproduce the Qwen3.5-35B reference shape used to fit the
+    GDN CP lab: hidden=2048, BF16 hidden exchange, 32 local value heads, and
+    key/value dim 128. Production callers should construct this with
+    ``from_model_shape`` so the same fitted hardware model scales by the actual
+    GDN state size instead of acting as a per-model profile.
     """
 
     cp_chain_beam_width: int = 2
@@ -147,6 +170,98 @@ class GdnPlannerConfig:
     runtime_parent_state_bytes_per_exchange: int = 262_144
     runtime_parent_state_bandwidth_bytes_per_ms: float = 56_000_000.0
     runtime_parent_state_latency_ms: float = 0.0
+
+    @classmethod
+    def from_provider(
+        cls,
+        provider: Any,
+        *,
+        dtype_bytes: int | None = None,
+        **overrides: Any,
+    ) -> GdnPlannerConfig:
+        return cls.from_model_shape(
+            hidden_size=int(getattr(provider, "hidden_size")),
+            tensor_model_parallel_size=int(
+                getattr(provider, "tensor_model_parallel_size", 1) or 1
+            ),
+            linear_num_key_heads=int(getattr(provider, "linear_num_key_heads")),
+            linear_num_value_heads=int(getattr(provider, "linear_num_value_heads")),
+            linear_key_head_dim=int(getattr(provider, "linear_key_head_dim")),
+            linear_value_head_dim=int(getattr(provider, "linear_value_head_dim")),
+            linear_conv_kernel_dim=int(
+                getattr(provider, "linear_conv_kernel_dim", 4) or 4
+            ),
+            dtype_bytes=(
+                dtype_bytes
+                if dtype_bytes is not None
+                else _dtype_bytes(getattr(provider, "params_dtype", None))
+            ),
+            **overrides,
+        )
+
+    @classmethod
+    def from_model_shape(
+        cls,
+        *,
+        hidden_size: int,
+        tensor_model_parallel_size: int,
+        linear_num_key_heads: int,
+        linear_num_value_heads: int,
+        linear_key_head_dim: int,
+        linear_value_head_dim: int,
+        linear_conv_kernel_dim: int = 4,
+        dtype_bytes: int = 2,
+        **overrides: Any,
+    ) -> GdnPlannerConfig:
+        """Build the fitted runtime model for an arbitrary GDN tensor shape."""
+
+        tp_size = max(1, int(tensor_model_parallel_size))
+        if linear_num_key_heads % tp_size != 0:
+            raise ValueError(
+                "linear_num_key_heads must be divisible by tensor parallel size, "
+                f"got {linear_num_key_heads} and {tp_size}"
+            )
+        if linear_num_value_heads % tp_size != 0:
+            raise ValueError(
+                "linear_num_value_heads must be divisible by tensor parallel size, "
+                f"got {linear_num_value_heads} and {tp_size}"
+            )
+        local_key_heads = int(linear_num_key_heads) // tp_size
+        local_value_heads = int(linear_num_value_heads) // tp_size
+        key_dim = int(linear_key_head_dim)
+        value_dim = int(linear_value_head_dim)
+        recurrent_state_elements = local_value_heads * key_dim * value_dim
+        summary_state_elements = local_value_heads * key_dim * (value_dim + key_dim)
+        ref_recurrent_elements = 32 * 128 * 128
+        ref_summary_elements = 32 * 128 * (128 + 128)
+        recurrent_scale = ref_recurrent_elements / max(1, recurrent_state_elements)
+        summary_scale = ref_summary_elements / max(1, summary_state_elements)
+        qkv_channels = 2 * local_key_heads * key_dim + local_value_heads * value_dim
+        conv_state_bytes = (
+            qkv_channels * max(0, int(linear_conv_kernel_dim) - 1) * int(dtype_bytes)
+        )
+        recurrent_state_bytes = recurrent_state_elements * 4
+        ref_parent_state_bytes = (
+            (2 * 16 * 128 + 32 * 128) * (4 - 1) * 2
+        ) + ref_recurrent_elements * 4
+        parent_state_bandwidth = 56_000_000.0 * ref_parent_state_bytes / 262_144.0
+        config = cls(
+            runtime_hidden_bytes_per_token=int(hidden_size) * int(dtype_bytes),
+            runtime_local_recurrent_tokens_per_ms=1_500.0 * recurrent_scale,
+            runtime_chain_recurrent_tokens_per_ms=1_400.0 * recurrent_scale,
+            runtime_cp_summary_bytes_per_segment=summary_state_elements * 4,
+            runtime_cp_summary_compute_segments_per_ms=320.0 * summary_scale,
+            runtime_cp_suffix_scan_segments_per_ms=15.0 * summary_scale,
+            runtime_parent_state_bytes_per_exchange=(
+                conv_state_bytes + recurrent_state_bytes
+            ),
+            runtime_parent_state_bandwidth_bytes_per_ms=parent_state_bandwidth,
+        )
+        return (
+            cast(GdnPlannerConfig, replace(config, **overrides))
+            if overrides
+            else config
+        )
 
 
 @dataclass(frozen=True)
