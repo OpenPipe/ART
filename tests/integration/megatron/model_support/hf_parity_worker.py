@@ -583,6 +583,15 @@ def _build_megatron_runtime(
     )
 
 
+def _freeze_bf16_grouped_expert_base_weights(
+    runtime: megatron_train.TrainingRuntime,
+) -> None:
+    for chunk in runtime.model:
+        for name, param in chunk.named_parameters():
+            if ".mlp.experts." in name:
+                param.requires_grad_(False)
+
+
 def _dtype_for_precision(precision: str) -> torch.dtype:
     if precision == "bf16":
         return torch.bfloat16
@@ -847,6 +856,8 @@ def _run_megatron_sft_step(
         request,
         moe_routing_replay_bundle=moe_routing_replay_bundle,
     )
+    if request.case_config.precision == "bf16":
+        _freeze_bf16_grouped_expert_base_weights(runtime)
     _assert_runtime_configuration(runtime.model, request.case_config, ORACLE_TOPOLOGY)
     assert runtime.optimizer is not None
     if moe_routing_replay_bundle is not None:
@@ -927,7 +938,8 @@ def _run_megatron_sft_step(
     derivative_tasks = [
         task
         for task in tasks
-        if _mapping_supports_derivative_parity(task.mapping)
+        if bool(getattr(task.param_weight, "requires_grad", False))
+        and _mapping_supports_derivative_parity(task.mapping)
         and _mapping_targets_language_only(task.mapping)
     ]
     _debug(f"retained {len(derivative_tasks)} derivative-safe conversion tasks")
