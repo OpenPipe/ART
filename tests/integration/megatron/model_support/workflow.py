@@ -138,6 +138,15 @@ def _stage_error_metrics(exc: Exception) -> dict[str, Any]:
     return {"error": f"{type(exc).__name__}: {exc}"}
 
 
+def _handler_workflow_precision(handler: Any) -> str:
+    precision = handler.workflow_validation_precision()
+    if precision not in {"bf16", "fp32"}:
+        raise ValueError(
+            f"{handler.key} returned unsupported workflow precision {precision!r}"
+        )
+    return precision
+
+
 def _truthy_env(name: str) -> bool:
     value = os.environ.get(name)
     return value is not None and value.strip().lower() in {"1", "true", "yes", "on"}
@@ -359,7 +368,7 @@ def run_hf_parity_stage(
     case_config = oracle_harness.OracleCaseConfig(
         base_model=base_model,
         is_moe=handler.is_moe,
-        precision="fp32",
+        precision=_handler_workflow_precision(handler),
         num_layers=max(1, architecture.recommended_min_layers),
         num_steps=1,
         allow_unvalidated_arch=allow_unvalidated_arch,
@@ -405,7 +414,7 @@ def run_lora_coverage_stage(
     case_config = oracle_harness.OracleCaseConfig(
         base_model=base_model,
         is_moe=handler.is_moe,
-        precision="fp32",
+        precision=_handler_workflow_precision(handler),
         num_layers=max(1, architecture.recommended_min_layers),
         num_steps=1,
         allow_unvalidated_arch=allow_unvalidated_arch,
@@ -458,7 +467,7 @@ def run_correctness_sensitivity_stage(
     case_config = oracle_harness.OracleCaseConfig(
         base_model=base_model,
         is_moe=handler.is_moe,
-        precision="fp32",
+        precision=_handler_workflow_precision(handler),
         num_layers=max(1, architecture.recommended_min_layers),
         num_steps=1,
         allow_unvalidated_arch=allow_unvalidated_arch,
@@ -620,7 +629,7 @@ def run_merged_vllm_serving_stage(
     case_config = oracle_harness.OracleCaseConfig(
         base_model=base_model,
         is_moe=handler.is_moe,
-        precision="fp32",
+        precision=_handler_workflow_precision(handler),
         num_layers=max(1, architecture.recommended_min_layers),
         num_steps=1,
         allow_unvalidated_arch=allow_unvalidated_arch,
@@ -726,7 +735,7 @@ def run_native_vllm_lora_stage(
     case_config = oracle_harness.OracleCaseConfig(
         base_model=base_model,
         is_moe=handler.is_moe,
-        precision="fp32",
+        precision=_handler_workflow_precision(handler),
         num_layers=max(1, architecture.recommended_min_layers),
         num_steps=1,
         allow_unvalidated_arch=allow_unvalidated_arch,

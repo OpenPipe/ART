@@ -75,8 +75,30 @@ class HfParityReport(BaseModel):
     metrics: list[HfParityMetricRow] = Field(default_factory=list)
 
 
-def _hf_parity_phase_pass_fns() -> dict[str, PhasePassFn]:
+def _hf_parity_phase_pass_fns(precision: str = "fp32") -> dict[str, PhasePassFn]:
     non_zero_scales = {"typical_abs_scale": 0.0, "candidate_abs_scale": 0.0}
+    if precision == "bf16":
+        fwd_out = MetricThresholdRule(
+            limits={"relative_l2": 3e-2, "mean_abs_pct": 3.0},
+            minimums=non_zero_scales,
+        )
+        loss = MetricThresholdRule(
+            limits={"relative_l2": 3e-2, "mean_abs_pct": 3.0},
+            minimums=non_zero_scales,
+        )
+        grads_deltas = MetricThresholdRule(
+            limits={"mean_abs_pct": 5.0},
+            minimums=non_zero_scales,
+        )
+        return {
+            "forward": fwd_out,
+            "outputs": fwd_out,
+            "losses": loss,
+            "grads": grads_deltas,
+            "deltas": grads_deltas,
+        }
+    if precision != "fp32":
+        raise ValueError(f"Unsupported HF parity precision: {precision}")
     fwd_out = MetricThresholdRule(
         limits={"relative_l2": 1e-2, "mean_abs_pct": 1.0},
         minimums=non_zero_scales,
@@ -324,8 +346,8 @@ def run_hf_parity(
     case_config: OracleCaseConfig,
 ) -> HfParityReport:
     case_config = hf_parity_case_config(case_config)
-    if case_config.precision != "fp32":
-        raise ValueError("HF parity currently requires fp32 precision")
+    if case_config.precision not in {"bf16", "fp32"}:
+        raise ValueError(f"Unsupported HF parity precision: {case_config.precision}")
     if case_config.num_steps != 1:
         raise ValueError("HF parity currently requires num_steps=1")
 
@@ -371,7 +393,7 @@ def build_hf_parity_report(
     loss_summary: dict[str, float],
     grads_rows: list[HfParityMetricRow],
 ) -> HfParityReport:
-    phase_pass_fns = _hf_parity_phase_pass_fns()
+    phase_pass_fns = _hf_parity_phase_pass_fns(request.case_config.precision)
     rows = [
         _build_metric_row(
             phase="outputs",
