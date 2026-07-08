@@ -51,6 +51,45 @@ class TrainSFTConfig(pydantic.BaseModel):
     batch_size: int | Literal["auto"] = "auto"
 
 
+class _SFTLossMaskBase(pydantic.BaseModel):
+    model_config = pydantic.ConfigDict(extra="forbid")
+
+
+class SFTAllLossMask(_SFTLossMaskBase):
+    type: Literal["all"] = "all"
+
+
+class SFTNoneLossMask(_SFTLossMaskBase):
+    type: Literal["none"] = "none"
+
+
+class SFTLastAssistantLossMask(_SFTLossMaskBase):
+    type: Literal["last_assistant"] = "last_assistant"
+
+
+class SFTMessageMaskLossMask(_SFTLossMaskBase):
+    type: Literal["message_mask"] = "message_mask"
+    mask: list[bool]
+
+
+class SFTRolesLossMask(_SFTLossMaskBase):
+    type: Literal["roles"] = "roles"
+    system: bool = False
+    user: bool = False
+    assistant: bool = True
+    tool: bool = False
+
+
+SFTLossMask = Annotated[
+    SFTAllLossMask
+    | SFTNoneLossMask
+    | SFTLastAssistantLossMask
+    | SFTMessageMaskLossMask
+    | SFTRolesLossMask,
+    pydantic.Field(discriminator="type"),
+]
+
+
 class SFTMetricLoggingConfig(TypedDict, total=False):
     enabled: bool
     target_training_step: int

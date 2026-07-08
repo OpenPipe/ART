@@ -7,7 +7,7 @@ import pytest
 
 from art import TrainableModel, Trajectory, TrajectoryGroup
 from art.serverless.backend import ServerlessBackend
-from art.types import TrainConfig, TrainSFTConfig
+from art.types import SFTLastAssistantLossMask, TrainConfig, TrainSFTConfig
 
 
 def _make_group() -> TrajectoryGroup:
@@ -285,6 +285,35 @@ async def test_serverless_train_sft_forwards_metric_logging_config() -> None:
     assert config["batch_size"] == 2
     assert metric_logging["enabled"] is True
     assert metric_logging["target_training_step"] == 1
+
+
+@pytest.mark.asyncio
+async def test_serverless_train_sft_rejects_loss_mask() -> None:
+    backend = _make_backend()
+    model = TrainableModel(
+        name="serverless-sft-loss-mask-rejects",
+        project="pipeline-tests",
+        base_model="test-model",
+    )
+    model.id = "model-id"
+    model.entity = "entity"
+
+    trajectory = Trajectory(
+        messages_and_choices=[
+            {"role": "user", "content": "prompt"},
+            {"role": "assistant", "content": "answer"},
+        ],
+        loss_mask=SFTLastAssistantLossMask(),
+    )
+
+    with pytest.raises(ValueError, match="does not support trajectory.loss_mask"):
+        async for _ in backend._train_sft(
+            model,
+            [trajectory],
+            TrainSFTConfig(learning_rate=[1e-4], batch_size=2),
+            {},
+        ):
+            pass
 
 
 @pytest.mark.asyncio

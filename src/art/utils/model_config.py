@@ -13,12 +13,31 @@ class ModelConfig:
 
 # Explicit model configurations for models that can't be auto-detected.
 # Models not listed here will fall back to auto-detection from the tokenizer's chat_template.
+QWEN_DISABLE_THINKING_CONFIG = ModelConfig(
+    instruction_part="<|im_start|>user\n",
+    response_part="<|im_start|>assistant\n<think>\n\n</think>\n\n",
+)
+
 MODEL_CONFIGS: dict[str, ModelConfig] = {
-    # Qwen3 with thinking disabled - always includes empty <think> tags
-    "OpenPipe/Qwen3-14B-Instruct": ModelConfig(
-        instruction_part="<|im_start|>user\n",
-        response_part="<|im_start|>assistant\n<think>\n\n</think>\n\n",
-    ),
+    model_id: QWEN_DISABLE_THINKING_CONFIG
+    for model_id in (
+        # Qwen renderers with thinking disabled inject empty <think> tags.
+        "OpenPipe/Qwen3-14B-Instruct",
+        "Qwen/Qwen3-4B",
+        "Qwen/Qwen3-4B-Base",
+        "Qwen/Qwen3-8B",
+        "Qwen/Qwen3-8B-Base",
+        "Qwen/Qwen3-14B",
+        "Qwen/Qwen3-14B-Base",
+        "Qwen/Qwen3-32B",
+        "Qwen/Qwen3-32B-Base",
+        "Qwen/Qwen3.5-4B",
+        "Qwen/Qwen3.5-27B",
+        "Qwen/Qwen3.5-35B-A3B",
+        "Qwen/Qwen3.5-397B-A17B",
+        "Qwen/Qwen3.6-27B",
+        "Qwen/Qwen3.6-35B-A3B",
+    )
 }
 
 

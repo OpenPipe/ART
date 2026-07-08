@@ -42,6 +42,27 @@ def test_iterate_file():
         jsonl_file.unlink()
 
 
+def test_iterate_file_preserves_loss_mask():
+    temp_file = tempfile.NamedTemporaryFile(mode="w", suffix=".jsonl", delete=False)
+    data = {
+        "messages": [
+            {"role": "user", "content": "Message"},
+            {"role": "assistant", "content": "Response"},
+        ],
+        "loss_mask": {"type": "last_assistant"},
+    }
+    temp_file.write(json.dumps(data) + "\n")
+    temp_file.close()
+    jsonl_file = Path(temp_file.name)
+
+    try:
+        [trajectory] = list(iterate_file(str(jsonl_file), epochs=1))
+        assert trajectory.loss_mask is not None
+        assert trajectory.loss_mask.type == "last_assistant"
+    finally:
+        jsonl_file.unlink()
+
+
 def test_iterate_file_multiple_epochs():
     """Test iterate_file with multiple epochs."""
     jsonl_file = create_temp_jsonl(10)

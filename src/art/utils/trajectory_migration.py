@@ -67,6 +67,11 @@ def trajectory_to_dict(trajectory: Trajectory) -> dict[str, Any]:
         "metadata": trajectory.metadata,
         "messages_and_choices": messages_and_choices,
         "tools": trajectory.tools,
+        "loss_mask": (
+            trajectory.loss_mask.model_dump()
+            if trajectory.loss_mask is not None
+            else None
+        ),
         "additional_histories": (
             [history_to_dict(h) for h in trajectory.additional_histories]
             if trajectory.additional_histories
@@ -125,6 +130,8 @@ def dict_to_trajectory(d: dict[str, Any]) -> Trajectory:
         reward=d["reward"],
         metrics=d["metrics"],
         metadata=d["metadata"],
+        tools=d.get("tools"),
+        loss_mask=d.get("loss_mask"),
         logs=d["logs"],
     )
 
@@ -272,6 +279,9 @@ def migrate_jsonl_to_parquet(
                         "tools": json.dumps(traj.get("tools"))
                         if traj.get("tools")
                         else None,
+                        "loss_mask": json.dumps(traj.get("loss_mask"))
+                        if traj.get("loss_mask")
+                        else None,
                         "logs": traj.get("logs"),
                         "additional_histories": json.dumps(
                             traj.get("additional_histories")
@@ -300,6 +310,7 @@ def migrate_jsonl_to_parquet(
                 ("metrics", pa.string()),
                 ("metadata", pa.string()),
                 ("tools", pa.string()),
+                ("loss_mask", pa.string()),
                 ("logs", pa.list_(pa.string())),
                 ("additional_histories", pa.string()),
                 ("messages", pa.list_(message_type)),

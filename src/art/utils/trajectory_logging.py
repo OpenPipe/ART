@@ -110,6 +110,11 @@ def write_trajectory_groups_parquet(
                     if trajectory.metadata
                     else None,
                     "tools": json.dumps(trajectory.tools) if trajectory.tools else None,
+                    "loss_mask": (
+                        trajectory.loss_mask.model_dump_json()
+                        if trajectory.loss_mask is not None
+                        else None
+                    ),
                     "logs": trajectory.logs if trajectory.logs else None,
                     "messages": messages,
                 }
@@ -136,6 +141,7 @@ def write_trajectory_groups_parquet(
             ("metrics", pa.string()),
             ("metadata", pa.string()),
             ("tools", pa.string()),
+            ("loss_mask", pa.string()),
             ("logs", pa.list_(pa.string())),
             ("messages", pa.list_(message_type)),
         ]
@@ -232,6 +238,10 @@ def read_trajectory_groups_parquet(path: str | Path) -> list[TrajectoryGroup]:
             metadata=json.loads(row_dict["metadata"])
             if row_dict.get("metadata")
             else {},
+            tools=json.loads(row_dict["tools"]) if row_dict.get("tools") else None,
+            loss_mask=json.loads(row_dict["loss_mask"])
+            if row_dict.get("loss_mask")
+            else None,
             logs=row_dict.get("logs") or [],
         )
 

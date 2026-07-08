@@ -27,7 +27,11 @@ from .moe_routing import (
     TokenRoute,
     align_choice_routes_to_tokenized_result,
 )
-from .response_masking import response_only_labels, token_ids_for_template_part
+from .response_masking import (
+    response_only_labels,
+    semantic_loss_mask_labels,
+    token_ids_for_template_part,
+)
 from .vllm_tokens import choice_vllm_token_metadata
 
 ChatTemplateTool = dict[Any, Any] | Callable[..., Any]
@@ -594,11 +598,27 @@ def tokenize_sft_batch(
 
         attention_mask = [1] * len(input_ids)
 
-        labels = response_only_labels(
-            input_ids,
-            instruction_ids=instruction_ids,
-            response_ids=response_ids,
-        )
+        if trajectory.loss_mask is None:
+            labels = response_only_labels(
+                input_ids,
+                instruction_ids=instruction_ids,
+                response_ids=response_ids,
+            )
+        else:
+            labels = semantic_loss_mask_labels(
+                input_ids,
+                messages=messages,
+                loss_mask=trajectory.loss_mask,
+                response_ids=response_ids,
+                render_message_prefix=lambda count: _apply_chat_template_token_ids(
+                    tokenizer,
+                    messages[:count],
+                    tools=tools,
+                    tokenize=True,
+                    add_generation_prompt=False,
+                    **template_kwargs,
+                ),
+            )
 
         trajectory_tensors.append(
             {

@@ -547,11 +547,6 @@ class ServerlessBackend(Backend):
 
         assert model.id is not None, "Model ID is required"
 
-        # Get the user's default entity from W&B if not set
-        if model.entity is None:
-            api = wandb.Api(api_key=self._client.api_key)
-            model.entity = api.default_entity
-
         # Generate unique artifact name to avoid race conditions in distributed systems
         artifact_id = uuid.uuid4().hex[:12]
         artifact_name = f"{model.name}-sft-data-{artifact_id}"
@@ -565,6 +560,14 @@ class ServerlessBackend(Backend):
             mode="w", suffix=".jsonl", delete=False
         ) as tmp_file:
             for trajectory in trajectories:
+                if trajectory.loss_mask is not None:
+                    import os
+
+                    os.unlink(tmp_file.name)
+                    raise ValueError(
+                        "ServerlessBackend SFT does not support trajectory.loss_mask "
+                        "yet. Use a local SFT backend or omit loss_mask."
+                    )
                 # Convert trajectory to the expected JSONL format
                 line: dict[str, Any] = {
                     "messages": trajectory.messages(),
@@ -585,6 +588,12 @@ class ServerlessBackend(Backend):
 
         if verbose:
             print(f"Serialized {num_trajectories} trajectories")
+
+        # Get the user's default entity from W&B if not set. Do this only after
+        # validating/serializing trajectories so local input errors surface first.
+        if model.entity is None:
+            api = wandb.Api(api_key=self._client.api_key)
+            model.entity = api.default_entity
 
         try:
             if verbose:

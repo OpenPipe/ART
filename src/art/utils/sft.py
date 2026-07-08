@@ -46,6 +46,7 @@ def _parse_jsonl_line(line: str) -> "Trajectory":
     return Trajectory(
         messages_and_choices=data.get("messages", []),
         tools=data.get("tools"),
+        loss_mask=data.get("loss_mask"),
     )
 
 
