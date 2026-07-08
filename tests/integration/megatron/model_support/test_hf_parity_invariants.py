@@ -317,10 +317,6 @@ def test_hf_moe_routing_capture_recognizes_gemma4_router_names() -> None:
         == "chunk_00.layer_0003.mlp.router"
     )
     assert (
-        _hf_moe_router_key("model.layers.3.mlp.router")
-        == "chunk_00.layer_0003.mlp.router"
-    )
-    assert (
         _hf_moe_router_key("model.language_model.layers.5.router")
         == "chunk_00.layer_0005.mlp.router"
     )

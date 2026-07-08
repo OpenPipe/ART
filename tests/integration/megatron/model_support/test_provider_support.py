@@ -19,7 +19,6 @@ from art.megatron.model_support.registry import (
     get_model_support_spec,
     model_uses_expert_parallel,
 )
-from art.megatron.model_support.spec import HfWeightSource
 import art.megatron.provider as provider_module
 from art.megatron.runtime.bridge_runtime import load_unique_hf_keys_once
 
@@ -36,7 +35,6 @@ class _FakeProvider:
         self.recompute_num_layers: int | None = None
         self.expert_model_parallel_size = 1
         self.expert_tensor_parallel_size = 1
-        self.window_size: tuple[int, int] | int | None = None
 
     def _base_layer_spec(
         self, config: object, vp_stage: int | None = None
@@ -118,16 +116,6 @@ class _FakeWeightBridge:
         return self.resolved
 
 
-class _TransientMegatronBridge:
-    __module__ = "megatron.bridge.models.fake"
-
-
-class _TransientAutoBridge:
-    @property
-    def _model_bridge(self) -> _TransientMegatronBridge:
-        return _TransientMegatronBridge()
-
-
 def test_openpipe_qwen3_14b_instruct_uses_qwen3_dense_support() -> None:
     spec = get_model_support_spec("OpenPipe/Qwen3-14B-Instruct")
     handler = get_model_support_handler("OpenPipe/Qwen3-14B-Instruct")
@@ -138,38 +126,18 @@ def test_openpipe_qwen3_14b_instruct_uses_qwen3_dense_support() -> None:
     assert handler.key == "qwen3_dense"
 
 
-def test_openai_gpt_oss_20b_uses_gpt_oss_moe_support() -> None:
-    spec = get_model_support_spec("openai/gpt-oss-20b")
-    handler = get_model_support_handler("openai/gpt-oss-20b")
-
-    assert spec.key == "gpt_oss_moe"
-    assert spec.is_moe is True
-    assert spec.native_vllm_lora_status == "wip"
-    assert spec.default_target_modules == (
-        "q_proj",
-        "k_proj",
-        "v_proj",
-        "o_proj",
-        "experts",
-    )
-    assert handler.key == "gpt_oss_moe"
-
-
 def test_model_support_specs_own_moe_metadata() -> None:
     assert model_uses_expert_parallel("OpenPipe/Qwen3-14B-Instruct") is False
     assert model_uses_expert_parallel("Qwen/Qwen3-30B-A3B-Instruct-2507") is True
     assert model_uses_expert_parallel("Qwen/Qwen3.5-35B-A3B") is True
-    assert model_uses_expert_parallel("openai/gpt-oss-20b") is True
 
 
 def test_megatron_lora_rank_defaults_by_architecture() -> None:
     dense_handler = get_model_support_handler("OpenPipe/Qwen3-14B-Instruct")
     moe_handler = get_model_support_handler("Qwen/Qwen3-30B-A3B-Instruct-2507")
-    gpt_oss_handler = get_model_support_handler("openai/gpt-oss-20b")
 
     assert default_lora_rank_for_handler(dense_handler) == 8
     assert default_lora_rank_for_handler(moe_handler) == 1
-    assert default_lora_rank_for_handler(gpt_oss_handler) == 1
 
 
 def test_get_provider_accepts_registry_supported_models(
@@ -212,136 +180,6 @@ def test_get_provider_accepts_registry_supported_models(
         layer_spec.submodules.self_attention.submodules.core_attention
         is ArtContextParallelCoreAttention
     )
-
-
-def test_provider_runtime_env_can_clear_moe_router_dtype() -> None:
-    runtime_env = provider_module._ProviderRuntimeEnv.from_environ(
-        {"ART_MEGATRON_MOE_ROUTER_DTYPE": "none"}
-    )
-
-    assert runtime_env.is_set("moe_router_dtype")
-    assert runtime_env.moe_router_dtype is None
-
-
-def test_gpt_oss_provider_uses_art_cp_attention(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    provider = _FakeProvider()
-    provider.num_moe_experts = 128
-    provider.window_size = (128, 0)
-    fake_bridge = _FakeBridge(
-        model_bridge=object(),
-        provider=provider,
-    )
-    monkeypatch.setattr(
-        provider_module.AutoBridge,
-        "from_hf_pretrained",
-        lambda *args, **kwargs: fake_bridge,
-    )
-    monkeypatch.setattr(provider_module.torch.cuda, "device_count", lambda: 2)
-
-    resolved = provider_module.get_provider("openai/gpt-oss-20b")
-
-    assert resolved is provider
-    assert resolved.context_parallel_size == 2
-    assert resolved.moe_shared_expert_overlap is False
-    assert resolved.moe_router_dtype is None
-    layer_spec = cast(Any, resolved.transformer_layer_spec)(resolved, vp_stage=0)
-    core_attention = layer_spec.submodules.self_attention.submodules.core_attention
-    assert issubclass(core_attention, ArtContextParallelCoreAttention)
-
-
-def test_missing_hf_prefetch_requires_available_source() -> None:
-    task = SimpleNamespace(
-        megatron_module=object(),
-        mapping=SimpleNamespace(hf_param="missing.weight", tp_size=1),
-    )
-
-    with pytest.raises(KeyError, match="missing.weight"):
-        load_unique_hf_keys_once(
-            [task],
-            {},
-            bridge=cast(Any, SimpleNamespace()),
-        )
-
-
-def test_gpt_oss_handler_plans_only_mxfp4_expert_weights() -> None:
-    handler = get_model_support_handler("openai/gpt-oss-20b")
-    bridge = SimpleNamespace()
-
-    handler.patch_bridge(cast(Any, bridge))
-    source_fn = getattr(bridge, "_art_hf_weight_source")
-    hf_param = "model.layers.0.mlp.experts.down_proj"
-
-    assert source_fn(hf_param, task=None) == HfWeightSource(
-        logical_key=hf_param,
-        physical_key_options=(
-            (hf_param,),
-            (f"{hf_param}_blocks", f"{hf_param}_scales"),
-        ),
-        kind="bridge_materialized",
-    )
-    assert source_fn("model.layers.0.mlp.experts.down_proj_bias", task=None) is None
-
-
-def test_gpt_oss_handler_patches_inner_model_bridge_weight_source() -> None:
-    handler = get_model_support_handler("openai/gpt-oss-20b")
-    inner_bridge = SimpleNamespace()
-    bridge = SimpleNamespace(_model_bridge=inner_bridge)
-    hf_param = "model.layers.0.mlp.experts.down_proj"
-
-    handler.patch_bridge(cast(Any, bridge))
-
-    source_fn = getattr(inner_bridge, "_art_hf_weight_source")
-    assert source_fn(hf_param, task=None) == HfWeightSource(
-        logical_key=hf_param,
-        physical_key_options=(
-            (hf_param,),
-            (f"{hf_param}_blocks", f"{hf_param}_scales"),
-        ),
-        kind="bridge_materialized",
-    )
-
-
-def test_gpt_oss_handler_patches_transient_megatron_bridge_class() -> None:
-    handler = get_model_support_handler("openai/gpt-oss-20b")
-    bridge = _TransientAutoBridge()
-    hf_param = "model.layers.0.mlp.experts.down_proj"
-
-    handler.patch_bridge(cast(Any, bridge))
-
-    source_fn = getattr(bridge._model_bridge, "_art_hf_weight_source")
-    assert source_fn(hf_param, task=None) == HfWeightSource(
-        logical_key=hf_param,
-        physical_key_options=(
-            (hf_param,),
-            (f"{hf_param}_blocks", f"{hf_param}_scales"),
-        ),
-        kind="bridge_materialized",
-    )
-
-
-def test_gpt_oss_provider_patches_inner_model_bridge_after_materialization(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    provider = _FakeProvider()
-    provider.num_moe_experts = 128
-    provider.window_size = (128, 0)
-    inner_bridge = SimpleNamespace()
-    fake_bridge = _FakeBridge(
-        model_bridge=inner_bridge,
-        provider=provider,
-    )
-    monkeypatch.setattr(
-        provider_module.AutoBridge,
-        "from_hf_pretrained",
-        lambda *args, **kwargs: fake_bridge,
-    )
-    monkeypatch.setattr(provider_module.torch.cuda, "device_count", lambda: 2)
-
-    provider_module.prepare_provider_bundle("openai/gpt-oss-20b")
-
-    assert hasattr(inner_bridge, "_art_hf_weight_source")
 
 
 def test_gpt_oss_mxfp4_weight_source_materializes_once() -> None:

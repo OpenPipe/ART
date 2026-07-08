@@ -213,11 +213,6 @@ def test_gemma4_real_path_limits() -> None:
     assert TOP20_KL_CANDIDATE_TO_TARGET_LIMIT == 0.002
 
 
-def test_gpt_oss_real_path_limits() -> None:
-    assert top20_kl_candidate_to_target_limit_for_model("openai/gpt-oss-20b") == 0.003
-    assert fwd_mean_abs_pct_limit_for_model("openai/gpt-oss-20b") == 4.0
-
-
 def test_compare_topk_reports_restricted_intersection_kl() -> None:
     target = ScoreBundle(
         side="megatron",

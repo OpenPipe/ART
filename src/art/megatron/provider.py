@@ -1,6 +1,7 @@
 from collections.abc import Mapping
 import copy
 import inspect
+import logging
 import os
 from typing import Any, Literal, cast
 
@@ -27,6 +28,10 @@ install_art_bridge_runtime_patches()
 _NONE_ENV_VALUES = {"", "none", "null", "off", "disable", "disabled"}
 _TRUE_ENV_VALUES = {"1", "true", "yes", "on"}
 _FALSE_ENV_VALUES = {"0", "false", "no", "off"}
+_DEEPEP_ROUTER_PROB_WARNING = (
+    "DeepEP only supports float32 probs, please set --moe-router-dtype=fp32"
+)
+_DEEPEP_TOKEN_DISPATCHER_LOGGER = "megatron.core.transformer.moe.token_dispatcher"
 _RECOMPUTE_GRANULARITIES = {"full", "selective"}
 _RECOMPUTE_METHODS = {"uniform", "block"}
 _FLEX_DISPATCHER_BACKENDS = {"deepep", "hybridep"}
@@ -87,6 +92,21 @@ class ProviderBundle(BaseModel):
     bridge: Any
     handler: Any
     spec: ModelSupportSpec
+
+
+class _DeepEpRouterProbWarningFilter(logging.Filter):
+    _art_deepep_router_prob_warning_filter = True
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        return record.getMessage() != _DEEPEP_ROUTER_PROB_WARNING
+
+
+def _install_deepep_router_prob_warning_filter() -> None:
+    logger = logging.getLogger(_DEEPEP_TOKEN_DISPATCHER_LOGGER)
+    for existing in logger.filters:
+        if getattr(existing, "_art_deepep_router_prob_warning_filter", False):
+            return
+    logger.addFilter(_DeepEpRouterProbWarningFilter())
 
 
 def resolve_layer_spec(
@@ -542,6 +562,7 @@ def prepare_provider_bundle(
     torch_dtype: torch.dtype = torch.bfloat16,
     allow_unvalidated_arch: bool = False,
 ) -> ProviderBundle:
+    _install_deepep_router_prob_warning_filter()
     runtime_env = _ProviderRuntimeEnv.from_environ()
     bundle = _build_provider_bundle(
         model,

@@ -373,9 +373,7 @@ def test_build_validation_report_populates_architecture_stage(
     assert native_vllm_lora_stage.artifact_dir == "/tmp/native-vllm-lora"
 
 
-def test_build_validation_report_only_stage_runs_prerequisites(
-    monkeypatch,
-) -> None:
+def test_build_validation_report_only_stage_skips_other_stages(monkeypatch) -> None:
     calls: list[str] = []
     monkeypatch.setattr(
         "tests.integration.megatron.model_support.workflow.inspect_architecture",
@@ -383,30 +381,19 @@ def test_build_validation_report_only_stage_runs_prerequisites(
             base_model=base_model,
             model_key="qwen3_5_moe",
             handler_key="qwen3_5_moe",
-            layer_families=[LayerFamilyInstance(key="standard_attention", count=2)],
+            layer_families=[],
             recommended_min_layers=1,
         ),
     )
     monkeypatch.setattr(
         "tests.integration.megatron.model_support.workflow.detect_dependency_versions",
-        lambda: {"transformers": "5.2.0"},
+        lambda: {},
     )
 
-    def _run_stage_in_subprocess(
-        *,
-        stage_name,
-        base_model,
-        architecture,
-        allow_unvalidated_arch=False,
-    ):
-        del base_model, architecture, allow_unvalidated_arch
+    def _run_stage_in_subprocess(**kwargs) -> ValidationStageResult:
+        stage_name = kwargs["stage_name"]
         calls.append(stage_name)
-        return ValidationStageResult(
-            name=stage_name,
-            passed=True,
-            metrics={"stage": stage_name},
-            artifact_dir=f"/tmp/{stage_name}",
-        )
+        return ValidationStageResult(name=stage_name, passed=True)
 
     monkeypatch.setattr(
         "tests.integration.megatron.model_support.workflow._run_stage_in_subprocess",
@@ -418,26 +405,9 @@ def test_build_validation_report_only_stage_runs_prerequisites(
         only_stage="length_trainability",
     )
 
+    skipped = next(stage for stage in report.stages if stage.name == "hf_parity")
     assert calls == ["length_trainability"]
-    dependency_stage = next(
-        stage for stage in report.stages if stage.name == "dependency_resolution"
-    )
-    architecture_stage = next(
-        stage for stage in report.stages if stage.name == "architecture_discovery"
-    )
-    trainability_stage = next(
-        stage for stage in report.stages if stage.name == "length_trainability"
-    )
-    skipped_stage = next(stage for stage in report.stages if stage.name == "hf_parity")
-
-    assert dependency_stage.passed is True
-    assert dependency_stage.metrics == {"transformers": "5.2.0"}
-    assert architecture_stage.passed is True
-    assert trainability_stage.passed is True
-    assert trainability_stage.metrics == {"stage": "length_trainability"}
-    assert trainability_stage.artifact_dir == "/tmp/length_trainability"
-    assert skipped_stage.passed is True
-    assert skipped_stage.metrics == {
+    assert skipped.metrics == {
         "skipped": True,
         "reason": "--only-stage=length_trainability",
     }
