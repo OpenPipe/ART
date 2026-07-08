@@ -200,6 +200,7 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
             if pipeline.max_batch_size is not None
             else pipeline.min_batch_size
         )
+        self.target_groups_per_step = self.max_batch_size
         self.max_steps_off_policy = pipeline.max_steps_off_policy
         self.limit_mean_steps_off_policy = limit_mean_steps_off_policy
         self.queue_maxsize = pipeline.queue_maxsize
@@ -405,6 +406,7 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
         self.num_rollout_workers = settings.num_rollout_workers
         self.min_batch_size = settings.min_batch_size
         self.max_batch_size = settings.max_batch_size
+        self.target_groups_per_step = settings.target_groups_per_step
         self.queue_maxsize = settings.queue_maxsize
         self._discard_queue_limit = self.discard_queue_multiplier * self.min_batch_size
         self._rollout_worker_controller.set_target(self.num_rollout_workers)
@@ -861,6 +863,7 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
                     )
                 )
                 metrics.update(self._queue_freshness_metrics(current_step))
+                metrics.update(self._pipeline_settings_metrics())
 
                 await self._emit_packed_group_observations(
                     metrics, batch=batch, step=current_step
@@ -1244,6 +1247,19 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
             if ages
             else 0.0,
             "queue/predicted_stale_fraction": stale / len(ages) if ages else 0.0,
+        }
+
+    def _pipeline_settings_metrics(self) -> dict[str, float]:
+        if self.autotune.mode == "off":
+            return {}
+        return {
+            "pipeline_settings/num_rollout_workers": float(self.num_rollout_workers),
+            "pipeline_settings/min_batch_size": float(self.min_batch_size),
+            "pipeline_settings/max_batch_size": float(self.max_batch_size),
+            "pipeline_settings/target_groups_per_step": float(
+                self.target_groups_per_step
+            ),
+            "pipeline_settings/queue_maxsize": float(self.queue_maxsize or 0),
         }
 
     def _retention_window_steps(self) -> int:

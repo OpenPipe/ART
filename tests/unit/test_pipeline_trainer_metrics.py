@@ -7,8 +7,15 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from art import PipelineRuntimeConfig, TrainableModel, Trajectory, TrajectoryGroup
+from art import (
+    PipelineAutotuneConfig,
+    PipelineRuntimeConfig,
+    TrainableModel,
+    Trajectory,
+    TrajectoryGroup,
+)
 from art.pipeline_trainer.trainer import PipelineTrainer
+from art.pipeline_tuner import PipelineTuneSettings
 
 
 def _make_group(
@@ -113,6 +120,46 @@ def test_pipeline_trainer_batch_factor_accounts_for_rollout_group_size(
         (8.0 + 300.0 / 8.0) / (8.0 + 300.0 / 16.0)
     )
     assert metrics["sample_efficiency/batch_factor"] > 1.0
+
+
+def test_pipeline_settings_metrics_only_when_autotune_active(tmp_path: Path) -> None:
+    model = TrainableModel(
+        name="pipeline-settings-metrics-test",
+        project="pipeline-settings-metrics-test",
+        base_model="test-model",
+        base_path=str(tmp_path),
+        report_metrics=[],
+    )
+    trainer = PipelineTrainer(
+        model=model,
+        backend=MagicMock(),
+        rollout_fn=lambda *_args, **_kwargs: asyncio.sleep(0),
+        scenarios=[],
+        config={},
+        autotune=PipelineAutotuneConfig(mode="online"),
+        eval_fn=None,
+        max_steps=1,
+    )
+    trainer.apply_pipeline_settings(
+        PipelineTuneSettings(
+            num_rollout_workers=24,
+            min_batch_size=9,
+            max_batch_size=12,
+            queue_maxsize=18,
+            target_groups_per_step=12,
+        )
+    )
+
+    assert trainer._pipeline_settings_metrics() == {
+        "pipeline_settings/num_rollout_workers": 24.0,
+        "pipeline_settings/min_batch_size": 9.0,
+        "pipeline_settings/max_batch_size": 12.0,
+        "pipeline_settings/target_groups_per_step": 12.0,
+        "pipeline_settings/queue_maxsize": 18.0,
+    }
+
+    trainer.autotune = PipelineAutotuneConfig(mode="off")
+    assert trainer._pipeline_settings_metrics() == {}
 
 
 @pytest.mark.asyncio

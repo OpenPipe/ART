@@ -212,6 +212,7 @@ METRIC_SECTIONS = frozenset(
         "loss",
         "offpolicy",
         "pipeline",
+        "pipeline_settings",
         "throughput",
         "costs",
         "time",
