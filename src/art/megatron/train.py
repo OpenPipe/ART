@@ -876,7 +876,12 @@ def _load_adapter_into_model(
 ) -> dict[str, torch.Tensor]:
     print0(rank, "Loading adapter model from", lora_path)
     adapter_model = load_lora_tensors_for_megatron(lora_path, handler=handler)
-    load_adapter_into_model(model_chunks, adapter_model, optimizer)
+    load_adapter_into_model(
+        model_chunks,
+        adapter_model,
+        optimizer,
+        model_support_handler=handler,
+    )
     return adapter_model
 
 
@@ -1007,12 +1012,16 @@ def load_adapter_into_model(
     model_chunks: ModelChunks,
     adapter_model: dict[str, torch.Tensor],
     optimizer: Any | None = None,
+    *,
+    model_support_handler: Any | None = None,
 ) -> None:
     with torch.no_grad():
         for chunk in model_chunks:
             for module in chunk.modules():
                 if hasattr(module, "load_lora"):
                     module.load_lora(adapter_model)  # type: ignore[attr-defined]
+        if model_support_handler is not None:
+            model_support_handler.zero_internal_padding_params(model_chunks)
 
     if optimizer is None:
         return
@@ -1360,7 +1369,12 @@ def _prepare_kl_reference_logprobs(
     finally:
         if loaded_ref_adapter:
             assert runtime.optimizer is not None
-            load_adapter_into_model(runtime.model, adapter_model, runtime.optimizer)
+            load_adapter_into_model(
+                runtime.model,
+                adapter_model,
+                runtime.optimizer,
+                model_support_handler=runtime.model_support_handler,
+            )
 
 
 def run_megatron_sft_step(

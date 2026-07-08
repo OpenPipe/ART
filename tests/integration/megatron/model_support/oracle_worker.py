@@ -1405,7 +1405,12 @@ def _worker_run(request: WorkerRunRequest) -> None:
     # load the shared initial lora into the model and validate we can collect it from the model
     _debug("loading shared initial lora state")
     adapter_model = load_file(str(shared_init_path))
-    megatron_train.load_adapter_into_model(model_chunks, adapter_model, optimizer)
+    megatron_train.load_adapter_into_model(
+        model_chunks,
+        adapter_model,
+        optimizer,
+        model_support_handler=runtime.model_support_handler,
+    )
     _debug("collecting loaded lora state")
     loaded_state = _collect_lora_state(model_chunks)
     if torch.distributed.get_rank() == 0:  # ty: ignore[possibly-missing-attribute]

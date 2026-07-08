@@ -15,6 +15,8 @@ from art.megatron.model_support.handlers import (
     QWEN3_MOE_HANDLER,
 )
 from art.megatron.model_support.lora_disk import (
+    ART_LORA_FORMAT_CONFIG_KEY,
+    ART_LORA_FORMAT_VLLM,
     load_lora_tensors_for_megatron,
     normalize_lora_checkpoint_to_vllm,
     save_vllm_lora_tensors,
@@ -77,6 +79,30 @@ def _save_adapter(path: Path, tensors: dict[str, torch.Tensor], config: dict) ->
     path.mkdir(parents=True, exist_ok=True)
     save_file(tensors, path / "adapter_model.safetensors")
     (path / "adapter_config.json").write_text(json.dumps(config), encoding="utf-8")
+
+
+def test_marked_vllm_lora_checkpoint_normalization_is_idempotent(tmp_path: Path):
+    tensors = {
+        "base_model.model.model.layers.0.mlp.gate_proj.lora_A.weight": torch.randn(
+            1,
+            4,
+        )
+    }
+    save_vllm_lora_tensors(tmp_path, tensors, _config("Qwen/Qwen3-0.6B"))
+
+    class FailingHandler:
+        def to_vllm_lora_tensors(self, tensors, *, adapter_config):
+            raise AssertionError("marked vLLM checkpoint should not be normalized")
+
+    normalize_lora_checkpoint_to_vllm(
+        tmp_path,
+        handler=cast(Any, FailingHandler()),
+        adapter_config=json.loads((tmp_path / "adapter_config.json").read_text()),
+    )
+
+    _assert_tensors_equal(load_file(tmp_path / "adapter_model.safetensors"), tensors)
+    adapter_config = json.loads((tmp_path / "adapter_config.json").read_text())
+    assert adapter_config[ART_LORA_FORMAT_CONFIG_KEY] == ART_LORA_FORMAT_VLLM
 
 
 def _old_merge_shard_files_to_vllm(

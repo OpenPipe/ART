@@ -943,7 +943,11 @@ def _real_path_megatron_worker(
             handler=runtime.model_support_handler,
             allow_unvalidated_arch=request.config.allow_unvalidated_arch,
         )
-        megatron_train.load_adapter_into_model(runtime.model, adapter_model)
+        megatron_train.load_adapter_into_model(
+            runtime.model,
+            adapter_model,
+            model_support_handler=runtime.model_support_handler,
+        )
 
     if adapter_only:
         if torch.distributed.get_rank() == 0:  # type: ignore[possibly-missing-attribute]
