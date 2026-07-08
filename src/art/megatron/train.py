@@ -26,12 +26,18 @@ from megatron.core import parallel_state as ps
 from megatron.core.distributed import DistributedDataParallelConfig
 from megatron.core.optimizer import OptimizerConfig, get_megatron_optimizer
 from megatron.core.transformer.module import MegatronModule
-from pydantic import BaseModel, ConfigDict, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 import torch
 from torch._inductor.runtime.cache_dir_utils import cache_dir as inductor_cache_dir
 
 from art import dev, types
-from art.loss import Loss, LossInputs, loss_fn, shift_tensor
+from art.loss import (
+    Loss,
+    LossInputs,
+    LossOffPolicyDiagnosticsAccumulator,
+    loss_fn,
+    shift_tensor,
+)
 from art.megatron.context_parallel.types import (
     DispatchedPackedTensors,
     ParallelTopology,
@@ -181,6 +187,7 @@ class TrainStepResult(BaseModel):
     update_successful: bool
     grad_norm: float
     num_zeros_in_grad: int | None
+    loss_metrics: dict[str, float] = Field(default_factory=dict)
 
 
 def print0(rank: int, *values: Any) -> None:
@@ -969,6 +976,7 @@ def _log_rl_step_result(
         }
         if step_result.kl_policy_ref is not None:
             metrics["kl_policy_ref"] = step_result.kl_policy_ref
+        metrics.update(step_result.loss_metrics)
         log_msg = json.dumps(metrics)
         print("Logging", log_msg)
         log_file.write(log_msg + "\n")
@@ -1587,6 +1595,7 @@ def run_training_step(
     probs_corr_total: torch.Tensor | None = None
     kl_policy_ref_sum = 0.0
     kl_policy_ref_count = 0
+    loss_diagnostics = LossOffPolicyDiagnosticsAccumulator()
     new_logprobs_gpu: list[torch.Tensor] = []
 
     def begin_micro(micro_order: int) -> None:
@@ -1682,6 +1691,7 @@ def run_training_step(
         if loss_info.kl_policy_ref is not None:
             kl_policy_ref_sum += float(loss_info.kl_policy_ref.item())
             kl_policy_ref_count += 1
+        loss_diagnostics.add(loss_info.offpolicy_diagnostics)
         detached_micro_loss = micro_loss.detach()
         if raw_loss_sum is None:
             raw_loss_sum = detached_micro_loss
@@ -1735,6 +1745,9 @@ def run_training_step(
         update_successful=update_successful,
         grad_norm=grad_norm,
         num_zeros_in_grad=num_zeros_in_grad,
+        loss_metrics=loss_diagnostics.to_metrics(
+            group=ps.get_data_parallel_group(with_context_parallel=True),
+        ),
     )
 
 

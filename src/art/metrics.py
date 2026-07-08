@@ -158,6 +158,37 @@ PIPELINE_RL_METRIC_DEFINITIONS: tuple[MetricDefinition, ...] = (
         higher_is_better=True,
     ),
     MetricDefinition(
+        key="loss/importance_ratio_mean",
+        title="Importance ratio mean",
+        description="mean configured importance-sampling ratio on trainable tokens",
+        kind="ratio",
+        higher_is_better=None,
+    ),
+    MetricDefinition(
+        key="loss/importance_ratio_p95",
+        title="Importance ratio p95",
+        description="histogram-estimated p95 configured importance-sampling ratio",
+        kind="ratio",
+        higher_is_better=False,
+    ),
+    MetricDefinition(
+        key="loss/importance_ratio_p99",
+        title="Importance ratio p99",
+        description="histogram-estimated p99 configured importance-sampling ratio",
+        kind="ratio",
+        higher_is_better=False,
+    ),
+    MetricDefinition(
+        key="loss/clipped_token_fraction",
+        title="Clipped token fraction",
+        description=(
+            "fraction of trainable tokens whose configured importance ratio is "
+            "outside the active clipping interval"
+        ),
+        kind="ratio",
+        higher_is_better=False,
+    ),
+    MetricDefinition(
         key="vllm/prompt_tok_per_s",
         title="vLLM prompt tokens per second",
         description="vLLM prompt prefill throughput over time",
