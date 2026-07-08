@@ -250,7 +250,6 @@ def tl_prefix_tree_indexer_fwd_impl(
 
     seq_len = T.dynamic("seq_len")
     seq_len_kv = T.dynamic("seq_len_kv")
-    visible_group_count = T.dynamic("visible_group_count")
 
     index_q_shape = [seq_len * heads, index_dim]
     index_k_shape = [seq_len_kv, index_dim]
@@ -263,12 +262,10 @@ def tl_prefix_tree_indexer_fwd_impl(
         Logits: T.Tensor(logits_shape, accum_dtype),  # type: ignore
         Weights: T.Tensor([seq_len, heads], accum_dtype),  # type: ignore
         QPosition: T.Tensor([seq_len], index_dtype),  # type: ignore
-        QGroup: T.Tensor([seq_len], index_dtype),  # type: ignore
-        QParent: T.Tensor([seq_len], index_dtype),  # type: ignore
-        EntryGroup: T.Tensor([seq_len_kv], index_dtype),  # type: ignore
-        EntryVisibleGroups: T.Tensor([seq_len_kv, visible_group_count], index_dtype),  # type: ignore
+        QGroupPreOrder: T.Tensor([seq_len], index_dtype),  # type: ignore
+        EntryGroupPreOrder: T.Tensor([seq_len_kv], index_dtype),  # type: ignore
+        EntryGroupPostOrder: T.Tensor([seq_len_kv], index_dtype),  # type: ignore
         EntryEndPosition: T.Tensor([seq_len_kv], index_dtype),  # type: ignore
-        EntryValid: T.Tensor([seq_len_kv], index_dtype),  # type: ignore
     ):
         with T.Kernel(T.ceildiv(seq_len, block_Q), threads=threads) as bx:
             index_q_shared = T.alloc_shared([block_Q * heads, index_dim], dtype)
@@ -314,15 +311,11 @@ def tl_prefix_tree_indexer_fwd_impl(
                     q_i = seq_len_i + bq_i
                     k_i = nbn_i * block_N + bn_i
                     if k_i < seq_len_kv:
-                        visible_group = False
-                        for group_i in T.serial(visible_group_count):
-                            visible_group = visible_group or (
-                                EntryVisibleGroups[k_i, group_i] == QGroup[q_i]
-                            )
+                        q_group_pre_order = QGroupPreOrder[q_i]
                         visible = (
-                            (EntryValid[k_i] != 0)
-                            and (EntryEndPosition[k_i] <= QPosition[q_i])
-                            and visible_group
+                            (EntryEndPosition[k_i] <= QPosition[q_i])
+                            and (EntryGroupPreOrder[k_i] <= q_group_pre_order)
+                            and (q_group_pre_order < EntryGroupPostOrder[k_i])
                         )
                         Logits[q_i, k_i] = T.if_then_else(
                             visible,
@@ -344,12 +337,10 @@ def prefix_tree_indexer_fwd_interface(
     kv,
     weights,
     position_ids,
-    group_ids,
-    parent_ids,
-    entry_group_ids,
-    entry_visible_group_ids,
+    query_group_pre_order,
+    entry_group_pre_order,
+    entry_group_post_order,
     entry_end_positions,
-    entry_valid,
 ):
     """Compute prefix-tree-aware indexer logits for one batch element.
 
@@ -386,12 +377,10 @@ def prefix_tree_indexer_fwd_interface(
             logits,
             weights.float(),
             _i32_contiguous(position_ids),
-            _i32_contiguous(group_ids),
-            _i32_contiguous(parent_ids),
-            _i32_contiguous(entry_group_ids),
-            _i32_contiguous(entry_visible_group_ids),
+            _i32_contiguous(query_group_pre_order),
+            _i32_contiguous(entry_group_pre_order),
+            _i32_contiguous(entry_group_post_order),
             _i32_contiguous(entry_end_positions),
-            _i32_contiguous(entry_valid),
         )
     return logits
 
@@ -401,12 +390,10 @@ def prefix_tree_indexer_topk_interface(
     kv,
     weights,
     position_ids,
-    group_ids,
-    parent_ids,
-    entry_group_ids,
-    entry_visible_group_ids,
+    query_group_pre_order,
+    entry_group_pre_order,
+    entry_group_post_order,
     entry_end_positions,
-    entry_valid,
     topk,
 ):
     """Compute prefix-tree-aware DSV4 indexer top-k compressed ids."""
@@ -416,12 +403,10 @@ def prefix_tree_indexer_topk_interface(
             kv,
             weights,
             position_ids,
-            group_ids,
-            parent_ids,
-            entry_group_ids,
-            entry_visible_group_ids,
+            query_group_pre_order,
+            entry_group_pre_order,
+            entry_group_post_order,
             entry_end_positions,
-            entry_valid,
         ),
         topk,
     )

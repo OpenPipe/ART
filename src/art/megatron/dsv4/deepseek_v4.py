@@ -111,35 +111,57 @@ def _prefix_tree_window_topk_idxs(
         parent_ids=parent_ids.detach().cpu(),
     )
     topk = torch.full((bsz, seqlen, width), -1, dtype=torch.int32)
+    if width == 0:
+        return topk.to(device=group_ids.device)
 
-    def path_position_map(
+    def branch_indices(
         row: PrefixTreeRow,
         segment: PrefixTreeSegment,
-    ) -> dict[int, int]:
-        by_group = {candidate.group_id: candidate for candidate in row.segments}
-        mapping: dict[int, int] = {}
+        by_group: dict[int, PrefixTreeSegment],
+        positions_by_group: dict[int, torch.Tensor],
+    ) -> torch.Tensor:
+        branch_len = int(positions_by_group[segment.group_id][-1].item()) + 1
+        indices = torch.full((branch_len,), -1, dtype=torch.int32)
         for group_id in (*segment.ancestors, segment.group_id):
             path_segment = by_group[group_id]
-            for index in range(path_segment.start, path_segment.end):
-                logical_pos = int(position_cpu[row.row_index, index])
-                if logical_pos in mapping:
-                    raise ValueError(
-                        "DSV4 prefix-tree SWA path has duplicate logical "
-                        f"position {logical_pos} in row {row.row_index}."
-                    )
-                mapping[logical_pos] = index
-        return mapping
+            logical_positions = positions_by_group[group_id]
+            physical_indices = torch.arange(
+                path_segment.start,
+                path_segment.end,
+                dtype=torch.int32,
+            )
+            indices[logical_positions] = physical_indices
+        if bool((indices < 0).any().item()):
+            raise ValueError(
+                "DSV4 prefix-tree SWA path must cover every logical position "
+                f"from 0 through {branch_len - 1}."
+            )
+        return indices
 
     for row in rows:
+        by_group = {candidate.group_id: candidate for candidate in row.segments}
+        positions_by_group = {
+            candidate.group_id: position_cpu[
+                row.row_index, candidate.start : candidate.end
+            ].to(torch.long)
+            for candidate in row.segments
+        }
         for segment in row.segments:
-            mapping = path_position_map(row, segment)
-            for q_index in range(segment.start, segment.end):
-                q_pos = int(position_cpu[row.row_index, q_index])
-                start_pos = q_pos - width + 1
-                for offset, logical_pos in enumerate(range(start_pos, q_pos + 1)):
-                    index = mapping.get(logical_pos)
-                    if index is not None:
-                        topk[row.row_index, q_index, offset] = index
+            indices = branch_indices(row, segment, by_group, positions_by_group)
+            padded = torch.cat(
+                (
+                    torch.full((width - 1,), -1, dtype=torch.int32),
+                    indices,
+                )
+            )
+            windows = padded.unfold(0, width, 1)
+            q_positions = position_cpu[row.row_index, segment.start : segment.end].to(
+                torch.long
+            )
+            topk[row.row_index, segment.start : segment.end] = windows.index_select(
+                0,
+                q_positions,
+            )
     return topk.to(device=group_ids.device)
 
 
@@ -185,8 +207,6 @@ def _prefix_tree_compressed_topk_idxs_cached(
     layout: Dsv4CompressionLayout,
     *,
     position_ids: torch.Tensor,
-    group_ids: torch.Tensor,
-    parent_ids: torch.Tensor,
     ratio: int,
     offset: int,
 ) -> torch.Tensor:
@@ -198,8 +218,6 @@ def _prefix_tree_compressed_topk_idxs_cached(
             compressed_layout_topk_idxs(
                 layout,
                 position_ids=position_ids,
-                group_ids=group_ids,
-                parent_ids=parent_ids,
                 offset=offset,
             )
             .to(torch.int32)
@@ -212,18 +230,12 @@ def _prefix_tree_compressed_topk_idxs_cached(
 def _prefix_tree_i32_metadata_cached(
     attention_bias: Any,
     position_ids: torch.Tensor,
-    group_ids: torch.Tensor,
-    parent_ids: torch.Tensor,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+) -> torch.Tensor:
     cache = _dsv4_topk_cache(attention_bias)
     key = "indexer_q_metadata_i32"
     cached = cache.get(key)
     if cached is None:
-        cached = (
-            position_ids.to(torch.int32).contiguous(),
-            group_ids.to(torch.int32).contiguous(),
-            parent_ids.to(torch.int32).contiguous(),
-        )
+        cached = position_ids.to(torch.int32).contiguous()
         cache[key] = cached
     return cached
 
@@ -239,10 +251,10 @@ def _prefix_tree_layout_indexer_metadata_cached(
     cached = cache.get(key)
     if cached is None:
         cached = (
-            layout.entry_group_ids.to(torch.int32).contiguous(),
-            layout.entry_visible_group_ids.to(torch.int32).contiguous(),
+            layout.query_group_pre_order.to(torch.int32).contiguous(),
+            layout.entry_group_pre_order.to(torch.int32).contiguous(),
+            layout.entry_group_post_order.to(torch.int32).contiguous(),
             layout.entry_end_positions.to(torch.int32).contiguous(),
-            layout.entry_valid.to(torch.int32).contiguous(),
         )
         cache[key] = cached
     return cached
@@ -551,34 +563,27 @@ class DeepSeekV4Attention(MegatronModule):
                         qr_sbd, group=self.tp_group
                     )
                 if isinstance(self.indexer, V4Indexer):
-                    group_ids = parent_ids = None
                     shared_layout_i32 = None
                     index_position_ids = position_ids
-                    if prefix_tree is not None:
-                        group_ids, parent_ids = prefix_tree
-                        if position_ids is not None and shared_layout is not None:
-                            index_position_ids, group_ids, parent_ids = (
-                                _prefix_tree_i32_metadata_cached(
-                                    attention_bias,
-                                    position_ids,
-                                    group_ids,
-                                    parent_ids,
-                                )
-                            )
-                            shared_layout_i32 = (
-                                _prefix_tree_layout_indexer_metadata_cached(
-                                    attention_bias,
-                                    shared_layout,
-                                    ratio=ratio,
-                                )
-                            )
+                    if (
+                        prefix_tree is not None
+                        and position_ids is not None
+                        and shared_layout is not None
+                    ):
+                        index_position_ids = _prefix_tree_i32_metadata_cached(
+                            attention_bias,
+                            position_ids,
+                        )
+                        shared_layout_i32 = _prefix_tree_layout_indexer_metadata_cached(
+                            attention_bias,
+                            shared_layout,
+                            ratio=ratio,
+                        )
                     compress_topk_idxs = self.indexer(
                         x_sbd,
                         qr_sbd,
                         position_ids=index_position_ids,
                         shared_layout=shared_layout,
-                        group_ids=group_ids,
-                        parent_ids=parent_ids,
                         shared_layout_i32=shared_layout_i32,
                     )
                 else:
@@ -608,13 +613,10 @@ class DeepSeekV4Attention(MegatronModule):
                         q_positions, ratio=ratio, bsz=bsz
                     )
                 else:
-                    group_ids, parent_ids = prefix_tree
                     compress_topk_idxs = _prefix_tree_compressed_topk_idxs_cached(
                         attention_bias,
                         shared_layout,
                         position_ids=position_ids,
-                        group_ids=group_ids,
-                        parent_ids=parent_ids,
                         ratio=ratio,
                         offset=kv_compress_offset,
                     )

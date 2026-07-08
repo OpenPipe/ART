@@ -48,8 +48,7 @@ def _exact_indexer_topk(
     *,
     shared_layout: Dsv4CompressionLayout | None = None,
     position_ids: torch.Tensor | None = None,
-    group_ids: torch.Tensor | None = None,
-    parent_ids: torch.Tensor | None = None,
+    q_offset: int = 0,
 ) -> torch.Tensor:
     """Return frozen DSV4 indexer topk using the reference score equation.
 
@@ -94,17 +93,15 @@ def _exact_indexer_topk(
                         kv_ids.unsqueeze(0) >= cu_seqlen_ks[q_start:q_end, None]
                     ) & (kv_ids.unsqueeze(0) < cu_seqlen_ke[q_start:q_end, None])
                 else:
-                    if position_ids is None or group_ids is None or parent_ids is None:
+                    if position_ids is None:
                         raise ValueError(
-                            "DSV4 prefix-tree indexer requires position/group metadata."
+                            "DSV4 prefix-tree indexer requires position ids."
                         )
                     visible = compressed_layout_visibility(
                         shared_layout,
-                        position_ids=position_ids[b : b + 1],
-                        group_ids=group_ids[b : b + 1],
-                        parent_ids=parent_ids[b : b + 1],
-                        q_start=q_start,
-                        q_end=q_end,
+                        position_ids=position_ids,
+                        q_start=q_offset + q_start,
+                        q_end=q_offset + q_end,
                     )[0]
                 scores.masked_fill_(~visible, float("-inf"))
                 top_scores, top_indices = scores.topk(actual_topk, dim=-1)
@@ -127,8 +124,6 @@ def _tilelang_indexer_topk(
     *,
     shared_layout: Dsv4CompressionLayout | None = None,
     position_ids: torch.Tensor | None = None,
-    group_ids: torch.Tensor | None = None,
-    parent_ids: torch.Tensor | None = None,
     shared_layout_i32: tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]
     | None = None,
 ) -> torch.Tensor:
@@ -147,33 +142,38 @@ def _tilelang_indexer_topk(
     with torch.no_grad():
         for b in range(batch):
             if shared_layout is not None:
-                if position_ids is None or group_ids is None or parent_ids is None:
+                if batch != 1:
                     raise ValueError(
-                        "DSV4 prefix-tree indexer requires position/group metadata."
+                        "DSV4 prefix-tree indexer expects one packed sequence per "
+                        f"Megatron microbatch, got batch={batch}."
                     )
+                if position_ids is None:
+                    raise ValueError("DSV4 prefix-tree indexer requires position ids.")
                 if shared_layout_i32 is None:
-                    entry_group_ids = shared_layout.entry_group_ids.to(torch.int32)
-                    entry_visible_group_ids = shared_layout.entry_visible_group_ids.to(
+                    query_group_pre_order = shared_layout.query_group_pre_order.to(
+                        torch.int32
+                    )
+                    entry_group_pre_order = shared_layout.entry_group_pre_order.to(
+                        torch.int32
+                    )
+                    entry_group_post_order = shared_layout.entry_group_post_order.to(
                         torch.int32
                     )
                     entry_end_positions = shared_layout.entry_end_positions.to(
                         torch.int32
                     )
-                    entry_valid = shared_layout.entry_valid.to(torch.int32)
                 else:
                     (
-                        entry_group_ids,
-                        entry_visible_group_ids,
+                        query_group_pre_order,
+                        entry_group_pre_order,
+                        entry_group_post_order,
                         entry_end_positions,
-                        entry_valid,
                     ) = shared_layout_i32
                 position_b = position_ids[b].to(torch.int32).contiguous()
-                group_b = group_ids[b].to(torch.int32).contiguous()
-                parent_b = parent_ids[b].to(torch.int32).contiguous()
-                entry_group_b = entry_group_ids[b].contiguous()
-                entry_visible_group_b = entry_visible_group_ids[b].contiguous()
-                entry_end_b = entry_end_positions[b].contiguous()
-                entry_valid_b = entry_valid[b].contiguous()
+                query_group_pre_b = query_group_pre_order.contiguous()
+                entry_group_pre_b = entry_group_pre_order.contiguous()
+                entry_group_post_b = entry_group_post_order.contiguous()
+                entry_end_b = entry_end_positions.contiguous()
             for q_start in range(0, fast_seqlen, q_block):
                 q_end = min(q_start + q_block, fast_seqlen)
                 q_slice = q[q_start:q_end, b].contiguous()
@@ -194,12 +194,10 @@ def _tilelang_indexer_topk(
                         k_slice,
                         weights_slice,
                         position_b[q_start:q_end],
-                        group_b[q_start:q_end],
-                        parent_b[q_start:q_end],
-                        entry_group_b,
-                        entry_visible_group_b,
+                        query_group_pre_b[q_start:q_end],
+                        entry_group_pre_b,
+                        entry_group_post_b,
                         entry_end_b,
-                        entry_valid_b,
                         topk,
                     )
         if fast_seqlen != seqlen:
@@ -211,11 +209,8 @@ def _tilelang_indexer_topk(
                 cu_seqlen_ke[fast_seqlen:],
                 topk,
                 shared_layout=shared_layout,
-                position_ids=None
-                if position_ids is None
-                else position_ids[:, fast_seqlen:],
-                group_ids=None if group_ids is None else group_ids[:, fast_seqlen:],
-                parent_ids=None if parent_ids is None else parent_ids[:, fast_seqlen:],
+                position_ids=position_ids,
+                q_offset=fast_seqlen,
             )
     return out
 
@@ -292,8 +287,6 @@ class V4Indexer(MegatronModule):
         packed_seq_params=None,
         position_ids: torch.Tensor | None = None,
         shared_layout: Dsv4CompressionLayout | None = None,
-        group_ids: torch.Tensor | None = None,
-        parent_ids: torch.Tensor | None = None,
         shared_layout_i32: tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]
         | None = None,
     ):
@@ -372,7 +365,5 @@ class V4Indexer(MegatronModule):
             self.index_topk,
             shared_layout=shared_layout,
             position_ids=position_ids,
-            group_ids=group_ids,
-            parent_ids=parent_ids,
             shared_layout_i32=shared_layout_i32,
         )
