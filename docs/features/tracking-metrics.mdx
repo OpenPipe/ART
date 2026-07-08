@@ -6,7 +6,8 @@ icon: "chart-line"
 ---
 
 ART writes a metrics row every time you call `model.log(...)`. Those rows go to
-`history.jsonl` in the run directory and, if W&B logging is enabled, to W&B.
+`history.jsonl` in the run directory and, if W&B or Trackio logging is enabled,
+to the configured tracker.
 
 Use this page for three things:
 
@@ -104,6 +105,26 @@ A few useful patterns:
 - use fully qualified keys like `time/step_actor_s` or `data/step_actor_tokens` for builder-managed metrics
 
 ART flushes builder-managed metrics on the next `model.log(...)` call.
+
+## Log trajectories as Trackio traces
+
+Set `report_metrics=["trackio"]` on your model to log each trajectory as a
+`trackio.Trace` when `model.log(...)` receives trajectory groups. ART also sends
+the metrics row for the same step to Trackio.
+
+```python
+model = art.Model(
+    name="my-model",
+    project="my-project",
+    report_metrics=["trackio"],
+)
+
+await model.log(train_groups, split="train", step=step)
+```
+
+Each Trackio trace includes the trajectory's OpenAI-style messages plus metadata
+for the split, step, group index, trajectory index, reward, trajectory metrics,
+trajectory metadata, and logs.
 
 ## Track judge and API costs
 

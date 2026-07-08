@@ -307,6 +307,103 @@ class TestPathStructure:
         ).exists()
 
 
+class TestTrackioLogging:
+    """Test Trackio trace logging integration."""
+
+    @pytest.mark.asyncio
+    async def test_model_log_writes_trackio_traces_when_enabled(self, tmp_path: Path):
+        fake_trackio = MagicMock()
+        fake_trackio.Trace.side_effect = lambda messages, metadata=None: {
+            "_type": "trackio.trace",
+            "messages": messages,
+            "metadata": metadata or {},
+        }
+
+        model = Model(
+            name="test-model",
+            project="test-project",
+            base_path=str(tmp_path),
+            report_metrics=["trackio"],
+        )
+        trajectory_groups = [
+            TrajectoryGroup(
+                trajectories=[
+                    Trajectory(
+                        reward=0.8,
+                        metrics={"correct": 1.0},
+                        metadata={"scenario_id": "scenario-1"},
+                        messages_and_choices=[
+                            {"role": "user", "content": "What is 2 + 2?"},
+                            {"role": "assistant", "content": "4"},
+                        ],
+                        logs=["finished"],
+                    )
+                ],
+            )
+        ]
+
+        with patch.dict("sys.modules", {"trackio": fake_trackio}):
+            await model.log(trajectory_groups, split="val", step=3)
+
+        fake_trackio.init.assert_called_once_with(
+            project="test-project",
+            name="test-model",
+            config=None,
+        )
+        fake_trackio.Trace.assert_called_once()
+        trace_kwargs = fake_trackio.Trace.call_args.kwargs
+        assert trace_kwargs["messages"] == [
+            {"role": "user", "content": "What is 2 + 2?"},
+            {"role": "assistant", "content": "4"},
+        ]
+        assert trace_kwargs["metadata"]["split"] == "val"
+        assert trace_kwargs["metadata"]["step"] == 3
+        assert trace_kwargs["metadata"]["reward"] == 0.8
+        assert trace_kwargs["metadata"]["metrics"] == {"correct": 1.0}
+        assert trace_kwargs["metadata"]["metadata"] == {"scenario_id": "scenario-1"}
+        assert trace_kwargs["metadata"]["logs"] == ["finished"]
+
+        trace_log_call = next(
+            call
+            for call in fake_trackio.log.call_args_list
+            if "val/trajectories" in call.args[0]
+        )
+        assert trace_log_call.kwargs == {"step": 3}
+
+    @pytest.mark.asyncio
+    async def test_model_log_does_not_import_trackio_unless_enabled(
+        self, tmp_path: Path
+    ):
+        fake_trackio = MagicMock()
+        model = Model(
+            name="test-model",
+            project="test-project",
+            base_path=str(tmp_path),
+            report_metrics=[],
+        )
+
+        with patch.dict("sys.modules", {"trackio": fake_trackio}):
+            await model.log(
+                [
+                    TrajectoryGroup(
+                        trajectories=[
+                            Trajectory(
+                                reward=0.5,
+                                messages_and_choices=[
+                                    {"role": "user", "content": "hello"}
+                                ],
+                            )
+                        ]
+                    )
+                ],
+                split="val",
+                step=1,
+            )
+
+        fake_trackio.init.assert_not_called()
+        fake_trackio.log.assert_not_called()
+
+
 class TestMetricCalculation:
     """Test metric calculation and formatting."""
 

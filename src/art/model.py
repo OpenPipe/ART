@@ -224,6 +224,7 @@ class Model(
     _s3_prefix: str | None = None
     _openai_client: AsyncOpenAI | None = None
     _wandb_run: Optional["Run"] = None  # Private, for lazy wandb initialization
+    _trackio_initialized: bool
     _wandb_defined_metrics: set[str]
     _wandb_config: dict[str, Any]
     _run_start_time: float
@@ -266,6 +267,7 @@ class Model(
 
     def _init_runtime_state(self) -> None:
         object.__setattr__(self, "_wandb_defined_metrics", set())
+        object.__setattr__(self, "_trackio_initialized", False)
         object.__setattr__(self, "_wandb_config", {})
         object.__setattr__(self, "_run_start_time", time.time())
         object.__setattr__(self, "_run_start_monotonic", time.monotonic())
@@ -671,6 +673,26 @@ class Model(
             self._sync_wandb_config(run)
         return self._wandb_run
 
+    def _get_trackio(self) -> Any:
+        """Get or initialize the Trackio logger for this model."""
+        try:
+            import trackio
+        except ImportError as exc:
+            raise ImportError(
+                "Trackio logging requires the `trackio` package. "
+                "Install it with `pip install trackio` or remove 'trackio' "
+                "from report_metrics."
+            ) from exc
+
+        if not self._trackio_initialized:
+            trackio.init(
+                project=self.project,
+                name=self.name,
+                config=self._wandb_config or None,
+            )
+            object.__setattr__(self, "_trackio_initialized", True)
+        return trackio
+
     def _log_metrics(
         self,
         metrics: dict[str, float],
@@ -724,6 +746,53 @@ class Model(
                 # ART's `training_step` remains the x-axis via define_metric,
                 # which preserves out-of-order eval logging.
                 run.log(prefixed)
+
+        should_log_trackio = (
+            self.report_metrics is not None and "trackio" in self.report_metrics
+        )
+        if should_log_trackio:
+            self._get_trackio().log(prefixed, step=step)
+
+    def _trackio_trace_messages(self, trajectory: Trajectory) -> list[dict[str, Any]]:
+        messages = []
+        for message in trajectory.for_logging()["messages"]:
+            messages.append(
+                {key: value for key, value in message.items() if key != "trainable"}
+            )
+        return messages
+
+    def _log_trackio_traces(
+        self,
+        trajectory_groups: list[TrajectoryGroup],
+        *,
+        split: str,
+        step: int,
+    ) -> None:
+        if self.report_metrics is None or "trackio" not in self.report_metrics:
+            return
+
+        trackio = self._get_trackio()
+        traces = []
+        for group_index, group in enumerate(trajectory_groups):
+            for trajectory_index, trajectory in enumerate(group.trajectories):
+                traces.append(
+                    trackio.Trace(
+                        messages=self._trackio_trace_messages(trajectory),
+                        metadata={
+                            "split": split,
+                            "step": step,
+                            "group_index": group_index,
+                            "trajectory_index": trajectory_index,
+                            "reward": trajectory.reward,
+                            "metrics": trajectory.metrics,
+                            "metadata": trajectory.metadata,
+                            "logs": trajectory.logs,
+                        },
+                    )
+                )
+
+        if traces:
+            trackio.log({f"{split}/trajectories": traces}, step=step)
 
     def _define_wandb_step_metrics(self, keys: Iterable[str]) -> None:
         run = self._wandb_run
@@ -956,6 +1025,7 @@ class Model(
         write_trajectory_groups_parquet(
             trajectory_groups, f"{trajectories_dir}/{file_name}"
         )
+        self._log_trackio_traces(trajectory_groups, split=split, step=step)
 
         # 2. Calculate aggregate metrics (excluding additive costs)
         reward_key = "reward"

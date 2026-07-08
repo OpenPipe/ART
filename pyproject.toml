@@ -281,6 +281,8 @@ allowed-unresolved-imports = [
     "torch.**",
     "torchao.**",
     "transformers.**",
+    "trackio",
+    "trackio.**",
     "trl.**",
     "unsloth.**",
     "unsloth_zoo.**",
