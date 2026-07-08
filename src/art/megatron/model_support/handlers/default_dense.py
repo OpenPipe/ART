@@ -6,7 +6,9 @@ from art.megatron.model_support.spec import (
     CompileWorkaroundConfig,
     ExpertPackedLoraGroup,
     FlexAttentionCompileCrashConfig,
+    HfWeightSource,
     LayerFamilyInstance,
+    RolloutWeightsMode,
     SharedExpertCompileState,
 )
 
@@ -81,6 +83,16 @@ class DefaultDenseHandler:
         del bridge
         return None
 
+    def hf_weight_source(
+        self,
+        bridge: Any,
+        hf_param: str,
+        *,
+        task: Any | None = None,
+    ) -> HfWeightSource | None:
+        del bridge, hf_param, task
+        return None
+
     def configure_provider_for_runtime(self, provider: Any) -> None:
         del provider
         return None
@@ -96,6 +108,17 @@ class DefaultDenseHandler:
     ) -> Any:
         del internal_config
         return tokenizer
+
+    def vllm_engine_args(
+        self,
+        *,
+        rollout_weights_mode: RolloutWeightsMode,
+    ) -> dict[str, object]:
+        del rollout_weights_mode
+        return {}
+
+    def vllm_server_args(self) -> dict[str, object]:
+        return {}
 
     def install_preprocess_patch(self, model_chunks: Sequence[Any]) -> None:
         del model_chunks

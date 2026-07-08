@@ -37,6 +37,7 @@ _TILELANG_ENV_KEYS = (
 _TILELANG_PATH_MARKERS = ("/site-packages/tilelang/", "\\site-packages\\tilelang\\")
 _FLASHINFER_WORKSPACE_ENV = "FLASHINFER_WORKSPACE_BASE"
 _ART_FLASHINFER_WORKSPACE_ENV = "ART_VLLM_RUNTIME_FLASHINFER_WORKSPACE_BASE"
+VLLM_RUNTIME_CLOSE_TIMEOUT = 15.0
 
 
 class VllmRuntimeLaunchConfig(BaseModel):
@@ -326,7 +327,12 @@ class ManagedVllmRuntime:
         if self.process is not None:
             terminate_popen_process_group(
                 self.process,
-                timeout=float(os.environ.get("ART_VLLM_RUNTIME_CLOSE_TIMEOUT", 30)),
+                timeout=float(
+                    os.environ.get(
+                        "ART_VLLM_RUNTIME_CLOSE_TIMEOUT",
+                        VLLM_RUNTIME_CLOSE_TIMEOUT,
+                    )
+                ),
             )
             self.process = None
         if self.log_file is not None:

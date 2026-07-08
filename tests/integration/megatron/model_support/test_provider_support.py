@@ -4,6 +4,7 @@ from types import SimpleNamespace
 from typing import Any, cast
 
 import pytest
+import torch
 
 pytest.importorskip("megatron.bridge")
 
@@ -20,6 +21,7 @@ from art.megatron.model_support.registry import (
     model_uses_expert_parallel,
 )
 import art.megatron.provider as provider_module
+from art.megatron.runtime.bridge_runtime import load_unique_hf_keys_once
 
 
 class _FakeProvider:
@@ -98,6 +100,21 @@ class _FakeBridge:
 
     def to_megatron_provider(self) -> _FakeProvider:
         return self._provider
+
+
+class _FakeWeightBridge:
+    def __init__(self, resolved: torch.Tensor) -> None:
+        self.resolved = resolved
+        self.calls: list[str] = []
+
+    def maybe_modify_loaded_hf_weight(
+        self,
+        hf_param: str,
+        hf_state_dict: dict[str, torch.Tensor],
+    ) -> torch.Tensor:
+        del hf_state_dict
+        self.calls.append(hf_param)
+        return self.resolved
 
 
 def test_openpipe_qwen3_14b_instruct_uses_qwen3_dense_support() -> None:
@@ -195,6 +212,29 @@ def test_get_provider_accepts_registry_supported_models(
         layer_spec.submodules.self_attention.submodules.core_attention
         is ArtContextParallelCoreAttention
     )
+
+
+def test_gpt_oss_mxfp4_weight_source_materializes_once() -> None:
+    handler = get_model_support_handler("openai/gpt-oss-20b")
+    resolved = torch.ones(2, 3)
+    bridge = _FakeWeightBridge(resolved)
+    hf_param = "model.layers.0.mlp.experts.down_proj"
+    task = SimpleNamespace(
+        megatron_module=object(),
+        mapping=SimpleNamespace(hf_param=hf_param, tp_size=1),
+    )
+    state = {
+        f"{hf_param}_blocks": torch.zeros(1),
+        f"{hf_param}_scales": torch.zeros(1),
+    }
+
+    handler.patch_bridge(cast(Any, bridge))
+    cache = load_unique_hf_keys_once([task], state, bridge=cast(Any, bridge))
+    loaded = cache[hf_param]
+
+    assert isinstance(loaded, torch.Tensor)
+    assert torch.equal(loaded, resolved)
+    assert bridge.calls == [hf_param]
 
 
 def test_finalize_provider_bundle_allows_art_gdn_context_parallel() -> None:

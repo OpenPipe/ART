@@ -13,7 +13,12 @@ SharedExpertCompileState = Literal[
     "shared_experts",
     "shared_expert_overlap",
 ]
-ExpertPackedLoraLayout = Literal["expert_rows", "rank_major_expert_cols"]
+ExpertPackedLoraLayout = Literal[
+    "expert_rows",
+    "rank_major_expert_cols",
+    "interleaved_gate_up_rank_major_expert_cols",
+]
+HfWeightSourceKind = Literal["direct", "bridge_materialized"]
 
 
 class DependencyFloor(BaseModel):
@@ -66,6 +71,12 @@ class ExpertPackedLoraGroup(BaseModel):
     slots: tuple[ExpertPackedLoraSlot, ...]
 
 
+class HfWeightSource(BaseModel):
+    logical_key: str
+    physical_key_options: tuple[tuple[str, ...], ...]
+    kind: HfWeightSourceKind = "direct"
+
+
 class ModelSupportSpec(BaseModel):
     key: str
     handler_key: str
@@ -95,6 +106,14 @@ class ModelSupportHandler(Protocol):
 
     def patch_bridge(self, bridge: "AutoBridge") -> None: ...
 
+    def hf_weight_source(
+        self,
+        bridge: "AutoBridge",
+        hf_param: str,
+        *,
+        task: Any | None = None,
+    ) -> HfWeightSource | None: ...
+
     def patch_provider(
         self,
         provider: "GPTModelProvider",
@@ -111,6 +130,14 @@ class ModelSupportHandler(Protocol):
         *,
         internal_config: Any,
     ) -> Any: ...
+
+    def vllm_engine_args(
+        self,
+        *,
+        rollout_weights_mode: RolloutWeightsMode,
+    ) -> dict[str, object]: ...
+
+    def vllm_server_args(self) -> dict[str, object]: ...
 
     def install_preprocess_patch(self, model_chunks: Sequence[Any]) -> None: ...
 

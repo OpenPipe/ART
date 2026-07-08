@@ -406,9 +406,19 @@ class MegatronService:
     def _runtime_engine_args(
         self, config: dev.OpenAIServerConfig | None
     ) -> dict[str, object]:
+        from .model_support import get_model_support_handler
+
         engine_args = dict(self.config.get("engine_args", {}))
         if config and "engine_args" in config:
             engine_args.update(dict(config["engine_args"]))
+        handler = get_model_support_handler(
+            self.base_model,
+            allow_unvalidated_arch=self._allow_unvalidated_arch,
+        )
+        for key, value in handler.vllm_engine_args(
+            rollout_weights_mode=self.rollout_weights_mode
+        ).items():
+            engine_args.setdefault(key, value)
         engine_args.setdefault("generation_config", "vllm")
         if self.rollout_weights_mode == "merged":
             engine_args["weight_transfer_config"] = {"backend": "nccl"}
@@ -424,11 +434,18 @@ class MegatronService:
     def _runtime_server_args(
         self, config: dev.OpenAIServerConfig | None
     ) -> dict[str, object]:
+        from .model_support import get_model_support_handler
+
         server_args: dict[str, object] = {
             "return_tokens_as_token_ids": True,
             "enable_auto_tool_choice": True,
             "tool_call_parser": "hermes",
         }
+        handler = get_model_support_handler(
+            self.base_model,
+            allow_unvalidated_arch=self._allow_unvalidated_arch,
+        )
+        server_args.update(handler.vllm_server_args())
         if config and "server_args" in config:
             server_args.update(dict(config["server_args"]))
         for key in ("port", "host", "lora_modules"):

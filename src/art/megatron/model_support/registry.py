@@ -15,6 +15,7 @@ _QWEN3_5_MOE_HANDLER_KEY = "qwen3_5_moe"
 _GEMMA4_DENSE_HANDLER_KEY = "gemma4_dense"
 _GEMMA4_MOE_HANDLER_KEY = "gemma4_moe"
 _DSV4_HANDLER_KEY = "dsv4"
+_GPT_OSS_MOE_HANDLER_KEY = "gpt_oss_moe"
 _VALIDATED_NATIVE_VLLM_LORA_STATUS: NativeVllmLoraStatus = "validated"
 _WIP_NATIVE_VLLM_LORA_STATUS: NativeVllmLoraStatus = "wip"
 _DISABLED_NATIVE_VLLM_LORA_STATUS: NativeVllmLoraStatus = "disabled"
@@ -31,6 +32,7 @@ _DENSE_TARGET_MODULES = (
 
 _QWEN3_MOE_TARGET_MODULES = (*_DENSE_TARGET_MODULES, "experts")
 _GEMMA4_MOE_TARGET_MODULES = (*_DENSE_TARGET_MODULES, "experts")
+_GPT_OSS_MOE_TARGET_MODULES = ("q_proj", "k_proj", "v_proj", "o_proj", "experts")
 
 _QWEN3_5_DENSE_TARGET_MODULES = (
     "q_proj",
@@ -193,6 +195,22 @@ DSV4_SPEC = ModelSupportSpec(
     dependency_floor=DependencyFloor(transformers="5.12.1"),
 )
 
+GPT_OSS_MOE_SPEC = ModelSupportSpec(
+    key="gpt_oss_moe",
+    handler_key=_GPT_OSS_MOE_HANDLER_KEY,
+    is_moe=True,
+    model_names=(
+        "openai/gpt-oss-20b",
+        "openai/gpt-oss-120b",
+    ),
+    default_target_modules=_GPT_OSS_MOE_TARGET_MODULES,
+    native_vllm_lora_status=_WIP_NATIVE_VLLM_LORA_STATUS,
+    dependency_floor=DependencyFloor(
+        transformers="5.6.2",
+        megatron_bridge="e1a207ac757e5d0ed94d8ffbe1cbd28e81d8c084",
+    ),
+)
+
 VALIDATED_MODEL_SUPPORT_SPECS = (
     QWEN3_MOE_SPEC,
     QWEN3_DENSE_SPEC,
@@ -201,6 +219,7 @@ VALIDATED_MODEL_SUPPORT_SPECS = (
     GEMMA4_MOE_SPEC,
     GEMMA4_DENSE_SPEC,
     DSV4_SPEC,
+    GPT_OSS_MOE_SPEC,
 )
 PROBE_ONLY_MODEL_SUPPORT_SPECS = ()
 _ALL_MODEL_SUPPORT_SPECS = (
@@ -252,6 +271,10 @@ _HANDLER_IMPORTS: dict[str, tuple[str, str]] = {
         "art.megatron.model_support.handlers.dsv4",
         "DSV4_HANDLER",
     ),
+    _GPT_OSS_MOE_HANDLER_KEY: (
+        "art.megatron.model_support.handlers.gpt_oss",
+        "GPT_OSS_MOE_HANDLER",
+    ),
 }
 _BRIDGE_REGISTRATION_IMPORTS: dict[str, tuple[str, str]] = {
     "qwen3_5_dense": (
@@ -286,6 +309,7 @@ QWEN3_5_MODELS = QWEN3_5_DENSE_MODELS | QWEN3_5_MOE_MODELS
 GEMMA4_MOE_MODELS = frozenset(GEMMA4_MOE_SPEC.model_names)
 GEMMA4_DENSE_MODELS = frozenset(GEMMA4_DENSE_SPEC.model_names)
 DSV4_MODELS = frozenset(DSV4_SPEC.model_names)
+GPT_OSS_MOE_MODELS = frozenset(GPT_OSS_MOE_SPEC.model_names)
 
 
 class UnsupportedModelArchitectureError(ValueError):

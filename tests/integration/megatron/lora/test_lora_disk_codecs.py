@@ -1,3 +1,4 @@
+import importlib.util
 import json
 from pathlib import Path
 import subprocess
@@ -11,6 +12,7 @@ from art.megatron import lora as lora_module
 from art.megatron.lora import LoRA, LoRAParallelSpec, LoRAPublishPlanner
 from art.megatron.model_support.handlers import (
     DEFAULT_DENSE_HANDLER,
+    GPT_OSS_MOE_HANDLER,
     QWEN3_5_MOE_HANDLER,
     QWEN3_MOE_HANDLER,
 )
@@ -29,6 +31,7 @@ from art.utils.convert_moe_lora import convert_checkpoint_if_needed
 
 REPO_ROOT = Path(__file__).parents[4]
 VLLM_PYTHON = REPO_ROOT / "vllm_runtime/.venv/bin/python"
+VLLM_RUNTIME_SRC = REPO_ROOT / "vllm_runtime/src"
 
 
 def _config(base_model: str, rank: int = 2, alpha: int = 4) -> dict:
@@ -241,6 +244,89 @@ def _qwen35_fused_expert_vllm_tensors(
         prefix = f"{art_expert_prefix}.{expert}"
         gate_up_a.append(original[f"{prefix}.gate_up_proj.lora_A.weight"])
         gate_up_b.append(original[f"{prefix}.gate_up_proj.lora_B.weight"])
+        down_a.append(original[f"{prefix}.down_proj.lora_A.weight"])
+        down_b.append(original[f"{prefix}.down_proj.lora_B.weight"])
+    return {
+        f"{expert_prefix}.base_layer.lora_A.weight": torch.cat(
+            gate_up_a,
+            dim=0,
+        ).contiguous(),
+        f"{expert_prefix}.base_layer.lora_B.weight": _pack_qwen35_vllm_lora_b(
+            gate_up_b
+        ),
+        f"{expert_prefix}.lora_A.weight": torch.cat(down_a, dim=0).contiguous(),
+        f"{expert_prefix}.lora_B.weight": _pack_qwen35_vllm_lora_b(down_b),
+    }
+
+
+def _gpt_oss_config(base_model: str, rank: int = 2, alpha: int = 4) -> dict:
+    config = _config(base_model, rank=rank, alpha=alpha)
+    config["target_modules"] = [
+        "q_proj",
+        "k_proj",
+        "v_proj",
+        "o_proj",
+        "gate_proj",
+        "up_proj",
+        "down_proj",
+    ]
+    return config
+
+
+def _gpt_oss_moe_art_tensors(prefix: str, *, rank: int = 2) -> dict[str, torch.Tensor]:
+    hidden = 3
+    intermediate = 4
+    tensors: dict[str, torch.Tensor] = {
+        f"{prefix}.self_attn.q_proj.lora_A.weight": torch.arange(
+            rank * hidden,
+            dtype=torch.float32,
+        ).reshape(rank, hidden),
+        f"{prefix}.self_attn.q_proj.lora_B.weight": torch.arange(
+            hidden * rank,
+            dtype=torch.float32,
+        ).reshape(hidden, rank)
+        + 100,
+    }
+    offset = 200
+    for expert in range(2):
+        for module in ("gate_up_proj", "down_proj"):
+            out_dim = hidden if module == "down_proj" else 2 * intermediate
+            in_dim = intermediate if module == "down_proj" else hidden
+            tensors[f"{prefix}.mlp.experts.{expert}.{module}.lora_A.weight"] = (
+                torch.arange(rank * in_dim, dtype=torch.float32).reshape(rank, in_dim)
+                + offset
+            )
+            offset += 100
+            tensors[f"{prefix}.mlp.experts.{expert}.{module}.lora_B.weight"] = (
+                torch.arange(out_dim * rank, dtype=torch.float32).reshape(out_dim, rank)
+                + offset
+            )
+            offset += 100
+    return tensors
+
+
+def _gpt_oss_gate_up_lora_b_to_vllm(tensor: torch.Tensor) -> torch.Tensor:
+    gate, up = tensor.split(tensor.shape[0] // 2, dim=0)
+    return torch.stack((gate, up), dim=1).flatten(0, 1).contiguous()
+
+
+def _gpt_oss_fused_expert_vllm_tensors(
+    original: dict[str, torch.Tensor],
+    art_prefix: str,
+) -> dict[str, torch.Tensor]:
+    expert_prefix = f"{art_prefix}.mlp.experts"
+    gate_up_a: list[torch.Tensor] = []
+    gate_up_b: list[torch.Tensor] = []
+    down_a: list[torch.Tensor] = []
+    down_b: list[torch.Tensor] = []
+    for expert in range(2):
+        prefix = f"{expert_prefix}.{expert}"
+        gate_up_a.append(original[f"{prefix}.gate_up_proj.lora_A.weight"])
+        gate_up_b.append(
+            _gpt_oss_gate_up_lora_b_to_vllm(
+                original[f"{prefix}.gate_up_proj.lora_B.weight"]
+            )
+        )
         down_a.append(original[f"{prefix}.down_proj.lora_A.weight"])
         down_b.append(original[f"{prefix}.down_proj.lora_B.weight"])
     return {
@@ -640,6 +726,73 @@ def test_qwen35_vllm_config_preserves_shared_expert_targets_when_present():
         adapter_config=vllm_config,
     )
     _assert_tensors_equal(roundtrip, original)
+
+
+def test_gpt_oss_vllm_canonical_roundtrip_and_stock_loader(tmp_path: Path):
+    art_prefix = "base_model.model.model.layers.0"
+    original = _gpt_oss_moe_art_tensors(art_prefix)
+    expected_experts = _gpt_oss_fused_expert_vllm_tensors(original, art_prefix)
+    vllm_tensors, vllm_config = GPT_OSS_MOE_HANDLER.to_vllm_lora_tensors(
+        original,
+        adapter_config=_gpt_oss_config("openai/gpt-oss-20b"),
+    )
+
+    assert vllm_config["target_modules"] == [
+        "q_proj",
+        "k_proj",
+        "v_proj",
+        "o_proj",
+        "experts",
+    ]
+    assert "base_model.model.model.layers.0.attn.q_proj.lora_A.weight" in vllm_tensors
+    assert not any(".self_attn." in key for key in vllm_tensors)
+    assert not any(".mlp.experts.0." in key for key in vllm_tensors)
+    for key, tensor in expected_experts.items():
+        assert torch.equal(vllm_tensors[key], tensor), key
+
+    roundtrip = GPT_OSS_MOE_HANDLER.from_vllm_lora_tensors(
+        vllm_tensors,
+        adapter_config=vllm_config,
+    )
+    _assert_tensors_equal(roundtrip, original)
+
+    adapter_dir = tmp_path / "gpt_oss"
+    _save_adapter(adapter_dir, vllm_tensors, vllm_config)
+    loaded_modules = _assert_stock_vllm_loads(
+        adapter_dir,
+        expected_modules={"q_proj", "experts"},
+    )
+    assert "model.layers.0.attn.q_proj" in loaded_modules
+    assert "model.layers.0.mlp.experts" in loaded_modules
+    assert "model.layers.0.mlp.experts.base_layer" in loaded_modules
+
+
+def test_gpt_oss_expert_lora_is_not_emitted_as_merged_delta() -> None:
+    module_path = VLLM_RUNTIME_SRC / "art_vllm_runtime/lora_delta.py"
+    spec = importlib.util.spec_from_file_location("art_vllm_lora_delta", module_path)
+    assert spec is not None and spec.loader is not None
+    lora_delta = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(lora_delta)
+    original = _gpt_oss_moe_art_tensors("base_model.model.model.layers.0")
+    vllm_tensors, adapter_config = GPT_OSS_MOE_HANDLER.to_vllm_lora_tensors(
+        original,
+        adapter_config=_gpt_oss_config("openai/gpt-oss-20b"),
+    )
+
+    names = [
+        name
+        for name, _tensor in lora_delta._iter_lora_checkpoint_deltas(
+            vllm_tensors,
+            adapter_config=adapter_config,
+            previous_lora_tensors=None,
+        )
+    ]
+
+    assert adapter_config["art_merged_lora_delta_unsupported_target_modules"] == [
+        "experts"
+    ]
+    assert "model.layers.0.attn.q_proj.weight" in names
+    assert not any(".mlp.experts" in name for name in names)
 
 
 def test_qwen35_target_parameter_identity_normalizes_to_fused_vllm_layout(
@@ -1267,6 +1420,90 @@ def test_direct_qwen35_packed_expert_publish_matches_old_vllm_exactly(
         model=cast(Any, [torch.nn.Sequential(gate_up_lora, down_lora)]),
         adapter_model=full,
         handler=QWEN3_5_MOE_HANDLER,
+        adapter_config=dict(adapter_config),
+        output_dir=str(current_dir),
+        rank=0,
+        world_size=1,
+    )
+
+    _assert_tensors_equal(
+        load_file(current_dir / "adapter_model.safetensors"),
+        load_file(old_dir / "adapter_model.safetensors"),
+    )
+    assert (current_dir / "adapter_model.safetensors").read_bytes() == (
+        old_dir / "adapter_model.safetensors"
+    ).read_bytes()
+    assert json.loads((current_dir / "adapter_config.json").read_text()) == json.loads(
+        (old_dir / "adapter_config.json").read_text()
+    )
+
+
+def test_direct_gpt_oss_packed_expert_publish_matches_handler_vllm_exactly(
+    tmp_path: Path,
+    monkeypatch,
+):
+    monkeypatch.setattr(lora_module.ps, "get_expert_model_parallel_rank", lambda: 0)
+    monkeypatch.setattr(lora_module.ps, "get_expert_data_parallel_rank", lambda: 0)
+
+    rank = 2
+    hidden = 3
+    intermediate = 4
+    group_prefix = "base_model.model.model.layers.0.mlp.experts"
+    full = {
+        key: tensor
+        for key, tensor in _gpt_oss_moe_art_tensors(
+            "base_model.model.model.layers.0",
+            rank=rank,
+        ).items()
+        if ".mlp.experts." in key
+    }
+    gate_up_lora = LoRA(
+        adapter_model_prefix=f"{group_prefix}.{{expert}}.gate_up_proj",
+        in_features=hidden,
+        out_features=2 * intermediate,
+        rank=rank,
+        alpha=rank,
+        dtype=torch.float32,
+        device=torch.device("cpu"),
+        num_local_experts=2,
+    )
+    down_lora = LoRA(
+        adapter_model_prefix=f"{group_prefix}.{{expert}}.down_proj",
+        in_features=intermediate,
+        out_features=hidden,
+        rank=rank,
+        alpha=rank,
+        dtype=torch.float32,
+        device=torch.device("cpu"),
+        num_local_experts=2,
+    )
+    for expert in range(2):
+        expert_prefix = f"{group_prefix}.{expert}"
+        gate_up_lora.A_T.data[expert].copy_(
+            full[f"{expert_prefix}.gate_up_proj.lora_A.weight"].T
+        )
+        gate_up_lora.B_T.data[expert].copy_(
+            full[f"{expert_prefix}.gate_up_proj.lora_B.weight"].T
+        )
+        down_lora.A_T.data[expert].copy_(
+            full[f"{expert_prefix}.down_proj.lora_A.weight"].T
+        )
+        down_lora.B_T.data[expert].copy_(
+            full[f"{expert_prefix}.down_proj.lora_B.weight"].T
+        )
+
+    adapter_config = _gpt_oss_config("openai/gpt-oss-20b", rank=rank, alpha=rank)
+    old_dir = tmp_path / "old"
+    current_dir = tmp_path / "current"
+    old_tensors, old_config = GPT_OSS_MOE_HANDLER.to_vllm_lora_tensors(
+        full,
+        adapter_config=dict(adapter_config),
+    )
+    save_vllm_lora_tensors(old_dir, old_tensors, old_config)
+    save_vllm_lora_from_model(
+        model=cast(Any, [torch.nn.Sequential(gate_up_lora, down_lora)]),
+        adapter_model=full,
+        handler=GPT_OSS_MOE_HANDLER,
         adapter_config=dict(adapter_config),
         output_dir=str(current_dir),
         rank=0,

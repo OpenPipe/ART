@@ -178,6 +178,28 @@ def test_pack_carries_routes_through_shared_prefix_splicing() -> None:
     assert stats.shared_prefix_conflict_slots == 4
 
 
+def test_pack_infers_at_least_topk_experts_from_sparse_routes() -> None:
+    result = _tokenized(
+        [10, 20],
+        [[[0, 0, 0, 0]], [[0, 0, 0, 0]]],
+        prompt_id=456,
+        prompt_length=1,
+    )
+
+    packed = packed_tensors_from_tokenized_results(
+        [result],
+        seq_len=4,
+        pad_token_id=0,
+        truncate_long_results=False,
+        include_moe_routing=True,
+    )
+
+    routing_replay = packed["moe_routing_replay"]
+    assert routing_replay is not None
+    assert routing_replay.topk == 4
+    assert routing_replay.num_experts == 4
+
+
 def test_build_replay_bundle_uses_packed_sequence_sample_calls() -> None:
     result = _tokenized(
         [10, 11, 20],

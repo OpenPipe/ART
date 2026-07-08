@@ -447,6 +447,7 @@ async def _direct_vllm_runtime(
     lora_path: str,
     rollout_weights_mode: str,
     engine_args: dict[str, Any],
+    server_args: dict[str, Any] | None = None,
     forward_trace_dir: Path | None = None,
 ) -> AsyncIterator[tuple[str, int]]:
     import art.vllm_runtime as runtime
@@ -461,7 +462,11 @@ async def _direct_vllm_runtime(
         served_model_name=served_model_name,
         rollout_weights_mode=cast(Any, rollout_weights_mode),
         engine_args=engine_args,
-        server_args={"return_tokens_as_token_ids": True, **config.server_args},
+        server_args={
+            "return_tokens_as_token_ids": True,
+            **(server_args or {}),
+            **config.server_args,
+        },
     )
     command = runtime.build_vllm_runtime_server_cmd(launch_config)
     log_path = artifact_dir / f"real_path_vllm_{served_model_name}.log"
@@ -470,6 +475,7 @@ async def _direct_vllm_runtime(
     if forward_trace_dir is not None:
         trace_site = Path(__file__).resolve().parent / "vllm_forward_trace_site"
         env["ART_VLLM_FORWARD_TRACE_DIR"] = str(forward_trace_dir)
+        env["ART_VLLM_FORWARD_TRACE_DETAIL"] = "1"
         env["PYTHONPATH"] = (
             str(trace_site)
             if not env.get("PYTHONPATH")
@@ -595,9 +601,14 @@ async def _score_base_real_generation_path(
 ) -> RealPathBaseDiagnosticBundle:
     import art
     from art.megatron.backend import MegatronBackend
+    from art.megatron.model_support import get_model_support_handler
     from art.preprocessing.pack import packed_tensors_to_dir
 
     parity_config = config.output_parity
+    handler = get_model_support_handler(
+        parity_config.base_model,
+        allow_unvalidated_arch=parity_config.allow_unvalidated_arch,
+    )
     served_name = f"train_inf_real_base_{uuid.uuid4().hex[:8]}"
     placeholder_lora = artifact_dir / "unused_base_lora_placeholder"
     placeholder_lora.mkdir(exist_ok=True)
@@ -608,6 +619,9 @@ async def _score_base_real_generation_path(
         "max_logprobs": TOP_K,
         **parity_config.engine_args,
     }
+    for key, value in handler.vllm_engine_args(rollout_weights_mode="merged").items():
+        engine_args.setdefault(key, value)
+    engine_args.setdefault("generation_config", "vllm")
     engine_args.pop("enable_lora", None)
     engine_args.pop("max_loras", None)
     engine_args.pop("lora_target_modules", None)
@@ -633,6 +647,11 @@ async def _score_base_real_generation_path(
         lora_path=str(placeholder_lora),
         rollout_weights_mode="merged",
         engine_args=engine_args,
+        server_args={
+            "enable_auto_tool_choice": True,
+            "tool_call_parser": "hermes",
+            **handler.vllm_server_args(),
+        },
         forward_trace_dir=vllm_forward_trace_dir,
     ) as (host, port):
         model = art.TrainableModel(
@@ -1044,7 +1063,12 @@ def _score_megatron_runtime(
         if forward_trace_capture is not None and forward_trace_dir is not None:
             trace_dir = Path(forward_trace_dir)
             forward_trace_capture.save_current_step(trace_dir)
-            torch.save(logits.detach().cpu(), trace_dir / "logits.pt")
+            if (
+                not torch.distributed.is_initialized()  # ty: ignore[possibly-missing-attribute]
+                or torch.distributed.get_rank() == 0  # ty: ignore[possibly-missing-attribute]
+            ):
+                trace_dir.mkdir(parents=True, exist_ok=True)
+                torch.save(logits.detach().cpu(), trace_dir / "logits.pt")
     finally:
         if forward_trace_capture is not None:
             forward_trace_capture.close()
@@ -1418,6 +1442,10 @@ async def run_real_path_train_inf_mismatch(
             artifact_dir / "real_path_vllm_lora_scores.json",
             vllm_lora.model_dump(mode="json"),
         )
+        # When debugging a suspected ART/Megatron scoring bug, reuse the saved
+        # vLLM scores, tokens, adapter, and routing replay here and rerun only
+        # the Megatron worker below. That keeps the comparison paired and avoids
+        # rerunning vLLM just to iterate on training-side scoring.
         await backend.close()
         backend_open = False
 

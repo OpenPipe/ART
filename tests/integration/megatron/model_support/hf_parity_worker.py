@@ -64,6 +64,7 @@ _VISUAL_HF_PREFIXES = ("model.visual.", "visual.")
 _HF_MOE_ROUTER_NAME_PATTERN = re.compile(
     r"^(?:"
     r"model\.layers\.(?P<gate_layer>\d+)\.mlp\.gate|"
+    r"model(?:\.language_model)?\.layers\.(?P<mlp_router_layer>\d+)\.mlp\.router|"
     r"model(?:\.language_model)?\.layers\.(?P<router_layer>\d+)\.router"
     r")$"
 )
@@ -98,7 +99,11 @@ def _hf_moe_router_key(module_name: str) -> str | None:
     match = _HF_MOE_ROUTER_NAME_PATTERN.match(module_name)
     if match is None:
         return None
-    layer = match.group("gate_layer") or match.group("router_layer")
+    layer = (
+        match.group("gate_layer")
+        or match.group("mlp_router_layer")
+        or match.group("router_layer")
+    )
     return f"chunk_00.layer_{int(layer):04d}.mlp.router"
 
 

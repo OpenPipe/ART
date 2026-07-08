@@ -1,6 +1,7 @@
 from collections.abc import Mapping
 import copy
 import inspect
+import logging
 import os
 from typing import Any, Literal, cast
 
@@ -27,9 +28,14 @@ install_art_bridge_runtime_patches()
 _NONE_ENV_VALUES = {"", "none", "null", "off", "disable", "disabled"}
 _TRUE_ENV_VALUES = {"1", "true", "yes", "on"}
 _FALSE_ENV_VALUES = {"0", "false", "no", "off"}
+_DEEPEP_ROUTER_PROB_WARNING = (
+    "DeepEP only supports float32 probs, please set --moe-router-dtype=fp32"
+)
+_DEEPEP_TOKEN_DISPATCHER_LOGGER = "megatron.core.transformer.moe.token_dispatcher"
 _RECOMPUTE_GRANULARITIES = {"full", "selective"}
 _RECOMPUTE_METHODS = {"uniform", "block"}
 _FLEX_DISPATCHER_BACKENDS = {"deepep", "hybridep"}
+_MOE_ROUTER_DTYPES = {"fp32", "fp64", "none"}
 _BOOL_ENV_FIELDS = (
     (
         "overlap_moe_expert_parallel_comm",
@@ -75,6 +81,7 @@ _CHOICE_ENV_FIELDS = (
         "ART_MEGATRON_MOE_FLEX_DISPATCHER_BACKEND",
         _FLEX_DISPATCHER_BACKENDS,
     ),
+    ("moe_router_dtype", "ART_MEGATRON_MOE_ROUTER_DTYPE", _MOE_ROUTER_DTYPES),
 )
 
 
@@ -85,6 +92,21 @@ class ProviderBundle(BaseModel):
     bridge: Any
     handler: Any
     spec: ModelSupportSpec
+
+
+class _DeepEpRouterProbWarningFilter(logging.Filter):
+    _art_deepep_router_prob_warning_filter = True
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        return record.getMessage() != _DEEPEP_ROUTER_PROB_WARNING
+
+
+def _install_deepep_router_prob_warning_filter() -> None:
+    logger = logging.getLogger(_DEEPEP_TOKEN_DISPATCHER_LOGGER)
+    for existing in logger.filters:
+        if getattr(existing, "_art_deepep_router_prob_warning_filter", False):
+            return
+    logger.addFilter(_DeepEpRouterProbWarningFilter())
 
 
 def resolve_layer_spec(
@@ -192,6 +214,7 @@ class _ProviderRuntimeEnv(BaseModel):
     recompute_modules: list[str] | None = None
     moe_shared_expert_overlap: bool | None = None
     moe_flex_dispatcher_backend: Literal["deepep", "hybridep"] | None = None
+    moe_router_dtype: Literal["fp32", "fp64"] | None = None
 
     @classmethod
     def from_environ(
@@ -476,6 +499,7 @@ def _apply_runtime_env_overrides(
     _apply_provider_attr_if_set(provider, runtime_env, "recompute_num_layers")
     _apply_provider_attr_if_set(provider, runtime_env, "recompute_modules")
     _apply_provider_attr_if_value(provider, runtime_env, "moe_shared_expert_overlap")
+    _apply_provider_attr_if_set(provider, runtime_env, "moe_router_dtype")
     _enforce_ep_overlap_recompute_contract(provider)
     _normalize_recompute_settings(provider)
 
@@ -513,6 +537,7 @@ def _enforce_ep_overlap_recompute_contract(provider: GPTModelProvider) -> None:
 
 
 def _install_art_training_flex_attention(provider: GPTModelProvider) -> None:
+    _register_art_flex_attention_mapping_types()
     base_layer_spec = provider.transformer_layer_spec
 
     def _flex_attention_layer_spec(
@@ -523,6 +548,13 @@ def _install_art_training_flex_attention(provider: GPTModelProvider) -> None:
         return layer_spec
 
     provider.transformer_layer_spec = cast(Any, _flex_attention_layer_spec)
+
+
+def _register_art_flex_attention_mapping_types() -> None:
+    from megatron.bridge.models.conversion.param_mapping import AutoMapping
+
+    AutoMapping.register_module_type("FlexDotProductAttention", "column")
+    AutoMapping.register_module_type("ArtContextParallelCoreAttention", "column")
 
 
 def _build_provider_bundle(
@@ -542,9 +574,10 @@ def _build_provider_bundle(
         dtype=torch_dtype,
         trust_remote_code=True,
     )
+    provider = bridge.to_megatron_provider()
     handler.patch_bridge(bridge)
     return ProviderBundle(
-        provider=bridge.to_megatron_provider(),
+        provider=provider,
         bridge=bridge,
         handler=handler,
         spec=spec,
@@ -557,6 +590,7 @@ def prepare_provider_bundle(
     torch_dtype: torch.dtype = torch.bfloat16,
     allow_unvalidated_arch: bool = False,
 ) -> ProviderBundle:
+    _install_deepep_router_prob_warning_filter()
     runtime_env = _ProviderRuntimeEnv.from_environ()
     bundle = _build_provider_bundle(
         model,

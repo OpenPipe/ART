@@ -77,6 +77,7 @@ def test_validated_architecture_representative_models_are_fixed() -> None:
         "google/gemma-4-26B-A4B-it",
         "google/gemma-4-31B-it",
         "deepseek-ai/DeepSeek-V4-Flash",
+        "openai/gpt-oss-20b",
     ]
 
 
@@ -204,6 +205,7 @@ def test_build_all_architectures_validation_report_stops_on_failure(
         include_sensitivity=None,
         output_json=None,
         skip_stages=None,
+        only_stage=None,
         stop_on_failure=False,
         allow_unvalidated_arch=False,
     ):
@@ -211,6 +213,7 @@ def test_build_all_architectures_validation_report_stops_on_failure(
         del include_sensitivity
         del output_json
         del skip_stages
+        del only_stage
         del stop_on_failure
         del allow_unvalidated_arch
         calls.append(base_model)
@@ -452,6 +455,46 @@ def test_build_validation_report_populates_architecture_stage(
         "step1_served": True,
     }
     assert native_vllm_lora_stage.artifact_dir == "/tmp/native-vllm-lora"
+
+
+def test_build_validation_report_only_stage_skips_other_stages(monkeypatch) -> None:
+    calls: list[str] = []
+    monkeypatch.setattr(
+        "tests.integration.megatron.model_support.workflow.inspect_architecture",
+        lambda base_model: ArchitectureReport(
+            base_model=base_model,
+            model_key="qwen3_5_moe",
+            handler_key="qwen3_5_moe",
+            layer_families=[],
+            recommended_min_layers=1,
+        ),
+    )
+    monkeypatch.setattr(
+        "tests.integration.megatron.model_support.workflow.detect_dependency_versions",
+        lambda: {},
+    )
+
+    def _run_stage_in_subprocess(**kwargs) -> ValidationStageResult:
+        stage_name = kwargs["stage_name"]
+        calls.append(stage_name)
+        return ValidationStageResult(name=stage_name, passed=True)
+
+    monkeypatch.setattr(
+        "tests.integration.megatron.model_support.workflow._run_stage_in_subprocess",
+        _run_stage_in_subprocess,
+    )
+
+    report = build_validation_report(
+        base_model="Qwen/Qwen3.5-35B-A3B",
+        only_stage="length_trainability",
+    )
+
+    skipped = next(stage for stage in report.stages if stage.name == "hf_parity")
+    assert calls == ["length_trainability"]
+    assert skipped.metrics == {
+        "skipped": True,
+        "reason": "--only-stage=length_trainability",
+    }
 
 
 def test_build_validation_report_captures_hf_parity_failure(monkeypatch) -> None:

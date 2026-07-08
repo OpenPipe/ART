@@ -28,8 +28,11 @@ CAPTURE_NAME_TOKENS = (
     ".self_attention.linear_qkv.q_proj_lora",
     ".self_attention.linear_qkv.k_proj_lora",
     ".self_attention.linear_qkv.v_proj_lora",
+    ".self_attention.core_attention",
     ".self_attention.linear_proj",
     ".self_attention.linear_proj.lora",
+    ".pre_mlp_layernorm",
+    ".mlp",
     ".mlp.router",
     ".mlp.experts.linear_fc1",
     ".mlp.experts.linear_fc1.gate_lora",
@@ -44,7 +47,14 @@ CAPTURE_NAME_TOKENS = (
     ".mlp.linear_fc2.row_parallel_lora.lora",
 )
 ROUTER_NAME_TOKEN = ".mlp.router"
+CORE_ATTENTION_NAME_TOKEN = ".self_attention.core_attention"
 PRIMARY_OUTPUT_CANONICAL_KEY = "primary_output__is_canonical"
+CAPTURE_INPUT_NAME_TOKENS = (
+    ".self_attention.linear_qkv",
+    ".self_attention.linear_qkv.q_proj_lora",
+    ".self_attention.linear_qkv.k_proj_lora",
+    ".self_attention.linear_qkv.v_proj_lora",
+)
 
 
 def _module_layer_index(module_name: str) -> int | None:
@@ -256,6 +266,23 @@ def _extract_router_output(output: Any) -> dict[str, torch.Tensor] | None:
     }
 
 
+def _extract_core_attention_inputs(inputs: Any) -> dict[str, torch.Tensor] | None:
+    if not isinstance(inputs, tuple) or len(inputs) < 3:
+        return None
+    query, key, value = inputs[:3]
+    if not (
+        isinstance(query, torch.Tensor)
+        and isinstance(key, torch.Tensor)
+        and isinstance(value, torch.Tensor)
+    ):
+        return None
+    return {
+        "core_attention_query": _materialize_tensor(query),
+        "core_attention_key": _materialize_tensor(key),
+        "core_attention_value": _materialize_tensor(value),
+    }
+
+
 class ForwardTraceCapture:
     def __init__(
         self,
@@ -346,10 +373,12 @@ class ForwardTraceCapture:
         module_by_name: dict[str, Any],
     ) -> dict[str, Any]:
         if module_name.endswith(".self_attention.in_proj"):
-            return {"component_sizes": cls._gdn_in_proj_component_sizes(module)}
+            sizes = cls._gdn_in_proj_component_sizes(module)
+            return {"component_sizes": sizes} if sizes is not None else {}
         if module_name.endswith(".self_attention.in_proj.in_proj"):
             parent_module = module_by_name[module_name.rsplit(".", 1)[0]]
-            return {"component_sizes": cls._gdn_in_proj_component_sizes(parent_module)}
+            sizes = cls._gdn_in_proj_component_sizes(parent_module)
+            return {"component_sizes": sizes} if sizes is not None else {}
         if module_name.endswith(".self_attention.out_norm"):
             gdn_module = module_by_name[module_name.removesuffix(".out_norm")]
             return {
@@ -358,7 +387,9 @@ class ForwardTraceCapture:
         return {}
 
     @staticmethod
-    def _gdn_in_proj_component_sizes(module: Any) -> tuple[int, ...]:
+    def _gdn_in_proj_component_sizes(module: Any) -> tuple[int, ...] | None:
+        if not hasattr(module, "qkv_lora") or not hasattr(module, "z_lora"):
+            return None
         qkv_sizes = tuple(
             int(size)
             for size in getattr(module.qkv_lora.B_T, "lora_tp_component_sizes")
@@ -483,6 +514,8 @@ class ForwardTraceCapture:
 
         if ".self_attention.linear_qkv" in name:
             return {"op": "concat", "dim": -1}
+        if ".self_attention.core_attention" in name:
+            return {"op": "concat", "dim": -1}
         if name.endswith(".self_attention.in_proj"):
             return {"op": "concat", "dim": -1}
         if name.endswith(
@@ -535,6 +568,11 @@ class ForwardTraceCapture:
             hints["output"] = concat_dim0
             hints["router_topk_ids"] = concat_dim0
             hints["router_topk_scores"] = concat_dim0
+        if CORE_ATTENTION_NAME_TOKEN in name:
+            concat_heads = {"op": "concat", "dim": 2}
+            hints["core_attention_query"] = concat_heads
+            hints["core_attention_key"] = concat_heads
+            hints["core_attention_value"] = concat_heads
         return hints
 
     def _make_hook(self, name: str, module: Any):
@@ -555,6 +593,14 @@ class ForwardTraceCapture:
                 # previously perturbed correctness in the real training forward.
                 "primary_output": self.guess_primary_tensor(output),
             }
+            if os.environ.get(
+                "ART_MEGATRON_FORWARD_TRACE_CAPTURE_INPUTS"
+            ) == "1" and any(
+                name.endswith(token) for token in CAPTURE_INPUT_NAME_TOKENS
+            ):
+                primary_input = self.guess_primary_tensor(inputs)
+                if primary_input is not None:
+                    trace_item["primary_input"] = primary_input
             if ROUTER_NAME_TOKEN in name:
                 router_output = _extract_router_output(output)
                 if router_output is not None:
@@ -570,6 +616,10 @@ class ForwardTraceCapture:
                     topk_ids, topk_scores = router_topk
                     trace_item["router_topk_ids"] = topk_ids
                     trace_item["router_topk_scores"] = topk_scores
+            if CORE_ATTENTION_NAME_TOKEN in name:
+                core_inputs = _extract_core_attention_inputs(inputs)
+                if core_inputs is not None:
+                    trace_item.update(core_inputs)
             primary_output = trace_item.get("primary_output")
             primary_row_count = (
                 int(primary_output.shape[0])
