@@ -23,8 +23,6 @@ T = cast(Any, _T)
 
 @tilelang.jit(out_idx=[-1])
 def preprocess(
-    B,
-    S,
     H,
     D,
     block_ND=32,
@@ -34,6 +32,8 @@ def preprocess(
 ):
     assert dtype == T.bfloat16
     assert accum_dtype == T.float32
+    B = T.dynamic("batch")
+    S = T.dynamic("seq_len")
     shape = [B, S, H, D]
 
     @T.prim_func
@@ -77,8 +77,6 @@ def preprocess(
 
 @tilelang.jit(out_idx=[-1])
 def postprocess(
-    B,
-    S_kv,
     D,
     block_N=64,
     threads=128,
@@ -87,6 +85,8 @@ def postprocess(
 ):
     assert dtype == T.bfloat16
     assert accum_dtype == T.float32
+    B = T.dynamic("batch")
+    S_kv = T.dynamic("seq_len_kv")
     dkv_shape = [B, S_kv, D]
 
     @T.prim_func
@@ -112,9 +112,6 @@ def postprocess(
     },
 )
 def bwd(
-    B,
-    S,
-    S_kv,
     H,
     D,
     topk,
@@ -131,6 +128,9 @@ def bwd(
     )
     assert dtype == T.bfloat16
     assert accum_dtype == T.float32
+    B = T.dynamic("batch")
+    S = T.dynamic("seq_len")
+    S_kv = T.dynamic("seq_len_kv")
 
     if sm_scale is None:
         sm_scale = D ** (-0.5)
@@ -356,17 +356,16 @@ def sparse_mqa_bwd_interface(q, kv, attn_sink, o, do, topk_idxs, lse, sm_scale=N
         topk = padded_topk
 
     with preserve_tilelang_env():
-        preprocess_kernel = preprocess(B, S, H, D, dtype=dtype)
-        postprocess_kernel = postprocess(B, S_kv, D, dtype=dtype)
+        # Keep sequence lengths dynamic so changing packed workloads reuse the
+        # same generated kernels.  Model/tile dimensions remain static.
+        preprocess_kernel = preprocess(H, D, dtype=dtype)
+        postprocess_kernel = postprocess(D, dtype=dtype)
         delta = preprocess_kernel(o, do)
     dkv = torch.zeros_like(kv, dtype=torch.float32)
     d_attn_sink = torch.zeros_like(attn_sink)
     if topk <= block_size:
         with preserve_tilelang_env():
             bwd_kernel = bwd(
-                B,
-                S,
-                S_kv,
                 H,
                 D,
                 topk,
@@ -382,9 +381,6 @@ def sparse_mqa_bwd_interface(q, kv, attn_sink, o, do, topk_idxs, lse, sm_scale=N
         chunk_count = topk // block_size
         with preserve_tilelang_env():
             bwd_kernel = bwd(
-                B,
-                S,
-                S_kv,
                 H,
                 D,
                 block_size,
