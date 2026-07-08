@@ -193,6 +193,43 @@ def test_production_compiled_flex_default_stays_flash() -> None:
     assert compiled_flex_attention._FORCED_FLEX_KERNEL_OPTIONS == {"BACKEND": "FLASH"}
 
 
+def test_sm90_block_sparse_dq_postprocess_atom_layout_keeps_wgmma_m64() -> None:
+    from art.megatron.flex_attn.flash_dlse_patch import (
+        _sm90_block_sparse_dq_postprocess_atom_layout,
+    )
+
+    assert (
+        _sm90_block_sparse_dq_postprocess_atom_layout(
+            arch=90,
+            hdim=64,
+            block_size=64,
+            atom_layout=2,
+            swap_ab=False,
+        )
+        == 1
+    )
+    assert (
+        _sm90_block_sparse_dq_postprocess_atom_layout(
+            arch=90,
+            hdim=64,
+            block_size=128,
+            atom_layout=2,
+            swap_ab=False,
+        )
+        == 2
+    )
+    assert (
+        _sm90_block_sparse_dq_postprocess_atom_layout(
+            arch=90,
+            hdim=128,
+            block_size=64,
+            atom_layout=1,
+            swap_ab=False,
+        )
+        == 1
+    )
+
+
 def test_forward_trace_reads_row_uids_from_output_tensor() -> None:
     output = torch.zeros((2, 1), dtype=torch.float32)
     setattr(output, "_art_trace_row_token_uids", torch.tensor([4, 7]))
@@ -221,6 +258,65 @@ def test_forward_trace_prefers_local_tensor_uids_over_module_fallback() -> None:
 
     assert row_uids is not None
     assert torch.equal(row_uids, torch.tensor([4, 7]))
+
+
+def test_forward_trace_capture_prefers_dense_module_uids_for_sequence_modules() -> None:
+    module = type("ModuleWithDenseTraceUids", (), {})()
+    output = torch.zeros((2, 1), dtype=torch.float32)
+    setattr(module, "_art_trace_row_token_uids", torch.tensor([10, 11]))
+    setattr(output, "_art_trace_row_token_uids", torch.tensor([4, 7]))
+
+    row_uids, _uid_span = ForwardTraceCapture._row_token_uids_for_capture(
+        module_name="chunk0.module.decoder.layers.0.self_attention",
+        inputs=(),
+        output=output,
+        module=module,
+        row_count=2,
+    )
+
+    assert row_uids is not None
+    assert torch.equal(row_uids, torch.tensor([10, 11]))
+
+
+def test_forward_trace_capture_keeps_expert_uid_span_for_expert_modules() -> None:
+    module = type("ModuleWithDenseTraceUids", (), {})()
+    output = torch.zeros((2, 1), dtype=torch.float32)
+    setattr(module, "_art_trace_row_token_uids", torch.tensor([10, 11]))
+    setattr(output, "_art_trace_row_token_uids", torch.tensor([4, 7]))
+    setattr(output, "_art_trace_uid_span", 16)
+
+    row_uids, uid_span = ForwardTraceCapture._row_token_uids_for_capture(
+        module_name="chunk0.module.decoder.layers.0.mlp.experts.linear_fc1",
+        inputs=(),
+        output=output,
+        module=module,
+        row_count=2,
+    )
+
+    assert uid_span == 16
+    assert row_uids is not None
+    assert torch.equal(row_uids, torch.tensor([4, 7]))
+
+
+def test_forward_trace_restores_dense_non_cp_sequence_uids_before_sorting() -> None:
+    trace: dict[str, list[dict[str, Any]]] = {
+        "chunk0.module.decoder.layers.0.self_attention": [
+            {
+                "primary_output": torch.tensor([[1.0], [2.0], [3.0]]),
+                "row_token_uids": torch.tensor([10, 30, 20]),
+                "rank_meta": [
+                    {"cp_world_size": 1, "tp_rank": 0},
+                    {"cp_world_size": 1, "tp_rank": 1},
+                ],
+            }
+        ]
+    }
+
+    ForwardTraceCapture.canonicalize_trace(trace)
+
+    call = trace["chunk0.module.decoder.layers.0.self_attention"][0]
+    assert torch.equal(call["row_token_uids"], torch.tensor([0, 1, 2]))
+    assert torch.equal(call["primary_output"], torch.tensor([[1.0], [2.0], [3.0]]))
 
 
 def test_forward_trace_extracts_empty_router_topk_with_config_hint() -> None:
@@ -365,6 +461,44 @@ def test_forward_trace_drops_exact_zero_padding_rows() -> None:
     assert torch.equal(
         call["output"]["hidden"],
         torch.tensor([[1.0, 1.1], [2.0, 2.1], [3.0, 3.1]]),
+    )
+
+
+def test_forward_trace_canonicalizes_router_outputs_without_output_attrs() -> None:
+    module = type("RouterWithDenseTraceUids", (), {})()
+    probs = torch.tensor([[3.0], [1.0], [2.0]])
+    routing_map = torch.tensor([[True], [False], [True]])
+    setattr(module, "_art_trace_row_token_uids", torch.tensor([3, 1, 2]))
+
+    row_uids, _uid_span = ForwardTraceCapture._row_token_uids_for_capture(
+        module_name="chunk0.module.decoder.layers.0.mlp.router",
+        inputs=(),
+        output=(probs, routing_map),
+        module=module,
+        row_count=3,
+    )
+    assert row_uids is not None
+
+    trace: dict[str, list[dict[str, Any]]] = {
+        "chunk0.module.decoder.layers.0.mlp.router": [
+            {
+                "primary_output": probs,
+                "router_topk_scores": probs,
+                "router_topk_ids": torch.tensor([[3], [1], [2]]),
+                "output": {"probs": probs, "routing_map": routing_map},
+                "row_token_uids": row_uids,
+            }
+        ]
+    }
+
+    ForwardTraceCapture.canonicalize_trace(trace)
+
+    call = trace["chunk0.module.decoder.layers.0.mlp.router"][0]
+    assert torch.equal(call["row_token_uids"], torch.tensor([1, 2, 3]))
+    assert torch.equal(call["output"]["probs"], torch.tensor([[1.0], [2.0], [3.0]]))
+    assert torch.equal(
+        call["output"]["routing_map"],
+        torch.tensor([[False], [True], [True]]),
     )
 
 

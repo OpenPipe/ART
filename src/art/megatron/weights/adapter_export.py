@@ -170,15 +170,19 @@ def _set_expert_adapter_weights(
 def _set_lora_weights(
     out: dict[str, list[Any]],
     base_prefix: str,
-    *items: tuple[LoRA, str | None],
+    *items: tuple[LoRA | None, str | None],
 ) -> None:
+    weights = [
+        _simple_adapter_weight(base_prefix, lora, adapter_key=adapter_key)
+        for lora, adapter_key in items
+        if lora is not None
+    ]
+    if not weights:
+        return
     _set_adapter_weights(
         out,
         base_prefix,
-        *(
-            _simple_adapter_weight(base_prefix, lora, adapter_key=adapter_key)
-            for lora, adapter_key in items
-        ),
+        *weights,
     )
 
 

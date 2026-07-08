@@ -35,6 +35,11 @@ on:
         required: true
         default: true
         type: boolean
+      prewarm_infras:
+        description: "Space/comma-separated Kubernetes-backed infra targets to prewarm"
+        required: true
+        default: "k8s/cks-wb3 k8s/ext-collab2 k8s/serverless-training-central"
+        type: string
       prewarm_timeout:
         description: "Timeout for GPU node prewarm rollout"
         required: true
@@ -56,8 +61,8 @@ permissions:
   packages: write
 
 concurrency:
-  group: build-gpu-image-cks-wb3
-  cancel-in-progress: false
+  group: build-gpu-image
+  cancel-in-progress: true
 
 jobs:
   build-gpu-image:
@@ -66,6 +71,7 @@ jobs:
 
     env:
       SKY_INFRA: k8s/cks-wb3
+      PREWARM_INFRAS: ${{ inputs.prewarm_infras || 'k8s/cks-wb3 k8s/ext-collab2 k8s/serverless-training-central' }}
 
     steps:
       - uses: actions/checkout@v4
@@ -85,12 +91,13 @@ jobs:
           sudo install -m 0755 kubectl /usr/local/bin/kubectl
           kubectl version --client=true
 
-      - name: Configure cks-wb3 kubeconfig
+      - name: Configure Kubernetes kubeconfig
         env:
-          CKS_WB3_KUBECONFIG: ${{ secrets.CKS_WB3_KUBECONFIG }}
+          GPU_IMAGE_KUBECONFIG: ${{ secrets.GPU_IMAGE_KUBECONFIG || secrets.CKS_WB3_KUBECONFIG }}
         run: |
-          if [ -z "${CKS_WB3_KUBECONFIG}" ]; then
-            echo "::error::Missing required CKS_WB3_KUBECONFIG secret."
+          set -euo pipefail
+          if [ -z "${GPU_IMAGE_KUBECONFIG}" ]; then
+            echo "::error::Missing required GPU_IMAGE_KUBECONFIG secret."
             exit 1
           fi
 
@@ -102,7 +109,7 @@ jobs:
           import os
           from pathlib import Path
 
-          value = os.environ["CKS_WB3_KUBECONFIG"].encode()
+          value = os.environ["GPU_IMAGE_KUBECONFIG"].encode()
           compact_value = b"".join(value.split())
           try:
               decoded = base64.b64decode(compact_value, validate=True)
@@ -113,7 +120,22 @@ jobs:
           Path(os.environ["KUBECONFIG_PATH"]).write_bytes(data)
           PY
           chmod 600 "${KUBECONFIG_PATH}"
-          kubectl --context cks-wb3 get nodes >/dev/null
+
+          for infra in ${SKY_INFRA} ${PREWARM_INFRAS}; do
+            case "${infra}" in
+              k8s/*)
+                context="${infra#k8s/}"
+                ;;
+              kubernetes/*)
+                context="${infra#kubernetes/}"
+                ;;
+              *)
+                echo "::error::Unsupported Kubernetes infra ${infra}"
+                exit 1
+                ;;
+            esac
+            kubectl --context "${context}" get nodes >/dev/null
+          done
 
       - name: Configure registry auth
         env:
@@ -248,3 +270,25 @@ jobs:
           kubectl --context cks-wb3 get pods -n default \
             -l "skypilot-cluster=${cluster}" \
             -o jsonpath='{range .items[*]}{.metadata.name} {.spec.containers[0].image}{"\n"}{end}'
+
+      - name: Dispatch Caladan GPU image build
+        if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+        env:
+          CALADAN_REPOSITORY_DISPATCH_TOKEN: ${{ secrets.CALADAN_REPOSITORY_DISPATCH_TOKEN }}
+          ART_IMAGE_REPO: ${{ inputs.pull_image_repo || 'docker.io/bradhiltonnw/art-gpu' }}
+          IMAGE_TAG: ${{ inputs.tag || 'latest' }}
+        run: |
+          if [ -z "${CALADAN_REPOSITORY_DISPATCH_TOKEN}" ]; then
+            echo "::error::Missing required CALADAN_REPOSITORY_DISPATCH_TOKEN secret."
+            exit 1
+          fi
+
+          payload="$(python3 -c 'import json, os; image_repo = os.environ["ART_IMAGE_REPO"]; image_tag = os.environ["IMAGE_TAG"]; print(json.dumps({"event_type": "art-gpu-image-built", "client_payload": {"art_sha": os.environ["GITHUB_SHA"], "art_ref": os.environ["GITHUB_REF_NAME"], "art_image": f"{image_repo}:{image_tag}", "art_image_repo": image_repo, "art_image_tag": image_tag, "prewarm_infras": os.environ["PREWARM_INFRAS"]}}))')"
+
+          curl -fsSL \
+            -X POST \
+            -H "Accept: application/vnd.github+json" \
+            -H "Authorization: Bearer ${CALADAN_REPOSITORY_DISPATCH_TOKEN}" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            "https://api.github.com/repos/${GITHUB_REPOSITORY_OWNER}/caladan/dispatches" \
+            -d "${payload}"

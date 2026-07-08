@@ -13,7 +13,7 @@ from art.megatron.context_parallel.block_mask import (
 )
 from art.megatron.context_parallel.builder import (
     build_dense_reference_mask,
-    build_shared_prefix_attention_spec,
+    build_prefix_tree_attention_spec,
 )
 from art.megatron.context_parallel.runtime import get_or_build_runtime_plan
 from art.megatron.context_parallel.types import (
@@ -25,8 +25,8 @@ from art.megatron.context_parallel.types import (
     ParallelTopology,
     TokenRange,
 )
-from art.megatron.shared_prefix_packing import SharedPrefixPack, prefix_tree_pack
-from art.megatron.shared_prefix_state import create_shared_prefix_state
+from art.megatron.prefix_tree_packing import PrefixTreePack, prefix_tree_pack
+from art.megatron.prefix_tree_state import create_prefix_tree_state
 
 
 def build_block_mask(
@@ -50,10 +50,10 @@ def build_block_mask(
     )
 
 
-def test_shared_prefix_attention_spec_supports_branching_completions() -> None:
+def test_prefix_tree_attention_spec_supports_branching_completions() -> None:
     group_ids, parent_ids = _branching_prefix_inputs()
 
-    spec = build_shared_prefix_attention_spec(
+    spec = build_prefix_tree_attention_spec(
         group_ids=group_ids,
         parent_ids=parent_ids,
     )
@@ -70,10 +70,10 @@ def test_shared_prefix_attention_spec_supports_branching_completions() -> None:
     ]
 
 
-def test_shared_prefix_attention_spec_matches_tree_reference() -> None:
+def test_prefix_tree_attention_spec_matches_tree_reference() -> None:
     group_ids, parent_ids = _branching_prefix_inputs()
 
-    spec = build_shared_prefix_attention_spec(
+    spec = build_prefix_tree_attention_spec(
         group_ids=group_ids,
         parent_ids=parent_ids,
     )
@@ -82,9 +82,9 @@ def test_shared_prefix_attention_spec_matches_tree_reference() -> None:
     assert dense.equal(_reference_tree_mask(group_ids[0], parent_ids[0]))
 
 
-def test_shared_prefix_can_build_context_parallel_layout() -> None:
+def test_prefix_tree_can_build_context_parallel_layout() -> None:
     group_ids, parent_ids = _branching_prefix_inputs()
-    spec = build_shared_prefix_attention_spec(
+    spec = build_prefix_tree_attention_spec(
         group_ids=group_ids,
         parent_ids=parent_ids,
     )
@@ -103,7 +103,7 @@ def test_shared_prefix_can_build_context_parallel_layout() -> None:
 
 def test_sparse_block_mask_exact_predicate_matches_dense_reference() -> None:
     group_ids, parent_ids = _branching_prefix_inputs()
-    spec = build_shared_prefix_attention_spec(
+    spec = build_prefix_tree_attention_spec(
         group_ids=group_ids,
         parent_ids=parent_ids,
     )
@@ -180,10 +180,10 @@ def test_sparse_block_mask_exact_predicate_matches_dense_reference() -> None:
 )
 def test_sparse_block_mask_matches_torch_block_metadata(
     name: str,
-    pack: SharedPrefixPack,
+    pack: PrefixTreePack,
 ) -> None:
     del name
-    spec = build_shared_prefix_attention_spec(
+    spec = build_prefix_tree_attention_spec(
         group_ids=pack.group_ids,
         parent_ids=pack.parent_ids,
     )
@@ -244,7 +244,7 @@ def test_sparse_block_mask_prunes_exact_blocks_rejected_by_group_tree() -> None:
     _assert_matches_torch_block_mask(block_mask)
 
 
-def test_shared_prefix_state_builds_batched_block_mask() -> None:
+def test_prefix_tree_state_builds_batched_block_mask() -> None:
     group_ids = torch.tensor(
         [
             [1, 1, 2, 2, -1],
@@ -260,7 +260,7 @@ def test_shared_prefix_state_builds_batched_block_mask() -> None:
         dtype=torch.long,
     )
 
-    state = create_shared_prefix_state(
+    state = create_prefix_tree_state(
         group_ids=group_ids,
         parent_ids=parent_ids,
         target_device=torch.device("cpu"),
@@ -275,7 +275,7 @@ def test_shared_prefix_state_builds_batched_block_mask() -> None:
         query_idx,
         kv_idx,
     )
-    spec = build_shared_prefix_attention_spec(
+    spec = build_prefix_tree_attention_spec(
         group_ids=group_ids,
         parent_ids=parent_ids,
     )
@@ -360,11 +360,11 @@ def test_context_parallel_stage_masks_match_dense_nested_tree() -> None:
 
 
 def _assert_context_parallel_stage_masks_match_dense(
-    pack: SharedPrefixPack,
+    pack: PrefixTreePack,
     *,
     require_remote_stage: bool,
 ) -> None:
-    spec = build_shared_prefix_attention_spec(
+    spec = build_prefix_tree_attention_spec(
         group_ids=pack.group_ids,
         parent_ids=pack.parent_ids,
     )

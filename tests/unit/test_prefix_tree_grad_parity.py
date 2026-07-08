@@ -7,7 +7,7 @@ import torch
 from torch import nn
 import torch.nn.functional as F
 
-from art.megatron.shared_prefix_packing import SharedPrefixPack, prefix_tree_pack
+from art.megatron.prefix_tree_packing import PrefixTreePack, prefix_tree_pack
 
 
 class _ToyCausalLM(nn.Module):
@@ -31,7 +31,7 @@ class _ToyCausalLM(nn.Module):
 
 @pytest.mark.parametrize("max_depth", (1, 2, 3))
 @pytest.mark.parametrize("multi_target", (False, True))
-def test_shared_prefix_ce_parameter_grads_match_independent_sequences(
+def test_prefix_tree_ce_parameter_grads_match_independent_sequences(
     *,
     max_depth: int,
     multi_target: bool,
@@ -159,7 +159,7 @@ def _sequence_ce_loss(
 
 def _packed_ce_loss(
     model: _ToyCausalLM,
-    pack: SharedPrefixPack,
+    pack: PrefixTreePack,
     target_ids: tuple[torch.Tensor, ...],
 ) -> torch.Tensor:
     logits = _packed_logits(model, pack)
@@ -176,7 +176,7 @@ def _packed_ce_loss(
 
 def _packed_sequence_ce_loss(
     model: _ToyCausalLM,
-    pack: SharedPrefixPack,
+    pack: PrefixTreePack,
     target_ids: tuple[torch.Tensor, ...],
     sequence_index: int,
 ) -> torch.Tensor:
@@ -189,11 +189,11 @@ def _packed_sequence_ce_loss(
     )
 
 
-def _packed_logits(model: _ToyCausalLM, pack: SharedPrefixPack) -> torch.Tensor:
+def _packed_logits(model: _ToyCausalLM, pack: PrefixTreePack) -> torch.Tensor:
     return model(
         pack.tokens.reshape(-1),
         pack.position_ids.reshape(-1),
-        _shared_prefix_causal_mask(pack),
+        _prefix_tree_causal_mask(pack),
     )
 
 
@@ -209,13 +209,13 @@ def _target_ce_loss(logits: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
     )
 
 
-def _mutated_pack(pack: SharedPrefixPack, *, keep: torch.Tensor) -> SharedPrefixPack:
+def _mutated_pack(pack: PrefixTreePack, *, keep: torch.Tensor) -> PrefixTreePack:
     tokens = pack.tokens.clone()
     mutate = torch.ones(int(tokens.shape[1]), dtype=torch.bool)
     mutate[keep] = False
     replacement = torch.arange(int(tokens.shape[1]), dtype=tokens.dtype) + 17
     tokens[0, mutate] = replacement[mutate] % 31
-    return SharedPrefixPack(
+    return PrefixTreePack(
         tokens=tokens,
         group_ids=pack.group_ids,
         parent_ids=pack.parent_ids,
@@ -241,7 +241,7 @@ def _assert_matching_grads(actual_model: nn.Module, expected_model: nn.Module) -
         )
 
 
-def _shared_prefix_causal_mask(pack: SharedPrefixPack) -> torch.Tensor:
+def _prefix_tree_causal_mask(pack: PrefixTreePack) -> torch.Tensor:
     group_ids = pack.group_ids.reshape(-1).tolist()
     parent_ids = pack.parent_ids.reshape(-1).tolist()
     position_ids = pack.position_ids.reshape(-1).tolist()
@@ -272,7 +272,7 @@ def _ancestor_groups(group_id: int, parent_by_group: dict[int, int]) -> set[int]
     parent_id = parent_by_group[group_id]
     while parent_id != group_id:
         if parent_id in ancestors:
-            raise AssertionError("shared-prefix group parents contain a cycle")
+            raise AssertionError("prefix-tree group parents contain a cycle")
         ancestors.add(parent_id)
         group_id = parent_id
         parent_id = parent_by_group[group_id]

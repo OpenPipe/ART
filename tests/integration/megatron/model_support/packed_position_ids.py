@@ -16,8 +16,8 @@ import torch
 
 from art.megatron import train as megatron_train
 from art.megatron.model_support.discovery import inspect_architecture
-from art.megatron.shared_prefix_state import create_shared_prefix_state
-from art.megatron.shared_prefix_tree import parse_shared_prefix_row
+from art.megatron.prefix_tree import parse_prefix_tree_row
+from art.megatron.prefix_tree_state import create_prefix_tree_state
 
 from ..artifacts import GitRepoState, pinned_git_state
 from .oracle_harness import (
@@ -39,7 +39,7 @@ from .prefix_tree_workloads import build_complex_prefix_tree_packed_tensors
 
 # Qwen3.5/3.6 hybrid MoE runs show small shape-dependent logit drift between
 # the single packed forward and many shorter reference forwards, even when the
-# rotary grouping and shared-prefix semantics are correct. Keep the bound tight,
+# rotary grouping and prefix-tree semantics are correct. Keep the bound tight,
 # but above the observed ~0.13% truncate-case jitter.
 _LOGITS_MEAN_ABS_PCT_LIMIT = 0.2
 _DEBUG_ENV = "ART_PACKED_POSITION_IDS_DEBUG"
@@ -54,6 +54,8 @@ _SINGLE_ROTARY_OUTPUT_HANDLER_KEYS = frozenset(
         "qwen3_moe",
         "qwen3_5_dense",
         "qwen3_5_moe",
+        "dsv4",
+        "gpt_oss_moe",
     }
 )
 _TUPLE_ROTARY_OUTPUT_HANDLER_KEYS = frozenset({"gemma4_dense", "gemma4_moe"})
@@ -294,7 +296,7 @@ def _prefix_tree_leaf_paths(
     *,
     required_leaf_count: int = 2,
 ) -> list[tuple[tuple[tuple[int, int], ...], tuple[int, int]]]:
-    tree = parse_shared_prefix_row(group_ids=group_ids, parent_ids=parent_ids)
+    tree = parse_prefix_tree_row(group_ids=group_ids, parent_ids=parent_ids)
     segment_by_group = {segment.group_id: segment for segment in tree.segments}
     child_count_by_group: dict[int, int] = {}
     for segment in tree.segments:
@@ -381,7 +383,7 @@ def _logits_equivalence_check(
             continue
         row_input_ids = input_ids[row_index : row_index + 1]
         row_position_ids = position_ids[row_index : row_index + 1]
-        packed_bias = create_shared_prefix_state(
+        packed_bias = create_prefix_tree_state(
             group_ids=row_group_ids,
             parent_ids=row_parent_ids,
             input_pos=row_position_ids,
@@ -389,6 +391,7 @@ def _logits_equivalence_check(
             build_gdn_execution_spec=bool(
                 getattr(handler, "build_gdn_execution_spec", False)
             ),
+            model_support_handler=handler,
             attention_head_dim=getattr(provider, "kv_channels", None),
             attention_value_head_dim=getattr(provider, "kv_channels", None),
         )
@@ -425,7 +428,7 @@ def _logits_equivalence_check(
             )
             reference_group_ids = torch.zeros_like(reference_input_ids)
             reference_parent_ids = torch.zeros_like(reference_input_ids)
-            reference_bias = create_shared_prefix_state(
+            reference_bias = create_prefix_tree_state(
                 group_ids=reference_group_ids,
                 parent_ids=reference_parent_ids,
                 input_pos=reference_position_ids,
@@ -433,6 +436,7 @@ def _logits_equivalence_check(
                 build_gdn_execution_spec=bool(
                     getattr(handler, "build_gdn_execution_spec", False)
                 ),
+                model_support_handler=handler,
                 attention_head_dim=getattr(provider, "kv_channels", None),
                 attention_value_head_dim=getattr(provider, "kv_channels", None),
             )

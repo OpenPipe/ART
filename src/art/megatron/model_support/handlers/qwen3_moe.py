@@ -35,6 +35,9 @@ class Qwen3MoeHandler(DefaultMoeHandler):
     ) -> tuple[dict[str, torch.Tensor], dict[str, Any]]:
         return _to_vllm_lora_tensors(tensors, adapter_config=adapter_config)
 
+    def to_vllm_lora_config(self, adapter_config: dict[str, Any]) -> dict[str, Any]:
+        return _qwen3_moe_config(adapter_config)
+
     def install_preprocess_patch(self, model_chunks: Sequence[Any]) -> None:
         install_qwen3_text_preprocess_patch(model_chunks)
 

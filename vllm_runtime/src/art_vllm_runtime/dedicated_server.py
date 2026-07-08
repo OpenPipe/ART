@@ -15,7 +15,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--port", type=int, required=True)
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--cuda-visible-devices", required=True)
-    parser.add_argument("--lora-path", required=True, help="Initial checkpoint path")
+    parser.add_argument("--lora-path", help="Optional initial checkpoint path")
     parser.add_argument("--served-model-name", required=True)
     parser.add_argument(
         "--rollout-weights-mode",
@@ -139,6 +139,8 @@ def _append_cli_arg(vllm_args: list[str], key: str, value: object) -> None:
 
 def main(argv: list[str] | None = None) -> None:
     args = parse_args(argv)
+    if args.rollout_weights_mode == "merged" and not args.lora_path:
+        raise SystemExit("--lora-path is required for merged rollout weights")
     engine_args = json.loads(args.engine_args_json)
     server_args = json.loads(args.server_args_json)
 
@@ -164,12 +166,11 @@ def main(argv: list[str] | None = None) -> None:
         f"--served-model-name={args.served_model_name}",
     ]
     if args.rollout_weights_mode == "lora":
-        vllm_args.extend(
-            [
-                "--enable-lora",
-                f"--lora-modules={args.served_model_name}={args.lora_path}",
-            ]
-        )
+        vllm_args.append("--enable-lora")
+        if args.lora_path:
+            vllm_args.append(
+                f"--lora-modules={args.served_model_name}={args.lora_path}"
+            )
     for extra_args in (engine_args, server_args):
         for key, value in extra_args.items():
             _append_cli_arg(vllm_args, key, value)

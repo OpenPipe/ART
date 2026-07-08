@@ -22,11 +22,11 @@ from torch.distributed import destroy_process_group, init_process_group  # noqa:
 import torch.multiprocessing as mp  # noqa: E402
 
 from art.megatron.context_parallel.layout_index import TokenLayoutIndex  # noqa: E402
-from art.megatron.gdn.gdn_shared_prefix import (  # noqa: E402
+from art.megatron.gdn.gdn_prefix_tree import (  # noqa: E402
     GdnPlannerConfig,
     GdnSegmentBucketPlan,
     build_gdn_rank_execution_plan,
-    parse_gdn_shared_prefix_segments,
+    parse_gdn_prefix_tree_segments,
 )
 from art.megatron.gdn.operator import (  # noqa: E402
     _project_gdn_inputs,
@@ -128,7 +128,7 @@ def _native_gdn_cp_packed_layer_worker(
         tensors = build_phase0_packed_tensors(case)
         group_ids = tensors["group_ids"].cuda()
         parent_ids = tensors["parent_ids"].cuda()
-        spec = parse_gdn_shared_prefix_segments(group_ids, parent_ids)
+        spec = parse_gdn_prefix_tree_segments(group_ids, parent_ids)
         plan = build_gdn_rank_execution_plan(
             spec,
             device=group_ids.device,

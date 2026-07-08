@@ -7,7 +7,7 @@ from typing import Any, Literal, NamedTuple, cast
 import torch
 
 from art.megatron.context_parallel.layout_index import TokenLayoutIndex
-from art.megatron.shared_prefix_tree import parse_shared_prefix_tree
+from art.megatron.prefix_tree import parse_prefix_tree
 
 GdnSegmentKind = Literal["prefix", "completion"]
 # FLA's public chunk_gated_delta_rule hard-codes 64-token WY chunks.
@@ -61,7 +61,7 @@ class GdnSegmentSpec:
 
 @dataclass(frozen=True)
 class GdnPackedExecutionSpec:
-    """Parsed shared-prefix GDN execution metadata for a packed batch."""
+    """Parsed prefix-tree GDN execution metadata for a packed batch."""
 
     batch_size: int
     sequence_length: int
@@ -275,7 +275,7 @@ class GdnPlannerConfig:
 
 @dataclass(frozen=True)
 class GdnRankExecutionPlan:
-    """Rank-local planned execution metadata for shared-prefix GDN."""
+    """Rank-local planned execution metadata for prefix-tree GDN."""
 
     cp_rank: int
     cp_size: int
@@ -359,7 +359,7 @@ def build_gdn_rank_execution_plan(
     attention_token_layout_index: TokenLayoutIndex | None = None,
     planner_config: GdnPlannerConfig | None = None,
 ) -> GdnRankExecutionPlan:
-    """Build rank-local tensor metadata from a parsed shared-prefix DAG.
+    """Build rank-local tensor metadata from a parsed prefix-tree DAG.
 
     Planning is CPU-bound and must run once per packed training sequence. CP>1
     emits mixed work: native FLA CP chain buckets for long segments and local
@@ -711,11 +711,11 @@ def _move_bucket_plans(
     )
 
 
-def parse_gdn_shared_prefix_segments(
+def parse_gdn_prefix_tree_segments(
     group_ids: torch.Tensor,
     parent_ids: torch.Tensor,
 ) -> GdnPackedExecutionSpec:
-    """Parse ART packed shared-prefix metadata into generic GDN tree nodes."""
+    """Parse ART packed prefix-tree metadata into generic GDN tree nodes."""
 
     groups = _rank2_long_cpu("group_ids", group_ids)
     parents = _rank2_long_cpu("parent_ids", parent_ids)
@@ -726,7 +726,7 @@ def parse_gdn_shared_prefix_segments(
         )
 
     batch_size, sequence_length = (int(groups.shape[0]), int(groups.shape[1]))
-    rows = parse_shared_prefix_tree(group_ids=groups, parent_ids=parents)
+    rows = parse_prefix_tree(group_ids=groups, parent_ids=parents)
     tree_segments: list[GdnSegmentSpec] = []
     tree_parent_indices: list[int] = []
     tree_depths: list[int] = []

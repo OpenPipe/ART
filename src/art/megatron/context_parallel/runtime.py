@@ -11,7 +11,7 @@ import torch
 from art.loss import shift_tensor
 from art.preprocessing.pack import PackedTensors
 
-from .builder import build_shared_prefix_attention_spec
+from .builder import build_prefix_tree_attention_spec
 from .layout_index import TokenLayoutIndex
 from .types import (
     ArtContextParallelState,
@@ -1519,7 +1519,7 @@ def prepare_cp_micro(
 ) -> PreparedMegatronBatch:
     """Prepare one CP microbatch with a CPU-only planning phase.
 
-    The intended overlap contract is: build the shared-prefix/runtime plan from
+    The intended overlap contract is: build the prefix-tree/runtime plan from
     CPU metadata, then materialize local tensors and BlockMasks on
     `target_device`. Passing CUDA `group_ids` or `parent_ids` still works for
     older direct callers, but it reintroduces D2H syncs and invalidates the
@@ -1581,7 +1581,7 @@ def prepare_megatron_context_parallel_state(
     This is the portion of CP prepare that must stay free of CUDA reads so the
     training loop can run it after enqueueing backward for the previous
     microbatch. If device metadata reaches this function, scalar reads,
-    cache-key hashing, and shared-prefix parsing can block the host on GPU work.
+    cache-key hashing, and prefix-tree parsing can block the host on GPU work.
     """
     if int(topology.cp) <= 1:
         raise RuntimeError(
@@ -1610,7 +1610,7 @@ def prepare_megatron_context_parallel_state(
     )
     bundle = _PLANNING_BUNDLE_CACHE.get(planning_key)
     if bundle is None:
-        spec = build_shared_prefix_attention_spec(
+        spec = build_prefix_tree_attention_spec(
             group_ids=group_ids_cpu,
             parent_ids=parent_ids_cpu,
         )
@@ -1622,11 +1622,11 @@ def prepare_megatron_context_parallel_state(
         )
         gdn_execution_spec = None
         if build_gdn_execution_spec:
-            from art.megatron.gdn.gdn_shared_prefix import (
-                parse_gdn_shared_prefix_segments,
+            from art.megatron.gdn.gdn_prefix_tree import (
+                parse_gdn_prefix_tree_segments,
             )
 
-            gdn_execution_spec = parse_gdn_shared_prefix_segments(
+            gdn_execution_spec = parse_gdn_prefix_tree_segments(
                 group_ids_cpu,
                 parent_ids_cpu,
             )
@@ -1655,7 +1655,7 @@ def prepare_megatron_context_parallel_state(
         )
         gdn_execution_plan = _GDN_RANK_PLAN_CACHE.get(rank_gdn_key)
         if gdn_execution_plan is None:
-            from art.megatron.gdn.gdn_shared_prefix import (
+            from art.megatron.gdn.gdn_prefix_tree import (
                 build_gdn_rank_execution_plan,
             )
 

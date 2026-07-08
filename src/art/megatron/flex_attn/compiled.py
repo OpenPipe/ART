@@ -192,10 +192,6 @@ def get_dense_compiled_flex_attention(
     head_dim_v: int,
     triton_num_stages_2_head_dims: tuple[int, ...] = (),
 ) -> Any:
-    if backend == _FORCED_FLEX_BACKEND:
-        return dense_compiled_flex_attention
-    if backend == "FLASH":
-        return flash_dense_compiled_flex_attention
     if _needs_triton_num_stages_2(
         backend=backend,
         head_dim=head_dim,
@@ -203,6 +199,10 @@ def get_dense_compiled_flex_attention(
         triton_num_stages_2_head_dims=triton_num_stages_2_head_dims,
     ):
         return triton_num_stages_2_dense_compiled_flex_attention
+    if backend == _FORCED_FLEX_BACKEND:
+        return dense_compiled_flex_attention
+    if backend == "FLASH":
+        return flash_dense_compiled_flex_attention
     return triton_dense_compiled_flex_attention
 
 
@@ -215,10 +215,6 @@ def get_sparse_compiled_flex_attention(
     triton_num_stages_2_head_dims: tuple[int, ...] = (),
 ) -> Any:
     del family_key
-    if backend == _FORCED_FLEX_BACKEND:
-        return sparse_compiled_flex_attention
-    if backend == "FLASH":
-        return flash_sparse_compiled_flex_attention
     if _needs_triton_num_stages_2(
         backend=backend,
         head_dim=head_dim,
@@ -226,6 +222,10 @@ def get_sparse_compiled_flex_attention(
         triton_num_stages_2_head_dims=triton_num_stages_2_head_dims,
     ):
         return triton_num_stages_2_sparse_compiled_flex_attention
+    if backend == _FORCED_FLEX_BACKEND:
+        return sparse_compiled_flex_attention
+    if backend == "FLASH":
+        return flash_sparse_compiled_flex_attention
     return triton_sparse_compiled_flex_attention
 
 

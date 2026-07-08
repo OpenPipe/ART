@@ -122,10 +122,10 @@ class Qwen35BaseHandler(DefaultDenseHandler):
 
         from art.megatron.gdn.operator import (
             install_gdn_island_hooks,
-            install_shared_prefix_gdn_hooks,
+            install_prefix_tree_gdn_hooks,
         )
 
-        install_shared_prefix_gdn_hooks(model_chunks)
+        install_prefix_tree_gdn_hooks(model_chunks)
         install_gdn_island_hooks(model_chunks)
         for chunk in list(model_chunks):
             module: Any = chunk

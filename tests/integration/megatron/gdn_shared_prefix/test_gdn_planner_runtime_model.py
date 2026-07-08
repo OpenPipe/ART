@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import pytest
 
-from art.megatron.gdn.gdn_shared_prefix import GdnPlannerConfig
+from art.megatron.gdn.gdn_prefix_tree import GdnPlannerConfig
 
 
 def test_gdn_planner_runtime_model_preserves_qwen35_reference_shape() -> None:

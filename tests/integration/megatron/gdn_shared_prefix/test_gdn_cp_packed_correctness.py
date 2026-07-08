@@ -15,13 +15,13 @@ from torch.distributed import destroy_process_group, init_process_group  # noqa:
 import torch.multiprocessing as mp  # noqa: E402
 
 from art.megatron.context_parallel.layout_index import TokenLayoutIndex  # noqa: E402
-from art.megatron.gdn.gdn_shared_prefix import (  # noqa: E402
+from art.megatron.gdn.gdn_prefix_tree import (  # noqa: E402
     GdnPlannerConfig,
     build_gdn_rank_execution_plan,
-    parse_gdn_shared_prefix_segments,
+    parse_gdn_prefix_tree_segments,
 )
 from art.megatron.gdn.operator import run_gdn_layer  # noqa: E402
-from art.megatron.shared_prefix_packing import prefix_tree_pack  # noqa: E402
+from art.megatron.prefix_tree_packing import prefix_tree_pack  # noqa: E402
 
 from .cases import (  # noqa: E402
     GdnFamilyShape,
@@ -279,7 +279,7 @@ def _tree_trainability_worker(
         pack = _tree_trainability_pack()
         group_ids = pack.group_ids.cuda()
         parent_ids = pack.parent_ids.cuda()
-        spec = parse_gdn_shared_prefix_segments(group_ids, parent_ids)
+        spec = parse_gdn_prefix_tree_segments(group_ids, parent_ids)
         plan = build_gdn_rank_execution_plan(
             spec,
             device=group_ids.device,
@@ -348,7 +348,7 @@ def _assert_case_matches_cp1(
     tensors = build_phase0_packed_tensors(case)
     group_ids = tensors["group_ids"].cuda()
     parent_ids = tensors["parent_ids"].cuda()
-    spec = parse_gdn_shared_prefix_segments(group_ids, parent_ids)
+    spec = parse_gdn_prefix_tree_segments(group_ids, parent_ids)
     plan = build_gdn_rank_execution_plan(
         spec,
         device=group_ids.device,
@@ -436,7 +436,7 @@ def _assert_tree_pack_matches_cp1(
     zero_parameter_grads(cp_gdn)
     group_ids = pack.group_ids.cuda()
     parent_ids = pack.parent_ids.cuda()
-    spec = parse_gdn_shared_prefix_segments(group_ids, parent_ids)
+    spec = parse_gdn_prefix_tree_segments(group_ids, parent_ids)
     plan = build_gdn_rank_execution_plan(
         spec,
         device=group_ids.device,
@@ -519,7 +519,7 @@ def _assert_sibling_order_matches_cp1(
     swapped_parent_ids[0, 5:9] = 0
     swapped_group_ids[0, 9:12] = 2
     swapped_parent_ids[0, 9:12] = 0
-    spec = parse_gdn_shared_prefix_segments(swapped_group_ids, swapped_parent_ids)
+    spec = parse_gdn_prefix_tree_segments(swapped_group_ids, swapped_parent_ids)
     plan = build_gdn_rank_execution_plan(
         spec,
         device=group_ids.device,

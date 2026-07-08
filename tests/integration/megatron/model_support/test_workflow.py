@@ -1,5 +1,6 @@
 import os
 from types import SimpleNamespace
+from typing import cast
 
 import pytest
 
@@ -30,6 +31,11 @@ from .workflow import (
     run_train_inf_mismatch_stage,
     run_yes_no_trainability_stage,
     validated_architecture_representative_models,
+)
+from .workflow_resources import (
+    _h200_equivalent_slots_for_total_gib,
+    handler_workflow_resources_for_base_model,
+    resolve_stage_resources_for_visible_gpus,
 )
 
 
@@ -73,7 +79,86 @@ def test_validated_architecture_representative_models_are_fixed() -> None:
         "Qwen/Qwen3.5-27B",
         "google/gemma-4-26B-A4B-it",
         "google/gemma-4-31B-it",
+        "deepseek-ai/DeepSeek-V4-Flash",
+        "openai/gpt-oss-20b",
     ]
+
+
+def test_dsv4_runtime_stages_use_full_model_resources() -> None:
+    resources = handler_workflow_resources_for_base_model(
+        "deepseek-ai/DeepSeek-V4-Flash"
+    )
+    assert resources is not None
+    for stage in (
+        resources.train_inf_mismatch,
+        resources.yes_no_trainability,
+        resources.length_trainability,
+    ):
+        assert stage is not None
+        assert stage.required_world_size == 8
+        assert stage.requires_external_vllm is True
+        assert stage.megatron is not None
+        assert stage.megatron.gpu_ids == [0, 1, 2, 3, 4, 5, 6, 7]
+        assert stage.megatron.topology.tp == 2
+        assert stage.megatron.topology.ep == 8
+        assert stage.megatron.topology.cp == 1
+        assert stage.vllm is not None
+        assert stage.vllm.gpu_ids == [4, 5, 6, 7]
+        engine_args = stage.vllm.engine_args()
+        assert "hf_overrides" not in engine_args
+        assert engine_args.get("load_format") != "dummy"
+        assert engine_args["moe_backend"] == "triton_unfused"
+        assert engine_args["kv_cache_dtype"] == "fp8"
+        assert stage.megatron_env == {"ART_MEGATRON_STREAMING_WEIGHT_OFFLOAD": "1"}
+
+    for stage in (resources.merged_vllm_serving, resources.native_vllm_lora):
+        assert stage is not None
+        assert stage.vllm is not None
+        engine_args = stage.vllm.engine_args()
+        assert engine_args["load_format"] == "dummy"
+        hf_overrides = cast(dict[str, object], engine_args["hf_overrides"])
+        assert hf_overrides["num_hidden_layers"] == 4
+    assert resources.merged_vllm_serving is not None
+    assert resources.merged_vllm_serving.vllm is not None
+    assert resources.merged_vllm_serving.vllm.engine_args()["kv_cache_dtype"] == "fp8"
+    assert resources.native_vllm_lora is not None
+    assert resources.native_vllm_lora.vllm is not None
+    assert resources.native_vllm_lora.vllm.engine_args().get("max_loras", 2) == 2
+
+
+def test_dsv4_resources_remap_to_four_high_vram_gpus(monkeypatch) -> None:
+    resources = handler_workflow_resources_for_base_model(
+        "deepseek-ai/DeepSeek-V4-Flash"
+    )
+    assert resources is not None
+    assert resources.train_inf_mismatch is not None
+    monkeypatch.setattr(
+        "tests.integration.megatron.model_support.workflow_resources."
+        "_visible_h200_equivalent_gpus",
+        lambda *, visible_gpu_count: 8,
+    )
+
+    stage = resolve_stage_resources_for_visible_gpus(
+        "train_inf_mismatch",
+        resources.train_inf_mismatch,
+        visible_gpu_count=4,
+    )
+
+    assert stage.megatron is not None
+    assert stage.vllm is not None
+    assert stage.megatron.gpu_ids == [0, 1]
+    assert stage.megatron.topology.tp == 2
+    assert stage.megatron.topology.ep == 2
+    assert stage.vllm.gpu_ids == [2, 3]
+    assert stage.vllm.tensor_parallel_size == 2
+    assert stage.vllm.engine_args()["moe_backend"] == "triton_unfused"
+    assert stage.vllm.engine_args()["kv_cache_dtype"] == "fp8"
+
+
+def test_h200_equivalent_slots_tolerate_reported_gb300_vram() -> None:
+    assert _h200_equivalent_slots_for_total_gib(80.0) == 0
+    assert _h200_equivalent_slots_for_total_gib(139.0) == 1
+    assert _h200_equivalent_slots_for_total_gib(276.6) == 2
 
 
 def test_inspect_architecture_for_workflow_uses_minimal_topology(monkeypatch) -> None:
@@ -123,6 +208,7 @@ def test_build_all_architectures_validation_report_stops_on_failure(
         include_sensitivity=None,
         output_json=None,
         skip_stages=None,
+        only_stage=None,
         stop_on_failure=False,
         allow_unvalidated_arch=False,
     ):
@@ -130,6 +216,7 @@ def test_build_all_architectures_validation_report_stops_on_failure(
         del include_sensitivity
         del output_json
         del skip_stages
+        del only_stage
         del stop_on_failure
         del allow_unvalidated_arch
         calls.append(base_model)
@@ -379,6 +466,7 @@ def test_build_validation_report_preserves_traces_when_sensitivity_runs(
     seen_keep_env: list[str | None] = []
 
     monkeypatch.delenv(KEEP_TOPOLOGY_ARTIFACTS_ENV, raising=False)
+
     monkeypatch.setattr(
         "tests.integration.megatron.model_support.workflow.inspect_architecture",
         lambda base_model: ArchitectureReport(
@@ -414,6 +502,46 @@ def test_build_validation_report_preserves_traces_when_sensitivity_runs(
 
     assert seen_keep_env == ["1"]
     assert os.environ.get(KEEP_TOPOLOGY_ARTIFACTS_ENV) is None
+
+
+def test_build_validation_report_only_stage_skips_other_stages(monkeypatch) -> None:
+    calls: list[str] = []
+    monkeypatch.setattr(
+        "tests.integration.megatron.model_support.workflow.inspect_architecture",
+        lambda base_model: ArchitectureReport(
+            base_model=base_model,
+            model_key="qwen3_5_moe",
+            handler_key="qwen3_5_moe",
+            layer_families=[],
+            recommended_min_layers=1,
+        ),
+    )
+    monkeypatch.setattr(
+        "tests.integration.megatron.model_support.workflow.detect_dependency_versions",
+        lambda: {},
+    )
+
+    def _run_stage_in_subprocess(**kwargs) -> ValidationStageResult:
+        stage_name = kwargs["stage_name"]
+        calls.append(stage_name)
+        return ValidationStageResult(name=stage_name, passed=True)
+
+    monkeypatch.setattr(
+        "tests.integration.megatron.model_support.workflow._run_stage_in_subprocess",
+        _run_stage_in_subprocess,
+    )
+
+    report = build_validation_report(
+        base_model="Qwen/Qwen3.5-35B-A3B",
+        only_stage="length_trainability",
+    )
+
+    skipped = next(stage for stage in report.stages if stage.name == "hf_parity")
+    assert calls == ["length_trainability"]
+    assert skipped.metrics == {
+        "skipped": True,
+        "reason": "--only-stage=length_trainability",
+    }
 
 
 def test_build_validation_report_captures_hf_parity_failure(monkeypatch) -> None:
@@ -631,7 +759,7 @@ def test_run_correctness_sensitivity_stage_runs_dense_models(monkeypatch) -> Non
     case_configs: list[SimpleNamespace] = []
     oracle_module = SimpleNamespace(
         OracleCaseConfig=lambda **kwargs: SimpleNamespace(**kwargs),
-        selected_suite_topologies=lambda *, is_moe: [
+        selected_suite_topologies=lambda *, is_moe, cp_supported=True: [
             SimpleNamespace(world_size=lambda: 1, slug=lambda: "tp1"),
             SimpleNamespace(world_size=lambda: 2, slug=lambda: "tp2"),
             SimpleNamespace(world_size=lambda: 2, slug=lambda: "dp2"),
@@ -646,7 +774,7 @@ def test_run_correctness_sensitivity_stage_runs_dense_models(monkeypatch) -> Non
             world_size=lambda: 2
         ),
         available_gpu_count=lambda: 4,
-        run_suite=lambda case_config, max_world_size: (
+        run_suite=lambda case_config, max_world_size, cp_supported=True, **kwargs: (
             case_configs.append(case_config)
             or [
                 SimpleNamespace(
@@ -1000,7 +1128,7 @@ def test_run_correctness_sensitivity_stage_summarizes_reports(monkeypatch) -> No
     )
     oracle_module = SimpleNamespace(
         OracleCaseConfig=lambda **kwargs: SimpleNamespace(**kwargs),
-        selected_suite_topologies=lambda *, is_moe: [
+        selected_suite_topologies=lambda *, is_moe, cp_supported=True: [
             SimpleNamespace(world_size=lambda: 1, slug=lambda: "tp1"),
             SimpleNamespace(world_size=lambda: 2, slug=lambda: "tp2"),
         ],
@@ -1013,7 +1141,7 @@ def test_run_correctness_sensitivity_stage_summarizes_reports(monkeypatch) -> No
             world_size=lambda: 2
         ),
         available_gpu_count=lambda: 2,
-        run_suite=lambda case_config, max_world_size: [
+        run_suite=lambda case_config, max_world_size, cp_supported=True, **kwargs: [
             SimpleNamespace(
                 variant="sft_topology_tp2",
                 topology="tp2",
@@ -1063,6 +1191,70 @@ def test_run_correctness_sensitivity_stage_summarizes_reports(monkeypatch) -> No
     assert stage.artifact_dir == "/tmp/oracle"
 
 
+def test_run_correctness_sensitivity_stage_uses_dsv4_real_path_config(
+    monkeypatch,
+) -> None:
+    architecture = ArchitectureReport(
+        base_model="deepseek-ai/DeepSeek-V4-Flash",
+        model_key="dsv4",
+        handler_key="dsv4",
+        layer_families=[LayerFamilyInstance(key="dsv4_attention", layer_index=0)],
+        recommended_min_layers=4,
+    )
+    captured: dict[str, object] = {}
+    oracle_module = SimpleNamespace(
+        OracleCaseConfig=lambda **kwargs: SimpleNamespace(**kwargs),
+        MetricThresholdRule=lambda **kwargs: SimpleNamespace(**kwargs),
+        selected_suite_topologies=lambda *, is_moe, cp_supported=True: [
+            SimpleNamespace(world_size=lambda: 1, slug=lambda: "tp1"),
+            SimpleNamespace(world_size=lambda: 2, slug=lambda: "tp2"),
+        ],
+        oracle_topology=lambda *, is_moe: SimpleNamespace(world_size=lambda: 1),
+        selected_oracle_objectives=lambda: ["rl"],
+        supported_sensitivity_mutations_for_objective=lambda objective, *, is_moe: [],
+        sensitivity_topology_for_mutation=lambda mutation, *, is_moe: SimpleNamespace(
+            world_size=lambda: 2
+        ),
+        available_gpu_count=lambda: 2,
+        run_suite=lambda case_config, **kwargs: (
+            captured.update(case_config=case_config, suite_kwargs=kwargs)
+            or [
+                SimpleNamespace(
+                    variant="rl_topology_tp2",
+                    topology="tp2",
+                    signal="pass",
+                    fail_count=0,
+                )
+            ]
+        ),
+        run_sensitivity_suite=lambda case_config, mutations, max_world_size: [],
+        ensure_case_artifacts=lambda case_config: SimpleNamespace(
+            case_dir="/tmp/oracle"
+        ),
+        keep_topology_artifacts=lambda: False,
+    )
+    monkeypatch.setattr(
+        "tests.integration.megatron.model_support.workflow._import_integration_module",
+        lambda name: oracle_module,
+    )
+    monkeypatch.setenv(SKIP_SENSITIVITY_ENV, "1")
+
+    stage = run_correctness_sensitivity_stage(
+        base_model="deepseek-ai/DeepSeek-V4-Flash",
+        architecture=architecture,
+    )
+
+    case_config = captured["case_config"]
+    suite_kwargs = cast(dict[str, object], captured["suite_kwargs"])
+    phase_pass_fns = cast(dict[str, object], suite_kwargs["phase_pass_fns"])
+    assert getattr(case_config, "precision") == "bf16"
+    assert suite_kwargs["use_fp32_lora_reference"] is False
+    assert getattr(phase_pass_fns["forward"], "limits") == {"mean_abs_pct": 3.0}
+    assert getattr(phase_pass_fns["grads"], "limits") == {"mean_abs_pct": 5.0}
+    assert stage.metrics["precision"] == "bf16"
+    assert stage.metrics["use_fp32_lora_reference"] is False
+
+
 def test_run_correctness_sensitivity_stage_can_skip_sensitivity_only(
     monkeypatch,
 ) -> None:
@@ -1075,7 +1267,7 @@ def test_run_correctness_sensitivity_stage_can_skip_sensitivity_only(
     )
     oracle_module = SimpleNamespace(
         OracleCaseConfig=lambda **kwargs: SimpleNamespace(**kwargs),
-        selected_suite_topologies=lambda *, is_moe: [
+        selected_suite_topologies=lambda *, is_moe, cp_supported=True: [
             SimpleNamespace(world_size=lambda: 1, slug=lambda: "tp1"),
             SimpleNamespace(world_size=lambda: 2, slug=lambda: "tp2"),
         ],
@@ -1088,7 +1280,7 @@ def test_run_correctness_sensitivity_stage_can_skip_sensitivity_only(
             world_size=lambda: 4
         ),
         available_gpu_count=lambda: 2,
-        run_suite=lambda case_config, max_world_size: [
+        run_suite=lambda case_config, max_world_size, cp_supported=True, **kwargs: [
             SimpleNamespace(
                 variant="sft_topology_tp2",
                 topology="tp2",
@@ -1167,8 +1359,7 @@ def test_run_merged_vllm_serving_stage_reports_served_model(monkeypatch) -> None
 
     assert stage.name == "merged_vllm_serving"
     assert stage.passed is True
-    assert stage.metrics == {
-        "base_model": "Qwen/Qwen3.5-35B-A3B",
-        "served_model_name": "validation@0",
-    }
+    assert stage.metrics["base_model"] == "Qwen/Qwen3.5-35B-A3B"
+    assert stage.metrics["served_model_name"] == "validation@0"
+    assert "readable_summary" in stage.metrics
     assert stage.artifact_dir == "/tmp/merged-serving"

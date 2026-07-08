@@ -7,10 +7,10 @@ from openai.types.chat.chat_completion import Choice
 import pytest
 import torch
 
+from art.megatron.prefix_tree import parse_prefix_tree_row
 from art.megatron.routing_replay import (
     build_moe_routing_replay_bundle_from_packed_tensors,
 )
-from art.megatron.shared_prefix_tree import parse_shared_prefix_row
 from art.preprocessing.moe_routing import (
     ART_MOE_ROUTING_METADATA_KEY,
     align_choice_routes_to_tokenized_result,
@@ -149,7 +149,7 @@ def _tokenized(
     )
 
 
-def test_pack_carries_routes_through_shared_prefix_splicing() -> None:
+def test_pack_carries_routes_through_prefix_tree_splicing() -> None:
     first = _tokenized(
         [10, 11, 20, 21],
         [_route(0), _route(10), _route(20), _route(30)],
@@ -186,9 +186,9 @@ def test_pack_carries_routes_through_shared_prefix_splicing() -> None:
         _route(50),
     ]
     stats = routing_replay.pack_stats
-    assert stats.shared_prefix_rows == 1
-    assert stats.shared_prefix_conflict_rows == 1
-    assert stats.shared_prefix_conflict_slots == 4
+    assert stats.prefix_tree_rows == 1
+    assert stats.prefix_tree_conflict_rows == 1
+    assert stats.prefix_tree_conflict_slots == 4
 
 
 def test_prefix_tree_pack_keeps_trainable_duplicates_in_leaf_metadata() -> None:
@@ -278,7 +278,7 @@ def test_prefix_tree_pack_public_api_emits_nested_metadata() -> None:
         pad_token_id=0,
         truncate_long_results=False,
     )
-    tree = parse_shared_prefix_row(
+    tree = parse_prefix_tree_row(
         group_ids=packed["group_ids"][0],
         parent_ids=packed["parent_ids"][0],
     )
@@ -302,6 +302,28 @@ def test_prefix_tree_pack_public_api_emits_nested_metadata() -> None:
     assert packed["assistant_mask"][0, 4]
     assert packed["assistant_mask"][0, 6]
     assert int(packed["group_ids"][0, 4]) != int(packed["group_ids"][0, 6])
+
+
+def test_pack_infers_at_least_topk_experts_from_sparse_routes() -> None:
+    result = _tokenized(
+        [10, 20],
+        [[[0, 0, 0, 0]], [[0, 0, 0, 0]]],
+        prompt_id=456,
+        prompt_length=1,
+    )
+
+    packed = packed_tensors_from_tokenized_results(
+        [result],
+        seq_len=4,
+        pad_token_id=0,
+        truncate_long_results=False,
+        include_moe_routing=True,
+    )
+
+    routing_replay = packed["moe_routing_replay"]
+    assert routing_replay is not None
+    assert routing_replay.topk == 4
+    assert routing_replay.num_experts == 4
 
 
 def test_build_replay_bundle_uses_packed_sequence_sample_calls() -> None:

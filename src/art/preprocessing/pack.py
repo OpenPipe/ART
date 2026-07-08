@@ -7,10 +7,10 @@ from typing import Any, Literal, NamedTuple, cast
 import torch
 from typing_extensions import NotRequired, TypedDict, Unpack
 
-from ..megatron.shared_prefix_packing import (
-    estimate_shared_prefix_packed_tokens,
+from ..megatron.prefix_tree_packing import (
+    estimate_prefix_tree_packed_tokens,
 )
-from ..megatron.shared_prefix_packing import (
+from ..megatron.prefix_tree_packing import (
     prefix_tree_pack as _prefix_tree_pack_sequences,
 )
 from ..types import Verbosity
@@ -295,7 +295,7 @@ def _packed_row_token_count(
 ) -> int:
     if not row:
         return 0
-    count = estimate_shared_prefix_packed_tokens(
+    count = estimate_prefix_tree_packed_tokens(
         (torch.tensor(item.token_ids, dtype=torch.long) for item in row),
         max_depth=seq_len,
         shareable_lengths=(item.shareable_length for item in row),
@@ -414,12 +414,12 @@ def _record_shared_route_conflict(
     stats: MoeRoutingPackStats,
 ) -> None:
     if existing is None or candidate is None:
-        raise RuntimeError("Shared-prefix MoE route is missing")
+        raise RuntimeError("Prefix-tree MoE route is missing")
     compared, conflicts = count_route_slot_conflicts(existing, candidate)
-    stats.shared_prefix_rows += 1
-    stats.shared_prefix_compared_slots += compared
-    stats.shared_prefix_conflict_slots += conflicts
-    stats.shared_prefix_conflict_rows += int(conflicts > 0)
+    stats.prefix_tree_rows += 1
+    stats.prefix_tree_compared_slots += compared
+    stats.prefix_tree_conflict_slots += conflicts
+    stats.prefix_tree_conflict_rows += int(conflicts > 0)
 
 
 def _packed_row_tensor_list(
@@ -489,7 +489,7 @@ def _tensorize_moe_routes(
         torch.tensor(route_masks, dtype=torch.bool),
         num_layers,
         topk,
-        max_expert_id + 1,
+        max(topk, max_expert_id + 1),
     )
 
 

@@ -20,6 +20,7 @@ from art.megatron.routing_replay import (
     ParallelTopology as ReplayParallelTopology,
 )
 from art.preprocessing.pack import PackedTensors
+from art.utils.lifecycle import terminate_popen_process_group
 
 from ..routing_replay.bundle import build_bundle_from_forward_trace_dir
 from ..routing_replay.trace import install_moe_routing_trace_hooks
@@ -103,6 +104,7 @@ def run_worker_subprocess(
     worker_log_path = topology_dir / "worker.log"
     live_log_raw = os.environ.get("ART_ORACLE_LIVE_TRAINING_LOG")
     live_log_path = None if not live_log_raw else Path(live_log_raw)
+    run: subprocess.Popen[str] | None = None
     worker_log_path.parent.mkdir(parents=True, exist_ok=True)
     with worker_log_path.open("w", encoding="utf-8") as worker_log:
         live_log = None
@@ -129,6 +131,7 @@ def run_worker_subprocess(
                 stderr=subprocess.STDOUT,
                 text=True,
                 bufsize=1,
+                start_new_session=True,
             )
             assert run.stdout is not None
             for line in run.stdout:
@@ -140,6 +143,8 @@ def run_worker_subprocess(
                     live_log.flush()
             run.returncode = run.wait()
         finally:
+            if run is not None and run.poll() is None:
+                terminate_popen_process_group(run)
             if live_log is not None:
                 live_log.close()
     combined_output = "".join(combined_lines).strip()
@@ -389,7 +394,12 @@ def _configure_provider(
     topology: Topology,
     case_config: OracleCaseConfig,
 ) -> None:
-    """Applies deterministic topology/model overrides to provider config."""
+    """Applies deterministic topology/model overrides to provider config.
+
+    Handler-specific oracle hooks are validation-only. They keep large model
+    families such as DSV4 fit-sized while preserving the layer families and
+    kernel-facing invariants under test.
+    """
     del topology
     provider.num_layers = case_config.num_layers
     if case_config.precision == "fp32":
@@ -405,6 +415,15 @@ def _configure_provider(
         provider.attention_dropout = 0.0
     if hasattr(provider, "hidden_dropout"):
         provider.hidden_dropout = 0.0
+    from art.megatron.model_support.registry import get_model_support_handler
+
+    handler = get_model_support_handler(
+        case_config.base_model,
+        allow_unvalidated_arch=case_config.allow_unvalidated_arch,
+    )
+    configure_oracle_provider = getattr(handler, "configure_oracle_provider", None)
+    if configure_oracle_provider is not None:
+        configure_oracle_provider(provider, case_config=case_config)
 
 
 @contextmanager

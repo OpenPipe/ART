@@ -12,13 +12,13 @@ import triton.language as tl
 
 from .conv_gelu import packed_varlen_causal_conv
 from .fla_cp import chunk_gated_delta_rule_native_cp
-from .gdn_shared_prefix import (
+from .gdn_prefix_tree import (
     GdnPackedExecutionSpec,
     GdnRankExecutionPlan,
     GdnSegmentBucketPlan,
     GdnStateExchangePlan,
     build_gdn_rank_execution_plan,
-    parse_gdn_shared_prefix_segments,
+    parse_gdn_prefix_tree_segments,
 )
 from .segment_layout import (
     gather_bucket_streams_compact as _gather_bucket_streams_compact_fused,
@@ -48,8 +48,8 @@ def set_gdn_trace_token_uid_hooks(hooks: Any | None) -> Any | None:
     return previous
 
 
-def install_shared_prefix_gdn_hooks(model_chunks: Sequence[Any]) -> None:
-    """Patch Megatron GatedDeltaNet modules to honor ART shared-prefix packing."""
+def install_prefix_tree_gdn_hooks(model_chunks: Sequence[Any]) -> None:
+    """Patch Megatron GatedDeltaNet modules to honor ART prefix-tree packing."""
 
     gated_delta_net_type = _optional_gated_delta_net_type()
     if gated_delta_net_type is None:
@@ -58,12 +58,12 @@ def install_shared_prefix_gdn_hooks(model_chunks: Sequence[Any]) -> None:
         for module in chunk.modules():
             if not isinstance(module, gated_delta_net_type):
                 continue
-            if getattr(module, "_art_shared_prefix_gdn_hooked", False):
+            if getattr(module, "_art_prefix_tree_gdn_hooked", False):
                 continue
             original_forward = module.forward
             module._art_physical_forward = original_forward
-            module.forward = MethodType(_shared_prefix_forward, module)
-            module._art_shared_prefix_gdn_hooked = True
+            module.forward = MethodType(_prefix_tree_forward, module)
+            module._art_prefix_tree_gdn_hooked = True
 
 
 def install_gdn_island_hooks(model_chunks: Sequence[Any]) -> None:
@@ -304,7 +304,7 @@ def _empty_safe_norm_forward(
 
 
 @torch.compiler.disable
-def _shared_prefix_forward(
+def _prefix_tree_forward(
     self: Any,
     hidden_states: Tensor,
     attention_mask: Tensor,
@@ -339,11 +339,9 @@ def _shared_prefix_forward(
 
     del attention_mask, key_value_states, sequence_len_offset, kwargs
     if inference_context is not None or inference_params is not None:
-        raise NotImplementedError("ART shared-prefix GDN does not support inference.")
+        raise NotImplementedError("ART prefix-tree GDN does not support inference.")
     if packed_seq_params is not None:
-        raise NotImplementedError(
-            "PackedSeqParams is not used in ART shared-prefix GDN."
-        )
+        raise NotImplementedError("PackedSeqParams is not used in ART prefix-tree GDN.")
     current_layout = _normalize_cp_layout(
         getattr(attention_bias, "gdn_hidden_layout", "attention")
     )
@@ -358,7 +356,7 @@ def _shared_prefix_forward(
         _mark_cp_layout_active(
             attention_bias, hidden_states, gdn=self, layout=input_layout
         )
-    output = gdn_shared_prefix_forward(
+    output = gdn_prefix_tree_forward(
         self,
         hidden_states,
         group_ids=cast(Tensor, group_ids),
@@ -380,7 +378,7 @@ def _shared_prefix_forward(
 
 
 @torch.compiler.disable
-def gdn_shared_prefix_forward(
+def gdn_prefix_tree_forward(
     gdn: Any,
     hidden_states: Tensor,
     *,
@@ -393,7 +391,7 @@ def gdn_shared_prefix_forward(
     input_layout: Literal["attention", "gdn"] = "attention",
     output_layout: Literal["attention", "gdn"] = "attention",
 ) -> tuple[Tensor, Tensor | None]:
-    """Run one GDN layer over ART shared-prefix packed rows."""
+    """Run one GDN layer over ART prefix-tree packed rows."""
 
     return run_gdn_layer(
         gdn,
@@ -423,7 +421,7 @@ def run_gdn_layer(
     input_layout: Literal["attention", "gdn"] = "attention",
     output_layout: Literal["attention", "gdn"] = "attention",
 ) -> tuple[Tensor, Tensor | None]:
-    """Run one production shared-prefix GDN layer."""
+    """Run one production prefix-tree GDN layer."""
 
     _disable_reentrant_te_linear_transpose_cache(gdn)
     if hidden_states.ndim != 3:
@@ -450,7 +448,7 @@ def run_gdn_layer(
         or int(group_ids.shape[1]) != expected_group_seq_len
     ):
         raise ValueError(
-            "shared-prefix GDN group_ids shape must match the logical sequence "
+            "prefix-tree GDN group_ids shape must match the logical sequence "
             "processed by Megatron GDN after sequence-parallel input gather, got "
             f"hidden={tuple(hidden_states.shape)} "
             f"group_ids={tuple(group_ids.shape)} "
@@ -459,14 +457,14 @@ def run_gdn_layer(
 
     if require_prebuilt_plan and execution_plan is None:
         raise ValueError(
-            "ART shared-prefix GDN production path requires a prebuilt "
-            "GDN execution plan on SharedPrefixAttentionState. Build it once "
-            "per packed sequence via create_shared_prefix_state(..., "
+            "ART prefix-tree GDN production path requires a prebuilt "
+            "GDN execution plan on PrefixTreeAttentionState. Build it once "
+            "per packed sequence via create_prefix_tree_state(..., "
             "build_gdn_execution_spec=True)."
         )
 
     if execution_spec is None and execution_plan is None:
-        execution_spec = parse_gdn_shared_prefix_segments(group_ids, parent_ids)
+        execution_spec = parse_gdn_prefix_tree_segments(group_ids, parent_ids)
     if (
         execution_spec is not None
         and requested_cp_size == 1
@@ -941,7 +939,7 @@ def _run_cp_planned_prefixes_and_completions(
         else _empty_autograd_dependency(qkv)
     )
     if not plan.tree_segment_buckets_by_depth:
-        raise ValueError("CP shared-prefix GDN requires a tree execution plan")
+        raise ValueError("CP prefix-tree GDN requires a tree execution plan")
     gate = gate.clone()
     recurrent_output = torch.zeros_like(gate)
     recurrent_output, cp_dependency = _run_tree_depth_buckets(
@@ -2840,7 +2838,5 @@ def _chunk_gated_delta_rule(*args: Any, **kwargs: Any) -> tuple[Tensor, Tensor |
     try:
         from fla.ops.gated_delta_rule import chunk_gated_delta_rule
     except ImportError as exc:
-        raise ImportError(
-            "FLA is required for ART shared-prefix GDN execution."
-        ) from exc
+        raise ImportError("FLA is required for ART prefix-tree GDN execution.") from exc
     return chunk_gated_delta_rule(*args, **kwargs)

@@ -46,6 +46,14 @@ _GEMMA4_MOE_COMPILE_WORKAROUND_FLAGS = (
     "flex_token_dispatch_combine",
     "te_triton_permute_with_mask_map",
 )
+_GEMMA4_TRITON_NUM_STAGES_2_SIGNATURES = {
+    # google/gemma-4-31B-it: Triton flex attention raises "No valid triton
+    # configs" for global attention head_dim=512 with backend-only options.
+    ("dense", 60, 5376, 32, 256, 512, 4),
+    # google/gemma-4-26B-A4B-it hits the same Triton resource limit on global
+    # attention head_dim=512 with backend-only options.
+    ("moe", 30, 2816, 16, 256, 512, 2),
+}
 _ART_MOE_EXPERT_KEY_RE = re.compile(
     r"^(?P<prefix>.*\.mlp\.experts)\.(?P<expert>\d+)\."
     r"(?P<module>gate_up_proj|down_proj)\.(?P<lora>lora_[AB])\.weight$"
@@ -125,7 +133,7 @@ class Gemma4MoeHandler(DefaultMoeHandler):
         _patch_gemma4_rotary_for_hf_proportional()
         _patch_gemma4_qkv_for_hf_tied_value()
         window_size = int(getattr(provider, "window_size", 1024))
-        provider.art_flex_core_attention_wrapper = _gemma4_flex_core_attention_wrapper
+        _install_gemma4_flex_core_attention_wrapper(provider)
         provider.art_flex_sliding_windows = (window_size,)
         provider.art_flex_head_dims_by_window = {
             None: int(getattr(provider, "global_head_dim", provider.kv_channels)),
@@ -365,7 +373,7 @@ class Gemma4DenseHandler(DefaultDenseHandler):
         _patch_gemma4_rotary_for_hf_proportional()
         _patch_gemma4_qkv_for_hf_tied_value()
         window_size = int(getattr(provider, "window_size", 1024))
-        provider.art_flex_core_attention_wrapper = _gemma4_flex_core_attention_wrapper
+        _install_gemma4_flex_core_attention_wrapper(provider)
         provider.art_flex_sliding_windows = (window_size,)
         provider.art_flex_head_dims_by_window = {
             None: int(getattr(provider, "global_head_dim", provider.kv_channels)),
@@ -972,12 +980,26 @@ def _gemma4_attention_pattern(provider: Any) -> tuple[int, int]:
 def _gemma4_flex_attention_compile_crash_config(
     provider: Any,
 ) -> FlexAttentionCompileCrashConfig:
-    global_head_dim = int(getattr(provider, "global_head_dim", 0) or 0)
-    if global_head_dim > 256:
+    if (
+        _gemma4_compile_crash_signature(provider)
+        in _GEMMA4_TRITON_NUM_STAGES_2_SIGNATURES
+    ):
         return FlexAttentionCompileCrashConfig(
-            triton_num_stages_2_head_dims=(global_head_dim,)
+            triton_num_stages_2_head_dims=(int(provider.global_head_dim),)
         )
     return FlexAttentionCompileCrashConfig()
+
+
+def _gemma4_compile_crash_signature(provider: Any) -> tuple[Any, ...]:
+    return (
+        "moe" if int(getattr(provider, "num_moe_experts", 0) or 0) > 0 else "dense",
+        int(provider.num_layers),
+        int(provider.hidden_size),
+        int(provider.num_attention_heads),
+        int(provider.kv_channels),
+        int(getattr(provider, "global_head_dim", 0) or 0),
+        int(getattr(provider, "num_global_key_value_heads", 0) or 0),
+    )
 
 
 def _is_gemma4_global_layer(layer_number: int, provider: Any) -> bool:
@@ -999,6 +1021,13 @@ def _gemma4_sliding_window_for_layer(provider: Any, layer_number: int) -> int | 
     return int(provider.window_size)
 
 
+def _install_gemma4_flex_core_attention_wrapper(provider: Any) -> None:
+    def _wrapper(_config: Any, base_cls: type[Any]) -> type[Any]:
+        return _gemma4_flex_core_attention_wrapper(provider, base_cls)
+
+    provider.art_flex_core_attention_wrapper = _wrapper
+
+
 def _gemma4_flex_core_attention_wrapper(
     provider: Any, base_cls: type[Any]
 ) -> type[Any]:
@@ -1010,6 +1039,11 @@ def _gemma4_flex_core_attention_wrapper(
             *args: Any,
             **kwargs: Any,
         ) -> None:
+            compile_crash_config = getattr(
+                provider, "art_flex_compile_crash_config", None
+            )
+            if compile_crash_config is not None:
+                config.art_flex_compile_crash_config = compile_crash_config
             super().__init__(config, layer_number, *args, **kwargs)
             self.art_sliding_window = _gemma4_sliding_window_for_layer(
                 provider,

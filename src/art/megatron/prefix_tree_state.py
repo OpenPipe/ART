@@ -1,4 +1,4 @@
-"""Shared-prefix packed-sequence state for ART attention and GDN integration."""
+"""Prefix-tree packed-sequence state for ART attention and GDN integration."""
 
 from __future__ import annotations
 
@@ -15,7 +15,7 @@ from art.megatron.context_parallel.block_mask import (
     build_block_mask_from_context,
     prepare_block_mask_context,
 )
-from art.megatron.context_parallel.builder import build_shared_prefix_attention_spec
+from art.megatron.context_parallel.builder import build_prefix_tree_attention_spec
 from art.megatron.context_parallel.layout_index import TokenLayoutIndex
 from art.megatron.context_parallel.types import (
     AttnMaskKind,
@@ -25,24 +25,26 @@ from art.megatron.context_parallel.types import (
     TokenRange,
 )
 from art.megatron.flex_attn.attention import (
-    SharedPrefixAttentionState as FlexSharedPrefixAttentionState,
+    PrefixTreeAttentionState as FlexPrefixTreeAttentionState,
 )
 from art.megatron.flex_attn.compiled import flash_sparse_block_size_for_head_dim
-from art.megatron.gdn.gdn_shared_prefix import (
+from art.megatron.gdn.gdn_prefix_tree import (
     GdnPackedExecutionSpec,
     GdnPlannerConfig,
     GdnRankExecutionPlan,
     build_gdn_rank_execution_plan,
     move_gdn_rank_execution_plan_to_device,
-    parse_gdn_shared_prefix_segments,
+    parse_gdn_prefix_tree_segments,
 )
+from art.megatron.model_support.spec import PrefixTreeModelStateContext
 
 
-class SharedPrefixAttentionState(FlexSharedPrefixAttentionState):
-    """Shared-prefix sparsity and optional GDN execution metadata."""
+class PrefixTreeAttentionState(FlexPrefixTreeAttentionState):
+    """Prefix-tree sparsity and optional GDN execution metadata."""
 
     group_ids: Tensor
     parent_ids: Tensor
+    model_state: dict[str, Any] = Field(default_factory=dict)
     gdn_execution_spec: GdnPackedExecutionSpec | None = None
     gdn_execution_plan: GdnRankExecutionPlan | None = None
     gdn_hidden_layout: str = "attention"
@@ -56,7 +58,7 @@ class SharedPrefixAttentionState(FlexSharedPrefixAttentionState):
     gdn_active_module: Any | None = None
 
 
-def create_shared_prefix_state(
+def create_prefix_tree_state(
     group_ids: Tensor,
     parent_ids: Tensor,
     *,
@@ -64,22 +66,23 @@ def create_shared_prefix_state(
     input_pos: Tensor | None = None,
     sliding_windows: tuple[int, ...] = (),
     build_gdn_execution_spec: bool = False,
+    model_support_handler: Any | None = None,
     attention_token_layout_index: TokenLayoutIndex | None = None,
     attention_head_dim: int | None = None,
     attention_value_head_dim: int | None = None,
     gdn_planner_config: GdnPlannerConfig | None = None,
-) -> SharedPrefixAttentionState:
-    """Build shared-prefix attention mask state plus optional reusable GDN plan."""
+) -> PrefixTreeAttentionState:
+    """Build prefix-tree attention mask state plus optional reusable GDN plan."""
     device = group_ids.device if target_device is None else torch.device(target_device)
     group_ids_cpu = _metadata_cpu(group_ids)
     parent_ids_cpu = _metadata_cpu(parent_ids)
     input_pos_cpu = None if input_pos is None else _metadata_cpu(input_pos)
-    block_size = _shared_prefix_block_size(
+    block_size = _prefix_tree_block_size(
         device,
         attention_head_dim=attention_head_dim,
         attention_value_head_dim=attention_value_head_dim,
     )
-    block_mask = _build_sparse_shared_prefix_block_mask(
+    block_mask = _build_sparse_prefix_tree_block_mask(
         group_ids_cpu=group_ids_cpu,
         parent_ids_cpu=parent_ids_cpu,
         input_pos_cpu=input_pos_cpu,
@@ -88,7 +91,7 @@ def create_shared_prefix_state(
         block_size=block_size,
     )
     sliding_block_masks = {
-        window: _build_sparse_shared_prefix_block_mask(
+        window: _build_sparse_prefix_tree_block_mask(
             group_ids_cpu=group_ids_cpu,
             parent_ids_cpu=parent_ids_cpu,
             input_pos_cpu=input_pos_cpu,
@@ -100,18 +103,28 @@ def create_shared_prefix_state(
     }
     cp_rank, cp_size = _gdn_cp_rank_size()
     gdn_execution_spec = (
-        parse_gdn_shared_prefix_segments(
+        parse_gdn_prefix_tree_segments(
             group_ids_cpu,
             parent_ids_cpu,
         )
         if build_gdn_execution_spec
         else None
     )
-    return SharedPrefixAttentionState(
+    return PrefixTreeAttentionState(
         block_mask=block_mask,
         sliding_block_masks=sliding_block_masks,
         group_ids=group_ids_cpu,
         parent_ids=parent_ids_cpu,
+        model_state=_build_model_state_once(
+            model_support_handler,
+            input_pos=input_pos_cpu,
+            group_ids=group_ids_cpu,
+            parent_ids=parent_ids_cpu,
+            device=device,
+            attention_token_layout_index=attention_token_layout_index,
+            attention_head_dim=attention_head_dim,
+            attention_value_head_dim=attention_value_head_dim,
+        ),
         gdn_execution_spec=gdn_execution_spec,
         gdn_execution_plan=_build_gdn_execution_plan_once(
             gdn_execution_spec,
@@ -124,6 +137,34 @@ def create_shared_prefix_state(
     )
 
 
+def _build_model_state_once(
+    model_support_handler: Any | None,
+    *,
+    input_pos: Tensor | None,
+    group_ids: Tensor,
+    parent_ids: Tensor,
+    device: torch.device,
+    attention_token_layout_index: TokenLayoutIndex | None,
+    attention_head_dim: int | None,
+    attention_value_head_dim: int | None,
+) -> dict[str, Any]:
+    if model_support_handler is None:
+        return {}
+    return dict(
+        model_support_handler.build_prefix_tree_model_state(
+            PrefixTreeModelStateContext(
+                input_pos=input_pos,
+                group_ids=group_ids,
+                parent_ids=parent_ids,
+                device=device,
+                attention_token_layout_index=attention_token_layout_index,
+                attention_head_dim=attention_head_dim,
+                attention_value_head_dim=attention_value_head_dim,
+            )
+        )
+    )
+
+
 def _metadata_cpu(tensor: Tensor) -> Tensor:
     tensor = tensor.detach()
     if tensor.device.type != "cpu" or tensor.dtype != torch.int64:
@@ -131,7 +172,7 @@ def _metadata_cpu(tensor: Tensor) -> Tensor:
     return tensor.contiguous()
 
 
-def _build_sparse_shared_prefix_block_mask(
+def _build_sparse_prefix_tree_block_mask(
     *,
     group_ids_cpu: Tensor,
     parent_ids_cpu: Tensor,
@@ -140,7 +181,7 @@ def _build_sparse_shared_prefix_block_mask(
     device: torch.device,
     block_size: tuple[int, int],
 ):
-    batch_spec = build_shared_prefix_attention_spec(
+    batch_spec = build_prefix_tree_attention_spec(
         group_ids=group_ids_cpu,
         parent_ids=parent_ids_cpu,
     )
@@ -290,7 +331,7 @@ def _false_mask(
     return torch.zeros_like(query_idx, dtype=torch.bool)
 
 
-def _shared_prefix_block_size(
+def _prefix_tree_block_size(
     device: torch.device,
     *,
     attention_head_dim: int | None,

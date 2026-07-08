@@ -9,7 +9,7 @@ import pytest
 torch = pytest.importorskip("torch")
 
 from art.megatron.flex_attn.attention import FlexAttentionWrapper
-from art.megatron.shared_prefix_state import create_shared_prefix_state
+from art.megatron.prefix_tree_state import create_prefix_tree_state
 from tests.integration.megatron.gdn_shared_prefix.cases import default_phase0_cases
 from tests.integration.megatron.gdn_shared_prefix.metrics import (
     GDN_CORRECTNESS_DTYPE,
@@ -22,7 +22,7 @@ from tests.integration.megatron.gdn_shared_prefix.packed_layout import (
     build_phase0_packed_tensors,
 )
 from tests.integration.megatron.gdn_shared_prefix.parser_import import (
-    parse_gdn_shared_prefix_segments,
+    parse_gdn_prefix_tree_segments,
 )
 from tests.integration.megatron.model_support.oracle_harness import (
     TEST_DEFAULT_FLEX_BACKEND,
@@ -51,23 +51,23 @@ def _fp32_test_flex_backend():
 
 @pytest.mark.skipif(
     not torch.cuda.is_available(),
-    reason="CUDA is required for compiled flex-attention shared-prefix coverage.",
+    reason="CUDA is required for compiled flex-attention prefix-tree coverage.",
 )
-def test_shared_prefix_attention_matches_flattened_grad_accumulation() -> None:
+def test_prefix_tree_attention_matches_flattened_grad_accumulation() -> None:
     case = next(
         item for item in default_phase0_cases() if item.name == "multi_family_repeated"
     )
     tensors = build_phase0_packed_tensors(case)
     group_ids = tensors["group_ids"].cuda()
     parent_ids = tensors["parent_ids"].cuda()
-    spec = parse_gdn_shared_prefix_segments(group_ids.cpu(), parent_ids.cpu())
+    spec = parse_gdn_prefix_tree_segments(group_ids.cpu(), parent_ids.cpu())
     q, k, v = _attention_inputs(group_ids.shape, seed=20260425)
     q_ref = q.detach().clone().requires_grad_(True)
     k_ref = k.detach().clone().requires_grad_(True)
     v_ref = v.detach().clone().requires_grad_(True)
     output_grad = _packed_output_grad(spec, q.shape, seed=20260426)
 
-    attention_state = create_shared_prefix_state(group_ids, parent_ids)
+    attention_state = create_prefix_tree_state(group_ids, parent_ids)
     packed_out = FlexAttentionWrapper()(
         q,
         k,
@@ -110,7 +110,7 @@ def test_shared_prefix_attention_matches_flattened_grad_accumulation() -> None:
 
 @pytest.mark.skipif(
     not torch.cuda.is_available(),
-    reason="CUDA is required for compiled flex-attention shared-prefix coverage.",
+    reason="CUDA is required for compiled flex-attention prefix-tree coverage.",
 )
 def test_physical_causal_attention_leaks_across_siblings() -> None:
     case = next(
@@ -119,9 +119,9 @@ def test_physical_causal_attention_leaks_across_siblings() -> None:
     tensors = build_phase0_packed_tensors(case)
     group_ids = tensors["group_ids"].cuda()
     parent_ids = tensors["parent_ids"].cuda()
-    spec = parse_gdn_shared_prefix_segments(group_ids.cpu(), parent_ids.cpu())
+    spec = parse_gdn_prefix_tree_segments(group_ids.cpu(), parent_ids.cpu())
     q, k, v = _attention_inputs(group_ids.shape, seed=20260427)
-    attention_state = create_shared_prefix_state(group_ids, parent_ids)
+    attention_state = create_prefix_tree_state(group_ids, parent_ids)
     packed_out = FlexAttentionWrapper()(
         q,
         k,

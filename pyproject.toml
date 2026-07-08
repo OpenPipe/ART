@@ -61,7 +61,7 @@ megatron = [
     "nvidia-ml-py==13.580.82",
     "nvidia-modelopt>=0.42.0a0 ; sys_platform != 'darwin'",
     "nvidia-resiliency-ext<0.5 ; sys_platform == 'linux'",
-    "transformers==5.6.2",
+    "transformers==5.12.1",
     "ml-dtypes>=0.5.0 ; python_full_version < '3.13'",
 ]
 
@@ -194,10 +194,8 @@ name = "deep-ep"
 version = "1.2.1+9af0e0d"
 requires-dist = []
 
-# The Megatron Bridge source metadata currently requires Transformers 5.8.x,
-# but this branch is validated against Transformers 5.6.2 for Gemma 4.
 # Keep Bridge's runtime deps explicit here and let ART's megatron extra own the
-# Transformers pin.
+# Transformers pin validated by model-support handlers in this branch.
 [[tool.uv.dependency-metadata]]
 name = "megatron-bridge"
 version = "0.5.0+e1a207ac"

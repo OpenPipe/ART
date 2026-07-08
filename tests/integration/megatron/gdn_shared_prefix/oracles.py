@@ -7,14 +7,14 @@ import torch
 from torch import Tensor
 import torch.nn.functional as F
 
-from art.megatron.gdn.gdn_shared_prefix import GdnPackedExecutionSpec, GdnSegmentSpec
+from art.megatron.gdn.gdn_prefix_tree import GdnPackedExecutionSpec, GdnSegmentSpec
 
 from .metrics import (
     mean_abs_pct,
     parameter_grad_mean_abs_pct_with_name,
     stable_output_mse_loss,
 )
-from .parser_import import parse_gdn_shared_prefix_segments
+from .parser_import import parse_gdn_prefix_tree_segments
 
 
 class ToyGdnConfig(BaseModel):
@@ -37,7 +37,7 @@ class ToyStatefulGdn(torch.nn.Module):
     """Small stateful block used to validate oracle mechanics on CPU.
 
     This is not a GDN approximation. It deliberately has the two state classes
-    that make GDN shared-prefix execution non-trivial: a finite conv tail and a
+    that make GDN prefix-tree execution non-trivial: a finite conv tail and a
     recurrent state. That is enough to prove parser routing, flattened
     accumulation, and known-bad physical-stream sensitivity before the real FLA
     kernels are invoked.
@@ -109,7 +109,7 @@ def run_toy_packed(
     group_ids: Tensor,
     parent_ids: Tensor,
 ) -> Tensor:
-    spec = parse_gdn_shared_prefix_segments(group_ids, parent_ids)
+    spec = parse_gdn_prefix_tree_segments(group_ids, parent_ids)
     output = torch.zeros_like(hidden)
     conv_states: list[Tensor] = []
     rec_states: list[Tensor] = []
@@ -140,7 +140,7 @@ def run_toy_flattened_reference(
     group_ids: Tensor,
     parent_ids: Tensor,
 ) -> Tensor:
-    spec = parse_gdn_shared_prefix_segments(group_ids, parent_ids)
+    spec = parse_gdn_prefix_tree_segments(group_ids, parent_ids)
     output = torch.zeros_like(hidden)
     for segment_index, segment in enumerate(spec.tree_segments):
         path = _segment_path(spec, segment_index)

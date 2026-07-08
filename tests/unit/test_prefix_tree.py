@@ -4,11 +4,11 @@ import pytest
 import torch
 
 from art.megatron.context_parallel.layout_index import TokenLayoutIndex
-from art.megatron.shared_prefix_packing import prefix_tree_pack
-from art.megatron.shared_prefix_tree import parse_shared_prefix_row
+from art.megatron.prefix_tree import parse_prefix_tree_row
+from art.megatron.prefix_tree_packing import prefix_tree_pack
 
 
-def test_parse_shared_prefix_row_tracks_ancestors_and_depth() -> None:
+def test_parse_prefix_tree_row_tracks_ancestors_and_depth() -> None:
     pack = prefix_tree_pack(
         (
             torch.tensor([1, 2, 3, 4, 8]),
@@ -19,7 +19,7 @@ def test_parse_shared_prefix_row_tracks_ancestors_and_depth() -> None:
         max_depth=3,
     )
 
-    tree = parse_shared_prefix_row(
+    tree = parse_prefix_tree_row(
         group_ids=pack.group_ids[0],
         parent_ids=pack.parent_ids[0],
     )
@@ -37,17 +37,17 @@ def test_parse_shared_prefix_row_tracks_ancestors_and_depth() -> None:
     ]
 
 
-def test_parse_shared_prefix_row_rejects_missing_parent() -> None:
+def test_parse_prefix_tree_row_rejects_missing_parent() -> None:
     with pytest.raises(RuntimeError, match="missing parent"):
-        parse_shared_prefix_row(
+        parse_prefix_tree_row(
             group_ids=torch.tensor([1, 2]),
             parent_ids=torch.tensor([1, 3]),
         )
 
 
-def test_parse_shared_prefix_row_rejects_non_contiguous_group() -> None:
+def test_parse_prefix_tree_row_rejects_non_contiguous_group() -> None:
     with pytest.raises(RuntimeError, match="contiguous group runs"):
-        parse_shared_prefix_row(
+        parse_prefix_tree_row(
             group_ids=torch.tensor([1, 2, 1]),
             parent_ids=torch.tensor([1, 1, 1]),
         )
@@ -55,10 +55,10 @@ def test_parse_shared_prefix_row_rejects_non_contiguous_group() -> None:
 
 def test_gdn_tree_parser_accepts_nested_tree() -> None:
     pytest.importorskip("megatron.core.packed_seq_params")
-    from art.megatron.gdn.gdn_shared_prefix import (
+    from art.megatron.gdn.gdn_prefix_tree import (
         GdnPlannerConfig,
         build_gdn_rank_execution_plan,
-        parse_gdn_shared_prefix_segments,
+        parse_gdn_prefix_tree_segments,
     )
 
     pack = prefix_tree_pack(
@@ -70,7 +70,7 @@ def test_gdn_tree_parser_accepts_nested_tree() -> None:
         max_depth=2,
     )
 
-    spec = parse_gdn_shared_prefix_segments(
+    spec = parse_gdn_prefix_tree_segments(
         group_ids=pack.group_ids,
         parent_ids=pack.parent_ids,
     )
@@ -93,9 +93,9 @@ def test_gdn_tree_parser_accepts_nested_tree() -> None:
 
 def test_gdn_tree_parser_accepts_zero_depth_roots() -> None:
     pytest.importorskip("megatron.core.packed_seq_params")
-    from art.megatron.gdn.gdn_shared_prefix import (
+    from art.megatron.gdn.gdn_prefix_tree import (
         build_gdn_rank_execution_plan,
-        parse_gdn_shared_prefix_segments,
+        parse_gdn_prefix_tree_segments,
     )
 
     pack = prefix_tree_pack(
@@ -107,7 +107,7 @@ def test_gdn_tree_parser_accepts_zero_depth_roots() -> None:
         max_depth=0,
     )
 
-    spec = parse_gdn_shared_prefix_segments(
+    spec = parse_gdn_prefix_tree_segments(
         group_ids=pack.group_ids,
         parent_ids=pack.parent_ids,
     )
@@ -126,10 +126,10 @@ def test_gdn_tree_parser_accepts_zero_depth_roots() -> None:
 
 def test_gdn_tree_planner_splits_leaf_and_internal_final_state_buckets() -> None:
     pytest.importorskip("megatron.core.packed_seq_params")
-    from art.megatron.gdn.gdn_shared_prefix import (
+    from art.megatron.gdn.gdn_prefix_tree import (
         GdnPlannerConfig,
         build_gdn_rank_execution_plan,
-        parse_gdn_shared_prefix_segments,
+        parse_gdn_prefix_tree_segments,
     )
 
     pack = prefix_tree_pack(
@@ -141,7 +141,7 @@ def test_gdn_tree_planner_splits_leaf_and_internal_final_state_buckets() -> None
         max_depth=2,
     )
 
-    spec = parse_gdn_shared_prefix_segments(
+    spec = parse_gdn_prefix_tree_segments(
         group_ids=pack.group_ids,
         parent_ids=pack.parent_ids,
     )
@@ -163,10 +163,10 @@ def test_gdn_tree_planner_splits_leaf_and_internal_final_state_buckets() -> None
 
 def test_gdn_tree_cp_plan_chains_long_nodes() -> None:
     pytest.importorskip("megatron.core.packed_seq_params")
-    from art.megatron.gdn.gdn_shared_prefix import (
+    from art.megatron.gdn.gdn_prefix_tree import (
         GdnPlannerConfig,
         build_gdn_rank_execution_plan,
-        parse_gdn_shared_prefix_segments,
+        parse_gdn_prefix_tree_segments,
     )
 
     root = torch.arange(1, 321)
@@ -180,7 +180,7 @@ def test_gdn_tree_cp_plan_chains_long_nodes() -> None:
         ),
         max_depth=3,
     )
-    spec = parse_gdn_shared_prefix_segments(
+    spec = parse_gdn_prefix_tree_segments(
         group_ids=pack.group_ids,
         parent_ids=pack.parent_ids,
     )
@@ -219,9 +219,9 @@ def test_gdn_tree_cp_plan_chains_long_nodes() -> None:
 
 def test_gdn_tree_cp_plan_exchanges_remote_parent_states() -> None:
     pytest.importorskip("megatron.core.packed_seq_params")
-    from art.megatron.gdn.gdn_shared_prefix import (
+    from art.megatron.gdn.gdn_prefix_tree import (
         build_gdn_rank_execution_plan,
-        parse_gdn_shared_prefix_segments,
+        parse_gdn_prefix_tree_segments,
     )
 
     root = torch.arange(1, 17)
@@ -234,7 +234,7 @@ def test_gdn_tree_cp_plan_exchanges_remote_parent_states() -> None:
         ),
         max_depth=2,
     )
-    spec = parse_gdn_shared_prefix_segments(
+    spec = parse_gdn_prefix_tree_segments(
         group_ids=pack.group_ids,
         parent_ids=pack.parent_ids,
     )
@@ -264,9 +264,9 @@ def test_gdn_tree_cp_plan_exchanges_remote_parent_states() -> None:
 
 def test_gdn_tree_cp_randomized_plans_cover_each_token_once() -> None:
     pytest.importorskip("megatron.core.packed_seq_params")
-    from art.megatron.gdn.gdn_shared_prefix import (
+    from art.megatron.gdn.gdn_prefix_tree import (
         build_gdn_rank_execution_plan,
-        parse_gdn_shared_prefix_segments,
+        parse_gdn_prefix_tree_segments,
     )
 
     config = _chain_every_legal_segment_config()
@@ -275,7 +275,7 @@ def test_gdn_tree_cp_randomized_plans_cover_each_token_once() -> None:
             _random_tree_sequences(seed),
             max_depth=4,
         )
-        spec = parse_gdn_shared_prefix_segments(
+        spec = parse_gdn_prefix_tree_segments(
             group_ids=pack.group_ids,
             parent_ids=pack.parent_ids,
         )
@@ -307,10 +307,10 @@ def test_gdn_tree_cp_randomized_plans_cover_each_token_once() -> None:
 
 def test_gdn_tree_cp_randomized_plans_pass_health_checks() -> None:
     pytest.importorskip("megatron.core.packed_seq_params")
-    from art.megatron.gdn.gdn_shared_prefix import (
+    from art.megatron.gdn.gdn_prefix_tree import (
         GdnPlannerConfig,
         build_gdn_rank_execution_plan,
-        parse_gdn_shared_prefix_segments,
+        parse_gdn_prefix_tree_segments,
     )
 
     config = GdnPlannerConfig()
@@ -319,7 +319,7 @@ def test_gdn_tree_cp_randomized_plans_pass_health_checks() -> None:
             _random_tree_sequences(seed + 100, max_depth=5),
             max_depth=5,
         )
-        spec = parse_gdn_shared_prefix_segments(
+        spec = parse_gdn_prefix_tree_segments(
             group_ids=pack.group_ids,
             parent_ids=pack.parent_ids,
         )
@@ -341,7 +341,7 @@ def test_gdn_tree_cp_randomized_plans_pass_health_checks() -> None:
 
 
 def _chain_every_legal_segment_config():
-    from art.megatron.gdn.gdn_shared_prefix import GdnPlannerConfig
+    from art.megatron.gdn.gdn_prefix_tree import GdnPlannerConfig
 
     return GdnPlannerConfig(
         cp_chain_min_runtime_delta_ms=0.0,

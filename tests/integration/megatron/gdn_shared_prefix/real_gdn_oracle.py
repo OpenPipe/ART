@@ -8,7 +8,7 @@ from torch import Tensor
 import torch.nn.functional as F
 
 from art.megatron.context_parallel.layout_index import TokenLayoutIndex
-from art.megatron.gdn.gdn_shared_prefix import FLA_CHUNK_SIZE
+from art.megatron.gdn.gdn_prefix_tree import FLA_CHUNK_SIZE
 from art.megatron.gdn.operator import (
     _apply_gated_rms_norm,
     _chunk_gated_delta_rule,
@@ -21,7 +21,7 @@ from art.megatron.gdn.operator import (
     _out_proj,
     _zero_conv_state,
     _zero_recurrent_state,
-    gdn_shared_prefix_forward,
+    gdn_prefix_tree_forward,
 )
 
 from .layout_reference import build_test_gdn_cp_layout_plan
@@ -30,7 +30,7 @@ from .metrics import (
     parameter_grad_mean_abs_pct_with_name,
     stable_output_mse_loss,
 )
-from .parser_import import parse_gdn_shared_prefix_segments
+from .parser_import import parse_gdn_prefix_tree_segments
 
 
 class RealGdnOracleMetrics(BaseModel):
@@ -124,7 +124,7 @@ def compare_real_gdn_cp1_to_flattened(
     packed_hidden = hidden_states.clone().detach().requires_grad_(True)
     flat_hidden = hidden_states.clone().detach().requires_grad_(True)
 
-    packed_out, _ = gdn_shared_prefix_forward(
+    packed_out, _ = gdn_prefix_tree_forward(
         packed_gdn,
         packed_hidden,
         group_ids=group_ids,
@@ -169,7 +169,7 @@ def compare_real_gdn_cp1_to_flattened_with_output_grad(
     packed_hidden = hidden_states.clone().detach().requires_grad_(True)
     flat_hidden = hidden_states.clone().detach().requires_grad_(True)
 
-    packed_out, _ = gdn_shared_prefix_forward(
+    packed_out, _ = gdn_prefix_tree_forward(
         packed_gdn,
         packed_hidden,
         group_ids=group_ids,
@@ -347,7 +347,7 @@ def run_real_gdn_flattened_reference(
     parent_ids: Tensor,
     execution_spec: Any | None = None,
 ) -> Tensor:
-    spec = execution_spec or parse_gdn_shared_prefix_segments(group_ids, parent_ids)
+    spec = execution_spec or parse_gdn_prefix_tree_segments(group_ids, parent_ids)
     output = torch.zeros_like(hidden_states)
     for segment_index, segment in enumerate(spec.tree_segments):
         flat_hidden = torch.cat(
@@ -409,7 +409,7 @@ def run_real_gdn_local_fork_reference(
     cp_size: int,
     attention_token_layout_index: TokenLayoutIndex | None = None,
 ) -> Tensor:
-    spec = parse_gdn_shared_prefix_segments(group_ids, parent_ids)
+    spec = parse_gdn_prefix_tree_segments(group_ids, parent_ids)
     gdn_token_indices_by_rank = _split_gdn_families_by_rank(spec, cp_size=cp_size)
     gdn_token_ranges_by_rank = _rank_ranges_from_tokens_by_rank(
         gdn_token_indices_by_rank
@@ -576,7 +576,7 @@ def run_real_gdn_suffix_only_chain_reference(
     mutation: GdnChainMutation | None = None,
     boundary_debug: list[GdnChainBoundaryDebug] | None = None,
 ) -> Tensor:
-    spec = parse_gdn_shared_prefix_segments(group_ids, parent_ids)
+    spec = parse_gdn_prefix_tree_segments(group_ids, parent_ids)
     output = torch.zeros_like(hidden_states)
     for family in _tree_families(spec):
         row = family.row_index
@@ -626,7 +626,7 @@ def run_real_gdn_chunk_native_reference(
     group_ids: Tensor,
     parent_ids: Tensor,
 ) -> Tensor:
-    spec = parse_gdn_shared_prefix_segments(group_ids, parent_ids)
+    spec = parse_gdn_prefix_tree_segments(group_ids, parent_ids)
     output = torch.zeros_like(hidden_states)
     for family in _tree_families(spec):
         _scatter_family_output(
@@ -646,7 +646,7 @@ def run_real_gdn_mixed_cp_reference(
     cp_size: int,
     local_fork_max_tokens: int,
 ) -> Tensor:
-    spec = parse_gdn_shared_prefix_segments(group_ids, parent_ids)
+    spec = parse_gdn_prefix_tree_segments(group_ids, parent_ids)
     output = torch.zeros_like(hidden_states)
     local_count = 0
     chain_count = 0
@@ -747,7 +747,7 @@ def _run_local_fork_rank(
     local_group_ids, local_parent_ids = _local_fork_group_tensors(
         spec, local_token_indices, device=rank_hidden.device
     )
-    local_output, _ = gdn_shared_prefix_forward(
+    local_output, _ = gdn_prefix_tree_forward(
         gdn,
         rank_hidden.unsqueeze(1).contiguous(),
         group_ids=local_group_ids,
@@ -773,7 +773,7 @@ def _run_gdn_family_local_fork(
     local_group_ids, local_parent_ids = _family_group_tensors(
         family, device=hidden_states.device
     )
-    local_output, _ = gdn_shared_prefix_forward(
+    local_output, _ = gdn_prefix_tree_forward(
         gdn,
         local_hidden,
         group_ids=local_group_ids,

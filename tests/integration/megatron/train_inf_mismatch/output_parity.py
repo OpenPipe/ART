@@ -11,7 +11,12 @@ from typing import Any, Literal, cast
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
-from art.megatron.shared_prefix_tree import parse_shared_prefix_row
+from art.megatron.prefix_tree import parse_prefix_tree_row
+
+from ..model_support.workflow_resources import (
+    handler_workflow_resources_for_base_model,
+    resolve_stage_resources_for_current_host,
+)
 
 # These gates are intentionally bf16-scale, not fp32 oracle-scale. A 2026-05-18
 # Qwen/Qwen3.5-35B-A3B diagnostic on the exact same real generated tokens found:
@@ -24,8 +29,14 @@ from art.megatron.shared_prefix_tree import parse_shared_prefix_row
 # prefix route-conflict behavior on the measured path. With the workflow's
 # 16-token completions, Qwen3.5 MoE reruns on 2026-05-25 measured 4.169% and
 # 4.606% mean_abs_pct while staying under the KL gate, so its gate is 5%.
+# DeepSeek-V4-Flash uses vLLM quantized DSV4 kernels on the serving side while
+# Megatron materializes train-time bf16/fp32 tensors. A 2026-06-18 diagnostic
+# measured non-QAT Megatron vs vLLM generation at 19.016% mean_abs_pct and
+# 0.02603 candidate->target top20 KL; vLLM generation vs exact vLLM prompt
+# rescore was already 15.176% mean_abs_pct and 0.04424 KL.
 BF16_FWD_MEAN_ABS_PCT_LIMIT = 4.0
 BF16_FWD_MEAN_ABS_PCT_LIMIT_BY_MODEL_KEY = {
+    "dsv4": 20.0,
     # Gemma 4 MoE long-prompt SWA native-LoRA runs showed high variation, with
     # repeated samples reaching 7.6% mean_abs_pct and 0.0076 KL.
     "gemma4_dense": 8.0,
@@ -35,8 +46,12 @@ BF16_FWD_MEAN_ABS_PCT_LIMIT_BY_MODEL_KEY = {
 }
 TOP20_KL_CANDIDATE_TO_TARGET_LIMIT = 0.002
 TOP20_KL_CANDIDATE_TO_TARGET_LIMIT_BY_MODEL_KEY = {
+    "dsv4": 0.07,
     "gemma4_dense": 0.003,
     "gemma4_moe": 0.008,
+    # GPT OSS MXFP4/native-LoRA repeats on 2026-07-06 stayed under the 4%
+    # mean_abs_pct gate but measured 0.00186-0.00256 top20 KL.
+    "gpt_oss_moe": 0.003,
 }
 MEAN_ABS_PCT_DENOMINATOR_EPS = 1e-18
 TOP_K = 20
@@ -106,6 +121,10 @@ class TrainInfOutputParityConfig(BaseModel):
     lora_target_modules: list[str] | None = None
     engine_args: dict[str, Any] = Field(default_factory=dict)
     server_args: dict[str, Any] = Field(default_factory=dict)
+    megatron_env: dict[str, str] = Field(default_factory=dict)
+    replay_vllm_routing: bool = False
+    external_vllm_server_url: str | None = None
+    external_vllm_api_key: str | None = None
 
     @model_validator(mode="after")
     def _set_default_rollout_modes(self) -> "TrainInfOutputParityConfig":
@@ -302,7 +321,28 @@ def model_support_is_moe(
     return get_model_support_handler_for_spec(spec).is_moe
 
 
+def model_supports_context_parallel(
+    base_model: str,
+    *,
+    allow_unvalidated_arch: bool = False,
+) -> bool:
+    from art.megatron.model_support.registry import (
+        get_model_support_handler_for_spec,
+        get_model_support_spec,
+    )
+
+    spec = get_model_support_spec(
+        base_model,
+        allow_unvalidated_arch=allow_unvalidated_arch,
+    )
+    return bool(getattr(get_model_support_handler_for_spec(spec), "cp_supported", True))
+
+
 def config_from_env() -> TrainInfOutputParityConfig:
+    train_inf_external_url_env = "ART_TRAIN_INF_MISMATCH_EXTERNAL_VLLM_URL"
+    model_support_external_url_env = "ART_MODEL_SUPPORT_EXTERNAL_VLLM_URL"
+    train_inf_external_key_env = "ART_TRAIN_INF_MISMATCH_EXTERNAL_VLLM_API_KEY"
+    model_support_external_key_env = "ART_MODEL_SUPPORT_EXTERNAL_VLLM_API_KEY"
     config = TrainInfOutputParityConfig(
         base_model=os.environ.get(
             "ART_TRAIN_INF_MISMATCH_BASE_MODEL",
@@ -321,6 +361,44 @@ def config_from_env() -> TrainInfOutputParityConfig:
         )
         == "1",
     )
+    workflow_resources = handler_workflow_resources_for_base_model(
+        config.base_model,
+        allow_unvalidated_arch=config.allow_unvalidated_arch,
+    )
+    stage_resources = (
+        workflow_resources.train_inf_mismatch
+        if workflow_resources is not None
+        else None
+    )
+    if stage_resources is not None:
+        stage_resources = resolve_stage_resources_for_current_host(
+            "train_inf_mismatch",
+            stage_resources,
+        )
+    if stage_resources is not None:
+        if (
+            stage_resources.megatron is not None
+            and "ART_TRAIN_INF_MISMATCH_TRAINER_GPU_IDS" not in os.environ
+        ):
+            config.trainer_gpu_ids = list(stage_resources.megatron.gpu_ids)
+        if (
+            stage_resources.vllm is not None
+            and "ART_TRAIN_INF_MISMATCH_INFERENCE_GPU_IDS" not in os.environ
+        ):
+            config.inference_gpu_ids = list(stage_resources.vllm.gpu_ids)
+        if stage_resources.megatron is not None:
+            config.topology = config.topology.model_copy(
+                update=stage_resources.megatron.topology.to_train_inf_topology_kwargs()
+            )
+        if stage_resources.vllm is not None:
+            config.engine_args = {
+                **stage_resources.vllm.engine_args(),
+                **config.engine_args,
+            }
+        config.megatron_env = {
+            **stage_resources.megatron_env,
+            **config.megatron_env,
+        }
     if raw_modes := os.environ.get("ART_TRAIN_INF_MISMATCH_ROLLOUT_MODES"):
         config.rollout_modes = _parse_rollout_modes(raw_modes)
     if raw_seq_len := os.environ.get("ART_TRAIN_INF_MISMATCH_SEQUENCE_LENGTH"):
@@ -333,16 +411,27 @@ def config_from_env() -> TrainInfOutputParityConfig:
         ("ART_TRAIN_INF_MISMATCH_TP", "tp"),
         ("ART_TRAIN_INF_MISMATCH_EP", "ep"),
         ("ART_TRAIN_INF_MISMATCH_ETP", "etp"),
+        ("ART_TRAIN_INF_MISMATCH_DP", "dp"),
         ("ART_TRAIN_INF_MISMATCH_CP", "cp"),
         ("ART_TRAIN_INF_MISMATCH_PP", "pp"),
     ):
         if raw_value := os.environ.get(env_name):
             config.topology = config.topology.model_copy(update={attr: int(raw_value)})
-    if not model_support_is_moe(
+    is_moe = model_support_is_moe(
         config.base_model,
         allow_unvalidated_arch=config.allow_unvalidated_arch,
-    ):
+    )
+    cp_supported = model_supports_context_parallel(
+        config.base_model,
+        allow_unvalidated_arch=config.allow_unvalidated_arch,
+    )
+    if not is_moe:
         config.topology = config.topology.model_copy(update={"ep": 1, "etp": 1})
+    if not cp_supported and "ART_TRAIN_INF_MISMATCH_CP" not in os.environ:
+        updates = {"cp": 1}
+        if stage_resources is None and "ART_TRAIN_INF_MISMATCH_DP" not in os.environ:
+            updates["dp"] = config.topology.dp * config.topology.cp
+        config.topology = config.topology.model_copy(update=updates)
     if raw_targets := os.environ.get("ART_TRAIN_INF_MISMATCH_LORA_TARGET_MODULES"):
         config.lora_target_modules = _parse_str_list(raw_targets)
     if raw_vllm_memory := os.environ.get(
@@ -350,9 +439,33 @@ def config_from_env() -> TrainInfOutputParityConfig:
     ):
         config.engine_args["gpu_memory_utilization"] = float(raw_vllm_memory)
     if raw_gdn_backend := os.environ.get("ART_TRAIN_INF_MISMATCH_GDN_PREFILL_BACKEND"):
-        config.engine_args.setdefault("additional_config", {})[
-            "gdn_prefill_backend"
-        ] = raw_gdn_backend
+        raw_additional_config = config.engine_args.get("additional_config")
+        additional_config: dict[str, Any] = {}
+        if isinstance(raw_additional_config, dict):
+            additional_config.update(cast(dict[str, Any], raw_additional_config))
+        additional_config["gdn_prefill_backend"] = raw_gdn_backend
+        config.engine_args["additional_config"] = additional_config
+    raw_url = os.environ.get(train_inf_external_url_env)
+    if raw_url is None and stage_resources is not None:
+        raw_url = os.environ.get(model_support_external_url_env)
+    if raw_url:
+        config.external_vllm_server_url = raw_url
+        config.external_vllm_api_key = os.environ.get(
+            train_inf_external_key_env,
+            os.environ.get(
+                model_support_external_key_env,
+                "art-external-vllm",
+            ),
+        )
+    if (
+        stage_resources is not None
+        and stage_resources.requires_external_vllm
+        and not config.external_vllm_server_url
+    ):
+        raise RuntimeError(
+            "train_inf_mismatch for this model requires an external vLLM server. "
+            f"Set {train_inf_external_url_env} or {model_support_external_url_env}."
+        )
     return config
 
 
@@ -362,7 +475,7 @@ def _prefix_tree_leaf_paths(
     *,
     required_leaf_count: int = 1,
 ) -> list[tuple[int, tuple[tuple[int, int], ...], tuple[int, int]]]:
-    tree = parse_shared_prefix_row(group_ids=group_ids, parent_ids=parent_ids)
+    tree = parse_prefix_tree_row(group_ids=group_ids, parent_ids=parent_ids)
     segment_by_group = {segment.group_id: segment for segment in tree.segments}
     child_count_by_group: dict[int, int] = {}
     for segment in tree.segments:
@@ -392,9 +505,20 @@ def build_logical_token_map(packed_tensors: dict[str, Any]) -> LogicalTokenMap:
     tokens = packed_tensors["tokens"]
     group_ids = packed_tensors["group_ids"]
     parent_ids = packed_tensors["parent_ids"]
+    assistant_mask = packed_tensors.get("assistant_mask")
+    logprobs = packed_tensors.get("logprobs")
     prompts: list[LogicalPrompt] = []
     logical_tokens: list[LogicalToken] = []
     prompt_id_by_tokens: dict[tuple[int, ...], int] = {}
+
+    def scored_token(sample_id: int, packed_i: int) -> bool:
+        if assistant_mask is not None and not bool(assistant_mask[sample_id, packed_i]):
+            return False
+        if logprobs is not None:
+            value = float(logprobs[sample_id, packed_i])
+            if math.isnan(value):
+                return False
+        return True
 
     for sample_id in range(int(tokens.shape[0])):
         leaf_paths = _prefix_tree_leaf_paths(
@@ -404,8 +528,15 @@ def build_logical_token_map(packed_tensors: dict[str, Any]) -> LogicalTokenMap:
             leaf_paths
         ):
             leaf_start, leaf_end = leaf_segment
+            last_scored_i = None
+            for packed_i in range(leaf_start + 1, leaf_end):
+                if scored_token(sample_id, packed_i):
+                    last_scored_i = packed_i
+            if last_scored_i is None:
+                continue
+            effective_leaf_end = last_scored_i + 1
             prompt_len = sum(end - start for start, end in ancestor_segments)
-            reference_segments = (*ancestor_segments, leaf_segment)
+            reference_segments = (*ancestor_segments, (leaf_start, effective_leaf_end))
             flat = [
                 int(value)
                 for start, end in reference_segments
@@ -427,7 +558,9 @@ def build_logical_token_map(packed_tensors: dict[str, Any]) -> LogicalTokenMap:
                         token_ids=flat,
                     )
                 )
-            for packed_i in range(leaf_start + 1, leaf_end):
+            for packed_i in range(leaf_start + 1, effective_leaf_end):
+                if not scored_token(sample_id, packed_i):
+                    continue
                 logical_tokens.append(
                     LogicalToken(
                         token_id=int(tokens[sample_id, packed_i].item()),
@@ -860,7 +993,7 @@ def _run_logits(
 ) -> Any:
     import torch
 
-    from art.megatron.shared_prefix_state import create_shared_prefix_state
+    from art.megatron.prefix_tree_state import create_prefix_tree_state
     from art.megatron.training.trace import (
         packed_sequence_token_uids,
         prepare_replay_local_input_token_uids,
@@ -872,7 +1005,7 @@ def _run_logits(
     position_ids = packed_tensors["input_pos"].to(device=device)
     group_ids = packed_tensors["group_ids"].to(device=device)
     parent_ids = packed_tensors["parent_ids"].to(device=device)
-    attention_state = create_shared_prefix_state(
+    attention_state = create_prefix_tree_state(
         group_ids=group_ids,
         parent_ids=parent_ids,
         input_pos=position_ids,
@@ -883,6 +1016,7 @@ def _run_logits(
         build_gdn_execution_spec=bool(
             getattr(runtime.model_support_handler, "build_gdn_execution_spec", False)
         ),
+        model_support_handler=runtime.model_support_handler,
         attention_head_dim=getattr(runtime.provider, "kv_channels", None),
         attention_value_head_dim=getattr(runtime.provider, "kv_channels", None),
     )

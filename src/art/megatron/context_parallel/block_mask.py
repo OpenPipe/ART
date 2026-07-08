@@ -7,7 +7,7 @@ import torch
 from torch.nn.attention.flex_attention import BlockMask
 
 from art.megatron.flex_attn.compiled import normalize_sparse_block_size
-from art.megatron.shared_prefix_tree import parse_shared_prefix_row
+from art.megatron.prefix_tree import parse_prefix_tree_row
 
 from .types import AttnMaskKind, FlexMaskSpec
 
@@ -63,7 +63,7 @@ def _build_interval_mask_mod(
     if sliding_window is not None and (
         q_pos_tensor_or_none is None or k_pos_tensor_or_none is None
     ):
-        raise RuntimeError("Sliding-window shared-prefix masks require input_pos.")
+        raise RuntimeError("Sliding-window prefix-tree masks require input_pos.")
     q_pos_tensor = q_pos_tensor_or_none
     k_pos_tensor = k_pos_tensor_or_none
 
@@ -748,7 +748,7 @@ def prepare_block_mask_context(
         if input_pos is None
         else input_pos.detach().to(device="cpu", dtype=torch.int64).reshape(-1)
     )
-    row_tree = parse_shared_prefix_row(
+    row_tree = parse_prefix_tree_row(
         group_ids=flat_group_ids,
         parent_ids=flat_parent_ids,
     )
@@ -766,9 +766,7 @@ def prepare_block_mask_context(
 
 def _require_input_pos(context: PreparedBlockMaskContext) -> np.ndarray:
     if context.input_pos_np is None:
-        raise RuntimeError(
-            "Sliding-window shared-prefix block masks require input_pos."
-        )
+        raise RuntimeError("Sliding-window prefix-tree block masks require input_pos.")
     return context.input_pos_np
 
 

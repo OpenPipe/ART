@@ -68,6 +68,51 @@ def test_build_runtime_server_cmd_honors_runtime_bin_override(monkeypatch) -> No
     assert command[:2] == ["/opt/art/bin/runtime", "--wrapped"]
 
 
+def test_build_runtime_server_cmd_allows_lora_without_initial_adapter(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.delenv("ART_VLLM_RUNTIME_BIN", raising=False)
+    runtime_root = tmp_path / "custom-runtime"
+    runtime_bin = runtime_root / ".venv" / "bin" / "art-vllm-runtime-server"
+    runtime_bin.parent.mkdir(parents=True, exist_ok=True)
+    runtime_bin.write_text("#!/bin/sh\n", encoding="ascii")
+    monkeypatch.setenv("ART_VLLM_RUNTIME_PROJECT_ROOT", str(runtime_root))
+
+    command = runtime.build_vllm_runtime_server_cmd(
+        runtime.VllmRuntimeLaunchConfig(
+            base_model="Qwen/Qwen3-14B",
+            port=8000,
+            host="0.0.0.0",
+            cuda_visible_devices="0,1",
+            served_model_name="test@0",
+            rollout_weights_mode="lora",
+        )
+    )
+
+    assert command[0] == str(runtime_bin)
+    assert not any(arg.startswith("--lora-path=") for arg in command)
+    assert "--rollout-weights-mode=lora" in command
+
+
+def test_external_checkpoint_path_mapping() -> None:
+    config = {
+        "vllm_runtime": {
+            "mode": "external",
+            "server_url": "http://inference:8000",
+            "local_checkpoint_root": "/mnt/ws_pvc/ws",
+            "server_checkpoint_root": "/remote/ws",
+        }
+    }
+
+    mapped = runtime.map_checkpoint_path_for_vllm(
+        config,
+        "/mnt/ws_pvc/ws/projects/art/.art/models/model/0001",
+    )
+
+    assert mapped == "/remote/ws/projects/art/.art/models/model/0001"
+
+
 def test_get_vllm_runtime_nccl_so_path_queries_runtime_python(
     monkeypatch,
     tmp_path: Path,
@@ -90,7 +135,7 @@ def test_get_vllm_runtime_nccl_so_path_queries_runtime_python(
         return SimpleNamespace(returncode=0, stdout=f"{nccl_so_path}\n", stderr="")
 
     monkeypatch.setenv("ART_VLLM_RUNTIME_PROJECT_ROOT", str(runtime_root))
-    monkeypatch.setattr(runtime.subprocess, "run", fake_run)
+    monkeypatch.setattr(runtime, "subprocess", SimpleNamespace(run=fake_run))
 
     assert runtime.get_vllm_runtime_nccl_so_path() == nccl_so_path.resolve()
     command = seen["command"]
@@ -98,6 +143,61 @@ def test_get_vllm_runtime_nccl_so_path_queries_runtime_python(
     assert command[0] == str(runtime_python)
     assert seen["capture_output"] is True
     assert seen["text"] is True
+
+
+def test_vllm_runtime_subprocess_env_isolates_flashinfer_for_source_runtime(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    runtime_root = tmp_path / "vllm_runtime"
+    runtime_root.mkdir()
+    monkeypatch.setenv("ART_VLLM_RUNTIME_PROJECT_ROOT", str(runtime_root))
+    monkeypatch.setenv("FLASHINFER_WORKSPACE_BASE", "/shared/flashinfer")
+    monkeypatch.setenv(
+        "PYTHONPATH",
+        os.pathsep.join(
+            [
+                "/keep",
+                "/venv/lib/python3.12/site-packages/tilelang/vendored",
+            ]
+        ),
+    )
+
+    env = runtime._vllm_runtime_subprocess_env()
+
+    assert env["PYTHONPATH"] == "/keep"
+    assert env["FLASHINFER_WORKSPACE_BASE"] == str(
+        tmp_path / "scratch" / "vllm_runtime_flashinfer"
+    )
+
+
+def test_vllm_runtime_subprocess_env_isolates_flashinfer_for_managed_runtime(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    cache_root = tmp_path / "runtime_cache"
+    monkeypatch.setenv("ART_VLLM_RUNTIME_PROJECT_ROOT", str(tmp_path / "missing"))
+    monkeypatch.setenv("ART_VLLM_RUNTIME_CACHE_DIR", str(cache_root))
+    monkeypatch.setenv("FLASHINFER_WORKSPACE_BASE", "/shared/flashinfer")
+
+    env = runtime._vllm_runtime_subprocess_env()
+
+    assert env["FLASHINFER_WORKSPACE_BASE"] == str(cache_root / "flashinfer_workspace")
+
+
+def test_vllm_runtime_subprocess_env_honors_flashinfer_workspace_override(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    override = tmp_path / "explicit_flashinfer"
+    monkeypatch.setenv(
+        "ART_VLLM_RUNTIME_FLASHINFER_WORKSPACE_BASE",
+        str(override),
+    )
+
+    env = runtime._vllm_runtime_subprocess_env()
+
+    assert env["FLASHINFER_WORKSPACE_BASE"] == str(override)
 
 
 def test_cleanup_old_managed_runtimes_only_deletes_marked_venvs(

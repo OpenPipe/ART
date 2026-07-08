@@ -220,6 +220,17 @@ TOPOLOGIES = [
     Topology(tp=2, ep=2, etp=1, dp=1, cp=2, sp=True),
     Topology(tp=2, ep=4, etp=2, dp=2, cp=2, sp=True),
 ]
+
+
+def _without_context_parallel(topology: Topology) -> Topology:
+    return topology.model_copy(update={"dp": topology.dp * topology.cp, "cp": 1})
+
+
+CP_UNSUPPORTED_MOE_TOPOLOGIES = [
+    _without_context_parallel(topology) for topology in TOPOLOGIES[:-1]
+] + [
+    Topology(tp=2, ep=2, etp=2, dp=2, cp=1, sp=True),
+]
 DENSE_TOPOLOGIES = [
     Topology(tp=1, ep=1, etp=1, dp=1, sp=False),
     Topology(tp=2, ep=1, etp=1, dp=1, sp=True),
@@ -756,9 +767,30 @@ def oracle_topology(*, is_moe: bool = True) -> Topology:
     return ORACLE_TOPOLOGY if is_moe else DENSE_ORACLE_TOPOLOGY
 
 
-def selected_suite_topologies(*, is_moe: bool = True) -> list[Topology]:
+def _filter_context_parallel_support(
+    topologies: list[Topology],
+    *,
+    is_moe: bool,
+    cp_supported: bool,
+) -> list[Topology]:
+    if cp_supported:
+        return topologies
+    if is_moe:
+        return list(CP_UNSUPPORTED_MOE_TOPOLOGIES)
+    return [_without_context_parallel(topology) for topology in topologies]
+
+
+def selected_suite_topologies(
+    *,
+    is_moe: bool = True,
+    cp_supported: bool = True,
+) -> list[Topology]:
     """Returns the correctness topology list for a model family."""
-    return list(TOPOLOGIES if is_moe else DENSE_TOPOLOGIES)
+    return _filter_context_parallel_support(
+        list(TOPOLOGIES if is_moe else DENSE_TOPOLOGIES),
+        is_moe=is_moe,
+        cp_supported=cp_supported,
+    )
 
 
 def stable_case_id(case_config: OracleCaseConfig) -> str:
@@ -1009,7 +1041,11 @@ def _stacked_layers(
         if len(reference_shapes) != 1 or len(candidate_shapes) != 1:
             original_names = original_names_by_group[normalized]
             for original_name, (reference, candidate) in zip(original_names, group):
-                stacked_pairs.append((original_name, reference, candidate))
+                # Keep one synthetic layer axis so layer-averaged comparison
+                # does not treat tensor rows/features as layer entries.
+                stacked_pairs.append(
+                    (original_name, reference.unsqueeze(0), candidate.unsqueeze(0))
+                )
             continue
         stacked_pairs.append(
             (
@@ -1075,7 +1111,7 @@ class VariantRunner:
         if self._sample_valid_lengths_cache is not None:
             return self._sample_valid_lengths_cache
         from art.megatron.context_parallel.builder import (
-            build_shared_prefix_attention_spec,
+            build_prefix_tree_attention_spec,
         )
         from art.preprocessing.pack import packed_tensors_from_dir
 
@@ -1086,7 +1122,7 @@ class VariantRunner:
         parent_ids = packed_tensors["parent_ids"]
         self._sample_valid_lengths_cache = tuple(
             int(
-                build_shared_prefix_attention_spec(
+                build_prefix_tree_attention_spec(
                     group_ids=group_ids[row_index : row_index + 1],
                     parent_ids=parent_ids[row_index : row_index + 1],
                 )
@@ -1866,8 +1902,17 @@ class VariantRunner:
     def run_suite(
         self,
         variants: list[VariantSpec],
+        *,
+        prune_reference_artifacts: bool = True,
+        prune_case_artifacts: bool = True,
     ) -> list[VariantReport]:
-        """Runs variants in order and stops at the first unexpected signal."""
+        """Runs variants in order and stops at the first unexpected signal.
+
+        Reference and case artifacts are normally pruned when the suite exits.
+        Callers that immediately run another comparison suite against the same
+        reference can defer that pruning so the second suite does not have to
+        regenerate or fail on missing forward traces.
+        """
         reports: list[VariantReport] = []
         try:
             for variant in variants:
@@ -1881,8 +1926,10 @@ class VariantRunner:
                     / "variant_report.json",
                 )
         finally:
-            self._prune_reference_artifacts()
-            _prune_case_artifacts(self.case_dir)
+            if prune_reference_artifacts:
+                self._prune_reference_artifacts()
+            if prune_case_artifacts:
+                _prune_case_artifacts(self.case_dir)
         return reports
 
 
@@ -1928,13 +1975,18 @@ def _suite_variants(
     objective: OracleObjective,
     *,
     is_moe: bool = True,
+    cp_supported: bool = True,
     max_world_size: int | None = None,
     variant_flex_backend: FlexBackend | None = None,
+    phase_pass_fns: dict[str, PhasePassFn] | None = None,
 ) -> list[VariantSpec]:
     """Builds the standard oracle suite variant ordering."""
-    phase_pass = _default_phase_pass_fns()
+    phase_pass = phase_pass_fns or _default_phase_pass_fns()
     variants: list[VariantSpec] = []
-    for topology in selected_suite_topologies(is_moe=is_moe)[1:]:
+    for topology in selected_suite_topologies(
+        is_moe=is_moe,
+        cp_supported=cp_supported,
+    )[1:]:
         if max_world_size is not None and topology.world_size() > max_world_size:
             continue
         variants.append(
@@ -1955,6 +2007,11 @@ def run_suite(
     max_world_size: int | None = None,
     oracle_flex_backend: FlexBackend | None = None,
     variant_flex_backend: FlexBackend | None = None,
+    cp_supported: bool = True,
+    phase_pass_fns: dict[str, PhasePassFn] | None = None,
+    use_fp32_lora_reference: bool = True,
+    prune_reference_artifacts: bool = True,
+    prune_case_artifacts: bool = True,
 ) -> list[VariantReport]:
     """Runs non-oracle topologies against the canonical replay-backed oracle."""
     reports: list[VariantReport] = []
@@ -1964,15 +2021,20 @@ def run_suite(
             case_config=case_config,
             oracle_flex_backend=oracle_flex_backend,
             variant_flex_backend=variant_flex_backend,
+            use_fp32_lora_reference=use_fp32_lora_reference,
         )
         reports.extend(
             runner.run_suite(
                 _suite_variants(
                     objective,
                     is_moe=case_config.is_moe,
+                    cp_supported=cp_supported,
                     max_world_size=max_world_size,
                     variant_flex_backend=variant_flex_backend,
-                )
+                    phase_pass_fns=phase_pass_fns,
+                ),
+                prune_reference_artifacts=prune_reference_artifacts,
+                prune_case_artifacts=prune_case_artifacts,
             )
         )
     return reports

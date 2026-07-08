@@ -1,3 +1,4 @@
+from types import SimpleNamespace
 from typing import Any, cast
 
 import httpx

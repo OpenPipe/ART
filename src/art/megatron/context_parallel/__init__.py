@@ -1,4 +1,4 @@
-from .builder import build_dense_reference_mask, build_shared_prefix_attention_spec
+from .builder import build_dense_reference_mask, build_prefix_tree_attention_spec
 from .layout_index import TokenLayoutIndex
 from .types import (
     ArtContextParallelState,
@@ -28,5 +28,5 @@ __all__ = [
     "TokenRange",
     "TokenLayoutIndex",
     "build_dense_reference_mask",
-    "build_shared_prefix_attention_spec",
+    "build_prefix_tree_attention_spec",
 ]

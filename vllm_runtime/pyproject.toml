@@ -5,7 +5,7 @@ description = "Tiny ART-owned vLLM runtime package"
 requires-python = ">=3.12,<3.13"
 dependencies = [
     "nvidia-nccl-cu12==2.28.9 ; sys_platform == 'linux'",
-    "transformers==5.6.2",
+    "transformers==5.12.1",
     "vllm @ https://github.com/vllm-project/vllm/releases/download/v0.23.0/vllm-0.23.0%2Bcu129-cp38-abi3-manylinux_2_28_x86_64.whl ; sys_platform == 'linux'",
 ]
 
@@ -37,5 +37,5 @@ override-dependencies = [
     "torch @ https://download.pytorch.org/whl/test/cu128/torch-2.11.0%2Bcu128-cp312-cp312-manylinux_2_28_x86_64.whl",
     "torchaudio @ https://download.pytorch.org/whl/test/cu128/torchaudio-2.11.0%2Bcu128-cp312-cp312-manylinux_2_28_x86_64.whl",
     "torchvision @ https://download.pytorch.org/whl/test/cu128/torchvision-0.26.0%2Bcu128-cp312-cp312-manylinux_2_28_x86_64.whl",
-    "transformers==5.6.2",
+    "transformers==5.12.1",
 ]

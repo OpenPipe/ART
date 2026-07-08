@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import torch
 
-from art.megatron.shared_prefix_tree import parse_shared_prefix_tree
+from art.megatron.prefix_tree import parse_prefix_tree
 
 from .types import (
     AttnMaskKind,
@@ -45,7 +45,7 @@ def _sort_and_dedupe_slices(slices: list[AttnSlice]) -> tuple[AttnSlice, ...]:
     return tuple(deduped)
 
 
-def build_shared_prefix_attention_spec(
+def build_prefix_tree_attention_spec(
     *,
     group_ids: torch.Tensor,
     parent_ids: torch.Tensor,
@@ -62,7 +62,7 @@ def build_shared_prefix_attention_spec(
             f"{group_ids.ndim}"
         )
     rows: list[PackedRowAttentionSpec] = []
-    for row in parse_shared_prefix_tree(
+    for row in parse_prefix_tree(
         group_ids=group_ids,
         parent_ids=parent_ids,
         ignore_padding_group_id=ignore_padding_group_id,

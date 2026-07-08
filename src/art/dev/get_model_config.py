@@ -1,4 +1,7 @@
-from ..megatron.model_support import default_target_modules_for_model
+from ..megatron.model_support import (
+    default_target_modules_for_model,
+    vllm_lora_config_for_model,
+)
 from .engine import EngineArgs
 from .model import (
     PEFT_ARGS_MIGRATION_MESSAGE,
@@ -67,7 +70,11 @@ def get_model_config(
     if rollout_weights_mode == "lora" and "lora_target_modules" not in config.get(
         "engine_args", {}
     ):
-        engine_args["lora_target_modules"] = merged_lora_config["target_modules"]
+        engine_args["lora_target_modules"] = vllm_lora_config_for_model(
+            base_model,
+            dict(merged_lora_config),
+            allow_unvalidated_arch=True,
+        )["target_modules"]
     trainer_args = TrainerArgs(
         adam_beta1=0.9,
         adam_beta2=0.99,
@@ -101,4 +108,6 @@ def get_model_config(
         result["trainer_gpu_ids"] = config["trainer_gpu_ids"]
     if "inference_gpu_ids" in config:
         result["inference_gpu_ids"] = config["inference_gpu_ids"]
+    if "vllm_runtime" in config:
+        result["vllm_runtime"] = config["vllm_runtime"]
     return result

@@ -31,7 +31,7 @@ from .real_path import (
 )
 
 
-def test_logical_map_flattens_shared_prefix_branches() -> None:
+def test_logical_map_flattens_prefix_tree_branches() -> None:
     packed = {
         "tokens": torch.tensor([[10, 11, 12, 13, 14, 12, 15, 16]]),
         "group_ids": torch.tensor([[0, 0, 1, 1, 1, 2, 2, 2]]),

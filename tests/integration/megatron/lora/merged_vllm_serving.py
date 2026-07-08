@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import asyncio
+from contextlib import contextmanager
 import os
 from pathlib import Path
 import socket
+from typing import Any, Iterator, cast
 
 from pydantic import BaseModel, Field
 import torch
@@ -15,9 +17,15 @@ from art.megatron.service import MegatronService
 from ..model_support.oracle_harness import (
     ORACLE_TOPOLOGY,
     OracleCaseConfig,
+    Topology,
     ensure_case_artifacts,
 )
 from ..model_support.oracle_worker import provider_topology_env
+from ..model_support.workflow_resources import (
+    handler_workflow_resources_for_base_model,
+    resolve_stage_resources_for_visible_gpus,
+    validate_dedicated_test_resources,
+)
 
 _TRAINER_GPU_IDS_ENV = "ART_MODEL_SUPPORT_TRAINER_GPU_IDS"
 _INFERENCE_GPU_IDS_ENV = "ART_MODEL_SUPPORT_INFERENCE_GPU_IDS"
@@ -66,14 +74,28 @@ def _resolve_dedicated_gpu_ids() -> tuple[list[int], list[int]]:
     return [0], [1]
 
 
-def _init_runtime_config(case_config: OracleCaseConfig) -> None:
+@contextmanager
+def _temporary_env(updates: dict[str, str]) -> Iterator[None]:
+    previous = {name: os.environ.get(name) for name in updates}
+    os.environ.update(updates)
+    try:
+        yield
+    finally:
+        for name, value in previous.items():
+            if value is None:
+                os.environ.pop(name, None)
+            else:
+                os.environ[name] = value
+
+
+def _init_runtime_config(case_config: OracleCaseConfig, topology: Any) -> None:
     art.init_megatron_runtime_config(
         topology=art.MegatronTopologyConfig(
-            tp=ORACLE_TOPOLOGY.tp,
-            cp=ORACLE_TOPOLOGY.cp,
-            ep=ORACLE_TOPOLOGY.ep,
-            pp=ORACLE_TOPOLOGY.pp,
-            etp=ORACLE_TOPOLOGY.etp,
+            tp=topology.tp,
+            cp=topology.cp,
+            ep=topology.ep,
+            pp=topology.pp,
+            etp=topology.etp,
         ),
         packed_sequence_length=case_config.packed_tensors.sequence_length,
     )
@@ -82,7 +104,50 @@ def _init_runtime_config(case_config: OracleCaseConfig) -> None:
 async def _run_merged_vllm_serving(
     case_config: OracleCaseConfig,
 ) -> MergedVllmServingReport:
-    trainer_gpu_ids, inference_gpu_ids = _resolve_dedicated_gpu_ids()
+    workflow_resources = handler_workflow_resources_for_base_model(
+        case_config.base_model,
+        allow_unvalidated_arch=case_config.allow_unvalidated_arch,
+    )
+    stage_resources = (
+        workflow_resources.merged_vllm_serving
+        if workflow_resources is not None
+        else None
+    )
+    topology: Topology = ORACLE_TOPOLOGY
+    megatron_env: dict[str, str] = {}
+    engine_args: dev.EngineArgs = dev.EngineArgs()
+    if stage_resources is not None:
+        stage_resources = resolve_stage_resources_for_visible_gpus(
+            "merged_vllm_serving",
+            stage_resources,
+            visible_gpu_count=int(torch.cuda.device_count()),
+        )
+        if stage_resources.megatron is None or stage_resources.vllm is None:
+            raise RuntimeError(
+                "merged_vllm_serving resources require Megatron and vLLM"
+            )
+        trainer_gpu_ids = list(stage_resources.megatron.gpu_ids)
+        inference_gpu_ids = list(stage_resources.vllm.gpu_ids)
+        validate_dedicated_test_resources(
+            stage_name="merged_vllm_serving",
+            trainer_gpu_ids=trainer_gpu_ids,
+            inference_gpu_ids=inference_gpu_ids,
+            allow_overlap=stage_resources.allow_gpu_overlap,
+        )
+        resource_topology = stage_resources.megatron.topology
+        topology = Topology(
+            tp=resource_topology.tp,
+            ep=resource_topology.ep,
+            etp=resource_topology.etp,
+            dp=resource_topology.dp,
+            cp=resource_topology.cp,
+            pp=resource_topology.pp,
+            sp=resource_topology.sp,
+        )
+        megatron_env = dict(stage_resources.megatron_env)
+        engine_args = cast(dev.EngineArgs, stage_resources.vllm.engine_args())
+    else:
+        trainer_gpu_ids, inference_gpu_ids = _resolve_dedicated_gpu_ids()
     service_name = "model_support_merged_validation"
     case_artifacts = ensure_case_artifacts(case_config)
     output_dir = str(Path(case_artifacts.case_dir) / "merged_vllm_serving")
@@ -92,10 +157,12 @@ async def _run_merged_vllm_serving(
         inference_gpu_ids=inference_gpu_ids,
         rollout_weights_mode="merged",
         allow_unvalidated_arch=case_config.allow_unvalidated_arch,
+        engine_args=engine_args,
     )
-    dev.validate_dedicated_config(internal_config)
-    with provider_topology_env(ORACLE_TOPOLOGY):
-        _init_runtime_config(case_config)
+    if stage_resources is None:
+        dev.validate_dedicated_config(internal_config)
+    with _temporary_env(megatron_env), provider_topology_env(topology):
+        _init_runtime_config(case_config, topology)
         service = MegatronService(
             model_name=service_name,
             base_model=case_config.base_model,

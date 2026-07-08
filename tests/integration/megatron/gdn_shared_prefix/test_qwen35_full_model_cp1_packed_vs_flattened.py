@@ -23,7 +23,7 @@ import torch.nn.functional as F
 
 from art.loss import shift_tensor
 from art.megatron.model_support.handlers.qwen3_5 import QWEN3_5_MOE_HANDLER
-from art.megatron.shared_prefix_state import create_shared_prefix_state
+from art.megatron.prefix_tree_state import create_prefix_tree_state
 
 from ..model_support.oracle_harness import TEST_DEFAULT_FLEX_BACKEND
 from ..model_support.oracle_worker import (
@@ -42,7 +42,7 @@ from .metrics import (
     stable_output_mse_loss,
 )
 from .packed_layout import build_phase0_packed_tensors
-from .parser_import import parse_gdn_shared_prefix_segments
+from .parser_import import parse_gdn_prefix_tree_segments
 from .real_gdn_oracle import (
     attach_main_grads,
     zero_parameter_grads,
@@ -66,7 +66,7 @@ def _fp32_test_flex_backend() -> Iterator[None]:
 
 @pytest.mark.skipif(
     not torch.cuda.is_available(),
-    reason="CUDA is required for Qwen3.5 full-model shared-prefix oracle coverage.",
+    reason="CUDA is required for Qwen3.5 full-model prefix-tree oracle coverage.",
 )
 def test_qwen35_full_model_cp1_matches_flattened_grad_accumulation() -> None:
     with _single_rank_model_parallel():
@@ -98,7 +98,7 @@ def test_qwen35_full_model_cp1_matches_flattened_grad_accumulation() -> None:
 
         flat_loss_sum: torch.Tensor | None = None
         logits_mean_abs_pct = 0.0
-        spec = parse_gdn_shared_prefix_segments(group_ids.cpu(), parent_ids.cpu())
+        spec = parse_gdn_prefix_tree_segments(group_ids.cpu(), parent_ids.cpu())
         for segment_index, completion in enumerate(spec.tree_segments):
             if spec.tree_parent_indices[segment_index] < 0:
                 continue
@@ -216,7 +216,7 @@ def _assert_logits_vjp_equivalence(
 
     flat_loss_sum: torch.Tensor | None = None
     logits_mean_abs_pct = 0.0
-    spec = parse_gdn_shared_prefix_segments(group_ids.cpu(), parent_ids.cpu())
+    spec = parse_gdn_prefix_tree_segments(group_ids.cpu(), parent_ids.cpu())
     for segment_index, completion in enumerate(spec.tree_segments):
         if spec.tree_parent_indices[segment_index] < 0:
             continue
@@ -300,7 +300,7 @@ def _run_model_loss(
         group_ids=group_ids,
         parent_ids=parent_ids,
     )
-    attention_state = create_shared_prefix_state(
+    attention_state = create_prefix_tree_state(
         group_ids=group_ids,
         parent_ids=parent_ids,
         build_gdn_execution_spec=True,
@@ -335,7 +335,7 @@ def _run_model_logits(
     group_ids: torch.Tensor,
     parent_ids: torch.Tensor,
 ) -> torch.Tensor:
-    attention_state = create_shared_prefix_state(
+    attention_state = create_prefix_tree_state(
         group_ids=group_ids,
         parent_ids=parent_ids,
         build_gdn_execution_spec=True,

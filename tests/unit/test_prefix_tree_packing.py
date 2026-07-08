@@ -3,9 +3,9 @@ from __future__ import annotations
 import pytest
 import torch
 
-from art.megatron.shared_prefix_packing import (
+from art.megatron.prefix_tree_packing import (
     _local_position_pairs,
-    estimate_shared_prefix_packed_tokens,
+    estimate_prefix_tree_packed_tokens,
     prefix_tree_pack,
 )
 
@@ -110,7 +110,7 @@ def test_prefix_tree_pack_respects_shareable_lengths() -> None:
         [0, 1, 2],
         [0, 3, 4],
     ]
-    assert estimate_shared_prefix_packed_tokens(
+    assert estimate_prefix_tree_packed_tokens(
         inputs,
         max_depth=4,
         shareable_lengths=(1, 1),
@@ -139,7 +139,7 @@ def test_packed_token_estimator_matches_real_packing() -> None:
         for depth in range(5):
             pack = prefix_tree_pack(inputs, max_depth=depth)
 
-            assert estimate_shared_prefix_packed_tokens(inputs, max_depth=depth) == int(
+            assert estimate_prefix_tree_packed_tokens(inputs, max_depth=depth) == int(
                 pack.tokens.numel()
             )
 
@@ -157,7 +157,7 @@ def test_packed_token_estimator_matches_randomized_packing() -> None:
     for depth in range(5):
         pack = prefix_tree_pack(inputs, max_depth=depth)
 
-        assert estimate_shared_prefix_packed_tokens(inputs, max_depth=depth) == int(
+        assert estimate_prefix_tree_packed_tokens(inputs, max_depth=depth) == int(
             pack.tokens.numel()
         )
 

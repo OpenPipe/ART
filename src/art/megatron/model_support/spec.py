@@ -1,6 +1,6 @@
 from typing import TYPE_CHECKING, Any, Literal, Protocol, Sequence, runtime_checkable
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 if TYPE_CHECKING:
     from megatron.bridge import AutoBridge
@@ -13,7 +13,12 @@ SharedExpertCompileState = Literal[
     "shared_experts",
     "shared_expert_overlap",
 ]
-ExpertPackedLoraLayout = Literal["expert_rows", "rank_major_expert_cols"]
+ExpertPackedLoraLayout = Literal[
+    "expert_rows",
+    "rank_major_expert_cols",
+    "interleaved_gate_up_rank_major_expert_cols",
+]
+HfWeightSourceKind = Literal["direct", "bridge_materialized"]
 
 
 class DependencyFloor(BaseModel):
@@ -41,6 +46,18 @@ class ArchitectureReport(BaseModel):
     unresolved_risks: list[str] = Field(default_factory=list)
 
 
+class PrefixTreeModelStateContext(BaseModel):
+    model_config = ConfigDict(arbitrary_types_allowed=True)
+
+    group_ids: Any
+    parent_ids: Any
+    input_pos: Any | None = None
+    device: Any
+    attention_token_layout_index: Any | None = None
+    attention_head_dim: int | None = None
+    attention_value_head_dim: int | None = None
+
+
 class CompileWorkaroundConfig(BaseModel):
     flags: tuple[str, ...] = ()
     unconditional_flags: tuple[str, ...] = ()
@@ -66,6 +83,12 @@ class ExpertPackedLoraGroup(BaseModel):
     slots: tuple[ExpertPackedLoraSlot, ...]
 
 
+class HfWeightSource(BaseModel):
+    logical_key: str
+    physical_key_options: tuple[tuple[str, ...], ...]
+    kind: HfWeightSourceKind = "direct"
+
+
 class ModelSupportSpec(BaseModel):
     key: str
     handler_key: str
@@ -82,6 +105,7 @@ class ModelSupportHandler(Protocol):
     key: str
     is_moe: bool
     build_gdn_execution_spec: bool
+    cp_supported: bool
     native_vllm_lora_status: NativeVllmLoraStatus
 
     def identity_lora_model_config(self, base_config: Any) -> Any: ...
@@ -95,6 +119,14 @@ class ModelSupportHandler(Protocol):
 
     def patch_bridge(self, bridge: "AutoBridge") -> None: ...
 
+    def hf_weight_source(
+        self,
+        bridge: "AutoBridge",
+        hf_param: str,
+        *,
+        task: Any | None = None,
+    ) -> HfWeightSource | None: ...
+
     def patch_provider(
         self,
         provider: "GPTModelProvider",
@@ -103,7 +135,37 @@ class ModelSupportHandler(Protocol):
 
     def configure_provider_for_runtime(self, provider: "GPTModelProvider") -> None: ...
 
+    def default_chat_template(self) -> str | None: ...
+
+    def configure_tokenizer(
+        self,
+        tokenizer: Any,
+        *,
+        internal_config: Any,
+    ) -> Any: ...
+
+    def vllm_engine_args(
+        self,
+        *,
+        rollout_weights_mode: RolloutWeightsMode,
+    ) -> dict[str, object]: ...
+
+    def vllm_server_args(self) -> dict[str, object]: ...
+
     def install_preprocess_patch(self, model_chunks: Sequence[Any]) -> None: ...
+
+    def build_prefix_tree_model_state(
+        self,
+        context: PrefixTreeModelStateContext,
+    ) -> dict[str, Any]: ...
+
+    def correctness_precision(self) -> Literal["bf16", "fp32"]: ...
+
+    def correctness_use_fp32_lora_reference(self) -> bool: ...
+
+    def correctness_phase_pass_fns(
+        self, oracle_harness: Any
+    ) -> dict[str, Any] | None: ...
 
     def collect_layer_families(
         self,
@@ -131,6 +193,11 @@ class ModelSupportHandler(Protocol):
         *,
         adapter_config: dict[str, Any],
     ) -> tuple[dict[str, Any], dict[str, Any]]: ...
+
+    def to_vllm_lora_config(
+        self,
+        adapter_config: dict[str, Any],
+    ) -> dict[str, Any]: ...
 
     def expert_packed_lora_groups(self) -> tuple[ExpertPackedLoraGroup, ...]: ...
 

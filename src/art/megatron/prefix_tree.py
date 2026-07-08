@@ -6,7 +6,7 @@ import torch
 
 
 @dataclass(frozen=True, slots=True)
-class SharedPrefixSegment:
+class PrefixTreeSegment:
     group_id: int
     parent_id: int
     start: int
@@ -20,18 +20,18 @@ class SharedPrefixSegment:
 
 
 @dataclass(frozen=True, slots=True)
-class SharedPrefixRowTree:
+class PrefixTreeRow:
     row_index: int
     valid_tokens: int
-    segments: tuple[SharedPrefixSegment, ...]
+    segments: tuple[PrefixTreeSegment, ...]
 
 
-def parse_shared_prefix_tree(
+def parse_prefix_tree(
     *,
     group_ids: torch.Tensor,
     parent_ids: torch.Tensor,
     ignore_padding_group_id: int = -1,
-) -> tuple[SharedPrefixRowTree, ...]:
+) -> tuple[PrefixTreeRow, ...]:
     if group_ids.shape != parent_ids.shape:
         raise RuntimeError(
             "group_ids and parent_ids must share shape, got "
@@ -43,7 +43,7 @@ def parse_shared_prefix_tree(
             f"{group_ids.ndim}"
         )
     return tuple(
-        parse_shared_prefix_row(
+        parse_prefix_tree_row(
             group_ids=group_ids[row_index],
             parent_ids=parent_ids[row_index],
             row_index=row_index,
@@ -53,13 +53,13 @@ def parse_shared_prefix_tree(
     )
 
 
-def parse_shared_prefix_row(
+def parse_prefix_tree_row(
     *,
     group_ids: torch.Tensor,
     parent_ids: torch.Tensor,
     row_index: int = 0,
     ignore_padding_group_id: int = -1,
-) -> SharedPrefixRowTree:
+) -> PrefixTreeRow:
     if group_ids.shape != parent_ids.shape:
         raise RuntimeError(
             "group_ids and parent_ids must share shape, got "
@@ -76,13 +76,13 @@ def parse_shared_prefix_row(
         ignore_padding_group_id=ignore_padding_group_id,
     )
     if valid_tokens == 0:
-        return SharedPrefixRowTree(row_index=row_index, valid_tokens=0, segments=())
+        return PrefixTreeRow(row_index=row_index, valid_tokens=0, segments=())
 
     runs = _scan_runs(group_ids[:valid_tokens], parent_ids[:valid_tokens])
-    first_segment_by_group: dict[int, SharedPrefixSegment] = {}
+    first_segment_by_group: dict[int, PrefixTreeSegment] = {}
     family_by_group: dict[int, int] = {}
     ancestors_by_group: dict[int, tuple[int, ...]] = {}
-    segments: list[SharedPrefixSegment] = []
+    segments: list[PrefixTreeSegment] = []
     next_family_index = 0
 
     seen_groups: set[int] = set()
@@ -93,7 +93,7 @@ def parse_shared_prefix_row(
         seen_groups.add(group_id)
     if repeated_groups:
         raise RuntimeError(
-            "Shared-prefix metadata requires contiguous group runs per row, "
+            "Prefix-tree metadata requires contiguous group runs per row, "
             f"found repeats in row {row_index}: {repeated_groups}"
         )
 
@@ -109,18 +109,18 @@ def parse_shared_prefix_row(
             parent_segment = first_segment_by_group.get(parent_id)
             if parent_segment is None:
                 raise RuntimeError(
-                    "Shared-prefix run points to a missing parent run: "
+                    "Prefix-tree run points to a missing parent run: "
                     f"row={row_index}, group_id={group_id}, parent_id={parent_id}"
                 )
             if int(parent_segment.end) > int(start):
                 raise RuntimeError(
-                    "Shared-prefix parent run must end before its child starts: "
+                    "Prefix-tree parent run must end before its child starts: "
                     f"row={row_index}, group_id={group_id}, parent_id={parent_id}"
                 )
             family_index = family_by_group[parent_id]
             ancestors = (*ancestors_by_group[parent_id], parent_id)
 
-        segment = SharedPrefixSegment(
+        segment = PrefixTreeSegment(
             group_id=group_id,
             parent_id=parent_id,
             start=start,
@@ -133,7 +133,7 @@ def parse_shared_prefix_row(
         ancestors_by_group[group_id] = ancestors
         segments.append(segment)
 
-    return SharedPrefixRowTree(
+    return PrefixTreeRow(
         row_index=row_index,
         valid_tokens=valid_tokens,
         segments=tuple(segments),

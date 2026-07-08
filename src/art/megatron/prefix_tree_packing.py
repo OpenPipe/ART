@@ -7,7 +7,7 @@ import torch
 
 
 @dataclass(frozen=True)
-class SharedPrefixPack:
+class PrefixTreePack:
     tokens: torch.Tensor
     group_ids: torch.Tensor
     parent_ids: torch.Tensor
@@ -29,8 +29,8 @@ def prefix_tree_pack(
     *,
     max_depth: int,
     shareable_lengths: Iterable[int] | None = None,
-) -> SharedPrefixPack:
-    """Pack token sequences by storing shared prefixes once.
+) -> PrefixTreePack:
+    """Pack token sequences by storing prefix trees once.
 
     This is the small packing step that lets `TrainerRank.dp_rank_forward()` run one
     model pass over a compact prefix tree instead of replaying the same prompt
@@ -40,14 +40,14 @@ def prefix_tree_pack(
 
     Args:
         sequences: 1-D token tensors to pack.
-        max_depth: How many nested shared-prefix levels to emit. `0` disables
-            prefix sharing and writes each sequence as its own root segment. `1`
+        max_depth: How many nested prefix-tree levels to emit. `0` disables
+            tree sharing and writes each sequence as its own root segment. `1`
             shares the first common segment in each branch; larger values allow
             branches to contain shared sub-branches.
 
     Returns:
         `tokens` is the compact model input, shaped `[1, packed_length]`.
-        `group_ids` and `parent_ids` describe the prefix tree to shared-prefix
+        `group_ids` and `parent_ids` describe the prefix tree to prefix-tree
         attention. Positions in the same emitted segment share a group, and each
         group points at the parent segment it continues from. Root groups point
         to themselves.
@@ -97,7 +97,7 @@ def prefix_tree_pack(
             positions_by_sequence[sequence_index].append(packed_positions)
         cursor += len(segment)
 
-    return SharedPrefixPack(
+    return PrefixTreePack(
         tokens=torch.cat(token_chunks).unsqueeze(0),
         group_ids=torch.cat(group_chunks).unsqueeze(0),
         parent_ids=torch.cat(parent_chunks).unsqueeze(0),
@@ -111,7 +111,7 @@ def prefix_tree_pack(
     )
 
 
-def estimate_shared_prefix_packed_tokens(
+def estimate_prefix_tree_packed_tokens(
     sequences: Iterable[torch.Tensor],
     *,
     max_depth: int,
@@ -260,10 +260,10 @@ def _empty_pack(
     sequence_count: int = 0,
     *,
     device: torch.device | None = None,
-) -> SharedPrefixPack:
+) -> PrefixTreePack:
     flat = torch.empty(0, dtype=torch.long, device=device)
     row = flat.unsqueeze(0)
-    return SharedPrefixPack(
+    return PrefixTreePack(
         tokens=row,
         group_ids=row,
         parent_ids=row,

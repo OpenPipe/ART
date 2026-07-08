@@ -6,7 +6,7 @@ from pydantic import BaseModel, ConfigDict, Field
 import torch
 
 from .cases import GdnPhase0Case
-from .parser_import import GdnPackedExecutionSpec, parse_gdn_shared_prefix_segments
+from .parser_import import GdnPackedExecutionSpec, parse_gdn_prefix_tree_segments
 
 
 class GdnCaseSummary(BaseModel):
@@ -137,7 +137,7 @@ def summarize_case(
     conv_width: int,
     cp_sizes: tuple[int, ...] = (2, 4, 8),
 ) -> GdnCaseSummary:
-    spec = parse_gdn_shared_prefix_segments(tensors["group_ids"], tensors["parent_ids"])
+    spec = parse_gdn_prefix_tree_segments(tensors["group_ids"], tensors["parent_ids"])
     suffix_lengths = [
         segment.length
         for index, segment in enumerate(spec.tree_segments)
