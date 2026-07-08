@@ -497,9 +497,20 @@ def build_logical_token_map(packed_tensors: dict[str, Any]) -> LogicalTokenMap:
     tokens = packed_tensors["tokens"]
     group_ids = packed_tensors["group_ids"]
     parent_ids = packed_tensors["parent_ids"]
+    assistant_mask = packed_tensors.get("assistant_mask")
+    logprobs = packed_tensors.get("logprobs")
     prompts: list[LogicalPrompt] = []
     logical_tokens: list[LogicalToken] = []
     prompt_id_by_tokens: dict[tuple[int, ...], int] = {}
+
+    def scored_token(sample_id: int, packed_i: int) -> bool:
+        if assistant_mask is not None and not bool(assistant_mask[sample_id, packed_i]):
+            return False
+        if logprobs is not None:
+            value = float(logprobs[sample_id, packed_i])
+            if math.isnan(value):
+                return False
+        return True
 
     for sample_id in range(int(tokens.shape[0])):
         families = _prompt_family_segments(group_ids[sample_id], parent_ids[sample_id])
@@ -509,15 +520,20 @@ def build_logical_token_map(packed_tensors: dict[str, Any]) -> LogicalTokenMap:
             for completion_id, (completion_start, completion_end) in enumerate(
                 completion_segments
             ):
-                if completion_end - completion_start < 2:
+                last_scored_i = None
+                for packed_i in range(completion_start + 1, completion_end):
+                    if scored_token(sample_id, packed_i):
+                        last_scored_i = packed_i
+                if last_scored_i is None:
                     continue
+                effective_completion_end = last_scored_i + 1
                 flat = [
                     int(value)
                     for value in tokens[sample_id, prompt_start:prompt_end].tolist()
                 ] + [
                     int(value)
                     for value in tokens[
-                        sample_id, completion_start:completion_end
+                        sample_id, completion_start:effective_completion_end
                     ].tolist()
                 ]
                 flat_key = tuple(flat)
@@ -536,7 +552,9 @@ def build_logical_token_map(packed_tensors: dict[str, Any]) -> LogicalTokenMap:
                             token_ids=flat,
                         )
                     )
-                for packed_i in range(completion_start + 1, completion_end):
+                for packed_i in range(completion_start + 1, effective_completion_end):
+                    if not scored_token(sample_id, packed_i):
+                        continue
                     logical_tokens.append(
                         LogicalToken(
                             token_id=int(tokens[sample_id, packed_i].item()),
