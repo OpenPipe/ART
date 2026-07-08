@@ -108,6 +108,12 @@ class ModelSupportHandler(Protocol):
 
     def zero_internal_padding_params(self, model_chunks: Sequence[Any]) -> None: ...
 
+    def canonicalize_loaded_lora_state(
+        self,
+        state: dict[str, Any],
+        model_chunks: Sequence[Any],
+    ) -> dict[str, Any]: ...
+
     def collect_layer_families(
         self,
         provider: "GPTModelProvider",

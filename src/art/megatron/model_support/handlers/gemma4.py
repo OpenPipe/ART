@@ -557,6 +557,97 @@ def _zero_gemma4_moe_lora_padding(
                     )
 
 
+def _gemma4_moe_padding_sizes_from_model_chunks(
+    model_chunks: Sequence[Any],
+) -> tuple[int, int] | None:
+    for chunk in model_chunks:
+        config = getattr(chunk, "config", None)
+        if config is None:
+            config = getattr(getattr(chunk, "module", None), "config", None)
+        if config is None:
+            continue
+        return _gemma4_moe_padding_sizes_from_provider(config)
+    return None
+
+
+def _zero_gemma4_moe_lora_padding_state_tensor(
+    key: str,
+    tensor: torch.Tensor,
+    *,
+    logical: int,
+    internal: int,
+) -> torch.Tensor:
+    result = tensor.clone().contiguous()
+    match = _ART_MOE_EXPERT_KEY_RE.match(key)
+    if match is not None:
+        module = match.group("module")
+        lora = match.group("lora")
+        if module == "gate_up_proj" and lora == "lora_B":
+            if int(result.shape[0]) != 2 * internal:
+                raise RuntimeError(
+                    f"{key}: expected Gemma 4 gate/up LoRA-B dim {2 * internal}, "
+                    f"got {tuple(result.shape)}"
+                )
+            _zero_ranges(
+                result,
+                dim=0,
+                ranges=((logical, internal), (internal + logical, 2 * internal)),
+            )
+        elif module == "down_proj" and lora == "lora_A":
+            if int(result.shape[-1]) != internal:
+                raise RuntimeError(
+                    f"{key}: expected Gemma 4 down LoRA-A dim {internal}, "
+                    f"got {tuple(result.shape)}"
+                )
+            _zero_ranges(result, dim=-1, ranges=((logical, internal),))
+        return result
+    if _ART_PACKED_MOE_KEY_RE.match(key):
+        if key.endswith(".base_layer.lora_B.weight"):
+            if int(result.shape[0]) != 2 * internal:
+                raise RuntimeError(
+                    f"{key}: expected Gemma 4 packed gate/up LoRA-B dim "
+                    f"{2 * internal}, got {tuple(result.shape)}"
+                )
+            _zero_ranges(
+                result,
+                dim=0,
+                ranges=((logical, internal), (internal + logical, 2 * internal)),
+            )
+        elif key.endswith(".lora_A.weight") and not key.endswith(
+            ".base_layer.lora_A.weight"
+        ):
+            if int(result.shape[-1]) != internal:
+                raise RuntimeError(
+                    f"{key}: expected Gemma 4 packed down LoRA-A dim {internal}, "
+                    f"got {tuple(result.shape)}"
+                )
+            _zero_ranges(result, dim=-1, ranges=((logical, internal),))
+    return result
+
+
+def _canonicalize_gemma4_loaded_lora_state(
+    state: dict[str, Any],
+    model_chunks: Sequence[Any],
+) -> dict[str, Any]:
+    sizes = _gemma4_moe_padding_sizes_from_model_chunks(model_chunks)
+    if sizes is None:
+        return state
+    logical, internal = sizes
+    if logical == internal:
+        return state
+    return {
+        key: _zero_gemma4_moe_lora_padding_state_tensor(
+            key,
+            value,
+            logical=logical,
+            internal=internal,
+        )
+        if torch.is_tensor(value)
+        else value
+        for key, value in state.items()
+    }
+
+
 class Gemma4MoeHandler(DefaultMoeHandler):
     key = "gemma4_moe"
     is_moe = True
@@ -603,6 +694,13 @@ class Gemma4MoeHandler(DefaultMoeHandler):
 
     def zero_internal_padding_params(self, model_chunks: Sequence[Any]) -> None:
         _zero_gemma4_moe_lora_padding(model_chunks, grads=False, params=True)
+
+    def canonicalize_loaded_lora_state(
+        self,
+        state: dict[str, Any],
+        model_chunks: Sequence[Any],
+    ) -> dict[str, Any]:
+        return _canonicalize_gemma4_loaded_lora_state(state, model_chunks)
 
     def collect_layer_families(self, provider: Any) -> list[LayerFamilyInstance]:
         if int(getattr(provider, "num_moe_experts", 0) or 0) <= 0:

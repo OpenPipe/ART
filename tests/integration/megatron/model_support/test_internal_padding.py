@@ -277,3 +277,37 @@ def test_gemma4_handler_masks_internal_padding_params_and_grads() -> None:
     assert torch.count_nonzero(chunk.down.A_T[:, logical:, :]) == 0
     assert torch.all(chunk.gate_up.B_T[..., :logical] == 1)
     assert torch.all(chunk.down.A_T[:, :logical, :] == 1)
+
+
+def test_gemma4_handler_canonicalizes_loaded_lora_state_padding() -> None:
+    logical = 4
+    internal = 128
+    chunk = _FakeChunk(logical=logical, internal=internal, rank=2)
+    prefix = "base_model.model.model.layers.0.mlp.experts"
+    state = {
+        f"{prefix}.0.gate_up_proj.lora_B.weight": torch.ones(2 * internal, 2),
+        f"{prefix}.0.down_proj.lora_A.weight": torch.ones(2, internal),
+        f"{prefix}.base_layer.lora_B.weight": torch.ones(2 * internal, 2),
+        f"{prefix}.lora_A.weight": torch.ones(2, internal),
+        f"{prefix}.0.gate_up_proj.lora_A.weight": torch.ones(2, 3),
+    }
+
+    canonical = GEMMA4_MOE_HANDLER.canonicalize_loaded_lora_state(state, [chunk])
+
+    gate_up = canonical[f"{prefix}.0.gate_up_proj.lora_B.weight"]
+    down = canonical[f"{prefix}.0.down_proj.lora_A.weight"]
+    packed_gate_up = canonical[f"{prefix}.base_layer.lora_B.weight"]
+    packed_down = canonical[f"{prefix}.lora_A.weight"]
+    assert torch.count_nonzero(gate_up[logical:internal]) == 0
+    assert torch.count_nonzero(gate_up[internal + logical :]) == 0
+    assert torch.count_nonzero(down[:, logical:]) == 0
+    assert torch.count_nonzero(packed_gate_up[logical:internal]) == 0
+    assert torch.count_nonzero(packed_gate_up[internal + logical :]) == 0
+    assert torch.count_nonzero(packed_down[:, logical:]) == 0
+    assert torch.all(gate_up[:logical] == 1)
+    assert torch.all(gate_up[internal : internal + logical] == 1)
+    assert torch.all(down[:, :logical] == 1)
+    assert torch.equal(
+        canonical[f"{prefix}.0.gate_up_proj.lora_A.weight"],
+        state[f"{prefix}.0.gate_up_proj.lora_A.weight"],
+    )

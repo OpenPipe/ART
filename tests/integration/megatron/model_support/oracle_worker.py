@@ -329,12 +329,19 @@ def _apply_save_mutation_to_tensor_map(
 def _validate_loaded_state_matches_adapter(
     loaded_state: dict[str, Any],
     adapter_model: dict[str, Any],
+    *,
+    model_chunks: list[Any],
+    model_support_handler: Any,
 ) -> None:
     """Checks loaded model LoRA state exactly matches adapter tensors and keys."""
     import torch
 
-    for key in sorted(adapter_model.keys()):
-        assert torch.equal(loaded_state[key].cpu(), adapter_model[key].cpu()), (
+    expected_state = model_support_handler.canonicalize_loaded_lora_state(
+        adapter_model,
+        model_chunks,
+    )
+    for key in sorted(expected_state.keys()):
+        assert torch.equal(loaded_state[key].cpu(), expected_state[key].cpu()), (
             f"Loaded LoRA state mismatch for key '{key}'"
         )
 
@@ -1416,7 +1423,10 @@ def _worker_run(request: WorkerRunRequest) -> None:
     if torch.distributed.get_rank() == 0:  # ty: ignore[possibly-missing-attribute]
         _debug("validating loaded lora state")
         _validate_loaded_state_matches_adapter(
-            _require_not_none(loaded_state, "loaded_state"), adapter_model
+            _require_not_none(loaded_state, "loaded_state"),
+            adapter_model,
+            model_chunks=model_chunks,
+            model_support_handler=runtime.model_support_handler,
         )
     _debug("waiting after loaded lora validation")
     torch.distributed.barrier()  # ty: ignore[possibly-missing-attribute]

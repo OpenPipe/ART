@@ -96,6 +96,14 @@ class DefaultDenseHandler:
         del model_chunks
         return None
 
+    def canonicalize_loaded_lora_state(
+        self,
+        state: dict[str, Any],
+        model_chunks: Sequence[Any],
+    ) -> dict[str, Any]:
+        del model_chunks
+        return state
+
     def to_vllm_lora_tensors(
         self,
         tensors: dict[str, torch.Tensor],
