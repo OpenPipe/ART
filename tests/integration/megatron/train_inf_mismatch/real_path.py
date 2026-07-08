@@ -24,6 +24,9 @@ from art.preprocessing.moe_routing import (
 )
 from art.preprocessing.pack import DiskPackedTensors
 
+from ..model_support.fp32_grouped_gemm import (
+    allow_fp32_grouped_gemm_fallback_for_model_support_tests,
+)
 from .artifacts import REPO_ROOT
 from .output_parity import (
     TOP_K,
@@ -883,6 +886,7 @@ def _real_path_megatron_worker(
     from art.megatron.model_support.lora_disk import load_lora_tensors_for_megatron
     from art.preprocessing.pack import packed_tensors_from_dir
 
+    allow_fp32_grouped_gemm_fallback_for_model_support_tests()
     local_rank = int(os.environ["LOCAL_RANK"])
     torch.cuda.set_device(local_rank)
     torch.distributed.init_process_group(backend="nccl")  # type: ignore[possibly-missing-attribute]
