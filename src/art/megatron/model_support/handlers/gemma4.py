@@ -677,6 +677,7 @@ class Gemma4MoeHandler(DefaultMoeHandler):
         _patch_gemma4_router_for_mcore()
         _patch_gemma4_rotary_for_hf_proportional()
         _patch_gemma4_qkv_for_hf_tied_value()
+        _patch_gemma4_attention_forward_rotary_selection()
         window_size = int(getattr(provider, "window_size", 1024))
         _install_gemma4_flex_core_attention_wrapper(provider)
         provider.art_flex_sliding_windows = (window_size,)
@@ -937,6 +938,7 @@ class Gemma4DenseHandler(DefaultDenseHandler):
     def configure_provider_for_runtime(self, provider: Any) -> None:
         _patch_gemma4_rotary_for_hf_proportional()
         _patch_gemma4_qkv_for_hf_tied_value()
+        _patch_gemma4_attention_forward_rotary_selection()
         window_size = int(getattr(provider, "window_size", 1024))
         _install_gemma4_flex_core_attention_wrapper(provider)
         provider.art_flex_sliding_windows = (window_size,)
@@ -1129,6 +1131,7 @@ GEMMA4_DENSE_HANDLER = Gemma4DenseHandler()
 _GEMMA4_ROUTER_PATCHED = False
 _GEMMA4_ROTARY_PATCHED = False
 _GEMMA4_QKV_PATCHED = False
+_GEMMA4_ATTENTION_FORWARD_PATCHED = False
 
 
 def _patch_gemma4_router_for_mcore() -> None:
@@ -1272,6 +1275,77 @@ def _patch_gemma4_qkv_for_hf_tied_value() -> None:
         _art_gemma4_get_query_key_value_tensors,
     )
     _GEMMA4_QKV_PATCHED = True
+
+
+def _patch_gemma4_attention_forward_rotary_selection() -> None:
+    global _GEMMA4_ATTENTION_FORWARD_PATCHED
+    if _GEMMA4_ATTENTION_FORWARD_PATCHED:
+        return
+    from megatron.bridge.models.gemma import gemma4_provider
+    from megatron.core.transformer.attention import SelfAttention
+
+    original_init = cast(Any, gemma4_provider.Gemma4SelfAttention.__init__)
+
+    def _art_gemma4_self_attention_init(
+        self: Any,
+        config: Any,
+        layer_number: int,
+        **kwargs: Any,
+    ) -> None:
+        original_init(self, config=config, layer_number=layer_number, **kwargs)
+        is_local = gemma4_provider._is_local_attn_layer(
+            layer_number,
+            self.config.interleaved_attn_pattern,
+        )
+        self._art_gemma4_rotary_pos_emb_index = 0 if is_local else 1
+
+    def _art_gemma4_self_attention_forward(
+        self: Any,
+        hidden_states: torch.Tensor,
+        attention_mask: torch.Tensor,
+        key_value_states: torch.Tensor | None = None,
+        inference_context: Any | None = None,
+        rotary_pos_emb: Any | None = None,
+        rotary_pos_cos: torch.Tensor | None = None,
+        rotary_pos_sin: torch.Tensor | None = None,
+        rotary_pos_cos_sin: tuple[torch.Tensor, torch.Tensor] | None = None,
+        attention_bias: torch.Tensor | None = None,
+        packed_seq_params: Any | None = None,
+        sequence_len_offset: int | None = None,
+        *,
+        inference_params: Any | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        del rotary_pos_cos_sin
+        assert isinstance(rotary_pos_emb, (tuple, list)) and len(rotary_pos_emb) == 2
+        assert rotary_pos_cos is None and rotary_pos_sin is None
+        # Avoid compiling one Gemma4SelfAttention.forward specialization per layer.
+        final_rotary_pos_emb = rotary_pos_emb[self._art_gemma4_rotary_pos_emb_index]
+        return SelfAttention.forward(
+            self,
+            hidden_states=hidden_states,
+            attention_mask=attention_mask,
+            key_value_states=key_value_states,
+            inference_context=inference_context,
+            rotary_pos_emb=final_rotary_pos_emb,
+            rotary_pos_cos=rotary_pos_cos,
+            rotary_pos_sin=rotary_pos_sin,
+            attention_bias=attention_bias,
+            packed_seq_params=packed_seq_params,
+            sequence_len_offset=sequence_len_offset,
+            inference_params=inference_params,
+        )
+
+    setattr(
+        gemma4_provider.Gemma4SelfAttention,
+        "__init__",
+        _art_gemma4_self_attention_init,
+    )
+    setattr(
+        gemma4_provider.Gemma4SelfAttention,
+        "forward",
+        _art_gemma4_self_attention_forward,
+    )
+    _GEMMA4_ATTENTION_FORWARD_PATCHED = True
 
 
 def _gather_absolute_rotary_pos_emb(

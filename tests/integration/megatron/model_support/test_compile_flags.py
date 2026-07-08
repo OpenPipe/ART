@@ -72,3 +72,30 @@ def test_gemma4_moe_postprocess_workaround_disables_bridge_override(
         )
     finally:
         monkeypatch.setattr(gemma4_provider.Gemma4MoELayer, "postprocess", original)
+
+
+def test_gemma4_attention_forward_patch_uses_precomputed_rotary_index(
+    monkeypatch,
+) -> None:
+    from megatron.bridge.models.gemma import gemma4_provider
+
+    import art.megatron.model_support.handlers.gemma4 as gemma4_handler
+
+    original_init = gemma4_provider.Gemma4SelfAttention.__init__
+    original_forward = gemma4_provider.Gemma4SelfAttention.forward
+    monkeypatch.setattr(gemma4_handler, "_GEMMA4_ATTENTION_FORWARD_PATCHED", False)
+    try:
+        gemma4_handler._patch_gemma4_attention_forward_rotary_selection()
+        patched_forward = gemma4_provider.Gemma4SelfAttention.forward
+        assert patched_forward is not original_forward
+        assert "layer_number" not in patched_forward.__code__.co_names
+        assert "_art_gemma4_rotary_pos_emb_index" in patched_forward.__code__.co_names
+    finally:
+        monkeypatch.setattr(
+            gemma4_provider.Gemma4SelfAttention, "__init__", original_init
+        )
+        monkeypatch.setattr(
+            gemma4_provider.Gemma4SelfAttention,
+            "forward",
+            original_forward,
+        )
