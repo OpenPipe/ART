@@ -8,6 +8,7 @@ _GEMMA4_MOE_COMPILE_FLAGS = (
     "deepep_dispatch_combine",
     "deepep_permute_restore",
     "flex_token_dispatch_combine",
+    "gemma4_moe_postprocess",
     "moe_postprocess",
     "te_triton_permute_with_mask_map",
 )
@@ -50,3 +51,24 @@ def test_gemma4_moe_compile_workarounds_cover_moe_postprocess() -> None:
     config = GEMMA4_MOE_HANDLER.compile_workaround_config(provider)
     assert config.flags == _GEMMA4_MOE_COMPILE_FLAGS
     assert config.unconditional_flags == ()
+
+
+def test_gemma4_moe_postprocess_workaround_disables_bridge_override(
+    monkeypatch,
+) -> None:
+    from megatron.bridge.models.gemma import gemma4_provider
+
+    from art.megatron.compile_workarounds import (
+        _install_gemma4_moe_postprocess_workaround,
+    )
+
+    original = gemma4_provider.Gemma4MoELayer.postprocess
+    try:
+        _install_gemma4_moe_postprocess_workaround()
+        assert getattr(
+            gemma4_provider.Gemma4MoELayer.postprocess,
+            "__art_compile_disabled__",
+            False,
+        )
+    finally:
+        monkeypatch.setattr(gemma4_provider.Gemma4MoELayer, "postprocess", original)

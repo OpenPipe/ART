@@ -44,6 +44,7 @@ _GEMMA4_MOE_COMPILE_WORKAROUND_FLAGS = (
     "deepep_dispatch_combine",
     "deepep_permute_restore",
     "flex_token_dispatch_combine",
+    "gemma4_moe_postprocess",
     "moe_postprocess",
     "te_triton_permute_with_mask_map",
 )
