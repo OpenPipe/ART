@@ -162,7 +162,7 @@ class StreamingWeightOffloader:
                     )
                 )
             )
-        self.offload_all(wait=True)
+        self.offload_all()
         _rank0_info(
             self.rank, STREAMING_INSTALLED_MESSAGE, len(self.layers), param_count
         )
@@ -171,7 +171,7 @@ class StreamingWeightOffloader:
         self._prefetch_window(0, 1, self.config.resident_layers)
 
     def finish_job(self) -> None:
-        self.offload_all(wait=True)
+        self.offload_all()
 
     def remove(self) -> None:
         for handle in self._hooks:
@@ -182,11 +182,9 @@ class StreamingWeightOffloader:
             self._condition.notify_all()
         self._worker.join(timeout=5.0)
 
-    def offload_all(self, *, wait: bool) -> None:
+    def offload_all(self) -> None:
         for layer_state in self.layers:
             self._ensure_offloaded(layer_state)
-        if wait:
-            torch.cuda.empty_cache()
 
     def _pre_forward(self, layer_state: _LayerState) -> None:
         recompute_forward = _is_recompute_forward()

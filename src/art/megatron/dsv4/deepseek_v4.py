@@ -33,6 +33,7 @@ from megatron.core.transformer.utils import make_sharded_tensors_for_checkpoint
 from art.megatron.dsv4.compressor import (
     DeepSeekV4Compressor,
     Dsv4CompressionLayout,
+    Dsv4SharedPrefixState,
     compressed_layout_topk_idxs,
 )
 from art.megatron.dsv4.kernel.tilelang_sparse_mla import sparse_attn_tilelang
@@ -131,11 +132,19 @@ def _shared_prefix_window_topk_idxs(
     return torch.where(valid, k_idx, torch.full_like(k_idx, -1)).to(torch.int32)
 
 
+def _dsv4_shared_prefix_state(attention_bias: Any) -> Dsv4SharedPrefixState:
+    model_state = getattr(attention_bias, "model_state", None)
+    state = model_state.get("dsv4") if isinstance(model_state, dict) else None
+    if not isinstance(state, Dsv4SharedPrefixState):
+        raise RuntimeError(
+            "DSV4 shared-prefix state is missing. Build it once per packed "
+            "sequence through the model-support shared-prefix state hook."
+        )
+    return state
+
+
 def _dsv4_topk_cache(attention_bias: Any) -> dict[Any, Any]:
-    cache = getattr(attention_bias, "dsv4_topk_idx_cache", None)
-    if not isinstance(cache, dict):
-        raise RuntimeError("DSV4 shared-prefix attention state is missing topk cache.")
-    return cache
+    return _dsv4_shared_prefix_state(attention_bias).topk_idx_cache
 
 
 def _shared_prefix_window_topk_idxs_cached(
@@ -233,13 +242,12 @@ def _shared_prefix_compression_layout(
     *,
     ratio: int,
 ) -> Dsv4CompressionLayout:
-    layouts = getattr(attention_bias, "dsv4_compression_layouts", None)
-    if not isinstance(layouts, dict) or ratio not in layouts:
+    layouts = _dsv4_shared_prefix_state(attention_bias).compression_layouts
+    if ratio not in layouts:
         raise RuntimeError(
             "DSV4 shared-prefix compression layout was not prepared on the "
             f"attention state for ratio={ratio}. Build it once per packed "
-            "sequence via create_shared_prefix_state(..., "
-            "build_dsv4_compression_layouts=True)."
+            "sequence through the model-support shared-prefix state hook."
         )
     layout = layouts[ratio]
     if not isinstance(layout, Dsv4CompressionLayout):

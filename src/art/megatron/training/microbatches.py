@@ -315,7 +315,7 @@ def _causal_attention_state(
     *,
     sliding_windows: tuple[int, ...] = (),
     build_gdn_execution_spec: bool,
-    build_dsv4_compression_layouts: bool = False,
+    model_support_handler: Any,
     attention_head_dim: int | None = None,
     attention_value_head_dim: int | None = None,
 ) -> Any:
@@ -328,14 +328,10 @@ def _causal_attention_state(
         input_pos=torch.arange(seq_len, dtype=torch.int64).unsqueeze(0),
         sliding_windows=sliding_windows,
         build_gdn_execution_spec=build_gdn_execution_spec,
-        build_dsv4_compression_layouts=build_dsv4_compression_layouts,
+        model_support_handler=model_support_handler,
         attention_head_dim=attention_head_dim,
         attention_value_head_dim=attention_value_head_dim,
     )
-
-
-def _build_dsv4_compression_layouts(model_support_handler: Any) -> bool:
-    return bool(getattr(model_support_handler, "build_dsv4_compression_layouts", False))
 
 
 def _next_micro_lookahead(
@@ -357,7 +353,6 @@ def _prepare_dense_rl_micro(
     model_support_handler: Any,
     ref_logprobs: torch.Tensor | None,
 ) -> PreparedRLMicroInputs:
-    build_dsv4_layouts = _build_dsv4_compression_layouts(model_support_handler)
     attention_state = create_shared_prefix_state(
         group_ids=micro["group_ids"],
         parent_ids=micro["parent_ids"],
@@ -367,10 +362,7 @@ def _prepare_dense_rl_micro(
         build_gdn_execution_spec=bool(
             getattr(model_support_handler, "build_gdn_execution_spec", False)
         ),
-        build_dsv4_compression_layouts=build_dsv4_layouts,
-        dsv4_position_ids=micro["input_pos"] if build_dsv4_layouts else None,
-        dsv4_group_ids=micro["group_ids"] if build_dsv4_layouts else None,
-        dsv4_parent_ids=micro["parent_ids"] if build_dsv4_layouts else None,
+        model_support_handler=model_support_handler,
         attention_head_dim=getattr(provider, "kv_channels", None),
         attention_value_head_dim=getattr(provider, "kv_channels", None),
     )
@@ -572,9 +564,7 @@ def _prepare_dense_sft_micro(
             build_gdn_execution_spec=bool(
                 getattr(model_support_handler, "build_gdn_execution_spec", False)
             ),
-            build_dsv4_compression_layouts=_build_dsv4_compression_layouts(
-                model_support_handler
-            ),
+            model_support_handler=model_support_handler,
             attention_head_dim=getattr(provider, "kv_channels", None),
             attention_value_head_dim=getattr(provider, "kv_channels", None),
         ),

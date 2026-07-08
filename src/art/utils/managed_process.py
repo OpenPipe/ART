@@ -3,7 +3,6 @@ from __future__ import annotations
 import argparse
 import ctypes
 import os
-from pathlib import Path
 import signal
 import subprocess
 import sys
@@ -33,34 +32,6 @@ def set_parent_death_signal(parent_pid: int, sig: signal.Signals) -> None:
         os._exit(1)
 
 
-def process_start_time(pid: int) -> int | None:
-    try:
-        stat = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8")
-    except OSError:
-        return None
-    fields = stat[stat.rfind(")") + 2 :].split()
-    try:
-        return int(fields[19])
-    except (IndexError, ValueError):
-        return None
-
-
-def direct_child_pids(pid: int) -> set[int]:
-    children: set[int] = set()
-    task_dir = Path(f"/proc/{pid}/task")
-    try:
-        task_paths = list(task_dir.iterdir())
-    except OSError:
-        return children
-    for task_path in task_paths:
-        try:
-            raw = (task_path / "children").read_text(encoding="utf-8").strip()
-        except OSError:
-            continue
-        children.update(int(part) for part in raw.split() if part.isdecimal())
-    return children
-
-
 def main() -> None:
     args = parse_args()
     if hasattr(os, "setsid") and os.getpgrp() != os.getpid():
@@ -68,33 +39,8 @@ def main() -> None:
 
     process: subprocess.Popen[bytes] | None = None
     child_pgid: int | None = None
-    known_descendants: dict[int, int] = {}
     shutting_down = False
     requested_shutdown: tuple[signal.Signals, int] | None = None
-
-    def remember_descendants() -> None:
-        if process is None:
-            return
-        stack = list(direct_child_pids(process.pid))
-        while stack:
-            pid = stack.pop()
-            if pid == os.getpid() or pid in known_descendants:
-                continue
-            start_time = process_start_time(pid)
-            if start_time is None:
-                continue
-            known_descendants[pid] = start_time
-            stack.extend(direct_child_pids(pid))
-
-    def signal_known_descendants(sig: signal.Signals) -> None:
-        for pid, start_time in list(known_descendants.items()):
-            if process_start_time(pid) != start_time:
-                known_descendants.pop(pid, None)
-                continue
-            try:
-                os.kill(pid, sig)
-            except ProcessLookupError:
-                known_descendants.pop(pid, None)
 
     def signal_child_group(sig: signal.Signals) -> None:
         if child_pgid is None:
@@ -105,28 +51,21 @@ def main() -> None:
             pass
 
     def sweep_child_group() -> None:
-        remember_descendants()
         signal_child_group(signal.SIGTERM)
-        signal_known_descendants(signal.SIGTERM)
         time.sleep(float(os.environ.get("ART_MANAGED_PROCESS_SWEEP_GRACE", 0.5)))
-        remember_descendants()
         signal_child_group(signal.SIGKILL)
-        signal_known_descendants(signal.SIGKILL)
 
     def shutdown(sig: signal.Signals, exit_code: int) -> None:
         nonlocal shutting_down
         if shutting_down:
             return
         shutting_down = True
-        remember_descendants()
         signal_child_group(sig)
-        signal_known_descendants(sig)
         if process is not None:
             try:
                 process.wait(timeout=5)
             except subprocess.TimeoutExpired:
                 signal_child_group(signal.SIGKILL)
-                signal_known_descendants(signal.SIGKILL)
                 process.wait()
         sweep_child_group()
         os._exit(exit_code)
@@ -147,7 +86,6 @@ def main() -> None:
     child_pgid = process.pid
 
     while True:
-        remember_descendants()
         if requested_shutdown is not None:
             shutdown(*requested_shutdown)
         if os.getppid() != args.parent_pid:

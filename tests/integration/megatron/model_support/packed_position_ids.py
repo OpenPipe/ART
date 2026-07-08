@@ -614,12 +614,7 @@ def _logits_equivalence_check(
             build_gdn_execution_spec=bool(
                 getattr(handler, "build_gdn_execution_spec", False)
             ),
-            build_dsv4_compression_layouts=bool(
-                getattr(handler, "build_dsv4_compression_layouts", False)
-            ),
-            dsv4_position_ids=row_position_ids,
-            dsv4_group_ids=row_group_ids,
-            dsv4_parent_ids=row_parent_ids,
+            model_support_handler=handler,
             attention_head_dim=getattr(provider, "kv_channels", None),
             attention_value_head_dim=getattr(provider, "kv_channels", None),
         )
@@ -670,12 +665,7 @@ def _logits_equivalence_check(
                     build_gdn_execution_spec=bool(
                         getattr(handler, "build_gdn_execution_spec", False)
                     ),
-                    build_dsv4_compression_layouts=bool(
-                        getattr(handler, "build_dsv4_compression_layouts", False)
-                    ),
-                    dsv4_position_ids=reference_position_ids,
-                    dsv4_group_ids=reference_group_ids,
-                    dsv4_parent_ids=reference_parent_ids,
+                    model_support_handler=handler,
                     attention_head_dim=getattr(provider, "kv_channels", None),
                     attention_value_head_dim=getattr(provider, "kv_channels", None),
                 )

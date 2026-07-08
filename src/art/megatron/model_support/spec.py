@@ -1,6 +1,6 @@
 from typing import TYPE_CHECKING, Any, Literal, Protocol, Sequence, runtime_checkable
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 if TYPE_CHECKING:
     from megatron.bridge import AutoBridge
@@ -44,6 +44,18 @@ class ArchitectureReport(BaseModel):
     layer_families: list[LayerFamilyInstance] = Field(default_factory=list)
     recommended_min_layers: int = 1
     unresolved_risks: list[str] = Field(default_factory=list)
+
+
+class SharedPrefixModelStateContext(BaseModel):
+    model_config = ConfigDict(arbitrary_types_allowed=True)
+
+    group_ids: Any
+    parent_ids: Any
+    input_pos: Any | None = None
+    device: Any
+    attention_token_layout_index: Any | None = None
+    attention_head_dim: int | None = None
+    attention_value_head_dim: int | None = None
 
 
 class CompileWorkaroundConfig(BaseModel):
@@ -140,6 +152,11 @@ class ModelSupportHandler(Protocol):
     def vllm_server_args(self) -> dict[str, object]: ...
 
     def install_preprocess_patch(self, model_chunks: Sequence[Any]) -> None: ...
+
+    def build_shared_prefix_model_state(
+        self,
+        context: SharedPrefixModelStateContext,
+    ) -> dict[str, Any]: ...
 
     def correctness_precision(self) -> Literal["bf16", "fp32"]: ...
 

@@ -31,6 +31,7 @@ from art.megatron.gdn.gdn_shared_prefix import (
     move_gdn_rank_execution_plan_to_device,
     parse_gdn_shared_prefix_segments,
 )
+from art.megatron.model_support.spec import SharedPrefixModelStateContext
 
 
 class SharedPrefixAttentionState(FlexSharedPrefixAttentionState):
@@ -38,8 +39,7 @@ class SharedPrefixAttentionState(FlexSharedPrefixAttentionState):
 
     group_ids: Tensor
     parent_ids: Tensor
-    dsv4_compression_layouts: dict[int, Any] = Field(default_factory=dict)
-    dsv4_topk_idx_cache: dict[Any, Any] = Field(default_factory=dict)
+    model_state: dict[str, Any] = Field(default_factory=dict)
     gdn_execution_spec: GdnPackedExecutionSpec | None = None
     gdn_execution_plan: GdnRankExecutionPlan | None = None
     gdn_hidden_layout: str = "attention"
@@ -61,10 +61,7 @@ def create_shared_prefix_state(
     input_pos: Tensor | None = None,
     sliding_windows: tuple[int, ...] = (),
     build_gdn_execution_spec: bool = False,
-    build_dsv4_compression_layouts: bool = False,
-    dsv4_position_ids: Tensor | None = None,
-    dsv4_group_ids: Tensor | None = None,
-    dsv4_parent_ids: Tensor | None = None,
+    model_support_handler: Any | None = None,
     attention_token_layout_index: TokenLayoutIndex | None = None,
     attention_head_dim: int | None = None,
     attention_value_head_dim: int | None = None,
@@ -112,14 +109,15 @@ def create_shared_prefix_state(
         sliding_block_masks=sliding_block_masks,
         group_ids=group_ids_cpu,
         parent_ids=parent_ids_cpu,
-        dsv4_compression_layouts=_build_dsv4_compression_layouts_once(
-            position_ids=dsv4_position_ids
-            if dsv4_position_ids is not None
-            else input_pos,
-            group_ids=group_ids if dsv4_group_ids is None else dsv4_group_ids,
-            parent_ids=parent_ids if dsv4_parent_ids is None else dsv4_parent_ids,
-            build=build_dsv4_compression_layouts,
+        model_state=_build_model_state_once(
+            model_support_handler,
+            input_pos=input_pos_cpu,
+            group_ids=group_ids_cpu,
+            parent_ids=parent_ids_cpu,
             device=device,
+            attention_token_layout_index=attention_token_layout_index,
+            attention_head_dim=attention_head_dim,
+            attention_value_head_dim=attention_value_head_dim,
         ),
         gdn_execution_spec=gdn_execution_spec,
         gdn_execution_plan=_build_gdn_execution_plan_once(
@@ -133,27 +131,31 @@ def create_shared_prefix_state(
     )
 
 
-def _build_dsv4_compression_layouts_once(
+def _build_model_state_once(
+    model_support_handler: Any | None,
     *,
-    position_ids: Tensor | None,
+    input_pos: Tensor | None,
     group_ids: Tensor,
     parent_ids: Tensor,
-    build: bool,
     device: torch.device,
-) -> dict[int, Any]:
-    if not build:
+    attention_token_layout_index: TokenLayoutIndex | None,
+    attention_head_dim: int | None,
+    attention_value_head_dim: int | None,
+) -> dict[str, Any]:
+    if model_support_handler is None:
         return {}
-    if position_ids is None:
-        raise RuntimeError(
-            "DSV4 shared-prefix compression layouts require position ids."
+    return dict(
+        model_support_handler.build_shared_prefix_model_state(
+            SharedPrefixModelStateContext(
+                input_pos=input_pos,
+                group_ids=group_ids,
+                parent_ids=parent_ids,
+                device=device,
+                attention_token_layout_index=attention_token_layout_index,
+                attention_head_dim=attention_head_dim,
+                attention_value_head_dim=attention_value_head_dim,
+            )
         )
-    from art.megatron.dsv4.compressor import build_shared_prefix_compression_layouts
-
-    return build_shared_prefix_compression_layouts(
-        position_ids=_metadata_cpu(position_ids),
-        group_ids=_metadata_cpu(group_ids),
-        parent_ids=_metadata_cpu(parent_ids),
-        device=device,
     )
 
 

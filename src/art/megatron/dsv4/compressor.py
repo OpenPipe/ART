@@ -2,6 +2,7 @@ from typing import Any, NamedTuple, cast
 
 import einops
 from megatron.core.transformer.transformer_config import TransformerConfig
+from pydantic import BaseModel, ConfigDict, Field
 import torch
 import torch.nn as nn
 from torch.nn import Linear
@@ -24,6 +25,13 @@ class Dsv4CompressionLayout(NamedTuple):
     entry_start_positions: torch.Tensor
     entry_end_positions: torch.Tensor
     entry_valid: torch.Tensor
+
+
+class Dsv4SharedPrefixState(BaseModel):
+    model_config = ConfigDict(arbitrary_types_allowed=True)
+
+    compression_layouts: dict[int, Dsv4CompressionLayout]
+    topk_idx_cache: dict[Any, Any] = Field(default_factory=dict)
 
 
 def move_compression_layout_to_device(

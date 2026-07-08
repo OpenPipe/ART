@@ -12,7 +12,11 @@ from art.megatron.model_support.handlers.default_dense import (
     _compile_workaround_flags_for_provider,
     _require_moe_experts,
 )
-from art.megatron.model_support.spec import CompileWorkaroundConfig, LayerFamilyInstance
+from art.megatron.model_support.spec import (
+    CompileWorkaroundConfig,
+    LayerFamilyInstance,
+    SharedPrefixModelStateContext,
+)
 
 _ORACLE_HIDDEN_SIZE = 512
 _ORACLE_Q_LORA_RANK = 128
@@ -49,7 +53,6 @@ class Dsv4Handler(DefaultMoeHandler):
     key = "dsv4"
     is_moe = True
     cp_supported = False
-    build_dsv4_compression_layouts = True
     native_vllm_lora_status = "validated"
 
     def identity_lora_model_config(self, base_config: Any) -> Any:
@@ -103,6 +106,30 @@ class Dsv4Handler(DefaultMoeHandler):
         if has_configured_chat_template(internal_config):
             return tokenizer
         return get_dsv4_tokenizer(tokenizer)
+
+    def build_shared_prefix_model_state(
+        self,
+        context: SharedPrefixModelStateContext,
+    ) -> dict[str, Any]:
+        if context.input_pos is None:
+            raise RuntimeError(
+                "DSV4 shared-prefix compression layouts require input_pos."
+            )
+        from art.megatron.dsv4.compressor import (
+            Dsv4SharedPrefixState,
+            build_shared_prefix_compression_layouts,
+        )
+
+        return {
+            "dsv4": Dsv4SharedPrefixState(
+                compression_layouts=build_shared_prefix_compression_layouts(
+                    position_ids=context.input_pos,
+                    group_ids=context.group_ids,
+                    parent_ids=context.parent_ids,
+                    device=context.device,
+                )
+            )
+        }
 
     def correctness_precision(self) -> Literal["bf16", "fp32"]:
         return "bf16"

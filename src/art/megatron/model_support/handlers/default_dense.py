@@ -10,6 +10,7 @@ from art.megatron.model_support.spec import (
     LayerFamilyInstance,
     RolloutWeightsMode,
     SharedExpertCompileState,
+    SharedPrefixModelStateContext,
 )
 
 _CONTEXT_PARALLEL_ATTENTION_WORKAROUND_FLAG = "context_parallel_attention"
@@ -123,6 +124,13 @@ class DefaultDenseHandler:
     def install_preprocess_patch(self, model_chunks: Sequence[Any]) -> None:
         del model_chunks
         return None
+
+    def build_shared_prefix_model_state(
+        self,
+        context: SharedPrefixModelStateContext,
+    ) -> dict[str, Any]:
+        del context
+        return {}
 
     def correctness_precision(self) -> Literal["bf16", "fp32"]:
         return "fp32"
