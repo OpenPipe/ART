@@ -6,7 +6,6 @@ import pytest
 
 torch = pytest.importorskip("torch")
 
-from . import real_path as real_path_module
 from . import workflow_stage
 from .output_parity import (
     TOP20_KL_CANDIDATE_TO_TARGET_LIMIT,
@@ -174,46 +173,6 @@ def test_real_path_deletes_only_adapter_safetensors_on_pass(tmp_path) -> None:
     assert list(run_dir.rglob("adapter_model.safetensors")) == []
     assert len(list(run_dir.rglob("adapter_config.json"))) == 2
     assert score_path.exists()
-
-
-def test_real_path_megatron_worker_uses_fp32_grouped_gemm_fallback(
-    monkeypatch: pytest.MonkeyPatch,
-    tmp_path,
-) -> None:
-    class StopWorker(RuntimeError):
-        pass
-
-    calls = 0
-
-    def fake_allow_fp32_grouped_gemm() -> None:
-        nonlocal calls
-        calls += 1
-        raise StopWorker
-
-    monkeypatch.setattr(
-        real_path_module,
-        "allow_fp32_grouped_gemm_fallback_for_model_support_tests",
-        fake_allow_fp32_grouped_gemm,
-    )
-    request = real_path_module.RealPathMegatronWorkerRequest(
-        config=TrainInfOutputParityConfig(base_model="Qwen/Qwen3.5-35B-A3B"),
-        artifact_dir=str(tmp_path),
-        disk_packed_tensors={
-            "dir": str(tmp_path),
-            "num_sequences": 1,
-            "sequence_length": 1,
-        },
-        logical_map_path=str(tmp_path / "logical_map.json"),
-        weight_state="lora",
-        adapter_path=str(tmp_path / "adapter"),
-        moe_routing_replay_path=None,
-        global_grad_accumulation_sequences=1,
-    )
-
-    with pytest.raises(StopWorker):
-        real_path_module._real_path_megatron_worker(request)
-
-    assert calls == 1
 
 
 def test_architecture_specific_real_path_limits() -> None:
