@@ -125,7 +125,7 @@ class PipelineAutotuner:
 
     def on_metric(self, rec: PipelineMetric) -> TunerDecision | None:
         self.metrics.append(rec)
-        if rec.name != "objective/score_default" or rec.step is None:
+        if rec.name != "objective/score" or rec.step is None:
             return None
         return self.maybe_decide(int(rec.step))
 
@@ -157,14 +157,12 @@ class PipelineAutotuner:
             if current is None or rec.t_s >= current.t_s:
                 by_step[int(rec.step)][rec.name] = rec
         steps = sorted(
-            step
-            for step, values in by_step.items()
-            if "objective/score_default" in values
+            step for step, values in by_step.items() if "objective/score" in values
         )
         if len(steps) < self.config.window_steps:
             return None
         window_steps = steps[-self.config.window_steps :]
-        t0 = min(by_step[step]["objective/score_default"].t_s for step in window_steps)
+        t0 = min(by_step[step]["objective/score"].t_s for step in window_steps)
         t1 = max(rec.t_s for step in window_steps for rec in by_step[step].values())
 
         def step_values(name: str) -> list[float]:
@@ -174,11 +172,9 @@ class PipelineAutotuner:
                 if name in by_step[step]
             ]
 
-        wall_values = _required_step_values(
-            by_step, window_steps, "pipeline_trainer/step_wall_s"
-        )
+        wall_values = _required_step_values(by_step, window_steps, "time/step_wall_s")
         collect_values = _required_step_values(
-            by_step, window_steps, "pipeline_trainer/step_collect_batch_s"
+            by_step, window_steps, "time/step_collect_batch_s"
         )
         wall = sum(wall_values)
         collect = sum(collect_values)
@@ -186,9 +182,9 @@ class PipelineAutotuner:
             by_step, window_steps, "data/step_num_groups_trainable"
         )
         train_capacity_tokens = _required_step_values(
-            by_step, window_steps, "data/step_train_tokens"
+            by_step, window_steps, "data/step_packed_train_tokens"
         )
-        discarded_stale = sum(step_values("staleness/discarded_groups"))
+        discarded_stale = sum(step_values("discarded/step/stale_groups"))
         generated_groups = sum(groups) + discarded_stale
         vllm_metrics = [
             rec
@@ -233,7 +229,7 @@ class PipelineAutotuner:
             window_start_s=t0,
             window_end_s=t1,
             score_mean=_mean(
-                _required_step_values(by_step, window_steps, "objective/score_default")
+                _required_step_values(by_step, window_steps, "objective/score")
             ),
             accepted_tok_per_s_mean=_mean(
                 _required_step_values(
@@ -288,7 +284,7 @@ class PipelineAutotuner:
         required = {
             "data/step_num_groups_trainable",
             "data/step_packed_sequences",
-            "data/step_train_tokens",
+            "data/step_packed_train_tokens",
         }
         for step in window_steps:
             if step in self._packing_outcome_steps:
@@ -303,10 +299,11 @@ class PipelineAutotuner:
             groups = int(round(values["data/step_num_groups_trainable"].value))
             if groups <= 0:
                 continue
-            train_tokens = float(values["data/step_train_tokens"].value)
+            train_tokens = float(values["data/step_packed_train_tokens"].value)
             if train_tokens <= 0.0:
                 raise RuntimeError(
-                    "Pipeline autotuning requires positive data/step_train_tokens "
+                    "Pipeline autotuning requires positive "
+                    "data/step_packed_train_tokens "
                     f"at step {step}."
                 )
             non_padding_tokens = sum(pack_by_step.get(step, []))

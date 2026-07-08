@@ -21,6 +21,7 @@ class PipelineState:
     # Metrics
     discarded_stale_groups: int = 0
     discarded_zero_variance_groups: int = 0
+    accepted_trainable_groups: int = 0
 
     # Synchronization
     policy_updated: asyncio.Condition = field(default_factory=asyncio.Condition)

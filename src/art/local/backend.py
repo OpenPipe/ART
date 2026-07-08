@@ -1352,17 +1352,13 @@ class LocalBackend(Backend):
             yield {
                 **base_metrics,
                 "data/step_num_groups_trainable": 0.0,
-                "data/step_trainer_tokens": 0.0,
-                "data/step_trainer_assistant_tokens": 0.0,
+                "data/step_trainable_assistant_tokens": 0.0,
                 TRAIN_GRADIENT_STEPS_KEY: 0.0,
             }
             return
-        base_metrics["data/step_trainer_tokens"] = float(
+        base_metrics["data/step_trainable_assistant_tokens"] = float(
             packed_tensors["assistant_mask"].sum().item()
         )
-        base_metrics["data/step_trainer_assistant_tokens"] = base_metrics[
-            "data/step_trainer_tokens"
-        ]
         packed_sequences, packed_sequence_length = packed_tensors["tokens"].shape
         packed_train_tokens = int(packed_sequences * packed_sequence_length)
         non_padding_tokens = int((packed_tensors["group_ids"] != -1).sum().item())
@@ -1370,8 +1366,7 @@ class LocalBackend(Backend):
             {
                 "data/step_packed_sequences": float(packed_sequences),
                 "data/step_packed_train_tokens": float(packed_train_tokens),
-                "data/step_train_tokens": float(packed_train_tokens),
-                "data/step_non_padding_tokens": float(non_padding_tokens),
+                "data/step_non_padding_train_tokens": float(non_padding_tokens),
                 "data/step_padding_ratio": (
                     float(packed_train_tokens - non_padding_tokens)
                     / packed_train_tokens
@@ -1573,8 +1568,7 @@ class LocalBackend(Backend):
             yield {
                 **result,
                 "data/step_num_trajectories": float(total_trajectories),
-                "data/step_trainer_tokens": float(total_trainable_tokens),
-                "data/step_trainer_assistant_tokens": float(total_trainable_tokens),
+                "data/step_trainable_assistant_tokens": float(total_trainable_tokens),
                 "data/step_num_dropped_trajectories": float(total_dropped_trajectories),
                 TRAIN_GRADIENT_STEPS_KEY: float(len(batches)),
             }

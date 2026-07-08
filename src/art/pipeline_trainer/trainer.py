@@ -281,6 +281,9 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
         self.state.total_scenarios_consumed = int(
             pipeline_state.get("total_scenarios_consumed", scenario_offset) or 0
         )
+        self.state.accepted_trainable_groups = int(
+            pipeline_state.get("accepted_trainable_groups", 0) or 0
+        )
         self.state.last_eval_step = last_eval_step
         self.state.completed_eval_steps = {
             int(step) for step in pipeline_state.get("completed_eval_steps", []) or []
@@ -817,35 +820,41 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
                     batch, step=current_step, step_seconds=step_seconds
                 )
 
-                steps_off_policy = self._average_steps_off_policy(
-                    training_policy_step, batch
+                stale_groups = float(self.state.discarded_stale_groups)
+                zero_variance_groups = float(self.state.discarded_zero_variance_groups)
+                self.state.accepted_trainable_groups += len(batch)
+                generated_groups_cum = (
+                    float(self.state.accepted_trainable_groups)
+                    + stale_groups
+                    + zero_variance_groups
                 )
                 metrics = {
-                    "discarded_stale_groups": float(self.state.discarded_stale_groups),
-                    "discarded_zero_variance_groups": float(
-                        self.state.discarded_zero_variance_groups
-                    ),
-                    "steps_off_policy": steps_off_policy,
+                    "discarded/cum/stale_groups": stale_groups,
+                    "discarded/cum/zero_variance_groups": zero_variance_groups,
+                    "discarded/step/stale_groups": float(discarded),
+                    "discarded/rate/stale_groups": stale_groups
+                    / max(generated_groups_cum, 1.0),
+                    "discarded/rate/zero_variance_groups": zero_variance_groups
+                    / max(generated_groups_cum, 1.0),
                     "time/step_wall_s": step_seconds,
-                    "pipeline_trainer/step_wall_s": step_seconds,
-                    "pipeline_trainer/step_collect_batch_s": trainer_idle_s,
-                    "throughput/step_trainer_idle_s": trainer_idle_s,
+                    "time/step_collect_batch_s": trainer_idle_s,
+                    "time/step_trainer_idle_s": trainer_idle_s,
                 }
-                metrics.setdefault("time/step_trainer_s", train_call_elapsed)
-                metrics.setdefault(
-                    "pipeline_trainer/step_backend_train_s", train_call_elapsed
-                )
+                metrics.setdefault("time/step_backend_train_s", train_call_elapsed)
                 if actor_wall_s > 0:
-                    metrics["time/step_actor_s"] = actor_wall_s
+                    metrics["time/step_rollout_s"] = actor_wall_s
                 if actor_idle_s > 0:
-                    metrics["throughput/step_actor_idle_s"] = actor_idle_s
+                    metrics["time/step_rollout_idle_s"] = actor_idle_s
                 if queue_wait_s > 0 and actor_wall_s > 0:
                     metrics["queue/put_wait_frac"] = queue_wait_s / actor_wall_s
                 metrics.update(result.metrics)
-                if "data/step_packed_train_tokens" in metrics:
-                    metrics.setdefault(
-                        "data/step_train_tokens",
-                        metrics["data/step_packed_train_tokens"],
+                if (
+                    train_call_elapsed > 0
+                    and "data/step_packed_train_tokens" in metrics
+                ):
+                    metrics["throughput/train_packed_tok_per_s"] = (
+                        float(metrics["data/step_packed_train_tokens"])
+                        / train_call_elapsed
                     )
                 vllm_metrics_collector = getattr(
                     self.backend, "collect_train_step_vllm_metrics", None
@@ -1301,47 +1310,24 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
             accepted_groups=accepted_groups,
             rollouts_per_group=rollouts_per_group,
         )
-        if rollouts_per_group is not None:
-            metrics["sample_efficiency/rollouts_per_group"] = rollouts_per_group
-        if self.score_reference_groups_per_step is not None:
-            metrics["sample_efficiency/reference_groups_per_step"] = (
-                self.score_reference_groups_per_step
-            )
-        reference_rollouts = self._reference_rollouts_per_group(rollouts_per_group)
-        if reference_rollouts is not None:
-            metrics["sample_efficiency/reference_rollouts_per_group"] = (
-                reference_rollouts
-            )
-        metrics["sample_efficiency/critical_rollout_batch_size"] = (
-            _SCORE_CRITICAL_ROLLOUT_BATCH_SIZE
-        )
         metrics["sample_efficiency/batch_factor"] = batch_factor
 
         age_metrics = self._batch_policy_age_metrics(current_step, batch)
+        age_exp_moment = age_metrics.pop("_policy_age_exp_tau8", None)
         metrics.update(age_metrics)
         mean_age = age_metrics.get("offpolicy/token_weighted_policy_age_steps")
-        age_exp_moment = age_metrics.get("offpolicy/token_weighted_policy_age_exp_tau8")
         if mean_age is None or age_exp_moment is None:
             return metrics
         freshness = 1.0 / max(float(age_exp_moment), 1e-12)
         metrics["sample_efficiency/freshness_discount"] = freshness
-        metrics["sample_efficiency/age_discount"] = freshness
 
         assistant_tokens = result_metrics.get(
-            "data/step_trainer_assistant_tokens",
-            result_metrics.get("data/step_trainer_tokens"),
+            "data/step_trainable_assistant_tokens",
         )
         if assistant_tokens is not None and step_seconds > 0:
             accepted_tok_per_s = float(assistant_tokens) / step_seconds
             metrics["throughput/accepted_train_tok_per_s"] = accepted_tok_per_s
-            metrics["objective/score_raw"] = accepted_tok_per_s
-            metrics["objective/score_freshness"] = accepted_tok_per_s * freshness
-            metrics["objective/age_discounted_accepted_tok_per_s"] = (
-                accepted_tok_per_s * freshness
-            )
-            metrics["objective/score_default"] = (
-                accepted_tok_per_s * freshness * batch_factor
-            )
+            metrics["objective/score"] = accepted_tok_per_s * freshness * batch_factor
         return metrics
 
     def _batch_rollouts_per_group(self, batch: list[TrajectoryGroup]) -> float | None:
@@ -1408,13 +1394,10 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
             return {}
         return {
             "offpolicy/token_weighted_policy_age_steps": age_sum / weight_sum,
-            "offpolicy/token_weighted_policy_age_exp_tau8": age_exp_sum / weight_sum,
-            "offpolicy/mean_policy_age_steps": age_sum / weight_sum,
-            "offpolicy/unweighted_mean_policy_age_steps": sum(unweighted_ages)
-            / len(unweighted_ages),
-            "offpolicy/min_policy_age_steps": min(unweighted_ages),
-            "offpolicy/p95_policy_age_steps": _weighted_percentile(weighted_ages, 0.95),
-            "offpolicy/max_policy_age_steps": max(unweighted_ages),
+            "_policy_age_exp_tau8": age_exp_sum / weight_sum,
+            "offpolicy/token_weighted_policy_age_p95_steps": _weighted_percentile(
+                weighted_ages, 0.95
+            ),
         }
 
     def _trajectory_policy_age_stats(
@@ -1493,6 +1476,7 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
             "training_step": training_step,
             "last_eval_step": self.state.last_eval_step,
             "completed_eval_steps": sorted(self.state.completed_eval_steps),
+            "accepted_trainable_groups": self.state.accepted_trainable_groups,
         }
         if self._pipeline_tuner_profile is not None:
             payload["pipeline_tuner_profile"] = self._pipeline_tuner_profile
@@ -1507,7 +1491,6 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
         if not row:
             return
         row["training_step"] = step
-        row["time/wall_clock_sec"] = time.time() - self.model._run_start_time
         row["step"] = step
         row["recorded_at"] = datetime.now().isoformat()
 

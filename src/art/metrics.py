@@ -20,10 +20,7 @@ from .api_costs import (
 _active_builder: ContextVar["MetricsBuilder"] = ContextVar("_active_metrics_builder")
 
 _HIERARCHICAL_SECTIONS = {"costs", "time", "data"}
-_THROUGHPUT_IDLE_MAPPINGS = {
-    "throughput/step_trainer_idle_s": "throughput/cum/trainer_idle_s",
-    "throughput/step_actor_idle_s": "throughput/cum/actor_idle_s",
-}
+_THROUGHPUT_IDLE_MAPPINGS: dict[str, str] = {}
 
 
 class MetricDefinition(pydantic.BaseModel):
@@ -39,8 +36,8 @@ class MetricDefinition(pydantic.BaseModel):
 
 PIPELINE_RL_METRIC_DEFINITIONS: tuple[MetricDefinition, ...] = (
     MetricDefinition(
-        key="objective/score_default",
-        title="Default score",
+        key="objective/score",
+        title="Score",
         description=(
             "accepted trainable assistant tokens per second times freshness "
             "discount times batch-size discount"
@@ -48,26 +45,6 @@ PIPELINE_RL_METRIC_DEFINITIONS: tuple[MetricDefinition, ...] = (
         kind="score",
         higher_is_better=True,
         dashboard_default=True,
-        score_component=True,
-    ),
-    MetricDefinition(
-        key="objective/score_raw",
-        title="Raw accepted throughput",
-        description=(
-            "accepted trainable assistant tokens per second before "
-            "sample-efficiency discounts"
-        ),
-        kind="rate",
-        unit="tok/s",
-        higher_is_better=True,
-        score_component=True,
-    ),
-    MetricDefinition(
-        key="objective/score_freshness",
-        title="Freshness-adjusted score",
-        description="accepted trainable assistant tokens per second times freshness discount",
-        kind="score",
-        higher_is_better=True,
         score_component=True,
     ),
     MetricDefinition(
@@ -117,7 +94,7 @@ PIPELINE_RL_METRIC_DEFINITIONS: tuple[MetricDefinition, ...] = (
         score_component=True,
     ),
     MetricDefinition(
-        key="data/step_trainer_assistant_tokens",
+        key="data/step_trainable_assistant_tokens",
         title="Accepted assistant tokens",
         description="trainable assistant tokens in accepted groups for this train step",
         kind="counter",
@@ -137,7 +114,7 @@ PIPELINE_RL_METRIC_DEFINITIONS: tuple[MetricDefinition, ...] = (
         dashboard_default=True,
     ),
     MetricDefinition(
-        key="megatron/packed_train_tok_per_s",
+        key="throughput/train_packed_tok_per_s",
         title="Megatron packed train tokens per second",
         description=(
             "physical packed training-token throughput reported by the Megatron worker"
@@ -146,16 +123,6 @@ PIPELINE_RL_METRIC_DEFINITIONS: tuple[MetricDefinition, ...] = (
         unit="tok/s",
         higher_is_better=True,
         dashboard_default=True,
-    ),
-    MetricDefinition(
-        key="megatron/non_padding_train_tok_per_s",
-        title="Megatron non-padding train tokens per second",
-        description=(
-            "non-padding training-token throughput reported by the Megatron worker"
-        ),
-        kind="rate",
-        unit="tok/s",
-        higher_is_better=True,
     ),
     MetricDefinition(
         key="loss/importance_ratio_mean",
@@ -288,14 +255,6 @@ PIPELINE_RL_METRIC_DEFINITIONS: tuple[MetricDefinition, ...] = (
         higher_is_better=False,
     ),
     MetricDefinition(
-        key="pipeline_trainer/step_collect_batch_s",
-        title="Pipeline collect-batch time",
-        description="time spent waiting for enough accepted rollout groups for a train step",
-        kind="duration",
-        unit="s",
-        higher_is_better=False,
-    ),
-    MetricDefinition(
         key="queue/freshness_pressure",
         title="Queue freshness pressure",
         description="predicted queued policy age divided by the active off-policy limit",
@@ -329,7 +288,7 @@ def is_cumulative_metric_key(key: str) -> bool:
 
 
 def is_builder_managed_metric(key: str) -> bool:
-    return key.startswith(("costs/", "time/step_", "data/step_", "throughput/step_"))
+    return key.startswith(("costs/", "time/step_", "data/step_"))
 
 
 def to_cumulative_metric_key(key: str) -> str:
@@ -443,13 +402,13 @@ class MetricsBuilder:
     def add_data(
         self,
         step_num_scenarios: int | None = None,
-        step_actor_tokens: int | None = None,
+        step_rollout_tokens: int | None = None,
         scenario_ids: list[str] | None = None,
     ) -> None:
         if step_num_scenarios is not None:
             self.add_metric("data/step_num_scenarios", float(step_num_scenarios))
-        if step_actor_tokens is not None:
-            self.add_metric("data/step_actor_tokens", float(step_actor_tokens))
+        if step_rollout_tokens is not None:
+            self.add_metric("data/step_rollout_tokens", float(step_rollout_tokens))
         if scenario_ids is not None:
             self._pending_state().pending_scenario_ids.update(
                 str(scenario_id) for scenario_id in scenario_ids
@@ -458,28 +417,25 @@ class MetricsBuilder:
     def add_user_timing(
         self,
         step_wall_s: float | None = None,
-        step_actor_s: float | None = None,
+        step_rollout_s: float | None = None,
         step_eval_s: float | None = None,
     ) -> None:
         if step_wall_s is not None:
             self.add_metric("time/step_wall_s", float(step_wall_s))
-        if step_actor_s is not None:
-            self.add_metric("time/step_actor_s", float(step_actor_s))
+        if step_rollout_s is not None:
+            self.add_metric("time/step_rollout_s", float(step_rollout_s))
         if step_eval_s is not None:
             self.add_metric("time/step_eval_s", float(step_eval_s))
 
     def add_idle_times(
         self,
         step_trainer_idle_s: float | None = None,
-        step_actor_idle_s: float | None = None,
+        step_rollout_idle_s: float | None = None,
     ) -> None:
         if step_trainer_idle_s is not None:
-            self.add_metric(
-                "throughput/step_trainer_idle_s",
-                float(step_trainer_idle_s),
-            )
-        if step_actor_idle_s is not None:
-            self.add_metric("throughput/step_actor_idle_s", float(step_actor_idle_s))
+            self.add_metric("time/step_trainer_idle_s", float(step_trainer_idle_s))
+        if step_rollout_idle_s is not None:
+            self.add_metric("time/step_rollout_idle_s", float(step_rollout_idle_s))
 
     @contextmanager
     def measure(self, key: str):
@@ -683,18 +639,15 @@ class MetricsBuilder:
             result[cum_key] = next_value
 
         if (
-            "data/step_trainer_tokens" in result
-            or "data/step_trainer_assistant_tokens" in result
-            or "time/step_trainer_s" in result
+            "data/step_trainable_assistant_tokens" in result
+            or "time/step_backend_train_s" in result
         ):
             trainer_tokens = self._shared_state.cum_state.get(
-                "data/cum/trainer_assistant_tokens"
+                "data/cum/trainable_assistant_tokens"
             )
-            if trainer_tokens is None:
-                trainer_tokens = self._shared_state.cum_state.get(
-                    "data/cum/trainer_tokens"
-                )
-            trainer_seconds = self._shared_state.cum_state.get("time/cum/trainer_s")
+            trainer_seconds = self._shared_state.cum_state.get(
+                "time/cum/backend_train_s"
+            )
             if (
                 trainer_tokens is not None
                 and trainer_seconds is not None
@@ -704,15 +657,17 @@ class MetricsBuilder:
                     trainer_tokens / trainer_seconds
                 )
 
-        if "data/step_actor_tokens" in result or "time/step_actor_s" in result:
-            actor_tokens = self._shared_state.cum_state.get("data/cum/actor_tokens")
-            actor_seconds = self._shared_state.cum_state.get("time/cum/actor_s")
+        if "data/step_rollout_tokens" in result or "time/step_rollout_s" in result:
+            rollout_tokens = self._shared_state.cum_state.get("data/cum/rollout_tokens")
+            rollout_seconds = self._shared_state.cum_state.get("time/cum/rollout_s")
             if (
-                actor_tokens is not None
-                and actor_seconds is not None
-                and actor_seconds > 0
+                rollout_tokens is not None
+                and rollout_seconds is not None
+                and rollout_seconds > 0
             ):
-                result["throughput/avg_actor_tok_per_s"] = actor_tokens / actor_seconds
+                result["throughput/avg_rollout_tok_per_s"] = (
+                    rollout_tokens / rollout_seconds
+                )
 
 
 from .api_costs import track_api_cost

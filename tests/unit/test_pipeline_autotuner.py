@@ -513,10 +513,10 @@ def _append_decision_window_metrics(
     for idx, step in enumerate(range(4, 8)):
         t_s = float(idx + 1)
         step_metrics = {
-            "objective/score_default": 100.0,
+            "objective/score": 100.0,
             "throughput/accepted_train_tok_per_s": 500.0,
-            "pipeline_trainer/step_wall_s": 10.0,
-            "pipeline_trainer/step_collect_batch_s": 1.0,
+            "time/step_wall_s": 10.0,
+            "time/step_collect_batch_s": 1.0,
             "data/step_num_groups_trainable": 2.0,
             "data/step_packed_sequences": 1.0,
             "sample_efficiency/freshness_discount": 0.5,
@@ -525,7 +525,7 @@ def _append_decision_window_metrics(
             "queue/freshness_pressure": 0.25,
         }
         if include_train_capacity:
-            step_metrics["data/step_train_tokens"] = 100.0
+            step_metrics["data/step_packed_train_tokens"] = 100.0
         for name, value in step_metrics.items():
             tuner.metrics.append(
                 PipelineMetric(name=name, value=value, step=step, t_s=t_s)
@@ -685,5 +685,5 @@ def test_window_stats_requires_train_capacity_for_padding() -> None:
     )
     _append_decision_window_metrics(tuner, include_train_capacity=False)
 
-    with pytest.raises(RuntimeError, match="data/step_train_tokens"):
+    with pytest.raises(RuntimeError, match="data/step_packed_train_tokens"):
         tuner.window_stats()

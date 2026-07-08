@@ -547,14 +547,14 @@ async def test_pipeline_trainer_checkpoint_retention_only_passes_unprotected_ste
         "\n".join(
             json.dumps(row)
             for row in [
-                {"step": 2, "val/reward": 1.0},
-                {"step": 2, "val/reward": 3.0},
+                {"step": 2, "reward/val": 1.0},
+                {"step": 2, "reward/val": 3.0},
                 {
                     "step": 2,
                     CHECKPOINT_CREATED_AT_METRIC: 123.0,
                     CHECKPOINT_EVAL_COMPLETED_METRIC: 1.0,
                 },
-                {"step": 3, "val/reward": 10.0},
+                {"step": 3, "reward/val": 10.0},
             ]
         )
         + "\n",
@@ -584,7 +584,7 @@ async def test_pipeline_trainer_checkpoint_retention_only_passes_unprotected_ste
     step_two = contexts[0].checkpoints[2]
     assert step_two.is_eval_step is True
     assert step_two.created_at == datetime.fromtimestamp(123.0, timezone.utc)
-    assert step_two.metrics["val/reward"] == 2.0
+    assert step_two.metrics["reward/val"] == 2.0
     backend._delete_checkpoint_files.assert_awaited_once_with(  # type: ignore[attr-defined]
         model,
         [1, 3, 4, 5],

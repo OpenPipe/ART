@@ -53,9 +53,9 @@ STATE_KEY_LATEST_STEP = "latest_step"
 T = TypeVar("T")
 
 _UPSTREAM_TRAIN_METRIC_KEYS = {
-    "reward": "reward",
-    "reward_std_dev": "reward_std_dev",
-    "exception_rate": "exception_rate",
+    "reward": "reward/train",
+    "reward_std_dev": "reward/train_std_dev",
+    "exception_rate": "task/train/exception_rate",
     "policy_loss": "loss/train",
     "loss": "loss/train",
     "entropy": "loss/entropy",
@@ -66,8 +66,8 @@ _UPSTREAM_TRAIN_METRIC_KEYS = {
     "num_groups_submitted": "data/step_num_groups_submitted",
     "num_groups_trainable": "data/step_num_groups_trainable",
     "num_trajectories": "data/step_num_trajectories",
-    "num_trainable_tokens": "data/step_trainer_tokens",
-    "train_tokens": "data/step_trainer_tokens",
+    "num_trainable_tokens": "data/step_trainable_assistant_tokens",
+    "train_tokens": "data/step_trainable_assistant_tokens",
     "num_datums": "data/step_num_datums",
 }
 
@@ -348,7 +348,7 @@ class TinkerNativeBackend(Backend):
         train_tokens = 0
         for datum in datums:
             train_tokens += len(datum.model_input.to_ints())
-        metrics["data/step_trainer_tokens"] = float(train_tokens)
+        metrics["data/step_trainable_assistant_tokens"] = float(train_tokens)
         pricing = get_model_pricing(model.base_model)
         if pricing is not None:
             metrics["costs/train/tinker_train"] = compute_train_cost(
@@ -453,7 +453,7 @@ class TinkerNativeBackend(Backend):
 
         state.current_step = next_step
         self._persist_model_state(model, state)
-        metrics["time/step_trainer_s"] = time.monotonic() - trainer_started
+        metrics["time/step_backend_train_s"] = time.monotonic() - trainer_started
 
         return TrainResult(step=state.current_step, metrics=metrics)
 

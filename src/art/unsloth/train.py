@@ -51,9 +51,9 @@ __all__ = [
 _TRAIN_TASK_SHUTDOWN_TIMEOUT_S = 5.0
 
 _UPSTREAM_TRAIN_METRIC_KEYS = {
-    "reward": "reward",
-    "reward_std_dev": "reward_std_dev",
-    "exception_rate": "exception_rate",
+    "reward": "reward/train",
+    "reward_std_dev": "reward/train_std_dev",
+    "exception_rate": "task/train/exception_rate",
     "policy_loss": "loss/train",
     "loss": "loss/train",
     "entropy": "loss/entropy",
@@ -64,8 +64,8 @@ _UPSTREAM_TRAIN_METRIC_KEYS = {
     "num_groups_submitted": "data/step_num_groups_submitted",
     "num_groups_trainable": "data/step_num_groups_trainable",
     "num_trajectories": "data/step_num_trajectories",
-    "num_trainable_tokens": "data/step_trainer_tokens",
-    "train_tokens": "data/step_trainer_tokens",
+    "num_trainable_tokens": "data/step_trainable_assistant_tokens",
+    "train_tokens": "data/step_trainable_assistant_tokens",
     "num_datums": "data/step_num_datums",
 }
 

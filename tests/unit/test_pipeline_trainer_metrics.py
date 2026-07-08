@@ -65,19 +65,14 @@ def test_pipeline_trainer_score_uses_start_policy_age_and_tau(tmp_path: Path) ->
         10,
         [group],
         step_seconds=2.0,
-        result_metrics={"data/step_trainer_assistant_tokens": 100.0},
+        result_metrics={"data/step_trainable_assistant_tokens": 100.0},
     )
 
     assert metrics["offpolicy/token_weighted_policy_age_steps"] == 2.0
-    assert metrics["offpolicy/token_weighted_policy_age_exp_tau8"] == pytest.approx(
-        math.exp(2.0 / 8.0)
-    )
     assert metrics["sample_efficiency/freshness_discount"] == pytest.approx(
         math.exp(-2.0 / 8.0)
     )
-    assert metrics["objective/score_default"] == pytest.approx(
-        50.0 * math.exp(-2.0 / 8.0)
-    )
+    assert metrics["objective/score"] == pytest.approx(50.0 * math.exp(-2.0 / 8.0))
 
 
 def test_pipeline_trainer_batch_factor_accounts_for_rollout_group_size(
@@ -112,10 +107,9 @@ def test_pipeline_trainer_batch_factor_accounts_for_rollout_group_size(
         10,
         batch,
         step_seconds=2.0,
-        result_metrics={"data/step_trainer_assistant_tokens": 800.0},
+        result_metrics={"data/step_trainable_assistant_tokens": 800.0},
     )
 
-    assert metrics["sample_efficiency/rollouts_per_group"] == 16.0
     assert metrics["sample_efficiency/batch_factor"] == pytest.approx(
         (8.0 + 300.0 / 8.0) / (8.0 + 300.0 / 16.0)
     )
@@ -212,11 +206,10 @@ async def test_pipeline_trainer_logs_explicit_stale_and_zero_variance_metrics(
     with open(history_path) as f:
         rows = [json.loads(line) for line in f if line.strip()]
 
-    train_row = next(row for row in rows if "train/reward" in row)
-    zero_variance_row = next(
-        row for row in rows if any(key.startswith("discarded/") for key in row)
-    )
+    train_row = next(row for row in rows if "reward/train" in row)
+    zero_variance_row = next(row for row in rows if "task/discarded/reward" in row)
 
-    assert "train/discarded_stale_groups" in train_row
-    assert "train/discarded_stale_samples" not in train_row
-    assert "discarded/reward" in zero_variance_row
+    assert "discarded/cum/stale_groups" in train_row
+    assert "discarded/step/stale_groups" in train_row
+    assert "discarded/stale_samples" not in train_row
+    assert "task/discarded/reward" in zero_variance_row

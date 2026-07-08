@@ -210,16 +210,80 @@ METRIC_SECTIONS = frozenset(
     {
         "reward",
         "loss",
+        "objective",
         "offpolicy",
         "pipeline",
         "pipeline_settings",
+        "queue",
+        "sample_efficiency",
         "throughput",
         "costs",
+        "discarded",
+        "task",
         "time",
         "data",
+        "vllm",
     }
 )
 METRIC_SPLITS = frozenset({"train", "val", "test"})
+
+WANDB_CANONICAL_METRIC_KEYS = frozenset(
+    {
+        "training_step",
+        SFT_WANDB_GRADIENT_STEP_KEY,
+        "objective/score",
+        "sample_efficiency/accepted_groups_per_step",
+        "sample_efficiency/batch_factor",
+        "sample_efficiency/freshness_discount",
+        "offpolicy/token_weighted_policy_age_steps",
+        "offpolicy/token_weighted_policy_age_p95_steps",
+        "throughput/accepted_train_tok_per_s",
+        "throughput/train_packed_tok_per_s",
+        "data/step_trainable_assistant_tokens",
+        "data/step_non_padding_train_tokens",
+        "data/step_padding_ratio",
+        "data/cum/num_unique_scenarios",
+        "data/cum/num_scenarios",
+        "data/cum/num_gradient_steps",
+        "discarded/cum/stale_groups",
+        "discarded/cum/zero_variance_groups",
+        "discarded/rate/stale_groups",
+        "discarded/rate/zero_variance_groups",
+        "time/step_wall_s",
+        "time/cum/wall_s",
+        "time/step_collect_batch_s",
+        "time/step_backend_train_s",
+        "time/step_rollout_idle_s",
+        "pipeline_settings/num_rollout_workers",
+        "pipeline_settings/min_batch_size",
+        "pipeline_settings/max_batch_size",
+        "pipeline_settings/target_groups_per_step",
+        "pipeline_settings/queue_maxsize",
+        "loss/train",
+        "loss/entropy",
+        "loss/kl_div",
+        "loss/kl_policy_ref",
+        "loss/grad_norm",
+        "loss/learning_rate",
+        "loss/importance_ratio_mean",
+        "loss/importance_ratio_p95",
+        "loss/importance_ratio_p99",
+        "loss/clipped_token_fraction",
+        "vllm/prompt_tok_per_s",
+        "vllm/completion_tok_per_s",
+        "vllm/num_requests_running",
+        "vllm/num_requests_waiting",
+        "vllm/num_requests_waiting_capacity",
+        "vllm/prefix_cache_hit_rate",
+        "vllm/kv_cache_usage_perc",
+    }
+)
+WANDB_CANONICAL_METRIC_PREFIXES = (
+    "costs/cum/",
+    "reward/",
+    f"{SFT_METRIC_PREFIX}/",
+    "task/",
+)
 
 
 def _wandb_run_is_finished(run: "Run") -> bool:
@@ -718,28 +782,29 @@ class Model(
                 {
                     SFT_WANDB_GRADIENT_STEP_KEY,
                     "training_step",
-                    "time/wall_clock_sec",
                 },
             )
 
             # Define training_step as the x-axis for all metrics.
             # This allows out-of-order logging (e.g., async validation for previous steps).
             run.define_metric("training_step")
-            run.define_metric("time/wall_clock_sec")
             run.define_metric(SFT_WANDB_GRADIENT_STEP_KEY)
             run.define_metric("reward/*", step_metric="training_step")
             run.define_metric("loss/*", step_metric="training_step")
+            run.define_metric("objective/*", step_metric="training_step")
+            run.define_metric("sample_efficiency/*", step_metric="training_step")
+            run.define_metric("offpolicy/*", step_metric="training_step")
             run.define_metric("throughput/*", step_metric="training_step")
             run.define_metric("costs/*", step_metric="training_step")
             run.define_metric("time/*", step_metric="training_step")
             run.define_metric("data/*", step_metric="training_step")
+            run.define_metric("discarded/*", step_metric="training_step")
+            run.define_metric("pipeline_settings/*", step_metric="training_step")
+            run.define_metric("task/*", step_metric="training_step")
+            run.define_metric("vllm/*", step_metric="training_step")
             run.define_metric(
                 f"{SFT_METRIC_PREFIX}/*", step_metric=SFT_WANDB_GRADIENT_STEP_KEY
             )
-            run.define_metric("train/*", step_metric="training_step")
-            run.define_metric("val/*", step_metric="training_step")
-            run.define_metric("test/*", step_metric="training_step")
-            run.define_metric("discarded/*", step_metric="training_step")
             self._sync_wandb_config(run)
         return self._wandb_run
 
@@ -750,7 +815,14 @@ class Model(
         step: int,
     ) -> None:
         """Log metrics to history.jsonl and optionally wandb."""
-        if split in METRIC_SPLITS:
+        if split == SFT_METRIC_PREFIX:
+            prefixed = {
+                key
+                if key.startswith(f"{SFT_METRIC_PREFIX}/")
+                else f"{split}/{key}": value
+                for key, value in metrics.items()
+            }
+        else:
             prefixed = {}
             for key, value in metrics.items():
                 first_component = key.split("/", 1)[0]
@@ -762,11 +834,8 @@ class Model(
                     prefixed[key] = value
                 else:
                     prefixed[f"{split}/{key}"] = value
-        else:
-            prefixed = {f"{split}/{k}": v for k, v in metrics.items()}
 
         prefixed["training_step"] = step
-        prefixed["time/wall_clock_sec"] = time.time() - self._run_start_time
 
         output_dir = self._get_output_dir()
 
@@ -791,11 +860,20 @@ class Model(
         ) or (self.report_metrics is not None and "wandb" in self.report_metrics)
         if should_log_wandb:
             if run := self._get_wandb_run():
-                self._define_wandb_step_metrics(prefixed.keys())
+                wandb_metrics = self._wandb_metrics_payload(prefixed)
+                self._define_wandb_step_metrics(wandb_metrics.keys())
                 # Let W&B use its own monotonically increasing history step.
                 # ART's `training_step` remains the x-axis via define_metric,
                 # which preserves out-of-order eval logging.
-                run.log(prefixed)
+                run.log(wandb_metrics)
+
+    def _wandb_metrics_payload(self, metrics: dict[str, float]) -> dict[str, float]:
+        return {
+            key: value
+            for key, value in metrics.items()
+            if key in WANDB_CANONICAL_METRIC_KEYS
+            or key.startswith(WANDB_CANONICAL_METRIC_PREFIXES)
+        }
 
     def _define_wandb_step_metrics(self, keys: Iterable[str]) -> None:
         run = self._wandb_run
@@ -831,6 +909,19 @@ class Model(
                 continue
             non_cost_metrics[metric] = numeric_value
         return non_cost_metrics
+
+    def _route_task_metrics_and_collect_non_costs(
+        self,
+        metrics: dict[str, float],
+        split: str,
+        *,
+        prefix: str | None = None,
+    ) -> dict[str, float]:
+        routed = self._route_metrics_and_collect_non_costs(metrics, split)
+        task_prefix = f"task/{split}"
+        if prefix:
+            task_prefix = f"{task_prefix}/{prefix.strip('/')}"
+        return {f"{task_prefix}/{metric}": value for metric, value in routed.items()}
 
     def _collect_automatic_backend_metrics(
         self,
@@ -1042,8 +1133,10 @@ class Model(
 
         for group in trajectory_groups:
             if group.metrics:
-                group_non_cost = self._route_metrics_and_collect_non_costs(
-                    cast(dict[str, float], group.metrics), split
+                group_non_cost = self._route_task_metrics_and_collect_non_costs(
+                    cast(dict[str, float], group.metrics),
+                    split,
+                    prefix="group",
                 )
             else:
                 group_non_cost = {}
@@ -1064,9 +1157,11 @@ class Model(
                 for metric, value in trajectory.metrics.items():
                     trajectory_metrics[metric] = float(value)
 
-                non_cost_trajectory_metrics = self._route_metrics_and_collect_non_costs(
-                    trajectory_metrics,
-                    split,
+                non_cost_trajectory_metrics = (
+                    self._route_task_metrics_and_collect_non_costs(
+                        trajectory_metrics,
+                        split,
+                    )
                 )
                 for metric, value in non_cost_trajectory_metrics.items():
                     if metric not in all_metrics:
@@ -1084,8 +1179,7 @@ class Model(
         # Aggregate group-level metrics once per group
         for metric, values in group_metrics.items():
             if len(values) > 0:
-                group_key = f"group_{metric}"
-                averages[group_key] = sum(values) / len(values)
+                averages[metric] = sum(values) / len(values)
 
         # Calculate average standard deviation of rewards within groups
         from .utils.old_benchmarking.calculate_step_metrics import (
@@ -1093,6 +1187,22 @@ class Model(
         )
 
         averages[reward_std_dev_key] = calculate_step_std_dev(trajectory_groups)
+
+        reward_value = averages.pop(reward_key, None)
+        reward_std_dev = averages.pop(reward_std_dev_key, None)
+        exception_rate = averages.pop(exception_rate_key, None)
+        if split in METRIC_SPLITS:
+            if reward_value is not None:
+                averages[f"reward/{split}"] = reward_value
+            if reward_std_dev is not None:
+                averages[f"reward/{split}_std_dev"] = reward_std_dev
+        else:
+            if reward_value is not None:
+                averages[f"task/{split}/reward"] = reward_value
+            if reward_std_dev is not None:
+                averages[f"task/{split}/reward_std_dev"] = reward_std_dev
+        if exception_rate is not None:
+            averages[f"task/{split}/exception_rate"] = exception_rate
 
         # Merge in any additional metrics passed directly
         if metrics is not None:
@@ -1288,14 +1398,14 @@ class TrainableModel(Model[ModelConfig, StateType], Generic[ModelConfig, StateTy
         )
 
     async def delete_checkpoints(
-        self, best_checkpoint_metric: str = "val/reward"
+        self, best_checkpoint_metric: str = "reward/val"
     ) -> None:
         """
         Delete all but the latest and best checkpoints.
 
         Args:
             best_checkpoint_metric: The metric to use to determine the best checkpoint.
-                Defaults to "val/reward".
+                Defaults to "reward/val".
         """
         output_dir = self._get_output_dir()
         steps_to_keep = [await self.get_step()]  # Keep latest
@@ -1389,7 +1499,7 @@ class TrainableModel(Model[ModelConfig, StateType], Generic[ModelConfig, StateTy
         # remote-logging backends, the remote SFT job owns this row too.
         if training_metrics and log_metrics and not backend_logs_sft_metrics:
             avg_metrics = average_metric_samples(training_metrics)
-            avg_metrics["time/step_trainer_s"] = trainer_elapsed
+            avg_metrics["time/step_backend_train_s"] = trainer_elapsed
             # Get the current step after training
             step = await self.get_step()
             await self.log(

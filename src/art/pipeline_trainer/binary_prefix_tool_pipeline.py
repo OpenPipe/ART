@@ -159,12 +159,12 @@ def print_history_summary(model: art.TrainableModel, tail: int = 5) -> None:
 
     rows = pl.read_ndjson(str(history_path)).to_dicts()
 
-    train_rows = [row for row in rows if "train/reward" in row]
+    train_rows = [row for row in rows if "reward/train" in row]
     print("\nRecent training metrics:")
     for row in train_rows[-tail:]:
         step = row["step"]
-        reward = row["train/reward"]
-        std_dev = row["train/reward_std_dev"]
+        reward = row["reward/train"]
+        std_dev = row["reward/train_std_dev"]
         discarded = row["train/discarded_stale_groups"]
         off_policy = row["train/steps_off_policy"]
         print(

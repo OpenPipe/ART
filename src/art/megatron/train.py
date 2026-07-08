@@ -969,13 +969,13 @@ def _log_rl_step_result(
         return
     with open(log_path, "a+", encoding="utf-8") as log_file:
         metrics = {
-            "loss": step_result.reduced_loss.item(),
-            "grad_norm": step_result.grad_norm,
-            "probs_corr": step_result.probs_corr,
+            "loss/train": step_result.reduced_loss.item(),
+            "loss/grad_norm": step_result.grad_norm,
+            "loss/probs_corr": step_result.probs_corr,
             TRAIN_GRADIENT_STEPS_KEY: num_gradient_steps,
         }
         if step_result.kl_policy_ref is not None:
-            metrics["kl_policy_ref"] = step_result.kl_policy_ref
+            metrics["loss/kl_policy_ref"] = step_result.kl_policy_ref
         metrics.update(step_result.loss_metrics)
         log_msg = json.dumps(metrics)
         print("Logging", log_msg)

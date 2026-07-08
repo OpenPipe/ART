@@ -101,7 +101,9 @@ def aggregate_rl_training_metrics(
     groups_list = list(trajectory_groups)
     avg_metrics = average_metric_samples(training_metrics)
     summary = summarize_trajectory_groups(groups_list)
-    avg_metrics.setdefault("time/step_trainer_s", time.monotonic() - trainer_started)
+    avg_metrics.setdefault(
+        "time/step_backend_train_s", time.monotonic() - trainer_started
+    )
     avg_metrics.update(
         {
             key: value
