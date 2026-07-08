@@ -100,6 +100,12 @@ def aggregate_rl_training_metrics(
 ) -> dict[str, float]:
     groups_list = list(trajectory_groups)
     avg_metrics = average_metric_samples(training_metrics)
+    tokens_per_second = avg_metrics.pop("tokens_per_second", None)
+    if (
+        tokens_per_second is not None
+        and "throughput/train_packed_tok_per_s" not in avg_metrics
+    ):
+        avg_metrics["throughput/train_packed_tok_per_s"] = float(tokens_per_second)
     summary = summarize_trajectory_groups(groups_list)
     avg_metrics.setdefault(
         "time/step_backend_train_s", time.monotonic() - trainer_started

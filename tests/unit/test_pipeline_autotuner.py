@@ -45,6 +45,47 @@ def test_build_initial_settings_uses_art_owned_defaults() -> None:
     assert settings.queue_maxsize == 12
 
 
+@pytest.mark.asyncio
+async def test_attachment_averages_train_step_vllm_metrics() -> None:
+    attachment = PipelineAutotunerAttachment(PipelineAutotuneConfig(mode="online"))
+
+    await attachment._emit_metrics(
+        {
+            "vllm/prompt_tok_per_s": 100.0,
+            "vllm/completion_tok_per_s": 20.0,
+            "vllm/num_requests_running": 4.0,
+            "loss/train": 1.0,
+        },
+        step=None,
+    )
+    await attachment._emit_metrics(
+        {
+            "vllm/prompt_tok_per_s": 300.0,
+            "vllm/completion_tok_per_s": 60.0,
+            "vllm/num_requests_running": 8.0,
+        },
+        step=None,
+    )
+
+    metrics = attachment.collect_train_step_metrics()
+
+    assert metrics == {
+        "vllm/prompt_tok_per_s": 200.0,
+        "vllm/completion_tok_per_s": 40.0,
+        "vllm/num_requests_running": 6.0,
+    }
+    assert attachment.collect_train_step_metrics() == {}
+
+
+def test_attachment_owns_step_vllm_metrics_only_online() -> None:
+    assert PipelineAutotunerAttachment(
+        PipelineAutotuneConfig(mode="online")
+    ).owns_train_step_vllm_metrics()
+    assert not PipelineAutotunerAttachment(
+        PipelineAutotuneConfig(mode="profile")
+    ).owns_train_step_vllm_metrics()
+
+
 def test_recommended_queue_keeps_one_batch_and_policy_age_bound() -> None:
     assert (
         recommended_queue_size(

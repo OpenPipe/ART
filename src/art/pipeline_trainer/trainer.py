@@ -458,6 +458,31 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
             if isinstance(value, (int, float)):
                 await self._emit_pipeline_metric(name, float(value), step=step)
 
+    def _collect_attachment_train_step_metrics(self) -> tuple[dict[str, float], bool]:
+        metrics: dict[str, float] = {}
+        owns_vllm_metrics = False
+        for attachment in self._attachments:
+            collector = getattr(attachment, "collect_train_step_metrics", None)
+            if not callable(collector):
+                continue
+            attachment_metrics = collector()
+            if not isinstance(attachment_metrics, Mapping):
+                raise RuntimeError(
+                    "Pipeline attachment train-step metrics collector returned a "
+                    "non-mapping result."
+                )
+            metrics.update(
+                {
+                    name: float(value)
+                    for name, value in attachment_metrics.items()
+                    if isinstance(value, (int, float))
+                }
+            )
+            owns_vllm_metrics = owns_vllm_metrics or bool(
+                getattr(attachment, "owns_train_step_vllm_metrics", lambda: False)()
+            )
+        return metrics, owns_vllm_metrics
+
     async def _emit_packed_group_observations(
         self, metrics: Mapping[str, float], *, batch: list[TrajectoryGroup], step: int
     ) -> None:
@@ -848,18 +873,17 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
                 if queue_wait_s > 0 and actor_wall_s > 0:
                     metrics["queue/put_wait_frac"] = queue_wait_s / actor_wall_s
                 metrics.update(result.metrics)
-                if (
-                    train_call_elapsed > 0
-                    and "data/step_packed_train_tokens" in metrics
-                ):
-                    metrics["throughput/train_packed_tok_per_s"] = (
-                        float(metrics["data/step_packed_train_tokens"])
-                        / train_call_elapsed
-                    )
+                attachment_metrics, attachment_owns_vllm_metrics = (
+                    self._collect_attachment_train_step_metrics()
+                )
+                metrics.update(attachment_metrics)
                 vllm_metrics_collector = getattr(
                     self.backend, "collect_train_step_vllm_metrics", None
                 )
-                if callable(vllm_metrics_collector):
+                if (
+                    callable(vllm_metrics_collector)
+                    and not attachment_owns_vllm_metrics
+                ):
                     maybe_metrics = vllm_metrics_collector(self.model)
                     if inspect.isawaitable(maybe_metrics):
                         metrics.update(await maybe_metrics)

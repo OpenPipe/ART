@@ -594,6 +594,7 @@ def run_megatron_rl_job(
                 if cp_lookahead_state is not None and ref_logprobs_by_index is not None
                 else None
             )
+            train_step_started = time.perf_counter()
             step_result = run_training_step(
                 model_chunks=runtime.model,
                 provider=runtime.provider,
@@ -611,6 +612,10 @@ def run_megatron_rl_job(
                 next_step_first_micro=next_step_first_micro,
                 next_step_first_ref_logprobs=next_step_first_ref_logprobs,
             )
+            train_step_s = time.perf_counter() - train_step_started
+            packed_train_tokens = sum(
+                int(micro["tokens"].numel()) for micro in micro_inputs
+            )
             print0(
                 runtime.rank,
                 "Correlation between old and new probabilities:",
@@ -621,6 +626,8 @@ def run_megatron_rl_job(
                 job.log_path,
                 step_result,
                 num_gradient_steps=num_steps,
+                packed_train_tokens=packed_train_tokens,
+                train_step_s=train_step_s,
             )
 
         _save_lora_and_optimizer(
@@ -964,15 +971,21 @@ def _log_rl_step_result(
     step_result: TrainStepResult,
     *,
     num_gradient_steps: int,
+    packed_train_tokens: int,
+    train_step_s: float,
 ) -> None:
     if rank != 0:
         return
     with open(log_path, "a+", encoding="utf-8") as log_file:
+        train_packed_tok_per_s = (
+            float(packed_train_tokens) / train_step_s if train_step_s > 0 else 0.0
+        )
         metrics = {
             "loss/train": step_result.reduced_loss.item(),
             "loss/grad_norm": step_result.grad_norm,
             "loss/probs_corr": step_result.probs_corr,
             TRAIN_GRADIENT_STEPS_KEY: num_gradient_steps,
+            "throughput/train_packed_tok_per_s": train_packed_tok_per_s,
         }
         if step_result.kl_policy_ref is not None:
             metrics["loss/kl_policy_ref"] = step_result.kl_policy_ref

@@ -14,11 +14,16 @@ import torch
 from transformers.tokenization_utils_base import PreTrainedTokenizerBase
 
 from art import PipelineRuntimeConfig, TrainableModel, Trajectory, TrajectoryGroup
+from art._backend_training import aggregate_rl_training_metrics
 from art.dev.model import InternalModelConfig
 from art.errors import ArtVllmMetricsTimeoutError
 from art.local import LocalBackend
 from art.megatron import MegatronBackend
-from art.megatron.train import load_adapter_into_model
+from art.megatron.train import (
+    TrainStepResult,
+    _log_rl_step_result,
+    load_adapter_into_model,
+)
 from art.pipeline_trainer import (
     CHECKPOINT_CREATED_AT_METRIC,
     CHECKPOINT_EVAL_COMPLETED_METRIC,
@@ -122,6 +127,39 @@ def _make_trainer(
         eval_fn=None,
         **kwargs,
     )
+
+
+def test_rl_training_metrics_canonicalize_megatron_packed_throughput() -> None:
+    metrics = aggregate_rl_training_metrics(
+        training_metrics=[{"tokens_per_second": 25000.0}],
+        trajectory_groups=[_make_group([0.0, 1.0])],
+        trainer_started=0.0,
+    )
+
+    assert metrics["throughput/train_packed_tok_per_s"] == 25000.0
+    assert "tokens_per_second" not in metrics
+
+
+def test_megatron_rl_log_includes_packed_train_throughput(tmp_path: Path) -> None:
+    log_path = tmp_path / "megatron_rl_step.jsonl"
+
+    _log_rl_step_result(
+        0,
+        str(log_path),
+        TrainStepResult(
+            reduced_loss=torch.tensor(1.0),
+            probs_corr=0.5,
+            update_successful=True,
+            grad_norm=2.0,
+            num_zeros_in_grad=None,
+        ),
+        num_gradient_steps=1,
+        packed_train_tokens=1000,
+        train_step_s=0.25,
+    )
+
+    row = json.loads(log_path.read_text())
+    assert row["throughput/train_packed_tok_per_s"] == 4000.0
 
 
 @pytest.mark.asyncio
@@ -368,6 +406,40 @@ async def test_pipeline_trainer_uses_same_train_kwargs_for_local_backend(
         "optimizer_save_interval": None,
         "final_training_step": 1,
     }
+
+
+@pytest.mark.asyncio
+async def test_pipeline_trainer_preserves_backend_train_packed_throughput(
+    tmp_path: Path,
+) -> None:
+    model = TrainableModel(
+        name="pipeline-preserve-packed-throughput",
+        project="pipeline-tests",
+        base_model="test-model",
+        base_path=str(tmp_path),
+    )
+    log_mock = AsyncMock()
+    object.__setattr__(model, "log", log_mock)
+    backend = MagicMock()
+    backend.train = AsyncMock(
+        return_value=SimpleNamespace(
+            step=1,
+            metrics={
+                "data/step_packed_train_tokens": 1000.0,
+                "throughput/train_packed_tok_per_s": 25000.0,
+            },
+        )
+    )
+
+    trainer = _make_trainer(model=model, backend=backend)
+    trainer._output_queue = asyncio.Queue()
+    await trainer._output_queue.put(_make_group([0.0, 1.0]))
+    await trainer._output_queue.put(None)
+
+    await trainer._training_stage()
+
+    logged_metrics = log_mock.await_args.kwargs["metrics"]
+    assert logged_metrics["throughput/train_packed_tok_per_s"] == 25000.0
 
 
 @pytest.mark.asyncio

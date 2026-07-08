@@ -30,6 +30,17 @@ _REQUIRED_AUTOTUNE_VLLM_METRICS = frozenset(
         "vllm/num_preemptions_total",
     }
 )
+_TRAIN_STEP_VLLM_METRICS = frozenset(
+    {
+        "vllm/prompt_tok_per_s",
+        "vllm/completion_tok_per_s",
+        "vllm/num_requests_running",
+        "vllm/num_requests_waiting",
+        "vllm/num_requests_waiting_capacity",
+        "vllm/prefix_cache_hit_rate",
+        "vllm/kv_cache_usage_perc",
+    }
+)
 
 
 class VllmMetricPollHealth(pydantic.BaseModel):
@@ -46,6 +57,7 @@ class PipelineAutotunerAttachment:
         self.profile_name = config.output_name
         self._sampler_task: asyncio.Task[None] | None = None
         self._poll_health: list[VllmMetricPollHealth] = []
+        self._train_step_vllm_metrics: list[PipelineMetric] = []
         self._sampler_error: BaseException | None = None
         self._started = False
 
@@ -110,6 +122,9 @@ class PipelineAutotunerAttachment:
         if self.tuner is not None:
             self.tuner.on_packed_group(observation)
 
+    def owns_train_step_vllm_metrics(self) -> bool:
+        return self.config.mode == "online"
+
     async def on_stop(self, *, training_failed: bool = False) -> None:
         if self._sampler_task is not None:
             self._sampler_task.cancel()
@@ -136,7 +151,7 @@ class PipelineAutotunerAttachment:
                 await asyncio.sleep(min(self.config.vllm_metric_interval_s, remaining))
                 continue
             self._record_poll_success()
-            await self._emit_metrics(metrics, step=None)
+            await self._emit_metrics(metrics, step=None, record_train_step=False)
             return
 
     async def _sample_serving_metrics(self) -> None:
@@ -222,13 +237,34 @@ class PipelineAutotunerAttachment:
                 "Pipeline autotuning ART vLLM metrics sampler failed."
             ) from self._sampler_error
 
-    async def _emit_metrics(self, metrics: dict[str, float], step: int | None) -> None:
+    def collect_train_step_metrics(self) -> dict[str, float]:
+        samples = self._train_step_vllm_metrics
+        self._train_step_vllm_metrics = []
+        by_name: dict[str, list[float]] = {}
+        for metric in samples:
+            by_name.setdefault(metric.name, []).append(metric.value)
+        return {
+            name: sum(values) / len(values)
+            for name, values in by_name.items()
+            if values
+        }
+
+    async def _emit_metrics(
+        self,
+        metrics: dict[str, float],
+        step: int | None,
+        *,
+        record_train_step: bool = True,
+    ) -> None:
         now = time.monotonic()
         for name, value in metrics.items():
             if isinstance(value, (int, float)):
-                await self.on_metric(
-                    PipelineMetric(name=name, value=float(value), step=step, t_s=now)
+                metric = PipelineMetric(
+                    name=name, value=float(value), step=step, t_s=now
                 )
+                if record_train_step and name in _TRAIN_STEP_VLLM_METRICS:
+                    self._train_step_vllm_metrics.append(metric)
+                await self.on_metric(metric)
 
     def _save_profile(self) -> None:
         if self.tuner is None or self.store is None:
