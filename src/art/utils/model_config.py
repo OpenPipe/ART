@@ -91,6 +91,9 @@ def detect_chat_template_parts(
 def get_instruction_response_parts(
     model_id: str,
     tokenizer: object,
+    *,
+    instruction_part: str | None = None,
+    response_part: str | None = None,
 ) -> tuple[str, str]:
     """Get instruction and response parts for a model.
 
@@ -107,6 +110,14 @@ def get_instruction_response_parts(
     Raises:
         ValueError: If chat template cannot be detected and model has no explicit config
     """
+    if instruction_part is not None or response_part is not None:
+        if not instruction_part or not response_part:
+            raise ValueError(
+                "Both instruction_part and response_part must be set when overriding "
+                "SFT chat template parts."
+            )
+        return instruction_part, response_part
+
     # Check for explicit model configuration first
     if model_id in MODEL_CONFIGS:
         config = MODEL_CONFIGS[model_id]

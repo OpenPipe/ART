@@ -135,6 +135,9 @@ class InternalModelConfig(TypedDict, total=False):
         chat_template_content_format: vLLM chat template content format.
         chat_template_tool_schema_format: Tool schema rendering format used for
             local training tokenization.
+        sft_instruction_part: Instruction template part used by local SFT
+            tokenization.
+        sft_response_part: Response template part used by local SFT tokenization.
         allow_unvalidated_arch: Permit model-support validation workflows to run
             architectures that are not yet in the supported-model registry.
     """
@@ -152,6 +155,8 @@ class InternalModelConfig(TypedDict, total=False):
     chat_template_path: str
     chat_template_content_format: str
     chat_template_tool_schema_format: Literal["default", "vllm_openai"]
+    sft_instruction_part: str
+    sft_response_part: str
     allow_unvalidated_arch: bool
 
 

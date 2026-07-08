@@ -1147,7 +1147,10 @@ class LocalBackend(Backend):
         from ..utils.model_config import get_instruction_response_parts
 
         instruction_part, response_part = get_instruction_response_parts(
-            model.base_model, tokenizer
+            model.base_model,
+            tokenizer,
+            instruction_part=internal_config.get("sft_instruction_part"),
+            response_part=internal_config.get("sft_response_part"),
         )
         chat_template_kwargs = internal_config.get("chat_template_kwargs")
         chat_template_tool_schema_format = self._chat_template_tool_schema_format(

@@ -245,6 +245,31 @@ def test_qwen_disable_thinking_config_excludes_scaffold_from_loss_mask() -> None
     assert batch.num_trainable_tokens == len("second")
 
 
+def test_get_instruction_response_parts_allows_explicit_override() -> None:
+    tokenizer = _QwenDisableThinkingTokenizer()
+
+    instruction_part, response_part = get_instruction_response_parts(
+        "Qwen/Qwen3.5-35B-A3B",
+        tokenizer,  # type: ignore[arg-type]
+        instruction_part="<user>",
+        response_part="<assistant>",
+    )
+
+    assert instruction_part == "<user>"
+    assert response_part == "<assistant>"
+
+
+def test_get_instruction_response_parts_requires_complete_override() -> None:
+    tokenizer = _QwenDisableThinkingTokenizer()
+
+    with pytest.raises(ValueError, match="Both instruction_part and response_part"):
+        get_instruction_response_parts(
+            "Qwen/Qwen3.5-35B-A3B",
+            tokenizer,  # type: ignore[arg-type]
+            response_part="<assistant>",
+        )
+
+
 def test_tokenize_sft_batch_loss_mask_message_mask() -> None:
     tokenizer = _FakeTokenizer()
     messages = cast(
