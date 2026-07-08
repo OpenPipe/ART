@@ -19,6 +19,7 @@ def main(
     steps: int = 1,
     lr: float = 5e-5,
     layers: int = 2,
+    lora_rank: int = 8,
     max_seq_length: int = 256,
 ) -> None:
     os.environ.setdefault("ART_MEGATRON_TENSOR_MODEL_PARALLEL_SIZE", "1")
@@ -71,6 +72,36 @@ def main(
             print_env=dist.get_rank() == 0,
         )
         rank = TrainerRank(runtime)
+        from art.megatron.lora import LoRA
+
+        adapter: dict[str, torch.Tensor] = {}
+        generator = torch.Generator(device=rank.device).manual_seed(0)
+        for chunk in runtime.model:
+            for module in chunk.modules():
+                if not isinstance(module, LoRA):
+                    continue
+                for a_key, b_key in zip(
+                    module._expected_weight_keys("lora_A"),
+                    module._expected_weight_keys("lora_B"),
+                    strict=True,
+                ):
+                    adapter[a_key] = torch.randn(
+                        lora_rank,
+                        module.in_features,
+                        device=rank.device,
+                        dtype=module.A_T.dtype,
+                        generator=generator,
+                    )
+                    adapter[b_key] = torch.zeros(
+                        module.out_features,
+                        lora_rank,
+                        device=rank.device,
+                        dtype=module.B_T.dtype,
+                    )
+        loaded_sites = rank.load_checkpoint_slot("student", adapter)
+        if loaded_sites == 0:
+            raise RuntimeError("TrainerRank dev script requires LoRA adapter sites")
+        rank.set_checkpoint("student")
         if dist.get_rank() == 0:
             print(
                 "TrainerRank ready: "

@@ -5,7 +5,6 @@ from collections.abc import (
     Iterable,
     Iterator,
     Mapping,
-    MutableMapping,
     Sequence,
 )
 from dataclasses import dataclass
@@ -33,7 +32,6 @@ from art.megatron.shared_prefix_packing import (
 
 if TYPE_CHECKING:
     from megatron.core.models.gpt.gpt_model import GPTModel
-    from megatron.core.optimizer import MegatronOptimizer, OptimizerConfig
     from megatron.core.packed_seq_params import PackedSeqParams
 
     from art.megatron.context_parallel.types import (
@@ -78,6 +76,12 @@ class _Unset:
 
 Unset = _Unset()
 type AdapterSelection = str | None | _Unset
+
+
+@dataclass(frozen=True)
+class _LocalLoRASlotRef:
+    kind: Literal["checkpoint", "lora"]
+    name: str | None
 
 
 @dataclass(frozen=True)
@@ -577,7 +581,7 @@ class TrainerRank:
             zero_grad_buffer = getattr(chunk, "zero_grad_buffer", None)
             if callable(zero_grad_buffer):
                 zero_grad_buffer()
-        optimizer = cast("MegatronOptimizer | None", self.runtime.optimizer)
+        optimizer = self.runtime.optimizer
         if optimizer is not None:
             optimizer.zero_grad()
         for params in self._checkpoint_slot_params_by_name.values():
@@ -611,6 +615,7 @@ class TrainerRank:
         name: str,
         adapter_model: dict[str, torch.Tensor],
         *,
+        optimizer_state: Mapping[str, object] | None = None,
         alpha: float | None = None,
     ) -> int:
         loaded = self._load_slot(
@@ -619,8 +624,19 @@ class TrainerRank:
         self._checkpoint_slot_params_by_name[name] = (
             self._validate_dynamic_slot_consistency("checkpoint", name, loaded)
         )
-        self._dynamic_optimizers.pop(name, None)
+        if optimizer_state is None:
+            self._dynamic_optimizers.pop(name, None)
+        else:
+            self._dynamic_optimizers[name] = self._restore_dynamic_optimizer(
+                name, optimizer_state
+            )
         return loaded
+
+    def checkpoint_slot_optimizer_state(self, name: str) -> dict[str, object] | None:
+        if name not in self._checkpoint_slot_params_by_name:
+            raise ValueError(f"Unknown checkpoint slot: {name!r}")
+        optimizer = self._dynamic_optimizers.get(name)
+        return None if optimizer is None else optimizer.state_dict()
 
     def load_lora_slot(
         self,
@@ -823,42 +839,11 @@ class TrainerRank:
         checkpoints: Sequence[str] | None = None,
     ) -> dict[str, float]:
         selected_checkpoints = self._selected_dynamic_checkpoints(checkpoints)
-        if selected_checkpoints:
-            return self._dynamic_optim_step(
-                selected_checkpoints,
-                params=params,
-                scale_grads=scale_grads,
-            )
-
-        from art.megatron.training.finalize_grads import (
-            finalize_model_grads_extended,
-            flush_param_grads_to_main_grads,
+        return self._dynamic_optim_step(
+            selected_checkpoints,
+            params=params,
+            scale_grads=scale_grads,
         )
-        from art.megatron.training.model_chunks import as_megatron_api_chunks
-
-        optimizer = self._optimizer()
-        flush_param_grads_to_main_grads(self.runtime.model)
-        finalize_model_grads_extended(
-            as_megatron_api_chunks(self.runtime.model),
-            num_tokens=None,
-        )
-        self._scale_main_grads(scale_grads)
-        self._configure_optimizer(params)
-        update_successful, grad_norm, num_zeros = optimizer.step()
-        optimizer.zero_grad()
-        self.zero_grad()
-        return {
-            "learning_rate": float(params.learning_rate),
-            "grad_norm": float(grad_norm),
-            "update_successful": float(bool(update_successful)),
-            "num_zeros_in_grad": float(num_zeros or 0),
-        }
-
-    def _optimizer(self) -> "MegatronOptimizer":
-        optimizer = cast("MegatronOptimizer | None", self.runtime.optimizer)
-        if optimizer is None:
-            raise RuntimeError("TrainerRank requires a runtime with an optimizer")
-        return optimizer
 
     def _load_slot(
         self,
@@ -892,7 +877,13 @@ class TrainerRank:
     def _slot_ref(
         kind: Literal["checkpoint", "lora"], name: str | None
     ) -> "LoRASlotRef":
-        from art.megatron.lora import LoRASlotRef
+        try:
+            from art.megatron.lora import LoRASlotRef
+        except ModuleNotFoundError as exc:
+            if exc.name is None or not exc.name.startswith("megatron"):
+                raise
+
+            return cast("LoRASlotRef", _LocalLoRASlotRef(kind=kind, name=name))
 
         return LoRASlotRef(kind=kind, name=name)
 
@@ -955,33 +946,77 @@ class TrainerRank:
             return self._slot_ref("lora", cast(str | None, request.lora))
         if self._slot_stack:
             return self._slot_stack[-1]
-        return self._default_slot_ref
+        if self._default_slot_ref is not None:
+            return self._default_slot_ref
+        return self._slot_ref("checkpoint", None)
 
     def _selected_dynamic_checkpoints(
         self,
         checkpoints: Sequence[str] | None,
     ) -> tuple[str, ...]:
         if checkpoints is not None:
-            if (
-                unknown := set(checkpoints)
-                - self._checkpoint_slot_params_by_name.keys()
-            ):
+            selected = tuple(dict.fromkeys(checkpoints))
+            if unknown := set(selected) - self._checkpoint_slot_params_by_name.keys():
                 raise ValueError(f"Unknown checkpoint slots: {sorted(unknown)}")
-            return tuple(dict.fromkeys(checkpoints))
+            if not selected:
+                raise TrainerRankSlotStateError(
+                    "TrainerRank.optim_step(checkpoints=...) received no checkpoint "
+                    "names. Pass at least one loaded checkpoint slot."
+                )
+            self._raise_if_checkpoints_have_no_grads(selected)
+            return selected
         slots = tuple(sorted(self._checkpoint_slot_params_by_name.items()))
         if not slots:
-            return ()
-        has_grad = torch.tensor(
+            raise TrainerRankSlotStateError(
+                "TrainerRank.optim_step requires a loaded checkpoint slot. Call "
+                "load_checkpoint_slot(...) and run backward on outputs produced by "
+                "that slot before stepping."
+            )
+        names = tuple(name for name, _ in slots)
+        has_grad = self._checkpoint_grad_flags(names)
+        selected = tuple(
+            name for name, flag in zip(names, has_grad, strict=True) if flag
+        )
+        if not selected:
+            raise TrainerRankSlotStateError(
+                "TrainerRank.optim_step found loaded checkpoint slots, but none have "
+                "gradients on any rank. Call loss.backward() first, or pass the "
+                "checkpoint names that should be stepped after producing gradients."
+            )
+        return selected
+
+    def _raise_if_checkpoints_have_no_grads(self, names: Sequence[str]) -> None:
+        missing = [
+            name
+            for name, has_grad in zip(
+                names, self._checkpoint_grad_flags(names), strict=True
+            )
+            if not has_grad
+        ]
+        if missing:
+            raise TrainerRankSlotStateError(
+                "TrainerRank.optim_step was asked to step checkpoint slots with no "
+                f"gradients on any rank: {missing}. Call loss.backward() for those "
+                "slots first, or omit them from checkpoints=[...]."
+            )
+
+    def _checkpoint_grad_flags(self, names: Sequence[str]) -> tuple[bool, ...]:
+        flags = torch.tensor(
             [
-                int(any(param.grad is not None for param in params))
-                for _, params in slots
+                int(
+                    any(
+                        param.grad is not None
+                        for param in self._checkpoint_slot_params_by_name[name]
+                    )
+                )
+                for name in names
             ],
             device=self.device,
             dtype=torch.int32,
         )
         if dist.is_available() and dist.is_initialized():
-            dist.all_reduce(has_grad, op=dist.ReduceOp.MAX)
-        return tuple(name for (name, _), flag in zip(slots, has_grad.tolist()) if flag)
+            dist.all_reduce(flags, op=dist.ReduceOp.MAX)
+        return tuple(bool(flag) for flag in flags.tolist())
 
     def _dynamic_optim_step(
         self,
@@ -1025,12 +1060,7 @@ class TrainerRank:
     ) -> torch.optim.Optimizer:
         optimizer = self._dynamic_optimizers.get(name)
         if optimizer is None:
-            optimizer = torch.optim.AdamW(
-                self._checkpoint_slot_params_by_name[name],
-                lr=params.learning_rate,
-                betas=(params.beta1, params.beta2),
-                weight_decay=params.weight_decay,
-            )
+            optimizer = self._new_dynamic_optimizer(name, params)
             self._dynamic_optimizers[name] = optimizer
             return optimizer
         for group in optimizer.param_groups:
@@ -1038,6 +1068,53 @@ class TrainerRank:
             group["betas"] = (params.beta1, params.beta2)
             group["weight_decay"] = params.weight_decay
         return optimizer
+
+    def _new_dynamic_optimizer(
+        self,
+        name: str,
+        params: AdamParams,
+    ) -> torch.optim.Optimizer:
+        return torch.optim.AdamW(
+            self._checkpoint_slot_params_by_name[name],
+            lr=params.learning_rate,
+            betas=(params.beta1, params.beta2),
+            weight_decay=params.weight_decay,
+        )
+
+    def _restore_dynamic_optimizer(
+        self,
+        name: str,
+        state: Mapping[str, object],
+    ) -> torch.optim.Optimizer:
+        optimizer = self._new_dynamic_optimizer(name, AdamParams(learning_rate=0.0))
+        try:
+            optimizer.load_state_dict(dict(state))
+        except ValueError as exc:
+            raise TrainerRankSlotStateError(
+                f"Optimizer state for checkpoint slot {name!r} does not match the "
+                "loaded slot parameter groups."
+            ) from exc
+        self._validate_dynamic_optimizer_state_shapes(name, optimizer)
+        return optimizer
+
+    def _validate_dynamic_optimizer_state_shapes(
+        self,
+        name: str,
+        optimizer: torch.optim.Optimizer,
+    ) -> None:
+        for param in self._checkpoint_slot_params_by_name[name]:
+            state = optimizer.state.get(param, {})
+            for state_name, value in state.items():
+                if (
+                    isinstance(value, torch.Tensor)
+                    and int(value.ndim) > 0
+                    and tuple(value.shape) != tuple(param.shape)
+                ):
+                    raise TrainerRankSlotStateError(
+                        f"Optimizer state {state_name!r} for checkpoint slot "
+                        f"{name!r} has shape {tuple(value.shape)}, but the loaded "
+                        f"slot parameter has shape {tuple(param.shape)}."
+                    )
 
     def _reduce_dynamic_grads(self, params: Sequence[torch.nn.Parameter]) -> None:
         from megatron.core import parallel_state as ps
@@ -2175,33 +2252,6 @@ class TrainerRank:
             torch.Tensor,
             tensor_parallel.gather_from_tensor_model_parallel_region(logits),
         )
-
-    def _configure_optimizer(self, params: AdamParams) -> None:
-        optimizer = self._optimizer()
-        config = cast("OptimizerConfig | None", optimizer.config)
-        if config is not None:
-            config.lr = params.learning_rate
-            config.adam_beta1 = params.beta1
-            config.adam_beta2 = params.beta2
-            config.weight_decay = params.weight_decay
-            config.clip_grad = params.grad_clip_norm
-        for group in optimizer.param_groups:
-            param_group = cast(MutableMapping[str, object], group)
-            param_group["lr"] = params.learning_rate
-            param_group["weight_decay"] = params.weight_decay
-            if "betas" in param_group:
-                param_group["betas"] = (params.beta1, params.beta2)
-
-    def _scale_main_grads(self, scale: float) -> None:
-        if scale == 1.0:
-            return
-        for chunk in self.runtime.model:
-            for param in chunk.parameters():
-                grad = getattr(param, "main_grad", None)
-                if isinstance(grad, torch.Tensor):
-                    grad.mul_(scale)
-                elif param.grad is not None:
-                    param.grad.mul_(scale)
 
 
 def _validate_top_k(top_k: int, model: "GPTModel") -> None:

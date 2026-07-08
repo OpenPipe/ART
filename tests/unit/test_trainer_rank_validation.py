@@ -8,6 +8,7 @@ import pytest
 import torch
 
 from art.trainer_rank import (
+    AdamParams,
     ForwardInput,
     ForwardOutput,
     TopK,
@@ -26,16 +27,36 @@ class _Model:
     vocab_size = 8
 
 
+class _NativeOptimizer:
+    config = None
+    param_groups: list[dict[str, object]] = []
+
+    def __init__(self) -> None:
+        self.step_calls = 0
+        self.zero_grad_calls = 0
+
+    def step(self) -> tuple[bool, float, int | None]:
+        self.step_calls += 1
+        raise AssertionError("TrainerRank must not step the native optimizer")
+
+    def zero_grad(self) -> None:
+        self.zero_grad_calls += 1
+
+
 @dataclass(frozen=True)
 class _SlotRef:
     kind: str
     name: str | None
 
 
-def _runtime(model: torch.nn.Module | None = None) -> SimpleNamespace:
+def _runtime(
+    model: torch.nn.Module | None = None,
+    *,
+    optimizer: object | None = None,
+) -> SimpleNamespace:
     return SimpleNamespace(
         model=[model or torch.nn.Linear(1, 1)],
-        optimizer=None,
+        optimizer=optimizer,
         provider=SimpleNamespace(hidden_size=4, num_layers=1),
         model_support_handler=SimpleNamespace(build_gdn_execution_spec=True),
     )
@@ -126,6 +147,135 @@ def test_trainer_rank_load_rejects_active_adapter_stack() -> None:
         trainer.load_checkpoint_slot("teacher", {})
     with pytest.raises(RuntimeError, match="Cannot load a LoRA/checkpoint"):
         trainer.load_lora_slot("teacher", {})
+
+
+def test_trainer_rank_default_forward_uses_explicit_base_slot() -> None:
+    trainer = TrainerRank(_runtime())  # type: ignore[arg-type]
+
+    plan = trainer._plan_flat_forward([_target_request(1)])
+
+    assert len(plan.groups) == 1
+    slot = plan.groups[0].slot_ref
+    assert slot is not None
+    assert getattr(slot, "kind") == "checkpoint"
+    assert getattr(slot, "name") is None
+
+
+def test_optim_step_requires_loaded_checkpoint_slot() -> None:
+    optimizer = _NativeOptimizer()
+    trainer = TrainerRank(_runtime(optimizer=optimizer))  # type: ignore[arg-type]
+
+    with pytest.raises(TrainerRankSlotStateError, match="loaded checkpoint slot"):
+        trainer.optim_step(params=AdamParams(learning_rate=1e-3))
+
+    assert optimizer.step_calls == 0
+
+
+def test_optim_step_rejects_loaded_slots_without_grads() -> None:
+    trainer = TrainerRank(_runtime())  # type: ignore[arg-type]
+    trainer._checkpoint_slot_params_by_name["student"] = (
+        torch.nn.Parameter(torch.ones(2)),
+    )
+
+    with pytest.raises(TrainerRankSlotStateError, match="none have gradients"):
+        trainer.optim_step(params=AdamParams(learning_rate=1e-3))
+    with pytest.raises(TrainerRankSlotStateError, match="no gradients"):
+        trainer.optim_step(
+            params=AdamParams(learning_rate=1e-3),
+            checkpoints=["student"],
+        )
+
+
+def test_optim_step_rejects_explicit_slot_subset_with_missing_grads(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    trainer = TrainerRank(_runtime())  # type: ignore[arg-type]
+    ready = torch.nn.Parameter(torch.ones(2))
+    missing = torch.nn.Parameter(torch.ones(2))
+    ready.grad = torch.ones_like(ready)
+    trainer._checkpoint_slot_params_by_name["ready"] = (ready,)
+    trainer._checkpoint_slot_params_by_name["missing"] = (missing,)
+    monkeypatch.setattr(trainer, "_reduce_dynamic_grads", lambda _params: None)
+
+    with pytest.raises(TrainerRankSlotStateError, match="missing"):
+        trainer.optim_step(
+            params=AdamParams(learning_rate=1e-3),
+            checkpoints=["ready", "missing"],
+        )
+
+
+def test_optim_step_implicitly_steps_only_slots_with_grads(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    trainer = TrainerRank(_runtime())  # type: ignore[arg-type]
+    ready = torch.nn.Parameter(torch.ones(2))
+    untouched = torch.nn.Parameter(torch.ones(2))
+    ready.grad = torch.ones_like(ready)
+    trainer._checkpoint_slot_params_by_name["ready"] = (ready,)
+    trainer._checkpoint_slot_params_by_name["untouched"] = (untouched,)
+    monkeypatch.setattr(trainer, "_reduce_dynamic_grads", lambda _params: None)
+
+    before_ready = ready.detach().clone()
+    before_untouched = untouched.detach().clone()
+    trainer.optim_step(
+        params=AdamParams(learning_rate=1e-2, weight_decay=0.0, grad_clip_norm=10.0)
+    )
+
+    assert "ready" in trainer._dynamic_optimizers
+    assert "untouched" not in trainer._dynamic_optimizers
+    assert not torch.equal(before_ready, ready)
+    torch.testing.assert_close(untouched, before_untouched)
+
+
+def test_checkpoint_slot_optimizer_state_round_trips_same_shape(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    trainer = TrainerRank(_runtime())  # type: ignore[arg-type]
+    param = torch.nn.Parameter(torch.ones(2))
+    param.grad = torch.tensor([0.5, -0.25])
+    trainer._checkpoint_slot_params_by_name["student"] = (param,)
+    monkeypatch.setattr(trainer, "_reduce_dynamic_grads", lambda _params: None)
+
+    trainer.optim_step(
+        params=AdamParams(learning_rate=1e-2, weight_decay=0.0, grad_clip_norm=10.0)
+    )
+    state = trainer.checkpoint_slot_optimizer_state("student")
+
+    assert state is not None
+    restored = TrainerRank(_runtime())  # type: ignore[arg-type]
+    restored._checkpoint_slot_params_by_name["student"] = (
+        torch.nn.Parameter(torch.ones(2)),
+    )
+    restored._dynamic_optimizers["student"] = restored._restore_dynamic_optimizer(
+        "student", state
+    )
+
+    restored_state = restored.checkpoint_slot_optimizer_state("student")
+    assert restored_state is not None
+    assert restored_state["state"]
+
+
+def test_checkpoint_slot_optimizer_state_rejects_shape_mismatch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    trainer = TrainerRank(_runtime())  # type: ignore[arg-type]
+    param = torch.nn.Parameter(torch.ones(2))
+    param.grad = torch.ones_like(param)
+    trainer._checkpoint_slot_params_by_name["student"] = (param,)
+    monkeypatch.setattr(trainer, "_reduce_dynamic_grads", lambda _params: None)
+    trainer.optim_step(
+        params=AdamParams(learning_rate=1e-2, weight_decay=0.0, grad_clip_norm=10.0)
+    )
+    state = trainer.checkpoint_slot_optimizer_state("student")
+    assert state is not None
+
+    restored = TrainerRank(_runtime())  # type: ignore[arg-type]
+    restored._checkpoint_slot_params_by_name["student"] = (
+        torch.nn.Parameter(torch.ones(3)),
+    )
+
+    with pytest.raises(TrainerRankSlotStateError, match="shape"):
+        restored._restore_dynamic_optimizer("student", state)
 
 
 def test_trainer_rank_load_rejects_pending_checkpoint_graph() -> None:
