@@ -1257,10 +1257,21 @@ def _mutation_hook(
 
     if pre_optimizer_step_hook is not None:
 
-        def _patched_optimizer_step(optimizer: Any, learning_rate: float):
+        def _patched_optimizer_step(
+            optimizer: Any,
+            learning_rate: float,
+            *,
+            model_support_handler: Any | None = None,
+            model_chunks: Any | None = None,
+        ):
             if pre_optimizer_step_hook is not None:
                 pre_optimizer_step_hook()
-            return original_optimizer_step(optimizer, learning_rate)
+            return original_optimizer_step(
+                optimizer,
+                learning_rate,
+                model_support_handler=model_support_handler,
+                model_chunks=model_chunks,
+            )
 
         megatron_train_module._optimizer_step = _patched_optimizer_step
 
