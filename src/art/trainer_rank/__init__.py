@@ -23,11 +23,11 @@ from typing import (
 import torch
 import torch.distributed as dist
 
-from art.megatron.shared_prefix_packing import (
-    SharedPrefixPack,
+from art.megatron.prefix_tree_packing import (
+    PrefixTreePack,
     _local_position_pairs,
-    estimate_shared_prefix_packed_tokens,
-    pack_shared_prefixes,
+    estimate_prefix_tree_packed_tokens,
+    prefix_tree_pack,
 )
 
 if TYPE_CHECKING:
@@ -39,7 +39,7 @@ if TYPE_CHECKING:
         ParallelTopology,
     )
     from art.megatron.lora import LoRASlotRef
-    from art.megatron.shared_prefix_state import SharedPrefixAttentionState
+    from art.megatron.prefix_tree_state import PrefixTreeAttentionState
     from art.megatron.train import TrainingRuntime
 
 
@@ -482,7 +482,7 @@ class _ForwardItem:
 class _PreparedPackedForward:
     tokens: torch.Tensor
     position_ids: torch.Tensor
-    attention_state: "SharedPrefixAttentionState | ArtContextParallelState"
+    attention_state: "PrefixTreeAttentionState | ArtContextParallelState"
     packed_seq_params: "PackedSeqParams | None"
     positions_by_item: tuple[torch.Tensor, ...]
     source_positions_by_item: tuple[torch.Tensor, ...]
@@ -507,7 +507,7 @@ class _ForwardGroupPlan:
     slot_ref: "LoRASlotRef | None"
     request_indices: tuple[int, ...]
     items: tuple[_ForwardItem, ...]
-    packed: SharedPrefixPack
+    packed: PrefixTreePack
 
 
 @dataclass(frozen=True)
@@ -856,6 +856,7 @@ class TrainerRank:
     ) -> int:
         if self._slot_stack:
             raise RuntimeError("Cannot load a LoRA/checkpoint while a slot is pushed")
+        self._validate_adapter_slot_keys(kind, name, adapter_model)
         from art.megatron.lora import LORA_ALPHA, load_lora_slot_into_model
 
         ref = self._slot_ref(kind, name)
@@ -867,6 +868,44 @@ class TrainerRank:
             alpha=LORA_ALPHA if alpha is None else alpha,
             requires_grad=trainable,
         )
+
+    def _validate_adapter_slot_keys(
+        self,
+        kind: Literal["checkpoint", "lora"],
+        name: str,
+        adapter_model: Mapping[str, torch.Tensor],
+    ) -> None:
+        keys = set(adapter_model)
+        if not keys:
+            return
+        expected = self._installed_lora_adapter_keys()
+        unknown = sorted(keys - expected)
+        if not unknown:
+            return
+        preview = ", ".join(repr(key) for key in unknown[:8])
+        suffix = "" if len(unknown) <= 8 else f", ... +{len(unknown) - 8} more"
+        raise ValueError(
+            f"Adapter for {kind} slot {name!r} contains keys that do not match "
+            f"installed LoRA wrapper sites: {preview}{suffix}. Configure the "
+            "Megatron runtime with matching LoRA target modules before loading "
+            "this slot."
+        )
+
+    def _installed_lora_adapter_keys(self) -> set[str]:
+        local: set[str] = set()
+        for chunk in self.runtime.model:
+            for module in chunk.modules():
+                expected_weight_keys = getattr(module, "_expected_weight_keys", None)
+                if not callable(expected_weight_keys):
+                    continue
+                for suffix in ("lora_A", "lora_B"):
+                    local.update(str(key) for key in expected_weight_keys(suffix))
+        if not (dist.is_available() and dist.is_initialized()):
+            return local
+
+        gathered: list[set[str] | None] = [None] * dist.get_world_size()
+        dist.all_gather_object(gathered, local)
+        return set().union(*(keys for keys in gathered if keys is not None))
 
     def _set_default_slot(self, ref: "LoRASlotRef") -> None:
         if self._slot_stack:
@@ -1383,7 +1422,7 @@ class TrainerRank:
             items = tuple(
                 self._forward_item(requests[index]) for index in group_indices
             )
-            packed = pack_shared_prefixes(
+            packed = prefix_tree_pack(
                 (item.input_ids for item in items),
                 max_depth=self.shared_prefix_max_depth,
             )
@@ -1414,7 +1453,7 @@ class TrainerRank:
         groups = self._group_active_request_indices(requests)
         packed_tokens = 0
         for _, group_indices in groups:
-            group_packed_tokens = estimate_shared_prefix_packed_tokens(
+            group_packed_tokens = estimate_prefix_tree_packed_tokens(
                 (requests[index].input_tokens for index in group_indices),
                 max_depth=self.shared_prefix_max_depth,
             )
@@ -2134,20 +2173,20 @@ class TrainerRank:
 
     def _prepare_packed_forward(
         self,
-        batch: SharedPrefixPack,
+        batch: PrefixTreePack,
     ) -> _PreparedPackedForward:
         topology = self._topology()
         batch = _pad_packed_batch(batch, multiple=int(topology.tp))
         if int(topology.cp) > 1:
             return self._prepare_context_parallel_forward(batch, topology=topology)
-        from art.megatron.shared_prefix_state import create_shared_prefix_state
+        from art.megatron.prefix_tree_state import create_prefix_tree_state
 
         handler = self.runtime.model_support_handler
         provider = self.runtime.provider
         return _PreparedPackedForward(
             tokens=batch.tokens.to(self.device),
             position_ids=batch.position_ids.to(self.device),
-            attention_state=create_shared_prefix_state(
+            attention_state=create_prefix_tree_state(
                 group_ids=batch.group_ids,
                 parent_ids=batch.parent_ids,
                 target_device=self.device,
@@ -2169,7 +2208,7 @@ class TrainerRank:
 
     def _prepare_context_parallel_forward(
         self,
-        batch: SharedPrefixPack,
+        batch: PrefixTreePack,
         *,
         topology: "ParallelTopology",
     ) -> _PreparedPackedForward:
@@ -2276,10 +2315,10 @@ def _request_mix_key(request: AnyForwardInput) -> str:
 
 
 def _pad_packed_batch(
-    batch: SharedPrefixPack,
+    batch: PrefixTreePack,
     *,
     multiple: int,
-) -> SharedPrefixPack:
+) -> PrefixTreePack:
     if multiple <= 1:
         return batch
     seq_len = int(batch.tokens.shape[1])
@@ -2297,7 +2336,7 @@ def _pad_packed_batch(
         dtype=batch.group_ids.dtype,
         device=device,
     ).unsqueeze(0)
-    return SharedPrefixPack(
+    return PrefixTreePack(
         tokens=torch.cat(
             (
                 batch.tokens,

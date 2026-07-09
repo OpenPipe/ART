@@ -11,7 +11,7 @@ import torch
 import torch.distributed as dist
 import typer
 
-from art.megatron.shared_prefix_packing import SharedPrefixPack, pack_shared_prefixes
+from art.megatron.prefix_tree_packing import PrefixTreePack, prefix_tree_pack
 from art.trainer_rank import (
     AnyForwardInput,
     TrainerRank,
@@ -212,7 +212,7 @@ def _run_capture(
 
     model = _language_model(rank.runtime.model[0])
     items = [rank._forward_item(request) for request in requests]
-    batch = pack_shared_prefixes(
+    batch = prefix_tree_pack(
         (item.input_ids for item in items),
         max_depth=rank.shared_prefix_max_depth,
     )
@@ -272,10 +272,10 @@ def _run_capture(
 
 
 def _mutated_batch(
-    batch: SharedPrefixPack,
+    batch: PrefixTreePack,
     *,
     keep_positions: torch.Tensor,
-) -> SharedPrefixPack:
+) -> PrefixTreePack:
     tokens = batch.tokens.clone()
     mask = torch.ones(int(tokens.shape[1]), dtype=torch.bool, device=tokens.device)
     mask[keep_positions.to(device=tokens.device)] = False
@@ -284,7 +284,7 @@ def _mutated_batch(
         + 50_000
     )
     tokens[0, mask] = replacement[mask] % 100_000
-    return SharedPrefixPack(
+    return PrefixTreePack(
         tokens=tokens,
         group_ids=batch.group_ids,
         parent_ids=batch.parent_ids,

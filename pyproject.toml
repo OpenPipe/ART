@@ -30,7 +30,7 @@ backend = [
     "awscli>=1.38.1",
     "setuptools>=78.1.0",
     "wandb==0.25.0",
-    "transformers==5.6.2",
+    "transformers==5.2.0",
     "duckdb>=1.0.0",
     "pyarrow>=15.0.0",
     "trl==0.20.0",
@@ -81,7 +81,7 @@ tinker = [
     "tinker-cookbook>=0.4.1,<0.5",
     "tinker>=0.21.0,<0.22",
     "torch==2.11.0",
-    "transformers==5.6.2",
+    "transformers>=5.2.0,<=5.5.3",
     "uvicorn>=0.35.0",
     "datrie>=0.8.3",
 ]
@@ -169,7 +169,6 @@ override-dependencies = [
     "quack-kernels==0.3.7",
     "transformer-engine==2.11.0",
     "torch==2.11.0",
-    "transformers==5.6.2",
 ]
 exclude-dependencies = ["pynvml", "emerging-optimizers", "causal-conv1d", "mamba-ssm"]
 no-build-isolation-package = ["apex", "transformer-engine", "transformer-engine-cu12", "transformer-engine-torch", "megatron-bridge", "deep-ep", "nv-grouped-gemm"]
@@ -295,6 +294,7 @@ allowed-unresolved-imports = [
     "seaborn.**",
     # megatron deps
     "causal_conv1d.**",
+    "einops.**",
     "fla.**",
     "megatron.**",
     "quack.**",

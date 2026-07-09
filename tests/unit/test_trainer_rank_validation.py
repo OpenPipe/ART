@@ -27,6 +27,16 @@ class _Model:
     vocab_size = 8
 
 
+class _FakeLoRASite(torch.nn.Module):
+    def __init__(self, prefix: str) -> None:
+        super().__init__()
+        self.prefix = prefix
+        self.weight = torch.nn.Parameter(torch.zeros(()))
+
+    def _expected_weight_keys(self, suffix: str) -> list[str]:
+        return [f"{self.prefix}.{suffix}.weight"]
+
+
 class _NativeOptimizer:
     config = None
     param_groups: list[dict[str, object]] = []
@@ -147,6 +157,22 @@ def test_trainer_rank_load_rejects_active_adapter_stack() -> None:
         trainer.load_checkpoint_slot("teacher", {})
     with pytest.raises(RuntimeError, match="Cannot load a LoRA/checkpoint"):
         trainer.load_lora_slot("teacher", {})
+
+
+def test_trainer_rank_rejects_adapter_keys_without_installed_lora_site() -> None:
+    trainer = TrainerRank(_runtime(_FakeLoRASite("base.layer")))  # type: ignore[arg-type]
+    valid = {
+        "base.layer.lora_A.weight": torch.empty(1),
+        "base.layer.lora_B.weight": torch.empty(1),
+    }
+    trainer._validate_adapter_slot_keys("checkpoint", "student", valid)
+
+    with pytest.raises(ValueError, match="matching LoRA target modules"):
+        trainer._validate_adapter_slot_keys(
+            "checkpoint",
+            "student",
+            {**valid, "base.other.lora_A.weight": torch.empty(1)},
+        )
 
 
 def test_trainer_rank_default_forward_uses_explicit_base_slot() -> None:

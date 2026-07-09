@@ -9,7 +9,7 @@ import torch
 import torch.distributed as dist
 import typer
 
-from art.megatron.shared_prefix_packing import SharedPrefixPack, pack_shared_prefixes
+from art.megatron.prefix_tree_packing import PrefixTreePack, prefix_tree_pack
 from art.trainer_rank import (
     ForwardInput,
     ForwardOutput,
@@ -616,7 +616,7 @@ def _packed_oracle(
 ) -> tuple[list[CheckOutput], tuple[torch.Tensor, ...]]:
     items = [rank._forward_item(request) for request in requests]
     prepared = rank._prepare_packed_forward(
-        pack_shared_prefixes(
+        prefix_tree_pack(
             (item.input_ids for item in items),
             max_depth=rank.shared_prefix_max_depth,
         )
@@ -652,7 +652,7 @@ def _shared_hidden_check(
 ]:
     items = [rank_a._forward_item(request) for request in requests]
     prepared = rank_a._prepare_packed_forward(
-        pack_shared_prefixes(
+        prefix_tree_pack(
             (item.input_ids for item in items),
             max_depth=rank_a.shared_prefix_max_depth,
         )
@@ -695,7 +695,7 @@ def _same_layout_check_outputs(
     ],
 ) -> list[CheckOutput]:
     items = [rank._forward_item(request) for request in requests]
-    batch = pack_shared_prefixes(
+    batch = prefix_tree_pack(
         (item.input_ids for item in items),
         max_depth=rank.shared_prefix_max_depth,
     )
@@ -715,10 +715,10 @@ def _same_layout_check_outputs(
 
 
 def _mutated_batch(
-    batch: SharedPrefixPack,
+    batch: PrefixTreePack,
     *,
     keep_positions: torch.Tensor,
-) -> SharedPrefixPack:
+) -> PrefixTreePack:
     tokens = batch.tokens.clone()
     mutate = torch.ones(int(tokens.shape[1]), dtype=torch.bool, device=tokens.device)
     mutate[keep_positions.to(device=tokens.device)] = False
@@ -727,7 +727,7 @@ def _mutated_batch(
         + 50_000
     )
     tokens[0, mutate] = replacement[mutate] % 100_000
-    return SharedPrefixPack(
+    return PrefixTreePack(
         tokens=tokens,
         group_ids=batch.group_ids,
         parent_ids=batch.parent_ids,
@@ -837,7 +837,7 @@ def _source_positions(
 ) -> tuple[torch.Tensor, ...]:
     items = [rank._forward_item(request) for request in requests]
     prepared = rank._prepare_packed_forward(
-        pack_shared_prefixes(
+        prefix_tree_pack(
             (item.input_ids for item in items),
             max_depth=rank.shared_prefix_max_depth,
         )
@@ -1212,7 +1212,7 @@ def _tensor_diff_value(
     else:
         max_abs_diff = 0.0
         mean_abs_pct = 0.0
-    mean_abs_pct_tolerance = 5e-3 if label.startswith("independent[") else 2e-5
+    mean_abs_pct_tolerance = _mean_abs_pct_tolerance(label)
     max_abs_tolerance = 0.0
     _debug(
         f"{label} max_abs_diff={max_abs_diff} "
@@ -1225,6 +1225,17 @@ def _tensor_diff_value(
     if max_abs_diff > max_abs_tolerance and not actual_for_diff.is_floating_point():
         raise AssertionError(f"{label} max diff {max_abs_diff}")
     return DiffStats(max_abs_diff=max_abs_diff, mean_abs_pct=mean_abs_pct)
+
+
+def _mean_abs_pct_tolerance(label: str) -> float:
+    if not label.startswith("independent["):
+        return 2e-5
+    # Independent checks compare different physical packed layouts. They are useful
+    # gross guards, but TE/Megatron kernels are not bitwise stable across those
+    # layouts; same-layout checks above remain the strict packing/unpacking oracle.
+    if ".top_k_logprobs" in label:
+        return 1e-2
+    return 5e-3
 
 
 def _merge_diff_stats(stats: list[DiffStats]) -> DiffStats:

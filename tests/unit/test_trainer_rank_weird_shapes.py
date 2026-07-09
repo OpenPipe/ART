@@ -6,9 +6,9 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from art.megatron.shared_prefix_packing import (
-    estimate_shared_prefix_packed_tokens,
-    pack_shared_prefixes,
+from art.megatron.prefix_tree_packing import (
+    estimate_prefix_tree_packed_tokens,
+    prefix_tree_pack,
 )
 from art.trainer_rank import (
     AdapterSelection,
@@ -148,15 +148,40 @@ def test_pack_estimator_matches_ternary_and_random_trees(max_depth: int) -> None
     ]
 
     for sequences in cases:
-        pack = pack_shared_prefixes(sequences, max_depth=max_depth)
+        pack = prefix_tree_pack(sequences, max_depth=max_depth)
 
-        assert estimate_shared_prefix_packed_tokens(
+        assert estimate_prefix_tree_packed_tokens(
             sequences, max_depth=max_depth
         ) == int(pack.tokens.numel())
         for sequence, positions in zip(
             sequences, pack.positions_by_sequence, strict=True
         ):
             torch.testing.assert_close(pack.tokens.reshape(-1)[positions], sequence)
+
+
+def test_shared_trainable_tokens_accumulate_independent_output_gradients() -> None:
+    sequences = (
+        torch.tensor([1, 2, 3], dtype=torch.long),
+        torch.tensor([1, 2, 3], dtype=torch.long),
+    )
+    pack = prefix_tree_pack(sequences, max_depth=4)
+    hidden = torch.randn(int(pack.tokens.numel()), 3, requires_grad=True)
+    weights = (2.0, 5.0)
+
+    loss = sum(
+        weight * hidden.index_select(0, positions).sum()
+        for weight, positions in zip(weights, pack.positions_by_sequence, strict=True)
+    )
+    loss.backward()
+
+    expected = torch.zeros_like(hidden)
+    for weight, positions in zip(weights, pack.positions_by_sequence, strict=True):
+        expected.index_add_(
+            0,
+            positions,
+            torch.full((int(positions.numel()), 3), weight, dtype=hidden.dtype),
+        )
+    torch.testing.assert_close(hidden.grad, expected)
 
 
 def test_planner_handles_vineppo_nested_shape_and_request_mix() -> None:
