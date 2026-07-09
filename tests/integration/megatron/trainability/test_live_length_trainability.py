@@ -14,8 +14,12 @@ from pydantic import BaseModel, Field
 import pytest
 
 import art
-from art.megatron.model_support.registry import model_uses_expert_parallel
+from art.megatron.model_support.registry import (
+    get_model_support_spec,
+    model_uses_expert_parallel,
+)
 from art.pipeline_trainer import PipelineTrainer
+from art.utils.chat_template import default_chat_template_kwargs_for_tokenizer
 
 from ..model_support.oracle_harness import Topology
 from .yes_no_trainability import (
@@ -27,18 +31,29 @@ from .yes_no_trainability import (
     _get_env_int,
     _init_megatron_runtime_config,
     _list_model_ids,
+    _trainability_stage_resources,
 )
 
 torch = pytest.importorskip("torch")
 
 DEFAULT_BASE_MODEL = "Qwen/Qwen3.5-35B-A3B"
+DEFAULT_LENGTH_LEARNING_RATE = 1e-4
+LARGE_MOE_LENGTH_LEARNING_RATE = 7e-5
 LIVE_ENV = "ART_RUN_LIVE_LENGTH_TRAINABILITY"
 TRAINER_GPU_IDS_ENV = "ART_MODEL_SUPPORT_TRAINER_GPU_IDS"
 INFERENCE_GPU_IDS_ENV = "ART_MODEL_SUPPORT_INFERENCE_GPU_IDS"
 REPO_ROOT = Path(__file__).resolve().parents[4]
 LATEST_SUMMARY_LOG_PATH = REPO_ROOT / ".local" / "length_trainability.log"
-INITIAL_ABS_ERROR_MIN = 5.0
-SUCCESS_ABS_ERROR_MAX = 1.5
+DEFAULT_INITIAL_ABS_ERROR_MIN = 5.0
+DEFAULT_SUCCESS_ABS_ERROR_MAX = 1.5
+GPT_OSS_INITIAL_ABS_ERROR_MIN = 100.0
+GPT_OSS_SUCCESS_ABS_ERROR_MAX = 5.0
+DEFAULT_LENGTH_MAX_STEPS = 20
+GPT_OSS_MIN_MAX_TOKENS = 512
+GPT_OSS_LENGTH_SYSTEM_PROMPT = (
+    "Use absolutely minimal reasoning. Give only the final answer. "
+    "Write no more than one short sentence."
+)
 MOE_DEDICATED_TRAINING_TOPOLOGY = Topology(
     tp=1,
     cp=2,
@@ -51,6 +66,16 @@ BASE_PROMPT = (
     "Write a plain answer about a quiet harbor. Use the unrelated notes below "
     "only as background texture. Use one sentence. Do not use bullets, numbering, "
     "code, or a preface."
+)
+LENGTH_PROMPT_MIDS = (
+    "Branch alpha: the harbor office is preparing a routine status note.",
+    "Branch beta: the harbor office is summarizing a quiet maintenance record.",
+)
+LENGTH_PROMPT_LEAVES = (
+    "Case one: mention calm water without adding drama.",
+    "Case two: mention ordinary work near the pier.",
+    "Case three: mention a simple observation from the office.",
+    "Case four: mention a reserved conclusion about the day.",
 )
 FILLER_SENTENCES = (
     "The morning ledger mentioned a bicycle bell near the old customs window.",
@@ -130,6 +155,11 @@ class LengthSampleReport(BaseModel):
     text: str
 
 
+class LengthTrainabilityThresholds(BaseModel):
+    initial_abs_error_min: float
+    success_abs_error_max: float
+
+
 class LengthTrainabilityReport(BaseModel):
     base_model: str
     max_steps: int
@@ -141,9 +171,12 @@ class LengthTrainabilityReport(BaseModel):
     training_topology: dict[str, int | bool]
     rollout_weights_mode: str
     rollouts_per_prompt: int
+    prompt_tree_depth: int = 0
+    prompt_tree_branch_count: int = 0
     normalize_advantages: bool
     summary_log_path: str
     latest_summary_log_path: str
+    thresholds: LengthTrainabilityThresholds
     initial_train_abs_error: float | None
     best_train_abs_error: float | None
     success_step: int | None
@@ -189,8 +222,21 @@ def _target_tokens() -> int:
     return _get_env_int("ART_MODEL_SUPPORT_LENGTH_TARGET_TOKENS", 10)
 
 
+def _default_learning_rate(base_model: str) -> float:
+    if base_model == DEFAULT_BASE_MODEL:
+        return LARGE_MOE_LENGTH_LEARNING_RATE
+    return DEFAULT_LENGTH_LEARNING_RATE
+
+
 def _use_default_moe_dedicated_placement(variant: Any, *, base_model: str) -> None:
     if not model_uses_expert_parallel(base_model, allow_unvalidated_arch=True):
+        return
+    stage_resources = _trainability_stage_resources(
+        base_model,
+        stage_name="length_trainability",
+        allow_unvalidated_arch=True,
+    )
+    if stage_resources is not None:
         return
     if os.environ.get(TRAINER_GPU_IDS_ENV) or os.environ.get(INFERENCE_GPU_IDS_ENV):
         return
@@ -215,24 +261,44 @@ def _check_prompt_hides_target(prompt: str) -> None:
         raise RuntimeError(f"Length prompt leaks target wording: {leaked}")
 
 
-def _prompt_for_index(index: int) -> tuple[str, int]:
-    target_words = _get_env_int("ART_MODEL_SUPPORT_LENGTH_PROMPT_WORDS", 300)
-    rng = random.Random(index)
-    sentences = list(FILLER_SENTENCES)
-    rng.shuffle(sentences)
-    selected: list[str] = []
-    prompt = BASE_PROMPT
-    for sentence in sentences:
-        if _word_count(prompt) >= target_words:
-            break
-        selected.append(sentence)
-        prompt = f"{BASE_PROMPT}\n\nNotes: {' '.join(selected)}"
-    _check_prompt_hides_target(prompt)
-    return prompt, _word_count(prompt)
+def _is_gpt_oss_model(base_model: str | None) -> bool:
+    if base_model is None:
+        return False
+    return (
+        get_model_support_spec(base_model, allow_unvalidated_arch=True).key
+        == "gpt_oss_moe"
+    )
 
 
-def _scenario(index: int, *, target_step: int | None = None) -> LengthScenario:
-    target_tokens = _target_tokens()
+def _length_trainability_thresholds(
+    base_model: str | None,
+) -> LengthTrainabilityThresholds:
+    if _is_gpt_oss_model(base_model):
+        return LengthTrainabilityThresholds(
+            initial_abs_error_min=GPT_OSS_INITIAL_ABS_ERROR_MIN,
+            success_abs_error_max=GPT_OSS_SUCCESS_ABS_ERROR_MAX,
+        )
+    return LengthTrainabilityThresholds(
+        initial_abs_error_min=DEFAULT_INITIAL_ABS_ERROR_MIN,
+        success_abs_error_max=DEFAULT_SUCCESS_ABS_ERROR_MAX,
+    )
+
+
+def _initial_abs_error_passed(
+    value: float,
+    thresholds: LengthTrainabilityThresholds,
+) -> bool:
+    return value >= thresholds.initial_abs_error_min
+
+
+def _success_abs_error_passed(
+    value: float,
+    thresholds: LengthTrainabilityThresholds,
+) -> bool:
+    return value <= thresholds.success_abs_error_max
+
+
+def _base_max_tokens(target_tokens: int, *, base_model: str | None = None) -> int:
     max_tokens = max(
         target_tokens + 1,
         math.ceil(
@@ -241,6 +307,52 @@ def _scenario(index: int, *, target_step: int | None = None) -> LengthScenario:
         )
         + 128,
     )
+    if _is_gpt_oss_model(base_model):
+        max_tokens = max(max_tokens, GPT_OSS_MIN_MAX_TOKENS)
+    return max_tokens
+
+
+def _prompt_for_index(index: int) -> tuple[str, int]:
+    target_words = _get_env_int("ART_MODEL_SUPPORT_LENGTH_PROMPT_WORDS", 300)
+    rng = random.Random(index)
+    sentences = list(FILLER_SENTENCES)
+    rng.shuffle(sentences)
+    selected: list[str] = []
+    mid = LENGTH_PROMPT_MIDS[(index // 2) % len(LENGTH_PROMPT_MIDS)]
+    leaf = LENGTH_PROMPT_LEAVES[index % len(LENGTH_PROMPT_LEAVES)]
+    prefix = f"{BASE_PROMPT}\n\n{mid}\n\n{leaf}"
+    prompt = prefix
+    for sentence in sentences:
+        if _word_count(prompt) >= target_words:
+            break
+        selected.append(sentence)
+        prompt = f"{prefix}\n\nNotes: {' '.join(selected)}"
+    _check_prompt_hides_target(prompt)
+    return prompt, _word_count(prompt)
+
+
+def _prompt_tree_shape(prompts: list[str]) -> tuple[int, int]:
+    mid_count = len(
+        {mid for mid in LENGTH_PROMPT_MIDS if any(mid in prompt for prompt in prompts)}
+    )
+    leaf_count = len(
+        {
+            leaf
+            for leaf in LENGTH_PROMPT_LEAVES
+            if any(leaf in prompt for prompt in prompts)
+        }
+    )
+    return (3 if mid_count and leaf_count else 1, mid_count + leaf_count)
+
+
+def _scenario(
+    index: int,
+    *,
+    target_step: int | None = None,
+    base_model: str | None = None,
+) -> LengthScenario:
+    target_tokens = _target_tokens()
+    max_tokens = _base_max_tokens(target_tokens, base_model=base_model)
     prompt, prompt_word_count = _prompt_for_index(index)
     return LengthScenario(
         scenario_index=index,
@@ -273,15 +385,85 @@ def _scenario_for_training_step(
     step: int,
 ) -> LengthScenario:
     parsed = LengthScenario.model_validate(scenario)
-    return _scenario(parsed.scenario_index, target_step=step)
+    metadata = dict(parsed.metadata)
+    metadata["target_step"] = step
+    return parsed.model_copy(update={"target_step": step, "metadata": metadata})
 
 
-def _messages(scenario: LengthScenario) -> art.Messages:
-    return [{"role": "user", "content": scenario.prompt}]
+def _max_tokens_for_completion(
+    *,
+    base_max_tokens: int,
+    completion_index: int,
+    completion_count: int,
+) -> int:
+    if completion_count <= 1:
+        return base_max_tokens
+    return base_max_tokens + round(completion_index * 5 / (completion_count - 1))
 
 
-def _extra_body() -> dict[str, object]:
-    return {"chat_template_kwargs": {"enable_thinking": False}}
+def _scenario_with_max_tokens(
+    scenario: LengthScenario,
+    *,
+    max_tokens: int,
+) -> LengthScenario:
+    metadata = dict(scenario.metadata)
+    metadata["max_tokens"] = max_tokens
+    return scenario.model_copy(update={"max_tokens": max_tokens, "metadata": metadata})
+
+
+def _messages(
+    scenario: LengthScenario,
+    *,
+    base_model: str | None = None,
+) -> art.Messages:
+    messages: art.Messages = [{"role": "user", "content": scenario.prompt}]
+    if _is_gpt_oss_model(base_model):
+        messages.insert(
+            0,
+            {
+                "role": "system",
+                "content": GPT_OSS_LENGTH_SYSTEM_PROMPT,
+            },
+        )
+    return messages
+
+
+def _extra_body(chat_template_kwargs: dict[str, Any]) -> dict[str, object]:
+    return (
+        {"chat_template_kwargs": chat_template_kwargs} if chat_template_kwargs else {}
+    )
+
+
+def _length_chat_template_kwargs(base_model: str, tokenizer: object) -> dict[str, Any]:
+    kwargs = default_chat_template_kwargs_for_tokenizer(tokenizer)
+    chat_template = getattr(tokenizer, "chat_template", None)
+    if (
+        _is_gpt_oss_model(base_model)
+        and isinstance(chat_template, str)
+        and "reasoning_effort" in chat_template
+    ):
+        kwargs["reasoning_effort"] = "low"
+    return kwargs
+
+
+def _scenario_limit() -> int | None:
+    if "ART_MODEL_SUPPORT_LENGTH_SCENARIOS" not in os.environ:
+        return None
+    return _get_env_int("ART_MODEL_SUPPORT_LENGTH_SCENARIOS", 0)
+
+
+def _length_max_steps() -> int:
+    return _get_env_int(
+        "ART_MODEL_SUPPORT_LENGTH_MAX_STEPS",
+        DEFAULT_LENGTH_MAX_STEPS,
+    )
+
+
+def _zero_variance_discard_multiplier(max_steps: int) -> int:
+    return _get_env_int(
+        "ART_MODEL_SUPPORT_LENGTH_ZERO_VARIANCE_DISCARD_MULTIPLIER",
+        max_steps,
+    )
 
 
 def _generated_token_count(choice: object) -> int:
@@ -327,33 +509,59 @@ def _sample_report(
 async def _length_group(
     model: art.TrainableModel,
     *,
+    base_model: str,
     scenario: LengthScenario,
     model_name: str,
     split: Literal["train"],
     step: int | None,
     n: int,
     temperature: float,
+    chat_template_kwargs: dict[str, Any],
     samples: list[LengthSampleReport],
     summary_log_path: Path | None = None,
 ) -> art.TrajectoryGroup:
-    messages = _messages(scenario)
-    completion = await model.openai_client().chat.completions.create(
-        messages=messages,
-        model=model_name,
-        max_tokens=scenario.max_tokens,
-        n=n,
-        temperature=temperature,
-        extra_body=_extra_body(),
-        logprobs=True,
-        top_logprobs=0,
-        timeout=_get_env_float("ART_MODEL_SUPPORT_LENGTH_REQUEST_TIMEOUT", 900.0),
-    )
+    messages = _messages(scenario, base_model=base_model)
+    client = model.openai_client()
+    max_tokens_by_completion = [
+        _max_tokens_for_completion(
+            base_max_tokens=scenario.max_tokens,
+            completion_index=completion_index,
+            completion_count=n,
+        )
+        for completion_index in range(n)
+    ]
     trajectories: list[art.Trajectory] = []
-    for choice in completion.choices:
+    completions = await asyncio.gather(
+        *(
+            client.chat.completions.create(
+                messages=messages,
+                model=model_name,
+                max_tokens=max_tokens,
+                n=1,
+                temperature=temperature,
+                extra_body=_extra_body(chat_template_kwargs),
+                logprobs=True,
+                top_logprobs=0,
+                timeout=_get_env_float(
+                    "ART_MODEL_SUPPORT_LENGTH_REQUEST_TIMEOUT",
+                    900.0,
+                ),
+            )
+            for max_tokens in max_tokens_by_completion
+        )
+    )
+    for max_tokens, completion in zip(
+        max_tokens_by_completion, completions, strict=True
+    ):
+        completion_scenario = _scenario_with_max_tokens(
+            scenario,
+            max_tokens=max_tokens,
+        )
+        choice = completion.choices[0]
         report = _sample_report(
             split=split,
             step=step,
-            scenario=scenario,
+            scenario=completion_scenario,
             choice=choice,
         )
         samples.append(report)
@@ -363,12 +571,12 @@ async def _length_group(
                 reward=report.reward,
                 metrics={
                     "length/generated_tokens": report.generated_tokens,
-                    "length/target_tokens": scenario.target_tokens,
-                    "length/max_tokens": scenario.max_tokens,
-                    "length/prompt_word_count": scenario.prompt_word_count,
+                    "length/target_tokens": report.target_tokens,
+                    "length/max_tokens": report.max_tokens,
+                    "length/prompt_word_count": report.prompt_word_count,
                     "length/abs_error": report.abs_error,
                 },
-                metadata=scenario.metadata,
+                metadata=completion_scenario.metadata,
             )
         )
     _append_step_summary(summary_log_path, samples, split=split, step=step)
@@ -473,9 +681,10 @@ async def run_length_trainability_async(
         "megatron_dedicated",
         base_model=base_model,
         allow_unvalidated_arch=allow_unvalidated_arch,
+        resource_stage_name="length_trainability",
     )
     _use_default_moe_dedicated_placement(variant, base_model=base_model)
-    max_steps = _get_env_int("ART_MODEL_SUPPORT_LENGTH_MAX_STEPS", 10)
+    max_steps = _length_max_steps()
     max_steps_off_policy = _get_env_int(
         "ART_MODEL_SUPPORT_LENGTH_MAX_STEPS_OFF_POLICY",
         0,
@@ -492,10 +701,9 @@ async def run_length_trainability_async(
         "ART_MODEL_SUPPORT_LENGTH_ROLLOUT_WORKERS",
         max(1, max_steps_off_policy + 1),
     )
-    scenario_count = _get_env_int(
-        "ART_MODEL_SUPPORT_LENGTH_SCENARIOS",
-        max_steps * max(rollouts_per_prompt, 2) + rollout_workers + 4,
-    )
+    thresholds = _length_trainability_thresholds(base_model)
+    scenario_limit = _scenario_limit()
+    zero_variance_discard_multiplier = _zero_variance_discard_multiplier(max_steps)
     success_hit = False
     samples: list[LengthSampleReport] = []
     backend_root = artifact_dir / "megatron_dedicated_workspace"
@@ -505,6 +713,7 @@ async def run_length_trainability_async(
         variant,
         base_model=base_model,
         allow_unvalidated_arch=allow_unvalidated_arch,
+        resource_stage_name="length_trainability",
     )
     internal_config["engine_args"]["max_model_len"] = _get_env_int(
         "ART_MODEL_SUPPORT_LENGTH_MAX_MODEL_LEN",
@@ -514,10 +723,24 @@ async def run_length_trainability_async(
         "ART_MODEL_SUPPORT_LENGTH_MAX_NUM_SEQS",
         4,
     )
+    from transformers import AutoTokenizer
+
+    tokenizer = AutoTokenizer.from_pretrained(base_model)
+    chat_template_kwargs = _length_chat_template_kwargs(base_model, tokenizer)
     rollout_weights_mode = internal_config["rollout_weights_mode"]
     _init_megatron_runtime_config(variant)
+    stage_resources = _trainability_stage_resources(
+        base_model,
+        stage_name="length_trainability",
+        allow_unvalidated_arch=allow_unvalidated_arch,
+    )
+    backend_env = stage_resources.megatron_env if stage_resources is not None else {}
 
-    async with _backend_context(variant, backend_root=backend_root) as backend:
+    async with _backend_context(
+        variant,
+        backend_root=backend_root,
+        extra_env=backend_env,
+    ) as backend:
         model = art.TrainableModel(
             name=f"length-{uuid.uuid4().hex[:8]}",
             project="integration-tests",
@@ -528,10 +751,16 @@ async def run_length_trainability_async(
         await model.register(backend)
 
         async def scenarios() -> AsyncIterator[dict[str, object]]:
-            for index in range(scenario_count):
-                if success_hit:
-                    break
-                yield _scenario(index, target_step=0).model_dump()
+            index = 0
+            while not success_hit and (
+                scenario_limit is None or index < scenario_limit
+            ):
+                yield _scenario(
+                    index,
+                    target_step=0,
+                    base_model=base_model,
+                ).model_dump()
+                index += 1
 
         async def rollout_fn(
             rollout_model: art.TrainableModel,
@@ -545,6 +774,7 @@ async def run_length_trainability_async(
                 target_step = await rollout_model.get_step()
             group = await _length_group(
                 rollout_model,
+                base_model=base_model,
                 scenario=_scenario_for_training_step(scenario, target_step),
                 model_name=model_name,
                 split="train",
@@ -554,14 +784,15 @@ async def run_length_trainability_async(
                     "ART_MODEL_SUPPORT_LENGTH_ROLLOUT_TEMPERATURE",
                     1.1,
                 ),
+                chat_template_kwargs=chat_template_kwargs,
                 samples=samples,
                 summary_log_path=summary_log_path,
             )
-            if (
+            if _success_abs_error_passed(
                 _mean_abs_error_by_step(
                     [sample for sample in samples if sample.split == "train"]
-                )[target_step]
-                <= SUCCESS_ABS_ERROR_MAX
+                )[target_step],
+                thresholds,
             ):
                 success_hit = True
             return group
@@ -578,7 +809,7 @@ async def run_length_trainability_async(
             max_steps_off_policy=max_steps_off_policy,
             learning_rate=_get_env_float(
                 "ART_MODEL_SUPPORT_LENGTH_LEARNING_RATE",
-                1e-4,
+                _default_learning_rate(base_model),
             ),
             loss_fn="cispo",
             normalize_advantages=normalize_advantages,
@@ -586,9 +817,9 @@ async def run_length_trainability_async(
             eval_every_n_steps=0,
             eval_at_start=False,
             save_checkpoint=False,
-            total_scenarios=scenario_count,
+            total_scenarios=scenario_limit,
             log_interval_seconds=30.0,
-            discard_queue_multiplier=1000,
+            discard_queue_multiplier=zero_variance_discard_multiplier,
             resume=False,
         )
         await trainer.train(handle_signals=False)
@@ -609,8 +840,8 @@ async def run_length_trainability_async(
     success_step = next(
         (
             step
-            for step, abs_error in train_abs_error_by_step.items()
-            if abs_error <= SUCCESS_ABS_ERROR_MAX
+            for step, abs_error in sorted(train_abs_error_by_step.items())
+            if _success_abs_error_passed(abs_error, thresholds)
         ),
         None,
     )
@@ -625,6 +856,13 @@ async def run_length_trainability_async(
         if final_train_samples
         else None
     )
+    prompt_tree_sample_count = 4 if scenario_limit is None else min(4, scenario_limit)
+    prompt_tree_depth, prompt_tree_branch_count = _prompt_tree_shape(
+        [
+            _scenario(index, base_model=base_model).prompt
+            for index in range(prompt_tree_sample_count)
+        ]
+    )
     topology = cast(Topology, variant.topology)
     report = LengthTrainabilityReport(
         base_model=base_model,
@@ -637,9 +875,12 @@ async def run_length_trainability_async(
         training_topology=cast(dict[str, int | bool], topology.model_dump()),
         rollout_weights_mode=rollout_weights_mode,
         rollouts_per_prompt=rollouts_per_prompt,
+        prompt_tree_depth=prompt_tree_depth,
+        prompt_tree_branch_count=prompt_tree_branch_count,
         normalize_advantages=normalize_advantages,
         summary_log_path=str(summary_log_path),
         latest_summary_log_path=str(LATEST_SUMMARY_LOG_PATH),
+        thresholds=thresholds,
         initial_train_abs_error=initial_train_abs_error,
         best_train_abs_error=best_train_abs_error,
         success_step=success_step,
@@ -669,6 +910,7 @@ def run_length_trainability(
 
 
 def length_trainability_passed(report: LengthTrainabilityReport) -> bool:
+    thresholds = report.thresholds
     train_samples = [sample for sample in report.samples if sample.split == "train"]
     train_rewards_by_step = {
         step: [sample.reward for sample in train_samples if sample.step == step]
@@ -678,9 +920,9 @@ def length_trainability_passed(report: LengthTrainabilityReport) -> bool:
         bool(train_samples)
         and report.latest_step <= report.max_steps
         and report.initial_train_abs_error is not None
-        and report.initial_train_abs_error >= INITIAL_ABS_ERROR_MIN
+        and _initial_abs_error_passed(report.initial_train_abs_error, thresholds)
         and report.best_train_abs_error is not None
-        and report.best_train_abs_error <= SUCCESS_ABS_ERROR_MAX
+        and _success_abs_error_passed(report.best_train_abs_error, thresholds)
         and report.success_step is not None
         and len(train_rewards_by_step) <= report.max_steps
         and all(sample.max_tokens > sample.target_tokens for sample in train_samples)
@@ -693,6 +935,7 @@ def length_trainability_passed(report: LengthTrainabilityReport) -> bool:
 
 
 def assert_length_trainability_passed(report: LengthTrainabilityReport) -> None:
+    thresholds = report.thresholds
     train_samples = [sample for sample in report.samples if sample.split == "train"]
     train_rewards_by_step = {
         step: [sample.reward for sample in train_samples if sample.step == step]
@@ -701,9 +944,9 @@ def assert_length_trainability_passed(report: LengthTrainabilityReport) -> None:
     assert train_samples
     assert report.latest_step <= report.max_steps
     assert report.initial_train_abs_error is not None
-    assert report.initial_train_abs_error >= INITIAL_ABS_ERROR_MIN
+    assert _initial_abs_error_passed(report.initial_train_abs_error, thresholds)
     assert report.best_train_abs_error is not None
-    assert report.best_train_abs_error <= SUCCESS_ABS_ERROR_MAX
+    assert _success_abs_error_passed(report.best_train_abs_error, thresholds)
     assert report.success_step is not None
     assert len(train_rewards_by_step) <= report.max_steps
     assert all(sample.max_tokens > sample.target_tokens for sample in train_samples)

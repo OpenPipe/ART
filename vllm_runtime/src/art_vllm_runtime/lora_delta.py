@@ -11,6 +11,9 @@ _LORA_B_SUFFIX = ".lora_B.weight"
 _GATE_UP_A_SUFFIX = ".base_layer.lora_A.weight"
 _GATE_UP_B_SUFFIX = ".base_layer.lora_B.weight"
 _PEFT_PREFIX = "base_model.model."
+_UNSUPPORTED_MERGED_DELTA_TARGETS_KEY = (
+    "art_merged_lora_delta_unsupported_target_modules"
+)
 
 
 def _lora_scaling(adapter_config: dict[str, Any]) -> float:
@@ -50,6 +53,11 @@ def _unpack_expert_lora_b(tensor: torch.Tensor, *, rank: int) -> torch.Tensor:
     return tensor.reshape(tensor.shape[0], rank, num_experts).permute(2, 0, 1)
 
 
+def _merged_delta_skips_experts(adapter_config: dict[str, Any]) -> bool:
+    targets = adapter_config.get(_UNSUPPORTED_MERGED_DELTA_TARGETS_KEY) or ()
+    return "experts" in set(targets)
+
+
 def _iter_lora_checkpoint_deltas(
     lora_tensors: dict[str, torch.Tensor],
     *,
@@ -58,12 +66,15 @@ def _iter_lora_checkpoint_deltas(
 ) -> Iterable[tuple[str, torch.Tensor]]:
     rank = int(adapter_config["r"])
     scaling = _lora_scaling(adapter_config)
+    skip_expert_deltas = _merged_delta_skips_experts(adapter_config)
     consumed: set[str] = set()
     for a_key in sorted(lora_tensors):
         if a_key.endswith(_GATE_UP_A_SUFFIX):
             prefix = a_key.removesuffix(_GATE_UP_A_SUFFIX)
             b_key = prefix + _GATE_UP_B_SUFFIX
             consumed.update((a_key, b_key))
+            if skip_expert_deltas:
+                continue
             a_tensor = lora_tensors[a_key]
             b_tensor = _unpack_expert_lora_b(lora_tensors[b_key], rank=rank)
             previous_b = (
@@ -76,6 +87,7 @@ def _iter_lora_checkpoint_deltas(
                 expert_a = a_tensor[expert_id * rank : (expert_id + 1) * rank]
                 delta = b_expert.float().matmul(expert_a.float()).mul_(scaling)
                 if previous_b is not None:
+                    assert previous_lora_tensors is not None
                     previous_a = previous_lora_tensors[a_key][
                         expert_id * rank : (expert_id + 1) * rank
                     ]
@@ -95,6 +107,8 @@ def _iter_lora_checkpoint_deltas(
         b_key = prefix + _LORA_B_SUFFIX
         consumed.update((a_key, b_key))
         if prefix.endswith(".experts"):
+            if skip_expert_deltas:
+                continue
             a_tensor = lora_tensors[a_key]
             b_tensor = _unpack_expert_lora_b(lora_tensors[b_key], rank=rank)
             previous_b = (
@@ -107,6 +121,7 @@ def _iter_lora_checkpoint_deltas(
                 expert_a = a_tensor[expert_id * rank : (expert_id + 1) * rank]
                 delta = b_expert.float().matmul(expert_a.float()).mul_(scaling)
                 if previous_b is not None:
+                    assert previous_lora_tensors is not None
                     previous_a = previous_lora_tensors[a_key][
                         expert_id * rank : (expert_id + 1) * rank
                     ]
@@ -144,6 +159,25 @@ def _default_weight_loader(param: torch.Tensor, loaded_weight: torch.Tensor) -> 
     param.data.copy_(loaded_weight)
 
 
+def _call_weight_loader(
+    loader: Any,
+    loader_param: torch.Tensor,
+    loaded_weight: torch.Tensor,
+    *args: Any,
+    **kwargs: Any,
+) -> Any:
+    if not hasattr(loader_param, "load_merged_column_weight"):
+        owner = getattr(loader, "__self__", None)
+        legacy_loader = getattr(owner, "weight_loader", None)
+        if (
+            legacy_loader is not None
+            and legacy_loader is not loader
+            and getattr(loader, "__name__", "") == "weight_loader_v2"
+        ):
+            return legacy_loader(loader_param, loaded_weight, *args, **kwargs)
+    return loader(loader_param, loaded_weight, *args, **kwargs)
+
+
 def _additive_weight_loader(param: torch.Tensor, original_loader: Any) -> Any:
     def load_delta(
         loader_param: torch.Tensor,
@@ -155,7 +189,13 @@ def _additive_weight_loader(param: torch.Tensor, original_loader: Any) -> Any:
         scratch = torch.zeros_like(real_data)
         loader_param.data = scratch
         try:
-            result = original_loader(loader_param, loaded_weight, *args, **kwargs)
+            result = _call_weight_loader(
+                original_loader,
+                loader_param,
+                loaded_weight,
+                *args,
+                **kwargs,
+            )
         finally:
             loader_param.data = real_data
         if result is not False:

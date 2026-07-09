@@ -10,10 +10,13 @@ Options:
   --image-repo REPO      Image repository to publish
   --infra INFRA          Kubernetes-backed SkyPilot infra (default: k8s/cks-wb3)
   --no-cache             Disable registry-backed BuildKit cache
+  --no-prewarm-modal     Skip prebuilding the pushed image in Modal
   --no-prewarm-nodes     Skip pre-pulling the pushed image on GPU nodes
+  --prewarm-infra INFRA  Kubernetes-backed infra to prewarm; repeatable
   --pull-image-repo REPO Image repository for cluster pulls/prewarm
+  --prewarm-modal        Require prebuilding the pushed image in Modal
   --prewarm-timeout DUR  Timeout for the prewarm DaemonSet rollout (default: 30m)
-  --tag TAG              Image tag to publish
+  --tag TAG              Image tag to publish (default: latest)
   --help                 Show this help
 EOF
 }
@@ -24,19 +27,27 @@ cluster_name=""
 infra="${SKY_INFRA:-k8s/cks-wb3}"
 image_repo="${ART_IMAGE_REPO:-}"
 pull_image_repo="${ART_PULL_IMAGE_REPO:-}"
-image_tag=""
+image_tag="${IMAGE_TAG:-latest}"
 docker_config_path="${DOCKER_CONFIG_PATH:-${HOME}/.docker/config.json}"
 buildkit_image="${BUILDKIT_IMAGE:-moby/buildkit:v0.29.0-rootless}"
 buildkit_namespace="${KUBECTL_NAMESPACE:-default}"
 buildkit_wait_timeout="${BUILDKIT_WAIT_TIMEOUT:-300s}"
 no_cache="${NO_CACHE:-false}"
+prewarm_modal="${PREWARM_MODAL:-auto}"
 prewarm_nodes="${PREWARM_NODES:-true}"
+prewarm_infras=()
+if [[ -n "${PREWARM_INFRAS:-}" ]]; then
+  while IFS= read -r prewarm_infra; do
+    [[ -n "${prewarm_infra}" ]] && prewarm_infras+=("${prewarm_infra}")
+  done < <(printf '%s\n' "${PREWARM_INFRAS}" | awk 'BEGIN { RS = "[[:space:],]+" } NF { print }')
+fi
 prewarm_namespace="${PREWARM_NAMESPACE:-default}"
 prewarm_name="${PREWARM_NAME:-art-gpu-image-prewarm}"
 prewarm_image_pull_secret="${PREWARM_IMAGE_PULL_SECRET:-art-gpu-registry-auth}"
 prewarm_node_selector="${PREWARM_NODE_SELECTOR:-node.coreweave.cloud/class=gpu}"
 prewarm_timeout="${PREWARM_TIMEOUT:-30m}"
 prewarm_node_timeout="${PREWARM_NODE_TIMEOUT:-10m}"
+prewarm_delete_timeout="${PREWARM_DELETE_TIMEOUT:-60s}"
 prewarm_node_retries="${PREWARM_NODE_RETRIES:-12}"
 prewarm_node_parallelism="${PREWARM_NODE_PARALLELISM:-3}"
 prewarm_tag_convergence_attempts="${PREWARM_TAG_CONVERGENCE_ATTEMPTS:-120}"
@@ -65,13 +76,25 @@ while [[ $# -gt 0 ]]; do
       no_cache=true
       shift
       ;;
+    --no-prewarm-modal)
+      prewarm_modal=false
+      shift
+      ;;
     --no-prewarm-nodes)
       prewarm_nodes=false
       shift
       ;;
+    --prewarm-infra)
+      prewarm_infras+=("$2")
+      shift 2
+      ;;
     --pull-image-repo)
       pull_image_repo="$2"
       shift 2
+      ;;
+    --prewarm-modal)
+      prewarm_modal=true
+      shift
       ;;
     --prewarm-timeout)
       prewarm_timeout="$2"
@@ -93,20 +116,40 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
-case "${infra}" in
-  k8s/*)
-    kube_context="${infra#k8s/}"
-    ;;
-  kubernetes/*)
-    kube_context="${infra#kubernetes/}"
-    ;;
+case "${prewarm_modal}" in
+  auto|true|false) ;;
   *)
-    echo "Unsupported --infra '${infra}'. Use k8s/<kubectl-context>." >&2
+    echo "PREWARM_MODAL must be one of: auto, true, false" >&2
     exit 1
     ;;
 esac
 
-kubectl_cmd=(kubectl --context "${kube_context}")
+kube_context_from_infra() {
+  local infra_value="$1"
+  case "${infra_value}" in
+    k8s/*)
+      printf '%s\n' "${infra_value#k8s/}"
+      ;;
+    kubernetes/*)
+      printf '%s\n' "${infra_value#kubernetes/}"
+      ;;
+    *)
+      echo "Unsupported infra '${infra_value}'. Use k8s/<kubectl-context>." >&2
+      return 1
+      ;;
+  esac
+}
+
+kube_context="$(kube_context_from_infra "${infra}")"
+build_kubectl_cmd=(kubectl --context "${kube_context}")
+kubectl_cmd=("${build_kubectl_cmd[@]}")
+if [[ "${#prewarm_infras[@]}" == "0" ]]; then
+  prewarm_infras=("${infra}")
+fi
+prewarm_contexts=()
+for prewarm_infra in "${prewarm_infras[@]}"; do
+  prewarm_contexts+=("$(kube_context_from_infra "${prewarm_infra}")")
+done
 if [[ "${prewarm_node_selector}" != *=* ]]; then
   echo "PREWARM_NODE_SELECTOR must be a key=value selector, got: ${prewarm_node_selector}" >&2
   exit 1
@@ -117,10 +160,6 @@ prewarm_node_selector_value="${prewarm_node_selector#*=}"
 art_sha="$(git -C "${repo_root}" rev-parse HEAD)"
 art_short_sha="$(git -C "${repo_root}" rev-parse --short=12 HEAD)"
 timestamp="$(date +%m%d-%H%M%S)"
-
-if [[ -z "${image_tag}" ]]; then
-  image_tag="skypilot-${art_short_sha}"
-fi
 
 if [[ -z "${cluster_name}" ]]; then
   cluster_name="art-gpu-build-${timestamp}"
@@ -250,7 +289,7 @@ cleanup() {
   rm -rf "${context_dir}"
   rm -f "${buildkit_manifest_path}" "${registry_auth_json_path}" \
     "${build_command_path}" "${build_log_snapshot_path}" "${build_log_offset_path}"
-  "${kubectl_cmd[@]}" delete pod -n "${buildkit_namespace}" "${cluster_name}" \
+  "${build_kubectl_cmd[@]}" delete pod -n "${buildkit_namespace}" "${cluster_name}" \
     --ignore-not-found --wait=true >/dev/null 2>&1 || true
 }
 trap cleanup EXIT
@@ -437,6 +476,38 @@ if [[ -n "${prewarm_refresh_tag_image}" ]]; then
   esac
 fi
 
+modal_auth_available=false
+if [[ "${prewarm_modal}" != "false" ]]; then
+  if uv run --with 'modal>=1.5.0' python - <<'PY' >/dev/null 2>&1; then
+import modal
+
+modal.Workspace.from_context().hydrate()
+PY
+    modal_auth_available=true
+  fi
+fi
+
+if [[ "${prewarm_modal}" == "true" || "${modal_auth_available}" == "true" ]]; then
+  echo "Prewarming ${image_repo}:${image_tag} in Modal image cache"
+  MODAL_FORCE_BUILD=1 uv run --with 'modal>=1.5.0' python - "${image_repo}:${image_tag}" <<'PY'
+import sys
+
+import modal
+
+image = (
+    modal.Image.from_registry(sys.argv[1], add_python="3.12")
+    .apt_install("openssh-server", "sudo", "rsync", "curl", "procps", "patch", "lsof")
+)
+app = modal.App.lookup("skypilot-modal", create_if_missing=True)
+with modal.enable_output():
+    image.build(app)
+PY
+elif [[ "${prewarm_modal}" == "auto" ]]; then
+  echo "Skipping Modal image prewarm: Modal auth unavailable"
+else
+  echo "Skipping Modal image prewarm"
+fi
+
 dump_prewarm_diagnostics() {
   echo "::group::Prewarm diagnostics"
   "${kubectl_cmd[@]}" get daemonset -n "${prewarm_namespace}" "${prewarm_name}" -o wide || true
@@ -542,6 +613,29 @@ render_clear_tag_commands() {
     printf '          crictl --runtime-endpoint "unix://%s" rmi '\''%s'\'' || true\n' \
       "${prewarm_containerd_socket}" "${image}"
   done
+}
+
+delete_pods_best_effort() {
+  if (( $# == 0 )); then
+    return 0
+  fi
+
+  if "${kubectl_cmd[@]}" delete pod -n "${prewarm_namespace}" "$@" \
+    --ignore-not-found --wait=true --timeout="${prewarm_delete_timeout}" >/dev/null 2>&1; then
+    return 0
+  fi
+
+  "${kubectl_cmd[@]}" delete pod -n "${prewarm_namespace}" "$@" \
+    --ignore-not-found --wait=false --grace-period=0 --force >/dev/null 2>&1 || true
+}
+
+delete_pods_without_wait() {
+  if (( $# == 0 )); then
+    return 0
+  fi
+
+  "${kubectl_cmd[@]}" delete pod -n "${prewarm_namespace}" "$@" \
+    --ignore-not-found --wait=false >/dev/null 2>&1 || true
 }
 
 render_tag_check_init_containers() {
@@ -666,15 +760,15 @@ verify_steady_prewarm_daemonset() {
     fi
 
     echo "Steady-state ${prewarm_name} has ${#stale_pods[@]} pod(s) with stale ${prewarm_refresh_tag_image}; recreating them (attempt ${attempt}/${prewarm_node_retries})"
-    "${kubectl_cmd[@]}" delete pod -n "${prewarm_namespace}" "${stale_pods[@]}" \
-      --wait=true >/dev/null 2>&1 || true
+    delete_pods_best_effort "${stale_pods[@]}"
     sleep "$((attempt * 10))"
   done
 }
 
 wait_for_mutable_tag_convergence() {
   local node="$1"
-  local pod="${prewarm_name}-tag-check"
+  local pod_base="${prewarm_name}-tag-check"
+  local pod
   local attempt
   local clear_mutable_tag
   local image_id
@@ -697,8 +791,8 @@ wait_for_mutable_tag_convergence() {
     if [[ "${attempt}" == "1" ]]; then
       clear_mutable_tag="${prewarm_clear_mutable_tag}"
     fi
-    "${kubectl_cmd[@]}" delete pod -n "${prewarm_namespace}" "${pod}" \
-      --ignore-not-found --wait=true >/dev/null 2>&1 || true
+    pod="${pod_base}-${attempt}"
+    delete_pods_without_wait "${pod}"
     "${kubectl_cmd[@]}" apply -n "${prewarm_namespace}" -f - <<EOF
 apiVersion: v1
 kind: Pod
@@ -732,8 +826,7 @@ EOF
       --timeout="${prewarm_node_timeout}" >/dev/null 2>&1; then
       if verify_prewarm_refresh_tag_digest "${pod}"; then
         echo "Mutable tags converged to ${image_digest}"
-        "${kubectl_cmd[@]}" delete pod -n "${prewarm_namespace}" "${pod}" \
-          --ignore-not-found --wait=true >/dev/null 2>&1 || true
+        delete_pods_without_wait "${pod}"
         return 0
       fi
       echo "Mutable tag check ${attempt}/${prewarm_tag_convergence_attempts} has not converged to ${image_digest}"
@@ -742,8 +835,7 @@ EOF
       "${kubectl_cmd[@]}" describe pod -n "${prewarm_namespace}" "${pod}" || true
     fi
 
-    "${kubectl_cmd[@]}" delete pod -n "${prewarm_namespace}" "${pod}" \
-      --ignore-not-found --wait=true >/dev/null 2>&1 || true
+    delete_pods_without_wait "${pod}"
     sleep "${prewarm_tag_convergence_interval}"
   done
 
@@ -766,8 +858,7 @@ prewarm_single_node() {
 
   for attempt in $(seq 1 "${prewarm_node_retries}"); do
     echo "Prewarming ${prewarm_display} on GPU node ${node} (attempt ${attempt}/${prewarm_node_retries})"
-    "${kubectl_cmd[@]}" delete pod -n "${prewarm_namespace}" "${pod}" \
-      --ignore-not-found --wait=true >/dev/null 2>&1 || true
+    delete_pods_best_effort "${pod}"
     "${kubectl_cmd[@]}" apply -n "${prewarm_namespace}" -f - <<EOF
 apiVersion: v1
 kind: Pod
@@ -799,22 +890,19 @@ EOF
       --for=condition=Ready "pod/${pod}" \
       --timeout="${prewarm_node_timeout}"; then
       if verify_prewarm_refresh_tag_digest "${pod}"; then
-        "${kubectl_cmd[@]}" delete pod -n "${prewarm_namespace}" "${pod}" \
-          --ignore-not-found --wait=true >/dev/null 2>&1 || true
+        delete_pods_best_effort "${pod}"
         return 0
       fi
 
       echo "Prewarm mutable tag verification failed on node ${node}; retrying after tag convergence delay"
-      "${kubectl_cmd[@]}" delete pod -n "${prewarm_namespace}" "${pod}" \
-        --ignore-not-found --wait=true >/dev/null 2>&1 || true
+      delete_pods_best_effort "${pod}"
       sleep "$((attempt * 10))"
       continue
     fi
 
     echo "Prewarm failed on node ${node}; pod diagnostics:"
     "${kubectl_cmd[@]}" describe pod -n "${prewarm_namespace}" "${pod}" || true
-    "${kubectl_cmd[@]}" delete pod -n "${prewarm_namespace}" "${pod}" \
-      --ignore-not-found --wait=true >/dev/null 2>&1 || true
+    delete_pods_best_effort "${pod}"
     sleep "$((attempt * 10))"
   done
 
@@ -823,6 +911,9 @@ EOF
 }
 
 if [[ "${prewarm_nodes}" == "true" ]]; then
+  for prewarm_context in "${prewarm_contexts[@]}"; do
+    kubectl_cmd=(kubectl --context "${prewarm_context}")
+    echo "Prewarming Kubernetes context ${prewarm_context}"
   if ! [[ "${prewarm_node_parallelism}" =~ ^[1-9][0-9]*$ ]]; then
     echo "PREWARM_NODE_PARALLELISM must be a positive integer, got: ${prewarm_node_parallelism}" >&2
     exit 1
@@ -920,6 +1011,7 @@ EOF
       exit 1
     fi
   fi
+  done
 else
   echo "Skipping GPU node prewarm"
 fi

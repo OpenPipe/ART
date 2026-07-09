@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 from pathlib import Path
-import socket
 
 import pytest
 
@@ -26,6 +25,7 @@ from art.megatron.model_support import QWEN3_5_MOE_SPEC  # noqa: E402
 from art.megatron.model_support.handlers import QWEN3_5_MOE_HANDLER  # noqa: E402
 
 from .cases import GdnPhase0Case, default_phase0_cases  # noqa: E402
+from .distributed_init import file_init_method  # noqa: E402
 from .metrics import GDN_CORRECTNESS_DTYPE, assert_real_gdn_metrics  # noqa: E402
 from .packed_layout import build_phase0_packed_tensors  # noqa: E402
 from .real_gdn_oracle import (  # noqa: E402
@@ -68,10 +68,10 @@ def test_real_qwen35_gdn_lora_gradients_match_flattened() -> None:
     reason="At least two CUDA devices are required for TP2 GDN coverage.",
 )
 def test_real_qwen35_gdn_tp2_gradients_match_flattened(tmp_path: Path) -> None:
-    port = _find_free_port()
+    init_method = file_init_method(tmp_path, "real_gdn_tp2_lora")
     mp.spawn(
         _tp2_worker,
-        args=(port, str(tmp_path)),
+        args=(init_method, str(tmp_path)),
         nprocs=2,
         join=True,
     )
@@ -79,11 +79,11 @@ def test_real_qwen35_gdn_tp2_gradients_match_flattened(tmp_path: Path) -> None:
         assert (tmp_path / f"rank_{rank}.ok").read_text() == "ok\n"
 
 
-def _tp2_worker(rank: int, port: int, output_dir: str) -> None:
+def _tp2_worker(rank: int, init_method: str, output_dir: str) -> None:
     torch.cuda.set_device(rank)
     init_process_group(
         backend="nccl",
-        init_method=f"tcp://127.0.0.1:{port}",
+        init_method=init_method,
         rank=rank,
         world_size=2,
     )
@@ -229,9 +229,3 @@ def _gdn_lora_grad_names(gdn: torch.nn.Module) -> tuple[str, ...]:
         and parameter.grad is not None
         and bool(parameter.grad.abs().max().item() > 0)
     )
-
-
-def _find_free_port() -> int:
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
-        sock.bind(("127.0.0.1", 0))
-        return int(sock.getsockname()[1])

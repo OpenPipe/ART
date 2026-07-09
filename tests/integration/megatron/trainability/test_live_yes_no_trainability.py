@@ -4,7 +4,10 @@ from pathlib import Path
 
 import pytest
 
-from .yes_no_trainability import run_yes_no_trainability_async
+from .yes_no_trainability import (
+    run_yes_no_trainability_async,
+    yes_no_trainability_passed,
+)
 
 torch = pytest.importorskip("torch")
 
@@ -29,12 +32,7 @@ def _unsloth_base_model() -> str:
 
 
 def _assert_passed(report) -> None:
-    assert report.saturated_step is not None
-    assert report.saturated_step > 0
-    assert report.initial_eval_reward < report.reward_threshold
-    assert report.final_eval_reward is not None
-    assert report.final_eval_reward >= report.reward_threshold
-    assert report.final_eval_reward > report.initial_eval_reward
+    assert yes_no_trainability_passed(report)
     assert report.latest_step > 0
     assert report.step0_name in report.model_ids_before
     assert report.latest_name in report.model_ids_after

@@ -164,7 +164,7 @@ def test_calculate_megatron_logprobs_replays_routes(monkeypatch) -> None:
     chunk = _Chunk(controller)
     monkeypatch.setattr(
         megatron_microbatches,
-        "create_shared_prefix_state",
+        "create_prefix_tree_state",
         lambda **kwargs: (kwargs["group_ids"], kwargs["parent_ids"]),
     )
     monkeypatch.setattr(

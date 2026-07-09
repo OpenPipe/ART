@@ -220,6 +220,17 @@ TOPOLOGIES = [
     Topology(tp=2, ep=2, etp=1, dp=1, cp=2, sp=True),
     Topology(tp=2, ep=4, etp=2, dp=2, cp=2, sp=True),
 ]
+
+
+def _without_context_parallel(topology: Topology) -> Topology:
+    return topology.model_copy(update={"dp": topology.dp * topology.cp, "cp": 1})
+
+
+CP_UNSUPPORTED_MOE_TOPOLOGIES = [
+    _without_context_parallel(topology) for topology in TOPOLOGIES[:-1]
+] + [
+    Topology(tp=2, ep=2, etp=2, dp=2, cp=1, sp=True),
+]
 DENSE_TOPOLOGIES = [
     Topology(tp=1, ep=1, etp=1, dp=1, sp=False),
     Topology(tp=2, ep=1, etp=1, dp=1, sp=True),
@@ -245,6 +256,9 @@ SENSITIVITY_TOPOLOGY_BY_MUTATION |= {
     mutation: CP_ATTENTION_SENSITIVITY_TOPOLOGY
     for mutation in CP_ATTENTION_SENSITIVITY_MUTATIONS
 }
+SENSITIVITY_TOPOLOGY_BY_MUTATION["attn_skip_flash_lse_normalize"] = Topology(
+    tp=1, ep=2, etp=1, dp=1, cp=4, sp=False
+)
 SENSITIVITY_TOPOLOGY_BY_MUTATION["bwd_skip_sync_fc1_a"] = Topology(
     tp=2, ep=1, etp=2, dp=1, sp=True
 )
@@ -701,6 +715,8 @@ def sensitivity_topology_for_mutation(
         }:
             return DENSE_DP_SENSITIVITY_TOPOLOGY
         if mutation in CP_ATTENTION_SENSITIVITY_MUTATIONS:
+            if mutation == "attn_skip_flash_lse_normalize":
+                return Topology(tp=1, ep=1, etp=1, dp=1, cp=4, sp=False)
             return DENSE_CP_ATTENTION_SENSITIVITY_TOPOLOGY
         return DENSE_SENSITIVITY_TOPOLOGY
     return SENSITIVITY_TOPOLOGY_BY_MUTATION[mutation]
@@ -751,9 +767,30 @@ def oracle_topology(*, is_moe: bool = True) -> Topology:
     return ORACLE_TOPOLOGY if is_moe else DENSE_ORACLE_TOPOLOGY
 
 
-def selected_suite_topologies(*, is_moe: bool = True) -> list[Topology]:
+def _filter_context_parallel_support(
+    topologies: list[Topology],
+    *,
+    is_moe: bool,
+    cp_supported: bool,
+) -> list[Topology]:
+    if cp_supported:
+        return topologies
+    if is_moe:
+        return list(CP_UNSUPPORTED_MOE_TOPOLOGIES)
+    return [_without_context_parallel(topology) for topology in topologies]
+
+
+def selected_suite_topologies(
+    *,
+    is_moe: bool = True,
+    cp_supported: bool = True,
+) -> list[Topology]:
     """Returns the correctness topology list for a model family."""
-    return list(TOPOLOGIES if is_moe else DENSE_TOPOLOGIES)
+    return _filter_context_parallel_support(
+        list(TOPOLOGIES if is_moe else DENSE_TOPOLOGIES),
+        is_moe=is_moe,
+        cp_supported=cp_supported,
+    )
 
 
 def stable_case_id(case_config: OracleCaseConfig) -> str:
@@ -805,210 +842,10 @@ def _build_packed_tensors(
     config: PackedTensorConfig,
     seed: int,
 ) -> dict[str, Any]:
-    """Generates deterministic synthetic packed tensors used in integration runs."""
-    import torch
+    """Generates deterministic nested prefix-tree tensors used in integration runs."""
+    from .prefix_tree_workloads import build_complex_prefix_tree_packed_tensors
 
-    if config.num_sequences <= 1:
-        raise ValueError("num_sequences must be greater than 1")
-    shape = (config.num_sequences, config.sequence_length)
-    generator = torch.Generator().manual_seed(seed)
-    tokens = torch.zeros(shape, dtype=torch.long)
-    token_low = 10
-    token_span = max(1, config.vocab_high - token_low)
-    group_ids = torch.full(shape, -1, dtype=torch.long)
-    parent_ids = torch.full(shape, -1, dtype=torch.long)
-    assistant_mask = torch.zeros(shape, dtype=torch.bool)
-    input_pos = torch.zeros(shape, dtype=torch.long)
-    logprobs = torch.full(shape, float("nan"), dtype=torch.float32)
-    advantages = torch.zeros(shape, dtype=torch.float32)
-    weights = torch.zeros(shape, dtype=torch.float32)
-
-    prefix_length = max(1, min(config.sequence_length - 1, config.prefill_tokens))
-    max_completion_tokens = max(1, config.sequence_length - prefix_length)
-    base_completion_tokens = max(1, min(config.decode_tokens, max_completion_tokens))
-    jitter_width = min(config.decode_tokens_jitter, max_completion_tokens - 1)
-
-    def _sample_completion_length() -> int:
-        if jitter_width > 0:
-            jitter = int(
-                torch.randint(
-                    low=-jitter_width,
-                    high=jitter_width + 1,
-                    size=(1,),
-                    generator=generator,
-                    dtype=torch.long,
-                ).item()
-            )
-        else:
-            jitter = 0
-        return max(
-            1,
-            min(max_completion_tokens, base_completion_tokens + jitter),
-        )
-
-    def _sample_token_block(length: int) -> torch.Tensor:
-        return torch.randint(
-            low=token_low,
-            high=config.vocab_high,
-            size=(length,),
-            dtype=torch.long,
-            generator=generator,
-        )
-
-    def _sample_logprob_block(length: int) -> torch.Tensor:
-        return (
-            torch.randn(
-                (length,),
-                generator=generator,
-                dtype=torch.float32,
-            )
-            * 0.25
-            - 1.75
-        )
-
-    def _sample_advantage_value() -> float:
-        return float(
-            (
-                torch.randn(
-                    (1,),
-                    generator=generator,
-                    dtype=torch.float32,
-                )
-                * 0.5
-            ).item()
-        )
-
-    for sequence_index in range(config.num_sequences):
-        cursor = 0
-        next_group_id = 0
-        while cursor < config.sequence_length:
-            prompt_group_id = next_group_id
-            next_group_id += 1
-            completion_lengths = [
-                _sample_completion_length()
-                for _ in range(config.completion_branches_per_prefix)
-            ]
-            remaining = config.sequence_length - cursor
-
-            if config.packing_mode == "stop_early":
-                included_completion_lengths = list(completion_lengths)
-                while (
-                    included_completion_lengths
-                    and (prefix_length + sum(included_completion_lengths)) > remaining
-                ):
-                    included_completion_lengths.pop()
-                if not included_completion_lengths:
-                    break
-
-                prompt_end = cursor + prefix_length
-                tokens[sequence_index, cursor:prompt_end] = _sample_token_block(
-                    prefix_length
-                )
-                group_ids[sequence_index, cursor:prompt_end] = prompt_group_id
-                parent_ids[sequence_index, cursor:prompt_end] = prompt_group_id
-                input_pos[sequence_index, cursor:prompt_end] = torch.arange(
-                    prefix_length, dtype=torch.long
-                )
-                cursor = prompt_end
-
-                for completion_length in included_completion_lengths:
-                    completion_group_id = next_group_id
-                    next_group_id += 1
-                    completion_end = cursor + completion_length
-                    tokens[sequence_index, cursor:completion_end] = _sample_token_block(
-                        completion_length
-                    )
-                    group_ids[sequence_index, cursor:completion_end] = (
-                        completion_group_id
-                    )
-                    parent_ids[sequence_index, cursor:completion_end] = prompt_group_id
-                    input_pos[sequence_index, cursor:completion_end] = torch.arange(
-                        prefix_length,
-                        prefix_length + completion_length,
-                        dtype=torch.long,
-                    )
-                    assistant_mask[sequence_index, cursor:completion_end] = True
-                    logprobs[sequence_index, cursor:completion_end] = (
-                        _sample_logprob_block(completion_length)
-                    )
-                    advantages[sequence_index, cursor:completion_end] = (
-                        _sample_advantage_value()
-                    )
-                    weights[sequence_index, cursor:completion_end] = 1.0
-                    cursor = completion_end
-                continue
-
-            prompt_take = min(prefix_length, remaining)
-            prompt_end = cursor + prompt_take
-            tokens[sequence_index, cursor:prompt_end] = _sample_token_block(prompt_take)
-            group_ids[sequence_index, cursor:prompt_end] = prompt_group_id
-            parent_ids[sequence_index, cursor:prompt_end] = prompt_group_id
-            input_pos[sequence_index, cursor:prompt_end] = torch.arange(
-                prompt_take, dtype=torch.long
-            )
-            cursor = prompt_end
-            if cursor >= config.sequence_length:
-                break
-
-            for completion_length in completion_lengths:
-                if cursor >= config.sequence_length:
-                    break
-                completion_group_id = next_group_id
-                next_group_id += 1
-                remaining = config.sequence_length - cursor
-                completion_take = min(completion_length, remaining)
-                completion_end = cursor + completion_take
-                tokens[sequence_index, cursor:completion_end] = _sample_token_block(
-                    completion_take
-                )
-                group_ids[sequence_index, cursor:completion_end] = completion_group_id
-                parent_ids[sequence_index, cursor:completion_end] = prompt_group_id
-                input_pos[sequence_index, cursor:completion_end] = torch.arange(
-                    prefix_length,
-                    prefix_length + completion_take,
-                    dtype=torch.long,
-                )
-                assistant_mask[sequence_index, cursor:completion_end] = True
-                logprobs[sequence_index, cursor:completion_end] = _sample_logprob_block(
-                    completion_take
-                )
-                advantages[sequence_index, cursor:completion_end] = (
-                    _sample_advantage_value()
-                )
-                weights[sequence_index, cursor:completion_end] = 1.0
-                cursor = completion_end
-                if completion_take < completion_length:
-                    break
-
-    # Ensure paired cross-DP rows are never token-identical across valid tokens.
-    half = config.num_sequences // 2
-    if half > 0 and config.num_sequences % 2 == 0:
-        valid_lengths = (group_ids != -1).sum(dim=1)
-        for pair_index in range(half):
-            left_index = pair_index
-            right_index = pair_index + half
-            left_valid = int(valid_lengths[left_index].item())
-            right_valid = int(valid_lengths[right_index].item())
-            if left_valid != right_valid or left_valid == 0:
-                continue
-            if torch.equal(
-                tokens[left_index, :left_valid], tokens[right_index, :right_valid]
-            ):
-                tokens[right_index, 0] = (
-                    (tokens[right_index, 0] - token_low + 1) % token_span
-                ) + token_low
-    return {
-        "tokens": tokens,
-        "group_ids": group_ids,
-        "parent_ids": parent_ids,
-        "input_pos": input_pos,
-        "assistant_mask": assistant_mask,
-        "logprobs": logprobs,
-        "advantages": advantages,
-        "weights": weights,
-        "pixel_values": [None] * config.num_sequences,
-        "image_grid_thw": [None] * config.num_sequences,
-    }
+    return build_complex_prefix_tree_packed_tensors(config, seed)
 
 
 def _create_packed_tensors(
@@ -1204,7 +1041,11 @@ def _stacked_layers(
         if len(reference_shapes) != 1 or len(candidate_shapes) != 1:
             original_names = original_names_by_group[normalized]
             for original_name, (reference, candidate) in zip(original_names, group):
-                stacked_pairs.append((original_name, reference, candidate))
+                # Keep one synthetic layer axis so layer-averaged comparison
+                # does not treat tensor rows/features as layer entries.
+                stacked_pairs.append(
+                    (original_name, reference.unsqueeze(0), candidate.unsqueeze(0))
+                )
             continue
         stacked_pairs.append(
             (
@@ -1270,7 +1111,7 @@ class VariantRunner:
         if self._sample_valid_lengths_cache is not None:
             return self._sample_valid_lengths_cache
         from art.megatron.context_parallel.builder import (
-            build_shared_prefix_attention_spec,
+            build_prefix_tree_attention_spec,
         )
         from art.preprocessing.pack import packed_tensors_from_dir
 
@@ -1281,7 +1122,7 @@ class VariantRunner:
         parent_ids = packed_tensors["parent_ids"]
         self._sample_valid_lengths_cache = tuple(
             int(
-                build_shared_prefix_attention_spec(
+                build_prefix_tree_attention_spec(
                     group_ids=group_ids[row_index : row_index + 1],
                     parent_ids=parent_ids[row_index : row_index + 1],
                 )
@@ -1361,8 +1202,6 @@ class VariantRunner:
                 if not isinstance(sample_index, int):
                     continue
                 valid_length = int(valid_lengths[sample_index])
-                if valid_length >= sequence_length:
-                    continue
                 row_token_uids = call.get("row_token_uids")
                 if (
                     isinstance(row_token_uids, torch.Tensor)
@@ -1373,9 +1212,7 @@ class VariantRunner:
                         (row_token_uids >= 0) & (local_token_uids < valid_length),
                         as_tuple=False,
                     ).reshape(-1)
-                    if int(keep_rows.numel()) > 0 and int(keep_rows.numel()) < int(
-                        row_token_uids.numel()
-                    ):
+                    if int(keep_rows.numel()) < int(row_token_uids.numel()):
                         call["row_token_uids"] = row_token_uids.index_select(
                             0, keep_rows
                         ).contiguous()
@@ -1394,6 +1231,8 @@ class VariantRunner:
                                     0, keep_rows
                                 ).contiguous()
                         continue
+                if valid_length >= sequence_length:
+                    continue
                 for key in ("primary_output", "router_topk_scores", "router_topk_ids"):
                     tensor = call.get(key)
                     if not isinstance(tensor, torch.Tensor) or tensor.ndim == 0:
@@ -2063,8 +1902,17 @@ class VariantRunner:
     def run_suite(
         self,
         variants: list[VariantSpec],
+        *,
+        prune_reference_artifacts: bool = True,
+        prune_case_artifacts: bool = True,
     ) -> list[VariantReport]:
-        """Runs variants in order and stops at the first unexpected signal."""
+        """Runs variants in order and stops at the first unexpected signal.
+
+        Reference and case artifacts are normally pruned when the suite exits.
+        Callers that immediately run another comparison suite against the same
+        reference can defer that pruning so the second suite does not have to
+        regenerate or fail on missing forward traces.
+        """
         reports: list[VariantReport] = []
         try:
             for variant in variants:
@@ -2078,8 +1926,10 @@ class VariantRunner:
                     / "variant_report.json",
                 )
         finally:
-            self._prune_reference_artifacts()
-            _prune_case_artifacts(self.case_dir)
+            if prune_reference_artifacts:
+                self._prune_reference_artifacts()
+            if prune_case_artifacts:
+                _prune_case_artifacts(self.case_dir)
         return reports
 
 
@@ -2125,13 +1975,18 @@ def _suite_variants(
     objective: OracleObjective,
     *,
     is_moe: bool = True,
+    cp_supported: bool = True,
     max_world_size: int | None = None,
     variant_flex_backend: FlexBackend | None = None,
+    phase_pass_fns: dict[str, PhasePassFn] | None = None,
 ) -> list[VariantSpec]:
     """Builds the standard oracle suite variant ordering."""
-    phase_pass = _default_phase_pass_fns()
+    phase_pass = phase_pass_fns or _default_phase_pass_fns()
     variants: list[VariantSpec] = []
-    for topology in selected_suite_topologies(is_moe=is_moe)[1:]:
+    for topology in selected_suite_topologies(
+        is_moe=is_moe,
+        cp_supported=cp_supported,
+    )[1:]:
         if max_world_size is not None and topology.world_size() > max_world_size:
             continue
         variants.append(
@@ -2152,6 +2007,11 @@ def run_suite(
     max_world_size: int | None = None,
     oracle_flex_backend: FlexBackend | None = None,
     variant_flex_backend: FlexBackend | None = None,
+    cp_supported: bool = True,
+    phase_pass_fns: dict[str, PhasePassFn] | None = None,
+    use_fp32_lora_reference: bool = True,
+    prune_reference_artifacts: bool = True,
+    prune_case_artifacts: bool = True,
 ) -> list[VariantReport]:
     """Runs non-oracle topologies against the canonical replay-backed oracle."""
     reports: list[VariantReport] = []
@@ -2161,15 +2021,20 @@ def run_suite(
             case_config=case_config,
             oracle_flex_backend=oracle_flex_backend,
             variant_flex_backend=variant_flex_backend,
+            use_fp32_lora_reference=use_fp32_lora_reference,
         )
         reports.extend(
             runner.run_suite(
                 _suite_variants(
                     objective,
                     is_moe=case_config.is_moe,
+                    cp_supported=cp_supported,
                     max_world_size=max_world_size,
                     variant_flex_backend=variant_flex_backend,
-                )
+                    phase_pass_fns=phase_pass_fns,
+                ),
+                prune_reference_artifacts=prune_reference_artifacts,
+                prune_case_artifacts=prune_case_artifacts,
             )
         )
     return reports
@@ -2188,12 +2053,6 @@ def run_sensitivity_suite(
     reports: list[VariantReport] = []
     ran_any_variants = False
     for objective in selected_oracle_objectives():
-        runner = VariantRunner(
-            objective=objective,
-            case_config=case_config,
-            oracle_flex_backend=oracle_flex_backend,
-            variant_flex_backend=variant_flex_backend,
-        )
         objective_mutations = selected_sensitivity_mutations_for_objective(
             objective,
             mutations,
@@ -2201,29 +2060,91 @@ def run_sensitivity_suite(
         )
         if not objective_mutations:
             continue
-        variants = []
-        for mutation in objective_mutations:
-            topology = sensitivity_topology_for_mutation(
-                mutation,
-                is_moe=case_config.is_moe,
-            )
-            if max_world_size is not None and topology.world_size() > max_world_size:
+        for flex_backend, flex_mutations in (
+            (
+                None,
+                [
+                    mutation
+                    for mutation in objective_mutations
+                    if mutation != "attn_skip_flash_lse_normalize"
+                ],
+            ),
+            (
+                "FLASH",
+                [
+                    mutation
+                    for mutation in objective_mutations
+                    if mutation == "attn_skip_flash_lse_normalize"
+                ],
+            ),
+        ):
+            if not flex_mutations:
                 continue
-            variants.append(
-                VariantSpec(
-                    name=f"{objective}_sensitivity_{mutation}",
-                    objective=objective,
-                    topology=topology,
-                    mutation=mutation,
-                    expected_signal="fail",
-                    pass_fn_by_phase=phase_pass,
-                    flex_backend=variant_flex_backend,
+            oracle_slug = (
+                None
+                if flex_backend is None
+                else oracle_output_slug(
+                    objective,
+                    oracle_topology(is_moe=case_config.is_moe),
+                    "flash",
                 )
             )
-        if not variants:
-            continue
-        ran_any_variants = True
-        reports.extend(runner.run_suite(variants))
+            runner_case_config = (
+                case_config
+                if flex_backend is None or case_config.precision == "bf16"
+                else case_config.model_copy(update={"precision": "bf16"})
+            )
+            runner = VariantRunner(
+                objective=objective,
+                case_config=runner_case_config,
+                oracle_flex_backend=(
+                    oracle_flex_backend if flex_backend is None else flex_backend
+                ),
+                variant_flex_backend=(
+                    variant_flex_backend if flex_backend is None else flex_backend
+                ),
+                oracle_slug_override=oracle_slug,
+            )
+            variants = []
+            for mutation in flex_mutations:
+                topology = sensitivity_topology_for_mutation(
+                    mutation,
+                    is_moe=runner_case_config.is_moe,
+                )
+                if (
+                    max_world_size is not None
+                    and topology.world_size() > max_world_size
+                ):
+                    continue
+                variants.append(
+                    VariantSpec(
+                        name=f"{objective}_sensitivity_{mutation}",
+                        objective=objective,
+                        topology=topology,
+                        output_slug=(
+                            None
+                            if flex_backend is None
+                            else oracle_output_slug(
+                                objective,
+                                topology,
+                                f"{mutation}_flash",
+                            )
+                        ),
+                        reference_slug=oracle_slug,
+                        mutation=mutation,
+                        expected_signal="fail",
+                        pass_fn_by_phase=phase_pass,
+                        flex_backend=(
+                            variant_flex_backend
+                            if flex_backend is None
+                            else flex_backend
+                        ),
+                    )
+                )
+            if not variants:
+                continue
+            ran_any_variants = True
+            reports.extend(runner.run_suite(variants))
     if ran_any_variants:
         return reports
     requested = ", ".join(mutations)

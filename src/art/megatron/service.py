@@ -8,6 +8,7 @@ import shutil
 import socket
 import sys
 from typing import Any, AsyncIterator, Literal, TypedDict, cast
+from urllib.parse import urlparse
 import warnings
 
 from peft.tuners.lora.config import LoraConfig
@@ -31,6 +32,10 @@ from ..utils.output_dirs import get_step_checkpoint_dir
 from ..vllm_runtime import (
     ManagedVllmRuntime,
     VllmRuntimeLaunchConfig,
+    get_external_vllm_runtime_config,
+    map_checkpoint_path_for_vllm,
+    normalize_vllm_server_url,
+    wait_for_vllm_http_runtime,
 )
 from .lora import (
     LORA_ALPHA,
@@ -242,14 +247,22 @@ class MegatronService:
 
     @property
     def _vllm_base_url(self) -> str:
+        if external_runtime := get_external_vllm_runtime_config(self.config):
+            return normalize_vllm_server_url(external_runtime.server_url)
         return self._vllm_runtime.base_url
 
     @property
     def _vllm_host(self) -> str:
+        if external_runtime := get_external_vllm_runtime_config(self.config):
+            parsed = urlparse(normalize_vllm_server_url(external_runtime.server_url))
+            return parsed.hostname or self._vllm_runtime.host
         return self._vllm_runtime.host
 
     @property
     def _vllm_port(self) -> int:
+        if external_runtime := get_external_vllm_runtime_config(self.config):
+            parsed = urlparse(normalize_vllm_server_url(external_runtime.server_url))
+            return parsed.port or (443 if parsed.scheme == "https" else 80)
         return self._vllm_runtime.port
 
     @_vllm_port.setter
@@ -258,6 +271,8 @@ class MegatronService:
 
     @property
     def _vllm_api_key(self) -> str | None:
+        if external_runtime := get_external_vllm_runtime_config(self.config):
+            return external_runtime.api_key
         return self._vllm_runtime.api_key
 
     @property
@@ -391,9 +406,19 @@ class MegatronService:
     def _runtime_engine_args(
         self, config: dev.OpenAIServerConfig | None
     ) -> dict[str, object]:
+        from .model_support import get_model_support_handler
+
         engine_args = dict(self.config.get("engine_args", {}))
         if config and "engine_args" in config:
             engine_args.update(dict(config["engine_args"]))
+        handler = get_model_support_handler(
+            self.base_model,
+            allow_unvalidated_arch=self._allow_unvalidated_arch,
+        )
+        for key, value in handler.vllm_engine_args(
+            rollout_weights_mode=self.rollout_weights_mode
+        ).items():
+            engine_args.setdefault(key, value)
         engine_args.setdefault("generation_config", "vllm")
         if self.rollout_weights_mode == "merged":
             engine_args["weight_transfer_config"] = {"backend": "nccl"}
@@ -409,11 +434,18 @@ class MegatronService:
     def _runtime_server_args(
         self, config: dev.OpenAIServerConfig | None
     ) -> dict[str, object]:
+        from .model_support import get_model_support_handler
+
         server_args: dict[str, object] = {
             "return_tokens_as_token_ids": True,
             "enable_auto_tool_choice": True,
             "tool_call_parser": "hermes",
         }
+        handler = get_model_support_handler(
+            self.base_model,
+            allow_unvalidated_arch=self._allow_unvalidated_arch,
+        )
+        server_args.update(handler.vllm_server_args())
         if config and "server_args" in config:
             server_args.update(dict(config["server_args"]))
         for key in ("port", "host", "lora_modules"):
@@ -428,6 +460,9 @@ class MegatronService:
     def _runtime_request_kwargs(self) -> _RuntimeRequestKwargs:
         headers = self._runtime_headers()
         return {"headers": headers} if headers else {}
+
+    def _vllm_checkpoint_path(self, checkpoint_path: str) -> str:
+        return map_checkpoint_path_for_vllm(self.config, checkpoint_path)
 
     def _sleep_mode_enabled(self) -> bool:
         return bool(self.config.get("engine_args", {}).get("enable_sleep_mode", True))
@@ -607,7 +642,7 @@ class MegatronService:
                 f"{self._vllm_base_url}/v1/load_lora_adapter",
                 json={
                     "lora_name": f"{self.model_name}@{step}",
-                    "lora_path": checkpoint_path,
+                    "lora_path": self._vllm_checkpoint_path(checkpoint_path),
                     "load_inplace": True,
                 },
                 **self._runtime_request_kwargs(),
@@ -892,12 +927,28 @@ class MegatronService:
     ) -> tuple[str, int]:
         self._raise_if_child_failed()
         lora_path = self._resolve_active_lora_path()
+        external_runtime = get_external_vllm_runtime_config(self.config)
 
         if not self.is_dedicated and not self._sleep_mode_enabled():
             raise ValueError(
                 "Shared-GPU mode requires engine_args.enable_sleep_mode=True "
                 "for the external vLLM runtime"
             )
+
+        if external_runtime is not None:
+            if self.rollout_weights_mode != "lora":
+                raise RuntimeError(
+                    "External vLLM runtime requires LoRA rollout weights"
+                )
+            await wait_for_vllm_http_runtime(
+                base_url=self._vllm_base_url,
+                timeout=external_runtime.health_timeout_s,
+                headers=self._runtime_headers(),
+            )
+            await self._reload_adapter(lora_path, self._latest_step)
+            self._loaded_adapter_steps.add(self._latest_step)
+            self._status(f"External vLLM runtime is ready at {self._vllm_base_url}")
+            return self._vllm_host, self._vllm_port
 
         port = (config or {}).get("server_args", {}).get("port", 8000)
         location = await self._start_vllm_subprocess(lora_path, port, config)

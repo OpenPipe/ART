@@ -7,12 +7,14 @@ import torch
 from torch import Tensor
 import torch.nn.functional as F
 
+from art.megatron.gdn.gdn_prefix_tree import GdnPackedExecutionSpec, GdnSegmentSpec
+
 from .metrics import (
     mean_abs_pct,
     parameter_grad_mean_abs_pct_with_name,
     stable_output_mse_loss,
 )
-from .parser_import import parse_gdn_shared_prefix_segments
+from .parser_import import parse_gdn_prefix_tree_segments
 
 
 class ToyGdnConfig(BaseModel):
@@ -35,7 +37,7 @@ class ToyStatefulGdn(torch.nn.Module):
     """Small stateful block used to validate oracle mechanics on CPU.
 
     This is not a GDN approximation. It deliberately has the two state classes
-    that make GDN shared-prefix execution non-trivial: a finite conv tail and a
+    that make GDN prefix-tree execution non-trivial: a finite conv tail and a
     recurrent state. That is enough to prove parser routing, flattened
     accumulation, and known-bad physical-stream sensitivity before the real FLA
     kernels are invoked.
@@ -107,27 +109,27 @@ def run_toy_packed(
     group_ids: Tensor,
     parent_ids: Tensor,
 ) -> Tensor:
-    spec = parse_gdn_shared_prefix_segments(
-        group_ids, parent_ids, min_completions_per_family=1
-    )
+    spec = parse_gdn_prefix_tree_segments(group_ids, parent_ids)
     output = torch.zeros_like(hidden)
-    for family in spec.families:
-        row = family.row_index
-        prefix_hidden = hidden[row, family.prefix.start : family.prefix.end]
-        prefix_out, prefix_conv, prefix_rec = module.forward_segment(
-            prefix_hidden,
-            conv_initial=module.zero_conv_state(hidden),
-            recurrent_initial=module.zero_recurrent_state(hidden),
+    conv_states: list[Tensor] = []
+    rec_states: list[Tensor] = []
+    for segment_index, segment in enumerate(spec.tree_segments):
+        row = segment.row_index
+        parent_index = spec.tree_parent_indices[segment_index]
+        if parent_index < 0:
+            conv_initial = module.zero_conv_state(hidden)
+            rec_initial = module.zero_recurrent_state(hidden)
+        else:
+            conv_initial = conv_states[parent_index]
+            rec_initial = rec_states[parent_index]
+        segment_out, conv_final, rec_final = module.forward_segment(
+            hidden[row, segment.start : segment.end],
+            conv_initial=conv_initial,
+            recurrent_initial=rec_initial,
         )
-        output[row, family.prefix.start : family.prefix.end] = prefix_out
-        for completion in family.completions:
-            suffix_hidden = hidden[row, completion.start : completion.end]
-            suffix_out, _, _ = module.forward_segment(
-                suffix_hidden,
-                conv_initial=prefix_conv,
-                recurrent_initial=prefix_rec,
-            )
-            output[row, completion.start : completion.end] = suffix_out
+        output[row, segment.start : segment.end] = segment_out
+        conv_states.append(conv_final)
+        rec_states.append(rec_final)
     return output
 
 
@@ -138,28 +140,34 @@ def run_toy_flattened_reference(
     group_ids: Tensor,
     parent_ids: Tensor,
 ) -> Tensor:
-    spec = parse_gdn_shared_prefix_segments(
-        group_ids, parent_ids, min_completions_per_family=1
-    )
+    spec = parse_gdn_prefix_tree_segments(group_ids, parent_ids)
     output = torch.zeros_like(hidden)
-    for family in spec.families:
-        row = family.row_index
-        prefix_hidden = hidden[row, family.prefix.start : family.prefix.end]
-        prefix_len = family.prefix.length
-        for child_index, completion in enumerate(family.completions):
-            suffix_hidden = hidden[row, completion.start : completion.end]
-            flattened = torch.cat([prefix_hidden, suffix_hidden], dim=0)
-            flat_out, _, _ = module.forward_segment(
-                flattened,
-                conv_initial=module.zero_conv_state(hidden),
-                recurrent_initial=module.zero_recurrent_state(hidden),
-            )
-            if child_index == 0:
-                output[row, family.prefix.start : family.prefix.end] = flat_out[
-                    :prefix_len
-                ]
-            output[row, completion.start : completion.end] = flat_out[prefix_len:]
+    for segment_index, segment in enumerate(spec.tree_segments):
+        path = _segment_path(spec, segment_index)
+        flattened = torch.cat(
+            [hidden[node.row_index, node.start : node.end] for node in path],
+            dim=0,
+        )
+        flat_out, _, _ = module.forward_segment(
+            flattened,
+            conv_initial=module.zero_conv_state(hidden),
+            recurrent_initial=module.zero_recurrent_state(hidden),
+        )
+        segment_len = segment.length
+        output[segment.row_index, segment.start : segment.end] = flat_out[-segment_len:]
     return output
+
+
+def _segment_path(
+    spec: GdnPackedExecutionSpec,
+    segment_index: int,
+) -> tuple[GdnSegmentSpec, ...]:
+    indices = []
+    cursor = segment_index
+    while cursor >= 0:
+        indices.append(cursor)
+        cursor = spec.tree_parent_indices[cursor]
+    return tuple(spec.tree_segments[index] for index in reversed(indices))
 
 
 def run_toy_physical_stream(

@@ -9,7 +9,7 @@ import pytest
 torch = pytest.importorskip("torch")
 
 from art.megatron.flex_attn.attention import FlexAttentionWrapper
-from art.megatron.shared_prefix_state import create_shared_prefix_state
+from art.megatron.prefix_tree_state import create_prefix_tree_state
 from tests.integration.megatron.gdn_shared_prefix.cases import default_phase0_cases
 from tests.integration.megatron.gdn_shared_prefix.metrics import (
     GDN_CORRECTNESS_DTYPE,
@@ -22,7 +22,7 @@ from tests.integration.megatron.gdn_shared_prefix.packed_layout import (
     build_phase0_packed_tensors,
 )
 from tests.integration.megatron.gdn_shared_prefix.parser_import import (
-    parse_gdn_shared_prefix_segments,
+    parse_gdn_prefix_tree_segments,
 )
 from tests.integration.megatron.model_support.oracle_harness import (
     TEST_DEFAULT_FLEX_BACKEND,
@@ -51,25 +51,23 @@ def _fp32_test_flex_backend():
 
 @pytest.mark.skipif(
     not torch.cuda.is_available(),
-    reason="CUDA is required for compiled flex-attention shared-prefix coverage.",
+    reason="CUDA is required for compiled flex-attention prefix-tree coverage.",
 )
-def test_shared_prefix_attention_matches_flattened_grad_accumulation() -> None:
+def test_prefix_tree_attention_matches_flattened_grad_accumulation() -> None:
     case = next(
         item for item in default_phase0_cases() if item.name == "multi_family_repeated"
     )
     tensors = build_phase0_packed_tensors(case)
     group_ids = tensors["group_ids"].cuda()
     parent_ids = tensors["parent_ids"].cuda()
-    spec = parse_gdn_shared_prefix_segments(
-        group_ids.cpu(), parent_ids.cpu(), min_completions_per_family=1
-    )
+    spec = parse_gdn_prefix_tree_segments(group_ids.cpu(), parent_ids.cpu())
     q, k, v = _attention_inputs(group_ids.shape, seed=20260425)
     q_ref = q.detach().clone().requires_grad_(True)
     k_ref = k.detach().clone().requires_grad_(True)
     v_ref = v.detach().clone().requires_grad_(True)
     output_grad = _packed_output_grad(spec, q.shape, seed=20260426)
 
-    attention_state = create_shared_prefix_state(group_ids, parent_ids)
+    attention_state = create_prefix_tree_state(group_ids, parent_ids)
     packed_out = FlexAttentionWrapper()(
         q,
         k,
@@ -82,40 +80,19 @@ def test_shared_prefix_attention_matches_flattened_grad_accumulation() -> None:
 
     ref_out = torch.zeros_like(packed_out)
     ref_loss = q_ref.new_zeros(())
-    for family in spec.families:
-        prefix = family.prefix
-        prefix_grad_used = False
-        for completion in family.completions:
-            indices = torch.tensor(
-                [
-                    *range(prefix.start, prefix.end),
-                    *range(completion.start, completion.end),
-                ],
-                device=q.device,
-                dtype=torch.long,
-            )
-            row = family.row_index
-            q_slice = q_ref[row : row + 1].index_select(2, indices)
-            k_slice = k_ref[row : row + 1].index_select(2, indices)
-            v_slice = v_ref[row : row + 1].index_select(2, indices)
-            flat_out = _dense_causal_attention(q_slice, k_slice, v_slice)
+    for segment_index, segment in enumerate(spec.tree_segments):
+        indices, output_slice = _segment_context_positions(spec, segment_index)
+        index_tensor = torch.tensor(indices, device=q.device, dtype=torch.long)
+        row = segment.row_index
+        q_slice = q_ref[row : row + 1].index_select(2, index_tensor)
+        k_slice = k_ref[row : row + 1].index_select(2, index_tensor)
+        v_slice = v_ref[row : row + 1].index_select(2, index_tensor)
+        flat_out = _dense_causal_attention(q_slice, k_slice, v_slice)
 
-            ref_out[row, :, completion.start : completion.end] = flat_out[
-                0, :, prefix.length :
-            ]
-            flat_grad = torch.zeros_like(flat_out)
-            flat_grad[0, :, prefix.length :] = output_grad[
-                row, :, completion.start : completion.end
-            ]
-            if not prefix_grad_used:
-                ref_out[row, :, prefix.start : prefix.end] = flat_out[
-                    0, :, : prefix.length
-                ]
-                flat_grad[0, :, : prefix.length] = output_grad[
-                    row, :, prefix.start : prefix.end
-                ]
-                prefix_grad_used = True
-            ref_loss = ref_loss + (flat_out * flat_grad).sum()
+        ref_out[row, :, segment.start : segment.end] = flat_out[0, :, output_slice]
+        flat_grad = torch.zeros_like(flat_out)
+        flat_grad[0, :, output_slice] = output_grad[row, :, segment.start : segment.end]
+        ref_loss = ref_loss + (flat_out * flat_grad).sum()
     ref_loss.backward()
 
     real_mask = _real_token_mask(spec, q.shape, device=q.device)
@@ -133,7 +110,7 @@ def test_shared_prefix_attention_matches_flattened_grad_accumulation() -> None:
 
 @pytest.mark.skipif(
     not torch.cuda.is_available(),
-    reason="CUDA is required for compiled flex-attention shared-prefix coverage.",
+    reason="CUDA is required for compiled flex-attention prefix-tree coverage.",
 )
 def test_physical_causal_attention_leaks_across_siblings() -> None:
     case = next(
@@ -142,11 +119,9 @@ def test_physical_causal_attention_leaks_across_siblings() -> None:
     tensors = build_phase0_packed_tensors(case)
     group_ids = tensors["group_ids"].cuda()
     parent_ids = tensors["parent_ids"].cuda()
-    spec = parse_gdn_shared_prefix_segments(
-        group_ids.cpu(), parent_ids.cpu(), min_completions_per_family=1
-    )
+    spec = parse_gdn_prefix_tree_segments(group_ids.cpu(), parent_ids.cpu())
     q, k, v = _attention_inputs(group_ids.shape, seed=20260427)
-    attention_state = create_shared_prefix_state(group_ids, parent_ids)
+    attention_state = create_prefix_tree_state(group_ids, parent_ids)
     packed_out = FlexAttentionWrapper()(
         q,
         k,
@@ -225,11 +200,27 @@ def _completion_token_mask(
     spec: Any, shape: torch.Size, *, device: torch.device
 ) -> torch.Tensor:
     mask = torch.zeros(shape, device=device, dtype=torch.bool)
-    for family in spec.families:
-        for completion in family.completions:
-            mask[
-                family.row_index,
-                :,
-                completion.start : completion.end,
-            ] = True
+    for index, segment in enumerate(spec.tree_segments):
+        if spec.tree_parent_indices[index] >= 0:
+            mask[segment.row_index, :, segment.start : segment.end] = True
     return mask
+
+
+def _segment_context_positions(
+    spec: Any, segment_index: int
+) -> tuple[list[int], slice]:
+    path = []
+    cursor = segment_index
+    while cursor >= 0:
+        path.append(cursor)
+        cursor = spec.tree_parent_indices[cursor]
+    path.reverse()
+    positions = [
+        position
+        for index in path
+        for position in range(
+            spec.tree_segments[index].start, spec.tree_segments[index].end
+        )
+    ]
+    segment_length = spec.tree_segments[segment_index].length
+    return positions, slice(len(positions) - segment_length, len(positions))

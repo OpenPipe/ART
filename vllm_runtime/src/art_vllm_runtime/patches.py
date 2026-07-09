@@ -1,6 +1,7 @@
 """Monkey patches and bootstrap contract for the ART-owned vLLM runtime."""
 
 import ctypes
+import importlib
 import inspect
 import logging
 from typing import Any
@@ -11,6 +12,7 @@ logger = logging.getLogger(__name__)
 
 
 def apply_vllm_runtime_patches() -> None:
+    from art_vllm_runtime.dsv4_patches import apply_dsv4_vllm_runtime_patches
     from art_vllm_runtime.gemma4_moe_lora_patch import (
         patch_gemma4_moe_lora_support,
     )
@@ -21,6 +23,7 @@ def apply_vllm_runtime_patches() -> None:
     patch_listen_for_disconnect()
     patch_tool_parser_manager()
     patch_nccl_unique_id_bootstrap()
+    apply_dsv4_vllm_runtime_patches()
     patch_art_lora_delta_weight_update()
     patch_gemma4_checkpoint_weight_update_reload()
     patch_routed_experts_prefix_cache_sidecar()
@@ -65,8 +68,6 @@ def _patch_gemma4_moe_experts_per_tok_alias() -> None:
         return
 
     def num_experts_per_tok(self: Any) -> Any:
-        # vLLM's routed-expert sidecar uses the Mistral MoE field name, while
-        # HF Gemma4 stores the same router top-k value as top_k_experts.
         return self.top_k_experts
 
     Gemma4TextConfig.num_experts_per_tok = property(num_experts_per_tok)  # type: ignore[attr-defined]
@@ -91,7 +92,10 @@ def subclass_chat_completion_request() -> None:
 
 
 def patch_listen_for_disconnect() -> None:
-    from vllm.entrypoints.serve.utils import api_utils
+    try:
+        api_utils = importlib.import_module("vllm.entrypoints.serve.utils.api_utils")
+    except ModuleNotFoundError:
+        api_utils = importlib.import_module("vllm.entrypoints.utils")
 
     if getattr(api_utils, "_art_listen_for_disconnect_patched", False):
         return
@@ -224,10 +228,6 @@ def patch_gemma4_checkpoint_weight_update_reload() -> None:
                 "start_weight_update called while a weight update is "
                 "already active. Call finish_weight_update first."
             )
-        # vLLM's layerwise checkpoint reload corrupts Gemma4 after reloading
-        # the original checkpoint. Direct model.load_weights keeps the update
-        # path identical to initial checkpoint loading while preserving the
-        # streaming NCCL transfer used by ART merged serving.
         self._is_checkpoint_format = True
         self._weight_update_active = True
 
@@ -372,15 +372,10 @@ def patch_routed_experts_prefix_cache_sidecar() -> None:
     if getattr(routed_experts_capturer, "_art_prefix_route_sidecar_patched", False):
         return
 
-    if hasattr(routed_experts_capturer, "RoutedExpertsManager"):
-        # vLLM 0.23 stores routed experts by physical KV-cache slot, so prefix
-        # cache hits recover routes from the shared slot buffer without ART's
-        # old per-request host-cache sidecar.
-        setattr(routed_experts_capturer, "_art_prefix_route_sidecar_patched", True)
+    host_cls = getattr(routed_experts_capturer, "_RoutedExpertsHostCache", None)
+    capturer_cls = getattr(routed_experts_capturer, "_RoutedExpertsCapturerReal", None)
+    if host_cls is None or capturer_cls is None:
         return
-
-    host_cls = routed_experts_capturer._RoutedExpertsHostCache
-    capturer_cls = routed_experts_capturer._RoutedExpertsCapturerReal
 
     original_host_init = host_cls.__init__
     original_get_or_grow_buffer = host_cls.get_or_grow_buffer

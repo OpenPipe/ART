@@ -6,6 +6,7 @@ from pydantic import BaseModel, Field
 
 import art
 from art.local import LocalBackend
+from art.local.backend import _tokenizer_cache_key
 from art.preprocessing.pack import PackedTensors
 from art.preprocessing.tokenize import (
     TokenizedResult,
@@ -13,6 +14,7 @@ from art.preprocessing.tokenize import (
     _messages_for_chat_template,
     tokenize_trajectory,
     tokenize_trajectory_groups,
+    tokenize_vllm_trajectory_histories,
 )
 from art.trajectories import History
 from tests.support.chat_template_conformance_cases import (
@@ -101,12 +103,18 @@ def run_chat_template_rollout(base_model: str) -> ChatTemplateRolloutReport:
         base_model=base_model,
         _internal_config={"init_args": {"max_seq_length": 2048}},
     )
-    tokenizer_key = (base_model, None)
+    internal_config = model._internal_config
+    assert internal_config is not None
+    tokenizer_key = _tokenizer_cache_key(base_model, internal_config)
     tokenizer = backend._tokenizers.get(tokenizer_key)
     if tokenizer is None:
         from transformers import AutoTokenizer
 
-        tokenizer = AutoTokenizer.from_pretrained(base_model)
+        tokenizer = backend._configure_training_tokenizer(
+            AutoTokenizer.from_pretrained(base_model),
+            model=model,
+            internal_config=internal_config,
+        )
         backend._tokenizers[tokenizer_key] = tokenizer
 
     inputs = build_chat_template_conformance_inputs(tokenizer)
@@ -124,27 +132,31 @@ def run_chat_template_rollout(base_model: str) -> ChatTemplateRolloutReport:
         )
     )
 
-    non_final_tool_call_base = tokenize_trajectory(
+    non_final_tool_call_base_results = tokenize_vllm_trajectory_histories(
         tokenizer=tokenizer,
-        image_processor=None,
-        history=_history(inputs.non_final_tool_call_base),
+        histories=[_history(inputs.non_final_tool_call_base)],
         advantage=1.0,
         allow_training_without_logprobs=False,
         trajectory=inputs.non_final_tool_call_base,
     )
-    non_final_tool_call_mutated = tokenize_trajectory(
+    non_final_tool_call_mutated_results = tokenize_vllm_trajectory_histories(
         tokenizer=tokenizer,
-        image_processor=None,
-        history=_history(inputs.non_final_tool_call_mutated),
+        histories=[_history(inputs.non_final_tool_call_mutated)],
         advantage=1.0,
         allow_training_without_logprobs=False,
         trajectory=inputs.non_final_tool_call_mutated,
     )
-    if non_final_tool_call_base is None or non_final_tool_call_mutated is None:
+    if not non_final_tool_call_base_results or not non_final_tool_call_mutated_results:
         raise RuntimeError("tool-call tokenization produced no trainable tokens")
+    non_final_tool_call_base = non_final_tool_call_base_results[-1]
+    non_final_tool_call_mutated = non_final_tool_call_mutated_results[-1]
     if (
-        len(non_final_tool_call_base.choice_offsets) < 2
-        or len(non_final_tool_call_mutated.choice_offsets) < 2
+        sum(len(result.choice_offsets) for result in non_final_tool_call_base_results)
+        < 2
+        or sum(
+            len(result.choice_offsets) for result in non_final_tool_call_mutated_results
+        )
+        < 2
     ):
         raise RuntimeError("expected non-final tool call and final assistant answer")
     non_final_tool_call_prefix_changed = _assistant_prefix_tokens(
@@ -157,10 +169,17 @@ def run_chat_template_rollout(base_model: str) -> ChatTemplateRolloutReport:
     scenarios.append(
         ChatTemplateScenarioReport(
             name="rl_non_final_tool_call_prefill_mutation",
-            entrypoint="tokenize_trajectory",
+            entrypoint="tokenize_vllm_trajectory_histories",
             passed=non_final_tool_call_prefix_changed
-            and int(sum(non_final_tool_call_base.assistant_mask)) > 0,
-            assistant_token_count=int(sum(non_final_tool_call_base.assistant_mask)),
+            and sum(
+                int(sum(result.assistant_mask))
+                for result in non_final_tool_call_base_results
+            )
+            > 0,
+            assistant_token_count=sum(
+                int(sum(result.assistant_mask))
+                for result in non_final_tool_call_base_results
+            ),
             mutation_changed_prompt=non_final_tool_call_prefix_changed,
         )
     )

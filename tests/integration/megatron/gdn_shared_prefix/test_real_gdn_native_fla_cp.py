@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 from pathlib import Path
-import socket
 from typing import cast
 
 import pytest
@@ -22,11 +21,12 @@ from megatron.core.tensor_parallel.random import (  # noqa: E402
 from torch.distributed import destroy_process_group, init_process_group  # noqa: E402
 import torch.multiprocessing as mp  # noqa: E402
 
-from art.megatron.gdn.gdn_shared_prefix import (  # noqa: E402
+from art.megatron.context_parallel.layout_index import TokenLayoutIndex  # noqa: E402
+from art.megatron.gdn.gdn_prefix_tree import (  # noqa: E402
     GdnPlannerConfig,
     GdnSegmentBucketPlan,
     build_gdn_rank_execution_plan,
-    parse_gdn_shared_prefix_segments,
+    parse_gdn_prefix_tree_segments,
 )
 from art.megatron.gdn.operator import (  # noqa: E402
     _project_gdn_inputs,
@@ -37,6 +37,7 @@ from art.megatron.gdn.operator import (  # noqa: E402
 )
 
 from .cases import GdnFamilyShape, GdnPackedRowShape, GdnPhase0Case  # noqa: E402
+from .distributed_init import file_init_method  # noqa: E402
 from .metrics import (  # noqa: E402
     GDN_CORRECTNESS_DTYPE,
     MEAN_ABS_PCT_THRESHOLD,
@@ -70,10 +71,10 @@ _CP_SIZES = (
 def test_real_qwen35_gdn_native_fla_cp_prepared_varlen_batch_matches_single_rank(
     cp_size: int, tmp_path: Path
 ) -> None:
-    port = _find_free_port()
+    init_method = file_init_method(tmp_path, f"native_gdn_prepared_cp{cp_size}")
     mp.spawn(
         _native_gdn_cp_prepared_varlen_worker,
-        args=(cp_size, port, str(tmp_path)),
+        args=(cp_size, init_method, str(tmp_path)),
         nprocs=cp_size,
         join=True,
     )
@@ -89,10 +90,10 @@ def test_real_qwen35_gdn_native_fla_cp_prepared_varlen_batch_matches_single_rank
 def test_real_qwen35_gdn_native_cp_packed_layer_matches_cp1(
     cp_size: int, tmp_path: Path
 ) -> None:
-    port = _find_free_port()
+    init_method = file_init_method(tmp_path, f"native_gdn_packed_cp{cp_size}")
     mp.spawn(
         _native_gdn_cp_packed_layer_worker,
-        args=(cp_size, port, str(tmp_path)),
+        args=(cp_size, init_method, str(tmp_path)),
         nprocs=cp_size,
         join=True,
     )
@@ -103,13 +104,13 @@ def test_real_qwen35_gdn_native_cp_packed_layer_matches_cp1(
 def _native_gdn_cp_packed_layer_worker(
     rank: int,
     cp_size: int,
-    port: int,
+    init_method: str,
     output_dir: str,
 ) -> None:
     torch.cuda.set_device(rank)
     init_process_group(
         backend="nccl",
-        init_method=f"tcp://127.0.0.1:{port}",
+        init_method=init_method,
         rank=rank,
         world_size=cp_size,
     )
@@ -127,29 +128,18 @@ def _native_gdn_cp_packed_layer_worker(
         tensors = build_phase0_packed_tensors(case)
         group_ids = tensors["group_ids"].cuda()
         parent_ids = tensors["parent_ids"].cuda()
-        spec = parse_gdn_shared_prefix_segments(
-            group_ids, parent_ids, min_completions_per_family=0
-        )
+        spec = parse_gdn_prefix_tree_segments(group_ids, parent_ids)
         plan = build_gdn_rank_execution_plan(
             spec,
             device=group_ids.device,
             cp_rank=rank,
             cp_size=cp_size,
-            planner_config=GdnPlannerConfig(
-                cp_chain_min_tokens_per_rank=16,
-                cp_chain_min_total_tokens=128,
-                cp_chain_min_prefix_only_tokens=128,
-                # This test is the native chain correctness guard, so force the
-                # planner onto chain prefix and completion buckets.
-                planner_chain_bucket_ms=0.0,
-                planner_chain_token_ms=0.0,
-                planner_local_bucket_ms=1.0,
-                planner_local_token_ms=1.0,
-                cp_chain_min_score_delta_ms=0.0,
+            attention_token_layout_index=_uniform_attention_layout(
+                spec.real_token_count, cp_size
             ),
+            planner_config=GdnPlannerConfig(),
         )
-        assert plan.chain_prefix_buckets
-        assert plan.chain_completion_buckets
+        assert any(plan.tree_chain_buckets_by_depth)
         hidden, output_grad = _packed_hidden_and_grad(case, cp_size)
         ref_hidden = hidden.clone().detach().requires_grad_(True)
         ref_out, _ = run_gdn_layer(
@@ -215,13 +205,13 @@ def _native_gdn_cp_packed_layer_worker(
 def _native_gdn_cp_prepared_varlen_worker(
     rank: int,
     cp_size: int,
-    port: int,
+    init_method: str,
     output_dir: str,
 ) -> None:
     torch.cuda.set_device(rank)
     init_process_group(
         backend="nccl",
-        init_method=f"tcp://127.0.0.1:{port}",
+        init_method=init_method,
         rank=rank,
         world_size=cp_size,
     )
@@ -465,6 +455,21 @@ def _packed_hidden_and_grad(
     return hidden, output_grad
 
 
+def _uniform_attention_layout(real_token_count: int, cp_size: int) -> TokenLayoutIndex:
+    ranges_by_rank: list[tuple[tuple[int, int, int], ...]] = []
+    for rank in range(cp_size):
+        start = (int(real_token_count) * rank) // cp_size
+        end = (int(real_token_count) * (rank + 1)) // cp_size
+        ranges_by_rank.append(((start, end, 0),) if end > start else ())
+    return TokenLayoutIndex(
+        ownership_ranges_by_rank=tuple(ranges_by_rank),
+        token_counts_by_rank=tuple(
+            sum(end - start for start, end, _position in ranges)
+            for ranges in ranges_by_rank
+        ),
+    )
+
+
 def _varlen_hidden_and_lengths(cp_size: int) -> tuple[torch.Tensor, torch.Tensor]:
     device = torch.device("cuda")
     lengths = torch.tensor((512, 1024, 1536), device=device, dtype=torch.long)
@@ -492,8 +497,25 @@ def _varlen_bucket(
     cu_seqlens_cpu = torch.cat(
         [lengths_cpu.new_zeros(1), torch.cumsum(lengths_cpu, dim=0)]
     )
-    offsets = torch.arange(max_len, device=device, dtype=torch.long).unsqueeze(1)
-    real_mask = offsets < lengths.unsqueeze(0)
+    row_indices = torch.cat(
+        [
+            torch.full((int(length),), row, device=device, dtype=torch.long)
+            for row, length in enumerate(lengths_cpu.tolist())
+            if int(length) > 0
+        ],
+        dim=0,
+    )
+    position_indices = torch.cat(
+        [
+            torch.arange(int(length), device=device, dtype=torch.long)
+            for length in lengths_cpu.tolist()
+            if int(length) > 0
+        ],
+        dim=0,
+    )
+    real_mask = torch.ones(
+        int(lengths_cpu.sum().item()), device=device, dtype=torch.bool
+    )
     return GdnSegmentBucketPlan(
         length=max_len,
         lengths=lengths,
@@ -502,11 +524,8 @@ def _varlen_bucket(
         real_mask=real_mask,
         cu_seqlens=cu_seqlens_cpu.to(device=device),
         cu_seqlens_cpu=cu_seqlens_cpu,
-        row_indices=torch.arange(int(lengths.numel()), device=device, dtype=torch.long)
-        .unsqueeze(0)
-        .expand(max_len, -1)
-        .contiguous(),
-        position_indices=offsets.expand(-1, int(lengths.numel())).contiguous(),
+        row_indices=row_indices.contiguous(),
+        position_indices=position_indices.contiguous(),
         family_indices=torch.arange(
             int(lengths.numel()), device=device, dtype=torch.long
         ),
@@ -599,9 +618,3 @@ def _all_reduce_parameter_grads(module: torch.nn.Module) -> None:
         main_grad = getattr(parameter, "main_grad", None)
         if main_grad is not None:
             torch.distributed.all_reduce(main_grad)
-
-
-def _find_free_port() -> int:
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
-        sock.bind(("127.0.0.1", 0))
-        return int(sock.getsockname()[1])

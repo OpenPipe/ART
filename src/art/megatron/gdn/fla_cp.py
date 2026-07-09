@@ -187,11 +187,10 @@ class _NativeCpChunkGatedDeltaRule(torch.autograd.Function):
             chunk_indices=chunk_indices,
         )
         summary = _fwd_summary(k=k, w=w, u=u, g=g_cumsum, cu_seqlens=cu_seqlens)
-        gathered_summary = _all_gather_summary(summary, group)
+        prefix_summary = _prefix_summary_exclusive(summary, group)
         local_initial = _scan_fwd_initial_state(
-            gathered_summary,
+            prefix_summary,
             initial_state,
-            rank=dist.get_rank(group),  # ty: ignore[possibly-missing-attribute]
         )
         h, v_new, local_final_state = chunk_gated_delta_rule_fwd_h(
             k=k,
@@ -275,11 +274,12 @@ class _NativeCpChunkGatedDeltaRule(torch.autograd.Function):
             scale=ctx.scale,
             cu_seqlens=ctx.cu_seqlens,
         )
-        gathered_bwd_summary = _all_gather_summary(bwd_summary, ctx.group)
+        suffix_summary, full_bwd_summary = _suffix_summary_exclusive_and_full(
+            bwd_summary, ctx.group
+        )
         local_dht = _scan_bwd_local_final_grad(
-            gathered_bwd_summary,
+            suffix_summary,
             external_dht,
-            rank=dist.get_rank(ctx.group),  # ty: ignore[possibly-missing-attribute]
         )
         dq, dk, dv, db, dg, _dh0, _dA_log, _ddt_bias = chunk_gated_delta_rule_bwd(
             q=q,
@@ -296,7 +296,7 @@ class _NativeCpChunkGatedDeltaRule(torch.autograd.Function):
             chunk_indices=ctx.chunk_indices,
             use_exp2=False,
         )
-        dh0 = _scan_bwd_initial_state_grad(gathered_bwd_summary, external_dht)
+        dh0 = _scan_bwd_initial_state_grad(full_bwd_summary, external_dht)
         return (
             dq.to(q),
             dk.to(k),
@@ -425,25 +425,122 @@ def _bwd_summary(
     return summary
 
 
-def _all_gather_summary(summary: Tensor, group: Any) -> Tensor:
+def _prefix_summary_exclusive(summary: Tensor, group: Any) -> Tensor | None:
+    inclusive = _prefix_summary_inclusive(summary, group)
+    rank = dist.get_rank(group)  # ty: ignore[possibly-missing-attribute]
     world_size = dist.get_world_size(group)  # ty: ignore[possibly-missing-attribute]
-    gathered = torch.empty(
-        world_size,
-        *summary.shape,
-        device=summary.device,
-        dtype=summary.dtype,
+    return _exchange_summary(
+        inclusive,
+        group=group,
+        send_to=rank + 1 if rank + 1 < world_size else None,
+        recv_from=rank - 1 if rank > 0 else None,
     )
-    dist.all_gather_into_tensor(  # ty: ignore[possibly-missing-attribute]
-        gathered, summary.contiguous(), group=group
-    )
-    return gathered
 
 
-def _scan_fwd_initial_state(summaries: Tensor, h0: Tensor, *, rank: int) -> Tensor:
-    multi = summaries.ndim == 5
+def _prefix_summary_inclusive(summary: Tensor, group: Any) -> Tensor:
+    rank = dist.get_rank(group)  # ty: ignore[possibly-missing-attribute]
+    world_size = dist.get_world_size(group)  # ty: ignore[possibly-missing-attribute]
+    aggregate = summary.contiguous()
+    offset = 1
+    while offset < world_size:
+        received = _exchange_summary(
+            aggregate,
+            group=group,
+            send_to=rank + offset if rank + offset < world_size else None,
+            recv_from=rank - offset if rank >= offset else None,
+        )
+        if received is not None:
+            aggregate = _compose_summary(aggregate, received)
+        offset *= 2
+    return aggregate
+
+
+def _suffix_summary_exclusive_and_full(
+    summary: Tensor, group: Any
+) -> tuple[Tensor | None, Tensor]:
+    inclusive = _suffix_summary_inclusive(summary, group)
+    rank = dist.get_rank(group)  # ty: ignore[possibly-missing-attribute]
+    world_size = dist.get_world_size(group)  # ty: ignore[possibly-missing-attribute]
+    exclusive = _exchange_summary(
+        inclusive,
+        group=group,
+        send_to=rank - 1 if rank > 0 else None,
+        recv_from=rank + 1 if rank + 1 < world_size else None,
+    )
+    full = inclusive if rank == 0 else torch.empty_like(summary)
+    dist.broadcast(full, src=0, group=group)  # ty: ignore[possibly-missing-attribute]
+    return exclusive, full
+
+
+def _suffix_summary_inclusive(summary: Tensor, group: Any) -> Tensor:
+    rank = dist.get_rank(group)  # ty: ignore[possibly-missing-attribute]
+    world_size = dist.get_world_size(group)  # ty: ignore[possibly-missing-attribute]
+    aggregate = summary.contiguous()
+    offset = 1
+    while offset < world_size:
+        received = _exchange_summary(
+            aggregate,
+            group=group,
+            send_to=rank - offset if rank >= offset else None,
+            recv_from=rank + offset if rank + offset < world_size else None,
+        )
+        if received is not None:
+            aggregate = _compose_summary(aggregate, received)
+        offset *= 2
+    return aggregate
+
+
+def _exchange_summary(
+    summary: Tensor,
+    *,
+    group: Any,
+    send_to: int | None,
+    recv_from: int | None,
+) -> Tensor | None:
+    world_size = dist.get_world_size(group)  # ty: ignore[possibly-missing-attribute]
+    count = int(summary.numel())
+    input_splits = [0] * world_size
+    output_splits = [0] * world_size
+    if send_to is None:
+        send_buffer = summary.new_empty((0,))
+    else:
+        input_splits[int(send_to)] = count
+        send_buffer = summary.reshape(-1).contiguous()
+    if recv_from is not None:
+        output_splits[int(recv_from)] = count
+    recv_buffer = summary.new_empty((sum(output_splits),))
+    dist.all_to_all_single(  # ty: ignore[possibly-missing-attribute]
+        recv_buffer,
+        send_buffer,
+        output_split_sizes=output_splits,
+        input_split_sizes=input_splits,
+        group=group,
+    )
+    if recv_from is None:
+        return None
+    return recv_buffer.view_as(summary)
+
+
+def _compose_summary(after: Tensor, before: Tensor) -> Tensor:
+    value_dim = int(before.shape[-1]) - int(before.shape[-2])
+    before_he = before[..., :value_dim]
+    before_transition = before[..., value_dim:]
+    after_he = after[..., :value_dim]
+    after_transition = after[..., value_dim:]
+    he = torch.matmul(after_transition.float(), before_he.float()) + after_he.float()
+    transition = torch.matmul(
+        after_transition.float(),
+        before_transition.float(),
+    )
+    return torch.cat((he, transition), dim=-1).contiguous()
+
+
+def _scan_fwd_initial_state(summary: Tensor | None, h0: Tensor) -> Tensor:
+    if summary is None:
+        return h0.float()
+    multi = summary.ndim == 4
     state = h0.float() if multi else h0[0].float()
-    for peer in range(rank):
-        state = _apply_summary(summaries[peer], state)
+    state = _apply_summary(summary, state)
     return state if multi else state.unsqueeze(0)
 
 
@@ -457,23 +554,21 @@ def _broadcast_chain_final_state(final_state: Tensor | None, group: Any) -> Tens
 
 
 def _scan_bwd_local_final_grad(
-    summaries: Tensor,
+    summary: Tensor | None,
     dht: Tensor,
-    *,
-    rank: int,
 ) -> Tensor:
-    multi = summaries.ndim == 5
+    if summary is None:
+        return dht.float()
+    multi = summary.ndim == 4
     state = dht.float() if multi else dht[0].float()
-    for peer in range(int(summaries.shape[0]) - 1, rank, -1):
-        state = _apply_summary(summaries[peer], state)
+    state = _apply_summary(summary, state)
     return state if multi else state.unsqueeze(0)
 
 
-def _scan_bwd_initial_state_grad(summaries: Tensor, dht: Tensor) -> Tensor:
-    multi = summaries.ndim == 5
+def _scan_bwd_initial_state_grad(summary: Tensor, dht: Tensor) -> Tensor:
+    multi = summary.ndim == 4
     state = dht.float() if multi else dht[0].float()
-    for peer in range(int(summaries.shape[0]) - 1, -1, -1):
-        state = _apply_summary(summaries[peer], state)
+    state = _apply_summary(summary, state)
     return state if multi else state.unsqueeze(0)
 
 

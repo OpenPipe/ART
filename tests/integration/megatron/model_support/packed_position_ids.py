@@ -16,7 +16,8 @@ import torch
 
 from art.megatron import train as megatron_train
 from art.megatron.model_support.discovery import inspect_architecture
-from art.megatron.shared_prefix_state import create_shared_prefix_state
+from art.megatron.prefix_tree import parse_prefix_tree_row
+from art.megatron.prefix_tree_state import create_prefix_tree_state
 
 from ..artifacts import GitRepoState, pinned_git_state
 from .oracle_harness import (
@@ -34,10 +35,11 @@ from .oracle_worker import (
     _configure_provider,
     provider_topology_env,
 )
+from .prefix_tree_workloads import build_complex_prefix_tree_packed_tensors
 
 # Qwen3.5/3.6 hybrid MoE runs show small shape-dependent logit drift between
 # the single packed forward and many shorter reference forwards, even when the
-# rotary grouping and shared-prefix semantics are correct. Keep the bound tight,
+# rotary grouping and prefix-tree semantics are correct. Keep the bound tight,
 # but above the observed ~0.13% truncate-case jitter.
 _LOGITS_MEAN_ABS_PCT_LIMIT = 0.2
 _DEBUG_ENV = "ART_PACKED_POSITION_IDS_DEBUG"
@@ -52,6 +54,8 @@ _SINGLE_ROTARY_OUTPUT_HANDLER_KEYS = frozenset(
         "qwen3_moe",
         "qwen3_5_dense",
         "qwen3_5_moe",
+        "dsv4",
+        "gpt_oss_moe",
     }
 )
 _TUPLE_ROTARY_OUTPUT_HANDLER_KEYS = frozenset({"gemma4_dense", "gemma4_moe"})
@@ -283,263 +287,38 @@ def _build_art_realistic_packed_tensors(
     config: PackedTensorConfig,
     seed: int,
 ) -> dict[str, Any]:
-    if config.num_sequences <= 1:
-        raise ValueError("num_sequences must be greater than 1")
-    if config.prefill_tokens < 2:
-        raise ValueError(
-            "prefill_tokens must be at least 2 to build ART-style branch context"
-        )
-    if config.sequence_length < 3:
-        raise ValueError(
-            "sequence_length must leave room for shared prompt, branch context, "
-            "and at least one trainable token"
-        )
-
-    shape = (config.num_sequences, config.sequence_length)
-    generator = torch.Generator().manual_seed(seed)
-    tokens = torch.zeros(shape, dtype=torch.long)
-    group_ids = torch.full(shape, -1, dtype=torch.long)
-    parent_ids = torch.full(shape, -1, dtype=torch.long)
-    input_pos = torch.zeros(shape, dtype=torch.long)
-    assistant_mask = torch.zeros(shape, dtype=torch.bool)
-    logprobs = torch.full(shape, float("nan"), dtype=torch.float32)
-    advantages = torch.zeros(shape, dtype=torch.float32)
-    weights = torch.zeros(shape, dtype=torch.float32)
-
-    first_trainable_pos = max(2, min(config.sequence_length - 1, config.prefill_tokens))
-    shared_prompt_length = first_trainable_pos - 1
-    max_completion_tokens = max(1, config.sequence_length - first_trainable_pos)
-    base_completion_tokens = max(1, min(config.decode_tokens, max_completion_tokens))
-    jitter_width = min(config.decode_tokens_jitter, max_completion_tokens - 1)
-    token_low = 10
-    token_span = max(1, config.vocab_high - token_low)
-
-    def _sample_completion_length() -> int:
-        if jitter_width > 0:
-            jitter = int(
-                torch.randint(
-                    low=-jitter_width,
-                    high=jitter_width + 1,
-                    size=(1,),
-                    generator=generator,
-                    dtype=torch.long,
-                ).item()
-            )
-        else:
-            jitter = 0
-        return max(1, min(max_completion_tokens, base_completion_tokens + jitter))
-
-    def _sample_token_block(length: int) -> torch.Tensor:
-        return torch.randint(
-            low=token_low,
-            high=config.vocab_high,
-            size=(length,),
-            dtype=torch.long,
-            generator=generator,
-        )
-
-    def _sample_logprob_block(length: int) -> torch.Tensor:
-        return (
-            torch.randn((length,), generator=generator, dtype=torch.float32) * 0.25
-            - 1.75
-        )
-
-    def _sample_advantage_value() -> float:
-        return float(
-            (torch.randn((1,), generator=generator, dtype=torch.float32) * 0.5).item()
-        )
-
-    def _write_prompt(
-        sequence_index: int,
-        cursor: int,
-        prompt_group_id: int,
-    ) -> tuple[int, int]:
-        prompt_tokens = _sample_token_block(first_trainable_pos)
-        prompt_end = cursor + shared_prompt_length
-        tokens[sequence_index, cursor:prompt_end] = prompt_tokens[:shared_prompt_length]
-        group_ids[sequence_index, cursor:prompt_end] = prompt_group_id
-        parent_ids[sequence_index, cursor:prompt_end] = prompt_group_id
-        input_pos[sequence_index, cursor:prompt_end] = torch.arange(
-            shared_prompt_length,
-            dtype=torch.long,
-        )
-        return prompt_end, int(prompt_tokens[shared_prompt_length].item())
-
-    def _write_branch(
-        sequence_index: int,
-        cursor: int,
-        completion_group_id: int,
-        prompt_group_id: int,
-        context_token: int,
-        completion_length: int,
-    ) -> int:
-        branch_end = cursor + 1 + completion_length
-        tokens[sequence_index, cursor] = context_token
-        tokens[sequence_index, cursor + 1 : branch_end] = _sample_token_block(
-            completion_length
-        )
-        group_ids[sequence_index, cursor:branch_end] = completion_group_id
-        parent_ids[sequence_index, cursor:branch_end] = prompt_group_id
-        input_pos[sequence_index, cursor:branch_end] = torch.arange(
-            shared_prompt_length,
-            shared_prompt_length + 1 + completion_length,
-            dtype=torch.long,
-        )
-        trainable_start = cursor + 1
-        assistant_mask[sequence_index, trainable_start:branch_end] = True
-        logprobs[sequence_index, trainable_start:branch_end] = _sample_logprob_block(
-            completion_length
-        )
-        advantages[sequence_index, trainable_start:branch_end] = (
-            _sample_advantage_value()
-        )
-        weights[sequence_index, trainable_start:branch_end] = 1.0 / completion_length
-        return branch_end
-
-    for sequence_index in range(config.num_sequences):
-        cursor = 0
-        next_group_id = 0
-        while cursor < config.sequence_length:
-            prompt_group_id = next_group_id
-            next_group_id += 1
-            completion_lengths = [
-                _sample_completion_length()
-                for _ in range(config.completion_branches_per_prefix)
-            ]
-            remaining = config.sequence_length - cursor
-            if remaining <= shared_prompt_length + 1:
-                break
-
-            if config.packing_mode == "stop_early":
-                included_completion_lengths = list(completion_lengths)
-                while included_completion_lengths and (
-                    shared_prompt_length
-                    + sum(1 + length for length in included_completion_lengths)
-                    > remaining
-                ):
-                    included_completion_lengths.pop()
-                if not included_completion_lengths:
-                    break
-
-                cursor, context_token = _write_prompt(
-                    sequence_index,
-                    cursor,
-                    prompt_group_id,
-                )
-                for completion_length in included_completion_lengths:
-                    completion_group_id = next_group_id
-                    next_group_id += 1
-                    cursor = _write_branch(
-                        sequence_index,
-                        cursor,
-                        completion_group_id,
-                        prompt_group_id,
-                        context_token,
-                        completion_length,
-                    )
-                continue
-
-            cursor, context_token = _write_prompt(
-                sequence_index,
-                cursor,
-                prompt_group_id,
-            )
-            for completion_length in completion_lengths:
-                remaining = config.sequence_length - cursor
-                if remaining <= 1:
-                    break
-                completion_take = min(completion_length, remaining - 1)
-                completion_group_id = next_group_id
-                next_group_id += 1
-                cursor = _write_branch(
-                    sequence_index,
-                    cursor,
-                    completion_group_id,
-                    prompt_group_id,
-                    context_token,
-                    completion_take,
-                )
-
-    half = config.num_sequences // 2
-    if half > 0 and config.num_sequences % 2 == 0:
-        valid_lengths = (group_ids != -1).sum(dim=1)
-        for pair_index in range(half):
-            left_index = pair_index
-            right_index = pair_index + half
-            left_valid = int(valid_lengths[left_index].item())
-            right_valid = int(valid_lengths[right_index].item())
-            if left_valid != right_valid or left_valid == 0:
-                continue
-            if torch.equal(
-                tokens[left_index, :left_valid],
-                tokens[right_index, :right_valid],
-            ):
-                tokens[right_index, 0] = (
-                    (tokens[right_index, 0] - token_low + 1) % token_span
-                ) + token_low
-
-    weights = torch.where(assistant_mask, weights, torch.zeros_like(weights))
-    if bool(assistant_mask.any().item()):
-        weights[assistant_mask] /= weights[assistant_mask].mean()
-        advantages = torch.where(
-            assistant_mask,
-            advantages,
-            torch.zeros_like(advantages),
-        )
-        advantage_scale = (
-            advantages[assistant_mask].abs() * weights[assistant_mask]
-        ).mean()
-        if float(advantage_scale.item()) > 0.0:
-            advantages[assistant_mask] /= advantage_scale
-
-    return {
-        "tokens": tokens,
-        "group_ids": group_ids,
-        "parent_ids": parent_ids,
-        "input_pos": input_pos,
-        "assistant_mask": assistant_mask,
-        "logprobs": logprobs,
-        "advantages": advantages,
-        "weights": weights,
-        "pixel_values": [None] * config.num_sequences,
-        "image_grid_thw": [None] * config.num_sequences,
-    }
+    return build_complex_prefix_tree_packed_tensors(config, seed)
 
 
-def _prompt_family_segments(
+def _prefix_tree_leaf_paths(
     group_ids: torch.Tensor,
     parent_ids: torch.Tensor,
     *,
-    required_completion_count: int = 2,
-) -> list[tuple[tuple[int, int], list[tuple[int, int]]]]:
-    families: list[tuple[tuple[int, int], list[tuple[int, int]]]] = []
-    valid_tokens = int((group_ids != -1).sum().item())
-    cursor = 0
-    while cursor < valid_tokens:
-        group_id = int(group_ids[cursor].item())
-        parent_id = int(parent_ids[cursor].item())
-        prompt_start = cursor
-        while cursor < valid_tokens and int(group_ids[cursor].item()) == group_id:
-            cursor += 1
-        prompt_end = cursor
-        if group_id != parent_id:
+    required_leaf_count: int = 2,
+) -> list[tuple[tuple[tuple[int, int], ...], tuple[int, int]]]:
+    tree = parse_prefix_tree_row(group_ids=group_ids, parent_ids=parent_ids)
+    segment_by_group = {segment.group_id: segment for segment in tree.segments}
+    child_count_by_group: dict[int, int] = {}
+    for segment in tree.segments:
+        if segment.group_id == segment.parent_id:
             continue
-        completions: list[tuple[int, int]] = []
-        while cursor < valid_tokens:
-            completion_group_id = int(group_ids[cursor].item())
-            completion_parent_id = int(parent_ids[cursor].item())
-            if completion_parent_id != group_id or completion_group_id == group_id:
-                break
-            completion_start = cursor
-            while (
-                cursor < valid_tokens
-                and int(group_ids[cursor].item()) == completion_group_id
-            ):
-                cursor += 1
-            completions.append((completion_start, cursor))
-        if len(completions) >= required_completion_count:
-            families.append(((prompt_start, prompt_end), completions))
-    return families
+        child_count_by_group[segment.parent_id] = (
+            child_count_by_group.get(segment.parent_id, 0) + 1
+        )
+    paths = [
+        (
+            tuple(
+                (segment_by_group[group_id].start, segment_by_group[group_id].end)
+                for group_id in leaf.ancestors
+            ),
+            (leaf.start, leaf.end),
+        )
+        for leaf in tree.segments
+        if leaf.group_id != leaf.parent_id
+        and child_count_by_group.get(leaf.group_id, 0) == 0
+        and leaf.end - leaf.start >= 2
+    ]
+    return paths if len(paths) >= required_leaf_count else []
 
 
 def _run_logits(
@@ -598,13 +377,13 @@ def _logits_equivalence_check(
     for row_index in range(int(input_ids.shape[0])):
         row_group_ids = group_ids[row_index : row_index + 1]
         row_parent_ids = parent_ids[row_index : row_index + 1]
-        families = _prompt_family_segments(row_group_ids[0], row_parent_ids[0])
-        if not families:
-            _debug_log(f"logits_check row={row_index} skipped no prompt family")
+        leaf_paths = _prefix_tree_leaf_paths(row_group_ids[0], row_parent_ids[0])
+        if not leaf_paths:
+            _debug_log(f"logits_check row={row_index} skipped no prefix-tree leaves")
             continue
         row_input_ids = input_ids[row_index : row_index + 1]
         row_position_ids = position_ids[row_index : row_index + 1]
-        packed_bias = create_shared_prefix_state(
+        packed_bias = create_prefix_tree_state(
             group_ids=row_group_ids,
             parent_ids=row_parent_ids,
             input_pos=row_position_ids,
@@ -612,10 +391,11 @@ def _logits_equivalence_check(
             build_gdn_execution_spec=bool(
                 getattr(handler, "build_gdn_execution_spec", False)
             ),
+            model_support_handler=handler,
             attention_head_dim=getattr(provider, "kv_channels", None),
             attention_value_head_dim=getattr(provider, "kv_channels", None),
         )
-        _debug_log(f"logits_check row={row_index} families={len(families)}")
+        _debug_log(f"logits_check row={row_index} leaves={len(leaf_paths)}")
         packed_logits = _time_block(
             f"logits_check row={row_index} packed_forward",
             lambda: _run_logits(
@@ -627,95 +407,63 @@ def _logits_equivalence_check(
             ),
             device=row_input_ids.device,
         )
-        for family_index, (prompt_segment, completion_segments) in enumerate(families):
-            prompt_start, prompt_end = prompt_segment
+        for leaf_index, (ancestor_segments, leaf_segment) in enumerate(leaf_paths):
+            leaf_start, leaf_end = leaf_segment
+            prompt_len = sum(end - start for start, end in ancestor_segments)
+            reference_segments = (*ancestor_segments, leaf_segment)
             _debug_log(
                 "logits_check row="
-                f"{row_index} family={family_index} "
-                f"prompt=({prompt_start},{prompt_end}) "
-                f"completions={completion_segments}"
+                f"{row_index} leaf={leaf_index} "
+                f"ancestors={ancestor_segments} leaf={leaf_segment}"
             )
-            for completion_index, (completion_start, completion_end) in enumerate(
-                completion_segments
-            ):
-                reference_input_ids = torch.cat(
-                    (
-                        row_input_ids[:, prompt_start:prompt_end],
-                        row_input_ids[:, completion_start:completion_end],
-                    ),
-                    dim=1,
-                )
-                reference_position_ids = torch.cat(
-                    (
-                        row_position_ids[:, prompt_start:prompt_end],
-                        row_position_ids[:, completion_start:completion_end],
-                    ),
-                    dim=1,
-                )
-                reference_group_ids = torch.zeros_like(reference_input_ids)
-                reference_parent_ids = torch.zeros_like(reference_input_ids)
-                reference_bias = create_shared_prefix_state(
-                    group_ids=reference_group_ids,
-                    parent_ids=reference_parent_ids,
-                    input_pos=reference_position_ids,
-                    sliding_windows=sliding_windows,
-                    build_gdn_execution_spec=bool(
-                        getattr(handler, "build_gdn_execution_spec", False)
-                    ),
-                    attention_head_dim=getattr(provider, "kv_channels", None),
-                    attention_value_head_dim=getattr(provider, "kv_channels", None),
-                )
-                _debug_log(
-                    "logits_check row="
-                    f"{row_index} family={family_index} "
-                    f"completion={completion_index} "
-                    f"segment=({completion_start},{completion_end}) "
-                    f"reference_seq={int(reference_input_ids.shape[1])}"
-                )
-                reference_logits = _time_block(
-                    (
-                        f"logits_check row={row_index} "
-                        f"family={family_index} "
-                        f"completion={completion_index} reference_forward"
-                    ),
-                    lambda: _run_logits(
-                        model=model,
-                        handler=handler,
-                        input_ids=reference_input_ids,
-                        position_ids=reference_position_ids,
-                        attention_bias=reference_bias,
-                    ),
-                    device=reference_input_ids.device,
-                )
-                if completion_end - completion_start < 2:
-                    continue
-                packed_completion_logits = packed_logits[
-                    :,
-                    completion_start : completion_end - 1,
-                    :,
-                ]
-                reference_completion_logits = reference_logits[
-                    :,
-                    prompt_end - prompt_start : -1,
-                    :,
-                ]
-                diff = (packed_completion_logits - reference_completion_logits).abs()
-                logits_abs_sum += float(diff.sum().item())
-                logits_ref_abs_sum += float(
-                    reference_completion_logits.abs().sum().item()
-                )
-                logits_numel += int(diff.numel())
-                logits_max_abs_diff = max(
-                    logits_max_abs_diff,
-                    float(diff.max().item()),
-                )
-                completion_pair_count += 1
-                _debug_log(
-                    "logits_check row="
-                    f"{row_index} family={family_index} "
-                    f"completion={completion_index} "
-                    f"max_abs_diff={float(diff.max().item()):.6f}"
-                )
+            reference_input_ids = torch.cat(
+                tuple(row_input_ids[:, start:end] for start, end in reference_segments),
+                dim=1,
+            )
+            reference_position_ids = torch.cat(
+                tuple(
+                    row_position_ids[:, start:end] for start, end in reference_segments
+                ),
+                dim=1,
+            )
+            reference_group_ids = torch.zeros_like(reference_input_ids)
+            reference_parent_ids = torch.zeros_like(reference_input_ids)
+            reference_bias = create_prefix_tree_state(
+                group_ids=reference_group_ids,
+                parent_ids=reference_parent_ids,
+                input_pos=reference_position_ids,
+                sliding_windows=sliding_windows,
+                build_gdn_execution_spec=bool(
+                    getattr(handler, "build_gdn_execution_spec", False)
+                ),
+                model_support_handler=handler,
+                attention_head_dim=getattr(provider, "kv_channels", None),
+                attention_value_head_dim=getattr(provider, "kv_channels", None),
+            )
+            reference_logits = _time_block(
+                f"logits_check row={row_index} leaf={leaf_index} reference_forward",
+                lambda: _run_logits(
+                    model=model,
+                    handler=handler,
+                    input_ids=reference_input_ids,
+                    position_ids=reference_position_ids,
+                    attention_bias=reference_bias,
+                ),
+                device=reference_input_ids.device,
+            )
+            packed_completion_logits = packed_logits[:, leaf_start : leaf_end - 1, :]
+            reference_completion_logits = reference_logits[:, prompt_len:-1, :]
+            diff = (packed_completion_logits - reference_completion_logits).abs()
+            logits_abs_sum += float(diff.sum().item())
+            logits_ref_abs_sum += float(reference_completion_logits.abs().sum().item())
+            logits_numel += int(diff.numel())
+            logits_max_abs_diff = max(logits_max_abs_diff, float(diff.max().item()))
+            completion_pair_count += 1
+            _debug_log(
+                "logits_check row="
+                f"{row_index} leaf={leaf_index} "
+                f"max_abs_diff={float(diff.max().item()):.6f}"
+            )
     if completion_pair_count > 0:
         mean_abs = logits_abs_sum / max(logits_numel, 1)
         typical_abs = logits_ref_abs_sum / max(logits_numel, 1)

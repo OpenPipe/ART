@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 from pathlib import Path
-import socket
 from typing import Any, cast
 
 import pytest
@@ -24,6 +23,7 @@ from art.megatron.context_parallel.types import (  # noqa: E402
 from art.preprocessing.pack import PackedTensors  # noqa: E402
 
 from .cases import default_phase0_cases  # noqa: E402
+from .distributed_init import file_init_method  # noqa: E402
 from .packed_layout import build_phase0_packed_tensors  # noqa: E402
 
 
@@ -31,10 +31,10 @@ def test_gdn_cp_training_batch_carries_prebuilt_rank_plan(tmp_path: Path) -> Non
     cp_size = 2
     if not torch.cuda.is_available() or torch.cuda.device_count() < cp_size:
         pytest.skip(f"requires {cp_size} CUDA devices")
-    port = _find_free_port()
+    init_method = file_init_method(tmp_path, "gdn_cp_train_prepare")
     mp.spawn(
         _worker,
-        args=(cp_size, port, str(tmp_path)),
+        args=(cp_size, init_method, str(tmp_path)),
         nprocs=cp_size,
         join=True,
     )
@@ -42,11 +42,11 @@ def test_gdn_cp_training_batch_carries_prebuilt_rank_plan(tmp_path: Path) -> Non
         assert (tmp_path / f"rank_{rank}.ok").read_text() == "ok\n"
 
 
-def _worker(rank: int, cp_size: int, port: int, output_dir: str) -> None:
+def _worker(rank: int, cp_size: int, init_method: str, output_dir: str) -> None:
     torch.cuda.set_device(rank)
     init_process_group(
         backend="nccl",
-        init_method=f"tcp://127.0.0.1:{port}",
+        init_method=init_method,
         rank=rank,
         world_size=cp_size,
     )
@@ -99,12 +99,6 @@ def _worker(rank: int, cp_size: int, port: int, output_dir: str) -> None:
         if getattr(ps, "model_parallel_is_initialized", lambda: False)():
             ps.destroy_model_parallel()
         destroy_process_group()
-
-
-def _find_free_port() -> int:
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
-        sock.bind(("127.0.0.1", 0))
-        return int(sock.getsockname()[1])
 
 
 def test_main_loss_matches_shifted_dispatched_loss_inputs() -> None:

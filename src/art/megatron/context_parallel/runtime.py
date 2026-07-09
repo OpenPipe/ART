@@ -1,26 +1,23 @@
 from __future__ import annotations
 
 from bisect import bisect_left, bisect_right
+from dataclasses import dataclass, replace
 import hashlib
 import json
 from typing import Any, cast
-import warnings
 
-from pydantic import BaseModel, ConfigDict
 import torch
 
 from art.loss import shift_tensor
 from art.preprocessing.pack import PackedTensors
 
-from .builder import build_shared_prefix_attention_spec
+from .builder import build_prefix_tree_attention_spec
 from .layout_index import TokenLayoutIndex
 from .types import (
     ArtContextParallelState,
     AttnMaskKind,
     AttnSlice,
     ContextParallelConfig,
-    ContextParallelRuntimeKey,
-    ContextParallelRuntimePlan,
     CpBlockMaskVariant,
     DispatchedPackedTensors,
     DkvReducePlan,
@@ -29,17 +26,12 @@ from .types import (
     PackedBatchAttentionSpec,
     PackedRowAttentionSpec,
     ParallelTopology,
-    PlannerProvenance,
     PreparedMegatronBatch,
     RankRuntimePlan,
     StagePlan,
     TokenRange,
 )
 
-_PLANNER_RUNTIME_BACKEND = "art_context_parallel"
-_PLANNER_BEST_EFFORT_WARNING_KEYS: set[
-    tuple[str, str, int, str, str, tuple[int, ...]]
-] = set()
 _CHUNK_MASK_STATS_TORCH_THRESHOLD = 1024
 _CP4_SEARCH_PROBE_CANDIDATE_LIMIT = 2
 _CP4_SEARCH_PROBE_IMPROVEMENT_MS = 1.0
@@ -49,18 +41,16 @@ StagePiece = tuple[TokenRange, TokenRange, AttnMaskKind, int | None]
 StageSliceKey = tuple[int, int, int, int, int, str, int]
 
 
-class _PlanningBundle(BaseModel):
-    model_config = ConfigDict(arbitrary_types_allowed=True)
-
+@dataclass(frozen=True)
+class _PlanningBundle:
     spec: PackedBatchAttentionSpec
-    runtime_key: ContextParallelRuntimeKey
-    runtime_plan: ContextParallelRuntimePlan
+    rank_plans: tuple[RankRuntimePlan, ...]
     gdn_execution_spec: Any | None = None
 
 
 _PLANNING_BUNDLE_CACHE: dict[str, _PlanningBundle] = {}
-_RUNTIME_PLAN_CACHE: dict[tuple[str, int], ContextParallelRuntimePlan] = {}
-_GDN_RANK_PLAN_CACHE: dict[tuple[str, str, int | None, int], Any] = {}
+_RUNTIME_PLAN_CACHE: dict[str, tuple[RankRuntimePlan, ...]] = {}
+_GDN_RANK_PLAN_CACHE: dict[tuple[str, str, int | None, int, str], Any] = {}
 
 
 def _json_cache_key(payload: Any) -> str:
@@ -112,170 +102,10 @@ def _planning_bundle_cache_key(
         {
             "group_ids": _metadata_tensor_digest(group_ids),
             "parent_ids": _metadata_tensor_digest(parent_ids),
-            "topology": topology.model_dump(mode="json"),
-            "config": config.model_dump(mode="json"),
+            "topology": _dataclass_payload(topology),
+            "config": _dataclass_payload(config),
             "original_seq_len": int(original_seq_len),
             "build_gdn_execution_spec": bool(build_gdn_execution_spec),
-        }
-    )
-
-
-def _rank_plan_cache_key(
-    *,
-    planning_key: str,
-    device: torch.device,
-    cp_rank: int,
-) -> tuple[str, str, int | None, int]:
-    return (planning_key, device.type, device.index, int(cp_rank))
-
-
-def _config_for_runtime_cp(
-    *,
-    topology: ParallelTopology,
-    config: ContextParallelConfig,
-) -> ContextParallelConfig:
-    cp_size = max(int(topology.cp), 1)
-    updates: dict[str, Any] = {}
-    applied_override = False
-    for override in config.planner_cp_overrides:
-        if int(override.cp_size) != cp_size:
-            continue
-        override_updates = override.model_dump(mode="python", exclude_none=True)
-        override_updates.pop("cp_size", None)
-        updates.update(override_updates)
-        applied_override = True
-    if not applied_override:
-        return config
-    updates.setdefault("planner_tuned_cp_sizes", (cp_size,))
-    return config.model_copy(update=updates)
-
-
-def _normalized_planner_metadata_value(value: str | None) -> str:
-    if value is None:
-        return ""
-    normalized = "".join(
-        character.lower() if character.isalnum() else " "
-        for character in str(value).strip()
-    )
-    return " ".join(part for part in normalized.split() if part)
-
-
-def _planner_metadata_matches(
-    expected: str | None,
-    actual: str | None,
-    *,
-    fuzzy: bool,
-) -> bool:
-    normalized_expected = _normalized_planner_metadata_value(expected)
-    normalized_actual = _normalized_planner_metadata_value(actual)
-    if not normalized_expected or not normalized_actual:
-        return False
-    if normalized_expected == normalized_actual:
-        return True
-    return bool(
-        fuzzy
-        and (
-            normalized_expected in normalized_actual
-            or normalized_actual in normalized_expected
-        )
-    )
-
-
-def _planner_runtime_hardware() -> str | None:
-    if not torch.cuda.is_available():
-        return None
-    try:
-        return str(torch.cuda.get_device_name(torch.cuda.current_device()))
-    except Exception:
-        return str(torch.cuda.get_device_name(0))
-
-
-def _planner_best_effort_warning_message(provenance: PlannerProvenance) -> str:
-    mismatch_reasons: list[str] = []
-    if not provenance.backend_match:
-        mismatch_reasons.append(
-            f"backend runtime={provenance.runtime_backend!r} tuned={provenance.tuned_backend!r}"
-        )
-    if not provenance.hardware_match:
-        mismatch_reasons.append(
-            f"hardware runtime={provenance.runtime_hardware!r} tuned={provenance.tuned_hardware!r}"
-        )
-    if not provenance.cp_size_match:
-        mismatch_reasons.append(
-            f"cp_size runtime={int(provenance.runtime_cp_size)} tuned={list(provenance.tuned_cp_sizes)}"
-        )
-    mismatch_text = (
-        "; ".join(mismatch_reasons) if mismatch_reasons else "metadata missing"
-    )
-    return (
-        "ART context parallel planner coefficients are running in best-effort mode; "
-        f"{mismatch_text}. The runtime will continue with the configured coefficients."
-    )
-
-
-def _planner_provenance(
-    *,
-    topology: ParallelTopology,
-    config: ContextParallelConfig,
-    warn: bool = True,
-) -> PlannerProvenance:
-    runtime_hardware = _planner_runtime_hardware()
-    tuned_cp_sizes = tuple(
-        sorted(
-            {
-                int(cp_size)
-                for cp_size in config.planner_tuned_cp_sizes
-                if int(cp_size) > 0
-            }
-        )
-    )
-    provenance = PlannerProvenance(
-        runtime_backend=_PLANNER_RUNTIME_BACKEND,
-        runtime_hardware=runtime_hardware,
-        runtime_cp_size=max(int(topology.cp), 1),
-        tuned_backend=config.planner_tuned_backend,
-        tuned_hardware=config.planner_tuned_hardware,
-        tuned_cp_sizes=tuned_cp_sizes,
-        backend_match=_planner_metadata_matches(
-            config.planner_tuned_backend,
-            _PLANNER_RUNTIME_BACKEND,
-            fuzzy=False,
-        ),
-        hardware_match=_planner_metadata_matches(
-            config.planner_tuned_hardware,
-            runtime_hardware,
-            fuzzy=True,
-        ),
-        cp_size_match=bool(tuned_cp_sizes)
-        and max(int(topology.cp), 1) in tuned_cp_sizes,
-        using_best_effort=False,
-    )
-    if (
-        provenance.backend_match
-        and provenance.hardware_match
-        and provenance.cp_size_match
-    ):
-        return provenance
-
-    warning_message = _planner_best_effort_warning_message(provenance)
-    warning_key = (
-        _normalized_planner_metadata_value(provenance.runtime_backend),
-        _normalized_planner_metadata_value(provenance.runtime_hardware),
-        int(provenance.runtime_cp_size),
-        _normalized_planner_metadata_value(provenance.tuned_backend),
-        _normalized_planner_metadata_value(provenance.tuned_hardware),
-        provenance.tuned_cp_sizes,
-    )
-    warning_emitted = False
-    if warn and warning_key not in _PLANNER_BEST_EFFORT_WARNING_KEYS:
-        _PLANNER_BEST_EFFORT_WARNING_KEYS.add(warning_key)
-        warnings.warn(warning_message, RuntimeWarning, stacklevel=3)
-        warning_emitted = True
-    return provenance.model_copy(
-        update={
-            "using_best_effort": True,
-            "warning_message": warning_message,
-            "warning_emitted": warning_emitted,
         }
     )
 
@@ -352,7 +182,7 @@ def _search_config_for_chunk_count(
         return config
     if all(int(getattr(config, key)) == int(value) for key, value in updates.items()):
         return config
-    return config.model_copy(update=updates)
+    return replace(config, **updates)
 
 
 def _best_improving_move(
@@ -388,9 +218,9 @@ def _best_improving_move(
             candidate = list(current_owners)
             candidate[chunk_index] = dst_rank
             candidate_owners = tuple(candidate)
-            if not _assignment_uses_all_ranks(
-                candidate_owners,
-                cp_size=cp_size,
+            if (
+                len(candidate_owners) >= cp_size
+                and len(set(candidate_owners)) != cp_size
             ):
                 continue
             candidate_eval = evaluate_candidate(
@@ -411,12 +241,10 @@ def _build_chunk_ranges(
     valid_tokens: int,
     chunk_size: int,
 ) -> tuple[TokenRange, ...]:
-    ranges: list[TokenRange] = []
-    for start in range(0, valid_tokens, chunk_size):
-        ranges.append(
-            TokenRange(start=start, end=min(start + chunk_size, valid_tokens))
-        )
-    return tuple(ranges)
+    return tuple(
+        TokenRange(start=start, end=min(start + chunk_size, valid_tokens))
+        for start in range(0, valid_tokens, chunk_size)
+    )
 
 
 def _indexed_intersections(
@@ -446,33 +274,6 @@ def _indexed_intersections(
     return intersections
 
 
-def _slice_pair_count(
-    *,
-    mask_kind: AttnMaskKind,
-    q_range: TokenRange,
-    k_range: TokenRange,
-) -> int:
-    if mask_kind is AttnMaskKind.FULL:
-        return int(q_range.size()) * int(k_range.size())
-    return _causal_piece_pair_count(
-        q_range=q_range,
-        k_range=k_range,
-    )
-
-
-def _causal_piece_pair_count(
-    *,
-    q_range: TokenRange,
-    k_range: TokenRange,
-) -> int:
-    return _causal_piece_pair_count_from_bounds(
-        q_start=int(q_range.start),
-        q_end=int(q_range.end),
-        k_start=int(k_range.start),
-        k_end=int(k_range.end),
-    )
-
-
 def _causal_piece_pair_count_from_bounds(
     *,
     q_start: int,
@@ -499,91 +300,15 @@ def _causal_piece_pair_count_from_bounds(
     return int(partial + full)
 
 
-def _chunk_piece_decomposition(
-    *,
-    start: int,
-    end: int,
-    chunk_size: int,
-) -> tuple[
-    int, tuple[int, ...], tuple[int, ...], tuple[int, ...], tuple[int, ...], int
-]:
-    first = start // chunk_size
-    last = (end - 1) // chunk_size
-    piece_starts: list[int] = []
-    piece_ends: list[int] = []
-    piece_lengths: list[int] = []
-    piece_prefix_lengths: list[int] = []
-    running_len = 0
-    for chunk_index in range(first, last + 1):
-        piece_start = start if chunk_index == first else chunk_index * chunk_size
-        piece_end = end if chunk_index == last else (chunk_index + 1) * chunk_size
-        piece_len = piece_end - piece_start
-        if piece_len <= 0:
-            continue
-        running_len += piece_len
-        piece_starts.append(piece_start)
-        piece_ends.append(piece_end)
-        piece_lengths.append(piece_len)
-        piece_prefix_lengths.append(running_len)
-    return (
-        first,
-        tuple(piece_starts),
-        tuple(piece_ends),
-        tuple(piece_lengths),
-        tuple(piece_prefix_lengths),
-        running_len,
-    )
-
-
-def _can_use_shared_prefix_chunk_pair_program(
-    row_spec: PackedRowAttentionSpec,
-) -> bool:
-    slices = row_spec.slices
-    index = 0
-    while index < len(slices):
-        prompt_slice = slices[index]
-        if (
-            prompt_slice.family_index is None
-            or prompt_slice.mask_kind is not AttnMaskKind.CAUSAL
-            or prompt_slice.q_range != prompt_slice.k_range
-        ):
-            return False
-        prompt_family_index = prompt_slice.family_index
-        if prompt_family_index is None:
-            raise RuntimeError("shared-prefix prompt slices must carry family_index")
-        family_index = int(prompt_family_index)
-        prompt_start = int(prompt_slice.q_range.start)
-        prompt_end = int(prompt_slice.q_range.end)
-        index += 1
-        while index < len(slices):
-            family_value = slices[index].family_index
-            if family_value is None or int(family_value) != family_index:
-                break
-            if index + 1 >= len(slices):
-                return False
-            full_slice = slices[index]
-            causal_slice = slices[index + 1]
-            if (
-                full_slice.family_index != prompt_slice.family_index
-                or causal_slice.family_index != prompt_slice.family_index
-                or full_slice.mask_kind is not AttnMaskKind.FULL
-                or causal_slice.mask_kind is not AttnMaskKind.CAUSAL
-                or full_slice.q_range != causal_slice.q_range
-                or causal_slice.q_range != causal_slice.k_range
-                or int(full_slice.k_range.start) != prompt_start
-                or int(full_slice.k_range.end) != prompt_end
-            ):
-                return False
-            index += 2
-    return True
-
-
-def _build_chunk_pair_program_generic(
+def _build_chunk_pair_program(
     row_spec: PackedRowAttentionSpec,
     *,
-    chunk_count: int,
-    chunk_size: int,
+    chunk_ranges: tuple[TokenRange, ...],
 ) -> tuple[torch.Tensor, list[float]]:
+    chunk_count = len(chunk_ranges)
+    if chunk_count == 0:
+        return torch.zeros((0, 0), dtype=torch.int64), []
+    chunk_size = int(chunk_ranges[0].size())
     pair_rows = [[0 for _ in range(chunk_count)] for _ in range(chunk_count)]
     q_weights = [0.0 for _ in range(chunk_count)]
 
@@ -679,138 +404,6 @@ def _build_chunk_pair_program_generic(
 
             if q_total > 0:
                 q_weights[q_chunk_index] += float(q_total)
-    return torch.tensor(pair_rows, dtype=torch.int64), q_weights
-
-
-def _build_chunk_pair_program(
-    row_spec: PackedRowAttentionSpec,
-    *,
-    chunk_ranges: tuple[TokenRange, ...],
-) -> tuple[torch.Tensor, list[float]]:
-    chunk_count = len(chunk_ranges)
-    if chunk_count == 0:
-        return torch.zeros((0, 0), dtype=torch.int64), []
-    chunk_size = int(chunk_ranges[0].size())
-    if not _can_use_shared_prefix_chunk_pair_program(row_spec):
-        return _build_chunk_pair_program_generic(
-            row_spec,
-            chunk_count=chunk_count,
-            chunk_size=chunk_size,
-        )
-
-    pair_rows = [[0 for _ in range(chunk_count)] for _ in range(chunk_count)]
-    q_weights = [0.0 for _ in range(chunk_count)]
-    slices = row_spec.slices
-    index = 0
-    while index < len(slices):
-        prompt_slice = slices[index]
-        (
-            prompt_first,
-            prompt_starts,
-            prompt_ends,
-            prompt_lengths,
-            prompt_prefix,
-            prompt_total,
-        ) = _chunk_piece_decomposition(
-            start=int(prompt_slice.q_range.start),
-            end=int(prompt_slice.q_range.end),
-            chunk_size=chunk_size,
-        )
-        for offset, q_chunk_index in enumerate(
-            range(prompt_first, prompt_first + len(prompt_lengths))
-        ):
-            q_piece_len = prompt_lengths[offset]
-            row = pair_rows[q_chunk_index]
-            q_total = 0
-            if offset > 0:
-                for k_offset in range(offset):
-                    row[prompt_first + k_offset] += (
-                        q_piece_len * prompt_lengths[k_offset]
-                    )
-                q_total += q_piece_len * prompt_prefix[offset - 1]
-            pair_count = _causal_piece_pair_count_from_bounds(
-                q_start=prompt_starts[offset],
-                q_end=prompt_ends[offset],
-                k_start=prompt_starts[offset],
-                k_end=prompt_ends[offset],
-            )
-            if pair_count > 0:
-                row[q_chunk_index] += pair_count
-                q_total += pair_count
-            if q_total > 0:
-                q_weights[q_chunk_index] += float(q_total)
-
-        prompt_family_index = prompt_slice.family_index
-        if prompt_family_index is None:
-            raise RuntimeError("shared-prefix prompt slices must carry family_index")
-        family_index = int(prompt_family_index)
-        index += 1
-        completion_chunk_indices: list[int] = []
-        completion_chunk_totals: list[int] = []
-        while index < len(slices):
-            family_value = slices[index].family_index
-            if family_value is None or int(family_value) != family_index:
-                break
-            full_slice = slices[index]
-            (
-                completion_first,
-                completion_starts,
-                completion_ends,
-                completion_lengths,
-                completion_prefix,
-                _,
-            ) = _chunk_piece_decomposition(
-                start=int(full_slice.q_range.start),
-                end=int(full_slice.q_range.end),
-                chunk_size=chunk_size,
-            )
-            for offset, q_chunk_index in enumerate(
-                range(completion_first, completion_first + len(completion_lengths))
-            ):
-                q_piece_len = completion_lengths[offset]
-                if (
-                    completion_chunk_indices
-                    and completion_chunk_indices[-1] == q_chunk_index
-                ):
-                    completion_chunk_totals[-1] += q_piece_len
-                else:
-                    completion_chunk_indices.append(q_chunk_index)
-                    completion_chunk_totals.append(q_piece_len)
-
-            for offset, q_chunk_index in enumerate(
-                range(completion_first, completion_first + len(completion_lengths))
-            ):
-                q_piece_len = completion_lengths[offset]
-                row = pair_rows[q_chunk_index]
-                q_total = 0
-                if offset > 0:
-                    for k_offset in range(offset):
-                        row[completion_first + k_offset] += (
-                            q_piece_len * completion_lengths[k_offset]
-                        )
-                    q_total += q_piece_len * completion_prefix[offset - 1]
-                pair_count = _causal_piece_pair_count_from_bounds(
-                    q_start=completion_starts[offset],
-                    q_end=completion_ends[offset],
-                    k_start=completion_starts[offset],
-                    k_end=completion_ends[offset],
-                )
-                if pair_count > 0:
-                    row[q_chunk_index] += pair_count
-                    q_total += pair_count
-                if q_total > 0:
-                    q_weights[q_chunk_index] += float(q_total)
-            index += 2
-
-        for q_chunk_index, total_q_len in zip(
-            completion_chunk_indices,
-            completion_chunk_totals,
-            strict=True,
-        ):
-            row = pair_rows[q_chunk_index]
-            for k_offset, k_piece_len in enumerate(prompt_lengths):
-                row[prompt_first + k_offset] += total_q_len * k_piece_len
-            q_weights[q_chunk_index] += float(total_q_len * prompt_total)
     return torch.tensor(pair_rows, dtype=torch.int64), q_weights
 
 
@@ -963,63 +556,6 @@ def _contiguous_chunk_assignment(
     return tuple(owners)
 
 
-def _bucket_chunk_assignment(
-    *,
-    q_weights: list[float],
-    cp_size: int,
-) -> tuple[int, ...]:
-    chunk_count = len(q_weights)
-    if chunk_count == 0:
-        return tuple()
-    if cp_size <= 1:
-        return tuple(0 for _ in range(chunk_count))
-    rank_loads = [0.0 for _ in range(cp_size)]
-    rank_chunk_counts = [0 for _ in range(cp_size)]
-    owners = [-1 for _ in range(chunk_count)]
-    for chunk_index in sorted(
-        range(chunk_count),
-        key=lambda index: (-q_weights[index], index),
-    ):
-        rank = min(
-            range(cp_size),
-            key=lambda candidate: (
-                rank_loads[candidate],
-                rank_chunk_counts[candidate],
-                candidate,
-            ),
-        )
-        owners[chunk_index] = rank
-        rank_loads[rank] += q_weights[chunk_index]
-        rank_chunk_counts[rank] += 1
-    return tuple(int(owner) for owner in owners)
-
-
-def _striped_chunk_assignment(
-    *,
-    chunk_count: int,
-    cp_size: int,
-    group_size: int,
-) -> tuple[int, ...]:
-    if chunk_count == 0:
-        return tuple()
-    if cp_size <= 1:
-        return tuple(0 for _ in range(chunk_count))
-    group_size = max(1, int(group_size))
-    return tuple(
-        ((chunk_index // group_size) % cp_size) for chunk_index in range(chunk_count)
-    )
-
-
-def _assignment_uses_all_ranks(
-    owners: tuple[int, ...],
-    *,
-    cp_size: int,
-) -> bool:
-    if len(owners) < cp_size:
-        return True
-    return len({int(owner) for owner in owners}) == cp_size
-
-
 def _candidate_chunk_indices(
     *,
     owners: tuple[int, ...],
@@ -1126,31 +662,6 @@ def _chunk_mask_stats(
             continue
         in_run = False
     return token_count, range_count
-
-
-def _merge_chunk_ranges_from_mask(
-    *,
-    chunk_ranges: tuple[TokenRange, ...],
-    chunk_mask: torch.Tensor,
-) -> tuple[TokenRange, ...]:
-    chunk_indices = torch.nonzero(chunk_mask, as_tuple=False).flatten()
-    if int(chunk_indices.numel()) == 0:
-        return tuple()
-    ordered_chunk_indices = chunk_indices.tolist()
-    first_range = chunk_ranges[int(ordered_chunk_indices[0])]
-    current_start = int(first_range.start)
-    current_end = int(first_range.end)
-    merged: list[TokenRange] = []
-    for chunk_index in ordered_chunk_indices[1:]:
-        range_ = chunk_ranges[int(chunk_index)]
-        if int(range_.start) <= current_end:
-            current_end = max(current_end, int(range_.end))
-            continue
-        merged.append(TokenRange(start=current_start, end=current_end))
-        current_start = int(range_.start)
-        current_end = int(range_.end)
-    merged.append(TokenRange(start=current_start, end=current_end))
-    return tuple(merged)
 
 
 def _stage_cost_ms(
@@ -1530,31 +1041,6 @@ def _evaluate_plan(
     }
 
 
-def _evaluate_plan_for_search(
-    *,
-    chunk_ranges: tuple[TokenRange, ...],
-    pair_matrix: list[list[int]] | torch.Tensor,
-    owners: tuple[int, ...],
-    wave_assignment: tuple[int, ...],
-    cp_size: int,
-    config: ContextParallelConfig,
-    pair_positive: torch.Tensor | None = None,
-    chunk_lengths: tuple[int, ...] | None = None,
-    chunk_lengths_tensor: torch.Tensor | None = None,
-) -> dict[str, Any]:
-    return _evaluate_plan(
-        chunk_ranges=chunk_ranges,
-        pair_matrix=pair_matrix,
-        owners=owners,
-        wave_assignment=wave_assignment,
-        cp_size=cp_size,
-        config=config,
-        pair_positive=pair_positive,
-        chunk_lengths=chunk_lengths,
-        chunk_lengths_tensor=chunk_lengths_tensor,
-    )
-
-
 def _search_chunk_assignment(
     *,
     chunk_ranges: tuple[TokenRange, ...],
@@ -1563,7 +1049,6 @@ def _search_chunk_assignment(
     cp_size: int,
     config: ContextParallelConfig,
 ) -> tuple[tuple[int, ...], tuple[int, ...], dict[str, Any]]:
-    cp_size = int(cp_size)
     config = _search_config_for_chunk_count(
         config=config,
         chunk_count=len(chunk_ranges),
@@ -1572,9 +1057,7 @@ def _search_chunk_assignment(
         1,
         min(int(config.planner_max_remote_waves), len(chunk_ranges)) + 1,
     )
-    best_owners: tuple[int, ...] = tuple()
-    best_waves: tuple[int, ...] = tuple()
-    best_eval: dict[str, Any] | None = None
+    best: tuple[tuple[int, ...], tuple[int, ...], dict[str, Any]] | None = None
     eval_cache: dict[tuple[tuple[int, ...], tuple[int, ...]], dict[str, Any]] = {}
     pair_counts = torch.as_tensor(pair_matrix, dtype=torch.int64)
     pair_positive = pair_counts > 0
@@ -1594,7 +1077,7 @@ def _search_chunk_assignment(
         cached = eval_cache.get(cache_key)
         if cached is not None:
             return cached
-        cached = _evaluate_plan_for_search(
+        cached = _evaluate_plan(
             chunk_ranges=chunk_ranges,
             pair_matrix=pair_counts,
             owners=owners,
@@ -1608,86 +1091,35 @@ def _search_chunk_assignment(
         eval_cache[cache_key] = cached
         return cached
 
-    def _best_wave_assignment_for_owners(
-        owners: tuple[int, ...],
-    ) -> tuple[tuple[int, ...], dict[str, Any]]:
-        best_wave_assignment = tuple()
-        best_eval_local: dict[str, Any] | None = None
-        for wave_count in wave_count_candidates:
-            wave_assignment = _wave_assignment(
-                chunk_count=len(chunk_ranges),
-                wave_count=wave_count,
-            )
-            candidate_eval = _evaluate_candidate(
-                owners=owners,
-                wave_assignment=wave_assignment,
-            )
-            if best_eval_local is None or float(candidate_eval["score"]) + 1e-9 < float(
-                best_eval_local["score"]
-            ):
-                best_wave_assignment = wave_assignment
-                best_eval_local = candidate_eval
-        if best_eval_local is None:
-            raise RuntimeError("Failed to evaluate any wave assignment candidate.")
-        return best_wave_assignment, best_eval_local
-
-    strategy = str(config.planner_assignment_strategy).strip().lower()
-    striped_owners = _striped_chunk_assignment(
-        chunk_count=len(chunk_ranges),
-        cp_size=cp_size,
-        group_size=int(config.planner_stripe_group_size),
-    )
-    fixed_owners_by_strategy = {
-        "contiguous": _contiguous_chunk_assignment(
-            q_weights=q_weights, cp_size=cp_size
-        ),
-        "bucket": _bucket_chunk_assignment(q_weights=q_weights, cp_size=cp_size),
-        "striped": striped_owners,
-    }
-    if strategy in fixed_owners_by_strategy:
-        owners = fixed_owners_by_strategy[strategy]
-        best_waves, best_eval = _best_wave_assignment_for_owners(owners)
-        return owners, best_waves, best_eval
-    if strategy not in {"search", "search_with_striped_seed"}:
-        raise ValueError(
-            "Unsupported planner_assignment_strategy="
-            f"{config.planner_assignment_strategy!r}."
-        )
-
     contiguous_owners = _contiguous_chunk_assignment(
         q_weights=q_weights,
         cp_size=cp_size,
     )
+    if not contiguous_owners:
+        wave_assignment = _wave_assignment(chunk_count=len(chunk_ranges), wave_count=1)
+        return (
+            contiguous_owners,
+            wave_assignment,
+            _evaluate_candidate(
+                owners=contiguous_owners,
+                wave_assignment=wave_assignment,
+            ),
+        )
+
     for wave_count in wave_count_candidates:
         wave_assignment = _wave_assignment(
             chunk_count=len(chunk_ranges),
             wave_count=wave_count,
         )
-        initial_candidates = [
-            initial_owners
-            for initial_owners in (contiguous_owners,)
-            if initial_owners
-            if _assignment_uses_all_ranks(initial_owners, cp_size=cp_size)
-        ]
-        if not initial_candidates:
-            continue
-        current_owners = min(
-            initial_candidates,
-            key=lambda owners: float(
-                _evaluate_candidate(owners=owners, wave_assignment=wave_assignment)[
-                    "score"
-                ]
-            ),
-        )
+        current_owners = contiguous_owners
         current_eval = _evaluate_candidate(
             owners=current_owners,
             wave_assignment=wave_assignment,
         )
 
-        if cp_size >= 8:
-            search_steps_remaining = 0
-        else:
-            search_steps_remaining = int(config.planner_max_search_steps)
+        search_steps_remaining = (
+            0 if cp_size >= 8 else int(config.planner_max_search_steps)
+        )
         if cp_size == 4 and search_steps_remaining > 0:
             probe_move = _best_improving_move(
                 current_owners=current_owners,
@@ -1725,27 +1157,13 @@ def _search_chunk_assignment(
                 break
             current_owners, current_eval = best_move
 
-        if best_eval is None or float(current_eval["score"]) + 1e-9 < float(
-            best_eval["score"]
+        if best is None or float(current_eval["score"]) + 1e-9 < float(
+            best[2]["score"]
         ):
-            best_owners = current_owners
-            best_waves = wave_assignment
-            best_eval = current_eval
-
-    if best_eval is None:
-        best_owners = _contiguous_chunk_assignment(q_weights=q_weights, cp_size=cp_size)
-        best_waves = _wave_assignment(chunk_count=len(chunk_ranges), wave_count=1)
-        best_eval = _evaluate_candidate(
-            owners=best_owners,
-            wave_assignment=best_waves,
-        )
-    return best_owners, best_waves, best_eval
-
-
-def _concatenate_peer_ranges(
-    ranges_by_peer: list[tuple[TokenRange, ...]] | tuple[tuple[TokenRange, ...], ...],
-) -> tuple[tuple[TokenRange, ...], ...]:
-    return tuple(tuple(ranges) for ranges in ranges_by_peer)
+            best = (current_owners, wave_assignment, current_eval)
+    if best is None:
+        raise RuntimeError("Failed to evaluate any CP planner wave assignment.")
+    return best
 
 
 def _flatten_ranges_by_peer(
@@ -1965,16 +1383,8 @@ def _build_rank_runtime_plan(
             _remap_subrange(range_, host_local_ranges)
             for range_ in local_global_k_ranges
         ),
-        kv_fetch_plan=KvFetchPlan(
-            send_splits=tuple(0 for _ in range(cp_size)),
-            recv_splits=tuple(0 for _ in range(cp_size)),
-            send_ranges_by_peer=tuple(tuple() for _ in range(cp_size)),
-        ),
-        dkv_reduce_plan=DkvReducePlan(
-            send_splits=tuple(0 for _ in range(cp_size)),
-            recv_splits=tuple(0 for _ in range(cp_size)),
-            recv_ranges_by_peer=tuple(tuple() for _ in range(cp_size)),
-        ),
+        kv_fetch_plan=None,
+        dkv_reduce_plan=None,
         remote_buffer_range=None,
         block_size=block_size,
     )
@@ -2082,71 +1492,13 @@ def _build_rank_runtime_plan(
         token_layout_index=token_layout_index,
         local_valid_lengths=(local_token_count,),
         local_row_ranges=local_row_ranges,
-        local_token_count=local_token_count,
         stage_plans=tuple(stage_plans),
         backward_stage_indices=tuple(backward_stage_indices + [0]),
-        remote_kv_fetch_plan=KvFetchPlan(
-            send_splits=aggregate_send_splits,
-            recv_splits=tuple(aggregate_recv_splits),
-            send_ranges_by_peer=aggregate_send_ranges,
-        ),
         remote_dkv_reduce_plan=DkvReducePlan(
             send_splits=tuple(aggregate_recv_splits),
             recv_splits=aggregate_send_splits,
             recv_ranges_by_peer=aggregate_send_ranges,
         ),
-    )
-
-
-def make_runtime_key(
-    spec: PackedBatchAttentionSpec,
-    *,
-    topology: ParallelTopology,
-    config: ContextParallelConfig,
-) -> ContextParallelRuntimeKey:
-    if len(spec.rows) != 1:
-        raise RuntimeError(
-            "ART context parallel runtime keys expect exactly one packed sequence, "
-            f"got {len(spec.rows)} rows."
-        )
-    row_signatures = tuple(_row_signature(row) for row in spec.rows)
-    return ContextParallelRuntimeKey(
-        topology=topology,
-        config=config,
-        row_signatures=row_signatures,
-    )
-
-
-def build_context_parallel_token_layout_index(
-    *,
-    group_ids: torch.Tensor,
-    parent_ids: torch.Tensor,
-    topology: ParallelTopology,
-    config: ContextParallelConfig,
-    original_seq_len: int,
-) -> TokenLayoutIndex:
-    """Return the token ownership chosen by the real CP attention planner."""
-
-    spec = build_shared_prefix_attention_spec(
-        group_ids=group_ids, parent_ids=parent_ids
-    )
-    if int(topology.cp) <= 1:
-        valid_tokens = int(spec.rows[0].valid_tokens) if spec.rows else 0
-        return TokenLayoutIndex(
-            ownership_ranges_by_rank=(((0, valid_tokens, 0),) if valid_tokens else (),),
-            token_counts_by_rank=(valid_tokens,),
-        )
-    runtime_config = _config_for_runtime_cp(topology=topology, config=config)
-    _row_spec, chunk_ranges, owners, _wave_assignment = _runtime_plan_assignment(
-        spec,
-        topology=topology,
-        config=runtime_config,
-    )
-    del original_seq_len
-    return _build_runtime_token_layout_index(
-        chunk_ranges=chunk_ranges,
-        owners=owners,
-        cp_size=max(int(topology.cp), 1),
     )
 
 
@@ -2158,6 +1510,7 @@ def prepare_cp_micro(
     cp_group: Any,
     cp_rank: int,
     build_gdn_execution_spec: bool = False,
+    gdn_planner_config: Any | None = None,
     trace_token_uids: bool = False,
     prepare_execution_state: bool = True,
     block_mask_variants: tuple[CpBlockMaskVariant, ...] = (),
@@ -2166,7 +1519,7 @@ def prepare_cp_micro(
 ) -> PreparedMegatronBatch:
     """Prepare one CP microbatch with a CPU-only planning phase.
 
-    The intended overlap contract is: build the shared-prefix/runtime plan from
+    The intended overlap contract is: build the prefix-tree/runtime plan from
     CPU metadata, then materialize local tensors and BlockMasks on
     `target_device`. Passing CUDA `group_ids` or `parent_ids` still works for
     older direct callers, but it reintroduces D2H syncs and invalidates the
@@ -2179,6 +1532,7 @@ def prepare_cp_micro(
         cp_group=cp_group,
         cp_rank=cp_rank,
         build_gdn_execution_spec=build_gdn_execution_spec,
+        gdn_planner_config=gdn_planner_config,
         block_mask_variants=block_mask_variants,
         target_device=target_device,
     )
@@ -2193,7 +1547,7 @@ def prepare_cp_micro(
         ref_logprobs=ref_logprobs,
     )
     if tensors.token_uids is not None:
-        state = state.model_copy(update={"trace_token_uids": tensors.token_uids})
+        state = replace(state, trace_token_uids=tensors.token_uids)
     if prepare_execution_state:
         from .executor import prepare_context_parallel_execution_state
 
@@ -2218,6 +1572,7 @@ def prepare_megatron_context_parallel_state(
     cp_group: Any,
     cp_rank: int,
     build_gdn_execution_spec: bool = False,
+    gdn_planner_config: Any | None = None,
     block_mask_variants: tuple[CpBlockMaskVariant, ...] = (),
     target_device: torch.device | None = None,
 ) -> tuple[ArtContextParallelState, RankRuntimePlan, PackedBatchAttentionSpec, int]:
@@ -2226,7 +1581,7 @@ def prepare_megatron_context_parallel_state(
     This is the portion of CP prepare that must stay free of CUDA reads so the
     training loop can run it after enqueueing backward for the previous
     microbatch. If device metadata reaches this function, scalar reads,
-    cache-key hashing, and shared-prefix parsing can block the host on GPU work.
+    cache-key hashing, and prefix-tree parsing can block the host on GPU work.
     """
     if int(topology.cp) <= 1:
         raise RuntimeError(
@@ -2245,48 +1600,43 @@ def prepare_megatron_context_parallel_state(
     group_ids_cpu = _planning_metadata_cpu(micro["group_ids"])
     parent_ids_cpu = _planning_metadata_cpu(micro["parent_ids"])
     input_pos_cpu = _planning_metadata_cpu(micro["input_pos"])
-    runtime_config = _config_for_runtime_cp(topology=topology, config=config)
     planning_key = _planning_bundle_cache_key(
         group_ids=group_ids_cpu,
         parent_ids=parent_ids_cpu,
         topology=topology,
-        config=runtime_config,
+        config=config,
         original_seq_len=int(micro["tokens"].shape[1]),
         build_gdn_execution_spec=build_gdn_execution_spec,
     )
     bundle = _PLANNING_BUNDLE_CACHE.get(planning_key)
     if bundle is None:
-        spec = build_shared_prefix_attention_spec(
+        spec = build_prefix_tree_attention_spec(
             group_ids=group_ids_cpu,
             parent_ids=parent_ids_cpu,
         )
-        runtime_key = make_runtime_key(spec, topology=topology, config=runtime_config)
         runtime_plan = get_or_build_runtime_plan(
             spec,
             topology=topology,
-            config=runtime_config,
-            runtime_key=runtime_key,
+            config=config,
             original_seq_len=int(micro["tokens"].shape[1]),
         )
         gdn_execution_spec = None
         if build_gdn_execution_spec:
-            from art.megatron.gdn.gdn_shared_prefix import (
-                parse_gdn_shared_prefix_segments,
+            from art.megatron.gdn.gdn_prefix_tree import (
+                parse_gdn_prefix_tree_segments,
             )
 
-            gdn_execution_spec = parse_gdn_shared_prefix_segments(
+            gdn_execution_spec = parse_gdn_prefix_tree_segments(
                 group_ids_cpu,
                 parent_ids_cpu,
-                min_completions_per_family=0,
             )
         bundle = _PlanningBundle(
             spec=spec,
-            runtime_key=runtime_key,
-            runtime_plan=runtime_plan,
+            rank_plans=runtime_plan,
             gdn_execution_spec=gdn_execution_spec,
         )
         _cache_put(_PLANNING_BUNDLE_CACHE, planning_key, bundle)
-    rank_plan = bundle.runtime_plan.rank_plans[int(cp_rank)]
+    rank_plan = bundle.rank_plans[int(cp_rank)]
     gdn_execution_plan = None
     if build_gdn_execution_spec:
         if bundle.gdn_execution_spec is None:
@@ -2294,14 +1644,18 @@ def prepare_megatron_context_parallel_state(
         gdn_plan_device = (
             target_device if target_device is not None else micro["tokens"].device
         )
-        rank_gdn_key = _rank_plan_cache_key(
-            planning_key=planning_key,
-            device=gdn_plan_device,
-            cp_rank=int(cp_rank),
+        rank_gdn_key = (
+            planning_key,
+            gdn_plan_device.type,
+            gdn_plan_device.index,
+            int(cp_rank),
+            _json_cache_key(_dataclass_payload(gdn_planner_config))
+            if gdn_planner_config is not None
+            else "",
         )
         gdn_execution_plan = _GDN_RANK_PLAN_CACHE.get(rank_gdn_key)
         if gdn_execution_plan is None:
-            from art.megatron.gdn.gdn_shared_prefix import (
+            from art.megatron.gdn.gdn_prefix_tree import (
                 build_gdn_rank_execution_plan,
             )
 
@@ -2311,26 +1665,20 @@ def prepare_megatron_context_parallel_state(
                 cp_rank=int(cp_rank),
                 cp_size=int(topology.cp),
                 attention_token_layout_index=rank_plan.token_layout_index,
+                planner_config=gdn_planner_config,
             )
             _cache_put(_GDN_RANK_PLAN_CACHE, rank_gdn_key, gdn_execution_plan)
-    planner_provenance = _planner_provenance(
-        topology=topology,
-        config=runtime_config,
-        warn=int(cp_rank) == 0,
-    )
     pad_multiple = int(topology.tp) if bool(topology.sp) and int(topology.tp) > 1 else 1
     state = ArtContextParallelState(
-        runtime_key=bundle.runtime_key,
         rank_plan=rank_plan,
         cp_group=cp_group,
-        config=runtime_config,
+        config=config,
         group_ids=group_ids_cpu[0].contiguous(),
         parent_ids=parent_ids_cpu[0].contiguous(),
         input_pos=input_pos_cpu[0].contiguous(),
         block_mask_variants=block_mask_variants,
         gdn_execution_spec=bundle.gdn_execution_spec,
         gdn_execution_plan=gdn_execution_plan,
-        planner_provenance=planner_provenance,
         trace_token_uids=None,
     )
     return state, rank_plan, bundle.spec, pad_multiple
@@ -2378,115 +1726,43 @@ def dispatch_megatron_context_parallel_training_tensors(
         if trace_token_uids
         else None
     )
-    local_tokens = _dispatch_tensor(
-        micro["tokens"],
-        rank_plan=rank_plan,
-        pad_value=0,
-        pad_multiple=pad_multiple,
-        dispatch_meta_cache=dispatch_meta_cache,
-    )
-    local_labels = _dispatch_tensor(
-        labels,
-        rank_plan=rank_plan,
-        pad_value=-100,
-        pad_multiple=pad_multiple,
-        dispatch_meta_cache=dispatch_meta_cache,
-    )
-    local_input_pos = _dispatch_tensor(
-        micro["input_pos"],
-        rank_plan=rank_plan,
-        pad_value=0,
-        pad_multiple=pad_multiple,
-        dispatch_meta_cache=dispatch_meta_cache,
-    )
-    local_assistant_mask = _dispatch_tensor(
-        assistant_mask,
-        rank_plan=rank_plan,
-        pad_value=False,
-        pad_multiple=pad_multiple,
-        dispatch_meta_cache=dispatch_meta_cache,
-    ).to(dtype=torch.bool)
-    local_group_ids = _dispatch_tensor(
-        shifted_group_ids,
-        rank_plan=rank_plan,
-        pad_value=0,
-        pad_multiple=pad_multiple,
-        dispatch_meta_cache=dispatch_meta_cache,
-    )
-    local_old_logprobs = _dispatch_tensor(
-        old_logprobs,
-        rank_plan=rank_plan,
-        pad_value=float("nan"),
-        pad_multiple=pad_multiple,
-        dispatch_meta_cache=dispatch_meta_cache,
-    )
-    local_original_logprobs = (
-        None
-        if original_logprobs is None
-        else _dispatch_tensor(
-            original_logprobs,
+
+    def dispatch(
+        tensor: torch.Tensor,
+        pad_value: int | float | bool,
+        *,
+        move_to_target: bool = True,
+    ) -> torch.Tensor:
+        local = _dispatch_tensor(
+            tensor,
             rank_plan=rank_plan,
-            pad_value=0.0,
+            pad_value=pad_value,
             pad_multiple=pad_multiple,
             dispatch_meta_cache=dispatch_meta_cache,
         )
-    )
-    local_ref_logprobs = (
-        None
-        if ref_logprobs is None
-        else _dispatch_tensor(
-            ref_logprobs,
-            rank_plan=rank_plan,
-            pad_value=float("nan"),
-            pad_multiple=pad_multiple,
-            dispatch_meta_cache=dispatch_meta_cache,
-        )
-    )
-    local_advantages = _dispatch_tensor(
-        advantages,
-        rank_plan=rank_plan,
-        pad_value=0.0,
-        pad_multiple=pad_multiple,
-        dispatch_meta_cache=dispatch_meta_cache,
-    )
-    local_weights = _dispatch_tensor(
-        weights,
-        rank_plan=rank_plan,
-        pad_value=0.0,
-        pad_multiple=pad_multiple,
-        dispatch_meta_cache=dispatch_meta_cache,
-    )
+        return _to_target_device(local, target_device) if move_to_target else local
+
+    def maybe_dispatch(
+        tensor: torch.Tensor | None,
+        pad_value: int | float | bool,
+    ) -> torch.Tensor | None:
+        return None if tensor is None else dispatch(tensor, pad_value)
+
     local_token_uids = (
-        None
-        if token_uids is None
-        else _dispatch_tensor(
-            token_uids,
-            rank_plan=rank_plan,
-            pad_value=-1,
-            pad_multiple=pad_multiple,
-            dispatch_meta_cache=dispatch_meta_cache,
-        )
+        None if token_uids is None else dispatch(token_uids, -1, move_to_target=False)
     )
     return DispatchedPackedTensors(
-        tokens=_to_target_device(local_tokens, target_device),
-        labels=_to_target_device(local_labels, target_device),
-        input_pos=_to_target_device(local_input_pos, target_device),
-        assistant_mask=_to_target_device(local_assistant_mask, target_device),
-        group_ids=_to_target_device(local_group_ids, target_device),
-        old_logprobs=_to_target_device(local_old_logprobs, target_device),
-        advantages=_to_target_device(local_advantages, target_device),
-        weights=_to_target_device(local_weights, target_device),
+        tokens=dispatch(micro["tokens"], 0),
+        labels=dispatch(labels, -100),
+        input_pos=dispatch(micro["input_pos"], 0),
+        assistant_mask=dispatch(assistant_mask, False).to(dtype=torch.bool),
+        group_ids=dispatch(shifted_group_ids, 0),
+        old_logprobs=dispatch(old_logprobs, float("nan")),
+        advantages=dispatch(advantages, 0.0),
+        weights=dispatch(weights, 0.0),
         valid_lengths=rank_plan.local_valid_lengths,
-        original_logprobs=(
-            None
-            if local_original_logprobs is None
-            else _to_target_device(local_original_logprobs, target_device)
-        ),
-        ref_logprobs=(
-            None
-            if local_ref_logprobs is None
-            else _to_target_device(local_ref_logprobs, target_device)
-        ),
+        original_logprobs=maybe_dispatch(original_logprobs, 0.0),
+        ref_logprobs=maybe_dispatch(ref_logprobs, float("nan")),
         loss_all_reduce_group=cp_group,
         token_uids=None if local_token_uids is None else local_token_uids.contiguous(),
     )
@@ -2497,12 +1773,13 @@ def get_or_build_runtime_plan(
     *,
     topology: ParallelTopology,
     config: ContextParallelConfig,
-    runtime_key: ContextParallelRuntimeKey,
     original_seq_len: int,
-) -> ContextParallelRuntimePlan:
-    key = (
-        _json_cache_key(runtime_key.model_dump(mode="json")),
-        int(original_seq_len),
+) -> tuple[RankRuntimePlan, ...]:
+    key = _runtime_plan_cache_key(
+        spec,
+        topology=topology,
+        config=config,
+        original_seq_len=original_seq_len,
     )
     cached = _RUNTIME_PLAN_CACHE.get(key)
     if cached is not None:
@@ -2515,25 +1792,6 @@ def get_or_build_runtime_plan(
     )
     _cache_put(_RUNTIME_PLAN_CACHE, key, plan)
     return plan
-
-
-def get_or_build_rank_runtime_plan(
-    spec: PackedBatchAttentionSpec,
-    *,
-    topology: ParallelTopology,
-    config: ContextParallelConfig,
-    runtime_key: ContextParallelRuntimeKey,
-    original_seq_len: int,
-    target_rank: int,
-) -> RankRuntimePlan:
-    del runtime_key
-    return _build_rank_runtime_plan_for_spec(
-        spec,
-        topology=topology,
-        config=config,
-        original_seq_len=original_seq_len,
-        target_rank=target_rank,
-    )
 
 
 def _runtime_plan_assignment(
@@ -2581,45 +1839,13 @@ def _runtime_plan_assignment(
     return row_spec, chunk_ranges, owners, wave_assignment
 
 
-def _build_rank_runtime_plan_for_spec(
-    spec: PackedBatchAttentionSpec,
-    *,
-    topology: ParallelTopology,
-    config: ContextParallelConfig,
-    original_seq_len: int,
-    target_rank: int,
-) -> RankRuntimePlan:
-    row_spec, chunk_ranges, owners, wave_assignment = _runtime_plan_assignment(
-        spec,
-        topology=topology,
-        config=config,
-    )
-    cp_size = max(int(topology.cp), 1)
-    token_layout_index = _build_runtime_token_layout_index(
-        chunk_ranges=chunk_ranges,
-        owners=owners,
-        cp_size=cp_size,
-    )
-    return _build_rank_runtime_plan(
-        row_spec=row_spec,
-        chunk_ranges=chunk_ranges,
-        owners=owners,
-        wave_assignment=wave_assignment,
-        token_layout_index=token_layout_index,
-        cp_size=cp_size,
-        original_seq_len=original_seq_len,
-        target_rank=int(target_rank),
-        block_size=int(config.block_size),
-    )
-
-
 def _build_runtime_plan(
     spec: PackedBatchAttentionSpec,
     *,
     topology: ParallelTopology,
     config: ContextParallelConfig,
     original_seq_len: int,
-) -> ContextParallelRuntimePlan:
+) -> tuple[RankRuntimePlan, ...]:
     row_spec, chunk_ranges, owners, wave_assignment = _runtime_plan_assignment(
         spec,
         topology=topology,
@@ -2631,7 +1857,7 @@ def _build_runtime_plan(
         owners=owners,
         cp_size=cp_size,
     )
-    rank_plans = [
+    return tuple(
         _build_rank_runtime_plan(
             row_spec=row_spec,
             chunk_ranges=chunk_ranges,
@@ -2644,12 +1870,6 @@ def _build_runtime_plan(
             block_size=int(config.block_size),
         )
         for rank in range(cp_size)
-    ]
-    return ContextParallelRuntimePlan(
-        topology=topology,
-        config=config,
-        token_layout_index=token_layout_index,
-        rank_plans=tuple(rank_plans),
     )
 
 
@@ -2677,9 +1897,40 @@ def _build_runtime_token_layout_index(
 def _row_signature(row_spec: PackedRowAttentionSpec) -> str:
     payload = {
         "valid_tokens": row_spec.valid_tokens,
-        "slices": [slice_.model_dump(mode="json") for slice_ in row_spec.slices],
+        "slices": [_attn_slice_payload(slice_) for slice_ in row_spec.slices],
     }
     return json.dumps(payload, sort_keys=True)
+
+
+def _runtime_plan_cache_key(
+    spec: PackedBatchAttentionSpec,
+    *,
+    topology: ParallelTopology,
+    config: ContextParallelConfig,
+    original_seq_len: int,
+) -> str:
+    return _json_cache_key(
+        {
+            "topology": _dataclass_payload(topology),
+            "config": _dataclass_payload(config),
+            "row_signatures": tuple(_row_signature(row) for row in spec.rows),
+            "original_seq_len": int(original_seq_len),
+        }
+    )
+
+
+def _dataclass_payload(value: Any) -> dict[str, Any]:
+    return dict(value.__dict__)
+
+
+def _attn_slice_payload(slice_: AttnSlice) -> dict[str, Any]:
+    return {
+        "q_range": _dataclass_payload(slice_.q_range),
+        "k_range": _dataclass_payload(slice_.k_range),
+        "mask_kind": slice_.mask_kind.value,
+        "row_index": slice_.row_index,
+        "family_index": slice_.family_index,
+    }
 
 
 def _range_key(range_: TokenRange) -> tuple[int, int]:
@@ -2721,101 +1972,6 @@ def _set_stage_token_indices(
             f"{int(source_indices[mismatch_offset].item())}"
         )
     current_indices.copy_(source_indices)
-
-
-def _token_costs(row_spec: PackedRowAttentionSpec) -> list[float]:
-    costs = [0.0] * row_spec.valid_tokens
-    for slice_ in row_spec.slices:
-        q_range = slice_.q_range
-        k_range = slice_.k_range
-        if slice_.mask_kind is AttnMaskKind.FULL:
-            cost = float(k_range.size())
-            for q_idx in range(q_range.start, q_range.end):
-                costs[q_idx] += cost
-            continue
-        if q_range.size() != k_range.size():
-            raise RuntimeError(
-                "The current planner only supports causal slices with matched q/k sizes, got "
-                f"{q_range} vs {k_range}"
-            )
-        for q_idx in range(q_range.start, q_range.end):
-            costs[q_idx] += float(q_idx - q_range.start + 1)
-    return costs
-
-
-def _split_row_by_cost(
-    row_spec: PackedRowAttentionSpec,
-    *,
-    cp_size: int,
-    block_size: int,
-) -> tuple[TokenRange | None, ...]:
-    if cp_size == 1:
-        return (TokenRange(start=0, end=row_spec.valid_tokens),)
-    if row_spec.valid_tokens == 0:
-        return tuple(None for _ in range(cp_size))
-
-    costs = _token_costs(row_spec)
-    prefix = [0.0]
-    for cost in costs:
-        prefix.append(prefix[-1] + cost)
-    total_cost = prefix[-1]
-    boundaries = [0]
-    block_aligned_split = int(block_size) > 1 and row_spec.valid_tokens >= (
-        cp_size * int(block_size)
-    )
-    for split_index in range(1, cp_size):
-        remaining_ranks = cp_size - split_index
-        min_boundary = boundaries[-1]
-        max_boundary = row_spec.valid_tokens - remaining_ranks
-        if max_boundary <= min_boundary:
-            boundaries.append(min_boundary)
-            continue
-        target = (
-            total_cost * split_index / cp_size
-            if total_cost > 0.0
-            else row_spec.valid_tokens * split_index / cp_size
-        )
-        best_boundary = min_boundary + 1
-        best_error = float("inf")
-        candidate_boundaries = range(min_boundary + 1, max_boundary + 1)
-        if block_aligned_split:
-            aligned_start = (
-                (min_boundary + 1 + block_size - 1) // block_size
-            ) * block_size
-            aligned_end = (max_boundary // block_size) * block_size
-            if aligned_start <= aligned_end:
-                candidate_boundaries = range(aligned_start, aligned_end + 1, block_size)
-        for boundary in candidate_boundaries:
-            current = prefix[boundary] if total_cost > 0.0 else float(boundary)
-            error = abs(current - target)
-            if error < best_error:
-                best_error = error
-                best_boundary = boundary
-        boundaries.append(best_boundary)
-    boundaries.append(row_spec.valid_tokens)
-
-    ranges: list[TokenRange | None] = []
-    for start, end in zip(boundaries[:-1], boundaries[1:]):
-        if end <= start:
-            ranges.append(None)
-        else:
-            ranges.append(TokenRange(start=start, end=end))
-    return tuple(ranges)
-
-
-def _intersections(
-    base_range: TokenRange,
-    owner_ranges: tuple[TokenRange | None, ...],
-) -> list[tuple[int, TokenRange]]:
-    intersections: list[tuple[int, TokenRange]] = []
-    for rank, owner_range in enumerate(owner_ranges):
-        if owner_range is None:
-            continue
-        start = max(base_range.start, owner_range.start)
-        end = min(base_range.end, owner_range.end)
-        if end > start:
-            intersections.append((rank, TokenRange(start=start, end=end)))
-    return intersections
 
 
 def _resolve_stage_mask_kind(

@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import math
-from typing import Any
+from typing import Any, cast
 
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.process_groups_config import ProcessGroupCollection
@@ -14,7 +14,8 @@ from torch.nn.attention.flex_attention import BlockMask
 
 from art.megatron.flex_attn.attention import (
     FlexAttentionWrapper,
-    SharedPrefixAttentionState,
+    PrefixTreeAttentionState,
+    _configure_softmax_offset,
     _triton_num_stages_2_head_dims,
 )
 
@@ -66,6 +67,11 @@ class ArtContextParallelCoreAttention(torch.nn.Module):
             self.softmax_scale = 1.0 / math.sqrt(head_dim)
         else:
             self.softmax_scale = softmax_scale
+        _configure_softmax_offset(
+            self,
+            self.config,
+            self.num_attention_heads_per_partition,
+        )
 
     def forward(
         self,
@@ -100,15 +106,16 @@ class ArtContextParallelCoreAttention(torch.nn.Module):
                 compile_enabled=True,
                 sliding_window=getattr(self, "art_sliding_window", None),
                 triton_num_stages_2_head_dims=self.triton_num_stages_2_head_dims,
+                softmax_offset=cast(Tensor | None, getattr(self, "softmax_offset")),
             )
         else:
-            if isinstance(attention_bias, SharedPrefixAttentionState):
+            if isinstance(attention_bias, PrefixTreeAttentionState):
                 block_mask = attention_bias.block_mask_for_window(
                     getattr(self, "art_sliding_window", None)
                 )
             else:
                 assert isinstance(attention_bias, BlockMask), (
-                    "Expected ArtContextParallelState, SharedPrefixAttentionState, or BlockMask in attention_bias."
+                    "Expected ArtContextParallelState, PrefixTreeAttentionState, or BlockMask in attention_bias."
                 )
                 block_mask = attention_bias
             q = query.permute(1, 2, 0, 3)
@@ -122,6 +129,7 @@ class ArtContextParallelCoreAttention(torch.nn.Module):
                 scale=self.softmax_scale,
                 enable_gqa=self.num_attention_heads_per_partition
                 != self.num_query_groups_per_partition,
+                softmax_offset=cast(Tensor | None, getattr(self, "softmax_offset")),
             )
             out = out_dense.permute(2, 0, 1, 3).contiguous()
 

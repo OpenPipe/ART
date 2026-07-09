@@ -43,6 +43,10 @@ from art.utils.s3 import (
     pull_model_from_s3,
     push_model_to_s3,
 )
+from art.vllm_runtime import (
+    get_external_vllm_runtime_config,
+    openai_base_url_from_vllm_server_url,
+)
 from mp_actors import close_proxy, move_to_child_process
 
 from .. import dev
@@ -111,6 +115,16 @@ def _configured_chat_template_server_arg(
     return chat_template_path or chat_template
 
 
+def _model_support_default_chat_template(
+    base_model: str,
+    internal_config: dev.InternalModelConfig,
+) -> str | None:
+    handler = _model_support_handler(base_model, internal_config)
+    if handler is None:
+        return None
+    return handler.default_chat_template()
+
+
 def _apply_configured_chat_template(
     tokenizer: PreTrainedTokenizerBase,
     internal_config: dev.InternalModelConfig,
@@ -120,11 +134,37 @@ def _apply_configured_chat_template(
         tokenizer.chat_template = chat_template
 
 
+def _model_support_handler(
+    base_model: str,
+    internal_config: dev.InternalModelConfig,
+) -> Any | None:
+    from ..megatron.model_support.registry import (
+        UnsupportedModelArchitectureError,
+        get_model_support_handler,
+    )
+
+    try:
+        return get_model_support_handler(
+            base_model,
+            allow_unvalidated_arch=bool(
+                internal_config.get("allow_unvalidated_arch", False)
+            ),
+        )
+    except UnsupportedModelArchitectureError:
+        return None
+
+
 def _apply_configured_chat_template_server_args(
     config_dict: dict,
     internal_config: dev.InternalModelConfig,
+    *,
+    base_model: str | None = None,
 ) -> None:
     chat_template = _configured_chat_template_server_arg(internal_config)
+    if chat_template is None and base_model is not None:
+        chat_template = _model_support_default_chat_template(
+            base_model, internal_config
+        )
     if chat_template is None:
         return
     server_args = dict(config_dict.get("server_args", {}))
@@ -299,6 +339,19 @@ class LocalBackend(Backend):
             "chat_template_tool_schema_format",
             self._default_chat_template_tool_schema_format,
         )
+
+    def _configure_training_tokenizer(
+        self,
+        tokenizer: PreTrainedTokenizerBase,
+        *,
+        model: AnyTrainableModel,
+        internal_config: dev.InternalModelConfig,
+    ) -> PreTrainedTokenizerBase:
+        _apply_configured_chat_template(tokenizer, internal_config)
+        handler = _model_support_handler(model.base_model, internal_config)
+        if handler is None:
+            return tokenizer
+        return handler.configure_tokenizer(tokenizer, internal_config=internal_config)
 
     def __enter__(self) -> Self:
         return self
@@ -524,8 +577,11 @@ class LocalBackend(Backend):
         internal_config = cast(dev.InternalModelConfig, model._internal_config or {})
         tokenizer_key = _tokenizer_cache_key(model.base_model, internal_config)
         if tokenizer_key not in self._tokenizers:
-            tokenizer = AutoTokenizer.from_pretrained(model.base_model)
-            _apply_configured_chat_template(tokenizer, internal_config)
+            tokenizer = self._configure_training_tokenizer(
+                AutoTokenizer.from_pretrained(model.base_model),
+                model=model,
+                internal_config=internal_config,
+            )
             self._tokenizers[tokenizer_key] = tokenizer
         if model.base_model not in self._image_processors:
             try:
@@ -702,8 +758,15 @@ class LocalBackend(Backend):
         service = await self._get_service(model)
         host, port = await service.start_openai_server(config=resolved_config)
 
-        base_url = f"http://{host}:{port}/v1"
-        api_key = server_args.get("api_key") or "default"
+        external_runtime = get_external_vllm_runtime_config(internal_config)
+        if external_runtime is not None:
+            base_url = openai_base_url_from_vllm_server_url(external_runtime.server_url)
+            api_key = (
+                server_args.get("api_key") or external_runtime.api_key or "default"
+            )
+        else:
+            base_url = f"http://{host}:{port}/v1"
+            api_key = server_args.get("api_key") or "default"
 
         return base_url, api_key
 
@@ -1130,8 +1193,11 @@ class LocalBackend(Backend):
         internal_config = cast(dev.InternalModelConfig, model._internal_config or {})
         tokenizer_key = _tokenizer_cache_key(model.base_model, internal_config)
         if tokenizer_key not in self._tokenizers:
-            tokenizer = AutoTokenizer.from_pretrained(model.base_model)
-            _apply_configured_chat_template(tokenizer, internal_config)
+            tokenizer = self._configure_training_tokenizer(
+                AutoTokenizer.from_pretrained(model.base_model),
+                model=model,
+                internal_config=internal_config,
+            )
             self._tokenizers[tokenizer_key] = tokenizer
         tokenizer = self._tokenizers[tokenizer_key]
 

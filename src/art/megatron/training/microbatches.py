@@ -17,7 +17,7 @@ from art.megatron.context_parallel.types import (
     PreparedMegatronBatch,
 )
 from art.megatron.flex_attn.compiled import flash_sparse_block_size_for_head_dim
-from art.megatron.shared_prefix_state import create_shared_prefix_state
+from art.megatron.prefix_tree_state import create_prefix_tree_state
 from art.megatron.training.trace import (
     packed_sequence_token_uids,
     sft_sequence_token_uids,
@@ -313,6 +313,8 @@ def _causal_attention_state(
     seq_len: int,
     device: torch.device,
     *,
+    provider: Any,
+    model_support_handler: Any,
     sliding_windows: tuple[int, ...] = (),
     build_gdn_execution_spec: bool,
     attention_head_dim: int | None = None,
@@ -320,16 +322,31 @@ def _causal_attention_state(
 ) -> Any:
     group_ids = torch.zeros((1, seq_len), dtype=torch.int64, device="cpu")
     parent_ids = torch.zeros_like(group_ids)
-    return create_shared_prefix_state(
+    return create_prefix_tree_state(
         group_ids=group_ids,
         parent_ids=parent_ids,
         target_device=device,
         input_pos=torch.arange(seq_len, dtype=torch.int64).unsqueeze(0),
         sliding_windows=sliding_windows,
         build_gdn_execution_spec=build_gdn_execution_spec,
+        model_support_handler=model_support_handler,
         attention_head_dim=attention_head_dim,
         attention_value_head_dim=attention_value_head_dim,
+        gdn_planner_config=_gdn_planner_config_for_provider(
+            provider,
+            model_support_handler,
+        ),
     )
+
+
+def _gdn_planner_config_for_provider(
+    provider: Any, model_support_handler: Any
+) -> Any | None:
+    if not bool(getattr(model_support_handler, "build_gdn_execution_spec", False)):
+        return None
+    from art.megatron.gdn.gdn_prefix_tree import GdnPlannerConfig
+
+    return GdnPlannerConfig.from_provider(provider)
 
 
 def _next_micro_lookahead(
@@ -351,7 +368,7 @@ def _prepare_dense_rl_micro(
     model_support_handler: Any,
     ref_logprobs: torch.Tensor | None,
 ) -> PreparedRLMicroInputs:
-    attention_state = create_shared_prefix_state(
+    attention_state = create_prefix_tree_state(
         group_ids=micro["group_ids"],
         parent_ids=micro["parent_ids"],
         target_device=device,
@@ -360,8 +377,13 @@ def _prepare_dense_rl_micro(
         build_gdn_execution_spec=bool(
             getattr(model_support_handler, "build_gdn_execution_spec", False)
         ),
+        model_support_handler=model_support_handler,
         attention_head_dim=getattr(provider, "kv_channels", None),
         attention_value_head_dim=getattr(provider, "kv_channels", None),
+        gdn_planner_config=_gdn_planner_config_for_provider(
+            provider,
+            model_support_handler,
+        ),
     )
     _move_inputs_to_device(micro, device)
     shifted_labels = shift_tensor(micro["tokens"], -100)
@@ -406,6 +428,10 @@ def _prepare_rl_cp_micro_full(
         cp_rank=ps.get_context_parallel_rank(),
         build_gdn_execution_spec=bool(
             getattr(model_support_handler, "build_gdn_execution_spec", False)
+        ),
+        gdn_planner_config=_gdn_planner_config_for_provider(
+            provider,
+            model_support_handler,
         ),
         trace_token_uids=trace_token_uids,
         block_mask_variants=_art_flex_cp_block_mask_variants(provider, device),
@@ -561,6 +587,8 @@ def _prepare_dense_sft_micro(
             build_gdn_execution_spec=bool(
                 getattr(model_support_handler, "build_gdn_execution_spec", False)
             ),
+            provider=provider,
+            model_support_handler=model_support_handler,
             attention_head_dim=getattr(provider, "kv_channels", None),
             attention_value_head_dim=getattr(provider, "kv_channels", None),
         ),
@@ -622,7 +650,7 @@ def _prepare_sft_cp_micro_full(
 
     The synthetic sparse-packed metadata is constructed on CPU and only the
     rank-local dispatched tensors are moved to `device`. Constructing it on CUDA
-    would make shared-prefix planning read metadata back from the GPU.
+    would make prefix-tree planning read metadata back from the GPU.
     """
     sparse_micro = _sft_inputs_to_sparse_packed_tensors(
         micro,
@@ -636,6 +664,10 @@ def _prepare_sft_cp_micro_full(
         cp_rank=ps.get_context_parallel_rank(),
         build_gdn_execution_spec=bool(
             getattr(model_support_handler, "build_gdn_execution_spec", False)
+        ),
+        gdn_planner_config=_gdn_planner_config_for_provider(
+            provider,
+            model_support_handler,
         ),
         trace_token_uids=trace_token_uids,
         block_mask_variants=_art_flex_cp_block_mask_variants(provider, device),

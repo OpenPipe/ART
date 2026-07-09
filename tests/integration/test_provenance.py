@@ -4,10 +4,10 @@ import asyncio
 from datetime import datetime
 
 from dotenv import load_dotenv
-import wandb
 
 import art
 from art.serverless.backend import ServerlessBackend
+from art.utils import wandb_sdk
 
 load_dotenv()
 
@@ -41,7 +41,7 @@ def get_latest_artifact_provenance(
     entity: str, project: str, name: str
 ) -> list[str] | None:
     """Fetch provenance from the latest W&B artifact's metadata."""
-    api = wandb.Api()
+    api = wandb_sdk.api()
     artifact = api.artifact(f"{entity}/{project}/{name}:latest", type="lora")
     return artifact.metadata.get("wandb.provenance")
 

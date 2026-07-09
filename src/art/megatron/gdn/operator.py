@@ -1,22 +1,24 @@
 from __future__ import annotations
 
 from types import MethodType
-from typing import Any, Callable, Literal, NamedTuple, Sequence, cast
+from typing import Any, Callable, Iterable, Literal, NamedTuple, Sequence, cast
 
 import torch
 from torch import Tensor
 import torch.distributed as dist
 import torch.nn.functional as F
+import triton
+import triton.language as tl
 
 from .conv_gelu import packed_varlen_causal_conv
 from .fla_cp import chunk_gated_delta_rule_native_cp
-from .gdn_shared_prefix import (
+from .gdn_prefix_tree import (
     GdnPackedExecutionSpec,
-    GdnParentStateTransferPlan,
     GdnRankExecutionPlan,
     GdnSegmentBucketPlan,
+    GdnStateExchangePlan,
     build_gdn_rank_execution_plan,
-    parse_gdn_shared_prefix_segments,
+    parse_gdn_prefix_tree_segments,
 )
 from .segment_layout import (
     gather_bucket_streams_compact as _gather_bucket_streams_compact_fused,
@@ -46,8 +48,8 @@ def set_gdn_trace_token_uid_hooks(hooks: Any | None) -> Any | None:
     return previous
 
 
-def install_shared_prefix_gdn_hooks(model_chunks: Sequence[Any]) -> None:
-    """Patch Megatron GatedDeltaNet modules to honor ART shared-prefix packing."""
+def install_prefix_tree_gdn_hooks(model_chunks: Sequence[Any]) -> None:
+    """Patch Megatron GatedDeltaNet modules to honor ART prefix-tree packing."""
 
     gated_delta_net_type = _optional_gated_delta_net_type()
     if gated_delta_net_type is None:
@@ -56,12 +58,12 @@ def install_shared_prefix_gdn_hooks(model_chunks: Sequence[Any]) -> None:
         for module in chunk.modules():
             if not isinstance(module, gated_delta_net_type):
                 continue
-            if getattr(module, "_art_shared_prefix_gdn_hooked", False):
+            if getattr(module, "_art_prefix_tree_gdn_hooked", False):
                 continue
             original_forward = module.forward
             module._art_physical_forward = original_forward
-            module.forward = MethodType(_shared_prefix_forward, module)
-            module._art_shared_prefix_gdn_hooked = True
+            module.forward = MethodType(_prefix_tree_forward, module)
+            module._art_prefix_tree_gdn_hooked = True
 
 
 def install_gdn_island_hooks(model_chunks: Sequence[Any]) -> None:
@@ -301,7 +303,8 @@ def _empty_safe_norm_forward(
     return original_forward(input_, *args, **kwargs)
 
 
-def _shared_prefix_forward(
+@torch.compiler.disable
+def _prefix_tree_forward(
     self: Any,
     hidden_states: Tensor,
     attention_mask: Tensor,
@@ -336,11 +339,9 @@ def _shared_prefix_forward(
 
     del attention_mask, key_value_states, sequence_len_offset, kwargs
     if inference_context is not None or inference_params is not None:
-        raise NotImplementedError("ART shared-prefix GDN does not support inference.")
+        raise NotImplementedError("ART prefix-tree GDN does not support inference.")
     if packed_seq_params is not None:
-        raise NotImplementedError(
-            "PackedSeqParams is not used in ART shared-prefix GDN."
-        )
+        raise NotImplementedError("PackedSeqParams is not used in ART prefix-tree GDN.")
     current_layout = _normalize_cp_layout(
         getattr(attention_bias, "gdn_hidden_layout", "attention")
     )
@@ -355,7 +356,7 @@ def _shared_prefix_forward(
         _mark_cp_layout_active(
             attention_bias, hidden_states, gdn=self, layout=input_layout
         )
-    output = gdn_shared_prefix_forward(
+    output = gdn_prefix_tree_forward(
         self,
         hidden_states,
         group_ids=cast(Tensor, group_ids),
@@ -377,7 +378,7 @@ def _shared_prefix_forward(
 
 
 @torch.compiler.disable
-def gdn_shared_prefix_forward(
+def gdn_prefix_tree_forward(
     gdn: Any,
     hidden_states: Tensor,
     *,
@@ -390,7 +391,7 @@ def gdn_shared_prefix_forward(
     input_layout: Literal["attention", "gdn"] = "attention",
     output_layout: Literal["attention", "gdn"] = "attention",
 ) -> tuple[Tensor, Tensor | None]:
-    """Run one GDN layer over ART shared-prefix packed rows."""
+    """Run one GDN layer over ART prefix-tree packed rows."""
 
     return run_gdn_layer(
         gdn,
@@ -420,7 +421,7 @@ def run_gdn_layer(
     input_layout: Literal["attention", "gdn"] = "attention",
     output_layout: Literal["attention", "gdn"] = "attention",
 ) -> tuple[Tensor, Tensor | None]:
-    """Run one production shared-prefix GDN layer."""
+    """Run one production prefix-tree GDN layer."""
 
     _disable_reentrant_te_linear_transpose_cache(gdn)
     if hidden_states.ndim != 3:
@@ -447,7 +448,7 @@ def run_gdn_layer(
         or int(group_ids.shape[1]) != expected_group_seq_len
     ):
         raise ValueError(
-            "shared-prefix GDN group_ids shape must match the logical sequence "
+            "prefix-tree GDN group_ids shape must match the logical sequence "
             "processed by Megatron GDN after sequence-parallel input gather, got "
             f"hidden={tuple(hidden_states.shape)} "
             f"group_ids={tuple(group_ids.shape)} "
@@ -456,16 +457,14 @@ def run_gdn_layer(
 
     if require_prebuilt_plan and execution_plan is None:
         raise ValueError(
-            "ART shared-prefix GDN production path requires a prebuilt "
-            "GDN execution plan on SharedPrefixAttentionState. Build it once "
-            "per packed sequence via create_shared_prefix_state(..., "
+            "ART prefix-tree GDN production path requires a prebuilt "
+            "GDN execution plan on PrefixTreeAttentionState. Build it once "
+            "per packed sequence via create_prefix_tree_state(..., "
             "build_gdn_execution_spec=True)."
         )
 
     if execution_spec is None and execution_plan is None:
-        execution_spec = parse_gdn_shared_prefix_segments(
-            group_ids, parent_ids, min_completions_per_family=0
-        )
+        execution_spec = parse_gdn_prefix_tree_segments(group_ids, parent_ids)
     if (
         execution_spec is not None
         and requested_cp_size == 1
@@ -510,31 +509,10 @@ def run_gdn_layer(
         )
     if input_layout != "attention" or output_layout != "attention":
         raise ValueError("GDN layout controls require a CP execution plan")
-    return _run_planned_prefixes_and_completions(gdn, hidden_states, execution_plan)
+    return _run_tree_prefixes(gdn, hidden_states, execution_plan)
 
 
-def _run_planned_prefixes_and_completions(
-    gdn: Any,
-    hidden_states: Tensor,
-    plan: GdnRankExecutionPlan,
-) -> tuple[Tensor, Tensor | None]:
-    if _has_chunk_aligned_local_plan(plan):
-        return _run_chunk_aligned_prefixes_and_completions(gdn, hidden_states, plan)
-    raise ValueError(
-        "shared-prefix GDN requires a chunk-aligned execution plan; "
-        "prefix/completion bucket execution has been removed"
-    )
-
-
-def _has_chunk_aligned_local_plan(plan: GdnRankExecutionPlan) -> bool:
-    return bool(
-        plan.prefix_boundary_buckets
-        or plan.prefix_tail_buckets
-        or plan.completion_with_prefix_tail_buckets
-    )
-
-
-def _run_chunk_aligned_prefixes_and_completions(
+def _run_tree_prefixes(
     gdn: Any,
     hidden_states: Tensor,
     plan: GdnRankExecutionPlan,
@@ -542,104 +520,385 @@ def _run_chunk_aligned_prefixes_and_completions(
     qkv, gate, beta, recurrent_g = _project_gdn_inputs(gdn, hidden_states)
     gate = gate.clone()
     recurrent_output = torch.zeros_like(gate)
-    boundary_family_chunks: list[Tensor] = []
-    boundary_conv_chunks: list[Tensor] = []
-    boundary_rec_chunks: list[Tensor] = []
-
-    for bucket in plan.prefix_boundary_buckets:
-        prefix_qkv, prefix_beta, prefix_g = _gather_bucket_streams(
-            qkv, beta, recurrent_g, bucket
-        )
-        zero_conv = _zero_conv_state(
-            gdn, hidden_states, batch_size=bucket.segment_count
-        )
-        zero_rec = _zero_recurrent_state(
-            gdn, hidden_states, batch_size=bucket.segment_count
-        )
-        prefix_out, prefix_conv, prefix_rec = run_gdn_bucket(
-            bucket,
-            (prefix_qkv, prefix_beta, prefix_g),
-            (zero_conv, zero_rec),
-            gdn=gdn,
-            output_final_state=True,
-        )
-        if prefix_conv is None or prefix_rec is None:
-            raise RuntimeError("prefix boundary GDN execution must return final states")
-        recurrent_output = _scatter_bucket_recurrent_output(
-            recurrent_output, bucket, prefix_out
-        )
-        boundary_family_chunks.append(bucket.family_indices)
-        boundary_conv_chunks.append(prefix_conv)
-        boundary_rec_chunks.append(prefix_rec)
-
-    boundary_conv_table = _materialize_indexed_family_state_table(
-        plan=plan,
-        family_chunks=boundary_family_chunks,
-        state_chunks=boundary_conv_chunks,
-        zero_state=_zero_conv_state(gdn, hidden_states, batch_size=plan.family_count),
+    recurrent_output, _cp_dependency = _run_tree_depth_buckets(
+        gdn,
+        qkv,
+        beta,
+        recurrent_g,
+        recurrent_output,
+        plan,
+        state_reference=hidden_states,
     )
-    boundary_rec_table = _materialize_indexed_family_state_table(
-        plan=plan,
-        family_chunks=boundary_family_chunks,
-        state_chunks=boundary_rec_chunks,
-        zero_state=_zero_recurrent_state(
-            gdn, hidden_states, batch_size=plan.family_count
-        ),
-    )
-
-    tail_family_chunks: list[Tensor] = []
-    tail_conv_chunks: list[Tensor] = []
-    tail_rec_chunks: list[Tensor] = []
-    for bucket in plan.prefix_tail_buckets:
-        tail_qkv, tail_beta, tail_g = _gather_bucket_streams(
-            qkv, beta, recurrent_g, bucket
-        )
-        tail_conv = boundary_conv_table.index_select(0, bucket.family_indices)
-        tail_rec = boundary_rec_table.index_select(0, bucket.family_indices)
-        tail_out, tail_conv, tail_rec = run_gdn_bucket(
-            bucket,
-            (tail_qkv, tail_beta, tail_g),
-            (tail_conv, tail_rec),
-            gdn=gdn,
-            output_final_state=True,
-        )
-        if tail_conv is None or tail_rec is None:
-            raise RuntimeError("prefix tail GDN execution must return final states")
-        recurrent_output = _scatter_bucket_recurrent_output(
-            recurrent_output, bucket, tail_out
-        )
-        tail_family_chunks.append(bucket.family_indices)
-        tail_conv_chunks.append(tail_conv)
-        tail_rec_chunks.append(tail_rec)
-
-    prefix_conv_table = _replace_indexed_family_states(
-        boundary_conv_table,
-        family_chunks=tail_family_chunks,
-        state_chunks=tail_conv_chunks,
-    )
-    prefix_rec_table = _replace_indexed_family_states(
-        boundary_rec_table,
-        family_chunks=tail_family_chunks,
-        state_chunks=tail_rec_chunks,
-    )
-
-    for bucket in plan.completion_with_prefix_tail_buckets:
-        completion_conv = prefix_conv_table.index_select(0, bucket.family_indices)
-        completion_rec = prefix_rec_table.index_select(0, bucket.family_indices)
-        completion_qkv, completion_beta, completion_g = _gather_bucket_streams(
-            qkv, beta, recurrent_g, bucket
-        )
-        completion_out, _, _ = run_gdn_bucket(
-            bucket,
-            (completion_qkv, completion_beta, completion_g),
-            (completion_conv, completion_rec),
-            gdn=gdn,
-            output_final_state=False,
-        )
-        recurrent_output = _scatter_bucket_recurrent_output(
-            recurrent_output, bucket, completion_out
-        )
     return _project_gdn_output(gdn, recurrent_output, gate, plan)
+
+
+def _run_tree_depth_buckets(
+    gdn: Any,
+    qkv: Tensor,
+    beta: Tensor,
+    recurrent_g: Tensor,
+    recurrent_output: Tensor,
+    plan: GdnRankExecutionPlan,
+    *,
+    state_reference: Tensor,
+    group: Any | None = None,
+    cp_dependency: Tensor | None = None,
+) -> tuple[Tensor, Tensor | None]:
+    state_cache = _TreeStateChunkCache(
+        device=state_reference.device,
+    )
+
+    for depth, buckets in enumerate(plan.tree_segment_buckets_by_depth):
+        if depth < len(plan.tree_state_exchanges_by_depth):
+            cp_dependency = state_cache.exchange_remote_parent_states(
+                gdn,
+                plan.tree_state_exchanges_by_depth[depth],
+                state_reference=state_reference,
+                rank=plan.cp_rank,
+                group=group,
+                cp_dependency=cp_dependency,
+            )
+        if depth < len(plan.tree_chain_buckets_by_depth):
+            for bucket in plan.tree_chain_buckets_by_depth[depth]:
+                recurrent_output, cp_dependency = _run_tree_bucket(
+                    gdn,
+                    qkv,
+                    beta,
+                    recurrent_g,
+                    recurrent_output,
+                    state_cache,
+                    bucket,
+                    state_reference=state_reference,
+                    group=group,
+                    cp_dependency=cp_dependency,
+                    recurrent_cp=True,
+                    scale_parent_state_gradient=1.0 / plan.cp_size,
+                )
+
+        for bucket in buckets:
+            recurrent_output, cp_dependency = _run_tree_bucket(
+                gdn,
+                qkv,
+                beta,
+                recurrent_g,
+                recurrent_output,
+                state_cache,
+                bucket,
+                state_reference=state_reference,
+                cp_dependency=cp_dependency,
+            )
+
+    return recurrent_output, cp_dependency
+
+
+def _run_tree_bucket(
+    gdn: Any,
+    qkv: Tensor,
+    beta: Tensor,
+    recurrent_g: Tensor,
+    recurrent_output: Tensor,
+    state_cache: "_TreeStateChunkCache",
+    bucket: GdnSegmentBucketPlan,
+    *,
+    state_reference: Tensor,
+    group: Any | None = None,
+    cp_dependency: Tensor | None = None,
+    recurrent_cp: bool = False,
+    scale_parent_state_gradient: float | None = None,
+) -> tuple[Tensor, Tensor | None]:
+    parent_conv, parent_rec = state_cache.parent_states(
+        gdn,
+        bucket,
+        state_reference=state_reference,
+    )
+    if _bucket_has_parent_state(bucket):
+        parent_conv, parent_rec = _couple_parent_states(parent_conv, parent_rec)
+        if scale_parent_state_gradient is not None:
+            parent_conv = _scale_state_gradient(
+                parent_conv,
+                scale_parent_state_gradient,
+            )
+            parent_rec = _scale_state_gradient(parent_rec, scale_parent_state_gradient)
+    segment_qkv, segment_beta, segment_g = _gather_bucket_streams(
+        qkv,
+        beta,
+        recurrent_g,
+        bucket,
+    )
+    if cp_dependency is not None:
+        segment_qkv = _add_autograd_dependency(segment_qkv, cp_dependency)
+        segment_beta = _add_autograd_dependency(segment_beta, cp_dependency)
+        segment_g = _add_autograd_dependency(segment_g, cp_dependency)
+        parent_conv = _add_autograd_dependency(parent_conv, cp_dependency)
+        parent_rec = _add_autograd_dependency(parent_rec, cp_dependency)
+    segment_out, segment_conv, segment_rec = run_gdn_bucket(
+        bucket,
+        (segment_qkv, segment_beta, segment_g),
+        (parent_conv, parent_rec),
+        gdn=gdn,
+        group=group,
+        recurrent_cp=recurrent_cp,
+        output_final_state=bucket.needs_final_state or recurrent_cp,
+    )
+    if bucket.needs_final_state and (segment_conv is None or segment_rec is None):
+        raise RuntimeError("tree GDN execution must return final states")
+    if (
+        bucket.needs_final_state
+        and segment_conv is not None
+        and segment_rec is not None
+    ):
+        cp_dependency = _make_autograd_dependency(
+            segment_out, segment_conv, segment_rec
+        )
+    else:
+        cp_dependency = _make_autograd_dependency(segment_out)
+    recurrent_output = _scatter_bucket_recurrent_output(
+        recurrent_output,
+        bucket,
+        segment_out,
+    )
+    if bucket.needs_final_state:
+        state_cache.append(
+            bucket,
+            cast(Tensor, segment_conv),
+            cast(Tensor, segment_rec),
+        )
+    return recurrent_output, cp_dependency
+
+
+class _TreeStateChunkCache:
+    def __init__(self, *, device: torch.device) -> None:
+        self._device = device
+        self._conv_chunks: list[Tensor] = []
+        self._rec_chunks: list[Tensor] = []
+        self._source_by_family: list[tuple[int, int] | None] = []
+
+    def append(self, bucket: GdnSegmentBucketPlan, conv: Tensor, rec: Tensor) -> None:
+        self.append_families(_bucket_family_indices_cpu(bucket), conv, rec)
+
+    def append_families(
+        self, family_indices: Sequence[int], conv: Tensor, rec: Tensor
+    ) -> None:
+        if len(family_indices) == 0:
+            return
+        if int(conv.shape[0]) != len(family_indices):
+            raise ValueError(
+                "tree GDN state cache conv batch must match family count, got "
+                f"{tuple(conv.shape)} and {len(family_indices)} families"
+            )
+        if int(rec.shape[0]) != len(family_indices):
+            raise ValueError(
+                "tree GDN state cache recurrent batch must match family count, got "
+                f"{tuple(rec.shape)} and {len(family_indices)} families"
+            )
+        chunk_index = len(self._conv_chunks)
+        self._conv_chunks.append(conv)
+        self._rec_chunks.append(rec)
+        max_family = max(int(index) for index in family_indices)
+        if max_family >= len(self._source_by_family):
+            self._source_by_family.extend(
+                None for _ in range(max_family + 1 - len(self._source_by_family))
+            )
+        for source_row, family_index in enumerate(family_indices):
+            self._source_by_family[int(family_index)] = (chunk_index, source_row)
+
+    def exchange_remote_parent_states(
+        self,
+        gdn: Any,
+        exchange: GdnStateExchangePlan | None,
+        *,
+        state_reference: Tensor,
+        rank: int,
+        group: Any | None,
+        cp_dependency: Tensor | None,
+    ) -> Tensor | None:
+        if exchange is None:
+            return cp_dependency
+        from .layout import exchange_rank_tensor_all_to_all
+
+        source_conv, source_rec = self.states_for_families(
+            gdn,
+            exchange.source_family_indices,
+            state_reference=state_reference,
+        )
+        if cp_dependency is not None:
+            source_conv = _add_autograd_dependency(source_conv, cp_dependency)
+            source_rec = _add_autograd_dependency(source_rec, cp_dependency)
+        remote_conv = exchange_rank_tensor_all_to_all(
+            source_conv,
+            exchange.exchange,
+            rank=rank,
+            group=group,
+            backward_plan=exchange.reverse_exchange,
+        )
+        remote_rec = exchange_rank_tensor_all_to_all(
+            source_rec,
+            exchange.exchange,
+            rank=rank,
+            group=group,
+            backward_plan=exchange.reverse_exchange,
+        )
+        self.append_families(exchange.dest_family_indices, remote_conv, remote_rec)
+        dependency = _make_zero_autograd_dependency(
+            source_conv, source_rec, remote_conv, remote_rec
+        )
+        return dependency if cp_dependency is None else dependency + cp_dependency
+
+    def states_for_families(
+        self,
+        gdn: Any,
+        family_indices: Sequence[int],
+        *,
+        state_reference: Tensor,
+    ) -> tuple[Tensor, Tensor]:
+        if len(family_indices) == 0:
+            conv = _zero_conv_state(gdn, state_reference, batch_size=0)
+            rec = _zero_recurrent_state(gdn, state_reference, batch_size=0)
+            return conv.requires_grad_(True), rec.requires_grad_(True)
+        return self._mixed_parent_states(
+            gdn,
+            tuple(int(index) for index in family_indices),
+            state_reference=state_reference,
+            batch_size=len(family_indices),
+            roots_allowed=False,
+        )
+
+    def parent_states(
+        self,
+        gdn: Any,
+        bucket: GdnSegmentBucketPlan,
+        *,
+        state_reference: Tensor,
+    ) -> tuple[Tensor, Tensor]:
+        parent_indices = bucket.parent_indices
+        if parent_indices is None:
+            raise RuntimeError("tree GDN bucket is missing parent indices")
+        parent_indices_cpu = _bucket_parent_indices_cpu(bucket)
+        batch_size = bucket.segment_count
+        if all(parent_index < 0 for parent_index in parent_indices_cpu):
+            return (
+                _zero_conv_state(gdn, state_reference, batch_size=batch_size),
+                _zero_recurrent_state(gdn, state_reference, batch_size=batch_size),
+            )
+
+        return self._mixed_parent_states(
+            gdn,
+            parent_indices_cpu,
+            state_reference=state_reference,
+            batch_size=batch_size,
+        )
+
+    def _mixed_parent_states(
+        self,
+        gdn: Any,
+        parent_indices_cpu: tuple[int, ...],
+        *,
+        state_reference: Tensor,
+        batch_size: int,
+        roots_allowed: bool = True,
+    ) -> tuple[Tensor, Tensor]:
+        sources_by_chunk: dict[int, list[tuple[int, int]]] = {}
+        missing_parents: list[int] = []
+        for dest_row, parent_index in enumerate(parent_indices_cpu):
+            if parent_index < 0:
+                if roots_allowed:
+                    continue
+                missing_parents.append(parent_index)
+                continue
+            source = (
+                self._source_by_family[parent_index]
+                if parent_index < len(self._source_by_family)
+                else None
+            )
+            if source is None:
+                missing_parents.append(parent_index)
+                continue
+            chunk_index, source_row = source
+            sources_by_chunk.setdefault(chunk_index, []).append((dest_row, source_row))
+        if missing_parents:
+            raise RuntimeError(
+                "tree GDN append-only execution is missing parent state for "
+                f"families {tuple(missing_parents)}"
+            )
+
+        single_source_chunk = next(iter(sources_by_chunk.values()))
+        if len(sources_by_chunk) == 1 and len(single_source_chunk) == batch_size:
+            chunk_index, pairs = next(iter(sources_by_chunk.items()))
+            return (
+                _select_state_rows(self._conv_chunks[chunk_index], pairs),
+                _select_state_rows(self._rec_chunks[chunk_index], pairs),
+            )
+
+        conv = _zero_conv_state(gdn, state_reference, batch_size=batch_size)
+        rec = _zero_recurrent_state(gdn, state_reference, batch_size=batch_size)
+        for chunk_index, pairs in sources_by_chunk.items():
+            dest_rows = _long_tensor(
+                (dest_row for dest_row, _ in pairs),
+                device=self._device,
+            )
+            source_rows = _long_tensor(
+                (source_row for _, source_row in pairs),
+                device=self._device,
+            )
+            conv = conv.index_copy(
+                0,
+                dest_rows,
+                self._conv_chunks[chunk_index].index_select(0, source_rows),
+            )
+            rec = rec.index_copy(
+                0,
+                dest_rows,
+                self._rec_chunks[chunk_index].index_select(0, source_rows),
+            )
+        return conv, rec
+
+
+def _select_state_rows(chunk: Tensor, pairs: Sequence[tuple[int, int]]) -> Tensor:
+    source_rows = tuple(source_row for _, source_row in pairs)
+    if len(set(source_rows)) == 1:
+        return chunk.narrow(0, source_rows[0], 1).expand(
+            len(source_rows),
+            *tuple(chunk.shape[1:]),
+        )
+    first_row = source_rows[0]
+    if source_rows == tuple(range(first_row, first_row + len(source_rows))):
+        return chunk.narrow(0, first_row, len(source_rows))
+    return chunk.index_select(
+        0,
+        _long_tensor(source_rows, device=chunk.device),
+    )
+
+
+def _bucket_family_indices_cpu(bucket: GdnSegmentBucketPlan) -> tuple[int, ...]:
+    family_indices = bucket.family_indices_cpu
+    if family_indices is None:
+        family_indices = bucket.family_indices.detach().cpu()
+    return tuple(int(index) for index in family_indices.tolist())
+
+
+def _bucket_parent_indices_cpu(bucket: GdnSegmentBucketPlan) -> tuple[int, ...]:
+    parent_indices = bucket.parent_indices
+    if parent_indices is None:
+        raise RuntimeError("tree GDN bucket is missing parent indices")
+    parent_indices_cpu = bucket.parent_indices_cpu
+    if parent_indices_cpu is None:
+        parent_indices_cpu = parent_indices.detach().cpu()
+    return tuple(int(index) for index in parent_indices_cpu.tolist())
+
+
+def _long_tensor(values: Iterable[int], *, device: torch.device) -> Tensor:
+    return torch.tensor(tuple(values), dtype=torch.long, device=device)
+
+
+def _bucket_has_parent_state(bucket: GdnSegmentBucketPlan) -> bool:
+    return any(parent_index >= 0 for parent_index in _bucket_parent_indices_cpu(bucket))
+
+
+def _bucket_has_uniform_lengths(bucket: GdnSegmentBucketPlan) -> bool:
+    lengths_cpu = bucket.lengths_cpu
+    if lengths_cpu is None:
+        lengths_cpu = bucket.lengths.detach().cpu()
+    return all(int(length) == int(bucket.length) for length in lengths_cpu.tolist())
 
 
 def _run_cp_planned_prefixes_and_completions(
@@ -679,385 +938,21 @@ def _run_cp_planned_prefixes_and_completions(
         if empty_gdn_rank
         else _empty_autograd_dependency(qkv)
     )
-    qkv_with_remote_tail = qkv
-    beta_with_remote_tail = beta
-    recurrent_g_with_remote_tail = recurrent_g
-    if plan.remote_prefix_tail_exchange is not None:
-        remote_qkv, remote_beta, remote_g = _exchange_remote_prefix_tail_streams(
-            qkv,
-            beta,
-            recurrent_g,
-            plan=plan,
-            group=group,
-        )
-        qkv_with_remote_tail = torch.cat([qkv, remote_qkv.unsqueeze(0)], dim=1)
-        beta_with_remote_tail = torch.cat([beta, remote_beta.unsqueeze(0)], dim=1)
-        recurrent_g_with_remote_tail = torch.cat(
-            [recurrent_g, remote_g.unsqueeze(0)], dim=1
-        )
-        cp_dependency = cp_dependency + _make_zero_autograd_dependency(
-            remote_qkv, remote_beta, remote_g
-        )
+    if not plan.tree_segment_buckets_by_depth:
+        raise ValueError("CP prefix-tree GDN requires a tree execution plan")
     gate = gate.clone()
     recurrent_output = torch.zeros_like(gate)
-    prefix_family_chunks: list[Tensor] = []
-    prefix_conv_chunks: list[Tensor] = []
-    prefix_rec_chunks: list[Tensor] = []
-
-    for bucket in plan.chain_prefix_buckets:
-        prefix_qkv, prefix_beta, prefix_g = _gather_bucket_streams(
-            qkv, beta, recurrent_g, bucket
-        )
-        zero_conv = _zero_conv_state(gdn, qkv, batch_size=bucket.segment_count)
-        zero_rec = _zero_recurrent_state(gdn, qkv, batch_size=bucket.segment_count)
-        prefix_out, prefix_conv, prefix_rec = run_gdn_bucket(
-            bucket,
-            (prefix_qkv, prefix_beta, prefix_g),
-            (zero_conv, zero_rec),
-            gdn=gdn,
-            group=group,
-            recurrent_cp=True,
-            output_final_state=True,
-        )
-        if prefix_conv is None or prefix_rec is None:
-            raise RuntimeError("CP prefix GDN execution must return final states")
-        prefix_out = _add_autograd_dependency(prefix_out, cp_dependency)
-        prefix_conv = _add_autograd_dependency(prefix_conv, cp_dependency)
-        prefix_rec = _add_autograd_dependency(prefix_rec, cp_dependency)
-        cp_dependency = _make_autograd_dependency(prefix_out, prefix_conv, prefix_rec)
-        recurrent_output = _scatter_bucket_recurrent_output(
-            recurrent_output, bucket, prefix_out
-        )
-        prefix_family_chunks.append(bucket.family_indices)
-        prefix_conv_chunks.append(prefix_conv)
-        prefix_rec_chunks.append(prefix_rec)
-
-    boundary_family_chunks: list[Tensor] = []
-    boundary_conv_chunks: list[Tensor] = []
-    boundary_rec_chunks: list[Tensor] = []
-    for bucket in plan.prefix_boundary_buckets:
-        prefix_qkv, prefix_beta, prefix_g = _gather_bucket_streams(
-            qkv, beta, recurrent_g, bucket
-        )
-        zero_conv = _zero_conv_state(gdn, qkv, batch_size=bucket.segment_count)
-        zero_rec = _zero_recurrent_state(gdn, qkv, batch_size=bucket.segment_count)
-        prefix_out, prefix_conv, prefix_rec = run_gdn_bucket(
-            bucket,
-            (prefix_qkv, prefix_beta, prefix_g),
-            (zero_conv, zero_rec),
-            gdn=gdn,
-            output_final_state=True,
-        )
-        if prefix_conv is None or prefix_rec is None:
-            raise RuntimeError("local prefix GDN execution must return final states")
-        prefix_out = _add_autograd_dependency(prefix_out, cp_dependency)
-        prefix_conv = _add_autograd_dependency(prefix_conv, cp_dependency)
-        prefix_rec = _add_autograd_dependency(prefix_rec, cp_dependency)
-        recurrent_output = _scatter_bucket_recurrent_output(
-            recurrent_output, bucket, prefix_out
-        )
-        boundary_family_chunks.append(bucket.family_indices)
-        boundary_conv_chunks.append(prefix_conv)
-        boundary_rec_chunks.append(prefix_rec)
-        prefix_family_chunks.append(bucket.family_indices)
-        prefix_conv_chunks.append(prefix_conv)
-        prefix_rec_chunks.append(prefix_rec)
-
-    if (
-        plan.prefix_tail_buckets
-        or plan.remote_prefix_tail_buckets
-        or plan.completion_with_prefix_tail_buckets
-        or plan.remote_completion_with_prefix_tail_buckets
-        or plan.remote_prefix_tail_state_transfers
-    ):
-        boundary_conv_table = _materialize_indexed_family_state_table(
-            plan=plan,
-            family_chunks=boundary_family_chunks,
-            state_chunks=boundary_conv_chunks,
-            zero_state=_zero_conv_state(gdn, qkv, batch_size=plan.family_count),
-        )
-        boundary_rec_table = _materialize_indexed_family_state_table(
-            plan=plan,
-            family_chunks=boundary_family_chunks,
-            state_chunks=boundary_rec_chunks,
-            zero_state=_zero_recurrent_state(gdn, qkv, batch_size=plan.family_count),
-        )
-        remote_boundary_conv_table = boundary_conv_table
-        remote_boundary_rec_table = boundary_rec_table
-        if plan.remote_prefix_tail_state_transfers:
-            (
-                remote_boundary_conv_table,
-                remote_boundary_rec_table,
-                remote_boundary_dependency,
-            ) = _exchange_parent_state_rows(
-                boundary_conv_table,
-                boundary_rec_table,
-                transfers=plan.remote_prefix_tail_state_transfers,
-                group=group,
-            )
-            cp_dependency = cp_dependency + remote_boundary_dependency
-        tail_family_chunks: list[Tensor] = []
-        tail_conv_chunks: list[Tensor] = []
-        tail_rec_chunks: list[Tensor] = []
-        for bucket in plan.prefix_tail_buckets:
-            tail_qkv, tail_beta, tail_g = _gather_bucket_streams(
-                qkv, beta, recurrent_g, bucket
-            )
-            tail_conv = boundary_conv_table.index_select(0, bucket.family_indices)
-            tail_rec = boundary_rec_table.index_select(0, bucket.family_indices)
-            tail_out, tail_conv, tail_rec = run_gdn_bucket(
-                bucket,
-                (tail_qkv, tail_beta, tail_g),
-                (tail_conv, tail_rec),
-                gdn=gdn,
-                output_final_state=True,
-            )
-            if tail_conv is None or tail_rec is None:
-                raise RuntimeError("local prefix tail GDN execution must return states")
-            tail_out = _add_autograd_dependency(tail_out, cp_dependency)
-            tail_conv = _add_autograd_dependency(tail_conv, cp_dependency)
-            tail_rec = _add_autograd_dependency(tail_rec, cp_dependency)
-            recurrent_output = _scatter_bucket_recurrent_output(
-                recurrent_output, bucket, tail_out
-            )
-            tail_family_chunks.append(bucket.family_indices)
-            tail_conv_chunks.append(tail_conv)
-            tail_rec_chunks.append(tail_rec)
-            prefix_family_chunks.append(bucket.family_indices)
-            prefix_conv_chunks.append(tail_conv)
-            prefix_rec_chunks.append(tail_rec)
-        for bucket in plan.remote_prefix_tail_buckets:
-            tail_qkv, tail_beta, tail_g = _gather_bucket_streams(
-                qkv_with_remote_tail,
-                beta_with_remote_tail,
-                recurrent_g_with_remote_tail,
-                bucket,
-            )
-            tail_conv = remote_boundary_conv_table.index_select(
-                0, bucket.family_indices
-            )
-            tail_rec = remote_boundary_rec_table.index_select(0, bucket.family_indices)
-            tail_out, tail_conv, tail_rec = run_gdn_bucket(
-                bucket,
-                (tail_qkv, tail_beta, tail_g),
-                (tail_conv, tail_rec),
-                gdn=gdn,
-                output_final_state=True,
-            )
-            if tail_conv is None or tail_rec is None:
-                raise RuntimeError(
-                    "remote prefix tail GDN execution must return states"
-                )
-            tail_out = _add_autograd_dependency(tail_out, cp_dependency)
-            tail_conv = _add_autograd_dependency(tail_conv, cp_dependency)
-            tail_rec = _add_autograd_dependency(tail_rec, cp_dependency)
-            tail_family_chunks.append(bucket.family_indices)
-            tail_conv_chunks.append(tail_conv)
-            tail_rec_chunks.append(tail_rec)
-            prefix_family_chunks.append(bucket.family_indices)
-            prefix_conv_chunks.append(tail_conv)
-            prefix_rec_chunks.append(tail_rec)
-        prefix_conv_table = _replace_indexed_family_states(
-            boundary_conv_table,
-            family_chunks=tail_family_chunks,
-            state_chunks=tail_conv_chunks,
-        )
-        prefix_rec_table = _replace_indexed_family_states(
-            boundary_rec_table,
-            family_chunks=tail_family_chunks,
-            state_chunks=tail_rec_chunks,
-        )
-        for bucket in plan.completion_with_prefix_tail_buckets:
-            completion_conv = prefix_conv_table.index_select(0, bucket.family_indices)
-            completion_rec = prefix_rec_table.index_select(0, bucket.family_indices)
-            completion_conv, completion_rec = _couple_parent_states(
-                completion_conv, completion_rec
-            )
-            completion_qkv, completion_beta, completion_g = _gather_bucket_streams(
-                qkv, beta, recurrent_g, bucket
-            )
-            completion_out, _, _ = run_gdn_bucket(
-                bucket,
-                (completion_qkv, completion_beta, completion_g),
-                (completion_conv, completion_rec),
-                gdn=gdn,
-                output_final_state=False,
-            )
-            completion_out = _add_autograd_dependency(completion_out, cp_dependency)
-            recurrent_output = _scatter_bucket_recurrent_output(
-                recurrent_output, bucket, completion_out
-            )
-        for bucket in plan.remote_completion_with_prefix_tail_buckets:
-            completion_conv = prefix_conv_table.index_select(0, bucket.family_indices)
-            completion_rec = prefix_rec_table.index_select(0, bucket.family_indices)
-            completion_conv, completion_rec = _couple_parent_states(
-                completion_conv, completion_rec
-            )
-            completion_qkv, completion_beta, completion_g = _gather_bucket_streams(
-                qkv,
-                beta,
-                recurrent_g,
-                bucket,
-            )
-            completion_out, _, _ = run_gdn_bucket(
-                bucket,
-                (completion_qkv, completion_beta, completion_g),
-                (completion_conv, completion_rec),
-                gdn=gdn,
-                output_final_state=False,
-            )
-            completion_out = _add_autograd_dependency(completion_out, cp_dependency)
-            recurrent_output = _scatter_bucket_recurrent_output(
-                recurrent_output, bucket, completion_out
-            )
-
-    for bucket in plan.local_prefix_buckets:
-        prefix_qkv, prefix_beta, prefix_g = _gather_bucket_streams(
-            qkv, beta, recurrent_g, bucket
-        )
-        zero_conv = _zero_conv_state(gdn, qkv, batch_size=bucket.segment_count)
-        zero_rec = _zero_recurrent_state(gdn, qkv, batch_size=bucket.segment_count)
-        prefix_out, prefix_conv, prefix_rec = run_gdn_bucket(
-            bucket,
-            (prefix_qkv, prefix_beta, prefix_g),
-            (zero_conv, zero_rec),
-            gdn=gdn,
-            output_final_state=True,
-        )
-        if prefix_conv is None or prefix_rec is None:
-            raise RuntimeError("local prefix GDN execution must return final states")
-        prefix_out = _add_autograd_dependency(prefix_out, cp_dependency)
-        prefix_conv = _add_autograd_dependency(prefix_conv, cp_dependency)
-        prefix_rec = _add_autograd_dependency(prefix_rec, cp_dependency)
-        recurrent_output = _scatter_bucket_recurrent_output(
-            recurrent_output, bucket, prefix_out
-        )
-        prefix_family_chunks.append(bucket.family_indices)
-        prefix_conv_chunks.append(prefix_conv)
-        prefix_rec_chunks.append(prefix_rec)
-
-    if not prefix_conv_chunks and not plan.parent_state_exchange_family_indices:
-        projected, out_bias = _project_cp_gdn_output(
-            gdn,
-            recurrent_output,
-            gate,
-            plan,
-            group=group,
-            output_layout=output_layout,
-        )
-        projected = _add_autograd_dependency(projected, cp_dependency)
-        return projected, out_bias
-
-    prefix_conv_table = _materialize_ordered_family_state_table(
-        family_chunks=prefix_family_chunks,
-        state_chunks=prefix_conv_chunks,
-        zero_state=_zero_conv_state(gdn, qkv, batch_size=plan.family_count),
+    recurrent_output, cp_dependency = _run_tree_depth_buckets(
+        gdn,
+        qkv,
+        beta,
+        recurrent_g,
+        recurrent_output,
+        plan,
+        state_reference=qkv,
+        group=group,
+        cp_dependency=cp_dependency,
     )
-    prefix_rec_table = _materialize_ordered_family_state_table(
-        family_chunks=prefix_family_chunks,
-        state_chunks=prefix_rec_chunks,
-        zero_state=_zero_recurrent_state(gdn, qkv, batch_size=plan.family_count),
-    )
-    parent_state_exchanged = False
-    if plan.chain_completion_buckets and plan.parent_state_exchange_family_indices:
-        if not plan.parent_state_transfers:
-            raise ValueError("CP parent-state exchange requires planned transfers")
-        prefix_conv_table, prefix_rec_table, exchange_dependency = (
-            _exchange_parent_state_rows(
-                prefix_conv_table,
-                prefix_rec_table,
-                transfers=plan.parent_state_transfers,
-                group=group,
-            )
-        )
-        cp_dependency = cp_dependency + exchange_dependency
-        parent_state_exchanged = True
-    for bucket in plan.chain_completion_buckets:
-        completion_qkv, completion_beta, completion_g = _gather_bucket_streams(
-            qkv, beta, recurrent_g, bucket
-        )
-        completion_conv = prefix_conv_table.index_select(0, bucket.family_indices)
-        completion_rec = prefix_rec_table.index_select(0, bucket.family_indices)
-        completion_conv, completion_rec = _couple_parent_states(
-            completion_conv, completion_rec
-        )
-        completion_conv = _scale_state_gradient(completion_conv, 1.0 / plan.cp_size)
-        completion_rec = _scale_state_gradient(completion_rec, 1.0 / plan.cp_size)
-        completion_out, _, _ = run_gdn_bucket(
-            bucket,
-            (completion_qkv, completion_beta, completion_g),
-            (completion_conv, completion_rec),
-            gdn=gdn,
-            group=group,
-            recurrent_cp=True,
-            output_final_state=False,
-        )
-        completion_out = _add_autograd_dependency(completion_out, cp_dependency)
-        cp_dependency = _make_autograd_dependency(completion_out)
-        recurrent_output = _scatter_bucket_recurrent_output(
-            recurrent_output, bucket, completion_out
-        )
-
-    ready_completion_buckets = (
-        plan.ready_local_completion_buckets
-        if plan.ready_local_completion_buckets or plan.remote_local_completion_buckets
-        else plan.local_completion_buckets
-    )
-    for bucket in ready_completion_buckets:
-        completion_qkv, completion_beta, completion_g = _gather_bucket_streams(
-            qkv, beta, recurrent_g, bucket
-        )
-        completion_conv = prefix_conv_table.index_select(0, bucket.family_indices)
-        completion_rec = prefix_rec_table.index_select(0, bucket.family_indices)
-        completion_conv, completion_rec = _couple_parent_states(
-            completion_conv, completion_rec
-        )
-        completion_out, _, _ = run_gdn_bucket(
-            bucket,
-            (completion_qkv, completion_beta, completion_g),
-            (completion_conv, completion_rec),
-            gdn=gdn,
-            output_final_state=False,
-        )
-        completion_out = _add_autograd_dependency(completion_out, cp_dependency)
-        recurrent_output = _scatter_bucket_recurrent_output(
-            recurrent_output, bucket, completion_out
-        )
-
-    if plan.parent_state_exchange_family_indices and not parent_state_exchanged:
-        if not plan.parent_state_transfers:
-            raise ValueError("CP parent-state exchange requires planned transfers")
-        prefix_conv_table, prefix_rec_table, exchange_dependency = (
-            _exchange_parent_state_rows(
-                prefix_conv_table,
-                prefix_rec_table,
-                transfers=plan.parent_state_transfers,
-                group=group,
-            )
-        )
-        cp_dependency = cp_dependency + exchange_dependency
-
-    for bucket in plan.remote_local_completion_buckets:
-        completion_qkv, completion_beta, completion_g = _gather_bucket_streams(
-            qkv, beta, recurrent_g, bucket
-        )
-        completion_conv = prefix_conv_table.index_select(0, bucket.family_indices)
-        completion_rec = prefix_rec_table.index_select(0, bucket.family_indices)
-        completion_conv, completion_rec = _couple_parent_states(
-            completion_conv, completion_rec
-        )
-        completion_out, _, _ = run_gdn_bucket(
-            bucket,
-            (completion_qkv, completion_beta, completion_g),
-            (completion_conv, completion_rec),
-            gdn=gdn,
-            output_final_state=False,
-        )
-        completion_out = _add_autograd_dependency(completion_out, cp_dependency)
-        recurrent_output = _scatter_bucket_recurrent_output(
-            recurrent_output, bucket, completion_out
-        )
-
     projected, out_bias = _project_cp_gdn_output(
         gdn,
         recurrent_output,
@@ -1065,8 +960,8 @@ def _run_cp_planned_prefixes_and_completions(
         plan,
         group=group,
         output_layout=output_layout,
+        dependency=cp_dependency,
     )
-    projected = _add_autograd_dependency(projected, cp_dependency)
     return projected, out_bias
 
 
@@ -1659,12 +1554,6 @@ def _local_layout_token_count_for_hidden(
     return (real_count + _tp_world_size(projection) - 1) // _tp_world_size(projection)
 
 
-def _attention_original_shape_from_plan(
-    hidden_states: Tensor, plan: GdnRankExecutionPlan
-) -> tuple[int, int, int]:
-    return (int(plan.attention_token_count), 1, int(hidden_states.shape[-1]))
-
-
 def _restore_hidden_from_cp_flat(
     flat: Tensor, original_shape: tuple[int, int, int]
 ) -> Tensor:
@@ -1847,9 +1736,7 @@ def _gather_bucket_streams(
         recurrent_g.reshape(-1, int(recurrent_g.shape[-1])),
         bucket.row_indices,
         bucket.position_indices,
-        bucket.cu_seqlens,
         token_count=int(bucket.real_token_count),
-        segment_count=int(bucket.segment_count),
         sequence_length=int(qkv.shape[1]),
     )
 
@@ -1922,6 +1809,7 @@ def _project_cp_gdn_output(
     *,
     group: Any,
     output_layout: Literal["attention", "gdn"],
+    dependency: Tensor | None = None,
 ) -> tuple[Tensor, Tensor | None]:
     batch_size, seq_len, _, _ = recurrent_output.shape
     token_uids = (
@@ -1933,6 +1821,8 @@ def _project_cp_gdn_output(
     norm_out = _apply_gated_rms_norm(gdn, recurrent_output, gate)
     norm_out = norm_out.reshape(batch_size, seq_len, _local_value_dim(gdn))
     norm_out = norm_out.transpose(0, 1).contiguous()
+    if dependency is not None:
+        norm_out = _add_autograd_dependency(norm_out, dependency)
     if token_uids is not None:
         token_uids = _replicated_layout_token_uids(plan, "gdn", hidden_states=norm_out)
     _attach_trace_token_uids(norm_out, token_uids)
@@ -2271,6 +2161,36 @@ def _local_value_dim(gdn: Any) -> int:
     return _local_value_heads(gdn) * int(gdn.value_head_dim)
 
 
+def _prepare_dense_recurrent_inputs(
+    qkv: Tensor,
+    beta: Tensor,
+    recurrent_g: Tensor,
+    *,
+    key_heads: int,
+    value_heads: int,
+    key_dim: int,
+    value_dim: int,
+) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor]:
+    key_channels = int(key_heads) * int(key_dim)
+    value_channels = int(value_heads) * int(value_dim)
+    query = qkv[..., :key_channels].reshape(*qkv.shape[:2], key_heads, key_dim)
+    key = qkv[..., key_channels : 2 * key_channels].reshape(
+        *qkv.shape[:2],
+        key_heads,
+        key_dim,
+    )
+    value = qkv[..., 2 * key_channels : 2 * key_channels + value_channels].reshape(
+        *qkv.shape[:2],
+        value_heads,
+        value_dim,
+    )
+    repeat = int(value_heads) // int(key_heads)
+    if repeat != 1:
+        query = query.repeat_interleave(repeat, dim=2)
+        key = key.repeat_interleave(repeat, dim=2)
+    return query, key, value, beta, recurrent_g
+
+
 def _scatter_bucket_recurrent_output(
     output: Tensor, bucket: GdnSegmentBucketPlan, bucket_output: Tensor
 ) -> Tensor:
@@ -2280,276 +2200,12 @@ def _scatter_bucket_recurrent_output(
         bucket.row_indices,
         bucket.position_indices,
         _bucket_output_mask(bucket),
-        bucket.cu_seqlens,
     )
 
 
 def _bucket_output_mask(bucket: GdnSegmentBucketPlan) -> Tensor:
     output_mask = bucket.output_mask
     return bucket.real_mask if output_mask is None else output_mask
-
-
-def _materialize_indexed_family_state_table(
-    *,
-    plan: GdnRankExecutionPlan,
-    family_chunks: list[Tensor],
-    state_chunks: list[Tensor],
-    zero_state: Tensor,
-) -> Tensor:
-    table = zero_state.detach()
-    if not state_chunks:
-        return table.requires_grad_(True)
-    values = torch.cat(state_chunks, dim=0)
-    family_indices = torch.cat(family_chunks, dim=0)
-    return table.index_copy(0, family_indices, values)
-
-
-def _materialize_ordered_family_state_table(
-    *,
-    family_chunks: list[Tensor],
-    state_chunks: list[Tensor],
-    zero_state: Tensor,
-) -> Tensor:
-    if len(family_chunks) != len(state_chunks):
-        raise RuntimeError("family and state chunk counts must match")
-    table = zero_state.detach().requires_grad_(True)
-    for family_indices, states in zip(family_chunks, state_chunks, strict=True):
-        table = table.index_copy(0, family_indices, states)
-    return table
-
-
-def _replace_indexed_family_states(
-    table: Tensor,
-    *,
-    family_chunks: list[Tensor],
-    state_chunks: list[Tensor],
-) -> Tensor:
-    if not state_chunks:
-        return table
-    return table.index_copy(
-        0,
-        torch.cat(family_chunks, dim=0),
-        torch.cat(state_chunks, dim=0),
-    )
-
-
-def _exchange_parent_state_rows(
-    conv_table: Tensor,
-    rec_table: Tensor,
-    *,
-    transfers: tuple[GdnParentStateTransferPlan, ...],
-    group: Any,
-) -> tuple[Tensor, Tensor, Tensor]:
-    if not transfers:
-        return conv_table, rec_table, _empty_autograd_dependency(conv_table)
-    conv_table, rec_table = _ParentStateExchange.apply(
-        conv_table, rec_table, transfers, group
-    )
-    return conv_table, rec_table, _make_autograd_dependency(conv_table, rec_table)
-
-
-def _exchange_remote_prefix_tail_streams(
-    qkv: Tensor,
-    beta: Tensor,
-    recurrent_g: Tensor,
-    *,
-    plan: GdnRankExecutionPlan,
-    group: Any,
-) -> tuple[Tensor, Tensor, Tensor]:
-    from .layout import exchange_rank_tensor_all_to_all
-
-    if plan.remote_prefix_tail_exchange is None:
-        return (
-            qkv.new_empty((0, int(qkv.shape[-1]))),
-            beta.new_empty((0, int(beta.shape[-1]))),
-            recurrent_g.new_empty((0, int(recurrent_g.shape[-1]))),
-        )
-    if plan.remote_prefix_tail_backward_exchange is None:
-        raise ValueError("remote prefix-tail exchange requires a backward plan")
-    qkv_flat = qkv.reshape(-1, int(qkv.shape[-1]))
-    beta_flat = beta.reshape(-1, int(beta.shape[-1]))
-    g_flat = recurrent_g.reshape(-1, int(recurrent_g.shape[-1]))
-    kwargs = {
-        "plan": plan.remote_prefix_tail_exchange,
-        "rank": plan.cp_rank,
-        "group": group,
-        "backward_plan": plan.remote_prefix_tail_backward_exchange,
-    }
-    return (
-        exchange_rank_tensor_all_to_all(qkv_flat, **kwargs),
-        exchange_rank_tensor_all_to_all(beta_flat, **kwargs),
-        exchange_rank_tensor_all_to_all(g_flat, **kwargs),
-    )
-
-
-class _ParentStateExchange(torch.autograd.Function):
-    @staticmethod
-    def forward(
-        ctx: Any,
-        conv_table: Tensor,
-        rec_table: Tensor,
-        transfers: tuple[GdnParentStateTransferPlan, ...],
-        group: Any,
-    ) -> tuple[Tensor, Tensor]:
-        ctx.group = group
-        ctx.transfers = transfers
-        ctx.save_for_backward(conv_table, rec_table)
-        return (
-            _exchange_parent_state_tensor_forward(
-                conv_table,
-                transfers,
-                group=group,
-            ),
-            _exchange_parent_state_tensor_forward(
-                rec_table,
-                transfers,
-                group=group,
-            ),
-        )
-
-    @staticmethod
-    def backward(
-        ctx: Any, *grad_outputs: Tensor | None
-    ) -> tuple[Tensor | None, Tensor | None, None, None]:
-        grad_conv, grad_rec = grad_outputs
-        conv_ref, rec_ref = ctx.saved_tensors
-        return (
-            _exchange_parent_state_tensor_backward(
-                _zero_if_none(grad_conv, conv_ref),
-                ctx.transfers,
-                group=ctx.group,
-            ),
-            _exchange_parent_state_tensor_backward(
-                _zero_if_none(grad_rec, rec_ref),
-                ctx.transfers,
-                group=ctx.group,
-            ),
-            None,
-            None,
-        )
-
-
-def _exchange_parent_state_tensor_forward(
-    table: Tensor,
-    transfers: tuple[GdnParentStateTransferPlan, ...],
-    *,
-    group: Any,
-) -> Tensor:
-    rank = torch.distributed.get_rank(group)  # ty: ignore[possibly-missing-attribute]
-    output = table.clone()
-    recvs = _exchange_parent_state_rows_all_to_all(
-        table, transfers, rank=rank, reverse=False, group=group
-    )
-    for transfer, rows in recvs:
-        index = _parent_state_index_tensor(transfer, device=table.device)
-        output.index_copy_(0, index, rows)
-    return output
-
-
-def _exchange_parent_state_tensor_backward(
-    grad_output: Tensor,
-    transfers: tuple[GdnParentStateTransferPlan, ...],
-    *,
-    group: Any,
-) -> Tensor:
-    rank = torch.distributed.get_rank(group)  # ty: ignore[possibly-missing-attribute]
-    grad_input = grad_output.clone()
-    for transfer in transfers:
-        if transfer.dest_rank != rank:
-            continue
-        index = _parent_state_index_tensor(transfer, device=grad_output.device)
-        grad_input.index_fill_(0, index, 0)
-    recvs = _exchange_parent_state_rows_all_to_all(
-        grad_output, transfers, rank=rank, reverse=True, group=group
-    )
-    for transfer, rows in recvs:
-        index = _parent_state_index_tensor(transfer, device=grad_output.device)
-        grad_input.index_add_(0, index, rows)
-    return grad_input
-
-
-def _zero_if_none(grad: Tensor | None, reference: Tensor) -> Tensor:
-    if grad is None:
-        return reference.new_zeros(reference.shape)
-    return grad.contiguous()
-
-
-def _exchange_parent_state_rows_all_to_all(
-    table: Tensor,
-    transfers: tuple[GdnParentStateTransferPlan, ...],
-    *,
-    rank: int,
-    reverse: bool,
-    group: Any,
-) -> list[tuple[GdnParentStateTransferPlan, Tensor]]:
-    world_size = torch.distributed.get_world_size(group)  # ty: ignore[possibly-missing-attribute]
-    send_counts = [0 for _ in range(world_size)]
-    recv_counts = [0 for _ in range(world_size)]
-    send_pieces: list[Tensor] = []
-    for peer_rank in range(world_size):
-        for transfer in transfers:
-            send_rank = transfer.dest_rank if reverse else transfer.source_rank
-            recv_rank = transfer.source_rank if reverse else transfer.dest_rank
-            if send_rank == recv_rank:
-                continue
-            row_count = len(transfer.family_indices)
-            if rank == send_rank and peer_rank == recv_rank:
-                index = _parent_state_index_tensor(transfer, device=table.device)
-                send_pieces.append(table.index_select(0, index).contiguous())
-                send_counts[peer_rank] += row_count
-            if rank == recv_rank and peer_rank == send_rank:
-                recv_counts[peer_rank] += row_count
-
-    trailing_shape = tuple(table.shape[1:])
-    send_buffer = (
-        torch.cat(send_pieces, dim=0)
-        if send_pieces
-        else table.new_empty((0, *trailing_shape))
-    )
-    recv_buffer = table.new_empty((sum(recv_counts), *trailing_shape))
-    work = torch.distributed.all_to_all_single(  # ty: ignore[possibly-missing-attribute]
-        recv_buffer,
-        send_buffer,
-        output_split_sizes=recv_counts,
-        input_split_sizes=send_counts,
-        group=group,
-        async_op=True,
-    )
-    work.wait()
-
-    recvs: list[tuple[GdnParentStateTransferPlan, Tensor]] = []
-    offset = 0
-    for peer_rank, count in enumerate(recv_counts):
-        peer_end = offset + count
-        for transfer in transfers:
-            send_rank = transfer.dest_rank if reverse else transfer.source_rank
-            recv_rank = transfer.source_rank if reverse else transfer.dest_rank
-            if send_rank == recv_rank:
-                continue
-            if rank != recv_rank or peer_rank != send_rank:
-                continue
-            rows = len(transfer.family_indices)
-            recvs.append((transfer, recv_buffer[offset : offset + rows]))
-            offset += rows
-        if offset != peer_end:
-            raise RuntimeError(
-                "parent-state exchange unpack mismatch: "
-                f"rank={rank} peer={peer_rank} consumed={offset} expected={peer_end}"
-            )
-    return recvs
-
-
-def _parent_state_index_tensor(
-    transfer: GdnParentStateTransferPlan,
-    *,
-    device: torch.device,
-) -> Tensor:
-    if (
-        transfer.family_indices_tensor is not None
-        and transfer.family_indices_tensor.device == device
-    ):
-        return transfer.family_indices_tensor
-    return torch.tensor(transfer.family_indices, device=device, dtype=torch.long)
 
 
 def run_gdn_bucket(
@@ -2597,14 +2253,17 @@ def run_gdn_bucket(
 
     conv_output_final_state = output_final_state
     chain_conv_final: Tensor | None = None
+    chain_gradient_dependency: Tensor | None = None
     if recurrent_cp:
-        conv_initial, chain_conv_final = _chain_conv_initial_and_final(
-            qkv,
-            bucket.cu_seqlens_cpu,
-            bucket.lengths_by_rank_cpu,
-            conv_initial,
-            group=group,
-            output_final_state=output_final_state,
+        conv_initial, chain_conv_final, chain_gradient_dependency = (
+            _chain_conv_initial_and_final(
+                qkv,
+                bucket.cu_seqlens_cpu,
+                bucket.lengths_by_rank_cpu,
+                conv_initial,
+                group=group,
+                output_final_state=output_final_state,
+            )
         )
         conv_output_final_state = False
 
@@ -2618,15 +2277,31 @@ def run_gdn_bucket(
     if recurrent_cp:
         conv_final = chain_conv_final
 
-    query, key, value, beta, recurrent_g = _prepare_packed_recurrent_inputs_fused(
-        qkv,
-        beta,
-        recurrent_g,
-        key_heads=_local_key_heads(gdn),
-        value_heads=_local_value_heads(gdn),
-        key_dim=int(gdn.key_head_dim),
-        value_dim=int(gdn.value_head_dim),
-    )
+    dense_local_bucket = not recurrent_cp and _bucket_has_uniform_lengths(bucket)
+    if dense_local_bucket:
+        query, key, value, beta, recurrent_g = _prepare_dense_recurrent_inputs(
+            qkv.reshape(batch_size, int(bucket.length), int(qkv.shape[-1])),
+            beta.reshape(batch_size, int(bucket.length), int(beta.shape[-1])),
+            recurrent_g.reshape(
+                batch_size,
+                int(bucket.length),
+                int(recurrent_g.shape[-1]),
+            ),
+            key_heads=_local_key_heads(gdn),
+            value_heads=_local_value_heads(gdn),
+            key_dim=int(gdn.key_head_dim),
+            value_dim=int(gdn.value_head_dim),
+        )
+    else:
+        query, key, value, beta, recurrent_g = _prepare_packed_recurrent_inputs_fused(
+            qkv,
+            beta,
+            recurrent_g,
+            key_heads=_local_key_heads(gdn),
+            value_heads=_local_value_heads(gdn),
+            key_dim=int(gdn.key_head_dim),
+            value_dim=int(gdn.value_head_dim),
+        )
     if gdn.use_qk_l2norm:
         query = _l2norm(query.contiguous())
         key = _l2norm(key.contiguous())
@@ -2657,8 +2332,27 @@ def run_gdn_bucket(
             initial_state=recurrent_initial,
             output_final_state=output_final_state,
             use_qk_l2norm_in_kernel=False,
-            cu_seqlens=bucket.cu_seqlens,
+            cu_seqlens=None if dense_local_bucket else bucket.cu_seqlens,
         )
+        if dense_local_bucket:
+            recurrent_out = recurrent_out.reshape(
+                1,
+                token_count,
+                int(recurrent_out.shape[-2]),
+                int(recurrent_out.shape[-1]),
+            )
+    if chain_gradient_dependency is not None:
+        recurrent_out = _add_autograd_dependency(
+            recurrent_out,
+            chain_gradient_dependency,
+        )
+        if conv_final is not None:
+            conv_final = _add_autograd_dependency(conv_final, chain_gradient_dependency)
+        if recurrent_final is not None:
+            recurrent_final = _add_autograd_dependency(
+                recurrent_final,
+                chain_gradient_dependency,
+            )
     return recurrent_out, conv_final, recurrent_final
 
 
@@ -2670,15 +2364,22 @@ def _chain_conv_initial_and_final(
     *,
     group: Any,
     output_final_state: bool,
-) -> tuple[Tensor, Tensor | None]:
+) -> tuple[Tensor, Tensor | None, Tensor]:
     if group is None:
         raise ValueError("CP chain conv state requires a process group")
     if not dist.is_available() or not dist.is_initialized():  # ty: ignore[possibly-missing-attribute]
         raise RuntimeError("torch.distributed must be initialized for CP chain conv")
-    parent_initial = _AllReduceGradient.apply(parent_initial, group)
+    parent_initial, gradient_dependency = _AllReduceGradient.apply(
+        parent_initial,
+        group,
+    )
     tail_width = int(parent_initial.shape[-1])
     if tail_width <= 0:
-        return parent_initial, parent_initial if output_final_state else None
+        return (
+            parent_initial,
+            parent_initial if output_final_state else None,
+            gradient_dependency,
+        )
     if lengths_by_rank_cpu is None:
         raise ValueError("CP chain conv requires static all-rank bucket lengths")
     if cu_seqlens_cpu.device.type != "cpu" or lengths_by_rank_cpu.device.type != "cpu":
@@ -2705,7 +2406,7 @@ def _chain_conv_initial_and_final(
         if output_final_state
         else None
     )
-    return conv_initial, conv_final
+    return conv_initial, conv_final, gradient_dependency
 
 
 def _local_packed_conv_tail(
@@ -2733,20 +2434,219 @@ def _scan_conv_tail_batch(
     *,
     stop_rank: int,
 ) -> Tensor:
-    states = []
     tail_width = int(parent_initial.shape[-1])
+    if tail_width <= 0:
+        return parent_initial
+    source_ids_cpu, source_pos_cpu = _conv_tail_source_map(
+        lengths_by_rank_cpu,
+        stop_rank=int(stop_rank),
+        tail_width=tail_width,
+    )
+    return _ConvTailScan.apply(
+        parent_initial,
+        tails_by_rank,
+        source_ids_cpu.to(device=parent_initial.device, non_blocking=True),
+        source_pos_cpu.to(device=parent_initial.device, non_blocking=True),
+    )
+
+
+def _conv_tail_source_map(
+    lengths_by_rank_cpu: Tensor,
+    *,
+    stop_rank: int,
+    tail_width: int,
+) -> tuple[Tensor, Tensor]:
+    if lengths_by_rank_cpu.device.type != "cpu":
+        raise ValueError("conv tail source-map lengths must stay on CPU")
+    segments = int(lengths_by_rank_cpu.shape[1])
+    source_ids = torch.empty((segments, tail_width), dtype=torch.int32)
+    source_pos = torch.empty((segments, tail_width), dtype=torch.int32)
     host_lengths = lengths_by_rank_cpu.tolist()
-    for segment in range(int(parent_initial.shape[0])):
-        state = parent_initial[segment]
-        for peer in range(int(stop_rank)):
-            valid = int(host_lengths[peer][segment])
-            if valid <= 0:
+    for segment in range(segments):
+        total = tail_width + sum(
+            int(host_lengths[peer][segment]) for peer in range(int(stop_rank))
+        )
+        first = total - tail_width
+        for out_pos in range(tail_width):
+            absolute = first + out_pos
+            if absolute < tail_width:
+                source_ids[segment, out_pos] = 0
+                source_pos[segment, out_pos] = absolute
                 continue
-            state = torch.cat([state, tails_by_rank[peer, segment, :, :valid]], dim=-1)[
-                :, -tail_width:
-            ]
-        states.append(state)
-    return torch.stack(states, dim=0)
+            remaining = absolute - tail_width
+            for peer in range(int(stop_rank)):
+                valid = int(host_lengths[peer][segment])
+                if remaining < valid:
+                    source_ids[segment, out_pos] = peer + 1
+                    source_pos[segment, out_pos] = remaining
+                    break
+                remaining -= valid
+            else:
+                raise RuntimeError("conv tail source-map construction fell off history")
+    return source_ids, source_pos
+
+
+@triton.jit(do_not_specialize=["segments"])
+def _conv_tail_scan_kernel(
+    parent_initial,
+    tails_by_rank,
+    source_ids,
+    source_pos,
+    output,
+    segments,
+    channels: tl.constexpr,
+    tail_width: tl.constexpr,
+    BLOCK_C: tl.constexpr,
+) -> None:
+    segment = tl.program_id(0)
+    channel_block = tl.program_id(1)
+    offsets = channel_block * BLOCK_C + tl.arange(0, BLOCK_C)
+    channel_mask = offsets < channels
+    for tail_pos in tl.static_range(0, tail_width):
+        source_id = tl.load(source_ids + segment * tail_width + tail_pos)
+        pos = tl.load(source_pos + segment * tail_width + tail_pos)
+        parent_values = tl.load(
+            parent_initial + (segment * channels + offsets) * tail_width + pos,
+            mask=channel_mask & (source_id == 0),
+            other=0.0,
+        )
+        tail_values = tl.load(
+            tails_by_rank
+            + (((source_id - 1) * segments + segment) * channels + offsets) * tail_width
+            + pos,
+            mask=channel_mask & (source_id != 0),
+            other=0.0,
+        )
+        tl.store(
+            output + (segment * channels + offsets) * tail_width + tail_pos,
+            parent_values + tail_values,
+            mask=channel_mask,
+        )
+
+
+@triton.jit(do_not_specialize=["segments"])
+def _conv_tail_scan_backward_kernel(
+    grad_output,
+    source_ids,
+    source_pos,
+    grad_parent_initial,
+    grad_tails_by_rank,
+    segments,
+    channels: tl.constexpr,
+    tail_width: tl.constexpr,
+    BLOCK_C: tl.constexpr,
+) -> None:
+    segment = tl.program_id(0)
+    channel_block = tl.program_id(1)
+    offsets = channel_block * BLOCK_C + tl.arange(0, BLOCK_C)
+    channel_mask = offsets < channels
+    for tail_pos in tl.static_range(0, tail_width):
+        source_id = tl.load(source_ids + segment * tail_width + tail_pos)
+        pos = tl.load(source_pos + segment * tail_width + tail_pos)
+        values = tl.load(
+            grad_output + (segment * channels + offsets) * tail_width + tail_pos,
+            mask=channel_mask,
+            other=0.0,
+        )
+        tl.store(
+            grad_parent_initial + (segment * channels + offsets) * tail_width + pos,
+            values,
+            mask=channel_mask & (source_id == 0),
+        )
+        tl.store(
+            grad_tails_by_rank
+            + (((source_id - 1) * segments + segment) * channels + offsets) * tail_width
+            + pos,
+            values,
+            mask=channel_mask & (source_id != 0),
+        )
+
+
+class _ConvTailScan(torch.autograd.Function):
+    @staticmethod
+    def forward(
+        ctx: Any,
+        parent_initial: Tensor,
+        tails_by_rank: Tensor,
+        source_ids: Tensor,
+        source_pos: Tensor,
+    ) -> Tensor:
+        if parent_initial.ndim != 3:
+            raise ValueError(
+                f"parent_initial must be [segments, channels, tail], got {tuple(parent_initial.shape)}"
+            )
+        if tails_by_rank.ndim != 4:
+            raise ValueError(
+                f"tails_by_rank must be [cp, segments, channels, tail], got {tuple(tails_by_rank.shape)}"
+            )
+        segments, channels, tail_width = (
+            int(parent_initial.shape[0]),
+            int(parent_initial.shape[1]),
+            int(parent_initial.shape[2]),
+        )
+        if tuple(tails_by_rank.shape[1:]) != tuple(parent_initial.shape):
+            raise ValueError(
+                "tails_by_rank trailing dimensions must match parent_initial, got "
+                f"{tuple(tails_by_rank.shape)} and {tuple(parent_initial.shape)}"
+            )
+        if tuple(source_ids.shape) != (segments, tail_width) or tuple(
+            source_pos.shape
+        ) != (segments, tail_width):
+            raise ValueError(
+                "conv tail source maps must be [segments, tail_width], got "
+                f"{tuple(source_ids.shape)} and {tuple(source_pos.shape)}"
+            )
+        output = torch.empty_like(parent_initial)
+        block_c = 256
+        _conv_tail_scan_kernel[(segments, triton.cdiv(channels, block_c))](
+            parent_initial,
+            tails_by_rank,
+            source_ids.contiguous(),
+            source_pos.contiguous(),
+            output,
+            segments,
+            channels,
+            tail_width,
+            BLOCK_C=block_c,
+            num_warps=8,
+        )
+        ctx.save_for_backward(source_ids, source_pos)
+        ctx.parent_shape = tuple(parent_initial.shape)
+        ctx.tails_shape = tuple(tails_by_rank.shape)
+        return output
+
+    @staticmethod
+    def backward(ctx: Any, *grad_outputs: Tensor | None) -> tuple[Any, ...]:
+        grad_output = grad_outputs[0]
+        if grad_output is None:
+            raise RuntimeError("conv tail scan backward expected output gradient")
+        source_ids, source_pos = ctx.saved_tensors
+        grad_output = grad_output.contiguous()
+        grad_parent = torch.zeros(
+            ctx.parent_shape, device=grad_output.device, dtype=grad_output.dtype
+        )
+        grad_tails = torch.zeros(
+            ctx.tails_shape, device=grad_output.device, dtype=grad_output.dtype
+        )
+        segments, channels, tail_width = (
+            int(ctx.parent_shape[0]),
+            int(ctx.parent_shape[1]),
+            int(ctx.parent_shape[2]),
+        )
+        block_c = 256
+        _conv_tail_scan_backward_kernel[(segments, triton.cdiv(channels, block_c))](
+            grad_output,
+            source_ids,
+            source_pos,
+            grad_parent,
+            grad_tails,
+            segments,
+            channels,
+            tail_width,
+            BLOCK_C=block_c,
+            num_warps=8,
+        )
+        return grad_parent, grad_tails, None, None
 
 
 class _AllGatherReplicated(torch.autograd.Function):
@@ -2782,14 +2682,20 @@ class _AllGatherReplicated(torch.autograd.Function):
 
 class _AllReduceGradient(torch.autograd.Function):
     @staticmethod
-    def forward(ctx: Any, tensor: Tensor, group: Any) -> Tensor:
+    def forward(ctx: Any, tensor: Tensor, group: Any) -> tuple[Tensor, Tensor]:
         ctx.group = group
-        return tensor
+        ctx.save_for_backward(tensor)
+        return tensor, tensor.new_zeros(())
 
     @staticmethod
-    def backward(ctx: Any, *grad_outputs: Tensor) -> tuple[Tensor, None]:
-        (grad_output,) = grad_outputs
-        grad_input = grad_output.contiguous()
+    def backward(ctx: Any, *grad_outputs: Tensor | None) -> tuple[Tensor, None]:
+        grad_output, _grad_dependency = grad_outputs
+        (reference,) = ctx.saved_tensors
+        grad_input = (
+            reference.new_zeros(reference.shape)
+            if grad_output is None
+            else grad_output.contiguous()
+        )
         dist.all_reduce(  # ty: ignore[possibly-missing-attribute]
             grad_input,
             op=dist.ReduceOp.SUM,  # ty: ignore[possibly-missing-attribute]
@@ -2932,7 +2838,5 @@ def _chunk_gated_delta_rule(*args: Any, **kwargs: Any) -> tuple[Tensor, Tensor |
     try:
         from fla.ops.gated_delta_rule import chunk_gated_delta_rule
     except ImportError as exc:
-        raise ImportError(
-            "FLA is required for ART shared-prefix GDN execution."
-        ) from exc
+        raise ImportError("FLA is required for ART prefix-tree GDN execution.") from exc
     return chunk_gated_delta_rule(*args, **kwargs)

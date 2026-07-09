@@ -2,7 +2,8 @@ from __future__ import annotations
 
 from collections.abc import Iterator
 from contextlib import contextmanager
-import socket
+from pathlib import Path
+import tempfile
 
 import pytest
 
@@ -18,13 +19,13 @@ from megatron.core import parallel_state as ps
 from megatron.core.ssm.gated_delta_net import GatedDeltaNet
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from torch.distributed import (
-    DistNetworkError,
     destroy_process_group,
     init_process_group,
     is_initialized,
 )
 
 from .cases import default_phase0_cases
+from .distributed_init import file_init_method
 from .metrics import (
     GDN_CORRECTNESS_DTYPE,
     MEAN_ABS_PCT_MISMATCH_THRESHOLD,
@@ -232,44 +233,23 @@ def _single_rank_model_parallel() -> Iterator[None]:
     if is_initialized():
         pytest.skip("torch.distributed is already initialized in this process.")
     torch.cuda.set_device(0)
-    _init_single_rank_process_group()
-    try:
-        ps.initialize_model_parallel(
-            tensor_model_parallel_size=1,
-            pipeline_model_parallel_size=1,
-            context_parallel_size=1,
-            expert_model_parallel_size=1,
+    with tempfile.TemporaryDirectory(prefix="art_dist_") as tmp:
+        init_process_group(
+            backend="nccl",
+            init_method=file_init_method(Path(tmp), "single_rank"),
+            rank=0,
+            world_size=1,
         )
-        yield
-    finally:
-        if getattr(ps, "model_parallel_is_initialized", lambda: False)():
-            ps.destroy_model_parallel()
-        if is_initialized():
-            destroy_process_group()
-
-
-def _init_single_rank_process_group() -> None:
-    last_error: DistNetworkError | None = None
-    for _ in range(16):
         try:
-            init_process_group(
-                backend="nccl",
-                init_method=f"tcp://127.0.0.1:{_find_free_port()}",
-                rank=0,
-                world_size=1,
+            ps.initialize_model_parallel(
+                tensor_model_parallel_size=1,
+                pipeline_model_parallel_size=1,
+                context_parallel_size=1,
+                expert_model_parallel_size=1,
             )
-            return
-        except DistNetworkError as error:
-            if "EADDRINUSE" not in str(error):
-                raise
-            last_error = error
+            yield
+        finally:
+            if getattr(ps, "model_parallel_is_initialized", lambda: False)():
+                ps.destroy_model_parallel()
             if is_initialized():
                 destroy_process_group()
-    if last_error is not None:
-        raise last_error
-
-
-def _find_free_port() -> int:
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
-        sock.bind(("127.0.0.1", 0))
-        return int(sock.getsockname()[1])

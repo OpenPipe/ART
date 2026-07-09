@@ -9,6 +9,8 @@ data/cache.db
 streaming-chat-completions/
 unsloth_compiled_cache/
 wandb/
+!/typings/wandb/
+!/typings/wandb/**
 docs/node_modules/
 dist/
 replays/

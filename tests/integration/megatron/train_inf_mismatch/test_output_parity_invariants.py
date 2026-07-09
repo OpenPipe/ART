@@ -31,7 +31,7 @@ from .real_path import (
 )
 
 
-def test_logical_map_flattens_shared_prefix_branches() -> None:
+def test_logical_map_flattens_prefix_tree_branches() -> None:
     packed = {
         "tokens": torch.tensor([[10, 11, 12, 13, 14, 12, 15, 16]]),
         "group_ids": torch.tensor([[0, 0, 1, 1, 1, 2, 2, 2]]),
@@ -54,6 +54,61 @@ def test_logical_map_flattens_shared_prefix_branches() -> None:
     assert [token.vllm_prompt_token_index for token in logical_map.tokens] == [
         3,
         4,
+        3,
+        4,
+    ]
+
+
+def test_logical_map_flattens_nested_prefix_tree_leaves() -> None:
+    packed = {
+        "tokens": torch.tensor(
+            [[10, 11, 20, 30, 31, 32, 33, 34, 35, 40, 50, 51, 52, 60, 61, 62]]
+        ),
+        "group_ids": torch.tensor([[0, 0, 1, 2, 2, 2, 3, 3, 3, 4, 5, 5, 5, 6, 6, 6]]),
+        "parent_ids": torch.tensor([[0, 0, 0, 1, 1, 1, 1, 1, 1, 0, 4, 4, 4, 0, 0, 0]]),
+    }
+
+    logical_map = build_logical_token_map(packed)
+
+    assert [prompt.token_ids for prompt in logical_map.prompts] == [
+        [10, 11, 20, 30, 31, 32],
+        [10, 11, 20, 33, 34, 35],
+        [10, 11, 40, 50, 51, 52],
+        [10, 11, 60, 61, 62],
+    ]
+    assert [prompt.packed_prompt_length for prompt in logical_map.prompts] == [
+        3,
+        3,
+        3,
+        2,
+    ]
+    assert [token.token_id for token in logical_map.tokens] == [
+        31,
+        32,
+        34,
+        35,
+        51,
+        52,
+        61,
+        62,
+    ]
+    assert [token.art_logit_index for token in logical_map.tokens] == [
+        3,
+        4,
+        6,
+        7,
+        10,
+        11,
+        13,
+        14,
+    ]
+    assert [token.vllm_prompt_token_index for token in logical_map.tokens] == [
+        4,
+        5,
+        4,
+        5,
+        4,
+        5,
         3,
         4,
     ]
@@ -260,6 +315,26 @@ def test_config_from_env_accepts_lora_target_module_override(
     assert config.lora_target_modules == ["experts", "in_proj_qkv", "in_proj_z"]
 
 
+def test_config_from_env_accepts_vllm_memory_utilization_override(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("ART_TRAIN_INF_MISMATCH_VLLM_GPU_MEMORY_UTILIZATION", "0.5")
+
+    config = config_from_env()
+
+    assert config.engine_args["gpu_memory_utilization"] == 0.5
+
+
+def test_config_from_env_accepts_gdn_prefill_backend_override(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("ART_TRAIN_INF_MISMATCH_GDN_PREFILL_BACKEND", "triton")
+
+    config = config_from_env()
+
+    assert config.engine_args["additional_config"] == {"gdn_prefill_backend": "triton"}
+
+
 def test_default_rollout_modes_follow_model_support_native_lora_status() -> None:
     assert TrainInfOutputParityConfig(
         base_model="Qwen/Qwen3.5-35B-A3B"
@@ -317,3 +392,4 @@ def test_workflow_stage_enables_live_train_inf_mismatch(
     assert captured_env["ART_RUN_TRAIN_INF_MISMATCH_LIVE"] == "1"
     assert captured_env["ART_TRAIN_INF_MISMATCH_ALLOW_UNVALIDATED_ARCH"] == "1"
     assert captured_env["ART_REAL_PATH_MAX_COMPLETION_TOKENS"] == "16"
+    assert captured_env["ART_TRAIN_INF_MISMATCH_VLLM_GPU_MEMORY_UTILIZATION"] == "0.50"

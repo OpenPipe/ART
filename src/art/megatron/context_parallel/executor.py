@@ -20,7 +20,7 @@ from art.megatron.flex_attn.compiled import (
     sparse_compiled_flex_attention,
 )
 
-from .block_mask import build_block_mask
+from .block_mask import build_block_mask_from_context, prepare_block_mask_context
 from .comm import A2AVCommunicator
 from .range_ops import (
     range_gather_head_major,
@@ -107,6 +107,54 @@ def _safe_exp_diff(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
     both_neg_inf = torch.isneginf(a) & torch.isneginf(b)
     diff = torch.where(both_neg_inf, torch.full_like(diff, float("-inf")), diff)
     return torch.exp(diff)
+
+
+def _softmax_offset_view(
+    softmax_offset: torch.Tensor,
+    *,
+    like: torch.Tensor,
+) -> torch.Tensor:
+    return softmax_offset.to(device=like.device, dtype=like.dtype).view(-1, 1)
+
+
+def _apply_softmax_offset(
+    accum_out: torch.Tensor,
+    accum_lse: torch.Tensor,
+    softmax_offset: torch.Tensor | None,
+) -> torch.Tensor:
+    if softmax_offset is None:
+        return accum_out
+    sink = _softmax_offset_view(softmax_offset, like=accum_lse)
+    merged_lse = _safe_logaddexp(accum_lse, sink)
+    scale = _safe_exp_diff(accum_lse, merged_lse).unsqueeze(-1)
+    return accum_out * scale.to(dtype=accum_out.dtype)
+
+
+def _softmax_offset_backward_values(
+    *,
+    grad_output: torch.Tensor,
+    accum_out: torch.Tensor,
+    accum_lse: torch.Tensor,
+    softmax_offset: torch.Tensor | None,
+) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor | None]:
+    if softmax_offset is None:
+        return grad_output, None, None
+    sink = _softmax_offset_view(softmax_offset, like=accum_lse)
+    merged_lse = _safe_logaddexp(accum_lse, sink)
+    key_weight = _safe_exp_diff(accum_lse, merged_lse)
+    sink_weight = _safe_exp_diff(sink, merged_lse)
+    grad_output_accum = grad_output.to(dtype=accum_out.dtype)
+    grad_accum_out = grad_output_accum * key_weight.unsqueeze(-1)
+    scale_grad = (
+        (grad_output_accum * accum_out.to(dtype=grad_output_accum.dtype)).sum(dim=-1)
+        * key_weight
+        * sink_weight
+    )
+    return (
+        grad_accum_out,
+        scale_grad,
+        -scale_grad.sum(dim=1).to(dtype=softmax_offset.dtype),
+    )
 
 
 def _accum_output_dtype(input_dtype: torch.dtype) -> torch.dtype:
@@ -700,19 +748,26 @@ def _build_stage_block_mask(
         raise RuntimeError(
             f"Stage {stage_plan.stage_index} is missing exact mask metadata"
         )
-    mask = build_block_mask(
+    block_mask_context = state.execution_cache.block_mask_context
+    if block_mask_context is None:
+        block_mask_context = prepare_block_mask_context(
+            group_ids=state.group_ids,
+            parent_ids=state.parent_ids,
+            input_pos=state.input_pos,
+        )
+        state.execution_cache.block_mask_context = block_mask_context
+    mask = build_block_mask_from_context(
         FlexMaskSpec(
             q_len=int(execution_spec.q_len),
             k_len=int(execution_spec.k_len),
             block_size=resolved_block_size,
             slices=stage_plan.slices,
-            exact_mask=mask_metadata.model_dump(mode="python"),
+            exact_mask=mask_metadata,
         ),
-        group_ids=state.group_ids,
-        parent_ids=state.parent_ids,
-        input_pos=state.input_pos,
+        context=block_mask_context,
         sliding_window=sliding_window,
         device=device,
+        validate=False,
     )
     cache[cache_key] = mask
     return mask
@@ -801,30 +856,6 @@ def prepare_context_parallel_execution_state(
                 block_size=variant.block_size,
                 sliding_window=variant.sliding_window,
             )
-
-
-def _causal_slice_pair_count(slice_: AttnSlice) -> int:
-    q_start = int(slice_.q_range.start)
-    q_end = int(slice_.q_range.end)
-    k_start = int(slice_.k_range.start)
-    k_end = int(slice_.k_range.end)
-    if q_end <= q_start or k_end <= k_start:
-        return 0
-
-    k_len = k_end - k_start
-    partial_q_start = max(q_start, k_start)
-    partial_q_end = min(q_end - 1, k_end - 2)
-    partial = 0
-    if partial_q_start <= partial_q_end:
-        count = partial_q_end - partial_q_start + 1
-        partial = count * (partial_q_start + partial_q_end + 2 - 2 * k_start) // 2
-
-    full_q_start = max(q_start, k_end - 1)
-    full_q_end = q_end - 1
-    full = 0
-    if full_q_start <= full_q_end:
-        full = (full_q_end - full_q_start + 1) * k_len
-    return int(partial + full)
 
 
 def _validate_stage_block_alignment(
@@ -1443,6 +1474,7 @@ def _merge_stage_output_grads_from_tape(
     *,
     replay_records: list[dict[str, Any]],
     grad_output_flat: torch.Tensor,
+    grad_lse_flat: torch.Tensor | None = None,
 ) -> tuple[list[torch.Tensor], list[torch.Tensor]]:
     if not replay_records:
         return [], []
@@ -1451,11 +1483,17 @@ def _merge_stage_output_grads_from_tape(
         dtype=accum_dtype,
         memory_format=torch.contiguous_format,
     )
-    grad_accum_lse = torch.zeros(
-        (grad_output_flat.shape[0], grad_output_flat.shape[1]),
-        device=grad_output_flat.device,
-        dtype=accum_dtype,
-    )
+    if grad_lse_flat is None:
+        grad_accum_lse = torch.zeros(
+            (grad_output_flat.shape[0], grad_output_flat.shape[1]),
+            device=grad_output_flat.device,
+            dtype=accum_dtype,
+        )
+    else:
+        grad_accum_lse = grad_lse_flat.to(
+            dtype=accum_dtype,
+            memory_format=torch.contiguous_format,
+        )
     stage_out_grads: list[torch.Tensor] = []
     stage_lse_grads: list[torch.Tensor] = []
     for record in replay_records:
@@ -1520,7 +1558,7 @@ def _forward_stage_records(
     enable_gqa: bool,
     sliding_window: int | None,
     record_for_backward: bool,
-) -> tuple[torch.Tensor, list[dict[str, Any]]]:
+) -> tuple[torch.Tensor, torch.Tensor, list[dict[str, Any]]]:
     q_source = q_flat.detach() if record_for_backward else q_flat
     k_source = k_flat.detach() if record_for_backward else k_flat
     v_source = v_flat.detach() if record_for_backward else v_flat
@@ -1833,12 +1871,13 @@ def _forward_stage_records(
         if int(q_flat.shape[1]) == 0:
             return (
                 q_flat.new_empty((q_flat.shape[0], 0, q_flat.shape[2])),
+                q_flat.new_empty((q_flat.shape[0], 0)),
                 replay_records,
             )
         raise RuntimeError("Sparse attention produced no stage outputs")
-    if accum_out is None:
+    if accum_out is None or accum_lse is None:
         raise RuntimeError("Sparse attention produced no accumulated output")
-    return accum_out, replay_records
+    return accum_out, accum_lse, replay_records
 
 
 def _flatten_qkv(
@@ -1866,6 +1905,7 @@ def _run_context_parallel_forward(
     compile_enabled: bool,
     sliding_window: int | None,
     triton_num_stages_2_head_dims: tuple[int, ...],
+    softmax_offset: torch.Tensor | None,
 ) -> torch.Tensor:
     kernel = FlexAttentionKernel(
         compile_enabled=compile_enabled,
@@ -1877,7 +1917,7 @@ def _run_context_parallel_forward(
         value=value,
         state=state,
     )
-    accum_out, _ = _forward_stage_records(
+    accum_out, accum_lse, _ = _forward_stage_records(
         q_flat=q_flat,
         k_flat=k_flat,
         v_flat=v_flat,
@@ -1888,6 +1928,7 @@ def _run_context_parallel_forward(
         sliding_window=sliding_window,
         record_for_backward=False,
     )
+    accum_out = _apply_softmax_offset(accum_out, accum_lse, softmax_offset)
     return unflatten_valid_sequence_head_major(
         accum_out.to(dtype=query.dtype),
         valid_lengths=state.rank_plan.local_valid_lengths,
@@ -1906,7 +1947,8 @@ def _run_context_parallel_forward_recorded(
     compile_enabled: bool,
     sliding_window: int | None,
     triton_num_stages_2_head_dims: tuple[int, ...],
-) -> tuple[torch.Tensor, torch.Tensor, list[dict[str, Any]]]:
+    softmax_offset: torch.Tensor | None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, list[dict[str, Any]]]:
     kernel = FlexAttentionKernel(
         compile_enabled=compile_enabled,
         triton_num_stages_2_head_dims=triton_num_stages_2_head_dims,
@@ -1917,7 +1959,7 @@ def _run_context_parallel_forward_recorded(
         value=value,
         state=state,
     )
-    accum_out, replay_records = _forward_stage_records(
+    accum_out, accum_lse, replay_records = _forward_stage_records(
         q_flat=q_flat,
         k_flat=k_flat,
         v_flat=v_flat,
@@ -1928,13 +1970,15 @@ def _run_context_parallel_forward_recorded(
         sliding_window=sliding_window,
         record_for_backward=True,
     )
+    output_accum = _apply_softmax_offset(accum_out, accum_lse, softmax_offset)
     return (
         unflatten_valid_sequence_head_major(
-            accum_out.to(dtype=query.dtype),
+            output_accum.to(dtype=query.dtype),
             valid_lengths=state.rank_plan.local_valid_lengths,
             seq_len=query.shape[0],
         ),
         accum_out,
+        accum_lse,
         replay_records,
     )
 
@@ -2009,8 +2053,11 @@ def _run_context_parallel_backward(
     compile_enabled: bool,
     sliding_window: int | None,
     triton_num_stages_2_head_dims: tuple[int, ...],
+    softmax_offset: torch.Tensor | None,
     replay_records: list[dict[str, Any]] | None = None,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    replay_accum_out: torch.Tensor | None = None,
+    replay_accum_lse: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None]:
     kernel = FlexAttentionKernel(
         compile_enabled=compile_enabled,
         triton_num_stages_2_head_dims=triton_num_stages_2_head_dims,
@@ -2027,7 +2074,7 @@ def _run_context_parallel_backward(
         state.rank_plan.local_valid_lengths,
     )
     if replay_records is None:
-        _, replay_records = _forward_stage_records(
+        replay_accum_out, replay_accum_lse, replay_records = _forward_stage_records(
             q_flat=q_flat,
             k_flat=k_flat,
             v_flat=v_flat,
@@ -2038,9 +2085,27 @@ def _run_context_parallel_backward(
             sliding_window=sliding_window,
             record_for_backward=True,
         )
+    if softmax_offset is None:
+        grad_accum_out = grad_output_flat
+        grad_accum_lse = None
+        grad_softmax_offset = None
+    else:
+        if replay_accum_out is None or replay_accum_lse is None:
+            raise RuntimeError(
+                "Missing context-parallel accumulators for softmax_offset backward."
+            )
+        grad_accum_out, grad_accum_lse, grad_softmax_offset = (
+            _softmax_offset_backward_values(
+                grad_output=grad_output_flat,
+                accum_out=replay_accum_out,
+                accum_lse=replay_accum_lse,
+                softmax_offset=softmax_offset,
+            )
+        )
     stage_out_grads, stage_lse_grads = _merge_stage_output_grads_from_tape(
         replay_records=replay_records,
-        grad_output_flat=grad_output_flat,
+        grad_output_flat=grad_accum_out,
+        grad_lse_flat=grad_accum_lse,
     )
     if stage_out_grads and stage_out_grads[0].is_cuda:
         # Nested FLASH flex backward consumes these external grad_outputs on an
@@ -2252,6 +2317,7 @@ def _run_context_parallel_backward(
             valid_lengths=state.rank_plan.local_valid_lengths,
             seq_len=value.shape[0],
         ),
+        grad_softmax_offset,
     )
 
 
@@ -2262,6 +2328,7 @@ class ArtContextParallelFn(torch.autograd.Function):
         query: torch.Tensor,
         key: torch.Tensor,
         value: torch.Tensor,
+        softmax_offset: torch.Tensor | None,
         state: ArtContextParallelState,
         scale: float,
         enable_gqa: bool,
@@ -2277,12 +2344,15 @@ class ArtContextParallelFn(torch.autograd.Function):
         ctx.triton_num_stages_2_head_dims = tuple(
             int(dim) for dim in triton_num_stages_2_head_dims
         )
-        ctx.save_for_backward(query, key, value)
+        tensors_to_save = [query, key, value]
+        if softmax_offset is not None:
+            tensors_to_save.append(softmax_offset)
+        ctx.has_softmax_offset = softmax_offset is not None
         with torch.enable_grad():
             query_record = query.detach().requires_grad_(bool(query.requires_grad))
             key_record = key.detach().requires_grad_(bool(key.requires_grad))
             value_record = value.detach().requires_grad_(bool(value.requires_grad))
-            output, _replay_accum_out, replay_records = (
+            output, replay_accum_out, replay_accum_lse, replay_records = (
                 _run_context_parallel_forward_recorded(
                     query=query_record,
                     key=key_record,
@@ -2293,17 +2363,29 @@ class ArtContextParallelFn(torch.autograd.Function):
                     compile_enabled=bool(compile_enabled),
                     sliding_window=sliding_window,
                     triton_num_stages_2_head_dims=ctx.triton_num_stages_2_head_dims,
+                    softmax_offset=softmax_offset,
                 )
             )
+        if softmax_offset is not None:
+            tensors_to_save.extend((replay_accum_out, replay_accum_lse))
+        ctx.save_for_backward(*tensors_to_save)
         ctx.replay_records = replay_records
         return output.detach()
 
     @staticmethod
     def backward(ctx, *grad_outputs: Any):
         (grad_output,) = cast(tuple[torch.Tensor], grad_outputs)
-        query, key, value = ctx.saved_tensors
+        saved_tensors = ctx.saved_tensors
+        query, key, value = saved_tensors[:3]
+        if bool(ctx.has_softmax_offset):
+            softmax_offset = saved_tensors[3]
+            replay_accum_out, replay_accum_lse = saved_tensors[4:6]
+        else:
+            softmax_offset = None
+            replay_accum_out = None
+            replay_accum_lse = None
         try:
-            dq, dk, dv = _run_context_parallel_backward(
+            dq, dk, dv, grad_softmax_offset = _run_context_parallel_backward(
                 grad_output=grad_output,
                 query=query,
                 key=key,
@@ -2314,11 +2396,14 @@ class ArtContextParallelFn(torch.autograd.Function):
                 compile_enabled=ctx.compile_enabled,
                 sliding_window=ctx.sliding_window,
                 triton_num_stages_2_head_dims=ctx.triton_num_stages_2_head_dims,
+                softmax_offset=softmax_offset,
                 replay_records=cast(list[dict[str, Any]], ctx.replay_records),
+                replay_accum_out=replay_accum_out,
+                replay_accum_lse=replay_accum_lse,
             )
         finally:
             ctx.replay_records = None
-        return dq, dk, dv, None, None, None, None, None, None
+        return dq, dk, dv, grad_softmax_offset, None, None, None, None, None, None
 
 
 def run_context_parallel(
@@ -2332,14 +2417,19 @@ def run_context_parallel(
     compile_enabled: bool,
     sliding_window: int | None = None,
     triton_num_stages_2_head_dims: tuple[int, ...] = (),
+    softmax_offset: torch.Tensor | None = None,
 ) -> torch.Tensor:
     if torch.is_grad_enabled() and (
-        query.requires_grad or key.requires_grad or value.requires_grad
+        query.requires_grad
+        or key.requires_grad
+        or value.requires_grad
+        or (softmax_offset is not None and softmax_offset.requires_grad)
     ):
         return ArtContextParallelFn.apply(
             query,
             key,
             value,
+            softmax_offset,
             state,
             float(scale),
             bool(enable_gqa),
@@ -2359,4 +2449,5 @@ def run_context_parallel(
         triton_num_stages_2_head_dims=tuple(
             int(dim) for dim in triton_num_stages_2_head_dims
         ),
+        softmax_offset=softmax_offset,
     )

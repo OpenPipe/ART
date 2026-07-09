@@ -29,6 +29,7 @@ from .preprocessing.moe_routing import attach_moe_routing_metadata_to_choice
 from .preprocessing.vllm_tokens import attach_vllm_token_metadata_to_choice
 from .trajectories import Trajectory, TrajectoryGroup
 from .types import SFTMetricLoggingConfig, TrainSFTConfig
+from .utils import wandb_sdk
 from .utils.trajectory_logging import write_trajectory_groups_parquet
 
 if TYPE_CHECKING:
@@ -617,28 +618,31 @@ class Model(
 
     def _get_wandb_run(self) -> Optional["Run"]:
         """Get or create the wandb run for this model."""
-        import wandb
-
         if "WANDB_API_KEY" not in os.environ:
             return None
         if self._wandb_run is None or self._wandb_run._is_finished:
-            run = wandb.init(
-                project=self.project,
-                name=self.name,
-                id=self.name,
-                config=self._wandb_config or None,
-                resume="allow",
-                reinit="create_new",
-                settings=wandb.Settings(
-                    x_stats_open_metrics_endpoints={
-                        "vllm": "http://localhost:8000/metrics",
-                    },
-                    x_stats_open_metrics_filters=(
-                        "vllm.vllm:num_requests_waiting",
-                        "vllm.vllm:num_requests_running",
+            try:
+                run = wandb_sdk.init(
+                    project=self.project,
+                    name=self.name,
+                    id=self.name,
+                    config=self._wandb_config or None,
+                    resume="allow",
+                    reinit="create_new",
+                    settings=wandb_sdk.settings(
+                        x_stats_open_metrics_endpoints={
+                            "vllm": "http://localhost:8000/metrics",
+                        },
+                        x_stats_open_metrics_filters=(
+                            "vllm.vllm:num_requests_waiting",
+                            "vllm.vllm:num_requests_running",
+                        ),
                     ),
-                ),
-            )
+                )
+            except ModuleNotFoundError as e:
+                if e.name == "wandb" or (e.name or "").startswith("wandb."):
+                    return None
+                raise
             self._wandb_run = run
             object.__setattr__(
                 self,

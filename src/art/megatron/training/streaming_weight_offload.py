@@ -27,6 +27,8 @@ STREAMING_INSTALLED_MESSAGE = (
 STREAMING_COMPILED_LAYERS_MESSAGE = (
     "Streaming weight offload managing compiled transformer layers"
 )
+# Quantized/custom kernels may vector-load weights and scales from streamed views.
+STREAMED_PARAM_ALIGNMENT_BYTES = 256
 
 
 def _rank0_info(rank: int, message: str, *args: object) -> None:
@@ -199,7 +201,7 @@ class StreamingWeightOffloader:
             )
 
     def _post_forward(self, layer_state: _LayerState) -> None:
-        if is_checkpointing() and not torch.is_grad_enabled():
+        if not torch.is_grad_enabled():
             self._start_offload(layer_state)
             self._prefetch_window(layer_state.index + self.config.resident_layers, 1, 1)
 
@@ -490,13 +492,16 @@ def _build_tensor_groups(
         grouped.setdefault(param.dtype, []).append((name, param))
     groups: list[_TensorGroup] = []
     for dtype, dtype_params in grouped.items():
-        total_numel = sum(param.numel() for _name, param in dtype_params)
-        cpu_flat = torch.empty(total_numel, dtype=dtype, device="cpu")
+        element_size = dtype_params[0][1].element_size()
+        alignment_numel = max(
+            1,
+            (STREAMED_PARAM_ALIGNMENT_BYTES + element_size - 1) // element_size,
+        )
         specs: list[_ParamSpec] = []
         offset = 0
         for name, param in dtype_params:
+            offset = _align_numel(offset, alignment_numel)
             numel = param.numel()
-            cpu_flat[offset : offset + numel].copy_(param.detach().view(-1).cpu())
             specs.append(
                 _ParamSpec(
                     name=name,
@@ -507,8 +512,17 @@ def _build_tensor_groups(
                 )
             )
             offset += numel
+        cpu_flat = torch.empty(offset, dtype=dtype, device="cpu")
+        for spec in specs:
+            cpu_flat[spec.offset : spec.offset + spec.numel].copy_(
+                spec.param.detach().view(-1).cpu()
+            )
         groups.append(_TensorGroup(dtype=dtype, cpu_flat=cpu_flat, specs=specs))
     return groups
+
+
+def _align_numel(offset: int, alignment_numel: int) -> int:
+    return ((offset + alignment_numel - 1) // alignment_numel) * alignment_numel
 
 
 def _validate_streamed_param(spec: _ParamSpec) -> None:

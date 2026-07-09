@@ -50,6 +50,9 @@ _GEMMA4_TRITON_NUM_STAGES_2_SIGNATURES = {
     # google/gemma-4-31B-it: Triton flex attention raises "No valid triton
     # configs" for global attention head_dim=512 with backend-only options.
     ("dense", 60, 5376, 32, 256, 512, 4),
+    # google/gemma-4-26B-A4B-it hits the same Triton resource limit on global
+    # attention head_dim=512 with backend-only options.
+    ("moe", 30, 2816, 16, 256, 512, 2),
 }
 _ART_MOE_EXPERT_KEY_RE = re.compile(
     r"^(?P<prefix>.*\.mlp\.experts)\.(?P<expert>\d+)\."
@@ -68,7 +71,7 @@ _DENSE_MLP_LORA_KEY_RE = re.compile(
     r"(?P<lora>lora_[AB])\.weight$"
 )
 _SHARED_EXPERT_FC1_LORA_A_KEY_RE = re.compile(
-    r"^.*\.layers\.(?P<layer>\d+)\.mlp\.(?:shared_expert\.)?"
+    r"^.*\.layers\.(?P<layer>\d+)\.mlp\.(?:shared_experts\.)?"
     r"(?:gate_proj|up_proj)\.lora_A\.weight$"
 )
 _SELF_ATTN_V_LORA_KEY_RE = re.compile(
@@ -130,7 +133,7 @@ class Gemma4MoeHandler(DefaultMoeHandler):
         _patch_gemma4_rotary_for_hf_proportional()
         _patch_gemma4_qkv_for_hf_tied_value()
         window_size = int(getattr(provider, "window_size", 1024))
-        provider.art_flex_core_attention_wrapper = _gemma4_flex_core_attention_wrapper
+        _install_gemma4_flex_core_attention_wrapper(provider)
         provider.art_flex_sliding_windows = (window_size,)
         provider.art_flex_head_dims_by_window = {
             None: int(getattr(provider, "global_head_dim", provider.kv_channels)),
@@ -349,6 +352,12 @@ class Gemma4MoeHandler(DefaultMoeHandler):
             disable_compile=False,
         )
 
+    def flex_attention_compile_crash_config(
+        self,
+        provider: Any,
+    ) -> FlexAttentionCompileCrashConfig:
+        return _gemma4_flex_attention_compile_crash_config(provider)
+
 
 GEMMA4_MOE_HANDLER = Gemma4MoeHandler()
 
@@ -364,7 +373,7 @@ class Gemma4DenseHandler(DefaultDenseHandler):
         _patch_gemma4_rotary_for_hf_proportional()
         _patch_gemma4_qkv_for_hf_tied_value()
         window_size = int(getattr(provider, "window_size", 1024))
-        provider.art_flex_core_attention_wrapper = _gemma4_flex_core_attention_wrapper
+        _install_gemma4_flex_core_attention_wrapper(provider)
         provider.art_flex_sliding_windows = (window_size,)
         provider.art_flex_head_dims_by_window = {
             None: int(getattr(provider, "global_head_dim", provider.kv_channels)),
@@ -537,14 +546,7 @@ class Gemma4DenseHandler(DefaultDenseHandler):
         self,
         provider: Any,
     ) -> FlexAttentionCompileCrashConfig:
-        if (
-            _gemma4_compile_crash_signature(provider)
-            in _GEMMA4_TRITON_NUM_STAGES_2_SIGNATURES
-        ):
-            return FlexAttentionCompileCrashConfig(
-                triton_num_stages_2_head_dims=(int(provider.global_head_dim),)
-            )
-        return FlexAttentionCompileCrashConfig()
+        return _gemma4_flex_attention_compile_crash_config(provider)
 
     def get_forward_kwargs(self, model: Any, **kwargs: Any) -> dict[str, Any]:
         return _gemma4_forward_kwargs(model, **kwargs)
@@ -975,6 +977,19 @@ def _gemma4_attention_pattern(provider: Any) -> tuple[int, int]:
     return (int(pattern[0]), int(pattern[1]))
 
 
+def _gemma4_flex_attention_compile_crash_config(
+    provider: Any,
+) -> FlexAttentionCompileCrashConfig:
+    if (
+        _gemma4_compile_crash_signature(provider)
+        in _GEMMA4_TRITON_NUM_STAGES_2_SIGNATURES
+    ):
+        return FlexAttentionCompileCrashConfig(
+            triton_num_stages_2_head_dims=(int(provider.global_head_dim),)
+        )
+    return FlexAttentionCompileCrashConfig()
+
+
 def _gemma4_compile_crash_signature(provider: Any) -> tuple[Any, ...]:
     return (
         "moe" if int(getattr(provider, "num_moe_experts", 0) or 0) > 0 else "dense",
@@ -1006,6 +1021,13 @@ def _gemma4_sliding_window_for_layer(provider: Any, layer_number: int) -> int | 
     return int(provider.window_size)
 
 
+def _install_gemma4_flex_core_attention_wrapper(provider: Any) -> None:
+    def _wrapper(_config: Any, base_cls: type[Any]) -> type[Any]:
+        return _gemma4_flex_core_attention_wrapper(provider, base_cls)
+
+    provider.art_flex_core_attention_wrapper = _wrapper
+
+
 def _gemma4_flex_core_attention_wrapper(
     provider: Any, base_cls: type[Any]
 ) -> type[Any]:
@@ -1017,6 +1039,11 @@ def _gemma4_flex_core_attention_wrapper(
             *args: Any,
             **kwargs: Any,
         ) -> None:
+            compile_crash_config = getattr(
+                provider, "art_flex_compile_crash_config", None
+            )
+            if compile_crash_config is not None:
+                config.art_flex_compile_crash_config = compile_crash_config
             super().__init__(config, layer_number, *args, **kwargs)
             self.art_sliding_window = _gemma4_sliding_window_for_layer(
                 provider,
@@ -1108,9 +1135,10 @@ def _wrap_gemma4_attention_output_lora(
 
 
 def _to_vllm_key(key: str) -> str:
-    key = key.replace(".mlp.shared_expert.", ".mlp.").replace(
-        ".mlp.experts",
-        ".moe.experts",
+    key = (
+        key.replace(".mlp.shared_experts.", ".mlp.")
+        .replace(".mlp.shared_expert.", ".mlp.")
+        .replace(".mlp.experts", ".moe.experts")
     )
     return _HF_TEXT_EXPERT_KEY_RE.sub(r"\g<layer>.moe.experts", key)
 
@@ -1118,7 +1146,7 @@ def _to_vllm_key(key: str) -> str:
 def _from_vllm_key(key: str) -> str:
     key = key.replace(".moe.experts", ".mlp.experts")
     return _DENSE_MLP_LORA_KEY_RE.sub(
-        r"\g<prefix>.shared_expert.\g<module>.\g<lora>.weight",
+        r"\g<prefix>.shared_experts.\g<module>.\g<lora>.weight",
         key,
     )
 
@@ -1199,10 +1227,8 @@ def _gemma4_shared_expert_prenorm_corrections(
     )
     weight_map = dict(index["weight_map"])
     text_config = _gemma4_text_config_dict(base_model_name_or_path)
-    num_layers = int(text_config["num_hidden_layers"])
     norm_keys_by_file: dict[str, list[tuple[int, str, str]]] = {}
-
-    for layer in range(num_layers):
+    for layer in range(int(text_config["num_hidden_layers"])):
         for suffix in (
             "pre_feedforward_layernorm",
             "pre_feedforward_layernorm_2",
@@ -1215,6 +1241,7 @@ def _gemma4_shared_expert_prenorm_corrections(
             norm_keys_by_file.setdefault(weight_map[key], []).append(
                 (layer, suffix, key)
             )
+
     norm_weights: dict[tuple[int, str], torch.Tensor] = {}
     for filename, entries in norm_keys_by_file.items():
         with safe_open(
@@ -1228,22 +1255,8 @@ def _gemma4_shared_expert_prenorm_corrections(
     return tuple(
         norm_weights[(layer, "pre_feedforward_layernorm")]
         / norm_weights[(layer, "pre_feedforward_layernorm_2")]
-        for layer in range(num_layers)
+        for layer in range(int(text_config["num_hidden_layers"]))
     )
-
-
-def _shared_expert_fc1_prenorm_correction(
-    *,
-    adapter_config: dict[str, Any],
-    layer: int,
-    device: torch.device,
-) -> torch.Tensor:
-    # Megatron Bridge folds pffl/pffl2 into shared-expert FC1 base weights because
-    # MCore feeds pffl2-normalized activations while HF/vLLM feeds pffl-normalized
-    # activations. LoRA-A needs the same basis change at the HF/vLLM boundary.
-    return _gemma4_shared_expert_prenorm_corrections(
-        str(adapter_config["base_model_name_or_path"])
-    )[layer].to(device=device)
 
 
 def _rescale_shared_expert_fc1_lora_a(
@@ -1256,11 +1269,10 @@ def _rescale_shared_expert_fc1_lora_a(
     match = _SHARED_EXPERT_FC1_LORA_A_KEY_RE.match(key)
     if match is None:
         return tensor
-    correction = _shared_expert_fc1_prenorm_correction(
-        adapter_config=adapter_config,
-        layer=int(match.group("layer")),
-        device=tensor.device,
+    corrections = _gemma4_shared_expert_prenorm_corrections(
+        str(adapter_config["base_model_name_or_path"])
     )
+    correction = corrections[int(match.group("layer"))].to(device=tensor.device)
     factor = correction.reciprocal() if to_vllm else correction
     return (tensor.float() * factor.unsqueeze(0)).to(tensor.dtype).contiguous()
 

@@ -6,7 +6,7 @@ from pydantic import BaseModel, ConfigDict, Field
 import torch
 
 from .cases import GdnPhase0Case
-from .parser_import import GdnPackedExecutionSpec, parse_gdn_shared_prefix_segments
+from .parser_import import GdnPackedExecutionSpec, parse_gdn_prefix_tree_segments
 
 
 class GdnCaseSummary(BaseModel):
@@ -137,19 +137,23 @@ def summarize_case(
     conv_width: int,
     cp_sizes: tuple[int, ...] = (2, 4, 8),
 ) -> GdnCaseSummary:
-    spec = parse_gdn_shared_prefix_segments(
-        tensors["group_ids"], tensors["parent_ids"], min_completions_per_family=1
-    )
+    spec = parse_gdn_prefix_tree_segments(tensors["group_ids"], tensors["parent_ids"])
     suffix_lengths = [
-        segment.length for family in spec.families for segment in family.completions
+        segment.length
+        for index, segment in enumerate(spec.tree_segments)
+        if spec.tree_parent_indices[index] >= 0
     ]
     boundary = _boundary_flags(spec, cp_sizes)
     return GdnCaseSummary(
         name=case.name,
         total_tokens=spec.real_token_count,
         family_count=spec.family_count,
-        completion_count=spec.completion_count,
-        max_segment_length=spec.max_segment_length,
+        completion_count=sum(
+            1 for parent_index in spec.tree_parent_indices if parent_index >= 0
+        ),
+        max_segment_length=max(
+            (segment.length for segment in spec.tree_segments), default=0
+        ),
         suffix_shorter_than_conv=any(length < conv_width for length in suffix_lengths),
         suffix_equal_to_conv=any(length == conv_width for length in suffix_lengths),
         suffix_longer_than_conv=any(length > conv_width for length in suffix_lengths),
@@ -227,17 +231,47 @@ def _boundary_flags(
         boundaries = {shard * rank for rank in range(1, cp_size)}
         if shard * (cp_size - 1) >= spec.real_token_count:
             flags["empty_trailing_rank"] = True
-        for family in spec.families:
-            family_start = _segment_real_start(family.prefix, spec, real_index)
-            family_end = _segment_real_end(family.completions[-1], spec, real_index)
+        for root in _root_segments(spec):
+            descendants = _descendant_segments(spec, root.family_index)
+            family_segments = (root, *descendants)
+            family_start = min(
+                _segment_real_start(segment, spec, real_index)
+                for segment in family_segments
+            )
+            family_end = max(
+                _segment_real_end(segment, spec, real_index)
+                for segment in family_segments
+            )
             if family_start in boundaries or family_end in boundaries:
                 flags["family_boundary_at_partition"] = True
-            if _crosses_boundary(family.prefix, spec, real_index, boundaries):
+            if _crosses_boundary(root, spec, real_index, boundaries):
                 flags["cp_boundary_prefix"] = True
-            for completion in family.completions:
+            for completion in descendants:
                 if _crosses_boundary(completion, spec, real_index, boundaries):
                     flags["cp_boundary_suffix"] = True
     return flags
+
+
+def _root_segments(spec: GdnPackedExecutionSpec) -> tuple[Any, ...]:
+    return tuple(
+        segment
+        for index, segment in enumerate(spec.tree_segments)
+        if spec.tree_parent_indices[index] < 0
+    )
+
+
+def _descendant_segments(
+    spec: GdnPackedExecutionSpec, root_index: int
+) -> tuple[Any, ...]:
+    descendants = []
+    for index, segment in enumerate(spec.tree_segments):
+        parent = spec.tree_parent_indices[index]
+        while parent >= 0:
+            if parent == root_index:
+                descendants.append(segment)
+                break
+            parent = spec.tree_parent_indices[parent]
+    return tuple(descendants)
 
 
 def _segment_real_start(

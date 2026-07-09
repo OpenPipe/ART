@@ -47,15 +47,15 @@ class MoeRoutingAlignmentStats(BaseModel):
 
 class MoeRoutingPackStats(BaseModel):
     packed_tokens: int = 0
-    shared_prefix_rows: int = 0
-    shared_prefix_conflict_rows: int = 0
-    shared_prefix_conflict_slots: int = 0
-    shared_prefix_compared_slots: int = 0
+    prefix_tree_rows: int = 0
+    prefix_tree_conflict_rows: int = 0
+    prefix_tree_conflict_slots: int = 0
+    prefix_tree_compared_slots: int = 0
 
     def add_alignment(self, stats: MoeRoutingAlignmentStats) -> None:
-        self.shared_prefix_conflict_rows += stats.overlap_conflict_rows
-        self.shared_prefix_conflict_slots += stats.overlap_conflict_slots
-        self.shared_prefix_compared_slots += stats.overlap_compared_slots
+        self.prefix_tree_conflict_rows += stats.overlap_conflict_rows
+        self.prefix_tree_conflict_slots += stats.overlap_conflict_slots
+        self.prefix_tree_compared_slots += stats.overlap_compared_slots
 
 
 class PackedMoeRoutingReplay(BaseModel):

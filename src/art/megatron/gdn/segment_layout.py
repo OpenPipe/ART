@@ -8,28 +8,13 @@ import triton
 import triton.language as tl
 
 
-@triton.jit(do_not_specialize=["segment_count"])
-def _segment_from_cu(cu_seqlens, n, segment_count):
-    lo = n * 0
-    hi = lo + segment_count
-    for _ in tl.static_range(0, 16):
-        mid = (lo + hi) // 2
-        start = tl.load(cu_seqlens + mid)
-        take_upper = start <= n
-        lo = tl.where(take_upper, mid, lo)
-        hi = tl.where(take_upper, hi, mid)
-    return lo, n - tl.load(cu_seqlens + lo)
-
-
-@triton.jit(do_not_specialize=["token_count", "segment_count", "sequence_length"])
+@triton.jit(do_not_specialize=["token_count", "sequence_length"])
 def _gather_compact_qkv_kernel(
     qkv_flat,
     row_indices,
     position_indices,
-    cu_seqlens,
     out,
     token_count,
-    segment_count,
     sequence_length,
     channels: tl.constexpr,
     BLOCK_N: tl.constexpr,
@@ -38,10 +23,8 @@ def _gather_compact_qkv_kernel(
     n = tl.program_id(0) * BLOCK_N + tl.arange(0, BLOCK_N)
     d = tl.program_id(1) * BLOCK_D + tl.arange(0, BLOCK_D)
     token_mask = n < token_count
-    segment, offset = _segment_from_cu(cu_seqlens, n, segment_count)
-    p = offset * segment_count + segment
-    row = tl.load(row_indices + p, mask=token_mask, other=0)
-    pos = tl.load(position_indices + p, mask=token_mask, other=0)
+    row = tl.load(row_indices + n, mask=token_mask, other=0)
+    pos = tl.load(position_indices + n, mask=token_mask, other=0)
     src = row * sequence_length + pos
     n64 = n.to(tl.int64)
     d64 = d.to(tl.int64)
@@ -55,15 +38,13 @@ def _gather_compact_qkv_kernel(
     tl.store(out + n64[:, None] * channels + d64[None, :], values, mask=mask)
 
 
-@triton.jit(do_not_specialize=["token_count", "segment_count", "sequence_length"])
+@triton.jit(do_not_specialize=["token_count", "sequence_length"])
 def _gather_compact_aux_kernel(
     x_flat,
     row_indices,
     position_indices,
-    cu_seqlens,
     out,
     token_count,
-    segment_count,
     sequence_length,
     width: tl.constexpr,
     BLOCK_N: tl.constexpr,
@@ -72,10 +53,8 @@ def _gather_compact_aux_kernel(
     n = tl.program_id(0) * BLOCK_N + tl.arange(0, BLOCK_N)
     d = tl.program_id(1) * BLOCK_D + tl.arange(0, BLOCK_D)
     token_mask = n < token_count
-    segment, offset = _segment_from_cu(cu_seqlens, n, segment_count)
-    p = offset * segment_count + segment
-    row = tl.load(row_indices + p, mask=token_mask, other=0)
-    pos = tl.load(position_indices + p, mask=token_mask, other=0)
+    row = tl.load(row_indices + n, mask=token_mask, other=0)
+    pos = tl.load(position_indices + n, mask=token_mask, other=0)
     src = row * sequence_length + pos
     n64 = n.to(tl.int64)
     d64 = d.to(tl.int64)
@@ -89,15 +68,13 @@ def _gather_compact_aux_kernel(
     tl.store(out + n64[:, None] * width + d64[None, :], values, mask=mask)
 
 
-@triton.jit(do_not_specialize=["token_count", "segment_count", "sequence_length"])
+@triton.jit(do_not_specialize=["token_count", "sequence_length"])
 def _scatter_compact_qkv_grad_kernel(
     grad_out,
     row_indices,
     position_indices,
-    cu_seqlens,
     grad_flat,
     token_count,
-    segment_count,
     sequence_length,
     channels: tl.constexpr,
     BLOCK_N: tl.constexpr,
@@ -106,10 +83,8 @@ def _scatter_compact_qkv_grad_kernel(
     n = tl.program_id(0) * BLOCK_N + tl.arange(0, BLOCK_N)
     d = tl.program_id(1) * BLOCK_D + tl.arange(0, BLOCK_D)
     token_mask = n < token_count
-    segment, offset = _segment_from_cu(cu_seqlens, n, segment_count)
-    p = offset * segment_count + segment
-    row = tl.load(row_indices + p, mask=token_mask, other=0)
-    pos = tl.load(position_indices + p, mask=token_mask, other=0)
+    row = tl.load(row_indices + n, mask=token_mask, other=0)
+    pos = tl.load(position_indices + n, mask=token_mask, other=0)
     dst = row * sequence_length + pos
     n64 = n.to(tl.int64)
     d64 = d.to(tl.int64)
@@ -128,15 +103,13 @@ def _scatter_compact_qkv_grad_kernel(
     )
 
 
-@triton.jit(do_not_specialize=["token_count", "segment_count", "sequence_length"])
+@triton.jit(do_not_specialize=["token_count", "sequence_length"])
 def _scatter_compact_aux_grad_kernel(
     grad_out,
     row_indices,
     position_indices,
-    cu_seqlens,
     grad_flat,
     token_count,
-    segment_count,
     sequence_length,
     width: tl.constexpr,
     BLOCK_N: tl.constexpr,
@@ -145,10 +118,8 @@ def _scatter_compact_aux_grad_kernel(
     n = tl.program_id(0) * BLOCK_N + tl.arange(0, BLOCK_N)
     d = tl.program_id(1) * BLOCK_D + tl.arange(0, BLOCK_D)
     token_mask = n < token_count
-    segment, offset = _segment_from_cu(cu_seqlens, n, segment_count)
-    p = offset * segment_count + segment
-    row = tl.load(row_indices + p, mask=token_mask, other=0)
-    pos = tl.load(position_indices + p, mask=token_mask, other=0)
+    row = tl.load(row_indices + n, mask=token_mask, other=0)
+    pos = tl.load(position_indices + n, mask=token_mask, other=0)
     dst = row * sequence_length + pos
     n64 = n.to(tl.int64)
     d64 = d.to(tl.int64)
@@ -319,18 +290,14 @@ def _prepare_packed_qkv_backward_kernel(
     tl.store(grad_qkv + n64[:, None] * channels + c64[None, :], values, mask=mask)
 
 
-@triton.jit(
-    do_not_specialize=["token_count", "segment_count", "output_sequence_length"]
-)
+@triton.jit(do_not_specialize=["token_count", "output_sequence_length"])
 def _scatter_bucket_output_compact_forward_kernel(
     output,
     bucket_output,
     row_indices,
     position_indices,
     output_mask,
-    cu_seqlens,
     token_count,
-    segment_count,
     output_sequence_length,
     heads: tl.constexpr,
     dim: tl.constexpr,
@@ -339,12 +306,10 @@ def _scatter_bucket_output_compact_forward_kernel(
 ):
     n = tl.program_id(0) * BLOCK_N + tl.arange(0, BLOCK_N)
     hd = tl.program_id(1) * BLOCK_D + tl.arange(0, BLOCK_D)
-    segment, offset = _segment_from_cu(cu_seqlens, n, segment_count)
-    p = offset * segment_count + segment
     token_mask = n < token_count
-    write = tl.load(output_mask + p, mask=token_mask, other=0).to(tl.int1)
-    row = tl.load(row_indices + p, mask=token_mask, other=0)
-    pos = tl.load(position_indices + p, mask=token_mask, other=0)
+    write = tl.load(output_mask + n, mask=token_mask, other=0).to(tl.int1)
+    row = tl.load(row_indices + n, mask=token_mask, other=0)
+    pos = tl.load(position_indices + n, mask=token_mask, other=0)
     h = hd // dim
     d = hd - h * dim
     n64 = n.to(tl.int64)
@@ -368,9 +333,7 @@ def _scatter_bucket_output_compact_forward_kernel(
     )
 
 
-@triton.jit(
-    do_not_specialize=["token_count", "segment_count", "output_sequence_length"]
-)
+@triton.jit(do_not_specialize=["token_count", "output_sequence_length"])
 def _scatter_bucket_output_compact_backward_kernel(
     grad_output,
     grad_base,
@@ -378,9 +341,7 @@ def _scatter_bucket_output_compact_backward_kernel(
     row_indices,
     position_indices,
     output_mask,
-    cu_seqlens,
     token_count,
-    segment_count,
     output_sequence_length,
     heads: tl.constexpr,
     dim: tl.constexpr,
@@ -389,12 +350,10 @@ def _scatter_bucket_output_compact_backward_kernel(
 ):
     n = tl.program_id(0) * BLOCK_N + tl.arange(0, BLOCK_N)
     hd = tl.program_id(1) * BLOCK_D + tl.arange(0, BLOCK_D)
-    segment, offset = _segment_from_cu(cu_seqlens, n, segment_count)
-    p = offset * segment_count + segment
     token_mask = n < token_count
-    write = tl.load(output_mask + p, mask=token_mask, other=0).to(tl.int1)
-    row = tl.load(row_indices + p, mask=token_mask, other=0)
-    pos = tl.load(position_indices + p, mask=token_mask, other=0)
+    write = tl.load(output_mask + n, mask=token_mask, other=0).to(tl.int1)
+    row = tl.load(row_indices + n, mask=token_mask, other=0)
+    pos = tl.load(position_indices + n, mask=token_mask, other=0)
     h = hd // dim
     d = hd - h * dim
     n64 = n.to(tl.int64)
@@ -428,9 +387,7 @@ class _CompactBucketStreamGather(torch.autograd.Function):
         recurrent_g_flat: Tensor,
         row_indices: Tensor,
         position_indices: Tensor,
-        cu_seqlens: Tensor,
         token_count: int,
-        segment_count: int,
         sequence_length: int,
     ) -> tuple[Tensor, Tensor, Tensor]:
         _validate_cuda("qkv_flat", qkv_flat)
@@ -439,10 +396,18 @@ class _CompactBucketStreamGather(torch.autograd.Function):
         recurrent_g_flat = recurrent_g_flat.contiguous()
         row_indices = row_indices.contiguous()
         position_indices = position_indices.contiguous()
-        cu_seqlens = cu_seqlens.contiguous()
         token_count = int(token_count)
-        segment_count = int(segment_count)
         sequence_length = int(sequence_length)
+        if tuple(row_indices.shape) != (token_count,):
+            raise ValueError(
+                "packed row_indices must be [tokens], got "
+                f"{tuple(row_indices.shape)} for {token_count}"
+            )
+        if tuple(position_indices.shape) != (token_count,):
+            raise ValueError(
+                "packed position_indices must be [tokens], got "
+                f"{tuple(position_indices.shape)} for {token_count}"
+            )
         qkv_channels = int(qkv_flat.shape[-1])
         aux_width = int(beta_flat.shape[-1])
         qkv = torch.empty(
@@ -465,10 +430,8 @@ class _CompactBucketStreamGather(torch.autograd.Function):
             qkv_flat,
             row_indices,
             position_indices,
-            cu_seqlens,
             qkv,
             token_count,
-            segment_count,
             sequence_length,
             qkv_channels,
             BLOCK_N=block_n,
@@ -483,10 +446,8 @@ class _CompactBucketStreamGather(torch.autograd.Function):
             beta_flat,
             row_indices,
             position_indices,
-            cu_seqlens,
             beta,
             token_count,
-            segment_count,
             sequence_length,
             aux_width,
             BLOCK_N=block_n,
@@ -497,19 +458,16 @@ class _CompactBucketStreamGather(torch.autograd.Function):
             recurrent_g_flat,
             row_indices,
             position_indices,
-            cu_seqlens,
             recurrent_g,
             token_count,
-            segment_count,
             sequence_length,
             aux_width,
             BLOCK_N=block_n,
             BLOCK_D=block_aux,
             num_warps=4,
         )
-        ctx.save_for_backward(row_indices, position_indices, cu_seqlens)
+        ctx.save_for_backward(row_indices, position_indices)
         ctx.token_count = token_count
-        ctx.segment_count = segment_count
         ctx.sequence_length = sequence_length
         ctx.qkv_flat_count = int(qkv_flat.shape[0])
         ctx.beta_flat_count = int(beta_flat.shape[0])
@@ -533,7 +491,7 @@ class _CompactBucketStreamGather(torch.autograd.Function):
         None,
     ]:
         grad_qkv_bucket, grad_beta_bucket, grad_g_bucket = grad_outputs
-        row_indices, position_indices, cu_seqlens = ctx.saved_tensors
+        row_indices, position_indices = ctx.saved_tensors
         block_n, block_qkv, block_aux = 32, 64, 32
         grad_qkv = None
         if ctx.needs_input_grad[0] and grad_qkv_bucket is not None:
@@ -548,10 +506,8 @@ class _CompactBucketStreamGather(torch.autograd.Function):
                 grad_qkv_bucket,
                 row_indices,
                 position_indices,
-                cu_seqlens,
                 grad_qkv,
                 ctx.token_count,
-                ctx.segment_count,
                 ctx.sequence_length,
                 ctx.qkv_channels,
                 BLOCK_N=block_n,
@@ -571,10 +527,8 @@ class _CompactBucketStreamGather(torch.autograd.Function):
                 grad_beta_bucket,
                 row_indices,
                 position_indices,
-                cu_seqlens,
                 grad_beta,
                 ctx.token_count,
-                ctx.segment_count,
                 ctx.sequence_length,
                 ctx.aux_width,
                 BLOCK_N=block_n,
@@ -594,10 +548,8 @@ class _CompactBucketStreamGather(torch.autograd.Function):
                 grad_g_bucket,
                 row_indices,
                 position_indices,
-                cu_seqlens,
                 grad_g,
                 ctx.token_count,
-                ctx.segment_count,
                 ctx.sequence_length,
                 ctx.aux_width,
                 BLOCK_N=block_n,
@@ -782,7 +734,6 @@ class _CompactScatterBucketOutput(torch.autograd.Function):
         row_indices: Tensor,
         position_indices: Tensor,
         output_mask: Tensor,
-        cu_seqlens: Tensor,
     ) -> Tensor:
         _validate_cuda("output", output)
         output = output.contiguous()
@@ -790,7 +741,6 @@ class _CompactScatterBucketOutput(torch.autograd.Function):
         row_indices = row_indices.contiguous()
         position_indices = position_indices.contiguous()
         output_mask = output_mask.contiguous()
-        cu_seqlens = cu_seqlens.contiguous()
         if bucket_output.ndim != 4 or int(bucket_output.shape[0]) != 1:
             raise ValueError(
                 "bucket_output must have shape [1, tokens, heads, dim], got "
@@ -799,16 +749,20 @@ class _CompactScatterBucketOutput(torch.autograd.Function):
         output_batch, output_sequence_length, heads, dim = output.shape
         del output_batch
         token_count = int(bucket_output.shape[1])
-        segment_count = int(cu_seqlens.numel()) - 1
-        if tuple(row_indices.shape) != tuple(position_indices.shape):
+        if tuple(row_indices.shape) != (token_count,):
             raise ValueError(
-                "row_indices and position_indices must have the same shape, got "
-                f"{tuple(row_indices.shape)} and {tuple(position_indices.shape)}"
+                "packed row_indices must be [tokens], got "
+                f"{tuple(row_indices.shape)} for {token_count}"
             )
-        if tuple(output_mask.shape) != tuple(row_indices.shape):
+        if tuple(position_indices.shape) != (token_count,):
             raise ValueError(
-                "output_mask must match row_indices shape, got "
-                f"{tuple(output_mask.shape)} and {tuple(row_indices.shape)}"
+                "packed position_indices must be [tokens], got "
+                f"{tuple(position_indices.shape)} for {token_count}"
+            )
+        if tuple(output_mask.shape) != (token_count,):
+            raise ValueError(
+                "packed output_mask must be [tokens], got "
+                f"{tuple(output_mask.shape)} for {token_count}"
             )
         out = output.clone()
         block_n, block_d = 16, 64
@@ -820,9 +774,7 @@ class _CompactScatterBucketOutput(torch.autograd.Function):
             row_indices,
             position_indices,
             output_mask,
-            cu_seqlens,
             token_count,
-            segment_count,
             output_sequence_length,
             heads,
             dim,
@@ -830,11 +782,10 @@ class _CompactScatterBucketOutput(torch.autograd.Function):
             BLOCK_D=block_d,
             num_warps=4,
         )
-        ctx.save_for_backward(row_indices, position_indices, output_mask, cu_seqlens)
+        ctx.save_for_backward(row_indices, position_indices, output_mask)
         ctx.output_shape = tuple(output.shape)
         ctx.bucket_output_shape = tuple(bucket_output.shape)
         ctx.token_count = token_count
-        ctx.segment_count = segment_count
         return out
 
     @staticmethod
@@ -844,7 +795,7 @@ class _CompactScatterBucketOutput(torch.autograd.Function):
         if len(grad_outputs) != 1 or grad_outputs[0] is None:
             raise RuntimeError("expected compact scatter output gradient")
         grad_out = grad_outputs[0]
-        row_indices, position_indices, output_mask, cu_seqlens = ctx.saved_tensors
+        row_indices, position_indices, output_mask = ctx.saved_tensors
         _, output_sequence_length, heads, dim = ctx.output_shape
         grad_out = grad_out.contiguous()
         grad_base = grad_out.clone()
@@ -862,9 +813,7 @@ class _CompactScatterBucketOutput(torch.autograd.Function):
             row_indices,
             position_indices,
             output_mask,
-            cu_seqlens,
             ctx.token_count,
-            ctx.segment_count,
             output_sequence_length,
             heads,
             dim,
@@ -881,10 +830,8 @@ def gather_bucket_streams_compact(
     recurrent_g_flat: Tensor,
     row_indices: Tensor,
     position_indices: Tensor,
-    cu_seqlens: Tensor,
     *,
     token_count: int,
-    segment_count: int,
     sequence_length: int,
 ) -> tuple[Tensor, Tensor, Tensor]:
     return _CompactBucketStreamGather.apply(
@@ -893,9 +840,7 @@ def gather_bucket_streams_compact(
         recurrent_g_flat,
         row_indices,
         position_indices,
-        cu_seqlens,
         token_count,
-        segment_count,
         sequence_length,
     )
 
@@ -906,7 +851,6 @@ def scatter_bucket_output_compact(
     row_indices: Tensor,
     position_indices: Tensor,
     output_mask: Tensor,
-    cu_seqlens: Tensor,
 ) -> Tensor:
     return _CompactScatterBucketOutput.apply(
         output,
@@ -914,7 +858,6 @@ def scatter_bucket_output_compact(
         row_indices,
         position_indices,
         output_mask,
-        cu_seqlens,
     )
 
 

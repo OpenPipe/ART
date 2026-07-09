@@ -48,6 +48,22 @@ _LAZY_EXPORTS = {
         "art.megatron.model_support.handlers.qwen3_5",
         "Qwen35MoeHandler",
     ),
+    "DSV4_HANDLER": (
+        "art.megatron.model_support.handlers.dsv4",
+        "DSV4_HANDLER",
+    ),
+    "Dsv4Handler": (
+        "art.megatron.model_support.handlers.dsv4",
+        "Dsv4Handler",
+    ),
+    "GPT_OSS_MOE_HANDLER": (
+        "art.megatron.model_support.handlers.gpt_oss",
+        "GPT_OSS_MOE_HANDLER",
+    ),
+    "GptOssMoeHandler": (
+        "art.megatron.model_support.handlers.gpt_oss",
+        "GptOssMoeHandler",
+    ),
 }
 
 
