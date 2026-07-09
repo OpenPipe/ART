@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from contextlib import contextmanager
 import os
+from pathlib import Path
 import socket
 from types import SimpleNamespace
 
@@ -12,9 +13,17 @@ pytest.importorskip("megatron.core")
 
 from megatron.core import parallel_state as ps  # noqa: E402
 from torch.distributed import destroy_process_group, init_process_group  # noqa: E402
+import torch.multiprocessing as mp  # noqa: E402
 
 from art.megatron.lora import LoRA, LoRASlotRef, use_lora_slot  # noqa: E402
-from art.trainer_rank import AdamParams, TrainerRank  # noqa: E402
+from art.trainer_rank import (  # noqa: E402
+    AdamParams,
+    TrainerRank,
+    _distributed_grad_norm,
+    _vocab_parallel_log_z,
+    _vocab_parallel_target_logprobs,
+    _vocab_parallel_topk_from_local,
+)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required.")
@@ -56,6 +65,18 @@ def test_dynamic_lora_slots_capture_recompute_context_and_step_independently() -
         assert lora._slot(ref_b).scale == 8.0  # type: ignore[union-attr]
 
         trainer = _trainer_for(lora, device)
+        cpu_adapter = {
+            key: value.cpu().double()
+            for key, value in _adapter("dense", rank=3, seed=7).items()
+        }
+        trainer.load_checkpoint_slot("CPU", cpu_adapter)
+        cpu_slot = lora._slot(LoRASlotRef("checkpoint", "CPU"))
+        assert cpu_slot is not None
+        assert cpu_slot.A_T.device == lora.A_T.device
+        assert cpu_slot.A_T.dtype == lora.A_T.dtype
+        with use_lora_slot(LoRASlotRef("checkpoint", "CPU")):
+            assert lora(x).is_cuda
+
         with trainer.push_checkpoint("A"):
             assert trainer._slot_stack[-1] == ref_a
             with trainer.push_lora(None):
@@ -74,6 +95,180 @@ def test_dynamic_lora_slots_capture_recompute_context_and_step_independently() -
         )
         _assert_step_updates_only(ref_a, ref_b, lora, trainer)
         _assert_reload_replaces_slot_optimizer(ref_a, lora, trainer)
+
+
+@pytest.mark.parametrize("tp_size", (2, 4))
+def test_trainer_rank_tp_head_backward_matches_unsharded_oracle(
+    tp_size: int,
+    tmp_path: Path,
+) -> None:
+    if not torch.cuda.is_available() or torch.cuda.device_count() < tp_size:
+        pytest.skip(f"requires {tp_size} CUDA devices")
+    init_file = tmp_path / f"tp_head_{tp_size}"
+    mp.spawn(
+        _tp_head_backward_worker,
+        args=(tp_size, f"file://{init_file}"),
+        nprocs=tp_size,
+        join=True,
+    )
+
+
+def _tp_head_backward_worker(rank: int, world: int, init_method: str) -> None:
+    torch.cuda.set_device(rank)
+    init_process_group(
+        "nccl",
+        rank=rank,
+        world_size=world,
+        init_method=init_method,
+    )
+    try:
+        ps.initialize_model_parallel(
+            tensor_model_parallel_size=world,
+            pipeline_model_parallel_size=1,
+            context_parallel_size=1,
+            expert_model_parallel_size=1,
+        )
+        device = torch.device("cuda", rank)
+        full = torch.tensor(
+            [
+                [-1.2, 0.4, 2.1, -0.7, 1.3, 0.2, -2.0, 0.8],
+                [0.1, -0.5, 1.7, 0.3, -1.1, 2.4, 0.9, -0.2],
+            ],
+            device=device,
+        )
+        local_size = int(full.shape[1]) // world
+        local = (
+            full[:, rank * local_size : (rank + 1) * local_size]
+            .clone()
+            .requires_grad_()
+        )
+        labels = torch.tensor([2, 5], device=device)
+        rows = torch.arange(int(full.shape[0]), device=device)
+        actual = _vocab_parallel_target_logprobs(
+            local,
+            labels,
+            _vocab_parallel_log_z(local),
+            row_offsets=rows,
+        )
+        (-actual.sum()).backward()
+
+        reference = full.detach().clone().requires_grad_()
+        (-torch.log_softmax(reference, dim=-1)[rows, labels].sum()).backward()
+        torch.testing.assert_close(
+            local.grad,
+            reference.grad[:, rank * local_size : (rank + 1) * local_size],
+            atol=1e-6,
+            rtol=1e-6,
+        )
+
+        local = (
+            full[:, rank * local_size : (rank + 1) * local_size]
+            .clone()
+            .requires_grad_()
+        )
+        local_values, local_tokens = torch.topk(local, k=min(2, local_size), dim=-1)
+        actual_topk = _vocab_parallel_topk_from_local(
+            local_values,
+            local_tokens,
+            k=2,
+            log_z=_vocab_parallel_log_z(local),
+            vocab_start=rank * local_size,
+        )
+        (-actual_topk.logprobs.sum()).backward()
+
+        reference = full.detach().clone().requires_grad_()
+        reference_values, reference_tokens = torch.topk(
+            torch.log_softmax(reference, dim=-1), k=2, dim=-1
+        )
+        (-reference_values.sum()).backward()
+        torch.testing.assert_close(actual_topk.tokens, reference_tokens)
+        torch.testing.assert_close(
+            local.grad,
+            reference.grad[:, rank * local_size : (rank + 1) * local_size],
+            atol=1e-6,
+            rtol=1e-6,
+        )
+
+        from megatron.core import tensor_parallel
+
+        local_hidden = torch.randn(2, 1, 3, device=device, requires_grad=True)
+        gathered_hidden = tensor_parallel.gather_from_sequence_parallel_region(
+            local_hidden,
+            tensor_parallel_output_grad=False,
+            group=ps.get_tensor_model_parallel_group(check_initialized=False),
+        ).squeeze(1)
+        gathered_hidden.sum().backward()
+        torch.testing.assert_close(local_hidden.grad, torch.ones_like(local_hidden))
+
+        replicated = torch.nn.Parameter(torch.ones(1, device=device))
+        replicated.lora_shard_domain = "tp"  # type: ignore[attr-defined]
+        replicated.lora_tp_sharded = False  # type: ignore[attr-defined]
+        replicated.grad_sync_domain = "tp_default"  # type: ignore[attr-defined]
+        replicated.grad_sync_op = "sum"  # type: ignore[attr-defined]
+        replicated.allreduce = True  # type: ignore[attr-defined]
+        replicated.grad = torch.tensor([float(rank + 1)], device=device)
+        sharded = torch.nn.Parameter(torch.ones(1, device=device))
+        sharded.lora_shard_domain = "tp"  # type: ignore[attr-defined]
+        sharded.lora_tp_sharded = True  # type: ignore[attr-defined]
+        sharded.grad_sync_domain = "tp_default"  # type: ignore[attr-defined]
+        sharded.grad_sync_op = "none"  # type: ignore[attr-defined]
+        sharded.allreduce = True  # type: ignore[attr-defined]
+        sharded.grad = torch.tensor([float(rank + 1)], device=device)
+        trainer = TrainerRank.__new__(TrainerRank)
+        reduced = trainer._reduce_dynamic_grads((replicated, sharded), scale_grads=0.5)
+        expected_replicated = 0.5 * sum(range(1, world + 1))
+        torch.testing.assert_close(
+            reduced[0], torch.tensor([expected_replicated], device=device)
+        )
+        torch.testing.assert_close(
+            reduced[1], torch.tensor([0.5 * (rank + 1)], device=device)
+        )
+        norm = _distributed_grad_norm(
+            (replicated, sharded),
+            reduced,
+        )
+        expected_norm = (
+            expected_replicated**2
+            + sum(float((0.5 * i) ** 2) for i in range(1, world + 1))
+        ) ** 0.5
+        assert norm == pytest.approx(expected_norm, rel=1e-6)
+
+        _assert_replica_grad_reduction(rank, world, context_parallel=True)
+        _assert_replica_grad_reduction(rank, world, context_parallel=False)
+    finally:
+        if getattr(ps, "model_parallel_is_initialized", lambda: False)():
+            ps.destroy_model_parallel()
+        destroy_process_group()
+
+
+def _assert_replica_grad_reduction(
+    rank: int,
+    world: int,
+    *,
+    context_parallel: bool,
+) -> None:
+    ps.destroy_model_parallel()
+    torch.distributed.barrier()
+    ps.initialize_model_parallel(
+        tensor_model_parallel_size=1,
+        pipeline_model_parallel_size=1,
+        context_parallel_size=world if context_parallel else 1,
+        expert_model_parallel_size=1,
+    )
+    device = torch.device("cuda", rank)
+    param = torch.nn.Parameter(torch.ones(1, device=device))
+    param.allreduce = True  # type: ignore[attr-defined]
+    param.lora_shard_domain = "tp"  # type: ignore[attr-defined]
+    param.lora_tp_sharded = False  # type: ignore[attr-defined]
+    param.grad_sync_domain = "tp_default"  # type: ignore[attr-defined]
+    param.grad_sync_op = "none"  # type: ignore[attr-defined]
+    param.grad = torch.tensor([float(rank + 1)], device=device)
+
+    trainer = TrainerRank.__new__(TrainerRank)
+    (reduced,) = trainer._reduce_dynamic_grads((param,), scale_grads=0.25)
+    expected = 0.25 * sum(range(1, world + 1))
+    torch.testing.assert_close(reduced, torch.tensor([expected], device=device))
+    assert _distributed_grad_norm((param,), (reduced,)) == pytest.approx(expected)
 
 
 def _adapter(prefix: str, *, rank: int, seed: int) -> dict[str, torch.Tensor]:

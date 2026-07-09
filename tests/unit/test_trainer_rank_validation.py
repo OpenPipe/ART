@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import gc
 from types import SimpleNamespace
 from typing import Any, cast
 
@@ -28,10 +29,17 @@ class _Model:
 
 
 class _FakeLoRASite(torch.nn.Module):
-    def __init__(self, prefix: str) -> None:
+    def __init__(
+        self,
+        prefix: str,
+        *,
+        device: torch.device | str = "cpu",
+        dtype: torch.dtype = torch.float32,
+    ) -> None:
         super().__init__()
         self.prefix = prefix
-        self.weight = torch.nn.Parameter(torch.zeros(()))
+        self.A_T = torch.nn.Parameter(torch.zeros(4, 2, device=device, dtype=dtype))
+        self.B_T = torch.nn.Parameter(torch.zeros(2, 5, device=device, dtype=dtype))
 
     def _expected_weight_keys(self, suffix: str) -> list[str]:
         return [f"{self.prefix}.{suffix}.weight"]
@@ -175,6 +183,20 @@ def test_trainer_rank_rejects_adapter_keys_without_installed_lora_site() -> None
         )
 
 
+def test_trainer_rank_normalizes_adapter_tensors_to_installed_site() -> None:
+    site = _FakeLoRASite("base.layer", dtype=torch.bfloat16)
+    trainer = TrainerRank(_runtime(site))  # type: ignore[arg-type]
+    adapter = {
+        "base.layer.lora_A.weight": torch.ones(3, 4, dtype=torch.float32),
+        "base.layer.lora_B.weight": torch.ones(5, 3, dtype=torch.float32),
+    }
+
+    normalized = trainer._normalize_adapter_model(adapter)
+
+    assert all(tensor.device == site.A_T.device for tensor in normalized.values())
+    assert all(tensor.dtype == torch.bfloat16 for tensor in normalized.values())
+
+
 def test_trainer_rank_default_forward_uses_explicit_base_slot() -> None:
     trainer = TrainerRank(_runtime())  # type: ignore[arg-type]
 
@@ -221,7 +243,11 @@ def test_optim_step_rejects_explicit_slot_subset_with_missing_grads(
     ready.grad = torch.ones_like(ready)
     trainer._checkpoint_slot_params_by_name["ready"] = (ready,)
     trainer._checkpoint_slot_params_by_name["missing"] = (missing,)
-    monkeypatch.setattr(trainer, "_reduce_dynamic_grads", lambda _params: None)
+    monkeypatch.setattr(
+        trainer,
+        "_reduce_dynamic_grads",
+        lambda params, **_kwargs: tuple(param.grad.float() for param in params),
+    )
 
     with pytest.raises(TrainerRankSlotStateError, match="missing"):
         trainer.optim_step(
@@ -239,7 +265,11 @@ def test_optim_step_implicitly_steps_only_slots_with_grads(
     ready.grad = torch.ones_like(ready)
     trainer._checkpoint_slot_params_by_name["ready"] = (ready,)
     trainer._checkpoint_slot_params_by_name["untouched"] = (untouched,)
-    monkeypatch.setattr(trainer, "_reduce_dynamic_grads", lambda _params: None)
+    monkeypatch.setattr(
+        trainer,
+        "_reduce_dynamic_grads",
+        lambda params, **_kwargs: tuple(param.grad.float() for param in params),
+    )
 
     before_ready = ready.detach().clone()
     before_untouched = untouched.detach().clone()
@@ -260,7 +290,11 @@ def test_checkpoint_slot_optimizer_state_round_trips_same_shape(
     param = torch.nn.Parameter(torch.ones(2))
     param.grad = torch.tensor([0.5, -0.25])
     trainer._checkpoint_slot_params_by_name["student"] = (param,)
-    monkeypatch.setattr(trainer, "_reduce_dynamic_grads", lambda _params: None)
+    monkeypatch.setattr(
+        trainer,
+        "_reduce_dynamic_grads",
+        lambda params, **_kwargs: tuple(param.grad.float() for param in params),
+    )
 
     trainer.optim_step(
         params=AdamParams(learning_rate=1e-2, weight_decay=0.0, grad_clip_norm=10.0)
@@ -278,7 +312,136 @@ def test_checkpoint_slot_optimizer_state_round_trips_same_shape(
 
     restored_state = restored.checkpoint_slot_optimizer_state("student")
     assert restored_state is not None
-    assert restored_state["state"]
+    assert restored_state["optimizer"]
+    assert restored_state["master_params"]
+
+
+def test_checkpoint_slot_optimizer_state_reproduces_exact_next_step(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    adam = AdamParams(
+        learning_rate=3e-4,
+        beta1=0.8,
+        beta2=0.95,
+        weight_decay=0.1,
+        grad_clip_norm=10.0,
+    )
+
+    def configure(value: torch.Tensor) -> tuple[TrainerRank, torch.nn.Parameter]:
+        trainer = TrainerRank(_runtime())  # type: ignore[arg-type]
+        param = torch.nn.Parameter(value.clone())
+        trainer._checkpoint_slot_params_by_name["student"] = (param,)
+        monkeypatch.setattr(
+            trainer,
+            "_reduce_dynamic_grads",
+            lambda params, **_kwargs: tuple(item.grad.float() for item in params),
+        )
+        return trainer, param
+
+    original, original_param = configure(
+        torch.tensor([0.5, -0.25], dtype=torch.bfloat16)
+    )
+    original_param.grad = torch.tensor([0.2, -0.4], dtype=torch.bfloat16)
+    original.optim_step(params=adam)
+    state = original.checkpoint_slot_optimizer_state("student")
+    assert state is not None
+
+    restored, restored_param = configure(original_param.detach())
+    restored._dynamic_optimizers["student"] = restored._restore_dynamic_optimizer(
+        "student", state
+    )
+    for param in (original_param, restored_param):
+        param.grad = torch.tensor([-0.3, 0.1], dtype=torch.bfloat16)
+    original.optim_step(params=adam)
+    restored.optim_step(params=adam)
+
+    torch.testing.assert_close(restored_param, original_param, atol=0, rtol=0)
+    original_state = original.checkpoint_slot_optimizer_state("student")
+    restored_state = restored.checkpoint_slot_optimizer_state("student")
+    assert original_state is not None and restored_state is not None
+    _assert_nested_tensors_equal(restored_state, original_state)
+
+
+def test_dynamic_optimizer_keeps_fp32_master_weight_and_moments(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    trainer = TrainerRank(_runtime())  # type: ignore[arg-type]
+    param = torch.nn.Parameter(torch.tensor([0.1], dtype=torch.bfloat16))
+    trainer._checkpoint_slot_params_by_name["student"] = (param,)
+    monkeypatch.setattr(
+        trainer,
+        "_reduce_dynamic_grads",
+        lambda params, **_kwargs: tuple(item.grad.float() for item in params),
+    )
+
+    for _ in range(100):
+        param.grad = torch.ones_like(param)
+        trainer.optim_step(
+            params=AdamParams(
+                learning_rate=1e-5,
+                weight_decay=0.0,
+                grad_clip_norm=10.0,
+            )
+        )
+
+    dynamic = trainer._dynamic_optimizers["student"]
+    assert dynamic.master_params[0].dtype == torch.float32
+    assert param.item() < torch.tensor(0.1, dtype=torch.bfloat16).item()
+    state = dynamic.optimizer.state[dynamic.master_params[0]]
+    assert state["exp_avg"].dtype == torch.float32
+    assert state["exp_avg_sq"].dtype == torch.float32
+
+
+def test_checkpoint_slot_optimizer_state_rejects_layout_mismatch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    trainer = TrainerRank(_runtime())  # type: ignore[arg-type]
+    param = torch.nn.Parameter(torch.ones(2))
+    param.grad = torch.ones_like(param)
+    trainer._checkpoint_slot_params_by_name["student"] = (param,)
+    monkeypatch.setattr(
+        trainer,
+        "_reduce_dynamic_grads",
+        lambda params, **_kwargs: tuple(item.grad.float() for item in params),
+    )
+    trainer.optim_step(
+        params=AdamParams(learning_rate=1e-2, weight_decay=0.0, grad_clip_norm=10.0)
+    )
+    state = trainer.checkpoint_slot_optimizer_state("student")
+    assert state is not None
+    state["layout"] = {"different": True}
+
+    restored = TrainerRank(_runtime())  # type: ignore[arg-type]
+    restored._checkpoint_slot_params_by_name["student"] = (
+        torch.nn.Parameter(torch.ones(2)),
+    )
+    with pytest.raises(TrainerRankSlotStateError, match="topology or parameter layout"):
+        restored._restore_dynamic_optimizer("student", state)
+
+
+def test_checkpoint_slot_optimizer_state_rejects_missing_master_parameter(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    trainer = TrainerRank(_runtime())  # type: ignore[arg-type]
+    param = torch.nn.Parameter(torch.ones(2))
+    param.grad = torch.ones_like(param)
+    trainer._checkpoint_slot_params_by_name["student"] = (param,)
+    monkeypatch.setattr(
+        trainer,
+        "_reduce_dynamic_grads",
+        lambda params, **_kwargs: tuple(item.grad.float() for item in params),
+    )
+    trainer.optim_step(params=AdamParams(learning_rate=1e-2))
+    state = trainer.checkpoint_slot_optimizer_state("student")
+    assert state is not None
+    state["master_params"] = ()
+
+    restored = TrainerRank(_runtime())  # type: ignore[arg-type]
+    restored._checkpoint_slot_params_by_name["student"] = (
+        torch.nn.Parameter(torch.ones(2)),
+    )
+    with pytest.raises(TrainerRankSlotStateError, match="master parameters"):
+        restored._restore_dynamic_optimizer("student", state)
 
 
 def test_checkpoint_slot_optimizer_state_rejects_shape_mismatch(
@@ -288,7 +451,11 @@ def test_checkpoint_slot_optimizer_state_rejects_shape_mismatch(
     param = torch.nn.Parameter(torch.ones(2))
     param.grad = torch.ones_like(param)
     trainer._checkpoint_slot_params_by_name["student"] = (param,)
-    monkeypatch.setattr(trainer, "_reduce_dynamic_grads", lambda _params: None)
+    monkeypatch.setattr(
+        trainer,
+        "_reduce_dynamic_grads",
+        lambda params, **_kwargs: tuple(param.grad.float() for param in params),
+    )
     trainer.optim_step(
         params=AdamParams(learning_rate=1e-2, weight_decay=0.0, grad_clip_norm=10.0)
     )
@@ -300,7 +467,7 @@ def test_checkpoint_slot_optimizer_state_rejects_shape_mismatch(
         torch.nn.Parameter(torch.ones(3)),
     )
 
-    with pytest.raises(TrainerRankSlotStateError, match="shape"):
+    with pytest.raises(TrainerRankSlotStateError, match="topology or parameter layout"):
         restored._restore_dynamic_optimizer("student", state)
 
 
@@ -309,12 +476,13 @@ def test_trainer_rank_load_rejects_pending_checkpoint_graph() -> None:
     ref = _SlotRef("checkpoint", "teacher")
     output = ForwardOutput(torch.ones(1, requires_grad=True) * 2, None, None, None)
 
-    trainer._track_slot_graph_outputs(ref, [output])  # type: ignore[arg-type]
+    tracked = trainer._track_slot_graph_outputs(ref, [output])  # type: ignore[arg-type]
 
     with pytest.raises(TrainerRankSlotStateError, match="Cannot load checkpoint slot"):
         trainer._guard_slot_can_load(ref)  # type: ignore[arg-type]
 
-    output.target_logprobs.sum().backward()
+    assert tracked[0].target_logprobs is not None
+    tracked[0].target_logprobs.sum().backward()
 
     trainer._guard_slot_can_load(ref)  # type: ignore[arg-type]
 
@@ -327,12 +495,13 @@ def test_trainer_rank_step_rejects_pending_checkpoint_graph(
     ref = _SlotRef("checkpoint", "student")
     output = ForwardOutput(torch.ones(1, requires_grad=True) * 2, None, None, None)
 
-    trainer._track_slot_graph_outputs(ref, [output])  # type: ignore[arg-type]
+    tracked = trainer._track_slot_graph_outputs(ref, [output])  # type: ignore[arg-type]
 
     with pytest.raises(TrainerRankSlotStateError, match="Cannot optim_step"):
         trainer._guard_checkpoint_can_step("student")
 
-    output.target_logprobs.sum().backward()
+    assert tracked[0].target_logprobs is not None
+    tracked[0].target_logprobs.sum().backward()
 
     trainer._guard_checkpoint_can_step("student")
 
@@ -346,7 +515,7 @@ def test_trainer_rank_step_allows_missing_slot_graph_bookkeeping(
     trainer._guard_checkpoint_can_step("student")
 
 
-def test_trainer_rank_zero_grad_clears_abandoned_slot_graphs() -> None:
+def test_trainer_rank_zero_grad_does_not_clear_live_slot_graphs() -> None:
     trainer = TrainerRank(_runtime())  # type: ignore[arg-type]
     ref = _SlotRef("lora", "teacher")
     output = ForwardOutput(
@@ -359,8 +528,75 @@ def test_trainer_rank_zero_grad_clears_abandoned_slot_graphs() -> None:
         None,
     )
 
-    trainer._track_slot_graph_outputs(ref, [output])  # type: ignore[arg-type]
+    tracked = trainer._track_slot_graph_outputs(ref, [output])  # type: ignore[arg-type]
     trainer.zero_grad()
+
+    assert tracked[0].top_k is not None
+    with pytest.raises(TrainerRankSlotStateError, match="live backward graph"):
+        trainer._guard_slot_can_load(ref)  # type: ignore[arg-type]
+
+
+def test_trainer_rank_retained_backward_keeps_slot_graph_guard() -> None:
+    trainer = TrainerRank(_runtime())  # type: ignore[arg-type]
+    ref = _SlotRef("checkpoint", "teacher")
+    output = ForwardOutput(torch.ones(1, requires_grad=True) * 2, None, None, None)
+    tracked = trainer._track_slot_graph_outputs(ref, [output])  # type: ignore[arg-type]
+    target = tracked[0].target_logprobs
+    assert target is not None
+
+    target.sum().backward(retain_graph=True)
+    with pytest.raises(TrainerRankSlotStateError, match="live backward graph"):
+        trainer._guard_slot_can_load(ref)  # type: ignore[arg-type]
+
+    target.sum().backward()
+    trainer._guard_slot_can_load(ref)  # type: ignore[arg-type]
+
+
+def test_trainer_rank_tracks_each_independent_output_graph() -> None:
+    trainer = TrainerRank(_runtime())  # type: ignore[arg-type]
+    ref = _SlotRef("checkpoint", "teacher")
+    outputs = [
+        ForwardOutput(torch.ones(1, requires_grad=True) * scale, None, None, None)
+        for scale in (2, 3)
+    ]
+    tracked = trainer._track_slot_graph_outputs(ref, outputs)  # type: ignore[arg-type]
+    first = tracked[0].target_logprobs
+    second = tracked[1].target_logprobs
+    assert first is not None and second is not None
+
+    first.sum().backward()
+    with pytest.raises(TrainerRankSlotStateError, match="live backward graph"):
+        trainer._guard_slot_can_load(ref)  # type: ignore[arg-type]
+
+    second.sum().backward()
+    trainer._guard_slot_can_load(ref)  # type: ignore[arg-type]
+
+
+def test_trainer_rank_tracks_graph_after_output_is_replaced_by_loss() -> None:
+    trainer = TrainerRank(_runtime())  # type: ignore[arg-type]
+    ref = _SlotRef("checkpoint", "teacher")
+    output = ForwardOutput(torch.ones(1, requires_grad=True) * 2, None, None, None)
+    tracked = trainer._track_slot_graph_outputs(ref, [output])  # type: ignore[arg-type]
+    target = tracked[0].target_logprobs
+    assert target is not None
+    loss = target.sum()
+    del output, tracked, target
+    gc.collect()
+
+    with pytest.raises(TrainerRankSlotStateError, match="live backward graph"):
+        trainer._guard_slot_can_load(ref)  # type: ignore[arg-type]
+
+    loss.backward()
+    trainer._guard_slot_can_load(ref)  # type: ignore[arg-type]
+
+
+def test_trainer_rank_releases_abandoned_output_graph() -> None:
+    trainer = TrainerRank(_runtime())  # type: ignore[arg-type]
+    ref = _SlotRef("checkpoint", "teacher")
+    output = ForwardOutput(torch.ones(1, requires_grad=True) * 2, None, None, None)
+    tracked = trainer._track_slot_graph_outputs(ref, [output])  # type: ignore[arg-type]
+    del output, tracked
+    gc.collect()
 
     trainer._guard_slot_can_load(ref)  # type: ignore[arg-type]
 
@@ -881,3 +1117,21 @@ def test_disconnected_outputs_keep_zero_graph_anchor() -> None:
     (anchored.sum() + anchored_top_k.logprobs.sum()).backward()
     assert hidden.grad is not None
     torch.testing.assert_close(hidden.grad, torch.zeros_like(hidden))
+
+
+def _assert_nested_tensors_equal(actual: object, expected: object) -> None:
+    if isinstance(expected, torch.Tensor):
+        assert isinstance(actual, torch.Tensor)
+        torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+    elif isinstance(expected, dict):
+        assert isinstance(actual, dict) and actual.keys() == expected.keys()
+        actual_dict = cast(dict[Any, object], actual)
+        expected_dict = cast(dict[Any, object], expected)
+        for key in expected_dict:
+            _assert_nested_tensors_equal(actual_dict[key], expected_dict[key])
+    elif isinstance(expected, tuple | list):
+        assert isinstance(actual, type(expected)) and len(actual) == len(expected)
+        for actual_item, expected_item in zip(actual, expected, strict=True):
+            _assert_nested_tensors_equal(actual_item, expected_item)
+    else:
+        assert actual == expected

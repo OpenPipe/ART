@@ -72,32 +72,46 @@ def main(
             print_env=dist.get_rank() == 0,
         )
         rank = TrainerRank(runtime)
-        from art.megatron.lora import LoRA
+        from art.megatron.lora import LoRAPublishPlanner, LoraShardMeta
 
-        adapter: dict[str, torch.Tensor] = {}
         generator = torch.Generator(device=rank.device).manual_seed(0)
-        for chunk in runtime.model:
-            for module in chunk.modules():
-                if not isinstance(module, LoRA):
-                    continue
-                for a_key, b_key in zip(
-                    module._expected_weight_keys("lora_A"),
-                    module._expected_weight_keys("lora_B"),
-                    strict=True,
-                ):
-                    adapter[a_key] = torch.randn(
-                        lora_rank,
-                        module.in_features,
-                        device=rank.device,
-                        dtype=module.A_T.dtype,
-                        generator=generator,
-                    )
-                    adapter[b_key] = torch.zeros(
-                        module.out_features,
-                        lora_rank,
-                        device=rank.device,
-                        dtype=module.B_T.dtype,
-                    )
+        dtype = next(runtime.model[0].parameters()).dtype
+        metadata_by_rank: list[list[LoraShardMeta] | None] = [
+            None for _ in range(dist.get_world_size())
+        ]
+        dist.all_gather_object(
+            metadata_by_rank,
+            LoRAPublishPlanner(runtime.model).global_metadata({}),
+        )
+        metadata = {
+            meta.key: meta
+            for rank_metadata in metadata_by_rank
+            if rank_metadata is not None
+            for meta in rank_metadata
+        }
+        adapter: dict[str, torch.Tensor] = {}
+        for meta in sorted(metadata.values(), key=lambda item: item.key):
+            shape = list(meta.shape)
+            if meta.manifest["sharded"]:
+                axis = int(meta.manifest["export_shard_dim"])
+                components = meta.manifest.get("component_sizes")
+                shape[axis] = (
+                    sum(int(size) for size in components)
+                    if isinstance(components, list)
+                    else shape[axis] * int(meta.manifest["shard_world_size"])
+                )
+            is_a = ".lora_A." in meta.key
+            shape[0 if is_a else -1] = lora_rank
+            adapter[meta.key] = (
+                torch.randn(
+                    shape,
+                    device=rank.device,
+                    dtype=dtype,
+                    generator=generator,
+                )
+                if is_a
+                else torch.zeros(shape, device=rank.device, dtype=dtype)
+            )
         loaded_sites = rank.load_checkpoint_slot("student", adapter)
         if loaded_sites == 0:
             raise RuntimeError("TrainerRank dev script requires LoRA adapter sites")

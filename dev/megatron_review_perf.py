@@ -5,7 +5,6 @@ from dataclasses import dataclass
 import json
 from pathlib import Path
 import time
-from types import SimpleNamespace
 
 import numpy as np
 import torch
@@ -17,8 +16,8 @@ from art.megatron.context_parallel.block_mask import (
     build_block_mask_from_context,
     prepare_block_mask_context,
 )
-from art.megatron.context_parallel.builder import build_prefix_tree_attention_spec
-from art.megatron.context_parallel.executor import _resolve_stage_execution_spec
+from art.megatron.context_parallel.builder import build_shared_prefix_attention_spec
+from art.megatron.context_parallel.executor import _build_stage_execution_spec
 from art.megatron.context_parallel.runtime import (
     _RUNTIME_PLAN_CACHE,
     get_or_build_runtime_plan,
@@ -34,7 +33,7 @@ from art.megatron.flex_attn.compiled import (
     normalize_sparse_block_size,
     sparse_compiled_flex_attention,
 )
-from art.megatron.prefix_tree_packing import PrefixTreePack, prefix_tree_pack
+from art.megatron.shared_prefix_packing import SharedPrefixPack, pack_shared_prefixes
 
 
 def main(
@@ -76,7 +75,7 @@ def main(
         branches_per_prefix=branches_per_prefix,
         completion_len=completion_len,
     )
-    spec = build_prefix_tree_attention_spec(
+    spec = build_shared_prefix_attention_spec(
         group_ids=pack.group_ids,
         parent_ids=pack.parent_ids,
     )
@@ -178,7 +177,7 @@ def main(
             branches_per_prefix=branches_per_prefix,
             completion_len=completion_len + variant * 11,
         )
-        variant_spec = build_prefix_tree_attention_spec(
+        variant_spec = build_shared_prefix_attention_spec(
             group_ids=variant_pack.group_ids,
             parent_ids=variant_pack.parent_ids,
         )
@@ -240,7 +239,7 @@ def _pack_workload(
     mid_prefix_len: int,
     branches_per_prefix: int,
     completion_len: int,
-) -> PrefixTreePack:
+) -> SharedPrefixPack:
     sequences = (
         _austin_sequences()
         if workload == "austin_198k"
@@ -255,7 +254,7 @@ def _pack_workload(
             completion_len=completion_len,
         )
     )
-    return prefix_tree_pack(sequences, max_depth=max_depth)
+    return pack_shared_prefixes(sequences, max_depth=max_depth)
 
 
 def _austin_sequences() -> tuple[torch.Tensor, ...]:
@@ -333,7 +332,7 @@ def _tokens(offset: int, length: int) -> torch.Tensor:
 
 
 def _build_cp_plan(
-    pack: PrefixTreePack,
+    pack: SharedPrefixPack,
     spec: object,
     topology: ParallelTopology,
     config: ContextParallelConfig,
@@ -347,7 +346,7 @@ def _build_cp_plan(
 
 
 def _build_stage_masks(
-    pack: PrefixTreePack,
+    pack: SharedPrefixPack,
     plan: object,
     config: ContextParallelConfig,
 ) -> tuple[tuple[BlockMask, tuple[object, ...]], ...]:
@@ -382,7 +381,7 @@ def _build_stage_masks(
 
 
 def _flex_records(
-    pack: PrefixTreePack,
+    pack: SharedPrefixPack,
     plan: object,
     config: ContextParallelConfig,
     *,
@@ -519,7 +518,7 @@ class _StageFlexCase:
 
 
 def _build_stage_flex_cases(
-    pack: PrefixTreePack,
+    pack: SharedPrefixPack,
     plan: object,
     config: ContextParallelConfig,
     *,
@@ -652,9 +651,8 @@ def _stage_execution_spec(
     stage: StagePlan,
     config: ContextParallelConfig,
 ) -> StageExecutionSpec:
-    return _resolve_stage_execution_spec(
+    return _build_stage_execution_spec(
         stage_plan=stage,
-        state=SimpleNamespace(config=config, execution_cache=None),
         block_size=_sparse_block_size(config),
     )
 
@@ -828,7 +826,7 @@ def _block_entries(
     return entries
 
 
-def _logical_tokens(pack: PrefixTreePack) -> int:
+def _logical_tokens(pack: SharedPrefixPack) -> int:
     return sum(int(positions.numel()) for positions in pack.positions_by_sequence)
 
 

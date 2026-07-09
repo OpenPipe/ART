@@ -294,7 +294,6 @@ allowed-unresolved-imports = [
     "seaborn.**",
     # megatron deps
     "causal_conv1d.**",
-    "einops.**",
     "fla.**",
     "megatron.**",
     "quack.**",

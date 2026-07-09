@@ -19,6 +19,7 @@ from typing import (
     cast,
     overload,
 )
+import weakref
 
 import torch
 import torch.distributed as dist
@@ -375,7 +376,6 @@ type AnyForwardOutput = ForwardOutput[
     torch.Tensor | None,
     torch.Tensor | None,
 ]
-type AnyMicroBatch = MicroBatch[AnyForwardInput, AnyForwardOutput]
 type ForwardInputs = AnyForwardInput | Iterable["ForwardInputs"]
 type ForwardOutputs = AnyForwardOutput | Sequence["ForwardOutputs"]
 ForwardInputsT = TypeVar("ForwardInputsT", bound=ForwardInputs)
@@ -441,17 +441,34 @@ class _CandidateMicroBatch(Generic[ForwardInputsT]):
     cold_start: bool
 
 
-@dataclass
-class _SlotGraphLease:
-    trainer: "TrainerRank"
-    ref: "LoRASlotRef"
-    active: bool = True
+class _SlotGraphSentinel(torch.autograd.Function):
+    @staticmethod
+    def forward(
+        ctx: Any,
+        tensor: torch.Tensor,
+        marker: torch.Tensor,
+    ) -> torch.Tensor:
+        ctx.save_for_backward(marker)
+        return tensor
 
-    def release(self) -> None:
-        if not self.active:
-            return
-        self.active = False
-        self.trainer._release_slot_graph(self.ref)
+    @staticmethod
+    def backward(ctx: Any, *grad_outputs: Any) -> tuple[torch.Tensor, None]:
+        return cast(torch.Tensor, grad_outputs[0]), None
+
+
+@dataclass(frozen=True)
+class _SlotGraphLease:
+    markers: tuple[weakref.ReferenceType[torch.Tensor], ...]
+
+    def is_live(self) -> bool:
+        return any(marker() is not None for marker in self.markers)
+
+
+@dataclass(frozen=True)
+class _DynamicOptimizer:
+    optimizer: torch.optim.Optimizer
+    model_params: tuple[torch.nn.Parameter, ...]
+    master_params: tuple[torch.nn.Parameter, ...]
 
 
 @dataclass(frozen=True)
@@ -563,11 +580,11 @@ class TrainerRank:
         )
         self._default_slot_ref: LoRASlotRef | None = None
         self._slot_stack: list[LoRASlotRef] = []
-        self._dynamic_optimizers: dict[str, torch.optim.Optimizer] = {}
+        self._dynamic_optimizers: dict[str, _DynamicOptimizer] = {}
         self._checkpoint_slot_params_by_name: dict[
             str, tuple[torch.nn.Parameter, ...]
         ] = {}
-        self._pending_slot_graphs: dict[LoRASlotRef, int] = {}
+        self._pending_slot_graphs: dict[LoRASlotRef, list[_SlotGraphLease]] = {}
         self._memory_profiles: dict[_MemorySignature, _MemoryProfile] = {}
         self._adaptive_plan_cache: dict[_AdaptivePlanCacheKey, _FlatForwardPlan] = {}
         self._adaptive_estimate_cache: dict[
@@ -587,7 +604,7 @@ class TrainerRank:
         for params in self._checkpoint_slot_params_by_name.values():
             for param in params:
                 param.grad = None
-        self._pending_slot_graphs.clear()
+        self._prune_slot_graphs()
 
     def set_checkpoint(self, name: str | None) -> None:
         self._set_default_slot(self._slot_ref("checkpoint", name))
@@ -635,8 +652,17 @@ class TrainerRank:
     def checkpoint_slot_optimizer_state(self, name: str) -> dict[str, object] | None:
         if name not in self._checkpoint_slot_params_by_name:
             raise ValueError(f"Unknown checkpoint slot: {name!r}")
-        optimizer = self._dynamic_optimizers.get(name)
-        return None if optimizer is None else optimizer.state_dict()
+        dynamic = self._dynamic_optimizers.get(name)
+        if dynamic is None:
+            return None
+        return {
+            "format_version": 1,
+            "layout": self._dynamic_optimizer_layout(name),
+            "master_params": tuple(
+                param.detach().cpu().clone() for param in dynamic.master_params
+            ),
+            "optimizer": _state_to_cpu(dynamic.optimizer.state_dict()),
+        }
 
     def load_lora_slot(
         self,
@@ -857,6 +883,7 @@ class TrainerRank:
         if self._slot_stack:
             raise RuntimeError("Cannot load a LoRA/checkpoint while a slot is pushed")
         self._validate_adapter_slot_keys(kind, name, adapter_model)
+        adapter_model = self._normalize_adapter_model(adapter_model)
         from art.megatron.lora import LORA_ALPHA, load_lora_slot_into_model
 
         ref = self._slot_ref(kind, name)
@@ -892,20 +919,50 @@ class TrainerRank:
         )
 
     def _installed_lora_adapter_keys(self) -> set[str]:
-        local: set[str] = set()
-        for chunk in self.runtime.model:
-            for module in chunk.modules():
-                expected_weight_keys = getattr(module, "_expected_weight_keys", None)
-                if not callable(expected_weight_keys):
-                    continue
-                for suffix in ("lora_A", "lora_B"):
-                    local.update(str(key) for key in expected_weight_keys(suffix))
+        local = set(self._local_lora_adapter_templates())
         if not (dist.is_available() and dist.is_initialized()):
             return local
 
         gathered: list[set[str] | None] = [None] * dist.get_world_size()
         dist.all_gather_object(gathered, local)
         return set().union(*(keys for keys in gathered if keys is not None))
+
+    def _normalize_adapter_model(
+        self,
+        adapter_model: Mapping[str, torch.Tensor],
+    ) -> dict[str, torch.Tensor]:
+        templates = self._local_lora_adapter_templates()
+        return {
+            key: (
+                tensor.to(
+                    device=templates[key].device,
+                    dtype=templates[key].dtype,
+                    non_blocking=True,
+                )
+                if key in templates
+                else tensor
+            )
+            for key, tensor in adapter_model.items()
+        }
+
+    def _local_lora_adapter_templates(self) -> dict[str, torch.Tensor]:
+        templates: dict[str, torch.Tensor] = {}
+        for chunk in self.runtime.model:
+            for module in chunk.modules():
+                expected_weight_keys = getattr(module, "_expected_weight_keys", None)
+                if not callable(expected_weight_keys):
+                    continue
+                for suffix, parameter_name in (
+                    ("lora_A", "A_T"),
+                    ("lora_B", "B_T"),
+                ):
+                    parameter = getattr(module, parameter_name, None)
+                    if not isinstance(parameter, torch.Tensor):
+                        continue
+                    templates.update(
+                        (str(key), parameter) for key in expected_weight_keys(suffix)
+                    )
+        return templates
 
     def _set_default_slot(self, ref: "LoRASlotRef") -> None:
         if self._slot_stack:
@@ -1064,27 +1121,58 @@ class TrainerRank:
         params: AdamParams,
         scale_grads: float,
     ) -> dict[str, float]:
-        all_params: list[torch.nn.Parameter] = []
+        selected: list[
+            tuple[
+                str,
+                tuple[torch.nn.Parameter, ...],
+                tuple[torch.Tensor, ...],
+            ]
+        ] = []
         for name in checkpoint_names:
             self._guard_checkpoint_can_step(name)
             slot_params = self._checkpoint_slot_params_by_name[name]
-            for param in slot_params:
-                if param.grad is None:
-                    param.grad = torch.zeros_like(param)
-                elif scale_grads != 1.0:
-                    param.grad.mul_(scale_grads)
-            self._reduce_dynamic_grads(slot_params)
-            all_params.extend(slot_params)
+            selected.append(
+                (
+                    name,
+                    slot_params,
+                    self._reduce_dynamic_grads(
+                        slot_params,
+                        scale_grads=scale_grads,
+                    ),
+                )
+            )
 
-        grad_norm = torch.nn.utils.clip_grad_norm_(
-            all_params,
-            max_norm=params.grad_clip_norm,
+        all_params = tuple(
+            param for _, slot_params, _ in selected for param in slot_params
         )
-        for name in checkpoint_names:
-            optimizer = self._dynamic_optimizer(name, params)
-            optimizer.step()
-            optimizer.zero_grad(set_to_none=True)
-            self._slot_graphs().pop(self._slot_ref("checkpoint", name), None)
+        all_grads = tuple(grad for _, _, slot_grads in selected for grad in slot_grads)
+        grad_norm = _distributed_grad_norm(all_params, all_grads)
+        if not torch.isfinite(torch.tensor(grad_norm)):
+            self.zero_grad()
+            return {
+                "learning_rate": float(params.learning_rate),
+                "grad_norm": float(grad_norm),
+                "update_successful": 0.0,
+                "num_zeros_in_grad": 0.0,
+            }
+        clip = (
+            min(1.0, params.grad_clip_norm / (grad_norm + 1.0e-6))
+            if params.grad_clip_norm > 0.0
+            else 1.0
+        )
+        for name, model_params, grads in selected:
+            dynamic = self._dynamic_optimizer(name, params)
+            for master, grad in zip(dynamic.master_params, grads, strict=True):
+                master.grad = grad.mul(clip)
+            dynamic.optimizer.step()
+            dynamic.optimizer.zero_grad(set_to_none=True)
+            with torch.no_grad():
+                for model, master in zip(
+                    model_params, dynamic.master_params, strict=True
+                ):
+                    model.copy_(master)
+                    model.grad = None
+            self._prune_slot_graphs(self._slot_ref("checkpoint", name))
         return {
             "learning_rate": float(params.learning_rate),
             "grad_norm": float(grad_norm),
@@ -1096,53 +1184,99 @@ class TrainerRank:
         self,
         name: str,
         params: AdamParams,
-    ) -> torch.optim.Optimizer:
-        optimizer = self._dynamic_optimizers.get(name)
-        if optimizer is None:
-            optimizer = self._new_dynamic_optimizer(name, params)
-            self._dynamic_optimizers[name] = optimizer
-            return optimizer
-        for group in optimizer.param_groups:
+    ) -> _DynamicOptimizer:
+        dynamic = self._dynamic_optimizers.get(name)
+        if dynamic is None:
+            dynamic = self._new_dynamic_optimizer(name, params)
+            self._dynamic_optimizers[name] = dynamic
+            return dynamic
+        for group in dynamic.optimizer.param_groups:
             group["lr"] = params.learning_rate
             group["betas"] = (params.beta1, params.beta2)
             group["weight_decay"] = params.weight_decay
-        return optimizer
+        return dynamic
 
     def _new_dynamic_optimizer(
         self,
         name: str,
         params: AdamParams,
-    ) -> torch.optim.Optimizer:
-        return torch.optim.AdamW(
-            self._checkpoint_slot_params_by_name[name],
+        *,
+        master_params: Sequence[torch.Tensor] | None = None,
+    ) -> _DynamicOptimizer:
+        model_params = self._checkpoint_slot_params_by_name[name]
+        sources = model_params if master_params is None else tuple(master_params)
+        if len(sources) != len(model_params) or any(
+            not isinstance(source, torch.Tensor) for source in sources
+        ):
+            raise TrainerRankSlotStateError(
+                f"Optimizer state for checkpoint slot {name!r} has "
+                f"{len(sources)} master parameters; expected {len(model_params)}."
+            )
+        masters = tuple(
+            torch.nn.Parameter(
+                source.detach().to(device=model.device, dtype=torch.float32).clone()
+            )
+            for model, source in zip(
+                model_params,
+                sources,
+                strict=True,
+            )
+        )
+        optimizer = torch.optim.AdamW(
+            masters,
             lr=params.learning_rate,
             betas=(params.beta1, params.beta2),
             weight_decay=params.weight_decay,
         )
+        return _DynamicOptimizer(optimizer, model_params, masters)
 
     def _restore_dynamic_optimizer(
         self,
         name: str,
         state: Mapping[str, object],
-    ) -> torch.optim.Optimizer:
-        optimizer = self._new_dynamic_optimizer(name, AdamParams(learning_rate=0.0))
+    ) -> _DynamicOptimizer:
+        if state.get("format_version") != 1:
+            raise TrainerRankSlotStateError(
+                f"Unsupported optimizer state format for checkpoint slot {name!r}."
+            )
+        if state.get("layout") != self._dynamic_optimizer_layout(name):
+            raise TrainerRankSlotStateError(
+                f"Optimizer state for checkpoint slot {name!r} was saved for a "
+                "different topology or parameter layout. Save and restore one "
+                "optimizer shard per TrainerRank with matching TP/EP/ETP ranks."
+            )
+        master_params = state.get("master_params")
+        optimizer_state = state.get("optimizer")
+        if not isinstance(master_params, Sequence) or not isinstance(
+            optimizer_state, Mapping
+        ):
+            raise TrainerRankSlotStateError(
+                f"Optimizer state for checkpoint slot {name!r} is incomplete."
+            )
+        dynamic = self._new_dynamic_optimizer(
+            name,
+            AdamParams(learning_rate=0.0),
+            master_params=cast(Sequence[torch.Tensor], master_params),
+        )
         try:
-            optimizer.load_state_dict(dict(state))
+            dynamic.optimizer.load_state_dict(
+                {str(key): value for key, value in optimizer_state.items()}
+            )
         except ValueError as exc:
             raise TrainerRankSlotStateError(
                 f"Optimizer state for checkpoint slot {name!r} does not match the "
                 "loaded slot parameter groups."
             ) from exc
-        self._validate_dynamic_optimizer_state_shapes(name, optimizer)
-        return optimizer
+        self._validate_dynamic_optimizer_state_shapes(name, dynamic)
+        return dynamic
 
     def _validate_dynamic_optimizer_state_shapes(
         self,
         name: str,
-        optimizer: torch.optim.Optimizer,
+        dynamic: _DynamicOptimizer,
     ) -> None:
-        for param in self._checkpoint_slot_params_by_name[name]:
-            state = optimizer.state.get(param, {})
+        for param in dynamic.master_params:
+            state = dynamic.optimizer.state.get(param, {})
             for state_name, value in state.items():
                 if (
                     isinstance(value, torch.Tensor)
@@ -1155,7 +1289,12 @@ class TrainerRank:
                         f"slot parameter has shape {tuple(param.shape)}."
                     )
 
-    def _reduce_dynamic_grads(self, params: Sequence[torch.nn.Parameter]) -> None:
+    def _reduce_dynamic_grads(
+        self,
+        params: Sequence[torch.nn.Parameter],
+        *,
+        scale_grads: float,
+    ) -> tuple[torch.Tensor, ...]:
         from megatron.core import parallel_state as ps
 
         from art.megatron.training.finalize_grads import (
@@ -1172,10 +1311,15 @@ class TrainerRank:
             key = (id(group), str(op), grad.dtype, grad.device)
             buckets.setdefault(key, (group, op, []))[2].append(grad)
 
-        for param in params:
-            grad = param.grad
-            if grad is None:
-                continue
+        grads = tuple(
+            (
+                torch.zeros_like(param, dtype=torch.float32)
+                if param.grad is None
+                else param.grad.detach().float().mul(scale_grads)
+            )
+            for param in params
+        )
+        for param, grad in zip(params, grads, strict=True):
             if bool(getattr(param, "allreduce", True)):
                 group = ps.get_data_parallel_group(with_context_parallel=True)
             else:
@@ -1188,8 +1332,26 @@ class TrainerRank:
                 group, reduce_op = sync
                 add(group, reduce_op, grad)
 
-        for group, op, grads in buckets.values():
-            coalesced_all_reduce(grads, group=group, op=op)
+        for group, op, bucket_grads in buckets.values():
+            coalesced_all_reduce(bucket_grads, group=group, op=op)
+        return grads
+
+    def _dynamic_optimizer_layout(self, name: str) -> dict[str, object]:
+        return {
+            "parallel": _parallel_optimizer_coordinates(),
+            "parameters": tuple(
+                (
+                    tuple(param.shape),
+                    str(param.dtype),
+                    str(getattr(param, "lora_shard_domain", "tp")),
+                    bool(getattr(param, "lora_tp_sharded", False)),
+                    getattr(param, "lora_tp_shard_dim", None),
+                    str(getattr(param, "lora_tp_shard_strategy", "uniform")),
+                    tuple(getattr(param, "lora_tp_component_sizes", ())),
+                )
+                for param in self._checkpoint_slot_params_by_name[name]
+            ),
+        }
 
     def _select_next_micro_batch(
         self,
@@ -1530,7 +1692,7 @@ class TrainerRank:
             with use_lora_slot(group.slot_ref):
                 prepared = self._prepare_packed_forward(group.packed)
                 item_outputs = self._forward_packed(group.items, prepared)
-            self._track_slot_graph_outputs(group.slot_ref, item_outputs)
+            item_outputs = self._track_slot_graph_outputs(group.slot_ref, item_outputs)
             for index, output in zip(group.request_indices, item_outputs, strict=True):
                 outputs[index] = output
         return outputs
@@ -1539,65 +1701,84 @@ class TrainerRank:
         self,
         ref: "LoRASlotRef | None",
         outputs: Sequence[AnyForwardOutput],
-    ) -> None:
+    ) -> list[AnyForwardOutput]:
         if ref is None or ref.name is None:
-            return
-        tensors = [
-            tensor
+            return list(outputs)
+
+        marker_refs: list[weakref.ReferenceType[torch.Tensor]] = []
+
+        def track(tensor: torch.Tensor | None) -> torch.Tensor | None:
+            if tensor is None or not tensor.requires_grad:
+                return tensor
+            marker = tensor.new_empty(0)
+            marker_refs.append(weakref.ref(marker))
+            return cast(torch.Tensor, _SlotGraphSentinel.apply(tensor, marker))
+
+        tracked_outputs = [
+            ForwardOutput(
+                target_logprobs=track(output.target_logprobs),
+                top_k=(
+                    None
+                    if output.top_k is None
+                    else TopK(
+                        logprobs=cast(torch.Tensor, track(output.top_k.logprobs)),
+                        tokens=output.top_k.tokens,
+                    )
+                ),
+                logits=track(output.logits),
+                hidden_states=track(output.hidden_states),
+            )
             for output in outputs
-            for tensor in _forward_output_grad_tensors(output)
         ]
-        if not tensors:
-            return
+        if marker_refs:
+            self._slot_graphs().setdefault(ref, []).append(
+                _SlotGraphLease(tuple(marker_refs))
+            )
+        return tracked_outputs
 
-        graphs = self._slot_graphs()
-        graphs[ref] = graphs.get(ref, 0) + 1
-        lease = _SlotGraphLease(self, ref)
-
-        def release(grad: torch.Tensor) -> torch.Tensor:
-            lease.release()
-            return grad
-
-        for tensor in tensors:
-            tensor.register_hook(release)
-
-    def _release_slot_graph(self, ref: "LoRASlotRef") -> None:
-        graphs = self._slot_graphs()
-        count = graphs.get(ref, 0)
-        if count <= 1:
-            graphs.pop(ref, None)
-        else:
-            graphs[ref] = count - 1
-
-    def _slot_graphs(self) -> dict["LoRASlotRef", int]:
+    def _slot_graphs(self) -> dict["LoRASlotRef", list[_SlotGraphLease]]:
         graphs = getattr(self, "_pending_slot_graphs", None)
         if graphs is None:
             graphs = {}
             self._pending_slot_graphs = graphs
         return graphs
 
+    def _prune_slot_graphs(self, ref: "LoRASlotRef | None" = None) -> None:
+        graphs = self._slot_graphs()
+        refs = tuple(graphs) if ref is None else (ref,)
+        for current in refs:
+            live = [lease for lease in graphs.get(current, ()) if lease.is_live()]
+            if live:
+                graphs[current] = live
+            else:
+                graphs.pop(current, None)
+
+    def _has_live_slot_graph(self, ref: "LoRASlotRef") -> bool:
+        self._prune_slot_graphs(ref)
+        return bool(self._slot_graphs().get(ref))
+
     def _guard_slot_can_load(self, ref: "LoRASlotRef") -> None:
-        if self._slot_graphs().get(ref, 0) <= 0:
+        if not self._has_live_slot_graph(ref):
             return
         raise TrainerRankSlotStateError(
             f"Cannot load {ref.kind} slot {ref.name!r} while outputs from an "
             "earlier forward using that slot still have a live backward graph. "
             "Activation checkpoint recompute resolves slots by name, so replacing "
             "the slot before backward can compute gradients with different LoRA "
-            "weights than the original forward. Call loss.backward() first, or "
-            "call zero_grad() if the forward was abandoned, or load the new "
-            "weights under a different slot name."
+            "weights than the original forward. Finish backward first; if the "
+            "forward was abandoned, release all references to its outputs; or load "
+            "the new weights under a different slot name."
         )
 
     def _guard_checkpoint_can_step(self, name: str) -> None:
         ref = self._slot_ref("checkpoint", name)
-        if self._slot_graphs().get(ref, 0) <= 0:
+        if not self._has_live_slot_graph(ref):
             return
         raise TrainerRankSlotStateError(
             f"Cannot optim_step checkpoint slot {name!r} while outputs from an "
             "earlier forward using that slot have not been backpropagated. Call "
-            "loss.backward() before optim_step(), or call zero_grad() if that "
-            "forward was abandoned."
+            "loss.backward() without retaining the graph before optim_step(); if "
+            "the forward was abandoned, release all references to its outputs."
         )
 
     def _estimate_group_request_output_bytes(
@@ -2166,7 +2347,7 @@ class TrainerRank:
 
         gathered = tensor_parallel.gather_from_sequence_parallel_region(
             hidden,
-            tensor_parallel_output_grad=True,
+            tensor_parallel_output_grad=False,
             group=ps.get_tensor_model_parallel_group(check_initialized=False),
         )
         return cast(torch.Tensor, gathered).squeeze(1)
@@ -2392,6 +2573,79 @@ def _dtype_size(dtype: torch.dtype) -> int:
     return torch.empty((), dtype=dtype).element_size()
 
 
+def _distributed_grad_norm(
+    params: Sequence[torch.nn.Parameter],
+    grads: Sequence[torch.Tensor],
+) -> float:
+    if len(params) != len(grads):
+        raise ValueError("params and grads must have matching lengths")
+    included = [
+        grad
+        for param, grad in zip(params, grads, strict=True)
+        if _include_in_distributed_grad_norm(param)
+    ]
+    device = grads[0].device if grads else torch.device("cpu")
+    squared = torch.zeros((), device=device, dtype=torch.float32)
+    for grad in included:
+        squared.add_(grad.float().square().sum())
+    if dist.is_available() and dist.is_initialized():
+        dist.all_reduce(squared, op=dist.ReduceOp.SUM)
+    return float(torch.sqrt(squared).item())
+
+
+def _include_in_distributed_grad_norm(param: torch.nn.Parameter) -> bool:
+    if not (dist.is_available() and dist.is_initialized()):
+        return True
+    from megatron.core import parallel_state as ps
+
+    replica_group = (
+        ps.get_data_parallel_group(with_context_parallel=True)
+        if bool(getattr(param, "allreduce", True))
+        else ps.get_expert_data_parallel_group()
+    )
+    if replica_group is not None and replica_group.size() > 1:
+        if replica_group.rank() != 0:
+            return False
+    if bool(getattr(param, "lora_tp_sharded", False)):
+        return True
+    shard_group = (
+        ps.get_tensor_model_parallel_group(check_initialized=False)
+        if getattr(param, "lora_shard_domain", "tp") == "tp"
+        else ps.get_expert_tensor_parallel_group(check_initialized=False)
+    )
+    return shard_group is None or shard_group.size() <= 1 or shard_group.rank() == 0
+
+
+def _parallel_optimizer_coordinates() -> tuple[int, ...]:
+    if not (dist.is_available() and dist.is_initialized()):
+        return (1, 0, 1, 0, 1, 0, 1, 0)
+    from megatron.core import parallel_state as ps
+
+    expert_tp_group = ps.get_expert_tensor_parallel_group(check_initialized=False)
+    return (
+        int(ps.get_tensor_model_parallel_world_size()),
+        int(ps.get_tensor_model_parallel_rank()),
+        int(ps.get_expert_model_parallel_world_size()),
+        int(ps.get_expert_model_parallel_rank()),
+        1 if expert_tp_group is None else int(expert_tp_group.size()),
+        0 if expert_tp_group is None else int(expert_tp_group.rank()),
+        int(ps.get_pipeline_model_parallel_world_size()),
+        int(ps.get_pipeline_model_parallel_rank()),
+    )
+
+
+def _state_to_cpu(value: object) -> object:
+    if isinstance(value, torch.Tensor):
+        return value.detach().cpu().clone()
+    if isinstance(value, Mapping):
+        return {key: _state_to_cpu(item) for key, item in value.items()}
+    if isinstance(value, tuple):
+        return tuple(_state_to_cpu(item) for item in value)
+    if isinstance(value, list):
+        return [_state_to_cpu(item) for item in value]
+    return value
+
+
 def _vocab_parallel_target_logprobs(
     local_logits: torch.Tensor,
     labels: torch.Tensor,
@@ -2538,25 +2792,36 @@ def _vocab_parallel_topk_from_local(
     vocab_start: int,
 ) -> TopK:
     local_k = min(k, int(local_values.shape[1]))
-    local_values = local_values[:, :local_k] - log_z.unsqueeze(1)
+    local_values = local_values[:, :local_k]
     local_tokens = local_tokens[:, :local_k] + vocab_start
 
     from megatron.core import parallel_state as ps
 
     tp_size = int(ps.get_tensor_model_parallel_world_size())
     if tp_size <= 1:
-        return TopK(logprobs=local_values, tokens=local_tokens)
+        return TopK(
+            logprobs=local_values - log_z.unsqueeze(1),
+            tokens=local_tokens,
+        )
 
-    from torch.distributed.nn.functional import all_gather
+    from megatron.core import tensor_parallel
 
     group = ps.get_tensor_model_parallel_group(check_initialized=False)
-    gathered_values = cast(tuple[torch.Tensor, ...], all_gather(local_values, group))
+    values = cast(
+        torch.Tensor,
+        tensor_parallel.gather_from_tensor_model_parallel_region(
+            local_values,
+            group=group,
+        ),
+    )
     gathered_tokens = [torch.empty_like(local_tokens) for _ in range(tp_size)]
     dist.all_gather(gathered_tokens, local_tokens, group=group)
-    values = torch.cat(gathered_values, dim=1)
     tokens = torch.cat(gathered_tokens, dim=1)
     top_values, top_offsets = torch.topk(values, k=k, dim=-1)
-    return TopK(logprobs=top_values, tokens=tokens.gather(1, top_offsets))
+    return TopK(
+        logprobs=top_values - log_z.unsqueeze(1),
+        tokens=tokens.gather(1, top_offsets),
+    )
 
 
 def _vocab_parallel_log_z(local_logits: torch.Tensor) -> torch.Tensor:
@@ -2589,13 +2854,12 @@ def _all_reduce_tensor_parallel_sum(tensor: torch.Tensor) -> torch.Tensor:
 
     if int(ps.get_tensor_model_parallel_world_size()) <= 1:
         return tensor
-    from torch.distributed.nn.functional import all_reduce
+    from megatron.core import tensor_parallel
 
     return cast(
         torch.Tensor,
-        all_reduce(
+        tensor_parallel.reduce_from_tensor_model_parallel_region(
             tensor,
-            op=dist.ReduceOp.SUM,
             group=ps.get_tensor_model_parallel_group(check_initialized=False),
         ),
     )
@@ -2689,17 +2953,6 @@ def _batch_seq_logits(logits: torch.Tensor, *, seq_len: int) -> torch.Tensor:
     raise RuntimeError(
         f"logits do not match sequence length {seq_len}: {tuple(logits.shape)}"
     )
-
-
-def _forward_output_grad_tensors(output: AnyForwardOutput) -> Iterator[torch.Tensor]:
-    if output.target_logprobs is not None and output.target_logprobs.requires_grad:
-        yield output.target_logprobs
-    if output.top_k is not None and output.top_k.logprobs.requires_grad:
-        yield output.top_k.logprobs
-    if output.logits is not None and output.logits.requires_grad:
-        yield output.logits
-    if output.hidden_states is not None and output.hidden_states.requires_grad:
-        yield output.hidden_states
 
 
 def _materialize(inputs: ForwardInputs) -> ForwardInputs:
