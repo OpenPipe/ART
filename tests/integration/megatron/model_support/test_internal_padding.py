@@ -19,6 +19,7 @@ from art.megatron.model_support.handlers.gpt_oss import (
     _GPT_OSS_LOGICAL_MOE_FFN_ATTR,
     GPT_OSS_MOE_HANDLER,
     _configure_gpt_oss_moe_internal_padding,
+    _install_gpt_oss_bridge_padding_patch,
 )
 
 
@@ -456,6 +457,107 @@ class _FakeGptOssChunk(torch.nn.Module):
             a_shape=(2, internal_ffn, rank),
             b_shape=(2, rank, internal_hidden),
         )
+
+
+class TEColumnParallelGroupedLinear(torch.nn.Module):
+    def __init__(
+        self,
+        *,
+        weight_shape: tuple[int, int],
+        bias_shape: tuple[int],
+    ) -> None:
+        super().__init__()
+        self.weight = torch.nn.Parameter(torch.empty(weight_shape))
+        self.bias = torch.nn.Parameter(torch.empty(bias_shape))
+
+
+class TERowParallelGroupedLinear(torch.nn.Module):
+    def __init__(self, *, weight_shape: tuple[int, int]) -> None:
+        super().__init__()
+        self.weight = torch.nn.Parameter(torch.empty(weight_shape))
+
+
+class _FakeGptOssExpert(torch.nn.Module):
+    def __init__(
+        self,
+        *,
+        internal_hidden: int,
+        internal_ffn: int,
+    ) -> None:
+        super().__init__()
+        self.linear_fc1 = TEColumnParallelGroupedLinear(
+            weight_shape=(2 * internal_ffn, internal_hidden),
+            bias_shape=(2 * internal_ffn,),
+        )
+        self.linear_fc2 = TERowParallelGroupedLinear(
+            weight_shape=(internal_hidden, internal_ffn),
+        )
+
+
+def test_gpt_oss_bridge_import_pads_logical_expert_weights() -> None:
+    from megatron.bridge.models.gpt_oss.gpt_oss_bridge import (
+        GPTOSSMLPDownProjMapping,
+        GPTOSSMLPGateUpProjMapping,
+    )
+
+    _install_gpt_oss_bridge_padding_patch()
+    logical_hidden = 4
+    internal_hidden = 128
+    logical_ffn = 6
+    internal_ffn = 128
+    expert = _FakeGptOssExpert(
+        internal_hidden=internal_hidden,
+        internal_ffn=internal_ffn,
+    )
+
+    gate_up = torch.arange(
+        2 * logical_ffn * logical_hidden,
+        dtype=torch.float32,
+    ).reshape(1, 2 * logical_ffn, logical_hidden)
+    gate_up_mapping = GPTOSSMLPGateUpProjMapping(
+        "decoder.layers.0.mlp.experts.local_experts.0.linear_fc1.weight",
+        "model.layers.0.mlp.experts.gate_up_proj",
+    )
+    padded_gate_up = gate_up_mapping.hf_to_megatron(gate_up, expert)
+
+    assert padded_gate_up.shape == (2 * internal_ffn, internal_hidden)
+    assert torch.equal(padded_gate_up[:logical_ffn, :logical_hidden], gate_up[0, ::2])
+    assert torch.equal(
+        padded_gate_up[internal_ffn : internal_ffn + logical_ffn, :logical_hidden],
+        gate_up[0, 1::2],
+    )
+    assert torch.count_nonzero(padded_gate_up[logical_ffn:internal_ffn]) == 0
+    assert torch.count_nonzero(padded_gate_up[:, logical_hidden:]) == 0
+
+    gate_up_bias = torch.arange(2 * logical_ffn, dtype=torch.float32).reshape(1, -1)
+    gate_up_bias_mapping = GPTOSSMLPGateUpProjMapping(
+        "decoder.layers.0.mlp.experts.local_experts.0.linear_fc1.bias",
+        "model.layers.0.mlp.experts.gate_up_proj_bias",
+    )
+    padded_gate_up_bias = gate_up_bias_mapping.hf_to_megatron(gate_up_bias, expert)
+
+    assert padded_gate_up_bias.shape == (2 * internal_ffn,)
+    assert torch.equal(padded_gate_up_bias[:logical_ffn], gate_up_bias[0, ::2])
+    assert torch.equal(
+        padded_gate_up_bias[internal_ffn : internal_ffn + logical_ffn],
+        gate_up_bias[0, 1::2],
+    )
+    assert torch.count_nonzero(padded_gate_up_bias[logical_ffn:internal_ffn]) == 0
+
+    down = torch.arange(
+        logical_ffn * logical_hidden,
+        dtype=torch.float32,
+    ).reshape(1, logical_ffn, logical_hidden)
+    down_mapping = GPTOSSMLPDownProjMapping(
+        "decoder.layers.0.mlp.experts.local_experts.0.linear_fc2.weight",
+        "model.layers.0.mlp.experts.down_proj",
+    )
+    padded_down = down_mapping.hf_to_megatron(down, expert)
+
+    assert padded_down.shape == (internal_hidden, internal_ffn)
+    assert torch.equal(padded_down[:logical_hidden, :logical_ffn], down[0].t())
+    assert torch.count_nonzero(padded_down[logical_hidden:]) == 0
+    assert torch.count_nonzero(padded_down[:, logical_ffn:]) == 0
 
 
 def test_gemma4_handler_masks_internal_padding_params_and_grads() -> None:
