@@ -366,12 +366,14 @@ class PipelineAutotunerAttachment:
 
     @staticmethod
     async def _discover_target_packed_sequences(trainer: Any) -> int:
+        from art.types import TrainConfig
+
         backend = trainer.backend
         get_service = getattr(backend, "_get_service", None)
         resolver = getattr(backend, "_resolve_grad_accumulation_sequences", None)
         if callable(get_service) and callable(resolver):
             service = await get_service(trainer.model)
-            return max(1, int(await resolver(service, trainer.config)))
+            return max(1, int(await resolver(service, TrainConfig())))
         raise ValueError(
             "Pipeline autotuning requires a backend that can resolve global "
             "grad_accumulation_sequences before training starts."
