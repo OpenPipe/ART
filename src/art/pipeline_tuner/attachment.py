@@ -68,10 +68,11 @@ class PipelineAutotunerAttachment:
         self.store = PipelineTunerProfileStore.for_model(trainer.model)
         self._validate_weight_update_mode(trainer)
         packed_sequence_length = self._discover_packed_sequence_length()
+        target_packed_sequences = await self._discover_target_packed_sequences(trainer)
         inference_gpu_count = self._discover_inference_gpu_count(trainer)
         policy_age_limit_steps = self._policy_age_limit_steps(trainer)
         loaded = self._load_profile_if_requested(
-            packed_sequence_length, policy_age_limit_steps
+            packed_sequence_length, target_packed_sequences, policy_age_limit_steps
         )
         if loaded is not None:
             settings = self._settings_with_current_queue(
@@ -85,6 +86,7 @@ class PipelineAutotunerAttachment:
             settings = build_initial_settings(
                 config=self.config,
                 inference_gpu_count=inference_gpu_count,
+                target_packed_sequences=target_packed_sequences,
                 policy_age_limit_steps=policy_age_limit_steps,
             )
         trainer.apply_pipeline_settings(settings)
@@ -95,6 +97,7 @@ class PipelineAutotunerAttachment:
                 model_name=trainer.model.name,
                 backend_name=type(trainer.backend).__name__,
                 packed_sequence_length=packed_sequence_length,
+                target_packed_sequences=target_packed_sequences,
                 inference_gpu_count=inference_gpu_count,
                 policy_age_limit_steps=policy_age_limit_steps,
             )
@@ -274,7 +277,10 @@ class PipelineAutotunerAttachment:
             self.trainer._pipeline_tuner_profile = path.stem
 
     def _load_profile_if_requested(
-        self, active_packed_sequence_length: int, policy_age_limit_steps: float
+        self,
+        active_packed_sequence_length: int,
+        target_packed_sequences: int,
+        policy_age_limit_steps: float,
     ) -> PipelineAutotunerProfile | None:
         if self.config.mode == "online" and not self.config.profile:
             return None
@@ -288,6 +294,17 @@ class PipelineAutotunerAttachment:
                 "Autotuner profile was produced with packed_sequence_length="
                 f"{profile.packed_sequence_length}, but active config uses "
                 f"{active_packed_sequence_length}. Applying saved settings, but "
+                "retuning is recommended.",
+                stacklevel=2,
+            )
+        if (
+            profile.target_packed_sequences is not None
+            and profile.target_packed_sequences != target_packed_sequences
+        ):
+            warnings.warn(
+                "Autotuner profile was produced with target_packed_sequences="
+                f"{profile.target_packed_sequences}, but active config uses "
+                f"{target_packed_sequences}. Applying saved settings, but "
                 "retuning is recommended.",
                 stacklevel=2,
             )
@@ -346,6 +363,19 @@ class PipelineAutotunerAttachment:
                 "Pipeline autotuning requires dedicated inference_gpu_ids."
             )
         return len(inference_gpu_ids)
+
+    @staticmethod
+    async def _discover_target_packed_sequences(trainer: Any) -> int:
+        backend = trainer.backend
+        get_service = getattr(backend, "_get_service", None)
+        resolver = getattr(backend, "_resolve_grad_accumulation_sequences", None)
+        if callable(get_service) and callable(resolver):
+            service = await get_service(trainer.model)
+            return max(1, int(await resolver(service, trainer.config)))
+        raise ValueError(
+            "Pipeline autotuning requires a backend that can resolve global "
+            "grad_accumulation_sequences before training starts."
+        )
 
     @staticmethod
     def _discover_packed_sequence_length() -> int:

@@ -43,8 +43,8 @@ class PipelineAutotuneConfig(pydantic.BaseModel):
     worker_move_fraction: float = pydantic.Field(default=0.10, gt=0.0, le=1.0)
     max_worker_move: int = pydantic.Field(default=16, ge=4)
     initial_model_calls_per_inference_gpu: int = pydantic.Field(default=8, ge=1)
-    initial_min_batch_size: int = pydantic.Field(default=8, ge=1)
-    initial_max_batch_size: int = pydantic.Field(default=8, ge=1)
+    initial_min_groups_per_packed_sequence: int = pydantic.Field(default=8, ge=1)
+    initial_max_groups_per_packed_sequence: int = pydantic.Field(default=8, ge=1)
     bootstrap_samples: int = pydantic.Field(default=256, ge=16)
     packing_history_steps: int = pydantic.Field(default=64, ge=1)
     packing_spill_prior_alpha: float = pydantic.Field(default=1.0, gt=0.0)
@@ -162,6 +162,7 @@ class PipelineAutotunerProfile(pydantic.BaseModel):
     model_name: str | None = None
     backend: str | None = None
     packed_sequence_length: int | None = None
+    target_packed_sequences: int | None = None
     inference_gpu_count: int | None = None
     policy_age_limit_steps: float | None = None
     settings: PipelineTuneSettings

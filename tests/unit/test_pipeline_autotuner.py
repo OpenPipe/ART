@@ -35,6 +35,7 @@ def test_build_initial_settings_uses_art_owned_defaults() -> None:
     settings = build_initial_settings(
         config=PipelineAutotuneConfig(),
         inference_gpu_count=2,
+        target_packed_sequences=1,
         policy_age_limit_steps=3.0,
     )
 
@@ -43,6 +44,21 @@ def test_build_initial_settings_uses_art_owned_defaults() -> None:
     assert settings.max_batch_size == 8
     assert settings.target_groups_per_step == 8
     assert settings.queue_maxsize == 12
+
+
+def test_build_initial_settings_scale_with_target_packed_sequences() -> None:
+    settings = build_initial_settings(
+        config=PipelineAutotuneConfig(),
+        inference_gpu_count=2,
+        target_packed_sequences=4,
+        policy_age_limit_steps=3.0,
+    )
+
+    assert settings.num_rollout_workers == 16
+    assert settings.min_batch_size == 32
+    assert settings.max_batch_size == 32
+    assert settings.target_groups_per_step == 32
+    assert settings.queue_maxsize == 84
 
 
 @pytest.mark.asyncio
@@ -199,6 +215,7 @@ def test_low_vllm_pressure_increases_workers_when_trainer_underfed() -> None:
         model_name="test",
         backend_name="MegatronBackend",
         packed_sequence_length=122880,
+        target_packed_sequences=1,
         inference_gpu_count=2,
         policy_age_limit_steps=3.0,
     )
@@ -239,6 +256,7 @@ def test_vllm_pressure_overloaded_train_underfed_lowers_min_batch() -> None:
         model_name="test",
         backend_name="MegatronBackend",
         packed_sequence_length=122880,
+        target_packed_sequences=1,
         inference_gpu_count=2,
         policy_age_limit_steps=3.0,
     )
@@ -279,6 +297,7 @@ def test_target_increase_preserves_min_to_max_batch_ratio() -> None:
         model_name="test",
         backend_name="MegatronBackend",
         packed_sequence_length=100,
+        target_packed_sequences=1,
         inference_gpu_count=2,
         policy_age_limit_steps=3.0,
     )
@@ -315,6 +334,7 @@ def test_target_group_projection_uses_spill_history_veto() -> None:
         model_name="test",
         backend_name="MegatronBackend",
         packed_sequence_length=100,
+        target_packed_sequences=1,
         inference_gpu_count=2,
         policy_age_limit_steps=3.0,
     )
@@ -332,6 +352,7 @@ def test_target_group_projection_uses_spill_history_veto() -> None:
         model_name="test",
         backend_name="MegatronBackend",
         packed_sequence_length=100,
+        target_packed_sequences=1,
         inference_gpu_count=2,
         policy_age_limit_steps=3.0,
     )
@@ -349,6 +370,46 @@ def test_target_group_projection_uses_spill_history_veto() -> None:
     assert spilled_tuner._adaptive_target_groups(settings, stats) == 9
 
 
+def test_target_group_projection_uses_target_packed_sequence_slots() -> None:
+    settings = PipelineTuneSettings(
+        num_rollout_workers=16,
+        min_batch_size=32,
+        max_batch_size=32,
+        queue_maxsize=84,
+        target_groups_per_step=32,
+    )
+    tuner = PipelineAutotuner(
+        config=PipelineAutotuneConfig(),
+        settings=settings,
+        model_name="test",
+        backend_name="MegatronBackend",
+        packed_sequence_length=100,
+        target_packed_sequences=4,
+        inference_gpu_count=2,
+        policy_age_limit_steps=3.0,
+    )
+    stats = TunerWindowStats(
+        start_step=4,
+        end_step=7,
+        group_pack_token_samples=[10.0] * 128,
+    )
+
+    assert tuner._adaptive_target_groups(settings, stats) == 40
+
+    tuner._packing_outcomes.append(
+        PackingOutcome(
+            step=7,
+            groups=40,
+            packed_sequences=5,
+            padding_ratio=0.50,
+            non_padding_tokens=400.0,
+            train_tokens=800.0,
+        )
+    )
+
+    assert tuner._adaptive_target_groups(settings, stats) == 39
+
+
 def test_spill_history_veto_is_monotone_for_larger_batches() -> None:
     settings = PipelineTuneSettings(
         num_rollout_workers=16,
@@ -363,6 +424,7 @@ def test_spill_history_veto_is_monotone_for_larger_batches() -> None:
         model_name="test",
         backend_name="MegatronBackend",
         packed_sequence_length=100,
+        target_packed_sequences=1,
         inference_gpu_count=2,
         policy_age_limit_steps=3.0,
     )
@@ -399,6 +461,7 @@ def test_target_group_projection_uses_prior_pack_samples() -> None:
         model_name="test",
         backend_name="MegatronBackend",
         packed_sequence_length=100,
+        target_packed_sequences=1,
         inference_gpu_count=2,
         policy_age_limit_steps=3.0,
     )
@@ -434,6 +497,7 @@ def test_min_batch_raise_replaces_worker_decrease_when_batch_has_room() -> None:
         model_name="test",
         backend_name="MegatronBackend",
         packed_sequence_length=122880,
+        target_packed_sequences=1,
         inference_gpu_count=2,
         policy_age_limit_steps=3.0,
     )
@@ -470,6 +534,7 @@ def test_stable_holds_emit_inference_gpu_warning() -> None:
         model_name="test",
         backend_name="MegatronBackend",
         packed_sequence_length=122880,
+        target_packed_sequences=1,
         inference_gpu_count=2,
         policy_age_limit_steps=3.0,
     )
@@ -516,6 +581,7 @@ def test_stable_holds_emit_group_size_or_training_gpu_warning() -> None:
         model_name="test",
         backend_name="MegatronBackend",
         packed_sequence_length=122880,
+        target_packed_sequences=1,
         inference_gpu_count=2,
         policy_age_limit_steps=3.0,
     )
@@ -614,6 +680,7 @@ def test_window_stats_derives_padding_from_packed_group_observations() -> None:
         model_name="test",
         backend_name="MegatronBackend",
         packed_sequence_length=122880,
+        target_packed_sequences=1,
         inference_gpu_count=2,
         policy_age_limit_steps=3.0,
     )
@@ -627,6 +694,32 @@ def test_window_stats_derives_padding_from_packed_group_observations() -> None:
     assert stats.window_start_s == 1.0
     assert stats.window_end_s == 4.0
     assert stats.group_pack_token_samples == [40.0, 20.0] * 4
+
+
+def test_window_stats_accounts_for_underfilled_target_packed_sequence_slots() -> None:
+    tuner = PipelineAutotuner(
+        config=PipelineAutotuneConfig(),
+        settings=PipelineTuneSettings(
+            num_rollout_workers=16,
+            min_batch_size=8,
+            max_batch_size=8,
+            queue_maxsize=12,
+            target_groups_per_step=8,
+        ),
+        model_name="test",
+        backend_name="MegatronBackend",
+        packed_sequence_length=122880,
+        target_packed_sequences=4,
+        inference_gpu_count=2,
+        policy_age_limit_steps=3.0,
+    )
+    _append_decision_window_metrics(tuner)
+
+    stats = tuner.window_stats()
+
+    assert stats is not None
+    assert stats.padding_ratio_mean == pytest.approx(0.85)
+    assert stats.train_capacity_tokens_mean == 400.0
 
 
 def _decision_for_timeout_window() -> TunerDecision:
@@ -721,6 +814,7 @@ def test_window_stats_requires_train_capacity_for_padding() -> None:
         model_name="test",
         backend_name="MegatronBackend",
         packed_sequence_length=122880,
+        target_packed_sequences=1,
         inference_gpu_count=2,
         policy_age_limit_steps=3.0,
     )

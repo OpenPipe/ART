@@ -103,6 +103,7 @@ class PipelineAutotuner:
         model_name: str | None,
         backend_name: str | None,
         packed_sequence_length: int,
+        target_packed_sequences: int,
         inference_gpu_count: int,
         policy_age_limit_steps: float,
     ) -> None:
@@ -111,6 +112,7 @@ class PipelineAutotuner:
         self.model_name = model_name
         self.backend_name = backend_name
         self.packed_sequence_length = packed_sequence_length
+        self.target_packed_sequences = max(1, int(target_packed_sequences))
         self.inference_gpu_count = inference_gpu_count
         self.policy_age_limit_steps = policy_age_limit_steps
         self.metrics: list[PipelineMetric] = []
@@ -181,9 +183,21 @@ class PipelineAutotuner:
         groups = _required_step_values(
             by_step, window_steps, "data/step_num_groups_trainable"
         )
-        train_capacity_tokens = _required_step_values(
+        step_packed_sequences = _required_step_values(
+            by_step, window_steps, "data/step_packed_sequences"
+        )
+        raw_train_capacity_tokens = _required_step_values(
             by_step, window_steps, "data/step_packed_train_tokens"
         )
+        train_capacity_tokens = [
+            self._effective_train_capacity_tokens(
+                packed_sequences=int(round(packed_sequences)),
+                train_tokens=train_tokens,
+            )
+            for packed_sequences, train_tokens in zip(
+                step_packed_sequences, raw_train_capacity_tokens
+            )
+        ]
         discarded_stale = sum(step_values("discarded/step/stale_groups"))
         generated_groups = sum(groups) + discarded_stale
         vllm_metrics = [
@@ -299,7 +313,11 @@ class PipelineAutotuner:
             groups = int(round(values["data/step_num_groups_trainable"].value))
             if groups <= 0:
                 continue
-            train_tokens = float(values["data/step_packed_train_tokens"].value)
+            packed_sequences = int(round(values["data/step_packed_sequences"].value))
+            train_tokens = self._effective_train_capacity_tokens(
+                packed_sequences=packed_sequences,
+                train_tokens=float(values["data/step_packed_train_tokens"].value),
+            )
             if train_tokens <= 0.0:
                 raise RuntimeError(
                     "Pipeline autotuning requires positive "
@@ -312,9 +330,7 @@ class PipelineAutotuner:
                 PackingOutcome(
                     step=step,
                     groups=groups,
-                    packed_sequences=int(
-                        round(values["data/step_packed_sequences"].value)
-                    ),
+                    packed_sequences=packed_sequences,
                     padding_ratio=min(1.0, padding_ratio),
                     non_padding_tokens=non_padding_tokens,
                     train_tokens=train_tokens,
@@ -586,6 +602,20 @@ class PipelineAutotuner:
             }
         )
 
+    def _effective_packed_slots(self, packed_sequences: int) -> int:
+        sequences = max(1, int(packed_sequences))
+        target = self.target_packed_sequences
+        return int(math.ceil(sequences / target) * target)
+
+    def _effective_train_capacity_tokens(
+        self, *, packed_sequences: int, train_tokens: float
+    ) -> float:
+        sequences = max(1, int(packed_sequences))
+        if train_tokens <= 0.0:
+            return float(train_tokens)
+        sequence_length = float(train_tokens) / sequences
+        return sequence_length * self._effective_packed_slots(sequences)
+
     def _adaptive_target_groups(
         self, settings: PipelineTuneSettings, stats: TunerWindowStats | None
     ) -> int:
@@ -653,7 +683,10 @@ class PipelineAutotuner:
         if not samples:
             return []
         mean_tokens = _mean(samples)
-        center = max(1.0, capacity / max(1.0, mean_tokens))
+        center = max(
+            1.0,
+            capacity * self.target_packed_sequences / max(1.0, mean_tokens),
+        )
         current = max(1, settings.target_groups_per_step)
         lo = max(1, int(math.floor(min(center, current) * 0.5)))
         hi = min(
@@ -676,10 +709,18 @@ class PipelineAutotuner:
         for groups in range(lo, hi + 1):
             totals = [prefix[idx + groups] - prefix[idx] for idx in range(sample_count)]
             packed_counts = [max(1, math.ceil(total / capacity)) for total in totals]
-            expected_capacity = _mean([count * capacity for count in packed_counts])
+            expected_capacity = _mean(
+                [
+                    self._effective_packed_slots(count) * capacity
+                    for count in packed_counts
+                ]
+            )
             expected_tokens = _mean(totals)
             bootstrap_spill_probability = _mean(
-                [1.0 if total > capacity else 0.0 for total in totals]
+                [
+                    1.0 if count > self.target_packed_sequences else 0.0
+                    for count in packed_counts
+                ]
             )
             history_risk = history_risks[groups]
             projections.append(
@@ -727,7 +768,11 @@ class PipelineAutotuner:
             ]
             trials = float(len(outcomes))
             spills = float(
-                sum(1 for outcome in outcomes if outcome.packed_sequences > 1)
+                sum(
+                    1
+                    for outcome in outcomes
+                    if outcome.packed_sequences > self.target_packed_sequences
+                )
             )
             bad_padding_events = float(
                 sum(
@@ -803,6 +848,7 @@ class PipelineAutotuner:
             model_name=self.model_name,
             backend=self.backend_name,
             packed_sequence_length=self.packed_sequence_length,
+            target_packed_sequences=self.target_packed_sequences,
             inference_gpu_count=self.inference_gpu_count,
             policy_age_limit_steps=self.policy_age_limit_steps,
             settings=self.settings,
@@ -831,6 +877,7 @@ def build_initial_settings(
     *,
     config: PipelineAutotuneConfig,
     inference_gpu_count: int,
+    target_packed_sequences: int,
     policy_age_limit_steps: float,
 ) -> PipelineTuneSettings:
     workers = _ceil_to_multiple(
@@ -838,8 +885,12 @@ def build_initial_settings(
         config.worker_step,
         minimum=config.worker_step,
     )
-    max_batch = int(config.initial_max_batch_size)
-    min_batch = min(int(config.initial_min_batch_size), max_batch)
+    target_slots = max(1, int(target_packed_sequences))
+    max_batch = int(config.initial_max_groups_per_packed_sequence) * target_slots
+    min_batch = min(
+        int(config.initial_min_groups_per_packed_sequence) * target_slots,
+        max_batch,
+    )
     queue = recommended_queue_size(
         target_groups_per_step=max_batch,
         limit_steps_off_policy=policy_age_limit_steps,
