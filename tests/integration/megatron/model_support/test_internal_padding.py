@@ -518,7 +518,7 @@ def test_gpt_oss_bridge_import_pads_logical_expert_weights() -> None:
         "decoder.layers.0.mlp.experts.local_experts.0.linear_fc1.weight",
         "model.layers.0.mlp.experts.gate_up_proj",
     )
-    padded_gate_up = gate_up_mapping.hf_to_megatron(gate_up, expert)
+    padded_gate_up = gate_up_mapping.hf_to_megatron(gate_up, expert.linear_fc1)
 
     assert padded_gate_up.shape == (2 * internal_ffn, internal_hidden)
     assert torch.equal(padded_gate_up[:logical_ffn, :logical_hidden], gate_up[0, ::2])
@@ -534,7 +534,10 @@ def test_gpt_oss_bridge_import_pads_logical_expert_weights() -> None:
         "decoder.layers.0.mlp.experts.local_experts.0.linear_fc1.bias",
         "model.layers.0.mlp.experts.gate_up_proj_bias",
     )
-    padded_gate_up_bias = gate_up_bias_mapping.hf_to_megatron(gate_up_bias, expert)
+    padded_gate_up_bias = gate_up_bias_mapping.hf_to_megatron(
+        gate_up_bias,
+        expert.linear_fc1,
+    )
 
     assert padded_gate_up_bias.shape == (2 * internal_ffn,)
     assert torch.equal(padded_gate_up_bias[:logical_ffn], gate_up_bias[0, ::2])
@@ -552,7 +555,7 @@ def test_gpt_oss_bridge_import_pads_logical_expert_weights() -> None:
         "decoder.layers.0.mlp.experts.local_experts.0.linear_fc2.weight",
         "model.layers.0.mlp.experts.down_proj",
     )
-    padded_down = down_mapping.hf_to_megatron(down, expert)
+    padded_down = down_mapping.hf_to_megatron(down, expert.linear_fc2)
 
     assert padded_down.shape == (internal_hidden, internal_ffn)
     assert torch.equal(padded_down[:logical_hidden, :logical_ffn], down[0].t())
