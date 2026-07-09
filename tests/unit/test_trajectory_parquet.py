@@ -33,10 +33,11 @@ from openai.types.chat.chat_completion_tool_message_param import (
 from openai.types.chat.chat_completion_user_message_param import (
     ChatCompletionUserMessageParam,
 )
+import pyarrow.parquet as pq
 import pytest
 
 from art import Trajectory, TrajectoryGroup
-from art.types import MessageOrChoice, SFTLastAssistantLossMask
+from art.types import MessageOrChoice, SFTLastAssistantLossMask, SFTRolesLossMask
 from art.utils.trajectory_logging import (
     read_trajectory_groups_parquet,
     write_trajectory_groups_parquet,
@@ -108,6 +109,9 @@ class TestParquetRoundTrip:
         parquet_path = tmp_path / "test.parquet"
         write_trajectory_groups_parquet(original, parquet_path)
 
+        raw_loss_mask = pq.read_table(parquet_path).column("loss_mask").to_pylist()[0]
+        assert json.loads(raw_loss_mask) == SFTRolesLossMask().model_dump()
+
         loaded = read_trajectory_groups_parquet(parquet_path)
 
         assert len(loaded) == 1
@@ -117,6 +121,7 @@ class TestParquetRoundTrip:
         assert traj.metrics == {"duration": 5.2}
         assert traj.metadata == {"trace_id": "abc-123"}
         assert len(traj.messages_and_choices) == 3
+        assert traj.loss_mask == SFTRolesLossMask()
         assert traj.logs == ["log1", "log2"]
 
     def test_loss_mask_round_trip(self, tmp_path: Path):
@@ -531,6 +536,73 @@ class TestMigration:
         loss_mask = loaded[0].trajectories[0].loss_mask
         assert loss_mask is not None
         assert loss_mask.type == "last_assistant"
+
+    def test_migrate_missing_loss_mask_writes_default(self, tmp_path: Path):
+        jsonl_path = tmp_path / "0001.jsonl"
+        jsonl_path.write_text(
+            json.dumps(
+                {
+                    "trajectories": [
+                        {
+                            "reward": 0.8,
+                            "metrics": {},
+                            "metadata": {},
+                            "messages_and_choices": [
+                                {"role": "user", "content": "Hello"},
+                                {"role": "assistant", "content": "Hi!"},
+                            ],
+                            "tools": None,
+                            "additional_histories": [],
+                            "logs": [],
+                        }
+                    ]
+                }
+            )
+        )
+
+        result = migrate_jsonl_to_parquet(jsonl_path, delete_original=True)
+
+        assert result.files_migrated == 1
+        parquet_path = tmp_path / "0001.parquet"
+        raw_loss_mask = pq.read_table(parquet_path).column("loss_mask").to_pylist()[0]
+        assert json.loads(raw_loss_mask) == SFTRolesLossMask().model_dump()
+
+        loaded = read_trajectory_groups_parquet(parquet_path)
+        assert loaded[0].trajectories[0].loss_mask == SFTRolesLossMask()
+
+    def test_migrate_null_loss_mask_is_rejected(
+        self,
+        tmp_path: Path,
+    ):
+        jsonl_path = tmp_path / "0001.jsonl"
+        jsonl_path.write_text(
+            json.dumps(
+                {
+                    "trajectories": [
+                        {
+                            "reward": 0.8,
+                            "metrics": {},
+                            "metadata": {},
+                            "messages_and_choices": [
+                                {"role": "user", "content": "Hello"},
+                                {"role": "assistant", "content": "Hi!"},
+                            ],
+                            "tools": None,
+                            "loss_mask": None,
+                            "additional_histories": [],
+                            "logs": [],
+                        }
+                    ]
+                }
+            )
+        )
+
+        result = migrate_jsonl_to_parquet(jsonl_path, delete_original=True)
+
+        assert result.files_migrated == 0
+        assert len(result.errors) == 1
+        assert "loss_mask cannot be null" in result.errors[0]
+        assert not (tmp_path / "0001.parquet").exists()
 
     def test_migrate_keeps_original_when_requested(self, tmp_path: Path):
         """Test that delete_original=False preserves the JSONL file."""

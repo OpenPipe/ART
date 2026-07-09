@@ -546,6 +546,13 @@ class ServerlessBackend(Backend):
 
         assert model.id is not None, "Model ID is required"
 
+        for _ in trajectories:
+            # TODO: Implement the semantic SFT mask contract for ServerlessBackend.
+            raise ValueError(
+                "ServerlessBackend SFT does not support semantic SFT loss masks "
+                "yet. Use a local SFT backend."
+            )
+
         # Generate unique artifact name to avoid race conditions in distributed systems
         artifact_id = uuid.uuid4().hex[:12]
         artifact_name = f"{model.name}-sft-data-{artifact_id}"
@@ -559,14 +566,6 @@ class ServerlessBackend(Backend):
             mode="w", suffix=".jsonl", delete=False
         ) as tmp_file:
             for trajectory in trajectories:
-                if trajectory.loss_mask is not None:
-                    import os
-
-                    os.unlink(tmp_file.name)
-                    raise ValueError(
-                        "ServerlessBackend SFT does not support trajectory.loss_mask "
-                        "yet. Use a local SFT backend or omit loss_mask."
-                    )
                 # Convert trajectory to the expected JSONL format
                 line: dict[str, Any] = {
                     "messages": trajectory.messages(),

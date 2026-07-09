@@ -28,9 +28,7 @@ from .moe_routing import (
     align_choice_routes_to_tokenized_result,
 )
 from .response_masking import (
-    response_only_labels,
     semantic_loss_mask_labels,
-    token_ids_for_template_part,
 )
 from .vllm_tokens import choice_vllm_token_metadata
 
@@ -239,6 +237,10 @@ def _apply_chat_template_token_ids(
     **kwargs: Any,
 ) -> list[int]:
     output = tokenizer.apply_chat_template(messages, **kwargs)
+    return _input_ids_from_chat_template_output(output)
+
+
+def _input_ids_from_chat_template_output(output: Any) -> list[int]:
     if isinstance(output, BatchEncoding):
         output = output["input_ids"]
     if isinstance(output, torch.Tensor):
@@ -248,6 +250,108 @@ def _apply_chat_template_token_ids(
         assert len(output) == 1
         output = output[0]
     return cast(list[int], output)
+
+
+def _assistant_mask_from_chat_template_output(output: Any) -> list[int] | None:
+    if not isinstance(output, (BatchEncoding, dict)):
+        return None
+    assistant_mask = output.get("assistant_masks")
+    if assistant_mask is None:
+        assistant_mask = output.get("assistant_tokens_mask")
+    if assistant_mask is None:
+        return None
+    if isinstance(assistant_mask, torch.Tensor):
+        assistant_mask = assistant_mask.tolist()
+    if (
+        assistant_mask
+        and isinstance(assistant_mask, list)
+        and isinstance(assistant_mask[0], list)
+    ):
+        if len(assistant_mask) != 1:
+            return None
+        assistant_mask = assistant_mask[0]
+    if not isinstance(assistant_mask, list):
+        return None
+    return [int(mask_value) for mask_value in assistant_mask]
+
+
+def _assistant_payload_text(message: dict[str, Any]) -> str:
+    content = message.get("content")
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        text_parts = []
+        for part in content:
+            if isinstance(part, dict) and isinstance(part.get("text"), str):
+                text_parts.append(part["text"])
+        return "".join(text_parts)
+    return ""
+
+
+def _assistant_tool_call_payload_text(message: dict[str, Any]) -> str:
+    tool_calls = message.get("tool_calls")
+    if not isinstance(tool_calls, list):
+        return ""
+
+    text_parts = []
+    for tool_call in tool_calls:
+        if not isinstance(tool_call, dict):
+            continue
+        function = tool_call.get("function")
+        if not isinstance(function, dict):
+            continue
+        name = function.get("name")
+        arguments = function.get("arguments")
+        if isinstance(name, str):
+            text_parts.append(name)
+        if isinstance(arguments, str):
+            text_parts.append(arguments)
+    return "".join(text_parts)
+
+
+def _assistant_payload_token_counts(
+    tokenizer: PreTrainedTokenizerBase,
+    messages: list[dict[str, Any]],
+) -> list[int]:
+    token_counts: list[int] = []
+    for message in messages:
+        if message.get("role") != "assistant":
+            continue
+        payload_text = _assistant_payload_text(message)
+        tool_call_text = _assistant_tool_call_payload_text(message)
+        has_tool_calls = bool(message.get("tool_calls"))
+        if not payload_text and not tool_call_text and not has_tool_calls:
+            continue
+        payload_text = f"{payload_text}{tool_call_text}"
+        payload_token_count = (
+            len(tokenizer.encode(payload_text, add_special_tokens=False))
+            if payload_text
+            else 0
+        )
+        if has_tool_calls:
+            payload_token_count = max(payload_token_count, 1)
+        token_counts.append(payload_token_count)
+    return token_counts
+
+
+def _apply_chat_template_token_ids_and_assistant_mask(
+    tokenizer: PreTrainedTokenizerBase,
+    messages: list[dict[str, Any]],
+    **kwargs: Any,
+) -> tuple[list[int], list[int] | None]:
+    try:
+        output = tokenizer.apply_chat_template(
+            messages,
+            **kwargs,
+            return_dict=True,
+            return_assistant_tokens_mask=True,
+        )
+    except (TypeError, ValueError):
+        return _apply_chat_template_token_ids(tokenizer, messages, **kwargs), None
+    return (
+        _input_ids_from_chat_template_output(output),
+        _assistant_mask_from_chat_template_output(output),
+    )
 
 
 def _choice_logprobs(
@@ -543,8 +647,6 @@ def tokenize_sft_batch(
     trajectory_batch: list[Trajectory],
     learning_rate: float,
     tokenizer: PreTrainedTokenizerBase,
-    instruction_part: str,
-    response_part: str,
     chat_template_kwargs: dict[str, Any] | None = None,
     chat_template_tool_schema_format: ChatTemplateToolSchemaFormat = "default",
     max_seq_length: int | None = None,
@@ -555,8 +657,6 @@ def tokenize_sft_batch(
         trajectory_batch: List of trajectories in this batch
         learning_rate: Learning rate for this batch
         tokenizer: Tokenizer to use for encoding
-        instruction_part: Instruction template part (e.g., "<|im_start|>user")
-        response_part: Response template part (e.g., "<|im_start|>assistant")
         max_seq_length: Optional maximum tokenized trajectory length. Trajectories
             longer than this limit are dropped before tensors are created.
 
@@ -565,8 +665,6 @@ def tokenize_sft_batch(
     """
     _validate_max_seq_length(max_seq_length)
 
-    instruction_ids = token_ids_for_template_part(tokenizer, instruction_part)
-    response_ids = token_ids_for_template_part(tokenizer, response_part)
     # Tokenize all trajectories (no padding — each keeps its natural length)
     trajectory_tensors = []
     num_tokens = 0
@@ -584,13 +682,15 @@ def tokenize_sft_batch(
         template_kwargs = _chat_template_kwargs(tokenizer, chat_template_kwargs)
 
         # Single-step tokenization: apply_chat_template with tokenize=True
-        input_ids = _apply_chat_template_token_ids(
-            tokenizer,
-            messages,
-            tools=tools,
-            tokenize=True,
-            add_generation_prompt=False,
-            **template_kwargs,
+        input_ids, assistant_token_mask = (
+            _apply_chat_template_token_ids_and_assistant_mask(
+                tokenizer,
+                messages,
+                tools=tools,
+                tokenize=True,
+                add_generation_prompt=False,
+                **template_kwargs,
+            )
         )
         if max_seq_length is not None and len(input_ids) > max_seq_length:
             num_dropped_trajectories += 1
@@ -598,27 +698,39 @@ def tokenize_sft_batch(
 
         attention_mask = [1] * len(input_ids)
 
-        if trajectory.loss_mask is None:
-            labels = response_only_labels(
-                input_ids,
-                instruction_ids=instruction_ids,
-                response_ids=response_ids,
-            )
-        else:
-            labels = semantic_loss_mask_labels(
-                input_ids,
-                messages=messages,
-                loss_mask=trajectory.loss_mask,
-                response_ids=response_ids,
-                render_message_prefix=lambda count: _apply_chat_template_token_ids(
-                    tokenizer,
-                    messages[:count],
-                    tools=tools,
-                    tokenize=True,
-                    add_generation_prompt=False,
-                    **template_kwargs,
-                ),
-            )
+        prefix_token_ids: list[list[int]] | None = None
+
+        def message_prefix_token_ids() -> list[list[int]]:
+            nonlocal prefix_token_ids
+            if prefix_token_ids is None:
+                prefix_token_ids = [
+                    [],
+                    *(
+                        _apply_chat_template_token_ids(
+                            tokenizer,
+                            messages[:count],
+                            tools=tools,
+                            tokenize=True,
+                            add_generation_prompt=False,
+                            **template_kwargs,
+                        )
+                        for count in range(1, len(messages))
+                    ),
+                    input_ids,
+                ]
+            return prefix_token_ids
+
+        labels = semantic_loss_mask_labels(
+            input_ids,
+            messages=messages,
+            loss_mask=trajectory.loss_mask,
+            message_prefix_token_ids=message_prefix_token_ids,
+            assistant_token_mask=assistant_token_mask,
+            assistant_payload_token_counts=_assistant_payload_token_counts(
+                tokenizer,
+                messages,
+            ),
+        )
 
         trajectory_tensors.append(
             {

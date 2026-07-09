@@ -43,11 +43,13 @@ def _parse_jsonl_line(line: str) -> "Trajectory":
     from art.trajectories import Trajectory
 
     data = json.loads(line)
-    return Trajectory(
-        messages_and_choices=data.get("messages", []),
-        tools=data.get("tools"),
-        loss_mask=data.get("loss_mask"),
-    )
+    trajectory_kwargs = {
+        "messages_and_choices": data.get("messages", []),
+        "tools": data.get("tools"),
+    }
+    if "loss_mask" in data:
+        trajectory_kwargs["loss_mask"] = data["loss_mask"]
+    return Trajectory(**trajectory_kwargs)
 
 
 def get_file_row_count(file_path: str) -> int:

@@ -16,7 +16,14 @@ from typing import (
 from openai.types.chat.chat_completion import Choice
 import pydantic
 
-from .types import Message, Messages, MessagesAndChoices, SFTLossMask, Tools
+from .types import (
+    Message,
+    Messages,
+    MessagesAndChoices,
+    SFTLossMask,
+    SFTRolesLossMask,
+    Tools,
+)
 
 MetadataValue = float | int | str | bool | None
 
@@ -38,7 +45,7 @@ class History(pydantic.BaseModel):
 class Trajectory(pydantic.BaseModel):
     messages_and_choices: MessagesAndChoices = []
     tools: Tools | None = None
-    loss_mask: SFTLossMask | None = None
+    loss_mask: SFTLossMask = pydantic.Field(default_factory=SFTRolesLossMask)
     additional_histories: list[History] = []
     reward: float = 0.0
     initial_policy_version: int | None = None
@@ -82,9 +89,7 @@ class Trajectory(pydantic.BaseModel):
             "metadata": self.metadata,
             "messages": [],
             "tools": self.tools,
-            "loss_mask": (
-                self.loss_mask.model_dump() if self.loss_mask is not None else None
-            ),
+            "loss_mask": self.loss_mask.model_dump(),
             "logs": self.logs,
         }
         for message_or_choice in self.messages_and_choices:

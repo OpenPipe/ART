@@ -206,48 +206,15 @@ async def test_serverless_train_model_forwards_experimental_config() -> None:
 
 
 @pytest.mark.asyncio
-async def test_serverless_train_sft_forwards_metric_logging_config() -> None:
+async def test_serverless_train_sft_rejects_default_semantic_loss_mask() -> None:
     backend = _make_backend()
     model = TrainableModel(
-        name="serverless-sft-config-payload",
+        name="serverless-sft-default-mask-rejects",
         project="pipeline-tests",
         base_model="test-model",
     )
     model.id = "model-id"
     model.entity = "entity"
-    model.run_id = "canonical-run-id"
-
-    captured: dict[str, Any] = {}
-    backend._client.sft_training_jobs.create = AsyncMock(  # type: ignore[attr-defined]
-        side_effect=lambda **kwargs: (
-            captured.update(kwargs) or SimpleNamespace(id="sft-training-job-id")
-        )
-    )
-
-    async def events_list(**_kwargs: Any):
-        yield SimpleNamespace(id="event-id", type="training_ended", data={})
-
-    backend._client.sft_training_jobs.events.list = events_list  # type: ignore[attr-defined]
-
-    async def no_sleep(_seconds: float) -> None:
-        return None
-
-    class FakeArtifact:
-        def __init__(self, *_args: Any, **_kwargs: Any) -> None:
-            pass
-
-        def add_file(self, *_args: Any, **_kwargs: Any) -> None:
-            pass
-
-        def wait(self):
-            return self
-
-    class FakeRun:
-        def log_artifact(self, artifact):
-            return artifact
-
-        def finish(self) -> None:
-            pass
 
     trajectory = Trajectory(
         messages_and_choices=[
@@ -256,32 +223,24 @@ async def test_serverless_train_sft_forwards_metric_logging_config() -> None:
         ],
     )
 
-    with patch.object(model, "_get_wandb_run", return_value=None):
-        with (
-            patch("art.serverless.backend.wandb_sdk.artifact", FakeArtifact),
-            patch("art.serverless.backend.wandb_sdk.init", return_value=FakeRun()),
-            patch("art.serverless.backend.wandb_sdk.settings", lambda **kwargs: kwargs),
+    with (
+        patch("tempfile.NamedTemporaryFile") as named_tempfile,
+        pytest.raises(ValueError, match="semantic SFT loss masks"),
+    ):
+        async for _ in backend._train_sft(
+            model,
+            [trajectory],
+            TrainSFTConfig(learning_rate=[1e-4], batch_size=2),
+            {
+                "metric_logging": {
+                    "enabled": True,
+                    "target_training_step": 1,
+                },
+            },
         ):
-            with patch("art.serverless.backend.asyncio.sleep", no_sleep):
-                async for _ in backend._train_sft(
-                    model,
-                    [trajectory],
-                    TrainSFTConfig(learning_rate=[1e-4], batch_size=2),
-                    {
-                        "metric_logging": {
-                            "enabled": True,
-                            "target_training_step": 1,
-                        },
-                    },
-                ):
-                    pass
+            pass
 
-    config = captured["config"]
-    metric_logging = config["metric_logging"]
-    assert config["learning_rate"] == [1e-4]
-    assert config["batch_size"] == 2
-    assert metric_logging["enabled"] is True
-    assert metric_logging["target_training_step"] == 1
+    named_tempfile.assert_not_called()
 
 
 @pytest.mark.asyncio
@@ -303,7 +262,7 @@ async def test_serverless_train_sft_rejects_loss_mask() -> None:
         loss_mask=SFTLastAssistantLossMask(),
     )
 
-    with pytest.raises(ValueError, match="does not support trajectory.loss_mask"):
+    with pytest.raises(ValueError, match="semantic SFT loss masks"):
         async for _ in backend._train_sft(
             model,
             [trajectory],
