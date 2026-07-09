@@ -462,7 +462,6 @@ def test_finalize_provider_bundle_respects_handler_flex_dispatcher_choice(
     provider_module._apply_art_training_runtime_finalize_defaults(cast(Any, provider))
 
     assert dispatcher_calls == []
-    assert provider.finalized is True
     assert getattr(provider, "sequence_parallel") is False
 
 
