@@ -47,23 +47,28 @@ def _branch_rows_without_future_scored_tokens(
     suffix token in the same branch, so a physical group boundary is not enough
     to identify rows that can safely use synthetic replay routes.
     """
-    non_padding = group_ids != -1
-    branch = non_padding & (group_ids != parent_ids)
-    scored = non_padding & torch.isfinite(logprobs)
-    allowed = torch.zeros_like(branch)
-    for sample_index in range(int(group_ids.shape[0])):
-        future_scored_by_group: dict[int, bool] = {}
-        for position in range(int(group_ids.shape[1]) - 1, -1, -1):
-            group_id = int(group_ids[sample_index, position].item())
+    group_rows = group_ids.detach().to(device="cpu").numpy()
+    parent_rows = parent_ids.detach().to(device="cpu").numpy()
+    scored_rows = torch.isfinite(logprobs).detach().to(device="cpu").numpy()
+    allowed = torch.zeros_like(group_ids, dtype=torch.bool, device="cpu").numpy()
+    for sample_index in range(int(group_rows.shape[0])):
+        future_scored_by_group: set[int] = set()
+        group_row = group_rows[sample_index]
+        parent_row = parent_rows[sample_index]
+        scored_row = scored_rows[sample_index]
+        allowed_row = allowed[sample_index]
+        for position in range(int(group_row.shape[0]) - 1, -1, -1):
+            group_id = int(group_row[position])
             if group_id == -1:
                 continue
-            has_future_scored = future_scored_by_group.get(group_id, False)
-            allowed[sample_index, position] = (
-                bool(branch[sample_index, position].item()) and not has_future_scored
-            )
-            if bool(scored[sample_index, position].item()):
-                future_scored_by_group[group_id] = True
-    return allowed
+            if (
+                group_id != int(parent_row[position])
+                and group_id not in future_scored_by_group
+            ):
+                allowed_row[position] = True
+            if bool(scored_row[position]):
+                future_scored_by_group.add(group_id)
+    return torch.from_numpy(allowed).to(device=group_ids.device)
 
 
 def _to_tensor_cpu_contiguous(

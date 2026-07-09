@@ -1,9 +1,23 @@
 from __future__ import annotations
 
-from collections.abc import Iterable
+from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
 
 import torch
+
+
+@dataclass(frozen=True)
+class PrefixTreePackSegment:
+    sequence_indices: tuple[int, ...]
+    start: int
+    end: int
+    packed_start: int
+    group_id: int
+    parent_id: int
+
+    @property
+    def length(self) -> int:
+        return self.end - self.start
 
 
 @dataclass(frozen=True)
@@ -13,6 +27,7 @@ class PrefixTreePack:
     parent_ids: torch.Tensor
     position_ids: torch.Tensor
     positions_by_sequence: tuple[torch.Tensor, ...]
+    segments: tuple[PrefixTreePackSegment, ...]
 
 
 @dataclass(frozen=True)
@@ -72,8 +87,8 @@ def prefix_tree_pack(
     share_limits = _shareable_lengths(tensors, shareable_lengths)
 
     device = tensors[0].device
-    rows = tuple(tensor.detach().cpu().tolist() for tensor in tensors)
-    segments = _prefix_segments(
+    rows = tuple(tuple(tensor.detach().cpu().tolist()) for tensor in tensors)
+    segments = prefix_tree_pack_segments(
         rows, max_depth=max_depth, shareable_lengths=share_limits
     )
     if not segments:
@@ -108,7 +123,44 @@ def prefix_tree_pack(
             else torch.empty(0, dtype=torch.long, device=device)
             for chunks in positions_by_sequence
         ),
+        segments=segments,
     )
+
+
+def prefix_tree_pack_segments(
+    sequences: Iterable[Sequence[int]],
+    *,
+    max_depth: int,
+    shareable_lengths: Iterable[int] | None = None,
+) -> tuple[PrefixTreePackSegment, ...]:
+    if max_depth < 0:
+        raise ValueError("max_depth must be >= 0")
+    rows = tuple(
+        sequence if isinstance(sequence, tuple) else tuple(sequence)
+        for sequence in sequences
+    )
+    if not rows:
+        return ()
+    share_limits = _shareable_row_lengths(rows, shareable_lengths)
+    cursor = 0
+    segments: list[PrefixTreePackSegment] = []
+    for segment in _prefix_segments(
+        rows,
+        max_depth=max_depth,
+        shareable_lengths=share_limits,
+    ):
+        segments.append(
+            PrefixTreePackSegment(
+                sequence_indices=segment.sequence_indices,
+                start=segment.start,
+                end=segment.end,
+                packed_start=cursor,
+                group_id=segment.group_id,
+                parent_id=segment.parent_id,
+            )
+        )
+        cursor += segment.end - segment.start
+    return tuple(segments)
 
 
 def estimate_prefix_tree_packed_tokens(
@@ -137,11 +189,9 @@ def estimate_prefix_tree_packed_tokens(
     share_limits = _shareable_lengths(tuple(tensors), shareable_lengths)
 
     return sum(
-        segment.end - segment.start
-        for segment in _prefix_segments(
-            tuple(rows),
-            max_depth=max_depth,
-            shareable_lengths=share_limits,
+        segment.length
+        for segment in prefix_tree_pack_segments(
+            rows, max_depth=max_depth, shareable_lengths=share_limits
         )
     )
 
@@ -161,7 +211,7 @@ def _local_position_pairs(
 
 
 def _prefix_segments(
-    rows: tuple[list[int], ...],
+    rows: tuple[Sequence[int], ...],
     *,
     max_depth: int,
     shareable_lengths: tuple[int, ...],
@@ -269,6 +319,7 @@ def _empty_pack(
         parent_ids=row,
         position_ids=row,
         positions_by_sequence=tuple(flat for _ in range(sequence_count)),
+        segments=(),
     )
 
 
@@ -295,6 +346,23 @@ def _shareable_lengths(
     return tuple(
         max(0, min(value, int(tensor.numel())))
         for value, tensor in zip(values, tensors, strict=True)
+    )
+
+
+def _shareable_row_lengths(
+    rows: tuple[Sequence[int], ...],
+    lengths: Iterable[int] | None,
+) -> tuple[int, ...]:
+    if lengths is None:
+        return tuple(len(row) for row in rows)
+    values = tuple(int(length) for length in lengths)
+    if len(values) != len(rows):
+        raise ValueError(
+            "shareable_lengths must have one entry per sequence, "
+            f"got {len(values)} for {len(rows)} sequences"
+        )
+    return tuple(
+        max(0, min(value, len(row))) for value, row in zip(values, rows, strict=True)
     )
 
 

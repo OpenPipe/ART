@@ -221,6 +221,7 @@ def _mutated_pack(pack: PrefixTreePack, *, keep: torch.Tensor) -> PrefixTreePack
         parent_ids=pack.parent_ids,
         position_ids=pack.position_ids,
         positions_by_sequence=pack.positions_by_sequence,
+        segments=pack.segments,
     )
 
 

@@ -288,15 +288,14 @@ def configure_moe_routing_replay(
     replay_bundle: MoeRoutingReplayBundle | None = None,
     strict: bool = True,
 ) -> None:
-    if runtime.moe_routing_replay_controller is not None:
-        runtime.moe_routing_replay_controller.remove_router_patches()
-        runtime.moe_routing_replay_controller = None
-
     if replay_bundle is not None and replay_bundle_path is not None:
         raise RuntimeError(
             "Provide either replay_bundle_path or replay_bundle, not both"
         )
     if replay_bundle is None and replay_bundle_path is None:
+        if runtime.moe_routing_replay_controller is not None:
+            runtime.moe_routing_replay_controller.remove_router_patches()
+            runtime.moe_routing_replay_controller = None
         return
 
     if replay_bundle is None:
@@ -305,6 +304,13 @@ def configure_moe_routing_replay(
                 "replay_bundle_path is required when replay_bundle is None"
             )
         replay_bundle = MoeRoutingReplayBundle.from_dir(replay_bundle_path)
+
+    if runtime.moe_routing_replay_controller is not None:
+        runtime.moe_routing_replay_controller.update_bundle(
+            bundle=replay_bundle,
+            strict=strict,
+        )
+        return
 
     controller = MoeRoutingReplayController(
         bundle=replay_bundle,
