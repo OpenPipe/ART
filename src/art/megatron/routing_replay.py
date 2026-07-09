@@ -990,7 +990,14 @@ class MoeRoutingReplayController:
                     routing_wrapper = _moe_routing_with_replay_target
                 else:
                     routing_wrapper = _routing_with_replay_target
-                module.routing = types.MethodType(routing_wrapper, module)
+                # Routing replay mutates Python replay cursors and Megatron's
+                # RouterReplay target state immediately before routing consumes
+                # it. Keep the whole patched routing boundary eager so Dynamo
+                # cannot specialize or reorder around that mutable replay state.
+                module.routing = types.MethodType(
+                    torch.compiler.disable(routing_wrapper),
+                    module,
+                )
                 setattr(module, "_art_routing_replay_target_patched", True)
                 self._router_bindings[router_key] = {
                     "module": module,

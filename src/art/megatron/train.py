@@ -627,6 +627,7 @@ def run_megatron_rl_job(
                 "Correlation between old and new probabilities:",
                 step_result.probs_corr,
             )
+            _validate_train_step_result_finite(runtime, step_result)
             _log_rl_step_result(
                 runtime.rank,
                 job.log_path,
@@ -942,6 +943,27 @@ def _save_lora_and_optimizer(
             write_optimizer_step_marker(optimizer_state_path, step)
 
 
+def _validate_train_step_result_finite(
+    runtime: TrainingRuntime,
+    step_result: TrainStepResult,
+) -> None:
+    finite = torch.isfinite(step_result.reduced_loss.detach()).to(dtype=torch.float32)
+    if not math.isfinite(float(step_result.grad_norm)):
+        finite.zero_()
+    if torch.distributed.is_initialized():  # ty: ignore[possibly-missing-attribute]
+        torch.distributed.all_reduce(  # ty: ignore[possibly-missing-attribute]
+            finite,
+            op=torch.distributed.ReduceOp.MIN,  # ty: ignore[possibly-missing-attribute]
+        )
+    if bool(finite.item()):
+        return
+    raise RuntimeError(
+        "Megatron training produced a non-finite result; refusing to save LoRA. "
+        f"loss={float(step_result.reduced_loss.detach().float().item())}, "
+        f"grad_norm={step_result.grad_norm}, rank={runtime.rank}"
+    )
+
+
 def _should_save_optimizer(
     runtime: TrainingRuntime,
     *,
@@ -1195,6 +1217,14 @@ def _forward_prepared_rl_micro(
             **model_forward_kwargs,
             labels=prepared_micro.model_labels,
         )
+
+
+def _zero_logprob_graph_contribution(
+    new_logprobs: torch.Tensor,
+    loss_inputs: LossInputs | DispatchedPackedTensors,
+) -> torch.Tensor:
+    assistant_mask = loss_inputs.align_inputs().assistant_mask.to(dtype=torch.bool)
+    return new_logprobs.masked_fill(~assistant_mask, 0.0).sum() * 0.0
 
 
 def _globalize_context_parallel_logprobs(
@@ -1660,7 +1690,10 @@ def run_training_step(
             experimental_config=experimental_config,
             reduction="sum",
         )
-        micro_loss = loss_info.policy_loss + new_logprobs.sum() * 0.0
+        micro_loss = loss_info.policy_loss + _zero_logprob_graph_contribution(
+            new_logprobs,
+            prepared_micro.loss_inputs,
+        )
         if not micro_loss.requires_grad:
             assistant_tokens = _count_trainable_tokens(prepared_micro.loss_inputs)
             nonzero_weights = int(

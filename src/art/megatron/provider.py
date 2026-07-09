@@ -478,7 +478,7 @@ def _apply_art_training_runtime_finalize_defaults(
     backend = (
         runtime_env.moe_flex_dispatcher_backend
         if runtime_env.is_set("moe_flex_dispatcher_backend")
-        else "deepep"
+        else getattr(provider, "art_moe_flex_dispatcher_backend", "deepep")
     )
     if backend is None:
         return

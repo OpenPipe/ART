@@ -236,7 +236,7 @@ def compute_probs_corr(
     old_logprobs: torch.Tensor,
     new_logprobs: torch.Tensor,
 ) -> torch.Tensor:
-    old_logprobs_mask = ~torch.isnan(old_logprobs)
+    old_logprobs_mask = torch.isfinite(old_logprobs) & torch.isfinite(new_logprobs)
     old_probs = torch.exp(old_logprobs[old_logprobs_mask])
     new_probs = torch.exp(new_logprobs[old_logprobs_mask])
     if old_probs.numel() < 2:
@@ -253,6 +253,13 @@ def compute_probs_corr(
     return torch.corrcoef(torch.stack([old_probs, new_probs]))[0, 1]
 
 
+def _mask_ignored_tokens(
+    tensor: torch.Tensor,
+    assistant_mask: torch.Tensor,
+) -> torch.Tensor:
+    return torch.where(assistant_mask, tensor, tensor.new_zeros(()))
+
+
 def loss_fn(
     inputs: "LossInputs | AlignedLossInputs",
     new_logprobs: torch.Tensor,
@@ -264,9 +271,23 @@ def loss_fn(
     aligned_inputs = inputs.align_inputs()
     old_logprobs = aligned_inputs.old_logprobs
     advantages = aligned_inputs.advantages
-    assistant_mask = aligned_inputs.assistant_mask.to(new_logprobs.dtype)
+    assistant_mask_bool = aligned_inputs.assistant_mask.to(dtype=torch.bool)
+    new_logprobs = _mask_ignored_tokens(new_logprobs, assistant_mask_bool)
+    old_logprobs = _mask_ignored_tokens(old_logprobs, assistant_mask_bool)
+    if ref_logprobs is not None:
+        ref_logprobs = _mask_ignored_tokens(ref_logprobs, assistant_mask_bool)
+    if entropies is not None:
+        entropies = _mask_ignored_tokens(entropies, assistant_mask_bool)
+    assistant_mask = assistant_mask_bool.to(new_logprobs.dtype)
     weights = aligned_inputs.weights
-    probs_corr = compute_probs_corr(old_logprobs, new_logprobs)
+    probs_corr = compute_probs_corr(
+        torch.where(
+            assistant_mask_bool,
+            old_logprobs,
+            old_logprobs.new_full((), float("nan")),
+        ),
+        new_logprobs,
+    )
     # Assume missing old logprobs were sampled under the current policy
     old_logprobs = torch.where(
         torch.isnan(old_logprobs),

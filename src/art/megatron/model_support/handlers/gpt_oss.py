@@ -32,6 +32,11 @@ _GPT_OSS_MOE_COMPILE_WORKAROUND_FLAGS = (
     "deepep_dispatch_combine",
     "deepep_permute_restore",
     "flex_token_dispatch_combine",
+    # Torch 2.11 can illegal-address in compiled GPT-OSS MoE under CP2 even
+    # when routing replay is disabled. Narrower dispatcher/expert/postprocess
+    # eager boundaries do not isolate it, so keep only the MoE layer eager while
+    # the surrounding transformer layer and compiled flex attention stay active.
+    "moe_forward",
     "te_triton_permute_with_mask_map",
 )
 _ART_MOE_EXPERT_KEY_RE = re.compile(
@@ -780,7 +785,17 @@ class GptOssMoeHandler(DefaultMoeHandler):
         provider.art_flex_core_attention_wrapper = _gpt_oss_flex_core_attention_wrapper
         provider.art_flex_sliding_windows = (sliding_window,)
         provider.moe_shared_expert_overlap = False
-        provider.moe_router_dtype = None
+        # GPT-OSS times out in DeepEP dispatch on ART's packed RL shape, while
+        # Megatron's all-to-all dispatcher trains the same CP/EP/routing replay
+        # input cleanly. Keep the handler on that dispatcher until DeepEP is
+        # validated for GPT-OSS.
+        provider.art_moe_flex_dispatcher_backend = None
+        provider.moe_enable_deepep = False
+        provider.moe_token_dispatcher_type = "alltoall"
+        # GPT-OSS has many experts; keep router logits in fp32 as in ART's
+        # generic MoE runtime default. Low-precision routing can produce
+        # non-finite losses and immediately poison LoRA checkpoints.
+        provider.moe_router_dtype = "fp32"
         _install_weighted_bias_quick_geglu_patch()
 
     def patch_bridge(self, bridge: Any) -> None:

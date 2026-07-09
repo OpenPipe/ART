@@ -35,6 +35,10 @@ class _FakeProvider:
         self.moe_ffn_hidden_size = 768
         self.add_bias_linear = True
         self.bias_activation_fusion = True
+        self.window_size: int | tuple[int, int] = (128, 0)
+        self.art_moe_flex_dispatcher_backend: str | None = "deepep"
+        self.moe_enable_deepep = True
+        self.moe_token_dispatcher_type = ""
         self.recompute_granularity: str | None = None
         self.recompute_method: str | None = None
         self.recompute_num_layers: int | None = None
@@ -243,6 +247,21 @@ def test_gpt_oss_mxfp4_weight_source_materializes_once() -> None:
     assert bridge.calls == [hf_param]
 
 
+def test_gpt_oss_runtime_disables_deepep_dispatcher() -> None:
+    handler = get_model_support_handler("openai/gpt-oss-20b")
+    provider: Any = _FakeProvider()
+    provider.num_moe_experts = 32
+    provider.hidden_size = 2880
+    provider.moe_ffn_hidden_size = 2880
+    provider.window_size = (128, 0)
+
+    handler.configure_provider_for_runtime(cast(Any, provider))
+
+    assert provider.art_moe_flex_dispatcher_backend is None
+    assert provider.moe_enable_deepep is False
+    assert provider.moe_token_dispatcher_type == "alltoall"
+
+
 def test_moe_grouped_gemm_fast_path_forces_bias_settings() -> None:
     provider = _FakeProvider()
     provider.num_moe_experts = 8
@@ -420,6 +439,27 @@ def test_finalize_provider_bundle_uses_post_prepare_topology(
     bundle.provider.expert_model_parallel_size = 1
     bundle.provider.sequence_parallel = False
     provider_module.finalize_provider_bundle(bundle)
+
+    assert dispatcher_calls == []
+
+
+def test_finalize_provider_bundle_respects_handler_flex_dispatcher_choice(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    provider: Any = _FakeProvider()
+    provider.expert_model_parallel_size = 2
+    provider.expert_tensor_parallel_size = 1
+    provider.art_moe_flex_dispatcher_backend = None
+    dispatcher_calls: list[str] = []
+    monkeypatch.setattr(
+        provider_module,
+        "apply_flex_dispatcher_backend",
+        lambda provider, moe_flex_dispatcher_backend: dispatcher_calls.append(
+            cast(str, moe_flex_dispatcher_backend)
+        ),
+    )
+
+    provider_module._apply_art_training_runtime_finalize_defaults(cast(Any, provider))
 
     assert dispatcher_calls == []
     assert provider.finalized is True
