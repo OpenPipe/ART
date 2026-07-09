@@ -397,6 +397,132 @@ def _install_gpt_oss_grouped_mlp_padding_patch() -> None:
     setattr(TEGroupedMLP, "_art_gpt_oss_padding_patch", True)
 
 
+def _install_gpt_oss_bridge_padding_patch() -> None:
+    from megatron.bridge.models.conversion.param_mapping import (
+        AutoMapping,
+        _align_expert_weight_to_shape,
+    )
+    from megatron.bridge.models.conversion.utils import (
+        get_module_and_param_from_name,
+    )
+    from megatron.bridge.models.gpt_oss.gpt_oss_bridge import (
+        GPTOSSMLPDownProjMapping,
+        GPTOSSMLPGateUpProjMapping,
+    )
+    from megatron.bridge.utils.common_utils import (
+        extract_expert_number_from_param,
+    )
+
+    if getattr(GPTOSSMLPGateUpProjMapping, "_art_padding_patch", False):
+        return
+
+    original_gate_up_hf_to_megatron = GPTOSSMLPGateUpProjMapping.hf_to_megatron
+    original_down_hf_to_megatron = GPTOSSMLPDownProjMapping.hf_to_megatron
+
+    def _target_param(mapping: Any, megatron_module: Any) -> torch.nn.Parameter:
+        normalized = mapping._normalize_expert_param_name(mapping.megatron_param)
+        return cast(
+            torch.nn.Parameter,
+            get_module_and_param_from_name(megatron_module, normalized)[1],
+        )
+
+    def _expert_weight(mapping: Any, hf_weights: torch.Tensor) -> torch.Tensor:
+        expert = extract_expert_number_from_param(mapping.megatron_param)
+        return hf_weights[expert] if hf_weights.ndim >= 2 else hf_weights
+
+    def _gate_up_hf_to_megatron(
+        self: Any,
+        hf_weights: torch.Tensor,
+        megatron_module: Any,
+    ) -> torch.Tensor:
+        target_param = _target_param(self, megatron_module)
+        target_shape = tuple(int(dim) for dim in target_param.shape)
+        full_rows = target_shape[0] * int(getattr(self, "tp_size", 1) or 1)
+        expert_weight = _expert_weight(self, hf_weights)
+
+        if expert_weight.ndim == 1 and full_rows > int(expert_weight.shape[0]):
+            logical_ffn = int(expert_weight.shape[0]) // 2
+            internal_ffn = full_rows // 2
+            aligned = _align_expert_weight_to_shape(
+                expert_weight,
+                torch.Size((2 * logical_ffn,)),
+                "gate_up_proj_bias",
+            )
+            padded = _pad_gpt_oss_gate_up_dim0(
+                self._interleave(aligned),
+                logical=logical_ffn,
+                internal=internal_ffn,
+            )
+            return AutoMapping.hf_to_megatron(self, padded, megatron_module)
+
+        if expert_weight.ndim == 2:
+            logical_hidden = int(expert_weight.shape[1])
+            logical_ffn = int(expert_weight.shape[0]) // 2
+            internal_hidden = target_shape[1]
+            internal_ffn = full_rows // 2
+            if internal_hidden > logical_hidden or internal_ffn > logical_ffn:
+                aligned = _align_expert_weight_to_shape(
+                    expert_weight,
+                    torch.Size((2 * logical_ffn, logical_hidden)),
+                    "gate_up_proj",
+                )
+                padded = _pad_dim_right(
+                    _pad_gpt_oss_gate_up_dim0(
+                        self._interleave(aligned),
+                        logical=logical_ffn,
+                        internal=internal_ffn,
+                    ),
+                    dim=1,
+                    size=internal_hidden,
+                )
+                return AutoMapping.hf_to_megatron(self, padded, megatron_module)
+
+        return original_gate_up_hf_to_megatron(self, hf_weights, megatron_module)
+
+    def _down_hf_to_megatron(
+        self: Any,
+        hf_weights: torch.Tensor,
+        megatron_module: Any,
+    ) -> torch.Tensor:
+        target_param = _target_param(self, megatron_module)
+        target_shape = tuple(int(dim) for dim in target_param.shape)
+        full_cols = target_shape[1] * int(getattr(self, "tp_size", 1) or 1)
+        expert_weight = _expert_weight(self, hf_weights)
+
+        if expert_weight.ndim == 1 and target_shape[0] > int(expert_weight.shape[0]):
+            padded = _pad_dim_right(
+                expert_weight,
+                dim=0,
+                size=target_shape[0],
+            )
+            return AutoMapping.hf_to_megatron(self, padded, megatron_module)
+
+        if expert_weight.ndim == 2:
+            logical_ffn = int(expert_weight.shape[0])
+            logical_hidden = int(expert_weight.shape[1])
+            internal_hidden = target_shape[0]
+            internal_ffn = full_cols
+            if internal_hidden > logical_hidden or internal_ffn > logical_ffn:
+                aligned = _align_expert_weight_to_shape(
+                    expert_weight,
+                    torch.Size((logical_hidden, logical_ffn)),
+                    "down_proj",
+                )
+                padded = _pad_dim_right(
+                    _pad_dim_right(aligned, dim=0, size=internal_hidden),
+                    dim=1,
+                    size=internal_ffn,
+                )
+                return AutoMapping.hf_to_megatron(self, padded, megatron_module)
+
+        return original_down_hf_to_megatron(self, hf_weights, megatron_module)
+
+    cast(Any, GPTOSSMLPGateUpProjMapping).hf_to_megatron = _gate_up_hf_to_megatron
+    cast(Any, GPTOSSMLPDownProjMapping).hf_to_megatron = _down_hf_to_megatron
+    setattr(GPTOSSMLPGateUpProjMapping, "_art_padding_patch", True)
+    setattr(GPTOSSMLPDownProjMapping, "_art_padding_patch", True)
+
+
 def _patch_gpt_oss_mapping_registry(target: Any) -> None:
     original = getattr(target, "mapping_registry", None)
     if original is None or getattr(original, "_art_gpt_oss_padding_patch", False):
@@ -649,6 +775,7 @@ class GptOssMoeHandler(DefaultMoeHandler):
         _register_gpt_oss_attention_mapping_types()
         _configure_gpt_oss_moe_internal_padding(provider)
         _install_gpt_oss_grouped_mlp_padding_patch()
+        _install_gpt_oss_bridge_padding_patch()
         sliding_window = _gpt_oss_sliding_window(provider)
         provider.art_flex_core_attention_wrapper = _gpt_oss_flex_core_attention_wrapper
         provider.art_flex_sliding_windows = (sliding_window,)
