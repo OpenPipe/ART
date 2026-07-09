@@ -313,6 +313,33 @@ def test_prefix_tree_pack_public_api_emits_nested_metadata() -> None:
     assert int(packed["group_ids"][0, 4]) != int(packed["group_ids"][0, 6])
 
 
+def test_prefix_tree_pack_best_fit_combines_independent_small_groups() -> None:
+    results = []
+    for group in range(4):
+        prompt = [10 + group, 100, 200 + group]
+        for sample in range(2):
+            token_ids = [*prompt, 300 + group * 10 + sample]
+            results.append(
+                _tokenized(
+                    token_ids,
+                    [_route(token) for token in token_ids],
+                    prompt_id=group,
+                    prompt_length=3,
+                    trainable_start=3,
+                )
+            )
+
+    packed = packed_tensors_from_tokenized_results(
+        results,
+        seq_len=12,
+        pad_token_id=0,
+        truncate_long_results=False,
+    )
+
+    assert packed["tokens"].shape[0] == 2
+    assert int((packed["group_ids"] != -1).sum().item()) == 24
+
+
 def test_pack_infers_at_least_topk_experts_from_sparse_routes() -> None:
     result = _tokenized(
         [10, 20],

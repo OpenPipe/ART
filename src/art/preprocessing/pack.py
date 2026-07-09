@@ -9,9 +9,6 @@ import torch
 from typing_extensions import NotRequired, TypedDict, Unpack
 
 from ..megatron.prefix_tree_packing import (
-    estimate_prefix_tree_packed_tokens,
-)
-from ..megatron.prefix_tree_packing import (
     prefix_tree_pack as _prefix_tree_pack_sequences,
 )
 from ..types import Verbosity
@@ -77,6 +74,117 @@ class _PrefixTreePackItem(NamedTuple):
     moe_routes: Any | None
 
 
+class _PrefixTrieNode:
+    __slots__ = ("children",)
+
+    def __init__(self) -> None:
+        self.children: dict[int, _PrefixTrieEdge] = {}
+
+
+class _PrefixTrieEdge:
+    __slots__ = ("child", "edge_id", "tokens")
+
+    def __init__(
+        self,
+        *,
+        edge_id: int,
+        tokens: tuple[int, ...],
+        child: _PrefixTrieNode,
+    ) -> None:
+        self.edge_id = edge_id
+        self.tokens = tokens
+        self.child = child
+
+
+class _PrefixTrie:
+    __slots__ = ("_next_edge_id", "root")
+
+    def __init__(self) -> None:
+        self.root = _PrefixTrieNode()
+        self._next_edge_id = 1
+
+    def insert(self, tokens: tuple[int, ...]) -> None:
+        node = self.root
+        pos = 0
+        while pos < len(tokens):
+            token = tokens[pos]
+            edge = node.children.get(token)
+            if edge is None:
+                node.children[token] = self._new_edge(tokens[pos:])
+                return
+            common = _prefix_trie_common_length(edge.tokens, tokens, pos)
+            if common == len(edge.tokens):
+                node = edge.child
+                pos += common
+                continue
+            split = _PrefixTrieNode()
+            old_suffix = edge.tokens[common:]
+            split.children[old_suffix[0]] = self._new_edge(old_suffix, child=edge.child)
+            node.children[token] = self._new_edge(edge.tokens[:common], child=split)
+            pos += common
+            if pos < len(tokens):
+                split.children[tokens[pos]] = self._new_edge(tokens[pos:])
+            return
+
+    def edge_path(self, tokens: tuple[int, ...]) -> tuple[_PrefixTrieEdge, ...]:
+        node = self.root
+        pos = 0
+        path: list[_PrefixTrieEdge] = []
+        while pos < len(tokens):
+            edge = node.children[tokens[pos]]
+            if not _prefix_trie_edge_matches(edge.tokens, tokens, pos):
+                raise RuntimeError("Prefix trie path mismatch")
+            path.append(edge)
+            pos += len(edge.tokens)
+            node = edge.child
+        return tuple(path)
+
+    def _new_edge(
+        self,
+        tokens: tuple[int, ...],
+        *,
+        child: _PrefixTrieNode | None = None,
+    ) -> _PrefixTrieEdge:
+        edge = _PrefixTrieEdge(
+            edge_id=self._next_edge_id,
+            tokens=tokens,
+            child=child or _PrefixTrieNode(),
+        )
+        self._next_edge_id += 1
+        return edge
+
+
+class _PrefixTrieLeaf(NamedTuple):
+    item: _PrefixTreePackItem
+    edge_path: tuple[_PrefixTrieEdge, ...]
+    suffix_len: int
+
+    @property
+    def empty_bin_cost(self) -> int:
+        return self.suffix_len + sum(len(edge.tokens) for edge in self.edge_path)
+
+
+class _PrefixTrieBin:
+    __slots__ = ("edge_ids", "items", "token_count")
+
+    def __init__(self) -> None:
+        self.edge_ids: set[int] = set()
+        self.items: list[_PrefixTreePackItem] = []
+        self.token_count = 0
+
+    def insertion_delta(self, leaf: _PrefixTrieLeaf) -> int:
+        return leaf.suffix_len + sum(
+            len(edge.tokens)
+            for edge in leaf.edge_path
+            if edge.edge_id not in self.edge_ids
+        )
+
+    def add(self, leaf: _PrefixTrieLeaf) -> None:
+        self.token_count += self.insertion_delta(leaf)
+        self.edge_ids.update(edge.edge_id for edge in leaf.edge_path)
+        self.items.append(leaf.item)
+
+
 def packed_tensors_from_tokenized_results(
     tokenized_results: list[TokenizedResult],
     seq_len: int,
@@ -110,7 +218,7 @@ def prefix_tree_pack(
     pack_results: bool = True,
     include_moe_routing: bool = False,
 ) -> PackedTensors:
-    rows: list[list[_PrefixTreePackItem]] = [[]]
+    items: list[_PrefixTreePackItem] = []
     moe_routing_pack_stats = MoeRoutingPackStats()
 
     for result in tokenized_results:
@@ -128,16 +236,15 @@ def prefix_tree_pack(
                 print("Result has no unique completion tokens, skipping")
             continue
         item = _prefix_tree_pack_item(result, seq_len=seq_len)
-        if rows[-1] and (
-            not pack_results
-            or _packed_row_token_count([*rows[-1], item], seq_len=seq_len) > seq_len
-        ):
-            rows.append([])
-        rows[-1].append(item)
         if truncate_long_results:
-            rows[-1][-1] = _truncate_prefix_tree_pack_item(rows[-1][-1], seq_len)
+            item = _truncate_prefix_tree_pack_item(item, seq_len)
+        items.append(item)
 
-    rows = [row for row in rows if row]
+    rows = _prefix_tree_pack_rows(
+        items,
+        seq_len=seq_len,
+        pack_results=pack_results,
+    )
     if not rows:
         raise RuntimeError("No tokenized results were packable")
     random.shuffle(rows)
@@ -263,6 +370,85 @@ def prefix_tree_pack(
     return packed_tensors
 
 
+def _prefix_tree_pack_rows(
+    items: list[_PrefixTreePackItem],
+    *,
+    seq_len: int,
+    pack_results: bool,
+) -> list[list[_PrefixTreePackItem]]:
+    if not items:
+        return []
+    if not pack_results:
+        return [[item] for item in items]
+
+    trie = _PrefixTrie()
+    prefixes = [item.token_ids[: item.shareable_length] for item in items]
+    for prefix in prefixes:
+        trie.insert(prefix)
+    leaves = [
+        _PrefixTrieLeaf(
+            item=item,
+            edge_path=trie.edge_path(prefix),
+            suffix_len=len(item.token_ids) - item.shareable_length,
+        )
+        for item, prefix in zip(items, prefixes, strict=True)
+    ]
+    grouped: dict[int, list[_PrefixTrieLeaf]] = {}
+    for leaf in leaves:
+        grouped.setdefault(leaf.item.prompt_id, []).append(leaf)
+    ordered_groups = sorted(
+        grouped.values(),
+        key=lambda group: max(leaf.empty_bin_cost for leaf in group),
+        reverse=True,
+    )
+    bins: list[_PrefixTrieBin] = []
+    for leaf in (leaf for group in ordered_groups for leaf in group):
+        if leaf.empty_bin_cost > seq_len:
+            raise RuntimeError(
+                "Prefix-tree pack item exceeds sequence length: "
+                f"cost={leaf.empty_bin_cost}, seq_len={seq_len}"
+            )
+        best_bin: _PrefixTrieBin | None = None
+        best_remaining = seq_len + 1
+        for candidate in bins:
+            new_count = candidate.token_count + candidate.insertion_delta(leaf)
+            if new_count <= seq_len:
+                remaining = seq_len - new_count
+                if remaining < best_remaining:
+                    best_bin = candidate
+                    best_remaining = remaining
+        if best_bin is None:
+            best_bin = _PrefixTrieBin()
+            bins.append(best_bin)
+        best_bin.add(leaf)
+    return [packed_bin.items for packed_bin in bins]
+
+
+def _prefix_trie_common_length(
+    edge_tokens: tuple[int, ...],
+    tokens: tuple[int, ...],
+    start: int,
+) -> int:
+    limit = min(len(edge_tokens), len(tokens) - start)
+    index = 0
+    while index < limit and edge_tokens[index] == tokens[start + index]:
+        index += 1
+    return index
+
+
+def _prefix_trie_edge_matches(
+    edge_tokens: tuple[int, ...],
+    tokens: tuple[int, ...],
+    start: int,
+) -> bool:
+    if start + len(edge_tokens) > len(tokens):
+        return False
+    for index, token in enumerate(edge_tokens):
+        if tokens[start + index] != token:
+            return False
+    return True
+
+
 def _prefix_tree_pack_item(
     result: TokenizedResult,
     *,
@@ -320,23 +506,6 @@ def _first_trainable_token_index(result: TokenizedResult) -> int:
         ),
         len(result.token_ids),
     )
-
-
-def _packed_row_token_count(
-    row: list[_PrefixTreePackItem],
-    *,
-    seq_len: int,
-) -> int:
-    if not row:
-        return 0
-    count = estimate_prefix_tree_packed_tokens(
-        (torch.tensor(item.token_ids, dtype=torch.long) for item in row),
-        max_depth=seq_len,
-        shareable_lengths=(item.shareable_length for item in row),
-    )
-    if count is None:
-        raise RuntimeError("CPU prefix-tree token estimate unexpectedly failed")
-    return count
 
 
 def _pack_prefix_tree_row(
