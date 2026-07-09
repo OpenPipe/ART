@@ -785,10 +785,12 @@ class GptOssMoeHandler(DefaultMoeHandler):
         provider.art_flex_core_attention_wrapper = _gpt_oss_flex_core_attention_wrapper
         provider.art_flex_sliding_windows = (sliding_window,)
         provider.moe_shared_expert_overlap = False
-        # GPT-OSS CP/EP packed RL replays hit CUDA illegal-memory failures in
-        # DeepEP fused_combine by MoE layer 3, while Megatron all-to-all trains
-        # the same routed inputs cleanly. Keep GPT-OSS off DeepEP until that
-        # fused-combine path is validated for this model and packing shape.
+        # GPT-OSS packed RL replays hit CUDA illegal-memory failures in early
+        # MoE DeepEP combine calls in full Megatron training. All-to-all trains
+        # the same routed inputs cleanly, and scratch replays of captured
+        # DeepEP route tensors are not sufficient to reproduce the failure
+        # outside the full Megatron path. Keep GPT-OSS off DeepEP until that
+        # full path is validated for this model and packing shape.
         provider.art_moe_flex_dispatcher_backend = None
         provider.moe_enable_deepep = False
         provider.moe_token_dispatcher_type = "alltoall"
