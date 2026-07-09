@@ -432,8 +432,22 @@ def _enforce_art_moe_grouped_gemm_fast_path(provider: GPTModelProvider) -> None:
 
 
 def _require_te_cutlass_grouped_gemm_dimensions(provider: GPTModelProvider) -> None:
-    hidden_size = int(getattr(provider, "hidden_size", 0) or 0)
-    moe_ffn_hidden_size = int(getattr(provider, "moe_ffn_hidden_size", 0) or 0)
+    hidden_size = int(
+        getattr(
+            provider,
+            "art_moe_grouped_gemm_hidden_size",
+            getattr(provider, "hidden_size", 0),
+        )
+        or 0
+    )
+    moe_ffn_hidden_size = int(
+        getattr(
+            provider,
+            "art_moe_grouped_gemm_ffn_hidden_size",
+            getattr(provider, "moe_ffn_hidden_size", 0),
+        )
+        or 0
+    )
     invalid = [
         f"{name}={value}"
         for name, value in (
