@@ -12,6 +12,8 @@ import time
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Run an ART-owned child process")
     parser.add_argument("--parent-pid", type=int, required=True)
+    parser.add_argument("--child-timeout", type=float, required=True)
+    parser.add_argument("--sweep-grace", type=float, required=True)
     parser.add_argument("command", nargs=argparse.REMAINDER)
     args = parser.parse_args()
     if args.command[:1] == ["--"]:
@@ -52,7 +54,7 @@ def main() -> None:
 
     def sweep_child_group() -> None:
         signal_child_group(signal.SIGTERM)
-        time.sleep(float(os.environ.get("ART_MANAGED_PROCESS_SWEEP_GRACE", 0.5)))
+        time.sleep(args.sweep_grace)
         signal_child_group(signal.SIGKILL)
 
     def shutdown(sig: signal.Signals, exit_code: int) -> None:
@@ -63,7 +65,7 @@ def main() -> None:
         signal_child_group(sig)
         if process is not None:
             try:
-                process.wait(timeout=5)
+                process.wait(timeout=args.child_timeout)
             except subprocess.TimeoutExpired:
                 signal_child_group(signal.SIGKILL)
                 process.wait()

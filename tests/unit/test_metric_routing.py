@@ -39,7 +39,7 @@ class TestMetricRoutingBaseline:
         assert entry["train/checkpoint/foo"] == 1.5
         assert entry["train/rewardish/value"] == 2.0
         assert entry["training_step"] == 7
-        assert entry["time/wall_clock_sec"] >= 0
+        assert "time/wall_clock_sec" not in entry
 
     def test_get_wandb_run_registers_taxonomy_sections(self, tmp_path: Path) -> None:
         fake_run = MagicMock()
@@ -65,19 +65,21 @@ class TestMetricRoutingBaseline:
         ]
         assert define_calls == [
             (("training_step",), {}),
-            (("time/wall_clock_sec",), {}),
             (("sft/gradient_step",), {}),
             (("reward/*",), {"step_metric": "training_step"}),
             (("loss/*",), {"step_metric": "training_step"}),
+            (("objective/*",), {"step_metric": "training_step"}),
+            (("sample_efficiency/*",), {"step_metric": "training_step"}),
+            (("offpolicy/*",), {"step_metric": "training_step"}),
             (("throughput/*",), {"step_metric": "training_step"}),
             (("costs/*",), {"step_metric": "training_step"}),
             (("time/*",), {"step_metric": "training_step"}),
             (("data/*",), {"step_metric": "training_step"}),
-            (("sft/*",), {"step_metric": "sft/gradient_step"}),
-            (("train/*",), {"step_metric": "training_step"}),
-            (("val/*",), {"step_metric": "training_step"}),
-            (("test/*",), {"step_metric": "training_step"}),
             (("discarded/*",), {"step_metric": "training_step"}),
+            (("pipeline_settings/*",), {"step_metric": "training_step"}),
+            (("task/*",), {"step_metric": "training_step"}),
+            (("vllm/*",), {"step_metric": "training_step"}),
+            (("sft/*",), {"step_metric": "sft/gradient_step"}),
         ]
 
     def test_log_metrics_defines_nested_cost_keys_with_training_step(
@@ -113,19 +115,15 @@ class TestMetricRoutingBaseline:
             (call.args, call.kwargs) for call in fake_run.define_metric.call_args_list
         ]
         assert (
-            ("costs/train/sample",),
-            {"step_metric": "training_step"},
-        ) in define_calls
-        assert (
             ("costs/cum/train/prefill",),
             {"step_metric": "training_step"},
         ) in define_calls
         fake_run.log.assert_called_once()
         logged_metrics = fake_run.log.call_args.args[0]
-        assert logged_metrics["costs/train/sample"] == 0.1
+        assert "costs/train/sample" not in logged_metrics
         assert logged_metrics["costs/cum/train/prefill"] == 0.2
         assert logged_metrics["training_step"] == 1
-        assert "time/wall_clock_sec" in logged_metrics
+        assert "time/wall_clock_sec" not in logged_metrics
         assert fake_run.log.call_args.kwargs == {}
 
     def test_update_wandb_config_seeds_wandb_init(self, tmp_path: Path) -> None:

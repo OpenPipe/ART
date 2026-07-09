@@ -8,15 +8,22 @@ from types import ModuleType, SimpleNamespace
 from typing import Any, cast
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import httpx
 import pytest
 import torch
 from transformers.tokenization_utils_base import PreTrainedTokenizerBase
 
-from art import TrainableModel, Trajectory, TrajectoryGroup
+from art import PipelineRuntimeConfig, TrainableModel, Trajectory, TrajectoryGroup
+from art._backend_training import aggregate_rl_training_metrics
 from art.dev.model import InternalModelConfig
+from art.errors import ArtVllmMetricsTimeoutError
 from art.local import LocalBackend
 from art.megatron import MegatronBackend
-from art.megatron.train import load_adapter_into_model
+from art.megatron.train import (
+    TrainStepResult,
+    _log_rl_step_result,
+    load_adapter_into_model,
+)
 from art.pipeline_trainer import (
     CHECKPOINT_CREATED_AT_METRIC,
     CHECKPOINT_EVAL_COMPLETED_METRIC,
@@ -25,6 +32,62 @@ from art.pipeline_trainer import (
 from art.pipeline_trainer.trainer import PipelineTrainer
 from art.preprocessing.tokenize import TokenizedResult
 from art.utils.output_dirs import get_model_dir, get_step_checkpoint_dir
+
+
+class _FakeArtMetricsResponse:
+    def raise_for_status(self) -> None:
+        return None
+
+    def json(self) -> dict[str, Any]:
+        return {
+            "schema_version": 1,
+            "metrics": {
+                "prompt_tokens_total": 100.0,
+                "generation_tokens_total": 20.0,
+                "prefix_cache_queries_total": 10.0,
+                "prefix_cache_hits_total": 7.0,
+                "num_preempted_reqs_total": 0.0,
+                "num_requests_running": 8.0,
+                "num_requests_waiting": 3.0,
+                "num_requests_waiting_capacity": 2.0,
+                "kv_cache_usage_perc": 0.25,
+            },
+        }
+
+
+class _FakeArtMetricsClient:
+    requested_urls: list[str] = []
+
+    def __init__(self, *, timeout: float) -> None:
+        self.timeout = timeout
+
+    async def __aenter__(self) -> "_FakeArtMetricsClient":
+        return self
+
+    async def __aexit__(self, *_args: object) -> None:
+        return None
+
+    async def get(
+        self, url: str, *, headers: dict[str, str] | None
+    ) -> _FakeArtMetricsResponse:
+        self.requested_urls.append(url)
+        assert headers == {"Authorization": "Bearer token"}
+        return _FakeArtMetricsResponse()
+
+
+class _TimeoutArtMetricsClient:
+    def __init__(self, *, timeout: float) -> None:
+        self.timeout = timeout
+
+    async def __aenter__(self) -> "_TimeoutArtMetricsClient":
+        return self
+
+    async def __aexit__(self, *_args: object) -> None:
+        return None
+
+    async def get(self, url: str, *, headers: dict[str, str] | None) -> None:
+        del url, headers
+        raise httpx.TimeoutException("timeout")
 
 
 def _make_group(rewards: list[float]) -> TrajectoryGroup:
@@ -55,13 +118,96 @@ def _make_trainer(
         rollout_fn=lambda *_args, **_kwargs: asyncio.sleep(0),
         scenarios=[],
         config={},
-        num_rollout_workers=1,
-        min_batch_size=1,
-        max_batch_size=1,
+        pipeline=PipelineRuntimeConfig(
+            num_rollout_workers=1,
+            min_batch_size=1,
+            max_batch_size=1,
+        ),
         max_steps=1,
         eval_fn=None,
         **kwargs,
     )
+
+
+def test_rl_training_metrics_canonicalize_megatron_packed_throughput() -> None:
+    metrics = aggregate_rl_training_metrics(
+        training_metrics=[{"tokens_per_second": 25000.0}],
+        trajectory_groups=[_make_group([0.0, 1.0])],
+        trainer_started=0.0,
+    )
+
+    assert metrics["throughput/train_packed_tok_per_s"] == 25000.0
+    assert "tokens_per_second" not in metrics
+
+
+def test_megatron_rl_log_includes_packed_train_throughput(tmp_path: Path) -> None:
+    log_path = tmp_path / "megatron_rl_step.jsonl"
+
+    _log_rl_step_result(
+        0,
+        str(log_path),
+        TrainStepResult(
+            reduced_loss=torch.tensor(1.0),
+            probs_corr=0.5,
+            update_successful=True,
+            grad_norm=2.0,
+            num_zeros_in_grad=None,
+        ),
+        num_gradient_steps=1,
+        packed_train_tokens=1000,
+        train_step_s=0.25,
+    )
+
+    row = json.loads(log_path.read_text())
+    assert row["throughput/train_packed_tok_per_s"] == 4000.0
+
+
+@pytest.mark.asyncio
+async def test_local_backend_collects_fast_art_vllm_metrics(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _FakeArtMetricsClient.requested_urls.clear()
+    monkeypatch.setattr(
+        "art.local.backend.httpx.AsyncClient",
+        _FakeArtMetricsClient,
+    )
+    model = TrainableModel(
+        name="pipeline-fast-vllm-metrics",
+        project="pipeline-tests",
+        base_model="test-model",
+        base_path=str(tmp_path),
+    )
+    model.inference_base_url = "http://127.0.0.1:9999/v1"
+    model.inference_api_key = "token"
+    metrics = await LocalBackend(
+        path=str(tmp_path / "art")
+    ).collect_train_step_vllm_metrics(model)
+
+    assert _FakeArtMetricsClient.requested_urls == ["http://127.0.0.1:9999/art/metrics"]
+    assert metrics["vllm/num_requests_running"] == 8.0
+    assert metrics["vllm/num_requests_waiting"] == 3.0
+    assert metrics["vllm/num_requests_waiting_capacity"] == 2.0
+    assert metrics["vllm/kv_cache_usage_perc"] == 0.25
+    assert metrics["vllm/prefix_cache_hit_rate"] == 0.7
+
+
+@pytest.mark.asyncio
+async def test_local_backend_vllm_metric_timeout_raises(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr("art.local.backend.httpx.AsyncClient", _TimeoutArtMetricsClient)
+    model = TrainableModel(
+        name="pipeline-fast-vllm-metrics-timeout",
+        project="pipeline-tests",
+        base_model="test-model",
+        base_path=str(tmp_path),
+    )
+    model.inference_base_url = "http://127.0.0.1:9999/v1"
+
+    with pytest.raises(ArtVllmMetricsTimeoutError):
+        await LocalBackend(path=str(tmp_path / "art")).collect_train_step_vllm_metrics(
+            model
+        )
 
 
 @pytest.mark.asyncio
@@ -99,6 +245,8 @@ async def test_pipeline_trainer_preserves_backend_train_kwargs(tmp_path: Path) -
         "normalize_advantages": True,
         "save_checkpoint": False,
         "adam_params": adam_params,
+        "optimizer_save_interval": None,
+        "final_training_step": 1,
     }
 
 
@@ -133,6 +281,8 @@ async def test_pipeline_trainer_forwards_default_kl_step_zero_for_generic_backen
         "normalize_advantages": True,
         "save_checkpoint": False,
         "adam_params": None,
+        "optimizer_save_interval": None,
+        "final_training_step": 1,
         "kl_penalty_coef": 0.25,
         "kl_penalty_reference_step": 0,
         "kl_penalty_source": "sample",
@@ -232,6 +382,7 @@ async def test_pipeline_trainer_uses_same_train_kwargs_for_local_backend(
     )
     backend = LocalBackend(path=str(tmp_path))
     backend.train = AsyncMock(return_value=SimpleNamespace(step=1, metrics={}))  # type: ignore[method-assign]
+    backend.collect_train_step_vllm_metrics = AsyncMock(return_value={})  # type: ignore[method-assign]
 
     trainer = _make_trainer(
         model=model,
@@ -252,7 +403,43 @@ async def test_pipeline_trainer_uses_same_train_kwargs_for_local_backend(
         "normalize_advantages": True,
         "save_checkpoint": False,
         "adam_params": None,
+        "optimizer_save_interval": None,
+        "final_training_step": 1,
     }
+
+
+@pytest.mark.asyncio
+async def test_pipeline_trainer_preserves_backend_train_packed_throughput(
+    tmp_path: Path,
+) -> None:
+    model = TrainableModel(
+        name="pipeline-preserve-packed-throughput",
+        project="pipeline-tests",
+        base_model="test-model",
+        base_path=str(tmp_path),
+    )
+    log_mock = AsyncMock()
+    object.__setattr__(model, "log", log_mock)
+    backend = MagicMock()
+    backend.train = AsyncMock(
+        return_value=SimpleNamespace(
+            step=1,
+            metrics={
+                "data/step_packed_train_tokens": 1000.0,
+                "throughput/train_packed_tok_per_s": 25000.0,
+            },
+        )
+    )
+
+    trainer = _make_trainer(model=model, backend=backend)
+    trainer._output_queue = asyncio.Queue()
+    await trainer._output_queue.put(_make_group([0.0, 1.0]))
+    await trainer._output_queue.put(None)
+
+    await trainer._training_stage()
+
+    logged_metrics = log_mock.await_args.kwargs["metrics"]
+    assert logged_metrics["throughput/train_packed_tok_per_s"] == 25000.0
 
 
 @pytest.mark.asyncio
@@ -432,14 +619,14 @@ async def test_pipeline_trainer_checkpoint_retention_only_passes_unprotected_ste
         "\n".join(
             json.dumps(row)
             for row in [
-                {"step": 2, "val/reward": 1.0},
-                {"step": 2, "val/reward": 3.0},
+                {"step": 2, "reward/val": 1.0},
+                {"step": 2, "reward/val": 3.0},
                 {
                     "step": 2,
                     CHECKPOINT_CREATED_AT_METRIC: 123.0,
                     CHECKPOINT_EVAL_COMPLETED_METRIC: 1.0,
                 },
-                {"step": 3, "val/reward": 10.0},
+                {"step": 3, "reward/val": 10.0},
             ]
         )
         + "\n",
@@ -469,7 +656,7 @@ async def test_pipeline_trainer_checkpoint_retention_only_passes_unprotected_ste
     step_two = contexts[0].checkpoints[2]
     assert step_two.is_eval_step is True
     assert step_two.created_at == datetime.fromtimestamp(123.0, timezone.utc)
-    assert step_two.metrics["val/reward"] == 2.0
+    assert step_two.metrics["reward/val"] == 2.0
     backend._delete_checkpoint_files.assert_awaited_once_with(  # type: ignore[attr-defined]
         model,
         [1, 3, 4, 5],
@@ -873,6 +1060,51 @@ async def test_local_backend_async_context_manager_awaits_async_cleanup(
 
     assert calls == ["aclose"]
     close_proxy.assert_called_once_with(service)
+
+
+@pytest.mark.asyncio
+async def test_local_backend_close_drains_provenance_update_tasks(
+    tmp_path: Path,
+) -> None:
+    backend = LocalBackend(path=str(tmp_path))
+    completed: list[str] = []
+
+    async def record() -> None:
+        completed.append("done")
+
+    task = asyncio.create_task(record())
+    backend._provenance_update_tasks.add(task)
+
+    await backend.close()
+
+    assert completed == ["done"]
+    assert not backend._provenance_update_tasks
+
+
+@pytest.mark.asyncio
+async def test_local_backend_close_bounds_cancelled_provenance_tasks(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("art.local.backend._PROVENANCE_UPDATE_TIMEOUT_SECONDS", 0.01)
+    backend = LocalBackend(path=str(tmp_path))
+    release = asyncio.Event()
+
+    async def ignore_cancel() -> None:
+        while not release.is_set():
+            try:
+                await release.wait()
+            except asyncio.CancelledError:
+                continue
+
+    task = asyncio.create_task(ignore_cancel())
+    backend._provenance_update_tasks.add(task)
+
+    await backend.close()
+
+    assert not backend._provenance_update_tasks
+    release.set()
+    await asyncio.wait_for(task, timeout=1.0)
 
 
 @pytest.mark.parametrize(

@@ -6,7 +6,6 @@ import logging
 import math
 import os
 from pathlib import Path
-import random
 import re
 import types
 from typing import TYPE_CHECKING, Any, Protocol
@@ -432,7 +431,7 @@ class MoeRoutingReplayBundle(BaseModel):
                         ] = route.expert_probs
                     step_tensors[
                         _build_tensor_key(router_key, call_index, "expert_mask")
-                    ] = route.expert_mask
+                    ] = route.expert_mask.contiguous()
                     call_info: dict[str, Any] = {"num_experts": int(route.num_experts)}
                     if route.sample_index is not None:
                         call_info["sample_index"] = int(route.sample_index)
@@ -476,13 +475,22 @@ def build_moe_routing_replay_bundle_from_packed_tensors(
             "global_grad_accumulation_sequences must be positive when building "
             f"MoE routing replay bundles, got {global_grad_accumulation_sequences}"
         )
-    expert_indices = routing_replay.expert_indices
-    token_mask = routing_replay.token_mask
+    expert_indices = _to_tensor_cpu_contiguous(
+        routing_replay.expert_indices, dtype=torch.int32
+    )
+    token_mask = _to_tensor_cpu_contiguous(routing_replay.token_mask, dtype=torch.bool)
+    num_experts = int(routing_replay.num_experts)
+    _validate_packed_moe_replay_tensors(
+        expert_indices=expert_indices,
+        token_mask=token_mask,
+        num_layers=int(routing_replay.num_layers),
+        topk=int(routing_replay.topk),
+        num_experts=num_experts,
+    )
     num_sequences = int(expert_indices.shape[0])
     sequence_length = int(expert_indices.shape[1])
     num_layers = int(expert_indices.shape[2])
     topk = int(expert_indices.shape[3])
-    num_experts = int(routing_replay.num_experts)
 
     group_ids = packed_tensors["group_ids"]
     parent_ids = packed_tensors["parent_ids"]
@@ -510,60 +518,52 @@ def build_moe_routing_replay_bundle_from_packed_tensors(
     ]
     steps: dict[int, StepRoutes] = {}
     num_steps = math.ceil(num_sequences / global_grad_accumulation_sequences)
+    global_token_uids = torch.arange(sequence_length, dtype=torch.int64)
+    all_row_positions = torch.arange(sequence_length, dtype=torch.long)
     for step_index in range(num_steps):
         start = step_index * global_grad_accumulation_sequences
         end = start + global_grad_accumulation_sequences
-        routers: dict[str, StepRouterRoutes] = {}
-        for layer_index, router_key in enumerate(router_keys):
-            calls: dict[int, RouterCallRoute] = {}
-            for offset, sample_index in enumerate(range(start, end)):
-                if sample_index < num_sequences:
-                    route_indices = expert_indices[
-                        sample_index, :, layer_index, :
-                    ].clone()
-                    missing_rows = ~token_mask[sample_index]
-                    if bool(missing_rows.any().item()):
-                        # Megatron Core RouterReplay replays only top-k ids and does
-                        # not consume an expert mask. Rows without vLLM routes are
-                        # allowed only for padding or branch-tail query positions
-                        # that cannot affect any later scored token.
-                        missing_positions = torch.nonzero(
-                            missing_rows, as_tuple=False
-                        ).flatten()
-                        route_indices[missing_rows] = _synthetic_replay_rows(
-                            row_positions=missing_positions,
-                            num_experts=num_experts,
-                            topk=topk,
-                            dtype=expert_indices.dtype,
-                            seed=(sample_index + 1) * 1_000_003
-                            + (layer_index + 1) * 97_003,
-                        )
-                    calls[offset] = RouterCallRoute(
-                        expert_indices=route_indices,
-                        expert_mask=torch.ones_like(route_indices, dtype=torch.bool),
-                        num_experts=num_experts,
-                        sample_index=sample_index,
-                    )
-                else:
-                    route_indices = _synthetic_replay_rows(
-                        row_positions=torch.arange(sequence_length),
-                        num_experts=num_experts,
-                        topk=topk,
-                        dtype=expert_indices.dtype,
-                        seed=(step_index + 1) * 1_000_003
-                        + (layer_index + 1) * 97_003
-                        + (offset + 1) * 9_176,
-                    )
-                    calls[offset] = RouterCallRoute(
-                        expert_indices=route_indices,
-                        expert_mask=torch.ones_like(route_indices, dtype=torch.bool),
-                        num_experts=num_experts,
-                        micro_slot=offset,
-                    )
-            routers[router_key] = StepRouterRoutes(calls=calls)
+        calls_by_router: dict[str, dict[int, RouterCallRoute]] = {
+            router_key: {} for router_key in router_keys
+        }
+        for offset, sample_index in enumerate(range(start, end)):
+            if sample_index < num_sequences:
+                routes_by_layer = _sample_routes_by_layer(
+                    expert_indices=expert_indices,
+                    token_mask=token_mask,
+                    sample_index=sample_index,
+                    num_experts=num_experts,
+                    topk=topk,
+                )
+                sample_route_index: int | None = sample_index
+                micro_slot: int | None = None
+            else:
+                routes_by_layer = _synthetic_replay_layer_rows(
+                    row_positions=all_row_positions,
+                    layer_seeds=_layer_replay_seeds(
+                        num_layers=num_layers,
+                        base_seed=(step_index + 1) * 1_000_003 + (offset + 1) * 9_176,
+                    ),
+                    num_experts=num_experts,
+                    topk=topk,
+                    dtype=expert_indices.dtype,
+                )
+                sample_route_index = None
+                micro_slot = offset
+            for layer_index, router_key in enumerate(router_keys):
+                calls_by_router[router_key][offset] = _full_mask_router_call_route(
+                    expert_indices=routes_by_layer[layer_index],
+                    num_experts=num_experts,
+                    sample_index=sample_route_index,
+                    micro_slot=micro_slot,
+                )
+        routers = {
+            router_key: StepRouterRoutes(calls=calls)
+            for router_key, calls in calls_by_router.items()
+        }
         steps[step_index] = StepRoutes(
             routers=routers,
-            global_token_uids=torch.arange(sequence_length, dtype=torch.int64),
+            global_token_uids=global_token_uids,
         )
     return MoeRoutingReplayBundle(
         topology=topology or parallel_topology_from_env(),
@@ -571,6 +571,105 @@ def build_moe_routing_replay_bundle_from_packed_tensors(
         max_topk=topk,
         router_keys=router_keys,
         steps=steps,
+    )
+
+
+def _validate_packed_moe_replay_tensors(
+    *,
+    expert_indices: torch.Tensor,
+    token_mask: torch.Tensor,
+    num_layers: int,
+    topk: int,
+    num_experts: int,
+) -> None:
+    if expert_indices.ndim != 4:
+        raise RuntimeError(
+            "expert_indices must have shape "
+            "[num_sequences, sequence_length, num_layers, topk], got "
+            f"{tuple(expert_indices.shape)}"
+        )
+    if token_mask.shape != expert_indices.shape[:2]:
+        raise RuntimeError(
+            "token_mask shape must match packed route tokens, got "
+            f"{tuple(token_mask.shape)} vs {tuple(expert_indices.shape[:2])}"
+        )
+    if num_layers != int(expert_indices.shape[2]):
+        raise RuntimeError(
+            f"num_layers={num_layers} does not match "
+            f"expert_indices.shape[2]={expert_indices.shape[2]}"
+        )
+    if topk != int(expert_indices.shape[3]):
+        raise RuntimeError(
+            f"topk={topk} does not match expert_indices.shape[3]={expert_indices.shape[3]}"
+        )
+    if num_experts <= 0:
+        raise RuntimeError(f"num_experts must be >0, got {num_experts}")
+    if topk > num_experts:
+        raise RuntimeError(
+            f"MoE routing topk cannot exceed num_experts: topk={topk}, "
+            f"num_experts={num_experts}"
+        )
+    if not bool(token_mask.any().item()):
+        return
+    selected = expert_indices[token_mask]
+    if int(selected.numel()) == 0:
+        return
+    if int(selected.min().item()) < 0 or int(selected.max().item()) >= num_experts:
+        raise RuntimeError(
+            "expert_indices contain ids outside [0, num_experts): "
+            f"num_experts={num_experts}"
+        )
+
+
+def _sample_routes_by_layer(
+    *,
+    expert_indices: torch.Tensor,
+    token_mask: torch.Tensor,
+    sample_index: int,
+    num_experts: int,
+    topk: int,
+) -> torch.Tensor:
+    routes_by_layer = expert_indices[sample_index].permute(1, 0, 2).contiguous()
+    missing_positions = torch.nonzero(~token_mask[sample_index], as_tuple=False).view(
+        -1
+    )
+    if int(missing_positions.numel()) == 0:
+        return routes_by_layer
+    # Megatron Core RouterReplay replays only top-k ids and does not consume an
+    # expert mask. Missing rows are legal only for padding or terminal completion
+    # query positions, both validated before this point.
+    routes_by_layer[:, missing_positions, :] = _synthetic_replay_layer_rows(
+        row_positions=missing_positions,
+        layer_seeds=_layer_replay_seeds(
+            num_layers=int(expert_indices.shape[2]),
+            base_seed=(sample_index + 1) * 1_000_003,
+        ),
+        num_experts=num_experts,
+        topk=topk,
+        dtype=expert_indices.dtype,
+    )
+    return routes_by_layer
+
+
+def _layer_replay_seeds(*, num_layers: int, base_seed: int) -> torch.Tensor:
+    return base_seed + (torch.arange(num_layers, dtype=torch.long) + 1) * 97_003
+
+
+def _full_mask_router_call_route(
+    *,
+    expert_indices: torch.Tensor,
+    num_experts: int,
+    sample_index: int | None = None,
+    micro_slot: int | None = None,
+) -> RouterCallRoute:
+    return RouterCallRoute.model_construct(
+        expert_indices=expert_indices,
+        expert_probs=None,
+        expert_mask=torch.ones((), dtype=torch.bool).expand(expert_indices.shape),
+        num_experts=int(num_experts),
+        sample_index=None if sample_index is None else int(sample_index),
+        micro_slot=None if micro_slot is None else int(micro_slot),
+        rank_token_counts=None,
     )
 
 
@@ -599,15 +698,35 @@ def _synthetic_replay_rows(
     dtype: torch.dtype,
     seed: int,
 ) -> torch.Tensor:
-    return torch.tensor(
-        [
-            random.Random(seed + (int(position) + 1) * 1_299_709).sample(
-                range(num_experts), topk
-            )
-            for position in row_positions.tolist()
-        ],
+    return _synthetic_replay_layer_rows(
+        row_positions=row_positions,
+        layer_seeds=torch.tensor([seed], dtype=torch.long),
+        num_experts=num_experts,
+        topk=topk,
         dtype=dtype,
-    )
+    )[0]
+
+
+def _synthetic_replay_layer_rows(
+    *,
+    row_positions: torch.Tensor,
+    layer_seeds: torch.Tensor,
+    num_experts: int,
+    topk: int,
+    dtype: torch.dtype,
+) -> torch.Tensor:
+    if num_experts <= 0:
+        raise RuntimeError(f"num_experts must be >0, got {num_experts}")
+    if topk <= 0 or topk > num_experts:
+        raise RuntimeError(
+            f"MoE routing topk must be in [1, num_experts], got topk={topk}, "
+            f"num_experts={num_experts}"
+        )
+    positions = row_positions.to(device="cpu", dtype=torch.long).reshape(1, -1, 1)
+    seeds = layer_seeds.to(device="cpu", dtype=torch.long).reshape(-1, 1, 1)
+    offsets = torch.arange(topk, dtype=torch.long).reshape(1, 1, -1)
+    rows = (seeds + (positions + 1) * 1_299_709 + offsets) % num_experts
+    return rows.to(dtype=dtype)
 
 
 class LocalTokenIndexer(Protocol):

@@ -1,15 +1,18 @@
-import asyncio
 import json
 from pathlib import Path
+import subprocess
 import sys
 from types import SimpleNamespace
-from typing import cast
+from typing import Any, cast
 from unittest.mock import AsyncMock
 
 import httpx
 import pytest
+from safetensors.torch import save_file
+import torch
 
 import art
+from art.megatron import service as service_module
 from art.megatron.service import MegatronService
 
 
@@ -43,18 +46,11 @@ class _RecordingAsyncClient:
         url: str,
         *,
         params: dict[str, object] | None = None,
+        json: dict[str, object] | None = None,
         timeout: float,
     ) -> _AsyncOkResponse:
-        self._posts.append((url, params, timeout))
+        self._posts.append((url, json if json is not None else params, timeout))
         return _AsyncOkResponse()
-
-
-class _FakeAsyncioProcess:
-    returncode: int | None = None
-
-    async def wait(self) -> int:
-        await asyncio.Event().wait()
-        return 0
 
 
 def test_megatron_default_lora_adapter_config_uses_model_lora_config(
@@ -76,6 +72,88 @@ def test_megatron_default_lora_adapter_config_uses_model_lora_config(
 
     assert config.r == 8
     assert config.target_modules == {"q_proj", "down_proj"}
+
+
+def test_megatron_reused_step0_identity_adapter_is_normalized(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    lora_path = tmp_path / "checkpoints" / "0000"
+    lora_path.mkdir(parents=True)
+    save_file(
+        {"base_model.model.layers.0.self_attn.q_proj.lora_A.weight": torch.ones(1, 1)},
+        lora_path / "adapter_model.safetensors",
+    )
+    calls: list[tuple[str, bool]] = []
+    monkeypatch.setattr(
+        service_module,
+        "normalize_lora_checkpoint_to_vllm",
+        lambda path, *, allow_unvalidated_arch=False: calls.append(
+            (str(path), allow_unvalidated_arch)
+        ),
+    )
+    service = MegatronService(
+        model_name="test-model",
+        base_model="Qwen/Qwen3-0.6B",
+        config={"allow_unvalidated_arch": True},
+        output_dir=str(tmp_path),
+    )
+
+    service._ensure_identity_lora(str(lora_path), normalize_existing=True)
+
+    assert calls == [(str(lora_path), True)]
+
+
+def test_megatron_in_flight_lora_uses_derived_slot_name(tmp_path: Path) -> None:
+    service = MegatronService(
+        model_name="test-model",
+        base_model="Qwen/Qwen3-0.6B",
+        config={
+            "rollout_weights_mode": "lora",
+            "rollout_weight_update_mode": "in_flight_lora",
+        },
+        output_dir=str(tmp_path),
+    )
+    service._latest_step = 3
+
+    assert service._in_flight_lora_slot == "test-model:active"
+    assert service._initial_served_model_name == "test-model:active"
+
+
+@pytest.mark.asyncio
+async def test_megatron_in_flight_lora_update_uses_derived_slot(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service = MegatronService(
+        model_name="test-model",
+        base_model="Qwen/Qwen3-0.6B",
+        config={
+            "rollout_weights_mode": "lora",
+            "rollout_weight_update_mode": "in_flight_lora",
+        },
+        output_dir=str(tmp_path),
+    )
+    service._vllm_runtime.port = 8123
+    posts: list[tuple[str, dict[str, object] | None, float]] = []
+    monkeypatch.setattr(httpx, "AsyncClient", lambda: _RecordingAsyncClient(posts))
+
+    await service._update_in_flight_adapter("/tmp/art/checkpoints/4", 4)
+
+    assert posts == [
+        (
+            "http://127.0.0.1:8123/art/in_flight_lora_update",
+            {
+                "model_name": "test-model@4",
+                "lora_slot": "test-model:active",
+                "lora_path": "/tmp/art/checkpoints/4",
+                "policy_version": 4,
+            },
+            60.0,
+        )
+    ]
+    assert service._latest_step == 4
+    assert service._loaded_adapter_steps == {4}
 
 
 @pytest.mark.asyncio
@@ -267,26 +345,33 @@ async def test_megatron_worker_uses_active_python_for_torchrun(
         output_dir=str(tmp_path),
     )
     recorded: dict[str, object] = {}
+    real_popen = subprocess.Popen
 
-    async def _fake_create_subprocess_exec(
-        *command: str,
-        cwd: str,
-        env: dict[str, str],
-        stdout,
-        stderr,
-        start_new_session: bool,
-    ) -> _FakeAsyncioProcess:
-        recorded["command"] = list(command)
-        recorded["cwd"] = cwd
-        recorded["env"] = env
-        recorded["stdout"] = stdout
-        recorded["stderr"] = stderr
-        recorded["start_new_session"] = start_new_session
-        return _FakeAsyncioProcess()
+    def _fake_popen(command: Any, *args: Any, **kwargs: Any) -> Any:
+        if not (
+            isinstance(command, list)
+            and len(command) > 2
+            and command[1].endswith("managed_process.py")
+        ):
+            return real_popen(command, *args, **kwargs)
+        recorded["command"] = command
+        recorded["cwd"] = kwargs["cwd"]
+        recorded["env"] = kwargs["env"]
+        recorded["stdout"] = kwargs["stdout"]
+        recorded["stderr"] = kwargs["stderr"]
+        recorded["start_new_session"] = kwargs["start_new_session"]
+        return SimpleNamespace(pid=12345, wait=lambda: 0)
 
     monkeypatch.setattr(
-        "art.megatron.service.asyncio.create_subprocess_exec",
-        _fake_create_subprocess_exec,
+        "art.megatron.service.subprocess.Popen",
+        _fake_popen,
+    )
+    monkeypatch.setattr(
+        service._child_processes,
+        "watch_popen",
+        lambda name, process, *, log_path: recorded.update(
+            {"watch_name": name, "watch_process": process, "watch_log_path": log_path}
+        ),
     )
     monkeypatch.setattr(service, "_install_parent_signal_cleanup", lambda: None)
     monkeypatch.setattr(service, "_allocate_master_port", lambda: 12345)
@@ -310,5 +395,6 @@ async def test_megatron_worker_uses_active_python_for_torchrun(
         "q_proj",
         "down_proj",
     ]
+    assert recorded["watch_name"] == "Megatron worker"
     service._child_processes.close()
     service._megatron_log_file.close()

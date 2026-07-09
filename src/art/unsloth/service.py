@@ -175,6 +175,25 @@ class UnslothService:
         return mode
 
     @property
+    def rollout_weight_update_mode(self) -> Literal["step_lora", "in_flight_lora"]:
+        mode = self.config.get("rollout_weight_update_mode", "step_lora")
+        assert mode in {"step_lora", "in_flight_lora"}
+        return mode
+
+    @property
+    def _in_flight_lora_slot(self) -> str:
+        return f"{self.model_name}:active"
+
+    @property
+    def _initial_served_model_name(self) -> str:
+        if (
+            self.rollout_weights_mode == "lora"
+            and self.rollout_weight_update_mode == "in_flight_lora"
+        ):
+            return self._in_flight_lora_slot
+        return f"{self.model_name}@{self._latest_step}"
+
+    @property
     def _vllm_base_url(self) -> str:
         return self._vllm_runtime.base_url
 
@@ -274,7 +293,7 @@ class UnslothService:
                 host=self._vllm_runtime.host,
                 cuda_visible_devices=self._runtime_cuda_visible_devices(),
                 lora_path=lora_path,
-                served_model_name=f"{self.model_name}@{self._latest_step}",
+                served_model_name=self._initial_served_model_name,
                 rollout_weights_mode=self.rollout_weights_mode,
                 engine_args=self._runtime_engine_args(config),
                 server_args=server_args,
@@ -534,6 +553,34 @@ class UnslothService:
         self._latest_step = step
         self._loaded_adapter_steps.add(step)
 
+    async def _update_in_flight_adapter(self, checkpoint_path: str, step: int) -> None:
+        import httpx
+
+        self._raise_if_child_failed()
+        async with httpx.AsyncClient() as client:
+            response = await client.post(
+                f"{self._vllm_base_url}/art/in_flight_lora_update",
+                json={
+                    "model_name": f"{self.model_name}@{step}",
+                    "lora_slot": self._in_flight_lora_slot,
+                    "lora_path": checkpoint_path,
+                    "policy_version": step,
+                },
+                **self._runtime_request_kwargs(),
+                timeout=60.0,
+            )
+            response.raise_for_status()
+        self._latest_step = step
+        self._loaded_adapter_steps.add(step)
+
+    async def _load_rollout_lora_for_step(
+        self, checkpoint_path: str, step: int
+    ) -> None:
+        if self.rollout_weight_update_mode == "in_flight_lora":
+            await self._update_in_flight_adapter(checkpoint_path, step)
+        else:
+            await self._reload_adapter(checkpoint_path, step)
+
     async def _unload_adapter(self, step: int) -> None:
         import httpx
 
@@ -553,6 +600,8 @@ class UnslothService:
 
     async def prune_loaded_adapters(self, *, retain_steps: set[int]) -> None:
         if self.rollout_weights_mode != "lora" or self._vllm_port == 0:
+            return
+        if self.rollout_weight_update_mode == "in_flight_lora":
             return
         for step in sorted(self._loaded_adapter_steps - retain_steps):
             if step == self._latest_step:
@@ -611,7 +660,10 @@ class UnslothService:
             config=config,
         )
         if self.rollout_weights_mode == "lora":
-            self._loaded_adapter_steps.add(self._latest_step)
+            if self.rollout_weight_update_mode == "in_flight_lora":
+                await self._update_in_flight_adapter(lora_path, self._latest_step)
+            else:
+                self._loaded_adapter_steps.add(self._latest_step)
         try:
             if self.rollout_weights_mode == "merged":
                 _ = self._state
@@ -656,7 +708,7 @@ class UnslothService:
         if self.rollout_weights_mode == "merged":
             await self._set_served_model_name(step)
         else:
-            await self._reload_adapter(checkpoint_dir, step)
+            await self._load_rollout_lora_for_step(checkpoint_dir, step)
         self._latest_step = step
 
     async def train(
@@ -718,7 +770,7 @@ class UnslothService:
                 "[DEDICATED] _train_dedicated: saved checkpoint step=%s, reloading adapter...",
                 new_step,
             )
-            await self._reload_adapter(checkpoint_dir, new_step)
+            await self._load_rollout_lora_for_step(checkpoint_dir, new_step)
         self._latest_step = new_step
         logger.info(
             f"[DEDICATED] _train_dedicated: inference weights updated for step {new_step}"
@@ -756,7 +808,7 @@ class UnslothService:
         await self._wake_runtime()
 
         new_step = int(os.path.basename(checkpoint_dir))
-        await self._reload_adapter(checkpoint_dir, new_step)
+        await self._load_rollout_lora_for_step(checkpoint_dir, new_step)
         self._latest_step = new_step
 
         if verbose:
@@ -818,7 +870,7 @@ class UnslothService:
             await asyncio.sleep(0.5)
             await self._wake_runtime()
             new_step = int(os.path.basename(checkpoint_dir))
-            await self._reload_adapter(checkpoint_dir, new_step)
+            await self._load_rollout_lora_for_step(checkpoint_dir, new_step)
             self._latest_step = new_step
 
             if verbose:

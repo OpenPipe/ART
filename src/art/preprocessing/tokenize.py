@@ -9,6 +9,7 @@ import math
 import random
 from typing import TYPE_CHECKING, Any, Generator, Literal, cast
 
+import numpy as np
 from openai.types.chat.chat_completion import Choice
 import torch
 from transformers.tokenization_utils_base import BatchEncoding, PreTrainedTokenizerBase
@@ -23,8 +24,10 @@ from ..utils.chat_template import (
     merge_chat_template_kwargs,
 )
 from .moe_routing import (
+    MoeRouteArray,
+    MoeRouteDecodeCache,
+    MoeRouteSegments,
     MoeRoutingAlignmentStats,
-    TokenRoute,
     align_choice_routes_to_tokenized_result,
 )
 from .response_masking import response_only_labels, token_ids_for_template_part
@@ -32,6 +35,24 @@ from .vllm_tokens import choice_vllm_token_metadata
 
 ChatTemplateTool = dict[Any, Any] | Callable[..., Any]
 ChatTemplateToolSchemaFormat = Literal["default", "vllm_openai"]
+
+
+def _slice_moe_routes(
+    routes: MoeRouteArray | MoeRouteSegments | None, start: int
+) -> MoeRouteArray | MoeRouteSegments | None:
+    if routes is None:
+        return None
+    if isinstance(routes, MoeRouteSegments):
+        if start <= 0:
+            return routes
+        if start >= routes.shape[0]:
+            return np.empty((0, routes.shape[1], routes.shape[2]), dtype=np.int32)
+        return MoeRouteSegments(
+            segments=tuple(
+                segment for _, segment in routes.iter_slices(start, routes.shape[0])
+            )
+        )
+    return routes[start:]
 
 
 def _chat_template_kwargs(
@@ -160,7 +181,7 @@ class TokenizedResult:
     choice_offsets: list[int]
     extra_logprobs: dict[str, list[float]]
     _tokenizer: "PreTrainedTokenizerBase" = field(repr=False, compare=False)
-    moe_routed_experts: list[TokenRoute | None] | None = None
+    moe_routed_experts: MoeRouteArray | MoeRouteSegments | None = None
     moe_routing_alignment_stats: MoeRoutingAlignmentStats | None = None
     weight: float = 0.0
     prompt_id: int = 0
@@ -188,10 +209,8 @@ class TokenizedResult:
                 key: values[self.prompt_length :]
                 for key, values in self.extra_logprobs.items()
             },
-            moe_routed_experts=(
-                self.moe_routed_experts[self.prompt_length :]
-                if self.moe_routed_experts is not None
-                else None
+            moe_routed_experts=_slice_moe_routes(
+                self.moe_routed_experts, self.prompt_length
             ),
             moe_routing_alignment_stats=self.moe_routing_alignment_stats,
             _tokenizer=self._tokenizer,
@@ -300,6 +319,7 @@ def _tokenized_result_from_vllm_choices(
     choice_token_logprobs: list[list[Any]],
     advantage: float,
     trajectory: Trajectory,
+    route_decode_cache: MoeRouteDecodeCache | None = None,
 ) -> TokenizedResult:
     moe_routed_experts, moe_routing_alignment_stats = (
         align_choice_routes_to_tokenized_result(
@@ -307,6 +327,7 @@ def _tokenized_result_from_vllm_choices(
             choices=choices,
             choice_offsets=choice_offsets,
             choice_token_lengths=choice_token_lengths,
+            route_decode_cache=route_decode_cache,
         )
     )
     return TokenizedResult(
@@ -338,6 +359,7 @@ def tokenize_vllm_trajectory_histories(
     advantage: float,
     allow_training_without_logprobs: bool,
     trajectory: Trajectory,
+    route_decode_cache: MoeRouteDecodeCache | None = None,
 ) -> list[TokenizedResult]:
     results: list[TokenizedResult] = []
     token_ids: list[int] = []
@@ -365,6 +387,7 @@ def tokenize_vllm_trajectory_histories(
                 choice_token_logprobs=choice_token_logprobs,
                 advantage=advantage,
                 trajectory=trajectory,
+                route_decode_cache=route_decode_cache,
             )
         )
         token_ids = []
@@ -434,6 +457,7 @@ def tokenize_trajectory_groups(
     chat_template_kwargs: dict[str, Any] | None = None,
     chat_template_tool_schema_format: ChatTemplateToolSchemaFormat = "default",
 ) -> Generator["TokenizedResult", None, None]:
+    route_decode_cache: MoeRouteDecodeCache = {}
     for group in trajectory_groups:
         if not group:
             continue
@@ -463,6 +487,7 @@ def tokenize_trajectory_groups(
                 advantage=advantage,
                 allow_training_without_logprobs=allow_training_without_logprobs,
                 trajectory=trajectory,
+                route_decode_cache=route_decode_cache,
             )
             weight = 1 / (
                 sum(sum(result.assistant_mask) for result in trajectory_results) + 1e-6

@@ -89,6 +89,86 @@ def _patch_art_runtime_routes() -> None:
             models.base_model_paths[0].name = name
             return JSONResponse(content={"name": name})
 
+        @router.get("/art/metrics")
+        async def art_metrics() -> JSONResponse:
+            from art_vllm_runtime.metrics import get_art_metrics_snapshot
+
+            return JSONResponse(content=get_art_metrics_snapshot())
+
+        @router.post("/art/reset_prefix_cache")
+        async def reset_prefix_cache(raw_request: Request) -> JSONResponse:
+            body = await raw_request.json()
+            success = await engine(raw_request).reset_prefix_cache(
+                reset_running_requests=bool(body.get("reset_running_requests", False)),
+                reset_connector=bool(body.get("reset_connector", True)),
+            )
+            return JSONResponse(content={"success": success})
+
+        @router.post("/art/in_flight_lora_update")
+        async def in_flight_lora_update(raw_request: Request) -> JSONResponse:
+            from vllm.entrypoints.openai.engine.protocol import ErrorResponse
+            from vllm.entrypoints.serve.lora.protocol import LoadLoRAAdapterRequest
+
+            from art_vllm_runtime.policy_spans import register_lora_alias
+
+            body = await raw_request.json()
+            public_model_name = body["model_name"]
+            lora_path = body["lora_path"]
+            policy_version = body.get("policy_version")
+            lora_slot = body.get("lora_slot") or public_model_name.rsplit("@", 1)[0]
+            assert isinstance(public_model_name, str) and public_model_name
+            assert isinstance(lora_path, str) and lora_path
+            assert isinstance(lora_slot, str) and lora_slot
+            if policy_version is not None:
+                policy_version = int(policy_version)
+
+            models = raw_request.app.state.openai_serving_models
+            load_result = await models.load_lora_adapter(
+                LoadLoRAAdapterRequest(
+                    lora_name=lora_slot,
+                    lora_path=lora_path,
+                    load_inplace=lora_slot in models.lora_requests,
+                    is_3d_lora_weight=bool(body.get("is_3d_lora_weight", False)),
+                ),
+                base_model_name=body.get("base_model_name"),
+            )
+            if isinstance(load_result, ErrorResponse):
+                return JSONResponse(
+                    content=load_result.model_dump(mode="python"),
+                    status_code=load_result.error.code,
+                )
+            register_lora_alias(
+                models,
+                public_model_name=public_model_name,
+                lora_slot=lora_slot,
+                policy_version=policy_version,
+            )
+            waiting_cache_salt = None
+            if policy_version is not None:
+                engine_client = engine(raw_request)
+                waiting_cache_salt = await engine_client.engine_core.call_utility_async(
+                    "art_update_waiting_lora_cache_salt",
+                    lora_slot,
+                    policy_version,
+                )
+                from art_vllm_runtime.metrics import record_policy_cache_waiting_update
+
+                record_policy_cache_waiting_update(
+                    updated=int(waiting_cache_salt["updated_waiting_requests"]),
+                    skipped_started=int(
+                        waiting_cache_salt["skipped_started_waiting_requests"]
+                    ),
+                )
+            return JSONResponse(
+                content={
+                    "status": "updated",
+                    "model_name": public_model_name,
+                    "lora_slot": lora_slot,
+                    "policy_version": policy_version,
+                    "waiting_cache_salt": waiting_cache_salt,
+                }
+            )
+
         app.include_router(router)
         return app
 

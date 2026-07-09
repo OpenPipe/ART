@@ -82,6 +82,249 @@ def test_runtime_patch_always_returns_token_ids(
     }
 
 
+def test_runtime_policy_spans_read_final_request_output(artifact_dir: Path) -> None:
+    result = subprocess.run(
+        [
+            "uv",
+            "run",
+            "--project",
+            str(ROOT / "vllm_runtime"),
+            "python",
+            "-c",
+            (
+                "import json, pickle; "
+                "from types import SimpleNamespace; "
+                "from art_vllm_runtime.policy_spans import ("
+                "ART_POLICY_TOKEN_SPANS_FIELD, "
+                "_policy_spans_by_choice_from_final_output"
+                "); "
+                "spans = [{'start_token': 0, 'end_token': 3, "
+                "'policy_version': 4, 'lora_slot': 'm:active', "
+                "'update_seq': 2}]; "
+                "choice = SimpleNamespace(index=1); "
+                "setattr(choice, ART_POLICY_TOKEN_SPANS_FIELD, spans); "
+                "payload = _policy_spans_by_choice_from_final_output("
+                "SimpleNamespace(outputs=[choice])"
+                "); "
+                "print(json.dumps(payload))"
+            ),
+        ],
+        cwd=ROOT,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    (artifact_dir / "policy_spans_stdout.txt").write_text(result.stdout)
+    (artifact_dir / "policy_spans_stderr.txt").write_text(result.stderr)
+    assert json.loads(result.stdout.strip()) == {
+        "1": [
+            {
+                "start_token": 0,
+                "end_token": 3,
+                "policy_version": 4,
+                "lora_slot": "m:active",
+                "update_seq": 2,
+            }
+        ]
+    }
+
+
+def test_runtime_policy_spans_accumulate_engine_core_outputs(
+    artifact_dir: Path,
+) -> None:
+    result = subprocess.run(
+        [
+            "uv",
+            "run",
+            "--project",
+            str(ROOT / "vllm_runtime"),
+            "python",
+            "-c",
+            (
+                "import json, pickle; "
+                "from types import SimpleNamespace; "
+                "from art_vllm_runtime.policy_spans import ("
+                "ART_POLICY_TOKEN_SPANS_FIELD, "
+                "_engine_core_policy_spans_by_request"
+                "); "
+                "spans = [{'start_token': 0, 'end_token': 1, "
+                "'policy_version': 2, 'lora_slot': 'm:active', "
+                "'update_seq': 5}]; "
+                "flat = SimpleNamespace(request_id='flat'); "
+                "nested = SimpleNamespace(request_id='nested'); "
+                "setattr(flat, ART_POLICY_TOKEN_SPANS_FIELD, spans); "
+                "setattr(nested, ART_POLICY_TOKEN_SPANS_FIELD, spans); "
+                "payload = _engine_core_policy_spans_by_request(["
+                "flat, SimpleNamespace(outputs=[nested])"
+                "]); "
+                "print(json.dumps(payload, sort_keys=True))"
+            ),
+        ],
+        cwd=ROOT,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    (artifact_dir / "engine_core_policy_spans_stdout.txt").write_text(result.stdout)
+    (artifact_dir / "engine_core_policy_spans_stderr.txt").write_text(result.stderr)
+    expected = [
+        {
+            "start_token": 0,
+            "end_token": 1,
+            "policy_version": 2,
+            "lora_slot": "m:active",
+            "update_seq": 5,
+        }
+    ]
+    assert json.loads(result.stdout.strip()) == {
+        "flat": expected,
+        "nested": expected,
+    }
+
+
+def test_runtime_policy_spans_declares_model_runner_output_field(
+    artifact_dir: Path,
+) -> None:
+    result = subprocess.run(
+        [
+            "uv",
+            "run",
+            "--project",
+            str(ROOT / "vllm_runtime"),
+            "python",
+            "-c",
+            (
+                "import json, pickle; "
+                "from dataclasses import fields; "
+                "from art_vllm_runtime.policy_spans import ("
+                "ART_POLICY_TOKEN_SPANS_FIELD, patch_policy_token_spans"
+                "); "
+                "patch_policy_token_spans(); "
+                "import vllm.v1.outputs as outputs_mod; "
+                "import vllm.v1.worker.gpu_model_runner as active_runner; "
+                "import vllm.v1.worker.gpu_worker as gpu_worker; "
+                "from vllm.v1.outputs import ModelRunnerOutput; "
+                "spans = {'r': [{'start_token': 0, 'end_token': 2, "
+                "'policy_version': 7, 'lora_slot': 'm:active', "
+                "'update_seq': 3}]}; "
+                "output = ModelRunnerOutput("
+                "req_ids=['r'], req_id_to_index={'r': 0}, "
+                "sampled_token_ids=[[1, 2]], art_policy_token_spans=spans"
+                "); "
+                "roundtrip = pickle.loads(pickle.dumps(output)); "
+                "print(json.dumps({"
+                "'active_async_patched': getattr("
+                "active_runner.AsyncGPUModelRunnerOutput.get_output, "
+                "'__art_policy_spans_patched__', False), "
+                "'active_sample_patched': getattr("
+                "active_runner.GPUModelRunner.sample_tokens, "
+                "'__art_policy_spans_patched__', False), "
+                "'class_shared': active_runner.ModelRunnerOutput is "
+                "ModelRunnerOutput and gpu_worker.ModelRunnerOutput is "
+                "ModelRunnerOutput, "
+                "'empty_shared': active_runner.EMPTY_MODEL_RUNNER_OUTPUT is "
+                "outputs_mod.EMPTY_MODEL_RUNNER_OUTPUT, "
+                "'has_field': ART_POLICY_TOKEN_SPANS_FIELD in "
+                "[field.name for field in fields(ModelRunnerOutput)], "
+                "'spans': getattr(output, ART_POLICY_TOKEN_SPANS_FIELD), "
+                "'roundtrip_spans': getattr(roundtrip, ART_POLICY_TOKEN_SPANS_FIELD)"
+                "}, sort_keys=True))"
+            ),
+        ],
+        cwd=ROOT,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    (artifact_dir / "model_runner_policy_spans_stdout.txt").write_text(result.stdout)
+    (artifact_dir / "model_runner_policy_spans_stderr.txt").write_text(result.stderr)
+    assert json.loads(result.stdout.strip()) == {
+        "active_async_patched": True,
+        "active_sample_patched": True,
+        "class_shared": True,
+        "empty_shared": True,
+        "has_field": True,
+        "spans": {
+            "r": [
+                {
+                    "start_token": 0,
+                    "end_token": 2,
+                    "policy_version": 7,
+                    "lora_slot": "m:active",
+                    "update_seq": 3,
+                }
+            ]
+        },
+        "roundtrip_spans": {
+            "r": [
+                {
+                    "start_token": 0,
+                    "end_token": 2,
+                    "policy_version": 7,
+                    "lora_slot": "m:active",
+                    "update_seq": 3,
+                }
+            ]
+        },
+    }
+
+
+def test_runtime_policy_spans_reads_active_input_batch_lora_mapping(
+    artifact_dir: Path,
+) -> None:
+    result = subprocess.run(
+        [
+            "uv",
+            "run",
+            "--project",
+            str(ROOT / "vllm_runtime"),
+            "python",
+            "-c",
+            (
+                "import json; "
+                "from types import SimpleNamespace; "
+                "from art_vllm_runtime.policy_spans import "
+                "_policy_context_from_runner; "
+                "lora = SimpleNamespace("
+                "lora_int_id=11, lora_name='active@6', "
+                "lora_path='/tmp/checkpoints/0006'"
+                "); "
+                "input_batch = SimpleNamespace("
+                "req_ids=['req'], req_id_to_index={'req': 0}, "
+                "request_lora_mapping=[11], lora_id_to_lora_request={11: lora}"
+                "); "
+                "direct = _policy_context_from_runner("
+                "SimpleNamespace(input_batch=input_batch)"
+                "); "
+                "state = _policy_context_from_runner("
+                "SimpleNamespace("
+                "input_batch=None, "
+                "execute_model_state=SimpleNamespace(input_batch=input_batch)"
+                ")"
+                "); "
+                "print(json.dumps({'direct': direct, 'state': state}, sort_keys=True))"
+            ),
+        ],
+        cwd=ROOT,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    (artifact_dir / "policy_span_input_batch_stdout.txt").write_text(result.stdout)
+    (artifact_dir / "policy_span_input_batch_stderr.txt").write_text(result.stderr)
+    expected = {
+        "req": {
+            "lora_slot": "active@6",
+            "policy_version": 6,
+            "update_seq": 1,
+        }
+    }
+    assert json.loads(result.stdout.strip()) == {
+        "direct": expected,
+        "state": expected,
+    }
+
+
 def test_runtime_general_plugin_loads_full_patch_set() -> None:
     pyproject = (ROOT / "vllm_runtime" / "pyproject.toml").read_text()
     assert 'art = "art_vllm_runtime.patches:apply_vllm_runtime_patches"' in pyproject

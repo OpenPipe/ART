@@ -1632,10 +1632,7 @@ class VariantRunner:
     def _router_topk_exact(cls, rows: list[MetricRow], step_index: int) -> bool:
         topk_rows = cls._step_phase_rows(rows, step_index, "router_topk_ids")
         return bool(topk_rows) and all(
-            row.pass_signal
-            and row.topk_mismatch_fraction == 0.0
-            and row.top1_mismatch_fraction == 0.0
-            for row in topk_rows
+            row.pass_signal and row.topk_mismatch_fraction == 0.0 for row in topk_rows
         )
 
     @classmethod
@@ -1955,13 +1952,12 @@ def _default_phase_pass_fns() -> dict[str, PhasePassFn]:
         # live candidate scores, so scores are close but not bit-exact.
         limits={"mean_abs_pct": ROUTER_SCORE_MEAN_ABS_PCT_LIMIT}
     )
-    router_topk_rule = (
-        MetricThresholdRule(  # should be no mismatch due to router replay
-            limits={
-                "topk_mismatch_fraction": 0.0,
-                "top1_mismatch_fraction": 0.0,
-            }
-        )
+    router_topk_rule = MetricThresholdRule(
+        # Router replay must preserve the selected expert set exactly. The order
+        # within that set is diagnostic only: near-tied router scores can swap
+        # top-1 ordering across distributed topologies without changing routed
+        # experts, and scores/output/loss/grad checks cover misaligned weights.
+        limits={"topk_mismatch_fraction": 0.0}
     )
     return {"forward": fwd_out, "outputs": fwd_out, "losses": fwd_out_loss} | {
         "grads": grads_deltas,

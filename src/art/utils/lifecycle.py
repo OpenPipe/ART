@@ -11,6 +11,19 @@ import sys
 import time
 from typing import Any
 
+PROCESS_SHUTDOWN_TIMEOUT_SECONDS = 20.0
+_PROCESS_SHUTDOWN_LEVEL_STEP = 0.1
+_PROCESS_SHUTDOWN_SWEEP_GRACE_FRACTION = 0.05
+
+
+def process_shutdown_timeout(level: int) -> float:
+    multiplier = max(0.1, 1.0 - _PROCESS_SHUTDOWN_LEVEL_STEP * level)
+    return PROCESS_SHUTDOWN_TIMEOUT_SECONDS * multiplier
+
+
+def process_shutdown_sweep_grace() -> float:
+    return PROCESS_SHUTDOWN_TIMEOUT_SECONDS * _PROCESS_SHUTDOWN_SWEEP_GRACE_FRACTION
+
 
 def managed_process_cmd(
     command: Sequence[str], *, parent_pid: int | None = None
@@ -20,6 +33,10 @@ def managed_process_cmd(
         str(Path(__file__).resolve().with_name("managed_process.py")),
         "--parent-pid",
         str(parent_pid or os.getpid()),
+        "--child-timeout",
+        str(process_shutdown_timeout(2)),
+        "--sweep-grace",
+        str(process_shutdown_sweep_grace()),
         "--",
         *command,
     ]
@@ -35,7 +52,7 @@ def kill_process_group(pid: int, sig: signal.Signals) -> None:
 def terminate_popen_process_group(
     process: subprocess.Popen[Any],
     *,
-    timeout: float = 5.0,
+    timeout: float = process_shutdown_timeout(1),
 ) -> None:
     if process.poll() is None:
         kill_process_group(process.pid, signal.SIGTERM)
@@ -46,7 +63,9 @@ def terminate_popen_process_group(
         process.wait()
 
 
-def terminate_asyncio_process_group(process: Any, *, timeout: float = 5.0) -> None:
+def terminate_asyncio_process_group(
+    process: Any, *, timeout: float = process_shutdown_timeout(1)
+) -> None:
     if process.returncode is None:
         kill_process_group(process.pid, signal.SIGTERM)
     deadline = time.monotonic() + timeout

@@ -35,15 +35,21 @@ async def stream_megatron_job(
     job_path: str,
     process: Any | None = None,
     process_log_path: str | None = None,
-    poll_interval: float = 0.1,
+    poll_interval: float = 0.05,
 ) -> AsyncIterator[dict[str, Any]]:
     num_lines = 0
     try:
         while True:
             await asyncio.sleep(poll_interval)
-            if process is not None and process.returncode is not None:
+            process_returncode = None
+            if process is not None:
+                process_returncode = process.returncode
+                poll = getattr(process, "poll", None)
+                if process_returncode is None and callable(poll):
+                    process_returncode = poll()
+            if process_returncode is not None:
                 raise RuntimeError(
-                    f"Megatron worker exited with code {process.returncode}. "
+                    f"Megatron worker exited with code {process_returncode}. "
                     f"Check logs at {process_log_path or job.log_path}"
                 )
             try:

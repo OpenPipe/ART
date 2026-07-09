@@ -4,6 +4,7 @@ import base64
 import io
 from typing import Any
 
+import numpy as np
 from openai.types.chat.chat_completion import Choice
 from pydantic import BaseModel, ConfigDict, model_validator
 
@@ -31,6 +32,10 @@ _ROUTING_EXPERT_KEYS = {
 }
 
 TokenRoute = list[list[int]]
+MoeRouteArray = np.ndarray
+MoeRouteCacheKey = tuple[int, str, str]
+MoeRouteDecodeCache = dict[MoeRouteCacheKey, list[tuple[str, MoeRouteArray]]]
+MISSING_EXPERT_ID = -1
 
 
 def _has_routing_experts(metadata: dict[str, Any]) -> bool:
@@ -40,22 +45,46 @@ def _has_routing_experts(metadata: dict[str, Any]) -> bool:
 class MoeRoutingAlignmentStats(BaseModel):
     choices_with_routing: int = 0
     routed_tokens: int = 0
-    overlap_conflict_rows: int = 0
-    overlap_conflict_slots: int = 0
-    overlap_compared_slots: int = 0
 
 
 class MoeRoutingPackStats(BaseModel):
     packed_tokens: int = 0
-    prefix_tree_rows: int = 0
-    prefix_tree_conflict_rows: int = 0
-    prefix_tree_conflict_slots: int = 0
-    prefix_tree_compared_slots: int = 0
 
-    def add_alignment(self, stats: MoeRoutingAlignmentStats) -> None:
-        self.prefix_tree_conflict_rows += stats.overlap_conflict_rows
-        self.prefix_tree_conflict_slots += stats.overlap_conflict_slots
-        self.prefix_tree_compared_slots += stats.overlap_compared_slots
+
+class MoeRouteSegments(BaseModel):
+    model_config = ConfigDict(arbitrary_types_allowed=True, frozen=True)
+
+    segments: tuple[MoeRouteArray, ...]
+
+    @property
+    def shape(self) -> tuple[int, int, int]:
+        first = self.segments[0]
+        return (
+            sum(segment.shape[0] for segment in self.segments),
+            first.shape[1],
+            first.shape[2],
+        )
+
+    def iter_slices(
+        self, start: int, end: int
+    ) -> tuple[tuple[int, MoeRouteArray], ...]:
+        slices: list[tuple[int, MoeRouteArray]] = []
+        offset = 0
+        for segment in self.segments:
+            segment_end = offset + segment.shape[0]
+            overlap_start = max(start, offset)
+            overlap_end = min(end, segment_end)
+            if overlap_start < overlap_end:
+                slices.append(
+                    (
+                        overlap_start,
+                        segment[overlap_start - offset : overlap_end - offset],
+                    )
+                )
+            offset = segment_end
+            if offset >= end:
+                break
+        return tuple(slices)
 
 
 class PackedMoeRoutingReplay(BaseModel):
@@ -151,14 +180,19 @@ def align_choice_routes_to_tokenized_result(
     choices: list[Choice],
     choice_offsets: list[int],
     choice_token_lengths: list[int],
-) -> tuple[list[TokenRoute | None] | None, MoeRoutingAlignmentStats]:
+    route_decode_cache: MoeRouteDecodeCache | None = None,
+) -> tuple[MoeRouteArray | MoeRouteSegments | None, MoeRoutingAlignmentStats]:
     if not (len(choices) == len(choice_offsets) == len(choice_token_lengths)):
         raise RuntimeError(
             "Choice routing alignment inputs differ in length: "
             f"choices={len(choices)}, offsets={len(choice_offsets)}, "
             f"lengths={len(choice_token_lengths)}"
         )
-    aligned: list[TokenRoute | None] = [None] * len(token_ids)
+    aligned: MoeRouteArray | None = None
+    route_mask: np.ndarray | None = None
+    route_segments: list[MoeRouteArray] = []
+    route_shape: tuple[int, int] | None = None
+    covered_until = 0
     stats = MoeRoutingAlignmentStats()
     saw_routing = False
     saw_missing = False
@@ -177,6 +211,7 @@ def align_choice_routes_to_tokenized_result(
             metadata,
             prompt_token_count=len(prompt_token_ids),
             completion_token_count=len(completion_token_ids),
+            route_decode_cache=route_decode_cache,
         )
         expected_prompt_ids = token_ids[:offset]
         expected_completion_ids = token_ids[offset : offset + token_length]
@@ -192,61 +227,137 @@ def align_choice_routes_to_tokenized_result(
                 f"offset={offset}, vllm_len={len(completion_token_ids)}, "
                 f"art_len={len(expected_completion_ids)}"
             )
-        if len(prompt_routes) != len(prompt_token_ids):
+        if prompt_routes.shape[0] != len(prompt_token_ids):
             raise RuntimeError(
                 "prompt_routed_experts length does not match prompt_token_ids: "
-                f"{len(prompt_routes)} != {len(prompt_token_ids)}"
+                f"{prompt_routes.shape[0]} != {len(prompt_token_ids)}"
             )
-        if len(completion_routes) not in {
+        if completion_routes.shape[0] not in {
             len(completion_token_ids),
             max(len(completion_token_ids) - 1, 0),
         }:
             raise RuntimeError(
                 "completion_routed_experts length does not match completion_token_ids: "
-                f"{len(completion_routes)} != {len(completion_token_ids)}"
+                f"{completion_routes.shape[0]} != {len(completion_token_ids)}"
             )
-        for position, route in enumerate(prompt_routes):
-            _overlay_route(aligned, position, route, stats)
-        for offset_delta, route in enumerate(completion_routes):
-            _overlay_route(aligned, offset + offset_delta, route, stats)
-        stats.routed_tokens = sum(route is not None for route in aligned)
+        current_shape = _common_route_shape(prompt_routes, completion_routes)
+        if route_shape is None:
+            route_shape = current_shape
+        elif route_shape != current_shape:
+            raise RuntimeError("MoE route arrays must have one rectangular shape")
+        (
+            aligned,
+            route_mask,
+            covered_until,
+        ) = _append_or_overlay_routes(
+            aligned=aligned,
+            route_mask=route_mask,
+            route_segments=route_segments,
+            covered_until=covered_until,
+            token_count=len(token_ids),
+            route_shape=route_shape,
+            start=0,
+            routes=prompt_routes,
+        )
+        (
+            aligned,
+            route_mask,
+            covered_until,
+        ) = _append_or_overlay_routes(
+            aligned=aligned,
+            route_mask=route_mask,
+            route_segments=route_segments,
+            covered_until=covered_until,
+            token_count=len(token_ids),
+            route_shape=route_shape,
+            start=offset,
+            routes=completion_routes,
+        )
+        stats.routed_tokens = (
+            int(route_mask.sum()) if route_mask is not None else covered_until
+        )
     if saw_routing and saw_missing:
         raise RuntimeError("Some trainable choices had MoE routes while others did not")
-    return (aligned if saw_routing else None), stats
+    if not saw_routing:
+        return None, stats
+    if aligned is not None:
+        return aligned, stats
+    if covered_until == len(token_ids):
+        if len(route_segments) == 1:
+            return route_segments[0], stats
+        return MoeRouteSegments(segments=tuple(route_segments)), stats
+    if route_shape is None:
+        raise RuntimeError("MoE routing metadata did not contain any routed tokens")
+    aligned, route_mask = _materialize_route_segments(
+        token_count=len(token_ids),
+        route_shape=route_shape,
+        route_segments=route_segments,
+    )
+    stats.routed_tokens = int(route_mask.sum())
+    return aligned, stats
 
 
-def _overlay_route(
-    aligned: list[TokenRoute | None],
-    position: int,
-    route: TokenRoute,
-    stats: MoeRoutingAlignmentStats,
+def _append_or_overlay_routes(
+    *,
+    aligned: MoeRouteArray | None,
+    route_mask: np.ndarray | None,
+    route_segments: list[MoeRouteArray],
+    covered_until: int,
+    token_count: int,
+    route_shape: tuple[int, int],
+    start: int,
+    routes: MoeRouteArray,
+) -> tuple[MoeRouteArray | None, np.ndarray | None, int]:
+    if routes.shape[0] == 0:
+        return aligned, route_mask, covered_until
+    if aligned is None and start == covered_until:
+        route_segments.append(routes)
+        return aligned, route_mask, covered_until + routes.shape[0]
+    if aligned is None:
+        aligned, route_mask = _materialize_route_segments(
+            token_count=token_count,
+            route_shape=route_shape,
+            route_segments=route_segments,
+        )
+    assert route_mask is not None
+    _overlay_routes(aligned, route_mask, start, routes)
+    return aligned, route_mask, covered_until
+
+
+def _materialize_route_segments(
+    *,
+    token_count: int,
+    route_shape: tuple[int, int],
+    route_segments: list[MoeRouteArray],
+) -> tuple[MoeRouteArray, np.ndarray]:
+    num_layers, topk = route_shape
+    aligned = np.full(
+        (token_count, num_layers, topk),
+        MISSING_EXPERT_ID,
+        dtype=np.int32,
+    )
+    route_mask = np.zeros(token_count, dtype=np.bool_)
+    offset = 0
+    for routes in route_segments:
+        _overlay_routes(aligned, route_mask, offset, routes)
+        offset += routes.shape[0]
+    return aligned, route_mask
+
+
+def _overlay_routes(
+    aligned: MoeRouteArray,
+    route_mask: np.ndarray,
+    start: int,
+    routes: MoeRouteArray,
 ) -> None:
-    existing = aligned[position]
-    if existing is None:
-        aligned[position] = route
+    if routes.shape[0] == 0:
         return
-    compared, conflicts = _count_route_slot_conflicts(existing, route)
-    stats.overlap_compared_slots += compared
-    stats.overlap_conflict_slots += conflicts
-    if conflicts:
-        stats.overlap_conflict_rows += 1
-
-
-def _count_route_slot_conflicts(left: TokenRoute, right: TokenRoute) -> tuple[int, int]:
-    _validate_route_shape(left)
-    _validate_route_shape(right)
-    if len(left) != len(right) or any(
-        len(left_layer) != len(right_layer)
-        for left_layer, right_layer in zip(left, right)
-    ):
-        raise RuntimeError("Cannot compare MoE routes with different shapes")
-    compared = 0
-    conflicts = 0
-    for left_layer, right_layer in zip(left, right):
-        for left_expert, right_expert in zip(left_layer, right_layer):
-            compared += 1
-            conflicts += int(int(left_expert) != int(right_expert))
-    return compared, conflicts
+    end = start + routes.shape[0]
+    existing = route_mask[start:end]
+    fill = ~existing
+    if bool(fill.any()):
+        aligned[start:end][fill] = routes[fill]
+        existing[fill] = True
 
 
 def _normalize_token_ids(raw: Any) -> list[int]:
@@ -257,49 +368,86 @@ def _normalize_token_ids(raw: Any) -> list[int]:
     return [int(token_id) for token_id in raw]
 
 
-def _normalize_routes(raw: Any, *, field_name: str) -> list[TokenRoute]:
+def _normalize_routes(
+    raw: Any,
+    *,
+    field_name: str,
+    route_decode_cache: MoeRouteDecodeCache | None = None,
+) -> MoeRouteArray:
     if isinstance(raw, str):
-        raw = _decode_vllm_routed_experts(raw, field_name=field_name)
+        if route_decode_cache is not None:
+            key = _route_cache_key(raw)
+            for cached_raw, cached_array in route_decode_cache.get(key, []):
+                if cached_raw == raw:
+                    return cached_array
+        array = _decode_vllm_routed_experts(raw, field_name=field_name)
+        if route_decode_cache is not None:
+            route_decode_cache.setdefault(key, []).append((raw, array))
+        return array
     if raw is None:
         raise RuntimeError(f"Missing {field_name}")
     if not isinstance(raw, list):
         raise RuntimeError(f"Expected {field_name} list, got {type(raw)}")
-    routes: list[TokenRoute] = []
-    for token_route in raw:
-        if not isinstance(token_route, list):
-            raise RuntimeError(f"Expected token route list in {field_name}")
-        route: TokenRoute = []
-        for layer_route in token_route:
-            if not isinstance(layer_route, list):
-                raise RuntimeError(f"Expected layer route list in {field_name}")
-            route.append([int(expert_id) for expert_id in layer_route])
-        _validate_route_shape(route)
-        routes.append(route)
-    return routes
+    if len(raw) == 0:
+        return np.empty((0, 0, 0), dtype=np.int32)
+    array = np.asarray(raw, dtype=np.int32)
+    _validate_route_array(array, field_name=field_name)
+    return array
 
 
-def _decode_vllm_routed_experts(raw: str, *, field_name: str) -> list[Any]:
-    import numpy as np
-
+def _decode_vllm_routed_experts(raw: str, *, field_name: str) -> MoeRouteArray:
     try:
-        array = np.load(io.BytesIO(base64.b64decode(raw)), allow_pickle=False)
+        payload = base64.b64decode(raw)
+        stream = io.BytesIO(payload)
+        version = np.lib.format.read_magic(stream)
+        if version == (1, 0):
+            shape, fortran_order, dtype = np.lib.format.read_array_header_1_0(stream)
+        elif version == (2, 0):
+            shape, fortran_order, dtype = np.lib.format.read_array_header_2_0(stream)
+        else:
+            shape, fortran_order, dtype = np.lib.format.read_array_header_2_0(stream)
+        if dtype.hasobject:
+            raise RuntimeError(f"{field_name} cannot contain object dtype routes")
+        array = np.frombuffer(
+            payload,
+            dtype=dtype,
+            count=int(np.prod(shape)),
+            offset=stream.tell(),
+        ).reshape(shape, order="F" if fortran_order else "C")
     except Exception as exc:
         raise RuntimeError(f"Failed to decode {field_name} as base64 .npy") from exc
+    array = np.asarray(array, dtype=np.int32)
+    _validate_route_array(array, field_name=field_name)
+    array.flags.writeable = False
+    return array
+
+
+def _route_cache_key(raw: str) -> MoeRouteCacheKey:
+    return len(raw), raw[:96], raw[-96:]
+
+
+def _validate_route_array(array: MoeRouteArray, *, field_name: str) -> None:
     if array.ndim != 3:
         raise RuntimeError(
             f"Expected {field_name} array with rank 3, got shape {array.shape}"
         )
-    return array.tolist()
+    if array.shape[0] > 0 and (array.shape[1] <= 0 or array.shape[2] <= 0):
+        raise RuntimeError(f"{field_name} must have non-empty layer and topk axes")
 
 
-def _validate_route_shape(route: TokenRoute) -> None:
-    if not route:
-        raise RuntimeError("MoE token route cannot have zero layers")
-    topk = len(route[0])
-    if topk <= 0:
-        raise RuntimeError("MoE token route cannot have zero topk")
-    if any(len(layer_route) != topk for layer_route in route):
-        raise RuntimeError("MoE token route topk must be constant across layers")
+def _common_route_shape(*arrays: MoeRouteArray) -> tuple[int, int]:
+    shape: tuple[int, int] | None = None
+    for array in arrays:
+        if array.shape[0] == 0:
+            continue
+        candidate = (int(array.shape[1]), int(array.shape[2]))
+        if shape is None:
+            shape = candidate
+        elif shape != candidate:
+            raise RuntimeError("MoE route arrays must have one rectangular shape")
+    if shape is None:
+        raise RuntimeError("MoE routing metadata did not contain any routed tokens")
+    return shape
 
 
 def _completion_token_ids(metadata: dict[str, Any]) -> list[int]:
@@ -314,19 +462,22 @@ def _choice_routes(
     *,
     prompt_token_count: int,
     completion_token_count: int,
-) -> tuple[list[TokenRoute], list[TokenRoute]]:
+    route_decode_cache: MoeRouteDecodeCache | None = None,
+) -> tuple[MoeRouteArray, MoeRouteArray]:
     if PROMPT_ROUTED_EXPERTS_KEY in metadata:
         return (
             _normalize_routes(
                 metadata.get(PROMPT_ROUTED_EXPERTS_KEY),
                 field_name=PROMPT_ROUTED_EXPERTS_KEY,
+                route_decode_cache=route_decode_cache,
             ),
-            _completion_routes(metadata),
+            _completion_routes(metadata, route_decode_cache=route_decode_cache),
         )
 
     routes = _normalize_routes(
         metadata.get(ROUTED_EXPERTS_KEY),
         field_name=ROUTED_EXPERTS_KEY,
+        route_decode_cache=route_decode_cache,
     )
     expected_lengths = {
         prompt_token_count + completion_token_count,
@@ -340,19 +491,21 @@ def _choice_routes(
     return routes[:prompt_token_count], routes[prompt_token_count:]
 
 
-def _completion_routes(metadata: dict[str, Any]) -> list[TokenRoute]:
+def _completion_routes(
+    metadata: dict[str, Any],
+    *,
+    route_decode_cache: MoeRouteDecodeCache | None = None,
+) -> MoeRouteArray:
     if COMPLETION_ROUTED_EXPERTS_KEY in metadata:
         return _normalize_routes(
             metadata[COMPLETION_ROUTED_EXPERTS_KEY],
             field_name=COMPLETION_ROUTED_EXPERTS_KEY,
+            route_decode_cache=route_decode_cache,
         )
     if ROUTED_EXPERTS_KEY in metadata:
         return _normalize_routes(
             metadata[ROUTED_EXPERTS_KEY],
             field_name=ROUTED_EXPERTS_KEY,
+            route_decode_cache=route_decode_cache,
         )
     raise RuntimeError("Missing routed completion experts")
-
-
-def count_route_slot_conflicts(left: TokenRoute, right: TokenRoute) -> tuple[int, int]:
-    return _count_route_slot_conflicts(left, right)

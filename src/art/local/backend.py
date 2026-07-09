@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from contextlib import asynccontextmanager
 import gc
 import hashlib
@@ -14,12 +15,20 @@ from types import TracebackType
 from typing import TYPE_CHECKING, Any, AsyncIterator, Iterable, Literal, cast
 import warnings
 
+from art.utils.lifecycle import (
+    PROCESS_SHUTDOWN_TIMEOUT_SECONDS,
+    process_shutdown_timeout,
+)
+
 logger = logging.getLogger(__name__)
+_SERVICE_CLOSE_TIMEOUT_SECONDS = PROCESS_SHUTDOWN_TIMEOUT_SECONDS
+_PROVENANCE_UPDATE_TIMEOUT_SECONDS = process_shutdown_timeout(9)
 
 _AUTO_GPU_HOURLY_PRICING_USD = {
     "H200": 3.0,
 }
 
+import httpx
 import numpy as np
 import polars as pl
 import torch
@@ -37,7 +46,7 @@ from art.utils.output_dirs import (
     get_output_dir_from_model_properties,
     get_step_checkpoint_dir,
 )
-from art.utils.record_provenance import record_provenance
+from art.utils.record_provenance import record_provenance_for_artifact
 from art.utils.s3 import (
     ExcludableOption,
     pull_model_from_s3,
@@ -56,12 +65,18 @@ from .._backend_training import (
 )
 from ..backend import AnyTrainableModel, Backend
 from ..dev.sequence_lengths import max_seq_length_from_model_config
+from ..errors import ArtVllmMetricsTimeoutError
 from ..metrics_taxonomy import (
     TRAIN_GRADIENT_STEPS_KEY,
     build_training_summary_metrics,
     summarize_trajectory_groups,
 )
 from ..model import Model, TrainableModel
+from ..pipeline_tuner import (
+    PACKED_GROUP_COMPLETION_TOKENS_KEY,
+    PACKED_GROUP_PHYSICAL_TOKENS_KEY,
+    PACKED_GROUP_PROMPT_TOKENS_KEY,
+)
 from ..preprocessing.pack import (
     PackedTensors,
     packed_tensors_from_tokenized_results,
@@ -90,6 +105,61 @@ from .checkpoints import (
     delete_checkpoints,
 )
 from .service import ModelService
+
+
+def _prometheus_values(text: str, name: str) -> list[float]:
+    values: list[float] = []
+    for line in text.splitlines():
+        if not line or line.startswith("#"):
+            continue
+        try:
+            sample, raw_value = line.rsplit(None, 1)
+        except ValueError:
+            continue
+        sample_name = sample.split("{", 1)[0]
+        if sample_name != name:
+            continue
+        try:
+            values.append(float(raw_value))
+        except ValueError:
+            continue
+    return values
+
+
+def _prometheus_sum(text: str, name: str) -> float | None:
+    values = _prometheus_values(text, name)
+    if not values:
+        return None
+    return math.fsum(values)
+
+
+def _prometheus_sum_with_label(
+    text: str, name: str, label: str, value: str
+) -> float | None:
+    values: list[float] = []
+    needle = f'{label}="{value}"'
+    for line in text.splitlines():
+        if not line or line.startswith("#"):
+            continue
+        try:
+            sample, raw_value = line.rsplit(None, 1)
+        except ValueError:
+            continue
+        sample_name = sample.split("{", 1)[0]
+        if sample_name != name or needle not in sample:
+            continue
+        try:
+            values.append(float(raw_value))
+        except ValueError:
+            continue
+    return math.fsum(values) if values else None
+
+
+def _prometheus_mean(text: str, name: str) -> float | None:
+    values = _prometheus_values(text, name)
+    if not values:
+        return None
+    return math.fsum(values) / len(values)
 
 
 def _configured_chat_template_value(
@@ -230,6 +300,9 @@ class LocalBackend(Backend):
         self._model_max_sequence_lengths: dict[
             tuple[str, str | None, str | None], int
         ] = {}
+        self._grad_accumulation_sequences_by_service: dict[int, int] = {}
+        self._provenance_update_tasks: set[asyncio.Task[None]] = set()
+        self._vllm_metric_snapshots: dict[str, tuple[float, dict[str, float]]] = {}
         self._image_processors: dict[str, BaseImageProcessor | None] = {}
         self._requires_explicit_packed_sequence_length = False
         self._packed_sequence_length_requires_chunk_alignment = True
@@ -292,6 +365,153 @@ class LocalBackend(Backend):
         if gpu_count <= 0:
             return None
         return per_gpu_cost * gpu_count
+
+    async def collect_train_step_vllm_metrics(self, model: Model) -> dict[str, float]:
+        base_url = model.inference_base_url
+        if not base_url or not base_url.startswith(("http://", "https://")):
+            raise RuntimeError(
+                "ART vLLM metrics require model.inference_base_url to point to the "
+                "dedicated ART vLLM runtime."
+            )
+
+        metrics_root = base_url.rstrip("/")
+        if metrics_root.endswith("/v1"):
+            metrics_root = metrics_root[: -len("/v1")]
+        headers = (
+            {"Authorization": f"Bearer {model.inference_api_key}"}
+            if model.inference_api_key
+            else None
+        )
+        try:
+            async with httpx.AsyncClient(timeout=1.0) as client:
+                response = await client.get(
+                    f"{metrics_root}/art/metrics",
+                    headers=headers,
+                )
+                response.raise_for_status()
+                payload = response.json()
+        except httpx.TimeoutException:
+            raise ArtVllmMetricsTimeoutError(
+                f"Timed out collecting ART vLLM metrics from {metrics_root}."
+            )
+        except (httpx.HTTPError, ValueError) as exc:
+            raise RuntimeError(
+                "ART vLLM metrics require the dedicated ART runtime endpoint at "
+                f"{metrics_root}/art/metrics."
+            ) from exc
+
+        raw_metrics = payload.get("metrics") if isinstance(payload, dict) else None
+        if not isinstance(raw_metrics, dict):
+            raise RuntimeError(
+                "ART vLLM metrics endpoint returned an invalid payload: expected "
+                "a top-level metrics object."
+            )
+
+        def required_metric(name: str) -> float:
+            raw_value = raw_metrics.get(name)
+            if not isinstance(raw_value, (int, float)):
+                raise RuntimeError(
+                    f"ART vLLM metrics endpoint did not provide numeric {name!r}."
+                )
+            return float(raw_value)
+
+        def optional_metric(name: str) -> float | None:
+            raw_value = raw_metrics.get(name)
+            if not isinstance(raw_value, (int, float)):
+                return None
+            return float(raw_value)
+
+        snapshot = {
+            "prompt_tokens_total": required_metric("prompt_tokens_total"),
+            "generation_tokens_total": required_metric("generation_tokens_total"),
+            "prefix_cache_queries_total": required_metric("prefix_cache_queries_total"),
+            "prefix_cache_hits_total": required_metric("prefix_cache_hits_total"),
+            "num_preemptions_total": required_metric("num_preempted_reqs_total"),
+        }
+        metrics: dict[str, float] = {}
+        gauges = {
+            "vllm/num_requests_running": required_metric("num_requests_running"),
+            "vllm/num_requests_waiting": required_metric("num_requests_waiting"),
+            "vllm/num_requests_waiting_capacity": required_metric(
+                "num_requests_waiting_capacity"
+            ),
+            "vllm/kv_cache_usage_perc": required_metric("kv_cache_usage_perc"),
+            "vllm/num_preemptions_total": snapshot["num_preemptions_total"],
+        }
+        for key, value in gauges.items():
+            if value is not None:
+                metrics[key] = value
+        for name in (
+            "max_num_seqs",
+            "max_num_batched_tokens",
+            "max_num_scheduled_tokens",
+            "max_model_len",
+        ):
+            value = optional_metric(name)
+            if value is not None:
+                metrics[f"vllm/{name}"] = value
+
+        now = time.monotonic()
+        previous = self._vllm_metric_snapshots.get(model.name)
+        if previous is not None:
+            previous_time, previous_snapshot = previous
+            elapsed = max(0.0, now - previous_time)
+            if elapsed > 0:
+                prompt_tokens = snapshot["prompt_tokens_total"]
+                previous_prompt_tokens = previous_snapshot.get("prompt_tokens_total")
+                if prompt_tokens is not None and previous_prompt_tokens is not None:
+                    metrics["vllm/prompt_tok_per_s"] = max(
+                        0.0, (prompt_tokens - previous_prompt_tokens) / elapsed
+                    )
+                generation_tokens = snapshot["generation_tokens_total"]
+                previous_generation_tokens = previous_snapshot.get(
+                    "generation_tokens_total"
+                )
+                if (
+                    generation_tokens is not None
+                    and previous_generation_tokens is not None
+                ):
+                    metrics["vllm/completion_tok_per_s"] = max(
+                        0.0, (generation_tokens - previous_generation_tokens) / elapsed
+                    )
+
+            prefix_queries = snapshot["prefix_cache_queries_total"]
+            previous_prefix_queries = previous_snapshot.get(
+                "prefix_cache_queries_total"
+            )
+            prefix_hits = snapshot["prefix_cache_hits_total"]
+            previous_prefix_hits = previous_snapshot.get("prefix_cache_hits_total")
+            if (
+                prefix_queries is not None
+                and previous_prefix_queries is not None
+                and prefix_hits is not None
+                and previous_prefix_hits is not None
+            ):
+                delta_queries = prefix_queries - previous_prefix_queries
+                if delta_queries > 0:
+                    metrics["vllm/prefix_cache_hit_rate"] = max(
+                        0.0,
+                        min(1.0, (prefix_hits - previous_prefix_hits) / delta_queries),
+                    )
+        elif (
+            snapshot["prefix_cache_queries_total"] is not None
+            and snapshot["prefix_cache_hits_total"] is not None
+            and snapshot["prefix_cache_queries_total"] > 0
+        ):
+            metrics["vllm/prefix_cache_hit_rate"] = max(
+                0.0,
+                min(
+                    1.0,
+                    snapshot["prefix_cache_hits_total"]
+                    / snapshot["prefix_cache_queries_total"],
+                ),
+            )
+
+        self._vllm_metric_snapshots[model.name] = (
+            now,
+            {key: value for key, value in snapshot.items() if value is not None},
+        )
+        return metrics
 
     def _resolve_gpu_cost_per_hour_usd(self) -> float | None:
         if self._gpu_cost_per_hour_usd is not None:
@@ -380,14 +600,47 @@ class LocalBackend(Backend):
         If running vLLM in a separate process, this will kill that process and close the communication threads.
         """
         for service in self._services.values():
-            aclose = getattr(service, "aclose", None)
-            if aclose is None:
+            try:
+                aclose = getattr(service, "aclose", None)
+                if aclose is None:
+                    close = getattr(service, "close", None)
+                    if close is not None:
+                        close()
+                else:
+                    await asyncio.wait_for(
+                        aclose(), timeout=_SERVICE_CLOSE_TIMEOUT_SECONDS
+                    )
+            except TimeoutError:
+                logger.warning("Timed out while closing local backend service.")
+            except Exception:
+                logger.exception("Failed to close local backend service.")
+            finally:
+                try:
+                    close_proxy(service)
+                except Exception:
+                    logger.exception("Failed to close local backend service proxy.")
+        self._services.clear()
+        self._adapter_leases.clear()
+        await self._drain_provenance_update_tasks()
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            torch.cuda.ipc_collect()
+
+    def _close(self) -> None:
+        self._cancel_provenance_update_tasks()
+        for service in self._services.values():
+            try:
                 close = getattr(service, "close", None)
                 if close is not None:
                     close()
-            else:
-                await aclose()
-            close_proxy(service)
+            except Exception:
+                logger.exception("Failed to close local backend service.")
+            finally:
+                try:
+                    close_proxy(service)
+                except Exception:
+                    logger.exception("Failed to close local backend service proxy.")
         self._services.clear()
         self._adapter_leases.clear()
         gc.collect()
@@ -395,18 +648,37 @@ class LocalBackend(Backend):
             torch.cuda.empty_cache()
             torch.cuda.ipc_collect()
 
-    def _close(self) -> None:
-        for service in self._services.values():
-            close = getattr(service, "close", None)
-            if close is not None:
-                close()
-            close_proxy(service)
-        self._services.clear()
-        self._adapter_leases.clear()
-        gc.collect()
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-            torch.cuda.ipc_collect()
+    async def _drain_provenance_update_tasks(self) -> None:
+        if not self._provenance_update_tasks:
+            return
+        tasks = set(self._provenance_update_tasks)
+        done, pending = await asyncio.wait(
+            tasks, timeout=_PROVENANCE_UPDATE_TIMEOUT_SECONDS
+        )
+        for task in pending:
+            task.cancel()
+        cancelled_done: set[asyncio.Task[Any]] = set()
+        if pending:
+            cancelled_done, pending = await asyncio.wait(
+                pending, timeout=_PROVENANCE_UPDATE_TIMEOUT_SECONDS
+            )
+            if pending:
+                logger.debug(
+                    "Timed out waiting for cancelled W&B provenance tasks to finish."
+                )
+        for task in done | cancelled_done:
+            try:
+                task.result()
+            except asyncio.CancelledError:
+                pass
+            except Exception:
+                logger.debug("Failed to record W&B provenance", exc_info=True)
+        self._provenance_update_tasks.difference_update(tasks)
+
+    def _cancel_provenance_update_tasks(self) -> None:
+        for task in tuple(self._provenance_update_tasks):
+            task.cancel()
+        self._provenance_update_tasks.clear()
 
     async def register(
         self,
@@ -677,6 +949,7 @@ class LocalBackend(Backend):
             if not tokenized_results:
                 return None
 
+        self._record_packed_group_observations(trajectory_groups, tokenized_results)
         packed_tensors = packed_tensors_from_tokenized_results(
             tokenized_results,
             sequence_length,
@@ -703,6 +976,36 @@ class LocalBackend(Backend):
                 f"Packed {len(tokenized_results)} trajectories into {packed_tensors['tokens'].shape[0]} sequences of length {packed_tensors['tokens'].shape[1]}"
             )
         return packed_tensors
+
+    @staticmethod
+    def _record_packed_group_observations(
+        trajectory_groups: list[TrajectoryGroup], tokenized_results: list[Any]
+    ) -> None:
+        by_trajectory_id: dict[int, list[Any]] = {}
+        for result in tokenized_results:
+            by_trajectory_id.setdefault(id(result.trajectory), []).append(result)
+        for group in trajectory_groups:
+            results: list[Any] = []
+            for trajectory in group.trajectories:
+                results.extend(by_trajectory_id.get(id(trajectory), []))
+            if not results:
+                continue
+            prompt_tokens = 0
+            completion_tokens = 0
+            seen_prompts: set[int] = set()
+            for result in results:
+                completion_tokens += max(
+                    0, len(result.token_ids) - result.prompt_length
+                )
+                if result.prompt_id not in seen_prompts:
+                    prompt_tokens += max(0, result.prompt_length)
+                    seen_prompts.add(result.prompt_id)
+            physical_tokens = prompt_tokens + completion_tokens
+            if physical_tokens <= 0:
+                continue
+            group.metadata[PACKED_GROUP_PHYSICAL_TOKENS_KEY] = physical_tokens
+            group.metadata[PACKED_GROUP_PROMPT_TOKENS_KEY] = prompt_tokens
+            group.metadata[PACKED_GROUP_COMPLETION_TOKENS_KEY] = completion_tokens
 
     async def _get_step(self, model: AnyTrainableModel) -> int:
         return self.__get_step(model)
@@ -824,6 +1127,8 @@ class LocalBackend(Backend):
         num_trajectories_learning_rate_multiplier_power: float = 0.0,
         # Checkpoint behavior
         save_checkpoint: bool = True,
+        optimizer_save_interval: int | None = None,
+        final_training_step: int | None = None,
         # Verbosity
         verbose: bool = False,
     ) -> LocalTrainResult:
@@ -959,6 +1264,8 @@ class LocalBackend(Backend):
             packed_sequence_length=packed_sequence_length,
             num_trajectories_learning_rate_multiplier_power=num_trajectories_learning_rate_multiplier_power,
             kl_ref_adapter_path=resolved_kl_ref_adapter_path,
+            optimizer_save_interval=optimizer_save_interval,
+            final_training_step=final_training_step,
         )
 
         # Collect metrics from training
@@ -988,13 +1295,37 @@ class LocalBackend(Backend):
         # Record provenance on the latest W&B artifact
         wandb_run = model._get_wandb_run()
         if wandb_run is not None:
-            record_provenance(wandb_run, "local-rl")
+            self._record_provenance_nonblocking(wandb_run, "local-rl")
 
         return LocalTrainResult(
             step=step,
             metrics=avg_metrics,
             checkpoint_path=checkpoint_path,
         )
+
+    def _record_provenance_nonblocking(self, wandb_run: Any, provenance: str) -> None:
+        key = (
+            str(wandb_run.entity),
+            str(wandb_run.project),
+            str(wandb_run.name),
+            provenance,
+        )
+
+        async def update() -> None:
+            try:
+                await asyncio.to_thread(
+                    record_provenance_for_artifact,
+                    entity=key[0],
+                    project=key[1],
+                    name=key[2],
+                    provenance=key[3],
+                )
+            except Exception:
+                logger.debug("Failed to record W&B provenance", exc_info=True)
+
+        task = asyncio.create_task(update())
+        self._provenance_update_tasks.add(task)
+        task.add_done_callback(self._provenance_update_tasks.discard)
 
     async def _train_model(
         self,
@@ -1084,12 +1415,28 @@ class LocalBackend(Backend):
             yield {
                 **base_metrics,
                 "data/step_num_groups_trainable": 0.0,
-                "data/step_trainer_tokens": 0.0,
+                "data/step_trainable_assistant_tokens": 0.0,
                 TRAIN_GRADIENT_STEPS_KEY: 0.0,
             }
             return
-        base_metrics["data/step_trainer_tokens"] = float(
+        base_metrics["data/step_trainable_assistant_tokens"] = float(
             packed_tensors["assistant_mask"].sum().item()
+        )
+        packed_sequences, packed_sequence_length = packed_tensors["tokens"].shape
+        packed_train_tokens = int(packed_sequences * packed_sequence_length)
+        non_padding_tokens = int((packed_tensors["group_ids"] != -1).sum().item())
+        base_metrics.update(
+            {
+                "data/step_packed_sequences": float(packed_sequences),
+                "data/step_packed_train_tokens": float(packed_train_tokens),
+                "data/step_non_padding_train_tokens": float(non_padding_tokens),
+                "data/step_padding_ratio": (
+                    float(packed_train_tokens - non_padding_tokens)
+                    / packed_train_tokens
+                    if packed_train_tokens > 0
+                    else 0.0
+                ),
+            }
         )
         disk_packed_tensors = packed_tensors_to_dir(
             packed_tensors, f"{get_model_dir(model=model, art_path=self._path)}/tensors"
@@ -1154,14 +1501,24 @@ class LocalBackend(Backend):
         service: ModelService,
         config: TrainConfig,
     ) -> int:
+        if config.grad_accumulation_sequences is not None:
+            return max(1, int(config.grad_accumulation_sequences))
+
+        service_key = id(service)
+        if service_key in self._grad_accumulation_sequences_by_service:
+            return self._grad_accumulation_sequences_by_service[service_key]
+
         resolver = getattr(
             cast(Any, service),
             "resolve_global_grad_accumulation_sequences",
             None,
         )
         if callable(resolver):
-            return max(1, int(await resolver(config)))
-        return max(1, int(config.grad_accumulation_sequences or 1))
+            resolved = max(1, int(await resolver(config)))
+        else:
+            resolved = 1
+        self._grad_accumulation_sequences_by_service[service_key] = resolved
+        return resolved
 
     # Note: _get_reward_std_dev_learning_rate_multiplier and _log_metrics
     # have been moved to the Model class (frontend)
@@ -1277,7 +1634,7 @@ class LocalBackend(Backend):
             yield {
                 **result,
                 "data/step_num_trajectories": float(total_trajectories),
-                "data/step_trainer_tokens": float(total_trainable_tokens),
+                "data/step_trainable_assistant_tokens": float(total_trainable_tokens),
                 "data/step_num_dropped_trajectories": float(total_dropped_trajectories),
                 TRAIN_GRADIENT_STEPS_KEY: float(len(batches)),
             }

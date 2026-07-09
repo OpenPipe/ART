@@ -15,6 +15,9 @@ art-vllm-runtime-server = "art_vllm_runtime.dedicated_server:main"
 [project.entry-points."vllm.general_plugins"]
 art = "art_vllm_runtime.patches:apply_vllm_runtime_patches"
 
+[project.entry-points."vllm.stat_logger_plugins"]
+art = "art_vllm_runtime.metrics:ArtRuntimeStatLogger"
+
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"

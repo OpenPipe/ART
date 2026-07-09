@@ -28,6 +28,8 @@ class TrainConfig(pydantic.BaseModel):
     kl_penalty_coef: float = 0.0
     kl_penalty_source: Literal["current_learner", "sample"] = "current_learner"
     grad_accumulation_sequences: int | None = pydantic.Field(default=None, ge=1)
+    optimizer_save_interval: int | None = pydantic.Field(default=5, ge=1)
+    final_training_step: int | None = pydantic.Field(default=None, ge=1)
 
 
 class MegatronTopologyConfig(pydantic.BaseModel):

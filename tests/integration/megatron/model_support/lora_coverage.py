@@ -18,8 +18,13 @@ from torch.distributed import (
 from art.megatron import train as megatron_train
 from art.megatron.lora import LoRA
 
+from .fp32_grouped_gemm import (
+    allow_fp32_grouped_gemm_fallback_for_model_support_tests,
+)
 from .oracle_harness import OracleCaseConfig, oracle_topology
 from .oracle_worker import _configure_provider, provider_topology_env
+
+allow_fp32_grouped_gemm_fallback_for_model_support_tests()
 
 _WRAPPED_TARGET_SUFFIXES: dict[str, tuple[str, ...]] = {
     "q_a_proj": (".self_attn.q_a_proj",),

@@ -1,4 +1,4 @@
-from typing import TYPE_CHECKING, Literal
+from typing import TYPE_CHECKING, Any, Literal
 
 from pydantic import BaseModel, ConfigDict
 import torch
@@ -16,6 +16,157 @@ else:
     PackedLossInput = object
 
 
+class LossOffPolicyDiagnostics(BaseModel):
+    model_config = ConfigDict(arbitrary_types_allowed=True)
+
+    ratio_sum: torch.Tensor
+    clipped_count: torch.Tensor
+    token_count: torch.Tensor
+    ratio_histogram: torch.Tensor
+
+    @classmethod
+    def from_tensors(
+        cls,
+        *,
+        prob_ratio: torch.Tensor,
+        advantages: torch.Tensor,
+        assistant_mask: torch.Tensor,
+        weights: torch.Tensor,
+        ppo: bool,
+        epsilon: float,
+        epsilon_high: float,
+    ) -> "LossOffPolicyDiagnostics":
+        train_mask = (assistant_mask > 0) & (weights != 0)
+        ratios = prob_ratio.detach()[train_mask].float()
+        edges = importance_ratio_histogram_edges(device=prob_ratio.device)
+        zero = prob_ratio.new_zeros((), dtype=torch.float32)
+        if ratios.numel() == 0:
+            return cls(
+                ratio_sum=zero,
+                clipped_count=zero,
+                token_count=zero,
+                ratio_histogram=zero.new_zeros(edges.numel() + 1),
+            )
+
+        lower = 1.0 - epsilon
+        upper = 1.0 + epsilon_high
+        if ppo:
+            train_advantages = advantages.detach()[train_mask]
+            clipped = ((train_advantages > 0) & (ratios > upper)) | (
+                (train_advantages < 0) & (ratios < lower)
+            )
+        else:
+            clipped = (ratios < lower) | (ratios > upper)
+
+        return cls(
+            ratio_sum=ratios.sum(),
+            clipped_count=clipped.float().sum(),
+            token_count=ratios.new_tensor(float(ratios.numel())),
+            ratio_histogram=torch.bincount(
+                torch.bucketize(ratios, edges),
+                minlength=edges.numel() + 1,
+            ).to(dtype=torch.float32),
+        )
+
+
+class LossOffPolicyDiagnosticsAccumulator(BaseModel):
+    model_config = ConfigDict(arbitrary_types_allowed=True)
+
+    ratio_sum: torch.Tensor | None = None
+    clipped_count: torch.Tensor | None = None
+    token_count: torch.Tensor | None = None
+    ratio_histogram: torch.Tensor | None = None
+
+    def add(self, diagnostics: LossOffPolicyDiagnostics | None) -> None:
+        if diagnostics is None:
+            return
+        if self.ratio_sum is None:
+            self.ratio_sum = diagnostics.ratio_sum.detach()
+            self.clipped_count = diagnostics.clipped_count.detach()
+            self.token_count = diagnostics.token_count.detach()
+            self.ratio_histogram = diagnostics.ratio_histogram.detach()
+            return
+        assert self.clipped_count is not None
+        assert self.token_count is not None
+        assert self.ratio_histogram is not None
+        self.ratio_sum = self.ratio_sum + diagnostics.ratio_sum.detach()
+        self.clipped_count = self.clipped_count + diagnostics.clipped_count.detach()
+        self.token_count = self.token_count + diagnostics.token_count.detach()
+        self.ratio_histogram = (
+            self.ratio_histogram + diagnostics.ratio_histogram.detach()
+        )
+
+    def to_metrics(self, *, group: Any | None = None) -> dict[str, float]:
+        if (
+            self.ratio_sum is None
+            or self.clipped_count is None
+            or self.token_count is None
+            or self.ratio_histogram is None
+        ):
+            return {}
+
+        vector = torch.cat(
+            [
+                self.ratio_sum.reshape(1),
+                self.clipped_count.reshape(1),
+                self.token_count.reshape(1),
+                self.ratio_histogram,
+            ]
+        )
+        if group is not None:
+            torch.distributed.all_reduce(vector, group=group)  # ty: ignore[possibly-missing-attribute]
+
+        ratio_sum, clipped_count, token_count = vector[:3]
+        denominator = token_count.clamp_min(1.0)
+        histogram = vector[3:]
+        edges = importance_ratio_histogram_edges(device=vector.device)
+        return {
+            "loss/importance_ratio_mean": float((ratio_sum / denominator).item()),
+            "loss/importance_ratio_p95": float(
+                histogram_quantile(histogram, edges, 0.95).item()
+            ),
+            "loss/importance_ratio_p99": float(
+                histogram_quantile(histogram, edges, 0.99).item()
+            ),
+            "loss/clipped_token_fraction": float((clipped_count / denominator).item()),
+        }
+
+
+def importance_ratio_histogram_edges(*, device: torch.device) -> torch.Tensor:
+    return torch.logspace(-4, 4, steps=257, device=device, dtype=torch.float32)
+
+
+def histogram_quantile(
+    histogram: torch.Tensor,
+    edges: torch.Tensor,
+    quantile: float,
+) -> torch.Tensor:
+    total = histogram.sum()
+    if total <= 0:
+        return histogram.new_zeros(())
+    cumulative = torch.cumsum(histogram, dim=0)
+    target = total * quantile
+    bucket = torch.searchsorted(cumulative, target).clamp(max=histogram.numel() - 1)
+    lower_count = torch.where(
+        bucket > 0,
+        cumulative[(bucket - 1).clamp_min(0)],
+        cumulative.new_zeros(()),
+    )
+    bucket_count = histogram[bucket].clamp_min(1.0)
+    lower = torch.where(
+        bucket == 0,
+        edges.new_zeros(()),
+        edges[(bucket - 1).clamp(max=edges.numel() - 1)],
+    )
+    upper = torch.where(
+        bucket >= edges.numel(),
+        edges[-1],
+        edges[bucket.clamp(max=edges.numel() - 1)],
+    )
+    fraction = ((target - lower_count) / bucket_count).clamp(0.0, 1.0)
+    return lower + (upper - lower) * fraction
+
+
 class Loss(BaseModel):
     model_config = ConfigDict(arbitrary_types_allowed=True)
     reduction: Literal["mean", "sum"]
@@ -24,6 +175,7 @@ class Loss(BaseModel):
     policy_loss_sum: torch.Tensor
     probs_corr: torch.Tensor
     kl_policy_ref: torch.Tensor | None = None
+    offpolicy_diagnostics: LossOffPolicyDiagnostics | None = None
 
 
 class AlignedLossInputs(BaseModel):
@@ -139,6 +291,7 @@ def loss_fn(
             prob_ratio = (prob_ratio + sequence_prob_ratio) / 2
         elif importance_sampling_level == "geometric_average":
             prob_ratio = (prob_ratio**0.5) * (sequence_prob_ratio**0.5)
+    raw_prob_ratio = prob_ratio
     ppo = experimental_config.get("ppo", False)
     if ppo:
         epsilon_default = 0.2
@@ -179,6 +332,15 @@ def loss_fn(
         kl_penalty = kl_penalty_coef * (avg_kl - kl_per_token) * assistant_mask
         advantages = advantages + kl_penalty
         kl_policy_ref = avg_kl
+    offpolicy_diagnostics = LossOffPolicyDiagnostics.from_tensors(
+        prob_ratio=raw_prob_ratio,
+        advantages=advantages,
+        assistant_mask=assistant_mask,
+        weights=weights,
+        ppo=ppo,
+        epsilon=epsilon,
+        epsilon_high=epsilon_high,
+    )
     if ppo:
         policy_loss = -torch.min(
             prob_ratio * advantages,
@@ -218,6 +380,7 @@ def loss_fn(
         policy_loss_sum=policy_loss.sum(),
         probs_corr=probs_corr,
         kl_policy_ref=kl_policy_ref,
+        offpolicy_diagnostics=offpolicy_diagnostics,
     )
 
 

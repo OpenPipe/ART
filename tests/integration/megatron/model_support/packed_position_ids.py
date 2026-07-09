@@ -20,6 +20,9 @@ from art.megatron.prefix_tree import parse_prefix_tree_row
 from art.megatron.prefix_tree_state import create_prefix_tree_state
 
 from ..artifacts import GitRepoState, pinned_git_state
+from .fp32_grouped_gemm import (
+    allow_fp32_grouped_gemm_fallback_for_model_support_tests,
+)
 from .oracle_harness import (
     ORACLE_TOPOLOGY,
     TEST_DEFAULT_FLEX_BACKEND,
@@ -36,6 +39,8 @@ from .oracle_worker import (
     provider_topology_env,
 )
 from .prefix_tree_workloads import build_complex_prefix_tree_packed_tensors
+
+allow_fp32_grouped_gemm_fallback_for_model_support_tests()
 
 # Qwen3.5/3.6 hybrid MoE runs show small shape-dependent logit drift between
 # the single packed forward and many shorter reference forwards, even when the

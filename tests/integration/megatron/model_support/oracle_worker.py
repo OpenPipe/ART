@@ -25,6 +25,9 @@ from art.utils.lifecycle import terminate_popen_process_group
 from ..routing_replay.bundle import build_bundle_from_forward_trace_dir
 from ..routing_replay.trace import install_moe_routing_trace_hooks
 from .forward_trace import ForwardTraceCapture
+from .fp32_grouped_gemm import (
+    allow_fp32_grouped_gemm_fallback_for_model_support_tests,
+)
 from .gdn_fp32_reference import install_megatron_qwen35_gdn_fp32_reference
 from .gdn_trace_uids import install_gdn_trace_token_uid_hooks
 from .oracle_harness import (
@@ -331,12 +334,19 @@ def _apply_save_mutation_to_tensor_map(
 def _validate_loaded_state_matches_adapter(
     loaded_state: dict[str, Any],
     adapter_model: dict[str, Any],
+    *,
+    model_chunks: list[Any],
+    model_support_handler: Any,
 ) -> None:
     """Checks loaded model LoRA state exactly matches adapter tensors and keys."""
     import torch
 
-    for key in sorted(adapter_model.keys()):
-        assert torch.equal(loaded_state[key].cpu(), adapter_model[key].cpu()), (
+    expected_state = model_support_handler.canonicalize_loaded_lora_state(
+        adapter_model,
+        model_chunks,
+    )
+    for key in sorted(expected_state.keys()):
+        assert torch.equal(loaded_state[key].cpu(), expected_state[key].cpu()), (
             f"Loaded LoRA state mismatch for key '{key}'"
         )
 
@@ -1271,10 +1281,21 @@ def _mutation_hook(
 
     if pre_optimizer_step_hook is not None:
 
-        def _patched_optimizer_step(optimizer: Any, learning_rate: float):
+        def _patched_optimizer_step(
+            optimizer: Any,
+            learning_rate: float,
+            *,
+            model_support_handler: Any | None = None,
+            model_chunks: Any | None = None,
+        ):
             if pre_optimizer_step_hook is not None:
                 pre_optimizer_step_hook()
-            return original_optimizer_step(optimizer, learning_rate)
+            return original_optimizer_step(
+                optimizer,
+                learning_rate,
+                model_support_handler=model_support_handler,
+                model_chunks=model_chunks,
+            )
 
         megatron_train_module._optimizer_step = _patched_optimizer_step
 
@@ -1333,6 +1354,9 @@ def _worker_run(request: WorkerRunRequest) -> None:
     from art.megatron import train as megatron_train
     from art.megatron.training.weight_offload import WeightOffloadManager
     from art.preprocessing.pack import packed_tensors_from_dir
+
+    if request.case_config.precision == "fp32":
+        allow_fp32_grouped_gemm_fallback_for_model_support_tests()
 
     local_rank = int(os.environ["LOCAL_RANK"])
     torch.cuda.set_device(local_rank)
@@ -1423,13 +1447,21 @@ def _worker_run(request: WorkerRunRequest) -> None:
     # load the shared initial lora into the model and validate we can collect it from the model
     _debug("loading shared initial lora state")
     adapter_model = load_file(str(shared_init_path))
-    megatron_train.load_adapter_into_model(model_chunks, adapter_model, optimizer)
+    megatron_train.load_adapter_into_model(
+        model_chunks,
+        adapter_model,
+        optimizer,
+        model_support_handler=runtime.model_support_handler,
+    )
     _debug("collecting loaded lora state")
     loaded_state = _collect_lora_state(model_chunks)
     if torch.distributed.get_rank() == 0:  # ty: ignore[possibly-missing-attribute]
         _debug("validating loaded lora state")
         _validate_loaded_state_matches_adapter(
-            _require_not_none(loaded_state, "loaded_state"), adapter_model
+            _require_not_none(loaded_state, "loaded_state"),
+            adapter_model,
+            model_chunks=model_chunks,
+            model_support_handler=runtime.model_support_handler,
         )
     _debug("waiting after loaded lora validation")
     torch.distributed.barrier()  # ty: ignore[possibly-missing-attribute]

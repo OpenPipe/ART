@@ -132,6 +132,22 @@ class DefaultDenseHandler:
         del context
         return {}
 
+    def zero_internal_padding_grads(self, model_chunks: Sequence[Any]) -> None:
+        del model_chunks
+        return None
+
+    def zero_internal_padding_params(self, model_chunks: Sequence[Any]) -> None:
+        del model_chunks
+        return None
+
+    def canonicalize_loaded_lora_state(
+        self,
+        state: dict[str, Any],
+        model_chunks: Sequence[Any],
+    ) -> dict[str, Any]:
+        del model_chunks
+        return state
+
     def correctness_precision(self) -> Literal["bf16", "fp32"]:
         return "fp32"
 

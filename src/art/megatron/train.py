@@ -26,12 +26,18 @@ from megatron.core import parallel_state as ps
 from megatron.core.distributed import DistributedDataParallelConfig
 from megatron.core.optimizer import OptimizerConfig, get_megatron_optimizer
 from megatron.core.transformer.module import MegatronModule
-from pydantic import BaseModel, ConfigDict, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 import torch
 from torch._inductor.runtime.cache_dir_utils import cache_dir as inductor_cache_dir
 
 from art import dev, types
-from art.loss import Loss, LossInputs, loss_fn, shift_tensor
+from art.loss import (
+    Loss,
+    LossInputs,
+    LossOffPolicyDiagnosticsAccumulator,
+    loss_fn,
+    shift_tensor,
+)
 from art.megatron.context_parallel.types import (
     DispatchedPackedTensors,
     ParallelTopology,
@@ -43,6 +49,7 @@ from art.megatron.model_support.lora_disk import (
     load_adapter_config,
     load_lora_tensors_for_megatron,
 )
+from art.megatron.optimizer_state import write_optimizer_step_marker
 from art.megatron.provider import (
     ProviderBundle,
     finalize_provider_bundle,
@@ -55,6 +62,7 @@ from art.megatron.routing_replay import (
 from art.megatron.runtime.jobs import (
     DEFAULT_JOBS_DIR,
     DEFAULT_VLLM_WAKE_LOCK_PATH,
+    LORA_READY_EVENT,
     MegatronJob,
     MegatronMergedTrainingJob,
     MegatronSFTTrainingJob,
@@ -142,6 +150,7 @@ class TrainingRuntime(BaseModel):
     model: ModelChunks
     optimizer: Any | None
     optimizer_config: OptimizerConfig
+    optimizer_persistent: bool = True
     transformer_layers_compiled: bool = False
     rank: int
     world_size: int
@@ -178,6 +187,7 @@ class TrainStepResult(BaseModel):
     update_successful: bool
     grad_norm: float
     num_zeros_in_grad: int | None
+    loss_metrics: dict[str, float] = Field(default_factory=dict)
 
 
 def print0(rank: int, *values: Any) -> None:
@@ -434,6 +444,22 @@ def build_training_runtime(
     return runtime
 
 
+def _poll_next_megatron_job_path(
+    runtime: TrainingRuntime,
+    jobs_dir: str,
+) -> str | None:
+    selected_job: list[str | None] = [None]
+    if runtime.rank == 0:
+        os.makedirs(jobs_dir, exist_ok=True)
+        job_names = sorted(
+            job_name for job_name in os.listdir(jobs_dir) if job_name.endswith(".json")
+        )
+        if job_names:
+            selected_job[0] = os.path.join(jobs_dir, job_names[0])
+    torch.distributed.broadcast_object_list(selected_job, src=0)  # type: ignore[possibly-missing-attribute]
+    return selected_job[0]
+
+
 def run_megatron_worker_loop(
     runtime: TrainingRuntime,
     *,
@@ -444,13 +470,9 @@ def run_megatron_worker_loop(
 ) -> None:
     jobs_dir = os.environ.get("ART_MEGATRON_JOBS_DIR", DEFAULT_JOBS_DIR)
     while True:
-        torch.distributed.barrier()  # type: ignore[possibly-missing-attribute]
-        os.makedirs(jobs_dir, exist_ok=True)
-        job_names = sorted(
-            job_name for job_name in os.listdir(jobs_dir) if job_name.endswith(".json")
-        )
-        if not job_names:
-            time.sleep(1)
+        job_path = _poll_next_megatron_job_path(runtime, jobs_dir)
+        if job_path is None:
+            time.sleep(0.05)
             continue
 
         if wait_until_ready is not None:
@@ -458,7 +480,6 @@ def run_megatron_worker_loop(
         if before_job is not None:
             before_job()
 
-        job_path = os.path.join(jobs_dir, job_names[0])
         job = _load_megatron_job(job_path, supports_sft=supports_sft)
         print0(runtime.rank, "Loaded job from", job_path)
         print0(runtime.rank, "Job:", job)
@@ -573,6 +594,7 @@ def run_megatron_rl_job(
                 if cp_lookahead_state is not None and ref_logprobs_by_index is not None
                 else None
             )
+            train_step_started = time.perf_counter()
             step_result = run_training_step(
                 model_chunks=runtime.model,
                 provider=runtime.provider,
@@ -590,31 +612,35 @@ def run_megatron_rl_job(
                 next_step_first_micro=next_step_first_micro,
                 next_step_first_ref_logprobs=next_step_first_ref_logprobs,
             )
+            train_step_s = time.perf_counter() - train_step_started
+            packed_train_tokens = sum(
+                int(micro["tokens"].numel()) for micro in micro_inputs
+            )
             print0(
                 runtime.rank,
                 "Correlation between old and new probabilities:",
                 step_result.probs_corr,
             )
-
-            if runtime.rank == 0:
-                with open(job.log_path, "a+", encoding="utf-8") as log_file:
-                    metrics = {
-                        "loss": step_result.reduced_loss.item(),
-                        "grad_norm": step_result.grad_norm,
-                        "probs_corr": step_result.probs_corr,
-                        TRAIN_GRADIENT_STEPS_KEY: num_steps,
-                    }
-                    if step_result.kl_policy_ref is not None:
-                        metrics["kl_policy_ref"] = step_result.kl_policy_ref
-                    log_msg = json.dumps(metrics)
-                    print("Logging", log_msg)
-                    log_file.write(log_msg + "\n")
+            _log_rl_step_result(
+                runtime.rank,
+                job.log_path,
+                step_result,
+                num_gradient_steps=num_steps,
+                packed_train_tokens=packed_train_tokens,
+                train_step_s=train_step_s,
+            )
 
         _save_lora_and_optimizer(
             runtime,
             adapter_model=adapter_model,
             lora_path=job.lora_path,
             optimizer_state_path=job.optimizer_state_path,
+            step=job.step,
+            optimizer_save_interval=job.config.optimizer_save_interval,
+            final_training_step=job.config.final_training_step,
+            lora_ready_log_path=(
+                None if isinstance(job, MegatronMergedTrainingJob) else job.log_path
+            ),
         )
     finally:
         configure_moe_routing_replay(runtime)
@@ -732,6 +758,9 @@ def run_megatron_sft_job(
                     adapter_model=adapter_model,
                     lora_path=job.lora_path,
                     optimizer_state_path=job.optimizer_state_path,
+                    step=completed_batches,
+                    optimizer_save_interval=1,
+                    final_training_step=job.num_batches,
                 )
                 torch.distributed.barrier()  # type: ignore[possibly-missing-attribute]
 
@@ -756,6 +785,9 @@ def run_megatron_sft_job(
             adapter_model=adapter_model,
             lora_path=job.lora_path,
             optimizer_state_path=job.optimizer_state_path,
+            step=job.num_batches,
+            optimizer_save_interval=1,
+            final_training_step=job.num_batches,
         )
     finally:
         if adapter_model is not None:
@@ -813,12 +845,17 @@ def _load_lora_and_optimizer(
     lora_path: str,
     optimizer_state_path: str,
 ) -> dict[str, torch.Tensor]:
+    persistent_optimizer = runtime.optimizer if runtime.optimizer_persistent else None
     adapter_model = _load_adapter_into_model(
         runtime.model,
         lora_path,
         runtime.rank,
         handler=runtime.model_support_handler,
+        optimizer=persistent_optimizer,
     )
+    if persistent_optimizer is not None:
+        return adapter_model
+
     runtime.optimizer = _build_optimizer(
         runtime.model,
         runtime.optimizer_config,
@@ -853,7 +890,12 @@ def _load_adapter_into_model(
 ) -> dict[str, torch.Tensor]:
     print0(rank, "Loading adapter model from", lora_path)
     adapter_model = load_lora_tensors_for_megatron(lora_path, handler=handler)
-    load_adapter_into_model(model_chunks, adapter_model, optimizer)
+    load_adapter_into_model(
+        model_chunks,
+        adapter_model,
+        optimizer,
+        model_support_handler=handler,
+    )
     return adapter_model
 
 
@@ -863,6 +905,10 @@ def _save_lora_and_optimizer(
     adapter_model: dict[str, torch.Tensor],
     lora_path: str,
     optimizer_state_path: str,
+    step: int,
+    optimizer_save_interval: int | None,
+    final_training_step: int | None = None,
+    lora_ready_log_path: str | None = None,
 ) -> None:
     assert runtime.optimizer is not None
     save_vllm_lora_from_model(
@@ -874,7 +920,79 @@ def _save_lora_and_optimizer(
         rank=runtime.rank,
         world_size=runtime.world_size,
     )
-    _save_optimizer(runtime, optimizer_state_path=optimizer_state_path)
+    if lora_ready_log_path is not None and runtime.rank == 0:
+        _write_job_event(lora_ready_log_path, LORA_READY_EVENT, step=step)
+    if _should_save_optimizer(
+        runtime,
+        step=step,
+        optimizer_state_path=optimizer_state_path,
+        optimizer_save_interval=optimizer_save_interval,
+        final_training_step=final_training_step,
+    ):
+        _save_optimizer(runtime, optimizer_state_path=optimizer_state_path)
+        if torch.distributed.is_initialized():  # ty:ignore[possibly-missing-attribute]
+            torch.distributed.barrier()  # ty:ignore[possibly-missing-attribute]
+        if runtime.rank == 0:
+            write_optimizer_step_marker(optimizer_state_path, step)
+
+
+def _should_save_optimizer(
+    runtime: TrainingRuntime,
+    *,
+    step: int,
+    optimizer_state_path: str,
+    optimizer_save_interval: int | None,
+    final_training_step: int | None,
+) -> bool:
+    if not runtime.optimizer_persistent or optimizer_save_interval in {None, 1}:
+        return True
+    if final_training_step is not None and step >= final_training_step:
+        return True
+    optimizer_shard_path = os.path.join(
+        optimizer_state_path,
+        f"{runtime.rank + 1:02d}-of-{runtime.world_size:02d}.pt",
+    )
+    return (
+        step <= 1
+        or step % optimizer_save_interval == 0
+        or not os.path.exists(optimizer_shard_path)
+    )
+
+
+def _write_job_event(log_path: str, event: str, **payload: int | float | str) -> None:
+    with open(log_path, "a+", encoding="utf-8") as log_file:
+        log_file.write(json.dumps({"event": event, **payload}) + "\n")
+        log_file.flush()
+
+
+def _log_rl_step_result(
+    rank: int,
+    log_path: str,
+    step_result: TrainStepResult,
+    *,
+    num_gradient_steps: int,
+    packed_train_tokens: int,
+    train_step_s: float,
+) -> None:
+    if rank != 0:
+        return
+    with open(log_path, "a+", encoding="utf-8") as log_file:
+        train_packed_tok_per_s = (
+            float(packed_train_tokens) / train_step_s if train_step_s > 0 else 0.0
+        )
+        metrics = {
+            "loss/train": step_result.reduced_loss.item(),
+            "loss/grad_norm": step_result.grad_norm,
+            "loss/probs_corr": step_result.probs_corr,
+            TRAIN_GRADIENT_STEPS_KEY: num_gradient_steps,
+            "throughput/train_packed_tok_per_s": train_packed_tok_per_s,
+        }
+        if step_result.kl_policy_ref is not None:
+            metrics["loss/kl_policy_ref"] = step_result.kl_policy_ref
+        metrics.update(step_result.loss_metrics)
+        log_msg = json.dumps(metrics)
+        print("Logging", log_msg)
+        log_file.write(log_msg + "\n")
 
 
 def _save_optimizer(runtime: TrainingRuntime, *, optimizer_state_path: str) -> None:
@@ -915,12 +1033,16 @@ def load_adapter_into_model(
     model_chunks: ModelChunks,
     adapter_model: dict[str, torch.Tensor],
     optimizer: Any | None = None,
+    *,
+    model_support_handler: Any | None = None,
 ) -> None:
     with torch.no_grad():
         for chunk in model_chunks:
             for module in chunk.modules():
                 if hasattr(module, "load_lora"):
                     module.load_lora(adapter_model)  # type: ignore[attr-defined]
+        if model_support_handler is not None:
+            model_support_handler.zero_internal_padding_params(model_chunks)
 
     if optimizer is None:
         return
@@ -930,12 +1052,19 @@ def load_adapter_into_model(
 def _optimizer_step(
     optimizer: Any,
     learning_rate: float,
+    *,
+    model_support_handler: Any | None = None,
+    model_chunks: ModelChunks | None = None,
 ) -> tuple[bool, float, int | None]:
     for param_group in optimizer.param_groups:
         param_group["lr"] = learning_rate
+    if model_support_handler is not None and model_chunks is not None:
+        model_support_handler.zero_internal_padding_grads(model_chunks)
     update_successful, grad_norm, num_zeros_in_grad = cast(
         tuple[bool, float, int | None], optimizer.step()
     )
+    if model_support_handler is not None and model_chunks is not None:
+        model_support_handler.zero_internal_padding_params(model_chunks)
     optimizer.zero_grad()
     return update_successful, grad_norm, num_zeros_in_grad
 
@@ -1261,7 +1390,12 @@ def _prepare_kl_reference_logprobs(
     finally:
         if loaded_ref_adapter:
             assert runtime.optimizer is not None
-            load_adapter_into_model(runtime.model, adapter_model, runtime.optimizer)
+            load_adapter_into_model(
+                runtime.model,
+                adapter_model,
+                runtime.optimizer,
+                model_support_handler=runtime.model_support_handler,
+            )
 
 
 def run_megatron_sft_step(
@@ -1383,6 +1517,8 @@ def run_megatron_sft_step(
     update_successful, grad_norm, num_zeros_in_grad = _optimizer_step(
         optimizer,
         learning_rate,
+        model_support_handler=model_support_handler,
+        model_chunks=model_chunks,
     )
     global_num_tokens = max(num_tokens.item(), 1.0)
     reduced_loss = _reduce_loss(
@@ -1472,6 +1608,7 @@ def run_training_step(
     probs_corr_total: torch.Tensor | None = None
     kl_policy_ref_sum = 0.0
     kl_policy_ref_count = 0
+    loss_diagnostics = LossOffPolicyDiagnosticsAccumulator()
     new_logprobs_gpu: list[torch.Tensor] = []
 
     def begin_micro(micro_order: int) -> None:
@@ -1567,6 +1704,7 @@ def run_training_step(
         if loss_info.kl_policy_ref is not None:
             kl_policy_ref_sum += float(loss_info.kl_policy_ref.item())
             kl_policy_ref_count += 1
+        loss_diagnostics.add(loss_info.offpolicy_diagnostics)
         detached_micro_loss = micro_loss.detach()
         if raw_loss_sum is None:
             raw_loss_sum = detached_micro_loss
@@ -1595,6 +1733,8 @@ def run_training_step(
     update_successful, grad_norm, num_zeros_in_grad = _optimizer_step(
         optimizer,
         learning_rate,
+        model_support_handler=model_support_handler,
+        model_chunks=model_chunks,
     )
     global_num_tokens = max(token_count.item(), 1.0)
     reduced_loss = _reduce_loss(
@@ -1618,6 +1758,9 @@ def run_training_step(
         update_successful=update_successful,
         grad_norm=grad_norm,
         num_zeros_in_grad=num_zeros_in_grad,
+        loss_metrics=loss_diagnostics.to_metrics(
+            group=ps.get_data_parallel_group(with_context_parallel=True),
+        ),
     )
 
 
@@ -1671,6 +1814,7 @@ def _run_service_loop(runtime: TrainingRuntime) -> None:
         rank=runtime.rank,
         compile_enabled=runtime.transformer_layers_compiled,
     )
+    runtime.optimizer_persistent = not weight_offload.offload_between_jobs
     weight_offload.install()
     wake_lock_path = os.environ.get(
         "ART_MEGATRON_WAKE_LOCK_PATH", DEFAULT_VLLM_WAKE_LOCK_PATH
@@ -1684,7 +1828,8 @@ def _run_service_loop(runtime: TrainingRuntime) -> None:
         weight_offload.before_job()
 
     def after_job() -> None:
-        runtime.optimizer = None
+        if not runtime.optimizer_persistent:
+            runtime.optimizer = None
         weight_offload.after_job()
 
     worker_error = False

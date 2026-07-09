@@ -62,6 +62,7 @@ megatron = [
     "nvidia-modelopt>=0.42.0a0 ; sys_platform != 'darwin'",
     "nvidia-resiliency-ext<0.5 ; sys_platform == 'linux'",
     "transformers==5.12.1",
+    "scipy>=1.17.0",
     "ml-dtypes>=0.5.0 ; python_full_version < '3.13'",
 ]
 
@@ -176,7 +177,7 @@ no-build-isolation-package = ["apex", "transformer-engine", "transformer-engine-
 [tool.uv.extra-build-dependencies]
 apex = ["torch>=2.11.0"]
 deep-ep = ["torch>=2.11.0"]
-megatron-core = ["pybind11"]
+megatron-core = ["pybind11", "setuptools"]
 nv-grouped-gemm = ["torch>=2.11.0"]
 transformer-engine-torch = ["torch>=2.11.0"]
 

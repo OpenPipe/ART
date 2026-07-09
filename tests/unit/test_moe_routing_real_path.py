@@ -1,8 +1,9 @@
 from __future__ import annotations
 
 import math
-from typing import Any, cast
+from typing import Any
 
+import numpy as np
 from openai.types.chat.chat_completion import Choice
 import pytest
 import torch
@@ -41,6 +42,15 @@ def _route(seed: int) -> list[list[int]]:
     return [[seed, seed + 1], [seed + 2, seed + 3]]
 
 
+def _routes_to_list(routes: Any) -> list[Any]:
+    if hasattr(routes, "segments"):
+        output: list[Any] = []
+        for segment in routes.segments:
+            output.extend(segment.tolist())
+        return output
+    return routes.tolist()
+
+
 def test_align_choice_routes_to_tokenized_result_maps_vllm_routes() -> None:
     routes, stats = align_choice_routes_to_tokenized_result(
         token_ids=[10, 11, 20, 21],
@@ -58,7 +68,8 @@ def test_align_choice_routes_to_tokenized_result_maps_vllm_routes() -> None:
         choice_token_lengths=[2],
     )
 
-    assert routes == [_route(0), _route(10), _route(20), _route(30)]
+    assert routes is not None
+    assert _routes_to_list(routes) == [_route(0), _route(10), _route(20), _route(30)]
     assert stats.choices_with_routing == 1
     assert stats.routed_tokens == 4
 
@@ -91,7 +102,8 @@ def test_align_choice_routes_to_tokenized_result_uses_current_vllm_contract() ->
         choice_token_lengths=[2],
     )
 
-    assert routes == [_route(0), _route(10), _route(20), _route(30)]
+    assert routes is not None
+    assert _routes_to_list(routes) == [_route(0), _route(10), _route(20), _route(30)]
     assert stats.choices_with_routing == 1
     assert stats.routed_tokens == 4
 
@@ -142,7 +154,7 @@ def _tokenized(
         choice_offsets=[trainable_start],
         extra_logprobs={},
         _tokenizer=_FakeTokenizer(),  # type: ignore[arg-type]
-        moe_routed_experts=cast(list[list[list[int]] | None], routes),
+        moe_routed_experts=np.asarray(routes, dtype=np.int32),
         prompt_id=prompt_id,
         prompt_length=prompt_length,
         weight=weight,
@@ -185,10 +197,7 @@ def test_pack_carries_routes_through_prefix_tree_splicing() -> None:
         _route(40),
         _route(50),
     ]
-    stats = routing_replay.pack_stats
-    assert stats.prefix_tree_rows == 1
-    assert stats.prefix_tree_conflict_rows == 1
-    assert stats.prefix_tree_conflict_slots == 4
+    assert routing_replay.pack_stats.packed_tokens == 7
 
 
 def test_prefix_tree_pack_keeps_trainable_duplicates_in_leaf_metadata() -> None:

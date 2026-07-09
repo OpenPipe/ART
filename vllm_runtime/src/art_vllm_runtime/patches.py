@@ -16,8 +16,10 @@ def apply_vllm_runtime_patches() -> None:
     from art_vllm_runtime.gemma4_moe_lora_patch import (
         patch_gemma4_moe_lora_support,
     )
+    from art_vllm_runtime.policy_spans import patch_policy_token_spans
 
     patch_transformers_v5_compat()
+    patch_policy_token_spans()
     patch_gemma4_moe_lora_support()
     subclass_chat_completion_request()
     patch_listen_for_disconnect()

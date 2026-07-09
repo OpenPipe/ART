@@ -101,10 +101,6 @@ class RealPathBaseDiagnosticBundle(BaseModel):
     logical_prompt_count: int
     logical_token_count: int
     moe_routing_packed_tokens: int
-    moe_routing_prefix_tree_rows: int
-    moe_routing_prefix_tree_conflict_rows: int
-    moe_routing_prefix_tree_conflict_slots: int
-    moe_routing_prefix_tree_compared_slots: int
     vllm_forward_trace_dir: str | None = None
     megatron_forward_trace_dir: str | None = None
 
@@ -134,8 +130,6 @@ class RealPathTrainInfReport(BaseModel):
     base_logical_prompt_count: int | None = None
     base_logical_token_count: int | None = None
     base_moe_routing_packed_tokens: int | None = None
-    base_moe_routing_prefix_tree_conflict_rows: int | None = None
-    base_moe_routing_prefix_tree_conflict_slots: int | None = None
     adapter_path: str
     adapter_cache_key: str
     adapter_cache_hit: bool
@@ -148,10 +142,6 @@ class RealPathTrainInfReport(BaseModel):
     lora: PairComparison
     lora_topk: TopKComparison
     moe_routing_packed_tokens: int
-    moe_routing_prefix_tree_rows: int
-    moe_routing_prefix_tree_conflict_rows: int
-    moe_routing_prefix_tree_conflict_slots: int
-    moe_routing_prefix_tree_compared_slots: int
     prompt_tree_depth: int = 0
     prompt_tree_branch_count: int = 0
     mean_abs_pct_limit: float
@@ -785,10 +775,6 @@ async def _score_base_real_generation_path(
         logical_prompt_count=len(logical_map.prompts),
         logical_token_count=len(logical_map.tokens),
         moe_routing_packed_tokens=int(stats.packed_tokens),
-        moe_routing_prefix_tree_rows=int(stats.prefix_tree_rows),
-        moe_routing_prefix_tree_conflict_rows=int(stats.prefix_tree_conflict_rows),
-        moe_routing_prefix_tree_conflict_slots=int(stats.prefix_tree_conflict_slots),
-        moe_routing_prefix_tree_compared_slots=int(stats.prefix_tree_compared_slots),
         vllm_forward_trace_dir=(
             str(vllm_forward_trace_dir) if vllm_forward_trace_dir is not None else None
         ),
@@ -1191,7 +1177,11 @@ def _real_path_megatron_worker(
                 handler=runtime.model_support_handler,
                 allow_unvalidated_arch=request.config.allow_unvalidated_arch,
             )
-            megatron_train.load_adapter_into_model(runtime.model, adapter_model)
+            megatron_train.load_adapter_into_model(
+                runtime.model,
+                adapter_model,
+                model_support_handler=runtime.model_support_handler,
+            )
 
         if adapter_only:
             if torch.distributed.get_rank() == 0:  # type: ignore[possibly-missing-attribute]
@@ -1557,16 +1547,6 @@ async def run_real_path_train_inf_mismatch(
                 if base_diagnostic is not None
                 else None
             ),
-            base_moe_routing_prefix_tree_conflict_rows=(
-                base_diagnostic.moe_routing_prefix_tree_conflict_rows
-                if base_diagnostic is not None
-                else None
-            ),
-            base_moe_routing_prefix_tree_conflict_slots=(
-                base_diagnostic.moe_routing_prefix_tree_conflict_slots
-                if base_diagnostic is not None
-                else None
-            ),
             adapter_path=adapter_path,
             adapter_cache_key=adapter.cache_key,
             adapter_cache_hit=adapter.cache_hit,
@@ -1585,14 +1565,6 @@ async def run_real_path_train_inf_mismatch(
             lora=comparison,
             lora_topk=topk_comparison,
             moe_routing_packed_tokens=int(stats.packed_tokens),
-            moe_routing_prefix_tree_rows=int(stats.prefix_tree_rows),
-            moe_routing_prefix_tree_conflict_rows=int(stats.prefix_tree_conflict_rows),
-            moe_routing_prefix_tree_conflict_slots=int(
-                stats.prefix_tree_conflict_slots
-            ),
-            moe_routing_prefix_tree_compared_slots=int(
-                stats.prefix_tree_compared_slots
-            ),
             prompt_tree_depth=prompt_tree_depth,
             prompt_tree_branch_count=prompt_tree_branch_count,
             mean_abs_pct_limit=mean_abs_pct_limit,

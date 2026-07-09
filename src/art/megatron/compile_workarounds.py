@@ -173,6 +173,25 @@ def _install_weighted_bias_swiglu_no_inner_forward_cast_workaround() -> None:
     )
 
 
+def _install_moe_postprocess_workaround(moe_layer: Any) -> None:
+    # Routed token counts change across packed RL steps. Megatron's MoE
+    # postprocess reshapes through dispatcher-owned shape state, which makes
+    # this small boundary recompile repeatedly while the surrounding layer still
+    # benefits from compilation.
+    moe_layer.MoELayer.postprocess = _disable(moe_layer.MoELayer.postprocess)
+
+
+def _install_gemma4_moe_postprocess_workaround() -> None:
+    from megatron.bridge.models.gemma import gemma4_provider
+
+    # Gemma4 overrides MoELayer.postprocess to normalize routed and shared
+    # expert outputs. That override sees dynamic routed-token counts, so it
+    # needs the same small eager boundary as the base MoE postprocess.
+    gemma4_provider.Gemma4MoELayer.postprocess = _disable(
+        gemma4_provider.Gemma4MoELayer.postprocess
+    )
+
+
 def install_torch_compile_workarounds(
     config: CompileWorkaroundConfig | None = None,
 ) -> None:
@@ -211,6 +230,11 @@ def install_torch_compile_workarounds(
         _install_self_attn_linear_proj_reduce_scatter_workaround()
     if "weighted_bias_swiglu_no_inner_forward_cast" in flags:
         _install_weighted_bias_swiglu_no_inner_forward_cast_workaround()
+    if "moe_postprocess" in flags:
+        _install_moe_postprocess_workaround(moe_layer)
+    if "gemma4_moe_postprocess" in flags:
+        _install_gemma4_moe_postprocess_workaround()
+
     deepep_flags = {"deepep_permute_restore", "deepep_dispatch_combine"} & flags
     if deepep_flags:
         deepep_manager = _require_attr(token_dispatcher, "_DeepepManager")

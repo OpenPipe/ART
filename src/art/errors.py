@@ -14,6 +14,14 @@ class ARTError(Exception):
         self.status_code = status_code
 
 
+class LocalServingUnavailableError(RuntimeError):
+    """ART-managed local inference is unavailable and training must stop."""
+
+
+class ArtVllmMetricsTimeoutError(TimeoutError):
+    """ART-managed vLLM metrics did not respond within the scrape timeout."""
+
+
 class ForbiddenBucketCreationError(ARTError):
     """An error raised when the user receives a 403 Forbidden error when trying to create a bucket.
 

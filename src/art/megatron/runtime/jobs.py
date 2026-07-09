@@ -8,6 +8,7 @@ from ...preprocessing.pack import DiskPackedTensors
 DEFAULT_TRAINING_LOG_PATH = "/tmp/megatron_training_log.jsonl"
 DEFAULT_JOBS_DIR = "/tmp/megatron_training_jobs"
 DEFAULT_VLLM_WAKE_LOCK_PATH = "/tmp/megatron_vllm_waking"
+LORA_READY_EVENT = "lora_ready"
 
 
 class MergedWeightTransferInitInfo(BaseModel):
@@ -26,6 +27,7 @@ class MergedWeightTransferSpec(BaseModel):
 
 
 class _MegatronTrainingJobBase(BaseModel):
+    step: int = Field(default=0, ge=0)
     lora_path: str
     allow_unvalidated_arch: bool = False
     optimizer_state_path: str
