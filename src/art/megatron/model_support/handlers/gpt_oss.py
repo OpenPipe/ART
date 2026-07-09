@@ -1217,6 +1217,8 @@ def _trim_gpt_oss_lora_for_vllm(
         if module == "gate_up_proj" and lora == "lora_A":
             return _trim_dim_right(tensor, dim=-1, size=logical_hidden)
         if module == "gate_up_proj" and lora == "lora_B":
+            if int(tensor.shape[0]) == 2 * logical_ffn:
+                return tensor.contiguous()
             return _trim_gpt_oss_gate_up_dim0(
                 tensor,
                 logical=logical_ffn,
@@ -1230,6 +1232,8 @@ def _trim_gpt_oss_lora_for_vllm(
         if key.endswith(".base_layer.lora_A.weight"):
             return _trim_dim_right(tensor, dim=-1, size=logical_hidden)
         if key.endswith(".base_layer.lora_B.weight"):
+            if int(tensor.shape[0]) == 2 * logical_ffn:
+                return tensor.contiguous()
             return _trim_gpt_oss_gate_up_dim0(
                 tensor,
                 logical=logical_ffn,

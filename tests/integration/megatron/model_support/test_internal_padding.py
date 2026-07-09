@@ -253,6 +253,48 @@ def test_gpt_oss_handler_trims_and_restores_external_moe_lora_padding(
         assert torch.count_nonzero(restored_down_b[logical_hidden:]) == 0
 
 
+def test_gpt_oss_handler_preserves_logical_fused_vllm_moe_lora(
+    tmp_path: Path,
+) -> None:
+    logical_hidden = 4
+    logical_ffn = 6
+    rank = 2
+    experts = 3
+    adapter_config = _gpt_oss_adapter_config(
+        tmp_path,
+        hidden=logical_hidden,
+        ffn=logical_ffn,
+    )
+    prefix = "base_model.model.model.layers.0.mlp.experts"
+    tensors = {
+        f"{prefix}.base_layer.lora_A.weight": torch.arange(
+            experts * rank * logical_hidden,
+            dtype=torch.float32,
+        ).reshape(experts * rank, logical_hidden),
+        f"{prefix}.base_layer.lora_B.weight": torch.arange(
+            2 * logical_ffn * experts * rank,
+            dtype=torch.float32,
+        ).reshape(2 * logical_ffn, experts * rank),
+        f"{prefix}.lora_A.weight": torch.arange(
+            experts * rank * logical_ffn,
+            dtype=torch.float32,
+        ).reshape(experts * rank, logical_ffn),
+        f"{prefix}.lora_B.weight": torch.arange(
+            logical_hidden * experts * rank,
+            dtype=torch.float32,
+        ).reshape(logical_hidden, experts * rank),
+    }
+
+    vllm_tensors, _config = GPT_OSS_MOE_HANDLER.to_vllm_lora_tensors(
+        tensors,
+        adapter_config=adapter_config,
+    )
+
+    assert set(vllm_tensors) == set(tensors)
+    for key, tensor in tensors.items():
+        assert torch.equal(vllm_tensors[key], tensor)
+
+
 def test_gemma4_handler_preserves_logical_fused_vllm_moe_lora(
     tmp_path: Path,
 ) -> None:
