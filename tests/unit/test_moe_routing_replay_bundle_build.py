@@ -27,6 +27,9 @@ def _packed(
     return {
         "group_ids": group_ids,
         "parent_ids": parent_ids,
+        "logprobs": torch.full(
+            (num_sequences, sequence_length), float("nan"), dtype=torch.float32
+        ),
         "moe_routing_replay": PackedMoeRoutingReplay(
             expert_indices=expert_indices,
             token_mask=token_mask,
