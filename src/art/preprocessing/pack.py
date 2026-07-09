@@ -23,6 +23,8 @@ from .moe_routing import (
 )
 from .tokenize import TokenizedResult
 
+DEFAULT_MIN_PREFIX_TREE_SHARED_TOKEN_SAVINGS = 256
+
 
 class PackedTensors(TypedDict):
     tokens: torch.Tensor
@@ -186,8 +188,8 @@ class _PrefixTrieBin:
             if edge.edge_id not in self.edge_ids
         )
 
-    def add(self, leaf: _PrefixTrieLeaf) -> None:
-        self.token_count += self.insertion_delta(leaf)
+    def add(self, leaf: _PrefixTrieLeaf, *, token_count: int) -> None:
+        self.token_count = token_count
         self.edge_ids.update(edge.edge_id for edge in leaf.edge_path)
         self.items.append(leaf.item)
 
@@ -201,6 +203,9 @@ def packed_tensors_from_tokenized_results(
     verbosity: Verbosity = 1,
     pack_results: bool = True,
     include_moe_routing: bool = False,
+    min_prefix_tree_shared_token_savings: int = (
+        DEFAULT_MIN_PREFIX_TREE_SHARED_TOKEN_SAVINGS
+    ),
 ) -> PackedTensors:
     return prefix_tree_pack(
         tokenized_results=tokenized_results,
@@ -211,6 +216,7 @@ def packed_tensors_from_tokenized_results(
         verbosity=verbosity,
         pack_results=pack_results,
         include_moe_routing=include_moe_routing,
+        min_prefix_tree_shared_token_savings=min_prefix_tree_shared_token_savings,
     )
 
 
@@ -224,7 +230,12 @@ def prefix_tree_pack(
     verbosity: Verbosity = 1,
     pack_results: bool = True,
     include_moe_routing: bool = False,
+    min_prefix_tree_shared_token_savings: int = (
+        DEFAULT_MIN_PREFIX_TREE_SHARED_TOKEN_SAVINGS
+    ),
 ) -> PackedTensors:
+    if min_prefix_tree_shared_token_savings < 0:
+        raise ValueError("min_prefix_tree_shared_token_savings must be >= 0")
     items: list[_PrefixTreePackItem] = []
     moe_routing_pack_stats = MoeRoutingPackStats()
 
@@ -251,6 +262,7 @@ def prefix_tree_pack(
         items,
         seq_len=seq_len,
         pack_results=pack_results,
+        min_shared_token_savings=min_prefix_tree_shared_token_savings,
     )
     if not rows:
         raise RuntimeError("No tokenized results were packable")
@@ -260,6 +272,7 @@ def prefix_tree_pack(
             row,
             seq_len=seq_len,
             pack_results=pack_results,
+            min_shared_token_savings=min_prefix_tree_shared_token_savings,
         )
         for row in rows
     ]
@@ -390,6 +403,7 @@ def _prefix_tree_pack_rows(
     *,
     seq_len: int,
     pack_results: bool,
+    min_shared_token_savings: int,
 ) -> list[list[_PrefixTreePackItem]]:
     if not items:
         return []
@@ -426,16 +440,29 @@ def _prefix_tree_pack_rows(
         best_bin: _PrefixTrieBin | None = None
         best_remaining = seq_len + 1
         for candidate in bins:
-            new_count = candidate.token_count + candidate.insertion_delta(leaf)
-            if new_count <= seq_len:
-                remaining = seq_len - new_count
+            if candidate.token_count + candidate.insertion_delta(leaf) > seq_len:
+                continue
+            exact_count = _prefix_tree_row_token_count(
+                (*candidate.items, leaf.item),
+                pack_results=pack_results,
+                min_shared_token_savings=min_shared_token_savings,
+            )
+            if exact_count <= seq_len:
+                remaining = seq_len - exact_count
                 if remaining < best_remaining:
                     best_bin = candidate
                     best_remaining = remaining
         if best_bin is None:
             best_bin = _PrefixTrieBin()
             bins.append(best_bin)
-        best_bin.add(leaf)
+        best_bin.add(
+            leaf,
+            token_count=_prefix_tree_row_token_count(
+                (*best_bin.items, leaf.item),
+                pack_results=pack_results,
+                min_shared_token_savings=min_shared_token_savings,
+            ),
+        )
     return [packed_bin.items for packed_bin in bins]
 
 
@@ -533,6 +560,7 @@ def _prefix_tree_row_plan(
     *,
     seq_len: int,
     pack_results: bool,
+    min_shared_token_savings: int,
 ) -> _PrefixTreeRowPlan:
     segments = _prefix_tree_pack_segments(
         (item.token_ids for item in row),
@@ -540,10 +568,30 @@ def _prefix_tree_row_plan(
         shareable_lengths=(
             item.shareable_length if pack_results else 0 for item in row
         ),
+        min_shared_token_savings=min_shared_token_savings,
     )
     return _PrefixTreeRowPlan(
         segments=segments,
         length=min(sum(segment.length for segment in segments), seq_len),
+    )
+
+
+def _prefix_tree_row_token_count(
+    row: tuple[_PrefixTreePackItem, ...],
+    *,
+    pack_results: bool,
+    min_shared_token_savings: int,
+) -> int:
+    return sum(
+        segment.length
+        for segment in _prefix_tree_pack_segments(
+            (item.token_ids for item in row),
+            max_depth=max(len(item.token_ids) for item in row) if pack_results else 0,
+            shareable_lengths=(
+                item.shareable_length if pack_results else 0 for item in row
+            ),
+            min_shared_token_savings=min_shared_token_savings,
+        )
     )
 
 
@@ -608,6 +656,7 @@ def _pack_prefix_tree_row(
     seq_len: int,
     pack_results: bool,
     include_moe_routing: bool,
+    min_shared_token_savings: int = DEFAULT_MIN_PREFIX_TREE_SHARED_TOKEN_SAVINGS,
 ) -> _PackedPrefixTreeRow:
     if not row:
         empty_i64 = np.empty((0,), dtype=np.int64)
@@ -624,7 +673,12 @@ def _pack_prefix_tree_row(
             pixel_values=None,
             image_grid_thw=None,
         )
-    plan = _prefix_tree_row_plan(row, seq_len=seq_len, pack_results=pack_results)
+    plan = _prefix_tree_row_plan(
+        row,
+        seq_len=seq_len,
+        pack_results=pack_results,
+        min_shared_token_savings=min_shared_token_savings,
+    )
     length = plan.length
     token_ids = np.empty(length, dtype=np.int64)
     group_ids = np.empty(length, dtype=np.int64)

@@ -183,6 +183,7 @@ def test_pack_carries_routes_through_prefix_tree_splicing() -> None:
         pad_token_id=0,
         truncate_long_results=False,
         include_moe_routing=True,
+        min_prefix_tree_shared_token_savings=0,
     )
 
     assert packed["tokens"].tolist()[0][:7] == [10, 11, 20, 21, 11, 22, 23]
@@ -229,6 +230,7 @@ def test_prefix_tree_pack_keeps_trainable_duplicates_in_leaf_metadata() -> None:
         seq_len=8,
         pad_token_id=0,
         truncate_long_results=False,
+        min_prefix_tree_shared_token_savings=0,
     )
 
     assert packed["tokens"].tolist()[0][:7] == [10, 11, 20, 21, 11, 20, 22]
@@ -286,6 +288,7 @@ def test_prefix_tree_pack_public_api_emits_nested_metadata() -> None:
         seq_len=16,
         pad_token_id=0,
         truncate_long_results=False,
+        min_prefix_tree_shared_token_savings=0,
     )
     tree = parse_prefix_tree_row(
         group_ids=packed["group_ids"][0],
@@ -334,6 +337,7 @@ def test_prefix_tree_pack_best_fit_combines_independent_small_groups() -> None:
         seq_len=12,
         pad_token_id=0,
         truncate_long_results=False,
+        min_prefix_tree_shared_token_savings=0,
     )
 
     assert packed["tokens"].shape[0] == 2
