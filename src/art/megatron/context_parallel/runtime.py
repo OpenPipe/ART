@@ -110,6 +110,79 @@ def _planning_bundle_cache_key(
     )
 
 
+def _get_or_build_planning_bundle(
+    *,
+    group_ids: torch.Tensor,
+    parent_ids: torch.Tensor,
+    topology: ParallelTopology,
+    config: ContextParallelConfig,
+    original_seq_len: int,
+    build_gdn_execution_spec: bool,
+) -> tuple[str, _PlanningBundle, torch.Tensor, torch.Tensor]:
+    group_ids_cpu = _planning_metadata_cpu(group_ids)
+    parent_ids_cpu = _planning_metadata_cpu(parent_ids)
+    planning_key = _planning_bundle_cache_key(
+        group_ids=group_ids_cpu,
+        parent_ids=parent_ids_cpu,
+        topology=topology,
+        config=config,
+        original_seq_len=original_seq_len,
+        build_gdn_execution_spec=build_gdn_execution_spec,
+    )
+    bundle = _PLANNING_BUNDLE_CACHE.get(planning_key)
+    if bundle is not None:
+        return planning_key, bundle, group_ids_cpu, parent_ids_cpu
+
+    spec = build_prefix_tree_attention_spec(
+        group_ids=group_ids_cpu,
+        parent_ids=parent_ids_cpu,
+    )
+    gdn_execution_spec = None
+    if build_gdn_execution_spec:
+        from art.megatron.gdn.gdn_prefix_tree import parse_gdn_prefix_tree_segments
+
+        gdn_execution_spec = parse_gdn_prefix_tree_segments(
+            group_ids_cpu,
+            parent_ids_cpu,
+        )
+    bundle = _PlanningBundle(
+        spec=spec,
+        rank_plans=get_or_build_runtime_plan(
+            spec,
+            topology=topology,
+            config=config,
+            original_seq_len=original_seq_len,
+        ),
+        gdn_execution_spec=gdn_execution_spec,
+    )
+    _cache_put(_PLANNING_BUNDLE_CACHE, planning_key, bundle)
+    return planning_key, bundle, group_ids_cpu, parent_ids_cpu
+
+
+def context_parallel_rank_token_counts(
+    *,
+    group_ids: torch.Tensor,
+    parent_ids: torch.Tensor,
+    topology: ParallelTopology,
+    config: ContextParallelConfig,
+    original_seq_len: int,
+    build_gdn_execution_spec: bool,
+) -> tuple[int, ...]:
+    """Return every CP rank's model rows using CPU-only packed metadata."""
+    _key, bundle, _group_ids_cpu, _parent_ids_cpu = _get_or_build_planning_bundle(
+        group_ids=group_ids,
+        parent_ids=parent_ids,
+        topology=topology,
+        config=config,
+        original_seq_len=original_seq_len,
+        build_gdn_execution_spec=build_gdn_execution_spec,
+    )
+    return tuple(
+        sum(int(length) for length in rank_plan.local_valid_lengths)
+        for rank_plan in bundle.rank_plans
+    )
+
+
 def _normalized_chunk_size(
     *,
     valid_tokens: int,
@@ -1597,45 +1670,15 @@ def prepare_megatron_context_parallel_state(
             "ART context parallel currently supports exactly one packed sequence at a time, "
             f"got batch={int(micro['group_ids'].shape[0])}."
         )
-    group_ids_cpu = _planning_metadata_cpu(micro["group_ids"])
-    parent_ids_cpu = _planning_metadata_cpu(micro["parent_ids"])
     input_pos_cpu = _planning_metadata_cpu(micro["input_pos"])
-    planning_key = _planning_bundle_cache_key(
-        group_ids=group_ids_cpu,
-        parent_ids=parent_ids_cpu,
+    planning_key, bundle, group_ids_cpu, parent_ids_cpu = _get_or_build_planning_bundle(
+        group_ids=micro["group_ids"],
+        parent_ids=micro["parent_ids"],
         topology=topology,
         config=config,
         original_seq_len=int(micro["tokens"].shape[1]),
         build_gdn_execution_spec=build_gdn_execution_spec,
     )
-    bundle = _PLANNING_BUNDLE_CACHE.get(planning_key)
-    if bundle is None:
-        spec = build_prefix_tree_attention_spec(
-            group_ids=group_ids_cpu,
-            parent_ids=parent_ids_cpu,
-        )
-        runtime_plan = get_or_build_runtime_plan(
-            spec,
-            topology=topology,
-            config=config,
-            original_seq_len=int(micro["tokens"].shape[1]),
-        )
-        gdn_execution_spec = None
-        if build_gdn_execution_spec:
-            from art.megatron.gdn.gdn_prefix_tree import (
-                parse_gdn_prefix_tree_segments,
-            )
-
-            gdn_execution_spec = parse_gdn_prefix_tree_segments(
-                group_ids_cpu,
-                parent_ids_cpu,
-            )
-        bundle = _PlanningBundle(
-            spec=spec,
-            rank_plans=runtime_plan,
-            gdn_execution_spec=gdn_execution_spec,
-        )
-        _cache_put(_PLANNING_BUNDLE_CACHE, planning_key, bundle)
     rank_plan = bundle.rank_plans[int(cp_rank)]
     gdn_execution_plan = None
     if build_gdn_execution_spec:

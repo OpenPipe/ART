@@ -1499,6 +1499,25 @@ def _worker_run(request: WorkerRunRequest) -> None:
         enabled=True,
     )
     install_moe_routing_trace_hooks(lambda: runtime.moe_routing_replay_controller)
+    from megatron.core import parallel_state as ps
+
+    topology = megatron_train._infer_parallel_topology(model_chunks)
+    if ps.get_expert_model_parallel_world_size() > 1:
+        sequence_length = (
+            int(packed_tensors["tokens"].shape[1])
+            if request.objective == "rl"
+            else max(
+                int(inputs["input_ids"].numel())
+                for inputs in _require_not_none(
+                    sft_trajectory_tensors, "sft_trajectory_tensors"
+                )
+            )
+        )
+        megatron_train._ensure_hybridep_capacity(
+            runtime,
+            packed_sequence_length=sequence_length,
+            context_parallel_size=topology.cp,
+        )
 
     def _capture_lora_grads() -> None:
         nonlocal captured_grads
@@ -1521,6 +1540,29 @@ def _worker_run(request: WorkerRunRequest) -> None:
 
         _debug("starting training loop")
         for step_index in range(request.case_config.num_steps):
+            hybridep_token_counts = None
+            if ps.get_expert_model_parallel_world_size() > 1:
+                if request.objective == "rl":
+                    hybridep_token_counts = megatron_train.build_rl_hybridep_token_counts(
+                        packed_tensors=packed_tensors,
+                        step_index=step_index,
+                        num_sequences=request.packed_tensors.num_sequences,
+                        global_grad_accumulation_sequences=global_grad_accumulation_sequences,
+                        topology=topology,
+                        provider=runtime.provider,
+                        model_support_handler=runtime.model_support_handler,
+                    )
+                else:
+                    hybridep_token_counts = megatron_train.build_sft_hybridep_token_counts(
+                        trajectory_tensors=_require_not_none(
+                            sft_trajectory_tensors, "sft_trajectory_tensors"
+                        ),
+                        step_index=step_index,
+                        global_grad_accumulation_sequences=global_grad_accumulation_sequences,
+                        topology=topology,
+                        provider=runtime.provider,
+                        model_support_handler=runtime.model_support_handler,
+                    )
             micro_sample_indices = megatron_train.build_micro_sample_indices(
                 step_index=step_index,
                 num_sequences=request.packed_tensors.num_sequences,
@@ -1548,6 +1590,7 @@ def _worker_run(request: WorkerRunRequest) -> None:
                     step_index=step_index,
                     sample_index=micro_sample_indices,
                     moe_routing_replay_controller=runtime.moe_routing_replay_controller,
+                    hybridep_token_counts=hybridep_token_counts,
                 )
             else:
                 micro_inputs = megatron_train.select_sft_micro_inputs(
@@ -1566,6 +1609,7 @@ def _worker_run(request: WorkerRunRequest) -> None:
                     sample_index=micro_sample_indices,
                     global_grad_accumulation_sequences=global_grad_accumulation_sequences,
                     moe_routing_replay_controller=runtime.moe_routing_replay_controller,
+                    hybridep_token_counts=hybridep_token_counts,
                 )
             _debug(f"finished step_index={step_index}")
             print(f"finished step_index={step_index}", flush=True)

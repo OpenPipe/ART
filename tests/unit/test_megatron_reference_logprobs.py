@@ -44,6 +44,7 @@ def test_precompute_reference_logprobs_preserves_sample_steps(monkeypatch) -> No
         step_index: int,
         sample_index: int,
         global_grad_accumulation_sequences: int,
+        hybridep_token_count: int | None,
     ) -> torch.Tensor:
         del (
             model_chunks,
@@ -51,6 +52,7 @@ def test_precompute_reference_logprobs_preserves_sample_steps(monkeypatch) -> No
             model_support_handler,
             inputs,
             moe_routing_replay_controller,
+            hybridep_token_count,
         )
         calls.append((sample_index, step_index, global_grad_accumulation_sequences))
         return torch.tensor([[float(sample_index)]])

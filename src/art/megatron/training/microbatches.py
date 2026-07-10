@@ -8,7 +8,10 @@ from pydantic import BaseModel, ConfigDict
 import torch
 
 from art.loss import LossInputs, shift_tensor
-from art.megatron.context_parallel.runtime import prepare_cp_micro
+from art.megatron.context_parallel.runtime import (
+    context_parallel_rank_token_counts,
+    prepare_cp_micro,
+)
 from art.megatron.context_parallel.types import (
     ContextParallelConfig,
     CpBlockMaskVariant,
@@ -148,6 +151,21 @@ def build_micro_sample_indices(
     global_grad_accumulation_sequences: int | None,
 ) -> list[int | None]:
     dp_rank = ps.get_data_parallel_rank()
+    return [
+        indices[dp_rank]
+        for indices in build_micro_sample_indices_by_dp_rank(
+            step_index=step_index,
+            num_sequences=num_sequences,
+            global_grad_accumulation_sequences=global_grad_accumulation_sequences,
+        )
+    ]
+
+
+def build_micro_sample_indices_by_dp_rank(
+    step_index: int,
+    num_sequences: int,
+    global_grad_accumulation_sequences: int | None,
+) -> list[list[int | None]]:
     resolved_global_grad_accumulation_sequences = (
         resolve_global_grad_accumulation_sequences(
             global_grad_accumulation_sequences=global_grad_accumulation_sequences
@@ -165,8 +183,97 @@ def build_micro_sample_indices(
             global_sample_index if global_sample_index < num_sequences else None
         )
     return [
-        global_step_indices[offset * dp_world_size + dp_rank]
+        global_step_indices[offset * dp_world_size : (offset + 1) * dp_world_size]
         for offset in range(local_grad_accumulation_sequences)
+    ]
+
+
+def build_rl_hybridep_token_counts(
+    *,
+    packed_tensors: PackedTensors,
+    step_index: int,
+    num_sequences: int,
+    global_grad_accumulation_sequences: int | None,
+    topology: ParallelTopology,
+    provider: Any,
+    model_support_handler: Any,
+) -> list[int]:
+    sample_rows = build_micro_sample_indices_by_dp_rank(
+        step_index=step_index,
+        num_sequences=num_sequences,
+        global_grad_accumulation_sequences=global_grad_accumulation_sequences,
+    )
+    sequence_length = int(packed_tensors["tokens"].shape[1])
+    if int(topology.cp) <= 1:
+        return [sequence_length for _ in sample_rows]
+
+    config = _context_parallel_config_for_provider(
+        provider, torch.device("cuda", torch.cuda.current_device())
+    )
+    build_gdn = bool(getattr(model_support_handler, "build_gdn_execution_spec", False))
+
+    def rank_counts(sample_index: int | None) -> tuple[int, ...]:
+        index = 0 if sample_index is None else sample_index
+        return context_parallel_rank_token_counts(
+            group_ids=packed_tensors["group_ids"][index : index + 1],
+            parent_ids=packed_tensors["parent_ids"][index : index + 1],
+            topology=topology,
+            config=config,
+            original_seq_len=sequence_length,
+            build_gdn_execution_spec=build_gdn,
+        )
+
+    return [
+        max(count for sample_index in indices for count in rank_counts(sample_index))
+        for indices in sample_rows
+    ]
+
+
+def build_sft_hybridep_token_counts(
+    *,
+    trajectory_tensors: list[dict[str, torch.Tensor]],
+    step_index: int,
+    global_grad_accumulation_sequences: int | None,
+    topology: ParallelTopology,
+    provider: Any,
+    model_support_handler: Any,
+) -> list[int]:
+    sample_rows = build_micro_sample_indices_by_dp_rank(
+        step_index=step_index,
+        num_sequences=len(trajectory_tensors),
+        global_grad_accumulation_sequences=global_grad_accumulation_sequences,
+    )
+
+    def sample(sample_index: int | None) -> dict[str, torch.Tensor]:
+        return trajectory_tensors[0 if sample_index is None else sample_index]
+
+    if int(topology.cp) <= 1:
+        return [
+            max(int(sample(index)["input_ids"].numel()) for index in indices)
+            for indices in sample_rows
+        ]
+
+    config = _context_parallel_config_for_provider(
+        provider, torch.device("cuda", torch.cuda.current_device())
+    )
+    build_gdn = bool(getattr(model_support_handler, "build_gdn_execution_spec", False))
+
+    def rank_counts(sample_index: int | None) -> tuple[int, ...]:
+        sparse = _sft_inputs_to_sparse_packed_tensors(
+            sample(sample_index), device=torch.device("cpu")
+        )
+        return context_parallel_rank_token_counts(
+            group_ids=sparse["group_ids"],
+            parent_ids=sparse["parent_ids"],
+            topology=topology,
+            config=config,
+            original_seq_len=int(sparse["tokens"].shape[1]),
+            build_gdn_execution_spec=build_gdn,
+        )
+
+    return [
+        max(count for sample_index in indices for count in rank_counts(sample_index))
+        for indices in sample_rows
     ]
 
 

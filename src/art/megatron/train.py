@@ -101,6 +101,8 @@ from art.megatron.training.microbatches import (
     _zero_contribution_inputs,
     _zero_contribution_sft_inputs,
     build_micro_sample_indices,
+    build_rl_hybridep_token_counts,
+    build_sft_hybridep_token_counts,
     resolve_global_grad_accumulation_sequences,
     select_indexed_inputs,
     select_micro_inputs,
@@ -545,6 +547,12 @@ def run_megatron_rl_job(
             job.config.grad_accumulation_sequences
         )
         num_steps = math.ceil(num_sequences / global_grad_accumulation_sequences)
+        topology = _infer_parallel_topology(runtime.model)
+        _ensure_hybridep_capacity(
+            runtime,
+            packed_sequence_length=job.disk_packed_tensors["sequence_length"],
+            context_parallel_size=topology.cp,
+        )
         ref_logprobs_by_index = _prepare_kl_reference_logprobs(
             runtime=runtime,
             job=job,
@@ -554,14 +562,21 @@ def run_megatron_rl_job(
             num_steps=num_steps,
             global_grad_accumulation_sequences=global_grad_accumulation_sequences,
         )
-        topology = _infer_parallel_topology(runtime.model)
-        _ensure_hybridep_capacity(
-            runtime,
-            packed_sequence_length=job.disk_packed_tensors["sequence_length"],
-            context_parallel_size=topology.cp,
-        )
         cp_lookahead_state = CpBatchLookaheadState() if int(topology.cp) > 1 else None
         for step_index in range(num_steps):
+            hybridep_token_counts = (
+                build_rl_hybridep_token_counts(
+                    packed_tensors=packed_tensors,
+                    step_index=step_index,
+                    num_sequences=num_sequences,
+                    global_grad_accumulation_sequences=global_grad_accumulation_sequences,
+                    topology=topology,
+                    provider=runtime.provider,
+                    model_support_handler=runtime.model_support_handler,
+                )
+                if ps.get_expert_model_parallel_world_size() > 1
+                else None
+            )
             micro_indices = build_micro_sample_indices(
                 step_index=step_index,
                 num_sequences=num_sequences,
@@ -622,6 +637,7 @@ def run_megatron_rl_job(
                 cp_lookahead_state=cp_lookahead_state,
                 next_step_first_micro=next_step_first_micro,
                 next_step_first_ref_logprobs=next_step_first_ref_logprobs,
+                hybridep_token_counts=hybridep_token_counts,
             )
             train_step_s = time.perf_counter() - train_step_started
             packed_train_tokens = sum(
@@ -734,6 +750,26 @@ def run_megatron_sft_job(
             )
             template = _clone_sft_tensors(trajectory_tensors[0])
             zero_template = _zero_contribution_sft_inputs(template)
+            topology = _infer_parallel_topology(runtime.model)
+            _ensure_hybridep_capacity(
+                runtime,
+                packed_sequence_length=max(
+                    int(inputs["input_ids"].numel()) for inputs in trajectory_tensors
+                ),
+                context_parallel_size=topology.cp,
+            )
+            hybridep_token_counts = (
+                build_sft_hybridep_token_counts(
+                    trajectory_tensors=trajectory_tensors,
+                    step_index=0,
+                    global_grad_accumulation_sequences=grad_accumulation_sequences,
+                    topology=topology,
+                    provider=runtime.provider,
+                    model_support_handler=runtime.model_support_handler,
+                )
+                if ps.get_expert_model_parallel_world_size() > 1
+                else None
+            )
             micro_indices = build_micro_sample_indices(
                 step_index=0,
                 num_sequences=num_trajectories,
@@ -755,6 +791,7 @@ def run_megatron_sft_job(
                 sample_index=micro_indices,
                 global_grad_accumulation_sequences=grad_accumulation_sequences,
                 moe_routing_replay_controller=runtime.moe_routing_replay_controller,
+                hybridep_token_counts=hybridep_token_counts,
             )
             batch_time = time.perf_counter() - batch_start_time
             tokens_per_second = global_tokens / batch_time if batch_time > 0 else 0.0
@@ -1178,6 +1215,24 @@ def _ensure_hybridep_capacity(
     )
 
 
+def _set_hybridep_token_count(rows: int) -> None:
+    from megatron.core.transformer.moe import fused_a2a
+
+    buffer = fused_a2a._hybrid_ep_buffer
+    if buffer is None:
+        raise RuntimeError("HybridEP buffer is not initialized")
+    buffer.set_num_tokens_per_rank(rows)
+
+
+def _validate_hybridep_token_counts(values: list[int] | None, micro_count: int) -> bool:
+    enabled = ps.get_expert_model_parallel_world_size() > 1
+    if enabled and (values is None or len(values) != micro_count):
+        raise RuntimeError(
+            "HybridEP requires one planned communication extent per microbatch"
+        )
+    return enabled
+
+
 def select_micro_ref_logprobs(
     ref_logprobs_by_index: dict[int, torch.Tensor],
     sample_indices: list[int | None],
@@ -1319,6 +1374,7 @@ def _calculate_megatron_logprobs(
     step_index: int | None = None,
     sample_index: int | None = None,
     global_grad_accumulation_sequences: int | None = None,
+    hybridep_token_count: int | None = None,
 ) -> torch.Tensor:
     if moe_routing_replay_controller is not None:
         if step_index is None or sample_index is None:
@@ -1358,6 +1414,11 @@ def _calculate_megatron_logprobs(
             prepared_micro.local_token_uids,
             prepared_micro.attention_state,
         )
+        if _validate_hybridep_token_counts(
+            None if hybridep_token_count is None else [hybridep_token_count], 1
+        ):
+            assert hybridep_token_count is not None
+            _set_hybridep_token_count(hybridep_token_count)
         logprobs = _forward_prepared_rl_micro(
             model_chunks=model_chunks,
             model_support_handler=model_support_handler,
@@ -1392,8 +1453,31 @@ def _precompute_reference_logprobs(
         len(sample_step_indices),
         "local sequences",
     )
-    return {
-        sample_index: _calculate_megatron_logprobs(
+    hybridep_by_step: dict[int, list[int]] = {}
+    hybridep_enabled = ps.get_expert_model_parallel_world_size() > 1
+    topology = _infer_parallel_topology(runtime.model) if hybridep_enabled else None
+    results: dict[int, torch.Tensor] = {}
+    for sample_index, step_index in sorted(sample_step_indices.items()):
+        hybridep_token_count = None
+        if hybridep_enabled:
+            assert topology is not None
+            counts = hybridep_by_step.get(step_index)
+            if counts is None:
+                counts = build_rl_hybridep_token_counts(
+                    packed_tensors=packed_tensors,
+                    step_index=step_index,
+                    num_sequences=int(packed_tensors["tokens"].shape[0]),
+                    global_grad_accumulation_sequences=global_grad_accumulation_sequences,
+                    topology=topology,
+                    provider=runtime.provider,
+                    model_support_handler=runtime.model_support_handler,
+                )
+                hybridep_by_step[step_index] = counts
+            micro_order = (
+                sample_index - step_index * global_grad_accumulation_sequences
+            ) // ps.get_data_parallel_world_size()
+            hybridep_token_count = counts[micro_order]
+        results[sample_index] = _calculate_megatron_logprobs(
             model_chunks=runtime.model,
             provider=runtime.provider,
             model_support_handler=runtime.model_support_handler,
@@ -1402,9 +1486,9 @@ def _precompute_reference_logprobs(
             step_index=step_index,
             sample_index=sample_index,
             global_grad_accumulation_sequences=global_grad_accumulation_sequences,
+            hybridep_token_count=hybridep_token_count,
         )
-        for sample_index, step_index in sorted(sample_step_indices.items())
-    }
+    return results
 
 
 def _reference_sample_step_indices(
@@ -1495,6 +1579,7 @@ def run_megatron_sft_step(
     sample_index: int | list[int | None],
     global_grad_accumulation_sequences: int | None,
     moe_routing_replay_controller: MoeRoutingReplayController | None = None,
+    hybridep_token_counts: list[int] | None = None,
 ) -> TrainStepResult:
     micro_inputs = inputs if isinstance(inputs, list) else [inputs]
     if not micro_inputs:
@@ -1536,6 +1621,9 @@ def run_megatron_sft_step(
     raw_loss_sum: torch.Tensor | None = None
     loss_inputs_for_count: list[dict[str, torch.Tensor] | PreparedSFTMicroInputs] = []
     pending_prepared_micro: PreparedMegatronBatch | None = None
+    hybridep_enabled = _validate_hybridep_token_counts(
+        hybridep_token_counts, len(micro_inputs)
+    )
 
     for micro_order, micro in enumerate(micro_inputs):
         if moe_routing_replay_controller is not None:
@@ -1557,6 +1645,9 @@ def run_megatron_sft_step(
             prepared_micro.local_token_uids,
             prepared_micro.attention_state,
         )
+        if hybridep_enabled:
+            assert hybridep_token_counts is not None
+            _set_hybridep_token_count(hybridep_token_counts[micro_order])
         with attach_trace_token_uids(model_chunks, prepared_micro.local_token_uids):
             per_token_loss: torch.Tensor = model_chunks[0](
                 input_ids=prepared_micro.input_ids,
@@ -1642,6 +1733,7 @@ def run_training_step(
     cp_lookahead_state: CpBatchLookaheadState | None = None,
     next_step_first_micro: PackedTensors | None = None,
     next_step_first_ref_logprobs: torch.Tensor | None = None,
+    hybridep_token_counts: list[int] | None = None,
 ) -> TrainStepResult:
     micro_inputs = inputs if isinstance(inputs, list) else [inputs]
     if not micro_inputs:
@@ -1688,6 +1780,9 @@ def run_training_step(
         chunk.zero_grad_buffer()  # type: ignore[call-non-callable]
 
     micro_count = len(micro_inputs)
+    hybridep_enabled = _validate_hybridep_token_counts(
+        hybridep_token_counts, micro_count
+    )
     raw_loss_sum: torch.Tensor | None = None
     loss_inputs_for_count: list[LossInputs | DispatchedPackedTensors] = []
     probs_corr_total: torch.Tensor | None = None
@@ -1723,6 +1818,9 @@ def run_training_step(
             prepared_micro.local_token_uids,
             prepared_micro.attention_state,
         )
+        if hybridep_enabled:
+            assert hybridep_token_counts is not None
+            _set_hybridep_token_count(hybridep_token_counts[micro_order])
 
         new_logprobs = _forward_prepared_rl_micro(
             model_chunks=model_chunks,
