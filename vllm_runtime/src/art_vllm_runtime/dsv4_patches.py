@@ -1,5 +1,6 @@
 """DSV4-specific monkey patches for the ART-owned vLLM runtime."""
 
+import functools
 import importlib
 from typing import Any
 
@@ -239,6 +240,20 @@ def patch_dsv4_lora_support() -> None:
     model_cls.is_3d_moe_weight = True
     model_cls.is_non_gated_moe = False
     model_cls.lora_skip_prefixes = ["mtp", "indexer"]
+    original_init = model_cls.__init__
+
+    @functools.wraps(original_init)
+    def init_3d_lora_only(self: Any, *args: Any, **kwargs: Any) -> None:
+        vllm_config = kwargs["vllm_config"]
+        lora_config = getattr(vllm_config, "lora_config", None)
+        if bool(getattr(lora_config, "enable_mixed_moe_lora_format", False)):
+            raise RuntimeError(
+                "DSV4 only supports fused 3D MoE LoRA; "
+                "enable_mixed_moe_lora_format must be false"
+            )
+        original_init(self, *args, **kwargs)
+
+    model_cls.__init__ = init_3d_lora_only
     model_cls._art_dsv4_lora_patched = True
     _patch_dsv4_lora_manager_indexer_skip(model_cls)
 
