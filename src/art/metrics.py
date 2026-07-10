@@ -209,6 +209,14 @@ PIPELINE_RL_METRIC_DEFINITIONS: tuple[MetricDefinition, ...] = (
         higher_is_better=None,
     ),
     MetricDefinition(
+        key="vllm/world_size",
+        title="vLLM GPU world size",
+        description="number of GPU ranks serving the model",
+        kind="gauge",
+        unit="ranks",
+        higher_is_better=None,
+    ),
+    MetricDefinition(
         key="vllm/max_num_batched_tokens",
         title="vLLM max batched tokens",
         description="configured token scheduling budget per vLLM iteration",

@@ -37,11 +37,13 @@ class _ArtRuntimeMetricsState:
     def configure(self, vllm_config: Any, *, engine_idx: int) -> None:
         scheduler_config = getattr(vllm_config, "scheduler_config", None)
         model_config = getattr(vllm_config, "model_config", None)
+        parallel_config = getattr(vllm_config, "parallel_config", None)
         engine_config: dict[str, float] = {}
         for metric_name, obj, attr in (
             ("max_num_seqs", scheduler_config, "max_num_seqs"),
             ("max_num_batched_tokens", scheduler_config, "max_num_batched_tokens"),
             ("max_model_len", model_config, "max_model_len"),
+            ("world_size", parallel_config, "world_size"),
         ):
             value = getattr(obj, attr, None)
             if isinstance(value, (int, float)):
@@ -165,6 +167,10 @@ class _ArtRuntimeMetricsState:
                         for item in engine_configs
                     ),
                     "max_model_len": max(max_model_lens, default=0.0),
+                    "world_size": max(
+                        (item.get("world_size", 0.0) for item in engine_configs),
+                        default=0.0,
+                    ),
                 }
             )
             return {

@@ -69,7 +69,7 @@ class PipelineAutotunerAttachment:
         self._validate_weight_update_mode(trainer)
         packed_sequence_length = self._discover_packed_sequence_length()
         target_packed_sequences = await self._discover_target_packed_sequences(trainer)
-        inference_gpu_count = self._discover_inference_gpu_count(trainer)
+        inference_gpu_count = await self._discover_inference_gpu_count(trainer)
         policy_age_limit_steps = self._policy_age_limit_steps(trainer)
         loaded = self._load_profile_if_requested(
             packed_sequence_length, target_packed_sequences, policy_age_limit_steps
@@ -355,14 +355,27 @@ class PipelineAutotunerAttachment:
             )
 
     @staticmethod
-    def _discover_inference_gpu_count(trainer: Any) -> int:
+    async def _discover_inference_gpu_count(trainer: Any) -> int:
         internal_config = trainer.model._internal_config or {}
         inference_gpu_ids = internal_config.get("inference_gpu_ids")
-        if not inference_gpu_ids:
+        if inference_gpu_ids:
+            return len(inference_gpu_ids)
+        collector = getattr(trainer.backend, "collect_train_step_vllm_metrics", None)
+        if not callable(collector):
             raise ValueError(
-                "Pipeline autotuning requires dedicated inference_gpu_ids."
+                "Pipeline autotuning requires inference_gpu_ids or ART vLLM metrics."
             )
-        return len(inference_gpu_ids)
+        maybe_metrics = collector(trainer.model)
+        metrics = (
+            await maybe_metrics if inspect.isawaitable(maybe_metrics) else maybe_metrics
+        )
+        world_size = metrics.get("vllm/world_size")
+        if not isinstance(world_size, (int, float)) or world_size < 1:
+            raise ValueError(
+                "Pipeline autotuning requires vLLM world size when inference_gpu_ids "
+                "are not local to the ART process."
+            )
+        return int(world_size)
 
     @staticmethod
     async def _discover_target_packed_sequences(trainer: Any) -> int:

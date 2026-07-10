@@ -446,6 +446,7 @@ class LocalBackend(Backend):
             "max_num_batched_tokens",
             "max_num_scheduled_tokens",
             "max_model_len",
+            "world_size",
         ):
             value = optional_metric(name)
             if value is not None:
