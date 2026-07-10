@@ -334,16 +334,10 @@ class MegatronService:
             return len(self.config["trainer_gpu_ids"])
         return max(int(torch.cuda.device_count()), 1)
 
-    @staticmethod
-    def _parallel_env_int(name: str, default: int) -> int:
-        raw = os.environ.get(name)
-        return default if raw is None or raw == "" else int(raw)
-
     def _data_parallel_world_size(self) -> int:
         num_gpus = self._trainer_gpu_count()
-        tp = self._parallel_env_int("ART_MEGATRON_TENSOR_MODEL_PARALLEL_SIZE", num_gpus)
-        cp = self._parallel_env_int("ART_MEGATRON_CONTEXT_PARALLEL_SIZE", 1)
-        pp = self._parallel_env_int("ART_MEGATRON_PIPELINE_MODEL_PARALLEL_SIZE", 1)
+        topology = self.runtime_config.topology
+        tp, cp, pp = topology.tp, topology.cp, topology.pp
         denominator = max(tp * cp * pp, 1)
         if num_gpus % denominator != 0:
             raise RuntimeError(
