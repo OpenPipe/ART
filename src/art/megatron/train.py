@@ -555,6 +555,11 @@ def run_megatron_rl_job(
             global_grad_accumulation_sequences=global_grad_accumulation_sequences,
         )
         topology = _infer_parallel_topology(runtime.model)
+        _ensure_hybridep_capacity(
+            runtime,
+            packed_sequence_length=job.disk_packed_tensors["sequence_length"],
+            context_parallel_size=topology.cp,
+        )
         cp_lookahead_state = CpBatchLookaheadState() if int(topology.cp) > 1 else None
         for step_index in range(num_steps):
             micro_indices = build_micro_sample_indices(
@@ -1126,6 +1131,50 @@ def _infer_parallel_topology(model_chunks: ModelChunks) -> ParallelTopology:
         dp=ps.get_data_parallel_world_size(),
         pp=ps.get_pipeline_model_parallel_world_size(),
         sp=bool(getattr(model_config, "sequence_parallel", False)),
+    )
+
+
+def _ensure_hybridep_capacity(
+    runtime: TrainingRuntime,
+    *,
+    packed_sequence_length: int,
+    context_parallel_size: int,
+) -> None:
+    expert_parallel_size = ps.get_expert_model_parallel_world_size()
+    if expert_parallel_size <= 1:
+        return
+    from megatron.core.transformer.moe import fused_a2a
+
+    from art.megatron.context_parallel.types import ContextParallelConfig
+
+    # HybridEP JIT keys include this capacity. Reserve CP's upper bound once so
+    # varying prefix-tree stage lengths do not compile new kernels mid-run.
+    planner_chunk = ContextParallelConfig().planner_chunk_size
+    token_capacity = (
+        math.ceil(packed_sequence_length / (planner_chunk * context_parallel_size))
+        * planner_chunk
+    )
+    current = fused_a2a._hybrid_ep_buffer
+    if (
+        current is not None
+        and current.configurer.buffer_config.max_num_of_tokens_per_rank
+        >= token_capacity
+    ):
+        return
+    num_experts = int(runtime.provider.num_moe_experts)
+    if num_experts % expert_parallel_size:
+        raise RuntimeError(
+            f"num_moe_experts={num_experts} is not divisible by EP={expert_parallel_size}"
+        )
+    fused_a2a.reset_hybrid_ep_buffer()
+    fused_a2a.init_hybrid_ep_buffer(
+        group=ps.get_expert_tensor_and_model_parallel_group(),
+        hidden_dim=int(runtime.provider.hidden_size),
+        seq_len=token_capacity,
+        num_local_experts=num_experts // expert_parallel_size,
+        num_sms_dispatch_api=int(runtime.provider.moe_hybridep_num_sms),
+        num_sms_combine_api=int(runtime.provider.moe_hybridep_num_sms),
+        fp8_dispatch=False,
     )
 
 
