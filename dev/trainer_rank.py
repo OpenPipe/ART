@@ -1,9 +1,9 @@
-from __future__ import annotations
-
+from itertools import islice
 import os
 
 import torch
 import torch.distributed as dist
+from trainer_rank_support import load_random_checkpoint_slots
 from transformers import AutoTokenizer
 import typer
 
@@ -12,9 +12,6 @@ from art.trainer_rank import AdamParams, ForwardInput, TrainerRank
 
 def main(
     model: str = "Qwen/Qwen3-0.6B",
-    dataset: str = "roneneldan/TinyStories",
-    split: str = "train",
-    text_column: str = "text",
     samples: int = 16,
     steps: int = 1,
     lr: float = 5e-5,
@@ -38,91 +35,30 @@ def main(
 
         tokenizer = AutoTokenizer.from_pretrained(model, trust_remote_code=True)
         inputs: list[ForwardInput[torch.Tensor, None, None, None]] = []
-        for row in load_dataset(dataset, split=split, streaming=True):
-            text = str(row.get(text_column, "")).strip()  # type: ignore[union-attr]
-            if not text:
-                continue
+        rows = load_dataset("roneneldan/TinyStories", split="train", streaming=True)
+        for row in islice(rows, samples):
             token_ids = tokenizer(
-                text,
+                str(row["text"]),  # type: ignore[index]
                 add_special_tokens=True,
                 truncation=True,
                 max_length=max_seq_length + 1,
                 return_tensors="pt",
             )["input_ids"].reshape(-1)
-            if int(token_ids.numel()) <= 1:
-                continue
             inputs.append(
                 ForwardInput(
                     input_tokens=token_ids[:-1],
                     target_tokens=token_ids[1:],
                 )
             )
-            if len(inputs) >= samples:
-                break
-        if not inputs:
-            raise RuntimeError("dataset produced no tokenized training examples")
 
         runtime = megatron_train.build_training_runtime(
             model_identifier=model,
-            provider_configure=lambda provider: setattr(
-                provider,
-                "num_layers",
-                layers,
-            ),
+            provider_configure=lambda provider: setattr(provider, "num_layers", layers),
             print_env=dist.get_rank() == 0,
         )
         rank = TrainerRank(runtime)
-        from art.megatron.lora import LoRAPublishPlanner, LoraShardMeta
-
-        generator = torch.Generator(device=rank.device).manual_seed(0)
-        dtype = next(runtime.model[0].parameters()).dtype
-        metadata_by_rank: list[list[LoraShardMeta] | None] = [
-            None for _ in range(dist.get_world_size())
-        ]
-        dist.all_gather_object(
-            metadata_by_rank,
-            LoRAPublishPlanner(runtime.model).global_metadata({}),
-        )
-        metadata = {
-            meta.key: meta
-            for rank_metadata in metadata_by_rank
-            if rank_metadata is not None
-            for meta in rank_metadata
-        }
-        adapter: dict[str, torch.Tensor] = {}
-        for meta in sorted(metadata.values(), key=lambda item: item.key):
-            shape = list(meta.shape)
-            if meta.manifest["sharded"]:
-                axis = int(meta.manifest["export_shard_dim"])
-                components = meta.manifest.get("component_sizes")
-                shape[axis] = (
-                    sum(int(size) for size in components)
-                    if isinstance(components, list)
-                    else shape[axis] * int(meta.manifest["shard_world_size"])
-                )
-            is_a = ".lora_A." in meta.key
-            shape[0 if is_a else -1] = lora_rank
-            adapter[meta.key] = (
-                torch.randn(
-                    shape,
-                    device=rank.device,
-                    dtype=dtype,
-                    generator=generator,
-                )
-                if is_a
-                else torch.zeros(shape, device=rank.device, dtype=dtype)
-            )
-        loaded_sites = rank.load_checkpoint_slot("student", adapter)
-        if loaded_sites == 0:
-            raise RuntimeError("TrainerRank dev script requires LoRA adapter sites")
-        rank.set_checkpoint("student")
-        if dist.get_rank() == 0:
-            print(
-                "TrainerRank ready: "
-                f"dp={megatron_train.ps.get_data_parallel_world_size()} "
-                f"device={rank.device}",
-                flush=True,
-            )
+        (slot,) = load_random_checkpoint_slots(runtime, rank, 1, lora_rank=lora_rank)
+        rank.set_checkpoint(slot)
 
         for step in range(steps):
             loss_sum = torch.tensor(0.0, device=rank.device)
@@ -133,9 +69,8 @@ def main(
                     assert output.target_logprobs is not None
                     loss = loss - output.target_logprobs.sum()
                     token_count += output.target_logprobs.numel()
-                if loss.requires_grad:
-                    loss.backward()
-                    loss_sum += loss.detach()
+                loss.backward()
+                loss_sum += loss.detach()
 
             rank.dp_reduce(loss_sum)
             rank.dp_reduce(token_count)
@@ -148,8 +83,6 @@ def main(
             metrics["tokens"] = float(token_count.item())
             if dist.get_rank() == 0:
                 print(f"step={step} {metrics}", flush=True)
-
-        dist.barrier()
     finally:
         if dist.is_initialized():
             dist.destroy_process_group()

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from importlib.util import find_spec
 import subprocess
 import sys
 
@@ -16,21 +17,10 @@ MEGATRON_FAST_TESTS = (
 )
 
 
-def _has_megatron() -> bool:
-    try:
-        import megatron.core.packed_seq_params  # noqa: F401
-    except ModuleNotFoundError:
-        return False
-    return True
-
-
 def main() -> None:
-    tests = (*FAST_TESTS, *(MEGATRON_FAST_TESTS if _has_megatron() else ()))
-    raise SystemExit(
-        subprocess.call(
-            [sys.executable, "-m", "pytest", "--tb=short", *tests, *sys.argv[1:]]
-        )
-    )
+    tests = (*FAST_TESTS, *(MEGATRON_FAST_TESTS if find_spec("megatron") else ()))
+    command = [sys.executable, "-m", "pytest", "--tb=short", *tests, *sys.argv[1:]]
+    raise SystemExit(subprocess.call(command))
 
 
 if __name__ == "__main__":
