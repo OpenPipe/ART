@@ -368,9 +368,19 @@ def _gpt_oss_config(base_model: str, rank: int = 2, alpha: int = 4) -> dict:
     return config
 
 
+def _gpt_oss_model_dir(tmp_path: Path) -> str:
+    model_dir = tmp_path / "gpt_oss_model"
+    model_dir.mkdir()
+    (model_dir / "config.json").write_text(
+        json.dumps({"hidden_size": 128, "intermediate_size": 128}),
+        encoding="utf-8",
+    )
+    return str(model_dir)
+
+
 def _gpt_oss_moe_art_tensors(prefix: str, *, rank: int = 2) -> dict[str, torch.Tensor]:
-    hidden = 3
-    intermediate = 4
+    hidden = 128
+    intermediate = 128
     tensors: dict[str, torch.Tensor] = {
         f"{prefix}.self_attn.q_proj.lora_A.weight": torch.arange(
             rank * hidden,
@@ -973,7 +983,7 @@ def test_gpt_oss_vllm_canonical_roundtrip_and_stock_loader(tmp_path: Path):
     expected_experts = _gpt_oss_fused_expert_vllm_tensors(original, art_prefix)
     vllm_tensors, vllm_config = GPT_OSS_MOE_HANDLER.to_vllm_lora_tensors(
         original,
-        adapter_config=_gpt_oss_config("openai/gpt-oss-20b"),
+        adapter_config=_gpt_oss_config(_gpt_oss_model_dir(tmp_path)),
     )
 
     assert vllm_config["target_modules"] == [
@@ -1006,7 +1016,7 @@ def test_gpt_oss_vllm_canonical_roundtrip_and_stock_loader(tmp_path: Path):
     assert "model.layers.0.mlp.experts.base_layer" in loaded_modules
 
 
-def test_gpt_oss_expert_lora_is_not_emitted_as_merged_delta() -> None:
+def test_gpt_oss_expert_lora_is_not_emitted_as_merged_delta(tmp_path: Path) -> None:
     module_path = VLLM_RUNTIME_SRC / "art_vllm_runtime/lora_delta.py"
     spec = importlib.util.spec_from_file_location("art_vllm_lora_delta", module_path)
     assert spec is not None and spec.loader is not None
@@ -1015,7 +1025,7 @@ def test_gpt_oss_expert_lora_is_not_emitted_as_merged_delta() -> None:
     original = _gpt_oss_moe_art_tensors("base_model.model.model.layers.0")
     vllm_tensors, adapter_config = GPT_OSS_MOE_HANDLER.to_vllm_lora_tensors(
         original,
-        adapter_config=_gpt_oss_config("openai/gpt-oss-20b"),
+        adapter_config=_gpt_oss_config(_gpt_oss_model_dir(tmp_path)),
     )
 
     names = [
@@ -1685,8 +1695,8 @@ def test_direct_gpt_oss_packed_expert_publish_matches_handler_vllm_exactly(
     monkeypatch.setattr(lora_module.ps, "get_expert_data_parallel_rank", lambda: 0)
 
     rank = 2
-    hidden = 3
-    intermediate = 4
+    hidden = 128
+    intermediate = 128
     group_prefix = "base_model.model.model.layers.0.mlp.experts"
     full = {
         key: tensor
@@ -1731,7 +1741,11 @@ def test_direct_gpt_oss_packed_expert_publish_matches_handler_vllm_exactly(
             full[f"{expert_prefix}.down_proj.lora_B.weight"].T
         )
 
-    adapter_config = _gpt_oss_config("openai/gpt-oss-20b", rank=rank, alpha=rank)
+    adapter_config = _gpt_oss_config(
+        _gpt_oss_model_dir(tmp_path),
+        rank=rank,
+        alpha=rank,
+    )
     old_dir = tmp_path / "old"
     current_dir = tmp_path / "current"
     old_tensors, old_config = GPT_OSS_MOE_HANDLER.to_vllm_lora_tensors(
