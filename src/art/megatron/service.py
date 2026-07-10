@@ -1065,7 +1065,7 @@ class MegatronService:
                 timeout=external_runtime.health_timeout_s,
                 headers=self._runtime_headers(),
             )
-            await self._reload_adapter(lora_path, self._latest_step)
+            await self._load_rollout_lora_for_step(lora_path, self._latest_step)
             self._loaded_adapter_steps.add(self._latest_step)
             self._status(f"External vLLM runtime is ready at {self._vllm_base_url}")
             return self._vllm_host, self._vllm_port

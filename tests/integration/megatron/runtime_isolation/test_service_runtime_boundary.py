@@ -157,6 +157,35 @@ async def test_megatron_in_flight_lora_update_uses_derived_slot(
 
 
 @pytest.mark.asyncio
+async def test_external_megatron_in_flight_start_initializes_active_slot(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service = MegatronService(
+        model_name="test-model",
+        base_model="Qwen/Qwen3-0.6B",
+        config={
+            "rollout_weights_mode": "lora",
+            "rollout_weight_update_mode": "in_flight_lora",
+            "vllm_runtime": {"mode": "external", "server_url": "http://host:8000"},
+        },
+        output_dir=str(tmp_path),
+    )
+    service._latest_step = 3
+    monkeypatch.setattr(service, "_resolve_active_lora_path", lambda: "/tmp/lora")
+    monkeypatch.setattr(service_module, "wait_for_vllm_http_runtime", AsyncMock())
+    update = AsyncMock()
+    reload_adapter = AsyncMock()
+    monkeypatch.setattr(service, "_update_in_flight_adapter", update)
+    monkeypatch.setattr(service, "_reload_adapter", reload_adapter)
+
+    await service.start_openai_server(None)
+
+    update.assert_awaited_once_with("/tmp/lora", 3)
+    reload_adapter.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 async def test_megatron_shared_start_requires_runtime_sleep_mode(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
