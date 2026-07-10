@@ -38,8 +38,8 @@ _DSV4_VLLM_MOE_KEY_RE = re.compile(
     r"(?:(?P<base_layer>base_layer)\.)?(?P<lora>lora_[AB])\.weight$"
 )
 _DSV4_SPLIT_MOE_EXPERT_KEY_RE = re.compile(
-    r"^.*\.(?:mlp|ffn)\.experts\.\d+\."
-    r"(?:gate_proj|up_proj|down_proj|w1|w2|w3)\.lora_[AB]\.weight$"
+    r"^.*(?:\.mlp\.experts\.\d+\.(?:gate_proj|up_proj)|"
+    r"\.ffn\.experts\.\d+\.w[123])\.lora_[AB]\.weight$"
 )
 _DSV4_MOE_COMPILE_WORKAROUND_FLAGS = ("te_triton_permute_with_mask_map",)
 
