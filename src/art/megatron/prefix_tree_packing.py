@@ -44,7 +44,7 @@ def prefix_tree_pack(
     *,
     max_depth: int,
     shareable_lengths: Iterable[int] | None = None,
-    min_shared_token_savings: int = 0,
+    min_shared_segment_length: int = 1,
 ) -> PrefixTreePack:
     """Pack token sequences by storing prefix trees once.
 
@@ -60,8 +60,7 @@ def prefix_tree_pack(
             tree sharing and writes each sequence as its own root segment. `1`
             shares the first common segment in each branch; larger values allow
             branches to contain shared sub-branches.
-        min_shared_token_savings: Minimum packed-token savings required to emit
-            a shared segment. Savings are `segment_length * (branch_count - 1)`.
+        min_shared_segment_length: Minimum length of an emitted shared segment.
 
     Returns:
         `tokens` is the compact model input, shaped `[1, packed_length]`.
@@ -83,8 +82,8 @@ def prefix_tree_pack(
     """
     if max_depth < 0:
         raise ValueError("max_depth must be >= 0")
-    if min_shared_token_savings < 0:
-        raise ValueError("min_shared_token_savings must be >= 0")
+    if min_shared_segment_length < 0:
+        raise ValueError("min_shared_segment_length must be >= 0")
 
     tensors = tuple(_sequence_tensor(sequence) for sequence in sequences)
     if not tensors:
@@ -97,7 +96,7 @@ def prefix_tree_pack(
         rows,
         max_depth=max_depth,
         shareable_lengths=share_limits,
-        min_shared_token_savings=min_shared_token_savings,
+        min_shared_segment_length=min_shared_segment_length,
     )
     if not segments:
         return _empty_pack(len(tensors), device=device)
@@ -140,12 +139,12 @@ def prefix_tree_pack_segments(
     *,
     max_depth: int,
     shareable_lengths: Iterable[int] | None = None,
-    min_shared_token_savings: int = 0,
+    min_shared_segment_length: int = 1,
 ) -> tuple[PrefixTreePackSegment, ...]:
     if max_depth < 0:
         raise ValueError("max_depth must be >= 0")
-    if min_shared_token_savings < 0:
-        raise ValueError("min_shared_token_savings must be >= 0")
+    if min_shared_segment_length < 0:
+        raise ValueError("min_shared_segment_length must be >= 0")
     rows = tuple(
         sequence if isinstance(sequence, tuple) else tuple(sequence)
         for sequence in sequences
@@ -159,7 +158,7 @@ def prefix_tree_pack_segments(
         rows,
         max_depth=max_depth,
         shareable_lengths=share_limits,
-        min_shared_token_savings=min_shared_token_savings,
+        min_shared_segment_length=min_shared_segment_length,
     ):
         segments.append(
             PrefixTreePackSegment(
@@ -180,7 +179,7 @@ def estimate_prefix_tree_packed_tokens(
     *,
     max_depth: int,
     shareable_lengths: Iterable[int] | None = None,
-    min_shared_token_savings: int = 0,
+    min_shared_segment_length: int = 1,
 ) -> int | None:
     """Return the exact packed token count without building a packed batch.
 
@@ -190,8 +189,8 @@ def estimate_prefix_tree_packed_tokens(
     """
     if max_depth < 0:
         raise ValueError("max_depth must be >= 0")
-    if min_shared_token_savings < 0:
-        raise ValueError("min_shared_token_savings must be >= 0")
+    if min_shared_segment_length < 0:
+        raise ValueError("min_shared_segment_length must be >= 0")
 
     tensors: list[torch.Tensor] = []
     rows: list[list[int]] = []
@@ -209,7 +208,7 @@ def estimate_prefix_tree_packed_tokens(
             rows,
             max_depth=max_depth,
             shareable_lengths=share_limits,
-            min_shared_token_savings=min_shared_token_savings,
+            min_shared_segment_length=min_shared_segment_length,
         )
     )
 
@@ -233,7 +232,7 @@ def _prefix_segments(
     *,
     max_depth: int,
     shareable_lengths: tuple[int, ...],
-    min_shared_token_savings: int,
+    min_shared_segment_length: int,
 ) -> tuple[_PrefixSegment, ...]:
     lengths = tuple(len(row) for row in rows)
     segments: list[_PrefixSegment] = []
@@ -331,8 +330,7 @@ def _prefix_segments(
 
         end = shared_end(shareable, start)
         if end > start:
-            savings = (end - start) * (len(shareable) - 1)
-            if savings >= min_shared_token_savings:
+            if end - start >= min_shared_segment_length:
                 walk(
                     shareable,
                     end,

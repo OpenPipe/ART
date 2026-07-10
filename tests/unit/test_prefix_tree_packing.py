@@ -117,7 +117,7 @@ def test_prefix_tree_pack_respects_shareable_lengths() -> None:
     ) == int(pack.tokens.numel())
 
 
-def test_prefix_tree_pack_prunes_low_savings_segments() -> None:
+def test_prefix_tree_pack_prunes_short_shared_segments() -> None:
     inputs = (
         torch.tensor([1, 2, 3]),
         torch.tensor([1, 2, 4]),
@@ -126,7 +126,7 @@ def test_prefix_tree_pack_prunes_low_savings_segments() -> None:
     pack = prefix_tree_pack(
         inputs,
         max_depth=4,
-        min_shared_token_savings=3,
+        min_shared_segment_length=3,
     )
 
     assert pack.tokens.tolist() == [[1, 2, 3, 1, 2, 4]]
@@ -134,11 +134,11 @@ def test_prefix_tree_pack_prunes_low_savings_segments() -> None:
     assert estimate_prefix_tree_packed_tokens(
         inputs,
         max_depth=4,
-        min_shared_token_savings=3,
+        min_shared_segment_length=3,
     ) == int(pack.tokens.numel())
 
 
-def test_prefix_tree_pack_keeps_deeper_profitable_segment_after_pruning() -> None:
+def test_prefix_tree_pack_keeps_deeper_long_segment_after_pruning() -> None:
     inputs = (
         torch.tensor([1, 3]),
         torch.tensor([1, 2, 4, 5, 6]),
@@ -148,7 +148,7 @@ def test_prefix_tree_pack_keeps_deeper_profitable_segment_after_pruning() -> Non
     pack = prefix_tree_pack(
         inputs,
         max_depth=4,
-        min_shared_token_savings=4,
+        min_shared_segment_length=4,
     )
 
     assert pack.tokens.tolist() == [[1, 3, 1, 2, 4, 5, 6, 7]]
@@ -161,7 +161,7 @@ def test_prefix_tree_pack_keeps_deeper_profitable_segment_after_pruning() -> Non
     assert estimate_prefix_tree_packed_tokens(
         inputs,
         max_depth=4,
-        min_shared_token_savings=4,
+        min_shared_segment_length=4,
     ) == int(pack.tokens.numel())
 
 

@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-import base64
-import io
 import math
 from typing import Any
 
@@ -52,12 +50,6 @@ def _routes_to_list(routes: Any) -> list[Any]:
             output.extend(segment.tolist())
         return output
     return routes.tolist()
-
-
-def _routes_to_b64(routes: list[list[list[int]]]) -> str:
-    output = io.BytesIO()
-    np.save(output, np.asarray(routes, dtype=np.int32))
-    return base64.b64encode(output.getvalue()).decode("ascii")
 
 
 def test_align_choice_routes_to_tokenized_result_maps_vllm_routes() -> None:
@@ -117,143 +109,26 @@ def test_align_choice_routes_to_tokenized_result_uses_current_vllm_contract() ->
     assert stats.routed_tokens == 4
 
 
-def test_align_choice_routes_reuses_group_prompt_route_cache() -> None:
-    prompt_routes = [_route(0), _route(10)]
-    prompt_payload = _routes_to_b64(prompt_routes)
-    prompt_route_cache = {}
-
-    first_routes, first_stats = align_choice_routes_to_tokenized_result(
+def test_align_choice_routes_keeps_binary_route_views() -> None:
+    combined = np.arange(4 * 2 * 2, dtype=np.uint8).reshape(4, 2, 2)
+    combined.flags.writeable = False
+    routes, _ = align_choice_routes_to_tokenized_result(
         token_ids=[10, 11, 20, 21],
         choices=[
             _choice(
                 {
                     "prompt_token_ids": [10, 11],
                     "completion_token_ids": [20, 21],
-                    "prompt_routed_experts": prompt_payload,
-                    "completion_routed_experts": [_route(20), _route(30)],
+                    "routed_experts": combined,
                 }
             )
         ],
         choice_offsets=[2],
         choice_token_lengths=[2],
-        prompt_route_cache=prompt_route_cache,
-    )
-    second_routes, second_stats = align_choice_routes_to_tokenized_result(
-        token_ids=[10, 11, 22],
-        choices=[
-            _choice(
-                {
-                    "prompt_token_ids": [10, 11],
-                    "completion_token_ids": [22],
-                    "prompt_routed_experts": prompt_payload,
-                    "completion_routed_experts": [_route(40)],
-                }
-            )
-        ],
-        choice_offsets=[2],
-        choice_token_lengths=[1],
-        prompt_route_cache=prompt_route_cache,
     )
 
-    assert first_stats.prompt_route_cache_misses == 1
-    assert second_stats.prompt_route_cache_hits == 1
-    assert isinstance(first_routes, MoeRouteSegments)
-    assert isinstance(second_routes, MoeRouteSegments)
-    assert first_routes.segments[0] is second_routes.segments[0]
-    assert _routes_to_list(first_routes) == [*prompt_routes, _route(20), _route(30)]
-    assert _routes_to_list(second_routes) == [*prompt_routes, _route(40)]
-
-
-def test_align_choice_routes_reuses_combined_group_prompt_route_cache() -> None:
-    prompt_routes = [_route(0), _route(10)]
-    prompt_route_cache = {}
-
-    first_routes, first_stats = align_choice_routes_to_tokenized_result(
-        token_ids=[10, 11, 20, 21],
-        choices=[
-            _choice(
-                {
-                    "prompt_token_ids": [10, 11],
-                    "completion_token_ids": [20, 21],
-                    "routed_experts": _routes_to_b64(
-                        [*prompt_routes, _route(20), _route(30)]
-                    ),
-                }
-            )
-        ],
-        choice_offsets=[2],
-        choice_token_lengths=[2],
-        prompt_route_cache=prompt_route_cache,
-    )
-    second_routes, second_stats = align_choice_routes_to_tokenized_result(
-        token_ids=[10, 11, 22],
-        choices=[
-            _choice(
-                {
-                    "prompt_token_ids": [10, 11],
-                    "completion_token_ids": [22],
-                    "routed_experts": _routes_to_b64([*prompt_routes, _route(40)]),
-                }
-            )
-        ],
-        choice_offsets=[2],
-        choice_token_lengths=[1],
-        prompt_route_cache=prompt_route_cache,
-    )
-
-    assert first_stats.prompt_route_cache_misses == 1
-    assert second_stats.prompt_route_cache_hits == 1
-    assert isinstance(first_routes, MoeRouteSegments)
-    assert isinstance(second_routes, MoeRouteSegments)
-    assert first_routes.segments[0] is second_routes.segments[0]
-    assert _routes_to_list(first_routes) == [*prompt_routes, _route(20), _route(30)]
-    assert _routes_to_list(second_routes) == [*prompt_routes, _route(40)]
-
-
-def test_align_choice_routes_keeps_distinct_combined_prompt_route_variants() -> None:
-    prompt_route_cache = {}
-
-    first_routes, first_stats = align_choice_routes_to_tokenized_result(
-        token_ids=[10, 11, 20],
-        choices=[
-            _choice(
-                {
-                    "prompt_token_ids": [10, 11],
-                    "completion_token_ids": [20],
-                    "routed_experts": _routes_to_b64(
-                        [_route(0), _route(10), _route(20)]
-                    ),
-                }
-            )
-        ],
-        choice_offsets=[2],
-        choice_token_lengths=[1],
-        prompt_route_cache=prompt_route_cache,
-    )
-    second_routes, second_stats = align_choice_routes_to_tokenized_result(
-        token_ids=[10, 11, 22],
-        choices=[
-            _choice(
-                {
-                    "prompt_token_ids": [10, 11],
-                    "completion_token_ids": [22],
-                    "routed_experts": _routes_to_b64(
-                        [_route(0), _route(99), _route(40)]
-                    ),
-                }
-            )
-        ],
-        choice_offsets=[2],
-        choice_token_lengths=[1],
-        prompt_route_cache=prompt_route_cache,
-    )
-
-    assert first_stats.prompt_route_cache_misses == 1
-    assert second_stats.prompt_route_cache_misses == 1
-    assert isinstance(first_routes, MoeRouteSegments)
-    assert isinstance(second_routes, MoeRouteSegments)
-    assert first_routes.segments[0] is not second_routes.segments[0]
-    assert _routes_to_list(second_routes) == [_route(0), _route(99), _route(40)]
+    assert isinstance(routes, MoeRouteSegments)
+    assert all(np.shares_memory(segment, combined) for segment in routes.segments)
 
 
 def test_align_choice_routes_to_tokenized_result_rejects_token_mismatch() -> None:
@@ -331,7 +206,7 @@ def test_pack_carries_routes_through_prefix_tree_splicing() -> None:
         pad_token_id=0,
         truncate_long_results=False,
         include_moe_routing=True,
-        min_prefix_tree_shared_token_savings=0,
+        min_prefix_tree_shared_segment_length=0,
     )
 
     assert packed["tokens"].tolist()[0][:7] == [10, 11, 20, 21, 11, 22, 23]
@@ -378,7 +253,7 @@ def test_prefix_tree_pack_keeps_trainable_duplicates_in_leaf_metadata() -> None:
         seq_len=8,
         pad_token_id=0,
         truncate_long_results=False,
-        min_prefix_tree_shared_token_savings=0,
+        min_prefix_tree_shared_segment_length=0,
     )
 
     assert packed["tokens"].tolist()[0][:7] == [10, 11, 20, 21, 11, 20, 22]
@@ -436,7 +311,7 @@ def test_prefix_tree_pack_public_api_emits_nested_metadata() -> None:
         seq_len=16,
         pad_token_id=0,
         truncate_long_results=False,
-        min_prefix_tree_shared_token_savings=0,
+        min_prefix_tree_shared_segment_length=0,
     )
     tree = parse_prefix_tree_row(
         group_ids=packed["group_ids"][0],
@@ -485,7 +360,7 @@ def test_prefix_tree_pack_best_fit_combines_independent_small_groups() -> None:
         seq_len=12,
         pad_token_id=0,
         truncate_long_results=False,
-        min_prefix_tree_shared_token_savings=0,
+        min_prefix_tree_shared_segment_length=0,
     )
 
     assert packed["tokens"].shape[0] == 2

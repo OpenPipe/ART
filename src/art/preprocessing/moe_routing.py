@@ -37,11 +37,6 @@ TokenRoute = list[list[int]]
 MoeRouteArray = np.ndarray
 MoeRouteCacheKey = tuple[int, str, str]
 MoeRouteDecodeCache = dict[MoeRouteCacheKey, list[tuple[str, MoeRouteArray]]]
-MoePromptRouteCacheKey = tuple[
-    tuple[int, ...],
-    tuple[int, str, str, str] | tuple[str, tuple[Any, ...] | None],
-]
-MoePromptRouteCache = dict[MoePromptRouteCacheKey, list[MoeRouteArray]]
 MISSING_EXPERT_ID = -1
 
 
@@ -52,14 +47,11 @@ def _has_routing_experts(metadata: dict[str, Any]) -> bool:
 class MoeRoutingAlignmentStats(BaseModel):
     choices_with_routing: int = 0
     routed_tokens: int = 0
-    prompt_route_cache_hits: int = 0
-    prompt_route_cache_misses: int = 0
     prompt_route_bytes: int = 0
     completion_route_bytes: int = 0
     decode_prompt_routes_s: float = 0.0
     decode_completion_routes_s: float = 0.0
     token_id_validation_s: float = 0.0
-    prompt_route_validation_s: float = 0.0
     append_overlay_s: float = 0.0
 
 
@@ -200,7 +192,6 @@ def align_choice_routes_to_tokenized_result(
     choice_offsets: list[int],
     choice_token_lengths: list[int],
     route_decode_cache: MoeRouteDecodeCache | None = None,
-    prompt_route_cache: MoePromptRouteCache | None = None,
 ) -> tuple[MoeRouteArray | MoeRouteSegments | None, MoeRoutingAlignmentStats]:
     if not (len(choices) == len(choice_offsets) == len(choice_token_lengths)):
         raise RuntimeError(
@@ -232,8 +223,6 @@ def align_choice_routes_to_tokenized_result(
             prompt_token_ids=prompt_token_ids,
             completion_token_count=len(completion_token_ids),
             route_decode_cache=route_decode_cache,
-            prompt_route_cache=prompt_route_cache,
-            prompt_policy_cache_key=_prompt_policy_cache_key(choice),
             stats=stats,
         )
         timing_start = _route_alignment_time_ns()
@@ -449,6 +438,7 @@ def _normalize_routes(
         return np.empty((0, 0, 0), dtype=np.int32)
     array = np.asarray(raw, dtype=np.int32)
     _validate_route_array(array, field_name=field_name)
+    array.flags.writeable = False
     return array
 
 
@@ -480,33 +470,6 @@ def _decode_vllm_routed_experts(raw: str, *, field_name: str) -> MoeRouteArray:
 
 def _route_cache_key(raw: str) -> MoeRouteCacheKey:
     return len(raw), raw[:96], raw[-96:]
-
-
-def _prompt_policy_cache_key(choice: Choice) -> tuple[Any, ...] | None:
-    extra = choice.model_extra or {}
-    spans = extra.get("policy_token_spans")
-    if not isinstance(spans, list) or not spans:
-        return None
-    first = spans[0]
-    if not isinstance(first, dict):
-        return None
-    return (
-        int(first.get("policy_version", 0)),
-        str(first.get("lora_slot", "")),
-        int(first.get("update_seq", 0)),
-    )
-
-
-def _prompt_route_cache_key(
-    *,
-    prompt_token_ids: list[int],
-    raw: Any,
-) -> MoePromptRouteCacheKey | None:
-    if not isinstance(raw, str):
-        return None
-    middle = len(raw) // 2
-    route_signature = (len(raw), raw[:96], raw[middle : middle + 96], raw[-96:])
-    return tuple(prompt_token_ids), route_signature
 
 
 def _validate_route_array(array: MoeRouteArray, *, field_name: str) -> None:
@@ -546,8 +509,6 @@ def _choice_routes(
     prompt_token_ids: list[int],
     completion_token_count: int,
     route_decode_cache: MoeRouteDecodeCache | None = None,
-    prompt_route_cache: MoePromptRouteCache | None = None,
-    prompt_policy_cache_key: tuple[Any, ...] | None = None,
     stats: MoeRoutingAlignmentStats | None = None,
 ) -> tuple[MoeRouteArray, MoeRouteArray]:
     if PROMPT_ROUTED_EXPERTS_KEY in metadata:
@@ -565,9 +526,7 @@ def _choice_routes(
         return (
             _prompt_routes(
                 metadata,
-                prompt_token_ids=prompt_token_ids,
                 route_decode_cache=route_decode_cache,
-                prompt_route_cache=prompt_route_cache,
                 stats=stats,
             ),
             completion_routes,
@@ -593,23 +552,15 @@ def _choice_routes(
             "routed_experts length does not match prompt/completion token ids: "
             f"{len(routes)} not in {sorted(expected_lengths)}"
         )
-    prompt_routes = _combined_prompt_routes(
-        routes=routes,
-        prompt_token_ids=prompt_token_ids,
-        prompt_route_cache=prompt_route_cache,
-        prompt_policy_cache_key=prompt_policy_cache_key,
-        stats=stats,
-    )
-    completion_routes = _readonly_route_copy(routes[len(prompt_token_ids) :])
+    prompt_routes = _readonly_route_view(routes[: len(prompt_token_ids)])
+    completion_routes = _readonly_route_view(routes[len(prompt_token_ids) :])
     return prompt_routes, completion_routes
 
 
 def _prompt_routes(
     metadata: dict[str, Any],
     *,
-    prompt_token_ids: list[int],
     route_decode_cache: MoeRouteDecodeCache | None = None,
-    prompt_route_cache: MoePromptRouteCache | None = None,
     stats: MoeRoutingAlignmentStats | None = None,
 ) -> MoeRouteArray:
     timing_start = _route_alignment_time_ns()
@@ -617,80 +568,19 @@ def _prompt_routes(
     try:
         if stats is not None:
             stats.prompt_route_bytes += _route_payload_size(raw)
-        cache_key = (
-            _prompt_route_cache_key(prompt_token_ids=prompt_token_ids, raw=raw)
-            if prompt_route_cache is not None
-            else None
-        )
-        if cache_key is not None and prompt_route_cache is not None:
-            cached = _single_cached_prompt_route(prompt_route_cache, cache_key)
-            if cached is not None:
-                if stats is not None:
-                    stats.prompt_route_cache_hits += 1
-                return cached
-            if stats is not None:
-                stats.prompt_route_cache_misses += 1
-        routes = _normalize_routes(
+        return _normalize_routes(
             raw,
             field_name=PROMPT_ROUTED_EXPERTS_KEY,
             route_decode_cache=route_decode_cache,
         )
-        if cache_key is not None and prompt_route_cache is not None:
-            prompt_route_cache[cache_key] = [routes]
-        return routes
     finally:
         if stats is not None:
             _add_route_alignment_elapsed(stats, "decode_prompt_routes_s", timing_start)
 
 
-def _single_cached_prompt_route(
-    prompt_route_cache: MoePromptRouteCache,
-    cache_key: MoePromptRouteCacheKey,
-) -> MoeRouteArray | None:
-    cached = prompt_route_cache.get(cache_key)
-    if not cached:
-        return None
-    return cached[0]
-
-
-def _combined_prompt_routes(
-    *,
-    routes: MoeRouteArray,
-    prompt_token_ids: list[int],
-    prompt_route_cache: MoePromptRouteCache | None,
-    prompt_policy_cache_key: tuple[Any, ...] | None,
-    stats: MoeRoutingAlignmentStats | None,
-) -> MoeRouteArray:
-    prompt_routes = routes[: len(prompt_token_ids)]
-    if prompt_route_cache is None:
-        return _readonly_route_copy(prompt_routes)
-    cache_key: MoePromptRouteCacheKey = (
-        tuple(prompt_token_ids),
-        ("combined", prompt_policy_cache_key),
-    )
-    timing_start = _route_alignment_time_ns()
-    try:
-        for cached in prompt_route_cache.get(cache_key, []):
-            if np.array_equal(cached, prompt_routes):
-                if stats is not None:
-                    stats.prompt_route_cache_hits += 1
-                return cached
-        if stats is not None:
-            stats.prompt_route_cache_misses += 1
-        cached_prompt = _readonly_route_copy(prompt_routes)
-        prompt_route_cache.setdefault(cache_key, []).append(cached_prompt)
-        return cached_prompt
-    finally:
-        if stats is not None:
-            _add_route_alignment_elapsed(
-                stats, "prompt_route_validation_s", timing_start
-            )
-
-
-def _readonly_route_copy(routes: MoeRouteArray) -> MoeRouteArray:
-    copied = np.array(routes, copy=True)
-    copied.flags.writeable = False
-    return copied
+def _readonly_route_view(routes: MoeRouteArray) -> MoeRouteArray:
+    routes.flags.writeable = False
+    return routes
 
 
 def _completion_routes(

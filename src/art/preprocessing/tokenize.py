@@ -24,7 +24,6 @@ from ..utils.chat_template import (
     merge_chat_template_kwargs,
 )
 from .moe_routing import (
-    MoePromptRouteCache,
     MoeRouteArray,
     MoeRouteDecodeCache,
     MoeRouteSegments,
@@ -321,7 +320,6 @@ def _tokenized_result_from_vllm_choices(
     advantage: float,
     trajectory: Trajectory,
     route_decode_cache: MoeRouteDecodeCache | None = None,
-    prompt_route_cache: MoePromptRouteCache | None = None,
 ) -> TokenizedResult:
     moe_routed_experts, moe_routing_alignment_stats = (
         align_choice_routes_to_tokenized_result(
@@ -330,7 +328,6 @@ def _tokenized_result_from_vllm_choices(
             choice_offsets=choice_offsets,
             choice_token_lengths=choice_token_lengths,
             route_decode_cache=route_decode_cache,
-            prompt_route_cache=prompt_route_cache,
         )
     )
     return TokenizedResult(
@@ -363,7 +360,6 @@ def tokenize_vllm_trajectory_histories(
     allow_training_without_logprobs: bool,
     trajectory: Trajectory,
     route_decode_cache: MoeRouteDecodeCache | None = None,
-    prompt_route_cache: MoePromptRouteCache | None = None,
 ) -> list[TokenizedResult]:
     results: list[TokenizedResult] = []
     token_ids: list[int] = []
@@ -392,7 +388,6 @@ def tokenize_vllm_trajectory_histories(
                 advantage=advantage,
                 trajectory=trajectory,
                 route_decode_cache=route_decode_cache,
-                prompt_route_cache=prompt_route_cache,
             )
         )
         token_ids = []
@@ -466,7 +461,6 @@ def tokenize_trajectory_groups(
     for group in trajectory_groups:
         if not group:
             continue
-        prompt_route_cache: MoePromptRouteCache = {}
         results: list[TokenizedResult] = []
         # Calculate GRPO group mean and standard deviation
         reward_mean = sum(trajectory.reward for trajectory in group) / len(group)
@@ -494,7 +488,6 @@ def tokenize_trajectory_groups(
                 allow_training_without_logprobs=allow_training_without_logprobs,
                 trajectory=trajectory,
                 route_decode_cache=route_decode_cache,
-                prompt_route_cache=prompt_route_cache,
             )
             weight = 1 / (
                 sum(sum(result.assistant_mask) for result in trajectory_results) + 1e-6
