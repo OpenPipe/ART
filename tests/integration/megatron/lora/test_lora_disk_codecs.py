@@ -21,6 +21,7 @@ from art.megatron.model_support.handlers import (
     QWEN3_5_MOE_HANDLER,
     QWEN3_MOE_HANDLER,
 )
+from art.megatron.model_support.handlers.dsv4 import DSV4_HANDLER
 from art.megatron.model_support.handlers.gemma4 import GEMMA4_MOE_HANDLER
 from art.megatron.model_support.lora_disk import (
     ART_LORA_FORMAT_CONFIG_KEY,
@@ -820,6 +821,72 @@ def test_qwen35_vllm_config_preserves_shared_expert_targets_when_present():
         adapter_config=vllm_config,
     )
     _assert_tensors_equal(roundtrip, original)
+
+
+def test_dsv4_vllm_canonical_moe_roundtrip() -> None:
+    prefix = "base_model.model.model.layers.4.mlp.experts"
+    original: dict[str, torch.Tensor] = {}
+    for expert in range(2):
+        offset = expert * 100
+        original.update(
+            {
+                f"{prefix}.{expert}.gate_up_proj.lora_A.weight": torch.arange(
+                    offset, offset + 6, dtype=torch.float32
+                ).reshape(2, 3),
+                f"{prefix}.{expert}.gate_up_proj.lora_B.weight": torch.arange(
+                    offset, offset + 16, dtype=torch.float32
+                ).reshape(8, 2),
+                f"{prefix}.{expert}.down_proj.lora_A.weight": torch.arange(
+                    offset, offset + 8, dtype=torch.float32
+                ).reshape(2, 4),
+                f"{prefix}.{expert}.down_proj.lora_B.weight": torch.arange(
+                    offset, offset + 6, dtype=torch.float32
+                ).reshape(3, 2),
+            }
+        )
+    config = _config("deepseek-ai/DeepSeek-V4-Flash")
+
+    vllm_tensors, vllm_config = DSV4_HANDLER.to_vllm_lora_tensors(
+        original,
+        adapter_config=config,
+    )
+
+    assert set(vllm_tensors) == {
+        f"{prefix}.base_layer.lora_A.weight",
+        f"{prefix}.base_layer.lora_B.weight",
+        f"{prefix}.lora_A.weight",
+        f"{prefix}.lora_B.weight",
+    }
+    assert vllm_tensors[f"{prefix}.base_layer.lora_A.weight"].shape == (4, 3)
+    assert vllm_tensors[f"{prefix}.base_layer.lora_B.weight"].shape == (8, 4)
+    assert vllm_tensors[f"{prefix}.lora_A.weight"].shape == (4, 4)
+    assert vllm_tensors[f"{prefix}.lora_B.weight"].shape == (3, 4)
+    assert "experts" in vllm_config["target_modules"]
+    _assert_tensors_equal(
+        DSV4_HANDLER.from_vllm_lora_tensors(
+            vllm_tensors,
+            adapter_config=vllm_config,
+        ),
+        original,
+    )
+
+
+def test_dsv4_rejects_lossy_split_gate_up_lora() -> None:
+    prefix = "base_model.model.model.layers.4.ffn.experts.0"
+    tensors = {
+        f"{prefix}.w1.lora_A.weight": torch.zeros(1, 3),
+        f"{prefix}.w1.lora_B.weight": torch.zeros(4, 1),
+        f"{prefix}.w2.lora_A.weight": torch.zeros(1, 4),
+        f"{prefix}.w2.lora_B.weight": torch.zeros(3, 1),
+        f"{prefix}.w3.lora_A.weight": torch.ones(1, 3),
+        f"{prefix}.w3.lora_B.weight": torch.zeros(4, 1),
+    }
+
+    with pytest.raises(RuntimeError, match="requires gate/up lora_A tensors to match"):
+        DSV4_HANDLER.from_vllm_lora_tensors(
+            tensors,
+            adapter_config=_config("deepseek-ai/DeepSeek-V4-Flash", rank=1),
+        )
 
 
 def test_gemma4_shared_experts_plural_keys_map_to_vllm_dense_mlp(tmp_path: Path):

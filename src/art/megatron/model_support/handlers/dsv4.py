@@ -30,7 +30,8 @@ _VALIDATION_NUM_LAYERS_ENV = "ART_DSV4_VALIDATION_NUM_LAYERS"
 _ORACLE_EXPERT_WEIGHT_RE = re.compile(r"\.mlp\.experts\..*\.weight(?P<expert>\d+)$")
 _DSV4_ART_MOE_EXPERT_KEY_RE = re.compile(
     r"^(?P<prefix>.*\.mlp\.experts)\.(?P<expert>\d+)\."
-    r"(?P<module>gate_proj|up_proj|down_proj)\.(?P<lora>lora_[AB])\.weight$"
+    r"(?P<module>gate_up_proj|gate_proj|up_proj|down_proj)\."
+    r"(?P<lora>lora_[AB])\.weight$"
 )
 _DSV4_VLLM_MOE_KEY_RE = re.compile(
     r"^(?P<prefix>.*\.mlp\.experts)\."
@@ -304,7 +305,7 @@ class Dsv4Handler(DefaultMoeHandler):
         )
         from art.megatron.lora import (
             _adapter_model_prefix,
-            wrap_grouped_moe_experts,
+            wrap_grouped_moe_experts_3d,
             wrap_shared_experts_mlp,
         )
 
@@ -324,7 +325,7 @@ class Dsv4Handler(DefaultMoeHandler):
                     rank=rank,
                     alpha=alpha,
                 )
-                wrap_grouped_moe_experts(
+                wrap_grouped_moe_experts_3d(
                     _require_moe_experts(module),
                     adapter_model_prefix=adapter_model_prefix,
                     target_modules=target_set,
@@ -997,6 +998,11 @@ def _dsv4_unpack_vllm_3d_lora_b(
     return tensor.reshape(tensor.shape[0], rank, num_experts).permute(2, 0, 1)
 
 
+def _dsv4_pack_vllm_3d_lora_b(blocks: list[torch.Tensor]) -> torch.Tensor:
+    stacked = torch.stack(blocks, dim=0)
+    return stacked.permute(1, 2, 0).reshape(stacked.shape[1], -1).contiguous()
+
+
 def _dsv4_clone(tensor: torch.Tensor) -> torch.Tensor:
     return tensor.clone().contiguous()
 
@@ -1094,8 +1100,57 @@ def _dsv4_to_vllm_lora_tensors(
     *,
     adapter_config: dict[str, Any],
 ) -> tuple[dict[str, torch.Tensor], dict[str, Any]]:
+    canonical = _dsv4_from_vllm_lora_tensors(
+        tensors,
+        adapter_config=adapter_config,
+    )
+    grouped: dict[str, dict[int, dict[str, dict[str, torch.Tensor]]]] = {}
+    for key, tensor in canonical.items():
+        match = _DSV4_ART_MOE_EXPERT_KEY_RE.match(key)
+        if match is not None:
+            grouped.setdefault(match.group("prefix"), {}).setdefault(
+                int(match.group("expert")), {}
+            ).setdefault(match.group("module"), {})[match.group("lora")] = tensor
+
     transformed: dict[str, torch.Tensor] = {}
-    for key, tensor in tensors.items():
+    used_keys: set[str] = set()
+    for prefix, experts in grouped.items():
+        blocks = {
+            slot: []
+            for slot in (
+                ("gate_up_proj", "lora_A"),
+                ("gate_up_proj", "lora_B"),
+                ("down_proj", "lora_A"),
+                ("down_proj", "lora_B"),
+            )
+        }
+        for expert in sorted(experts):
+            modules = experts[expert]
+            try:
+                expert_tensors = {slot: modules[slot[0]][slot[1]] for slot in blocks}
+            except KeyError as exc:
+                raise RuntimeError(
+                    f"Incomplete DSV4 MoE LoRA block for {prefix}.{expert}"
+                ) from exc
+            for slot, tensor in expert_tensors.items():
+                blocks[slot].append(tensor.contiguous())
+                used_keys.add(f"{prefix}.{expert}.{slot[0]}.{slot[1]}.weight")
+        transformed[f"{prefix}.base_layer.lora_A.weight"] = torch.cat(
+            blocks[("gate_up_proj", "lora_A")], dim=0
+        ).contiguous()
+        transformed[f"{prefix}.base_layer.lora_B.weight"] = _dsv4_pack_vllm_3d_lora_b(
+            blocks[("gate_up_proj", "lora_B")]
+        )
+        transformed[f"{prefix}.lora_A.weight"] = torch.cat(
+            blocks[("down_proj", "lora_A")], dim=0
+        ).contiguous()
+        transformed[f"{prefix}.lora_B.weight"] = _dsv4_pack_vllm_3d_lora_b(
+            blocks[("down_proj", "lora_B")]
+        )
+
+    for key, tensor in canonical.items():
+        if key in used_keys:
+            continue
         vllm_key = _dsv4_to_vllm_lora_key(key)
         if vllm_key in transformed:
             raise RuntimeError(
@@ -1103,6 +1158,51 @@ def _dsv4_to_vllm_lora_tensors(
             )
         transformed[vllm_key] = tensor
     return transformed, _dsv4_vllm_lora_config(adapter_config)
+
+
+def _dsv4_fuse_split_expert_lora(
+    tensors: dict[str, torch.Tensor],
+) -> dict[str, torch.Tensor]:
+    grouped: dict[str, dict[int, dict[str, dict[str, torch.Tensor]]]] = {}
+    for key, tensor in tensors.items():
+        match = _DSV4_ART_MOE_EXPERT_KEY_RE.match(key)
+        if match is not None:
+            grouped.setdefault(match.group("prefix"), {}).setdefault(
+                int(match.group("expert")), {}
+            ).setdefault(match.group("module"), {})[match.group("lora")] = tensor
+
+    transformed = dict(tensors)
+    for prefix, experts in grouped.items():
+        for expert, modules in experts.items():
+            if "gate_up_proj" in modules:
+                if "gate_proj" in modules or "up_proj" in modules:
+                    raise RuntimeError(
+                        f"Mixed fused and split DSV4 LoRA tensors for {prefix}.{expert}"
+                    )
+                continue
+            try:
+                gate_a = modules["gate_proj"]["lora_A"]
+                gate_b = modules["gate_proj"]["lora_B"]
+                up_a = modules["up_proj"]["lora_A"]
+                up_b = modules["up_proj"]["lora_B"]
+            except KeyError as exc:
+                raise RuntimeError(
+                    f"Incomplete DSV4 gate/up LoRA block for {prefix}.{expert}"
+                ) from exc
+            if not torch.equal(gate_a, up_a):
+                raise RuntimeError(
+                    "DSV4 fused-MoE LoRA requires gate/up lora_A tensors to match "
+                    f"for {prefix}.{expert}"
+                )
+            fused_prefix = f"{prefix}.{expert}.gate_up_proj"
+            transformed[f"{fused_prefix}.lora_A.weight"] = _dsv4_clone(gate_a)
+            transformed[f"{fused_prefix}.lora_B.weight"] = torch.cat(
+                (gate_b, up_b), dim=0
+            ).contiguous()
+            for module in ("gate_proj", "up_proj"):
+                for lora in ("lora_A", "lora_B"):
+                    transformed.pop(f"{prefix}.{expert}.{module}.{lora}.weight")
+    return transformed
 
 
 def _dsv4_from_vllm_lora_tensors(
@@ -1120,9 +1220,9 @@ def _dsv4_from_vllm_lora_tensors(
         )
         grouped.setdefault(match.group("prefix"), {})[slot] = tensor
     if not grouped:
-        return {
-            _dsv4_from_vllm_lora_key(key): tensor for key, tensor in tensors.items()
-        }
+        return _dsv4_fuse_split_expert_lora(
+            {_dsv4_from_vllm_lora_key(key): tensor for key, tensor in tensors.items()}
+        )
 
     rank = int(adapter_config["r"])
     transformed: dict[str, torch.Tensor] = {}
@@ -1161,17 +1261,12 @@ def _dsv4_from_vllm_lora_tensors(
             row = expert * rank
             gate_up_a_block = gate_up_a[row : row + rank]
             down_a_block = down_a[row : row + rank]
-            gate_b, up_b = gate_up_b_by_expert[expert].chunk(2, dim=0)
-            transformed[f"{prefix}.{expert}.gate_proj.lora_A.weight"] = _dsv4_clone(
+            transformed[f"{prefix}.{expert}.gate_up_proj.lora_A.weight"] = _dsv4_clone(
                 gate_up_a_block
             )
-            transformed[f"{prefix}.{expert}.gate_proj.lora_B.weight"] = _dsv4_clone(
-                gate_b
+            transformed[f"{prefix}.{expert}.gate_up_proj.lora_B.weight"] = _dsv4_clone(
+                gate_up_b_by_expert[expert]
             )
-            transformed[f"{prefix}.{expert}.up_proj.lora_A.weight"] = _dsv4_clone(
-                gate_up_a_block
-            )
-            transformed[f"{prefix}.{expert}.up_proj.lora_B.weight"] = _dsv4_clone(up_b)
             transformed[f"{prefix}.{expert}.down_proj.lora_A.weight"] = _dsv4_clone(
                 down_a_block
             )
@@ -1189,4 +1284,4 @@ def _dsv4_from_vllm_lora_tensors(
     for key, tensor in tensors.items():
         if key not in used_keys:
             transformed[_dsv4_from_vllm_lora_key(key)] = tensor
-    return transformed
+    return _dsv4_fuse_split_expert_lora(transformed)
