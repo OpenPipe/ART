@@ -137,11 +137,7 @@ def _tp_head_backward_worker(rank: int, world: int, init_method: str) -> None:
             device=device,
         )
         local_size = int(full.shape[1]) // world
-        local = (
-            full[:, rank * local_size : (rank + 1) * local_size]
-            .clone()
-            .requires_grad_()
-        )
+        local = _local_shard(full, rank, local_size)
         labels = torch.tensor([2, 5], device=device)
         rows = torch.arange(int(full.shape[0]), device=device)
         actual = _vocab_parallel_target_logprobs(
@@ -161,11 +157,7 @@ def _tp_head_backward_worker(rank: int, world: int, init_method: str) -> None:
             rtol=1e-6,
         )
 
-        local = (
-            full[:, rank * local_size : (rank + 1) * local_size]
-            .clone()
-            .requires_grad_()
-        )
+        local = _local_shard(full, rank, local_size)
         local_values, local_tokens = torch.topk(local, k=min(2, local_size), dim=-1)
         actual_topk = _vocab_parallel_topk_from_local(
             local_values,
@@ -200,20 +192,8 @@ def _tp_head_backward_worker(rank: int, world: int, init_method: str) -> None:
         gathered_hidden.sum().backward()
         torch.testing.assert_close(local_hidden.grad, torch.ones_like(local_hidden))
 
-        replicated = torch.nn.Parameter(torch.ones(1, device=device))
-        replicated.lora_shard_domain = "tp"  # type: ignore[attr-defined]
-        replicated.lora_tp_sharded = False  # type: ignore[attr-defined]
-        replicated.grad_sync_domain = "tp_default"  # type: ignore[attr-defined]
-        replicated.grad_sync_op = "sum"  # type: ignore[attr-defined]
-        replicated.allreduce = True  # type: ignore[attr-defined]
-        replicated.grad = torch.tensor([float(rank + 1)], device=device)
-        sharded = torch.nn.Parameter(torch.ones(1, device=device))
-        sharded.lora_shard_domain = "tp"  # type: ignore[attr-defined]
-        sharded.lora_tp_sharded = True  # type: ignore[attr-defined]
-        sharded.grad_sync_domain = "tp_default"  # type: ignore[attr-defined]
-        sharded.grad_sync_op = "none"  # type: ignore[attr-defined]
-        sharded.allreduce = True  # type: ignore[attr-defined]
-        sharded.grad = torch.tensor([float(rank + 1)], device=device)
+        replicated = _grad_param(rank, device, sharded=False, sync_op="sum")
+        sharded = _grad_param(rank, device, sharded=True)
         trainer = TrainerRank.__new__(TrainerRank)
         reduced = trainer._reduce_dynamic_grads((replicated, sharded), scale_grads=0.5)
         expected_replicated = 0.5 * sum(range(1, world + 1))
@@ -235,6 +215,7 @@ def _tp_head_backward_worker(rank: int, world: int, init_method: str) -> None:
 
         _assert_replica_grad_reduction(rank, world, context_parallel=True)
         _assert_replica_grad_reduction(rank, world, context_parallel=False)
+        _assert_distributed_optimizer_restore(device)
     finally:
         if getattr(ps, "model_parallel_is_initialized", lambda: False)():
             ps.destroy_model_parallel()
@@ -256,19 +237,66 @@ def _assert_replica_grad_reduction(
         expert_model_parallel_size=1,
     )
     device = torch.device("cuda", rank)
-    param = torch.nn.Parameter(torch.ones(1, device=device))
-    param.allreduce = True  # type: ignore[attr-defined]
-    param.lora_shard_domain = "tp"  # type: ignore[attr-defined]
-    param.lora_tp_sharded = False  # type: ignore[attr-defined]
-    param.grad_sync_domain = "tp_default"  # type: ignore[attr-defined]
-    param.grad_sync_op = "none"  # type: ignore[attr-defined]
-    param.grad = torch.tensor([float(rank + 1)], device=device)
+    param = _grad_param(rank, device, sharded=False)
 
     trainer = TrainerRank.__new__(TrainerRank)
     (reduced,) = trainer._reduce_dynamic_grads((param,), scale_grads=0.25)
     expected = 0.25 * sum(range(1, world + 1))
     torch.testing.assert_close(reduced, torch.tensor([expected], device=device))
     assert _distributed_grad_norm((param,), (reduced,)) == pytest.approx(expected)
+
+
+def _assert_distributed_optimizer_restore(device: torch.device) -> None:
+    ref = LoRASlotRef("checkpoint", "A")
+    adapter = _adapter("dense", rank=2, seed=11)
+    lora = LoRA("dense", 4, 5, 2, 32, torch.float32, device)
+    lora.load_lora_slot(ref, adapter, requires_grad=True)
+    trainer = _trainer_for(lora, device)
+    params = AdamParams(learning_rate=1e-3, weight_decay=0.0, grad_clip_norm=0.0)
+    x = torch.randn(3, 4, device=device)
+
+    with use_lora_slot(ref):
+        lora(x).sum().backward()
+    trainer.optim_step(params=params, checkpoints=["A"])
+    state = trainer.checkpoint_slot_optimizer_state("A")
+    assert state is not None
+    slot = lora._slot(ref)
+    assert slot is not None
+    adapter = {
+        "dense.lora_A.weight": slot.A_T.detach().T.contiguous(),
+        "dense.lora_B.weight": slot.B_T.detach().T.contiguous(),
+    }
+    with use_lora_slot(ref):
+        lora(x).sum().backward()
+    trainer.optim_step(params=params, checkpoints=["A"])
+
+    restored_lora = LoRA("dense", 4, 5, 2, 32, torch.float32, device)
+    restored = _trainer_for(restored_lora, device)
+    restored.load_checkpoint_slot("A", adapter, optimizer_state=state)
+    with use_lora_slot(ref):
+        restored_lora(x).sum().backward()
+    restored.optim_step(params=params, checkpoints=["A"])
+    for expected, actual in zip(
+        lora.lora_slot_params(ref), restored_lora.lora_slot_params(ref), strict=True
+    ):
+        torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+
+
+def _local_shard(full: torch.Tensor, rank: int, size: int) -> torch.Tensor:
+    return full[:, rank * size : (rank + 1) * size].clone().requires_grad_()
+
+
+def _grad_param(
+    rank: int, device: torch.device, *, sharded: bool, sync_op: str = "none"
+) -> torch.nn.Parameter:
+    param = torch.nn.Parameter(torch.ones(1, device=device))
+    param.allreduce = True  # type: ignore[attr-defined]
+    param.lora_shard_domain = "tp"  # type: ignore[attr-defined]
+    param.lora_tp_sharded = sharded  # type: ignore[attr-defined]
+    param.grad_sync_domain = "tp_default"  # type: ignore[attr-defined]
+    param.grad_sync_op = sync_op  # type: ignore[attr-defined]
+    param.grad = torch.tensor([float(rank + 1)], device=device)
+    return param
 
 
 def _adapter(prefix: str, *, rank: int, seed: int) -> dict[str, torch.Tensor]:

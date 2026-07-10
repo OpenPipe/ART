@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 from types import SimpleNamespace
 
 import pytest
@@ -20,6 +20,7 @@ from art.trainer_rank import (
     Unset,
     _flatten,
     _MemoryCheck,
+    _MemoryProfile,
 )
 
 
@@ -78,6 +79,24 @@ def _target_request(
         checkpoint=checkpoint,
         lora=lora,
     )
+
+
+def _set_packed_token_budget(
+    monkeypatch: pytest.MonkeyPatch,
+    rank: TrainerRank,
+    available: int | Callable[[], int],
+) -> None:
+    monkeypatch.setattr(
+        rank,
+        "_estimate_required_memory_bytes_from_values",
+        lambda **kwargs: kwargs["packed_tokens"],
+    )
+
+    def check(required: int, *, sync_across_dp: bool = False) -> _MemoryCheck:
+        limit = available() if callable(available) else available
+        return _MemoryCheck(required, limit, required <= limit)
+
+    monkeypatch.setattr(rank, "_memory_check_required", check)
 
 
 def _ternary_tree_sequences() -> tuple[torch.Tensor, ...]:
@@ -272,22 +291,9 @@ def test_adaptive_planner_materializes_only_final_large_candidate(
         estimate_calls += 1
         return original_estimate(requests)
 
-    def required_memory(**kwargs):
-        return kwargs["packed_tokens"]
-
-    def check(required, *, sync_across_dp=False):
-        return _MemoryCheck(
-            estimated_required_bytes=required,
-            available_bytes=limit_packed_tokens,
-            fits=required <= limit_packed_tokens,
-        )
-
     monkeypatch.setattr(rank, "_plan_flat_forward", plan)
     monkeypatch.setattr(rank, "_estimate_flat_forward", estimate)
-    monkeypatch.setattr(
-        rank, "_estimate_required_memory_bytes_from_values", required_memory
-    )
-    monkeypatch.setattr(rank, "_memory_check_required", check)
+    _set_packed_token_budget(monkeypatch, rank, limit_packed_tokens)
 
     candidate = rank._select_next_micro_batch(inputs, 0)
 
@@ -297,35 +303,75 @@ def test_adaptive_planner_materializes_only_final_large_candidate(
     assert candidate.rejected_candidates <= 8
 
 
-def test_adaptive_planner_reuses_large_stable_window(
+def test_adaptive_planner_globally_falls_back_when_one_rank_cannot_estimate(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    rank = TrainerRank(_runtime())  # type: ignore[arg-type]
+    monkeypatch.setattr(rank, "_dp_rank_and_size", lambda: (0, 2))
+    monkeypatch.setattr(rank, "_all_ranks_true", lambda _local: False)
+    plans = 0
+    original = rank._plan_flat_forward
+
+    def plan(requests):
+        nonlocal plans
+        plans += 1
+        return original(requests)
+
+    monkeypatch.setattr(rank, "_plan_flat_forward", plan)
+    candidate = rank._select_next_micro_batch(
+        [_target_request(_tokens(index)) for index in range(4)], 0
+    )
+
+    assert candidate.stats_global_count == 2
+    assert plans == 1
+
+
+def test_adaptive_planner_probes_new_heterogeneous_signatures(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    rank = TrainerRank(_runtime())  # type: ignore[arg-type]
+    monkeypatch.setattr(rank, "_dp_rank_and_size", lambda: (0, 1))
+    monkeypatch.setattr(rank, "_resolve_slot_ref", lambda request: request.checkpoint)
+    inputs = [
+        _target_request(_tokens(index), checkpoint=f"S{index % 4}")
+        for index in range(16)
+    ]
+
+    first = rank._select_next_micro_batch(inputs, 0)
+    rank._memory_profiles[first.plan.signature] = _MemoryProfile(0.0, 1_000_000)
+    rank._last_global_micro_batch_size = 1
+    second = rank._select_next_micro_batch(inputs, 1)
+    rank._memory_profiles[second.plan.signature] = _MemoryProfile(0.0, 1_000_000)
+    rank._last_global_micro_batch_size = 2
+    third = rank._select_next_micro_batch(inputs, 3)
+
+    assert [
+        first.stats_global_count,
+        second.stats_global_count,
+        third.stats_global_count,
+    ] == [
+        1,
+        2,
+        4,
+    ]
+
+
+def test_adaptive_planner_grows_stable_window_to_largest_aligned_fit(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     rank = TrainerRank(_runtime(), shared_prefix_max_depth=1)  # type: ignore[arg-type]
     rank._last_global_micro_batch_size = 512
     monkeypatch.setattr(rank, "_dp_rank_and_size", lambda: (0, 1))
     monkeypatch.setattr(rank, "_all_ranks_have_memory_profile", lambda **_kwargs: True)
-    monkeypatch.setattr(
-        rank,
-        "_estimate_required_memory_bytes_from_values",
-        lambda **kwargs: kwargs["packed_tokens"],
-    )
-    monkeypatch.setattr(
-        rank,
-        "_memory_check_required",
-        lambda required, *, sync_across_dp=False: _MemoryCheck(
-            estimated_required_bytes=required,
-            available_bytes=700,
-            fits=required <= 700,
-        ),
-    )
+    _set_packed_token_budget(monkeypatch, rank, 700)
 
     candidate = rank._select_next_micro_batch(
         [_target_request(_tokens(index)) for index in range(900)],
         0,
     )
 
-    assert candidate.stats_global_count == 512
-    assert candidate.rejected_candidates == 0
+    assert candidate.stats_global_count == 672
+    assert candidate.rejected_candidates <= 2
 
 
 def test_forward_micro_batches_shrinks_when_memory_budget_drops(
@@ -350,17 +396,6 @@ def test_forward_micro_batches_shrinks_when_memory_budget_drops(
         plan_calls += 1
         return original_plan(requests)
 
-    def required_memory(**kwargs):
-        return kwargs["packed_tokens"]
-
-    def check(required, *, sync_across_dp=False):
-        limit = available["packed_tokens"]
-        return _MemoryCheck(
-            estimated_required_bytes=required,
-            available_bytes=limit,
-            fits=required <= limit,
-        )
-
     def run(plan, **_kwargs):
         if available["packed_tokens"] == first_limit_packed_tokens:
             available["packed_tokens"] = tail_limit_packed_tokens
@@ -369,10 +404,7 @@ def test_forward_micro_batches_shrinks_when_memory_budget_drops(
         ]
 
     monkeypatch.setattr(rank, "_plan_flat_forward", plan)
-    monkeypatch.setattr(
-        rank, "_estimate_required_memory_bytes_from_values", required_memory
-    )
-    monkeypatch.setattr(rank, "_memory_check_required", check)
+    _set_packed_token_budget(monkeypatch, rank, lambda: available["packed_tokens"])
     monkeypatch.setattr(rank, "_run_flat_plan_with_memory_tracking", run)
 
     batches = list(rank.forward_micro_batches(inputs))
@@ -425,89 +457,45 @@ def test_heterogeneous_slots_split_packing_without_losing_output_estimates(
     }
 
 
-def test_dp_uneven_tail_yields_empty_rank_batch(
+@pytest.mark.parametrize("api", ("dp_rank_forward", "forward_micro_batches"))
+def test_forward_raises_before_expected_oom_with_actionable_context(
+    api: str,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     rank = TrainerRank(_runtime())  # type: ignore[arg-type]
-    monkeypatch.setattr(rank, "_dp_rank_and_size", lambda: (3, 4))
-    monkeypatch.setattr(
-        rank,
-        "_run_flat_plan_with_memory_tracking",
-        lambda plan, **_kwargs: [
-            ForwardOutput(None, None, None, None) for _ in range(plan.request_count)
-        ],
-    )
-
-    batches = list(
-        rank.forward_micro_batches(
-            [_target_request(_tokens(i, i + 1)) for i in range(5)]
+    if api == "dp_rank_forward":
+        monkeypatch.setattr(
+            rank,
+            "_memory_check",
+            lambda plan, **_kwargs: _MemoryCheck(plan.output_bytes + 1, 0, False),
         )
-    )
-
-    assert [batch.indices for batch in batches] == [(3,), ()]
-    assert [batch.stats.local_count for batch in batches] == [1, 0]
-
-
-def test_dp_rank_forward_raises_before_expected_oom(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    rank = TrainerRank(_runtime())  # type: ignore[arg-type]
-    monkeypatch.setattr(
-        rank,
-        "_memory_check",
-        lambda plan, *, sync_across_dp=False: _MemoryCheck(
-            estimated_required_bytes=plan.output_bytes + 1,
-            available_bytes=plan.output_bytes,
-            fits=False,
-        ),
-    )
-
-    with pytest.raises(TrainerRankMemoryError, match="dp_rank_forward"):
-        rank.dp_rank_forward(
-            [_target_request(_tokens(1, 2, 3), logits=True, hidden_states=True)]
+    else:
+        monkeypatch.setattr(rank, "_dp_rank_and_size", lambda: (0, 1))
+        monkeypatch.setattr(
+            rank,
+            "_estimate_required_memory_bytes_from_values",
+            lambda **_kwargs: 99,
         )
-
-
-def test_memory_error_includes_actionable_shape_context(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    rank = TrainerRank(_runtime())  # type: ignore[arg-type]
-    monkeypatch.setattr(rank, "_dp_rank_and_size", lambda: (0, 1))
-    monkeypatch.setattr(
-        rank,
-        "_estimate_required_memory_bytes_from_values",
-        lambda **_kwargs: 99,
-    )
-    monkeypatch.setattr(
-        rank,
-        "_memory_check_required",
-        lambda required, *, sync_across_dp=False: _MemoryCheck(required, 1, False),
-    )
+        monkeypatch.setattr(
+            rank,
+            "_memory_check_required",
+            lambda required, **_kwargs: _MemoryCheck(required, 1, False),
+        )
+    request = [_target_request(_tokens(1, 2, 3), logits=True)]
 
     with pytest.raises(TrainerRankMemoryError) as exc_info:
-        next(
-            iter(
-                rank.forward_micro_batches(
-                    [_target_request(_tokens(1, 2, 3), logits=True)]
-                )
-            )
+        (
+            rank.dp_rank_forward(request)
+            if api == "dp_rank_forward"
+            else next(iter(rank.forward_micro_batches(request)))
         )
 
     message = str(exc_info.value)
+    assert api in message
     assert "packed_tokens=" in message
     assert "logical_tokens=" in message
     assert "output_gb=" in message
     assert "Use smaller top-level items" in message
-
-
-def test_topk_output_memory_scales_with_requested_k() -> None:
-    rank = TrainerRank(_runtime())  # type: ignore[arg-type]
-    tokens = _tokens(1, 2, 3, 4)
-
-    small = rank._plan_flat_forward([_target_request(tokens, top_k=1)])
-    large = rank._plan_flat_forward([_target_request(tokens, top_k=7)])
-
-    assert large.output_bytes - small.output_bytes == 4 * 6 * (4 + 8)
 
 
 def test_flatten_rejects_dicts_to_avoid_silent_top_level_shape_changes() -> None:

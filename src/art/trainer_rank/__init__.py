@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 from collections.abc import (
-    Callable,
     Iterable,
     Iterator,
     Mapping,
@@ -14,7 +13,6 @@ from typing import (
     Any,
     Generic,
     Literal,
-    ParamSpec,
     TypeVar,
     cast,
     overload,
@@ -64,10 +62,7 @@ TopKT = TypeVar("TopKT", bound=TopK | None, covariant=True)
 LogitsT = TypeVar("LogitsT", bound=torch.Tensor | None, covariant=True)
 HiddenStatesT = TypeVar("HiddenStatesT", bound=torch.Tensor | None, covariant=True)
 T = TypeVar("T")
-P = ParamSpec("P")
-R = TypeVar("R")
 
-_COMPILED_FUNCTIONS: dict[Callable[..., object], Callable[..., object]] = {}
 _MEMORY_PROFILE_TRUST_GROWTH = 8
 
 
@@ -93,7 +88,7 @@ class ForwardOutput(Generic[LogprobsT, TopKT, LogitsT, HiddenStatesT]):
     hidden_states: HiddenStatesT
 
 
-@dataclass(slots=True, init=False)
+@dataclass(slots=True)
 class ForwardInput(Generic[LogprobsT, TopKT, LogitsT, HiddenStatesT]):
     input_tokens: torch.Tensor
     target_tokens: torch.Tensor | None = None
@@ -337,26 +332,6 @@ class ForwardInput(Generic[LogprobsT, TopKT, LogitsT, HiddenStatesT]):
     ) -> Any:
         return object.__new__(cls)
 
-    def __init__(
-        self,
-        *,
-        input_tokens: torch.Tensor,
-        target_tokens: torch.Tensor | None = None,
-        top_k: int | None = None,
-        logits: bool = False,
-        hidden_states: bool = False,
-        checkpoint: AdapterSelection = Unset,
-        lora: AdapterSelection = Unset,
-    ) -> None:
-        self.input_tokens = input_tokens
-        self.target_tokens = target_tokens
-        self.top_k = top_k
-        self.logits = logits
-        self.hidden_states = hidden_states
-        self.checkpoint = checkpoint
-        self.lora = lora
-        self.__post_init__()
-
     def __post_init__(self) -> None:
         if self.top_k is not None and self.top_k < 1:
             raise ValueError("top_k must be >= 1")
@@ -457,17 +432,8 @@ class _SlotGraphSentinel(torch.autograd.Function):
 
 
 @dataclass(frozen=True)
-class _SlotGraphLease:
-    markers: tuple[weakref.ReferenceType[torch.Tensor], ...]
-
-    def is_live(self) -> bool:
-        return any(marker() is not None for marker in self.markers)
-
-
-@dataclass(frozen=True)
 class _DynamicOptimizer:
     optimizer: torch.optim.Optimizer
-    model_params: tuple[torch.nn.Parameter, ...]
     master_params: tuple[torch.nn.Parameter, ...]
 
 
@@ -505,10 +471,7 @@ class _PreparedPackedForward:
     source_positions_by_item: tuple[torch.Tensor, ...]
 
 
-@dataclass(frozen=True)
-class _RowMatch:
-    source_offsets: torch.Tensor
-    row_offsets: torch.Tensor
+type _RowMatch = tuple[torch.Tensor, torch.Tensor, tuple[int, ...]]
 
 
 @dataclass(frozen=True)
@@ -535,9 +498,6 @@ class _FlatForwardPlan:
     logical_tokens: int
     output_bytes: int
     signature: _MemorySignature
-
-
-type _AdaptivePlanCacheKey = tuple[tuple[int, ...], object, tuple[object, ...], int]
 
 
 class TrainerRank:
@@ -584,12 +544,10 @@ class TrainerRank:
         self._checkpoint_slot_params_by_name: dict[
             str, tuple[torch.nn.Parameter, ...]
         ] = {}
-        self._pending_slot_graphs: dict[LoRASlotRef, list[_SlotGraphLease]] = {}
-        self._memory_profiles: dict[_MemorySignature, _MemoryProfile] = {}
-        self._adaptive_plan_cache: dict[_AdaptivePlanCacheKey, _FlatForwardPlan] = {}
-        self._adaptive_estimate_cache: dict[
-            _AdaptivePlanCacheKey, tuple[int, int, _MemorySignature] | None
+        self._pending_slot_graphs: dict[
+            LoRASlotRef, list[weakref.ReferenceType[torch.Tensor]]
         ] = {}
+        self._memory_profiles: dict[_MemorySignature, _MemoryProfile] = {}
         self._last_global_micro_batch_size: int | None = None
         self.zero_grad()
 
@@ -743,9 +701,11 @@ class TrainerRank:
         self,
         inputs: Iterable[ForwardInputs],
     ) -> Iterator[MicroBatch[ForwardInputs, ForwardOutputs]]:
-        items: list[ForwardInputs] = list(inputs)
-        self._adaptive_plan_cache.clear()
-        self._adaptive_estimate_cache.clear()
+        items = [_materialize(item) for item in inputs]
+        requests = list(_flatten(items))
+        for _, indices in self._group_active_request_indices(requests):
+            for index in indices:
+                self._forward_item(requests[index])
         self._validate_replicated_top_level_count(len(items))
         start = 0
         while start < len(items):
@@ -882,8 +842,7 @@ class TrainerRank:
     ) -> int:
         if self._slot_stack:
             raise RuntimeError("Cannot load a LoRA/checkpoint while a slot is pushed")
-        self._validate_adapter_slot_keys(kind, name, adapter_model)
-        adapter_model = self._normalize_adapter_model(adapter_model)
+        adapter_model = self._prepare_adapter_model(kind, name, adapter_model)
         from art.megatron.lora import LORA_ALPHA, load_lora_slot_into_model
 
         ref = self._slot_ref(kind, name)
@@ -896,42 +855,27 @@ class TrainerRank:
             requires_grad=trainable,
         )
 
-    def _validate_adapter_slot_keys(
+    def _prepare_adapter_model(
         self,
         kind: Literal["checkpoint", "lora"],
         name: str,
         adapter_model: Mapping[str, torch.Tensor],
-    ) -> None:
-        keys = set(adapter_model)
-        if not keys:
-            return
-        expected = self._installed_lora_adapter_keys()
-        unknown = sorted(keys - expected)
-        if not unknown:
-            return
-        preview = ", ".join(repr(key) for key in unknown[:8])
-        suffix = "" if len(unknown) <= 8 else f", ... +{len(unknown) - 8} more"
-        raise ValueError(
-            f"Adapter for {kind} slot {name!r} contains keys that do not match "
-            f"installed LoRA wrapper sites: {preview}{suffix}. Configure the "
-            "Megatron runtime with matching LoRA target modules before loading "
-            "this slot."
-        )
-
-    def _installed_lora_adapter_keys(self) -> set[str]:
-        local = set(self._local_lora_adapter_templates())
-        if not (dist.is_available() and dist.is_initialized()):
-            return local
-
-        gathered: list[set[str] | None] = [None] * dist.get_world_size()
-        dist.all_gather_object(gathered, local)
-        return set().union(*(keys for keys in gathered if keys is not None))
-
-    def _normalize_adapter_model(
-        self,
-        adapter_model: Mapping[str, torch.Tensor],
     ) -> dict[str, torch.Tensor]:
         templates = self._local_lora_adapter_templates()
+        keys = set(adapter_model)
+        expected = set(templates)
+        if dist.is_available() and dist.is_initialized():
+            gathered: list[set[str] | None] = [None] * dist.get_world_size()
+            dist.all_gather_object(gathered, expected)
+            expected = set().union(*(value for value in gathered if value is not None))
+        if unknown := sorted(keys - expected):
+            preview = ", ".join(repr(key) for key in unknown[:8])
+            more = "" if len(unknown) <= 8 else f", ... +{len(unknown) - 8} more"
+            raise ValueError(
+                f"Adapter for {kind} slot {name!r} contains keys that do not match "
+                f"installed LoRA wrapper sites: {preview}{more}. Configure the "
+                "Megatron runtime with matching LoRA target modules before loading."
+            )
         return {
             key: (
                 tensor.to(
@@ -996,43 +940,28 @@ class TrainerRank:
         if not (dist.is_available() and dist.is_initialized()):
             return params
 
-        local = {
-            "rank": dist.get_rank(),
-            "loaded_sites": int(loaded_sites),
-            "param_count": len(params),
-            "numel": sum(int(param.numel()) for param in params),
-            "signature": [
-                (
-                    tuple(int(dim) for dim in param.shape),
-                    str(param.dtype),
-                    bool(getattr(param, "allreduce", True)),
-                    str(getattr(param, "grad_sync_domain", "tp_default")),
-                    str(getattr(param, "grad_sync_op", "none")),
-                )
-                for param in params
-            ],
-        }
-        gathered: list[dict[str, object] | None] = [None] * dist.get_world_size()
+        signature = tuple(
+            (
+                tuple(param.shape),
+                str(param.dtype),
+                bool(getattr(param, "allreduce", True)),
+                str(getattr(param, "grad_sync_domain", "tp_default")),
+                str(getattr(param, "grad_sync_op", "none")),
+            )
+            for param in params
+        )
+        local = (int(loaded_sites), signature)
+        gathered: list[tuple[int, object] | None] = [None] * dist.get_world_size()
         dist.all_gather_object(gathered, local)
-        ranks = [rank for rank in gathered if rank is not None]
-        reference = ranks[0]
-        if all(
-            rank["loaded_sites"] == reference["loaded_sites"]
-            and rank["signature"] == reference["signature"]
-            for rank in ranks
-        ):
+        ranks = [state for state in gathered if state is not None]
+        if all(state == ranks[0] for state in ranks[1:]):
             return params
-
-        summary = [
-            {key: rank[key] for key in ("rank", "loaded_sites", "param_count", "numel")}
-            for rank in ranks
-        ]
         raise RuntimeError(
             f"Dynamic LoRA slot {kind}:{name} is not loaded consistently across "
             "distributed ranks. This usually means a sharded/exported LoRA state "
             "dict was passed directly to TrainerRank; gather or materialize the "
             "full adapter state before loading a dynamic slot. "
-            f"Rank summary: {summary}."
+            f"Loaded-site counts by rank: {[state[0] for state in ranks]}."
         )
 
     def _resolve_slot_ref(self, request: AnyForwardInput) -> "LoRASlotRef | None":
@@ -1050,60 +979,54 @@ class TrainerRank:
         self,
         checkpoints: Sequence[str] | None,
     ) -> tuple[str, ...]:
-        if checkpoints is not None:
-            selected = tuple(dict.fromkeys(checkpoints))
-            if unknown := set(selected) - self._checkpoint_slot_params_by_name.keys():
-                raise ValueError(f"Unknown checkpoint slots: {sorted(unknown)}")
-            if not selected:
-                raise TrainerRankSlotStateError(
-                    "TrainerRank.optim_step(checkpoints=...) received no checkpoint "
-                    "names. Pass at least one loaded checkpoint slot."
-                )
-            self._raise_if_checkpoints_have_no_grads(selected)
-            return selected
-        slots = tuple(sorted(self._checkpoint_slot_params_by_name.items()))
-        if not slots:
+        loaded = set(self._checkpoint_slot_params_by_name)
+        if not loaded:
             raise TrainerRankSlotStateError(
                 "TrainerRank.optim_step requires a loaded checkpoint slot. Call "
                 "load_checkpoint_slot(...) and run backward on outputs produced by "
                 "that slot before stepping."
             )
-        names = tuple(name for name, _ in slots)
-        has_grad = self._checkpoint_grad_flags(names)
-        selected = tuple(
-            name for name, flag in zip(names, has_grad, strict=True) if flag
+        requested = (
+            tuple(sorted(loaded))
+            if checkpoints is None
+            else tuple(dict.fromkeys(checkpoints))
         )
-        if not selected:
+        if not requested:
             raise TrainerRankSlotStateError(
-                "TrainerRank.optim_step found loaded checkpoint slots, but none have "
-                "gradients on any rank. Call loss.backward() first, or pass the "
-                "checkpoint names that should be stepped after producing gradients."
+                "TrainerRank.optim_step(checkpoints=...) received no checkpoint "
+                "names. Pass at least one loaded checkpoint slot."
             )
-        return selected
-
-    def _raise_if_checkpoints_have_no_grads(self, names: Sequence[str]) -> None:
-        missing = [
+        if unknown := set(requested) - loaded:
+            raise ValueError(f"Unknown checkpoint slots: {sorted(unknown)}")
+        flags = self._checkpoint_grad_flags(requested)
+        selected = tuple(
+            name for name, has_grad in zip(requested, flags, strict=True) if has_grad
+        )
+        if checkpoints is None:
+            if selected:
+                return selected
+            raise TrainerRankSlotStateError(
+                "TrainerRank.optim_step found loaded checkpoint slots, but none "
+                "have gradients on any rank. Call loss.backward() first."
+            )
+        if missing := [
             name
-            for name, has_grad in zip(
-                names, self._checkpoint_grad_flags(names), strict=True
-            )
+            for name, has_grad in zip(requested, flags, strict=True)
             if not has_grad
-        ]
-        if missing:
+        ]:
             raise TrainerRankSlotStateError(
                 "TrainerRank.optim_step was asked to step checkpoint slots with no "
                 f"gradients on any rank: {missing}. Call loss.backward() for those "
                 "slots first, or omit them from checkpoints=[...]."
             )
+        return selected
 
     def _checkpoint_grad_flags(self, names: Sequence[str]) -> tuple[bool, ...]:
         flags = torch.tensor(
             [
-                int(
-                    any(
-                        param.grad is not None
-                        for param in self._checkpoint_slot_params_by_name[name]
-                    )
+                any(
+                    param.grad is not None
+                    for param in self._checkpoint_slot_params_by_name[name]
                 )
                 for name in names
             ],
@@ -1121,26 +1044,14 @@ class TrainerRank:
         params: AdamParams,
         scale_grads: float,
     ) -> dict[str, float]:
-        selected: list[
-            tuple[
-                str,
-                tuple[torch.nn.Parameter, ...],
-                tuple[torch.Tensor, ...],
-            ]
-        ] = []
+        selected = []
         for name in checkpoint_names:
             self._guard_checkpoint_can_step(name)
             slot_params = self._checkpoint_slot_params_by_name[name]
-            selected.append(
-                (
-                    name,
-                    slot_params,
-                    self._reduce_dynamic_grads(
-                        slot_params,
-                        scale_grads=scale_grads,
-                    ),
-                )
+            slot_grads = self._reduce_dynamic_grads(
+                slot_params, scale_grads=scale_grads
             )
+            selected.append((name, slot_params, slot_grads))
 
         all_params = tuple(
             param for _, slot_params, _ in selected for param in slot_params
@@ -1228,7 +1139,7 @@ class TrainerRank:
             betas=(params.beta1, params.beta2),
             weight_decay=params.weight_decay,
         )
-        return _DynamicOptimizer(optimizer, model_params, masters)
+        return _DynamicOptimizer(optimizer, masters)
 
     def _restore_dynamic_optimizer(
         self,
@@ -1267,17 +1178,8 @@ class TrainerRank:
                 f"Optimizer state for checkpoint slot {name!r} does not match the "
                 "loaded slot parameter groups."
             ) from exc
-        self._validate_dynamic_optimizer_state_shapes(name, dynamic)
-        return dynamic
-
-    def _validate_dynamic_optimizer_state_shapes(
-        self,
-        name: str,
-        dynamic: _DynamicOptimizer,
-    ) -> None:
         for param in dynamic.master_params:
-            state = dynamic.optimizer.state.get(param, {})
-            for state_name, value in state.items():
+            for state_name, value in dynamic.optimizer.state.get(param, {}).items():
                 if (
                     isinstance(value, torch.Tensor)
                     and int(value.ndim) > 0
@@ -1288,6 +1190,7 @@ class TrainerRank:
                         f"{name!r} has shape {tuple(value.shape)}, but the loaded "
                         f"slot parameter has shape {tuple(param.shape)}."
                     )
+        return dynamic
 
     def _reduce_dynamic_grads(
         self,
@@ -1363,18 +1266,14 @@ class TrainerRank:
         min_width = min(dp_size, remaining)
         if min_width <= 0:
             raise RuntimeError("cannot select an empty microbatch window")
-
-        def clamp_width(width: int) -> int:
-            return max(min_width, min(width, remaining))
-
         base_granularity = 1 if remaining < 64 else 8 if remaining < 256 else 32
         granularity = max(
             1,
             ((base_granularity + dp_size - 1) // dp_size) * dp_size,
         )
 
-        def snap_width(width: int) -> int:
-            width = clamp_width(width)
+        def normalize(width: int) -> int:
+            width = max(min_width, min(width, remaining))
             if width in (min_width, remaining) or granularity <= 1:
                 return width
             if width < granularity:
@@ -1382,71 +1281,97 @@ class TrainerRank:
             return max(min_width, (width // granularity) * granularity)
 
         def local_slice(width: int) -> tuple[tuple[int, ...], list[ForwardInputsT]]:
-            stop = start + clamp_width(width)
+            stop = start + width
             indices = tuple(range(start + dp_rank, stop, dp_size))
             return indices, [items[index] for index in indices]
 
-        def candidate(
-            width: int,
-            estimated_check: _MemoryCheck | None = None,
-            *,
-            rejected: int,
-        ) -> _CandidateMicroBatch[ForwardInputsT]:
-            width = clamp_width(width)
+        estimates: dict[int, tuple[_MemoryCheck, bool, bool] | None] = {}
+        plans: dict[int, _FlatForwardPlan] = {}
+
+        def estimate(width: int) -> tuple[_MemoryCheck, bool, bool] | None:
+            width = normalize(width)
+            if width in estimates:
+                return estimates[width]
             indices, local_inputs = local_slice(width)
-            plan = self._cached_adaptive_plan(indices, local_inputs)
+            values = self._estimate_flat_forward(list(_flatten(local_inputs)))
+            if not self._all_ranks_true(values is not None):
+                estimates[width] = None
+                return None
+            assert values is not None
+            packed_tokens, output_bytes, signature = values
+            result = (
+                self._memory_check_required(
+                    self._estimate_required_memory_bytes_from_values(
+                        packed_tokens=packed_tokens,
+                        output_bytes=output_bytes,
+                        signature=signature,
+                    ),
+                    sync_across_dp=True,
+                ),
+                self._all_ranks_have_memory_profile(
+                    packed_tokens=packed_tokens,
+                    signature=signature,
+                ),
+                self._all_ranks_true(signature in self._memory_profiles),
+            )
+            estimates[width] = result
+            return result
+
+        rejected_widths: set[int] = set()
+
+        def fits(width: int) -> tuple[bool, bool]:
+            width = normalize(width)
+            result = estimate(width)
+            if result is None:
+                plan = materialize(width)
+                check = self._memory_check(plan, sync_across_dp=True)
+                trusted = self._all_ranks_have_memory_profile(
+                    packed_tokens=plan.packed_tokens,
+                    signature=plan.signature,
+                )
+                profiled = self._all_ranks_true(plan.signature in self._memory_profiles)
+            else:
+                check, trusted, profiled = result
+            if not check.fits:
+                rejected_widths.add(width)
+            return check.fits and (trusted or not profiled), trusted
+
+        def materialize(width: int) -> _FlatForwardPlan:
+            width = normalize(width)
+            plan = plans.get(width)
+            if plan is None:
+                _, local_inputs = local_slice(width)
+                plan = self._plan_flat_forward(list(_flatten(local_inputs)))
+                plans[width] = plan
+            return plan
+
+        def candidate(width: int) -> _CandidateMicroBatch[ForwardInputsT]:
+            width = normalize(width)
+            indices, local_inputs = local_slice(width)
+            plan = materialize(width)
+            estimated = estimates.get(width)
+            check = (
+                estimated[0]
+                if estimated is not None
+                else self._memory_check(plan, sync_across_dp=True)
+            )
+            cold_start = not self._all_ranks_have_memory_profile(
+                packed_tokens=plan.packed_tokens,
+                signature=plan.signature,
+            )
             return _CandidateMicroBatch(
                 inputs=local_inputs,
                 indices=indices,
                 plan=plan,
-                check=estimated_check or self._memory_check(plan, sync_across_dp=True),
+                check=check,
                 stats_global_count=width,
-                rejected_candidates=rejected,
-                cold_start=not self._all_ranks_have_memory_profile(
-                    packed_tokens=plan.packed_tokens,
-                    signature=plan.signature,
-                ),
+                rejected_candidates=len(rejected_widths),
+                cold_start=cold_start,
             )
 
-        def estimate(width: int) -> tuple[_MemoryCheck, bool] | None:
-            indices, local_inputs = local_slice(width)
-            return self._cached_adaptive_estimate(indices, local_inputs)
-
-        def probe(width: int) -> tuple[bool, _MemoryCheck | None, bool]:
-            estimated = estimate(width)
-            if estimated is not None:
-                check, trusted = estimated
-                return trusted and check.fits, check, trusted
-            item = candidate(width, rejected=0)
-            return item.check.fits, item.check, not item.cold_start
-
-        rejected = 0
-        best_width = min_width
-        best_check: _MemoryCheck | None = None
-
-        def fit(width: int) -> bool:
-            nonlocal best_width, best_check, rejected
-            ok, check, _ = probe(width)
-            if ok:
-                best_width = snap_width(width)
-                best_check = check
-            else:
-                rejected += 1
-            return ok
-
-        def search_below(failed_width: int) -> None:
-            low = best_width + 1
-            high = failed_width - 1
-            while low <= high:
-                mid = (low + high) // 2
-                if fit(mid):
-                    low = mid + 1
-                else:
-                    high = mid - 1
-
-        first_fits, first_check, first_trusted = probe(min_width)
-        if not first_fits:
-            first = candidate(min_width, first_check, rejected=rejected)
+        first_estimate = estimate(min_width)
+        if first_estimate is None or not (first_estimate[0].fits and first_estimate[1]):
+            first = candidate(min_width)
             if not first.check.fits:
                 self._raise_memory_error(
                     first.plan,
@@ -1456,99 +1381,42 @@ class TrainerRank:
                 )
             if first.cold_start:
                 return first
-            best_check = first.check
-        else:
-            best_check = first_check
 
-        stable_width = self._last_global_micro_batch_size
-        if stable_width is not None and stable_width >= max(64, granularity * 2):
-            stable_capacity = stable_width
-            stable_width = clamp_width(stable_capacity)
-            if fit(stable_width):
-                grow_multiplier = 4 if stable_capacity < 256 else 2
-                grow_capacity = min(remaining, stable_capacity * grow_multiplier)
-                if remaining > grow_capacity:
-                    grow_width = clamp_width(grow_capacity)
-                    if grow_width > stable_width and not fit(grow_width):
-                        search_below(grow_width)
-                return candidate(best_width, best_check, rejected=rejected)
-            search_below(stable_width)
-            self._last_global_micro_batch_size = best_width
-            return candidate(best_width, best_check, rejected=rejected)
+        best = min_width
+        failed: int | None = None
+        width = normalize(self._last_global_micro_batch_size or min_width)
+        if width > best:
+            fit, trusted = fits(width)
+            if fit:
+                best = width
+                if not trusted:
+                    return candidate(best)
+            else:
+                failed = width
 
-        high_fail: int | None = None
-        width = min(
-            remaining,
-            max(min_width, (self._last_global_micro_batch_size or min_width) * 2),
-        )
-        while width <= remaining:
-            if fit(width):
-                if width == remaining:
+        while failed is None and best < remaining:
+            width = normalize(max(best + 1, best * 2))
+            if width == best:
+                break
+            fit, trusted = fits(width)
+            if fit:
+                best = width
+                if not trusted:
                     break
-                width = min(remaining, max(width + 1, width * 2))
-                continue
-            high_fail = width
-            break
+            else:
+                failed = width
 
-        if high_fail is not None:
-            search_below(high_fail)
+        if failed is not None:
+            while failed - best > 1:
+                width = normalize((best + failed) // 2)
+                if width in (best, failed):
+                    break
+                if fits(width)[0]:
+                    best = width
+                else:
+                    failed = width
 
-        if not first_trusted and best_width == min_width and best_check is None:
-            return candidate(min_width, first_check, rejected=rejected)
-        return candidate(best_width, best_check, rejected=rejected)
-
-    def _cached_adaptive_plan(
-        self,
-        indices: tuple[int, ...],
-        local_inputs: Sequence[ForwardInputsT],
-    ) -> _FlatForwardPlan:
-        key = self._adaptive_cache_key(indices)
-        cached = self._adaptive_plan_cache.get(key)
-        if cached is not None:
-            return cached
-        plan = self._plan_flat_forward(list(_flatten(local_inputs)))
-        self._adaptive_plan_cache[key] = plan
-        return plan
-
-    def _cached_adaptive_estimate(
-        self,
-        indices: tuple[int, ...],
-        local_inputs: Sequence[ForwardInputsT],
-    ) -> tuple[_MemoryCheck, bool] | None:
-        key = self._adaptive_cache_key(indices)
-        if key in self._adaptive_estimate_cache:
-            estimate = self._adaptive_estimate_cache[key]
-        else:
-            estimate = self._estimate_flat_forward(list(_flatten(local_inputs)))
-            self._adaptive_estimate_cache[key] = estimate
-        if estimate is None:
-            return None
-        packed_tokens, output_bytes, signature = estimate
-        return (
-            self._memory_check_required(
-                self._estimate_required_memory_bytes_from_values(
-                    packed_tokens=packed_tokens,
-                    output_bytes=output_bytes,
-                    signature=signature,
-                ),
-                sync_across_dp=True,
-            ),
-            self._all_ranks_have_memory_profile(
-                packed_tokens=packed_tokens,
-                signature=signature,
-            ),
-        )
-
-    def _adaptive_cache_key(
-        self,
-        indices: tuple[int, ...],
-    ) -> _AdaptivePlanCacheKey:
-        return (
-            indices,
-            self._default_slot_ref,
-            tuple(self._slot_stack),
-            self.shared_prefix_max_depth,
-        )
+        return candidate(best)
 
     def _validate_replicated_top_level_count(self, count: int) -> None:
         if not (dist.is_available() and dist.is_initialized()):
@@ -1616,7 +1484,7 @@ class TrainerRank:
         packed_tokens = 0
         for _, group_indices in groups:
             group_packed_tokens = estimate_prefix_tree_packed_tokens(
-                (requests[index].input_tokens for index in group_indices),
+                (requests[index].input_tokens.reshape(-1) for index in group_indices),
                 max_depth=self.shared_prefix_max_depth,
             )
             if group_packed_tokens is None:
@@ -1678,13 +1546,7 @@ class TrainerRank:
 
     def _execute_flat_plan(self, plan: _FlatForwardPlan) -> list[AnyForwardOutput]:
         outputs = [
-            ForwardOutput(
-                target_logprobs=None,
-                top_k=None,
-                logits=None,
-                hidden_states=None,
-            )
-            for _ in range(plan.request_count)
+            ForwardOutput(None, None, None, None) for _ in range(plan.request_count)
         ]
         for group in plan.groups:
             from art.megatron.lora import use_lora_slot
@@ -1705,13 +1567,14 @@ class TrainerRank:
         if ref is None or ref.name is None:
             return list(outputs)
 
-        marker_refs: list[weakref.ReferenceType[torch.Tensor]] = []
+        marker: torch.Tensor | None = None
 
         def track(tensor: torch.Tensor | None) -> torch.Tensor | None:
+            nonlocal marker
             if tensor is None or not tensor.requires_grad:
                 return tensor
-            marker = tensor.new_empty(0)
-            marker_refs.append(weakref.ref(marker))
+            if marker is None:
+                marker = tensor.new_empty(0)
             return cast(torch.Tensor, _SlotGraphSentinel.apply(tensor, marker))
 
         tracked_outputs = [
@@ -1730,13 +1593,13 @@ class TrainerRank:
             )
             for output in outputs
         ]
-        if marker_refs:
-            self._slot_graphs().setdefault(ref, []).append(
-                _SlotGraphLease(tuple(marker_refs))
-            )
+        if marker is not None:
+            self._slot_graphs().setdefault(ref, []).append(weakref.ref(marker))
         return tracked_outputs
 
-    def _slot_graphs(self) -> dict["LoRASlotRef", list[_SlotGraphLease]]:
+    def _slot_graphs(
+        self,
+    ) -> dict["LoRASlotRef", list[weakref.ReferenceType[torch.Tensor]]]:
         graphs = getattr(self, "_pending_slot_graphs", None)
         if graphs is None:
             graphs = {}
@@ -1747,7 +1610,9 @@ class TrainerRank:
         graphs = self._slot_graphs()
         refs = tuple(graphs) if ref is None else (ref,)
         for current in refs:
-            live = [lease for lease in graphs.get(current, ()) if lease.is_live()]
+            live = [
+                marker for marker in graphs.get(current, ()) if marker() is not None
+            ]
             if live:
                 graphs[current] = live
             else:
@@ -1945,15 +1810,18 @@ class TrainerRank:
             profile is not None
             and profile.packed_tokens * _MEMORY_PROFILE_TRUST_GROWTH >= packed_tokens
         )
-        if dist.is_available() and dist.is_initialized():
-            value = torch.tensor(
-                int(local),
-                device=self.device if self.device.type == "cuda" else "cpu",
-                dtype=torch.int32,
-            )
-            dist.all_reduce(value, op=dist.ReduceOp.MIN)
-            return bool(value.item())
-        return local
+        return self._all_ranks_true(local)
+
+    def _all_ranks_true(self, local: bool) -> bool:
+        if not (dist.is_available() and dist.is_initialized()):
+            return local
+        value = torch.tensor(
+            int(local),
+            device=self.device if self.device.type == "cuda" else "cpu",
+            dtype=torch.int32,
+        )
+        dist.all_reduce(value, op=dist.ReduceOp.MIN)
+        return bool(value.item())
 
     def _update_memory_profile(
         self, plan: _FlatForwardPlan, peak_delta_bytes: int
@@ -2110,6 +1978,12 @@ class TrainerRank:
                     device=hidden_by_row.device,
                     dtype=hidden_by_row.dtype,
                 )
+            if item.request.top_k is not None:
+                shape = (int(positions.numel()), item.request.top_k)
+                top_k[index] = TopK(
+                    logprobs=torch.empty(shape, device=device, dtype=torch.float32),
+                    tokens=torch.empty(shape, device=device, dtype=torch.long),
+                )
 
         row_tensor = (
             torch.cat(projected_rows).unique(sorted=True)
@@ -2117,17 +1991,37 @@ class TrainerRank:
             else torch.empty(0, dtype=torch.long, device=device)
         )
         if int(row_tensor.numel()):
-            local_row_matches = tuple(
-                _row_match(positions.to(device=device), row_tensor)
+            rows_cpu = row_tensor.detach().cpu()
+            cpu_matches = tuple(
+                _row_match(
+                    positions.cpu(),
+                    rows_cpu,
+                    chunk_tokens=self.head_chunk_tokens,
+                )
                 for positions in prepared.positions_by_item
             )
+            local_row_matches = tuple(
+                (source.to(device), row.to(device), bounds)
+                for source, row, bounds in cpu_matches
+            )
+            logit_rows_cpu = torch.cat(
+                tuple(
+                    match[1]
+                    for item, match in zip(items, cpu_matches, strict=True)
+                    if item.request.logits
+                )
+                or (torch.empty(0, dtype=torch.long),)
+            ).unique(sorted=True)
             self._project_vocab_parallel(
                 items,
                 hidden_by_row,
                 row_tensor,
                 row_matches=local_row_matches,
-                item_lengths=tuple(
-                    int(positions.numel()) for positions in prepared.positions_by_item
+                logit_rows=logit_rows_cpu.to(device),
+                logit_bounds=_chunk_boundaries(
+                    logit_rows_cpu,
+                    end=int(row_tensor.numel()),
+                    chunk_tokens=self.head_chunk_tokens,
                 ),
                 output_weight=output_weight,
                 target_logprobs=target_logprobs,
@@ -2164,7 +2058,8 @@ class TrainerRank:
         rows: torch.Tensor,
         *,
         row_matches: Sequence[_RowMatch],
-        item_lengths: Sequence[int],
+        logit_rows: torch.Tensor,
+        logit_bounds: tuple[int, ...],
         output_weight: torch.Tensor | None,
         target_logprobs: list[torch.Tensor | None],
         top_k: list[TopK | None],
@@ -2176,7 +2071,9 @@ class TrainerRank:
         need_log_z = any(
             item.labels is not None or item.request.top_k is not None for item in items
         )
-        for start in range(0, int(rows.numel()), self.head_chunk_tokens):
+        for chunk_index, start in enumerate(
+            range(0, int(rows.numel()), self.head_chunk_tokens)
+        ):
             chunk_rows = rows[start : start + self.head_chunk_tokens]
             local_logits = self._local_logits_from_hidden_rows(
                 model,
@@ -2188,7 +2085,10 @@ class TrainerRank:
             if need_log_z:
                 topk_stats = _try_triton_local_topk_stats(local_logits, k=max_top_k)
                 logsumexp_stats = (
-                    _try_triton_local_logsumexp_stats(local_logits)
+                    cast(
+                        tuple[torch.Tensor, torch.Tensor] | None,
+                        _try_triton_stats("local_logsumexp_stats", local_logits),
+                    )
                     if topk_stats is None
                     else None
                 )
@@ -2214,24 +2114,8 @@ class TrainerRank:
                     )
                     local_topk = (local_values.float(), local_tokens)
 
-            logit_chunks = [
-                chunk_offsets
-                for item, match in zip(items, row_matches, strict=True)
-                if item.request.logits
-                for _, chunk_offsets in (
-                    _match_chunk_offsets(
-                        match,
-                        start=start,
-                        end=start + int(chunk_rows.numel()),
-                    ),
-                )
-                if int(chunk_offsets.numel())
-            ]
-            logit_chunk_offsets = (
-                torch.cat(logit_chunks).unique(sorted=True)
-                if logit_chunks
-                else torch.empty(0, dtype=torch.long, device=rows.device)
-            )
+            logit_start, logit_end = logit_bounds[chunk_index : chunk_index + 2]
+            logit_chunk_offsets = logit_rows[logit_start:logit_end] - start
             chunk_logits: torch.Tensor | None = None
             if int(logit_chunk_offsets.numel()):
                 chunk_logits = _batch_seq_logits(
@@ -2242,23 +2126,19 @@ class TrainerRank:
                 ).squeeze(0)
 
             for index, item in enumerate(items):
-                offsets, chunk_offsets = _match_chunk_offsets(
-                    row_matches[index],
-                    start=start,
-                    end=start + int(chunk_rows.numel()),
-                )
+                offsets, row_offsets, bounds = row_matches[index]
+                begin, finish = bounds[chunk_index : chunk_index + 2]
+                offsets = offsets[begin:finish]
+                chunk_offsets = row_offsets[begin:finish] - start
                 if int(offsets.numel()) == 0:
                     continue
                 item_logits = logits[index]
                 if item_logits is not None:
                     if chunk_logits is None:
                         raise RuntimeError("logits output requires gathered logits")
-                    source_offsets, gathered_offsets = _matching_offsets(
-                        chunk_offsets,
-                        logit_chunk_offsets,
-                    )
-                    item_logits[offsets.index_select(0, source_offsets)] = (
-                        chunk_logits.index_select(0, gathered_offsets)
+                    item_logits[offsets] = chunk_logits.index_select(
+                        0,
+                        torch.searchsorted(logit_chunk_offsets, chunk_offsets),
                     )
                 labels = label_rows[index]
                 item_logprobs = target_logprobs[index]
@@ -2297,19 +2177,7 @@ class TrainerRank:
                     )
                     current = top_k[index]
                     if current is None:
-                        current = TopK(
-                            logprobs=torch.empty(
-                                (item_lengths[index], int(values.logprobs.shape[1])),
-                                device=values.logprobs.device,
-                                dtype=values.logprobs.dtype,
-                            ),
-                            tokens=torch.empty(
-                                (item_lengths[index], int(values.tokens.shape[1])),
-                                device=values.tokens.device,
-                                dtype=values.tokens.dtype,
-                            ),
-                        )
-                        top_k[index] = current
+                        raise RuntimeError("top_k output was not allocated")
                     current.logprobs[offsets] = values.logprobs
                     current.tokens[offsets] = values.tokens
 
@@ -2400,7 +2268,9 @@ class TrainerRank:
             prepare_cp_micro,
         )
         from art.megatron.training.microbatches import (
+            _art_flex_cp_block_mask_variants,
             _context_parallel_config_for_provider,
+            _gdn_planner_config_for_provider,
         )
         from art.preprocessing.pack import PackedTensors
 
@@ -2421,15 +2291,16 @@ class TrainerRank:
             "moe_routing_replay": None,
         }
         handler = self.runtime.model_support_handler
+        provider = self.runtime.provider
         prepared = prepare_cp_micro(
             micro=sparse_micro,
             topology=topology,
-            config=_context_parallel_config_for_provider(
-                self.runtime.provider, self.device
-            ),
+            config=_context_parallel_config_for_provider(provider, self.device),
             cp_group=ps.get_context_parallel_group(check_initialized=False),
             cp_rank=ps.get_context_parallel_rank(),
             build_gdn_execution_spec=handler.build_gdn_execution_spec,
+            gdn_planner_config=_gdn_planner_config_for_provider(provider, handler),
+            block_mask_variants=_art_flex_cp_block_mask_variants(provider, self.device),
             target_device=self.device,
         )
         if prepared.rank_plan is None:
@@ -2518,21 +2389,11 @@ def _pad_packed_batch(
         device=device,
     ).unsqueeze(0)
     return PrefixTreePack(
-        tokens=torch.cat(
-            (
-                batch.tokens,
-                torch.zeros((1, pad), dtype=batch.tokens.dtype, device=device),
-            ),
-            dim=1,
-        ),
+        tokens=torch.cat((batch.tokens, batch.tokens.new_zeros((1, pad))), dim=1),
         group_ids=torch.cat((batch.group_ids, pad_group_ids), dim=1),
         parent_ids=torch.cat((batch.parent_ids, pad_group_ids), dim=1),
         position_ids=torch.cat(
-            (
-                batch.position_ids,
-                torch.zeros((1, pad), dtype=batch.position_ids.dtype, device=device),
-            ),
-            dim=1,
+            (batch.position_ids, batch.position_ids.new_zeros((1, pad))), dim=1
         ),
         positions_by_sequence=batch.positions_by_sequence,
     )
@@ -2654,43 +2515,20 @@ def _vocab_parallel_target_logprobs(
     row_offsets: torch.Tensor,
 ) -> torch.Tensor:
     start, _ = _vocab_range(local_logits)
-    target_logits = _call_compiled(
-        _owned_target_logits_for_rows,
-        local_logits,
-        labels,
-        start,
-        row_offsets,
-    )
-    target_logits = _all_reduce_tensor_parallel_sum(target_logits)
-    return _call_compiled(_finish_target_logprobs, target_logits, labels, log_z)
-
-
-def _owned_target_logits_for_rows(
-    local_logits: torch.Tensor,
-    labels: torch.Tensor,
-    vocab_start: int,
-    row_offsets: torch.Tensor,
-) -> torch.Tensor:
     flat_labels = labels.reshape(int(labels.shape[0]), -1)
-    local_labels = flat_labels - vocab_start
+    local_labels = flat_labels - start
     owns_label = (
         (flat_labels != -100)
         & (local_labels >= 0)
         & (local_labels < int(local_logits.shape[1]))
     )
-    rows = row_offsets.reshape(int(row_offsets.shape[0]), 1).expand_as(flat_labels)
-    selected = local_logits[
+    rows = row_offsets.reshape(-1, 1).expand_as(flat_labels)
+    target_logits = local_logits[
         rows,
         local_labels.clamp(0, int(local_logits.shape[1]) - 1),
     ].float()
-    return selected.masked_fill(~owns_label, 0.0).reshape(labels.shape)
-
-
-def _finish_target_logprobs(
-    target_logits: torch.Tensor,
-    labels: torch.Tensor,
-    log_z: torch.Tensor,
-) -> torch.Tensor:
+    target_logits = target_logits.masked_fill(~owns_label, 0.0).reshape(labels.shape)
+    target_logits = _all_reduce_tensor_parallel_sum(target_logits)
     log_z = log_z.reshape(int(log_z.shape[0]), *((1,) * (int(labels.ndim) - 1)))
     return (target_logits.float() - log_z).masked_fill(labels == -100, 0.0)
 
@@ -2712,23 +2550,13 @@ def _anchor_disconnected_outputs(
             anchor = hidden_by_row.reshape(-1)[:1].float().sum() * 0.0
         return tensor + anchor
 
-    return (
-        [
-            None if item_logprobs is None else anchor_tensor(item_logprobs)
-            for item_logprobs in target_logprobs
-        ],
-        [
-            (
-                None
-                if item_top_k is None
-                else TopK(
-                    logprobs=anchor_tensor(item_top_k.logprobs),
-                    tokens=item_top_k.tokens,
-                )
-            )
-            for item_top_k in top_k
-        ],
-    )
+    for index, logprobs in enumerate(target_logprobs):
+        if logprobs is not None:
+            target_logprobs[index] = anchor_tensor(logprobs)
+    for index, item in enumerate(top_k):
+        if item is not None:
+            top_k[index] = TopK(anchor_tensor(item.logprobs), item.tokens)
+    return target_logprobs, top_k
 
 
 def _try_triton_local_topk_stats(
@@ -2747,15 +2575,6 @@ def _try_triton_local_topk_stats(
             local_logits,
             k=min(k, int(local_logits.shape[1])),
         ),
-    )
-
-
-def _try_triton_local_logsumexp_stats(
-    local_logits: torch.Tensor,
-) -> tuple[torch.Tensor, torch.Tensor] | None:
-    return cast(
-        tuple[torch.Tensor, torch.Tensor] | None,
-        _try_triton_stats("local_logsumexp_stats", local_logits),
     )
 
 
@@ -2828,7 +2647,7 @@ def _vocab_parallel_log_z(local_logits: torch.Tensor) -> torch.Tensor:
     local_logits = local_logits.float()
     local_max = local_logits.max(dim=-1).values.detach()
     global_max = _all_reduce_tensor_parallel_max(local_max)
-    local_sum = _call_compiled(_local_vocab_exp_sum, local_logits, global_max)
+    local_sum = _local_vocab_exp_sum(local_logits, global_max)
     global_sum = _all_reduce_tensor_parallel_sum(local_sum)
     return global_max + torch.log(global_sum)
 
@@ -2879,60 +2698,46 @@ def _all_reduce_tensor_parallel_max(tensor: torch.Tensor) -> torch.Tensor:
     return output
 
 
-def _call_compiled(fn: Callable[P, R], *args: P.args, **kwargs: P.kwargs) -> R:
-    if os.environ.get("ART_TRAINER_RANK_COMPILE", "0").lower() in {"0", "false"}:
-        return fn(*args, **kwargs)
-    compiled = _COMPILED_FUNCTIONS.get(fn)
-    if compiled is None:
-        compiled = cast(Callable[..., object], torch.compile(fn, dynamic=True))
-        _COMPILED_FUNCTIONS[fn] = compiled
-    try:
-        return cast(Callable[P, R], compiled)(*args, **kwargs)
-    except Exception:
-        return fn(*args, **kwargs)
-
-
-def _matching_offsets(
+def _row_match(
     positions: torch.Tensor,
-    chunk_rows: torch.Tensor,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    if int(positions.numel()) == 0 or int(chunk_rows.numel()) == 0:
-        empty = torch.empty(0, dtype=torch.long, device=positions.device)
-        return empty, empty
-    sorted_rows, order = chunk_rows.sort()
-    indices = torch.searchsorted(sorted_rows, positions)
-    in_bounds = indices < int(sorted_rows.numel())
+    rows: torch.Tensor,
+    *,
+    chunk_tokens: int,
+) -> _RowMatch:
+    row_offsets = torch.searchsorted(rows, positions)
+    in_bounds = row_offsets < int(rows.numel())
     source_offsets = torch.arange(
-        int(positions.numel()),
-        device=positions.device,
-        dtype=torch.long,
+        int(positions.numel()), device=positions.device, dtype=torch.long
     )[in_bounds]
-    found = indices[in_bounds]
-    keep = sorted_rows.index_select(0, found) == positions.index_select(
-        0,
-        source_offsets,
+    row_offsets = row_offsets[in_bounds]
+    keep = rows.index_select(0, row_offsets) == positions.index_select(
+        0, source_offsets
     )
-    return source_offsets[keep], order.index_select(0, found[keep])
-
-
-def _row_match(positions: torch.Tensor, rows: torch.Tensor) -> _RowMatch:
-    source_offsets, row_offsets = _matching_offsets(positions, rows)
+    source_offsets, row_offsets = source_offsets[keep], row_offsets[keep]
     if int(row_offsets.numel()) > 1:
         order = row_offsets.argsort()
         source_offsets = source_offsets.index_select(0, order)
         row_offsets = row_offsets.index_select(0, order)
-    return _RowMatch(source_offsets=source_offsets, row_offsets=row_offsets)
+    return (
+        source_offsets,
+        row_offsets,
+        _chunk_boundaries(
+            row_offsets,
+            end=int(rows.numel()),
+            chunk_tokens=chunk_tokens,
+        ),
+    )
 
 
-def _match_chunk_offsets(
-    match: _RowMatch,
+def _chunk_boundaries(
+    offsets: torch.Tensor,
     *,
-    start: int,
     end: int,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    keep = (match.row_offsets >= start) & (match.row_offsets < end)
-    source_offsets = match.source_offsets[keep]
-    return source_offsets, match.row_offsets[keep] - start
+    chunk_tokens: int,
+) -> tuple[int, ...]:
+    edges = torch.arange(0, end, chunk_tokens, dtype=torch.long)
+    edges = torch.cat((edges, torch.tensor((end,), dtype=torch.long)))
+    return tuple(torch.searchsorted(offsets, edges).tolist())
 
 
 def _select_positions(values: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:

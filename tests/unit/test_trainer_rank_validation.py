@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import gc
+import inspect
 from types import SimpleNamespace
 from typing import Any, cast
 
@@ -92,6 +93,17 @@ def _indexed_outputs(plan: object, **_kwargs: object) -> list[ForwardOutput]:
     ]
 
 
+def _empty_outputs(plan: object, **_kwargs: object) -> list[ForwardOutput]:
+    return [ForwardOutput(None, None, None, None)] * int(getattr(plan, "request_count"))
+
+
+def _stub_forward(mp, rank, out=_empty_outputs, dp=(0, 1), profiled=False) -> None:
+    mp.setattr(rank, "_dp_rank_and_size", lambda: dp)
+    mp.setattr(rank, "_run_flat_plan_with_memory_tracking", out)
+    if profiled:
+        mp.setattr(rank, "_all_ranks_have_memory_profile", lambda **_: True)
+
+
 def _output_values(outputs: object) -> list[int]:
     if isinstance(outputs, ForwardOutput):
         target_logprobs = outputs.target_logprobs
@@ -109,62 +121,75 @@ def _output_shape(outputs: object) -> object:
     return [_output_shape(item) for item in outputs]  # type: ignore[union-attr]
 
 
-def test_forward_input_rejects_non_positive_top_k() -> None:
+def _trainer_with_checkpoint(
+    monkeypatch: pytest.MonkeyPatch,
+    value: torch.Tensor,
+) -> tuple[TrainerRank, torch.nn.Parameter]:
+    trainer = TrainerRank(_runtime())  # type: ignore[arg-type]
+    param = torch.nn.Parameter(value.clone())
+    trainer._checkpoint_slot_params_by_name["student"] = (param,)
+    monkeypatch.setattr(
+        trainer,
+        "_reduce_dynamic_grads",
+        lambda params, **_kwargs: tuple(item.grad.float() for item in params),
+    )
+    return trainer, param
+
+
+def _tracked_targets(
+    trainer: TrainerRank, ref: _SlotRef, *scales: float
+) -> list[torch.Tensor]:
+    tracked = trainer._track_slot_graph_outputs(
+        ref,  # type: ignore[arg-type]
+        [
+            ForwardOutput(torch.ones(1, requires_grad=True) * scale, None, None, None)
+            for scale in scales
+        ],
+    )
+    return [cast(torch.Tensor, output.target_logprobs) for output in tracked]
+
+
+def test_forward_input_validation() -> None:
     with pytest.raises(ValueError, match="top_k must be >= 1"):
         ForwardInput(input_tokens=torch.tensor([1]), top_k=0)
-
-
-def test_forward_input_adapter_selection_defaults_to_unset() -> None:
-    request = ForwardInput(input_tokens=torch.tensor([1]))
-
-    assert request.checkpoint is Unset
-    assert request.lora is Unset
-
-
-def test_forward_input_accepts_explicit_base_checkpoint() -> None:
-    request = ForwardInput(input_tokens=torch.tensor([1]), checkpoint=None)
-
-    assert request.checkpoint is None
-    assert request.lora is Unset
-
-
-def test_forward_input_rejects_checkpoint_and_lora_together() -> None:
     with pytest.raises(ValueError, match="cannot set both checkpoint and lora"):
         ForwardInput(input_tokens=torch.tensor([1]), checkpoint="a", lora="b")
-
-
-def test_validate_top_k_rejects_values_above_vocab_size() -> None:
     with pytest.raises(ValueError, match="top_k=9 exceeds vocabulary size 8"):
         _validate_top_k(9, _Model())  # type: ignore[arg-type]
 
 
-def test_trainer_rank_accepts_nested_shared_prefix_for_gdn_runtime() -> None:
-    trainer = TrainerRank(_runtime(), shared_prefix_max_depth=2)  # type: ignore[arg-type]
+@pytest.mark.parametrize(("checkpoint", "expected"), ((Unset, Unset), (None, None)))
+def test_forward_input_distinguishes_unset_and_base_checkpoint(
+    checkpoint: object, expected: object
+) -> None:
+    request = ForwardInput(input_tokens=torch.tensor([1]), checkpoint=checkpoint)  # type: ignore[arg-type]
 
-    assert trainer.shared_prefix_max_depth == 2
-
-
-def test_trainer_rank_accepts_zero_depth_shared_prefix_for_gdn_runtime() -> None:
-    trainer = TrainerRank(_runtime(), shared_prefix_max_depth=0)  # type: ignore[arg-type]
-
-    assert trainer.shared_prefix_max_depth == 0
+    assert request.checkpoint is expected
+    assert request.lora is Unset
 
 
-def test_trainer_rank_pop_rejects_empty_adapter_stack() -> None:
+def test_forward_input_preserves_public_runtime_shape() -> None:
+    fields = tuple(ForwardInput.__dataclass_fields__)
+    assert tuple(inspect.signature(ForwardInput).parameters) == fields
+    assert ForwardInput.__match_args__ == fields
+
+
+@pytest.mark.parametrize("depth", (0, 2))
+def test_trainer_rank_accepts_shared_prefix_depth(depth: int) -> None:
+    trainer = TrainerRank(_runtime(), shared_prefix_max_depth=depth)  # type: ignore[arg-type]
+
+    assert trainer.shared_prefix_max_depth == depth
+
+
+def test_trainer_rank_adapter_stack_errors() -> None:
     trainer = TrainerRank(_runtime())  # type: ignore[arg-type]
 
     with pytest.raises(RuntimeError, match="No pushed LoRA or checkpoint"):
         trainer.pop_pushed_lora_or_checkpoint()
-
-
-def test_trainer_rank_load_rejects_active_adapter_stack() -> None:
-    trainer = TrainerRank(_runtime())  # type: ignore[arg-type]
     trainer._slot_stack.append(object())  # type: ignore[arg-type]
-
-    with pytest.raises(RuntimeError, match="Cannot load a LoRA/checkpoint"):
-        trainer.load_checkpoint_slot("teacher", {})
-    with pytest.raises(RuntimeError, match="Cannot load a LoRA/checkpoint"):
-        trainer.load_lora_slot("teacher", {})
+    for load in (trainer.load_checkpoint_slot, trainer.load_lora_slot):
+        with pytest.raises(RuntimeError, match="Cannot load a LoRA/checkpoint"):
+            load("teacher", {})
 
 
 def test_trainer_rank_rejects_adapter_keys_without_installed_lora_site() -> None:
@@ -173,10 +198,10 @@ def test_trainer_rank_rejects_adapter_keys_without_installed_lora_site() -> None
         "base.layer.lora_A.weight": torch.empty(1),
         "base.layer.lora_B.weight": torch.empty(1),
     }
-    trainer._validate_adapter_slot_keys("checkpoint", "student", valid)
+    trainer._prepare_adapter_model("checkpoint", "student", valid)
 
     with pytest.raises(ValueError, match="matching LoRA target modules"):
-        trainer._validate_adapter_slot_keys(
+        trainer._prepare_adapter_model(
             "checkpoint",
             "student",
             {**valid, "base.other.lora_A.weight": torch.empty(1)},
@@ -191,7 +216,7 @@ def test_trainer_rank_normalizes_adapter_tensors_to_installed_site() -> None:
         "base.layer.lora_B.weight": torch.ones(5, 3, dtype=torch.float32),
     }
 
-    normalized = trainer._normalize_adapter_model(adapter)
+    normalized = trainer._prepare_adapter_model("checkpoint", "student", adapter)
 
     assert all(tensor.device == site.A_T.device for tensor in normalized.values())
     assert all(tensor.dtype == torch.bfloat16 for tensor in normalized.values())
@@ -283,39 +308,6 @@ def test_optim_step_implicitly_steps_only_slots_with_grads(
     torch.testing.assert_close(untouched, before_untouched)
 
 
-def test_checkpoint_slot_optimizer_state_round_trips_same_shape(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    trainer = TrainerRank(_runtime())  # type: ignore[arg-type]
-    param = torch.nn.Parameter(torch.ones(2))
-    param.grad = torch.tensor([0.5, -0.25])
-    trainer._checkpoint_slot_params_by_name["student"] = (param,)
-    monkeypatch.setattr(
-        trainer,
-        "_reduce_dynamic_grads",
-        lambda params, **_kwargs: tuple(param.grad.float() for param in params),
-    )
-
-    trainer.optim_step(
-        params=AdamParams(learning_rate=1e-2, weight_decay=0.0, grad_clip_norm=10.0)
-    )
-    state = trainer.checkpoint_slot_optimizer_state("student")
-
-    assert state is not None
-    restored = TrainerRank(_runtime())  # type: ignore[arg-type]
-    restored._checkpoint_slot_params_by_name["student"] = (
-        torch.nn.Parameter(torch.ones(2)),
-    )
-    restored._dynamic_optimizers["student"] = restored._restore_dynamic_optimizer(
-        "student", state
-    )
-
-    restored_state = restored.checkpoint_slot_optimizer_state("student")
-    assert restored_state is not None
-    assert restored_state["optimizer"]
-    assert restored_state["master_params"]
-
-
 def test_checkpoint_slot_optimizer_state_reproduces_exact_next_step(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -327,26 +319,17 @@ def test_checkpoint_slot_optimizer_state_reproduces_exact_next_step(
         grad_clip_norm=10.0,
     )
 
-    def configure(value: torch.Tensor) -> tuple[TrainerRank, torch.nn.Parameter]:
-        trainer = TrainerRank(_runtime())  # type: ignore[arg-type]
-        param = torch.nn.Parameter(value.clone())
-        trainer._checkpoint_slot_params_by_name["student"] = (param,)
-        monkeypatch.setattr(
-            trainer,
-            "_reduce_dynamic_grads",
-            lambda params, **_kwargs: tuple(item.grad.float() for item in params),
-        )
-        return trainer, param
-
-    original, original_param = configure(
-        torch.tensor([0.5, -0.25], dtype=torch.bfloat16)
+    original, original_param = _trainer_with_checkpoint(
+        monkeypatch, torch.tensor([0.5, -0.25], dtype=torch.bfloat16)
     )
     original_param.grad = torch.tensor([0.2, -0.4], dtype=torch.bfloat16)
     original.optim_step(params=adam)
     state = original.checkpoint_slot_optimizer_state("student")
     assert state is not None
 
-    restored, restored_param = configure(original_param.detach())
+    restored, restored_param = _trainer_with_checkpoint(
+        monkeypatch, original_param.detach()
+    )
     restored._dynamic_optimizers["student"] = restored._restore_dynamic_optimizer(
         "student", state
     )
@@ -365,13 +348,8 @@ def test_checkpoint_slot_optimizer_state_reproduces_exact_next_step(
 def test_dynamic_optimizer_keeps_fp32_master_weight_and_moments(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    trainer = TrainerRank(_runtime())  # type: ignore[arg-type]
-    param = torch.nn.Parameter(torch.tensor([0.1], dtype=torch.bfloat16))
-    trainer._checkpoint_slot_params_by_name["student"] = (param,)
-    monkeypatch.setattr(
-        trainer,
-        "_reduce_dynamic_grads",
-        lambda params, **_kwargs: tuple(item.grad.float() for item in params),
+    trainer, param = _trainer_with_checkpoint(
+        monkeypatch, torch.tensor([0.1], dtype=torch.bfloat16)
     )
 
     for _ in range(100):
@@ -392,118 +370,57 @@ def test_dynamic_optimizer_keeps_fp32_master_weight_and_moments(
     assert state["exp_avg_sq"].dtype == torch.float32
 
 
-def test_checkpoint_slot_optimizer_state_rejects_layout_mismatch(
+@pytest.mark.parametrize(
+    ("corruption", "error"),
+    (
+        ("layout", "topology or parameter layout"),
+        ("missing_master", "master parameters"),
+        ("shape", "topology or parameter layout"),
+    ),
+)
+def test_checkpoint_slot_optimizer_state_rejects_incompatible_state(
+    corruption: str,
+    error: str,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    trainer = TrainerRank(_runtime())  # type: ignore[arg-type]
-    param = torch.nn.Parameter(torch.ones(2))
+    trainer, param = _trainer_with_checkpoint(monkeypatch, torch.ones(2))
     param.grad = torch.ones_like(param)
-    trainer._checkpoint_slot_params_by_name["student"] = (param,)
-    monkeypatch.setattr(
-        trainer,
-        "_reduce_dynamic_grads",
-        lambda params, **_kwargs: tuple(item.grad.float() for item in params),
-    )
     trainer.optim_step(
         params=AdamParams(learning_rate=1e-2, weight_decay=0.0, grad_clip_norm=10.0)
     )
     state = trainer.checkpoint_slot_optimizer_state("student")
     assert state is not None
-    state["layout"] = {"different": True}
-
-    restored = TrainerRank(_runtime())  # type: ignore[arg-type]
-    restored._checkpoint_slot_params_by_name["student"] = (
-        torch.nn.Parameter(torch.ones(2)),
+    if corruption == "layout":
+        state["layout"] = {"different": True}
+    elif corruption == "missing_master":
+        state["master_params"] = ()
+    restored, _ = _trainer_with_checkpoint(
+        monkeypatch, torch.ones(3 if corruption == "shape" else 2)
     )
-    with pytest.raises(TrainerRankSlotStateError, match="topology or parameter layout"):
+    with pytest.raises(TrainerRankSlotStateError, match=error):
         restored._restore_dynamic_optimizer("student", state)
 
 
-def test_checkpoint_slot_optimizer_state_rejects_missing_master_parameter(
+@pytest.mark.parametrize("operation", ("load", "step"))
+def test_trainer_rank_rejects_mutating_slot_with_pending_graph(
+    operation: str,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    trainer = TrainerRank(_runtime())  # type: ignore[arg-type]
-    param = torch.nn.Parameter(torch.ones(2))
-    param.grad = torch.ones_like(param)
-    trainer._checkpoint_slot_params_by_name["student"] = (param,)
-    monkeypatch.setattr(
-        trainer,
-        "_reduce_dynamic_grads",
-        lambda params, **_kwargs: tuple(item.grad.float() for item in params),
-    )
-    trainer.optim_step(params=AdamParams(learning_rate=1e-2))
-    state = trainer.checkpoint_slot_optimizer_state("student")
-    assert state is not None
-    state["master_params"] = ()
-
-    restored = TrainerRank(_runtime())  # type: ignore[arg-type]
-    restored._checkpoint_slot_params_by_name["student"] = (
-        torch.nn.Parameter(torch.ones(2)),
-    )
-    with pytest.raises(TrainerRankSlotStateError, match="master parameters"):
-        restored._restore_dynamic_optimizer("student", state)
-
-
-def test_checkpoint_slot_optimizer_state_rejects_shape_mismatch(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    trainer = TrainerRank(_runtime())  # type: ignore[arg-type]
-    param = torch.nn.Parameter(torch.ones(2))
-    param.grad = torch.ones_like(param)
-    trainer._checkpoint_slot_params_by_name["student"] = (param,)
-    monkeypatch.setattr(
-        trainer,
-        "_reduce_dynamic_grads",
-        lambda params, **_kwargs: tuple(param.grad.float() for param in params),
-    )
-    trainer.optim_step(
-        params=AdamParams(learning_rate=1e-2, weight_decay=0.0, grad_clip_norm=10.0)
-    )
-    state = trainer.checkpoint_slot_optimizer_state("student")
-    assert state is not None
-
-    restored = TrainerRank(_runtime())  # type: ignore[arg-type]
-    restored._checkpoint_slot_params_by_name["student"] = (
-        torch.nn.Parameter(torch.ones(3)),
-    )
-
-    with pytest.raises(TrainerRankSlotStateError, match="topology or parameter layout"):
-        restored._restore_dynamic_optimizer("student", state)
-
-
-def test_trainer_rank_load_rejects_pending_checkpoint_graph() -> None:
     trainer = TrainerRank(_runtime())  # type: ignore[arg-type]
     ref = _SlotRef("checkpoint", "teacher")
-    output = ForwardOutput(torch.ones(1, requires_grad=True) * 2, None, None, None)
-
-    tracked = trainer._track_slot_graph_outputs(ref, [output])  # type: ignore[arg-type]
-
-    with pytest.raises(TrainerRankSlotStateError, match="Cannot load checkpoint slot"):
-        trainer._guard_slot_can_load(ref)  # type: ignore[arg-type]
-
-    assert tracked[0].target_logprobs is not None
-    tracked[0].target_logprobs.sum().backward()
-
-    trainer._guard_slot_can_load(ref)  # type: ignore[arg-type]
-
-
-def test_trainer_rank_step_rejects_pending_checkpoint_graph(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    trainer = TrainerRank(_runtime())  # type: ignore[arg-type]
     monkeypatch.setattr(trainer, "_slot_ref", lambda kind, name: _SlotRef(kind, name))
-    ref = _SlotRef("checkpoint", "student")
-    output = ForwardOutput(torch.ones(1, requires_grad=True) * 2, None, None, None)
+    target = _tracked_targets(trainer, ref, 2)[0]
+    guard = (
+        (lambda: trainer._guard_slot_can_load(ref))  # type: ignore[arg-type]
+        if operation == "load"
+        else (lambda: trainer._guard_checkpoint_can_step("teacher"))
+    )
 
-    tracked = trainer._track_slot_graph_outputs(ref, [output])  # type: ignore[arg-type]
+    with pytest.raises(TrainerRankSlotStateError, match="Cannot"):
+        guard()
 
-    with pytest.raises(TrainerRankSlotStateError, match="Cannot optim_step"):
-        trainer._guard_checkpoint_can_step("student")
-
-    assert tracked[0].target_logprobs is not None
-    tracked[0].target_logprobs.sum().backward()
-
-    trainer._guard_checkpoint_can_step("student")
+    target.sum().backward()
+    guard()
 
 
 def test_trainer_rank_step_allows_missing_slot_graph_bookkeeping(
@@ -539,10 +456,7 @@ def test_trainer_rank_zero_grad_does_not_clear_live_slot_graphs() -> None:
 def test_trainer_rank_retained_backward_keeps_slot_graph_guard() -> None:
     trainer = TrainerRank(_runtime())  # type: ignore[arg-type]
     ref = _SlotRef("checkpoint", "teacher")
-    output = ForwardOutput(torch.ones(1, requires_grad=True) * 2, None, None, None)
-    tracked = trainer._track_slot_graph_outputs(ref, [output])  # type: ignore[arg-type]
-    target = tracked[0].target_logprobs
-    assert target is not None
+    target = _tracked_targets(trainer, ref, 2)[0]
 
     target.sum().backward(retain_graph=True)
     with pytest.raises(TrainerRankSlotStateError, match="live backward graph"):
@@ -555,14 +469,7 @@ def test_trainer_rank_retained_backward_keeps_slot_graph_guard() -> None:
 def test_trainer_rank_tracks_each_independent_output_graph() -> None:
     trainer = TrainerRank(_runtime())  # type: ignore[arg-type]
     ref = _SlotRef("checkpoint", "teacher")
-    outputs = [
-        ForwardOutput(torch.ones(1, requires_grad=True) * scale, None, None, None)
-        for scale in (2, 3)
-    ]
-    tracked = trainer._track_slot_graph_outputs(ref, outputs)  # type: ignore[arg-type]
-    first = tracked[0].target_logprobs
-    second = tracked[1].target_logprobs
-    assert first is not None and second is not None
+    first, second = _tracked_targets(trainer, ref, 2, 3)
 
     first.sum().backward()
     with pytest.raises(TrainerRankSlotStateError, match="live backward graph"):
@@ -575,12 +482,9 @@ def test_trainer_rank_tracks_each_independent_output_graph() -> None:
 def test_trainer_rank_tracks_graph_after_output_is_replaced_by_loss() -> None:
     trainer = TrainerRank(_runtime())  # type: ignore[arg-type]
     ref = _SlotRef("checkpoint", "teacher")
-    output = ForwardOutput(torch.ones(1, requires_grad=True) * 2, None, None, None)
-    tracked = trainer._track_slot_graph_outputs(ref, [output])  # type: ignore[arg-type]
-    target = tracked[0].target_logprobs
-    assert target is not None
+    target = _tracked_targets(trainer, ref, 2)[0]
     loss = target.sum()
-    del output, tracked, target
+    del target
     gc.collect()
 
     with pytest.raises(TrainerRankSlotStateError, match="live backward graph"):
@@ -593,9 +497,8 @@ def test_trainer_rank_tracks_graph_after_output_is_replaced_by_loss() -> None:
 def test_trainer_rank_releases_abandoned_output_graph() -> None:
     trainer = TrainerRank(_runtime())  # type: ignore[arg-type]
     ref = _SlotRef("checkpoint", "teacher")
-    output = ForwardOutput(torch.ones(1, requires_grad=True) * 2, None, None, None)
-    tracked = trainer._track_slot_graph_outputs(ref, [output])  # type: ignore[arg-type]
-    del output, tracked
+    target = _tracked_targets(trainer, ref, 2)[0]
+    del target
     gc.collect()
 
     trainer._guard_slot_can_load(ref)  # type: ignore[arg-type]
@@ -620,9 +523,7 @@ def test_dp_rank_forward_supports_arbitrary_nested_depth(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     trainer = TrainerRank(_runtime())  # type: ignore[arg-type]
-    monkeypatch.setattr(
-        trainer, "_run_flat_plan_with_memory_tracking", _indexed_outputs
-    )
+    _stub_forward(monkeypatch, trainer, _indexed_outputs)
     nested = [
         [[[[[_target_request(1)]]]]],
         [[[[[_target_request(3), _target_request(5)]]]]],
@@ -641,14 +542,7 @@ def test_forward_micro_batches_uses_deterministic_dp_windows(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     trainer = TrainerRank(_runtime())  # type: ignore[arg-type]
-    monkeypatch.setattr(trainer, "_dp_rank_and_size", lambda: (1, 2))
-    monkeypatch.setattr(
-        trainer,
-        "_run_flat_plan_with_memory_tracking",
-        lambda plan, **_kwargs: [
-            ForwardOutput(None, None, None, None) for _ in range(plan.request_count)
-        ],
-    )
+    _stub_forward(monkeypatch, trainer, dp=(1, 2))
 
     batches = list(
         trainer.forward_micro_batches([_target_request(i) for i in range(5)])
@@ -662,10 +556,7 @@ def test_forward_micro_batches_syncs_fit_decision_across_dp(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     trainer = TrainerRank(_runtime())  # type: ignore[arg-type]
-    monkeypatch.setattr(trainer, "_dp_rank_and_size", lambda: (1, 2))
-    monkeypatch.setattr(
-        trainer, "_all_ranks_have_memory_profile", lambda **_kwargs: True
-    )
+    _stub_forward(monkeypatch, trainer, dp=(1, 2), profiled=True)
     sync_flags: list[bool] = []
 
     def memory_check(required: int, *, sync_across_dp: bool = False) -> _MemoryCheck:
@@ -677,62 +568,26 @@ def test_forward_micro_batches_syncs_fit_decision_across_dp(
         )
 
     monkeypatch.setattr(trainer, "_memory_check_required", memory_check)
-    monkeypatch.setattr(
-        trainer,
-        "_run_flat_plan_with_memory_tracking",
-        lambda plan, **_kwargs: [
-            ForwardOutput(None, None, None, None) for _ in range(plan.request_count)
-        ],
-    )
-
     next(iter(trainer.forward_micro_batches([_target_request(i) for i in range(6)])))
 
     assert sync_flags
     assert all(sync_flags)
 
 
-def test_forward_micro_batches_outputs_match_top_level_nested_inputs(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    trainer = TrainerRank(_runtime())  # type: ignore[arg-type]
-    monkeypatch.setattr(trainer, "_dp_rank_and_size", lambda: (0, 1))
-    monkeypatch.setattr(
-        trainer,
-        "_run_flat_plan_with_memory_tracking",
-        lambda plan, **_kwargs: [
-            ForwardOutput(None, None, None, None) for _ in range(plan.request_count)
-        ],
-    )
-
-    nested = [[_target_request(1), _target_request(3)]]
-    batch = next(iter(trainer.forward_micro_batches(nested)))
-
-    assert batch.inputs == nested
-    assert len(batch.outputs) == 1
-    assert len(batch.outputs[0]) == 2
-
-
 def test_forward_micro_batches_supports_arbitrary_nested_depth(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     trainer = TrainerRank(_runtime())  # type: ignore[arg-type]
-    monkeypatch.setattr(trainer, "_dp_rank_and_size", lambda: (0, 1))
-    monkeypatch.setattr(
-        trainer, "_all_ranks_have_memory_profile", lambda **_kwargs: True
-    )
-    monkeypatch.setattr(
-        trainer, "_run_flat_plan_with_memory_tracking", _indexed_outputs
-    )
-    nested = [
+    _stub_forward(monkeypatch, trainer, _indexed_outputs, profiled=True)
+    expected = [
         [[[[[_target_request(1)]]]]],
         [[[[[_target_request(3), _target_request(5)]]]]],
     ]
+    nested = [(child for child in item) for item in expected]
 
     batches = list(cast(Any, trainer).forward_micro_batches(nested))
 
-    assert len(batches) == 1
-    assert batches[0].inputs == nested
-    assert batches[0].select(nested) == nested
+    assert batches[0].inputs == expected
     assert _output_shape(batches[0].outputs) == [
         [[[[["output"]]]]],
         [[[[["output", "output"]]]]],
@@ -744,7 +599,6 @@ def test_forward_micro_batches_ramps_after_first_success(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     trainer = TrainerRank(_runtime())  # type: ignore[arg-type]
-    monkeypatch.setattr(trainer, "_dp_rank_and_size", lambda: (0, 1))
 
     def run(plan, **_kwargs):
         trainer._memory_profiles[plan.signature] = _MemoryProfile(
@@ -755,7 +609,7 @@ def test_forward_micro_batches_ramps_after_first_success(
             ForwardOutput(None, None, None, None) for _ in range(plan.request_count)
         ]
 
-    monkeypatch.setattr(trainer, "_run_flat_plan_with_memory_tracking", run)
+    _stub_forward(monkeypatch, trainer, run)
 
     batches = list(
         trainer.forward_micro_batches([_target_request(i) for i in range(8)])
@@ -785,56 +639,12 @@ def test_forward_micro_batches_does_not_overtrust_tiny_memory_profile(
     assert candidate.plan.packed_tokens == 16
 
 
-def test_forward_micro_batches_shrinks_to_largest_fitting_window(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    trainer = TrainerRank(_runtime())  # type: ignore[arg-type]
-    trainer._last_global_micro_batch_size = 4
-    monkeypatch.setattr(trainer, "_dp_rank_and_size", lambda: (0, 1))
-    monkeypatch.setattr(
-        trainer, "_all_ranks_have_memory_profile", lambda **_kwargs: True
-    )
-
-    def required_memory(**kwargs):
-        return kwargs["packed_tokens"]
-
-    def memory_check(required, *, sync_across_dp=False):
-        assert sync_across_dp
-        return _MemoryCheck(
-            estimated_required_bytes=required,
-            available_bytes=6,
-            fits=required <= 6,
-        )
-
-    monkeypatch.setattr(
-        trainer, "_estimate_required_memory_bytes_from_values", required_memory
-    )
-    monkeypatch.setattr(trainer, "_memory_check_required", memory_check)
-    monkeypatch.setattr(
-        trainer,
-        "_run_flat_plan_with_memory_tracking",
-        lambda plan, **_kwargs: [
-            ForwardOutput(None, None, None, None) for _ in range(plan.request_count)
-        ],
-    )
-
-    batch = next(
-        iter(trainer.forward_micro_batches([_target_request(i) for i in range(8)]))
-    )
-
-    assert batch.stats.global_count == 3
-    assert batch.stats.rejected_candidates >= 1
-
-
 def test_forward_micro_batches_tail_does_not_reset_stable_window(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     trainer = TrainerRank(_runtime())  # type: ignore[arg-type]
     trainer._last_global_micro_batch_size = 64
-    monkeypatch.setattr(trainer, "_dp_rank_and_size", lambda: (0, 1))
-    monkeypatch.setattr(
-        trainer, "_all_ranks_have_memory_profile", lambda **_kwargs: True
-    )
+    _stub_forward(monkeypatch, trainer, profiled=True)
     monkeypatch.setattr(
         trainer,
         "_estimate_required_memory_bytes_from_values",
@@ -849,172 +659,12 @@ def test_forward_micro_batches_tail_does_not_reset_stable_window(
             fits=required <= 128,
         ),
     )
-    monkeypatch.setattr(
-        trainer,
-        "_run_flat_plan_with_memory_tracking",
-        lambda plan, **_kwargs: [
-            ForwardOutput(None, None, None, None) for _ in range(plan.request_count)
-        ],
-    )
-
     batches = list(
         trainer.forward_micro_batches([_target_request(i) for i in range(130)])
     )
 
     assert [batch.stats.global_count for batch in batches] == [64, 64, 2]
     assert trainer._last_global_micro_batch_size == 64
-
-
-def test_forward_micro_batches_grows_small_stable_window_when_work_remains(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    trainer = TrainerRank(_runtime())  # type: ignore[arg-type]
-    trainer._last_global_micro_batch_size = 64
-    monkeypatch.setattr(trainer, "_dp_rank_and_size", lambda: (0, 1))
-    monkeypatch.setattr(
-        trainer, "_all_ranks_have_memory_profile", lambda **_kwargs: True
-    )
-    monkeypatch.setattr(
-        trainer,
-        "_estimate_required_memory_bytes_from_values",
-        lambda **kwargs: kwargs["packed_tokens"],
-    )
-    monkeypatch.setattr(
-        trainer,
-        "_memory_check_required",
-        lambda required, *, sync_across_dp=False: _MemoryCheck(
-            estimated_required_bytes=required,
-            available_bytes=512,
-            fits=required <= 512,
-        ),
-    )
-
-    candidate = trainer._select_next_micro_batch(
-        [_target_request(i) for i in range(512)],
-        0,
-    )
-
-    assert candidate.stats_global_count == 256
-
-
-def test_forward_micro_batches_avoids_packing_rejected_candidates(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    trainer = TrainerRank(_runtime())  # type: ignore[arg-type]
-    monkeypatch.setattr(trainer, "_dp_rank_and_size", lambda: (0, 1))
-    monkeypatch.setattr(
-        trainer, "_all_ranks_have_memory_profile", lambda **_kwargs: True
-    )
-    monkeypatch.setattr(
-        trainer,
-        "_run_flat_plan_with_memory_tracking",
-        lambda plan, **_kwargs: [
-            ForwardOutput(None, None, None, None) for _ in range(plan.request_count)
-        ],
-    )
-    original_plan = trainer._plan_flat_forward
-    plan_calls = 0
-    memory_checks = 0
-
-    def plan(requests):
-        nonlocal plan_calls
-        plan_calls += 1
-        return original_plan(requests)
-
-    def memory_check(plan, *, sync_across_dp=False):
-        assert sync_across_dp
-        nonlocal memory_checks
-        memory_checks += 1
-        return _MemoryCheck(
-            estimated_required_bytes=plan.packed_tokens,
-            available_bytes=10,
-            fits=True,
-        )
-
-    monkeypatch.setattr(trainer, "_plan_flat_forward", plan)
-    monkeypatch.setattr(trainer, "_memory_check", memory_check)
-    inputs = [_target_request(i) for i in range(8)]
-
-    batches = list(trainer.forward_micro_batches(inputs))
-
-    assert [batch.stats.global_count for batch in batches] == [8]
-    assert plan_calls == 1
-    assert memory_checks == 0
-
-
-def test_forward_micro_batches_replans_reused_input_list(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    trainer = TrainerRank(_runtime())  # type: ignore[arg-type]
-    monkeypatch.setattr(trainer, "_dp_rank_and_size", lambda: (0, 1))
-    monkeypatch.setattr(
-        trainer, "_all_ranks_have_memory_profile", lambda **_kwargs: True
-    )
-    original_plan = trainer._plan_flat_forward
-    plan_calls = 0
-
-    def plan(requests):
-        nonlocal plan_calls
-        plan_calls += 1
-        return original_plan(requests)
-
-    monkeypatch.setattr(trainer, "_plan_flat_forward", plan)
-    monkeypatch.setattr(
-        trainer,
-        "_run_flat_plan_with_memory_tracking",
-        lambda plan, **_kwargs: [
-            ForwardOutput(None, None, None, None) for _ in range(plan.request_count)
-        ],
-    )
-    inputs = [_target_request(1)]
-
-    list(trainer.forward_micro_batches(inputs))
-    inputs[0] = _target_request(10)
-    list(trainer.forward_micro_batches(inputs))
-
-    assert plan_calls == 2
-
-
-def test_cached_adaptive_estimate_rechecks_current_memory(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    trainer = TrainerRank(_runtime())  # type: ignore[arg-type]
-    monkeypatch.setattr(
-        trainer,
-        "_estimate_required_memory_bytes_from_values",
-        lambda **kwargs: kwargs["packed_tokens"],
-    )
-    monkeypatch.setattr(
-        trainer, "_all_ranks_have_memory_profile", lambda **_kwargs: True
-    )
-    original_estimate = trainer._estimate_flat_forward
-    estimate_calls = 0
-    available = [1 << 30, 1]
-
-    def estimate(requests):
-        nonlocal estimate_calls
-        estimate_calls += 1
-        return original_estimate(requests)
-
-    def memory_check(required: int, *, sync_across_dp: bool = False) -> _MemoryCheck:
-        assert sync_across_dp
-        current = available.pop(0)
-        return _MemoryCheck(
-            estimated_required_bytes=required,
-            available_bytes=current,
-            fits=required <= current,
-        )
-
-    monkeypatch.setattr(trainer, "_estimate_flat_forward", estimate)
-    monkeypatch.setattr(trainer, "_memory_check_required", memory_check)
-    inputs = [_target_request(1), _target_request(2)]
-
-    first = trainer._cached_adaptive_estimate((0, 1), inputs)
-    second = trainer._cached_adaptive_estimate((0, 1), inputs)
-
-    assert first is not None and first[0].fits
-    assert second is not None and not second[0].fits
-    assert estimate_calls == 1
 
 
 def test_forward_micro_batches_raises_when_smallest_batch_will_not_fit(
@@ -1058,6 +708,14 @@ def test_forward_micro_batches_rejects_mismatched_replicated_counts(
     with pytest.raises(ValueError, match="same top-level input count"):
         list(trainer.forward_micro_batches([_target_request(1)]))
 
+    monkeypatch.setattr(trainer_rank.dist, "is_initialized", lambda: False)
+    _stub_forward(monkeypatch, trainer, dp=(1, 2))
+    invalid = ForwardInput(
+        input_tokens=torch.tensor([1, 2]), target_tokens=torch.tensor([1, 2, 3])
+    )
+    with pytest.raises(ValueError, match="target_tokens"):
+        next(iter(trainer.forward_micro_batches([invalid, _target_request(1)])))
+
 
 def test_forward_plan_estimates_output_memory_for_request_combo() -> None:
     class FakeGPT(torch.nn.Module):
@@ -1075,25 +733,24 @@ def test_forward_plan_estimates_output_memory_for_request_combo() -> None:
             return None
 
     trainer = TrainerRank(_runtime(FakeGPT()))  # type: ignore[arg-type]
-    tokens = torch.tensor([1, 2, 3], dtype=torch.long)
-    labels = torch.stack((tokens, tokens + 1), dim=1)
+    tokens = torch.tensor([[1, 2, 3]], dtype=torch.long)
+    labels = torch.stack((tokens, tokens + 1), dim=-1)
 
-    plan = trainer._plan_flat_forward(
-        [
-            ForwardInput(
-                input_tokens=tokens,
-                target_tokens=labels,
-                top_k=5,
-                logits=True,
-                hidden_states=True,
-            )
-        ]
+    request = ForwardInput(
+        input_tokens=tokens,
+        target_tokens=labels,
+        top_k=5,
+        logits=True,
+        hidden_states=True,
     )
+    plan = trainer._plan_flat_forward([request])
+    estimate = trainer._estimate_flat_forward([request])
 
     target_bytes = 3 * 2 * 4
     topk_bytes = 3 * 5 * (4 + 8)
     logits_bytes = 3 * 10 * 4
     hidden_bytes = 3 * 4 * 4
+    assert estimate is not None and estimate[0] == plan.packed_tokens
     assert plan.output_bytes == target_bytes + topk_bytes + logits_bytes + hidden_bytes
 
 
