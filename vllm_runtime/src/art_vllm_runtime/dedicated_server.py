@@ -35,9 +35,21 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
 
 def _patch_art_runtime_routes() -> None:
-    from fastapi import APIRouter, FastAPI, Query, Request
-    from fastapi.responses import JSONResponse
+    from fastapi import APIRouter, Depends, FastAPI, Query, Request
+    from fastapi.responses import JSONResponse, Response
     from vllm.entrypoints.openai import api_server
+    from vllm.entrypoints.openai.chat_completion.api_router import (
+        create_chat_completion,
+    )
+    from vllm.entrypoints.openai.chat_completion.protocol import (
+        ChatCompletionRequest,
+    )
+    from vllm.entrypoints.serve.utils.api_utils import validate_json_request
+
+    from art_vllm_runtime.binary_routes import (
+        capture_routed_experts,
+        encode_routed_experts_response,
+    )
 
     if getattr(api_server, "_art_runtime_routes_patched", False):
         return
@@ -94,6 +106,38 @@ def _patch_art_runtime_routes() -> None:
             from art_vllm_runtime.metrics import get_art_metrics_snapshot
 
             return JSONResponse(content=get_art_metrics_snapshot())
+
+        @router.post(
+            "/art/v1/chat/completions",
+            dependencies=[Depends(validate_json_request)],
+        )
+        async def binary_chat_completion(
+            request: ChatCompletionRequest, raw_request: Request
+        ) -> Response:
+            if request.stream:
+                return JSONResponse(
+                    content={"error": "ART binary routed experts require stream=false"},
+                    status_code=HTTPStatus.BAD_REQUEST.value,
+                )
+            with capture_routed_experts() as routes:
+                response = await create_chat_completion(request, raw_request)
+            if response.status_code >= HTTPStatus.BAD_REQUEST.value:
+                return response
+            if not routes:
+                return JSONResponse(
+                    content={"error": "vLLM returned no routed experts"},
+                    status_code=HTTPStatus.INTERNAL_SERVER_ERROR.value,
+                )
+            headers = {
+                key: value
+                for key, value in response.headers.items()
+                if key.lower() not in {"content-length", "content-type"}
+            }
+            return Response(
+                content=encode_routed_experts_response(response.body, routes),
+                media_type="application/vnd.art.routed-experts-v1",
+                headers=headers,
+            )
 
         @router.post("/art/reset_prefix_cache")
         async def reset_prefix_cache(raw_request: Request) -> JSONResponse:

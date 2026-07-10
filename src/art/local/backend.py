@@ -1072,6 +1072,17 @@ class LocalBackend(Backend):
             base_url = f"http://{host}:{port}/v1"
             api_key = server_args.get("api_key") or "default"
 
+        if self._model_uses_expert_replay(model):
+            if not base_url.rstrip("/").endswith("/v1"):
+                raise RuntimeError(
+                    "ART vLLM base URL must end in /v1 for binary routed experts"
+                )
+            object.__setattr__(
+                model,
+                "_art_binary_routes_base_url",
+                f"{base_url.rstrip('/')[:-3]}/art/v1",
+            )
+
         return base_url, api_key
 
     # Note: _log() method has been moved to the Model class (frontend)

@@ -35,6 +35,7 @@ from .trajectories import Trajectory, TrajectoryGroup
 from .types import SFTMetricLoggingConfig, TrainSFTConfig
 from .utils import wandb_sdk
 from .utils.trajectory_logging import write_trajectory_groups_parquet
+from .vllm_route_transport import decode_routed_experts_response
 
 if TYPE_CHECKING:
     from wandb.sdk.wandb_run import Run
@@ -79,7 +80,10 @@ def _merge_extra_body_defaults(
     return merged
 
 
-def _attach_response_art_metadata(response: Any) -> None:
+def _attach_response_art_metadata(
+    response: Any,
+    routed_experts: dict[int, Any] | None = None,
+) -> None:
     choices = getattr(response, "choices", None)
     model_dump = getattr(response, "model_dump", None)
     if not choices or not callable(model_dump):
@@ -95,6 +99,11 @@ def _attach_response_art_metadata(response: Any) -> None:
             choice=choice,
             response_payload=response_payload,
             choice_index=choice_index,
+            routed_experts=(
+                routed_experts.get(int(choice.index))
+                if routed_experts is not None
+                else None
+            ),
         )
         attach_policy_token_metadata_to_choice(
             choice=choice,
@@ -120,11 +129,13 @@ class _OpenAIChatCompletionsProxy:
         record_costs: Any,
         default_extra_body: dict[str, Any] | None = None,
         local_serving_base_url: str | None = None,
+        binary_completions: Any | None = None,
     ) -> None:
         self._completions = completions
         self._record_costs = record_costs
         self._default_extra_body = default_extra_body
         self._local_serving_base_url = local_serving_base_url
+        self._binary_completions = binary_completions
 
     async def create(self, *args: Any, **kwargs: Any) -> Any:
         if self._default_extra_body is not None:
@@ -139,7 +150,18 @@ class _OpenAIChatCompletionsProxy:
         # training response intact and suppress only this implicit trace.
         try:
             with _suppress_weave_trace():
-                response = await self._completions.create(*args, **kwargs)
+                if self._binary_completions is None:
+                    response = await self._completions.create(*args, **kwargs)
+                    routed_experts = None
+                else:
+                    raw_response = (
+                        await self._binary_completions.with_raw_response.create(
+                            *args, **kwargs
+                        )
+                    )
+                    response, routed_experts = decode_routed_experts_response(
+                        raw_response.content
+                    )
         except APIConnectionError as exc:
             if self._local_serving_base_url is not None:
                 raise LocalServingUnavailableError(
@@ -148,7 +170,7 @@ class _OpenAIChatCompletionsProxy:
                     "of counting rollouts as data errors."
                 ) from exc
             raise
-        _attach_response_art_metadata(response)
+        _attach_response_art_metadata(response, routed_experts)
         self._record_costs(response)
         return response
 
@@ -163,6 +185,7 @@ class _OpenAIChatProxy:
         record_costs: Any,
         default_extra_body: dict[str, Any] | None = None,
         local_serving_base_url: str | None = None,
+        binary_chat: Any | None = None,
     ) -> None:
         self._chat = chat
         self.completions = _OpenAIChatCompletionsProxy(
@@ -170,6 +193,7 @@ class _OpenAIChatProxy:
             record_costs,
             default_extra_body,
             local_serving_base_url,
+            binary_chat.completions if binary_chat is not None else None,
         )
 
     def __getattr__(self, name: str) -> Any:
@@ -183,16 +207,24 @@ class _OpenAIClientProxy:
         record_costs: Any,
         default_extra_body: dict[str, Any] | None = None,
         local_serving_base_url: str | None = None,
+        binary_routes_base_url: str | None = None,
     ) -> None:
         self._client = client
         self._record_costs = record_costs
         self._default_extra_body = default_extra_body
         self._local_serving_base_url = local_serving_base_url
+        self._binary_routes_base_url = binary_routes_base_url
+        binary_client = (
+            client.with_options(base_url=binary_routes_base_url)
+            if binary_routes_base_url is not None
+            else None
+        )
         self.chat = _OpenAIChatProxy(
             client.chat,
             record_costs,
             default_extra_body,
             local_serving_base_url,
+            binary_client.chat if binary_client is not None else None,
         )
 
     def with_options(self, *args: Any, **kwargs: Any) -> "_OpenAIClientProxy":
@@ -201,6 +233,7 @@ class _OpenAIClientProxy:
             self._record_costs,
             self._default_extra_body,
             self._local_serving_base_url,
+            self._binary_routes_base_url,
         )
 
     def __getattr__(self, name: str) -> Any:
@@ -354,6 +387,7 @@ class Model(
     _s3_bucket: str | None = None
     _s3_prefix: str | None = None
     _openai_client: AsyncOpenAI | None = None
+    _art_binary_routes_base_url: str | None = None
     _wandb_run: Optional["Run"] = None  # Private, for lazy wandb initialization
     _wandb_defined_metrics: set[str]
     _wandb_config: dict[str, Any]
@@ -408,6 +442,7 @@ class Model(
             self, "_metrics_builder", MetricsBuilder(cost_context="train")
         )
         object.__setattr__(self, "_metrics_builder_state_loaded", False)
+        object.__setattr__(self, "_art_binary_routes_base_url", None)
 
     @overload
     def __new__(
@@ -522,6 +557,7 @@ class Model(
                     and _is_local_inference_base_url(self.inference_base_url)
                     else None
                 ),
+                self._art_binary_routes_base_url,
             ),
         )
         return self._openai_client

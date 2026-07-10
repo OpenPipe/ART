@@ -152,6 +152,7 @@ def attach_moe_routing_metadata_to_choice(
     choice: Choice,
     response_payload: dict[str, Any],
     choice_index: int = 0,
+    routed_experts: MoeRouteArray | None = None,
 ) -> None:
     metadata: dict[str, Any] = {
         key: response_payload[key]
@@ -169,6 +170,8 @@ def attach_moe_routing_metadata_to_choice(
                     if key in raw_choice
                 }
             )
+    if routed_experts is not None:
+        metadata[ROUTED_EXPERTS_KEY] = routed_experts
     if not metadata or not _has_routing_experts(metadata):
         return
     extra = choice.model_extra
@@ -424,6 +427,10 @@ def _normalize_routes(
     field_name: str,
     route_decode_cache: MoeRouteDecodeCache | None = None,
 ) -> MoeRouteArray:
+    if isinstance(raw, np.ndarray):
+        _validate_route_array(raw, field_name=field_name)
+        raw.flags.writeable = False
+        return raw
     if isinstance(raw, str):
         if route_decode_cache is not None:
             key = _route_cache_key(raw)
@@ -713,6 +720,8 @@ def _completion_routes_payload(metadata: dict[str, Any]) -> Any:
 
 
 def _route_payload_size(raw: Any) -> int:
+    if isinstance(raw, np.ndarray):
+        return int(raw.nbytes)
     if isinstance(raw, str):
         return len(raw)
     if isinstance(raw, list):
