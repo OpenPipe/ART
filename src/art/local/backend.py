@@ -1179,8 +1179,8 @@ class LocalBackend(Backend):
         Args:
             model: The trainable model to fine-tune
             trajectories: Iterable of Trajectory objects
-            config: SFT configuration with batch_size and learning rates.
-                    If learning_rate is a list, streaming mode is used automatically.
+            config: SFT configuration with batch size, learning rates, and assistant
+                turn selection. A learning-rate list enables streaming mode.
             dev_config: Developer configuration
             verbose: Whether to print detailed logs
 
@@ -1209,38 +1209,55 @@ class LocalBackend(Backend):
         )
         service_config = config.model_copy(update={"batch_size": batch_size})
 
+        # Auto-detect instruction/response parts from model
+        from ..utils.model_config import get_instruction_response_parts
+
+        instruction_part, response_part = get_instruction_response_parts(
+            model.base_model, tokenizer
+        )
         chat_template_kwargs = internal_config.get("chat_template_kwargs")
         chat_template_tool_schema_format = self._chat_template_tool_schema_format(
             internal_config
         )
 
+        if verbose:
+            print(f"Using instruction_part: {instruction_part!r}")
+            print(f"Using response_part: {response_part!r}")
+
         max_seq_length = self._model_max_sequence_length(model)
 
-        import itertools
-        from typing import Iterator
-
         from ..preprocessing.tokenize import SFTBatch
-
-        if isinstance(config.learning_rate, list):
-            learning_rates_iter: Iterator[float] = iter(config.learning_rate)
-        else:
-            learning_rates_iter = itertools.repeat(config.learning_rate)
 
         # Build all batches in memory
         trajectory_list = list(trajectories)
         batches: list[SFTBatch] = []
+        total_dropped_trajectories = 0
         for i in range(0, len(trajectory_list), batch_size):
             batch_trajectories = trajectory_list[i : i + batch_size]
-            batches.append(
-                tokenize_sft_batch(
-                    trajectory_batch=batch_trajectories,
-                    learning_rate=next(learning_rates_iter),
-                    tokenizer=tokenizer,
-                    chat_template_kwargs=chat_template_kwargs,
-                    chat_template_tool_schema_format=chat_template_tool_schema_format,
-                    max_seq_length=max_seq_length,
-                )
+            learning_rate = (
+                config.learning_rate[len(batches)]
+                if isinstance(config.learning_rate, list)
+                else config.learning_rate
             )
+            batch = tokenize_sft_batch(
+                trajectory_batch=batch_trajectories,
+                learning_rate=learning_rate,
+                tokenizer=tokenizer,
+                instruction_part=instruction_part,
+                response_part=response_part,
+                chat_template_kwargs=chat_template_kwargs,
+                chat_template_tool_schema_format=chat_template_tool_schema_format,
+                max_seq_length=max_seq_length,
+                assistant_turns=config.assistant_turns,
+            )
+            total_dropped_trajectories += batch.num_dropped_trajectories
+            if batch.num_trainable_tokens > 0:
+                batches.append(batch)
+
+        if not batches:
+            if verbose:
+                print("No SFT batches contained trainable tokens")
+            return
 
         # Get the service and train
         service = await self._get_service(model)
@@ -1248,9 +1265,6 @@ class LocalBackend(Backend):
         pbar = tqdm.tqdm(total=len(batches), desc="sft train")
         total_trainable_tokens = sum(batch.num_trainable_tokens for batch in batches)
         total_trajectories = len(trajectory_list)
-        total_dropped_trajectories = sum(
-            batch.num_dropped_trajectories for batch in batches
-        )
         batch_count = 0
 
         async for result in service.train_sft(batches, service_config, verbose):
@@ -1271,12 +1285,6 @@ class LocalBackend(Backend):
             }
 
         pbar.close()
-
-        if batch_count > 0 and total_trainable_tokens == 0:
-            print(
-                "WARNING: No trainable tokens found! "
-                "Check trajectory.loss_mask and the tokenizer chat template."
-            )
 
         if verbose:
             print("_train_sft complete")

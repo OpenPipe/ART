@@ -110,7 +110,6 @@ def write_trajectory_groups_parquet(
                     if trajectory.metadata
                     else None,
                     "tools": json.dumps(trajectory.tools) if trajectory.tools else None,
-                    "loss_mask": trajectory.loss_mask.model_dump_json(),
                     "logs": trajectory.logs if trajectory.logs else None,
                     "messages": messages,
                 }
@@ -137,7 +136,6 @@ def write_trajectory_groups_parquet(
             ("metrics", pa.string()),
             ("metadata", pa.string()),
             ("tools", pa.string()),
-            ("loss_mask", pa.string()),
             ("logs", pa.list_(pa.string())),
             ("messages", pa.list_(message_type)),
         ]
@@ -227,22 +225,15 @@ def read_trajectory_groups_parquet(path: str | Path) -> list[TrajectoryGroup]:
                 }
             messages_and_choices.append(_unflatten_message(msg))
 
-        trajectory_kwargs: dict[str, Any] = {
-            "messages_and_choices": messages_and_choices,
-            "reward": row_dict["reward"],
-            "metrics": json.loads(row_dict["metrics"])
-            if row_dict.get("metrics")
-            else {},
-            "metadata": json.loads(row_dict["metadata"])
+        trajectory = Trajectory(
+            messages_and_choices=messages_and_choices,
+            reward=row_dict["reward"],
+            metrics=json.loads(row_dict["metrics"]) if row_dict.get("metrics") else {},
+            metadata=json.loads(row_dict["metadata"])
             if row_dict.get("metadata")
             else {},
-            "tools": json.loads(row_dict["tools"]) if row_dict.get("tools") else None,
-            "logs": row_dict.get("logs") or [],
-        }
-        if row_dict.get("loss_mask"):
-            trajectory_kwargs["loss_mask"] = json.loads(row_dict["loss_mask"])
-
-        trajectory = Trajectory(**trajectory_kwargs)
+            logs=row_dict.get("logs") or [],
+        )
 
         if group_index not in groups_dict:
             groups_dict[group_index] = []

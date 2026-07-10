@@ -538,6 +538,11 @@ class ServerlessBackend(Backend):
         Yields:
             Dictionary containing training metrics for each batch.
         """
+        if config.assistant_turns == "last":
+            raise NotImplementedError(
+                "assistant_turns='last' currently requires LocalBackend"
+            )
+
         import json
         import tempfile
         import uuid
@@ -546,12 +551,10 @@ class ServerlessBackend(Backend):
 
         assert model.id is not None, "Model ID is required"
 
-        for _ in trajectories:
-            # TODO: Implement the semantic SFT mask contract for ServerlessBackend.
-            raise ValueError(
-                "ServerlessBackend SFT does not support semantic SFT loss masks "
-                "yet. Use a local SFT backend."
-            )
+        # Get the user's default entity from W&B if not set
+        if model.entity is None:
+            api = wandb_sdk.api(api_key=self._client.api_key)
+            model.entity = api.default_entity
 
         # Generate unique artifact name to avoid race conditions in distributed systems
         artifact_id = uuid.uuid4().hex[:12]
@@ -586,12 +589,6 @@ class ServerlessBackend(Backend):
 
         if verbose:
             print(f"Serialized {num_trajectories} trajectories")
-
-        # Get the user's default entity from W&B if not set. Do this only after
-        # validating/serializing trajectories so local input errors surface first.
-        if model.entity is None:
-            api = wandb_sdk.api(api_key=self._client.api_key)
-            model.entity = api.default_entity
 
         try:
             if verbose:

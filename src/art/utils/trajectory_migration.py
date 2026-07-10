@@ -18,7 +18,7 @@ from typing import Any, Callable, Iterator, cast
 import yaml
 
 from art.trajectories import History, Trajectory, TrajectoryGroup
-from art.types import Choice, Message, MessageOrChoice, SFTRolesLossMask
+from art.types import Choice, Message, MessageOrChoice
 
 # ============================================================================
 # Legacy JSONL serialization helpers
@@ -67,7 +67,6 @@ def trajectory_to_dict(trajectory: Trajectory) -> dict[str, Any]:
         "metadata": trajectory.metadata,
         "messages_and_choices": messages_and_choices,
         "tools": trajectory.tools,
-        "loss_mask": trajectory.loss_mask.model_dump(),
         "additional_histories": (
             [history_to_dict(h) for h in trajectory.additional_histories]
             if trajectory.additional_histories
@@ -118,20 +117,16 @@ def dict_to_trajectory_group(d: dict[str, Any]) -> TrajectoryGroup:
 
 
 def dict_to_trajectory(d: dict[str, Any]) -> Trajectory:
-    trajectory_kwargs: dict[str, Any] = {
-        "messages_and_choices": [
+    return Trajectory(
+        messages_and_choices=[
             dict_to_message_or_choice(message_or_choice)
             for message_or_choice in d["messages_and_choices"]
         ],
-        "reward": d["reward"],
-        "metrics": d["metrics"],
-        "metadata": d["metadata"],
-        "tools": d.get("tools"),
-        "logs": d["logs"],
-    }
-    if "loss_mask" in d:
-        trajectory_kwargs["loss_mask"] = d["loss_mask"]
-    return Trajectory(**trajectory_kwargs)
+        reward=d["reward"],
+        metrics=d["metrics"],
+        metadata=d["metadata"],
+        logs=d["logs"],
+    )
 
 
 def dict_to_message_or_choice(d: dict[str, Any]) -> MessageOrChoice:
@@ -233,17 +228,6 @@ def migrate_jsonl_to_parquet(
         rows = []
         for group_index, group in enumerate(trajectory_groups_data):
             for traj in group.get("trajectories", []):
-                loss_mask = (
-                    traj["loss_mask"]
-                    if "loss_mask" in traj
-                    else SFTRolesLossMask().model_dump()
-                )
-                if loss_mask is None:
-                    raise ValueError(
-                        "loss_mask cannot be null; omit loss_mask to use the "
-                        "default assistant-role mask"
-                    )
-
                 # Flatten messages
                 messages = []
                 for msg in traj.get("messages_and_choices", []):
@@ -288,7 +272,6 @@ def migrate_jsonl_to_parquet(
                         "tools": json.dumps(traj.get("tools"))
                         if traj.get("tools")
                         else None,
-                        "loss_mask": json.dumps(loss_mask),
                         "logs": traj.get("logs"),
                         "additional_histories": json.dumps(
                             traj.get("additional_histories")
@@ -317,7 +300,6 @@ def migrate_jsonl_to_parquet(
                 ("metrics", pa.string()),
                 ("metadata", pa.string()),
                 ("tools", pa.string()),
-                ("loss_mask", pa.string()),
                 ("logs", pa.list_(pa.string())),
                 ("additional_histories", pa.string()),
                 ("messages", pa.list_(message_type)),
