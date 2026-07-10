@@ -14,6 +14,8 @@ from art.megatron.model_support.handlers.default_dense import (
 )
 from art.megatron.model_support.spec import (
     CompileWorkaroundConfig,
+    ExpertPackedLoraGroup,
+    ExpertPackedLoraSlot,
     LayerFamilyInstance,
     PrefixTreeModelStateContext,
 )
@@ -421,6 +423,39 @@ class Dsv4Handler(DefaultMoeHandler):
         vLLM/Miles module names rather than ART/Megatron training target names.
         """
         return _dsv4_vllm_lora_config(adapter_config)
+
+    def expert_packed_lora_groups(self) -> tuple[ExpertPackedLoraGroup, ...]:
+        return (
+            ExpertPackedLoraGroup(
+                art_group_suffix=".mlp.experts",
+                slots=(
+                    ExpertPackedLoraSlot(
+                        source_projection="gate_up_proj",
+                        source_lora="lora_A",
+                        output_suffix="base_layer.lora_A.weight",
+                        pack_layout="expert_rows",
+                    ),
+                    ExpertPackedLoraSlot(
+                        source_projection="gate_up_proj",
+                        source_lora="lora_B",
+                        output_suffix="base_layer.lora_B.weight",
+                        pack_layout="rank_major_expert_cols",
+                    ),
+                    ExpertPackedLoraSlot(
+                        source_projection="down_proj",
+                        source_lora="lora_A",
+                        output_suffix="lora_A.weight",
+                        pack_layout="expert_rows",
+                    ),
+                    ExpertPackedLoraSlot(
+                        source_projection="down_proj",
+                        source_lora="lora_B",
+                        output_suffix="lora_B.weight",
+                        pack_layout="rank_major_expert_cols",
+                    ),
+                ),
+            ),
+        )
 
     def compile_workaround_config(self, provider: Any) -> CompileWorkaroundConfig:
         return CompileWorkaroundConfig(

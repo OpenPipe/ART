@@ -1589,9 +1589,18 @@ def test_save_vllm_lora_from_model_writes_single_vllm_checkpoint(tmp_path: Path)
     _assert_tensors_equal(roundtrip, full)
 
 
-def test_direct_qwen35_packed_expert_publish_matches_old_vllm_exactly(
+@pytest.mark.parametrize(
+    ("handler", "base_model"),
+    (
+        (QWEN3_5_MOE_HANDLER, "Qwen/Qwen3.5-35B-A3B"),
+        (DSV4_HANDLER, "deepseek-ai/DeepSeek-V4-Flash"),
+    ),
+)
+def test_direct_3d_packed_expert_publish_matches_handler_vllm_exactly(
     tmp_path: Path,
     monkeypatch,
+    handler,
+    base_model: str,
 ):
     monkeypatch.setattr(lora_module.ps, "get_expert_model_parallel_rank", lambda: 0)
     monkeypatch.setattr(lora_module.ps, "get_expert_data_parallel_rank", lambda: 0)
@@ -1657,10 +1666,10 @@ def test_direct_qwen35_packed_expert_publish_matches_old_vllm_exactly(
         down_lora.B_T.data[expert].copy_(tensors["down_proj.lora_B.weight"].T)
         offset += 1000
 
-    adapter_config = _config("Qwen/Qwen3.5-35B-A3B", rank=rank, alpha=rank)
+    adapter_config = _config(base_model, rank=rank, alpha=rank)
     old_dir = tmp_path / "old"
     current_dir = tmp_path / "current"
-    old_tensors, old_config = QWEN3_5_MOE_HANDLER.to_vllm_lora_tensors(
+    old_tensors, old_config = handler.to_vllm_lora_tensors(
         full,
         adapter_config=dict(adapter_config),
     )
@@ -1668,7 +1677,7 @@ def test_direct_qwen35_packed_expert_publish_matches_old_vllm_exactly(
     save_vllm_lora_from_model(
         model=cast(Any, [torch.nn.Sequential(gate_up_lora, down_lora)]),
         adapter_model=full,
-        handler=QWEN3_5_MOE_HANDLER,
+        handler=handler,
         adapter_config=dict(adapter_config),
         output_dir=str(current_dir),
         rank=0,
