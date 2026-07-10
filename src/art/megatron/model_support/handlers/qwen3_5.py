@@ -26,11 +26,6 @@ from art.megatron.model_support.spec import (
 )
 
 _QWEN35_MOE_COMPILE_WORKAROUND_FLAGS = (
-    "alltoall_dtoh",
-    "alltoall_dispatch_preprocess",
-    "deepep_dispatch_combine",
-    "deepep_permute_restore",
-    "flex_token_dispatch_combine",
     "moe_postprocess",
     "te_triton_permute_with_mask_map",
     # Torch 2.11.0 compiles Megatron's weighted SwiGLU custom autograd

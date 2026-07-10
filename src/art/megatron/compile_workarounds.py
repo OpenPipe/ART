@@ -235,29 +235,6 @@ def install_torch_compile_workarounds(
     if "gemma4_moe_postprocess" in flags:
         _install_gemma4_moe_postprocess_workaround()
 
-    deepep_flags = {"deepep_permute_restore", "deepep_dispatch_combine"} & flags
-    if deepep_flags:
-        deepep_manager = _require_attr(token_dispatcher, "_DeepepManager")
-        if "deepep_permute_restore" in flags:
-            _disable_attr(deepep_manager, "get_permuted_hidden_states_by_experts")
-            _disable_attr(deepep_manager, "get_restored_hidden_states_by_experts")
-        if "deepep_dispatch_combine" in flags:
-            _disable_attr(deepep_manager, "dispatch")
-            _disable_attr(deepep_manager, "combine")
-    if "alltoall_dtoh" in flags:
-        token_dispatcher.MoEAlltoAllTokenDispatcher._maybe_dtoh_and_synchronize = (
-            _disable(
-                token_dispatcher.MoEAlltoAllTokenDispatcher._maybe_dtoh_and_synchronize
-            )
-        )
-    if "alltoall_dispatch_preprocess" in flags:
-        token_dispatcher.MoEAlltoAllTokenDispatcher.dispatch_preprocess = _disable(
-            token_dispatcher.MoEAlltoAllTokenDispatcher.dispatch_preprocess
-        )
-    if "alltoall_combine_postprocess" in flags:
-        token_dispatcher.MoEAlltoAllTokenDispatcher.combine_postprocess = _disable(
-            token_dispatcher.MoEAlltoAllTokenDispatcher.combine_postprocess
-        )
     if "te_moe_permute_with_probs" in flags:
         from transformer_engine.pytorch import permutation as te_permutation
 

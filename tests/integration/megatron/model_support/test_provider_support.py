@@ -36,8 +36,8 @@ class _FakeProvider:
         self.add_bias_linear = True
         self.bias_activation_fusion = True
         self.window_size: int | tuple[int, int] = (128, 0)
-        self.art_moe_flex_dispatcher_backend: str | None = "deepep"
-        self.moe_enable_deepep = True
+        self.moe_hybridep_num_sms = 16
+        self.moe_flex_dispatcher_backend = "hybridep"
         self.moe_token_dispatcher_type = ""
         self.recompute_granularity: str | None = None
         self.recompute_method: str | None = None
@@ -247,7 +247,7 @@ def test_gpt_oss_mxfp4_weight_source_materializes_once() -> None:
     assert bridge.calls == [hf_param]
 
 
-def test_gpt_oss_runtime_disables_deepep_dispatcher() -> None:
+def test_gpt_oss_runtime_preserves_hybridep_dispatcher() -> None:
     handler = get_model_support_handler("openai/gpt-oss-20b")
     provider: Any = _FakeProvider()
     provider.num_moe_experts = 32
@@ -255,11 +255,12 @@ def test_gpt_oss_runtime_disables_deepep_dispatcher() -> None:
     provider.moe_ffn_hidden_size = 2880
     provider.window_size = (128, 0)
 
+    provider.moe_token_dispatcher_type = "flex"
+    provider.moe_flex_dispatcher_backend = "hybridep"
     handler.configure_provider_for_runtime(cast(Any, provider))
 
-    assert provider.art_moe_flex_dispatcher_backend is None
-    assert provider.moe_enable_deepep is False
-    assert provider.moe_token_dispatcher_type == "alltoall"
+    assert provider.moe_flex_dispatcher_backend == "hybridep"
+    assert provider.moe_token_dispatcher_type == "flex"
 
 
 def test_moe_grouped_gemm_fast_path_forces_bias_settings() -> None:
@@ -443,25 +444,46 @@ def test_finalize_provider_bundle_uses_post_prepare_topology(
     assert dispatcher_calls == []
 
 
-def test_finalize_provider_bundle_respects_handler_flex_dispatcher_choice(
+def test_finalize_provider_bundle_always_uses_hybridep(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     provider: Any = _FakeProvider()
     provider.expert_model_parallel_size = 2
     provider.expert_tensor_parallel_size = 1
-    provider.art_moe_flex_dispatcher_backend = None
     dispatcher_calls: list[str] = []
+
+    def apply_hybridep(provider: Any, moe_flex_dispatcher_backend: str) -> None:
+        dispatcher_calls.append(moe_flex_dispatcher_backend)
+        provider.moe_token_dispatcher_type = "flex"
+        provider.moe_flex_dispatcher_backend = moe_flex_dispatcher_backend
+
     monkeypatch.setattr(
         provider_module,
         "apply_flex_dispatcher_backend",
-        lambda provider, moe_flex_dispatcher_backend: dispatcher_calls.append(
-            cast(str, moe_flex_dispatcher_backend)
-        ),
+        apply_hybridep,
     )
 
     provider_module._apply_art_training_runtime_finalize_defaults(cast(Any, provider))
 
-    assert dispatcher_calls == []
+    assert dispatcher_calls == ["hybridep"]
+
+
+def test_finalize_provider_bundle_rejects_hybridep_skip(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    provider = _FakeProvider()
+    provider.expert_model_parallel_size = 2
+    provider.moe_token_dispatcher_type = "alltoall"
+    monkeypatch.setattr(
+        provider_module,
+        "apply_flex_dispatcher_backend",
+        lambda provider, moe_flex_dispatcher_backend: None,
+    )
+
+    with pytest.raises(RuntimeError, match="requires HybridEP"):
+        provider_module._apply_art_training_runtime_finalize_defaults(
+            cast(Any, provider)
+        )
 
 
 def test_get_provider_bundle_honors_single_gpu_env_topology(
@@ -735,22 +757,24 @@ def test_moe_grouped_gemm_fast_path_rejects_unaligned_dimensions() -> None:
         provider_module._enforce_art_moe_grouped_gemm_fast_path(cast(Any, provider))
 
 
-def test_finalize_provider_bundle_can_disable_flex_dispatcher_backend(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    provider = _FakeProvider()
-    provider.expert_model_parallel_size = 2
-    provider.expert_tensor_parallel_size = 1
-    dispatcher_calls: list[str] = []
-    monkeypatch.setenv("ART_MEGATRON_MOE_FLEX_DISPATCHER_BACKEND", "disabled")
-    monkeypatch.setattr(
-        provider_module,
-        "apply_flex_dispatcher_backend",
-        lambda provider, moe_flex_dispatcher_backend: dispatcher_calls.append(
-            cast(str, moe_flex_dispatcher_backend)
-        ),
+@pytest.mark.parametrize(
+    "retired",
+    [
+        "ART_MEGATRON_MOE_FLEX_DISPATCHER_BACKEND",
+        "ART_MEGATRON_MOE_DEEPEP_NUM_SMS",
+    ],
+)
+def test_provider_runtime_rejects_retired_deepep_settings(retired: str) -> None:
+    with pytest.raises(ValueError, match=f"{retired} was removed"):
+        provider_module._ProviderRuntimeEnv.from_environ({retired: "disabled"})
+
+
+def test_provider_runtime_configures_hybridep_sms() -> None:
+    runtime = provider_module._ProviderRuntimeEnv.from_environ(
+        {"ART_MEGATRON_MOE_HYBRIDEP_NUM_SMS": "28"}
     )
+    provider = _FakeProvider()
 
-    provider_module._apply_art_training_runtime_finalize_defaults(cast(Any, provider))
+    provider_module._apply_runtime_env_overrides(cast(Any, provider), runtime)
 
-    assert dispatcher_calls == []
+    assert provider.moe_hybridep_num_sms == 28

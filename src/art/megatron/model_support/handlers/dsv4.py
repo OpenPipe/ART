@@ -40,13 +40,7 @@ _DSV4_VLLM_MOE_EXPERT_KEY_RE = re.compile(
     r"^(?P<prefix>.*\.ffn\.experts)\.(?P<expert>\d+)\."
     r"(?P<module>w1|w2|w3)\.(?P<lora>lora_[AB])\.weight$"
 )
-_DSV4_MOE_COMPILE_WORKAROUND_FLAGS = (
-    "alltoall_dtoh",
-    "alltoall_dispatch_preprocess",
-    "deepep_dispatch_combine",
-    "deepep_permute_restore",
-    "te_triton_permute_with_mask_map",
-)
+_DSV4_MOE_COMPILE_WORKAROUND_FLAGS = ("te_triton_permute_with_mask_map",)
 
 
 class Dsv4Handler(DefaultMoeHandler):

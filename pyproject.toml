@@ -325,6 +325,8 @@ dev = [
 [tool.uv.sources]
 torch = [{ index = "pytorch-cu128", marker = "sys_platform == 'linux' or sys_platform == 'win32'" }]
 apex = { git = "https://github.com/NVIDIA/apex.git", rev = "25.09" }
+# Local development override until openpipe-deep-ep is published. Release keeps
+# the versioned dependency above and removes only this source entry.
 openpipe-deep-ep = { path = "../../openpipe_deep_ep/hybrid_ep_cuda_12_8_cache" }
 flash-attn-4 = { url = "https://files.pythonhosted.org/packages/24/f7/01ee2576ce41f9884d291ee21861ef194afc0b2b1ce3bd175fc7a6e1b133/flash_attn_4-4.0.0b5-py3-none-any.whl" }
 megatron-bridge = { git = "https://github.com/NVIDIA-NeMo/Megatron-Bridge.git", rev = "e1a207ac757e5d0ed94d8ffbe1cbd28e81d8c084" }

@@ -6,44 +6,39 @@ from art.megatron.model_support.handlers.qwen3_5 import QWEN3_5_MOE_HANDLER
 from art.megatron.model_support.handlers.qwen3_moe import QWEN3_MOE_HANDLER
 
 _GEMMA4_MOE_COMPILE_FLAGS = (
-    "alltoall_dtoh",
-    "alltoall_dispatch_preprocess",
-    "deepep_dispatch_combine",
-    "deepep_permute_restore",
-    "flex_token_dispatch_combine",
     "gemma4_moe_postprocess",
     "moe_postprocess",
     "te_triton_permute_with_mask_map",
+    "flex_token_dispatch_combine",
 )
 _QWEN3_MOE_COMPILE_FLAGS = (
-    "alltoall_dtoh",
-    "alltoall_dispatch_preprocess",
-    "deepep_dispatch_combine",
-    "deepep_permute_restore",
     "moe_postprocess",
     "te_triton_permute_with_mask_map",
+    "flex_token_dispatch_combine",
 )
 _QWEN35_MOE_COMPILE_FLAGS = (
-    "alltoall_dtoh",
-    "alltoall_dispatch_preprocess",
-    "deepep_dispatch_combine",
-    "deepep_permute_restore",
-    "flex_token_dispatch_combine",
     "moe_postprocess",
     "te_triton_permute_with_mask_map",
     "weighted_bias_swiglu_no_inner_forward_cast",
+    "flex_token_dispatch_combine",
 )
 
 
-def test_qwen3_moe_compile_workarounds_cover_deepep_permute_restore() -> None:
-    provider = type("Provider", (), {"context_parallel_size": 1})()
+def test_qwen3_moe_compile_workarounds_cover_hybridep_boundary() -> None:
+    provider = type(
+        "Provider", (), {"context_parallel_size": 1, "num_moe_experts": 128}
+    )()
     config = QWEN3_MOE_HANDLER.compile_workaround_config(provider)
     assert config.flags == _QWEN3_MOE_COMPILE_FLAGS
     assert config.unconditional_flags == ()
 
 
-def test_qwen35_moe_compile_workarounds_cover_deepep_permute_restore() -> None:
-    provider = type("Provider", (), {"moe_shared_expert_overlap": False})()
+def test_qwen35_moe_compile_workarounds_cover_hybridep_boundary() -> None:
+    provider = type(
+        "Provider",
+        (),
+        {"moe_shared_expert_overlap": False, "num_moe_experts": 256},
+    )()
     config = QWEN3_5_MOE_HANDLER.compile_workaround_config(provider)
     assert config.flags == _QWEN35_MOE_COMPILE_FLAGS
     assert config.unconditional_flags == ()
@@ -78,7 +73,11 @@ def test_gemma4_standard_global_attention_keeps_default_triton_stage_count() -> 
 
 
 def test_gemma4_moe_compile_workarounds_cover_moe_postprocess() -> None:
-    provider = type("Provider", (), {"moe_shared_expert_overlap": False})()
+    provider = type(
+        "Provider",
+        (),
+        {"moe_shared_expert_overlap": False, "num_moe_experts": 128},
+    )()
     config = GEMMA4_MOE_HANDLER.compile_workaround_config(provider)
     assert config.flags == _GEMMA4_MOE_COMPILE_FLAGS
     assert config.unconditional_flags == ()
