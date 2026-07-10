@@ -277,13 +277,13 @@ def test_tokenize_sft_batch_trains_only_final_assistant_turn() -> None:
 
     input_ids = batch.trajectory_tensors[0]["input_ids"][0].tolist()
     labels = batch.trajectory_tensors[0]["labels"][0].tolist()
-    target_ids = tokenizer.encode("final answer<eos>")
+    target_ids = tokenizer.encode("final answer<eos>\n")
     target_start = len(input_ids) - len(target_ids)
 
     assert labels[:target_start] == [-100] * target_start
     assert labels[target_start:] == target_ids
     assert input_ids[target_start:] == target_ids
-    assert tokenizer.decode(target_ids) == "final answer<eos>"
+    assert tokenizer.decode(target_ids) == "final answer<eos>\n"
     assert batch.num_trainable_tokens == len(target_ids)
 
 
@@ -326,10 +326,10 @@ def test_tokenize_sft_batch_trains_final_tool_call_and_turn_end() -> None:
     assert target_text == (
         "\n\n<tool_call>\n<function=send_whatsapp>\n"
         "<parameter=body>\nparking info\n</parameter>\n"
-        "</function>\n</tool_call><eos>"
+        "</function>\n</tool_call><eos>\n"
     )
     assert tokenizer.assistant_prefix not in target_text
-    assert not target_text.endswith("\n")
+    assert target_text.endswith("<eos>\n")
 
 
 def test_tokenize_sft_batch_preserves_prompt_target_token_boundary() -> None:

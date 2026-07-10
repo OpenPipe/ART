@@ -292,17 +292,7 @@ def _last_assistant_input_ids_and_labels(
             "does not extend its generation prompt"
         )
 
-    target_with_separator = completed_text[len(prompt_text) :]
-    eos_token = tokenizer.eos_token
-    if not eos_token or not target_with_separator.endswith(f"{eos_token}\n"):
-        raise ValueError(
-            "assistant_turns='last' requires the final assistant rendering to end "
-            "with the tokenizer EOS token followed by one newline"
-        )
-
-    # The model emits the turn-ending token, but the following newline only
-    # separates messages in the rendered conversation.
-    target_text = target_with_separator[:-1]
+    target_text = completed_text[len(prompt_text) :]
     prompt_ids = token_ids_for_template_part(tokenizer, prompt_text)
     target_ids = token_ids_for_template_part(tokenizer, target_text)
     input_ids = [*prompt_ids, *target_ids]
