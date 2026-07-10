@@ -217,12 +217,11 @@ def patch_dsv4_mhc_pre_fixed_split() -> None:
 def patch_dsv4_lora_support() -> None:
     """Enable vLLM's existing LoRA manager for ART-served DSV4.
 
-    DSV4 itself does not need a custom LoRA executor here. Once the model
-    advertises packed MLA/shared-expert modules and MoE expert children, vLLM
-    wraps the same FusedMoE module it already uses for serving. With LoRA
-    enabled, vLLM's modular MoE selector picks Marlin, whose expert backend
-    supports fused MoE LoRA. Do not point this patch at the FlashInfer TRTLLM
-    MXFP4 backend; that backend currently has no LoRA hooks.
+    DSV4 uses vLLM's fused 3D MoE LoRA layout exclusively; split per-expert
+    w1/w2/w3 adapters are not supported. With LoRA enabled, vLLM's modular MoE
+    selector picks Marlin, whose expert backend supports fused MoE LoRA. Do not
+    point this patch at the FlashInfer TRTLLM MXFP4 backend; that backend
+    currently has no LoRA hooks.
     """
     dsv4_model = _import_dsv4_model_module()
     if dsv4_model is None:
@@ -237,7 +236,7 @@ def patch_dsv4_lora_support() -> None:
         "fused_wkv_wgate": ["wkv", "wgate"],
         "gate_up_proj": ["gate_proj", "up_proj"],
     }
-    model_cls.is_3d_moe_weight = False
+    model_cls.is_3d_moe_weight = True
     model_cls.is_non_gated_moe = False
     model_cls.lora_skip_prefixes = ["mtp", "indexer"]
     model_cls._art_dsv4_lora_patched = True

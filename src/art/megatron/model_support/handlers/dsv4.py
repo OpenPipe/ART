@@ -30,16 +30,16 @@ _VALIDATION_NUM_LAYERS_ENV = "ART_DSV4_VALIDATION_NUM_LAYERS"
 _ORACLE_EXPERT_WEIGHT_RE = re.compile(r"\.mlp\.experts\..*\.weight(?P<expert>\d+)$")
 _DSV4_ART_MOE_EXPERT_KEY_RE = re.compile(
     r"^(?P<prefix>.*\.mlp\.experts)\.(?P<expert>\d+)\."
-    r"(?P<module>gate_up_proj|gate_proj|up_proj|down_proj)\."
+    r"(?P<module>gate_up_proj|down_proj)\."
     r"(?P<lora>lora_[AB])\.weight$"
 )
 _DSV4_VLLM_MOE_KEY_RE = re.compile(
     r"^(?P<prefix>.*\.mlp\.experts)\."
     r"(?:(?P<base_layer>base_layer)\.)?(?P<lora>lora_[AB])\.weight$"
 )
-_DSV4_VLLM_MOE_EXPERT_KEY_RE = re.compile(
-    r"^(?P<prefix>.*\.ffn\.experts)\.(?P<expert>\d+)\."
-    r"(?P<module>w1|w2|w3)\.(?P<lora>lora_[AB])\.weight$"
+_DSV4_SPLIT_MOE_EXPERT_KEY_RE = re.compile(
+    r"^.*\.(?:mlp|ffn)\.experts\.\d+\."
+    r"(?:gate_proj|up_proj|down_proj|w1|w2|w3)\.lora_[AB]\.weight$"
 )
 _DSV4_MOE_COMPILE_WORKAROUND_FLAGS = ("te_triton_permute_with_mask_map",)
 
@@ -1008,16 +1008,6 @@ def _dsv4_clone(tensor: torch.Tensor) -> torch.Tensor:
 
 
 def _dsv4_to_vllm_lora_key(key: str) -> str:
-    match = _DSV4_ART_MOE_EXPERT_KEY_RE.match(key)
-    if match is not None:
-        module = {
-            "gate_proj": "w1",
-            "down_proj": "w2",
-            "up_proj": "w3",
-        }[match.group("module")]
-        prefix = match.group("prefix").replace(".mlp.experts", ".ffn.experts", 1)
-        return f"{prefix}.{match.group('expert')}.{module}.{match.group('lora')}.weight"
-
     replacements = (
         (".self_attn.compressor.kv_proj.", ".attn.mla_attn.compressor.wkv."),
         (".self_attn.compressor.gate_proj.", ".attn.mla_attn.compressor.wgate."),
@@ -1036,16 +1026,6 @@ def _dsv4_to_vllm_lora_key(key: str) -> str:
 
 
 def _dsv4_from_vllm_lora_key(key: str) -> str:
-    match = _DSV4_VLLM_MOE_EXPERT_KEY_RE.match(key)
-    if match is not None:
-        module = {
-            "w1": "gate_proj",
-            "w2": "down_proj",
-            "w3": "up_proj",
-        }[match.group("module")]
-        prefix = match.group("prefix").replace(".ffn.experts", ".mlp.experts", 1)
-        return f"{prefix}.{match.group('expert')}.{module}.{match.group('lora')}.weight"
-
     replacements = (
         (".attn.mla_attn.compressor.wkv.", ".self_attn.compressor.kv_proj."),
         (".attn.mla_attn.compressor.wgate.", ".self_attn.compressor.gate_proj."),
@@ -1160,51 +1140,6 @@ def _dsv4_to_vllm_lora_tensors(
     return transformed, _dsv4_vllm_lora_config(adapter_config)
 
 
-def _dsv4_fuse_split_expert_lora(
-    tensors: dict[str, torch.Tensor],
-) -> dict[str, torch.Tensor]:
-    grouped: dict[str, dict[int, dict[str, dict[str, torch.Tensor]]]] = {}
-    for key, tensor in tensors.items():
-        match = _DSV4_ART_MOE_EXPERT_KEY_RE.match(key)
-        if match is not None:
-            grouped.setdefault(match.group("prefix"), {}).setdefault(
-                int(match.group("expert")), {}
-            ).setdefault(match.group("module"), {})[match.group("lora")] = tensor
-
-    transformed = dict(tensors)
-    for prefix, experts in grouped.items():
-        for expert, modules in experts.items():
-            if "gate_up_proj" in modules:
-                if "gate_proj" in modules or "up_proj" in modules:
-                    raise RuntimeError(
-                        f"Mixed fused and split DSV4 LoRA tensors for {prefix}.{expert}"
-                    )
-                continue
-            try:
-                gate_a = modules["gate_proj"]["lora_A"]
-                gate_b = modules["gate_proj"]["lora_B"]
-                up_a = modules["up_proj"]["lora_A"]
-                up_b = modules["up_proj"]["lora_B"]
-            except KeyError as exc:
-                raise RuntimeError(
-                    f"Incomplete DSV4 gate/up LoRA block for {prefix}.{expert}"
-                ) from exc
-            if not torch.equal(gate_a, up_a):
-                raise RuntimeError(
-                    "DSV4 fused-MoE LoRA requires gate/up lora_A tensors to match "
-                    f"for {prefix}.{expert}"
-                )
-            fused_prefix = f"{prefix}.{expert}.gate_up_proj"
-            transformed[f"{fused_prefix}.lora_A.weight"] = _dsv4_clone(gate_a)
-            transformed[f"{fused_prefix}.lora_B.weight"] = torch.cat(
-                (gate_b, up_b), dim=0
-            ).contiguous()
-            for module in ("gate_proj", "up_proj"):
-                for lora in ("lora_A", "lora_B"):
-                    transformed.pop(f"{prefix}.{expert}.{module}.{lora}.weight")
-    return transformed
-
-
 def _dsv4_from_vllm_lora_tensors(
     tensors: dict[str, torch.Tensor],
     *,
@@ -1219,10 +1154,18 @@ def _dsv4_from_vllm_lora_tensors(
             f"{'base_layer.' if match.group('base_layer') else ''}{match.group('lora')}"
         )
         grouped.setdefault(match.group("prefix"), {})[slot] = tensor
-    if not grouped:
-        return _dsv4_fuse_split_expert_lora(
-            {_dsv4_from_vllm_lora_key(key): tensor for key, tensor in tensors.items()}
+    split_key = next(
+        (key for key in tensors if _DSV4_SPLIT_MOE_EXPERT_KEY_RE.match(key)), None
+    )
+    if split_key is not None:
+        raise RuntimeError(
+            "DSV4 only supports fused 3D MoE LoRA tensors; got split expert "
+            f"tensor {split_key}"
         )
+    if not grouped:
+        return {
+            _dsv4_from_vllm_lora_key(key): tensor for key, tensor in tensors.items()
+        }
 
     rank = int(adapter_config["r"])
     transformed: dict[str, torch.Tensor] = {}
@@ -1284,4 +1227,4 @@ def _dsv4_from_vllm_lora_tensors(
     for key, tensor in tensors.items():
         if key not in used_keys:
             transformed[_dsv4_from_vllm_lora_key(key)] = tensor
-    return _dsv4_fuse_split_expert_lora(transformed)
+    return transformed

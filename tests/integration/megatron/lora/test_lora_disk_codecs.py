@@ -881,18 +881,18 @@ def test_dsv4_vllm_canonical_moe_roundtrip() -> None:
     )
 
 
-def test_dsv4_rejects_lossy_split_gate_up_lora() -> None:
+def test_dsv4_rejects_split_moe_lora() -> None:
     prefix = "base_model.model.model.layers.4.ffn.experts.0"
     tensors = {
         f"{prefix}.w1.lora_A.weight": torch.zeros(1, 3),
         f"{prefix}.w1.lora_B.weight": torch.zeros(4, 1),
         f"{prefix}.w2.lora_A.weight": torch.zeros(1, 4),
         f"{prefix}.w2.lora_B.weight": torch.zeros(3, 1),
-        f"{prefix}.w3.lora_A.weight": torch.ones(1, 3),
+        f"{prefix}.w3.lora_A.weight": torch.zeros(1, 3),
         f"{prefix}.w3.lora_B.weight": torch.zeros(4, 1),
     }
 
-    with pytest.raises(RuntimeError, match="requires gate/up lora_A tensors to match"):
+    with pytest.raises(RuntimeError, match="only supports fused 3D MoE LoRA"):
         DSV4_HANDLER.from_vllm_lora_tensors(
             tensors,
             adapter_config=_config("deepseek-ai/DeepSeek-V4-Flash", rank=1),
