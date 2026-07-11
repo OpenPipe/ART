@@ -9,10 +9,6 @@ import torch
 from art.megatron.context_parallel.builder import build_prefix_tree_attention_spec
 from art.megatron.context_parallel.types import AttnMaskKind
 
-_ROUTE_STAGE_BITS = 3
-_MAX_ROUTE_STAGES = 1 << _ROUTE_STAGE_BITS
-_MAX_ROUTE_ROWS = 1 << (31 - _ROUTE_STAGE_BITS)
-
 
 class Glm52IndexerSlice(BaseModel):
     model_config = ConfigDict(frozen=True)
@@ -162,16 +158,13 @@ def build_glm52_context_parallel_state(
     route_by_global_id = torch.full(
         (int(rank_plan.original_seq_len),), -1, dtype=torch.int32
     )
+    combined_k_start = 0
     for stage in rank_plan.stage_plans:
         q_len = sum(range_.size() for range_ in stage.owner_local_q_ranges)
         k_len = sum(range_.size() for range_ in stage.owner_local_k_ranges)
-        if int(stage.stage_index) >= _MAX_ROUTE_STAGES:
+        if combined_k_start + k_len > torch.iinfo(torch.int32).max:
             raise RuntimeError(
-                f"GLM-5.2 route encoding supports {_MAX_ROUTE_STAGES} stages."
-            )
-        if k_len >= _MAX_ROUTE_ROWS:
-            raise RuntimeError(
-                f"GLM-5.2 stage {stage.stage_index} has too many KV rows: {k_len}."
+                "GLM-5.2 combined CP KV rows exceed int32 index capacity."
             )
         metadata = stage.mask_metadata
         if metadata is None and (q_len or k_len):
@@ -182,9 +175,11 @@ def build_glm52_context_parallel_state(
             q_ids = k_ids = torch.empty(0, dtype=torch.int32, device=device)
         else:
             k_ids_cpu = metadata.k_token_indices[:k_len].to(torch.int64)
-            routes_cpu = (
-                torch.arange(k_len, dtype=torch.int32) << _ROUTE_STAGE_BITS
-            ) | int(stage.stage_index)
+            routes_cpu = torch.arange(
+                combined_k_start,
+                combined_k_start + k_len,
+                dtype=torch.int32,
+            )
             existing = route_by_global_id[k_ids_cpu]
             if bool(((existing >= 0) & (existing != routes_cpu)).any()):
                 raise RuntimeError(
@@ -231,6 +226,7 @@ def build_glm52_context_parallel_state(
                 ),
             )
         )
+        combined_k_start += k_len
     position_ids_device, rope_cos, rope_sin = _rope_state(
         position_ids,
         device=device,

@@ -22,14 +22,12 @@ from art.megatron.glm52.state import (
 
 _MAX_SCORE_WORKSPACE_BYTES = 256 * 1024 * 1024
 _MAX_K_CHUNK = 32 * 1024
-_ROUTE_STAGE_BITS = 3
 
 
 class Glm52RoutedTopk(BaseModel):
     model_config = ConfigDict(arbitrary_types_allowed=True, frozen=True)
 
     indices: torch.Tensor
-    stage_offsets: torch.Tensor
 
 
 @triton.jit
@@ -527,83 +525,13 @@ def context_parallel_tree_topk(
     route_map = state.route_by_global_id
     if route_map is None:
         raise RuntimeError("GLM-5.2 CP route map is missing.")
-    routes = torch.where(
+    indices = torch.where(
         best_ids >= 0,
         route_map[best_ids.clamp_min(0).to(torch.int64)],
         torch.full_like(best_ids, -1),
     ).view(1, valid_tokens, topk)
     del best_ids
-    indices, stage_offsets = group_stage_routes(
-        routes,
-        stage_count=len(state.stages),
-    )
-    return Glm52RoutedTopk(indices=indices, stage_offsets=stage_offsets)
-
-
-@triton.jit
-def _group_stage_routes_kernel(
-    routes_ptr,
-    grouped_ptr,
-    offsets_ptr,
-    topk: tl.constexpr,
-    stage_count: tl.constexpr,
-    stage_bits: tl.constexpr,
-    stage_mask: tl.constexpr,
-    block: tl.constexpr,
-):
-    row = tl.program_id(0)
-    row_base = row * topk
-    offset_base = row * (stage_count + 1)
-    cursor = 0
-    tl.store(offsets_ptr + offset_base, 0)
-    for stage in range(stage_count):
-        for block_start in range(0, topk, block):
-            columns = block_start + tl.arange(0, block)
-            in_bounds = columns < topk
-            routes = tl.load(routes_ptr + row_base + columns, mask=in_bounds, other=-1)
-            matches = in_bounds & (routes >= 0) & ((routes & stage_mask) == stage)
-            compact = tl.cumsum(matches.to(tl.int32), axis=0) - 1
-            tl.store(
-                grouped_ptr + row_base + cursor + compact,
-                routes >> stage_bits,
-                mask=matches,
-            )
-            cursor += tl.sum(matches.to(tl.int32), axis=0)
-        tl.store(offsets_ptr + offset_base + stage + 1, cursor)
-
-
-def group_stage_routes(
-    routes: torch.Tensor,
-    *,
-    stage_count: int,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Group packed `(stage, local_row)` routes without a global-id remap."""
-    if routes.dtype is not torch.int32 or not routes.is_cuda or routes.ndim != 3:
-        raise TypeError("GLM-5.2 routes must be CUDA int32 [B,S,topk].")
-    if not 1 <= stage_count <= 1 << _ROUTE_STAGE_BITS:
-        raise ValueError(f"GLM-5.2 route stage count is invalid: {stage_count}.")
-    topk = int(routes.shape[-1])
-    if topk % 32:
-        raise ValueError("GLM-5.2 route topk must be divisible by 32.")
-    routes = routes.contiguous()
-    grouped = torch.empty_like(routes)
-    offsets = torch.empty(
-        (*routes.shape[:2], stage_count + 1),
-        device=routes.device,
-        dtype=torch.int32,
-    )
-    _group_stage_routes_kernel[(routes.numel() // topk,)](
-        routes,
-        grouped,
-        offsets,
-        topk=topk,  # ty: ignore[invalid-argument-type]
-        stage_count=stage_count,  # ty: ignore[invalid-argument-type]
-        stage_bits=_ROUTE_STAGE_BITS,  # ty: ignore[invalid-argument-type]
-        stage_mask=(1 << _ROUTE_STAGE_BITS) - 1,  # ty: ignore[invalid-argument-type]
-        block=256,  # ty: ignore[invalid-argument-type]
-        num_warps=8,  # ty: ignore[unknown-argument]
-    )
-    return grouped, offsets
+    return Glm52RoutedTopk(indices=indices)
 
 
 @torch.compiler.disable

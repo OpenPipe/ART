@@ -3,8 +3,6 @@ from __future__ import annotations
 from typing import Any, cast
 
 import torch
-import triton
-import triton.language as tl
 
 from art.megatron.context_parallel.types import ArtContextParallelState
 from art.megatron.glm52.cp_stage import (
@@ -13,7 +11,6 @@ from art.megatron.glm52.cp_stage import (
     launch_remote_stage_reduce,
     reduce_local_stage_rows_,
     stage_kv_rows,
-    stage_query_rows,
 )
 from art.megatron.glm52.indexer import Glm52RoutedTopk
 from art.megatron.glm52.sparse_mla import sparse_mla_backward, sparse_mla_forward
@@ -22,98 +19,21 @@ from art.megatron.glm52.state import Glm52PrefixTreeState
 _LATENT_DIM = 512
 
 
-@triton.jit
-def _merge_stage_kernel(
-    stage_out_ptr,
-    stage_lse_ptr,
-    owner_rows_ptr,
-    accum_out_ptr,
-    accum_lse_ptr,
-    heads,
-    stride_soq,
-    stride_soh,
-    stride_sod,
-    stride_slq,
-    stride_slh,
-    stride_aoq,
-    stride_aoh,
-    stride_aod,
-    stride_alq,
-    stride_alh,
-    latent_dim: tl.constexpr,
-    block_d: tl.constexpr,
-):
-    query = tl.program_id(0)
-    head = tl.program_id(1)
-    d_block = tl.program_id(2)
-    owner = tl.load(owner_rows_ptr + query)
-    dimensions = d_block * block_d + tl.arange(0, block_d)
-    mask = (head < heads) & (dimensions < latent_dim)
-    stage_lse = tl.load(stage_lse_ptr + query * stride_slq + head * stride_slh)
-    accum_lse_offset = owner * stride_alq + head * stride_alh
-    previous_lse = tl.load(accum_lse_ptr + accum_lse_offset)
-    both_empty = (previous_lse == float("-inf")) & (stage_lse == float("-inf"))
-    maximum = tl.maximum(previous_lse, stage_lse)
-    previous_weight = tl.exp(previous_lse - maximum)
-    stage_weight = tl.exp(stage_lse - maximum)
-    normalizer = previous_weight + stage_weight
-    merged_lse = maximum + tl.log(normalizer)
-    merged_lse = tl.where(both_empty, float("-inf"), merged_lse)
-    previous = tl.load(
-        accum_out_ptr
-        + owner * stride_aoq
-        + head * stride_aoh
-        + dimensions * stride_aod,
-        mask=mask,
-        other=0.0,
+def _combined_stage_kv(
+    kv: torch.Tensor,
+    cp_state: ArtContextParallelState,
+) -> tuple[torch.Tensor, tuple[int, ...]]:
+    fetches = launch_remote_stage_fetches(kv, cp_state)
+    parts = tuple(
+        stage_kv_rows(kv, stage, cp_state, fetches)
+        for stage in cp_state.rank_plan.stage_plans
     )
-    stage = tl.load(
-        stage_out_ptr
-        + query * stride_soq
-        + head * stride_soh
-        + dimensions * stride_sod,
-        mask=mask,
-        other=0.0,
-    )
-    merged = (previous * previous_weight + stage * stage_weight) / normalizer
-    merged = tl.where(both_empty, 0.0, merged)
-    tl.store(
-        accum_out_ptr
-        + owner * stride_aoq
-        + head * stride_aoh
-        + dimensions * stride_aod,
-        merged,
-        mask=mask,
-    )
-    tl.store(
-        accum_lse_ptr + accum_lse_offset,
-        merged_lse,
-        mask=(d_block == 0) & (head < heads),
-    )
-
-
-def _merge_stage_(
-    accum_out: torch.Tensor,
-    accum_lse: torch.Tensor,
-    stage_out: torch.Tensor,
-    stage_lse: torch.Tensor,
-    owner_rows: torch.Tensor,
-) -> None:
-    q_len, heads = stage_lse.shape
-    _merge_stage_kernel[(q_len, heads, 1)](
-        stage_out,
-        stage_lse,
-        owner_rows,
-        accum_out,
-        accum_lse,
-        heads,
-        *stage_out.stride(),
-        *stage_lse.stride(),
-        *accum_out.stride(),
-        *accum_lse.stride(),
-        latent_dim=_LATENT_DIM,  # ty: ignore[invalid-argument-type]
-        block_d=_LATENT_DIM,  # ty: ignore[invalid-argument-type]
-        num_warps=8,  # ty: ignore[unknown-argument]
+    drain_stage_fetches(fetches)
+    if not parts:
+        raise RuntimeError("GLM-5.2 CP plan has no KV stages.")
+    return (
+        parts[0] if len(parts) == 1 else torch.cat(parts),
+        tuple(int(part.shape[0]) for part in parts),
     )
 
 
@@ -121,51 +41,22 @@ def _forward(
     q: torch.Tensor,
     kv: torch.Tensor,
     indices: torch.Tensor,
-    offsets: torch.Tensor,
     state: Glm52PrefixTreeState,
     scale: float,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     cp_state = cast(ArtContextParallelState, state.context_parallel_state)
     valid = int(sum(cp_state.rank_plan.local_valid_lengths))
-    q_flat = q[0, :valid].contiguous()
     kv_flat = kv[0, :valid].contiguous()
-    accum_out = torch.zeros(
-        (valid, q.shape[2], _LATENT_DIM), device=q.device, dtype=torch.float32
+    combined_kv, _ = _combined_stage_kv(kv_flat, cp_state)
+    combined_out, lse = sparse_mla_forward(
+        q[:, :valid].contiguous(),
+        combined_kv.unsqueeze(0),
+        indices[:, :valid].contiguous(),
+        scale=scale,
     )
-    accum_lse = torch.full(
-        (valid, q.shape[2]), float("-inf"), device=q.device, dtype=torch.float32
-    )
-    fetches = launch_remote_stage_fetches(kv_flat, cp_state)
-    for stage_plan, stage in zip(
-        cp_state.rank_plan.stage_plans, state.stages, strict=True
-    ):
-        if not stage.slices:
-            continue
-        q_stage = stage_query_rows(q_flat, stage_plan, cp_state)
-        kv_stage = stage_kv_rows(kv_flat, stage_plan, cp_state, fetches)
-        indices_stage = stage_query_rows(indices[0], stage_plan, cp_state)
-        offsets_stage = stage_query_rows(offsets[0], stage_plan, cp_state)
-        stage_out, stage_lse = sparse_mla_forward(
-            q_stage.unsqueeze(0),
-            kv_stage.unsqueeze(0),
-            indices_stage.unsqueeze(0),
-            scale=scale,
-            route_offsets=offsets_stage.unsqueeze(0),
-            stage_index=int(stage.stage_index),
-            fp32_output=True,
-        )
-        _merge_stage_(
-            accum_out,
-            accum_lse,
-            stage_out[0],
-            stage_lse[0],
-            stage.owner_q_rows,
-        )
-        del q_stage, kv_stage, indices_stage, offsets_stage, stage_out, stage_lse
-    drain_stage_fetches(fetches)
     output = q.new_zeros((q.shape[0], q.shape[1], q.shape[2], _LATENT_DIM))
-    output[0, :valid].copy_(accum_out)
-    return output, output[0, :valid], accum_lse
+    output[:, :valid].copy_(combined_out)
+    return output, combined_out[0], lse[0]
 
 
 def _backward(
@@ -173,7 +64,6 @@ def _backward(
     q: torch.Tensor,
     kv: torch.Tensor,
     indices: torch.Tensor,
-    offsets: torch.Tensor,
     global_out: torch.Tensor,
     global_lse: torch.Tensor,
     state: Glm52PrefixTreeState,
@@ -181,52 +71,37 @@ def _backward(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     cp_state = cast(ArtContextParallelState, state.context_parallel_state)
     valid = int(sum(cp_state.rank_plan.local_valid_lengths))
-    q_flat = q[0, :valid].contiguous()
     kv_flat = kv[0, :valid].contiguous()
-    grad_flat = grad_output[0, :valid].contiguous()
-    dq = torch.zeros_like(q_flat, dtype=torch.float32)
     dkv = torch.zeros_like(kv_flat)
-    fetches = launch_remote_stage_fetches(kv_flat, cp_state)
+    combined_kv, stage_sizes = _combined_stage_kv(kv_flat, cp_state)
+    dq, combined_dkv = sparse_mla_backward(
+        q[:, :valid].contiguous(),
+        combined_kv.unsqueeze(0),
+        indices[:, :valid].contiguous(),
+        global_out.unsqueeze(0),
+        global_lse.unsqueeze(0),
+        grad_output[:, :valid].contiguous(),
+        scale=scale,
+    )
+    stage_starts = [0]
+    for size in stage_sizes:
+        stage_starts.append(stage_starts[-1] + size)
     reductions = []
     for stage_index in cp_state.rank_plan.backward_stage_indices:
         stage_plan = cp_state.rank_plan.stage_plans[int(stage_index)]
-        stage = state.stages[int(stage_index)]
-        kv_stage = stage_kv_rows(kv_flat, stage_plan, cp_state, fetches)
-        if stage.slices:
-            q_stage = stage_query_rows(q_flat, stage_plan, cp_state)
-            indices_stage = stage_query_rows(indices[0], stage_plan, cp_state)
-            offsets_stage = stage_query_rows(offsets[0], stage_plan, cp_state)
-            out_stage = global_out.index_select(0, stage.owner_q_rows)
-            lse_stage = global_lse.index_select(0, stage.owner_q_rows)
-            grad_stage = grad_flat.index_select(0, stage.owner_q_rows)
-            dq_stage, dkv_stage = sparse_mla_backward(
-                q_stage.unsqueeze(0),
-                kv_stage.unsqueeze(0),
-                indices_stage.unsqueeze(0),
-                out_stage.unsqueeze(0),
-                lse_stage.unsqueeze(0),
-                grad_stage.unsqueeze(0),
-                scale=scale,
-                route_offsets=offsets_stage.unsqueeze(0),
-                stage_index=int(stage.stage_index),
-                fp32_grad_q=True,
-            )
-            dq.index_add_(0, stage.owner_q_rows, dq_stage[0])
-            dkv_stage = dkv_stage[0]
-        else:
-            dkv_stage = torch.zeros_like(kv_stage)
+        start, end = stage_starts[int(stage_index) : int(stage_index) + 2]
+        dkv_stage = combined_dkv[0, start:end]
         if stage_plan.is_local_stage:
             reduce_local_stage_rows_(dkv, dkv_stage, stage_plan, cp_state)
         else:
             reductions.append(
                 launch_remote_stage_reduce(dkv_stage, stage_plan, cp_state, dkv)
             )
-    drain_stage_fetches(fetches)
     for reduction in reductions:
         reduction.wait_post_process()
     dq_padded = torch.zeros_like(q)
     dkv_padded = torch.zeros_like(kv)
-    dq_padded[0, :valid].copy_(dq)
+    dq_padded[:, :valid].copy_(dq)
     dkv_padded[0, :valid].copy_(dkv)
     return dq_padded, dkv_padded
 
@@ -238,12 +113,11 @@ class _ContextParallelSparseMla(torch.autograd.Function):
         q: torch.Tensor,
         kv: torch.Tensor,
         indices: torch.Tensor,
-        offsets: torch.Tensor,
         state: Glm52PrefixTreeState,
         scale: float,
     ) -> torch.Tensor:
-        output, global_out, global_lse = _forward(q, kv, indices, offsets, state, scale)
-        ctx.save_for_backward(q, kv, indices, offsets, global_out, global_lse)
+        output, global_out, global_lse = _forward(q, kv, indices, state, scale)
+        ctx.save_for_backward(q, kv, indices, global_out, global_lse)
         ctx.state = state
         ctx.scale = float(scale)
         return output
@@ -251,19 +125,18 @@ class _ContextParallelSparseMla(torch.autograd.Function):
     @staticmethod
     def backward(ctx: Any, *grad_outputs: Any):
         (grad_output,) = cast(tuple[torch.Tensor], grad_outputs)
-        q, kv, indices, offsets, global_out, global_lse = ctx.saved_tensors
+        q, kv, indices, global_out, global_lse = ctx.saved_tensors
         dq, dkv = _backward(
             grad_output,
             q,
             kv,
             indices,
-            offsets,
             global_out,
             global_lse,
             ctx.state,
             ctx.scale,
         )
-        return dq, dkv, None, None, None, None
+        return dq, dkv, None, None, None
 
 
 def context_parallel_sparse_mla(
@@ -274,7 +147,7 @@ def context_parallel_sparse_mla(
     *,
     scale: float,
 ) -> torch.Tensor:
-    """Run stage-routed sparse MLA with global-LSE backward replay."""
+    """Run sparse MLA once over the union of ART-planned KV stages."""
     if q.ndim != 4 or kv.ndim != 3 or q.shape[:2] != kv.shape[:2]:
         raise ValueError("GLM-5.2 CP sparse MLA expects q[B,S,H,576], kv[B,S,576].")
     if q.shape[0] != 1:
@@ -283,7 +156,6 @@ def context_parallel_sparse_mla(
         q.contiguous(),
         kv.contiguous(),
         topk.indices.contiguous(),
-        topk.stage_offsets.contiguous(),
         state,
         float(scale),
     )
