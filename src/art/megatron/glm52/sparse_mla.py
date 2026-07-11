@@ -128,7 +128,7 @@ def _sparse_mla_fwd_kernel(
         probabilities = tl.where(valid, probabilities, 0.0)
         row_sum = row_sum * alpha + tl.sum(probabilities, axis=1)
         acc *= alpha[:, None]
-        acc += tl.dot(probabilities.to(tl.bfloat16), kv_latent)
+        acc += tl.dot(probabilities.to(tl.float16), kv_latent.to(tl.float16))
         row_max = next_max
         index_start += block_i
 
@@ -258,6 +258,9 @@ def _sparse_mla_bwd_kernel(
     delta = tl.sum(out.to(tl.float32) * grad_out.to(tl.float32), axis=1)
     grad_q_latent = tl.zeros((block_h, latent_dim), tl.float32)
     grad_q_rope = tl.zeros((block_h, rope_dim), tl.float32)
+    q_latent_f16 = q_latent.to(tl.float16)
+    q_rope_f16 = q_rope.to(tl.float16)
+    grad_out_f16 = grad_out.to(tl.float16)
 
     if routed:
         route_base = batch * stride_xb + token * stride_xs
@@ -299,14 +302,18 @@ def _sparse_mla_bwd_kernel(
         valid = valid_heads[:, None] & valid_indices[None, :]
         probabilities = tl.exp(scores * scale - lse[:, None])
         probabilities = tl.where(valid, probabilities, 0.0)
-        grad_probabilities = tl.dot(grad_out, tl.trans(kv_latent))
-        grad_scores = probabilities * (grad_probabilities - delta[:, None]) * scale
-
-        grad_q_latent += tl.dot(grad_scores.to(tl.bfloat16), kv_latent)
-        grad_q_rope += tl.dot(grad_scores.to(tl.bfloat16), kv_rope)
-        grad_key_latent = tl.dot(tl.trans(grad_scores.to(tl.bfloat16)), q_latent)
-        grad_value = tl.dot(tl.trans(probabilities.to(tl.bfloat16)), grad_out)
-        grad_key_rope = tl.dot(tl.trans(grad_scores.to(tl.bfloat16)), q_rope)
+        kv_latent_f16 = kv_latent.to(tl.float16)
+        kv_rope_f16 = kv_rope.to(tl.float16)
+        grad_probabilities = tl.dot(grad_out_f16, tl.trans(kv_latent_f16))
+        grad_scores_f16 = (
+            probabilities * (grad_probabilities - delta[:, None]) * scale
+        ).to(tl.float16)
+        probabilities_f16 = probabilities.to(tl.float16)
+        grad_q_latent += tl.dot(grad_scores_f16, kv_latent_f16)
+        grad_q_rope += tl.dot(grad_scores_f16, kv_rope_f16)
+        grad_key_latent = tl.dot(tl.trans(grad_scores_f16), q_latent_f16)
+        grad_value = tl.dot(tl.trans(probabilities_f16), grad_out_f16)
+        grad_key_rope = tl.dot(tl.trans(grad_scores_f16), q_rope_f16)
         tl.atomic_add(
             grad_kv_ptr
             + batch * stride_gkb
