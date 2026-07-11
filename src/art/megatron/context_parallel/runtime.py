@@ -44,12 +44,17 @@ StageSliceKey = tuple[int, int, int, int, int, str, int]
 @dataclass(frozen=True)
 class _PlanningBundle:
     spec: PackedBatchAttentionSpec
-    rank_plans: tuple[RankRuntimePlan, ...]
+    row_spec: PackedRowAttentionSpec
+    chunk_ranges: tuple[TokenRange, ...]
+    owners: tuple[int, ...]
+    wave_assignment: tuple[int, ...]
+    token_layout_index: TokenLayoutIndex
     gdn_execution_spec: Any | None = None
 
 
 _PLANNING_BUNDLE_CACHE: dict[str, _PlanningBundle] = {}
 _RUNTIME_PLAN_CACHE: dict[str, tuple[RankRuntimePlan, ...]] = {}
+_RANK_RUNTIME_PLAN_CACHE: dict[tuple[str, int], RankRuntimePlan] = {}
 _GDN_RANK_PLAN_CACHE: dict[tuple[str, str, int | None, int, str], Any] = {}
 
 
@@ -145,18 +150,60 @@ def _get_or_build_planning_bundle(
             group_ids_cpu,
             parent_ids_cpu,
         )
+    row_spec, chunk_ranges, owners, wave_assignment = _runtime_plan_assignment(
+        spec,
+        topology=topology,
+        config=config,
+    )
     bundle = _PlanningBundle(
         spec=spec,
-        rank_plans=get_or_build_runtime_plan(
-            spec,
-            topology=topology,
-            config=config,
-            original_seq_len=original_seq_len,
+        row_spec=row_spec,
+        chunk_ranges=chunk_ranges,
+        owners=owners,
+        wave_assignment=wave_assignment,
+        token_layout_index=_build_runtime_token_layout_index(
+            chunk_ranges=chunk_ranges,
+            owners=owners,
+            cp_size=max(int(topology.cp), 1),
         ),
         gdn_execution_spec=gdn_execution_spec,
     )
     _cache_put(_PLANNING_BUNDLE_CACHE, planning_key, bundle)
     return planning_key, bundle, group_ids_cpu, parent_ids_cpu
+
+
+def _get_or_build_bundle_rank_plan(
+    *,
+    planning_key: str,
+    bundle: _PlanningBundle,
+    original_seq_len: int,
+    target_rank: int,
+    block_size: int,
+) -> RankRuntimePlan:
+    """Materialize only the caller's rank plan at the host-ahead boundary.
+
+    Building every rank plan here scales CPU work with CP size, can exceed the
+    planning budget, and exposes planning after lookahead GPU work completes.
+    Each rank plan depends only on the shared assignment, so peer plans are not
+    part of this runtime boundary.
+    """
+    cache_key = (planning_key, int(target_rank))
+    cached = _RANK_RUNTIME_PLAN_CACHE.get(cache_key)
+    if cached is not None:
+        return cached
+    plan = _build_rank_runtime_plan(
+        row_spec=bundle.row_spec,
+        chunk_ranges=bundle.chunk_ranges,
+        owners=bundle.owners,
+        wave_assignment=bundle.wave_assignment,
+        token_layout_index=bundle.token_layout_index,
+        cp_size=len(bundle.token_layout_index.token_counts_by_rank),
+        original_seq_len=original_seq_len,
+        target_rank=target_rank,
+        block_size=block_size,
+    )
+    _cache_put(_RANK_RUNTIME_PLAN_CACHE, cache_key, plan)
+    return plan
 
 
 def _gdn_rank_plan_cache_key(
@@ -208,7 +255,7 @@ def _plan_gdn_rank_execution(
         device="cpu",
         cp_rank=int(cp_rank),
         cp_size=int(topology.cp),
-        attention_token_layout_index=bundle.rank_plans[int(cp_rank)].token_layout_index,
+        attention_token_layout_index=bundle.token_layout_index,
         planner_config=gdn_planner_config,
     )
     _cache_put(_GDN_RANK_PLAN_CACHE, cache_key, plan)
@@ -277,10 +324,7 @@ def context_parallel_rank_model_token_counts(
             build_gdn_execution_spec=build_gdn_execution_spec,
         )
     )
-    attention_counts = tuple(
-        sum(int(length) for length in rank_plan.local_valid_lengths)
-        for rank_plan in bundle.rank_plans
-    )
+    attention_counts = bundle.token_layout_index.token_counts_by_rank
     if not build_gdn_execution_spec:
         return attention_counts
     gdn_counts = tuple(
@@ -1821,7 +1865,13 @@ def prepare_megatron_context_parallel_state(
         original_seq_len=int(micro["tokens"].shape[1]),
         build_gdn_execution_spec=build_gdn_execution_spec,
     )
-    rank_plan = bundle.rank_plans[int(cp_rank)]
+    rank_plan = _get_or_build_bundle_rank_plan(
+        planning_key=planning_key,
+        bundle=bundle,
+        original_seq_len=int(micro["tokens"].shape[1]),
+        target_rank=cp_rank,
+        block_size=int(config.block_size),
+    )
     gdn_execution_plan = None
     if build_gdn_execution_spec:
         _plan_gdn_rank_execution(
