@@ -333,6 +333,7 @@ class Glm52SelfAttention(Attention):
             return gather_from_sequence_parallel_region(tensor, group=self.tp_group)
         return copy_to_tensor_model_parallel_region(tensor, group=self.tp_group)
 
+    @torch.compiler.disable
     def forward(  # ty: ignore[invalid-method-override]
         self,
         hidden_states: torch.Tensor,
