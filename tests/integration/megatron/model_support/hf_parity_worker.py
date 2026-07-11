@@ -123,6 +123,33 @@ def _hf_router_num_experts(module: Any, router_scores: torch.Tensor) -> int:
     )
 
 
+def _glm_router_output(
+    module: Any, router_logits: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    scores = router_logits.sigmoid()
+    choice = scores + module.e_score_correction_bias
+    groups = int(module.n_group)
+    group_scores = (
+        choice.view(choice.shape[0], groups, -1).topk(2, dim=-1).values.sum(-1)
+    )
+    selected_groups = group_scores.topk(
+        int(module.topk_group), dim=-1, sorted=False
+    ).indices
+    group_mask = torch.zeros_like(group_scores, dtype=torch.bool)
+    group_mask.scatter_(1, selected_groups, True)
+    choice = choice.masked_fill(
+        ~group_mask.unsqueeze(-1)
+        .expand_as(choice.view(choice.shape[0], groups, -1))
+        .reshape_as(choice),
+        float("-inf"),
+    )
+    indices = choice.topk(int(module.top_k), dim=-1, sorted=False).indices
+    weights = scores.gather(1, indices)
+    if bool(module.norm_topk_prob):
+        weights = weights / (weights.sum(-1, keepdim=True) + 1e-20)
+    return weights * float(module.routed_scaling_factor), indices
+
+
 class _HfMoeRoutingCapture:
     def __init__(self, model: Any) -> None:
         self._handles: list[Any] = []
@@ -195,12 +222,17 @@ class _HfMoeRoutingCapture:
 
     def _make_hook(self, router_key: str, module: Any) -> Any:
         def _hook(_module: Any, _inputs: Any, output: Any) -> None:
-            if not isinstance(output, tuple) or len(output) < 3:
+            if isinstance(output, torch.Tensor) and hasattr(
+                module, "e_score_correction_bias"
+            ):
+                router_scores, router_indices = _glm_router_output(module, output)
+            elif isinstance(output, tuple) and len(output) >= 3:
+                router_scores = output[1]
+                router_indices = output[2]
+            else:
                 raise RuntimeError(
-                    f"Expected HF router tuple output for '{router_key}', got {type(output)}"
+                    f"Unsupported HF router output for '{router_key}': {type(output)}"
                 )
-            router_scores = output[1]
-            router_indices = output[2]
             if not isinstance(router_scores, torch.Tensor) or not isinstance(
                 router_indices, torch.Tensor
             ):
