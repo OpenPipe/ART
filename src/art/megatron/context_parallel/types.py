@@ -181,6 +181,7 @@ class ArtContextParallelState:
     group_ids: torch.Tensor
     parent_ids: torch.Tensor
     input_pos: torch.Tensor
+    model_state: dict[str, Any] = field(default_factory=dict)
     block_mask_variants: tuple[CpBlockMaskVariant, ...] = ()
     gdn_execution_spec: Any | None = None
     gdn_execution_plan: Any | None = None

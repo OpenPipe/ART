@@ -56,6 +56,7 @@ class PrefixTreeModelStateContext(BaseModel):
     attention_token_layout_index: Any | None = None
     attention_head_dim: int | None = None
     attention_value_head_dim: int | None = None
+    context_parallel_state: Any | None = None
 
 
 class CompileWorkaroundConfig(BaseModel):

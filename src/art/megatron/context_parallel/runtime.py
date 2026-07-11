@@ -1707,6 +1707,9 @@ def prepare_cp_micro(
     block_mask_variants: tuple[CpBlockMaskVariant, ...] = (),
     target_device: torch.device | None = None,
     ref_logprobs: torch.Tensor | None = None,
+    model_support_handler: Any | None = None,
+    attention_head_dim: int | None = None,
+    attention_value_head_dim: int | None = None,
 ) -> PreparedMegatronBatch:
     """Prepare one CP microbatch with a CPU-only planning phase.
 
@@ -1715,6 +1718,10 @@ def prepare_cp_micro(
     `target_device`. Passing CUDA `group_ids` or `parent_ids` still works for
     older direct callers, but it reintroduces D2H syncs and invalidates the
     host-ahead/device-behind lookahead assumption.
+
+    Model-owned state is built exactly once here, after rank-local dispatch.
+    Its handler must only enqueue device work: scalar CUDA reads would expose
+    planning on the host and invalidate lookahead overlap.
     """
     state, rank_plan, spec, pad_multiple = prepare_megatron_context_parallel_state(
         micro=micro,
@@ -1737,6 +1744,23 @@ def prepare_cp_micro(
         cp_group=cp_group,
         ref_logprobs=ref_logprobs,
     )
+    if model_support_handler is not None:
+        from art.megatron.model_support.spec import PrefixTreeModelStateContext
+
+        state.model_state = dict(
+            model_support_handler.build_prefix_tree_model_state(
+                PrefixTreeModelStateContext(
+                    input_pos=tensors.input_pos,
+                    group_ids=micro["group_ids"],
+                    parent_ids=micro["parent_ids"],
+                    device=tensors.tokens.device,
+                    attention_token_layout_index=rank_plan.token_layout_index,
+                    attention_head_dim=attention_head_dim,
+                    attention_value_head_dim=attention_value_head_dim,
+                    context_parallel_state=state,
+                )
+            )
+        )
     if tensors.token_uids is not None:
         state = replace(state, trace_token_uids=tensors.token_uids)
     if prepare_execution_state:

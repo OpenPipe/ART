@@ -90,6 +90,41 @@ class KvFetchWork:
 
 
 @dataclass
+class TensorFetchWork:
+    packed_buffer: torch.Tensor
+    recv_splits: tuple[int, ...]
+    handle: _Waitable | None
+    send_buffer: torch.Tensor | None = None
+    stream: torch.cuda.Stream | None = None
+    output_layout: str = "token_major"
+    _wait_complete: bool = False
+
+    def is_completed(self) -> bool:
+        if self._wait_complete:
+            return True
+        handle_complete = True
+        if self.handle is not None:
+            is_completed = getattr(self.handle, "is_completed", None)
+            if callable(is_completed):
+                handle_complete = bool(is_completed())
+        return handle_complete and (self.stream is None or bool(self.stream.query()))
+
+    def wait_post_process(self) -> torch.Tensor:
+        if not self._wait_complete:
+            if self.handle is not None:
+                self.handle.wait()
+            if self.stream is not None:
+                torch.cuda.current_stream(self.packed_buffer.device).wait_stream(
+                    self.stream
+                )
+            self._wait_complete = True
+        return _unpack_single_tensor(
+            self.packed_buffer,
+            output_layout=self.output_layout,
+        )
+
+
+@dataclass
 class DkvReduceWork:
     packed_buffer: torch.Tensor | None
     handle: _Waitable | None
@@ -166,6 +201,55 @@ class DkvReduceWork:
         return self.dk_local, self.dv_local
 
 
+@dataclass
+class TensorReduceWork:
+    packed_buffer: torch.Tensor | None
+    handle: _Waitable | None
+    send_buffer: torch.Tensor | None
+    stream: torch.cuda.Stream | None
+    plan: DkvReducePlan
+    output: torch.Tensor
+    range_meta_cache: dict[Any, Any] | None = None
+    input_layout: str = "token_major"
+    _wait_complete: bool = False
+
+    def wait_post_process(self) -> torch.Tensor:
+        if not self._wait_complete:
+            if self.handle is not None:
+                self.handle.wait()
+            if self.stream is not None and self.packed_buffer is not None:
+                torch.cuda.current_stream(self.packed_buffer.device).wait_stream(
+                    self.stream
+                )
+            self._wait_complete = True
+        if self.packed_buffer is None or int(self.packed_buffer.shape[0]) == 0:
+            return self.output
+        remote = _unpack_single_tensor(
+            self.packed_buffer,
+            output_layout=self.input_layout,
+        )
+        ranges = tuple(
+            range_
+            for peer_ranges in self.plan.recv_ranges_by_peer
+            for range_ in peer_ranges
+            if range_.size() > 0
+        )
+        reduce_fn = (
+            range_reduce_sum_head_major_
+            if self.input_layout == "head_major"
+            else range_reduce_sum_
+        )
+        reduce_fn(
+            remote
+            if remote.dtype == self.output.dtype
+            else remote.to(dtype=self.output.dtype),
+            output_tensor=self.output,
+            ranges=ranges,
+            range_meta_cache=self.range_meta_cache,
+        )
+        return self.output
+
+
 class A2AVCommunicator:
     def __init__(self) -> None:
         self._streams: dict[int, torch.cuda.Stream] = {}
@@ -194,6 +278,7 @@ class A2AVCommunicator:
         group: Any,
         async_op: bool,
         input_layout: str,
+        row_factor: int = 2,
     ) -> tuple[_Waitable | None, torch.Tensor, torch.cuda.Stream | None]:
         stream = self._get_stream(tensor) if async_op else None
         send_buffer = (
@@ -202,6 +287,7 @@ class A2AVCommunicator:
                     tensor=tensor,
                     total_rows=0,
                     input_layout=input_layout,
+                    row_factor=row_factor,
                 )
             )
             if total_send_rows <= 0
@@ -302,6 +388,61 @@ class A2AVCommunicator:
             output_layout=output_layout,
         )
 
+    def launch_tensor_fetch(
+        self,
+        *,
+        tensor_local: torch.Tensor,
+        plan: KvFetchPlan,
+        group: Any,
+        async_op: bool,
+        range_meta_cache: dict[Any, Any] | None = None,
+        input_layout: str = "token_major",
+        output_layout: str = "token_major",
+    ) -> TensorFetchWork:
+        """Fetch one stage tensor without duplicating it on the communication wire."""
+        total_send_rows = int(sum(plan.send_splits))
+        total_recv_rows = int(sum(plan.recv_splits))
+        recv_packed = tensor_local.new_empty(
+            _packed_peer_tensor_shape(
+                tensor=tensor_local,
+                total_rows=total_recv_rows,
+                input_layout=input_layout,
+                row_factor=1,
+            )
+        )
+        if group is None or _DIST.get_world_size(group) == 1:
+            return TensorFetchWork(
+                packed_buffer=recv_packed,
+                recv_splits=plan.recv_splits,
+                handle=None,
+                output_layout=output_layout,
+            )
+        handle, send_buffer, stream = self._launch_exchange(
+            tensor=tensor_local,
+            recv_buffer=recv_packed,
+            total_send_rows=total_send_rows,
+            make_send_buffer=lambda: _pack_gathered_tensor_per_peer(
+                tensor=tensor_local,
+                ranges_by_peer=plan.send_ranges_by_peer,
+                range_meta_cache=range_meta_cache,
+                input_layout=input_layout,
+            ),
+            output_split_sizes=list(plan.recv_splits),
+            input_split_sizes=list(plan.send_splits),
+            group=group,
+            async_op=async_op,
+            input_layout=input_layout,
+            row_factor=1,
+        )
+        return TensorFetchWork(
+            packed_buffer=recv_packed,
+            recv_splits=plan.recv_splits,
+            handle=handle,
+            send_buffer=send_buffer,
+            stream=stream,
+            output_layout=output_layout,
+        )
+
     def launch_dkv_reduce(
         self,
         *,
@@ -366,6 +507,64 @@ class A2AVCommunicator:
             dv_local=dv_local,
             range_meta_cache=range_meta_cache,
             label=label,
+            input_layout=input_layout,
+        )
+
+    def launch_tensor_reduce(
+        self,
+        *,
+        remote: torch.Tensor,
+        plan: DkvReducePlan,
+        group: Any,
+        async_op: bool,
+        output: torch.Tensor,
+        range_meta_cache: dict[Any, Any] | None = None,
+        input_layout: str = "token_major",
+    ) -> TensorReduceWork:
+        """Return one stage gradient to owners through the plan's inverse ranges."""
+        if group is None or _DIST.get_world_size(group) == 1:
+            return TensorReduceWork(
+                packed_buffer=None,
+                handle=None,
+                send_buffer=None,
+                stream=None,
+                plan=plan,
+                output=output,
+                range_meta_cache=range_meta_cache,
+                input_layout=input_layout,
+            )
+        recv_packed = remote.new_empty(
+            _packed_peer_tensor_shape(
+                tensor=remote,
+                total_rows=int(sum(plan.recv_splits)),
+                input_layout=input_layout,
+                row_factor=1,
+            )
+        )
+        handle, send_buffer, stream = self._launch_exchange(
+            tensor=remote,
+            recv_buffer=recv_packed,
+            total_send_rows=int(sum(plan.send_splits)),
+            make_send_buffer=lambda: _pack_split_tensor_by_peer(
+                tensor=remote,
+                splits=plan.send_splits,
+                input_layout=input_layout,
+            ),
+            output_split_sizes=list(plan.recv_splits),
+            input_split_sizes=list(plan.send_splits),
+            group=group,
+            async_op=async_op,
+            input_layout=input_layout,
+            row_factor=1,
+        )
+        return TensorReduceWork(
+            packed_buffer=recv_packed,
+            handle=handle,
+            send_buffer=send_buffer,
+            stream=stream,
+            plan=plan,
+            output=output,
+            range_meta_cache=range_meta_cache,
             input_layout=input_layout,
         )
 
@@ -435,6 +634,35 @@ def _pack_gathered_tensors_per_peer(
     return packed
 
 
+def _pack_gathered_tensor_per_peer(
+    *,
+    tensor: torch.Tensor,
+    ranges_by_peer: tuple[tuple[TokenRange, ...], ...],
+    range_meta_cache: dict[Any, Any] | None,
+    input_layout: str,
+) -> torch.Tensor:
+    rows = [
+        _gather_peer_rows(
+            tensor,
+            peer_ranges,
+            input_layout=input_layout,
+            range_meta_cache=range_meta_cache,
+        )
+        for peer_ranges in ranges_by_peer
+        if any(range_.size() > 0 for range_ in peer_ranges)
+    ]
+    if not rows:
+        return tensor.new_empty(
+            _packed_peer_tensor_shape(
+                tensor=tensor,
+                total_rows=0,
+                input_layout=input_layout,
+                row_factor=1,
+            )
+        )
+    return torch.cat(rows, dim=0).contiguous()
+
+
 def _pack_split_tensors_by_peer(
     *,
     left_tensor: torch.Tensor,
@@ -472,6 +700,21 @@ def _pack_split_tensors_by_peer(
     return packed
 
 
+def _pack_split_tensor_by_peer(
+    *, tensor: torch.Tensor, splits: tuple[int, ...], input_layout: str
+) -> torch.Tensor:
+    rows = _peer_row_count(tensor, layout=input_layout)
+    if rows != int(sum(splits)):
+        raise RuntimeError(
+            f"Packed split consumed the wrong number of rows: {rows} != {sum(splits)}"
+        )
+    return (
+        tensor.movedim(1, 0).contiguous()
+        if input_layout == "head_major"
+        else tensor.contiguous()
+    )
+
+
 def _validate_peer_layout(layout: str, *, context: str) -> None:
     if layout not in {"token_major", "head_major"}:
         raise ValueError(f"Unsupported {context} layout: {layout}")
@@ -482,11 +725,12 @@ def _packed_peer_tensor_shape(
     tensor: torch.Tensor,
     total_rows: int,
     input_layout: str,
+    row_factor: int = 2,
 ) -> tuple[int, ...]:
     _validate_peer_layout(input_layout, context="peer tensor input")
     if input_layout == "head_major":
-        return (total_rows * 2, int(tensor.shape[0]), int(tensor.shape[2]))
-    return (total_rows * 2, *tuple(int(dim) for dim in tensor.shape[1:]))
+        return (total_rows * row_factor, int(tensor.shape[0]), int(tensor.shape[2]))
+    return (total_rows * row_factor, *tuple(int(dim) for dim in tensor.shape[1:]))
 
 
 def _peer_row_count(tensor: torch.Tensor, *, layout: str) -> int:
@@ -577,6 +821,19 @@ def _unpack_packed_tensor_per_peer(
         in_cursor += split * 2
         out_cursor += split
     return left, right
+
+
+def _unpack_single_tensor(
+    packed_tensor: torch.Tensor,
+    *,
+    output_layout: str,
+) -> torch.Tensor:
+    _validate_peer_layout(output_layout, context="single-tensor output")
+    return (
+        packed_tensor.movedim(0, 1).contiguous()
+        if output_layout == "head_major"
+        else packed_tensor
+    )
 
 
 def _new_unpacked_peer_tensor(

@@ -555,6 +555,9 @@ def _prepare_rl_cp_micro_full(
         block_mask_variants=_art_flex_cp_block_mask_variants(provider, device),
         target_device=device,
         ref_logprobs=ref_logprobs,
+        model_support_handler=model_support_handler,
+        attention_head_dim=getattr(provider, "kv_channels", None),
+        attention_value_head_dim=getattr(provider, "kv_channels", None),
     )
 
 
@@ -790,6 +793,9 @@ def _prepare_sft_cp_micro_full(
         trace_token_uids=trace_token_uids,
         block_mask_variants=_art_flex_cp_block_mask_variants(provider, device),
         target_device=device,
+        model_support_handler=model_support_handler,
+        attention_head_dim=getattr(provider, "kv_channels", None),
+        attention_value_head_dim=getattr(provider, "kv_channels", None),
     )
 
 
