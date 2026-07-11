@@ -467,7 +467,9 @@ def _stage_topk_update(
     max_score_elements = _MAX_SCORE_WORKSPACE_BYTES // torch.int64.itemsize
     for query in stage.queries:
         candidate_k = _gather_ranges(k, query.k_ranges).contiguous()
-        candidate_ids = _gather_ranges(stage.global_k_ids, query.k_ranges).contiguous()
+        candidate_global_ids = _gather_ranges(
+            stage.global_k_ids, query.k_ranges
+        ).contiguous()
         max_k_len = int(candidate_k.shape[0])
         k_chunk_size = min(max_k_len, _MAX_K_CHUNK)
         q_chunk_size = max(1, max_score_elements // max(k_chunk_size, 1))
@@ -484,7 +486,7 @@ def _stage_topk_update(
                     candidate_k[k_start:k_end].contiguous(),
                     weights[q_start:q_end].contiguous(),
                     q_ids,
-                    candidate_ids[k_start:k_end],
+                    candidate_global_ids[k_start:k_end],
                 )
                 keep = min(topk, k_end - k_start)
                 candidate_keys = torch.topk(
@@ -500,7 +502,7 @@ def _stage_topk_update(
                 )
             best_scores.index_copy_(0, owner_rows, scores)
             best_ids.index_copy_(0, owner_rows, ids)
-        del candidate_k, candidate_ids
+        del candidate_k, candidate_global_ids
 
 
 @torch.no_grad()
