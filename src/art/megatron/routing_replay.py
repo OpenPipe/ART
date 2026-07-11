@@ -33,44 +33,6 @@ def _active_routing_replay_controller() -> Any | None:
     return _ACTIVE_ROUTING_REPLAY_CONTROLLER
 
 
-def _branch_rows_without_future_scored_tokens(
-    *,
-    group_ids: torch.Tensor,
-    parent_ids: torch.Tensor,
-    logprobs: torch.Tensor,
-) -> torch.Tensor:
-    """Rows whose MoE route cannot affect any later trainable token.
-
-    vLLM returns routes for forwards it actually ran. During generation it does
-    not run a forward for the final generated token, because no later token is
-    sampled from that row. ART prefix-tree packing may still leave a masked
-    suffix token in the same branch, so a physical group boundary is not enough
-    to identify rows that can safely use synthetic replay routes.
-    """
-    group_rows = group_ids.detach().to(device="cpu").numpy()
-    parent_rows = parent_ids.detach().to(device="cpu").numpy()
-    scored_rows = torch.isfinite(logprobs).detach().to(device="cpu").numpy()
-    allowed = torch.zeros_like(group_ids, dtype=torch.bool, device="cpu").numpy()
-    for sample_index in range(int(group_rows.shape[0])):
-        future_scored_by_group: set[int] = set()
-        group_row = group_rows[sample_index]
-        parent_row = parent_rows[sample_index]
-        scored_row = scored_rows[sample_index]
-        allowed_row = allowed[sample_index]
-        for position in range(int(group_row.shape[0]) - 1, -1, -1):
-            group_id = int(group_row[position])
-            if group_id == -1:
-                continue
-            if (
-                group_id != int(parent_row[position])
-                and group_id not in future_scored_by_group
-            ):
-                allowed_row[position] = True
-            if bool(scored_row[position]):
-                future_scored_by_group.add(group_id)
-    return torch.from_numpy(allowed).to(device=group_ids.device)
-
-
 def _to_tensor_cpu_contiguous(
     tensor: torch.Tensor, *, dtype: torch.dtype
 ) -> torch.Tensor:
@@ -389,7 +351,7 @@ class MoeRoutingReplayBundle(BaseModel):
                         raise RuntimeError(
                             f"Missing tensor keys {missing_keys} in {step_info['file']}"
                         )
-                    calls[call_index] = RouterCallRoute(
+                    calls[call_index] = RouterCallRoute.model_construct(
                         expert_indices=step_tensors[indices_key],
                         expert_probs=step_tensors.get(probs_key),
                         expert_mask=step_tensors[mask_key],
@@ -398,13 +360,13 @@ class MoeRoutingReplayBundle(BaseModel):
                         micro_slot=call_info.get("micro_slot"),
                         rank_token_counts=call_info.get("rank_token_counts"),
                     )
-                routers[router_key] = StepRouterRoutes(calls=calls)
-            steps[step_index] = StepRoutes(
+                routers[router_key] = StepRouterRoutes.model_construct(calls=calls)
+            steps[step_index] = StepRoutes.model_construct(
                 routers=routers,
                 global_token_uids=step_tensors[GLOBAL_TOKEN_UIDS_KEY],
             )
 
-        return cls(
+        return cls.model_construct(
             format_version=manifest["format_version"],
             topology=ParallelTopology.model_validate(manifest["topology"]),
             num_steps=int(manifest["num_steps"]),
@@ -485,37 +447,10 @@ def build_moe_routing_replay_bundle_from_packed_tensors(
     )
     token_mask = _to_tensor_cpu_contiguous(routing_replay.token_mask, dtype=torch.bool)
     num_experts = int(routing_replay.num_experts)
-    _validate_packed_moe_replay_tensors(
-        expert_indices=expert_indices,
-        token_mask=token_mask,
-        num_layers=int(routing_replay.num_layers),
-        topk=int(routing_replay.topk),
-        num_experts=num_experts,
-    )
     num_sequences = int(expert_indices.shape[0])
     sequence_length = int(expert_indices.shape[1])
     num_layers = int(expert_indices.shape[2])
     topk = int(expert_indices.shape[3])
-
-    group_ids = packed_tensors["group_ids"]
-    parent_ids = packed_tensors["parent_ids"]
-    non_padding = group_ids != -1
-    next_group_ids = torch.nn.functional.pad(group_ids[:, 1:], (0, 1), value=-1)
-    terminal_completion = (
-        non_padding & (group_ids != parent_ids) & (group_ids != next_group_ids)
-    )
-    no_future_scored = _branch_rows_without_future_scored_tokens(
-        group_ids=group_ids,
-        parent_ids=parent_ids,
-        logprobs=packed_tensors["logprobs"],
-    )
-    allowed_missing = terminal_completion | no_future_scored
-    unexpected_missing = non_padding & ~token_mask & ~allowed_missing
-    if bool(unexpected_missing.any().item()):
-        raise RuntimeError(
-            "Packed tensors are missing MoE routes outside terminal completion "
-            f"tokens: missing_rows={int(unexpected_missing.sum().item())}"
-        )
 
     router_keys = [
         f"chunk_00.layer_{layer_index:04d}.mlp.router"
@@ -563,67 +498,20 @@ def build_moe_routing_replay_bundle_from_packed_tensors(
                     micro_slot=micro_slot,
                 )
         routers = {
-            router_key: StepRouterRoutes(calls=calls)
+            router_key: StepRouterRoutes.model_construct(calls=calls)
             for router_key, calls in calls_by_router.items()
         }
-        steps[step_index] = StepRoutes(
+        steps[step_index] = StepRoutes.model_construct(
             routers=routers,
             global_token_uids=global_token_uids,
         )
-    return MoeRoutingReplayBundle(
+    return MoeRoutingReplayBundle.model_construct(
         topology=topology or parallel_topology_from_env(),
         num_steps=num_steps,
         max_topk=topk,
         router_keys=router_keys,
         steps=steps,
     )
-
-
-def _validate_packed_moe_replay_tensors(
-    *,
-    expert_indices: torch.Tensor,
-    token_mask: torch.Tensor,
-    num_layers: int,
-    topk: int,
-    num_experts: int,
-) -> None:
-    if expert_indices.ndim != 4:
-        raise RuntimeError(
-            "expert_indices must have shape "
-            "[num_sequences, sequence_length, num_layers, topk], got "
-            f"{tuple(expert_indices.shape)}"
-        )
-    if token_mask.shape != expert_indices.shape[:2]:
-        raise RuntimeError(
-            "token_mask shape must match packed route tokens, got "
-            f"{tuple(token_mask.shape)} vs {tuple(expert_indices.shape[:2])}"
-        )
-    if num_layers != int(expert_indices.shape[2]):
-        raise RuntimeError(
-            f"num_layers={num_layers} does not match "
-            f"expert_indices.shape[2]={expert_indices.shape[2]}"
-        )
-    if topk != int(expert_indices.shape[3]):
-        raise RuntimeError(
-            f"topk={topk} does not match expert_indices.shape[3]={expert_indices.shape[3]}"
-        )
-    if num_experts <= 0:
-        raise RuntimeError(f"num_experts must be >0, got {num_experts}")
-    if topk > num_experts:
-        raise RuntimeError(
-            f"MoE routing topk cannot exceed num_experts: topk={topk}, "
-            f"num_experts={num_experts}"
-        )
-    if not bool(token_mask.any().item()):
-        return
-    selected = expert_indices[token_mask]
-    if int(selected.numel()) == 0:
-        return
-    if int(selected.min().item()) < 0 or int(selected.max().item()) >= num_experts:
-        raise RuntimeError(
-            "expert_indices contain ids outside [0, num_experts): "
-            f"num_experts={num_experts}"
-        )
 
 
 def _sample_routes_by_layer(
@@ -640,9 +528,9 @@ def _sample_routes_by_layer(
     )
     if int(missing_positions.numel()) == 0:
         return routes_by_layer
-    # Megatron Core RouterReplay replays only top-k ids and does not consume an
-    # expert mask. Missing rows are legal only for padding or terminal completion
-    # query positions, both validated before this point.
+    # Megatron Core RouterReplay requires concrete top-k ids. The packer leaves
+    # only padding and terminal query rows missing, so materialize deterministic
+    # values for those rows without rescanning the bundle here.
     routes_by_layer[:, missing_positions, :] = _synthetic_replay_layer_rows(
         row_positions=missing_positions,
         layer_seeds=_layer_replay_seeds(

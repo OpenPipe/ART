@@ -671,7 +671,6 @@ def run_megatron_rl_job(
             ),
         )
     finally:
-        configure_moe_routing_replay(runtime)
         if packed_tensors is not None:
             del packed_tensors
         if adapter_model is not None:

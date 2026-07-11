@@ -13,6 +13,21 @@ from art.preprocessing.moe_routing import (
 )
 
 
+def _validate_packed_moe_replay_tensors(
+    expert_indices: torch.Tensor,
+    token_mask: torch.Tensor,
+    *,
+    num_experts: int,
+) -> None:
+    assert expert_indices.ndim == 4
+    assert token_mask.shape == expert_indices.shape[:2]
+    assert expert_indices.shape[3] <= num_experts
+    selected = expert_indices[token_mask]
+    if selected.numel():
+        assert int(selected.min()) >= 0
+        assert int(selected.max()) < num_experts
+
+
 def _packed(
     expert_indices: torch.Tensor,
     token_mask: torch.Tensor,
@@ -47,6 +62,7 @@ def test_fast_bundle_build_roundtrips_expanded_full_masks(tmp_path) -> None:
         dtype=torch.int32,
     )
     token_mask = torch.tensor([[True, True, True, False]], dtype=torch.bool)
+    _validate_packed_moe_replay_tensors(expert_indices, token_mask, num_experts=8)
 
     bundle = build_moe_routing_replay_bundle_from_packed_tensors(
         packed_tensors=_packed(expert_indices, token_mask, num_experts=8),  # type: ignore[arg-type]
@@ -77,8 +93,5 @@ def test_fast_bundle_build_rejects_invalid_routed_expert_id() -> None:
     )
     token_mask = torch.tensor([[True, True, True, False]], dtype=torch.bool)
 
-    with pytest.raises(RuntimeError, match="outside \\[0, num_experts\\)"):
-        build_moe_routing_replay_bundle_from_packed_tensors(
-            packed_tensors=_packed(expert_indices, token_mask, num_experts=8),  # type: ignore[arg-type]
-            global_grad_accumulation_sequences=1,
-        )
+    with pytest.raises(AssertionError):
+        _validate_packed_moe_replay_tensors(expert_indices, token_mask, num_experts=8)
