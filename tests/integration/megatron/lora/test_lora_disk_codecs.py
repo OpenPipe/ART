@@ -5,6 +5,7 @@ from pathlib import Path
 import shutil
 import subprocess
 import sys
+from types import SimpleNamespace
 from typing import Any, cast
 
 import pytest
@@ -14,7 +15,7 @@ import torch
 pytest.importorskip("megatron.bridge.models.gpt_provider")
 
 from art.megatron import lora as lora_module
-from art.megatron.lora import LoRA, LoRAParallelSpec, LoRAPublishPlanner
+from art.megatron.lora import LoRA, LoRAParallelSpec, LoRAPublishPlanner, LoRASlotRef
 from art.megatron.model_support.handlers import (
     DEFAULT_DENSE_HANDLER,
     GPT_OSS_MOE_HANDLER,
@@ -33,6 +34,7 @@ from art.megatron.weights.lora_publish import (
     merge_sharded_adapter_entries,
     save_vllm_lora_from_model,
 )
+from art.trainer_rank import TrainerRank
 from art.utils.convert_moe_lora import convert_checkpoint_if_needed
 
 REPO_ROOT = Path(__file__).parents[4]
@@ -1486,9 +1488,45 @@ def test_save_vllm_lora_from_model_writes_single_vllm_checkpoint(tmp_path: Path)
     _assert_tensors_equal(roundtrip, full)
 
 
+def test_trainer_rank_publishes_named_checkpoint_slot_without_mutating_base(
+    tmp_path: Path,
+):
+    prefix = "base_model.model.model.layers.0.self_attn.q_proj"
+    lora = LoRA(prefix, 3, 4, 2, 2, torch.float32, torch.device("cpu"))
+    baseline = (lora.A_T.detach().clone(), lora.B_T.detach().clone())
+    adapter = {
+        f"{prefix}.lora_A.weight": torch.arange(6, dtype=torch.float32).reshape(2, 3),
+        f"{prefix}.lora_B.weight": torch.arange(8, dtype=torch.float32).reshape(4, 2),
+    }
+    trainer = TrainerRank.__new__(TrainerRank)
+    trainer.runtime = SimpleNamespace(
+        model=[lora],
+        model_support_handler=DEFAULT_DENSE_HANDLER,
+        rank=0,
+        world_size=1,
+    )
+    trainer._slot_stack = []
+    trainer._pending_slot_graphs = {}
+    trainer._dynamic_optimizers = {}
+    trainer._checkpoint_slot_params_by_name = {}
+    trainer._checkpoint_slot_adapter_configs = {}
+    config = _config("Qwen/Qwen3-8B", rank=2, alpha=2)
+    assert trainer.load_checkpoint_slot("student", adapter, adapter_config=config) == 1
+    output_dir = tmp_path / "checkpoint"
+
+    trainer.save_checkpoint_slot_lora("student", str(output_dir))
+
+    _assert_tensors_equal(load_file(output_dir / "adapter_model.safetensors"), adapter)
+    assert json.loads((output_dir / "adapter_config.json").read_text()) == config
+    assert torch.equal(lora.A_T, baseline[0])
+    assert torch.equal(lora.B_T, baseline[1])
+
+
+@pytest.mark.parametrize("dynamic_slot", [False, True])
 def test_direct_qwen35_packed_expert_publish_matches_old_vllm_exactly(
     tmp_path: Path,
     monkeypatch,
+    dynamic_slot: bool,
 ):
     monkeypatch.setattr(lora_module.ps, "get_expert_model_parallel_rank", lambda: 0)
     monkeypatch.setattr(lora_module.ps, "get_expert_data_parallel_rank", lambda: 0)
@@ -1554,6 +1592,13 @@ def test_direct_qwen35_packed_expert_publish_matches_old_vllm_exactly(
         down_lora.B_T.data[expert].copy_(tensors["down_proj.lora_B.weight"].T)
         offset += 1000
 
+    slot_ref = LoRASlotRef("checkpoint", "student") if dynamic_slot else None
+    if slot_ref is not None:
+        assert gate_up_lora.load_lora_slot(
+            slot_ref, full, alpha=rank, requires_grad=True
+        )
+        assert down_lora.load_lora_slot(slot_ref, full, alpha=rank, requires_grad=True)
+
     adapter_config = _config("Qwen/Qwen3.5-35B-A3B", rank=rank, alpha=rank)
     old_dir = tmp_path / "old"
     current_dir = tmp_path / "current"
@@ -1570,6 +1615,7 @@ def test_direct_qwen35_packed_expert_publish_matches_old_vllm_exactly(
         output_dir=str(current_dir),
         rank=0,
         world_size=1,
+        slot_ref=slot_ref,
     )
 
     _assert_tensors_equal(

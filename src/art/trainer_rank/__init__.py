@@ -6,6 +6,7 @@ from collections.abc import (
     Mapping,
     Sequence,
 )
+from copy import deepcopy
 from dataclasses import dataclass
 import os
 from typing import (
@@ -544,6 +545,7 @@ class TrainerRank:
         self._checkpoint_slot_params_by_name: dict[
             str, tuple[torch.nn.Parameter, ...]
         ] = {}
+        self._checkpoint_slot_adapter_configs: dict[str, dict[str, Any]] = {}
         self._pending_slot_graphs: dict[
             LoRASlotRef, list[weakref.ReferenceType[torch.Tensor]]
         ] = {}
@@ -592,19 +594,37 @@ class TrainerRank:
         *,
         optimizer_state: Mapping[str, object] | None = None,
         alpha: float | None = None,
+        adapter_config: Mapping[str, object] | None = None,
     ) -> int:
+        config = self._validate_checkpoint_slot_adapter_config(
+            name, adapter_config, alpha=alpha
+        )
         loaded = self._load_slot(
-            "checkpoint", name, adapter_model, trainable=True, alpha=alpha
+            "checkpoint",
+            name,
+            adapter_model,
+            trainable=True,
+            alpha=alpha if config is None else float(config["lora_alpha"]),
         )
-        self._checkpoint_slot_params_by_name[name] = (
-            self._validate_dynamic_slot_consistency("checkpoint", name, loaded)
+        slot_params = self._validate_dynamic_slot_consistency(
+            "checkpoint", name, loaded
         )
+        if config is not None:
+            self._validate_loaded_checkpoint_slot_config(name, config)
+        self._checkpoint_slot_params_by_name[name] = slot_params
         if optimizer_state is None:
             self._dynamic_optimizers.pop(name, None)
         else:
             self._dynamic_optimizers[name] = self._restore_dynamic_optimizer(
                 name, optimizer_state
             )
+        configs = getattr(self, "_checkpoint_slot_adapter_configs", None)
+        if configs is None:
+            configs = self._checkpoint_slot_adapter_configs = {}
+        if config is None:
+            configs.pop(name, None)
+        else:
+            configs[name] = config
         return loaded
 
     def checkpoint_slot_optimizer_state(self, name: str) -> dict[str, object] | None:
@@ -621,6 +641,94 @@ class TrainerRank:
             ),
             "optimizer": _state_to_cpu(dynamic.optimizer.state_dict()),
         }
+
+    def save_checkpoint_slot_lora(self, name: str, output_dir: str) -> None:
+        """Collectively publish a trained checkpoint slot as a vLLM LoRA."""
+        known = name in self._checkpoint_slot_params_by_name
+        if dist.is_available() and dist.is_initialized():
+            gathered: list[tuple[str, bool] | None] = [None] * dist.get_world_size()
+            dist.all_gather_object(gathered, (name, known))
+            if any(state != (name, True) for state in gathered):
+                raise ValueError(
+                    "Checkpoint slot publish requires the same loaded name on all "
+                    f"ranks; got {gathered}"
+                )
+        if not known:
+            raise ValueError(f"Unknown checkpoint slot: {name!r}")
+        config = getattr(self, "_checkpoint_slot_adapter_configs", {}).get(name)
+        if config is None:
+            raise TrainerRankSlotStateError(
+                f"Checkpoint slot {name!r} was loaded without adapter_config; "
+                "reload it with adapter_config=... before publishing."
+            )
+        from art.megatron.weights.lora_publish import save_vllm_lora_from_model
+
+        save_vllm_lora_from_model(
+            model=self.runtime.model,
+            adapter_model={},
+            handler=self.runtime.model_support_handler,
+            adapter_config=config,
+            output_dir=output_dir,
+            rank=self.runtime.rank,
+            world_size=self.runtime.world_size,
+            slot_ref=self._slot_ref("checkpoint", name),
+        )
+
+    def _validate_checkpoint_slot_adapter_config(
+        self,
+        name: str,
+        adapter_config: Mapping[str, object] | None,
+        *,
+        alpha: float | None,
+    ) -> dict[str, Any] | None:
+        config = (
+            None
+            if adapter_config is None
+            else cast(dict[str, Any], deepcopy(dict(adapter_config)))
+        )
+        if dist.is_available() and dist.is_initialized():
+            gathered: list[dict[str, Any] | None] = [None] * dist.get_world_size()
+            dist.all_gather_object(gathered, config)
+            if any(value != config for value in gathered):
+                raise ValueError(
+                    f"Adapter config for checkpoint slot {name!r} differs across ranks"
+                )
+        if config is None:
+            return None
+        required = {"base_model_name_or_path", "r", "lora_alpha", "target_modules"}
+        if missing := sorted(required - config.keys()):
+            raise ValueError(
+                f"Adapter config for checkpoint slot {name!r} is missing {missing}"
+            )
+        if int(config["r"]) < 1:
+            raise ValueError("adapter_config['r'] must be >= 1")
+        config_alpha = float(config["lora_alpha"])
+        if alpha is not None and float(alpha) != config_alpha:
+            raise ValueError(
+                f"alpha={alpha} conflicts with adapter_config lora_alpha={config_alpha}"
+            )
+        return config
+
+    def _validate_loaded_checkpoint_slot_config(
+        self, name: str, config: Mapping[str, Any]
+    ) -> None:
+        from art.megatron.lora import LoRA
+
+        ref = self._slot_ref("checkpoint", name)
+        slots = [
+            slot
+            for chunk in self.runtime.model
+            for module in chunk.modules()
+            if isinstance(module, LoRA)
+            if (slot := module._slot(ref)) is not None
+        ]
+        expected = (int(config["r"]), float(config["lora_alpha"]))
+        actual = {(slot.rank, slot.alpha) for slot in slots}
+        if actual != {expected}:
+            raise ValueError(
+                f"Adapter config for checkpoint slot {name!r} declares "
+                f"rank/alpha={expected}, loaded weights use {sorted(actual)}"
+            )
 
     def load_lora_slot(
         self,

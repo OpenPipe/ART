@@ -738,17 +738,27 @@ class LoRA(torch.nn.Module):
                 manifest["component_sizes"] = component_sizes
         return manifest
 
-    def _lora_params(self) -> list[tuple[str, torch.nn.Parameter]]:
+    def _lora_params(
+        self, ref: LoRASlotRef | None = None
+    ) -> list[tuple[str, torch.nn.Parameter]]:
+        if ref is not None:
+            slot = self._slot(ref)
+            if slot is None:
+                return []
+            return [
+                ("lora_A.weight", slot.A_T),
+                ("lora_B.weight", slot.B_T),
+            ]
         return [
             ("lora_A.weight", self.A_T),
             ("lora_B.weight", self.B_T),
         ]
 
     def _export_items(
-        self,
+        self, ref: LoRASlotRef | None = None
     ) -> list[tuple[str, torch.nn.Parameter, int | None]]:
         export_items: list[tuple[str, torch.nn.Parameter, int | None]] = []
-        for key, param in self._lora_params():
+        for key, param in self._lora_params(ref):
             if not self._should_export_parameter(param):
                 continue
             if self.num_local_experts > 1:
@@ -759,15 +769,19 @@ class LoRA(torch.nn.Module):
                 export_items.append((f"{self.adapter_model_prefix}.{key}", param, None))
         return export_items
 
-    def sharded_lora_manifest(self) -> dict[str, dict[str, Any]]:
+    def sharded_lora_manifest(
+        self, ref: LoRASlotRef | None = None
+    ) -> dict[str, dict[str, Any]]:
         return {
             key: self._manifest_for_param(param)
-            for key, param, _expert in self._export_items()
+            for key, param, _expert in self._export_items(ref)
         }
 
-    def sharded_lora_state_dict(self) -> dict[str, torch.Tensor]:
+    def sharded_lora_state_dict(
+        self, ref: LoRASlotRef | None = None
+    ) -> dict[str, torch.Tensor]:
         state: dict[str, torch.Tensor] = {}
-        for key, param, expert in self._export_items():
+        for key, param, expert in self._export_items(ref):
             state[key] = param.data[expert].T if expert is not None else param.data.T
         return state
 
@@ -822,8 +836,12 @@ class LoRA(torch.nn.Module):
 
 
 class LoRAPublishPlanner:
-    def __init__(self, model_chunks: Sequence[torch.nn.Module]) -> None:
-        self.templates = tuple(self._collect_templates(model_chunks))
+    def __init__(
+        self,
+        model_chunks: Sequence[torch.nn.Module],
+        slot_ref: LoRASlotRef | None = None,
+    ) -> None:
+        self.templates = tuple(self._collect_templates(model_chunks, slot_ref))
 
     def global_metadata(
         self,
@@ -846,13 +864,14 @@ class LoRAPublishPlanner:
     @staticmethod
     def _collect_templates(
         model_chunks: Sequence[torch.nn.Module],
+        slot_ref: LoRASlotRef | None = None,
     ) -> list[_LoraPublishTemplate]:
         templates: list[_LoraPublishTemplate] = []
         for chunk in model_chunks:
             for module in chunk.modules():
                 if not isinstance(module, LoRA):
                     continue
-                for suffix, param in module._lora_params():
+                for suffix, param in module._lora_params(slot_ref):
                     if not module._should_export_parameter(param):
                         continue
                     sharded = bool(param.lora_tp_sharded)  # type: ignore[attr-defined]

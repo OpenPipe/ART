@@ -222,6 +222,88 @@ def test_trainer_rank_normalizes_adapter_tensors_to_installed_site() -> None:
     assert all(tensor.dtype == torch.bfloat16 for tensor in normalized.values())
 
 
+def test_checkpoint_slot_adapter_config_is_validated_and_copied() -> None:
+    trainer = TrainerRank(_runtime())  # type: ignore[arg-type]
+    config = {
+        "base_model_name_or_path": "Qwen/Qwen3-8B",
+        "r": 8,
+        "lora_alpha": 16,
+        "target_modules": ["q_proj"],
+    }
+
+    retained = trainer._validate_checkpoint_slot_adapter_config(
+        "student", config, alpha=16
+    )
+
+    assert retained == config
+    config["target_modules"].append("v_proj")  # type: ignore[union-attr]
+    assert retained is not None
+    assert retained["target_modules"] == ["q_proj"]
+    with pytest.raises(ValueError, match="conflicts"):
+        trainer._validate_checkpoint_slot_adapter_config("student", config, alpha=32)
+    with pytest.raises(ValueError, match="missing"):
+        trainer._validate_checkpoint_slot_adapter_config(
+            "student", {"r": 8}, alpha=None
+        )
+
+
+def test_checkpoint_slot_adapter_config_rejects_cross_rank_mismatch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    trainer = TrainerRank(_runtime())  # type: ignore[arg-type]
+    monkeypatch.setattr("art.trainer_rank.dist.is_initialized", lambda: True)
+    monkeypatch.setattr("art.trainer_rank.dist.get_world_size", lambda: 2)
+
+    def gather(output: list[object], value: object) -> None:
+        output[:] = [value, {"different": True}]
+
+    monkeypatch.setattr("art.trainer_rank.dist.all_gather_object", gather)
+
+    with pytest.raises(ValueError, match="differs across ranks"):
+        trainer._validate_checkpoint_slot_adapter_config("student", None, alpha=None)
+
+
+def test_load_checkpoint_slot_retains_config_and_uses_its_alpha(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    trainer = TrainerRank(_runtime())  # type: ignore[arg-type]
+    seen: dict[str, object] = {}
+    monkeypatch.setattr(
+        trainer,
+        "_load_slot",
+        lambda *_args, **kwargs: seen.update(kwargs) or 1,
+    )
+    monkeypatch.setattr(trainer, "_validate_dynamic_slot_consistency", lambda *_: ())
+    monkeypatch.setattr(
+        trainer, "_validate_loaded_checkpoint_slot_config", lambda *_: None
+    )
+    config = {
+        "base_model_name_or_path": "Qwen/Qwen3-8B",
+        "r": 8,
+        "lora_alpha": 16,
+        "target_modules": ["q_proj"],
+    }
+
+    trainer.load_checkpoint_slot("student", {}, adapter_config=config)
+
+    assert seen["alpha"] == 16
+    assert trainer._checkpoint_slot_adapter_configs["student"] == config
+    trainer.load_checkpoint_slot("student", {}, alpha=7)
+    assert seen["alpha"] == 7
+    assert "student" not in trainer._checkpoint_slot_adapter_configs
+
+
+def test_checkpoint_slot_publish_requires_retained_adapter_config() -> None:
+    trainer = TrainerRank(_runtime())  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="Unknown checkpoint slot"):
+        trainer.save_checkpoint_slot_lora("missing", "/unused")
+
+    trainer._checkpoint_slot_params_by_name["student"] = ()
+
+    with pytest.raises(TrainerRankSlotStateError, match="adapter_config"):
+        trainer.save_checkpoint_slot_lora("student", "/unused")
+
+
 def test_trainer_rank_default_forward_uses_explicit_base_slot() -> None:
     trainer = TrainerRank(_runtime())  # type: ignore[arg-type]
 
