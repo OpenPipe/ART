@@ -164,6 +164,7 @@ class Glm52Handler(DefaultMoeHandler):
     def configure_provider_for_runtime(self, provider: Any) -> None:
         provider.mtp_num_layers = None
         provider.mtp_loss_scaling_factor = None
+        provider.moe_shared_expert_overlap = False
 
     def install_preprocess_patch(self, model_chunks: Sequence[Any]) -> None:
         from megatron.core.models.gpt.gpt_model import GPTModel
