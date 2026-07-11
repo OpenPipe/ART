@@ -366,6 +366,7 @@ def sparse_mla_backward(
     *,
     scale: float,
 ) -> tuple[torch.Tensor, torch.Tensor]:
+    grad_out = grad_out.contiguous()
     batch, q_tokens, heads, _ = q.shape
     kv_tokens = int(kv.shape[1])
     topk = int(indices.shape[-1])
@@ -376,7 +377,7 @@ def sparse_mla_backward(
         kv,
         indices,
         out,
-        grad_out.contiguous(),
+        grad_out,
         lse,
         grad_q,
         grad_kv_fp32,

@@ -38,6 +38,8 @@ class Glm52PrefixTreeState(BaseModel):
     model_config = ConfigDict(arbitrary_types_allowed=True)
 
     position_ids: torch.Tensor
+    rope_cos: torch.Tensor
+    rope_sin: torch.Tensor
     indexer_rows: tuple[Glm52IndexerRowPlan, ...]
     topk_by_full_layer: dict[int, torch.Tensor] = Field(default_factory=dict)
 
@@ -86,12 +88,19 @@ def build_glm52_prefix_tree_state(
                 queries=queries,
             )
         )
+    position_ids_device = position_ids.to(
+        device=device,
+        dtype=torch.int64,
+        non_blocking=True,
+    ).contiguous()
+    inv_freq = 1.0 / (
+        8_000_000 ** (torch.arange(0, 64, 2, device=device, dtype=torch.float32) / 64)
+    )
+    frequencies = position_ids_device.float().unsqueeze(-1) * inv_freq
     return Glm52PrefixTreeState(
-        position_ids=position_ids.to(
-            device=device,
-            dtype=torch.int64,
-            non_blocking=True,
-        ).contiguous(),
+        position_ids=position_ids_device,
+        rope_cos=frequencies.cos().to(torch.bfloat16),
+        rope_sin=frequencies.sin().to(torch.bfloat16),
         indexer_rows=tuple(rows),
     )
 
