@@ -26,7 +26,7 @@ class Glm52Handler(DefaultMoeHandler):
     key = "glm52"
     is_moe = True
     cp_supported = False
-    native_vllm_lora_status = "wip"
+    native_vllm_lora_status = "validated"
 
     def compile_workaround_config(self, provider: Any) -> CompileWorkaroundConfig:
         ep1_alltoall = (
