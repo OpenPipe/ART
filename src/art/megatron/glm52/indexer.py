@@ -192,6 +192,8 @@ def _index_scores_kernel(
     q_ptr,
     k_ptr,
     weights_ptr,
+    q_ids_ptr,
+    k_ids_ptr,
     scores_ptr,
     q_len,
     k_len,
@@ -204,13 +206,14 @@ def _index_scores_kernel(
     stride_wh,
     stride_st,
     stride_sk,
-    q_position_offset: tl.constexpr,
-    k_position_offset: tl.constexpr,
+    q_position_offset,
+    k_position_offset,
     heads: tl.constexpr,
     head_dim: tl.constexpr,
     block_q: tl.constexpr,
     block_k: tl.constexpr,
     causal: tl.constexpr,
+    explicit_ids: tl.constexpr,
     ranking_keys: tl.constexpr,
 ):
     q_block = tl.program_id(0)
@@ -243,11 +246,16 @@ def _index_scores_kernel(
     )
     scores = tl.sum(tl.maximum(dots, 0.0) * weights[:, :, None], axis=1)
     valid = (q_offsets[:, None] < q_len) & (k_offsets[None, :] < k_len)
-    if causal:
-        valid &= (
-            k_position_offset + k_offsets[None, :]
-            <= q_position_offset + q_offsets[:, None]
+    if explicit_ids:
+        q_positions = tl.load(q_ids_ptr + q_offsets, mask=q_offsets < q_len, other=-1)
+        k_positions = tl.load(
+            k_ids_ptr + k_offsets, mask=k_offsets < k_len, other=0x7FFF_FFFF
         )
+    else:
+        q_positions = q_position_offset + q_offsets
+        k_positions = k_position_offset + k_offsets
+    if causal:
+        valid &= k_positions[None, :] <= q_positions[:, None]
     scores = tl.where(valid, scores, float("-inf"))
     output_offsets = (
         scores_ptr + q_offsets[:, None] * stride_st + k_offsets[None, :] * stride_sk
@@ -262,7 +270,7 @@ def _index_scores_kernel(
             bits ^ 0x8000_0000,
         )
         primary = ordered - 0x8000_0000
-        global_ids = (k_position_offset + k_offsets[None, :]).to(tl.int64)
+        global_ids = k_positions[None, :].to(tl.int64)
         keys = (primary << 32) | (0xFFFF_FFFF - global_ids)
         keys = tl.where(valid, keys, -0x8000_0000_0000_0000)
         tl.store(output_offsets, keys, mask=output_mask)
@@ -301,6 +309,8 @@ def _index_scores(
         q,
         k,
         weights,
+        q,
+        k,
         scores,
         q_len,
         k_len,
@@ -315,6 +325,7 @@ def _index_scores(
         block_q=block_q,  # ty: ignore[invalid-argument-type]
         block_k=block_k,  # ty: ignore[invalid-argument-type]
         causal=causal,  # ty: ignore[invalid-argument-type]
+        explicit_ids=False,  # ty: ignore[invalid-argument-type]
         ranking_keys=False,  # ty: ignore[invalid-argument-type]
         num_warps=8,  # ty: ignore[unknown-argument]
         num_stages=3,  # ty: ignore[unknown-argument]
@@ -326,13 +337,13 @@ def _index_score_keys(
     q: torch.Tensor,
     k: torch.Tensor,
     weights: torch.Tensor,
-    *,
-    q_position_offset: int,
-    k_position_offset: int,
-    causal: bool,
+    q_ids: torch.Tensor,
+    k_ids: torch.Tensor,
 ) -> torch.Tensor:
     q_len, heads, head_dim = q.shape
     k_len = int(k.shape[0])
+    if q_ids.shape != (q_len,) or k_ids.shape != (k_len,):
+        raise ValueError("GLM-5.2 CP index ids must match query and key rows.")
     block_q = 128 // heads
     block_k = 64
     keys = torch.empty((q_len, k_len), device=q.device, dtype=torch.int64)
@@ -340,6 +351,8 @@ def _index_score_keys(
         q,
         k,
         weights,
+        q_ids,
+        k_ids,
         keys,
         q_len,
         k_len,
@@ -347,13 +360,14 @@ def _index_score_keys(
         *k.stride(),
         *weights.stride(),
         *keys.stride(),
-        q_position_offset=q_position_offset,  # ty: ignore[invalid-argument-type]
-        k_position_offset=k_position_offset,  # ty: ignore[invalid-argument-type]
+        q_position_offset=0,  # ty: ignore[invalid-argument-type]
+        k_position_offset=0,  # ty: ignore[invalid-argument-type]
         heads=heads,  # ty: ignore[invalid-argument-type]
         head_dim=head_dim,  # ty: ignore[invalid-argument-type]
         block_q=block_q,  # ty: ignore[invalid-argument-type]
         block_k=block_k,  # ty: ignore[invalid-argument-type]
-        causal=causal,  # ty: ignore[invalid-argument-type]
+        causal=True,  # ty: ignore[invalid-argument-type]
+        explicit_ids=True,  # ty: ignore[invalid-argument-type]
         ranking_keys=True,  # ty: ignore[invalid-argument-type]
         num_warps=8,  # ty: ignore[unknown-argument]
         num_stages=3,  # ty: ignore[unknown-argument]
@@ -431,6 +445,15 @@ def _merge_stable_topk(
     )
 
 
+def _gather_ranges(
+    tensor: torch.Tensor, ranges: tuple[tuple[int, int], ...]
+) -> torch.Tensor:
+    if len(ranges) == 1:
+        start, end = ranges[0]
+        return tensor[start:end]
+    return torch.cat(tuple(tensor[start:end] for start, end in ranges))
+
+
 def _stage_topk_update(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -442,28 +465,26 @@ def _stage_topk_update(
     topk: int,
 ) -> None:
     max_score_elements = _MAX_SCORE_WORKSPACE_BYTES // torch.int64.itemsize
-    for slice_ in stage.slices:
-        max_k_len = int(slice_.k_end - slice_.k_start)
+    for query in stage.queries:
+        candidate_k = _gather_ranges(k, query.k_ranges).contiguous()
+        candidate_ids = _gather_ranges(stage.global_k_ids, query.k_ranges).contiguous()
+        max_k_len = int(candidate_k.shape[0])
         k_chunk_size = min(max_k_len, _MAX_K_CHUNK)
         q_chunk_size = max(1, max_score_elements // max(k_chunk_size, 1))
-        for q_start in range(slice_.q_start, slice_.q_end, q_chunk_size):
-            q_end = min(q_start + q_chunk_size, slice_.q_end)
+        for q_start in range(query.q_start, query.q_end, q_chunk_size):
+            q_end = min(q_start + q_chunk_size, query.q_end)
             owner_rows = stage.owner_q_rows[q_start:q_end]
             scores = best_scores.index_select(0, owner_rows)
             ids = best_ids.index_select(0, owner_rows)
-            for k_start in range(slice_.k_start, slice_.k_end, k_chunk_size):
-                k_end = min(k_start + k_chunk_size, slice_.k_end)
+            q_ids = stage.global_q_ids[q_start:q_end]
+            for k_start in range(0, max_k_len, k_chunk_size):
+                k_end = min(k_start + k_chunk_size, max_k_len)
                 score_keys = _index_score_keys(
                     q[q_start:q_end].contiguous(),
-                    k[k_start:k_end].contiguous(),
+                    candidate_k[k_start:k_end].contiguous(),
                     weights[q_start:q_end].contiguous(),
-                    q_position_offset=slice_.q_position_offset
-                    + q_start
-                    - slice_.q_start,
-                    k_position_offset=slice_.k_position_offset
-                    + k_start
-                    - slice_.k_start,
-                    causal=slice_.causal,
+                    q_ids,
+                    candidate_ids[k_start:k_end],
                 )
                 keep = min(topk, k_end - k_start)
                 candidate_keys = torch.topk(
@@ -479,6 +500,7 @@ def _stage_topk_update(
                 )
             best_scores.index_copy_(0, owner_rows, scores)
             best_ids.index_copy_(0, owner_rows, ids)
+        del candidate_k, candidate_ids
 
 
 @torch.no_grad()
@@ -504,7 +526,7 @@ def context_parallel_tree_topk(
     for stage_plan, stage in zip(
         cp_state.rank_plan.stage_plans, state.stages, strict=True
     ):
-        if not stage.slices:
+        if not stage.queries:
             continue
         q_stage = stage_query_rows(q, stage_plan, cp_state)
         weights_stage = stage_query_rows(weights, stage_plan, cp_state)

@@ -18,16 +18,12 @@ class Glm52IndexerSlice(BaseModel):
     causal: bool
 
 
-class Glm52StageSlice(BaseModel):
+class Glm52StageQueryPlan(BaseModel):
     model_config = ConfigDict(frozen=True)
 
     q_start: int
     q_end: int
-    k_start: int
-    k_end: int
-    q_position_offset: int
-    k_position_offset: int
-    causal: bool
+    k_ranges: tuple[tuple[int, int], ...]
 
 
 class Glm52IndexerQueryPlan(BaseModel):
@@ -53,7 +49,7 @@ class Glm52StageState(BaseModel):
     global_q_ids: torch.Tensor
     global_k_ids: torch.Tensor
     owner_q_rows: torch.Tensor
-    slices: tuple[Glm52StageSlice, ...]
+    queries: tuple[Glm52StageQueryPlan, ...]
 
 
 class Glm52PrefixTreeState(BaseModel):
@@ -203,27 +199,26 @@ def build_glm52_context_parallel_state(
             if owner_q_parts
             else torch.empty(0, dtype=torch.int64)
         )
+        k_ranges_by_query: dict[tuple[int, int], list[tuple[int, int]]] = defaultdict(
+            list
+        )
+        for slice_ in stage.slices:
+            k_ranges_by_query[
+                (int(slice_.q_range.start), int(slice_.q_range.end))
+            ].append((int(slice_.k_range.start), int(slice_.k_range.end)))
         stages.append(
             Glm52StageState(
                 stage_index=int(stage.stage_index),
                 global_q_ids=q_ids.contiguous(),
                 global_k_ids=k_ids.contiguous(),
                 owner_q_rows=owner_q_rows.to(device=device, non_blocking=True),
-                slices=tuple(
-                    Glm52StageSlice(
-                        q_start=int(slice_.q_range.start),
-                        q_end=int(slice_.q_range.end),
-                        k_start=int(slice_.k_range.start),
-                        k_end=int(slice_.k_range.end),
-                        q_position_offset=int(
-                            metadata.q_token_indices[slice_.q_range.start]
-                        ),
-                        k_position_offset=int(
-                            metadata.k_token_indices[slice_.k_range.start]
-                        ),
-                        causal=slice_.mask_kind is AttnMaskKind.CAUSAL,
+                queries=tuple(
+                    Glm52StageQueryPlan(
+                        q_start=q_start,
+                        q_end=q_end,
+                        k_ranges=tuple(k_ranges),
                     )
-                    for slice_ in stage.slices
+                    for (q_start, q_end), k_ranges in sorted(k_ranges_by_query.items())
                 ),
             )
         )

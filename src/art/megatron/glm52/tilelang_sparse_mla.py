@@ -62,6 +62,7 @@ _LATENT = 512
 _ROPE = 64
 _DIM = _LATENT + _ROPE
 _HEAD_BLOCK = 16
+_DKV_SPLITS = 4
 _LOG2_E = 1.4426950408889634
 _LN_2 = 0.6931471805599453
 
@@ -233,6 +234,7 @@ def _backward(
     kv_tokens,
     topk,
     scale,
+    dkv_splits=_DKV_SPLITS,
     block_i=32,
     num_stages=0,
     threads=256,
@@ -242,6 +244,7 @@ def _backward(
     assert topk % block_i == 0
     q_shape = [batch, q_tokens, heads, _DIM]
     kv_shape = [batch, kv_tokens, 1, _DIM]
+    grad_kv_shape = [batch, dkv_splits, kv_tokens, 1, _DIM]
     out_shape = [batch, q_tokens, heads, _LATENT]
     indices_shape = [batch, q_tokens, 1, topk]
     row_shape = [batch, q_tokens, heads]
@@ -258,7 +261,7 @@ def _backward(
         Lse: T.Tensor(row_shape, T.float32),  # type: ignore
         Delta: T.Tensor(row_shape, T.float32),  # type: ignore
         GradQ: T.Tensor(q_shape, T.bfloat16),  # type: ignore
-        GradKV: T.Tensor(kv_shape, T.float32),  # type: ignore
+        GradKV: T.Tensor(grad_kv_shape, T.float32),  # type: ignore
     ):
         with T.Kernel(q_tokens, batch, threads=threads) as (q_i, b_i):
             q_shared = T.alloc_shared([heads, _LATENT], T.bfloat16)
@@ -399,6 +402,7 @@ def _backward(
                         T.atomic_add(
                             GradKV[
                                 b_i,
+                                q_i % dkv_splits,
                                 Indices[b_i, q_i, 0, block * block_i + source],
                                 0,
                                 d,
@@ -410,6 +414,7 @@ def _backward(
                         T.atomic_add(
                             GradKV[
                                 b_i,
+                                q_i % dkv_splits,
                                 Indices[b_i, q_i, 0, block * block_i + source],
                                 0,
                                 _LATENT + d,
@@ -469,7 +474,11 @@ def backward(
         delta = _delta(int(kernel_heads))(output, grad_output)
         kv_grouped = kv.unsqueeze(2)
         indices_grouped = indices.unsqueeze(2)
-        grad_kv = torch.zeros_like(kv_grouped, dtype=torch.float32)
+        grad_kv = torch.zeros(
+            (kv.shape[0], _DKV_SPLITS, kv.shape[1], 1, kv.shape[2]),
+            device=kv.device,
+            dtype=torch.float32,
+        )
         grad_q = _backward(
             int(kernel_heads),
             int(q.shape[0]),
@@ -479,4 +488,7 @@ def backward(
             float(scale),
             threads=min(256, int(kernel_heads) * 8),
         )(q, kv_grouped, grad_output, indices_grouped, lse, delta, grad_kv)
-    return grad_q[:, :, :heads], grad_kv[:, :-1].to(kv.dtype).squeeze(2)
+    return (
+        grad_q[:, :, :heads],
+        grad_kv.sum(dim=1)[:, :-1].to(kv.dtype).squeeze(2),
+    )
