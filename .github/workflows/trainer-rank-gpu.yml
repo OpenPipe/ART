@@ -1,0 +1,135 @@
+name: TrainerRank GPU validation
+
+on:
+  pull_request:
+    types: [opened, reopened, synchronize, ready_for_review]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: trainer-rank-gpu-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  classify:
+    runs-on: ubuntu-latest
+    outputs:
+      required: ${{ steps.changes.outputs.required }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - id: changes
+        name: Classify changed files
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -euo pipefail
+          pattern='^src/art/megatron/(prefix_tree(_packing|_state)?\.py|context_parallel/|flex_attn/|gdn/|lora\.py|megatron_patches\.py|training/(finalize_grads|microbatches)\.py)'
+          changed="$(git diff --name-only "${BASE_SHA}...${HEAD_SHA}")"
+          critical="$(printf '%s\n' "${changed}" | grep -E "${pattern}" || true)"
+          if [ -n "${critical}" ]; then
+            echo "required=true" >> "${GITHUB_OUTPUT}"
+            {
+              echo "### TrainerRank GPU validation required"
+              echo
+              echo '```text'
+              printf '%s\n' "${critical}"
+              echo '```'
+            } >> "${GITHUB_STEP_SUMMARY}"
+          else
+            echo "required=false" >> "${GITHUB_OUTPUT}"
+            echo "### TrainerRank GPU validation not required" >> "${GITHUB_STEP_SUMMARY}"
+          fi
+
+  validate:
+    name: Run on 2x H200
+    needs: classify
+    if: needs.classify.outputs.required == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    environment: trainer-rank-gpu-validation
+    env:
+      SKY_INFRA: k8s/cks-wb3
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+
+      - name: Install launch dependencies
+        run: |
+          curl -LsSf https://astral.sh/uv/install.sh | sh
+          echo "${HOME}/.local/bin" >> "${GITHUB_PATH}"
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends socat
+          kubectl_version="$(curl -LsSf https://dl.k8s.io/release/stable.txt)"
+          curl -LsSf -o kubectl "https://dl.k8s.io/release/${kubectl_version}/bin/linux/amd64/kubectl"
+          sudo install -m 0755 kubectl /usr/local/bin/kubectl
+
+      - name: Configure Kubernetes
+        env:
+          KUBECONFIG_VALUE: ${{ secrets.CKS_WB3_KUBECONFIG }}
+        run: |
+          set -euo pipefail
+          test -n "${KUBECONFIG_VALUE}"
+          mkdir -p "${HOME}/.kube"
+          KUBECONFIG_PATH="${HOME}/.kube/config" python3 - <<'PY'
+          import base64
+          import binascii
+          import os
+          from pathlib import Path
+
+          value = os.environ["KUBECONFIG_VALUE"].encode()
+          try:
+              decoded = base64.b64decode(b"".join(value.split()), validate=True)
+              data = decoded if decoded.lstrip().startswith(b"apiVersion:") else value
+          except binascii.Error:
+              data = value
+          Path(os.environ["KUBECONFIG_PATH"]).write_bytes(data)
+          PY
+          chmod 600 "${HOME}/.kube/config"
+          kubectl --context cks-wb3 get nodes >/dev/null
+
+      - name: Run TrainerRank GPU validation
+        run: |
+          set -euo pipefail
+          sky_venv="${RUNNER_TEMP}/skypilot"
+          uv venv --python 3.10 "${sky_venv}"
+          uv pip install --python "${sky_venv}/bin/python" \
+            'skypilot[kubernetes,remote]==0.12.0' 'kubernetes==34.1.0'
+          sky="${sky_venv}/bin/sky"
+          cluster="trainer-rank-gpu-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          cleanup() { "${sky}" down -y "${cluster}" || true; }
+          trap cleanup EXIT
+          "${sky}" check kubernetes
+          "${sky}" launch -y -c "${cluster}" \
+            --infra "${SKY_INFRA}" \
+            scripts/ci/trainer-rank-gpu.sky.yaml
+
+  gate:
+    name: trainer-rank-gpu-validation
+    needs: [classify, validate]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - env:
+          CLASSIFY_RESULT: ${{ needs.classify.result }}
+          REQUIRED: ${{ needs.classify.outputs.required }}
+          RESULT: ${{ needs.validate.result }}
+        run: |
+          if [ "${CLASSIFY_RESULT}" != "success" ]; then
+            echo "TrainerRank GPU classification failed." >&2
+            exit 1
+          fi
+          if [ "${REQUIRED}" = "true" ] && [ "${RESULT}" != "success" ]; then
+            echo "TrainerRank GPU validation required but result was ${RESULT}." >&2
+            exit 1
+          fi
+          if [ "${REQUIRED}" = "true" ]; then
+            echo "TrainerRank GPU validation passed."
+          else
+            echo "TrainerRank GPU validation was not required."
+          fi

@@ -1,0 +1,27 @@
+name: trainer-rank-gpu-validation
+
+workdir: .
+
+resources:
+  accelerators: H200:2
+  image_id: docker:docker.io/bradhiltonnw/art-gpu:latest
+
+setup: |
+  uv sync --frozen --extra megatron --group dev
+
+run: |
+  timeout --signal=TERM --kill-after=30s 20m \
+    bash scripts/ci/trainer-rank-gpu-tests.sh
+
+config:
+  kubernetes:
+    pod_config:
+      spec:
+        schedulerName: binpack-scheduler
+        activeDeadlineSeconds: 3600
+        containers:
+          - name: ray-node
+            imagePullPolicy: Always
+            env:
+              - name: UV_LINK_MODE
+                value: copy
