@@ -54,20 +54,11 @@ def _merge_stage_kernel(
     previous_lse = tl.load(accum_lse_ptr + accum_lse_offset)
     both_empty = (previous_lse == float("-inf")) & (stage_lse == float("-inf"))
     maximum = tl.maximum(previous_lse, stage_lse)
-    merged_lse = maximum + tl.log(
-        tl.exp(previous_lse - maximum) + tl.exp(stage_lse - maximum)
-    )
+    previous_weight = tl.exp(previous_lse - maximum)
+    stage_weight = tl.exp(stage_lse - maximum)
+    normalizer = previous_weight + stage_weight
+    merged_lse = maximum + tl.log(normalizer)
     merged_lse = tl.where(both_empty, float("-inf"), merged_lse)
-    previous_delta = tl.where(
-        (previous_lse == float("-inf")) & (merged_lse == float("-inf")),
-        float("-inf"),
-        previous_lse - merged_lse,
-    )
-    stage_delta = tl.where(
-        (stage_lse == float("-inf")) & (merged_lse == float("-inf")),
-        float("-inf"),
-        stage_lse - merged_lse,
-    )
     previous = tl.load(
         accum_out_ptr
         + owner * stride_aoq
@@ -84,7 +75,8 @@ def _merge_stage_kernel(
         mask=mask,
         other=0.0,
     )
-    merged = previous * tl.exp(previous_delta) + stage * tl.exp(stage_delta)
+    merged = (previous * previous_weight + stage * stage_weight) / normalizer
+    merged = tl.where(both_empty, 0.0, merged)
     tl.store(
         accum_out_ptr
         + owner * stride_aoq

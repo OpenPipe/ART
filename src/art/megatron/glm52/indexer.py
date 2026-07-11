@@ -33,6 +33,39 @@ class Glm52RoutedTopk(BaseModel):
 
 
 @triton.jit
+def _canonicalize_topk_kernel(
+    ids_ptr,
+    topk: tl.constexpr,
+    block: tl.constexpr,
+):
+    row = tl.program_id(0)
+    columns = tl.arange(0, block)
+    ids = tl.load(
+        ids_ptr + row * topk + columns,
+        mask=columns < topk,
+        other=0x7FFF_FFFF,
+    )
+    ids = tl.where(ids >= 0, ids, 0x7FFF_FFFF)
+    ids = tl.sort(ids)
+    tl.store(
+        ids_ptr + row * topk + columns,
+        tl.where(ids == 0x7FFF_FFFF, -1, ids),
+        mask=columns < topk,
+    )
+
+
+def _canonicalize_topk_(ids: torch.Tensor) -> None:
+    topk = int(ids.shape[-1])
+    block = triton.next_power_of_2(topk)
+    _canonicalize_topk_kernel[(ids.numel() // topk,)](
+        ids,
+        topk=topk,  # ty: ignore[invalid-argument-type]
+        block=block,  # ty: ignore[invalid-argument-type]
+        num_warps=4,  # ty: ignore[unknown-argument]
+    )
+
+
+@triton.jit
 def _round_bf16(value):
     bits = value.to(tl.int32, bitcast=True)
     rounded = bits + 0x7FFF + ((bits >> 16) & 1)
@@ -490,6 +523,7 @@ def context_parallel_tree_topk(
         del q_stage, weights_stage, k_stage
     drain_stage_fetches(works)
     del best_scores
+    _canonicalize_topk_(best_ids)
     route_map = state.route_by_global_id
     if route_map is None:
         raise RuntimeError("GLM-5.2 CP route map is missing.")
@@ -639,4 +673,5 @@ def streaming_tree_topk(
                             topk=topk,
                         )
                 result[row.row_index, q_start:q_end, : best_ids.shape[1]] = best_ids
+    _canonicalize_topk_(result)
     return result
