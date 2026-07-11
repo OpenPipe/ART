@@ -9,6 +9,42 @@ import torch
 from art.megatron.context_parallel.builder import build_prefix_tree_attention_spec
 from art.megatron.context_parallel.types import AttnMaskKind
 
+# Preserve the CUDA float32 `pow` rounding used by the reference GLM RoPE.
+_ROPE_INV_FREQ_BITS = (
+    1065353216,
+    1058785356,
+    1052612689,
+    1046920992,
+    1041001025,
+    1034609764,
+    1028652027,
+    1023221913,
+    1016727752,
+    1010530219,
+    1004808260,
+    998954723,
+    992541049,
+    986556035,
+    981092721,
+    974671434,
+    968449313,
+    962697431,
+    956909580,
+    950473744,
+    944461757,
+    938965617,
+    932616387,
+    926369956,
+    920588484,
+    914865582,
+    908407833,
+    902369178,
+    896840579,
+    890562597,
+    884292128,
+    878481401,
+)
+
 
 class Glm52IndexerSlice(BaseModel):
     model_config = ConfigDict(frozen=True)
@@ -76,8 +112,8 @@ def _rope_state(
         dtype=torch.int64,
         non_blocking=True,
     ).contiguous()
-    inv_freq = 1.0 / (
-        8_000_000 ** (torch.arange(0, 64, 2, device=device, dtype=torch.float32) / 64)
+    inv_freq = torch.tensor(_ROPE_INV_FREQ_BITS, device=device, dtype=torch.int32).view(
+        torch.float32
     )
     frequencies = position_ids_device.float().unsqueeze(-1) * inv_freq
     return (

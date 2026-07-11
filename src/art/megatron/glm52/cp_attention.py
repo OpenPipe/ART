@@ -54,6 +54,8 @@ def _forward(
         indices[:, :valid].contiguous(),
         scale=scale,
     )
+    if valid == q.shape[1]:
+        return combined_out, combined_out[0], lse[0]
     output = q.new_zeros((q.shape[0], q.shape[1], q.shape[2], _LATENT_DIM))
     output[:, :valid].copy_(combined_out)
     return output, combined_out[0], lse[0]
@@ -99,8 +101,9 @@ def _backward(
             )
     for reduction in reductions:
         reduction.wait_post_process()
-    dq_padded = torch.zeros_like(q)
-    dkv_padded = torch.zeros_like(kv)
+    if valid == q.shape[1]:
+        return dq, dkv.unsqueeze(0)
+    dq_padded, dkv_padded = torch.zeros_like(q), torch.zeros_like(kv)
     dq_padded[:, :valid].copy_(dq)
     dkv_padded[0, :valid].copy_(dkv)
     return dq_padded, dkv_padded
