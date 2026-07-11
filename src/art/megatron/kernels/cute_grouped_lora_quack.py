@@ -350,6 +350,18 @@ class _QuackGroupedLoraFn(torch.autograd.Function):
         scale: float,
         residual: torch.Tensor | None,
     ) -> torch.Tensor:
+        has_residual = residual is not None
+        if residual is not None:
+            if not residual.is_contiguous():
+                raise ValueError("Residual grouped LoRA requires contiguous output")
+            residual = torch.empty(
+                0, device=residual.device, dtype=residual.dtype
+            ).set_(
+                residual.untyped_storage(),
+                residual.storage_offset(),
+                residual.size(),
+                residual.stride(),
+            )
         expert_offsets = _build_expert_offsets(counts, device=x.device)
         actual_rank = a_t.shape[-1]
         effective_rank = _effective_rank(actual_rank)
@@ -376,14 +388,11 @@ class _QuackGroupedLoraFn(torch.autograd.Function):
             alpha=scale,
             residual=residual,
         )
-        if residual is not None:
-            ctx.mark_dirty(residual)
-
         ctx.save_for_backward(x, a_t_eff, b_t_eff, tmp, expert_offsets)
         ctx.actual_rank = actual_rank
         ctx.effective_rank = effective_rank
         ctx.scale = scale
-        ctx.has_residual = residual is not None
+        ctx.has_residual = has_residual
         return out
 
     @staticmethod
@@ -674,7 +683,7 @@ def quack_grouped_lora_residual(
     counts: list[int] | torch.Tensor,
     scale: float = 1.0,
 ) -> torch.Tensor:
-    """Accumulate grouped LoRA into a caller-owned base output."""
+    """Consume a base output and accumulate grouped LoRA into its storage."""
     counts_tensor = _validate_inputs(x, a_t, b_t, counts)
     expected = (x.shape[0], b_t.shape[-1])
     if residual.shape != expected:
