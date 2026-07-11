@@ -415,13 +415,14 @@ def sparse_mla_backward(
     scale: float,
     route_offsets: torch.Tensor | None = None,
     stage_index: int = 0,
+    fp32_grad_q: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     _validate_inputs(q, kv, indices, route_offsets, stage_index)
     grad_out = grad_out.contiguous()
     batch, q_tokens, heads, _ = q.shape
     kv_tokens = int(kv.shape[1])
     topk = int(indices.shape[-1])
-    grad_q = torch.empty_like(q)
+    grad_q = torch.empty_like(q, dtype=torch.float32 if fp32_grad_q else q.dtype)
     grad_kv_fp32 = torch.zeros_like(kv, dtype=torch.float32)
     _sparse_mla_bwd_kernel[(batch * q_tokens, triton.cdiv(heads, _HEAD_BLOCK))](
         q,

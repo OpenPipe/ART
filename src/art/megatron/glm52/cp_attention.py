@@ -192,7 +192,7 @@ def _backward(
     q_flat = q[0, :valid].contiguous()
     kv_flat = kv[0, :valid].contiguous()
     grad_flat = grad_output[0, :valid].contiguous()
-    dq = torch.zeros_like(q_flat)
+    dq = torch.zeros_like(q_flat, dtype=torch.float32)
     dkv = torch.zeros_like(kv_flat)
     fetches = launch_remote_stage_fetches(kv_flat, cp_state)
     reductions = []
@@ -217,6 +217,7 @@ def _backward(
                 scale=scale,
                 route_offsets=offsets_stage.unsqueeze(0),
                 stage_index=int(stage.stage_index),
+                fp32_grad_q=True,
             )
             dq.index_add_(0, stage.owner_q_rows, dq_stage[0])
             dkv_stage = dkv_stage[0]
