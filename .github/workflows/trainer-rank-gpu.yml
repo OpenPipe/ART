@@ -66,8 +66,10 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends socat
           kubectl_version="$(curl -LsSf https://dl.k8s.io/release/stable.txt)"
-          curl -LsSf -o kubectl "https://dl.k8s.io/release/${kubectl_version}/bin/linux/amd64/kubectl"
-          sudo install -m 0755 kubectl /usr/local/bin/kubectl
+          kubectl_path="${RUNNER_TEMP}/kubectl"
+          curl -LsSf -o "${kubectl_path}" \
+            "https://dl.k8s.io/release/${kubectl_version}/bin/linux/amd64/kubectl"
+          sudo install -m 0755 "${kubectl_path}" /usr/local/bin/kubectl
 
       - name: Configure Kubernetes
         env:
