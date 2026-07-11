@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+# Temporary no-op used to validate the manual TrainerRank GPU workflow.
 from dataclasses import dataclass
 
 import torch
