@@ -11,7 +11,7 @@ import torch
 
 from art.megatron.kernels.cute_grouped_lora_quack import quack_grouped_lora_residual
 from art.megatron.lora import (
-    GRAD_SYNC_OP_NONE,
+    GRAD_SYNC_OP_SUM,
     LORA_ALPHA,
     TP_DEFAULT_GRAD_SYNC_DOMAIN,
     LoRA,
@@ -35,7 +35,7 @@ def _replicated_lora(
     weight = linear.weight
     parallel = LoRAParallelSpec(
         grad_sync_domain=TP_DEFAULT_GRAD_SYNC_DOMAIN,
-        grad_sync_op=GRAD_SYNC_OP_NONE,
+        grad_sync_op=GRAD_SYNC_OP_SUM,
     )
     return LoRA(
         adapter_model_prefix=adapter_model_prefix,

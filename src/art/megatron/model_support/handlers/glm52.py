@@ -96,10 +96,11 @@ class Glm52Handler(DefaultMoeHandler):
             int(getattr(provider, "expert_model_parallel_size", 1) or 1) == 1
             and getattr(provider, "moe_token_dispatcher_type", None) == "alltoall"
         )
+        flags = ("mlp_forward", "moe_forward")
+        if ep1_alltoall:
+            flags = (*flags, "moe_preprocess")
         return CompileWorkaroundConfig(
-            flags=_compile_workaround_flags_for_provider(
-                provider, ("moe_preprocess",) if ep1_alltoall else ()
-            ),
+            flags=_compile_workaround_flags_for_provider(provider, flags),
             shared_expert_state=self._shared_expert_compile_state(provider),
         )
 

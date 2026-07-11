@@ -307,6 +307,10 @@ def install_torch_compile_workarounds(
         moe_layer.MoELayer.preprocess = _disable(moe_layer.MoELayer.preprocess)
     if "moe_forward" in flags:
         moe_layer.MoELayer.forward = _disable(moe_layer.MoELayer.forward)
+    if "mlp_forward" in flags:
+        from megatron.core.transformer import mlp
+
+        mlp.MLP.forward = _disable(mlp.MLP.forward)
     if "te_grouped_mlp_forward" in flags:
         moe_experts.TEGroupedMLP.forward = _disable(moe_experts.TEGroupedMLP.forward)
     _INSTALLED_CONFIG = installed_config
