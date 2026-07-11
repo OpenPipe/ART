@@ -153,6 +153,10 @@ class TrainingRuntime(BaseModel):
     optimizer: Any | None
     optimizer_config: OptimizerConfig
     optimizer_persistent: bool = True
+    resident_training_session_id: str | None = None
+    resident_policy_step: int | None = None
+    optimizer_state_loaded: bool = False
+    adapter_export_template: dict[str, torch.Tensor] | None = None
     transformer_layers_compiled: bool = False
     rank: int
     world_size: int
@@ -521,6 +525,7 @@ def run_megatron_rl_job(
     next_step_first_micro = None
     next_step_first_ref_logprobs = None
     step_result = None
+    job_succeeded = False
 
     try:
         configure_moe_routing_replay(
@@ -528,11 +533,7 @@ def run_megatron_rl_job(
             replay_bundle_path=job.moe_routing_replay_path,
             strict=job.moe_routing_replay_strict,
         )
-        adapter_model = _load_lora_and_optimizer(
-            runtime,
-            lora_path=job.lora_path,
-            optimizer_state_path=job.optimizer_state_path,
-        )
+        adapter_model = _prepare_rl_training_state(runtime, job)
 
         print0(
             runtime.rank,
@@ -556,7 +557,6 @@ def run_megatron_rl_job(
         ref_logprobs_by_index = _prepare_kl_reference_logprobs(
             runtime=runtime,
             job=job,
-            adapter_model=adapter_model,
             packed_tensors=packed_tensors,
             num_sequences=num_sequences,
             num_steps=num_steps,
@@ -670,7 +670,15 @@ def run_megatron_rl_job(
                 None if isinstance(job, MegatronMergedTrainingJob) else job.log_path
             ),
         )
+        runtime.resident_training_session_id = job.training_session_id
+        runtime.resident_policy_step = job.step
+        runtime.optimizer_state_loaded = True
+        job_succeeded = True
     finally:
+        if not job_succeeded:
+            runtime.resident_training_session_id = None
+            runtime.resident_policy_step = None
+            runtime.optimizer_state_loaded = False
         if packed_tensors is not None:
             del packed_tensors
         if adapter_model is not None:
@@ -925,6 +933,62 @@ def _load_lora_and_optimizer(
             "- resetting optimizer for new run",
         )
         _eager_initialize_optimizer_state(runtime.optimizer)
+    return adapter_model
+
+
+def _prepare_rl_training_state(
+    runtime: TrainingRuntime,
+    job: MegatronTrainingJob | MegatronMergedTrainingJob,
+) -> dict[str, torch.Tensor]:
+    state_is_resident = (
+        runtime.optimizer_persistent
+        and runtime.resident_training_session_id == job.training_session_id
+        and runtime.resident_policy_step == job.source_policy_step
+        and runtime.optimizer_state_loaded
+    )
+    if state_is_resident:
+        if runtime.adapter_export_template is None:
+            raise RuntimeError("Resident Megatron state has no LoRA export template")
+        return runtime.adapter_export_template
+
+    replacing_resident_state = runtime.resident_training_session_id is not None
+    runtime.resident_training_session_id = None
+    runtime.resident_policy_step = None
+    runtime.optimizer_state_loaded = False
+    if replacing_resident_state or not runtime.optimizer_persistent:
+        runtime.optimizer = None
+
+    adapter_model = _load_adapter_into_model(
+        runtime.model,
+        job.lora_path,
+        runtime.rank,
+        handler=runtime.model_support_handler,
+        optimizer=runtime.optimizer,
+    )
+    if runtime.optimizer is None:
+        runtime.optimizer = _build_optimizer(runtime.model, runtime.optimizer_config)
+    assert runtime.optimizer is not None
+
+    optimizer_shard_path = os.path.join(
+        job.optimizer_state_path,
+        f"{runtime.rank + 1:02d}-of-{runtime.world_size:02d}.pt",
+    )
+    if os.path.exists(optimizer_shard_path):
+        print0(runtime.rank, "Loading optimizer state from", optimizer_shard_path)
+        runtime.optimizer.load_state_dict(torch.load(optimizer_shard_path))
+    else:
+        print0(
+            runtime.rank,
+            "No optimizer state found at",
+            optimizer_shard_path,
+            "- resetting optimizer for new run",
+        )
+        _eager_initialize_optimizer_state(runtime.optimizer)
+
+    runtime.adapter_export_template = adapter_model
+    runtime.resident_training_session_id = job.training_session_id
+    runtime.resident_policy_step = job.source_policy_step
+    runtime.optimizer_state_loaded = True
     return adapter_model
 
 
@@ -1512,7 +1576,6 @@ def _prepare_kl_reference_logprobs(
     *,
     runtime: TrainingRuntime,
     job: MegatronTrainingJob | MegatronMergedTrainingJob,
-    adapter_model: dict[str, torch.Tensor],
     packed_tensors: PackedTensors,
     num_sequences: int,
     num_steps: int,
@@ -1536,8 +1599,13 @@ def _prepare_kl_reference_logprobs(
         job.lora_path
     )
     loaded_ref_adapter = False
+    restore_adapter = None
     try:
         if adapter_swapped:
+            restore_adapter = load_lora_tensors_for_megatron(
+                job.lora_path,
+                handler=runtime.model_support_handler,
+            )
             _load_adapter_into_model(
                 runtime.model,
                 ref_adapter_path,
@@ -1558,9 +1626,10 @@ def _prepare_kl_reference_logprobs(
     finally:
         if loaded_ref_adapter:
             assert runtime.optimizer is not None
+            assert restore_adapter is not None
             load_adapter_into_model(
                 runtime.model,
-                adapter_model,
+                restore_adapter,
                 runtime.optimizer,
                 model_support_handler=runtime.model_support_handler,
             )
@@ -2015,6 +2084,10 @@ def _run_service_loop(runtime: TrainingRuntime) -> None:
     def after_job() -> None:
         if not runtime.optimizer_persistent:
             runtime.optimizer = None
+            runtime.resident_training_session_id = None
+            runtime.resident_policy_step = None
+            runtime.optimizer_state_loaded = False
+            runtime.adapter_export_template = None
         weight_offload.after_job()
 
     worker_error = False

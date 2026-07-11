@@ -1120,6 +1120,8 @@ class MegatronService:
                     job: MegatronTrainingJob | MegatronMergedTrainingJob = (
                         MegatronMergedTrainingJob(
                             step=next_step,
+                            source_policy_step=self._latest_step,
+                            training_session_id=os.path.realpath(self.output_dir),
                             lora_path=staging_lora_path,
                             allow_unvalidated_arch=self._allow_unvalidated_arch,
                             optimizer_state_path=self._get_optimizer_state_path("rl"),
@@ -1142,6 +1144,8 @@ class MegatronService:
                 else:
                     job = MegatronTrainingJob(
                         step=next_step,
+                        source_policy_step=self._latest_step,
+                        training_session_id=os.path.realpath(self.output_dir),
                         lora_path=staging_lora_path,
                         allow_unvalidated_arch=self._allow_unvalidated_arch,
                         optimizer_state_path=self._get_optimizer_state_path("rl"),
@@ -1188,6 +1192,8 @@ class MegatronService:
             job_path, log_path = self._create_megatron_job_paths()
             job = MegatronTrainingJob(
                 step=next_step,
+                source_policy_step=self._latest_step,
+                training_session_id=os.path.realpath(self.output_dir),
                 lora_path=staging_lora_path,
                 allow_unvalidated_arch=self._allow_unvalidated_arch,
                 optimizer_state_path=self._get_optimizer_state_path("rl"),

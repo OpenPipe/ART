@@ -28,6 +28,8 @@ class MergedWeightTransferSpec(BaseModel):
 
 class _MegatronTrainingJobBase(BaseModel):
     step: int = Field(default=0, ge=0)
+    source_policy_step: int = Field(ge=0)
+    training_session_id: str
     lora_path: str
     allow_unvalidated_arch: bool = False
     optimizer_state_path: str

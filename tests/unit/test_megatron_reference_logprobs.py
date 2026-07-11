@@ -96,7 +96,6 @@ def test_prepare_kl_reference_logprobs_requires_reference_path() -> None:
         megatron_train._prepare_kl_reference_logprobs(
             runtime=cast(megatron_train.TrainingRuntime, runtime),
             job=cast(megatron_train.MegatronTrainingJob, job),
-            adapter_model={},
             packed_tensors=_packed_inputs(),
             num_sequences=1,
             num_steps=1,
