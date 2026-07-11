@@ -128,7 +128,12 @@ def _sparse_mla_fwd_kernel(
         probabilities = tl.where(valid, probabilities, 0.0)
         row_sum = row_sum * alpha + tl.sum(probabilities, axis=1)
         acc *= alpha[:, None]
-        acc += tl.dot(probabilities.to(tl.float16), kv_latent.to(tl.float16))
+        probabilities_hi = probabilities.to(tl.float16)
+        probabilities_lo = (probabilities - probabilities_hi.to(tl.float32)).to(
+            tl.float16
+        )
+        kv_f16 = kv_latent.to(tl.float16)
+        acc += tl.dot(probabilities_hi, kv_f16) + tl.dot(probabilities_lo, kv_f16)
         row_max = next_max
         index_start += block_i
 
