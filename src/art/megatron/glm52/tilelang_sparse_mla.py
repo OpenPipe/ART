@@ -58,10 +58,10 @@ with _preserve_env():
     tilelang: Any = importlib.import_module("tilelang")
     T: Any = importlib.import_module("tilelang.language")
 
-_HEADS = 64
 _LATENT = 512
 _ROPE = 64
 _DIM = _LATENT + _ROPE
+_HEAD_BLOCK = 16
 _LOG2_E = 1.4426950408889634
 _LN_2 = 0.6931471805599453
 
@@ -73,16 +73,16 @@ _LN_2 = 0.6931471805599453
         tilelang.PassConfigKey.TL_DISABLE_WARP_SPECIALIZED: True,
     },
 )
-def _forward(topk, scale, block_i=64, num_stages=2, threads=256):
+def _forward(heads, topk, scale, block_i=64, num_stages=2, threads=256):
     assert topk % block_i == 0
     batch = T.dynamic("batch")
     q_tokens = T.dynamic("q_tokens")
     kv_tokens = T.dynamic("kv_tokens")
-    q_shape = [batch, q_tokens, _HEADS, _DIM]
+    q_shape = [batch, q_tokens, heads, _DIM]
     kv_shape = [batch, kv_tokens, _DIM]
     indices_shape = [batch, q_tokens, topk]
-    out_shape = [batch, q_tokens, _HEADS, _LATENT]
-    lse_shape = [batch, q_tokens, _HEADS]
+    out_shape = [batch, q_tokens, heads, _LATENT]
+    lse_shape = [batch, q_tokens, heads]
     blocks = topk // block_i
     scale_log2 = scale * _LOG2_E
 
@@ -95,20 +95,20 @@ def _forward(topk, scale, block_i=64, num_stages=2, threads=256):
         Lse: T.Tensor(lse_shape, T.float32),  # type: ignore
     ):
         with T.Kernel(q_tokens, batch, threads=threads) as (q_i, b_i):
-            q_shared = T.alloc_shared([_HEADS, _LATENT], T.bfloat16)
-            q_rope_shared = T.alloc_shared([_HEADS, _ROPE], T.bfloat16)
+            q_shared = T.alloc_shared([heads, _LATENT], T.bfloat16)
+            q_rope_shared = T.alloc_shared([heads, _ROPE], T.bfloat16)
             kv_shared = T.alloc_shared([block_i, _LATENT], T.bfloat16)
             kv_rope_shared = T.alloc_shared([block_i, _ROPE], T.bfloat16)
-            scores_shared = T.alloc_shared([_HEADS, block_i], T.bfloat16)
-            out_shared = T.alloc_shared([_HEADS, _LATENT], T.bfloat16)
+            scores_shared = T.alloc_shared([heads, block_i], T.bfloat16)
+            out_shared = T.alloc_shared([heads, _LATENT], T.bfloat16)
             valid = T.alloc_fragment([block_i], "bool")
-            scores = T.alloc_fragment([_HEADS, block_i], T.float32)
-            output = T.alloc_fragment([_HEADS, _LATENT], T.float32)
-            row_sum = T.alloc_fragment([_HEADS], T.float32)
-            block_sum = T.alloc_fragment([_HEADS], T.float32)
-            row_max = T.alloc_fragment([_HEADS], T.float32)
-            previous_max = T.alloc_fragment([_HEADS], T.float32)
-            alpha = T.alloc_fragment([_HEADS], T.float32)
+            scores = T.alloc_fragment([heads, block_i], T.float32)
+            output = T.alloc_fragment([heads, _LATENT], T.float32)
+            row_sum = T.alloc_fragment([heads], T.float32)
+            block_sum = T.alloc_fragment([heads], T.float32)
+            row_max = T.alloc_fragment([heads], T.float32)
+            previous_max = T.alloc_fragment([heads], T.float32)
+            alpha = T.alloc_fragment([heads], T.float32)
 
             T.copy(Q[b_i, q_i, :, :_LATENT], q_shared)
             T.copy(Q[b_i, q_i, :, _LATENT:], q_rope_shared)
@@ -126,7 +126,7 @@ def _forward(topk, scale, block_i=64, num_stages=2, threads=256):
                     kv_rope_shared[i, d] = KV[
                         b_i, Indices[b_i, q_i, block * block_i + i], _LATENT + d
                     ]
-                for h, i in T.Parallel(_HEADS, block_i):
+                for h, i in T.Parallel(heads, block_i):
                     scores[h, i] = T.if_then_else(valid[i], 0, -T.infinity(T.float32))
                 T.gemm(
                     q_shared,
@@ -144,24 +144,24 @@ def _forward(topk, scale, block_i=64, num_stages=2, threads=256):
                 )
                 T.copy(row_max, previous_max)
                 T.reduce_max(scores, row_max, dim=1, clear=False)
-                for h in T.Parallel(_HEADS):
+                for h in T.Parallel(heads):
                     row_max[h] = T.max(row_max[h], previous_max[h])
                     alpha[h] = T.exp2((previous_max[h] - row_max[h]) * scale_log2)
-                for h, i in T.Parallel(_HEADS, block_i):
+                for h, i in T.Parallel(heads, block_i):
                     scores[h, i] = T.exp2((scores[h, i] - row_max[h]) * scale_log2)
                 T.reduce_sum(scores, block_sum, dim=1)
-                for h in T.Parallel(_HEADS):
+                for h in T.Parallel(heads):
                     row_sum[h] = row_sum[h] * alpha[h] + block_sum[h]
-                for h, d in T.Parallel(_HEADS, _LATENT):
+                for h, d in T.Parallel(heads, _LATENT):
                     output[h, d] *= alpha[h]
                 T.copy(scores, scores_shared)
                 T.gemm(
                     scores_shared, kv_shared, output, policy=T.GemmWarpPolicy.FullRow
                 )
 
-            for h, d in T.Parallel(_HEADS, _LATENT):
+            for h, d in T.Parallel(heads, _LATENT):
                 output[h, d] /= T.max(row_sum[h], 1e-20)
-            for h in T.Parallel(_HEADS):
+            for h in T.Parallel(heads):
                 row_sum[h] = T.if_then_else(
                     row_sum[h] > 0,
                     (T.log2(row_sum[h]) + row_max[h] * scale_log2) * _LN_2,
@@ -175,18 +175,18 @@ def _forward(topk, scale, block_i=64, num_stages=2, threads=256):
 
 
 @tilelang.jit(out_idx=[-1])
-def _delta(block=32, num_stages=5):
+def _delta(heads, block=32, num_stages=5):
     batch = T.dynamic("batch")
     tokens = T.dynamic("tokens")
-    shape = [batch, tokens, _HEADS, _LATENT]
+    shape = [batch, tokens, heads, _LATENT]
 
     @T.prim_func
     def main(
         Output: T.Tensor(shape, T.bfloat16),  # type: ignore
         GradOutput: T.Tensor(shape, T.bfloat16),  # type: ignore
-        Delta: T.Tensor([batch, tokens, _HEADS], T.float32),  # type: ignore
+        Delta: T.Tensor([batch, tokens, heads], T.float32),  # type: ignore
     ):
-        with T.Kernel(_HEADS, T.ceildiv(tokens, block), batch) as (h_i, t_i, b_i):
+        with T.Kernel(heads, T.ceildiv(tokens, block), batch) as (h_i, t_i, b_i):
             output = T.alloc_fragment([block, block], T.float32)
             grad = T.alloc_fragment([block, block], T.float32)
             product = T.alloc_fragment([block, block], T.float32)
@@ -227,6 +227,7 @@ def _delta(block=32, num_stages=5):
     },
 )
 def _backward(
+    heads,
     batch,
     q_tokens,
     kv_tokens,
@@ -239,11 +240,11 @@ def _backward(
     # TileLang 0.1.10 mislowers dynamic indirect atomic destinations; packed
     # extents are stable across layers and compile once per training topology.
     assert topk % block_i == 0
-    q_shape = [batch, q_tokens, _HEADS, _DIM]
+    q_shape = [batch, q_tokens, heads, _DIM]
     kv_shape = [batch, kv_tokens, 1, _DIM]
-    out_shape = [batch, q_tokens, _HEADS, _LATENT]
+    out_shape = [batch, q_tokens, heads, _LATENT]
     indices_shape = [batch, q_tokens, 1, topk]
-    row_shape = [batch, q_tokens, _HEADS]
+    row_shape = [batch, q_tokens, heads]
     blocks = topk // block_i
     scale_log2 = scale * _LOG2_E
     split_store = 2
@@ -260,15 +261,15 @@ def _backward(
         GradKV: T.Tensor(kv_shape, T.float32),  # type: ignore
     ):
         with T.Kernel(q_tokens, batch, threads=threads) as (q_i, b_i):
-            q_shared = T.alloc_shared([_HEADS, _LATENT], T.bfloat16)
-            q_rope_shared = T.alloc_shared([_HEADS, _ROPE], T.bfloat16)
+            q_shared = T.alloc_shared([heads, _LATENT], T.bfloat16)
+            q_rope_shared = T.alloc_shared([heads, _ROPE], T.bfloat16)
             kv_shared = T.alloc_shared([block_i, _LATENT], T.bfloat16)
             kv_rope_shared = T.alloc_shared([block_i, _ROPE], T.bfloat16)
-            grad_out_shared = T.alloc_shared([_HEADS, _LATENT], T.bfloat16)
-            probabilities_shared = T.alloc_shared([_HEADS, block_i], T.bfloat16)
-            grad_scores_shared = T.alloc_shared([_HEADS, block_i], T.bfloat16)
-            grad_q_shared = T.alloc_shared([_HEADS, _LATENT], T.bfloat16)
-            grad_q_rope_shared = T.alloc_shared([_HEADS, _ROPE], T.bfloat16)
+            grad_out_shared = T.alloc_shared([heads, _LATENT], T.bfloat16)
+            probabilities_shared = T.alloc_shared([heads, block_i], T.bfloat16)
+            grad_scores_shared = T.alloc_shared([heads, block_i], T.bfloat16)
+            grad_q_shared = T.alloc_shared([heads, _LATENT], T.bfloat16)
+            grad_q_rope_shared = T.alloc_shared([heads, _ROPE], T.bfloat16)
             grad_kv_shared = T.alloc_shared(
                 [block_i // split_store, _LATENT], T.float32
             )
@@ -276,10 +277,10 @@ def _backward(
                 [block_i // split_store, _ROPE], T.float32
             )
             valid = T.alloc_fragment([block_i], "bool")
-            probabilities = T.alloc_fragment([_HEADS, block_i], T.float32)
-            grad_probabilities = T.alloc_fragment([_HEADS, block_i], T.float32)
-            grad_q = T.alloc_fragment([_HEADS, _LATENT], T.float32)
-            grad_q_rope = T.alloc_fragment([_HEADS, _ROPE], T.float32)
+            probabilities = T.alloc_fragment([heads, block_i], T.float32)
+            grad_probabilities = T.alloc_fragment([heads, block_i], T.float32)
+            grad_q = T.alloc_fragment([heads, _LATENT], T.float32)
+            grad_q_rope = T.alloc_fragment([heads, _ROPE], T.float32)
             grad_kv = T.alloc_fragment([block_i, _LATENT], T.float32)
             grad_kv_rope = T.alloc_fragment([block_i, _ROPE], T.float32)
 
@@ -293,7 +294,7 @@ def _backward(
                 for i in T.Parallel(block_i):
                     index = Indices[b_i, q_i, 0, block * block_i + i]
                     valid[i] = (index >= 0) & (index < kv_tokens - 1)
-                for h, i in T.Parallel(_HEADS, block_i):
+                for h, i in T.Parallel(heads, block_i):
                     probabilities[h, i] = T.if_then_else(
                         valid[i], 0, -T.infinity(T.float32)
                     )
@@ -322,7 +323,7 @@ def _backward(
                     transpose_B=True,
                     policy=T.GemmWarpPolicy.FullCol,
                 )
-                for h, i in T.Parallel(_HEADS, block_i):
+                for h, i in T.Parallel(heads, block_i):
                     probabilities[h, i] = T.if_then_else(
                         valid[i] & (Lse[b_i, q_i, h] > -1e30),
                         T.exp2(
@@ -339,7 +340,7 @@ def _backward(
                     policy=T.GemmWarpPolicy.FullCol,
                     clear_accum=True,
                 )
-                for h, i in T.Parallel(_HEADS, block_i):
+                for h, i in T.Parallel(heads, block_i):
                     grad_probabilities[h, i] = (
                         probabilities[h, i]
                         * (grad_probabilities[h, i] - Delta[b_i, q_i, h])
@@ -427,9 +428,18 @@ def _backward(
 def forward(
     q: torch.Tensor, kv: torch.Tensor, indices: torch.Tensor, scale: float
 ) -> tuple[torch.Tensor, torch.Tensor]:
+    heads = q.shape[2]
+    kernel_heads = (heads + _HEAD_BLOCK - 1) // _HEAD_BLOCK * _HEAD_BLOCK
+    if kernel_heads != heads:
+        q = torch.cat(
+            (q, q.new_zeros((*q.shape[:2], kernel_heads - heads, q.shape[3]))), dim=2
+        )
     kv = torch.cat((kv, kv.new_zeros((kv.shape[0], 1, kv.shape[2]))), dim=1)
     with _preserve_env():
-        return _forward(int(indices.shape[-1]), float(scale))(q, kv, indices)
+        output, lse = _forward(int(kernel_heads), int(indices.shape[-1]), float(scale))(
+            q, kv, indices
+        )
+    return output[:, :, :heads], lse[:, :, :heads]
 
 
 def backward(
@@ -441,17 +451,32 @@ def backward(
     grad_output: torch.Tensor,
     scale: float,
 ) -> tuple[torch.Tensor, torch.Tensor]:
+    heads = q.shape[2]
+    kernel_heads = (heads + _HEAD_BLOCK - 1) // _HEAD_BLOCK * _HEAD_BLOCK
+    if kernel_heads != heads:
+        pad_shape = (*q.shape[:2], kernel_heads - heads)
+        q = torch.cat((q, q.new_zeros((*pad_shape, q.shape[3]))), dim=2)
+        output = torch.cat(
+            (output, output.new_zeros((*pad_shape, output.shape[3]))), dim=2
+        )
+        grad_output = torch.cat(
+            (grad_output, grad_output.new_zeros((*pad_shape, grad_output.shape[3]))),
+            dim=2,
+        )
+        lse = torch.cat((lse, lse.new_zeros(pad_shape)), dim=2)
     kv = torch.cat((kv, kv.new_zeros((kv.shape[0], 1, kv.shape[2]))), dim=1)
     with _preserve_env():
-        delta = _delta()(output, grad_output)
+        delta = _delta(int(kernel_heads))(output, grad_output)
         kv_grouped = kv.unsqueeze(2)
         indices_grouped = indices.unsqueeze(2)
         grad_kv = torch.zeros_like(kv_grouped, dtype=torch.float32)
         grad_q = _backward(
+            int(kernel_heads),
             int(q.shape[0]),
             int(q.shape[1]),
             int(kv.shape[1]),
             int(indices.shape[-1]),
             float(scale),
+            threads=min(256, int(kernel_heads) * 8),
         )(q, kv_grouped, grad_output, indices_grouped, lse, delta, grad_kv)
-    return grad_q, grad_kv[:, :-1].to(kv.dtype).squeeze(2)
+    return grad_q[:, :, :heads], grad_kv[:, :-1].to(kv.dtype).squeeze(2)

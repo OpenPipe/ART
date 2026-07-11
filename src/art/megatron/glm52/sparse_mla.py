@@ -6,7 +6,6 @@ import torch
 
 from art.megatron.glm52 import tilelang_sparse_mla
 
-_HEADS = 64
 _LATENT_DIM = 512
 _ROPE_DIM = 64
 _TOPK_BLOCK = 64
@@ -113,8 +112,8 @@ def _validate_inputs(
         raise ValueError(
             "GLM-5.2 sparse MLA expects q[B,S,H,576], kv[B,K,576], ids[B,S,T]."
         )
-    if q.shape[2:] != (_HEADS, _LATENT_DIM + _ROPE_DIM):
-        raise ValueError("GLM-5.2 sparse MLA requires 64 heads of dimension 576.")
+    if not 0 < q.shape[2] <= 64 or q.shape[3] != _LATENT_DIM + _ROPE_DIM:
+        raise ValueError("GLM-5.2 sparse MLA requires positive 576-dimensional heads.")
     if kv.shape[-1] != q.shape[-1] or q.shape[:2] != indices.shape[:2]:
         raise ValueError("GLM-5.2 sparse MLA tensor shapes do not match.")
     if q.shape[0] != kv.shape[0]:
