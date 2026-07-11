@@ -255,12 +255,14 @@ def _sparse_mla_bwd_kernel(
         mask=valid_heads,
         other=float("-inf"),
     )
-    delta = tl.sum(out.to(tl.float32) * grad_out.to(tl.float32), axis=1)
+    grad_scale = tl.max(tl.max(tl.abs(grad_out.to(tl.float32)), axis=1), axis=0)
+    grad_scale = tl.where(grad_scale > 0.0, grad_scale, 1.0)
+    delta = tl.sum(out.to(tl.float32) * grad_out.to(tl.float32), axis=1) / grad_scale
     grad_q_latent = tl.zeros((block_h, latent_dim), tl.float32)
     grad_q_rope = tl.zeros((block_h, rope_dim), tl.float32)
     q_latent_f16 = q_latent.to(tl.float16)
     q_rope_f16 = q_rope.to(tl.float16)
-    grad_out_f16 = grad_out.to(tl.float16)
+    grad_out_f16 = (grad_out / grad_scale).to(tl.float16)
 
     if routed:
         route_base = batch * stride_xb + token * stride_xs
@@ -319,7 +321,7 @@ def _sparse_mla_bwd_kernel(
             + batch * stride_gkb
             + safe_indices[:, None] * stride_gks
             + latent[None, :] * stride_gkd,
-            grad_key_latent + grad_value,
+            (grad_key_latent + grad_value) * grad_scale,
             mask=valid_indices[:, None],
         )
         tl.atomic_add(
@@ -327,7 +329,7 @@ def _sparse_mla_bwd_kernel(
             + batch * stride_gkb
             + safe_indices[:, None] * stride_gks
             + (latent_dim + rope[None, :]) * stride_gkd,
-            grad_key_rope,
+            grad_key_rope * grad_scale,
             mask=valid_indices[:, None],
         )
         index_start += block_i
@@ -338,7 +340,7 @@ def _sparse_mla_bwd_kernel(
         + token * stride_gqs
         + h[:, None] * stride_gqh
         + latent[None, :] * stride_gqd,
-        grad_q_latent,
+        grad_q_latent * grad_scale,
         mask=valid_heads[:, None],
     )
     tl.store(
@@ -347,7 +349,7 @@ def _sparse_mla_bwd_kernel(
         + token * stride_gqs
         + h[:, None] * stride_gqh
         + (latent_dim + rope[None, :]) * stride_gqd,
-        grad_q_rope,
+        grad_q_rope * grad_scale,
         mask=valid_heads[:, None],
     )
 
