@@ -1,12 +1,9 @@
 from __future__ import annotations
 
+from array import array
 from typing import Literal
 
 import pydantic
-
-PACKED_GROUP_PHYSICAL_TOKENS_KEY = "_art_packed_group_physical_tokens"
-PACKED_GROUP_PROMPT_TOKENS_KEY = "_art_packed_group_prompt_tokens"
-PACKED_GROUP_COMPLETION_TOKENS_KEY = "_art_packed_group_completion_tokens"
 
 
 class PipelineRuntimeConfig(pydantic.BaseModel):
@@ -45,7 +42,9 @@ class PipelineAutotuneConfig(pydantic.BaseModel):
     initial_model_calls_per_inference_gpu: int = pydantic.Field(default=8, ge=1)
     initial_min_groups_per_packed_sequence: int = pydantic.Field(default=8, ge=1)
     initial_max_groups_per_packed_sequence: int = pydantic.Field(default=8, ge=1)
-    bootstrap_samples: int = pydantic.Field(default=256, ge=16)
+    packing_trials: int = pydantic.Field(default=64, ge=16)
+    packing_reservoir_multiplier: int = pydantic.Field(default=2, ge=2)
+    packing_reservoir_min_groups: int = pydantic.Field(default=32, ge=16)
     packing_history_steps: int = pydantic.Field(default=64, ge=1)
     packing_spill_prior_alpha: float = pydantic.Field(default=1.0, gt=0.0)
     packing_spill_prior_beta: float = pydantic.Field(default=8.0, gt=0.0)
@@ -98,11 +97,27 @@ class PipelineMetric(pydantic.BaseModel):
     tags: dict[str, str] = pydantic.Field(default_factory=dict)
 
 
-class PackedGroupObservation(pydantic.BaseModel):
+class PackingLeafShape(pydantic.BaseModel):
+    model_config = pydantic.ConfigDict(arbitrary_types_allowed=True)
+
+    token_ids: array
+    shareable_length: int = pydantic.Field(ge=0)
+
+    @pydantic.model_validator(mode="after")
+    def validate_shape(self) -> "PackingLeafShape":
+        if self.token_ids.typecode != "I":
+            raise ValueError("packing token_ids must use unsigned 32-bit storage")
+        if self.shareable_length > len(self.token_ids):
+            raise ValueError("shareable_length exceeds packing token count")
+        return self
+
+
+class PackedGroupShape(pydantic.BaseModel):
+    leaves: tuple[PackingLeafShape, ...] = pydantic.Field(min_length=1)
+
+
+class PackedGroupObservation(PackedGroupShape):
     step: int
-    physical_tokens: int = pydantic.Field(ge=1)
-    prompt_tokens: int = pydantic.Field(ge=0)
-    completion_tokens: int = pydantic.Field(ge=0)
 
 
 class TunerWindowStats(pydantic.BaseModel):
@@ -141,9 +156,10 @@ class TunerWindowStats(pydantic.BaseModel):
     packing_history_spill_probability_upper: float = 0.0
     packing_history_bad_padding_events: float = 0.0
     packing_history_bad_padding_probability_upper: float = 0.0
-    group_pack_token_samples: list[float] = pydantic.Field(
-        default_factory=list, exclude=True
-    )
+    packing_counterfactual_trials: float = 0.0
+    packing_counterfactual_spills: float = 0.0
+    packing_counterfactual_spill_probability_upper: float = 0.0
+    packing_marginal_tokens_mean: float = 0.0
 
 
 class TunerDecision(pydantic.BaseModel):

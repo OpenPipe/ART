@@ -20,10 +20,8 @@ import art
 from art import TrajectoryGroup
 from art.errors import LocalServingUnavailableError
 from art.pipeline_tuner import (
-    PACKED_GROUP_COMPLETION_TOKENS_KEY,
-    PACKED_GROUP_PHYSICAL_TOKENS_KEY,
-    PACKED_GROUP_PROMPT_TOKENS_KEY,
     PackedGroupObservation,
+    PackedGroupShape,
     PipelineAutotuneConfig,
     PipelineAutotunerAttachment,
     PipelineMetric,
@@ -490,21 +488,17 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
             return
         observations: list[PackedGroupObservation] = []
         for group in batch:
-            physical_tokens = group.metadata.get(PACKED_GROUP_PHYSICAL_TOKENS_KEY)
-            prompt_tokens = group.metadata.get(PACKED_GROUP_PROMPT_TOKENS_KEY)
-            completion_tokens = group.metadata.get(PACKED_GROUP_COMPLETION_TOKENS_KEY)
-            if (
-                not isinstance(physical_tokens, int)
-                or not isinstance(prompt_tokens, int)
-                or not isinstance(completion_tokens, int)
-            ):
+            shape = group._packed_group_shape
+            group._collect_packing_shape = False
+            group._packed_group_shape = None
+            if shape is None:
                 continue
+            if not isinstance(shape, PackedGroupShape):
+                raise RuntimeError("Backend returned an invalid packed-group shape")
             observations.append(
                 PackedGroupObservation(
                     step=step,
-                    physical_tokens=physical_tokens,
-                    prompt_tokens=prompt_tokens,
-                    completion_tokens=completion_tokens,
+                    leaves=shape.leaves,
                 )
             )
         groups = int(metrics.get("data/step_num_groups_trainable", 0.0) or 0)
@@ -816,12 +810,18 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
                     train_kwargs["kl_penalty_reference_step"] = (
                         kl_penalty_reference_step
                     )
+                if self.autotune.mode != "off":
+                    for group in batch:
+                        group._collect_packing_shape = True
                 result = await self.backend.train(
                     self.model,
                     batch,
                     **train_kwargs,
                 )
             except Exception:
+                for group in batch:
+                    group._collect_packing_shape = False
+                    group._packed_group_shape = None
                 self._status.note_training_end()
                 raise
             finally:

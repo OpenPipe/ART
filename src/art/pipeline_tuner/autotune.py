@@ -1,12 +1,17 @@
 from __future__ import annotations
 
 from collections import defaultdict
+from collections.abc import Sequence
 import math
+import random
 import statistics
+from typing import cast
 import warnings
 
 import pydantic
+from scipy.stats import beta as beta_distribution
 
+from ..preprocessing.pack import PrefixTreePackingPool
 from .config import (
     PackedGroupObservation,
     PipelineAutotuneConfig,
@@ -48,7 +53,10 @@ class PackingProjection(pydantic.BaseModel):
     groups: int
     spill_probability: float
     expected_padding_ratio: float
-    bootstrap_spill_probability: float = 0.0
+    counterfactual_trials: float = 0.0
+    counterfactual_spills: float = 0.0
+    counterfactual_spill_probability_upper: float = 0.0
+    marginal_tokens_mean: float = 0.0
     history_spill_probability_upper: float = 0.0
     history_trials: float = 0.0
     history_spills: float = 0.0
@@ -132,6 +140,13 @@ class PipelineAutotuner:
         return self.maybe_decide(int(rec.step))
 
     def on_packed_group(self, rec: PackedGroupObservation) -> None:
+        if self.packed_groups and rec.step > self.packed_groups[-1].step:
+            cutoff_step = rec.step - self.config.packing_history_steps + 1
+            self.packed_groups = [
+                observation
+                for observation in self.packed_groups
+                if observation.step >= cutoff_step
+            ]
         self.packed_groups.append(rec)
 
     def maybe_decide(self, step: int) -> TunerDecision | None:
@@ -189,6 +204,9 @@ class PipelineAutotuner:
         raw_train_capacity_tokens = _required_step_values(
             by_step, window_steps, "data/step_packed_train_tokens"
         )
+        non_padding_tokens = _required_step_values(
+            by_step, window_steps, "data/step_non_padding_train_tokens"
+        )
         train_capacity_tokens = [
             self._effective_train_capacity_tokens(
                 packed_sequences=int(round(packed_sequences)),
@@ -206,35 +224,32 @@ class PipelineAutotuner:
             if rec.step is None and t0 <= rec.t_s <= max(t1, t0 + 1e-6)
         ]
         window_step_set = set(window_steps)
-        pack_by_step: dict[int, list[float]] = defaultdict(list)
+        packed_group_counts: dict[int, int] = defaultdict(int)
         for obs in self.packed_groups:
             if obs.step in window_step_set:
-                pack_by_step[obs.step].append(float(obs.physical_tokens))
+                packed_group_counts[obs.step] += 1
         missing_packed_steps = [
             step
             for step, group_count in zip(window_steps, groups)
-            if group_count > 0 and not pack_by_step[step]
+            if group_count > 0 and packed_group_counts[step] != int(round(group_count))
         ]
         if missing_packed_steps:
             raise RuntimeError(
                 "Pipeline autotuner requires packed-group observations in every "
                 f"trainable decision-window step; missing steps {missing_packed_steps}."
             )
-        pack_samples = [
-            sample for step in window_steps for sample in pack_by_step.get(step, [])
-        ]
         padding_ratios = []
-        for step, capacity in zip(window_steps, train_capacity_tokens):
+        for capacity, non_padding in zip(
+            train_capacity_tokens, non_padding_tokens, strict=True
+        ):
             if capacity <= 0:
                 continue
-            non_padding = sum(pack_by_step.get(step, []))
             padding_ratios.append(max(0.0, (capacity - non_padding) / capacity))
         trainer_idle_frac = (collect / wall) if wall > 0 else 0.0
         padding_ratio_mean = _mean(padding_ratios)
         self._record_packing_outcomes(
             by_step=by_step,
             window_steps=window_steps,
-            pack_by_step=pack_by_step,
         )
         vllm_load = _vllm_load_stats(vllm_metrics, window_start_s=t0, window_end_s=t1)
         return TunerWindowStats(
@@ -285,7 +300,6 @@ class PipelineAutotuner:
             collect_batch_s_mean=_mean(collect_values),
             train_work_s_mean=max(0.0, _mean(wall_values) - _mean(collect_values)),
             train_capacity_tokens_mean=_mean(train_capacity_tokens),
-            group_pack_token_samples=pack_samples,
         )
 
     def _record_packing_outcomes(
@@ -293,12 +307,12 @@ class PipelineAutotuner:
         *,
         by_step: dict[int, dict[str, PipelineMetric]],
         window_steps: list[int],
-        pack_by_step: dict[int, list[float]],
     ) -> None:
         required = {
             "data/step_num_groups_trainable",
             "data/step_packed_sequences",
             "data/step_packed_train_tokens",
+            "data/step_non_padding_train_tokens",
         }
         for step in window_steps:
             if step in self._packing_outcome_steps:
@@ -324,7 +338,7 @@ class PipelineAutotuner:
                     "data/step_packed_train_tokens "
                     f"at step {step}."
                 )
-            non_padding_tokens = sum(pack_by_step.get(step, []))
+            non_padding_tokens = values["data/step_non_padding_train_tokens"].value
             padding_ratio = max(0.0, (train_tokens - non_padding_tokens) / train_tokens)
             self._packing_outcomes.append(
                 PackingOutcome(
@@ -623,12 +637,20 @@ class PipelineAutotuner:
         if stats is None:
             return current
         projections = self._packing_projections(settings, stats)
+        if not projections:
+            raise RuntimeError(
+                "Pipeline autotuner requires packing shapes before adapting batch size"
+            )
         allowed = [
             projection
             for projection in projections
             if projection.spill_probability <= self.config.target_spill_probability
         ]
-        observed = max(allowed, key=lambda p: p.groups).groups if allowed else current
+        observed = (
+            max(allowed, key=lambda p: p.groups).groups
+            if allowed
+            else min(projections, key=lambda p: p.groups).groups
+        )
         if observed > current:
             observed = min(
                 observed,
@@ -676,85 +698,143 @@ class PipelineAutotuner:
     def _packing_projections(
         self, settings: PipelineTuneSettings, stats: TunerWindowStats
     ) -> list[PackingProjection]:
-        samples = [
-            value for value in self._packing_projection_samples(stats) if value > 0
-        ]
-        capacity = float(self.packed_sequence_length)
-        if not samples:
+        reservoir = self._packing_reservoir(settings, stats)
+        if not reservoir:
             return []
-        mean_tokens = _mean(samples)
-        center = max(
-            1.0,
-            capacity * self.target_packed_sequences / max(1.0, mean_tokens),
+        pool = PrefixTreePackingPool(
+            [
+                [
+                    (cast(Sequence[int], leaf.token_ids), leaf.shareable_length)
+                    for leaf in observation.leaves
+                ]
+                for observation in reservoir
+            ]
         )
         current = max(1, settings.target_groups_per_step)
-        lo = max(1, int(math.floor(min(center, current) * 0.5)))
-        hi = min(
-            max(
-                current + 2,
-                int(math.ceil(max(center, current) * 1.5)),
-                int(math.ceil(current * 1.25)),
+        increase = max(
+            1,
+            min(
+                self.config.target_group_max_increase,
+                math.ceil(current * self.config.target_group_increase_fraction),
             ),
-            2000,
         )
-        sample_count = min(self.config.bootstrap_samples, max(16, len(samples) * 4))
+        lo = max(1, current // 2)
+        hi = min(len(reservoir), current + increase)
         history_risks = self._packing_history_risks(range(lo, hi + 1))
-        repeated: list[float] = []
-        while len(repeated) < sample_count + hi + 1:
-            repeated.extend(samples)
-        prefix = [0.0]
-        for value in repeated:
-            prefix.append(prefix[-1] + value)
-        projections: list[PackingProjection] = []
-        for groups in range(lo, hi + 1):
-            totals = [prefix[idx + groups] - prefix[idx] for idx in range(sample_count)]
-            packed_counts = [max(1, math.ceil(total / capacity)) for total in totals]
-            expected_capacity = _mean(
-                [
-                    self._effective_packed_slots(count) * capacity
-                    for count in packed_counts
-                ]
-            )
-            expected_tokens = _mean(totals)
-            bootstrap_spill_probability = _mean(
-                [
-                    1.0 if count > self.target_packed_sequences else 0.0
-                    for count in packed_counts
-                ]
+        projections: dict[int, PackingProjection] = {}
+
+        def project(groups: int) -> PackingProjection:
+            existing = projections.get(groups)
+            if existing is not None:
+                return existing
+            rng = random.Random((stats.end_step << 32) ^ groups)
+            spills = 0.0
+            marginal_tokens: list[float] = []
+            padding_ratios: list[float] = []
+            for _ in range(self.config.packing_trials):
+                selected = rng.sample(range(len(reservoir)), groups)
+                before = pool.estimate(
+                    selected[:-1], seq_len=self.packed_sequence_length
+                )
+                after = pool.estimate(selected, seq_len=self.packed_sequence_length)
+                spills += float(after.packed_sequences > self.target_packed_sequences)
+                marginal_tokens.append(
+                    float(after.non_padding_tokens - before.non_padding_tokens)
+                )
+                capacity = float(
+                    self._effective_packed_slots(after.packed_sequences)
+                    * self.packed_sequence_length
+                )
+                padding_ratios.append(
+                    max(0.0, (capacity - after.non_padding_tokens) / capacity)
+                )
+            trials = float(self.config.packing_trials)
+            counterfactual_risk = self._packing_probability_upper(
+                events=spills,
+                trials=trials,
             )
             history_risk = history_risks[groups]
-            projections.append(
-                PackingProjection(
-                    groups=groups,
-                    spill_probability=max(
-                        bootstrap_spill_probability,
-                        history_risk.spill_probability_upper,
-                    ),
-                    expected_padding_ratio=max(
-                        0.0, (expected_capacity - expected_tokens) / expected_capacity
-                    )
-                    if expected_capacity > 0
-                    else 0.0,
-                    bootstrap_spill_probability=bootstrap_spill_probability,
-                    history_spill_probability_upper=history_risk.spill_probability_upper,
-                    history_trials=history_risk.trials,
-                    history_spills=history_risk.spills,
-                    history_bad_padding_events=history_risk.bad_padding_events,
-                    history_bad_padding_probability_upper=(
-                        history_risk.bad_padding_probability_upper
-                    ),
-                )
+            projection = PackingProjection(
+                groups=groups,
+                spill_probability=max(
+                    counterfactual_risk,
+                    history_risk.spill_probability_upper,
+                ),
+                expected_padding_ratio=_mean(padding_ratios),
+                counterfactual_trials=trials,
+                counterfactual_spills=spills,
+                counterfactual_spill_probability_upper=counterfactual_risk,
+                marginal_tokens_mean=_mean(marginal_tokens),
+                history_spill_probability_upper=history_risk.spill_probability_upper,
+                history_trials=history_risk.trials,
+                history_spills=history_risk.spills,
+                history_bad_padding_events=history_risk.bad_padding_events,
+                history_bad_padding_probability_upper=(
+                    history_risk.bad_padding_probability_upper
+                ),
             )
-        return projections
+            projections[groups] = projection
+            return projection
 
-    def _packing_projection_samples(self, stats: TunerWindowStats) -> list[float]:
+        best = lo - 1
+        left, right = lo, hi
+        while left <= right:
+            groups = (left + right) // 2
+            if (
+                project(groups).spill_probability
+                <= self.config.target_spill_probability
+            ):
+                best = groups
+                left = groups + 1
+            else:
+                right = groups - 1
+        for groups in range(max(lo, best - 2), min(hi, best + 2) + 1):
+            project(groups)
+        monotone_risk = 0.0
+        for groups in sorted(projections):
+            projection = projections[groups]
+            monotone_risk = max(monotone_risk, projection.spill_probability)
+            if projection.spill_probability < monotone_risk:
+                projections[groups] = projection.model_copy(
+                    update={"spill_probability": monotone_risk}
+                )
+        return [projections[groups] for groups in sorted(projections)]
+
+    def _packing_reservoir(
+        self,
+        settings: PipelineTuneSettings,
+        stats: TunerWindowStats,
+    ) -> list[PackedGroupObservation]:
         cutoff_step = stats.end_step - self.config.packing_history_steps + 1
-        prior_samples = [
-            float(observation.physical_tokens)
+        recent = [
+            observation
             for observation in self.packed_groups
-            if cutoff_step <= observation.step < stats.start_step
+            if cutoff_step <= observation.step <= stats.end_step
         ]
-        return prior_samples + stats.group_pack_token_samples
+        by_step: dict[int, list[PackedGroupObservation]] = defaultdict(list)
+        for observation in recent:
+            by_step[observation.step].append(observation)
+        increase = max(
+            1,
+            min(
+                self.config.target_group_max_increase,
+                math.ceil(
+                    settings.target_groups_per_step
+                    * self.config.target_group_increase_fraction
+                ),
+            ),
+        )
+        required = max(
+            self.config.packing_reservoir_min_groups,
+            self.config.packing_reservoir_multiplier
+            * (settings.target_groups_per_step + increase + 1),
+        )
+        selected: list[PackedGroupObservation] = []
+        for step in sorted(by_step, reverse=True):
+            selected.extend(by_step[step])
+            if len(selected) >= required:
+                break
+        return selected
 
     def _packing_history_risks(
         self, groups_range: range
@@ -814,8 +894,6 @@ class PipelineAutotuner:
         return risks
 
     def _packing_probability_upper(self, *, events: float, trials: float) -> float:
-        from scipy.stats import beta as beta_distribution
-
         non_events = max(0.0, trials - events)
         value = float(
             beta_distribution.ppf(
@@ -842,6 +920,12 @@ class PipelineAutotuner:
         stats.packing_history_bad_padding_probability_upper = (
             projection.history_bad_padding_probability_upper
         )
+        stats.packing_counterfactual_trials = projection.counterfactual_trials
+        stats.packing_counterfactual_spills = projection.counterfactual_spills
+        stats.packing_counterfactual_spill_probability_upper = (
+            projection.counterfactual_spill_probability_upper
+        )
+        stats.packing_marginal_tokens_mean = projection.marginal_tokens_mean
 
     def profile(self) -> PipelineAutotunerProfile:
         return PipelineAutotunerProfile(

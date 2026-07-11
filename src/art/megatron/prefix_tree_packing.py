@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from array import array
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
 
@@ -146,7 +147,7 @@ def prefix_tree_pack_segments(
     if min_shared_segment_length < 0:
         raise ValueError("min_shared_segment_length must be >= 0")
     rows = tuple(
-        sequence if isinstance(sequence, tuple) else tuple(sequence)
+        sequence if isinstance(sequence, (array, tuple)) else tuple(sequence)
         for sequence in sequences
     )
     if not rows:

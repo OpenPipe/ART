@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from array import array
 import asyncio
 from contextlib import asynccontextmanager
 import gc
@@ -73,15 +74,15 @@ from ..metrics_taxonomy import (
 )
 from ..model import Model, TrainableModel
 from ..pipeline_tuner import (
-    PACKED_GROUP_COMPLETION_TOKENS_KEY,
-    PACKED_GROUP_PHYSICAL_TOKENS_KEY,
-    PACKED_GROUP_PROMPT_TOKENS_KEY,
+    PackedGroupShape,
+    PackingLeafShape,
 )
 from ..preprocessing.pack import (
     PackedTensors,
     packed_tensors_from_tokenized_results,
     packed_tensors_to_dir,
     plot_packed_tensors,
+    prefix_tree_shareable_length,
 )
 from ..preprocessing.tokenize import (
     ChatTemplateToolSchemaFormat,
@@ -982,31 +983,28 @@ class LocalBackend(Backend):
     def _record_packed_group_observations(
         trajectory_groups: list[TrajectoryGroup], tokenized_results: list[Any]
     ) -> None:
+        if not any(group._collect_packing_shape for group in trajectory_groups):
+            return
         by_trajectory_id: dict[int, list[Any]] = {}
         for result in tokenized_results:
             by_trajectory_id.setdefault(id(result.trajectory), []).append(result)
         for group in trajectory_groups:
+            if not group._collect_packing_shape:
+                continue
             results: list[Any] = []
             for trajectory in group.trajectories:
                 results.extend(by_trajectory_id.get(id(trajectory), []))
             if not results:
                 continue
-            prompt_tokens = 0
-            completion_tokens = 0
-            seen_prompts: set[int] = set()
+            leaves = []
             for result in results:
-                completion_tokens += max(
-                    0, len(result.token_ids) - result.prompt_length
+                leaves.append(
+                    PackingLeafShape(
+                        token_ids=array("I", result.token_ids),
+                        shareable_length=prefix_tree_shareable_length(result),
+                    )
                 )
-                if result.prompt_id not in seen_prompts:
-                    prompt_tokens += max(0, result.prompt_length)
-                    seen_prompts.add(result.prompt_id)
-            physical_tokens = prompt_tokens + completion_tokens
-            if physical_tokens <= 0:
-                continue
-            group.metadata[PACKED_GROUP_PHYSICAL_TOKENS_KEY] = physical_tokens
-            group.metadata[PACKED_GROUP_PROMPT_TOKENS_KEY] = prompt_tokens
-            group.metadata[PACKED_GROUP_COMPLETION_TOKENS_KEY] = completion_tokens
+            group._packed_group_shape = PackedGroupShape(leaves=tuple(leaves))
 
     async def _get_step(self, model: AnyTrainableModel) -> int:
         return self.__get_step(model)

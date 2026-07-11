@@ -88,10 +88,7 @@ class _PrefixTreeLeaf(NamedTuple):
     item_index: int
     packing_group_id: int
     segment_path: tuple[tuple[int, int], ...]
-
-    @property
-    def empty_bin_cost(self) -> int:
-        return sum(length for _, length in self.segment_path)
+    empty_bin_cost: int
 
 
 class _PrefixTreeBin:
@@ -121,7 +118,7 @@ class PrefixTreePackingEstimate(NamedTuple):
 
 
 class PrefixTreePackingPool:
-    __slots__ = ("groups",)
+    __slots__ = ("group_costs", "groups")
 
     def __init__(
         self,
@@ -129,46 +126,78 @@ class PrefixTreePackingPool:
         *,
         min_shared_segment_length: int = DEFAULT_MIN_PREFIX_TREE_SHARED_SEGMENT_LENGTH,
     ) -> None:
-        token_ids: list[Sequence[int]] = []
-        shareable_lengths: list[int] = []
-        packing_group_ids: list[int] = []
+        prefixes: list[Sequence[int]] = []
+        leaf_specs: list[tuple[int, int | None, int]] = []
         for group_id, group in enumerate(groups):
+            group_prefixes: list[tuple[Sequence[int], int]] = []
             for tokens, shareable_length in group:
-                token_ids.append(tokens)
-                shareable_lengths.append(shareable_length)
-                packing_group_ids.append(group_id)
-        if not token_ids:
+                prefix = tokens[:shareable_length]
+                prefix_index = next(
+                    (
+                        index
+                        for candidate, index in group_prefixes
+                        if candidate == prefix
+                    ),
+                    None,
+                )
+                if prefix_index is None and shareable_length > 0:
+                    prefix_index = len(prefixes)
+                    prefixes.append(prefix)
+                    group_prefixes.append((prefix, prefix_index))
+                leaf_specs.append(
+                    (group_id, prefix_index, len(tokens) - shareable_length)
+                )
+        if not leaf_specs:
             raise ValueError("Prefix-tree packing pool requires at least one leaf")
-        segments = _prefix_tree_pack_segments(
-            token_ids,
-            max_depth=max(map(len, token_ids)),
-            shareable_lengths=shareable_lengths,
-            min_shared_segment_length=min_shared_segment_length,
+        segments = (
+            _prefix_tree_pack_segments(
+                prefixes,
+                max_depth=max(map(len, prefixes)),
+                shareable_lengths=map(len, prefixes),
+                min_shared_segment_length=min_shared_segment_length,
+            )
+            if prefixes
+            else ()
         )
-        paths: list[list[tuple[int, int]]] = [[] for _ in token_ids]
+        paths: list[list[tuple[int, int]]] = [[] for _ in prefixes]
         for segment_id, segment in enumerate(segments):
             path_segment = (segment_id, segment.length)
-            for item_index in segment.sequence_indices:
-                paths[item_index].append(path_segment)
-        leaves = tuple(
-            _PrefixTreeLeaf(
-                item_index=index,
-                packing_group_id=packing_group_ids[index],
-                segment_path=tuple(paths[index]),
+            for prefix_index in segment.sequence_indices:
+                paths[prefix_index].append(path_segment)
+        next_segment_id = len(segments)
+        leaves = []
+        for index, (group_id, prefix_index, tail_length) in enumerate(leaf_specs):
+            segment_path = tuple(
+                () if prefix_index is None else paths[prefix_index]
+            ) + (((next_segment_id + index, tail_length),) if tail_length > 0 else ())
+            leaves.append(
+                _PrefixTreeLeaf(
+                    item_index=index,
+                    packing_group_id=group_id,
+                    segment_path=segment_path,
+                    empty_bin_cost=sum(length for _, length in segment_path),
+                ),
             )
-            for index in range(len(token_ids))
-        )
         grouped_leaves: list[list[_PrefixTreeLeaf]] = [[] for _ in groups]
         for leaf in leaves:
             grouped_leaves[leaf.packing_group_id].append(leaf)
         self.groups = tuple(tuple(group) for group in grouped_leaves)
+        self.group_costs = tuple(
+            max(leaf.empty_bin_cost for leaf in group) for group in self.groups
+        )
 
     def estimate(
         self, group_indices: Sequence[int], *, seq_len: int
     ) -> PrefixTreePackingEstimate:
+        ordered = sorted(
+            group_indices,
+            key=lambda index: self.group_costs[index],
+            reverse=True,
+        )
         bins = _place_prefix_tree_leaves(
-            (self.groups[index] for index in group_indices),
+            (self.groups[index] for index in ordered),
             seq_len=seq_len,
+            groups_are_ordered=True,
         )
         return PrefixTreePackingEstimate(
             packed_sequences=len(bins),
@@ -412,6 +441,7 @@ def _prefix_tree_pack_rows(
             item_index=index,
             packing_group_id=item.prompt_id,
             segment_path=tuple(paths[index]),
+            empty_bin_cost=sum(length for _, length in paths[index]),
         )
         for index, item in enumerate(items)
     ]
@@ -459,11 +489,16 @@ def _place_prefix_tree_leaves(
     groups: Iterable[Sequence[_PrefixTreeLeaf]],
     *,
     seq_len: int,
+    groups_are_ordered: bool = False,
 ) -> list[_PrefixTreeBin]:
-    ordered_groups = sorted(
-        groups,
-        key=lambda group: max(leaf.empty_bin_cost for leaf in group),
-        reverse=True,
+    ordered_groups = (
+        groups
+        if groups_are_ordered
+        else sorted(
+            groups,
+            key=lambda group: max(leaf.empty_bin_cost for leaf in group),
+            reverse=True,
+        )
     )
     bins: list[_PrefixTreeBin] = []
     for leaf in (leaf for group in ordered_groups for leaf in group):
@@ -556,16 +591,10 @@ def _prefix_tree_pack_item(
 ) -> _PrefixTreePackItem:
     assistant_mask = np.asarray(result.assistant_mask, dtype=np.bool_)
     logprobs = np.asarray(result.logprobs, dtype=np.float32)
-    shareable_length = min(
-        int(result.prompt_length),
-        max(
-            _first_trainable_token_index(
-                assistant_mask=assistant_mask,
-                logprobs=logprobs,
-            )
-            - 1,
-            0,
-        ),
+    shareable_length = prefix_tree_shareable_length(
+        result,
+        assistant_mask=assistant_mask,
+        logprobs=logprobs,
     )
     item = _PrefixTreePackItem(
         token_ids=tuple(result.token_ids),
@@ -581,6 +610,33 @@ def _prefix_tree_pack_item(
         moe_routes=result.moe_routed_experts,
     )
     return _truncate_prefix_tree_pack_item(item, seq_len)
+
+
+def prefix_tree_shareable_length(
+    result: TokenizedResult,
+    *,
+    assistant_mask: np.ndarray | None = None,
+    logprobs: np.ndarray | None = None,
+) -> int:
+    assistant_mask = (
+        np.asarray(result.assistant_mask, dtype=np.bool_)
+        if assistant_mask is None
+        else assistant_mask
+    )
+    logprobs = (
+        np.asarray(result.logprobs, dtype=np.float32) if logprobs is None else logprobs
+    )
+    return min(
+        int(result.prompt_length),
+        max(
+            _first_trainable_token_index(
+                assistant_mask=assistant_mask,
+                logprobs=logprobs,
+            )
+            - 1,
+            0,
+        ),
+    )
 
 
 def _truncate_prefix_tree_pack_item(

@@ -1,9 +1,8 @@
 from .attachment import PipelineAutotunerAttachment
 from .config import (
-    PACKED_GROUP_COMPLETION_TOKENS_KEY,
-    PACKED_GROUP_PHYSICAL_TOKENS_KEY,
-    PACKED_GROUP_PROMPT_TOKENS_KEY,
     PackedGroupObservation,
+    PackedGroupShape,
+    PackingLeafShape,
     PipelineAutotuneConfig,
     PipelineAutotunerProfile,
     PipelineMetric,
@@ -14,9 +13,8 @@ from .worker_controller import RolloutWorkerController
 
 __all__ = [
     "PackedGroupObservation",
-    "PACKED_GROUP_COMPLETION_TOKENS_KEY",
-    "PACKED_GROUP_PHYSICAL_TOKENS_KEY",
-    "PACKED_GROUP_PROMPT_TOKENS_KEY",
+    "PackedGroupShape",
+    "PackingLeafShape",
     "PipelineAutotuneConfig",
     "PipelineAutotunerAttachment",
     "PipelineAutotunerProfile",

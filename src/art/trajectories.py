@@ -133,6 +133,8 @@ class TrajectoryGroup(pydantic.BaseModel):
     metadata: dict[str, MetadataValue] = {}
     metrics: dict[str, float | int | bool] = {}
     logs: list[str] = []
+    _collect_packing_shape: bool = pydantic.PrivateAttr(default=False)
+    _packed_group_shape: Any = pydantic.PrivateAttr(default=None)
 
     def __init__(
         self,

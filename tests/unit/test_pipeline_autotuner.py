@@ -1,3 +1,4 @@
+from array import array
 from types import SimpleNamespace
 
 import pytest
@@ -18,6 +19,7 @@ from art.pipeline_tuner.autotune import (
 )
 from art.pipeline_tuner.config import (
     PackedGroupObservation,
+    PackingLeafShape,
     PipelineMetric,
     PipelineTuneSettings,
     TunerDecision,
@@ -29,6 +31,46 @@ from art.pipeline_tuner.worker_controller import RolloutWorkerController
 class _PendingTask:
     def done(self) -> bool:
         return False
+
+
+def _packing_group(step: int, tokens: int) -> PackedGroupObservation:
+    return PackedGroupObservation(
+        step=step,
+        leaves=(
+            PackingLeafShape(token_ids=array("I", range(tokens)), shareable_length=0),
+        ),
+    )
+
+
+def _shared_packing_group(
+    step: int,
+    *,
+    family: int,
+    prefix_tokens: int = 70,
+    tail_tokens: int = 10,
+) -> PackedGroupObservation:
+    token_ids = array("I", [family] * prefix_tokens + list(range(tail_tokens)))
+    return PackedGroupObservation(
+        step=step,
+        leaves=(
+            PackingLeafShape(
+                token_ids=token_ids,
+                shareable_length=prefix_tokens,
+            ),
+        ),
+    )
+
+
+def _seed_packing_groups(
+    tuner: PipelineAutotuner,
+    *,
+    groups_per_step: int,
+    tokens: int,
+    steps: range = range(4, 8),
+) -> None:
+    tuner.packed_groups.extend(
+        _packing_group(step, tokens) for step in steps for _ in range(groups_per_step)
+    )
 
 
 def test_build_initial_settings_uses_art_owned_defaults() -> None:
@@ -219,6 +261,7 @@ def test_low_vllm_pressure_increases_workers_when_trainer_underfed() -> None:
         inference_gpu_count=2,
         policy_age_limit_steps=3.0,
     )
+    _seed_packing_groups(tuner, groups_per_step=8, tokens=15000)
     decision = tuner._decide(
         TunerWindowStats(
             start_step=4,
@@ -234,7 +277,6 @@ def test_low_vllm_pressure_increases_workers_when_trainer_underfed() -> None:
             queue_freshness_pressure=0.30,
             token_weighted_policy_age_steps_mean=1.0,
             groups_per_step_mean=8.0,
-            group_pack_token_samples=[15000.0] * 32,
         )
     )
 
@@ -260,6 +302,7 @@ def test_vllm_pressure_overloaded_train_underfed_lowers_min_batch() -> None:
         inference_gpu_count=2,
         policy_age_limit_steps=3.0,
     )
+    _seed_packing_groups(tuner, groups_per_step=8, tokens=15000)
     decision = tuner._decide(
         TunerWindowStats(
             start_step=4,
@@ -273,7 +316,6 @@ def test_vllm_pressure_overloaded_train_underfed_lowers_min_batch() -> None:
             queue_freshness_pressure=0.20,
             token_weighted_policy_age_steps_mean=1.0,
             groups_per_step_mean=8.0,
-            group_pack_token_samples=[15000.0] * 32,
         )
     )
 
@@ -301,6 +343,7 @@ def test_target_increase_preserves_min_to_max_batch_ratio() -> None:
         inference_gpu_count=2,
         policy_age_limit_steps=3.0,
     )
+    _seed_packing_groups(tuner, groups_per_step=8, tokens=10)
     decision = tuner._decide(
         TunerWindowStats(
             start_step=4,
@@ -311,7 +354,6 @@ def test_target_increase_preserves_min_to_max_batch_ratio() -> None:
             queue_freshness_pressure=0.30,
             token_weighted_policy_age_steps_mean=4.0,
             groups_per_step_mean=8.0,
-            group_pack_token_samples=[10.0] * 32,
         )
     )
 
@@ -338,11 +380,8 @@ def test_target_group_projection_uses_spill_history_veto() -> None:
         inference_gpu_count=2,
         policy_age_limit_steps=3.0,
     )
-    stats = TunerWindowStats(
-        start_step=4,
-        end_step=7,
-        group_pack_token_samples=[10.0] * 32,
-    )
+    _seed_packing_groups(clean_tuner, groups_per_step=8, tokens=10)
+    stats = TunerWindowStats(start_step=4, end_step=7)
 
     assert clean_tuner._adaptive_target_groups(settings, stats) == 10
 
@@ -356,6 +395,7 @@ def test_target_group_projection_uses_spill_history_veto() -> None:
         inference_gpu_count=2,
         policy_age_limit_steps=3.0,
     )
+    _seed_packing_groups(spilled_tuner, groups_per_step=8, tokens=10)
     spilled_tuner._packing_outcomes.append(
         PackingOutcome(
             step=7,
@@ -368,6 +408,69 @@ def test_target_group_projection_uses_spill_history_veto() -> None:
     )
 
     assert spilled_tuner._adaptive_target_groups(settings, stats) == 9
+
+
+def test_target_projection_conditions_on_shared_prefix_marginal() -> None:
+    settings = PipelineTuneSettings(
+        num_rollout_workers=16,
+        min_batch_size=2,
+        max_batch_size=2,
+        queue_maxsize=4,
+        target_groups_per_step=2,
+    )
+    tuner = PipelineAutotuner(
+        config=PipelineAutotuneConfig(),
+        settings=settings,
+        model_name="test",
+        backend_name="MegatronBackend",
+        packed_sequence_length=100,
+        target_packed_sequences=1,
+        inference_gpu_count=2,
+        policy_age_limit_steps=3.0,
+    )
+    tuner.packed_groups.extend(
+        _shared_packing_group(step, family=1) for step in range(4, 8) for _ in range(8)
+    )
+    stats = TunerWindowStats(start_step=4, end_step=7)
+
+    assert tuner._adaptive_target_groups(settings, stats) == 3
+    assert stats.packing_counterfactual_spills == 0.0
+    assert stats.packing_counterfactual_spill_probability_upper < 0.03
+    assert stats.packing_marginal_tokens_mean == pytest.approx(10.0)
+
+
+def test_target_projection_prices_a_new_prefix_family() -> None:
+    settings = PipelineTuneSettings(
+        num_rollout_workers=16,
+        min_batch_size=1,
+        max_batch_size=1,
+        queue_maxsize=2,
+        target_groups_per_step=1,
+    )
+    tuner = PipelineAutotuner(
+        config=PipelineAutotuneConfig(),
+        settings=settings,
+        model_name="test",
+        backend_name="MegatronBackend",
+        packed_sequence_length=100,
+        target_packed_sequences=1,
+        inference_gpu_count=2,
+        policy_age_limit_steps=3.0,
+    )
+    tuner.packed_groups.extend(
+        _shared_packing_group(step, family=index % 2)
+        for step in range(4, 8)
+        for index in range(32)
+    )
+    stats = TunerWindowStats(start_step=4, end_step=7)
+
+    assert tuner._adaptive_target_groups(settings, stats) == 1
+    projections = tuner._packing_projections(settings, stats)
+    two_groups = next(
+        projection for projection in projections if projection.groups == 2
+    )
+    assert two_groups.counterfactual_spills > 20
+    assert two_groups.counterfactual_spill_probability_upper > 0.03
 
 
 def test_target_group_projection_uses_target_packed_sequence_slots() -> None:
@@ -388,11 +491,8 @@ def test_target_group_projection_uses_target_packed_sequence_slots() -> None:
         inference_gpu_count=2,
         policy_age_limit_steps=3.0,
     )
-    stats = TunerWindowStats(
-        start_step=4,
-        end_step=7,
-        group_pack_token_samples=[10.0] * 128,
-    )
+    _seed_packing_groups(tuner, groups_per_step=32, tokens=10)
+    stats = TunerWindowStats(start_step=4, end_step=7)
 
     assert tuner._adaptive_target_groups(settings, stats) == 40
 
@@ -438,11 +538,12 @@ def test_spill_history_veto_is_monotone_for_larger_batches() -> None:
             train_tokens=200.0,
         )
     )
-    stats = TunerWindowStats(
-        start_step=4,
-        end_step=7,
-        group_pack_token_samples=[9.0] * 32,
+    _seed_packing_groups(
+        tuner,
+        groups_per_step=8,
+        tokens=9,
     )
+    stats = TunerWindowStats(start_step=4, end_step=7)
 
     assert tuner._adaptive_target_groups(settings, stats) == 9
 
@@ -467,19 +568,14 @@ def test_target_group_projection_uses_prior_pack_samples() -> None:
     )
     for step in range(1, 4):
         for _ in range(8):
-            tuner.on_packed_group(
-                PackedGroupObservation(
-                    step=step,
-                    physical_tokens=11,
-                    prompt_tokens=10,
-                    completion_tokens=1,
-                )
-            )
-    stats = TunerWindowStats(
-        start_step=4,
-        end_step=7,
-        group_pack_token_samples=[9.0] * 32,
+            tuner.on_packed_group(_packing_group(step, 11))
+    _seed_packing_groups(
+        tuner,
+        groups_per_step=8,
+        tokens=9,
+        steps=range(4, 5),
     )
+    stats = TunerWindowStats(start_step=4, end_step=7)
 
     assert tuner._adaptive_target_groups(settings, stats) == 9
 
@@ -501,6 +597,7 @@ def test_min_batch_raise_replaces_worker_decrease_when_batch_has_room() -> None:
         inference_gpu_count=2,
         policy_age_limit_steps=3.0,
     )
+    _seed_packing_groups(tuner, groups_per_step=12, tokens=9000)
     decision = tuner._decide(
         TunerWindowStats(
             start_step=4,
@@ -510,7 +607,6 @@ def test_min_batch_raise_replaces_worker_decrease_when_batch_has_room() -> None:
             vllm_pressure=0.25,
             predicted_stale_frac=1.0,
             groups_per_step_mean=12.0,
-            group_pack_token_samples=[9000.0] * 48,
         )
     )
 
@@ -553,7 +649,6 @@ def test_stable_holds_emit_inference_gpu_warning() -> None:
                     trainer_idle_frac=0.60,
                     trainer_load_score=0.60,
                     vllm_pressure=1.0,
-                    group_pack_token_samples=[15000.0] * 8,
                 ),
             )
         )
@@ -600,7 +695,6 @@ def test_stable_holds_emit_group_size_or_training_gpu_warning() -> None:
                     trainer_idle_frac=0.01,
                     trainer_load_score=0.01,
                     vllm_pressure=0.25,
-                    group_pack_token_samples=[15000.0] * 8,
                 ),
             )
         )
@@ -626,6 +720,7 @@ def _append_decision_window_metrics(
             "time/step_collect_batch_s": 1.0,
             "data/step_num_groups_trainable": 2.0,
             "data/step_packed_sequences": 1.0,
+            "data/step_non_padding_train_tokens": 60.0,
             "sample_efficiency/freshness_discount": 0.5,
             "offpolicy/token_weighted_policy_age_steps": 1.0,
             "queue/predicted_stale_fraction": 0.0,
@@ -639,18 +734,8 @@ def _append_decision_window_metrics(
             )
         tuner.packed_groups.extend(
             [
-                PackedGroupObservation(
-                    step=step,
-                    physical_tokens=40,
-                    prompt_tokens=30,
-                    completion_tokens=10,
-                ),
-                PackedGroupObservation(
-                    step=step,
-                    physical_tokens=20,
-                    prompt_tokens=10,
-                    completion_tokens=10,
-                ),
+                _packing_group(step, 40),
+                _packing_group(step, 20),
             ]
         )
     for idx in range(4):
@@ -667,7 +752,7 @@ def _append_decision_window_metrics(
         )
 
 
-def test_window_stats_derives_padding_from_packed_group_observations() -> None:
+def test_window_stats_uses_exact_non_padding_tokens() -> None:
     tuner = PipelineAutotuner(
         config=PipelineAutotuneConfig(),
         settings=PipelineTuneSettings(
@@ -693,7 +778,6 @@ def test_window_stats_derives_padding_from_packed_group_observations() -> None:
     assert stats.train_capacity_tokens_mean == 100.0
     assert stats.window_start_s == 1.0
     assert stats.window_end_s == 4.0
-    assert stats.group_pack_token_samples == [40.0, 20.0] * 4
 
 
 def test_window_stats_accounts_for_underfilled_target_packed_sequence_slots() -> None:
