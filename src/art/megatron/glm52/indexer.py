@@ -528,7 +528,7 @@ def context_parallel_tree_topk(
     indices = torch.where(
         best_ids >= 0,
         route_map[best_ids.clamp_min(0).to(torch.int64)],
-        torch.full_like(best_ids, -1),
+        torch.full_like(best_ids, state.combined_k_rows),
     ).view(1, valid_tokens, topk)
     del best_ids
     return Glm52RoutedTopk(indices=indices)
@@ -602,4 +602,5 @@ def streaming_tree_topk(
                         )
                 result[row.row_index, q_start:q_end, : best_ids.shape[1]] = best_ids
     _canonicalize_topk_(result)
+    result.masked_fill_(result < 0, seq_len)
     return result

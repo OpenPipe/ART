@@ -65,6 +65,7 @@ class Glm52PrefixTreeState(BaseModel):
     indexer_rows: tuple[Glm52IndexerRowPlan, ...] = ()
     stages: tuple[Glm52StageState, ...] = ()
     route_by_global_id: torch.Tensor | None = None
+    combined_k_rows: int = 0
     context_parallel_state: Any | None = None
     topk_by_full_layer: dict[int, Any] = Field(default_factory=dict)
 
@@ -237,6 +238,7 @@ def build_glm52_context_parallel_state(
         rope_sin=rope_sin,
         stages=tuple(stages),
         route_by_global_id=route_by_global_id.to(device=device, non_blocking=True),
+        combined_k_rows=combined_k_start,
         context_parallel_state=context_parallel_state,
     )
 
