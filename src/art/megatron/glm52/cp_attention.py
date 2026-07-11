@@ -137,7 +137,9 @@ def _forward(
     valid = int(sum(cp_state.rank_plan.local_valid_lengths))
     q_flat = q[0, :valid].contiguous()
     kv_flat = kv[0, :valid].contiguous()
-    accum_out = q.new_zeros((valid, q.shape[2], _LATENT_DIM))
+    accum_out = torch.zeros(
+        (valid, q.shape[2], _LATENT_DIM), device=q.device, dtype=torch.float32
+    )
     accum_lse = torch.full(
         (valid, q.shape[2]), float("-inf"), device=q.device, dtype=torch.float32
     )
@@ -158,6 +160,7 @@ def _forward(
             scale=scale,
             route_offsets=offsets_stage.unsqueeze(0),
             stage_index=int(stage.stage_index),
+            fp32_output=True,
         )
         _merge_stage_(
             accum_out,
@@ -170,7 +173,7 @@ def _forward(
     drain_stage_fetches(fetches)
     output = q.new_zeros((q.shape[0], q.shape[1], q.shape[2], _LATENT_DIM))
     output[0, :valid].copy_(accum_out)
-    return output, accum_out, accum_lse
+    return output, output[0, :valid], accum_lse
 
 
 def _backward(

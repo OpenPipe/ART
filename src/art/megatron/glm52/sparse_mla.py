@@ -353,6 +353,7 @@ def sparse_mla_forward(
     scale: float,
     route_offsets: torch.Tensor | None = None,
     stage_index: int = 0,
+    fp32_output: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     _validate_inputs(q, kv, indices, route_offsets, stage_index)
     batch, q_tokens, heads, _ = q.shape
@@ -361,7 +362,9 @@ def sparse_mla_forward(
     if topk % _INDEX_BLOCK:
         raise ValueError(f"GLM-5.2 sparse topk must be divisible by {_INDEX_BLOCK}.")
     out = torch.empty(
-        (batch, q_tokens, heads, _LATENT_DIM), device=q.device, dtype=q.dtype
+        (batch, q_tokens, heads, _LATENT_DIM),
+        device=q.device,
+        dtype=torch.float32 if fp32_output else q.dtype,
     )
     lse = torch.empty((batch, q_tokens, heads), device=q.device, dtype=torch.float32)
     _sparse_mla_fwd_kernel[(batch * q_tokens, triton.cdiv(heads, _HEAD_BLOCK))](
