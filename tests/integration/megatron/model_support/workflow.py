@@ -381,7 +381,7 @@ def run_hf_parity_stage(
     case_config = oracle_harness.OracleCaseConfig(
         base_model=base_model,
         is_moe=handler.is_moe,
-        precision="fp32",
+        precision=handler.correctness_precision(),
         num_layers=max(1, architecture.recommended_min_layers),
         num_steps=1,
         lora={"target_modules": list(spec.default_target_modules)},
@@ -428,7 +428,7 @@ def run_lora_coverage_stage(
     case_config = oracle_harness.OracleCaseConfig(
         base_model=base_model,
         is_moe=handler.is_moe,
-        precision="fp32",
+        precision=handler.correctness_precision(),
         num_layers=max(1, architecture.recommended_min_layers),
         num_steps=1,
         lora={"target_modules": list(spec.default_target_modules)},
@@ -678,7 +678,7 @@ def run_merged_vllm_serving_stage(
     case_config = oracle_harness.OracleCaseConfig(
         base_model=base_model,
         is_moe=handler.is_moe,
-        precision="fp32",
+        precision=handler.correctness_precision(),
         num_layers=max(1, architecture.recommended_min_layers),
         num_steps=1,
         lora={"target_modules": list(spec.default_target_modules)},
@@ -806,7 +806,7 @@ def run_native_vllm_lora_stage(
     case_config = oracle_harness.OracleCaseConfig(
         base_model=base_model,
         is_moe=handler.is_moe,
-        precision="fp32",
+        precision=handler.correctness_precision(),
         num_layers=max(1, architecture.recommended_min_layers),
         num_steps=1,
         lora={"target_modules": list(spec.default_target_modules)},

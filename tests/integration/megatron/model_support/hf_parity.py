@@ -98,6 +98,22 @@ def _hf_parity_phase_pass_fns() -> dict[str, PhasePassFn]:
     }
 
 
+def _hf_parity_phase_pass_fns_for_case(
+    case_config: OracleCaseConfig,
+) -> dict[str, PhasePassFn]:
+    if case_config.precision == "fp32":
+        return _hf_parity_phase_pass_fns()
+    from art.megatron.model_support.registry import get_model_support_handler
+
+    handler = get_model_support_handler(
+        case_config.base_model,
+        allow_unvalidated_arch=case_config.allow_unvalidated_arch,
+    )
+    return handler.correctness_phase_pass_fns(sys.modules[__name__]) or (
+        _hf_parity_phase_pass_fns()
+    )
+
+
 def hf_parity_case_config(case_config: OracleCaseConfig) -> OracleCaseConfig:
     return case_config.model_copy(
         update={"packed_tensors": HF_PARITY_PACKED_TENSORS.model_copy(deep=True)}
@@ -324,8 +340,8 @@ def run_hf_parity(
     case_config: OracleCaseConfig,
 ) -> HfParityReport:
     case_config = hf_parity_case_config(case_config)
-    if case_config.precision != "fp32":
-        raise ValueError("HF parity currently requires fp32 precision")
+    if case_config.precision not in {"bf16", "fp32"}:
+        raise ValueError(f"Unsupported HF parity precision {case_config.precision!r}")
     if case_config.num_steps != 1:
         raise ValueError("HF parity currently requires num_steps=1")
 
@@ -371,7 +387,7 @@ def build_hf_parity_report(
     loss_summary: dict[str, float],
     grads_rows: list[HfParityMetricRow],
 ) -> HfParityReport:
-    phase_pass_fns = _hf_parity_phase_pass_fns()
+    phase_pass_fns = _hf_parity_phase_pass_fns_for_case(request.case_config)
     rows = [
         _build_metric_row(
             phase="outputs",

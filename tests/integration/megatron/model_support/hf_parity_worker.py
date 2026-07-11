@@ -34,7 +34,7 @@ from .gdn_fp32_reference import install_megatron_qwen35_gdn_fp32_reference
 from .hf_parity import (
     HF_PARITY_REPORT_FILENAME,
     HfParityRunRequest,
-    _hf_parity_phase_pass_fns,
+    _hf_parity_phase_pass_fns_for_case,
     build_hf_parity_report,
     build_parity_sample_indices,
     build_tensor_map_metric_rows,
@@ -350,12 +350,15 @@ def _load_hf_model(
     num_layers: int,
     device: torch.device,
     dtype: torch.dtype,
+    allow_unvalidated_arch: bool,
 ) -> Any:
     from transformers import AutoConfig, AutoModelForCausalLM
 
     from art.megatron.model_support.registry import get_model_support_handler
 
-    handler = get_model_support_handler(base_model)
+    handler = get_model_support_handler(
+        base_model, allow_unvalidated_arch=allow_unvalidated_arch
+    )
     ensure_hf_reference_registered = getattr(
         handler, "ensure_hf_reference_registered", None
     )
@@ -410,20 +413,27 @@ def _normalize_hf_reference_state_for_hf_parity(
     base_model: str,
     model: Any,
     state: dict[str, torch.Tensor],
+    allow_unvalidated_arch: bool,
 ) -> dict[str, torch.Tensor]:
     from art.megatron.model_support.registry import get_model_support_handler
 
-    handler = get_model_support_handler(base_model)
+    handler = get_model_support_handler(
+        base_model, allow_unvalidated_arch=allow_unvalidated_arch
+    )
     normalize = getattr(handler, "normalize_hf_reference_state_for_hf_parity", None)
     if normalize is not None:
         normalize(state, config=model.config)
     return state
 
 
-def _use_hf_reference_state_for_hf_parity(base_model: str) -> bool:
+def _use_hf_reference_state_for_hf_parity(
+    base_model: str, *, allow_unvalidated_arch: bool
+) -> bool:
     from art.megatron.model_support.registry import get_model_support_handler
 
-    handler = get_model_support_handler(base_model)
+    handler = get_model_support_handler(
+        base_model, allow_unvalidated_arch=allow_unvalidated_arch
+    )
     enabled = getattr(handler, "use_hf_reference_state_for_hf_parity", None)
     return bool(enabled()) if enabled is not None else False
 
@@ -591,6 +601,7 @@ def _run_hf_sft_step(
     topology: ReplayParallelTopology,
     device: torch.device,
     dtype: torch.dtype,
+    allow_unvalidated_arch: bool,
 ) -> tuple[
     torch.Tensor,
     torch.Tensor,
@@ -604,6 +615,7 @@ def _run_hf_sft_step(
         num_layers=num_layers,
         device=device,
         dtype=dtype,
+        allow_unvalidated_arch=allow_unvalidated_arch,
     )
     if dtype == torch.float32:
         _install_hf_qwen35_gdn_fp32_reference(model, base_model=base_model)
@@ -653,8 +665,11 @@ def _run_hf_sft_step(
             base_model=base_model,
             model=model,
             state=_collect_hf_state_dict(model),
+            allow_unvalidated_arch=allow_unvalidated_arch,
         )
-        if _use_hf_reference_state_for_hf_parity(base_model)
+        if _use_hf_reference_state_for_hf_parity(
+            base_model, allow_unvalidated_arch=allow_unvalidated_arch
+        )
         else None
     )
     routing_replay_bundle = route_capture.build_replay_bundle(topology=topology)
@@ -696,7 +711,8 @@ def _build_megatron_runtime(
     moe_routing_replay_bundle: MoeRoutingReplayBundle | None = None,
 ) -> megatron_train.TrainingRuntime:
     use_hf_reference_state = _use_hf_reference_state_for_hf_parity(
-        request.case_config.base_model
+        request.case_config.base_model,
+        allow_unvalidated_arch=request.case_config.allow_unvalidated_arch,
     )
     return megatron_train.build_training_runtime(
         model_identifier=request.case_config.base_model,
@@ -1246,6 +1262,7 @@ def _worker_run(request: HfParityRunRequest) -> None:
             topology=replay_topology,
             device=device,
             dtype=dtype,
+            allow_unvalidated_arch=request.case_config.allow_unvalidated_arch,
         )
         megatron_outputs, megatron_loss, megatron_grads = _run_megatron_sft_step(
             request=request,
@@ -1299,7 +1316,7 @@ def _worker_run(request: HfParityRunRequest) -> None:
             phase="grads",
             reference=normalized_hf_grads,
             candidate=megatron_grads,
-            phase_pass_fns=_hf_parity_phase_pass_fns(),
+            phase_pass_fns=_hf_parity_phase_pass_fns_for_case(request.case_config),
         )
         report = build_hf_parity_report(
             request=request,
