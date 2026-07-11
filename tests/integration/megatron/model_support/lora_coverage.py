@@ -29,6 +29,8 @@ allow_fp32_grouped_gemm_fallback_for_model_support_tests()
 _WRAPPED_TARGET_SUFFIXES: dict[str, tuple[str, ...]] = {
     "q_a_proj": (".self_attn.q_a_proj",),
     "q_b_proj": (".self_attn.q_b_proj",),
+    "kv_a_proj_with_mqa": (".self_attn.kv_a_proj_with_mqa",),
+    "kv_b_proj": (".self_attn.kv_b_proj",),
     "kv_proj": (".self_attn.kv_proj",),
     "o_a_proj": (".self_attn.o_a_proj",),
     "o_b_proj": (".self_attn.o_b_proj",),
@@ -119,6 +121,18 @@ def _covered_exported_target_modules(
 ) -> set[str]:
     covered: set[str] = set()
     for base_name, adapter_weights in adapter_weights_by_base.items():
+        if base_name.endswith(".self_attention.linear_q_down_proj.weight"):
+            covered.add("q_a_proj")
+            continue
+        if base_name.endswith(".self_attention.linear_q_up_proj.weight"):
+            covered.add("q_b_proj")
+            continue
+        if base_name.endswith(".self_attention.linear_kv_down_proj.weight"):
+            covered.add("kv_a_proj_with_mqa")
+            continue
+        if base_name.endswith(".self_attention.linear_kv_up_proj.weight"):
+            covered.add("kv_b_proj")
+            continue
         if base_name.endswith(".self_attention.wq_a.weight"):
             covered.add("q_a_proj")
             continue
