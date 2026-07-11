@@ -379,14 +379,27 @@ def _prefix_tree_pack_rows(
     planned_rows = []
     for packed_bin in bins:
         row = [leaf.item for leaf in packed_bin.leaves]
-        plan = _filtered_prefix_tree_plan(
+        occupancy_plan = _filtered_prefix_tree_plan(
             segments,
             item_indices=tuple(leaf.item_index for leaf in packed_bin.leaves),
         )
-        if plan.length != packed_bin.token_count:
+        if occupancy_plan.length != packed_bin.token_count:
             raise RuntimeError(
                 "Global prefix-tree occupancy disagrees with final bin plan: "
-                f"occupancy={packed_bin.token_count}, plan={plan.length}"
+                f"occupancy={packed_bin.token_count}, plan={occupancy_plan.length}"
+            )
+        # Rebuild only after placement so bin-local paths compress without putting
+        # repeated tree construction in the best-fit search.
+        plan = _prefix_tree_row_plan(
+            row,
+            seq_len=seq_len,
+            pack_results=True,
+            min_shared_segment_length=min_shared_segment_length,
+        )
+        if plan.length > occupancy_plan.length:
+            raise RuntimeError(
+                "Final prefix-tree rebuild increased bin occupancy: "
+                f"global={occupancy_plan.length}, rebuilt={plan.length}"
             )
         planned_rows.append((row, plan))
     return planned_rows
