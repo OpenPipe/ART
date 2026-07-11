@@ -9,7 +9,7 @@ import torch
 
 from art.loss import LossInputs, shift_tensor
 from art.megatron.context_parallel.runtime import (
-    context_parallel_rank_token_counts,
+    context_parallel_rank_model_token_counts,
     prepare_cp_micro,
 )
 from art.megatron.context_parallel.types import (
@@ -211,16 +211,20 @@ def build_rl_hybridep_token_counts(
         provider, torch.device("cuda", torch.cuda.current_device())
     )
     build_gdn = bool(getattr(model_support_handler, "build_gdn_execution_spec", False))
+    gdn_planner_config = _gdn_planner_config_for_provider(
+        provider, model_support_handler
+    )
 
     def rank_counts(sample_index: int | None) -> tuple[int, ...]:
         index = 0 if sample_index is None else sample_index
-        return context_parallel_rank_token_counts(
+        return context_parallel_rank_model_token_counts(
             group_ids=packed_tensors["group_ids"][index : index + 1],
             parent_ids=packed_tensors["parent_ids"][index : index + 1],
             topology=topology,
             config=config,
             original_seq_len=sequence_length,
             build_gdn_execution_spec=build_gdn,
+            gdn_planner_config=gdn_planner_config,
         )
 
     return [
@@ -257,18 +261,22 @@ def build_sft_hybridep_token_counts(
         provider, torch.device("cuda", torch.cuda.current_device())
     )
     build_gdn = bool(getattr(model_support_handler, "build_gdn_execution_spec", False))
+    gdn_planner_config = _gdn_planner_config_for_provider(
+        provider, model_support_handler
+    )
 
     def rank_counts(sample_index: int | None) -> tuple[int, ...]:
         sparse = _sft_inputs_to_sparse_packed_tensors(
             sample(sample_index), device=torch.device("cpu")
         )
-        return context_parallel_rank_token_counts(
+        return context_parallel_rank_model_token_counts(
             group_ids=sparse["group_ids"],
             parent_ids=sparse["parent_ids"],
             topology=topology,
             config=config,
             original_seq_len=int(sparse["tokens"].shape[1]),
             build_gdn_execution_spec=build_gdn,
+            gdn_planner_config=gdn_planner_config,
         )
 
     return [

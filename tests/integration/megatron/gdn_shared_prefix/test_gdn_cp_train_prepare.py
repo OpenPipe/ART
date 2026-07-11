@@ -13,13 +13,18 @@ from torch.distributed import destroy_process_group, init_process_group  # noqa:
 import torch.multiprocessing as mp  # noqa: E402
 
 from art.loss import LossInputs, loss_fn, shift_tensor  # noqa: E402
-from art.megatron.context_parallel.runtime import prepare_cp_micro  # noqa: E402
+from art.megatron.context_parallel.runtime import (  # noqa: E402
+    context_parallel_rank_model_token_counts,
+    prepare_cp_micro,
+    prepare_megatron_context_parallel_state,
+)
 from art.megatron.context_parallel.types import (  # noqa: E402
     ArtContextParallelState,
     ContextParallelConfig,
     DispatchedPackedTensors,
     ParallelTopology,
 )
+from art.megatron.gdn.gdn_prefix_tree import GdnPlannerConfig  # noqa: E402
 from art.preprocessing.pack import PackedTensors  # noqa: E402
 
 from .cases import default_phase0_cases  # noqa: E402
@@ -40,6 +45,48 @@ def test_gdn_cp_training_batch_carries_prebuilt_rank_plan(tmp_path: Path) -> Non
     )
     for rank in range(cp_size):
         assert (tmp_path / f"rank_{rank}.ok").read_text() == "ok\n"
+
+
+def test_hybridep_extent_includes_gdn_layout_rows() -> None:
+    micro = cast(
+        PackedTensors,
+        build_phase0_packed_tensors(default_phase0_cases()[0]),
+    )
+    topology = ParallelTopology(cp=2)
+    config = ContextParallelConfig()
+    planner_config = GdnPlannerConfig()
+    counts = context_parallel_rank_model_token_counts(
+        group_ids=micro["group_ids"],
+        parent_ids=micro["parent_ids"],
+        topology=topology,
+        config=config,
+        original_seq_len=int(micro["tokens"].shape[1]),
+        build_gdn_execution_spec=True,
+        gdn_planner_config=planner_config,
+    )
+    expected = []
+    attention_counts = []
+    for cp_rank in range(topology.cp):
+        state, rank_plan, _spec, _pad_multiple = (
+            prepare_megatron_context_parallel_state(
+                micro=micro,
+                topology=topology,
+                config=config,
+                cp_group=None,
+                cp_rank=cp_rank,
+                build_gdn_execution_spec=True,
+                gdn_planner_config=planner_config,
+                target_device=torch.device("cpu"),
+            )
+        )
+        assert state.gdn_execution_plan is not None
+        attention_count = sum(int(value) for value in rank_plan.local_valid_lengths)
+        attention_counts.append(attention_count)
+        expected.append(
+            max(attention_count, int(state.gdn_execution_plan.gdn_token_count))
+        )
+    assert counts == tuple(expected)
+    assert any(count > attention for count, attention in zip(counts, attention_counts))
 
 
 def _worker(rank: int, cp_size: int, init_method: str, output_dir: str) -> None:
