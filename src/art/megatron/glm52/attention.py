@@ -17,13 +17,19 @@ from megatron.core.typed_torch import apply_module, not_none
 from megatron.core.utils import get_pg_size
 import torch
 
-from art.megatron.glm52.indexer import streaming_tree_topk
+from art.megatron.glm52.indexer import indexer_rope, streaming_tree_topk
 from art.megatron.glm52.sparse_mla import sparse_mla
 from art.megatron.glm52.state import Glm52PrefixTreeState, require_glm52_state
 
 
 def _tensor(value: Any) -> torch.Tensor:
     return value[0] if isinstance(value, tuple) else value
+
+
+def _latent_rms_norm(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
+    x_float = x.float()
+    normalized = x_float * torch.rsqrt(x_float.square().mean(-1, keepdim=True) + 1e-6)
+    return weight * normalized.to(x.dtype)
 
 
 def _half_split_rope(
@@ -125,17 +131,9 @@ class Glm52Indexer(torch.nn.Module):
                 "GLM-5.2 indexer state/token shape mismatch: "
                 f"state={tuple(state.position_ids.shape)} tokens={expected}."
             )
-        cos = state.rope_cos[:, :, None, :].to(q.dtype)
-        sin = state.rope_sin[:, :, None, :].to(q.dtype)
         q = q.permute(1, 0, 2, 3).contiguous()
         k = k.permute(1, 0, 2).contiguous()
-        q_rot, q_pass = q.split((64, self.head_dim - 64), dim=-1)
-        k_rot, k_pass = k.split((64, self.head_dim - 64), dim=-1)
-        q = torch.cat((_half_split_rope(q_rot, cos, sin), q_pass), dim=-1)
-        k = torch.cat(
-            (_half_split_rope(k_rot[:, :, None], cos, sin).squeeze(2), k_pass),
-            dim=-1,
-        )
+        q, k = indexer_rope(q, k, state.rope_cos, state.rope_sin)
         weights = weights.permute(1, 0, 2).contiguous()
         weights *= (self.heads * self.head_dim) ** -0.5
         return streaming_tree_topk(
@@ -292,13 +290,13 @@ class Glm52SelfAttention(Attention):
             submodules.q_layernorm,
             config=config,
             hidden_size=config.q_lora_rank,
-            eps=config.layernorm_epsilon,
+            eps=1e-6,
         )
         self.kv_layernorm = build_module(
             submodules.kv_layernorm,
             config=config,
             hidden_size=config.kv_lora_rank,
-            eps=config.layernorm_epsilon,
+            eps=1e-6,
         )
         self.softmax_scale = (config.qk_head_dim + config.qk_pos_emb_head_dim) ** -0.5
         self.q_a_lora: Any = None
@@ -338,7 +336,7 @@ class Glm52SelfAttention(Attention):
         q_compressed = _tensor(self.linear_q_down_proj(hidden_states))
         if self.q_a_lora is not None:
             q_compressed = q_compressed + self.q_a_lora(hidden_states)
-        q_residual = _tensor(apply_module(self.q_layernorm)(q_compressed))
+        q_residual = _latent_rms_norm(q_compressed, self.q_layernorm.weight)
         q = _tensor(self.linear_q_up_proj(q_residual))
         if self.q_b_lora is not None:
             q = q + self.q_b_lora(self._column_lora_input(q_residual))
@@ -348,7 +346,7 @@ class Glm52SelfAttention(Attention):
         kv_compressed, k_rope = kv_combined.split(
             (self.config.kv_lora_rank, self.config.qk_pos_emb_head_dim), dim=-1
         )
-        kv_compressed = _tensor(apply_module(self.kv_layernorm)(kv_compressed))
+        kv_compressed = _latent_rms_norm(kv_compressed, self.kv_layernorm.weight)
         kv_compressed = self._gather_replicated_sequence(kv_compressed)
         k_rope = self._gather_replicated_sequence(k_rope)
         seq_len, batch = kv_compressed.shape[:2]

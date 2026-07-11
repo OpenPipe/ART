@@ -419,12 +419,19 @@ def _load_hf_model(
         **extra_kwargs,
     )
     model.train()
-    return cast(Any, model).to(device)
+    model = cast(Any, model).to(device)
+    if handler.key == "glm52":
+        for module in model.modules():
+            if type(module).__name__ == "GlmMoeDsaIndexer":
+                module.requires_grad_(False)
+    return model
 
 
 def _collect_hf_grads(model: Any) -> dict[str, torch.Tensor]:
     grads: dict[str, torch.Tensor] = {}
     for name, param in model.named_parameters():
+        if not param.requires_grad:
+            continue
         grad = param.grad
         if grad is None:
             grad = torch.zeros_like(param)
@@ -1181,6 +1188,7 @@ def _run_megatron_sft_step(
     derivative_tasks = [
         task
         for task in tasks
+        if cast(torch.nn.Parameter, task.param_weight).requires_grad
         if _mapping_supports_derivative_parity(task.mapping)
         and _mapping_targets_language_only(task.mapping)
     ]

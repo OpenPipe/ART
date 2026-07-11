@@ -11,6 +11,130 @@ _MAX_K_CHUNK = 32 * 1024
 
 
 @triton.jit
+def _round_bf16(value):
+    bits = value.to(tl.int32, bitcast=True)
+    rounded = bits + 0x7FFF + ((bits >> 16) & 1)
+    return (rounded & -0x10000).to(tl.float32, bitcast=True)
+
+
+@triton.jit
+def _index_rope_kernel(
+    q_ptr,
+    k_ptr,
+    cos_ptr,
+    sin_ptr,
+    q_out_ptr,
+    k_out_ptr,
+    tokens,
+    stride_qb,
+    stride_qs,
+    stride_qh,
+    stride_qd,
+    stride_kb,
+    stride_ks,
+    stride_kd,
+    stride_rb,
+    stride_rs,
+    stride_rd,
+    heads: tl.constexpr,
+):
+    row = tl.program_id(0)
+    head = tl.program_id(1)
+    batch = row // tokens
+    token = row - batch * tokens
+    half = tl.arange(0, 32)
+    passthrough = tl.arange(0, 64)
+    rope_base = batch * stride_rb + token * stride_rs
+    cos = tl.load(cos_ptr + rope_base + half * stride_rd)
+    sin = tl.load(sin_ptr + rope_base + half * stride_rd)
+
+    q_base = batch * stride_qb + token * stride_qs + head * stride_qh
+    q_first = tl.load(q_ptr + q_base + half * stride_qd)
+    q_second = tl.load(q_ptr + q_base + (32 + half) * stride_qd)
+    q_ac = _round_bf16(q_first.to(tl.float32) * cos.to(tl.float32))
+    q_bs = _round_bf16(q_second.to(tl.float32) * sin.to(tl.float32))
+    q_bc = _round_bf16(q_second.to(tl.float32) * cos.to(tl.float32))
+    q_as = _round_bf16(q_first.to(tl.float32) * sin.to(tl.float32))
+    tl.store(
+        q_out_ptr + q_base + half * stride_qd,
+        _round_bf16(q_ac - q_bs),
+    )
+    tl.store(
+        q_out_ptr + q_base + (32 + half) * stride_qd,
+        _round_bf16(q_bc + q_as),
+    )
+    tl.store(
+        q_out_ptr + q_base + (64 + passthrough) * stride_qd,
+        tl.load(q_ptr + q_base + (64 + passthrough) * stride_qd),
+    )
+
+    k_base = batch * stride_kb + token * stride_ks
+    k_mask = head == 0
+    k_first = tl.load(k_ptr + k_base + half * stride_kd, mask=k_mask, other=0.0)
+    k_second = tl.load(k_ptr + k_base + (32 + half) * stride_kd, mask=k_mask, other=0.0)
+    k_ac = _round_bf16(k_first.to(tl.float32) * cos.to(tl.float32))
+    k_bs = _round_bf16(k_second.to(tl.float32) * sin.to(tl.float32))
+    k_bc = _round_bf16(k_second.to(tl.float32) * cos.to(tl.float32))
+    k_as = _round_bf16(k_first.to(tl.float32) * sin.to(tl.float32))
+    tl.store(
+        k_out_ptr + k_base + half * stride_kd,
+        _round_bf16(k_ac - k_bs),
+        mask=k_mask,
+    )
+    tl.store(
+        k_out_ptr + k_base + (32 + half) * stride_kd,
+        _round_bf16(k_bc + k_as),
+        mask=k_mask,
+    )
+    tl.store(
+        k_out_ptr + k_base + (64 + passthrough) * stride_kd,
+        tl.load(
+            k_ptr + k_base + (64 + passthrough) * stride_kd,
+            mask=k_mask,
+            other=0.0,
+        ),
+        mask=k_mask,
+    )
+
+
+def indexer_rope(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    cos: torch.Tensor,
+    sin: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Apply half-split RoPE with the indexer's eager-BF16 rounding contract."""
+    if q.ndim != 4 or k.ndim != 3 or q.shape[:2] != k.shape[:2]:
+        raise ValueError("GLM-5.2 indexer RoPE expects q[B,S,H,128], k[B,S,128].")
+    if q.shape[-1] != 128 or k.shape[-1] != 128:
+        raise ValueError("GLM-5.2 indexer RoPE requires head_dim=128.")
+    if q.dtype is not torch.bfloat16 or k.dtype is not torch.bfloat16:
+        raise TypeError("GLM-5.2 indexer RoPE requires BF16 q/k.")
+    q = q.contiguous()
+    k = k.contiguous()
+    cos = cos.contiguous()
+    sin = sin.contiguous()
+    q_out = torch.empty_like(q)
+    k_out = torch.empty_like(k)
+    batch, tokens, heads, _ = q.shape
+    _index_rope_kernel[(batch * tokens, heads)](
+        q,
+        k,
+        cos,
+        sin,
+        q_out,
+        k_out,
+        tokens,
+        *q.stride(),
+        *k.stride(),
+        *cos.stride(),
+        heads=heads,  # ty: ignore[invalid-argument-type]
+        num_warps=1,  # ty: ignore[unknown-argument]
+    )
+    return q_out, k_out
+
+
+@triton.jit
 def _index_scores_kernel(
     q_ptr,
     k_ptr,
