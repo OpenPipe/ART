@@ -104,7 +104,10 @@ class Glm52Handler(DefaultMoeHandler):
         )
 
     def patch_provider(self, provider: Any, bridge: Any) -> None:
-        from art.megatron.glm52.spec import get_glm52_decoder_block_spec
+        from art.megatron.glm52.spec import (
+            build_glm52_pipeline_layout,
+            get_glm52_decoder_block_spec,
+        )
 
         config = _hf_config(bridge)
         required_dims = {
@@ -139,6 +142,14 @@ class Glm52Handler(DefaultMoeHandler):
         provider.dsa_indexer_loss_coeff = 0.0
         provider.dsa_indexer_use_sparse_loss = False
         provider.glm52_indexer_types = tuple(config.indexer_types)
+        pp_size = int(provider.pipeline_model_parallel_size or 1)
+        vp_size = int(provider.virtual_pipeline_model_parallel_size or 1)
+        if pp_size * vp_size > 1 and provider.pipeline_model_parallel_layout is None:
+            provider.pipeline_model_parallel_layout = build_glm52_pipeline_layout(
+                provider.glm52_indexer_types,
+                pp_size,
+                vp_size,
+            )
         provider.moe_layer_freq = [
             0 if layer_type == "dense" else 1 for layer_type in config.mlp_layer_types
         ]
