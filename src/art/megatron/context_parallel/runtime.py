@@ -159,63 +159,101 @@ def _get_or_build_planning_bundle(
     return planning_key, bundle, group_ids_cpu, parent_ids_cpu
 
 
-def _get_or_build_gdn_rank_execution_plan(
+def _gdn_rank_plan_cache_key(
     *,
     planning_key: str,
-    bundle: _PlanningBundle,
-    topology: ParallelTopology,
     cp_rank: int,
     gdn_planner_config: Any | None,
     device: torch.device,
-) -> Any:
-    if bundle.gdn_execution_spec is None:
-        raise RuntimeError("GDN CP planning requires a parsed execution spec")
+) -> tuple[str, str, int | None, int, str]:
     config_key = (
         _json_cache_key(_dataclass_payload(gdn_planner_config))
         if gdn_planner_config is not None
         else ""
     )
-    cache_key = (
+    return (
         planning_key,
         device.type,
         device.index,
         int(cp_rank),
         config_key,
     )
+
+
+def _plan_gdn_rank_execution(
+    *,
+    planning_key: str,
+    bundle: _PlanningBundle,
+    topology: ParallelTopology,
+    cp_rank: int,
+    gdn_planner_config: Any | None,
+) -> Any:
+    """Plan one GDN rank on CPU at the explicit CP planning boundary."""
+    if bundle.gdn_execution_spec is None:
+        raise RuntimeError("GDN CP planning requires a parsed execution spec")
+    cache_key = _gdn_rank_plan_cache_key(
+        planning_key=planning_key,
+        cp_rank=cp_rank,
+        gdn_planner_config=gdn_planner_config,
+        device=torch.device("cpu"),
+    )
     cached = _GDN_RANK_PLAN_CACHE.get(cache_key)
     if cached is not None:
         return cached
 
+    from art.megatron.gdn.gdn_prefix_tree import build_gdn_rank_execution_plan
+
+    plan = build_gdn_rank_execution_plan(
+        bundle.gdn_execution_spec,
+        device="cpu",
+        cp_rank=int(cp_rank),
+        cp_size=int(topology.cp),
+        attention_token_layout_index=bundle.rank_plans[int(cp_rank)].token_layout_index,
+        planner_config=gdn_planner_config,
+    )
+    _cache_put(_GDN_RANK_PLAN_CACHE, cache_key, plan)
+    return plan
+
+
+def _materialize_preplanned_gdn_rank_execution(
+    *,
+    planning_key: str,
+    cp_rank: int,
+    gdn_planner_config: Any | None,
+    device: torch.device,
+) -> Any:
+    """Materialize a CPU-planned GDN rank without permitting late planning."""
+    cpu_key = _gdn_rank_plan_cache_key(
+        planning_key=planning_key,
+        cp_rank=cp_rank,
+        gdn_planner_config=gdn_planner_config,
+        device=torch.device("cpu"),
+    )
+    cpu_plan = _GDN_RANK_PLAN_CACHE.get(cpu_key)
+    if cpu_plan is None:
+        raise RuntimeError(
+            "GDN execution plan was not built at the CPU planning boundary"
+        )
+    if device.type == "cpu":
+        return cpu_plan
+
+    device_key = _gdn_rank_plan_cache_key(
+        planning_key=planning_key,
+        cp_rank=cp_rank,
+        gdn_planner_config=gdn_planner_config,
+        device=device,
+    )
+    device_plan = _GDN_RANK_PLAN_CACHE.get(device_key)
+    if device_plan is not None:
+        return device_plan
+
     from art.megatron.gdn.gdn_prefix_tree import (
-        build_gdn_rank_execution_plan,
         move_gdn_rank_execution_plan_to_device,
     )
 
-    if device.type == "cpu":
-        plan = build_gdn_rank_execution_plan(
-            bundle.gdn_execution_spec,
-            device=device,
-            cp_rank=int(cp_rank),
-            cp_size=int(topology.cp),
-            attention_token_layout_index=bundle.rank_plans[
-                int(cp_rank)
-            ].token_layout_index,
-            planner_config=gdn_planner_config,
-        )
-    else:
-        plan = move_gdn_rank_execution_plan_to_device(
-            _get_or_build_gdn_rank_execution_plan(
-                planning_key=planning_key,
-                bundle=bundle,
-                topology=topology,
-                cp_rank=cp_rank,
-                gdn_planner_config=gdn_planner_config,
-                device=torch.device("cpu"),
-            ),
-            device,
-        )
-    _cache_put(_GDN_RANK_PLAN_CACHE, cache_key, plan)
-    return plan
+    device_plan = move_gdn_rank_execution_plan_to_device(cpu_plan, device)
+    _cache_put(_GDN_RANK_PLAN_CACHE, device_key, device_plan)
+    return device_plan
 
 
 def context_parallel_rank_model_token_counts(
@@ -247,13 +285,12 @@ def context_parallel_rank_model_token_counts(
         return attention_counts
     gdn_counts = tuple(
         int(
-            _get_or_build_gdn_rank_execution_plan(
+            _plan_gdn_rank_execution(
                 planning_key=planning_key,
                 bundle=bundle,
                 topology=topology,
                 cp_rank=cp_rank,
                 gdn_planner_config=gdn_planner_config,
-                device=torch.device("cpu"),
             ).gdn_token_count
         )
         for cp_rank in range(int(topology.cp))
@@ -1763,13 +1800,18 @@ def prepare_megatron_context_parallel_state(
     rank_plan = bundle.rank_plans[int(cp_rank)]
     gdn_execution_plan = None
     if build_gdn_execution_spec:
-        gdn_plan_device = (
-            target_device if target_device is not None else micro["tokens"].device
-        )
-        gdn_execution_plan = _get_or_build_gdn_rank_execution_plan(
+        _plan_gdn_rank_execution(
             planning_key=planning_key,
             bundle=bundle,
             topology=topology,
+            cp_rank=cp_rank,
+            gdn_planner_config=gdn_planner_config,
+        )
+        gdn_plan_device = (
+            target_device if target_device is not None else micro["tokens"].device
+        )
+        gdn_execution_plan = _materialize_preplanned_gdn_rank_execution(
+            planning_key=planning_key,
             cp_rank=cp_rank,
             gdn_planner_config=gdn_planner_config,
             device=gdn_plan_device,
