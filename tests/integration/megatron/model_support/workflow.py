@@ -69,6 +69,7 @@ ARCHITECTURE_REPRESENTATIVE_MODELS = {
     "gemma4_moe": "google/gemma-4-26B-A4B-it",
     "gemma4_dense": "google/gemma-4-31B-it",
     "dsv4": "deepseek-ai/DeepSeek-V4-Flash",
+    "glm52": "zai-org/GLM-5.2",
     "gpt_oss_moe": "openai/gpt-oss-20b",
 }
 SUBPROCESS_VALIDATION_STAGES = frozenset(

@@ -80,6 +80,7 @@ def test_validated_architecture_representative_models_are_fixed() -> None:
         "google/gemma-4-26B-A4B-it",
         "google/gemma-4-31B-it",
         "deepseek-ai/DeepSeek-V4-Flash",
+        "zai-org/GLM-5.2",
         "openai/gpt-oss-20b",
     ]
 
