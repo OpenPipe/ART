@@ -25,7 +25,7 @@ def _hf_config(bridge: Any) -> Any:
 class Glm52Handler(DefaultMoeHandler):
     key = "glm52"
     is_moe = True
-    cp_supported = False
+    cp_supported = True
     native_vllm_lora_status = "validated"
 
     def compile_workaround_config(self, provider: Any) -> CompileWorkaroundConfig:

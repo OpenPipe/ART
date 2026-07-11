@@ -17,7 +17,13 @@ from megatron.core.typed_torch import apply_module, not_none
 from megatron.core.utils import get_pg_size
 import torch
 
-from art.megatron.glm52.indexer import indexer_rope, streaming_tree_topk
+from art.megatron.glm52.cp_attention import context_parallel_sparse_mla
+from art.megatron.glm52.indexer import (
+    Glm52RoutedTopk,
+    context_parallel_tree_topk,
+    indexer_rope,
+    streaming_tree_topk,
+)
 from art.megatron.glm52.sparse_mla import sparse_mla
 from art.megatron.glm52.state import Glm52PrefixTreeState, require_glm52_state
 
@@ -115,7 +121,7 @@ class Glm52Indexer(torch.nn.Module):
         hidden_states: torch.Tensor,
         q_residual: torch.Tensor,
         state: Glm52PrefixTreeState,
-    ) -> torch.Tensor:
+    ) -> torch.Tensor | Glm52RoutedTopk:
         q = _tensor(self.linear_wq_b(q_residual)).view(
             q_residual.shape[0], q_residual.shape[1], self.heads, self.head_dim
         )
@@ -136,6 +142,8 @@ class Glm52Indexer(torch.nn.Module):
         q, k = indexer_rope(q, k, state.rope_cos, state.rope_sin)
         weights = weights.permute(1, 0, 2).contiguous()
         weights *= (self.heads * self.head_dim) ** -0.5
+        if state.context_parallel_state is not None:
+            return context_parallel_tree_topk(q, k, weights, state, topk=self.topk)
         return streaming_tree_topk(
             q.contiguous(),
             k.contiguous(),
@@ -187,7 +195,7 @@ class Glm52SparseCore(torch.nn.Module):
         hidden_states: torch.Tensor,
         q_residual: torch.Tensor,
         state: Glm52PrefixTreeState,
-    ) -> torch.Tensor:
+    ) -> torch.Tensor | Glm52RoutedTopk:
         if self.indexer is not None:
             indices = self.indexer(hidden_states.detach(), q_residual.detach(), state)
             state.topk_by_full_layer.clear()
@@ -402,11 +410,23 @@ class Glm52SelfAttention(Attention):
         if not isinstance(core, Glm52SparseCore):
             raise TypeError(f"Expected Glm52SparseCore, got {type(core).__name__}.")
         topk = core.topk(hidden_states, q_residual, state)
-        latent_out = sparse_mla(
-            q_absorbed.permute(1, 0, 2, 3).contiguous(),
-            kv_absorbed.permute(1, 0, 2).contiguous(),
-            topk,
-            scale=self.softmax_scale,
+        q_absorbed = q_absorbed.permute(1, 0, 2, 3).contiguous()
+        kv_absorbed = kv_absorbed.permute(1, 0, 2).contiguous()
+        latent_out = (
+            context_parallel_sparse_mla(
+                q_absorbed,
+                kv_absorbed,
+                topk,
+                state,
+                scale=self.softmax_scale,
+            )
+            if isinstance(topk, Glm52RoutedTopk)
+            else sparse_mla(
+                q_absorbed,
+                kv_absorbed,
+                topk,
+                scale=self.softmax_scale,
+            )
         )
         value_out = torch.einsum("bshm,hdm->bshd", latent_out, value_weight)
         if self.kv_b_lora is not None:

@@ -1,15 +1,19 @@
 from __future__ import annotations
 
-from typing import Any, cast
+from typing import cast
 
 from pydantic import BaseModel, ConfigDict
 import torch
 import triton
 import triton.language as tl
 
-from art.megatron.context_parallel.comm import A2AVCommunicator
-from art.megatron.context_parallel.range_ops import range_gather
-from art.megatron.context_parallel.types import ArtContextParallelState, StagePlan
+from art.megatron.context_parallel.types import ArtContextParallelState
+from art.megatron.glm52.cp_stage import (
+    drain_stage_fetches,
+    launch_remote_stage_fetches,
+    stage_kv_rows,
+    stage_query_rows,
+)
 from art.megatron.glm52.state import (
     Glm52IndexerRowPlan,
     Glm52PrefixTreeState,
@@ -19,7 +23,6 @@ from art.megatron.glm52.state import (
 _MAX_SCORE_WORKSPACE_BYTES = 256 * 1024 * 1024
 _MAX_K_CHUNK = 32 * 1024
 _ROUTE_STAGE_BITS = 3
-_COMMUNICATOR = A2AVCommunicator()
 
 
 class Glm52RoutedTopk(BaseModel):
@@ -447,37 +450,6 @@ def _stage_topk_update(
             best_ids.index_copy_(0, owner_rows, ids)
 
 
-def _stage_query_inputs(
-    q: torch.Tensor,
-    weights: torch.Tensor,
-    stage_plan: StagePlan,
-    cp_state: ArtContextParallelState,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    ranges = stage_plan.owner_local_q_ranges
-    if len(ranges) == 1 and ranges[0].start == 0 and ranges[0].end == q.shape[0]:
-        return q, weights
-    cache = cp_state.execution_cache.range_meta
-    return (
-        range_gather(q, ranges, range_meta_cache=cache),
-        range_gather(weights, ranges, range_meta_cache=cache),
-    )
-
-
-def _local_stage_k(
-    k: torch.Tensor,
-    stage_plan: StagePlan,
-    cp_state: ArtContextParallelState,
-) -> torch.Tensor:
-    ranges = stage_plan.owner_local_k_ranges
-    if len(ranges) == 1 and ranges[0].start == 0 and ranges[0].end == k.shape[0]:
-        return k
-    return range_gather(
-        k,
-        ranges,
-        range_meta_cache=cp_state.execution_cache.range_meta,
-    )
-
-
 @torch.no_grad()
 def context_parallel_tree_topk(
     q: torch.Tensor,
@@ -497,27 +469,15 @@ def context_parallel_tree_topk(
         (valid_tokens, topk), float("-inf"), device=q.device, dtype=torch.float32
     )
     best_ids = torch.full((valid_tokens, topk), -1, device=q.device, dtype=torch.int32)
-    works: dict[int, Any] = {}
-    for stage_plan in cp_state.rank_plan.stage_plans:
-        if not stage_plan.is_local_stage:
-            works[int(stage_plan.stage_index)] = _COMMUNICATOR.launch_tensor_fetch(
-                tensor_local=k,
-                plan=cast(Any, stage_plan.kv_fetch_plan),
-                group=cp_state.cp_group,
-                async_op=True,
-                range_meta_cache=cp_state.execution_cache.range_meta,
-            )
+    works = launch_remote_stage_fetches(k, cp_state)
     for stage_plan, stage in zip(
         cp_state.rank_plan.stage_plans, state.stages, strict=True
     ):
         if not stage.slices:
             continue
-        q_stage, weights_stage = _stage_query_inputs(q, weights, stage_plan, cp_state)
-        k_stage = (
-            _local_stage_k(k, stage_plan, cp_state)
-            if stage_plan.is_local_stage
-            else works.pop(int(stage_plan.stage_index)).wait_post_process()
-        )
+        q_stage = stage_query_rows(q, stage_plan, cp_state)
+        weights_stage = stage_query_rows(weights, stage_plan, cp_state)
+        k_stage = stage_kv_rows(k, stage_plan, cp_state, works)
         _stage_topk_update(
             q_stage,
             k_stage,
@@ -528,8 +488,7 @@ def context_parallel_tree_topk(
             topk=topk,
         )
         del q_stage, weights_stage, k_stage
-    for work in works.values():
-        work.wait_post_process()
+    drain_stage_fetches(works)
     del best_scores
     route_map = state.route_by_global_id
     if route_map is None:
