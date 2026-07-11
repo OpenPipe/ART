@@ -10,6 +10,7 @@ import subprocess
 import sys
 from typing import Any, AsyncIterator, Literal, TypedDict, cast
 from urllib.parse import urlparse
+import uuid
 import warnings
 
 from peft.tuners.lora.config import LoraConfig
@@ -203,6 +204,10 @@ class MegatronService:
     )
     _is_sleeping: bool = False
     _latest_step: int = 0
+    _training_session_id: str = field(
+        default_factory=lambda: uuid.uuid4().hex,
+        init=False,
+    )
     _resume_step: MegatronResumeStep | None = None
     _megatron_process: subprocess.Popen[Any] | None = None
     _megatron_log_file: Any = None
@@ -1121,7 +1126,7 @@ class MegatronService:
                         MegatronMergedTrainingJob(
                             step=next_step,
                             source_policy_step=self._latest_step,
-                            training_session_id=os.path.realpath(self.output_dir),
+                            training_session_id=self._training_session_id,
                             lora_path=staging_lora_path,
                             allow_unvalidated_arch=self._allow_unvalidated_arch,
                             optimizer_state_path=self._get_optimizer_state_path("rl"),
@@ -1145,7 +1150,7 @@ class MegatronService:
                     job = MegatronTrainingJob(
                         step=next_step,
                         source_policy_step=self._latest_step,
-                        training_session_id=os.path.realpath(self.output_dir),
+                        training_session_id=self._training_session_id,
                         lora_path=staging_lora_path,
                         allow_unvalidated_arch=self._allow_unvalidated_arch,
                         optimizer_state_path=self._get_optimizer_state_path("rl"),
@@ -1193,7 +1198,7 @@ class MegatronService:
             job = MegatronTrainingJob(
                 step=next_step,
                 source_policy_step=self._latest_step,
-                training_session_id=os.path.realpath(self.output_dir),
+                training_session_id=self._training_session_id,
                 lora_path=staging_lora_path,
                 allow_unvalidated_arch=self._allow_unvalidated_arch,
                 optimizer_state_path=self._get_optimizer_state_path("rl"),
