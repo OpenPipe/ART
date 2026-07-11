@@ -17,6 +17,7 @@ def apply_vllm_runtime_patches() -> None:
     from art_vllm_runtime.gemma4_moe_lora_patch import (
         patch_gemma4_moe_lora_support,
     )
+    from art_vllm_runtime.glm52_patches import apply_glm52_vllm_runtime_patches
     from art_vllm_runtime.policy_spans import patch_policy_token_spans
 
     patch_transformers_v5_compat()
@@ -27,6 +28,7 @@ def apply_vllm_runtime_patches() -> None:
     patch_listen_for_disconnect()
     patch_tool_parser_manager()
     patch_nccl_unique_id_bootstrap()
+    apply_glm52_vllm_runtime_patches()
     apply_dsv4_vllm_runtime_patches()
     patch_art_lora_delta_weight_update()
     patch_gemma4_checkpoint_weight_update_reload()
