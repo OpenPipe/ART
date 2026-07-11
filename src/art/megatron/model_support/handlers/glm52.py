@@ -298,6 +298,11 @@ class Glm52Handler(DefaultMoeHandler):
         )
 
         targets = set(target_modules)
+        if "kv_b_proj" in targets:
+            raise ValueError(
+                "GLM-5.2 does not support kv_b_proj LoRA because native vLLM "
+                "sparse MLA executes statically absorbed W_K/W_V weights."
+            )
         for chunk in model_chunks:
             for module_name, layer in chunk.named_modules():
                 if not isinstance(layer, TransformerLayer) or not (

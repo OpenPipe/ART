@@ -78,7 +78,6 @@ _GLM52_TARGET_MODULES = (
     "q_a_proj",
     "q_b_proj",
     "kv_a_proj_with_mqa",
-    "kv_b_proj",
     "o_proj",
     "gate_proj",
     "up_proj",

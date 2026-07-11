@@ -311,7 +311,6 @@ class Glm52SelfAttention(Attention):
         self.q_a_lora: Any = None
         self.q_b_lora: Any = None
         self.kv_a_lora: Any = None
-        self.kv_b_lora: Any = None
 
     def get_query_key_value_tensors(self, *args: Any, **kwargs: Any):
         del args, kwargs
@@ -388,20 +387,6 @@ class Glm52SelfAttention(Attention):
             (self.config.qk_head_dim, self.config.v_head_dim), dim=1
         )
         q_absorbed = torch.einsum("sbhd,hdm->sbhm", q_nope, key_weight)
-        if self.kv_b_lora is not None:
-            rank = self.kv_b_lora.B_T.shape[0]
-            lora_weight = self.kv_b_lora.B_T.view(
-                rank,
-                heads,
-                self.config.qk_head_dim + self.config.v_head_dim,
-            )
-            key_lora_weight, value_lora_weight = lora_weight.split(
-                (self.config.qk_head_dim, self.config.v_head_dim), dim=-1
-            )
-            q_lora_rank = torch.einsum("sbhd,rhd->sbhr", q_nope, key_lora_weight)
-            q_absorbed = q_absorbed + self.kv_b_lora.scale * torch.einsum(
-                "sbhr,mr->sbhm", q_lora_rank, self.kv_b_lora.A_T
-            )
         q_absorbed = torch.cat((q_absorbed, q_rope), dim=-1)
         kv_absorbed = torch.cat((kv_compressed, k_rope), dim=-1)
         kv_absorbed = copy_to_tensor_model_parallel_region(
@@ -430,11 +415,6 @@ class Glm52SelfAttention(Attention):
             )
         )
         value_out = torch.einsum("bshm,hdm->bshd", latent_out, value_weight)
-        if self.kv_b_lora is not None:
-            value_rank = torch.einsum("bshm,mr->bshr", latent_out, self.kv_b_lora.A_T)
-            value_out = value_out + self.kv_b_lora.scale * torch.einsum(
-                "bshr,rhd->bshd", value_rank, value_lora_weight
-            )
         value_out = value_out.permute(1, 0, 2, 3).reshape(
             seq_len, batch, heads * self.config.v_head_dim
         )

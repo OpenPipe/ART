@@ -76,24 +76,16 @@ def apply_glm52_attention_lora(
                     alpha=alpha,
                 ),
             )
-    for target, attr, linear_attr in (
-        ("q_b_proj", "q_b_lora", "linear_q_up_proj"),
-        ("kv_b_proj", "kv_b_lora", "linear_kv_up_proj"),
-    ):
-        if _targets_include(target_modules, target):
-            linear = getattr(attention, linear_attr)
-            setattr(
-                attention,
-                attr,
-                _parallel_lora(
-                    adapter_model_prefix=f"{prefix}.{target}",
-                    linear=linear,
-                    out_features=linear.weight.shape[0],
-                    rank=rank,
-                    alpha=alpha,
-                    layout="column",
-                ),
-            )
+    if _targets_include(target_modules, "q_b_proj"):
+        linear = attention.linear_q_up_proj
+        attention.q_b_lora = _parallel_lora(
+            adapter_model_prefix=f"{prefix}.q_b_proj",
+            linear=linear,
+            out_features=linear.weight.shape[0],
+            rank=rank,
+            alpha=alpha,
+            layout="column",
+        )
     if _targets_include(target_modules, "o_proj"):
         attention.linear_proj = SelfAttentionLinearProjLoRA(
             adapter_model_prefix=f"{prefix}.o_proj",
@@ -199,7 +191,6 @@ def add_glm52_attention_adapter_weights(
         ("q_a_lora", "linear_q_down_proj"),
         ("q_b_lora", "linear_q_up_proj"),
         ("kv_a_lora", "linear_kv_down_proj"),
-        ("kv_b_lora", "linear_kv_up_proj"),
     ):
         lora = getattr(attention, attr)
         if lora is not None:
