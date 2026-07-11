@@ -4,8 +4,9 @@ from typing import Any
 
 
 class _SharedTopkBuffer:
-    def __init__(self, topk_indices_buffer: Any) -> None:
+    def __init__(self, topk_indices_buffer: Any, topk_tokens: int) -> None:
         self.topk_indices_buffer = topk_indices_buffer
+        self.topk_tokens = topk_tokens
 
 
 def apply_glm52_vllm_runtime_patches() -> None:
@@ -42,7 +43,11 @@ def patch_glm52_shared_indexers() -> None:
                 raise RuntimeError(
                     f"GLM index schedules disagree at layer {layer_idx}: {mode=}"
                 )
-            return _SharedTopkBuffer(args[6]) if skip_topk else super().__new__(cls)
+            return (
+                _SharedTopkBuffer(args[6], config.index_topk)
+                if skip_topk
+                else super().__new__(cls)
+            )
 
     Glm52Indexer.__art_glm52_index_share_patched__ = True
     deepseek_v2.Indexer = Glm52Indexer
