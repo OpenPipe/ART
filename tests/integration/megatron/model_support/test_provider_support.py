@@ -213,7 +213,7 @@ def test_get_provider_accepts_registry_supported_models(
     assert resolved.moe_shared_expert_overlap is False
     assert resolved.add_bias_linear is False
     assert resolved.bias_activation_fusion is False
-    assert resolved.moe_router_dtype == "fp32"
+    assert resolved.moe_router_dtype is None
     assert resolved.moe_aux_loss_coeff == 0.0
     assert resolved.calculate_per_token_loss is True
 

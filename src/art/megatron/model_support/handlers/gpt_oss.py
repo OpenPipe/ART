@@ -780,10 +780,9 @@ class GptOssMoeHandler(DefaultMoeHandler):
         provider.art_flex_core_attention_wrapper = _gpt_oss_flex_core_attention_wrapper
         provider.art_flex_sliding_windows = (sliding_window,)
         provider.moe_shared_expert_overlap = False
-        # GPT-OSS has many experts; keep router logits in fp32 as in ART's
-        # generic MoE runtime default and as required by HybridEP's
-        # route-probability contract.
-        provider.moe_router_dtype = "fp32"
+        # Match vLLM's bf16 router computation; fp32 routing changes expert
+        # selection enough to regress GPT-OSS train/inference parity.
+        provider.moe_router_dtype = None
         _install_weighted_bias_quick_geglu_patch()
 
     def patch_bridge(self, bridge: Any) -> None:
