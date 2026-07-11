@@ -17,6 +17,7 @@ def _sparse_mla_fwd_kernel(
     q_ptr,
     kv_ptr,
     indices_ptr,
+    offsets_ptr,
     out_ptr,
     lse_ptr,
     q_tokens,
@@ -32,6 +33,9 @@ def _sparse_mla_fwd_kernel(
     stride_ib,
     stride_is,
     stride_ik,
+    stride_xb,
+    stride_xs,
+    stride_xg,
     stride_ob,
     stride_os,
     stride_oh,
@@ -45,6 +49,8 @@ def _sparse_mla_fwd_kernel(
     rope_dim: tl.constexpr,
     block_h: tl.constexpr,
     block_i: tl.constexpr,
+    stage_index: tl.constexpr,
+    routed: tl.constexpr,
 ):
     row = tl.program_id(0)
     h_block = tl.program_id(1)
@@ -76,7 +82,14 @@ def _sparse_mla_fwd_kernel(
     row_max = tl.full((block_h,), float("-inf"), tl.float32)
     row_sum = tl.zeros((block_h,), tl.float32)
 
-    for index_start in range(0, topk, block_i):
+    if routed:
+        route_base = batch * stride_xb + token * stride_xs
+        index_start = tl.load(offsets_ptr + route_base + stage_index * stride_xg)
+        index_end = tl.load(offsets_ptr + route_base + (stage_index + 1) * stride_xg)
+    else:
+        index_start = 0
+        index_end = topk
+    while index_start < index_end:
         index_offsets = index_start + tl.arange(0, block_i)
         indices = tl.load(
             indices_ptr
@@ -84,7 +97,9 @@ def _sparse_mla_fwd_kernel(
             + token * stride_is
             + index_offsets * stride_ik,
         )
-        valid_indices = (indices >= 0) & (indices < kv_tokens)
+        valid_indices = (
+            (index_offsets < index_end) & (indices >= 0) & (indices < kv_tokens)
+        )
         safe_indices = tl.maximum(indices, 0)
         kv_latent = tl.load(
             kv_ptr
@@ -115,6 +130,7 @@ def _sparse_mla_fwd_kernel(
         acc *= alpha[:, None]
         acc += tl.dot(probabilities.to(tl.bfloat16), kv_latent)
         row_max = next_max
+        index_start += block_i
 
     has_keys = row_sum > 0.0
     output = tl.where(has_keys[:, None], acc / row_sum[:, None], 0.0)
@@ -140,6 +156,7 @@ def _sparse_mla_bwd_kernel(
     q_ptr,
     kv_ptr,
     indices_ptr,
+    offsets_ptr,
     out_ptr,
     grad_out_ptr,
     lse_ptr,
@@ -158,6 +175,9 @@ def _sparse_mla_bwd_kernel(
     stride_ib,
     stride_is,
     stride_ik,
+    stride_xb,
+    stride_xs,
+    stride_xg,
     stride_ob,
     stride_os,
     stride_oh,
@@ -182,6 +202,8 @@ def _sparse_mla_bwd_kernel(
     rope_dim: tl.constexpr,
     block_h: tl.constexpr,
     block_i: tl.constexpr,
+    stage_index: tl.constexpr,
+    routed: tl.constexpr,
 ):
     row = tl.program_id(0)
     h_block = tl.program_id(1)
@@ -237,7 +259,14 @@ def _sparse_mla_bwd_kernel(
     grad_q_latent = tl.zeros((block_h, latent_dim), tl.float32)
     grad_q_rope = tl.zeros((block_h, rope_dim), tl.float32)
 
-    for index_start in range(0, topk, block_i):
+    if routed:
+        route_base = batch * stride_xb + token * stride_xs
+        index_start = tl.load(offsets_ptr + route_base + stage_index * stride_xg)
+        index_end = tl.load(offsets_ptr + route_base + (stage_index + 1) * stride_xg)
+    else:
+        index_start = 0
+        index_end = topk
+    while index_start < index_end:
         index_offsets = index_start + tl.arange(0, block_i)
         indices = tl.load(
             indices_ptr
@@ -245,7 +274,9 @@ def _sparse_mla_bwd_kernel(
             + token * stride_is
             + index_offsets * stride_ik,
         )
-        valid_indices = (indices >= 0) & (indices < kv_tokens)
+        valid_indices = (
+            (index_offsets < index_end) & (indices >= 0) & (indices < kv_tokens)
+        )
         safe_indices = tl.maximum(indices, 0)
         kv_latent = tl.load(
             kv_ptr
@@ -292,6 +323,7 @@ def _sparse_mla_bwd_kernel(
             grad_key_rope,
             mask=valid_indices[:, None],
         )
+        index_start += block_i
 
     tl.store(
         grad_q_ptr
@@ -319,8 +351,10 @@ def sparse_mla_forward(
     indices: torch.Tensor,
     *,
     scale: float,
+    route_offsets: torch.Tensor | None = None,
+    stage_index: int = 0,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    _validate_inputs(q, kv, indices)
+    _validate_inputs(q, kv, indices, route_offsets, stage_index)
     batch, q_tokens, heads, _ = q.shape
     kv_tokens = int(kv.shape[1])
     topk = int(indices.shape[-1])
@@ -334,6 +368,7 @@ def sparse_mla_forward(
         q,
         kv,
         indices,
+        indices if route_offsets is None else route_offsets,
         out,
         lse,
         q_tokens,
@@ -342,6 +377,7 @@ def sparse_mla_forward(
         *q.stride(),
         *kv.stride(),
         *indices.stride(),
+        *(indices.stride() if route_offsets is None else route_offsets.stride()),
         *out.stride(),
         *lse.stride(),
         scale=scale,  # ty: ignore[invalid-argument-type]
@@ -350,6 +386,8 @@ def sparse_mla_forward(
         rope_dim=_ROPE_DIM,  # ty: ignore[invalid-argument-type]
         block_h=_HEAD_BLOCK,  # ty: ignore[invalid-argument-type]
         block_i=_INDEX_BLOCK,  # ty: ignore[invalid-argument-type]
+        stage_index=stage_index,  # ty: ignore[invalid-argument-type]
+        routed=route_offsets is not None,  # ty: ignore[invalid-argument-type]
         num_warps=8,  # ty: ignore[unknown-argument]
         num_stages=2,  # ty: ignore[unknown-argument]
     )
@@ -365,7 +403,10 @@ def sparse_mla_backward(
     grad_out: torch.Tensor,
     *,
     scale: float,
+    route_offsets: torch.Tensor | None = None,
+    stage_index: int = 0,
 ) -> tuple[torch.Tensor, torch.Tensor]:
+    _validate_inputs(q, kv, indices, route_offsets, stage_index)
     grad_out = grad_out.contiguous()
     batch, q_tokens, heads, _ = q.shape
     kv_tokens = int(kv.shape[1])
@@ -376,6 +417,7 @@ def sparse_mla_backward(
         q,
         kv,
         indices,
+        indices if route_offsets is None else route_offsets,
         out,
         grad_out,
         lse,
@@ -387,6 +429,7 @@ def sparse_mla_backward(
         *q.stride(),
         *kv.stride(),
         *indices.stride(),
+        *(indices.stride() if route_offsets is None else route_offsets.stride()),
         *out.stride(),
         *grad_out.stride(),
         *lse.stride(),
@@ -398,6 +441,8 @@ def sparse_mla_backward(
         rope_dim=_ROPE_DIM,  # ty: ignore[invalid-argument-type]
         block_h=_HEAD_BLOCK,  # ty: ignore[invalid-argument-type]
         block_i=_INDEX_BLOCK,  # ty: ignore[invalid-argument-type]
+        stage_index=stage_index,  # ty: ignore[invalid-argument-type]
+        routed=route_offsets is not None,  # ty: ignore[invalid-argument-type]
         num_warps=8,  # ty: ignore[unknown-argument]
         num_stages=1,  # ty: ignore[unknown-argument]
     )
@@ -447,7 +492,13 @@ def sparse_mla(
     )
 
 
-def _validate_inputs(q: torch.Tensor, kv: torch.Tensor, indices: torch.Tensor) -> None:
+def _validate_inputs(
+    q: torch.Tensor,
+    kv: torch.Tensor,
+    indices: torch.Tensor,
+    route_offsets: torch.Tensor | None,
+    stage_index: int,
+) -> None:
     if q.dtype is not torch.bfloat16 or kv.dtype is not torch.bfloat16:
         raise TypeError(f"GLM-5.2 sparse MLA requires bf16, got {q.dtype}/{kv.dtype}.")
     if indices.dtype is not torch.int32:
@@ -466,3 +517,11 @@ def _validate_inputs(q: torch.Tensor, kv: torch.Tensor, indices: torch.Tensor) -
         )
     if q.shape[:2] != indices.shape[:2] or q.shape[0] != kv.shape[0]:
         raise ValueError("GLM-5.2 sparse MLA batch/query shapes do not match.")
+    if route_offsets is None:
+        return
+    if route_offsets.dtype is not torch.int32 or route_offsets.device != q.device:
+        raise TypeError("GLM-5.2 route offsets must be colocated int32 tensors.")
+    if route_offsets.ndim != 3 or route_offsets.shape[:2] != q.shape[:2]:
+        raise ValueError("GLM-5.2 route offsets must have shape [B,S,stages+1].")
+    if not 0 <= stage_index < int(route_offsets.shape[-1]) - 1:
+        raise ValueError(f"GLM-5.2 route stage {stage_index} is out of range.")
