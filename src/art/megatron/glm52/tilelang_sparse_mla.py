@@ -229,9 +229,6 @@ def _delta(heads, block=32, num_stages=5):
 )
 def _backward(
     heads,
-    batch,
-    q_tokens,
-    kv_tokens,
     topk,
     scale,
     dkv_splits=_DKV_SPLITS,
@@ -239,8 +236,9 @@ def _backward(
     num_stages=0,
     threads=256,
 ):
-    # TileLang 0.1.10 mislowers dynamic indirect atomic destinations; packed
-    # extents are stable across layers and compile once per training topology.
+    batch = T.dynamic("batch")
+    q_tokens = T.dynamic("q_tokens")
+    kv_tokens = T.dynamic("kv_tokens")
     assert topk % block_i == 0
     q_shape = [batch, q_tokens, heads, _DIM]
     kv_shape = [batch, kv_tokens, 1, _DIM]
@@ -481,9 +479,6 @@ def backward(
         )
         grad_q = _backward(
             int(kernel_heads),
-            int(q.shape[0]),
-            int(q.shape[1]),
-            int(kv.shape[1]),
             int(indices.shape[-1]),
             float(scale),
             threads=min(256, int(kernel_heads) * 8),
