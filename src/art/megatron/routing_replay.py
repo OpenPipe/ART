@@ -20,7 +20,7 @@ if TYPE_CHECKING:
     from art.preprocessing.pack import PackedTensors
 
 ROUTER_NAME_TOKEN = ".mlp.router"
-ROUTER_KEY_FORMAT_VERSION = "moe_routing_replay_v2"
+ROUTER_KEY_FORMAT_VERSION = "moe_routing_replay_v3"
 GLOBAL_TOKEN_UIDS_KEY = "global_token_uids"
 
 _ROUTER_LAYER_PATTERN = re.compile(r"decoder\.layers\.(?P<layer>\d+)\.mlp\.router$")
@@ -93,7 +93,7 @@ class RouterCallRoute(BaseModel):
 
     expert_indices: torch.Tensor
     expert_probs: torch.Tensor | None = None
-    expert_mask: torch.Tensor
+    expert_mask: torch.Tensor | None = None
     num_experts: int
     sample_index: int | None = None
     micro_slot: int | None = None
@@ -108,7 +108,6 @@ class RouterCallRoute(BaseModel):
             self.expert_probs = _to_tensor_cpu_contiguous(
                 self.expert_probs, dtype=torch.float32
             )
-        self.expert_mask = _to_tensor_cpu_contiguous(self.expert_mask, dtype=torch.bool)
         if self.expert_indices.ndim != 2:
             raise RuntimeError(
                 "expert_indices must have shape [num_tokens, topk], got "
@@ -122,20 +121,22 @@ class RouterCallRoute(BaseModel):
                 "expert_probs shape must match expert_indices shape, got "
                 f"{tuple(self.expert_probs.shape)} vs {tuple(self.expert_indices.shape)}"
             )
-        if self.expert_mask.shape != self.expert_indices.shape:
-            raise RuntimeError(
-                "expert_mask shape must match expert_indices shape, got "
-                f"{tuple(self.expert_mask.shape)} vs {tuple(self.expert_indices.shape)}"
+        if self.expert_mask is not None:
+            self.expert_mask = _to_tensor_cpu_contiguous(
+                self.expert_mask, dtype=torch.bool
             )
-        if not bool(self.expert_mask.all().item()):
-            raise RuntimeError(
-                "masked slots are unsupported by Megatron native MoE routing replay; "
-                "route bundles must contain a valid full top-k expert id row for "
-                "every replayed token"
-            )
+            if self.expert_mask.shape != self.expert_indices.shape:
+                raise RuntimeError(
+                    "expert_mask shape must match expert_indices shape, got "
+                    f"{tuple(self.expert_mask.shape)} vs {tuple(self.expert_indices.shape)}"
+                )
         if self.num_experts <= 0:
             raise RuntimeError(f"num_experts must be >0, got {self.num_experts}")
-        selected = self.expert_indices[self.expert_mask]
+        selected = (
+            self.expert_indices
+            if self.expert_mask is None
+            else self.expert_indices[self.expert_mask]
+        )
         if int(selected.numel()) > 0 and (
             int(selected.min().item()) < 0
             or int(selected.max().item()) >= int(self.num_experts)
@@ -342,19 +343,14 @@ class MoeRoutingReplayBundle(BaseModel):
                         router_key, call_index, "expert_probs"
                     )
                     mask_key = _build_tensor_key(router_key, call_index, "expert_mask")
-                    missing_keys = [
-                        key
-                        for key in (indices_key, mask_key)
-                        if key not in step_tensors
-                    ]
-                    if missing_keys:
+                    if indices_key not in step_tensors:
                         raise RuntimeError(
-                            f"Missing tensor keys {missing_keys} in {step_info['file']}"
+                            f"Missing tensor key {indices_key} in {step_info['file']}"
                         )
                     calls[call_index] = RouterCallRoute.model_construct(
                         expert_indices=step_tensors[indices_key],
                         expert_probs=step_tensors.get(probs_key),
-                        expert_mask=step_tensors[mask_key],
+                        expert_mask=step_tensors.get(mask_key),
                         num_experts=int(call_info["num_experts"]),
                         sample_index=call_info.get("sample_index"),
                         micro_slot=call_info.get("micro_slot"),
@@ -396,9 +392,10 @@ class MoeRoutingReplayBundle(BaseModel):
                         step_tensors[
                             _build_tensor_key(router_key, call_index, "expert_probs")
                         ] = route.expert_probs
-                    step_tensors[
-                        _build_tensor_key(router_key, call_index, "expert_mask")
-                    ] = route.expert_mask.contiguous()
+                    if route.expert_mask is not None:
+                        step_tensors[
+                            _build_tensor_key(router_key, call_index, "expert_mask")
+                        ] = route.expert_mask.contiguous()
                     call_info: dict[str, Any] = {"num_experts": int(route.num_experts)}
                     if route.sample_index is not None:
                         call_info["sample_index"] = int(route.sample_index)
@@ -558,7 +555,7 @@ def _full_mask_router_call_route(
     return RouterCallRoute.model_construct(
         expert_indices=expert_indices,
         expert_probs=None,
-        expert_mask=torch.ones((), dtype=torch.bool).expand(expert_indices.shape),
+        expert_mask=None,
         num_experts=int(num_experts),
         sample_index=None if sample_index is None else int(sample_index),
         micro_slot=None if micro_slot is None else int(micro_slot),
@@ -1078,7 +1075,9 @@ class MoeRoutingReplayController:
             router_calls = step_routes.routers[router_key].calls
             binding_topk = int(self._router_bindings[router_key]["topk"])
             for call_index, route in router_calls.items():
-                if not bool(route.expert_mask.all().item()):
+                if route.expert_mask is not None and not bool(
+                    route.expert_mask.all().item()
+                ):
                     raise RuntimeError(
                         "masked slots are unsupported by Megatron native MoE routing "
                         f"replay: step={step_index}, router='{router_key}', "

@@ -342,6 +342,8 @@ def test_bundle_roundtrip_disk() -> None:
     assert loaded.router_keys == bundle.router_keys
     loaded_route = loaded.steps[0].routers[bundle.router_keys[0]].calls[0]
     assert torch.equal(loaded_route.expert_indices, route.expert_indices)
+    assert loaded_route.expert_mask is not None
+    assert route.expert_mask is not None
     assert torch.equal(loaded_route.expert_mask, route.expert_mask)
 
 
@@ -505,6 +507,7 @@ def test_controller_rejects_missing_native_router_replay() -> None:
 
 def test_controller_rejects_masked_slots() -> None:
     bundle, route = _make_bundle()
+    assert route.expert_mask is not None
     route.expert_mask[0, 1] = False
     controller = MoeRoutingReplayController(bundle=bundle, strict=True, device="cpu")
     chunk = _FakeChunk()

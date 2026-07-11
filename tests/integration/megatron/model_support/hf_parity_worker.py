@@ -489,7 +489,13 @@ def _active_router_rows_by_layer(
         for route in router_routes.calls.values():
             if route.expert_indices.numel() == 0:
                 continue
-            layer_rows.append(route.expert_indices[route.expert_mask].to(torch.long))
+            layer_rows.append(
+                (
+                    route.expert_indices
+                    if route.expert_mask is None
+                    else route.expert_indices[route.expert_mask]
+                ).to(torch.long)
+            )
         if layer_rows:
             active_rows[layer_index] = torch.unique(
                 torch.cat(layer_rows, dim=0),
@@ -529,7 +535,9 @@ def _loss_active_last_layer_experts(
                 micro["labels"].reshape(-1)[:actual_len].unsqueeze(0), -100
             ).reshape(-1)
             loss_mask = (shifted_labels != -100).cpu()
-            selected = route.expert_indices[loss_mask][route.expert_mask[loss_mask]]
+            selected = route.expert_indices[loss_mask]
+            if route.expert_mask is not None:
+                selected = selected[route.expert_mask[loss_mask]]
             experts.update(int(expert) for expert in selected.reshape(-1).tolist())
     return experts
 

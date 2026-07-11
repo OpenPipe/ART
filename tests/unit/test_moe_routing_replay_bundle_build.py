@@ -71,8 +71,7 @@ def test_fast_bundle_build_roundtrips_expanded_full_masks(tmp_path) -> None:
 
     route = bundle.steps[0].routers["chunk_00.layer_0000.mlp.router"].calls[0]
     assert route.expert_indices[:3].tolist() == [[0, 1], [1, 2], [2, 3]]
-    assert route.expert_mask.shape == route.expert_indices.shape
-    assert bool(route.expert_mask.all().item())
+    assert route.expert_mask is None
     assert all(
         0 <= expert_id < route.num_experts
         for expert_id in route.expert_indices[3].tolist()
@@ -83,7 +82,7 @@ def test_fast_bundle_build_roundtrips_expanded_full_masks(tmp_path) -> None:
     loaded = MoeRoutingReplayBundle.from_dir(tmp_path)
     loaded_route = loaded.steps[0].routers["chunk_00.layer_0000.mlp.router"].calls[0]
     assert torch.equal(loaded_route.expert_indices, route.expert_indices)
-    assert bool(loaded_route.expert_mask.all().item())
+    assert loaded_route.expert_mask is None
 
 
 def test_fast_bundle_build_rejects_invalid_routed_expert_id() -> None:
