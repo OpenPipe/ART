@@ -117,7 +117,11 @@ def run_train_inf_mismatch(
             skipped_count=counts["skipped"],
         )
         attempts.append(selected)
-        if result.returncode == 0:
+        if (
+            result.returncode == 0
+            and selected.passed_count > 0
+            and selected.skipped_count == 0
+        ):
             break
     if selected is None:
         raise RuntimeError("train/inf mismatch retry loop did not run")

@@ -401,6 +401,7 @@ def test_workflow_stage_does_not_accept_a_skipped_live_test(
 ) -> None:
     import subprocess
 
+    monkeypatch.setenv("ART_TRAIN_INF_MISMATCH_ATTEMPTS", "1")
     monkeypatch.setattr(workflow_stage, "create_artifact_dir", lambda _nodeid: tmp_path)
     monkeypatch.setattr(
         workflow_stage.subprocess,
@@ -416,3 +417,5 @@ def test_workflow_stage_does_not_accept_a_skipped_live_test(
     report = workflow_stage.run_train_inf_mismatch(base_model="Qwen/Qwen3.5-35B-A3B")
 
     assert report.passed is False
+    assert report.passed_count == 0
+    assert report.skipped_count == 1
