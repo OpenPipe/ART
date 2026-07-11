@@ -797,6 +797,12 @@ def selected_suite_topologies(
 def stable_case_id(case_config: OracleCaseConfig) -> str:
     """Builds a deterministic case id from case config contents."""
     payload = case_config.model_dump(mode="json")
+    from art.megatron.model_support import default_target_modules_for_model
+
+    payload["runtime_target_modules"] = default_target_modules_for_model(
+        case_config.base_model,
+        allow_unvalidated_arch=case_config.allow_unvalidated_arch,
+    )
     encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"))
     digest = hashlib.sha256(encoded.encode("utf-8")).hexdigest()[:16]
     model_tag = (
