@@ -4,8 +4,12 @@ from typing import Any, Literal, Sequence
 
 import torch
 
-from art.megatron.model_support.handlers.default_dense import DefaultMoeHandler
+from art.megatron.model_support.handlers.default_dense import (
+    DefaultMoeHandler,
+    _compile_workaround_flags_for_provider,
+)
 from art.megatron.model_support.spec import (
+    CompileWorkaroundConfig,
     ExpertPackedLoraGroup,
     ExpertPackedLoraSlot,
     LayerFamilyInstance,
@@ -23,6 +27,18 @@ class Glm52Handler(DefaultMoeHandler):
     is_moe = True
     cp_supported = False
     native_vllm_lora_status = "wip"
+
+    def compile_workaround_config(self, provider: Any) -> CompileWorkaroundConfig:
+        ep1_alltoall = (
+            int(getattr(provider, "expert_model_parallel_size", 1) or 1) == 1
+            and getattr(provider, "moe_token_dispatcher_type", None) == "alltoall"
+        )
+        return CompileWorkaroundConfig(
+            flags=_compile_workaround_flags_for_provider(
+                provider, ("moe_preprocess",) if ep1_alltoall else ()
+            ),
+            shared_expert_state=self._shared_expert_compile_state(provider),
+        )
 
     def patch_provider(self, provider: Any, bridge: Any) -> None:
         from art.megatron.glm52.spec import get_glm52_decoder_block_spec
