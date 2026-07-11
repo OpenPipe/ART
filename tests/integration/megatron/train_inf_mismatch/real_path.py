@@ -1246,20 +1246,30 @@ def _real_path_megatron_worker(
         if request.weight_state == "lora":
             if request.adapter_path is None:
                 initial_state = _collect_full_lora_state(cast(list[Any], runtime.model))
-                if torch.distributed.get_rank() == 0:  # type: ignore[possibly-missing-attribute]
-                    adapter_path = artifact_dir / "real_path_active_lora"
-                    initialized = _build_deterministic_nonzero_lora(
+                rank = torch.distributed.get_rank()  # type: ignore[possibly-missing-attribute]
+                initialized = (
+                    _build_deterministic_nonzero_lora(
                         initial_state or {},
                         seed=request.config.seed,
                     )
-                    _save_vllm_lora_adapter(
-                        lora_path=adapter_path,
-                        state=initialized,
-                        runtime=runtime,
-                        config=request.config,
-                    )
-                torch.distributed.barrier()  # type: ignore[possibly-missing-attribute]
+                    if rank == 0
+                    else None
+                )
+                payload = [initialized]
+                torch.distributed.broadcast_object_list(  # type: ignore[possibly-missing-attribute]
+                    payload,
+                    src=0,
+                    device=torch.device("cuda", local_rank),
+                )
+                initialized = cast(dict[str, Any], payload[0])
                 adapter_path = artifact_dir / "real_path_active_lora"
+                _save_vllm_lora_adapter(
+                    lora_path=adapter_path,
+                    state=initialized,
+                    runtime=runtime,
+                    config=request.config,
+                )
+                torch.distributed.barrier()  # type: ignore[possibly-missing-attribute]
             else:
                 adapter_path = Path(request.adapter_path)
             adapter_model = load_lora_tensors_for_megatron(

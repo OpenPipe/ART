@@ -969,7 +969,8 @@ def _save_vllm_lora_adapter(
 ) -> None:
     import torch
 
-    from art.megatron.model_support.lora_disk import save_vllm_lora_tensors
+    from art.megatron import train as megatron_train
+    from art.megatron.weights.lora_publish import save_vllm_lora_from_model
 
     if not state:
         raise RuntimeError("Refusing to save empty LoRA state")
@@ -981,12 +982,20 @@ def _save_vllm_lora_adapter(
     ]
     if zero_keys:
         raise RuntimeError(f"Refusing zero LoRA tensors: {zero_keys[:5]}")
-    adapter_config = _adapter_config(config)
-    tensors, adapter_config = runtime.model_support_handler.to_vllm_lora_tensors(
+    megatron_train.load_adapter_into_model(
+        runtime.model,
         state,
-        adapter_config=adapter_config,
+        model_support_handler=runtime.model_support_handler,
     )
-    save_vllm_lora_tensors(lora_path, tensors, adapter_config)
+    save_vllm_lora_from_model(
+        model=runtime.model,
+        adapter_model=state,
+        handler=runtime.model_support_handler,
+        adapter_config=_adapter_config(config),
+        output_dir=str(lora_path),
+        rank=runtime.rank,
+        world_size=runtime.world_size,
+    )
 
 
 def _run_logits(
