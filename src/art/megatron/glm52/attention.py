@@ -190,6 +190,7 @@ class Glm52SparseCore(torch.nn.Module):
     ) -> torch.Tensor:
         if self.indexer is not None:
             indices = self.indexer(hidden_states.detach(), q_residual.detach(), state)
+            state.topk_by_full_layer.clear()
             state.topk_by_full_layer[self.full_layer_index] = indices
             return indices
         indices = state.topk_by_full_layer.get(self.full_layer_index)

@@ -97,6 +97,17 @@ class Glm52Handler(DefaultMoeHandler):
             raise RuntimeError("GLM-5.2 prefix-tree attention requires input_pos.")
         from art.megatron.glm52.state import build_glm52_prefix_tree_state
 
+        if context.context_parallel_state is not None:
+            from art.megatron.glm52.state import build_glm52_context_parallel_state
+
+            return {
+                "glm52": build_glm52_context_parallel_state(
+                    position_ids=context.input_pos,
+                    context_parallel_state=context.context_parallel_state,
+                    device=context.device,
+                )
+            }
+
         return {
             "glm52": build_glm52_prefix_tree_state(
                 position_ids=context.input_pos,
