@@ -1234,6 +1234,22 @@ def _infer_parallel_topology(model_chunks: ModelChunks) -> ParallelTopology:
     )
 
 
+def _hybridep_token_capacity(
+    packed_sequence_length: int, context_parallel_size: int
+) -> int:
+    from art.megatron.context_parallel.types import ContextParallelConfig
+
+    # HybridEP JIT keys include this capacity. A CP tree unit is at most one
+    # mean rank load and is assigned to the least-loaded rank, so twice the
+    # rounded mean is the layout-independent upper bound. Reserve it once.
+    planner_chunk = ContextParallelConfig().planner_chunk_size
+    mean_rank_load = (
+        math.ceil(packed_sequence_length / (planner_chunk * context_parallel_size))
+        * planner_chunk
+    )
+    return min(packed_sequence_length, 2 * mean_rank_load)
+
+
 def _ensure_hybridep_capacity(
     runtime: TrainingRuntime,
     *,
@@ -1245,14 +1261,8 @@ def _ensure_hybridep_capacity(
         return
     from megatron.core.transformer.moe import fused_a2a
 
-    from art.megatron.context_parallel.types import ContextParallelConfig
-
-    # HybridEP JIT keys include this capacity. Reserve CP's upper bound once so
-    # varying prefix-tree stage lengths do not compile new kernels mid-run.
-    planner_chunk = ContextParallelConfig().planner_chunk_size
-    token_capacity = (
-        math.ceil(packed_sequence_length / (planner_chunk * context_parallel_size))
-        * planner_chunk
+    token_capacity = _hybridep_token_capacity(
+        packed_sequence_length, context_parallel_size
     )
     current = fused_a2a._hybrid_ep_buffer
     if (
