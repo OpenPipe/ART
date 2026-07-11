@@ -1,11 +1,13 @@
 from __future__ import annotations
 
-from typing import Any, Literal
+from typing import Any, Literal, Sequence
 
 import torch
 
 from art.megatron.model_support.handlers.default_dense import DefaultMoeHandler
 from art.megatron.model_support.spec import (
+    ExpertPackedLoraGroup,
+    ExpertPackedLoraSlot,
     LayerFamilyInstance,
     PrefixTreeModelStateContext,
 )
@@ -162,6 +164,155 @@ class Glm52Handler(DefaultMoeHandler):
                 or ("experts" in targets and ".experts." in name)
             )
         ]
+
+    def apply_lora_adapters(
+        self,
+        model_chunks: Sequence[Any],
+        provider: Any,
+        *,
+        target_modules: list[str],
+        rank: int,
+        alpha: int,
+    ) -> None:
+        from megatron.core.transformer.transformer_layer import TransformerLayer
+
+        from art.megatron.glm52.attention import Glm52SelfAttention
+        from art.megatron.glm52.lora import apply_glm52_attention_lora
+        from art.megatron.lora import (
+            _adapter_model_prefix,
+            _is_language_transformer_layer_name,
+            wrap_dense_mlp,
+            wrap_grouped_moe_experts_3d,
+            wrap_shared_experts_mlp,
+        )
+
+        targets = set(target_modules)
+        for chunk in model_chunks:
+            for module_name, layer in chunk.named_modules():
+                if not isinstance(layer, TransformerLayer) or not (
+                    _is_language_transformer_layer_name(module_name)
+                ):
+                    continue
+                if not isinstance(layer.self_attention, Glm52SelfAttention):
+                    raise TypeError(
+                        "GLM-5.2 layer has unsupported attention "
+                        f"{type(layer.self_attention).__name__}."
+                    )
+                prefix = _adapter_model_prefix(layer)
+                apply_glm52_attention_lora(
+                    layer.self_attention,
+                    adapter_model_prefix=prefix,
+                    provider=provider,
+                    target_modules=targets,
+                    rank=rank,
+                    alpha=alpha,
+                )
+                experts = getattr(layer.mlp, "experts", None)
+                if experts is None:
+                    wrap_dense_mlp(
+                        layer.mlp,
+                        adapter_model_prefix=prefix,
+                        provider=provider,
+                        target_modules=targets,
+                        rank=rank,
+                        alpha=alpha,
+                    )
+                    continue
+                wrap_grouped_moe_experts_3d(
+                    experts,
+                    adapter_model_prefix=prefix,
+                    target_modules=targets,
+                    rank=rank,
+                    alpha=alpha,
+                )
+                shared_experts = getattr(layer.mlp, "shared_experts", None)
+                if shared_experts is not None:
+                    wrap_shared_experts_mlp(
+                        shared_experts,
+                        adapter_model_prefix=prefix,
+                        provider=provider,
+                        target_modules=targets,
+                        rank=rank,
+                        alpha=alpha,
+                    )
+
+    def build_adapter_weights_by_base(
+        self, model_chunks: Sequence[Any]
+    ) -> dict[str, list[Any]]:
+        from megatron.core.transformer.transformer_layer import TransformerLayer
+
+        from art.megatron.glm52.attention import Glm52SelfAttention
+        from art.megatron.glm52.lora import add_glm52_attention_adapter_weights
+        from art.megatron.weights.adapter_export import (
+            add_dense_mlp_adapter_weights,
+            add_grouped_moe_adapter_weights,
+            add_shared_experts_adapter_weights,
+            layer_base_prefix,
+        )
+
+        result: dict[str, list[Any]] = {}
+        for chunk in model_chunks:
+            for module_name, layer in chunk.named_modules():
+                if not isinstance(layer, TransformerLayer) or not isinstance(
+                    layer.self_attention, Glm52SelfAttention
+                ):
+                    continue
+                prefix = layer_base_prefix(layer, module_name=module_name)
+                add_glm52_attention_adapter_weights(
+                    result,
+                    layer_prefix=prefix,
+                    attention=layer.self_attention,
+                )
+                experts = getattr(layer.mlp, "experts", None)
+                if experts is None:
+                    add_dense_mlp_adapter_weights(
+                        result, layer_prefix=prefix, mlp=layer.mlp
+                    )
+                    continue
+                add_grouped_moe_adapter_weights(
+                    result, layer_prefix=prefix, experts=experts
+                )
+                shared_experts = getattr(layer.mlp, "shared_experts", None)
+                if shared_experts is not None:
+                    add_shared_experts_adapter_weights(
+                        result,
+                        layer_prefix=prefix,
+                        shared_experts=shared_experts,
+                    )
+        return result
+
+    def expert_packed_lora_groups(self) -> tuple[ExpertPackedLoraGroup, ...]:
+        return (
+            ExpertPackedLoraGroup(
+                art_group_suffix=".mlp.experts",
+                slots=(
+                    ExpertPackedLoraSlot(
+                        source_projection="gate_up_proj",
+                        source_lora="lora_A",
+                        output_suffix="base_layer.lora_A.weight",
+                        pack_layout="expert_rows",
+                    ),
+                    ExpertPackedLoraSlot(
+                        source_projection="gate_up_proj",
+                        source_lora="lora_B",
+                        output_suffix="base_layer.lora_B.weight",
+                        pack_layout="rank_major_expert_cols",
+                    ),
+                    ExpertPackedLoraSlot(
+                        source_projection="down_proj",
+                        source_lora="lora_A",
+                        output_suffix="lora_A.weight",
+                        pack_layout="expert_rows",
+                    ),
+                    ExpertPackedLoraSlot(
+                        source_projection="down_proj",
+                        source_lora="lora_B",
+                        output_suffix="lora_B.weight",
+                        pack_layout="rank_major_expert_cols",
+                    ),
+                ),
+            ),
+        )
 
 
 GLM52_HANDLER = Glm52Handler()
