@@ -223,12 +223,14 @@ class Glm52Handler(DefaultMoeHandler):
         from megatron.core.transformer.transformer_layer import TransformerLayer
 
         from art.megatron.glm52.attention import Glm52SelfAttention
-        from art.megatron.glm52.lora import apply_glm52_attention_lora
+        from art.megatron.glm52.lora import (
+            apply_glm52_attention_lora,
+            wrap_glm52_grouped_moe_experts_3d,
+        )
         from art.megatron.lora import (
             _adapter_model_prefix,
             _is_language_transformer_layer_name,
             wrap_dense_mlp,
-            wrap_grouped_moe_experts_3d,
             wrap_shared_experts_mlp,
         )
 
@@ -264,7 +266,7 @@ class Glm52Handler(DefaultMoeHandler):
                         alpha=alpha,
                     )
                     continue
-                wrap_grouped_moe_experts_3d(
+                wrap_glm52_grouped_moe_experts_3d(
                     experts,
                     adapter_model_prefix=prefix,
                     target_modules=targets,

@@ -1,18 +1,27 @@
 from __future__ import annotations
 
-from typing import Any
+from collections.abc import Callable
+from typing import Any, cast
 
+from megatron.core.extensions.transformer_engine import (
+    TEColumnParallelGroupedLinear,
+    TERowParallelGroupedLinear,
+)
 import torch
 
+from art.megatron.kernels.cute_grouped_lora_quack import quack_grouped_lora_residual
 from art.megatron.lora import (
     GRAD_SYNC_OP_NONE,
     LORA_ALPHA,
     TP_DEFAULT_GRAD_SYNC_DOMAIN,
     LoRA,
     LoRAParallelSpec,
+    MLPExpertsLinearFC1LoRA,
+    MLPExpertsLinearFC2LoRA,
     SelfAttentionLinearProjLoRA,
     _parallel_lora,
     _targets_include,
+    _unwrap_attr,
 )
 
 
@@ -93,6 +102,80 @@ def apply_glm52_attention_lora(
             alpha=alpha,
             provider=provider,
         )
+
+
+def _expert_lora_residual(
+    base: torch.Tensor,
+    x: torch.Tensor,
+    lora: LoRA,
+    tokens_per_expert: list[int] | torch.Tensor,
+) -> torch.Tensor:
+    active = lora.active_lora_tensors()
+    if active is None or x.shape[0] == 0:
+        return base
+    a_t, b_t, scale = active
+    return quack_grouped_lora_residual(
+        base, x, a_t, b_t, tokens_per_expert, scale=scale
+    )
+
+
+def _grouped_linear(
+    linear: Any, x: torch.Tensor, tokens_per_expert: list[int] | torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor | None]:
+    return cast(Callable[..., tuple[torch.Tensor, torch.Tensor | None]], linear)(
+        x, tokens_per_expert
+    )
+
+
+class Glm52MLPExpertsLinearFC1LoRA(MLPExpertsLinearFC1LoRA):
+    def forward(
+        self, x: torch.Tensor, tokens_per_expert: list[int] | torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        base, bias = _grouped_linear(self.linear_fc1, x, tokens_per_expert)
+        return _expert_lora_residual(base, x, self.lora, tokens_per_expert), bias
+
+
+class Glm52MLPExpertsLinearFC2LoRA(MLPExpertsLinearFC2LoRA):
+    def forward(
+        self, x: torch.Tensor, tokens_per_expert: list[int] | torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        base, bias = _grouped_linear(self.linear_fc2, x, tokens_per_expert)
+        return _expert_lora_residual(base, x, self.lora, tokens_per_expert), bias
+
+
+def wrap_glm52_grouped_moe_experts_3d(
+    experts: Any,
+    *,
+    adapter_model_prefix: str,
+    target_modules: set[str],
+    rank: int,
+    alpha: int,
+) -> None:
+    if not _targets_include(target_modules, "experts"):
+        return
+    experts.linear_fc1 = Glm52MLPExpertsLinearFC1LoRA(
+        adapter_model_prefix=f"{adapter_model_prefix}.mlp.experts",
+        linear_fc1=_unwrap_attr(
+            experts.linear_fc1,
+            "linear_fc1",
+            TEColumnParallelGroupedLinear,  # type: ignore[arg-type]
+        ),
+        rank=rank,
+        alpha=alpha,
+        num_local_experts=experts.num_local_experts,
+        fused_gate_up=True,
+    )
+    experts.linear_fc2 = Glm52MLPExpertsLinearFC2LoRA(
+        adapter_model_prefix=f"{adapter_model_prefix}.mlp.experts",
+        linear_fc2=_unwrap_attr(
+            experts.linear_fc2,
+            "linear_fc2",
+            TERowParallelGroupedLinear,  # type: ignore[arg-type]
+        ),
+        rank=rank,
+        alpha=alpha,
+        num_local_experts=experts.num_local_experts,
+    )
 
 
 def add_glm52_attention_adapter_weights(

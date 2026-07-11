@@ -264,7 +264,12 @@ def _varlen_quack_gemm(
     tile_n: int,
     alpha: float = 1.0,
     out: torch.Tensor | None = None,
+    residual: torch.Tensor | None = None,
 ) -> torch.Tensor:
+    if residual is not None:
+        if out is not None and out is not residual:
+            raise ValueError("Residual grouped GEMM requires aliased output")
+        out = residual
     if out is None:
         out = torch.empty(
             a.shape[0],
@@ -285,7 +290,7 @@ def _varlen_quack_gemm(
         a,
         b,
         out,
-        None,
+        residual,
         None,
         tile_M=tile_m,
         tile_N=tile_n,
@@ -343,6 +348,7 @@ class _QuackGroupedLoraFn(torch.autograd.Function):
         b_t: torch.Tensor,
         counts: torch.Tensor,
         scale: float,
+        residual: torch.Tensor | None,
     ) -> torch.Tensor:
         expert_offsets = _build_expert_offsets(counts, device=x.device)
         actual_rank = a_t.shape[-1]
@@ -368,12 +374,16 @@ class _QuackGroupedLoraFn(torch.autograd.Function):
             tile_m=64,
             tile_n=_matmul_tile_n(b_t.shape[-1]),
             alpha=scale,
+            residual=residual,
         )
+        if residual is not None:
+            ctx.mark_dirty(residual)
 
         ctx.save_for_backward(x, a_t_eff, b_t_eff, tmp, expert_offsets)
         ctx.actual_rank = actual_rank
         ctx.effective_rank = effective_rank
         ctx.scale = scale
+        ctx.has_residual = residual is not None
         return out
 
     @staticmethod
@@ -435,6 +445,7 @@ class _QuackGroupedLoraFn(torch.autograd.Function):
             grad_b_eff[:, :actual_rank, :].contiguous(),
             None,
             None,
+            grad_out if ctx.has_residual else None,
         )
 
 
@@ -651,7 +662,30 @@ def quack_grouped_lora(
     synchronization in the hot path.
     """
     counts_tensor = _validate_inputs(x, a_t, b_t, counts)
-    return _QuackGroupedLoraFn.apply(x, a_t, b_t, counts_tensor, scale)
+    return _QuackGroupedLoraFn.apply(x, a_t, b_t, counts_tensor, scale, None)
+
+
+@torch.compiler.disable
+def quack_grouped_lora_residual(
+    residual: torch.Tensor,
+    x: torch.Tensor,
+    a_t: torch.Tensor,
+    b_t: torch.Tensor,
+    counts: list[int] | torch.Tensor,
+    scale: float = 1.0,
+) -> torch.Tensor:
+    """Accumulate grouped LoRA into a caller-owned base output."""
+    counts_tensor = _validate_inputs(x, a_t, b_t, counts)
+    expected = (x.shape[0], b_t.shape[-1])
+    if residual.shape != expected:
+        raise ValueError(
+            f"Expected residual shape {expected}, got {tuple(residual.shape)}"
+        )
+    if residual.device != x.device or residual.dtype != x.dtype:
+        raise ValueError("Residual must match grouped LoRA input device and dtype")
+    if x.shape[0] == 0:
+        return residual
+    return _QuackGroupedLoraFn.apply(x, a_t, b_t, counts_tensor, scale, residual)
 
 
 @torch.compiler.disable
