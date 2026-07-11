@@ -1,3 +1,4 @@
+from collections.abc import Iterable, Sequence
 import os
 import random
 import time
@@ -85,7 +86,7 @@ class _PrefixTreeRowPlan(NamedTuple):
 
 class _PrefixTreeLeaf(NamedTuple):
     item_index: int
-    item: _PrefixTreePackItem
+    packing_group_id: int
     segment_path: tuple[tuple[int, int], ...]
 
     @property
@@ -112,6 +113,67 @@ class _PrefixTreeBin:
         self.token_count += self.insertion_delta(leaf)
         self.occupied_segments.update(segment_id for segment_id, _ in leaf.segment_path)
         self.leaves.append(leaf)
+
+
+class PrefixTreePackingEstimate(NamedTuple):
+    packed_sequences: int
+    non_padding_tokens: int
+
+
+class PrefixTreePackingPool:
+    __slots__ = ("groups",)
+
+    def __init__(
+        self,
+        groups: Sequence[Sequence[tuple[Sequence[int], int]]],
+        *,
+        min_shared_segment_length: int = DEFAULT_MIN_PREFIX_TREE_SHARED_SEGMENT_LENGTH,
+    ) -> None:
+        token_ids: list[Sequence[int]] = []
+        shareable_lengths: list[int] = []
+        packing_group_ids: list[int] = []
+        for group_id, group in enumerate(groups):
+            for tokens, shareable_length in group:
+                token_ids.append(tokens)
+                shareable_lengths.append(shareable_length)
+                packing_group_ids.append(group_id)
+        if not token_ids:
+            raise ValueError("Prefix-tree packing pool requires at least one leaf")
+        segments = _prefix_tree_pack_segments(
+            token_ids,
+            max_depth=max(map(len, token_ids)),
+            shareable_lengths=shareable_lengths,
+            min_shared_segment_length=min_shared_segment_length,
+        )
+        paths: list[list[tuple[int, int]]] = [[] for _ in token_ids]
+        for segment_id, segment in enumerate(segments):
+            path_segment = (segment_id, segment.length)
+            for item_index in segment.sequence_indices:
+                paths[item_index].append(path_segment)
+        leaves = tuple(
+            _PrefixTreeLeaf(
+                item_index=index,
+                packing_group_id=packing_group_ids[index],
+                segment_path=tuple(paths[index]),
+            )
+            for index in range(len(token_ids))
+        )
+        grouped_leaves: list[list[_PrefixTreeLeaf]] = [[] for _ in groups]
+        for leaf in leaves:
+            grouped_leaves[leaf.packing_group_id].append(leaf)
+        self.groups = tuple(tuple(group) for group in grouped_leaves)
+
+    def estimate(
+        self, group_indices: Sequence[int], *, seq_len: int
+    ) -> PrefixTreePackingEstimate:
+        bins = _place_prefix_tree_leaves(
+            (self.groups[index] for index in group_indices),
+            seq_len=seq_len,
+        )
+        return PrefixTreePackingEstimate(
+            packed_sequences=len(bins),
+            non_padding_tokens=sum(packed_bin.token_count for packed_bin in bins),
+        )
 
 
 def packed_tensors_from_tokenized_results(
@@ -346,39 +408,27 @@ def _prefix_tree_pack_rows(
         for item_index in segment.sequence_indices:
             paths[item_index].append(path_segment)
     leaves = [
-        _PrefixTreeLeaf(item_index=index, item=item, segment_path=tuple(paths[index]))
+        _PrefixTreeLeaf(
+            item_index=index,
+            packing_group_id=item.prompt_id,
+            segment_path=tuple(paths[index]),
+        )
         for index, item in enumerate(items)
     ]
-    grouped: dict[int, list[_PrefixTreeLeaf]] = {}
     for leaf in leaves:
         if leaf.empty_bin_cost > seq_len:
             raise RuntimeError(
                 "Prefix-tree pack item exceeds sequence length: "
                 f"cost={leaf.empty_bin_cost}, seq_len={seq_len}"
             )
-        grouped.setdefault(leaf.item.prompt_id, []).append(leaf)
-    ordered_groups = sorted(
-        grouped.values(),
-        key=lambda group: max(leaf.empty_bin_cost for leaf in group),
-        reverse=True,
-    )
-    bins: list[_PrefixTreeBin] = []
-    for leaf in (leaf for group in ordered_groups for leaf in group):
-        best_bin: _PrefixTreeBin | None = None
-        best_remaining = seq_len + 1
-        for candidate in bins:
-            count = candidate.token_count + candidate.insertion_delta(leaf)
-            if count <= seq_len and seq_len - count < best_remaining:
-                best_bin = candidate
-                best_remaining = seq_len - count
-        if best_bin is None:
-            best_bin = _PrefixTreeBin()
-            bins.append(best_bin)
-        best_bin.add(leaf)
+    grouped: dict[int, list[_PrefixTreeLeaf]] = {}
+    for leaf in leaves:
+        grouped.setdefault(leaf.packing_group_id, []).append(leaf)
+    bins = _place_prefix_tree_leaves(grouped.values(), seq_len=seq_len)
 
     planned_rows = []
     for packed_bin in bins:
-        row = [leaf.item for leaf in packed_bin.leaves]
+        row = [items[leaf.item_index] for leaf in packed_bin.leaves]
         occupancy_plan = _filtered_prefix_tree_plan(
             segments,
             item_indices=tuple(leaf.item_index for leaf in packed_bin.leaves),
@@ -403,6 +453,37 @@ def _prefix_tree_pack_rows(
             )
         planned_rows.append((row, plan))
     return planned_rows
+
+
+def _place_prefix_tree_leaves(
+    groups: Iterable[Sequence[_PrefixTreeLeaf]],
+    *,
+    seq_len: int,
+) -> list[_PrefixTreeBin]:
+    ordered_groups = sorted(
+        groups,
+        key=lambda group: max(leaf.empty_bin_cost for leaf in group),
+        reverse=True,
+    )
+    bins: list[_PrefixTreeBin] = []
+    for leaf in (leaf for group in ordered_groups for leaf in group):
+        if leaf.empty_bin_cost > seq_len:
+            raise RuntimeError(
+                "Prefix-tree pack item exceeds sequence length: "
+                f"cost={leaf.empty_bin_cost}, seq_len={seq_len}"
+            )
+        best_bin = None
+        best_remaining = seq_len + 1
+        for candidate in bins:
+            count = candidate.token_count + candidate.insertion_delta(leaf)
+            if count <= seq_len and seq_len - count < best_remaining:
+                best_bin = candidate
+                best_remaining = seq_len - count
+        if best_bin is None:
+            best_bin = _PrefixTreeBin()
+            bins.append(best_bin)
+        best_bin.add(leaf)
+    return bins
 
 
 def _filtered_prefix_tree_plan(
