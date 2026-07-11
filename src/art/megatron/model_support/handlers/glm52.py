@@ -22,6 +22,69 @@ def _hf_config(bridge: Any) -> Any:
     return getattr(pretrained, "config", pretrained)
 
 
+def _from_vllm_expert_lora(
+    tensors: dict[str, torch.Tensor], adapter_config: dict[str, Any]
+) -> dict[str, torch.Tensor]:
+    slots = (
+        ("base_layer.lora_A.weight", "gate_up_proj", "lora_A", "rows"),
+        ("base_layer.lora_B.weight", "gate_up_proj", "lora_B", "cols"),
+        ("lora_A.weight", "down_proj", "lora_A", "rows"),
+        ("lora_B.weight", "down_proj", "lora_B", "cols"),
+    )
+    grouped: dict[str, dict[str, torch.Tensor]] = {}
+    used: set[str] = set()
+    for key, tensor in tensors.items():
+        for suffix, _projection, _lora, _layout in slots:
+            marker = f".{suffix}"
+            if key.endswith(marker) and key[: -len(marker)].endswith(".mlp.experts"):
+                grouped.setdefault(key[: -len(marker)], {})[suffix] = tensor
+                used.add(key)
+                break
+    if not grouped:
+        return tensors
+    try:
+        rank = int(adapter_config["r"])
+    except (KeyError, TypeError, ValueError) as exc:
+        raise RuntimeError(
+            "GLM-5.2 fused expert LoRA requires adapter rank r."
+        ) from exc
+    if rank <= 0:
+        raise RuntimeError(f"GLM-5.2 LoRA rank must be positive, got {rank}.")
+
+    result = {key: tensor for key, tensor in tensors.items() if key not in used}
+    for prefix, block in grouped.items():
+        missing = [suffix for suffix, *_ in slots if suffix not in block]
+        if missing:
+            raise RuntimeError(
+                f"Incomplete GLM-5.2 expert LoRA block {prefix}: {missing}"
+            )
+        gate_a = block[slots[0][0]]
+        if gate_a.ndim != 2 or gate_a.shape[0] % rank:
+            raise RuntimeError(
+                f"{prefix}: invalid fused expert A shape {tuple(gate_a.shape)} for rank {rank}."
+            )
+        experts = gate_a.shape[0] // rank
+        for suffix, projection, lora, layout in slots:
+            tensor = block[suffix]
+            packed = experts * rank
+            if tensor.ndim != 2 or tensor.shape[0 if layout == "rows" else 1] != packed:
+                raise RuntimeError(
+                    f"{prefix}.{suffix}: shape {tuple(tensor.shape)} does not encode "
+                    f"{experts} experts at rank {rank}."
+                )
+            unpacked = (
+                tensor.reshape(experts, rank, tensor.shape[1])
+                if layout == "rows"
+                else tensor.reshape(tensor.shape[0], rank, experts).permute(2, 0, 1)
+            )
+            for expert, expert_tensor in enumerate(unpacked):
+                key = f"{prefix}.{expert}.{projection}.{lora}.weight"
+                if key in result:
+                    raise RuntimeError(f"Duplicate GLM-5.2 expert LoRA tensor {key}.")
+                result[key] = expert_tensor.clone().contiguous()
+    return result
+
+
 class Glm52Handler(DefaultMoeHandler):
     key = "glm52"
     is_moe = True
@@ -361,6 +424,14 @@ class Glm52Handler(DefaultMoeHandler):
                 ),
             ),
         )
+
+    def from_vllm_lora_tensors(
+        self,
+        tensors: dict[str, torch.Tensor],
+        *,
+        adapter_config: dict[str, Any],
+    ) -> dict[str, torch.Tensor]:
+        return _from_vllm_expert_lora(tensors, adapter_config)
 
 
 GLM52_HANDLER = Glm52Handler()
