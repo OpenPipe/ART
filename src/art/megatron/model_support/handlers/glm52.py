@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Any, Literal, Sequence
+from typing import Any, Literal, Sequence, cast
 
 import torch
 
@@ -89,6 +89,25 @@ class Glm52Handler(DefaultMoeHandler):
     def configure_provider_for_runtime(self, provider: Any) -> None:
         provider.mtp_num_layers = None
         provider.mtp_loss_scaling_factor = None
+
+    def install_preprocess_patch(self, model_chunks: Sequence[Any]) -> None:
+        from megatron.core.models.gpt.gpt_model import GPTModel
+
+        for chunk in model_chunks:
+            module = chunk
+            while hasattr(module, "module"):
+                module = module.module
+            gpt = module if isinstance(module, GPTModel) else module.language_model
+            preprocess = gpt._preprocess
+
+            def preprocess_hook(*args: Any, _preprocess=preprocess, **kwargs: Any):
+                output = list(_preprocess(*args, **kwargs))
+                decoder_input = cast(torch.Tensor, output[0])
+                if decoder_input.is_leaf and not decoder_input.requires_grad:
+                    decoder_input.requires_grad_(True)
+                return tuple(output)
+
+            gpt._preprocess = preprocess_hook
 
     def build_prefix_tree_model_state(
         self, context: PrefixTreeModelStateContext
