@@ -1,14 +1,32 @@
 from __future__ import annotations
 
+from typing import Any, cast
+
+from pydantic import BaseModel, ConfigDict
 import torch
 import triton
 import triton.language as tl
 
-from art.megatron.glm52.state import Glm52IndexerRowPlan
+from art.megatron.context_parallel.comm import A2AVCommunicator
+from art.megatron.context_parallel.range_ops import range_gather
+from art.megatron.context_parallel.types import ArtContextParallelState, StagePlan
+from art.megatron.glm52.state import (
+    Glm52IndexerRowPlan,
+    Glm52PrefixTreeState,
+    Glm52StageState,
+)
 
 _MAX_SCORE_WORKSPACE_BYTES = 256 * 1024 * 1024
 _MAX_K_CHUNK = 32 * 1024
 _ROUTE_STAGE_BITS = 3
+_COMMUNICATOR = A2AVCommunicator()
+
+
+class Glm52RoutedTopk(BaseModel):
+    model_config = ConfigDict(arbitrary_types_allowed=True, frozen=True)
+
+    indices: torch.Tensor
+    stage_offsets: torch.Tensor
 
 
 @triton.jit
@@ -159,6 +177,7 @@ def _index_scores_kernel(
     block_q: tl.constexpr,
     block_k: tl.constexpr,
     causal: tl.constexpr,
+    ranking_keys: tl.constexpr,
 ):
     q_block = tl.program_id(0)
     k_block = tl.program_id(1)
@@ -196,11 +215,25 @@ def _index_scores_kernel(
             <= q_position_offset + q_offsets[:, None]
         )
     scores = tl.where(valid, scores, float("-inf"))
-    tl.store(
-        scores_ptr + q_offsets[:, None] * stride_st + k_offsets[None, :] * stride_sk,
-        scores,
-        mask=(q_offsets[:, None] < q_len) & (k_offsets[None, :] < k_len),
+    output_offsets = (
+        scores_ptr + q_offsets[:, None] * stride_st + k_offsets[None, :] * stride_sk
     )
+    output_mask = (q_offsets[:, None] < q_len) & (k_offsets[None, :] < k_len)
+    if ranking_keys:
+        canonical_scores = tl.where(scores == 0.0, 0.0, scores)
+        bits = canonical_scores.to(tl.int32, bitcast=True).to(tl.int64) & 0xFFFF_FFFF
+        ordered = tl.where(
+            (bits >> 31) != 0,
+            (~bits) & 0xFFFF_FFFF,
+            bits ^ 0x8000_0000,
+        )
+        primary = ordered - 0x8000_0000
+        global_ids = (k_position_offset + k_offsets[None, :]).to(tl.int64)
+        keys = (primary << 32) | (0xFFFF_FFFF - global_ids)
+        keys = tl.where(valid, keys, -0x8000_0000_0000_0000)
+        tl.store(output_offsets, keys, mask=output_mask)
+    else:
+        tl.store(output_offsets, scores, mask=output_mask)
 
 
 def _index_scores(
@@ -248,10 +281,63 @@ def _index_scores(
         block_q=block_q,  # ty: ignore[invalid-argument-type]
         block_k=block_k,  # ty: ignore[invalid-argument-type]
         causal=causal,  # ty: ignore[invalid-argument-type]
+        ranking_keys=False,  # ty: ignore[invalid-argument-type]
         num_warps=8,  # ty: ignore[unknown-argument]
         num_stages=3,  # ty: ignore[unknown-argument]
     )
     return scores
+
+
+def _index_score_keys(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    weights: torch.Tensor,
+    *,
+    q_position_offset: int,
+    k_position_offset: int,
+    causal: bool,
+) -> torch.Tensor:
+    q_len, heads, head_dim = q.shape
+    k_len = int(k.shape[0])
+    block_q = 128 // heads
+    block_k = 64
+    keys = torch.empty((q_len, k_len), device=q.device, dtype=torch.int64)
+    _index_scores_kernel[(triton.cdiv(q_len, block_q), triton.cdiv(k_len, block_k))](
+        q,
+        k,
+        weights,
+        keys,
+        q_len,
+        k_len,
+        *q.stride(),
+        *k.stride(),
+        *weights.stride(),
+        *keys.stride(),
+        q_position_offset=q_position_offset,  # ty: ignore[invalid-argument-type]
+        k_position_offset=k_position_offset,  # ty: ignore[invalid-argument-type]
+        heads=heads,  # ty: ignore[invalid-argument-type]
+        head_dim=head_dim,  # ty: ignore[invalid-argument-type]
+        block_q=block_q,  # ty: ignore[invalid-argument-type]
+        block_k=block_k,  # ty: ignore[invalid-argument-type]
+        causal=causal,  # ty: ignore[invalid-argument-type]
+        ranking_keys=True,  # ty: ignore[invalid-argument-type]
+        num_warps=8,  # ty: ignore[unknown-argument]
+        num_stages=3,  # ty: ignore[unknown-argument]
+    )
+    return keys
+
+
+def _decode_score_keys(keys: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    invalid = keys == torch.iinfo(torch.int64).min
+    ordered = (keys >> 32) + 0x8000_0000
+    bits = torch.where(
+        (ordered & 0x8000_0000).bool(),
+        ordered ^ 0x8000_0000,
+        (~ordered) & 0xFFFF_FFFF,
+    )
+    scores = bits.to(torch.int32).view(torch.float32)
+    ids = (0xFFFF_FFFF - (keys & 0xFFFF_FFFF)).to(torch.int32)
+    return scores.masked_fill(invalid, float("-inf")), ids.masked_fill(invalid, -1)
 
 
 def _merge_topk(
@@ -267,6 +353,198 @@ def _merge_topk(
     keep = min(topk, int(all_scores.shape[1]))
     scores, positions = torch.topk(all_scores, keep, dim=1, sorted=False)
     return scores, torch.gather(all_ids, 1, positions)
+
+
+def _stable_topk(
+    scores: torch.Tensor,
+    global_ids: torch.Tensor,
+    *,
+    topk: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Select score-descending/id-ascending top-k using an exact integer key."""
+    if scores.dtype is not torch.float32 or global_ids.dtype is not torch.int32:
+        raise TypeError("GLM-5.2 stable top-k expects fp32 scores and int32 ids.")
+    keep = min(int(topk), int(scores.shape[1]))
+    key_scores = torch.where(scores == 0, torch.zeros_like(scores), scores)
+    bits = key_scores.contiguous().view(torch.int32).to(torch.int64) & 0xFFFF_FFFF
+    ordered = torch.where(
+        (bits >> 31).bool(),
+        (~bits) & 0xFFFF_FFFF,
+        bits ^ 0x8000_0000,
+    )
+    primary = ordered - 0x8000_0000
+    secondary = torch.where(
+        global_ids >= 0,
+        0xFFFF_FFFF - global_ids.to(torch.int64),
+        torch.zeros_like(primary),
+    )
+    positions = torch.topk((primary << 32) | secondary, keep, dim=1).indices
+    return torch.gather(scores, 1, positions), torch.gather(global_ids, 1, positions)
+
+
+def _merge_stable_topk(
+    scores: torch.Tensor,
+    global_ids: torch.Tensor,
+    candidate_scores: torch.Tensor,
+    candidate_ids: torch.Tensor,
+    *,
+    topk: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    return _stable_topk(
+        torch.cat((scores, candidate_scores), dim=1),
+        torch.cat((global_ids, candidate_ids), dim=1),
+        topk=topk,
+    )
+
+
+def _stage_topk_update(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    weights: torch.Tensor,
+    stage: Glm52StageState,
+    best_scores: torch.Tensor,
+    best_ids: torch.Tensor,
+    *,
+    topk: int,
+) -> None:
+    max_score_elements = _MAX_SCORE_WORKSPACE_BYTES // torch.int64.itemsize
+    for slice_ in stage.slices:
+        max_k_len = int(slice_.k_end - slice_.k_start)
+        k_chunk_size = min(max_k_len, _MAX_K_CHUNK)
+        q_chunk_size = max(1, max_score_elements // max(k_chunk_size, 1))
+        for q_start in range(slice_.q_start, slice_.q_end, q_chunk_size):
+            q_end = min(q_start + q_chunk_size, slice_.q_end)
+            owner_rows = stage.owner_q_rows[q_start:q_end]
+            scores = best_scores.index_select(0, owner_rows)
+            ids = best_ids.index_select(0, owner_rows)
+            for k_start in range(slice_.k_start, slice_.k_end, k_chunk_size):
+                k_end = min(k_start + k_chunk_size, slice_.k_end)
+                score_keys = _index_score_keys(
+                    q[q_start:q_end].contiguous(),
+                    k[k_start:k_end].contiguous(),
+                    weights[q_start:q_end].contiguous(),
+                    q_position_offset=slice_.q_position_offset
+                    + q_start
+                    - slice_.q_start,
+                    k_position_offset=slice_.k_position_offset
+                    + k_start
+                    - slice_.k_start,
+                    causal=slice_.causal,
+                )
+                keep = min(topk, k_end - k_start)
+                candidate_keys = torch.topk(
+                    score_keys, keep, dim=1, sorted=False
+                ).values
+                candidate_scores, candidate_ids = _decode_score_keys(candidate_keys)
+                scores, ids = _merge_stable_topk(
+                    scores,
+                    ids,
+                    candidate_scores,
+                    candidate_ids,
+                    topk=topk,
+                )
+            best_scores.index_copy_(0, owner_rows, scores)
+            best_ids.index_copy_(0, owner_rows, ids)
+
+
+def _stage_query_inputs(
+    q: torch.Tensor,
+    weights: torch.Tensor,
+    stage_plan: StagePlan,
+    cp_state: ArtContextParallelState,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    ranges = stage_plan.owner_local_q_ranges
+    if len(ranges) == 1 and ranges[0].start == 0 and ranges[0].end == q.shape[0]:
+        return q, weights
+    cache = cp_state.execution_cache.range_meta
+    return (
+        range_gather(q, ranges, range_meta_cache=cache),
+        range_gather(weights, ranges, range_meta_cache=cache),
+    )
+
+
+def _local_stage_k(
+    k: torch.Tensor,
+    stage_plan: StagePlan,
+    cp_state: ArtContextParallelState,
+) -> torch.Tensor:
+    ranges = stage_plan.owner_local_k_ranges
+    if len(ranges) == 1 and ranges[0].start == 0 and ranges[0].end == k.shape[0]:
+        return k
+    return range_gather(
+        k,
+        ranges,
+        range_meta_cache=cp_state.execution_cache.range_meta,
+    )
+
+
+@torch.no_grad()
+def context_parallel_tree_topk(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    weights: torch.Tensor,
+    state: Glm52PrefixTreeState,
+    *,
+    topk: int,
+) -> Glm52RoutedTopk:
+    """Accumulate exact GLM indexer top-k on query owners across ART stages."""
+    cp_state = cast(ArtContextParallelState, state.context_parallel_state)
+    valid_tokens = int(sum(cp_state.rank_plan.local_valid_lengths))
+    q = q[:, :valid_tokens].reshape(valid_tokens, *q.shape[2:]).contiguous()
+    k = k[:, :valid_tokens].reshape(valid_tokens, k.shape[-1]).contiguous()
+    weights = weights[:, :valid_tokens].reshape(valid_tokens, weights.shape[-1])
+    best_scores = torch.full(
+        (valid_tokens, topk), float("-inf"), device=q.device, dtype=torch.float32
+    )
+    best_ids = torch.full((valid_tokens, topk), -1, device=q.device, dtype=torch.int32)
+    works: dict[int, Any] = {}
+    for stage_plan in cp_state.rank_plan.stage_plans:
+        if not stage_plan.is_local_stage:
+            works[int(stage_plan.stage_index)] = _COMMUNICATOR.launch_tensor_fetch(
+                tensor_local=k,
+                plan=cast(Any, stage_plan.kv_fetch_plan),
+                group=cp_state.cp_group,
+                async_op=True,
+                range_meta_cache=cp_state.execution_cache.range_meta,
+            )
+    for stage_plan, stage in zip(
+        cp_state.rank_plan.stage_plans, state.stages, strict=True
+    ):
+        if not stage.slices:
+            continue
+        q_stage, weights_stage = _stage_query_inputs(q, weights, stage_plan, cp_state)
+        k_stage = (
+            _local_stage_k(k, stage_plan, cp_state)
+            if stage_plan.is_local_stage
+            else works.pop(int(stage_plan.stage_index)).wait_post_process()
+        )
+        _stage_topk_update(
+            q_stage,
+            k_stage,
+            weights_stage,
+            stage,
+            best_scores,
+            best_ids,
+            topk=topk,
+        )
+        del q_stage, weights_stage, k_stage
+    for work in works.values():
+        work.wait_post_process()
+    del best_scores
+    route_map = state.route_by_global_id
+    if route_map is None:
+        raise RuntimeError("GLM-5.2 CP route map is missing.")
+    routes = torch.where(
+        best_ids >= 0,
+        route_map[best_ids.clamp_min(0).to(torch.int64)],
+        torch.full_like(best_ids, -1),
+    ).view(1, valid_tokens, topk)
+    del best_ids
+    indices, stage_offsets = group_stage_routes(
+        routes,
+        stage_count=len(state.stages),
+    )
+    return Glm52RoutedTopk(indices=indices, stage_offsets=stage_offsets)
 
 
 @triton.jit

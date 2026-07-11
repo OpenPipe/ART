@@ -22,6 +22,18 @@ class Glm52IndexerSlice(BaseModel):
     causal: bool
 
 
+class Glm52StageSlice(BaseModel):
+    model_config = ConfigDict(frozen=True)
+
+    q_start: int
+    q_end: int
+    k_start: int
+    k_end: int
+    q_position_offset: int
+    k_position_offset: int
+    causal: bool
+
+
 class Glm52IndexerQueryPlan(BaseModel):
     model_config = ConfigDict(frozen=True)
 
@@ -44,6 +56,8 @@ class Glm52StageState(BaseModel):
     stage_index: int
     global_q_ids: torch.Tensor
     global_k_ids: torch.Tensor
+    owner_q_rows: torch.Tensor
+    slices: tuple[Glm52StageSlice, ...]
 
 
 class Glm52PrefixTreeState(BaseModel):
@@ -54,6 +68,7 @@ class Glm52PrefixTreeState(BaseModel):
     rope_sin: torch.Tensor
     indexer_rows: tuple[Glm52IndexerRowPlan, ...] = ()
     stages: tuple[Glm52StageState, ...] = ()
+    route_by_global_id: torch.Tensor | None = None
     context_parallel_state: Any | None = None
     topk_by_full_layer: dict[int, Any] = Field(default_factory=dict)
 
@@ -144,6 +159,9 @@ def build_glm52_context_parallel_state(
     """Materialize GLM stage ids once without reading CUDA data on the host."""
     rank_plan = context_parallel_state.rank_plan
     stages = []
+    route_by_global_id = torch.full(
+        (int(rank_plan.original_seq_len),), -1, dtype=torch.int32
+    )
     for stage in rank_plan.stage_plans:
         q_len = sum(range_.size() for range_ in stage.owner_local_q_ranges)
         k_len = sum(range_.size() for range_ in stage.owner_local_k_ranges)
@@ -163,17 +181,54 @@ def build_glm52_context_parallel_state(
         if metadata is None:
             q_ids = k_ids = torch.empty(0, dtype=torch.int32, device=device)
         else:
+            k_ids_cpu = metadata.k_token_indices[:k_len].to(torch.int64)
+            routes_cpu = (
+                torch.arange(k_len, dtype=torch.int32) << _ROUTE_STAGE_BITS
+            ) | int(stage.stage_index)
+            existing = route_by_global_id[k_ids_cpu]
+            if bool(((existing >= 0) & (existing != routes_cpu)).any()):
+                raise RuntimeError(
+                    "GLM-5.2 CP stages assign one global KV id to multiple routes."
+                )
+            route_by_global_id[k_ids_cpu] = routes_cpu
             q_ids = metadata.q_token_indices[:q_len].to(
                 device=device, dtype=torch.int32, non_blocking=True
             )
             k_ids = metadata.k_token_indices[:k_len].to(
                 device=device, dtype=torch.int32, non_blocking=True
             )
+        owner_q_parts = tuple(
+            torch.arange(range_.start, range_.end, dtype=torch.int64)
+            for range_ in stage.owner_local_q_ranges
+            if range_.size() > 0
+        )
+        owner_q_rows = (
+            torch.cat(owner_q_parts)
+            if owner_q_parts
+            else torch.empty(0, dtype=torch.int64)
+        )
         stages.append(
             Glm52StageState(
                 stage_index=int(stage.stage_index),
                 global_q_ids=q_ids.contiguous(),
                 global_k_ids=k_ids.contiguous(),
+                owner_q_rows=owner_q_rows.to(device=device, non_blocking=True),
+                slices=tuple(
+                    Glm52StageSlice(
+                        q_start=int(slice_.q_range.start),
+                        q_end=int(slice_.q_range.end),
+                        k_start=int(slice_.k_range.start),
+                        k_end=int(slice_.k_range.end),
+                        q_position_offset=int(
+                            metadata.q_token_indices[slice_.q_range.start]
+                        ),
+                        k_position_offset=int(
+                            metadata.k_token_indices[slice_.k_range.start]
+                        ),
+                        causal=slice_.mask_kind is AttnMaskKind.CAUSAL,
+                    )
+                    for slice_ in stage.slices
+                ),
             )
         )
     position_ids_device, rope_cos, rope_sin = _rope_state(
@@ -185,6 +240,7 @@ def build_glm52_context_parallel_state(
         rope_cos=rope_cos,
         rope_sin=rope_sin,
         stages=tuple(stages),
+        route_by_global_id=route_by_global_id.to(device=device, non_blocking=True),
         context_parallel_state=context_parallel_state,
     )
 
