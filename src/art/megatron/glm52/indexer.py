@@ -1,0 +1,214 @@
+from __future__ import annotations
+
+import torch
+import triton
+import triton.language as tl
+
+from art.megatron.glm52.state import Glm52IndexerRowPlan
+
+_MAX_SCORE_WORKSPACE_BYTES = 256 * 1024 * 1024
+_MAX_K_CHUNK = 32 * 1024
+
+
+@triton.jit
+def _index_scores_kernel(
+    q_ptr,
+    k_ptr,
+    weights_ptr,
+    scores_ptr,
+    q_len,
+    k_len,
+    stride_qt,
+    stride_qh,
+    stride_qd,
+    stride_kt,
+    stride_kd,
+    stride_wt,
+    stride_wh,
+    stride_st,
+    stride_sk,
+    q_position_offset: tl.constexpr,
+    k_position_offset: tl.constexpr,
+    heads: tl.constexpr,
+    head_dim: tl.constexpr,
+    block_q: tl.constexpr,
+    block_k: tl.constexpr,
+    causal: tl.constexpr,
+):
+    q_block = tl.program_id(0)
+    k_block = tl.program_id(1)
+    q_offsets = q_block * block_q + tl.arange(0, block_q)
+    h_offsets = tl.arange(0, heads)
+    d_offsets = tl.arange(0, head_dim)
+    k_offsets = k_block * block_k + tl.arange(0, block_k)
+
+    qh_offsets = q_offsets[:, None] * heads + h_offsets[None, :]
+    qh_offsets = qh_offsets.reshape((block_q * heads,))
+    q = tl.load(
+        q_ptr
+        + (qh_offsets // heads)[:, None] * stride_qt
+        + (qh_offsets % heads)[:, None] * stride_qh
+        + d_offsets[None, :] * stride_qd,
+        mask=(qh_offsets[:, None] // heads < q_len),
+        other=0.0,
+    )
+    k = tl.load(
+        k_ptr + k_offsets[None, :] * stride_kt + d_offsets[:, None] * stride_kd,
+        mask=k_offsets[None, :] < k_len,
+        other=0.0,
+    )
+    dots = tl.dot(q, k).reshape((block_q, heads, block_k))
+    weights = tl.load(
+        weights_ptr + q_offsets[:, None] * stride_wt + h_offsets[None, :] * stride_wh,
+        mask=q_offsets[:, None] < q_len,
+        other=0.0,
+    )
+    scores = tl.sum(tl.maximum(dots, 0.0) * weights[:, :, None], axis=1)
+    valid = (q_offsets[:, None] < q_len) & (k_offsets[None, :] < k_len)
+    if causal:
+        valid &= (
+            k_position_offset + k_offsets[None, :]
+            <= q_position_offset + q_offsets[:, None]
+        )
+    scores = tl.where(valid, scores, float("-inf"))
+    tl.store(
+        scores_ptr + q_offsets[:, None] * stride_st + k_offsets[None, :] * stride_sk,
+        scores,
+        mask=(q_offsets[:, None] < q_len) & (k_offsets[None, :] < k_len),
+    )
+
+
+def _index_scores(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    weights: torch.Tensor,
+    *,
+    q_position_offset: int,
+    k_position_offset: int,
+    causal: bool,
+) -> torch.Tensor:
+    if q.dtype is not torch.bfloat16 or k.dtype is not torch.bfloat16:
+        raise TypeError(f"GLM-5.2 index q/k must be bf16, got {q.dtype}/{k.dtype}.")
+    if weights.dtype is not torch.float32:
+        raise TypeError(f"GLM-5.2 index weights must be fp32, got {weights.dtype}.")
+    if q.ndim != 3 or k.ndim != 2 or weights.shape != q.shape[:2]:
+        raise ValueError(
+            "GLM-5.2 index score shapes must be q[Q,H,D], k[K,D], w[Q,H], "
+            f"got {tuple(q.shape)}, {tuple(k.shape)}, {tuple(weights.shape)}."
+        )
+    q_len, heads, head_dim = q.shape
+    k_len = int(k.shape[0])
+    if int(k.shape[1]) != head_dim or 128 % heads:
+        raise ValueError(
+            f"Unsupported GLM-5.2 index shape heads={heads}, head_dim={head_dim}."
+        )
+    block_q = 128 // heads
+    block_k = 64
+    scores = torch.empty((q_len, k_len), device=q.device, dtype=torch.float32)
+    _index_scores_kernel[(triton.cdiv(q_len, block_q), triton.cdiv(k_len, block_k))](
+        q,
+        k,
+        weights,
+        scores,
+        q_len,
+        k_len,
+        *q.stride(),
+        *k.stride(),
+        *weights.stride(),
+        *scores.stride(),
+        q_position_offset=q_position_offset,  # ty: ignore[invalid-argument-type]
+        k_position_offset=k_position_offset,  # ty: ignore[invalid-argument-type]
+        heads=heads,  # ty: ignore[invalid-argument-type]
+        head_dim=head_dim,  # ty: ignore[invalid-argument-type]
+        block_q=block_q,  # ty: ignore[invalid-argument-type]
+        block_k=block_k,  # ty: ignore[invalid-argument-type]
+        causal=causal,  # ty: ignore[invalid-argument-type]
+        num_warps=8,  # ty: ignore[unknown-argument]
+        num_stages=3,  # ty: ignore[unknown-argument]
+    )
+    return scores
+
+
+def _merge_topk(
+    scores: torch.Tensor,
+    ids: torch.Tensor,
+    candidate_scores: torch.Tensor,
+    candidate_ids: torch.Tensor,
+    *,
+    topk: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    all_scores = torch.cat((scores, candidate_scores), dim=1)
+    all_ids = torch.cat((ids, candidate_ids), dim=1)
+    keep = min(topk, int(all_scores.shape[1]))
+    scores, positions = torch.topk(all_scores, keep, dim=1, sorted=False)
+    return scores, torch.gather(all_ids, 1, positions)
+
+
+@torch.compiler.disable
+def streaming_tree_topk(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    weights: torch.Tensor,
+    rows: tuple[Glm52IndexerRowPlan, ...],
+    *,
+    topk: int,
+) -> torch.Tensor:
+    """Exact tree-aware topk with bounded score workspace and no square logits."""
+    if not q.is_cuda or q.device != k.device or q.device != weights.device:
+        raise RuntimeError("GLM-5.2 indexer requires colocated CUDA tensors.")
+    if q.ndim != 4 or k.ndim != 3 or weights.ndim != 3:
+        raise ValueError("GLM-5.2 indexer expects q[B,S,H,D], k[B,S,D], w[B,S,H].")
+    batch, seq_len, _, _ = q.shape
+    if len(rows) != batch or k.shape[:2] != (batch, seq_len):
+        raise ValueError("GLM-5.2 index plan does not match the packed tensor shape.")
+    result = torch.full(
+        (batch, seq_len, topk),
+        -1,
+        device=q.device,
+        dtype=torch.int32,
+    )
+    max_score_elements = _MAX_SCORE_WORKSPACE_BYTES // torch.float32.itemsize
+    for row in rows:
+        for query in row.queries:
+            max_k_len = max(slice_.k_end - slice_.k_start for slice_ in query.slices)
+            k_chunk_size = min(max_k_len, _MAX_K_CHUNK)
+            q_chunk_size = max(1, max_score_elements // max(k_chunk_size, 1))
+            for q_start in range(query.q_start, query.q_end, q_chunk_size):
+                q_end = min(q_start + q_chunk_size, query.q_end)
+                q_chunk = q[row.row_index, q_start:q_end].contiguous()
+                w_chunk = weights[row.row_index, q_start:q_end].contiguous()
+                best_scores = torch.empty(
+                    (q_end - q_start, 0), device=q.device, dtype=torch.float32
+                )
+                best_ids = torch.empty(
+                    (q_end - q_start, 0), device=q.device, dtype=torch.int32
+                )
+                for slice_ in query.slices:
+                    for k_start in range(slice_.k_start, slice_.k_end, k_chunk_size):
+                        k_end = min(k_start + k_chunk_size, slice_.k_end)
+                        score_chunk = _index_scores(
+                            q_chunk,
+                            k[row.row_index, k_start:k_end].contiguous(),
+                            w_chunk,
+                            q_position_offset=q_start,
+                            k_position_offset=k_start,
+                            causal=slice_.causal,
+                        )
+                        keep = min(topk, k_end - k_start)
+                        candidate_scores, candidate_ids = torch.topk(
+                            score_chunk,
+                            keep,
+                            dim=1,
+                            sorted=False,
+                        )
+                        candidate_ids = (candidate_ids + k_start).to(torch.int32)
+                        candidate_ids.masked_fill_(torch.isneginf(candidate_scores), -1)
+                        best_scores, best_ids = _merge_topk(
+                            best_scores,
+                            best_ids,
+                            candidate_scores,
+                            candidate_ids,
+                            topk=topk,
+                        )
+                result[row.row_index, q_start:q_end, : best_ids.shape[1]] = best_ids
+    return result
