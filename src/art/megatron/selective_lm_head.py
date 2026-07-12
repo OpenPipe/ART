@@ -158,28 +158,27 @@ def forward_token_losses(
 
     language_model = _language_model(model)
     _validate_language_model(language_model)
-    with _select_output_rows(language_model.output_layer, selection):
-        logits = model(**forward_kwargs, labels=None)
-    if not isinstance(logits, torch.Tensor):
-        raise TypeError(f"model must return logits, got {type(logits).__name__}")
     if not labels.numel():
+        with _select_output_rows(language_model.output_layer, selection):
+            logits = model(**forward_kwargs, labels=None)
+        if not isinstance(logits, torch.Tensor):
+            raise TypeError(f"model must return logits, got {type(logits).__name__}")
         return TokenLossOutput(
             token_losses=_empty_token_losses(logits, labels),
             selection=selection,
         )
-    if logits.ndim != 3 or tuple(logits.shape[:2]) != (
-        1,
-        selection.flat_indices.numel(),
-    ):
-        raise ValueError(
-            "selected logits must be [1, N, V]: "
-            f"logits={tuple(logits.shape)} N={selection.flat_indices.numel()}"
+    compact_labels = selection.select(labels)
+    with _select_output_rows(language_model.output_layer, selection):
+        with _restore_root_output(model, selection):
+            token_losses = model(**forward_kwargs, labels=compact_labels)
+    if not isinstance(token_losses, torch.Tensor):
+        raise TypeError(
+            f"model must return token losses, got {type(token_losses).__name__}"
         )
-    token_losses = language_model.compute_language_model_loss(
-        selection.select(labels),
-        logits.transpose(0, 1).contiguous(),
+    return TokenLossOutput(
+        token_losses=selection.select(token_losses),
+        selection=selection,
     )
-    return TokenLossOutput(token_losses=token_losses, selection=selection)
 
 
 def _language_model(model: torch.nn.Module) -> Any:
@@ -215,6 +214,29 @@ def _validate_language_model(language_model: Any) -> None:
         raise RuntimeError("selective LM head does not support MTP training")
     if bool(getattr(language_model.output_layer, "gather_output", False)):
         raise RuntimeError("selective LM head requires vocabulary-parallel logits")
+
+
+@contextmanager
+def _restore_root_output(
+    model: torch.nn.Module,
+    selection: LmHeadTokenSelection,
+) -> Iterator[None]:
+    def restore(
+        _module: torch.nn.Module,
+        _args: tuple[Any, ...],
+        output: Any,
+    ) -> torch.Tensor:
+        if not isinstance(output, torch.Tensor):
+            raise TypeError(
+                f"model must return token losses, got {type(output).__name__}"
+            )
+        return selection.restore(output)
+
+    handle = model.register_forward_hook(restore, prepend=True)
+    try:
+        yield
+    finally:
+        handle.remove()
 
 
 @contextmanager
