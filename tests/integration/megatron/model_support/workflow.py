@@ -562,7 +562,9 @@ def run_correctness_sensitivity_stage(
                 > 1
             )
         ]
-        if not _truthy_env(INCLUDE_FLASH_SENSITIVITY_ENV):
+        if FLASH_SENSITIVITY_MUTATION in mutations and not _truthy_env(
+            INCLUDE_FLASH_SENSITIVITY_ENV
+        ):
             default_excluded_sensitivity_mutations.append(FLASH_SENSITIVITY_MUTATION)
         mutations = [
             mutation

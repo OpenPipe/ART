@@ -16,6 +16,11 @@ import torch
 
 from art.megatron import train as megatron_train
 from art.megatron.model_support.discovery import inspect_architecture
+from art.megatron.model_support.registry import (
+    get_model_support_handler_for_spec,
+    get_model_support_spec,
+)
+from art.megatron.model_support.spec import PrefixTreeModelStateContext
 from art.megatron.prefix_tree import parse_prefix_tree_row
 from art.megatron.prefix_tree_state import create_prefix_tree_state
 
@@ -283,9 +288,30 @@ def _rotary_grouping_check(
 
 def _rotary_outputs_for_validation(
     *,
-    handler_key: str,
+    handler: Any,
     preprocess_output: Any,
+    position_ids: torch.Tensor,
+    group_ids: torch.Tensor,
+    parent_ids: torch.Tensor,
 ) -> tuple[torch.Tensor | None, ...]:
+    handler_key = handler.key
+    if handler_key == "glm52":
+        model_state = handler.build_prefix_tree_model_state(
+            PrefixTreeModelStateContext(
+                input_pos=position_ids.detach().cpu(),
+                group_ids=group_ids.detach().cpu(),
+                parent_ids=parent_ids.detach().cpu(),
+                device=position_ids.device,
+            )
+        )
+        state = model_state.get("glm52")
+        if (
+            state is None
+            or not torch.is_tensor(state.rope_cos)
+            or not torch.is_tensor(state.rope_sin)
+        ):
+            raise RuntimeError("GLM-5.2 packed-position validation requires RoPE state")
+        return (torch.cat((state.rope_cos, state.rope_sin), dim=-1).permute(1, 0, 2),)
     rotary_output = preprocess_output[1]
     if handler_key in _SINGLE_ROTARY_OUTPUT_HANDLER_KEYS:
         return (
@@ -308,6 +334,14 @@ def _build_art_realistic_packed_tensors(
     deep: bool,
 ) -> dict[str, Any]:
     return build_complex_prefix_tree_packed_tensors(config, seed, deep=deep)
+
+
+def _dtype_for_precision(precision: str) -> torch.dtype:
+    if precision == "bf16":
+        return torch.bfloat16
+    if precision == "fp32":
+        return torch.float32
+    raise ValueError(f"Unsupported packed-position precision: {precision}")
 
 
 def _prefix_tree_leaf_paths(
@@ -628,9 +662,15 @@ def _run_packing_invariance_worker(
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA is required for packing invariance validation")
 
+    spec = get_model_support_spec(
+        base_model,
+        allow_unvalidated_arch=allow_unvalidated_arch,
+    )
+    handler = get_model_support_handler_for_spec(spec)
+    precision = handler.correctness_precision()
     case_config = OracleCaseConfig(
         base_model=base_model,
-        precision="fp32",
+        precision=precision,
         num_layers=num_layers,
         allow_unvalidated_arch=allow_unvalidated_arch,
     )
@@ -639,19 +679,20 @@ def _run_packing_invariance_worker(
     flex_patch_stack.enter_context(
         _apply_requested_flex_backend_patch(TEST_DEFAULT_FLEX_BACKEND)
     )
-    flex_patch_stack.enter_context(
-        _apply_test_flex_inner_fp32_patch(TEST_DEFAULT_FLEX_BACKEND)
-    )
-    flex_patch_stack.enter_context(
-        _apply_test_attention_full_fp32_patch(TEST_DEFAULT_FLEX_BACKEND)
-    )
+    if precision == "fp32":
+        flex_patch_stack.enter_context(
+            _apply_test_flex_inner_fp32_patch(TEST_DEFAULT_FLEX_BACKEND)
+        )
+        flex_patch_stack.enter_context(
+            _apply_test_attention_full_fp32_patch(TEST_DEFAULT_FLEX_BACKEND)
+        )
     try:
         with provider_topology_env(ORACLE_TOPOLOGY):
             runtime = _time_block(
                 "build_training_runtime",
                 lambda: megatron_train.build_training_runtime(
                     model_identifier=base_model,
-                    provider_torch_dtype=torch.float32,
+                    provider_torch_dtype=_dtype_for_precision(precision),
                     provider_configure=lambda provider: _configure_provider(
                         provider,
                         ORACLE_TOPOLOGY,
@@ -703,8 +744,11 @@ def _run_packing_invariance_worker(
                 row_respected = True
                 row_repeated_count = 0
                 rotary_outputs = _rotary_outputs_for_validation(
-                    handler_key=runtime.model_support_handler.key,
+                    handler=runtime.model_support_handler,
                     preprocess_output=hooked_output,
+                    position_ids=row_position_ids,
+                    group_ids=group_ids[row_index : row_index + 1],
+                    parent_ids=parent_ids[row_index : row_index + 1],
                 )
                 for rotary_output in rotary_outputs:
                     checked, respected, repeated_count = _rotary_grouping_check(
@@ -800,12 +844,18 @@ def run_packing_invariance(
     allow_unvalidated_arch: bool = False,
 ) -> PackingInvarianceReport:
     _debug_log(f"run start base_model={base_model} requested_num_layers={num_layers}")
+    spec = get_model_support_spec(
+        base_model,
+        allow_unvalidated_arch=allow_unvalidated_arch,
+    )
+    handler = get_model_support_handler_for_spec(spec)
+    dtype = _dtype_for_precision(handler.correctness_precision())
     resolved_num_layers = (
         max(
             1,
             inspect_architecture(
                 base_model,
-                torch_dtype=torch.float32,
+                torch_dtype=dtype,
                 allow_unvalidated_arch=allow_unvalidated_arch,
             ).recommended_min_layers,
         )
