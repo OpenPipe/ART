@@ -1121,7 +1121,14 @@ def yes_no_trainability_passed(report: YesNoTrainabilityReport) -> bool:
         and report.final_eval_reward is not None
         and report.final_eval_reward >= report.reward_threshold
         and bool(report.steps)
-        and any(step.train_metrics.get("grad_norm", 0.0) > 0.0 for step in report.steps)
+        and any(
+            max(
+                step.train_metrics.get("grad_norm", 0.0),
+                step.train_metrics.get("loss/grad_norm", 0.0),
+            )
+            > 0.0
+            for step in report.steps
+        )
     )
     return learned_from_below_threshold or already_saturated_and_stable
 
