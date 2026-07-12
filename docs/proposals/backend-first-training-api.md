@@ -96,21 +96,21 @@ class ServerlessBackend(Backend):
         *,
         # Core training args
         learning_rate: float = 5e-6,
-        
+
         # RL algorithm settings
         ppo: bool = False,
         epsilon: float | None = None,  # defaults based on ppo
         epsilon_high: float | None = None,
-        
+
         # Advantage computation
         advantage_balance: float = 0.0,
         scale_rewards: bool = True,
-        
+
         # Importance sampling
         importance_sampling_level: Literal["token", "sequence", "average", "geometric_average"] = "token",
         max_negative_advantage_importance_sampling_weight: float | None = None,
         mask_prob_ratio: bool = False,
-        
+
         # Experimental
         kimi_k2_tau: float | None = None,
         precalculate_logprobs: bool = False,
@@ -139,17 +139,17 @@ class LocalBackend(Backend):
         mask_prob_ratio: bool = False,
         kimi_k2_tau: float | None = None,
         precalculate_logprobs: bool = False,
-        
+
         # LocalBackend-specific
         allow_training_without_logprobs: bool = False,
         plot_tensors: bool = False,
         truncated_importance_sampling: float | None = None,
         scale_learning_rate_by_reward_std_dev: bool = False,
         logprob_calculation_chunk_size: int = 1024,
-        
+
         # Checkpoint behavior
         save_checkpoint: bool = True,
-        
+
         verbose: bool = False,
     ) -> TrainResult:
         ...
@@ -172,16 +172,16 @@ class TinkerBackend(Backend):
         advantage_balance: float = 0.0,
         scale_rewards: bool = True,
         importance_sampling_level: Literal["token", "sequence", "average", "geometric_average"] = "token",
-        
+
         # Tinker-specific checkpoint behavior
         save_checkpoint: bool = True,
         deploy_checkpoint: bool = False,  # Push to Tinker inference
-        
+
         # Tinker-specific training options
         train_mlp: bool = True,
         train_attn: bool = True,
         train_unembed: bool = False,
-        
+
         verbose: bool = False,
     ) -> TrainResult:
         ...
