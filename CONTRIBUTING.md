@@ -65,7 +65,7 @@ To create a new release:
    - Click "Run workflow"
    - Select the version bump type:
      - `patch`: Bug fixes and minor changes (0.3.13 → 0.3.14)
-     - `minor`: New features and non-breaking changes (0.3.13 → 0.4.0)  
+     - `minor`: New features and non-breaking changes (0.3.13 → 0.4.0)
      - `major`: Breaking changes (0.3.13 → 1.0.0)
 
 3. **Edit the draft release notes**:
