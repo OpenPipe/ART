@@ -299,6 +299,9 @@ def _empty_token_losses(logits: torch.Tensor, labels: torch.Tensor) -> torch.Ten
             f"expected empty labels and [B, 0, V] logits, got {tuple(logits.shape)}"
         )
     losses = logits[..., 0]
+    if tuple(losses.shape) == tuple(labels.shape):
+        return losses
+    losses = losses.transpose(0, 1).contiguous()
     if tuple(losses.shape) != tuple(labels.shape):
         raise ValueError(
             f"empty logits={tuple(logits.shape)} labels={tuple(labels.shape)}"
