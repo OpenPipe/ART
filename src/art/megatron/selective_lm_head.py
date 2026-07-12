@@ -39,7 +39,7 @@ class LmHeadTokenSelection(BaseModel):
             # Keep one ignored row so zero-contribution microbatches retain a graph.
             indices = torch.zeros(1, dtype=torch.long, device=labels.device)
         if target_device is not None:
-            indices = indices.to(device=target_device)
+            indices = indices.to(device=target_device, non_blocking=True)
         return cls(
             flat_indices=indices.to(dtype=torch.long).contiguous(),
             full_shape=(int(labels.shape[0]), int(labels.shape[1])),
@@ -223,6 +223,7 @@ def _select_output_rows(
     selection: LmHeadTokenSelection,
 ) -> Iterator[None]:
     sequence_parallel = bool(getattr(output_layer, "sequence_parallel", False))
+    disable_grad_reduce = bool(getattr(output_layer, "disable_grad_reduce", False))
     calls = 0
 
     def select_rows(
@@ -241,6 +242,7 @@ def _select_output_rows(
                 group=getattr(module, "tp_group"),
             )
             module.sequence_parallel = False  # type: ignore[attr-defined]
+            module.disable_grad_reduce = True  # type: ignore[attr-defined]
         batch, sequence = selection.full_shape
         if tuple(hidden_states.shape[:2]) != (sequence, batch):
             raise ValueError(
@@ -264,6 +266,7 @@ def _select_output_rows(
         handle.remove()
         if sequence_parallel:
             output_layer.sequence_parallel = True  # type: ignore[attr-defined]
+            output_layer.disable_grad_reduce = disable_grad_reduce  # type: ignore[attr-defined]
     if succeeded and calls != 1:
         raise RuntimeError(f"selective LM head expected one output call, got {calls}")
 
