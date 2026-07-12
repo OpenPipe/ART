@@ -9,6 +9,7 @@ from typing import Any, cast
 import torch
 
 from art.loss import shift_tensor
+from art.megatron.selective_lm_head import LmHeadTokenSelection
 from art.preprocessing.pack import PackedTensors
 
 from .builder import build_prefix_tree_attention_spec
@@ -1970,12 +1971,17 @@ def dispatch_megatron_context_parallel_training_tensors(
     ) -> torch.Tensor | None:
         return None if tensor is None else dispatch(tensor, pad_value)
 
+    local_labels = dispatch(labels, -100, move_to_target=False)
+    lm_head_selection = LmHeadTokenSelection.from_labels(
+        local_labels,
+        target_device=target_device,
+    )
     local_token_uids = (
         None if token_uids is None else dispatch(token_uids, -1, move_to_target=False)
     )
     return DispatchedPackedTensors(
         tokens=dispatch(micro["tokens"], 0),
-        labels=dispatch(labels, -100),
+        labels=_to_target_device(local_labels, target_device),
         input_pos=dispatch(micro["input_pos"], 0),
         assistant_mask=dispatch(assistant_mask, False).to(dtype=torch.bool),
         group_ids=dispatch(shifted_group_ids, 0),
@@ -1983,6 +1989,7 @@ def dispatch_megatron_context_parallel_training_tensors(
         advantages=dispatch(advantages, 0.0),
         weights=dispatch(weights, 0.0),
         valid_lengths=rank_plan.local_valid_lengths,
+        lm_head_selection=lm_head_selection,
         original_logprobs=maybe_dispatch(original_logprobs, 0.0),
         ref_logprobs=maybe_dispatch(ref_logprobs, float("nan")),
         loss_all_reduce_group=cp_group,

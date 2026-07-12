@@ -21,6 +21,7 @@ from art.megatron.context_parallel.types import (
 )
 from art.megatron.flex_attn.compiled import flash_sparse_block_size_for_head_dim
 from art.megatron.prefix_tree_state import create_prefix_tree_state
+from art.megatron.selective_lm_head import LmHeadTokenSelection
 from art.megatron.training.trace import (
     packed_sequence_token_uids,
     sft_sequence_token_uids,
@@ -43,6 +44,7 @@ class PreparedRLMicroInputs(BaseModel):
     attention_state: Any
     packed_seq_params: Any | None = None
     loss_inputs: LossInputs | DispatchedPackedTensors
+    lm_head_selection: LmHeadTokenSelection
     ref_logprobs: torch.Tensor | None = None
     local_token_uids: torch.Tensor | None = None
 
@@ -54,6 +56,7 @@ class PreparedSFTMicroInputs(BaseModel):
     position_ids: torch.Tensor
     labels: torch.Tensor
     loss_mask: torch.Tensor
+    lm_head_selection: LmHeadTokenSelection
     attention_state: Any
     packed_seq_params: Any | None = None
     local_token_uids: torch.Tensor | None = None
@@ -503,7 +506,6 @@ def _prepare_dense_rl_micro(
             model_support_handler,
         ),
     )
-    _move_inputs_to_device(micro, device)
     shifted_labels = shift_tensor(micro["tokens"], -100)
     shifted_assistant_mask = shift_tensor(micro["assistant_mask"], False)
     shifted_labels = torch.where(
@@ -511,12 +513,19 @@ def _prepare_dense_rl_micro(
         shifted_labels,
         torch.full_like(shifted_labels, -100),
     )
+    lm_head_selection = LmHeadTokenSelection.from_labels(
+        shifted_labels,
+        target_device=device,
+    )
+    shifted_labels = shifted_labels.to(device)
+    _move_inputs_to_device(micro, device)
     return PreparedRLMicroInputs(
         model_tokens=micro["tokens"],
         model_input_pos=micro["input_pos"],
         model_labels=shifted_labels,
         attention_state=attention_state,
         loss_inputs=LossInputs(inputs=micro),
+        lm_head_selection=lm_head_selection,
         ref_logprobs=ref_logprobs,
         local_token_uids=packed_sequence_token_uids(micro, device=device),
     )
@@ -573,32 +582,12 @@ def _prepared_rl_micro_from_cp_batch(
         attention_state=prepared.attention_state,
         packed_seq_params=prepared.packed_seq_params,
         loss_inputs=prepared.tensors,
+        lm_head_selection=prepared.tensors.lm_head_selection,
         ref_logprobs=(
             prepared.tensors.ref_logprobs if ref_logprobs is not None else None
         ),
         local_token_uids=prepared.tensors.token_uids,
     )
-
-
-def _empty_new_logprobs_from_logits(
-    logits: torch.Tensor, labels: torch.Tensor
-) -> torch.Tensor:
-    if int(labels.numel()) != 0:
-        raise ValueError("empty-logprob path requires empty local labels")
-    if logits.ndim < 3 or int(logits.shape[-1]) == 0:
-        raise ValueError(
-            f"expected empty local logits [B, S, V], got {tuple(logits.shape)}"
-        )
-    candidate = logits[..., 0]
-    if tuple(candidate.shape) == tuple(labels.shape):
-        return candidate
-    candidate = candidate.transpose(0, 1).contiguous()
-    if tuple(candidate.shape) != tuple(labels.shape):
-        raise ValueError(
-            "empty local logits shape must match labels after removing vocab dim, "
-            f"got logits={tuple(logits.shape)} labels={tuple(labels.shape)}"
-        )
-    return candidate
 
 
 def _prepare_current_rl_micro(
@@ -692,15 +681,22 @@ def _prepare_dense_sft_micro(
     attention_mask = micro["attention_mask"].reshape(-1)
     seq_len = max(int(attention_mask.sum().item()), 1)
     input_ids = micro["input_ids"].reshape(-1)[:seq_len].unsqueeze(0).to(device)
-    labels = micro["labels"].reshape(-1)[:seq_len].unsqueeze(0).to(device)
+    labels = micro["labels"].reshape(-1)[:seq_len].unsqueeze(0)
     position_ids = torch.arange(seq_len, device=device).unsqueeze(0)
     shifted_labels = shift_tensor(labels, -100)
     loss_mask = shifted_labels != -100
+    lm_head_selection = LmHeadTokenSelection.from_labels(
+        shifted_labels,
+        target_device=device,
+    )
+    shifted_labels = shifted_labels.to(device)
+    loss_mask = loss_mask.to(device)
     return PreparedSFTMicroInputs(
         input_ids=input_ids,
         position_ids=position_ids,
         labels=shifted_labels,
         loss_mask=loss_mask,
+        lm_head_selection=lm_head_selection,
         attention_state=_causal_attention_state(
             seq_len,
             device,
@@ -808,6 +804,7 @@ def _prepared_sft_micro_from_cp_batch(
         position_ids=prepared.tensors.input_pos,
         labels=prepared.tensors.labels.masked_fill(~loss_mask, -100),
         loss_mask=loss_mask,
+        lm_head_selection=prepared.tensors.lm_head_selection,
         attention_state=prepared.attention_state,
         packed_seq_params=prepared.packed_seq_params,
         local_token_uids=prepared.tensors.token_uids,

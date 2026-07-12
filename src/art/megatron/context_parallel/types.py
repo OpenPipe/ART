@@ -8,6 +8,8 @@ from megatron.core.packed_seq_params import PackedSeqParams
 from pydantic import BaseModel, ConfigDict
 import torch
 
+from art.megatron.selective_lm_head import LmHeadTokenSelection
+
 from .layout_index import TokenLayoutIndex
 from .loss_inputs import ContextParallelLossInputs
 
@@ -142,6 +144,7 @@ class DispatchedPackedTensors(ContextParallelLossInputs):
     advantages: torch.Tensor
     weights: torch.Tensor
     valid_lengths: tuple[int, ...]
+    lm_head_selection: LmHeadTokenSelection
     original_logprobs: torch.Tensor | None = None
     ref_logprobs: torch.Tensor | None = None
     loss_all_reduce_group: Any | None = None

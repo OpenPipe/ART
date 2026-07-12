@@ -32,6 +32,7 @@ from torch._inductor.runtime.cache_dir_utils import cache_dir as inductor_cache_
 
 from art import dev, types
 from art.loss import (
+    AlignedLossInputs,
     Loss,
     LossInputs,
     LossOffPolicyDiagnosticsAccumulator,
@@ -72,6 +73,10 @@ from art.megatron.runtime.jobs import (
     MergedWeightTransferSpec,
     load_megatron_job,
 )
+from art.megatron.selective_lm_head import (
+    TokenLossOutput,
+    forward_token_losses,
+)
 from art.megatron.training.compile import (
     configure_training_compile,
 )
@@ -88,7 +93,6 @@ from art.megatron.training.microbatches import (
     _clone_sft_tensors,
     _count_sft_trainable_tokens,
     _count_trainable_tokens,
-    _empty_new_logprobs_from_logits,
     _local_trainable_sft_token_count_tensor,
     _local_trainable_token_count_tensor,
     _next_micro_lookahead,
@@ -1388,7 +1392,7 @@ def _forward_prepared_rl_micro(
     model_support_handler: Any,
     prepared_micro: PreparedRLMicroInputs,
     device: torch.device,
-) -> torch.Tensor:
+) -> TokenLossOutput:
     model_forward_kwargs = dict(
         input_ids=prepared_micro.model_tokens,
         position_ids=prepared_micro.model_input_pos,
@@ -1400,18 +1404,17 @@ def _forward_prepared_rl_micro(
         ),
     )
     with attach_trace_token_uids(model_chunks, prepared_micro.local_token_uids):
-        if int(prepared_micro.model_tokens.numel()) == 0:
-            logits = model_chunks[0](**model_forward_kwargs, labels=None)
-            return _empty_new_logprobs_from_logits(logits, prepared_micro.model_labels)
-        return -model_chunks[0](
-            **model_forward_kwargs,
+        return forward_token_losses(
+            model_chunks[0],
             labels=prepared_micro.model_labels,
+            selection=prepared_micro.lm_head_selection,
+            forward_kwargs=model_forward_kwargs,
         )
 
 
 def _zero_logprob_graph_contribution(
     new_logprobs: torch.Tensor,
-    loss_inputs: LossInputs | DispatchedPackedTensors,
+    loss_inputs: LossInputs | AlignedLossInputs,
 ) -> torch.Tensor:
     assistant_mask = loss_inputs.align_inputs().assistant_mask.to(dtype=torch.bool)
     return new_logprobs.masked_fill(~assistant_mask, 0.0).sum() * 0.0
@@ -1503,12 +1506,13 @@ def _calculate_megatron_logprobs(
         ):
             assert hybridep_token_count is not None
             _set_hybridep_token_count(hybridep_token_count)
-        logprobs = _forward_prepared_rl_micro(
+        token_loss_output = _forward_prepared_rl_micro(
             model_chunks=model_chunks,
             model_support_handler=model_support_handler,
             prepared_micro=prepared_micro,
             device=device,
         )
+        logprobs = token_loss_output.restore(-token_loss_output.token_losses)
         if int(topology.cp) > 1:
             logprobs = _globalize_context_parallel_logprobs(
                 local_logprobs=logprobs,
@@ -1732,20 +1736,22 @@ def run_megatron_sft_step(
             assert hybridep_token_counts is not None
             _set_hybridep_token_count(hybridep_token_counts[micro_order])
         with attach_trace_token_uids(model_chunks, prepared_micro.local_token_uids):
-            per_token_loss: torch.Tensor = model_chunks[0](
-                input_ids=prepared_micro.input_ids,
-                position_ids=prepared_micro.position_ids,
-                attention_mask=_placeholder_attention_mask(device),
+            token_loss_output = forward_token_losses(
+                model_chunks[0],
                 labels=prepared_micro.labels,
-                packed_seq_params=prepared_micro.packed_seq_params,
-                **model_support_handler.get_forward_kwargs(
-                    model_chunks[0],
-                    attention_bias=prepared_micro.attention_state,
+                selection=prepared_micro.lm_head_selection,
+                forward_kwargs=dict(
+                    input_ids=prepared_micro.input_ids,
+                    position_ids=prepared_micro.position_ids,
+                    attention_mask=_placeholder_attention_mask(device),
+                    packed_seq_params=prepared_micro.packed_seq_params,
+                    **model_support_handler.get_forward_kwargs(
+                        model_chunks[0],
+                        attention_bias=prepared_micro.attention_state,
+                    ),
                 ),
             )
-        masked_loss = (
-            per_token_loss[prepared_micro.loss_mask].sum() + per_token_loss.sum() * 0.0
-        )
+        masked_loss = token_loss_output.masked_sum(prepared_micro.loss_mask)
         masked_loss.backward()
         pending_prepared_micro = _prepare_next_sft_cp_micro(
             _next_micro_lookahead(micro_inputs, micro_order),
@@ -1901,24 +1907,28 @@ def run_training_step(
             assert hybridep_token_counts is not None
             _set_hybridep_token_count(hybridep_token_counts[micro_order])
 
-        new_logprobs = _forward_prepared_rl_micro(
+        token_loss_output = _forward_prepared_rl_micro(
             model_chunks=model_chunks,
             model_support_handler=model_support_handler,
             prepared_micro=prepared_micro,
             device=device,
         )
+        new_logprobs = -token_loss_output.token_losses
+        compact_loss_inputs = token_loss_output.compact_loss_inputs(
+            prepared_micro.loss_inputs
+        )
 
         loss_info = loss_fn(
-            prepared_micro.loss_inputs,
+            compact_loss_inputs,
             new_logprobs=new_logprobs,
-            ref_logprobs=prepared_micro.ref_logprobs,
+            ref_logprobs=token_loss_output.select_optional(prepared_micro.ref_logprobs),
             entropies=None,
             experimental_config=experimental_config,
             reduction="sum",
         )
         micro_loss = loss_info.policy_loss + _zero_logprob_graph_contribution(
             new_logprobs,
-            prepared_micro.loss_inputs,
+            compact_loss_inputs,
         )
         if not micro_loss.requires_grad:
             assistant_tokens = _count_trainable_tokens(prepared_micro.loss_inputs)
@@ -1977,7 +1987,8 @@ def run_training_step(
             raw_loss_sum = raw_loss_sum + detached_micro_loss
         del loss_info
         del micro_loss
-        new_logprobs_gpu.append(new_logprobs.detach())
+        new_logprobs_gpu.append(token_loss_output.restore(new_logprobs.detach()))
+        del token_loss_output
         del new_logprobs
 
     if raw_loss_sum is None:
