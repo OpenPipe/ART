@@ -234,6 +234,8 @@ def _gather_full_state(
 
 def _collect_lora_state(
     model_chunks: list[Any],
+    *,
+    optimizer_master: bool = False,
 ) -> dict[str, Any] | None:
     """Collects full LoRA adapter state for validation and delta computation."""
     local_state: dict[str, Any] = {}
@@ -248,9 +250,25 @@ def _collect_lora_state(
                             f"Duplicate manifest key while collecting state: {key}"
                         )
                     local_manifest[key] = value
-            if not hasattr(module, "sharded_lora_state_dict"):
+            if optimizer_master:
+                export_items = getattr(module, "_export_items", None)
+                if not callable(export_items):
+                    continue
+                module_state = {}
+                for key, param, expert in export_items():
+                    main_param = getattr(param, "main_param", None)
+                    if main_param is None or bool(
+                        getattr(param, "main_param_sharded", False)
+                    ):
+                        raise RuntimeError(
+                            f"Oracle requires a full FP32 optimizer master parameter for '{key}'"
+                        )
+                    value = main_param[expert] if expert is not None else main_param
+                    module_state[key] = value.T
+            elif hasattr(module, "sharded_lora_state_dict"):
+                module_state = module.sharded_lora_state_dict()
+            else:
                 continue
-            module_state = module.sharded_lora_state_dict()
             for key, value in module_state.items():
                 if key in local_state:
                     raise RuntimeError(
@@ -1489,7 +1507,7 @@ def _worker_run(request: WorkerRunRequest) -> None:
         sft_zero_template = megatron_train._zero_contribution_sft_inputs(
             sft_trajectory_tensors[0]
         )
-    initial_lora_state = loaded_state
+    initial_optimizer_state = _collect_lora_state(model_chunks, optimizer_master=True)
     global_grad_accumulation_sequences = request.case_config.grad_accumulation_sequences
 
     train_config = types.TrainConfig(
@@ -1631,14 +1649,17 @@ def _worker_run(request: WorkerRunRequest) -> None:
             forward_trace_capture.save_current_step(traces_dir)
             torch.distributed.barrier()  # ty: ignore[possibly-missing-attribute]
             current_lora_state = _collect_lora_state(model_chunks)
+            current_optimizer_state = _collect_lora_state(
+                model_chunks, optimizer_master=True
+            )
 
             if torch.distributed.get_rank() == 0:  # ty: ignore[possibly-missing-attribute]
                 grads = _require_not_none(captured_grads, "captured_grads")
                 initial_state = _require_not_none(
-                    initial_lora_state, "initial_lora_state"
+                    initial_optimizer_state, "initial_optimizer_state"
                 )
                 current_state = _require_not_none(
-                    current_lora_state, "current_lora_state"
+                    current_optimizer_state, "current_optimizer_state"
                 )
                 deltas = _delta_state(initial_state, current_state)
                 saved_deltas = _apply_save_mutation_to_tensor_map(

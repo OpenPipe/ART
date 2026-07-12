@@ -334,6 +334,20 @@ def test_forward_trace_extracts_empty_router_topk_with_config_hint() -> None:
     assert scores.shape == (0, 2)
 
 
+def test_forward_trace_extracts_router_ids_from_actual_routing_map() -> None:
+    topk = _extract_router_topk(
+        (
+            torch.tensor([[0.0, 1.2, 1.3, 0.0], [0.8, 0.0, 0.0, 1.7]]),
+            torch.tensor([[False, True, True, False], [True, False, False, True]]),
+        )
+    )
+    assert topk is not None
+    ids, scores = topk
+
+    assert torch.equal(ids, torch.tensor([[1, 2], [0, 3]]))
+    assert torch.equal(scores, torch.tensor([[1.2, 1.3], [0.8, 1.7]]))
+
+
 def test_megatron_empty_swiglu_patch_preserves_known_output_width() -> None:
     from art.megatron.runtime.bridge_runtime import install_art_bridge_runtime_patches
 
@@ -433,16 +447,16 @@ def test_forward_trace_canonicalizes_row_outputs_by_token_uid() -> None:
     )
 
 
-def test_forward_trace_drops_exact_zero_padding_rows() -> None:
+def test_forward_trace_drops_explicit_nonzero_padding_rows() -> None:
     trace: dict[str, list[dict[str, Any]]] = {
         "chunk0.module.decoder.layers.0.self_attention.out_proj": [
             {
                 "primary_output": torch.tensor(
-                    [[0.0, 0.0], [30.0, 31.0], [10.0, 11.0], [20.0, 21.0]]
+                    [[9.0, 9.0], [30.0, 31.0], [0.0, 0.0], [20.0, 21.0]]
                 ),
                 "output": {
                     "hidden": torch.tensor(
-                        [[0.0, 0.0], [3.0, 3.1], [1.0, 1.1], [2.0, 2.1]]
+                        [[9.0, 9.0], [3.0, 3.1], [0.0, 0.0], [2.0, 2.1]]
                     )
                 },
                 "row_token_uids": torch.tensor([-1, 3, 1, 2]),
@@ -456,11 +470,11 @@ def test_forward_trace_drops_exact_zero_padding_rows() -> None:
     assert torch.equal(call["row_token_uids"], torch.tensor([1, 2, 3]))
     assert torch.equal(
         call["primary_output"],
-        torch.tensor([[10.0, 11.0], [20.0, 21.0], [30.0, 31.0]]),
+        torch.tensor([[0.0, 0.0], [20.0, 21.0], [30.0, 31.0]]),
     )
     assert torch.equal(
         call["output"]["hidden"],
-        torch.tensor([[1.0, 1.1], [2.0, 2.1], [3.0, 3.1]]),
+        torch.tensor([[0.0, 0.0], [2.0, 2.1], [3.0, 3.1]]),
     )
 
 

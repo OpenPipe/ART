@@ -249,7 +249,16 @@ def _extract_router_topk(
         topk_scores = probs.new_zeros((probs.shape[0], 0))
         topk_ids = torch.zeros((probs.shape[0], 0), dtype=torch.int64)
     else:
-        topk_scores, topk_ids = torch.topk(probs, k=topk, dim=-1)
+        expert_ids = torch.arange(probs.shape[-1]).expand_as(routing_map)
+        topk_ids = (
+            expert_ids.masked_fill(~routing_map, probs.shape[-1])
+            .sort(dim=-1)
+            .values[:, :topk]
+        )
+        valid = topk_ids < probs.shape[-1]
+        topk_scores = probs.gather(-1, topk_ids.clamp_max(probs.shape[-1] - 1))
+        topk_ids = topk_ids.masked_fill(~valid, -1)
+        topk_scores = topk_scores.masked_fill(~valid, 0)
     return topk_ids.contiguous(), topk_scores.contiguous()
 
 
@@ -1253,8 +1262,7 @@ class ForwardTraceCapture:
     @classmethod
     def _canonicalize_call_row_token_order(cls, call: dict[str, Any]) -> None:
         """Canonicalizes all row-aligned call tensors to global token order."""
-        cls._align_exact_zero_padding_row_token_uids(call)
-        cls._drop_exact_zero_padding_rows(call)
+        cls._drop_padding_rows(call)
         row_token_uids = call.get("row_token_uids")
         if not isinstance(row_token_uids, torch.Tensor) or row_token_uids.ndim != 1:
             return
@@ -1276,8 +1284,8 @@ class ForwardTraceCapture:
         call["row_token_uids"] = row_token_uids.index_select(0, order).contiguous()
 
     @classmethod
-    def _drop_exact_zero_padding_rows(cls, call: dict[str, Any]) -> None:
-        """Removes traced sequence-padding rows before comparing compact CP traces."""
+    def _drop_padding_rows(cls, call: dict[str, Any]) -> None:
+        """Removes rows explicitly marked as sequence padding by their token UID."""
         row_token_uids = call.get("row_token_uids")
         tensor = call.get("primary_output")
         if (
@@ -1292,9 +1300,6 @@ class ForwardTraceCapture:
         padding_rows = row_token_uids < 0
         if row_count == 0 or not bool(padding_rows.any().item()):
             return
-        flat = tensor.detach().reshape(row_count, -1)
-        if not bool((flat[padding_rows] == 0).all().item()):
-            return
         valid_rows = torch.nonzero(~padding_rows, as_tuple=False).reshape(-1)
         original_call = dict(call)
         for key, value in original_call.items():
@@ -1306,48 +1311,6 @@ class ForwardTraceCapture:
                 total_rows=row_count,
             )
         call["row_token_uids"] = row_token_uids.index_select(0, valid_rows).contiguous()
-
-    @staticmethod
-    def _align_exact_zero_padding_row_token_uids(call: dict[str, Any]) -> None:
-        """Moves padding UID markers onto exact-zero sequence-parallel pad rows."""
-        row_token_uids = call.get("row_token_uids")
-        tensor = call.get("primary_output")
-        if (
-            not isinstance(row_token_uids, torch.Tensor)
-            or row_token_uids.ndim != 1
-            or not isinstance(tensor, torch.Tensor)
-            or tensor.ndim == 0
-            or int(tensor.shape[0]) != int(row_token_uids.numel())
-        ):
-            return
-        row_count = int(row_token_uids.numel())
-        if row_count <= 1 or not bool((row_token_uids < 0).any().item()):
-            return
-        flat = tensor.detach().reshape(row_count, -1)
-        zero_rows = torch.nonzero(
-            (flat == 0).all(dim=1) & (row_token_uids >= 0),
-            as_tuple=False,
-        ).reshape(-1)
-        negative_rows = torch.nonzero(
-            (row_token_uids < 0) & ~(flat == 0).all(dim=1),
-            as_tuple=False,
-        ).reshape(-1)
-        if int(zero_rows.numel()) == 0 or int(zero_rows.numel()) != int(
-            negative_rows.numel()
-        ):
-            return
-        aligned = row_token_uids.clone()
-        for zero_pos, negative_pos in zip(
-            zero_rows.tolist(), negative_rows.tolist(), strict=True
-        ):
-            zero_pos = int(zero_pos)
-            negative_pos = int(negative_pos)
-            if zero_pos >= negative_pos:
-                return
-            shifted = aligned[zero_pos:negative_pos].clone()
-            aligned[zero_pos] = -1
-            aligned[zero_pos + 1 : negative_pos + 1] = shifted
-        call["row_token_uids"] = aligned
 
     @classmethod
     def _canonicalize_primary_output_tensor(
