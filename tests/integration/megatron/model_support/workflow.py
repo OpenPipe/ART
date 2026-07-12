@@ -41,6 +41,11 @@ INCLUDE_FLASH_SENSITIVITY_ENV = "ART_MODEL_SUPPORT_INCLUDE_FLASH_SENSITIVITY"
 KEEP_TOPOLOGY_ARTIFACTS_ENV = "ART_ORACLE_KEEP_TOPOLOGY_ARTIFACTS"
 WORKFLOW_ARTIFACT_SUITE_NAME = "Megatron model-support validation workflow"
 FLASH_SENSITIVITY_MUTATION = "attn_skip_flash_lse_normalize"
+_HANDLER_INAPPLICABLE_SENSITIVITY_MUTATIONS = {
+    "glm52": frozenset(
+        {"attn_skip_nested_grad_sanitize", "attn_skip_flash_lse_normalize"}
+    )
+}
 
 MANDATORY_VALIDATION_STAGES = (
     "dependency_resolution",
@@ -522,6 +527,7 @@ def run_correctness_sensitivity_stage(
         if topology.world_size() > max_world_size
     ]
     mutations: list[str] = []
+    inapplicable_sensitivity_mutations: list[str] = []
     default_excluded_sensitivity_mutations: list[str] = []
     excluded_sensitivity_mutations: list[str] = []
     if not skip_sensitivity:
@@ -534,6 +540,11 @@ def run_correctness_sensitivity_stage(
             ):
                 if mutation not in mutations:
                     mutations.append(mutation)
+        inapplicable = _HANDLER_INAPPLICABLE_SENSITIVITY_MUTATIONS.get(handler.key, ())
+        inapplicable_sensitivity_mutations = [
+            mutation for mutation in mutations if mutation in inapplicable
+        ]
+        mutations = [mutation for mutation in mutations if mutation not in inapplicable]
         excluded_sensitivity_mutations = [
             mutation
             for mutation in mutations
@@ -614,6 +625,7 @@ def run_correctness_sensitivity_stage(
             "allow_unvalidated_arch": allow_unvalidated_arch,
             "objectives": objectives,
             "sensitivity_mutations": mutations,
+            "inapplicable_sensitivity_mutations": (inapplicable_sensitivity_mutations),
             "excluded_sensitivity_mutations": excluded_sensitivity_mutations,
             "default_excluded_sensitivity_mutations": (
                 default_excluded_sensitivity_mutations
