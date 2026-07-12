@@ -952,85 +952,57 @@ def _apply_attention_async_comm_mutation(mutation: SensitivityMutation | None):
 
     from art.megatron.context_parallel import comm
 
-    original = comm.A2AVCommunicator.launch_kv_fetch
+    original = comm.A2AVCommunicator._launch_exchange
     comm_delay_cycles = 80_000_000
 
-    def _mutated_launch_kv_fetch(
+    def _mutated_launch_exchange(
         self: Any,
         *,
-        k_local: torch.Tensor,
-        v_local: torch.Tensor,
-        plan: Any,
+        tensor: torch.Tensor,
+        recv_buffer: torch.Tensor,
+        total_send_rows: int,
+        make_send_buffer: Callable[[], torch.Tensor],
+        output_split_sizes: list[int],
+        input_split_sizes: list[int],
         group: Any,
         async_op: bool,
-        range_meta_cache: dict[Any, Any] | None = None,
-        label: str = "kv_fetch",
-        input_layout: str = "token_major",
-        output_layout: str = "head_major",
+        input_layout: str,
+        row_factor: int = 2,
     ):
-        if group is None or comm._DIST.get_world_size(group) == 1:
-            return original(
-                self,
-                k_local=k_local,
-                v_local=v_local,
-                plan=plan,
-                group=group,
-                async_op=async_op,
-                range_meta_cache=range_meta_cache,
-                label=label,
-                input_layout=input_layout,
-                output_layout=output_layout,
-            )
-
-        total_send_rows = int(sum(plan.send_splits))
-        total_recv_rows = int(sum(plan.recv_splits))
-        recv_packed = k_local.new_empty(
-            comm._packed_peer_tensor_shape(
-                tensor=k_local,
-                total_rows=total_recv_rows,
-                input_layout=input_layout,
-            )
-        )
-        input_split_sizes = [split * 2 for split in plan.send_splits]
-        output_split_sizes = [split * 2 for split in plan.recv_splits]
-        stream = self._get_stream(k_local) if async_op else None
+        stream = self._get_stream(tensor) if async_op else None
         if stream is None:
             return original(
                 self,
-                k_local=k_local,
-                v_local=v_local,
-                plan=plan,
+                tensor=tensor,
+                recv_buffer=recv_buffer,
+                total_send_rows=total_send_rows,
+                make_send_buffer=make_send_buffer,
+                output_split_sizes=output_split_sizes,
+                input_split_sizes=input_split_sizes,
                 group=group,
                 async_op=async_op,
-                range_meta_cache=range_meta_cache,
-                label=label,
                 input_layout=input_layout,
-                output_layout=output_layout,
+                row_factor=row_factor,
             )
-        current_stream = torch.cuda.current_stream(k_local.device)
+        current_stream = torch.cuda.current_stream(tensor.device)
         if total_send_rows > 0:
             stream.wait_stream(current_stream)
         with torch.cuda.stream(stream):
             if total_send_rows <= 0:
-                send_buffer = k_local.new_empty(
+                send_buffer = tensor.new_empty(
                     comm._packed_peer_tensor_shape(
-                        tensor=k_local,
+                        tensor=tensor,
                         total_rows=0,
                         input_layout=input_layout,
+                        row_factor=row_factor,
                     )
                 )
             else:
-                send_buffer = comm._pack_gathered_tensors_per_peer(
-                    left_tensor=k_local,
-                    right_tensor=v_local,
-                    ranges_by_peer=plan.send_ranges_by_peer,
-                    range_meta_cache=range_meta_cache,
-                    input_layout=input_layout,
-                )
+                send_buffer = make_send_buffer()
             if total_send_rows > 0:
                 torch.cuda._sleep(comm_delay_cycles)
             handle = comm._launch_peer_exchange(
-                recv_buffer=recv_packed,
+                recv_buffer=recv_buffer,
                 send_buffer=send_buffer,
                 output_split_sizes=output_split_sizes,
                 input_split_sizes=input_split_sizes,
@@ -1039,21 +1011,13 @@ def _apply_attention_async_comm_mutation(mutation: SensitivityMutation | None):
             )
         if total_send_rows > 0 and send_buffer.numel() > 0:
             send_buffer.zero_()
-        return comm.KvFetchWork(
-            packed_buffer=recv_packed,
-            recv_splits=plan.recv_splits,
-            handle=handle,
-            send_buffer=send_buffer,
-            stream=stream,
-            label=label,
-            output_layout=output_layout,
-        )
+        return handle, send_buffer, stream
 
-    comm.A2AVCommunicator.launch_kv_fetch = _mutated_launch_kv_fetch  # type: ignore[invalid-assignment]
+    comm.A2AVCommunicator._launch_exchange = _mutated_launch_exchange  # type: ignore[invalid-assignment]
     try:
         yield
     finally:
-        comm.A2AVCommunicator.launch_kv_fetch = original
+        comm.A2AVCommunicator._launch_exchange = original
 
 
 @contextmanager
