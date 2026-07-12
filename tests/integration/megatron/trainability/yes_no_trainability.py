@@ -318,6 +318,16 @@ def _get_env_float(name: str, default: float) -> float:
     return float(os.environ.get(name, str(default)))
 
 
+def _get_env_int_list(name: str) -> list[int] | None:
+    raw = os.environ.get(name)
+    if raw is None:
+        return None
+    parts = raw.split(",")
+    if any(not part.strip() for part in parts):
+        raise ValueError(f"Invalid integer list for {name}: {raw!r}")
+    return [int(part) for part in parts]
+
+
 def _get_env_bool(name: str, default: bool) -> bool:
     raw = os.environ.get(name)
     if raw is None:
@@ -346,7 +356,13 @@ def _enable_thinking() -> bool:
 
 
 def _extra_body() -> dict[str, object]:
-    return {"chat_template_kwargs": {"enable_thinking": _enable_thinking()}}
+    body: dict[str, object] = {
+        "chat_template_kwargs": {"enable_thinking": _enable_thinking()}
+    }
+    allowed_token_ids = _get_env_int_list("ART_MODEL_SUPPORT_YES_NO_ALLOWED_TOKEN_IDS")
+    if allowed_token_ids is not None:
+        body["allowed_token_ids"] = allowed_token_ids
+    return body
 
 
 def _request_timeout(name: str, default: float) -> float:

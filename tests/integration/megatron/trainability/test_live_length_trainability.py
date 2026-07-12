@@ -29,6 +29,7 @@ from .yes_no_trainability import (
     _get_env_bool,
     _get_env_float,
     _get_env_int,
+    _get_env_int_list,
     _init_megatron_runtime_config,
     _list_model_ids,
     _topology_with_env_overrides,
@@ -442,9 +443,23 @@ def _messages(
 
 
 def _extra_body(chat_template_kwargs: dict[str, Any]) -> dict[str, object]:
-    return (
+    body: dict[str, object] = (
         {"chat_template_kwargs": chat_template_kwargs} if chat_template_kwargs else {}
     )
+    allowed_token_ids = _get_env_int_list("ART_MODEL_SUPPORT_LENGTH_ALLOWED_TOKEN_IDS")
+    if allowed_token_ids is not None:
+        body["allowed_token_ids"] = allowed_token_ids
+    if (
+        min_tokens := os.environ.get("ART_MODEL_SUPPORT_LENGTH_MIN_TOKENS")
+    ) is not None:
+        body["min_tokens"] = int(min_tokens)
+    if (
+        frequency_penalty := os.environ.get(
+            "ART_MODEL_SUPPORT_LENGTH_FREQUENCY_PENALTY"
+        )
+    ) is not None:
+        body["frequency_penalty"] = float(frequency_penalty)
+    return body
 
 
 def _length_chat_template_kwargs(base_model: str, tokenizer: object) -> dict[str, Any]:

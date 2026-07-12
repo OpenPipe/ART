@@ -21,6 +21,9 @@ from .test_live_length_trainability import (
     length_trainability_passed,
 )
 from .test_live_length_trainability import (
+    _extra_body as _length_extra_body,
+)
+from .test_live_length_trainability import (
     _prompt_tree_shape as _length_prompt_tree_shape,
 )
 from .yes_no_trainability import (
@@ -30,6 +33,7 @@ from .yes_no_trainability import (
     _build_variant,
     _default_variant_name,
     _evaluate_groups,
+    _get_env_int_list,
     _TrainabilityVariant,
     _variant_init_args,
     _variant_max_steps,
@@ -38,6 +42,9 @@ from .yes_no_trainability import (
     _variant_train_kwargs,
     build_prompts,
     yes_no_trainability_passed,
+)
+from .yes_no_trainability import (
+    _extra_body as _yes_no_extra_body,
 )
 from .yes_no_trainability import (
     _prompt_tree_shape as _yes_no_prompt_tree_shape,
@@ -99,6 +106,26 @@ class _FakeModel:
 
     def get_inference_name(self, *, step: int | None = None) -> str:
         return f"fake@{step}"
+
+
+def test_optional_sampling_controls(monkeypatch) -> None:
+    monkeypatch.setenv("ART_MODEL_SUPPORT_YES_NO_ALLOWED_TOKEN_IDS", "9829,902,36569")
+    monkeypatch.setenv("ART_MODEL_SUPPORT_LENGTH_ALLOWED_TOKEN_IDS", "154820,38069")
+    monkeypatch.setenv("ART_MODEL_SUPPORT_LENGTH_MIN_TOKENS", "2")
+    monkeypatch.setenv("ART_MODEL_SUPPORT_LENGTH_FREQUENCY_PENALTY", "0.5")
+
+    assert _yes_no_extra_body()["allowed_token_ids"] == [9829, 902, 36569]
+    assert _length_extra_body({}) == {
+        "allowed_token_ids": [154820, 38069],
+        "min_tokens": 2,
+        "frequency_penalty": 0.5,
+    }
+
+
+def test_integer_list_rejects_empty_values(monkeypatch) -> None:
+    monkeypatch.setenv("INVALID_INTEGER_LIST", "1,,2")
+    with pytest.raises(ValueError, match="Invalid integer list"):
+        _get_env_int_list("INVALID_INTEGER_LIST")
 
 
 @pytest.mark.asyncio
