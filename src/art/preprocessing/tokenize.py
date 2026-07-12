@@ -20,6 +20,7 @@ if TYPE_CHECKING:
 from ..trajectories import History, Trajectory, TrajectoryGroup, get_messages
 from ..types import MessagesAndChoices
 from ..utils.chat_template import (
+    TOOL_CALL_ARGUMENTS_AS_MAPPING_ATTR,
     default_chat_template_kwargs_for_tokenizer,
     merge_chat_template_kwargs,
 )
@@ -134,7 +135,9 @@ def _normalize_tool_call_arguments_for_chat_template(
 ) -> list[dict[str, Any]]:
     chat_template = tokenizer.chat_template
     assert isinstance(chat_template, str)
-    if "tool_call.arguments|items" not in chat_template:
+    if not getattr(tokenizer, TOOL_CALL_ARGUMENTS_AS_MAPPING_ATTR, False) and (
+        "tool_call.arguments|items" not in chat_template
+    ):
         return messages
 
     normalized_messages: list[dict[str, Any]] = []

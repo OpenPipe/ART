@@ -4,6 +4,7 @@ THINKING_CHAT_TEMPLATE_KWARGS: dict[str, Any] = {
     "enable_thinking": False,
     "preserve_thinking": True,
 }
+TOOL_CALL_ARGUMENTS_AS_MAPPING_ATTR = "_art_tool_call_arguments_as_mapping"
 
 
 def default_chat_template_kwargs_for_template(

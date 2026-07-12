@@ -91,6 +91,21 @@ class Glm52Handler(DefaultMoeHandler):
     cp_supported = True
     native_vllm_lora_status = "validated"
 
+    def configure_tokenizer(
+        self,
+        tokenizer: Any,
+        *,
+        internal_config: Any,
+    ) -> Any:
+        if not any(
+            internal_config.get(key) is not None
+            for key in ("chat_template", "chat_template_path")
+        ):
+            from art.utils.chat_template import TOOL_CALL_ARGUMENTS_AS_MAPPING_ATTR
+
+            setattr(tokenizer, TOOL_CALL_ARGUMENTS_AS_MAPPING_ATTR, True)
+        return tokenizer
+
     def compile_workaround_config(self, provider: Any) -> CompileWorkaroundConfig:
         ep1_alltoall = (
             int(getattr(provider, "expert_model_parallel_size", 1) or 1) == 1
