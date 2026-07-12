@@ -430,7 +430,9 @@ class ForwardTraceCapture:
     @staticmethod
     def _lora_primary_output_merge_hint(module: Any) -> dict[str, Any] | None:
         """Infers the correct output merge op for LoRA modules."""
-        if module.__class__.__name__ != "LoRA":
+        from art.megatron.lora import LoRA
+
+        if not isinstance(module, LoRA):
             return None
         lora_module = module
         b_param = getattr(lora_module, "B_T", None)
