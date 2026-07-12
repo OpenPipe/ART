@@ -1,5 +1,6 @@
 """GLM-5.2 adaptations for the ART-owned vLLM runtime."""
 
+from functools import wraps
 from typing import Any
 
 
@@ -12,6 +13,7 @@ class _SharedTopkBuffer:
 def apply_glm52_vllm_runtime_patches() -> None:
     patch_glm52_lora_metadata()
     patch_glm52_shared_indexers()
+    patch_glm52_indexer_rope()
 
 
 def patch_glm52_lora_metadata() -> None:
@@ -59,3 +61,33 @@ def patch_glm52_shared_indexers() -> None:
 
     Glm52Indexer.__art_glm52_index_share_patched__ = True
     deepseek_v2.Indexer = Glm52Indexer
+
+
+def patch_glm52_indexer_rope() -> None:
+    """Match GLM's half-split indexer RoPE without changing main MLA RoPE."""
+    from vllm.model_executor.models import deepseek_v2
+
+    original = deepseek_v2.DeepseekV2MLAAttention.__init__
+    if getattr(original, "__art_glm52_indexer_rope_patched__", False):
+        return
+
+    @wraps(original)
+    def init(self: Any, *args: Any, **kwargs: Any) -> None:
+        original(self, *args, **kwargs)
+        config = kwargs["config"] if "config" in kwargs else args[1]
+        if getattr(config, "model_type", None) != "glm_moe_dsa":
+            return
+        rope = deepseek_v2.get_rope(
+            self.qk_rope_head_dim,
+            max_position=self.max_position_embeddings,
+            rope_parameters=config.rope_parameters,
+            is_neox_style=True,
+        )
+        self.indexer_rope_emb = rope
+        self.mla_attn.indexer_rope_emb = rope
+        indexer = self.mla_attn.indexer
+        if hasattr(indexer, "is_inplace_rope"):
+            indexer.is_inplace_rope = rope.enabled()
+
+    init.__art_glm52_indexer_rope_patched__ = True  # type: ignore[attr-defined]
+    deepseek_v2.DeepseekV2MLAAttention.__init__ = init
