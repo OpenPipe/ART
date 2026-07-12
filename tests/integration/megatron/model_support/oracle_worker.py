@@ -257,6 +257,8 @@ def _collect_lora_state(
                 module_state = {}
                 for key, param, expert in export_items():
                     main_param = getattr(param, "main_param", None)
+                    if main_param is None and param.dtype == torch.float32:
+                        main_param = param
                     if main_param is None or bool(
                         getattr(param, "main_param_sharded", False)
                     ):
