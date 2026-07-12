@@ -265,11 +265,14 @@ SENSITIVITY_TOPOLOGY_BY_MUTATION["bwd_skip_sync_fc1_a"] = Topology(
 SENSITIVITY_TOPOLOGY_BY_MUTATION |= {
     k: Topology(tp=1, ep=2, etp=1, dp=2, sp=False)
     for k in [
-        "dp_grad_accumulation_seqs",
         "dp_local_token_normalization",
         "sft_local_token_normalization",
     ]
 }
+# Isolate DP sample assignment from HybridEP's independently planned micro extents.
+SENSITIVITY_TOPOLOGY_BY_MUTATION["dp_grad_accumulation_seqs"] = Topology(
+    tp=1, ep=1, etp=1, dp=2, sp=False
+)
 
 
 class PackedTensorConfig(BaseModel):

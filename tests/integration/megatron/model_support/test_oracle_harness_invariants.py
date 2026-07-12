@@ -1054,6 +1054,10 @@ def test_dense_sensitivity_keeps_dp_and_cp_attention_cases() -> None:
         "attn_skip_flash_lse_normalize",
         is_moe=True,
     ) == Topology(tp=1, ep=2, etp=1, dp=1, cp=4, sp=False)
+    assert sensitivity_topology_for_mutation(
+        "dp_grad_accumulation_seqs",
+        is_moe=True,
+    ) == Topology(tp=1, ep=1, etp=1, dp=2, sp=False)
 
 
 def test_case_config_base_model_can_be_overridden_by_env(
