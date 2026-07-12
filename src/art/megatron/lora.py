@@ -1104,6 +1104,7 @@ def _parallel_lora(
     grad_sync_domain: GradSyncDomain = TP_DEFAULT_GRAD_SYNC_DOMAIN,
     allreduce: bool = True,
     num_local_experts: int = 1,
+    lora_cls: type[LoRA] = LoRA,
 ) -> LoRA:
     weight = getattr(linear, "weight0", None)
     if weight is None:
@@ -1124,7 +1125,7 @@ def _parallel_lora(
         grad_sync_domain=grad_sync_domain,
         grad_sync_op=GRAD_SYNC_OP_SUM if row_layout else GRAD_SYNC_OP_NONE,
     )
-    return LoRA(
+    return lora_cls(
         adapter_model_prefix=adapter_model_prefix,
         in_features=linear.in_features,
         out_features=out_features,
@@ -1149,6 +1150,7 @@ def _parallel_lora_pair(
     layout: Literal["column", "row"],
     suffixes: tuple[str, str],
     num_local_experts: int = 1,
+    lora_cls: type[LoRA] = LoRA,
 ) -> tuple[LoRA, LoRA]:
     expert_parallel = num_local_experts > 1
     return cast(
@@ -1169,6 +1171,7 @@ def _parallel_lora_pair(
                 ),
                 allreduce=not expert_parallel,
                 num_local_experts=num_local_experts,
+                lora_cls=lora_cls,
             )
             for suffix in suffixes
         ),
@@ -1184,6 +1187,7 @@ class SelfAttentionLinearProjLoRA(torch.nn.Module):
         alpha: float,
         provider: GPTModelProvider,
         reduce_output: bool = True,
+        lora_cls: type[LoRA] = LoRA,
     ) -> None:
         super().__init__()
         self.provider = provider
@@ -1196,6 +1200,7 @@ class SelfAttentionLinearProjLoRA(torch.nn.Module):
             rank=rank,
             alpha=alpha,
             layout="row",
+            lora_cls=lora_cls,
         )
 
     def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor | None]:
@@ -1597,6 +1602,7 @@ class SharedExpertsLinearFC1LoRA(torch.nn.Module):
         linear_fc1: TEColumnParallelLinear | TELayerNormColumnParallelLinear,
         rank: int,
         alpha: float,
+        lora_cls: type[LoRA] = LoRA,
     ) -> None:
         super().__init__()
         if isinstance(linear_fc1, TELayerNormColumnParallelLinear):
@@ -1611,6 +1617,7 @@ class SharedExpertsLinearFC1LoRA(torch.nn.Module):
             alpha=alpha,
             layout="column",
             suffixes=("gate_proj", "up_proj"),
+            lora_cls=lora_cls,
         )
 
     def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor | None]:
@@ -1653,6 +1660,7 @@ class SharedExpertsLinearFC2LoRA(torch.nn.Module):
         rank: int,
         alpha: float,
         provider: GPTModelProvider,
+        lora_cls: type[LoRA] = LoRA,
     ) -> None:
         super().__init__()
         self.row_parallel_lora = SelfAttentionLinearProjLoRA(
@@ -1662,6 +1670,7 @@ class SharedExpertsLinearFC2LoRA(torch.nn.Module):
             alpha=alpha,
             provider=provider,
             reduce_output=not _linear_disables_tensor_parallel_comm(linear_fc2),
+            lora_cls=lora_cls,
         )
 
     def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor | None]:
@@ -1826,6 +1835,7 @@ def wrap_split_mlp_lora(
     target_modules: set[str],
     rank: int,
     alpha: int,
+    lora_cls: type[LoRA] = LoRA,
 ) -> None:
     if _targets_include(target_modules, "gate_proj", "up_proj"):
         linear_fc1 = _unwrap_attr(
@@ -1838,6 +1848,7 @@ def wrap_split_mlp_lora(
             linear_fc1=linear_fc1,
             rank=rank,
             alpha=alpha,
+            lora_cls=lora_cls,
         )
     if _targets_include(target_modules, "down_proj"):
         linear_fc2 = _unwrap_attr(
@@ -1851,6 +1862,7 @@ def wrap_split_mlp_lora(
             rank=rank,
             alpha=alpha,
             provider=provider,
+            lora_cls=lora_cls,
         )
 
 
@@ -1880,6 +1892,7 @@ def wrap_dense_mlp(
     target_modules: set[str],
     rank: int,
     alpha: int,
+    lora_cls: type[LoRA] = LoRA,
 ) -> None:
     wrap_split_mlp_lora(
         mlp,
@@ -1888,6 +1901,7 @@ def wrap_dense_mlp(
         target_modules=target_modules,
         rank=rank,
         alpha=alpha,
+        lora_cls=lora_cls,
     )
 
 
@@ -1899,6 +1913,7 @@ def wrap_shared_experts_mlp(
     target_modules: set[str],
     rank: int,
     alpha: int,
+    lora_cls: type[LoRA] = LoRA,
 ) -> None:
     wrap_split_mlp_lora(
         shared_experts,
@@ -1907,6 +1922,7 @@ def wrap_shared_experts_mlp(
         target_modules=target_modules,
         rank=rank,
         alpha=alpha,
+        lora_cls=lora_cls,
     )
 
 

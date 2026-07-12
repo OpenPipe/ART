@@ -9,6 +9,7 @@ from megatron.core.extensions.transformer_engine import (
 )
 import torch
 
+from art.megatron.glm52.lora_projection import glm52_lora_a
 from art.megatron.kernels.cute_grouped_lora_quack import quack_grouped_lora_residual
 from art.megatron.lora import (
     GRAD_SYNC_OP_SUM,
@@ -25,6 +26,20 @@ from art.megatron.lora import (
 )
 
 
+class Glm52LoRA(LoRA):
+    def forward(
+        self, x: torch.Tensor, tokens_per_expert: list[int] | torch.Tensor | None = None
+    ) -> torch.Tensor:
+        if tokens_per_expert is not None:
+            raise ValueError("Glm52LoRA is only for non-expert projections.")
+        active = self.active_lora_tensors()
+        if active is None:
+            return x.new_zeros((*x.shape[:-1], self.out_features))
+        a_t, b_t, scale = active
+        out = glm52_lora_a(x, a_t) @ b_t
+        return out if scale == 1.0 else out * scale
+
+
 def _replicated_lora(
     linear: Any,
     *,
@@ -37,7 +52,7 @@ def _replicated_lora(
         grad_sync_domain=TP_DEFAULT_GRAD_SYNC_DOMAIN,
         grad_sync_op=GRAD_SYNC_OP_SUM,
     )
-    return LoRA(
+    return Glm52LoRA(
         adapter_model_prefix=adapter_model_prefix,
         in_features=weight.shape[1],
         out_features=weight.shape[0],
@@ -85,6 +100,7 @@ def apply_glm52_attention_lora(
             rank=rank,
             alpha=alpha,
             layout="column",
+            lora_cls=Glm52LoRA,
         )
     if _targets_include(target_modules, "o_proj"):
         attention.linear_proj = SelfAttentionLinearProjLoRA(
@@ -93,6 +109,7 @@ def apply_glm52_attention_lora(
             rank=rank,
             alpha=alpha,
             provider=provider,
+            lora_cls=Glm52LoRA,
         )
 
 

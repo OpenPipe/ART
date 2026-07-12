@@ -300,6 +300,7 @@ class Glm52Handler(DefaultMoeHandler):
 
         from art.megatron.glm52.attention import Glm52SelfAttention
         from art.megatron.glm52.lora import (
+            Glm52LoRA,
             apply_glm52_attention_lora,
             wrap_glm52_grouped_moe_experts_3d,
         )
@@ -345,6 +346,7 @@ class Glm52Handler(DefaultMoeHandler):
                         target_modules=targets,
                         rank=rank,
                         alpha=alpha,
+                        lora_cls=Glm52LoRA,
                     )
                     continue
                 wrap_glm52_grouped_moe_experts_3d(
@@ -363,6 +365,7 @@ class Glm52Handler(DefaultMoeHandler):
                         target_modules=targets,
                         rank=rank,
                         alpha=alpha,
+                        lora_cls=Glm52LoRA,
                     )
 
     def build_adapter_weights_by_base(
