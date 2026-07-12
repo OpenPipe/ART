@@ -142,6 +142,68 @@ def _rank_token_counts(
     return counts
 
 
+def _route_token_uids(
+    call_entry: dict[str, Any], token_count: int
+) -> torch.Tensor | None:
+    token_uids = call_entry.get("row_token_uids")
+    if not isinstance(token_uids, torch.Tensor):
+        return None
+    token_uids = token_uids.to(dtype=torch.int64).reshape(-1).contiguous()
+    if int(token_uids.numel()) != token_count:
+        raise RuntimeError(
+            "Router row token UID count must match route rows: "
+            f"uids={int(token_uids.numel())}, routes={token_count}"
+        )
+    if bool((token_uids < 0).any().item()) or int(token_uids.unique().numel()) != int(
+        token_uids.numel()
+    ):
+        raise RuntimeError("Router row token UIDs must be unique and non-negative")
+    return token_uids
+
+
+def _expand_route_to_token_span(
+    route: RouterCallRoute,
+    token_uids: torch.Tensor | None,
+    token_count: int,
+) -> RouterCallRoute:
+    if token_uids is None:
+        if route.num_global_tokens != token_count:
+            raise RuntimeError(
+                "A compact router route requires row token UIDs: "
+                f"routes={route.num_global_tokens}, token_span={token_count}"
+            )
+        return route
+    identity = torch.arange(token_count, dtype=torch.int64)
+    if route.num_global_tokens == token_count and torch.equal(token_uids, identity):
+        return route
+    if int(token_uids.numel()) > 0 and int(token_uids.max().item()) >= token_count:
+        raise RuntimeError(
+            "Router row token UID exceeds the replay token span: "
+            f"max_uid={int(token_uids.max().item())}, token_span={token_count}"
+        )
+
+    rows = torch.arange(token_count, dtype=torch.int64).unsqueeze(1)
+    slots = torch.arange(route.max_topk, dtype=torch.int64).unsqueeze(0)
+    expert_indices = ((rows + slots) % route.num_experts).to(torch.int32)
+    expert_indices.index_copy_(0, token_uids, route.expert_indices)
+    expert_probs = None
+    if route.expert_probs is not None:
+        expert_probs = torch.zeros((token_count, route.max_topk), dtype=torch.float32)
+        expert_probs.index_copy_(0, token_uids, route.expert_probs)
+    expert_mask = None
+    if route.expert_mask is not None:
+        expert_mask = torch.ones((token_count, route.max_topk), dtype=torch.bool)
+        expert_mask.index_copy_(0, token_uids, route.expert_mask)
+    return RouterCallRoute(
+        expert_indices=expert_indices,
+        expert_probs=expert_probs,
+        expert_mask=expert_mask,
+        num_experts=route.num_experts,
+        sample_index=route.sample_index,
+        micro_slot=route.micro_slot,
+    )
+
+
 def _dedupe_checkpoint_router_calls(
     call_entries: list[dict[str, Any]],
 ) -> list[dict[str, Any]]:
@@ -221,7 +283,7 @@ def build_bundle_from_forward_trace_dir(
 
         step_routers: dict[str, StepRouterRoutes] = {}
         step_global_tokens: int | None = None
-        token_count_by_call_key: dict[tuple[str, int], int] = {}
+        route_token_uids: dict[tuple[str, int], torch.Tensor | None] = {}
         for module_name in sorted(step_trace.keys()):
             if ROUTER_NAME_TOKEN not in module_name:
                 continue
@@ -240,29 +302,14 @@ def build_bundle_from_forward_trace_dir(
                     call_entry, compact_route.num_global_tokens
                 )
                 router_calls[call_index] = compact_route
+                token_uids = _route_token_uids(
+                    call_entry, compact_route.num_global_tokens
+                )
+                route_token_uids[(router_key, call_index)] = token_uids
                 max_topk = max(max_topk, compact_route.max_topk)
                 token_count = compact_route.num_global_tokens
-                call_key = (
-                    ("sample", int(sample_index))
-                    if sample_index is not None
-                    else (
-                        ("dummy_micro_slot", int(micro_slot))
-                        if micro_slot is not None
-                        else ("call_index", int(call_index))
-                    )
-                )
-                previous_token_count = token_count_by_call_key.get(call_key)
-                if (
-                    previous_token_count is not None
-                    and previous_token_count != token_count
-                ):
-                    raise RuntimeError(
-                        "Inconsistent token count across routers for the same micro: "
-                        f"step={step_index}, call_key={call_key}, "
-                        f"expected={previous_token_count}, got={token_count}, "
-                        f"router='{router_key}', call={call_index}"
-                    )
-                token_count_by_call_key[call_key] = token_count
+                if token_uids is not None and int(token_uids.numel()) > 0:
+                    token_count = max(token_count, int(token_uids.max().item()) + 1)
                 step_global_tokens = (
                     token_count
                     if step_global_tokens is None
@@ -284,6 +331,13 @@ def build_bundle_from_forward_trace_dir(
             raise RuntimeError(
                 f"Could not infer token count for step={step_index} from router traces"
             )
+        for router_key, router_routes in step_routers.items():
+            for call_index, route in router_routes.calls.items():
+                router_routes.calls[call_index] = _expand_route_to_token_span(
+                    route,
+                    route_token_uids[(router_key, call_index)],
+                    step_global_tokens,
+                )
         global_token_uids = torch.arange(step_global_tokens, dtype=torch.int64)
         steps[step_index] = StepRoutes(
             routers=step_routers,
