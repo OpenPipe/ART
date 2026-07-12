@@ -189,6 +189,7 @@ class _LoraPublishTemplate(NamedTuple):
     shape: tuple[int, ...]
     dtype_name: str
     num_local_experts: int
+    is_expert: bool
     shard_domain: ShardDomain
     sharded: bool
     shard_world_size: int
@@ -464,9 +465,12 @@ class LoRA(torch.nn.Module):
         allreduce: bool = True,
     ) -> None:
         super().__init__()
-        assert num_local_experts == 1 or "{expert}" in adapter_model_prefix, (
-            "adapter_model_prefix must contain the '{expert}' format placeholder if num_local_experts > 1"
-        )
+        is_expert = "{expert}" in adapter_model_prefix
+        if num_local_experts < 1 or (num_local_experts != 1 and not is_expert):
+            raise ValueError(
+                "num_local_experts must be positive and requires an '{expert}' "
+                "adapter_model_prefix when greater than one"
+            )
         self.adapter_model_prefix = adapter_model_prefix
         self.alpha = float(alpha)
         self.in_features = int(in_features)
@@ -474,16 +478,16 @@ class LoRA(torch.nn.Module):
         self.scale = alpha / rank
         self._slot_modules = torch.nn.ModuleDict()
         self._slot_keys: dict[LoRASlotRef, str] = {}
-        self.A_T = torch.nn.Parameter(
-            torch.zeros(
-                num_local_experts, in_features, rank, dtype=dtype, device=device
-            ).squeeze(0)
+        a_shape = (
+            (num_local_experts, in_features, rank) if is_expert else (in_features, rank)
         )
-        self.B_T = torch.nn.Parameter(
-            torch.zeros(
-                num_local_experts, rank, out_features, dtype=dtype, device=device
-            ).squeeze(0)
+        b_shape = (
+            (num_local_experts, rank, out_features)
+            if is_expert
+            else (rank, out_features)
         )
+        self.A_T = torch.nn.Parameter(torch.zeros(a_shape, dtype=dtype, device=device))
+        self.B_T = torch.nn.Parameter(torch.zeros(b_shape, dtype=dtype, device=device))
         _set_lora_parallel_metadata(
             self.A_T,
             parallel_spec=a_parallel_spec,
@@ -499,7 +503,11 @@ class LoRA(torch.nn.Module):
 
     @property
     def num_local_experts(self) -> int:
-        return self.A_T.shape[0] if self.A_T.ndim == 3 else 1
+        return self.A_T.shape[0] if self.is_expert else 1
+
+    @property
+    def is_expert(self) -> bool:
+        return "{expert}" in self.adapter_model_prefix
 
     def _broadcast_if_replicated(self, param: torch.nn.Parameter) -> None:
         if not param.lora_tp_replicated:  # ty: ignore[unresolved-attribute]
@@ -528,7 +536,7 @@ class LoRA(torch.nn.Module):
 
     def reset_lora_parameters(self) -> None:
         """Initialize LoRA weights (A=Kaiming, B=zeros) like PEFT defaults."""
-        if self.A_T.ndim == 3:
+        if self.is_expert:
             for expert in range(self.A_T.shape[0]):
                 torch.nn.init.kaiming_uniform_(self.A_T[expert].T, a=math.sqrt(5))
         else:
@@ -538,7 +546,7 @@ class LoRA(torch.nn.Module):
         self._broadcast_if_replicated(self.B_T)
 
     def _expected_weight_keys(self, suffix: str) -> list[str]:
-        if self.num_local_experts > 1:
+        if self.is_expert:
             return [
                 f"{self.adapter_model_prefix.format(expert=expert + self._expert_offset)}.{suffix}.weight"
                 for expert in range(self.num_local_experts)
@@ -638,7 +646,7 @@ class LoRA(torch.nn.Module):
         suffix: str,
     ) -> torch.Tensor:
         keys = self._expected_weight_keys(suffix)
-        if self.num_local_experts > 1:
+        if self.is_expert:
             return torch.stack([adapter_model[key].T for key in keys])
         return adapter_model[keys[0]].T
 
@@ -700,7 +708,7 @@ class LoRA(torch.nn.Module):
         Determine if the given LoRA param should be exported in the sharded LoRA state dict
         (drop replicated ranks/params).
         """
-        if self.num_local_experts > 1:  # self is a MoE layer
+        if self.is_expert:
             if ps.get_expert_data_parallel_rank() != 0:
                 return False
         else:  # self is a non-MoE layer
@@ -761,7 +769,7 @@ class LoRA(torch.nn.Module):
         for key, param in self._lora_params(ref):
             if not self._should_export_parameter(param):
                 continue
-            if self.num_local_experts > 1:
+            if self.is_expert:
                 for expert in range(self.num_local_experts):
                     full_key = f"{self.adapter_model_prefix.format(expert=expert + self._expert_offset)}.{key}"
                     export_items.append((full_key, param, expert))
@@ -822,9 +830,7 @@ class LoRA(torch.nn.Module):
             return x.new_zeros((*x.shape[:-1], self.out_features))
         a_t, b_t, scale = active
         if tokens_per_expert is not None:
-            assert self.num_local_experts > 1, (
-                "tokens_per_expert is only supported if num_local_experts > 1"
-            )
+            assert self.is_expert, "tokens_per_expert requires expert LoRA"
             bsz = tokens_per_expert
             if isinstance(bsz, list):
                 bsz = torch.tensor(bsz, dtype=torch.int64, device="cpu")
@@ -887,6 +893,7 @@ class LoRAPublishPlanner:
                             shape=_exported_param_shape(module, param),
                             dtype_name=_dtype_name(param.dtype),
                             num_local_experts=module.num_local_experts,
+                            is_expert=module.is_expert,
                             shard_domain=shard_domain,
                             sharded=sharded,
                             shard_world_size=(
@@ -918,7 +925,7 @@ class LoRAPublishPlanner:
         adapter_dtypes: dict[str, torch.dtype],
     ) -> list[LoraShardMeta]:
         shard_ranks = range(template.shard_world_size) if template.sharded else (0,)
-        if template.num_local_experts <= 1:
+        if not template.is_expert:
             tp_ranks = (
                 _process_group_ranks(ps.get_tensor_model_parallel_group())
                 if _distributed_initialized()
@@ -1033,7 +1040,7 @@ class LoRAPublishPlanner:
 
 
 def _exported_param_shape(module: LoRA, param: torch.nn.Parameter) -> tuple[int, ...]:
-    if module.num_local_experts > 1:
+    if module.is_expert:
         return tuple(int(dim) for dim in param[0].T.shape)
     return tuple(int(dim) for dim in param.T.shape)
 
@@ -1152,7 +1159,7 @@ def _parallel_lora_pair(
     num_local_experts: int = 1,
     lora_cls: type[LoRA] = LoRA,
 ) -> tuple[LoRA, LoRA]:
-    expert_parallel = num_local_experts > 1
+    expert_parallel = "{expert}" in adapter_model_prefix
     return cast(
         tuple[LoRA, LoRA],
         tuple(

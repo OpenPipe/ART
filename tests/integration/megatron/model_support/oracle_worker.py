@@ -1139,7 +1139,7 @@ def _patch_lora_for_fp32(
         work_a = self.A_T.to(dtype=work_dtype)
         work_b = self.B_T.to(dtype=work_dtype)
 
-        if tokens_per_expert is None or self.num_local_experts == 1:
+        if tokens_per_expert is None or not self.is_expert:
             return (((work_x @ work_a) @ work_b) * self.scale).to(dtype=x.dtype)
 
         counts = (
