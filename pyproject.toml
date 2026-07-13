@@ -29,7 +29,7 @@ backend = [
     "accelerate==1.7.0",
     "awscli>=1.38.1",
     "setuptools>=78.1.0",
-    "wandb==0.25.0",
+    "wandb==0.28.0",
     "transformers==5.2.0",
     "duckdb>=1.0.0",
     "pyarrow>=15.0.0",
@@ -162,6 +162,7 @@ conflicts = [
     ],
 ]
 override-dependencies = [
+    "click==8.2.0",
     "flashinfer-python==0.6.8.post1",
     "megatron-core==0.17.0",
     "numpy<2",
