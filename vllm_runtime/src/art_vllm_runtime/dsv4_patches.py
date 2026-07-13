@@ -239,6 +239,7 @@ def patch_dsv4_lora_support() -> None:
     }
     model_cls.is_3d_moe_weight = False
     model_cls.is_non_gated_moe = False
+    model_cls.lora_manager = None
     model_cls.lora_skip_prefixes = ["mtp", "indexer"]
     model_cls._art_dsv4_lora_patched = True
     _patch_dsv4_lora_manager_indexer_skip(model_cls)
