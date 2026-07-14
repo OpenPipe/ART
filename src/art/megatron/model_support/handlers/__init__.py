@@ -16,6 +16,14 @@ _LAZY_EXPORTS = {
         "art.megatron.model_support.handlers.default_dense",
         "DefaultMoeHandler",
     ),
+    "LLAMA3_DENSE_HANDLER": (
+        "art.megatron.model_support.handlers.llama3",
+        "LLAMA3_DENSE_HANDLER",
+    ),
+    "Llama3DenseHandler": (
+        "art.megatron.model_support.handlers.llama3",
+        "Llama3DenseHandler",
+    ),
     "QWEN3_DENSE_HANDLER": (
         "art.megatron.model_support.handlers.qwen3_dense",
         "QWEN3_DENSE_HANDLER",

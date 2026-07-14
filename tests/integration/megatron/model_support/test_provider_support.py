@@ -136,7 +136,19 @@ def test_openpipe_qwen3_14b_instruct_uses_qwen3_dense_support() -> None:
     assert handler.key == "qwen3_dense"
 
 
+def test_meta_llama_32_1b_instruct_uses_llama3_dense_support() -> None:
+    model = "meta-llama/Llama-3.2-1B-Instruct"
+    spec = get_model_support_spec(model)
+    handler = get_model_support_handler(model)
+
+    assert spec.key == "llama3_dense"
+    assert spec.is_moe is False
+    assert spec.native_vllm_lora_status == "wip"
+    assert handler.key == "llama3_dense"
+
+
 def test_model_support_specs_own_moe_metadata() -> None:
+    assert model_uses_expert_parallel("meta-llama/Llama-3.2-1B-Instruct") is False
     assert model_uses_expert_parallel("OpenPipe/Qwen3-14B-Instruct") is False
     assert model_uses_expert_parallel("Qwen/Qwen3-30B-A3B-Instruct-2507") is True
     assert model_uses_expert_parallel("Qwen/Qwen3.5-35B-A3B") is True
