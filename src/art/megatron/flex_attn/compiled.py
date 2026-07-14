@@ -161,11 +161,16 @@ def select_sparse_execution_family(
 ) -> tuple[int, int, str]:
     del is_local_stage
     q_block, k_block = normalize_sparse_block_size(block_size)
+    # Avoid Flex's separate zero/one-block Dynamo specialization.
     target_q_len = (
-        0 if int(q_len) <= 0 else ((int(q_len) + q_block - 1) // q_block) * q_block
+        0
+        if int(q_len) <= 0
+        else max(2, (int(q_len) + q_block - 1) // q_block) * q_block
     )
     target_k_len = (
-        0 if int(k_len) <= 0 else ((int(k_len) + k_block - 1) // k_block) * k_block
+        0
+        if int(k_len) <= 0
+        else max(2, (int(k_len) + k_block - 1) // k_block) * k_block
     )
     return int(target_q_len), int(target_k_len), "sparse"
 
