@@ -244,7 +244,11 @@ def test_build_all_architectures_validation_report_stops_on_failure(
         stop_on_failure=True,
     )
 
-    assert calls == ["Qwen/Qwen3-30B-A3B", "Qwen/Qwen3-32B"]
+    assert calls == [
+        "meta-llama/Llama-3.2-1B-Instruct",
+        "Qwen/Qwen3-30B-A3B",
+        "Qwen/Qwen3-32B",
+    ]
     assert report.passed is False
     assert [item.base_model for item in report.reports] == calls
 
