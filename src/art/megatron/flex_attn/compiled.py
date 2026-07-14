@@ -4,8 +4,12 @@ import math
 from typing import Any, Literal, TypeAlias, cast
 
 import torch
+from torch._higher_order_ops.flex_attention import (
+    flex_attention as flex_attention_hop,
+)
 from torch.nn.attention.flex_attention import (
     AuxRequest,
+    BlockMask,
     FlexKernelOptions,
     flex_attention,
 )
@@ -105,26 +109,72 @@ def _forced_flex_attention_dense(
     )
 
 
-def _forced_flex_attention_sparse(
-    q,
-    k,
-    v,
+def _identity_score(score, _batch, _head, _query, _key):
+    return score
+
+
+def _sparse_flex_attention_with_options(kernel_options: FlexKernelOptions) -> Any:
+    resolved_options = dict(kernel_options)
+    resolved_options.setdefault("PRESCALE_QK", False)
+    resolved_options.setdefault("ROWS_GUARANTEED_SAFE", False)
+    resolved_options.setdefault("BLOCKS_ARE_CONTIGUOUS", False)
+    resolved_options.setdefault("WRITE_DQ", True)
+    resolved_options["OUTPUT_LOGSUMEXP"] = True
+    resolved_options["OUTPUT_MAX"] = False
+
+    def _flex_attention(q, k, v, *, block_mask, scale, enable_gqa):
+        del enable_gqa
+        for tensor in (q, k, v):
+            torch._dynamo.mark_static(tensor, -3)
+            torch._dynamo.mark_static(tensor, -1)
+        out, lse, _max_scores = flex_attention_hop(
+            q,
+            k,
+            v,
+            _identity_score,
+            (q.shape[-2], k.shape[-2], *block_mask.as_tuple()[2:]),
+            scale,
+            resolved_options,
+        )
+        return out, lse * _FLASH_LSE_RESCALE
+
+    return _flex_attention
+
+
+def prepare_sparse_flex_attention(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
     *,
-    block_mask,
-    scale,
-    enable_gqa,
-    return_aux: AuxRequest | None = None,
-):
-    return flex_attention(
-        q,
-        k,
-        v,
-        block_mask=block_mask,
-        scale=scale,
-        enable_gqa=enable_gqa,
-        kernel_options=_FORCED_FLEX_KERNEL_OPTIONS,
-        return_aux=return_aux,
-    )
+    block_mask: BlockMask,
+    enable_gqa: bool,
+) -> None:
+    """Validate ART's sparse boundary and keep stage lengths symbolic."""
+    if q.ndim != 4 or k.ndim != 4 or v.ndim != 4:
+        raise RuntimeError("Sparse flex attention requires rank-4 q, k, and v.")
+    if int(q.shape[0]) != int(k.shape[0]) or k.shape[:-1] != v.shape[:-1]:
+        raise RuntimeError("Sparse flex attention received incompatible q, k, and v.")
+    if int(q.shape[-1]) != int(k.shape[-1]):
+        raise RuntimeError("Sparse flex attention requires equal q/k head dimensions.")
+    q_heads, kv_heads = int(q.shape[1]), int(k.shape[1])
+    if (q_heads != kv_heads and not enable_gqa) or q_heads % kv_heads != 0:
+        raise RuntimeError(
+            f"Sparse flex attention received q_heads={q_heads}, kv_heads={kv_heads}, "
+            f"enable_gqa={enable_gqa}."
+        )
+    if tuple(block_mask.shape[-2:]) != (int(q.shape[2]), int(k.shape[2])):
+        raise RuntimeError("Sparse flex attention block-mask lengths do not match q/k.")
+    for tensor in (q, k, v):
+        torch._dynamo.mark_dynamic(tensor, 2)
+    for value in block_mask.as_tuple()[2:]:
+        if isinstance(value, torch.Tensor):
+            for dim in range(2, value.ndim):
+                torch._dynamo.mark_dynamic(value, dim)
+    for cell in getattr(block_mask.mask_mod, "__closure__", None) or ():
+        value = cell.cell_contents
+        if isinstance(value, torch.Tensor):
+            for dim in range(value.ndim):
+                torch._dynamo.mark_dynamic(value, dim)
 
 
 def _flex_attention_with_options(kernel_options: FlexKernelOptions) -> Any:
@@ -248,14 +298,14 @@ triton_num_stages_2_dense_compiled_flex_attention = torch.compile(
 )
 
 sparse_compiled_flex_attention = torch.compile(
-    _forced_flex_attention_sparse,
+    _sparse_flex_attention_with_options(_FORCED_FLEX_KERNEL_OPTIONS),
 )
 flash_sparse_compiled_flex_attention = torch.compile(
-    _flex_attention_with_options(_FLASH_FLEX_KERNEL_OPTIONS),
+    _sparse_flex_attention_with_options(_FLASH_FLEX_KERNEL_OPTIONS),
 )
 triton_sparse_compiled_flex_attention = torch.compile(
-    _flex_attention_with_options(_TRITON_FLEX_KERNEL_OPTIONS),
+    _sparse_flex_attention_with_options(_TRITON_FLEX_KERNEL_OPTIONS),
 )
 triton_num_stages_2_sparse_compiled_flex_attention = torch.compile(
-    _flex_attention_with_options(_TRITON_NUM_STAGES_2_FLEX_KERNEL_OPTIONS),
+    _sparse_flex_attention_with_options(_TRITON_NUM_STAGES_2_FLEX_KERNEL_OPTIONS),
 )

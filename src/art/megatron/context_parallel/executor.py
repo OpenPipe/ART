@@ -5,7 +5,7 @@ from typing import Any, cast
 import torch
 from torch._dynamo import config as dynamo_config
 import torch.distributed as dist
-from torch.nn.attention.flex_attention import AuxOutput, AuxRequest, BlockMask
+from torch.nn.attention.flex_attention import BlockMask
 import triton
 import triton.language as tl
 
@@ -16,6 +16,7 @@ from art.megatron.flex_attn.compiled import (
     get_sparse_compiled_flex_attention,
     normalize_flex_lse,
     normalize_sparse_block_size,
+    prepare_sparse_flex_attention,
     select_sparse_execution_family,
     sparse_compiled_flex_attention,
 )
@@ -689,21 +690,21 @@ class FlexAttentionKernel:
                 triton_num_stages_2_head_dims=self.triton_num_stages_2_head_dims,
             )
         )
-        out, aux = cast(
-            tuple[torch.Tensor, AuxOutput],
-            compiled_flex_attention(
-                q,
-                k,
-                v,
-                block_mask=block_mask,
-                scale=scale,
-                enable_gqa=enable_gqa,
-                return_aux=AuxRequest(lse=True),
-            ),
+        prepare_sparse_flex_attention(
+            q,
+            k,
+            v,
+            block_mask=block_mask,
+            enable_gqa=enable_gqa,
         )
-        lse = aux.lse
-        if lse is None:
-            raise RuntimeError("Compiled flex attention did not return lse.")
+        out, lse = compiled_flex_attention(
+            q,
+            k,
+            v,
+            block_mask=block_mask,
+            scale=scale,
+            enable_gqa=enable_gqa,
+        )
         lse = normalize_flex_lse(lse, backend=backend)
         return out, lse
 
