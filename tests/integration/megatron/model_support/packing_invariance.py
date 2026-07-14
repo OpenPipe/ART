@@ -49,19 +49,6 @@ _DEBUG_ENV = "ART_PACKING_INVARIANCE_DEBUG"
 PACKING_INVARIANCE_REPORT_FILENAME = "report.json"
 PACKING_INVARIANCE_ARTIFACT_SUITE_NAME = "Megatron packing-invariance artifacts"
 REPO_ROOT = Path(__file__).resolve().parents[4]
-_SINGLE_ROTARY_OUTPUT_HANDLER_KEYS = frozenset(
-    {
-        "default_dense",
-        "default_moe",
-        "qwen3_dense",
-        "qwen3_moe",
-        "qwen3_5_dense",
-        "qwen3_5_moe",
-        "dsv4",
-        "gpt_oss_moe",
-    }
-)
-_TUPLE_ROTARY_OUTPUT_HANDLER_KEYS = frozenset({"gemma4_dense", "gemma4_moe"})
 
 
 def _slugify(value: str) -> str:
@@ -283,21 +270,18 @@ def _rotary_grouping_check(
 
 def _rotary_outputs_for_validation(
     *,
-    handler_key: str,
     preprocess_output: Any,
 ) -> tuple[torch.Tensor | None, ...]:
     rotary_output = preprocess_output[1]
-    if handler_key in _SINGLE_ROTARY_OUTPUT_HANDLER_KEYS:
-        return (
-            cast(torch.Tensor | None, rotary_output)
-            if torch.is_tensor(rotary_output)
-            else None,
-        )
-    if handler_key in _TUPLE_ROTARY_OUTPUT_HANDLER_KEYS:
-        local_rotary, global_rotary = rotary_output
-        return local_rotary, global_rotary
+    if rotary_output is None or torch.is_tensor(rotary_output):
+        return (cast(torch.Tensor | None, rotary_output),)
+    if isinstance(rotary_output, tuple) and all(
+        item is None or torch.is_tensor(item) for item in rotary_output
+    ):
+        return cast(tuple[torch.Tensor | None, ...], rotary_output)
     raise RuntimeError(
-        f"Packed position validation has no rotary output mapping for {handler_key!r}"
+        "Packed position validation received unsupported rotary outputs: "
+        f"{type(rotary_output).__name__}"
     )
 
 
@@ -703,7 +687,6 @@ def _run_packing_invariance_worker(
                 row_respected = True
                 row_repeated_count = 0
                 rotary_outputs = _rotary_outputs_for_validation(
-                    handler_key=runtime.model_support_handler.key,
                     preprocess_output=hooked_output,
                 )
                 for rotary_output in rotary_outputs:
