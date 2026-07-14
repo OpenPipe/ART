@@ -5,9 +5,16 @@ from dataclasses import dataclass, field
 from datetime import datetime
 import json
 import logging
-from typing import Any
+from typing import Any, assert_never
 
-from .._protocols import build_exchange, endpoint_for_url
+from .. import (
+    ChatCompletionsExchange,
+    CompletionsExchange,
+    MessagesExchange,
+    ResponsesExchange,
+    Trajectory,
+)
+from .._protocols import Endpoint, Exchange, build_exchange, endpoint_for_url
 from .._scope import get_current_trajectory
 
 logger = logging.getLogger(__name__)
@@ -18,8 +25,8 @@ _adapter_active: contextvars.ContextVar[bool] = contextvars.ContextVar(
 
 @dataclass
 class CaptureState:
-    trajectory: Any
-    endpoint: str
+    trajectory: Trajectory
+    endpoint: Endpoint
     request: dict[str, Any]
     start_time: datetime = field(default_factory=datetime.now)
     status_code: int | None = None
@@ -37,7 +44,7 @@ class CaptureState:
         if self.status_code is None or not 200 <= self.status_code < 300:
             return
         try:
-            name, exchange = build_exchange(
+            _, exchange = build_exchange(
                 self.endpoint,
                 self.request,
                 bytes(self.body),
@@ -47,12 +54,27 @@ class CaptureState:
         except Exception as exc:
             logger.debug("Ignoring incomplete trajectory exchange: %s", exc)
             return
-        getattr(self.trajectory.exchanges, name).append(exchange)
+        _append_exchange(self.trajectory, exchange)
 
 
-def _json_body(value: Any) -> dict[str, Any] | None:
+def _append_exchange(trajectory: Trajectory, exchange: Exchange) -> None:
+    if isinstance(exchange, ChatCompletionsExchange):
+        trajectory.exchanges.chat_completions.append(exchange)
+    elif isinstance(exchange, CompletionsExchange):
+        trajectory.exchanges.completions.append(exchange)
+    elif isinstance(exchange, ResponsesExchange):
+        trajectory.exchanges.responses.append(exchange)
+    elif isinstance(exchange, MessagesExchange):
+        trajectory.exchanges.messages.append(exchange)
+    else:
+        assert_never(exchange)
+
+
+def _json_body(value: object) -> dict[str, Any] | None:
     if isinstance(value, dict):
-        return value
+        if not all(isinstance(key, str) for key in value):
+            return None
+        return {key: item for key, item in value.items() if isinstance(key, str)}
     if isinstance(value, str):
         value = value.encode()
     if not isinstance(value, bytes):
@@ -67,7 +89,7 @@ def _json_body(value: Any) -> dict[str, Any] | None:
 def begin(
     method: str,
     url: str,
-    body: Any,
+    body: object,
 ) -> tuple[CaptureState | None, contextvars.Token[bool] | None]:
     trajectory = get_current_trajectory(required=False)
     endpoint = endpoint_for_url(url)

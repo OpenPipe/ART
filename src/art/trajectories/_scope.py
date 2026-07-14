@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 from collections.abc import Coroutine, Iterable
 import contextvars
+from types import TracebackType
 from typing import Any
 
 from . import PydanticException, Trajectory, TrajectoryGroup
@@ -42,7 +43,12 @@ def enter_trajectory(trajectory: Trajectory) -> Trajectory:
     return trajectory
 
 
-def exit_trajectory(trajectory: Trajectory, *exc_info: Any) -> None:
+def exit_trajectory(
+    trajectory: Trajectory,
+    _exc_type: type[BaseException] | None,
+    _exc_value: BaseException | None,
+    _traceback: TracebackType | None,
+) -> None:
     current = _trajectories.get()
     if not current or current[-1] is not trajectory:
         raise RuntimeError("Trajectory contexts must exit in stack order")
@@ -58,21 +64,26 @@ def enter_trajectory_group(group: TrajectoryGroup) -> TrajectoryGroup:
     return group
 
 
-def exit_trajectory_group(group: TrajectoryGroup, *exc_info: Any) -> None:
+def exit_trajectory_group(
+    group: TrajectoryGroup,
+    _exc_type: type[BaseException] | None,
+    _exc_value: BaseException | None,
+    _traceback: TracebackType | None,
+) -> None:
     current = _groups.get()
     if not current or current[-1] is not group:
         raise RuntimeError("TrajectoryGroup contexts must exit in stack order")
     _groups.set(current[:-1])
 
 
-def _require_raw_coroutine(value: Any) -> None:
+def _require_raw_coroutine(value: object) -> None:
     if isinstance(value, (asyncio.Task, asyncio.Future)) or not isinstance(
         value, Coroutine
     ):
         raise TypeError("Expected a raw coroutine, not a Task, Future, or awaitable")
 
 
-async def capture_trajectory(coroutine: Coroutine[Any, Any, Any]) -> Trajectory:
+async def capture_trajectory(coroutine: Coroutine[Any, Any, object]) -> Trajectory:
     _require_raw_coroutine(coroutine)
     with Trajectory() as captured:
         await coroutine
@@ -87,9 +98,9 @@ async def capture_trajectory_group(
     coroutines = list(trajectories)
     for coroutine in coroutines:
         _require_raw_coroutine(coroutine)
-    results = await asyncio.gather(*coroutines, return_exceptions=return_exceptions)
     if not return_exceptions:
-        return TrajectoryGroup(results)  # type: ignore[arg-type]
+        return TrajectoryGroup(await asyncio.gather(*coroutines))
+    results = await asyncio.gather(*coroutines, return_exceptions=True)
     completed: list[Trajectory] = []
     exceptions: list[PydanticException] = []
     for result in results:

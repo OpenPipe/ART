@@ -1,10 +1,18 @@
 from __future__ import annotations
 
-from collections.abc import AsyncGenerator, Awaitable, Coroutine, Iterable, Iterator
+from collections.abc import (
+    AsyncGenerator,
+    Awaitable,
+    Coroutine,
+    Iterable,
+    Iterator,
+    Mapping,
+)
 from contextlib import asynccontextmanager
 from datetime import datetime
 import time
-from typing import Any, Literal, cast, overload
+from types import TracebackType
+from typing import Any, Literal, overload
 
 from anthropic.types import Message as AnthropicMessage
 from openai.types import Completion
@@ -14,23 +22,25 @@ import pydantic
 from typing_extensions import deprecated
 
 from ..types import Messages, MessagesAndChoices, Tools
+from ._serialization import _CompactModel
 
+# Deliberately open: Pydantic enforces serializability when callers dump in JSON mode.
 MetadataValue = Any
 
 
-class ChatCompletionsRequest(pydantic.RootModel[dict[str, Any]]):
+class ChatCompletionsRequest(pydantic.RootModel[dict[str, pydantic.JsonValue]]):
     """The JSON body sent to an OpenAI-compatible Chat Completions endpoint."""
 
 
-class CompletionsRequest(pydantic.RootModel[dict[str, Any]]):
+class CompletionsRequest(pydantic.RootModel[dict[str, pydantic.JsonValue]]):
     """The JSON body sent to an OpenAI-compatible Completions endpoint."""
 
 
-class ResponsesRequest(pydantic.RootModel[dict[str, Any]]):
+class ResponsesRequest(pydantic.RootModel[dict[str, pydantic.JsonValue]]):
     """The JSON body sent to an OpenAI-compatible Responses endpoint."""
 
 
-class MessagesRequest(pydantic.RootModel[dict[str, Any]]):
+class MessagesRequest(pydantic.RootModel[dict[str, pydantic.JsonValue]]):
     """The JSON body sent to an Anthropic-compatible Messages endpoint."""
 
 
@@ -94,7 +104,7 @@ class History(pydantic.BaseModel):
         return get_messages(self.messages_and_choices)
 
 
-class Trajectory(pydantic.BaseModel):
+class Trajectory(_CompactModel):
     exchanges: TrajectoryExchanges = pydantic.Field(default_factory=TrajectoryExchanges)
     messages_and_choices: MessagesAndChoices = pydantic.Field(
         default_factory=list,
@@ -107,7 +117,7 @@ class Trajectory(pydantic.BaseModel):
     initial_policy_version: int | None = None
     final_policy_version: int | None = None
     metrics: dict[str, float | int | bool] = pydantic.Field(default_factory=dict)
-    metadata: dict[str, Any] = pydantic.Field(default_factory=dict)
+    metadata: dict[str, MetadataValue] = pydantic.Field(default_factory=dict)
     logs: list[str] = pydantic.Field(default_factory=list)
     start_time: datetime = pydantic.Field(default_factory=datetime.now, exclude=True)
 
@@ -128,10 +138,15 @@ class Trajectory(pydantic.BaseModel):
 
         return enter_trajectory(self)
 
-    def __exit__(self, *exc_info: Any) -> None:
+    def __exit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc_value: BaseException | None,
+        traceback: TracebackType | None,
+    ) -> None:
         from ._scope import exit_trajectory
 
-        exit_trajectory(self, *exc_info)
+        exit_trajectory(self, exc_type, exc_value, traceback)
 
     def log(self, message: str) -> None:
         self.logs.append(message)
@@ -153,27 +168,19 @@ class Trajectory(pydantic.BaseModel):
     def __str__(self) -> str:
         return f"Trajectory(reward={self.reward}, metrics={self.metrics}, metadata={self.metadata})"
 
-    def model_dump(self, **kwargs: Any) -> dict[str, Any]:
-        kwargs.setdefault("exclude_defaults", True)
-        return super().model_dump(**kwargs)
-
-    def model_dump_json(self, **kwargs: Any) -> str:
-        kwargs.setdefault("exclude_defaults", True)
-        return super().model_dump_json(**kwargs)
-
     def messages(self) -> Messages:
         return get_messages(self.messages_and_choices)
 
-    def for_logging(self) -> dict[str, Any]:
+    def for_logging(self) -> dict[str, object]:
         from ._compat import trajectory_for_logging
 
         return trajectory_for_logging(self)
 
 
-class TrajectoryGroup(pydantic.BaseModel):
+class TrajectoryGroup(_CompactModel):
     trajectories: list[Trajectory] = pydantic.Field(default_factory=list)
     exceptions: list[PydanticException] = pydantic.Field(default_factory=list)
-    metadata: dict[str, Any] = pydantic.Field(default_factory=dict)
+    metadata: dict[str, MetadataValue] = pydantic.Field(default_factory=dict)
     metrics: dict[str, float | int | bool] = pydantic.Field(default_factory=dict)
     logs: list[str] = pydantic.Field(default_factory=list)
 
@@ -181,7 +188,11 @@ class TrajectoryGroup(pydantic.BaseModel):
     def __new__(
         cls,
         trajectories: Iterable[Trajectory | BaseException] = (),
-        **kwargs: Any,
+        *,
+        exceptions: Iterable[BaseException | PydanticException] = (),
+        metadata: dict[str, MetadataValue] | None = None,
+        metrics: dict[str, float | int | bool] | None = None,
+        logs: list[str] | None = None,
     ) -> TrajectoryGroup: ...
 
     @overload
@@ -189,13 +200,32 @@ class TrajectoryGroup(pydantic.BaseModel):
     def __new__(
         cls,
         trajectories: Iterable[Awaitable[Trajectory]],
-        **kwargs: Any,
+        *,
+        exceptions: Iterable[BaseException | PydanticException] = (),
+        metadata: dict[str, MetadataValue] | None = None,
+        metrics: dict[str, float | int | bool] | None = None,
+        logs: list[str] | None = None,
     ) -> Awaitable[TrajectoryGroup]: ...
 
-    def __new__(cls, trajectories: Iterable[Any] = (), **kwargs: Any) -> Any:
+    def __new__(
+        cls,
+        trajectories: Iterable[Trajectory | BaseException | Awaitable[Trajectory]] = (),
+        *,
+        exceptions: Iterable[BaseException | PydanticException] = (),
+        metadata: dict[str, MetadataValue] | None = None,
+        metrics: dict[str, float | int | bool] | None = None,
+        logs: list[str] | None = None,
+    ) -> TrajectoryGroup | Awaitable[TrajectoryGroup]:
         from ._compat import new_trajectory_group
 
-        return new_trajectory_group(cls, trajectories, kwargs)
+        return new_trajectory_group(
+            cls,
+            trajectories,
+            exceptions=exceptions,
+            metadata=metadata,
+            metrics=metrics,
+            logs=logs,
+        )
 
     def __init__(
         self,
@@ -204,15 +234,21 @@ class TrajectoryGroup(pydantic.BaseModel):
         ) = (),
         *,
         exceptions: Iterable[BaseException | PydanticException] = (),
-        metadata: dict[str, Any] | None = None,
+        metadata: dict[str, MetadataValue] | None = None,
         metrics: dict[str, float | int | bool] | None = None,
         logs: list[str] | None = None,
     ) -> None:
         from ._compat import init_trajectory_group
 
+        items = list(trajectories)
+        sync_items = [
+            item for item in items if isinstance(item, (Trajectory, BaseException))
+        ]
+        if len(sync_items) != len(items):
+            raise TypeError("TrajectoryGroup cannot initialize from awaitables")
         init_trajectory_group(
             self,
-            cast(Iterable[Trajectory | BaseException], trajectories),
+            sync_items,
             exceptions=exceptions,
             metadata=metadata,
             metrics=metrics,
@@ -224,17 +260,22 @@ class TrajectoryGroup(pydantic.BaseModel):
 
         return enter_trajectory_group(self)
 
-    def __exit__(self, *exc_info: Any) -> None:
+    def __exit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc_value: BaseException | None,
+        traceback: TracebackType | None,
+    ) -> None:
         from ._scope import exit_trajectory_group
 
-        exit_trajectory_group(self, *exc_info)
+        exit_trajectory_group(self, exc_type, exc_value, traceback)
 
     def __copy__(self) -> TrajectoryGroup:
         from ._compat import copy_trajectory_group
 
         return copy_trajectory_group(self)
 
-    def __deepcopy__(self, memo: dict[int, Any] | None = None) -> TrajectoryGroup:
+    def __deepcopy__(self, memo: dict[int, object] | None = None) -> TrajectoryGroup:
         from ._compat import deepcopy_trajectory_group
 
         return deepcopy_trajectory_group(self, memo)
@@ -242,19 +283,12 @@ class TrajectoryGroup(pydantic.BaseModel):
     def log(self, message: str) -> None:
         self.logs.append(message)
 
+    # Legacy groups iterate over trajectories rather than Pydantic field pairs.
     def __iter__(self) -> Iterator[Trajectory]:  # type: ignore[override]
         return iter(self.trajectories)
 
     def __len__(self) -> int:
         return len(self.trajectories)
-
-    def model_dump(self, **kwargs: Any) -> dict[str, Any]:
-        kwargs.setdefault("exclude_defaults", True)
-        return super().model_dump(**kwargs)
-
-    def model_dump_json(self, **kwargs: Any) -> str:
-        kwargs.setdefault("exclude_defaults", True)
-        return super().model_dump_json(**kwargs)
 
 
 class TokenizedTrajectory(pydantic.BaseModel):
@@ -299,7 +333,7 @@ def current_trajectory_group(*, required: bool = False) -> TrajectoryGroup | Non
     return get_current_trajectory_group(required=required)
 
 
-async def trajectory(coroutine: Coroutine[Any, Any, Any]) -> Trajectory:
+async def trajectory(coroutine: Coroutine[Any, Any, object]) -> Trajectory:
     from ._scope import capture_trajectory
 
     return await capture_trajectory(coroutine)
@@ -324,7 +358,7 @@ def tokenize_trajectory(
     *,
     model: str | None = None,
     chat_template: str | None = None,
-    chat_template_kwargs: dict[str, Any] | None = None,
+    chat_template_kwargs: Mapping[str, object] | None = None,
 ) -> TokenizedTrajectory:
     from ._tokenize import tokenize_one
 
@@ -340,18 +374,39 @@ def tokenize_trajectory(
 def tokenize_trajectories(
     trajectories: Iterable[Trajectory],
     base_model: str | None = None,
-    **kwargs: Any,
+    *,
+    model: str | None = None,
+    chat_template: str | None = None,
+    chat_template_kwargs: Mapping[str, object] | None = None,
 ) -> list[TokenizedTrajectory]:
-    return [tokenize_trajectory(item, base_model, **kwargs) for item in trajectories]
+    return [
+        tokenize_trajectory(
+            item,
+            base_model,
+            model=model,
+            chat_template=chat_template,
+            chat_template_kwargs=chat_template_kwargs,
+        )
+        for item in trajectories
+    ]
 
 
 def tokenize_trajectory_group(
     group: TrajectoryGroup,
     base_model: str | None = None,
-    **kwargs: Any,
+    *,
+    model: str | None = None,
+    chat_template: str | None = None,
+    chat_template_kwargs: Mapping[str, object] | None = None,
 ) -> TokenizedTrajectoryGroup:
     return TokenizedTrajectoryGroup(
-        trajectories=tokenize_trajectories(group, base_model, **kwargs),
+        trajectories=tokenize_trajectories(
+            group,
+            base_model,
+            model=model,
+            chat_template=chat_template,
+            chat_template_kwargs=chat_template_kwargs,
+        ),
         underlying=group,
     )
 
@@ -359,9 +414,31 @@ def tokenize_trajectory_group(
 def tokenize_trajectory_groups(
     groups: Iterable[TrajectoryGroup],
     base_model: str | None = None,
-    **kwargs: Any,
+    *,
+    model: str | None = None,
+    chat_template: str | None = None,
+    chat_template_kwargs: Mapping[str, object] | None = None,
 ) -> list[TokenizedTrajectoryGroup]:
-    return [tokenize_trajectory_group(group, base_model, **kwargs) for group in groups]
+    return [
+        tokenize_trajectory_group(
+            group,
+            base_model,
+            model=model,
+            chat_template=chat_template,
+            chat_template_kwargs=chat_template_kwargs,
+        )
+        for group in groups
+    ]
+
+
+@overload
+@deprecated("Use current_trajectory() instead.")
+def auto_trajectory(*, required: Literal[True]) -> Trajectory: ...
+
+
+@overload
+@deprecated("Use current_trajectory() instead.")
+def auto_trajectory(*, required: Literal[False] = False) -> Trajectory | None: ...
 
 
 @deprecated("Use current_trajectory() instead.")
@@ -371,7 +448,7 @@ def auto_trajectory(*, required: bool = False) -> Trajectory | None:
 
 @deprecated("Use trajectory() instead.")
 async def capture_auto_trajectory(
-    coroutine: Coroutine[Any, Any, Any],
+    coroutine: Coroutine[Any, Any, object],
 ) -> Trajectory:
     return await trajectory(coroutine)
 

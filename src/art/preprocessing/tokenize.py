@@ -526,15 +526,15 @@ def tokenize_trajectory_groups(
             if advantage == 0 and drop_zero_advantage_trajectories:
                 continue
             if trajectory.exchanges:
-                from ..trajectories._tokenize import tokenize_one
+                from ..trajectories._tokenize import _as_tokenizer, tokenize_one
 
                 exchange_result = tokenize_one(
                     trajectory,
-                    getattr(tokenizer, "name_or_path", None),
+                    tokenizer.name_or_path,
                     model=None,
                     chat_template=None,
                     chat_template_kwargs=chat_template_kwargs,
-                    tokenizer_instance=tokenizer,
+                    tokenizer_instance=_as_tokenizer(tokenizer),
                 )
                 choice_offsets = [
                     index

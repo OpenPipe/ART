@@ -1,26 +1,24 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Iterable
+from collections.abc import Awaitable, Coroutine, Generator, Iterable
 import copy
 import traceback
-from typing import Any, cast
+from typing import Any
 import warnings
 
 from openai.types.chat.chat_completion import Choice
 import pydantic
 
 from ..types import Message, Messages, MessagesAndChoices
-from . import PydanticException, Trajectory, TrajectoryGroup
+from . import MetadataValue, PydanticException, Trajectory, TrajectoryGroup
 
 
 def exception_model(
-    exception: BaseException | PydanticException | dict[str, Any],
+    exception: BaseException | PydanticException,
 ) -> PydanticException:
     if isinstance(exception, PydanticException):
         return exception
-    if isinstance(exception, dict):
-        return PydanticException.model_validate(exception)
     return PydanticException(
         type=str(type(exception)),
         message=str(exception),
@@ -33,13 +31,18 @@ def exception_model(
 
 
 async def _legacy_async_group(
-    items: list[Any], kwargs: dict[str, Any]
+    items: list[Awaitable[Trajectory]],
+    *,
+    exceptions: Iterable[BaseException | PydanticException],
+    metadata: dict[str, MetadataValue] | None,
+    metrics: dict[str, float | int | bool] | None,
+    logs: list[str] | None,
 ) -> TrajectoryGroup:
     from ..gather import get_gather_context, record_metrics
 
     context = get_gather_context()
     trajectories: list[Trajectory] = []
-    exceptions = list(kwargs.pop("exceptions", ()))
+    captured_exceptions = list(exceptions)
     for future in asyncio.as_completed(items):
         try:
             item = await future
@@ -47,38 +50,73 @@ async def _legacy_async_group(
             record_metrics(context, item)
             context.update_pbar(n=1)
         except BaseException as exc:
-            exceptions.append(exc)
+            captured_exceptions.append(exc)
             context.metric_sums["exceptions"] += 1
             context.update_pbar(n=0)
             if context.too_many_exceptions():
                 raise
-    return TrajectoryGroup(trajectories, exceptions=exceptions, **kwargs)
+    return TrajectoryGroup(
+        trajectories,
+        exceptions=captured_exceptions,
+        metadata=metadata,
+        metrics=metrics,
+        logs=logs,
+    )
 
 
-class _LegacyGroupCoroutine:
-    def __init__(self, coroutine: Any, size: int) -> None:
+class _LegacyGroupCoroutine(Awaitable[TrajectoryGroup]):
+    def __init__(
+        self, coroutine: Coroutine[Any, Any, TrajectoryGroup], size: int
+    ) -> None:
         self.coroutine = coroutine
         self._num_trajectories = size
 
-    def __await__(self) -> Any:
+    def __await__(self) -> Generator[Any, None, TrajectoryGroup]:
         return self.coroutine.__await__()
 
 
 def new_trajectory_group(
-    cls: type[TrajectoryGroup], trajectories: Iterable[Any], kwargs: dict[str, Any]
-) -> Any:
+    cls: type[TrajectoryGroup],
+    trajectories: Iterable[Trajectory | BaseException | Awaitable[Trajectory]],
+    *,
+    exceptions: Iterable[BaseException | PydanticException],
+    metadata: dict[str, MetadataValue] | None,
+    metrics: dict[str, float | int | bool] | None,
+    logs: list[str] | None,
+) -> TrajectoryGroup | Awaitable[TrajectoryGroup]:
     items = list(trajectories)
-    if any(hasattr(item, "__await__") for item in items):
+    awaitables = [item for item in items if isinstance(item, Awaitable)]
+    if awaitables:
+        if len(awaitables) != len(items):
+            raise TypeError("TrajectoryGroup cannot mix trajectories and awaitables")
         warnings.warn(
             "Awaiting TrajectoryGroup(...) is deprecated; use art.trajectory_group(...).",
             DeprecationWarning,
             stacklevel=2,
         )
         return _LegacyGroupCoroutine(
-            _legacy_async_group(items, dict(kwargs)), len(items)
+            _legacy_async_group(
+                awaitables,
+                exceptions=exceptions,
+                metadata=metadata,
+                metrics=metrics,
+                logs=logs,
+            ),
+            len(items),
         )
+    sync_items = [
+        item for item in items if isinstance(item, (Trajectory, BaseException))
+    ]
+    if len(sync_items) != len(items):
+        raise TypeError("TrajectoryGroup items must be trajectories or exceptions")
     group = object.__new__(cls)
-    group.__init__(items, **kwargs)
+    group.__init__(
+        sync_items,
+        exceptions=exceptions,
+        metadata=metadata,
+        metrics=metrics,
+        logs=logs,
+    )
     return group
 
 
@@ -87,7 +125,7 @@ def init_trajectory_group(
     trajectories: Iterable[Trajectory | BaseException],
     *,
     exceptions: Iterable[BaseException | PydanticException],
-    metadata: dict[str, Any] | None,
+    metadata: dict[str, MetadataValue] | None,
     metrics: dict[str, float | int | bool] | None,
     logs: list[str] | None,
 ) -> None:
@@ -126,11 +164,13 @@ def copy_trajectory_group(group: TrajectoryGroup) -> TrajectoryGroup:
 
 
 def deepcopy_trajectory_group(
-    group: TrajectoryGroup, memo: dict[int, Any] | None
+    group: TrajectoryGroup, memo: dict[int, object] | None
 ) -> TrajectoryGroup:
     memo = {} if memo is None else memo
-    if id(group) in memo:
-        return memo[id(group)]
+    if existing := memo.get(id(group)):
+        if not isinstance(existing, TrajectoryGroup):
+            raise TypeError("TrajectoryGroup deepcopy memo contains an invalid value")
+        return existing
     copied = TrajectoryGroup(
         copy.deepcopy(group.trajectories, memo),
         metadata=copy.deepcopy(group.metadata, memo),
@@ -148,8 +188,9 @@ def messages_from_legacy_history(messages_and_choices: MessagesAndChoices) -> Me
         if isinstance(item, Choice):
             content = item.message.content or ""
             tool_calls = item.message.tool_calls or []
-            message: Message = cast(
-                Message,
+            # Response messages and request messages are parallel OpenAI models,
+            # but their generated Python types are unrelated. Validate at the seam.
+            message = pydantic.TypeAdapter(Message).validate_python(
                 {
                     "role": "assistant",
                     "content": content,
@@ -163,18 +204,18 @@ def messages_from_legacy_history(messages_and_choices: MessagesAndChoices) -> Me
                         if tool_calls
                         else {}
                     ),
-                },
+                }
             )
             messages.append(message)
         else:
-            message = dict(item)
+            message = copy.copy(item)
             if message.get("content") is None:
                 message["content"] = ""
-            messages.append(message)  # type: ignore[arg-type]
+            messages.append(message)
     return messages
 
 
-def trajectory_for_logging(trajectory: Trajectory) -> dict[str, Any]:
+def trajectory_for_logging(trajectory: Trajectory) -> dict[str, object]:
     if trajectory.exchanges:
         return trajectory.model_dump(mode="json", exclude={"start_time"})
     messages = []
@@ -183,7 +224,7 @@ def trajectory_for_logging(trajectory: Trajectory) -> dict[str, Any]:
             message = item.message.to_dict()
             trainable = True
         else:
-            message = cast(dict[str, Any], item)
+            message = dict(item)
             trainable = False
         messages.append({**message, "trainable": trainable})
     return {

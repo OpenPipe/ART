@@ -120,14 +120,18 @@ def test_branching_and_multiple_models_require_explicit_resolution() -> None:
 
 class _FakeTokenizer:
     def __init__(self) -> None:
-        self.calls: list[dict[str, Any]] = []
+        self.calls: list[dict[str, object]] = []
 
-    def apply_chat_template(self, messages: list[dict[str, Any]], **kwargs: Any):
+    def apply_chat_template(
+        self, messages: list[dict[str, Any]], **kwargs: object
+    ) -> list[int]:
         self.calls.append(kwargs)
         return [10, 11] if messages[-1]["role"] == "assistant" else [10]
 
 
-def test_fallback_uses_template_overrides_and_nan_logprobs(monkeypatch) -> None:
+def test_fallback_uses_template_overrides_and_nan_logprobs(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     response = Message.model_validate(
         {
             "id": "msg_1",
@@ -195,11 +199,13 @@ def test_fallback_uses_template_overrides_and_nan_logprobs(monkeypatch) -> None:
     ]
 
 
-def test_checkpoint_fallback_uses_latest_artifact_renderer(monkeypatch) -> None:
+def test_checkpoint_fallback_uses_latest_artifact_renderer(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     artifact_names: list[str] = []
 
     class Api:
-        def artifact(self, name: str):
+        def artifact(self, name: str) -> SimpleNamespace:
             artifact_names.append(name)
             return SimpleNamespace(
                 metadata={
@@ -283,7 +289,9 @@ def test_anthropic_fallback_preserves_thinking_and_tool_history() -> None:
     ]
 
 
-def test_choice_logprobs_survive_tokenizer_fallback(monkeypatch) -> None:
+def test_choice_logprobs_survive_tokenizer_fallback(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     exchange = _chat_exchange([], [])
     logprobs = exchange.response.choices[0].logprobs
     assert logprobs is not None
@@ -301,13 +309,15 @@ def test_choice_logprobs_survive_tokenizer_fallback(monkeypatch) -> None:
     )
 
     class Tokenizer:
-        def apply_chat_template(self, messages, **kwargs):
+        def apply_chat_template(
+            self, messages: list[dict[str, Any]], **kwargs: object
+        ) -> list[int]:
             del kwargs
             return [10, 11, 12] if messages[-1]["role"] == "assistant" else [10]
 
-        def __call__(self, text, **kwargs):
+        def __call__(self, text: str, **kwargs: object) -> SimpleNamespace:
             del text, kwargs
-            return type("Encoding", (), {"input_ids": [11]})()
+            return SimpleNamespace(input_ids=[11])
 
     monkeypatch.setattr(
         "art.trajectories._tokenize._load_tokenizer", lambda _config: Tokenizer()
@@ -378,9 +388,13 @@ def _response_exchange(
     )
 
 
-def test_responses_previous_response_id_resolves_local_history(monkeypatch) -> None:
+def test_responses_previous_response_id_resolves_local_history(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     class Tokenizer:
-        def apply_chat_template(self, messages, **kwargs):
+        def apply_chat_template(
+            self, messages: list[dict[str, Any]], **kwargs: object
+        ) -> list[int]:
             del kwargs
             return [10] if len(messages) == 1 else [10, 20, 11]
 
@@ -433,6 +447,7 @@ def test_exchange_trajectories_feed_existing_training_tokenizer() -> None:
 
     results = list(
         tokenize_trajectory_groups(
+            # This path only calls decode; the minimal test double is intentional.
             Tokenizer(),  # type: ignore[arg-type]
             [group],
             allow_training_without_logprobs=True,

@@ -1,13 +1,21 @@
 from __future__ import annotations
 
 from collections.abc import AsyncIterator, Iterator
-from typing import Any
 
 import httpx
+from httpx._client import UseClientDefault
+from httpx._types import AuthTypes
+from typing_extensions import TypedDict, Unpack
 
 from .core import CaptureState, begin, reset
 
 _STATE = "_art_trajectory_capture"
+
+
+class _SendOptions(TypedDict, total=False):
+    stream: bool
+    auth: AuthTypes | UseClientDefault | None
+    follow_redirects: bool | UseClientDefault
 
 
 def install() -> None:
@@ -21,7 +29,9 @@ def install() -> None:
     original_aclose = httpx.Response.aclose
 
     def send(
-        self: httpx.Client, request: httpx.Request, **kwargs: Any
+        self: httpx.Client,
+        request: httpx.Request,
+        **kwargs: Unpack[_SendOptions],
     ) -> httpx.Response:
         try:
             body = request.content
@@ -41,7 +51,9 @@ def install() -> None:
         return response
 
     async def async_send(
-        self: httpx.AsyncClient, request: httpx.Request, **kwargs: Any
+        self: httpx.AsyncClient,
+        request: httpx.Request,
+        **kwargs: Unpack[_SendOptions],
     ) -> httpx.Response:
         try:
             body = request.content
@@ -96,11 +108,11 @@ def install() -> None:
         if state := getattr(self, _STATE, None):
             state.finish()
 
-    send._art_capture = True  # type: ignore[attr-defined]
-    async_send._art_capture = True  # type: ignore[attr-defined]
-    httpx.Client.send = send  # type: ignore[method-assign]
-    httpx.AsyncClient.send = async_send  # type: ignore[method-assign]
-    httpx.Response.iter_bytes = iter_bytes  # type: ignore[method-assign]
-    httpx.Response.aiter_bytes = aiter_bytes  # type: ignore[method-assign]
-    httpx.Response.close = close  # type: ignore[method-assign]
-    httpx.Response.aclose = aclose  # type: ignore[method-assign]
+    setattr(send, "_art_capture", True)
+    setattr(async_send, "_art_capture", True)
+    setattr(httpx.Client, "send", send)
+    setattr(httpx.AsyncClient, "send", async_send)
+    setattr(httpx.Response, "iter_bytes", iter_bytes)
+    setattr(httpx.Response, "aiter_bytes", aiter_bytes)
+    setattr(httpx.Response, "close", close)
+    setattr(httpx.Response, "aclose", aclose)

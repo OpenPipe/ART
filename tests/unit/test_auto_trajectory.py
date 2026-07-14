@@ -290,7 +290,9 @@ async def test_auto_trajectory(test_server: None) -> None:
     assert len(exchanges) == 5
     assert exchanges[0].request.root["messages"] == [message]
     assert exchanges[0].request.root["tools"] == tools
-    assert exchanges[0].response.choices[0] == Choice(**mock_response["choices"][0])  # ty:ignore[invalid-argument-type, not-subscriptable]
+    choices = mock_response["choices"]
+    assert isinstance(choices, list)
+    assert exchanges[0].response.choices[0] == Choice.model_validate(choices[0])
     assert exchanges[-1].response.choices[0] == mock_stream_choice
     assert all(exchange.model == "test" for exchange in exchanges)
 

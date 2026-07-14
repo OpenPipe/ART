@@ -1,22 +1,29 @@
 from __future__ import annotations
 
 from collections.abc import AsyncIterator
-from typing import Any
+from typing import Any, cast, overload
 
 import aiohttp
+from yarl import URL
 
 from .core import CaptureState, begin, reset
 
 
 class _CapturedStream:
-    def __init__(self, stream: Any, state: CaptureState) -> None:
+    def __init__(self, stream: aiohttp.StreamReader, state: CaptureState) -> None:
         self._stream = stream
         self._state = state
 
     def __getattr__(self, name: str) -> Any:
         return getattr(self._stream, name)
 
-    def _record(self, value: Any) -> Any:
+    @overload
+    def _record(self, value: bytes) -> bytes: ...
+
+    @overload
+    def _record(self, value: tuple[bytes, bool]) -> tuple[bytes, bool]: ...
+
+    def _record(self, value: bytes | tuple[bytes, bool]) -> bytes | tuple[bytes, bool]:
         chunk = value[0] if isinstance(value, tuple) else value
         if isinstance(chunk, bytes):
             self._state.add(chunk)
@@ -24,8 +31,8 @@ class _CapturedStream:
             self._state.finish()
         return value
 
-    async def read(self, *args: Any, **kwargs: Any) -> bytes:
-        return self._record(await self._stream.read(*args, **kwargs))
+    async def read(self, n: int = -1) -> bytes:
+        return self._record(await self._stream.read(n))
 
     async def readany(self) -> bytes:
         return self._record(await self._stream.readany())
@@ -36,7 +43,7 @@ class _CapturedStream:
     async def readchunk(self) -> tuple[bytes, bool]:
         return self._record(await self._stream.readchunk())
 
-    async def _iterate(self, iterator: Any) -> AsyncIterator[bytes]:
+    async def _iterate(self, iterator: AsyncIterator[bytes]) -> AsyncIterator[bytes]:
         try:
             async for chunk in iterator:
                 yield self._record(chunk)
@@ -61,10 +68,11 @@ def install() -> None:
     async def request(
         self: aiohttp.ClientSession,
         method: str,
-        str_or_url: Any,
+        str_or_url: str | URL,
+        # This private aiohttp surface is version-dependent; preserve its options.
         **kwargs: Any,
     ) -> aiohttp.ClientResponse:
-        body: Any = kwargs.get("json")
+        body: object = kwargs.get("json")
         if body is None:
             body = kwargs.get("data")
         state, token = begin(method, str(str_or_url), body)
@@ -74,8 +82,12 @@ def install() -> None:
             reset(token)
         if state is not None:
             state.status_code = response.status
-            response.content = _CapturedStream(response.content, state)  # type: ignore[assignment]
+            # The proxy preserves StreamReader's runtime surface while intercepting
+            # reads; aiohttp exposes no protocol type for response.content.
+            response.content = cast(
+                aiohttp.StreamReader, _CapturedStream(response.content, state)
+            )
         return response
 
-    request._art_capture = True  # type: ignore[attr-defined]
-    aiohttp.ClientSession._request = request  # type: ignore[method-assign]
+    setattr(request, "_art_capture", True)
+    setattr(aiohttp.ClientSession, "_request", request)

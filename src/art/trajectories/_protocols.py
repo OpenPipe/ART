@@ -3,12 +3,12 @@ from __future__ import annotations
 from collections.abc import Mapping
 from datetime import datetime
 import json
-from typing import Any, cast
+from typing import Any, Literal
 from urllib.parse import urlsplit
 
 from anthropic._types import NOT_GIVEN
 from anthropic.lib.streaming._messages import accumulate_event
-from anthropic.types import Message, RawMessageStreamEvent
+from anthropic.types import Message, ParsedMessage, RawMessageStreamEvent
 from openai.types import Completion
 from openai.types.chat import ChatCompletion
 from openai.types.chat.chat_completion_chunk import ChatCompletionChunk
@@ -27,7 +27,12 @@ from . import (
     ResponsesRequest,
 )
 
-Endpoint = str
+Endpoint = Literal["chat_completions", "completions", "responses", "messages"]
+Exchange = (
+    ChatCompletionsExchange | CompletionsExchange | ResponsesExchange | MessagesExchange
+)
+ResponseModel = ChatCompletion | Completion | Response | Message
+SSEPayload = dict[str, Any] | Literal["[DONE]"]
 _ENDPOINTS = {
     "/v1/chat/completions": "chat_completions",
     "/v1/completions": "completions",
@@ -43,9 +48,9 @@ def endpoint_for_url(url: str) -> Endpoint | None:
     )
 
 
-def _sse_events(body: bytes) -> list[tuple[str | None, dict[str, Any] | str]]:
+def _sse_events(body: bytes) -> list[tuple[str | None, SSEPayload]]:
     text = body.decode("utf-8").replace("\r\n", "\n")
-    events: list[tuple[str | None, dict[str, Any] | str]] = []
+    events: list[tuple[str | None, SSEPayload]] = []
     for block in text.split("\n\n"):
         event_name: str | None = None
         data_lines: list[str] = []
@@ -58,7 +63,7 @@ def _sse_events(body: bytes) -> list[tuple[str | None, dict[str, Any] | str]]:
             continue
         raw = "\n".join(data_lines)
         if raw == "[DONE]":
-            events.append((event_name, raw))
+            events.append((event_name, "[DONE]"))
         else:
             value = json.loads(raw)
             if isinstance(value, dict):
@@ -164,7 +169,7 @@ def _messages_response(body: bytes, *, stream: bool) -> Message:
     if not stream:
         return Message.model_validate_json(body)
     adapter = TypeAdapter(RawMessageStreamEvent)
-    snapshot: Any = None
+    snapshot: ParsedMessage[object] | None = None
     complete = False
     token_ids: list[int] = []
     logprobs: list[float] = []
@@ -201,12 +206,11 @@ def _messages_response(body: bytes, *, stream: bool) -> Message:
     return Message.model_validate(data)
 
 
-def _model(request: Mapping[str, Any], response: Any) -> str | None:
+def _model(request: Mapping[str, object], response: ResponseModel) -> str | None:
     requested = request.get("model")
     if isinstance(requested, str):
         return requested
-    returned = getattr(response, "model", None)
-    return returned if isinstance(returned, str) else None
+    return response.model if isinstance(response.model, str) else None
 
 
 def build_exchange(
@@ -216,7 +220,7 @@ def build_exchange(
     *,
     start_time: datetime,
     end_time: datetime,
-) -> tuple[str, Any]:
+) -> tuple[Endpoint, Exchange]:
     stream = request.get("stream") is True
     if endpoint == "chat_completions":
         response = _chat_response(body, stream=stream)

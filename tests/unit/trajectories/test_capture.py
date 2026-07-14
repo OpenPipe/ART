@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from collections.abc import AsyncIterator
 from datetime import datetime, timedelta
 import json
 from typing import Any
@@ -8,6 +9,7 @@ from typing import Any
 import aiohttp
 from aiohttp import web
 from anthropic import AsyncAnthropic
+from anthropic.types import TextBlock
 import httpx
 from openai import AsyncOpenAI
 import pytest
@@ -15,7 +17,8 @@ import pytest_asyncio
 import requests
 
 import art
-from art.trajectories._protocols import build_exchange
+from art.trajectories import ChatCompletionsExchange, MessagesExchange
+from art.trajectories._protocols import Endpoint, build_exchange
 
 CHAT: dict[str, Any] = {
     "id": "chatcmpl-1",
@@ -107,7 +110,7 @@ MESSAGE: dict[str, Any] = {
 
 
 @pytest_asyncio.fixture
-async def endpoint_server(unused_tcp_port: int):
+async def endpoint_server(unused_tcp_port: int) -> AsyncIterator[str]:
     async def handler(request: web.Request) -> web.Response:
         request_body = await request.json()
         if request_body.get("fail"):
@@ -171,6 +174,7 @@ async def test_group_context_and_async_helpers() -> None:
     assert isinstance(captured, art.Trajectory)
     task = asyncio.create_task(rollout())
     with pytest.raises(TypeError, match="raw coroutine"):
+        # Passing a Task is deliberately a static type error and a runtime error.
         await art.trajectory(task)  # type: ignore[arg-type]
     await task
 
@@ -262,7 +266,7 @@ async def test_failed_and_incomplete_calls_are_excluded(endpoint_server: str) ->
 
 def test_all_protocols_reconstruct_typed_responses() -> None:
     now = datetime.now()
-    values = [
+    values: list[tuple[Endpoint, dict[str, Any], dict[str, Any]]] = [
         ("chat_completions", {"model": "request-model", "messages": []}, CHAT),
         ("completions", {"model": "request-model", "prompt": "hi"}, COMPLETION),
         ("responses", {"input": "hi"}, RESPONSE),
@@ -361,7 +365,7 @@ def test_all_streaming_protocols_reconstruct_final_responses() -> None:
         ),
         ("message_stop", {"type": "message_stop"}),
     ]
-    values = [
+    values: list[tuple[Endpoint, dict[str, Any], bytes]] = [
         (
             "chat_completions",
             {"model": "test/model", "messages": [], "stream": True},
@@ -392,8 +396,10 @@ def test_all_streaming_protocols_reconstruct_final_responses() -> None:
             end_time=now + timedelta(seconds=1),
         )
         assert exchange.model == "test/model"
-        if endpoint == "messages":
-            assert exchange.response.content[0].text == "hello"
+        if isinstance(exchange, MessagesExchange):
+            content = exchange.response.content[0]
+            assert isinstance(content, TextBlock)
+            assert content.text == "hello"
 
 
 def test_trajectory_rejects_mixed_representations() -> None:
@@ -404,6 +410,7 @@ def test_trajectory_rejects_mixed_representations() -> None:
         start_time=datetime.now(),
         end_time=datetime.now(),
     )
+    assert isinstance(exchange, ChatCompletionsExchange)
     with pytest.raises(ValueError, match="both exchanges and legacy histories"):
         art.Trajectory(
             exchanges=art.TrajectoryExchanges(chat_completions=[exchange]),
@@ -413,6 +420,13 @@ def test_trajectory_rejects_mixed_representations() -> None:
 
 def test_metadata_accepts_json_serializable_values() -> None:
     assert art.Trajectory().model_dump() == {}
+    assert art.Trajectory().model_dump(
+        mode="json", include={"reward"}, exclude_defaults=False
+    ) == {"reward": 0.0}
+    assert (
+        art.Trajectory().model_dump_json(include={"reward"}, exclude_defaults=False)
+        == '{"reward":0.0}'
+    )
     trajectory = art.Trajectory(metadata={"nested": {"items": [1, "two"]}})
     assert trajectory.model_dump(mode="json")["metadata"] == {
         "nested": {"items": [1, "two"]}

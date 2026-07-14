@@ -33,11 +33,15 @@ def install() -> None:
         return response
 
     def iter_content(
-        self: requests.Response, *args: Any, **kwargs: Any
-    ) -> Iterator[Any]:
+        self: requests.Response,
+        chunk_size: int | None = 1,
+        decode_unicode: bool = False,
+    ) -> Iterator[str | bytes]:
         state: CaptureState | None = getattr(self, _STATE, None)
         try:
-            for chunk in original_iter(self, *args, **kwargs):
+            for chunk in original_iter(
+                self, chunk_size=chunk_size, decode_unicode=decode_unicode
+            ):
                 if state is not None:
                     if isinstance(chunk, str):
                         chunk = chunk.encode(self.encoding or "utf-8")
@@ -48,6 +52,6 @@ def install() -> None:
             if state is not None:
                 state.finish()
 
-    send._art_capture = True  # type: ignore[attr-defined]
-    requests.Session.send = send  # type: ignore[method-assign]
-    requests.Response.iter_content = iter_content  # type: ignore[method-assign]
+    setattr(send, "_art_capture", True)
+    setattr(requests.Session, "send", send)
+    setattr(requests.Response, "iter_content", iter_content)

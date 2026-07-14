@@ -1,11 +1,18 @@
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass
 import math
 import re
-from typing import Any, cast
+from typing import Any, Protocol, cast
 
+from anthropic.types import Message
+from openai.types import Completion
+from openai.types.chat import ChatCompletion
 from openai.types.chat.chat_completion import Choice
+from openai.types.responses import Response
+from pydantic import BaseModel
+from transformers import PreTrainedTokenizerBase
 
 from . import (
     ChatCompletionsExchange,
@@ -15,6 +22,7 @@ from . import (
     TokenizedTrajectory,
     Trajectory,
 )
+from ._protocols import Exchange
 
 _TOKEN_ID = re.compile(r"token_id:(\d+)$")
 
@@ -24,17 +32,57 @@ class _TokenizerConfig:
     base_model: str
     revision: str | None = None
     chat_template: str | None = None
-    chat_template_kwargs: dict[str, Any] | None = None
+    chat_template_kwargs: Mapping[str, object] | None = None
 
 
-def _dump(value: Any) -> dict[str, Any]:
-    if hasattr(value, "model_dump"):
+class _Tokenizer(Protocol):
+    def __call__(self, text: str, *, add_special_tokens: bool = False) -> object: ...
+
+    def apply_chat_template(
+        self,
+        messages: list[dict[str, Any]],
+        *,
+        tools: object,
+        tokenize: bool,
+        add_generation_prompt: bool,
+        chat_template: str | None = None,
+        **kwargs: object,
+    ) -> object: ...
+
+
+def _as_tokenizer(tokenizer: PreTrainedTokenizerBase) -> _Tokenizer:
+    # Transformers' annotation permits only string-valued message dictionaries,
+    # although its runtime API supports the structured content ART must tokenize.
+    return cast(_Tokenizer, tokenizer)
+
+
+def _string_dict(value: object) -> dict[str, Any] | None:
+    if not isinstance(value, dict) or not all(isinstance(key, str) for key in value):
+        return None
+    return {key: item for key, item in value.items() if isinstance(key, str)}
+
+
+def _dict_list(value: object) -> list[dict[str, Any]]:
+    if value is None:
+        return []
+    if not isinstance(value, list):
+        raise TypeError("Expected a list of JSON objects")
+    result: list[dict[str, Any]] = []
+    for item in value:
+        if (mapping := _string_dict(item)) is None:
+            raise TypeError("Expected a list of JSON objects")
+        result.append(mapping)
+    return result
+
+
+def _dump(value: object) -> dict[str, Any]:
+    if isinstance(value, BaseModel):
         result = value.model_dump(mode="python")
         return result if isinstance(result, dict) else {}
-    return value if isinstance(value, dict) else {}
+    return _string_dict(value) or {}
 
 
-def _token_id(value: Any) -> int | None:
+def _token_id(value: object) -> int | None:
     if isinstance(value, int) and not isinstance(value, bool):
         return value
     if isinstance(value, str) and (match := _TOKEN_ID.fullmatch(value)):
@@ -42,7 +90,7 @@ def _token_id(value: Any) -> int | None:
     return None
 
 
-def _pairs(values: Any) -> tuple[list[int], list[float]]:
+def _pairs(values: object) -> tuple[list[int], list[float]]:
     if not isinstance(values, list):
         return [], []
     token_ids: list[int] = []
@@ -62,7 +110,7 @@ def _pairs(values: Any) -> tuple[list[int], list[float]]:
     return token_ids, logprobs
 
 
-def _logprob_values(values: Any) -> list[float]:
+def _logprob_values(values: object) -> list[float]:
     if not isinstance(values, list):
         return []
     result: list[float] = []
@@ -74,7 +122,48 @@ def _logprob_values(values: Any) -> list[float]:
     return result
 
 
-def _chat_tokens(response: Any) -> tuple[list[int] | None, list[int], list[float]]:
+def _chat_choice_tokens(
+    choice: Choice, response_data: dict[str, Any]
+) -> tuple[list[int] | None, list[int], list[float]]:
+    choice_data = _dump(choice)
+    prompt = choice_data.get("prompt_token_ids") or response_data.get(
+        "prompt_token_ids"
+    )
+    prompt_ids = (
+        [token for value in prompt if (token := _token_id(value)) is not None]
+        if isinstance(prompt, list)
+        else None
+    )
+    token_ids = [
+        token
+        for value in choice_data.get("token_ids") or []
+        if (token := _token_id(value)) is not None
+    ]
+    logprob_values = None
+    if choice.logprobs is not None:
+        logprob_values = choice.logprobs.content or choice.logprobs.refusal
+    values = list(logprob_values or [])
+    pair_ids, logprobs = _pairs(values)
+    if token_ids and pair_ids and token_ids != pair_ids:
+        raise ValueError("Response token IDs disagree with choice logprobs")
+    return (
+        prompt_ids,
+        token_ids or pair_ids,
+        logprobs or _logprob_values(values) or [math.nan] * len(token_ids),
+    )
+
+
+def _chat_tokens(
+    response: ChatCompletion,
+) -> tuple[list[int] | None, list[int], list[float]]:
+    if len(response.choices) != 1:
+        raise ValueError("Trajectory tokenization requires exactly one response choice")
+    return _chat_choice_tokens(response.choices[0], _dump(response))
+
+
+def _completion_tokens(
+    response: Completion,
+) -> tuple[list[int] | None, list[int], list[float]]:
     if len(response.choices) != 1:
         raise ValueError("Trajectory tokenization requires exactly one response choice")
     choice = response.choices[0]
@@ -93,38 +182,7 @@ def _chat_tokens(response: Any) -> tuple[list[int] | None, list[int], list[float
         for value in choice_data.get("token_ids") or []
         if (token := _token_id(value)) is not None
     ]
-    logprob_values = getattr(getattr(choice, "logprobs", None), "content", None)
-    if logprob_values is None:
-        logprob_values = getattr(getattr(choice, "logprobs", None), "refusal", None)
-    values = list(logprob_values or [])
-    pair_ids, logprobs = _pairs(values)
-    if token_ids and pair_ids and token_ids != pair_ids:
-        raise ValueError("Response token IDs disagree with choice logprobs")
-    return (
-        prompt_ids,
-        token_ids or pair_ids,
-        logprobs or _logprob_values(values) or [math.nan] * len(token_ids),
-    )
-
-
-def _completion_tokens(
-    response: Any,
-) -> tuple[list[int] | None, list[int], list[float]]:
-    if len(response.choices) != 1:
-        raise ValueError("Trajectory tokenization requires exactly one response choice")
-    choice = response.choices[0]
-    response_data = _dump(response)
-    choice_data = _dump(choice)
-    prompt = choice_data.get("prompt_token_ids") or response_data.get(
-        "prompt_token_ids"
-    )
-    prompt_ids = list(prompt) if isinstance(prompt, list) else None
-    token_ids = [
-        token
-        for value in choice_data.get("token_ids") or []
-        if (token := _token_id(value)) is not None
-    ]
-    logprobs = _dump(getattr(choice, "logprobs", None))
+    logprobs = _dump(choice.logprobs)
     tokens = logprobs.get("tokens") or []
     pair_ids = [token for value in tokens if (token := _token_id(value)) is not None]
     pair_logprobs = [
@@ -139,7 +197,7 @@ def _completion_tokens(
     return prompt_ids, selected, pair_logprobs
 
 
-def _responses_tokens(response: Any) -> tuple[None, list[int], list[float]]:
+def _responses_tokens(response: Response) -> tuple[None, list[int], list[float]]:
     data = _dump(response)
     token_ids, logprobs = _pairs(data.get("raw_output_tokens"))
     if token_ids:
@@ -155,7 +213,7 @@ def _responses_tokens(response: Any) -> tuple[None, list[int], list[float]]:
     return None, [], []
 
 
-def _messages_tokens(response: Any) -> tuple[None, list[int], list[float]]:
+def _messages_tokens(response: Message) -> tuple[None, list[int], list[float]]:
     data = _dump(response)
     token_ids = [
         token
@@ -171,7 +229,7 @@ def _messages_tokens(response: Any) -> tuple[None, list[int], list[float]]:
     return None, token_ids, logprobs
 
 
-def _exchange_list(trajectory: Trajectory, model: str | None) -> list[Any]:
+def _exchange_list(trajectory: Trajectory, model: str | None) -> list[Exchange]:
     exchanges = [
         *trajectory.exchanges.chat_completions,
         *trajectory.exchanges.completions,
@@ -198,7 +256,7 @@ def _artifact_config(model: str) -> _TokenizerConfig:
     import wandb
 
     artifact_path = model.removeprefix("wandb-artifact:///")
-    artifact = getattr(wandb, "Api")().artifact(f"{artifact_path}:latest")
+    artifact = wandb.Api().artifact(f"{artifact_path}:latest")
     metadata = artifact.metadata
     base_model = metadata.get("base_model") or metadata.get("wandb.base_model")
     if not isinstance(base_model, str):
@@ -235,7 +293,7 @@ def _tokenizer_config(model: str, base_model: str | None) -> _TokenizerConfig:
     return _TokenizerConfig(model)
 
 
-def _load_tokenizer(config: _TokenizerConfig) -> Any:
+def _load_tokenizer(config: _TokenizerConfig) -> _Tokenizer:
     try:
         from transformers import AutoTokenizer
     except ImportError as exc:
@@ -243,9 +301,11 @@ def _load_tokenizer(config: _TokenizerConfig) -> Any:
             "Tokenizer fallback requires ART's backend or tinker dependencies"
         ) from exc
     try:
-        return AutoTokenizer.from_pretrained(
-            config.base_model,
-            revision=config.revision,
+        return _as_tokenizer(
+            AutoTokenizer.from_pretrained(
+                config.base_model,
+                revision=config.revision,
+            )
         )
     except Exception as exc:
         raise ValueError(
@@ -253,31 +313,42 @@ def _load_tokenizer(config: _TokenizerConfig) -> Any:
         ) from exc
 
 
-def _ids(value: Any) -> list[int]:
-    if hasattr(value, "input_ids"):
-        value = value.input_ids
-    if hasattr(value, "tolist"):
-        value = value.tolist()
-    if isinstance(value, dict):
-        value = value.get("input_ids")
+def _ids(value: object) -> list[int]:
+    if (input_ids := getattr(value, "input_ids", None)) is not None:
+        value = input_ids
+    if callable(to_list := getattr(value, "tolist", None)):
+        value = to_list()
+    if mapping := _string_dict(value):
+        value = mapping.get("input_ids")
     if isinstance(value, list) and value and isinstance(value[0], list):
         value = value[0]
-    if not isinstance(value, list) or any(not isinstance(item, int) for item in value):
+    if not isinstance(value, list):
         raise TypeError("Tokenizer did not return one token ID sequence")
-    return value
+    token_ids = [
+        item for item in value if isinstance(item, int) and not isinstance(item, bool)
+    ]
+    if len(token_ids) != len(value):
+        raise TypeError("Tokenizer did not return one token ID sequence")
+    return token_ids
 
 
-def _content_text(content: Any) -> str:
+def _content_text(content: object) -> str:
     if isinstance(content, str):
         return content
     if not isinstance(content, list):
         return ""
-    return "".join(
-        block.get("text", "")
-        for block in content
-        if isinstance(block, dict)
-        and block.get("type") in {"input_text", "output_text", "text"}
-    )
+    text = ""
+    for block in content:
+        data = _string_dict(block)
+        if data is not None and data.get("type") in {
+            "input_text",
+            "output_text",
+            "text",
+        }:
+            value = data.get("text")
+            if isinstance(value, str):
+                text += value
+    return text
 
 
 def _anthropic_messages(request: dict[str, Any]) -> list[dict[str, Any]]:
@@ -387,25 +458,26 @@ def _responses_messages(request: dict[str, Any]) -> list[dict[str, Any]]:
     return messages
 
 
-def _openai_tools(tools: Any, *, dialect: str) -> Any:
+def _openai_tools(tools: object, *, dialect: str) -> object:
     if not isinstance(tools, list) or dialect == "chat":
         return tools
     normalized = []
     for tool in tools:
-        if not isinstance(tool, dict) or tool.get("type", "function") != "function":
+        data = _string_dict(tool)
+        if data is None or data.get("type", "function") != "function":
             normalized.append(tool)
             continue
         if dialect == "messages":
             function = {
-                "name": tool.get("name"),
-                "description": tool.get("description"),
-                "parameters": tool.get("input_schema", {}),
+                "name": data.get("name"),
+                "description": data.get("description"),
+                "parameters": data.get("input_schema", {}),
             }
         else:
             function = {
-                "name": tool.get("name"),
-                "description": tool.get("description"),
-                "parameters": tool.get("parameters", {}),
+                "name": data.get("name"),
+                "description": data.get("description"),
+                "parameters": data.get("parameters", {}),
             }
         normalized.append(
             {
@@ -419,11 +491,12 @@ def _openai_tools(tools: Any, *, dialect: str) -> Any:
 
 
 def _request_messages(
-    exchange: Any, messages_override: list[dict[str, Any]] | None = None
-) -> tuple[list[dict[str, Any]], Any]:
+    exchange: ChatCompletionsExchange | MessagesExchange | ResponsesExchange,
+    messages_override: list[dict[str, Any]] | None = None,
+) -> tuple[list[dict[str, Any]], object]:
     request = exchange.request.root
     if isinstance(exchange, ChatCompletionsExchange):
-        return list(request.get("messages") or []), request.get("tools")
+        return _dict_list(request.get("messages")), request.get("tools")
     if isinstance(exchange, MessagesExchange):
         return _anthropic_messages(request), _openai_tools(
             request.get("tools"), dialect="messages"
@@ -438,7 +511,9 @@ def _request_messages(
     raise TypeError("Completions requests do not use chat templates")
 
 
-def _response_message(exchange: Any) -> dict[str, Any]:
+def _response_message(
+    exchange: ChatCompletionsExchange | MessagesExchange | ResponsesExchange,
+) -> dict[str, Any]:
     if isinstance(exchange, ChatCompletionsExchange):
         return exchange.response.choices[0].message.model_dump(
             mode="python", exclude_none=True
@@ -476,13 +551,13 @@ def _response_message(exchange: Any) -> dict[str, Any]:
 
 
 def _template_ids(
-    tokenizer: Any,
-    exchange: Any,
+    tokenizer: _Tokenizer,
+    exchange: Exchange,
     *,
     completed: bool,
     config: _TokenizerConfig,
     chat_template: str | None,
-    chat_template_kwargs: dict[str, Any] | None,
+    chat_template_kwargs: Mapping[str, object] | None,
     messages_override: list[dict[str, Any]] | None = None,
 ) -> list[int]:
     request = exchange.request.root
@@ -528,7 +603,9 @@ def _template_ids(
     return _ids(result)
 
 
-def _exchange_tokens(exchange: Any) -> tuple[list[int] | None, list[int], list[float]]:
+def _exchange_tokens(
+    exchange: Exchange,
+) -> tuple[list[int] | None, list[int], list[float]]:
     if isinstance(exchange, ChatCompletionsExchange):
         return _chat_tokens(exchange.response)
     if isinstance(exchange, CompletionsExchange):
@@ -540,7 +617,7 @@ def _exchange_tokens(exchange: Any) -> tuple[list[int] | None, list[int], list[f
     raise TypeError(f"Unknown exchange type: {type(exchange)!r}")
 
 
-def _visible_logprobs(exchange: Any) -> list[tuple[str, float]]:
+def _visible_logprobs(exchange: Exchange) -> list[tuple[str, float]]:
     values: list[tuple[str, float]] = []
     if isinstance(exchange, ChatCompletionsExchange):
         logprobs = exchange.response.choices[0].logprobs
@@ -577,10 +654,10 @@ def _visible_logprobs(exchange: Any) -> list[tuple[str, float]]:
 
 
 def _align_visible_logprobs(
-    tokenizer: Any, completion: list[int], exchange: Any
+    tokenizer: _Tokenizer | None, completion: list[int], exchange: Exchange
 ) -> list[float] | None:
     values = _visible_logprobs(exchange)
-    if not values or not callable(tokenizer):
+    if not values or tokenizer is None:
         return None
     aligned = [math.nan] * len(completion)
     cursor = 0
@@ -602,7 +679,7 @@ def _legacy_tokenize(
     base_model: str | None,
     *,
     chat_template: str | None,
-    chat_template_kwargs: dict[str, Any] | None,
+    chat_template_kwargs: Mapping[str, object] | None,
 ) -> TokenizedTrajectory:
     if trajectory.additional_histories:
         raise ValueError("Tokenization requires one history")
@@ -612,11 +689,7 @@ def _legacy_tokenize(
     for item in trajectory.messages_and_choices:
         if not isinstance(item, Choice):
             continue
-        prompt, completion, completion_logprobs = _chat_tokens(
-            type(
-                "Response", (), {"choices": [item], "model_dump": lambda self, **_: {}}
-            )()
-        )
+        prompt, completion, completion_logprobs = _chat_choice_tokens(item, {})
         if prompt is None or not completion:
             raise ValueError(
                 "Legacy fallback tokenization is unavailable without exact choice token metadata"
@@ -651,8 +724,8 @@ def tokenize_one(
     *,
     model: str | None,
     chat_template: str | None,
-    chat_template_kwargs: dict[str, Any] | None,
-    tokenizer_instance: Any = None,
+    chat_template_kwargs: Mapping[str, object] | None,
+    tokenizer_instance: _Tokenizer | None = None,
 ) -> TokenizedTrajectory:
     if not trajectory.exchanges:
         return _legacy_tokenize(
@@ -662,7 +735,9 @@ def tokenize_one(
             chat_template_kwargs=chat_template_kwargs,
         )
     exchanges = _exchange_list(trajectory, model)
-    selected_model = cast(str, exchanges[0].model)
+    selected_model = exchanges[0].model
+    if selected_model is None:
+        raise AssertionError("_exchange_list returned an exchange without a model")
     config = _tokenizer_config(selected_model, base_model)
     tokenizer = tokenizer_instance
     token_ids: list[int] = []
@@ -690,9 +765,9 @@ def tokenize_one(
                 _response_message(exchange),
             ]
         prompt, completion, completion_logprobs = _exchange_tokens(exchange)
-        if prompt is None or not completion:
-            tokenizer = tokenizer or _load_tokenizer(config)
         if prompt is None:
+            if tokenizer is None:
+                tokenizer = _load_tokenizer(config)
             prompt = _template_ids(
                 tokenizer,
                 exchange,
@@ -703,6 +778,8 @@ def tokenize_one(
                 messages_override=messages_override,
             )
         if not completion:
+            if tokenizer is None:
+                tokenizer = _load_tokenizer(config)
             completed = _template_ids(
                 tokenizer,
                 exchange,
