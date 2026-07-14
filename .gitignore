@@ -14,7 +14,7 @@ wandb/
 docs/node_modules/
 dist/
 replays/
-trajectories/
+/trajectories/
 .DS_Store
 .local/
 .claude/settings.local.json

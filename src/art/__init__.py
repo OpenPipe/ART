@@ -59,7 +59,6 @@ except ImportError:
 
 
 from . import dev
-from .auto_trajectory import auto_trajectory, capture_auto_trajectory
 from .backend import Backend
 from .batches import trajectory_group_batches
 from .dev import LoRAConfig
@@ -70,7 +69,27 @@ from .megatron.runtime_config import (
 )
 from .model import Model, TrainableModel
 from .serverless import ServerlessBackend
-from .trajectories import Trajectory, TrajectoryGroup
+from .trajectories import (
+    ChatCompletionsExchange,
+    CompletionsExchange,
+    MessagesExchange,
+    ResponsesExchange,
+    TokenizedTrajectory,
+    TokenizedTrajectoryGroup,
+    Trajectory,
+    TrajectoryExchanges,
+    TrajectoryGroup,
+    auto_trajectory,
+    capture_auto_trajectory,
+    current_trajectory,
+    current_trajectory_group,
+    tokenize_trajectories,
+    tokenize_trajectory,
+    tokenize_trajectory_group,
+    tokenize_trajectory_groups,
+    trajectory,
+    trajectory_group,
+)
 from .types import (
     LocalTrainResult,
     MegatronRuntimeConfig,
@@ -90,6 +109,8 @@ __all__ = [
     "dev",
     "auto_trajectory",
     "capture_auto_trajectory",
+    "current_trajectory",
+    "current_trajectory_group",
     "gather_trajectories",
     "gather_trajectory_groups",
     "trajectory_group_batches",
@@ -112,7 +133,20 @@ __all__ = [
     "TrainConfig",
     "TrainResult",
     "Trajectory",
+    "TrajectoryExchanges",
     "TrajectoryGroup",
+    "ChatCompletionsExchange",
+    "CompletionsExchange",
+    "ResponsesExchange",
+    "MessagesExchange",
+    "TokenizedTrajectory",
+    "TokenizedTrajectoryGroup",
+    "trajectory",
+    "trajectory_group",
+    "tokenize_trajectory",
+    "tokenize_trajectories",
+    "tokenize_trajectory_group",
+    "tokenize_trajectory_groups",
     "capture_yielded_trajectory",
     "yield_trajectory",
 ]

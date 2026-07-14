@@ -525,19 +525,55 @@ def tokenize_trajectory_groups(
                 advantage /= reward_std + 1e-6
             if advantage == 0 and drop_zero_advantage_trajectories:
                 continue
-            trajectory_results = tokenize_vllm_trajectory_histories(
-                tokenizer=tokenizer,
-                histories=[
-                    History(
-                        messages_and_choices=trajectory.messages_and_choices,
-                        tools=trajectory.tools,
-                    ),
-                    *trajectory.additional_histories,
-                ],
-                advantage=advantage,
-                allow_training_without_logprobs=allow_training_without_logprobs,
-                trajectory=trajectory,
-            )
+            if trajectory.exchanges:
+                from ..trajectories._tokenize import tokenize_one
+
+                exchange_result = tokenize_one(
+                    trajectory,
+                    getattr(tokenizer, "name_or_path", None),
+                    model=None,
+                    chat_template=None,
+                    chat_template_kwargs=chat_template_kwargs,
+                    tokenizer_instance=tokenizer,
+                )
+                choice_offsets = [
+                    index
+                    for index, trainable in enumerate(exchange_result.assistant_mask)
+                    if trainable
+                    and (index == 0 or not exchange_result.assistant_mask[index - 1])
+                ]
+                trajectory_results = [
+                    TokenizedResult(
+                        advantage=advantage,
+                        chat="",
+                        token_ids=exchange_result.token_ids,
+                        input_pos=list(range(len(exchange_result.token_ids))),
+                        assistant_mask=[
+                            int(value) for value in exchange_result.assistant_mask
+                        ],
+                        logprobs=exchange_result.logprobs,
+                        pixel_values=None,
+                        image_grid_thw=None,
+                        trajectory=trajectory,
+                        choice_offsets=choice_offsets,
+                        extra_logprobs={},
+                        _tokenizer=tokenizer,
+                    )
+                ]
+            else:
+                trajectory_results = tokenize_vllm_trajectory_histories(
+                    tokenizer=tokenizer,
+                    histories=[
+                        History(
+                            messages_and_choices=trajectory.messages_and_choices,
+                            tools=trajectory.tools,
+                        ),
+                        *trajectory.additional_histories,
+                    ],
+                    advantage=advantage,
+                    allow_training_without_logprobs=allow_training_without_logprobs,
+                    trajectory=trajectory,
+                )
             weight = 1 / (
                 sum(sum(result.assistant_mask) for result in trajectory_results) + 1e-6
             )

@@ -312,6 +312,25 @@ wheels = [
 ]
 
 [[package]]
+name = "anthropic"
+version = "0.116.0"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "anyio" },
+    { name = "distro" },
+    { name = "docstring-parser" },
+    { name = "httpx" },
+    { name = "jiter" },
+    { name = "pydantic" },
+    { name = "sniffio" },
+    { name = "typing-extensions" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/66/a2/d31f14e28d49bae983a3634e38dfb4b31c50110b5e403596c5c6a20b23f8/anthropic-0.116.0.tar.gz", hash = "sha256:5fc248fbb9fe03ef686f8a774f81586bca31a043260aab88b387ea3660f4a396", size = 949149, upload-time = "2026-07-02T19:08:10.534Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/c7/dd/2a1e81cf1b163acc340afc4ec74ed1d86f5eed1a809fabdeed3e0997b346/anthropic-0.116.0-py3-none-any.whl", hash = "sha256:6c0a7698e8d652455da3499978279bb2588c7264d0a35be3666009a4258c8256", size = 956896, upload-time = "2026-07-02T19:08:08.756Z" },
+]
+
+[[package]]
 name = "antlr4-python3-runtime"
 version = "4.9.3"
 source = { registry = "https://pypi.org/simple" }
@@ -4740,10 +4759,13 @@ name = "openpipe-art"
 version = "0.5.18"
 source = { editable = "." }
 dependencies = [
+    { name = "aiohttp" },
+    { name = "anthropic" },
     { name = "litellm" },
     { name = "nest-asyncio" },
     { name = "openai" },
     { name = "polars" },
+    { name = "requests" },
     { name = "setproctitle" },
     { name = "tblib" },
     { name = "typer" },
@@ -4845,6 +4867,8 @@ dev = [
 [package.metadata]
 requires-dist = [
     { name = "accelerate", marker = "extra == 'backend'", specifier = "==1.7.0" },
+    { name = "aiohttp", specifier = ">=3.10.0" },
+    { name = "anthropic", specifier = ">=0.75.0" },
     { name = "apex", marker = "extra == 'megatron'", git = "https://github.com/NVIDIA/apex.git?rev=25.09" },
     { name = "awscli", marker = "extra == 'backend'", specifier = ">=1.38.1" },
     { name = "bitsandbytes", marker = "extra == 'backend'", specifier = ">=0.45.2" },
@@ -4888,6 +4912,7 @@ requires-dist = [
     { name = "pydantic", marker = "extra == 'tinker'", specifier = ">=2.12.5" },
     { name = "pytest", marker = "extra == 'backend'", specifier = ">=8.4.1" },
     { name = "quack-kernels", marker = "extra == 'megatron'", specifier = "==0.3.7" },
+    { name = "requests", specifier = ">=2.32.0" },
     { name = "seaborn", marker = "extra == 'plotting'", specifier = ">=0.13.2" },
     { name = "setproctitle", specifier = ">=1.3.6" },
     { name = "setuptools", marker = "extra == 'backend'", specifier = ">=78.1.0" },
