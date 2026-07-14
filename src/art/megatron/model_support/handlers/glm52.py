@@ -233,6 +233,12 @@ class Glm52Handler(DefaultMoeHandler):
     def correctness_use_fp32_lora_reference(self) -> bool:
         return False
 
+    def prepare_hf_reference_model(self, model: Any) -> Any:
+        for module in model.modules():
+            if type(module).__name__ == "GlmMoeDsaIndexer":
+                module.requires_grad_(False)
+        return model
+
     def correctness_phase_pass_fns(self, oracle_harness: Any) -> dict[str, Any]:
         nonzero = {"typical_abs_scale": 0.0, "candidate_abs_scale": 0.0}
         forward = oracle_harness.MetricThresholdRule(

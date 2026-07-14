@@ -420,10 +420,9 @@ def _load_hf_model(
     )
     model.train()
     model = cast(Any, model).to(device)
-    if handler.key == "glm52":
-        for module in model.modules():
-            if type(module).__name__ == "GlmMoeDsaIndexer":
-                module.requires_grad_(False)
+    prepare_hf_reference_model = getattr(handler, "prepare_hf_reference_model", None)
+    if prepare_hf_reference_model is not None:
+        model = prepare_hf_reference_model(model)
     return model
 
 
