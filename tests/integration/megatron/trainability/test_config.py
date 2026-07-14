@@ -129,7 +129,7 @@ def test_megatron_variants_keep_short_packed_sequence_default(monkeypatch) -> No
     )
 
     assert _variant_packed_sequence_length(variant) == 1024
-    assert _variant_train_kwargs(variant) == {"packed_sequence_length": 1024}
+    assert _variant_train_kwargs(variant) == {}
     config = _build_internal_config(
         variant, base_model="Qwen/Qwen3-30B-A3B-Instruct-2507"
     )
