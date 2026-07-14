@@ -199,9 +199,6 @@ def create_identity_lora(
         adapter_config=final_config,
     )
     del peft_model, model
-    if torch.cuda.is_available():
-        torch.cuda.synchronize()
-        torch.cuda.empty_cache()
 
 
 @dataclass
