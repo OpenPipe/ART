@@ -217,7 +217,7 @@ def test_yes_no_trainability_passes_initially_saturated_stable_report() -> None:
                 step=1,
                 eval_reward=0.9375,
                 train_reward=0.875,
-                train_metrics={"grad_norm": 54.0},
+                train_metrics={"loss/grad_norm": 54.0},
             )
         ],
     )
