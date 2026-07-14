@@ -1022,9 +1022,9 @@ def _run_stage_attention(
         head_major=input_head_major,
     )
     if input_head_major:
-        q_flex = q_stage.unsqueeze(0)
-        k_flex = k_stage.unsqueeze(0)
-        v_flex = v_stage.unsqueeze(0)
+        q_flex = q_stage.unsqueeze(0).contiguous()
+        k_flex = k_stage.unsqueeze(0).contiguous()
+        v_flex = v_stage.unsqueeze(0).contiguous()
     else:
         q_flex = q_stage.permute(1, 0, 2).unsqueeze(0).contiguous()
         k_flex = k_stage.permute(1, 0, 2).unsqueeze(0).contiguous()
