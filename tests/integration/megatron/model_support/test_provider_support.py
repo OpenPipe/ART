@@ -143,7 +143,7 @@ def test_meta_llama_32_1b_instruct_uses_llama3_dense_support() -> None:
 
     assert spec.key == "llama3_dense"
     assert spec.is_moe is False
-    assert spec.native_vllm_lora_status == "wip"
+    assert spec.native_vllm_lora_status == "validated"
     assert handler.key == "llama3_dense"
 
 

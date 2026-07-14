@@ -103,7 +103,7 @@ LLAMA3_DENSE_SPEC = ModelSupportSpec(
         "meta-llama/Llama-3.3-70B-Instruct",
     ),
     default_target_modules=_DENSE_TARGET_MODULES,
-    native_vllm_lora_status=_WIP_NATIVE_VLLM_LORA_STATUS,
+    native_vllm_lora_status=_VALIDATED_NATIVE_VLLM_LORA_STATUS,
 )
 
 QWEN3_MOE_SPEC = ModelSupportSpec(
