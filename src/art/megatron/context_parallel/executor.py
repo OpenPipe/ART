@@ -23,6 +23,7 @@ from art.megatron.flex_attn.compiled import (
 from .block_mask import build_block_mask_from_context, prepare_block_mask_context
 from .comm import A2AVCommunicator
 from .range_ops import (
+    prepare_range_head_major_kernels,
     range_gather_head_major,
     range_reduce_sum_,
     range_reduce_sum_head_major_,
@@ -1887,11 +1888,14 @@ def _flatten_qkv(
     value: torch.Tensor,
     state: ArtContextParallelState,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    return (
+    flattened = (
         flatten_valid_sequence_head_major(query, state.rank_plan.local_valid_lengths),
         flatten_valid_sequence_head_major(key, state.rank_plan.local_valid_lengths),
         flatten_valid_sequence_head_major(value, state.rank_plan.local_valid_lengths),
     )
+    for tensor in flattened:
+        prepare_range_head_major_kernels(tensor)
+    return flattened
 
 
 def _run_context_parallel_forward(
