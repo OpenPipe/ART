@@ -225,10 +225,15 @@ class DistributedRolloutExecutor:
 
     def set_workers(self, worker_ids: tuple[int, ...]) -> None:
         workers = tuple(sorted(worker_ids))
+        drained = len(workers) <= len(self._worker_endpoints)
         assignments = {
             worker_id: self._endpoint_by_worker[worker_id]
             for worker_id in workers
             if worker_id in self._endpoint_by_worker
+            and (
+                not drained
+                or self._endpoint_by_worker[worker_id] in self._worker_endpoints
+            )
         }
         available = [
             endpoint
