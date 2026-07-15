@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from collections import OrderedDict
 from functools import wraps
 import gc
@@ -12,7 +13,13 @@ from typing import Any, cast
 # This module is imported only by explicit distributed runtime construction.
 from monarch.actor import Actor, endpoint  # ty: ignore[unresolved-import]
 
-from .data_plane import BatchReservation, PackedBatchInbox, PackedBatchRef
+from .data_plane import (
+    BatchReservation,
+    PackedBatchCapacityError,
+    PackedBatchInbox,
+    PackedBatchLeaseError,
+    PackedBatchRef,
+)
 from .monarch_runtime import RemoteCallError, RemoteCallResult
 from .packing import PackingRequest, PackingResult
 from .rollout import RolloutInvocation, RolloutResult
@@ -25,9 +32,26 @@ def resilient_endpoint(function: Any) -> Any:
     async def wrapped(*args: Any, **kwargs: Any) -> RemoteCallResult:
         try:
             return RemoteCallResult(value=await function(*args, **kwargs))
-        except Exception as error:
+        except (KeyboardInterrupt, SystemExit, GeneratorExit):
+            raise
+        except BaseException as error:
+            from art.errors import LocalServingUnavailableError
+
+            if isinstance(error, asyncio.CancelledError):
+                kind = "cancelled"
+            elif isinstance(error, LocalServingUnavailableError):
+                kind = "serving"
+            elif isinstance(error, PackedBatchCapacityError):
+                kind = "capacity"
+            elif isinstance(error, PackedBatchLeaseError):
+                kind = "lease"
+            elif isinstance(error, (TypeError, ValueError)):
+                kind = "input"
+            else:
+                kind = "internal"
             return RemoteCallResult(
                 error=RemoteCallError(
+                    kind=kind,
                     error_type=type(error).__name__,
                     message=str(error) or type(error).__name__,
                     traceback=traceback.format_exc(),

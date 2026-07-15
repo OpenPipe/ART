@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-from typing import Any
+import asyncio
+from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict
 
@@ -21,6 +22,7 @@ from .vllm_replica import HostMemberLaunchRequest, HostMemberState
 class RemoteCallError(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
+    kind: Literal["cancelled", "capacity", "input", "lease", "serving", "internal"]
     error_type: str
     message: str
     traceback: str
@@ -37,7 +39,24 @@ def unwrap_remote_call(result: RemoteCallResult) -> Any:
     if result.error is None:
         return result.value
     error = result.error
-    raise RuntimeError(f"remote {error.error_type}: {error.message}\n{error.traceback}")
+    message = f"remote {error.error_type}: {error.message}\n{error.traceback}"
+    if error.kind == "cancelled":
+        raise asyncio.CancelledError(message)
+    if error.kind == "serving":
+        from art.errors import LocalServingUnavailableError
+
+        raise LocalServingUnavailableError(message)
+    if error.kind == "capacity":
+        from .data_plane import PackedBatchCapacityError
+
+        raise PackedBatchCapacityError(message)
+    if error.kind == "lease":
+        from .data_plane import PackedBatchLeaseError
+
+        raise PackedBatchLeaseError(message)
+    if error.kind == "input":
+        raise ValueError(message)
+    raise RuntimeError(message)
 
 
 async def call_remote(endpoint: Any, *args: Any) -> Any:
