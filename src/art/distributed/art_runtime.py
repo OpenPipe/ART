@@ -25,7 +25,15 @@ from .host_admission import (
     runtime_package_names,
     validate_host_admission,
 )
-from .monarch_bootstrap import activate_child_virtualenv, monarch_identifier
+from .monarch_bootstrap import (
+    _start_worker,
+    _stop_worker,
+    activate_child_virtualenv,
+    activate_cpu_child_virtualenv,
+    attach_controller,
+    monarch_identifier,
+    require_local_worker_address,
+)
 from .monarch_runtime import (
     MonarchPackedBatchInbox,
     MonarchPackedBatchSource,
@@ -99,6 +107,7 @@ class ArtRuntime:
             else None
         )
         self._close_task: asyncio.Task[None] | None = None
+        self._local_worker: Any | None = None
         self._started = False
         self._closed = False
 
@@ -117,18 +126,51 @@ class ArtRuntime:
             config=config,
             owns_host_mesh=owns_host_mesh,
         )
+        return await runtime._start()
+
+    @classmethod
+    async def start_local(
+        cls,
+        topology: RuntimeTopology,
+        *,
+        config: ArtRuntimeConfig | None = None,
+    ) -> "ArtRuntime":
+        address = require_local_worker_address(
+            tuple(host.worker_address for host in topology.cluster.hosts)
+        )
+        worker = _start_worker(address)
         try:
-            await runtime._start_host_services()
+            host_mesh = await attach_controller(
+                (address,),
+                name=f"art_local_{uuid.uuid4().hex}",
+                startup_timeout_s=topology.cluster.startup_timeout_s,
+            )
         except BaseException as startup_error:
             try:
-                await runtime.close()
+                await asyncio.to_thread(_stop_worker, worker)
+            except BaseException as cleanup_error:
+                raise BaseExceptionGroup(
+                    "local ART runtime startup and cleanup failed",
+                    [startup_error, cleanup_error],
+                ) from None
+            raise
+        runtime = cls(host_mesh, topology, config=config, owns_host_mesh=True)
+        runtime._local_worker = worker
+        return await runtime._start()
+
+    async def _start(self) -> "ArtRuntime":
+        try:
+            await self._start_host_services()
+        except BaseException as startup_error:
+            try:
+                await self.close()
             except BaseException as cleanup_error:
                 raise BaseExceptionGroup(
                     "ART runtime startup and cleanup failed",
                     [startup_error, cleanup_error],
                 ) from None
             raise
-        return runtime
+        return self
 
     async def _start_host_services(self) -> None:
         from .monarch_actor import RolloutHostService
@@ -137,7 +179,7 @@ class ArtRuntime:
             for index, host in enumerate(self.topology.cluster.hosts):
                 proc = self.host_mesh.slice(hosts=index).spawn_procs(
                     per_host={"service": 1},
-                    bootstrap=activate_child_virtualenv,
+                    bootstrap=activate_cpu_child_virtualenv,
                     name=monarch_identifier(
                         f"art_host_{self.runtime_id}_{host.host_id}"
                     ),
@@ -317,7 +359,7 @@ class ArtRuntime:
                 continue
             proc = self.host_mesh.slice(hosts=index).spawn_procs(
                 per_host={"rollout": host.cpu_slots},
-                bootstrap=activate_child_virtualenv,
+                bootstrap=activate_cpu_child_virtualenv,
                 name=monarch_identifier(
                     f"art_rollout_{self.runtime_id}_{host.host_id}"
                 ),
@@ -355,14 +397,15 @@ class ArtRuntime:
             if host_id != source_host
         }
         try:
-            host_refs.update(
-                await fanout_rdma_packed_batch(
-                    ref=result.ref,
-                    source_endpoint=MonarchPackedBatchSource(source_actor),
-                    inboxes=destinations,
-                    timeout_s=self.topology.cluster.rpc_timeout_s,
+            if destinations:
+                host_refs.update(
+                    await fanout_rdma_packed_batch(
+                        ref=result.ref,
+                        source_endpoint=MonarchPackedBatchSource(source_actor),
+                        inboxes=destinations,
+                        timeout_s=self.topology.cluster.rpc_timeout_s,
+                    )
                 )
-            )
             leases = PackedBatchLeaseSet(ref=result.ref, host_refs=host_refs)
         except BaseException:
             await self._release_refs(host_refs)
@@ -575,6 +618,12 @@ class ArtRuntime:
         self._host_procs.clear()
         if self.owns_host_mesh:
             await collect("host mesh shutdown", self.host_mesh.shutdown())
+        worker, self._local_worker = self._local_worker, None
+        if worker is not None:
+            try:
+                await asyncio.to_thread(_stop_worker, worker)
+            except BaseException as error:
+                failures.append(error)
         if failures:
             raise BaseExceptionGroup("ART runtime teardown failed", failures)
 

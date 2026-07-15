@@ -21,6 +21,7 @@ import subprocess
 import sys
 import time
 from typing import TYPE_CHECKING, Any
+from urllib.parse import urlsplit
 import uuid
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
@@ -193,6 +194,40 @@ def _tcp_address(host: str, port: int) -> str:
     return f"tcp://[{host}]:{port}" if ":" in host else f"tcp://{host}:{port}"
 
 
+def require_local_worker_address(worker_addresses: Sequence[str]) -> str:
+    error = "local ART runtime requires exactly one loopback tcp worker address"
+    if len(worker_addresses) != 1:
+        raise ValueError(error)
+    address = worker_addresses[0]
+    try:
+        parsed = urlsplit(address)
+        host = parsed.hostname
+        port = parsed.port
+    except ValueError:
+        raise ValueError(error) from None
+    if (
+        parsed.scheme != "tcp"
+        or host is None
+        or port is None
+        or port < 1
+        or parsed.path
+        or parsed.query
+        or parsed.fragment
+        or parsed.username is not None
+        or parsed.password is not None
+    ):
+        raise ValueError(error)
+    try:
+        is_loopback = (
+            host.casefold() == "localhost" or ipaddress.ip_address(host).is_loopback
+        )
+    except ValueError:
+        is_loopback = False
+    if not is_loopback:
+        raise ValueError(error)
+    return address
+
+
 def _parse_ssh_host(value: str) -> SshHost:
     target, separator, worker_host = value.partition("=")
     target = target.strip()
@@ -251,6 +286,11 @@ def activate_child_virtualenv() -> None:
 
     if virtual_env := os.environ.get("ART_VIRTUAL_ENV"):
         sys.prefix = sys.exec_prefix = virtual_env
+
+
+def activate_cpu_child_virtualenv() -> None:
+    os.environ["CUDA_VISIBLE_DEVICES"] = ""
+    activate_child_virtualenv()
 
 
 async def _deployment_rollout(
@@ -348,10 +388,20 @@ async def attach_controller(
         ca="trust_all_connections",
         name=monarch_identifier(name),
     )
-    if startup_timeout_s is None:
-        await hosts.initialized
-    else:
-        await asyncio.wait_for(hosts.initialized, startup_timeout_s)
+    try:
+        if startup_timeout_s is None:
+            await hosts.initialized
+        else:
+            await asyncio.wait_for(hosts.initialized, startup_timeout_s)
+    except BaseException as startup_error:
+        try:
+            await hosts.shutdown()
+        except BaseException as cleanup_error:
+            raise BaseExceptionGroup(
+                "Monarch attach and cleanup failed",
+                [startup_error, cleanup_error],
+            ) from None
+        raise
     return hosts
 
 
@@ -383,6 +433,36 @@ def _stop_worker(worker: multiprocessing.Process) -> None:
     if worker.is_alive():
         worker.kill()
         worker.join()
+
+
+def run_local(
+    program: "InstalledAsyncCallable",
+    *,
+    port: int = DEFAULT_MONARCH_PORT,
+    startup_timeout_s: float = DEFAULT_STARTUP_TIMEOUT_S,
+) -> None:
+    """Own one clean loopback worker and controller for one local program."""
+
+    address = require_local_worker_address((_tcp_address("127.0.0.1", port),))
+    worker = _start_worker(address)
+    try:
+        asyncio.run(
+            run_explicit_controller(
+                ExplicitHostBootstrap(worker_addresses=(address,)),
+                program,
+                startup_timeout_s=startup_timeout_s,
+            )
+        )
+    except BaseException as program_error:
+        try:
+            _stop_worker(worker)
+        except BaseException as cleanup_error:
+            raise BaseExceptionGroup(
+                "local controller and worker cleanup failed",
+                [program_error, cleanup_error],
+            ) from None
+        raise
+    _stop_worker(worker)
 
 
 def _lifecycle_listener(spec: SkyPilotBootstrap) -> socket.socket:
@@ -691,6 +771,12 @@ def main(argv: Sequence[str] | None = None) -> None:
     controller.add_argument(
         "--startup-timeout", type=_positive_float, default=DEFAULT_STARTUP_TIMEOUT_S
     )
+    local = subparsers.add_parser("local", help="own one loopback worker")
+    local.add_argument("--program", required=True, help="module:qualname")
+    local.add_argument("--port", type=int, default=DEFAULT_MONARCH_PORT)
+    local.add_argument(
+        "--startup-timeout", type=_positive_float, default=DEFAULT_STARTUP_TIMEOUT_S
+    )
     sky = subparsers.add_parser(
         "skypilot", help="consume the nodes in one SkyPilot task"
     )
@@ -738,7 +824,13 @@ def main(argv: Sequence[str] | None = None) -> None:
     from .rollout import InstalledAsyncCallable
 
     program = InstalledAsyncCallable(module=module, qualname=qualname)
-    if args.command == "ssh":
+    if args.command == "local":
+        run_local(
+            program,
+            port=args.port,
+            startup_timeout_s=args.startup_timeout,
+        )
+    elif args.command == "ssh":
         run_ssh(
             SshBootstrap(
                 hosts=tuple(_parse_ssh_host(host) for host in args.host),
