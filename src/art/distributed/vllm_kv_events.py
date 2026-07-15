@@ -3,9 +3,9 @@ from __future__ import annotations
 import asyncio
 from collections.abc import Callable
 import logging
-import struct
 from typing import Any
 
+import msgspec
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 import zmq
 import zmq.asyncio
@@ -20,7 +20,6 @@ from .vllm_router import KvCacheEvent, canonical_block_hash
 
 _LOGGER = logging.getLogger(__name__)
 _MAX_PAYLOAD_BYTES = 64 << 20
-_MAX_MSGPACK_DEPTH = 32
 _MAX_MSGPACK_ITEMS = 1_000_000
 _REPLAY_TIMEOUT_S = 5.0
 _RECONNECT_DELAY_S = 0.25
@@ -47,94 +46,6 @@ class KvEventSource(BaseModel):
         return self
 
 
-class _MsgpackDecoder:
-    def __init__(self, payload: bytes) -> None:
-        if len(payload) > _MAX_PAYLOAD_BYTES:
-            raise ValueError("MsgPack payload exceeds the configured limit")
-        self._payload = memoryview(payload)
-        self._position = 0
-        self._items = 0
-
-    def decode(self) -> Any:
-        value = self._read(0)
-        if self._position != len(self._payload):
-            raise ValueError("MsgPack payload has trailing bytes")
-        return value
-
-    def _take(self, size: int) -> memoryview:
-        end = self._position + size
-        if size < 0 or end > len(self._payload):
-            raise ValueError("truncated MsgPack payload")
-        value = self._payload[self._position : end]
-        self._position = end
-        return value
-
-    def _uint(self, size: int) -> int:
-        return int.from_bytes(self._take(size), "big")
-
-    def _collection(self, size: int, depth: int, *, mapping: bool) -> Any:
-        if size > _MAX_MSGPACK_ITEMS:
-            raise ValueError("MsgPack collection exceeds the configured limit")
-        if mapping:
-            result = {}
-            for _ in range(size):
-                key = self._read(depth)
-                try:
-                    result[key] = self._read(depth)
-                except TypeError as error:
-                    raise ValueError("MsgPack map key is not hashable") from error
-            return result
-        return [self._read(depth) for _ in range(size)]
-
-    def _read(self, depth: int) -> Any:
-        if depth > _MAX_MSGPACK_DEPTH:
-            raise ValueError("MsgPack nesting exceeds the configured limit")
-        self._items += 1
-        if self._items > _MAX_MSGPACK_ITEMS:
-            raise ValueError("MsgPack item count exceeds the configured limit")
-        marker = self._uint(1)
-        if marker <= 0x7F:
-            return marker
-        if marker >= 0xE0:
-            return marker - 256
-        if 0x80 <= marker <= 0x8F:
-            return self._collection(marker & 0x0F, depth + 1, mapping=True)
-        if 0x90 <= marker <= 0x9F:
-            return self._collection(marker & 0x0F, depth + 1, mapping=False)
-        if 0xA0 <= marker <= 0xBF:
-            return bytes(self._take(marker & 0x1F)).decode("utf-8")
-        if marker == 0xC0:
-            return None
-        if marker in (0xC2, 0xC3):
-            return marker == 0xC3
-        if marker in (0xC4, 0xC5, 0xC6):
-            return bytes(self._take(self._uint(1 << (marker - 0xC4))))
-        if marker in (0xCA, 0xCB):
-            size = 4 if marker == 0xCA else 8
-            return struct.unpack(">f" if size == 4 else ">d", self._take(size))[0]
-        if 0xCC <= marker <= 0xCF:
-            return self._uint(1 << (marker - 0xCC))
-        if 0xD0 <= marker <= 0xD3:
-            size = 1 << (marker - 0xD0)
-            return int.from_bytes(self._take(size), "big", signed=True)
-        if marker in (0xD9, 0xDA, 0xDB):
-            size = self._uint(1 << (marker - 0xD9))
-            return bytes(self._take(size)).decode("utf-8")
-        if marker in (0xDC, 0xDD):
-            return self._collection(
-                self._uint(2 if marker == 0xDC else 4),
-                depth + 1,
-                mapping=False,
-            )
-        if marker in (0xDE, 0xDF):
-            return self._collection(
-                self._uint(2 if marker == 0xDE else 4),
-                depth + 1,
-                mapping=True,
-            )
-        raise ValueError(f"unsupported MsgPack marker 0x{marker:02x}")
-
-
 def _array(value: Any, name: str, minimum: int, maximum: int) -> list[Any]:
     if not isinstance(value, list) or not minimum <= len(value) <= maximum:
         raise ValueError(f"{name} must be an array of length {minimum}..{maximum}")
@@ -155,7 +66,9 @@ def _hashes(value: Any) -> tuple[str, ...]:
 def decode_vllm_kv_event_batch(
     payload: bytes, source: KvEventSource, sequence: int
 ) -> tuple[KvCacheEvent, ...]:
-    batch = _array(_MsgpackDecoder(payload).decode(), "event batch", 3, 3)
+    if len(payload) > _MAX_PAYLOAD_BYTES:
+        raise ValueError("MsgPack payload exceeds the configured limit")
+    batch = _array(msgspec.msgpack.decode(payload), "event batch", 3, 3)
     if isinstance(batch[0], bool) or not isinstance(batch[0], (int, float)):
         raise ValueError("event timestamp must be numeric")
     events = _array(batch[1], "events", 0, _MAX_MSGPACK_ITEMS)
@@ -367,6 +280,7 @@ class VllmKvEventSubscriber:
         try:
             await replay.send_multipart((b"", start_sequence.to_bytes(8, "big")))
             count = 0
+            previous_sequence: int | None = None
             while True:
                 frames = await asyncio.wait_for(
                     replay.recv_multipart(), timeout=_REPLAY_TIMEOUT_S
@@ -380,7 +294,16 @@ class VllmKvEventSubscriber:
                 count += 1
                 if count > VLLM_KV_EVENT_BUFFER_STEPS:
                     raise ValueError("vLLM KV replay exceeded its configured bound")
-                self._consume(self._sequence(frames[1]), frames[2])
+                sequence = self._sequence(frames[1])
+                if sequence < start_sequence or (
+                    previous_sequence is not None and sequence <= previous_sequence
+                ):
+                    raise ValueError("vLLM KV replay sequence is not monotonic")
+                if previous_sequence is None and sequence > start_sequence:
+                    self._invalidate()
+                    self._next_sequence = None
+                self._consume(sequence, frames[2])
+                previous_sequence = sequence
         finally:
             replay.close(linger=0)
 

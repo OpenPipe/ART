@@ -17,7 +17,12 @@ dependencies = [
 
 [project.optional-dependencies]
 plotting = ["matplotlib>=3.10.1", "seaborn>=0.13.2"]
-distributed = ["aiohttp>=3.13.0", "torchmonarch==0.2.0"]
+distributed = [
+    "aiohttp>=3.13.0",
+    "msgspec>=0.21.0",
+    "pyzmq>=27.1.0",
+    "torchmonarch==0.2.0",
+]
 
 backend = [
     "peft>=0.14.0",

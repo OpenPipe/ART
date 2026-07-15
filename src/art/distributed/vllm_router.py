@@ -149,9 +149,16 @@ def _effective_cache_salt(
 ) -> str | None:
     if config.policy_cache_key is None:
         return cache_salt
+    prefix = "art_policy_cache_salt="
+    marker = f"|{prefix}"
     if cache_salt:
-        return f"{cache_salt}|art_policy={config.policy_cache_key}"
-    return f"art_policy_cache_salt={config.policy_cache_key}"
+        if cache_salt.startswith(prefix):
+            cache_salt = None
+        else:
+            cache_salt = cache_salt.partition(marker)[0] or None
+    if cache_salt:
+        return f"{cache_salt}{marker}{config.policy_cache_key}"
+    return f"{prefix}{config.policy_cache_key}"
 
 
 def vllm_request_block_hashes(

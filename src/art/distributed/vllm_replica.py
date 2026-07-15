@@ -252,6 +252,8 @@ class ReplicaManager:
             "enable_prefix_caching": True,
             "prefix_caching_hash_algo": "sha256",
             "hash_block_size": hash_block_size,
+            "prefill_context_parallel_size": 1,
+            "decode_context_parallel_size": 1,
         }
         for key, expected in managed_args.items():
             configured = template.engine_args.get(key)
@@ -558,6 +560,8 @@ class ReplicaManager:
             "enable_prefix_caching": True,
             "prefix_caching_hash_algo": "sha256",
             "hash_block_size": self._hash_block_size,
+            "prefill_context_parallel_size": 1,
+            "decode_context_parallel_size": 1,
             "kv_events_config": kv_events_config,
             "tensor_parallel_size": parallel.tp,
             "pipeline_parallel_size": parallel.pp,

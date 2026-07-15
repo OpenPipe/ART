@@ -4815,6 +4815,8 @@ backend = [
 ]
 distributed = [
     { name = "aiohttp" },
+    { name = "msgspec" },
+    { name = "pyzmq" },
     { name = "torchmonarch" },
 ]
 langgraph = [
@@ -4912,6 +4914,7 @@ requires-dist = [
     { name = "megatron-bridge", marker = "extra == 'megatron'", git = "https://github.com/NVIDIA-NeMo/Megatron-Bridge.git?rev=e1a207ac757e5d0ed94d8ffbe1cbd28e81d8c084" },
     { name = "megatron-core", marker = "extra == 'megatron'", specifier = "==0.17.0" },
     { name = "ml-dtypes", marker = "python_full_version < '3.13' and extra == 'megatron'", specifier = ">=0.5.0" },
+    { name = "msgspec", marker = "extra == 'distributed'", specifier = ">=0.21.0" },
     { name = "nbclient", marker = "extra == 'backend'", specifier = ">=0.10.1" },
     { name = "nbmake", marker = "extra == 'backend'", specifier = ">=1.5.5" },
     { name = "nest-asyncio", specifier = ">=1.6.0" },
@@ -4934,6 +4937,7 @@ requires-dist = [
     { name = "pybind11", marker = "extra == 'megatron'", specifier = ">=2.13.6" },
     { name = "pydantic", marker = "extra == 'tinker'", specifier = ">=2.12.5" },
     { name = "pytest", marker = "extra == 'backend'", specifier = ">=8.4.1" },
+    { name = "pyzmq", marker = "extra == 'distributed'", specifier = ">=27.1.0" },
     { name = "quack-kernels", marker = "extra == 'megatron'", specifier = "==0.3.7" },
     { name = "scipy", marker = "extra == 'megatron'", specifier = ">=1.17.0" },
     { name = "seaborn", marker = "extra == 'plotting'", specifier = ">=0.13.2" },
