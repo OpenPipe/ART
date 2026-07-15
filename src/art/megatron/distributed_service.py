@@ -341,6 +341,7 @@ class DistributedMegatronService:
                 ),
                 return_exceptions=True,
             )
+            self._replica_ids = ()
             raise BaseExceptionGroup("vLLM replica startup failed", failures)
         self._base_urls = tuple(
             f"http://{replica.leader_endpoint.host}:{replica.leader_endpoint.port}"

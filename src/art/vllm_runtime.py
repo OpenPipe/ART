@@ -261,6 +261,7 @@ def _vllm_runtime_subprocess_env(
         _runtime_dir_from_bin(Path(runtime_command[0])) if runtime_command else None
     )
     if runtime_dir is not None:
+        env.pop("PYTHONPATH", None)
         nvidia_libs = sorted(
             str(path)
             for site_packages in (runtime_dir / ".venv" / "lib").glob(
