@@ -9,7 +9,7 @@ import uuid
 from pydantic import BaseModel, ConfigDict
 
 from .data_plane import PackedBatchLeaseSet, fanout_rdma_packed_batch
-from .monarch_bootstrap import monarch_identifier
+from .monarch_bootstrap import activate_child_virtualenv, monarch_identifier
 from .monarch_runtime import (
     MonarchPackedBatchInbox,
     MonarchPackedBatchSource,
@@ -89,6 +89,7 @@ class ArtRuntime:
         for index, host in enumerate(self.topology.cluster.hosts):
             proc = self.host_mesh.slice(hosts=index).spawn_procs(
                 per_host={"service": 1},
+                bootstrap=activate_child_virtualenv,
                 name=monarch_identifier(f"art_host_{self.runtime_id}_{host.host_id}"),
             )
             actor = proc.spawn(
@@ -225,6 +226,7 @@ class ArtRuntime:
         selected = self.host_mesh.slice(hosts=slice(indices[0], indices[-1] + 1))
         proc = selected.spawn_procs(
             per_host={"trainer": next(iter(counts.values()))},
+            bootstrap=activate_child_virtualenv,
             name=monarch_identifier(f"art_trainer_{self.runtime_id}_{run_spec.run_id}"),
         )
         from art.megatron.runtime.monarch import (

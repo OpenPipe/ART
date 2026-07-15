@@ -13,7 +13,6 @@ from collections.abc import Mapping, Sequence
 import hashlib
 import multiprocessing
 import os
-from pathlib import Path
 import re
 import sys
 from typing import TYPE_CHECKING, Any
@@ -112,24 +111,17 @@ def _prepare_child_environment() -> None:
     roots = [path for path in sys.path if path and os.path.isabs(path)]
     roots.extend(os.environ.get("PYTHONPATH", "").split(os.pathsep))
     os.environ["PYTHONPATH"] = os.pathsep.join(dict.fromkeys(filter(None, roots)))
-    nvidia_libs = tuple(
-        str(path)
-        for root in roots
-        for path in (Path(root) / "nvidia").glob("*/lib")
-        if path.is_dir()
-    )
-    if nvidia_libs:
-        inherited = os.environ.get("LD_LIBRARY_PATH", "").split(os.pathsep)
-        os.environ["LD_LIBRARY_PATH"] = os.pathsep.join(
-            dict.fromkeys((*nvidia_libs, *filter(None, inherited)))
-        )
-    for root in roots:
-        cudnn = Path(root) / "nvidia" / "cudnn"
-        if cudnn.is_dir():
-            os.environ.setdefault("CUDNN_HOME", str(cudnn))
-            break
+    if os.path.isfile(os.path.join(sys.prefix, "pyvenv.cfg")):
+        os.environ.setdefault("ART_VIRTUAL_ENV", sys.prefix)
     for name in _MONARCH_TIMEOUT_ENV:
         os.environ.setdefault(name, "600s")
+
+
+def activate_child_virtualenv() -> None:
+    """Restore venv identity lost when Monarch resolves the Python executable."""
+
+    if virtual_env := os.environ.get("ART_VIRTUAL_ENV"):
+        sys.prefix = sys.exec_prefix = virtual_env
 
 
 def run_worker(address: str) -> None:

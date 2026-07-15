@@ -61,7 +61,6 @@ class MegatronBackend(LocalBackend):
 
     async def _get_service(self, model: TrainableModel) -> ModelService:
         from ..dev.get_model_config import get_model_config
-        from .service import MegatronService
 
         if model.name not in self._services:
             config = get_model_config(
@@ -85,6 +84,8 @@ class MegatronBackend(LocalBackend):
                     ),
                 )
             else:
+                from .service import MegatronService
+
                 self._services[model.name] = MegatronService(
                     model_name=model.name,
                     base_model=model.base_model,

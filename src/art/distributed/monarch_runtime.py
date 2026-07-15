@@ -3,7 +3,7 @@ from __future__ import annotations
 from typing import Any
 
 from .data_plane import BatchReservation, PackedBatchRef
-from .monarch_bootstrap import monarch_identifier
+from .monarch_bootstrap import activate_child_virtualenv, monarch_identifier
 from .packing import PackingRequest, PackingResult
 from .rollout import (
     DistributedRolloutExecutor,
@@ -125,6 +125,7 @@ async def create_rollout_executor(
     for host_id, index in indices.items():
         proc = host_mesh.slice(hosts=index).spawn_procs(
             per_host={"rollout": 1},
+            bootstrap=activate_child_virtualenv,
             name=monarch_identifier(f"art_rollout_{host_id}"),
         )
         actor = proc.spawn(
