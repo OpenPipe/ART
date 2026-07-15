@@ -730,7 +730,11 @@ def execute_megatron_rl_job(
                 hybridep_token_counts=hybridep_token_counts,
             )
             train_step_s = time.perf_counter() - train_step_started
-            global_packed_train_tokens = _global_packed_train_tokens(micro_inputs)
+            workload = _rl_step_workload(
+                packed_tensors,
+                step_index=step_index,
+                grad_accumulation_sequences=global_grad_accumulation_sequences,
+            )
             print0(
                 runtime.rank,
                 "Correlation between old and new probabilities:",
@@ -740,7 +744,7 @@ def execute_megatron_rl_job(
             final_metrics = _rl_step_metrics(
                 step_result,
                 num_gradient_steps=num_steps,
-                packed_train_tokens=global_packed_train_tokens,
+                workload=workload,
                 train_step_s=train_step_s,
             )
             if runtime.rank == 0:
@@ -1299,18 +1303,22 @@ def _rl_step_metrics(
     step_result: TrainStepResult,
     *,
     num_gradient_steps: int,
-    packed_train_tokens: int,
+    workload: dict[str, int],
     train_step_s: float,
 ) -> dict[str, float]:
-    train_packed_tok_per_s = (
-        float(packed_train_tokens) / train_step_s if train_step_s > 0 else 0.0
-    )
+    rate = 1.0 / train_step_s if train_step_s > 0 else 0.0
     metrics = {
         "loss/train": step_result.reduced_loss.item(),
         "loss/grad_norm": step_result.grad_norm,
         "loss/probs_corr": step_result.probs_corr,
         TRAIN_GRADIENT_STEPS_KEY: float(num_gradient_steps),
-        "throughput/train_packed_tok_per_s": train_packed_tok_per_s,
+        "pipeline/global_real_microbatches": float(workload["real_microbatches"]),
+        "pipeline/global_dummy_microbatches": float(workload["dummy_microbatches"]),
+        "throughput/train_trainable_assistant_tok_per_s": (
+            workload["trainable_tokens"] * rate
+        ),
+        "throughput/train_nonpadding_tok_per_s": (workload["nonpadding_tokens"] * rate),
+        "throughput/train_packed_tok_per_s": workload["physical_tokens"] * rate,
     }
     if step_result.kl_policy_ref is not None:
         metrics["loss/kl_policy_ref"] = step_result.kl_policy_ref
@@ -1326,9 +1334,31 @@ def _write_job_metrics(log_path: str, metrics: dict[str, float]) -> None:
         log_file.write(log_msg + "\n")
 
 
-def _global_packed_train_tokens(micro_inputs: list[PackedTensors]) -> int:
-    local_tokens = sum(int(micro["tokens"].numel()) for micro in micro_inputs)
-    return local_tokens * ps.get_data_parallel_world_size(with_context_parallel=False)
+def _rl_step_workload(
+    packed_tensors: PackedTensors,
+    *,
+    step_index: int,
+    grad_accumulation_sequences: int,
+) -> dict[str, int]:
+    start = step_index * grad_accumulation_sequences
+    stop = min(
+        start + grad_accumulation_sequences, int(packed_tensors["tokens"].shape[0])
+    )
+    rows = slice(start, stop)
+    real_microbatches = stop - start
+    return {
+        "real_microbatches": real_microbatches,
+        "dummy_microbatches": grad_accumulation_sequences - real_microbatches,
+        "trainable_tokens": int(
+            shift_tensor(packed_tensors["assistant_mask"][rows], False).sum().item()
+        ),
+        "nonpadding_tokens": int(
+            (packed_tensors["group_ids"][rows] != -1).sum().item()
+        ),
+        "physical_tokens": (
+            grad_accumulation_sequences * int(packed_tensors["tokens"].shape[1])
+        ),
+    }
 
 
 def finalize_megatron_job(

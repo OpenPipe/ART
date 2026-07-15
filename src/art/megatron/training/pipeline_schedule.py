@@ -99,6 +99,8 @@ class PipelineScheduleTelemetry:
     pp_size: int
     vp_size: int
     num_microbatches: int
+    real_microbatches: int
+    dummy_microbatches: int
     micro_batch_size: int
     seq_length: int
     microbatch_group_size: int
@@ -130,7 +132,9 @@ class PipelineScheduleTelemetry:
             "pipeline/pp_rank": float(self.pp_rank),
             "pipeline/pp_size": float(self.pp_size),
             "pipeline/vp_size": float(self.vp_size),
-            "pipeline/num_microbatches": float(self.num_microbatches),
+            "pipeline/microbatches_per_dp_rank": float(self.num_microbatches),
+            "pipeline/real_microbatches_per_dp_rank": float(self.real_microbatches),
+            "pipeline/dummy_microbatches_per_dp_rank": float(self.dummy_microbatches),
             "pipeline/micro_batch_size": float(self.micro_batch_size),
             "pipeline/packed_sequence_length": float(self.seq_length),
             "pipeline/microbatch_group_size_per_vp_stage": float(
@@ -148,7 +152,6 @@ class PipelineScheduleTelemetry:
             ),
             "pipeline/peak_memory_bytes": float(self.peak_memory_bytes),
             "pipeline/ideal_bubble_fraction": bubble_fraction,
-            "pipeline/bubble_fraction_estimate": bubble_fraction,
         }
         for chunk, forward_compute in sorted(self.forward_compute_s_by_chunk.items()):
             backward_compute = self.backward_compute_s_by_chunk.get(chunk, 0.0)
@@ -511,6 +514,12 @@ class MCoreScheduleAdapter(Generic[_T]):
             pp_size=self.pp_size,
             vp_size=self.vp_size,
             num_microbatches=len(self.microbatches),
+            real_microbatches=sum(
+                microbatch.sample_index is not None for microbatch in self.microbatches
+            ),
+            dummy_microbatches=sum(
+                microbatch.sample_index is None for microbatch in self.microbatches
+            ),
             micro_batch_size=self.micro_batch_size,
             seq_length=self.seq_length,
             microbatch_group_size=self.microbatch_group_size,
@@ -593,11 +602,13 @@ class MCoreScheduleAdapter(Generic[_T]):
         config = get_model_config(self.model_chunks[0])
         if (
             not enabled
+            or self.pp_size <= 1
             or not self._microbatch_state.enabled
             or not _stateful_recompute_enabled(config)
         ):
             yield
             return
+        _validate_stateful_recompute_mode(config)
 
         by_state_id: dict[int, ScheduleMicrobatch[_T]] = {}
         for microbatch in self.microbatches:
@@ -607,10 +618,7 @@ class MCoreScheduleAdapter(Generic[_T]):
                     "Stateful PP recomputation requires recompute_state on every microbatch"
                 )
             previous = by_state_id.setdefault(id(state), microbatch)
-            if previous is not microbatch and (
-                previous.order != microbatch.order
-                or previous.sample_index != microbatch.sample_index
-            ):
+            if previous is not microbatch:
                 raise RuntimeError(
                     "recompute_state must identify one logical microbatch"
                 )
@@ -619,8 +627,7 @@ class MCoreScheduleAdapter(Generic[_T]):
             _module: Any, args: tuple[Any, ...], kwargs: dict[str, Any]
         ) -> None:
             microbatch = _find_bound_microbatch(by_state_id, (*args, kwargs))
-            if microbatch is not None:
-                self.activate(microbatch)
+            self.activate(microbatch)
 
         restore = torch.compiler.disable(restore)
         handles = [
@@ -766,6 +773,15 @@ def _stateful_recompute_enabled(config: Any) -> bool:
     return granularity == "selective" and bool(modules & {"mlp", "moe"})
 
 
+def _validate_stateful_recompute_mode(config: Any) -> None:
+    if getattr(config, "recompute_granularity", None) != "full":
+        raise RuntimeError(
+            "HybridEP/MoE replay requires full-layer activation recomputation under "
+            "PP; selective MLP/MoE checkpoints do not retain ART's exact microbatch "
+            "state"
+        )
+
+
 def _transformer_layer_callers(
     model_chunks: Sequence[torch.nn.Module],
 ) -> list[torch.nn.Module]:
@@ -785,9 +801,10 @@ def _transformer_layer_callers(
 def _find_bound_microbatch(
     by_state_id: dict[int, ScheduleMicrobatch[_T]],
     values: Sequence[Any],
-) -> ScheduleMicrobatch[_T] | None:
+) -> ScheduleMicrobatch[_T]:
     pending = list(values)
     seen: set[int] = set()
+    match: ScheduleMicrobatch[_T] | None = None
     while pending:
         value = pending.pop()
         value_id = id(value)
@@ -796,12 +813,21 @@ def _find_bound_microbatch(
         seen.add(value_id)
         microbatch = by_state_id.get(value_id)
         if microbatch is not None and microbatch.recompute_state is value:
-            return microbatch
+            if match is not None and match is not microbatch:
+                raise RuntimeError(
+                    "Stateful PP recomputation received multiple microbatch states: "
+                    f"orders={[match.order, microbatch.order]}"
+                )
+            match = microbatch
         if isinstance(value, dict):
             pending.extend(value.values())
         elif isinstance(value, list | tuple):
             pending.extend(value)
-    return None
+    if match is None:
+        raise RuntimeError(
+            "Stateful PP recomputation did not receive its exact microbatch state"
+        )
+    return match
 
 
 def _process_group_collection() -> ProcessGroupCollection:
