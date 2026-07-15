@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Iterable
+from hmac import compare_digest
+from ipaddress import ip_address
 import json
 import socket
 from typing import Any
@@ -34,6 +36,7 @@ _HOP_HEADERS = {
     "transfer-encoding",
     "upgrade",
 }
+_REQUEST_HEADER_DENYLIST = _HOP_HEADERS | {"authorization"}
 
 
 class _RoutingHints(BaseModel):
@@ -59,25 +62,49 @@ class VllmGateway:
         table: RoutingTable,
         *,
         upstream_headers: dict[str, str] | None = None,
+        inbound_api_key: str | None = None,
         max_queued: int = 128,
         route_timeout_s: float = 1200.0,
     ) -> None:
+        if inbound_api_key is not None and not inbound_api_key.strip():
+            raise ValueError("inbound_api_key cannot be empty")
         self.router = ReplicaRouter(table, max_queued=max_queued)
         self._policies = {table.policy_version: self.router}
         self._pinned_policies: set[str] = set()
         self._max_queued = max_queued
-        self._upstream_headers = upstream_headers or {}
+        self._upstream_headers = dict(upstream_headers or {})
+        self._required_authorization = (
+            f"Bearer {inbound_api_key}"
+            if inbound_api_key is not None
+            else next(
+                (
+                    value
+                    for key, value in self._upstream_headers.items()
+                    if key.lower() == "authorization"
+                ),
+                None,
+            )
+        )
         self._route_timeout_s = route_timeout_s
         self._runner: web.AppRunner | None = None
         self._socket: socket.socket | None = None
         self._session: ClientSession | None = None
         self._telemetry_task: asyncio.Task[None] | None = None
 
-    async def start(self, bind_host: str, port: int = 0) -> int:
+    async def start(self, bind_host: str = "127.0.0.1", port: int = 0) -> int:
         if self._runner is not None:
             raise RuntimeError("vLLM gateway is already running")
-        app = web.Application(client_max_size=64 << 20)
-        app.router.add_route("*", "/{path_info:.*}", self._handle)
+        if not _is_loopback(bind_host) and self._required_authorization is None:
+            raise ValueError(
+                "a non-loopback vLLM gateway requires inbound authentication"
+            )
+        app = web.Application(
+            client_max_size=64 << 20, middlewares=(self._authenticate,)
+        )
+        for path in _ROUTED_PATHS:
+            app.router.add_post(path, self._handle)
+        app.router.add_get("/art/metrics", self._handle, allow_head=False)
+        app.router.add_get("/health", self._handle, allow_head=False)
         self._runner = web.AppRunner(app, access_log=None)
         await self._runner.setup()
         sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -94,6 +121,17 @@ class VllmGateway:
         )
         self._telemetry_task = asyncio.create_task(self._refresh_telemetry())
         return int(sock.getsockname()[1])
+
+    @web.middleware
+    async def _authenticate(
+        self, request: web.Request, handler: Any
+    ) -> web.StreamResponse:
+        expected = self._required_authorization
+        if expected is not None and not compare_digest(
+            request.headers.get("Authorization", ""), expected
+        ):
+            raise web.HTTPUnauthorized(headers={"WWW-Authenticate": "Bearer"})
+        return await handler(request)
 
     async def commit(
         self,
@@ -138,7 +176,6 @@ class VllmGateway:
     async def _handle(self, request: web.Request) -> web.StreamResponse:
         if self._session is None:
             raise web.HTTPServiceUnavailable(text="gateway is not ready")
-        body = await request.read()
         path = request.path
         if path == "/art/metrics":
             return web.json_response({"metrics": await self._aggregate_metrics()})
@@ -147,9 +184,7 @@ class VllmGateway:
                 raise web.HTTPServiceUnavailable(text="a replica is not routable")
             await self._require_all_healthy()
             return web.Response()
-        if path not in _ROUTED_PATHS:
-            replica = self.router.table.replicas[0]
-            return await self._proxy(request, body, replica.endpoint.url)
+        body = await request.read()
         try:
             payload = json.loads(body)
             version = _policy_version(payload)
@@ -185,10 +220,10 @@ class VllmGateway:
         headers = {
             key: value
             for key, value in request.headers.items()
-            if key.lower() not in _HOP_HEADERS
+            if key.lower() not in _REQUEST_HEADER_DENYLIST
         }
         headers.update(self._upstream_headers)
-        url = f"{endpoint.rstrip('/')}{request.rel_url}"
+        url = f"{endpoint.rstrip('/')}{request.path}"
         async with self._session.request(
             request.method,
             url,
@@ -320,3 +355,12 @@ def _routing_input(payload: dict[str, Any], table: RoutingTable) -> RoutingInput
 def _policy_version(payload: dict[str, Any]) -> str:
     model = str(payload["model"])
     return model.rsplit("@", 1)[-1] if "@" in model else model
+
+
+def _is_loopback(host: str) -> bool:
+    if host == "localhost":
+        return True
+    try:
+        return ip_address(host).is_loopback
+    except ValueError:
+        return False
