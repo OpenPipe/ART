@@ -176,22 +176,45 @@ async def wrap_trajectories_awaitable(
 
 
 def record_metrics(context: "GatherContext", trajectory: Trajectory) -> None:
-    logprobs = [
-        message_or_choice.logprobs
-        for message_or_choice in trajectory.messages_and_choices
-        if isinstance(message_or_choice, Choice)
-        if message_or_choice.logprobs
-    ]
-    if logprobs:
-        # TODO: probably shouldn't average this
-        trajectory.metrics["completion_tokens"] = sum(
-            len(l.content or l.refusal or [])
-            for l in logprobs  # noqa: E741
-        ) / len(logprobs)
+    if trajectory.exchanges:
+        completion_tokens = _exchange_completion_tokens(trajectory)
+        if completion_tokens is not None:
+            trajectory.metrics["completion_tokens"] = completion_tokens
+    else:
+        logprobs = [
+            message_or_choice.logprobs
+            for message_or_choice in trajectory.messages_and_choices
+            if isinstance(message_or_choice, Choice)
+            if message_or_choice.logprobs
+        ]
+        if logprobs:
+            trajectory.metrics["completion_tokens"] = sum(
+                len(logprob.content or logprob.refusal or []) for logprob in logprobs
+            )
     context.metric_sums["reward"] += trajectory.reward
     context.metric_divisors["reward"] += 1
     context.metric_sums.update(trajectory.metrics)
     context.metric_divisors.update(trajectory.metrics.keys())
+
+
+def _exchange_completion_tokens(trajectory: Trajectory) -> int | None:
+    counts: list[int | None] = []
+    for exchange in trajectory.exchanges.chat_completions:
+        usage = exchange.response.usage
+        counts.append(usage.completion_tokens if usage is not None else None)
+    for exchange in trajectory.exchanges.completions:
+        usage = exchange.response.usage
+        counts.append(usage.completion_tokens if usage is not None else None)
+    for exchange in trajectory.exchanges.responses:
+        usage = exchange.response.usage
+        counts.append(usage.output_tokens if usage is not None else None)
+    counts.extend(
+        exchange.response.usage.output_tokens
+        for exchange in trajectory.exchanges.messages
+    )
+    if not counts or any(count is None for count in counts):
+        return None
+    return sum(count for count in counts if count is not None)
 
 
 @dataclass

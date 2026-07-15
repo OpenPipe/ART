@@ -18,7 +18,14 @@ import pytest_asyncio
 import requests
 
 import art
-from art.trajectories import ChatCompletionsExchange, MessagesExchange, _compat
+from art.gather import GatherContext, record_metrics
+from art.trajectories import (
+    ChatCompletionsExchange,
+    CompletionsExchange,
+    MessagesExchange,
+    ResponsesExchange,
+    _compat,
+)
 from art.trajectories._capture.core import begin, reset
 from art.trajectories._protocols import Endpoint, build_exchange, endpoint_for_url
 
@@ -46,6 +53,7 @@ CHAT: dict[str, Any] = {
             "prompt_token_ids": [1],
         }
     ],
+    "usage": {"prompt_tokens": 1, "completion_tokens": 2, "total_tokens": 3},
 }
 
 COMPLETION: dict[str, Any] = {
@@ -68,6 +76,7 @@ COMPLETION: dict[str, Any] = {
             },
         }
     ],
+    "usage": {"prompt_tokens": 1, "completion_tokens": 3, "total_tokens": 4},
 }
 
 RESPONSE: dict[str, Any] = {
@@ -94,6 +103,13 @@ RESPONSE: dict[str, Any] = {
     "parallel_tool_calls": True,
     "tool_choice": "auto",
     "tools": [],
+    "usage": {
+        "input_tokens": 1,
+        "input_tokens_details": {"cached_tokens": 0},
+        "output_tokens": 4,
+        "output_tokens_details": {"reasoning_tokens": 0},
+        "total_tokens": 5,
+    },
     "raw_output_tokens": [{"token_id": 2, "logprob": -0.2}],
 }
 
@@ -388,6 +404,89 @@ def test_all_protocols_reconstruct_typed_responses() -> None:
         exchange.request["model"] = "updated/model"
         assert exchange.model == "updated/model"
         assert exchange.model_dump(mode="json")["model"] == "updated/model"
+
+
+def test_gather_metrics_sum_legacy_and_exchange_completion_tokens() -> None:
+    now = datetime.now()
+    chat = build_exchange(
+        "chat_completions",
+        {"model": "test/model", "messages": []},
+        json.dumps(CHAT).encode(),
+        start_time=now,
+        end_time=now,
+    )
+    completion = build_exchange(
+        "completions",
+        {"model": "test/model", "prompt": "hi"},
+        json.dumps(COMPLETION).encode(),
+        start_time=now,
+        end_time=now,
+    )
+    response = build_exchange(
+        "responses",
+        {"model": "test/model", "input": "hi"},
+        json.dumps(RESPONSE).encode(),
+        start_time=now,
+        end_time=now,
+    )
+    message = build_exchange(
+        "messages",
+        {"model": "test/model", "messages": []},
+        json.dumps(MESSAGE).encode(),
+        start_time=now,
+        end_time=now,
+    )
+    assert isinstance(chat, ChatCompletionsExchange)
+    assert isinstance(completion, CompletionsExchange)
+    assert isinstance(response, ResponsesExchange)
+    assert isinstance(message, MessagesExchange)
+
+    trajectory = art.Trajectory(
+        exchanges=art.TrajectoryExchanges(
+            chat_completions=[chat],
+            completions=[completion],
+            responses=[response],
+            messages=[message],
+        )
+    )
+    record_metrics(GatherContext(), trajectory)
+    assert trajectory.metrics["completion_tokens"] == 10
+
+    first = chat.response.choices[0]
+    second = first.model_copy(deep=True)
+    assert second.logprobs is not None and second.logprobs.content is not None
+    second.logprobs.content *= 2
+    legacy = art.Trajectory(messages_and_choices=[first, second])
+    record_metrics(GatherContext(), legacy)
+    assert legacy.metrics["completion_tokens"] == 3
+
+
+def test_gather_metrics_omit_partial_exchange_usage() -> None:
+    now = datetime.now()
+    chat = build_exchange(
+        "chat_completions",
+        {"model": "test/model", "messages": []},
+        json.dumps(CHAT).encode(),
+        start_time=now,
+        end_time=now,
+    )
+    message = build_exchange(
+        "messages",
+        {"model": "test/model", "messages": []},
+        json.dumps(MESSAGE).encode(),
+        start_time=now,
+        end_time=now,
+    )
+    assert isinstance(chat, ChatCompletionsExchange)
+    assert isinstance(message, MessagesExchange)
+    chat.response.usage = None
+    trajectory = art.Trajectory(
+        exchanges=art.TrajectoryExchanges(chat_completions=[chat], messages=[message])
+    )
+
+    record_metrics(GatherContext(), trajectory)
+
+    assert "completion_tokens" not in trajectory.metrics
 
 
 @pytest.mark.parametrize(
