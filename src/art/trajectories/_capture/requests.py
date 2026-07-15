@@ -27,7 +27,7 @@ def install() -> None:
         if state is not None:
             state.status_code = response.status_code
             setattr(response, _STATE, state)
-            if not kwargs.get("stream", False):
+            if not kwargs.get("stream", self.stream):
                 state.add(response.content)
                 state.finish()
         return response

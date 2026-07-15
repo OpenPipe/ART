@@ -40,6 +40,15 @@ class _CapturedStream:
     async def readline(self) -> bytes:
         return self._record(await self._stream.readline())
 
+    async def readexactly(self, n: int) -> bytes:
+        return self._record(await self._stream.readexactly(n))
+
+    async def readuntil(self, separator: bytes = b"\n") -> bytes:
+        return self._record(await self._stream.readuntil(separator))
+
+    def read_nowait(self, n: int = -1) -> bytes:
+        return self._record(self._stream.read_nowait(n))
+
     async def readchunk(self) -> tuple[bytes, bool]:
         return self._record(await self._stream.readchunk())
 
@@ -61,6 +70,21 @@ class _CapturedStream:
 
     def iter_chunked(self, size: int) -> AsyncIterator[bytes]:
         return self._iterate(self._stream.iter_chunked(size))
+
+    async def _iterate_chunks(
+        self, iterator: AsyncIterator[tuple[bytes, bool]]
+    ) -> AsyncIterator[tuple[bytes, bool]]:
+        completed = False
+        try:
+            async for chunk in iterator:
+                yield self._record(chunk)
+            completed = True
+        finally:
+            if completed or self._state.request.get("stream") is True:
+                self._state.finish()
+
+    def iter_chunks(self) -> AsyncIterator[tuple[bytes, bool]]:
+        return self._iterate_chunks(self._stream.iter_chunks())
 
 
 def install() -> None:

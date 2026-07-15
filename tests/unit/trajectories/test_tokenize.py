@@ -5,7 +5,7 @@ import math
 from types import SimpleNamespace
 from typing import Any
 
-from anthropic.types import Message
+from anthropic.types import ImageBlockParam, Message, MessageParam
 from openai.types import Completion
 from openai.types.chat import ChatCompletion
 from openai.types.chat.chat_completion_token_logprob import ChatCompletionTokenLogprob
@@ -436,6 +436,118 @@ def test_choice_logprobs_survive_tokenizer_fallback(
     assert math.isnan(result.logprobs[2])
 
 
+def test_ambiguous_visible_logprobs_fail_closed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    exchange = _chat_exchange([], [])
+    logprobs = exchange.response.choices[0].logprobs
+    assert logprobs is not None
+    exchange.response.choices[0].logprobs = logprobs.model_copy(
+        update={
+            "content": [
+                ChatCompletionTokenLogprob(
+                    token="answer",
+                    logprob=-0.7,
+                    bytes=list(b"answer"),
+                    top_logprobs=[],
+                )
+            ]
+        }
+    )
+
+    class Tokenizer:
+        def apply_chat_template(
+            self, messages: list[dict[str, Any]], **kwargs: object
+        ) -> list[int]:
+            del kwargs
+            return [10, 11, 12, 11] if messages[-1]["role"] == "assistant" else [10]
+
+        def __call__(self, text: str, **kwargs: object) -> SimpleNamespace:
+            del text, kwargs
+            return SimpleNamespace(input_ids=[11])
+
+    monkeypatch.setattr(
+        "art.trajectories._tokenize._load_tokenizer", lambda _config: Tokenizer()
+    )
+    result = art.tokenize_trajectory(
+        art.Trajectory(exchanges=TrajectoryExchanges(chat_completions=[exchange])),
+        base_model="base/model",
+    )
+
+    assert result.token_ids == [10, 11, 12, 11]
+    assert all(math.isnan(logprob) for logprob in result.logprobs[1:])
+
+
+def test_legacy_logprob_mismatch_fails_closed() -> None:
+    exchange = _chat_exchange([1], [2, 3])
+    choice = exchange.response.choices[0]
+    assert choice.logprobs is not None
+    content = choice.logprobs.content
+    assert content
+    choice.logprobs = choice.logprobs.model_copy(
+        update={
+            "content": [
+                content[0].model_copy(
+                    update={"token": "answer", "bytes": list(b"answer")}
+                )
+            ]
+        }
+    )
+
+    result = art.tokenize_trajectory(
+        art.Trajectory(messages_and_choices=[choice]),
+    )
+
+    assert result.token_ids == [1, 2, 3]
+    assert len(result.logprobs) == len(result.token_ids)
+    assert all(math.isnan(logprob) for logprob in result.logprobs)
+
+
+def test_anthropic_fallback_rejects_unknown_content_blocks(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    response = Message.model_validate(
+        {
+            "id": "msg_1",
+            "type": "message",
+            "role": "assistant",
+            "model": "test/model",
+            "content": [{"type": "text", "text": "answer"}],
+            "stop_reason": "end_turn",
+            "stop_sequence": None,
+            "usage": {"input_tokens": 1, "output_tokens": 1},
+        }
+    )
+    start = datetime(2026, 1, 1)
+    image: ImageBlockParam = {
+        "type": "image",
+        "source": {
+            "type": "base64",
+            "media_type": "image/png",
+            "data": "...",
+        },
+    }
+    message: MessageParam = {"role": "user", "content": [image]}
+    exchange = MessagesExchange(
+        request=MessagesRequest(
+            model="test/model",
+            messages=[message],
+        ),
+        response=response,
+        start_time=start,
+        end_time=start + timedelta(seconds=1),
+    )
+    monkeypatch.setattr(
+        "art.trajectories._tokenize._load_tokenizer", lambda _config: _FakeTokenizer()
+    )
+
+    with pytest.raises(ValueError, match="Unsupported Anthropic content block"):
+        art.tokenize_trajectory(
+            art.Trajectory(exchanges=TrajectoryExchanges(messages=[exchange])),
+            base_model="base/model",
+        )
+
+
 def test_undecodable_visible_token_bytes_fall_back_to_nan(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -633,29 +745,40 @@ def test_responses_rejects_only_unrenderable_prompt_history(
         def apply_chat_template(
             self, messages: list[dict[str, Any]], **kwargs: object
         ) -> list[int]:
-            del messages, kwargs
-            return [10]
+            del kwargs
+            assistant_count = sum(
+                message["role"] == "assistant" for message in messages
+            )
+            return [10, *range(2, 2 + assistant_count)]
 
     monkeypatch.setattr(
         "art.trajectories._tokenize._load_tokenizer", lambda _config: Tokenizer()
     )
     request_reasoning = _response_exchange("request-reasoning", 2)
     request_reasoning.request["input"] = [
-        {"id": "reasoning-1", "summary": [], "type": "reasoning"}
+        {
+            "id": "reasoning-1",
+            "summary": [{"type": "summary_text", "text": "request thought"}],
+            "type": "reasoning",
+        }
     ]
 
     response_reasoning = _response_exchange("response-reasoning", 2)
     data = response_reasoning.response.model_dump(mode="python")
-    data["output"] = [{"id": "reasoning-2", "summary": [], "type": "reasoning"}]
+    data["output"] = [
+        {
+            "id": "reasoning-2",
+            "summary": [{"type": "summary_text", "text": "response thought"}],
+            "type": "reasoning",
+        }
+    ]
+    data.pop("raw_output_tokens", None)
     response_reasoning.response = Response.model_validate(data)
 
-    with pytest.raises(ValueError, match="Unsupported Responses input"):
-        art.tokenize_trajectory(
-            art.Trajectory(
-                exchanges=TrajectoryExchanges(responses=[request_reasoning])
-            ),
-            base_model="base/model",
-        )
+    art.tokenize_trajectory(
+        art.Trajectory(exchanges=TrajectoryExchanges(responses=[request_reasoning])),
+        base_model="base/model",
+    )
 
     single = art.Trajectory(
         exchanges=TrajectoryExchanges(responses=[response_reasoning])
@@ -671,15 +794,98 @@ def test_responses_rejects_only_unrenderable_prompt_history(
         previous_response_id=response_reasoning.response.id,
         offset=1,
     )
-    with pytest.raises(ValueError, match="Unsupported Responses output"):
+    assert art.tokenize_trajectory(
+        art.Trajectory(
+            exchanges=TrajectoryExchanges(responses=[response_reasoning, continuation])
+        ),
+        base_model="base/model",
+    ).token_ids == [10, 2, 3]
+
+
+def test_responses_opaque_reasoning_requires_exact_tokens(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    exchange = _response_exchange("opaque-reasoning", 2)
+    response = exchange.response.model_dump(mode="python")
+    response["output"] = [
+        {
+            "id": "reasoning-1",
+            "encrypted_content": "opaque",
+            "summary": [],
+            "type": "reasoning",
+        }
+    ]
+    exchange.response = Response.model_validate(response)
+    monkeypatch.setattr(
+        "art.trajectories._tokenize._load_tokenizer", lambda _config: _FakeTokenizer()
+    )
+
+    assert art.tokenize_trajectory(
+        art.Trajectory(exchanges=TrajectoryExchanges(responses=[exchange])),
+        base_model="base/model",
+    ).token_ids == [10, 2]
+
+    response = exchange.response.model_dump(mode="python")
+    response.pop("raw_output_tokens", None)
+    exchange.response = Response.model_validate(response)
+    with pytest.raises(ValueError, match="no renderable text"):
         art.tokenize_trajectory(
-            art.Trajectory(
-                exchanges=TrajectoryExchanges(
-                    responses=[response_reasoning, continuation]
-                )
-            ),
+            art.Trajectory(exchanges=TrajectoryExchanges(responses=[exchange])),
             base_model="base/model",
         )
+
+
+def test_responses_parallel_function_calls_form_one_assistant_turn(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    exchange = _response_exchange("parallel-tools", 2)
+    exchange.request["input"] = [
+        {
+            "id": "reasoning-1",
+            "summary": [{"type": "summary_text", "text": "think"}],
+            "type": "reasoning",
+        },
+        {"type": "function_call", "call_id": "one", "name": "first", "arguments": "{}"},
+        {
+            "type": "function_call",
+            "call_id": "two",
+            "name": "second",
+            "arguments": "{}",
+        },
+    ]
+    seen: list[list[dict[str, Any]]] = []
+
+    class Tokenizer(_FakeTokenizer):
+        def apply_chat_template(
+            self, messages: list[dict[str, Any]], **kwargs: object
+        ) -> list[int]:
+            seen.append(messages)
+            return super().apply_chat_template(messages, **kwargs)
+
+    monkeypatch.setattr(
+        "art.trajectories._tokenize._load_tokenizer", lambda _config: Tokenizer()
+    )
+    art.tokenize_trajectory(
+        art.Trajectory(exchanges=TrajectoryExchanges(responses=[exchange])),
+        base_model="base/model",
+    )
+
+    assistant = seen[0][0]
+    assert assistant["reasoning"] == "think"
+    assert [call["function"]["name"] for call in assistant["tool_calls"]] == [
+        "first",
+        "second",
+    ]
+
+
+def test_tokenization_rejects_mutated_mixed_representation() -> None:
+    trajectory = art.Trajectory(
+        messages_and_choices=[{"role": "user", "content": "hi"}]
+    )
+    trajectory.exchanges.chat_completions.append(_chat_exchange([1], [2]))
+
+    with pytest.raises(ValueError, match="both exchanges and legacy histories"):
+        art.tokenize_trajectory(trajectory)
 
 
 def test_responses_previous_response_id_resolves_local_history(

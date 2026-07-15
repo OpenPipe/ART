@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import AsyncGenerator, AsyncIterator, Generator
+import copy
 from datetime import datetime, timedelta
 import json
 from typing import Any, cast
@@ -26,7 +27,7 @@ from art.trajectories import (
     ResponsesExchange,
     _compat,
 )
-from art.trajectories._capture.core import begin, reset
+from art.trajectories._capture.core import _append_exchange, begin, reset
 from art.trajectories._protocols import Endpoint, build_exchange, endpoint_for_url
 
 CHAT: dict[str, Any] = {
@@ -230,6 +231,32 @@ def test_sync_group_generator_initializes_once(
     assert initializer.call_count == 1
 
 
+def test_group_pydantic_round_trip_restores_trajectories_and_exceptions() -> None:
+    group = art.TrajectoryGroup(
+        [art.Trajectory(reward=1)],
+        exceptions=[ValueError("boom")],
+        metadata={"source": "test"},
+    )
+    payload = group.model_dump()
+
+    restored = art.TrajectoryGroup.model_validate_json(group.model_dump_json())
+
+    assert isinstance(restored, art.TrajectoryGroup)
+    assert restored.model_dump() == payload
+    assert art.TrajectoryGroup.model_validate(payload).model_dump() == payload
+    assert art.TrajectoryGroup(**payload).model_dump() == payload
+
+
+def test_group_copy_preserves_subclass() -> None:
+    class Group(art.TrajectoryGroup):
+        pass
+
+    group = Group([art.Trajectory(reward=1)])
+
+    assert type(copy.copy(group)) is Group
+    assert type(copy.deepcopy(group)) is Group
+
+
 async def test_httpx_requests_and_aiohttp_capture_once(endpoint_server: str) -> None:
     body = {"model": "test/model", "messages": [{"role": "user", "content": "hi"}]}
 
@@ -262,6 +289,52 @@ async def test_httpx_requests_and_aiohttp_capture_once(endpoint_server: str) -> 
         exchange.response.choices[0].message.content == "hello"
         for exchange in trajectory.exchanges.chat_completions
     )
+
+
+async def test_aiohttp_capture_covers_stream_reader_consumption_methods(
+    endpoint_server: str,
+) -> None:
+    body = {"model": "test/model", "messages": [{"role": "user", "content": "hi"}]}
+
+    with art.Trajectory() as trajectory:
+        async with aiohttp.ClientSession() as session:
+            async with session.post(
+                f"{endpoint_server}/chat/completions", json=body
+            ) as response:
+                await response.content.readexactly(1)
+                await response.content.read()
+            async with session.post(
+                f"{endpoint_server}/chat/completions", json=body
+            ) as response:
+                await response.content.readuntil(b"}")
+                await response.content.read()
+            async with session.post(
+                f"{endpoint_server}/chat/completions", json=body
+            ) as response:
+                async for _chunk, _end_of_http_chunk in response.content.iter_chunks():
+                    pass
+
+    assert len(trajectory.exchanges.chat_completions) == 3
+
+
+async def test_requests_session_stream_default_is_preserved(
+    endpoint_server: str,
+) -> None:
+    body = {"model": "test/model", "messages": [{"role": "user", "content": "hi"}]}
+
+    def consume(trajectory: art.Trajectory) -> None:
+        session = requests.Session()
+        session.stream = True
+        response = session.post(
+            f"{endpoint_server}/chat/completions", json=body, timeout=5
+        )
+        assert not trajectory.exchanges
+        list(response.iter_content())
+
+    with art.Trajectory() as trajectory:
+        await asyncio.to_thread(consume, trajectory)
+
+    assert len(trajectory.exchanges.chat_completions) == 1
 
 
 async def test_native_openai_and_anthropic_sdks(endpoint_server: str) -> None:
@@ -672,6 +745,51 @@ def test_streaming_chat_choices_are_accumulated_by_index() -> None:
     ]
 
 
+def test_streaming_chat_ignores_keepalives_and_azure_prologue() -> None:
+    chunk = {
+        "id": "chatcmpl-1",
+        "object": "chat.completion.chunk",
+        "created": 1,
+        "model": "test/model",
+        "choices": [
+            {
+                "index": 0,
+                "delta": {"role": "assistant", "content": "hello"},
+                "finish_reason": "stop",
+                "logprobs": None,
+            }
+        ],
+    }
+    body = _sse(
+        [
+            (None, "ping"),
+            (None, {"id": "", "object": "", "created": 0, "model": "", "choices": []}),
+            (None, chunk),
+            (None, "[DONE]"),
+        ]
+    )
+
+    exchange = build_exchange(
+        "chat_completions",
+        {"model": "test/model", "messages": [], "stream": True},
+        body,
+        start_time=datetime.now(),
+        end_time=datetime.now(),
+    )
+
+    assert isinstance(exchange, ChatCompletionsExchange)
+    assert exchange.response.choices[0].message.content == "hello"
+
+    with pytest.raises(json.JSONDecodeError):
+        build_exchange(
+            "chat_completions",
+            {"model": "test/model", "messages": [], "stream": True},
+            _sse([(None, "corrupt"), (None, chunk), (None, "[DONE]")]),
+            start_time=datetime.now(),
+            end_time=datetime.now(),
+        )
+
+
 def test_trajectory_rejects_mixed_representations() -> None:
     exchange = build_exchange(
         "chat_completions",
@@ -686,6 +804,24 @@ def test_trajectory_rejects_mixed_representations() -> None:
             exchanges=art.TrajectoryExchanges(chat_completions=[exchange]),
             messages_and_choices=[{"role": "user", "content": "hi"}],
         )
+
+
+def test_capture_does_not_mix_exchange_and_legacy_representations() -> None:
+    exchange = build_exchange(
+        "chat_completions",
+        {"model": "test/model", "messages": []},
+        json.dumps(CHAT).encode(),
+        start_time=datetime.now(),
+        end_time=datetime.now(),
+    )
+    assert isinstance(exchange, ChatCompletionsExchange)
+    trajectory = art.Trajectory(
+        messages_and_choices=[{"role": "user", "content": "hi"}]
+    )
+
+    _append_exchange(trajectory, exchange)
+
+    assert not trajectory.exchanges
 
 
 def test_metadata_accepts_json_serializable_values() -> None:

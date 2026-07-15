@@ -295,6 +295,32 @@ def test_completions_history_preserves_exact_tokens_and_sampled_spans() -> None:
         history.as_chat_completions_history()
 
 
+def test_completions_history_uses_request_token_ids_and_rejects_echo() -> None:
+    exchange = _completion([1], [2])
+    response = exchange.response.model_dump(mode="python")
+    response["choices"][0].pop("prompt_token_ids")
+    exchange.response = Completion.model_validate(response)
+    trajectory = art.Trajectory(exchanges=TrajectoryExchanges(completions=[exchange]))
+
+    assert trajectory.completions_history().token_ids == [1, 2]
+
+    exchange.request["echo"] = True
+    with pytest.raises(ValueError, match="echo=True"):
+        trajectory.completions_history()
+
+
+def test_history_rejects_mutated_mixed_representation() -> None:
+    trajectory = art.Trajectory(
+        messages_and_choices=[{"role": "user", "content": "hi"}]
+    )
+    trajectory.exchanges.chat_completions.append(
+        _chat([{"role": "user", "content": "hi"}], "hello")
+    )
+
+    with pytest.raises(ValueError, match="both exchanges and legacy histories"):
+        trajectory.history()
+
+
 def test_legacy_messages_delegate_through_history() -> None:
     trajectory = art.Trajectory(
         messages_and_choices=[{"role": "user", "content": "hello"}]

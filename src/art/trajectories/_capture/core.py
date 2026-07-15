@@ -59,6 +59,13 @@ class CaptureState:
 
 
 def _append_exchange(trajectory: Trajectory, exchange: Exchange) -> None:
+    if (
+        trajectory.messages_and_choices
+        or trajectory.tools is not None
+        or trajectory.additional_histories
+    ):
+        logger.debug("Ignoring exchange captured into a legacy trajectory")
+        return
     if isinstance(exchange, ChatCompletionsExchange):
         trajectory.exchanges.chat_completions.append(exchange)
     elif isinstance(exchange, CompletionsExchange):

@@ -17,10 +17,12 @@ _PREPARED_TRAJECTORIES = "_art_prepared_trajectories"
 
 
 def exception_model(
-    exception: BaseException | PydanticException,
+    exception: object,
 ) -> PydanticException:
     if isinstance(exception, PydanticException):
         return exception
+    if not isinstance(exception, BaseException):
+        return PydanticException.model_validate(exception)
     return PydanticException(
         type=str(type(exception)),
         message=str(exception),
@@ -33,7 +35,7 @@ def exception_model(
 
 
 async def _legacy_async_group(
-    items: list[Awaitable[Trajectory]],
+    items: list[Awaitable[object]],
     *,
     exceptions: Iterable[BaseException | PydanticException],
     metadata: dict[str, MetadataValue] | None,
@@ -48,8 +50,13 @@ async def _legacy_async_group(
     for future in asyncio.as_completed(items):
         try:
             item = await future
-            trajectories.append(item)
-            record_metrics(context, item)
+            trajectory = (
+                item
+                if isinstance(item, Trajectory)
+                else Trajectory.model_validate(item)
+            )
+            trajectories.append(trajectory)
+            record_metrics(context, trajectory)
             context.update_pbar(n=1)
         except BaseException as exc:
             captured_exceptions.append(exc)
@@ -79,7 +86,7 @@ class _LegacyGroupCoroutine(Awaitable[TrajectoryGroup]):
 
 def new_trajectory_group(
     cls: type[TrajectoryGroup],
-    trajectories: Iterable[Trajectory | BaseException | Awaitable[Trajectory]],
+    trajectories: Iterable[object],
     *,
     exceptions: Iterable[BaseException | PydanticException],
     metadata: dict[str, MetadataValue] | None,
@@ -87,9 +94,7 @@ def new_trajectory_group(
     logs: list[str] | None,
 ) -> TrajectoryGroup | Awaitable[TrajectoryGroup]:
     items = list(trajectories)
-    awaitables = [
-        item for item in items if not isinstance(item, (Trajectory, BaseException))
-    ]
+    awaitables = [item for item in items if isinstance(item, Awaitable)]
     if awaitables:
         if len(awaitables) != len(items):
             raise TypeError("TrajectoryGroup cannot mix trajectories and awaitables")
@@ -108,28 +113,23 @@ def new_trajectory_group(
             ),
             len(items),
         )
-    sync_items = [
-        item for item in items if isinstance(item, (Trajectory, BaseException))
-    ]
-    if len(sync_items) != len(items):
-        raise TypeError("TrajectoryGroup items must be trajectories or exceptions")
     group = object.__new__(cls)
-    object.__setattr__(group, _PREPARED_TRAJECTORIES, sync_items)
+    object.__setattr__(group, _PREPARED_TRAJECTORIES, items)
     return group
 
 
 def init_trajectory_group(
     group: TrajectoryGroup,
-    trajectories: Iterable[Trajectory | BaseException | Awaitable[Trajectory]],
+    trajectories: Iterable[object],
     *,
-    exceptions: Iterable[BaseException | PydanticException],
+    exceptions: Iterable[object],
     metadata: dict[str, MetadataValue] | None,
     metrics: dict[str, float | int | bool] | None,
     logs: list[str] | None,
 ) -> None:
     prepared = group.__dict__.pop(_PREPARED_TRAJECTORIES, None)
     items = prepared if isinstance(prepared, list) else list(trajectories)
-    if not all(isinstance(item, (Trajectory, BaseException)) for item in items):
+    if any(isinstance(item, Awaitable) for item in items):
         raise TypeError("TrajectoryGroup cannot initialize from awaitables")
     normalized_trajectories = [
         item if isinstance(item, Trajectory) else Trajectory.model_validate(item)
@@ -154,7 +154,7 @@ def init_trajectory_group(
 
 
 def copy_trajectory_group(group: TrajectoryGroup) -> TrajectoryGroup:
-    copied = TrajectoryGroup(
+    copied = group.__class__(
         group.trajectories[:],
         metadata=group.metadata.copy(),
         metrics=group.metrics.copy(),
@@ -168,11 +168,11 @@ def deepcopy_trajectory_group(
     group: TrajectoryGroup, memo: dict[int, object] | None
 ) -> TrajectoryGroup:
     memo = {} if memo is None else memo
-    if existing := memo.get(id(group)):
+    if (existing := memo.get(id(group))) is not None:
         if not isinstance(existing, TrajectoryGroup):
             raise TypeError("TrajectoryGroup deepcopy memo contains an invalid value")
         return existing
-    copied = TrajectoryGroup(
+    copied = group.__class__(
         copy.deepcopy(group.trajectories, memo),
         metadata=copy.deepcopy(group.metadata, memo),
         metrics=copy.deepcopy(group.metrics, memo),

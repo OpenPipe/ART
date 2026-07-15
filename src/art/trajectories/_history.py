@@ -100,6 +100,17 @@ def _model(exchange: _ModelledExchange) -> str:
     return exchange.model
 
 
+def _require_unmixed(trajectory: Trajectory) -> None:
+    if trajectory.exchanges and (
+        trajectory.messages_and_choices
+        or trajectory.tools is not None
+        or trajectory.additional_histories
+    ):
+        raise ValueError(
+            "A trajectory cannot contain both exchanges and legacy histories"
+        )
+
+
 def legacy_as_chat_completions_history(history: History) -> ChatCompletionsHistory:
     return ChatCompletionsHistory(
         model=None,
@@ -111,6 +122,7 @@ def legacy_as_chat_completions_history(history: History) -> ChatCompletionsHisto
 def chat_completions_history(
     trajectory: Trajectory, *, model: str | None
 ) -> ChatCompletionsHistory:
+    _require_unmixed(trajectory)
     if not trajectory.exchanges:
         if trajectory.additional_histories:
             raise ValueError("Trajectory contains multiple legacy histories")
@@ -152,6 +164,7 @@ def chat_completions_history(
 def anthropic_messages_history(
     trajectory: Trajectory, *, model: str | None
 ) -> AnthropicMessagesHistory:
+    _require_unmixed(trajectory)
     exchanges = _select(trajectory.exchanges.messages, model, "Anthropic Messages")
     _require_context(
         [exchange.request for exchange in exchanges],
@@ -198,6 +211,7 @@ def _responses_input(value: object) -> list[object]:
 
 
 def responses_history(trajectory: Trajectory, *, model: str | None) -> ResponsesHistory:
+    _require_unmixed(trajectory)
     exchanges = _select(trajectory.exchanges.responses, model, "Responses")
     _require_context(
         [exchange.request for exchange in exchanges],
@@ -241,15 +255,23 @@ def responses_history(trajectory: Trajectory, *, model: str | None) -> Responses
 def completions_history(
     trajectory: Trajectory, *, model: str | None
 ) -> CompletionsHistory:
-    from ._tokenize import _completion_tokens
+    from ._tokenize import _completion_tokens, _exact_token_ids
 
+    _require_unmixed(trajectory)
     exchanges = _select(trajectory.exchanges.completions, model, "Completions")
     _require_context([exchange.request for exchange in exchanges], ("cache_salt",))
     token_ids: list[int] = []
     sampled_spans: list[tuple[int, int]] = []
     for index, exchange in enumerate(exchanges):
         _only_choice(exchange)
+        if exchange.request.get("echo") is True:
+            raise ValueError("Completions history does not support echo=True")
         prompt, completion, _ = _completion_tokens(exchange.response)
+        request_prompt = exchange.request.get("prompt")
+        if prompt is None and isinstance(request_prompt, list):
+            prompt = _exact_token_ids(
+                request_prompt, field="Completions request prompt"
+            )
         if prompt is None:
             raise ValueError(
                 "Completions history requires exact prompt and output token IDs"
@@ -295,26 +317,9 @@ def responses_as_chat_completions_history(
 ) -> ChatCompletionsHistory:
     from ._tokenize import _openai_tools, _responses_messages
 
-    messages = _responses_messages({"instructions": history.instructions, "input": []})
-    pending_reasoning = ""
-    for item in history.input:
-        if isinstance(item, Mapping) and item.get("type") == "reasoning":
-            pending_reasoning += _responses_reasoning_text(item)
-            continue
-        converted = _responses_messages({"input": [item]})
-        if pending_reasoning and converted:
-            if converted[0].get("role") == "assistant":
-                converted[0]["reasoning"] = pending_reasoning
-            else:
-                messages.append(
-                    {"role": "assistant", "content": "", "reasoning": pending_reasoning}
-                )
-            pending_reasoning = ""
-        messages.extend(converted)
-    if pending_reasoning:
-        messages.append(
-            {"role": "assistant", "content": "", "reasoning": pending_reasoning}
-        )
+    messages = _responses_messages(
+        {"instructions": history.instructions, "input": history.input}
+    )
     tools = _TOOLS.validate_python(_openai_tools(history.tools, dialect="responses"))
     return ChatCompletionsHistory(
         model=history.model,
@@ -325,22 +330,10 @@ def responses_as_chat_completions_history(
     )
 
 
-def _responses_reasoning_text(item: Mapping[str, object]) -> str:
-    text = ""
-    for field in ("content", "summary"):
-        blocks = item.get(field)
-        if not isinstance(blocks, list):
-            continue
-        for block in blocks:
-            value = block.get("text") if isinstance(block, Mapping) else None
-            if isinstance(value, str):
-                text += value
-    return text
-
-
 def trajectory_history(
     trajectory: Trajectory, *, model: str | None
 ) -> TrajectoryHistory:
+    _require_unmixed(trajectory)
     if not trajectory.exchanges:
         if trajectory.additional_histories:
             raise ValueError("Trajectory contains multiple legacy histories")

@@ -12,7 +12,7 @@ from openai.types import Completion
 from openai.types.chat import ChatCompletion
 from openai.types.chat.chat_completion_chunk import ChatCompletionChunk
 from openai.types.responses import Response
-from pydantic import TypeAdapter
+from pydantic import TypeAdapter, ValidationError
 
 from ..openai import init_chat_completion, update_chat_completion
 from . import (
@@ -63,7 +63,12 @@ def _sse_events(body: bytes) -> list[tuple[str | None, SSEPayload]]:
         if raw == "[DONE]":
             events.append((event_name, "[DONE]"))
         else:
-            value = json.loads(raw)
+            try:
+                value = json.loads(raw)
+            except json.JSONDecodeError:
+                if raw.strip().lower() in {"ping", "keepalive"}:
+                    continue
+                raise
             if isinstance(value, dict):
                 events.append((event_name, value))
     return events
@@ -79,7 +84,12 @@ def _chat_response(body: bytes, *, stream: bool) -> ChatCompletion:
         if payload == "[DONE]":
             done = True
             continue
-        chunk = ChatCompletionChunk.model_validate(payload)
+        try:
+            chunk = ChatCompletionChunk.model_validate(payload)
+        except ValidationError:
+            if not payload.get("object") and not payload.get("choices"):
+                continue
+            raise
         if response is None:
             response = init_chat_completion(chunk.model_copy(update={"choices": []}))
         update_chat_completion(response, chunk.model_copy(update={"choices": []}))

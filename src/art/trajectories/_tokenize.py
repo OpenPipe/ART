@@ -464,6 +464,8 @@ def _anthropic_messages(request: dict[str, Any]) -> list[dict[str, Any]]:
                         ),
                     }
                 )
+            else:
+                raise ValueError(f"Unsupported Anthropic content block type: {kind!r}")
         message: dict[str, Any] = {"role": role, "content": text}
         if reasoning:
             message["reasoning"] = reasoning
@@ -485,50 +487,79 @@ def _responses_messages(request: dict[str, Any]) -> list[dict[str, Any]]:
     if isinstance(value, str):
         messages.append({"role": "user", "content": value})
     elif isinstance(value, list):
+        pending_reasoning = ""
+        pending_tool_calls: list[dict[str, Any]] | None = None
         for item in value:
             if not isinstance(item, dict):
                 raise ValueError("Responses input items must be JSON objects")
             kind = item.get("type")
-            if kind == "function_call_output":
-                messages.append(
-                    {
-                        "role": "tool",
-                        "tool_call_id": item.get("call_id"),
-                        "content": _responses_input_text(
-                            item.get("output", ""), field="function_call_output"
-                        ),
-                    }
-                )
-            elif kind == "function_call":
-                messages.append(
-                    {
+            if kind == "reasoning":
+                pending_tool_calls = None
+                reasoning = _responses_reasoning_text(item)
+                if not reasoning:
+                    raise ValueError("Responses reasoning item has no renderable text")
+                pending_reasoning += reasoning
+                continue
+            if kind == "function_call":
+                if pending_tool_calls is None:
+                    pending_tool_calls = []
+                    message: dict[str, Any] = {
                         "role": "assistant",
                         "content": "",
-                        "tool_calls": [
-                            {
-                                "id": item.get("call_id"),
-                                "type": "function",
-                                "function": {
-                                    "name": item.get("name"),
-                                    "arguments": item.get("arguments", "{}"),
-                                },
-                            }
-                        ],
+                        "tool_calls": pending_tool_calls,
+                    }
+                    if pending_reasoning:
+                        message["reasoning"] = pending_reasoning
+                        pending_reasoning = ""
+                    messages.append(message)
+                pending_tool_calls.append(
+                    {
+                        "id": item.get("call_id"),
+                        "type": "function",
+                        "function": {
+                            "name": item.get("name"),
+                            "arguments": item.get("arguments", "{}"),
+                        },
                     }
                 )
+                continue
+            pending_tool_calls = None
+            if kind == "function_call_output":
+                message: dict[str, Any] = {
+                    "role": "tool",
+                    "tool_call_id": item.get("call_id"),
+                    "content": _responses_input_text(
+                        item.get("output", ""), field="function_call_output"
+                    ),
+                }
             elif kind in {None, "message"} and item.get("role"):
                 if item.get("phase") is not None:
                     raise ValueError("Unsupported Responses message phase")
-                messages.append(
-                    {
-                        "role": item["role"],
-                        "content": _responses_input_text(
-                            item.get("content"), field="message content"
-                        ),
-                    }
-                )
+                message = {
+                    "role": item["role"],
+                    "content": _responses_input_text(
+                        item.get("content"), field="message content"
+                    ),
+                }
             else:
                 raise ValueError(f"Unsupported Responses input item type: {kind!r}")
+            if pending_reasoning:
+                if message["role"] == "assistant":
+                    message["reasoning"] = pending_reasoning
+                else:
+                    messages.append(
+                        {
+                            "role": "assistant",
+                            "content": "",
+                            "reasoning": pending_reasoning,
+                        }
+                    )
+                pending_reasoning = ""
+            messages.append(message)
+        if pending_reasoning:
+            messages.append(
+                {"role": "assistant", "content": "", "reasoning": pending_reasoning}
+            )
     elif value is not None:
         raise ValueError("Responses input must be text or a list of input items")
     return messages
@@ -576,6 +607,19 @@ def _responses_output_text(content: object) -> str:
         if not isinstance(value, str):
             raise ValueError(f"Responses {kind} content must be text")
         text += value
+    return text
+
+
+def _responses_reasoning_text(item: Mapping[str, object]) -> str:
+    text = ""
+    for field in ("content", "summary"):
+        blocks = item.get(field)
+        if not isinstance(blocks, list):
+            continue
+        for block in blocks:
+            data = _string_dict(block)
+            if data is not None and isinstance(data.get("text"), str):
+                text += data["text"]
     return text
 
 
@@ -646,6 +690,7 @@ def _response_message(
     if isinstance(exchange, ResponsesExchange):
         data = exchange.response.model_dump(mode="python")
         content = ""
+        reasoning = ""
         tool_calls = []
         for raw_item in data.get("output") or []:
             item = _string_dict(raw_item)
@@ -656,6 +701,11 @@ def _response_message(
                 if item.get("phase") is not None:
                     raise ValueError("Unsupported Responses message phase")
                 content += _responses_output_text(item.get("content"))
+            elif kind == "reasoning":
+                rendered = _responses_reasoning_text(item)
+                if not rendered:
+                    raise ValueError("Responses reasoning item has no renderable text")
+                reasoning += rendered
             elif kind == "function_call":
                 tool_calls.append(
                     {
@@ -673,6 +723,8 @@ def _response_message(
             "role": "assistant",
             "content": content,
         }
+        if reasoning:
+            message["reasoning"] = reasoning
         if tool_calls:
             message["tool_calls"] = tool_calls
         return message
@@ -707,7 +759,7 @@ def _template_ids(
 
     messages, tools = _request_messages(exchange, messages_override)
     if completed:
-        messages.append(_response_message(exchange))
+        messages = [*messages, _response_message(exchange)]
     request_kwargs = request.get("chat_template_kwargs")
     kwargs = {
         **(config.chat_template_kwargs or {}),
@@ -790,18 +842,42 @@ def _align_visible_logprobs(
     values = _visible_logprobs(exchange)
     if not values or tokenizer is None:
         return None
-    aligned = [math.nan] * len(completion)
-    cursor = 0
+    token_ids: list[int] = []
+    logprobs: list[float] = []
     for text, logprob in values:
         encoded = _ids(tokenizer(text, add_special_tokens=False))
         if len(encoded) != 1:
             return None
+        token_ids.append(encoded[0])
+        logprobs.append(logprob)
+
+    left: list[int] = []
+    cursor = 0
+    for token_id in token_ids:
         try:
-            index = completion.index(encoded[0], cursor)
+            index = completion.index(token_id, cursor)
         except ValueError:
             return None
-        aligned[index] = logprob
+        left.append(index)
         cursor = index + 1
+
+    right: list[int] = []
+    cursor = len(completion)
+    for token_id in reversed(token_ids):
+        while cursor:
+            cursor -= 1
+            if completion[cursor] == token_id:
+                right.append(cursor)
+                break
+        else:
+            return None
+    right.reverse()
+    if left != right:
+        return None
+
+    aligned = [math.nan] * len(completion)
+    for index, logprob in zip(left, logprobs, strict=True):
+        aligned[index] = logprob
     return aligned
 
 
@@ -837,6 +913,8 @@ def _legacy_tokenize(
             logprobs.extend([math.nan] * len(suffix))
             assistant_mask.extend([False] * len(suffix))
         token_ids.extend(completion)
+        if len(completion_logprobs) != len(completion):
+            completion_logprobs = [math.nan] * len(completion)
         logprobs.extend(completion_logprobs)
         assistant_mask.extend([True] * len(completion))
     if not token_ids:
@@ -858,6 +936,14 @@ def tokenize_one(
     chat_template_kwargs: Mapping[str, object] | None,
     tokenizer_instance: _Tokenizer | None = None,
 ) -> TokenizedTrajectory:
+    if trajectory.exchanges and (
+        trajectory.messages_and_choices
+        or trajectory.tools is not None
+        or trajectory.additional_histories
+    ):
+        raise ValueError(
+            "A trajectory cannot contain both exchanges and legacy histories"
+        )
     if not trajectory.exchanges:
         return _legacy_tokenize(
             trajectory,
@@ -874,7 +960,9 @@ def tokenize_one(
     token_ids: list[int] = []
     logprobs: list[float] = []
     assistant_mask: list[bool] = []
-    response_histories: dict[str, tuple[list[dict[str, Any]], ResponsesExchange]] = {}
+    response_histories: dict[
+        str, tuple[list[dict[str, Any]] | None, ResponsesExchange]
+    ] = {}
 
     for exchange in exchanges:
         if isinstance(exchange, CompletionsExchange):
@@ -891,10 +979,15 @@ def tokenize_one(
                 raise ValueError(
                     "Trajectory tokenization does not support Completions echo=True"
                 )
-        messages_override = None
+        prompt, completion, completion_logprobs = _exchange_tokens(exchange)
+        messages_override: list[dict[str, Any]] | None = None
         if isinstance(exchange, ResponsesExchange):
             request = exchange.request
-            messages_override = _responses_messages(request)
+            try:
+                messages_override = _responses_messages(request)
+            except ValueError:
+                if prompt is None:
+                    raise
             previous = request.get("previous_response_id")
             if previous is not None:
                 if not isinstance(previous, str) or previous not in response_histories:
@@ -902,13 +995,17 @@ def tokenize_one(
                         "Responses exchange refers to a previous response outside this trajectory"
                     )
                 previous_messages, previous_exchange = response_histories[previous]
-                messages_override = [
-                    *previous_messages,
-                    _response_message(previous_exchange),
-                    *messages_override,
-                ]
+                if prompt is None:
+                    if previous_messages is None or messages_override is None:
+                        raise ValueError(
+                            "Responses history cannot be rendered without exact prompt tokens"
+                        )
+                    messages_override = [
+                        *previous_messages,
+                        _response_message(previous_exchange),
+                        *messages_override,
+                    ]
             response_histories[exchange.response.id] = (messages_override, exchange)
-        prompt, completion, completion_logprobs = _exchange_tokens(exchange)
         if prompt is None:
             if tokenizer is None:
                 tokenizer = _load_tokenizer(config)
