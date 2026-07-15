@@ -17,6 +17,7 @@ dependencies = [
 
 [project.optional-dependencies]
 plotting = ["matplotlib>=3.10.1", "seaborn>=0.13.2"]
+distributed = ["torchmonarch==0.2.0"]
 
 backend = [
     "peft>=0.14.0",
