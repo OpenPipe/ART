@@ -23,6 +23,7 @@ ALLOW_UNPAIRED_MEGATRON_RESUME_ENV = "ART_ALLOW_UNPAIRED_MEGATRON_RESUME"
 OPTIMIZER_GENERATIONS_DIR = "generations"
 OPTIMIZER_MANIFEST = "manifest.json"
 OPTIMIZER_POINTER = "committed.json"
+OPTIMIZER_POLICY_POINTER = "policy.json"
 OPTIMIZER_MODEL_LOCK = ".optimizer.lock"
 OPTIMIZER_WRITER_LOCK = ".writer.lock"
 OPTIMIZER_GENERATION_LEASE_PREFIX = ".lease-"
@@ -35,6 +36,7 @@ _GENERATION_PATTERN = r"step-\d{8,}-[0-9a-f]{32}"
 _GENERATION_RE = re.compile(f"^{_GENERATION_PATTERN}$")
 _TRASH_RE = re.compile(f"^\\.trash-({_GENERATION_PATTERN})-[0-9a-f]{{32}}$")
 _POINTER_TEMP_RE = re.compile(r"^\.committed\.json\.\d+\.[0-9a-f]{32}\.tmp$")
+_POLICY_TEMP_RE = re.compile(r"^\.policy\.json\.\d+\.[0-9a-f]{32}\.tmp$")
 _SHA256_PATTERN = r"^[0-9a-f]{64}$"
 _POINTER_UNSET = object()
 
@@ -104,6 +106,29 @@ class OptimizerGenerationManifest(_OptimizerGenerationRecord):
 
 class OptimizerGenerationPointer(_OptimizerGenerationRecord):
     format_version: Literal[2] = 2
+
+
+class OptimizerPolicyPointer(_OptimizerRecord):
+    format_version: Literal[1] = 1
+    policy_adapter: OptimizerAdapter
+    optimizer_anchor: OptimizerGenerationPointer | None
+
+    @model_validator(mode="after")
+    def _validate_policy_alias(self) -> "OptimizerPolicyPointer":
+        if self.policy_adapter.step == 0:
+            raise ValueError("policy alias must advance beyond checkpoint 0")
+        if self.optimizer_anchor is not None and (
+            self.policy_adapter.step <= self.optimizer_anchor.step
+            or self.policy_adapter.sha256 != self.optimizer_anchor.adapter.sha256
+        ):
+            raise ValueError("policy alias does not match its optimizer anchor")
+        return self
+
+
+class CommittedOptimizerPolicy(_OptimizerRecord):
+    policy_adapter: OptimizerAdapter
+    state_adapter: OptimizerAdapter | None
+    optimizer_anchor: OptimizerGenerationPointer | None
 
 
 def optimizer_shard_name(rank: int, world_size: int) -> str:
@@ -420,6 +445,136 @@ def _read_pointer(path: Path) -> OptimizerGenerationPointer | None:
     return None
 
 
+def _read_policy_pointer(path: Path) -> OptimizerPolicyPointer | None:
+    policy_path = path / OPTIMIZER_POLICY_POINTER
+    if policy_path.is_file():
+        try:
+            return OptimizerPolicyPointer.model_validate_json(
+                policy_path.read_text("utf-8")
+            )
+        except Exception as exc:
+            raise RuntimeError(
+                f"Invalid optimizer policy pointer: {policy_path}"
+            ) from exc
+    if policy_path.exists():
+        raise RuntimeError(
+            f"Invalid optimizer policy pointer: {policy_path} is not a file"
+        )
+    return None
+
+
+def _resolve_policy_pointer(
+    path: Path,
+    pointer: OptimizerGenerationPointer | None,
+) -> OptimizerPolicyPointer | None:
+    policy = _read_policy_pointer(path)
+    if policy is None:
+        return None
+    if policy.optimizer_anchor != pointer:
+        if pointer is not None and pointer.step >= policy.policy_adapter.step:
+            return None
+        raise RuntimeError(
+            "Optimizer policy pointer lost or changed its optimizer anchor: "
+            f"policy={policy.model_dump()}, "
+            f"current={pointer.model_dump() if pointer else None}"
+        )
+    _validate_adapter_publication(policy.policy_adapter, verify_files=True)
+    expected = Path(
+        get_step_checkpoint_dir(str(path.absolute().parent), policy.policy_adapter.step)
+    ).absolute()
+    if policy.policy_adapter.identity != str(expected):
+        raise RuntimeError("Optimizer policy does not identify a canonical checkpoint")
+    return policy
+
+
+def _committed_policy(
+    path: Path,
+    pointer: OptimizerGenerationPointer | None,
+    *,
+    initial_adapter_path: str,
+) -> CommittedOptimizerPolicy:
+    if policy := _resolve_policy_pointer(path, pointer):
+        return CommittedOptimizerPolicy(
+            policy_adapter=policy.policy_adapter,
+            state_adapter=None if pointer is None else pointer.adapter,
+            optimizer_anchor=pointer,
+        )
+    if pointer is not None:
+        return CommittedOptimizerPolicy(
+            policy_adapter=pointer.adapter,
+            state_adapter=pointer.adapter,
+            optimizer_anchor=pointer,
+        )
+    if (
+        Path(initial_adapter_path).absolute()
+        != Path(get_step_checkpoint_dir(str(path.absolute().parent), 0)).absolute()
+    ):
+        raise RuntimeError("Initial optimizer policy must use canonical checkpoint 0")
+    initial = optimizer_adapter(initial_adapter_path, 0)
+    return CommittedOptimizerPolicy(
+        policy_adapter=initial,
+        state_adapter=None,
+        optimizer_anchor=None,
+    )
+
+
+def resolve_committed_optimizer_policy(
+    optimizer_state_path: str,
+    *,
+    initial_adapter_path: str,
+) -> CommittedOptimizerPolicy:
+    path = Path(optimizer_state_path)
+    with _committed_generation_lease(path) as pointer:
+        if pointer is not None:
+            _validate_pointer_manifest(
+                pointer,
+                _read_manifest(
+                    optimizer_generation_path(optimizer_state_path, pointer.generation)
+                ),
+            )
+            _validate_adapter_publication(pointer.adapter, verify_files=True)
+        return _committed_policy(
+            path,
+            pointer,
+            initial_adapter_path=initial_adapter_path,
+        )
+
+
+def commit_optimizer_policy_advance(
+    optimizer_state_path: str,
+    *,
+    initial_adapter_path: str,
+    expected_step: int,
+    adapter: OptimizerAdapter,
+) -> OptimizerPolicyPointer:
+    path = Path(optimizer_state_path)
+    with _writer_lease(path) as pointer:
+        current = _committed_policy(
+            path,
+            pointer,
+            initial_adapter_path=initial_adapter_path,
+        )
+        if current.policy_adapter.step != expected_step:
+            raise RuntimeError(
+                "Stale no-op policy writer: "
+                f"expected={expected_step}, current={current.policy_adapter.step}"
+            )
+        if (
+            adapter.step != expected_step + 1
+            or adapter.sha256 != current.policy_adapter.sha256
+        ):
+            raise RuntimeError(
+                "No-op policy checkpoint must advance one step without changing bytes"
+            )
+        _validate_adapter_publication(adapter, verify_files=True)
+        policy = OptimizerPolicyPointer(
+            policy_adapter=adapter,
+            optimizer_anchor=pointer,
+        )
+        _write_model_atomic(path / OPTIMIZER_POLICY_POINTER, policy)
+        return policy
+
+
 def read_committed_optimizer_pointer(
     optimizer_state_path: str,
 ) -> OptimizerGenerationPointer | None:
@@ -665,6 +820,9 @@ def _prune_optimizer_generations_locked(
     now = time.time()
     with _writer_lease(path) as pointer:
         pointer_temps, candidates = _scan_optimizer_transactions(path)
+        policy = _resolve_policy_pointer(path, pointer)
+        if policy is not None:
+            protected_steps.add(policy.policy_adapter.step)
         if not generations.exists():
             if pointer is not None:
                 raise RuntimeError(
@@ -675,7 +833,7 @@ def _prune_optimizer_generations_locked(
                 raise RuntimeError(
                     "Interrupted optimizer pointer has no committed generation"
                 )
-            return set()
+            return protected_steps
         if not generations.is_dir():
             raise RuntimeError(
                 f"Optimizer generations path is not a directory: {generations}"
@@ -1297,13 +1455,20 @@ def _sibling_optimizer_owns_adapter(
         if sibling == current or not sibling.exists():
             continue
         with _committed_generation_lease(sibling) as pointer:
-            if pointer is None:
+            policy_pointer = _read_policy_pointer(sibling)
+            if pointer is None and policy_pointer is None:
                 continue
-            manifest = _read_manifest(
-                optimizer_generation_path(str(sibling), pointer.generation)
+            if pointer is not None:
+                manifest = _read_manifest(
+                    optimizer_generation_path(str(sibling), pointer.generation)
+                )
+                _validate_pointer_manifest(pointer, manifest)
+            policy = _committed_policy(
+                sibling,
+                pointer,
+                initial_adapter_path=get_step_checkpoint_dir(str(sibling.parent), 0),
             )
-            _validate_pointer_manifest(pointer, manifest)
-            if pointer.adapter == adapter:
+            if policy.policy_adapter == adapter:
                 return True
     return False
 
@@ -1323,11 +1488,24 @@ def load_optimizer_state(
         def select_generation() -> dict[str, Any] | None:
             runtime_sha256, layouts = _validated_runtime_layouts(runtime, records)
             adapter = _loaded_adapter(adapter_path, adapter_step)
-            leased_pointer = leases.enter_context(
-                _committed_generation_lease(Path(optimizer_state_path))
+            path = Path(optimizer_state_path)
+            leased_pointer = leases.enter_context(_committed_generation_lease(path))
+            policy = _committed_policy(
+                path,
+                leased_pointer,
+                initial_adapter_path=get_step_checkpoint_dir(
+                    str(path.absolute().parent), 0
+                ),
             )
+            if policy.policy_adapter == adapter:
+                if policy.optimizer_anchor is None:
+                    return None
+                assert policy.state_adapter is not None
+                pinned_adapter = policy.state_adapter
+            else:
+                pinned_adapter = adapter
             lineage_switch = (
-                leased_pointer is None or leased_pointer.adapter != adapter
+                leased_pointer is None or leased_pointer.adapter != pinned_adapter
             ) and _sibling_optimizer_owns_adapter(optimizer_state_path, adapter)
             if lineage_switch:
                 return None
@@ -1336,7 +1514,7 @@ def load_optimizer_state(
                 world_size=runtime.world_size,
                 runtime_sha256=runtime_sha256,
                 layout_sha256_by_rank=layouts,
-                adapter=adapter,
+                adapter=pinned_adapter,
                 pointer=leased_pointer,
                 verify_adapter_files=False,
             )
@@ -1400,6 +1578,7 @@ def _scan_optimizer_transactions(
     pointer_temps: list[tuple[Path, OptimizerGenerationPointer]] = []
     allowed = {
         OPTIMIZER_POINTER,
+        OPTIMIZER_POLICY_POINTER,
         OPTIMIZER_WRITER_LOCK,
         OPTIMIZER_GENERATIONS_DIR,
         "uncommitted_generations",
@@ -1488,6 +1667,15 @@ def _validate_recovery_generation(
 def _recover_optimizer_pointer_locked(
     path: Path, current: OptimizerGenerationPointer | None
 ) -> OptimizerGenerationPointer | None:
+    policy_temps = tuple(
+        entry
+        for entry in sorted(path.iterdir())
+        if _POLICY_TEMP_RE.fullmatch(entry.name) is not None and entry.is_file()
+    )
+    for temporary in policy_temps:
+        temporary.unlink()
+    if policy_temps:
+        _fsync_directory(path)
     temporary_paths = tuple(
         entry
         for entry in sorted(path.iterdir())
@@ -1587,6 +1775,9 @@ def _recover_uncommitted_initial_transaction(
         pointers = {root: locks.enter_context(_writer_lease(root)) for root in roots}
         pointer = pointers[path]
         if pointer is not None:
+            return ()
+        policy = _resolve_policy_pointer(path, pointer)
+        if policy is not None and policy.policy_adapter.step == 1:
             return ()
         adapter = read_adapter_publication(checkpoint, step=1, verify_files=True)
         if adapter is None:
@@ -1726,6 +1917,23 @@ def resolve_megatron_resume_step(
                     f"saved={pointer.adapter.identity}, expected={expected_path}"
                 )
             _validate_adapter_publication(pointer.adapter, verify_files=True)
+        policy = _resolve_policy_pointer(Path(optimizer_state_path), pointer)
+        if policy is not None:
+            expected_path = Path(
+                get_step_checkpoint_dir(output_dir, policy.policy_adapter.step)
+            ).absolute()
+            if policy.policy_adapter.identity != str(expected_path):
+                raise RuntimeError(
+                    "Optimizer policy pointer does not identify the canonical "
+                    f"adapter path: saved={policy.policy_adapter.identity}, "
+                    f"expected={expected_path}"
+                )
+            return MegatronResumeStep(
+                step=policy.policy_adapter.step,
+                latest_lora_step=latest_lora_step,
+                optimizer_step=None if pointer is None else pointer.step,
+            )
+        if pointer is not None:
             return MegatronResumeStep(
                 step=pointer.step,
                 latest_lora_step=latest_lora_step,
@@ -1756,7 +1964,10 @@ def _resolve_model_resume_step(
 ) -> MegatronResumeStep:
     paired = []
     for path in _optimizer_state_paths(output_dir, optimizer_state_path):
-        if read_committed_optimizer_pointer(str(path)) is not None:
+        if (
+            read_committed_optimizer_pointer(str(path)) is not None
+            or _read_policy_pointer(path) is not None
+        ):
             paired.append(
                 resolve_megatron_resume_step(
                     output_dir=output_dir,
@@ -1832,11 +2043,26 @@ def format_megatron_resume_message(info: MegatronResumeStep) -> str:
             "Resuming Megatron from unpaired LoRA checkpoint "
             f"{info.step} because {ALLOW_UNPAIRED_MEGATRON_RESUME_ENV} is set"
         )
+    suffix = ""
+    if info.quarantined_lora_steps:
+        moved = ", ".join(f"{step:04d}" for step in info.quarantined_lora_steps)
+        suffix = f"; quarantined unpaired LoRA checkpoint(s): {moved}"
+    if info.step > 0 and info.optimizer_step != info.step:
+        optimizer = (
+            "an uninitialized optimizer"
+            if info.optimizer_step is None
+            else f"optimizer state {info.optimizer_step}"
+        )
+        latest = (
+            ""
+            if info.step == info.latest_lora_step
+            else f" instead of latest LoRA checkpoint {info.latest_lora_step}"
+        )
+        return (
+            f"Resuming no-op policy checkpoint {info.step} with {optimizer}"
+            f"{latest}{suffix}"
+        )
     if info.step != info.latest_lora_step:
-        suffix = ""
-        if info.quarantined_lora_steps:
-            moved = ", ".join(f"{step:04d}" for step in info.quarantined_lora_steps)
-            suffix = f"; quarantined unpaired LoRA checkpoint(s): {moved}"
         return (
             "Resuming Megatron from paired LoRA/optimizer checkpoint "
             f"{info.step} instead of latest LoRA checkpoint "
