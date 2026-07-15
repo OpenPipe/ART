@@ -92,24 +92,61 @@ def _token_id(value: object) -> int | None:
     return None
 
 
-def _pairs(values: object) -> tuple[list[int], list[float]]:
+def _exact_token_ids(values: object, *, field: str) -> list[int] | None:
+    if values is None:
+        return None
     if not isinstance(values, list):
+        raise ValueError(f"{field} exact token metadata must be a list")
+    token_ids: list[int] = []
+    for value in values:
+        token_id = _token_id(value)
+        if token_id is None:
+            raise ValueError(f"{field} contains an invalid exact token ID")
+        token_ids.append(token_id)
+    return token_ids
+
+
+def _pair_token_id(data: dict[str, Any], *, required: bool, field: str) -> int | None:
+    if "token_id" in data:
+        token_id = _token_id(data["token_id"])
+        if token_id is None:
+            raise ValueError(f"{field} contains an invalid exact token ID")
+        return token_id
+    raw_token = data.get("token")
+    token_id = _token_id(raw_token)
+    if token_id is not None:
+        return token_id
+    if isinstance(raw_token, str) and raw_token.startswith("token_id:"):
+        raise ValueError(f"{field} contains an invalid exact token ID")
+    if required:
+        raise ValueError(f"{field} is missing an exact token ID")
+    return None
+
+
+def _pairs(
+    values: object, *, require_token_ids: bool = False, field: str = "token pairs"
+) -> tuple[list[int], list[float]]:
+    if not isinstance(values, list):
+        if require_token_ids:
+            raise ValueError(f"{field} exact token metadata must be a list")
         return [], []
     token_ids: list[int] = []
     logprobs: list[float] = []
+    complete = True
     for value in values:
         data = _dump(value)
-        token_id = _token_id(data.get("token_id"))
+        token_id = _pair_token_id(data, required=require_token_ids, field=field)
         if token_id is None:
-            token_id = _token_id(data.get("token"))
-        if token_id is None:
-            return [], []
+            complete = False
+            continue
         logprob = data.get("logprob")
         token_ids.append(token_id)
         logprobs.append(
-            float(logprob) if isinstance(logprob, (int, float)) else math.nan
+            float(logprob)
+            if isinstance(logprob, (int, float)) and not isinstance(logprob, bool)
+            else math.nan
         )
-    return token_ids, logprobs
+    return (token_ids, logprobs) if complete else ([], [])
 
 
 def _logprob_values(values: object) -> list[float]:
@@ -118,7 +155,7 @@ def _logprob_values(values: object) -> list[float]:
     result: list[float] = []
     for value in values:
         logprob = _dump(value).get("logprob")
-        if not isinstance(logprob, (int, float)):
+        if not isinstance(logprob, (int, float)) or isinstance(logprob, bool):
             return []
         result.append(float(logprob))
     return result
@@ -128,24 +165,20 @@ def _chat_choice_tokens(
     choice: Choice, response_data: dict[str, Any]
 ) -> tuple[list[int] | None, list[int], list[float]]:
     choice_data = _dump(choice)
-    prompt = choice_data.get("prompt_token_ids") or response_data.get(
-        "prompt_token_ids"
+    prompt = choice_data.get("prompt_token_ids")
+    if prompt is None:
+        prompt = response_data.get("prompt_token_ids")
+    prompt_ids = _exact_token_ids(prompt, field="Chat Completions prompt_token_ids")
+    token_ids = _exact_token_ids(
+        choice_data.get("token_ids"),
+        field="Chat Completions token_ids",
     )
-    prompt_ids = (
-        [token for value in prompt if (token := _token_id(value)) is not None]
-        if isinstance(prompt, list)
-        else None
-    )
-    token_ids = [
-        token
-        for value in choice_data.get("token_ids") or []
-        if (token := _token_id(value)) is not None
-    ]
     logprob_values = None
     if choice.logprobs is not None:
         logprob_values = choice.logprobs.content or choice.logprobs.refusal
     values = list(logprob_values or [])
-    pair_ids, logprobs = _pairs(values)
+    pair_ids, logprobs = _pairs(values, field="Chat Completions logprobs")
+    token_ids = token_ids or []
     if token_ids and pair_ids and token_ids != pair_ids:
         raise ValueError("Response token IDs disagree with choice logprobs")
     return (
@@ -171,22 +204,30 @@ def _completion_tokens(
     choice = response.choices[0]
     response_data = _dump(response)
     choice_data = _dump(choice)
-    prompt = choice_data.get("prompt_token_ids") or response_data.get(
-        "prompt_token_ids"
+    prompt = choice_data.get("prompt_token_ids")
+    if prompt is None:
+        prompt = response_data.get("prompt_token_ids")
+    prompt_ids = _exact_token_ids(prompt, field="Completions prompt_token_ids")
+    token_ids = _exact_token_ids(
+        choice_data.get("token_ids"), field="Completions token_ids"
     )
-    prompt_ids = (
-        [token for value in prompt if (token := _token_id(value)) is not None]
-        if isinstance(prompt, list)
-        else None
-    )
-    token_ids = [
-        token
-        for value in choice_data.get("token_ids") or []
-        if (token := _token_id(value)) is not None
-    ]
+    token_ids = token_ids or []
     logprobs = _dump(choice.logprobs)
     tokens = logprobs.get("tokens") or []
-    pair_ids = [token for value in tokens if (token := _token_id(value)) is not None]
+    pair_ids: list[int] = []
+    complete_pairs = True
+    for value in tokens:
+        token = _token_id(value)
+        if token is None:
+            if isinstance(value, str) and value.startswith("token_id:"):
+                raise ValueError(
+                    "Completions logprobs contain an invalid exact token ID"
+                )
+            complete_pairs = False
+        else:
+            pair_ids.append(token)
+    if not complete_pairs:
+        pair_ids = []
     pair_logprobs = [
         float(value) if isinstance(value, (int, float)) else math.nan
         for value in logprobs.get("token_logprobs") or []
@@ -201,27 +242,46 @@ def _completion_tokens(
 
 def _responses_tokens(response: Response) -> tuple[None, list[int], list[float]]:
     data = _dump(response)
-    token_ids, logprobs = _pairs(data.get("raw_output_tokens"))
-    if token_ids:
+    if "raw_output_tokens" in data:
+        token_ids, logprobs = _pairs(
+            data["raw_output_tokens"],
+            require_token_ids=True,
+            field="Responses raw_output_tokens",
+        )
         return None, token_ids, logprobs
+    token_ids: list[int] = []
+    logprobs: list[float] = []
+    saw_rendered_output = False
+    complete = True
     for output in data.get("output") or []:
-        for content in _dump(output).get("content") or []:
-            values = _dump(content).get("logprobs")
-            token_ids, logprobs = _pairs(values)
-            if token_ids:
-                return None, token_ids, logprobs
-            if logprobs := _logprob_values(values):
-                return None, [], logprobs
+        output_data = _dump(output)
+        if output_data.get("type") != "message":
+            complete = False
+            continue
+        for content in output_data.get("content") or []:
+            content_data = _dump(content)
+            text = content_data.get("text") or content_data.get("refusal")
+            if not isinstance(text, str) or not text:
+                continue
+            saw_rendered_output = True
+            pair_ids, pair_logprobs = _pairs(
+                content_data.get("logprobs"), field="Responses content logprobs"
+            )
+            if not pair_ids:
+                complete = False
+                continue
+            token_ids.extend(pair_ids)
+            logprobs.extend(pair_logprobs)
+    if saw_rendered_output and complete:
+        return None, token_ids, logprobs
     return None, [], []
 
 
 def _messages_tokens(response: Message) -> tuple[None, list[int], list[float]]:
     data = _dump(response)
-    token_ids = [
-        token
-        for value in data.get("token_ids") or []
-        if (token := _token_id(value)) is not None
-    ]
+    token_ids = (
+        _exact_token_ids(data.get("token_ids"), field="Messages token_ids") or []
+    )
     logprobs = [
         float(value) if isinstance(value, (int, float)) else math.nan
         for value in data.get("logprobs") or []
@@ -416,7 +476,10 @@ def _anthropic_messages(request: dict[str, Any]) -> list[dict[str, Any]]:
 
 def _responses_messages(request: dict[str, Any]) -> list[dict[str, Any]]:
     messages: list[dict[str, Any]] = []
-    if instructions := request.get("instructions"):
+    instructions = request.get("instructions")
+    if instructions is not None and not isinstance(instructions, str):
+        raise ValueError("Responses instructions must be text")
+    if instructions:
         messages.append({"role": "system", "content": instructions})
     value = request.get("input")
     if isinstance(value, str):
@@ -424,16 +487,19 @@ def _responses_messages(request: dict[str, Any]) -> list[dict[str, Any]]:
     elif isinstance(value, list):
         for item in value:
             if not isinstance(item, dict):
-                continue
-            if item.get("type") == "function_call_output":
+                raise ValueError("Responses input items must be JSON objects")
+            kind = item.get("type")
+            if kind == "function_call_output":
                 messages.append(
                     {
                         "role": "tool",
                         "tool_call_id": item.get("call_id"),
-                        "content": item.get("output", ""),
+                        "content": _responses_input_text(
+                            item.get("output", ""), field="function_call_output"
+                        ),
                     }
                 )
-            elif item.get("type") == "function_call":
+            elif kind == "function_call":
                 messages.append(
                     {
                         "role": "assistant",
@@ -450,14 +516,67 @@ def _responses_messages(request: dict[str, Any]) -> list[dict[str, Any]]:
                         ],
                     }
                 )
-            elif item.get("role"):
+            elif kind in {None, "message"} and item.get("role"):
+                if item.get("phase") is not None:
+                    raise ValueError("Unsupported Responses message phase")
                 messages.append(
                     {
                         "role": item["role"],
-                        "content": _content_text(item.get("content")),
+                        "content": _responses_input_text(
+                            item.get("content"), field="message content"
+                        ),
                     }
                 )
+            else:
+                raise ValueError(f"Unsupported Responses input item type: {kind!r}")
+    elif value is not None:
+        raise ValueError("Responses input must be text or a list of input items")
     return messages
+
+
+def _responses_input_text(content: object, *, field: str) -> str:
+    if isinstance(content, str):
+        return content
+    if not isinstance(content, list):
+        raise ValueError(f"Responses {field} must contain text")
+    text = ""
+    for block in content:
+        data = _string_dict(block)
+        if data is None:
+            raise ValueError(f"Responses {field} blocks must be JSON objects")
+        kind = data.get("type")
+        if kind not in {"input_text", "output_text", "refusal", "text"}:
+            raise ValueError(f"Unsupported Responses content block type: {kind!r}")
+        value = data.get("refusal" if kind == "refusal" else "text")
+        if not isinstance(value, str):
+            raise ValueError(f"Responses {field} blocks must contain text")
+        text += value
+    return text
+
+
+def _responses_output_text(content: object) -> str:
+    if not isinstance(content, list):
+        raise ValueError("Responses message output content must be a list")
+    text = ""
+    for block in content:
+        data = _string_dict(block)
+        if data is None:
+            raise ValueError("Responses output content blocks must be JSON objects")
+        kind = data.get("type")
+        key = (
+            "text"
+            if kind == "output_text"
+            else "refusal"
+            if kind == "refusal"
+            else None
+        )
+        if key is None:
+            raise ValueError(f"Unsupported Responses output content type: {kind!r}")
+        value = data.get(key)
+        if not isinstance(value, str):
+            raise ValueError(f"Responses {kind} content must be text")
+        text += value
+    return text
 
 
 def _openai_tools(tools: object, *, dialect: str) -> object:
@@ -526,12 +645,18 @@ def _response_message(
         return _anthropic_messages(request)[0]
     if isinstance(exchange, ResponsesExchange):
         data = exchange.response.model_dump(mode="python")
-        content = []
+        content = ""
         tool_calls = []
-        for item in data.get("output") or []:
-            if item.get("type") == "message":
-                content.extend(item.get("content") or [])
-            elif item.get("type") == "function_call":
+        for raw_item in data.get("output") or []:
+            item = _string_dict(raw_item)
+            if item is None:
+                raise ValueError("Responses output items must be JSON objects")
+            kind = item.get("type")
+            if kind == "message":
+                if item.get("phase") is not None:
+                    raise ValueError("Unsupported Responses message phase")
+                content += _responses_output_text(item.get("content"))
+            elif kind == "function_call":
                 tool_calls.append(
                     {
                         "id": item.get("call_id"),
@@ -542,9 +667,11 @@ def _response_message(
                         },
                     }
                 )
+            else:
+                raise ValueError(f"Unsupported Responses output item type: {kind!r}")
         message: dict[str, Any] = {
             "role": "assistant",
-            "content": _content_text(content),
+            "content": content,
         }
         if tool_calls:
             message["tool_calls"] = tool_calls
@@ -627,11 +754,13 @@ def _visible_logprobs(exchange: Exchange) -> list[tuple[str, float]]:
         for entry in entries:
             data = _dump(entry)
             raw_bytes = data.get("bytes")
-            text = (
-                bytes(raw_bytes).decode("utf-8")
-                if isinstance(raw_bytes, list)
-                else data.get("token")
-            )
+            if isinstance(raw_bytes, list):
+                try:
+                    text = bytes(raw_bytes).decode("utf-8")
+                except (TypeError, ValueError, UnicodeDecodeError):
+                    return []
+            else:
+                text = data.get("token")
             logprob = data.get("logprob")
             if isinstance(text, str) and isinstance(logprob, (int, float)):
                 values.append((text, float(logprob)))
@@ -745,9 +874,23 @@ def tokenize_one(
     token_ids: list[int] = []
     logprobs: list[float] = []
     assistant_mask: list[bool] = []
-    response_histories: dict[str, list[dict[str, Any]]] = {}
+    response_histories: dict[str, tuple[list[dict[str, Any]], ResponsesExchange]] = {}
 
     for exchange in exchanges:
+        if isinstance(exchange, CompletionsExchange):
+            prompt = exchange.request.get("prompt")
+            if isinstance(prompt, list) and not all(
+                isinstance(item, int) and not isinstance(item, bool) for item in prompt
+            ):
+                raise ValueError(
+                    "Trajectory tokenization does not support batched Completions prompts"
+                )
+            if not isinstance(prompt, (str, list)):
+                raise ValueError("Completions prompt must be text or one token ID list")
+            if exchange.request.get("echo") is True:
+                raise ValueError(
+                    "Trajectory tokenization does not support Completions echo=True"
+                )
         messages_override = None
         if isinstance(exchange, ResponsesExchange):
             request = exchange.request
@@ -758,14 +901,13 @@ def tokenize_one(
                     raise ValueError(
                         "Responses exchange refers to a previous response outside this trajectory"
                     )
+                previous_messages, previous_exchange = response_histories[previous]
                 messages_override = [
-                    *response_histories[previous],
+                    *previous_messages,
+                    _response_message(previous_exchange),
                     *messages_override,
                 ]
-            response_histories[exchange.response.id] = [
-                *messages_override,
-                _response_message(exchange),
-            ]
+            response_histories[exchange.response.id] = (messages_override, exchange)
         prompt, completion, completion_logprobs = _exchange_tokens(exchange)
         if prompt is None:
             if tokenizer is None:

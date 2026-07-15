@@ -38,6 +38,7 @@ def install() -> None:
         decode_unicode: bool = False,
     ) -> Iterator[str | bytes]:
         state: CaptureState | None = getattr(self, _STATE, None)
+        completed = False
         try:
             for chunk in original_iter(
                 self, chunk_size=chunk_size, decode_unicode=decode_unicode
@@ -48,8 +49,9 @@ def install() -> None:
                     if isinstance(chunk, bytes):
                         state.add(chunk)
                 yield chunk
+            completed = True
         finally:
-            if state is not None:
+            if state is not None and (completed or state.request.get("stream") is True):
                 state.finish()
 
     setattr(send, "_art_capture", True)

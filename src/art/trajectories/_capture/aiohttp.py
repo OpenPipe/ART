@@ -44,11 +44,14 @@ class _CapturedStream:
         return self._record(await self._stream.readchunk())
 
     async def _iterate(self, iterator: AsyncIterator[bytes]) -> AsyncIterator[bytes]:
+        completed = False
         try:
             async for chunk in iterator:
                 yield self._record(chunk)
+            completed = True
         finally:
-            self._state.finish()
+            if completed or self._state.request.get("stream") is True:
+                self._state.finish()
 
     def __aiter__(self) -> AsyncIterator[bytes]:
         return self._iterate(self._stream.__aiter__())

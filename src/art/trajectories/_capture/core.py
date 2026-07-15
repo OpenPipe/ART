@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import contextvars
+from copy import deepcopy
 from dataclasses import dataclass, field
 from datetime import datetime
 import json
@@ -44,7 +45,7 @@ class CaptureState:
         if self.status_code is None or not 200 <= self.status_code < 300:
             return
         try:
-            _, exchange = build_exchange(
+            exchange = build_exchange(
                 self.endpoint,
                 self.request,
                 bytes(self.body),
@@ -74,7 +75,12 @@ def _json_body(value: object) -> dict[str, Any] | None:
     if isinstance(value, dict):
         if not all(isinstance(key, str) for key in value):
             return None
-        return {key: item for key, item in value.items() if isinstance(key, str)}
+        try:
+            return deepcopy(
+                {key: item for key, item in value.items() if isinstance(key, str)}
+            )
+        except Exception:
+            return None
     if isinstance(value, str):
         value = value.encode()
     if not isinstance(value, bytes):

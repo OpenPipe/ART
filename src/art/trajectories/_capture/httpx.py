@@ -76,36 +76,42 @@ def install() -> None:
         self: httpx.Response, chunk_size: int | None = None
     ) -> Iterator[bytes]:
         state: CaptureState | None = getattr(self, _STATE, None)
+        completed = False
         try:
             for chunk in original_iter(self, chunk_size):
                 if state is not None:
                     state.add(chunk)
                 yield chunk
+            completed = True
         finally:
-            if state is not None:
+            if state is not None and (completed or state.request.get("stream") is True):
                 state.finish()
 
     async def aiter_bytes(
         self: httpx.Response, chunk_size: int | None = None
     ) -> AsyncIterator[bytes]:
         state: CaptureState | None = getattr(self, _STATE, None)
+        completed = False
         try:
             async for chunk in original_aiter(self, chunk_size):
                 if state is not None:
                     state.add(chunk)
                 yield chunk
+            completed = True
         finally:
-            if state is not None:
+            if state is not None and (completed or state.request.get("stream") is True):
                 state.finish()
 
     def close(self: httpx.Response) -> None:
         original_close(self)
-        if state := getattr(self, _STATE, None):
+        state: CaptureState | None = getattr(self, _STATE, None)
+        if state is not None and state.request.get("stream") is True:
             state.finish()
 
     async def aclose(self: httpx.Response) -> None:
         await original_aclose(self)
-        if state := getattr(self, _STATE, None):
+        state: CaptureState | None = getattr(self, _STATE, None)
+        if state is not None and state.request.get("stream") is True:
             state.finish()
 
     setattr(send, "_art_capture", True)

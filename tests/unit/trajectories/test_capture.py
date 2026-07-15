@@ -1,10 +1,10 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import AsyncIterator
+from collections.abc import AsyncGenerator, AsyncIterator, Generator
 from datetime import datetime, timedelta
 import json
-from typing import Any
+from typing import Any, cast
 
 import aiohttp
 from aiohttp import web
@@ -18,7 +18,8 @@ import requests
 
 import art
 from art.trajectories import ChatCompletionsExchange, MessagesExchange
-from art.trajectories._protocols import Endpoint, build_exchange
+from art.trajectories._capture.core import begin, reset
+from art.trajectories._protocols import Endpoint, build_exchange, endpoint_for_url
 
 CHAT: dict[str, Any] = {
     "id": "chatcmpl-1",
@@ -111,7 +112,7 @@ MESSAGE: dict[str, Any] = {
 
 @pytest_asyncio.fixture
 async def endpoint_server(unused_tcp_port: int) -> AsyncIterator[str]:
-    async def handler(request: web.Request) -> web.Response:
+    async def handler(request: web.Request) -> web.StreamResponse:
         request_body = await request.json()
         if request_body.get("fail"):
             return web.json_response({"error": "failed"}, status=400)
@@ -120,6 +121,18 @@ async def endpoint_server(unused_tcp_port: int) -> AsyncIterator[str]:
                 body=_sse([(None, {"type": "incomplete"})]),
                 content_type="text/event-stream",
             )
+        if request_body.get("early_close"):
+            response = web.StreamResponse(
+                status=200, headers={"Content-Type": "application/json"}
+            )
+            await response.prepare(request)
+            await response.write(json.dumps(CHAT).encode())
+            await asyncio.sleep(0.05)
+            try:
+                await response.write(b" ")
+            except ConnectionResetError:
+                pass
+            return response
         bodies = {
             "/v1/chat/completions": CHAT,
             "/v1/completions": COMPLETION,
@@ -265,6 +278,76 @@ async def test_failed_and_incomplete_calls_are_excluded(endpoint_server: str) ->
     assert not trajectory.exchanges
 
 
+async def test_abandoned_transport_streams_are_excluded(endpoint_server: str) -> None:
+    body = {
+        "model": "test/model",
+        "messages": [],
+        "early_close": True,
+    }
+
+    async def abandon_httpx() -> None:
+        async with httpx.AsyncClient() as client:
+            async with client.stream(
+                "POST", f"{endpoint_server}/chat/completions", json=body
+            ) as response:
+                iterator = cast(AsyncGenerator[bytes, None], response.aiter_bytes())
+                await anext(iterator)
+                await iterator.aclose()
+
+    async def abandon_aiohttp() -> None:
+        async with aiohttp.ClientSession() as session:
+            async with session.post(
+                f"{endpoint_server}/chat/completions", json=body
+            ) as response:
+                iterator = cast(
+                    AsyncGenerator[bytes, None], response.content.iter_any()
+                )
+                await anext(iterator)
+                await iterator.aclose()
+
+    def abandon_requests() -> None:
+        with requests.post(
+            f"{endpoint_server}/chat/completions",
+            json=body,
+            stream=True,
+            timeout=5,
+        ) as response:
+            iterator = cast(
+                Generator[bytes, None, None],
+                response.iter_content(chunk_size=None),
+            )
+            next(iterator)
+            iterator.close()
+
+    with art.Trajectory() as trajectory:
+        await abandon_httpx()
+        await abandon_aiohttp()
+        await asyncio.to_thread(abandon_requests)
+
+    assert not trajectory.exchanges
+
+
+def test_capture_snapshots_nested_request_values() -> None:
+    request = {
+        "model": "test/model",
+        "messages": [{"role": "user", "content": "before"}],
+    }
+    with art.Trajectory() as trajectory:
+        state, token = begin(
+            "POST", "https://example.test/v1/chat/completions", request
+        )
+        reset(token)
+        assert state is not None
+        request["messages"][0]["content"] = "after"
+        state.status_code = 200
+        state.add(json.dumps(CHAT).encode())
+        state.finish()
+
+    assert trajectory.exchanges.chat_completions[0].request["messages"] == [
+        {"role": "user", "content": "before"}
+    ]
+
+
 def test_all_protocols_reconstruct_typed_responses() -> None:
     now = datetime.now()
     values: list[tuple[Endpoint, dict[str, Any], dict[str, Any]]] = [
@@ -274,18 +357,40 @@ def test_all_protocols_reconstruct_typed_responses() -> None:
         ("messages", {"model": "request-model", "messages": []}, MESSAGE),
     ]
     for endpoint, request, response in values:
-        name, exchange = build_exchange(
+        exchange = build_exchange(
             endpoint,
             request,
             json.dumps(response).encode(),
             start_time=now,
             end_time=now + timedelta(seconds=1),
         )
-        assert name == endpoint
         assert exchange.end_time > exchange.start_time
         expected = request.get("model", "test/model")
         assert exchange.model == expected
         assert exchange.model_dump(mode="json")["request"] == request
+
+
+@pytest.mark.parametrize(
+    ("url", "endpoint"),
+    [
+        (
+            "https://azure.test/openai/deployments/model/chat/completions?api-version=1",
+            "chat_completions",
+        ),
+        (
+            "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions",
+            "chat_completions",
+        ),
+        ("https://gateway.test/completions", "completions"),
+        ("https://gateway.test/responses", "responses"),
+        ("https://gateway.test/messages", "messages"),
+        ("https://gateway.test/not-messages", None),
+    ],
+)
+def test_endpoint_detection_accepts_compatible_gateway_paths(
+    url: str, endpoint: Endpoint | None
+) -> None:
+    assert endpoint_for_url(url) == endpoint
 
 
 def _sse(events: list[tuple[str | None, dict[str, Any] | str]]) -> bytes:
@@ -389,7 +494,7 @@ def test_all_streaming_protocols_reconstruct_final_responses() -> None:
         ),
     ]
     for endpoint, request, body in values:
-        _, exchange = build_exchange(
+        exchange = build_exchange(
             endpoint,
             request,
             body,
@@ -401,10 +506,55 @@ def test_all_streaming_protocols_reconstruct_final_responses() -> None:
             content = exchange.response.content[0]
             assert isinstance(content, TextBlock)
             assert content.text == "hello"
+            assert getattr(exchange.response, "token_ids") == [2]
+            assert getattr(exchange.response, "logprobs") == [-0.2]
+
+
+def test_streaming_chat_choices_are_accumulated_by_index() -> None:
+    now = datetime.now()
+
+    def chunk(index: int, content: str) -> dict[str, Any]:
+        return {
+            "id": "chatcmpl-1",
+            "object": "chat.completion.chunk",
+            "created": 1,
+            "model": "test/model",
+            "choices": [
+                {
+                    "index": index,
+                    "delta": {"role": "assistant", "content": content},
+                    "finish_reason": None,
+                    "logprobs": None,
+                }
+            ],
+        }
+
+    exchange = build_exchange(
+        "chat_completions",
+        {"model": "test/model", "messages": [], "stream": True, "n": 2},
+        _sse(
+            [
+                (None, chunk(1, "b")),
+                (None, chunk(0, "a")),
+                (None, chunk(1, "d")),
+                (None, chunk(0, "c")),
+                (None, "[DONE]"),
+            ]
+        ),
+        start_time=now,
+        end_time=now + timedelta(seconds=1),
+    )
+
+    assert isinstance(exchange, ChatCompletionsExchange)
+    assert [choice.index for choice in exchange.response.choices] == [0, 1]
+    assert [choice.message.content for choice in exchange.response.choices] == [
+        "ac",
+        "bd",
+    ]
 
 
 def test_trajectory_rejects_mixed_representations() -> None:
-    _, exchange = build_exchange(
+    exchange = build_exchange(
         "chat_completions",
         {"model": "test/model", "messages": []},
         json.dumps(CHAT).encode(),

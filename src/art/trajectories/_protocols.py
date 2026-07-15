@@ -34,10 +34,10 @@ Exchange = (
 ResponseModel = ChatCompletion | Completion | Response | Message
 SSEPayload = dict[str, Any] | Literal["[DONE]"]
 _ENDPOINTS: dict[str, Endpoint] = {
-    "/v1/chat/completions": "chat_completions",
-    "/v1/completions": "completions",
-    "/v1/responses": "responses",
-    "/v1/messages": "messages",
+    "/chat/completions": "chat_completions",
+    "/completions": "completions",
+    "/responses": "responses",
+    "/messages": "messages",
 }
 
 
@@ -75,6 +75,7 @@ def _chat_response(body: bytes, *, stream: bool) -> ChatCompletion:
     if not stream:
         return ChatCompletion.model_validate_json(body)
     response: ChatCompletion | None = None
+    choices: dict[int, ChatCompletion] = {}
     done = False
     for _, payload in _sse_events(body):
         if payload == "[DONE]":
@@ -82,10 +83,18 @@ def _chat_response(body: bytes, *, stream: bool) -> ChatCompletion:
             continue
         chunk = ChatCompletionChunk.model_validate(payload)
         if response is None:
-            response = init_chat_completion(chunk)
-        update_chat_completion(response, chunk)
+            response = init_chat_completion(chunk.model_copy(update={"choices": []}))
+        update_chat_completion(response, chunk.model_copy(update={"choices": []}))
+        for choice in chunk.choices:
+            choice_chunk = chunk.model_copy(update={"choices": [choice]})
+            choice_response = choices.get(choice.index)
+            if choice_response is None:
+                choice_response = init_chat_completion(choice_chunk)
+                choices[choice.index] = choice_response
+            update_chat_completion(choice_response, choice_chunk)
     if response is None or not done:
         raise ValueError("Incomplete Chat Completions stream")
+    response.choices = [choices[index].choices[0] for index in sorted(choices)]
     return response
 
 
@@ -220,11 +229,11 @@ def build_exchange(
     *,
     start_time: datetime,
     end_time: datetime,
-) -> tuple[Endpoint, Exchange]:
+) -> Exchange:
     stream = request.get("stream") is True
     if endpoint == "chat_completions":
         response = _chat_response(body, stream=stream)
-        return endpoint, ChatCompletionsExchange(
+        return ChatCompletionsExchange(
             request=ChatCompletionsRequest(**request),
             response=response,
             model=_model(request, response),
@@ -233,7 +242,7 @@ def build_exchange(
         )
     if endpoint == "completions":
         response = _completion_response(body, stream=stream)
-        return endpoint, CompletionsExchange(
+        return CompletionsExchange(
             request=CompletionsRequest(**request),
             response=response,
             model=_model(request, response),
@@ -242,7 +251,7 @@ def build_exchange(
         )
     if endpoint == "responses":
         response = _responses_response(body, stream=stream)
-        return endpoint, ResponsesExchange(
+        return ResponsesExchange(
             request=ResponsesRequest(**request),
             response=response,
             model=_model(request, response),
@@ -251,7 +260,7 @@ def build_exchange(
         )
     if endpoint == "messages":
         response = _messages_response(body, stream=stream)
-        return endpoint, MessagesExchange(
+        return MessagesExchange(
             request=MessagesRequest(**request),
             response=response,
             model=_model(request, response),
