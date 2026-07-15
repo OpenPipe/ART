@@ -1967,3 +1967,26 @@ def iter_lora_slot_parameters(
                     continue
                 seen.add(param_id)
                 yield param
+
+
+def iter_lora_sites(
+    model: Sequence[torch.nn.Module],
+) -> Iterator[tuple[str, torch.nn.Parameter, torch.nn.Parameter]]:
+    """Yield every ambient and dynamic LoRA parameter pair exactly once."""
+    seen: set[int] = set()
+    for chunk in model:
+        for module in chunk.modules():
+            prefix = getattr(module, "adapter_model_prefix", None)
+            a_t = getattr(module, "A_T", None)
+            b_t = getattr(module, "B_T", None)
+            if (
+                not isinstance(prefix, str)
+                or not isinstance(a_t, torch.nn.Parameter)
+                or not isinstance(b_t, torch.nn.Parameter)
+                or id(module) in seen
+            ):
+                continue
+            seen.add(id(module))
+            yield prefix, a_t, b_t
+            for slot in getattr(module, "_slot_modules", {}).values():
+                yield prefix, slot.A_T, slot.B_T

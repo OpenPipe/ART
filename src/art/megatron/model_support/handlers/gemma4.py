@@ -402,13 +402,12 @@ def _zero_gemma4_moe_lora_padding(
             logical, internal = _gemma4_moe_padding_sizes_from_provider(config)
             if logical == internal:
                 continue
-            for module in chunk.modules():
-                prefix = getattr(module, "adapter_model_prefix", None)
-                if not isinstance(prefix, str) or ".mlp.experts." not in prefix:
+            for prefix, a_t, b_t in art_lora.iter_lora_sites([chunk]):
+                if ".mlp.experts." not in prefix:
                     continue
-                if prefix.endswith(".gate_up_proj") and hasattr(module, "B_T"):
+                if prefix.endswith(".gate_up_proj"):
                     _zero_gemma4_moe_lora_padding_tensor_set(
-                        cast(torch.nn.Parameter, module.B_T),
+                        b_t,
                         dim=-1,
                         logical=logical,
                         internal=internal,
@@ -416,9 +415,9 @@ def _zero_gemma4_moe_lora_padding(
                         grads=grads,
                         params=params,
                     )
-                elif prefix.endswith(".down_proj") and hasattr(module, "A_T"):
+                elif prefix.endswith(".down_proj"):
                     _zero_gemma4_moe_lora_padding_tensor_set(
-                        cast(torch.nn.Parameter, module.A_T),
+                        a_t,
                         dim=-2,
                         logical=logical,
                         internal=internal,

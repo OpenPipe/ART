@@ -8,6 +8,7 @@ from typing import Any, Sequence, cast
 
 import torch
 
+from art.megatron import lora as art_lora
 from art.megatron.model_support.handlers.default_dense import (
     DefaultMoeHandler,
     _compile_workaround_flags_for_provider,
@@ -1391,53 +1392,47 @@ def _zero_gpt_oss_moe_lora_padding(
     if logical_hidden == internal_hidden and logical_ffn == internal_ffn:
         return
     with torch.no_grad():
-        for chunk in model_chunks:
-            for module in chunk.modules():
-                prefix = getattr(module, "adapter_model_prefix", None)
-                if not isinstance(prefix, str) or ".mlp.experts." not in prefix:
-                    continue
-                if prefix.endswith(".gate_up_proj"):
-                    if hasattr(module, "A_T"):
-                        _zero_gpt_oss_lora_padding_tensor_set(
-                            cast(torch.nn.Parameter, module.A_T),
-                            dim=-2,
-                            logical=logical_hidden,
-                            internal=internal_hidden,
-                            components=(internal_hidden,),
-                            grads=grads,
-                            params=params,
-                        )
-                    if hasattr(module, "B_T"):
-                        _zero_gpt_oss_lora_padding_tensor_set(
-                            cast(torch.nn.Parameter, module.B_T),
-                            dim=-1,
-                            logical=logical_ffn,
-                            internal=internal_ffn,
-                            components=(internal_ffn, internal_ffn),
-                            grads=grads,
-                            params=params,
-                        )
-                elif prefix.endswith(".down_proj"):
-                    if hasattr(module, "A_T"):
-                        _zero_gpt_oss_lora_padding_tensor_set(
-                            cast(torch.nn.Parameter, module.A_T),
-                            dim=-2,
-                            logical=logical_ffn,
-                            internal=internal_ffn,
-                            components=(internal_ffn,),
-                            grads=grads,
-                            params=params,
-                        )
-                    if hasattr(module, "B_T"):
-                        _zero_gpt_oss_lora_padding_tensor_set(
-                            cast(torch.nn.Parameter, module.B_T),
-                            dim=-1,
-                            logical=logical_hidden,
-                            internal=internal_hidden,
-                            components=(internal_hidden,),
-                            grads=grads,
-                            params=params,
-                        )
+        for prefix, a_t, b_t in art_lora.iter_lora_sites(model_chunks):
+            if ".mlp.experts." not in prefix:
+                continue
+            if prefix.endswith(".gate_up_proj"):
+                _zero_gpt_oss_lora_padding_tensor_set(
+                    a_t,
+                    dim=-2,
+                    logical=logical_hidden,
+                    internal=internal_hidden,
+                    components=(internal_hidden,),
+                    grads=grads,
+                    params=params,
+                )
+                _zero_gpt_oss_lora_padding_tensor_set(
+                    b_t,
+                    dim=-1,
+                    logical=logical_ffn,
+                    internal=internal_ffn,
+                    components=(internal_ffn, internal_ffn),
+                    grads=grads,
+                    params=params,
+                )
+            elif prefix.endswith(".down_proj"):
+                _zero_gpt_oss_lora_padding_tensor_set(
+                    a_t,
+                    dim=-2,
+                    logical=logical_ffn,
+                    internal=internal_ffn,
+                    components=(internal_ffn,),
+                    grads=grads,
+                    params=params,
+                )
+                _zero_gpt_oss_lora_padding_tensor_set(
+                    b_t,
+                    dim=-1,
+                    logical=logical_hidden,
+                    internal=internal_hidden,
+                    components=(internal_hidden,),
+                    grads=grads,
+                    params=params,
+                )
 
 
 def _zero_gpt_oss_lora_padding_state_tensor(
