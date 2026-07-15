@@ -112,6 +112,10 @@ class MonarchTrainerActor(Actor):
         self._host_id = placement.host_id
         os.environ["LOCAL_RANK"] = str(placement.gpu_id)
         torch.cuda.set_device(placement.gpu_id)
+        if topology.ep > 1:
+            from art.megatron.hybrid_ep_setup import validate_hybrid_ep
+
+            validate_hybrid_ep()
         from art.megatron.train import build_training_runtime
 
         dtype = {
