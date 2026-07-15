@@ -26,6 +26,10 @@ class ModelService(Protocol):
 
     async def release_exact_adapter(self, step: int) -> None: ...
 
+    async def resolve_global_grad_accumulation_sequences(
+        self, config: types.TrainConfig
+    ) -> int: ...
+
     def train(
         self,
         disk_packed_tensors: DiskPackedTensors,

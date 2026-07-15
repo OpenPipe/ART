@@ -672,6 +672,22 @@ class UnslothService:
             await self._unload_exact_adapter(step)
             del self._exact_adapter_refcounts[step]
 
+    async def resolve_global_grad_accumulation_sequences(
+        self, config: types.TrainConfig
+    ) -> int:
+        configured = int(
+            self.config.get("trainer_args", {}).get("gradient_accumulation_steps", 1)
+        )
+        if configured < 1:
+            raise ValueError("Unsloth gradient accumulation must be >= 1")
+        requested = config.grad_accumulation_sequences
+        if requested is not None and requested != configured:
+            raise ValueError(
+                f"UnslothService is configured for "
+                f"grad_accumulation_sequences={configured}, got {requested}"
+            )
+        return configured
+
     async def _unload_adapter_name(self, lora_name: str) -> bool:
         import httpx
 
