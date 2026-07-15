@@ -14,6 +14,7 @@ import signal
 import sys
 import time
 from typing import (
+    TYPE_CHECKING,
     Any,
     AsyncIterator,
     Generic,
@@ -53,6 +54,9 @@ from .checkpoint_retention import (
 from .state import PipelineState
 from .status import StatusReporter
 from .types import ConfigT, EvalFn, RolloutFn, ScenarioT, SingleRolloutFn  # noqa: F401
+
+if TYPE_CHECKING:
+    from art.distributed.rollout import RolloutExecutor
 
 PIPELINE_STATE_KEY = "_pipeline_trainer"
 _ROLLOUT_WALL_TIME_KEY = "_art_rollout_wall_s"
@@ -179,6 +183,7 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
         checkpoint_retention_interval: int = 1,
         # Resumption
         resume: bool = True,
+        rollout_executor: RolloutExecutor | None = None,
     ) -> None:
         autotune = autotune or PipelineAutotuneConfig()
         if autotune.mode != "off" and pipeline is not None:
@@ -207,6 +212,11 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
         self.model = model
         self.backend = backend
         self.rollout_fn = rollout_fn
+        if rollout_executor is None:
+            from art.distributed.rollout import LocalRolloutExecutor
+
+            rollout_executor = LocalRolloutExecutor()
+        self._rollout_executor = rollout_executor
         self.config = config
         self.eval_fn = eval_fn
         self.pipeline = pipeline
@@ -266,6 +276,7 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
         self._rollout_worker_controller = RolloutWorkerController(
             self, self.num_rollout_workers
         )
+        self._rollout_executor.set_target(self.num_rollout_workers)
         self._attachments: list[PipelineAutotunerAttachment] = []
         if self.autotune.mode != "off":
             self._attachments.append(PipelineAutotunerAttachment(self.autotune))
@@ -462,6 +473,7 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
         self.queue_maxsize = settings.queue_maxsize
         self._discard_queue_limit = self.discard_queue_multiplier * self.min_batch_size
         self._rollout_worker_controller.set_target(self.num_rollout_workers)
+        self._rollout_executor.set_target(self.num_rollout_workers)
         if self._output_queue is not None:
             cast(Any, self._output_queue)._maxsize = self.queue_maxsize
         self._status._num_workers = self.num_rollout_workers
@@ -772,7 +784,13 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
                 rollout_started = time.monotonic()
                 try:
                     async with self._adapter_lease(initial_version):
-                        group = await self.rollout_fn(self.model, scenario, self.config)
+                        group = await self._rollout_executor.run(
+                            worker_id,
+                            self.rollout_fn,
+                            self.model,
+                            scenario,
+                            self.config,
+                        )
                 finally:
                     token.var.reset(token)
                 rollout_wall_s = time.monotonic() - rollout_started

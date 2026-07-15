@@ -1,3 +1,5 @@
+from .data_plane import PackedBatchRef, TensorSpec
+from .rollout import InstalledAsyncCallable, LocalRolloutExecutor
 from .specs import (
     ClusterSpec,
     EndpointSpec,
@@ -51,8 +53,11 @@ __all__ = [
     "compile_topology",
     "HostMemberLaunchRequest",
     "HostMemberState",
+    "InstalledAsyncCallable",
     "KvCacheEvent",
+    "LocalRolloutExecutor",
     "ManagedVllmHostLauncher",
+    "PackedBatchRef",
     "PolicyGenerationCommitError",
     "PrefixBlockHashes",
     "PreparedRoutingTable",
@@ -70,4 +75,5 @@ __all__ = [
     "RoutingQueueFullError",
     "RoutingTable",
     "RoutingUnavailableError",
+    "TensorSpec",
 ]

@@ -48,6 +48,7 @@ class RolloutWorkerController:
             )
             self._tasks[worker_id] = task
             active.append(worker_id)
+        self.trainer._rollout_executor.set_workers(tuple(active))
 
     async def _raise_finished_errors(self) -> None:
         for worker_id, task in list(self._tasks.items()):

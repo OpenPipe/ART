@@ -92,6 +92,7 @@ tinker = [
 
 [project.scripts]
 art = "art.cli:app"
+art-monarch = "art.distributed.monarch_bootstrap:main"
 
 [build-system]
 requires = ["hatchling"]
