@@ -32,6 +32,7 @@ _AUTO_GPU_HOURLY_PRICING_USD = {
 import httpx
 import numpy as np
 import polars as pl
+from pydantic import BaseModel, ConfigDict
 import torch
 from tqdm import auto as tqdm
 from transformers import AutoTokenizer
@@ -110,6 +111,19 @@ from .checkpoints import (
     delete_checkpoints,
 )
 from .service import ModelService
+
+
+class _PackedTrainingBatch(BaseModel):
+    model_config = ConfigDict(extra="forbid", arbitrary_types_allowed=True)
+
+    payload: Any
+    num_sequences: int
+    sequence_length: int
+    trainable_assistant_tokens: int
+    non_padding_tokens: int
+    logical_tokens: int
+    physical_tokens: int
+    include_moe_routing: bool
 
 
 def _prometheus_values(text: str, name: str) -> list[float]:
@@ -1413,22 +1427,13 @@ class LocalBackend:
             include_trainable_groups=True,
         )
         include_moe_routing = self._model_uses_expert_replay(model)
-        packed_tensors = self._get_packed_tensors(
+        packed_batch = await self._prepare_training_batch(
             model,
             trajectory_groups,
-            advantage_balance=dev_config.get("advantage_balance", 0.0),
-            allow_training_without_logprobs=dev_config.get(
-                "allow_training_without_logprobs", False
-            ),
-            scale_rewards=dev_config.get("scale_rewards", True),
-            plot_tensors=dev_config.get("plot_tensors", False),
-            packed_sequence_length=dev_config.get("packed_sequence_length"),
-            logprob_calculation_chunk_size=dev_config.get(
-                "logprob_calculation_chunk_size", 1024
-            ),
+            dev_config,
             include_moe_routing=include_moe_routing,
         )
-        if packed_tensors is None:
+        if packed_batch is None:
             print(
                 "Skipping tuning as there is no suitable data. "
                 "This can happen when all the trajectories in the same group "
@@ -1486,14 +1491,11 @@ class LocalBackend:
             }
             return
         base_metrics["data/step_trainable_assistant_tokens"] = float(
-            packed_tensors["assistant_mask"].sum().item()
+            packed_batch.trainable_assistant_tokens
         )
-        packed_sequences, packed_sequence_length = packed_tensors["tokens"].shape
-        non_padding_tokens = int((packed_tensors["group_ids"] != -1).sum().item())
-        packing_stats = packed_tensors["prefix_tree_packing_stats"]
-        disk_packed_tensors = packed_tensors_to_dir(
-            packed_tensors, f"{get_model_dir(model=model, art_path=self._path)}/tensors"
-        )
+        packed_sequences = packed_batch.num_sequences
+        packed_sequence_length = packed_batch.sequence_length
+        non_padding_tokens = packed_batch.non_padding_tokens
         service_dev_config = cast(dev.TrainConfig, {**dev_config})
         grad_accumulation_sequences = await self._resolve_grad_accumulation_sequences(
             service,
@@ -1516,14 +1518,108 @@ class LocalBackend:
                     float(packed_train_tokens - non_padding_tokens)
                     / packed_train_tokens
                 ),
-                "prefix_tree/logical_tokens": float(packing_stats["logical_tokens"]),
-                "prefix_tree/physical_tokens": float(packing_stats["physical_tokens"]),
+                "prefix_tree/logical_tokens": float(packed_batch.logical_tokens),
+                "prefix_tree/physical_tokens": float(packed_batch.physical_tokens),
                 "prefix_tree/compression_ratio": (
-                    packing_stats["logical_tokens"] / packing_stats["physical_tokens"]
+                    packed_batch.logical_tokens / packed_batch.physical_tokens
                 ),
             }
         )
-        if include_moe_routing:
+        # Note: scale_learning_rate_by_reward_std_dev is now handled by the frontend (Model.train())
+        pbar = tqdm.tqdm(total=fallback_gradient_steps, desc="train")
+        reported_gradient_steps: int | None = None
+        try:
+            async for result in self._stream_prepared_training(
+                model,
+                service,
+                packed_batch,
+                config,
+                service_dev_config,
+                grad_accumulation_sequences,
+                verbose,
+            ):
+                raw_num_gradient_steps = result.pop(TRAIN_GRADIENT_STEPS_KEY, None)
+                if raw_num_gradient_steps is not None:
+                    num_gradient_steps = int(raw_num_gradient_steps)
+                    if reported_gradient_steps is None:
+                        reported_gradient_steps = num_gradient_steps
+                        if pbar.total != num_gradient_steps:
+                            pbar.total = num_gradient_steps
+                            pbar.refresh()
+                    else:
+                        assert num_gradient_steps == reported_gradient_steps, (
+                            f"num_gradient_steps {num_gradient_steps} != reported_gradient_steps {reported_gradient_steps}"
+                        )
+                else:
+                    num_gradient_steps = (
+                        reported_gradient_steps or fallback_gradient_steps
+                    )
+                yield {
+                    **base_metrics,
+                    **result,
+                    TRAIN_GRADIENT_STEPS_KEY: float(num_gradient_steps),
+                }
+                pbar.update(1)
+                pbar.set_postfix(result)
+        finally:
+            pbar.close()
+        # Note: Metrics logging is now handled by the frontend (Model.train())
+        if verbose:
+            print("_train_model complete")
+
+    async def _prepare_training_batch(
+        self,
+        model: TrainableModel,
+        trajectory_groups: list[TrajectoryGroup],
+        dev_config: dev.TrainConfig,
+        *,
+        include_moe_routing: bool,
+    ) -> _PackedTrainingBatch | None:
+        packed = self._get_packed_tensors(
+            model,
+            trajectory_groups,
+            advantage_balance=dev_config.get("advantage_balance", 0.0),
+            allow_training_without_logprobs=dev_config.get(
+                "allow_training_without_logprobs", False
+            ),
+            scale_rewards=dev_config.get("scale_rewards", True),
+            plot_tensors=dev_config.get("plot_tensors", False),
+            packed_sequence_length=dev_config.get("packed_sequence_length"),
+            logprob_calculation_chunk_size=dev_config.get(
+                "logprob_calculation_chunk_size", 1024
+            ),
+            include_moe_routing=include_moe_routing,
+        )
+        if packed is None:
+            return None
+        num_sequences, sequence_length = packed["tokens"].shape
+        packing_stats = packed["prefix_tree_packing_stats"]
+        return _PackedTrainingBatch(
+            payload=packed,
+            num_sequences=num_sequences,
+            sequence_length=sequence_length,
+            trainable_assistant_tokens=int(packed["assistant_mask"].sum().item()),
+            non_padding_tokens=int((packed["group_ids"] != -1).sum().item()),
+            logical_tokens=packing_stats["logical_tokens"],
+            physical_tokens=packing_stats["physical_tokens"],
+            include_moe_routing=include_moe_routing,
+        )
+
+    async def _stream_prepared_training(
+        self,
+        model: TrainableModel,
+        service: ModelService,
+        batch: _PackedTrainingBatch,
+        config: TrainConfig,
+        service_dev_config: dev.TrainConfig,
+        grad_accumulation_sequences: int,
+        verbose: bool,
+    ) -> AsyncIterator[dict[str, float]]:
+        packed = cast(PackedTensors, batch.payload)
+        disk = packed_tensors_to_dir(
+            packed, f"{get_model_dir(model=model, art_path=self._path)}/tensors"
+        )
+        if batch.include_moe_routing:
             from ..megatron.routing_replay import (
                 build_moe_routing_replay_bundle_from_packed_tensors,
             )
@@ -1533,42 +1629,13 @@ class LocalBackend:
                 "moe_routing_replay"
             )
             build_moe_routing_replay_bundle_from_packed_tensors(
-                packed_tensors=packed_tensors,
+                packed_tensors=packed,
                 global_grad_accumulation_sequences=grad_accumulation_sequences,
             ).to_dir(routing_replay_dir)
             service_dev_config["moe_routing_replay_path"] = routing_replay_dir
             service_dev_config["moe_routing_replay_strict"] = True
-        # Note: scale_learning_rate_by_reward_std_dev is now handled by the frontend (Model.train())
-        pbar = tqdm.tqdm(total=fallback_gradient_steps, desc="train")
-        reported_gradient_steps: int | None = None
-        async for result in service.train(
-            disk_packed_tensors, config, service_dev_config, verbose
-        ):
-            raw_num_gradient_steps = result.pop(TRAIN_GRADIENT_STEPS_KEY, None)
-            if raw_num_gradient_steps is not None:
-                num_gradient_steps = int(raw_num_gradient_steps)
-                if reported_gradient_steps is None:
-                    reported_gradient_steps = num_gradient_steps
-                    if pbar.total != num_gradient_steps:
-                        pbar.total = num_gradient_steps
-                        pbar.refresh()
-                else:
-                    assert num_gradient_steps == reported_gradient_steps, (
-                        f"num_gradient_steps {num_gradient_steps} != reported_gradient_steps {reported_gradient_steps}"
-                    )
-            else:
-                num_gradient_steps = reported_gradient_steps or fallback_gradient_steps
-            yield {
-                **base_metrics,
-                **result,
-                TRAIN_GRADIENT_STEPS_KEY: float(num_gradient_steps),
-            }
-            pbar.update(1)
-            pbar.set_postfix(result)
-        pbar.close()
-        # Note: Metrics logging is now handled by the frontend (Model.train())
-        if verbose:
-            print("_train_model complete")
+        async for result in service.train(disk, config, service_dev_config, verbose):
+            yield result
 
     async def _resolve_grad_accumulation_sequences(
         self,
