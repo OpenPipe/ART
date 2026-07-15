@@ -323,7 +323,9 @@ class ManagedVllmRuntime:
         self.host = launch_config.host
         self.port = launch_config.port
         api_key = launch_config.server_args.get("api_key")
-        self.api_key = api_key if isinstance(api_key, str) else None
+        if api_key is not None and (not isinstance(api_key, str) or not api_key):
+            raise ValueError("vLLM api_key must be a non-empty string")
+        self.api_key = api_key
         self.nccl_so_path = (
             str(get_vllm_runtime_nccl_so_path())
             if launch_config.rollout_weights_mode == "merged"
@@ -336,11 +338,15 @@ class ManagedVllmRuntime:
         os.makedirs(log_dir, exist_ok=True)
         self.log_path = os.path.join(log_dir, "vllm-runtime.log")
         self.log_file = open(self.log_path, "w", buffering=1)
+        env = _vllm_runtime_subprocess_env(cmd)
+        env.pop("VLLM_API_KEY", None)
+        if self.api_key is not None:
+            env["VLLM_API_KEY"] = self.api_key
         self.process = subprocess.Popen(
             managed_process_cmd(cmd),
             cwd=str(get_vllm_runtime_working_dir()),
             env={
-                **_vllm_runtime_subprocess_env(cmd),
+                **env,
                 "CUDA_VISIBLE_DEVICES": launch_config.visible_devices,
             },
             stdout=self.log_file,
@@ -856,6 +862,9 @@ def _runtime_command_prefix() -> list[str]:
 
 
 def build_vllm_runtime_server_cmd(config: VllmRuntimeLaunchConfig) -> list[str]:
+    server_args = {
+        key: value for key, value in config.server_args.items() if key != "api_key"
+    }
     command = [
         *_runtime_command_prefix(),
         f"--model={config.base_model}",
@@ -870,7 +879,7 @@ def build_vllm_runtime_server_cmd(config: VllmRuntimeLaunchConfig) -> list[str]:
             f"--served-model-name={config.served_model_name}",
             f"--rollout-weights-mode={config.rollout_weights_mode}",
             f"--engine-args-json={json.dumps(config.engine_args)}",
-            f"--server-args-json={json.dumps(config.server_args)}",
+            f"--server-args-json={json.dumps(server_args)}",
         ]
     )
     if config.nnodes > 1:
