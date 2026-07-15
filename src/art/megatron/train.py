@@ -448,7 +448,11 @@ def build_training_runtime(
         ep=int(ps.get_expert_model_parallel_world_size()),
         etp=int(ps.get_expert_tensor_parallel_world_size()),
         vp=int(ps.get_virtual_pipeline_model_parallel_world_size() or 1),
-        num_layers=int(provider.num_layers),
+        num_layers=(
+            None
+            if provider.pipeline_model_parallel_layout is not None
+            else int(provider.num_layers)
+        ),
     )
 
     if rank == 0 and print_env:
@@ -617,6 +621,7 @@ def execute_megatron_rl_job(
         num_sequences, packed_sequence_length = map(int, packed_tensors["tokens"].shape)
         num_steps = math.ceil(num_sequences / global_grad_accumulation_sequences)
         topology = _infer_parallel_topology(runtime.model)
+        has_local_loss_stage = any(chunk_post_process(chunk) for chunk in runtime.model)
         _ensure_hybridep_capacity(
             runtime,
             packed_sequence_length=packed_sequence_length,
@@ -665,7 +670,7 @@ def execute_megatron_rl_job(
                     micro_indices,
                     zero_template,
                 )
-                if ref_logprobs_by_index is not None
+                if ref_logprobs_by_index is not None and has_local_loss_stage
                 else None
             )
             next_step_first_micro = (
@@ -689,7 +694,11 @@ def execute_megatron_rl_job(
                     num_sequences=num_sequences,
                     global_grad_accumulation_sequences=global_grad_accumulation_sequences,
                 )
-                if cp_lookahead_state is not None and ref_logprobs_by_index is not None
+                if (
+                    cp_lookahead_state is not None
+                    and ref_logprobs_by_index is not None
+                    and has_local_loss_stage
+                )
                 else None
             )
             train_step_started = time.perf_counter()
@@ -1596,60 +1605,78 @@ def _zero_logprob_graph_contribution(
     return new_logprobs.masked_fill(~assistant_mask, 0.0).sum() * 0.0
 
 
-def _globalize_context_parallel_logprobs(
+def _globalize_context_parallel_logprob_batch(
     *,
-    local_logprobs: torch.Tensor,
-    attention_state: Any,
+    local_logprobs: list[torch.Tensor],
+    attention_states: list[Any],
     seq_len: int,
-) -> torch.Tensor:
-    rank_plan = getattr(attention_state, "rank_plan", None)
-    cp_group = getattr(attention_state, "cp_group", None)
-    if rank_plan is None or cp_group is None:
-        raise RuntimeError("Context-parallel reference logprobs require a rank plan")
+) -> list[torch.Tensor]:
+    if len(local_logprobs) != len(attention_states):
+        raise ValueError("Context-parallel logprob/state counts differ")
+    rows: list[torch.Tensor] = []
+    cp_group = None
+    for values, attention_state in zip(local_logprobs, attention_states, strict=True):
+        rank_plan = getattr(attention_state, "rank_plan", None)
+        micro_cp_group = getattr(attention_state, "cp_group", None)
+        if rank_plan is None or micro_cp_group is None:
+            raise RuntimeError(
+                "Context-parallel reference logprobs require a rank plan"
+            )
+        if cp_group is not None and micro_cp_group is not cp_group:
+            raise RuntimeError(
+                "Context-parallel microbatches use different process groups"
+            )
+        cp_group = micro_cp_group
+        row = values.new_zeros((1, seq_len))
+        local_values = values.reshape(-1)
+        cursor = 0
+        for range_ in rank_plan.local_row_ranges:
+            if range_ is None:
+                continue
+            size = int(range_.size())
+            if size <= 0:
+                continue
+            row[0, int(range_.start) : int(range_.end)] = local_values[
+                cursor : cursor + size
+            ]
+            cursor += size
+        if cursor != int(local_values.numel()):
+            raise RuntimeError(
+                "Context-parallel reference-logprob layout did not consume all values: "
+                f"consumed={cursor}, values={local_values.numel()}"
+            )
+        rows.append(row)
 
-    global_logprobs = local_logprobs.new_zeros((1, seq_len))
-    local_values = local_logprobs.reshape(-1)
-    cursor = 0
-    for range_ in rank_plan.local_row_ranges:
-        if range_ is None:
-            continue
-        size = int(range_.size())
-        if size <= 0:
-            continue
-        global_logprobs[0, int(range_.start) : int(range_.end)] = local_values[
-            cursor : cursor + size
-        ]
-        cursor += size
-
+    global_logprobs = torch.cat(rows)
     torch.distributed.all_reduce(  # ty: ignore[possibly-missing-attribute]
-        global_logprobs,
-        group=cp_group,
+        global_logprobs, group=cp_group
     )
-    return global_logprobs
+    return list(global_logprobs.split(1))
 
 
 @torch.no_grad()
-def _calculate_megatron_logprobs(
+def _calculate_megatron_logprob_batch(
     *,
     model_chunks: ModelChunks,
     provider: Any,
     model_support_handler: Any,
-    inputs: PackedTensors,
+    inputs: list[PackedTensors],
+    sample_indices: list[int | None],
     moe_routing_replay_controller: MoeRoutingReplayController | None = None,
     step_index: int | None = None,
-    sample_index: int | None = None,
-    hybridep_token_count: int | None = None,
-) -> torch.Tensor:
+    hybridep_token_counts: list[int] | None = None,
+) -> list[torch.Tensor]:
+    if not inputs or len(inputs) != len(sample_indices):
+        raise ValueError("Reference input/sample counts must match and be nonzero")
     if moe_routing_replay_controller is not None:
-        if step_index is None or sample_index is None:
-            raise ValueError(
-                "step_index and sample_index are required for routing replay"
-            )
+        if step_index is None:
+            raise ValueError("step_index is required for routing replay")
         moe_routing_replay_controller.set_step(
             step_index=step_index,
-            sample_index=sample_index,
+            sample_index=(
+                sample_indices[0] if len(sample_indices) == 1 else sample_indices
+            ),
         )
-        moe_routing_replay_controller.begin_micro(sample_index, 0)
 
     device = next(model_chunks[0].parameters()).device
     topology = _infer_parallel_topology(model_chunks)
@@ -1662,77 +1689,88 @@ def _calculate_megatron_logprobs(
         chunk.eval()
     forward_succeeded = False
     try:
-        prepared_micro, _pending_prepared_micro = _prepare_current_rl_micro(
-            inputs,
-            device=device,
-            topology=topology,
-            provider=provider,
-            model_support_handler=model_support_handler,
-            ref_logprobs=None,
-            trace_token_uids=trace_token_uids,
-            pending_prepared_micro=None,
+        pending_prepared_micro: PreparedMegatronBatch | None = None
+        prepared_micros: list[PreparedRLMicroInputs] = []
+        for order, micro in enumerate(inputs):
+            prepared, pending_prepared_micro = _prepare_current_rl_micro(
+                micro,
+                device=device,
+                topology=topology,
+                provider=provider,
+                model_support_handler=model_support_handler,
+                ref_logprobs=None,
+                trace_token_uids=trace_token_uids,
+                pending_prepared_micro=pending_prepared_micro,
+            )
+            prepared_micros.append(prepared)
+            pending_prepared_micro = _prepare_next_rl_cp_micro(
+                _next_micro_lookahead(inputs, order),
+                device=device,
+                topology=topology,
+                provider=provider,
+                model_support_handler=model_support_handler,
+                trace_token_uids=trace_token_uids,
+                ref_logprobs=None,
+            )
+        hybridep_enabled = _validate_hybridep_token_counts(
+            hybridep_token_counts, len(prepared_micros)
         )
-        prepare_replay_local_input_token_uids(
-            moe_routing_replay_controller,
-            prepared_micro.local_token_uids,
-            prepared_micro.attention_state,
-        )
-        if _validate_hybridep_token_counts(
-            None if hybridep_token_count is None else [hybridep_token_count], 1
-        ):
-            assert hybridep_token_count is not None
-            _set_hybridep_token_count(hybridep_token_count)
         if not ps.model_parallel_is_initialized():
             # Unit/static callers do not have MCore process groups. Production
             # reference forwards always take the common schedule path below.
+            if len(prepared_micros) != 1:
+                raise RuntimeError("Static reference forward accepts one microbatch")
+            prepared = prepared_micros[0]
+            if moe_routing_replay_controller is not None:
+                moe_routing_replay_controller.begin_micro(sample_indices[0], 0)
+                prepare_replay_local_input_token_uids(
+                    moe_routing_replay_controller,
+                    prepared.local_token_uids,
+                    prepared.attention_state,
+                )
+            if hybridep_enabled:
+                assert hybridep_token_counts is not None
+                _set_hybridep_token_count(hybridep_token_counts[0])
             token_output = forward_token_losses(
                 model_chunks[0],
-                labels=prepared_micro.model_labels,
-                selection=prepared_micro.lm_head_selection,
+                labels=prepared.model_labels,
+                selection=prepared.lm_head_selection,
                 forward_kwargs=dict(
-                    input_ids=prepared_micro.model_tokens,
-                    position_ids=prepared_micro.model_input_pos,
+                    input_ids=prepared.model_tokens,
+                    position_ids=prepared.model_input_pos,
                     attention_mask=_placeholder_attention_mask(device),
-                    packed_seq_params=prepared_micro.packed_seq_params,
+                    packed_seq_params=prepared.packed_seq_params,
                     **model_support_handler.get_forward_kwargs(
-                        model_chunks[0], attention_bias=prepared_micro.attention_state
+                        model_chunks[0], attention_bias=prepared.attention_state
                     ),
                 ),
                 enabled=False,
             )
             forward_succeeded = True
-            return token_output.restore(-token_output.token_losses).detach().cpu()
-        vp_size = int(ps.get_virtual_pipeline_model_parallel_world_size() or 1)
-        schedule_micro_count = (
-            max(1, int(ps.get_pipeline_model_parallel_world_size()))
-            if vp_size > 1
-            else 1
-        )
+            return [token_output.restore(-token_output.token_losses).detach().cpu()]
         schedule = MCoreScheduleAdapter(
             model_chunks=model_chunks,
             microbatches=[
                 ScheduleMicrobatch(
                     order,
-                    sample_index,
-                    prepared_micro,
-                    prepared_micro.attention_state,
+                    sample_indices[order],
+                    prepared,
+                    prepared.attention_state,
                 )
-                for order in range(schedule_micro_count)
+                for order, prepared in enumerate(prepared_micros)
             ],
             microbatch_shapes=[
                 (
-                    int(prepared_micro.model_tokens.shape[0]),
-                    int(prepared_micro.model_tokens.shape[1]),
+                    int(prepared.model_tokens.shape[0]),
+                    int(prepared.model_tokens.shape[1]),
                 )
-            ]
-            * schedule_micro_count,
+                for prepared in prepared_micros
+            ],
             routing_replay_enabled=moe_routing_replay_controller is not None,
             activate_microbatch=_schedule_microbatch_activator(
                 moe_routing_replay_controller=moe_routing_replay_controller,
                 hybridep_token_counts=(
-                    None
-                    if hybridep_token_count is None
-                    else [hybridep_token_count] * schedule_micro_count
+                    hybridep_token_counts if hybridep_enabled else None
                 ),
             ),
         )
@@ -1748,8 +1786,11 @@ def _calculate_megatron_logprobs(
                 device=device,
             )
 
-            def collect(output_tensor: torch.Tensor, **_kwargs: Any) -> torch.Tensor:
-                return token_output.restore(-output_tensor).detach().cpu()
+            def collect(output_tensor: torch.Tensor, **_kwargs: Any) -> dict[str, Any]:
+                return {
+                    "order": item.order,
+                    "logprobs": token_output.restore(-output_tensor).detach(),
+                }
 
             return token_output.token_losses, collect
 
@@ -1758,25 +1799,61 @@ def _calculate_megatron_logprobs(
             forward_only=True,
             collect_non_loss_data=True,
         )
-        forward_outputs = cast(
-            list[torch.Tensor], _broadcast_from_pipeline_last(forward_outputs)
-        )
-        if not forward_outputs:
-            raise RuntimeError("reference-logprob pipeline forward returned no outputs")
-        logprobs = forward_outputs[0].to(device)
-        if int(topology.cp) > 1:
-            logprobs = _globalize_context_parallel_logprobs(
-                local_logprobs=logprobs,
-                attention_state=prepared_micro.attention_state,
-                seq_len=int(inputs["tokens"].shape[1]),
+        if not any(chunk_post_process(chunk) for chunk in model_chunks):
+            forward_succeeded = True
+            return []
+        outputs = cast(list[dict[str, Any]], forward_outputs)
+        if len(outputs) != len(prepared_micros):
+            raise RuntimeError(
+                "Reference pipeline did not return one result per microbatch: "
+                f"expected={len(prepared_micros)}, got={len(outputs)}"
             )
+        outputs.sort(key=lambda output: int(output["order"]))
+        logprobs = [cast(torch.Tensor, output["logprobs"]) for output in outputs]
+        if int(topology.cp) > 1:
+            logprobs = _globalize_context_parallel_logprob_batch(
+                local_logprobs=logprobs,
+                attention_states=[
+                    prepared.attention_state for prepared in prepared_micros
+                ],
+                seq_len=int(inputs[0]["tokens"].shape[1]),
+            )
+        host_logprobs = torch.cat(logprobs).detach().cpu()
         forward_succeeded = True
+        return list(host_logprobs.split(1))
     finally:
         for chunk, was_training in zip(model_chunks, previous_training_modes):
             chunk.train(was_training)
         if moe_routing_replay_controller is not None and forward_succeeded:
             moe_routing_replay_controller.finalize_step()
-    return logprobs.detach().cpu()
+
+
+def _calculate_megatron_logprobs(
+    *,
+    model_chunks: ModelChunks,
+    provider: Any,
+    model_support_handler: Any,
+    inputs: PackedTensors,
+    moe_routing_replay_controller: MoeRoutingReplayController | None = None,
+    step_index: int | None = None,
+    sample_index: int | None = None,
+    hybridep_token_count: int | None = None,
+) -> torch.Tensor:
+    results = _calculate_megatron_logprob_batch(
+        model_chunks=model_chunks,
+        provider=provider,
+        model_support_handler=model_support_handler,
+        inputs=[inputs],
+        sample_indices=[sample_index],
+        moe_routing_replay_controller=moe_routing_replay_controller,
+        step_index=step_index,
+        hybridep_token_counts=(
+            None if hybridep_token_count is None else [hybridep_token_count]
+        ),
+    )
+    if len(results) != 1:
+        raise RuntimeError("Single reference forward did not run on the loss stage")
+    return results[0]
 
 
 def _precompute_reference_logprobs(
@@ -1792,40 +1869,69 @@ def _precompute_reference_logprobs(
         len(sample_step_indices),
         "local sequences",
     )
-    hybridep_by_step: dict[int, list[int]] = {}
     hybridep_enabled = ps.get_expert_model_parallel_world_size() > 1
     topology = _infer_parallel_topology(runtime.model) if hybridep_enabled else None
     results: dict[int, torch.Tensor] = {}
-    for sample_index, step_index in sorted(sample_step_indices.items()):
-        hybridep_token_count = None
+    if not ps.model_parallel_is_initialized():
+        for sample_index, step_index in sorted(sample_step_indices.items()):
+            results[sample_index] = _calculate_megatron_logprobs(
+                model_chunks=runtime.model,
+                provider=runtime.provider,
+                model_support_handler=runtime.model_support_handler,
+                inputs=select_indexed_inputs(packed_tensors, sample_index),
+                moe_routing_replay_controller=runtime.moe_routing_replay_controller,
+                step_index=step_index,
+                sample_index=sample_index,
+                hybridep_token_count=None,
+            )
+        return results
+
+    num_sequences = int(packed_tensors["tokens"].shape[0])
+    zero_template = _zero_contribution_inputs(
+        _clone_packed_tensors(select_indexed_inputs(packed_tensors, 0))
+    )
+    for step_index in sorted(set(sample_step_indices.values())):
+        micro_indices = build_micro_sample_indices(
+            step_index=step_index,
+            num_sequences=num_sequences,
+            global_grad_accumulation_sequences=global_grad_accumulation_sequences,
+        )
+        hybridep_token_counts = None
         if hybridep_enabled:
             assert topology is not None
-            counts = hybridep_by_step.get(step_index)
-            if counts is None:
-                counts = build_rl_hybridep_token_counts(
-                    packed_tensors=packed_tensors,
-                    step_index=step_index,
-                    num_sequences=int(packed_tensors["tokens"].shape[0]),
-                    global_grad_accumulation_sequences=global_grad_accumulation_sequences,
-                    topology=topology,
-                    provider=runtime.provider,
-                    model_support_handler=runtime.model_support_handler,
-                )
-                hybridep_by_step[step_index] = counts
-            micro_order = (
-                sample_index - step_index * global_grad_accumulation_sequences
-            ) // ps.get_data_parallel_world_size()
-            hybridep_token_count = counts[micro_order]
-        results[sample_index] = _calculate_megatron_logprobs(
+            hybridep_token_counts = build_rl_hybridep_token_counts(
+                packed_tensors=packed_tensors,
+                step_index=step_index,
+                num_sequences=num_sequences,
+                global_grad_accumulation_sequences=global_grad_accumulation_sequences,
+                topology=topology,
+                provider=runtime.provider,
+                model_support_handler=runtime.model_support_handler,
+            )
+        outputs = _calculate_megatron_logprob_batch(
             model_chunks=runtime.model,
             provider=runtime.provider,
             model_support_handler=runtime.model_support_handler,
-            inputs=select_indexed_inputs(packed_tensors, sample_index),
+            inputs=select_micro_inputs(packed_tensors, micro_indices, zero_template),
+            sample_indices=micro_indices,
             moe_routing_replay_controller=runtime.moe_routing_replay_controller,
             step_index=step_index,
-            sample_index=sample_index,
-            hybridep_token_count=hybridep_token_count,
+            hybridep_token_counts=hybridep_token_counts,
         )
+        if not outputs:
+            continue
+        for sample_index, output in zip(micro_indices, outputs, strict=True):
+            if sample_index is not None:
+                if sample_step_indices.get(sample_index) != step_index:
+                    raise RuntimeError(
+                        "Reference microbatch does not match its planned training step: "
+                        f"sample={sample_index}, step={step_index}"
+                    )
+                results[sample_index] = output
+    if any(chunk_post_process(chunk) for chunk in runtime.model) and set(
+        results
+    ) != set(sample_step_indices):
+        raise RuntimeError("Reference forward did not materialize every local sample")
     return results
 
 
