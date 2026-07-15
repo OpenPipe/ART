@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Awaitable
 import json
 import os
 from threading import Event
@@ -419,10 +419,15 @@ class MonarchTrainerRun:
         self._closed = True
         async with self._lock:
             try:
-                await self._actors.close.call()
-            except asyncio.CancelledError:
-                task = asyncio.current_task()
-                if task is not None and task.cancelling():
-                    raise
+                await _remote_teardown(self._actors.close.call())
             finally:
-                await self._proc_mesh.stop()
+                await _remote_teardown(self._proc_mesh.stop())
+
+
+async def _remote_teardown(operation: Awaitable[Any]) -> None:
+    try:
+        await operation
+    except asyncio.CancelledError:
+        task = asyncio.current_task()
+        if task is not None and task.cancelling():
+            raise
