@@ -8,7 +8,10 @@ from typing import Any, Generic, TypeVar, cast
 
 from megatron.core import parallel_state as ps
 from megatron.core.pipeline_parallel.p2p_communication import P2PCommunicator
-from megatron.core.pipeline_parallel.schedules import get_forward_backward_func
+from megatron.core.pipeline_parallel.schedules import (
+    get_forward_backward_func,
+    get_schedule_table,
+)
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.utils import get_model_config
 import torch
@@ -33,23 +36,55 @@ class PipelineScheduleTelemetry:
     pp_size: int
     vp_size: int
     num_microbatches: int
+    micro_batch_size: int
+    seq_length: int
+    microbatch_group_size: int
     compute_s_by_chunk: dict[int, float] = field(default_factory=dict)
+    forward_compute_s_by_chunk: dict[int, float] = field(default_factory=dict)
+    backward_compute_s_by_chunk: dict[int, float] = field(default_factory=dict)
+    forward_host_s_by_chunk: dict[int, float] = field(default_factory=dict)
     forward_calls_by_chunk: dict[int, int] = field(default_factory=dict)
     p2p_s: float = 0.0
     p2p_calls: int = 0
+    p2p_wait_s: float = 0.0
+    p2p_wait_calls: int = 0
     schedule_wall_s: float = 0.0
+    schedule_gpu_s: float = 0.0
+    memory_allocated_start_bytes: int = 0
     peak_memory_bytes: int = 0
+    _cuda_timers: _DeferredCudaTimers | None = field(default=None, repr=False)
+    _metrics_cache: dict[str, float] | None = field(default=None, repr=False)
 
     def metrics(self) -> dict[str, float]:
+        if self._metrics_cache is not None:
+            return dict(self._metrics_cache)
+        self._resolve_cuda_timers()
         metrics = {
             "pipeline/pp_rank": float(self.pp_rank),
             "pipeline/pp_size": float(self.pp_size),
             "pipeline/vp_size": float(self.vp_size),
             "pipeline/num_microbatches": float(self.num_microbatches),
+            "pipeline/micro_batch_size": float(self.micro_batch_size),
+            "pipeline/packed_sequence_length": float(self.seq_length),
+            "pipeline/microbatch_group_size_per_vp_stage": float(
+                self.microbatch_group_size
+            ),
             "pipeline/schedule_wall_s": self.schedule_wall_s,
+            "pipeline/schedule_gpu_s": self.schedule_gpu_s,
             "pipeline/p2p_s": self.p2p_s,
+            "pipeline/p2p_call_host_s": self.p2p_s,
             "pipeline/p2p_calls": float(self.p2p_calls),
+            "pipeline/p2p_wait_host_s": self.p2p_wait_s,
+            "pipeline/p2p_wait_calls": float(self.p2p_wait_calls),
+            "pipeline/memory_allocated_start_bytes": float(
+                self.memory_allocated_start_bytes
+            ),
             "pipeline/peak_memory_bytes": float(self.peak_memory_bytes),
+            "pipeline/ideal_bubble_fraction": pipeline_bubble_fraction(
+                pp_size=self.pp_size,
+                vp_size=self.vp_size,
+                num_microbatches=self.num_microbatches,
+            ),
             "pipeline/bubble_fraction_estimate": pipeline_bubble_fraction(
                 pp_size=self.pp_size,
                 vp_size=self.vp_size,
@@ -58,9 +93,88 @@ class PipelineScheduleTelemetry:
         }
         for chunk, value in sorted(self.compute_s_by_chunk.items()):
             metrics[f"pipeline/chunk_{chunk}/compute_s"] = value
+            metrics[f"pipeline/chunk_{chunk}/forward_compute_s"] = (
+                self.forward_compute_s_by_chunk.get(chunk, 0.0)
+            )
+            metrics[f"pipeline/chunk_{chunk}/backward_compute_s"] = (
+                self.backward_compute_s_by_chunk.get(chunk, 0.0)
+            )
+            metrics[f"pipeline/chunk_{chunk}/forward_host_s"] = (
+                self.forward_host_s_by_chunk.get(chunk, 0.0)
+            )
             metrics[f"pipeline/chunk_{chunk}/forward_calls"] = float(
                 self.forward_calls_by_chunk[chunk]
             )
+        metrics.update(self._stage_metrics())
+        self._metrics_cache = metrics
+        return dict(metrics)
+
+    def _resolve_cuda_timers(self) -> None:
+        timers = self._cuda_timers
+        if timers is None:
+            return
+        timers.synchronize()
+        self.schedule_gpu_s = timers.total("forward-backward")
+        forward = timers.by_chunk("forward-compute")
+        backward = timers.by_chunk("backward-compute")
+        self.forward_compute_s_by_chunk = forward
+        self.backward_compute_s_by_chunk = backward
+        self.compute_s_by_chunk = {
+            chunk: forward.get(chunk, 0.0) + backward.get(chunk, 0.0)
+            for chunk in range(self.vp_size)
+        }
+
+    def _stage_metrics(self) -> dict[str, float]:
+        local = [
+            self.schedule_gpu_s,
+            sum(self.forward_compute_s_by_chunk.values()),
+            sum(self.backward_compute_s_by_chunk.values()),
+            self.p2p_s,
+            self.p2p_wait_s,
+            float(self.peak_memory_bytes),
+            *(
+                self.forward_compute_s_by_chunk.get(chunk, 0.0)
+                for chunk in range(self.vp_size)
+            ),
+            *(
+                self.backward_compute_s_by_chunk.get(chunk, 0.0)
+                for chunk in range(self.vp_size)
+            ),
+        ]
+        rows = [local]
+        if self.pp_size > 1:
+            value = torch.tensor(
+                local, device=torch.cuda.current_device(), dtype=torch.float64
+            )
+            gathered = torch.empty(
+                self.pp_size * value.numel(), device=value.device, dtype=value.dtype
+            )
+            torch.distributed.all_gather_into_tensor(  # ty: ignore[possibly-missing-attribute]
+                gathered,
+                value,
+                group=ps.get_pipeline_model_parallel_group(),
+            )
+            rows = gathered.view(self.pp_size, -1).cpu().tolist()
+
+        metrics: dict[str, float] = {}
+        for stage, row in enumerate(rows):
+            prefix = f"pipeline/stage_{stage}"
+            metrics[f"{prefix}/schedule_gpu_s"] = row[0]
+            metrics[f"{prefix}/forward_compute_s"] = row[1]
+            metrics[f"{prefix}/backward_compute_s"] = row[2]
+            metrics[f"{prefix}/p2p_call_host_s"] = row[3]
+            metrics[f"{prefix}/p2p_wait_host_s"] = row[4]
+            metrics[f"{prefix}/peak_memory_bytes"] = row[5]
+            for chunk in range(self.vp_size):
+                metrics[f"{prefix}/chunk_{chunk}/forward_compute_s"] = row[6 + chunk]
+                metrics[f"{prefix}/chunk_{chunk}/backward_compute_s"] = row[
+                    6 + self.vp_size + chunk
+                ]
+        stage_compute = [row[1] + row[2] for row in rows]
+        max_compute = max(stage_compute, default=0.0)
+        metrics["pipeline/stage_compute_imbalance_fraction"] = (
+            (max_compute - min(stage_compute)) / max_compute if max_compute > 0 else 0.0
+        )
         return metrics
 
 
@@ -160,6 +274,134 @@ def _chunk_attr(model: torch.nn.Module, name: str) -> Any:
     return None
 
 
+class _DeferredCudaTimer:
+    def __init__(self, owner: _DeferredCudaTimers, name: str) -> None:
+        self._owner = owner
+        self._name = name
+        self._start: torch.cuda.Event | None = None
+
+    def start(self, barrier: bool = False) -> None:
+        if self._start is not None:
+            raise RuntimeError(f"CUDA timer {self._name!r} is already running")
+        if barrier:
+            torch.distributed.barrier()  # ty: ignore[possibly-missing-attribute]
+        self._start = torch.cuda.Event(enable_timing=True)
+        self._start.record()
+
+    def stop(self, barrier: bool = False) -> None:
+        if self._start is None:
+            raise RuntimeError(f"CUDA timer {self._name!r} is not running")
+        if barrier:
+            torch.distributed.barrier()  # ty: ignore[possibly-missing-attribute]
+        end = torch.cuda.Event(enable_timing=True)
+        end.record()
+        self._owner.add(self._name, self._start, end)
+        self._start = None
+
+
+class _NullTimer:
+    def start(self, barrier: bool = False) -> None:
+        pass
+
+    def stop(self, barrier: bool = False) -> None:
+        pass
+
+
+class _DeferredCudaTimers:
+    _TIMED_NAMES = {"forward-backward", "forward-compute", "backward-compute"}
+
+    def __init__(
+        self, *, forward_chunks: Sequence[int], backward_chunks: Sequence[int]
+    ):
+        self._chunk_sequences = {
+            "forward-compute": tuple(forward_chunks),
+            "backward-compute": tuple(backward_chunks),
+        }
+        self._timers = {
+            name: _DeferredCudaTimer(self, name) for name in self._TIMED_NAMES
+        }
+        self._null_timer = _NullTimer()
+        self._spans: dict[str, list[tuple[torch.cuda.Event, torch.cuda.Event]]] = {}
+
+    def __call__(self, name: str, **_kwargs: Any) -> _DeferredCudaTimer | _NullTimer:
+        return self._timers.get(name, self._null_timer)
+
+    def add(self, name: str, start: torch.cuda.Event, end: torch.cuda.Event) -> None:
+        self._spans.setdefault(name, []).append((start, end))
+
+    def validate_counts(self, *, forward_only: bool) -> None:
+        names = (
+            ("forward-compute",)
+            if forward_only
+            else (
+                "forward-compute",
+                "backward-compute",
+            )
+        )
+        for name in names:
+            actual = len(self._spans.get(name, ()))
+            expected = len(self._chunk_sequences[name])
+            if actual != expected:
+                raise RuntimeError(
+                    f"MCore {name} count differs from the schedule table: "
+                    f"expected={expected}, got={actual}"
+                )
+
+    def synchronize(self) -> None:
+        schedule = self._spans.get("forward-backward", ())
+        if schedule:
+            schedule[-1][1].synchronize()
+
+    def total(self, name: str) -> float:
+        return (
+            sum(start.elapsed_time(end) for start, end in self._spans.get(name, ()))
+            / 1e3
+        )
+
+    def by_chunk(self, name: str) -> dict[int, float]:
+        spans = self._spans.get(name, ())
+        if not spans:
+            return {}
+        chunks = self._chunk_sequences[name]
+        if len(spans) != len(chunks):
+            raise RuntimeError(
+                f"Cannot resolve {name}: spans={len(spans)}, chunks={len(chunks)}"
+            )
+        values: dict[int, float] = {}
+        for chunk, (start, end) in zip(chunks, spans, strict=True):
+            values[chunk] = values.get(chunk, 0.0) + start.elapsed_time(end) / 1e3
+        return values
+
+
+class _TimedWork:
+    def __init__(self, work: Any, telemetry: PipelineScheduleTelemetry) -> None:
+        self._work = work
+        self._telemetry = telemetry
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._work, name)
+
+    def wait(self, *args: Any, **kwargs: Any) -> Any:
+        start = time.perf_counter()
+        try:
+            return self._work.wait(*args, **kwargs)
+        finally:
+            self._telemetry.p2p_wait_s += time.perf_counter() - start
+            self._telemetry.p2p_wait_calls += 1
+
+
+def _wrap_p2p_work(value: Any, telemetry: PipelineScheduleTelemetry) -> Any:
+    if isinstance(value, torch.distributed.Work):  # ty: ignore[possibly-missing-attribute]
+        return _TimedWork(value, telemetry)
+    if isinstance(value, dict):
+        return {key: _wrap_p2p_work(item, telemetry) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_wrap_p2p_work(item, telemetry) for item in value]
+    if isinstance(value, tuple):
+        return tuple(_wrap_p2p_work(item, telemetry) for item in value)
+    return value
+
+
 class _TimedP2PCommunicator:
     def __init__(
         self, communicator: P2PCommunicator, telemetry: PipelineScheduleTelemetry
@@ -177,10 +419,11 @@ class _TimedP2PCommunicator:
         def timed(*args: Any, **kwargs: Any) -> Any:
             start = time.perf_counter()
             try:
-                return value(*args, **kwargs)
+                result = value(*args, **kwargs)
             finally:
                 self._telemetry.p2p_s += time.perf_counter() - start
                 self._telemetry.p2p_calls += 1
+            return _wrap_p2p_work(result, self._telemetry)
 
         return timed
 
@@ -211,6 +454,7 @@ class MCoreScheduleAdapter(Generic[_T]):
         self.pp_size = int(ps.get_pipeline_model_parallel_world_size())
         self.pp_rank = int(ps.get_pipeline_model_parallel_rank())
         self.vp_size = int(ps.get_virtual_pipeline_model_parallel_world_size() or 1)
+        self.microbatch_group_size = len(self.microbatches)
         if self.vp_size != len(model_chunks):
             raise ValueError(
                 "Local model chunk count must equal VPP size: "
@@ -231,7 +475,22 @@ class MCoreScheduleAdapter(Generic[_T]):
             pp_size=self.pp_size,
             vp_size=self.vp_size,
             num_microbatches=len(self.microbatches),
+            micro_batch_size=self.micro_batch_size,
+            seq_length=self.seq_length,
+            microbatch_group_size=self.microbatch_group_size,
         )
+        forward_chunks = [0] * len(self.microbatches)
+        if self.vp_size > 1:
+            table = get_schedule_table(
+                len(self.microbatches), self.vp_size, self.microbatch_group_size
+            )
+            forward_chunks = [int(chunk) for _, chunk in table]
+        backward_chunks = [self.vp_size - chunk - 1 for chunk in forward_chunks]
+        if torch.cuda.is_available():
+            self.telemetry._cuda_timers = _DeferredCudaTimers(
+                forward_chunks=forward_chunks,
+                backward_chunks=backward_chunks,
+            )
         self._chunk_by_id = {
             id(chunk): index for index, chunk in enumerate(model_chunks)
         }
@@ -255,6 +514,7 @@ class MCoreScheduleAdapter(Generic[_T]):
 
     def _configure(self, *, routing_replay_enabled: bool) -> None:
         seen: set[int] = set()
+        vpp_group: int | None = None
         for chunk in self.model_chunks:
             config = get_model_config(chunk)
             if id(config) in seen:
@@ -276,12 +536,19 @@ class MCoreScheduleAdapter(Generic[_T]):
                     getattr(config, "microbatch_group_size_per_vp_stage", 0)
                     or self.pp_size
                 )
+                if vpp_group is not None and group != vpp_group:
+                    raise ValueError(
+                        "All VPP model chunks must use one microbatch group size: "
+                        f"expected={vpp_group}, got={group}"
+                    )
+                vpp_group = group
                 validate_vpp_microbatch_group(
                     num_microbatches=len(self.microbatches),
                     pp_size=self.pp_size,
                     group_size=group,
                 )
                 config.microbatch_group_size_per_vp_stage = group
+                self.microbatch_group_size = group
                 config.overlap_p2p_comm = True
                 config.batch_p2p_comm = False
             elif self.pp_size > 1:
@@ -351,6 +618,27 @@ class MCoreScheduleAdapter(Generic[_T]):
     def independent_iterators(self) -> list[Iterator[ScheduleMicrobatch[_T]]]:
         return [iter(self.microbatches) for _ in self.model_chunks]
 
+    @contextmanager
+    def _telemetry_timer_context(self) -> Iterator[None]:
+        timers = self.telemetry._cuda_timers
+        if timers is None:
+            yield
+            return
+        configs: list[Any] = []
+        previous: list[Any] = []
+        for chunk in self.model_chunks:
+            config = get_model_config(chunk)
+            if any(config is seen for seen in configs):
+                continue
+            configs.append(config)
+            previous.append(config.timers)
+            config.timers = timers
+        try:
+            yield
+        finally:
+            for config, prior in zip(configs, previous, strict=True):
+                config.timers = prior
+
     def run(
         self,
         forward_step_func: Callable[
@@ -369,8 +657,8 @@ class MCoreScheduleAdapter(Generic[_T]):
                 return forward_step_func(data_iterator, model, *args)
             finally:
                 elapsed = time.perf_counter() - start
-                self.telemetry.compute_s_by_chunk[chunk] = (
-                    self.telemetry.compute_s_by_chunk.get(chunk, 0.0) + elapsed
+                self.telemetry.forward_host_s_by_chunk[chunk] = (
+                    self.telemetry.forward_host_s_by_chunk.get(chunk, 0.0) + elapsed
                 )
                 self.telemetry.forward_calls_by_chunk[chunk] = (
                     self.telemetry.forward_calls_by_chunk.get(chunk, 0) + 1
@@ -394,7 +682,15 @@ class MCoreScheduleAdapter(Generic[_T]):
             pg_collection = _process_group_collection()
         start = time.perf_counter()
         self._active_recompute_state_id = None
-        with self._recompute_activation_hooks(enabled=not forward_only):
+        if torch.cuda.is_available():
+            torch.cuda.reset_peak_memory_stats()
+            self.telemetry.memory_allocated_start_bytes = int(
+                torch.cuda.memory_allocated()
+            )
+        with (
+            self._telemetry_timer_context(),
+            self._recompute_activation_hooks(enabled=not forward_only),
+        ):
             outputs = get_forward_backward_func(
                 pp_size=self.pp_size,
                 vp_size=None if self.vp_size == 1 else self.vp_size,
@@ -411,6 +707,19 @@ class MCoreScheduleAdapter(Generic[_T]):
                 pg_collection=pg_collection,
             )
         self.telemetry.schedule_wall_s = time.perf_counter() - start
+        expected_calls = len(self.microbatches)
+        invalid_calls = {
+            chunk: self.telemetry.forward_calls_by_chunk.get(chunk, 0)
+            for chunk in range(self.vp_size)
+            if self.telemetry.forward_calls_by_chunk.get(chunk, 0) != expected_calls
+        }
+        if invalid_calls:
+            raise RuntimeError(
+                "MCore schedule did not run every local chunk once per microbatch: "
+                f"expected={expected_calls}, got={invalid_calls}"
+            )
+        if self.telemetry._cuda_timers is not None:
+            self.telemetry._cuda_timers.validate_counts(forward_only=forward_only)
         if torch.cuda.is_available():
             self.telemetry.peak_memory_bytes = int(torch.cuda.max_memory_allocated())
         return cast(list[Any], outputs)
