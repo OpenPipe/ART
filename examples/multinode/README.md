@@ -8,8 +8,9 @@ sky launch -c art-multinode examples/multinode/skypilot.yaml
 
 SkyPilot synchronizes `workdir` and runs `setup` on every node before starting
 the same `run` command on every node. ART starts one Monarch worker per node and
-calls the installed deployment smoke only on rank 0. Replace that import path
-with an installed top-level async function that owns your ART run.
+calls the installed deployment smoke only on rank 0. The smoke admits every host
+and runs one CPU rollout on each; replace its import path with an installed
+top-level async function that owns your ART run.
 
 Edit the accelerator and setup commands for your infrastructure. The example
 assumes `uv` is installed in the image and builds both ART and the pinned vLLM
