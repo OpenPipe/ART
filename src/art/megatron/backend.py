@@ -1,3 +1,4 @@
+from pathlib import Path
 from typing import TYPE_CHECKING, Any, AsyncIterator, Iterable, cast
 
 from mp_actors import move_to_child_process
@@ -29,6 +30,16 @@ class MegatronBackend(LocalBackend):
         enable_expert_replay: bool = True,
         runtime: "ArtRuntime | None" = None,
     ) -> None:
+        if runtime is not None:
+            artifact_root = runtime.topology.cluster.artifact_root
+            if artifact_root is None:
+                raise ValueError("distributed Megatron requires cluster.artifact_root")
+            if (
+                path is not None
+                and Path(path).resolve() != Path(artifact_root).resolve()
+            ):
+                raise ValueError("backend path must match cluster.artifact_root")
+            path = artifact_root
         super().__init__(
             in_process=in_process,
             path=path,
