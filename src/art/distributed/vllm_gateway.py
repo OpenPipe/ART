@@ -20,6 +20,7 @@ from aiohttp import (
 )
 from pydantic import BaseModel, ConfigDict, Field, StrictInt
 
+from .specs import EndpointSpec
 from .vllm_kv_events import KvEventSource, VllmKvEventSubscriber
 from .vllm_replica import ReplicaUpdateReport
 from .vllm_router import (
@@ -154,10 +155,15 @@ class VllmGateway:
         self._upstream_pool_size = upstream_pool_size
         self._upstream_slots = asyncio.BoundedSemaphore(upstream_pool_size)
         self._shutdown_timeout_s = shutdown_timeout_s
-        self._kv_subscribers = tuple(
-            VllmKvEventSubscriber(source, self.apply_kv_events, self.invalidate_kv)
-            for source in kv_event_sources
-        )
+        sources = tuple(kv_event_sources)
+        self._kv_subscribers = {
+            (source.replica_id, source.publisher_rank): VllmKvEventSubscriber(
+                source, self.apply_kv_events, self.invalidate_kv
+            )
+            for source in sources
+        }
+        if len(self._kv_subscribers) != len(sources):
+            raise ValueError("KV event sources must be unique per replica publisher")
         self._runner: web.AppRunner | None = None
         self._site: web.SockSite | None = None
         self._socket: socket.socket | None = None
@@ -165,6 +171,7 @@ class VllmGateway:
         self._telemetry_task: asyncio.Task[None] | None = None
         self._admitting = False
         self._close_lock = asyncio.Lock()
+        self._policy_lock = asyncio.Lock()
 
     async def start(self, bind_host: str = "127.0.0.1", port: int = 0) -> int:
         if self._runner is not None:
@@ -199,7 +206,7 @@ class VllmGateway:
         )
         self._telemetry_task = asyncio.create_task(self._refresh_telemetry())
         try:
-            for subscriber in self._kv_subscribers:
+            for subscriber in self._kv_subscribers.values():
                 subscriber.start()
         except BaseException:
             await self.close()
@@ -222,30 +229,34 @@ class VllmGateway:
         self,
         table: RoutingTable,
         reports: tuple[ReplicaUpdateReport, ...],
-    ) -> None:
-        previous = self.router.table.policy_version
-        prepared = self.router.prepare(table)
-        await self.router.verify(prepared, reports)
-        await self.router.commit(prepared)
-        self._policies[table.policy_version] = self.router
-        if previous not in self._pinned_policies:
-            self._policies.pop(previous, None)
+    ) -> int:
+        async with self._policy_lock:
+            previous = self.router.table.policy_version
+            prepared = self.router.prepare(table)
+            await self.router.verify(prepared, reports)
+            committed = await self.router.commit(prepared)
+            self._policies[table.policy_version] = self.router
+            if previous not in self._pinned_policies:
+                self._policies.pop(previous, None)
+            return committed.policy_generation
 
-    def add_policy(self, table: RoutingTable) -> None:
-        version = table.policy_version
-        router = ReplicaRouter(
-            table,
-            telemetry_max_age_s=_TELEMETRY_MAX_AGE_S,
-            max_queued=self._max_queued,
-        )
-        router.inherit_kv(self.router)
-        self._policies[version] = router
-        self._pinned_policies.add(version)
+    async def add_policy(self, table: RoutingTable) -> None:
+        async with self._policy_lock:
+            version = table.policy_version
+            router = ReplicaRouter(
+                table,
+                telemetry_max_age_s=_TELEMETRY_MAX_AGE_S,
+                max_queued=self._max_queued,
+            )
+            router.inherit_kv(self.router)
+            self._policies[version] = router
+            self._pinned_policies.add(version)
 
-    def remove_policy(self, version: str) -> None:
-        self._pinned_policies.discard(version)
-        if version != self.router.table.policy_version:
-            self._policies.pop(version, None)
+    async def remove_policy(self, version: str) -> None:
+        async with self._policy_lock:
+            self._pinned_policies.discard(version)
+            if version != self.router.table.policy_version:
+                self._policies.pop(version, None)
 
     def apply_kv_events(self, events: Iterable[KvCacheEvent]) -> bool:
         """Apply one normalized vLLM publisher batch to every policy view."""
@@ -259,10 +270,109 @@ class VllmGateway:
         for router in set(self._policies.values()):
             router.invalidate_kv(replica_id)
 
-    async def pause(self, reason: str) -> None:
-        await self.router.quarantine(
-            (replica.replica_id for replica in self.router.table.replicas), reason
-        )
+    async def pause(self, reason: str) -> int:
+        async with self._policy_lock:
+            table = await self.router.quarantine(
+                (replica.replica_id for replica in self.router.table.replicas), reason
+            )
+            return table.policy_generation
+
+    async def quarantine_replica(
+        self, replica_id: str, generation: int, reason: str
+    ) -> int:
+        async with self._policy_lock:
+            for router in set(self._policies.values()):
+                await router.quarantine(
+                    (replica_id,),
+                    reason,
+                    expected_generations={replica_id: generation},
+                )
+            return self.router.table.policy_generation
+
+    async def replace_replica(
+        self,
+        *,
+        replica_id: str,
+        previous_generation: int,
+        generation: int,
+        generation_digest: str,
+        endpoint: EndpointSpec,
+        kv_event_sources: Iterable[KvEventSource],
+    ) -> int:
+        sources = tuple(kv_event_sources)
+        if not sources or any(
+            source.replica_id != replica_id or source.generation != generation
+            for source in sources
+        ):
+            raise ValueError(
+                "replacement KV sources do not match the replica generation"
+            )
+        keys = {(source.replica_id, source.publisher_rank) for source in sources}
+        if len(keys) != len(sources):
+            raise ValueError("replacement KV sources contain duplicate publishers")
+        async with self._policy_lock:
+            routers = set(self._policies.values())
+            current_by_router = {}
+            for router in routers:
+                current = next(
+                    (
+                        replica
+                        for replica in router.table.replicas
+                        if replica.replica_id == replica_id
+                    ),
+                    None,
+                )
+                if current is None or current.generation != previous_generation:
+                    raise RuntimeError(
+                        "replica routing generation changed during recovery"
+                    )
+                current_by_router[router] = current
+            old_subscribers = tuple(
+                subscriber
+                for key, subscriber in self._kv_subscribers.items()
+                if key[0] == replica_id
+            )
+            await asyncio.gather(
+                *(subscriber.close() for subscriber in old_subscribers)
+            )
+            new_subscribers = {
+                (source.replica_id, source.publisher_rank): VllmKvEventSubscriber(
+                    source, self.apply_kv_events, self.invalidate_kv
+                )
+                for source in sources
+            }
+            try:
+                for subscriber in new_subscribers.values():
+                    subscriber.start()
+                now = asyncio.get_running_loop().time()
+                for router, current in current_by_router.items():
+                    await router.replace_replica(
+                        current.model_copy(
+                            update={
+                                "endpoint": endpoint,
+                                "phase": "ready",
+                                "generation": generation,
+                                "generation_digest": generation_digest,
+                                "telemetry": current.telemetry.model_copy(
+                                    update={"observed_at": now, "in_flight": 0}
+                                ),
+                                "quarantine_reason": None,
+                            }
+                        ),
+                        expected_generation=previous_generation,
+                    )
+            except BaseException:
+                await asyncio.gather(
+                    *(subscriber.close() for subscriber in new_subscribers.values())
+                )
+                raise
+            self._kv_subscribers = {
+                key: subscriber
+                for key, subscriber in self._kv_subscribers.items()
+                if key[0] != replica_id
+            }
+            self._kv_subscribers.update(new_subscribers)
+            return self.router.table.policy_generation
 
     async def _handle(self, request: web.Request) -> web.StreamResponse:
         if not self._admitting or self._session is None:
@@ -489,7 +599,10 @@ class VllmGateway:
                 self._runner = None
                 try:
                     await asyncio.gather(
-                        *(subscriber.close() for subscriber in self._kv_subscribers)
+                        *(
+                            subscriber.close()
+                            for subscriber in self._kv_subscribers.values()
+                        )
                     )
                 finally:
                     if self._session is not None:

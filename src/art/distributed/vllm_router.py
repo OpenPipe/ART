@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import AsyncIterator, Callable, Iterable
+from collections.abc import AsyncIterator, Callable, Iterable, Mapping
 import hashlib
 import pickle
 import random
@@ -522,23 +522,90 @@ class ReplicaRouter:
             self._condition.notify_all()
             return self._table
 
-    async def quarantine(self, replica_ids: Iterable[str], reason: str) -> RoutingTable:
+    async def quarantine(
+        self,
+        replica_ids: Iterable[str],
+        reason: str,
+        *,
+        expected_generations: Mapping[str, int] | None = None,
+    ) -> RoutingTable:
         ids = set(replica_ids)
         async with self._condition:
+            changed = False
+            replicas = []
+            for replica in self._table.replicas:
+                expected = (
+                    None
+                    if expected_generations is None
+                    else expected_generations.get(replica.replica_id)
+                )
+                matches = replica.replica_id in ids and (
+                    expected_generations is None or expected == replica.generation
+                )
+                if matches and replica.phase != "quarantined":
+                    replica = replica.model_copy(
+                        update={"phase": "quarantined", "quarantine_reason": reason}
+                    )
+                    changed = True
+                replicas.append(replica)
+            if not changed:
+                return self._table
             self._table = self._table.model_copy(
                 update={
-                    "replicas": tuple(
-                        replica.model_copy(
-                            update={"phase": "quarantined", "quarantine_reason": reason}
-                        )
-                        if replica.replica_id in ids
-                        else replica
-                        for replica in self._table.replicas
-                    )
+                    "policy_generation": self._table.policy_generation + 1,
+                    "replicas": tuple(replicas),
                 }
             )
             for replica_id in ids:
                 self.invalidate_kv(replica_id)
+            self._condition.notify_all()
+            return self._table
+
+    async def replace_replica(
+        self, replacement: RoutableReplica, *, expected_generation: int
+    ) -> RoutingTable:
+        async with self._condition:
+            replicas = list(self._table.replicas)
+            for index, current in enumerate(replicas):
+                if current.replica_id == replacement.replica_id:
+                    break
+            else:
+                raise PolicyGenerationCommitError(
+                    f"unknown replica {replacement.replica_id!r}"
+                )
+            if current.generation != expected_generation:
+                raise PolicyGenerationCommitError(
+                    f"replica {current.replica_id!r} generation changed"
+                )
+            if replacement.generation <= expected_generation:
+                raise PolicyGenerationCommitError(
+                    "replacement replica generation must increase"
+                )
+            expected_policy = (
+                self._table.policy_version,
+                self._table.policy_digest,
+                self._table.update_identity,
+            )
+            if (
+                replacement.phase != "ready"
+                or (
+                    replacement.committed_version,
+                    replacement.policy_digest,
+                    replacement.update_identity,
+                )
+                != expected_policy
+            ):
+                raise PolicyGenerationCommitError(
+                    "replacement replica does not match the routed policy"
+                )
+            replicas[index] = replacement
+            self._table = self._table.model_copy(
+                update={
+                    "policy_generation": self._table.policy_generation + 1,
+                    "replicas": tuple(replicas),
+                }
+            )
+            self.invalidate_kv(replacement.replica_id)
             self._condition.notify_all()
             return self._table
 

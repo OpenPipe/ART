@@ -157,12 +157,6 @@ class RolloutHostService(Actor):
             await self._vllm_launcher.stop_member(replica_id, member_id, generation)
 
     @resilient_endpoint
-    async def allocate_port(self) -> int:
-        with socket.socket() as listener:
-            listener.bind(("", 0))
-            return int(listener.getsockname()[1])
-
-    @resilient_endpoint
     async def pack_batch(self, request: PackingRequest) -> PackingResult:
         if self._packer is None:
             from art.megatron.backend import MegatronBackend

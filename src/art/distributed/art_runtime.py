@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import asyncio
 from collections import Counter
-from collections.abc import Mapping
+from collections.abc import Awaitable, Callable, Mapping
 import logging
 from typing import Any
 import uuid
@@ -50,7 +50,12 @@ from .specs import (
     ModelServiceReplicaSpec,
     RuntimeTopology,
 )
-from .vllm_replica import ReplicaLaunchTemplate, ReplicaManager, ReplicaState
+from .vllm_replica import (
+    ReplicaFailure,
+    ReplicaLaunchTemplate,
+    ReplicaManager,
+    ReplicaState,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -511,6 +516,8 @@ class ArtRuntime:
         self,
         spec: ModelServiceReplicaSpec,
         template: ReplicaLaunchTemplate,
+        *,
+        on_failure: Callable[[ReplicaFailure], Awaitable[None]] | None = None,
     ) -> ReplicaState:
         self._require_open()
         configured = {
@@ -527,29 +534,13 @@ class ArtRuntime:
             member.host_id: MonarchVllmHostLauncher(self._host_actors[member.host_id])
             for member in spec.members
         }
-        endpoint_hosts = {
-            spec.leader_endpoint.host: next(
-                member.host_id for member in spec.members if member.leader
-            ),
-            spec.rendezvous.host: next(
-                member.host_id for member in spec.members if member.node_rank == 0
-            ),
-        }
-
-        async def allocate(host: str) -> int:
-            try:
-                host_id = endpoint_hosts[host]
-            except KeyError:
-                raise ValueError(
-                    f"no replica member owns endpoint host {host!r}"
-                ) from None
-            return await launchers[host_id].allocate_port()
-
         manager = ReplicaManager(
             spec,
             launchers,
             template,
-            port_allocator=allocate,
+            on_failure=on_failure,
+            startup_timeout_s=self.topology.cluster.startup_timeout_s,
+            rpc_timeout_s=self.topology.cluster.rpc_timeout_s,
         )
         self._replicas[spec.replica_id] = manager
         try:

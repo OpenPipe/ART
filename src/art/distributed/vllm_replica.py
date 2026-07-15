@@ -3,12 +3,10 @@ from __future__ import annotations
 import asyncio
 from collections.abc import Awaitable, Callable, Mapping
 import hashlib
-import inspect
 import json
 import os
 from pathlib import Path
-import socket
-from typing import Literal, Protocol, cast
+from typing import Literal, Protocol
 import uuid
 
 from pydantic import BaseModel, ConfigDict, Field
@@ -20,7 +18,6 @@ from .specs import (
     VLLM_KV_EVENT_HWM,
     VLLM_PREFIX_HASH_BLOCK_SIZE,
     VLLM_PREFIX_HASH_SEED,
-    EndpointSpec,
     ModelServiceMemberSpec,
     ModelServiceReplicaSpec,
     vllm_kv_event_topic,
@@ -109,6 +106,13 @@ class ReplicaState(_Message):
     quarantine_reason: str | None = None
 
 
+class ReplicaFailure(_Message):
+    replica_id: str
+    generation: int = Field(ge=0)
+    generation_digest: str = Field(min_length=1)
+    reason: str = Field(min_length=1)
+
+
 class ReplicaHostLauncher(Protocol):
     async def start_member(
         self, request: HostMemberLaunchRequest
@@ -192,11 +196,13 @@ class ManagedVllmHostLauncher:
     async def stop_member(
         self, replica_id: str, member_id: str, generation: int
     ) -> None:
-        managed = self._members.pop((replica_id, member_id, generation), None)
+        key = (replica_id, member_id, generation)
+        managed = self._members.get(key)
         if managed is None:
             return
         managed.supervisor.close()
         await asyncio.to_thread(managed.runtime.close)
+        self._members.pop(key, None)
 
     async def close(self) -> None:
         keys = tuple(self._members)
@@ -232,9 +238,13 @@ class ReplicaManager:
         launchers: Mapping[str, ReplicaHostLauncher],
         template: ReplicaLaunchTemplate,
         *,
-        port_allocator: Callable[[str], int | Awaitable[int]] | None = None,
+        on_failure: Callable[[ReplicaFailure], Awaitable[None]] | None = None,
+        startup_timeout_s: float = 300.0,
+        rpc_timeout_s: float = 60.0,
         monitor_interval_s: float = 0.25,
     ) -> None:
+        if min(startup_timeout_s, rpc_timeout_s, monitor_interval_s) <= 0:
+            raise ValueError("replica timeouts must be positive")
         missing = {member.host_id for member in spec.members} - launchers.keys()
         if missing:
             raise ValueError(f"replica launchers missing hosts: {sorted(missing)}")
@@ -265,14 +275,12 @@ class ReplicaManager:
         self._template = template
         self._requested_hash_block_size = hash_block_size
         self._hash_block_size: int | None = None
-        self._port_allocator = port_allocator or self._allocate_port
+        self._on_failure = on_failure
+        self._startup_timeout_s = startup_timeout_s
+        self._rpc_timeout_s = rpc_timeout_s
         self._monitor_interval_s = monitor_interval_s
         self._lock = asyncio.Lock()
         self._monitor_task: asyncio.Task[None] | None = None
-        self._used_ports = {
-            (spec.leader_endpoint.host, spec.leader_endpoint.port),
-            (spec.rendezvous.host, spec.rendezvous.port),
-        }
         digest = self._generation_digest(spec)
         self._state = ReplicaState(
             replica_id=spec.replica_id,
@@ -323,93 +331,84 @@ class ReplicaManager:
 
     async def start(self) -> ReplicaState:
         async with self._lock:
-            if self._state.phase != "stopped":
-                raise RuntimeError(f"cannot start replica in {self._state.phase} state")
-            self._state = self._state.model_copy(update={"phase": "starting"})
-            requests = tuple(
-                self._launch_request(member) for member in self._spec.members
+            return await self._start_locked()
+
+    async def _start_locked(self) -> ReplicaState:
+        if self._state.phase != "stopped":
+            raise RuntimeError(f"cannot start replica in {self._state.phase} state")
+        self._state = self._state.model_copy(update={"phase": "starting"})
+        requests = tuple(self._launch_request(member) for member in self._spec.members)
+        tasks = [
+            asyncio.create_task(
+                self._launchers[request.member.host_id].start_member(request)
             )
-            tasks = [
-                asyncio.create_task(
-                    self._launchers[request.member.host_id].start_member(request)
-                )
-                for request in requests
-            ]
-            try:
+            for request in requests
+        ]
+        try:
+            async with asyncio.timeout(self._startup_timeout_s):
                 members = await asyncio.gather(*tasks)
-                if any(member.phase != "ready" for member in members):
-                    raise RuntimeError(f"vLLM gang was not ready: {members!r}")
-            except BaseException as error:
-                for task in tasks:
-                    task.cancel()
-                await asyncio.gather(*tasks, return_exceptions=True)
-                try:
-                    await self._stop_members(requests)
-                except BaseException as cleanup_error:
-                    error = BaseExceptionGroup(
-                        "vLLM gang startup and teardown failed",
-                        [error, cleanup_error],
-                    )
-                self._state = self._state.model_copy(
-                    update={
-                        "phase": "quarantined",
-                        "quarantine_reason": f"gang startup failed: {error}",
-                    }
+            if any(member.phase != "ready" for member in members):
+                raise RuntimeError(f"vLLM gang was not ready: {members!r}")
+        except BaseException as error:
+            for task in tasks:
+                task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+            try:
+                await self._stop_members(requests)
+            except BaseException as cleanup_error:
+                error = BaseExceptionGroup(
+                    "vLLM gang startup and teardown failed",
+                    [error, cleanup_error],
                 )
-                raise error from None
             self._state = self._state.model_copy(
-                update={"phase": "ready", "members": tuple(members)}
+                update={
+                    "phase": "quarantined",
+                    "quarantine_reason": f"gang startup failed: {error}",
+                }
             )
-            self._monitor_task = asyncio.create_task(self._monitor())
-            return self._state
+            raise error from None
+        self._state = self._state.model_copy(
+            update={"phase": "ready", "members": tuple(members)}
+        )
+        self._monitor_task = asyncio.create_task(self._monitor())
+        return self._state
 
     async def stop(self) -> ReplicaState:
         async with self._lock:
-            await self._cancel_monitor()
-            self._state = self._state.model_copy(update={"phase": "closing"})
-            try:
-                await self._stop_current_members()
-            except BaseException as error:
-                self._state = self._state.model_copy(
-                    update={
-                        "phase": "quarantined",
-                        "quarantine_reason": f"replica teardown failed: {error}",
-                    }
-                )
-                raise
-            self._state = self._state.model_copy(
-                update={"phase": "stopped", "members": ()}
-            )
-            self._hash_block_size = None
-            return self._state
+            return await self._stop_locked()
 
-    async def restart(self) -> ReplicaState:
-        await self.stop()
-        generation = self._spec.generation + 1
-        kv_event_port = self._spec.kv_event_base_port
-        kv_replay_port = self._spec.kv_replay_base_port
-        self._spec = self._spec.model_copy(
-            update={
-                "generation": generation,
-                "kv_event_port": kv_event_port,
-                "kv_replay_port": kv_replay_port,
-                "leader_endpoint": EndpointSpec(
-                    host=self._spec.leader_endpoint.host,
-                    port=await self._fresh_port(self._spec.leader_endpoint.host),
-                ),
-                "rendezvous": EndpointSpec(
-                    host=self._spec.rendezvous.host,
-                    port=await self._fresh_port(self._spec.rendezvous.host),
-                ),
-            }
-        )
-        self._state = ReplicaState(
-            replica_id=self._spec.replica_id,
-            generation=generation,
-            generation_digest=self._generation_digest(self._spec),
-            phase="stopped",
-        )
-        return await self.start()
+    async def _stop_locked(self) -> ReplicaState:
+        await self._cancel_monitor()
+        self._state = self._state.model_copy(update={"phase": "closing"})
+        try:
+            await self._stop_current_members()
+        except BaseException as error:
+            self._state = self._state.model_copy(
+                update={
+                    "phase": "quarantined",
+                    "quarantine_reason": f"replica teardown failed: {error}",
+                }
+            )
+            raise
+        self._state = self._state.model_copy(update={"phase": "stopped", "members": ()})
+        self._hash_block_size = None
+        return self._state
+
+    async def restart(self, *, served_model_name: str, lora_path: str) -> ReplicaState:
+        async with self._lock:
+            await self._stop_locked()
+            self._template = self._template.model_copy(
+                update={"served_model_name": served_model_name, "lora_path": lora_path}
+            )
+            generation = self._spec.generation + 1
+            self._spec = self._spec.model_copy(update={"generation": generation})
+            self._state = ReplicaState(
+                replica_id=self._spec.replica_id,
+                generation=generation,
+                generation_digest=self._generation_digest(self._spec),
+                phase="stopped",
+            )
+            return await self._start_locked()
 
     def prepare_update(self, *, update_identity: str) -> ReplicaState:
         if self._state.phase != "ready":
@@ -448,38 +447,74 @@ class ReplicaManager:
         return self._state
 
     async def poll(self) -> ReplicaState:
-        if self._state.phase not in {"ready", "updating"}:
-            return self._state
-        states = await asyncio.gather(
-            *(
-                self._launchers[member.host_id].member_state(
-                    self._spec.replica_id, member.member_id, self._spec.generation
+        failure_event: ReplicaFailure | None = None
+        async with self._lock:
+            if self._state.phase not in {"ready", "updating"}:
+                return self._state
+            states = await asyncio.gather(
+                *(
+                    asyncio.wait_for(
+                        self._launchers[member.host_id].member_state(
+                            self._spec.replica_id,
+                            member.member_id,
+                            self._spec.generation,
+                        ),
+                        self._rpc_timeout_s,
+                    )
+                    for member in self._spec.members
+                ),
+                return_exceptions=True,
+            )
+            failure = next(
+                (
+                    state
+                    for state in states
+                    if isinstance(state, BaseException) or state.phase != "ready"
+                ),
+                None,
+            )
+            if failure is None:
+                self._state = self._state.model_copy(
+                    update={"members": tuple(states)}  # type: ignore[arg-type]
                 )
-                for member in self._spec.members
-            ),
-            return_exceptions=True,
-        )
-        failure = next(
-            (
-                state
-                for state in states
-                if isinstance(state, BaseException) or state.phase != "ready"
-            ),
-            None,
-        )
-        if failure is not None:
-            self.quarantine(f"member failure: {failure}")
+                return self._state
+            reason = f"member failure: {failure}"
+            generation = self._state.generation
+            generation_digest = self._state.generation_digest
+            self.quarantine(reason)
+            failure_event = ReplicaFailure(
+                replica_id=self._spec.replica_id,
+                generation=generation,
+                generation_digest=generation_digest,
+                reason=reason,
+            )
+        notification_error: BaseException | None = None
+        if self._on_failure is not None:
             try:
-                await self._stop_current_members()
+                await self._on_failure(failure_event)
             except BaseException as error:
-                self.quarantine(f"member failure: {failure}; teardown failure: {error}")
-            return self._state
-        self._state = self._state.model_copy(update={"members": tuple(states)})  # type: ignore[arg-type]
+                notification_error = error
+        async with self._lock:
+            if (
+                self._state.generation == failure_event.generation
+                and self._state.phase == "quarantined"
+            ):
+                try:
+                    await self._stop_current_members()
+                except BaseException as error:
+                    reason += f"; teardown failure: {error}"
+                    self.quarantine(reason)
+        if notification_error is not None:
+            raise notification_error
         return self._state
 
     async def _monitor(self) -> None:
+        current = asyncio.current_task()
         try:
-            while self._state.phase in {"ready", "updating"}:
+            while self._monitor_task is current and self._state.phase in {
+                "ready",
+                "updating",
+            }:
                 await asyncio.sleep(self._monitor_interval_s)
                 await self.poll()
         except asyncio.CancelledError:
@@ -520,8 +555,8 @@ class ReplicaManager:
             )
         )
 
-    @staticmethod
     async def _stop_calls(
+        self,
         calls: tuple[tuple[ReplicaHostLauncher, str, str, int], ...],
     ) -> None:
         pending = calls
@@ -529,7 +564,10 @@ class ReplicaManager:
         for _attempt in range(2):
             results = await asyncio.gather(
                 *(
-                    launcher.stop_member(replica_id, member_id, generation)
+                    asyncio.wait_for(
+                        launcher.stop_member(replica_id, member_id, generation),
+                        self._rpc_timeout_s,
+                    )
                     for launcher, replica_id, member_id, generation in pending
                 ),
                 return_exceptions=True,
@@ -611,25 +649,6 @@ class ReplicaManager:
             process_uuid=process_uuid,
             launch_config=launch,
         )
-
-    async def _fresh_port(self, host: str) -> int:
-        for _ in range(100):
-            value = self._port_allocator(host)
-            port = (
-                await cast(Awaitable[int], value)
-                if inspect.isawaitable(value)
-                else value
-            )
-            if (host, port) not in self._used_ports:
-                self._used_ports.add((host, port))
-                return port
-        raise RuntimeError(f"failed to allocate a fresh port on {host}")
-
-    @staticmethod
-    def _allocate_port(_host: str) -> int:
-        with socket.socket() as listener:
-            listener.bind(("", 0))
-            return int(listener.getsockname()[1])
 
     @staticmethod
     def _generation_digest(spec: ModelServiceReplicaSpec) -> str:

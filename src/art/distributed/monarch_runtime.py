@@ -94,9 +94,6 @@ class MonarchVllmHostLauncher:
             self.actor.stop_vllm_member, replica_id, member_id, generation
         )
 
-    async def allocate_port(self) -> int:
-        return int(await call_remote(self.actor.allocate_port))
-
 
 class MonarchPackedBatchInbox:
     def __init__(self, actor: Any) -> None:
