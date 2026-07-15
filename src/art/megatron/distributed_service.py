@@ -72,6 +72,11 @@ from .runtime.specs import (
 from .runtime_config import get_megatron_runtime_config
 
 
+def _consume_task_result(task: asyncio.Future[Any]) -> None:
+    if not task.cancelled():
+        task.exception()
+
+
 class DistributedMegatronService:
     """One model's durable checkpoints and run-scoped distributed runtimes."""
 
@@ -109,6 +114,7 @@ class DistributedMegatronService:
         self._loaded_adapter_steps: set[int] = set()
         self._loaded_exact_adapter_steps: set[int] = set()
         self._exact_adapter_refcounts: dict[int, int] = {}
+        self._close_task: asyncio.Task[None] | None = None
         self._closed = False
 
     @property
@@ -1061,10 +1067,14 @@ class DistributedMegatronService:
         return False
 
     async def aclose(self) -> None:
-        async with self._mutation_lock:
-            if self._closed:
-                return
+        if self._close_task is None:
             self._closed = True
+            self._close_task = asyncio.create_task(self._close())
+            self._close_task.add_done_callback(_consume_task_result)
+        await asyncio.shield(self._close_task)
+
+    async def _close(self) -> None:
+        async with self._mutation_lock:
             operations = []
             if self._gateway is not None:
                 operations.append(self._gateway.close())
