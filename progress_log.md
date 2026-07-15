@@ -4,11 +4,11 @@
 
 - Objective: deliver production-quality single- and multi-node ART with Monarch control, live typed communication, multi-node Megatron and vLLM, efficient replica routing, and unchanged simple single-node usage. Generalized RL is not a prerequisite.
 - Baseline: `base/austin/glm52_cp` at `bc39c128`; implementation branch `austin/monarch_multinode_training`.
-- Completed: baseline/contracts and research gates committed; local/cross-host Monarch, RDMA, and NCCL/GDR smokes passed; native vLLM replica management/router integrated.
-- Active: runtime/data-plane, typed trainer, and PP/VPP workstreams are converging; pinned vLLM 0.23 live leader/headless validation is next.
-- Blocker/risk: no external blocker. Scope is broad, so correctness and throughput gates must prevent speculative abstractions or duplicate execution paths.
-- Next: review and integrate workstream commits, run one-node parity, then provision the two-node H200 validation cluster.
-- Authoritative state: tracker `project_tracking/art/monarch_multinode_training/project.md`; source/base commit `bc39c128`; tracker commit `232b02e`.
+- Completed: contracts/research, cross-host Monarch/RDMA/NCCL smokes, native vLLM replica/router, a real two-node PP2 generation, typed rollout execution, and typed warm-trainer transport are committed.
+- Active: unify the one canonical RDMA batch plane with the trainer run, wire runtime ownership through `MegatronBackend`, then integrate and validate PP/VPP.
+- Blocker/risk: no external blocker. The vLLM API parent does not reap detached engine/member workers, so ART must terminate the full managed process group explicitly.
+- Next: complete RDMA/trainer integration and service cutover, then run one-node parity and the frozen 2x8 H200 GLM matrix.
+- Authoritative state: tracker `project_tracking/art/monarch_multinode_training/project.md` at `a3d8b29`; source/base commit `bc39c128`; implementation head `6605aa89`.
 
 ## Work Blocks
 
@@ -22,3 +22,5 @@
 | 2026-07-15 08:59 | 1h13 | Passed a real cross-host Monarch RDMA ownership probe: one source actor exposed a 128 MiB CPU buffer, both hosts read it concurrently with exact SHA-256 equality, and the owning actor released the handle cleanly. | Probe `scratch/monarch_remote_rdma_smoke.py`. Use actor-owned `RDMABuffer` handles for one transfer per trainer host, POSIX shared memory for host-local rank fanout, and owner-actor release. Root-created or root-dropped handles are invalid in pinned Monarch 0.2. |
 | 2026-07-15 09:09 | 1h23 | Integrated native vLLM replica management and the bounded prefix-aware router, installed the pinned vLLM 0.23 runtime, validated its real native-multiprocessing parser, and passed the focused router suite. | Commit `db7abd06`; 8 focused tests passed on the integrated branch. Next: live 2-host PP=2 serve smoke before GLM scale-up. |
 | 2026-07-15 09:11 | 1h25 | Passed the two-node NCCL preflight on GPU 7: NCCL selected `NET/IB/.../GDRDMA` in both directions, discovered all eight 400 Gb/s HCAs, and sustained 43.908 GB/s algorithm payload on repeated 256 MiB all-reduces. | Probe `scratch/nccl_multinode_preflight.py`. Preserve the validated IB/GDR environment and reject socket fallback for all model tests. |
+| 2026-07-15 09:12 | 1h26 | Passed native vLLM 0.23 PP2 serving across both hosts on one H200 each. Llama-3.2-1B loaded as leader/headless members, `/art/state` reported `nnodes=2`, and deterministic chat returned exactly `YES` with ART token/policy metadata. | Probe `scratch/run_vllm_pp2_smoke.sh`. Startup took about 126 s and used NCCL IB/GDRDMA. Parent cancellation orphaned EngineCore/PP workers, establishing the required managed-process-group teardown fix. |
+| 2026-07-15 09:20 | 1h34 | Integrated the leased batch plane and typed warm-trainer branches, then hardened distributed rollouts: explicit Monarch TCP/PYTHONPATH bootstrap, valid stable actor names, inference-only model snapshots, per-host/version client reuse, and raw metric-delta return. | Commits `283303ec`, `27b20be8`, `daf34750`, `55b8ce6f`, `ef4fc826`, `6605aa89`; focused pipeline/runtime tests and repository pre-commit passed. Next: remove duplicate batch refs and use the proven actor-owned RDMA path. |
