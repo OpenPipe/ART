@@ -475,6 +475,16 @@ class DistributedMegatronService:
             capabilities[0].require(
                 "exact_lora_worker_state", operation="distributed LoRA publication"
             )
+            for replica_id, capability in zip(replica_ids, capabilities, strict=True):
+                hash_block_size = capability.prefix_hash_block_size
+                if hash_block_size is None:
+                    raise RuntimeError(
+                        "distributed prefix routing requires the effective vLLM "
+                        "hash block size"
+                    )
+                self.runtime.replica(replica_id).confirm_prefix_hash_block_size(
+                    hash_block_size
+                )
             digest = await self._checkpoint_digest(lora_path, self._latest_step)
             update_identity = uuid.uuid4().hex
             states = {

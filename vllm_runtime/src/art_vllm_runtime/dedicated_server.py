@@ -161,7 +161,18 @@ def _patch_art_runtime_routes() -> None:
             return JSONResponse(content=get_art_metrics_snapshot())
 
         @router.get("/art/capabilities")
-        async def art_capabilities() -> JSONResponse:
+        async def art_capabilities(raw_request: Request) -> JSONResponse:
+            hash_block_size = await engine(raw_request).engine_core.call_utility_async(
+                "art_kv_cache_hash_block_size"
+            )
+            if (
+                isinstance(hash_block_size, bool)
+                or not isinstance(hash_block_size, int)
+                or hash_block_size <= 0
+            ):
+                raise RuntimeError(
+                    "vLLM returned an invalid effective KV hash block size"
+                )
             return JSONResponse(
                 content={
                     "runtime": "art_vllm",
@@ -172,6 +183,7 @@ def _patch_art_runtime_routes() -> None:
                     "in_flight_lora_updates": True,
                     "policy_token_spans": True,
                     "exact_lora_worker_state": True,
+                    "prefix_hash_block_size": hash_block_size,
                 }
             )
 

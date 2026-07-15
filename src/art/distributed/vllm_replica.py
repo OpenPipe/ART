@@ -263,7 +263,8 @@ class ReplicaManager:
         self._spec = spec
         self._launchers = launchers
         self._template = template
-        self._hash_block_size = hash_block_size
+        self._requested_hash_block_size = hash_block_size
+        self._hash_block_size: int | None = None
         self._port_allocator = port_allocator or self._allocate_port
         self._monitor_interval_s = monitor_interval_s
         self._lock = asyncio.Lock()
@@ -290,7 +291,16 @@ class ReplicaManager:
 
     @property
     def prefix_hash_block_size(self) -> int:
+        if self._hash_block_size is None:
+            raise RuntimeError("vLLM effective hash block size is not confirmed")
         return self._hash_block_size
+
+    def confirm_prefix_hash_block_size(self, value: int) -> None:
+        if isinstance(value, bool) or value <= 0:
+            raise ValueError("vLLM effective hash block size must be positive")
+        if self._hash_block_size not in (None, value):
+            raise RuntimeError("vLLM effective hash block size changed")
+        self._hash_block_size = value
 
     def expected_worker_identities(self) -> tuple[dict[str, int | str], ...]:
         if self._state.phase not in {"ready", "updating"}:
@@ -559,7 +569,7 @@ class ReplicaManager:
             "tokenizer_revision": self._spec.model_revision,
             "enable_prefix_caching": True,
             "prefix_caching_hash_algo": "sha256",
-            "hash_block_size": self._hash_block_size,
+            "hash_block_size": self._requested_hash_block_size,
             "prefill_context_parallel_size": 1,
             "decode_context_parallel_size": 1,
             "kv_events_config": kv_events_config,

@@ -1,7 +1,7 @@
 from typing import Literal
 
 import httpx
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, Field
 
 ServingFeature = Literal[
     "binary_routed_experts",
@@ -24,6 +24,7 @@ class ServingCapabilities(BaseModel):
     in_flight_lora_updates: bool = False
     policy_token_spans: bool = False
     exact_lora_worker_state: bool = False
+    prefix_hash_block_size: int | None = Field(default=None, gt=0)
 
     @classmethod
     def openai_compatible(cls) -> "ServingCapabilities":
