@@ -536,6 +536,17 @@ def tokenize_trajectory_groups(
                     chat_template_kwargs=chat_template_kwargs,
                     tokenizer_instance=_as_tokenizer(tokenizer),
                 )
+                if not allow_training_without_logprobs and any(
+                    trainable and math.isnan(logprob)
+                    for trainable, logprob in zip(
+                        exchange_result.assistant_mask,
+                        exchange_result.logprobs,
+                        strict=True,
+                    )
+                ):
+                    raise RuntimeError(
+                        "Exchange trajectory is missing logprobs for trainable tokens"
+                    )
                 choice_offsets = [
                     index
                     for index, trainable in enumerate(exchange_result.assistant_mask)

@@ -744,7 +744,7 @@ def test_exchange_trajectories_feed_existing_training_tokenizer() -> None:
             # This path only calls decode; the minimal test double is intentional.
             Tokenizer(),  # type: ignore[arg-type, ty:invalid-argument-type]
             [group],
-            allow_training_without_logprobs=True,
+            allow_training_without_logprobs=False,
             scale_rewards=False,
             shuffle_group_trajectories=False,
         )
@@ -752,3 +752,45 @@ def test_exchange_trajectories_feed_existing_training_tokenizer() -> None:
 
     assert [result.token_ids for result in results] == [[1, 2], [1, 3]]
     assert [result.assistant_mask for result in results] == [[0, 1], [0, 1]]
+
+
+def test_exchange_training_requires_logprobs_unless_allowed() -> None:
+    from art.preprocessing.tokenize import TokenizedResult, tokenize_trajectory_groups
+
+    class Tokenizer:
+        name_or_path = "test/model"
+
+        def decode(self, token_id: int) -> str:
+            return str(token_id)
+
+    missing = _chat_exchange([1], [2])
+    missing.response.choices[0].logprobs = None
+    group = art.TrajectoryGroup(
+        [
+            art.Trajectory(
+                exchanges=TrajectoryExchanges(chat_completions=[missing]), reward=1
+            ),
+            art.Trajectory(
+                exchanges=TrajectoryExchanges(
+                    chat_completions=[_chat_exchange([1], [3])]
+                ),
+                reward=0,
+            ),
+        ]
+    )
+
+    def tokenize(*, allow_missing: bool) -> list[TokenizedResult]:
+        return list(
+            tokenize_trajectory_groups(
+                # This exact-token path only calls decode.
+                Tokenizer(),  # type: ignore[arg-type, ty:invalid-argument-type]
+                [group],
+                allow_training_without_logprobs=allow_missing,
+                scale_rewards=False,
+                shuffle_group_trajectories=False,
+            )
+        )
+
+    with pytest.raises(RuntimeError, match="missing logprobs"):
+        tokenize(allow_missing=False)
+    assert len(tokenize(allow_missing=True)) == 2
