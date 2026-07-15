@@ -331,6 +331,7 @@ class TinkerNativeBackend:
             state.renderer,
             state.tokenizer,
             normalize_advantages,
+            base_model=model.base_model,
         )
 
         metrics: dict[str, float] = {
@@ -591,6 +592,8 @@ class TinkerNativeBackend:
                                 )
                             ]
                         ),
+                        prompt_token_ids=prompt_tokens,
+                        token_ids=list(sequence.tokens),
                     )
                 )
 

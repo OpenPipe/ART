@@ -31,13 +31,14 @@ async def simple_rollout(
     client: openai.AsyncOpenAI, model_name: str, prompt: str
 ) -> art.Trajectory:
     messages: art.Messages = [{"role": "user", "content": prompt}]
-    chat_completion = await client.chat.completions.create(
-        messages=messages,
-        model=model_name,
-        max_tokens=10,
-        timeout=60,
-        temperature=1,
-    )
+    with art.Trajectory() as trajectory:
+        chat_completion = await client.chat.completions.create(
+            messages=messages,
+            model=model_name,
+            max_tokens=10,
+            timeout=60,
+            temperature=1,
+        )
     choice = chat_completion.choices[0]
     content = (choice.message.content or "").lower()
     if "yes" in content:
@@ -48,7 +49,8 @@ async def simple_rollout(
         reward = 0.25
     else:
         reward = 0.0
-    return art.Trajectory(messages_and_choices=[*messages, choice], reward=reward)  # type: ignore[attr-defined]
+    trajectory.reward = reward
+    return trajectory
 
 
 @pytest.mark.skipif(
