@@ -237,7 +237,9 @@ def _drop_tilelang_env_paths(value: str | None) -> str | None:
     return os.pathsep.join(kept) if kept else None
 
 
-def _vllm_runtime_subprocess_env() -> dict[str, str]:
+def _vllm_runtime_subprocess_env(
+    runtime_command: list[str] | None = None,
+) -> dict[str, str]:
     """Build a child env isolated from runtime-specific JIT path leaks.
 
     TileLang mutates process env during import. If a vLLM runtime child inherits
@@ -255,6 +257,22 @@ def _vllm_runtime_subprocess_env() -> dict[str, str]:
             env.pop(key, None)
         else:
             env[key] = value
+    runtime_dir = (
+        _runtime_dir_from_bin(Path(runtime_command[0])) if runtime_command else None
+    )
+    if runtime_dir is not None:
+        nvidia_libs = sorted(
+            str(path)
+            for site_packages in (runtime_dir / ".venv" / "lib").glob(
+                "python*/site-packages"
+            )
+            for path in (site_packages / "nvidia").glob("*/lib")
+            if path.is_dir()
+        )
+        inherited = env.get("LD_LIBRARY_PATH", "").split(os.pathsep)
+        env["LD_LIBRARY_PATH"] = os.pathsep.join(
+            (*nvidia_libs, *(path for path in inherited if "/nvidia/" not in path))
+        )
     env[_FLASHINFER_WORKSPACE_ENV] = str(_vllm_runtime_flashinfer_workspace_base())
     return env
 
@@ -307,7 +325,7 @@ class ManagedVllmRuntime:
         self.process = subprocess.Popen(
             managed_process_cmd(cmd),
             cwd=str(get_vllm_runtime_working_dir()),
-            env=_vllm_runtime_subprocess_env(),
+            env=_vllm_runtime_subprocess_env(cmd),
             stdout=self.log_file,
             stderr=subprocess.STDOUT,
             bufsize=1,
