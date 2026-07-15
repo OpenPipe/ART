@@ -24,6 +24,7 @@ if TYPE_CHECKING:
 
 DEFAULT_MONARCH_PORT = 22222
 _INVALID_IDENTIFIER = re.compile(r"\W")
+_MAX_IDENTIFIER_LENGTH = 48
 _MONARCH_TIMEOUT_ENV = (
     "HYPERACTOR_HOST_SPAWN_READY_TIMEOUT",
     "HYPERACTOR_MESSAGE_DELIVERY_TIMEOUT",
@@ -97,10 +98,11 @@ def monarch_identifier(value: str) -> str:
     identifier = _INVALID_IDENTIFIER.sub("_", value)
     if not identifier or identifier[0].isdigit():
         identifier = f"art_{identifier}"
-    if identifier == value:
+    if identifier == value and len(identifier) <= _MAX_IDENTIFIER_LENGTH:
         return identifier
     suffix = hashlib.sha256(value.encode()).hexdigest()[:8]
-    return f"{identifier}_{suffix}"
+    prefix_length = _MAX_IDENTIFIER_LENGTH - len(suffix) - 1
+    return f"{identifier[:prefix_length]}_{suffix}"
 
 
 def _prepare_child_environment() -> None:
