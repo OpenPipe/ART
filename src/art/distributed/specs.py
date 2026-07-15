@@ -91,6 +91,21 @@ class EndpointSpec(_Spec):
         except ValueError:
             return False
 
+    @property
+    def is_routable(self) -> bool:
+        if self.host.lower() == "localhost":
+            return False
+        try:
+            address = ip_address(self.host.strip("[]"))
+        except ValueError:
+            return self.host not in {"0.0.0.0", "::"}
+        return not (
+            address.is_loopback
+            or address.is_unspecified
+            or address.is_link_local
+            or address.is_multicast
+        )
+
 
 class VllmParallelSpec(_Spec):
     tp: int = Field(default=1, ge=1)
@@ -144,6 +159,8 @@ class ModelServiceReplicaSpec(_Spec):
             raise ValueError("member_id values must be unique within a replica")
         if sorted(node_ranks) != list(range(len(self.members))):
             raise ValueError("member node_rank values must be contiguous from zero")
+        if len({member.host_id for member in self.members}) != len(self.members):
+            raise ValueError("native vLLM members must occupy distinct hosts")
         leaders = [member for member in self.members if member.leader]
         if len(leaders) != 1 or leaders[0].node_rank != 0:
             raise ValueError("exactly node_rank 0 must be the replica leader")
@@ -155,8 +172,8 @@ class ModelServiceReplicaSpec(_Spec):
             != self.parallel.world_size
         ):
             raise ValueError("vLLM TP * PP * DP must equal the replica GPU count")
-        if len(self.members) > 1 and self.rendezvous.is_loopback:
-            raise ValueError("multi-host vLLM rendezvous must not use loopback")
+        if len(self.members) > 1 and not self.rendezvous.is_routable:
+            raise ValueError("multi-host vLLM rendezvous must be routable")
         return self
 
     @property

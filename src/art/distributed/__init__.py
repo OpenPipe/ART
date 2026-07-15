@@ -11,6 +11,31 @@ from .specs import (
     VllmParallelSpec,
 )
 from .topology import compile_topology
+from .vllm_replica import (
+    HostMemberLaunchRequest,
+    HostMemberState,
+    ManagedVllmHostLauncher,
+    ReplicaHostLauncher,
+    ReplicaLaunchTemplate,
+    ReplicaManager,
+    ReplicaState,
+    ReplicaUpdateReport,
+)
+from .vllm_router import (
+    KvCacheEvent,
+    PolicyGenerationCommitError,
+    PrefixBlockHashes,
+    PreparedRoutingTable,
+    ReplicaRouter,
+    ReplicaTelemetry,
+    RoutableReplica,
+    RouteReservation,
+    RoutingDeadlineExceededError,
+    RoutingInput,
+    RoutingQueueFullError,
+    RoutingTable,
+    RoutingUnavailableError,
+)
 
 __all__ = [
     "ClusterSpec",
@@ -24,4 +49,25 @@ __all__ = [
     "TrainerMeshSpec",
     "VllmParallelSpec",
     "compile_topology",
+    "HostMemberLaunchRequest",
+    "HostMemberState",
+    "KvCacheEvent",
+    "ManagedVllmHostLauncher",
+    "PolicyGenerationCommitError",
+    "PrefixBlockHashes",
+    "PreparedRoutingTable",
+    "ReplicaHostLauncher",
+    "ReplicaLaunchTemplate",
+    "ReplicaManager",
+    "ReplicaRouter",
+    "ReplicaState",
+    "ReplicaTelemetry",
+    "ReplicaUpdateReport",
+    "RoutableReplica",
+    "RouteReservation",
+    "RoutingDeadlineExceededError",
+    "RoutingInput",
+    "RoutingQueueFullError",
+    "RoutingTable",
+    "RoutingUnavailableError",
 ]

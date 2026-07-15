@@ -5,10 +5,13 @@ import asyncio
 from http import HTTPStatus
 import json
 import os
+import uuid
 
 from pydantic import BaseModel, Field
 
 from art_vllm_runtime.patches import apply_vllm_runtime_patches
+
+_runtime_state: dict[str, object] = {}
 
 
 class _SetServedModelNameRequest(BaseModel):
@@ -35,6 +38,14 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--port", type=int, required=True)
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--cuda-visible-devices", required=True)
+    parser.add_argument("--nnodes", type=int, default=1)
+    parser.add_argument("--node-rank", type=int, default=0)
+    parser.add_argument("--master-addr")
+    parser.add_argument("--master-port", type=int)
+    parser.add_argument("--headless", action="store_true")
+    parser.add_argument("--replica-generation", type=int, default=0)
+    parser.add_argument("--process-uuid")
+    parser.add_argument("--update-identity")
     parser.add_argument("--lora-path", help="Optional initial checkpoint path")
     parser.add_argument("--served-model-name", required=True)
     parser.add_argument(
@@ -119,7 +130,14 @@ def _patch_art_runtime_routes() -> None:
             if not models.base_model_paths:
                 raise RuntimeError("vLLM runtime has no registered base model")
             models.base_model_paths[0].name = body.name
+            _runtime_state["loaded_adapter"] = body.name
+            if "@" in body.name and body.name.rsplit("@", 1)[1].isdigit():
+                _runtime_state["policy_version"] = int(body.name.rsplit("@", 1)[1])
             return JSONResponse(content={"name": body.name})
+
+        @router.get("/art/state")
+        async def art_state() -> JSONResponse:
+            return JSONResponse(content=dict(_runtime_state))
 
         @router.get("/art/metrics")
         async def art_metrics() -> JSONResponse:
@@ -240,6 +258,11 @@ def _patch_art_runtime_routes() -> None:
                     policy_version,
                     models.lora_requests[lora_slot],
                 )
+                _runtime_state.update(
+                    loaded_adapter=public_model_name,
+                    policy_version=policy_version,
+                    update_identity=f"lora:{lora_slot}:{policy_version}",
+                )
                 from art_vllm_runtime.metrics import record_policy_cache_waiting_update
 
                 record_policy_cache_waiting_update(
@@ -316,6 +339,24 @@ def main(argv: list[str] | None = None) -> None:
     engine_args = json.loads(args.engine_args_json)
     server_args = json.loads(args.server_args_json)
 
+    _runtime_state.update(
+        runtime="art_vllm",
+        protocol_version=1,
+        process_uuid=args.process_uuid or uuid.uuid4().hex,
+        generation=args.replica_generation,
+        node_rank=args.node_rank,
+        nnodes=args.nnodes,
+        headless=args.headless,
+        loaded_adapter=args.served_model_name if args.lora_path else None,
+        policy_version=(
+            int(args.served_model_name.rsplit("@", 1)[1])
+            if "@" in args.served_model_name
+            and args.served_model_name.rsplit("@", 1)[1].isdigit()
+            else None
+        ),
+        update_identity=args.update_identity,
+    )
+
     os.environ["CUDA_VISIBLE_DEVICES"] = args.cuda_visible_devices
     os.environ["VLLM_ALLOW_RUNTIME_LORA_UPDATING"] = "1"
     if args.rollout_weights_mode == "merged":
@@ -337,6 +378,17 @@ def main(argv: list[str] | None = None) -> None:
         f"--host={args.host}",
         f"--served-model-name={args.served_model_name}",
     ]
+    if args.nnodes > 1:
+        vllm_args.extend(
+            [
+                f"--nnodes={args.nnodes}",
+                f"--node-rank={args.node_rank}",
+                f"--master-addr={args.master_addr}",
+                f"--master-port={args.master_port}",
+            ]
+        )
+        if args.headless:
+            vllm_args.append("--headless")
     if args.rollout_weights_mode == "lora":
         vllm_args.append("--enable-lora")
         if args.lora_path:
@@ -353,7 +405,13 @@ def main(argv: list[str] | None = None) -> None:
     vllm_parser = make_arg_parser(vllm_parser)
     namespace = vllm_parser.parse_args(vllm_args)
     validate_parsed_serve_args(namespace)
-    asyncio.run(api_server.run_server(namespace))
+    if args.headless:
+        from vllm.entrypoints.cli.serve import run_headless
+
+        namespace.api_server_count = 0
+        run_headless(namespace)
+    else:
+        asyncio.run(api_server.run_server(namespace))
 
 
 if __name__ == "__main__":

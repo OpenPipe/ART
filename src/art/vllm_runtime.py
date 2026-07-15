@@ -14,7 +14,7 @@ from typing import Any, Callable, Literal, Mapping, TypedDict
 from urllib.parse import urlparse
 
 import httpx
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from .utils.lifecycle import (
     ChildProcessSupervisor,
@@ -47,12 +47,55 @@ class VllmRuntimeLaunchConfig(BaseModel):
     base_model: str
     port: int
     host: str = "127.0.0.1"
-    cuda_visible_devices: str
+    cuda_visible_devices: str | None = None
+    local_gpu_ids: tuple[int, ...] | None = None
     lora_path: str | None = None
     served_model_name: str
     rollout_weights_mode: Literal["lora", "merged"]
     engine_args: dict[str, object] = Field(default_factory=dict)
     server_args: dict[str, object] = Field(default_factory=dict)
+    nnodes: int = Field(default=1, ge=1)
+    node_rank: int = Field(default=0, ge=0)
+    master_addr: str | None = None
+    master_port: int | None = Field(default=None, ge=1, le=65535)
+    headless: bool = False
+    replica_generation: int = Field(default=0, ge=0)
+    process_uuid: str | None = None
+    update_identity: str | None = None
+
+    @model_validator(mode="after")
+    def _validate_native_member(self) -> "VllmRuntimeLaunchConfig":
+        explicit = self.local_gpu_ids
+        if explicit is not None:
+            if not explicit or any(gpu_id < 0 for gpu_id in explicit):
+                raise ValueError("local_gpu_ids must contain non-negative GPU IDs")
+            if len(set(explicit)) != len(explicit):
+                raise ValueError("local_gpu_ids must be unique")
+            visible = ",".join(map(str, explicit))
+            if self.cuda_visible_devices not in (None, visible):
+                raise ValueError("cuda_visible_devices must match local_gpu_ids")
+        elif not self.cuda_visible_devices:
+            raise ValueError("cuda_visible_devices or local_gpu_ids is required")
+        if self.node_rank >= self.nnodes:
+            raise ValueError("node_rank must be smaller than nnodes")
+        if self.nnodes == 1:
+            if self.node_rank or self.headless or self.master_addr or self.master_port:
+                raise ValueError("single-node launch cannot set native member options")
+        else:
+            if self.master_addr is None or self.master_port is None:
+                raise ValueError(
+                    "multi-node launch requires master_addr and master_port"
+                )
+            if self.headless != (self.node_rank != 0):
+                raise ValueError("exactly nonzero node ranks must be headless")
+        return self
+
+    @property
+    def visible_devices(self) -> str:
+        if self.local_gpu_ids is not None:
+            return ",".join(map(str, self.local_gpu_ids))
+        assert self.cuda_visible_devices is not None
+        return self.cuda_visible_devices
 
 
 class ExternalVllmRuntimeConfig(BaseModel):
@@ -276,6 +319,24 @@ class ManagedVllmRuntime:
             if timeout is not None
             else float(os.environ.get("ART_DEDICATED_VLLM_TIMEOUT", 1200))
         )
+        if launch_config.headless:
+            await asyncio.sleep(0.1)
+            if self.process.poll() is not None:
+                returncode = self.process.returncode
+                log_path = self.log_path
+                self._cleanup_after_start_error(cleanup_on_error)
+                raise RuntimeError(
+                    f"headless vLLM member exited with code {returncode}. "
+                    f"Check logs at {log_path}"
+                )
+            assert self.log_path is not None
+            child_processes.watch_popen(
+                f"vLLM headless member {launch_config.node_rank}",
+                self.process,
+                log_path=self.log_path,
+            )
+            return self.host, self.port
+
         async with httpx.AsyncClient() as client:
             try:
                 await wait_for_vllm_runtime(
@@ -299,6 +360,31 @@ class ManagedVllmRuntime:
                     f"vLLM subprocess exited with code {returncode}. "
                     f"Check logs at {log_path}"
                 ) from exc
+
+            if launch_config.process_uuid is not None:
+                try:
+                    response = await client.get(
+                        f"{self.base_url}/art/state",
+                        **self.request_kwargs(),
+                        timeout=5.0,
+                    )
+                    response.raise_for_status()
+                    state = response.json()
+                    expected = {
+                        "process_uuid": launch_config.process_uuid,
+                        "generation": launch_config.replica_generation,
+                    }
+                    if any(state.get(key) != value for key, value in expected.items()):
+                        raise RuntimeError(
+                            f"vLLM /art/state identity mismatch: {state!r}"
+                        )
+                except (httpx.HTTPError, RuntimeError, ValueError) as exc:
+                    log_path = self.log_path
+                    self._cleanup_after_start_error(cleanup_on_error)
+                    raise RuntimeError(
+                        "vLLM passed readiness but /art/state was invalid. "
+                        f"Check logs at {log_path}"
+                    ) from exc
 
             try:
                 response = await client.get(
@@ -740,7 +826,7 @@ def build_vllm_runtime_server_cmd(config: VllmRuntimeLaunchConfig) -> list[str]:
         f"--model={config.base_model}",
         f"--port={config.port}",
         f"--host={config.host}",
-        f"--cuda-visible-devices={config.cuda_visible_devices}",
+        f"--cuda-visible-devices={config.visible_devices}",
     ]
     if config.lora_path is not None:
         command.append(f"--lora-path={config.lora_path}")
@@ -752,6 +838,26 @@ def build_vllm_runtime_server_cmd(config: VllmRuntimeLaunchConfig) -> list[str]:
             f"--server-args-json={json.dumps(config.server_args)}",
         ]
     )
+    if config.nnodes > 1:
+        command.extend(
+            [
+                f"--nnodes={config.nnodes}",
+                f"--node-rank={config.node_rank}",
+                f"--master-addr={config.master_addr}",
+                f"--master-port={config.master_port}",
+            ]
+        )
+        if config.headless:
+            command.append("--headless")
+    if config.process_uuid is not None:
+        command.extend(
+            [
+                f"--replica-generation={config.replica_generation}",
+                f"--process-uuid={config.process_uuid}",
+            ]
+        )
+    if config.update_identity is not None:
+        command.append(f"--update-identity={config.update_identity}")
     return command
 
 
