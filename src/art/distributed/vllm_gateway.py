@@ -85,6 +85,10 @@ class VllmGateway:
                 None,
             )
         )
+        if self._required_authorization is not None and not _has_credentials(
+            self._required_authorization
+        ):
+            raise ValueError("configured Authorization header has no credentials")
         self._route_timeout_s = route_timeout_s
         self._runner: web.AppRunner | None = None
         self._socket: socket.socket | None = None
@@ -128,7 +132,7 @@ class VllmGateway:
     ) -> web.StreamResponse:
         expected = self._required_authorization
         if expected is not None and not compare_digest(
-            request.headers.get("Authorization", ""), expected
+            request.headers.get("Authorization", "").encode(), expected.encode()
         ):
             raise web.HTTPUnauthorized(headers={"WWW-Authenticate": "Bearer"})
         return await handler(request)
@@ -364,3 +368,8 @@ def _is_loopback(host: str) -> bool:
         return ip_address(host).is_loopback
     except ValueError:
         return False
+
+
+def _has_credentials(authorization: str) -> bool:
+    scheme, separator, credentials = authorization.partition(" ")
+    return bool(scheme and separator and credentials.strip())
