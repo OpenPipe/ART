@@ -5,7 +5,7 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict
 
-from .data_plane import BatchReservation, PackedBatchRef
+from .data_plane import PackedBatchRef
 from .packing import PackingRequest, PackingResult
 from .rollout import (
     RolloutHostEndpoint,
@@ -102,23 +102,12 @@ class MonarchPackedBatchInbox:
     def __init__(self, actor: Any) -> None:
         self.actor = actor
 
-    async def reserve(self, ref: PackedBatchRef) -> BatchReservation:
-        return await call_remote(self.actor.reserve_batch, ref)
-
-    async def put(
-        self, reservation: BatchReservation, ref: PackedBatchRef, payload: bytes
-    ) -> PackedBatchRef:
-        return await call_remote(self.actor.put_batch, reservation, ref, payload)
-
     async def receive_rdma(
         self, ref: PackedBatchRef, rdma_buffer: Any, *, timeout_s: float
     ) -> PackedBatchRef:
         return await call_remote(
             self.actor.receive_rdma_batch, ref, rdma_buffer, timeout_s
         )
-
-    async def abort(self, reservation_id: str) -> None:
-        await call_remote(self.actor.abort_batch, reservation_id)
 
     async def drop(self, ref: PackedBatchRef) -> None:
         await call_remote(self.actor.drop_batch_ref, ref)

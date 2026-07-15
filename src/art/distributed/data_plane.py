@@ -231,7 +231,6 @@ class SharedMemoryPackedBatchStore:
         self._entries: dict[str, _Entry] = {}
         self._lease_to_batch: dict[str, str] = {}
         self._reservations: dict[str, BatchReservation] = {}
-        self._committed_reservations: dict[str, tuple[str, str]] = {}
         self._used_bytes = 0
         self._reserved_bytes = 0
         self._peak_bytes = 0
@@ -319,28 +318,6 @@ class SharedMemoryPackedBatchStore:
         )
         return reservation
 
-    def commit(
-        self, reservation_id: str, source: PackedBatchRef, payload: bytes
-    ) -> PackedBatchRef:
-        reservation = self._reservations.get(reservation_id)
-        if reservation is None or reservation.batch_id != source.batch_id:
-            raise PackedBatchLeaseError(
-                "unknown or mismatched packed-batch reservation"
-            )
-        if len(payload) != reservation.storage_byte_count:
-            raise ValueError(
-                f"packed-batch payload has {len(payload)} bytes, expected "
-                f"{reservation.storage_byte_count}"
-            )
-        shm = shared_memory.SharedMemory(create=True, size=len(payload))
-        try:
-            _shm_buffer(shm)[:] = payload
-        except BaseException:
-            shm.close()
-            shm.unlink()
-            raise
-        return self._finish_commit(reservation, source, shm)
-
     async def commit_rdma(
         self,
         reservation_id: str,
@@ -382,12 +359,6 @@ class SharedMemoryPackedBatchStore:
         reservation = self._reservations.pop(reservation_id, None)
         if reservation is not None:
             self._reserved_bytes -= reservation.storage_byte_count
-            return
-        committed = self._committed_reservations.pop(reservation_id, None)
-        if committed is not None:
-            batch_id, lease_id = committed
-            self.release(lease_id)
-            self.unlink(batch_id)
 
     def acquire(self, batch_id: str, consumer_id: str) -> PackedBatchRef:
         if not consumer_id:
@@ -403,9 +374,6 @@ class SharedMemoryPackedBatchStore:
         if batch_id is None:
             raise PackedBatchLeaseError(f"unknown packed-batch lease {lease_id!r}")
         self._entry(batch_id).leases.remove(lease_id)
-        for reservation_id, committed in tuple(self._committed_reservations.items()):
-            if committed == (batch_id, lease_id):
-                self._committed_reservations.pop(reservation_id)
 
     def drop(self, ref: PackedBatchRef) -> None:
         """Idempotently release one lease and unlink storage after the last lease."""
@@ -427,15 +395,6 @@ class SharedMemoryPackedBatchStore:
         if self._lease_to_batch.get(ref.lease_id) != ref.batch_id:
             raise PackedBatchLeaseError("packed-batch reference has no active lease")
         return MappedPackedBatch.open(ref)
-
-    def export_bytes(self, ref: PackedBatchRef) -> bytes:
-        if self._lease_to_batch.get(ref.lease_id) != ref.batch_id:
-            raise PackedBatchLeaseError("packed-batch reference has no active lease")
-        payload = bytes(_shm_buffer(self._entry(ref.batch_id).shm))
-        self._transmitted_bytes += len(payload)
-        self._copied_bytes += len(payload)
-        self._copy_count += 1
-        return payload
 
     def note_transmitted(self, byte_count: int) -> None:
         self._transmitted_bytes += byte_count
@@ -510,10 +469,6 @@ class SharedMemoryPackedBatchStore:
         self._reserved_bytes -= reservation.storage_byte_count
         self._entries[ref.batch_id] = _Entry(shm, ref)
         self._lease_to_batch[lease_id] = ref.batch_id
-        self._committed_reservations[reservation.reservation_id] = (
-            ref.batch_id,
-            lease_id,
-        )
         self._used_bytes += ref.storage_byte_count
         self._created_bytes += ref.storage_byte_count
         self._copied_bytes += ref.storage_byte_count
@@ -573,14 +528,6 @@ class PackedBatchInbox:
             capacity_bytes=capacity_bytes,
         )
 
-    async def reserve(self, ref: PackedBatchRef) -> BatchReservation:
-        return self.store.reserve(ref)
-
-    async def put(
-        self, reservation: BatchReservation, ref: PackedBatchRef, payload: bytes
-    ) -> PackedBatchRef:
-        return self.store.commit(reservation.reservation_id, ref, payload)
-
     async def receive_rdma(
         self, ref: PackedBatchRef, rdma_buffer: Any, *, timeout_s: float
     ) -> PackedBatchRef:
@@ -596,50 +543,8 @@ class PackedBatchInbox:
             self.store.abort(reservation.reservation_id)
             raise
 
-    async def abort(self, reservation_id: str) -> None:
-        self.store.abort(reservation_id)
-
     async def drop(self, ref: PackedBatchRef) -> None:
         self.store.drop(ref)
-
-
-class PackedBatchInboxEndpoint(Protocol):
-    async def reserve(self, ref: PackedBatchRef) -> BatchReservation: ...
-
-    async def put(
-        self, reservation: BatchReservation, ref: PackedBatchRef, payload: bytes
-    ) -> PackedBatchRef: ...
-
-    async def abort(self, reservation_id: str) -> None: ...
-
-    async def drop(self, ref: PackedBatchRef) -> None: ...
-
-
-class PackedBatchTransport(Protocol):
-    async def transfer(
-        self,
-        source: SharedMemoryPackedBatchStore,
-        ref: PackedBatchRef,
-        inbox: PackedBatchInboxEndpoint,
-    ) -> PackedBatchRef: ...
-
-
-class ActorBytesTransport:
-    """Pinned-Monarch v1 bulk path: one accounted actor byte payload per host."""
-
-    async def transfer(
-        self,
-        source: SharedMemoryPackedBatchStore,
-        ref: PackedBatchRef,
-        inbox: PackedBatchInboxEndpoint,
-    ) -> PackedBatchRef:
-        reservation = await inbox.reserve(ref)
-        try:
-            payload = source.export_bytes(ref)
-            return await inbox.put(reservation, ref, payload)
-        except BaseException:
-            await inbox.abort(reservation.reservation_id)
-            raise
 
 
 class RDMABatchSourceEndpoint(Protocol):
@@ -650,10 +555,12 @@ class RDMABatchSourceEndpoint(Protocol):
     async def note_transmitted(self, byte_count: int) -> None: ...
 
 
-class RDMABatchInboxEndpoint(PackedBatchInboxEndpoint, Protocol):
+class RDMABatchInboxEndpoint(Protocol):
     async def receive_rdma(
         self, ref: PackedBatchRef, rdma_buffer: Any, *, timeout_s: float
     ) -> PackedBatchRef: ...
+
+    async def drop(self, ref: PackedBatchRef) -> None: ...
 
 
 async def fanout_rdma_packed_batch(
@@ -703,40 +610,8 @@ async def fanout_rdma_packed_batch(
         await source_endpoint.drop(ref.batch_id)
 
 
-async def fanout_packed_batch(
-    *,
-    source: SharedMemoryPackedBatchStore,
-    ref: PackedBatchRef,
-    inboxes: Mapping[str, PackedBatchInboxEndpoint],
-    transport: PackedBatchTransport,
-) -> dict[str, PackedBatchRef]:
-    """Transfer once to each trainer host; release all destinations on failure."""
-
-    async def send(
-        host_id: str, inbox: PackedBatchInboxEndpoint
-    ) -> tuple[str, PackedBatchRef]:
-        return host_id, await transport.transfer(source, ref, inbox)
-
-    tasks = [
-        asyncio.create_task(send(host_id, inbox)) for host_id, inbox in inboxes.items()
-    ]
-    try:
-        gathered = await asyncio.gather(*tasks, return_exceptions=True)
-    except BaseException:
-        for task in tasks:
-            task.cancel()
-        gathered = await asyncio.gather(*tasks, return_exceptions=True)
-        await _release_transferred(inboxes, gathered)
-        raise
-    failures = [result for result in gathered if isinstance(result, BaseException)]
-    if failures:
-        await _release_transferred(inboxes, gathered)
-        raise failures[0]
-    return dict(cast(list[tuple[str, PackedBatchRef]], gathered))
-
-
 async def _release_transferred(
-    inboxes: Mapping[str, PackedBatchInboxEndpoint],
+    inboxes: Mapping[str, RDMABatchInboxEndpoint],
     results: list[tuple[str, PackedBatchRef] | BaseException],
 ) -> None:
     for result in results:

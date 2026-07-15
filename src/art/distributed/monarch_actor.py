@@ -19,7 +19,6 @@ from .artifact_preflight import (
     execute_artifact_probe,
 )
 from .data_plane import (
-    BatchReservation,
     PackedBatchCapacityError,
     PackedBatchInbox,
     PackedBatchLeaseError,
@@ -244,24 +243,10 @@ class RolloutHostService(Actor):
         shm.close()
 
     @resilient_endpoint
-    async def reserve_batch(self, ref: PackedBatchRef) -> BatchReservation:
-        return await self.inbox.reserve(ref)
-
-    @resilient_endpoint
-    async def put_batch(
-        self, reservation: BatchReservation, ref: PackedBatchRef, payload: bytes
-    ) -> PackedBatchRef:
-        return await self.inbox.put(reservation, ref, payload)
-
-    @resilient_endpoint
     async def receive_rdma_batch(
         self, ref: PackedBatchRef, rdma_buffer: Any, timeout_s: float
     ) -> PackedBatchRef:
         return await self.inbox.receive_rdma(ref, rdma_buffer, timeout_s=timeout_s)
-
-    @resilient_endpoint
-    async def abort_batch(self, reservation_id: str) -> None:
-        await self.inbox.abort(reservation_id)
 
     @resilient_endpoint
     async def drop_batch_ref(self, ref: PackedBatchRef) -> None:
