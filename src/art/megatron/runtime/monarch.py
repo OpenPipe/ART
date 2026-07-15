@@ -339,9 +339,10 @@ class MonarchTrainerRun:
                         results = list(values.values())
                         versions = {result["learner_version"] for result in results}
                         ranks = {result["rank"] for result in results}
-                        if versions != {job.learner_version} or ranks != set(
-                            range(len(results))
-                        ):
+                        expected_ranks = set(
+                            range(len(self.runtime_spec.trainer_mesh.ranks))
+                        )
+                        if versions != {job.learner_version} or ranks != expected_ranks:
                             raise RuntimeError(
                                 "trainer ranks did not agree on job completion"
                             )
