@@ -251,6 +251,19 @@ def _vllm_runtime_subprocess_env(
     make one runtime compile kernels from another runtime's venv.
     """
     env = os.environ.copy()
+    service_prefixes = {
+        key.removesuffix("_SERVICE_HOST")
+        for key in env
+        if key.startswith("VLLM_") and key.endswith("_SERVICE_HOST")
+    }
+    for key in tuple(env):
+        if any(
+            key.startswith(f"{prefix}_SERVICE_")
+            or key == f"{prefix}_PORT"
+            or key.startswith(f"{prefix}_PORT_")
+            for prefix in service_prefixes
+        ):
+            env.pop(key)
     for key in _TILELANG_ENV_KEYS:
         value = _drop_tilelang_env_paths(env.get(key))
         if value is None:

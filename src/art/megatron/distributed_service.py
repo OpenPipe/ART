@@ -468,7 +468,8 @@ class DistributedMegatronService:
         values.update(dict((server or {}).get("engine_args", {})))
         for key, value in handler.vllm_engine_args(rollout_weights_mode="lora").items():
             values.setdefault(key, value)
-        values.update(enable_lora=True, enable_sleep_mode=False)
+        values["enable_sleep_mode"] = False
+        values.pop("enable_lora", None)
         values.setdefault("max_loras", 2)
         values.setdefault("generation_config", "vllm")
         for key in ("model", "served_model_name"):
