@@ -61,7 +61,7 @@ from art.megatron.optimizer_state import (
     optimizer_group_decision,
     optimizer_model_lease,
     read_committed_optimizer_step,
-    save_optimizer_state,
+    save_optimizer_state_under_model_lease,
 )
 from art.megatron.provider import (
     ProviderBundle,
@@ -758,6 +758,10 @@ def execute_megatron_rl_job(
             optimizer_save_interval=job.config.optimizer_save_interval,
             final_training_step=job.config.final_training_step,
             adapter_ready=adapter_ready_sink,
+            controller_owns_model_lease=(
+                isinstance(job, TrainJobSpec)
+                and job.output.optimizer_lease_owner == "controller"
+            ),
         )
         if isinstance(job, TrainJobSpec) and job.merged_weight_transfer is not None:
             _sync_merged_weights_to_vllm(
@@ -1161,14 +1165,18 @@ def _save_lora_and_optimizer(
     optimizer_save_interval: int,
     final_training_step: int | None = None,
     adapter_ready: Callable[[], None] | None = None,
+    controller_owns_model_lease: bool = False,
 ) -> OptimizerAdapter:
     assert runtime.optimizer is not None
     with ExitStack() as leases:
-        optimizer_group_decision(
-            runtime,
-            lambda: leases.enter_context(optimizer_model_lease(optimizer_state_path)),
-            operation="optimizer model lease acquisition",
-        )
+        if not controller_owns_model_lease:
+            optimizer_group_decision(
+                runtime,
+                lambda: leases.enter_context(
+                    optimizer_model_lease(optimizer_state_path)
+                ),
+                operation="optimizer model lease acquisition",
+            )
         _save_staged_lora(
             runtime,
             adapter_dtypes=adapter_dtypes,
@@ -1190,12 +1198,11 @@ def _save_lora_and_optimizer(
             optimizer_save_interval=optimizer_save_interval,
             final_training_step=final_training_step,
         ):
-            save_optimizer_state(
+            save_optimizer_state_under_model_lease(
                 runtime,
                 optimizer_state_path=optimizer_state_path,
                 step=step,
                 adapter=adapter,
-                model_lock_held=True,
             )
 
         return adapter

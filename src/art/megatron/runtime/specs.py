@@ -97,6 +97,7 @@ class ExperimentalTrainConfig(_Spec):
 class DurableTrainOutput(_Spec):
     adapter_path: str = Field(min_length=1)
     optimizer_state_path: str = Field(min_length=1)
+    optimizer_lease_owner: Literal["controller", "trainer_rank_zero"]
 
 
 class TrainJobSpec(_Spec):

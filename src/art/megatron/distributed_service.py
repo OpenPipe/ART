@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 import hashlib
 import json
 import os
@@ -42,6 +43,7 @@ from .lora import LORA_ALPHA, default_lora_rank_for_handler
 from .model_support import get_model_support_handler, model_uses_expert_parallel
 from .optimizer_state import (
     OptimizerAdapter,
+    async_optimizer_model_lease,
     format_megatron_resume_message,
     hash_adapter_checkpoint,
     prepare_megatron_resume_state,
@@ -98,7 +100,7 @@ class DistributedMegatronService:
         self._policy_generation = 0
         self._serving_capabilities: ServingCapabilities | None = None
         self._api_key_value: str | None = None
-        self._checkpoint_digests: dict[int, str] = {}
+        self._published_adapters: dict[int, OptimizerAdapter] = {}
         self._loaded_adapter_steps: set[int] = set()
         self._loaded_exact_adapter_steps: set[int] = set()
         self._exact_adapter_refcounts: dict[int, int] = {}
@@ -224,6 +226,20 @@ class DistributedMegatronService:
         self._trainer = await self.runtime.start_trainer(runtime_spec, run_spec)
         return self._trainer
 
+    @asynccontextmanager
+    async def _trainer_transaction(
+        self,
+        trainer: Any,
+        job: TrainJobSpec,
+        leases: Any,
+        *,
+        source: str,
+        staging: str,
+    ) -> AsyncIterator[AsyncIterator[Any]]:
+        async with async_optimizer_model_lease(job.output.optimizer_state_path):
+            await asyncio.to_thread(_copy_checkpoint, source, staging)
+            yield trainer.train(job, leases)
+
     async def train_packed(
         self,
         batch: DistributedPackedBatch,
@@ -236,7 +252,6 @@ class DistributedMegatronService:
             next_step = self._latest_step + 1
             source = get_step_checkpoint_dir(self.output_dir, self._latest_step)
             staging = f"{self.output_dir}/megatron_runtime/staging/{next_step:04d}"
-            await asyncio.to_thread(_copy_checkpoint, source, staging)
             values = {
                 key: value
                 for key, value in experimental_config.items()
@@ -254,56 +269,68 @@ class DistributedMegatronService:
                 output=DurableTrainOutput(
                     adapter_path=staging,
                     optimizer_state_path=self._optimizer_state_path,
+                    optimizer_lease_owner="controller",
                 ),
             )
             adapter_ready = False
             completed = False
             checkpoint: str | None = None
-            async for event in trainer.train(job, batch.leases):
-                if event.job_id != job.job_id or event.run_id != job.run_id:
-                    raise RuntimeError("trainer returned an event for a different job")
-                if isinstance(event, TrainAccepted):
-                    continue
-                if isinstance(event, TrainProgress):
-                    yield event.metrics
-                    continue
-                if isinstance(event, AdapterReady):
-                    if adapter_ready:
+            async with self._trainer_transaction(
+                trainer,
+                job,
+                batch.leases,
+                source=source,
+                staging=staging,
+            ) as events:
+                async for event in events:
+                    if event.job_id != job.job_id or event.run_id != job.run_id:
                         raise RuntimeError(
-                            "trainer returned duplicate AdapterReady events"
+                            "trainer returned an event for a different job"
                         )
-                    if (
-                        event.learner_version != next_step
-                        or event.adapter_path != staging
-                    ):
-                        raise RuntimeError("trainer prepared the wrong adapter")
-                    published = _publish_checkpoint(staging, self.output_dir, next_step)
-                    checkpoint = published.identity
-                    self._checkpoint_digests[next_step] = published.sha256
-                    adapter_ready = True
-                    continue
-                if isinstance(event, TrainCompleted):
-                    if completed:
+                    if isinstance(event, TrainAccepted):
+                        continue
+                    if isinstance(event, TrainProgress):
+                        yield event.metrics
+                        continue
+                    if isinstance(event, AdapterReady):
+                        if adapter_ready:
+                            raise RuntimeError(
+                                "trainer returned duplicate AdapterReady events"
+                            )
+                        if (
+                            event.learner_version != next_step
+                            or event.adapter_path != staging
+                        ):
+                            raise RuntimeError("trainer prepared the wrong adapter")
+                        published = _publish_checkpoint(
+                            staging, self.output_dir, next_step
+                        )
+                        checkpoint = published.identity
+                        self._published_adapters[next_step] = published
+                        adapter_ready = True
+                        continue
+                    if isinstance(event, TrainCompleted):
+                        if completed:
+                            raise RuntimeError(
+                                "trainer returned duplicate TrainCompleted events"
+                            )
+                        if not adapter_ready:
+                            raise RuntimeError(
+                                "trainer completed before preparing the adapter"
+                            )
+                        if event.learner_version != next_step:
+                            raise RuntimeError(
+                                "trainer completed the wrong learner version"
+                            )
+                        completed = True
+                        continue
+                    if isinstance(event, TrainFailed):
                         raise RuntimeError(
-                            "trainer returned duplicate TrainCompleted events"
+                            f"distributed Megatron job failed ({event.error_type}): "
+                            f"{event.message}"
                         )
-                    if not adapter_ready:
-                        raise RuntimeError(
-                            "trainer completed before preparing the adapter"
-                        )
-                    if event.learner_version != next_step:
-                        raise RuntimeError(
-                            "trainer completed the wrong learner version"
-                        )
-                    completed = True
-                    continue
-                if isinstance(event, TrainFailed):
-                    raise RuntimeError(
-                        f"distributed Megatron job failed ({event.error_type}): "
-                        f"{event.message}"
-                    )
-                if isinstance(event, TrainCancelled):
-                    raise asyncio.CancelledError(event.reason)
+                    if isinstance(event, TrainCancelled):
+                        raise asyncio.CancelledError(event.reason)
             if not adapter_ready or not completed:
                 raise RuntimeError(
                     "trainer ended without preparing and durably completing the adapter"
@@ -901,11 +928,12 @@ class DistributedMegatronService:
         self._loaded_adapter_steps.add(step)
 
     async def _checkpoint_digest(self, checkpoint: str, step: int) -> str:
-        if step not in self._checkpoint_digests:
-            self._checkpoint_digests[step] = await asyncio.to_thread(
-                hash_adapter_checkpoint, checkpoint
-            )
-        return self._checkpoint_digests[step]
+        published = self._published_adapters.get(step)
+        if published is not None and published.identity == str(
+            Path(checkpoint).absolute()
+        ):
+            return published.sha256
+        return await asyncio.to_thread(hash_adapter_checkpoint, checkpoint)
 
     async def acquire_exact_adapter(self, step: int, checkpoint: str) -> str:
         async with self._mutation_lock:

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-from contextlib import ExitStack, contextmanager
+import asyncio
+from contextlib import ExitStack, asynccontextmanager, contextmanager
 import fcntl
 import hashlib
 import json
@@ -9,7 +10,7 @@ from pathlib import Path
 import re
 import shutil
 import time
-from typing import Any, Callable, Iterator, Literal, cast
+from typing import Any, AsyncIterator, Callable, Iterator, Literal, cast
 from uuid import uuid4
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
@@ -162,14 +163,35 @@ def _generation_step(generation: str) -> int:
 
 @contextmanager
 def optimizer_model_lease(optimizer_state_path: str | Path) -> Iterator[None]:
-    model_root = Path(optimizer_state_path).absolute().parent
-    model_root.mkdir(parents=True, exist_ok=True)
-    with (model_root / OPTIMIZER_MODEL_LOCK).open("a+b") as lock_file:
+    with _optimizer_model_lock_path(optimizer_state_path).open("a+b") as lock_file:
         fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
         try:
             yield
         finally:
             fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+
+
+@asynccontextmanager
+async def async_optimizer_model_lease(
+    optimizer_state_path: str | Path,
+) -> AsyncIterator[None]:
+    with _optimizer_model_lock_path(optimizer_state_path).open("a+b") as lock_file:
+        while True:
+            try:
+                fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except BlockingIOError:
+                await asyncio.sleep(0.05)
+        try:
+            yield
+        finally:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+
+
+def _optimizer_model_lock_path(optimizer_state_path: str | Path) -> Path:
+    model_root = Path(optimizer_state_path).absolute().parent
+    model_root.mkdir(parents=True, exist_ok=True)
+    return model_root / OPTIMIZER_MODEL_LOCK
 
 
 def optimizer_shard_path(generation_path: Path, *, rank: int, world_size: int) -> Path:
@@ -591,6 +613,12 @@ def commit_optimizer_generation(
     _write_model_atomic(pending / OPTIMIZER_MANIFEST, manifest)
     _validate_generation_files(pending, manifest, local_rank=None)
     with _writer_lease(path) as current_pointer:
+        pointer_temps, _ = _scan_optimizer_transactions(path)
+        if pointer_temps:
+            raise RuntimeError(
+                "Cannot commit an optimizer generation while a pointer swap is "
+                "interrupted"
+            )
         if current_pointer != expected_pointer:
             raise RuntimeError(
                 "Stale optimizer writer: committed pointer changed before publication; "
@@ -634,11 +662,16 @@ def _prune_optimizer_generations_locked(
     trash: list[Path] = []
     now = time.time()
     with _writer_lease(path) as pointer:
+        pointer_temps, candidates = _scan_optimizer_transactions(path)
         if not generations.exists():
             if pointer is not None:
                 raise RuntimeError(
                     "Optimizer pointer exists without a generations directory: "
                     f"{generations}"
+                )
+            if pointer_temps:
+                raise RuntimeError(
+                    "Interrupted optimizer pointer has no committed generation"
                 )
             return set()
         if not generations.is_dir():
@@ -646,7 +679,6 @@ def _prune_optimizer_generations_locked(
                 f"Optimizer generations path is not a directory: {generations}"
             )
 
-        pointer_temps, candidates = _scan_optimizer_transactions(path)
         if len(pointer_temps) > 1:
             raise RuntimeError(
                 "Cannot collect optimizer generations with multiple interrupted "
@@ -1155,7 +1187,13 @@ def _save_optimizer_state_locked(
 
     def select_generation() -> tuple[str, str, tuple[str, ...], dict[str, Any] | None]:
         runtime_sha256, layouts = _validated_runtime_layouts(runtime, records)
-        expected = read_committed_optimizer_pointer(optimizer_state_path)
+        path = Path(optimizer_state_path)
+        with _writer_lease(path) as expected:
+            pointer_temps, _ = _scan_optimizer_transactions(path)
+            if pointer_temps:
+                raise RuntimeError(
+                    "Cannot save optimizer state while a pointer swap is interrupted"
+                )
         if expected is not None and step <= expected.step:
             raise RuntimeError(
                 "Optimizer save step must advance the committed pointer: "
@@ -1218,23 +1256,34 @@ def save_optimizer_state(
     optimizer_state_path: str,
     step: int,
     adapter: OptimizerAdapter,
-    model_lock_held: bool = False,
 ) -> None:
     with ExitStack() as leases:
-        if not model_lock_held:
-            optimizer_group_decision(
-                runtime,
-                lambda: leases.enter_context(
-                    optimizer_model_lease(optimizer_state_path)
-                ),
-                operation="optimizer model lease acquisition",
-            )
-        _save_optimizer_state_locked(
+        optimizer_group_decision(
+            runtime,
+            lambda: leases.enter_context(optimizer_model_lease(optimizer_state_path)),
+            operation="optimizer model lease acquisition",
+        )
+        save_optimizer_state_under_model_lease(
             runtime,
             optimizer_state_path=optimizer_state_path,
             step=step,
             adapter=adapter,
         )
+
+
+def save_optimizer_state_under_model_lease(
+    runtime: Any,
+    *,
+    optimizer_state_path: str,
+    step: int,
+    adapter: OptimizerAdapter,
+) -> None:
+    _save_optimizer_state_locked(
+        runtime,
+        optimizer_state_path=optimizer_state_path,
+        step=step,
+        adapter=adapter,
+    )
 
 
 def _sibling_optimizer_owns_adapter(
