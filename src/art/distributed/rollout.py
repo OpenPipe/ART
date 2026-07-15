@@ -1,11 +1,17 @@
 from __future__ import annotations
 
+import asyncio
 from collections.abc import Awaitable, Callable, Mapping
+import hashlib
 import importlib
 import inspect
+import json
 from typing import Any, Protocol
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
+
+from art.model import TrainableModel
+from art.serving_capabilities import ServingCapabilities
 
 
 class InstalledAsyncCallable(BaseModel):
@@ -52,13 +58,67 @@ class InstalledAsyncCallable(BaseModel):
         return value
 
 
+class RolloutModelSpec(BaseModel):
+    """Serializable inference-only view of a registered trainable model."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True, arbitrary_types_allowed=True)
+
+    payload: dict[str, Any]
+    user_config: Any = None
+    serving_capabilities: ServingCapabilities | None = None
+    binary_routes_base_url: str | None = None
+
+    @classmethod
+    def from_model(cls, model: TrainableModel) -> "RolloutModelSpec":
+        payload = model.model_dump(mode="json")
+        payload["config"] = None
+        payload["inference_model_name"] = model.get_inference_name()
+        return cls(
+            payload=payload,
+            user_config=model.config,
+            serving_capabilities=model._serving_capabilities,
+            binary_routes_base_url=model._art_binary_routes_base_url,
+        )
+
+    @property
+    def cache_key(self) -> str:
+        payload = {
+            "model": self.payload,
+            "capabilities": (
+                self.serving_capabilities.model_dump(mode="json")
+                if self.serving_capabilities is not None
+                else None
+            ),
+            "binary_routes_base_url": self.binary_routes_base_url,
+        }
+        return hashlib.sha256(
+            json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
+        ).hexdigest()
+
+    def build(self) -> TrainableModel:
+        model = TrainableModel.model_validate(self.payload)
+        object.__setattr__(model, "config", self.user_config)
+        object.__setattr__(model, "_serving_capabilities", self.serving_capabilities)
+        object.__setattr__(
+            model, "_art_binary_routes_base_url", self.binary_routes_base_url
+        )
+        return model
+
+
 class RolloutInvocation(BaseModel):
     model_config = ConfigDict(extra="forbid", arbitrary_types_allowed=True)
 
     callable: InstalledAsyncCallable
-    model: Any
+    model: RolloutModelSpec
     scenario: Any
     config: Any
+
+
+class RolloutResult(BaseModel):
+    model_config = ConfigDict(extra="forbid", arbitrary_types_allowed=True)
+
+    value: Any
+    metrics: dict[str, float] = Field(default_factory=dict)
 
 
 class RolloutExecutor(Protocol):
@@ -97,7 +157,9 @@ class LocalRolloutExecutor:
 
 
 class RolloutHostEndpoint(Protocol):
-    async def run(self, invocation: RolloutInvocation) -> Any: ...
+    async def run(self, invocation: RolloutInvocation) -> RolloutResult: ...
+
+    async def close(self) -> None: ...
 
 
 def apportion_rollout_workers(
@@ -177,19 +239,47 @@ class DistributedRolloutExecutor:
             raise RuntimeError(
                 f"rollout worker {worker_id} has no host assignment"
             ) from None
-        return await self.hosts[host_id].run(
+        result = await self.hosts[host_id].run(
             RolloutInvocation(
                 callable=self.callable,
-                model=model,
+                model=RolloutModelSpec.from_model(model),
                 scenario=scenario,
                 config=config,
             )
         )
+        if result.metrics:
+            from art.metrics import MetricsBuilder
+
+            try:
+                builder = MetricsBuilder.get_active()
+            except LookupError:
+                raise RuntimeError(
+                    "distributed rollout produced metrics without an active ART metrics context"
+                ) from None
+            for key, value in result.metrics.items():
+                builder.add_metric(key, value)
+        return result.value
+
+    async def close(self) -> None:
+        await asyncio.gather(*(endpoint.close() for endpoint in self.hosts.values()))
 
 
 class InProcessRolloutHost:
     """One coarse host service used by local collapse and tests."""
 
-    async def run(self, invocation: RolloutInvocation) -> Any:
+    async def run(self, invocation: RolloutInvocation) -> RolloutResult:
+        from art.metrics import MetricsBuilder
+
         function = invocation.callable.resolve()
-        return await function(invocation.model, invocation.scenario, invocation.config)
+        builder = MetricsBuilder(cost_context="train")
+        token = builder.activate()
+        try:
+            value = await function(
+                invocation.model.build(), invocation.scenario, invocation.config
+            )
+        finally:
+            token.var.reset(token)
+        return RolloutResult(value=value, metrics=await builder.drain_pending())
+
+    async def close(self) -> None:
+        return None

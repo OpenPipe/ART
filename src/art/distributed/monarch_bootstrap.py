@@ -10,8 +10,11 @@ transport is unavailable in that release.
 import argparse
 import asyncio
 from collections.abc import Mapping, Sequence
+import hashlib
 import multiprocessing
 import os
+import re
+import sys
 from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
@@ -19,6 +22,7 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 from .rollout import InstalledAsyncCallable
 
 DEFAULT_MONARCH_PORT = 22222
+_INVALID_IDENTIFIER = re.compile(r"\W")
 
 
 class _BootstrapContract(BaseModel):
@@ -75,6 +79,26 @@ class SkyPilotBootstrap(_BootstrapContract):
         return tuple(f"tcp://{ip}:{self.port}" for ip in self.node_ips)
 
 
+def monarch_identifier(value: str) -> str:
+    """Return a stable valid Monarch mesh, proc, or actor identifier."""
+
+    identifier = _INVALID_IDENTIFIER.sub("_", value)
+    if not identifier or identifier[0].isdigit():
+        identifier = f"art_{identifier}"
+    if identifier == value:
+        return identifier
+    suffix = hashlib.sha256(value.encode()).hexdigest()[:8]
+    return f"{identifier}_{suffix}"
+
+
+def _prepare_child_environment() -> None:
+    # Monarch's spawned interpreter may resolve outside the active uv venv. Make
+    # the controller's import roots explicit for ART and installed user code.
+    roots = [path for path in sys.path if path and os.path.isabs(path)]
+    roots.extend(os.environ.get("PYTHONPATH", "").split(os.pathsep))
+    os.environ["PYTHONPATH"] = os.pathsep.join(dict.fromkeys(filter(None, roots)))
+
+
 def run_worker(address: str) -> None:
     """Run a pinned Monarch 0.2 worker on a trusted private network.
 
@@ -82,8 +106,13 @@ def run_worker(address: str) -> None:
     trust-all mode must never be exposed to an untrusted or public network.
     """
 
-    from monarch.actor import run_worker_loop_forever  # ty: ignore[unresolved-import]
+    from monarch.actor import (  # ty: ignore[unresolved-import]
+        enable_transport,
+        run_worker_loop_forever,
+    )
 
+    enable_transport("tcp")
+    _prepare_child_environment()
     run_worker_loop_forever(address=address, ca="trust_all_connections")
 
 
@@ -92,10 +121,17 @@ async def attach_controller(
 ) -> Any:
     """Attach a controller to already-started workers on a trusted network."""
 
-    from monarch.actor import attach_to_workers  # ty: ignore[unresolved-import]
+    from monarch.actor import (  # ty: ignore[unresolved-import]
+        attach_to_workers,
+        enable_transport,
+    )
 
+    enable_transport("tcp")
+    _prepare_child_environment()
     hosts = attach_to_workers(
-        workers=list(worker_addresses), ca="trust_all_connections", name=name
+        workers=list(worker_addresses),
+        ca="trust_all_connections",
+        name=monarch_identifier(name),
     )
     await hosts.initialized
     return hosts

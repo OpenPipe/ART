@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+from collections import OrderedDict
+
 # This module is imported only by explicit distributed runtime construction.
 from monarch.actor import Actor, endpoint  # ty: ignore[unresolved-import]
 
 from .data_plane import BatchReservation, PackedBatchInbox, PackedBatchRef
-from .rollout import RolloutInvocation
+from .rollout import RolloutInvocation, RolloutResult
 
 
 class RolloutHostService(Actor):
@@ -14,11 +16,36 @@ class RolloutHostService(Actor):
         self.inbox = PackedBatchInbox(
             host_id=host_id, capacity_bytes=packed_batch_capacity_bytes
         )
+        self._models = OrderedDict()
 
     @endpoint
     async def run(self, invocation: RolloutInvocation):
+        from art.metrics import MetricsBuilder
+
+        key = invocation.model.cache_key
+        model = self._models.get(key)
+        if model is None:
+            model = invocation.model.build()
+            self._models[key] = model
+            if len(self._models) > 16:
+                _, evicted = self._models.popitem(last=False)
+                await evicted._reset_inference_runtime()
+        else:
+            self._models.move_to_end(key)
         function = invocation.callable.resolve()
-        return await function(invocation.model, invocation.scenario, invocation.config)
+        builder = MetricsBuilder(cost_context="train")
+        token = builder.activate()
+        try:
+            value = await function(model, invocation.scenario, invocation.config)
+        finally:
+            token.var.reset(token)
+        return RolloutResult(value=value, metrics=await builder.drain_pending())
+
+    @endpoint
+    async def close(self) -> None:
+        for model in self._models.values():
+            await model._reset_inference_runtime()
+        self._models.clear()
 
     @endpoint
     async def reserve_batch(self, ref: PackedBatchRef) -> BatchReservation:

@@ -3,11 +3,13 @@ from __future__ import annotations
 from typing import Any
 
 from .data_plane import BatchReservation, PackedBatchRef
+from .monarch_bootstrap import monarch_identifier
 from .rollout import (
     DistributedRolloutExecutor,
     InstalledAsyncCallable,
     RolloutHostEndpoint,
     RolloutInvocation,
+    RolloutResult,
 )
 from .specs import RuntimeTopology
 
@@ -16,8 +18,11 @@ class _MonarchRolloutHostEndpoint(RolloutHostEndpoint):
     def __init__(self, actor: Any) -> None:
         self.actor = actor
 
-    async def run(self, invocation: RolloutInvocation) -> Any:
+    async def run(self, invocation: RolloutInvocation) -> RolloutResult:
         return await self.actor.run.call_one(invocation)
+
+    async def close(self) -> None:
+        await self.actor.close.call_one()
 
 
 class MonarchPackedBatchInbox:
@@ -65,10 +70,11 @@ async def create_rollout_executor(
     endpoints: dict[str, RolloutHostEndpoint] = {}
     for host_id, index in indices.items():
         proc = host_mesh.slice(hosts=index).spawn_procs(
-            per_host={"rollout": 1}, name=f"art_rollout_{host_id}"
+            per_host={"rollout": 1},
+            name=monarch_identifier(f"art_rollout_{host_id}"),
         )
         actor = proc.spawn(
-            "rollout_host_service",
+            monarch_identifier(f"rollout_host_service_{host_id}"),
             RolloutHostService,
             host_id,
             packed_batch_capacity_bytes,

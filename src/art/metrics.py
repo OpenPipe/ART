@@ -483,6 +483,16 @@ class MetricsBuilder:
             pending_state.pending_scenario_ids.clear()
             return result
 
+    async def drain_pending(self) -> dict[str, float]:
+        """Move raw step deltas across an execution boundary without rollups."""
+
+        async with self._shared_state.lock:
+            pending_state = self._pending_state()
+            result = dict(pending_state.step_buffer)
+            pending_state.step_buffer.clear()
+            pending_state.pending_scenario_ids.clear()
+            return result
+
     def activate(self) -> Token["MetricsBuilder"]:
         return _active_builder.set(self)
 
