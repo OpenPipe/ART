@@ -14,6 +14,7 @@ Public cross-repo API consumed by serverless-training:
 - run_megatron_worker_loop
 """
 
+from contextlib import ExitStack
 import json
 import math
 import os
@@ -58,6 +59,7 @@ from art.megatron.optimizer_state import (
     await_adapter_publication_group,
     load_optimizer_state,
     optimizer_group_decision,
+    optimizer_model_lease,
     read_committed_optimizer_step,
     save_optimizer_state,
 )
@@ -1161,35 +1163,42 @@ def _save_lora_and_optimizer(
     adapter_ready: Callable[[], None] | None = None,
 ) -> OptimizerAdapter:
     assert runtime.optimizer is not None
-    _save_staged_lora(
-        runtime,
-        adapter_dtypes=adapter_dtypes,
-        lora_path=lora_path,
-    )
-
-    if adapter_ready is None:
-        raise RuntimeError("Optimizer durability requires an adapter publisher")
-    adapter = await_adapter_publication_group(
-        runtime,
-        lora_path,
-        step=step,
-        ready=adapter_ready,
-    )
-    if _should_save_optimizer_group(
-        runtime,
-        step=step,
-        optimizer_state_path=optimizer_state_path,
-        optimizer_save_interval=optimizer_save_interval,
-        final_training_step=final_training_step,
-    ):
-        save_optimizer_state(
+    with ExitStack() as leases:
+        optimizer_group_decision(
             runtime,
-            optimizer_state_path=optimizer_state_path,
-            step=step,
-            adapter=adapter,
+            lambda: leases.enter_context(optimizer_model_lease(optimizer_state_path)),
+            operation="optimizer model lease acquisition",
+        )
+        _save_staged_lora(
+            runtime,
+            adapter_dtypes=adapter_dtypes,
+            lora_path=lora_path,
         )
 
-    return adapter
+        if adapter_ready is None:
+            raise RuntimeError("Optimizer durability requires an adapter publisher")
+        adapter = await_adapter_publication_group(
+            runtime,
+            lora_path,
+            step=step,
+            ready=adapter_ready,
+        )
+        if _should_save_optimizer_group(
+            runtime,
+            step=step,
+            optimizer_state_path=optimizer_state_path,
+            optimizer_save_interval=optimizer_save_interval,
+            final_training_step=final_training_step,
+        ):
+            save_optimizer_state(
+                runtime,
+                optimizer_state_path=optimizer_state_path,
+                step=step,
+                adapter=adapter,
+                model_lock_held=True,
+            )
+
+        return adapter
 
 
 def _save_staged_lora(

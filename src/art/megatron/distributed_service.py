@@ -41,6 +41,7 @@ from art.vllm_runtime import (
 from .lora import LORA_ALPHA, default_lora_rank_for_handler
 from .model_support import get_model_support_handler, model_uses_expert_parallel
 from .optimizer_state import (
+    OptimizerAdapter,
     format_megatron_resume_message,
     hash_adapter_checkpoint,
     prepare_megatron_resume_state,
@@ -97,6 +98,7 @@ class DistributedMegatronService:
         self._policy_generation = 0
         self._serving_capabilities: ServingCapabilities | None = None
         self._api_key_value: str | None = None
+        self._checkpoint_digests: dict[int, str] = {}
         self._loaded_adapter_steps: set[int] = set()
         self._loaded_exact_adapter_steps: set[int] = set()
         self._exact_adapter_refcounts: dict[int, int] = {}
@@ -275,9 +277,9 @@ class DistributedMegatronService:
                         or event.adapter_path != staging
                     ):
                         raise RuntimeError("trainer prepared the wrong adapter")
-                    checkpoint = _publish_checkpoint(
-                        staging, self.output_dir, next_step
-                    )
+                    published = _publish_checkpoint(staging, self.output_dir, next_step)
+                    checkpoint = published.identity
+                    self._checkpoint_digests[next_step] = published.sha256
                     adapter_ready = True
                     continue
                 if isinstance(event, TrainCompleted):
@@ -446,7 +448,7 @@ class DistributedMegatronService:
             capabilities[0].require(
                 "exact_lora_worker_state", operation="distributed LoRA publication"
             )
-            digest = await asyncio.to_thread(_checkpoint_digest, lora_path)
+            digest = await self._checkpoint_digest(lora_path, self._latest_step)
             update_identity = uuid.uuid4().hex
             states = {
                 replica_id: self.runtime.replica(replica_id).prepare_update(
@@ -828,7 +830,7 @@ class DistributedMegatronService:
     async def _register_lora_for_step_locked(self, step: int, checkpoint: str) -> None:
         if not self._base_urls:
             return
-        digest = await asyncio.to_thread(_checkpoint_digest, checkpoint)
+        digest = await self._checkpoint_digest(checkpoint, step)
         update_identity = uuid.uuid4().hex
         try:
             states = {
@@ -898,6 +900,13 @@ class DistributedMegatronService:
             raise
         self._loaded_adapter_steps.add(step)
 
+    async def _checkpoint_digest(self, checkpoint: str, step: int) -> str:
+        if step not in self._checkpoint_digests:
+            self._checkpoint_digests[step] = await asyncio.to_thread(
+                hash_adapter_checkpoint, checkpoint
+            )
+        return self._checkpoint_digests[step]
+
     async def acquire_exact_adapter(self, step: int, checkpoint: str) -> str:
         async with self._mutation_lock:
             self._require_open()
@@ -927,7 +936,7 @@ class DistributedMegatronService:
                         for service in self.runtime.topology.model_services
                         if service.name == self.model_name
                     )
-                    digest = await asyncio.to_thread(_checkpoint_digest, checkpoint)
+                    digest = await self._checkpoint_digest(checkpoint, step)
                     self._gateway.add_policy(
                         self._routing_table(
                             service,
@@ -1023,7 +1032,7 @@ def _copy_checkpoint(source: str, destination: str) -> None:
     shutil.copytree(source, destination)
 
 
-def _publish_checkpoint(staging: str, output_dir: str, step: int) -> str:
+def _publish_checkpoint(staging: str, output_dir: str, step: int) -> OptimizerAdapter:
     adapter = publish_adapter_checkpoint(staging, step=step)
     expected = str(Path(get_step_checkpoint_dir(output_dir, step)).absolute())
     if adapter.identity != expected:
@@ -1031,7 +1040,7 @@ def _publish_checkpoint(staging: str, output_dir: str, step: int) -> str:
             "Published adapter path does not match the service output: "
             f"published={adapter.identity}, expected={expected}"
         )
-    return adapter.identity
+    return adapter
 
 
 def _trainer_dtype(
@@ -1067,10 +1076,6 @@ def _art_source_revision() -> str:
         digest.update(str(path.relative_to(root)).encode())
         digest.update(path.read_bytes())
     return digest.hexdigest()
-
-
-def _checkpoint_digest(path: str) -> str:
-    return hash_adapter_checkpoint(path)
 
 
 def _headers(api_key: str | None) -> dict[str, str] | None:

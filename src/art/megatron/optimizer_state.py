@@ -1,12 +1,13 @@
 from __future__ import annotations
 
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
 import fcntl
 import hashlib
 import json
 import os
 from pathlib import Path
 import re
+import shutil
 import time
 from typing import Any, Callable, Iterator, Literal, cast
 from uuid import uuid4
@@ -21,13 +22,20 @@ ALLOW_UNPAIRED_MEGATRON_RESUME_ENV = "ART_ALLOW_UNPAIRED_MEGATRON_RESUME"
 OPTIMIZER_GENERATIONS_DIR = "generations"
 OPTIMIZER_MANIFEST = "manifest.json"
 OPTIMIZER_POINTER = "committed.json"
+OPTIMIZER_MODEL_LOCK = ".optimizer.lock"
 OPTIMIZER_WRITER_LOCK = ".writer.lock"
+OPTIMIZER_GENERATION_LEASE_PREFIX = ".lease-"
+OPTIMIZER_TRASH_PREFIX = ".trash-"
+OPTIMIZER_ORPHAN_GRACE_S = 3600.0
 ADAPTER_PUBLICATION_ACK = ".optimizer-published.json"
 ADAPTER_PUBLICATION_TIMEOUT_ENV = "ART_ADAPTER_PUBLICATION_TIMEOUT_S"
 _ADAPTER_FILES = ("adapter_config.json", "adapter_model.safetensors")
 _GENERATION_PATTERN = r"step-\d{8,}-[0-9a-f]{32}"
 _GENERATION_RE = re.compile(f"^{_GENERATION_PATTERN}$")
+_TRASH_RE = re.compile(f"^\\.trash-({_GENERATION_PATTERN})-[0-9a-f]{{32}}$")
+_POINTER_TEMP_RE = re.compile(r"^\.committed\.json\.\d+\.[0-9a-f]{32}\.tmp$")
 _SHA256_PATTERN = r"^[0-9a-f]{64}$"
+_POINTER_UNSET = object()
 
 
 class _OptimizerRecord(BaseModel):
@@ -138,6 +146,32 @@ def optimizer_generation_path(optimizer_state_path: str, generation: str) -> Pat
     return Path(optimizer_state_path) / OPTIMIZER_GENERATIONS_DIR / generation
 
 
+def _generation_lease_path(path: Path, generation: str) -> Path:
+    _validate_generation_name(generation)
+    return (
+        path
+        / OPTIMIZER_GENERATIONS_DIR
+        / f"{OPTIMIZER_GENERATION_LEASE_PREFIX}{generation}"
+    )
+
+
+def _generation_step(generation: str) -> int:
+    _validate_generation_name(generation)
+    return int(generation.split("-", 2)[1])
+
+
+@contextmanager
+def optimizer_model_lease(optimizer_state_path: str | Path) -> Iterator[None]:
+    model_root = Path(optimizer_state_path).absolute().parent
+    model_root.mkdir(parents=True, exist_ok=True)
+    with (model_root / OPTIMIZER_MODEL_LOCK).open("a+b") as lock_file:
+        fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+
+
 def optimizer_shard_path(generation_path: Path, *, rank: int, world_size: int) -> Path:
     return generation_path / optimizer_shard_name(rank, world_size)
 
@@ -146,12 +180,17 @@ def hash_optimizer_shard(path: Path) -> str:
     return _hash_files((path,))
 
 
-def hash_adapter_checkpoint(path: str | Path) -> str:
+def _adapter_checkpoint_files(path: str | Path) -> tuple[Path, tuple[Path, ...]]:
     adapter_path = Path(path)
     files = tuple(adapter_path / name for name in _ADAPTER_FILES)
     missing = [str(file) for file in files if not file.is_file()]
     if missing:
         raise RuntimeError(f"Adapter checkpoint is incomplete; missing {missing}")
+    return adapter_path, files
+
+
+def hash_adapter_checkpoint(path: str | Path) -> str:
+    adapter_path, files = _adapter_checkpoint_files(path)
     return _hash_files(files, relative_to=adapter_path)
 
 
@@ -198,26 +237,28 @@ def publish_adapter_checkpoint(
     canonical = canonical_adapter_path(staging, step)
     if canonical.exists():
         raise RuntimeError(f"Refusing to replace canonical adapter {canonical}")
-    digest = hash_adapter_checkpoint(staging)
-    for name in _ADAPTER_FILES:
-        with (staging / name).open("rb") as adapter_file:
+    _, files = _adapter_checkpoint_files(staging)
+    for path in files:
+        with path.open("rb") as adapter_file:
             os.fsync(adapter_file.fileno())
     _fsync_directory(staging)
+    adapter = OptimizerAdapter(
+        identity=str(canonical),
+        step=step,
+        sha256=hash_adapter_checkpoint(staging),
+    )
+    _write_model_atomic(staging / ADAPTER_PUBLICATION_ACK, adapter)
     canonical.parent.mkdir(parents=True, exist_ok=True)
     os.replace(staging, canonical)
     _fsync_directory(canonical.parent)
-    adapter = optimizer_adapter(canonical, step)
-    if adapter.sha256 != digest:
-        raise RuntimeError(
-            "Canonical adapter digest changed during publication: "
-            f"staged={digest}, canonical={adapter.sha256}"
-        )
-    _write_model_atomic(canonical / ADAPTER_PUBLICATION_ACK, adapter)
     return adapter
 
 
 def read_adapter_publication(
-    adapter_path: str | Path, *, step: int
+    adapter_path: str | Path,
+    *,
+    step: int,
+    verify_files: bool = True,
 ) -> OptimizerAdapter | None:
     canonical = _canonical_adapter_path(adapter_path, step)
     acknowledgment = canonical / ADAPTER_PUBLICATION_ACK
@@ -235,22 +276,43 @@ def read_adapter_publication(
         raise RuntimeError(
             f"Invalid adapter publication acknowledgment: {acknowledgment}"
         ) from exc
-    current = optimizer_adapter(canonical, step)
-    if adapter != current or "staging" in Path(adapter.identity).parts:
+    expected_identity = str(canonical)
+    if (
+        adapter.identity != expected_identity
+        or adapter.step != step
+        or "staging" in Path(adapter.identity).parts
+    ):
         raise RuntimeError(
-            "Adapter publication acknowledgment identity or digest does not match "
-            "the canonical adapter: "
-            f"acknowledged={adapter.model_dump()}, current={current.model_dump()}"
+            "Adapter publication acknowledgment does not identify the canonical "
+            f"adapter: acknowledged={adapter.model_dump()}, "
+            f"expected_identity={expected_identity!r}, expected_step={step}"
         )
+    if verify_files:
+        current_digest = hash_adapter_checkpoint(canonical)
+        if adapter.sha256 != current_digest:
+            raise RuntimeError(
+                "Adapter publication acknowledgment digest does not match the "
+                f"canonical adapter: acknowledged={adapter.sha256}, "
+                f"current={current_digest}"
+            )
     return adapter
 
 
-def _validate_adapter_publication(adapter: OptimizerAdapter) -> None:
+def _validate_adapter_publication(
+    adapter: OptimizerAdapter, *, verify_files: bool = False
+) -> None:
     if "staging" in Path(adapter.identity).parts:
         raise RuntimeError(
             f"Optimizer pointers cannot reference a staging adapter: {adapter.identity}"
         )
-    if read_adapter_publication(adapter.identity, step=adapter.step) != adapter:
+    if (
+        read_adapter_publication(
+            adapter.identity,
+            step=adapter.step,
+            verify_files=verify_files,
+        )
+        != adapter
+    ):
         raise RuntimeError(
             f"Optimizer adapter publication is not acknowledged: {adapter.model_dump()}"
         )
@@ -454,14 +516,65 @@ def _validate_generation_files(
 
 
 @contextmanager
-def _writer_lease(path: Path) -> Iterator[OptimizerGenerationPointer | None]:
+def _root_lease(
+    path: Path, operation: int
+) -> Iterator[OptimizerGenerationPointer | None]:
     path.mkdir(parents=True, exist_ok=True)
     with (path / OPTIMIZER_WRITER_LOCK).open("a+b") as lock_file:
-        fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+        fcntl.flock(lock_file.fileno(), operation)
         try:
             yield _read_pointer(path)
         finally:
             fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+
+
+@contextmanager
+def _writer_lease(path: Path) -> Iterator[OptimizerGenerationPointer | None]:
+    with _root_lease(path, fcntl.LOCK_EX) as pointer:
+        yield pointer
+
+
+@contextmanager
+def _generation_lease(
+    path: Path,
+    generation: str,
+    *,
+    exclusive: bool,
+    nonblocking: bool = False,
+) -> Iterator[bool]:
+    lease_path = _generation_lease_path(path, generation)
+    lease_path.parent.mkdir(parents=True, exist_ok=True)
+    with lease_path.open("a+b") as lease_file:
+        operation = fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH
+        if nonblocking:
+            operation |= fcntl.LOCK_NB
+        try:
+            fcntl.flock(lease_file.fileno(), operation)
+        except BlockingIOError:
+            yield False
+            return
+        try:
+            yield True
+        finally:
+            fcntl.flock(lease_file.fileno(), fcntl.LOCK_UN)
+
+
+@contextmanager
+def _committed_generation_lease(
+    path: Path,
+) -> Iterator[OptimizerGenerationPointer | None]:
+    stack = ExitStack()
+    with _root_lease(path, fcntl.LOCK_SH) as pointer:
+        if pointer is not None and not stack.enter_context(
+            _generation_lease(path, pointer.generation, exclusive=False)
+        ):
+            raise RuntimeError(
+                f"Could not lease optimizer generation {pointer.generation}"
+            )
+    try:
+        yield pointer
+    finally:
+        stack.close()
 
 
 def commit_optimizer_generation(
@@ -503,6 +616,173 @@ def commit_optimizer_generation(
     return committed
 
 
+def _prune_optimizer_generations_locked(
+    optimizer_state_path: str,
+    *,
+    retain_adapter_steps: set[int],
+    orphan_grace_s: float = OPTIMIZER_ORPHAN_GRACE_S,
+) -> set[int]:
+    """Reclaim unretained generations and return adapter steps still in use."""
+    if orphan_grace_s < 0:
+        raise ValueError("orphan_grace_s must be non-negative")
+    path = Path(optimizer_state_path)
+    generations = path / OPTIMIZER_GENERATIONS_DIR
+    if not path.exists():
+        return set()
+
+    protected_steps: set[int] = set()
+    trash: list[Path] = []
+    now = time.time()
+    with _writer_lease(path) as pointer:
+        if not generations.exists():
+            if pointer is not None:
+                raise RuntimeError(
+                    "Optimizer pointer exists without a generations directory: "
+                    f"{generations}"
+                )
+            return set()
+        if not generations.is_dir():
+            raise RuntimeError(
+                f"Optimizer generations path is not a directory: {generations}"
+            )
+
+        pointer_temps, candidates = _scan_optimizer_transactions(path)
+        if len(pointer_temps) > 1:
+            raise RuntimeError(
+                "Cannot collect optimizer generations with multiple interrupted "
+                "pointers"
+            )
+        records: list[tuple[Path, str, int, bool, bool]] = []
+        manifests: dict[str, OptimizerGenerationManifest] = {}
+        current_found = False
+        for entry, generation, pending in candidates:
+            step = _generation_step(generation)
+            manifest = None if pending else _read_manifest(entry)
+            if manifest is not None and (
+                manifest.generation != generation or manifest.step != step
+            ):
+                raise RuntimeError(
+                    f"Optimizer generation directory/manifest mismatch: {entry}"
+                )
+            if manifest is not None:
+                manifests[generation] = manifest
+            adapter_step = step if manifest is None else manifest.adapter.step
+            current = pointer is not None and pointer.generation == generation
+            young = now - entry.stat().st_mtime < orphan_grace_s
+            if current:
+                assert manifest is not None
+                _validate_pointer_manifest(pointer, manifest)
+                _validate_adapter_publication(pointer.adapter)
+                current_found = True
+            records.append((entry, generation, adapter_step, current, young))
+
+        if pointer is not None and not current_found:
+            raise RuntimeError(
+                f"Optimizer pointer generation is missing: {pointer.generation}"
+            )
+        interrupted_generation: str | None = None
+        if pointer_temps:
+            temporary_pointer = pointer_temps[0][1]
+            interrupted_generation = temporary_pointer.generation
+            manifest = manifests.get(interrupted_generation)
+            if manifest is None:
+                raise RuntimeError(
+                    "Interrupted optimizer pointer has no committed generation"
+                )
+            _validate_pointer_manifest(temporary_pointer, manifest)
+            if pointer is not None and temporary_pointer.step <= pointer.step:
+                raise RuntimeError(
+                    "Interrupted optimizer pointer does not advance the committed "
+                    "generation"
+                )
+        trash.extend(
+            entry
+            for entry in generations.iterdir()
+            if entry.name.startswith(OPTIMIZER_TRASH_PREFIX)
+            and now - entry.stat().st_mtime >= orphan_grace_s
+        )
+
+        for entry, generation, adapter_step, current, young in records:
+            if current or adapter_step in retain_adapter_steps or young:
+                protected_steps.add(adapter_step)
+                continue
+
+            with _generation_lease(
+                path,
+                generation,
+                exclusive=True,
+                nonblocking=True,
+            ) as acquired:
+                if not acquired:
+                    protected_steps.add(adapter_step)
+                    continue
+                destination = generations / (
+                    f"{OPTIMIZER_TRASH_PREFIX}{generation}-{uuid4().hex}"
+                )
+                if interrupted_generation == generation:
+                    pointer_temps[0][0].unlink()
+                    _fsync_directory(path)
+                os.replace(entry, destination)
+                os.utime(destination)
+                trash.append(destination)
+            _generation_lease_path(path, generation).unlink(missing_ok=True)
+
+        live = {generation for entry, generation, *_ in records if entry.exists()}
+        for lease in generations.iterdir():
+            if not lease.name.startswith(OPTIMIZER_GENERATION_LEASE_PREFIX):
+                continue
+            generation = lease.name.removeprefix(OPTIMIZER_GENERATION_LEASE_PREFIX)
+            _validate_generation_name(generation)
+            if generation in live:
+                continue
+            with _generation_lease(
+                path,
+                generation,
+                exclusive=True,
+                nonblocking=True,
+            ) as acquired:
+                if acquired:
+                    lease.unlink()
+        if trash:
+            _fsync_directory(generations)
+
+    for entry in trash:
+        shutil.rmtree(entry)
+    return protected_steps
+
+
+def prune_optimizer_generations(
+    optimizer_state_path: str,
+    *,
+    retain_adapter_steps: set[int],
+    orphan_grace_s: float = OPTIMIZER_ORPHAN_GRACE_S,
+) -> set[int]:
+    with optimizer_model_lease(optimizer_state_path):
+        return _prune_optimizer_generations_locked(
+            optimizer_state_path,
+            retain_adapter_steps=retain_adapter_steps,
+            orphan_grace_s=orphan_grace_s,
+        )
+
+
+@contextmanager
+def optimizer_retention_lease(
+    output_dir: str, retain_adapter_steps: set[int]
+) -> Iterator[set[int]]:
+    paths = tuple(
+        f"{output_dir}/optimizer_states_{job_type}" for job_type in ("rl", "sft")
+    )
+    with optimizer_model_lease(paths[0]):
+        protected = set(retain_adapter_steps)
+        for path in paths:
+            protected.update(
+                _prune_optimizer_generations_locked(
+                    path, retain_adapter_steps=protected
+                )
+            )
+        yield protected
+
+
 def _validate_generation(
     optimizer_state_path: str,
     pointer: OptimizerGenerationPointer,
@@ -532,10 +812,14 @@ def pin_optimizer_generation(
     runtime_sha256: str,
     layout_sha256_by_rank: tuple[str, ...],
     adapter: OptimizerAdapter,
+    pointer: OptimizerGenerationPointer | None | object = _POINTER_UNSET,
+    verify_adapter_files: bool = True,
 ) -> OptimizerGenerationPointer | None:
-    pointer = read_committed_optimizer_pointer(optimizer_state_path)
+    if pointer is _POINTER_UNSET:
+        pointer = read_committed_optimizer_pointer(optimizer_state_path)
     if pointer is None:
         return None
+    pointer = cast(OptimizerGenerationPointer, pointer)
     _, manifest, ordered = _validate_generation(
         optimizer_state_path, pointer, world_size, None
     )
@@ -549,7 +833,7 @@ def pin_optimizer_generation(
             "Optimizer checkpoint adapter mismatch: "
             f"saved={pointer.adapter.model_dump()}, current={adapter.model_dump()}"
         )
-    _validate_adapter_publication(pointer.adapter)
+    _validate_adapter_publication(pointer.adapter, verify_files=verify_adapter_files)
     saved_layouts = tuple(shard.layout_sha256 for shard in ordered)
     if saved_layouts != layout_sha256_by_rank:
         raise RuntimeError(
@@ -784,7 +1068,11 @@ def _validated_runtime_layouts(
 def _loaded_adapter(adapter_path: str, step: int) -> OptimizerAdapter:
     path = Path(adapter_path).absolute()
     canonical = _canonical_adapter_path(path, step)
-    adapter = optimizer_adapter(canonical, step)
+    adapter = read_adapter_publication(canonical, step=step, verify_files=True)
+    if adapter is None:
+        adapter = optimizer_adapter(canonical, step)
+    if path == canonical:
+        return adapter
     loaded_digest = hash_adapter_checkpoint(path)
     if loaded_digest != adapter.sha256:
         raise RuntimeError(
@@ -806,7 +1094,13 @@ def await_adapter_publication_group(
         deadline = time.monotonic() + float(
             os.environ.get(ADAPTER_PUBLICATION_TIMEOUT_ENV, "300")
         )
-        while (adapter := read_adapter_publication(staging_path, step=step)) is None:
+        while (
+            adapter := read_adapter_publication(
+                staging_path,
+                step=step,
+                verify_files=False,
+            )
+        ) is None:
             if time.monotonic() >= deadline:
                 raise TimeoutError(
                     "Timed out waiting for canonical adapter publication "
@@ -850,7 +1144,7 @@ def _write_optimizer_shard(
     )
 
 
-def save_optimizer_state(
+def _save_optimizer_state_locked(
     runtime: Any,
     *,
     optimizer_state_path: str,
@@ -918,6 +1212,53 @@ def save_optimizer_state(
     )
 
 
+def save_optimizer_state(
+    runtime: Any,
+    *,
+    optimizer_state_path: str,
+    step: int,
+    adapter: OptimizerAdapter,
+    model_lock_held: bool = False,
+) -> None:
+    with ExitStack() as leases:
+        if not model_lock_held:
+            optimizer_group_decision(
+                runtime,
+                lambda: leases.enter_context(
+                    optimizer_model_lease(optimizer_state_path)
+                ),
+                operation="optimizer model lease acquisition",
+            )
+        _save_optimizer_state_locked(
+            runtime,
+            optimizer_state_path=optimizer_state_path,
+            step=step,
+            adapter=adapter,
+        )
+
+
+def _sibling_optimizer_owns_adapter(
+    optimizer_state_path: str, adapter: OptimizerAdapter
+) -> bool:
+    current = Path(optimizer_state_path).absolute()
+    for sibling in (
+        current.parent / "optimizer_states_rl",
+        current.parent / "optimizer_states_sft",
+    ):
+        if sibling == current or not sibling.exists():
+            continue
+        with _committed_generation_lease(sibling) as pointer:
+            if pointer is None:
+                continue
+            manifest = _read_manifest(
+                optimizer_generation_path(str(sibling), pointer.generation)
+            )
+            _validate_pointer_manifest(pointer, manifest)
+            if pointer.adapter == adapter:
+                return True
+    return False
+
+
 def load_optimizer_state(
     runtime: Any,
     *,
@@ -928,58 +1269,69 @@ def load_optimizer_state(
     initialize: Callable[[Any], None],
 ) -> Path | None:
     records = _all_gather_objects(runtime, _runtime_layout_record(runtime))
+    with ExitStack() as leases:
 
-    def select_generation() -> dict[str, Any] | None:
-        runtime_sha256, layouts = _validated_runtime_layouts(runtime, records)
-        adapter = _loaded_adapter(adapter_path, adapter_step)
-        pointer = pin_optimizer_generation(
-            optimizer_state_path,
-            world_size=runtime.world_size,
-            runtime_sha256=runtime_sha256,
-            layout_sha256_by_rank=layouts,
-            adapter=adapter,
-        )
-        if pointer is None and not allow_missing:
-            raise RuntimeError(
-                "No optimizer generation is paired with canonical adapter "
-                f"step {adapter_step}"
+        def select_generation() -> dict[str, Any] | None:
+            runtime_sha256, layouts = _validated_runtime_layouts(runtime, records)
+            adapter = _loaded_adapter(adapter_path, adapter_step)
+            leased_pointer = leases.enter_context(
+                _committed_generation_lease(Path(optimizer_state_path))
             )
-        return None if pointer is None else pointer.model_dump(mode="json")
+            lineage_switch = (
+                leased_pointer is None or leased_pointer.adapter != adapter
+            ) and _sibling_optimizer_owns_adapter(optimizer_state_path, adapter)
+            if lineage_switch:
+                return None
+            pointer = pin_optimizer_generation(
+                optimizer_state_path,
+                world_size=runtime.world_size,
+                runtime_sha256=runtime_sha256,
+                layout_sha256_by_rank=layouts,
+                adapter=adapter,
+                pointer=leased_pointer,
+                verify_adapter_files=False,
+            )
+            if pointer is None and not allow_missing:
+                raise RuntimeError(
+                    "No optimizer generation is paired with canonical adapter "
+                    f"step {adapter_step}"
+                )
+            return None if pointer is None else pointer.model_dump(mode="json")
 
-    pointer_data = optimizer_group_decision(
-        runtime, select_generation, operation="optimizer load selection"
-    )
-    if pointer_data is None:
-        _run_rank_operation(
-            runtime, "optimizer reset", lambda: initialize(runtime.optimizer)
+        pointer_data = optimizer_group_decision(
+            runtime, select_generation, operation="optimizer load selection"
         )
-        return None
+        if pointer_data is None:
+            _run_rank_operation(
+                runtime, "optimizer reset", lambda: initialize(runtime.optimizer)
+            )
+            return None
 
-    pointer = OptimizerGenerationPointer.model_validate(pointer_data)
+        pointer = OptimizerGenerationPointer.model_validate(pointer_data)
 
-    def load_shard() -> tuple[Path, Any]:
-        shard_path = resolve_optimizer_shard(
-            optimizer_state_path,
-            rank=runtime.rank,
-            world_size=runtime.world_size,
-            pointer=pointer,
+        def load_shard() -> tuple[Path, Any]:
+            shard_path = resolve_optimizer_shard(
+                optimizer_state_path,
+                rank=runtime.rank,
+                world_size=runtime.world_size,
+                pointer=pointer,
+            )
+            assert shard_path is not None
+            return shard_path, torch.load(shard_path)
+
+        shard_path, loaded_state = cast(
+            tuple[Path, Any],
+            _run_rank_operation(runtime, "optimizer shard load", load_shard),
         )
-        assert shard_path is not None
-        return shard_path, torch.load(shard_path)
-
-    shard_path, loaded_state = cast(
-        tuple[Path, Any],
-        _run_rank_operation(runtime, "optimizer shard load", load_shard),
-    )
-    try:
-        _run_rank_operation(
-            runtime,
-            "optimizer state apply",
-            lambda: runtime.optimizer.load_state_dict(loaded_state),
-        )
-    finally:
-        del loaded_state
-    return shard_path
+        try:
+            _run_rank_operation(
+                runtime,
+                "optimizer state apply",
+                lambda: runtime.optimizer.load_state_dict(loaded_state),
+            )
+        finally:
+            del loaded_state
+        return shard_path
 
 
 def _allow_unpaired_resume() -> bool:
@@ -990,33 +1342,238 @@ def _allow_unpaired_resume() -> bool:
     }
 
 
+def _scan_optimizer_transactions(
+    path: Path,
+) -> tuple[
+    list[tuple[Path, OptimizerGenerationPointer]],
+    list[tuple[Path, str, bool]],
+]:
+    pointer_temps: list[tuple[Path, OptimizerGenerationPointer]] = []
+    allowed = {
+        OPTIMIZER_POINTER,
+        OPTIMIZER_WRITER_LOCK,
+        OPTIMIZER_GENERATIONS_DIR,
+        "uncommitted_generations",
+    }
+    for entry in sorted(path.iterdir()):
+        if entry.name in allowed:
+            continue
+        if _POINTER_TEMP_RE.fullmatch(entry.name) is None or not entry.is_file():
+            raise RuntimeError(
+                "Ambiguous interrupted optimizer transaction; unexpected root "
+                f"entry {entry}"
+            )
+        try:
+            pointer = OptimizerGenerationPointer.model_validate_json(
+                entry.read_text("utf-8")
+            )
+        except Exception as exc:
+            raise RuntimeError(
+                f"Invalid interrupted optimizer pointer: {entry}"
+            ) from exc
+        pointer_temps.append((entry, pointer))
+
+    candidates: list[tuple[Path, str, bool]] = []
+    generations = path / OPTIMIZER_GENERATIONS_DIR
+    if not generations.exists():
+        return pointer_temps, candidates
+    if not generations.is_dir():
+        raise RuntimeError(
+            f"Optimizer generations path is not a directory: {generations}"
+        )
+    for entry in sorted(generations.iterdir()):
+        name = entry.name
+        if name.startswith(OPTIMIZER_GENERATION_LEASE_PREFIX):
+            _validate_generation_name(
+                name.removeprefix(OPTIMIZER_GENERATION_LEASE_PREFIX)
+            )
+            if not entry.is_file():
+                raise RuntimeError(f"Invalid optimizer generation lease: {entry}")
+            continue
+        if name.startswith(OPTIMIZER_TRASH_PREFIX):
+            if _TRASH_RE.fullmatch(name) is None or not entry.is_dir():
+                raise RuntimeError(f"Invalid optimizer generation trash: {entry}")
+            continue
+        pending = name.startswith(".pending-")
+        generation = name.removeprefix(".pending-") if pending else name
+        if _GENERATION_RE.fullmatch(generation) is None or not entry.is_dir():
+            raise RuntimeError(
+                "Ambiguous interrupted optimizer transaction; unexpected generation "
+                f"entry {entry}"
+            )
+        candidates.append((entry, generation, pending))
+    return pointer_temps, candidates
+
+
+def _optimizer_state_paths(output_dir: str, current: str) -> tuple[Path, ...]:
+    selected = Path(current).absolute()
+    candidates = {selected} | {
+        (Path(output_dir) / f"optimizer_states_{kind}").absolute()
+        for kind in ("rl", "sft")
+    }
+    return tuple(
+        sorted(path for path in candidates if path == selected or path.exists())
+    )
+
+
+def _recover_uncommitted_initial_transaction(
+    *,
+    output_dir: str,
+    optimizer_state_path: str,
+) -> tuple[int, ...]:
+    if get_step_from_dir(output_dir) != 1:
+        return ()
+    path = Path(optimizer_state_path).absolute()
+    checkpoint = Path(get_step_checkpoint_dir(output_dir, 1)).absolute()
+    roots = _optimizer_state_paths(output_dir, optimizer_state_path)
+    with ExitStack() as locks:
+        pointers = {root: locks.enter_context(_writer_lease(root)) for root in roots}
+        pointer = pointers[path]
+        if pointer is not None:
+            return ()
+        adapter = read_adapter_publication(checkpoint, step=1, verify_files=True)
+        if adapter is None:
+            return ()
+
+        pointer_temps, candidates = _scan_optimizer_transactions(path)
+        for sibling in roots:
+            if sibling == path:
+                continue
+            sibling_temps, sibling_candidates = _scan_optimizer_transactions(sibling)
+            sibling_pointer = pointers[sibling]
+            if sibling_pointer is not None and sibling_pointer.adapter.step == 1:
+                return ()
+            if any(pointer.adapter.step == 1 for _, pointer in sibling_temps) or any(
+                _generation_step(generation) == 1
+                for _, generation, _ in sibling_candidates
+            ):
+                raise RuntimeError(
+                    "Cannot recover interrupted initial optimizer transaction; "
+                    f"sibling optimizer state may own checkpoint 0001: {sibling}"
+                )
+        if len(candidates) > 1:
+            raise RuntimeError(
+                "Ambiguous interrupted initial optimizer transaction; found "
+                f"{len(candidates)} candidate generations"
+            )
+        manifest: OptimizerGenerationManifest | None = None
+        if candidates:
+            entry, generation, pending = candidates[0]
+            if _generation_step(generation) != 1:
+                raise RuntimeError(
+                    "Ambiguous interrupted initial optimizer transaction; "
+                    f"unexpected generation {generation}"
+                )
+            manifest_path = entry / OPTIMIZER_MANIFEST
+            if not pending or manifest_path.exists():
+                manifest = _read_manifest(entry)
+                if (
+                    manifest.generation != generation
+                    or manifest.step != 1
+                    or manifest.adapter != adapter
+                ):
+                    raise RuntimeError(
+                        "Interrupted initial optimizer generation does not match "
+                        f"the published adapter: {entry}"
+                    )
+        if len(pointer_temps) > 1:
+            raise RuntimeError(
+                "Ambiguous interrupted initial optimizer transaction; found "
+                f"{len(pointer_temps)} temporary pointers"
+            )
+        if pointer_temps:
+            if not candidates or candidates[0][2] or manifest is None:
+                raise RuntimeError(
+                    "Interrupted optimizer pointer has no committed generation"
+                )
+            expected = OptimizerGenerationPointer(
+                generation=manifest.generation,
+                step=manifest.step,
+                adapter=manifest.adapter,
+            )
+            if pointer_temps[0][1] != expected:
+                raise RuntimeError(
+                    "Interrupted optimizer pointer does not match its generation"
+                )
+        if candidates and not locks.enter_context(
+            _generation_lease(
+                path,
+                candidates[0][1],
+                exclusive=True,
+                nonblocking=True,
+            )
+        ):
+            raise RuntimeError(
+                "Interrupted initial optimizer generation is still in use: "
+                f"{candidates[0][1]}"
+            )
+        if _allow_unpaired_resume() and (pointer_temps or candidates):
+            raise RuntimeError(
+                f"{ALLOW_UNPAIRED_MEGATRON_RESUME_ENV} cannot bypass an interrupted "
+                "optimizer transaction"
+            )
+        if _allow_unpaired_resume():
+            return ()
+
+        tag = f"initial_step_0001_{adapter.sha256[:16]}"
+        previous = Path(output_dir) / "unpaired_checkpoints" / tag / checkpoint.name
+        if previous.exists():
+            tag = f"{tag}_{uuid4().hex}"
+        quarantine = path / "uncommitted_generations" / tag
+        quarantine.mkdir(parents=True, exist_ok=True)
+        if pointer_temps:
+            pointer_temp = pointer_temps[0][0]
+            destination = quarantine / pointer_temp.name
+            if destination.exists():
+                raise RuntimeError(f"Optimizer quarantine entry exists: {destination}")
+            os.replace(pointer_temp, destination)
+            _fsync_directory(path)
+        if candidates:
+            entry = candidates[0][0]
+            destination = quarantine / entry.name
+            if destination.exists():
+                raise RuntimeError(f"Optimizer quarantine entry exists: {destination}")
+            os.replace(entry, destination)
+            _fsync_directory(quarantine)
+            _fsync_directory(entry.parent)
+
+        checkpoint_quarantine = Path(output_dir) / "unpaired_checkpoints" / tag
+        checkpoint_quarantine.mkdir(parents=True, exist_ok=True)
+        destination = checkpoint_quarantine / checkpoint.name
+        if destination.exists():
+            raise RuntimeError(f"Checkpoint quarantine entry exists: {destination}")
+        os.replace(checkpoint, destination)
+        _fsync_directory(checkpoint_quarantine)
+        _fsync_directory(checkpoint.parent)
+    return (1,)
+
+
 def resolve_megatron_resume_step(
     *,
     output_dir: str,
     optimizer_state_path: str,
 ) -> MegatronResumeStep:
     latest_lora_step = get_step_from_dir(output_dir)
-    pointer = read_committed_optimizer_pointer(optimizer_state_path)
-    optimizer_step = None if pointer is None else pointer.step
-    if pointer is not None:
-        generation_path = optimizer_generation_path(
-            optimizer_state_path, pointer.generation
-        )
-        _validate_pointer_manifest(pointer, _read_manifest(generation_path))
-        expected_path = Path(
-            get_step_checkpoint_dir(output_dir, pointer.adapter.step)
-        ).absolute()
-        if pointer.adapter.identity != str(expected_path):
-            raise RuntimeError(
-                "Optimizer pointer does not identify the canonical adapter path: "
-                f"saved={pointer.adapter.identity}, expected={expected_path}"
+    with _committed_generation_lease(Path(optimizer_state_path)) as pointer:
+        if pointer is not None:
+            generation_path = optimizer_generation_path(
+                optimizer_state_path, pointer.generation
             )
-        _validate_adapter_publication(pointer.adapter)
-        return MegatronResumeStep(
-            step=pointer.step,
-            latest_lora_step=latest_lora_step,
-            optimizer_step=pointer.step,
-        )
+            _validate_pointer_manifest(pointer, _read_manifest(generation_path))
+            expected_path = Path(
+                get_step_checkpoint_dir(output_dir, pointer.adapter.step)
+            ).absolute()
+            if pointer.adapter.identity != str(expected_path):
+                raise RuntimeError(
+                    "Optimizer pointer does not identify the canonical adapter path: "
+                    f"saved={pointer.adapter.identity}, expected={expected_path}"
+                )
+            _validate_adapter_publication(pointer.adapter, verify_files=True)
+            return MegatronResumeStep(
+                step=pointer.step,
+                latest_lora_step=latest_lora_step,
+                optimizer_step=pointer.step,
+            )
     if latest_lora_step == 0:
         return MegatronResumeStep(
             step=0,
@@ -1037,15 +1594,41 @@ def resolve_megatron_resume_step(
     )
 
 
-def prepare_megatron_resume_state(
+def _resolve_model_resume_step(
+    *, output_dir: str, optimizer_state_path: str
+) -> MegatronResumeStep:
+    paired = []
+    for path in _optimizer_state_paths(output_dir, optimizer_state_path):
+        if read_committed_optimizer_pointer(str(path)) is not None:
+            paired.append(
+                resolve_megatron_resume_step(
+                    output_dir=output_dir,
+                    optimizer_state_path=str(path),
+                )
+            )
+    if paired:
+        return max(paired, key=lambda info: info.step)
+    return resolve_megatron_resume_step(
+        output_dir=output_dir,
+        optimizer_state_path=optimizer_state_path,
+    )
+
+
+def _prepare_megatron_resume_state_locked(
     *,
     output_dir: str,
     optimizer_state_path: str,
 ) -> MegatronResumeStep:
-    info = resolve_megatron_resume_step(
+    recovered_steps = _recover_uncommitted_initial_transaction(
         output_dir=output_dir,
         optimizer_state_path=optimizer_state_path,
     )
+    info = _resolve_model_resume_step(
+        output_dir=output_dir,
+        optimizer_state_path=optimizer_state_path,
+    )
+    if recovered_steps:
+        info = info.model_copy(update={"quarantined_lora_steps": recovered_steps})
     if info.used_unpaired_override or info.latest_lora_step <= info.step:
         return info
 
@@ -1055,17 +1638,34 @@ def prepare_megatron_resume_state(
         / "unpaired_checkpoints"
         / f"resume_from_{info.step:04d}_{int(time.time())}_{os.getpid()}"
     )
+    to_move = [
+        checkpoint_dir
+        for checkpoint_dir in sorted(checkpoints_dir.iterdir())
+        if checkpoint_dir.is_dir()
+        and checkpoint_dir.name.isdigit()
+        and int(checkpoint_dir.name) > info.step
+    ]
     moved_steps: list[int] = []
-    for checkpoint_dir in sorted(checkpoints_dir.iterdir()):
-        if not checkpoint_dir.is_dir() or not checkpoint_dir.name.isdigit():
-            continue
-        step = int(checkpoint_dir.name)
-        if step <= info.step:
-            continue
+    for checkpoint_dir in to_move:
         quarantine_dir.mkdir(parents=True, exist_ok=True)
-        checkpoint_dir.rename(quarantine_dir / checkpoint_dir.name)
-        moved_steps.append(step)
+        os.replace(checkpoint_dir, quarantine_dir / checkpoint_dir.name)
+        moved_steps.append(int(checkpoint_dir.name))
+    if moved_steps:
+        _fsync_directory(checkpoints_dir)
+        _fsync_directory(quarantine_dir)
     return info.model_copy(update={"quarantined_lora_steps": tuple(moved_steps)})
+
+
+def prepare_megatron_resume_state(
+    *,
+    output_dir: str,
+    optimizer_state_path: str,
+) -> MegatronResumeStep:
+    with optimizer_model_lease(optimizer_state_path):
+        return _prepare_megatron_resume_state_locked(
+            output_dir=output_dir,
+            optimizer_state_path=optimizer_state_path,
+        )
 
 
 def format_megatron_resume_message(info: MegatronResumeStep) -> str:
