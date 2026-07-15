@@ -8,17 +8,19 @@ network because ART currently configures Monarch with ``trust_all_connections``.
 
 import argparse
 import asyncio
-from collections.abc import Mapping, Sequence
+from collections.abc import Mapping, MutableMapping, Sequence
+import fcntl
 import hashlib
 import ipaddress
-import multiprocessing
 import os
 from pathlib import Path
 import re
 import shlex
+import signal
 import socket
 import subprocess
 import sys
+import threading
 import time
 from typing import TYPE_CHECKING, Any
 from urllib.parse import urlsplit
@@ -41,6 +43,8 @@ _MONARCH_TIMEOUT_ENV = (
     "HYPERACTOR_MESH_ACTOR_SPAWN_MAX_IDLE",
     "HYPERACTOR_MESH_PROC_SPAWN_MAX_IDLE",
 )
+_WORKER_ADDRESS_LOCK = threading.Lock()
+_USED_WORKER_ADDRESSES: set[str] = set()
 _WORKER_CODE = """\
 import sys
 from monarch.actor import run_worker_loop_forever
@@ -256,14 +260,19 @@ def monarch_identifier(value: str) -> str:
     return f"{identifier[:prefix_length]}_{suffix}"
 
 
-def _prepare_child_environment(*, worker: bool = False) -> None:
+def _prepare_child_environment(
+    *,
+    worker: bool = False,
+    environ: MutableMapping[str, str] | None = None,
+) -> None:
+    environ = os.environ if environ is None else environ
     # Monarch's spawned interpreter may resolve outside the active uv venv. Make
     # the controller's import roots explicit for ART and installed user code.
     roots = [path for path in sys.path if path and os.path.isabs(path)]
-    roots.extend(os.environ.get("PYTHONPATH", "").split(os.pathsep))
-    os.environ["PYTHONPATH"] = os.pathsep.join(dict.fromkeys(filter(None, roots)))
+    roots.extend(environ.get("PYTHONPATH", "").split(os.pathsep))
+    environ["PYTHONPATH"] = os.pathsep.join(dict.fromkeys(filter(None, roots)))
     if os.path.isfile(os.path.join(sys.prefix, "pyvenv.cfg")):
-        os.environ.setdefault("ART_VIRTUAL_ENV", sys.prefix)
+        environ.setdefault("ART_VIRTUAL_ENV", sys.prefix)
     if worker:
         nvidia_libs = (
             str(path)
@@ -271,14 +280,14 @@ def _prepare_child_environment(*, worker: bool = False) -> None:
             for path in (Path(root) / "nvidia").glob("*/lib")
             if path.is_dir()
         )
-        inherited = os.environ.get("LD_LIBRARY_PATH", "").split(os.pathsep)
-        os.environ["LD_LIBRARY_PATH"] = os.pathsep.join(
+        inherited = environ.get("LD_LIBRARY_PATH", "").split(os.pathsep)
+        environ["LD_LIBRARY_PATH"] = os.pathsep.join(
             dict.fromkeys((*nvidia_libs, *filter(None, inherited)))
         )
     for name in _MONARCH_TIMEOUT_ENV:
-        os.environ.setdefault(name, "600s")
+        environ.setdefault(name, "600s")
     # INFO launch records include the inherited environment and may expose secrets.
-    os.environ.setdefault("MONARCH_FILE_LOG", "warn")
+    environ.setdefault("MONARCH_FILE_LOG", "warn")
 
 
 def activate_child_virtualenv() -> None:
@@ -373,6 +382,7 @@ async def attach_controller(
     *,
     name: str = "art",
     startup_timeout_s: float | None = None,
+    owned_workers: Sequence["_WorkerProcess"] = (),
 ) -> Any:
     """Attach a controller to already-started workers on a trusted network."""
 
@@ -388,14 +398,41 @@ async def attach_controller(
         ca="trust_all_connections",
         name=monarch_identifier(name),
     )
+    initialized = asyncio.ensure_future(hosts.initialized)
+    deadline = (
+        None
+        if startup_timeout_s is None
+        else asyncio.get_running_loop().time() + startup_timeout_s
+    )
     try:
-        if startup_timeout_s is None:
-            await hosts.initialized
-        else:
-            await asyncio.wait_for(hosts.initialized, startup_timeout_s)
+        while not initialized.done():
+            exited = [worker for worker in owned_workers if not worker.is_alive()]
+            if exited:
+                raise RuntimeError(
+                    "owned Monarch worker exited during attach: "
+                    + ", ".join(
+                        f"{worker.address} code={worker.exitcode}" for worker in exited
+                    )
+                )
+            timeout = 0.05
+            if deadline is not None:
+                timeout = min(
+                    timeout, max(0.0, deadline - asyncio.get_running_loop().time())
+                )
+                if timeout == 0:
+                    raise TimeoutError("timed out attaching to Monarch workers")
+            await asyncio.wait((initialized,), timeout=timeout)
+        await initialized
+        exited = [worker for worker in owned_workers if not worker.is_alive()]
+        if exited:
+            raise RuntimeError("owned Monarch worker exited as attach completed")
     except BaseException as startup_error:
+        initialized.cancel()
         try:
-            await hosts.shutdown()
+            await asyncio.wait_for(
+                hosts.shutdown(),
+                startup_timeout_s or DEFAULT_STARTUP_TIMEOUT_S,
+            )
         except BaseException as cleanup_error:
             raise BaseExceptionGroup(
                 "Monarch attach and cleanup failed",
@@ -410,29 +447,108 @@ async def run_explicit_controller(
     program: "InstalledAsyncCallable",
     *,
     startup_timeout_s: float | None = None,
+    owned_workers: Sequence["_WorkerProcess"] = (),
 ) -> Any:
     hosts = await attach_controller(
-        spec.worker_addresses, startup_timeout_s=startup_timeout_s
+        spec.worker_addresses,
+        startup_timeout_s=startup_timeout_s,
+        owned_workers=owned_workers,
     )
     try:
-        return await program.resolve()(hosts)
-    finally:
-        await hosts.shutdown()
+        result = await program.resolve()(hosts)
+    except BaseException as program_error:
+        try:
+            await asyncio.wait_for(
+                hosts.shutdown(),
+                startup_timeout_s or DEFAULT_STARTUP_TIMEOUT_S,
+            )
+        except BaseException as cleanup_error:
+            raise BaseExceptionGroup(
+                "Monarch program and controller cleanup failed",
+                [program_error, cleanup_error],
+            ) from None
+        raise
+    await asyncio.wait_for(
+        hosts.shutdown(),
+        startup_timeout_s or DEFAULT_STARTUP_TIMEOUT_S,
+    )
+    return result
 
 
-def _start_worker(address: str) -> multiprocessing.Process:
-    worker = multiprocessing.Process(target=run_worker, args=(address,), daemon=True)
-    worker.start()
-    return worker
+class _WorkerProcess:
+    def __init__(self, address: str) -> None:
+        self.address = address
+        digest = hashlib.sha256(address.encode()).hexdigest()[:16]
+        self._lease = open(f"/tmp/art-monarch-worker-{digest}.lock", "a+b")
+        try:
+            fcntl.flock(self._lease.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            with _WORKER_ADDRESS_LOCK:
+                if address in _USED_WORKER_ADDRESSES:
+                    raise RuntimeError(
+                        "Monarch worker addresses cannot be reused by one controller "
+                        f"process: {address}"
+                    )
+                _require_bindable_worker_address(address)
+                environment = os.environ.copy()
+                _prepare_child_environment(worker=True, environ=environment)
+                self.process = subprocess.Popen(
+                    [sys.executable, "-c", _WORKER_CODE, address],
+                    env=environment,
+                    stdin=subprocess.DEVNULL,
+                    start_new_session=True,
+                )
+                _USED_WORKER_ADDRESSES.add(address)
+        except BaseException:
+            self._lease.close()
+            raise
+
+    @property
+    def exitcode(self) -> int | None:
+        return self.process.poll()
+
+    def is_alive(self) -> bool:
+        return self.process.poll() is None
+
+    def stop(self) -> None:
+        try:
+            if self.is_alive():
+                os.killpg(self.process.pid, signal.SIGTERM)
+            try:
+                self.process.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                os.killpg(self.process.pid, signal.SIGKILL)
+                self.process.wait()
+        finally:
+            self._lease.close()
 
 
-def _stop_worker(worker: multiprocessing.Process) -> None:
-    if worker.is_alive():
-        worker.terminate()
-    worker.join(timeout=10)
-    if worker.is_alive():
-        worker.kill()
-        worker.join()
+def _require_bindable_worker_address(address: str) -> None:
+    parsed = urlsplit(address)
+    assert parsed.hostname is not None and parsed.port is not None
+    error: OSError | None = None
+    for family, socktype, proto, _, sockaddr in socket.getaddrinfo(
+        parsed.hostname, parsed.port, type=socket.SOCK_STREAM
+    ):
+        probe = socket.socket(family, socktype, proto)
+        try:
+            probe.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            probe.bind(sockaddr)
+            return
+        except OSError as exc:
+            error = exc
+        finally:
+            probe.close()
+    raise RuntimeError(
+        f"Monarch worker address is already in use: {address}"
+    ) from error
+
+
+def _start_worker(address: str) -> _WorkerProcess:
+    return _WorkerProcess(address)
+
+
+def _stop_worker(worker: _WorkerProcess) -> None:
+    worker.stop()
 
 
 def run_local(
@@ -451,6 +567,7 @@ def run_local(
                 ExplicitHostBootstrap(worker_addresses=(address,)),
                 program,
                 startup_timeout_s=startup_timeout_s,
+                owned_workers=(worker,),
             )
         )
     except BaseException as program_error:
@@ -486,7 +603,7 @@ def _lifecycle_listener(spec: SkyPilotBootstrap) -> socket.socket:
 def _accept_sky_peers(
     spec: SkyPilotBootstrap,
     listener: socket.socket,
-    worker: multiprocessing.Process,
+    worker: _WorkerProcess,
     startup_timeout_s: float,
 ) -> list[socket.socket]:
     peers: list[socket.socket] = []
@@ -515,7 +632,7 @@ def _accept_sky_peers(
 
 def _wait_for_sky_controller(
     spec: SkyPilotBootstrap,
-    worker: multiprocessing.Process,
+    worker: _WorkerProcess,
     startup_timeout_s: float,
 ) -> None:
     deadline = time.monotonic() + startup_timeout_s

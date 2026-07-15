@@ -91,6 +91,7 @@ class ArtRuntime:
         self._rollout_actors: dict[str, Any] = {}
         self._trainer_runs: set[Any] = set()
         self._replicas: dict[str, ReplicaManager] = {}
+        self._closeables: set[Any] = set()
         self._next_packing_host = 0
         self._runtime_packages = runtime_package_names(
             trainer=topology.trainer is not None
@@ -144,6 +145,7 @@ class ArtRuntime:
                 (address,),
                 name=f"art_local_{uuid.uuid4().hex}",
                 startup_timeout_s=topology.cluster.startup_timeout_s,
+                owned_workers=(worker,),
             )
         except BaseException as startup_error:
             try:
@@ -154,7 +156,20 @@ class ArtRuntime:
                     [startup_error, cleanup_error],
                 ) from None
             raise
-        runtime = cls(host_mesh, topology, config=config, owns_host_mesh=True)
+        try:
+            runtime = cls(host_mesh, topology, config=config, owns_host_mesh=True)
+        except BaseException as startup_error:
+            try:
+                await asyncio.wait_for(
+                    host_mesh.shutdown(), topology.cluster.rpc_timeout_s
+                )
+                await asyncio.to_thread(_stop_worker, worker)
+            except BaseException as cleanup_error:
+                raise BaseExceptionGroup(
+                    "local ART runtime construction and cleanup failed",
+                    [startup_error, cleanup_error],
+                ) from None
+            raise
         runtime._local_worker = worker
         return await runtime._start()
 
@@ -488,6 +503,10 @@ class ArtRuntime:
         self._trainer_runs.add(run)
         return run
 
+    def register_closeable(self, closeable: Any) -> None:
+        self._require_open()
+        self._closeables.add(closeable)
+
     async def start_replica(
         self,
         spec: ModelServiceReplicaSpec,
@@ -588,6 +607,10 @@ class ArtRuntime:
                 except BaseException as error:
                     failures.append(error)
 
+        await collect(
+            "dependent shutdown", *(value.aclose() for value in self._closeables)
+        )
+        self._closeables.clear()
         await collect("replica shutdown", *(m.stop() for m in self._replicas.values()))
         self._replicas.clear()
         await collect("trainer shutdown", *(run.close() for run in self._trainer_runs))

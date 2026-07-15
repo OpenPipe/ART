@@ -94,7 +94,7 @@ class MegatronBackend(LocalBackend):
             if self._runtime is not None:
                 from .distributed_service import DistributedMegatronService
 
-                self._services[model.name] = cast(
+                service = cast(
                     ModelService,
                     DistributedMegatronService(
                         model_name=model.name,
@@ -105,6 +105,8 @@ class MegatronBackend(LocalBackend):
                         enable_expert_replay=self._enable_expert_replay,
                     ),
                 )
+                self._runtime.register_closeable(service)
+                self._services[model.name] = service
             else:
                 from .service import MegatronService
 
