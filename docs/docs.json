@@ -47,6 +47,7 @@
           "getting-started/about",
           "getting-started/quick-start",
           "getting-started/installation-setup",
+          "getting-started/multi-node",
           "getting-started/notebooks",
           "getting-started/faq"
         ]

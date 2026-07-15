@@ -1,0 +1,96 @@
+---
+title: "Multi-node deployment"
+sidebarTitle: "Multi-node deployment"
+icon: "network-wired"
+---
+
+ART's distributed runtime consumes a Monarch host mesh. SkyPilot can provision
+that mesh, but it is a deployment tool rather than an ART dependency. The ART
+process does not launch another SkyPilot cluster from inside its allocation.
+
+## Controller program
+
+The bootstrap accepts an import path to a top-level async function. SkyPilot
+runs the bootstrap on every node, but ART invokes this function only on node
+rank 0:
+
+```python
+from typing import Any
+
+
+async def main(hosts: Any) -> None:
+    # Construct and run your distributed ART backend with this HostMesh.
+    ...
+```
+
+The module must be importable on the controller. User functions and other code
+spawned through Monarch must be installed or synchronized at the same import
+paths on every node; ART does not ship pickled closures between hosts.
+
+## SkyPilot
+
+Start with `examples/multinode/skypilot.yaml`. It contains `num_nodes: 2`, a
+synchronized workdir, setup on every node, and one command:
+
+```yaml
+run: |
+  .venv/bin/art-monarch skypilot \
+    --program your_package.train:main
+```
+
+Launch it from the project root:
+
+```fish
+sky launch -c art-multinode examples/multinode/skypilot.yaml
+```
+
+One task rank runs on each allocated node. Every rank owns one Monarch worker
+subprocess; rank 0 also attaches the host mesh and runs the controller
+program. Controller success, failure, or disconnect releases all task ranks.
+No manual SSH or per-node command is required.
+
+Each task invocation owns fresh worker loops and terminates them after the host
+mesh shuts down. A later `sky exec` starts new loops; ART does not reattach a
+second controller to completed Monarch 0.2 workers.
+
+Reuse an existing cluster without rerunning setup:
+
+```fish
+sky exec art-multinode examples/multinode/skypilot.yaml
+```
+
+Use `sky launch` instead when `setup`, mounts, the image, or SkyPilot config
+changed. Setting `num_nodes: 1` uses the same path on one node. The existing
+`LocalBackend` interface remains unchanged for users who do not opt into the
+distributed APIs.
+
+SkyPilot provides `SKYPILOT_NODE_RANK`, `SKYPILOT_NODE_IPS`, and
+`SKYPILOT_NUM_NODES`; ART validates and translates them internally. Port
+`22222` is the Monarch worker port and `22223` is its job-lifecycle port. Pass
+`--port N` to reserve `N` and `N + 1` instead. These ports must be reachable
+between allocated nodes but must not be publicly exposed: Monarch 0.2 requires
+unauthenticated `trust_all_connections` transport.
+
+## Existing SSH hosts
+
+For preallocated machines with passwordless SSH, start and own all workers from
+one controller command:
+
+```fish
+.venv/bin/art-monarch ssh \
+  --host gpu-a=10.0.0.10 \
+  --host gpu-b=10.0.0.11 \
+  --python /shared/project/.venv/bin/python \
+  --program your_package.train:main
+```
+
+Each value is `SSH_TARGET=WORKER_HOST`. Omit `=WORKER_HOST` when the SSH target
+is also the private address to which Monarch should bind. The selected Python
+executable and user code must exist on every host. ART uses non-interactive SSH
+and keeps each remote worker in the foreground for the controller lifetime.
+Configure identities and proxies in `~/.ssh/config`, or pass repeated arguments
+such as `--ssh-arg=-F --ssh-arg=/path/to/config`.
+
+The lower-level `worker` and `controller` subcommands remain available for
+schedulers or process supervisors that own worker lifecycle themselves. Those
+supervisors must replace worker loops before a subsequent controller attach.

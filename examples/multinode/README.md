@@ -1,0 +1,27 @@
+# ART multi-node bootstrap
+
+This example consumes one SkyPilot allocation directly. From the project root:
+
+```fish
+sky launch -c art-multinode examples/multinode/skypilot.yaml
+```
+
+SkyPilot synchronizes `workdir` and runs `setup` on every node before starting
+the same `run` command on every node. ART starts one Monarch worker per node and
+calls the installed deployment smoke only on rank 0. Replace that import path
+with an installed top-level async function that owns your ART run.
+
+Edit the accelerator and setup commands for your infrastructure. The example
+assumes `uv` is installed in the image. Use `sky launch` after changing setup;
+reuse an unchanged cluster without rerunning setup with:
+
+```fish
+sky exec art-multinode examples/multinode/skypilot.yaml
+```
+
+Each invocation terminates every worker loop before the task exits. Reusing the
+cluster starts fresh loops; completed Monarch 0.2 loops are not reattached.
+
+Setting `num_nodes: 1` exercises the same API on one node. Do not expose the
+default private ports `22222` and `22223`; pinned Monarch 0.2 does not
+authenticate its transport.
