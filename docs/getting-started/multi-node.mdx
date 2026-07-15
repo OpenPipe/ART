@@ -53,7 +53,7 @@ No manual SSH or per-node command is required.
 
 Each task invocation owns fresh worker loops and terminates them after the host
 mesh shuts down. A later `sky exec` starts new loops; ART does not reattach a
-second controller to completed Monarch 0.2 workers.
+second controller to completed workers.
 
 Reuse an existing cluster without rerunning setup:
 
@@ -70,8 +70,8 @@ SkyPilot provides `SKYPILOT_NODE_RANK`, `SKYPILOT_NODE_IPS`, and
 `SKYPILOT_NUM_NODES`; ART validates and translates them internally. Port
 `22222` is the Monarch worker port and `22223` is its job-lifecycle port. Pass
 `--port N` to reserve `N` and `N + 1` instead. These ports must be reachable
-between allocated nodes but must not be publicly exposed: Monarch 0.2 requires
-unauthenticated `trust_all_connections` transport.
+between allocated nodes but must not be publicly exposed: ART's pinned Monarch
+0.5 runtime currently uses unauthenticated `trust_all_connections` transport.
 
 ## Existing SSH hosts
 
