@@ -302,8 +302,15 @@ class MonarchTrainerRun:
                     if not collective.done():
                         waiters.add(collective)
                     done, _ = await asyncio.wait(
-                        waiters, return_when=asyncio.FIRST_COMPLETED
+                        waiters,
+                        timeout=self.run_spec.event_timeout_s,
+                        return_when=asyncio.FIRST_COMPLETED,
                     )
+                    if not done:
+                        raise TimeoutError(
+                            "trainer ranks produced no event for "
+                            f"{self.run_spec.event_timeout_s:g}s"
+                        )
                     if collective in done:
                         await collective
                         if receive not in done:
