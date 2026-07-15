@@ -87,7 +87,22 @@ def _chat_response(body: bytes, *, stream: bool) -> ChatCompletion:
         try:
             chunk = ChatCompletionChunk.model_validate(payload)
         except ValidationError:
-            if not payload.get("object") and not payload.get("choices"):
+            if (
+                set(payload)
+                <= {
+                    "choices",
+                    "created",
+                    "id",
+                    "model",
+                    "object",
+                    "prompt_filter_results",
+                    "system_fingerprint",
+                }
+                and payload.get("object") == ""
+                and payload.get("id") == ""
+                and payload.get("model") == ""
+                and payload.get("choices") == []
+            ):
                 continue
             raise
         if response is None:

@@ -789,6 +789,21 @@ def test_streaming_chat_ignores_keepalives_and_azure_prologue() -> None:
             end_time=datetime.now(),
         )
 
+    with pytest.raises(ValueError):
+        build_exchange(
+            "chat_completions",
+            {"model": "test/model", "messages": [], "stream": True},
+            _sse(
+                [
+                    (None, chunk),
+                    (None, {"error": {"message": "failed"}}),
+                    (None, "[DONE]"),
+                ]
+            ),
+            start_time=datetime.now(),
+            end_time=datetime.now(),
+        )
+
 
 def test_trajectory_rejects_mixed_representations() -> None:
     exchange = build_exchange(
