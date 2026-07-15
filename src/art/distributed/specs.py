@@ -207,3 +207,14 @@ class RuntimeTopology(_Spec):
     rollout_host_ids: tuple[str, ...]
     trainer: TrainerMeshSpec | None = None
     model_services: tuple[ModelServiceSpec, ...] = ()
+
+
+class ArtRuntimeConfig(_Spec):
+    packed_batch_capacity_bytes: int = Field(default=2 << 30, ge=1)
+    vllm_output_root: str = "/tmp/art-vllm"
+
+
+class HostServiceHealth(_Spec):
+    host_id: str = Field(min_length=1)
+    hostname: str = Field(min_length=1)
+    process_id: int = Field(ge=1)

@@ -2,6 +2,8 @@ from importlib import import_module
 from typing import Any
 
 _EXPORTS = {
+    "ArtRuntime": ".art_runtime",
+    "ArtRuntimeConfig": ".specs",
     "ClusterSpec": ".specs",
     "EndpointSpec": ".specs",
     "GpuPlacement": ".specs",

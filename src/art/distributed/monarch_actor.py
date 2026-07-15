@@ -4,6 +4,7 @@ from collections import OrderedDict
 import gc
 from multiprocessing import resource_tracker, shared_memory
 import os
+import socket
 from typing import Any, cast
 
 # This module is imported only by explicit distributed runtime construction.
@@ -12,18 +13,36 @@ from monarch.actor import Actor, endpoint  # ty: ignore[unresolved-import]
 from .data_plane import BatchReservation, PackedBatchInbox, PackedBatchRef
 from .packing import PackingRequest, PackingResult
 from .rollout import RolloutInvocation, RolloutResult
+from .specs import HostServiceHealth
+from .vllm_replica import HostMemberLaunchRequest
 
 
 class RolloutHostService(Actor):
     """One coarse CPU rollout and packed-batch inbox actor per host."""
 
-    def __init__(self, host_id: str, packed_batch_capacity_bytes: int) -> None:
+    def __init__(
+        self,
+        host_id: str,
+        packed_batch_capacity_bytes: int,
+        vllm_output_root: str = "/tmp/art-vllm",
+    ) -> None:
+        self.host_id = host_id
         self.inbox = PackedBatchInbox(
             host_id=host_id, capacity_bytes=packed_batch_capacity_bytes
         )
         self._models = OrderedDict()
         self._rdma_batches: dict[str, tuple[Any, Any, shared_memory.SharedMemory]] = {}
         self._packer = None
+        self._vllm_output_root = vllm_output_root
+        self._vllm_launcher = None
+
+    @endpoint
+    async def health(self) -> HostServiceHealth:
+        return HostServiceHealth(
+            host_id=self.host_id,
+            hostname=socket.gethostname(),
+            process_id=os.getpid(),
+        )
 
     @endpoint
     async def run(self, invocation: RolloutInvocation):
@@ -58,7 +77,41 @@ class RolloutHostService(Actor):
         if self._packer is not None:
             await self._packer.close()
             self._packer = None
+        if self._vllm_launcher is not None:
+            await self._vllm_launcher.close()
+            self._vllm_launcher = None
         self.inbox.store.close()
+
+    def _launcher(self):
+        if self._vllm_launcher is None:
+            from .vllm_replica import ManagedVllmHostLauncher
+
+            self._vllm_launcher = ManagedVllmHostLauncher(
+                self._vllm_output_root,
+                install_parent_cleanup=lambda: None,
+            )
+        return self._vllm_launcher
+
+    @endpoint
+    async def start_vllm_member(self, request: HostMemberLaunchRequest):
+        return await self._launcher().start_member(request)
+
+    @endpoint
+    async def vllm_member_state(self, replica_id: str, member_id: str, generation: int):
+        return await self._launcher().member_state(replica_id, member_id, generation)
+
+    @endpoint
+    async def stop_vllm_member(
+        self, replica_id: str, member_id: str, generation: int
+    ) -> None:
+        if self._vllm_launcher is not None:
+            await self._vllm_launcher.stop_member(replica_id, member_id, generation)
+
+    @endpoint
+    async def allocate_port(self) -> int:
+        with socket.socket() as listener:
+            listener.bind(("", 0))
+            return int(listener.getsockname()[1])
 
     @endpoint
     async def pack_batch(self, request: PackingRequest) -> PackingResult:
@@ -85,6 +138,8 @@ class RolloutHostService(Actor):
         shapes = tuple(group._packed_group_shape for group in groups)
         if packed is None:
             return PackingResult(ref=None, packed_group_shapes=shapes)
+        trainable_assistant_tokens = int(packed["assistant_mask"].sum().item())
+        non_padding_tokens = int((packed["group_ids"] != -1).sum().item())
         ref = self.inbox.store.create(
             packed,
             group_ids=request.group_ids,
@@ -92,7 +147,12 @@ class RolloutHostService(Actor):
             min_source_version=request.min_source_version,
             max_source_version=request.max_source_version,
         )
-        return PackingResult(ref=ref, packed_group_shapes=shapes)
+        return PackingResult(
+            ref=ref,
+            packed_group_shapes=shapes,
+            trainable_assistant_tokens=trainable_assistant_tokens,
+            non_padding_tokens=non_padding_tokens,
+        )
 
     @endpoint
     async def publish_batch(self, ref: PackedBatchRef):

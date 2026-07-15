@@ -1,12 +1,13 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Callable, Mapping
+from collections.abc import Awaitable, Callable, Mapping
 import hashlib
+import inspect
 import json
 from pathlib import Path
 import socket
-from typing import Literal, Protocol
+from typing import Literal, Protocol, cast
 import uuid
 
 from pydantic import BaseModel, ConfigDict, Field
@@ -162,6 +163,15 @@ class ManagedVllmHostLauncher:
         managed.supervisor.close()
         await asyncio.to_thread(managed.runtime.close)
 
+    async def close(self) -> None:
+        keys = tuple(self._members)
+        results = await asyncio.gather(
+            *(self.stop_member(*key) for key in keys), return_exceptions=True
+        )
+        failures = [result for result in results if isinstance(result, BaseException)]
+        if failures:
+            raise BaseExceptionGroup("failed to stop vLLM host members", failures)
+
     @staticmethod
     def _state(
         managed: _ManagedMember, phase: MemberPhase, detail: str | None = None
@@ -187,7 +197,7 @@ class ReplicaManager:
         launchers: Mapping[str, ReplicaHostLauncher],
         template: ReplicaLaunchTemplate,
         *,
-        port_allocator: Callable[[str], int] | None = None,
+        port_allocator: Callable[[str], int | Awaitable[int]] | None = None,
         monitor_interval_s: float = 0.25,
     ) -> None:
         missing = {member.host_id for member in spec.members} - launchers.keys()
@@ -292,11 +302,11 @@ class ReplicaManager:
                 "generation": generation,
                 "leader_endpoint": EndpointSpec(
                     host=self._spec.leader_endpoint.host,
-                    port=self._fresh_port(self._spec.leader_endpoint.host),
+                    port=await self._fresh_port(self._spec.leader_endpoint.host),
                 ),
                 "rendezvous": EndpointSpec(
                     host=self._spec.rendezvous.host,
-                    port=self._fresh_port(self._spec.rendezvous.host),
+                    port=await self._fresh_port(self._spec.rendezvous.host),
                 ),
             }
         )
@@ -487,9 +497,14 @@ class ReplicaManager:
             launch_config=launch,
         )
 
-    def _fresh_port(self, host: str) -> int:
+    async def _fresh_port(self, host: str) -> int:
         for _ in range(100):
-            port = self._port_allocator(host)
+            value = self._port_allocator(host)
+            port = (
+                await cast(Awaitable[int], value)
+                if inspect.isawaitable(value)
+                else value
+            )
             if (host, port) not in self._used_ports:
                 self._used_ports.add((host, port))
                 return port

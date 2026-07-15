@@ -13,17 +13,43 @@ from .rollout import (
     RolloutResult,
 )
 from .specs import RuntimeTopology
+from .vllm_replica import HostMemberLaunchRequest, HostMemberState
 
 
-class _MonarchRolloutHostEndpoint(RolloutHostEndpoint):
-    def __init__(self, actor: Any) -> None:
+class MonarchRolloutHostEndpoint(RolloutHostEndpoint):
+    def __init__(self, actor: Any, *, owns_actor: bool = False) -> None:
         self.actor = actor
+        self.owns_actor = owns_actor
 
     async def run(self, invocation: RolloutInvocation) -> RolloutResult:
         return await self.actor.run.call_one(invocation)
 
     async def close(self) -> None:
-        await self.actor.close.call_one()
+        if self.owns_actor:
+            await self.actor.close.call_one()
+
+
+class MonarchVllmHostLauncher:
+    def __init__(self, actor: Any) -> None:
+        self.actor = actor
+
+    async def start_member(self, request: HostMemberLaunchRequest) -> HostMemberState:
+        return await self.actor.start_vllm_member.call_one(request)
+
+    async def member_state(
+        self, replica_id: str, member_id: str, generation: int
+    ) -> HostMemberState:
+        return await self.actor.vllm_member_state.call_one(
+            replica_id, member_id, generation
+        )
+
+    async def stop_member(
+        self, replica_id: str, member_id: str, generation: int
+    ) -> None:
+        await self.actor.stop_vllm_member.call_one(replica_id, member_id, generation)
+
+    async def allocate_port(self) -> int:
+        return int(await self.actor.allocate_port.call_one())
 
 
 class MonarchPackedBatchInbox:
@@ -109,7 +135,7 @@ async def create_rollout_executor(
         )
         await actor.initialized
         procs.append(proc)
-        endpoints[host_id] = _MonarchRolloutHostEndpoint(actor)
+        endpoints[host_id] = MonarchRolloutHostEndpoint(actor, owns_actor=True)
     executor = DistributedRolloutExecutor(
         callable=rollout_callable,
         hosts=endpoints,

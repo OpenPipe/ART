@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 from collections.abc import Mapping
 import gc
+import math
 from multiprocessing import resource_tracker, shared_memory
 import os
 import secrets
@@ -365,7 +366,7 @@ class SharedMemoryPackedBatchStore:
                 dtype=torch.uint8,
                 count=reservation.storage_byte_count,
             )
-            await rdma_buffer.read_into(destination, timeout=timeout_s)
+            await rdma_buffer.read_into(destination, timeout=math.ceil(timeout_s))
             del destination
             destination = None
             return self._finish_commit(reservation, source, shm)
