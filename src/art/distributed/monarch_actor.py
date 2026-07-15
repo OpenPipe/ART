@@ -13,12 +13,22 @@ from typing import Any, cast
 # This module is imported only by explicit distributed runtime construction.
 from monarch.actor import Actor, endpoint  # ty: ignore[unresolved-import]
 
+from .artifact_preflight import (
+    ArtifactProbeCommand,
+    ArtifactProbeResult,
+    execute_artifact_probe,
+)
 from .data_plane import (
     BatchReservation,
     PackedBatchCapacityError,
     PackedBatchInbox,
     PackedBatchLeaseError,
     PackedBatchRef,
+)
+from .host_admission import (
+    HostAdmissionReport,
+    HostAdmissionRequest,
+    inspect_host,
 )
 from .monarch_runtime import RemoteCallError, RemoteCallResult
 from .packing import PackingRequest, PackingResult
@@ -66,13 +76,16 @@ class RolloutHostService(Actor):
 
     def __init__(
         self,
-        host_id: str,
+        admission_json: str,
         packed_batch_capacity_bytes: int,
         vllm_output_root: str = "/tmp/art-vllm",
     ) -> None:
-        self.host_id = host_id
+        admission = HostAdmissionRequest.model_validate_json(admission_json)
+        self.host_id = admission.host_id
+        self._admission = admission
+        self._admission_report: HostAdmissionReport | None = None
         self.inbox = PackedBatchInbox(
-            host_id=host_id, capacity_bytes=packed_batch_capacity_bytes
+            host_id=self.host_id, capacity_bytes=packed_batch_capacity_bytes
         )
         self._rdma_batches: dict[str, tuple[Any, Any, shared_memory.SharedMemory]] = {}
         self._packer = None
@@ -80,12 +93,30 @@ class RolloutHostService(Actor):
         self._vllm_launcher = None
 
     @resilient_endpoint
+    async def admission(self) -> HostAdmissionReport:
+        if self._admission_report is None:
+            self._admission_report = await asyncio.to_thread(
+                inspect_host, self._admission
+            )
+        return self._admission_report
+
+    @resilient_endpoint
     async def health(self) -> HostServiceHealth:
+        if self._admission_report is None:
+            raise RuntimeError("host has not passed ART runtime admission")
         return HostServiceHealth(
             host_id=self.host_id,
             hostname=socket.gethostname(),
             process_id=os.getpid(),
         )
+
+    @resilient_endpoint
+    async def artifact_root_probe(
+        self, command: ArtifactProbeCommand
+    ) -> ArtifactProbeResult:
+        if self._admission_report is None:
+            raise RuntimeError("host has not passed ART runtime admission")
+        return await asyncio.to_thread(execute_artifact_probe, self.host_id, command)
 
     @resilient_endpoint
     async def close(self) -> None:
@@ -111,6 +142,8 @@ class RolloutHostService(Actor):
 
     @resilient_endpoint
     async def start_vllm_member(self, request: HostMemberLaunchRequest):
+        if self._admission_report is None:
+            raise RuntimeError("host has not passed ART runtime admission")
         return await self._launcher().start_member(request)
 
     @resilient_endpoint

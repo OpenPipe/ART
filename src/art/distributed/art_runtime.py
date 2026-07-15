@@ -3,12 +3,28 @@ from __future__ import annotations
 import asyncio
 from collections import Counter
 from collections.abc import Mapping
+import logging
 from typing import Any
 import uuid
 
 from pydantic import BaseModel, ConfigDict
 
+from .artifact_preflight import (
+    ArtifactProbeCommand,
+    ArtifactProbeOperation,
+    ArtifactProbeResult,
+    ArtifactProbeSpec,
+    ArtifactRootPreflightError,
+)
 from .data_plane import PackedBatchLeaseSet, fanout_rdma_packed_batch
+from .host_admission import (
+    HostAdmissionReport,
+    HostAdmissionRequest,
+    RuntimeFingerprint,
+    build_runtime_fingerprint,
+    runtime_package_names,
+    validate_host_admission,
+)
 from .monarch_bootstrap import activate_child_virtualenv, monarch_identifier
 from .monarch_runtime import (
     MonarchPackedBatchInbox,
@@ -27,6 +43,13 @@ from .specs import (
     RuntimeTopology,
 )
 from .vllm_replica import ReplicaLaunchTemplate, ReplicaManager, ReplicaState
+
+logger = logging.getLogger(__name__)
+
+
+def _consume_task_result(task: asyncio.Future[Any]) -> None:
+    if not task.cancelled():
+        task.exception()
 
 
 class DistributedPackedBatch(BaseModel):
@@ -61,6 +84,21 @@ class ArtRuntime:
         self._trainer_runs: set[Any] = set()
         self._replicas: dict[str, ReplicaManager] = {}
         self._next_packing_host = 0
+        self._runtime_packages = runtime_package_names(
+            trainer=topology.trainer is not None
+        )
+        self._controller_fingerprint: RuntimeFingerprint
+        self._admitted_hosts: dict[str, HostAdmissionReport] = {}
+        self._artifact_probe = (
+            ArtifactProbeSpec(
+                artifact_root=topology.cluster.artifact_root,
+                runtime_id=self.runtime_id,
+                host_ids=tuple(host.host_id for host in topology.cluster.hosts),
+            )
+            if topology.cluster.artifact_root is not None
+            else None
+        )
+        self._close_task: asyncio.Task[None] | None = None
         self._started = False
         self._closed = False
 
@@ -81,47 +119,158 @@ class ArtRuntime:
         )
         try:
             await runtime._start_host_services()
-        except BaseException:
-            await runtime.close()
+        except BaseException as startup_error:
+            try:
+                await runtime.close()
+            except BaseException as cleanup_error:
+                raise BaseExceptionGroup(
+                    "ART runtime startup and cleanup failed",
+                    [startup_error, cleanup_error],
+                ) from None
             raise
         return runtime
 
     async def _start_host_services(self) -> None:
         from .monarch_actor import RolloutHostService
 
-        for index, host in enumerate(self.topology.cluster.hosts):
-            proc = self.host_mesh.slice(hosts=index).spawn_procs(
-                per_host={"service": 1},
-                bootstrap=activate_child_virtualenv,
-                name=monarch_identifier(f"art_host_{self.runtime_id}_{host.host_id}"),
+        async with asyncio.timeout(self.topology.cluster.startup_timeout_s):
+            for index, host in enumerate(self.topology.cluster.hosts):
+                proc = self.host_mesh.slice(hosts=index).spawn_procs(
+                    per_host={"service": 1},
+                    bootstrap=activate_child_virtualenv,
+                    name=monarch_identifier(
+                        f"art_host_{self.runtime_id}_{host.host_id}"
+                    ),
+                )
+                actor = proc.spawn(
+                    monarch_identifier(f"art_service_{self.runtime_id}_{host.host_id}"),
+                    RolloutHostService,
+                    HostAdmissionRequest(
+                        host_id=host.host_id,
+                        node_rank=host.node_rank,
+                        expected_gpu_ids=host.gpu_ids,
+                        runtime_packages=self._runtime_packages,
+                    ).model_dump_json(),
+                    self.config.packed_batch_capacity_bytes,
+                    self.config.vllm_output_root,
+                )
+                self._host_procs[host.host_id] = proc
+                self._host_actors[host.host_id] = actor
+            await asyncio.gather(
+                *(actor.initialized for actor in self._host_actors.values())
             )
-            actor = proc.spawn(
-                monarch_identifier(f"art_service_{self.runtime_id}_{host.host_id}"),
-                RolloutHostService,
-                host.host_id,
-                self.config.packed_batch_capacity_bytes,
-                self.config.vllm_output_root,
+            self._controller_fingerprint, reports = await asyncio.gather(
+                asyncio.to_thread(build_runtime_fingerprint, self._runtime_packages),
+                asyncio.gather(
+                    *(
+                        call_remote(actor.admission)
+                        for actor in self._host_actors.values()
+                    )
+                ),
             )
-            self._host_procs[host.host_id] = proc
-            self._host_actors[host.host_id] = actor
-        await asyncio.gather(
-            *(actor.initialized for actor in self._host_actors.values())
-        )
-        health = await self.health()
-        if set(health) != {host.host_id for host in self.topology.cluster.hosts}:
-            raise RuntimeError(
-                "host-service membership does not match runtime topology"
+            self._admitted_hosts = validate_host_admission(
+                self.topology.cluster.hosts,
+                reports,
+                expected_runtime=self._controller_fingerprint,
             )
+            await self._preflight_artifact_root()
         self._started = True
+        for report in self._admitted_hosts.values():
+            gpus = ",".join(
+                f"{gpu.index}={gpu.uuid}@{gpu.pci_bus_id}"
+                for gpu in report.assigned_gpus
+            )
+            logger.info(
+                "admitted ART host %s hostname=%s boot_id=%s gpus=[%s] runtime=%s",
+                report.host_id,
+                report.hostname,
+                report.boot_id,
+                gpus,
+                report.runtime.sha256,
+            )
 
     async def health(self) -> dict[str, HostServiceHealth]:
-        values = await asyncio.gather(
-            *(call_remote(actor.health) for actor in self._host_actors.values())
-        )
+        async with asyncio.timeout(self.topology.cluster.rpc_timeout_s):
+            values = await asyncio.gather(
+                *(call_remote(actor.health) for actor in self._host_actors.values())
+            )
         health = {value.host_id: value for value in values}
-        if len(health) != len(values):
-            raise RuntimeError("host services returned duplicate identities")
+        if len(health) != len(values) or health.keys() != self._admitted_hosts.keys():
+            raise RuntimeError("host-service liveness membership changed")
+        for host_id, value in health.items():
+            admitted = self._admitted_hosts[host_id]
+            if (value.hostname, value.process_id) != (
+                admitted.hostname,
+                admitted.process_id,
+            ):
+                raise RuntimeError(f"host service {host_id!r} identity changed")
         return health
+
+    async def _preflight_launch(self) -> None:
+        await self.health()
+
+    async def _preflight_artifact_root(self) -> None:
+        if self._artifact_probe is None:
+            return
+        try:
+            await self._artifact_probe_phase("initialize", owner_only=True)
+            for operation in (
+                "create",
+                "read_created",
+                "rename",
+                "read_renamed",
+                "delete",
+            ):
+                await self._artifact_probe_phase(operation)
+            await self._artifact_probe_phase("finalize", owner_only=True)
+        except BaseException as preflight_error:
+            cleanup_failures = await self._cleanup_artifact_probe()
+            if cleanup_failures:
+                raise BaseExceptionGroup(
+                    "artifact_root preflight and cleanup failed",
+                    [preflight_error, *cleanup_failures],
+                ) from None
+            raise
+
+    async def _artifact_probe_phase(
+        self, operation: ArtifactProbeOperation, *, owner_only: bool = False
+    ) -> None:
+        if self._artifact_probe is None:
+            return
+        host_ids = (
+            self._artifact_probe.host_ids[:1]
+            if owner_only
+            else self._artifact_probe.host_ids
+        )
+        command = ArtifactProbeCommand(spec=self._artifact_probe, operation=operation)
+        async with asyncio.timeout(self.topology.cluster.rpc_timeout_s):
+            results: list[ArtifactProbeResult] = await asyncio.gather(
+                *(
+                    call_remote(self._host_actors[host_id].artifact_root_probe, command)
+                    for host_id in host_ids
+                )
+            )
+        for host_id, result in zip(host_ids, results, strict=True):
+            if result.error_type is not None:
+                raise ArtifactRootPreflightError(result)
+            if result.host_id != host_id or result.operation != operation:
+                raise RuntimeError(
+                    f"invalid artifact_root preflight response from host {host_id!r}"
+                )
+
+    async def _cleanup_artifact_probe(self) -> list[BaseException]:
+        failures: list[BaseException] = []
+        for operation, owner_only in (("cleanup", False), ("finalize", True)):
+            try:
+                await self._artifact_probe_phase(operation, owner_only=owner_only)
+            except BaseException as error:
+                if not (
+                    operation == "finalize"
+                    and isinstance(error, ArtifactRootPreflightError)
+                    and error.result.error_type == "FileNotFoundError"
+                ):
+                    failures.append(error)
+        return failures
 
     def rollout_executor(
         self,
@@ -252,6 +401,7 @@ class ArtRuntime:
         ]
         if indices != list(range(indices[0], indices[-1] + 1)):
             raise ValueError("trainer hosts must be contiguous in the cluster mesh")
+        await self._preflight_launch()
         selected = self.host_mesh.slice(hosts=slice(indices[0], indices[-1] + 1))
         proc = selected.spawn_procs(
             per_host={"trainer": next(iter(counts.values()))},
@@ -264,10 +414,18 @@ class ArtRuntime:
         )
 
         try:
-            actors = await spawn_monarch_trainer_actors(proc, runtime_spec)
-            await actors.initialized
-        except BaseException:
-            await proc.stop()
+            async with asyncio.timeout(self.topology.cluster.startup_timeout_s):
+                actors = await spawn_monarch_trainer_actors(proc, runtime_spec)
+                await actors.initialized
+        except BaseException as startup_error:
+            try:
+                async with asyncio.timeout(self.topology.cluster.rpc_timeout_s):
+                    await proc.stop()
+            except BaseException as cleanup_error:
+                raise BaseExceptionGroup(
+                    "trainer startup and cleanup failed",
+                    [startup_error, cleanup_error],
+                ) from None
             raise
         run = MonarchTrainerRun(runtime_spec, run_spec, actors, proc)
         self._trainer_runs.add(run)
@@ -288,6 +446,7 @@ class ArtRuntime:
             raise ValueError("replica does not match the compiled runtime topology")
         if spec.replica_id in self._replicas:
             raise RuntimeError(f"replica {spec.replica_id!r} is already managed")
+        await self._preflight_launch()
         launchers = {
             member.host_id: MonarchVllmHostLauncher(self._host_actors[member.host_id])
             for member in spec.members
@@ -337,58 +496,71 @@ class ArtRuntime:
             self._replicas.pop(replica_id, None)
 
     async def close(self) -> None:
-        if self._closed:
-            return
-        self._closed = True
+        if self._close_task is None:
+            self._closed = True
+            self._close_task = asyncio.create_task(self._close())
+        await asyncio.shield(self._close_task)
+
+    async def _close(self) -> None:
         failures: list[BaseException] = []
-        for manager in tuple(self._replicas.values()):
+
+        async def collect(name: str, *awaitables: Any) -> None:
+            if not awaitables:
+                return
+            tasks = {asyncio.ensure_future(awaitable) for awaitable in awaitables}
             try:
-                await manager.stop()
-            except BaseException as error:
-                failures.append(error)
-        self._replicas.clear()
-        for run in tuple(self._trainer_runs):
-            try:
-                await run.close()
-            except BaseException as error:
-                failures.append(error)
-        self._trainer_runs.clear()
-        for host_id, actor in self._rollout_actors.items():
-            for slot in range(self._host(host_id).cpu_slots):
+                done, pending = await asyncio.wait(
+                    tasks, timeout=self.topology.cluster.rpc_timeout_s
+                )
+            except BaseException:
+                for task in tasks:
+                    task.cancel()
+                raise
+            for task in pending:
+                task.cancel()
+                task.add_done_callback(_consume_task_result)
+            if pending:
+                failures.append(
+                    TimeoutError(
+                        f"{name} exceeded {self.topology.cluster.rpc_timeout_s}s"
+                    )
+                )
+            for task in done:
                 try:
-                    await call_remote(actor.slice(rollout=slot).close)
+                    task.result()
                 except BaseException as error:
                     failures.append(error)
-        results = await asyncio.gather(
-            *(proc.stop() for proc in self._rollout_procs.values()),
-            return_exceptions=True,
+
+        await collect("replica shutdown", *(m.stop() for m in self._replicas.values()))
+        self._replicas.clear()
+        await collect("trainer shutdown", *(run.close() for run in self._trainer_runs))
+        self._trainer_runs.clear()
+        await collect(
+            "rollout actor shutdown",
+            *(
+                call_remote(actor.slice(rollout=slot).close)
+                for host_id, actor in self._rollout_actors.items()
+                for slot in range(self._host(host_id).cpu_slots)
+            ),
         )
-        failures.extend(
-            result for result in results if isinstance(result, BaseException)
+        await collect(
+            "rollout process shutdown",
+            *(proc.stop() for proc in self._rollout_procs.values()),
         )
         self._rollout_actors.clear()
         self._rollout_procs.clear()
-        results = await asyncio.gather(
+        await collect(
+            "host actor shutdown",
             *(call_remote(actor.close) for actor in self._host_actors.values()),
-            return_exceptions=True,
         )
-        failures.extend(
-            result for result in results if isinstance(result, BaseException)
-        )
-        results = await asyncio.gather(
+        await collect(
+            "host process shutdown",
             *(proc.stop() for proc in self._host_procs.values()),
-            return_exceptions=True,
-        )
-        failures.extend(
-            result for result in results if isinstance(result, BaseException)
         )
         self._host_actors.clear()
         self._host_procs.clear()
         if self.owns_host_mesh:
-            try:
-                await self.host_mesh.shutdown()
-            except BaseException as error:
-                failures.append(error)
+            await collect("host mesh shutdown", self.host_mesh.shutdown())
         if failures:
             raise BaseExceptionGroup("ART runtime teardown failed", failures)
 
