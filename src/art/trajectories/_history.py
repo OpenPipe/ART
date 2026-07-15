@@ -369,3 +369,16 @@ def trajectory_history(
     if protocol == "responses":
         return responses_history(trajectory, model=model)
     return anthropic_messages_history(trajectory, model=model)
+
+
+def trajectory_messages(trajectory: Trajectory) -> Messages:
+    if not trajectory.exchanges:
+        return History(
+            messages_and_choices=trajectory.messages_and_choices,
+            tools=trajectory.tools,
+        ).messages()
+    return (
+        trajectory_history(trajectory, model=None)
+        .as_chat_completions_history()
+        .messages
+    )

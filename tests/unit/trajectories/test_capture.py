@@ -218,6 +218,18 @@ async def test_group_context_and_async_helpers() -> None:
     assert result.exceptions[0].message == "boom"
 
 
+def test_failed_trajectory_context_records_exception_without_trajectory() -> None:
+    group = art.TrajectoryGroup()
+
+    with pytest.raises(ValueError, match="boom"):
+        with group:
+            with art.Trajectory() as failed:
+                raise ValueError("boom")
+
+    assert failed not in group.trajectories
+    assert [exception.message for exception in group.exceptions] == ["boom"]
+
+
 def test_sync_group_generator_initializes_once(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

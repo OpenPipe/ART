@@ -119,7 +119,9 @@ class MessagesRequest(TypedDict, total=False, extra_items=Any):
 
 
 class ChatCompletionsExchange(pydantic.BaseModel):
-    request: Annotated[ChatCompletionsRequest, pydantic.SkipValidation]
+    request: Annotated[
+        pydantic.SerializeAsAny[ChatCompletionsRequest], pydantic.SkipValidation
+    ]
     response: ChatCompletion
     start_time: datetime
     end_time: datetime
@@ -132,7 +134,9 @@ class ChatCompletionsExchange(pydantic.BaseModel):
 
 
 class CompletionsExchange(pydantic.BaseModel):
-    request: Annotated[CompletionsRequest, pydantic.SkipValidation]
+    request: Annotated[
+        pydantic.SerializeAsAny[CompletionsRequest], pydantic.SkipValidation
+    ]
     response: Completion
     start_time: datetime
     end_time: datetime
@@ -145,7 +149,9 @@ class CompletionsExchange(pydantic.BaseModel):
 
 
 class ResponsesExchange(pydantic.BaseModel):
-    request: Annotated[ResponsesRequest, pydantic.SkipValidation]
+    request: Annotated[
+        pydantic.SerializeAsAny[ResponsesRequest], pydantic.SkipValidation
+    ]
     response: Response
     start_time: datetime
     end_time: datetime
@@ -158,7 +164,9 @@ class ResponsesExchange(pydantic.BaseModel):
 
 
 class MessagesExchange(pydantic.BaseModel):
-    request: Annotated[MessagesRequest, pydantic.SkipValidation]
+    request: Annotated[
+        pydantic.SerializeAsAny[MessagesRequest], pydantic.SkipValidation
+    ]
     response: AnthropicMessage
     start_time: datetime
     end_time: datetime
@@ -205,8 +213,10 @@ class History(pydantic.BaseModel):
 
 class ChatCompletionsHistory(pydantic.BaseModel):
     model: str | None
-    messages: Messages
-    tools: Tools | None = None
+    messages: Annotated[pydantic.SerializeAsAny[Messages], pydantic.SkipValidation]
+    tools: Annotated[pydantic.SerializeAsAny[Tools | None], pydantic.SkipValidation] = (
+        None
+    )
     chat_template: str | None = None
     chat_template_kwargs: dict[str, Any] | None = None
 
@@ -371,7 +381,9 @@ class Trajectory(_CompactModel):
         return trajectory_history(self, model=model)
 
     def messages(self) -> Messages:
-        return self.history().as_chat_completions_history().messages
+        from ._history import trajectory_messages
+
+        return trajectory_messages(self)
 
     def for_logging(self) -> dict[str, object]:
         from ._compat import trajectory_for_logging

@@ -272,6 +272,12 @@ def test_responses_history_expands_previous_response_chain() -> None:
         "assistant",
     ]
     assert dict(chat_history.messages[1]).get("reasoning") == "think"
+    assert (
+        art.ChatCompletionsHistory.model_validate_json(
+            chat_history.model_dump_json(warnings="error")
+        )
+        == chat_history
+    )
 
     trajectory.exchanges.responses[1].request["previous_response_id"] = "missing"
     with pytest.raises(ValueError, match="outside this history"):
@@ -332,6 +338,19 @@ def test_legacy_messages_delegate_through_history() -> None:
         trajectory.history(model="test/model")
 
 
+def test_legacy_messages_preserve_primary_history_with_additional_histories() -> None:
+    trajectory = art.Trajectory(
+        messages_and_choices=[{"role": "user", "content": "primary"}],
+        additional_histories=[
+            art.History(messages_and_choices=[{"role": "user", "content": "alternate"}])
+        ],
+    )
+
+    assert trajectory.messages() == [{"role": "user", "content": "primary"}]
+    with pytest.raises(ValueError, match="multiple legacy histories"):
+        trajectory.history()
+
+
 @pytest.mark.asyncio
 async def test_ruler_accepts_exchange_trajectories(
     monkeypatch: pytest.MonkeyPatch,
@@ -359,3 +378,20 @@ async def test_ruler_accepts_exchange_trajectories(
     assert result is not None
     assert result.trajectories[0].exchanges == trajectory.exchanges
     assert [message["role"] for message in captured[0]] == ["user", "assistant"]
+
+
+@pytest.mark.asyncio
+async def test_ruler_swallow_exceptions_covers_history_projection() -> None:
+    from art.rewards.ruler import ruler_score_group
+
+    group = art.TrajectoryGroup(
+        [
+            art.Trajectory(
+                exchanges=TrajectoryExchanges(completions=[_completion([1], [2])])
+            )
+        ]
+    )
+
+    assert await ruler_score_group(group, swallow_exceptions=True) is None
+    with pytest.raises(ValueError, match="no chat-message structure"):
+        await ruler_score_group(group)

@@ -333,21 +333,18 @@ async def ruler_score_group(
         )
         new_trajectories.append(new_traj)
 
-    # Extract message lists and preserve original rewards for comparison
-    histories = [
-        trajectory.history().as_chat_completions_history()
-        for trajectory in new_trajectories
-    ]
-    message_lists: list[list[ChatCompletionMessageParam]] = [
-        history.messages for history in histories
-    ]
     for trajectory in new_trajectories:
         trajectory.metrics["independent_reward"] = trajectory.reward
 
-    # Extract tools from first trajectory (they should all be the same)
-    tools = histories[0].tools if histories else None
-
     try:
+        histories = [
+            trajectory.history().as_chat_completions_history()
+            for trajectory in new_trajectories
+        ]
+        message_lists: list[list[ChatCompletionMessageParam]] = [
+            history.messages for history in histories
+        ]
+        tools = histories[0].tools if histories else None
         # Call the core ruler function to get scores
         scores = await ruler(
             message_lists,

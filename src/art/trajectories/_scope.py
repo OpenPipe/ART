@@ -46,7 +46,7 @@ def enter_trajectory(trajectory: Trajectory) -> Trajectory:
 def exit_trajectory(
     trajectory: Trajectory,
     _exc_type: type[BaseException] | None,
-    _exc_value: BaseException | None,
+    exc_value: BaseException | None,
     _traceback: TracebackType | None,
 ) -> None:
     current = _trajectories.get()
@@ -55,8 +55,11 @@ def exit_trajectory(
     _trajectories.set(current[:-1])
     trajectory.finish()
     group = get_current_trajectory_group(required=False)
-    if group is not None and all(item is not trajectory for item in group.trajectories):
-        group.trajectories.append(trajectory)
+    if group is not None:
+        if exc_value is not None:
+            group.exceptions.append(exception_model(exc_value))
+        elif all(item is not trajectory for item in group.trajectories):
+            group.trajectories.append(trajectory)
 
 
 def enter_trajectory_group(group: TrajectoryGroup) -> TrajectoryGroup:

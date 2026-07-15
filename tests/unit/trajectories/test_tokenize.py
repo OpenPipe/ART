@@ -587,9 +587,19 @@ def test_undecodable_visible_token_bytes_fall_back_to_nan(
 
 
 def test_json_round_trip_preserves_exchange_types() -> None:
+    exchange = _chat_exchange([1], [2])
+    request: dict[str, Any] = {
+        "model": "test/model",
+        "messages": [
+            {"role": "assistant", "content": "answer", "reasoning": "thinking"}
+        ],
+    }
+    exchange.request = ChatCompletionsRequest(**request)
     original = art.Trajectory(
-        exchanges=TrajectoryExchanges(chat_completions=[_chat_exchange([1], [2])])
+        exchanges=TrajectoryExchanges(chat_completions=[exchange])
     )
+    dumped = original.model_dump(mode="json", warnings="error")
+    assert dumped["exchanges"]["chat_completions"][0]["request"] == request
     restored = art.Trajectory.model_validate_json(original.model_dump_json())
     assert restored.model_dump(mode="json") == original.model_dump(mode="json")
     assert isinstance(restored.exchanges.chat_completions[0].response, ChatCompletion)
