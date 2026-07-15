@@ -152,7 +152,7 @@ def selected_oracle_objectives() -> list[OracleObjective]:
     if normalized == "all":
         return list(SUPPORTED_ORACLE_OBJECTIVES)
     if normalized in SUPPORTED_ORACLE_OBJECTIVES:
-        return [cast(OracleObjective, normalized)]
+        return [normalized]
     supported = ", ".join((*SUPPORTED_ORACLE_OBJECTIVES, "all"))
     raise ValueError(
         f"Unsupported {ORACLE_OBJECTIVE_ENV} value '{raw}'. "

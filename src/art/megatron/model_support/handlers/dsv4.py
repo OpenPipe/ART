@@ -268,10 +268,10 @@ class Dsv4Handler(DefaultMoeHandler):
                     )
                 return tuple(preproc_output)
 
-            gpt_module._preprocess = preprocess_hook  # type: ignore[attr-defined]
+            gpt_module._preprocess = preprocess_hook  # type: ignore[attr-defined]  # ty:ignore[invalid-assignment]
 
     def collect_layer_families(self, provider: Any) -> list[LayerFamilyInstance]:
-        ratios = list(getattr(provider, "dsv4_compress_ratios", ()) or ())
+        ratios: list[int] = list(getattr(provider, "dsv4_compress_ratios", ()) or ())
 
         def first_layer_index(ratio: int) -> int | None:
             try:

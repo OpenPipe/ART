@@ -2876,7 +2876,7 @@ def _materialize(inputs: ForwardInputs) -> ForwardInputs:
 
 def _flatten(inputs: ForwardInputs) -> Iterator[AnyForwardInput]:
     if isinstance(inputs, ForwardInput):
-        yield inputs
+        yield inputs  # ty: ignore[invalid-yield]
         return
     for item in _nested_forward_children(inputs):
         yield from _flatten(item)

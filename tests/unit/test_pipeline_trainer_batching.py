@@ -8,6 +8,10 @@ from art import TrainableModel, Trajectory, TrajectoryGroup
 from art.pipeline_trainer.trainer import PipelineTrainer
 
 
+async def _noop_rollout(*_args: object, **_kwargs: object) -> TrajectoryGroup:
+    return TrajectoryGroup([])
+
+
 def _make_group() -> TrajectoryGroup:
     return TrajectoryGroup(
         [
@@ -35,7 +39,7 @@ async def test_collect_batch_respects_max_batch_size(tmp_path: Path) -> None:
     trainer = PipelineTrainer(
         model=model,
         backend=MagicMock(),  # type: ignore[arg-type]
-        rollout_fn=lambda *_args, **_kwargs: asyncio.sleep(0),
+        rollout_fn=_noop_rollout,
         scenarios=[],
         config={},
         num_rollout_workers=1,

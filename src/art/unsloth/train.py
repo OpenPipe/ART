@@ -435,7 +435,7 @@ def get_compute_loss_fn(trainer: "GRPOTrainer") -> Callable[..., torch.Tensor]:
             f"Sequence length ({seq_len}) must be evenly divisible by chunk size ({chunk_size})"
         )
         os.environ["UNSLOTH_RETURN_HIDDEN_STATES"] = "1"
-        forward_kwargs = {}
+        forward_kwargs: dict[str, object] = {}
         if "pixel_values" in inputs:
             forward_kwargs["pixel_values"] = inputs["pixel_values"]
         if "image_grid_thw" in inputs:
@@ -602,7 +602,7 @@ def calculate_logprobs(
     trainer: "GRPOTrainer",
     input_ids: torch.Tensor,
     causal_mask: torch.Tensor,
-    forward_kwargs: dict[str, torch.Tensor],
+    forward_kwargs: dict[str, object],
     next_input_ids: torch.Tensor,
     lm_head_t: torch.Tensor,
     chunk_size: int,
@@ -830,7 +830,7 @@ async def run_unsloth_rl_training(
     for offset in range(0, packed_tensors["tokens"].shape[0]):
         for _ in range(2 if warmup else 1):
             if precalculate_logprobs and not warmup:
-                packed_tensors["original_logprobs"] = packed_tensors["logprobs"]  # type: ignore[index]
+                packed_tensors["original_logprobs"] = packed_tensors["logprobs"]  # type: ignore[index]  # ty:ignore[invalid-key]
                 packed_tensors["logprobs"] = _precalculate_new_logprobs(
                     ctx,
                     packed_tensors,

@@ -10,6 +10,10 @@ from art import TrainableModel, Trajectory, TrajectoryGroup
 from art.pipeline_trainer.trainer import PipelineTrainer
 
 
+async def _noop_rollout(*_args: object, **_kwargs: object) -> TrajectoryGroup:
+    return TrajectoryGroup([])
+
+
 def _make_group(
     rewards: list[float], *, initial_policy_version: int | None
 ) -> TrajectoryGroup:
@@ -45,7 +49,7 @@ async def test_pipeline_trainer_logs_explicit_stale_and_zero_variance_metrics(
     trainer = PipelineTrainer(
         model=model,
         backend=backend,
-        rollout_fn=lambda *_args, **_kwargs: asyncio.sleep(0),
+        rollout_fn=_noop_rollout,
         scenarios=[],
         config={},
         num_rollout_workers=1,

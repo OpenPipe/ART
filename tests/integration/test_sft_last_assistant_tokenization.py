@@ -2,6 +2,7 @@ import json
 
 import pytest
 from transformers import AutoTokenizer
+from transformers.tokenization_utils_base import PreTrainedTokenizerBase
 
 from art.preprocessing.tokenize import tokenize_sft_batch
 from art.trajectories import Trajectory
@@ -36,6 +37,7 @@ def test_qwen_last_assistant_tool_call_tokenization() -> None:
         )
     except OSError:
         pytest.skip("Qwen3.6 tokenizer is not cached")
+    assert isinstance(tokenizer, PreTrainedTokenizerBase)
     tokenizer.chat_template = QWEN_LAST_ASSISTANT_TEMPLATE
     trajectory = Trajectory(
         messages_and_choices=[
@@ -94,6 +96,7 @@ def test_qwen_last_assistant_preserves_stock_generation_boundary() -> None:
         )
     except OSError:
         pytest.skip("Qwen3.6 tokenizer is not cached")
+    assert isinstance(tokenizer, PreTrainedTokenizerBase)
     trajectory = Trajectory(
         messages_and_choices=[
             {"role": "system", "content": "You are helpful."},

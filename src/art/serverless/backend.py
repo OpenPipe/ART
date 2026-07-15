@@ -257,7 +257,7 @@ class ServerlessBackend(Backend):
         save_checkpoint: bool = True,
         # Verbosity
         verbose: bool = False,
-    ) -> ServerlessTrainResult:
+    ) -> ServerlessTrainResult:  # ty:ignore[invalid-method-override]
         """Train the model on the given trajectory groups.
 
         This method does NOT automatically log trajectories or metrics. Call
@@ -858,7 +858,7 @@ class ServerlessBackend(Backend):
 
             # Pull from W&B to local temp dir
             checkpoint_dir = await self._experimental_pull_model_checkpoint(
-                model,  # type: ignore[arg-type]
+                model,  # type: ignore[arg-type]  # ty:ignore[invalid-argument-type]
                 step=step,
                 verbose=verbose,
             )

@@ -1,3 +1,5 @@
+# ty: ignore[invalid-argument-type, unknown-argument]
+
 from __future__ import annotations
 
 from types import MethodType

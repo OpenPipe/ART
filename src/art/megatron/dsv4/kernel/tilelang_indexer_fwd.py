@@ -4,8 +4,6 @@
 #   - Operates on [seqlen, batch, heads, dim] (SBHD) layout, batch handled externally
 #   - Uses causal mask via cu_seqlens instead of variable-length packed sequences
 #   - Supports compressed KV (seq_len_kv = seq_len_q / compress_ratio)
-from typing import Any, cast
-
 import torch
 
 from art.megatron.dsv4.kernel.tilelang_import import (
@@ -16,8 +14,8 @@ from art.megatron.dsv4.kernel.tilelang_import import (
 
 _tilelang, _T = import_tilelang()
 
-tilelang = cast(Any, _tilelang)
-T = cast(Any, _T)
+tilelang = _tilelang
+T = _T
 
 
 @tilelang.jit(

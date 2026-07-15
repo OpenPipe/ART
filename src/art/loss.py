@@ -73,7 +73,7 @@ class LossInputs(BaseModel):
             weights=shift_tensor(inputs["weights"], 0.0),
             group_ids=shift_tensor(inputs["group_ids"], 0),
             original_logprobs=(
-                shift_tensor(inputs["original_logprobs"], 0.0)  # ty: ignore[invalid-key]
+                shift_tensor(inputs["original_logprobs"], 0.0)  # ty: ignore[invalid-key, invalid-argument-type]
                 if "original_logprobs" in inputs
                 else None
             ),

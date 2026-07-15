@@ -65,7 +65,7 @@ def select_indexed_inputs(packed_tensors: PackedTensors, index: int) -> PackedTe
             return selected.clone()
         return selected
 
-    return PackedTensors(  # type: ignore[call-arg]
+    return PackedTensors(  # type: ignore[call-arg]  # ty:ignore[missing-typed-dict-key]
         **{
             key: selected_tensor(value)
             for key, value in packed_tensors.items()
@@ -78,7 +78,7 @@ def select_indexed_inputs(packed_tensors: PackedTensors, index: int) -> PackedTe
 
 @torch.no_grad()
 def _clone_packed_tensors(inputs: PackedTensors) -> PackedTensors:
-    return PackedTensors(  # type: ignore[call-arg]
+    return PackedTensors(  # type: ignore[call-arg]  # ty:ignore[missing-typed-dict-key]
         **{
             key: value.clone()
             for key, value in inputs.items()
@@ -227,7 +227,7 @@ def _select_next_step_first_micro(
 def _move_inputs_to_device(inputs: PackedTensors, device: torch.device) -> None:
     for key, value in inputs.items():
         if isinstance(value, torch.Tensor):
-            inputs[key] = value.to(device)  # type: ignore[index]
+            inputs[key] = value.to(device)  # type: ignore[index]  # ty:ignore[invalid-key]
 
 
 def _count_trainable_tokens(inputs: LossInputs | DispatchedPackedTensors) -> float:

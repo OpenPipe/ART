@@ -799,7 +799,7 @@ def _install_gemma4_preprocess_patch(model_chunks: Sequence[Any]) -> None:
             )
             return tuple(preproc_output)
 
-        gpt_module._preprocess = preprocess_hook  # type: ignore[attr-defined]
+        gpt_module._preprocess = preprocess_hook  # type: ignore[attr-defined]  # ty:ignore[invalid-assignment]
 
 
 def _install_gemma4_full_recompute_patch(model_chunks: Sequence[Any]) -> None:
@@ -1945,7 +1945,7 @@ def ensure_gemma4_text_only_bridge_registered() -> None:
     from megatron.bridge.models.gemma_vl.gemma4_vl_bridge import Gemma4VLBridge
     from megatron.core.models.gpt.gpt_model import GPTModel
 
-    @MegatronModelBridge.register_bridge(
+    @MegatronModelBridge.register_bridge(  # ty: ignore[invalid-argument-type]
         source="Gemma4ForConditionalGeneration",
         target=GPTModel,
         provider=Gemma4ModelProvider,

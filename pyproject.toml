@@ -254,6 +254,7 @@ python-version = "3.12"
 # optional deps are installed. The ty:ignore comments are needed in CI (with all deps)
 # but become unused locally (without all deps).
 unused-ignore-comment = "ignore"
+unused-type-ignore-comment = "ignore"
 
 [tool.ty.analysis]
 # Allow unresolved imports for optional dependencies that may not be installed locally.
@@ -295,9 +296,11 @@ allowed-unresolved-imports = [
     "seaborn.**",
     # megatron deps
     "causal_conv1d.**",
+    "einops.**",
     "fla.**",
     "megatron.**",
     "quack.**",
+    "safetensors.**",
     "transformer_engine.**",
     "triton.**",
 ]
@@ -312,7 +315,7 @@ dev = [
     "pytest>=8.4.1",
     "nbval>=0.11.0",
     "pytest-xdist>=3.8.0",
-    "ty==0.0.14",
+    "ty==0.0.59",
     "pytest-asyncio>=1.1.0",
     "duckdb>=1.0.0",
     "pyarrow>=15.0.0",

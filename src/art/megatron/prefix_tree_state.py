@@ -208,34 +208,35 @@ def _build_sparse_prefix_tree_block_mask(
                 _empty_block_mask(seq_len=seq_len, block_size=block_size, device=device)
             )
             continue
-        row_masks.append(
-            build_block_mask_from_context(
-                FlexMaskSpec(
-                    q_len=seq_len,
-                    k_len=seq_len,
-                    block_size=block_size,
-                    slices=slices,
-                    exact_mask=ExactMaskMetadata(
-                        q_token_indices=token_indices,
-                        k_token_indices=token_indices,
-                        cache_key=(
-                            f"identity:{seq_len}"
-                            if sliding_window is None
-                            else f"identity:{seq_len}:sliding:{int(sliding_window)}"
-                        ),
+        row_mask = build_block_mask_from_context(
+            FlexMaskSpec(
+                q_len=seq_len,
+                k_len=seq_len,
+                block_size=block_size,
+                slices=slices,
+                exact_mask=ExactMaskMetadata(
+                    q_token_indices=token_indices,
+                    k_token_indices=token_indices,
+                    cache_key=(
+                        f"identity:{seq_len}"
+                        if sliding_window is None
+                        else f"identity:{seq_len}:sliding:{int(sliding_window)}"
                     ),
                 ),
-                context=prepare_block_mask_context(
-                    group_ids=group_ids_cpu[row_index],
-                    parent_ids=parent_ids_cpu[row_index],
-                    input_pos=None
-                    if input_pos_cpu is None
-                    else input_pos_cpu[row_index],
-                ),
-                sliding_window=sliding_window,
-                device=device,
-            )
+            ),
+            context=prepare_block_mask_context(
+                group_ids=group_ids_cpu[row_index],
+                parent_ids=parent_ids_cpu[row_index],
+                input_pos=None if input_pos_cpu is None else input_pos_cpu[row_index],
+            ),
+            sliding_window=sliding_window,
+            device=device,
         )
+        if row_mask is None:
+            row_mask = _empty_block_mask(
+                seq_len=seq_len, block_size=block_size, device=device
+            )
+        row_masks.append(row_mask)
     if not row_masks:
         return _empty_block_mask(seq_len=seq_len, block_size=block_size, device=device)
     return _stack_row_block_masks(

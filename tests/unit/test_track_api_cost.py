@@ -715,7 +715,7 @@ class TestTrackApiCostIntegration:
         trainer = PipelineTrainer(
             model=model,
             backend=backend,
-            rollout_fn=lambda *_args, **_kwargs: asyncio.sleep(0),
+            rollout_fn=lambda *_args, **_kwargs: asyncio.sleep(0),  # ty: ignore[invalid-argument-type]
             scenarios=[],
             config={},
             num_rollout_workers=1,

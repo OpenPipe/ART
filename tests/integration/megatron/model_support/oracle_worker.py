@@ -525,7 +525,7 @@ def _apply_requested_flex_backend_patch(flex_backend: str | None):
     else:
         raise RuntimeError(f"Unsupported flex backend request: {flex_backend}")
 
-    compiled_flex_attention._FORCED_FLEX_BACKEND = patched_backend  # type: ignore[invalid-assignment]
+    compiled_flex_attention._FORCED_FLEX_BACKEND = patched_backend  # type: ignore[invalid-assignment]  # ty:ignore[invalid-assignment]
     compiled_flex_attention._FORCED_FLEX_KERNEL_OPTIONS = patched_kernel_options
     compiled_flex_attention.dense_compiled_flex_attention = torch.compile(
         compiled_flex_attention._forced_flex_attention_dense
@@ -699,7 +699,7 @@ def _assert_runtime_configuration(
     try:
         from megatron.core.ssm.gated_delta_net import GatedDeltaNet
     except ImportError:  # pragma: no cover - optional dependency guard.
-        GatedDeltaNet = ()  # type: ignore[assignment]
+        GatedDeltaNet = ()  # type: ignore[assignment]  # ty:ignore[invalid-assignment]
     from megatron.core.transformer.attention import SelfAttention
 
     for chunk in model_chunks:
@@ -1044,7 +1044,7 @@ def _apply_attention_nested_grad_mutation(mutation: SensitivityMutation | None):
         view.copy_(grad)
         return view
 
-    executor._sanitize_nested_stage_input_grad = _mutated_sanitize  # type: ignore[invalid-assignment]
+    executor._sanitize_nested_stage_input_grad = _mutated_sanitize  # type: ignore[invalid-assignment]  # ty:ignore[invalid-assignment]
     try:
         yield
     finally:
@@ -1066,8 +1066,8 @@ def _apply_attention_lse_normalize_mutation(mutation: SensitivityMutation | None
     def _identity(lse: torch.Tensor, **_kwargs: Any) -> torch.Tensor:
         return lse
 
-    compiled_flex_attention.normalize_flex_lse = _identity  # type: ignore[invalid-assignment]
-    executor.normalize_flex_lse = _identity  # type: ignore[invalid-assignment]
+    compiled_flex_attention.normalize_flex_lse = _identity  # type: ignore[invalid-assignment]  # ty:ignore[invalid-assignment]
+    executor.normalize_flex_lse = _identity  # type: ignore[invalid-assignment]  # ty:ignore[invalid-assignment]
     try:
         yield
     finally:

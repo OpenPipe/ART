@@ -1195,7 +1195,7 @@ def ensure_qwen35_text_only_bridge_registered() -> None:
     )
     from megatron.core.models.gpt.gpt_model import GPTModel
 
-    @MegatronModelBridge.register_bridge(
+    @MegatronModelBridge.register_bridge(  # ty: ignore[invalid-argument-type]
         source=_QWEN3_5_DENSE_HF_CLASS_NAME,
         target=GPTModel,
         provider=Qwen35VLModelProvider,
@@ -1205,7 +1205,7 @@ def ensure_qwen35_text_only_bridge_registered() -> None:
         def mapping_registry(self) -> Any:
             return _qwen35_text_only_mapping_registry(Qwen35VLBridge)
 
-    @MegatronModelBridge.register_bridge(
+    @MegatronModelBridge.register_bridge(  # ty: ignore[invalid-argument-type]
         source=_QWEN3_5_MOE_HF_CLASS_NAME,
         target=GPTModel,
         provider=Qwen35VLMoEModelProvider,

@@ -239,11 +239,12 @@ def _native_gdn_cp_prepared_varlen_worker(
         ).requires_grad_(True)
         conv_grad = torch.randn_like(conv0_ref)
         rec_grad = torch.randn_like(rec0_ref)
+        assert cp_gdn.num_value_heads is not None
         output_grad = torch.randn(
             1,
             int(lengths.sum().item()),
-            cast(int, cp_gdn.num_value_heads) // cast(int, cp_gdn.tp_size),
-            cast(int, cp_gdn.value_head_dim),
+            cp_gdn.num_value_heads // cp_gdn.tp_size,
+            cp_gdn.value_head_dim,
             device=hidden.device,
             dtype=GDN_CORRECTNESS_DTYPE,
         )

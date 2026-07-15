@@ -322,8 +322,9 @@ Examples:
         print("Running all notebooks")
 
     # Process notebook configurations
-    processed_configs = []
+    processed_configs: list[dict[str, Any]] = []
     for config in selected_configs:
+        processed_config: dict[str, Any]
         if isinstance(config, str):
             # Handle legacy string format
             processed_config = {"path": config, "variables": {}}

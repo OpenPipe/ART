@@ -109,9 +109,12 @@ def run_chat_template_rollout(base_model: str) -> ChatTemplateRolloutReport:
     tokenizer = backend._tokenizers.get(tokenizer_key)
     if tokenizer is None:
         from transformers import AutoTokenizer
+        from transformers.tokenization_utils_base import PreTrainedTokenizerBase
 
+        loaded_tokenizer = AutoTokenizer.from_pretrained(base_model)
+        assert isinstance(loaded_tokenizer, PreTrainedTokenizerBase)
         tokenizer = backend._configure_training_tokenizer(
-            AutoTokenizer.from_pretrained(base_model),
+            loaded_tokenizer,
             model=model,
             internal_config=internal_config,
         )

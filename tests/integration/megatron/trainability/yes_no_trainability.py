@@ -118,7 +118,7 @@ def build_prompts() -> list[str]:
     prompt_count = _get_env_int("ART_MODEL_SUPPORT_YES_NO_PROMPT_COUNT", 8)
     if prompt:
         return [prompt] * max(1, prompt_count)
-    prompts = [
+    prompts: list[str] = [
         "\n\n".join(
             (
                 _YES_NO_PROMPT_ROOT,

@@ -363,6 +363,7 @@ async def _collect_real_trajectory_groups(
     config: RealPathConfig,
 ) -> list[Any]:
     from transformers import AutoTokenizer
+    from transformers.tokenization_utils_base import PreTrainedTokenizerBase
 
     import art
     from art.megatron.model_support.tokenizer import (
@@ -371,8 +372,10 @@ async def _collect_real_trajectory_groups(
 
     if config.rollouts_per_prompt < 2:
         raise ValueError("real-path mismatch requires at least two rollouts per prompt")
+    loaded_tokenizer = AutoTokenizer.from_pretrained(config.output_parity.base_model)
+    assert isinstance(loaded_tokenizer, PreTrainedTokenizerBase)
     tokenizer = configure_tokenizer_for_model_support(
-        AutoTokenizer.from_pretrained(config.output_parity.base_model),
+        loaded_tokenizer,
         base_model=config.output_parity.base_model,
         internal_config={
             "allow_unvalidated_arch": config.output_parity.allow_unvalidated_arch

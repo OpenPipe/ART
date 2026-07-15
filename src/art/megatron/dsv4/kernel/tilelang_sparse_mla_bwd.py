@@ -5,8 +5,6 @@
 #   - Single-head KV: kv shape [B, S_kv, D] (no kv_group, no D/D_tail split)
 #   - Index shape: [B, S, topk] (no kv_group dim)
 #   - Outputs: dQ [B, S, H, D], dKV [B, S_kv, D], dAttnSink [H]
-from typing import Any, cast
-
 import torch
 
 from art.megatron.dsv4.kernel.tilelang_import import (
@@ -17,8 +15,8 @@ from art.megatron.dsv4.kernel.tilelang_import import (
 
 _tilelang, _T = import_tilelang()
 
-tilelang = cast(Any, _tilelang)
-T = cast(Any, _T)
+tilelang = _tilelang
+T = _T
 
 
 @tilelang.jit(out_idx=[-1])

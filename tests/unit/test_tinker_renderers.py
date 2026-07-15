@@ -53,7 +53,7 @@ class FakeTokenizer:
 
 def _decode_model_input(tokenizer: FakeTokenizer, model_input: object) -> str:
     tokens: list[int] = []
-    for chunk in model_input.chunks:  # type: ignore[attr-defined]
+    for chunk in model_input.chunks:  # type: ignore[attr-defined]  # ty:ignore[unresolved-attribute]
         assert hasattr(chunk, "tokens"), f"Unexpected non-text chunk: {chunk!r}"
         tokens.extend(list(chunk.tokens))
     return tokenizer.decode(tokens)

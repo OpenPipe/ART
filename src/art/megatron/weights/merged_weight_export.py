@@ -300,7 +300,7 @@ def ensure_merged_weight_transfer_group(
 
     error: BaseException | None = None
     if _is_sender_rank(rank):
-        init_kwargs = {
+        init_kwargs: dict[str, object] = {
             "master_address": spec.init_info.master_address,
             "master_port": spec.init_info.master_port,
             "world_size": spec.init_info.world_size,

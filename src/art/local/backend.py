@@ -75,6 +75,7 @@ from ..preprocessing.tokenize import (
 )
 from ..trajectories import Trajectory, TrajectoryGroup
 from ..types import (
+    Choice,
     LocalTrainResult,
     Message,
     TrainConfig,
@@ -187,6 +188,13 @@ def _tokenizer_cache_key(
     if chat_template is None:
         return (base_model, None)
     return (base_model, hashlib.sha256(chat_template.encode("utf-8")).hexdigest())
+
+
+def _load_training_tokenizer(base_model: str) -> PreTrainedTokenizerBase:
+    return cast(
+        PreTrainedTokenizerBase,
+        AutoTokenizer.from_pretrained(base_model),
+    )
 
 
 class LocalBackend(Backend):
@@ -578,7 +586,7 @@ class LocalBackend(Backend):
         tokenizer_key = _tokenizer_cache_key(model.base_model, internal_config)
         if tokenizer_key not in self._tokenizers:
             tokenizer = self._configure_training_tokenizer(
-                AutoTokenizer.from_pretrained(model.base_model),
+                _load_training_tokenizer(model.base_model),
                 model=model,
                 internal_config=internal_config,
             )
@@ -777,10 +785,10 @@ class LocalBackend(Backend):
         header = f"reward: {trajectory.reward} {' '.join(f'{k}: {v}' for k, v in trajectory.metrics.items())}\n\n"
         formatted_messages = []
         for message_or_choice in trajectory.messages_and_choices:
-            if isinstance(message_or_choice, dict):
-                message = message_or_choice
+            if isinstance(message_or_choice, Choice):
+                message = cast(Message, message_or_choice.message.model_dump())
             else:
-                message = cast(Message, message_or_choice.message.model_dump())  # ty:ignore[possibly-missing-attribute]
+                message = message_or_choice
             formatted_messages.append(format_message(message))
         return header + "\n".join(formatted_messages)
 
@@ -826,7 +834,7 @@ class LocalBackend(Backend):
         save_checkpoint: bool = True,
         # Verbosity
         verbose: bool = False,
-    ) -> LocalTrainResult:
+    ) -> LocalTrainResult:  # ty:ignore[invalid-method-override]
         """Train the model on the given trajectory groups.
 
         This method does NOT automatically log trajectories or metrics. Call
@@ -1071,7 +1079,7 @@ class LocalBackend(Backend):
                     if hasattr(service, "register_lora_for_step"):
                         await service.register_lora_for_step(  # type: ignore[attr-defined]
                             next_step, next_checkpoint_dir
-                        )
+                        )  # ty:ignore[call-non-callable]
                     logger.info(
                         f"[BACKEND] _train_model SKIP: register_lora_for_step "
                         f"completed for step {next_step}"
@@ -1194,7 +1202,7 @@ class LocalBackend(Backend):
         tokenizer_key = _tokenizer_cache_key(model.base_model, internal_config)
         if tokenizer_key not in self._tokenizers:
             tokenizer = self._configure_training_tokenizer(
-                AutoTokenizer.from_pretrained(model.base_model),
+                _load_training_tokenizer(model.base_model),
                 model=model,
                 internal_config=internal_config,
             )
@@ -1364,7 +1372,7 @@ class LocalBackend(Backend):
                     f"No checkpoints found for {model.project}/{model.name} in local storage or S3"
                 )
             elif local_latest_step is None:
-                resolved_step = s3_latest_step  # type: ignore[assignment]
+                resolved_step = s3_latest_step  # type: ignore[assignment]  # ty:ignore[invalid-assignment]
                 if verbose:
                     print(f"Using latest checkpoint from S3: step {resolved_step}")
             elif s3_latest_step is None:

@@ -735,10 +735,7 @@ class TinkerNativeBackend(Backend):
 
     def _resolve_model_config(self, model: TrainableModel) -> TinkerNativeModelConfig:
         internal_config = model._internal_config or {}
-        tinker_native_args = cast(
-            dev.TinkerNativeArgs | None,
-            internal_config.get("tinker_native_args"),
-        )
+        tinker_native_args = internal_config.get("tinker_native_args")
         renderer_name = (
             tinker_native_args.get("renderer_name")
             if tinker_native_args is not None

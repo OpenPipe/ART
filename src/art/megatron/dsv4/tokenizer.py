@@ -28,7 +28,7 @@ def get_dsv4_tokenizer(
     added_vocab_size = len(added_vocab)
     tokenizer_vocab_size = tokenizer.vocab_size
 
-    class _ArtDsv4Tokenizer(tokenizer.__class__):  # type: ignore[misc, valid-type]
+    class _ArtDsv4Tokenizer(tokenizer.__class__):  # type: ignore[misc, valid-type]  # ty:ignore[unsupported-base]
         def apply_chat_template(
             self,
             messages: list[dict[str, Any]],

@@ -3,7 +3,7 @@ from collections import Counter
 import contextlib
 import contextvars
 from dataclasses import dataclass, field
-from typing import Awaitable, Callable, Iterable, Iterator, Literal, overload
+from typing import Awaitable, Callable, Iterable, Iterator, Literal, Sequence, overload
 
 from openai.types.chat.chat_completion import Choice
 from tqdm import auto as tqdm
@@ -53,7 +53,7 @@ async def gather_trajectory_groups(
         context.pbar.close()
 
     # Filter out any None results that may have been returned due to handled exceptions
-    processed_groups = []
+    processed_groups: list[TrajectoryGroup] = []
     for g in result_groups:
         if g is None:
             continue
@@ -113,12 +113,7 @@ async def gather_trajectories(
     pbar_desc: str | None = "gather",
     pbar_total_completion_tokens: bool = False,
     max_exceptions: int | float = 0,
-) -> (
-    list[Trajectory]
-    | list[Trajectory | BaseException]
-    | list[list[Trajectory]]
-    | list[list[Trajectory] | BaseException]
-):
+) -> Sequence[Trajectory | list[Trajectory] | BaseException]:
     if pbar_total_completion_tokens:
         print(
             "pbar_total_completion_tokens is deprecated and will be removed in a future version."

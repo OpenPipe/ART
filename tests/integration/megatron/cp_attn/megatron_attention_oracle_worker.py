@@ -97,7 +97,7 @@ def run_worker_subprocess(
         log_file.flush()
         live_log_file.write(header)
         live_log_file.flush()
-        run = subprocess.Popen(
+        run = subprocess.Popen(  # ty: ignore[no-matching-overload]
             command,
             cwd=str(worker_cwd),
             env=env,

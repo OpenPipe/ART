@@ -62,7 +62,7 @@ def test_dynamic_lora_slots_capture_recompute_context_and_step_independently() -
         assert torch.allclose(actual, expected, atol=0, rtol=0)
         assert slot_a.rank == 1
         assert slot_a.scale == 32.0
-        assert lora._slot(ref_b).scale == 8.0  # type: ignore[union-attr]
+        assert lora._slot(ref_b).scale == 8.0  # type: ignore[union-attr]  # ty:ignore[unresolved-attribute]
 
         trainer = _trainer_for(lora, device)
         cpu_adapter = {
@@ -326,8 +326,8 @@ def _assert_checkpoint_recomputes_with(
         y = checkpoint(lambda t: lora(t), *checkpoint_args, x)
     with use_lora_slot(ambient_ref):
         y.sum().backward()
-    assert lora._slot(expected_ref).A_T.grad is not None  # type: ignore[union-attr]
-    assert lora._slot(ambient_ref).A_T.grad is None  # type: ignore[union-attr]
+    assert lora._slot(expected_ref).A_T.grad is not None  # type: ignore[union-attr]  # ty:ignore[unresolved-attribute]
+    assert lora._slot(ambient_ref).A_T.grad is None  # type: ignore[union-attr]  # ty:ignore[unresolved-attribute]
 
 
 def _assert_step_updates_only(
@@ -375,7 +375,7 @@ def _assert_reload_replaces_slot_optimizer(
     assert ref.name not in trainer._dynamic_optimizers
     assert [tuple(param.shape) for param in new_params] == [(4, 3), (3, 5)]
     assert all(old is not new for old, new in zip(old_params, new_params, strict=True))
-    assert lora._slot(ref).rank == 3  # type: ignore[union-attr]
+    assert lora._slot(ref).rank == 3  # type: ignore[union-attr]  # ty:ignore[unresolved-attribute]
 
 
 def _trainer_for(lora: LoRA, device: torch.device) -> TrainerRank:
