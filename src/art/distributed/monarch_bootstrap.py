@@ -13,6 +13,7 @@ from collections.abc import Mapping, Sequence
 import hashlib
 import multiprocessing
 import os
+from pathlib import Path
 import re
 import sys
 from typing import TYPE_CHECKING, Any
@@ -105,7 +106,7 @@ def monarch_identifier(value: str) -> str:
     return f"{identifier[:prefix_length]}_{suffix}"
 
 
-def _prepare_child_environment() -> None:
+def _prepare_child_environment(*, worker: bool = False) -> None:
     # Monarch's spawned interpreter may resolve outside the active uv venv. Make
     # the controller's import roots explicit for ART and installed user code.
     roots = [path for path in sys.path if path and os.path.isabs(path)]
@@ -113,6 +114,17 @@ def _prepare_child_environment() -> None:
     os.environ["PYTHONPATH"] = os.pathsep.join(dict.fromkeys(filter(None, roots)))
     if os.path.isfile(os.path.join(sys.prefix, "pyvenv.cfg")):
         os.environ.setdefault("ART_VIRTUAL_ENV", sys.prefix)
+    if worker:
+        nvidia_libs = (
+            str(path)
+            for root in roots
+            for path in (Path(root) / "nvidia").glob("*/lib")
+            if path.is_dir()
+        )
+        inherited = os.environ.get("LD_LIBRARY_PATH", "").split(os.pathsep)
+        os.environ["LD_LIBRARY_PATH"] = os.pathsep.join(
+            dict.fromkeys((*nvidia_libs, *filter(None, inherited)))
+        )
     for name in _MONARCH_TIMEOUT_ENV:
         os.environ.setdefault(name, "600s")
 
@@ -131,7 +143,7 @@ def run_worker(address: str) -> None:
     trust-all mode must never be exposed to an untrusted or public network.
     """
 
-    _prepare_child_environment()
+    _prepare_child_environment(worker=True)
     # Importing ``art`` initializes enough third-party state to break Monarch's
     # spawned interpreter bootstrap. Replace this process with a clean worker.
     os.execv(sys.executable, [sys.executable, "-c", _WORKER_CODE, address])
