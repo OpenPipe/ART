@@ -394,6 +394,37 @@ def _metadata_by_owner_dtype(
     }
 
 
+def _canonical_global_metadata(local_metadata: list[Any]) -> list[Any]:
+    """Gather stage-local manifests; select one canonical DP/CP replica per shard."""
+    if not _distributed_ready():
+        return local_metadata
+    world_size = torch.distributed.get_world_size()  # type: ignore[possibly-missing-attribute]
+    gathered: list[list[Any] | None] = [None] * world_size
+    torch.distributed.all_gather_object(gathered, local_metadata)  # type: ignore[possibly-missing-attribute]
+    canonical: dict[tuple[Any, ...], Any] = {}
+    for rank_entries in gathered:
+        if rank_entries is None:
+            raise RuntimeError("LoRA manifest gather returned a missing rank")
+        for meta in rank_entries:
+            manifest = meta.manifest
+            identity = (
+                meta.key,
+                int(manifest.get("shard_rank", 0)),
+                int(getattr(meta, "expert_start", -1)),
+            )
+            current = canonical.get(identity)
+            if current is None or meta.owner_rank < current.owner_rank:
+                canonical[identity] = meta
+    return sorted(
+        canonical.values(),
+        key=lambda meta: (
+            meta.key,
+            int(getattr(meta, "expert_start", -1)),
+            int(meta.manifest.get("shard_rank", 0)),
+        ),
+    )
+
+
 def _pack_metadata_tensors(
     metadata: Sequence[Any],
     tensors: dict[str, torch.Tensor],
@@ -693,7 +724,6 @@ def build_vllm_lora_tensors_from_model(
             )
         rank = 0
     packed_expert_groups = tuple(handler.expert_packed_lora_groups())
-    planner = LoRAPublishPlanner(model, slot_ref)
     local_tensors, local_metadata = collect_local_lora_entries(
         model,
         adapter_dtypes,
@@ -708,19 +738,8 @@ def build_vllm_lora_tensors_from_model(
         packed_expert_groups=packed_expert_groups,
         slot_ref=slot_ref,
     )
-    all_packed_metadata = (
-        _global_packed_expert_metadata(planner, adapter_dtypes, packed_expert_groups)
-        if rank == 0
-        else local_packed_metadata
-    )
-    if rank == 0:
-        all_metadata = _global_regular_metadata(
-            planner,
-            adapter_dtypes,
-            packed_expert_groups if all_packed_metadata else (),
-        )
-    else:
-        all_metadata = local_metadata
+    all_packed_metadata = _canonical_global_metadata(local_packed_metadata)
+    all_metadata = _canonical_global_metadata(local_metadata)
     exchanged_tensors = _exchange_batched_tensors(
         all_metadata,
         local_tensors=local_tensors,

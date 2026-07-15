@@ -1,10 +1,13 @@
 from __future__ import annotations
 
+import json
 import os
 from pathlib import Path
 import time
 
 from pydantic import BaseModel
+
+OPTIMIZER_MANIFEST = "manifest.json"
 
 from ..utils.get_model_step import get_step_from_dir
 from ..utils.output_dirs import get_step_checkpoint_dir
@@ -18,6 +21,83 @@ class MegatronResumeStep(BaseModel):
     optimizer_step: int | None
     used_unpaired_override: bool = False
     quarantined_lora_steps: tuple[int, ...] = ()
+
+
+class OptimizerTopology(BaseModel):
+    world_size: int
+    tp: int
+    cp: int
+    ep: int
+    etp: int
+    pp: int
+    vpp: int
+    expected_shards: tuple[str, ...]
+
+
+def current_optimizer_topology(world_size: int) -> OptimizerTopology:
+    from megatron.core import parallel_state as ps
+
+    return OptimizerTopology(
+        world_size=world_size,
+        tp=int(ps.get_tensor_model_parallel_world_size()),
+        cp=int(ps.get_context_parallel_world_size()),
+        ep=int(ps.get_expert_model_parallel_world_size()),
+        etp=int(ps.get_expert_tensor_parallel_world_size()),
+        pp=int(ps.get_pipeline_model_parallel_world_size()),
+        vpp=int(ps.get_virtual_pipeline_model_parallel_world_size() or 1),
+        expected_shards=tuple(
+            f"{rank + 1:02d}-of-{world_size:02d}.pt" for rank in range(world_size)
+        ),
+    )
+
+
+def write_optimizer_manifest(optimizer_state_path: str, *, world_size: int) -> None:
+    path = Path(optimizer_state_path)
+    path.mkdir(parents=True, exist_ok=True)
+    manifest = current_optimizer_topology(world_size)
+    missing = [name for name in manifest.expected_shards if not (path / name).is_file()]
+    if missing:
+        raise RuntimeError(
+            f"Cannot publish optimizer manifest with missing shards: {missing}"
+        )
+    temporary = path / f".{OPTIMIZER_MANIFEST}.{os.getpid()}.tmp"
+    temporary.write_text(
+        json.dumps(manifest.model_dump(mode="json"), sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    os.replace(temporary, path / OPTIMIZER_MANIFEST)
+
+
+def validate_optimizer_manifest(optimizer_state_path: str, *, world_size: int) -> bool:
+    path = Path(optimizer_state_path)
+    shard_paths = sorted(path.glob("*-of-*.pt")) if path.exists() else []
+    manifest_path = path / OPTIMIZER_MANIFEST
+    if not manifest_path.exists():
+        if shard_paths:
+            raise RuntimeError(
+                "Optimizer shards exist without a topology manifest; refusing to reset "
+                f"or load ambiguous state from {path}"
+            )
+        return False
+    try:
+        saved = OptimizerTopology.model_validate_json(manifest_path.read_text("utf-8"))
+    except Exception as exc:
+        raise RuntimeError(
+            f"Invalid optimizer topology manifest: {manifest_path}"
+        ) from exc
+    current = current_optimizer_topology(world_size)
+    if saved != current:
+        raise RuntimeError(
+            "Optimizer checkpoint topology mismatch; optimizer state is topology-strict: "
+            f"saved={saved.model_dump()} current={current.model_dump()}"
+        )
+    actual = tuple(sorted(shard.name for shard in shard_paths))
+    if actual != saved.expected_shards:
+        raise RuntimeError(
+            "Optimizer checkpoint shard coverage mismatch: "
+            f"expected={saved.expected_shards}, actual={actual}"
+        )
+    return True
 
 
 def write_optimizer_step_marker(optimizer_state_path: str, step: int) -> None:

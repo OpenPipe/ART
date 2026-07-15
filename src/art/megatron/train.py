@@ -51,7 +51,11 @@ from art.megatron.model_support.lora_disk import (
     load_adapter_config,
     load_lora_tensors_for_megatron,
 )
-from art.megatron.optimizer_state import write_optimizer_step_marker
+from art.megatron.optimizer_state import (
+    validate_optimizer_manifest,
+    write_optimizer_manifest,
+    write_optimizer_step_marker,
+)
 from art.megatron.provider import (
     ProviderBundle,
     finalize_provider_bundle,
@@ -119,6 +123,13 @@ from art.megatron.training.model_chunks import (
     ModelChunks,
     as_megatron_api_chunks,
     validate_model_chunks,
+)
+from art.megatron.training.pipeline_schedule import (
+    MCoreScheduleAdapter,
+    ScheduleMicrobatch,
+    chunk_post_process,
+    chunk_pre_process,
+    validate_pipeline_topology,
 )
 from art.megatron.training.sft_batches import load_sft_batch_from_disk
 from art.megatron.training.trace import (
@@ -201,6 +212,7 @@ class TrainStepResult(BaseModel):
     grad_norm: float
     num_zeros_in_grad: int | None
     loss_metrics: dict[str, float] = Field(default_factory=dict)
+    pipeline_metrics: dict[str, float] = Field(default_factory=dict)
 
 
 def print0(rank: int, *values: Any) -> None:
@@ -428,6 +440,16 @@ def build_training_runtime(
         )
     rank = torch.distributed.get_rank()  # ty: ignore[possibly-missing-attribute]
     world_size = torch.distributed.get_world_size()  # ty: ignore[possibly-missing-attribute]
+    validate_pipeline_topology(
+        world_size=world_size,
+        tp=int(ps.get_tensor_model_parallel_world_size()),
+        cp=int(ps.get_context_parallel_world_size()),
+        pp=int(ps.get_pipeline_model_parallel_world_size()),
+        ep=int(ps.get_expert_model_parallel_world_size()),
+        etp=int(ps.get_expert_tensor_parallel_world_size()),
+        vp=int(ps.get_virtual_pipeline_model_parallel_world_size() or 1),
+        num_layers=int(provider.num_layers),
+    )
 
     if rank == 0 and print_env:
         print("TORCHINDUCTOR_CACHE_DIR:", os.environ["TORCHINDUCTOR_CACHE_DIR"])
@@ -889,6 +911,7 @@ def run_megatron_sft_job(
                             "num_tokens": float(global_tokens),
                             "num_trainable_tokens": float(global_trainable_tokens),
                             "tokens_per_second": tokens_per_second,
+                            **step_result.pipeline_metrics,
                         }
                     )
                     print("Logging SFT", log_msg)
@@ -999,7 +1022,14 @@ def _load_lora_and_optimizer(
         optimizer_state_path,
         f"{runtime.rank + 1:02d}-of-{runtime.world_size:02d}.pt",
     )
-    if os.path.exists(optimizer_shard_path):
+    has_optimizer_state = validate_optimizer_manifest(
+        optimizer_state_path, world_size=runtime.world_size
+    )
+    if has_optimizer_state:
+        if not os.path.exists(optimizer_shard_path):
+            raise RuntimeError(
+                f"Optimizer manifest is missing local shard {optimizer_shard_path}"
+            )
         print0(runtime.rank, "Loading optimizer state from", optimizer_shard_path)
         runtime.optimizer.load_state_dict(torch.load(optimizer_shard_path))
     else:
@@ -1050,7 +1080,14 @@ def _prepare_rl_training_state(
         job.optimizer_state_path,
         f"{runtime.rank + 1:02d}-of-{runtime.world_size:02d}.pt",
     )
-    if os.path.exists(optimizer_shard_path):
+    has_optimizer_state = validate_optimizer_manifest(
+        job.optimizer_state_path, world_size=runtime.world_size
+    )
+    if has_optimizer_state:
+        if not os.path.exists(optimizer_shard_path):
+            raise RuntimeError(
+                f"Optimizer manifest is missing local shard {optimizer_shard_path}"
+            )
         print0(runtime.rank, "Loading optimizer state from", optimizer_shard_path)
         runtime.optimizer.load_state_dict(torch.load(optimizer_shard_path))
     else:
@@ -1129,6 +1166,9 @@ def _save_lora_and_optimizer(
         if torch.distributed.is_initialized():  # ty:ignore[possibly-missing-attribute]
             torch.distributed.barrier()  # ty:ignore[possibly-missing-attribute]
         if runtime.rank == 0:
+            write_optimizer_manifest(
+                optimizer_state_path, world_size=runtime.world_size
+            )
             write_optimizer_step_marker(optimizer_state_path, step)
 
 
@@ -1202,6 +1242,7 @@ def _rl_step_metrics(
     if step_result.kl_policy_ref is not None:
         metrics["loss/kl_policy_ref"] = step_result.kl_policy_ref
     metrics.update(step_result.loss_metrics)
+    metrics.update(step_result.pipeline_metrics)
     return metrics
 
 
@@ -1312,6 +1353,18 @@ def _reduce_loss(
         group=group,
     )
     return reduced_loss
+
+
+def _broadcast_from_pipeline_last(value: Any) -> Any:
+    if ps.get_pipeline_model_parallel_world_size() <= 1:
+        return value
+    objects = [value]
+    torch.distributed.broadcast_object_list(  # ty: ignore[possibly-missing-attribute]
+        objects,
+        src=ps.get_pipeline_model_parallel_last_rank(),
+        group=ps.get_pipeline_model_parallel_group(),
+    )
+    return objects[0]
 
 
 def _unwrap_model_config(model_chunks: ModelChunks) -> Any | None:
@@ -1470,27 +1523,46 @@ def _select_next_ref_logprobs(
 def _forward_prepared_rl_micro(
     *,
     model_chunks: ModelChunks,
+    model_chunk: MegatronModule | None = None,
     model_support_handler: Any,
     prepared_micro: PreparedRLMicroInputs,
     device: torch.device,
 ) -> TokenLossOutput:
+    model = model_chunks[0] if model_chunk is None else model_chunk
     model_forward_kwargs = dict(
-        input_ids=prepared_micro.model_tokens,
+        input_ids=prepared_micro.model_tokens if chunk_pre_process(model) else None,
         position_ids=prepared_micro.model_input_pos,
         attention_mask=_placeholder_attention_mask(device),
         packed_seq_params=prepared_micro.packed_seq_params,
         **model_support_handler.get_forward_kwargs(
-            model_chunks[0],
+            model,
             attention_bias=prepared_micro.attention_state,
         ),
     )
     with attach_trace_token_uids(model_chunks, prepared_micro.local_token_uids):
-        return forward_token_losses(
-            model_chunks[0],
-            labels=prepared_micro.model_labels,
-            selection=prepared_micro.lm_head_selection,
-            forward_kwargs=model_forward_kwargs,
-        )
+        if chunk_post_process(model):
+            return forward_token_losses(
+                model,
+                labels=prepared_micro.model_labels,
+                selection=prepared_micro.lm_head_selection,
+                forward_kwargs=model_forward_kwargs,
+            )
+        output = model(**model_forward_kwargs, labels=None)
+        if not isinstance(output, torch.Tensor):
+            raise TypeError(
+                f"pipeline model chunk must return a tensor, got {type(output).__name__}"
+            )
+        return TokenLossOutput(token_losses=output)
+
+
+def _install_schedule_finalize(model_chunks: ModelChunks) -> None:
+    seen: set[int] = set()
+    for chunk in model_chunks:
+        config = _unwrap_model_config([chunk])
+        if config is None or id(config) in seen:
+            continue
+        seen.add(id(config))
+        config.finalize_model_grads_func = finalize_model_grads_extended
 
 
 def _zero_logprob_graph_contribution(
@@ -1587,13 +1659,81 @@ def _calculate_megatron_logprobs(
         ):
             assert hybridep_token_count is not None
             _set_hybridep_token_count(hybridep_token_count)
-        token_loss_output = _forward_prepared_rl_micro(
-            model_chunks=model_chunks,
-            model_support_handler=model_support_handler,
-            prepared_micro=prepared_micro,
-            device=device,
+        if not ps.model_parallel_is_initialized():
+            # Unit/static callers do not have MCore process groups. Production
+            # reference forwards always take the common schedule path below.
+            token_output = forward_token_losses(
+                model_chunks[0],
+                labels=prepared_micro.model_labels,
+                selection=prepared_micro.lm_head_selection,
+                forward_kwargs=dict(
+                    input_ids=prepared_micro.model_tokens,
+                    position_ids=prepared_micro.model_input_pos,
+                    attention_mask=_placeholder_attention_mask(device),
+                    packed_seq_params=prepared_micro.packed_seq_params,
+                    **model_support_handler.get_forward_kwargs(
+                        model_chunks[0], attention_bias=prepared_micro.attention_state
+                    ),
+                ),
+                enabled=False,
+            )
+            forward_succeeded = True
+            return token_output.restore(-token_output.token_losses).detach().cpu()
+        vp_size = int(ps.get_virtual_pipeline_model_parallel_world_size() or 1)
+        schedule_micro_count = (
+            max(1, int(ps.get_pipeline_model_parallel_world_size()))
+            if vp_size > 1
+            else 1
         )
-        logprobs = token_loss_output.restore(-token_loss_output.token_losses)
+        schedule = MCoreScheduleAdapter(
+            model_chunks=model_chunks,
+            microbatches=[
+                ScheduleMicrobatch(order, sample_index, prepared_micro)
+                for order in range(schedule_micro_count)
+            ],
+            microbatch_shapes=[
+                (
+                    int(prepared_micro.model_tokens.shape[0]),
+                    int(prepared_micro.model_tokens.shape[1]),
+                )
+            ]
+            * schedule_micro_count,
+            routing_replay_enabled=moe_routing_replay_controller is not None,
+        )
+
+        def forward_step_func(data_iterator: Any, model: MegatronModule, *_args: Any):
+            item = next(data_iterator)
+            if moe_routing_replay_controller is not None:
+                moe_routing_replay_controller.begin_micro(sample_index, 0)
+            prepare_replay_local_input_token_uids(
+                moe_routing_replay_controller,
+                prepared_micro.local_token_uids,
+                prepared_micro.attention_state,
+            )
+            token_output = _forward_prepared_rl_micro(
+                model_chunks=model_chunks,
+                model_chunk=model,
+                model_support_handler=model_support_handler,
+                prepared_micro=item.payload,
+                device=device,
+            )
+
+            def collect(output_tensor: torch.Tensor, **_kwargs: Any) -> torch.Tensor:
+                return token_output.restore(-output_tensor).detach().cpu()
+
+            return token_output.token_losses, collect
+
+        forward_outputs = schedule.run(
+            forward_step_func,
+            forward_only=True,
+            collect_non_loss_data=True,
+        )
+        forward_outputs = cast(
+            list[torch.Tensor], _broadcast_from_pipeline_last(forward_outputs)
+        )
+        if not forward_outputs:
+            raise RuntimeError("reference-logprob pipeline forward returned no outputs")
+        logprobs = forward_outputs[0].to(device)
         if int(topology.cp) > 1:
             logprobs = _globalize_context_parallel_logprobs(
                 local_logprobs=logprobs,
@@ -1783,20 +1923,15 @@ def run_megatron_sft_step(
     )
 
     _zero_grad_buffers(model_chunks)
+    _install_schedule_finalize(model_chunks)
 
-    raw_loss_sum: torch.Tensor | None = None
-    loss_inputs_for_count: list[dict[str, torch.Tensor] | PreparedSFTMicroInputs] = []
     pending_prepared_micro: PreparedMegatronBatch | None = None
     hybridep_enabled = _validate_hybridep_token_counts(
         hybridep_token_counts, len(micro_inputs)
     )
 
+    prepared_micros: list[PreparedSFTMicroInputs] = []
     for micro_order, micro in enumerate(micro_inputs):
-        if moe_routing_replay_controller is not None:
-            moe_routing_replay_controller.begin_micro(
-                micro_sample_indices[micro_order],
-                micro_order,
-            )
         prepared_micro, pending_prepared_micro = _prepare_current_sft_micro(
             micro,
             device=device,
@@ -1806,32 +1941,7 @@ def run_megatron_sft_step(
             trace_token_uids=trace_token_uids,
             pending_prepared_micro=pending_prepared_micro,
         )
-        prepare_replay_local_input_token_uids(
-            moe_routing_replay_controller,
-            prepared_micro.local_token_uids,
-            prepared_micro.attention_state,
-        )
-        if hybridep_enabled:
-            assert hybridep_token_counts is not None
-            _set_hybridep_token_count(hybridep_token_counts[micro_order])
-        with attach_trace_token_uids(model_chunks, prepared_micro.local_token_uids):
-            token_loss_output = forward_token_losses(
-                model_chunks[0],
-                labels=prepared_micro.labels,
-                selection=prepared_micro.lm_head_selection,
-                forward_kwargs=dict(
-                    input_ids=prepared_micro.input_ids,
-                    position_ids=prepared_micro.position_ids,
-                    attention_mask=_placeholder_attention_mask(device),
-                    packed_seq_params=prepared_micro.packed_seq_params,
-                    **model_support_handler.get_forward_kwargs(
-                        model_chunks[0],
-                        attention_bias=prepared_micro.attention_state,
-                    ),
-                ),
-            )
-        masked_loss = token_loss_output.masked_sum(prepared_micro.loss_mask)
-        masked_loss.backward()
+        prepared_micros.append(prepared_micro)
         pending_prepared_micro = _prepare_next_sft_cp_micro(
             _next_micro_lookahead(micro_inputs, micro_order),
             device=device,
@@ -1840,23 +1950,71 @@ def run_megatron_sft_step(
             model_support_handler=model_support_handler,
             trace_token_uids=trace_token_uids,
         )
-        detached_micro_loss = masked_loss.detach()
-        if raw_loss_sum is None:
-            raw_loss_sum = detached_micro_loss
-        else:
-            raw_loss_sum = raw_loss_sum + detached_micro_loss
-        loss_inputs_for_count.append(prepared_micro)
-
-    if raw_loss_sum is None:
-        raise RuntimeError("run_megatron_sft_step did not produce outputs")
-
-    num_tokens = _local_trainable_sft_token_count_tensor(
-        loss_inputs_for_count,
-        device=device,
+    schedule = MCoreScheduleAdapter(
+        model_chunks=model_chunks,
+        microbatches=[
+            ScheduleMicrobatch(order, micro_sample_indices[order], prepared)
+            for order, prepared in enumerate(prepared_micros)
+        ],
+        microbatch_shapes=[
+            (int(prepared.input_ids.shape[0]), int(prepared.input_ids.shape[1]))
+            for prepared in prepared_micros
+        ],
+        routing_replay_enabled=moe_routing_replay_controller is not None,
     )
-    flush_param_grads_to_main_grads(model_chunks)
-    finalize_model_grads_extended(
-        as_megatron_api_chunks(model_chunks), num_tokens=num_tokens
+
+    def forward_step_func(data_iterator: Any, model: MegatronModule, *_args: Any):
+        item = next(data_iterator)
+        prepared = item.payload
+        if moe_routing_replay_controller is not None:
+            moe_routing_replay_controller.begin_micro(item.sample_index, item.order)
+        prepare_replay_local_input_token_uids(
+            moe_routing_replay_controller,
+            prepared.local_token_uids,
+            prepared.attention_state,
+        )
+        if hybridep_enabled:
+            assert hybridep_token_counts is not None
+            _set_hybridep_token_count(hybridep_token_counts[item.order])
+        kwargs = dict(
+            input_ids=prepared.input_ids if chunk_pre_process(model) else None,
+            position_ids=prepared.position_ids,
+            attention_mask=_placeholder_attention_mask(device),
+            packed_seq_params=prepared.packed_seq_params,
+            **model_support_handler.get_forward_kwargs(
+                model, attention_bias=prepared.attention_state
+            ),
+        )
+        with attach_trace_token_uids(model_chunks, prepared.local_token_uids):
+            if chunk_post_process(model):
+                token_output = forward_token_losses(
+                    model,
+                    labels=prepared.labels,
+                    selection=prepared.lm_head_selection,
+                    forward_kwargs=kwargs,
+                )
+                output = token_output.token_losses
+            else:
+                output = model(**kwargs, labels=None)
+                token_output = None
+
+        def reduce_loss(output_tensor: torch.Tensor):
+            assert token_output is not None
+            masked_loss = token_output.masked_sum(prepared.loss_mask)
+            num_tokens = _local_trainable_sft_token_count_tensor(
+                [prepared], device=device
+            )
+            return masked_loss, num_tokens, {"raw_loss_sum": masked_loss.detach()}
+
+        return output, reduce_loss
+
+    forward_data_store = schedule.run(forward_step_func, forward_only=False)
+    forward_data_store = cast(
+        list[dict[str, Any]], _broadcast_from_pipeline_last(forward_data_store)
+    )
+    raw_loss_sum = sum(
+        (cast(torch.Tensor, data["raw_loss_sum"]) for data in forward_data_store),
+        torch.zeros([], device=device, dtype=torch.float32),
     )
     update_successful, grad_norm, num_zeros_in_grad = _optimizer_step(
         optimizer,
@@ -1864,6 +2022,7 @@ def run_megatron_sft_step(
         model_support_handler=model_support_handler,
         model_chunks=model_chunks,
     )
+    num_tokens = _local_trainable_sft_token_count_tensor(prepared_micros, device=device)
     global_num_tokens = max(num_tokens.item(), 1.0)
     reduced_loss = _reduce_loss(
         raw_loss_sum / global_num_tokens,
@@ -1881,6 +2040,7 @@ def run_megatron_sft_step(
         update_successful=update_successful,
         grad_norm=grad_norm,
         num_zeros_in_grad=num_zeros_in_grad,
+        pipeline_metrics=schedule.telemetry.metrics(),
     )
 
 
@@ -1942,28 +2102,14 @@ def run_training_step(
         cp_lookahead_state.pending_prepared_micro = None
 
     _zero_grad_buffers(model_chunks)
+    _install_schedule_finalize(model_chunks)
 
     micro_count = len(micro_inputs)
     hybridep_enabled = _validate_hybridep_token_counts(
         hybridep_token_counts, micro_count
     )
-    raw_loss_sum: torch.Tensor | None = None
-    loss_inputs_for_count: list[LossInputs | DispatchedPackedTensors] = []
-    probs_corr_total: torch.Tensor | None = None
-    kl_policy_ref_sum = 0.0
-    kl_policy_ref_count = 0
-    loss_diagnostics = LossOffPolicyDiagnosticsAccumulator()
-    new_logprobs_gpu: list[torch.Tensor] = []
-
-    def begin_micro(micro_order: int) -> None:
-        if moe_routing_replay_controller is not None:
-            moe_routing_replay_controller.begin_micro(
-                micro_sample_indices[micro_order],
-                micro_order,
-            )
-
+    prepared_micros: list[PreparedRLMicroInputs] = []
     for micro_order in range(micro_count):
-        begin_micro(micro_order)
         micro_ref_logprobs = _select_ref_logprobs(ref_logprobs, micro_order)
         if micro_ref_logprobs is not None and int(topology.cp) <= 1:
             micro_ref_logprobs = micro_ref_logprobs.to(device)
@@ -1977,61 +2123,7 @@ def run_training_step(
             trace_token_uids=trace_token_uids,
             pending_prepared_micro=pending_prepared_micro,
         )
-        prepare_replay_local_input_token_uids(
-            moe_routing_replay_controller,
-            prepared_micro.local_token_uids,
-            prepared_micro.attention_state,
-        )
-        if hybridep_enabled:
-            assert hybridep_token_counts is not None
-            _set_hybridep_token_count(hybridep_token_counts[micro_order])
-
-        token_loss_output = _forward_prepared_rl_micro(
-            model_chunks=model_chunks,
-            model_support_handler=model_support_handler,
-            prepared_micro=prepared_micro,
-            device=device,
-        )
-        new_logprobs = -token_loss_output.token_losses
-        compact_loss_inputs = token_loss_output.compact_loss_inputs(
-            prepared_micro.loss_inputs
-        )
-
-        loss_info = loss_fn(
-            compact_loss_inputs,
-            new_logprobs=new_logprobs,
-            ref_logprobs=token_loss_output.select_optional(prepared_micro.ref_logprobs),
-            entropies=None,
-            experimental_config=experimental_config,
-            reduction="sum",
-        )
-        micro_loss = loss_info.policy_loss + _zero_logprob_graph_contribution(
-            new_logprobs,
-            compact_loss_inputs,
-        )
-        if not micro_loss.requires_grad:
-            assistant_tokens = _count_trainable_tokens(prepared_micro.loss_inputs)
-            nonzero_weights = int(
-                torch.count_nonzero(
-                    prepared_micro.loss_inputs.align_inputs().weights
-                ).item()
-            )
-            nonzero_advantages = int(
-                torch.count_nonzero(
-                    prepared_micro.loss_inputs.align_inputs().advantages
-                ).item()
-            )
-            raise RuntimeError(
-                "RL micro_loss is detached before backward: "
-                f"new_logprobs.requires_grad={new_logprobs.requires_grad}, "
-                f"policy_loss_sum_requires_grad={loss_info.policy_loss_sum.requires_grad}, "
-                f"assistant_tokens={assistant_tokens}, "
-                f"nonzero_weights={nonzero_weights}, "
-                f"nonzero_advantages={nonzero_advantages}"
-            )
-        micro_loss.backward()
-        loss_inputs_for_count.append(prepared_micro.loss_inputs)
-        del prepared_micro
+        prepared_micros.append(prepared_micro)
         pending_prepared_micro = _prepare_next_rl_cp_micro(
             _next_micro_lookahead(
                 micro_inputs,
@@ -2050,40 +2142,126 @@ def run_training_step(
                 next_step_first_ref_logprobs=next_step_first_ref_logprobs,
             ),
         )
-        detached_probs_corr = loss_info.probs_corr.detach()
-        if probs_corr_total is None:
-            probs_corr_total = detached_probs_corr
-        else:
-            probs_corr_total = probs_corr_total + detached_probs_corr
-        if loss_info.kl_policy_ref is not None:
-            kl_policy_ref_sum += float(loss_info.kl_policy_ref.item())
-            kl_policy_ref_count += 1
-        loss_diagnostics.add(loss_info.offpolicy_diagnostics)
-        detached_micro_loss = micro_loss.detach()
-        if raw_loss_sum is None:
-            raw_loss_sum = detached_micro_loss
-        else:
-            raw_loss_sum = raw_loss_sum + detached_micro_loss
-        del loss_info
-        del micro_loss
-        new_logprobs_gpu.append(token_loss_output.restore(new_logprobs.detach()))
-        del token_loss_output
-        del new_logprobs
-
-    if raw_loss_sum is None:
-        raise RuntimeError("run_training_step did not produce outputs")
-    if probs_corr_total is None:
-        raise RuntimeError("run_training_step did not accumulate probs_corr")
     if cp_lookahead_state is not None:
         cp_lookahead_state.pending_prepared_micro = pending_prepared_micro
 
-    token_count = _local_trainable_token_count_tensor(
-        loss_inputs_for_count,
-        device=device,
+    schedule = MCoreScheduleAdapter(
+        model_chunks=model_chunks,
+        microbatches=[
+            ScheduleMicrobatch(order, micro_sample_indices[order], prepared)
+            for order, prepared in enumerate(prepared_micros)
+        ],
+        microbatch_shapes=[
+            (
+                int(prepared.model_tokens.shape[0]),
+                int(prepared.model_tokens.shape[1]),
+            )
+            for prepared in prepared_micros
+        ],
+        routing_replay_enabled=moe_routing_replay_controller is not None,
     )
-    finalize_model_grads_extended(
-        as_megatron_api_chunks(model_chunks),
-        num_tokens=token_count,
+
+    def forward_step_func(data_iterator: Any, model: MegatronModule, *_args: Any):
+        item = next(data_iterator)
+        prepared = item.payload
+        if moe_routing_replay_controller is not None:
+            moe_routing_replay_controller.begin_micro(item.sample_index, item.order)
+        prepare_replay_local_input_token_uids(
+            moe_routing_replay_controller,
+            prepared.local_token_uids,
+            prepared.attention_state,
+        )
+        if hybridep_enabled:
+            assert hybridep_token_counts is not None
+            _set_hybridep_token_count(hybridep_token_counts[item.order])
+        token_output = _forward_prepared_rl_micro(
+            model_chunks=model_chunks,
+            model_chunk=model,
+            model_support_handler=model_support_handler,
+            prepared_micro=prepared,
+            device=device,
+        )
+
+        def reduce_loss(output_tensor: torch.Tensor):
+            new_logprobs = -output_tensor
+            compact_loss_inputs = token_output.compact_loss_inputs(prepared.loss_inputs)
+            loss_info = loss_fn(
+                compact_loss_inputs,
+                new_logprobs=new_logprobs,
+                ref_logprobs=token_output.select_optional(prepared.ref_logprobs),
+                entropies=None,
+                experimental_config=experimental_config,
+                reduction="sum",
+            )
+            micro_loss = loss_info.policy_loss + _zero_logprob_graph_contribution(
+                new_logprobs, compact_loss_inputs
+            )
+            if not micro_loss.requires_grad:
+                raise RuntimeError(
+                    "RL micro_loss is detached before pipeline backward: "
+                    f"micro={item.order}, sample={item.sample_index}"
+                )
+            num_tokens = _local_trainable_token_count_tensor(
+                [prepared.loss_inputs], device=device
+            )
+            return (
+                micro_loss,
+                num_tokens,
+                {
+                    "order": item.order,
+                    "raw_loss_sum": micro_loss.detach(),
+                    "probs_corr": loss_info.probs_corr.detach(),
+                    "kl_policy_ref": (
+                        None
+                        if loss_info.kl_policy_ref is None
+                        else float(loss_info.kl_policy_ref.item())
+                    ),
+                    "offpolicy_diagnostics": loss_info.offpolicy_diagnostics,
+                    "new_logprobs": token_output.restore(new_logprobs.detach()).to(
+                        "cpu"
+                    ),
+                },
+            )
+
+        return token_output.token_losses, reduce_loss
+
+    forward_data_store = schedule.run(forward_step_func, forward_only=False)
+    pipeline_results = cast(
+        list[dict[str, Any]],
+        _broadcast_from_pipeline_last(forward_data_store),
+    )
+    if len(pipeline_results) != micro_count:
+        raise RuntimeError(
+            "MCore schedule did not return one final-stage result per microbatch: "
+            f"expected={micro_count}, got={len(pipeline_results)}"
+        )
+    pipeline_results.sort(key=lambda data: int(data["order"]))
+    raw_loss_sum = sum(
+        (
+            cast(torch.Tensor, data["raw_loss_sum"]).to(device)
+            for data in pipeline_results
+        ),
+        torch.zeros([], device=device, dtype=torch.float32),
+    )
+    probs_corr_total = sum(
+        (
+            cast(torch.Tensor, data["probs_corr"]).to(device)
+            for data in pipeline_results
+        ),
+        torch.zeros([], device=device, dtype=torch.float32),
+    )
+    kl_values = [
+        float(value)
+        for data in pipeline_results
+        if (value := data["kl_policy_ref"]) is not None
+    ]
+    loss_diagnostics = LossOffPolicyDiagnosticsAccumulator()
+    for data in pipeline_results:
+        loss_diagnostics.add(data["offpolicy_diagnostics"])
+
+    token_count = _local_trainable_token_count_tensor(
+        [prepared.loss_inputs for prepared in prepared_micros],
+        device=device,
     )
     update_successful, grad_norm, num_zeros_in_grad = _optimizer_step(
         optimizer,
@@ -2104,11 +2282,9 @@ def run_training_step(
     return TrainStepResult(
         reduced_loss=reduced_loss,
         probs_corr=float((probs_corr_total / micro_count).item()),
-        kl_policy_ref=(
-            kl_policy_ref_sum / kl_policy_ref_count if kl_policy_ref_count > 0 else None
-        ),
+        kl_policy_ref=(sum(kl_values) / len(kl_values) if kl_values else None),
         new_logprobs=[
-            tensor.to(device="cpu", non_blocking=True) for tensor in new_logprobs_gpu
+            cast(torch.Tensor, data["new_logprobs"]) for data in pipeline_results
         ],
         update_successful=update_successful,
         grad_norm=grad_norm,
@@ -2116,6 +2292,7 @@ def run_training_step(
         loss_metrics=loss_diagnostics.to_metrics(
             group=ps.get_data_parallel_group(with_context_parallel=True),
         ),
+        pipeline_metrics=schedule.telemetry.metrics(),
     )
 
 
