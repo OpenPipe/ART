@@ -1,6 +1,6 @@
 from typing import Annotated, Any, Literal, TypeAlias
 
-from pydantic import BaseModel, Field, TypeAdapter
+from pydantic import BaseModel, ConfigDict, Field, TypeAdapter
 
 from ... import types
 from ...preprocessing.pack import DiskPackedTensors
@@ -12,6 +12,8 @@ LORA_READY_EVENT = "lora_ready"
 
 
 class MergedWeightTransferInitInfo(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
     master_address: str
     master_port: int
     rank_offset: int
@@ -19,6 +21,8 @@ class MergedWeightTransferInitInfo(BaseModel):
 
 
 class MergedWeightTransferSpec(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
     init_info: MergedWeightTransferInitInfo
     vllm_base_url: str
     served_model_name: str

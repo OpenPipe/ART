@@ -305,8 +305,10 @@ allowed-unresolved-imports = [
     "einops.**",
     "fla.**",
     "megatron.**",
+    "monarch.**",
     "quack.**",
     "safetensors.**",
+    "scipy.**",
     "transformer_engine.**",
     "triton.**",
 ]

@@ -19,6 +19,7 @@ import math
 import os
 import random
 import shutil
+from threading import Event
 import time
 from typing import Any, Callable, Literal, cast
 
@@ -59,6 +60,7 @@ from art.megatron.provider import (
 from art.megatron.routing_replay import (
     MoeRoutingReplayBundle,
     MoeRoutingReplayController,
+    build_moe_routing_replay_bundle_from_packed_tensors,
 )
 from art.megatron.runtime.jobs import (
     DEFAULT_JOBS_DIR,
@@ -73,6 +75,7 @@ from art.megatron.runtime.jobs import (
     MergedWeightTransferSpec,
     load_megatron_job,
 )
+from art.megatron.runtime.specs import TrainJobSpec
 from art.megatron.selective_lm_head import (
     TokenLossOutput,
     forward_token_losses,
@@ -520,7 +523,43 @@ def run_megatron_rl_job(
     runtime: TrainingRuntime,
     job: MegatronTrainingJob | MegatronMergedTrainingJob,
 ) -> None:
-    packed_tensors = None
+    """Compatibility adapter for the legacy file-backed local service."""
+    packed_tensors = packed_tensors_from_dir(**job.disk_packed_tensors)
+    replay_bundle = (
+        MoeRoutingReplayBundle.from_dir(job.moe_routing_replay_path)
+        if job.moe_routing_replay_path is not None
+        else None
+    )
+
+    def progress(step_index: int, num_steps: int, metrics: dict[str, float]) -> None:
+        del step_index, num_steps
+        _write_job_metrics(job.log_path, metrics)
+
+    execute_megatron_rl_job(
+        runtime,
+        job,
+        packed_tensors,
+        progress_sink=progress,
+        adapter_ready_sink=(
+            None
+            if isinstance(job, MegatronMergedTrainingJob)
+            else lambda: _write_job_event(job.log_path, LORA_READY_EVENT, step=job.step)
+        ),
+        replay_bundle=replay_bundle,
+    )
+
+
+def execute_megatron_rl_job(
+    runtime: TrainingRuntime,
+    job: MegatronTrainingJob | MegatronMergedTrainingJob | TrainJobSpec,
+    packed_tensors: PackedTensors,
+    *,
+    progress_sink: Callable[[int, int, dict[str, float]], None],
+    adapter_ready_sink: Callable[[], None] | None,
+    cancelled: Event | None = None,
+    replay_bundle: MoeRoutingReplayBundle | None = None,
+) -> dict[str, float]:
+    """Execute one current RL update from an in-memory packed batch."""
     adapter_dtypes = None
     template = None
     zero_template = None
@@ -530,32 +569,35 @@ def run_megatron_rl_job(
     next_step_first_ref_logprobs = None
     step_result = None
     job_succeeded = False
+    final_metrics: dict[str, float] = {}
 
     try:
-        configure_moe_routing_replay(
-            runtime,
-            replay_bundle_path=job.moe_routing_replay_path,
-            strict=job.moe_routing_replay_strict,
-        )
-        adapter_dtypes = _prepare_rl_training_state(runtime, job)
-
-        print0(
-            runtime.rank,
-            "Loading packed tensors from",
-            job.disk_packed_tensors["dir"],
-        )
-        packed_tensors = packed_tensors_from_dir(**job.disk_packed_tensors)
-        template = _clone_packed_tensors(select_indexed_inputs(packed_tensors, 0))
-        zero_template = _zero_contribution_inputs(template)
-        num_sequences = job.disk_packed_tensors["num_sequences"]
         global_grad_accumulation_sequences = resolve_global_grad_accumulation_sequences(
             job.config.grad_accumulation_sequences
         )
+        if (
+            replay_bundle is None
+            and packed_tensors.get("moe_routing_replay") is not None
+        ):
+            replay_bundle = build_moe_routing_replay_bundle_from_packed_tensors(
+                packed_tensors=packed_tensors,
+                global_grad_accumulation_sequences=global_grad_accumulation_sequences,
+            )
+        configure_moe_routing_replay(
+            runtime,
+            replay_bundle=replay_bundle,
+            strict=_moe_replay_strict(job),
+        )
+        adapter_dtypes = _prepare_rl_training_state(runtime, job)
+
+        template = _clone_packed_tensors(select_indexed_inputs(packed_tensors, 0))
+        zero_template = _zero_contribution_inputs(template)
+        num_sequences, packed_sequence_length = map(int, packed_tensors["tokens"].shape)
         num_steps = math.ceil(num_sequences / global_grad_accumulation_sequences)
         topology = _infer_parallel_topology(runtime.model)
         _ensure_hybridep_capacity(
             runtime,
-            packed_sequence_length=job.disk_packed_tensors["sequence_length"],
+            packed_sequence_length=packed_sequence_length,
             context_parallel_size=topology.cp,
         )
         ref_logprobs_by_index = _prepare_kl_reference_logprobs(
@@ -568,6 +610,10 @@ def run_megatron_rl_job(
         )
         cp_lookahead_state = CpBatchLookaheadState() if int(topology.cp) > 1 else None
         for step_index in range(num_steps):
+            if cancelled is not None and cancelled.is_set():
+                from art.megatron.runtime.trainer_run import TrainingCancelledError
+
+                raise TrainingCancelledError("train job was cancelled")
             hybridep_token_counts = (
                 build_rl_hybridep_token_counts(
                     packed_tensors=packed_tensors,
@@ -633,7 +679,7 @@ def run_megatron_rl_job(
                 learning_rate=job.config.learning_rate,
                 inputs=micro_inputs,
                 config=job.config,
-                experimental_config=cast(dev.TrainConfig, job.experimental_config),
+                experimental_config=_experimental_train_config(job),
                 ref_logprobs=ref_logprobs,
                 step_index=step_index,
                 sample_index=micro_indices,
@@ -651,14 +697,19 @@ def run_megatron_rl_job(
                 step_result.probs_corr,
             )
             _validate_train_step_result_finite(runtime, step_result)
-            _log_rl_step_result(
-                runtime.rank,
-                job.log_path,
+            final_metrics = _rl_step_metrics(
                 step_result,
                 num_gradient_steps=num_steps,
                 packed_train_tokens=global_packed_train_tokens,
                 train_step_s=train_step_s,
             )
+            if runtime.rank == 0:
+                progress_sink(step_index, num_steps, final_metrics)
+
+        if cancelled is not None and cancelled.is_set():
+            from art.megatron.runtime.trainer_run import TrainingCancelledError
+
+            raise TrainingCancelledError("train job was cancelled")
 
         _save_lora_and_optimizer(
             runtime,
@@ -668,21 +719,27 @@ def run_megatron_rl_job(
             step=job.step,
             optimizer_save_interval=job.config.optimizer_save_interval,
             final_training_step=job.config.final_training_step,
-            lora_ready_log_path=(
-                None if isinstance(job, MegatronMergedTrainingJob) else job.log_path
-            ),
+            adapter_ready=adapter_ready_sink,
         )
+        if isinstance(job, TrainJobSpec) and job.merged_weight_transfer is not None:
+            _sync_merged_weights_to_vllm(
+                runtime,
+                job.merged_weight_transfer,
+                lora_path=job.lora_path,
+                pause_generation=True,
+            )
+        if torch.distributed.is_initialized():  # ty:ignore[possibly-missing-attribute]
+            torch.distributed.barrier()  # ty:ignore[possibly-missing-attribute]
         runtime.resident_training_session_id = job.training_session_id
         runtime.resident_policy_step = job.step
         runtime.optimizer_state_loaded = True
         job_succeeded = True
+        return final_metrics
     finally:
         if not job_succeeded:
             runtime.resident_training_session_id = None
             runtime.resident_policy_step = None
             runtime.optimizer_state_loaded = False
-        if packed_tensors is not None:
-            del packed_tensors
         if adapter_dtypes is not None:
             del adapter_dtypes
         if template is not None:
@@ -896,6 +953,25 @@ def _job_cleanup_path(job: MegatronJob) -> str | None:
     return job.disk_packed_tensors["dir"]
 
 
+def _experimental_train_config(
+    job: MegatronTrainingJob | MegatronMergedTrainingJob | TrainJobSpec,
+) -> dev.TrainConfig:
+    if isinstance(job, TrainJobSpec):
+        return cast(
+            dev.TrainConfig,
+            job.experimental_config.model_dump(exclude_none=True),
+        )
+    return cast(dev.TrainConfig, job.experimental_config)
+
+
+def _moe_replay_strict(
+    job: MegatronTrainingJob | MegatronMergedTrainingJob | TrainJobSpec,
+) -> bool:
+    if isinstance(job, TrainJobSpec):
+        return job.experimental_config.moe_routing_replay_strict
+    return job.moe_routing_replay_strict
+
+
 def _load_lora_and_optimizer(
     runtime: TrainingRuntime,
     *,
@@ -939,7 +1015,7 @@ def _load_lora_and_optimizer(
 
 def _prepare_rl_training_state(
     runtime: TrainingRuntime,
-    job: MegatronTrainingJob | MegatronMergedTrainingJob,
+    job: MegatronTrainingJob | MegatronMergedTrainingJob | TrainJobSpec,
 ) -> dict[str, torch.dtype]:
     state_is_resident = (
         runtime.optimizer_persistent
@@ -1024,6 +1100,7 @@ def _save_lora_and_optimizer(
     optimizer_save_interval: int,
     final_training_step: int | None = None,
     lora_ready_log_path: str | None = None,
+    adapter_ready: Callable[[], None] | None = None,
 ) -> None:
     assert runtime.optimizer is not None
     save_vllm_lora_from_model(
@@ -1035,8 +1112,12 @@ def _save_lora_and_optimizer(
         rank=runtime.rank,
         world_size=runtime.world_size,
     )
+    if torch.distributed.is_initialized():  # ty:ignore[possibly-missing-attribute]
+        torch.distributed.barrier()  # ty:ignore[possibly-missing-attribute]
     if lora_ready_log_path is not None and runtime.rank == 0:
         _write_job_event(lora_ready_log_path, LORA_READY_EVENT, step=step)
+    if adapter_ready is not None and runtime.rank == 0:
+        adapter_ready()
     if _should_save_optimizer(
         runtime,
         step=step,
@@ -1101,31 +1182,31 @@ def _write_job_event(log_path: str, event: str, **payload: int | float | str) ->
         log_file.flush()
 
 
-def _log_rl_step_result(
-    rank: int,
-    log_path: str,
+def _rl_step_metrics(
     step_result: TrainStepResult,
     *,
     num_gradient_steps: int,
     packed_train_tokens: int,
     train_step_s: float,
-) -> None:
-    if rank != 0:
-        return
+) -> dict[str, float]:
+    train_packed_tok_per_s = (
+        float(packed_train_tokens) / train_step_s if train_step_s > 0 else 0.0
+    )
+    metrics = {
+        "loss/train": step_result.reduced_loss.item(),
+        "loss/grad_norm": step_result.grad_norm,
+        "loss/probs_corr": step_result.probs_corr,
+        TRAIN_GRADIENT_STEPS_KEY: float(num_gradient_steps),
+        "throughput/train_packed_tok_per_s": train_packed_tok_per_s,
+    }
+    if step_result.kl_policy_ref is not None:
+        metrics["loss/kl_policy_ref"] = step_result.kl_policy_ref
+    metrics.update(step_result.loss_metrics)
+    return metrics
+
+
+def _write_job_metrics(log_path: str, metrics: dict[str, float]) -> None:
     with open(log_path, "a+", encoding="utf-8") as log_file:
-        train_packed_tok_per_s = (
-            float(packed_train_tokens) / train_step_s if train_step_s > 0 else 0.0
-        )
-        metrics = {
-            "loss/train": step_result.reduced_loss.item(),
-            "loss/grad_norm": step_result.grad_norm,
-            "loss/probs_corr": step_result.probs_corr,
-            TRAIN_GRADIENT_STEPS_KEY: num_gradient_steps,
-            "throughput/train_packed_tok_per_s": train_packed_tok_per_s,
-        }
-        if step_result.kl_policy_ref is not None:
-            metrics["loss/kl_policy_ref"] = step_result.kl_policy_ref
-        metrics.update(step_result.loss_metrics)
         log_msg = json.dumps(metrics)
         print("Logging", log_msg)
         log_file.write(log_msg + "\n")
@@ -1599,7 +1680,7 @@ def _reference_sample_step_indices(
 def _prepare_kl_reference_logprobs(
     *,
     runtime: TrainingRuntime,
-    job: MegatronTrainingJob | MegatronMergedTrainingJob,
+    job: MegatronTrainingJob | MegatronMergedTrainingJob | TrainJobSpec,
     packed_tensors: PackedTensors,
     num_sequences: int,
     num_steps: int,
@@ -1608,9 +1689,7 @@ def _prepare_kl_reference_logprobs(
     if job.config.kl_penalty_coef <= 0.0:
         return None
 
-    ref_adapter_path = cast(dev.TrainConfig, job.experimental_config).get(
-        "kl_ref_adapter_path"
-    )
+    ref_adapter_path = _experimental_train_config(job).get("kl_ref_adapter_path")
     if ref_adapter_path is None:
         raise RuntimeError(
             "KL penalty is enabled but no kl_ref_adapter_path was provided. "
