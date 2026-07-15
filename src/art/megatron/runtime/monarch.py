@@ -228,6 +228,11 @@ class MonarchTrainerRun:
         self._learner_version = run_spec.initial_learner_version
         self._jobs: dict[str, tuple[str, tuple[TrainEvent, ...]]] = {}
         self._lock = asyncio.Lock()
+        self._active_job_id: str | None = None
+        self._active_collective: asyncio.Future[Any] | None = None
+        self._active_receive: asyncio.Future[Any] | None = None
+        self._stop_task: asyncio.Task[None] | None = None
+        self._close_task: asyncio.Task[None] | None = None
         self._closed = False
         self._valid = True
 
@@ -287,6 +292,10 @@ class MonarchTrainerRun:
                 )
             )
             receive = asyncio.ensure_future(receiver.recv())
+            self._active_job_id = job.job_id
+            self._active_collective = collective
+            self._active_receive = receive
+            terminal_delivered = False
             try:
                 while True:
                     waiters = {receive}
@@ -329,7 +338,7 @@ class MonarchTrainerRun:
                                 "trainer ranks did not agree on job completion"
                             )
                         self._learner_version = job.learner_version
-                        yield emit(
+                        completed = emit(
                             TrainCompleted(
                                 job_id=job.job_id,
                                 run_id=job.run_id,
@@ -338,31 +347,50 @@ class MonarchTrainerRun:
                                 metrics=payload["metrics"],
                             )
                         )
+                        self._clear_active(job.job_id)
+                        terminal_delivered = True
+                        yield completed
                         break
                     yield emit(TRAIN_EVENT_ADAPTER.validate_python(event))
                     receive = asyncio.ensure_future(receiver.recv())
+                    self._active_receive = receive
             except BaseException as exc:
-                self._valid = False
-                if not collective.done():
-                    collective.cancel()
-                if not receive.done():
-                    receive.cancel()
-                self._closed = True
-                await self._proc_mesh.stop()
-                if isinstance(exc, (asyncio.CancelledError, GeneratorExit)):
-                    events.append(
-                        TrainCancelled(
-                            job_id=job.job_id,
-                            run_id=job.run_id,
-                            sequence=len(events),
-                            reason="train stream was cancelled",
-                        )
-                    )
+                if terminal_delivered:
                     raise
+                closed_by_caller = self._closed
+                self._valid = False
+                self._closed = True
+                self._cancel_active()
+                try:
+                    await self._force_stop()
+                except BaseException as cleanup_exc:
+                    exc.add_note(
+                        "trainer ProcMesh cleanup failed: "
+                        f"{type(cleanup_exc).__name__}: {cleanup_exc}"
+                    )
+                caller_cancelled = isinstance(exc, GeneratorExit) or (
+                    isinstance(exc, asyncio.CancelledError)
+                    and _current_task_is_cancelling()
+                )
+                if caller_cancelled or (
+                    isinstance(exc, asyncio.CancelledError) and closed_by_caller
+                ):
+                    cancelled = TrainCancelled(
+                        job_id=job.job_id,
+                        run_id=job.run_id,
+                        sequence=len(events),
+                        reason="train stream was cancelled",
+                    )
+                    events.append(cancelled)
+                    if caller_cancelled:
+                        raise
+                    yield cancelled
+                    return
                 failure = self._failed(job, len(events), exc, True)
                 events.append(failure)
                 yield failure
             finally:
+                self._clear_active(job.job_id)
                 self._jobs[job.job_id] = (job.fingerprint, tuple(events))
 
     def _validate(
@@ -414,14 +442,65 @@ class MonarchTrainerRun:
         )
 
     async def close(self) -> None:
-        if self._closed:
+        if self._close_task is not None:
+            await asyncio.shield(self._close_task)
             return
+        graceful = self._valid and self._active_job_id is None
         self._closed = True
-        async with self._lock:
+        self._valid = False
+        self._cancel_active()
+        self._close_task = asyncio.create_task(self._close(graceful))
+        self._close_task.add_done_callback(_consume_future)
+        await asyncio.shield(self._close_task)
+
+    async def _close(self, graceful: bool) -> None:
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + self.run_spec.shutdown_timeout_s
+        primary: BaseException | None = None
+        if graceful:
             try:
-                await _remote_teardown(self._actors.close.call())
-            finally:
-                await _remote_teardown(self._proc_mesh.stop())
+                await asyncio.wait_for(
+                    _remote_teardown(self._actors.close.call()),
+                    self.run_spec.shutdown_timeout_s / 2,
+                )
+            except BaseException as exc:
+                primary = exc
+        try:
+            await self._force_stop(max(0.0, deadline - loop.time()))
+        except BaseException as exc:
+            if primary is None:
+                primary = exc
+            else:
+                primary.add_note(
+                    f"trainer ProcMesh cleanup failed: {type(exc).__name__}: {exc}"
+                )
+        if primary is not None:
+            raise primary
+
+    async def _force_stop(self, timeout_s: float | None = None) -> None:
+        if self._stop_task is None:
+            self._stop_task = asyncio.create_task(
+                _remote_teardown(self._proc_mesh.stop())
+            )
+            self._stop_task.add_done_callback(_consume_future)
+        await asyncio.wait_for(
+            asyncio.shield(self._stop_task),
+            self.run_spec.shutdown_timeout_s if timeout_s is None else timeout_s,
+        )
+
+    def _cancel_active(self) -> None:
+        # Monarch 0.2 only cancels these local waiters; ProcMesh.stop invalidates ranks.
+        for future in (self._active_receive, self._active_collective):
+            if future is not None and not future.done():
+                future.cancel()
+            if future is not None:
+                future.add_done_callback(_consume_future)
+
+    def _clear_active(self, job_id: str) -> None:
+        if self._active_job_id == job_id:
+            self._active_job_id = None
+            self._active_collective = None
+            self._active_receive = None
 
 
 async def _remote_teardown(operation: Awaitable[Any]) -> None:
@@ -431,3 +510,15 @@ async def _remote_teardown(operation: Awaitable[Any]) -> None:
         task = asyncio.current_task()
         if task is not None and task.cancelling():
             raise
+
+
+def _current_task_is_cancelling() -> bool:
+    task = asyncio.current_task()
+    return task is not None and bool(task.cancelling())
+
+
+def _consume_future(future: asyncio.Future[Any]) -> None:
+    try:
+        future.exception()
+    except asyncio.CancelledError:
+        pass
