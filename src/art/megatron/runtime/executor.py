@@ -1,11 +1,14 @@
 from __future__ import annotations
 
 from threading import Event
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from .data_plane import InMemoryPackedBatch, validate_packed_batch
 from .specs import TrainJobSpec
 from .trainer_run import EventSink
+
+if TYPE_CHECKING:
+    from art.megatron.optimizer_state import OptimizerAdapter
 
 
 class MegatronTrainJobExecutor:
@@ -42,6 +45,40 @@ class MegatronTrainJobExecutor:
             ),
             cancelled=cancelled,
         )
+
+    def advance_without_training(
+        self,
+        *,
+        training_session_id: str,
+        expected_learner_version: int,
+        learner_version: int,
+        optimizer_state_path: str,
+        adapter: "OptimizerAdapter | None",
+    ) -> None:
+        if self._closed:
+            raise RuntimeError("Megatron executor is closed")
+        if learner_version != expected_learner_version + 1:
+            raise ValueError("a no-op learner transition must advance exactly one step")
+        runtime = self.runtime
+        if (
+            runtime.resident_training_session_id != training_session_id
+            or runtime.resident_policy_step != expected_learner_version
+            or not runtime.optimizer_state_loaded
+            or runtime.optimizer is None
+        ):
+            raise RuntimeError("resident trainer state does not match no-op transition")
+        if adapter is not None:
+            from art.megatron.optimizer_state import (
+                save_optimizer_state_under_model_lease,
+            )
+
+            save_optimizer_state_under_model_lease(
+                runtime,
+                optimizer_state_path=optimizer_state_path,
+                step=learner_version,
+                adapter=adapter,
+            )
+        runtime.resident_policy_step = learner_version
 
     def close(self) -> None:
         if self._closed:

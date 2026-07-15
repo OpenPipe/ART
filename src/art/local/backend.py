@@ -1430,6 +1430,21 @@ class LocalBackend:
         self._provenance_update_tasks.add(task)
         task.add_done_callback(self._provenance_update_tasks.discard)
 
+    async def _advance_skipped_step(
+        self,
+        model: TrainableModel,
+        service: ModelService,
+        current_step: int,
+        next_step: int,
+    ) -> None:
+        model_dir = get_model_dir(model=model, art_path=self._path)
+        current = get_step_checkpoint_dir(model_dir, current_step)
+        if not os.path.exists(current):
+            return
+        checkpoint = get_step_checkpoint_dir(model_dir, next_step)
+        shutil.copytree(current, checkpoint, dirs_exist_ok=True)
+        await service.register_lora_for_step(next_step, checkpoint)
+
     async def _train_model(
         self,
         model: TrainableModel,
@@ -1471,39 +1486,11 @@ class LocalBackend:
                 f"[BACKEND] _train_model SKIP: current_step={current_step} "
                 f"next_step={next_step} (all rewards equal)"
             )
-            current_checkpoint_dir = get_step_checkpoint_dir(
-                get_model_dir(model=model, art_path=self._path), current_step
+            await self._advance_skipped_step(model, service, current_step, next_step)
+            logger.info(
+                f"[BACKEND] _train_model SKIP: advanced checkpoint "
+                f"{current_step} -> {next_step}"
             )
-            next_checkpoint_dir = get_step_checkpoint_dir(
-                get_model_dir(model=model, art_path=self._path), next_step
-            )
-
-            # If the current checkpoint exists, copy it to the next step
-            if os.path.exists(current_checkpoint_dir):
-                shutil.copytree(
-                    current_checkpoint_dir,
-                    next_checkpoint_dir,
-                    dirs_exist_ok=True,
-                )
-                logger.info(
-                    f"[BACKEND] _train_model SKIP: copied checkpoint "
-                    f"{current_step} -> {next_step}, calling register_lora_for_step..."
-                )
-
-                try:
-                    # Register the copied checkpoint as a new LoRA adapter
-                    # so it's available for inference at the new step
-                    register_lora_for_step = getattr(
-                        service, "register_lora_for_step", None
-                    )
-                    if callable(register_lora_for_step):
-                        await register_lora_for_step(next_step, next_checkpoint_dir)
-                    logger.info(
-                        f"[BACKEND] _train_model SKIP: register_lora_for_step "
-                        f"completed for step {next_step}"
-                    )
-                except ModuleNotFoundError:
-                    pass  # Unsloth is not installed
 
             # Yield metrics showing no groups were trainable
             # (the frontend will handle logging)

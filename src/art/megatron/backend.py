@@ -280,6 +280,25 @@ class MegatronBackend(LocalBackend):
                     raise
                 training_error.add_note(f"packed batch release also failed: {error}")
 
+    async def _advance_skipped_step(
+        self,
+        model: TrainableModel,
+        service: ModelService,
+        current_step: int,
+        next_step: int,
+    ) -> None:
+        if self._runtime is None:
+            await super()._advance_skipped_step(model, service, current_step, next_step)
+            return
+        from .distributed_service import DistributedMegatronService
+
+        distributed = cast(DistributedMegatronService, service)
+        current_step = distributed.learner_version
+        await distributed.advance_without_training(
+            expected_step=current_step,
+            learner_version=current_step + 1,
+        )
+
     async def _get_step(self, model: AnyTrainableModel) -> int:
         if not model.trainable:
             return 0

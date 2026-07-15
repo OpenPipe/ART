@@ -30,6 +30,8 @@ class ModelService(Protocol):
         self, config: types.TrainConfig
     ) -> int: ...
 
+    async def register_lora_for_step(self, step: int, checkpoint_dir: str) -> None: ...
+
     def train(
         self,
         disk_packed_tensors: DiskPackedTensors,

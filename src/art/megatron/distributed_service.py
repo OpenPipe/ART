@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager
 import hashlib
 import json
@@ -9,7 +9,7 @@ import logging
 import os
 from pathlib import Path
 import shutil
-from typing import Any, Literal, cast
+from typing import Any, Literal, TypeVar, cast
 import uuid
 
 import httpx
@@ -52,10 +52,14 @@ from .model_support import (
 from .optimizer_state import (
     OptimizerAdapter,
     async_optimizer_model_lease,
+    commit_optimizer_policy_advance,
     format_megatron_resume_message,
     hash_adapter_checkpoint,
     prepare_megatron_resume_state,
     publish_adapter_checkpoint,
+    read_adapter_publication,
+    read_committed_optimizer_pointer,
+    resolve_committed_optimizer_policy,
 )
 from .runtime.specs import (
     AdapterReady,
@@ -74,11 +78,36 @@ from .runtime.specs import (
 from .runtime_config import get_megatron_runtime_config
 
 logger = logging.getLogger(__name__)
+_T = TypeVar("_T")
 
 
 def _consume_task_result(task: asyncio.Future[Any]) -> None:
     if not task.cancelled():
         task.exception()
+
+
+async def _complete_to_thread(
+    operation: Callable[[], _T],
+) -> tuple[_T, asyncio.CancelledError | None]:
+    task = asyncio.create_task(asyncio.to_thread(operation))
+    cancelled: asyncio.CancelledError | None = None
+    while not task.done():
+        try:
+            await asyncio.shield(task)
+        except asyncio.CancelledError as error:
+            if task.cancelled():
+                break
+            cancelled = cancelled or error
+        except BaseException:
+            break
+    try:
+        result = task.result()
+    except BaseException as error:
+        if cancelled is not None:
+            cancelled.add_note(f"filesystem transaction also failed: {error}")
+            raise cancelled
+        raise
+    return result, cancelled
 
 
 class DistributedMegatronService:
@@ -140,6 +169,17 @@ class DistributedMegatronService:
             raise RuntimeError("distributed model service is closed")
 
     @property
+    def learner_version(self) -> int:
+        return self._latest_step
+
+    def _trainer_is_current(self) -> bool:
+        return (
+            self._trainer is not None
+            and self._trainer.valid
+            and self._trainer.learner_version == self._latest_step
+        )
+
+    @property
     def _optimizer_state_path(self) -> str:
         path = f"{self.output_dir}/optimizer_states_rl"
         os.makedirs(path, exist_ok=True)
@@ -163,7 +203,7 @@ class DistributedMegatronService:
         return value
 
     def _resolve_current_lora_path(self) -> str:
-        if self._trainer is not None and self._trainer.valid:
+        if self._trainer_is_current():
             path = get_step_checkpoint_dir(self.output_dir, self._latest_step)
             if not (Path(path) / "adapter_model.safetensors").is_file():
                 raise RuntimeError(
@@ -259,7 +299,7 @@ class DistributedMegatronService:
         )
 
     async def _ensure_trainer_locked(self) -> Any:
-        if self._trainer is not None and self._trainer.valid:
+        if self._trainer_is_current():
             return self._trainer
         if self._trainer is not None:
             await self._trainer.close()
@@ -321,19 +361,11 @@ class DistributedMegatronService:
         staging: str,
     ) -> AsyncIterator[AsyncIterator[Any]]:
         async with async_optimizer_model_lease(job.output.optimizer_state_path):
-            copy = asyncio.create_task(
-                asyncio.to_thread(_copy_checkpoint, source, staging)
+            _, cancelled = await _complete_to_thread(
+                lambda: _copy_checkpoint(source, staging)
             )
-            try:
-                await asyncio.shield(copy)
-            except asyncio.CancelledError as cancelled:
-                try:
-                    await copy
-                except BaseException as error:
-                    cancelled.add_note(
-                        f"checkpoint copy failed during cancellation: {error}"
-                    )
-                raise
+            if cancelled is not None:
+                raise cancelled
             events = trainer.train(job, leases)
             try:
                 yield events
@@ -1127,8 +1159,176 @@ class DistributedMegatronService:
     async def register_lora_for_step(self, step: int, checkpoint: str) -> None:
         async with self._mutation_lock:
             self._require_open()
+            policy = await asyncio.to_thread(
+                resolve_committed_optimizer_policy,
+                self._optimizer_state_path,
+                initial_adapter_path=get_step_checkpoint_dir(self.output_dir, 0),
+            )
+            if policy.policy_adapter.step != step or policy.policy_adapter.identity != (
+                str(Path(checkpoint).absolute())
+            ):
+                raise RuntimeError(
+                    "distributed LoRA registration requires a committed policy step"
+                )
             await self._register_lora_for_step_locked(step, checkpoint)
             self._latest_step = step
+
+    async def advance_without_training(
+        self,
+        *,
+        expected_step: int,
+        learner_version: int,
+    ) -> None:
+        async with self._mutation_lock:
+            self._require_open()
+            if expected_step != self._latest_step:
+                raise ValueError(
+                    "no-op policy transition expected the wrong service step: "
+                    f"expected={expected_step}, current={self._latest_step}"
+                )
+            if learner_version != expected_step + 1:
+                raise ValueError("a no-op policy transition must advance one step")
+            if self._trainer is not None and not self._trainer_is_current():
+                await self._trainer.close()
+                self._trainer = None
+            trainer = self._trainer
+            source = get_step_checkpoint_dir(self.output_dir, expected_step)
+            staging = (
+                f"{self.output_dir}/megatron_runtime/staging/{learner_version:04d}"
+            )
+            initial = get_step_checkpoint_dir(self.output_dir, 0)
+            published: OptimizerAdapter | None = None
+            durable = False
+            transition_started = False
+            try:
+                async with async_optimizer_model_lease(self._optimizer_state_path):
+                    current = await asyncio.to_thread(
+                        resolve_committed_optimizer_policy,
+                        self._optimizer_state_path,
+                        initial_adapter_path=initial,
+                    )
+                    if current.policy_adapter.step > expected_step:
+                        raise RuntimeError(
+                            "durable policy is newer than the model service"
+                        )
+                    flush_optimizer = current.policy_adapter.step < expected_step
+                    if flush_optimizer and trainer is None:
+                        raise RuntimeError(
+                            "no resident trainer can checkpoint newer optimizer state"
+                        )
+                    _, cancelled = await _complete_to_thread(
+                        lambda: _copy_checkpoint(source, staging)
+                    )
+                    if cancelled is not None:
+                        raise cancelled
+                    published, cancelled = await _complete_to_thread(
+                        lambda: _publish_checkpoint(
+                            staging, self.output_dir, learner_version
+                        )
+                    )
+                    self._published_adapters[learner_version] = published
+                    assert published is not None
+                    if cancelled is not None:
+                        raise cancelled
+                    if not flush_optimizer:
+                        _, cancelled = await _complete_to_thread(
+                            lambda: commit_optimizer_policy_advance(
+                                self._optimizer_state_path,
+                                initial_adapter_path=initial,
+                                expected_step=expected_step,
+                                adapter=cast(OptimizerAdapter, published),
+                            )
+                        )
+                        durable = True
+                        if cancelled is not None:
+                            raise cancelled
+                    if trainer is not None:
+                        transition_started = True
+                        await trainer.advance_without_training(
+                            expected_learner_version=expected_step,
+                            learner_version=learner_version,
+                            optimizer_state_path=self._optimizer_state_path,
+                            adapter=published if flush_optimizer else None,
+                        )
+                    if flush_optimizer:
+                        pointer = await asyncio.to_thread(
+                            read_committed_optimizer_pointer,
+                            self._optimizer_state_path,
+                        )
+                        durable = (
+                            pointer is not None
+                            and pointer.step == learner_version
+                            and pointer.adapter == published
+                        )
+                        if not durable:
+                            raise RuntimeError(
+                                "trainer did not commit the no-op optimizer checkpoint"
+                            )
+            except BaseException as error:
+                failures: list[BaseException] = [error]
+                if published is None:
+                    try:
+                        published, discovery_cancelled = await _complete_to_thread(
+                            lambda: read_adapter_publication(
+                                get_step_checkpoint_dir(
+                                    self.output_dir, learner_version
+                                ),
+                                step=learner_version,
+                                verify_files=True,
+                            )
+                        )
+                        if discovery_cancelled is not None:
+                            failures.append(discovery_cancelled)
+                    except BaseException as discovery_error:
+                        failures.append(discovery_error)
+                reconcile_checkpoint: str | None = None
+                if published is not None and not durable:
+                    try:
+                        resume, recovery_cancelled = await _complete_to_thread(
+                            lambda: prepare_megatron_resume_state(
+                                output_dir=self.output_dir,
+                                optimizer_state_path=self._optimizer_state_path,
+                            )
+                        )
+                        self._latest_step = resume.step
+                        durable = resume.step == learner_version
+                        self._published_adapters = {
+                            step: adapter
+                            for step, adapter in self._published_adapters.items()
+                            if step <= resume.step
+                        }
+                        reconcile_checkpoint = get_step_checkpoint_dir(
+                            self.output_dir, resume.step
+                        )
+                        if recovery_cancelled is not None:
+                            failures.append(recovery_cancelled)
+                    except BaseException as recovery_error:
+                        failures.append(recovery_error)
+                if durable:
+                    assert published is not None
+                    self._latest_step = learner_version
+                    reconcile_checkpoint = published.identity
+                if trainer is not None and (transition_started or durable):
+                    try:
+                        await trainer.close()
+                    except BaseException as cleanup_error:
+                        failures.append(cleanup_error)
+                    self._trainer = None
+                if reconcile_checkpoint is not None:
+                    try:
+                        await self._reconcile_serving_locked(reconcile_checkpoint)
+                    except BaseException as serving_error:
+                        failures.append(serving_error)
+                if len(failures) > 1:
+                    raise BaseExceptionGroup(
+                        "no-op policy transition and recovery failed", failures
+                    ) from None
+                raise
+            assert published is not None and durable
+            self._latest_step = learner_version
+            await self._register_lora_for_step_locked(
+                learner_version, published.identity
+            )
 
     async def _register_lora_for_step_locked(self, step: int, checkpoint: str) -> None:
         if not self._base_urls:

@@ -192,6 +192,38 @@ class MonarchTrainerActor(Actor):
     def close(self) -> None:
         self._executor.close()
 
+    @endpoint
+    def advance_without_training(
+        self,
+        training_session_id: str,
+        expected_learner_version: int,
+        learner_version: int,
+        optimizer_state_path: str,
+        adapter_json: str | None,
+    ) -> dict[str, int]:
+        if not self._valid:
+            raise RuntimeError("trainer actor runtime is invalid")
+        from art.megatron.optimizer_state import OptimizerAdapter
+
+        adapter = (
+            None
+            if adapter_json is None
+            else OptimizerAdapter.model_validate_json(adapter_json)
+        )
+        try:
+            with self._weight_offload.job():
+                self._executor.advance_without_training(
+                    training_session_id=training_session_id,
+                    expected_learner_version=expected_learner_version,
+                    learner_version=learner_version,
+                    optimizer_state_path=optimizer_state_path,
+                    adapter=adapter,
+                )
+            return {"rank": self._runtime.rank, "learner_version": learner_version}
+        except BaseException:
+            self._valid = False
+            raise
+
     def __cleanup__(self, exc: Exception | None) -> None:
         if exc is not None:
             self._valid = False
@@ -403,6 +435,56 @@ class MonarchTrainerRun:
             finally:
                 self._clear_active(job.job_id)
                 self._jobs[job.job_id] = (job.fingerprint, tuple(events))
+
+    async def advance_without_training(
+        self,
+        *,
+        expected_learner_version: int,
+        learner_version: int,
+        optimizer_state_path: str,
+        adapter: Any | None,
+    ) -> None:
+        async with self._lock:
+            if self._closed or not self._valid:
+                raise RuntimeError("trainer runtime is invalid")
+            if self._active_job_id is not None:
+                raise RuntimeError("trainer has an active job")
+            if expected_learner_version != self._learner_version:
+                raise ValueError(
+                    "expected learner version mismatch: "
+                    f"transition={expected_learner_version}, "
+                    f"runtime={self._learner_version}"
+                )
+            if learner_version != expected_learner_version + 1:
+                raise ValueError("a no-op transition must advance exactly one step")
+            try:
+                values = await asyncio.wait_for(
+                    self._actors.advance_without_training.call(
+                        self.run_spec.training_session_id,
+                        expected_learner_version,
+                        learner_version,
+                        optimizer_state_path,
+                        None if adapter is None else adapter.model_dump_json(),
+                    ),
+                    timeout=self.run_spec.event_timeout_s,
+                )
+                results = list(values.values())
+                if {result["rank"] for result in results} != set(
+                    range(len(self.runtime_spec.trainer_mesh.ranks))
+                ) or {result["learner_version"] for result in results} != {
+                    learner_version
+                }:
+                    raise RuntimeError("trainer ranks rejected no-op transition")
+            except BaseException as exc:
+                self._valid = False
+                self._closed = True
+                await cleanup_after_failure(
+                    exc,
+                    self._force_stop,
+                    message="no-op transition and trainer cleanup failed",
+                )
+                raise
+            self._learner_version = learner_version
 
     def _validate(
         self, job: TrainJobSpec, batch: PackedBatchLeaseSet
