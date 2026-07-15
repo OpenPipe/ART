@@ -15,14 +15,26 @@ import multiprocessing
 import os
 import re
 import sys
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
-from .rollout import InstalledAsyncCallable
+if TYPE_CHECKING:
+    from .rollout import InstalledAsyncCallable
 
 DEFAULT_MONARCH_PORT = 22222
 _INVALID_IDENTIFIER = re.compile(r"\W")
+_MONARCH_TIMEOUT_ENV = (
+    "HYPERACTOR_HOST_SPAWN_READY_TIMEOUT",
+    "HYPERACTOR_MESSAGE_DELIVERY_TIMEOUT",
+    "HYPERACTOR_MESH_ACTOR_SPAWN_MAX_IDLE",
+    "HYPERACTOR_MESH_PROC_SPAWN_MAX_IDLE",
+)
+_WORKER_CODE = """\
+import sys
+from monarch.actor import run_worker_loop_forever
+run_worker_loop_forever(address=sys.argv[1], ca="trust_all_connections")
+"""
 
 
 class _BootstrapContract(BaseModel):
@@ -97,6 +109,8 @@ def _prepare_child_environment() -> None:
     roots = [path for path in sys.path if path and os.path.isabs(path)]
     roots.extend(os.environ.get("PYTHONPATH", "").split(os.pathsep))
     os.environ["PYTHONPATH"] = os.pathsep.join(dict.fromkeys(filter(None, roots)))
+    for name in _MONARCH_TIMEOUT_ENV:
+        os.environ.setdefault(name, "600s")
 
 
 def run_worker(address: str) -> None:
@@ -106,14 +120,10 @@ def run_worker(address: str) -> None:
     trust-all mode must never be exposed to an untrusted or public network.
     """
 
-    from monarch.actor import (  # ty: ignore[unresolved-import]
-        enable_transport,
-        run_worker_loop_forever,
-    )
-
-    enable_transport("tcp")
     _prepare_child_environment()
-    run_worker_loop_forever(address=address, ca="trust_all_connections")
+    # Importing ``art`` initializes enough third-party state to break Monarch's
+    # spawned interpreter bootstrap. Replace this process with a clean worker.
+    os.execv(sys.executable, [sys.executable, "-c", _WORKER_CODE, address])
 
 
 async def attach_controller(
@@ -121,13 +131,13 @@ async def attach_controller(
 ) -> Any:
     """Attach a controller to already-started workers on a trusted network."""
 
+    _prepare_child_environment()
     from monarch.actor import (  # ty: ignore[unresolved-import]
         attach_to_workers,
         enable_transport,
     )
 
     enable_transport("tcp")
-    _prepare_child_environment()
     hosts = attach_to_workers(
         workers=list(worker_addresses),
         ca="trust_all_connections",
@@ -138,7 +148,7 @@ async def attach_controller(
 
 
 async def run_explicit_controller(
-    spec: ExplicitHostBootstrap, program: InstalledAsyncCallable
+    spec: ExplicitHostBootstrap, program: "InstalledAsyncCallable"
 ) -> Any:
     hosts = await attach_controller(spec.worker_addresses)
     try:
@@ -147,7 +157,7 @@ async def run_explicit_controller(
         await hosts.shutdown()
 
 
-def run_skypilot(program: InstalledAsyncCallable) -> None:
+def run_skypilot(program_module: str, program_qualname: str) -> None:
     """Translate SkyPilot topology and run one worker per node plus rank-0 controller."""
 
     spec = SkyPilotBootstrap.from_environ()
@@ -157,6 +167,9 @@ def run_skypilot(program: InstalledAsyncCallable) -> None:
         return
     worker = multiprocessing.Process(target=run_worker, args=(address,), daemon=True)
     worker.start()
+    from .rollout import InstalledAsyncCallable
+
+    program = InstalledAsyncCallable(module=program_module, qualname=program_qualname)
 
     async def controller() -> None:
         try:
@@ -195,12 +208,18 @@ def main(argv: Sequence[str] | None = None) -> None:
     module, separator, qualname = args.program.partition(":")
     if not separator:
         parser.error("--program must use module:qualname")
-    program = InstalledAsyncCallable(module=module, qualname=qualname)
     if args.command == "skypilot":
-        run_skypilot(program)
+        run_skypilot(module, qualname)
     else:
+        from .rollout import InstalledAsyncCallable
+
+        program = InstalledAsyncCallable(module=module, qualname=qualname)
         asyncio.run(
             run_explicit_controller(
                 ExplicitHostBootstrap(worker_addresses=tuple(args.worker)), program
             )
         )
+
+
+if __name__ == "__main__":
+    main()

@@ -1,79 +1,53 @@
-from .data_plane import PackedBatchRef, TensorSpec
-from .rollout import InstalledAsyncCallable, LocalRolloutExecutor
-from .specs import (
-    ClusterSpec,
-    EndpointSpec,
-    GpuPlacement,
-    HostSpec,
-    ModelServiceMemberSpec,
-    ModelServiceReplicaSpec,
-    ModelServiceSpec,
-    RuntimeTopology,
-    TrainerMeshSpec,
-    VllmParallelSpec,
-)
-from .topology import compile_topology
-from .vllm_replica import (
-    HostMemberLaunchRequest,
-    HostMemberState,
-    ManagedVllmHostLauncher,
-    ReplicaHostLauncher,
-    ReplicaLaunchTemplate,
-    ReplicaManager,
-    ReplicaState,
-    ReplicaUpdateReport,
-)
-from .vllm_router import (
-    KvCacheEvent,
-    PolicyGenerationCommitError,
-    PrefixBlockHashes,
-    PreparedRoutingTable,
-    ReplicaRouter,
-    ReplicaTelemetry,
-    RoutableReplica,
-    RouteReservation,
-    RoutingDeadlineExceededError,
-    RoutingInput,
-    RoutingQueueFullError,
-    RoutingTable,
-    RoutingUnavailableError,
-)
+from importlib import import_module
+from typing import Any
 
-__all__ = [
-    "ClusterSpec",
-    "EndpointSpec",
-    "GpuPlacement",
-    "HostSpec",
-    "ModelServiceMemberSpec",
-    "ModelServiceReplicaSpec",
-    "ModelServiceSpec",
-    "RuntimeTopology",
-    "TrainerMeshSpec",
-    "VllmParallelSpec",
-    "compile_topology",
-    "HostMemberLaunchRequest",
-    "HostMemberState",
-    "InstalledAsyncCallable",
-    "KvCacheEvent",
-    "LocalRolloutExecutor",
-    "ManagedVllmHostLauncher",
-    "PackedBatchRef",
-    "PolicyGenerationCommitError",
-    "PrefixBlockHashes",
-    "PreparedRoutingTable",
-    "ReplicaHostLauncher",
-    "ReplicaLaunchTemplate",
-    "ReplicaManager",
-    "ReplicaRouter",
-    "ReplicaState",
-    "ReplicaTelemetry",
-    "ReplicaUpdateReport",
-    "RoutableReplica",
-    "RouteReservation",
-    "RoutingDeadlineExceededError",
-    "RoutingInput",
-    "RoutingQueueFullError",
-    "RoutingTable",
-    "RoutingUnavailableError",
-    "TensorSpec",
-]
+_EXPORTS = {
+    "ClusterSpec": ".specs",
+    "EndpointSpec": ".specs",
+    "GpuPlacement": ".specs",
+    "HostMemberLaunchRequest": ".vllm_replica",
+    "HostMemberState": ".vllm_replica",
+    "HostSpec": ".specs",
+    "InstalledAsyncCallable": ".rollout",
+    "KvCacheEvent": ".vllm_router",
+    "LocalRolloutExecutor": ".rollout",
+    "ManagedVllmHostLauncher": ".vllm_replica",
+    "ModelServiceMemberSpec": ".specs",
+    "ModelServiceReplicaSpec": ".specs",
+    "ModelServiceSpec": ".specs",
+    "PackedBatchRef": ".data_plane",
+    "PolicyGenerationCommitError": ".vllm_router",
+    "PrefixBlockHashes": ".vllm_router",
+    "PreparedRoutingTable": ".vllm_router",
+    "ReplicaHostLauncher": ".vllm_replica",
+    "ReplicaLaunchTemplate": ".vllm_replica",
+    "ReplicaManager": ".vllm_replica",
+    "ReplicaRouter": ".vllm_router",
+    "ReplicaState": ".vllm_replica",
+    "ReplicaTelemetry": ".vllm_router",
+    "ReplicaUpdateReport": ".vllm_replica",
+    "RoutableReplica": ".vllm_router",
+    "RouteReservation": ".vllm_router",
+    "RoutingDeadlineExceededError": ".vllm_router",
+    "RoutingInput": ".vllm_router",
+    "RoutingQueueFullError": ".vllm_router",
+    "RoutingTable": ".vllm_router",
+    "RoutingUnavailableError": ".vllm_router",
+    "RuntimeTopology": ".specs",
+    "TensorSpec": ".data_plane",
+    "TrainerMeshSpec": ".specs",
+    "VllmParallelSpec": ".specs",
+    "compile_topology": ".topology",
+}
+
+__all__ = list(_EXPORTS)
+
+
+def __getattr__(name: str) -> Any:
+    try:
+        module = _EXPORTS[name]
+    except KeyError:
+        raise AttributeError(name) from None
+    value = getattr(import_module(module, __name__), name)
+    globals()[name] = value
+    return value

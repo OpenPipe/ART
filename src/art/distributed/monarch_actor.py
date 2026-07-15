@@ -10,6 +10,7 @@ from typing import Any, cast
 from monarch.actor import Actor, endpoint  # ty: ignore[unresolved-import]
 
 from .data_plane import BatchReservation, PackedBatchInbox, PackedBatchRef
+from .packing import PackingRequest, PackingResult
 from .rollout import RolloutInvocation, RolloutResult
 
 
@@ -22,6 +23,7 @@ class RolloutHostService(Actor):
         )
         self._models = OrderedDict()
         self._rdma_batches: dict[str, tuple[Any, Any, shared_memory.SharedMemory]] = {}
+        self._packer = None
 
     @endpoint
     async def run(self, invocation: RolloutInvocation):
@@ -53,6 +55,44 @@ class RolloutHostService(Actor):
         self._models.clear()
         for batch_id in tuple(self._rdma_batches):
             await self._drop_batch(batch_id)
+        if self._packer is not None:
+            await self._packer.close()
+            self._packer = None
+        self.inbox.store.close()
+
+    @endpoint
+    async def pack_batch(self, request: PackingRequest) -> PackingResult:
+        if self._packer is None:
+            from art.megatron.backend import MegatronBackend
+
+            self._packer = MegatronBackend(
+                in_process=True,
+                path=f"/tmp/art-packing-{os.getpid()}",
+                enable_expert_replay=request.include_moe_routing,
+            )
+        groups = [payload.build() for payload in request.trajectory_groups]
+        packed = self._packer._get_packed_tensors(
+            request.model.build(),
+            groups,
+            advantage_balance=request.advantage_balance,
+            allow_training_without_logprobs=request.allow_training_without_logprobs,
+            scale_rewards=request.scale_rewards,
+            plot_tensors=request.plot_tensors,
+            packed_sequence_length=request.packed_sequence_length,
+            logprob_calculation_chunk_size=request.logprob_calculation_chunk_size,
+            include_moe_routing=request.include_moe_routing,
+        )
+        shapes = tuple(group._packed_group_shape for group in groups)
+        if packed is None:
+            return PackingResult(ref=None, packed_group_shapes=shapes)
+        ref = self.inbox.store.create(
+            packed,
+            group_ids=request.group_ids,
+            record_ids=request.record_ids,
+            min_source_version=request.min_source_version,
+            max_source_version=request.max_source_version,
+        )
+        return PackingResult(ref=ref, packed_group_shapes=shapes)
 
     @endpoint
     async def publish_batch(self, ref: PackedBatchRef):
@@ -78,6 +118,10 @@ class RolloutHostService(Actor):
     @endpoint
     async def drop_batch(self, batch_id: str) -> None:
         await self._drop_batch(batch_id)
+
+    @endpoint
+    async def note_batch_transmitted(self, byte_count: int) -> None:
+        self.inbox.store.note_transmitted(byte_count)
 
     async def _drop_batch(self, batch_id: str) -> None:
         try:

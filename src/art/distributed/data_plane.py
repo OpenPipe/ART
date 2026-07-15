@@ -365,15 +365,7 @@ class SharedMemoryPackedBatchStore:
                 dtype=torch.uint8,
                 count=reservation.storage_byte_count,
             )
-            transferred = await rdma_buffer.read_into(destination, timeout=timeout_s)
-            if (
-                transferred is not None
-                and int(transferred) != reservation.storage_byte_count
-            ):
-                raise RuntimeError(
-                    f"RDMA transferred {transferred} bytes, expected "
-                    f"{reservation.storage_byte_count}"
-                )
+            await rdma_buffer.read_into(destination, timeout=timeout_s)
             del destination
             destination = None
             return self._finish_commit(reservation, source, shm)
@@ -643,6 +635,8 @@ class RDMABatchSourceEndpoint(Protocol):
 
     async def drop(self, batch_id: str) -> None: ...
 
+    async def note_transmitted(self, byte_count: int) -> None: ...
+
 
 class RDMABatchInboxEndpoint(PackedBatchInboxEndpoint, Protocol):
     async def receive_rdma(
@@ -652,7 +646,6 @@ class RDMABatchInboxEndpoint(PackedBatchInboxEndpoint, Protocol):
 
 async def fanout_rdma_packed_batch(
     *,
-    source: SharedMemoryPackedBatchStore,
     ref: PackedBatchRef,
     source_endpoint: RDMABatchSourceEndpoint,
     inboxes: Mapping[str, RDMABatchInboxEndpoint],
@@ -692,7 +685,7 @@ async def fanout_rdma_packed_batch(
                 ],
             )
             raise failures[0]
-        source.note_transmitted(len(inboxes) * ref.storage_byte_count)
+        await source_endpoint.note_transmitted(len(inboxes) * ref.storage_byte_count)
         return dict(zip(tasks, cast(list[PackedBatchRef], results), strict=True))
     finally:
         await source_endpoint.drop(ref.batch_id)

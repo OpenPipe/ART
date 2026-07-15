@@ -4,6 +4,7 @@ from typing import Any
 
 from .data_plane import BatchReservation, PackedBatchRef
 from .monarch_bootstrap import monarch_identifier
+from .packing import PackingRequest, PackingResult
 from .rollout import (
     DistributedRolloutExecutor,
     InstalledAsyncCallable,
@@ -61,6 +62,17 @@ class MonarchPackedBatchSource:
 
     async def drop(self, batch_id: str) -> None:
         await self.actor.drop_batch.call_one(batch_id)
+
+    async def note_transmitted(self, byte_count: int) -> None:
+        await self.actor.note_batch_transmitted.call_one(byte_count)
+
+
+class MonarchPackingEndpoint:
+    def __init__(self, actor: Any) -> None:
+        self.actor = actor
+
+    async def pack(self, request: PackingRequest) -> PackingResult:
+        return await self.actor.pack_batch.call_one(request)
 
 
 async def create_rollout_executor(

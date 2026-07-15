@@ -65,6 +65,7 @@ class RolloutModelSpec(BaseModel):
 
     payload: dict[str, Any]
     user_config: Any = None
+    internal_config: dict[str, Any] | None = None
     serving_capabilities: ServingCapabilities | None = None
     binary_routes_base_url: str | None = None
 
@@ -76,6 +77,11 @@ class RolloutModelSpec(BaseModel):
         return cls(
             payload=payload,
             user_config=model.config,
+            internal_config=(
+                dict(model._internal_config)
+                if model._internal_config is not None
+                else None
+            ),
             serving_capabilities=model._serving_capabilities,
             binary_routes_base_url=model._art_binary_routes_base_url,
         )
@@ -84,6 +90,7 @@ class RolloutModelSpec(BaseModel):
     def cache_key(self) -> str:
         payload = {
             "model": self.payload,
+            "internal_config": self.internal_config,
             "capabilities": (
                 self.serving_capabilities.model_dump(mode="json")
                 if self.serving_capabilities is not None
@@ -98,6 +105,7 @@ class RolloutModelSpec(BaseModel):
     def build(self) -> TrainableModel:
         model = TrainableModel.model_validate(self.payload)
         object.__setattr__(model, "config", self.user_config)
+        object.__setattr__(model, "_internal_config", self.internal_config)
         object.__setattr__(model, "_serving_capabilities", self.serving_capabilities)
         object.__setattr__(
             model, "_art_binary_routes_base_url", self.binary_routes_base_url
