@@ -168,6 +168,8 @@ class RolloutResult(BaseModel):
 
 
 class RolloutExecutor(Protocol):
+    max_workers: int | None
+
     def set_target(self, target_workers: int) -> None: ...
 
     def set_workers(self, worker_ids: tuple[int, ...]) -> None: ...
@@ -183,6 +185,8 @@ class RolloutExecutor(Protocol):
 
 
 class LocalRolloutExecutor:
+    max_workers: int | None = None
+
     def set_target(self, target_workers: int) -> None:
         if target_workers < 1:
             raise ValueError("target_workers must be >= 1")
@@ -246,6 +250,7 @@ class DistributedRolloutExecutor:
             raise ValueError("rollout hosts must each provide at least one endpoint")
         self.callable = callable
         self.hosts = {host: tuple(endpoints) for host, endpoints in hosts.items()}
+        self.max_workers = sum(len(endpoints) for endpoints in self.hosts.values())
         self._worker_endpoints: tuple[RolloutHostEndpoint, ...] = ()
         self._endpoint_by_worker: dict[int, RolloutHostEndpoint] = {}
         self.set_target(target_workers)

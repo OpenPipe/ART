@@ -161,6 +161,7 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
         loss_fn: str = "cispo",
         loss_fn_config: dict | None = None,
         normalize_advantages: bool = True,
+        grad_accumulation_sequences: int | None = None,
         adam_params: object | None = None,
         kl_penalty_coef: float = 0.0,
         kl_penalty_step_lag: int | None = None,
@@ -186,6 +187,9 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
         rollout_executor: RolloutExecutor | None = None,
     ) -> None:
         autotune = autotune or PipelineAutotuneConfig()
+        rollout_workers_explicit = (
+            pipeline is not None and "num_rollout_workers" in pipeline.model_fields_set
+        )
         if autotune.mode != "off" and pipeline is not None:
             raise ValueError(
                 "Pipeline runtime config cannot be provided when pipeline autotuning "
@@ -209,6 +213,8 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
             raise ValueError("optimizer_save_interval must be > 0")
         if kl_penalty_step_lag is not None and kl_penalty_step_lag < 1:
             raise ValueError("kl_penalty_step_lag must be >= 1")
+        if grad_accumulation_sequences is not None and grad_accumulation_sequences < 1:
+            raise ValueError("grad_accumulation_sequences must be >= 1")
         self.model = model
         self.backend = backend
         self.rollout_fn = rollout_fn
@@ -217,6 +223,19 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
 
             rollout_executor = LocalRolloutExecutor()
         self._rollout_executor = rollout_executor
+        self.rollout_worker_capacity = rollout_executor.max_workers
+        if self.rollout_worker_capacity is not None:
+            if self.rollout_worker_capacity < 1:
+                raise ValueError("rollout executor capacity must be >= 1")
+            if pipeline.num_rollout_workers > self.rollout_worker_capacity:
+                if autotune.mode == "off" and rollout_workers_explicit:
+                    raise ValueError(
+                        f"num_rollout_workers={pipeline.num_rollout_workers} exceeds "
+                        f"rollout executor capacity {self.rollout_worker_capacity}"
+                    )
+                pipeline = pipeline.model_copy(
+                    update={"num_rollout_workers": self.rollout_worker_capacity}
+                )
         self.config = config
         self.eval_fn = eval_fn
         self.pipeline = pipeline
@@ -236,6 +255,7 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
         self.loss_fn = loss_fn
         self.loss_fn_config = loss_fn_config
         self.normalize_advantages = normalize_advantages
+        self.grad_accumulation_sequences = grad_accumulation_sequences
         self.adam_params = adam_params
         self.kl_penalty_coef = kl_penalty_coef
         self.kl_penalty_step_lag = kl_penalty_step_lag
@@ -466,6 +486,14 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
                 loop.create_task(self._output_queue.put(None))
 
     def apply_pipeline_settings(self, settings: PipelineTuneSettings) -> None:
+        if (
+            self.rollout_worker_capacity is not None
+            and settings.num_rollout_workers > self.rollout_worker_capacity
+        ):
+            raise ValueError(
+                f"num_rollout_workers={settings.num_rollout_workers} exceeds rollout "
+                f"executor capacity {self.rollout_worker_capacity}"
+            )
         self.num_rollout_workers = settings.num_rollout_workers
         self.min_batch_size = settings.min_batch_size
         self.max_batch_size = settings.max_batch_size
@@ -892,6 +920,10 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
                     "optimizer_save_interval": self.optimizer_save_interval,
                     "final_training_step": stop_at_step,
                 }
+                if self.grad_accumulation_sequences is not None:
+                    train_kwargs["grad_accumulation_sequences"] = (
+                        self.grad_accumulation_sequences
+                    )
                 if self.kl_penalty_coef > 0.0:
                     kl_penalty_reference_step = self._kl_penalty_reference_step(
                         current_step

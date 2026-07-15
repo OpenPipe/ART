@@ -70,9 +70,13 @@ class PipelineAutotunerAttachment:
         packed_sequence_length = self._discover_packed_sequence_length()
         target_packed_sequences = await self._discover_target_packed_sequences(trainer)
         inference_gpu_count = await self._discover_inference_gpu_count(trainer)
+        rollout_worker_capacity = trainer.rollout_worker_capacity
         policy_age_limit_steps = self._policy_age_limit_steps(trainer)
         loaded = self._load_profile_if_requested(
-            packed_sequence_length, target_packed_sequences, policy_age_limit_steps
+            packed_sequence_length,
+            target_packed_sequences,
+            policy_age_limit_steps,
+            rollout_worker_capacity,
         )
         if loaded is not None:
             settings = self._settings_with_current_queue(
@@ -88,6 +92,7 @@ class PipelineAutotunerAttachment:
                 inference_gpu_count=inference_gpu_count,
                 target_packed_sequences=target_packed_sequences,
                 policy_age_limit_steps=policy_age_limit_steps,
+                rollout_worker_capacity=rollout_worker_capacity,
             )
         trainer.apply_pipeline_settings(settings)
         if self.config.mode == "online":
@@ -100,6 +105,7 @@ class PipelineAutotunerAttachment:
                 target_packed_sequences=target_packed_sequences,
                 inference_gpu_count=inference_gpu_count,
                 policy_age_limit_steps=policy_age_limit_steps,
+                rollout_worker_capacity=rollout_worker_capacity,
             )
             await self._wait_for_initial_serving_metrics()
             self._sampler_task = asyncio.create_task(
@@ -281,11 +287,21 @@ class PipelineAutotunerAttachment:
         active_packed_sequence_length: int,
         target_packed_sequences: int,
         policy_age_limit_steps: float,
+        rollout_worker_capacity: int | None,
     ) -> PipelineAutotunerProfile | None:
         if self.config.mode == "online" and not self.config.profile:
             return None
         assert self.store is not None
         profile = self.store.load(self.config.profile)
+        if (
+            rollout_worker_capacity is not None
+            and profile.settings.num_rollout_workers > rollout_worker_capacity
+        ):
+            raise ValueError(
+                "Autotuner profile requests "
+                f"num_rollout_workers={profile.settings.num_rollout_workers}, above "
+                f"current rollout executor capacity {rollout_worker_capacity}."
+            )
         if (
             profile.packed_sequence_length is not None
             and profile.packed_sequence_length != active_packed_sequence_length
@@ -386,7 +402,10 @@ class PipelineAutotunerAttachment:
         resolver = getattr(backend, "_resolve_grad_accumulation_sequences", None)
         if callable(get_service) and callable(resolver):
             service = await get_service(trainer.model)
-            return max(1, int(await resolver(service, TrainConfig())))
+            config = TrainConfig(
+                grad_accumulation_sequences=trainer.grad_accumulation_sequences
+            )
+            return max(1, int(await resolver(service, config)))
         raise ValueError(
             "Pipeline autotuning requires a backend that can resolve global "
             "grad_accumulation_sequences before training starts."

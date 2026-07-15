@@ -148,6 +148,7 @@ class PipelineAutotunerProfile(pydantic.BaseModel):
     packed_sequence_length: int | None = None
     target_packed_sequences: int | None = None
     inference_gpu_count: int | None = None
+    rollout_worker_capacity: int | None = pydantic.Field(default=None, ge=1)
     policy_age_limit_steps: float | None = None
     settings: PipelineTuneSettings
     config: PipelineAutotuneConfig

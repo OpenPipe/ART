@@ -79,7 +79,15 @@ class PipelineAutotuner:
         target_packed_sequences: int,
         inference_gpu_count: int,
         policy_age_limit_steps: float,
+        rollout_worker_capacity: int | None,
     ) -> None:
+        if rollout_worker_capacity is not None and rollout_worker_capacity < 1:
+            raise ValueError("rollout_worker_capacity must be >= 1")
+        if (
+            rollout_worker_capacity is not None
+            and settings.num_rollout_workers > rollout_worker_capacity
+        ):
+            raise ValueError("initial settings exceed rollout worker capacity")
         self.config = config
         self.settings = settings
         self.model_name = model_name
@@ -88,6 +96,7 @@ class PipelineAutotuner:
         self.target_packed_sequences = max(1, int(target_packed_sequences))
         self.inference_gpu_count = inference_gpu_count
         self.policy_age_limit_steps = policy_age_limit_steps
+        self.rollout_worker_capacity = rollout_worker_capacity
         self.metrics: list[PipelineMetric] = []
         self.packed_groups: list[PackedGroupObservation] = []
         self._packing_outcomes: list[PackingOutcome] = []
@@ -486,7 +495,12 @@ class PipelineAutotuner:
             ),
         )
         cap = _ceil_to_multiple(self.config.max_worker_move, self.config.worker_step)
-        return max(self.config.worker_step, current + direction * min(cap, raw))
+        floor = min(
+            self.config.worker_step,
+            self.rollout_worker_capacity or self.config.worker_step,
+        )
+        moved = max(floor, current + direction * min(cap, raw))
+        return min(moved, self.rollout_worker_capacity or moved)
 
     def _settings_with_recomputed_queue(
         self,
@@ -744,6 +758,7 @@ class PipelineAutotuner:
             packed_sequence_length=self.packed_sequence_length,
             target_packed_sequences=self.target_packed_sequences,
             inference_gpu_count=self.inference_gpu_count,
+            rollout_worker_capacity=self.rollout_worker_capacity,
             policy_age_limit_steps=self.policy_age_limit_steps,
             settings=self.settings,
             config=self.config,
@@ -773,12 +788,15 @@ def build_initial_settings(
     inference_gpu_count: int,
     target_packed_sequences: int,
     policy_age_limit_steps: float,
+    rollout_worker_capacity: int | None,
 ) -> PipelineTuneSettings:
     workers = _ceil_to_multiple(
         config.initial_model_calls_per_inference_gpu * inference_gpu_count,
         config.worker_step,
         minimum=config.worker_step,
     )
+    if rollout_worker_capacity is not None:
+        workers = min(workers, rollout_worker_capacity)
     target_slots = max(1, int(target_packed_sequences))
     max_batch = int(config.initial_max_groups_per_packed_sequence) * target_slots
     min_batch = min(
