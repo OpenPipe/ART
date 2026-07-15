@@ -20,6 +20,8 @@ from typing import (
     cast,
 )
 
+from typing_extensions import TypeIs
+
 T = TypeVar("T")
 
 import art
@@ -42,9 +44,17 @@ _ROLLOUT_WALL_TIME_KEY = "_art_rollout_wall_s"
 _ACTOR_IDLE_TIME_KEY = "_art_actor_idle_s"
 
 
+def _is_eval_mapping(
+    result: Sequence[art.Trajectory | art.TrajectoryGroup]
+    | Mapping[str, Sequence[art.Trajectory | art.TrajectoryGroup]],
+) -> TypeIs[Mapping[str, Sequence[art.Trajectory | art.TrajectoryGroup]]]:
+    return isinstance(result, Mapping)
+
+
 def _to_async_iterator(iterable: Iterable[T] | AsyncIterator[T]) -> AsyncIterator[T]:
     """Convert a sync Iterable to an AsyncIterator, or pass through if already async."""
     if isinstance(iterable, AsyncIterator):
+        # ty cannot currently preserve T through this runtime generic check.
         return cast(AsyncIterator[T], iterable)
 
     async def _iter():
@@ -769,14 +779,7 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
             finally:
                 token.var.reset(token)
                 eval_elapsed = time.monotonic() - eval_started
-            splits: Mapping[str, Sequence[art.Trajectory | art.TrajectoryGroup]]
-            if isinstance(result, Mapping):
-                splits = cast(
-                    Mapping[str, Sequence[art.Trajectory | art.TrajectoryGroup]],
-                    result,
-                )
-            else:
-                splits = {"val": result}
+            splits = result if _is_eval_mapping(result) else {"val": result}
 
             logged_eval_timing = False
             for split_name, items in splits.items():

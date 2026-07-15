@@ -29,7 +29,6 @@ import torch
 import uvicorn
 
 from .. import dev
-from ..backend import Backend
 from ..costs import build_cost_calculator, compute_train_cost, get_model_pricing
 from ..metrics_taxonomy import (
     build_training_summary_metrics,
@@ -178,7 +177,7 @@ class TinkerNativeModelConfig:
     training_client_args: dict[str, Any]
 
 
-class TinkerNativeBackend(Backend):
+class TinkerNativeBackend:
     _tinker_train_log_env = "ART_TINKER_TRAIN_LOG"
     _tinker_sample_log_env = "ART_TINKER_SAMPLE_LOG"
 

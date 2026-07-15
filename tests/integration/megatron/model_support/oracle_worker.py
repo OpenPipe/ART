@@ -525,7 +525,7 @@ def _apply_requested_flex_backend_patch(flex_backend: str | None):
     else:
         raise RuntimeError(f"Unsupported flex backend request: {flex_backend}")
 
-    compiled_flex_attention._FORCED_FLEX_BACKEND = patched_backend  # type: ignore[invalid-assignment]  # ty:ignore[invalid-assignment]
+    setattr(compiled_flex_attention, "_FORCED_FLEX_BACKEND", patched_backend)
     compiled_flex_attention._FORCED_FLEX_KERNEL_OPTIONS = patched_kernel_options
     compiled_flex_attention.dense_compiled_flex_attention = torch.compile(
         compiled_flex_attention._forced_flex_attention_dense
@@ -697,9 +697,11 @@ def _assert_runtime_configuration(
     standard_attention_layers = 0
 
     try:
-        from megatron.core.ssm.gated_delta_net import GatedDeltaNet
+        import megatron.core.ssm.gated_delta_net as gated_delta_net
     except ImportError:  # pragma: no cover - optional dependency guard.
-        GatedDeltaNet = ()  # type: ignore[assignment]  # ty:ignore[invalid-assignment]
+        gated_delta_net_type = None
+    else:
+        gated_delta_net_type = getattr(gated_delta_net, "GatedDeltaNet")
     from megatron.core.transformer.attention import SelfAttention
 
     for chunk in model_chunks:
@@ -712,7 +714,9 @@ def _assert_runtime_configuration(
         if config is not None and hasattr(config, "context_parallel_size"):
             observed_context_parallel_sizes.add(int(config.context_parallel_size))
         for child in module.modules():
-            if GatedDeltaNet and isinstance(child, GatedDeltaNet):
+            if gated_delta_net_type is not None and isinstance(
+                child, gated_delta_net_type
+            ):
                 gdn_layers += 1
             if isinstance(child, SelfAttention):
                 standard_attention_layers += 1
@@ -1044,7 +1048,7 @@ def _apply_attention_nested_grad_mutation(mutation: SensitivityMutation | None):
         view.copy_(grad)
         return view
 
-    executor._sanitize_nested_stage_input_grad = _mutated_sanitize  # type: ignore[invalid-assignment]  # ty:ignore[invalid-assignment]
+    setattr(executor, "_sanitize_nested_stage_input_grad", _mutated_sanitize)
     try:
         yield
     finally:
@@ -1066,8 +1070,8 @@ def _apply_attention_lse_normalize_mutation(mutation: SensitivityMutation | None
     def _identity(lse: torch.Tensor, **_kwargs: Any) -> torch.Tensor:
         return lse
 
-    compiled_flex_attention.normalize_flex_lse = _identity  # type: ignore[invalid-assignment]  # ty:ignore[invalid-assignment]
-    executor.normalize_flex_lse = _identity  # type: ignore[invalid-assignment]  # ty:ignore[invalid-assignment]
+    setattr(compiled_flex_attention, "normalize_flex_lse", _identity)
+    setattr(executor, "normalize_flex_lse", _identity)
     try:
         yield
     finally:

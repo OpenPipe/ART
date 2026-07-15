@@ -141,7 +141,7 @@ def _tokenized(
         trajectory=Trajectory(),
         choice_offsets=[trainable_start],
         extra_logprobs={},
-        _tokenizer=_FakeTokenizer(),  # type: ignore[arg-type]  # ty:ignore[invalid-argument-type]
+        _tokenizer=_FakeTokenizer(),
         moe_routed_experts=cast(list[list[list[int]] | None], routes),
         prompt_id=prompt_id,
         prompt_length=prompt_length,

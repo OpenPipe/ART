@@ -15,7 +15,7 @@ from .._backend_training import (
     aggregate_rl_training_metrics,
     build_rl_train_configs,
 )
-from ..backend import AnyTrainableModel, Backend
+from ..backend import AnyTrainableModel
 from ..metrics_taxonomy import (
     TRAIN_GRADIENT_STEPS_KEY,
     build_training_summary_metrics,
@@ -86,7 +86,7 @@ def _canonicalize_upstream_metrics(metrics: dict[str, float]) -> dict[str, float
     }
 
 
-class ServerlessBackend(Backend):
+class ServerlessBackend:
     def __init__(
         self, *, api_key: str | None = None, base_url: str | None = None
     ) -> None:
@@ -257,7 +257,7 @@ class ServerlessBackend(Backend):
         save_checkpoint: bool = True,
         # Verbosity
         verbose: bool = False,
-    ) -> ServerlessTrainResult:  # ty:ignore[invalid-method-override]
+    ) -> ServerlessTrainResult:
         """Train the model on the given trajectory groups.
 
         This method does NOT automatically log trajectories or metrics. Call
@@ -816,7 +816,7 @@ class ServerlessBackend(Backend):
 
     async def _experimental_push_to_s3(
         self,
-        model: "Model",
+        model: "TrainableModel",
         *,
         s3_bucket: str | None = None,
         prefix: str | None = None,
@@ -858,7 +858,7 @@ class ServerlessBackend(Backend):
 
             # Pull from W&B to local temp dir
             checkpoint_dir = await self._experimental_pull_model_checkpoint(
-                model,  # type: ignore[arg-type]  # ty:ignore[invalid-argument-type]
+                model,
                 step=step,
                 verbose=verbose,
             )

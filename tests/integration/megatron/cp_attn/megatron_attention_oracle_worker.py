@@ -69,12 +69,14 @@ def run_worker_subprocess(
         "--run-request",
         str(request_path),
     ]
-    env = {
-        **os.environ,
-        "ART_MEGATRON_ATTACH_TOKEN_UIDS": "1",
-        "PYTHONUNBUFFERED": "1",
-        "PYTHONPATH": os.pathsep.join(pythonpath_entries),
-    }
+    env = dict(os.environ)
+    env.update(
+        {
+            "ART_MEGATRON_ATTACH_TOKEN_UIDS": "1",
+            "PYTHONUNBUFFERED": "1",
+            "PYTHONPATH": os.pathsep.join(pythonpath_entries),
+        }
+    )
     env.pop("ART_FLEX_BACKEND", None)
     for cache_env in ("TORCHINDUCTOR_CACHE_DIR", "TRITON_CACHE_DIR"):
         cache_root = env.get(cache_env)
@@ -97,7 +99,7 @@ def run_worker_subprocess(
         log_file.flush()
         live_log_file.write(header)
         live_log_file.flush()
-        run = subprocess.Popen(  # ty: ignore[no-matching-overload]
+        run: subprocess.Popen[bytes] = subprocess.Popen(
             command,
             cwd=str(worker_cwd),
             env=env,

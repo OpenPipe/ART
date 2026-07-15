@@ -55,7 +55,7 @@ def _make_trainer(
 ) -> PipelineTrainer:
     return PipelineTrainer(
         model=model,
-        backend=backend,  # type: ignore[arg-type]  # ty:ignore[invalid-argument-type]
+        backend=backend,  # type: ignore
         rollout_fn=_noop_rollout,
         scenarios=[],
         config={},
@@ -239,7 +239,8 @@ async def test_pipeline_trainer_uses_same_train_kwargs_for_local_backend(
         ),
     )
     backend = LocalBackend(path=str(tmp_path))
-    backend.train = AsyncMock(return_value=SimpleNamespace(step=1, metrics={}))  # type: ignore[method-assign]
+    train = AsyncMock(return_value=SimpleNamespace(step=1, metrics={}))
+    setattr(backend, "train", train)
 
     trainer = _make_trainer(
         model=model,
@@ -253,7 +254,8 @@ async def test_pipeline_trainer_uses_same_train_kwargs_for_local_backend(
 
     await trainer._training_stage()
 
-    assert backend.train.await_args.kwargs == {  # type: ignore[attr-defined]  # ty:ignore[unresolved-attribute]
+    assert train.await_args is not None
+    assert train.await_args.kwargs == {
         "learning_rate": 3e-5,
         "loss_fn": "ppo",
         "loss_fn_config": None,
@@ -286,7 +288,7 @@ async def test_local_backend_train_translates_loss_fn(tmp_path: Path) -> None:
         seen["verbose"] = verbose
         yield {}
 
-    backend._train_model = fake_train_model  # type: ignore[method-assign]  # ty:ignore[invalid-assignment]
+    setattr(backend, "_train_model", fake_train_model)
     backend._get_step = AsyncMock(return_value=1)  # type: ignore[method-assign]
     with patch.object(model, "_get_wandb_run", return_value=None):
         result = await backend.train(
@@ -326,7 +328,7 @@ async def test_local_backend_train_passes_kl_penalty_source(tmp_path: Path) -> N
         seen["verbose"] = verbose
         yield {}
 
-    backend._train_model = fake_train_model  # type: ignore[method-assign]  # ty:ignore[invalid-assignment]
+    setattr(backend, "_train_model", fake_train_model)
     backend._get_step = AsyncMock(return_value=1)  # type: ignore[method-assign]
     with patch.object(model, "_get_wandb_run", return_value=None):
         result = await backend.train(
@@ -367,7 +369,7 @@ async def test_megatron_backend_defaults_kl_reference_to_step_zero(
         seen["dev_config"] = dev_config
         yield {}
 
-    backend._train_model = fake_train_model  # type: ignore[method-assign]  # ty:ignore[invalid-assignment]
+    setattr(backend, "_train_model", fake_train_model)
     backend._get_step = AsyncMock(return_value=1)  # type: ignore[method-assign]
 
     with patch.object(model, "_get_wandb_run", return_value=None):
@@ -409,7 +411,7 @@ async def test_local_backend_train_maps_normalize_advantages_to_scale_rewards(
         seen["dev_config"] = dev_config
         yield {}
 
-    backend._train_model = fake_train_model  # type: ignore[method-assign]  # ty:ignore[invalid-assignment]
+    setattr(backend, "_train_model", fake_train_model)
     backend._get_step = AsyncMock(return_value=1)  # type: ignore[method-assign]
     with patch.object(model, "_get_wandb_run", return_value=None):
         await backend.train(

@@ -34,7 +34,8 @@ class PackedTensors(TypedDict):
     weights: torch.Tensor
     pixel_values: list[torch.Tensor | None]
     image_grid_thw: list[torch.Tensor | None]
-    moe_routing_replay: PackedMoeRoutingReplay | None
+    moe_routing_replay: NotRequired[PackedMoeRoutingReplay | None]
+    original_logprobs: NotRequired[torch.Tensor]
 
 
 class DiskPackedTensors(TypedDict):

@@ -1,6 +1,7 @@
 import json
 from typing import cast
 
+from tinker import EncodedTextChunk, ModelInput
 from tinker_cookbook import renderers
 from tinker_cookbook.tokenizer_utils import Tokenizer
 
@@ -51,10 +52,12 @@ class FakeTokenizer:
         return "".join(self._id_to_text[token] for token in tokens)
 
 
-def _decode_model_input(tokenizer: FakeTokenizer, model_input: object) -> str:
+def _decode_model_input(tokenizer: FakeTokenizer, model_input: ModelInput) -> str:
     tokens: list[int] = []
-    for chunk in model_input.chunks:  # type: ignore[attr-defined]  # ty:ignore[unresolved-attribute]
-        assert hasattr(chunk, "tokens"), f"Unexpected non-text chunk: {chunk!r}"
+    for chunk in model_input.chunks:
+        assert isinstance(chunk, EncodedTextChunk), (
+            f"Unexpected non-text chunk: {chunk!r}"
+        )
         tokens.extend(list(chunk.tokens))
     return tokenizer.decode(tokens)
 

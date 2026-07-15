@@ -138,8 +138,10 @@ def _apply_flash_block_sparse_dq_postprocess_patch() -> None:
             cluster_size=cluster_size,
         )
 
-    bwd_postprocess_convert_art.compile_cache = (  # type: ignore[attr-defined]  # ty:ignore[unresolved-attribute]
-        original_bwd_postprocess_convert.compile_cache
+    setattr(
+        bwd_postprocess_convert_art,
+        "compile_cache",
+        original_bwd_postprocess_convert.compile_cache,
     )
     cute_interface_any._bwd_postprocess_convert = bwd_postprocess_convert_art
     _DQ_POSTPROCESS_PATCH_APPLIED = True

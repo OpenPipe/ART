@@ -658,13 +658,13 @@ def _replicated_hf_to_megatron(
         broadcast_device = _materialization_device()
     if self.tp_rank == 0:
         tensor = hf_weights.to(
-            device=cast(Any, broadcast_device),  # ty: ignore[redundant-cast]
+            device=broadcast_device,
             non_blocking=True,
         )
     else:
         tensor = torch.empty_like(
             hf_weights,
-            device=cast(Any, broadcast_device),  # ty: ignore[redundant-cast]
+            device=broadcast_device,
         )
     return self.broadcast_tensor_to_tp_ranks(tensor, src_rank=0)
 

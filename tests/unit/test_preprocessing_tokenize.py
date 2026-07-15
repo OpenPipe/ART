@@ -181,7 +181,7 @@ def test_tokenize_sft_batch_masks_response_tokens_without_unsloth_import() -> No
     batch = tokenize_sft_batch(
         trajectory_batch=[Trajectory(messages_and_choices=messages, reward=1.0)],
         learning_rate=1e-5,
-        tokenizer=tokenizer,  # type: ignore[arg-type]  # ty:ignore[invalid-argument-type]
+        tokenizer=tokenizer,
         instruction_part="<user>",
         response_part="<assistant>",
     )
@@ -207,7 +207,7 @@ def test_tokenize_sft_batch_all_trains_every_assistant_turn() -> None:
     batch = tokenize_sft_batch(
         trajectory_batch=[Trajectory(messages_and_choices=messages)],
         learning_rate=1e-5,
-        tokenizer=tokenizer,  # type: ignore[arg-type]  # ty:ignore[invalid-argument-type]
+        tokenizer=tokenizer,
         instruction_part="<user>",
         response_part="<assistant>",
         assistant_turns="all",
@@ -231,7 +231,7 @@ def test_tokenize_sft_batch_passes_chat_template_kwargs() -> None:
     tokenize_sft_batch(
         trajectory_batch=[Trajectory(messages_and_choices=messages, reward=1.0)],
         learning_rate=1e-5,
-        tokenizer=tokenizer,  # type: ignore[arg-type]  # ty:ignore[invalid-argument-type]
+        tokenizer=tokenizer,
         instruction_part="<user>",
         response_part="<assistant>",
         chat_template_kwargs={
@@ -269,7 +269,7 @@ def test_tokenize_sft_batch_trains_only_final_assistant_turn() -> None:
     batch = tokenize_sft_batch(
         trajectory_batch=[Trajectory(messages_and_choices=messages)],
         learning_rate=1e-5,
-        tokenizer=tokenizer,  # type: ignore[arg-type]  # ty:ignore[invalid-argument-type]
+        tokenizer=tokenizer,
         instruction_part="<user>",
         response_part="<assistant>",
         assistant_turns="last",
@@ -313,7 +313,7 @@ def test_tokenize_sft_batch_trains_final_tool_call_and_turn_end() -> None:
     batch = tokenize_sft_batch(
         trajectory_batch=[Trajectory(messages_and_choices=messages)],
         learning_rate=1e-5,
-        tokenizer=tokenizer,  # type: ignore[arg-type]  # ty:ignore[invalid-argument-type]
+        tokenizer=tokenizer,
         instruction_part="<user>",
         response_part="<assistant>",
         assistant_turns="last",
@@ -358,7 +358,7 @@ def test_tokenize_sft_batch_preserves_prompt_target_token_boundary() -> None:
     batch = tokenize_sft_batch(
         trajectory_batch=[Trajectory(messages_and_choices=messages)],
         learning_rate=1e-5,
-        tokenizer=tokenizer,  # type: ignore[arg-type]  # ty:ignore[invalid-argument-type]
+        tokenizer=tokenizer,
         instruction_part="<user>",
         response_part="<assistant>",
         assistant_turns="last",
@@ -380,7 +380,7 @@ def test_tokenize_sft_batch_last_requires_final_assistant_message() -> None:
                 Trajectory(messages_and_choices=[{"role": "user", "content": "hello"}])
             ],
             learning_rate=1e-5,
-            tokenizer=tokenizer,  # type: ignore[arg-type]  # ty:ignore[invalid-argument-type]
+            tokenizer=tokenizer,
             instruction_part="<user>",
             response_part="<assistant>",
             assistant_turns="last",
@@ -400,7 +400,7 @@ def test_tokenize_sft_batch_last_rejects_non_prefix_stable_template() -> None:
                 )
             ],
             learning_rate=1e-5,
-            tokenizer=tokenizer,  # type: ignore[arg-type]  # ty:ignore[invalid-argument-type]
+            tokenizer=tokenizer,
             instruction_part="<user>",
             response_part="<assistant>",
             assistant_turns="last",

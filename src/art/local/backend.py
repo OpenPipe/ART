@@ -54,7 +54,7 @@ from .._backend_training import (
     aggregate_rl_training_metrics,
     build_rl_train_configs,
 )
-from ..backend import AnyTrainableModel, Backend
+from ..backend import AnyTrainableModel
 from ..dev.sequence_lengths import max_seq_length_from_model_config
 from ..metrics_taxonomy import (
     TRAIN_GRADIENT_STEPS_KEY,
@@ -197,7 +197,7 @@ def _load_training_tokenizer(base_model: str) -> PreTrainedTokenizerBase:
     )
 
 
-class LocalBackend(Backend):
+class LocalBackend:
     def __init__(
         self,
         *,
@@ -834,7 +834,7 @@ class LocalBackend(Backend):
         save_checkpoint: bool = True,
         # Verbosity
         verbose: bool = False,
-    ) -> LocalTrainResult:  # ty:ignore[invalid-method-override]
+    ) -> LocalTrainResult:
         """Train the model on the given trajectory groups.
 
         This method does NOT automatically log trajectories or metrics. Call
@@ -1076,10 +1076,11 @@ class LocalBackend(Backend):
                 try:
                     # Register the copied checkpoint as a new LoRA adapter
                     # so it's available for inference at the new step
-                    if hasattr(service, "register_lora_for_step"):
-                        await service.register_lora_for_step(  # type: ignore[attr-defined]
-                            next_step, next_checkpoint_dir
-                        )  # ty:ignore[call-non-callable]
+                    register_lora_for_step = getattr(
+                        service, "register_lora_for_step", None
+                    )
+                    if callable(register_lora_for_step):
+                        await register_lora_for_step(next_step, next_checkpoint_dir)
                     logger.info(
                         f"[BACKEND] _train_model SKIP: register_lora_for_step "
                         f"completed for step {next_step}"
@@ -1372,7 +1373,8 @@ class LocalBackend(Backend):
                     f"No checkpoints found for {model.project}/{model.name} in local storage or S3"
                 )
             elif local_latest_step is None:
-                resolved_step = s3_latest_step  # type: ignore[assignment]  # ty:ignore[invalid-assignment]
+                assert s3_latest_step is not None
+                resolved_step = s3_latest_step
                 if verbose:
                     print(f"Using latest checkpoint from S3: step {resolved_step}")
             elif s3_latest_step is None:

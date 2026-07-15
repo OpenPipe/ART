@@ -22,6 +22,7 @@ import weakref
 
 import torch
 import torch.distributed as dist
+from typing_extensions import TypeIs
 
 from art.megatron.prefix_tree_packing import (
     PrefixTreePack,
@@ -2453,7 +2454,7 @@ class TrainerRank:
         )
 
 
-def _validate_top_k(top_k: int, model: "GPTModel") -> None:
+def _validate_top_k(top_k: int, model: object) -> None:
     vocab_size = _padded_vocab_size(model)
     if top_k > vocab_size:
         raise ValueError(f"top_k={top_k} exceeds vocabulary size {vocab_size}")
@@ -2519,7 +2520,7 @@ def _language_model(model: torch.nn.Module) -> "GPTModel":
     raise RuntimeError("expected a Megatron GPT model")
 
 
-def _padded_vocab_size(model: "GPTModel") -> int:
+def _padded_vocab_size(model: object) -> int:
     vocab_size = getattr(getattr(model, "config", None), "padded_vocab_size", None)
     if vocab_size is None:
         vocab_size = getattr(model, "vocab_size", None)
@@ -2874,9 +2875,13 @@ def _materialize(inputs: ForwardInputs) -> ForwardInputs:
     return [_materialize(item) for item in _nested_forward_children(inputs)]
 
 
+def _is_forward_input(inputs: ForwardInputs) -> TypeIs[AnyForwardInput]:
+    return isinstance(inputs, ForwardInput)
+
+
 def _flatten(inputs: ForwardInputs) -> Iterator[AnyForwardInput]:
-    if isinstance(inputs, ForwardInput):
-        yield inputs  # ty: ignore[invalid-yield]
+    if _is_forward_input(inputs):
+        yield inputs
         return
     for item in _nested_forward_children(inputs):
         yield from _flatten(item)

@@ -268,7 +268,7 @@ class Dsv4Handler(DefaultMoeHandler):
                     )
                 return tuple(preproc_output)
 
-            gpt_module._preprocess = preprocess_hook  # type: ignore[attr-defined]  # ty:ignore[invalid-assignment]
+            setattr(gpt_module, "_preprocess", preprocess_hook)
 
     def collect_layer_families(self, provider: Any) -> list[LayerFamilyInstance]:
         ratios: list[int] = list(getattr(provider, "dsv4_compress_ratios", ()) or ())

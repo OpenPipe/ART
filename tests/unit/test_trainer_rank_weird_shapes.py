@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from collections.abc import Callable, Iterable
 from types import SimpleNamespace
+from typing import TYPE_CHECKING
 
 import pytest
 import torch
@@ -23,6 +24,9 @@ from art.trainer_rank import (
     _MemoryProfile,
 )
 
+if TYPE_CHECKING:
+    from art.megatron.train import TrainingRuntime
+
 
 class _FakeGPT(torch.nn.Module):
     def __init__(self, *, hidden_size: int = 8, vocab_size: int = 32) -> None:
@@ -39,13 +43,15 @@ class _FakeGPT(torch.nn.Module):
         return None
 
 
-def _runtime() -> SimpleNamespace:
+def _runtime() -> "TrainingRuntime":
+    # Deliberately lightweight structural fake; importing/constructing the real
+    # Megatron runtime would make these CPU-only unit tests require Megatron.
     return SimpleNamespace(
         model=[_FakeGPT()],
         optimizer=None,
         provider=SimpleNamespace(hidden_size=8, num_layers=4),
         model_support_handler=SimpleNamespace(build_gdn_execution_spec=True),
-    )
+    )  # type: ignore
 
 
 def _tokens(*values: int) -> torch.Tensor:
@@ -208,7 +214,7 @@ def test_shared_trainable_tokens_accumulate_independent_output_gradients() -> No
 
 
 def test_planner_handles_vineppo_nested_shape_and_request_mix() -> None:
-    rank = TrainerRank(_runtime(), shared_prefix_max_depth=3)  # type: ignore[arg-type]  # ty:ignore[invalid-argument-type]
+    rank = TrainerRank(_runtime(), shared_prefix_max_depth=3)
     inputs = _vineppo_like_inputs()
     flat = list(_flatten(inputs))
 
@@ -231,7 +237,7 @@ def test_planner_handles_vineppo_nested_shape_and_request_mix() -> None:
 def test_forward_micro_batches_preserves_nested_vineppo_groups(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    rank = TrainerRank(_runtime(), shared_prefix_max_depth=2)  # type: ignore[arg-type]  # ty:ignore[invalid-argument-type]
+    rank = TrainerRank(_runtime(), shared_prefix_max_depth=2)
     monkeypatch.setattr(rank, "_dp_rank_and_size", lambda: (0, 1))
     monkeypatch.setattr(rank, "_all_ranks_have_memory_profile", lambda **_kwargs: True)
     monkeypatch.setattr(
@@ -264,7 +270,7 @@ def test_forward_micro_batches_preserves_nested_vineppo_groups(
 def test_adaptive_planner_materializes_only_final_large_candidate(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    rank = TrainerRank(_runtime(), shared_prefix_max_depth=3)  # type: ignore[arg-type]  # ty:ignore[invalid-argument-type]
+    rank = TrainerRank(_runtime(), shared_prefix_max_depth=3)
     rank._last_global_micro_batch_size = 32
     monkeypatch.setattr(rank, "_dp_rank_and_size", lambda: (0, 1))
     monkeypatch.setattr(rank, "_all_ranks_have_memory_profile", lambda **_kwargs: True)
@@ -310,7 +316,7 @@ def test_adaptive_planner_materializes_only_final_large_candidate(
 def test_adaptive_planner_globally_falls_back_when_one_rank_cannot_estimate(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    rank = TrainerRank(_runtime())  # type: ignore[arg-type]  # ty:ignore[invalid-argument-type]
+    rank = TrainerRank(_runtime())
     monkeypatch.setattr(rank, "_dp_rank_and_size", lambda: (0, 2))
     monkeypatch.setattr(rank, "_all_ranks_true", lambda _local: False)
     plans = 0
@@ -333,7 +339,7 @@ def test_adaptive_planner_globally_falls_back_when_one_rank_cannot_estimate(
 def test_adaptive_planner_probes_new_heterogeneous_signatures(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    rank = TrainerRank(_runtime())  # type: ignore[arg-type]  # ty:ignore[invalid-argument-type]
+    rank = TrainerRank(_runtime())
     monkeypatch.setattr(rank, "_dp_rank_and_size", lambda: (0, 1))
     monkeypatch.setattr(rank, "_resolve_slot_ref", lambda request: request.checkpoint)
     inputs = [
@@ -363,7 +369,7 @@ def test_adaptive_planner_probes_new_heterogeneous_signatures(
 def test_adaptive_planner_grows_stable_window_to_largest_aligned_fit(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    rank = TrainerRank(_runtime(), shared_prefix_max_depth=1)  # type: ignore[arg-type]  # ty:ignore[invalid-argument-type]
+    rank = TrainerRank(_runtime(), shared_prefix_max_depth=1)
     rank._last_global_micro_batch_size = 512
     monkeypatch.setattr(rank, "_dp_rank_and_size", lambda: (0, 1))
     monkeypatch.setattr(rank, "_all_ranks_have_memory_profile", lambda **_kwargs: True)
@@ -381,7 +387,7 @@ def test_adaptive_planner_grows_stable_window_to_largest_aligned_fit(
 def test_forward_micro_batches_shrinks_when_memory_budget_drops(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    rank = TrainerRank(_runtime(), shared_prefix_max_depth=2)  # type: ignore[arg-type]  # ty:ignore[invalid-argument-type]
+    rank = TrainerRank(_runtime(), shared_prefix_max_depth=2)
     monkeypatch.setattr(rank, "_dp_rank_and_size", lambda: (0, 1))
     monkeypatch.setattr(rank, "_all_ranks_have_memory_profile", lambda **_kwargs: True)
     inputs = [_target_request(_tokens(1, 2, 3, index)) for index in range(14)]
@@ -430,7 +436,7 @@ def test_forward_micro_batches_shrinks_when_memory_budget_drops(
 def test_heterogeneous_slots_split_packing_without_losing_output_estimates(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    rank = TrainerRank(_runtime(), shared_prefix_max_depth=4)  # type: ignore[arg-type]  # ty:ignore[invalid-argument-type]
+    rank = TrainerRank(_runtime(), shared_prefix_max_depth=4)
     monkeypatch.setattr(
         TrainerRank,
         "_slot_ref",
@@ -466,7 +472,7 @@ def test_forward_raises_before_expected_oom_with_actionable_context(
     api: str,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    rank = TrainerRank(_runtime())  # type: ignore[arg-type]  # ty:ignore[invalid-argument-type]
+    rank = TrainerRank(_runtime())
     if api == "dp_rank_forward":
         monkeypatch.setattr(
             rank,
@@ -508,7 +514,7 @@ def test_flatten_rejects_dicts_to_avoid_silent_top_level_shape_changes() -> None
 
 
 def test_no_output_requests_do_not_pack_or_consume_compute_memory() -> None:
-    rank = TrainerRank(_runtime())  # type: ignore[arg-type]  # ty:ignore[invalid-argument-type]
+    rank = TrainerRank(_runtime())
     requests: Iterable[ForwardInput] = [
         ForwardInput(input_tokens=_tokens(1, 2, 3)),
         ForwardInput(input_tokens=_tokens(1, 2, 4)),

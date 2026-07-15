@@ -248,7 +248,7 @@ def test_invalid_rollout_weights_mode():
         ValueError, match="rollout_weights_mode must be either 'lora' or 'merged'"
     ):
         validate_dedicated_config(
-            InternalModelConfig(rollout_weights_mode="bad-mode")  # type: ignore[typeddict-item]  # ty:ignore[invalid-argument-type]
+            InternalModelConfig(rollout_weights_mode="bad-mode")  # type: ignore
         )
 
 

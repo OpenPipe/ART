@@ -1,7 +1,16 @@
-from typing import TYPE_CHECKING, Any, AsyncIterator, Iterable, Protocol, TypeAlias
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    AsyncIterator,
+    Callable,
+    Coroutine,
+    Iterable,
+    Protocol,
+    TypeAlias,
+)
 
 from . import dev
-from .trajectories import Trajectory, TrajectoryGroup
+from .trajectories import Trajectory
 from .types import TrainResult, TrainSFTConfig
 
 if TYPE_CHECKING:
@@ -35,12 +44,11 @@ class Backend(Protocol):
         config: dev.OpenAIServerConfig | None,
     ) -> tuple[str, str]: ...
 
-    async def train(
-        self,
-        model: AnyTrainableModel,
-        trajectory_groups: Iterable[TrajectoryGroup],
-        **kwargs: Any,
-    ) -> TrainResult: ...
+    # Backends intentionally expose backend-specific optional training arguments.
+    # Callable[..., ...] preserves that extensibility without falsely requiring
+    # every implementation to accept every other backend's keyword arguments.
+    @property
+    def train(self) -> Callable[..., Coroutine[Any, Any, TrainResult]]: ...
 
     def _train_sft(
         self,

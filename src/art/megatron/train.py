@@ -919,12 +919,21 @@ def load_adapter_into_model(
     with torch.no_grad():
         for chunk in model_chunks:
             for module in chunk.modules():
-                if hasattr(module, "load_lora"):
-                    module.load_lora(adapter_model)  # type: ignore[attr-defined]  # ty:ignore[call-non-callable]
+                load_lora = getattr(module, "load_lora", None)
+                if callable(load_lora):
+                    load_lora(adapter_model)
 
     if optimizer is None:
         return
     optimizer.reload_model_params()
+
+
+def _zero_grad_buffers(model_chunks: ModelChunks) -> None:
+    for chunk in model_chunks:
+        zero_grad_buffer = getattr(chunk, "zero_grad_buffer", None)
+        if not callable(zero_grad_buffer):
+            raise TypeError(f"{type(chunk).__name__} has no zero_grad_buffer method")
+        zero_grad_buffer()
 
 
 def _optimizer_step(
@@ -1314,8 +1323,7 @@ def run_megatron_sft_step(
         moe_routing_replay_controller,
     )
 
-    for chunk in model_chunks:
-        chunk.zero_grad_buffer()  # type: ignore[call-non-callable]  # ty:ignore[call-non-callable]
+    _zero_grad_buffers(model_chunks)
 
     raw_loss_sum: torch.Tensor | None = None
     loss_inputs_for_count: list[dict[str, torch.Tensor] | PreparedSFTMicroInputs] = []
@@ -1469,8 +1477,7 @@ def run_training_step(
     if cp_lookahead_state is not None and int(topology.cp) <= 1:
         cp_lookahead_state.pending_prepared_micro = None
 
-    for chunk in model_chunks:
-        chunk.zero_grad_buffer()  # type: ignore[call-non-callable]  # ty:ignore[call-non-callable]
+    _zero_grad_buffers(model_chunks)
 
     micro_count = len(micro_inputs)
     raw_loss_sum: torch.Tensor | None = None

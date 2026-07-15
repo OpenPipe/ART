@@ -7,7 +7,7 @@ from itertools import takewhile
 import json
 import math
 import random
-from typing import TYPE_CHECKING, Any, Generator, Literal, cast
+from typing import TYPE_CHECKING, Any, Generator, Literal, Protocol, cast
 
 from openai.types.chat.chat_completion import Choice
 import torch
@@ -27,15 +27,31 @@ from .moe_routing import (
     TokenRoute,
     align_choice_routes_to_tokenized_result,
 )
-from .response_masking import response_only_labels, token_ids_for_template_part
+from .response_masking import (
+    _TemplatePartTokenizer,
+    response_only_labels,
+    token_ids_for_template_part,
+)
 from .vllm_tokens import choice_vllm_token_metadata
 
 ChatTemplateTool = dict[Any, Any] | Callable[..., Any]
 ChatTemplateToolSchemaFormat = Literal["default", "vllm_openai"]
 
 
+class _TokenDecoder(Protocol):
+    def decode(self, token_ids: int, /) -> str | list[str]: ...
+
+
+class _SFTTokenizer(_TemplatePartTokenizer, Protocol):
+    @property
+    def chat_template(self) -> object: ...
+
+    @property
+    def apply_chat_template(self) -> Callable[..., object]: ...
+
+
 def _chat_template_kwargs(
-    tokenizer: PreTrainedTokenizerBase,
+    tokenizer: _SFTTokenizer,
     chat_template_kwargs: dict[str, Any] | None,
 ) -> dict[str, Any]:
     return merge_chat_template_kwargs(
@@ -93,7 +109,7 @@ def _normalize_tools_for_chat_template(
 
 
 def _normalize_tool_call_arguments_for_chat_template(
-    tokenizer: PreTrainedTokenizerBase,
+    tokenizer: _SFTTokenizer,
     messages: list[dict[str, Any]],
 ) -> list[dict[str, Any]]:
     chat_template = tokenizer.chat_template
@@ -127,7 +143,7 @@ def _normalize_tool_call_arguments_for_chat_template(
 
 
 def _messages_for_chat_template(
-    tokenizer: PreTrainedTokenizerBase,
+    tokenizer: _SFTTokenizer,
     messages_and_choices: MessagesAndChoices,
     *,
     final_trainable_choice_index: int | None = None,
@@ -159,7 +175,7 @@ class TokenizedResult:
     trajectory: Trajectory
     choice_offsets: list[int]
     extra_logprobs: dict[str, list[float]]
-    _tokenizer: "PreTrainedTokenizerBase" = field(repr=False, compare=False)
+    _tokenizer: _TokenDecoder = field(repr=False, compare=False)
     moe_routed_experts: list[TokenRoute | None] | None = None
     moe_routing_alignment_stats: MoeRoutingAlignmentStats | None = None
     weight: float = 0.0
@@ -168,9 +184,13 @@ class TokenizedResult:
 
     @cached_property
     def tokens(self) -> list[str]:
-        return [
-            cast(str, self._tokenizer.decode(token_id)) for token_id in self.token_ids
-        ]
+        tokens: list[str] = []
+        for token_id in self.token_ids:
+            token = self._tokenizer.decode(token_id)
+            if not isinstance(token, str):
+                raise TypeError("decoding one token must return one string")
+            tokens.append(token)
+        return tokens
 
     def without_prompt(self) -> "TokenizedResult":
         return TokenizedResult(
@@ -230,7 +250,7 @@ def _validate_max_seq_length(max_seq_length: int | None) -> None:
 
 
 def _apply_chat_template_token_ids(
-    tokenizer: PreTrainedTokenizerBase,
+    tokenizer: _SFTTokenizer,
     messages: list[dict[str, Any]],
     **kwargs: Any,
 ) -> list[int]:
@@ -247,7 +267,7 @@ def _apply_chat_template_token_ids(
 
 
 def _apply_chat_template_text(
-    tokenizer: PreTrainedTokenizerBase,
+    tokenizer: _SFTTokenizer,
     messages: list[dict[str, Any]],
     **kwargs: Any,
 ) -> str:
@@ -262,7 +282,7 @@ def _apply_chat_template_text(
 
 
 def _last_assistant_input_ids_and_labels(
-    tokenizer: PreTrainedTokenizerBase,
+    tokenizer: _SFTTokenizer,
     messages: list[dict[str, Any]],
     tools: list[ChatTemplateTool] | None,
     template_kwargs: dict[str, Any],
@@ -592,7 +612,7 @@ def tokenize_trajectory(
 def tokenize_sft_batch(
     trajectory_batch: list[Trajectory],
     learning_rate: float,
-    tokenizer: PreTrainedTokenizerBase,
+    tokenizer: _SFTTokenizer,
     instruction_part: str,
     response_part: str,
     chat_template_kwargs: dict[str, Any] | None = None,

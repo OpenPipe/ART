@@ -830,7 +830,7 @@ async def run_unsloth_rl_training(
     for offset in range(0, packed_tensors["tokens"].shape[0]):
         for _ in range(2 if warmup else 1):
             if precalculate_logprobs and not warmup:
-                packed_tensors["original_logprobs"] = packed_tensors["logprobs"]  # type: ignore[index]  # ty:ignore[invalid-key]
+                packed_tensors["original_logprobs"] = packed_tensors["logprobs"]
                 packed_tensors["logprobs"] = _precalculate_new_logprobs(
                     ctx,
                     packed_tensors,

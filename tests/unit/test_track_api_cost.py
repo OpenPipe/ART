@@ -712,10 +712,17 @@ class TestTrackApiCostIntegration:
                 )
             ]
 
+        async def rollout_fn(
+            _model: TrainableModel,
+            _scenario: dict,
+            _config: dict,
+        ) -> TrajectoryGroup:
+            return TrajectoryGroup([])
+
         trainer = PipelineTrainer(
             model=model,
             backend=backend,
-            rollout_fn=lambda *_args, **_kwargs: asyncio.sleep(0),  # ty: ignore[invalid-argument-type]
+            rollout_fn=rollout_fn,
             scenarios=[],
             config={},
             num_rollout_workers=1,

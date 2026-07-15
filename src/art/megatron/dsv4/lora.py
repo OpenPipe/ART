@@ -619,7 +619,7 @@ def _install_dsv4_triton_static_config(autotuner: Any) -> None:
             cache[key] = _dsv4_te_permutation_config(int(key[0]))
         return original_run(*args, **kwargs)
 
-    static_config_run._art_dsv4_static_config_wrapped = True  # type: ignore[attr-defined]  # ty:ignore[unresolved-attribute]
+    setattr(static_config_run, "_art_dsv4_static_config_wrapped", True)
     autotuner.run = static_config_run
     autotuner._art_dsv4_static_config_wrapped = True
 

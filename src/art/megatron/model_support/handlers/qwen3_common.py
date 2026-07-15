@@ -140,4 +140,4 @@ def install_qwen3_text_preprocess_patch(model_chunks: Sequence[Any]) -> None:
             )
             return tuple(preproc_output)
 
-        gpt_module._preprocess = preprocess_hook  # type: ignore[attr-defined]  # ty:ignore[invalid-assignment]
+        setattr(gpt_module, "_preprocess", preprocess_hook)

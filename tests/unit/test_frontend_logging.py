@@ -1264,7 +1264,7 @@ class TestGradientStepMetrics:
                     TRAIN_GRADIENT_STEPS_KEY: 2.0,
                 }
 
-        backend._train_model = mock_train_model  # type: ignore[method-assign]  # ty:ignore[invalid-assignment]
+        setattr(backend, "_train_model", mock_train_model)
         backend._get_step = AsyncMock(return_value=1)  # type: ignore[method-assign]
 
         groups = [
