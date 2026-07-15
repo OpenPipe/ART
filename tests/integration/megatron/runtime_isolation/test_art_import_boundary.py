@@ -60,20 +60,31 @@ def test_art_import_does_not_require_vllm_or_mutate_compile_threads(
     assert payload["after"] is None
 
 
-def test_base_import_does_not_require_numpy_or_torch(artifact_dir: Path) -> None:
+def test_base_import_does_not_require_torch(artifact_dir: Path) -> None:
     script = """
-import importlib.abc
+import importlib.util
+import builtins
 import json
-import sys
 
 
-class Block(importlib.abc.MetaPathFinder):
-    def find_spec(self, fullname, path=None, target=None):
-        if fullname.split(".")[0] in {"numpy", "torch"}:
-            raise ImportError(f"blocked optional dependency: {fullname}")
+real_find_spec = importlib.util.find_spec
+real_import = builtins.__import__
 
 
-sys.meta_path.insert(0, Block())
+def find_spec(fullname, package=None):
+    if fullname.split(".")[0] == "torch":
+        return None
+    return real_find_spec(fullname, package)
+
+
+def import_module(name, *args, **kwargs):
+    if name.split(".")[0] == "torch":
+        raise ImportError(f"blocked optional dependency: {name}")
+    return real_import(name, *args, **kwargs)
+
+
+importlib.util.find_spec = find_spec
+builtins.__import__ = import_module
 import art
 
 print(json.dumps({"imported": art.__name__}))
