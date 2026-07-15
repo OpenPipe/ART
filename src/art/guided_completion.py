@@ -36,7 +36,7 @@ def get_guided_completion_params(
     completion: ChatCompletion,
     base_tools: Iterable[ChatCompletionToolParam] | None = None,
 ) -> Tuple[
-    List[str] | None,
+    List[str | None] | None,
     ChatCompletionToolChoiceOptionParam | None,
     List[ChatCompletionToolParam] | None,
 ]:
@@ -50,7 +50,7 @@ def get_guided_completion_params(
 
     Returns a tuple of (guided_choice, tool_choice, tool_params).
     """
-    guided_choice: List[str] | None = None
+    guided_choice: List[str | None] | None = None
     tool_choice: ChatCompletionToolChoiceOptionParam | None = None
     tool_params: List[ChatCompletionToolParam] | None = None
 
@@ -77,7 +77,5 @@ def get_guided_completion_params(
         ]
     else:
         content = completion.choices[0].message.content
-        if content is None:
-            raise ValueError("Completion has no text or tool call")
         guided_choice = [content]
     return (guided_choice, tool_choice, tool_params)

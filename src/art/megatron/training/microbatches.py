@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Sequence
-from typing import Any
+from typing import Any, cast
 
 from megatron.core import parallel_state as ps
 from pydantic import BaseModel, ConfigDict
@@ -60,18 +60,13 @@ def _map_packed_tensors(
     inputs: PackedTensors,
     transform: Callable[[torch.Tensor], torch.Tensor],
 ) -> PackedTensors:
-    mapped = inputs.copy()
-    mapped["tokens"] = transform(inputs["tokens"])
-    mapped["group_ids"] = transform(inputs["group_ids"])
-    mapped["parent_ids"] = transform(inputs["parent_ids"])
-    mapped["input_pos"] = transform(inputs["input_pos"])
-    mapped["assistant_mask"] = transform(inputs["assistant_mask"])
-    mapped["logprobs"] = transform(inputs["logprobs"])
-    mapped["advantages"] = transform(inputs["advantages"])
-    mapped["weights"] = transform(inputs["weights"])
-    if "original_logprobs" in inputs:
-        mapped["original_logprobs"] = transform(inputs["original_logprobs"])
-    return mapped
+    return cast(
+        PackedTensors,
+        {
+            key: transform(value) if isinstance(value, torch.Tensor) else value
+            for key, value in inputs.items()
+        },
+    )
 
 
 @torch.no_grad()
