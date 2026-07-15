@@ -4765,10 +4765,12 @@ dependencies = [
     { name = "nest-asyncio" },
     { name = "openai" },
     { name = "polars" },
+    { name = "pydantic" },
     { name = "requests" },
     { name = "setproctitle" },
     { name = "tblib" },
     { name = "typer" },
+    { name = "typing-extensions" },
     { name = "weave" },
 ]
 
@@ -4909,6 +4911,7 @@ requires-dist = [
     { name = "pyarrow", marker = "extra == 'backend'", specifier = ">=15.0.0" },
     { name = "pyarrow", marker = "extra == 'tinker'", specifier = ">=15.0.0" },
     { name = "pybind11", marker = "extra == 'megatron'", specifier = ">=2.13.6" },
+    { name = "pydantic", specifier = ">=2.12" },
     { name = "pydantic", marker = "extra == 'tinker'", specifier = ">=2.12.5" },
     { name = "pytest", marker = "extra == 'backend'", specifier = ">=8.4.1" },
     { name = "quack-kernels", marker = "extra == 'megatron'", specifier = "==0.3.7" },
@@ -4935,6 +4938,7 @@ requires-dist = [
     { name = "transformers", marker = "extra == 'tinker'", specifier = ">=5.2.0,<=5.5.3" },
     { name = "trl", marker = "extra == 'backend'", specifier = "==0.20.0" },
     { name = "typer", specifier = ">=0.15.2" },
+    { name = "typing-extensions", specifier = ">=4.13" },
     { name = "unsloth", marker = "extra == 'backend'", specifier = "==2026.3.3" },
     { name = "unsloth-zoo", marker = "extra == 'backend'", specifier = "==2026.3.1" },
     { name = "uvicorn", marker = "extra == 'tinker'", specifier = ">=0.35.0" },
