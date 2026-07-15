@@ -809,10 +809,29 @@ def _record_worker_lora_policy(lora_request: Any) -> dict[str, Any]:
     state = {
         "policy_version": int(policy_version or 0),
         "lora_slot": str(lora_request.lora_name),
+        "lora_path": str(lora_request.lora_path),
         "update_seq": _WORKER_LORA_UPDATE_SEQ,
     }
     _WORKER_LORA_POLICY_BY_ID[int(lora_request.lora_int_id)] = state
     return state
+
+
+def get_worker_lora_states(lora_ids: set[int]) -> tuple[dict[str, Any], ...]:
+    states = []
+    for lora_id in sorted(lora_ids):
+        state = _WORKER_LORA_POLICY_BY_ID.get(lora_id)
+        if state is None:
+            raise RuntimeError(f"loaded LoRA {lora_id} has no ART worker state")
+        states.append(
+            {
+                "lora_id": lora_id,
+                "lora_name": state["lora_slot"],
+                "lora_path": state["lora_path"],
+                "policy_version": state["policy_version"],
+                "update_seq": state["update_seq"],
+            }
+        )
+    return tuple(states)
 
 
 def _policy_version_from_lora_request(lora_request: Any) -> int | None:
