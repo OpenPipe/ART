@@ -442,6 +442,9 @@ class DistributedMegatronService:
             )
             if len(set(capabilities)) != 1:
                 raise RuntimeError("vLLM replicas expose different ART capabilities")
+            capabilities[0].require(
+                "exact_lora_worker_state", operation="distributed LoRA publication"
+            )
             digest = await asyncio.to_thread(_checkpoint_digest, lora_path)
             update_identity = uuid.uuid4().hex
             states = {

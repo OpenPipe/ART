@@ -9,6 +9,7 @@ ServingFeature = Literal[
     "inplace_lora_load",
     "in_flight_lora_updates",
     "policy_token_spans",
+    "exact_lora_worker_state",
 ]
 
 
@@ -22,6 +23,7 @@ class ServingCapabilities(BaseModel):
     inplace_lora_load: bool = False
     in_flight_lora_updates: bool = False
     policy_token_spans: bool = False
+    exact_lora_worker_state: bool = False
 
     @classmethod
     def openai_compatible(cls) -> "ServingCapabilities":

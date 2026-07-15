@@ -170,6 +170,7 @@ def _patch_art_runtime_routes() -> None:
                     "inplace_lora_load": True,
                     "in_flight_lora_updates": True,
                     "policy_token_spans": True,
+                    "exact_lora_worker_state": True,
                 }
             )
 
