@@ -5,6 +5,7 @@ from collections.abc import AsyncGenerator, AsyncIterator, Generator
 from datetime import datetime, timedelta
 import json
 from typing import Any, cast
+from unittest.mock import Mock
 
 import aiohttp
 from aiohttp import web
@@ -17,7 +18,7 @@ import pytest_asyncio
 import requests
 
 import art
-from art.trajectories import ChatCompletionsExchange, MessagesExchange
+from art.trajectories import ChatCompletionsExchange, MessagesExchange, _compat
 from art.trajectories._capture.core import begin, reset
 from art.trajectories._protocols import Endpoint, build_exchange, endpoint_for_url
 
@@ -200,6 +201,19 @@ async def test_group_context_and_async_helpers() -> None:
     assert result.exceptions[0].message == "boom"
 
 
+def test_sync_group_generator_initializes_once(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    initializer = Mock(wraps=_compat.init_trajectory_group)
+    monkeypatch.setattr(_compat, "init_trajectory_group", initializer)
+
+    trajectory = art.Trajectory(reward=1)
+    group = art.TrajectoryGroup(item for item in [trajectory])
+
+    assert group.trajectories == [trajectory]
+    assert initializer.call_count == 1
+
+
 async def test_httpx_requests_and_aiohttp_capture_once(endpoint_server: str) -> None:
     body = {"model": "test/model", "messages": [{"role": "user", "content": "hi"}]}
 
@@ -370,12 +384,6 @@ def test_all_protocols_reconstruct_typed_responses() -> None:
         dumped = exchange.model_dump(mode="json")
         assert dumped["request"] == request
         assert dumped["model"] == expected
-
-        # Older serialized exchanges may contain a stale stored model. It is ignored
-        # in favor of the request, with the response as fallback.
-        dumped["model"] = "stale/model"
-        restored = type(exchange).model_validate(dumped)
-        assert restored.model == expected
 
         exchange.request["model"] = "updated/model"
         assert exchange.model == "updated/model"

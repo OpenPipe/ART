@@ -334,15 +334,9 @@ class TrajectoryGroup(_CompactModel):
     ) -> None:
         from ._compat import init_trajectory_group
 
-        items = list(trajectories)
-        sync_items = [
-            item for item in items if isinstance(item, (Trajectory, BaseException))
-        ]
-        if len(sync_items) != len(items):
-            raise TypeError("TrajectoryGroup cannot initialize from awaitables")
         init_trajectory_group(
             self,
-            sync_items,
+            trajectories,
             exceptions=exceptions,
             metadata=metadata,
             metrics=metrics,

@@ -13,6 +13,8 @@ import pydantic
 from ..types import Message, Messages, MessagesAndChoices
 from . import MetadataValue, PydanticException, Trajectory, TrajectoryGroup
 
+_PREPARED_TRAJECTORIES = "_art_prepared_trajectories"
+
 
 def exception_model(
     exception: BaseException | PydanticException,
@@ -112,26 +114,23 @@ def new_trajectory_group(
     if len(sync_items) != len(items):
         raise TypeError("TrajectoryGroup items must be trajectories or exceptions")
     group = object.__new__(cls)
-    group.__init__(
-        sync_items,
-        exceptions=exceptions,
-        metadata=metadata,
-        metrics=metrics,
-        logs=logs,
-    )
+    object.__setattr__(group, _PREPARED_TRAJECTORIES, sync_items)
     return group
 
 
 def init_trajectory_group(
     group: TrajectoryGroup,
-    trajectories: Iterable[Trajectory | BaseException],
+    trajectories: Iterable[Trajectory | BaseException | Awaitable[Trajectory]],
     *,
     exceptions: Iterable[BaseException | PydanticException],
     metadata: dict[str, MetadataValue] | None,
     metrics: dict[str, float | int | bool] | None,
     logs: list[str] | None,
 ) -> None:
-    items = list(trajectories)
+    prepared = group.__dict__.pop(_PREPARED_TRAJECTORIES, None)
+    items = prepared if isinstance(prepared, list) else list(trajectories)
+    if not all(isinstance(item, (Trajectory, BaseException)) for item in items):
+        raise TypeError("TrajectoryGroup cannot initialize from awaitables")
     normalized_trajectories = [
         item if isinstance(item, Trajectory) else Trajectory.model_validate(item)
         for item in items
