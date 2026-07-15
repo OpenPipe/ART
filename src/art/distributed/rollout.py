@@ -2,10 +2,12 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Awaitable, Callable, Mapping, Sequence
+from functools import lru_cache
 import hashlib
 import importlib
 import inspect
 import json
+from pathlib import Path
 from typing import Any, Protocol
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
@@ -21,12 +23,17 @@ class InstalledAsyncCallable(BaseModel):
 
     module: str = Field(min_length=1)
     qualname: str = Field(min_length=1)
+    source_sha256: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
 
     @model_validator(mode="after")
     def _validate_import_path(self) -> "InstalledAsyncCallable":
         if self.qualname == "<lambda>" or "<locals>" in self.qualname.split("."):
             raise ValueError(
                 "distributed rollout callable must be a top-level function"
+            )
+        if self.source_sha256 is None:
+            object.__setattr__(
+                self, "source_sha256", _callable_source_sha256(self._resolve())
             )
         return self
 
@@ -50,12 +57,43 @@ class InstalledAsyncCallable(BaseModel):
         return reference
 
     def resolve(self) -> Callable[..., Awaitable[Any]]:
+        assert self.source_sha256 is not None
+        return _verified_callable(self.module, self.qualname, self.source_sha256)
+
+    def _resolve(self) -> Callable[..., Awaitable[Any]]:
         value: Any = importlib.import_module(self.module)
         for component in self.qualname.split("."):
             value = getattr(value, component)
         if not inspect.iscoroutinefunction(value):
             raise TypeError(f"{self.module}:{self.qualname} is not an async function")
         return value
+
+
+@lru_cache(maxsize=128)
+def _verified_callable(
+    module: str, qualname: str, source_sha256: str
+) -> Callable[..., Awaitable[Any]]:
+    value: Any = importlib.import_module(module)
+    for component in qualname.split("."):
+        value = getattr(value, component)
+    if not inspect.iscoroutinefunction(value):
+        raise TypeError(f"{module}:{qualname} is not an async function")
+    if _callable_source_sha256(value) != source_sha256:
+        raise RuntimeError(f"installed callable source differs for {module}:{qualname}")
+    return value
+
+
+def _callable_source_sha256(function: Callable[..., Awaitable[Any]]) -> str:
+    source = inspect.getsourcefile(function)
+    if source is None:
+        raise ValueError("distributed callable must come from a source-backed module")
+    try:
+        payload = Path(source).read_bytes()
+    except OSError as error:
+        raise RuntimeError(
+            f"cannot read distributed callable source {source}: {error}"
+        ) from None
+    return hashlib.sha256(payload).hexdigest()
 
 
 class RolloutModelSpec(BaseModel):
