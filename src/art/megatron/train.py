@@ -53,15 +53,13 @@ from art.megatron.model_support.lora_disk import (
     load_lora_tensors_for_megatron,
 )
 from art.megatron.optimizer_state import (
-    OptimizerShard,
-    build_optimizer_manifest,
-    commit_optimizer_generation,
-    hash_optimizer_shard,
-    new_optimizer_generation,
-    optimizer_pending_generation_path,
-    optimizer_shard_path,
+    ALLOW_UNPAIRED_MEGATRON_RESUME_ENV,
+    OptimizerAdapter,
+    await_adapter_publication_group,
+    load_optimizer_state,
+    optimizer_group_decision,
     read_committed_optimizer_step,
-    resolve_optimizer_shard,
+    save_optimizer_state,
 )
 from art.megatron.provider import (
     ProviderBundle,
@@ -575,10 +573,8 @@ def run_megatron_rl_job(
         job,
         packed_tensors,
         progress_sink=progress,
-        adapter_ready_sink=(
-            None
-            if isinstance(job, MegatronMergedTrainingJob)
-            else lambda: _write_job_event(job.log_path, LORA_READY_EVENT, step=job.step)
+        adapter_ready_sink=lambda: _write_job_event(
+            job.log_path, LORA_READY_EVENT, step=job.step
         ),
         replay_bundle=replay_bundle,
     )
@@ -751,7 +747,7 @@ def execute_megatron_rl_job(
 
             raise TrainingCancelledError("train job was cancelled")
 
-        _save_lora_and_optimizer(
+        published_adapter = _save_lora_and_optimizer(
             runtime,
             adapter_dtypes=adapter_dtypes,
             lora_path=job.lora_path,
@@ -765,7 +761,7 @@ def execute_megatron_rl_job(
             _sync_merged_weights_to_vllm(
                 runtime,
                 job.merged_weight_transfer,
-                lora_path=job.lora_path,
+                lora_path=published_adapter.identity,
                 pause_generation=True,
             )
         if torch.distributed.is_initialized():  # ty:ignore[possibly-missing-attribute]
@@ -809,10 +805,16 @@ def run_megatron_sft_job(
 
     try:
         configure_moe_routing_replay(runtime)
+        adapter_step = int(Path(job.lora_path).name)
+        if adapter_step <= 0:
+            raise RuntimeError(
+                f"Invalid managed SFT adapter staging path: {job.lora_path}"
+            )
         adapter_dtypes = _load_lora_and_optimizer(
             runtime,
             lora_path=job.lora_path,
             optimizer_state_path=job.optimizer_state_path,
+            adapter_step=adapter_step - 1,
         )
 
         assert runtime.optimizer is not None
@@ -907,16 +909,13 @@ def run_megatron_sft_job(
                 and completed_batches < job.num_batches
                 and completed_batches % checkpoint_interval == 0
             ):
-                _save_lora_and_optimizer(
+                # Intermediate SFT files remain staging-only and must never advance
+                # the durable optimizer pointer without a canonical adapter.
+                _save_staged_lora(
                     runtime,
                     adapter_dtypes=adapter_dtypes,
                     lora_path=job.lora_path,
-                    optimizer_state_path=job.optimizer_state_path,
-                    step=completed_batches,
-                    optimizer_save_interval=1,
-                    final_training_step=job.num_batches,
                 )
-                torch.distributed.barrier()  # type: ignore[possibly-missing-attribute]
 
             if runtime.rank == 0:
                 with open(job.log_path, "a+", encoding="utf-8") as log_file:
@@ -940,9 +939,12 @@ def run_megatron_sft_job(
             adapter_dtypes=adapter_dtypes,
             lora_path=job.lora_path,
             optimizer_state_path=job.optimizer_state_path,
-            step=job.num_batches,
+            step=adapter_step,
             optimizer_save_interval=1,
-            final_training_step=job.num_batches,
+            final_training_step=adapter_step,
+            adapter_ready=lambda: _write_job_event(
+                job.log_path, LORA_READY_EVENT, step=adapter_step
+            ),
         )
     finally:
         if adapter_dtypes is not None:
@@ -1018,6 +1020,7 @@ def _load_lora_and_optimizer(
     *,
     lora_path: str,
     optimizer_state_path: str,
+    adapter_step: int,
 ) -> dict[str, torch.dtype]:
     persistent_optimizer = runtime.optimizer if runtime.optimizer_persistent else None
     adapter_model = _load_adapter_into_model(
@@ -1035,7 +1038,13 @@ def _load_lora_and_optimizer(
         runtime.optimizer_config,
     )
     assert runtime.optimizer is not None
-    _load_optimizer(runtime, optimizer_state_path=optimizer_state_path)
+    _load_optimizer(
+        runtime,
+        optimizer_state_path=optimizer_state_path,
+        adapter_path=lora_path,
+        adapter_step=adapter_step,
+        allow_missing=True,
+    )
     return {key: tensor.dtype for key, tensor in adapter_model.items()}
 
 
@@ -1072,7 +1081,17 @@ def _prepare_rl_training_state(
         runtime.optimizer = _build_optimizer(runtime.model, runtime.optimizer_config)
     assert runtime.optimizer is not None
 
-    _load_optimizer(runtime, optimizer_state_path=job.optimizer_state_path)
+    _load_optimizer(
+        runtime,
+        optimizer_state_path=job.optimizer_state_path,
+        adapter_path=job.lora_path,
+        adapter_step=job.source_policy_step,
+        allow_missing=(
+            job.source_policy_step == 0
+            or os.environ.get(ALLOW_UNPAIRED_MEGATRON_RESUME_ENV, "").lower()
+            in {"1", "true", "yes"}
+        ),
+    )
 
     runtime.adapter_export_dtypes = {
         key: tensor.dtype for key, tensor in adapter_model.items()
@@ -1083,24 +1102,32 @@ def _prepare_rl_training_state(
     return runtime.adapter_export_dtypes
 
 
-def _load_optimizer(runtime: TrainingRuntime, *, optimizer_state_path: str) -> None:
+def _load_optimizer(
+    runtime: TrainingRuntime,
+    *,
+    optimizer_state_path: str,
+    adapter_path: str,
+    adapter_step: int,
+    allow_missing: bool,
+) -> None:
     assert runtime.optimizer is not None
-    shard_path = resolve_optimizer_shard(
-        optimizer_state_path,
-        rank=runtime.rank,
-        world_size=runtime.world_size,
+    shard_path = load_optimizer_state(
+        runtime,
+        optimizer_state_path=optimizer_state_path,
+        adapter_path=adapter_path,
+        adapter_step=adapter_step,
+        allow_missing=allow_missing,
+        initialize=_eager_initialize_optimizer_state,
     )
     if shard_path is None:
         print0(
             runtime.rank,
             "No committed optimizer state found at",
             optimizer_state_path,
-            "- resetting optimizer for new run",
+            "- resetting optimizer for a new lineage",
         )
-        _eager_initialize_optimizer_state(runtime.optimizer)
         return
     print0(runtime.rank, "Loading optimizer state from", shard_path)
-    runtime.optimizer.load_state_dict(torch.load(shard_path))
 
 
 def _load_adapter_into_model(
@@ -1131,10 +1158,46 @@ def _save_lora_and_optimizer(
     step: int,
     optimizer_save_interval: int,
     final_training_step: int | None = None,
-    lora_ready_log_path: str | None = None,
     adapter_ready: Callable[[], None] | None = None,
-) -> None:
+) -> OptimizerAdapter:
     assert runtime.optimizer is not None
+    _save_staged_lora(
+        runtime,
+        adapter_dtypes=adapter_dtypes,
+        lora_path=lora_path,
+    )
+
+    if adapter_ready is None:
+        raise RuntimeError("Optimizer durability requires an adapter publisher")
+    adapter = await_adapter_publication_group(
+        runtime,
+        lora_path,
+        step=step,
+        ready=adapter_ready,
+    )
+    if _should_save_optimizer_group(
+        runtime,
+        step=step,
+        optimizer_state_path=optimizer_state_path,
+        optimizer_save_interval=optimizer_save_interval,
+        final_training_step=final_training_step,
+    ):
+        save_optimizer_state(
+            runtime,
+            optimizer_state_path=optimizer_state_path,
+            step=step,
+            adapter=adapter,
+        )
+
+    return adapter
+
+
+def _save_staged_lora(
+    runtime: TrainingRuntime,
+    *,
+    adapter_dtypes: dict[str, torch.dtype],
+    lora_path: str,
+) -> None:
     save_vllm_lora_from_model(
         model=runtime.model,
         adapter_dtypes=adapter_dtypes,
@@ -1146,22 +1209,6 @@ def _save_lora_and_optimizer(
     )
     if torch.distributed.is_initialized():  # ty:ignore[possibly-missing-attribute]
         torch.distributed.barrier()  # ty:ignore[possibly-missing-attribute]
-    if lora_ready_log_path is not None and runtime.rank == 0:
-        _write_job_event(lora_ready_log_path, LORA_READY_EVENT, step=step)
-    if adapter_ready is not None and runtime.rank == 0:
-        adapter_ready()
-    if _should_save_optimizer(
-        runtime,
-        step=step,
-        optimizer_state_path=optimizer_state_path,
-        optimizer_save_interval=optimizer_save_interval,
-        final_training_step=final_training_step,
-    ):
-        _save_optimizer(
-            runtime,
-            optimizer_state_path=optimizer_state_path,
-            step=step,
-        )
 
 
 def _validate_train_step_result_finite(
@@ -1199,6 +1246,29 @@ def _should_save_optimizer(
     if final_training_step is not None and step >= final_training_step:
         return True
     return step <= 1 or step % optimizer_save_interval == 0 or committed_step is None
+
+
+def _should_save_optimizer_group(
+    runtime: TrainingRuntime,
+    *,
+    step: int,
+    optimizer_state_path: str,
+    optimizer_save_interval: int,
+    final_training_step: int | None,
+) -> bool:
+    return bool(
+        optimizer_group_decision(
+            runtime,
+            lambda: _should_save_optimizer(
+                runtime,
+                step=step,
+                optimizer_state_path=optimizer_state_path,
+                optimizer_save_interval=optimizer_save_interval,
+                final_training_step=final_training_step,
+            ),
+            operation="optimizer save selection",
+        )
+    )
 
 
 def _write_job_event(log_path: str, event: str, **payload: int | float | str) -> None:
@@ -1241,113 +1311,6 @@ def _write_job_metrics(log_path: str, metrics: dict[str, float]) -> None:
 def _global_packed_train_tokens(micro_inputs: list[PackedTensors]) -> int:
     local_tokens = sum(int(micro["tokens"].numel()) for micro in micro_inputs)
     return local_tokens * ps.get_data_parallel_world_size(with_context_parallel=False)
-
-
-def _write_optimizer_shard(
-    runtime: TrainingRuntime, generation_path: Path
-) -> OptimizerShard:
-    assert runtime.optimizer is not None
-    shard_path = optimizer_shard_path(
-        generation_path,
-        rank=runtime.rank,
-        world_size=runtime.world_size,
-    )
-    temporary = shard_path.with_name(f".{shard_path.name}.{os.getpid()}.tmp")
-    generation_path.mkdir(parents=True, exist_ok=True)
-    print("Saving optimizer shard to", shard_path)
-    try:
-        with temporary.open("wb") as output:
-            torch.save(runtime.optimizer.state_dict(), output)
-            output.flush()
-            os.fsync(output.fileno())
-        os.replace(temporary, shard_path)
-    finally:
-        temporary.unlink(missing_ok=True)
-    return OptimizerShard(
-        rank=runtime.rank,
-        name=shard_path.name,
-        size_bytes=shard_path.stat().st_size,
-        sha256=hash_optimizer_shard(shard_path),
-    )
-
-
-def _save_optimizer(
-    runtime: TrainingRuntime, *, optimizer_state_path: str, step: int
-) -> None:
-    distributed = torch.distributed.is_initialized()  # ty:ignore[possibly-missing-attribute]
-    if distributed:
-        actual_world_size = torch.distributed.get_world_size()  # ty:ignore[possibly-missing-attribute]
-        if actual_world_size != runtime.world_size:
-            raise RuntimeError(
-                "Optimizer save world-size mismatch: "
-                f"runtime={runtime.world_size}, process_group={actual_world_size}"
-            )
-    elif (runtime.rank, runtime.world_size) != (0, 1):
-        raise RuntimeError(
-            "Multi-rank optimizer save requires an initialized process group: "
-            f"rank={runtime.rank}, world_size={runtime.world_size}"
-        )
-    generation_box = [new_optimizer_generation(step) if runtime.rank == 0 else None]
-    if distributed:
-        torch.distributed.broadcast_object_list(  # ty:ignore[possibly-missing-attribute]
-            generation_box, src=0
-        )
-    generation = generation_box[0]
-    if generation is None:
-        raise RuntimeError("Optimizer generation broadcast returned no generation")
-    generation_path = optimizer_pending_generation_path(
-        optimizer_state_path, generation
-    )
-    try:
-        shard = _write_optimizer_shard(runtime, generation_path)
-        local_result: dict[str, Any] = {"shard": shard.model_dump(mode="json")}
-    except Exception as exc:
-        local_result = {
-            "rank": runtime.rank,
-            "error": f"{type(exc).__name__}: {exc}",
-        }
-
-    gathered: list[dict[str, Any] | None] = [None] * runtime.world_size
-    if distributed:
-        torch.distributed.all_gather_object(  # ty:ignore[possibly-missing-attribute]
-            gathered, local_result
-        )
-    else:
-        gathered = [local_result]
-    errors = [
-        f"rank {rank}: missing shard metadata"
-        if result is None
-        else str(result["error"])
-        for rank, result in enumerate(gathered)
-        if result is None or "error" in result
-    ]
-    if errors:
-        raise RuntimeError(f"Optimizer shard save failed: {errors}")
-
-    publication_error: list[str | None] = [None]
-    if runtime.rank == 0:
-        try:
-            manifest = build_optimizer_manifest(
-                generation=generation,
-                step=step,
-                world_size=runtime.world_size,
-                shards=[
-                    OptimizerShard.model_validate(result["shard"])
-                    for result in gathered
-                    if result is not None
-                ],
-            )
-            commit_optimizer_generation(optimizer_state_path, manifest)
-        except Exception as exc:
-            publication_error[0] = f"{type(exc).__name__}: {exc}"
-    if distributed:
-        torch.distributed.broadcast_object_list(  # ty:ignore[possibly-missing-attribute]
-            publication_error, src=0
-        )
-    if publication_error[0] is not None:
-        raise RuntimeError(
-            f"Optimizer generation publication failed: {publication_error[0]}"
-        )
 
 
 def finalize_megatron_job(

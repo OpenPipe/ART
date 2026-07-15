@@ -58,6 +58,8 @@ from .optimizer_state import (
     MegatronResumeStep,
     format_megatron_resume_message,
     prepare_megatron_resume_state,
+    publish_adapter_checkpoint,
+    read_committed_optimizer_adapter_step,
 )
 from .runtime.client import (
     create_megatron_job_paths,
@@ -1087,19 +1089,12 @@ class MegatronService:
         step: int,
     ) -> str:
         self._ensure_lora_adapter_config(staging_lora_path)
-        checkpoint_dir = get_step_checkpoint_dir(self.output_dir, step)
-        if os.path.exists(checkpoint_dir):
-            raise RuntimeError(
-                f"Refusing to publish Megatron checkpoint over existing directory: "
-                f"{checkpoint_dir}"
-            )
+        adapter = publish_adapter_checkpoint(staging_lora_path, step=step)
         self._status(
-            f"Publishing training checkpoint {step} "
-            f"to {self._display_path(checkpoint_dir)}"
+            f"Published training checkpoint {step} "
+            f"to {self._display_path(adapter.identity)}"
         )
-        Path(checkpoint_dir).parent.mkdir(parents=True, exist_ok=True)
-        Path(staging_lora_path).rename(checkpoint_dir)
-        return checkpoint_dir
+        return adapter.identity
 
     async def _wake_and_reload_training_checkpoint(
         self,
@@ -1131,29 +1126,24 @@ class MegatronService:
                 staging_lora_path=staging_lora_path,
                 step=step,
             )
-        if self.is_dedicated and self.rollout_weights_mode == "lora":
-            await self._load_rollout_lora_for_step(checkpoint_dir, step)
-            self._status(f"Loaded checkpoint {step} into vLLM")
         return checkpoint_dir
 
     async def _finish_training_checkpoint(
         self,
         *,
         checkpoint_dir: str | None,
-        staging_lora_path: str,
         step: int,
     ) -> str:
         if checkpoint_dir is None:
-            checkpoint_dir = self._publish_staged_training_checkpoint(
-                staging_lora_path=staging_lora_path,
-                step=step,
+            raise RuntimeError(
+                f"Trainer completed without checkpoint publication at step {step}"
             )
+        self._latest_step = step
         if self.rollout_weights_mode == "merged":
-            self._latest_step = step
-        elif self.is_dedicated:
-            if self._latest_step != step:
-                await self._load_rollout_lora_for_step(checkpoint_dir, step)
-                self._status(f"Loaded checkpoint {step} into vLLM")
+            return checkpoint_dir
+        if self.is_dedicated:
+            await self._load_rollout_lora_for_step(checkpoint_dir, step)
+            self._status(f"Loaded checkpoint {step} into vLLM")
         else:
             await self._wake_and_reload_training_checkpoint(
                 checkpoint_dir=checkpoint_dir,
@@ -1311,7 +1301,6 @@ class MegatronService:
 
                 await self._finish_training_checkpoint(
                     checkpoint_dir=checkpoint_dir,
-                    staging_lora_path=staging_lora_path,
                     step=next_step,
                 )
                 return
@@ -1341,7 +1330,7 @@ class MegatronService:
             )
             write_megatron_job(job, job_path=job_path)
 
-            checkpoint_dir = None
+            checkpoint_dir: str | None = None
             async for result in stream_megatron_job(
                 job,
                 job_path=job_path,
@@ -1359,12 +1348,19 @@ class MegatronService:
 
             await self._finish_training_checkpoint(
                 checkpoint_dir=checkpoint_dir,
-                staging_lora_path=staging_lora_path,
                 step=next_step,
             )
         except GeneratorExit:
             raise
         except BaseException as exc:
+            try:
+                durable_step = read_committed_optimizer_adapter_step(
+                    self._get_optimizer_state_path("rl")
+                )
+                if durable_step is not None:
+                    self._latest_step = max(self._latest_step, durable_step)
+            except Exception as durability_error:
+                exc.add_note(f"Failed to inspect durable state: {durability_error}")
             self._status(f"Megatron train failed: {type(exc).__name__}: {exc}")
             await cleanup_after_failure(
                 exc,
@@ -1413,12 +1409,20 @@ class MegatronService:
                 f"Training log: {self._display_path(log_path)}"
             )
 
+            checkpoint_dir: str | None = None
             async for result in stream_megatron_job(
                 job,
                 job_path=job_path,
                 process=self._megatron_process,
                 process_log_path=self._megatron_log_path,
             ):
+                if result.get("event") == LORA_READY_EVENT:
+                    checkpoint_dir = await self._handle_training_lora_ready(
+                        checkpoint_dir=checkpoint_dir,
+                        staging_lora_path=staging_lora_path,
+                        step=next_step,
+                    )
+                    continue
                 metrics = {
                     "loss/train": float(result["loss"]),
                     "loss/learning_rate": float(result["learning_rate"]),
@@ -1430,12 +1434,8 @@ class MegatronService:
                     )
                 yield metrics
 
-            new_checkpoint_dir = self._publish_staged_training_checkpoint(
-                staging_lora_path=staging_lora_path,
-                step=next_step,
-            )
-            await self._wake_and_reload_training_checkpoint(
-                checkpoint_dir=new_checkpoint_dir,
+            await self._finish_training_checkpoint(
+                checkpoint_dir=checkpoint_dir,
                 step=next_step,
             )
         except GeneratorExit:

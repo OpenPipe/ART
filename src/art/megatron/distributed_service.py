@@ -42,7 +42,9 @@ from .lora import LORA_ALPHA, default_lora_rank_for_handler
 from .model_support import get_model_support_handler, model_uses_expert_parallel
 from .optimizer_state import (
     format_megatron_resume_message,
+    hash_adapter_checkpoint,
     prepare_megatron_resume_state,
+    publish_adapter_checkpoint,
 )
 from .runtime.specs import (
     AdapterReady,
@@ -140,12 +142,6 @@ class DistributedMegatronService:
         print(format_megatron_resume_message(resume))
         self._latest_step = max(self._latest_step, resume.step)
         path = get_step_checkpoint_dir(self.output_dir, self._latest_step)
-        staging = f"{self.output_dir}/megatron_runtime/staging/{self._latest_step:04d}"
-        if (
-            not (Path(path) / "adapter_model.safetensors").is_file()
-            and (Path(staging) / "adapter_model.safetensors").is_file()
-        ):
-            path = _publish_checkpoint(staging, self.output_dir, self._latest_step)
         if not (Path(path) / "adapter_model.safetensors").is_file():
             lora = self._lora_config()
             create_identity_lora(
@@ -260,6 +256,7 @@ class DistributedMegatronService:
             )
             adapter_ready = False
             completed = False
+            checkpoint: str | None = None
             async for event in trainer.train(job, batch.leases):
                 if event.job_id != job.job_id or event.run_id != job.run_id:
                     raise RuntimeError("trainer returned an event for a different job")
@@ -278,6 +275,9 @@ class DistributedMegatronService:
                         or event.adapter_path != staging
                     ):
                         raise RuntimeError("trainer prepared the wrong adapter")
+                    checkpoint = _publish_checkpoint(
+                        staging, self.output_dir, next_step
+                    )
                     adapter_ready = True
                     continue
                 if isinstance(event, TrainCompleted):
@@ -306,7 +306,7 @@ class DistributedMegatronService:
                 raise RuntimeError(
                     "trainer ended without preparing and durably completing the adapter"
                 )
-            checkpoint = _publish_checkpoint(staging, self.output_dir, next_step)
+            assert checkpoint is not None
             try:
                 await self._register_lora_for_step_locked(next_step, checkpoint)
             except BaseException:
@@ -1024,12 +1024,14 @@ def _copy_checkpoint(source: str, destination: str) -> None:
 
 
 def _publish_checkpoint(staging: str, output_dir: str, step: int) -> str:
-    destination = get_step_checkpoint_dir(output_dir, step)
-    if os.path.exists(destination):
-        raise RuntimeError(f"refusing to replace checkpoint {destination}")
-    Path(destination).parent.mkdir(parents=True, exist_ok=True)
-    Path(staging).rename(destination)
-    return destination
+    adapter = publish_adapter_checkpoint(staging, step=step)
+    expected = str(Path(get_step_checkpoint_dir(output_dir, step)).absolute())
+    if adapter.identity != expected:
+        raise RuntimeError(
+            "Published adapter path does not match the service output: "
+            f"published={adapter.identity}, expected={expected}"
+        )
+    return adapter.identity
 
 
 def _trainer_dtype(
@@ -1068,10 +1070,7 @@ def _art_source_revision() -> str:
 
 
 def _checkpoint_digest(path: str) -> str:
-    digest = hashlib.sha256()
-    for name in ("adapter_config.json", "adapter_model.safetensors"):
-        digest.update((Path(path) / name).read_bytes())
-    return digest.hexdigest()
+    return hash_adapter_checkpoint(path)
 
 
 def _headers(api_key: str | None) -> dict[str, str] | None:

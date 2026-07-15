@@ -1095,6 +1095,18 @@ class LocalBackend:
         """Delete checkpoint files, keeping only the specified steps."""
 
         output_dir = get_model_dir(model=model, art_path=self._path)
+        from ..megatron.optimizer_state import (
+            read_committed_optimizer_adapter_step,
+        )
+
+        protected_steps = set(steps_to_keep)
+        for job_type in ("rl", "sft"):
+            paired_step = read_committed_optimizer_adapter_step(
+                f"{output_dir}/optimizer_states_{job_type}"
+            )
+            if paired_step is not None:
+                protected_steps.add(paired_step)
+        steps_to_keep = sorted(protected_steps)
         service = await self._get_service(model)
         try:
             from ..tinker.service import TinkerService
