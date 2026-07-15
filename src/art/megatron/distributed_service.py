@@ -65,6 +65,9 @@ from .service import create_identity_lora
 class DistributedMegatronService:
     """One model's durable checkpoints and run-scoped distributed runtimes."""
 
+    propagate_close_errors = True
+    close_timeout_s = 60.0
+
     def __init__(
         self,
         *,
@@ -306,14 +309,10 @@ class DistributedMegatronService:
             checkpoint = _publish_checkpoint(staging, self.output_dir, next_step)
             try:
                 await self._register_lora_for_step_locked(next_step, checkpoint)
-            except BaseException as error:
-                try:
-                    _unpublish_checkpoint(checkpoint, staging)
-                except BaseException as rollback_error:
-                    raise BaseExceptionGroup(
-                        "policy publication and checkpoint rollback failed",
-                        [error, rollback_error],
-                    ) from None
+            except BaseException:
+                # Training is durable before serving publication. Preserve that
+                # lineage even when the serving generation fails closed.
+                self._latest_step = next_step
                 raise
             self._latest_step = next_step
 
@@ -999,22 +998,19 @@ class DistributedMegatronService:
             if self._closed:
                 return
             self._closed = True
-            failures: list[BaseException] = []
+            operations = []
             if self._gateway is not None:
-                try:
-                    await self._gateway.close()
-                except BaseException as error:
-                    failures.append(error)
+                operations.append(self._gateway.close())
             if self._trainer is not None:
-                try:
-                    await self._trainer.close()
-                except BaseException as error:
-                    failures.append(error)
-            for replica_id in self._replica_ids:
-                try:
-                    await self.runtime.stop_replica(replica_id)
-                except BaseException as error:
-                    failures.append(error)
+                operations.append(self._trainer.close())
+            operations.extend(
+                self.runtime.stop_replica(replica_id)
+                for replica_id in self._replica_ids
+            )
+            results = await asyncio.gather(*operations, return_exceptions=True)
+            failures = [
+                result for result in results if isinstance(result, BaseException)
+            ]
             if failures:
                 raise BaseExceptionGroup(
                     "distributed model service close failed", failures
@@ -1034,13 +1030,6 @@ def _publish_checkpoint(staging: str, output_dir: str, step: int) -> str:
     Path(destination).parent.mkdir(parents=True, exist_ok=True)
     Path(staging).rename(destination)
     return destination
-
-
-def _unpublish_checkpoint(checkpoint: str, staging: str) -> None:
-    if os.path.exists(staging):
-        raise RuntimeError(f"refusing to replace checkpoint staging path {staging}")
-    Path(staging).parent.mkdir(parents=True, exist_ok=True)
-    Path(checkpoint).rename(staging)
 
 
 def _trainer_dtype(
