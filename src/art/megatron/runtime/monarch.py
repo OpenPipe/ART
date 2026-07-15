@@ -11,6 +11,7 @@ from monarch.actor import Actor, Channel, Port, ProcMesh, endpoint
 from monarch.spmd import setup_torch_elastic_env_async
 
 from art.distributed.data_plane import PackedBatchLeaseSet
+from art.utils.lifecycle import cleanup_after_failure
 
 from .data_plane import InMemoryPackedBatch
 from .specs import (
@@ -304,7 +305,6 @@ class MonarchTrainerRun:
             self._active_job_id = job.job_id
             self._active_collective = collective
             self._active_receive = receive
-            terminal_delivered = False
             try:
                 while True:
                     waiters = {receive}
@@ -354,37 +354,31 @@ class MonarchTrainerRun:
                             raise RuntimeError(
                                 "trainer ranks did not agree on job completion"
                             )
-                        self._learner_version = job.learner_version
-                        completed = emit(
-                            TrainCompleted(
-                                job_id=job.job_id,
-                                run_id=job.run_id,
-                                sequence=len(events),
-                                learner_version=job.learner_version,
-                                metrics=payload["metrics"],
-                            )
+                        completed = TrainCompleted(
+                            job_id=job.job_id,
+                            run_id=job.run_id,
+                            sequence=len(events),
+                            learner_version=job.learner_version,
+                            metrics=payload["metrics"],
                         )
-                        self._clear_active(job.job_id)
-                        terminal_delivered = True
                         yield completed
+                        self._learner_version = job.learner_version
+                        emit(completed)
+                        self._clear_active(job.job_id)
                         break
                     yield emit(TRAIN_EVENT_ADAPTER.validate_python(event))
                     receive = asyncio.ensure_future(receiver.recv())
                     self._active_receive = receive
             except BaseException as exc:
-                if terminal_delivered:
-                    raise
                 closed_by_caller = self._closed
                 self._valid = False
                 self._closed = True
                 self._cancel_active()
-                try:
-                    await self._force_stop()
-                except BaseException as cleanup_exc:
-                    exc.add_note(
-                        "trainer ProcMesh cleanup failed: "
-                        f"{type(cleanup_exc).__name__}: {cleanup_exc}"
-                    )
+                await cleanup_after_failure(
+                    exc,
+                    self._force_stop,
+                    message="training and forced trainer ProcMesh cleanup failed",
+                )
                 caller_cancelled = isinstance(exc, GeneratorExit) or (
                     isinstance(exc, asyncio.CancelledError)
                     and _current_task_is_cancelling()
