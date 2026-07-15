@@ -1,15 +1,17 @@
 from __future__ import annotations
 
 import asyncio
-import hashlib
+from collections.abc import Iterable
 import json
 import socket
 from typing import Any
 
 from aiohttp import ClientError, ClientSession, ClientTimeout, TCPConnector, web
+from pydantic import BaseModel, ConfigDict, Field
 
 from .vllm_replica import ReplicaUpdateReport
 from .vllm_router import (
+    KvCacheEvent,
     PrefixBlockHashes,
     ReplicaRouter,
     ReplicaTelemetry,
@@ -32,6 +34,15 @@ _HOP_HEADERS = {
     "transfer-encoding",
     "upgrade",
 }
+
+
+class _RoutingHints(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    stable_key: str | None = Field(default=None, min_length=1)
+    prefix: PrefixBlockHashes | None = None
+
+
 _ROUTED_PATHS = {
     "/v1/chat/completions",
     "/v1/completions",
@@ -107,6 +118,18 @@ class VllmGateway:
         if version != self.router.table.policy_version:
             self._policies.pop(version, None)
 
+    def apply_kv_events(self, events: Iterable[KvCacheEvent]) -> bool:
+        """Apply one normalized vLLM publisher batch to every policy view."""
+        batch = tuple(events)
+        applied = False
+        for router in set(self._policies.values()):
+            applied = router.apply_kv_events(batch) or applied
+        return applied
+
+    def invalidate_kv(self, replica_id: str) -> None:
+        for router in set(self._policies.values()):
+            router.invalidate_kv(replica_id)
+
     async def pause(self, reason: str) -> None:
         await self.router.quarantine(
             (replica.replica_id for replica in self.router.table.replicas), reason
@@ -120,6 +143,8 @@ class VllmGateway:
         if path == "/art/metrics":
             return web.json_response({"metrics": await self._aggregate_metrics()})
         if path == "/health":
+            if any(replica.phase != "ready" for replica in self.router.table.replicas):
+                raise web.HTTPServiceUnavailable(text="a replica is not routable")
             await self._require_all_healthy()
             return web.Response()
         if path not in _ROUTED_PATHS:
@@ -133,14 +158,19 @@ class VllmGateway:
                 raise RoutingUnavailableError(
                     f"policy version {version!r} is not loaded"
                 )
-            routing = _routing_input(request, payload, router.table)
+            routing = _routing_input(payload, router.table)
+            if "art_routing" in payload:
+                payload.pop("art_routing")
+                body = json.dumps(payload, separators=(",", ":")).encode()
             reservation = await router.acquire(routing, timeout_s=self._route_timeout_s)
             async with reservation:
                 return await self._proxy(
                     request, body, reservation.replica.endpoint.url
                 )
         except RoutingQueueFullError as error:
-            raise web.HTTPTooManyRequests(text=str(error)) from error
+            raise web.HTTPTooManyRequests(
+                text=str(error), headers={"Retry-After": "1"}
+            ) from error
         except RoutingDeadlineExceededError as error:
             raise web.HTTPGatewayTimeout(text=str(error)) from error
         except RoutingUnavailableError as error:
@@ -242,7 +272,8 @@ class VllmGateway:
                     )
                     telemetry = ReplicaTelemetry(
                         observed_at=observed_at,
-                        in_flight=int(values["num_requests_running"]),
+                        in_flight=int(values["num_requests_running"])
+                        + int(values.get("num_requests_waiting", 0)),
                         capacity=int(values.get("max_num_seqs") or 256),
                     )
                     await asyncio.gather(
@@ -275,41 +306,17 @@ class VllmGateway:
             self._socket = None
 
 
-def _routing_input(
-    request: web.Request, payload: dict[str, Any], table: RoutingTable
-) -> RoutingInput:
+def _routing_input(payload: dict[str, Any], table: RoutingTable) -> RoutingInput:
     policy_version = _policy_version(payload)
-    prefix = None
-    raw_hashes = request.headers.get("x-art-prefix-block-hashes")
-    if raw_hashes:
-        prefix = PrefixBlockHashes(
-            version=request.headers.get("x-art-prefix-version", policy_version),
-            block_size=int(request.headers["x-art-prefix-block-size"]),
-            hashes=tuple(raw_hashes.split(",")),
-        )
+    hints = _RoutingHints.model_validate(payload.get("art_routing", {}))
     return RoutingInput(
         policy_version=policy_version,
         policy_digest=table.policy_digest,
-        stable_key=request.headers.get("x-art-routing-key") or _stable_prefix(payload),
-        prefix=prefix,
+        stable_key=hints.stable_key,
+        prefix=hints.prefix,
     )
 
 
 def _policy_version(payload: dict[str, Any]) -> str:
     model = str(payload["model"])
     return model.rsplit("@", 1)[-1] if "@" in model else model
-
-
-def _stable_prefix(payload: dict[str, Any]) -> str:
-    messages = payload.get("messages")
-    if isinstance(messages, list) and messages:
-        prefix = []
-        for message in messages:
-            prefix.append(message)
-            if isinstance(message, dict) and message.get("role") != "system":
-                break
-        value: object = prefix
-    else:
-        value = payload.get("prompt", payload)
-    encoded = json.dumps(value, sort_keys=True, separators=(",", ":")).encode()
-    return hashlib.sha256(encoded).hexdigest()

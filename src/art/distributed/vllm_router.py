@@ -46,6 +46,7 @@ class RoutableReplica(_RoutingModel):
     policy_digest: str | None
     update_identity: str | None
     telemetry: ReplicaTelemetry
+    kv_event_publishers: int = Field(default=1, gt=0)
     quarantine_reason: str | None = None
 
 
@@ -66,13 +67,22 @@ class RoutingTable(_RoutingModel):
 
 
 class KvCacheEvent(_RoutingModel):
-    replica_id: str
+    replica_id: str = Field(min_length=1)
     generation: int = Field(ge=0)
+    publisher_rank: int = Field(default=0, ge=0)
     sequence: int = Field(ge=0)
     version: str = Field(min_length=1)
-    block_size: int = Field(gt=0)
+    block_size: int | None = Field(default=None, gt=0)
     operation: Literal["store", "remove", "reset"]
     block_hashes: tuple[str, ...] = ()
+
+    @model_validator(mode="after")
+    def _validate_operation(self) -> "KvCacheEvent":
+        if self.operation == "store" and self.block_size is None:
+            raise ValueError("store events require block_size")
+        if self.operation == "reset" and self.block_hashes:
+            raise ValueError("reset events must not contain block hashes")
+        return self
 
 
 class PreparedRoutingTable(_RoutingModel):
@@ -96,13 +106,18 @@ class PolicyGenerationCommitError(RuntimeError):
     pass
 
 
+def canonical_block_hash(value: int | bytes) -> str:
+    """Canonicalize vLLM's version-dependent external block-hash type."""
+    if isinstance(value, bool) or (isinstance(value, int) and value < 0):
+        raise ValueError("vLLM block hashes must be nonnegative integers or bytes")
+    return f"i:{value:x}" if isinstance(value, int) else f"b:{value.hex()}"
+
+
 class _KvIndex:
-    def __init__(self, generation: int, version: str, block_size: int) -> None:
+    def __init__(self, generation: int) -> None:
         self.generation = generation
-        self.version = version
-        self.block_size = block_size
         self.next_sequence: int | None = None
-        self.blocks: set[str] = set()
+        self.blocks: dict[tuple[str, int], set[str]] = {}
 
 
 T = TypeVar("T")
@@ -167,7 +182,7 @@ class ReplicaRouter:
         self._reservations: dict[tuple[str, int], dict[int, float]] = {}
         self._next_reservation = 0
         self._queued = 0
-        self._kv: dict[str, _KvIndex] = {}
+        self._kv: dict[tuple[str, int], _KvIndex] = {}
 
     @property
     def table(self) -> RoutingTable:
@@ -250,41 +265,77 @@ class ReplicaRouter:
             self._condition.notify_all()
 
     def apply_kv_event(self, event: KvCacheEvent) -> bool:
+        return self.apply_kv_events((event,))
+
+    def apply_kv_events(self, events: Iterable[KvCacheEvent]) -> bool:
+        """Apply one ordered publisher batch, clearing affinity on a gap."""
+        events = tuple(events)
+        if not events:
+            raise ValueError("KV event batch must not be empty")
+        first = events[0]
+        identity = (
+            first.replica_id,
+            first.generation,
+            first.publisher_rank,
+            first.sequence,
+        )
+        if any(
+            (
+                event.replica_id,
+                event.generation,
+                event.publisher_rank,
+                event.sequence,
+            )
+            != identity
+            for event in events[1:]
+        ):
+            raise ValueError("KV event batch must come from one publisher sequence")
         replica = next(
             (
                 item
                 for item in self._table.replicas
-                if item.replica_id == event.replica_id
+                if item.replica_id == first.replica_id
             ),
             None,
         )
-        if replica is None or replica.generation != event.generation:
-            self._kv.pop(event.replica_id, None)
+        if (
+            replica is None
+            or replica.generation != first.generation
+            or first.publisher_rank >= replica.kv_event_publishers
+        ):
             return False
-        index = self._kv.get(event.replica_id)
-        compatible = (
-            index is not None
-            and index.generation == event.generation
-            and index.version == event.version
-            and index.block_size == event.block_size
-        )
-        if not compatible:
-            index = _KvIndex(event.generation, event.version, event.block_size)
-            self._kv[event.replica_id] = index
+        key = (first.replica_id, first.publisher_rank)
+        index = self._kv.get(key)
+        if index is None or index.generation != first.generation:
+            index = _KvIndex(first.generation)
+            self._kv[key] = index
+        if index.next_sequence is not None and first.sequence < index.next_sequence:
+            return True
         contiguous = (
-            index.next_sequence is None or event.sequence == index.next_sequence
+            index.next_sequence is None or first.sequence == index.next_sequence
         )
-        if not contiguous or event.operation == "reset":
+        if not contiguous:
             index.blocks.clear()
-        if event.operation == "store":
-            index.blocks.update(event.block_hashes)
-        elif event.operation == "remove":
-            index.blocks.difference_update(event.block_hashes)
-        index.next_sequence = event.sequence + 1
-        return contiguous and event.operation != "reset"
+        reset = False
+        for event in events:
+            if event.operation == "reset":
+                index.blocks.clear()
+                reset = True
+            elif event.operation == "store":
+                assert event.block_size is not None
+                index.blocks.setdefault(
+                    (event.version, event.block_size), set()
+                ).update(event.block_hashes)
+            else:
+                for blocks in index.blocks.values():
+                    blocks.difference_update(event.block_hashes)
+        index.next_sequence = first.sequence + 1
+        return contiguous and not reset
 
     def invalidate_kv(self, replica_id: str) -> None:
-        self._kv.pop(replica_id, None)
+        for key in tuple(self._kv):
+            if key[0] == replica_id:
+                self._kv.pop(key)
 
     def prepare(self, candidate: RoutingTable) -> PreparedRoutingTable:
         current = self._table
@@ -352,16 +403,24 @@ class ReplicaRouter:
                 )
             previous = {replica.replica_id: replica for replica in self._table.replicas}
             self._table = prepared.candidate
+            for replica_id in previous.keys() - {
+                replica.replica_id for replica in prepared.candidate.replicas
+            }:
+                self.invalidate_kv(replica_id)
             for replica in prepared.candidate.replicas:
                 old = previous.get(replica.replica_id)
                 if old is None or (
                     old.generation,
                     old.generation_digest,
+                    old.committed_version,
                     old.policy_digest,
+                    old.update_identity,
                 ) != (
                     replica.generation,
                     replica.generation_digest,
+                    replica.committed_version,
                     replica.policy_digest,
+                    replica.update_identity,
                 ):
                     self.invalidate_kv(replica.replica_id)
             self._condition.notify_all()
@@ -454,18 +513,20 @@ class ReplicaRouter:
 
     def _prefix_match(self, replica: RoutableReplica, request: RoutingInput) -> int:
         prefix = request.prefix
-        index = self._kv.get(replica.replica_id)
-        if (
-            prefix is None
-            or index is None
-            or index.generation != replica.generation
-            or index.version != prefix.version
-            or index.block_size != prefix.block_size
-        ):
+        if prefix is None:
             return 0
-        matched = 0
-        for block_hash in prefix.hashes:
-            if block_hash not in index.blocks:
-                break
-            matched += 1
-        return matched
+        matches = []
+        for publisher_rank in range(replica.kv_event_publishers):
+            index = self._kv.get((replica.replica_id, publisher_rank))
+            if index is None or index.generation != replica.generation:
+                return 0
+            blocks = index.blocks.get((prefix.version, prefix.block_size))
+            if blocks is None:
+                return 0
+            matched = 0
+            for block_hash in prefix.hashes:
+                if block_hash not in blocks:
+                    break
+                matched += 1
+            matches.append(matched)
+        return min(matches)
