@@ -1,8 +1,10 @@
 from pathlib import Path
+import secrets
 from typing import TYPE_CHECKING, Any, AsyncIterator, Iterable, cast
 
 from mp_actors import move_to_child_process
 
+from .. import dev
 from ..backend import AnyTrainableModel
 from ..local.backend import LocalBackend, _PackedTrainingBatch
 from ..local.service import ModelService
@@ -10,6 +12,7 @@ from ..model import TrainableModel
 from ..trajectories import TrajectoryGroup
 from ..types import LocalTrainResult
 from ..utils.output_dirs import get_model_dir
+from ..vllm_runtime import get_external_vllm_runtime_config
 from .optimizer_state import (
     format_megatron_resume_message,
     prepare_megatron_resume_state,
@@ -50,6 +53,9 @@ class MegatronBackend(LocalBackend):
         self._supports_result_packing = True
         self._resume_prepared_models: set[str] = set()
         self._runtime = runtime
+        self._managed_api_key = (
+            secrets.token_urlsafe(32) if runtime is not None else None
+        )
 
     def __enter__(self) -> "MegatronBackend":
         if self._runtime is not None:
@@ -115,6 +121,25 @@ class MegatronBackend(LocalBackend):
                     process_name="megatron-service",
                 )
         return self._services[model.name]
+
+    async def _prepare_backend_for_training(
+        self,
+        model: AnyTrainableModel,
+        config: dev.OpenAIServerConfig | None = None,
+    ) -> tuple[str, str]:
+        if (
+            self._managed_api_key is None
+            or get_external_vllm_runtime_config(model._internal_config or {})
+            is not None
+        ):
+            return await super()._prepare_backend_for_training(model, config)
+        config_dict = dict(config or {})
+        server_args = dict(config_dict.get("server_args", {}))
+        server_args.setdefault("api_key", self._managed_api_key)
+        config_dict["server_args"] = server_args
+        return await super()._prepare_backend_for_training(
+            model, cast(dev.OpenAIServerConfig, config_dict)
+        )
 
     async def _prepare_training_batch(
         self,
