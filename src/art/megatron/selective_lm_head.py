@@ -263,8 +263,8 @@ def _select_output_rows(
                 hidden_states,
                 group=getattr(module, "tp_group"),
             )
-            module.sequence_parallel = False  # type: ignore[attr-defined]
-            module.disable_grad_reduce = True  # type: ignore[attr-defined]
+            setattr(module, "sequence_parallel", False)
+            setattr(module, "disable_grad_reduce", True)
         batch, sequence = selection.full_shape
         if tuple(hidden_states.shape[:2]) != (sequence, batch):
             raise ValueError(
@@ -287,8 +287,8 @@ def _select_output_rows(
     finally:
         handle.remove()
         if sequence_parallel:
-            output_layer.sequence_parallel = True  # type: ignore[attr-defined]
-            output_layer.disable_grad_reduce = disable_grad_reduce  # type: ignore[attr-defined]
+            setattr(output_layer, "sequence_parallel", True)
+            setattr(output_layer, "disable_grad_reduce", disable_grad_reduce)
     if succeeded and calls != 1:
         raise RuntimeError(f"selective LM head expected one output call, got {calls}")
 

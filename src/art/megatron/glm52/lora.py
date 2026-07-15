@@ -162,12 +162,14 @@ def wrap_glm52_grouped_moe_experts_3d(
 ) -> None:
     if not _targets_include(target_modules, "experts"):
         return
+    if TEColumnParallelGroupedLinear is None or TERowParallelGroupedLinear is None:
+        raise RuntimeError("GLM-5.2 expert LoRA requires Transformer Engine")
     experts.linear_fc1 = Glm52MLPExpertsLinearFC1LoRA(
         adapter_model_prefix=f"{adapter_model_prefix}.mlp.experts",
         linear_fc1=_unwrap_attr(
             experts.linear_fc1,
             "linear_fc1",
-            TEColumnParallelGroupedLinear,  # type: ignore[arg-type]
+            TEColumnParallelGroupedLinear,
         ),
         rank=rank,
         alpha=alpha,
@@ -179,7 +181,7 @@ def wrap_glm52_grouped_moe_experts_3d(
         linear_fc2=_unwrap_attr(
             experts.linear_fc2,
             "linear_fc2",
-            TERowParallelGroupedLinear,  # type: ignore[arg-type]
+            TERowParallelGroupedLinear,
         ),
         rank=rank,
         alpha=alpha,

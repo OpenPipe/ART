@@ -982,6 +982,11 @@ def _save_vllm_lora_adapter(
     ]
     if zero_keys:
         raise RuntimeError(f"Refusing zero LoRA tensors: {zero_keys[:5]}")
+    adapter_dtypes: dict[str, torch.dtype] = {}
+    for key, value in state.items():
+        if not isinstance(value, torch.Tensor):
+            raise TypeError(f"Expected tensor for LoRA key {key!r}")
+        adapter_dtypes[key] = value.dtype
     megatron_train.load_adapter_into_model(
         runtime.model,
         state,
@@ -989,7 +994,7 @@ def _save_vllm_lora_adapter(
     )
     save_vllm_lora_from_model(
         model=runtime.model,
-        adapter_model=state,
+        adapter_dtypes=adapter_dtypes,
         handler=runtime.model_support_handler,
         adapter_config=_adapter_config(config),
         output_dir=str(lora_path),
