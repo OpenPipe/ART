@@ -339,7 +339,10 @@ class ManagedVllmRuntime:
         self.process = subprocess.Popen(
             managed_process_cmd(cmd),
             cwd=str(get_vllm_runtime_working_dir()),
-            env=_vllm_runtime_subprocess_env(cmd),
+            env={
+                **_vllm_runtime_subprocess_env(cmd),
+                "CUDA_VISIBLE_DEVICES": launch_config.visible_devices,
+            },
             stdout=self.log_file,
             stderr=subprocess.STDOUT,
             bufsize=1,
