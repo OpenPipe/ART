@@ -5,6 +5,7 @@ import asyncio
 from http import HTTPStatus
 import json
 import os
+from typing import Any
 import uuid
 
 from pydantic import BaseModel, Field
@@ -347,12 +348,33 @@ def _append_cli_arg(vllm_args: list[str], key: str, value: object) -> None:
             assert False, f"Unsupported CLI arg for {key}: {type(value)}"
 
 
+def _take_hash_block_size(engine_args: dict[str, object]) -> int | None:
+    value = engine_args.pop("hash_block_size", None)
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+        raise ValueError("hash_block_size must be a positive integer")
+    return value
+
+
+def _set_hash_block_size(engine_args_type: Any, value: int) -> None:
+    create_engine_config = engine_args_type.create_engine_config
+
+    def create(self: Any, *args: Any, **kwargs: Any) -> Any:
+        config = create_engine_config(self, *args, **kwargs)
+        config.cache_config.hash_block_size = value
+        return config
+
+    setattr(engine_args_type, "create_engine_config", create)
+
+
 def main(argv: list[str] | None = None) -> None:
     args = parse_args(argv)
     if args.rollout_weights_mode == "merged" and not args.lora_path:
         raise SystemExit("--lora-path is required for merged rollout weights")
     engine_args = json.loads(args.engine_args_json)
     server_args = json.loads(args.server_args_json)
+    hash_block_size = _take_hash_block_size(engine_args)
 
     from art_vllm_runtime.lora_state import (
         ART_LORA_WORKER_EXTENSION,
@@ -397,6 +419,7 @@ def main(argv: list[str] | None = None) -> None:
         os.environ["VLLM_SERVER_DEV_MODE"] = "1"
     apply_vllm_runtime_patches()
 
+    from vllm.engine.arg_utils import AsyncEngineArgs
     from vllm.entrypoints.openai import api_server
     from vllm.entrypoints.openai.cli_args import (
         make_arg_parser,
@@ -405,6 +428,8 @@ def main(argv: list[str] | None = None) -> None:
     from vllm.utils.argparse_utils import FlexibleArgumentParser
 
     _patch_art_runtime_routes()
+    if hash_block_size is not None:
+        _set_hash_block_size(AsyncEngineArgs, hash_block_size)
 
     vllm_args = [
         f"--model={args.model}",
