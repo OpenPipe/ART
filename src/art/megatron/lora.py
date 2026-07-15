@@ -34,12 +34,15 @@ from .kernels.cute_grouped_lora_quack import (
     quack_grouped_lora,
     quack_grouped_lora_dual,
 )
+from .lora_config import (
+    DENSE_LORA_RANK,
+    LORA_ALPHA,
+    MEGATRON_LORA_RANK_ENV,
+    MEGATRON_LORA_TARGET_MODULES_ENV,
+    MOE_LORA_RANK,
+    default_lora_rank_for_handler,
+)
 
-MOE_LORA_RANK = 1
-DENSE_LORA_RANK = 8
-LORA_ALPHA = 32
-MEGATRON_LORA_RANK_ENV = "ART_MEGATRON_LORA_RANK"
-MEGATRON_LORA_TARGET_MODULES_ENV = "ART_MEGATRON_LORA_TARGET_MODULES"
 _LAYER_BLOCK_RE = re.compile(r"^(?P<block>.*\.layers\.\d+)\.")
 
 ShardDomain = Literal["tp", "expert_tp"]
@@ -290,10 +293,6 @@ def _linear_disables_tensor_parallel_comm(linear: Any) -> bool:
     return getattr(linear, "parallel_mode", "") is None or getattr(
         linear, "explicit_expert_comm", False
     )
-
-
-def default_lora_rank_for_handler(handler: Any) -> int:
-    return MOE_LORA_RANK if bool(getattr(handler, "is_moe", False)) else DENSE_LORA_RANK
 
 
 def _configured_lora_rank(provider: Any, handler: Any) -> int:

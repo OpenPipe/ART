@@ -39,7 +39,8 @@ from art.vllm_runtime import (
     wait_for_vllm_http_runtime,
 )
 
-from .lora import LORA_ALPHA, default_lora_rank_for_handler
+from .identity_lora import create_identity_lora
+from .lora_config import LORA_ALPHA, default_lora_rank_for_handler
 from .model_support import (
     get_model_support_handler,
     get_model_support_handler_for_spec,
@@ -69,7 +70,6 @@ from .runtime.specs import (
     TrainProgress,
 )
 from .runtime_config import get_megatron_runtime_config
-from .service import create_identity_lora
 
 
 class DistributedMegatronService:
