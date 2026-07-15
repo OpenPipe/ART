@@ -66,6 +66,17 @@ changed. Setting `num_nodes: 1` uses the same path on one node. The existing
 `LocalBackend` interface remains unchanged for users who do not opt into the
 distributed APIs.
 
+For a local process that explicitly wants the same Monarch service APIs, ART
+can own one loopback worker directly:
+
+```fish
+.venv/bin/art-monarch local --program your_package.train:main
+```
+
+`ArtRuntime.start_local(...)` is the equivalent library API. It accepts the
+same one-host compiled topology used by multi-node code and owns the worker for
+the runtime lifetime.
+
 SkyPilot provides `SKYPILOT_NODE_RANK`, `SKYPILOT_NODE_IPS`, and
 `SKYPILOT_NUM_NODES`; ART validates and translates them internally. Port
 `22222` is the Monarch worker port and `22223` is its job-lifecycle port. Pass

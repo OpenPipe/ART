@@ -23,8 +23,15 @@ sky exec art-multinode examples/multinode/skypilot.yaml
 ```
 
 Each invocation terminates every worker loop before the task exits. Reusing the
-cluster starts fresh loops; completed Monarch 0.2 loops are not reattached.
+cluster starts fresh loops; completed Monarch 0.5 loops are not reattached.
 
 Setting `num_nodes: 1` exercises the same API on one node. Do not expose the
-default private ports `22222` and `22223`; pinned Monarch 0.2 does not
+default private ports `22222` and `22223`; pinned Monarch 0.5 does not
 authenticate its transport.
+
+Without SkyPilot, the equivalent owned one-host smoke is:
+
+```fish
+.venv/bin/art-monarch local \
+  --program art.distributed.monarch_bootstrap:deployment_smoke
+```
