@@ -1,20 +1,32 @@
 import asyncio
+from contextlib import contextmanager
 from contextvars import Token
 from datetime import datetime
 import json
 import os
 import time
-from typing import TYPE_CHECKING, Any, Generic, Iterable, Optional, cast, overload
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    Generic,
+    Iterable,
+    Literal,
+    Optional,
+    cast,
+    overload,
+)
+from urllib.parse import urlparse
 import warnings
 
 import httpx
-from openai import AsyncOpenAI, DefaultAsyncHttpxClient
+from openai import APIConnectionError, AsyncOpenAI, DefaultAsyncHttpxClient
 import polars as pl
 from pydantic import BaseModel
 from typing_extensions import Never, TypeVar
 
 from . import dev
 from .costs import CostCalculator
+from .errors import LocalServingUnavailableError
 from .metrics import MetricsBuilder, is_builder_managed_metric
 from .metrics_taxonomy import (
     SFT_GRADIENT_STEP_KEY,
@@ -26,11 +38,23 @@ from .metrics_taxonomy import (
     summarize_trajectory_groups,
 )
 from .preprocessing.moe_routing import attach_moe_routing_metadata_to_choice
-from .preprocessing.vllm_tokens import attach_vllm_token_metadata_to_choice
+from .preprocessing.policy_spans import (
+    attach_policy_token_metadata_to_choice,
+    attach_static_policy_token_span_to_choice,
+    choice_policy_token_spans,
+    validate_complete_policy_token_spans,
+)
+from .preprocessing.vllm_tokens import (
+    attach_completion_token_metadata,
+    attach_vllm_token_metadata_to_choice,
+    choice_completion_tokens,
+)
+from .serving_capabilities import ServingCapabilities
 from .trajectories import Trajectory, TrajectoryGroup
 from .types import SFTMetricLoggingConfig, TrainSFTConfig
 from .utils import wandb_sdk
 from .utils.trajectory_logging import write_trajectory_groups_parquet
+from .vllm_route_transport import decode_routed_experts_response
 
 if TYPE_CHECKING:
     from wandb.sdk.wandb_run import Run
@@ -42,6 +66,19 @@ ModelConfig = TypeVar("ModelConfig", bound=BaseModel | None)
 StateType = TypeVar("StateType", bound=dict[str, Any], default=dict[str, Any])
 
 METRICS_BUILDER_STATE_KEY = "_metrics_builder_state"
+LOCAL_INFERENCE_HOSTS = frozenset({"127.0.0.1", "0.0.0.0", "::1", "localhost"})
+
+
+@contextmanager
+def _suppress_weave_trace():
+    try:
+        from weave.trace.settings import override_settings
+    except ModuleNotFoundError:
+        yield
+        return
+
+    with override_settings(disabled=True):
+        yield
 
 
 def _merge_extra_body_defaults(
@@ -62,23 +99,83 @@ def _merge_extra_body_defaults(
     return merged
 
 
-def _attach_response_art_metadata(response: Any) -> None:
+def _attach_response_art_metadata(
+    response: Any,
+    routed_experts: dict[int, Any] | None = None,
+    policy_span_mode: Literal["none", "require", "synthesize"] = "none",
+    request_model: str | None = None,
+) -> None:
     choices = getattr(response, "choices", None)
     model_dump = getattr(response, "model_dump", None)
     if not choices or not callable(model_dump):
         return
     response_payload = model_dump(mode="python")
+    if routed_experts is not None:
+        missing = [
+            int(choice.index)
+            for choice in choices
+            if int(choice.index) not in routed_experts
+        ]
+        if missing:
+            raise RuntimeError(
+                "ART binary response omitted routed experts for choice indices "
+                f"{missing}; received {sorted(routed_experts)}"
+            )
     for choice_index, choice in enumerate(choices):
         attach_vllm_token_metadata_to_choice(
             choice=choice,
             response_payload=response_payload,
             choice_index=choice_index,
         )
+    attach_completion_token_metadata(response)
+    for choice_index, choice in enumerate(choices):
         attach_moe_routing_metadata_to_choice(
             choice=choice,
             response_payload=response_payload,
             choice_index=choice_index,
+            routed_experts=(
+                routed_experts.get(int(choice.index))
+                if routed_experts is not None
+                else None
+            ),
         )
+        attach_policy_token_metadata_to_choice(
+            choice=choice,
+            response_payload=response_payload,
+            choice_index=choice_index,
+        )
+        if policy_span_mode == "synthesize" and not choice_policy_token_spans(choice):
+            completion_tokens = choice_completion_tokens(choice)
+            if completion_tokens is None or completion_tokens <= 0:
+                raise RuntimeError(
+                    "Immutable step-LoRA policy tracking requires a positive exact "
+                    "per-choice completion token count."
+                )
+            attach_static_policy_token_span_to_choice(
+                choice=choice,
+                model_name=request_model or "",
+                completion_tokens=completion_tokens,
+            )
+        if policy_span_mode != "none":
+            completion_tokens = choice_completion_tokens(choice)
+            if completion_tokens is None or completion_tokens <= 0:
+                raise RuntimeError(
+                    "Policy tracking requires a positive exact per-choice completion "
+                    "token count."
+                )
+            validate_complete_policy_token_spans(
+                choice, completion_tokens=completion_tokens
+            )
+
+
+def _is_local_inference_base_url(base_url: str | None) -> bool:
+    if base_url is None:
+        return False
+    try:
+        hostname = urlparse(base_url).hostname
+    except ValueError:
+        return False
+    return hostname in LOCAL_INFERENCE_HOSTS
 
 
 class _OpenAIChatCompletionsProxy:
@@ -87,10 +184,16 @@ class _OpenAIChatCompletionsProxy:
         completions: Any,
         record_costs: Any,
         default_extra_body: dict[str, Any] | None = None,
+        local_serving_base_url: str | None = None,
+        binary_completions: Any | None = None,
+        policy_span_mode: Literal["none", "require", "synthesize"] = "none",
     ) -> None:
         self._completions = completions
         self._record_costs = record_costs
         self._default_extra_body = default_extra_body
+        self._local_serving_base_url = local_serving_base_url
+        self._binary_completions = binary_completions
+        self._policy_span_mode = policy_span_mode
 
     async def create(self, *args: Any, **kwargs: Any) -> Any:
         if self._default_extra_body is not None:
@@ -98,8 +201,42 @@ class _OpenAIChatCompletionsProxy:
                 self._default_extra_body,
                 kwargs.get("extra_body"),
             )
-        response = await self._completions.create(*args, **kwargs)
-        _attach_response_art_metadata(response)
+        # Local vLLM responses carry token IDs, logprobs, routed experts, and
+        # policy-span metadata that ART needs for training. Weave's OpenAI
+        # integration serializes the whole response by default, which can turn a
+        # long RL run into hundreds of GB of trace payload. Keep the production
+        # training response intact and suppress only this implicit trace.
+        try:
+            with _suppress_weave_trace():
+                if self._binary_completions is None:
+                    response = await self._completions.create(*args, **kwargs)
+                    routed_experts = None
+                else:
+                    raw_response = (
+                        await self._binary_completions.with_raw_response.create(
+                            *args, **kwargs
+                        )
+                    )
+                    response, routed_experts = decode_routed_experts_response(
+                        raw_response.content
+                    )
+        except APIConnectionError as exc:
+            if self._local_serving_base_url is not None:
+                raise LocalServingUnavailableError(
+                    "ART-managed local inference endpoint became unreachable "
+                    f"at {self._local_serving_base_url}. Aborting training instead "
+                    "of counting rollouts as data errors."
+                ) from exc
+            raise
+        request_model = kwargs.get("model")
+        if self._policy_span_mode != "none" and not isinstance(request_model, str):
+            raise RuntimeError("OpenAI completion model must be a string")
+        _attach_response_art_metadata(
+            response,
+            routed_experts,
+            self._policy_span_mode,
+            request_model,
+        )
         self._record_costs(response)
         return response
 
@@ -113,12 +250,18 @@ class _OpenAIChatProxy:
         chat: Any,
         record_costs: Any,
         default_extra_body: dict[str, Any] | None = None,
+        local_serving_base_url: str | None = None,
+        binary_chat: Any | None = None,
+        policy_span_mode: Literal["none", "require", "synthesize"] = "none",
     ) -> None:
         self._chat = chat
         self.completions = _OpenAIChatCompletionsProxy(
             chat.completions,
             record_costs,
             default_extra_body,
+            local_serving_base_url,
+            binary_chat.completions if binary_chat is not None else None,
+            policy_span_mode,
         )
 
     def __getattr__(self, name: str) -> Any:
@@ -131,17 +274,38 @@ class _OpenAIClientProxy:
         client: Any,
         record_costs: Any,
         default_extra_body: dict[str, Any] | None = None,
+        local_serving_base_url: str | None = None,
+        binary_routes_base_url: str | None = None,
+        policy_span_mode: Literal["none", "require", "synthesize"] = "none",
     ) -> None:
         self._client = client
         self._record_costs = record_costs
         self._default_extra_body = default_extra_body
-        self.chat = _OpenAIChatProxy(client.chat, record_costs, default_extra_body)
+        self._local_serving_base_url = local_serving_base_url
+        self._binary_routes_base_url = binary_routes_base_url
+        self._policy_span_mode = policy_span_mode
+        binary_client = (
+            client.with_options(base_url=binary_routes_base_url)
+            if binary_routes_base_url is not None
+            else None
+        )
+        self.chat = _OpenAIChatProxy(
+            client.chat,
+            record_costs,
+            default_extra_body,
+            local_serving_base_url,
+            binary_client.chat if binary_client is not None else None,
+            policy_span_mode,
+        )
 
     def with_options(self, *args: Any, **kwargs: Any) -> "_OpenAIClientProxy":
         return _OpenAIClientProxy(
             self._client.with_options(*args, **kwargs),
             self._record_costs,
             self._default_extra_body,
+            self._local_serving_base_url,
+            self._binary_routes_base_url,
+            self._policy_span_mode,
         )
 
     def __getattr__(self, name: str) -> Any:
@@ -152,15 +316,86 @@ METRIC_SECTIONS = frozenset(
     {
         "reward",
         "loss",
+        "objective",
         "offpolicy",
         "pipeline",
+        "pipeline_settings",
+        "queue",
+        "sample_efficiency",
         "throughput",
         "costs",
+        "discarded",
+        "task",
         "time",
         "data",
+        "vllm",
     }
 )
 METRIC_SPLITS = frozenset({"train", "val", "test"})
+
+WANDB_CANONICAL_METRIC_KEYS = frozenset(
+    {
+        "training_step",
+        SFT_WANDB_GRADIENT_STEP_KEY,
+        "objective/score",
+        "sample_efficiency/accepted_groups_per_step",
+        "sample_efficiency/batch_factor",
+        "sample_efficiency/freshness_discount",
+        "offpolicy/token_weighted_policy_age_steps",
+        "offpolicy/token_weighted_policy_age_p95_steps",
+        "throughput/accepted_train_tok_per_s",
+        "throughput/train_packed_tok_per_s",
+        "data/step_trainable_assistant_tokens",
+        "data/step_non_padding_train_tokens",
+        "data/step_padding_ratio",
+        "data/cum/num_unique_scenarios",
+        "data/cum/num_scenarios",
+        "data/cum/num_gradient_steps",
+        "discarded/cum/stale_groups",
+        "discarded/cum/zero_variance_groups",
+        "discarded/rate/stale_groups",
+        "discarded/rate/zero_variance_groups",
+        "time/step_wall_s",
+        "time/cum/wall_s",
+        "time/step_collect_batch_s",
+        "time/step_backend_train_s",
+        "time/step_rollout_idle_s",
+        "pipeline_settings/num_rollout_workers",
+        "pipeline_settings/min_batch_size",
+        "pipeline_settings/max_batch_size",
+        "pipeline_settings/target_groups_per_step",
+        "pipeline_settings/queue_maxsize",
+        "loss/train",
+        "loss/entropy",
+        "loss/kl_div",
+        "loss/kl_policy_ref",
+        "loss/grad_norm",
+        "loss/learning_rate",
+        "loss/importance_ratio_mean",
+        "loss/importance_ratio_p95",
+        "loss/importance_ratio_p99",
+        "loss/clipped_token_fraction",
+        "vllm/prompt_tok_per_s",
+        "vllm/completion_tok_per_s",
+        "vllm/num_requests_running",
+        "vllm/num_requests_waiting",
+        "vllm/num_requests_waiting_capacity",
+        "vllm/prefix_cache_hit_rate",
+        "vllm/kv_cache_usage_perc",
+    }
+)
+WANDB_CANONICAL_METRIC_PREFIXES = (
+    "costs/cum/",
+    "reward/",
+    f"{SFT_METRIC_PREFIX}/",
+    "task/",
+)
+
+
+def _wandb_run_is_finished(run: "Run") -> bool:
+    # W&B has changed private finished-state attrs across versions. Missing attrs
+    # mean the current run object should remain usable.
+    return bool(getattr(run, "_is_finished", getattr(run, "_finished", False)))
 
 
 class Model(
@@ -224,6 +459,8 @@ class Model(
     _s3_bucket: str | None = None
     _s3_prefix: str | None = None
     _openai_client: AsyncOpenAI | None = None
+    _art_binary_routes_base_url: str | None = None
+    _serving_capabilities: ServingCapabilities | None = None
     _wandb_run: Optional["Run"] = None  # Private, for lazy wandb initialization
     _wandb_defined_metrics: set[str]
     _wandb_config: dict[str, Any]
@@ -278,6 +515,8 @@ class Model(
             self, "_metrics_builder", MetricsBuilder(cost_context="train")
         )
         object.__setattr__(self, "_metrics_builder_state_loaded", False)
+        object.__setattr__(self, "_art_binary_routes_base_url", None)
+        object.__setattr__(self, "_serving_capabilities", None)
 
     @overload
     def __new__(
@@ -386,9 +625,40 @@ class Model(
                 raw_client,
                 self._record_openai_completion_costs,
                 self._default_chat_completion_extra_body(),
+                (
+                    self.inference_base_url
+                    if self.trainable
+                    and _is_local_inference_base_url(self.inference_base_url)
+                    else None
+                ),
+                self._art_binary_routes_base_url,
+                self._policy_span_mode(),
             ),
         )
         return self._openai_client
+
+    async def _reset_inference_runtime(self) -> None:
+        client = self._openai_client
+        self._openai_client = None
+        self._art_binary_routes_base_url = None
+        self._serving_capabilities = None
+        self.inference_base_url = None
+        self.inference_api_key = None
+        self.inference_model_name = None
+        if client is not None:
+            await client.close()
+
+    def _policy_span_mode(self) -> Literal["none", "require", "synthesize"]:
+        internal_config = getattr(self, "_internal_config", None)
+        if not self.trainable or self._serving_capabilities is None:
+            return "none"
+        if self._serving_capabilities.policy_token_spans:
+            return "require"
+        if (internal_config or {}).get(
+            "rollout_weight_update_mode", "step_lora"
+        ) == "step_lora":
+            return "synthesize"
+        return "none"
 
     def _default_chat_completion_extra_body(self) -> dict[str, Any] | None:
         internal_config = getattr(self, "_internal_config", None)
@@ -598,7 +868,7 @@ class Model(
         merged = self._merge_wandb_config(self._wandb_config, config)
         object.__setattr__(self, "_wandb_config", merged)
 
-        if self._wandb_run is not None and not self._wandb_run._is_finished:
+        if self._wandb_run is not None and not _wandb_run_is_finished(self._wandb_run):
             self._sync_wandb_config(self._wandb_run)
 
     def _sync_wandb_config(
@@ -620,7 +890,7 @@ class Model(
         """Get or create the wandb run for this model."""
         if "WANDB_API_KEY" not in os.environ:
             return None
-        if self._wandb_run is None or self._wandb_run._is_finished:
+        if self._wandb_run is None or _wandb_run_is_finished(self._wandb_run):
             try:
                 run = wandb_sdk.init(
                     project=self.project,
@@ -650,28 +920,29 @@ class Model(
                 {
                     SFT_WANDB_GRADIENT_STEP_KEY,
                     "training_step",
-                    "time/wall_clock_sec",
                 },
             )
 
             # Define training_step as the x-axis for all metrics.
             # This allows out-of-order logging (e.g., async validation for previous steps).
             run.define_metric("training_step")
-            run.define_metric("time/wall_clock_sec")
             run.define_metric(SFT_WANDB_GRADIENT_STEP_KEY)
             run.define_metric("reward/*", step_metric="training_step")
             run.define_metric("loss/*", step_metric="training_step")
+            run.define_metric("objective/*", step_metric="training_step")
+            run.define_metric("sample_efficiency/*", step_metric="training_step")
+            run.define_metric("offpolicy/*", step_metric="training_step")
             run.define_metric("throughput/*", step_metric="training_step")
             run.define_metric("costs/*", step_metric="training_step")
             run.define_metric("time/*", step_metric="training_step")
             run.define_metric("data/*", step_metric="training_step")
+            run.define_metric("discarded/*", step_metric="training_step")
+            run.define_metric("pipeline_settings/*", step_metric="training_step")
+            run.define_metric("task/*", step_metric="training_step")
+            run.define_metric("vllm/*", step_metric="training_step")
             run.define_metric(
                 f"{SFT_METRIC_PREFIX}/*", step_metric=SFT_WANDB_GRADIENT_STEP_KEY
             )
-            run.define_metric("train/*", step_metric="training_step")
-            run.define_metric("val/*", step_metric="training_step")
-            run.define_metric("test/*", step_metric="training_step")
-            run.define_metric("discarded/*", step_metric="training_step")
             self._sync_wandb_config(run)
         return self._wandb_run
 
@@ -682,7 +953,14 @@ class Model(
         step: int,
     ) -> None:
         """Log metrics to history.jsonl and optionally wandb."""
-        if split in METRIC_SPLITS:
+        if split == SFT_METRIC_PREFIX:
+            prefixed = {
+                key
+                if key.startswith(f"{SFT_METRIC_PREFIX}/")
+                else f"{split}/{key}": value
+                for key, value in metrics.items()
+            }
+        else:
             prefixed = {}
             for key, value in metrics.items():
                 first_component = key.split("/", 1)[0]
@@ -694,11 +972,8 @@ class Model(
                     prefixed[key] = value
                 else:
                     prefixed[f"{split}/{key}"] = value
-        else:
-            prefixed = {f"{split}/{k}": v for k, v in metrics.items()}
 
         prefixed["training_step"] = step
-        prefixed["time/wall_clock_sec"] = time.time() - self._run_start_time
 
         output_dir = self._get_output_dir()
 
@@ -723,15 +998,24 @@ class Model(
         ) or (self.report_metrics is not None and "wandb" in self.report_metrics)
         if should_log_wandb:
             if run := self._get_wandb_run():
-                self._define_wandb_step_metrics(prefixed.keys())
+                wandb_metrics = self._wandb_metrics_payload(prefixed)
+                self._define_wandb_step_metrics(wandb_metrics.keys())
                 # Let W&B use its own monotonically increasing history step.
                 # ART's `training_step` remains the x-axis via define_metric,
                 # which preserves out-of-order eval logging.
-                run.log(prefixed)
+                run.log(wandb_metrics)
+
+    def _wandb_metrics_payload(self, metrics: dict[str, float]) -> dict[str, float]:
+        return {
+            key: value
+            for key, value in metrics.items()
+            if key in WANDB_CANONICAL_METRIC_KEYS
+            or key.startswith(WANDB_CANONICAL_METRIC_PREFIXES)
+        }
 
     def _define_wandb_step_metrics(self, keys: Iterable[str]) -> None:
         run = self._wandb_run
-        if run is None or run._is_finished:
+        if run is None or _wandb_run_is_finished(run):
             return
 
         for key in keys:
@@ -763,6 +1047,19 @@ class Model(
                 continue
             non_cost_metrics[metric] = numeric_value
         return non_cost_metrics
+
+    def _route_task_metrics_and_collect_non_costs(
+        self,
+        metrics: dict[str, float],
+        split: str,
+        *,
+        prefix: str | None = None,
+    ) -> dict[str, float]:
+        routed = self._route_metrics_and_collect_non_costs(metrics, split)
+        task_prefix = f"task/{split}"
+        if prefix:
+            task_prefix = f"{task_prefix}/{prefix.strip('/')}"
+        return {f"{task_prefix}/{metric}": value for metric, value in routed.items()}
 
     def _collect_automatic_backend_metrics(
         self,
@@ -974,8 +1271,10 @@ class Model(
 
         for group in trajectory_groups:
             if group.metrics:
-                group_non_cost = self._route_metrics_and_collect_non_costs(
-                    cast(dict[str, float], group.metrics), split
+                group_non_cost = self._route_task_metrics_and_collect_non_costs(
+                    cast(dict[str, float], group.metrics),
+                    split,
+                    prefix="group",
                 )
             else:
                 group_non_cost = {}
@@ -996,9 +1295,11 @@ class Model(
                 for metric, value in trajectory.metrics.items():
                     trajectory_metrics[metric] = float(value)
 
-                non_cost_trajectory_metrics = self._route_metrics_and_collect_non_costs(
-                    trajectory_metrics,
-                    split,
+                non_cost_trajectory_metrics = (
+                    self._route_task_metrics_and_collect_non_costs(
+                        trajectory_metrics,
+                        split,
+                    )
                 )
                 for metric, value in non_cost_trajectory_metrics.items():
                     if metric not in all_metrics:
@@ -1016,8 +1317,7 @@ class Model(
         # Aggregate group-level metrics once per group
         for metric, values in group_metrics.items():
             if len(values) > 0:
-                group_key = f"group_{metric}"
-                averages[group_key] = sum(values) / len(values)
+                averages[metric] = sum(values) / len(values)
 
         # Calculate average standard deviation of rewards within groups
         from .utils.old_benchmarking.calculate_step_metrics import (
@@ -1025,6 +1325,22 @@ class Model(
         )
 
         averages[reward_std_dev_key] = calculate_step_std_dev(trajectory_groups)
+
+        reward_value = averages.pop(reward_key, None)
+        reward_std_dev = averages.pop(reward_std_dev_key, None)
+        exception_rate = averages.pop(exception_rate_key, None)
+        if split in METRIC_SPLITS:
+            if reward_value is not None:
+                averages[f"reward/{split}"] = reward_value
+            if reward_std_dev is not None:
+                averages[f"reward/{split}_std_dev"] = reward_std_dev
+        else:
+            if reward_value is not None:
+                averages[f"task/{split}/reward"] = reward_value
+            if reward_std_dev is not None:
+                averages[f"task/{split}/reward_std_dev"] = reward_std_dev
+        if exception_rate is not None:
+            averages[f"task/{split}/exception_rate"] = exception_rate
 
         # Merge in any additional metrics passed directly
         if metrics is not None:
@@ -1204,6 +1520,7 @@ class TrainableModel(Model[ModelConfig, StateType], Generic[ModelConfig, StateTy
         backend: "Backend",
         _openai_client_config: dev.OpenAIServerConfig | None = None,
     ) -> None:
+        await self._reset_inference_runtime()
         await super().register(backend)
         base_url, api_key = await backend._prepare_backend_for_training(
             self, _openai_client_config
@@ -1220,14 +1537,14 @@ class TrainableModel(Model[ModelConfig, StateType], Generic[ModelConfig, StateTy
         )
 
     async def delete_checkpoints(
-        self, best_checkpoint_metric: str = "val/reward"
+        self, best_checkpoint_metric: str = "reward/val"
     ) -> None:
         """
         Delete all but the latest and best checkpoints.
 
         Args:
             best_checkpoint_metric: The metric to use to determine the best checkpoint.
-                Defaults to "val/reward".
+                Defaults to "reward/val".
         """
         output_dir = self._get_output_dir()
         steps_to_keep = [await self.get_step()]  # Keep latest
@@ -1321,7 +1638,7 @@ class TrainableModel(Model[ModelConfig, StateType], Generic[ModelConfig, StateTy
         # remote-logging backends, the remote SFT job owns this row too.
         if training_metrics and log_metrics and not backend_logs_sft_metrics:
             avg_metrics = average_metric_samples(training_metrics)
-            avg_metrics["time/step_trainer_s"] = trainer_elapsed
+            avg_metrics["time/step_backend_train_s"] = trainer_elapsed
             # Get the current step after training
             step = await self.get_step()
             await self.log(

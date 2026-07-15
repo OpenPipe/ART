@@ -1,5 +1,6 @@
 """DSV4-specific monkey patches for the ART-owned vLLM runtime."""
 
+import functools
 import importlib
 from typing import Any
 
@@ -8,6 +9,7 @@ def apply_dsv4_vllm_runtime_patches() -> None:
     patch_layerwise_reload_shadow_attrs()
     patch_dsv4_attn_sink_layerwise_reload()
     patch_dsv4_mhc_pre_fixed_split()
+    patch_dsv4_mhc_stable_transition()
     patch_dsv4_lora_support()
     patch_dsv4_mla_lora_aliases()
     patch_dsv4_fast_path_lora()
@@ -197,12 +199,11 @@ def patch_dsv4_mhc_pre_fixed_split() -> None:
     shape to the TileLang kernel default split count keeps the reduction plan
     stable without changing model math.
     """
-    try:
-        mhc = importlib.import_module("vllm.model_executor.layers.mhc")
-    except ImportError:
-        return
-    original = getattr(mhc, "compute_num_split", None)
-    if original is None or getattr(original, "__art_dsv4_fixed_split_patched__", False):
+    kernels = importlib.import_module(
+        "vllm.model_executor.kernels.mhc.tilelang_kernels"
+    )
+    original = kernels.compute_num_split
+    if getattr(original, "__art_dsv4_fixed_split_patched__", False):
         return
 
     def compute_num_split(block_k: int, k: int | None, grid_size: int) -> int:
@@ -211,18 +212,72 @@ def patch_dsv4_mhc_pre_fixed_split() -> None:
         return original(block_k, k, grid_size)
 
     compute_num_split.__art_dsv4_fixed_split_patched__ = True  # type: ignore[attr-defined]
-    mhc.compute_num_split = compute_num_split
+    kernels.compute_num_split = compute_num_split
+
+
+def patch_dsv4_mhc_stable_transition() -> None:
+    """Use one DSV4 mHC reduction path for prefill and short decode batches.
+
+    vLLM 0.23 routes transitions with at most 16 tokens through a fused FMA
+    kernel while larger batches use the DeepGEMM prenorm path. Their small
+    per-layer differences accumulate into generation/prompt-rescore drift.
+    Decomposing post and pre preserves vLLM's fused RMSNorm while making every
+    token count use the fixed-split prenorm path above.
+    """
+    model = importlib.import_module("vllm.models.deepseek_v4.nvidia.model")
+    kernels = importlib.import_module("vllm.model_executor.kernels.mhc.tilelang")
+    original = model.mhc_fused_post_pre_tilelang
+    if getattr(original, "__art_dsv4_stable_transition_patched__", False):
+        return
+
+    def mhc_stable_post_pre(
+        x: Any,
+        residual: Any,
+        post_layer_mix: Any,
+        comb_res_mix: Any,
+        fn: Any,
+        hc_scale: Any,
+        hc_base: Any,
+        rms_eps: float,
+        hc_pre_eps: float,
+        hc_sinkhorn_eps: float,
+        hc_post_mult_value: float,
+        sinkhorn_repeat: int,
+        n_splits: int = 1,
+        tile_n: int = 1,
+        norm_weight: Any | None = None,
+        norm_eps: float = 1e-6,
+    ) -> tuple[Any, Any, Any, Any]:
+        del tile_n
+        residual = kernels.mhc_post_tilelang(x, residual, post_layer_mix, comb_res_mix)
+        post_mix, comb_mix, layer_input = kernels.mhc_pre_tilelang(
+            residual,
+            fn,
+            hc_scale,
+            hc_base,
+            rms_eps,
+            hc_pre_eps,
+            hc_sinkhorn_eps,
+            hc_post_mult_value,
+            sinkhorn_repeat,
+            n_splits,
+            norm_weight,
+            norm_eps,
+        )
+        return residual, post_mix, comb_mix, layer_input
+
+    mhc_stable_post_pre.__art_dsv4_stable_transition_patched__ = True  # type: ignore[attr-defined]
+    model.mhc_fused_post_pre_tilelang = mhc_stable_post_pre
 
 
 def patch_dsv4_lora_support() -> None:
     """Enable vLLM's existing LoRA manager for ART-served DSV4.
 
-    DSV4 itself does not need a custom LoRA executor here. Once the model
-    advertises packed MLA/shared-expert modules and MoE expert children, vLLM
-    wraps the same FusedMoE module it already uses for serving. With LoRA
-    enabled, vLLM's modular MoE selector picks Marlin, whose expert backend
-    supports fused MoE LoRA. Do not point this patch at the FlashInfer TRTLLM
-    MXFP4 backend; that backend currently has no LoRA hooks.
+    DSV4 uses vLLM's fused 3D MoE LoRA layout exclusively; split per-expert
+    w1/w2/w3 adapters are not supported. With LoRA enabled, vLLM's modular MoE
+    selector picks Marlin, whose expert backend supports fused MoE LoRA. Do not
+    point this patch at the FlashInfer TRTLLM MXFP4 backend; that backend
+    currently has no LoRA hooks.
     """
     dsv4_model = _import_dsv4_model_module()
     if dsv4_model is None:
@@ -237,10 +292,24 @@ def patch_dsv4_lora_support() -> None:
         "fused_wkv_wgate": ["wkv", "wgate"],
         "gate_up_proj": ["gate_proj", "up_proj"],
     }
-    model_cls.is_3d_moe_weight = False
+    model_cls.is_3d_moe_weight = True
     model_cls.is_non_gated_moe = False
     model_cls.lora_manager = None
     model_cls.lora_skip_prefixes = ["mtp", "indexer"]
+    original_init = model_cls.__init__
+
+    @functools.wraps(original_init)
+    def init_3d_lora_only(self: Any, *args: Any, **kwargs: Any) -> None:
+        vllm_config = kwargs["vllm_config"]
+        lora_config = getattr(vllm_config, "lora_config", None)
+        if bool(getattr(lora_config, "enable_mixed_moe_lora_format", False)):
+            raise RuntimeError(
+                "DSV4 only supports fused 3D MoE LoRA; "
+                "enable_mixed_moe_lora_format must be false"
+            )
+        original_init(self, *args, **kwargs)
+
+    model_cls.__init__ = init_3d_lora_only
     model_cls._art_dsv4_lora_patched = True
     _patch_dsv4_lora_manager_indexer_skip(model_cls)
 

@@ -26,7 +26,7 @@ def _packed_inputs(seq_len: int = 4) -> PackedTensors:
 
 
 def test_precompute_reference_logprobs_preserves_sample_steps(monkeypatch) -> None:
-    calls: list[tuple[int, int, int]] = []
+    calls: list[tuple[int, int]] = []
 
     def fake_select_indexed_inputs(
         packed_tensors: dict[str, torch.Tensor], sample_index: int
@@ -43,7 +43,7 @@ def test_precompute_reference_logprobs_preserves_sample_steps(monkeypatch) -> No
         moe_routing_replay_controller: Any,
         step_index: int,
         sample_index: int,
-        global_grad_accumulation_sequences: int,
+        hybridep_token_count: int | None,
     ) -> torch.Tensor:
         del (
             model_chunks,
@@ -51,8 +51,9 @@ def test_precompute_reference_logprobs_preserves_sample_steps(monkeypatch) -> No
             model_support_handler,
             inputs,
             moe_routing_replay_controller,
+            hybridep_token_count,
         )
-        calls.append((sample_index, step_index, global_grad_accumulation_sequences))
+        calls.append((sample_index, step_index))
         return torch.tensor([[float(sample_index)]])
 
     monkeypatch.setattr(
@@ -78,7 +79,7 @@ def test_precompute_reference_logprobs_preserves_sample_steps(monkeypatch) -> No
         global_grad_accumulation_sequences=4,
     )
 
-    assert calls == [(0, 0, 4), (3, 1, 4)]
+    assert calls == [(0, 0), (3, 1)]
     assert sorted(result) == [0, 3]
 
 
@@ -94,7 +95,6 @@ def test_prepare_kl_reference_logprobs_requires_reference_path() -> None:
         megatron_train._prepare_kl_reference_logprobs(
             runtime=cast(megatron_train.TrainingRuntime, runtime),
             job=cast(megatron_train.MegatronTrainingJob, job),
-            adapter_model={},
             packed_tensors=_packed_inputs(),
             num_sequences=1,
             num_steps=1,
@@ -108,24 +108,21 @@ def test_prepare_kl_reference_logprobs_requires_reference_path() -> None:
 
 class _ReplayController:
     def __init__(self) -> None:
-        self.events: list[tuple[str, int, int | None, int | None]] = []
+        self.events: list[tuple[str, int, int | None]] = []
 
     def set_step(
         self,
         *,
         step_index: int,
         sample_index: int,
-        global_grad_accumulation_sequences: int | None = None,
     ) -> None:
-        self.events.append(
-            ("set_step", step_index, sample_index, global_grad_accumulation_sequences)
-        )
+        self.events.append(("set_step", step_index, sample_index))
 
     def begin_micro(self, sample_index: int, micro_order: int) -> None:
-        self.events.append(("begin_micro", micro_order, sample_index, None))
+        self.events.append(("begin_micro", micro_order, sample_index))
 
     def finalize_step(self) -> None:
-        self.events.append(("finalize_step", 0, None, None))
+        self.events.append(("finalize_step", 0, None))
 
 
 class _Chunk(nn.Module):
@@ -147,8 +144,8 @@ class _Chunk(nn.Module):
         del input_ids, position_ids, attention_mask, packed_seq_params
         self.training_modes_seen.append(self.training)
         assert self.controller.events == [
-            ("set_step", 2, 5, 8),
-            ("begin_micro", 0, 5, None),
+            ("set_step", 2, 5),
+            ("begin_micro", 0, 5),
         ]
         return torch.full(labels.shape, 0.25, dtype=torch.float32, device=labels.device)
 
@@ -183,13 +180,12 @@ def test_calculate_megatron_logprobs_replays_routes(monkeypatch) -> None:
         ),
         step_index=2,
         sample_index=5,
-        global_grad_accumulation_sequences=8,
     )
 
     assert controller.events == [
-        ("set_step", 2, 5, 8),
-        ("begin_micro", 0, 5, None),
-        ("finalize_step", 0, None, None),
+        ("set_step", 2, 5),
+        ("begin_micro", 0, 5),
+        ("finalize_step", 0, None),
     ]
     assert chunk.training_modes_seen == [False]
     assert chunk.training is True

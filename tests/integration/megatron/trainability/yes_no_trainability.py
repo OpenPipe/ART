@@ -557,7 +557,11 @@ def _variant_init_args(variant: _TrainabilityVariant) -> dev.InitArgs:
     return {"max_seq_length": _variant_packed_sequence_length(variant)}
 
 
-def _init_megatron_runtime_config(variant: _TrainabilityVariant) -> None:
+def _init_megatron_runtime_config(
+    variant: _TrainabilityVariant,
+    *,
+    streaming_weight_offload: bool = False,
+) -> None:
     if variant.topology is None:
         return
     init_runtime_config = getattr(art, "init_megatron_runtime_config", None)
@@ -571,6 +575,7 @@ def _init_megatron_runtime_config(variant: _TrainabilityVariant) -> None:
             etp=variant.topology.etp,
         ),
         packed_sequence_length=_variant_packed_sequence_length(variant),
+        streaming_weight_offload=streaming_weight_offload,
     )
 
 
@@ -939,15 +944,6 @@ async def run_yes_no_trainability_async(
         allow_unvalidated_arch=allow_unvalidated_arch,
     )
     rollout_weights_mode = internal_config["rollout_weights_mode"]
-    _init_megatron_runtime_config(variant)
-    model = art.TrainableModel(
-        name=f"{variant.name}-{uuid.uuid4().hex[:8]}",
-        project="model-support-validation",
-        base_model=base_model,
-        _internal_config=internal_config,
-        report_metrics=[],
-    )
-    train_kwargs = _variant_train_kwargs(variant)
     workflow_resources = handler_workflow_resources_for_base_model(
         base_model,
         allow_unvalidated_arch=allow_unvalidated_arch,
@@ -962,6 +958,22 @@ async def run_yes_no_trainability_async(
             "yes_no_trainability",
             stage_resources,
         )
+    _init_megatron_runtime_config(
+        variant,
+        streaming_weight_offload=(
+            stage_resources.streaming_weight_offload
+            if stage_resources is not None
+            else False
+        ),
+    )
+    model = art.TrainableModel(
+        name=f"{variant.name}-{uuid.uuid4().hex[:8]}",
+        project="model-support-validation",
+        base_model=base_model,
+        _internal_config=internal_config,
+        report_metrics=[],
+    )
+    train_kwargs = _variant_train_kwargs(variant)
     backend_env = {
         **(stage_resources.megatron_env if stage_resources is not None else {}),
         **(extra_env or {}),

@@ -24,6 +24,14 @@ def _compile_workaround_flags_for_provider(
     base_flags: tuple[str, ...] = (),
 ) -> tuple[str, ...]:
     flags = base_flags
+    if int(getattr(provider, "num_moe_experts", 0) or 0) > 0:
+        # Megatron's all-to-all dispatcher performs side-stream D2H copies and
+        # record_stream lifetime management inside this method. Those effects
+        # cannot be functionalized by Dynamo and do not benefit from compile.
+        flags = (*flags, "alltoall_dispatch_dtoh")
+        # HybridEP owns native communication, dynamic routing metadata, and
+        # side-stream lifetimes. Keep only Megatron's thin flex wrapper eager.
+        flags = (*flags, "flex_token_dispatch_combine")
     if (
         bool(getattr(provider, "sequence_parallel", False))
         and int(getattr(provider, "tensor_model_parallel_size", 1) or 1) > 1
@@ -131,6 +139,22 @@ class DefaultDenseHandler:
     ) -> dict[str, Any]:
         del context
         return {}
+
+    def zero_internal_padding_grads(self, model_chunks: Sequence[Any]) -> None:
+        del model_chunks
+        return None
+
+    def zero_internal_padding_params(self, model_chunks: Sequence[Any]) -> None:
+        del model_chunks
+        return None
+
+    def canonicalize_loaded_lora_state(
+        self,
+        state: dict[str, Any],
+        model_chunks: Sequence[Any],
+    ) -> dict[str, Any]:
+        del model_chunks
+        return state
 
     def correctness_precision(self) -> Literal["bf16", "fp32"]:
         return "fp32"

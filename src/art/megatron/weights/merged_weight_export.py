@@ -360,7 +360,7 @@ def sync_merged_weights_to_vllm(
     _ = bridge
     lora_result = build_vllm_lora_tensors_from_model(
         model=model,
-        adapter_model=adapter_model,
+        adapter_dtypes={key: tensor.dtype for key, tensor in adapter_model.items()},
         handler=model_support_handler,
         adapter_config=adapter_config,
         rank=rank,

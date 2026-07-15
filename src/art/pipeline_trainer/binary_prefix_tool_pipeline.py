@@ -19,7 +19,7 @@ import polars as pl
 import art
 from art.tinker_native import TinkerNativeBackend
 
-from . import PipelineTrainer, make_group_rollout_fn
+from . import PipelineRuntimeConfig, PipelineTrainer, make_group_rollout_fn
 
 Scenario = dict[str, Any]
 
@@ -159,12 +159,12 @@ def print_history_summary(model: art.TrainableModel, tail: int = 5) -> None:
 
     rows = pl.read_ndjson(str(history_path)).to_dicts()
 
-    train_rows = [row for row in rows if "train/reward" in row]
+    train_rows = [row for row in rows if "reward/train" in row]
     print("\nRecent training metrics:")
     for row in train_rows[-tail:]:
         step = row["step"]
-        reward = row["train/reward"]
-        std_dev = row["train/reward_std_dev"]
+        reward = row["reward/train"]
+        std_dev = row["reward/train_std_dev"]
         discarded = row["train/discarded_stale_groups"]
         off_policy = row["train/steps_off_policy"]
         print(
@@ -331,10 +331,12 @@ async def main() -> None:
         scenarios=scenario_iter(),
         config=config,
         eval_fn=eval_fn,
-        num_rollout_workers=num_rollout_workers,
-        min_batch_size=min_batch_size,
-        max_steps_off_policy=max_steps_off_policy,
-        max_batch_size=max_batch_size,
+        pipeline=PipelineRuntimeConfig(
+            num_rollout_workers=num_rollout_workers,
+            min_batch_size=min_batch_size,
+            max_batch_size=max_batch_size,
+            max_steps_off_policy=max_steps_off_policy,
+        ),
         learning_rate=float(os.environ.get("LEARNING_RATE", "1e-4")),
         log_interval_seconds=log_interval_seconds,
         eval_every_n_steps=eval_every_n_steps,

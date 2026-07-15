@@ -18,7 +18,7 @@ from art.megatron.model_support.registry import (
     get_model_support_spec,
     model_uses_expert_parallel,
 )
-from art.pipeline_trainer import PipelineTrainer
+from art.pipeline_trainer import PipelineRuntimeConfig, PipelineTrainer
 from art.utils.chat_template import default_chat_template_kwargs_for_tokenizer
 
 from ..model_support.oracle_harness import Topology
@@ -31,6 +31,7 @@ from .yes_no_trainability import (
     _get_env_int,
     _init_megatron_runtime_config,
     _list_model_ids,
+    _topology_with_env_overrides,
     _trainability_stage_resources,
 )
 
@@ -48,6 +49,9 @@ DEFAULT_INITIAL_ABS_ERROR_MIN = 5.0
 DEFAULT_SUCCESS_ABS_ERROR_MAX = 1.5
 GPT_OSS_INITIAL_ABS_ERROR_MIN = 100.0
 GPT_OSS_SUCCESS_ABS_ERROR_MAX = 5.0
+GPT_OSS_TARGET_TOKENS = 20
+GEMMA4_TARGET_TOKENS = 22
+GEMMA4_LENGTH_LEARNING_RATE = 3e-5
 DEFAULT_LENGTH_MAX_STEPS = 20
 GPT_OSS_MIN_MAX_TOKENS = 512
 GPT_OSS_LENGTH_SYSTEM_PROMPT = (
@@ -218,11 +222,18 @@ def _word_count(text: str) -> int:
     return len(text.split())
 
 
-def _target_tokens() -> int:
-    return _get_env_int("ART_MODEL_SUPPORT_LENGTH_TARGET_TOKENS", 10)
+def _target_tokens(base_model: str | None = None) -> int:
+    model_key = _model_support_key(base_model)
+    default = {
+        "gemma4_moe": GEMMA4_TARGET_TOKENS,
+        "gpt_oss_moe": GPT_OSS_TARGET_TOKENS,
+    }.get(model_key, 10)
+    return _get_env_int("ART_MODEL_SUPPORT_LENGTH_TARGET_TOKENS", default)
 
 
 def _default_learning_rate(base_model: str) -> float:
+    if _model_support_key(base_model) == "gemma4_moe":
+        return GEMMA4_LENGTH_LEARNING_RATE
     if base_model == DEFAULT_BASE_MODEL:
         return LARGE_MOE_LENGTH_LEARNING_RATE
     return DEFAULT_LENGTH_LEARNING_RATE
@@ -238,16 +249,17 @@ def _use_default_moe_dedicated_placement(variant: Any, *, base_model: str) -> No
     )
     if stage_resources is not None:
         return
-    if os.environ.get(TRAINER_GPU_IDS_ENV) or os.environ.get(INFERENCE_GPU_IDS_ENV):
-        return
-    if torch.cuda.device_count() < 3:
-        pytest.skip(
-            "Need at least 3 visible CUDA GPUs for default dedicated MoE length "
-            "trainability: 2 trainer GPUs and 1 inference GPU."
-        )
-    variant.trainer_gpu_ids = [0, 1]
-    variant.inference_gpu_ids = [2]
-    variant.topology = MOE_DEDICATED_TRAINING_TOPOLOGY
+    if not (
+        os.environ.get(TRAINER_GPU_IDS_ENV) or os.environ.get(INFERENCE_GPU_IDS_ENV)
+    ):
+        if torch.cuda.device_count() < 3:
+            pytest.skip(
+                "Need at least 3 visible CUDA GPUs for default dedicated MoE "
+                "length trainability: 2 trainer GPUs and 1 inference GPU."
+            )
+        variant.trainer_gpu_ids = [0, 1]
+        variant.inference_gpu_ids = [2]
+    variant.topology = _topology_with_env_overrides(MOE_DEDICATED_TRAINING_TOPOLOGY)
 
 
 def _check_prompt_hides_target(prompt: str) -> None:
@@ -261,13 +273,14 @@ def _check_prompt_hides_target(prompt: str) -> None:
         raise RuntimeError(f"Length prompt leaks target wording: {leaked}")
 
 
-def _is_gpt_oss_model(base_model: str | None) -> bool:
+def _model_support_key(base_model: str | None) -> str | None:
     if base_model is None:
-        return False
-    return (
-        get_model_support_spec(base_model, allow_unvalidated_arch=True).key
-        == "gpt_oss_moe"
-    )
+        return None
+    return get_model_support_spec(base_model, allow_unvalidated_arch=True).key
+
+
+def _is_gpt_oss_model(base_model: str | None) -> bool:
+    return _model_support_key(base_model) == "gpt_oss_moe"
 
 
 def _length_trainability_thresholds(
@@ -351,7 +364,7 @@ def _scenario(
     target_step: int | None = None,
     base_model: str | None = None,
 ) -> LengthScenario:
-    target_tokens = _target_tokens()
+    target_tokens = _target_tokens(base_model)
     max_tokens = _base_max_tokens(target_tokens, base_model=base_model)
     prompt, prompt_word_count = _prompt_for_index(index)
     return LengthScenario(
@@ -728,11 +741,18 @@ async def run_length_trainability_async(
     tokenizer = AutoTokenizer.from_pretrained(base_model)
     chat_template_kwargs = _length_chat_template_kwargs(base_model, tokenizer)
     rollout_weights_mode = internal_config["rollout_weights_mode"]
-    _init_megatron_runtime_config(variant)
     stage_resources = _trainability_stage_resources(
         base_model,
         stage_name="length_trainability",
         allow_unvalidated_arch=allow_unvalidated_arch,
+    )
+    _init_megatron_runtime_config(
+        variant,
+        streaming_weight_offload=(
+            stage_resources.streaming_weight_offload
+            if stage_resources is not None
+            else False
+        ),
     )
     backend_env = stage_resources.megatron_env if stage_resources is not None else {}
 
@@ -803,10 +823,12 @@ async def run_length_trainability_async(
             rollout_fn=rollout_fn,
             scenarios=scenarios(),
             config=None,
-            num_rollout_workers=rollout_workers,
-            min_batch_size=1,
-            max_batch_size=1,
-            max_steps_off_policy=max_steps_off_policy,
+            pipeline=PipelineRuntimeConfig(
+                num_rollout_workers=rollout_workers,
+                min_batch_size=1,
+                max_batch_size=1,
+                max_steps_off_policy=max_steps_off_policy,
+            ),
             learning_rate=_get_env_float(
                 "ART_MODEL_SUPPORT_LENGTH_LEARNING_RATE",
                 _default_learning_rate(base_model),

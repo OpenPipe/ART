@@ -6,9 +6,11 @@ import os
 from pathlib import Path
 import shutil
 import socket
+import subprocess
 import sys
 from typing import Any, AsyncIterator, Literal, TypedDict, cast
 from urllib.parse import urlparse
+import uuid
 import warnings
 
 from peft.tuners.lora.config import LoraConfig
@@ -17,16 +19,20 @@ import torch
 from .. import dev, types
 from ..dev.get_model_config import default_target_modules
 from ..dev.validate import is_dedicated_mode
-from ..local.checkpoints import get_last_checkpoint_dir
 from ..preprocessing.pack import DiskPackedTensors
 from ..preprocessing.tokenize import SFTBatch
+from ..serving_capabilities import (
+    ServingCapabilities,
+    discover_serving_capabilities,
+)
 from ..types import MegatronRuntimeConfig, MegatronTopologyConfig
 from ..utils.get_model_step import get_step_from_dir
 from ..utils.lifecycle import (
     ChildProcessSupervisor,
     ServiceLifecycle,
+    cleanup_after_failure,
     managed_process_cmd,
-    terminate_asyncio_process_group,
+    terminate_popen_process_group,
 )
 from ..utils.output_dirs import get_step_checkpoint_dir
 from ..vllm_runtime import (
@@ -48,12 +54,18 @@ from .model_support.registry import (
     UnsupportedModelArchitectureError,
     model_uses_expert_parallel,
 )
+from .optimizer_state import (
+    MegatronResumeStep,
+    format_megatron_resume_message,
+    prepare_megatron_resume_state,
+)
 from .runtime.client import (
     create_megatron_job_paths,
     stream_megatron_job,
     write_megatron_job,
 )
 from .runtime.jobs import (
+    LORA_READY_EVENT,
     MegatronMergedTrainingJob,
     MegatronSFTTrainingJob,
     MegatronSyncJob,
@@ -61,6 +73,7 @@ from .runtime.jobs import (
     MergedWeightTransferInitInfo,
     MergedWeightTransferSpec,
 )
+from .runtime.te_cutlass_grouped_gemm import force_te_cutlass_grouped_gemm_env
 from .runtime_config import get_megatron_runtime_config
 from .training.sft_batches import materialize_sft_batches
 
@@ -196,7 +209,12 @@ class MegatronService:
     )
     _is_sleeping: bool = False
     _latest_step: int = 0
-    _megatron_process: asyncio.subprocess.Process | None = None
+    _training_session_id: str = field(
+        default_factory=lambda: uuid.uuid4().hex,
+        init=False,
+    )
+    _resume_step: MegatronResumeStep | None = None
+    _megatron_process: subprocess.Popen[Any] | None = None
     _megatron_log_file: Any = None
     _megatron_log_path: str | None = None
     _vllm_runtime: ManagedVllmRuntime = field(
@@ -217,12 +235,33 @@ class MegatronService:
         init=False,
         repr=False,
     )
+    _loaded_exact_adapter_steps: set[int] = field(
+        default_factory=set,
+        init=False,
+        repr=False,
+    )
+    _exact_adapter_refcounts: dict[int, int] = field(
+        default_factory=dict,
+        init=False,
+        repr=False,
+    )
+    _exact_adapter_lock: asyncio.Lock = field(
+        default_factory=asyncio.Lock,
+        init=False,
+        repr=False,
+    )
+    _serving_capabilities: ServingCapabilities | None = field(
+        default=None,
+        init=False,
+        repr=False,
+    )
 
     def __post_init__(self) -> None:
         self._child_processes = ChildProcessSupervisor(self._on_child_process_exit)
         self._validate_megatron_dependencies()
 
-    def _on_child_process_exit(self, _error: RuntimeError) -> None:
+    def _on_child_process_exit(self, error: RuntimeError) -> None:
+        self._status(f"Child process exited unexpectedly: {error}")
         self.close()
 
     def _raise_if_child_failed(self) -> None:
@@ -244,6 +283,30 @@ class MegatronService:
         mode = self.config.get("rollout_weights_mode", "lora")
         assert mode in {"lora", "merged"}
         return mode
+
+    @property
+    def rollout_weight_update_mode(self) -> Literal["step_lora", "in_flight_lora"]:
+        mode = self.config.get("rollout_weight_update_mode", "step_lora")
+        assert mode in {"step_lora", "in_flight_lora"}
+        return mode
+
+    @property
+    def _in_flight_lora_slot(self) -> str:
+        return f"{self.model_name}:active"
+
+    @property
+    def _initial_served_model_name(self) -> str:
+        if (
+            self.rollout_weights_mode == "lora"
+            and self.rollout_weight_update_mode == "in_flight_lora"
+        ):
+            return self._in_flight_lora_slot
+        return f"{self.model_name}@{self._latest_step}"
+
+    def _exact_lora_name(self, step: int) -> str:
+        if self.rollout_weight_update_mode == "in_flight_lora":
+            return f"{self.model_name}:eval@{step}"
+        return f"{self.model_name}@{step}"
 
     @property
     def _vllm_base_url(self) -> str:
@@ -306,16 +369,10 @@ class MegatronService:
             return len(self.config["trainer_gpu_ids"])
         return max(int(torch.cuda.device_count()), 1)
 
-    @staticmethod
-    def _parallel_env_int(name: str, default: int) -> int:
-        raw = os.environ.get(name)
-        return default if raw is None or raw == "" else int(raw)
-
     def _data_parallel_world_size(self) -> int:
         num_gpus = self._trainer_gpu_count()
-        tp = self._parallel_env_int("ART_MEGATRON_TENSOR_MODEL_PARALLEL_SIZE", num_gpus)
-        cp = self._parallel_env_int("ART_MEGATRON_CONTEXT_PARALLEL_SIZE", 1)
-        pp = self._parallel_env_int("ART_MEGATRON_PIPELINE_MODEL_PARALLEL_SIZE", 1)
+        topology = self.runtime_config.topology
+        tp, cp, pp = topology.tp, topology.cp, topology.pp
         denominator = max(tp * cp * pp, 1)
         if num_gpus % denominator != 0:
             raise RuntimeError(
@@ -461,6 +518,22 @@ class MegatronService:
         headers = self._runtime_headers()
         return {"headers": headers} if headers else {}
 
+    @property
+    def serving_capabilities(self) -> ServingCapabilities:
+        if self._serving_capabilities is None:
+            raise RuntimeError("vLLM serving capabilities have not been discovered")
+        return self._serving_capabilities
+
+    async def get_serving_capabilities(self) -> ServingCapabilities:
+        return self.serving_capabilities
+
+    async def _discover_serving_capabilities(self, *, external: bool) -> None:
+        self._serving_capabilities = await discover_serving_capabilities(
+            base_url=self._vllm_base_url,
+            headers=self._runtime_headers(),
+            allow_openai_compatible=external,
+        )
+
     def _vllm_checkpoint_path(self, checkpoint_path: str) -> str:
         return map_checkpoint_path_for_vllm(self.config, checkpoint_path)
 
@@ -473,6 +546,17 @@ class MegatronService:
         )
         os.makedirs(optimizer_state_path, exist_ok=True)
         return optimizer_state_path
+
+    def _resolve_resume_step(self) -> MegatronResumeStep:
+        if self._resume_step is not None:
+            return self._resume_step
+        info = prepare_megatron_resume_state(
+            output_dir=self.output_dir,
+            optimizer_state_path=self._get_optimizer_state_path("rl"),
+        )
+        self._resume_step = info
+        self._status(format_megatron_resume_message(info))
+        return info
 
     def _default_lora_adapter_config(self) -> LoraConfig:
         from .model_support import get_model_support_handler
@@ -494,7 +578,12 @@ class MegatronService:
             bias="none",
         )
 
-    def _adapter_exists_and_loads(self, lora_path: str) -> bool:
+    def _adapter_exists_and_loads(
+        self,
+        lora_path: str,
+        *,
+        normalize_existing: bool = False,
+    ) -> bool:
         adapter_path = os.path.join(lora_path, "adapter_model.safetensors")
         if not os.path.exists(adapter_path):
             return False
@@ -504,6 +593,11 @@ class MegatronService:
                 raise RuntimeError(f"LoRA adapter contains no tensors: {adapter_path}")
             for key in keys:
                 adapter_file.get_tensor(key)
+        if normalize_existing:
+            normalize_lora_checkpoint_to_vllm(
+                lora_path,
+                allow_unvalidated_arch=self._allow_unvalidated_arch,
+            )
         return True
 
     def _create_identity_lora(self, lora_path: str) -> None:
@@ -522,8 +616,16 @@ class MegatronService:
             allow_unvalidated_arch=self._allow_unvalidated_arch,
         )
 
-    def _ensure_identity_lora(self, lora_path: str) -> None:
-        if self._adapter_exists_and_loads(lora_path):
+    def _ensure_identity_lora(
+        self,
+        lora_path: str,
+        *,
+        normalize_existing: bool = False,
+    ) -> None:
+        if self._adapter_exists_and_loads(
+            lora_path,
+            normalize_existing=normalize_existing,
+        ):
             return
         self._create_identity_lora(lora_path)
 
@@ -554,16 +656,22 @@ class MegatronService:
             nccl_so_path=self._vllm_nccl_so_path,
         )
 
-    def _resolve_active_lora_path(self) -> str:
-        lora_path = get_last_checkpoint_dir(self.output_dir)
-        if lora_path is None:
+    def _resolve_current_lora_path(self) -> str:
+        resume_step = self._resolve_resume_step()
+        if self._latest_step < resume_step.step:
+            self._latest_step = resume_step.step
+        lora_path = get_step_checkpoint_dir(self.output_dir, self._latest_step)
+        if self._latest_step == 0 and not os.path.exists(lora_path):
             lora_path = get_step_checkpoint_dir(self.output_dir, 0)
-            self._latest_step = 0
-        else:
-            self._latest_step = get_step_from_dir(self.output_dir)
-        self._ensure_identity_lora(lora_path)
+        self._ensure_identity_lora(
+            lora_path,
+            normalize_existing=self._latest_step == 0,
+        )
         self._ensure_lora_adapter_config(lora_path)
         return lora_path
+
+    def _resolve_active_lora_path(self) -> str:
+        return self._resolve_current_lora_path()
 
     async def _set_served_model_name(self, step: int) -> None:
         import httpx
@@ -620,7 +728,7 @@ class MegatronService:
                 host=self._vllm_runtime.host,
                 cuda_visible_devices=self._runtime_cuda_visible_devices(),
                 lora_path=lora_path,
-                served_model_name=f"{self.model_name}@{self._latest_step}",
+                served_model_name=self._initial_served_model_name,
                 rollout_weights_mode=self.rollout_weights_mode,
                 engine_args=self._runtime_engine_args(config),
                 server_args=server_args,
@@ -637,13 +745,41 @@ class MegatronService:
         import httpx
 
         self._raise_if_child_failed()
+        payload: dict[str, Any] = {
+            "lora_name": f"{self.model_name}@{step}",
+            "lora_path": self._vllm_checkpoint_path(checkpoint_path),
+        }
+        if self.serving_capabilities.inplace_lora_load:
+            payload["load_inplace"] = True
         async with httpx.AsyncClient() as client:
             response = await client.post(
                 f"{self._vllm_base_url}/v1/load_lora_adapter",
+                json=payload,
+                **self._runtime_request_kwargs(),
+                timeout=60.0,
+            )
+            response.raise_for_status()
+        self._latest_step = step
+        self._loaded_adapter_steps.add(step)
+
+    async def _update_in_flight_adapter(self, checkpoint_path: str, step: int) -> None:
+        import httpx
+
+        self._raise_if_child_failed()
+        self.serving_capabilities.require(
+            "in_flight_lora_updates", operation="In-flight LoRA updates"
+        )
+        self.serving_capabilities.require(
+            "policy_token_spans", operation="In-flight LoRA updates"
+        )
+        async with httpx.AsyncClient() as client:
+            response = await client.post(
+                f"{self._vllm_base_url}/art/in_flight_lora_update",
                 json={
-                    "lora_name": f"{self.model_name}@{step}",
-                    "lora_path": self._vllm_checkpoint_path(checkpoint_path),
-                    "load_inplace": True,
+                    "model_name": f"{self.model_name}@{step}",
+                    "lora_slot": self._in_flight_lora_slot,
+                    "lora_path": checkpoint_path,
+                    "policy_version": step,
                 },
                 **self._runtime_request_kwargs(),
                 timeout=60.0,
@@ -652,25 +788,90 @@ class MegatronService:
         self._latest_step = step
         self._loaded_adapter_steps.add(step)
 
-    async def _unload_adapter(self, step: int) -> None:
+    async def _load_rollout_lora_for_step(
+        self, checkpoint_path: str, step: int
+    ) -> None:
+        if self.rollout_weight_update_mode == "in_flight_lora":
+            await self._update_in_flight_adapter(checkpoint_path, step)
+        else:
+            await self._reload_adapter(checkpoint_path, step)
+
+    async def acquire_exact_adapter(self, step: int, checkpoint_path: str) -> str:
+        if self.rollout_weights_mode != "lora":
+            raise RuntimeError("Exact checkpoint eval requires LoRA rollout serving")
+        lora_name = self._exact_lora_name(step)
+        async with self._exact_adapter_lock:
+            loaded_steps = (
+                self._loaded_exact_adapter_steps
+                if self.rollout_weight_update_mode == "in_flight_lora"
+                else self._loaded_adapter_steps
+            )
+            if step in loaded_steps:
+                if self.rollout_weight_update_mode == "in_flight_lora":
+                    self._exact_adapter_refcounts[step] += 1
+                return lora_name
+            import httpx
+
+            self._raise_if_child_failed()
+            async with httpx.AsyncClient() as client:
+                response = await client.post(
+                    f"{self._vllm_base_url}/v1/load_lora_adapter",
+                    json={
+                        "lora_name": lora_name,
+                        "lora_path": self._vllm_checkpoint_path(checkpoint_path),
+                    },
+                    **self._runtime_request_kwargs(),
+                    timeout=60.0,
+                )
+                response.raise_for_status()
+            loaded_steps.add(step)
+            if self.rollout_weight_update_mode == "in_flight_lora":
+                self._exact_adapter_refcounts[step] = 1
+        return lora_name
+
+    async def release_exact_adapter(self, step: int) -> None:
+        if self.rollout_weight_update_mode != "in_flight_lora":
+            return
+        async with self._exact_adapter_lock:
+            count = self._exact_adapter_refcounts[step]
+            if count > 1:
+                self._exact_adapter_refcounts[step] = count - 1
+                return
+            await self._unload_exact_adapter(step)
+            del self._exact_adapter_refcounts[step]
+
+    async def _unload_adapter_name(self, lora_name: str) -> bool:
         import httpx
 
         self._raise_if_child_failed()
         async with httpx.AsyncClient() as client:
             response = await client.post(
                 f"{self._vllm_base_url}/v1/unload_lora_adapter",
-                json={"lora_name": f"{self.model_name}@{step}"},
+                json={"lora_name": lora_name},
                 **self._runtime_request_kwargs(),
                 timeout=30.0,
             )
             if response.status_code == 404:
-                self._loaded_adapter_steps.discard(step)
-                return
+                return False
             response.raise_for_status()
+        return True
+
+    async def _unload_adapter(self, step: int) -> None:
+        await self._unload_adapter_name(f"{self.model_name}@{step}")
         self._loaded_adapter_steps.discard(step)
+
+    async def _unload_exact_adapter(self, step: int) -> None:
+        await self._unload_adapter_name(self._exact_lora_name(step))
+        self._loaded_exact_adapter_steps.discard(step)
 
     async def prune_loaded_adapters(self, *, retain_steps: set[int]) -> None:
         if self.rollout_weights_mode != "lora" or self._vllm_port == 0:
+            return
+        async with self._exact_adapter_lock:
+            for step in sorted(self._loaded_exact_adapter_steps - retain_steps):
+                if self._exact_adapter_refcounts.get(step, 0) == 0:
+                    await self._unload_exact_adapter(step)
+        if self.rollout_weight_update_mode == "in_flight_lora":
             return
         for step in sorted(self._loaded_adapter_steps - retain_steps):
             if step == self._latest_step:
@@ -740,18 +941,20 @@ class MegatronService:
         if self.rollout_weights_mode == "merged":
             await self._set_served_model_name(step)
         else:
-            await self._reload_adapter(checkpoint_dir, step)
+            await self._load_rollout_lora_for_step(checkpoint_dir, step)
         self._latest_step = step
 
     def _validate_megatron_dependencies(self) -> None:
         try:
+            from .hybrid_ep_setup import validate_hybrid_ep
+
+            validate_hybrid_ep()
+            import deep_ep  # noqa: F401
             import megatron.bridge  # type: ignore
         except ImportError as exc:
             raise RuntimeError(
                 "Megatron dependencies are not available in the active ART environment. "
-                "Run `setup.sh` for this worktree and build the project venv with "
-                "`uv sync --extra megatron` before starting Megatron "
-                "training."
+                "Run ART's Megatron setup before starting training."
             ) from exc
 
     async def _ensure_megatron_running(self) -> None:
@@ -770,6 +973,7 @@ class MegatronService:
         train_script = Path(__file__).parent / "train.py"
         project_root = Path(__file__).resolve().parents[3]
         env = os.environ.copy()
+        force_te_cutlass_grouped_gemm_env(env)
         if self.is_dedicated:
             trainer_gpu_ids = self.config["trainer_gpu_ids"]
             num_gpus = len(trainer_gpu_ids)
@@ -787,6 +991,9 @@ class MegatronService:
         env["ART_MEGATRON_JOBS_DIR"] = jobs_dir
         env["ART_MEGATRON_WAKE_LOCK_PATH"] = wake_lock_path
         env[OFFLOAD_BETWEEN_JOBS_ENV] = "0" if self.is_dedicated else "1"
+        env["ART_MEGATRON_STREAMING_WEIGHT_OFFLOAD"] = (
+            "1" if self.runtime_config.streaming_weight_offload else "0"
+        )
         master_addr = env.get("MASTER_ADDR", "127.0.0.1")
         master_port = str(self._allocate_master_port())
         env["MASTER_ADDR"] = master_addr
@@ -828,8 +1035,8 @@ class MegatronService:
             f"Starting Megatron worker on {num_gpus} GPU(s). "
             f"Logs: {self._display_path(megatron_log_path)}"
         )
-        self._megatron_process = await asyncio.create_subprocess_exec(
-            *managed_process_cmd(command),
+        self._megatron_process = subprocess.Popen(
+            managed_process_cmd(command),
             cwd=str(project_root),
             env=env,
             stdout=self._megatron_log_file,
@@ -837,7 +1044,7 @@ class MegatronService:
             start_new_session=True,
         )
         self._install_parent_signal_cleanup()
-        self._child_processes.watch_asyncio_process(
+        self._child_processes.watch_popen(
             "Megatron worker",
             self._megatron_process,
             log_path=megatron_log_path,
@@ -860,13 +1067,7 @@ class MegatronService:
         )
 
     def _resolve_training_lora_path(self) -> str:
-        lora_path = get_last_checkpoint_dir(self.output_dir)
-        if lora_path is None:
-            lora_path = get_step_checkpoint_dir(self.output_dir, 0)
-            self._latest_step = 0
-        self._ensure_identity_lora(lora_path)
-        self._ensure_lora_adapter_config(lora_path)
-        return lora_path
+        return self._resolve_current_lora_path()
 
     async def _prepare_for_training(self) -> str:
         self._raise_if_child_failed()
@@ -886,10 +1087,6 @@ class MegatronService:
         step: int,
     ) -> str:
         self._ensure_lora_adapter_config(staging_lora_path)
-        if not self._adapter_exists_and_loads(staging_lora_path):
-            raise RuntimeError(
-                f"Megatron training did not publish LoRA adapter: {staging_lora_path}"
-            )
         checkpoint_dir = get_step_checkpoint_dir(self.output_dir, step)
         if os.path.exists(checkpoint_dir):
             raise RuntimeError(
@@ -919,8 +1116,50 @@ class MegatronService:
             if os.path.exists(wake_lock_path):
                 os.remove(wake_lock_path)
 
-        await self._reload_adapter(checkpoint_dir, step)
+        await self._load_rollout_lora_for_step(checkpoint_dir, step)
         self._status(f"Loaded checkpoint {step} into vLLM")
+
+    async def _handle_training_lora_ready(
+        self,
+        *,
+        checkpoint_dir: str | None,
+        staging_lora_path: str,
+        step: int,
+    ) -> str:
+        if checkpoint_dir is None:
+            checkpoint_dir = self._publish_staged_training_checkpoint(
+                staging_lora_path=staging_lora_path,
+                step=step,
+            )
+        if self.is_dedicated and self.rollout_weights_mode == "lora":
+            await self._load_rollout_lora_for_step(checkpoint_dir, step)
+            self._status(f"Loaded checkpoint {step} into vLLM")
+        return checkpoint_dir
+
+    async def _finish_training_checkpoint(
+        self,
+        *,
+        checkpoint_dir: str | None,
+        staging_lora_path: str,
+        step: int,
+    ) -> str:
+        if checkpoint_dir is None:
+            checkpoint_dir = self._publish_staged_training_checkpoint(
+                staging_lora_path=staging_lora_path,
+                step=step,
+            )
+        if self.rollout_weights_mode == "merged":
+            self._latest_step = step
+        elif self.is_dedicated:
+            if self._latest_step != step:
+                await self._load_rollout_lora_for_step(checkpoint_dir, step)
+                self._status(f"Loaded checkpoint {step} into vLLM")
+        else:
+            await self._wake_and_reload_training_checkpoint(
+                checkpoint_dir=checkpoint_dir,
+                step=step,
+            )
+        return checkpoint_dir
 
     async def start_openai_server(
         self, config: dev.OpenAIServerConfig | None
@@ -945,23 +1184,40 @@ class MegatronService:
                 timeout=external_runtime.health_timeout_s,
                 headers=self._runtime_headers(),
             )
-            await self._reload_adapter(lora_path, self._latest_step)
-            self._loaded_adapter_steps.add(self._latest_step)
+            try:
+                await self._discover_serving_capabilities(external=True)
+                await self._load_rollout_lora_for_step(lora_path, self._latest_step)
+                self._loaded_adapter_steps.add(self._latest_step)
+            except BaseException as exc:
+                await cleanup_after_failure(
+                    exc,
+                    self.aclose,
+                    message="vLLM startup and Megatron cleanup failed.",
+                )
+                raise
             self._status(f"External vLLM runtime is ready at {self._vllm_base_url}")
             return self._vllm_host, self._vllm_port
 
         port = (config or {}).get("server_args", {}).get("port", 8000)
         location = await self._start_vllm_subprocess(lora_path, port, config)
-        if self.rollout_weights_mode == "lora":
-            self._loaded_adapter_steps.add(self._latest_step)
         try:
+            await self._discover_serving_capabilities(external=False)
+            if self.rollout_weights_mode == "lora":
+                if self.rollout_weight_update_mode == "in_flight_lora":
+                    await self._update_in_flight_adapter(lora_path, self._latest_step)
+                else:
+                    self._loaded_adapter_steps.add(self._latest_step)
             if self.rollout_weights_mode == "merged":
                 await self._sync_dedicated_merged_weights(
                     lora_path=lora_path,
                     step=self._latest_step,
                 )
-        except BaseException:
-            await self.aclose()
+        except BaseException as exc:
+            await cleanup_after_failure(
+                exc,
+                self.aclose,
+                message="vLLM startup and Megatron cleanup failed.",
+            )
             raise
         return location
 
@@ -996,6 +1252,9 @@ class MegatronService:
                     await self._init_merged_weight_transfer()
                     job: MegatronTrainingJob | MegatronMergedTrainingJob = (
                         MegatronMergedTrainingJob(
+                            step=next_step,
+                            source_policy_step=self._latest_step,
+                            training_session_id=self._training_session_id,
                             lora_path=staging_lora_path,
                             allow_unvalidated_arch=self._allow_unvalidated_arch,
                             optimizer_state_path=self._get_optimizer_state_path("rl"),
@@ -1017,6 +1276,9 @@ class MegatronService:
                     )
                 else:
                     job = MegatronTrainingJob(
+                        step=next_step,
+                        source_policy_step=self._latest_step,
+                        training_session_id=self._training_session_id,
                         lora_path=staging_lora_path,
                         allow_unvalidated_arch=self._allow_unvalidated_arch,
                         optimizer_state_path=self._get_optimizer_state_path("rl"),
@@ -1031,22 +1293,27 @@ class MegatronService:
                         log_path=log_path,
                     )
                 write_megatron_job(job, job_path=job_path)
+                checkpoint_dir: str | None = None
                 async for result in stream_megatron_job(
                     job,
                     job_path=job_path,
                     process=self._megatron_process,
                     process_log_path=self._megatron_log_path,
                 ):
+                    if result.get("event") == LORA_READY_EVENT:
+                        checkpoint_dir = await self._handle_training_lora_ready(
+                            checkpoint_dir=checkpoint_dir,
+                            staging_lora_path=staging_lora_path,
+                            step=next_step,
+                        )
+                        continue
                     yield {key: float(value) for key, value in result.items()}
 
-                new_checkpoint_dir = self._publish_staged_training_checkpoint(
+                await self._finish_training_checkpoint(
+                    checkpoint_dir=checkpoint_dir,
                     staging_lora_path=staging_lora_path,
                     step=next_step,
                 )
-                if self.rollout_weights_mode == "merged":
-                    self._latest_step = next_step
-                else:
-                    await self._reload_adapter(new_checkpoint_dir, next_step)
                 return
 
             lora_path = await self._prepare_for_training()
@@ -1057,6 +1324,9 @@ class MegatronService:
             )
             job_path, log_path = self._create_megatron_job_paths()
             job = MegatronTrainingJob(
+                step=next_step,
+                source_policy_step=self._latest_step,
+                training_session_id=self._training_session_id,
                 lora_path=staging_lora_path,
                 allow_unvalidated_arch=self._allow_unvalidated_arch,
                 optimizer_state_path=self._get_optimizer_state_path("rl"),
@@ -1071,24 +1341,36 @@ class MegatronService:
             )
             write_megatron_job(job, job_path=job_path)
 
+            checkpoint_dir = None
             async for result in stream_megatron_job(
                 job,
                 job_path=job_path,
                 process=self._megatron_process,
                 process_log_path=self._megatron_log_path,
             ):
+                if result.get("event") == LORA_READY_EVENT:
+                    checkpoint_dir = await self._handle_training_lora_ready(
+                        checkpoint_dir=checkpoint_dir,
+                        staging_lora_path=staging_lora_path,
+                        step=next_step,
+                    )
+                    continue
                 yield {key: float(value) for key, value in result.items()}
 
-            new_checkpoint_dir = self._publish_staged_training_checkpoint(
+            await self._finish_training_checkpoint(
+                checkpoint_dir=checkpoint_dir,
                 staging_lora_path=staging_lora_path,
                 step=next_step,
             )
-            await self._wake_and_reload_training_checkpoint(
-                checkpoint_dir=new_checkpoint_dir,
-                step=next_step,
+        except GeneratorExit:
+            raise
+        except BaseException as exc:
+            self._status(f"Megatron train failed: {type(exc).__name__}: {exc}")
+            await cleanup_after_failure(
+                exc,
+                self.aclose,
+                message="Megatron training and cleanup failed.",
             )
-        except BaseException:
-            await self.aclose()
             raise
 
     async def train_sft(
@@ -1143,7 +1425,7 @@ class MegatronService:
                     "loss/grad_norm": float(result["grad_norm"]),
                 }
                 if "tokens_per_second" in result:
-                    metrics["throughput/step_trainer_tok_per_s"] = float(
+                    metrics["throughput/train_packed_tok_per_s"] = float(
                         result["tokens_per_second"]
                     )
                 yield metrics
@@ -1156,8 +1438,15 @@ class MegatronService:
                 checkpoint_dir=new_checkpoint_dir,
                 step=next_step,
             )
-        except BaseException:
-            await self.aclose()
+        except GeneratorExit:
+            raise
+        except BaseException as exc:
+            self._status(f"Megatron SFT train failed: {type(exc).__name__}: {exc}")
+            await cleanup_after_failure(
+                exc,
+                self.aclose,
+                message="Megatron SFT training and cleanup failed.",
+            )
             raise
 
     async def aclose(self) -> None:
@@ -1167,6 +1456,8 @@ class MegatronService:
         self._vllm_runtime.close()
         self._merged_weight_transfer_init_info = None
         self._loaded_adapter_steps.clear()
+        self._loaded_exact_adapter_steps.clear()
+        self._exact_adapter_refcounts.clear()
 
     def _stop_megatron_process(self) -> None:
         if self._megatron_process is None:
@@ -1176,7 +1467,7 @@ class MegatronService:
             self._megatron_log_path = None
             self._active_megatron_topology = None
             return
-        terminate_asyncio_process_group(self._megatron_process)
+        terminate_popen_process_group(self._megatron_process)
         self._megatron_process = None
         self._active_megatron_topology = None
         if self._megatron_log_file is not None:

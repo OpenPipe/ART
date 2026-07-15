@@ -51,7 +51,7 @@ MANDATORY_VALIDATION_STAGES = (
     "merged_vllm_serving",
     "correctness_sensitivity",
     "chat_template_rollout",
-    "packed_position_ids",
+    "packing_invariance",
     "length_trainability",
 )
 NATIVE_VLLM_LORA_STAGE = "native_vllm_lora"
@@ -79,7 +79,7 @@ SUBPROCESS_VALIDATION_STAGES = frozenset(
         "merged_vllm_serving",
         "correctness_sensitivity",
         "chat_template_rollout",
-        "packed_position_ids",
+        "packing_invariance",
         "length_trainability",
         YES_NO_TRAINABILITY_STAGE,
         NATIVE_VLLM_LORA_STAGE,
@@ -384,6 +384,7 @@ def run_hf_parity_stage(
         precision="fp32",
         num_layers=max(1, architecture.recommended_min_layers),
         num_steps=1,
+        lora={"target_modules": list(spec.default_target_modules)},
         allow_unvalidated_arch=allow_unvalidated_arch,
     )
     case_config = hf_parity.hf_parity_case_config(case_config)
@@ -430,6 +431,7 @@ def run_lora_coverage_stage(
         precision="fp32",
         num_layers=max(1, architecture.recommended_min_layers),
         num_steps=1,
+        lora={"target_modules": list(spec.default_target_modules)},
         allow_unvalidated_arch=allow_unvalidated_arch,
     )
     report = lora_coverage.run_lora_coverage(case_config)
@@ -487,6 +489,7 @@ def run_correctness_sensitivity_stage(
         precision=correctness_precision,
         num_layers=max(1, architecture.recommended_min_layers),
         num_steps=1,
+        lora={"target_modules": list(spec.default_target_modules)},
         allow_unvalidated_arch=allow_unvalidated_arch,
     )
     suite_topologies = list(
@@ -678,6 +681,7 @@ def run_merged_vllm_serving_stage(
         precision="fp32",
         num_layers=max(1, architecture.recommended_min_layers),
         num_steps=1,
+        lora={"target_modules": list(spec.default_target_modules)},
         allow_unvalidated_arch=allow_unvalidated_arch,
     )
     report = merged_vllm_serving.run_merged_vllm_serving(case_config)
@@ -805,6 +809,7 @@ def run_native_vllm_lora_stage(
         precision="fp32",
         num_layers=max(1, architecture.recommended_min_layers),
         num_steps=1,
+        lora={"target_modules": list(spec.default_target_modules)},
         allow_unvalidated_arch=allow_unvalidated_arch,
     )
     report = native_vllm_lora.run_native_vllm_lora(case_config)
@@ -825,16 +830,16 @@ def run_native_vllm_lora_stage(
     )
 
 
-def run_packed_position_ids_stage(
+def run_packing_invariance_stage(
     *,
     base_model: str,
     architecture: ArchitectureReport,
     allow_unvalidated_arch: bool = False,
 ) -> ValidationStageResult:
-    packed_position_ids = _import_integration_module(
-        "integration.megatron.model_support.packed_position_ids"
+    packing_invariance = _import_integration_module(
+        "integration.megatron.model_support.packing_invariance"
     )
-    report = packed_position_ids.run_packed_position_ids(
+    report = packing_invariance.run_packing_invariance(
         base_model=base_model,
         num_layers=max(1, architecture.recommended_min_layers),
         allow_unvalidated_arch=allow_unvalidated_arch,
@@ -845,7 +850,7 @@ def run_packed_position_ids_stage(
         for scenario in metrics["scenarios"]
     )
     return ValidationStageResult(
-        name="packed_position_ids",
+        name="packing_invariance",
         passed=passed,
         metrics=metrics,
         artifact_dir=report.output_dir,
@@ -884,7 +889,7 @@ def build_validation_report(
         "merged_vllm_serving": run_merged_vllm_serving_stage,
         "correctness_sensitivity": run_correctness_sensitivity_stage,
         "chat_template_rollout": run_chat_template_rollout_stage,
-        "packed_position_ids": run_packed_position_ids_stage,
+        "packing_invariance": run_packing_invariance_stage,
         "length_trainability": run_length_trainability_stage,
         YES_NO_TRAINABILITY_STAGE: run_yes_no_trainability_stage,
         NATIVE_VLLM_LORA_STAGE: run_native_vllm_lora_stage,

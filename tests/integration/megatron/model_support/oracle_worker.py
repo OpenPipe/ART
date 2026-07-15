@@ -25,6 +25,9 @@ from art.utils.lifecycle import terminate_popen_process_group
 from ..routing_replay.bundle import build_bundle_from_forward_trace_dir
 from ..routing_replay.trace import install_moe_routing_trace_hooks
 from .forward_trace import ForwardTraceCapture
+from .fp32_grouped_gemm import (
+    allow_fp32_grouped_gemm_fallback_for_model_support_tests,
+)
 from .gdn_fp32_reference import install_megatron_qwen35_gdn_fp32_reference
 from .gdn_trace_uids import install_gdn_trace_token_uid_hooks
 from .oracle_harness import (
@@ -331,12 +334,19 @@ def _apply_save_mutation_to_tensor_map(
 def _validate_loaded_state_matches_adapter(
     loaded_state: dict[str, Any],
     adapter_model: dict[str, Any],
+    *,
+    model_chunks: list[Any],
+    model_support_handler: Any,
 ) -> None:
     """Checks loaded model LoRA state exactly matches adapter tensors and keys."""
     import torch
 
-    for key in sorted(adapter_model.keys()):
-        assert torch.equal(loaded_state[key].cpu(), adapter_model[key].cpu()), (
+    expected_state = model_support_handler.canonicalize_loaded_lora_state(
+        adapter_model,
+        model_chunks,
+    )
+    for key in sorted(expected_state.keys()):
+        assert torch.equal(loaded_state[key].cpu(), expected_state[key].cpu()), (
             f"Loaded LoRA state mismatch for key '{key}'"
         )
 
@@ -458,7 +468,7 @@ def _patch_finalize_provider_bundle_for_oracle(
 
 
 def _build_optimizer_config(case_config: OracleCaseConfig):
-    """Builds Megatron optimizer settings for deterministic harness runs."""
+    """Builds a linear one-step optimizer for deterministic delta comparisons."""
     from megatron.core.optimizer import OptimizerConfig
 
     if case_config.precision == "fp32":
@@ -470,22 +480,20 @@ def _build_optimizer_config(case_config: OracleCaseConfig):
             main_params_dtype=torch.float32,
             exp_avg_dtype=torch.float32,
             exp_avg_sq_dtype=torch.float32,
+            optimizer="sgd",
+            sgd_momentum=0.0,
             lr=case_config.learning_rate,
-            adam_beta1=0.9,
-            adam_beta2=0.99,
-            clip_grad=0.1,
+            clip_grad=0.0,
             weight_decay=0.0,
-            adam_eps=1e-13,
         )
     return OptimizerConfig(
         bf16=True,
         fp16=False,
+        optimizer="sgd",
+        sgd_momentum=0.0,
         lr=case_config.learning_rate,
-        adam_beta1=0.9,
-        adam_beta2=0.99,
-        clip_grad=0.1,
+        clip_grad=0.0,
         weight_decay=0.0,
-        adam_eps=1e-13,
     )
 
 
@@ -1275,10 +1283,21 @@ def _mutation_hook(
 
     if pre_optimizer_step_hook is not None:
 
-        def _patched_optimizer_step(optimizer: Any, learning_rate: float):
+        def _patched_optimizer_step(
+            optimizer: Any,
+            learning_rate: float,
+            *,
+            model_support_handler: Any | None = None,
+            model_chunks: Any | None = None,
+        ):
             if pre_optimizer_step_hook is not None:
                 pre_optimizer_step_hook()
-            return original_optimizer_step(optimizer, learning_rate)
+            return original_optimizer_step(
+                optimizer,
+                learning_rate,
+                model_support_handler=model_support_handler,
+                model_chunks=model_chunks,
+            )
 
         megatron_train_module._optimizer_step = _patched_optimizer_step
 
@@ -1337,6 +1356,9 @@ def _worker_run(request: WorkerRunRequest) -> None:
     from art.megatron import train as megatron_train
     from art.megatron.training.weight_offload import WeightOffloadManager
     from art.preprocessing.pack import packed_tensors_from_dir
+
+    if request.case_config.precision == "fp32":
+        allow_fp32_grouped_gemm_fallback_for_model_support_tests()
 
     local_rank = int(os.environ["LOCAL_RANK"])
     torch.cuda.set_device(local_rank)
@@ -1427,13 +1449,21 @@ def _worker_run(request: WorkerRunRequest) -> None:
     # load the shared initial lora into the model and validate we can collect it from the model
     _debug("loading shared initial lora state")
     adapter_model = load_file(str(shared_init_path))
-    megatron_train.load_adapter_into_model(model_chunks, adapter_model, optimizer)
+    megatron_train.load_adapter_into_model(
+        model_chunks,
+        adapter_model,
+        optimizer,
+        model_support_handler=runtime.model_support_handler,
+    )
     _debug("collecting loaded lora state")
     loaded_state = _collect_lora_state(model_chunks)
     if torch.distributed.get_rank() == 0:  # ty: ignore[possibly-missing-attribute]
         _debug("validating loaded lora state")
         _validate_loaded_state_matches_adapter(
-            _require_not_none(loaded_state, "loaded_state"), adapter_model
+            _require_not_none(loaded_state, "loaded_state"),
+            adapter_model,
+            model_chunks=model_chunks,
+            model_support_handler=runtime.model_support_handler,
         )
     _debug("waiting after loaded lora validation")
     torch.distributed.barrier()  # ty: ignore[possibly-missing-attribute]
@@ -1471,6 +1501,25 @@ def _worker_run(request: WorkerRunRequest) -> None:
         enabled=True,
     )
     install_moe_routing_trace_hooks(lambda: runtime.moe_routing_replay_controller)
+    from megatron.core import parallel_state as ps
+
+    topology = megatron_train._infer_parallel_topology(model_chunks)
+    if ps.get_expert_model_parallel_world_size() > 1:
+        sequence_length = (
+            int(packed_tensors["tokens"].shape[1])
+            if request.objective == "rl"
+            else max(
+                int(inputs["input_ids"].numel())
+                for inputs in _require_not_none(
+                    sft_trajectory_tensors, "sft_trajectory_tensors"
+                )
+            )
+        )
+        megatron_train._ensure_hybridep_capacity(
+            runtime,
+            packed_sequence_length=sequence_length,
+            context_parallel_size=topology.cp,
+        )
 
     def _capture_lora_grads() -> None:
         nonlocal captured_grads
@@ -1493,6 +1542,29 @@ def _worker_run(request: WorkerRunRequest) -> None:
 
         _debug("starting training loop")
         for step_index in range(request.case_config.num_steps):
+            hybridep_token_counts = None
+            if ps.get_expert_model_parallel_world_size() > 1:
+                if request.objective == "rl":
+                    hybridep_token_counts = megatron_train.build_rl_hybridep_token_counts(
+                        packed_tensors=packed_tensors,
+                        step_index=step_index,
+                        num_sequences=request.packed_tensors.num_sequences,
+                        global_grad_accumulation_sequences=global_grad_accumulation_sequences,
+                        topology=topology,
+                        provider=runtime.provider,
+                        model_support_handler=runtime.model_support_handler,
+                    )
+                else:
+                    hybridep_token_counts = megatron_train.build_sft_hybridep_token_counts(
+                        trajectory_tensors=_require_not_none(
+                            sft_trajectory_tensors, "sft_trajectory_tensors"
+                        ),
+                        step_index=step_index,
+                        global_grad_accumulation_sequences=global_grad_accumulation_sequences,
+                        topology=topology,
+                        provider=runtime.provider,
+                        model_support_handler=runtime.model_support_handler,
+                    )
             micro_sample_indices = megatron_train.build_micro_sample_indices(
                 step_index=step_index,
                 num_sequences=request.packed_tensors.num_sequences,
@@ -1520,6 +1592,7 @@ def _worker_run(request: WorkerRunRequest) -> None:
                     step_index=step_index,
                     sample_index=micro_sample_indices,
                     moe_routing_replay_controller=runtime.moe_routing_replay_controller,
+                    hybridep_token_counts=hybridep_token_counts,
                 )
             else:
                 micro_inputs = megatron_train.select_sft_micro_inputs(
@@ -1536,8 +1609,8 @@ def _worker_run(request: WorkerRunRequest) -> None:
                     inputs=micro_inputs,
                     step_index=step_index,
                     sample_index=micro_sample_indices,
-                    global_grad_accumulation_sequences=global_grad_accumulation_sequences,
                     moe_routing_replay_controller=runtime.moe_routing_replay_controller,
+                    hybridep_token_counts=hybridep_token_counts,
                 )
             _debug(f"finished step_index={step_index}")
             print(f"finished step_index={step_index}", flush=True)

@@ -14,10 +14,7 @@ from art.megatron.model_support.handlers.qwen3_common import (
 from art.megatron.model_support.spec import CompileWorkaroundConfig
 
 _QWEN3_MOE_COMPILE_WORKAROUND_FLAGS = (
-    "alltoall_dtoh",
-    "alltoall_dispatch_preprocess",
-    "deepep_dispatch_combine",
-    "deepep_permute_restore",
+    "moe_postprocess",
     "te_triton_permute_with_mask_map",
 )
 _QWEN3_MOE_UNCONDITIONAL_COMPILE_WORKAROUND_FLAGS: tuple[str, ...] = ()

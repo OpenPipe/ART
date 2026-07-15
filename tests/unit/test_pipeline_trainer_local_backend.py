@@ -12,7 +12,7 @@ import pytest
 import torch
 from transformers.tokenization_utils_base import PreTrainedTokenizerBase
 
-from art import TrainableModel, Trajectory, TrajectoryGroup
+from art import PipelineRuntimeConfig, TrainableModel, Trajectory, TrajectoryGroup
 from art.dev.model import InternalModelConfig
 from art.local import LocalBackend
 from art.megatron import MegatronBackend
@@ -31,12 +31,17 @@ async def _noop_rollout(*_args: object, **_kwargs: object) -> TrajectoryGroup:
     return TrajectoryGroup([])
 
 
+async def _noop_eval(*_args: object, **_kwargs: object) -> list[Trajectory]:
+    return []
+
+
 def _make_group(rewards: list[float]) -> TrajectoryGroup:
     return TrajectoryGroup(
         [
             Trajectory(
                 reward=reward,
                 initial_policy_version=0,
+                metrics={"completion_tokens": 1},
                 messages_and_choices=[
                     {"role": "user", "content": f"prompt-{idx}"},
                     {"role": "assistant", "content": f"answer-{idx}"},
@@ -59,9 +64,11 @@ def _make_trainer(
         rollout_fn=_noop_rollout,
         scenarios=[],
         config={},
-        num_rollout_workers=1,
-        min_batch_size=1,
-        max_batch_size=1,
+        pipeline=PipelineRuntimeConfig(
+            num_rollout_workers=1,
+            min_batch_size=1,
+            max_batch_size=1,
+        ),
         max_steps=1,
         eval_fn=None,
         **kwargs,
@@ -104,6 +111,8 @@ async def test_pipeline_trainer_preserves_backend_train_kwargs(tmp_path: Path) -
         "normalize_advantages": True,
         "save_checkpoint": False,
         "adam_params": adam_params,
+        "optimizer_save_interval": 5,
+        "final_training_step": 1,
     }
 
 
@@ -139,6 +148,8 @@ async def test_pipeline_trainer_forwards_default_kl_step_zero_for_generic_backen
         "normalize_advantages": True,
         "save_checkpoint": False,
         "adam_params": None,
+        "optimizer_save_interval": 5,
+        "final_training_step": 1,
         "kl_penalty_coef": 0.25,
         "kl_penalty_reference_step": 0,
         "kl_penalty_source": "sample",
@@ -241,6 +252,7 @@ async def test_pipeline_trainer_uses_same_train_kwargs_for_local_backend(
     backend = LocalBackend(path=str(tmp_path))
     train = AsyncMock(return_value=SimpleNamespace(step=1, metrics={}))
     setattr(backend, "train", train)
+    setattr(backend, "collect_train_step_vllm_metrics", AsyncMock(return_value={}))
 
     trainer = _make_trainer(
         model=model,
@@ -262,6 +274,8 @@ async def test_pipeline_trainer_uses_same_train_kwargs_for_local_backend(
         "normalize_advantages": True,
         "save_checkpoint": False,
         "adam_params": None,
+        "optimizer_save_interval": 5,
+        "final_training_step": 1,
     }
 
 
@@ -442,14 +456,14 @@ async def test_pipeline_trainer_checkpoint_retention_only_passes_unprotected_ste
         "\n".join(
             json.dumps(row)
             for row in [
-                {"step": 2, "val/reward": 1.0},
-                {"step": 2, "val/reward": 3.0},
+                {"step": 2, "reward/val": 1.0},
+                {"step": 2, "reward/val": 3.0},
                 {
                     "step": 2,
                     CHECKPOINT_CREATED_AT_METRIC: 123.0,
                     CHECKPOINT_EVAL_COMPLETED_METRIC: 1.0,
                 },
-                {"step": 3, "val/reward": 10.0},
+                {"step": 3, "reward/val": 10.0},
             ]
         )
         + "\n",
@@ -479,7 +493,7 @@ async def test_pipeline_trainer_checkpoint_retention_only_passes_unprotected_ste
     step_two = contexts[0].checkpoints[2]
     assert step_two.is_eval_step is True
     assert step_two.created_at == datetime.fromtimestamp(123.0, timezone.utc)
-    assert step_two.metrics["val/reward"] == 2.0
+    assert step_two.metrics["reward/val"] == 2.0
     backend._delete_checkpoint_files.assert_awaited_once_with(  # type: ignore[attr-defined]
         model,
         [1, 3, 4, 5],
@@ -885,6 +899,32 @@ async def test_local_backend_async_context_manager_awaits_async_cleanup(
     close_proxy.assert_called_once_with(service)
 
 
+@pytest.mark.asyncio
+async def test_local_backend_close_bounds_cancelled_provenance_tasks(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("art.local.backend._PROVENANCE_UPDATE_TIMEOUT_SECONDS", 0.01)
+    backend = LocalBackend(path=str(tmp_path))
+    release = asyncio.Event()
+
+    async def ignore_cancel() -> None:
+        while not release.is_set():
+            try:
+                await release.wait()
+            except asyncio.CancelledError:
+                continue
+
+    task = asyncio.create_task(ignore_cancel())
+    backend._provenance_update_tasks.add(task)
+
+    await backend.close()
+
+    assert not backend._provenance_update_tasks
+    release.set()
+    await asyncio.wait_for(task, timeout=1.0)
+
+
 @pytest.mark.parametrize(
     ("trainer_kwargs", "match"),
     [
@@ -983,6 +1023,45 @@ async def test_local_backend_adapter_lease_pins_inference_name_and_prune(
 
 
 @pytest.mark.asyncio
+async def test_local_backend_exact_adapter_lease_pins_immutable_name(
+    tmp_path: Path,
+) -> None:
+    model = TrainableModel(
+        name="local-backend-exact-adapter-lease",
+        project="pipeline-tests",
+        base_model="test-model",
+        base_path=str(tmp_path),
+        _internal_config=InternalModelConfig(
+            trainer_gpu_ids=[0],
+            inference_gpu_ids=[1],
+        ),
+    )
+    backend = LocalBackend(path=str(tmp_path))
+    exact_name = f"{model.name}:eval@3"
+    service = SimpleNamespace(
+        _latest_step=5,
+        acquire_exact_adapter=AsyncMock(return_value=exact_name),
+        release_exact_adapter=AsyncMock(),
+        prune_loaded_adapters=AsyncMock(),
+    )
+    backend._services[model.name] = cast(Any, service)
+
+    async with backend.exact_adapter_lease(model, 3):
+        assert backend._model_inference_name(model) == exact_name
+        assert backend._model_inference_name(model, step=3) == exact_name
+        assert backend._model_inference_name(model, step=4) == f"{model.name}@4"
+        await backend.prune_model_adapters(model, retain_steps={5})
+
+    assert backend._model_inference_name(model) == f"{model.name}@5"
+    service.acquire_exact_adapter.assert_awaited_once_with(
+        3,
+        get_step_checkpoint_dir(get_model_dir(model=model, art_path=str(tmp_path)), 3),
+    )
+    service.release_exact_adapter.assert_awaited_once_with(3)
+    service.prune_loaded_adapters.assert_awaited_once_with(retain_steps={3, 5})
+
+
+@pytest.mark.asyncio
 async def test_local_backend_adapter_retention_lease_does_not_pin_inference(
     tmp_path: Path,
 ) -> None:
@@ -1049,3 +1128,35 @@ async def test_pipeline_trainer_scheduled_eval_holds_retention_lease(
     assert trainer._scheduled_eval_steps == set()
     assert backend.active_steps == set()
     assert trainer._protected_checkpoint_steps(8) == {8}
+
+
+def test_pipeline_trainer_rejects_merged_weight_eval(tmp_path: Path) -> None:
+    model = TrainableModel(
+        name="pipeline-merged-eval",
+        project="pipeline-tests",
+        base_model="test-model",
+        base_path=str(tmp_path),
+        _internal_config=InternalModelConfig(
+            trainer_gpu_ids=[0],
+            inference_gpu_ids=[1],
+            rollout_weights_mode="merged",
+        ),
+    )
+
+    with pytest.raises(
+        ValueError,
+        match="eval requires rollout_weights_mode='lora'",
+    ):
+        PipelineTrainer(
+            model=model,
+            backend=LocalBackend(path=str(tmp_path)),
+            rollout_fn=_noop_rollout,
+            scenarios=[],
+            config={},
+            pipeline=PipelineRuntimeConfig(
+                num_rollout_workers=1,
+                min_batch_size=1,
+                max_batch_size=1,
+            ),
+            eval_fn=_noop_eval,
+        )

@@ -1,3 +1,4 @@
+from contextlib import AbstractAsyncContextManager
 from typing import (
     TYPE_CHECKING,
     Any,
@@ -43,6 +44,12 @@ class Backend(Protocol):
         model: AnyTrainableModel,
         config: dev.OpenAIServerConfig | None,
     ) -> tuple[str, str]: ...
+
+    def exact_adapter_lease(
+        self,
+        model: AnyTrainableModel,
+        step: int,
+    ) -> AbstractAsyncContextManager[None]: ...
 
     # Backends intentionally expose backend-specific optional training arguments.
     # Callable[..., ...] preserves that extensibility without falsely requiring

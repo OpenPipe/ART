@@ -17,11 +17,16 @@ from ..local.checkpoints import get_last_checkpoint_dir
 from ..preprocessing.inputs import TrainInputs
 from ..preprocessing.pack import DiskPackedTensors
 from ..preprocessing.tokenize import SFTBatch
+from ..serving_capabilities import (
+    ServingCapabilities,
+    discover_serving_capabilities,
+)
 from ..utils.convert_moe_lora import convert_checkpoint_if_needed
 from ..utils.get_model_step import get_step_from_dir
 from ..utils.lifecycle import (
     ChildProcessSupervisor,
     ServiceLifecycle,
+    cleanup_after_failure,
 )
 from ..utils.output_dirs import get_step_checkpoint_dir
 from ..vllm_runtime import (
@@ -153,6 +158,26 @@ class UnslothService:
         init=False,
         repr=False,
     )
+    _loaded_exact_adapter_steps: set[int] = field(
+        default_factory=set,
+        init=False,
+        repr=False,
+    )
+    _exact_adapter_refcounts: dict[int, int] = field(
+        default_factory=dict,
+        init=False,
+        repr=False,
+    )
+    _exact_adapter_lock: asyncio.Lock = field(
+        default_factory=asyncio.Lock,
+        init=False,
+        repr=False,
+    )
+    _serving_capabilities: ServingCapabilities | None = field(
+        default=None,
+        init=False,
+        repr=False,
+    )
 
     def __post_init__(self) -> None:
         self._child_processes = ChildProcessSupervisor(self._on_child_process_exit)
@@ -173,6 +198,30 @@ class UnslothService:
         mode = self.config["rollout_weights_mode"]
         assert mode in {"lora", "merged"}
         return mode
+
+    @property
+    def rollout_weight_update_mode(self) -> Literal["step_lora", "in_flight_lora"]:
+        mode = self.config.get("rollout_weight_update_mode", "step_lora")
+        assert mode in {"step_lora", "in_flight_lora"}
+        return mode
+
+    @property
+    def _in_flight_lora_slot(self) -> str:
+        return f"{self.model_name}:active"
+
+    @property
+    def _initial_served_model_name(self) -> str:
+        if (
+            self.rollout_weights_mode == "lora"
+            and self.rollout_weight_update_mode == "in_flight_lora"
+        ):
+            return self._in_flight_lora_slot
+        return f"{self.model_name}@{self._latest_step}"
+
+    def _exact_lora_name(self, step: int) -> str:
+        if self.rollout_weight_update_mode == "in_flight_lora":
+            return f"{self.model_name}:eval@{step}"
+        return f"{self.model_name}@{step}"
 
     @property
     def _vllm_base_url(self) -> str:
@@ -246,6 +295,15 @@ class UnslothService:
         headers = self._runtime_headers()
         return {"headers": headers} if headers else {}
 
+    @property
+    def serving_capabilities(self) -> ServingCapabilities:
+        if self._serving_capabilities is None:
+            raise RuntimeError("vLLM serving capabilities have not been discovered")
+        return self._serving_capabilities
+
+    async def get_serving_capabilities(self) -> ServingCapabilities:
+        return self.serving_capabilities
+
     def _sleep_mode_enabled(self) -> bool:
         return bool(self.config.get("engine_args", {}).get("enable_sleep_mode", True))
 
@@ -274,7 +332,7 @@ class UnslothService:
                 host=self._vllm_runtime.host,
                 cuda_visible_devices=self._runtime_cuda_visible_devices(),
                 lora_path=lora_path,
-                served_model_name=f"{self.model_name}@{self._latest_step}",
+                served_model_name=self._initial_served_model_name,
                 rollout_weights_mode=self.rollout_weights_mode,
                 engine_args=self._runtime_engine_args(config),
                 server_args=server_args,
@@ -515,14 +573,16 @@ class UnslothService:
             f"[DEDICATED] _reload_adapter START: lora_name={lora_name} "
             f"path={checkpoint_path}"
         )
+        payload: dict[str, Any] = {
+            "lora_name": lora_name,
+            "lora_path": checkpoint_path,
+        }
+        if self.serving_capabilities.inplace_lora_load:
+            payload["load_inplace"] = True
         async with httpx.AsyncClient() as client:
             response = await client.post(
                 f"{self._vllm_base_url}/v1/load_lora_adapter",
-                json={
-                    "lora_name": lora_name,
-                    "lora_path": checkpoint_path,
-                    "load_inplace": True,
-                },
+                json=payload,
                 **self._runtime_request_kwargs(),
                 timeout=60.0,
             )
@@ -534,25 +594,116 @@ class UnslothService:
         self._latest_step = step
         self._loaded_adapter_steps.add(step)
 
-    async def _unload_adapter(self, step: int) -> None:
+    async def _update_in_flight_adapter(self, checkpoint_path: str, step: int) -> None:
+        import httpx
+
+        self._raise_if_child_failed()
+        self.serving_capabilities.require(
+            "in_flight_lora_updates", operation="In-flight LoRA updates"
+        )
+        self.serving_capabilities.require(
+            "policy_token_spans", operation="In-flight LoRA updates"
+        )
+        async with httpx.AsyncClient() as client:
+            response = await client.post(
+                f"{self._vllm_base_url}/art/in_flight_lora_update",
+                json={
+                    "model_name": f"{self.model_name}@{step}",
+                    "lora_slot": self._in_flight_lora_slot,
+                    "lora_path": checkpoint_path,
+                    "policy_version": step,
+                },
+                **self._runtime_request_kwargs(),
+                timeout=60.0,
+            )
+            response.raise_for_status()
+        self._latest_step = step
+        self._loaded_adapter_steps.add(step)
+
+    async def _load_rollout_lora_for_step(
+        self, checkpoint_path: str, step: int
+    ) -> None:
+        if self.rollout_weight_update_mode == "in_flight_lora":
+            await self._update_in_flight_adapter(checkpoint_path, step)
+        else:
+            await self._reload_adapter(checkpoint_path, step)
+
+    async def acquire_exact_adapter(self, step: int, checkpoint_path: str) -> str:
+        if self.rollout_weights_mode != "lora":
+            raise RuntimeError("Exact checkpoint eval requires LoRA rollout serving")
+        lora_name = self._exact_lora_name(step)
+        async with self._exact_adapter_lock:
+            loaded_steps = (
+                self._loaded_exact_adapter_steps
+                if self.rollout_weight_update_mode == "in_flight_lora"
+                else self._loaded_adapter_steps
+            )
+            if step in loaded_steps:
+                if self.rollout_weight_update_mode == "in_flight_lora":
+                    self._exact_adapter_refcounts[step] += 1
+                return lora_name
+            import httpx
+
+            self._raise_if_child_failed()
+            async with httpx.AsyncClient() as client:
+                response = await client.post(
+                    f"{self._vllm_base_url}/v1/load_lora_adapter",
+                    json={
+                        "lora_name": lora_name,
+                        "lora_path": checkpoint_path,
+                    },
+                    **self._runtime_request_kwargs(),
+                    timeout=60.0,
+                )
+                response.raise_for_status()
+            loaded_steps.add(step)
+            if self.rollout_weight_update_mode == "in_flight_lora":
+                self._exact_adapter_refcounts[step] = 1
+        return lora_name
+
+    async def release_exact_adapter(self, step: int) -> None:
+        if self.rollout_weight_update_mode != "in_flight_lora":
+            return
+        async with self._exact_adapter_lock:
+            count = self._exact_adapter_refcounts[step]
+            if count > 1:
+                self._exact_adapter_refcounts[step] = count - 1
+                return
+            await self._unload_exact_adapter(step)
+            del self._exact_adapter_refcounts[step]
+
+    async def _unload_adapter_name(self, lora_name: str) -> bool:
         import httpx
 
         self._raise_if_child_failed()
         async with httpx.AsyncClient() as client:
             response = await client.post(
                 f"{self._vllm_base_url}/v1/unload_lora_adapter",
-                json={"lora_name": f"{self.model_name}@{step}"},
+                json={"lora_name": lora_name},
                 **self._runtime_request_kwargs(),
                 timeout=30.0,
             )
             if response.status_code == 404:
-                self._loaded_adapter_steps.discard(step)
-                return
+                return False
             response.raise_for_status()
+        return True
+
+    async def _unload_adapter(self, step: int) -> None:
+        await self._unload_adapter_name(f"{self.model_name}@{step}")
         self._loaded_adapter_steps.discard(step)
+
+    async def _unload_exact_adapter(self, step: int) -> None:
+        await self._unload_adapter_name(self._exact_lora_name(step))
+        self._loaded_exact_adapter_steps.discard(step)
 
     async def prune_loaded_adapters(self, *, retain_steps: set[int]) -> None:
         if self.rollout_weights_mode != "lora" or self._vllm_port == 0:
+            return
+        async with self._exact_adapter_lock:
+            for step in sorted(self._loaded_exact_adapter_steps - retain_steps):
+                if self._exact_adapter_refcounts.get(step, 0) == 0:
+                    await self._unload_exact_adapter(step)
+        if self.rollout_weight_update_mode == "in_flight_lora":
             return
         for step in sorted(self._loaded_adapter_steps - retain_steps):
             if step == self._latest_step:
@@ -575,6 +726,8 @@ class UnslothService:
                 self._child_processes.close()
                 self._vllm_runtime.close()
                 self._loaded_adapter_steps.clear()
+                self._loaded_exact_adapter_steps.clear()
+                self._exact_adapter_refcounts.clear()
         finally:
             self._lifecycle.restore_parent_cleanup()
 
@@ -610,15 +763,27 @@ class UnslothService:
             port,
             config=config,
         )
-        if self.rollout_weights_mode == "lora":
-            self._loaded_adapter_steps.add(self._latest_step)
         try:
+            self._serving_capabilities = await discover_serving_capabilities(
+                base_url=self._vllm_base_url,
+                headers=self._runtime_headers(),
+                allow_openai_compatible=False,
+            )
+            if self.rollout_weights_mode == "lora":
+                if self.rollout_weight_update_mode == "in_flight_lora":
+                    await self._update_in_flight_adapter(lora_path, self._latest_step)
+                else:
+                    self._loaded_adapter_steps.add(self._latest_step)
             if self.rollout_weights_mode == "merged":
                 _ = self._state
                 await self._init_merged_weight_transfer()
                 await self._sync_merged_weights(self._latest_step, False)
-        except BaseException:
-            await self.aclose()
+        except BaseException as exc:
+            await cleanup_after_failure(
+                exc,
+                self.aclose,
+                message="vLLM startup and Unsloth cleanup failed.",
+            )
             raise
         return vllm_location
 
@@ -656,7 +821,7 @@ class UnslothService:
         if self.rollout_weights_mode == "merged":
             await self._set_served_model_name(step)
         else:
-            await self._reload_adapter(checkpoint_dir, step)
+            await self._load_rollout_lora_for_step(checkpoint_dir, step)
         self._latest_step = step
 
     async def train(
@@ -679,8 +844,14 @@ class UnslothService:
                 disk_packed_tensors, config, _config, verbose
             ):
                 yield result
-        except BaseException:
-            await self.aclose()
+        except GeneratorExit:
+            raise
+        except BaseException as exc:
+            await cleanup_after_failure(
+                exc,
+                self.aclose,
+                message="Unsloth training and cleanup failed.",
+            )
             raise
 
     async def _train_dedicated(
@@ -718,7 +889,7 @@ class UnslothService:
                 "[DEDICATED] _train_dedicated: saved checkpoint step=%s, reloading adapter...",
                 new_step,
             )
-            await self._reload_adapter(checkpoint_dir, new_step)
+            await self._load_rollout_lora_for_step(checkpoint_dir, new_step)
         self._latest_step = new_step
         logger.info(
             f"[DEDICATED] _train_dedicated: inference weights updated for step {new_step}"
@@ -756,7 +927,7 @@ class UnslothService:
         await self._wake_runtime()
 
         new_step = int(os.path.basename(checkpoint_dir))
-        await self._reload_adapter(checkpoint_dir, new_step)
+        await self._load_rollout_lora_for_step(checkpoint_dir, new_step)
         self._latest_step = new_step
 
         if verbose:
@@ -818,13 +989,19 @@ class UnslothService:
             await asyncio.sleep(0.5)
             await self._wake_runtime()
             new_step = int(os.path.basename(checkpoint_dir))
-            await self._reload_adapter(checkpoint_dir, new_step)
+            await self._load_rollout_lora_for_step(checkpoint_dir, new_step)
             self._latest_step = new_step
 
             if verbose:
                 print("SFT training finished")
-        except BaseException:
-            await self.aclose()
+        except GeneratorExit:
+            raise
+        except BaseException as exc:
+            await cleanup_after_failure(
+                exc,
+                self.aclose,
+                message="Unsloth SFT training and cleanup failed.",
+            )
             raise
 
     @cached_property

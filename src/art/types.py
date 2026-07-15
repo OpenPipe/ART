@@ -28,6 +28,8 @@ class TrainConfig(pydantic.BaseModel):
     kl_penalty_coef: float = 0.0
     kl_penalty_source: Literal["current_learner", "sample"] = "current_learner"
     grad_accumulation_sequences: int | None = pydantic.Field(default=None, ge=1)
+    optimizer_save_interval: int = pydantic.Field(default=5, ge=1)
+    final_training_step: int | None = pydantic.Field(default=None, ge=1)
 
 
 class MegatronTopologyConfig(pydantic.BaseModel):
@@ -44,6 +46,10 @@ class MegatronRuntimeConfig(pydantic.BaseModel):
 
     topology: MegatronTopologyConfig
     packed_sequence_length: int = pydantic.Field(ge=1)
+    # The default 2 resident layers / 4 slots is the tested recommendation.
+    # Set ART_MEGATRON_STREAMING_WEIGHT_OFFLOAD_{NUM_LAYERS,NUM_SLOTS,RESIDENT_LAYERS}
+    # before worker startup only when benchmarking a different streaming policy.
+    streaming_weight_offload: bool = False
 
 
 class TrainSFTConfig(pydantic.BaseModel):

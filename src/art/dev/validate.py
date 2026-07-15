@@ -3,7 +3,12 @@
 from collections.abc import Mapping
 from typing import cast
 
-from .model import InternalModelConfig, RolloutWeightsMode, VllmRuntimeMode
+from .model import (
+    InternalModelConfig,
+    RolloutWeightsMode,
+    RolloutWeightUpdateMode,
+    VllmRuntimeMode,
+)
 
 
 def _vllm_runtime_mode(config: InternalModelConfig) -> VllmRuntimeMode:
@@ -34,6 +39,17 @@ def _rollout_weights_mode(config: InternalModelConfig) -> RolloutWeightsMode:
     raise ValueError("rollout_weights_mode must be either 'lora' or 'merged'")
 
 
+def _rollout_weight_update_mode(
+    config: InternalModelConfig,
+) -> RolloutWeightUpdateMode:
+    mode = config.get("rollout_weight_update_mode", "step_lora")
+    if mode in {"step_lora", "in_flight_lora"}:
+        return mode
+    raise ValueError(
+        "rollout_weight_update_mode must be either 'step_lora' or 'in_flight_lora'"
+    )
+
+
 def validate_dedicated_config(config: InternalModelConfig) -> None:
     """Validate dedicated mode GPU configuration.
 
@@ -43,6 +59,7 @@ def validate_dedicated_config(config: InternalModelConfig) -> None:
     has_trainer = "trainer_gpu_ids" in config
     has_inference = "inference_gpu_ids" in config
     rollout_weights_mode = _rollout_weights_mode(config)
+    rollout_weight_update_mode = _rollout_weight_update_mode(config)
     external = is_external_vllm_mode(config)
 
     if external:
@@ -61,6 +78,14 @@ def validate_dedicated_config(config: InternalModelConfig) -> None:
                 "fast_inference is no longer supported; ART always uses an external "
                 "vLLM runtime"
             )
+        if (
+            rollout_weight_update_mode == "in_flight_lora"
+            and rollout_weights_mode != "lora"
+        ):
+            raise ValueError(
+                "rollout_weight_update_mode='in_flight_lora' requires "
+                "rollout_weights_mode='lora'"
+            )
         return
 
     if has_trainer != has_inference:
@@ -72,6 +97,15 @@ def validate_dedicated_config(config: InternalModelConfig) -> None:
         raise ValueError(
             "rollout_weights_mode='merged' requires dedicated mode "
             "(set both trainer_gpu_ids and inference_gpu_ids)"
+        )
+
+    if (
+        rollout_weight_update_mode == "in_flight_lora"
+        and rollout_weights_mode != "lora"
+    ):
+        raise ValueError(
+            "rollout_weight_update_mode='in_flight_lora' requires "
+            "rollout_weights_mode='lora'"
         )
 
     if "fast_inference" in config.get("init_args", {}):
@@ -95,9 +129,11 @@ def validate_dedicated_config(config: InternalModelConfig) -> None:
     if set(trainer_gpu_ids) & set(inference_gpu_ids):
         raise ValueError("trainer_gpu_ids and inference_gpu_ids must not overlap")
 
-    if len(inference_gpu_ids) > 1:
+    inference_tp = int(config.get("engine_args", {}).get("tensor_parallel_size", 1))
+    if len(inference_gpu_ids) > 1 and inference_tp != len(inference_gpu_ids):
         raise ValueError(
-            "Multi-GPU inference not yet supported; inference_gpu_ids must have exactly one GPU"
+            "Multi-GPU inference requires engine_args.tensor_parallel_size to "
+            "match len(inference_gpu_ids)"
         )
 
     if trainer_gpu_ids[0] != 0:

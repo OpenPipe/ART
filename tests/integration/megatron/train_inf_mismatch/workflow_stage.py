@@ -121,9 +121,15 @@ def run_train_inf_mismatch(
             break
     if selected is None:
         raise RuntimeError("train/inf mismatch retry loop did not run")
+    passed = (
+        selected.returncode == 0
+        and selected.passed_count > 0
+        and selected.failed_count == 0
+        and selected.skipped_count == 0
+    )
     return TrainInfMismatchReport(
         base_model=base_model,
-        passed=selected.returncode == 0,
+        passed=passed,
         returncode=selected.returncode,
         artifact_dir=str(artifact_dir),
         test_root=str(TEST_ROOT),

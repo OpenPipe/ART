@@ -1,8 +1,9 @@
 from __future__ import annotations
 
 import math
-from typing import Any, cast
+from typing import Any
 
+import numpy as np
 from openai.types.chat.chat_completion import Choice
 import pytest
 import torch
@@ -13,8 +14,8 @@ from art.megatron.routing_replay import (
 )
 from art.preprocessing.moe_routing import (
     ART_MOE_ROUTING_METADATA_KEY,
+    MoeRouteSegments,
     align_choice_routes_to_tokenized_result,
-    attach_moe_routing_metadata_to_choice,
 )
 from art.preprocessing.pack import packed_tensors_from_tokenized_results
 from art.preprocessing.tokenize import TokenizedResult
@@ -41,16 +42,26 @@ def _route(seed: int) -> list[list[int]]:
     return [[seed, seed + 1], [seed + 2, seed + 3]]
 
 
-def test_align_choice_routes_to_tokenized_result_maps_vllm_routes() -> None:
-    routes, stats = align_choice_routes_to_tokenized_result(
+def _routes_to_list(routes: Any) -> list[Any]:
+    if hasattr(routes, "segments"):
+        output: list[Any] = []
+        for segment in routes.segments:
+            output.extend(segment.tolist())
+        return output
+    return routes.tolist()
+
+
+def test_align_choice_routes_keeps_binary_route_views() -> None:
+    combined = np.arange(4 * 2 * 2, dtype=np.uint8).reshape(4, 2, 2)
+    combined.flags.writeable = False
+    routes, _ = align_choice_routes_to_tokenized_result(
         token_ids=[10, 11, 20, 21],
         choices=[
             _choice(
                 {
                     "prompt_token_ids": [10, 11],
                     "completion_token_ids": [20, 21],
-                    "prompt_routed_experts": [_route(0), _route(10)],
-                    "completion_routed_experts": [_route(20), _route(30)],
+                    "routed_experts": combined,
                 }
             )
         ],
@@ -58,42 +69,8 @@ def test_align_choice_routes_to_tokenized_result_maps_vllm_routes() -> None:
         choice_token_lengths=[2],
     )
 
-    assert routes == [_route(0), _route(10), _route(20), _route(30)]
-    assert stats.choices_with_routing == 1
-    assert stats.routed_tokens == 4
-
-
-def test_align_choice_routes_to_tokenized_result_uses_current_vllm_contract() -> None:
-    response_payload = {
-        "prompt_token_ids": [10, 11],
-        "prompt_routed_experts": [_route(0), _route(10)],
-        "choices": [
-            {
-                "index": 0,
-                "finish_reason": "stop",
-                "message": {"role": "assistant", "content": "x"},
-                "token_ids": [20, 21],
-                "routed_experts": [_route(20), _route(30)],
-            }
-        ],
-    }
-    choice = Choice.model_validate(response_payload["choices"][0])
-    attach_moe_routing_metadata_to_choice(
-        choice=choice,
-        response_payload=response_payload,
-        choice_index=0,
-    )
-
-    routes, stats = align_choice_routes_to_tokenized_result(
-        token_ids=[10, 11, 20, 21],
-        choices=[choice],
-        choice_offsets=[2],
-        choice_token_lengths=[2],
-    )
-
-    assert routes == [_route(0), _route(10), _route(20), _route(30)]
-    assert stats.choices_with_routing == 1
-    assert stats.routed_tokens == 4
+    assert isinstance(routes, MoeRouteSegments)
+    assert all(np.shares_memory(segment, combined) for segment in routes.segments)
 
 
 def test_align_choice_routes_to_tokenized_result_rejects_token_mismatch() -> None:
@@ -105,8 +82,9 @@ def test_align_choice_routes_to_tokenized_result_rejects_token_mismatch() -> Non
                     {
                         "prompt_token_ids": [10, 11],
                         "completion_token_ids": [20],
-                        "prompt_routed_experts": [_route(0), _route(10)],
-                        "completion_routed_experts": [_route(20)],
+                        "routed_experts": np.asarray(
+                            [_route(0), _route(10), _route(20)], dtype=np.uint8
+                        ),
                     }
                 )
             ],
@@ -141,8 +119,8 @@ def _tokenized(
         trajectory=Trajectory(),
         choice_offsets=[trainable_start],
         extra_logprobs={},
-        _tokenizer=_FakeTokenizer(),
-        moe_routed_experts=cast(list[list[list[int]] | None], routes),
+        _tokenizer=_FakeTokenizer(),  # type: ignore[arg-type]
+        moe_routed_experts=np.asarray(routes, dtype=np.int32),
         prompt_id=prompt_id,
         prompt_length=prompt_length,
         weight=weight,
@@ -171,6 +149,7 @@ def test_pack_carries_routes_through_prefix_tree_splicing() -> None:
         pad_token_id=0,
         truncate_long_results=False,
         include_moe_routing=True,
+        min_prefix_tree_shared_segment_length=0,
     )
 
     assert packed["tokens"].tolist()[0][:7] == [10, 11, 20, 21, 11, 22, 23]
@@ -185,10 +164,7 @@ def test_pack_carries_routes_through_prefix_tree_splicing() -> None:
         _route(40),
         _route(50),
     ]
-    stats = routing_replay.pack_stats
-    assert stats.prefix_tree_rows == 1
-    assert stats.prefix_tree_conflict_rows == 1
-    assert stats.prefix_tree_conflict_slots == 4
+    assert routing_replay.pack_stats.packed_tokens == 7
 
 
 def test_prefix_tree_pack_keeps_trainable_duplicates_in_leaf_metadata() -> None:
@@ -220,6 +196,7 @@ def test_prefix_tree_pack_keeps_trainable_duplicates_in_leaf_metadata() -> None:
         seq_len=8,
         pad_token_id=0,
         truncate_long_results=False,
+        min_prefix_tree_shared_segment_length=0,
     )
 
     assert packed["tokens"].tolist()[0][:7] == [10, 11, 20, 21, 11, 20, 22]
@@ -277,6 +254,7 @@ def test_prefix_tree_pack_public_api_emits_nested_metadata() -> None:
         seq_len=16,
         pad_token_id=0,
         truncate_long_results=False,
+        min_prefix_tree_shared_segment_length=0,
     )
     tree = parse_prefix_tree_row(
         group_ids=packed["group_ids"][0],
@@ -302,6 +280,34 @@ def test_prefix_tree_pack_public_api_emits_nested_metadata() -> None:
     assert packed["assistant_mask"][0, 4]
     assert packed["assistant_mask"][0, 6]
     assert int(packed["group_ids"][0, 4]) != int(packed["group_ids"][0, 6])
+
+
+def test_prefix_tree_pack_best_fit_combines_independent_small_groups() -> None:
+    results = []
+    for group in range(4):
+        prompt = [10 + group, 100, 200 + group]
+        for sample in range(2):
+            token_ids = [*prompt, 300 + group * 10 + sample]
+            results.append(
+                _tokenized(
+                    token_ids,
+                    [_route(token) for token in token_ids],
+                    prompt_id=group,
+                    prompt_length=3,
+                    trainable_start=3,
+                )
+            )
+
+    packed = packed_tensors_from_tokenized_results(
+        results,
+        seq_len=12,
+        pad_token_id=0,
+        truncate_long_results=False,
+        min_prefix_tree_shared_segment_length=0,
+    )
+
+    assert packed["tokens"].shape[0] == 2
+    assert int((packed["group_ids"] != -1).sum().item()) == 24
 
 
 def test_pack_infers_at_least_topk_experts_from_sparse_routes() -> None:

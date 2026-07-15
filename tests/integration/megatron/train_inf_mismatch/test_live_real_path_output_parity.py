@@ -4,6 +4,8 @@ from pathlib import Path
 
 import pytest
 
+from art.megatron.model_support.registry import get_model_support_spec
+
 from .output_parity import model_support_is_moe
 from .real_path import (
     config_from_env,
@@ -40,6 +42,16 @@ async def test_real_path_train_inf_mismatch_live(artifact_dir: Path) -> None:
 
     assert report.logical_prompt_count > 0
     assert report.logical_token_count > 0
+    handler_key = get_model_support_spec(
+        parity_config.base_model,
+        allow_unvalidated_arch=parity_config.allow_unvalidated_arch,
+    ).handler_key
+    if handler_key == "dsv4":
+        assert report.prompt_tree_depth == 2
+        assert report.prompt_tree_branch_count == 6
+    elif config.sliding_window is None:
+        assert report.prompt_tree_depth > 2
+        assert report.prompt_tree_branch_count >= 14
     if model_support_is_moe(
         parity_config.base_model,
         allow_unvalidated_arch=parity_config.allow_unvalidated_arch,

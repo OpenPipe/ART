@@ -1,7 +1,6 @@
 from collections.abc import Mapping
 import copy
 import inspect
-import logging
 import os
 from typing import Any, Literal, cast
 
@@ -28,13 +27,8 @@ install_art_bridge_runtime_patches()
 _NONE_ENV_VALUES = {"", "none", "null", "off", "disable", "disabled"}
 _TRUE_ENV_VALUES = {"1", "true", "yes", "on"}
 _FALSE_ENV_VALUES = {"0", "false", "no", "off"}
-_DEEPEP_ROUTER_PROB_WARNING = (
-    "DeepEP only supports float32 probs, please set --moe-router-dtype=fp32"
-)
-_DEEPEP_TOKEN_DISPATCHER_LOGGER = "megatron.core.transformer.moe.token_dispatcher"
 _RECOMPUTE_GRANULARITIES = {"full", "selective"}
 _RECOMPUTE_METHODS = {"uniform", "block"}
-_FLEX_DISPATCHER_BACKENDS = {"deepep", "hybridep"}
 _MOE_ROUTER_DTYPES = {"fp32", "fp64", "none"}
 _BOOL_ENV_FIELDS = (
     (
@@ -76,11 +70,6 @@ _CHOICE_ENV_FIELDS = (
         _RECOMPUTE_GRANULARITIES,
     ),
     ("recompute_method", "ART_MEGATRON_RECOMPUTE_METHOD", _RECOMPUTE_METHODS),
-    (
-        "moe_flex_dispatcher_backend",
-        "ART_MEGATRON_MOE_FLEX_DISPATCHER_BACKEND",
-        _FLEX_DISPATCHER_BACKENDS,
-    ),
     ("moe_router_dtype", "ART_MEGATRON_MOE_ROUTER_DTYPE", _MOE_ROUTER_DTYPES),
 )
 
@@ -92,21 +81,6 @@ class ProviderBundle(BaseModel):
     bridge: Any
     handler: Any
     spec: ModelSupportSpec
-
-
-class _DeepEpRouterProbWarningFilter(logging.Filter):
-    _art_deepep_router_prob_warning_filter = True
-
-    def filter(self, record: logging.LogRecord) -> bool:
-        return record.getMessage() != _DEEPEP_ROUTER_PROB_WARNING
-
-
-def _install_deepep_router_prob_warning_filter() -> None:
-    logger = logging.getLogger(_DEEPEP_TOKEN_DISPATCHER_LOGGER)
-    for existing in logger.filters:
-        if getattr(existing, "_art_deepep_router_prob_warning_filter", False):
-            return
-    logger.addFilter(_DeepEpRouterProbWarningFilter())
 
 
 def resolve_layer_spec(
@@ -197,7 +171,7 @@ class _ProviderRuntimeEnv(BaseModel):
     overlap_moe_expert_parallel_comm: bool | None = None
     delay_wgrad_compute: bool | None = None
     ep_overlap_early_attn_memory_release: bool | None = None
-    moe_deepep_num_sms: int | None = None
+    moe_hybridep_num_sms: int | None = None
     moe_apply_probs_on_input: bool | None = None
     bias_activation_fusion: bool | None = None
     fine_grained_activation_offloading: bool | None = None
@@ -213,7 +187,6 @@ class _ProviderRuntimeEnv(BaseModel):
     recompute_num_layers: int | None = None
     recompute_modules: list[str] | None = None
     moe_shared_expert_overlap: bool | None = None
-    moe_flex_dispatcher_backend: Literal["deepep", "hybridep"] | None = None
     moe_router_dtype: Literal["fp32", "fp64"] | None = None
 
     @classmethod
@@ -222,6 +195,18 @@ class _ProviderRuntimeEnv(BaseModel):
         env: Mapping[str, str] | None = None,
     ) -> "_ProviderRuntimeEnv":
         env = os.environ if env is None else env
+        for retired, replacement in (
+            (
+                "ART_MEGATRON_MOE_FLEX_DISPATCHER_BACKEND",
+                "ART always uses HybridEP",
+            ),
+            (
+                "ART_MEGATRON_MOE_DEEPEP_NUM_SMS",
+                "use ART_MEGATRON_MOE_HYBRIDEP_NUM_SMS",
+            ),
+        ):
+            if retired in env:
+                raise ValueError(f"{retired} was removed; {replacement}.")
         values: dict[str, Any] = {}
         for field_name, env_name in _BOOL_ENV_FIELDS:
             _set_if_found(values, field_name, _env_bool(env, env_name))
@@ -237,10 +222,10 @@ class _ProviderRuntimeEnv(BaseModel):
             )
         _set_if_found(
             values,
-            "moe_deepep_num_sms",
+            "moe_hybridep_num_sms",
             _env_default_or_even_positive_int(
                 env,
-                "ART_MEGATRON_MOE_DEEPEP_NUM_SMS",
+                "ART_MEGATRON_MOE_HYBRIDEP_NUM_SMS",
             ),
         )
         _set_if_found(
@@ -354,14 +339,10 @@ def _env_expert_tensor_parallel_size(
     return _env_optional_int(env, "ART_MEGATRON_EXPERT_TENSOR_MODEL_PARALLEL_SIZE")
 
 
-def _resolve_default_deepep_num_sms(provider: GPTModelProvider) -> int:
-    if provider.overlap_moe_expert_parallel_comm:
-        return 20
-    if not torch.cuda.is_available():
-        return 20
-    sm_count = torch.cuda.get_device_properties(0).multi_processor_count
-    sm_count -= sm_count % 2
-    return sm_count if sm_count >= 2 else 20
+def _resolve_default_hybridep_num_sms() -> int:
+    # Match HybridEP's tuned single-node default. Multi-node tuning remains a
+    # package/release follow-up once ART supports multi-node Megatron.
+    return 24
 
 
 def _handler_cp_supported(handler: Any) -> bool:
@@ -413,25 +394,92 @@ def _validate_context_parallel_support(
         )
 
 
+def _enforce_art_moe_grouped_gemm_fast_path(provider: GPTModelProvider) -> None:
+    if int(getattr(provider, "num_moe_experts", 0) or 0) <= 0:
+        return
+    _require_te_cutlass_grouped_gemm_dimensions(provider)
+    # ART's MoE path relies on TE CUTLASS grouped GEMM. TE's cuBLAS grouped
+    # fallback builds a cache keyed by routed shapes and warms up slowly as
+    # routing changes; the CUTLASS grouped path uses explicit problem
+    # descriptors and does not have that cache-convergence issue. Keep grouped
+    # bias/activation epilogues off here so handlers do not accidentally leave
+    # the fast path.
+    #
+    # Current validation is for SM90/Hopper. SM100/Blackwell enablement should
+    # come from upgrading Transformer Engine's grouped-GEMM implementation,
+    # while ART keeps this same central fast-path contract.
+    if provider.add_bias_linear and not getattr(
+        provider,
+        "art_moe_grouped_gemm_bias_encoded",
+        False,
+    ):
+        raise RuntimeError(
+            "TE CUTLASS grouped GEMM does not accept expert bias parameters; "
+            "the model handler must preserve required expert biases outside the "
+            "grouped-GEMM bias epilogue."
+        )
+    provider.bias_activation_fusion = False
+
+
+def _require_te_cutlass_grouped_gemm_dimensions(provider: GPTModelProvider) -> None:
+    hidden_size = int(
+        getattr(
+            provider,
+            "art_moe_grouped_gemm_hidden_size",
+            getattr(provider, "hidden_size", 0),
+        )
+        or 0
+    )
+    moe_ffn_hidden_size = int(
+        getattr(
+            provider,
+            "art_moe_grouped_gemm_ffn_hidden_size",
+            getattr(provider, "moe_ffn_hidden_size", 0),
+        )
+        or 0
+    )
+    expert_tensor_parallel_size = int(
+        getattr(provider, "expert_tensor_parallel_size", 1) or 1
+    )
+    invalid = []
+    if hidden_size <= 0 or hidden_size % 128:
+        invalid.append(f"hidden_size={hidden_size}")
+    if moe_ffn_hidden_size % expert_tensor_parallel_size:
+        invalid.append(
+            f"moe_ffn_hidden_size={moe_ffn_hidden_size} is not divisible by "
+            f"expert_tensor_parallel_size={expert_tensor_parallel_size}"
+        )
+    else:
+        local_moe_ffn_hidden_size = moe_ffn_hidden_size // expert_tensor_parallel_size
+        if local_moe_ffn_hidden_size <= 0 or local_moe_ffn_hidden_size % 128:
+            invalid.append(f"local_moe_ffn_hidden_size={local_moe_ffn_hidden_size}")
+    if invalid:
+        raise RuntimeError(
+            "ART Megatron MoE training requires Transformer Engine CUTLASS "
+            "grouped GEMM-compatible expert dimensions; "
+            f"{', '.join(invalid)} is not 128-aligned. This avoids TE's "
+            "cuBLAS grouped GEMM fallback, whose routed-shape cache warms "
+            "slowly and destabilizes pipeline throughput."
+        )
+
+
 def _apply_art_training_runtime_finalize_defaults(
     provider: GPTModelProvider,
-    runtime_env: _ProviderRuntimeEnv | None = None,
 ) -> None:
     if int(provider.expert_model_parallel_size or 1) <= 1:
         return
-    runtime_env = (
-        _ProviderRuntimeEnv.from_environ() if runtime_env is None else runtime_env
-    )
-    backend = (
-        runtime_env.moe_flex_dispatcher_backend
-        if runtime_env.is_set("moe_flex_dispatcher_backend")
-        else "deepep"
-    )
-    if backend is None:
-        return
     # Expert communication is comparable to expert MLP compute, so the ART
-    # runtime uses Megatron's optimized flex dispatcher instead of all-to-all.
-    apply_flex_dispatcher_backend(provider, moe_flex_dispatcher_backend=backend)
+    # runtime uses one optimized dispatcher contract instead of model-specific
+    # DeepEP or all-to-all alternatives.
+    apply_flex_dispatcher_backend(provider, moe_flex_dispatcher_backend="hybridep")
+    if (
+        provider.moe_token_dispatcher_type != "flex"
+        or provider.moe_flex_dispatcher_backend != "hybridep"
+    ):
+        raise RuntimeError(
+            "ART requires HybridEP for expert-parallel Megatron training, but "
+            "Megatron did not enable it on the current GPU."
+        )
 
 
 def _normalize_recompute_settings(provider: GPTModelProvider) -> None:
@@ -463,14 +511,14 @@ def _apply_runtime_env_overrides(
         "ep_overlap_early_attn_memory_release",
     )
 
-    if runtime_env.is_set("moe_deepep_num_sms"):
-        provider.moe_deepep_num_sms = (
-            _resolve_default_deepep_num_sms(provider)
-            if runtime_env.moe_deepep_num_sms is None
-            else runtime_env.moe_deepep_num_sms
+    if runtime_env.is_set("moe_hybridep_num_sms"):
+        provider.moe_hybridep_num_sms = (
+            _resolve_default_hybridep_num_sms()
+            if runtime_env.moe_hybridep_num_sms is None
+            else runtime_env.moe_hybridep_num_sms
         )
     else:
-        provider.moe_deepep_num_sms = _resolve_default_deepep_num_sms(provider)
+        provider.moe_hybridep_num_sms = _resolve_default_hybridep_num_sms()
 
     _apply_provider_attr_if_value(provider, runtime_env, "moe_apply_probs_on_input")
     _apply_provider_attr_if_value(provider, runtime_env, "bias_activation_fusion")
@@ -590,7 +638,6 @@ def prepare_provider_bundle(
     torch_dtype: torch.dtype = torch.bfloat16,
     allow_unvalidated_arch: bool = False,
 ) -> ProviderBundle:
-    _install_deepep_router_prob_warning_filter()
     runtime_env = _ProviderRuntimeEnv.from_environ()
     bundle = _build_provider_bundle(
         model,
@@ -620,13 +667,15 @@ def prepare_provider_bundle(
     provider.sequence_parallel = provider.tensor_model_parallel_size > 1
     _install_art_training_flex_attention(provider)
     bundle.handler.patch_provider(provider, bundle.bridge)
+    _enforce_art_moe_grouped_gemm_fast_path(provider)
     return bundle
 
 
 def finalize_provider_bundle(provider_bundle: ProviderBundle) -> ProviderBundle:
     runtime_env = _ProviderRuntimeEnv.from_environ()
     provider = cast(GPTModelProvider, provider_bundle.provider)
-    _apply_art_training_runtime_finalize_defaults(provider, runtime_env)
+    _apply_art_training_runtime_finalize_defaults(provider)
+    _enforce_art_moe_grouped_gemm_fast_path(provider)
     _finalize_provider_with_art_overrides(provider)
     _normalize_recompute_settings(provider)
     return provider_bundle
@@ -634,15 +683,33 @@ def finalize_provider_bundle(provider_bundle: ProviderBundle) -> ProviderBundle:
 
 def _finalize_provider_with_art_overrides(provider: GPTModelProvider) -> None:
     if not _is_art_gdn_context_parallel_provider(provider):
-        provider.finalize()
+        _finalize_provider_config(provider)
         return
     _validate_art_gdn_context_parallel_provider(provider)
     variant = provider.experimental_attention_variant
     provider.experimental_attention_variant = None
     try:
-        provider.finalize()
+        _finalize_provider_config(provider)
     finally:
         provider.experimental_attention_variant = variant
+
+
+def _finalize_provider_config(provider: GPTModelProvider) -> None:
+    # MCore rejects ETP whenever the global linear-bias flag is set. GPT-OSS
+    # keeps that flag for attention biases while its handler encodes expert
+    # biases into padded weights and constructs the grouped MLP without bias.
+    preserve_non_expert_bias = bool(
+        provider.add_bias_linear
+        and int(provider.expert_tensor_parallel_size or 1) > 1
+        and getattr(provider, "art_moe_grouped_gemm_bias_encoded", False)
+    )
+    if preserve_non_expert_bias:
+        provider.add_bias_linear = False
+    try:
+        provider.finalize()
+    finally:
+        if preserve_non_expert_bias:
+            provider.add_bias_linear = True
 
 
 def _is_art_gdn_context_parallel_provider(provider: GPTModelProvider) -> bool:

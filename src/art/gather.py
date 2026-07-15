@@ -8,6 +8,7 @@ from typing import Awaitable, Callable, Iterable, Iterator, Literal, Sequence, o
 from openai.types.chat.chat_completion import Choice
 from tqdm import auto as tqdm
 
+from .preprocessing.vllm_tokens import choice_completion_tokens
 from .trajectories import Trajectory, TrajectoryGroup
 
 
@@ -176,18 +177,24 @@ async def wrap_trajectories_awaitable(
 
 
 def record_metrics(context: "GatherContext", trajectory: Trajectory) -> None:
-    logprobs = [
-        message_or_choice.logprobs
-        for message_or_choice in trajectory.messages_and_choices
-        if isinstance(message_or_choice, Choice)
-        if message_or_choice.logprobs
+    trajectory.metrics.pop("completion_tokens", None)
+    choices = [
+        item
+        for history in (
+            trajectory.messages_and_choices,
+            *(
+                history.messages_and_choices
+                for history in trajectory.additional_histories
+            ),
+        )
+        for item in history
+        if isinstance(item, Choice)
     ]
-    if logprobs:
-        # TODO: probably shouldn't average this
+    completion_tokens = [choice_completion_tokens(choice) for choice in choices]
+    if choices and all(count is not None for count in completion_tokens):
         trajectory.metrics["completion_tokens"] = sum(
-            len(l.content or l.refusal or [])
-            for l in logprobs  # noqa: E741
-        ) / len(logprobs)
+            count for count in completion_tokens if count is not None
+        )
     context.metric_sums["reward"] += trajectory.reward
     context.metric_divisors["reward"] += 1
     context.metric_sums.update(trajectory.metrics)

@@ -10,8 +10,24 @@ from . import wandb_sdk
 
 def record_provenance(run: Run, provenance: str) -> None:
     """Record provenance on the latest artifact version's metadata."""
+    record_provenance_for_artifact(
+        entity=str(run.entity),
+        project=str(run.project),
+        name=str(run.name),
+        provenance=provenance,
+    )
+
+
+def record_provenance_for_artifact(
+    *,
+    entity: str,
+    project: str,
+    name: str,
+    provenance: str,
+) -> None:
+    """Record provenance on the latest artifact version's metadata."""
     api = wandb_sdk.api()
-    artifact_path = f"{run.entity}/{run.project}/{run.name}:latest"
+    artifact_path = f"{entity}/{project}/{name}:latest"
     try:
         artifact = api.artifact(artifact_path, type="lora")
     except wandb_sdk.comm_error_type():

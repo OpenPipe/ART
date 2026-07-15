@@ -22,6 +22,10 @@ class ModelService(Protocol):
 
     async def vllm_engine_is_sleeping(self) -> bool: ...
 
+    async def acquire_exact_adapter(self, step: int, checkpoint_path: str) -> str: ...
+
+    async def release_exact_adapter(self, step: int) -> None: ...
+
     def train(
         self,
         disk_packed_tensors: DiskPackedTensors,

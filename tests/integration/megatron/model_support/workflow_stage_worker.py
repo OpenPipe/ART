@@ -11,7 +11,7 @@ from .workflow import (
     run_lora_coverage_stage,
     run_merged_vllm_serving_stage,
     run_native_vllm_lora_stage,
-    run_packed_position_ids_stage,
+    run_packing_invariance_stage,
     run_train_inf_mismatch_stage,
     run_yes_no_trainability_stage,
 )
@@ -23,7 +23,7 @@ _STAGE_RUNNERS = {
     "merged_vllm_serving": run_merged_vllm_serving_stage,
     "correctness_sensitivity": run_correctness_sensitivity_stage,
     "chat_template_rollout": run_chat_template_rollout_stage,
-    "packed_position_ids": run_packed_position_ids_stage,
+    "packing_invariance": run_packing_invariance_stage,
     "length_trainability": run_length_trainability_stage,
     "yes_no_trainability": run_yes_no_trainability_stage,
     "native_vllm_lora": run_native_vllm_lora_stage,

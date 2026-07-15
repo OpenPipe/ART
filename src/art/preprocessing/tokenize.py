@@ -9,6 +9,7 @@ import math
 import random
 from typing import TYPE_CHECKING, Any, Generator, Literal, Protocol, cast
 
+import numpy as np
 from openai.types.chat.chat_completion import Choice
 import torch
 from transformers.tokenization_utils_base import BatchEncoding, PreTrainedTokenizerBase
@@ -23,8 +24,9 @@ from ..utils.chat_template import (
     merge_chat_template_kwargs,
 )
 from .moe_routing import (
+    MoeRouteArray,
+    MoeRouteSegments,
     MoeRoutingAlignmentStats,
-    TokenRoute,
     align_choice_routes_to_tokenized_result,
 )
 from .response_masking import (
@@ -36,6 +38,24 @@ from .vllm_tokens import choice_vllm_token_metadata
 
 ChatTemplateTool = dict[Any, Any] | Callable[..., Any]
 ChatTemplateToolSchemaFormat = Literal["default", "vllm_openai"]
+
+
+def _slice_moe_routes(
+    routes: MoeRouteArray | MoeRouteSegments | None, start: int
+) -> MoeRouteArray | MoeRouteSegments | None:
+    if routes is None:
+        return None
+    if isinstance(routes, MoeRouteSegments):
+        if start <= 0:
+            return routes
+        if start >= routes.shape[0]:
+            return np.empty((0, routes.shape[1], routes.shape[2]), dtype=np.int32)
+        return MoeRouteSegments(
+            segments=tuple(
+                segment for _, segment in routes.iter_slices(start, routes.shape[0])
+            )
+        )
+    return routes[start:]
 
 
 class _TokenDecoder(Protocol):
@@ -176,7 +196,7 @@ class TokenizedResult:
     choice_offsets: list[int]
     extra_logprobs: dict[str, list[float]]
     _tokenizer: _TokenDecoder = field(repr=False, compare=False)
-    moe_routed_experts: list[TokenRoute | None] | None = None
+    moe_routed_experts: MoeRouteArray | MoeRouteSegments | None = None
     moe_routing_alignment_stats: MoeRoutingAlignmentStats | None = None
     weight: float = 0.0
     prompt_id: int = 0
@@ -208,10 +228,8 @@ class TokenizedResult:
                 key: values[self.prompt_length :]
                 for key, values in self.extra_logprobs.items()
             },
-            moe_routed_experts=(
-                self.moe_routed_experts[self.prompt_length :]
-                if self.moe_routed_experts is not None
-                else None
+            moe_routed_experts=_slice_moe_routes(
+                self.moe_routed_experts, self.prompt_length
             ),
             moe_routing_alignment_stats=self.moe_routing_alignment_stats,
             _tokenizer=self._tokenizer,

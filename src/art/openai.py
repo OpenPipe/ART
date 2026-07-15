@@ -12,6 +12,8 @@ from openai.types.chat.chat_completion_message_function_tool_call import (
 )
 from openai.types.chat.chat_completion_message_tool_call import Function
 
+from .preprocessing.policy_spans import POLICY_TOKEN_SPANS_KEY
+
 
 async def consume_chat_completion_stream(
     stream: AsyncStream[ChatCompletionChunk],
@@ -96,6 +98,12 @@ def update_chat_completion(
             choice_extra["token_ids"] = [
                 *choice_extra.get("token_ids", []),
                 *token_ids,
+            ]
+        policy_token_spans = getattr(chunk_choice, POLICY_TOKEN_SPANS_KEY, None)
+        if policy_token_spans:
+            choice_extra[POLICY_TOKEN_SPANS_KEY] = [
+                *choice_extra.get(POLICY_TOKEN_SPANS_KEY, []),
+                *policy_token_spans,
             ]
         choice.finish_reason = chunk_choice.finish_reason or "stop"
         if chunk_choice.logprobs:

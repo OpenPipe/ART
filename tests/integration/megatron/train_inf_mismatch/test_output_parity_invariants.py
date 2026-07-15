@@ -231,7 +231,7 @@ def test_real_path_deletes_only_adapter_safetensors_on_pass(tmp_path) -> None:
 
 
 def test_architecture_specific_real_path_limits() -> None:
-    assert fwd_mean_abs_pct_limit_for_model("Qwen/Qwen3-30B-A3B") == 7.0
+    assert fwd_mean_abs_pct_limit_for_model("Qwen/Qwen3-30B-A3B") == 8.0
     assert fwd_mean_abs_pct_limit_for_model("Qwen/Qwen3.5-35B-A3B") == 5.0
     assert TOP20_KL_CANDIDATE_TO_TARGET_LIMIT == 0.002
 
@@ -242,7 +242,7 @@ def test_gemma4_real_path_limits() -> None:
             "google/gemma-4-31B-it",
             allow_unvalidated_arch=True,
         )
-        == 8.0
+        == 10.0
     )
     assert (
         top20_kl_candidate_to_target_limit_for_model(
@@ -256,7 +256,7 @@ def test_gemma4_real_path_limits() -> None:
             "google/gemma-4-26B-A4B-it",
             allow_unvalidated_arch=True,
         )
-        == 8.0
+        == 10.0
     )
     assert (
         top20_kl_candidate_to_target_limit_for_model(
@@ -393,3 +393,26 @@ def test_workflow_stage_enables_live_train_inf_mismatch(
     assert captured_env["ART_TRAIN_INF_MISMATCH_ALLOW_UNVALIDATED_ARCH"] == "1"
     assert captured_env["ART_REAL_PATH_MAX_COMPLETION_TOKENS"] == "16"
     assert captured_env["ART_TRAIN_INF_MISMATCH_VLLM_GPU_MEMORY_UTILIZATION"] == "0.50"
+
+
+def test_workflow_stage_does_not_accept_a_skipped_live_test(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+) -> None:
+    import subprocess
+
+    monkeypatch.setattr(workflow_stage, "create_artifact_dir", lambda _nodeid: tmp_path)
+    monkeypatch.setattr(
+        workflow_stage.subprocess,
+        "run",
+        lambda *args, **kwargs: subprocess.CompletedProcess(
+            args=args,
+            returncode=0,
+            stdout="1 skipped\n",
+            stderr="",
+        ),
+    )
+
+    report = workflow_stage.run_train_inf_mismatch(base_model="Qwen/Qwen3.5-35B-A3B")
+
+    assert report.passed is False

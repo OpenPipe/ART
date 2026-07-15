@@ -33,6 +33,7 @@ from .segment_layout import (
 )
 
 _GDN_ATTENTION_ORIGINAL_SHAPE_ATTR = "_art_gdn_attention_original_shape"
+_GDN_RUNTIME_STATE_ATTR = "_art_gdn_runtime_state"
 _GDN_TRACE_TOKEN_UID_HOOKS: Any | None = None
 
 
@@ -41,6 +42,15 @@ class _GdnIslandBoundary(NamedTuple):
     island_id: int | None
     input_layout: Literal["attention", "gdn"]
     output_layout: Literal["attention", "gdn"]
+
+
+class _GdnRuntimeState:
+    __slots__ = ("active_shape_key", "hidden_layout", "original_shapes")
+
+    def __init__(self) -> None:
+        self.active_shape_key: int | None = None
+        self.hidden_layout: Literal["attention", "gdn"] = "attention"
+        self.original_shapes: dict[int, tuple[int, int, int]] = {}
 
 
 def set_gdn_trace_token_uid_hooks(hooks: Any | None) -> Any | None:
@@ -56,10 +66,18 @@ def install_prefix_tree_gdn_hooks(model_chunks: Sequence[Any]) -> None:
     gated_delta_net_type = _optional_gated_delta_net_type()
     if gated_delta_net_type is None:
         return
+    next_gdn_index = 0
     for chunk in model_chunks:
         for module in chunk.modules():
             if not isinstance(module, gated_delta_net_type):
                 continue
+            existing_index = getattr(module, "_art_gdn_index", None)
+            if existing_index is None:
+                module._art_gdn_index = next_gdn_index
+                module_index = next_gdn_index
+            else:
+                module_index = int(existing_index)
+            next_gdn_index = max(next_gdn_index, module_index + 1)
             if getattr(module, "_art_prefix_tree_gdn_hooked", False):
                 continue
             original_forward = module.forward
@@ -92,6 +110,10 @@ def install_gdn_island_hooks(model_chunks: Sequence[Any]) -> None:
         )
         for layer, boundary in zip(layers, boundaries, strict=True):
             layer._art_gdn_island_boundary = boundary
+            if boundary.is_gdn:
+                layer.self_attention._art_gdn_island_id = boundary.island_id
+                layer.self_attention._art_gdn_inner_input_layout = "gdn"
+                layer.self_attention._art_gdn_inner_output_layout = "gdn"
             if getattr(layer, "_art_gdn_island_hooked", False):
                 continue
             layer._art_gdn_island_physical_forward = layer.forward
@@ -160,7 +182,7 @@ def _gdn_island_layer_forward(self: Any, *args: Any, **kwargs: Any) -> Any:
 
     boundary = cast(_GdnIslandBoundary, self._art_gdn_island_boundary)
     if not boundary.is_gdn:
-        if getattr(attention_bias, "gdn_hidden_layout", "attention") != "attention":
+        if _gdn_runtime_state(attention_bias).hidden_layout != "attention":
             _mark_attention_layout_active(attention_bias, hidden_states)
         return original_forward(*args, **kwargs)
 
@@ -194,16 +216,8 @@ def _gdn_island_layer_forward(self: Any, *args: Any, **kwargs: Any) -> Any:
             force=True,
         )
         args, kwargs = _replace_layer_hidden_states(args, kwargs, hidden_states)
-    previous_input_layout = getattr(attention_bias, "gdn_input_layout", None)
-    previous_output_layout = getattr(attention_bias, "gdn_output_layout", None)
-    setattr(attention_bias, "gdn_input_layout", "gdn")
-    setattr(attention_bias, "gdn_output_layout", "gdn")
 
-    try:
-        output = original_forward(*args, **kwargs)
-    finally:
-        setattr(attention_bias, "gdn_input_layout", previous_input_layout)
-        setattr(attention_bias, "gdn_output_layout", previous_output_layout)
+    output = original_forward(*args, **kwargs)
     if boundary.output_layout == "gdn":
         original_shape = _gdn_attention_original_shape_from_state(
             attention_bias, gdn=self.self_attention, island_id=boundary.island_id
@@ -288,6 +302,7 @@ def _is_empty_safe_norm_target(module: Any) -> bool:
     )
 
 
+@torch.compiler.disable
 def _empty_safe_norm_forward(
     self: Any, input_: Tensor, *args: Any, **kwargs: Any
 ) -> Any:
@@ -344,17 +359,20 @@ def _prefix_tree_forward(
         raise NotImplementedError("ART prefix-tree GDN does not support inference.")
     if packed_seq_params is not None:
         raise NotImplementedError("PackedSeqParams is not used in ART prefix-tree GDN.")
+    mark_layout = execution_plan is not None and int(execution_plan.cp_size) > 1
     current_layout = _normalize_cp_layout(
         getattr(attention_bias, "gdn_hidden_layout", "attention")
     )
-    input_layout = _normalize_cp_layout(
-        getattr(attention_bias, "gdn_input_layout", None) or current_layout
-    )
-    output_layout = _normalize_cp_layout(
-        getattr(attention_bias, "gdn_output_layout", None) or current_layout
-    )
-    mark_layout = execution_plan is not None and int(execution_plan.cp_size) > 1
     if mark_layout:
+        input_layout = _normalize_cp_layout(
+            getattr(self, "_art_gdn_inner_input_layout", "attention")
+        )
+        output_layout = _normalize_cp_layout(
+            getattr(self, "_art_gdn_inner_output_layout", "attention")
+        )
+    else:
+        input_layout = output_layout = "attention"
+    if mark_layout and current_layout != input_layout:
         _mark_cp_layout_active(
             attention_bias, hidden_states, gdn=self, layout=input_layout
         )
@@ -369,13 +387,6 @@ def _prefix_tree_forward(
         output_layout=output_layout,
         require_prebuilt_plan=True,
     )
-    if mark_layout:
-        _mark_cp_layout_active(
-            attention_bias,
-            _layer_output_hidden_states(output),
-            gdn=self,
-            layout=output_layout,
-        )
     return output
 
 
@@ -1017,6 +1028,15 @@ def _normalize_cp_layout(value: Any) -> Literal["attention", "gdn"]:
     raise ValueError(f"unsupported GDN CP layout {value!r}")
 
 
+def _gdn_runtime_state(attention_bias: Any) -> _GdnRuntimeState:
+    state = getattr(attention_bias, _GDN_RUNTIME_STATE_ATTR, None)
+    if isinstance(state, _GdnRuntimeState):
+        return state
+    state = _GdnRuntimeState()
+    object.__setattr__(attention_bias, _GDN_RUNTIME_STATE_ATTR, state)
+    return state
+
+
 def _enter_gdn_island_layout(
     hidden_states: Tensor,
     attention_bias: Any,
@@ -1026,7 +1046,8 @@ def _enter_gdn_island_layout(
     force: bool = False,
 ) -> Tensor:
     plan = _require_gdn_cp_plan(attention_bias)
-    if not force and getattr(attention_bias, "gdn_hidden_layout", "attention") == "gdn":
+    runtime = _gdn_runtime_state(attention_bias)
+    if not force and runtime.hidden_layout == "gdn":
         return _validate_gdn_hidden_for_cp_plan(hidden_states, plan, gdn=gdn)
     gdn_hidden, original_shape = gdn_cp_attention_to_gdn_layout(
         hidden_states,
@@ -1034,12 +1055,11 @@ def _enter_gdn_island_layout(
         _default_cp_group(plan.cp_size),
         gdn=gdn,
     )
-    attention_bias.gdn_hidden_layout = "gdn"
+    runtime.hidden_layout = "gdn"
     _store_gdn_attention_original_shape(
         attention_bias, original_shape, gdn=gdn, island_id=island_id
     )
-    if gdn is not None:
-        attention_bias.gdn_active_module = gdn
+    runtime.active_shape_key = _gdn_attention_original_shape_cache_key(gdn, island_id)
     token_uids = (
         _local_layout_token_uids(plan, "gdn", hidden_states=gdn_hidden, gdn=gdn)
         if _layout_token_uids_enabled()
@@ -1074,10 +1094,9 @@ def _mark_attention_layout_active(
     *,
     gdn: Any | None = None,
 ) -> None:
-    attention_bias.gdn_hidden_layout = "attention"
-    attention_bias.gdn_attention_original_shape = None
-    attention_bias.gdn_attention_token_uids = None
-    attention_bias.gdn_active_module = None
+    runtime = _gdn_runtime_state(attention_bias)
+    runtime.hidden_layout = "attention"
+    runtime.active_shape_key = None
     if hidden_states is None:
         return
     plan = _require_gdn_cp_plan(attention_bias)
@@ -1100,9 +1119,9 @@ def _mark_gdn_layout_active(
     island_id: int | None = None,
 ) -> None:
     plan = _require_gdn_cp_plan(attention_bias)
-    attention_bias.gdn_hidden_layout = "gdn"
-    if gdn is not None:
-        attention_bias.gdn_active_module = gdn
+    runtime = _gdn_runtime_state(attention_bias)
+    runtime.hidden_layout = "gdn"
+    runtime.active_shape_key = _gdn_attention_original_shape_cache_key(gdn, island_id)
     if hidden_states is None:
         return
     original_shape = _gdn_attention_original_shape_from_tensor(hidden_states)
@@ -1410,11 +1429,14 @@ def _store_gdn_attention_original_shape(
         int(original_shape[1]),
         int(original_shape[2]),
     )
-    attention_bias.gdn_attention_original_shape = normalized
     cache = _gdn_attention_original_shape_cache(attention_bias)
-    cache[_gdn_attention_original_shape_cache_key(gdn)] = normalized
+    key = _gdn_attention_original_shape_cache_key(gdn)
+    cache[key] = normalized
+    _gdn_runtime_state(attention_bias).active_shape_key = key
     if island_id is not None:
-        cache[_gdn_attention_original_shape_cache_key(None, island_id)] = normalized
+        island_key = _gdn_attention_original_shape_cache_key(None, island_id)
+        cache[island_key] = normalized
+        _gdn_runtime_state(attention_bias).active_shape_key = island_key
     return normalized
 
 
@@ -1424,52 +1446,27 @@ def _gdn_attention_original_shape_from_state(
     gdn: Any | None,
     island_id: int | None = None,
 ) -> tuple[int, int, int] | None:
-    cache = getattr(attention_bias, "gdn_attention_original_shapes", None)
-    if isinstance(cache, dict):
-        if island_id is not None:
-            original_shape = _normalize_gdn_attention_original_shape(
-                cache.get(_gdn_attention_original_shape_cache_key(None, island_id))
-            )
-            if original_shape is not None:
-                return original_shape
-        if gdn is not None:
-            original_shape = _normalize_gdn_attention_original_shape(
-                cache.get(_gdn_attention_original_shape_cache_key(gdn))
-            )
-            if original_shape is not None:
-                return original_shape
-        active_gdn = getattr(attention_bias, "gdn_active_module", None)
-        if active_gdn is not None:
-            original_shape = _normalize_gdn_attention_original_shape(
-                cache.get(_gdn_attention_original_shape_cache_key(active_gdn))
-            )
-            if original_shape is not None:
-                return original_shape
-        if gdn is None:
-            original_shape = _normalize_gdn_attention_original_shape(
-                cache.get(_gdn_attention_original_shape_cache_key(None))
-            )
-            if original_shape is not None:
-                return original_shape
-    original_shape = _normalize_gdn_attention_original_shape(
-        getattr(attention_bias, "gdn_attention_original_shape", None)
-    )
-    active_gdn = getattr(attention_bias, "gdn_active_module", None)
-    if original_shape is None or (
-        gdn is not None and active_gdn is not None and active_gdn is not gdn
-    ):
-        return None
-    return original_shape
+    runtime = _gdn_runtime_state(attention_bias)
+    cache = runtime.original_shapes
+    lookup_keys: list[int] = []
+    if island_id is not None:
+        lookup_keys.append(_gdn_attention_original_shape_cache_key(None, island_id))
+    if gdn is not None:
+        lookup_keys.append(_gdn_attention_original_shape_cache_key(gdn))
+    if runtime.active_shape_key is not None:
+        lookup_keys.append(runtime.active_shape_key)
+    lookup_keys.append(_gdn_attention_original_shape_cache_key(None))
+    for key in lookup_keys:
+        original_shape = _normalize_gdn_attention_original_shape(cache.get(key))
+        if original_shape is not None:
+            return original_shape
+    return None
 
 
 def _gdn_attention_original_shape_cache(
     attention_bias: Any,
 ) -> dict[int, tuple[int, int, int]]:
-    cache = getattr(attention_bias, "gdn_attention_original_shapes", None)
-    if not isinstance(cache, dict):
-        cache = {}
-        setattr(attention_bias, "gdn_attention_original_shapes", cache)
-    return cast(dict[int, tuple[int, int, int]], cache)
+    return _gdn_runtime_state(attention_bias).original_shapes
 
 
 def _gdn_attention_original_shape_cache_key(
@@ -1477,7 +1474,10 @@ def _gdn_attention_original_shape_cache_key(
 ) -> int:
     if island_id is not None:
         return -int(island_id) - 1
-    return 0 if gdn is None else id(gdn)
+    module_index = getattr(gdn, "_art_gdn_index", None)
+    if module_index is not None:
+        return int(module_index) + 1
+    return 0
 
 
 def _normalize_gdn_attention_original_shape(
@@ -2829,11 +2829,9 @@ def _group_rank(group: Any | None) -> int:
 
 
 def _l2norm(x: Tensor) -> Tensor:
-    try:
-        from fla.modules.l2norm import l2norm
-    except ImportError:
-        return F.normalize(x, p=2, dim=-1)
-    return l2norm(x)
+    from .l2norm import dynamic_l2norm
+
+    return dynamic_l2norm(x)
 
 
 def _chunk_gated_delta_rule(*args: Any, **kwargs: Any) -> tuple[Tensor, Tensor | None]:

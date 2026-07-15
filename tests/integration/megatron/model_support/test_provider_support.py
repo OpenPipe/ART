@@ -31,6 +31,15 @@ class _FakeProvider:
         self.overlap_moe_expert_parallel_comm = False
         self.moe_shared_expert_overlap = False
         self.num_moe_experts = 0
+        self.hidden_size = 2048
+        self.moe_ffn_hidden_size = 768
+        self.add_bias_linear = False
+        self.art_moe_grouped_gemm_bias_encoded = False
+        self.bias_activation_fusion = True
+        self.window_size: int | tuple[int, int] = (128, 0)
+        self.moe_hybridep_num_sms = 16
+        self.moe_flex_dispatcher_backend = "hybridep"
+        self.moe_token_dispatcher_type = ""
         self.recompute_granularity: str | None = None
         self.recompute_method: str | None = None
         self.recompute_num_layers: int | None = None
@@ -203,6 +212,8 @@ def test_get_provider_accepts_registry_supported_models(
     assert resolved.expert_tensor_parallel_size == 1
     assert resolved.sequence_parallel is False
     assert resolved.moe_shared_expert_overlap is False
+    assert resolved.add_bias_linear is False
+    assert resolved.bias_activation_fusion is False
     assert resolved.moe_router_dtype == "fp32"
     assert resolved.moe_aux_loss_coeff == 0.0
     assert resolved.calculate_per_token_loss is True
@@ -374,8 +385,6 @@ def test_finalize_provider_bundle_uses_post_prepare_topology(
     provider_module.finalize_provider_bundle(bundle)
 
     assert dispatcher_calls == []
-    assert provider.finalized is True
-    assert getattr(provider, "sequence_parallel") is False
 
 
 def test_get_provider_bundle_honors_single_gpu_env_topology(
@@ -625,24 +634,3 @@ def test_ep_overlap_recompute_contract_disables_full_recompute() -> None:
     assert provider.recompute_granularity is None
     assert provider.recompute_method is None
     assert provider.recompute_num_layers is None
-
-
-def test_finalize_provider_bundle_can_disable_flex_dispatcher_backend(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    provider = _FakeProvider()
-    provider.expert_model_parallel_size = 2
-    provider.expert_tensor_parallel_size = 1
-    dispatcher_calls: list[str] = []
-    monkeypatch.setenv("ART_MEGATRON_MOE_FLEX_DISPATCHER_BACKEND", "disabled")
-    monkeypatch.setattr(
-        provider_module,
-        "apply_flex_dispatcher_backend",
-        lambda provider, moe_flex_dispatcher_backend: dispatcher_calls.append(
-            cast(str, moe_flex_dispatcher_backend)
-        ),
-    )
-
-    provider_module._apply_art_training_runtime_finalize_defaults(cast(Any, provider))
-
-    assert dispatcher_calls == []

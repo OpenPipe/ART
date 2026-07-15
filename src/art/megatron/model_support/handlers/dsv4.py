@@ -14,6 +14,8 @@ from art.megatron.model_support.handlers.default_dense import (
 )
 from art.megatron.model_support.spec import (
     CompileWorkaroundConfig,
+    ExpertPackedLoraGroup,
+    ExpertPackedLoraSlot,
     LayerFamilyInstance,
     PrefixTreeModelStateContext,
 )
@@ -23,30 +25,25 @@ _ORACLE_Q_LORA_RANK = 128
 _ORACLE_NUM_ATTENTION_HEADS = 16
 _ORACLE_NUM_EXPERTS = 4
 _ORACLE_NUM_EXPERTS_PER_TOK = 1
-_ORACLE_FFN_HIDDEN_SIZE = 128
+_ORACLE_FFN_HIDDEN_SIZE = 256
 _ORACLE_INDEX_HEADS = 1
 _ORACLE_INDEX_TOPK = 1024
 _VALIDATION_NUM_LAYERS_ENV = "ART_DSV4_VALIDATION_NUM_LAYERS"
 _ORACLE_EXPERT_WEIGHT_RE = re.compile(r"\.mlp\.experts\..*\.weight(?P<expert>\d+)$")
 _DSV4_ART_MOE_EXPERT_KEY_RE = re.compile(
     r"^(?P<prefix>.*\.mlp\.experts)\.(?P<expert>\d+)\."
-    r"(?P<module>gate_proj|up_proj|down_proj)\.(?P<lora>lora_[AB])\.weight$"
+    r"(?P<module>gate_up_proj|down_proj)\."
+    r"(?P<lora>lora_[AB])\.weight$"
 )
 _DSV4_VLLM_MOE_KEY_RE = re.compile(
     r"^(?P<prefix>.*\.mlp\.experts)\."
     r"(?:(?P<base_layer>base_layer)\.)?(?P<lora>lora_[AB])\.weight$"
 )
-_DSV4_VLLM_MOE_EXPERT_KEY_RE = re.compile(
-    r"^(?P<prefix>.*\.ffn\.experts)\.(?P<expert>\d+)\."
-    r"(?P<module>w1|w2|w3)\.(?P<lora>lora_[AB])\.weight$"
+_DSV4_SPLIT_MOE_EXPERT_KEY_RE = re.compile(
+    r"^.*(?:\.mlp\.experts\.\d+\.(?:gate_proj|up_proj)|"
+    r"\.ffn\.experts\.\d+\.w[123])\.lora_[AB]\.weight$"
 )
-_DSV4_MOE_COMPILE_WORKAROUND_FLAGS = (
-    "alltoall_dtoh",
-    "alltoall_dispatch_preprocess",
-    "deepep_dispatch_combine",
-    "deepep_permute_restore",
-    "te_triton_permute_with_mask_map",
-)
+_DSV4_MOE_COMPILE_WORKAROUND_FLAGS = ("te_triton_permute_with_mask_map",)
 
 
 class Dsv4Handler(DefaultMoeHandler):
@@ -310,7 +307,7 @@ class Dsv4Handler(DefaultMoeHandler):
         )
         from art.megatron.lora import (
             _adapter_model_prefix,
-            wrap_grouped_moe_experts,
+            wrap_grouped_moe_experts_3d,
             wrap_shared_experts_mlp,
         )
 
@@ -330,7 +327,7 @@ class Dsv4Handler(DefaultMoeHandler):
                     rank=rank,
                     alpha=alpha,
                 )
-                wrap_grouped_moe_experts(
+                wrap_grouped_moe_experts_3d(
                     _require_moe_experts(module),
                     adapter_model_prefix=adapter_model_prefix,
                     target_modules=target_set,
@@ -426,6 +423,39 @@ class Dsv4Handler(DefaultMoeHandler):
         vLLM/Miles module names rather than ART/Megatron training target names.
         """
         return _dsv4_vllm_lora_config(adapter_config)
+
+    def expert_packed_lora_groups(self) -> tuple[ExpertPackedLoraGroup, ...]:
+        return (
+            ExpertPackedLoraGroup(
+                art_group_suffix=".mlp.experts",
+                slots=(
+                    ExpertPackedLoraSlot(
+                        source_projection="gate_up_proj",
+                        source_lora="lora_A",
+                        output_suffix="base_layer.lora_A.weight",
+                        pack_layout="expert_rows",
+                    ),
+                    ExpertPackedLoraSlot(
+                        source_projection="gate_up_proj",
+                        source_lora="lora_B",
+                        output_suffix="base_layer.lora_B.weight",
+                        pack_layout="rank_major_expert_cols",
+                    ),
+                    ExpertPackedLoraSlot(
+                        source_projection="down_proj",
+                        source_lora="lora_A",
+                        output_suffix="lora_A.weight",
+                        pack_layout="expert_rows",
+                    ),
+                    ExpertPackedLoraSlot(
+                        source_projection="down_proj",
+                        source_lora="lora_B",
+                        output_suffix="lora_B.weight",
+                        pack_layout="rank_major_expert_cols",
+                    ),
+                ),
+            ),
+        )
 
     def compile_workaround_config(self, provider: Any) -> CompileWorkaroundConfig:
         return CompileWorkaroundConfig(
@@ -1003,29 +1033,25 @@ def _dsv4_unpack_vllm_3d_lora_b(
     return tensor.reshape(tensor.shape[0], rank, num_experts).permute(2, 0, 1)
 
 
+def _dsv4_pack_vllm_3d_lora_b(blocks: list[torch.Tensor]) -> torch.Tensor:
+    stacked = torch.stack(blocks, dim=0)
+    return stacked.permute(1, 2, 0).reshape(stacked.shape[1], -1).contiguous()
+
+
 def _dsv4_clone(tensor: torch.Tensor) -> torch.Tensor:
     return tensor.clone().contiguous()
 
 
 def _dsv4_to_vllm_lora_key(key: str) -> str:
-    match = _DSV4_ART_MOE_EXPERT_KEY_RE.match(key)
-    if match is not None:
-        module = {
-            "gate_proj": "w1",
-            "down_proj": "w2",
-            "up_proj": "w3",
-        }[match.group("module")]
-        prefix = match.group("prefix").replace(".mlp.experts", ".ffn.experts", 1)
-        return f"{prefix}.{match.group('expert')}.{module}.{match.group('lora')}.weight"
-
     replacements = (
-        (".self_attn.compressor.kv_proj.", ".attn.mla_attn.compressor.wkv."),
-        (".self_attn.compressor.gate_proj.", ".attn.mla_attn.compressor.wgate."),
+        (".self_attn.compressor.kv_proj.", ".attn.compressor.wkv."),
+        (".self_attn.compressor.gate_proj.", ".attn.compressor.wgate."),
         (".self_attn.q_a_proj.", ".attn.wq_a."),
         (".self_attn.q_b_proj.", ".attn.wq_b."),
         (".self_attn.kv_proj.", ".attn.wkv."),
         (".self_attn.o_a_proj.", ".attn.wo_a."),
         (".self_attn.o_b_proj.", ".attn.wo_b."),
+        (".mlp.experts", ".ffn.experts"),
         (".mlp.shared_expert.", ".ffn.shared_experts."),
         (".mlp.shared_experts.", ".ffn.shared_experts."),
     )
@@ -1036,24 +1062,15 @@ def _dsv4_to_vllm_lora_key(key: str) -> str:
 
 
 def _dsv4_from_vllm_lora_key(key: str) -> str:
-    match = _DSV4_VLLM_MOE_EXPERT_KEY_RE.match(key)
-    if match is not None:
-        module = {
-            "w1": "gate_proj",
-            "w2": "down_proj",
-            "w3": "up_proj",
-        }[match.group("module")]
-        prefix = match.group("prefix").replace(".ffn.experts", ".mlp.experts", 1)
-        return f"{prefix}.{match.group('expert')}.{module}.{match.group('lora')}.weight"
-
     replacements = (
-        (".attn.mla_attn.compressor.wkv.", ".self_attn.compressor.kv_proj."),
-        (".attn.mla_attn.compressor.wgate.", ".self_attn.compressor.gate_proj."),
+        (".attn.compressor.wkv.", ".self_attn.compressor.kv_proj."),
+        (".attn.compressor.wgate.", ".self_attn.compressor.gate_proj."),
         (".attn.wq_a.", ".self_attn.q_a_proj."),
         (".attn.wq_b.", ".self_attn.q_b_proj."),
         (".attn.wkv.", ".self_attn.kv_proj."),
         (".attn.wo_a.", ".self_attn.o_a_proj."),
         (".attn.wo_b.", ".self_attn.o_b_proj."),
+        (".ffn.experts", ".mlp.experts"),
         (".ffn.shared_experts.", ".mlp.shared_expert."),
         (".mlp.shared_experts.", ".mlp.shared_expert."),
     )
@@ -1100,8 +1117,58 @@ def _dsv4_to_vllm_lora_tensors(
     *,
     adapter_config: dict[str, Any],
 ) -> tuple[dict[str, torch.Tensor], dict[str, Any]]:
+    canonical = _dsv4_from_vllm_lora_tensors(
+        tensors,
+        adapter_config=adapter_config,
+    )
+    grouped: dict[str, dict[int, dict[str, dict[str, torch.Tensor]]]] = {}
+    for key, tensor in canonical.items():
+        match = _DSV4_ART_MOE_EXPERT_KEY_RE.match(key)
+        if match is not None:
+            grouped.setdefault(match.group("prefix"), {}).setdefault(
+                int(match.group("expert")), {}
+            ).setdefault(match.group("module"), {})[match.group("lora")] = tensor
+
     transformed: dict[str, torch.Tensor] = {}
-    for key, tensor in tensors.items():
+    used_keys: set[str] = set()
+    for prefix, experts in grouped.items():
+        vllm_prefix = _dsv4_to_vllm_lora_key(prefix)
+        blocks = {
+            slot: []
+            for slot in (
+                ("gate_up_proj", "lora_A"),
+                ("gate_up_proj", "lora_B"),
+                ("down_proj", "lora_A"),
+                ("down_proj", "lora_B"),
+            )
+        }
+        for expert in sorted(experts):
+            modules = experts[expert]
+            try:
+                expert_tensors = {slot: modules[slot[0]][slot[1]] for slot in blocks}
+            except KeyError as exc:
+                raise RuntimeError(
+                    f"Incomplete DSV4 MoE LoRA block for {prefix}.{expert}"
+                ) from exc
+            for slot, tensor in expert_tensors.items():
+                blocks[slot].append(tensor.contiguous())
+                used_keys.add(f"{prefix}.{expert}.{slot[0]}.{slot[1]}.weight")
+        transformed[f"{vllm_prefix}.base_layer.lora_A.weight"] = torch.cat(
+            blocks[("gate_up_proj", "lora_A")], dim=0
+        ).contiguous()
+        transformed[f"{vllm_prefix}.base_layer.lora_B.weight"] = (
+            _dsv4_pack_vllm_3d_lora_b(blocks[("gate_up_proj", "lora_B")])
+        )
+        transformed[f"{vllm_prefix}.lora_A.weight"] = torch.cat(
+            blocks[("down_proj", "lora_A")], dim=0
+        ).contiguous()
+        transformed[f"{vllm_prefix}.lora_B.weight"] = _dsv4_pack_vllm_3d_lora_b(
+            blocks[("down_proj", "lora_B")]
+        )
+
+    for key, tensor in canonical.items():
+        if key in used_keys:
+            continue
         vllm_key = _dsv4_to_vllm_lora_key(key)
         if vllm_key in transformed:
             raise RuntimeError(
@@ -1116,8 +1183,21 @@ def _dsv4_from_vllm_lora_tensors(
     *,
     adapter_config: dict[str, Any],
 ) -> dict[str, torch.Tensor]:
+    split_key = next(
+        (key for key in tensors if _DSV4_SPLIT_MOE_EXPERT_KEY_RE.match(key)), None
+    )
+    if split_key is not None:
+        raise RuntimeError(
+            "DSV4 only supports fused 3D MoE LoRA tensors; got split expert "
+            f"tensor {split_key}"
+        )
+    canonical = {
+        _dsv4_from_vllm_lora_key(key): tensor for key, tensor in tensors.items()
+    }
+    if len(canonical) != len(tensors):
+        raise RuntimeError("Duplicate DSV4 LoRA tensor after key canonicalization")
     grouped: dict[str, dict[str, torch.Tensor]] = {}
-    for key, tensor in tensors.items():
+    for key, tensor in canonical.items():
         match = _DSV4_VLLM_MOE_KEY_RE.match(key)
         if match is None:
             continue
@@ -1126,9 +1206,7 @@ def _dsv4_from_vllm_lora_tensors(
         )
         grouped.setdefault(match.group("prefix"), {})[slot] = tensor
     if not grouped:
-        return {
-            _dsv4_from_vllm_lora_key(key): tensor for key, tensor in tensors.items()
-        }
+        return canonical
 
     rank = int(adapter_config["r"])
     transformed: dict[str, torch.Tensor] = {}
@@ -1167,17 +1245,12 @@ def _dsv4_from_vllm_lora_tensors(
             row = expert * rank
             gate_up_a_block = gate_up_a[row : row + rank]
             down_a_block = down_a[row : row + rank]
-            gate_b, up_b = gate_up_b_by_expert[expert].chunk(2, dim=0)
-            transformed[f"{prefix}.{expert}.gate_proj.lora_A.weight"] = _dsv4_clone(
+            transformed[f"{prefix}.{expert}.gate_up_proj.lora_A.weight"] = _dsv4_clone(
                 gate_up_a_block
             )
-            transformed[f"{prefix}.{expert}.gate_proj.lora_B.weight"] = _dsv4_clone(
-                gate_b
+            transformed[f"{prefix}.{expert}.gate_up_proj.lora_B.weight"] = _dsv4_clone(
+                gate_up_b_by_expert[expert]
             )
-            transformed[f"{prefix}.{expert}.up_proj.lora_A.weight"] = _dsv4_clone(
-                gate_up_a_block
-            )
-            transformed[f"{prefix}.{expert}.up_proj.lora_B.weight"] = _dsv4_clone(up_b)
             transformed[f"{prefix}.{expert}.down_proj.lora_A.weight"] = _dsv4_clone(
                 down_a_block
             )
@@ -1192,7 +1265,7 @@ def _dsv4_from_vllm_lora_tensors(
                 f"{prefix}.lora_B.weight",
             }
         )
-    for key, tensor in tensors.items():
+    for key, tensor in canonical.items():
         if key not in used_keys:
-            transformed[_dsv4_from_vllm_lora_key(key)] = tensor
+            transformed[key] = tensor
     return transformed

@@ -187,7 +187,7 @@ class TestHistoryJsonlCompatibility:
         # Verify required fields
         assert "step" in entry
         assert "recorded_at" in entry
-        assert "val/reward" in entry  # Prefixed metric
+        assert "reward/val" in entry
 
     @pytest.mark.asyncio
     async def test_history_readable_by_polars(
@@ -207,8 +207,8 @@ class TestHistoryJsonlCompatibility:
         df = pl.read_ndjson(str(history_path))
 
         assert "step" in df.columns
-        assert "val/reward" in df.columns
-        assert "val/reward_std_dev" in df.columns
+        assert "reward/val" in df.columns
+        assert "reward/val_std_dev" in df.columns
 
     @pytest.mark.asyncio
     async def test_history_appends_entries(
@@ -348,14 +348,12 @@ class TestMetricCalculation:
                 "step",
                 "recorded_at",
                 "training_step",
-                "time/wall_clock_sec",
             ]
         ]
-        assert all(k.startswith(("val/", "data/")) for k in metric_keys), (
+        assert all(k.startswith(("reward/", "task/", "data/")) for k in metric_keys), (
             f"Not all metrics routed into taxonomy namespaces: {metric_keys}"
         )
         assert entry["training_step"] == 0
-        assert entry["time/wall_clock_sec"] >= 0
 
     @pytest.mark.asyncio
     async def test_standard_metrics_present(self, tmp_path: Path):
@@ -389,12 +387,12 @@ class TestMetricCalculation:
         with open(history_path) as f:
             entry = json.loads(f.readline())
 
-        assert "val/reward" in entry
-        assert "val/exception_rate" in entry
-        assert "val/reward_std_dev" in entry
+        assert "reward/val" in entry
+        assert "task/val/exception_rate" in entry
+        assert "reward/val_std_dev" in entry
 
         # Check reward average is correct
-        assert entry["val/reward"] == 0.7  # (0.8 + 0.6) / 2
+        assert entry["reward/val"] == 0.7  # (0.8 + 0.6) / 2
 
     @pytest.mark.asyncio
     async def test_group_metric_aggregation(self, tmp_path: Path):
@@ -435,7 +433,7 @@ class TestMetricCalculation:
         with open(history_path) as f:
             entry = json.loads(f.readline())
 
-        assert entry["val/group_judge_score"] == 0.4
+        assert entry["task/val/group/judge_score"] == 0.4
 
     @pytest.mark.asyncio
     async def test_exception_rate_calculation(self, tmp_path: Path):
@@ -468,7 +466,7 @@ class TestMetricCalculation:
             entry = json.loads(f.readline())
 
         # All successful trajectories = 0% exception rate
-        assert entry["val/exception_rate"] == 0.0
+        assert entry["task/val/exception_rate"] == 0.0
 
     @pytest.mark.asyncio
     async def test_exception_rate_counts_group_exceptions(self, tmp_path: Path):
@@ -497,7 +495,7 @@ class TestMetricCalculation:
         with open(history_path) as f:
             entry = json.loads(f.readline())
 
-        assert entry["val/exception_rate"] == pytest.approx(0.5)
+        assert entry["task/val/exception_rate"] == pytest.approx(0.5)
 
     @pytest.mark.asyncio
     async def test_generator_of_trajectories_is_consumed_once(self, tmp_path: Path):
@@ -526,8 +524,8 @@ class TestMetricCalculation:
         with open(history_path) as f:
             entry = json.loads(f.readline())
 
-        assert entry["val/reward"] == pytest.approx(2.0)
-        assert entry["val/custom"] == pytest.approx(2.0)
+        assert entry["reward/val"] == pytest.approx(2.0)
+        assert entry["task/val/custom"] == pytest.approx(2.0)
 
     @pytest.mark.asyncio
     async def test_train_trajectory_metrics_default_to_train_prefix(
@@ -562,10 +560,10 @@ class TestMetricCalculation:
         with open(history_path) as f:
             entry = json.loads(f.readline())
 
-        assert entry["train/reward"] == 0.7
-        assert entry["train/exception_rate"] == 0.0
-        assert entry["train/custom_score"] == 1.0
-        assert entry["reward/prefixed"] == 2.0
+        assert entry["reward/train"] == 0.7
+        assert entry["task/train/exception_rate"] == 0.0
+        assert entry["task/train/custom_score"] == 1.0
+        assert entry["task/train/reward/prefixed"] == 2.0
 
     @pytest.mark.asyncio
     async def test_train_logs_add_default_data_metrics_from_trajectory_groups(
@@ -751,8 +749,8 @@ class TestMetricCalculation:
             split="train",
             step=1,
             metrics={
-                "time/step_actor_s": 1.5,
-                "data/step_actor_tokens": 10,
+                "time/step_rollout_s": 1.5,
+                "data/step_rollout_tokens": 10,
             },
         )
 
@@ -760,10 +758,10 @@ class TestMetricCalculation:
         with open(history_path) as f:
             entry = json.loads(f.readline())
 
-        assert entry["time/step_actor_s"] == pytest.approx(1.5)
-        assert entry["time/cum/actor_s"] == pytest.approx(1.5)
-        assert entry["data/step_actor_tokens"] == pytest.approx(10)
-        assert entry["data/cum/actor_tokens"] == pytest.approx(10)
+        assert entry["time/step_rollout_s"] == pytest.approx(1.5)
+        assert entry["time/cum/rollout_s"] == pytest.approx(1.5)
+        assert entry["data/step_rollout_tokens"] == pytest.approx(10)
+        assert entry["data/cum/rollout_tokens"] == pytest.approx(10)
 
     @pytest.mark.asyncio
     async def test_log_without_new_builder_metrics_skips_extra_taxonomy_row(
@@ -782,8 +780,8 @@ class TestMetricCalculation:
             split="train",
             step=1,
             metrics={
-                "time/step_trainer_s": 2.0,
-                "data/step_trainer_tokens": 20.0,
+                "time/step_backend_train_s": 2.0,
+                "data/step_trainable_assistant_tokens": 20.0,
             },
         )
         await model.log(
@@ -1086,8 +1084,8 @@ class TestTrainSFTMetricsAggregation:
         summary = summary_entries[0]
         assert summary["loss/train"] == pytest.approx(0.8)  # (1.0 + 0.8 + 0.6) / 3
         assert summary["loss/grad_norm"] == pytest.approx(0.4)  # (0.5 + 0.4 + 0.3) / 3
-        assert summary["time/step_trainer_s"] >= 0
-        assert summary["time/cum/trainer_s"] >= 0
+        assert summary["time/step_backend_train_s"] >= 0
+        assert summary["time/cum/backend_train_s"] >= 0
 
     @pytest.mark.asyncio
     async def test_train_sft_single_step_increment(self, tmp_path: Path):

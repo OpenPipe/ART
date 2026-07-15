@@ -1,26 +1,35 @@
-import math
+from collections.abc import Iterable, Sequence
 import os
 import random
 import time
 from typing import Any, Literal, NamedTuple, cast
 
+import numpy as np
 import torch
 from typing_extensions import NotRequired, TypedDict, Unpack
 
 from ..megatron.prefix_tree_packing import (
-    estimate_prefix_tree_packed_tokens,
+    PrefixTreePackSegment,
 )
 from ..megatron.prefix_tree_packing import (
-    prefix_tree_pack as _prefix_tree_pack_sequences,
+    prefix_tree_pack_segments as _prefix_tree_pack_segments,
 )
 from ..types import Verbosity
 from .moe_routing import (
+    MISSING_EXPERT_ID,
+    MoeRouteArray,
+    MoeRouteSegments,
     MoeRoutingPackStats,
     PackedMoeRoutingReplay,
-    TokenRoute,
-    count_route_slot_conflicts,
 )
 from .tokenize import TokenizedResult
+
+DEFAULT_MIN_PREFIX_TREE_SHARED_SEGMENT_LENGTH = 64
+
+
+class PrefixTreePackingStats(TypedDict):
+    logical_tokens: int
+    physical_tokens: int
 
 
 class PackedTensors(TypedDict):
@@ -34,7 +43,8 @@ class PackedTensors(TypedDict):
     weights: torch.Tensor
     pixel_values: list[torch.Tensor | None]
     image_grid_thw: list[torch.Tensor | None]
-    moe_routing_replay: NotRequired[PackedMoeRoutingReplay | None]
+    moe_routing_replay: PackedMoeRoutingReplay | None
+    prefix_tree_packing_stats: NotRequired[PrefixTreePackingStats]
     original_logprobs: NotRequired[torch.Tensor]
 
 
@@ -46,32 +56,160 @@ class DiskPackedTensors(TypedDict):
     image_grid_thw: NotRequired[tuple[int, list[int]]]
 
 
-class _PackedPrefixTreeRow(TypedDict):
-    token_ids: list[int]
-    group_ids: list[int]
-    parent_ids: list[int]
-    input_pos: list[int]
-    assistant_mask: list[int]
-    logprobs: list[float]
-    advantages: list[float]
-    weights: list[float]
+class _PackedPrefixTreeRow(NamedTuple):
+    token_ids: np.ndarray
+    group_ids: np.ndarray
+    parent_ids: np.ndarray
+    input_pos: np.ndarray
+    assistant_mask: np.ndarray
+    logprobs: np.ndarray
+    advantages: np.ndarray
+    weights: np.ndarray
     pixel_values: torch.Tensor | None
     image_grid_thw: torch.Tensor | None
-    moe_routes: list[TokenRoute | None]
+    route_tensor: np.ndarray | None = None
+    route_mask: np.ndarray | None = None
+    max_expert_id: int = 0
 
 
 class _PrefixTreePackItem(NamedTuple):
     token_ids: tuple[int, ...]
-    input_pos: tuple[int, ...]
-    assistant_mask: tuple[int, ...]
-    logprobs: tuple[float, ...]
+    input_pos: np.ndarray
+    assistant_mask: np.ndarray
+    logprobs: np.ndarray
     advantage: float
     weight: float
     prompt_id: int
     shareable_length: int
     pixel_values: torch.Tensor | None
     image_grid_thw: torch.Tensor | None
-    moe_routes: tuple[TokenRoute | None, ...] | None
+    moe_routes: MoeRouteArray | MoeRouteSegments | None
+
+
+class _PrefixTreeRowPlan(NamedTuple):
+    segments: tuple[PrefixTreePackSegment, ...]
+    length: int
+
+
+class _PrefixTreeLeaf(NamedTuple):
+    item_index: int
+    packing_group_id: int
+    segment_path: tuple[tuple[int, int], ...]
+    empty_bin_cost: int
+
+
+class _PrefixTreeBin:
+    __slots__ = ("leaves", "occupied_segments", "token_count")
+
+    def __init__(self) -> None:
+        self.leaves: list[_PrefixTreeLeaf] = []
+        self.occupied_segments: set[int] = set()
+        self.token_count = 0
+
+    def insertion_delta(self, leaf: _PrefixTreeLeaf) -> int:
+        return sum(
+            length
+            for segment_id, length in leaf.segment_path
+            if segment_id not in self.occupied_segments
+        )
+
+    def add(self, leaf: _PrefixTreeLeaf) -> None:
+        self.token_count += self.insertion_delta(leaf)
+        self.occupied_segments.update(segment_id for segment_id, _ in leaf.segment_path)
+        self.leaves.append(leaf)
+
+
+class PrefixTreePackingEstimate(NamedTuple):
+    packed_sequences: int
+    non_padding_tokens: int
+
+
+class PrefixTreePackingPool:
+    __slots__ = ("group_costs", "groups")
+
+    def __init__(
+        self,
+        groups: Sequence[Sequence[tuple[Sequence[int], int]]],
+        *,
+        min_shared_segment_length: int = DEFAULT_MIN_PREFIX_TREE_SHARED_SEGMENT_LENGTH,
+    ) -> None:
+        prefixes: list[Sequence[int]] = []
+        leaf_specs: list[tuple[int, int | None, int]] = []
+        for group_id, group in enumerate(groups):
+            group_prefixes: list[tuple[Sequence[int], int]] = []
+            for tokens, shareable_length in group:
+                prefix = tokens[:shareable_length]
+                prefix_index = next(
+                    (
+                        index
+                        for candidate, index in group_prefixes
+                        if candidate == prefix
+                    ),
+                    None,
+                )
+                if prefix_index is None and shareable_length > 0:
+                    prefix_index = len(prefixes)
+                    prefixes.append(prefix)
+                    group_prefixes.append((prefix, prefix_index))
+                leaf_specs.append(
+                    (group_id, prefix_index, len(tokens) - shareable_length)
+                )
+        if not leaf_specs:
+            raise ValueError("Prefix-tree packing pool requires at least one leaf")
+        segments = (
+            _prefix_tree_pack_segments(
+                prefixes,
+                max_depth=max(map(len, prefixes)),
+                shareable_lengths=map(len, prefixes),
+                min_shared_segment_length=min_shared_segment_length,
+            )
+            if prefixes
+            else ()
+        )
+        paths: list[list[tuple[int, int]]] = [[] for _ in prefixes]
+        for segment_id, segment in enumerate(segments):
+            path_segment = (segment_id, segment.length)
+            for prefix_index in segment.sequence_indices:
+                paths[prefix_index].append(path_segment)
+        next_segment_id = len(segments)
+        leaves = []
+        for index, (group_id, prefix_index, tail_length) in enumerate(leaf_specs):
+            segment_path = tuple(
+                () if prefix_index is None else paths[prefix_index]
+            ) + (((next_segment_id + index, tail_length),) if tail_length > 0 else ())
+            leaves.append(
+                _PrefixTreeLeaf(
+                    item_index=index,
+                    packing_group_id=group_id,
+                    segment_path=segment_path,
+                    empty_bin_cost=sum(length for _, length in segment_path),
+                ),
+            )
+        grouped_leaves: list[list[_PrefixTreeLeaf]] = [[] for _ in groups]
+        for leaf in leaves:
+            grouped_leaves[leaf.packing_group_id].append(leaf)
+        self.groups = tuple(tuple(group) for group in grouped_leaves)
+        self.group_costs = tuple(
+            max(leaf.empty_bin_cost for leaf in group) for group in self.groups
+        )
+
+    def estimate(
+        self, group_indices: Sequence[int], *, seq_len: int
+    ) -> PrefixTreePackingEstimate:
+        ordered = sorted(
+            group_indices,
+            key=lambda index: self.group_costs[index],
+            reverse=True,
+        )
+        bins = _place_prefix_tree_leaves(
+            (self.groups[index] for index in ordered),
+            seq_len=seq_len,
+            groups_are_ordered=True,
+        )
+        return PrefixTreePackingEstimate(
+            packed_sequences=len(bins),
+            non_padding_tokens=sum(packed_bin.token_count for packed_bin in bins),
+        )
 
 
 def packed_tensors_from_tokenized_results(
@@ -83,6 +221,9 @@ def packed_tensors_from_tokenized_results(
     verbosity: Verbosity = 1,
     pack_results: bool = True,
     include_moe_routing: bool = False,
+    min_prefix_tree_shared_segment_length: int = (
+        DEFAULT_MIN_PREFIX_TREE_SHARED_SEGMENT_LENGTH
+    ),
 ) -> PackedTensors:
     return prefix_tree_pack(
         tokenized_results=tokenized_results,
@@ -93,6 +234,7 @@ def packed_tensors_from_tokenized_results(
         verbosity=verbosity,
         pack_results=pack_results,
         include_moe_routing=include_moe_routing,
+        min_prefix_tree_shared_segment_length=(min_prefix_tree_shared_segment_length),
     )
 
 
@@ -106,8 +248,13 @@ def prefix_tree_pack(
     verbosity: Verbosity = 1,
     pack_results: bool = True,
     include_moe_routing: bool = False,
+    min_prefix_tree_shared_segment_length: int = (
+        DEFAULT_MIN_PREFIX_TREE_SHARED_SEGMENT_LENGTH
+    ),
 ) -> PackedTensors:
-    rows: list[list[_PrefixTreePackItem]] = [[]]
+    if min_prefix_tree_shared_segment_length < 0:
+        raise ValueError("min_prefix_tree_shared_segment_length must be >= 0")
+    items: list[_PrefixTreePackItem] = []
     moe_routing_pack_stats = MoeRoutingPackStats()
 
     for result in tokenized_results:
@@ -125,54 +272,91 @@ def prefix_tree_pack(
                 print("Result has no unique completion tokens, skipping")
             continue
         item = _prefix_tree_pack_item(result, seq_len=seq_len)
-        if rows[-1] and (
-            not pack_results
-            or _packed_row_token_count([*rows[-1], item], seq_len=seq_len) > seq_len
-        ):
-            rows.append([])
-        rows[-1].append(item)
         if truncate_long_results:
-            rows[-1][-1] = _truncate_prefix_tree_pack_item(rows[-1][-1], seq_len)
+            item = _truncate_prefix_tree_pack_item(item, seq_len)
+        items.append(item)
 
-    random.shuffle(rows)
-    packed_rows = [
-        _pack_prefix_tree_row(
-            row,
-            seq_len=seq_len,
-            pack_results=pack_results,
-            include_moe_routing=include_moe_routing,
-            moe_routing_pack_stats=moe_routing_pack_stats,
+    planned_rows = _prefix_tree_pack_rows(
+        items,
+        seq_len=seq_len,
+        pack_results=pack_results,
+        min_shared_segment_length=min_prefix_tree_shared_segment_length,
+    )
+    if not planned_rows:
+        raise RuntimeError("No tokenized results were packable")
+    random.shuffle(planned_rows)
+    rows = [row for row, _ in planned_rows]
+    row_plans = [plan for _, plan in planned_rows]
+
+    num_sequences = len(rows)
+    tokens_np = np.full((num_sequences, seq_len), pad_token_id, dtype=np.int64)
+    group_ids_np = np.full((num_sequences, seq_len), -1, dtype=np.int64)
+    parent_ids_np = np.full((num_sequences, seq_len), -1, dtype=np.int64)
+    input_pos_np = np.zeros((num_sequences, seq_len), dtype=np.int64)
+    assistant_mask_np = np.zeros((num_sequences, seq_len), dtype=np.bool_)
+    logprobs_np = np.full((num_sequences, seq_len), np.nan, dtype=np.float32)
+    advantages_np = np.zeros((num_sequences, seq_len), dtype=np.float32)
+    weights_np = np.zeros((num_sequences, seq_len), dtype=np.float32)
+    pixel_values: list[torch.Tensor | None] = []
+    image_grid_thw: list[torch.Tensor | None] = []
+    route_shape = next(
+        (
+            shape
+            for row in rows
+            if (shape := _first_item_moe_route_shape(row)) is not None
+        ),
+        None,
+    )
+    route_tensor_np: np.ndarray | None = None
+    route_mask_np: np.ndarray | None = None
+    max_expert_id = 0
+    if include_moe_routing:
+        if route_shape is None:
+            raise RuntimeError("No MoE routes were packed")
+        num_layers, topk = route_shape
+        route_tensor_np = np.zeros(
+            (num_sequences, seq_len, num_layers, topk), dtype=np.int32
         )
-        for row in rows
-    ]
+        route_mask_np = np.zeros((num_sequences, seq_len), dtype=np.bool_)
 
-    def pad(values: list[list], pad_value) -> list[list]:
-        max_len = seq_len
-        for value in values:
-            value.extend([pad_value] * (max_len - len(value)))
-        return values
+    for index, (row, plan) in enumerate(zip(rows, row_plans, strict=True)):
+        row_route_tensor = (
+            route_tensor_np[index] if route_tensor_np is not None else None
+        )
+        row_route_mask = route_mask_np[index] if route_mask_np is not None else None
+        _materialize_prefix_tree_row(
+            row,
+            plan=plan,
+            token_ids=tokens_np[index],
+            group_ids=group_ids_np[index],
+            parent_ids=parent_ids_np[index],
+            input_pos=input_pos_np[index],
+            assistant_mask=assistant_mask_np[index],
+            logprobs=logprobs_np[index],
+            advantages=advantages_np[index],
+            weights=weights_np[index],
+            route_tensor=row_route_tensor,
+            route_mask=row_route_mask,
+            route_shape=route_shape,
+            include_moe_routing=include_moe_routing,
+        )
+        pixel_values.append(_packed_row_tensor_list(row, "pixel_values"))
+        image_grid_thw.append(_packed_row_tensor_list(row, "image_grid_thw"))
+    if include_moe_routing:
+        assert route_tensor_np is not None and route_mask_np is not None
+        if bool(route_mask_np.any()):
+            max_expert_id = int(route_tensor_np.max())
 
-    token_ids = [row["token_ids"] for row in packed_rows]
-    group_ids = [row["group_ids"] for row in packed_rows]
-    parent_ids = [row["parent_ids"] for row in packed_rows]
-    input_pos = [row["input_pos"] for row in packed_rows]
-    assistant_mask = [row["assistant_mask"] for row in packed_rows]
-    logprobs = [row["logprobs"] for row in packed_rows]
-    advantages = [row["advantages"] for row in packed_rows]
-    weights = [row["weights"] for row in packed_rows]
-    pixel_values = [row["pixel_values"] for row in packed_rows]
-    image_grid_thw = [row["image_grid_thw"] for row in packed_rows]
-    moe_routes = [row["moe_routes"] for row in packed_rows]
-
-    assistant_mask_tensor = torch.tensor(pad(assistant_mask, 0), dtype=torch.bool)
-    weights_tensor = torch.tensor(pad(weights, 0.0))
+    assistant_mask_tensor = torch.from_numpy(assistant_mask_np)
+    weights_tensor = torch.from_numpy(weights_np)
     weights_tensor = torch.where(
         assistant_mask_tensor, weights_tensor, torch.zeros_like(weights_tensor)
     )
-    weights_tensor[assistant_mask_tensor] /= weights_tensor[
-        assistant_mask_tensor
-    ].mean()
-    advantages_tensor = torch.tensor(pad(advantages, 0.0))
+    if bool(assistant_mask_tensor.any()):
+        weights_tensor[assistant_mask_tensor] /= weights_tensor[
+            assistant_mask_tensor
+        ].mean()
+    advantages_tensor = torch.from_numpy(advantages_np)
     advantages_tensor = torch.where(
         assistant_mask_tensor, advantages_tensor, torch.zeros_like(advantages_tensor)
     )
@@ -188,42 +372,227 @@ def prefix_tree_pack(
             advantages_tensor,
             advantages_tensor * (1 + advantage_balance),
         )
-    advantages_tensor[assistant_mask_tensor] /= (
-        advantages_tensor[assistant_mask_tensor].abs()
-        * weights_tensor[assistant_mask_tensor]
-    ).mean()
+    if bool(assistant_mask_tensor.any()):
+        advantages_tensor[assistant_mask_tensor] /= (
+            advantages_tensor[assistant_mask_tensor].abs()
+            * weights_tensor[assistant_mask_tensor]
+        ).mean()
 
     packed_tensors: PackedTensors = {
-        "tokens": torch.tensor(pad(token_ids, pad_token_id)),
-        "group_ids": torch.tensor(pad(group_ids, -1)),
-        "parent_ids": torch.tensor(pad(parent_ids, -1)),
-        "input_pos": torch.tensor(pad(input_pos, 0)),
+        "tokens": torch.from_numpy(tokens_np),
+        "group_ids": torch.from_numpy(group_ids_np),
+        "parent_ids": torch.from_numpy(parent_ids_np),
+        "input_pos": torch.from_numpy(input_pos_np),
         "assistant_mask": assistant_mask_tensor,
-        "logprobs": torch.tensor(pad(logprobs, float("nan"))),
+        "logprobs": torch.from_numpy(logprobs_np),
         "advantages": advantages_tensor,
         "weights": weights_tensor,
         "pixel_values": pixel_values,
         "image_grid_thw": image_grid_thw,
         "moe_routing_replay": None,
+        "prefix_tree_packing_stats": {
+            "logical_tokens": sum(len(item.token_ids) for item in items),
+            "physical_tokens": sum(plan.length for plan in row_plans),
+        },
     }
     if include_moe_routing:
-        (
-            route_tensor,
-            route_mask,
-            num_layers,
-            topk,
-            num_experts,
-        ) = _tensorize_moe_routes(moe_routes, seq_len)
-        moe_routing_pack_stats.packed_tokens = int(route_mask.sum().item())
+        assert route_tensor_np is not None and route_mask_np is not None
+        assert route_shape is not None
+        num_layers, topk = route_shape
+        if not bool(route_mask_np.any()):
+            raise RuntimeError("No MoE routes were packed")
+        moe_routing_pack_stats.packed_tokens = int(route_mask_np.sum())
         packed_tensors["moe_routing_replay"] = PackedMoeRoutingReplay(
-            expert_indices=route_tensor,
-            token_mask=route_mask,
+            expert_indices=torch.from_numpy(route_tensor_np),
+            token_mask=torch.from_numpy(route_mask_np),
             num_layers=num_layers,
             topk=topk,
-            num_experts=num_experts,
+            num_experts=max(topk, max_expert_id + 1),
             pack_stats=moe_routing_pack_stats,
         )
     return packed_tensors
+
+
+def _prefix_tree_pack_rows(
+    items: list[_PrefixTreePackItem],
+    *,
+    seq_len: int,
+    pack_results: bool,
+    min_shared_segment_length: int,
+) -> list[tuple[list[_PrefixTreePackItem], _PrefixTreeRowPlan]]:
+    if not items:
+        return []
+    if not pack_results:
+        return [
+            (
+                [item],
+                _prefix_tree_row_plan(
+                    [item],
+                    seq_len=seq_len,
+                    pack_results=False,
+                    min_shared_segment_length=min_shared_segment_length,
+                ),
+            )
+            for item in items
+        ]
+
+    segments = _prefix_tree_pack_segments(
+        (item.token_ids for item in items),
+        max_depth=max(len(item.token_ids) for item in items),
+        shareable_lengths=(item.shareable_length for item in items),
+        min_shared_segment_length=min_shared_segment_length,
+    )
+    paths: list[list[tuple[int, int]]] = [[] for _ in items]
+    for segment_id, segment in enumerate(segments):
+        path_segment = (segment_id, segment.length)
+        for item_index in segment.sequence_indices:
+            paths[item_index].append(path_segment)
+    leaves = [
+        _PrefixTreeLeaf(
+            item_index=index,
+            packing_group_id=item.prompt_id,
+            segment_path=tuple(paths[index]),
+            empty_bin_cost=sum(length for _, length in paths[index]),
+        )
+        for index, item in enumerate(items)
+    ]
+    for leaf in leaves:
+        if leaf.empty_bin_cost > seq_len:
+            raise RuntimeError(
+                "Prefix-tree pack item exceeds sequence length: "
+                f"cost={leaf.empty_bin_cost}, seq_len={seq_len}"
+            )
+    grouped: dict[int, list[_PrefixTreeLeaf]] = {}
+    for leaf in leaves:
+        grouped.setdefault(leaf.packing_group_id, []).append(leaf)
+    bins = _place_prefix_tree_leaves(grouped.values(), seq_len=seq_len)
+
+    planned_rows = []
+    for packed_bin in bins:
+        row = [items[leaf.item_index] for leaf in packed_bin.leaves]
+        occupancy_plan = _filtered_prefix_tree_plan(
+            segments,
+            item_indices=tuple(leaf.item_index for leaf in packed_bin.leaves),
+        )
+        if occupancy_plan.length != packed_bin.token_count:
+            raise RuntimeError(
+                "Global prefix-tree occupancy disagrees with final bin plan: "
+                f"occupancy={packed_bin.token_count}, plan={occupancy_plan.length}"
+            )
+        # Rebuild only after placement so bin-local paths compress without putting
+        # repeated tree construction in the best-fit search.
+        plan = _prefix_tree_row_plan(
+            row,
+            seq_len=seq_len,
+            pack_results=True,
+            min_shared_segment_length=min_shared_segment_length,
+        )
+        if plan.length > occupancy_plan.length:
+            raise RuntimeError(
+                "Final prefix-tree rebuild increased bin occupancy: "
+                f"global={occupancy_plan.length}, rebuilt={plan.length}"
+            )
+        planned_rows.append((row, plan))
+    return planned_rows
+
+
+def _place_prefix_tree_leaves(
+    groups: Iterable[Sequence[_PrefixTreeLeaf]],
+    *,
+    seq_len: int,
+    groups_are_ordered: bool = False,
+) -> list[_PrefixTreeBin]:
+    ordered_groups = (
+        groups
+        if groups_are_ordered
+        else sorted(
+            groups,
+            key=lambda group: max(leaf.empty_bin_cost for leaf in group),
+            reverse=True,
+        )
+    )
+    bins: list[_PrefixTreeBin] = []
+    for leaf in (leaf for group in ordered_groups for leaf in group):
+        if leaf.empty_bin_cost > seq_len:
+            raise RuntimeError(
+                "Prefix-tree pack item exceeds sequence length: "
+                f"cost={leaf.empty_bin_cost}, seq_len={seq_len}"
+            )
+        best_bin = None
+        best_remaining = seq_len + 1
+        for candidate in bins:
+            count = candidate.token_count + candidate.insertion_delta(leaf)
+            if count <= seq_len and seq_len - count < best_remaining:
+                best_bin = candidate
+                best_remaining = seq_len - count
+        if best_bin is None:
+            best_bin = _PrefixTreeBin()
+            bins.append(best_bin)
+        best_bin.add(leaf)
+    return bins
+
+
+def _filtered_prefix_tree_plan(
+    segments: tuple[PrefixTreePackSegment, ...],
+    *,
+    item_indices: tuple[int, ...],
+) -> _PrefixTreeRowPlan:
+    """Restrict the global plan to one bin without rerunning sharing decisions."""
+    local_index = {item_index: index for index, item_index in enumerate(item_indices)}
+    aliases: dict[int, int] = {}
+    group_positions: dict[int, int] = {}
+    planned: list[PrefixTreePackSegment] = []
+    cursor = 0
+
+    def resolve(group_id: int) -> int:
+        while group_id in aliases:
+            group_id = aliases[group_id]
+        return group_id
+
+    for segment in segments:
+        sequence_indices = tuple(
+            local_index[index]
+            for index in segment.sequence_indices
+            if index in local_index
+        )
+        if not sequence_indices:
+            continue
+        parent_id = resolve(segment.parent_id)
+        parent_position = group_positions.get(parent_id)
+        if parent_position is not None:
+            parent = planned[parent_position]
+            if (
+                parent_position == len(planned) - 1
+                and parent.sequence_indices == sequence_indices
+                and parent.end == segment.start
+            ):
+                planned[parent_position] = PrefixTreePackSegment(
+                    sequence_indices=sequence_indices,
+                    start=parent.start,
+                    end=segment.end,
+                    packed_start=parent.packed_start,
+                    group_id=parent.group_id,
+                    parent_id=parent.parent_id,
+                )
+                aliases[segment.group_id] = parent.group_id
+                cursor += segment.length
+                continue
+        group_id = segment.group_id
+        if segment.parent_id == segment.group_id:
+            parent_id = group_id
+        group_positions[group_id] = len(planned)
+        planned.append(
+            PrefixTreePackSegment(
+                sequence_indices=sequence_indices,
+                start=segment.start,
+                end=segment.end,
+                packed_start=cursor,
+                group_id=group_id,
+                parent_id=parent_id,
+            )
+        )
+        cursor += segment.length
+    return _PrefixTreeRowPlan(segments=tuple(planned), length=cursor)
 
 
 def _prefix_tree_pack_item(
@@ -231,28 +600,54 @@ def _prefix_tree_pack_item(
     *,
     seq_len: int,
 ) -> _PrefixTreePackItem:
-    shareable_length = min(
-        int(result.prompt_length),
-        max(_first_trainable_token_index(result) - 1, 0),
+    assistant_mask = np.asarray(result.assistant_mask, dtype=np.bool_)
+    logprobs = np.asarray(result.logprobs, dtype=np.float32)
+    shareable_length = prefix_tree_shareable_length(
+        result,
+        assistant_mask=assistant_mask,
+        logprobs=logprobs,
     )
     item = _PrefixTreePackItem(
-        token_ids=tuple(int(value) for value in result.token_ids),
-        input_pos=tuple(int(value) for value in result.input_pos),
-        assistant_mask=tuple(int(value) for value in result.assistant_mask),
-        logprobs=tuple(float(value) for value in result.logprobs),
+        token_ids=tuple(result.token_ids),
+        input_pos=np.asarray(result.input_pos, dtype=np.int64),
+        assistant_mask=assistant_mask,
+        logprobs=logprobs,
         advantage=float(result.advantage),
         weight=float(result.weight),
         prompt_id=int(result.prompt_id),
         shareable_length=shareable_length,
         pixel_values=result.pixel_values,
         image_grid_thw=result.image_grid_thw,
-        moe_routes=(
-            tuple(result.moe_routed_experts)
-            if result.moe_routed_experts is not None
-            else None
-        ),
+        moe_routes=result.moe_routed_experts,
     )
     return _truncate_prefix_tree_pack_item(item, seq_len)
+
+
+def prefix_tree_shareable_length(
+    result: TokenizedResult,
+    *,
+    assistant_mask: np.ndarray | None = None,
+    logprobs: np.ndarray | None = None,
+) -> int:
+    assistant_mask = (
+        np.asarray(result.assistant_mask, dtype=np.bool_)
+        if assistant_mask is None
+        else assistant_mask
+    )
+    logprobs = (
+        np.asarray(result.logprobs, dtype=np.float32) if logprobs is None else logprobs
+    )
+    return min(
+        int(result.prompt_length),
+        max(
+            _first_trainable_token_index(
+                assistant_mask=assistant_mask,
+                logprobs=logprobs,
+            )
+            - 1,
+            0,
+        ),
+    )
 
 
 def _truncate_prefix_tree_pack_item(
@@ -272,38 +667,95 @@ def _truncate_prefix_tree_pack_item(
         shareable_length=min(item.shareable_length, seq_len),
         pixel_values=item.pixel_values,
         image_grid_thw=item.image_grid_thw,
-        moe_routes=item.moe_routes[:seq_len] if item.moe_routes is not None else None,
+        moe_routes=item.moe_routes,
     )
 
 
-def _first_trainable_token_index(result: TokenizedResult) -> int:
-    return next(
-        (
-            index
-            for index, (is_assistant, logprob) in enumerate(
-                zip(result.assistant_mask, result.logprobs, strict=True)
-            )
-            if bool(is_assistant) or not math.isnan(float(logprob))
-        ),
-        len(result.token_ids),
-    )
+def _first_trainable_token_index(
+    *,
+    assistant_mask: np.ndarray,
+    logprobs: np.ndarray,
+) -> int:
+    trainable = assistant_mask | ~np.isnan(logprobs)
+    indices = np.flatnonzero(trainable)
+    return int(indices[0]) if int(indices.size) > 0 else int(assistant_mask.shape[0])
 
 
-def _packed_row_token_count(
+def _prefix_tree_row_plan(
     row: list[_PrefixTreePackItem],
     *,
     seq_len: int,
-) -> int:
-    if not row:
-        return 0
-    count = estimate_prefix_tree_packed_tokens(
-        (torch.tensor(item.token_ids, dtype=torch.long) for item in row),
-        max_depth=seq_len,
-        shareable_lengths=(item.shareable_length for item in row),
+    pack_results: bool,
+    min_shared_segment_length: int,
+) -> _PrefixTreeRowPlan:
+    segments = _prefix_tree_pack_segments(
+        (item.token_ids for item in row),
+        max_depth=seq_len if pack_results else 0,
+        shareable_lengths=(
+            item.shareable_length if pack_results else 0 for item in row
+        ),
+        min_shared_segment_length=min_shared_segment_length,
     )
-    if count is None:
-        raise RuntimeError("CPU prefix-tree token estimate unexpectedly failed")
-    return count
+    return _PrefixTreeRowPlan(
+        segments=segments,
+        length=min(sum(segment.length for segment in segments), seq_len),
+    )
+
+
+def _materialize_prefix_tree_row(
+    row: list[_PrefixTreePackItem],
+    *,
+    plan: _PrefixTreeRowPlan,
+    token_ids: np.ndarray,
+    group_ids: np.ndarray,
+    parent_ids: np.ndarray,
+    input_pos: np.ndarray,
+    assistant_mask: np.ndarray,
+    logprobs: np.ndarray,
+    advantages: np.ndarray,
+    weights: np.ndarray,
+    route_tensor: np.ndarray | None,
+    route_mask: np.ndarray | None,
+    route_shape: tuple[int, int] | None,
+    include_moe_routing: bool,
+) -> None:
+    for segment in plan.segments:
+        dst_start = int(segment.packed_start)
+        if dst_start >= plan.length:
+            continue
+        segment_length = min(int(segment.length), plan.length - dst_start)
+        dst_end = dst_start + segment_length
+        src_start = int(segment.start)
+        src_end = src_start + segment_length
+        item = row[segment.sequence_indices[0]]
+        token_ids[dst_start:dst_end] = item.token_ids[src_start:src_end]
+        group_ids[dst_start:dst_end] = int(segment.group_id)
+        parent_ids[dst_start:dst_end] = int(segment.parent_id)
+        input_pos[dst_start:dst_end] = item.input_pos[src_start:src_end]
+        assistant_mask[dst_start:dst_end] = item.assistant_mask[src_start:src_end]
+        logprobs[dst_start:dst_end] = item.logprobs[src_start:src_end]
+        advantages[dst_start:dst_end] = item.advantage
+        weights[dst_start:dst_end] = item.weight
+        if len(segment.sequence_indices) > 1:
+            _validate_shared_prefix_tree_segment(
+                row,
+                sequence_indices=segment.sequence_indices,
+                src_start=src_start,
+                src_end=src_end,
+            )
+        if include_moe_routing:
+            assert route_tensor is not None and route_mask is not None
+            assert route_shape is not None
+            assert item.moe_routes is not None
+            _copy_moe_route_slice(
+                route_tensor=route_tensor,
+                route_mask=route_mask,
+                dst_start=dst_start,
+                src_start=src_start,
+                src_end=src_end,
+                raw_routes=item.moe_routes,
+                route_shape=route_shape,
+            )
 
 
 def _pack_prefix_tree_row(
@@ -312,115 +764,104 @@ def _pack_prefix_tree_row(
     seq_len: int,
     pack_results: bool,
     include_moe_routing: bool,
-    moe_routing_pack_stats: MoeRoutingPackStats,
+    min_shared_segment_length: int = DEFAULT_MIN_PREFIX_TREE_SHARED_SEGMENT_LENGTH,
 ) -> _PackedPrefixTreeRow:
     if not row:
-        return {
-            "token_ids": [],
-            "group_ids": [],
-            "parent_ids": [],
-            "input_pos": [],
-            "assistant_mask": [],
-            "logprobs": [],
-            "advantages": [],
-            "weights": [],
-            "pixel_values": None,
-            "image_grid_thw": None,
-            "moe_routes": [],
-        }
-    tree = _prefix_tree_pack_sequences(
-        (torch.tensor(item.token_ids, dtype=torch.long) for item in row),
-        max_depth=seq_len if pack_results else 0,
-        shareable_lengths=(
-            item.shareable_length if pack_results else 0 for item in row
-        ),
+        empty_i64 = np.empty((0,), dtype=np.int64)
+        empty_f32 = np.empty((0,), dtype=np.float32)
+        return _PackedPrefixTreeRow(
+            token_ids=empty_i64,
+            group_ids=empty_i64,
+            parent_ids=empty_i64,
+            input_pos=empty_i64,
+            assistant_mask=np.empty((0,), dtype=np.bool_),
+            logprobs=empty_f32,
+            advantages=empty_f32,
+            weights=empty_f32,
+            pixel_values=None,
+            image_grid_thw=None,
+        )
+    plan = _prefix_tree_row_plan(
+        row,
+        seq_len=seq_len,
+        pack_results=pack_results,
+        min_shared_segment_length=min_shared_segment_length,
     )
-    token_ids = tree.tokens.reshape(-1).tolist()
-    assigned = [False] * len(token_ids)
-    input_pos = [0] * len(token_ids)
-    assistant_mask = [0] * len(token_ids)
-    logprobs = [float("nan")] * len(token_ids)
-    advantages = [0.0] * len(token_ids)
-    weights = [0.0] * len(token_ids)
-    moe_routes: list[TokenRoute | None] = [None] * len(token_ids)
-    for item_index, item in enumerate(row):
-        packed_positions = tree.positions_by_sequence[item_index].tolist()
-        for source_index, packed_index in enumerate(packed_positions):
-            _validate_prefix_tree_assignment(
-                item,
-                source_index=source_index,
-                packed_index=packed_index,
-                token_ids=token_ids,
-                input_pos=input_pos,
-                assigned=assigned,
-            )
-            route = (
-                item.moe_routes[source_index]
-                if item.moe_routes is not None and source_index < len(item.moe_routes)
-                else None
-            )
-            if assigned[packed_index]:
-                if include_moe_routing:
-                    _record_shared_route_conflict(
-                        existing=moe_routes[packed_index],
-                        candidate=route,
-                        stats=moe_routing_pack_stats,
-                    )
-                continue
-            assigned[packed_index] = True
-            input_pos[packed_index] = item.input_pos[source_index]
-            assistant_mask[packed_index] = item.assistant_mask[source_index]
-            logprobs[packed_index] = item.logprobs[source_index]
-            advantages[packed_index] = item.advantage
-            weights[packed_index] = item.weight
-            moe_routes[packed_index] = route
-    return {
-        "token_ids": token_ids[:seq_len],
-        "group_ids": tree.group_ids.reshape(-1).tolist()[:seq_len],
-        "parent_ids": tree.parent_ids.reshape(-1).tolist()[:seq_len],
-        "input_pos": input_pos[:seq_len],
-        "assistant_mask": assistant_mask[:seq_len],
-        "logprobs": logprobs[:seq_len],
-        "advantages": advantages[:seq_len],
-        "weights": weights[:seq_len],
-        "pixel_values": _packed_row_tensor_list(row, "pixel_values"),
-        "image_grid_thw": _packed_row_tensor_list(row, "image_grid_thw"),
-        "moe_routes": moe_routes[:seq_len] if include_moe_routing else [],
-    }
+    length = plan.length
+    token_ids = np.empty(length, dtype=np.int64)
+    group_ids = np.empty(length, dtype=np.int64)
+    parent_ids = np.empty(length, dtype=np.int64)
+    input_pos = np.zeros(length, dtype=np.int64)
+    assistant_mask = np.zeros(length, dtype=np.bool_)
+    logprobs = np.full(length, np.nan, dtype=np.float32)
+    advantages = np.zeros(length, dtype=np.float32)
+    weights = np.zeros(length, dtype=np.float32)
+    route_shape = _first_item_moe_route_shape(row) if include_moe_routing else None
+    route_tensor: np.ndarray | None = None
+    route_mask: np.ndarray | None = None
+    max_expert_id = 0
+    if route_shape is not None:
+        route_tensor = np.zeros(
+            (length, route_shape[0], route_shape[1]), dtype=np.int32
+        )
+        route_mask = np.zeros(length, dtype=np.bool_)
+    _materialize_prefix_tree_row(
+        row,
+        plan=plan,
+        token_ids=token_ids,
+        group_ids=group_ids,
+        parent_ids=parent_ids,
+        input_pos=input_pos,
+        assistant_mask=assistant_mask,
+        logprobs=logprobs,
+        advantages=advantages,
+        weights=weights,
+        route_tensor=route_tensor,
+        route_mask=route_mask,
+        route_shape=route_shape,
+        include_moe_routing=include_moe_routing,
+    )
+    max_expert_id = (
+        int(route_tensor.max())
+        if route_tensor is not None
+        and route_mask is not None
+        and bool(route_mask.any())
+        else 0
+    )
+    return _PackedPrefixTreeRow(
+        token_ids=token_ids[:length],
+        group_ids=group_ids[:length],
+        parent_ids=parent_ids[:length],
+        input_pos=input_pos,
+        assistant_mask=assistant_mask,
+        logprobs=logprobs,
+        advantages=advantages,
+        weights=weights,
+        pixel_values=_packed_row_tensor_list(row, "pixel_values"),
+        image_grid_thw=_packed_row_tensor_list(row, "image_grid_thw"),
+        route_tensor=route_tensor,
+        route_mask=route_mask,
+        max_expert_id=max_expert_id,
+    )
 
 
-def _validate_prefix_tree_assignment(
-    item: _PrefixTreePackItem,
+def _validate_shared_prefix_tree_segment(
+    row: list[_PrefixTreePackItem],
     *,
-    source_index: int,
-    packed_index: int,
-    token_ids: list[int],
-    input_pos: list[int],
-    assigned: list[bool],
+    sequence_indices: tuple[int, ...],
+    src_start: int,
+    src_end: int,
 ) -> None:
-    if token_ids[packed_index] != item.token_ids[source_index]:
-        raise RuntimeError("Prefix-tree pack token assignment mismatch")
-    if not assigned[packed_index]:
-        return
-    if input_pos[packed_index] != item.input_pos[source_index]:
-        raise RuntimeError("Prefix-tree pack cannot share mismatched input positions")
-    if item.assistant_mask[source_index] or not math.isnan(item.logprobs[source_index]):
-        raise RuntimeError("Prefix-tree pack attempted to share a trainable token")
-
-
-def _record_shared_route_conflict(
-    *,
-    existing: TokenRoute | None,
-    candidate: TokenRoute | None,
-    stats: MoeRoutingPackStats,
-) -> None:
-    if existing is None or candidate is None:
-        raise RuntimeError("Prefix-tree MoE route is missing")
-    compared, conflicts = count_route_slot_conflicts(existing, candidate)
-    stats.prefix_tree_rows += 1
-    stats.prefix_tree_compared_slots += compared
-    stats.prefix_tree_conflict_slots += conflicts
-    stats.prefix_tree_conflict_rows += int(conflicts > 0)
+    reference = row[sequence_indices[0]]
+    reference_input_pos = reference.input_pos[src_start:src_end]
+    for sequence_index in sequence_indices:
+        item = row[sequence_index]
+        if src_end > item.shareable_length:
+            raise RuntimeError("Prefix-tree pack attempted to share a trainable token")
+        if not np.array_equal(item.input_pos[src_start:src_end], reference_input_pos):
+            raise RuntimeError(
+                "Prefix-tree pack cannot share mismatched input positions"
+            )
 
 
 def _packed_row_tensor_list(
@@ -441,57 +882,158 @@ def _packed_row_tensor_list(
     return torch.concat(tensors) if tensors else None
 
 
-def _tensorize_moe_routes(
-    routes_by_sequence: list[list[TokenRoute | None]],
-    seq_len: int,
-) -> tuple[torch.Tensor, torch.Tensor, int, int, int]:
-    first_route = next(
-        (
-            route
-            for sequence_routes in routes_by_sequence
-            for route in sequence_routes
-            if route is not None
-        ),
-        None,
-    )
-    if first_route is None:
-        raise RuntimeError("No MoE routes were packed")
-    num_layers = len(first_route)
-    topk = len(first_route[0])
-    max_expert_id = 0
-    dense_routes: list[list[TokenRoute]] = []
-    route_masks: list[list[bool]] = []
-    zero_route: TokenRoute = [[0 for _ in range(topk)] for _ in range(num_layers)]
-    for sequence_routes in routes_by_sequence:
-        dense_sequence: list[TokenRoute] = []
-        mask_sequence: list[bool] = []
-        for route in sequence_routes:
-            if route is None:
-                dense_sequence.append(zero_route)
-                mask_sequence.append(False)
-                continue
-            if len(route) != num_layers or any(
-                len(layer_route) != topk for layer_route in route
-            ):
+def _first_item_moe_route_shape(
+    row: list[_PrefixTreePackItem],
+) -> tuple[int, int] | None:
+    for item in row:
+        if item.moe_routes is not None:
+            shape = _moe_route_shape(item.moe_routes)
+            if shape is not None:
+                return shape
+    return None
+
+
+def _moe_route_shape(raw: MoeRouteArray | MoeRouteSegments) -> tuple[int, int] | None:
+    if isinstance(raw, MoeRouteSegments):
+        return int(raw.shape[1]), int(raw.shape[2])
+    routes = _coerce_moe_routes(raw)
+    if routes.shape[0] == 0:
+        return None
+    return int(routes.shape[1]), int(routes.shape[2])
+
+
+def _coerce_moe_routes(raw: MoeRouteArray | MoeRouteSegments) -> MoeRouteArray:
+    if not isinstance(raw, np.ndarray):
+        raise RuntimeError(f"Expected MoE routes array, got {type(raw)}")
+    routes = np.asarray(raw, dtype=np.int32)
+    if routes.ndim != 3 or routes.shape[1] <= 0 or routes.shape[2] <= 0:
+        raise RuntimeError(f"Packed MoE routes must be rank 3, got {routes.shape}")
+    return routes
+
+
+def _copy_moe_route_slice(
+    *,
+    route_tensor: np.ndarray,
+    route_mask: np.ndarray,
+    dst_start: int,
+    src_start: int,
+    src_end: int,
+    raw_routes: MoeRouteArray | MoeRouteSegments,
+    route_shape: tuple[int, int],
+) -> None:
+    if src_end <= src_start:
+        return
+    if isinstance(raw_routes, MoeRouteSegments):
+        covered_until = src_start
+        for segment_start, segment in raw_routes.iter_slices(src_start, src_end):
+            if segment_start != covered_until:
+                raise RuntimeError(
+                    "Segmented MoE routes did not cover packed source slice"
+                )
+            if tuple(segment.shape[1:]) != route_shape:
                 raise RuntimeError("Packed MoE routes must have one rectangular shape")
-            max_expert_id = max(
-                max_expert_id,
-                max(int(expert_id) for layer in route for expert_id in layer),
+            segment_dst_start = dst_start + segment_start - src_start
+            _copy_valid_moe_route_chunk(
+                route_tensor=route_tensor,
+                route_mask=route_mask,
+                dst_start=segment_dst_start,
+                routes=segment,
+                assume_valid=True,
             )
-            dense_sequence.append(route)
-            mask_sequence.append(True)
-        while len(dense_sequence) < seq_len:
-            dense_sequence.append(zero_route)
-            mask_sequence.append(False)
-        dense_routes.append(dense_sequence[:seq_len])
-        route_masks.append(mask_sequence[:seq_len])
-    return (
-        torch.tensor(dense_routes, dtype=torch.int32),
-        torch.tensor(route_masks, dtype=torch.bool),
-        num_layers,
-        topk,
-        max(topk, max_expert_id + 1),
+            covered_until = segment_start + int(segment.shape[0])
+        if covered_until != src_end:
+            raise RuntimeError("Segmented MoE routes did not cover packed source slice")
+        return
+
+    routes = _coerce_moe_routes(raw_routes)
+    route_slice = routes[src_start:src_end]
+    if tuple(route_slice.shape[1:]) != route_shape:
+        raise RuntimeError("Packed MoE routes must have one rectangular shape")
+    _copy_valid_moe_route_chunk(
+        route_tensor=route_tensor,
+        route_mask=route_mask,
+        dst_start=dst_start,
+        routes=route_slice,
     )
+
+
+def _copy_valid_moe_route_chunk(
+    *,
+    route_tensor: np.ndarray,
+    route_mask: np.ndarray,
+    dst_start: int,
+    routes: np.ndarray,
+    assume_valid: bool = False,
+) -> None:
+    if int(routes.shape[0]) == 0:
+        return
+    if assume_valid:
+        dst_end = dst_start + int(routes.shape[0])
+        route_tensor[dst_start:dst_end] = routes
+        route_mask[dst_start:dst_end] = True
+        return
+    valid = np.all(routes != MISSING_EXPERT_ID, axis=(1, 2))
+    if not bool(valid.any()):
+        return
+    if bool(valid.all()):
+        dst_end = dst_start + int(routes.shape[0])
+        route_tensor[dst_start:dst_end] = routes
+        route_mask[dst_start:dst_end] = True
+        return
+    valid_offsets = np.nonzero(valid)[0]
+    route_tensor[dst_start + valid_offsets] = routes[valid_offsets]
+    route_mask[dst_start + valid_offsets] = True
+
+
+def _copy_source_moe_route(
+    *,
+    route_tensor: np.ndarray,
+    route_mask: np.ndarray,
+    dst_index: int,
+    source_index: int,
+    raw_routes: MoeRouteArray | MoeRouteSegments,
+    route_shape: tuple[int, int],
+) -> int:
+    if isinstance(raw_routes, MoeRouteSegments):
+        for segment_start, segment in raw_routes.iter_slices(
+            source_index, source_index + 1
+        ):
+            if tuple(segment.shape[1:]) != route_shape:
+                raise RuntimeError("Packed MoE routes must have one rectangular shape")
+            route = segment[source_index - segment_start]
+            return _copy_valid_moe_route(
+                route_tensor=route_tensor,
+                route_mask=route_mask,
+                dst_index=dst_index,
+                route=route,
+            )
+        raise RuntimeError(f"Segmented MoE routes did not cover row {source_index}")
+
+    routes = _coerce_moe_routes(raw_routes)
+    route = routes[source_index]
+    if tuple(route.shape) != route_shape:
+        raise RuntimeError("Packed MoE routes must have one rectangular shape")
+    return _copy_valid_moe_route(
+        route_tensor=route_tensor,
+        route_mask=route_mask,
+        dst_index=dst_index,
+        route=route,
+    )
+
+
+def _copy_valid_moe_route(
+    *,
+    route_tensor: np.ndarray,
+    route_mask: np.ndarray,
+    dst_index: int,
+    route: np.ndarray,
+) -> int:
+    valid = bool(np.all(route != MISSING_EXPERT_ID))
+    if not valid:
+        return 0
+    route_tensor[dst_index] = route
+    route_mask[dst_index] = True
+    return int(route.max()) if route.size else 0
 
 
 def packed_tensors_from_dir(**kwargs: Unpack[DiskPackedTensors]) -> PackedTensors:

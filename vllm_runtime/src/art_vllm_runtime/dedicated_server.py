@@ -6,7 +6,27 @@ from http import HTTPStatus
 import json
 import os
 
+from pydantic import BaseModel, Field
+
 from art_vllm_runtime.patches import apply_vllm_runtime_patches
+
+
+class _SetServedModelNameRequest(BaseModel):
+    name: str = Field(min_length=1)
+
+
+class _ResetPrefixCacheRequest(BaseModel):
+    reset_running_requests: bool = False
+    reset_connector: bool = True
+
+
+class _InFlightLoraUpdateRequest(BaseModel):
+    model_name: str = Field(min_length=1)
+    lora_path: str = Field(min_length=1)
+    policy_version: int
+    lora_slot: str | None = Field(default=None, min_length=1)
+    base_model_name: str | None = None
+    is_3d_lora_weight: bool = False
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -35,9 +55,21 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
 
 def _patch_art_runtime_routes() -> None:
-    from fastapi import APIRouter, FastAPI, Query, Request
-    from fastapi.responses import JSONResponse
+    from fastapi import APIRouter, Depends, FastAPI, Query, Request
+    from fastapi.responses import JSONResponse, Response
     from vllm.entrypoints.openai import api_server
+    from vllm.entrypoints.openai.chat_completion.api_router import (
+        create_chat_completion,
+    )
+    from vllm.entrypoints.openai.chat_completion.protocol import (
+        ChatCompletionRequest,
+    )
+    from vllm.entrypoints.serve.utils.api_utils import validate_json_request
+
+    from art_vllm_runtime.binary_routes import (
+        capture_routed_experts,
+        encode_routed_experts_response,
+    )
 
     if getattr(api_server, "_art_runtime_routes_patched", False):
         return
@@ -80,14 +112,154 @@ def _patch_art_runtime_routes() -> None:
             )
 
         @router.post("/art/set_served_model_name")
-        async def set_served_model_name(raw_request: Request) -> JSONResponse:
-            body = await raw_request.json()
-            name = body["name"]
-            assert isinstance(name, str) and name
+        async def set_served_model_name(
+            body: _SetServedModelNameRequest, raw_request: Request
+        ) -> JSONResponse:
             models = raw_request.app.state.openai_serving_models
-            assert models.base_model_paths
-            models.base_model_paths[0].name = name
-            return JSONResponse(content={"name": name})
+            if not models.base_model_paths:
+                raise RuntimeError("vLLM runtime has no registered base model")
+            models.base_model_paths[0].name = body.name
+            return JSONResponse(content={"name": body.name})
+
+        @router.get("/art/metrics")
+        async def art_metrics() -> JSONResponse:
+            from art_vllm_runtime.metrics import get_art_metrics_snapshot
+
+            return JSONResponse(content=get_art_metrics_snapshot())
+
+        @router.get("/art/capabilities")
+        async def art_capabilities() -> JSONResponse:
+            return JSONResponse(
+                content={
+                    "runtime": "art_vllm",
+                    "protocol_version": 1,
+                    "binary_routed_experts": True,
+                    "fast_metrics": True,
+                    "inplace_lora_load": True,
+                    "in_flight_lora_updates": True,
+                    "policy_token_spans": True,
+                }
+            )
+
+        @router.post(
+            "/art/v1/chat/completions",
+            dependencies=[Depends(validate_json_request)],
+        )
+        async def binary_chat_completion(
+            request: ChatCompletionRequest, raw_request: Request
+        ) -> Response:
+            if request.stream:
+                return JSONResponse(
+                    content={"error": "ART binary routed experts require stream=false"},
+                    status_code=HTTPStatus.BAD_REQUEST.value,
+                )
+            with capture_routed_experts() as routes:
+                response = await create_chat_completion(request, raw_request)
+            if response.status_code >= HTTPStatus.BAD_REQUEST.value:
+                return response
+            if not routes:
+                return JSONResponse(
+                    content={"error": "vLLM returned no routed experts"},
+                    status_code=HTTPStatus.INTERNAL_SERVER_ERROR.value,
+                )
+            headers = {
+                key: value
+                for key, value in response.headers.items()
+                if key.lower() not in {"content-length", "content-type"}
+            }
+            return Response(
+                content=encode_routed_experts_response(response.body, routes),
+                media_type="application/vnd.art.routed-experts-v1",
+                headers=headers,
+            )
+
+        @router.post("/art/reset_prefix_cache")
+        async def reset_prefix_cache(
+            body: _ResetPrefixCacheRequest, raw_request: Request
+        ) -> JSONResponse:
+            success = await engine(raw_request).reset_prefix_cache(
+                reset_running_requests=body.reset_running_requests,
+                reset_connector=body.reset_connector,
+            )
+            return JSONResponse(content={"success": success})
+
+        @router.post("/art/in_flight_lora_update")
+        async def in_flight_lora_update(
+            body: _InFlightLoraUpdateRequest, raw_request: Request
+        ) -> JSONResponse:
+            from vllm.entrypoints.openai.engine.protocol import ErrorResponse
+            from vllm.entrypoints.serve.lora.protocol import LoadLoRAAdapterRequest
+
+            from art_vllm_runtime.policy_spans import (
+                lora_update_coordinator,
+                publish_lora_slot_policy,
+                register_lora_alias,
+            )
+
+            public_model_name = body.model_name
+            lora_path = body.lora_path
+            policy_version = body.policy_version
+            lora_slot = body.lora_slot or public_model_name.rsplit("@", 1)[0]
+            models = raw_request.app.state.openai_serving_models
+            engine_client = engine(raw_request)
+            coordinator = lora_update_coordinator(models, engine_client)
+            await coordinator.begin_update(lora_slot)
+            try:
+                load_result = await models.load_lora_adapter(
+                    LoadLoRAAdapterRequest(
+                        lora_name=lora_slot,
+                        lora_path=lora_path,
+                        load_inplace=lora_slot in models.lora_requests,
+                        is_3d_lora_weight=body.is_3d_lora_weight,
+                    ),
+                    base_model_name=body.base_model_name,
+                )
+                if isinstance(load_result, ErrorResponse):
+                    await coordinator.fail_update(lora_slot)
+                    return JSONResponse(
+                        content=load_result.model_dump(mode="python"),
+                        status_code=load_result.error.code,
+                    )
+                register_lora_alias(
+                    models,
+                    public_model_name=public_model_name,
+                    lora_slot=lora_slot,
+                )
+                waiting_cache_salt = await engine_client.engine_core.call_utility_async(
+                    "art_update_waiting_lora_cache_salt",
+                    lora_slot,
+                    policy_version,
+                )
+                publish_lora_slot_policy(
+                    models,
+                    lora_slot=lora_slot,
+                    policy_version=policy_version,
+                )
+                await coordinator.commit_update(
+                    lora_slot,
+                    policy_version,
+                    models.lora_requests[lora_slot],
+                )
+                from art_vllm_runtime.metrics import record_policy_cache_waiting_update
+
+                record_policy_cache_waiting_update(
+                    updated=int(waiting_cache_salt["updated_waiting_requests"]),
+                    skipped_started=int(
+                        waiting_cache_salt["skipped_started_waiting_requests"]
+                    ),
+                )
+            except BaseException:
+                await coordinator.fail_update(lora_slot)
+                raise
+            return JSONResponse(
+                content={
+                    "status": "updated",
+                    "model_name": public_model_name,
+                    "lora_slot": lora_slot,
+                    "policy_version": policy_version,
+                    "waiting_cache_salt": waiting_cache_salt,
+                }
+            )
 
         app.include_router(router)
         return app

@@ -10,11 +10,13 @@ import torch
 import art
 
 from .test_live_length_trainability import (
+    MOE_DEDICATED_TRAINING_TOPOLOGY,
     LengthSampleReport,
     LengthTrainabilityReport,
     _default_learning_rate,
     _length_trainability_thresholds,
     _prompt_for_index,
+    _target_tokens,
     _use_default_moe_dedicated_placement,
     length_trainability_passed,
 )
@@ -237,6 +239,13 @@ def test_qwen3_5_length_trainability_uses_stable_learning_rate() -> None:
     assert _default_learning_rate("Qwen/Qwen3-30B-A3B-Instruct-2507") == 1e-4
 
 
+def test_gpt_oss_length_target_accounts_for_harmony_tokens(monkeypatch) -> None:
+    assert _target_tokens("openai/gpt-oss-20b") == 20
+    assert _target_tokens("Qwen/Qwen3.5-35B-A3B") == 10
+    monkeypatch.setenv("ART_MODEL_SUPPORT_LENGTH_TARGET_TOKENS", "24")
+    assert _target_tokens("openai/gpt-oss-20b") == 24
+
+
 def test_length_prompts_form_prefix_tree_by_default() -> None:
     prompts = [_prompt_for_index(index)[0] for index in range(4)]
 
@@ -259,7 +268,7 @@ def test_length_trainability_accepts_near_baseline_learning_signal() -> None:
         summary_log_path="/tmp/length_trainability.log",
         latest_summary_log_path="/tmp/latest_length_trainability.log",
         thresholds=_length_trainability_thresholds("google/gemma-4-31B-it"),
-        initial_train_abs_error=3.875,
+        initial_train_abs_error=5.5,
         best_train_abs_error=0.5,
         success_step=3,
         final_train_reward=-0.05,
@@ -274,9 +283,9 @@ def test_length_trainability_accepts_near_baseline_learning_signal() -> None:
                 target_tokens=10,
                 max_tokens=142,
                 prompt_word_count=300,
-                generated_tokens=14,
-                abs_error=4,
-                reward=-0.4,
+                generated_tokens=16,
+                abs_error=6,
+                reward=-0.6,
                 text="a short answer",
             ),
             LengthSampleReport(
@@ -287,9 +296,9 @@ def test_length_trainability_accepts_near_baseline_learning_signal() -> None:
                 target_tokens=10,
                 max_tokens=142,
                 prompt_word_count=300,
-                generated_tokens=6,
-                abs_error=4,
-                reward=-0.4,
+                generated_tokens=5,
+                abs_error=5,
+                reward=-0.5,
                 text="brief",
             ),
             LengthSampleReport(
@@ -443,3 +452,25 @@ def test_dsv4_length_trainability_keeps_handler_resources(monkeypatch) -> None:
     assert variant.topology.tp == 2
     assert variant.topology.ep == 8
     assert variant.topology.cp == 1
+
+
+def test_explicit_length_gpu_placement_keeps_default_moe_topology(
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("ART_MODEL_SUPPORT_TRAINER_GPU_IDS", "3,4")
+    monkeypatch.setenv("ART_MODEL_SUPPORT_INFERENCE_GPU_IDS", "6")
+    variant = _build_variant(
+        "megatron_dedicated",
+        base_model="openai/gpt-oss-20b",
+        resource_stage_name="length_trainability",
+    )
+
+    _use_default_moe_dedicated_placement(
+        variant,
+        base_model="openai/gpt-oss-20b",
+    )
+
+    assert variant.trainer_gpu_ids == [3, 4]
+    assert variant.inference_gpu_ids == [6]
+    assert variant.topology is not None
+    assert variant.topology.model_dump() == MOE_DEDICATED_TRAINING_TOPOLOGY.model_dump()

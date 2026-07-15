@@ -122,6 +122,10 @@ def verify_wheel(wheel: Path) -> None:
         "art/_vllm_runtime/manifest.json",
         "art/_vllm_runtime/pyproject.toml",
         "art/_vllm_runtime/uv.lock",
+        "art/megatron/_hybrid_ep/LICENSE",
+        "art/megatron/_hybrid_ep/setup.py",
+        "art/megatron/_hybrid_ep/csrc/hybrid_ep/backend/hybrid_ep_backend.cuh",
+        "art/megatron/_hybrid_ep/deep_ep/hybrid_ep_buffer.py",
     }
     with zipfile.ZipFile(wheel) as archive:
         names = set(archive.namelist())
@@ -158,6 +162,10 @@ def verify_sdist(sdist: Path) -> None:
         "src/art/_vllm_runtime/manifest.json",
         "src/art/_vllm_runtime/pyproject.toml",
         "src/art/_vllm_runtime/uv.lock",
+        "src/art/megatron/_hybrid_ep/LICENSE",
+        "src/art/megatron/_hybrid_ep/setup.py",
+        "src/art/megatron/_hybrid_ep/csrc/hybrid_ep/backend/hybrid_ep_backend.cuh",
+        "src/art/megatron/_hybrid_ep/deep_ep/hybrid_ep_buffer.py",
     }
     with tarfile.open(sdist) as archive:
         names = set(archive.getnames())

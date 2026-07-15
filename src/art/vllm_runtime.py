@@ -19,6 +19,7 @@ from pydantic import BaseModel, ConfigDict, Field
 from .utils.lifecycle import (
     ChildProcessSupervisor,
     managed_process_cmd,
+    process_shutdown_timeout,
     terminate_popen_process_group,
 )
 
@@ -37,7 +38,7 @@ _TILELANG_ENV_KEYS = (
 _TILELANG_PATH_MARKERS = ("/site-packages/tilelang/", "\\site-packages\\tilelang\\")
 _FLASHINFER_WORKSPACE_ENV = "FLASHINFER_WORKSPACE_BASE"
 _ART_FLASHINFER_WORKSPACE_ENV = "ART_VLLM_RUNTIME_FLASHINFER_WORKSPACE_BASE"
-VLLM_RUNTIME_CLOSE_TIMEOUT = 15.0
+VLLM_RUNTIME_CLOSE_TIMEOUT = process_shutdown_timeout(1)
 
 
 class VllmRuntimeLaunchConfig(BaseModel):

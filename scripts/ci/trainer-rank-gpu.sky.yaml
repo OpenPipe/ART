@@ -8,6 +8,7 @@ resources:
 
 setup: |
   uv sync --frozen --extra megatron --group dev
+  uv run --no-sync python -m art.megatron.hybrid_ep_setup
 
 run: |
   timeout --signal=TERM --kill-after=30s 20m \

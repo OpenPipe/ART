@@ -85,13 +85,6 @@ def test_overlapping_gpu_ids():
         )
 
 
-def test_multi_gpu_inference():
-    with pytest.raises(ValueError, match="Multi-GPU inference not yet supported"):
-        validate_dedicated_config(
-            InternalModelConfig(trainer_gpu_ids=[0], inference_gpu_ids=[1, 2])
-        )
-
-
 def test_trainer_not_starting_at_zero():
     with pytest.raises(ValueError, match="must start at GPU 0"):
         validate_dedicated_config(
@@ -150,6 +143,7 @@ def test_get_model_config_shared_mode():
         assert result["engine_args"]["enable_sleep_mode"] is True
         assert "fast_inference" not in result["init_args"]
         assert result["rollout_weights_mode"] == "lora"
+        assert result["rollout_weight_update_mode"] == "step_lora"
         assert result["lora_config"]["target_modules"] == [
             "q_proj",
             "k_proj",
@@ -217,6 +211,7 @@ def test_get_model_config_dedicated_mode():
         assert result["engine_args"]["enable_sleep_mode"] is False
         assert "fast_inference" not in result["init_args"]
         assert result["rollout_weights_mode"] == "lora"
+        assert result["rollout_weight_update_mode"] == "step_lora"
 
 
 def test_get_model_config_dedicated_preserves_user_engine_args():

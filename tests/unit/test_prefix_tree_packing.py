@@ -117,6 +117,54 @@ def test_prefix_tree_pack_respects_shareable_lengths() -> None:
     ) == int(pack.tokens.numel())
 
 
+def test_prefix_tree_pack_prunes_short_shared_segments() -> None:
+    inputs = (
+        torch.tensor([1, 2, 3]),
+        torch.tensor([1, 2, 4]),
+    )
+
+    pack = prefix_tree_pack(
+        inputs,
+        max_depth=4,
+        min_shared_segment_length=3,
+    )
+
+    assert pack.tokens.tolist() == [[1, 2, 3, 1, 2, 4]]
+    assert len(pack.segments) == 2
+    assert estimate_prefix_tree_packed_tokens(
+        inputs,
+        max_depth=4,
+        min_shared_segment_length=3,
+    ) == int(pack.tokens.numel())
+
+
+def test_prefix_tree_pack_keeps_deeper_long_segment_after_pruning() -> None:
+    inputs = (
+        torch.tensor([1, 3]),
+        torch.tensor([1, 2, 4, 5, 6]),
+        torch.tensor([1, 2, 4, 5, 7]),
+    )
+
+    pack = prefix_tree_pack(
+        inputs,
+        max_depth=4,
+        min_shared_segment_length=4,
+    )
+
+    assert pack.tokens.tolist() == [[1, 3, 1, 2, 4, 5, 6, 7]]
+    assert [tuple(segment.sequence_indices) for segment in pack.segments] == [
+        (0,),
+        (1, 2),
+        (1,),
+        (2,),
+    ]
+    assert estimate_prefix_tree_packed_tokens(
+        inputs,
+        max_depth=4,
+        min_shared_segment_length=4,
+    ) == int(pack.tokens.numel())
+
+
 def test_packed_token_estimator_matches_real_packing() -> None:
     cases = [
         (torch.tensor([1, 2, 3]), torch.tensor([1, 2, 4]), torch.tensor([5])),

@@ -666,7 +666,7 @@ class TrainerRank:
 
         save_vllm_lora_from_model(
             model=self.runtime.model,
-            adapter_model={},
+            adapter_dtypes={},
             handler=self.runtime.model_support_handler,
             adapter_config=config,
             output_dir=output_dir,
@@ -2505,6 +2505,7 @@ def _pad_packed_batch(
             (batch.position_ids, batch.position_ids.new_zeros((1, pad))), dim=1
         ),
         positions_by_sequence=batch.positions_by_sequence,
+        segments=batch.segments,
     )
 
 

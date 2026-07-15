@@ -13,7 +13,7 @@ pytest.importorskip("vllm")
 
 import art
 from art.local import LocalBackend
-from art.pipeline_trainer import PipelineTrainer
+from art.pipeline_trainer import PipelineRuntimeConfig, PipelineTrainer
 
 DEFAULT_BASE_MODEL = "Qwen/Qwen3-0.6B"
 DEFAULT_GPU_MEMORY_UTILIZATION = 0.2
@@ -159,9 +159,11 @@ async def test_pipeline_trainer_local_backend_dedicated_smoke() -> None:
                     rollout_fn=rollout_fn,
                     scenarios=scenario_iter(),
                     config=None,
-                    num_rollout_workers=2,
-                    min_batch_size=1,
-                    max_batch_size=1,
+                    pipeline=PipelineRuntimeConfig(
+                        num_rollout_workers=2,
+                        min_batch_size=1,
+                        max_batch_size=1,
+                    ),
                     max_steps=2,
                     loss_fn="cispo",
                     eval_fn=None,

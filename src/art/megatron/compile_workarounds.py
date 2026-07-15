@@ -173,6 +173,38 @@ def _install_weighted_bias_swiglu_no_inner_forward_cast_workaround() -> None:
     )
 
 
+def _install_moe_postprocess_workaround(moe_layer: Any) -> None:
+    # Routed token counts change across packed RL steps. Megatron's MoE
+    # postprocess reshapes through dispatcher-owned shape state, which makes
+    # this small boundary recompile repeatedly while the surrounding layer still
+    # benefits from compilation.
+    moe_layer.MoELayer.postprocess = _disable(moe_layer.MoELayer.postprocess)
+
+
+def _install_gemma4_moe_postprocess_workaround() -> None:
+    from megatron.bridge.models.gemma import gemma4_provider
+
+    # Gemma4 overrides MoELayer.postprocess to normalize routed and shared
+    # expert outputs. That override sees dynamic routed-token counts, so it
+    # needs the same small eager boundary as the base MoE postprocess.
+    gemma4_provider.Gemma4MoELayer.postprocess = _disable(
+        gemma4_provider.Gemma4MoELayer.postprocess
+    )
+
+
+def _install_te_triton_mask_map_workaround() -> None:
+    from transformer_engine.pytorch.triton import permutation
+
+    # TE's mask-map path launches custom Triton kernels. Keep their thin Python
+    # wrappers eager while the surrounding MoE layer and grouped GEMMs compile.
+    for name in (
+        "make_row_id_map",
+        "permute_with_mask_map",
+        "unpermute_with_mask_map",
+    ):
+        _disable_attr(permutation, name)
+
+
 def install_torch_compile_workarounds(
     config: CompileWorkaroundConfig | None = None,
 ) -> None:
@@ -211,29 +243,11 @@ def install_torch_compile_workarounds(
         _install_self_attn_linear_proj_reduce_scatter_workaround()
     if "weighted_bias_swiglu_no_inner_forward_cast" in flags:
         _install_weighted_bias_swiglu_no_inner_forward_cast_workaround()
-    deepep_flags = {"deepep_permute_restore", "deepep_dispatch_combine"} & flags
-    if deepep_flags:
-        deepep_manager = _require_attr(token_dispatcher, "_DeepepManager")
-        if "deepep_permute_restore" in flags:
-            _disable_attr(deepep_manager, "get_permuted_hidden_states_by_experts")
-            _disable_attr(deepep_manager, "get_restored_hidden_states_by_experts")
-        if "deepep_dispatch_combine" in flags:
-            _disable_attr(deepep_manager, "dispatch")
-            _disable_attr(deepep_manager, "combine")
-    if "alltoall_dtoh" in flags:
-        token_dispatcher.MoEAlltoAllTokenDispatcher._maybe_dtoh_and_synchronize = (
-            _disable(
-                token_dispatcher.MoEAlltoAllTokenDispatcher._maybe_dtoh_and_synchronize
-            )
-        )
-    if "alltoall_dispatch_preprocess" in flags:
-        token_dispatcher.MoEAlltoAllTokenDispatcher.dispatch_preprocess = _disable(
-            token_dispatcher.MoEAlltoAllTokenDispatcher.dispatch_preprocess
-        )
-    if "alltoall_combine_postprocess" in flags:
-        token_dispatcher.MoEAlltoAllTokenDispatcher.combine_postprocess = _disable(
-            token_dispatcher.MoEAlltoAllTokenDispatcher.combine_postprocess
-        )
+    if "moe_postprocess" in flags:
+        _install_moe_postprocess_workaround(moe_layer)
+    if "gemma4_moe_postprocess" in flags:
+        _install_gemma4_moe_postprocess_workaround()
+
     if "te_moe_permute_with_probs" in flags:
         from transformer_engine.pytorch import permutation as te_permutation
 
@@ -247,13 +261,7 @@ def install_torch_compile_workarounds(
                 moe_utils.fused_permute_with_probs
             )
     if "te_triton_permute_with_mask_map" in flags:
-        from transformer_engine.pytorch.triton import (
-            permutation as te_triton_permutation,
-        )
-
-        te_triton_permutation.permute_with_mask_map = _disable(
-            te_triton_permutation.permute_with_mask_map
-        )
+        _install_te_triton_mask_map_workaround()
     if "te_moe_unpermute" in flags:
         from transformer_engine.pytorch import permutation as te_permutation
 
@@ -281,6 +289,12 @@ def install_torch_compile_workarounds(
 
         te_triton_permutation.unpermute_with_mask_map_bwd_with_merging_probs = _disable(
             te_triton_permutation.unpermute_with_mask_map_bwd_with_merging_probs
+        )
+    if "alltoall_dispatch_dtoh" in flags:
+        token_dispatcher.MoEAlltoAllTokenDispatcher._maybe_dtoh_and_synchronize = (
+            _disable(
+                token_dispatcher.MoEAlltoAllTokenDispatcher._maybe_dtoh_and_synchronize
+            )
         )
     if "flex_token_dispatch_combine" in flags:
         token_dispatcher.MoEFlexTokenDispatcher.token_dispatch = _disable(

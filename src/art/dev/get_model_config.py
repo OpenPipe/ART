@@ -34,6 +34,7 @@ def get_model_config(
 
     dedicated = is_dedicated_mode(config)
     rollout_weights_mode = config.get("rollout_weights_mode", "lora")
+    rollout_weight_update_mode = config.get("rollout_weight_update_mode", "step_lora")
 
     if dedicated:
         enable_sleep_mode = False
@@ -99,6 +100,7 @@ def get_model_config(
         engine_args=engine_args,
         lora_config=merged_lora_config,
         rollout_weights_mode=rollout_weights_mode,
+        rollout_weight_update_mode=rollout_weight_update_mode,
         tinker_args=config.get("tinker_args"),
         trainer_args=trainer_args,
     )

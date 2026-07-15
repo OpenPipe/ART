@@ -765,6 +765,17 @@ class ForwardTraceCapture:
         module: Any,
         row_count: int | None,
     ) -> tuple[torch.Tensor | None, int | None]:
+        normalized_name = _normalize_trace_module_name(module_name)
+        if (
+            row_count is not None
+            and cls._decoder_layer_name(normalized_name) == normalized_name
+        ):
+            return cls._row_token_uids_for_trace(
+                inputs=inputs,
+                output=output,
+                module=module,
+                row_count=row_count,
+            )
         if row_count is not None and not cls._is_moe_expert_forward_module(module_name):
             row_token_uids, uid_span = cls._module_row_token_uids(
                 module,
@@ -1365,33 +1376,44 @@ class ForwardTraceCapture:
         return tensor
 
     @staticmethod
+    def _decoder_layer_name(module_name: str) -> str | None:
+        module_name = _normalize_trace_module_name(module_name)
+        marker = ".decoder.layers."
+        if marker not in module_name:
+            return None
+        prefix, suffix = module_name.split(marker, 1)
+        return f"{prefix}{marker}{suffix.split('.', 1)[0]}"
+
+    @classmethod
     def _decoder_layer_trace_key(
+        cls,
         module_name: str,
         call: dict[str, Any],
     ) -> tuple[str, int, int, int] | None:
-        module_name = _normalize_trace_module_name(module_name)
-        if ".decoder.layers." not in module_name:
+        layer_name = cls._decoder_layer_name(module_name)
+        if layer_name is None:
             return None
         tensor = call.get("primary_output")
         if not isinstance(tensor, torch.Tensor) or tensor.ndim == 0:
             return None
         return (
-            module_name.split(".self_attention", 1)[0].split(".mlp", 1)[0],
+            layer_name,
             _safe_int(call.get("micro_sample_index"), -1),
             _safe_int(call.get("micro_order"), -1),
             int(tensor.shape[0]),
         )
 
-    @staticmethod
+    @classmethod
     def _decoder_micro_trace_key(
+        cls,
         module_name: str,
         call: dict[str, Any],
     ) -> tuple[str, int, int] | None:
-        module_name = _normalize_trace_module_name(module_name)
-        if ".decoder.layers." not in module_name:
+        layer_name = cls._decoder_layer_name(module_name)
+        if layer_name is None:
             return None
         return (
-            module_name.split(".self_attention", 1)[0].split(".mlp", 1)[0],
+            layer_name,
             _safe_int(call.get("micro_sample_index"), -1),
             _safe_int(call.get("micro_order"), -1),
         )
@@ -1400,6 +1422,17 @@ class ForwardTraceCapture:
     def _is_attention_output_trace(module_name: str) -> bool:
         module_name = _normalize_trace_module_name(module_name)
         return module_name.endswith(".self_attention")
+
+    @classmethod
+    def _is_post_attention_sequence_trace(cls, module_name: str) -> bool:
+        module_name = _normalize_trace_module_name(module_name)
+        layer_name = cls._decoder_layer_name(module_name)
+        if layer_name is None:
+            return False
+        return module_name.startswith(f"{layer_name}.pre_mlp_layernorm") or (
+            module_name.startswith(f"{layer_name}.mlp")
+            and ".mlp.experts." not in module_name
+        )
 
     @staticmethod
     def _rank_blocked_token_head_count(call: dict[str, Any]) -> int | None:
@@ -1498,6 +1531,7 @@ class ForwardTraceCapture:
                     isinstance(existing_uids, torch.Tensor)
                     and existing_uids.ndim == 1
                     and int(existing_uids.numel()) == int(tensor.shape[0])
+                    and not cls._is_post_attention_sequence_trace(module_name)
                 ):
                     continue
                 if int(token_uids.numel()) == int(tensor.shape[0]):
