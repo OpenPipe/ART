@@ -85,17 +85,25 @@ class _PairedOptimizerRecord(_OptimizerRecord):
         return self
 
 
-class OptimizerGenerationManifest(_PairedOptimizerRecord):
-    format_version: Literal[2] = 2
+class _OptimizerGenerationRecord(_PairedOptimizerRecord):
     generation: str = Field(pattern=f"^{_GENERATION_PATTERN}$")
+
+    @model_validator(mode="after")
+    def _validate_generation_step(self) -> "_OptimizerGenerationRecord":
+        if int(self.generation.split("-", 2)[1]) != self.step:
+            raise ValueError("optimizer generation name and step must match")
+        return self
+
+
+class OptimizerGenerationManifest(_OptimizerGenerationRecord):
+    format_version: Literal[2] = 2
     runtime_sha256: str = Field(pattern=_SHA256_PATTERN)
     topology: OptimizerTopology
     shards: tuple[OptimizerShard, ...]
 
 
-class OptimizerGenerationPointer(_PairedOptimizerRecord):
+class OptimizerGenerationPointer(_OptimizerGenerationRecord):
     format_version: Literal[2] = 2
-    generation: str = Field(pattern=f"^{_GENERATION_PATTERN}$")
 
 
 def optimizer_shard_name(rank: int, world_size: int) -> str:
@@ -553,7 +561,7 @@ def _root_lease(
 @contextmanager
 def _writer_lease(path: Path) -> Iterator[OptimizerGenerationPointer | None]:
     with _root_lease(path, fcntl.LOCK_EX) as pointer:
-        yield pointer
+        yield _recover_optimizer_pointer_locked(path, pointer)
 
 
 @contextmanager
@@ -613,12 +621,6 @@ def commit_optimizer_generation(
     _write_model_atomic(pending / OPTIMIZER_MANIFEST, manifest)
     _validate_generation_files(pending, manifest, local_rank=None)
     with _writer_lease(path) as current_pointer:
-        pointer_temps, _ = _scan_optimizer_transactions(path)
-        if pointer_temps:
-            raise RuntimeError(
-                "Cannot commit an optimizer generation while a pointer swap is "
-                "interrupted"
-            )
         if current_pointer != expected_pointer:
             raise RuntimeError(
                 "Stale optimizer writer: committed pointer changed before publication; "
@@ -1189,21 +1191,19 @@ def _save_optimizer_state_locked(
         runtime_sha256, layouts = _validated_runtime_layouts(runtime, records)
         path = Path(optimizer_state_path)
         with _writer_lease(path) as expected:
-            pointer_temps, _ = _scan_optimizer_transactions(path)
-            if pointer_temps:
+            if expected is not None and step <= expected.step:
                 raise RuntimeError(
-                    "Cannot save optimizer state while a pointer swap is interrupted"
+                    "Optimizer save step must advance the committed pointer: "
+                    f"current={expected.step}, attempted={step}"
                 )
-        if expected is not None and step <= expected.step:
-            raise RuntimeError(
-                "Optimizer save step must advance the committed pointer: "
-                f"current={expected.step}, attempted={step}"
+            expected_data = (
+                None if expected is None else expected.model_dump(mode="json")
             )
         return (
             new_optimizer_generation(step),
             runtime_sha256,
             layouts,
-            None if expected is None else expected.model_dump(mode="json"),
+            expected_data,
         )
 
     generation, runtime_sha256, layouts, expected_data = cast(
@@ -1454,6 +1454,108 @@ def _scan_optimizer_transactions(
     return pointer_temps, candidates
 
 
+def _quarantine_pointer_temp(path: Path, temporary: Path) -> None:
+    quarantine = (
+        path
+        / "uncommitted_generations"
+        / f"invalid_pointer_{int(time.time())}_{uuid4().hex}"
+    )
+    quarantine.mkdir(parents=True)
+    os.replace(temporary, quarantine / temporary.name)
+    _fsync_directory(quarantine)
+    _fsync_directory(path)
+
+
+def _validate_recovery_generation(
+    path: Path, pointer: OptimizerGenerationPointer
+) -> None:
+    generation_path = optimizer_generation_path(str(path), pointer.generation)
+    manifest = _read_manifest(generation_path)
+    _validate_pointer_manifest(pointer, manifest)
+    for shard in _validate_generation_files(generation_path, manifest, local_rank=None):
+        shard_path = generation_path / optimizer_shard_name(
+            shard.rank, manifest.topology.world_size
+        )
+        digest = hash_optimizer_shard(shard_path)
+        if digest != shard.sha256:
+            raise RuntimeError(
+                f"Optimizer shard checksum mismatch for {shard_path.name}: "
+                f"expected={shard.sha256}, actual={digest}"
+            )
+    _validate_adapter_publication(pointer.adapter, verify_files=True)
+
+
+def _recover_optimizer_pointer_locked(
+    path: Path, current: OptimizerGenerationPointer | None
+) -> OptimizerGenerationPointer | None:
+    temporary_paths = tuple(
+        entry
+        for entry in sorted(path.iterdir())
+        if _POINTER_TEMP_RE.fullmatch(entry.name) is not None and entry.is_file()
+    )
+    if len(temporary_paths) > 1:
+        raise RuntimeError(
+            "Ambiguous interrupted optimizer transaction; found multiple temporary "
+            "pointers"
+        )
+    if temporary_paths:
+        try:
+            temporary = OptimizerGenerationPointer.model_validate_json(
+                temporary_paths[0].read_text("utf-8")
+            )
+        except Exception:
+            _quarantine_pointer_temp(path, temporary_paths[0])
+            temporary = None
+    else:
+        temporary = None
+
+    _, candidates = _scan_optimizer_transactions(path)
+    current_step = -1 if current is None else current.step
+    advancing = tuple(
+        (entry, generation)
+        for entry, generation, pending in candidates
+        if not pending
+        and generation != (None if current is None else current.generation)
+        and _generation_step(generation) > current_step
+    )
+    if temporary is not None and temporary.step <= current_step:
+        if temporary == current:
+            temporary_paths[0].unlink()
+            _fsync_directory(path)
+        else:
+            _quarantine_pointer_temp(path, temporary_paths[0])
+        temporary = None
+    if temporary is not None:
+        if len(advancing) != 1 or advancing[0][1] != temporary.generation:
+            raise RuntimeError(
+                "Interrupted optimizer pointer does not uniquely identify an "
+                "advancing committed generation"
+            )
+        pointer = temporary
+    elif not advancing:
+        return current
+    elif len(advancing) == 1:
+        manifest = _read_manifest(advancing[0][0])
+        pointer = OptimizerGenerationPointer(
+            generation=manifest.generation,
+            step=manifest.step,
+            adapter=manifest.adapter,
+        )
+    else:
+        raise RuntimeError(
+            "Ambiguous interrupted optimizer transaction; found multiple advancing "
+            "committed generations"
+        )
+
+    _validate_recovery_generation(path, pointer)
+    if temporary is None:
+        _write_model_atomic(path / OPTIMIZER_POINTER, pointer)
+    else:
+        os.replace(temporary_paths[0], path / OPTIMIZER_POINTER)
+        _fsync_directory(path)
+    return pointer
+
+
 def _optimizer_state_paths(output_dir: str, current: str) -> tuple[Path, ...]:
     selected = Path(current).absolute()
     candidates = {selected} | {
@@ -1463,6 +1565,12 @@ def _optimizer_state_paths(output_dir: str, current: str) -> tuple[Path, ...]:
     return tuple(
         sorted(path for path in candidates if path == selected or path.exists())
     )
+
+
+def _recover_optimizer_transactions(output_dir: str, current: str) -> None:
+    for path in _optimizer_state_paths(output_dir, current):
+        with _writer_lease(path):
+            pass
 
 
 def _recover_uncommitted_initial_transaction(
@@ -1668,6 +1776,7 @@ def _prepare_megatron_resume_state_locked(
     output_dir: str,
     optimizer_state_path: str,
 ) -> MegatronResumeStep:
+    _recover_optimizer_transactions(output_dir, optimizer_state_path)
     recovered_steps = _recover_uncommitted_initial_transaction(
         output_dir=output_dir,
         optimizer_state_path=optimizer_state_path,
