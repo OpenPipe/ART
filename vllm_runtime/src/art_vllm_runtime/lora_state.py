@@ -97,7 +97,7 @@ class LoraWorkerReport(_StrictMessage):
     engine_instance_id: str | None
     world_size: int = Field(ge=1)
     local_world_size: int = Field(ge=1)
-    loaded_loras: tuple[WorkerLoraState, ...]
+    loaded_loras: list[WorkerLoraState]
 
     @model_validator(mode="after")
     def _validate_loaded_loras(self) -> "LoraWorkerReport":
