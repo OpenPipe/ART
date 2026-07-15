@@ -64,6 +64,44 @@ def build_router_key_from_module_name(*, chunk_index: int, module_name: str) -> 
     return f"chunk_{chunk_index:02d}.layer_{layer_index:04d}.mlp.router"
 
 
+def _router_key_for_model_module(
+    *,
+    module_name: str,
+    layer_prefixes: list[tuple[str, int]],
+    fallback_chunk_index: int | None,
+) -> str:
+    for prefix, global_layer_index in layer_prefixes:
+        if module_name.startswith(f"{prefix}."):
+            return f"chunk_00.layer_{global_layer_index:04d}.mlp.router"
+    if fallback_chunk_index is not None:
+        return build_router_key_from_module_name(
+            chunk_index=fallback_chunk_index,
+            module_name=module_name,
+        )
+    raise RuntimeError(
+        "PP/VPP routing replay requires every router to have an owning "
+        f"TransformerLayer; router='{module_name}'"
+    )
+
+
+def _global_layer_prefixes(chunk: Any) -> list[tuple[str, int]]:
+    from megatron.core.transformer.transformer_layer import TransformerLayer
+
+    prefixes: dict[str, int] = {}
+    for module_name, module in chunk.named_modules():
+        original = getattr(module, "_orig_mod", None)
+        layer = (
+            original
+            if isinstance(original, TransformerLayer)
+            else module
+            if isinstance(module, TransformerLayer)
+            else None
+        )
+        if layer is not None:
+            prefixes[module_name] = int(layer.layer_number) - 1
+    return sorted(prefixes.items(), key=lambda item: len(item[0]), reverse=True)
+
+
 def build_router_key_from_trace_name(trace_module_name: str) -> str:
     chunk_match = _TRACE_CHUNK_PREFIX_PATTERN.match(trace_module_name)
     if chunk_match is None:
@@ -718,6 +756,7 @@ class MoeRoutingReplayController:
         self._router_call_sequences: dict[str, list[int]] = {}
         self._router_last_call_indices: dict[str, int] = {}
         self._router_last_call_keys: dict[str, tuple[str, int] | None] = {}
+        self._router_consumed_calls: dict[str, dict[tuple[str, int], int]] = {}
         self._router_reuse_counts: dict[str, int] = {}
         self._global_uid_to_row_index: dict[int, int] = {}
         self._global_uid_dense_start: int | None = None
@@ -765,15 +804,18 @@ class MoeRoutingReplayController:
         global _ACTIVE_ROUTING_REPLAY_CONTROLLER
         if self._router_bindings:
             return
+        pipeline_model = self.bundle.topology.pp > 1 or len(model_chunks) > 1
         for chunk_index, chunk in enumerate(model_chunks):
+            layer_prefixes = _global_layer_prefixes(chunk)
             for module_name, module in chunk.named_modules():
                 if ROUTER_NAME_TOKEN not in module_name or not hasattr(
                     module, "routing"
                 ):
                     continue
-                router_key = build_router_key_from_module_name(
-                    chunk_index=chunk_index,
+                router_key = _router_key_for_model_module(
                     module_name=module_name,
+                    layer_prefixes=layer_prefixes,
+                    fallback_chunk_index=None if pipeline_model else chunk_index,
                 )
                 if self.strict and router_key not in self.bundle.router_keys:
                     raise RuntimeError(
@@ -1042,6 +1084,7 @@ class MoeRoutingReplayController:
         self._router_call_sequences = {}
         self._router_last_call_indices = {}
         self._router_last_call_keys = {}
+        self._router_consumed_calls = {}
         self._router_reuse_counts = {}
         self._global_uid_count = int(step_routes.global_token_uids.numel())
         self._global_uid_dense_start = self._dense_global_uid_start(
@@ -1079,6 +1122,7 @@ class MoeRoutingReplayController:
                         f"route_topk={route.max_topk}, router_topk={binding_topk}"
                     )
             self._router_call_cursors[router_key] = 0
+            self._router_consumed_calls[router_key] = {}
             self._router_call_sequences[router_key] = self._build_call_sequence(
                 router_key=router_key,
                 sample_index=sample_index,
@@ -1122,6 +1166,7 @@ class MoeRoutingReplayController:
         self._router_call_sequences = {}
         self._router_last_call_indices = {}
         self._router_last_call_keys = {}
+        self._router_consumed_calls = {}
         self._router_reuse_counts = {}
         self._reset_staged_micro_targets()
         self._global_uid_to_row_index = {}
@@ -1229,6 +1274,11 @@ class MoeRoutingReplayController:
         call_sequence = self._router_call_sequences[router_key]
         cursor = self._router_call_cursors.get(router_key, 0)
         active_call_key = self._active_router_call_key()
+        consumed_call = self._router_consumed_calls.get(router_key, {}).get(
+            active_call_key
+        )
+        if consumed_call is not None:
+            return [consumed_call]
         if cursor >= len(call_sequence):
             last_index = self._router_last_call_indices.get(router_key)
             last_key = self._router_last_call_keys.get(router_key)
@@ -1270,6 +1320,20 @@ class MoeRoutingReplayController:
             )
         cursor = self._router_call_cursors.get(router_key, 0)
         active_call_key = self._active_router_call_key()
+        consumed_call = self._router_consumed_calls.get(router_key, {}).get(
+            active_call_key
+        )
+        if consumed_call is not None:
+            if not self.allow_recompute_reuse:
+                raise RuntimeError(
+                    "Routing replay recompute reuse is disabled: "
+                    f"step={self._active_step_index}, router='{router_key}', "
+                    f"call_key={active_call_key}"
+                )
+            self._router_reuse_counts[router_key] = (
+                self._router_reuse_counts.get(router_key, 0) + 1
+            )
+            return consumed_call
         last_index = self._router_last_call_indices.get(router_key)
         last_key = self._router_last_call_keys.get(router_key)
         next_key = (
@@ -1302,9 +1366,9 @@ class MoeRoutingReplayController:
         call_index = call_sequence[cursor]
         self._router_call_cursors[router_key] = cursor + 1
         self._router_last_call_indices[router_key] = call_index
-        self._router_last_call_keys[router_key] = _router_call_key(
-            router_calls[call_index]
-        )
+        call_key = _router_call_key(router_calls[call_index])
+        self._router_last_call_keys[router_key] = call_key
+        self._router_consumed_calls[router_key][call_key] = call_index
         return call_index
 
     def _prepare_native_target_for_router(self, router_key: str) -> None:

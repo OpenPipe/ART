@@ -1457,6 +1457,29 @@ def _validate_hybridep_token_counts(values: list[int] | None, micro_count: int) 
     return enabled
 
 
+def _schedule_microbatch_activator(
+    *,
+    moe_routing_replay_controller: MoeRoutingReplayController | None,
+    hybridep_token_counts: list[int] | None,
+) -> Callable[[ScheduleMicrobatch[Any]], None] | None:
+    if moe_routing_replay_controller is None and hybridep_token_counts is None:
+        return None
+
+    def activate(item: ScheduleMicrobatch[Any]) -> None:
+        prepared = item.payload
+        if moe_routing_replay_controller is not None:
+            moe_routing_replay_controller.begin_micro(item.sample_index, item.order)
+            prepare_replay_local_input_token_uids(
+                moe_routing_replay_controller,
+                prepared.local_token_uids,
+                prepared.attention_state,
+            )
+        if hybridep_token_counts is not None:
+            _set_hybridep_token_count(hybridep_token_counts[item.order])
+
+    return activate
+
+
 def select_micro_ref_logprobs(
     ref_logprobs_by_index: dict[int, torch.Tensor],
     sample_indices: list[int | None],
@@ -1688,7 +1711,12 @@ def _calculate_megatron_logprobs(
         schedule = MCoreScheduleAdapter(
             model_chunks=model_chunks,
             microbatches=[
-                ScheduleMicrobatch(order, sample_index, prepared_micro)
+                ScheduleMicrobatch(
+                    order,
+                    sample_index,
+                    prepared_micro,
+                    prepared_micro.attention_state,
+                )
                 for order in range(schedule_micro_count)
             ],
             microbatch_shapes=[
@@ -1699,17 +1727,19 @@ def _calculate_megatron_logprobs(
             ]
             * schedule_micro_count,
             routing_replay_enabled=moe_routing_replay_controller is not None,
+            activate_microbatch=_schedule_microbatch_activator(
+                moe_routing_replay_controller=moe_routing_replay_controller,
+                hybridep_token_counts=(
+                    None
+                    if hybridep_token_count is None
+                    else [hybridep_token_count] * schedule_micro_count
+                ),
+            ),
         )
 
         def forward_step_func(data_iterator: Any, model: MegatronModule, *_args: Any):
             item = next(data_iterator)
-            if moe_routing_replay_controller is not None:
-                moe_routing_replay_controller.begin_micro(sample_index, 0)
-            prepare_replay_local_input_token_uids(
-                moe_routing_replay_controller,
-                prepared_micro.local_token_uids,
-                prepared_micro.attention_state,
-            )
+            schedule.activate(item)
             token_output = _forward_prepared_rl_micro(
                 model_chunks=model_chunks,
                 model_chunk=model,
@@ -1953,7 +1983,12 @@ def run_megatron_sft_step(
     schedule = MCoreScheduleAdapter(
         model_chunks=model_chunks,
         microbatches=[
-            ScheduleMicrobatch(order, micro_sample_indices[order], prepared)
+            ScheduleMicrobatch(
+                order,
+                micro_sample_indices[order],
+                prepared,
+                prepared.attention_state,
+            )
             for order, prepared in enumerate(prepared_micros)
         ],
         microbatch_shapes=[
@@ -1961,21 +1996,16 @@ def run_megatron_sft_step(
             for prepared in prepared_micros
         ],
         routing_replay_enabled=moe_routing_replay_controller is not None,
+        activate_microbatch=_schedule_microbatch_activator(
+            moe_routing_replay_controller=moe_routing_replay_controller,
+            hybridep_token_counts=(hybridep_token_counts if hybridep_enabled else None),
+        ),
     )
 
     def forward_step_func(data_iterator: Any, model: MegatronModule, *_args: Any):
         item = next(data_iterator)
         prepared = item.payload
-        if moe_routing_replay_controller is not None:
-            moe_routing_replay_controller.begin_micro(item.sample_index, item.order)
-        prepare_replay_local_input_token_uids(
-            moe_routing_replay_controller,
-            prepared.local_token_uids,
-            prepared.attention_state,
-        )
-        if hybridep_enabled:
-            assert hybridep_token_counts is not None
-            _set_hybridep_token_count(hybridep_token_counts[item.order])
+        schedule.activate(item)
         kwargs = dict(
             input_ids=prepared.input_ids if chunk_pre_process(model) else None,
             position_ids=prepared.position_ids,
@@ -2148,7 +2178,12 @@ def run_training_step(
     schedule = MCoreScheduleAdapter(
         model_chunks=model_chunks,
         microbatches=[
-            ScheduleMicrobatch(order, micro_sample_indices[order], prepared)
+            ScheduleMicrobatch(
+                order,
+                micro_sample_indices[order],
+                prepared,
+                prepared.attention_state,
+            )
             for order, prepared in enumerate(prepared_micros)
         ],
         microbatch_shapes=[
@@ -2159,21 +2194,16 @@ def run_training_step(
             for prepared in prepared_micros
         ],
         routing_replay_enabled=moe_routing_replay_controller is not None,
+        activate_microbatch=_schedule_microbatch_activator(
+            moe_routing_replay_controller=moe_routing_replay_controller,
+            hybridep_token_counts=(hybridep_token_counts if hybridep_enabled else None),
+        ),
     )
 
     def forward_step_func(data_iterator: Any, model: MegatronModule, *_args: Any):
         item = next(data_iterator)
         prepared = item.payload
-        if moe_routing_replay_controller is not None:
-            moe_routing_replay_controller.begin_micro(item.sample_index, item.order)
-        prepare_replay_local_input_token_uids(
-            moe_routing_replay_controller,
-            prepared.local_token_uids,
-            prepared.attention_state,
-        )
-        if hybridep_enabled:
-            assert hybridep_token_counts is not None
-            _set_hybridep_token_count(hybridep_token_counts[item.order])
+        schedule.activate(item)
         token_output = _forward_prepared_rl_micro(
             model_chunks=model_chunks,
             model_chunk=model,

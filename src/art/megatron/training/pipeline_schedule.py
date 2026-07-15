@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Iterator, Sequence
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 import time
 from typing import Any, Generic, TypeVar, cast
@@ -22,6 +23,7 @@ class ScheduleMicrobatch(Generic[_T]):
     order: int
     sample_index: int | None
     payload: _T
+    recompute_state: object | None = None
 
 
 @dataclass
@@ -193,6 +195,7 @@ class MCoreScheduleAdapter(Generic[_T]):
         microbatches: Sequence[ScheduleMicrobatch[_T]],
         microbatch_shapes: Sequence[tuple[int, int]],
         routing_replay_enabled: bool = False,
+        activate_microbatch: Callable[[ScheduleMicrobatch[_T]], None] | None = None,
     ) -> None:
         if not model_chunks:
             raise ValueError("MCore schedule requires at least one model chunk")
@@ -200,6 +203,8 @@ class MCoreScheduleAdapter(Generic[_T]):
             raise ValueError("microbatch payload/shape counts differ")
         self.model_chunks = model_chunks
         self.microbatches = tuple(microbatches)
+        self._activate_microbatch = activate_microbatch
+        self._active_recompute_state_id: int | None = None
         self.micro_batch_size, self.seq_length = validate_fixed_microbatch_shapes(
             microbatch_shapes
         )
@@ -211,6 +216,7 @@ class MCoreScheduleAdapter(Generic[_T]):
                 "Local model chunk count must equal VPP size: "
                 f"chunks={len(model_chunks)}, vpp={self.vp_size}"
             )
+        self._validate_stage_ownership()
         self._configure(routing_replay_enabled=routing_replay_enabled)
         schedule = (
             "pp1"
@@ -230,6 +236,23 @@ class MCoreScheduleAdapter(Generic[_T]):
             id(chunk): index for index, chunk in enumerate(model_chunks)
         }
 
+    def _validate_stage_ownership(self) -> None:
+        for chunk_index, chunk in enumerate(self.model_chunks):
+            expected_pre = self.pp_rank == 0 and chunk_index == 0
+            expected_post = (
+                self.pp_rank == self.pp_size - 1
+                and chunk_index == len(self.model_chunks) - 1
+            )
+            actual_pre = chunk_pre_process(chunk)
+            actual_post = chunk_post_process(chunk)
+            if (actual_pre, actual_post) != (expected_pre, expected_post):
+                raise RuntimeError(
+                    "Megatron model chunk pipeline ownership is inconsistent: "
+                    f"pp_rank={self.pp_rank}, chunk={chunk_index}, "
+                    f"pre_process={actual_pre} (expected {expected_pre}), "
+                    f"post_process={actual_post} (expected {expected_post})"
+                )
+
     def _configure(self, *, routing_replay_enabled: bool) -> None:
         seen: set[int] = set()
         for chunk in self.model_chunks:
@@ -240,14 +263,14 @@ class MCoreScheduleAdapter(Generic[_T]):
             if (
                 routing_replay_enabled
                 and self.pp_size > 1
-                and _recompute_enabled(config)
+                and _stateful_recompute_enabled(config)
+                and self._activate_microbatch is None
             ):
                 raise RuntimeError(
-                    "MoE routing replay with pipeline 1F1B and activation recomputation "
-                    "is disabled: recomputation may revisit microbatches out of forward "
-                    "order. Disable recompute or routing replay for PP until the identity "
-                    "recovery path has a distributed correctness test."
+                    "PP routing replay with MoE/full activation recomputation requires "
+                    "a microbatch activation callback"
                 )
+            config.variable_seq_lengths = False
             if self.vp_size > 1:
                 group = int(
                     getattr(config, "microbatch_group_size_per_vp_stage", 0)
@@ -264,6 +287,66 @@ class MCoreScheduleAdapter(Generic[_T]):
             elif self.pp_size > 1:
                 config.overlap_p2p_comm = False
                 config.batch_p2p_comm = True
+                # PyTorch 2.11 does not need MCore's legacy batch-P2P device sync.
+                config.batch_p2p_sync = False
+
+    def activate(self, microbatch: ScheduleMicrobatch[_T]) -> None:
+        if self._activate_microbatch is None:
+            return
+        state_id = id(microbatch.recompute_state)
+        if state_id == self._active_recompute_state_id:
+            return
+        self._activate_microbatch(microbatch)
+        self._active_recompute_state_id = state_id
+
+    @contextmanager
+    def _recompute_activation_hooks(self, *, enabled: bool) -> Iterator[None]:
+        config = get_model_config(self.model_chunks[0])
+        if (
+            not enabled
+            or self._activate_microbatch is None
+            or not _stateful_recompute_enabled(config)
+        ):
+            yield
+            return
+
+        by_state_id: dict[int, ScheduleMicrobatch[_T]] = {}
+        for microbatch in self.microbatches:
+            state = microbatch.recompute_state
+            if state is None:
+                raise RuntimeError(
+                    "Stateful PP recomputation requires recompute_state on every microbatch"
+                )
+            previous = by_state_id.setdefault(id(state), microbatch)
+            if previous is not microbatch and (
+                previous.order != microbatch.order
+                or previous.sample_index != microbatch.sample_index
+            ):
+                raise RuntimeError(
+                    "recompute_state must identify one logical microbatch"
+                )
+
+        def restore(
+            _module: Any, args: tuple[Any, ...], kwargs: dict[str, Any]
+        ) -> None:
+            microbatch = _find_bound_microbatch(by_state_id, (*args, kwargs))
+            if microbatch is not None:
+                self.activate(microbatch)
+
+        restore = torch.compiler.disable(restore)
+        handles = [
+            layer.register_forward_pre_hook(restore, with_kwargs=True)
+            for layer in _transformer_layer_callers(self.model_chunks)
+        ]
+        if not handles:
+            raise RuntimeError(
+                "Stateful PP recomputation could not find TransformerLayer call sites"
+            )
+        try:
+            yield
+        finally:
+            for handle in handles:
+                handle.remove()
 
     def independent_iterators(self) -> list[Iterator[ScheduleMicrobatch[_T]]]:
         return [iter(self.microbatches) for _ in self.model_chunks]
@@ -294,6 +377,11 @@ class MCoreScheduleAdapter(Generic[_T]):
                 )
 
         config = get_model_config(self.model_chunks[0])
+        if not forward_only and bool(config.overlap_moe_expert_parallel_comm):
+            raise RuntimeError(
+                "ART's forward-step contract does not support MCore's combined "
+                "EP-overlap schedule; disable overlap_moe_expert_parallel_comm"
+            )
         communicator: Any | None = None
         pg_collection: ProcessGroupCollection | None = None
         if self.pp_size > 1:
@@ -305,21 +393,23 @@ class MCoreScheduleAdapter(Generic[_T]):
             )
             pg_collection = _process_group_collection()
         start = time.perf_counter()
-        outputs = get_forward_backward_func(
-            pp_size=self.pp_size,
-            vp_size=None if self.vp_size == 1 else self.vp_size,
-        )(
-            forward_step_func=timed_forward,
-            data_iterator=self.independent_iterators(),
-            model=self.model_chunks,
-            num_microbatches=len(self.microbatches),
-            seq_length=self.seq_length,
-            micro_batch_size=self.micro_batch_size,
-            forward_only=forward_only,
-            collect_non_loss_data=collect_non_loss_data,
-            p2p_communicator=cast(Any, communicator),
-            pg_collection=pg_collection,
-        )
+        self._active_recompute_state_id = None
+        with self._recompute_activation_hooks(enabled=not forward_only):
+            outputs = get_forward_backward_func(
+                pp_size=self.pp_size,
+                vp_size=None if self.vp_size == 1 else self.vp_size,
+            )(
+                forward_step_func=timed_forward,
+                data_iterator=self.independent_iterators(),
+                model=self.model_chunks,
+                num_microbatches=len(self.microbatches),
+                seq_length=self.seq_length,
+                micro_batch_size=self.micro_batch_size,
+                forward_only=forward_only,
+                collect_non_loss_data=collect_non_loss_data,
+                p2p_communicator=cast(Any, communicator),
+                pg_collection=pg_collection,
+            )
         self.telemetry.schedule_wall_s = time.perf_counter() - start
         if torch.cuda.is_available():
             self.telemetry.peak_memory_bytes = int(torch.cuda.max_memory_allocated())
@@ -342,13 +432,50 @@ def validate_vpp_microbatch_group(
         )
 
 
-def _recompute_enabled(config: Any) -> bool:
-    return bool(
-        getattr(config, "recompute_granularity", None)
-        or getattr(config, "recompute_method", None)
-        or getattr(config, "recompute_num_layers", None)
-        or getattr(config, "recompute_modules", None)
-    )
+def _stateful_recompute_enabled(config: Any) -> bool:
+    granularity = getattr(config, "recompute_granularity", None)
+    if granularity == "full":
+        return True
+    modules = set(getattr(config, "recompute_modules", None) or ())
+    return granularity == "selective" and bool(modules & {"mlp", "moe"})
+
+
+def _transformer_layer_callers(
+    model_chunks: Sequence[torch.nn.Module],
+) -> list[torch.nn.Module]:
+    from megatron.core.transformer.transformer_layer import TransformerLayer
+
+    callers: dict[int, torch.nn.Module] = {}
+    for chunk in model_chunks:
+        for module in chunk.modules():
+            original = getattr(module, "_orig_mod", None)
+            if isinstance(original, TransformerLayer):
+                callers[id(original)] = module
+            elif isinstance(module, TransformerLayer):
+                callers.setdefault(id(module), module)
+    return list(callers.values())
+
+
+def _find_bound_microbatch(
+    by_state_id: dict[int, ScheduleMicrobatch[_T]],
+    values: Sequence[Any],
+) -> ScheduleMicrobatch[_T] | None:
+    pending = list(values)
+    seen: set[int] = set()
+    while pending:
+        value = pending.pop()
+        value_id = id(value)
+        if value_id in seen:
+            continue
+        seen.add(value_id)
+        microbatch = by_state_id.get(value_id)
+        if microbatch is not None and microbatch.recompute_state is value:
+            return microbatch
+        if isinstance(value, dict):
+            pending.extend(value.values())
+        elif isinstance(value, list | tuple):
+            pending.extend(value)
+    return None
 
 
 def _process_group_collection() -> ProcessGroupCollection:
