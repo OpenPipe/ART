@@ -11,8 +11,8 @@ process does not launch another SkyPilot cluster from inside its allocation.
 ## Controller program
 
 The bootstrap accepts an import path to a top-level async function. SkyPilot
-runs the bootstrap on every node, but ART invokes this function only on node
-rank 0:
+runs the bootstrap on every node, but only rank 0 imports its module and invokes
+the function:
 
 ```python
 from typing import Any
@@ -23,22 +23,55 @@ async def main(hosts: Any) -> None:
     ...
 ```
 
-The module must be importable on the controller. User functions and other code
-spawned through Monarch must be installed or synchronized at the same import
-paths on every node; ART does not ship pickled closures between hosts.
+The controller module only needs to be importable on rank 0. User functions and
+other code spawned through Monarch must be installed or synchronized at the
+same import paths on every node; ART does not ship pickled closures between
+hosts.
 
 ## SkyPilot
 
-Start with `examples/multinode/skypilot.yaml`. It contains `num_nodes: 2`, a
-synchronized workdir, setup on every node, and one command. A source checkout
-must sync both the root project and `vllm_runtime`; an installed ART wheel uses
-its content-addressed managed runtime bundle instead.
+Start with `examples/multinode/skypilot.yaml`. It is an intentionally CPU-only
+two-node smoke that validates physical launch, host admission, and one remote
+rollout per node without reserving training GPUs.
+
+For source-based GPU training, replace its resources and setup with the desired
+topology and both locked environments:
 
 ```yaml
+resources:
+  accelerators: H200:8
+
+setup: |
+  set -euo pipefail
+  uv sync --frozen --no-dev --extra distributed --extra megatron
+  uv sync --project vllm_runtime --frozen --no-dev
+
 run: |
-  .venv/bin/art-monarch skypilot \
+  set -euo pipefail
+  exec .venv/bin/art-monarch skypilot \
     --program your_package.train:main
 ```
+
+`set -euo pipefail` is required because SkyPilot runs multiline setup under
+Bash without enabling fail-fast behavior. The source checkout needs the root
+and `vllm_runtime` projects at the same revision on every node.
+
+For a published release wheel, use a separate setup rather than synchronizing
+the source runtime:
+
+```yaml
+setup: |
+  set -euo pipefail
+  uv venv --python 3.12
+  uv pip install --python .venv/bin/python \
+    "openpipe-art[distributed,megatron]==VERSION"
+```
+
+Release wheels use a content-addressed managed runtime bundle. Only wheels
+built with `scripts/build_package.py` contain that bundle; a generic `uv build`
+wheel does not. Every node still needs the external `uv` command and either
+first-use network access to populate the runtime cache or a preinstalled
+runtime selected with `ART_VLLM_RUNTIME_BIN`.
 
 Launch it from the project root:
 
@@ -47,24 +80,35 @@ sky launch -c art-multinode examples/multinode/skypilot.yaml
 ```
 
 One task rank runs on each allocated node. Every rank owns one Monarch worker
-subprocess; rank 0 also attaches the host mesh and runs the controller
-program. Controller success, failure, or disconnect releases all task ranks.
-No manual SSH or per-node command is required.
+subprocess; rank 0 also attaches the host mesh and runs the controller program.
+Rank-0 program completion or failure closes the lifecycle sockets and releases
+the peer task ranks. No manual SSH or per-node command is required.
 
 Each task invocation owns fresh worker loops and terminates them after the host
 mesh shuts down. A later `sky exec` starts new loops; ART does not reattach a
 second controller to completed workers.
 
-Reuse an existing cluster without rerunning setup:
+Ctrl-C disconnects SkyPilot log streaming; it does not stop the remote job.
+Check the queue and cancel explicitly when needed:
+
+```fish
+sky queue art-multinode
+sky cancel art-multinode JOB_ID
+```
+
+Only after the previous job is terminal, reuse an existing cluster without
+rerunning setup:
 
 ```fish
 sky exec art-multinode examples/multinode/skypilot.yaml
 ```
 
-Use `sky launch` instead when `setup`, mounts, the image, or SkyPilot config
-changed. Setting `num_nodes: 1` uses the same path on one node. The existing
-`LocalBackend` interface remains unchanged for users who do not opt into the
-distributed APIs.
+`sky exec` synchronizes the workdir before scheduling, so running it while the
+previous job is live can change files under that job. Use `sky launch` instead
+when setup, mounts, the image, SkyPilot config, a wheel, `pyproject.toml`, or a
+lockfile changed. Setting `num_nodes: 1` uses the same path on one node. The
+existing `LocalBackend` interface remains unchanged for users who do not opt
+into the distributed APIs.
 
 For a local process that explicitly wants the same Monarch service APIs, ART
 can own one loopback worker directly:
@@ -86,8 +130,8 @@ between allocated nodes but must not be publicly exposed: ART's pinned Monarch
 
 ## Existing SSH hosts
 
-For preallocated machines with passwordless SSH, start and own all workers from
-one controller command:
+For preallocated machines, start and own all workers from one controller
+command:
 
 ```fish
 .venv/bin/art-monarch ssh \
@@ -98,11 +142,19 @@ one controller command:
 ```
 
 Each value is `SSH_TARGET=WORKER_HOST`. Omit `=WORKER_HOST` when the SSH target
-is also the private address to which Monarch should bind. The selected Python
-executable and user code must exist on every host. ART uses non-interactive SSH
-and keeps each remote worker in the foreground for the controller lifetime.
-Configure identities and proxies in `~/.ssh/config`, or pass repeated arguments
-such as `--ssh-arg=-F --ssh-arg=/path/to/config`.
+is also the private address to which Monarch should bind. The controller must
+have both passwordless SSH access to every `SSH_TARGET` and a direct trusted
+private or VPN route to every `WORKER_HOST:N`. SSH options such as `ProxyJump`
+or `--ssh-arg=-F` affect only launch and stop commands; they do not tunnel
+Monarch traffic. SSH mode uses only worker port `N`, not SkyPilot's lifecycle
+port `N + 1`.
+
+The selected Python executable and user code must exist at the same paths on
+every host. ART uses non-interactive SSH, verifies that each launch-specific
+worker PID owns its listener, and monitors each foreground SSH process for the
+controller lifetime. A pre-existing listener is a hard error rather than a
+worker to reattach. SIGTERM and SIGHUP trigger bounded remote cleanup before the
+controller exits.
 
 The lower-level `worker` and `controller` subcommands remain available for
 schedulers or process supervisors that own worker lifecycle themselves. Those

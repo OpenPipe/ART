@@ -5,15 +5,17 @@ num_nodes: 2
 workdir: .
 
 resources:
-  accelerators: H200:8
+  cpus: 4+
+  memory: 8+
 
 envs:
   PYTHONUTF8: "1"
 
 setup: |
-  uv sync --frozen --extra distributed --extra megatron
-  uv sync --project vllm_runtime --frozen
+  set -euo pipefail
+  uv sync --frozen --no-dev --extra distributed
 
 run: |
-  .venv/bin/art-monarch skypilot \
+  set -euo pipefail
+  exec .venv/bin/art-monarch skypilot \
     --program art.distributed.monarch_bootstrap:deployment_smoke

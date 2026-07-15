@@ -8,13 +8,15 @@ network because ART currently configures Monarch with ``trust_all_connections``.
 
 import argparse
 import asyncio
-from collections.abc import Mapping, MutableMapping, Sequence
+from collections.abc import Callable, Iterator, Mapping, MutableMapping, Sequence
+from contextlib import contextmanager
 import fcntl
 import hashlib
 import ipaddress
 import os
 from pathlib import Path
 import re
+import select
 import shlex
 import signal
 import socket
@@ -35,7 +37,8 @@ DEFAULT_MONARCH_PORT = 22222
 DEFAULT_STARTUP_TIMEOUT_S = 600.0
 _INVALID_IDENTIFIER = re.compile(r"\W")
 _MAX_IDENTIFIER_LENGTH = 48
-_SSH_PID_FILE = re.compile(r"^/tmp/art-monarch-[0-9a-f]{32}\.pid$")
+_SSH_LAUNCH_ID = re.compile(r"^[0-9a-f]{32}$")
+_SSH_READY_PREFIX = b"ART_MONARCH_READY "
 _MONARCH_TIMEOUT_ENV = (
     "HYPERACTOR_HOST_SPAWN_READY_TIMEOUT",
     "HYPERACTOR_MESSAGE_DELIVERY_TIMEOUT",
@@ -50,55 +53,57 @@ import sys
 from monarch.actor import run_worker_loop_forever
 run_worker_loop_forever(address=sys.argv[1], ca="trust_all_connections")
 """
-_SSH_STOP_CODE = """\
-import os
-from pathlib import Path
-import signal
-import sys
-import time
-
-path = Path(sys.argv[1])
-address = sys.argv[2]
-try:
-    pid_text, recorded_address = path.read_text(encoding="ascii").splitlines()
-except FileNotFoundError:
-    raise SystemExit
-if recorded_address != address or not pid_text.isdecimal() or int(pid_text) < 2:
-    raise RuntimeError(f"invalid ART Monarch worker identity in {path}")
-pid = int(pid_text)
-try:
-    state = Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()[0]
-    command = Path(f"/proc/{pid}/cmdline").read_bytes()
-except FileNotFoundError:
-    path.unlink(missing_ok=True)
-    raise SystemExit
-if state == "Z":
-    path.unlink(missing_ok=True)
-    raise SystemExit
-if address.encode() not in command or not any(marker in command for marker in (
-    b"art.distributed.monarch_bootstrap", b"run_worker_loop_forever"
-)):
-    raise RuntimeError(f"PID {pid} no longer identifies ART worker {address}")
-if os.getpgid(pid) != pid:
-    raise RuntimeError(f"ART worker PID {pid} is not its process-group leader")
-os.killpg(pid, signal.SIGTERM)
-deadline = time.monotonic() + 10
-while time.monotonic() < deadline:
-    try:
-        state = Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()[0]
-    except FileNotFoundError:
-        break
-    if state == "Z":
-        break
-    time.sleep(0.05)
-else:
-    os.killpg(pid, signal.SIGKILL)
-path.unlink(missing_ok=True)
-"""
 
 
 class _BootstrapContract(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
+
+
+class _WorkerSession(_BootstrapContract):
+    model_config = ConfigDict(
+        arbitrary_types_allowed=True,
+        extra="forbid",
+        frozen=True,
+    )
+
+    address: str
+    process: subprocess.Popen[bytes]
+    label: str
+    graceful: bool = False
+    launch_id: str | None = None
+    lease: Any = None
+
+    @property
+    def exitcode(self) -> int | None:
+        return self.process.poll()
+
+    def is_alive(self) -> bool:
+        return self.exitcode is None
+
+    def release(self) -> None:
+        if not self.is_alive():
+            return
+        if self.graceful:
+            assert self.process.stdin is not None
+            self.process.stdin.close()
+        else:
+            os.killpg(self.process.pid, signal.SIGTERM)
+
+    def wait(self) -> None:
+        try:
+            self.process.wait(timeout=15)
+        except subprocess.TimeoutExpired:
+            if self.graceful:
+                self.process.terminate()
+            else:
+                os.killpg(self.process.pid, signal.SIGKILL)
+            self.process.wait()
+            raise RuntimeError(f"{self.label} did not stop in time") from None
+        finally:
+            if self.lease is not None:
+                self.lease.close()
+        if self.graceful and self.process.returncode:
+            raise RuntimeError(f"{self.label} exited {self.process.returncode}")
 
 
 class ExplicitHostBootstrap(_BootstrapContract):
@@ -359,19 +364,100 @@ async def deployment_smoke(hosts: Any) -> None:
         await runtime.close()
 
 
-def run_worker(address: str, *, pid_file: str | None = None) -> None:
+def _owns_tcp_listener(pid: int, port: int) -> bool:
+    socket_inodes = {
+        target[8:-1]
+        for descriptor in Path(f"/proc/{pid}/fd").iterdir()
+        if (target := os.readlink(descriptor)).startswith("socket:[")
+    }
+    for table in ("tcp", "tcp6"):
+        for line in Path(f"/proc/{pid}/net/{table}").read_text().splitlines()[1:]:
+            fields = line.split()
+            if (
+                len(fields) > 9
+                and fields[3] == "0A"
+                and int(fields[1].rsplit(":", 1)[1], 16) == port
+                and fields[9] in socket_inodes
+            ):
+                return True
+    return False
+
+
+def _stop_worker_process(process: subprocess.Popen[bytes]) -> None:
+    if process.poll() is None:
+        os.killpg(process.pid, signal.SIGTERM)
+    try:
+        process.wait(timeout=10)
+    except subprocess.TimeoutExpired:
+        os.killpg(process.pid, signal.SIGKILL)
+        process.wait()
+
+
+def _run_ssh_worker_session(
+    address: str,
+    launch_id: str,
+    startup_timeout_s: float,
+) -> None:
+    port = urlsplit(address).port
+    if port is None or not _SSH_LAUNCH_ID.fullmatch(launch_id):
+        raise ValueError("invalid SSH worker launch identity")
+    worker = subprocess.Popen(
+        [sys.executable, "-c", _WORKER_CODE, address, launch_id],
+        stdin=subprocess.DEVNULL,
+        stdout=sys.stderr,
+        stderr=sys.stderr,
+        start_new_session=True,
+    )
+
+    def terminate(_signum: int, _frame: Any) -> None:
+        raise SystemExit
+
+    previous = {
+        signum: signal.signal(signum, terminate)
+        for signum in (signal.SIGTERM, signal.SIGHUP)
+    }
+    try:
+        deadline = time.monotonic() + startup_timeout_s
+        while time.monotonic() < deadline and worker.poll() is None:
+            try:
+                if _owns_tcp_listener(worker.pid, port):
+                    print((_SSH_READY_PREFIX + launch_id.encode()).decode(), flush=True)
+                    break
+            except FileNotFoundError:
+                pass
+            time.sleep(0.05)
+        else:
+            if worker.poll() is not None:
+                raise RuntimeError(
+                    f"Monarch worker exited {worker.returncode} before ready"
+                )
+            raise TimeoutError(f"Monarch worker did not own {address} in time")
+        while worker.poll() is None:
+            readable, _, _ = select.select((sys.stdin,), (), (), 0.1)
+            if readable and not os.read(sys.stdin.fileno(), 1):
+                return
+        raise RuntimeError(f"Monarch worker exited {worker.returncode}")
+    finally:
+        _stop_worker_process(worker)
+        for signum, handler in previous.items():
+            signal.signal(signum, handler)
+
+
+def run_worker(
+    address: str,
+    *,
+    launch_id: str | None = None,
+    startup_timeout_s: float = DEFAULT_STARTUP_TIMEOUT_S,
+) -> None:
     """Run a pinned Monarch worker on a trusted private network.
 
     ART's trust-all mode must never be exposed to an untrusted or public network.
     """
 
     _prepare_child_environment(worker=True)
-    if pid_file is not None:
-        if not _SSH_PID_FILE.fullmatch(pid_file):
-            raise ValueError("invalid ART Monarch worker PID file")
-        descriptor = os.open(pid_file, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-        with os.fdopen(descriptor, "w", encoding="ascii") as handle:
-            handle.write(f"{os.getpid()}\n{address}\n")
+    if launch_id is not None:
+        _run_ssh_worker_session(address, launch_id, startup_timeout_s)
+        return
     # Importing ``art`` initializes enough third-party state to break Monarch's
     # spawned interpreter bootstrap. Replace this process with a clean worker.
     os.execv(sys.executable, [sys.executable, "-c", _WORKER_CODE, address])
@@ -382,7 +468,7 @@ async def attach_controller(
     *,
     name: str = "art",
     startup_timeout_s: float | None = None,
-    owned_workers: Sequence["_WorkerProcess"] = (),
+    owned_workers: Sequence[_WorkerSession] = (),
 ) -> Any:
     """Attach a controller to already-started workers on a trusted network."""
 
@@ -447,16 +533,32 @@ async def run_explicit_controller(
     program: "InstalledAsyncCallable",
     *,
     startup_timeout_s: float | None = None,
-    owned_workers: Sequence["_WorkerProcess"] = (),
+    owned_workers: Sequence[_WorkerSession] = (),
 ) -> Any:
     hosts = await attach_controller(
         spec.worker_addresses,
         startup_timeout_s=startup_timeout_s,
         owned_workers=owned_workers,
     )
+    program_task = asyncio.ensure_future(program.resolve()(hosts))
     try:
-        result = await program.resolve()(hosts)
+        while not program_task.done():
+            exited = [worker for worker in owned_workers if not worker.is_alive()]
+            if exited:
+                raise RuntimeError(
+                    "owned Monarch worker exited during controller program: "
+                    + ", ".join(
+                        f"{worker.address} code={worker.exitcode}" for worker in exited
+                    )
+                )
+            await asyncio.wait((program_task,), timeout=0.05)
+        result = await program_task
+        if any(not worker.is_alive() for worker in owned_workers):
+            raise RuntimeError("owned Monarch worker exited as program completed")
     except BaseException as program_error:
+        if not program_task.done():
+            program_task.cancel()
+            await asyncio.gather(program_task, return_exceptions=True)
         try:
             await asyncio.wait_for(
                 hosts.shutdown(),
@@ -473,53 +575,6 @@ async def run_explicit_controller(
         startup_timeout_s or DEFAULT_STARTUP_TIMEOUT_S,
     )
     return result
-
-
-class _WorkerProcess:
-    def __init__(self, address: str) -> None:
-        self.address = address
-        digest = hashlib.sha256(address.encode()).hexdigest()[:16]
-        self._lease = open(f"/tmp/art-monarch-worker-{digest}.lock", "a+b")
-        try:
-            fcntl.flock(self._lease.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-            with _WORKER_ADDRESS_LOCK:
-                if address in _USED_WORKER_ADDRESSES:
-                    raise RuntimeError(
-                        "Monarch worker addresses cannot be reused by one controller "
-                        f"process: {address}"
-                    )
-                _require_bindable_worker_address(address)
-                environment = os.environ.copy()
-                _prepare_child_environment(worker=True, environ=environment)
-                self.process = subprocess.Popen(
-                    [sys.executable, "-c", _WORKER_CODE, address],
-                    env=environment,
-                    stdin=subprocess.DEVNULL,
-                    start_new_session=True,
-                )
-                _USED_WORKER_ADDRESSES.add(address)
-        except BaseException:
-            self._lease.close()
-            raise
-
-    @property
-    def exitcode(self) -> int | None:
-        return self.process.poll()
-
-    def is_alive(self) -> bool:
-        return self.process.poll() is None
-
-    def stop(self) -> None:
-        try:
-            if self.is_alive():
-                os.killpg(self.process.pid, signal.SIGTERM)
-            try:
-                self.process.wait(timeout=10)
-            except subprocess.TimeoutExpired:
-                os.killpg(self.process.pid, signal.SIGKILL)
-                self.process.wait()
-        finally:
-            self._lease.close()
 
 
 def _require_bindable_worker_address(address: str) -> None:
@@ -543,12 +598,55 @@ def _require_bindable_worker_address(address: str) -> None:
     ) from error
 
 
-def _start_worker(address: str) -> _WorkerProcess:
-    return _WorkerProcess(address)
+def _start_worker(address: str) -> _WorkerSession:
+    digest = hashlib.sha256(address.encode()).hexdigest()[:16]
+    lease = open(f"/tmp/art-monarch-worker-{digest}.lock", "a+b")
+    try:
+        fcntl.flock(lease.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        with _WORKER_ADDRESS_LOCK:
+            if address in _USED_WORKER_ADDRESSES:
+                raise RuntimeError(
+                    f"Monarch worker address was already used: {address}"
+                )
+            _require_bindable_worker_address(address)
+            environment = os.environ.copy()
+            _prepare_child_environment(worker=True, environ=environment)
+            process = subprocess.Popen(
+                [sys.executable, "-c", _WORKER_CODE, address],
+                env=environment,
+                stdin=subprocess.DEVNULL,
+                start_new_session=True,
+            )
+            _USED_WORKER_ADDRESSES.add(address)
+        return _WorkerSession(
+            address=address,
+            process=process,
+            label=f"Monarch worker {address}",
+            lease=lease,
+        )
+    except BaseException:
+        lease.close()
+        raise
 
 
-def _stop_worker(worker: _WorkerProcess) -> None:
-    worker.stop()
+def _stop_worker_sessions(workers: Sequence[_WorkerSession]) -> None:
+    failures: list[BaseException] = []
+    for worker in workers:
+        try:
+            worker.release()
+        except BaseException as error:
+            failures.append(error)
+    for worker in workers:
+        try:
+            worker.wait()
+        except BaseException as error:
+            failures.append(error)
+    if failures:
+        raise BaseExceptionGroup("Monarch worker cleanup failed", failures)
+
+
+def _stop_worker(worker: _WorkerSession) -> None:
+    _stop_worker_sessions((worker,))
 
 
 def run_local(
@@ -603,7 +701,7 @@ def _lifecycle_listener(spec: SkyPilotBootstrap) -> socket.socket:
 def _accept_sky_peers(
     spec: SkyPilotBootstrap,
     listener: socket.socket,
-    worker: _WorkerProcess,
+    worker: _WorkerSession,
     startup_timeout_s: float,
 ) -> list[socket.socket]:
     peers: list[socket.socket] = []
@@ -632,7 +730,7 @@ def _accept_sky_peers(
 
 def _wait_for_sky_controller(
     spec: SkyPilotBootstrap,
-    worker: _WorkerProcess,
+    worker: _WorkerSession,
     startup_timeout_s: float,
 ) -> None:
     deadline = time.monotonic() + startup_timeout_s
@@ -678,10 +776,7 @@ def run_skypilot(
 ) -> None:
     """Translate SkyPilot topology and own one worker process per task rank."""
 
-    from .rollout import InstalledAsyncCallable
-
     spec = SkyPilotBootstrap.from_environ(port=port)
-    program = InstalledAsyncCallable(module=program_module, qualname=program_qualname)
     worker = _start_worker(spec.worker_addresses[spec.node_rank])
     if spec.node_rank != 0:
         try:
@@ -694,6 +789,12 @@ def run_skypilot(
     listener: socket.socket | None = None
     success = False
     try:
+        from .rollout import InstalledAsyncCallable
+
+        program = InstalledAsyncCallable(
+            module=program_module,
+            qualname=program_qualname,
+        )
         if len(spec.node_ips) > 1:
             listener = _lifecycle_listener(spec)
             peers = _accept_sky_peers(spec, listener, worker, startup_timeout_s)
@@ -702,6 +803,7 @@ def run_skypilot(
                 ExplicitHostBootstrap(worker_addresses=spec.worker_addresses),
                 program,
                 startup_timeout_s=startup_timeout_s,
+                owned_workers=(worker,),
             )
         )
         success = True
@@ -712,17 +814,33 @@ def run_skypilot(
         _stop_worker(worker)
 
 
-type _SshWorker = tuple[SshHost, str, str, subprocess.Popen[bytes]]
+def _require_unused_ssh_addresses(spec: SshBootstrap) -> None:
+    for host in spec.hosts:
+        try:
+            connection = socket.create_connection(
+                (host.worker_host.strip("[]"), spec.port),
+                timeout=0.2,
+            )
+        except OSError:
+            continue
+        connection.close()
+        raise RuntimeError(
+            "refusing to reuse a pre-existing Monarch worker listener at "
+            f"{host.worker_host}:{spec.port}"
+        )
 
 
-def _start_ssh_workers(spec: SshBootstrap) -> list[_SshWorker]:
-    workers: list[_SshWorker] = []
-    ssh_environment = os.environ.copy()
-    ssh_environment.pop("ART_VIRTUAL_ENV", None)
-    ssh_environment.pop("PYTHONPATH", None)
+def _start_ssh_workers(
+    spec: SshBootstrap,
+    startup_timeout_s: float,
+) -> list[_WorkerSession]:
+    workers: list[_WorkerSession] = []
+    environment = os.environ.copy()
+    environment.pop("ART_VIRTUAL_ENV", None)
+    environment.pop("PYTHONPATH", None)
     try:
         for host, address in zip(spec.hosts, spec.worker_addresses, strict=True):
-            pid_file = f"/tmp/art-monarch-{uuid.uuid4().hex}.pid"
+            launch_id = uuid.uuid4().hex
             command = "exec " + shlex.join(
                 (
                     spec.python_executable,
@@ -731,24 +849,33 @@ def _start_ssh_workers(spec: SshBootstrap) -> list[_SshWorker]:
                     "worker",
                     "--address",
                     address,
-                    "--pid-file",
-                    pid_file,
+                    "--launch-id",
+                    launch_id,
+                    "--startup-timeout",
+                    str(startup_timeout_s),
                 )
             )
-            process = subprocess.Popen(
-                (
-                    "ssh",
-                    "-n",
-                    "-o",
-                    "BatchMode=yes",
-                    *spec.ssh_args,
-                    host.target,
-                    command,
-                ),
-                stdin=subprocess.DEVNULL,
-                env=ssh_environment,
+            workers.append(
+                _WorkerSession(
+                    address=address,
+                    process=subprocess.Popen(
+                        (
+                            "ssh",
+                            "-o",
+                            "BatchMode=yes",
+                            *spec.ssh_args,
+                            host.target,
+                            command,
+                        ),
+                        stdin=subprocess.PIPE,
+                        stdout=subprocess.PIPE,
+                        env=environment,
+                    ),
+                    label=f"SSH worker {host.target!r}",
+                    graceful=True,
+                    launch_id=launch_id,
+                )
             )
-            workers.append((host, address, pid_file, process))
         return workers
     except BaseException as startup_error:
         try:
@@ -762,80 +889,78 @@ def _start_ssh_workers(spec: SshBootstrap) -> list[_SshWorker]:
 
 
 def _wait_for_ssh_workers(
-    spec: SshBootstrap, workers: Sequence[_SshWorker], timeout_s: float
+    spec: SshBootstrap, workers: Sequence[_WorkerSession], timeout_s: float
 ) -> None:
-    pending = {host.target: (host, process) for host, _, _, process in workers}
+    pending = {
+        host.target: (host, worker)
+        for host, worker in zip(spec.hosts, workers, strict=True)
+    }
+    streams = {}
+    for target, (_, worker) in pending.items():
+        assert worker.process.stdout is not None and worker.launch_id is not None
+        streams[worker.process.stdout] = target
+    ready: set[str] = set()
     deadline = time.monotonic() + timeout_s
     while pending:
-        for target, (host, process) in tuple(pending.items()):
-            if (code := process.poll()) is not None:
+        for target, (_, worker) in tuple(pending.items()):
+            if (code := worker.exitcode) is not None:
                 raise RuntimeError(f"SSH worker {target!r} exited {code} before ready")
+        wait = max(0.0, min(0.05, deadline - time.monotonic()))
+        readable, _, _ = select.select(tuple(streams), (), (), wait)
+        for stream in readable:
+            target = streams.pop(stream)
+            _, worker = pending[target]
+            assert worker.launch_id is not None
+            expected = _SSH_READY_PREFIX + worker.launch_id.encode() + b"\n"
+            if stream.readline() != expected:
+                raise RuntimeError(
+                    f"SSH worker {target!r} did not prove launch identity"
+                )
+            ready.add(target)
+        for target in tuple(ready):
+            host, _ = pending[target]
             try:
                 with socket.create_connection(
-                    (host.worker_host.strip("[]"), spec.port), timeout=0.2
+                    (host.worker_host.strip("[]"), spec.port),
+                    timeout=0.2,
                 ):
                     pending.pop(target)
+                    ready.remove(target)
             except OSError:
                 pass
-        if pending and time.monotonic() >= deadline:
+        if time.monotonic() >= deadline:
             raise TimeoutError(f"timed out waiting for SSH workers {tuple(pending)}")
-        if pending:
-            time.sleep(0.05)
 
 
-def _stop_ssh_workers(spec: SshBootstrap, workers: Sequence[_SshWorker]) -> None:
-    ssh_environment = os.environ.copy()
-    ssh_environment.pop("ART_VIRTUAL_ENV", None)
-    ssh_environment.pop("PYTHONPATH", None)
-    stop_processes = [
-        subprocess.Popen(
-            (
-                "ssh",
-                "-n",
-                "-o",
-                "BatchMode=yes",
-                *spec.ssh_args,
-                host.target,
-                shlex.join(
-                    (
-                        spec.python_executable,
-                        "-c",
-                        _SSH_STOP_CODE,
-                        pid_file,
-                        address,
-                    )
-                ),
-            ),
-            stdin=subprocess.DEVNULL,
-            env=ssh_environment,
-        )
-        for host, address, pid_file, _ in workers
-    ]
-    failures: list[str] = []
-    deadline = time.monotonic() + 15
-    for process in stop_processes:
-        try:
-            code = process.wait(timeout=max(0.1, deadline - time.monotonic()))
-        except subprocess.TimeoutExpired:
-            process.kill()
-            process.wait()
-            failures.append("remote worker stop timed out")
-        else:
-            if code:
-                failures.append(f"remote worker stop exited {code}")
-    for _, _, _, worker in workers:
-        try:
-            worker.wait(timeout=max(0.1, deadline - time.monotonic()))
-        except subprocess.TimeoutExpired:
-            worker.terminate()
-            try:
-                worker.wait(timeout=2)
-            except subprocess.TimeoutExpired:
-                worker.kill()
-                worker.wait()
-            failures.append("SSH worker command did not exit after remote stop")
-    if failures:
-        raise RuntimeError("; ".join(failures))
+def _stop_ssh_workers(
+    _spec: SshBootstrap,
+    workers: Sequence[_WorkerSession],
+) -> None:
+    _stop_worker_sessions(workers)
+
+
+@contextmanager
+def _ssh_termination_signals() -> Iterator[Callable[[], None]]:
+    received = False
+
+    def terminate(signum: int, _frame: Any) -> None:
+        nonlocal received
+        if not received:
+            received = True
+            raise SystemExit(128 + signum)
+
+    managed = (signal.SIGTERM, signal.SIGHUP)
+    previous = {signum: signal.signal(signum, terminate) for signum in managed}
+
+    def ignore() -> None:
+        for signum in managed:
+            signal.signal(signum, signal.SIG_IGN)
+
+    try:
+        yield ignore
+    finally:
+        for signum, handler in previous.items():
+            signal.signal(signum, handler)
 
 
 def run_ssh(
@@ -846,26 +971,31 @@ def run_ssh(
 ) -> None:
     """Start workers on passwordless SSH hosts and own them for one ART run."""
 
-    workers = _start_ssh_workers(spec)
-    try:
-        _wait_for_ssh_workers(spec, workers, startup_timeout_s)
-        asyncio.run(
-            run_explicit_controller(
-                ExplicitHostBootstrap(worker_addresses=spec.worker_addresses),
-                program,
-                startup_timeout_s=startup_timeout_s,
-            )
-        )
-    except BaseException as program_error:
+    with _ssh_termination_signals() as ignore_termination:
+        _require_unused_ssh_addresses(spec)
+        workers = _start_ssh_workers(spec, startup_timeout_s)
         try:
-            _stop_ssh_workers(spec, workers)
-        except BaseException as cleanup_error:
-            raise BaseExceptionGroup(
-                "SSH controller and worker cleanup failed",
-                [program_error, cleanup_error],
-            ) from None
-        raise
-    _stop_ssh_workers(spec, workers)
+            _wait_for_ssh_workers(spec, workers, startup_timeout_s)
+            asyncio.run(
+                run_explicit_controller(
+                    ExplicitHostBootstrap(worker_addresses=spec.worker_addresses),
+                    program,
+                    startup_timeout_s=startup_timeout_s,
+                    owned_workers=workers,
+                )
+            )
+        except BaseException as program_error:
+            ignore_termination()
+            try:
+                _stop_ssh_workers(spec, workers)
+            except BaseException as cleanup_error:
+                raise BaseExceptionGroup(
+                    "SSH controller and worker cleanup failed",
+                    [program_error, cleanup_error],
+                ) from None
+            raise
+        ignore_termination()
+        _stop_ssh_workers(spec, workers)
 
 
 def main(argv: Sequence[str] | None = None) -> None:
@@ -879,7 +1009,10 @@ def main(argv: Sequence[str] | None = None) -> None:
     subparsers = parser.add_subparsers(dest="command", required=True)
     worker = subparsers.add_parser("worker")
     worker.add_argument("--address", required=True)
-    worker.add_argument("--pid-file")
+    worker.add_argument("--launch-id")
+    worker.add_argument(
+        "--startup-timeout", type=_positive_float, default=DEFAULT_STARTUP_TIMEOUT_S
+    )
     controller = subparsers.add_parser(
         "controller", help="attach to worker commands managed by the caller"
     )
@@ -925,7 +1058,11 @@ def main(argv: Sequence[str] | None = None) -> None:
     )
     args = parser.parse_args(argv)
     if args.command == "worker":
-        run_worker(args.address, pid_file=args.pid_file)
+        run_worker(
+            args.address,
+            launch_id=args.launch_id,
+            startup_timeout_s=args.startup_timeout,
+        )
         return
     module, separator, qualname = args.program.partition(":")
     if not module or not separator or not qualname:
