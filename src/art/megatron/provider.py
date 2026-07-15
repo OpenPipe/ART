@@ -408,7 +408,16 @@ def _enforce_art_moe_grouped_gemm_fast_path(provider: GPTModelProvider) -> None:
     # Current validation is for SM90/Hopper. SM100/Blackwell enablement should
     # come from upgrading Transformer Engine's grouped-GEMM implementation,
     # while ART keeps this same central fast-path contract.
-    provider.add_bias_linear = False
+    if provider.add_bias_linear and not getattr(
+        provider,
+        "art_moe_grouped_gemm_bias_encoded",
+        False,
+    ):
+        raise RuntimeError(
+            "TE CUTLASS grouped GEMM does not accept expert bias parameters; "
+            "the model handler must preserve required expert biases outside the "
+            "grouped-GEMM bias epilogue."
+        )
     provider.bias_activation_fusion = False
 
 
@@ -429,14 +438,21 @@ def _require_te_cutlass_grouped_gemm_dimensions(provider: GPTModelProvider) -> N
         )
         or 0
     )
-    invalid = [
-        f"{name}={value}"
-        for name, value in (
-            ("hidden_size", hidden_size),
-            ("moe_ffn_hidden_size", moe_ffn_hidden_size),
+    expert_tensor_parallel_size = int(
+        getattr(provider, "expert_tensor_parallel_size", 1) or 1
+    )
+    invalid = []
+    if hidden_size <= 0 or hidden_size % 128:
+        invalid.append(f"hidden_size={hidden_size}")
+    if moe_ffn_hidden_size % expert_tensor_parallel_size:
+        invalid.append(
+            f"moe_ffn_hidden_size={moe_ffn_hidden_size} is not divisible by "
+            f"expert_tensor_parallel_size={expert_tensor_parallel_size}"
         )
-        if value <= 0 or value % 128 != 0
-    ]
+    else:
+        local_moe_ffn_hidden_size = moe_ffn_hidden_size // expert_tensor_parallel_size
+        if local_moe_ffn_hidden_size <= 0 or local_moe_ffn_hidden_size % 128:
+            invalid.append(f"local_moe_ffn_hidden_size={local_moe_ffn_hidden_size}")
     if invalid:
         raise RuntimeError(
             "ART Megatron MoE training requires Transformer Engine CUTLASS "
@@ -454,7 +470,7 @@ def _apply_art_training_runtime_finalize_defaults(
         return
     # Expert communication is comparable to expert MLP compute, so the ART
     # runtime uses one optimized dispatcher contract instead of model-specific
-    # DeepEP/all-to-all fallbacks.
+    # DeepEP or all-to-all alternatives.
     apply_flex_dispatcher_backend(provider, moe_flex_dispatcher_backend="hybridep")
     if (
         provider.moe_token_dispatcher_type != "flex"
@@ -667,15 +683,33 @@ def finalize_provider_bundle(provider_bundle: ProviderBundle) -> ProviderBundle:
 
 def _finalize_provider_with_art_overrides(provider: GPTModelProvider) -> None:
     if not _is_art_gdn_context_parallel_provider(provider):
-        provider.finalize()
+        _finalize_provider_config(provider)
         return
     _validate_art_gdn_context_parallel_provider(provider)
     variant = provider.experimental_attention_variant
     provider.experimental_attention_variant = None
     try:
-        provider.finalize()
+        _finalize_provider_config(provider)
     finally:
         provider.experimental_attention_variant = variant
+
+
+def _finalize_provider_config(provider: GPTModelProvider) -> None:
+    # MCore rejects ETP whenever the global linear-bias flag is set. GPT-OSS
+    # keeps that flag for attention biases while its handler encodes expert
+    # biases into padded weights and constructs the grouped MLP without bias.
+    preserve_non_expert_bias = bool(
+        provider.add_bias_linear
+        and int(provider.expert_tensor_parallel_size or 1) > 1
+        and getattr(provider, "art_moe_grouped_gemm_bias_encoded", False)
+    )
+    if preserve_non_expert_bias:
+        provider.add_bias_linear = False
+    try:
+        provider.finalize()
+    finally:
+        if preserve_non_expert_bias:
+            provider.add_bias_linear = True
 
 
 def _is_art_gdn_context_parallel_provider(provider: GPTModelProvider) -> bool:

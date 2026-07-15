@@ -3,11 +3,12 @@ from collections import Counter
 import contextlib
 import contextvars
 from dataclasses import dataclass, field
-from typing import Awaitable, Callable, Iterable, Iterator, Literal, overload
+from typing import Awaitable, Callable, Iterable, Iterator, Literal, Sequence, overload
 
 from openai.types.chat.chat_completion import Choice
 from tqdm import auto as tqdm
 
+from .preprocessing.vllm_tokens import choice_completion_tokens
 from .trajectories import Trajectory, TrajectoryGroup
 
 
@@ -53,7 +54,7 @@ async def gather_trajectory_groups(
         context.pbar.close()
 
     # Filter out any None results that may have been returned due to handled exceptions
-    processed_groups = []
+    processed_groups: list[TrajectoryGroup] = []
     for g in result_groups:
         if g is None:
             continue
@@ -113,12 +114,7 @@ async def gather_trajectories(
     pbar_desc: str | None = "gather",
     pbar_total_completion_tokens: bool = False,
     max_exceptions: int | float = 0,
-) -> (
-    list[Trajectory]
-    | list[Trajectory | BaseException]
-    | list[list[Trajectory]]
-    | list[list[Trajectory] | BaseException]
-):
+) -> Sequence[Trajectory | list[Trajectory] | BaseException]:
     if pbar_total_completion_tokens:
         print(
             "pbar_total_completion_tokens is deprecated and will be removed in a future version."
@@ -181,18 +177,24 @@ async def wrap_trajectories_awaitable(
 
 
 def record_metrics(context: "GatherContext", trajectory: Trajectory) -> None:
-    logprobs = [
-        message_or_choice.logprobs
-        for message_or_choice in trajectory.messages_and_choices
-        if isinstance(message_or_choice, Choice)
-        if message_or_choice.logprobs
+    trajectory.metrics.pop("completion_tokens", None)
+    choices = [
+        item
+        for history in (
+            trajectory.messages_and_choices,
+            *(
+                history.messages_and_choices
+                for history in trajectory.additional_histories
+            ),
+        )
+        for item in history
+        if isinstance(item, Choice)
     ]
-    if logprobs:
-        # TODO: probably shouldn't average this
+    completion_tokens = [choice_completion_tokens(choice) for choice in choices]
+    if choices and all(count is not None for count in completion_tokens):
         trajectory.metrics["completion_tokens"] = sum(
-            len(l.content or l.refusal or [])
-            for l in logprobs  # noqa: E741
-        ) / len(logprobs)
+            count for count in completion_tokens if count is not None
+        )
     context.metric_sums["reward"] += trajectory.reward
     context.metric_divisors["reward"] += 1
     context.metric_sums.update(trajectory.metrics)

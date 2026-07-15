@@ -669,7 +669,7 @@ def _art_dsv4_expert_mapping_types() -> tuple[type[Any], type[Any]]:
 
         @property
         def group_key(self) -> str:
-            return cast(dict[str, str], self.export_hf_param)["gate"]
+            return self.export_hf_param["gate"]
 
         def hf_to_megatron(
             self,
@@ -718,7 +718,7 @@ def _art_dsv4_expert_mapping_types() -> tuple[type[Any], type[Any]]:
             hf_param = cast(dict[str, str], self.hf_param)
             gate_suffix = hf_param["gate"].rpartition(".experts.")[2].split(".", 1)[1]
             remapped: dict[str, torch.Tensor] = {}
-            export = cast(dict[str, str], self.export_hf_param)
+            export = self.export_hf_param
             for gate_key, gate in converted.items():
                 if not gate_key.endswith(gate_suffix):
                     continue
@@ -1269,5 +1269,5 @@ def ensure_dsv4_bridge_registered() -> None:
         target=GPTModel,
         provider=MLAModelProvider,
         model_type="deepseek_v4",
-    )(ArtDeepSeekV4Bridge)
+    )(ArtDeepSeekV4Bridge)  # ty: ignore[invalid-argument-type]
     _DSV4_BRIDGE_REGISTERED = True

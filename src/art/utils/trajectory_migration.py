@@ -79,9 +79,9 @@ def trajectory_to_dict(trajectory: Trajectory) -> dict[str, Any]:
 def message_or_choice_to_dict(message_or_choice: MessageOrChoice) -> dict[str, Any]:
     # messages are sometimes stored as dicts, so we need to handle both cases
     item_dict = (
-        message_or_choice
-        if isinstance(message_or_choice, dict)
-        else message_or_choice.to_dict()  # ty:ignore[possibly-missing-attribute]
+        message_or_choice.to_dict()
+        if isinstance(message_or_choice, Choice)
+        else message_or_choice
     )
 
     if "logprobs" in item_dict:

@@ -81,6 +81,7 @@ class WorkflowStageResources(BaseModel):
     vllm: VllmWorkflowResources | None = None
     high_vram_megatron: MegatronWorkflowResources | None = None
     high_vram_vllm: VllmWorkflowResources | None = None
+    streaming_weight_offload: bool = False
     megatron_env: dict[str, str] = Field(default_factory=dict)
 
 
@@ -141,7 +142,6 @@ _DSV4_REPRESENTATIVE_MLP_LAYER_TYPES = ["hash_moe", "hash_moe", "hash_moe", "moe
 _DSV4_MEGATRON_ENV = {
     "ART_DSV4_VALIDATION_NUM_LAYERS": str(_DSV4_REPRESENTATIVE_NUM_LAYERS)
 }
-_DSV4_STREAMING_OFFLOAD_ENV = {"ART_MEGATRON_STREAMING_WEIGHT_OFFLOAD": "1"}
 _DSV4_HF_OVERRIDES = {
     "num_hidden_layers": _DSV4_REPRESENTATIVE_NUM_LAYERS,
     "compress_ratios": _DSV4_REPRESENTATIVE_COMPRESS_RATIOS,
@@ -232,7 +232,7 @@ HANDLER_WORKFLOW_RESOURCES: dict[str, HandlerWorkflowResources] = {
             vllm=_DSV4_FULL_VLLM_EP4,
             high_vram_megatron=_DSV4_HIGH_VRAM_MEGATRON,
             high_vram_vllm=_DSV4_FULL_VLLM_EP2,
-            megatron_env=_DSV4_STREAMING_OFFLOAD_ENV,
+            streaming_weight_offload=True,
         ),
         merged_vllm_serving=WorkflowStageResources(
             required_world_size=8,
@@ -255,7 +255,7 @@ HANDLER_WORKFLOW_RESOURCES: dict[str, HandlerWorkflowResources] = {
             vllm=_DSV4_FULL_VLLM_EP4,
             high_vram_megatron=_DSV4_HIGH_VRAM_MEGATRON,
             high_vram_vllm=_DSV4_FULL_VLLM_EP2,
-            megatron_env=_DSV4_STREAMING_OFFLOAD_ENV,
+            streaming_weight_offload=True,
         ),
         length_trainability=WorkflowStageResources(
             required_world_size=8,
@@ -265,7 +265,7 @@ HANDLER_WORKFLOW_RESOURCES: dict[str, HandlerWorkflowResources] = {
             vllm=_DSV4_FULL_VLLM_EP4,
             high_vram_megatron=_DSV4_HIGH_VRAM_MEGATRON,
             high_vram_vllm=_DSV4_FULL_VLLM_EP2,
-            megatron_env=_DSV4_STREAMING_OFFLOAD_ENV,
+            streaming_weight_offload=True,
         ),
         yes_no_trainability_variant="megatron_dedicated",
     ),

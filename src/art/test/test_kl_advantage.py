@@ -196,7 +196,7 @@ def test_loss_masks_nonfinite_ignored_logprobs_before_arithmetic() -> None:
         requires_grad=True,
     )
     ref_logprobs = torch.tensor([[float("nan"), -0.25, float("nan"), float("nan")]])
-    entropies = torch.tensor([[float("nan"), 0.125, float("nan"), float("nan")]])
+    entropies = torch.tensor([[float("nan"), float("nan"), 0.125, float("nan")]])
 
     loss = loss_fn(
         LossInputs(inputs=inputs),

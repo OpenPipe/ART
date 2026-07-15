@@ -41,3 +41,13 @@ BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
 CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN
 ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH
 DAMAGE.
+
+This project vendors a modified HybridEP runtime derived from DeepEP:
+
+- Repository: https://github.com/deepseek-ai/DeepEP
+- License: MIT License
+- Vendored path: src/art/megatron/_hybrid_ep
+
+The applicable license text is retained at:
+
+- src/art/megatron/_hybrid_ep/LICENSE

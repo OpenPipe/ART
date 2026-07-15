@@ -300,7 +300,7 @@ def ensure_merged_weight_transfer_group(
 
     error: BaseException | None = None
     if _is_sender_rank(rank):
-        init_kwargs = {
+        init_kwargs: dict[str, object] = {
             "master_address": spec.init_info.master_address,
             "master_port": spec.init_info.master_port,
             "world_size": spec.init_info.world_size,
@@ -360,7 +360,7 @@ def sync_merged_weights_to_vllm(
     _ = bridge
     lora_result = build_vllm_lora_tensors_from_model(
         model=model,
-        adapter_model=adapter_model,
+        adapter_dtypes={key: tensor.dtype for key, tensor in adapter_model.items()},
         handler=model_support_handler,
         adapter_config=adapter_config,
         rank=rank,

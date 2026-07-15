@@ -1,7 +1,5 @@
 # ruff: noqa
 # Adapted from miles_plugins/models/glm5/ops/tilelang_indexer_bwd.py for DeepSeek-V4.
-from typing import Any, cast
-
 import torch
 
 from art.megatron.dsv4.kernel.tilelang_import import (
@@ -12,8 +10,8 @@ from art.megatron.dsv4.kernel.tilelang_import import (
 
 _tl, _T = import_tilelang()
 
-tl = cast(Any, _tl)
-T = cast(Any, _T)
+tl = _tl
+T = _T
 
 BF16 = T.bfloat16
 FP32 = T.float32

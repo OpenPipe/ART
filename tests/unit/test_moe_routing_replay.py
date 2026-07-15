@@ -231,7 +231,7 @@ class _FakeChunk(nn.Module):
 
 def _fake_chunk_router(chunk: _FakeChunk) -> _FakeRouter:
     layer = cast(_FakeLayer, chunk.decoder.layers[0])
-    return cast(_FakeRouter, layer.mlp.router)
+    return layer.mlp.router
 
 
 def _assert_target(

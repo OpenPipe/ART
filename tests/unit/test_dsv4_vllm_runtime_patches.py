@@ -25,6 +25,31 @@ def _load_dsv4_patches_module():
     return module
 
 
+def test_dsv4_lora_support_declares_vllm_024_manager_protocol(monkeypatch) -> None:
+    patches = _load_dsv4_patches_module()
+
+    class FakeDeepseekV4ForCausalLM:
+        pass
+
+    manager_patches: list[type] = []
+    monkeypatch.setattr(
+        patches,
+        "_import_dsv4_model_module",
+        lambda: SimpleNamespace(DeepseekV4ForCausalLM=FakeDeepseekV4ForCausalLM),
+    )
+    monkeypatch.setattr(
+        patches,
+        "_patch_dsv4_lora_manager_indexer_skip",
+        manager_patches.append,
+    )
+
+    patches.patch_dsv4_lora_support()
+
+    assert getattr(FakeDeepseekV4ForCausalLM, "supports_lora") is True
+    assert getattr(FakeDeepseekV4ForCausalLM, "lora_manager") is None
+    assert manager_patches == [FakeDeepseekV4ForCausalLM]
+
+
 def test_dsv4_compressor_helper_uses_punica_metadata_without_full_batch_lora(
     monkeypatch,
 ) -> None:

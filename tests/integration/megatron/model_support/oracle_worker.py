@@ -468,7 +468,7 @@ def _patch_finalize_provider_bundle_for_oracle(
 
 
 def _build_optimizer_config(case_config: OracleCaseConfig):
-    """Builds Megatron optimizer settings for deterministic harness runs."""
+    """Builds a linear one-step optimizer for deterministic delta comparisons."""
     from megatron.core.optimizer import OptimizerConfig
 
     if case_config.precision == "fp32":
@@ -480,22 +480,20 @@ def _build_optimizer_config(case_config: OracleCaseConfig):
             main_params_dtype=torch.float32,
             exp_avg_dtype=torch.float32,
             exp_avg_sq_dtype=torch.float32,
+            optimizer="sgd",
+            sgd_momentum=0.0,
             lr=case_config.learning_rate,
-            adam_beta1=0.9,
-            adam_beta2=0.99,
-            clip_grad=0.1,
+            clip_grad=0.0,
             weight_decay=0.0,
-            adam_eps=1e-13,
         )
     return OptimizerConfig(
         bf16=True,
         fp16=False,
+        optimizer="sgd",
+        sgd_momentum=0.0,
         lr=case_config.learning_rate,
-        adam_beta1=0.9,
-        adam_beta2=0.99,
-        clip_grad=0.1,
+        clip_grad=0.0,
         weight_decay=0.0,
-        adam_eps=1e-13,
     )
 
 
@@ -535,7 +533,7 @@ def _apply_requested_flex_backend_patch(flex_backend: str | None):
     else:
         raise RuntimeError(f"Unsupported flex backend request: {flex_backend}")
 
-    compiled_flex_attention._FORCED_FLEX_BACKEND = patched_backend  # type: ignore[invalid-assignment]
+    setattr(compiled_flex_attention, "_FORCED_FLEX_BACKEND", patched_backend)
     compiled_flex_attention._FORCED_FLEX_KERNEL_OPTIONS = patched_kernel_options
     compiled_flex_attention.dense_compiled_flex_attention = torch.compile(
         compiled_flex_attention._forced_flex_attention_dense
@@ -707,9 +705,11 @@ def _assert_runtime_configuration(
     standard_attention_layers = 0
 
     try:
-        from megatron.core.ssm.gated_delta_net import GatedDeltaNet
+        import megatron.core.ssm.gated_delta_net as gated_delta_net
     except ImportError:  # pragma: no cover - optional dependency guard.
-        GatedDeltaNet = ()  # type: ignore[assignment]
+        gated_delta_net_type = None
+    else:
+        gated_delta_net_type = getattr(gated_delta_net, "GatedDeltaNet")
     from megatron.core.transformer.attention import SelfAttention
 
     for chunk in model_chunks:
@@ -722,7 +722,9 @@ def _assert_runtime_configuration(
         if config is not None and hasattr(config, "context_parallel_size"):
             observed_context_parallel_sizes.add(int(config.context_parallel_size))
         for child in module.modules():
-            if GatedDeltaNet and isinstance(child, GatedDeltaNet):
+            if gated_delta_net_type is not None and isinstance(
+                child, gated_delta_net_type
+            ):
                 gdn_layers += 1
             if isinstance(child, SelfAttention):
                 standard_attention_layers += 1
@@ -1054,7 +1056,7 @@ def _apply_attention_nested_grad_mutation(mutation: SensitivityMutation | None):
         view.copy_(grad)
         return view
 
-    executor._sanitize_nested_stage_input_grad = _mutated_sanitize  # type: ignore[invalid-assignment]
+    setattr(executor, "_sanitize_nested_stage_input_grad", _mutated_sanitize)
     try:
         yield
     finally:
@@ -1076,8 +1078,8 @@ def _apply_attention_lse_normalize_mutation(mutation: SensitivityMutation | None
     def _identity(lse: torch.Tensor, **_kwargs: Any) -> torch.Tensor:
         return lse
 
-    compiled_flex_attention.normalize_flex_lse = _identity  # type: ignore[invalid-assignment]
-    executor.normalize_flex_lse = _identity  # type: ignore[invalid-assignment]
+    setattr(compiled_flex_attention, "normalize_flex_lse", _identity)
+    setattr(executor, "normalize_flex_lse", _identity)
     try:
         yield
     finally:
@@ -1607,7 +1609,6 @@ def _worker_run(request: WorkerRunRequest) -> None:
                     inputs=micro_inputs,
                     step_index=step_index,
                     sample_index=micro_sample_indices,
-                    global_grad_accumulation_sequences=global_grad_accumulation_sequences,
                     moe_routing_replay_controller=runtime.moe_routing_replay_controller,
                     hybridep_token_counts=hybridep_token_counts,
                 )

@@ -3,6 +3,7 @@ from __future__ import annotations
 from array import array
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
+from typing import Any, cast
 
 import torch
 
@@ -264,9 +265,9 @@ def _prefix_segments(
         low = high = rows[indices[0]]
         for index in indices[1:]:
             row = rows[index]
-            if row < low:
+            if cast(Any, row) < low:
                 low = row
-            elif row > high:
+            elif cast(Any, row) > high:
                 high = row
         while start < end:
             if low[start] != high[start]:

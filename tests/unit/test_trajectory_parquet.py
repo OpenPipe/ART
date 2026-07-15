@@ -44,6 +44,7 @@ from art.utils.trajectory_logging import (
 from art.utils.trajectory_migration import (
     MigrationResult,
     deserialize_trajectory_groups,
+    message_or_choice_to_dict,
     migrate_jsonl_to_parquet,
     migrate_model_dir,
     migrate_trajectories_dir,
@@ -53,6 +54,20 @@ from art.utils.trajectory_migration import (
 
 # Path to test fixtures
 FIXTURES_DIR = Path(__file__).parent.parent / "fixtures" / "trajectories"
+
+
+def test_legacy_choice_serialization_omits_unset_fields() -> None:
+    choice = Choice(
+        index=0,
+        finish_reason="stop",
+        message={"role": "assistant", "content": "ok"},
+    )
+
+    assert message_or_choice_to_dict(choice) == {
+        "finish_reason": "stop",
+        "index": 0,
+        "message": {"content": "ok", "role": "assistant"},
+    }
 
 
 def _ensure_message(item: MessageOrChoice) -> ChatCompletionMessageParam:

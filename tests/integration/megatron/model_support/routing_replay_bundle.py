@@ -161,7 +161,15 @@ def _dedupe_checkpoint_router_calls(
             previous_call_key == call_key
             and previous_route is not None
             and torch.equal(compact_route.expert_indices, previous_route.expert_indices)
-            and torch.equal(compact_route.expert_probs, previous_route.expert_probs)
+            and (
+                compact_route.expert_probs is None
+                and previous_route.expert_probs is None
+                or compact_route.expert_probs is not None
+                and previous_route.expert_probs is not None
+                and torch.equal(compact_route.expert_probs, previous_route.expert_probs)
+            )
+            and compact_route.expert_mask is not None
+            and previous_route.expert_mask is not None
             and torch.equal(compact_route.expert_mask, previous_route.expert_mask)
         )
         if is_checkpoint_duplicate:

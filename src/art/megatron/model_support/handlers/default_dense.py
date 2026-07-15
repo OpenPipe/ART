@@ -25,6 +25,10 @@ def _compile_workaround_flags_for_provider(
 ) -> tuple[str, ...]:
     flags = base_flags
     if int(getattr(provider, "num_moe_experts", 0) or 0) > 0:
+        # Megatron's all-to-all dispatcher performs side-stream D2H copies and
+        # record_stream lifetime management inside this method. Those effects
+        # cannot be functionalized by Dynamo and do not benefit from compile.
+        flags = (*flags, "alltoall_dispatch_dtoh")
         # HybridEP owns native communication, dynamic routing metadata, and
         # side-stream lifetimes. Keep only Megatron's thin flex wrapper eager.
         flags = (*flags, "flex_token_dispatch_combine")

@@ -9,7 +9,6 @@ from typing import cast
 import warnings
 
 import pydantic
-from scipy.stats import beta as beta_distribution
 
 from ..preprocessing.pack import PrefixTreePackingPool
 from .config import (
@@ -52,49 +51,15 @@ _TRAINER_PADDING_EPSILON = 1e-9
 class PackingProjection(pydantic.BaseModel):
     groups: int
     spill_probability: float
-    expected_padding_ratio: float
-    counterfactual_trials: float = 0.0
-    counterfactual_spills: float = 0.0
-    counterfactual_spill_probability_upper: float = 0.0
-    marginal_tokens_mean: float = 0.0
-    history_spill_probability_upper: float = 0.0
-    history_trials: float = 0.0
-    history_spills: float = 0.0
-    history_bad_padding_events: float = 0.0
-    history_bad_padding_probability_upper: float = 0.0
 
 
 class PackingOutcome(pydantic.BaseModel):
     step: int
     groups: int = pydantic.Field(ge=1)
     packed_sequences: int = pydantic.Field(ge=1)
-    padding_ratio: float = pydantic.Field(ge=0.0, le=1.0)
-    non_padding_tokens: float = pydantic.Field(ge=0.0)
-    train_tokens: float = pydantic.Field(gt=0.0)
 
 
-class PackingHistoryRisk(pydantic.BaseModel):
-    groups: int
-    trials: float = 0.0
-    spills: float = 0.0
-    spill_probability_upper: float = 0.0
-    bad_padding_events: float = 0.0
-    bad_padding_probability_upper: float = 0.0
-
-
-class VllmLoadStats(pydantic.BaseModel):
-    capacity_wait_frac: float = 0.0
-    active_frac: float = 0.0
-    capacity_wait_request_s: float = 0.0
-    running_request_s: float = 0.0
-    pressure: float = 0.0
-    capacity_wait_area: float = 0.0
-    running_area: float = 0.0
-    idle_frac: float = 0.0
-    max_num_seqs_mean: float = 0.0
-
-
-def _trainer_load_score(*, idle_frac: float, padding_ratio: float) -> float:
+def _trainer_underfeed_score(*, idle_frac: float, padding_ratio: float) -> float:
     denominator = max(
         _TRAINER_PADDING_EPSILON,
         1.0 + _TRAINER_PADDING_EPSILON - max(0.0, min(1.0, padding_ratio)),
@@ -198,26 +163,12 @@ class PipelineAutotuner:
         groups = _required_step_values(
             by_step, window_steps, "data/step_num_groups_trainable"
         )
-        step_packed_sequences = _required_step_values(
-            by_step, window_steps, "data/step_packed_sequences"
-        )
-        raw_train_capacity_tokens = _required_step_values(
+        train_capacity_tokens = _required_step_values(
             by_step, window_steps, "data/step_packed_train_tokens"
         )
         non_padding_tokens = _required_step_values(
             by_step, window_steps, "data/step_non_padding_train_tokens"
         )
-        train_capacity_tokens = [
-            self._effective_train_capacity_tokens(
-                packed_sequences=int(round(packed_sequences)),
-                train_tokens=train_tokens,
-            )
-            for packed_sequences, train_tokens in zip(
-                step_packed_sequences, raw_train_capacity_tokens
-            )
-        ]
-        discarded_stale = sum(step_values("discarded/step/stale_groups"))
-        generated_groups = sum(groups) + discarded_stale
         vllm_metrics = [
             rec
             for rec in self.metrics
@@ -251,55 +202,21 @@ class PipelineAutotuner:
             by_step=by_step,
             window_steps=window_steps,
         )
-        vllm_load = _vllm_load_stats(vllm_metrics, window_start_s=t0, window_end_s=t1)
         return TunerWindowStats(
             start_step=window_steps[0],
             end_step=window_steps[-1],
             window_start_s=t0,
             window_end_s=t1,
-            score_mean=_mean(
-                _required_step_values(by_step, window_steps, "objective/score")
-            ),
-            accepted_tok_per_s_mean=_mean(
-                _required_step_values(
-                    by_step, window_steps, "throughput/accepted_train_tok_per_s"
-                )
-            ),
-            trainer_idle_frac=trainer_idle_frac,
-            trainer_load_score=_trainer_load_score(
+            trainer_underfeed_score=_trainer_underfeed_score(
                 idle_frac=trainer_idle_frac,
                 padding_ratio=padding_ratio_mean,
             ),
-            vllm_capacity_wait_frac=vllm_load.capacity_wait_frac,
-            vllm_active_frac=vllm_load.active_frac,
-            vllm_capacity_wait_request_s=vllm_load.capacity_wait_request_s,
-            vllm_running_request_s=vllm_load.running_request_s,
-            vllm_pressure=vllm_load.pressure,
-            vllm_capacity_wait_area=vllm_load.capacity_wait_area,
-            vllm_running_area=vllm_load.running_area,
-            vllm_idle_frac=vllm_load.idle_frac,
-            vllm_max_num_seqs_mean=vllm_load.max_num_seqs_mean,
-            queue_put_wait_frac=_mean(step_values("queue/put_wait_frac")),
-            stale_frac=(discarded_stale / generated_groups)
-            if generated_groups > 0
-            else 0.0,
-            predicted_stale_frac=_mean(step_values("queue/predicted_stale_fraction")),
-            queue_freshness_pressure=_mean(step_values("queue/freshness_pressure")),
-            token_weighted_policy_age_steps_mean=_mean(
-                _required_step_values(
-                    by_step, window_steps, "offpolicy/token_weighted_policy_age_steps"
-                )
+            vllm_pressure=_vllm_pressure(
+                vllm_metrics, window_start_s=t0, window_end_s=t1
             ),
-            freshness_discount_mean=_mean(
-                step_values("sample_efficiency/freshness_discount")
-            )
-            or 1.0,
+            queue_put_wait_frac=_mean(step_values("queue/put_wait_frac")),
+            predicted_stale_frac=_mean(step_values("queue/predicted_stale_fraction")),
             padding_ratio_mean=padding_ratio_mean,
-            groups_per_step_mean=_mean(groups),
-            step_wall_s_mean=_mean(wall_values),
-            collect_batch_s_mean=_mean(collect_values),
-            train_work_s_mean=max(0.0, _mean(wall_values) - _mean(collect_values)),
-            train_capacity_tokens_mean=_mean(train_capacity_tokens),
         )
 
     def _record_packing_outcomes(
@@ -311,8 +228,6 @@ class PipelineAutotuner:
         required = {
             "data/step_num_groups_trainable",
             "data/step_packed_sequences",
-            "data/step_packed_train_tokens",
-            "data/step_non_padding_train_tokens",
         }
         for step in window_steps:
             if step in self._packing_outcome_steps:
@@ -328,26 +243,11 @@ class PipelineAutotuner:
             if groups <= 0:
                 continue
             packed_sequences = int(round(values["data/step_packed_sequences"].value))
-            train_tokens = self._effective_train_capacity_tokens(
-                packed_sequences=packed_sequences,
-                train_tokens=float(values["data/step_packed_train_tokens"].value),
-            )
-            if train_tokens <= 0.0:
-                raise RuntimeError(
-                    "Pipeline autotuning requires positive "
-                    "data/step_packed_train_tokens "
-                    f"at step {step}."
-                )
-            non_padding_tokens = values["data/step_non_padding_train_tokens"].value
-            padding_ratio = max(0.0, (train_tokens - non_padding_tokens) / train_tokens)
             self._packing_outcomes.append(
                 PackingOutcome(
                     step=step,
                     groups=groups,
                     packed_sequences=packed_sequences,
-                    padding_ratio=min(1.0, padding_ratio),
-                    non_padding_tokens=non_padding_tokens,
-                    train_tokens=train_tokens,
                 )
             )
             self._packing_outcome_steps.add(step)
@@ -364,8 +264,12 @@ class PipelineAutotuner:
 
     def _decide(self, stats: TunerWindowStats) -> TunerDecision:
         inference_over = stats.vllm_pressure > self.config.vllm_pressure_over_ratio
-        trainer_under = stats.trainer_load_score > self.config.trainer_load_under_score
-        trainer_over = stats.trainer_load_score <= self.config.trainer_load_over_score
+        trainer_under = (
+            stats.trainer_underfeed_score > self.config.trainer_load_under_score
+        )
+        trainer_over = (
+            stats.trainer_underfeed_score <= self.config.trainer_load_over_score
+        )
         inference_under = (
             not inference_over
             and stats.vllm_pressure <= self.config.vllm_pressure_under_ratio
@@ -462,7 +366,8 @@ class PipelineAutotuner:
     ) -> tuple[PipelineTuneSettings, str, str] | None:
         if (
             action != "increase_workers"
-            and stats.trainer_load_score > self.config.trainer_min_batch_lower_score
+            and stats.trainer_underfeed_score
+            > self.config.trainer_min_batch_lower_score
         ):
             floor = max(
                 1,
@@ -533,10 +438,10 @@ class PipelineAutotuner:
         vllm_saturated = stats.vllm_pressure > self.config.vllm_pressure_over_ratio
         vllm_underloaded = stats.vllm_pressure <= self.config.vllm_pressure_under_ratio
         trainer_severely_underloaded = (
-            stats.trainer_load_score >= self.config.trainer_load_severe_under_score
+            stats.trainer_underfeed_score >= self.config.trainer_load_severe_under_score
         )
         trainer_saturated = (
-            stats.trainer_load_score <= self.config.trainer_load_over_score
+            stats.trainer_underfeed_score <= self.config.trainer_load_over_score
         )
         recommendations: list[tuple[str, str]] = []
         if vllm_saturated and trainer_severely_underloaded:
@@ -602,7 +507,7 @@ class PipelineAutotuner:
         # Packed sequence length is the user's cap on target/max batch size. If a
         # run should never use larger train batches, lower packed_sequence_length.
         queue = recommended_queue_size(
-            target_groups_per_step=min_batch,
+            target_groups_per_step=target,
             limit_steps_off_policy=self.policy_age_limit_steps,
             num_rollout_workers=settings.num_rollout_workers,
             running_reserve_fraction=self.config.queue_running_reserve_fraction,
@@ -615,20 +520,6 @@ class PipelineAutotuner:
                 "queue_maxsize": queue,
             }
         )
-
-    def _effective_packed_slots(self, packed_sequences: int) -> int:
-        sequences = max(1, int(packed_sequences))
-        target = self.target_packed_sequences
-        return int(math.ceil(sequences / target) * target)
-
-    def _effective_train_capacity_tokens(
-        self, *, packed_sequences: int, train_tokens: float
-    ) -> float:
-        sequences = max(1, int(packed_sequences))
-        if train_tokens <= 0.0:
-            return float(train_tokens)
-        sequence_length = float(train_tokens) / sequences
-        return sequence_length * self._effective_packed_slots(sequences)
 
     def _adaptive_target_groups(
         self, settings: PipelineTuneSettings, stats: TunerWindowStats | None
@@ -663,12 +554,6 @@ class PipelineAutotuner:
                     ),
                 ),
             )
-        selected_projection = next(
-            (projection for projection in projections if projection.groups == observed),
-            None,
-        )
-        if selected_projection is not None:
-            self._record_selected_packing_projection(stats, selected_projection)
         min_delta = max(
             1, math.ceil(current * self.config.target_group_min_relative_change)
         )
@@ -729,49 +614,18 @@ class PipelineAutotuner:
                 return existing
             rng = random.Random((stats.end_step << 32) ^ groups)
             spills = 0.0
-            marginal_tokens: list[float] = []
-            padding_ratios: list[float] = []
             for _ in range(self.config.packing_trials):
                 selected = rng.sample(range(len(reservoir)), groups)
-                before = pool.estimate(
-                    selected[:-1], seq_len=self.packed_sequence_length
-                )
                 after = pool.estimate(selected, seq_len=self.packed_sequence_length)
                 spills += float(after.packed_sequences > self.target_packed_sequences)
-                marginal_tokens.append(
-                    float(after.non_padding_tokens - before.non_padding_tokens)
-                )
-                capacity = float(
-                    self._effective_packed_slots(after.packed_sequences)
-                    * self.packed_sequence_length
-                )
-                padding_ratios.append(
-                    max(0.0, (capacity - after.non_padding_tokens) / capacity)
-                )
             trials = float(self.config.packing_trials)
             counterfactual_risk = self._packing_probability_upper(
                 events=spills,
                 trials=trials,
             )
-            history_risk = history_risks[groups]
             projection = PackingProjection(
                 groups=groups,
-                spill_probability=max(
-                    counterfactual_risk,
-                    history_risk.spill_probability_upper,
-                ),
-                expected_padding_ratio=_mean(padding_ratios),
-                counterfactual_trials=trials,
-                counterfactual_spills=spills,
-                counterfactual_spill_probability_upper=counterfactual_risk,
-                marginal_tokens_mean=_mean(marginal_tokens),
-                history_spill_probability_upper=history_risk.spill_probability_upper,
-                history_trials=history_risk.trials,
-                history_spills=history_risk.spills,
-                history_bad_padding_events=history_risk.bad_padding_events,
-                history_bad_padding_probability_upper=(
-                    history_risk.bad_padding_probability_upper
-                ),
+                spill_probability=max(counterfactual_risk, history_risks[groups]),
             )
             projections[groups] = projection
             return projection
@@ -836,10 +690,8 @@ class PipelineAutotuner:
                 break
         return selected
 
-    def _packing_history_risks(
-        self, groups_range: range
-    ) -> dict[int, PackingHistoryRisk]:
-        risks: dict[int, PackingHistoryRisk] = {}
+    def _packing_history_risks(self, groups_range: range) -> dict[int, float]:
+        risks: dict[int, float] = {}
         for groups in groups_range:
             outcomes = [
                 outcome
@@ -854,46 +706,25 @@ class PipelineAutotuner:
                     if outcome.packed_sequences > self.target_packed_sequences
                 )
             )
-            bad_padding_events = float(
-                sum(
-                    1
-                    for outcome in outcomes
-                    if outcome.padding_ratio >= self.config.packing_bad_padding_ratio
-                )
-            )
             # Zero-spill samples are useful diagnostics but should not block exploration:
             # a beta upper bound with sparse clean samples would make target batches
             # sticky. Actual spills are the hard signal we carry across the horizon.
-            risks[groups] = PackingHistoryRisk(
-                groups=groups,
-                trials=trials,
-                spills=spills,
-                spill_probability_upper=self._packing_probability_upper(
-                    events=spills, trials=trials
-                )
+            risks[groups] = (
+                self._packing_probability_upper(events=spills, trials=trials)
                 if spills > 0.0
-                else 0.0,
-                bad_padding_events=bad_padding_events,
-                bad_padding_probability_upper=self._packing_probability_upper(
-                    events=bad_padding_events, trials=trials
-                )
-                if bad_padding_events > 0.0
-                else 0.0,
+                else 0.0
             )
         inherited_spill_probability = 0.0
         for groups in sorted(risks):
             inherited_spill_probability = max(
-                inherited_spill_probability, risks[groups].spill_probability_upper
+                inherited_spill_probability, risks[groups]
             )
-            if inherited_spill_probability > risks[groups].spill_probability_upper:
-                risks[groups] = risks[groups].model_copy(
-                    update={
-                        "spill_probability_upper": inherited_spill_probability,
-                    }
-                )
+            risks[groups] = inherited_spill_probability
         return risks
 
     def _packing_probability_upper(self, *, events: float, trials: float) -> float:
+        from scipy.stats import beta as beta_distribution
+
         non_events = max(0.0, trials - events)
         value = float(
             beta_distribution.ppf(
@@ -905,27 +736,6 @@ class PipelineAutotuner:
         if not math.isfinite(value):
             raise RuntimeError("Failed to compute packing spill beta posterior.")
         return max(0.0, min(1.0, value))
-
-    @staticmethod
-    def _record_selected_packing_projection(
-        stats: TunerWindowStats, projection: PackingProjection
-    ) -> None:
-        stats.packing_history_groups = projection.groups
-        stats.packing_history_trials = projection.history_trials
-        stats.packing_history_spills = projection.history_spills
-        stats.packing_history_spill_probability_upper = (
-            projection.history_spill_probability_upper
-        )
-        stats.packing_history_bad_padding_events = projection.history_bad_padding_events
-        stats.packing_history_bad_padding_probability_upper = (
-            projection.history_bad_padding_probability_upper
-        )
-        stats.packing_counterfactual_trials = projection.counterfactual_trials
-        stats.packing_counterfactual_spills = projection.counterfactual_spills
-        stats.packing_counterfactual_spill_probability_upper = (
-            projection.counterfactual_spill_probability_upper
-        )
-        stats.packing_marginal_tokens_mean = projection.marginal_tokens_mean
 
     def profile(self) -> PipelineAutotunerProfile:
         return PipelineAutotunerProfile(
@@ -1007,15 +817,10 @@ def recommended_queue_size(
     return max(lower, min(max_completed, max_completed - running_reserve))
 
 
-def _vllm_load_stats(
+def _vllm_pressure(
     metrics: list[PipelineMetric], *, window_start_s: float, window_end_s: float
-) -> VllmLoadStats:
-    wanted = {
-        "vllm/num_requests_running",
-        "vllm/num_requests_waiting",
-        "vllm/num_requests_waiting_capacity",
-        "vllm/max_num_seqs",
-    }
+) -> float:
+    wanted = {"vllm/num_requests_running", "vllm/num_requests_waiting_capacity"}
     rows: list[tuple[float, str, float]] = []
     for rec in metrics:
         if rec.name in wanted and math.isfinite(rec.value):
@@ -1023,30 +828,11 @@ def _vllm_load_stats(
     if not rows:
         raise RuntimeError("Pipeline autotuning requires vLLM runtime metric samples.")
     by_time = _group_vllm_metric_rows(rows)
-    samples: list[tuple[float, float, float, float]] = []
-    complete_times: list[float] = []
-    for t_s, values in by_time.items():
-        if not {
-            "vllm/num_requests_running",
-            "vllm/num_requests_waiting",
-            "vllm/num_requests_waiting_capacity",
-        }.issubset(values):
-            continue
-        complete_times.append(t_s)
-        samples.append(
-            (
-                values["vllm/num_requests_running"],
-                values["vllm/num_requests_waiting"],
-                values["vllm/num_requests_waiting_capacity"],
-                values.get("vllm/max_num_seqs", 0.0),
-            )
-        )
-    if not samples:
+    times = sorted(t_s for t_s, values in by_time.items() if wanted <= values.keys())
+    if not times:
         raise RuntimeError(
-            "Pipeline autotuning requires complete vLLM running/waiting/capacity "
-            "samples in each decision window."
+            "Pipeline autotuning requires complete vLLM running/capacity samples."
         )
-    times = sorted(complete_times)
     capacity_wait_request_s = 0.0
     running_request_s = 0.0
     total_s = 0.0
@@ -1071,46 +857,8 @@ def _vllm_load_stats(
     if total_s <= 0.0:
         raise RuntimeError("Pipeline autotuning requires nonzero vLLM sample duration.")
     if running_request_s > 0.0:
-        pressure = capacity_wait_request_s / running_request_s
-    elif capacity_wait_request_s > 0.0:
-        pressure = math.inf
-    else:
-        pressure = 0.0
-    max_num_seqs_values = [
-        max_num_seqs for _, _, _, max_num_seqs in samples if max_num_seqs > 0
-    ]
-    return VllmLoadStats(
-        capacity_wait_frac=_mean(
-            [1.0 if wait_capacity > 0 else 0.0 for _, _, wait_capacity, _ in samples]
-        ),
-        active_frac=_mean(
-            [1.0 if running > 0 else 0.0 for running, _, _, _ in samples]
-        ),
-        capacity_wait_request_s=capacity_wait_request_s,
-        running_request_s=running_request_s,
-        pressure=pressure,
-        capacity_wait_area=_mean(
-            [
-                max(0.0, wait_capacity) / max_num_seqs
-                for _, _, wait_capacity, max_num_seqs in samples
-                if max_num_seqs > 0
-            ]
-        ),
-        running_area=_mean(
-            [
-                max(0.0, running) / max_num_seqs
-                for running, _, _, max_num_seqs in samples
-                if max_num_seqs > 0
-            ]
-        ),
-        idle_frac=_mean(
-            [
-                1.0 if running <= 0 and waiting <= 0 else 0.0
-                for running, waiting, _, _ in samples
-            ]
-        ),
-        max_num_seqs_mean=_mean(max_num_seqs_values),
-    )
+        return capacity_wait_request_s / running_request_s
+    return math.inf if capacity_wait_request_s > 0.0 else 0.0
 
 
 def _group_vllm_metric_rows(

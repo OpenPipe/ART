@@ -27,6 +27,11 @@ from .tokenize import TokenizedResult
 DEFAULT_MIN_PREFIX_TREE_SHARED_SEGMENT_LENGTH = 64
 
 
+class PrefixTreePackingStats(TypedDict):
+    logical_tokens: int
+    physical_tokens: int
+
+
 class PackedTensors(TypedDict):
     tokens: torch.Tensor
     group_ids: torch.Tensor
@@ -39,6 +44,8 @@ class PackedTensors(TypedDict):
     pixel_values: list[torch.Tensor | None]
     image_grid_thw: list[torch.Tensor | None]
     moe_routing_replay: PackedMoeRoutingReplay | None
+    prefix_tree_packing_stats: NotRequired[PrefixTreePackingStats]
+    original_logprobs: NotRequired[torch.Tensor]
 
 
 class DiskPackedTensors(TypedDict):
@@ -76,7 +83,7 @@ class _PrefixTreePackItem(NamedTuple):
     shareable_length: int
     pixel_values: torch.Tensor | None
     image_grid_thw: torch.Tensor | None
-    moe_routes: Any | None
+    moe_routes: MoeRouteArray | MoeRouteSegments | None
 
 
 class _PrefixTreeRowPlan(NamedTuple):
@@ -383,6 +390,10 @@ def prefix_tree_pack(
         "pixel_values": pixel_values,
         "image_grid_thw": image_grid_thw,
         "moe_routing_replay": None,
+        "prefix_tree_packing_stats": {
+            "logical_tokens": sum(len(item.token_ids) for item in items),
+            "physical_tokens": sum(plan.length for plan in row_plans),
+        },
     }
     if include_moe_routing:
         assert route_tensor_np is not None and route_mask_np is not None
@@ -735,6 +746,7 @@ def _materialize_prefix_tree_row(
         if include_moe_routing:
             assert route_tensor is not None and route_mask is not None
             assert route_shape is not None
+            assert item.moe_routes is not None
             _copy_moe_route_slice(
                 route_tensor=route_tensor,
                 route_mask=route_mask,
@@ -881,7 +893,7 @@ def _first_item_moe_route_shape(
     return None
 
 
-def _moe_route_shape(raw: Any) -> tuple[int, int] | None:
+def _moe_route_shape(raw: MoeRouteArray | MoeRouteSegments) -> tuple[int, int] | None:
     if isinstance(raw, MoeRouteSegments):
         return int(raw.shape[1]), int(raw.shape[2])
     routes = _coerce_moe_routes(raw)
@@ -890,21 +902,10 @@ def _moe_route_shape(raw: Any) -> tuple[int, int] | None:
     return int(routes.shape[1]), int(routes.shape[2])
 
 
-def _coerce_moe_routes(raw: Any) -> MoeRouteArray:
-    if isinstance(raw, np.ndarray):
-        routes = raw.astype(np.int32, copy=False)
-    elif isinstance(raw, list):
-        first = next((route for route in raw if route is not None), None)
-        if first is None:
-            raise RuntimeError("No MoE routes were packed")
-        routes = np.full(
-            (len(raw), len(first), len(first[0])), MISSING_EXPERT_ID, dtype=np.int32
-        )
-        for index, route in enumerate(raw):
-            if route is not None:
-                routes[index] = route
-    else:
+def _coerce_moe_routes(raw: MoeRouteArray | MoeRouteSegments) -> MoeRouteArray:
+    if not isinstance(raw, np.ndarray):
         raise RuntimeError(f"Expected MoE routes array, got {type(raw)}")
+    routes = np.asarray(raw, dtype=np.int32)
     if routes.ndim != 3 or routes.shape[1] <= 0 or routes.shape[2] <= 0:
         raise RuntimeError(f"Packed MoE routes must be rank 3, got {routes.shape}")
     return routes
@@ -917,7 +918,7 @@ def _copy_moe_route_slice(
     dst_start: int,
     src_start: int,
     src_end: int,
-    raw_routes: Any,
+    raw_routes: MoeRouteArray | MoeRouteSegments,
     route_shape: tuple[int, int],
 ) -> None:
     if src_end <= src_start:
@@ -990,7 +991,7 @@ def _copy_source_moe_route(
     route_mask: np.ndarray,
     dst_index: int,
     source_index: int,
-    raw_routes: Any,
+    raw_routes: MoeRouteArray | MoeRouteSegments,
     route_shape: tuple[int, int],
 ) -> int:
     if isinstance(raw_routes, MoeRouteSegments):

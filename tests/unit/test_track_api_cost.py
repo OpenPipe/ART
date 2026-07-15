@@ -1,4 +1,5 @@
 import asyncio
+from contextlib import asynccontextmanager
 import json
 from pathlib import Path
 from unittest.mock import MagicMock
@@ -693,6 +694,12 @@ class TestTrackApiCostIntegration:
         backend = MagicMock()
         observed_contexts: list[str] = []
 
+        @asynccontextmanager
+        async def exact_adapter_lease(*_args: object):
+            yield
+
+        backend.exact_adapter_lease = exact_adapter_lease
+
         @track_api_cost(
             source="llm_judge/correctness",
             provider="openai",
@@ -720,10 +727,17 @@ class TestTrackApiCostIntegration:
                 )
             ]
 
+        async def rollout_fn(
+            _model: TrainableModel,
+            _scenario: dict,
+            _config: dict,
+        ) -> TrajectoryGroup:
+            return TrajectoryGroup([])
+
         trainer = PipelineTrainer(
             model=model,
             backend=backend,
-            rollout_fn=lambda *_args, **_kwargs: asyncio.sleep(0),
+            rollout_fn=rollout_fn,
             scenarios=[],
             config={},
             pipeline=PipelineRuntimeConfig(

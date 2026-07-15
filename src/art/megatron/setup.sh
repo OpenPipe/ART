@@ -2,8 +2,7 @@
 set -euo pipefail
 
 export CUDA_HOME="${CUDA_HOME:-/usr/local/cuda-12.8}"
-export TORCH_CUDA_ARCH_LIST="${TORCH_CUDA_ARCH_LIST:-9.0}"
-# Install missing cudnn headers, DeepEP RDMA headers, and ninja build tools.
+# Install missing cuDNN headers, HybridEP RDMA headers, and Ninja build tools.
 missing_packages=()
 for package in libcudnn9-headers-cuda-12 libibverbs-dev ninja-build; do
     if ! dpkg-query -W "${package}" >/dev/null 2>&1; then
@@ -35,6 +34,7 @@ if [ -x "${HOME}/.local/bin/uv" ]; then
     uv_bin="${HOME}/.local/bin/uv"
 fi
 "${uv_bin}" sync --extra megatron --frozen --active
+"${uv_bin}" run --active --frozen --no-sync python -m art.megatron.hybrid_ep_setup
 
 if [ "${INSTALL_VLLM_RUNTIME:-true}" = "true" ]; then
     "${uv_bin}" sync --project vllm_runtime --frozen --no-dev

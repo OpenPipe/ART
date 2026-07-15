@@ -335,12 +335,20 @@ def test_build_megatron_runtime_uses_training_provider_bundle(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     calls: list[dict[str, Any]] = []
+    configured_bundles: list[tuple[Any, bool]] = []
     runtime = SimpleNamespace(provider="provider", model=["model"])
 
     monkeypatch.setattr(
         hf_parity_worker_module.megatron_train,
         "build_training_runtime",
         lambda **kwargs: calls.append(kwargs) or runtime,
+    )
+    monkeypatch.setattr(
+        hf_parity_worker_module,
+        "_configure_hf_parity_provider_bundle",
+        lambda provider_bundle, *, use_hf_reference_state: configured_bundles.append(
+            (provider_bundle, use_hf_reference_state)
+        ),
     )
 
     request = HfParityRunRequest(
@@ -367,10 +375,9 @@ def test_build_megatron_runtime_uses_training_provider_bundle(
     kwargs = calls[0]
     assert kwargs["model_identifier"] == "Qwen/Qwen3.5-35B-A3B"
     assert kwargs["provider_torch_dtype"] == torch.float32
-    assert (
-        kwargs["provider_bundle_configure"]
-        is hf_parity_worker_module._install_bridge_timing_debug
-    )
+    provider_bundle = SimpleNamespace()
+    kwargs["provider_bundle_configure"](provider_bundle)
+    assert configured_bundles == [(provider_bundle, False)]
     assert kwargs["print_env"] is False
     assert kwargs["trainable_parameter_mode"] == "base_model"
     configured_provider = SimpleNamespace()

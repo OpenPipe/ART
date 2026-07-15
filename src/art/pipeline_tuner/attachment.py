@@ -327,7 +327,7 @@ class PipelineAutotunerAttachment:
         return settings.model_copy(
             update={
                 "queue_maxsize": recommended_queue_size(
-                    target_groups_per_step=settings.min_batch_size,
+                    target_groups_per_step=settings.target_groups_per_step,
                     limit_steps_off_policy=policy_age_limit_steps,
                     num_rollout_workers=settings.num_rollout_workers,
                     running_reserve_fraction=self.config.queue_running_reserve_fraction,

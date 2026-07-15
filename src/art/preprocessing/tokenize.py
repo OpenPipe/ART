@@ -7,7 +7,7 @@ from itertools import takewhile
 import json
 import math
 import random
-from typing import TYPE_CHECKING, Any, Generator, Literal, cast
+from typing import TYPE_CHECKING, Any, Generator, Literal, Protocol, cast
 
 import numpy as np
 from openai.types.chat.chat_completion import Choice
@@ -25,12 +25,15 @@ from ..utils.chat_template import (
 )
 from .moe_routing import (
     MoeRouteArray,
-    MoeRouteDecodeCache,
     MoeRouteSegments,
     MoeRoutingAlignmentStats,
     align_choice_routes_to_tokenized_result,
 )
-from .response_masking import response_only_labels, token_ids_for_template_part
+from .response_masking import (
+    _TemplatePartTokenizer,
+    response_only_labels,
+    token_ids_for_template_part,
+)
 from .vllm_tokens import choice_vllm_token_metadata
 
 ChatTemplateTool = dict[Any, Any] | Callable[..., Any]
@@ -55,8 +58,20 @@ def _slice_moe_routes(
     return routes[start:]
 
 
+class _TokenDecoder(Protocol):
+    def decode(self, token_ids: int, /) -> str | list[str]: ...
+
+
+class _SFTTokenizer(_TemplatePartTokenizer, Protocol):
+    @property
+    def chat_template(self) -> object: ...
+
+    @property
+    def apply_chat_template(self) -> Callable[..., object]: ...
+
+
 def _chat_template_kwargs(
-    tokenizer: PreTrainedTokenizerBase,
+    tokenizer: _SFTTokenizer,
     chat_template_kwargs: dict[str, Any] | None,
 ) -> dict[str, Any]:
     return merge_chat_template_kwargs(
@@ -114,7 +129,7 @@ def _normalize_tools_for_chat_template(
 
 
 def _normalize_tool_call_arguments_for_chat_template(
-    tokenizer: PreTrainedTokenizerBase,
+    tokenizer: _SFTTokenizer,
     messages: list[dict[str, Any]],
 ) -> list[dict[str, Any]]:
     chat_template = tokenizer.chat_template
@@ -148,7 +163,7 @@ def _normalize_tool_call_arguments_for_chat_template(
 
 
 def _messages_for_chat_template(
-    tokenizer: PreTrainedTokenizerBase,
+    tokenizer: _SFTTokenizer,
     messages_and_choices: MessagesAndChoices,
     *,
     final_trainable_choice_index: int | None = None,
@@ -180,7 +195,7 @@ class TokenizedResult:
     trajectory: Trajectory
     choice_offsets: list[int]
     extra_logprobs: dict[str, list[float]]
-    _tokenizer: "PreTrainedTokenizerBase" = field(repr=False, compare=False)
+    _tokenizer: _TokenDecoder = field(repr=False, compare=False)
     moe_routed_experts: MoeRouteArray | MoeRouteSegments | None = None
     moe_routing_alignment_stats: MoeRoutingAlignmentStats | None = None
     weight: float = 0.0
@@ -189,9 +204,13 @@ class TokenizedResult:
 
     @cached_property
     def tokens(self) -> list[str]:
-        return [
-            cast(str, self._tokenizer.decode(token_id)) for token_id in self.token_ids
-        ]
+        tokens: list[str] = []
+        for token_id in self.token_ids:
+            token = self._tokenizer.decode(token_id)
+            if not isinstance(token, str):
+                raise TypeError("decoding one token must return one string")
+            tokens.append(token)
+        return tokens
 
     def without_prompt(self) -> "TokenizedResult":
         return TokenizedResult(
@@ -249,7 +268,7 @@ def _validate_max_seq_length(max_seq_length: int | None) -> None:
 
 
 def _apply_chat_template_token_ids(
-    tokenizer: PreTrainedTokenizerBase,
+    tokenizer: _SFTTokenizer,
     messages: list[dict[str, Any]],
     **kwargs: Any,
 ) -> list[int]:
@@ -263,6 +282,60 @@ def _apply_chat_template_token_ids(
         assert len(output) == 1
         output = output[0]
     return cast(list[int], output)
+
+
+def _apply_chat_template_text(
+    tokenizer: _SFTTokenizer,
+    messages: list[dict[str, Any]],
+    **kwargs: Any,
+) -> str:
+    output = tokenizer.apply_chat_template(
+        messages,
+        tokenize=False,
+        **kwargs,
+    )
+    if not isinstance(output, str):
+        raise TypeError("Expected the chat template to render one string")
+    return output
+
+
+def _last_assistant_input_ids_and_labels(
+    tokenizer: _SFTTokenizer,
+    messages: list[dict[str, Any]],
+    tools: list[ChatTemplateTool] | None,
+    template_kwargs: dict[str, Any],
+) -> tuple[list[int], list[int]]:
+    if not messages or messages[-1].get("role") != "assistant":
+        raise ValueError(
+            "assistant_turns='last' requires the final message to be an assistant"
+        )
+
+    prompt_text = _apply_chat_template_text(
+        tokenizer,
+        messages[:-1],
+        tools=tools,
+        add_generation_prompt=True,
+        **template_kwargs,
+    )
+    completed_text = _apply_chat_template_text(
+        tokenizer,
+        messages,
+        tools=tools,
+        add_generation_prompt=False,
+        **template_kwargs,
+    )
+    if not completed_text.startswith(prompt_text):
+        raise ValueError(
+            "Cannot isolate the final assistant response because the completed chat "
+            "does not extend its generation prompt"
+        )
+
+    target_text = completed_text[len(prompt_text) :]
+    prompt_ids = token_ids_for_template_part(tokenizer, prompt_text)
+    target_ids = token_ids_for_template_part(tokenizer, target_text)
+    input_ids = [*prompt_ids, *target_ids]
+    labels = [-100] * len(prompt_ids) + target_ids
+    return input_ids, labels
 
 
 def _choice_logprobs(
@@ -319,7 +392,6 @@ def _tokenized_result_from_vllm_choices(
     choice_token_logprobs: list[list[Any]],
     advantage: float,
     trajectory: Trajectory,
-    route_decode_cache: MoeRouteDecodeCache | None = None,
 ) -> TokenizedResult:
     moe_routed_experts, moe_routing_alignment_stats = (
         align_choice_routes_to_tokenized_result(
@@ -327,7 +399,6 @@ def _tokenized_result_from_vllm_choices(
             choices=choices,
             choice_offsets=choice_offsets,
             choice_token_lengths=choice_token_lengths,
-            route_decode_cache=route_decode_cache,
         )
     )
     return TokenizedResult(
@@ -359,7 +430,6 @@ def tokenize_vllm_trajectory_histories(
     advantage: float,
     allow_training_without_logprobs: bool,
     trajectory: Trajectory,
-    route_decode_cache: MoeRouteDecodeCache | None = None,
 ) -> list[TokenizedResult]:
     results: list[TokenizedResult] = []
     token_ids: list[int] = []
@@ -387,7 +457,6 @@ def tokenize_vllm_trajectory_histories(
                 choice_token_logprobs=choice_token_logprobs,
                 advantage=advantage,
                 trajectory=trajectory,
-                route_decode_cache=route_decode_cache,
             )
         )
         token_ids = []
@@ -457,7 +526,6 @@ def tokenize_trajectory_groups(
     chat_template_kwargs: dict[str, Any] | None = None,
     chat_template_tool_schema_format: ChatTemplateToolSchemaFormat = "default",
 ) -> Generator["TokenizedResult", None, None]:
-    route_decode_cache: MoeRouteDecodeCache = {}
     for group in trajectory_groups:
         if not group:
             continue
@@ -487,7 +555,6 @@ def tokenize_trajectory_groups(
                 advantage=advantage,
                 allow_training_without_logprobs=allow_training_without_logprobs,
                 trajectory=trajectory,
-                route_decode_cache=route_decode_cache,
             )
             weight = 1 / (
                 sum(sum(result.assistant_mask) for result in trajectory_results) + 1e-6
@@ -563,12 +630,13 @@ def tokenize_trajectory(
 def tokenize_sft_batch(
     trajectory_batch: list[Trajectory],
     learning_rate: float,
-    tokenizer: PreTrainedTokenizerBase,
+    tokenizer: _SFTTokenizer,
     instruction_part: str,
     response_part: str,
     chat_template_kwargs: dict[str, Any] | None = None,
     chat_template_tool_schema_format: ChatTemplateToolSchemaFormat = "default",
     max_seq_length: int | None = None,
+    assistant_turns: Literal["all", "last"] = "all",
 ) -> SFTBatch:
     """Tokenize a single batch of trajectories for SFT.
 
@@ -580,6 +648,7 @@ def tokenize_sft_batch(
         response_part: Response template part (e.g., "<|im_start|>assistant")
         max_seq_length: Optional maximum tokenized trajectory length. Trajectories
             longer than this limit are dropped before tensors are created.
+        assistant_turns: Whether to train every assistant turn or only the final one.
 
     Returns:
         SFTBatch object for this batch
@@ -604,26 +673,33 @@ def tokenize_sft_batch(
         )
         template_kwargs = _chat_template_kwargs(tokenizer, chat_template_kwargs)
 
-        # Single-step tokenization: apply_chat_template with tokenize=True
-        input_ids = _apply_chat_template_token_ids(
-            tokenizer,
-            messages,
-            tools=tools,
-            tokenize=True,
-            add_generation_prompt=False,
-            **template_kwargs,
-        )
+        if assistant_turns == "last":
+            input_ids, labels = _last_assistant_input_ids_and_labels(
+                tokenizer,
+                messages,
+                tools,
+                template_kwargs,
+            )
+        else:
+            # Preserve the existing response-marker behavior for all assistant turns.
+            input_ids = _apply_chat_template_token_ids(
+                tokenizer,
+                messages,
+                tools=tools,
+                tokenize=True,
+                add_generation_prompt=False,
+                **template_kwargs,
+            )
+            labels = response_only_labels(
+                input_ids,
+                instruction_ids=instruction_ids,
+                response_ids=response_ids,
+            )
         if max_seq_length is not None and len(input_ids) > max_seq_length:
             num_dropped_trajectories += 1
             continue
 
         attention_mask = [1] * len(input_ids)
-
-        labels = response_only_labels(
-            input_ids,
-            instruction_ids=instruction_ids,
-            response_ids=response_ids,
-        )
 
         trajectory_tensors.append(
             {

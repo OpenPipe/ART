@@ -11,8 +11,20 @@ import math
 import os
 from pathlib import Path
 import signal
+import sys
 import time
-from typing import Any, AsyncIterator, Generic, Iterable, TypeVar, cast
+from typing import (
+    Any,
+    AsyncIterator,
+    Generic,
+    Iterable,
+    Mapping,
+    Sequence,
+    TypeVar,
+    cast,
+)
+
+from typing_extensions import TypeIs
 
 T = TypeVar("T")
 
@@ -56,10 +68,18 @@ class _ScenarioSourceExhausted(Exception):
     pass
 
 
+def _is_eval_mapping(
+    result: Sequence[art.Trajectory | art.TrajectoryGroup]
+    | Mapping[str, Sequence[art.Trajectory | art.TrajectoryGroup]],
+) -> TypeIs[Mapping[str, Sequence[art.Trajectory | art.TrajectoryGroup]]]:
+    return isinstance(result, Mapping)
+
+
 def _to_async_iterator(iterable: Iterable[T] | AsyncIterator[T]) -> AsyncIterator[T]:
     """Convert a sync Iterable to an AsyncIterator, or pass through if already async."""
     if isinstance(iterable, AsyncIterator):
-        return iterable
+        # ty cannot currently preserve T through this runtime generic check.
+        return cast(AsyncIterator[T], iterable)
 
     async def _iter():
         for item in iterable:
@@ -154,7 +174,7 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
         eval_every_n_steps: int = 20,
         eval_at_start: bool = True,
         save_checkpoint: bool = True,
-        optimizer_save_interval: int | None = None,
+        optimizer_save_interval: int = 5,
         checkpoint_retention_strategy: CheckpointRetentionStrategy | None = None,
         checkpoint_retention_interval: int = 1,
         # Resumption
@@ -180,7 +200,7 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
             raise ValueError("limit_mean_steps_off_policy must be >= 0")
         if checkpoint_retention_interval <= 0:
             raise ValueError("checkpoint_retention_interval must be > 0")
-        if optimizer_save_interval is not None and optimizer_save_interval <= 0:
+        if optimizer_save_interval <= 0:
             raise ValueError("optimizer_save_interval must be > 0")
         if kl_penalty_step_lag is not None and kl_penalty_step_lag < 1:
             raise ValueError("kl_penalty_step_lag must be >= 1")
@@ -282,6 +302,12 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
         self.state.accepted_trainable_groups = int(
             pipeline_state.get("accepted_trainable_groups", 0) or 0
         )
+        self.state.discarded_stale_groups = int(
+            pipeline_state.get("discarded_stale_groups", 0) or 0
+        )
+        self.state.discarded_zero_variance_groups = int(
+            pipeline_state.get("discarded_zero_variance_groups", 0) or 0
+        )
         self.state.last_eval_step = last_eval_step
         self.state.completed_eval_steps = {
             int(step) for step in pipeline_state.get("completed_eval_steps", []) or []
@@ -294,23 +320,24 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
 
         try:
             await self._start_attachments()
-        except Exception:
-            await self._stop_attachments()
+        except BaseException as primary:
+            try:
+                await self._stop_attachments(training_failed=True)
+            except BaseException as cleanup:
+                raise BaseExceptionGroup(
+                    "Pipeline attachment startup and cleanup failed.",
+                    [primary, cleanup],
+                ) from None
             raise
 
         queue_maxsize = (
             self.queue_maxsize
             if self.queue_maxsize is not None
-            else max(1, self._freshness_queue_window() * self.max_batch_size)
+            else max(1, self._freshness_queue_window() * self.target_groups_per_step)
         )
         self._output_queue = asyncio.Queue(maxsize=queue_maxsize)
         self._eval_queue = asyncio.Queue()
 
-        if self.eval_fn is not None and self.eval_at_start:
-            await self._schedule_eval_step(start_step)
-            self._persist_state(start_step)
-
-        self._status.start(initial_step=start_step)
         loop = asyncio.get_running_loop()
         stop_requested = False
         installed_handlers: list[tuple[str, signal.Signals]] = []
@@ -327,33 +354,42 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
         def _sync_signal_handler(signum: int, _frame: object | None) -> None:
             _request_stop(signal.Signals(signum))
 
-        if handle_signals:
-            for sig in (signal.SIGINT, signal.SIGTERM):
-                original_handlers[sig] = signal.getsignal(sig)
-                try:
-                    loop.add_signal_handler(sig, _request_stop, sig)
-                    installed_handlers.append(("loop", sig))
-                except (NotImplementedError, RuntimeError):
-                    try:
-                        signal.signal(sig, _sync_signal_handler)
-                        installed_handlers.append(("signal", sig))
-                    except (ValueError, RuntimeError):
-                        continue
         training_failed = False
         try:
-            async with asyncio.TaskGroup() as tg:
-                tg.create_task(self._rollout_stage(), name="rollout_stage")
-                tg.create_task(self._training_stage(), name="training_stage")
-                tg.create_task(self._eval_stage(), name="eval_stage")
-                tg.create_task(self._status_loop(), name="status_loop")
-        except* Exception as eg:
-            training_failed = True
-            self.request_stop()
-            for exc in eg.exceptions:
-                if not isinstance(exc, asyncio.CancelledError):
-                    print(f"Pipeline stage failed: {exc}")
-            raise
+            if self.eval_fn is not None and self.eval_at_start:
+                await self._schedule_eval_step(start_step)
+                self._persist_state(start_step)
+
+            self._status.start(initial_step=start_step)
+            if handle_signals:
+                for sig in (signal.SIGINT, signal.SIGTERM):
+                    original_handlers[sig] = signal.getsignal(sig)
+                    try:
+                        loop.add_signal_handler(sig, _request_stop, sig)
+                        installed_handlers.append(("loop", sig))
+                    except (NotImplementedError, RuntimeError):
+                        try:
+                            signal.signal(sig, _sync_signal_handler)
+                            installed_handlers.append(("signal", sig))
+                        except (ValueError, RuntimeError):
+                            continue
+
+            try:
+                async with asyncio.TaskGroup() as tg:
+                    tg.create_task(self._rollout_stage(), name="rollout_stage")
+                    tg.create_task(self._training_stage(), name="training_stage")
+                    tg.create_task(self._eval_stage(), name="eval_stage")
+                    tg.create_task(self._status_loop(), name="status_loop")
+            except* Exception as eg:
+                training_failed = True
+                self.request_stop()
+                for exc in eg.exceptions:
+                    if not isinstance(exc, asyncio.CancelledError):
+                        print(f"Pipeline stage failed: {exc}")
+                raise
         finally:
+            primary_failure = sys.exception()
+            training_failed = training_failed or primary_failure is not None
             if handle_signals:
                 for mode, sig in installed_handlers:
                     if mode == "loop":
@@ -367,16 +403,31 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
                             signal.signal(sig, cast(signal.Handlers, previous))
                     except (ValueError, RuntimeError):
                         pass
-            attachment_failure: Exception | None = None
+            cleanup_failures: list[BaseException] = []
             try:
                 await self._stop_attachments(training_failed=training_failed)
-            except Exception as exc:
-                attachment_failure = exc
-            self._status.flush()
-            self._status.close()
-            await self._release_all_scheduled_eval_leases()
-            if attachment_failure is not None:
-                raise attachment_failure
+            except BaseException as exc:
+                cleanup_failures.append(exc)
+            for cleanup in (self._status.flush, self._status.close):
+                try:
+                    cleanup()
+                except BaseException as exc:
+                    cleanup_failures.append(exc)
+            try:
+                await self._release_all_scheduled_eval_leases()
+            except BaseException as exc:
+                cleanup_failures.append(exc)
+            if cleanup_failures:
+                if primary_failure is not None:
+                    raise BaseExceptionGroup(
+                        "Pipeline training and cleanup failed.",
+                        [primary_failure, *cleanup_failures],
+                    ) from None
+                if len(cleanup_failures) == 1:
+                    raise cleanup_failures[0]
+                raise BaseExceptionGroup(
+                    "Pipeline cleanup failed.", cleanup_failures
+                ) from None
 
     def request_stop(self) -> None:
         """Request a clean shutdown of the pipeline stages."""
@@ -420,14 +471,14 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
             await attachment.on_start(self)
 
     async def _stop_attachments(self, *, training_failed: bool = False) -> None:
-        failures: list[Exception] = []
+        failures: list[BaseException] = []
         for attachment in reversed(self._attachments):
             try:
                 await attachment.on_stop(training_failed=training_failed)
-            except Exception as exc:
+            except BaseException as exc:
                 failures.append(exc)
         if failures:
-            raise ExceptionGroup("Pipeline attachment cleanup failed.", failures)
+            raise BaseExceptionGroup("Pipeline attachment cleanup failed.", failures)
 
     async def _emit_pipeline_metric(
         self,
@@ -517,6 +568,13 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
         from art.dev.validate import is_dedicated_mode
         from art.local.backend import LocalBackend
 
+        if self.eval_fn is not None and not callable(
+            getattr(self.backend, "exact_adapter_lease", None)
+        ):
+            raise ValueError(
+                "PipelineTrainer eval requires a backend with exact checkpoint "
+                "inference leases."
+            )
         if not isinstance(self.backend, LocalBackend):
             return
 
@@ -528,6 +586,15 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
                 "a supported async PipelineTrainer path. Set both "
                 "trainer_gpu_ids and inference_gpu_ids on the TrainableModel "
                 "_internal_config to use LocalBackend with PipelineTrainer."
+            )
+        if (
+            self.eval_fn is not None
+            and model_config.get("tinker_args") is None
+            and model_config.get("rollout_weights_mode", "lora") != "lora"
+        ):
+            raise ValueError(
+                "PipelineTrainer eval requires rollout_weights_mode='lora' so "
+                "the requested checkpoint can remain immutable during eval."
             )
         if self.loss_fn not in {"cispo", "ppo"}:
             raise ValueError(
@@ -618,6 +685,12 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
                 return
             async with lease(self.model, step):
                 yield
+
+    @asynccontextmanager
+    async def _exact_adapter_lease(self, step: int) -> AsyncIterator[None]:
+        lease = getattr(self.backend, "exact_adapter_lease")
+        async with self._checkpoint_lease(step), lease(self.model, step):
+            yield
 
     def _release_checkpoint_lease(self, step: int) -> None:
         self._checkpoint_lease_counts[step] -= 1
@@ -883,6 +956,8 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
                 if (
                     callable(vllm_metrics_collector)
                     and not attachment_owns_vllm_metrics
+                    and self.model._serving_capabilities is not None
+                    and self.model._serving_capabilities.fast_metrics
                 ):
                     maybe_metrics = vllm_metrics_collector(self.model)
                     if inspect.isawaitable(maybe_metrics):
@@ -1025,20 +1100,17 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
             token = self.model.activate_metrics_context("eval")
             eval_started = time.monotonic()
             try:
-                async with self._adapter_lease(step):
+                async with self._exact_adapter_lease(step):
                     result = await self.eval_fn(self.model, step, self.config)
             finally:
                 token.var.reset(token)
                 eval_elapsed = time.monotonic() - eval_started
-            splits: dict[str, list[art.Trajectory | art.TrajectoryGroup]]
-            if isinstance(result, dict):
-                splits = result
-            else:
-                splits = {"val": result}
+            splits = result if _is_eval_mapping(result) else {"val": result}
 
             logged_eval_timing = False
             for split_name, items in splits.items():
                 groups, trajectories = self._normalize_eval_items(items)
+                self._validate_eval_policy_spans(step, trajectories)
                 if split_name == "val":
                     if trajectories:
                         reward = sum(t.reward for t in trajectories) / len(trajectories)
@@ -1079,7 +1151,7 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
 
     @staticmethod
     def _normalize_eval_items(
-        items: list[art.Trajectory | art.TrajectoryGroup],
+        items: Sequence[art.Trajectory | art.TrajectoryGroup],
     ) -> tuple[list[TrajectoryGroup], list[art.Trajectory]]:
         if not items:
             return [], []
@@ -1096,6 +1168,29 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
         for group in groups:
             trajectories.extend(group.trajectories)
         return groups, trajectories
+
+    @classmethod
+    def _validate_eval_policy_spans(
+        cls,
+        step: int,
+        trajectories: Iterable[art.Trajectory],
+    ) -> None:
+        for trajectory in trajectories:
+            for item in cls._trajectory_messages_and_choices(trajectory):
+                extra = getattr(item, "model_extra", None)
+                if not isinstance(extra, Mapping) or "policy_token_spans" not in extra:
+                    continue
+                spans = extra["policy_token_spans"]
+                if not isinstance(spans, list):
+                    raise RuntimeError("Eval policy_token_spans must be a list")
+                for span in spans:
+                    if not isinstance(span, Mapping) or "policy_version" not in span:
+                        raise RuntimeError("Eval policy token span is malformed")
+                    policy_version = int(span["policy_version"])
+                    if policy_version != step:
+                        raise RuntimeError(
+                            f"Eval at step {step} returned policy-{policy_version} tokens"
+                        )
 
     def _apply_policy_versions(
         self,
@@ -1476,11 +1571,13 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
     @staticmethod
     def _trajectory_completion_weight(trajectory: art.Trajectory) -> float:
         value = trajectory.metrics.get("completion_tokens")
-        if isinstance(value, bool):
-            return 1.0
-        if isinstance(value, int | float) and value > 0:
+        if not isinstance(value, bool) and isinstance(value, int | float) and value > 0:
             return float(value)
-        return 1.0
+        raise RuntimeError(
+            "Pipeline training requires a positive completion_tokens metric from "
+            "serving response usage; received "
+            f"{value!r}"
+        )
 
     def _should_eval_step(self, step: int) -> bool:
         if self.eval_fn is None:
@@ -1501,13 +1598,17 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
             "last_eval_step": self.state.last_eval_step,
             "completed_eval_steps": sorted(self.state.completed_eval_steps),
             "accepted_trainable_groups": self.state.accepted_trainable_groups,
+            "discarded_stale_groups": self.state.discarded_stale_groups,
+            "discarded_zero_variance_groups": (
+                self.state.discarded_zero_variance_groups
+            ),
         }
         if self._pipeline_tuner_profile is not None:
             payload["pipeline_tuner_profile"] = self._pipeline_tuner_profile
         self.model.merge_state({PIPELINE_STATE_KEY: payload})
 
     def _log_checkpoint_history(self, step: int, metrics: dict[str, float]) -> None:
-        row = {
+        row: dict[str, int | float | str] = {
             (key if key.startswith("checkpoint/") else f"checkpoint/{key}"): value
             for key, value in metrics.items()
             if value == value

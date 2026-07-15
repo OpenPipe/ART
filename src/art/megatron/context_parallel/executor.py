@@ -2235,16 +2235,16 @@ def _run_context_parallel_backward(
             grad_outputs=tuple(stage_output_grads),
             allow_unused=True,
         )
-        grad_map = {
+        grad_map: dict[str, torch.Tensor | None] = {
             name: grad for name, grad in zip(input_names, input_grads, strict=True)
         }
         for grad_name in ("q_input", "k_input", "v_input"):
             grad_map[grad_name] = _sanitize_nested_stage_input_grad(
-                cast(torch.Tensor | None, grad_map.get(grad_name)),
+                grad_map.get(grad_name),
             )
         _scatter_stage_grad(
             target=dq_flat,
-            grad=cast(torch.Tensor | None, grad_map.get("q_input")),
+            grad=grad_map.get("q_input"),
             ranges=stage_plan.owner_local_q_ranges,
             state=state,
             head_major=True,
@@ -2252,14 +2252,14 @@ def _run_context_parallel_backward(
         if stage_plan.is_local_stage:
             _scatter_stage_grad(
                 target=dk_flat,
-                grad=cast(torch.Tensor | None, grad_map.get("k_input")),
+                grad=grad_map.get("k_input"),
                 ranges=stage_plan.owner_local_k_ranges,
                 state=state,
                 head_major=True,
             )
             _scatter_stage_grad(
                 target=dv_flat,
-                grad=cast(torch.Tensor | None, grad_map.get("v_input")),
+                grad=grad_map.get("v_input"),
                 ranges=stage_plan.owner_local_k_ranges,
                 state=state,
                 head_major=True,
@@ -2269,8 +2269,8 @@ def _run_context_parallel_backward(
             stage_record.clear()
             continue
         if not stage_plan.is_local_stage:
-            dk_remote = cast(torch.Tensor | None, grad_map.get("k_input"))
-            dv_remote = cast(torch.Tensor | None, grad_map.get("v_input"))
+            dk_remote = grad_map.get("k_input")
+            dv_remote = grad_map.get("v_input")
             if dk_remote is None:
                 dk_remote = k_flat.new_empty((k_flat.shape[0], 0, k_flat.shape[2]))
             if dv_remote is None:

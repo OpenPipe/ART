@@ -4,6 +4,7 @@ import argparse
 import asyncio
 from contextlib import asynccontextmanager, contextmanager
 import hashlib
+import inspect
 import json
 import os
 from pathlib import Path
@@ -19,6 +20,7 @@ from openai.types.chat.chat_completion import Choice
 from pydantic import BaseModel, ConfigDict, Field
 
 from art.dev.model import InternalModelConfig, RolloutWeightsMode
+from art.megatron.prefix_tree import parse_prefix_tree
 from art.preprocessing.moe_routing import (
     MoeRoutingPackStats,
     PackedMoeRoutingReplay,
@@ -67,7 +69,7 @@ class RealPathConfig(BaseModel):
     prompt_count: int = 4
     rollouts_per_prompt: int = 2
     max_completion_tokens: int = 16
-    prompt_sentence_count: int = 28
+    prompt_sentence_count: int = 2
     prompt_target_tokens: int | None = None
     sliding_window: int | None = None
     diagnose_base: bool = False
@@ -192,28 +194,62 @@ _PROMPT_SENTENCES = [
     "Validation code belongs in tests unless production needs the behavior.",
 ]
 _PROMPT_TOKENS_PER_SENTENCE_ESTIMATE = 12
-_PROMPT_TREE_ROOT = (
-    "Write a concise continuation for a validation note. Preserve the technical "
-    "tone and keep the answer concrete."
+
+
+def _shared_prompt_segment(text: str) -> str:
+    return " ".join((text,) * 4)
+
+
+_PROMPT_TREE_ROOT = _shared_prompt_segment(
+    "Validate this training and serving comparison with concrete evidence about "
+    "tokenization, packed execution, routed experts, adapter weights, and output scores."
 )
 _PROMPT_TREE_MIDS = (
-    "Branch alpha: emphasize runtime validation and packed training inputs.",
-    "Branch beta: emphasize serving parity and reproducible comparison artifacts.",
+    _shared_prompt_segment(
+        "Branch alpha emphasizes runtime validation, packed training inputs, "
+        "deterministic metadata, and exact policy tokens for every comparison."
+    ),
+    _shared_prompt_segment(
+        "Branch beta emphasizes serving parity, reproducible artifacts, adapter "
+        "loading, and measured output differences for every comparison."
+    ),
 )
 _PROMPT_TREE_LEAVES = (
-    "Case one: describe a route where a prefix tree splits into two completions.",
-    "Case two: describe a route where the same branch has a longer continuation.",
-    "Case three: describe a route where another branch reaches a different expert.",
-    "Case four: describe a direct leaf that skips the intermediate branch.",
+    _shared_prompt_segment(
+        "Case one follows a prefix-tree branch into the first completion and records "
+        "each relevant execution decision."
+    ),
+    _shared_prompt_segment(
+        "Case two follows the same intermediate branch into a second prompt leaf and "
+        "records each relevant execution decision."
+    ),
+    _shared_prompt_segment(
+        "Case three follows another intermediate branch into a different expert route "
+        "and records each relevant execution decision."
+    ),
+    _shared_prompt_segment(
+        "Case four follows that intermediate branch into its final prompt leaf and "
+        "records each relevant execution decision."
+    ),
 )
 
 
 def config_from_env() -> RealPathConfig:
+    from art.megatron.model_support.registry import get_model_support_spec
+
     from .output_parity import config_from_env as output_config_from_env
 
     config = RealPathConfig(output_parity=output_config_from_env())
     if raw := os.environ.get("ART_REAL_PATH_PROMPT_COUNT"):
         config.prompt_count = int(raw)
+    elif (
+        get_model_support_spec(
+            config.output_parity.base_model,
+            allow_unvalidated_arch=config.output_parity.allow_unvalidated_arch,
+        ).handler_key
+        == "dsv4"
+    ):
+        config.prompt_count = 2
     if raw := os.environ.get("ART_REAL_PATH_ROLLOUTS_PER_PROMPT"):
         config.rollouts_per_prompt = int(raw)
     if raw := os.environ.get("ART_REAL_PATH_MAX_COMPLETION_TOKENS"):
@@ -287,21 +323,63 @@ def _build_prompt_from_sentences(index: int, sentences: list[str]) -> str:
     return f"{_PROMPT_TREE_ROOT}\n\n{mid}\n\n{leaf}\n\nNotes: " + " ".join(sentences)
 
 
-def _prompt_tree_shape(prompts: list[str]) -> tuple[int, int]:
-    mid_count = len(
-        {mid for mid in _PROMPT_TREE_MIDS if any(mid in prompt for prompt in prompts)}
+def _prompt_tree_shape(packed_tensors: dict[str, Any]) -> tuple[int, int]:
+    segments = tuple(
+        segment
+        for row in parse_prefix_tree(
+            group_ids=packed_tensors["group_ids"],
+            parent_ids=packed_tensors["parent_ids"],
+        )
+        for segment in row.segments
     )
-    leaf_count = len(
-        {
-            leaf
-            for leaf in _PROMPT_TREE_LEAVES
-            if any(leaf in prompt for prompt in prompts)
-        }
+    return (
+        max((segment.depth for segment in segments), default=0),
+        sum(segment.depth > 0 for segment in segments),
     )
-    return (3 if mid_count and leaf_count else 1, mid_count + leaf_count)
 
 
-def _build_prompts(config: RealPathConfig) -> list[str]:
+def _dsv4_aligned_prompts(config: RealPathConfig, tokenizer: Any) -> list[str]:
+    if config.prompt_count != 2:
+        raise ValueError("DSV4 train/inf mismatch requires exactly two aligned prompts")
+    root = "Calibration root." + " common" * 249 + "\n"
+    prompts = [root + " alpha" * 254, root + " beta" * 254]
+    token_ids = [
+        list(
+            tokenizer.apply_chat_template(
+                [{"role": "user", "content": prompt}],
+                tokenize=True,
+                add_generation_prompt=True,
+            )
+        )
+        for prompt in prompts
+    ]
+    shared = next(
+        index
+        for index, pair in enumerate(zip(*token_ids, strict=True))
+        if pair[0] != pair[1]
+    )
+    if shared != 256 or any(len(tokens) != 512 for tokens in token_ids):
+        raise RuntimeError(
+            "DSV4 aligned fixture tokenization changed: "
+            f"shared={shared}, lengths={[len(tokens) for tokens in token_ids]}"
+        )
+    return prompts
+
+
+def _build_prompts(config: RealPathConfig, tokenizer: Any) -> list[str]:
+    from art.megatron.model_support.registry import get_model_support_spec
+
+    if (
+        get_model_support_spec(
+            config.output_parity.base_model,
+            allow_unvalidated_arch=config.output_parity.allow_unvalidated_arch,
+        ).handler_key
+        == "dsv4"
+    ):
+        # FP4 vLLM rescoring varies enough for DSV4 that arbitrary short tails
+        # dominate train/inf mismatch. Exact 256-token blocks maximize stable KV
+        # reuse while retaining a real shared-root, divergent-branch packed tree.
+        return _dsv4_aligned_prompts(config, tokenizer)
     rng = random.Random(config.output_parity.seed)
     prompts: list[str] = []
     for index in range(config.prompt_count):
@@ -353,6 +431,7 @@ async def _collect_real_trajectory_groups(
     config: RealPathConfig,
 ) -> list[Any]:
     from transformers import AutoTokenizer
+    from transformers.tokenization_utils_base import PreTrainedTokenizerBase
 
     import art
     from art.megatron.model_support.tokenizer import (
@@ -361,8 +440,10 @@ async def _collect_real_trajectory_groups(
 
     if config.rollouts_per_prompt < 2:
         raise ValueError("real-path mismatch requires at least two rollouts per prompt")
+    loaded_tokenizer = AutoTokenizer.from_pretrained(config.output_parity.base_model)
+    assert isinstance(loaded_tokenizer, PreTrainedTokenizerBase)
     tokenizer = configure_tokenizer_for_model_support(
-        AutoTokenizer.from_pretrained(config.output_parity.base_model),
+        loaded_tokenizer,
         base_model=config.output_parity.base_model,
         internal_config={
             "allow_unvalidated_arch": config.output_parity.allow_unvalidated_arch
@@ -377,7 +458,7 @@ async def _collect_real_trajectory_groups(
     extra_body = (
         {"chat_template_kwargs": chat_template_kwargs} if chat_template_kwargs else None
     )
-    prompts = _build_prompts(config)
+    prompts = _build_prompts(config, tokenizer)
     groups = [
         art.TrajectoryGroup(
             [
@@ -823,6 +904,7 @@ def _init_art_megatron_runtime_config(config: TrainInfOutputParityConfig) -> Non
             etp=config.topology.etp,
         ),
         packed_sequence_length=config.packed.sequence_length,
+        streaming_weight_offload=config.streaming_weight_offload,
     )
 
 
@@ -870,7 +952,10 @@ def _make_nonzero_adapter(
 
 
 def _adapter_cache_key(config: TrainInfOutputParityConfig) -> str:
-    from art.megatron.model_support import vllm_lora_config_for_model
+    from art.megatron.model_support import (
+        get_model_support_handler,
+        vllm_lora_config_for_model,
+    )
 
     from .output_parity import _adapter_config
 
@@ -889,14 +974,20 @@ def _adapter_cache_key(config: TrainInfOutputParityConfig) -> str:
         adapter_config,
         allow_unvalidated_arch=config.allow_unvalidated_arch,
     )
+    handler = get_model_support_handler(
+        config.base_model,
+        allow_unvalidated_arch=config.allow_unvalidated_arch,
+    )
+    handler_module = Path(inspect.getfile(type(handler)))
     payload = {
-        "schema": 2,
+        "schema": 3,
         "base_model": config.base_model,
         "seed": config.seed,
         "allow_unvalidated_arch": config.allow_unvalidated_arch,
         "lora_target_modules": _lora_target_modules(config),
         "adapter_config": adapter_config,
         "published_adapter_config": published_adapter_config,
+        "handler_sha256": hashlib.sha256(handler_module.read_bytes()).hexdigest(),
     }
     encoded = json.dumps(
         jsonable(payload),
@@ -1024,7 +1115,6 @@ def _run_logits_with_replay(
         runtime.moe_routing_replay_controller.set_step(
             step_index=step_index,
             sample_index=sample_index,
-            global_grad_accumulation_sequences=global_grad_accumulation_sequences,
         )
         runtime.moe_routing_replay_controller.begin_micro(sample_index, sample_index)
         logits_by_sample.append(
@@ -1520,7 +1610,7 @@ async def run_real_path_train_inf_mismatch(
             allow_unvalidated_arch=parity_config.allow_unvalidated_arch,
         )
         prompt_tree_depth, prompt_tree_branch_count = _prompt_tree_shape(
-            _build_prompts(config)
+            cast(dict[str, Any], packed_tensors)
         )
         passed = (
             comparison.mean_abs_pct <= mean_abs_pct_limit

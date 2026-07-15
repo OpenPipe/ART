@@ -1,3 +1,5 @@
+# ty: ignore[invalid-argument-type, unknown-argument]
+
 from __future__ import annotations
 
 from types import MethodType
@@ -357,16 +359,19 @@ def _prefix_tree_forward(
         raise NotImplementedError("ART prefix-tree GDN does not support inference.")
     if packed_seq_params is not None:
         raise NotImplementedError("PackedSeqParams is not used in ART prefix-tree GDN.")
+    mark_layout = execution_plan is not None and int(execution_plan.cp_size) > 1
     current_layout = _normalize_cp_layout(
         getattr(attention_bias, "gdn_hidden_layout", "attention")
     )
-    input_layout = _normalize_cp_layout(
-        getattr(self, "_art_gdn_inner_input_layout", "attention")
-    )
-    output_layout = _normalize_cp_layout(
-        getattr(self, "_art_gdn_inner_output_layout", "attention")
-    )
-    mark_layout = execution_plan is not None and int(execution_plan.cp_size) > 1
+    if mark_layout:
+        input_layout = _normalize_cp_layout(
+            getattr(self, "_art_gdn_inner_input_layout", "attention")
+        )
+        output_layout = _normalize_cp_layout(
+            getattr(self, "_art_gdn_inner_output_layout", "attention")
+        )
+    else:
+        input_layout = output_layout = "attention"
     if mark_layout and current_layout != input_layout:
         _mark_cp_layout_active(
             attention_bias, hidden_states, gdn=self, layout=input_layout
@@ -1028,10 +1033,7 @@ def _gdn_runtime_state(attention_bias: Any) -> _GdnRuntimeState:
     if isinstance(state, _GdnRuntimeState):
         return state
     state = _GdnRuntimeState()
-    try:
-        setattr(attention_bias, _GDN_RUNTIME_STATE_ATTR, state)
-    except Exception:
-        object.__setattr__(attention_bias, _GDN_RUNTIME_STATE_ATTR, state)
+    object.__setattr__(attention_bias, _GDN_RUNTIME_STATE_ATTR, state)
     return state
 
 
@@ -2827,11 +2829,9 @@ def _group_rank(group: Any | None) -> int:
 
 
 def _l2norm(x: Tensor) -> Tensor:
-    try:
-        from fla.modules.l2norm import l2norm
-    except ImportError:
-        return F.normalize(x, p=2, dim=-1)
-    return l2norm(x)
+    from .l2norm import dynamic_l2norm
+
+    return dynamic_l2norm(x)
 
 
 def _chunk_gated_delta_rule(*args: Any, **kwargs: Any) -> tuple[Tensor, Tensor | None]:

@@ -7,6 +7,7 @@ from art.megatron.lora import (
     LoRA,
     LoRAPublishPlanner,
     LoraShardMeta,
+    LoRASlotRef,
     _block_for_key,
     _dtype_name,
 )
@@ -98,10 +99,11 @@ def _packed_expert_slot(
 def _uses_packed_expert_publish(
     module: LoRA,
     groups: Sequence[ExpertPackedLoraGroup],
+    slot_ref: LoRASlotRef | None = None,
 ) -> bool:
     if module.num_local_experts <= 1:
         return False
-    params = tuple(module._lora_params())
+    params = tuple(module._lora_params(slot_ref))
     return bool(params) and all(
         _packed_expert_slot(module.adapter_model_prefix, suffix, groups) is not None
         for suffix, _param in params
@@ -110,22 +112,21 @@ def _uses_packed_expert_publish(
 
 def collect_local_lora_entries(
     model_chunks: ModelChunks,
-    adapter_model: dict[str, torch.Tensor],
+    adapter_dtypes: dict[str, torch.dtype],
     *,
     owner_rank: int,
     packed_expert_groups: Sequence[ExpertPackedLoraGroup] = (),
+    slot_ref: LoRASlotRef | None = None,
 ) -> tuple[dict[str, torch.Tensor], list[LoraShardMeta]]:
     local_tensors: dict[str, torch.Tensor] = {}
     local_manifest: dict[str, dict[str, Any]] = {}
     for module in iter_lora_modules(model_chunks):
-        if _uses_packed_expert_publish(module, packed_expert_groups):
+        if _uses_packed_expert_publish(module, packed_expert_groups, slot_ref):
             continue
-        for key, value in module.sharded_lora_state_dict().items():
-            target_dtype = (
-                adapter_model[key].dtype if key in adapter_model else value.dtype
-            )
+        for key, value in module.sharded_lora_state_dict(slot_ref).items():
+            target_dtype = adapter_dtypes[key] if key in adapter_dtypes else value.dtype
             local_tensors[key] = value.to(target_dtype).contiguous()
-        local_manifest.update(module.sharded_lora_manifest())
+        local_manifest.update(module.sharded_lora_manifest(slot_ref))
 
     if set(local_tensors) != set(local_manifest):
         raise RuntimeError(
@@ -149,19 +150,20 @@ def collect_local_lora_entries(
 
 def collect_local_packed_expert_entries(
     model_chunks: ModelChunks,
-    adapter_model: dict[str, torch.Tensor],
+    adapter_dtypes: dict[str, torch.dtype],
     *,
     owner_rank: int,
     packed_expert_groups: Sequence[ExpertPackedLoraGroup],
+    slot_ref: LoRASlotRef | None = None,
 ) -> tuple[dict[str, torch.Tensor], list[PackedExpertShardMeta]]:
     local_tensors: dict[str, torch.Tensor] = {}
     metadata: list[PackedExpertShardMeta] = []
     for module in iter_lora_modules(model_chunks):
-        if not _uses_packed_expert_publish(module, packed_expert_groups):
+        if not _uses_packed_expert_publish(module, packed_expert_groups, slot_ref):
             continue
         expert_start = int(module._expert_offset)
         expert_count = int(module.num_local_experts)
-        for suffix, param in module._lora_params():
+        for suffix, param in module._lora_params(slot_ref):
             slot_match = _packed_expert_slot(
                 module.adapter_model_prefix,
                 suffix,
@@ -174,8 +176,8 @@ def collect_local_packed_expert_entries(
             tensor = param.data.transpose(1, 2).contiguous()
             source_keys = module._expected_weight_keys(suffix.removesuffix(".weight"))
             target_dtype = (
-                adapter_model[source_keys[0]].dtype
-                if source_keys and source_keys[0] in adapter_model
+                adapter_dtypes[source_keys[0]]
+                if source_keys and source_keys[0] in adapter_dtypes
                 else tensor.dtype
             )
             tensor = tensor.to(target_dtype).contiguous()
@@ -199,7 +201,7 @@ def collect_local_packed_expert_entries(
 
 def _global_packed_expert_metadata(
     planner: LoRAPublishPlanner,
-    adapter_model: dict[str, torch.Tensor],
+    adapter_dtypes: dict[str, torch.dtype],
     packed_expert_groups: Sequence[ExpertPackedLoraGroup],
 ) -> list[PackedExpertShardMeta]:
     metadata: list[PackedExpertShardMeta] = []
@@ -233,7 +235,7 @@ def _global_packed_expert_metadata(
                     key=expert_key,
                     owner_rank=owner_rank,
                     shard_rank=shard_rank,
-                    adapter_model=adapter_model,
+                    adapter_dtypes=adapter_dtypes,
                 )
                 metadata.append(
                     PackedExpertShardMeta(
@@ -252,11 +254,11 @@ def _global_packed_expert_metadata(
 
 def _global_regular_metadata(
     planner: LoRAPublishPlanner,
-    adapter_model: dict[str, torch.Tensor],
+    adapter_dtypes: dict[str, torch.dtype],
     packed_expert_groups: Sequence[ExpertPackedLoraGroup],
 ) -> list[LoraShardMeta]:
     if not packed_expert_groups:
-        return planner.global_metadata(adapter_model)
+        return planner.global_metadata(adapter_dtypes)
     if _distributed_ready():
         from megatron.core import parallel_state as ps
 
@@ -278,7 +280,7 @@ def _global_regular_metadata(
             is not None
         ):
             continue
-        metadata.extend(planner._metadata_for_template(template, adapter_model))
+        metadata.extend(planner._metadata_for_template(template, adapter_dtypes))
     return metadata
 
 
@@ -668,11 +670,12 @@ def _rank0_vllm_lora_tensors(
 def build_vllm_lora_tensors_from_model(
     *,
     model: ModelChunks,
-    adapter_model: dict[str, torch.Tensor],
+    adapter_dtypes: dict[str, torch.dtype],
     handler: Any,
     adapter_config: dict[str, Any],
     rank: int,
     world_size: int,
+    slot_ref: LoRASlotRef | None = None,
 ) -> tuple[dict[str, torch.Tensor], dict[str, Any]] | None:
     actual_rank, device = _rank_and_device()
     if _distributed_ready():
@@ -690,28 +693,30 @@ def build_vllm_lora_tensors_from_model(
             )
         rank = 0
     packed_expert_groups = tuple(handler.expert_packed_lora_groups())
-    planner = LoRAPublishPlanner(model)
+    planner = LoRAPublishPlanner(model, slot_ref)
     local_tensors, local_metadata = collect_local_lora_entries(
         model,
-        adapter_model,
+        adapter_dtypes,
         owner_rank=rank,
         packed_expert_groups=packed_expert_groups,
+        slot_ref=slot_ref,
     )
     local_packed_tensors, local_packed_metadata = collect_local_packed_expert_entries(
         model,
-        adapter_model,
+        adapter_dtypes,
         owner_rank=rank,
         packed_expert_groups=packed_expert_groups,
+        slot_ref=slot_ref,
     )
     all_packed_metadata = (
-        _global_packed_expert_metadata(planner, adapter_model, packed_expert_groups)
+        _global_packed_expert_metadata(planner, adapter_dtypes, packed_expert_groups)
         if rank == 0
         else local_packed_metadata
     )
     if rank == 0:
         all_metadata = _global_regular_metadata(
             planner,
-            adapter_model,
+            adapter_dtypes,
             packed_expert_groups if all_packed_metadata else (),
         )
     else:
@@ -745,20 +750,22 @@ def build_vllm_lora_tensors_from_model(
 def save_vllm_lora_from_model(
     *,
     model: ModelChunks,
-    adapter_model: dict[str, torch.Tensor],
+    adapter_dtypes: dict[str, torch.dtype],
     handler: Any,
     adapter_config: dict[str, Any],
     output_dir: str,
     rank: int,
     world_size: int,
+    slot_ref: LoRASlotRef | None = None,
 ) -> None:
     result = build_vllm_lora_tensors_from_model(
         model=model,
-        adapter_model=adapter_model,
+        adapter_dtypes=adapter_dtypes,
         handler=handler,
         adapter_config=adapter_config,
         rank=rank,
         world_size=world_size,
+        slot_ref=slot_ref,
     )
     if result is None:
         return

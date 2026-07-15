@@ -15,7 +15,7 @@ from .._backend_training import (
     aggregate_rl_training_metrics,
     build_rl_train_configs,
 )
-from ..backend import AnyTrainableModel, Backend
+from ..backend import AnyTrainableModel
 from ..metrics_taxonomy import (
     TRAIN_GRADIENT_STEPS_KEY,
     build_training_summary_metrics,
@@ -86,7 +86,7 @@ def _canonicalize_upstream_metrics(metrics: dict[str, float]) -> dict[str, float
     }
 
 
-class ServerlessBackend(Backend):
+class ServerlessBackend:
     def __init__(
         self, *, api_key: str | None = None, base_url: str | None = None
     ) -> None:
@@ -168,6 +168,15 @@ class ServerlessBackend(Backend):
 
     @asynccontextmanager
     async def adapter_lease(
+        self,
+        model: AnyTrainableModel,
+        step: int,
+    ) -> AsyncIterator[None]:
+        async with pin_inference_step(model.name, step):
+            yield
+
+    @asynccontextmanager
+    async def exact_adapter_lease(
         self,
         model: AnyTrainableModel,
         step: int,
@@ -538,6 +547,11 @@ class ServerlessBackend(Backend):
         Yields:
             Dictionary containing training metrics for each batch.
         """
+        if config.assistant_turns == "last":
+            raise NotImplementedError(
+                "assistant_turns='last' currently requires LocalBackend"
+            )
+
         import json
         import tempfile
         import uuid
@@ -811,7 +825,7 @@ class ServerlessBackend(Backend):
 
     async def _experimental_push_to_s3(
         self,
-        model: "Model",
+        model: "TrainableModel",
         *,
         s3_bucket: str | None = None,
         prefix: str | None = None,
@@ -853,7 +867,7 @@ class ServerlessBackend(Backend):
 
             # Pull from W&B to local temp dir
             checkpoint_dir = await self._experimental_pull_model_checkpoint(
-                model,  # type: ignore[arg-type]
+                model,
                 step=step,
                 verbose=verbose,
             )

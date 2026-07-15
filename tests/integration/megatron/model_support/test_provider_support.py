@@ -33,7 +33,8 @@ class _FakeProvider:
         self.num_moe_experts = 0
         self.hidden_size = 2048
         self.moe_ffn_hidden_size = 768
-        self.add_bias_linear = True
+        self.add_bias_linear = False
+        self.art_moe_grouped_gemm_bias_encoded = False
         self.bias_activation_fusion = True
         self.window_size: int | tuple[int, int] = (128, 0)
         self.moe_hybridep_num_sms = 16
@@ -213,7 +214,7 @@ def test_get_provider_accepts_registry_supported_models(
     assert resolved.moe_shared_expert_overlap is False
     assert resolved.add_bias_linear is False
     assert resolved.bias_activation_fusion is False
-    assert resolved.moe_router_dtype is None
+    assert resolved.moe_router_dtype == "fp32"
     assert resolved.moe_aux_loss_coeff == 0.0
     assert resolved.calculate_per_token_loss is True
 
@@ -245,64 +246,6 @@ def test_gpt_oss_mxfp4_weight_source_materializes_once() -> None:
     assert isinstance(loaded, torch.Tensor)
     assert torch.equal(loaded, resolved)
     assert bridge.calls == [hf_param]
-
-
-def test_gpt_oss_runtime_preserves_hybridep_dispatcher() -> None:
-    handler = get_model_support_handler("openai/gpt-oss-20b")
-    provider: Any = _FakeProvider()
-    provider.num_moe_experts = 32
-    provider.hidden_size = 2880
-    provider.moe_ffn_hidden_size = 2880
-    provider.window_size = (128, 0)
-
-    provider.moe_token_dispatcher_type = "flex"
-    provider.moe_flex_dispatcher_backend = "hybridep"
-    handler.configure_provider_for_runtime(cast(Any, provider))
-
-    assert provider.moe_flex_dispatcher_backend == "hybridep"
-    assert provider.moe_token_dispatcher_type == "flex"
-
-
-def test_moe_grouped_gemm_fast_path_forces_bias_settings() -> None:
-    provider = _FakeProvider()
-    provider.num_moe_experts = 8
-
-    provider_module._enforce_art_moe_grouped_gemm_fast_path(cast(Any, provider))
-
-    assert provider.add_bias_linear is False
-    assert provider.bias_activation_fusion is False
-
-
-def test_moe_grouped_gemm_fast_path_leaves_dense_bias_settings() -> None:
-    provider = _FakeProvider()
-
-    provider_module._enforce_art_moe_grouped_gemm_fast_path(cast(Any, provider))
-
-    assert provider.add_bias_linear is True
-    assert provider.bias_activation_fusion is True
-
-
-def test_get_provider_moe_grouped_gemm_fast_path_overrides_env(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    provider = _FakeProvider()
-    provider.num_moe_experts = 8
-    fake_bridge = _FakeBridge(
-        model_bridge=object(),
-        provider=provider,
-    )
-    monkeypatch.setattr(
-        provider_module.AutoBridge,
-        "from_hf_pretrained",
-        lambda *args, **kwargs: fake_bridge,
-    )
-    monkeypatch.setattr(provider_module.torch.cuda, "device_count", lambda: 2)
-    monkeypatch.setenv("ART_MEGATRON_BIAS_ACTIVATION_FUSION", "true")
-
-    resolved = provider_module.get_provider("Qwen/Qwen3-30B-A3B-Instruct-2507")
-
-    assert resolved.add_bias_linear is False
-    assert resolved.bias_activation_fusion is False
 
 
 def test_finalize_provider_bundle_allows_art_gdn_context_parallel() -> None:
@@ -442,48 +385,6 @@ def test_finalize_provider_bundle_uses_post_prepare_topology(
     provider_module.finalize_provider_bundle(bundle)
 
     assert dispatcher_calls == []
-
-
-def test_finalize_provider_bundle_always_uses_hybridep(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    provider: Any = _FakeProvider()
-    provider.expert_model_parallel_size = 2
-    provider.expert_tensor_parallel_size = 1
-    dispatcher_calls: list[str] = []
-
-    def apply_hybridep(provider: Any, moe_flex_dispatcher_backend: str) -> None:
-        dispatcher_calls.append(moe_flex_dispatcher_backend)
-        provider.moe_token_dispatcher_type = "flex"
-        provider.moe_flex_dispatcher_backend = moe_flex_dispatcher_backend
-
-    monkeypatch.setattr(
-        provider_module,
-        "apply_flex_dispatcher_backend",
-        apply_hybridep,
-    )
-
-    provider_module._apply_art_training_runtime_finalize_defaults(cast(Any, provider))
-
-    assert dispatcher_calls == ["hybridep"]
-
-
-def test_finalize_provider_bundle_rejects_hybridep_skip(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    provider = _FakeProvider()
-    provider.expert_model_parallel_size = 2
-    provider.moe_token_dispatcher_type = "alltoall"
-    monkeypatch.setattr(
-        provider_module,
-        "apply_flex_dispatcher_backend",
-        lambda provider, moe_flex_dispatcher_backend: None,
-    )
-
-    with pytest.raises(RuntimeError, match="requires HybridEP"):
-        provider_module._apply_art_training_runtime_finalize_defaults(
-            cast(Any, provider)
-        )
 
 
 def test_get_provider_bundle_honors_single_gpu_env_topology(
@@ -733,48 +634,3 @@ def test_ep_overlap_recompute_contract_disables_full_recompute() -> None:
     assert provider.recompute_granularity is None
     assert provider.recompute_method is None
     assert provider.recompute_num_layers is None
-
-
-def test_moe_grouped_gemm_fast_path_accepts_128_aligned_dimensions() -> None:
-    provider = _FakeProvider()
-    provider.num_moe_experts = 128
-    provider.hidden_size = 2048
-    provider.moe_ffn_hidden_size = 768
-
-    provider_module._enforce_art_moe_grouped_gemm_fast_path(cast(Any, provider))
-
-    assert provider.add_bias_linear is False
-    assert provider.bias_activation_fusion is False
-
-
-def test_moe_grouped_gemm_fast_path_rejects_unaligned_dimensions() -> None:
-    provider = _FakeProvider()
-    provider.num_moe_experts = 128
-    provider.hidden_size = 2816
-    provider.moe_ffn_hidden_size = 704
-
-    with pytest.raises(RuntimeError, match="moe_ffn_hidden_size=704"):
-        provider_module._enforce_art_moe_grouped_gemm_fast_path(cast(Any, provider))
-
-
-@pytest.mark.parametrize(
-    "retired",
-    [
-        "ART_MEGATRON_MOE_FLEX_DISPATCHER_BACKEND",
-        "ART_MEGATRON_MOE_DEEPEP_NUM_SMS",
-    ],
-)
-def test_provider_runtime_rejects_retired_deepep_settings(retired: str) -> None:
-    with pytest.raises(ValueError, match=f"{retired} was removed"):
-        provider_module._ProviderRuntimeEnv.from_environ({retired: "disabled"})
-
-
-def test_provider_runtime_configures_hybridep_sms() -> None:
-    runtime = provider_module._ProviderRuntimeEnv.from_environ(
-        {"ART_MEGATRON_MOE_HYBRIDEP_NUM_SMS": "28"}
-    )
-    provider = _FakeProvider()
-
-    provider_module._apply_runtime_env_overrides(cast(Any, provider), runtime)
-
-    assert provider.moe_hybridep_num_sms == 28

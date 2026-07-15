@@ -192,6 +192,19 @@ def _install_gemma4_moe_postprocess_workaround() -> None:
     )
 
 
+def _install_te_triton_mask_map_workaround() -> None:
+    from transformer_engine.pytorch.triton import permutation
+
+    # TE's mask-map path launches custom Triton kernels. Keep their thin Python
+    # wrappers eager while the surrounding MoE layer and grouped GEMMs compile.
+    for name in (
+        "make_row_id_map",
+        "permute_with_mask_map",
+        "unpermute_with_mask_map",
+    ):
+        _disable_attr(permutation, name)
+
+
 def install_torch_compile_workarounds(
     config: CompileWorkaroundConfig | None = None,
 ) -> None:
@@ -248,13 +261,7 @@ def install_torch_compile_workarounds(
                 moe_utils.fused_permute_with_probs
             )
     if "te_triton_permute_with_mask_map" in flags:
-        from transformer_engine.pytorch.triton import (
-            permutation as te_triton_permutation,
-        )
-
-        te_triton_permutation.permute_with_mask_map = _disable(
-            te_triton_permutation.permute_with_mask_map
-        )
+        _install_te_triton_mask_map_workaround()
     if "te_moe_unpermute" in flags:
         from transformer_engine.pytorch import permutation as te_permutation
 
@@ -282,6 +289,12 @@ def install_torch_compile_workarounds(
 
         te_triton_permutation.unpermute_with_mask_map_bwd_with_merging_probs = _disable(
             te_triton_permutation.unpermute_with_mask_map_bwd_with_merging_probs
+        )
+    if "alltoall_dispatch_dtoh" in flags:
+        token_dispatcher.MoEAlltoAllTokenDispatcher._maybe_dtoh_and_synchronize = (
+            _disable(
+                token_dispatcher.MoEAlltoAllTokenDispatcher._maybe_dtoh_and_synchronize
+            )
         )
     if "flex_token_dispatch_combine" in flags:
         token_dispatcher.MoEFlexTokenDispatcher.token_dispatch = _disable(

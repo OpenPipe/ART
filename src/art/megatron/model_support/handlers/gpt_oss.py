@@ -4,7 +4,6 @@ from functools import lru_cache
 import json
 from pathlib import Path
 import re
-from types import MethodType
 from typing import Any, Sequence, cast
 
 import torch
@@ -16,6 +15,30 @@ from art.megatron.model_support.handlers.default_dense import (
 )
 from art.megatron.model_support.handlers.qwen3_common import (
     _context_parallel_world_size,
+)
+from art.megatron.model_support.internal_padding import (
+    group_expert_lora_tensors,
+)
+from art.megatron.model_support.internal_padding import (
+    pack_vllm_3d_lora_b as _pack_vllm_3d_lora_b,
+)
+from art.megatron.model_support.internal_padding import (
+    pad_dim_right as _pad_dim_right,
+)
+from art.megatron.model_support.internal_padding import (
+    round_up_to_multiple as _round_up_to_multiple,
+)
+from art.megatron.model_support.internal_padding import (
+    trim_dim_right as _trim_dim_right,
+)
+from art.megatron.model_support.internal_padding import (
+    unpack_vllm_3d_lora_b as _unpack_vllm_3d_lora_b,
+)
+from art.megatron.model_support.internal_padding import (
+    zero_lora_padding as _zero_gpt_oss_lora_padding_tensor_set,
+)
+from art.megatron.model_support.internal_padding import (
+    zero_ranges as _zero_ranges,
 )
 from art.megatron.model_support.spec import (
     CompileWorkaroundConfig,
@@ -48,38 +71,37 @@ _GPT_OSS_MXFP4_EXPERT_WEIGHT_RE = re.compile(
 _ART_PACKED_MOE_KEY_RE = re.compile(
     r"^.*\.mlp\.experts\.(?:base_layer\.)?lora_[AB]\.weight$"
 )
-_GPT_OSS_ALIGNMENT = 128
+_GPT_OSS_HIDDEN_ALIGNMENT = 128
+# Keep the serialized expert shape topology-independent while ensuring each
+# local FFN remains 128-aligned for the supported ETP sizes 1, 2, 4, and 8.
+_GPT_OSS_MOE_FFN_ALIGNMENT = 128 * 8
 _GPT_OSS_LOGICAL_HIDDEN_ATTR = "art_gpt_oss_logical_hidden_size"
 _GPT_OSS_INTERNAL_HIDDEN_ATTR = "art_gpt_oss_internal_hidden_size"
 _GPT_OSS_LOGICAL_MOE_FFN_ATTR = "art_gpt_oss_logical_moe_ffn_hidden_size"
 _GPT_OSS_INTERNAL_MOE_FFN_ATTR = "art_gpt_oss_internal_moe_ffn_hidden_size"
-_GPT_OSS_MAPPING_PADDING_ATTR = "_art_gpt_oss_moe_padding_sizes"
+_GPT_OSS_QUICK_GELU_ONE = 1.1429453389509778
 
 
-def _round_up_to_multiple(value: int, multiple: int) -> int:
-    return ((value + multiple - 1) // multiple) * multiple
-
-
-def _pad_dim_right(tensor: torch.Tensor, *, dim: int, size: int) -> torch.Tensor:
-    dim = dim if dim >= 0 else tensor.ndim + dim
-    current = int(tensor.shape[dim])
-    if current == size:
-        return tensor.contiguous()
-    if current > size:
-        raise RuntimeError(f"Cannot pad tensor dim {dim} from {current} down to {size}")
-    pad_shape = list(tensor.shape)
-    pad_shape[dim] = size - current
-    return torch.cat([tensor, tensor.new_zeros(pad_shape)], dim=dim).contiguous()
-
-
-def _trim_dim_right(tensor: torch.Tensor, *, dim: int, size: int) -> torch.Tensor:
-    dim = dim if dim >= 0 else tensor.ndim + dim
-    current = int(tensor.shape[dim])
-    if current == size:
-        return tensor.contiguous()
-    if current < size:
-        raise RuntimeError(f"Cannot trim tensor dim {dim} from {current} up to {size}")
-    return tensor.narrow(dim, 0, size).contiguous()
+def _pad_gpt_oss_hidden_with_bias_coordinate(
+    tensor: torch.Tensor,
+    *,
+    logical: int,
+    internal: int,
+) -> torch.Tensor:
+    if int(tensor.shape[-1]) != logical or internal <= logical:
+        raise RuntimeError(
+            "GPT OSS expert bias encoding requires a padded hidden dimension: "
+            f"shape={tuple(tensor.shape)}, hidden={logical}->{internal}"
+        )
+    pad_shape = (*tensor.shape[:-1], internal - logical - 1)
+    return torch.cat(
+        [
+            tensor,
+            tensor.new_ones(*tensor.shape[:-1], 1),
+            tensor.new_zeros(pad_shape),
+        ],
+        dim=-1,
+    )
 
 
 def _pad_gpt_oss_gate_up_dim0(
@@ -125,6 +147,30 @@ def _trim_gpt_oss_gate_up_dim0(
         ],
         dim=0,
     ).contiguous()
+
+
+def _gate_up_to_etp_shard_order(tensor: torch.Tensor, etp_size: int) -> torch.Tensor:
+    if etp_size == 1:
+        return tensor
+    local_rows = tensor.shape[0] // (2 * etp_size)
+    return (
+        tensor.reshape(2, etp_size, local_rows, *tensor.shape[1:])
+        .transpose(0, 1)
+        .reshape(tensor.shape)
+        .contiguous()
+    )
+
+
+def _gate_up_from_etp_shard_order(tensor: torch.Tensor, etp_size: int) -> torch.Tensor:
+    if etp_size == 1:
+        return tensor
+    local_rows = tensor.shape[0] // (2 * etp_size)
+    return (
+        tensor.reshape(etp_size, 2, local_rows, *tensor.shape[1:])
+        .transpose(0, 1)
+        .reshape(tensor.shape)
+        .contiguous()
+    )
 
 
 def _pad_gpt_oss_interleaved_gate_up_last(
@@ -191,8 +237,8 @@ def _configure_gpt_oss_moe_internal_padding(provider: Any) -> None:
         raise RuntimeError(
             "GPT OSS provider is missing hidden_size or moe_ffn_hidden_size"
         )
-    internal_hidden = _round_up_to_multiple(logical_hidden, _GPT_OSS_ALIGNMENT)
-    internal_ffn = _round_up_to_multiple(logical_ffn, _GPT_OSS_ALIGNMENT)
+    internal_hidden = _round_up_to_multiple(logical_hidden, _GPT_OSS_HIDDEN_ALIGNMENT)
+    internal_ffn = _round_up_to_multiple(logical_ffn, _GPT_OSS_MOE_FFN_ALIGNMENT)
     setattr(provider, _GPT_OSS_LOGICAL_HIDDEN_ATTR, logical_hidden)
     setattr(provider, _GPT_OSS_INTERNAL_HIDDEN_ATTR, internal_hidden)
     setattr(provider, _GPT_OSS_LOGICAL_MOE_FFN_ATTR, logical_ffn)
@@ -248,25 +294,6 @@ def _gpt_oss_padding_sizes_from_module(
     return _gpt_oss_padding_sizes_from_provider(config)
 
 
-def _set_gpt_oss_mapping_padding(
-    mapping: Any,
-    padding_sizes: tuple[int, int, int, int] | None,
-) -> Any:
-    if padding_sizes is not None:
-        setattr(mapping, _GPT_OSS_MAPPING_PADDING_ATTR, padding_sizes)
-    return mapping
-
-
-def _copy_gpt_oss_mapping_padding(source: Any, target: Any) -> Any:
-    if hasattr(source, _GPT_OSS_MAPPING_PADDING_ATTR):
-        setattr(
-            target,
-            _GPT_OSS_MAPPING_PADDING_ATTR,
-            getattr(source, _GPT_OSS_MAPPING_PADDING_ATTR),
-        )
-    return target
-
-
 def _gpt_oss_padding_sizes_from_hf_config(
     hf_config: Any | None,
 ) -> tuple[int, int, int, int] | None:
@@ -279,9 +306,9 @@ def _gpt_oss_padding_sizes_from_hf_config(
         return None
     return (
         hidden,
-        _round_up_to_multiple(hidden, _GPT_OSS_ALIGNMENT),
+        _round_up_to_multiple(hidden, _GPT_OSS_HIDDEN_ALIGNMENT),
         ffn,
-        _round_up_to_multiple(ffn, _GPT_OSS_ALIGNMENT),
+        _round_up_to_multiple(ffn, _GPT_OSS_MOE_FFN_ALIGNMENT),
     )
 
 
@@ -311,9 +338,9 @@ def _gpt_oss_padding_sizes_from_adapter_config(
         )
     return (
         hidden,
-        _round_up_to_multiple(hidden, _GPT_OSS_ALIGNMENT),
+        _round_up_to_multiple(hidden, _GPT_OSS_HIDDEN_ALIGNMENT),
         ffn,
-        _round_up_to_multiple(ffn, _GPT_OSS_ALIGNMENT),
+        _round_up_to_multiple(ffn, _GPT_OSS_MOE_FFN_ALIGNMENT),
     )
 
 
@@ -352,13 +379,16 @@ def _install_gpt_oss_grouped_mlp_padding_patch() -> None:
         )
         original_hidden = config.hidden_size
         original_ffn = config.moe_ffn_hidden_size
+        original_add_bias = config.add_bias_linear
         config.hidden_size = internal_hidden
         config.moe_ffn_hidden_size = internal_ffn
+        config.add_bias_linear = False
         try:
             original_init(self, num_local_experts, config, submodules, pg_collection)
         finally:
             config.hidden_size = original_hidden
             config.moe_ffn_hidden_size = original_ffn
+            config.add_bias_linear = original_add_bias
         setattr(self, _GPT_OSS_LOGICAL_HIDDEN_ATTR, logical_hidden)
         setattr(self, _GPT_OSS_INTERNAL_HIDDEN_ATTR, internal_hidden)
         setattr(self, _GPT_OSS_LOGICAL_MOE_FFN_ATTR, logical_ffn)
@@ -379,10 +409,10 @@ def _install_gpt_oss_grouped_mlp_padding_patch() -> None:
                 tokens_per_expert,
                 permuted_probs,
             )
-        padded = _pad_dim_right(
+        padded = _pad_gpt_oss_hidden_with_bias_coordinate(
             permuted_local_hidden_states,
-            dim=-1,
-            size=internal_hidden,
+            logical=logical_hidden,
+            internal=internal_hidden,
         )
         output, output_bias = original_forward(
             self,
@@ -397,150 +427,55 @@ def _install_gpt_oss_grouped_mlp_padding_patch() -> None:
     setattr(TEGroupedMLP, "_art_gpt_oss_padding_patch", True)
 
 
-def _install_gpt_oss_bridge_padding_patch() -> None:
-    from megatron.bridge.models.conversion.param_mapping import (
-        AutoMapping,
-        _align_expert_weight_to_shape,
-    )
-    from megatron.bridge.models.conversion.utils import (
-        get_module_and_param_from_name,
-    )
-    from megatron.bridge.models.gpt_oss.gpt_oss_bridge import (
-        GPTOSSMLPDownProjMapping,
-        GPTOSSMLPGateUpProjMapping,
-    )
-    from megatron.bridge.utils.common_utils import (
-        extract_expert_number_from_param,
-    )
-
-    if getattr(GPTOSSMLPGateUpProjMapping, "_art_padding_patch", False):
-        return
-
-    original_gate_up_hf_to_megatron = GPTOSSMLPGateUpProjMapping.hf_to_megatron
-    original_down_hf_to_megatron = GPTOSSMLPDownProjMapping.hf_to_megatron
-
-    def _target_param(mapping: Any, megatron_module: Any) -> torch.nn.Parameter:
-        normalized = mapping._normalize_expert_param_name(mapping.megatron_param)
-        return cast(
-            torch.nn.Parameter,
-            get_module_and_param_from_name(megatron_module, normalized)[1],
-        )
-
-    def _expert_weight(mapping: Any, hf_weights: torch.Tensor) -> torch.Tensor:
-        expert = extract_expert_number_from_param(mapping.megatron_param)
-        return hf_weights[expert] if hf_weights.ndim >= 2 else hf_weights
-
-    def _gate_up_hf_to_megatron(
-        self: Any,
-        hf_weights: torch.Tensor,
-        megatron_module: Any,
-    ) -> torch.Tensor:
-        target_param = _target_param(self, megatron_module)
-        target_shape = tuple(int(dim) for dim in target_param.shape)
-        full_rows = target_shape[0] * int(getattr(self, "tp_size", 1) or 1)
-        expert_weight = _expert_weight(self, hf_weights)
-
-        if expert_weight.ndim == 1 and full_rows > int(expert_weight.shape[0]):
-            logical_ffn = int(expert_weight.shape[0]) // 2
-            internal_ffn = full_rows // 2
-            aligned = _align_expert_weight_to_shape(
-                expert_weight,
-                torch.Size((2 * logical_ffn,)),
-                "gate_up_proj_bias",
-            )
-            padded = _pad_gpt_oss_gate_up_dim0(
-                self._interleave(aligned),
-                logical=logical_ffn,
-                internal=internal_ffn,
-            )
-            return AutoMapping.hf_to_megatron(self, padded, megatron_module)
-
-        if expert_weight.ndim == 2:
-            logical_hidden = int(expert_weight.shape[1])
-            logical_ffn = int(expert_weight.shape[0]) // 2
-            internal_hidden = target_shape[1]
-            internal_ffn = full_rows // 2
-            if internal_hidden > logical_hidden or internal_ffn > logical_ffn:
-                aligned = _align_expert_weight_to_shape(
-                    expert_weight,
-                    torch.Size((2 * logical_ffn, logical_hidden)),
-                    "gate_up_proj",
-                )
-                padded = _pad_dim_right(
-                    _pad_gpt_oss_gate_up_dim0(
-                        self._interleave(aligned),
-                        logical=logical_ffn,
-                        internal=internal_ffn,
-                    ),
-                    dim=1,
-                    size=internal_hidden,
-                )
-                return AutoMapping.hf_to_megatron(self, padded, megatron_module)
-
-        return original_gate_up_hf_to_megatron(self, hf_weights, megatron_module)
-
-    def _down_hf_to_megatron(
-        self: Any,
-        hf_weights: torch.Tensor,
-        megatron_module: Any,
-    ) -> torch.Tensor:
-        target_param = _target_param(self, megatron_module)
-        target_shape = tuple(int(dim) for dim in target_param.shape)
-        full_cols = target_shape[1] * int(getattr(self, "tp_size", 1) or 1)
-        expert_weight = _expert_weight(self, hf_weights)
-
-        if expert_weight.ndim == 1 and target_shape[0] > int(expert_weight.shape[0]):
-            padded = _pad_dim_right(
-                expert_weight,
-                dim=0,
-                size=target_shape[0],
-            )
-            return AutoMapping.hf_to_megatron(self, padded, megatron_module)
-
-        if expert_weight.ndim == 2:
-            logical_ffn = int(expert_weight.shape[0])
-            logical_hidden = int(expert_weight.shape[1])
-            internal_hidden = target_shape[0]
-            internal_ffn = full_cols
-            if internal_hidden > logical_hidden or internal_ffn > logical_ffn:
-                aligned = _align_expert_weight_to_shape(
-                    expert_weight,
-                    torch.Size((logical_hidden, logical_ffn)),
-                    "down_proj",
-                )
-                padded = _pad_dim_right(
-                    _pad_dim_right(aligned, dim=0, size=internal_hidden),
-                    dim=1,
-                    size=internal_ffn,
-                )
-                return AutoMapping.hf_to_megatron(self, padded, megatron_module)
-
-        return original_down_hf_to_megatron(self, hf_weights, megatron_module)
-
-    cast(Any, GPTOSSMLPGateUpProjMapping).hf_to_megatron = _gate_up_hf_to_megatron
-    cast(Any, GPTOSSMLPDownProjMapping).hf_to_megatron = _down_hf_to_megatron
-    setattr(GPTOSSMLPGateUpProjMapping, "_art_padding_patch", True)
-    setattr(GPTOSSMLPDownProjMapping, "_art_padding_patch", True)
-
-
 def _patch_gpt_oss_mapping_registry(target: Any) -> None:
-    original = getattr(target, "mapping_registry", None)
+    bridge_type = type(target)
+    original = getattr(bridge_type, "mapping_registry", None)
     if original is None or getattr(original, "_art_gpt_oss_padding_patch", False):
         return
-    hf_pretrained = getattr(target, "hf_pretrained", None)
-    padding_sizes = _gpt_oss_padding_sizes_from_hf_config(
-        getattr(hf_pretrained, "config", None)
-    )
 
-    def mapping_registry(_self: Any) -> Any:
-        upstream = original()
+    def mapping_registry(self: Any) -> Any:
+        upstream = original(self)
+        hf_config = getattr(self, "hf_config", None)
+        if hf_config is None:
+            hf_config = getattr(getattr(self, "hf_pretrained", None), "config", None)
         return _gpt_oss_padded_mapping_registry(
             upstream,
-            padding_sizes=padding_sizes,
+            padding_sizes=_gpt_oss_padding_sizes_from_hf_config(hf_config),
         )
 
     setattr(mapping_registry, "_art_gpt_oss_padding_patch", True)
-    target.mapping_registry = MethodType(mapping_registry, target)
+    bridge_type.mapping_registry = mapping_registry
+
+
+def _patch_gpt_oss_weight_loader(target: Any) -> None:
+    bridge_type = type(target)
+    original = getattr(bridge_type, "maybe_modify_loaded_hf_weight", None)
+    if original is None or getattr(original, "_art_gpt_oss_bias_encoding", False):
+        return
+    original_loader = cast(Any, original)
+
+    def maybe_modify_loaded_hf_weight(
+        self: Any,
+        hf_param: str | dict[str, str],
+        hf_state_dict: Any,
+    ) -> Any:
+        def load_one(name: str) -> torch.Tensor:
+            loaded = original_loader(self, name, hf_state_dict)
+            if name.endswith(".mlp.experts.down_proj") and name not in hf_state_dict:
+                # This Bridge version documents MXFP4 down projection output as
+                # [E, hidden, ffn], but its dequantizer emits the checkpoint's
+                # [E, ffn, hidden] layout. GPT-OSS-20B is square, so shape-based
+                # alignment cannot detect the orientation. Normalize before the
+                # optimized loader caches the materialized logical tensor.
+                loaded = loaded.transpose(-1, -2).contiguous()
+            return loaded
+
+        if isinstance(hf_param, dict):
+            return {key: load_one(name) for key, name in hf_param.items()}
+        return load_one(hf_param)
+
+    setattr(maybe_modify_loaded_hf_weight, "_art_gpt_oss_bias_encoding", True)
+    bridge_type.maybe_modify_loaded_hf_weight = maybe_modify_loaded_hf_weight
 
 
 def _gpt_oss_padded_mapping_registry(
@@ -551,19 +486,46 @@ def _gpt_oss_padded_mapping_registry(
     from megatron.bridge.models.conversion.mapping_registry import (
         MegatronMappingRegistry,
     )
+    from megatron.bridge.models.conversion.param_mapping import AutoMapping
     from megatron.bridge.models.gpt_oss.gpt_oss_bridge import (
         GPTOSSMLPDownProjMapping,
         GPTOSSMLPGateUpProjMapping,
     )
 
+    if padding_sizes is None:
+        raise RuntimeError("GPT OSS padded mappings require model padding dimensions")
+    logical_hidden, internal_hidden, logical_ffn, internal_ffn = padding_sizes
+    if internal_hidden <= logical_hidden or internal_ffn <= logical_ffn:
+        raise RuntimeError(
+            "GPT OSS expert bias encoding requires hidden and FFN padding: "
+            f"hidden={logical_hidden}->{internal_hidden}, "
+            f"ffn={logical_ffn}->{internal_ffn}"
+        )
+
     class _ArtGptOssMLPGateUpProjMapping(GPTOSSMLPGateUpProjMapping):
+        def __init__(
+            self,
+            megatron_param: str,
+            weight_hf_param: str,
+            bias_hf_param: str,
+        ) -> None:
+            cast(Any, AutoMapping).__init__(
+                self,
+                megatron_param,
+                {"weight": weight_hf_param, "bias": bias_hf_param},
+            )
+            self.allow_hf_name_mismatch = True
+
+        @property
+        def group_key(self) -> str:
+            return cast(dict[str, str], self.hf_param)["weight"]
+
         def hf_to_megatron(
             self,
             hf_weights: Any,
             megatron_module: Any,
         ) -> torch.Tensor:
             from megatron.bridge.models.conversion.param_mapping import (
-                AutoMapping,
                 _align_expert_weight_to_shape,
             )
             from megatron.bridge.models.conversion.utils import (
@@ -574,19 +536,13 @@ def _gpt_oss_padded_mapping_registry(
             )
 
             global_expert_number = extract_expert_number_from_param(self.megatron_param)
-            expert_weight = (
-                hf_weights[global_expert_number] if hf_weights.ndim >= 2 else hf_weights
-            )
+            expert_weight = hf_weights["weight"][global_expert_number]
+            expert_bias = hf_weights["bias"][global_expert_number]
             normalized_param = self._normalize_expert_param_name(self.megatron_param)
             target_param = get_module_and_param_from_name(
                 megatron_module,
                 normalized_param,
             )[1]
-            sizes = getattr(self, _GPT_OSS_MAPPING_PADDING_ATTR, None)
-            hf_param = cast(str, self.hf_param)
-            if sizes is None or hf_param.endswith("_bias"):
-                return super().hf_to_megatron(hf_weights, megatron_module)
-            logical_hidden, internal_hidden, logical_ffn, internal_ffn = sizes
             full_target_shape = (
                 int(target_param.shape[0]) * int(self.tp_size),
                 int(target_param.shape[1]),
@@ -610,46 +566,89 @@ def _gpt_oss_padded_mapping_registry(
                 dim=1,
                 size=internal_hidden,
             )
-            return AutoMapping.hf_to_megatron(self, padded, megatron_module)
+            padded[:logical_ffn, logical_hidden] = expert_bias[::2]
+            padded[
+                internal_ffn : internal_ffn + logical_ffn,
+                logical_hidden,
+            ] = expert_bias[1::2]
+            padded[logical_ffn, logical_hidden] = _GPT_OSS_QUICK_GELU_ONE
+            return AutoMapping.hf_to_megatron(
+                self,
+                _gate_up_to_etp_shard_order(padded, self.tp_size),
+                megatron_module,
+            )
 
         def megatron_to_hf(
             self,
             megatron_weights: torch.Tensor | None,
             megatron_module: Any | None,
         ) -> dict[str, torch.Tensor]:
-            converted = cast(Any, super()).megatron_to_hf(
+            converted = AutoMapping.megatron_to_hf(
+                self,
                 megatron_weights,
                 megatron_module,
             )
-            hf_param = cast(str, self.hf_param)
-            if not converted or hf_param.endswith("_bias"):
+            if not converted:
                 return converted
-            sizes = getattr(self, _GPT_OSS_MAPPING_PADDING_ATTR, None)
-            if sizes is None:
-                return converted
-            logical_hidden, internal_hidden, logical_ffn, internal_ffn = sizes
+            tensor = _gate_up_from_etp_shard_order(
+                next(iter(converted.values())), self.tp_size
+            )
+            gate = tensor[:logical_ffn, :logical_hidden]
+            up = tensor[internal_ffn : internal_ffn + logical_ffn, :logical_hidden]
+            interleaved = torch.empty(
+                2 * logical_ffn,
+                logical_hidden,
+                dtype=tensor.dtype,
+                device=tensor.device,
+            )
+            interleaved[::2] = gate
+            interleaved[1::2] = up
+            names = cast(dict[str, str], self.hf_param)
             return {
-                key: _trim_gpt_oss_interleaved_gate_up_last(
-                    _trim_dim_right(tensor, dim=-2, size=logical_hidden),
-                    logical=logical_ffn,
-                    internal=internal_ffn,
+                names["weight"]: interleaved.t().contiguous(),
+                names["bias"]: torch.stack(
+                    [
+                        tensor[:logical_ffn, logical_hidden],
+                        tensor[
+                            internal_ffn : internal_ffn + logical_ffn,
+                            logical_hidden,
+                        ],
+                    ],
+                    dim=-1,
                 )
-                if tensor.ndim >= 2
-                else tensor
-                for key, tensor in converted.items()
+                .flatten()
+                .contiguous(),
             }
 
         def resolve(self, captures: tuple[str, ...]) -> Any:
-            return _copy_gpt_oss_mapping_padding(self, super().resolve(captures))
+            megatron_param, hf_params = self._resolve_names(captures)
+            names = cast(dict[str, str], hf_params)
+            return type(self)(megatron_param, names["weight"], names["bias"])
 
     class _ArtGptOssMLPDownProjMapping(GPTOSSMLPDownProjMapping):
+        def __init__(
+            self,
+            megatron_param: str,
+            weight_hf_param: str,
+            bias_hf_param: str,
+        ) -> None:
+            cast(Any, AutoMapping).__init__(
+                self,
+                megatron_param,
+                {"weight": weight_hf_param, "bias": bias_hf_param},
+            )
+            self.allow_hf_name_mismatch = True
+
+        @property
+        def group_key(self) -> str:
+            return cast(dict[str, str], self.hf_param)["weight"]
+
         def hf_to_megatron(
             self,
-            hf_weights: torch.Tensor,
+            hf_weights: Any,
             megatron_module: Any,
         ) -> torch.Tensor:
             from megatron.bridge.models.conversion.param_mapping import (
-                AutoMapping,
                 _align_expert_weight_to_shape,
             )
             from megatron.bridge.models.conversion.utils import (
@@ -659,20 +658,14 @@ def _gpt_oss_padded_mapping_registry(
                 extract_expert_number_from_param,
             )
 
-            hf_param = cast(str, self.hf_param)
-            if hf_param.endswith("_bias"):
-                return super().hf_to_megatron(hf_weights, megatron_module)
             global_expert_number = extract_expert_number_from_param(self.megatron_param)
-            expert_weight = hf_weights[global_expert_number]
+            expert_weight = hf_weights["weight"][global_expert_number]
+            expert_bias = hf_weights["bias"][global_expert_number]
             normalized_param = self._normalize_expert_param_name(self.megatron_param)
             target_param = get_module_and_param_from_name(
                 megatron_module,
                 normalized_param,
             )[1]
-            sizes = getattr(self, _GPT_OSS_MAPPING_PADDING_ATTR, None)
-            if sizes is None:
-                return super().hf_to_megatron(hf_weights, megatron_module)
-            logical_hidden, internal_hidden, logical_ffn, internal_ffn = sizes
             full_target_shape = (
                 int(target_param.shape[0]),
                 int(target_param.shape[1]) * int(self.tp_size),
@@ -692,6 +685,7 @@ def _gpt_oss_padded_mapping_registry(
                 dim=1,
                 size=internal_ffn,
             )
+            padded[:logical_hidden, logical_ffn] = expert_bias
             return AutoMapping.hf_to_megatron(self, padded, megatron_module)
 
         def megatron_to_hf(
@@ -699,53 +693,47 @@ def _gpt_oss_padded_mapping_registry(
             megatron_weights: torch.Tensor | None,
             megatron_module: Any | None,
         ) -> dict[str, torch.Tensor]:
-            converted = cast(Any, super()).megatron_to_hf(
+            converted = AutoMapping.megatron_to_hf(
+                self,
                 megatron_weights,
                 megatron_module,
             )
-            hf_param = cast(str, self.hf_param)
-            if not converted or hf_param.endswith("_bias"):
+            if not converted:
                 return converted
-            sizes = getattr(self, _GPT_OSS_MAPPING_PADDING_ATTR, None)
-            if sizes is None:
-                return converted
-            logical_hidden, _internal_hidden, logical_ffn, _internal_ffn = sizes
+            tensor = next(iter(converted.values()))
+            names = cast(dict[str, str], self.hf_param)
             return {
-                key: _trim_dim_right(
-                    _trim_dim_right(tensor, dim=-2, size=logical_ffn),
-                    dim=-1,
-                    size=logical_hidden,
-                )
-                if tensor.ndim >= 2
-                else tensor
-                for key, tensor in converted.items()
+                names["weight"]: tensor[:logical_hidden, :logical_ffn].t().contiguous(),
+                names["bias"]: tensor[:logical_hidden, logical_ffn].contiguous(),
             }
 
         def resolve(self, captures: tuple[str, ...]) -> Any:
-            return _copy_gpt_oss_mapping_padding(self, super().resolve(captures))
+            megatron_param, hf_params = self._resolve_names(captures)
+            names = cast(dict[str, str], hf_params)
+            return type(self)(megatron_param, names["weight"], names["bias"])
 
     mappings = []
     for mapping in upstream_registry.mappings:
         if isinstance(mapping, GPTOSSMLPGateUpProjMapping):
-            mappings.append(
-                _set_gpt_oss_mapping_padding(
+            hf_param = cast(str, mapping.hf_param)
+            if not hf_param.endswith("_bias"):
+                mappings.append(
                     _ArtGptOssMLPGateUpProjMapping(
                         mapping.megatron_param,
-                        mapping.hf_param,
-                    ),
-                    padding_sizes,
+                        hf_param,
+                        f"{hf_param}_bias",
+                    )
                 )
-            )
         elif isinstance(mapping, GPTOSSMLPDownProjMapping):
-            mappings.append(
-                _set_gpt_oss_mapping_padding(
+            hf_param = cast(str, mapping.hf_param)
+            if not hf_param.endswith("_bias"):
+                mappings.append(
                     _ArtGptOssMLPDownProjMapping(
                         mapping.megatron_param,
-                        mapping.hf_param,
-                    ),
-                    padding_sizes,
+                        hf_param,
+                        f"{hf_param}_bias",
+                    )
                 )
-            )
         else:
             mappings.append(mapping)
     return MegatronMappingRegistry(*mappings)
@@ -775,13 +763,13 @@ class GptOssMoeHandler(DefaultMoeHandler):
         _register_gpt_oss_attention_mapping_types()
         _configure_gpt_oss_moe_internal_padding(provider)
         _install_gpt_oss_grouped_mlp_padding_patch()
-        _install_gpt_oss_bridge_padding_patch()
         sliding_window = _gpt_oss_sliding_window(provider)
         provider.art_flex_core_attention_wrapper = _gpt_oss_flex_core_attention_wrapper
         provider.art_flex_sliding_windows = (sliding_window,)
         provider.moe_shared_expert_overlap = False
-        # Match vLLM's bf16 router computation; fp32 routing changes expert
-        # selection enough to regress GPT-OSS train/inference parity.
+        provider.art_moe_grouped_gemm_bias_encoded = True
+        # Match GPT-OSS HF and vLLM routing precision. HybridEP converts the
+        # selected route probabilities to fp32 at its communication boundary.
         provider.moe_router_dtype = None
         _install_weighted_bias_quick_geglu_patch()
 
@@ -798,9 +786,9 @@ class GptOssMoeHandler(DefaultMoeHandler):
             )
 
         setattr(bridge, "_art_hf_weight_source", _hf_weight_source)
-        _patch_gpt_oss_mapping_registry(bridge)
         model_bridge = getattr(bridge, "_model_bridge", None)
         if model_bridge is not None and model_bridge is not bridge:
+            _patch_gpt_oss_weight_loader(model_bridge)
             _patch_gpt_oss_mapping_registry(model_bridge)
             if type(model_bridge) is object:
                 return
@@ -1208,7 +1196,7 @@ def _install_gpt_oss_preprocess_patch(model_chunks: Sequence[Any]) -> None:
             )
             return tuple(preproc_output)
 
-        gpt_module._preprocess = preprocess_hook  # type: ignore[attr-defined]
+        setattr(gpt_module, "_preprocess", preprocess_hook)
 
 
 def _install_weighted_bias_quick_geglu_patch() -> None:
@@ -1269,20 +1257,6 @@ def _from_vllm_key(key: str) -> str:
     return key.replace(".attn.", ".self_attn.", 1)
 
 
-def _pack_vllm_3d_lora_b(blocks: list[torch.Tensor]) -> torch.Tensor:
-    stacked = torch.stack(blocks, dim=0)
-    return stacked.permute(1, 2, 0).reshape(stacked.shape[1], -1).contiguous()
-
-
-def _unpack_vllm_3d_lora_b(
-    tensor: torch.Tensor,
-    *,
-    num_experts: int,
-    rank: int,
-) -> torch.Tensor:
-    return tensor.reshape(tensor.shape[0], rank, num_experts).permute(2, 0, 1)
-
-
 def _gate_up_b_to_vllm(tensor: torch.Tensor) -> torch.Tensor:
     if tensor.shape[0] % 2 != 0:
         raise RuntimeError(
@@ -1298,21 +1272,6 @@ def _gate_up_b_from_vllm(tensor: torch.Tensor) -> torch.Tensor:
             f"GPT OSS gate/up lora_B rows {tensor.shape[0]} are not even"
         )
     return torch.cat((tensor[::2], tensor[1::2]), dim=0).contiguous()
-
-
-def _group_art_moe_tensors(
-    tensors: dict[str, torch.Tensor],
-) -> dict[str, dict[int, dict[str, dict[str, torch.Tensor]]]]:
-    grouped: dict[str, dict[int, dict[str, dict[str, torch.Tensor]]]] = {}
-    for key, tensor in tensors.items():
-        match = _ART_MOE_EXPERT_KEY_RE.match(key)
-        if match is None:
-            continue
-        grouped.setdefault(match.group("prefix"), {}).setdefault(
-            int(match.group("expert")),
-            {},
-        ).setdefault(match.group("module"), {})[match.group("lora")] = tensor
-    return grouped
 
 
 def _vllm_moe_config(adapter_config: dict[str, Any]) -> dict[str, Any]:
@@ -1415,131 +1374,6 @@ def _pad_gpt_oss_lora_from_vllm(
         if key.endswith(".lora_B.weight"):
             return _pad_dim_right(tensor, dim=0, size=internal_hidden)
     return tensor.contiguous()
-
-
-def _local_padding_ranges(
-    *,
-    param: torch.nn.Parameter,
-    tensor: torch.Tensor,
-    logical: int,
-    internal: int,
-    components: tuple[int, ...],
-) -> tuple[tuple[int, int], ...]:
-    if logical == internal:
-        return ()
-    sharded = bool(getattr(param, "lora_tp_sharded", False))
-    if not sharded:
-        offset = 0
-        ranges: list[tuple[int, int]] = []
-        for component_size in components:
-            if component_size != internal:
-                raise RuntimeError(
-                    f"Unexpected GPT OSS padded component size {component_size}; "
-                    f"expected {internal}"
-                )
-            ranges.append((offset + logical, offset + internal))
-            offset += internal
-        return tuple(ranges)
-
-    from art.megatron import lora as art_lora
-
-    domain = getattr(param, "lora_shard_domain")
-    world_size = art_lora._get_shard_world_size(domain)  # type: ignore[attr-defined]
-    shard_rank = art_lora._get_shard_rank(domain)  # type: ignore[attr-defined]
-    strategy = getattr(param, "lora_tp_shard_strategy", "uniform")
-    if strategy == "uniform":
-        if components != (internal,):
-            raise RuntimeError("GPT OSS uniform padding mask expects one component")
-        if internal % world_size != 0:
-            raise RuntimeError(
-                f"GPT OSS internal size {internal} is not divisible by world size {world_size}"
-            )
-        shard_size = internal // world_size
-        shard_start = shard_rank * shard_size
-        start = max(logical, shard_start) - shard_start
-        end = min(internal, shard_start + shard_size) - shard_start
-        return ((start, end),) if end > start else ()
-
-    if strategy != "componentwise":
-        raise RuntimeError(f"Unsupported GPT OSS padding shard strategy={strategy!r}")
-
-    component_sizes = tuple(
-        int(size) for size in getattr(param, "lora_tp_component_sizes", ())
-    )
-    if component_sizes != components:
-        raise RuntimeError(
-            f"Unexpected GPT OSS component sizes {component_sizes}; expected {components}"
-        )
-    local_offset = 0
-    ranges = []
-    for component_size in component_sizes:
-        if component_size % world_size != 0:
-            raise RuntimeError(
-                "GPT OSS component size "
-                f"{component_size} is not divisible by world size {world_size}"
-            )
-        shard_size = component_size // world_size
-        shard_start = shard_rank * shard_size
-        start = max(logical, shard_start) - shard_start
-        end = min(internal, shard_start + shard_size) - shard_start
-        if end > start:
-            ranges.append((local_offset + start, local_offset + end))
-        local_offset += shard_size
-    if local_offset != tensor.shape[-1]:
-        raise RuntimeError(
-            f"GPT OSS componentwise padding mask expected local extent {local_offset}, got {tensor.shape[-1]}"
-        )
-    return tuple(ranges)
-
-
-def _zero_ranges(
-    tensor: torch.Tensor,
-    *,
-    dim: int,
-    ranges: Sequence[tuple[int, int]],
-) -> None:
-    dim = dim if dim >= 0 else tensor.ndim + dim
-    for start, end in ranges:
-        if end > start:
-            tensor.narrow(dim, start, end - start).zero_()
-
-
-def _tensor_or_local_tensor(value: Any) -> torch.Tensor | None:
-    if torch.is_tensor(value):
-        return value
-    local_tensor = getattr(value, "_local_tensor", None)
-    return local_tensor if torch.is_tensor(local_tensor) else None
-
-
-def _zero_gpt_oss_lora_padding_tensor_set(
-    param: torch.nn.Parameter,
-    *,
-    dim: int,
-    logical: int,
-    internal: int,
-    components: tuple[int, ...],
-    grads: bool,
-    params: bool,
-) -> None:
-    tensors: list[torch.Tensor] = []
-    if params:
-        tensors.append(param.data)
-    if grads:
-        for grad_value in (param.grad, getattr(param, "main_grad", None)):
-            grad = _tensor_or_local_tensor(grad_value)
-            if grad is not None:
-                tensors.append(grad)
-    if not tensors:
-        return
-    ranges = _local_padding_ranges(
-        param=param,
-        tensor=tensors[0],
-        logical=logical,
-        internal=internal,
-        components=components,
-    )
-    for tensor in tensors:
-        _zero_ranges(tensor, dim=dim, ranges=ranges)
 
 
 def _zero_gpt_oss_moe_lora_padding(
@@ -1685,7 +1519,7 @@ def _to_vllm_lora_tensors(
     *,
     adapter_config: dict[str, Any],
 ) -> tuple[dict[str, torch.Tensor], dict[str, Any]]:
-    grouped = _group_art_moe_tensors(tensors)
+    grouped = group_expert_lora_tensors(tensors, _ART_MOE_EXPERT_KEY_RE)
     transformed: dict[str, torch.Tensor] = {}
     if not grouped:
         has_fused_experts = False

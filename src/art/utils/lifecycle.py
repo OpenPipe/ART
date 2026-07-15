@@ -9,6 +9,7 @@ import signal
 import subprocess
 import sys
 import time
+from types import FrameType
 from typing import Any
 
 PROCESS_SHUTDOWN_TIMEOUT_SECONDS = 20.0
@@ -23,6 +24,18 @@ def process_shutdown_timeout(level: int) -> float:
 
 def process_shutdown_sweep_grace() -> float:
     return PROCESS_SHUTDOWN_TIMEOUT_SECONDS * _PROCESS_SHUTDOWN_SWEEP_GRACE_FRACTION
+
+
+async def cleanup_after_failure(
+    primary: BaseException,
+    cleanup: Callable[[], Awaitable[None]],
+    *,
+    message: str,
+) -> None:
+    try:
+        await cleanup()
+    except BaseException as cleanup_failure:
+        raise BaseExceptionGroup(message, [primary, cleanup_failure]) from None
 
 
 def managed_process_cmd(
@@ -168,7 +181,9 @@ class ServiceLifecycle:
     def __init__(self) -> None:
         self.closing = False
         self._close_callback: Callable[[], None] | None = None
-        self._previous_signal_handlers: dict[int, Any] = {}
+        self._previous_signal_handlers: dict[
+            int, Callable[[int, FrameType | None], object] | int | None
+        ] = {}
 
     def begin_close(self) -> bool:
         if self.closing:
@@ -191,9 +206,16 @@ class ServiceLifecycle:
             previous = signal.getsignal(signum)
             self._previous_signal_handlers[signum] = previous
 
-            def _handler(received_signum, frame, *, _previous=previous):
+            def _handler(
+                received_signum: int,
+                frame: FrameType | None,
+                *,
+                _previous: Callable[[int, FrameType | None], object]
+                | int
+                | None = previous,
+            ) -> None:
                 close()
-                if callable(_previous):
+                if not isinstance(_previous, int) and _previous is not None:
                     _previous(received_signum, frame)
                     return
                 if _previous == signal.SIG_IGN:

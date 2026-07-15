@@ -5,7 +5,16 @@ from datetime import datetime
 import json
 import os
 import time
-from typing import TYPE_CHECKING, Any, Generic, Iterable, Optional, cast, overload
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    Generic,
+    Iterable,
+    Literal,
+    Optional,
+    cast,
+    overload,
+)
 from urllib.parse import urlparse
 import warnings
 
@@ -29,8 +38,18 @@ from .metrics_taxonomy import (
     summarize_trajectory_groups,
 )
 from .preprocessing.moe_routing import attach_moe_routing_metadata_to_choice
-from .preprocessing.policy_spans import attach_policy_token_metadata_to_choice
-from .preprocessing.vllm_tokens import attach_vllm_token_metadata_to_choice
+from .preprocessing.policy_spans import (
+    attach_policy_token_metadata_to_choice,
+    attach_static_policy_token_span_to_choice,
+    choice_policy_token_spans,
+    validate_complete_policy_token_spans,
+)
+from .preprocessing.vllm_tokens import (
+    attach_completion_token_metadata,
+    attach_vllm_token_metadata_to_choice,
+    choice_completion_tokens,
+)
+from .serving_capabilities import ServingCapabilities
 from .trajectories import Trajectory, TrajectoryGroup
 from .types import SFTMetricLoggingConfig, TrainSFTConfig
 from .utils import wandb_sdk
@@ -83,18 +102,33 @@ def _merge_extra_body_defaults(
 def _attach_response_art_metadata(
     response: Any,
     routed_experts: dict[int, Any] | None = None,
+    policy_span_mode: Literal["none", "require", "synthesize"] = "none",
+    request_model: str | None = None,
 ) -> None:
     choices = getattr(response, "choices", None)
     model_dump = getattr(response, "model_dump", None)
     if not choices or not callable(model_dump):
         return
     response_payload = model_dump(mode="python")
+    if routed_experts is not None:
+        missing = [
+            int(choice.index)
+            for choice in choices
+            if int(choice.index) not in routed_experts
+        ]
+        if missing:
+            raise RuntimeError(
+                "ART binary response omitted routed experts for choice indices "
+                f"{missing}; received {sorted(routed_experts)}"
+            )
     for choice_index, choice in enumerate(choices):
         attach_vllm_token_metadata_to_choice(
             choice=choice,
             response_payload=response_payload,
             choice_index=choice_index,
         )
+    attach_completion_token_metadata(response)
+    for choice_index, choice in enumerate(choices):
         attach_moe_routing_metadata_to_choice(
             choice=choice,
             response_payload=response_payload,
@@ -110,6 +144,28 @@ def _attach_response_art_metadata(
             response_payload=response_payload,
             choice_index=choice_index,
         )
+        if policy_span_mode == "synthesize" and not choice_policy_token_spans(choice):
+            completion_tokens = choice_completion_tokens(choice)
+            if completion_tokens is None or completion_tokens <= 0:
+                raise RuntimeError(
+                    "Immutable step-LoRA policy tracking requires a positive exact "
+                    "per-choice completion token count."
+                )
+            attach_static_policy_token_span_to_choice(
+                choice=choice,
+                model_name=request_model or "",
+                completion_tokens=completion_tokens,
+            )
+        if policy_span_mode != "none":
+            completion_tokens = choice_completion_tokens(choice)
+            if completion_tokens is None or completion_tokens <= 0:
+                raise RuntimeError(
+                    "Policy tracking requires a positive exact per-choice completion "
+                    "token count."
+                )
+            validate_complete_policy_token_spans(
+                choice, completion_tokens=completion_tokens
+            )
 
 
 def _is_local_inference_base_url(base_url: str | None) -> bool:
@@ -130,12 +186,14 @@ class _OpenAIChatCompletionsProxy:
         default_extra_body: dict[str, Any] | None = None,
         local_serving_base_url: str | None = None,
         binary_completions: Any | None = None,
+        policy_span_mode: Literal["none", "require", "synthesize"] = "none",
     ) -> None:
         self._completions = completions
         self._record_costs = record_costs
         self._default_extra_body = default_extra_body
         self._local_serving_base_url = local_serving_base_url
         self._binary_completions = binary_completions
+        self._policy_span_mode = policy_span_mode
 
     async def create(self, *args: Any, **kwargs: Any) -> Any:
         if self._default_extra_body is not None:
@@ -170,7 +228,15 @@ class _OpenAIChatCompletionsProxy:
                     "of counting rollouts as data errors."
                 ) from exc
             raise
-        _attach_response_art_metadata(response, routed_experts)
+        request_model = kwargs.get("model")
+        if self._policy_span_mode != "none" and not isinstance(request_model, str):
+            raise RuntimeError("OpenAI completion model must be a string")
+        _attach_response_art_metadata(
+            response,
+            routed_experts,
+            self._policy_span_mode,
+            request_model,
+        )
         self._record_costs(response)
         return response
 
@@ -186,6 +252,7 @@ class _OpenAIChatProxy:
         default_extra_body: dict[str, Any] | None = None,
         local_serving_base_url: str | None = None,
         binary_chat: Any | None = None,
+        policy_span_mode: Literal["none", "require", "synthesize"] = "none",
     ) -> None:
         self._chat = chat
         self.completions = _OpenAIChatCompletionsProxy(
@@ -194,6 +261,7 @@ class _OpenAIChatProxy:
             default_extra_body,
             local_serving_base_url,
             binary_chat.completions if binary_chat is not None else None,
+            policy_span_mode,
         )
 
     def __getattr__(self, name: str) -> Any:
@@ -208,12 +276,14 @@ class _OpenAIClientProxy:
         default_extra_body: dict[str, Any] | None = None,
         local_serving_base_url: str | None = None,
         binary_routes_base_url: str | None = None,
+        policy_span_mode: Literal["none", "require", "synthesize"] = "none",
     ) -> None:
         self._client = client
         self._record_costs = record_costs
         self._default_extra_body = default_extra_body
         self._local_serving_base_url = local_serving_base_url
         self._binary_routes_base_url = binary_routes_base_url
+        self._policy_span_mode = policy_span_mode
         binary_client = (
             client.with_options(base_url=binary_routes_base_url)
             if binary_routes_base_url is not None
@@ -225,6 +295,7 @@ class _OpenAIClientProxy:
             default_extra_body,
             local_serving_base_url,
             binary_client.chat if binary_client is not None else None,
+            policy_span_mode,
         )
 
     def with_options(self, *args: Any, **kwargs: Any) -> "_OpenAIClientProxy":
@@ -234,6 +305,7 @@ class _OpenAIClientProxy:
             self._default_extra_body,
             self._local_serving_base_url,
             self._binary_routes_base_url,
+            self._policy_span_mode,
         )
 
     def __getattr__(self, name: str) -> Any:
@@ -388,6 +460,7 @@ class Model(
     _s3_prefix: str | None = None
     _openai_client: AsyncOpenAI | None = None
     _art_binary_routes_base_url: str | None = None
+    _serving_capabilities: ServingCapabilities | None = None
     _wandb_run: Optional["Run"] = None  # Private, for lazy wandb initialization
     _wandb_defined_metrics: set[str]
     _wandb_config: dict[str, Any]
@@ -443,6 +516,7 @@ class Model(
         )
         object.__setattr__(self, "_metrics_builder_state_loaded", False)
         object.__setattr__(self, "_art_binary_routes_base_url", None)
+        object.__setattr__(self, "_serving_capabilities", None)
 
     @overload
     def __new__(
@@ -558,9 +632,33 @@ class Model(
                     else None
                 ),
                 self._art_binary_routes_base_url,
+                self._policy_span_mode(),
             ),
         )
         return self._openai_client
+
+    async def _reset_inference_runtime(self) -> None:
+        client = self._openai_client
+        self._openai_client = None
+        self._art_binary_routes_base_url = None
+        self._serving_capabilities = None
+        self.inference_base_url = None
+        self.inference_api_key = None
+        self.inference_model_name = None
+        if client is not None:
+            await client.close()
+
+    def _policy_span_mode(self) -> Literal["none", "require", "synthesize"]:
+        internal_config = getattr(self, "_internal_config", None)
+        if not self.trainable or self._serving_capabilities is None:
+            return "none"
+        if self._serving_capabilities.policy_token_spans:
+            return "require"
+        if (internal_config or {}).get(
+            "rollout_weight_update_mode", "step_lora"
+        ) == "step_lora":
+            return "synthesize"
+        return "none"
 
     def _default_chat_completion_extra_body(self) -> dict[str, Any] | None:
         internal_config = getattr(self, "_internal_config", None)
@@ -1422,6 +1520,7 @@ class TrainableModel(Model[ModelConfig, StateType], Generic[ModelConfig, StateTy
         backend: "Backend",
         _openai_client_config: dev.OpenAIServerConfig | None = None,
     ) -> None:
+        await self._reset_inference_runtime()
         await super().register(backend)
         base_url, api_key = await backend._prepare_backend_for_training(
             self, _openai_client_config
@@ -1483,8 +1582,8 @@ class TrainableModel(Model[ModelConfig, StateType], Generic[ModelConfig, StateTy
 
         Args:
             trajectories: An iterable of Trajectory objects.
-            config: SFT configuration including learning_rate and batch_size.
-                If None, uses default TrainSFTConfig().
+            config: SFT configuration including learning_rate, batch_size, and which
+                assistant turns contribute loss. If None, uses TrainSFTConfig().
             _config: Additional experimental configuration that is subject to change and
                 not yet part of the public API. Use at your own risk.
             verbose: Whether to print verbose output.

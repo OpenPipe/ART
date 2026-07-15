@@ -3,7 +3,12 @@ from collections import Counter
 from contextlib import asynccontextmanager
 from typing import AsyncIterator
 
-from art.adapter_leases import pin_inference_step, pinned_inference_step
+from art.adapter_leases import (
+    pin_inference_step,
+    pin_inference_target,
+    pinned_inference_name,
+    pinned_inference_step,
+)
 
 
 class AdapterLeaseManager:

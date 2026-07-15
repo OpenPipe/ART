@@ -1,7 +1,7 @@
 from __future__ import annotations
 
-from collections.abc import Sequence
-from typing import Any
+from collections.abc import Callable, Sequence
+from typing import Any, cast
 
 from megatron.core import parallel_state as ps
 from pydantic import BaseModel, ConfigDict
@@ -59,6 +59,19 @@ class PreparedSFTMicroInputs(BaseModel):
     local_token_uids: torch.Tensor | None = None
 
 
+def _map_packed_tensors(
+    inputs: PackedTensors,
+    transform: Callable[[torch.Tensor], torch.Tensor],
+) -> PackedTensors:
+    return cast(
+        PackedTensors,
+        {
+            key: transform(value) if isinstance(value, torch.Tensor) else value
+            for key, value in inputs.items()
+        },
+    )
+
+
 @torch.no_grad()
 def select_indexed_inputs(packed_tensors: PackedTensors, index: int) -> PackedTensors:
     def selected_tensor(value: torch.Tensor) -> torch.Tensor:
@@ -68,28 +81,20 @@ def select_indexed_inputs(packed_tensors: PackedTensors, index: int) -> PackedTe
             return selected.clone()
         return selected
 
-    return PackedTensors(  # type: ignore[call-arg]
-        **{
-            key: selected_tensor(value)
-            for key, value in packed_tensors.items()
-            if isinstance(value, torch.Tensor)
-        },
-        pixel_values=[None],
-        image_grid_thw=[None],
-    )
+    selected = _map_packed_tensors(packed_tensors, selected_tensor)
+    selected["moe_routing_replay"] = None
+    selected["pixel_values"] = [None]
+    selected["image_grid_thw"] = [None]
+    return selected
 
 
 @torch.no_grad()
 def _clone_packed_tensors(inputs: PackedTensors) -> PackedTensors:
-    return PackedTensors(  # type: ignore[call-arg]
-        **{
-            key: value.clone()
-            for key, value in inputs.items()
-            if isinstance(value, torch.Tensor)
-        },
-        pixel_values=[None],
-        image_grid_thw=[None],
-    )
+    cloned = _map_packed_tensors(inputs, torch.Tensor.clone)
+    cloned["moe_routing_replay"] = None
+    cloned["pixel_values"] = [None]
+    cloned["image_grid_thw"] = [None]
+    return cloned
 
 
 @torch.no_grad()
@@ -340,9 +345,7 @@ def _select_next_step_first_micro(
 
 
 def _move_inputs_to_device(inputs: PackedTensors, device: torch.device) -> None:
-    for key, value in inputs.items():
-        if isinstance(value, torch.Tensor):
-            inputs[key] = value.to(device)  # type: ignore[index]
+    inputs.update(_map_packed_tensors(inputs, lambda tensor: tensor.to(device)))
 
 
 def _count_trainable_tokens(inputs: LossInputs | DispatchedPackedTensors) -> float:

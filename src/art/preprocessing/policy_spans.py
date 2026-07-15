@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from typing import Any, cast
 
 from openai.types.chat.chat_completion import Choice
@@ -59,4 +60,46 @@ def choice_policy_token_spans(choice: Choice) -> list[PolicyTokenSpan]:
     return [
         PolicyTokenSpan.model_validate(span)
         for span in extra.get(POLICY_TOKEN_SPANS_KEY, [])
+    ]
+
+
+def validate_complete_policy_token_spans(
+    choice: Choice, *, completion_tokens: int
+) -> None:
+    spans = choice_policy_token_spans(choice)
+    cursor = 0
+    for span in spans:
+        if span.start_token != cursor:
+            raise RuntimeError(
+                "Policy token spans must form a contiguous completion partition; "
+                f"expected start_token={cursor}, got {span.start_token}."
+            )
+        cursor = span.end_token
+    if cursor != completion_tokens:
+        raise RuntimeError(
+            "Policy token spans must cover every completion token; "
+            f"covered={cursor}, completion_tokens={completion_tokens}."
+        )
+
+
+def attach_static_policy_token_span_to_choice(
+    *, choice: Choice, model_name: str, completion_tokens: int
+) -> None:
+    if completion_tokens <= 0:
+        return
+    match = re.search(r"@(\d+)$", model_name)
+    if match is None:
+        raise RuntimeError(
+            "Immutable step-LoRA policy tracking requires a model name ending in @<step>."
+        )
+    step = int(match.group(1))
+    extra = cast(dict[str, Any], choice.model_extra)
+    extra[POLICY_TOKEN_SPANS_KEY] = [
+        PolicyTokenSpan(
+            start_token=0,
+            end_token=completion_tokens,
+            policy_version=step,
+            lora_slot=model_name,
+            update_seq=step,
+        ).model_dump(mode="python")
     ]

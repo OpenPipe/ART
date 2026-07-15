@@ -172,6 +172,14 @@ class RouterCallRoute(BaseModel):
         return int(self.expert_indices.shape[1])
 
 
+def _router_call_key(route: RouterCallRoute) -> tuple[str, int]:
+    if route.sample_index is not None:
+        return ("sample", int(route.sample_index))
+    if route.micro_slot is not None:
+        return ("dummy_micro_slot", int(route.micro_slot))
+    raise RuntimeError("Routing replay calls require sample_index or micro_slot")
+
+
 class StepRouterRoutes(BaseModel):
     calls: dict[int, RouterCallRoute]
 
@@ -211,17 +219,7 @@ class StepRoutes(BaseModel):
         token_count_by_call_key: dict[tuple[str, int], int] = {}
         for router_key, step_router in self.routers.items():
             for call_index, route in step_router.calls.items():
-                call_key = self._router_call_key(route)
-                if call_key is None:
-                    if route.num_global_tokens != expected_tokens:
-                        raise RuntimeError(
-                            "Route token count must match step global_token_uids "
-                            "when no per-micro metadata is present: "
-                            f"router='{router_key}', call={call_index}, "
-                            f"route_tokens={route.num_global_tokens}, "
-                            f"global_token_uids={expected_tokens}"
-                        )
-                    continue
+                call_key = _router_call_key(route)
                 if route.num_global_tokens > expected_tokens:
                     raise RuntimeError(
                         "Route token count exceeds step global_token_uids span: "
@@ -242,14 +240,6 @@ class StepRoutes(BaseModel):
                     )
                 token_count_by_call_key[call_key] = route.num_global_tokens
         return self
-
-    @staticmethod
-    def _router_call_key(route: RouterCallRoute) -> tuple[str, int] | None:
-        if route.sample_index is not None:
-            return ("sample", int(route.sample_index))
-        if route.micro_slot is not None:
-            return ("dummy_micro_slot", int(route.micro_slot))
-        return None
 
 
 class MoeRoutingReplayBundle(BaseModel):
@@ -1032,7 +1022,6 @@ class MoeRoutingReplayController:
         *,
         step_index: int,
         sample_index: int | list[int | None] | None,
-        global_grad_accumulation_sequences: int | None = None,
     ) -> None:
         if step_index not in self.bundle.steps:
             raise RuntimeError(
@@ -1093,7 +1082,6 @@ class MoeRoutingReplayController:
             self._router_call_sequences[router_key] = self._build_call_sequence(
                 router_key=router_key,
                 sample_index=sample_index,
-                global_grad_accumulation_sequences=global_grad_accumulation_sequences,
             )
         RouterReplay, RouterReplayAction = _router_replay_classes()
         RouterReplay.clear_global_indices()
@@ -1172,45 +1160,30 @@ class MoeRoutingReplayController:
         *,
         router_key: str,
         sample_index: int | list[int | None] | None,
-        global_grad_accumulation_sequences: int | None,
     ) -> list[int]:
         if self._active_step_routes is None or self._active_step_index is None:
             raise RuntimeError("Routing replay step is not active")
         router_calls = self._active_step_routes.routers[router_key].calls
-        if all(
-            self._router_call_key(route) is not None for route in router_calls.values()
-        ):
-            calls_by_key: dict[tuple[str, int], list[int]] = defaultdict(list)
-            for call_index, route in sorted(router_calls.items()):
-                call_key = self._router_call_key(route)
-                assert call_key is not None
-                calls_by_key[call_key].append(call_index)
-            call_sequence: list[int] = []
-            for call_key in self._build_local_call_keys(sample_index=sample_index):
-                if call_key is None:
-                    continue
-                matching_call_indices = calls_by_key.get(call_key)
-                if not matching_call_indices:
-                    raise RuntimeError(
-                        "Replay router call sequence is missing local micro metadata: "
-                        f"step={self._active_step_index}, router='{router_key}', "
-                        f"call_key={call_key}"
-                    )
-                call_sequence.extend(matching_call_indices)
-            return call_sequence
-        return self._legacy_router_call_sequence(
-            step_index=self._active_step_index,
-            router_key=router_key,
-            sample_index=sample_index,
-            global_grad_accumulation_sequences=global_grad_accumulation_sequences,
-            total_calls=len(router_calls),
-        )
+        calls_by_key: dict[tuple[str, int], list[int]] = defaultdict(list)
+        for call_index, route in sorted(router_calls.items()):
+            calls_by_key[_router_call_key(route)].append(call_index)
+        call_sequence: list[int] = []
+        for call_key in self._build_local_call_keys(sample_index=sample_index):
+            matching_call_indices = calls_by_key.get(call_key)
+            if not matching_call_indices:
+                raise RuntimeError(
+                    "Replay router call sequence is missing local micro metadata: "
+                    f"step={self._active_step_index}, router='{router_key}', "
+                    f"call_key={call_key}"
+                )
+            call_sequence.extend(matching_call_indices)
+        return call_sequence
 
     def _build_local_call_keys(
         self,
         *,
         sample_index: int | list[int | None] | None,
-    ) -> list[tuple[str, int] | None]:
+    ) -> list[tuple[str, int]]:
         if not isinstance(sample_index, list):
             if sample_index is None:
                 return [self._dummy_micro_call_key(local_micro_index=0)]
@@ -1228,7 +1201,7 @@ class MoeRoutingReplayController:
         *,
         global_sample_index: int | None,
         local_micro_index: int,
-    ) -> tuple[str, int] | None:
+    ) -> tuple[str, int]:
         if global_sample_index is not None:
             return ("sample", int(global_sample_index))
         return self._dummy_micro_call_key(local_micro_index=local_micro_index)
@@ -1241,14 +1214,6 @@ class MoeRoutingReplayController:
         dp_world_size = int(ps.get_data_parallel_world_size())
         return ("dummy_micro_slot", local_micro_index * dp_world_size + dp_rank)
 
-    @staticmethod
-    def _router_call_key(route: RouterCallRoute) -> tuple[str, int] | None:
-        if route.sample_index is not None:
-            return ("sample", int(route.sample_index))
-        if route.micro_slot is not None:
-            return ("dummy_micro_slot", int(route.micro_slot))
-        return None
-
     def _active_router_call_key(self) -> tuple[str, int] | None:
         if self._active_micro_order is None:
             return None
@@ -1256,67 +1221,6 @@ class MoeRoutingReplayController:
             global_sample_index=self._active_sample_index,
             local_micro_index=self._active_micro_order,
         )
-
-    @staticmethod
-    def _legacy_router_call_sequence(
-        *,
-        step_index: int,
-        router_key: str,
-        sample_index: int | list[int | None] | None,
-        global_grad_accumulation_sequences: int | None,
-        total_calls: int,
-    ) -> list[int]:
-        if not isinstance(sample_index, list) and sample_index is None:
-            if total_calls != 1:
-                raise RuntimeError(
-                    "Replay router call sequence lacks sample metadata and has "
-                    f"{total_calls} calls for router='{router_key}', step={step_index}"
-                )
-            return [0]
-
-        step_sample_count = global_grad_accumulation_sequences
-        if step_sample_count is None:
-            if isinstance(sample_index, list):
-                step_sample_count = len(
-                    [index for index in sample_index if index is not None]
-                )
-            else:
-                step_sample_count = 1
-        if step_sample_count <= 0 or total_calls % step_sample_count != 0:
-            raise RuntimeError(
-                "Replay router call count is not divisible by step sample count: "
-                f"step={step_index}, router='{router_key}', total_calls={total_calls}, "
-                f"step_sample_count={step_sample_count}"
-            )
-        calls_per_sample = total_calls // step_sample_count
-        step_base_sample_index = step_index * step_sample_count
-        if isinstance(sample_index, list):
-            call_sequence: list[int] = []
-            for global_sample_index in sample_index:
-                if global_sample_index is None:
-                    continue
-                sample_offset = int(global_sample_index) - step_base_sample_index
-                if sample_offset < 0 or sample_offset >= step_sample_count:
-                    raise RuntimeError(
-                        "Replay router call index is outside the step-local range: "
-                        f"step={step_index}, router='{router_key}', "
-                        f"global_sample_index={global_sample_index}, "
-                        f"step_base_sample_index={step_base_sample_index}, "
-                        f"step_sample_count={step_sample_count}"
-                    )
-                start = sample_offset * calls_per_sample
-                call_sequence.extend(range(start, start + calls_per_sample))
-            return call_sequence
-
-        sample_offset = int(sample_index) - step_base_sample_index
-        if sample_offset < 0 or sample_offset >= step_sample_count:
-            raise RuntimeError(
-                "Replay router call index is outside the step-local range: "
-                f"step={step_index}, router='{router_key}', sample_index={sample_index}, "
-                f"step_sample_count={step_sample_count}"
-            )
-        start = sample_offset * calls_per_sample
-        return list(range(start, start + calls_per_sample))
 
     def _active_micro_call_indices(self, router_key: str) -> list[int]:
         if self._active_step_routes is None:
@@ -1338,7 +1242,7 @@ class MoeRoutingReplayController:
         first_index = call_sequence[cursor]
         if active_call_key is None:
             return [first_index]
-        next_key = self._router_call_key(router_calls[first_index])
+        next_key = _router_call_key(router_calls[first_index])
         last_index = self._router_last_call_indices.get(router_key)
         last_key = self._router_last_call_keys.get(router_key)
         if (
@@ -1349,7 +1253,7 @@ class MoeRoutingReplayController:
             return [last_index]
         indices: list[int] = []
         for call_index in call_sequence[cursor:]:
-            if self._router_call_key(router_calls[call_index]) != active_call_key:
+            if _router_call_key(router_calls[call_index]) != active_call_key:
                 break
             indices.append(call_index)
         return indices
@@ -1369,7 +1273,7 @@ class MoeRoutingReplayController:
         last_index = self._router_last_call_indices.get(router_key)
         last_key = self._router_last_call_keys.get(router_key)
         next_key = (
-            self._router_call_key(router_calls[call_sequence[cursor]])
+            _router_call_key(router_calls[call_sequence[cursor]])
             if cursor < len(call_sequence)
             else None
         )
@@ -1398,7 +1302,7 @@ class MoeRoutingReplayController:
         call_index = call_sequence[cursor]
         self._router_call_cursors[router_key] = cursor + 1
         self._router_last_call_indices[router_key] = call_index
-        self._router_last_call_keys[router_key] = self._router_call_key(
+        self._router_last_call_keys[router_key] = _router_call_key(
             router_calls[call_index]
         )
         return call_index

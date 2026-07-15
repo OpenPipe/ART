@@ -225,7 +225,7 @@ class LossInputs(BaseModel):
             weights=shift_tensor(inputs["weights"], 0.0),
             group_ids=shift_tensor(inputs["group_ids"], 0),
             original_logprobs=(
-                shift_tensor(inputs["original_logprobs"], 0.0)  # ty: ignore[invalid-key]
+                shift_tensor(inputs["original_logprobs"], 0.0)
                 if "original_logprobs" in inputs
                 else None
             ),
@@ -276,8 +276,6 @@ def loss_fn(
     old_logprobs = _mask_ignored_tokens(old_logprobs, assistant_mask_bool)
     if ref_logprobs is not None:
         ref_logprobs = _mask_ignored_tokens(ref_logprobs, assistant_mask_bool)
-    if entropies is not None:
-        entropies = _mask_ignored_tokens(entropies, assistant_mask_bool)
     assistant_mask = assistant_mask_bool.to(new_logprobs.dtype)
     weights = aligned_inputs.weights
     probs_corr = compute_probs_corr(
@@ -391,6 +389,7 @@ def loss_fn(
     # Compute reduced entropy for the current step.
     aligned_entropies = aligned_inputs.aligned_entropies(entropies)
     if aligned_entropies is not None:
+        aligned_entropies = _mask_ignored_tokens(aligned_entropies, assistant_mask_bool)
         entropy = (aligned_entropies * weights * assistant_mask).sum() / denominator
     else:
         entropy = None

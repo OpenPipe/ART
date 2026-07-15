@@ -6,12 +6,14 @@ with Pydantic after the OpenAI response crosses back into the training process.
 
 from __future__ import annotations
 
+import asyncio
 from collections.abc import Mapping
+from contextlib import asynccontextmanager
 from dataclasses import dataclass
 import importlib
 import re
 import sys
-from typing import Any
+from typing import Any, AsyncIterator
 
 import msgspec
 import numpy as np
@@ -21,11 +23,11 @@ POLICY_TOKEN_SPANS_FIELD = "policy_token_spans"
 ART_POLICY_TOKEN_SPANS_FIELD = "art_policy_token_spans"
 
 _CURRENT_ENGINE_POLICY_SPANS: dict[str, list[dict[str, Any]]] = {}
-_COMPLETION_POLICY_SPANS_BY_REQUEST: dict[str, dict[int, list[dict[str, Any]]]] = {}
 _WORKER_LORA_POLICY_BY_ID: dict[int, dict[str, Any]] = {}
 _WORKER_LORA_UPDATE_SEQ = 0
 _POLICY_CACHE_SALT_PREFIX = "art_policy_cache_salt="
 _POLICY_CACHE_SALT_MARKER = f"|{_POLICY_CACHE_SALT_PREFIX}"
+_LORA_UPDATE_COORDINATOR_FIELD = "_art_lora_update_coordinator"
 
 _MODEL_RUNNER_OUTPUT_MODULES = (
     "vllm.v1.outputs",
@@ -50,8 +52,97 @@ def patch_policy_token_spans() -> None:
     _patch_output_processor_policy_span_accumulation()
     _patch_openai_response_policy_spans()
     _patch_lora_alias_resolution()
+    _patch_engine_request_admission()
     _patch_load_inplace_storage()
     _patch_engine_waiting_cache_salt_utility()
+
+
+class _SlotAdmissionState:
+    __slots__ = (
+        "condition",
+        "active_admissions",
+        "blocked",
+        "lora_request",
+        "update_active",
+        "policy_version",
+    )
+
+    def __init__(self) -> None:
+        self.condition = asyncio.Condition()
+        self.active_admissions = 0
+        self.blocked = False
+        self.lora_request: Any | None = None
+        self.update_active = False
+        self.policy_version: int | None = None
+
+
+class LoraUpdateCoordinator:
+    """Linearizes request admission with mutable LoRA slot updates."""
+
+    def __init__(self) -> None:
+        self._states: dict[str, _SlotAdmissionState] = {}
+
+    def _state(self, lora_slot: str) -> _SlotAdmissionState:
+        return self._states.setdefault(lora_slot, _SlotAdmissionState())
+
+    @asynccontextmanager
+    async def admission(
+        self, lora_slot: str
+    ) -> AsyncIterator[tuple[int | None, Any | None]]:
+        state = self._state(lora_slot)
+        async with state.condition:
+            await state.condition.wait_for(lambda: not state.blocked)
+            state.active_admissions += 1
+        try:
+            yield state.policy_version, state.lora_request
+        finally:
+            async with state.condition:
+                state.active_admissions -= 1
+                state.condition.notify_all()
+
+    async def begin_update(self, lora_slot: str) -> None:
+        state = self._state(lora_slot)
+        async with state.condition:
+            await state.condition.wait_for(lambda: not state.update_active)
+            state.update_active = True
+            state.blocked = True
+            await state.condition.wait_for(lambda: state.active_admissions == 0)
+
+    async def commit_update(
+        self,
+        lora_slot: str,
+        policy_version: int,
+        lora_request: Any,
+    ) -> None:
+        state = self._state(lora_slot)
+        async with state.condition:
+            if not state.update_active:
+                raise RuntimeError(f"No active LoRA update for slot {lora_slot!r}")
+            state.policy_version = int(policy_version)
+            state.lora_request = lora_request
+            state.update_active = False
+            state.blocked = False
+            state.condition.notify_all()
+
+    async def fail_update(self, lora_slot: str) -> None:
+        state = self._state(lora_slot)
+        async with state.condition:
+            state.update_active = False
+            # The workers may already hold new weights. Keep admission blocked
+            # until a retry completes publication and scheduler rehashing.
+            state.blocked = True
+            state.condition.notify_all()
+
+
+def lora_update_coordinator(models: Any, engine_client: Any) -> LoraUpdateCoordinator:
+    coordinator = getattr(models, _LORA_UPDATE_COORDINATOR_FIELD, None)
+    if coordinator is None:
+        coordinator = getattr(engine_client, _LORA_UPDATE_COORDINATOR_FIELD, None)
+    if coordinator is None:
+        coordinator = LoraUpdateCoordinator()
+    setattr(models, _LORA_UPDATE_COORDINATOR_FIELD, coordinator)
+    setattr(engine_client, _LORA_UPDATE_COORDINATOR_FIELD, coordinator)
+    return coordinator
 
 
 def _patch_model_runner_output_type() -> None:
@@ -93,7 +184,6 @@ def register_lora_alias(
     *,
     public_model_name: str,
     lora_slot: str,
-    policy_version: int | None,
 ) -> None:
     aliases = getattr(models, "_art_lora_aliases", None)
     if aliases is None:
@@ -101,12 +191,18 @@ def register_lora_alias(
         setattr(models, "_art_lora_aliases", aliases)
     aliases[public_model_name] = lora_slot
 
-    versions = getattr(models, "_art_lora_alias_policy_versions", None)
+
+def publish_lora_slot_policy(
+    models: Any,
+    *,
+    lora_slot: str,
+    policy_version: int,
+) -> None:
+    versions = getattr(models, "_art_lora_slot_policy_versions", None)
     if versions is None:
         versions = {}
-        setattr(models, "_art_lora_alias_policy_versions", versions)
-    if policy_version is not None:
-        versions[public_model_name] = policy_version
+        setattr(models, "_art_lora_slot_policy_versions", versions)
+    versions[lora_slot] = int(policy_version)
 
 
 def _resolve_lora_alias(models: Any, model_name: str | None) -> Any | None:
@@ -118,10 +214,8 @@ def _resolve_lora_alias(models: Any, model_name: str | None) -> Any | None:
     return models.lora_requests.get(slot)
 
 
-def _alias_policy_version(models: Any, model_name: str | None) -> int | None:
-    if not model_name:
-        return None
-    version = getattr(models, "_art_lora_alias_policy_versions", {}).get(model_name)
+def _slot_policy_version(models: Any, lora_slot: str) -> int | None:
+    version = getattr(models, "_art_lora_slot_policy_versions", {}).get(lora_slot)
     if version is None:
         return None
     return int(version)
@@ -169,12 +263,13 @@ def _apply_lora_alias_policy_cache_salt(
     request: Any,
     lora_request: Any,
 ) -> None:
-    policy_version = _alias_policy_version(models, getattr(request, "model", None))
+    lora_slot = str(lora_request.lora_name)
+    policy_version = _slot_policy_version(models, lora_slot)
     if policy_version is None:
         return
     _set_policy_cache_salt(
         request,
-        lora_slot=str(lora_request.lora_name),
+        lora_slot=lora_slot,
         policy_version=policy_version,
     )
 
@@ -456,9 +551,6 @@ def _patch_openai_response_policy_spans() -> None:
         )
         if isinstance(response, ChatCompletionResponse):
             spans_by_choice = _policy_spans_by_choice_from_final_output(final_res)
-            fallback_spans = _COMPLETION_POLICY_SPANS_BY_REQUEST.pop(request_id, {})
-            if not spans_by_choice:
-                spans_by_choice = fallback_spans
             for choice in response.choices:
                 spans = spans_by_choice.get(choice.index)
                 if spans:
@@ -473,6 +565,16 @@ def _patch_openai_response_policy_spans() -> None:
 
 def _patch_lora_alias_resolution() -> None:
     from vllm.entrypoints.openai.engine.serving import OpenAIServing
+
+    original_init = OpenAIServing.__init__
+    if not getattr(original_init, "__art_lora_update_patched__", False):
+
+        def __init__(self: Any, *args: Any, **kwargs: Any) -> None:
+            original_init(self, *args, **kwargs)
+            lora_update_coordinator(self.models, self.engine_client)
+
+        __init__.__art_lora_update_patched__ = True  # type: ignore[attr-defined]
+        OpenAIServing.__init__ = __init__  # type: ignore[method-assign]
 
     original_check = OpenAIServing._check_model
     if not getattr(original_check, "__art_policy_spans_patched__", False):
@@ -516,6 +618,66 @@ def _patch_lora_alias_resolution() -> None:
 
     _maybe_get_adapters.__art_policy_spans_patched__ = True  # type: ignore[attr-defined]
     OpenAIServing._maybe_get_adapters = _maybe_get_adapters  # type: ignore[method-assign]
+
+
+def _patch_engine_request_admission() -> None:
+    from vllm.v1.engine.async_llm import AsyncLLM
+
+    original = AsyncLLM.add_request
+    if getattr(original, "__art_lora_update_patched__", False):
+        return
+
+    async def add_request(
+        self: Any,
+        request_id: str,
+        prompt: Any,
+        params: Any,
+        arrival_time: float | None = None,
+        lora_request: Any | None = None,
+        **kwargs: Any,
+    ) -> Any:
+        coordinator = getattr(self, _LORA_UPDATE_COORDINATOR_FIELD, None)
+        if coordinator is None or lora_request is None:
+            return await original(
+                self,
+                request_id,
+                prompt,
+                params,
+                arrival_time=arrival_time,
+                lora_request=lora_request,
+                **kwargs,
+            )
+        lora_slot = str(lora_request.lora_name)
+        async with coordinator.admission(lora_slot) as (
+            policy_version,
+            current_lora_request,
+        ):
+            if current_lora_request is not None:
+                lora_request = current_lora_request
+            if policy_version is not None:
+                _set_policy_cache_salt(
+                    params,
+                    lora_slot=lora_slot,
+                    policy_version=policy_version,
+                )
+                if hasattr(prompt, "cache_salt"):
+                    _set_policy_cache_salt(
+                        prompt,
+                        lora_slot=lora_slot,
+                        policy_version=policy_version,
+                    )
+            return await original(
+                self,
+                request_id,
+                prompt,
+                params,
+                arrival_time=arrival_time,
+                lora_request=lora_request,
+                **kwargs,
+            )
+
+    add_request.__art_lora_update_patched__ = True  # type: ignore[attr-defined]
+    AsyncLLM.add_request = add_request  # type: ignore[method-assign]
 
 
 def _patch_load_inplace_storage() -> None:
@@ -785,15 +947,11 @@ def _record_request_output_spans(
     request_index: int,
     spans: list[dict[str, Any]],
 ) -> None:
-    by_choice = _COMPLETION_POLICY_SPANS_BY_REQUEST.setdefault(
-        request_output.request_id, {}
-    )
     for output in request_output.outputs:
         if getattr(output, "index", request_index) != request_index:
             continue
         copied = [dict(span) for span in spans]
         setattr(output, ART_POLICY_TOKEN_SPANS_FIELD, copied)
-        by_choice[output.index] = copied
 
 
 def _policy_spans_by_choice_from_final_output(

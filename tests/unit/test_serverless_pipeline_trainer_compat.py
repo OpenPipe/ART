@@ -56,7 +56,7 @@ async def test_serverless_train_accepts_pipeline_trainer_kwargs() -> None:
         seen["verbose"] = verbose
         yield {"loss": 0.25}
 
-    backend._train_model = fake_train_model  # type: ignore[method-assign]
+    setattr(backend, "_train_model", fake_train_model)
     backend._get_step = AsyncMock(return_value=3)  # type: ignore[method-assign]
 
     with patch.object(model, "_get_wandb_run", return_value=None):
@@ -156,7 +156,7 @@ async def test_serverless_train_model_forwards_experimental_config() -> None:
     async def events_list(**_kwargs: Any):
         yield SimpleNamespace(id="event-id", type="training_ended", data={})
 
-    backend._client.training_jobs.events.list = events_list  # type: ignore[attr-defined]
+    setattr(backend._client.training_jobs.events, "list", events_list)  # type: ignore[attr-defined]
 
     async def no_sleep(_seconds: float) -> None:
         return None
@@ -227,7 +227,7 @@ async def test_serverless_train_sft_forwards_metric_logging_config() -> None:
     async def events_list(**_kwargs: Any):
         yield SimpleNamespace(id="event-id", type="training_ended", data={})
 
-    backend._client.sft_training_jobs.events.list = events_list  # type: ignore[attr-defined]
+    setattr(backend._client.sft_training_jobs.events, "list", events_list)  # type: ignore[attr-defined]
 
     async def no_sleep(_seconds: float) -> None:
         return None
@@ -285,6 +285,31 @@ async def test_serverless_train_sft_forwards_metric_logging_config() -> None:
 
 
 @pytest.mark.asyncio
+async def test_serverless_train_sft_rejects_last_assistant_mode() -> None:
+    backend = _make_backend()
+    model = TrainableModel(
+        name="serverless-sft-last-assistant",
+        project="pipeline-tests",
+        base_model="test-model",
+    )
+    trajectory = Trajectory(
+        messages_and_choices=[
+            {"role": "user", "content": "prompt"},
+            {"role": "assistant", "content": "answer"},
+        ],
+    )
+
+    with pytest.raises(NotImplementedError, match="currently requires LocalBackend"):
+        async for _ in backend._train_sft(
+            model,
+            [trajectory],
+            TrainSFTConfig(assistant_turns="last"),
+            {},
+        ):
+            pass
+
+
+@pytest.mark.asyncio
 async def test_serverless_train_forwards_kl_step_lag() -> None:
     backend = _make_backend()
     model = TrainableModel(
@@ -307,7 +332,7 @@ async def test_serverless_train_forwards_kl_step_lag() -> None:
         seen["dev_config"] = dev_config
         yield {}
 
-    backend._train_model = fake_train_model  # type: ignore[method-assign]
+    setattr(backend, "_train_model", fake_train_model)
     backend._get_step = AsyncMock(return_value=1)  # type: ignore[method-assign]
 
     with patch.object(model, "_get_wandb_run", return_value=None):

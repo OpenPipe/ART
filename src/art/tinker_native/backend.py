@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from contextlib import asynccontextmanager
 from dataclasses import dataclass
 import json
 import os
@@ -29,6 +30,7 @@ import torch
 import uvicorn
 
 from .. import dev
+from ..adapter_leases import pin_inference_step, pinned_inference_step
 from ..backend import Backend
 from ..costs import build_cost_calculator, compute_train_cost, get_model_pricing
 from ..metrics_taxonomy import (
@@ -178,7 +180,7 @@ class TinkerNativeModelConfig:
     training_client_args: dict[str, Any]
 
 
-class TinkerNativeBackend(Backend):
+class TinkerNativeBackend:
     _tinker_train_log_env = "ART_TINKER_TRAIN_LOG"
     _tinker_sample_log_env = "ART_TINKER_SAMPLE_LOG"
 
@@ -488,9 +490,20 @@ class TinkerNativeBackend(Backend):
         if "@" in base_name:
             base_name = base_name.split("@", 1)[0]
         if step is None:
+            step = pinned_inference_step(model.name)
+        if step is None:
             state = self._model_state.get(model.name)
             step = state.current_step if state is not None else 0
         return f"{base_name}@{step}"
+
+    @asynccontextmanager
+    async def exact_adapter_lease(
+        self,
+        model: TrainableModel,
+        step: int,
+    ) -> AsyncIterator[None]:
+        async with pin_inference_step(model.name, step):
+            yield
 
     async def _run_openai_server(
         self,
@@ -735,10 +748,7 @@ class TinkerNativeBackend(Backend):
 
     def _resolve_model_config(self, model: TrainableModel) -> TinkerNativeModelConfig:
         internal_config = model._internal_config or {}
-        tinker_native_args = cast(
-            dev.TinkerNativeArgs | None,
-            internal_config.get("tinker_native_args"),
-        )
+        tinker_native_args = internal_config.get("tinker_native_args")
         renderer_name = (
             tinker_native_args.get("renderer_name")
             if tinker_native_args is not None

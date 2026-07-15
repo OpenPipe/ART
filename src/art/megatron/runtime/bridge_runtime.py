@@ -562,9 +562,26 @@ def _column_parallel_hf_to_megatron(
 ) -> torch.Tensor:
     if self.tp_size == 1:
         return hf_weights
-    normalized_param = self._normalize_expert_param_name(self.megatron_param)
+    param_name = self.megatron_param
+    if self.is_expert:
+        # Bridge names experts globally; TE registers rank-local numeric suffixes.
+        expert_digits = param_name[len(param_name.rstrip("0123456789")) :]
+        config = getattr(megatron_module, "config", None)
+        num_experts = int(getattr(config, "num_moe_experts", 0) or 0)
+        if not expert_digits or num_experts <= 0 or num_experts % self.ep_size:
+            raise RuntimeError(
+                "Cannot resolve local expert parameter for "
+                f"{param_name!r}: num_experts={num_experts}, ep_size={self.ep_size}"
+            )
+        experts_per_rank = num_experts // self.ep_size
+        local_expert = int(expert_digits) - self.ep_rank * experts_per_rank
+        if not 0 <= local_expert < experts_per_rank:
+            raise RuntimeError(
+                f"Expert {expert_digits} is not local to EP rank {self.ep_rank}"
+            )
+        param_name = f"{param_name[: -len(expert_digits)]}{local_expert}"
     target_param = get_module_and_param_from_name(
-        cast(Any, megatron_module), normalized_param
+        cast(Any, megatron_module), param_name
     )[1]
     if self.tp_rank == 0:
         full_size = hf_weights.shape[0]
@@ -657,9 +674,15 @@ def _replicated_hf_to_megatron(
     ):
         broadcast_device = _materialization_device()
     if self.tp_rank == 0:
-        tensor = hf_weights.to(device=cast(Any, broadcast_device), non_blocking=True)
+        tensor = hf_weights.to(
+            device=broadcast_device,
+            non_blocking=True,
+        )
     else:
-        tensor = torch.empty_like(hf_weights, device=cast(Any, broadcast_device))
+        tensor = torch.empty_like(
+            hf_weights,
+            device=broadcast_device,
+        )
     return self.broadcast_tensor_to_tp_ranks(tensor, src_rank=0)
 
 

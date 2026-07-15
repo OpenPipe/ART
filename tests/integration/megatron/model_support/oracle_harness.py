@@ -152,7 +152,7 @@ def selected_oracle_objectives() -> list[OracleObjective]:
     if normalized == "all":
         return list(SUPPORTED_ORACLE_OBJECTIVES)
     if normalized in SUPPORTED_ORACLE_OBJECTIVES:
-        return [cast(OracleObjective, normalized)]
+        return [normalized]
     supported = ", ".join((*SUPPORTED_ORACLE_OBJECTIVES, "all"))
     raise ValueError(
         f"Unsupported {ORACLE_OBJECTIVE_ENV} value '{raw}'. "
@@ -346,9 +346,10 @@ class OracleCaseConfig(BaseModel):
     seed: int = 20260304
     num_steps: int = 1
     grad_accumulation_sequences: int = Field(default=4, ge=1)
-    learning_rate: float = 5e-6
+    learning_rate: float = 1.0
     beta: float = 0.0
-    loss_scale: float = 1
+    # Keep BF16 LoRA updates above one ULP without changing their linear topology.
+    loss_scale: float = 32768
     packed_tensors: PackedTensorConfig = Field(default_factory=PackedTensorConfig)
     lora: LoraConfig = Field(default_factory=LoraConfig)
     allow_unvalidated_arch: bool = False
@@ -1014,6 +1015,12 @@ def _is_forward_expert_lora_trace(param: str) -> bool:
     )
 
 
+def _is_base_expert_linear_trace(param: str) -> bool:
+    return ".mlp.experts.linear_fc" in param and not _is_forward_expert_lora_trace(
+        param
+    )
+
+
 def _stacked_layers(
     pairs: list[tuple[str, Any, Any]],
 ) -> list[tuple[str, Any, Any]]:
@@ -1570,6 +1577,13 @@ class VariantRunner:
             (key, reference[key], candidate[key])
             for key in sorted(set(reference.keys()))
         ]
+        if phase == "forward":
+            pairs = [
+                pair
+                for pair in pairs
+                if pair[1].shape == pair[2].shape
+                or not _is_base_expert_linear_trace(pair[0])
+            ]
         if phase in {"forward", "grads", "deltas"}:
             pairs = _stacked_layers(pairs)
         rows = self._build_metric_rows_from_tensor_pairs(

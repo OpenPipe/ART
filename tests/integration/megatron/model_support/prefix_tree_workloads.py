@@ -8,6 +8,8 @@ import torch
 def build_complex_prefix_tree_packed_tensors(
     config: Any,
     seed: int,
+    *,
+    deep: bool = False,
 ) -> dict[str, Any]:
     """Build a deterministic nested prefix-tree packed workload.
 
@@ -15,7 +17,7 @@ def build_complex_prefix_tree_packed_tensors(
 
     root
       -> mid_a -> leaf_a_short, leaf_a_long
-      -> mid_b -> leaf_b
+      -> mid_b -> [deep_mid ->] leaf_b
       -> direct_leaf
 
     Internal nodes are non-trainable. Each leaf starts with one non-trainable
@@ -49,6 +51,8 @@ def build_complex_prefix_tree_packed_tensors(
     mid_budget = max(2, prefill_tokens - root_len)
     mid_a_len = max(1, mid_budget // 2)
     mid_b_len = max(1, mid_budget - mid_a_len)
+    deep_mid_len = max(1, mid_b_len // 2) if deep else 0
+    mid_b_len -= deep_mid_len
     max_completion_tokens = max(1, sequence_length - root_len - mid_a_len - 2)
     base_completion_tokens = max(
         1,
@@ -128,6 +132,7 @@ def build_complex_prefix_tree_packed_tensors(
             root_len
             + mid_a_len
             + mid_b_len
+            + deep_mid_len
             + sum(1 + length for length in leaf_lengths)
         )
 
@@ -137,7 +142,12 @@ def build_complex_prefix_tree_packed_tensors(
         remaining: int,
     ) -> tuple[int, int, int, int] | None:
         completion_budget = (
-            remaining - root_len - mid_a_len - mid_b_len - len(leaf_lengths)
+            remaining
+            - root_len
+            - mid_a_len
+            - mid_b_len
+            - deep_mid_len
+            - len(leaf_lengths)
         )
         if completion_budget < len(leaf_lengths):
             return None
@@ -216,15 +226,27 @@ def build_complex_prefix_tree_packed_tensors(
                 length=mid_b_len,
                 input_start=root_len,
             )
+            leaf_b_parent = mid_b_group
+            if deep:
+                leaf_b_parent = next_group_id
+                next_group_id += 1
+                cursor = write_segment(
+                    sequence_index=sequence_index,
+                    cursor=cursor,
+                    group_id=leaf_b_parent,
+                    parent_id=mid_b_group,
+                    length=deep_mid_len,
+                    input_start=root_len + mid_b_len,
+                )
             leaf_b_group = next_group_id
             next_group_id += 1
             cursor = write_segment(
                 sequence_index=sequence_index,
                 cursor=cursor,
                 group_id=leaf_b_group,
-                parent_id=mid_b_group,
+                parent_id=leaf_b_parent,
                 length=1 + leaf_lengths[2],
-                input_start=root_len + mid_b_len,
+                input_start=root_len + mid_b_len + deep_mid_len,
                 trainable_offset=1,
             )
             direct_group = next_group_id

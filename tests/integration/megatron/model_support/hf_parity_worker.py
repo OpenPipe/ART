@@ -1047,7 +1047,6 @@ def _run_megatron_sft_step(
         controller.set_step(
             step_index=0,
             sample_index=sample_indices,
-            global_grad_accumulation_sequences=request.case_config.grad_accumulation_sequences,
         )
     if hf_reference_state_dict is None:
         tasks = [

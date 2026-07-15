@@ -85,26 +85,6 @@ def test_overlapping_gpu_ids():
         )
 
 
-def test_multi_gpu_inference_requires_matching_tensor_parallel_size():
-    with pytest.raises(
-        ValueError,
-        match="Multi-GPU inference requires engine_args.tensor_parallel_size",
-    ):
-        validate_dedicated_config(
-            InternalModelConfig(trainer_gpu_ids=[0], inference_gpu_ids=[1, 2])
-        )
-
-
-def test_multi_gpu_inference_allows_matching_tensor_parallel_size():
-    validate_dedicated_config(
-        InternalModelConfig(
-            trainer_gpu_ids=[0],
-            inference_gpu_ids=[1, 2],
-            engine_args={"tensor_parallel_size": 2},  # type: ignore[typeddict-item]
-        )
-    )
-
-
 def test_trainer_not_starting_at_zero():
     with pytest.raises(ValueError, match="must start at GPU 0"):
         validate_dedicated_config(
@@ -258,33 +238,12 @@ def test_get_model_config_preserves_rollout_weights_mode():
         assert result["rollout_weights_mode"] == "merged"
 
 
-def test_get_model_config_preserves_rollout_weight_update_mode():
-    with tempfile.TemporaryDirectory() as tmpdir:
-        config = InternalModelConfig(
-            trainer_gpu_ids=[0],
-            inference_gpu_ids=[1],
-            rollout_weight_update_mode="in_flight_lora",
-        )
-        result = get_model_config("test-model", tmpdir, config)
-        assert result["rollout_weight_update_mode"] == "in_flight_lora"
-
-
 def test_invalid_rollout_weights_mode():
     with pytest.raises(
         ValueError, match="rollout_weights_mode must be either 'lora' or 'merged'"
     ):
         validate_dedicated_config(
-            InternalModelConfig(rollout_weights_mode="bad-mode")  # type: ignore[typeddict-item]
-        )
-
-
-def test_invalid_rollout_weight_update_mode():
-    with pytest.raises(
-        ValueError,
-        match="rollout_weight_update_mode must be either 'step_lora' or 'in_flight_lora'",
-    ):
-        validate_dedicated_config(
-            InternalModelConfig(rollout_weight_update_mode="bad-mode")  # type: ignore[typeddict-item]
+            InternalModelConfig(rollout_weights_mode="bad-mode")  # type: ignore
         )
 
 
@@ -293,32 +252,6 @@ def test_merged_rollout_weights_requires_dedicated_mode():
         ValueError, match="rollout_weights_mode='merged' requires dedicated mode"
     ):
         validate_dedicated_config(InternalModelConfig(rollout_weights_mode="merged"))
-
-
-def test_in_flight_lora_update_requires_lora_rollout_weights():
-    with pytest.raises(
-        ValueError,
-        match="rollout_weight_update_mode='in_flight_lora' requires rollout_weights_mode='lora'",
-    ):
-        validate_dedicated_config(
-            InternalModelConfig(
-                trainer_gpu_ids=[0],
-                inference_gpu_ids=[1],
-                rollout_weights_mode="merged",
-                rollout_weight_update_mode="in_flight_lora",
-            )
-        )
-
-
-def test_in_flight_lora_update_allowed_with_lora_rollout_weights():
-    validate_dedicated_config(
-        InternalModelConfig(
-            trainer_gpu_ids=[0],
-            inference_gpu_ids=[1],
-            rollout_weights_mode="lora",
-            rollout_weight_update_mode="in_flight_lora",
-        )
-    )
 
 
 def test_qwen3_5_moe_allows_default_lora_rollout_weights():

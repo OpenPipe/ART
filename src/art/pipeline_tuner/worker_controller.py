@@ -36,10 +36,7 @@ class RolloutWorkerController:
                 self._retiring.discard(worker_id)
 
         live = [wid for wid, task in self._tasks.items() if not task.done()]
-        excess = max(0, len(live) - self.target_workers)
-        if excess:
-            for worker_id in live[-excess:]:
-                self._retiring.add(worker_id)
+        self._retiring = set(live[self.target_workers :])
 
         active = [wid for wid in live if wid not in self._retiring]
         while len(active) < self.target_workers and not self.trainer.state.done:

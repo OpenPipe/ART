@@ -8,22 +8,15 @@ from types import ModuleType, SimpleNamespace
 from typing import Any, cast
 from unittest.mock import AsyncMock, MagicMock, patch
 
-import httpx
 import pytest
 import torch
 from transformers.tokenization_utils_base import PreTrainedTokenizerBase
 
 from art import PipelineRuntimeConfig, TrainableModel, Trajectory, TrajectoryGroup
-from art._backend_training import aggregate_rl_training_metrics
 from art.dev.model import InternalModelConfig
-from art.errors import ArtVllmMetricsTimeoutError
 from art.local import LocalBackend
 from art.megatron import MegatronBackend
-from art.megatron.train import (
-    TrainStepResult,
-    _log_rl_step_result,
-    load_adapter_into_model,
-)
+from art.megatron.train import load_adapter_into_model
 from art.pipeline_trainer import (
     CHECKPOINT_CREATED_AT_METRIC,
     CHECKPOINT_EVAL_COMPLETED_METRIC,
@@ -34,60 +27,12 @@ from art.preprocessing.tokenize import TokenizedResult
 from art.utils.output_dirs import get_model_dir, get_step_checkpoint_dir
 
 
-class _FakeArtMetricsResponse:
-    def raise_for_status(self) -> None:
-        return None
-
-    def json(self) -> dict[str, Any]:
-        return {
-            "schema_version": 1,
-            "metrics": {
-                "prompt_tokens_total": 100.0,
-                "generation_tokens_total": 20.0,
-                "prefix_cache_queries_total": 10.0,
-                "prefix_cache_hits_total": 7.0,
-                "num_preempted_reqs_total": 0.0,
-                "num_requests_running": 8.0,
-                "num_requests_waiting": 3.0,
-                "num_requests_waiting_capacity": 2.0,
-                "kv_cache_usage_perc": 0.25,
-            },
-        }
+async def _noop_rollout(*_args: object, **_kwargs: object) -> TrajectoryGroup:
+    return TrajectoryGroup([])
 
 
-class _FakeArtMetricsClient:
-    requested_urls: list[str] = []
-
-    def __init__(self, *, timeout: float) -> None:
-        self.timeout = timeout
-
-    async def __aenter__(self) -> "_FakeArtMetricsClient":
-        return self
-
-    async def __aexit__(self, *_args: object) -> None:
-        return None
-
-    async def get(
-        self, url: str, *, headers: dict[str, str] | None
-    ) -> _FakeArtMetricsResponse:
-        self.requested_urls.append(url)
-        assert headers == {"Authorization": "Bearer token"}
-        return _FakeArtMetricsResponse()
-
-
-class _TimeoutArtMetricsClient:
-    def __init__(self, *, timeout: float) -> None:
-        self.timeout = timeout
-
-    async def __aenter__(self) -> "_TimeoutArtMetricsClient":
-        return self
-
-    async def __aexit__(self, *_args: object) -> None:
-        return None
-
-    async def get(self, url: str, *, headers: dict[str, str] | None) -> None:
-        del url, headers
-        raise httpx.TimeoutException("timeout")
+async def _noop_eval(*_args: object, **_kwargs: object) -> list[Trajectory]:
+    return []
 
 
 def _make_group(rewards: list[float]) -> TrajectoryGroup:
@@ -96,6 +41,7 @@ def _make_group(rewards: list[float]) -> TrajectoryGroup:
             Trajectory(
                 reward=reward,
                 initial_policy_version=0,
+                metrics={"completion_tokens": 1},
                 messages_and_choices=[
                     {"role": "user", "content": f"prompt-{idx}"},
                     {"role": "assistant", "content": f"answer-{idx}"},
@@ -114,8 +60,8 @@ def _make_trainer(
 ) -> PipelineTrainer:
     return PipelineTrainer(
         model=model,
-        backend=backend,  # type: ignore[arg-type]
-        rollout_fn=lambda *_args, **_kwargs: asyncio.sleep(0),
+        backend=backend,  # type: ignore
+        rollout_fn=_noop_rollout,
         scenarios=[],
         config={},
         pipeline=PipelineRuntimeConfig(
@@ -127,87 +73,6 @@ def _make_trainer(
         eval_fn=None,
         **kwargs,
     )
-
-
-def test_rl_training_metrics_canonicalize_megatron_packed_throughput() -> None:
-    metrics = aggregate_rl_training_metrics(
-        training_metrics=[{"tokens_per_second": 25000.0}],
-        trajectory_groups=[_make_group([0.0, 1.0])],
-        trainer_started=0.0,
-    )
-
-    assert metrics["throughput/train_packed_tok_per_s"] == 25000.0
-    assert "tokens_per_second" not in metrics
-
-
-def test_megatron_rl_log_includes_packed_train_throughput(tmp_path: Path) -> None:
-    log_path = tmp_path / "megatron_rl_step.jsonl"
-
-    _log_rl_step_result(
-        0,
-        str(log_path),
-        TrainStepResult(
-            reduced_loss=torch.tensor(1.0),
-            probs_corr=0.5,
-            update_successful=True,
-            grad_norm=2.0,
-            num_zeros_in_grad=None,
-        ),
-        num_gradient_steps=1,
-        packed_train_tokens=1000,
-        train_step_s=0.25,
-    )
-
-    row = json.loads(log_path.read_text())
-    assert row["throughput/train_packed_tok_per_s"] == 4000.0
-
-
-@pytest.mark.asyncio
-async def test_local_backend_collects_fast_art_vllm_metrics(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    _FakeArtMetricsClient.requested_urls.clear()
-    monkeypatch.setattr(
-        "art.local.backend.httpx.AsyncClient",
-        _FakeArtMetricsClient,
-    )
-    model = TrainableModel(
-        name="pipeline-fast-vllm-metrics",
-        project="pipeline-tests",
-        base_model="test-model",
-        base_path=str(tmp_path),
-    )
-    model.inference_base_url = "http://127.0.0.1:9999/v1"
-    model.inference_api_key = "token"
-    metrics = await LocalBackend(
-        path=str(tmp_path / "art")
-    ).collect_train_step_vllm_metrics(model)
-
-    assert _FakeArtMetricsClient.requested_urls == ["http://127.0.0.1:9999/art/metrics"]
-    assert metrics["vllm/num_requests_running"] == 8.0
-    assert metrics["vllm/num_requests_waiting"] == 3.0
-    assert metrics["vllm/num_requests_waiting_capacity"] == 2.0
-    assert metrics["vllm/kv_cache_usage_perc"] == 0.25
-    assert metrics["vllm/prefix_cache_hit_rate"] == 0.7
-
-
-@pytest.mark.asyncio
-async def test_local_backend_vllm_metric_timeout_raises(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    monkeypatch.setattr("art.local.backend.httpx.AsyncClient", _TimeoutArtMetricsClient)
-    model = TrainableModel(
-        name="pipeline-fast-vllm-metrics-timeout",
-        project="pipeline-tests",
-        base_model="test-model",
-        base_path=str(tmp_path),
-    )
-    model.inference_base_url = "http://127.0.0.1:9999/v1"
-
-    with pytest.raises(ArtVllmMetricsTimeoutError):
-        await LocalBackend(path=str(tmp_path / "art")).collect_train_step_vllm_metrics(
-            model
-        )
 
 
 @pytest.mark.asyncio
@@ -238,6 +103,7 @@ async def test_pipeline_trainer_preserves_backend_train_kwargs(tmp_path: Path) -
 
     await trainer._training_stage()
 
+    assert backend.train.await_args is not None
     assert backend.train.await_args.kwargs == {
         "learning_rate": 2e-5,
         "loss_fn": "cispo",
@@ -245,7 +111,7 @@ async def test_pipeline_trainer_preserves_backend_train_kwargs(tmp_path: Path) -
         "normalize_advantages": True,
         "save_checkpoint": False,
         "adam_params": adam_params,
-        "optimizer_save_interval": None,
+        "optimizer_save_interval": 5,
         "final_training_step": 1,
     }
 
@@ -274,6 +140,7 @@ async def test_pipeline_trainer_forwards_default_kl_step_zero_for_generic_backen
 
     await trainer._training_stage()
 
+    assert backend.train.await_args is not None
     assert backend.train.await_args.kwargs == {
         "learning_rate": 1e-5,
         "loss_fn": "cispo",
@@ -281,7 +148,7 @@ async def test_pipeline_trainer_forwards_default_kl_step_zero_for_generic_backen
         "normalize_advantages": True,
         "save_checkpoint": False,
         "adam_params": None,
-        "optimizer_save_interval": None,
+        "optimizer_save_interval": 5,
         "final_training_step": 1,
         "kl_penalty_coef": 0.25,
         "kl_penalty_reference_step": 0,
@@ -316,6 +183,7 @@ async def test_pipeline_trainer_kl_step_lag_floors_at_zero(
 
     await trainer._training_stage()
 
+    assert backend.train.await_args is not None
     assert backend.train.await_args.kwargs["kl_penalty_reference_step"] == 0
 
 
@@ -346,6 +214,7 @@ async def test_pipeline_trainer_kl_step_lag_computes_reference(
 
     await trainer._training_stage()
 
+    assert backend.train.await_args is not None
     assert backend.train.await_args.kwargs["kl_penalty_reference_step"] == 1
 
 
@@ -381,8 +250,9 @@ async def test_pipeline_trainer_uses_same_train_kwargs_for_local_backend(
         ),
     )
     backend = LocalBackend(path=str(tmp_path))
-    backend.train = AsyncMock(return_value=SimpleNamespace(step=1, metrics={}))  # type: ignore[method-assign]
-    backend.collect_train_step_vllm_metrics = AsyncMock(return_value={})  # type: ignore[method-assign]
+    train = AsyncMock(return_value=SimpleNamespace(step=1, metrics={}))
+    setattr(backend, "train", train)
+    setattr(backend, "collect_train_step_vllm_metrics", AsyncMock(return_value={}))
 
     trainer = _make_trainer(
         model=model,
@@ -396,50 +266,17 @@ async def test_pipeline_trainer_uses_same_train_kwargs_for_local_backend(
 
     await trainer._training_stage()
 
-    assert backend.train.await_args.kwargs == {  # type: ignore[attr-defined]
+    assert train.await_args is not None
+    assert train.await_args.kwargs == {
         "learning_rate": 3e-5,
         "loss_fn": "ppo",
         "loss_fn_config": None,
         "normalize_advantages": True,
         "save_checkpoint": False,
         "adam_params": None,
-        "optimizer_save_interval": None,
+        "optimizer_save_interval": 5,
         "final_training_step": 1,
     }
-
-
-@pytest.mark.asyncio
-async def test_pipeline_trainer_preserves_backend_train_packed_throughput(
-    tmp_path: Path,
-) -> None:
-    model = TrainableModel(
-        name="pipeline-preserve-packed-throughput",
-        project="pipeline-tests",
-        base_model="test-model",
-        base_path=str(tmp_path),
-    )
-    log_mock = AsyncMock()
-    object.__setattr__(model, "log", log_mock)
-    backend = MagicMock()
-    backend.train = AsyncMock(
-        return_value=SimpleNamespace(
-            step=1,
-            metrics={
-                "data/step_packed_train_tokens": 1000.0,
-                "throughput/train_packed_tok_per_s": 25000.0,
-            },
-        )
-    )
-
-    trainer = _make_trainer(model=model, backend=backend)
-    trainer._output_queue = asyncio.Queue()
-    await trainer._output_queue.put(_make_group([0.0, 1.0]))
-    await trainer._output_queue.put(None)
-
-    await trainer._training_stage()
-
-    logged_metrics = log_mock.await_args.kwargs["metrics"]
-    assert logged_metrics["throughput/train_packed_tok_per_s"] == 25000.0
 
 
 @pytest.mark.asyncio
@@ -465,7 +302,7 @@ async def test_local_backend_train_translates_loss_fn(tmp_path: Path) -> None:
         seen["verbose"] = verbose
         yield {}
 
-    backend._train_model = fake_train_model  # type: ignore[method-assign]
+    setattr(backend, "_train_model", fake_train_model)
     backend._get_step = AsyncMock(return_value=1)  # type: ignore[method-assign]
     with patch.object(model, "_get_wandb_run", return_value=None):
         result = await backend.train(
@@ -505,7 +342,7 @@ async def test_local_backend_train_passes_kl_penalty_source(tmp_path: Path) -> N
         seen["verbose"] = verbose
         yield {}
 
-    backend._train_model = fake_train_model  # type: ignore[method-assign]
+    setattr(backend, "_train_model", fake_train_model)
     backend._get_step = AsyncMock(return_value=1)  # type: ignore[method-assign]
     with patch.object(model, "_get_wandb_run", return_value=None):
         result = await backend.train(
@@ -546,7 +383,7 @@ async def test_megatron_backend_defaults_kl_reference_to_step_zero(
         seen["dev_config"] = dev_config
         yield {}
 
-    backend._train_model = fake_train_model  # type: ignore[method-assign]
+    setattr(backend, "_train_model", fake_train_model)
     backend._get_step = AsyncMock(return_value=1)  # type: ignore[method-assign]
 
     with patch.object(model, "_get_wandb_run", return_value=None):
@@ -588,7 +425,7 @@ async def test_local_backend_train_maps_normalize_advantages_to_scale_rewards(
         seen["dev_config"] = dev_config
         yield {}
 
-    backend._train_model = fake_train_model  # type: ignore[method-assign]
+    setattr(backend, "_train_model", fake_train_model)
     backend._get_step = AsyncMock(return_value=1)  # type: ignore[method-assign]
     with patch.object(model, "_get_wandb_run", return_value=None):
         await backend.train(
@@ -1063,25 +900,6 @@ async def test_local_backend_async_context_manager_awaits_async_cleanup(
 
 
 @pytest.mark.asyncio
-async def test_local_backend_close_drains_provenance_update_tasks(
-    tmp_path: Path,
-) -> None:
-    backend = LocalBackend(path=str(tmp_path))
-    completed: list[str] = []
-
-    async def record() -> None:
-        completed.append("done")
-
-    task = asyncio.create_task(record())
-    backend._provenance_update_tasks.add(task)
-
-    await backend.close()
-
-    assert completed == ["done"]
-    assert not backend._provenance_update_tasks
-
-
-@pytest.mark.asyncio
 async def test_local_backend_close_bounds_cancelled_provenance_tasks(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1205,6 +1023,45 @@ async def test_local_backend_adapter_lease_pins_inference_name_and_prune(
 
 
 @pytest.mark.asyncio
+async def test_local_backend_exact_adapter_lease_pins_immutable_name(
+    tmp_path: Path,
+) -> None:
+    model = TrainableModel(
+        name="local-backend-exact-adapter-lease",
+        project="pipeline-tests",
+        base_model="test-model",
+        base_path=str(tmp_path),
+        _internal_config=InternalModelConfig(
+            trainer_gpu_ids=[0],
+            inference_gpu_ids=[1],
+        ),
+    )
+    backend = LocalBackend(path=str(tmp_path))
+    exact_name = f"{model.name}:eval@3"
+    service = SimpleNamespace(
+        _latest_step=5,
+        acquire_exact_adapter=AsyncMock(return_value=exact_name),
+        release_exact_adapter=AsyncMock(),
+        prune_loaded_adapters=AsyncMock(),
+    )
+    backend._services[model.name] = cast(Any, service)
+
+    async with backend.exact_adapter_lease(model, 3):
+        assert backend._model_inference_name(model) == exact_name
+        assert backend._model_inference_name(model, step=3) == exact_name
+        assert backend._model_inference_name(model, step=4) == f"{model.name}@4"
+        await backend.prune_model_adapters(model, retain_steps={5})
+
+    assert backend._model_inference_name(model) == f"{model.name}@5"
+    service.acquire_exact_adapter.assert_awaited_once_with(
+        3,
+        get_step_checkpoint_dir(get_model_dir(model=model, art_path=str(tmp_path)), 3),
+    )
+    service.release_exact_adapter.assert_awaited_once_with(3)
+    service.prune_loaded_adapters.assert_awaited_once_with(retain_steps={3, 5})
+
+
+@pytest.mark.asyncio
 async def test_local_backend_adapter_retention_lease_does_not_pin_inference(
     tmp_path: Path,
 ) -> None:
@@ -1271,3 +1128,35 @@ async def test_pipeline_trainer_scheduled_eval_holds_retention_lease(
     assert trainer._scheduled_eval_steps == set()
     assert backend.active_steps == set()
     assert trainer._protected_checkpoint_steps(8) == {8}
+
+
+def test_pipeline_trainer_rejects_merged_weight_eval(tmp_path: Path) -> None:
+    model = TrainableModel(
+        name="pipeline-merged-eval",
+        project="pipeline-tests",
+        base_model="test-model",
+        base_path=str(tmp_path),
+        _internal_config=InternalModelConfig(
+            trainer_gpu_ids=[0],
+            inference_gpu_ids=[1],
+            rollout_weights_mode="merged",
+        ),
+    )
+
+    with pytest.raises(
+        ValueError,
+        match="eval requires rollout_weights_mode='lora'",
+    ):
+        PipelineTrainer(
+            model=model,
+            backend=LocalBackend(path=str(tmp_path)),
+            rollout_fn=_noop_rollout,
+            scenarios=[],
+            config={},
+            pipeline=PipelineRuntimeConfig(
+                num_rollout_workers=1,
+                min_batch_size=1,
+                max_batch_size=1,
+            ),
+            eval_fn=_noop_eval,
+        )

@@ -49,14 +49,12 @@ class PipelineAutotuneConfig(pydantic.BaseModel):
     packing_spill_prior_alpha: float = pydantic.Field(default=1.0, gt=0.0)
     packing_spill_prior_beta: float = pydantic.Field(default=8.0, gt=0.0)
     packing_spill_confidence: float = pydantic.Field(default=0.8, gt=0.0, lt=1.0)
-    packing_bad_padding_ratio: float = pydantic.Field(default=0.35, ge=0.0, le=1.0)
     queue_running_reserve_fraction: float = pydantic.Field(default=0.75, ge=0.0, le=1.0)
     trainer_load_under_score: float = pydantic.Field(default=0.08, ge=0.0)
     trainer_load_severe_under_score: float = pydantic.Field(default=0.50, ge=0.0)
     trainer_load_over_score: float = pydantic.Field(default=0.04, ge=0.0)
     vllm_pressure_over_ratio: float = pydantic.Field(default=0.80, ge=0.0)
     vllm_pressure_under_ratio: float = pydantic.Field(default=0.50, ge=0.0)
-    queue_put_high_frac: float = pydantic.Field(default=0.20, ge=0.0, le=1.0)
     queue_put_severe_frac: float = pydantic.Field(default=0.50, ge=0.0, le=1.0)
     stale_high_frac: float = pydantic.Field(default=0.20, ge=0.0, le=1.0)
     padding_high_frac: float = pydantic.Field(default=0.25, ge=0.0, le=1.0)
@@ -125,41 +123,11 @@ class TunerWindowStats(pydantic.BaseModel):
     end_step: int
     window_start_s: float = 0.0
     window_end_s: float = 0.0
-    score_mean: float = 0.0
-    accepted_tok_per_s_mean: float = 0.0
-    trainer_idle_frac: float = 0.0
-    trainer_load_score: float = 0.0
-    vllm_capacity_wait_frac: float = 0.0
-    vllm_active_frac: float = 0.0
-    vllm_capacity_wait_request_s: float = 0.0
-    vllm_running_request_s: float = 0.0
+    trainer_underfeed_score: float = 0.0
     vllm_pressure: float = 0.0
-    vllm_capacity_wait_area: float = 0.0
-    vllm_running_area: float = 0.0
-    vllm_idle_frac: float = 0.0
-    vllm_max_num_seqs_mean: float = 0.0
     queue_put_wait_frac: float = 0.0
-    stale_frac: float = 0.0
     predicted_stale_frac: float = 0.0
-    queue_freshness_pressure: float = 0.0
-    token_weighted_policy_age_steps_mean: float = 0.0
-    freshness_discount_mean: float = 1.0
     padding_ratio_mean: float = 0.0
-    groups_per_step_mean: float = 0.0
-    step_wall_s_mean: float = 0.0
-    collect_batch_s_mean: float = 0.0
-    train_work_s_mean: float = 0.0
-    train_capacity_tokens_mean: float = 0.0
-    packing_history_groups: int | None = None
-    packing_history_trials: float = 0.0
-    packing_history_spills: float = 0.0
-    packing_history_spill_probability_upper: float = 0.0
-    packing_history_bad_padding_events: float = 0.0
-    packing_history_bad_padding_probability_upper: float = 0.0
-    packing_counterfactual_trials: float = 0.0
-    packing_counterfactual_spills: float = 0.0
-    packing_counterfactual_spill_probability_upper: float = 0.0
-    packing_marginal_tokens_mean: float = 0.0
 
 
 class TunerDecision(pydantic.BaseModel):

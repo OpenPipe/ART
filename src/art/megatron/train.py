@@ -156,7 +156,7 @@ class TrainingRuntime(BaseModel):
     resident_training_session_id: str | None = None
     resident_policy_step: int | None = None
     optimizer_state_loaded: bool = False
-    adapter_export_template: dict[str, torch.Tensor] | None = None
+    adapter_export_dtypes: dict[str, torch.dtype] | None = None
     transformer_layers_compiled: bool = False
     rank: int
     world_size: int
@@ -517,7 +517,7 @@ def run_megatron_rl_job(
     job: MegatronTrainingJob | MegatronMergedTrainingJob,
 ) -> None:
     packed_tensors = None
-    adapter_model = None
+    adapter_dtypes = None
     template = None
     zero_template = None
     ref_logprobs_by_index = None
@@ -533,7 +533,7 @@ def run_megatron_rl_job(
             replay_bundle_path=job.moe_routing_replay_path,
             strict=job.moe_routing_replay_strict,
         )
-        adapter_model = _prepare_rl_training_state(runtime, job)
+        adapter_dtypes = _prepare_rl_training_state(runtime, job)
 
         print0(
             runtime.rank,
@@ -640,9 +640,7 @@ def run_megatron_rl_job(
                 hybridep_token_counts=hybridep_token_counts,
             )
             train_step_s = time.perf_counter() - train_step_started
-            packed_train_tokens = sum(
-                int(micro["tokens"].numel()) for micro in micro_inputs
-            )
+            global_packed_train_tokens = _global_packed_train_tokens(micro_inputs)
             print0(
                 runtime.rank,
                 "Correlation between old and new probabilities:",
@@ -654,13 +652,13 @@ def run_megatron_rl_job(
                 job.log_path,
                 step_result,
                 num_gradient_steps=num_steps,
-                packed_train_tokens=packed_train_tokens,
+                packed_train_tokens=global_packed_train_tokens,
                 train_step_s=train_step_s,
             )
 
         _save_lora_and_optimizer(
             runtime,
-            adapter_model=adapter_model,
+            adapter_dtypes=adapter_dtypes,
             lora_path=job.lora_path,
             optimizer_state_path=job.optimizer_state_path,
             step=job.step,
@@ -681,8 +679,8 @@ def run_megatron_rl_job(
             runtime.optimizer_state_loaded = False
         if packed_tensors is not None:
             del packed_tensors
-        if adapter_model is not None:
-            del adapter_model
+        if adapter_dtypes is not None:
+            del adapter_dtypes
         if template is not None:
             del template
         if zero_template is not None:
@@ -706,11 +704,11 @@ def run_megatron_sft_job(
     runtime: TrainingRuntime,
     job: MegatronSFTTrainingJob,
 ) -> None:
-    adapter_model = None
+    adapter_dtypes = None
 
     try:
         configure_moe_routing_replay(runtime)
-        adapter_model = _load_lora_and_optimizer(
+        adapter_dtypes = _load_lora_and_optimizer(
             runtime,
             lora_path=job.lora_path,
             optimizer_state_path=job.optimizer_state_path,
@@ -796,7 +794,6 @@ def run_megatron_sft_job(
                 inputs=micro_inputs,
                 step_index=batch_idx,
                 sample_index=micro_indices,
-                global_grad_accumulation_sequences=grad_accumulation_sequences,
                 moe_routing_replay_controller=runtime.moe_routing_replay_controller,
                 hybridep_token_counts=hybridep_token_counts,
             )
@@ -811,7 +808,7 @@ def run_megatron_sft_job(
             ):
                 _save_lora_and_optimizer(
                     runtime,
-                    adapter_model=adapter_model,
+                    adapter_dtypes=adapter_dtypes,
                     lora_path=job.lora_path,
                     optimizer_state_path=job.optimizer_state_path,
                     step=completed_batches,
@@ -838,7 +835,7 @@ def run_megatron_sft_job(
 
         _save_lora_and_optimizer(
             runtime,
-            adapter_model=adapter_model,
+            adapter_dtypes=adapter_dtypes,
             lora_path=job.lora_path,
             optimizer_state_path=job.optimizer_state_path,
             step=job.num_batches,
@@ -846,8 +843,8 @@ def run_megatron_sft_job(
             final_training_step=job.num_batches,
         )
     finally:
-        if adapter_model is not None:
-            del adapter_model
+        if adapter_dtypes is not None:
+            del adapter_dtypes
 
 
 def _load_megatron_job(job_path: str, *, supports_sft: bool) -> MegatronJob:
@@ -900,7 +897,7 @@ def _load_lora_and_optimizer(
     *,
     lora_path: str,
     optimizer_state_path: str,
-) -> dict[str, torch.Tensor]:
+) -> dict[str, torch.dtype]:
     persistent_optimizer = runtime.optimizer if runtime.optimizer_persistent else None
     adapter_model = _load_adapter_into_model(
         runtime.model,
@@ -910,7 +907,7 @@ def _load_lora_and_optimizer(
         optimizer=persistent_optimizer,
     )
     if persistent_optimizer is not None:
-        return adapter_model
+        return {key: tensor.dtype for key, tensor in adapter_model.items()}
 
     runtime.optimizer = _build_optimizer(
         runtime.model,
@@ -933,13 +930,13 @@ def _load_lora_and_optimizer(
             "- resetting optimizer for new run",
         )
         _eager_initialize_optimizer_state(runtime.optimizer)
-    return adapter_model
+    return {key: tensor.dtype for key, tensor in adapter_model.items()}
 
 
 def _prepare_rl_training_state(
     runtime: TrainingRuntime,
     job: MegatronTrainingJob | MegatronMergedTrainingJob,
-) -> dict[str, torch.Tensor]:
+) -> dict[str, torch.dtype]:
     state_is_resident = (
         runtime.optimizer_persistent
         and runtime.resident_training_session_id == job.training_session_id
@@ -947,9 +944,9 @@ def _prepare_rl_training_state(
         and runtime.optimizer_state_loaded
     )
     if state_is_resident:
-        if runtime.adapter_export_template is None:
+        if runtime.adapter_export_dtypes is None:
             raise RuntimeError("Resident Megatron state has no LoRA export template")
-        return runtime.adapter_export_template
+        return runtime.adapter_export_dtypes
 
     replacing_resident_state = runtime.resident_training_session_id is not None
     runtime.resident_training_session_id = None
@@ -985,11 +982,13 @@ def _prepare_rl_training_state(
         )
         _eager_initialize_optimizer_state(runtime.optimizer)
 
-    runtime.adapter_export_template = adapter_model
+    runtime.adapter_export_dtypes = {
+        key: tensor.dtype for key, tensor in adapter_model.items()
+    }
     runtime.resident_training_session_id = job.training_session_id
     runtime.resident_policy_step = job.source_policy_step
     runtime.optimizer_state_loaded = True
-    return adapter_model
+    return runtime.adapter_export_dtypes
 
 
 def _load_adapter_into_model(
@@ -1014,18 +1013,18 @@ def _load_adapter_into_model(
 def _save_lora_and_optimizer(
     runtime: TrainingRuntime,
     *,
-    adapter_model: dict[str, torch.Tensor],
+    adapter_dtypes: dict[str, torch.dtype],
     lora_path: str,
     optimizer_state_path: str,
     step: int,
-    optimizer_save_interval: int | None,
+    optimizer_save_interval: int,
     final_training_step: int | None = None,
     lora_ready_log_path: str | None = None,
 ) -> None:
     assert runtime.optimizer is not None
     save_vllm_lora_from_model(
         model=runtime.model,
-        adapter_model=adapter_model,
+        adapter_dtypes=adapter_dtypes,
         handler=runtime.model_support_handler,
         adapter_config=load_adapter_config(lora_path),
         output_dir=lora_path,
@@ -1074,10 +1073,10 @@ def _should_save_optimizer(
     *,
     step: int,
     optimizer_state_path: str,
-    optimizer_save_interval: int | None,
+    optimizer_save_interval: int,
     final_training_step: int | None,
 ) -> bool:
-    if not runtime.optimizer_persistent or optimizer_save_interval in {None, 1}:
+    if not runtime.optimizer_persistent or optimizer_save_interval == 1:
         return True
     if final_training_step is not None and step >= final_training_step:
         return True
@@ -1128,6 +1127,11 @@ def _log_rl_step_result(
         log_file.write(log_msg + "\n")
 
 
+def _global_packed_train_tokens(micro_inputs: list[PackedTensors]) -> int:
+    local_tokens = sum(int(micro["tokens"].numel()) for micro in micro_inputs)
+    return local_tokens * ps.get_data_parallel_world_size(with_context_parallel=False)
+
+
 def _save_optimizer(runtime: TrainingRuntime, *, optimizer_state_path: str) -> None:
     assert runtime.optimizer is not None
     optimizer_shard_path = os.path.join(
@@ -1172,14 +1176,23 @@ def load_adapter_into_model(
     with torch.no_grad():
         for chunk in model_chunks:
             for module in chunk.modules():
-                if hasattr(module, "load_lora"):
-                    module.load_lora(adapter_model)  # type: ignore[attr-defined]
+                load_lora = getattr(module, "load_lora", None)
+                if callable(load_lora):
+                    load_lora(adapter_model)
         if model_support_handler is not None:
             model_support_handler.zero_internal_padding_params(model_chunks)
 
     if optimizer is None:
         return
     optimizer.reload_model_params()
+
+
+def _zero_grad_buffers(model_chunks: ModelChunks) -> None:
+    for chunk in model_chunks:
+        zero_grad_buffer = getattr(chunk, "zero_grad_buffer", None)
+        if not callable(zero_grad_buffer):
+            raise TypeError(f"{type(chunk).__name__} has no zero_grad_buffer method")
+        zero_grad_buffer()
 
 
 def _optimizer_step(
@@ -1446,7 +1459,6 @@ def _calculate_megatron_logprobs(
     moe_routing_replay_controller: MoeRoutingReplayController | None = None,
     step_index: int | None = None,
     sample_index: int | None = None,
-    global_grad_accumulation_sequences: int | None = None,
     hybridep_token_count: int | None = None,
 ) -> torch.Tensor:
     if moe_routing_replay_controller is not None:
@@ -1457,7 +1469,6 @@ def _calculate_megatron_logprobs(
         moe_routing_replay_controller.set_step(
             step_index=step_index,
             sample_index=sample_index,
-            global_grad_accumulation_sequences=global_grad_accumulation_sequences,
         )
         moe_routing_replay_controller.begin_micro(sample_index, 0)
 
@@ -1558,7 +1569,6 @@ def _precompute_reference_logprobs(
             moe_routing_replay_controller=runtime.moe_routing_replay_controller,
             step_index=step_index,
             sample_index=sample_index,
-            global_grad_accumulation_sequences=global_grad_accumulation_sequences,
             hybridep_token_count=hybridep_token_count,
         )
     return results
@@ -1655,7 +1665,6 @@ def run_megatron_sft_step(
     inputs: dict[str, torch.Tensor] | list[dict[str, torch.Tensor]],
     step_index: int,
     sample_index: int | list[int | None],
-    global_grad_accumulation_sequences: int | None,
     moe_routing_replay_controller: MoeRoutingReplayController | None = None,
     hybridep_token_counts: list[int] | None = None,
 ) -> TrainStepResult:
@@ -1663,27 +1672,24 @@ def run_megatron_sft_step(
     if not micro_inputs:
         raise ValueError("run_megatron_sft_step requires at least one trajectory")
 
+    micro_sample_indices: list[int | None]
     if isinstance(sample_index, list):
         if len(sample_index) != len(micro_inputs):
             raise ValueError(
                 "sample_index list length must match number of micro inputs: "
                 f"{len(sample_index)} != {len(micro_inputs)}"
             )
-        micro_sample_indices: list[int | None] = sample_index
+        micro_sample_indices = [
+            int(index) if index is not None else None for index in sample_index
+        ]
     else:
         assert len(micro_inputs) == 1
         micro_sample_indices = [sample_index]
 
     if moe_routing_replay_controller is not None:
-        resolved_global_grad_accumulation_sequences = (
-            resolve_global_grad_accumulation_sequences(
-                global_grad_accumulation_sequences
-            )
-        )
         moe_routing_replay_controller.set_step(
             step_index=step_index,
             sample_index=micro_sample_indices,
-            global_grad_accumulation_sequences=resolved_global_grad_accumulation_sequences,
         )
 
     topology = _infer_parallel_topology(model_chunks)
@@ -1693,8 +1699,7 @@ def run_megatron_sft_step(
         moe_routing_replay_controller,
     )
 
-    for chunk in model_chunks:
-        chunk.zero_grad_buffer()  # type: ignore[call-non-callable]
+    _zero_grad_buffers(model_chunks)
 
     raw_loss_sum: torch.Tensor | None = None
     loss_inputs_for_count: list[dict[str, torch.Tensor] | PreparedSFTMicroInputs] = []
@@ -1817,27 +1822,24 @@ def run_training_step(
     if not micro_inputs:
         raise ValueError("run_training_step requires at least one packed sequence")
 
+    micro_sample_indices: list[int | None]
     if isinstance(sample_index, list):
         if len(sample_index) != len(micro_inputs):
             raise ValueError(
                 "sample_index list length must match number of micro inputs: "
                 f"{len(sample_index)} != {len(micro_inputs)}"
             )
-        micro_sample_indices: list[int | None] = sample_index
+        micro_sample_indices = [
+            int(index) if index is not None else None for index in sample_index
+        ]
     else:
         assert len(micro_inputs) == 1
         micro_sample_indices = [sample_index]
 
     if moe_routing_replay_controller is not None:
-        resolved_global_grad_accumulation_sequences = (
-            resolve_global_grad_accumulation_sequences(
-                config.grad_accumulation_sequences
-            )
-        )
         moe_routing_replay_controller.set_step(
             step_index=step_index,
             sample_index=micro_sample_indices,
-            global_grad_accumulation_sequences=resolved_global_grad_accumulation_sequences,
         )
 
     device = next(model_chunks[0].parameters()).device
@@ -1854,8 +1856,7 @@ def run_training_step(
     if cp_lookahead_state is not None and int(topology.cp) <= 1:
         cp_lookahead_state.pending_prepared_micro = None
 
-    for chunk in model_chunks:
-        chunk.zero_grad_buffer()  # type: ignore[call-non-callable]
+    _zero_grad_buffers(model_chunks)
 
     micro_count = len(micro_inputs)
     hybridep_enabled = _validate_hybridep_token_counts(
@@ -2097,7 +2098,7 @@ def _run_service_loop(runtime: TrainingRuntime) -> None:
             runtime.resident_training_session_id = None
             runtime.resident_policy_step = None
             runtime.optimizer_state_loaded = False
-            runtime.adapter_export_template = None
+            runtime.adapter_export_dtypes = None
         weight_offload.after_job()
 
     worker_error = False

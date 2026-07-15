@@ -16,7 +16,6 @@ from art.preprocessing.moe_routing import (
     ART_MOE_ROUTING_METADATA_KEY,
     MoeRouteSegments,
     align_choice_routes_to_tokenized_result,
-    attach_moe_routing_metadata_to_choice,
 )
 from art.preprocessing.pack import packed_tensors_from_tokenized_results
 from art.preprocessing.tokenize import TokenizedResult
@@ -52,63 +51,6 @@ def _routes_to_list(routes: Any) -> list[Any]:
     return routes.tolist()
 
 
-def test_align_choice_routes_to_tokenized_result_maps_vllm_routes() -> None:
-    routes, stats = align_choice_routes_to_tokenized_result(
-        token_ids=[10, 11, 20, 21],
-        choices=[
-            _choice(
-                {
-                    "prompt_token_ids": [10, 11],
-                    "completion_token_ids": [20, 21],
-                    "prompt_routed_experts": [_route(0), _route(10)],
-                    "completion_routed_experts": [_route(20), _route(30)],
-                }
-            )
-        ],
-        choice_offsets=[2],
-        choice_token_lengths=[2],
-    )
-
-    assert routes is not None
-    assert _routes_to_list(routes) == [_route(0), _route(10), _route(20), _route(30)]
-    assert stats.choices_with_routing == 1
-    assert stats.routed_tokens == 4
-
-
-def test_align_choice_routes_to_tokenized_result_uses_current_vllm_contract() -> None:
-    response_payload = {
-        "prompt_token_ids": [10, 11],
-        "prompt_routed_experts": [_route(0), _route(10)],
-        "choices": [
-            {
-                "index": 0,
-                "finish_reason": "stop",
-                "message": {"role": "assistant", "content": "x"},
-                "token_ids": [20, 21],
-                "routed_experts": [_route(20), _route(30)],
-            }
-        ],
-    }
-    choice = Choice.model_validate(response_payload["choices"][0])
-    attach_moe_routing_metadata_to_choice(
-        choice=choice,
-        response_payload=response_payload,
-        choice_index=0,
-    )
-
-    routes, stats = align_choice_routes_to_tokenized_result(
-        token_ids=[10, 11, 20, 21],
-        choices=[choice],
-        choice_offsets=[2],
-        choice_token_lengths=[2],
-    )
-
-    assert routes is not None
-    assert _routes_to_list(routes) == [_route(0), _route(10), _route(20), _route(30)]
-    assert stats.choices_with_routing == 1
-    assert stats.routed_tokens == 4
-
-
 def test_align_choice_routes_keeps_binary_route_views() -> None:
     combined = np.arange(4 * 2 * 2, dtype=np.uint8).reshape(4, 2, 2)
     combined.flags.writeable = False
@@ -140,8 +82,9 @@ def test_align_choice_routes_to_tokenized_result_rejects_token_mismatch() -> Non
                     {
                         "prompt_token_ids": [10, 11],
                         "completion_token_ids": [20],
-                        "prompt_routed_experts": [_route(0), _route(10)],
-                        "completion_routed_experts": [_route(20)],
+                        "routed_experts": np.asarray(
+                            [_route(0), _route(10), _route(20)], dtype=np.uint8
+                        ),
                     }
                 )
             ],

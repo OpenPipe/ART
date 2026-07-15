@@ -11,7 +11,6 @@ import json
 from pathlib import Path
 from typing import Any, cast
 
-from litellm.types.utils import Choices
 from openai.types.chat.chat_completion import Choice
 from openai.types.chat.chat_completion_message_param import ChatCompletionMessageParam
 
@@ -82,9 +81,18 @@ def write_trajectory_groups_parquet(
             # Flatten messages
             messages = []
             for message_or_choice in trajectory.messages_and_choices:
-                if isinstance(message_or_choice, Choice):
+                if isinstance(message_or_choice, dict):
+                    message = message_or_choice
+                elif isinstance(message_or_choice, Choice):
                     message = message_or_choice.to_dict()
-                elif isinstance(message_or_choice, Choices):
+                else:
+                    from litellm.types.utils import Choices
+
+                    if not isinstance(message_or_choice, Choices):
+                        raise TypeError(
+                            "trajectory messages must be dict, OpenAI Choice, or "
+                            "LiteLLM Choices objects"
+                        )
                     message = {
                         "finish_reason": message_or_choice.finish_reason,
                         "index": message_or_choice.index,
@@ -92,8 +100,6 @@ def write_trajectory_groups_parquet(
                         if hasattr(message_or_choice.message, "to_dict")
                         else message_or_choice.message,
                     }
-                else:
-                    message = message_or_choice
                 messages.append(_flatten_message(message))  # type: ignore
 
             rows.append(

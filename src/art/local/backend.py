@@ -64,7 +64,7 @@ from .._backend_training import (
     aggregate_rl_training_metrics,
     build_rl_train_configs,
 )
-from ..backend import AnyTrainableModel, Backend
+from ..backend import AnyTrainableModel
 from ..dev.sequence_lengths import max_seq_length_from_model_config
 from ..errors import ArtVllmMetricsTimeoutError
 from ..metrics_taxonomy import (
@@ -89,8 +89,10 @@ from ..preprocessing.tokenize import (
     tokenize_sft_batch,
     tokenize_trajectory_groups,
 )
+from ..serving_capabilities import ServingCapabilities
 from ..trajectories import Trajectory, TrajectoryGroup
 from ..types import (
+    Choice,
     LocalTrainResult,
     Message,
     TrainConfig,
@@ -100,6 +102,8 @@ from ..utils import format_message, get_model_step
 from .adapter_leases import (
     AdapterLeaseManager,
     pin_inference_step,
+    pin_inference_target,
+    pinned_inference_name,
     pinned_inference_step,
 )
 from .checkpoints import (
@@ -260,7 +264,14 @@ def _tokenizer_cache_key(
     return (base_model, hashlib.sha256(chat_template.encode("utf-8")).hexdigest())
 
 
-class LocalBackend(Backend):
+def _load_training_tokenizer(base_model: str) -> PreTrainedTokenizerBase:
+    return cast(
+        PreTrainedTokenizerBase,
+        AutoTokenizer.from_pretrained(base_model),
+    )
+
+
+class LocalBackend:
     def __init__(
         self,
         *,
@@ -368,6 +379,10 @@ class LocalBackend(Backend):
         return per_gpu_cost * gpu_count
 
     async def collect_train_step_vllm_metrics(self, model: Model) -> dict[str, float]:
+        capabilities = model._serving_capabilities
+        if capabilities is None:
+            raise RuntimeError("vLLM serving capabilities have not been discovered")
+        capabilities.require("fast_metrics", operation="ART vLLM metrics collection")
         base_url = model.inference_base_url
         if not base_url or not base_url.startswith(("http://", "https://")):
             raise RuntimeError(
@@ -722,6 +737,8 @@ class LocalBackend(Backend):
         """
 
         requested_step = step
+        if exact_name := pinned_inference_name(model.name, step):
+            return exact_name
 
         if step is None:
             step = pinned_inference_step(model.name)
@@ -764,6 +781,31 @@ class LocalBackend(Backend):
         manager = self._adapter_lease_manager(model.name)
         async with pin_inference_step(model.name, step), manager.lease(step):
             yield
+
+    @asynccontextmanager
+    async def exact_adapter_lease(
+        self,
+        model: AnyTrainableModel,
+        step: int,
+    ) -> AsyncIterator[None]:
+        service = await self._get_service(model)
+        checkpoint_path = get_step_checkpoint_dir(
+            get_model_dir(model=model, art_path=self._path), step
+        )
+        inference_name = await service.acquire_exact_adapter(step, checkpoint_path)
+        manager = self._adapter_lease_manager(model.name)
+        try:
+            async with (
+                pin_inference_target(
+                    model.name,
+                    step=step,
+                    inference_name=inference_name,
+                ),
+                manager.lease(step),
+            ):
+                yield
+        finally:
+            await service.release_exact_adapter(step)
 
     @asynccontextmanager
     async def adapter_retention_lease(
@@ -852,7 +894,7 @@ class LocalBackend(Backend):
         tokenizer_key = _tokenizer_cache_key(model.base_model, internal_config)
         if tokenizer_key not in self._tokenizers:
             tokenizer = self._configure_training_tokenizer(
-                AutoTokenizer.from_pretrained(model.base_model),
+                _load_training_tokenizer(model.base_model),
                 model=model,
                 internal_config=internal_config,
             )
@@ -1059,6 +1101,12 @@ class LocalBackend(Backend):
 
         service = await self._get_service(model)
         host, port = await service.start_openai_server(config=resolved_config)
+        get_capabilities = getattr(service, "get_serving_capabilities", None)
+        capabilities = await get_capabilities() if callable(get_capabilities) else None
+        if capabilities is not None:
+            if not isinstance(capabilities, ServingCapabilities):
+                raise RuntimeError("Serving service returned invalid capabilities")
+            object.__setattr__(model, "_serving_capabilities", capabilities)
 
         external_runtime = get_external_vllm_runtime_config(internal_config)
         if external_runtime is not None:
@@ -1071,6 +1119,13 @@ class LocalBackend(Backend):
             api_key = server_args.get("api_key") or "default"
 
         if self._model_uses_expert_replay(model):
+            if capabilities is None:
+                raise RuntimeError(
+                    "MoE routing replay requires serving capability discovery"
+                )
+            capabilities.require(
+                "binary_routed_experts", operation="MoE routing replay"
+            )
             if not base_url.rstrip("/").endswith("/v1"):
                 raise RuntimeError(
                     "ART vLLM base URL must end in /v1 for binary routed experts"
@@ -1090,10 +1145,10 @@ class LocalBackend(Backend):
         header = f"reward: {trajectory.reward} {' '.join(f'{k}: {v}' for k, v in trajectory.metrics.items())}\n\n"
         formatted_messages = []
         for message_or_choice in trajectory.messages_and_choices:
-            if isinstance(message_or_choice, dict):
-                message = message_or_choice
+            if isinstance(message_or_choice, Choice):
+                message = cast(Message, message_or_choice.message.model_dump())
             else:
-                message = cast(Message, message_or_choice.message.model_dump())  # ty:ignore[possibly-missing-attribute]
+                message = message_or_choice
             formatted_messages.append(format_message(message))
         return header + "\n".join(formatted_messages)
 
@@ -1137,7 +1192,7 @@ class LocalBackend(Backend):
         num_trajectories_learning_rate_multiplier_power: float = 0.0,
         # Checkpoint behavior
         save_checkpoint: bool = True,
-        optimizer_save_interval: int | None = None,
+        optimizer_save_interval: int = 5,
         final_training_step: int | None = None,
         # Verbosity
         verbose: bool = False,
@@ -1409,10 +1464,11 @@ class LocalBackend(Backend):
                 try:
                     # Register the copied checkpoint as a new LoRA adapter
                     # so it's available for inference at the new step
-                    if hasattr(service, "register_lora_for_step"):
-                        await service.register_lora_for_step(  # type: ignore[attr-defined]
-                            next_step, next_checkpoint_dir
-                        )
+                    register_lora_for_step = getattr(
+                        service, "register_lora_for_step", None
+                    )
+                    if callable(register_lora_for_step):
+                        await register_lora_for_step(next_step, next_checkpoint_dir)
                     logger.info(
                         f"[BACKEND] _train_model SKIP: register_lora_for_step "
                         f"completed for step {next_step}"
@@ -1433,8 +1489,24 @@ class LocalBackend(Backend):
             packed_tensors["assistant_mask"].sum().item()
         )
         packed_sequences, packed_sequence_length = packed_tensors["tokens"].shape
-        packed_train_tokens = int(packed_sequences * packed_sequence_length)
         non_padding_tokens = int((packed_tensors["group_ids"] != -1).sum().item())
+        packing_stats = packed_tensors["prefix_tree_packing_stats"]
+        disk_packed_tensors = packed_tensors_to_dir(
+            packed_tensors, f"{get_model_dir(model=model, art_path=self._path)}/tensors"
+        )
+        service_dev_config = cast(dev.TrainConfig, {**dev_config})
+        grad_accumulation_sequences = await self._resolve_grad_accumulation_sequences(
+            service,
+            config,
+        )
+        fallback_gradient_steps = math.ceil(
+            packed_sequences / grad_accumulation_sequences
+        )
+        packed_train_tokens = int(
+            fallback_gradient_steps
+            * grad_accumulation_sequences
+            * packed_sequence_length
+        )
         base_metrics.update(
             {
                 "data/step_packed_sequences": float(packed_sequences),
@@ -1443,18 +1515,13 @@ class LocalBackend(Backend):
                 "data/step_padding_ratio": (
                     float(packed_train_tokens - non_padding_tokens)
                     / packed_train_tokens
-                    if packed_train_tokens > 0
-                    else 0.0
+                ),
+                "prefix_tree/logical_tokens": float(packing_stats["logical_tokens"]),
+                "prefix_tree/physical_tokens": float(packing_stats["physical_tokens"]),
+                "prefix_tree/compression_ratio": (
+                    packing_stats["logical_tokens"] / packing_stats["physical_tokens"]
                 ),
             }
-        )
-        disk_packed_tensors = packed_tensors_to_dir(
-            packed_tensors, f"{get_model_dir(model=model, art_path=self._path)}/tensors"
-        )
-        service_dev_config = cast(dev.TrainConfig, {**dev_config})
-        grad_accumulation_sequences = await self._resolve_grad_accumulation_sequences(
-            service,
-            config,
         )
         if include_moe_routing:
             from ..megatron.routing_replay import (
@@ -1472,9 +1539,6 @@ class LocalBackend(Backend):
             service_dev_config["moe_routing_replay_path"] = routing_replay_dir
             service_dev_config["moe_routing_replay_strict"] = True
         # Note: scale_learning_rate_by_reward_std_dev is now handled by the frontend (Model.train())
-        fallback_gradient_steps = math.ceil(
-            disk_packed_tensors["num_sequences"] / grad_accumulation_sequences
-        )
         pbar = tqdm.tqdm(total=fallback_gradient_steps, desc="train")
         reported_gradient_steps: int | None = None
         async for result in service.train(
@@ -1546,8 +1610,8 @@ class LocalBackend(Backend):
         Args:
             model: The trainable model to fine-tune
             trajectories: Iterable of Trajectory objects
-            config: SFT configuration with batch_size and learning rates.
-                    If learning_rate is a list, streaming mode is used automatically.
+            config: SFT configuration with batch size, learning rates, and assistant
+                turn selection. A learning-rate list enables streaming mode.
             dev_config: Developer configuration
             verbose: Whether to print detailed logs
 
@@ -1561,7 +1625,7 @@ class LocalBackend(Backend):
         tokenizer_key = _tokenizer_cache_key(model.base_model, internal_config)
         if tokenizer_key not in self._tokenizers:
             tokenizer = self._configure_training_tokenizer(
-                AutoTokenizer.from_pretrained(model.base_model),
+                _load_training_tokenizer(model.base_model),
                 model=model,
                 internal_config=internal_config,
             )
@@ -1593,33 +1657,38 @@ class LocalBackend(Backend):
 
         max_seq_length = self._model_max_sequence_length(model)
 
-        import itertools
-        from typing import Iterator
-
         from ..preprocessing.tokenize import SFTBatch
-
-        if isinstance(config.learning_rate, list):
-            learning_rates_iter: Iterator[float] = iter(config.learning_rate)
-        else:
-            learning_rates_iter = itertools.repeat(config.learning_rate)
 
         # Build all batches in memory
         trajectory_list = list(trajectories)
         batches: list[SFTBatch] = []
+        total_dropped_trajectories = 0
         for i in range(0, len(trajectory_list), batch_size):
             batch_trajectories = trajectory_list[i : i + batch_size]
-            batches.append(
-                tokenize_sft_batch(
-                    trajectory_batch=batch_trajectories,
-                    learning_rate=next(learning_rates_iter),
-                    tokenizer=tokenizer,
-                    instruction_part=instruction_part,
-                    response_part=response_part,
-                    chat_template_kwargs=chat_template_kwargs,
-                    chat_template_tool_schema_format=chat_template_tool_schema_format,
-                    max_seq_length=max_seq_length,
-                )
+            learning_rate = (
+                config.learning_rate[len(batches)]
+                if isinstance(config.learning_rate, list)
+                else config.learning_rate
             )
+            batch = tokenize_sft_batch(
+                trajectory_batch=batch_trajectories,
+                learning_rate=learning_rate,
+                tokenizer=tokenizer,
+                instruction_part=instruction_part,
+                response_part=response_part,
+                chat_template_kwargs=chat_template_kwargs,
+                chat_template_tool_schema_format=chat_template_tool_schema_format,
+                max_seq_length=max_seq_length,
+                assistant_turns=config.assistant_turns,
+            )
+            total_dropped_trajectories += batch.num_dropped_trajectories
+            if batch.num_trainable_tokens > 0:
+                batches.append(batch)
+
+        if not batches:
+            if verbose:
+                print("No SFT batches contained trainable tokens")
+            return
 
         # Get the service and train
         service = await self._get_service(model)
@@ -1627,9 +1696,6 @@ class LocalBackend(Backend):
         pbar = tqdm.tqdm(total=len(batches), desc="sft train")
         total_trainable_tokens = sum(batch.num_trainable_tokens for batch in batches)
         total_trajectories = len(trajectory_list)
-        total_dropped_trajectories = sum(
-            batch.num_dropped_trajectories for batch in batches
-        )
         batch_count = 0
 
         async for result in service.train_sft(batches, service_config, verbose):
@@ -1650,12 +1716,6 @@ class LocalBackend(Backend):
             }
 
         pbar.close()
-
-        if batch_count > 0 and total_trainable_tokens == 0:
-            print(
-                "WARNING: No trainable tokens found! "
-                "Check instruction_part and response_part settings."
-            )
 
         if verbose:
             print("_train_sft complete")
@@ -1735,7 +1795,8 @@ class LocalBackend(Backend):
                     f"No checkpoints found for {model.project}/{model.name} in local storage or S3"
                 )
             elif local_latest_step is None:
-                resolved_step = s3_latest_step  # type: ignore[assignment]
+                assert s3_latest_step is not None
+                resolved_step = s3_latest_step
                 if verbose:
                     print(f"Using latest checkpoint from S3: step {resolved_step}")
             elif s3_latest_step is None:

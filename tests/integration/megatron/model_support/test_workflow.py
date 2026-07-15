@@ -27,7 +27,7 @@ from .workflow import (
     run_lora_coverage_stage,
     run_merged_vllm_serving_stage,
     run_native_vllm_lora_stage,
-    run_packed_position_ids_stage,
+    run_packing_invariance_stage,
     run_train_inf_mismatch_stage,
     run_yes_no_trainability_stage,
     validated_architecture_representative_models,
@@ -109,7 +109,8 @@ def test_dsv4_runtime_stages_use_full_model_resources() -> None:
         assert engine_args.get("load_format") != "dummy"
         assert engine_args["moe_backend"] == "triton_unfused"
         assert engine_args["kv_cache_dtype"] == "fp8"
-        assert stage.megatron_env == {"ART_MEGATRON_STREAMING_WEIGHT_OFFLOAD": "1"}
+        assert stage.streaming_weight_offload is True
+        assert stage.megatron_env == {}
 
     for stage in (resources.merged_vllm_serving, resources.native_vllm_lora):
         assert stage is not None
@@ -309,8 +310,8 @@ def test_build_validation_report_populates_architecture_stage(
                 },
                 artifact_dir="/tmp/chat-template",
             ),
-            "packed_position_ids": ValidationStageResult(
-                name="packed_position_ids",
+            "packing_invariance": ValidationStageResult(
+                name="packing_invariance",
                 passed=True,
                 metrics={
                     "num_layers": 4,
@@ -322,7 +323,7 @@ def test_build_validation_report_populates_architecture_stage(
                         }
                     ],
                 },
-                artifact_dir="/tmp/packed-position-ids",
+                artifact_dir="/tmp/packing-invariance",
             ),
             "length_trainability": ValidationStageResult(
                 name="length_trainability",
@@ -419,11 +420,11 @@ def test_build_validation_report_populates_architecture_stage(
         "failed_scenarios": [],
     }
     assert chat_template_stage.artifact_dir == "/tmp/chat-template"
-    position_id_stage = next(
-        stage for stage in report.stages if stage.name == "packed_position_ids"
+    packing_invariance_stage = next(
+        stage for stage in report.stages if stage.name == "packing_invariance"
     )
-    assert position_id_stage.passed is True
-    assert position_id_stage.metrics == {
+    assert packing_invariance_stage.passed is True
+    assert packing_invariance_stage.metrics == {
         "num_layers": 4,
         "scenarios": [
             {
@@ -433,7 +434,7 @@ def test_build_validation_report_populates_architecture_stage(
             }
         ],
     }
-    assert position_id_stage.artifact_dir == "/tmp/packed-position-ids"
+    assert packing_invariance_stage.artifact_dir == "/tmp/packing-invariance"
     trainability_stage = next(
         stage for stage in report.stages if stage.name == "length_trainability"
     )
@@ -1002,13 +1003,13 @@ def test_run_native_vllm_lora_stage(monkeypatch) -> None:
     assert result.artifact_dir == "/tmp/native-vllm-lora"
 
 
-def test_run_packed_position_ids_stage(monkeypatch) -> None:
+def test_run_packing_invariance_stage(monkeypatch) -> None:
     monkeypatch.setattr(
         "tests.integration.megatron.model_support.workflow._import_integration_module",
         lambda name: SimpleNamespace(
-            run_packed_position_ids=lambda *, base_model, num_layers, allow_unvalidated_arch=False: (
+            run_packing_invariance=lambda *, base_model, num_layers, allow_unvalidated_arch=False: (
                 SimpleNamespace(
-                    output_dir="/tmp/packed-position-ids",
+                    output_dir="/tmp/packing-invariance",
                     model_dump=lambda mode="json": {
                         "base_model": base_model,
                         "num_layers": num_layers,
@@ -1030,7 +1031,7 @@ def test_run_packed_position_ids_stage(monkeypatch) -> None:
         ),
     )
 
-    result = run_packed_position_ids_stage(
+    result = run_packing_invariance_stage(
         base_model="Qwen/Qwen3.5-35B-A3B",
         architecture=ArchitectureReport(
             base_model="Qwen/Qwen3.5-35B-A3B",
@@ -1041,7 +1042,7 @@ def test_run_packed_position_ids_stage(monkeypatch) -> None:
     )
 
     assert result.passed is True
-    assert result.artifact_dir == "/tmp/packed-position-ids"
+    assert result.artifact_dir == "/tmp/packing-invariance"
 
 
 def test_assess_minimal_layer_coverage_passes_when_prefix_covers_all_families(

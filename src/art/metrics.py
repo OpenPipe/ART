@@ -40,7 +40,7 @@ PIPELINE_RL_METRIC_DEFINITIONS: tuple[MetricDefinition, ...] = (
         title="Score",
         description=(
             "accepted trainable assistant tokens per second times freshness "
-            "discount times batch-size discount"
+            "discount times critical-batch factor"
         ),
         kind="score",
         higher_is_better=True,
@@ -106,8 +106,8 @@ PIPELINE_RL_METRIC_DEFINITIONS: tuple[MetricDefinition, ...] = (
         key="data/step_padding_ratio",
         title="Padding ratio",
         description=(
-            "physical packed-token padding divided by packed sequence length "
-            "for this step"
+            "unused packed-token slots, including dummy data-parallel rows, "
+            "divided by executed packed-token capacity for this step"
         ),
         kind="ratio",
         higher_is_better=False,

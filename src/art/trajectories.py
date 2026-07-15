@@ -123,7 +123,7 @@ def get_messages(messages_and_choices: MessagesAndChoices) -> Messages:
             msg = dict(message_or_choice)
             if msg.get("content") is None:
                 msg["content"] = ""
-            messages.append(msg)  # type: ignore[arg-type]
+            messages.append(cast(Message, msg))
     return messages
 
 
@@ -225,7 +225,7 @@ class TrajectoryGroup(pydantic.BaseModel):
     def log(self, message: str) -> None:
         self.logs.append(message)
 
-    def __iter__(self) -> Iterator[Trajectory]:  # type: ignore[override]
+    def __iter__(self) -> Iterator[Trajectory]:  # type: ignore
         return iter(self.trajectories)
 
     def __len__(self) -> int:

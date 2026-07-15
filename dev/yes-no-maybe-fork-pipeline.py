@@ -24,7 +24,7 @@ import openai
 
 import art
 from art.local import LocalBackend
-from art.pipeline_trainer import PipelineTrainer
+from art.pipeline_trainer import PipelineRuntimeConfig, PipelineTrainer
 from art.utils.deployment.wandb import deploy_wandb
 from art.utils.output_dirs import get_model_dir, get_step_checkpoint_dir
 
@@ -298,9 +298,11 @@ async def main() -> None:
                 rollout_fn=make_rollout_fn(),
                 scenarios=scenario_iter(),
                 config=None,
-                num_rollout_workers=len(PROMPTS),
-                min_batch_size=len(PROMPTS),
-                max_batch_size=len(PROMPTS),
+                pipeline=PipelineRuntimeConfig(
+                    num_rollout_workers=len(PROMPTS),
+                    min_batch_size=len(PROMPTS),
+                    max_batch_size=len(PROMPTS),
+                ),
                 max_steps=TRAIN_STEPS - start_step,
                 learning_rate=1e-4,
                 loss_fn="cispo",
@@ -368,9 +370,11 @@ async def main() -> None:
         rollout_fn=make_rollout_fn(),
         scenarios=scenario_iter(),
         config=None,
-        num_rollout_workers=len(PROMPTS),
-        min_batch_size=len(PROMPTS),
-        max_batch_size=len(PROMPTS),
+        pipeline=PipelineRuntimeConfig(
+            num_rollout_workers=len(PROMPTS),
+            min_batch_size=len(PROMPTS),
+            max_batch_size=len(PROMPTS),
+        ),
         max_steps=2,
         learning_rate=1e-4,
         loss_fn="cispo",

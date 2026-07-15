@@ -1,6 +1,7 @@
 """Monkey patches and bootstrap contract for the ART-owned vLLM runtime."""
 
 import ctypes
+from functools import wraps
 import importlib
 import inspect
 import logging
@@ -19,6 +20,7 @@ def apply_vllm_runtime_patches() -> None:
     from art_vllm_runtime.policy_spans import patch_policy_token_spans
 
     patch_transformers_v5_compat()
+    patch_flashinfer_oneshot_pdl_completion()
     patch_policy_token_spans()
     patch_gemma4_moe_lora_support()
     subclass_chat_completion_request()
@@ -32,6 +34,29 @@ def apply_vllm_runtime_patches() -> None:
     from art_vllm_runtime.binary_routes import patch_binary_routed_experts_response
 
     patch_binary_routed_experts_response()
+
+
+def patch_flashinfer_oneshot_pdl_completion() -> None:
+    """Prevent one-shot fused all-reduce consumers from racing its output.
+
+    FlashInfer's one-shot algorithm has no internal synchronization after an
+    early PDL completion trigger, so completion must be signaled at kernel end.
+    This backports vLLM PR #45448 without changing the synchronized two-shot path.
+    """
+    import flashinfer.comm as flashinfer_comm
+
+    original = flashinfer_comm.allreduce_fusion
+    if getattr(original, "__art_oneshot_pdl_patched__", False):
+        return
+
+    @wraps(original)
+    def allreduce_fusion(*args: Any, **kwargs: Any) -> Any:
+        if kwargs.get("use_oneshot"):
+            kwargs["trigger_completion_at_end"] = True
+        return original(*args, **kwargs)
+
+    allreduce_fusion.__art_oneshot_pdl_patched__ = True  # type: ignore[attr-defined]
+    flashinfer_comm.allreduce_fusion = allreduce_fusion
 
 
 def patch_transformers_v5_compat() -> None:
