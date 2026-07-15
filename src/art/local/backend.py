@@ -1223,6 +1223,7 @@ class LocalBackend:
         save_checkpoint: bool = True,
         optimizer_save_interval: int = 5,
         final_training_step: int | None = None,
+        grad_accumulation_sequences: int | None = None,
         # Verbosity
         verbose: bool = False,
     ) -> LocalTrainResult:
@@ -1360,6 +1361,7 @@ class LocalBackend:
             kl_ref_adapter_path=resolved_kl_ref_adapter_path,
             optimizer_save_interval=optimizer_save_interval,
             final_training_step=final_training_step,
+            grad_accumulation_sequences=grad_accumulation_sequences,
         )
 
         # Collect metrics from training

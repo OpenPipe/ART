@@ -39,11 +39,13 @@ def build_rl_train_configs(
     kl_ref_adapter_path: str | None = None,
     optimizer_save_interval: int = 5,
     final_training_step: int | None = None,
+    grad_accumulation_sequences: int | None = None,
 ) -> tuple[TrainConfig, dev.TrainConfig]:
     config = TrainConfig(
         learning_rate=learning_rate,
         kl_penalty_coef=kl_penalty_coef,
         kl_penalty_source=kl_penalty_source,
+        grad_accumulation_sequences=grad_accumulation_sequences,
         optimizer_save_interval=optimizer_save_interval,
         final_training_step=final_training_step,
     )
