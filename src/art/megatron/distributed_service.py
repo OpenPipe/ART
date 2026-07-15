@@ -157,14 +157,30 @@ class DistributedMegatronService:
         return value
 
     def _resolve_current_lora_path(self) -> str:
+        if self._trainer is not None and self._trainer.valid:
+            path = get_step_checkpoint_dir(self.output_dir, self._latest_step)
+            if not (Path(path) / "adapter_model.safetensors").is_file():
+                raise RuntimeError(
+                    f"resident trainer adapter is missing for step {self._latest_step}"
+                )
+            return path
         resume = prepare_megatron_resume_state(
             output_dir=self.output_dir,
             optimizer_state_path=self._optimizer_state_path,
         )
         print(format_megatron_resume_message(resume))
-        self._latest_step = max(self._latest_step, resume.step)
+        self._latest_step = resume.step
+        self._published_adapters = {
+            step: adapter
+            for step, adapter in self._published_adapters.items()
+            if step <= resume.step
+        }
         path = get_step_checkpoint_dir(self.output_dir, self._latest_step)
         if not (Path(path) / "adapter_model.safetensors").is_file():
+            if self._latest_step != 0:
+                raise RuntimeError(
+                    f"committed adapter is missing for step {self._latest_step}"
+                )
             lora = self._lora_config()
             handler = get_model_support_handler(
                 self.base_model,
@@ -237,8 +253,11 @@ class DistributedMegatronService:
         )
 
     async def _ensure_trainer_locked(self) -> Any:
-        if self._trainer is not None:
+        if self._trainer is not None and self._trainer.valid:
             return self._trainer
+        if self._trainer is not None:
+            await self._trainer.close()
+            self._trainer = None
         current = await asyncio.to_thread(self._resolve_current_lora_path)
         runtime_spec = self._runtime_spec()
         run_spec = TrainingRunSpec(
@@ -263,8 +282,24 @@ class DistributedMegatronService:
         staging: str,
     ) -> AsyncIterator[AsyncIterator[Any]]:
         async with async_optimizer_model_lease(job.output.optimizer_state_path):
-            await asyncio.to_thread(_copy_checkpoint, source, staging)
-            yield trainer.train(job, leases)
+            copy = asyncio.create_task(
+                asyncio.to_thread(_copy_checkpoint, source, staging)
+            )
+            try:
+                await asyncio.shield(copy)
+            except asyncio.CancelledError as cancelled:
+                try:
+                    await copy
+                except BaseException as error:
+                    cancelled.add_note(
+                        f"checkpoint copy failed during cancellation: {error}"
+                    )
+                raise
+            events = trainer.train(job, leases)
+            try:
+                yield events
+            finally:
+                await events.aclose()
 
     async def train_packed(
         self,

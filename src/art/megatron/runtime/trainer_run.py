@@ -46,6 +46,9 @@ class TrainJobExecutor(Protocol):
 
 
 class TrainerRun(Protocol):
+    @property
+    def valid(self) -> bool: ...
+
     def train(
         self, job: TrainJobSpec, batch: PackedBatch
     ) -> AsyncIterator[TrainEvent]: ...
@@ -326,8 +329,8 @@ class LocalTrainerRun:
         if self._closed:
             return
         self._closed = True
+        self._valid = False
         if self._active_cancel is not None:
             self._active_cancel.set()
-            self._valid = False
         async with self._job_lock:
             await asyncio.to_thread(self._executor.close)

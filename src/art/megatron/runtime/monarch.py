@@ -237,6 +237,14 @@ class MonarchTrainerRun:
         self._closed = False
         self._valid = True
 
+    @property
+    def learner_version(self) -> int:
+        return self._learner_version
+
+    @property
+    def valid(self) -> bool:
+        return self._valid
+
     async def train(
         self, job: TrainJobSpec, batch: PackedBatchLeaseSet
     ) -> AsyncIterator[TrainEvent]:
