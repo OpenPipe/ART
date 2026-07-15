@@ -94,6 +94,12 @@ class MegatronBackend(LocalBackend):
             if self._runtime is not None:
                 from .distributed_service import DistributedMegatronService
 
+                config["init_args"]["model_name"] = (
+                    (model._internal_config or {})
+                    .get("init_args", {})
+                    .get("model_name", model.base_model)
+                )
+
                 service = cast(
                     ModelService,
                     DistributedMegatronService(
