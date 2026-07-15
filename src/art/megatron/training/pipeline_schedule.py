@@ -4,7 +4,7 @@ from collections.abc import Callable, Iterator, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 import time
-from typing import Any, Generic, TypeVar, cast
+from typing import Any, Generic, Protocol, TypeVar, cast
 
 from megatron.core import parallel_state as ps
 from megatron.core.pipeline_parallel.p2p_communication import P2PCommunicator
@@ -13,12 +13,21 @@ from megatron.core.pipeline_parallel.schedules import (
     get_schedule_table,
 )
 from megatron.core.process_groups_config import ProcessGroupCollection
+from megatron.core.timers import DummyTimer
 from megatron.core.utils import get_model_config
 import torch
 
+from art.megatron.routing_replay import MoeRoutingReplayController
 from art.megatron.training.model_chunks import ModelChunks
+from art.megatron.training.trace import prepare_replay_local_input_token_uids
 
-_T = TypeVar("_T")
+
+class _PreparedMicrobatch(Protocol):
+    attention_state: Any
+    local_token_uids: torch.Tensor | None
+
+
+_T = TypeVar("_T", bound=_PreparedMicrobatch)
 
 
 @dataclass(frozen=True)
@@ -29,9 +38,63 @@ class ScheduleMicrobatch(Generic[_T]):
     recompute_state: object | None = None
 
 
+def _set_hybridep_token_count(rows: int) -> None:
+    from megatron.core.transformer.moe import fused_a2a
+
+    buffer = fused_a2a._hybrid_ep_buffer
+    if buffer is None:
+        raise RuntimeError("HybridEP buffer is not initialized")
+    buffer.set_num_tokens_per_rank(rows)
+
+
+def _validate_hybridep_token_counts(
+    values: Sequence[int] | None, microbatch_count: int
+) -> bool:
+    enabled = ps.get_expert_model_parallel_world_size() > 1
+    if enabled and (values is None or len(values) != microbatch_count):
+        raise RuntimeError(
+            "HybridEP requires one planned communication extent per microbatch"
+        )
+    return enabled
+
+
+class PipelineMicrobatchState(Generic[_T]):
+    def __init__(
+        self,
+        *,
+        controller: MoeRoutingReplayController | None,
+        hybridep_token_counts: Sequence[int] | None,
+        microbatch_count: int,
+    ) -> None:
+        hybridep_enabled = _validate_hybridep_token_counts(
+            hybridep_token_counts, microbatch_count
+        )
+        self._controller = controller
+        self._hybridep_token_counts = (
+            tuple(cast(Sequence[int], hybridep_token_counts))
+            if hybridep_enabled
+            else None
+        )
+
+    @property
+    def enabled(self) -> bool:
+        return self._controller is not None or self._hybridep_token_counts is not None
+
+    def activate(self, item: ScheduleMicrobatch[_T]) -> None:
+        prepared = item.payload
+        if self._controller is not None:
+            self._controller.begin_micro(item.sample_index, item.order)
+            prepare_replay_local_input_token_uids(
+                self._controller,
+                prepared.local_token_uids,
+                prepared.attention_state,
+            )
+        if self._hybridep_token_counts is not None:
+            _set_hybridep_token_count(self._hybridep_token_counts[item.order])
+
+
 @dataclass
 class PipelineScheduleTelemetry:
-    schedule: str
     pp_rank: int
     pp_size: int
     vp_size: int
@@ -39,7 +102,6 @@ class PipelineScheduleTelemetry:
     micro_batch_size: int
     seq_length: int
     microbatch_group_size: int
-    compute_s_by_chunk: dict[int, float] = field(default_factory=dict)
     forward_compute_s_by_chunk: dict[int, float] = field(default_factory=dict)
     backward_compute_s_by_chunk: dict[int, float] = field(default_factory=dict)
     forward_host_s_by_chunk: dict[int, float] = field(default_factory=dict)
@@ -59,6 +121,11 @@ class PipelineScheduleTelemetry:
         if self._metrics_cache is not None:
             return dict(self._metrics_cache)
         self._resolve_cuda_timers()
+        bubble_fraction = pipeline_bubble_fraction(
+            pp_size=self.pp_size,
+            vp_size=self.vp_size,
+            num_microbatches=self.num_microbatches,
+        )
         metrics = {
             "pipeline/pp_rank": float(self.pp_rank),
             "pipeline/pp_size": float(self.pp_size),
@@ -80,25 +147,16 @@ class PipelineScheduleTelemetry:
                 self.memory_allocated_start_bytes
             ),
             "pipeline/peak_memory_bytes": float(self.peak_memory_bytes),
-            "pipeline/ideal_bubble_fraction": pipeline_bubble_fraction(
-                pp_size=self.pp_size,
-                vp_size=self.vp_size,
-                num_microbatches=self.num_microbatches,
-            ),
-            "pipeline/bubble_fraction_estimate": pipeline_bubble_fraction(
-                pp_size=self.pp_size,
-                vp_size=self.vp_size,
-                num_microbatches=self.num_microbatches,
-            ),
+            "pipeline/ideal_bubble_fraction": bubble_fraction,
+            "pipeline/bubble_fraction_estimate": bubble_fraction,
         }
-        for chunk, value in sorted(self.compute_s_by_chunk.items()):
-            metrics[f"pipeline/chunk_{chunk}/compute_s"] = value
-            metrics[f"pipeline/chunk_{chunk}/forward_compute_s"] = (
-                self.forward_compute_s_by_chunk.get(chunk, 0.0)
+        for chunk, forward_compute in sorted(self.forward_compute_s_by_chunk.items()):
+            backward_compute = self.backward_compute_s_by_chunk.get(chunk, 0.0)
+            metrics[f"pipeline/chunk_{chunk}/compute_s"] = (
+                forward_compute + backward_compute
             )
-            metrics[f"pipeline/chunk_{chunk}/backward_compute_s"] = (
-                self.backward_compute_s_by_chunk.get(chunk, 0.0)
-            )
+            metrics[f"pipeline/chunk_{chunk}/forward_compute_s"] = forward_compute
+            metrics[f"pipeline/chunk_{chunk}/backward_compute_s"] = backward_compute
             metrics[f"pipeline/chunk_{chunk}/forward_host_s"] = (
                 self.forward_host_s_by_chunk.get(chunk, 0.0)
             )
@@ -115,14 +173,8 @@ class PipelineScheduleTelemetry:
             return
         timers.synchronize()
         self.schedule_gpu_s = timers.total("forward-backward")
-        forward = timers.by_chunk("forward-compute")
-        backward = timers.by_chunk("backward-compute")
-        self.forward_compute_s_by_chunk = forward
-        self.backward_compute_s_by_chunk = backward
-        self.compute_s_by_chunk = {
-            chunk: forward.get(chunk, 0.0) + backward.get(chunk, 0.0)
-            for chunk in range(self.vp_size)
-        }
+        self.forward_compute_s_by_chunk = timers.by_chunk("forward-compute")
+        self.backward_compute_s_by_chunk = timers.by_chunk("backward-compute")
 
     def _stage_metrics(self) -> dict[str, float]:
         local = [
@@ -133,11 +185,11 @@ class PipelineScheduleTelemetry:
             self.p2p_wait_s,
             float(self.peak_memory_bytes),
             *(
-                self.forward_compute_s_by_chunk.get(chunk, 0.0)
-                for chunk in range(self.vp_size)
-            ),
-            *(
-                self.backward_compute_s_by_chunk.get(chunk, 0.0)
+                values.get(chunk, 0.0)
+                for values in (
+                    self.forward_compute_s_by_chunk,
+                    self.backward_compute_s_by_chunk,
+                )
                 for chunk in range(self.vp_size)
             ),
         ]
@@ -295,16 +347,8 @@ class _DeferredCudaTimer:
             torch.distributed.barrier()  # ty: ignore[possibly-missing-attribute]
         end = torch.cuda.Event(enable_timing=True)
         end.record()
-        self._owner.add(self._name, self._start, end)
+        self._owner._spans.setdefault(self._name, []).append((self._start, end))
         self._start = None
-
-
-class _NullTimer:
-    def start(self, barrier: bool = False) -> None:
-        pass
-
-    def stop(self, barrier: bool = False) -> None:
-        pass
 
 
 class _DeferredCudaTimers:
@@ -320,24 +364,14 @@ class _DeferredCudaTimers:
         self._timers = {
             name: _DeferredCudaTimer(self, name) for name in self._TIMED_NAMES
         }
-        self._null_timer = _NullTimer()
+        self._null_timer = DummyTimer()
         self._spans: dict[str, list[tuple[torch.cuda.Event, torch.cuda.Event]]] = {}
 
-    def __call__(self, name: str, **_kwargs: Any) -> _DeferredCudaTimer | _NullTimer:
+    def __call__(self, name: str, **_kwargs: Any) -> _DeferredCudaTimer | DummyTimer:
         return self._timers.get(name, self._null_timer)
 
-    def add(self, name: str, start: torch.cuda.Event, end: torch.cuda.Event) -> None:
-        self._spans.setdefault(name, []).append((start, end))
-
     def validate_counts(self, *, forward_only: bool) -> None:
-        names = (
-            ("forward-compute",)
-            if forward_only
-            else (
-                "forward-compute",
-                "backward-compute",
-            )
-        )
+        names = ("forward-compute",) + (() if forward_only else ("backward-compute",))
         for name in names:
             actual = len(self._spans.get(name, ()))
             expected = len(self._chunk_sequences[name])
@@ -435,21 +469,31 @@ class MCoreScheduleAdapter(Generic[_T]):
         self,
         *,
         model_chunks: ModelChunks,
-        microbatches: Sequence[ScheduleMicrobatch[_T]],
-        microbatch_shapes: Sequence[tuple[int, int]],
-        routing_replay_enabled: bool = False,
-        activate_microbatch: Callable[[ScheduleMicrobatch[_T]], None] | None = None,
+        prepared_microbatches: Sequence[_T],
+        sample_indices: Sequence[int | None],
+        model_inputs: Sequence[torch.Tensor],
+        moe_routing_replay_controller: MoeRoutingReplayController | None = None,
+        hybridep_token_counts: Sequence[int] | None = None,
     ) -> None:
         if not model_chunks:
             raise ValueError("MCore schedule requires at least one model chunk")
-        if len(microbatches) != len(microbatch_shapes):
-            raise ValueError("microbatch payload/shape counts differ")
+        if not (len(prepared_microbatches) == len(sample_indices) == len(model_inputs)):
+            raise ValueError("microbatch payload/sample/input counts differ")
         self.model_chunks = model_chunks
-        self.microbatches = tuple(microbatches)
-        self._activate_microbatch = activate_microbatch
+        self.microbatches = tuple(
+            ScheduleMicrobatch(order, sample_index, prepared, prepared.attention_state)
+            for order, (sample_index, prepared) in enumerate(
+                zip(sample_indices, prepared_microbatches, strict=True)
+            )
+        )
+        self._microbatch_state = PipelineMicrobatchState(
+            controller=moe_routing_replay_controller,
+            hybridep_token_counts=hybridep_token_counts,
+            microbatch_count=len(self.microbatches),
+        )
         self._active_recompute_state_id: int | None = None
         self.micro_batch_size, self.seq_length = validate_fixed_microbatch_shapes(
-            microbatch_shapes
+            [(int(value.shape[0]), int(value.shape[1])) for value in model_inputs]
         )
         self.pp_size = int(ps.get_pipeline_model_parallel_world_size())
         self.pp_rank = int(ps.get_pipeline_model_parallel_rank())
@@ -461,16 +505,8 @@ class MCoreScheduleAdapter(Generic[_T]):
                 f"chunks={len(model_chunks)}, vpp={self.vp_size}"
             )
         self._validate_stage_ownership()
-        self._configure(routing_replay_enabled=routing_replay_enabled)
-        schedule = (
-            "pp1"
-            if self.pp_size == 1
-            else "interleaved"
-            if self.vp_size > 1
-            else "noninterleaved"
-        )
+        self._configure()
         self.telemetry = PipelineScheduleTelemetry(
-            schedule=schedule,
             pp_rank=self.pp_rank,
             pp_size=self.pp_size,
             vp_size=self.vp_size,
@@ -512,24 +548,9 @@ class MCoreScheduleAdapter(Generic[_T]):
                     f"post_process={actual_post} (expected {expected_post})"
                 )
 
-    def _configure(self, *, routing_replay_enabled: bool) -> None:
-        seen: set[int] = set()
+    def _configure(self) -> None:
         vpp_group: int | None = None
-        for chunk in self.model_chunks:
-            config = get_model_config(chunk)
-            if id(config) in seen:
-                continue
-            seen.add(id(config))
-            if (
-                routing_replay_enabled
-                and self.pp_size > 1
-                and _stateful_recompute_enabled(config)
-                and self._activate_microbatch is None
-            ):
-                raise RuntimeError(
-                    "PP routing replay with MoE/full activation recomputation requires "
-                    "a microbatch activation callback"
-                )
+        for config in _model_configs(self.model_chunks):
             config.variable_seq_lengths = False
             if self.vp_size > 1:
                 group = int(
@@ -558,12 +579,13 @@ class MCoreScheduleAdapter(Generic[_T]):
                 config.batch_p2p_sync = False
 
     def activate(self, microbatch: ScheduleMicrobatch[_T]) -> None:
-        if self._activate_microbatch is None:
+        if not self._microbatch_state.enabled:
             return
-        state_id = id(microbatch.recompute_state)
+        state = microbatch.recompute_state
+        state_id = id(microbatch if state is None else state)
         if state_id == self._active_recompute_state_id:
             return
-        self._activate_microbatch(microbatch)
+        self._microbatch_state.activate(microbatch)
         self._active_recompute_state_id = state_id
 
     @contextmanager
@@ -571,7 +593,7 @@ class MCoreScheduleAdapter(Generic[_T]):
         config = get_model_config(self.model_chunks[0])
         if (
             not enabled
-            or self._activate_microbatch is None
+            or not self._microbatch_state.enabled
             or not _stateful_recompute_enabled(config)
         ):
             yield
@@ -624,14 +646,9 @@ class MCoreScheduleAdapter(Generic[_T]):
         if timers is None:
             yield
             return
-        configs: list[Any] = []
-        previous: list[Any] = []
-        for chunk in self.model_chunks:
-            config = get_model_config(chunk)
-            if any(config is seen for seen in configs):
-                continue
-            configs.append(config)
-            previous.append(config.timers)
+        configs = _model_configs(self.model_chunks)
+        previous = [config.timers for config in configs]
+        for config in configs:
             config.timers = timers
         try:
             yield
@@ -798,3 +815,11 @@ def _process_group_collection() -> ProcessGroupCollection:
         with_context_parallel=True, partial_data_parallel=False
     )
     return groups
+
+
+def _model_configs(model_chunks: Sequence[torch.nn.Module]) -> list[Any]:
+    configs: dict[int, Any] = {}
+    for chunk in model_chunks:
+        config = get_model_config(chunk)
+        configs.setdefault(id(config), config)
+    return list(configs.values())
