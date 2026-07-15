@@ -51,6 +51,11 @@ class MegatronBackend(LocalBackend):
         self._resume_prepared_models: set[str] = set()
         self._runtime = runtime
 
+    def __enter__(self) -> "MegatronBackend":
+        if self._runtime is not None:
+            raise TypeError("distributed MegatronBackend requires 'async with'")
+        return super().__enter__()
+
     async def train(
         self,
         model: AnyTrainableModel,

@@ -630,7 +630,9 @@ class LocalBackend:
         """
         If running vLLM in a separate process, this will kill that process and close the communication threads.
         """
+        failures: list[Exception] = []
         for service in self._services.values():
+            propagate = bool(getattr(service, "propagate_close_errors", False))
             try:
                 aclose = getattr(service, "aclose", None)
                 if aclose is None:
@@ -639,17 +641,28 @@ class LocalBackend:
                         close()
                 else:
                     await asyncio.wait_for(
-                        aclose(), timeout=_SERVICE_CLOSE_TIMEOUT_SECONDS
+                        aclose(),
+                        timeout=float(
+                            getattr(
+                                service,
+                                "close_timeout_s",
+                                _SERVICE_CLOSE_TIMEOUT_SECONDS,
+                            )
+                        ),
                     )
-            except TimeoutError:
-                logger.warning("Timed out while closing local backend service.")
-            except Exception:
-                logger.exception("Failed to close local backend service.")
+            except Exception as error:
+                if propagate:
+                    failures.append(error)
+                else:
+                    logger.exception("Failed to close local backend service.")
             finally:
                 try:
                     close_proxy(service)
-                except Exception:
-                    logger.exception("Failed to close local backend service proxy.")
+                except Exception as error:
+                    if propagate:
+                        failures.append(error)
+                    else:
+                        logger.exception("Failed to close local backend service proxy.")
         self._services.clear()
         self._adapter_leases.clear()
         await self._drain_provenance_update_tasks()
@@ -657,6 +670,8 @@ class LocalBackend:
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
             torch.cuda.ipc_collect()
+        if failures:
+            raise ExceptionGroup("distributed backend close failed", failures)
 
     def _close(self) -> None:
         self._cancel_provenance_update_tasks()
