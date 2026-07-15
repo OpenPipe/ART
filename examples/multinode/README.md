@@ -12,7 +12,9 @@ calls the installed deployment smoke only on rank 0. Replace that import path
 with an installed top-level async function that owns your ART run.
 
 Edit the accelerator and setup commands for your infrastructure. The example
-assumes `uv` is installed in the image. Use `sky launch` after changing setup;
+assumes `uv` is installed in the image and builds both ART and the pinned vLLM
+runtime because it runs from a source checkout. Wheel installs provision the
+bundled managed runtime on first use. Use `sky launch` after changing setup;
 reuse an unchanged cluster without rerunning setup with:
 
 ```fish

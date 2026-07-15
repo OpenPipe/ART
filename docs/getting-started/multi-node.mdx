@@ -30,7 +30,9 @@ paths on every node; ART does not ship pickled closures between hosts.
 ## SkyPilot
 
 Start with `examples/multinode/skypilot.yaml`. It contains `num_nodes: 2`, a
-synchronized workdir, setup on every node, and one command:
+synchronized workdir, setup on every node, and one command. A source checkout
+must sync both the root project and `vllm_runtime`; an installed ART wheel uses
+its content-addressed managed runtime bundle instead.
 
 ```yaml
 run: |

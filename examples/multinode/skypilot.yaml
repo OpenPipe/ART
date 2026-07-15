@@ -12,6 +12,7 @@ envs:
 
 setup: |
   uv sync --frozen --extra distributed --extra megatron
+  uv sync --project vllm_runtime --frozen
 
 run: |
   .venv/bin/art-monarch skypilot \
