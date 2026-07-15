@@ -22,7 +22,6 @@ def apply_vllm_runtime_patches() -> None:
 
     patch_transformers_v5_compat()
     patch_engine_kv_hash_config()
-    patch_pp_intermediate_transport()
     patch_flashinfer_oneshot_pdl_completion()
     patch_policy_token_spans()
     patch_gemma4_moe_lora_support()
@@ -50,35 +49,6 @@ def patch_engine_kv_hash_config() -> None:
         return int(self.scheduler.kv_cache_manager.block_pool.hash_block_size)
 
     EngineCore.art_kv_cache_hash_block_size = art_kv_cache_hash_block_size  # type: ignore[attr-defined]
-
-
-def patch_pp_intermediate_transport() -> None:
-    """Keep rank-local PP boundary tensors paired across TP ranks.
-
-    vLLM 0.23 otherwise reconstructs divisible tensors from slices sent by
-    different TP ranks, which corrupts non-identical hidden state and residuals.
-    """
-
-    from vllm.distributed.parallel_state import GroupCoordinator
-
-    original = GroupCoordinator._should_use_all_gather
-    if getattr(original, "__art_pp_transport_patched__", False):
-        return
-
-    @wraps(original)
-    def should_use_all_gather(
-        self: Any,
-        key: str,
-        numel: int,
-        all_gather_group: Any,
-        all_gather_tensors: dict[str, bool] | None,
-    ) -> bool:
-        if key in {"hidden_states", "residual"}:
-            return False
-        return original(self, key, numel, all_gather_group, all_gather_tensors)
-
-    setattr(should_use_all_gather, "__art_pp_transport_patched__", True)
-    GroupCoordinator._should_use_all_gather = should_use_all_gather  # ty: ignore[invalid-assignment]
 
 
 def patch_flashinfer_oneshot_pdl_completion() -> None:
