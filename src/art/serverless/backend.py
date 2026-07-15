@@ -264,6 +264,7 @@ class ServerlessBackend:
         num_trajectories_learning_rate_multiplier_power: float = 0.0,
         # Checkpoint behavior
         save_checkpoint: bool = True,
+        optimizer_save_interval: int = 5,
         # Verbosity
         verbose: bool = False,
     ) -> ServerlessTrainResult:
@@ -329,6 +330,8 @@ class ServerlessBackend:
             save_checkpoint: Accepted for PipelineTrainer compatibility. Serverless
                 training currently always saves a trainable checkpoint for the next
                 inference step.
+            optimizer_save_interval: Accepted for PipelineTrainer compatibility;
+                serverless training owns optimizer checkpoint cadence.
             verbose: Whether to print verbose output. Defaults to False.
 
         Returns:
@@ -340,6 +343,7 @@ class ServerlessBackend:
             # Optionally log training metrics:
             # await model.log(metrics=result.metrics, step=result.step)
         """
+        del optimizer_save_interval
         groups_list = list(trajectory_groups)
         if loss_fn is None:
             resolved_loss_fn: Literal["cispo", "ppo"] = "ppo" if ppo else "cispo"

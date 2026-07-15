@@ -1,4 +1,4 @@
-from typing import Any, Iterable
+from typing import Any, Iterable, cast
 
 from mp_actors import move_to_child_process
 
@@ -91,6 +91,11 @@ class MegatronBackend(LocalBackend):
         print(format_megatron_resume_message(info))
         self._resume_prepared_models.add(model.name)
         return await super()._get_step(model)
+
+    async def finalize_training_session(self, model: AnyTrainableModel) -> None:
+        service = self._services.get(model.name)
+        if service is not None:
+            await cast(Any, service).finalize_training_session()
 
     def _default_sft_batch_size(self) -> int:
         import torch

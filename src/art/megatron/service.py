@@ -58,6 +58,7 @@ from .optimizer_state import (
     MegatronResumeStep,
     format_megatron_resume_message,
     prepare_megatron_resume_state,
+    read_optimizer_commit,
 )
 from .runtime.client import (
     create_megatron_job_paths,
@@ -67,6 +68,7 @@ from .runtime.client import (
 from .runtime.jobs import (
     LORA_READY_EVENT,
     MegatronMergedTrainingJob,
+    MegatronOptimizerSaveJob,
     MegatronSFTTrainingJob,
     MegatronSyncJob,
     MegatronTrainingJob,
@@ -778,7 +780,7 @@ class MegatronService:
                 json={
                     "model_name": f"{self.model_name}@{step}",
                     "lora_slot": self._in_flight_lora_slot,
-                    "lora_path": checkpoint_path,
+                    "lora_path": self._vllm_checkpoint_path(checkpoint_path),
                     "policy_version": step,
                 },
                 **self._runtime_request_kwargs(),
@@ -1397,6 +1399,9 @@ class MegatronService:
                 config.batch_size if isinstance(config.batch_size, int) else None
             )
             job = MegatronSFTTrainingJob(
+                step=next_step,
+                source_policy_step=self._latest_step,
+                training_session_id=self._training_session_id,
                 lora_path=staging_lora_path,
                 allow_unvalidated_arch=self._allow_unvalidated_arch,
                 optimizer_state_path=self._get_optimizer_state_path("sft"),
@@ -1448,6 +1453,31 @@ class MegatronService:
                 message="Megatron SFT training and cleanup failed.",
             )
             raise
+
+    async def finalize_training_session(self) -> None:
+        optimizer_state_path = self._get_optimizer_state_path("rl")
+        commit = read_optimizer_commit(optimizer_state_path)
+        if self._megatron_process is None or (
+            commit is not None and commit.step == self._latest_step
+        ):
+            return
+        self._raise_if_child_failed()
+        job_path, log_path = self._create_megatron_job_paths()
+        job = MegatronOptimizerSaveJob(
+            step=self._latest_step,
+            training_session_id=self._training_session_id,
+            training_mode="rl",
+            optimizer_state_path=optimizer_state_path,
+            log_path=log_path,
+        )
+        write_megatron_job(job, job_path=job_path)
+        async for result in stream_megatron_job(
+            job,
+            job_path=job_path,
+            process=self._megatron_process,
+            process_log_path=self._megatron_log_path,
+        ):
+            raise RuntimeError(f"Optimizer finalization returned data: {result!r}")
 
     async def aclose(self) -> None:
         self.close()

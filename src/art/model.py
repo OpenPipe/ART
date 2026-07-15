@@ -196,6 +196,11 @@ class _OpenAIChatCompletionsProxy:
         self._policy_span_mode = policy_span_mode
 
     async def create(self, *args: Any, **kwargs: Any) -> Any:
+        if self._policy_span_mode != "none" and kwargs.get("stream", False):
+            raise ValueError(
+                "Streaming completions are not supported while ART policy-token "
+                "tracking is enabled."
+            )
         if self._default_extra_body is not None:
             kwargs["extra_body"] = _merge_extra_body_defaults(
                 self._default_extra_body,

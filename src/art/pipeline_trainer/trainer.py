@@ -23,6 +23,7 @@ from typing import (
     TypeVar,
     cast,
 )
+import warnings
 
 from typing_extensions import TypeIs
 
@@ -62,10 +63,6 @@ _SCORE_FRESHNESS_TAU_STEPS = 8.0
 # Rollout critical batch size from the best current GRPO/RLVR evidence. This is
 # grounded in reported experiments, not a well-validated universal constant.
 _SCORE_CRITICAL_ROLLOUT_BATCH_SIZE = 300.0
-
-
-class _ScenarioSourceExhausted(Exception):
-    pass
 
 
 def _is_eval_mapping(
@@ -150,6 +147,12 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
         config: ConfigT,
         eval_fn: EvalFn[ConfigT] | None = None,
         *,
+        # Deprecated direct pipeline settings
+        num_rollout_workers: int | None = None,
+        min_batch_size: int | None = None,
+        max_batch_size: int | None = None,
+        max_steps_off_policy: int | None = None,
+        queue_maxsize: int | None = None,
         pipeline: PipelineRuntimeConfig | None = None,
         autotune: PipelineAutotuneConfig | None = None,
         # Training
@@ -181,13 +184,36 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
         resume: bool = True,
     ) -> None:
         autotune = autotune or PipelineAutotuneConfig()
-        if autotune.mode != "off" and pipeline is not None:
+        pipeline_aliases = {
+            key: value
+            for key, value in {
+                "num_rollout_workers": num_rollout_workers,
+                "min_batch_size": min_batch_size,
+                "max_batch_size": max_batch_size,
+                "max_steps_off_policy": max_steps_off_policy,
+                "queue_maxsize": queue_maxsize,
+            }.items()
+            if value is not None
+        }
+        if autotune.mode != "off" and (pipeline is not None or pipeline_aliases):
             raise ValueError(
                 "Pipeline runtime config cannot be provided when pipeline autotuning "
                 "is enabled. The autotuner owns the initial and online pipeline "
                 "settings."
             )
-        pipeline = pipeline or PipelineRuntimeConfig()
+        if pipeline is not None and pipeline_aliases:
+            raise ValueError(
+                "Use either pipeline=PipelineRuntimeConfig(...) or deprecated direct "
+                "pipeline settings, not both."
+            )
+        if pipeline_aliases:
+            warnings.warn(
+                "Direct PipelineTrainer runtime settings are deprecated; pass "
+                "pipeline=PipelineRuntimeConfig(...) instead.",
+                DeprecationWarning,
+                stacklevel=2,
+            )
+        pipeline = pipeline or PipelineRuntimeConfig(**pipeline_aliases)
         if eval_every_n_steps < 0:
             raise ValueError("eval_every_n_steps must be >= 0")
         if max_steps is not None and max_steps < 0:
@@ -216,7 +242,7 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
         self.max_batch_size = (
             pipeline.max_batch_size
             if pipeline.max_batch_size is not None
-            else pipeline.min_batch_size
+            else 10 * pipeline.min_batch_size
         )
         self.target_groups_per_step = self.max_batch_size
         self.max_steps_off_policy = pipeline.max_steps_off_policy
@@ -261,6 +287,7 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
         self._scenario_iter: AsyncIterator[ScenarioT] | None = _to_async_iterator(
             scenarios
         )
+        self._scenario_source_exhausted = False
         self._output_queue: asyncio.Queue[TrajectoryGroup | None] | None = None
         self._eval_queue: asyncio.Queue[int] | None = None
         self._rollout_worker_controller = RolloutWorkerController(
@@ -270,6 +297,7 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
         if self.autotune.mode != "off":
             self._attachments.append(PipelineAutotunerAttachment(self.autotune))
         self._pipeline_tuner_profile: str | None = None
+        self._backend_training_completed = False
         self._status = StatusReporter(
             get_scenario_offset=lambda: self.state.scenario_offset,
             log_interval_seconds=log_interval_seconds,
@@ -281,6 +309,7 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
 
     async def train(self, *, handle_signals: bool = True) -> None:
         """Run the training pipeline over the configured scenario iterator."""
+        self._backend_training_completed = False
         start_step = await self.model.get_step()
         pipeline_state = self._read_pipeline_state() if self.resume else {}
         scenario_offset = int(pipeline_state.get("scenario_offset", 0) or 0)
@@ -404,6 +433,11 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
                     except (ValueError, RuntimeError):
                         pass
             cleanup_failures: list[BaseException] = []
+            if not training_failed:
+                try:
+                    await self._finalize_backend_training()
+                except BaseException as exc:
+                    cleanup_failures.append(exc)
             try:
                 await self._stop_attachments(training_failed=training_failed)
             except BaseException as exc:
@@ -453,6 +487,13 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
                 self._output_queue.put_nowait(None)
             except asyncio.QueueFull:
                 loop.create_task(self._output_queue.put(None))
+
+    async def _finalize_backend_training(self) -> None:
+        if not self._backend_training_completed:
+            return
+        finalize = getattr(self.backend, "finalize_training_session", None)
+        if finalize is not None:
+            await finalize(self.model)
 
     def apply_pipeline_settings(self, settings: PipelineTuneSettings) -> None:
         self.num_rollout_workers = settings.num_rollout_workers
@@ -629,13 +670,16 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
         return skipped
 
     async def _get_next_scenario(self) -> ScenarioT | None:
-        if self._scenario_iter is None:
+        if self._scenario_iter is None or self._scenario_source_exhausted:
             return None
         async with self._scenario_lock:
+            if self._scenario_source_exhausted:
+                return None
             try:
                 scenario = await anext(self._scenario_iter)
             except StopAsyncIteration:
-                raise _ScenarioSourceExhausted
+                self._scenario_source_exhausted = True
+                return None
             self.state.scenario_offset += 1
             self.state.total_scenarios_consumed += 1
             return scenario
@@ -750,11 +794,7 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
         while not self.state.done:
             if not self._rollout_worker_controller.worker_allowed(worker_id):
                 break
-            try:
-                scenario = await self._get_next_scenario()
-            except _ScenarioSourceExhausted:
-                self.request_stop()
-                break
+            scenario = await self._get_next_scenario()
             if scenario is None:
                 break
             self._status.note_rollout_started()
@@ -806,12 +846,13 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
                 self._status.note_rollout_finished(errored=errored)
 
     async def _rollout_stage(self) -> None:
-        try:
-            await self._rollout_worker_controller.run()
-        except _ScenarioSourceExhausted:
-            print("Scenario source exhausted; stopping training.")
-            self.request_stop()
-        if not self.state.done and self._output_queue is not None:
+        await self._rollout_worker_controller.run()
+        if (
+            self._scenario_source_exhausted
+            and not self.state.done
+            and self._output_queue is not None
+        ):
+            print("Scenario source exhausted; draining completed rollouts.")
             try:
                 self._output_queue.put_nowait(None)
             except asyncio.QueueFull:
@@ -872,7 +913,6 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
                     "save_checkpoint": should_checkpoint,
                     "adam_params": self.adam_params,
                     "optimizer_save_interval": self.optimizer_save_interval,
-                    "final_training_step": stop_at_step,
                 }
                 if self.kl_penalty_coef > 0.0:
                     kl_penalty_reference_step = self._kl_penalty_reference_step(
@@ -891,6 +931,7 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
                     batch,
                     **train_kwargs,
                 )
+                self._backend_training_completed = True
             except Exception:
                 for group in batch:
                     group._collect_packing_shape = False

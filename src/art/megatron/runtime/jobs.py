@@ -58,8 +58,20 @@ class MegatronSyncJob(BaseModel):
     log_path: str = DEFAULT_TRAINING_LOG_PATH
 
 
+class MegatronOptimizerSaveJob(BaseModel):
+    kind: Literal["save_optimizer"] = "save_optimizer"
+    step: int = Field(ge=0)
+    training_session_id: str
+    training_mode: Literal["rl", "sft"]
+    optimizer_state_path: str
+    log_path: str = DEFAULT_TRAINING_LOG_PATH
+
+
 class MegatronSFTTrainingJob(BaseModel):
     kind: Literal["sft"] = "sft"
+    step: int = Field(ge=0)
+    source_policy_step: int = Field(ge=0)
+    training_session_id: str
     lora_path: str
     allow_unvalidated_arch: bool = False
     optimizer_state_path: str
@@ -77,6 +89,7 @@ MegatronJob: TypeAlias = Annotated[
     MegatronTrainingJob
     | MegatronMergedTrainingJob
     | MegatronSyncJob
+    | MegatronOptimizerSaveJob
     | MegatronSFTTrainingJob,
     Field(discriminator="kind"),
 ]

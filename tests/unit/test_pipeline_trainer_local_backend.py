@@ -112,7 +112,6 @@ async def test_pipeline_trainer_preserves_backend_train_kwargs(tmp_path: Path) -
         "save_checkpoint": False,
         "adam_params": adam_params,
         "optimizer_save_interval": 5,
-        "final_training_step": 1,
     }
 
 
@@ -149,7 +148,6 @@ async def test_pipeline_trainer_forwards_default_kl_step_zero_for_generic_backen
         "save_checkpoint": False,
         "adam_params": None,
         "optimizer_save_interval": 5,
-        "final_training_step": 1,
         "kl_penalty_coef": 0.25,
         "kl_penalty_reference_step": 0,
         "kl_penalty_source": "sample",
@@ -275,7 +273,6 @@ async def test_pipeline_trainer_uses_same_train_kwargs_for_local_backend(
         "save_checkpoint": False,
         "adam_params": None,
         "optimizer_save_interval": 5,
-        "final_training_step": 1,
     }
 
 

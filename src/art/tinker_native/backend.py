@@ -497,12 +497,21 @@ class TinkerNativeBackend:
         return f"{base_name}@{step}"
 
     @asynccontextmanager
-    async def exact_adapter_lease(
+    async def adapter_lease(
         self,
         model: TrainableModel,
         step: int,
     ) -> AsyncIterator[None]:
         async with pin_inference_step(model.name, step):
+            yield
+
+    @asynccontextmanager
+    async def exact_adapter_lease(
+        self,
+        model: TrainableModel,
+        step: int,
+    ) -> AsyncIterator[None]:
+        async with self.adapter_lease(model, step):
             yield
 
     async def _run_openai_server(

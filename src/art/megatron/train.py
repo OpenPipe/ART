@@ -49,7 +49,11 @@ from art.megatron.model_support.lora_disk import (
     load_adapter_config,
     load_lora_tensors_for_megatron,
 )
-from art.megatron.optimizer_state import write_optimizer_step_marker
+from art.megatron.optimizer_state import (
+    commit_optimizer_generation,
+    optimizer_generation_files,
+    resolve_optimizer_shard_path,
+)
 from art.megatron.provider import (
     ProviderBundle,
     finalize_provider_bundle,
@@ -65,6 +69,7 @@ from art.megatron.runtime.jobs import (
     LORA_READY_EVENT,
     MegatronJob,
     MegatronMergedTrainingJob,
+    MegatronOptimizerSaveJob,
     MegatronSFTTrainingJob,
     MegatronSyncJob,
     MegatronTrainingJob,
@@ -154,7 +159,10 @@ class TrainingRuntime(BaseModel):
     optimizer_config: OptimizerConfig
     optimizer_persistent: bool = True
     resident_training_session_id: str | None = None
+    resident_training_mode: Literal["rl", "sft"] | None = None
+    resident_optimizer_state_path: str | None = None
     resident_policy_step: int | None = None
+    resident_optimizer_dirty: bool = False
     optimizer_state_loaded: bool = False
     adapter_export_dtypes: dict[str, torch.dtype] | None = None
     transformer_layers_compiled: bool = False
@@ -656,27 +664,30 @@ def run_megatron_rl_job(
                 train_step_s=train_step_s,
             )
 
+        runtime.resident_optimizer_dirty = True
         _save_lora_and_optimizer(
             runtime,
             adapter_dtypes=adapter_dtypes,
             lora_path=job.lora_path,
             optimizer_state_path=job.optimizer_state_path,
             step=job.step,
+            training_mode="rl",
             optimizer_save_interval=job.config.optimizer_save_interval,
-            final_training_step=job.config.final_training_step,
             lora_ready_log_path=(
                 None if isinstance(job, MegatronMergedTrainingJob) else job.log_path
             ),
         )
         runtime.resident_training_session_id = job.training_session_id
+        runtime.resident_training_mode = "rl"
+        runtime.resident_optimizer_state_path = os.path.realpath(
+            job.optimizer_state_path
+        )
         runtime.resident_policy_step = job.step
         runtime.optimizer_state_loaded = True
         job_succeeded = True
     finally:
         if not job_succeeded:
-            runtime.resident_training_session_id = None
-            runtime.resident_policy_step = None
-            runtime.optimizer_state_loaded = False
+            _clear_resident_optimizer(runtime)
         if packed_tensors is not None:
             del packed_tensors
         if adapter_dtypes is not None:
@@ -708,11 +719,7 @@ def run_megatron_sft_job(
 
     try:
         configure_moe_routing_replay(runtime)
-        adapter_dtypes = _load_lora_and_optimizer(
-            runtime,
-            lora_path=job.lora_path,
-            optimizer_state_path=job.optimizer_state_path,
-        )
+        adapter_dtypes = _prepare_sft_training_state(runtime, job)
 
         assert runtime.optimizer is not None
         runtime.optimizer.config.clip_grad = job.max_grad_norm
@@ -797,6 +804,7 @@ def run_megatron_sft_job(
                 moe_routing_replay_controller=runtime.moe_routing_replay_controller,
                 hybridep_token_counts=hybridep_token_counts,
             )
+            runtime.resident_optimizer_dirty = True
             batch_time = time.perf_counter() - batch_start_time
             tokens_per_second = global_tokens / batch_time if batch_time > 0 else 0.0
             completed_batches = batch_idx + 1
@@ -811,9 +819,9 @@ def run_megatron_sft_job(
                     adapter_dtypes=adapter_dtypes,
                     lora_path=job.lora_path,
                     optimizer_state_path=job.optimizer_state_path,
-                    step=completed_batches,
+                    step=job.step,
+                    training_mode="sft",
                     optimizer_save_interval=1,
-                    final_training_step=job.num_batches,
                 )
                 torch.distributed.barrier()  # type: ignore[possibly-missing-attribute]
 
@@ -838,10 +846,11 @@ def run_megatron_sft_job(
             adapter_dtypes=adapter_dtypes,
             lora_path=job.lora_path,
             optimizer_state_path=job.optimizer_state_path,
-            step=job.num_batches,
+            step=job.step,
+            training_mode="sft",
             optimizer_save_interval=1,
-            final_training_step=job.num_batches,
         )
+        runtime.resident_policy_step = job.step
     finally:
         if adapter_dtypes is not None:
             del adapter_dtypes
@@ -856,6 +865,9 @@ def _load_megatron_job(job_path: str, *, supports_sft: bool) -> MegatronJob:
 
 
 def _run_megatron_job(runtime: TrainingRuntime, job: MegatronJob) -> None:
+    if isinstance(job, MegatronOptimizerSaveJob):
+        _save_resident_optimizer(runtime, job)
+        return
     if isinstance(job, MegatronSyncJob):
         adapter_model = _load_adapter_into_model(
             runtime.model,
@@ -885,62 +897,57 @@ def _run_megatron_job(runtime: TrainingRuntime, job: MegatronJob) -> None:
 
 
 def _job_cleanup_path(job: MegatronJob) -> str | None:
-    if isinstance(job, MegatronSyncJob):
+    if isinstance(job, (MegatronOptimizerSaveJob, MegatronSyncJob)):
         return None
     if isinstance(job, MegatronSFTTrainingJob):
         return job.sft_data_dir
     return job.disk_packed_tensors["dir"]
 
 
-def _load_lora_and_optimizer(
-    runtime: TrainingRuntime,
-    *,
-    lora_path: str,
-    optimizer_state_path: str,
-) -> dict[str, torch.dtype]:
-    persistent_optimizer = runtime.optimizer if runtime.optimizer_persistent else None
-    adapter_model = _load_adapter_into_model(
-        runtime.model,
-        lora_path,
-        runtime.rank,
-        handler=runtime.model_support_handler,
-        optimizer=persistent_optimizer,
-    )
-    if persistent_optimizer is not None:
-        return {key: tensor.dtype for key, tensor in adapter_model.items()}
-
-    runtime.optimizer = _build_optimizer(
-        runtime.model,
-        runtime.optimizer_config,
-    )
-    assert runtime.optimizer is not None
-
-    optimizer_shard_path = os.path.join(
-        optimizer_state_path,
-        f"{runtime.rank + 1:02d}-of-{runtime.world_size:02d}.pt",
-    )
-    if os.path.exists(optimizer_shard_path):
-        print0(runtime.rank, "Loading optimizer state from", optimizer_shard_path)
-        runtime.optimizer.load_state_dict(torch.load(optimizer_shard_path))
-    else:
-        print0(
-            runtime.rank,
-            "No optimizer state found at",
-            optimizer_shard_path,
-            "- resetting optimizer for new run",
-        )
-        _eager_initialize_optimizer_state(runtime.optimizer)
-    return {key: tensor.dtype for key, tensor in adapter_model.items()}
-
-
 def _prepare_rl_training_state(
     runtime: TrainingRuntime,
     job: MegatronTrainingJob | MegatronMergedTrainingJob,
 ) -> dict[str, torch.dtype]:
+    return _prepare_training_state(
+        runtime,
+        training_session_id=job.training_session_id,
+        training_mode="rl",
+        source_policy_step=job.source_policy_step,
+        lora_path=job.lora_path,
+        optimizer_state_path=job.optimizer_state_path,
+    )
+
+
+def _prepare_sft_training_state(
+    runtime: TrainingRuntime,
+    job: MegatronSFTTrainingJob,
+) -> dict[str, torch.dtype]:
+    return _prepare_training_state(
+        runtime,
+        training_session_id=job.training_session_id,
+        training_mode="sft",
+        source_policy_step=job.source_policy_step,
+        lora_path=job.lora_path,
+        optimizer_state_path=job.optimizer_state_path,
+    )
+
+
+def _prepare_training_state(
+    runtime: TrainingRuntime,
+    *,
+    training_session_id: str,
+    training_mode: Literal["rl", "sft"],
+    source_policy_step: int,
+    lora_path: str,
+    optimizer_state_path: str,
+) -> dict[str, torch.dtype]:
+    normalized_path = os.path.realpath(optimizer_state_path)
     state_is_resident = (
         runtime.optimizer_persistent
-        and runtime.resident_training_session_id == job.training_session_id
-        and runtime.resident_policy_step == job.source_policy_step
+        and runtime.resident_training_session_id == training_session_id
+        and runtime.resident_training_mode == training_mode
+        and runtime.resident_optimizer_state_path == normalized_path
+        and runtime.resident_policy_step == source_policy_step
         and runtime.optimizer_state_loaded
     )
     if state_is_resident:
@@ -948,45 +955,41 @@ def _prepare_rl_training_state(
             raise RuntimeError("Resident Megatron state has no LoRA export template")
         return runtime.adapter_export_dtypes
 
-    replacing_resident_state = runtime.resident_training_session_id is not None
-    runtime.resident_training_session_id = None
-    runtime.resident_policy_step = None
-    runtime.optimizer_state_loaded = False
-    if replacing_resident_state or not runtime.optimizer_persistent:
-        runtime.optimizer = None
-
+    _commit_resident_optimizer(runtime)
+    _clear_resident_optimizer(runtime)
     adapter_model = _load_adapter_into_model(
         runtime.model,
-        job.lora_path,
+        lora_path,
         runtime.rank,
         handler=runtime.model_support_handler,
-        optimizer=runtime.optimizer,
     )
-    if runtime.optimizer is None:
-        runtime.optimizer = _build_optimizer(runtime.model, runtime.optimizer_config)
+    runtime.optimizer = _build_optimizer(runtime.model, runtime.optimizer_config)
     assert runtime.optimizer is not None
-
-    optimizer_shard_path = os.path.join(
-        job.optimizer_state_path,
-        f"{runtime.rank + 1:02d}-of-{runtime.world_size:02d}.pt",
+    optimizer_shard_path = resolve_optimizer_shard_path(
+        optimizer_state_path,
+        rank=runtime.rank,
+        world_size=runtime.world_size,
+        training_mode=training_mode,
     )
-    if os.path.exists(optimizer_shard_path):
-        print0(runtime.rank, "Loading optimizer state from", optimizer_shard_path)
-        runtime.optimizer.load_state_dict(torch.load(optimizer_shard_path))
-    else:
+    if optimizer_shard_path is None:
         print0(
             runtime.rank,
             "No optimizer state found at",
-            optimizer_shard_path,
+            optimizer_state_path,
             "- resetting optimizer for new run",
         )
         _eager_initialize_optimizer_state(runtime.optimizer)
+    else:
+        print0(runtime.rank, "Loading optimizer state from", optimizer_shard_path)
+        runtime.optimizer.load_state_dict(torch.load(optimizer_shard_path))
 
     runtime.adapter_export_dtypes = {
         key: tensor.dtype for key, tensor in adapter_model.items()
     }
-    runtime.resident_training_session_id = job.training_session_id
-    runtime.resident_policy_step = job.source_policy_step
+    runtime.resident_training_session_id = training_session_id
+    runtime.resident_training_mode = training_mode
+    runtime.resident_optimizer_state_path = normalized_path
+    runtime.resident_policy_step = source_policy_step
     runtime.optimizer_state_loaded = True
     return runtime.adapter_export_dtypes
 
@@ -1017,8 +1020,8 @@ def _save_lora_and_optimizer(
     lora_path: str,
     optimizer_state_path: str,
     step: int,
+    training_mode: Literal["rl", "sft"],
     optimizer_save_interval: int,
-    final_training_step: int | None = None,
     lora_ready_log_path: str | None = None,
 ) -> None:
     assert runtime.optimizer is not None
@@ -1037,14 +1040,15 @@ def _save_lora_and_optimizer(
         runtime,
         step=step,
         optimizer_state_path=optimizer_state_path,
+        training_mode=training_mode,
         optimizer_save_interval=optimizer_save_interval,
-        final_training_step=final_training_step,
     ):
-        _save_optimizer(runtime, optimizer_state_path=optimizer_state_path)
-        if torch.distributed.is_initialized():  # ty:ignore[possibly-missing-attribute]
-            torch.distributed.barrier()  # ty:ignore[possibly-missing-attribute]
-        if runtime.rank == 0:
-            write_optimizer_step_marker(optimizer_state_path, step)
+        _save_optimizer(
+            runtime,
+            optimizer_state_path=optimizer_state_path,
+            step=step,
+            training_mode=training_mode,
+        )
 
 
 def _validate_train_step_result_finite(
@@ -1073,21 +1077,19 @@ def _should_save_optimizer(
     *,
     step: int,
     optimizer_state_path: str,
+    training_mode: Literal["rl", "sft"],
     optimizer_save_interval: int,
-    final_training_step: int | None,
 ) -> bool:
     if not runtime.optimizer_persistent or optimizer_save_interval == 1:
         return True
-    if final_training_step is not None and step >= final_training_step:
-        return True
-    optimizer_shard_path = os.path.join(
+    optimizer_shard_path = resolve_optimizer_shard_path(
         optimizer_state_path,
-        f"{runtime.rank + 1:02d}-of-{runtime.world_size:02d}.pt",
+        rank=runtime.rank,
+        world_size=runtime.world_size,
+        training_mode=training_mode,
     )
     return (
-        step <= 1
-        or step % optimizer_save_interval == 0
-        or not os.path.exists(optimizer_shard_path)
+        step <= 1 or step % optimizer_save_interval == 0 or optimizer_shard_path is None
     )
 
 
@@ -1132,15 +1134,95 @@ def _global_packed_train_tokens(micro_inputs: list[PackedTensors]) -> int:
     return local_tokens * ps.get_data_parallel_world_size(with_context_parallel=False)
 
 
-def _save_optimizer(runtime: TrainingRuntime, *, optimizer_state_path: str) -> None:
+def _save_optimizer(
+    runtime: TrainingRuntime,
+    *,
+    optimizer_state_path: str,
+    step: int,
+    training_mode: Literal["rl", "sft"],
+) -> None:
     assert runtime.optimizer is not None
-    optimizer_shard_path = os.path.join(
-        optimizer_state_path,
-        f"{runtime.rank + 1:02d}-of-{runtime.world_size:02d}.pt",
-    )
+    files = optimizer_generation_files(step, runtime.world_size)
+    optimizer_shard_path = os.path.join(optimizer_state_path, files[runtime.rank])
+    temporary_path = f"{optimizer_shard_path}.tmp"
     print("Saving optimizer shard to", optimizer_shard_path)
     os.makedirs(optimizer_state_path, exist_ok=True)
-    torch.save(runtime.optimizer.state_dict(), optimizer_shard_path)
+    with open(temporary_path, "wb") as handle:
+        torch.save(runtime.optimizer.state_dict(), handle)
+        handle.flush()
+        os.fsync(handle.fileno())
+    os.replace(temporary_path, optimizer_shard_path)
+    directory_fd = os.open(optimizer_state_path, os.O_RDONLY)
+    try:
+        os.fsync(directory_fd)
+    finally:
+        os.close(directory_fd)
+    if torch.distributed.is_initialized():  # ty:ignore[possibly-missing-attribute]
+        torch.distributed.barrier()  # ty:ignore[possibly-missing-attribute]
+    if runtime.rank == 0:
+        commit_optimizer_generation(
+            optimizer_state_path,
+            step=step,
+            world_size=runtime.world_size,
+            training_mode=training_mode,
+            files=files,
+        )
+    if torch.distributed.is_initialized():  # ty:ignore[possibly-missing-attribute]
+        torch.distributed.barrier()  # ty:ignore[possibly-missing-attribute]
+    runtime.resident_optimizer_dirty = False
+
+
+def _commit_resident_optimizer(runtime: TrainingRuntime) -> None:
+    if not runtime.resident_optimizer_dirty:
+        return
+    if (
+        runtime.optimizer is None
+        or runtime.resident_policy_step is None
+        or runtime.resident_training_mode is None
+        or runtime.resident_optimizer_state_path is None
+    ):
+        raise RuntimeError("Dirty resident optimizer has incomplete identity")
+    _save_optimizer(
+        runtime,
+        optimizer_state_path=runtime.resident_optimizer_state_path,
+        step=runtime.resident_policy_step,
+        training_mode=runtime.resident_training_mode,
+    )
+
+
+def _clear_resident_optimizer(runtime: TrainingRuntime) -> None:
+    runtime.optimizer = None
+    runtime.resident_training_session_id = None
+    runtime.resident_training_mode = None
+    runtime.resident_optimizer_state_path = None
+    runtime.resident_policy_step = None
+    runtime.resident_optimizer_dirty = False
+    runtime.optimizer_state_loaded = False
+    runtime.adapter_export_dtypes = None
+
+
+def _save_resident_optimizer(
+    runtime: TrainingRuntime,
+    job: MegatronOptimizerSaveJob,
+) -> None:
+    expected_path = os.path.realpath(job.optimizer_state_path)
+    identity = (
+        runtime.resident_training_session_id,
+        runtime.resident_training_mode,
+        runtime.resident_optimizer_state_path,
+        runtime.resident_policy_step,
+    )
+    expected = (
+        job.training_session_id,
+        job.training_mode,
+        expected_path,
+        job.step,
+    )
+    if identity != expected:
+        raise RuntimeError(
+            f"Cannot finalize non-resident optimizer state: {identity!r} != {expected!r}"
+        )
+    _commit_resident_optimizer(runtime)
 
 
 def finalize_megatron_job(
@@ -2094,11 +2176,7 @@ def _run_service_loop(runtime: TrainingRuntime) -> None:
 
     def after_job() -> None:
         if not runtime.optimizer_persistent:
-            runtime.optimizer = None
-            runtime.resident_training_session_id = None
-            runtime.resident_policy_step = None
-            runtime.optimizer_state_loaded = False
-            runtime.adapter_export_dtypes = None
+            _clear_resident_optimizer(runtime)
         weight_offload.after_job()
 
     worker_error = False

@@ -1193,7 +1193,6 @@ class LocalBackend:
         # Checkpoint behavior
         save_checkpoint: bool = True,
         optimizer_save_interval: int = 5,
-        final_training_step: int | None = None,
         # Verbosity
         verbose: bool = False,
     ) -> LocalTrainResult:
@@ -1330,7 +1329,6 @@ class LocalBackend:
             num_trajectories_learning_rate_multiplier_power=num_trajectories_learning_rate_multiplier_power,
             kl_ref_adapter_path=resolved_kl_ref_adapter_path,
             optimizer_save_interval=optimizer_save_interval,
-            final_training_step=final_training_step,
         )
 
         # Collect metrics from training

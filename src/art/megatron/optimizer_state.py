@@ -1,15 +1,44 @@
 from __future__ import annotations
 
+import json
 import os
 from pathlib import Path
+import re
 import time
+from typing import Literal
 
-from pydantic import BaseModel
+from pydantic import BaseModel, Field, model_validator
 
 from ..utils.get_model_step import get_step_from_dir
 from ..utils.output_dirs import get_step_checkpoint_dir
 
 ALLOW_UNPAIRED_MEGATRON_RESUME_ENV = "ART_ALLOW_UNPAIRED_MEGATRON_RESUME"
+OPTIMIZER_MANIFEST = "CURRENT.json"
+OPTIMIZER_TRAINING_MODE = "training_mode"
+_LEGACY_SHARD_RE = re.compile(r"^(?P<rank>\d+)-of-(?P<world>\d+)\.pt$")
+_GENERATION_SHARD_RE = re.compile(
+    r"^step-(?P<step>\d+)-(?P<rank>\d+)-of-(?P<world>\d+)\.pt$"
+)
+
+
+class OptimizerCommit(BaseModel):
+    schema_version: Literal[1] = 1
+    step: int = Field(ge=0)
+    world_size: int = Field(ge=1)
+    files: tuple[str, ...]
+    training_mode: Literal["rl", "sft"]
+
+    @model_validator(mode="after")
+    def validate_files(self) -> "OptimizerCommit":
+        if len(self.files) != self.world_size:
+            raise ValueError("optimizer manifest file count does not match world_size")
+        if len(set(self.files)) != len(self.files):
+            raise ValueError("optimizer manifest contains duplicate shard names")
+        if any(
+            Path(name).name != name or not name.endswith(".pt") for name in self.files
+        ):
+            raise ValueError("optimizer manifest contains an invalid shard name")
+        return self
 
 
 class MegatronResumeStep(BaseModel):
@@ -20,27 +49,143 @@ class MegatronResumeStep(BaseModel):
     quarantined_lora_steps: tuple[int, ...] = ()
 
 
-def write_optimizer_step_marker(optimizer_state_path: str, step: int) -> None:
+def optimizer_generation_files(step: int, world_size: int) -> tuple[str, ...]:
+    return tuple(
+        f"step-{step:08d}-{rank:02d}-of-{world_size:02d}.pt"
+        for rank in range(1, world_size + 1)
+    )
+
+
+def read_optimizer_commit(optimizer_state_path: str) -> OptimizerCommit | None:
+    path = Path(optimizer_state_path)
+    manifest_path = path / OPTIMIZER_MANIFEST
+    if not manifest_path.exists():
+        return None
+    commit = OptimizerCommit.model_validate_json(manifest_path.read_text())
+    missing = [name for name in commit.files if not (path / name).is_file()]
+    if missing:
+        raise RuntimeError(
+            f"Optimizer manifest {manifest_path} references missing shard(s): {missing}"
+        )
+    return commit
+
+
+def resolve_optimizer_shard_path(
+    optimizer_state_path: str,
+    *,
+    rank: int,
+    world_size: int,
+    training_mode: Literal["rl", "sft"],
+) -> Path | None:
+    if not 0 <= rank < world_size:
+        raise ValueError(f"optimizer rank {rank} is outside world size {world_size}")
+    path = Path(optimizer_state_path)
+    commit = read_optimizer_commit(optimizer_state_path)
+    if commit is not None:
+        if commit.world_size != world_size:
+            raise RuntimeError(
+                "Optimizer world size does not match the active Megatron runtime: "
+                f"{commit.world_size} != {world_size}"
+            )
+        if commit.training_mode != training_mode:
+            raise RuntimeError(
+                "Optimizer training mode does not match the requested objective: "
+                f"{commit.training_mode!r} != {training_mode!r}"
+            )
+        return path / commit.files[rank]
+
+    legacy = path / f"{rank + 1:02d}-of-{world_size:02d}.pt"
+    if not legacy.exists():
+        return None
+    mode_path = path / OPTIMIZER_TRAINING_MODE
+    if mode_path.exists() and mode_path.read_text().strip() != training_mode:
+        raise RuntimeError(
+            f"Legacy optimizer at {path} belongs to a different training mode"
+        )
+    return legacy
+
+
+def commit_optimizer_generation(
+    optimizer_state_path: str,
+    *,
+    step: int,
+    world_size: int,
+    training_mode: Literal["rl", "sft"],
+    files: tuple[str, ...],
+) -> None:
     path = Path(optimizer_state_path)
     path.mkdir(parents=True, exist_ok=True)
-    for marker in path.iterdir():
-        if marker.is_file() and marker.name.isdigit():
-            marker.unlink()
-    (path / f"{step:04d}").touch()
+    previous = read_optimizer_commit(optimizer_state_path)
+    commit = OptimizerCommit(
+        step=step,
+        world_size=world_size,
+        files=files,
+        training_mode=training_mode,
+    )
+    _atomic_write(path / OPTIMIZER_TRAINING_MODE, training_mode)
+    _atomic_write(path / OPTIMIZER_MANIFEST, commit.model_dump_json())
+
+    retained = set(files) | {OPTIMIZER_MANIFEST, OPTIMIZER_TRAINING_MODE}
+    obsolete = set(previous.files if previous is not None else ())
+    obsolete.update(
+        item.name
+        for item in path.iterdir()
+        if item.is_file()
+        and (
+            _LEGACY_SHARD_RE.fullmatch(item.name)
+            or _GENERATION_SHARD_RE.fullmatch(item.name)
+            or item.name.isdigit()
+        )
+    )
+    for name in obsolete - retained:
+        candidate = path / name
+        if candidate.exists():
+            candidate.unlink()
 
 
-def read_optimizer_step_marker(optimizer_state_path: str) -> int | None:
+def _atomic_write(path: Path, content: str) -> None:
+    temporary = path.with_name(f"{path.name}.tmp")
+    with temporary.open("w", encoding="utf-8") as handle:
+        handle.write(content)
+        handle.flush()
+        os.fsync(handle.fileno())
+    os.replace(temporary, path)
+    directory_fd = os.open(path.parent, os.O_RDONLY)
+    try:
+        os.fsync(directory_fd)
+    finally:
+        os.close(directory_fd)
+
+
+def _legacy_optimizer_step(optimizer_state_path: str) -> int | None:
     path = Path(optimizer_state_path)
     if not path.exists():
         return None
-    return max(
+    marker = max(
         (
-            int(marker.name)
-            for marker in path.iterdir()
-            if marker.is_file() and marker.name.isdigit()
+            int(item.name)
+            for item in path.iterdir()
+            if item.is_file() and item.name.isdigit()
         ),
         default=None,
     )
+    if marker is not None:
+        return marker
+    shards = [
+        match
+        for item in path.iterdir()
+        if item.is_file() and (match := _LEGACY_SHARD_RE.fullmatch(item.name))
+    ]
+    if not shards:
+        return None
+    worlds = {int(match.group("world")) for match in shards}
+    if len(worlds) != 1:
+        raise RuntimeError(f"Legacy optimizer shards at {path} mix world sizes")
+    world_size = worlds.pop()
+    ranks = {int(match.group("rank")) for match in shards}
+    if ranks != set(range(1, world_size + 1)):
+        raise RuntimeError(f"Legacy optimizer shards at {path} are incomplete")
+    return -1
 
 
 def _allow_unpaired_resume() -> bool:
@@ -57,7 +202,14 @@ def resolve_megatron_resume_step(
     optimizer_state_path: str,
 ) -> MegatronResumeStep:
     latest_lora_step = get_step_from_dir(output_dir)
-    optimizer_step = read_optimizer_step_marker(optimizer_state_path)
+    commit = read_optimizer_commit(optimizer_state_path)
+    optimizer_step = (
+        commit.step
+        if commit is not None
+        else _legacy_optimizer_step(optimizer_state_path)
+    )
+    if optimizer_step == -1:
+        optimizer_step = latest_lora_step
     if latest_lora_step == 0:
         return MegatronResumeStep(
             step=0,

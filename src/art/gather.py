@@ -177,7 +177,6 @@ async def wrap_trajectories_awaitable(
 
 
 def record_metrics(context: "GatherContext", trajectory: Trajectory) -> None:
-    trajectory.metrics.pop("completion_tokens", None)
     choices = [
         item
         for history in (
@@ -191,7 +190,7 @@ def record_metrics(context: "GatherContext", trajectory: Trajectory) -> None:
         if isinstance(item, Choice)
     ]
     completion_tokens = [choice_completion_tokens(choice) for choice in choices]
-    if choices and all(count is not None for count in completion_tokens):
+    if choices and all(count is not None and count > 0 for count in completion_tokens):
         trajectory.metrics["completion_tokens"] = sum(
             count for count in completion_tokens if count is not None
         )

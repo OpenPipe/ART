@@ -60,6 +60,31 @@ def test_art_import_does_not_require_vllm_or_mutate_compile_threads(
     assert payload["after"] is None
 
 
+def test_base_import_does_not_require_numpy_or_torch(artifact_dir: Path) -> None:
+    script = """
+import importlib.abc
+import json
+import sys
+
+
+class Block(importlib.abc.MetaPathFinder):
+    def find_spec(self, fullname, path=None, target=None):
+        if fullname.split(".")[0] in {"numpy", "torch"}:
+            raise ImportError(f"blocked optional dependency: {fullname}")
+
+
+sys.meta_path.insert(0, Block())
+import art
+
+print(json.dumps({"imported": art.__name__}))
+"""
+    result = _run(
+        [sys.executable, "-c", script],
+        artifact_dir=artifact_dir,
+    )
+    assert _load_json_from_stdout(result.stdout) == {"imported": "art"}
+
+
 def test_service_modules_import_without_vllm(artifact_dir: Path) -> None:
     result = _run(
         [
