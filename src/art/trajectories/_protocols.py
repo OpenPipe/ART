@@ -33,7 +33,7 @@ Exchange = (
 )
 ResponseModel = ChatCompletion | Completion | Response | Message
 SSEPayload = dict[str, Any] | Literal["[DONE]"]
-_ENDPOINTS = {
+_ENDPOINTS: dict[str, Endpoint] = {
     "/v1/chat/completions": "chat_completions",
     "/v1/completions": "completions",
     "/v1/responses": "responses",
@@ -225,7 +225,7 @@ def build_exchange(
     if endpoint == "chat_completions":
         response = _chat_response(body, stream=stream)
         return endpoint, ChatCompletionsExchange(
-            request=ChatCompletionsRequest(request),
+            request=ChatCompletionsRequest(**request),
             response=response,
             model=_model(request, response),
             start_time=start_time,
@@ -234,7 +234,7 @@ def build_exchange(
     if endpoint == "completions":
         response = _completion_response(body, stream=stream)
         return endpoint, CompletionsExchange(
-            request=CompletionsRequest(request),
+            request=CompletionsRequest(**request),
             response=response,
             model=_model(request, response),
             start_time=start_time,
@@ -243,7 +243,7 @@ def build_exchange(
     if endpoint == "responses":
         response = _responses_response(body, stream=stream)
         return endpoint, ResponsesExchange(
-            request=ResponsesRequest(request),
+            request=ResponsesRequest(**request),
             response=response,
             model=_model(request, response),
             start_time=start_time,
@@ -252,7 +252,7 @@ def build_exchange(
     if endpoint == "messages":
         response = _messages_response(body, stream=stream)
         return endpoint, MessagesExchange(
-            request=MessagesRequest(request),
+            request=MessagesRequest(**request),
             response=response,
             model=_model(request, response),
             start_time=start_time,

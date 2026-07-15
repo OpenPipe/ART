@@ -280,16 +280,18 @@ async def test_auto_trajectory(test_server: None) -> None:
         ):
             pass
         # Add ART support with a couple lines of optional code
-        if trajectory := art.auto_trajectory():
+        if trajectory := art.auto_trajectory():  # ty: ignore[deprecated]
             trajectory.reward = 1.0
         return chat_completion.choices[0].message.content
 
     # Use the capture_auto_trajectory utility to capture a trajectory automatically
-    trajectory = await art.capture_auto_trajectory(say_hi())
+    trajectory = await art.capture_auto_trajectory(  # ty: ignore[deprecated]
+        say_hi()
+    )
     exchanges = trajectory.exchanges.chat_completions
     assert len(exchanges) == 5
-    assert exchanges[0].request.root["messages"] == [message]
-    assert exchanges[0].request.root["tools"] == tools
+    assert exchanges[0].request["messages"] == [message]
+    assert exchanges[0].request["tools"] == tools
     choices = mock_response["choices"]
     assert isinstance(choices, list)
     assert exchanges[0].response.choices[0] == Choice.model_validate(choices[0])
@@ -356,14 +358,16 @@ async def test_litellm_auto_trajectory(test_server: None) -> None:
         async for _ in stream:
             pass
         # Add ART support with a couple lines of optional code
-        if trajectory := art.auto_trajectory():
+        if trajectory := art.auto_trajectory():  # ty: ignore[deprecated]
             trajectory.reward = 1.0
         return choice.message.content
 
     # Use the capture_auto_trajectory utility to capture a trajectory automatically
-    trajectory = await art.capture_auto_trajectory(say_hi())
+    trajectory = await art.capture_auto_trajectory(  # ty: ignore[deprecated]
+        say_hi()
+    )
     exchanges = trajectory.exchanges.chat_completions
     assert len(exchanges) == 3
-    assert exchanges[0].request.root["messages"] == [message]
+    assert exchanges[0].request["messages"] == [message]
     assert exchanges[-1].response.choices[0] == mock_stream_choice
     assert all(exchange.model == "test" for exchange in exchanges)

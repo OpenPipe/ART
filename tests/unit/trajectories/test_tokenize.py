@@ -61,10 +61,8 @@ def _chat_exchange(
     start = datetime(2026, 1, 1) + timedelta(seconds=offset)
     return ChatCompletionsExchange(
         request=ChatCompletionsRequest(
-            {
-                "model": model,
-                "messages": [{"role": "user", "content": f"turn {offset}"}],
-            }
+            model=model,
+            messages=[{"role": "user", "content": f"turn {offset}"}],
         ),
         response=response,
         model=model,
@@ -147,13 +145,11 @@ def test_fallback_uses_template_overrides_and_nan_logprobs(
     start = datetime(2026, 1, 1)
     exchange = MessagesExchange(
         request=MessagesRequest(
-            {
-                "model": "test/model",
-                "messages": [{"role": "user", "content": "question"}],
-                "chat_template": "request-template",
-                "chat_template_kwargs": {"request": True},
-                "thinking": {"type": "enabled", "budget_tokens": 128},
-            }
+            model="test/model",
+            messages=[{"role": "user", "content": "question"}],
+            chat_template="request-template",
+            chat_template_kwargs={"request": True},
+            thinking={"type": "enabled", "budget_tokens": 128},
         ),
         response=response,
         model="test/model",
@@ -218,7 +214,7 @@ def test_checkpoint_fallback_uses_latest_artifact_renderer(
                 }
             )
 
-    monkeypatch.setattr("wandb.Api", Api)
+    monkeypatch.setattr("wandb.apis.public.Api", Api)
     from art.trajectories._tokenize import _tokenizer_config
 
     config = _tokenizer_config("wandb-artifact:///entity/project/run", None)
@@ -375,12 +371,12 @@ def _response_exchange(
             "raw_output_tokens": [{"token_id": output_id, "logprob": -0.1}],
         }
     )
-    request = {"model": "test/model", "input": f"turn {offset}"}
+    request = ResponsesRequest(model="test/model", input=f"turn {offset}")
     if previous_response_id is not None:
         request["previous_response_id"] = previous_response_id
     start = datetime(2026, 1, 1) + timedelta(seconds=offset)
     return ResponsesExchange(
-        request=ResponsesRequest(request),
+        request=request,
         response=response,
         model="test/model",
         start_time=start,
@@ -414,7 +410,7 @@ def test_responses_previous_response_id_resolves_local_history(
         30,
     ]
 
-    second.request.root["previous_response_id"] = "missing"
+    second.request["previous_response_id"] = "missing"
     with pytest.raises(ValueError, match="outside this trajectory"):
         art.tokenize_trajectory(trajectory, base_model="base/model")
 
@@ -448,7 +444,7 @@ def test_exchange_trajectories_feed_existing_training_tokenizer() -> None:
     results = list(
         tokenize_trajectory_groups(
             # This path only calls decode; the minimal test double is intentional.
-            Tokenizer(),  # type: ignore[arg-type]
+            Tokenizer(),  # type: ignore[arg-type, ty:invalid-argument-type]
             [group],
             allow_training_without_logprobs=True,
             scale_rewards=False,

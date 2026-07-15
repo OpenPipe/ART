@@ -12,14 +12,38 @@ from contextlib import asynccontextmanager
 from datetime import datetime
 import time
 from types import TracebackType
-from typing import Any, Literal, overload
+from typing import Annotated, Any, Literal, overload
 
-from anthropic.types import Message as AnthropicMessage
+from anthropic.types import (
+    Message as AnthropicMessage,
+)
+from anthropic.types import (
+    MessageParam as AnthropicMessageParam,
+)
+from anthropic.types import (
+    TextBlockParam as AnthropicTextBlockParam,
+)
+from anthropic.types import (
+    ThinkingConfigParam as AnthropicThinkingConfigParam,
+)
+from anthropic.types import (
+    ToolUnionParam as AnthropicToolParam,
+)
 from openai.types import Completion
-from openai.types.chat import ChatCompletion
-from openai.types.responses import Response
+from openai.types.chat import (
+    ChatCompletion,
+    ChatCompletionMessageParam,
+    ChatCompletionToolParam,
+)
+from openai.types.responses import (
+    Response,
+    ResponseInputParam,
+)
+from openai.types.responses import (
+    ToolParam as ResponsesToolParam,
+)
 import pydantic
-from typing_extensions import deprecated
+from typing_extensions import TypedDict, deprecated
 
 from ..types import Messages, MessagesAndChoices, Tools
 from ._serialization import _CompactModel
@@ -28,24 +52,74 @@ from ._serialization import _CompactModel
 MetadataValue = Any
 
 
-class ChatCompletionsRequest(pydantic.RootModel[dict[str, pydantic.JsonValue]]):
+class ChatCompletionsRequest(TypedDict, total=False, extra_items=Any):
     """The JSON body sent to an OpenAI-compatible Chat Completions endpoint."""
 
+    model: str
+    messages: list[ChatCompletionMessageParam]
+    stream: bool
+    tools: list[ChatCompletionToolParam]
+    max_completion_tokens: int
+    max_tokens: int
+    temperature: float
+    top_p: float
+    logprobs: bool
+    top_logprobs: int
+    chat_template: str
+    chat_template_kwargs: dict[str, Any]
 
-class CompletionsRequest(pydantic.RootModel[dict[str, pydantic.JsonValue]]):
+
+class CompletionsRequest(TypedDict, total=False, extra_items=Any):
     """The JSON body sent to an OpenAI-compatible Completions endpoint."""
 
+    model: str
+    prompt: str | list[str] | list[int] | list[list[int]]
+    stream: bool
+    max_tokens: int
+    temperature: float
+    top_p: float
+    logprobs: int
+    echo: bool
+    stop: str | list[str]
+    seed: int
 
-class ResponsesRequest(pydantic.RootModel[dict[str, pydantic.JsonValue]]):
+
+class ResponsesRequest(TypedDict, total=False, extra_items=Any):
     """The JSON body sent to an OpenAI-compatible Responses endpoint."""
 
+    model: str
+    input: str | ResponseInputParam
+    instructions: str
+    previous_response_id: str
+    stream: bool
+    tools: list[ResponsesToolParam]
+    max_output_tokens: int
+    temperature: float
+    top_p: float
+    chat_template: str
+    chat_template_kwargs: dict[str, Any]
 
-class MessagesRequest(pydantic.RootModel[dict[str, pydantic.JsonValue]]):
+
+class MessagesRequest(TypedDict, total=False, extra_items=Any):
     """The JSON body sent to an Anthropic-compatible Messages endpoint."""
+
+    model: str
+    messages: list[AnthropicMessageParam]
+    max_tokens: int
+    stream: bool
+    system: str | list[AnthropicTextBlockParam]
+    tools: list[AnthropicToolParam]
+    thinking: AnthropicThinkingConfigParam
+    temperature: float
+    top_p: float
+    top_k: int
+    stop_sequences: list[str]
+    chat_template: str
+    chat_template_kwargs: dict[str, Any]
 
 
 class ChatCompletionsExchange(pydantic.BaseModel):
-    request: ChatCompletionsRequest
+    request: Annotated[ChatCompletionsRequest, pydantic.SkipValidation]
     response: ChatCompletion
     model: str | None
     start_time: datetime
@@ -53,7 +127,7 @@ class ChatCompletionsExchange(pydantic.BaseModel):
 
 
 class CompletionsExchange(pydantic.BaseModel):
-    request: CompletionsRequest
+    request: Annotated[CompletionsRequest, pydantic.SkipValidation]
     response: Completion
     model: str | None
     start_time: datetime
@@ -61,7 +135,7 @@ class CompletionsExchange(pydantic.BaseModel):
 
 
 class ResponsesExchange(pydantic.BaseModel):
-    request: ResponsesRequest
+    request: Annotated[ResponsesRequest, pydantic.SkipValidation]
     response: Response
     model: str | None
     start_time: datetime
@@ -69,7 +143,7 @@ class ResponsesExchange(pydantic.BaseModel):
 
 
 class MessagesExchange(pydantic.BaseModel):
-    request: MessagesRequest
+    request: Annotated[MessagesRequest, pydantic.SkipValidation]
     response: AnthropicMessage
     model: str | None
     start_time: datetime
@@ -284,7 +358,7 @@ class TrajectoryGroup(_CompactModel):
         self.logs.append(message)
 
     # Legacy groups iterate over trajectories rather than Pydantic field pairs.
-    def __iter__(self) -> Iterator[Trajectory]:  # type: ignore[override]
+    def __iter__(self) -> Iterator[Trajectory]:  # ty: ignore[invalid-method-override]
         return iter(self.trajectories)
 
     def __len__(self) -> int:

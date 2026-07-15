@@ -175,7 +175,7 @@ async def test_group_context_and_async_helpers() -> None:
     task = asyncio.create_task(rollout())
     with pytest.raises(TypeError, match="raw coroutine"):
         # Passing a Task is deliberately a static type error and a runtime error.
-        await art.trajectory(task)  # type: ignore[arg-type]
+        await art.trajectory(task)  # ty: ignore[invalid-argument-type]
     await task
 
     async def failed() -> art.Trajectory:
@@ -239,6 +239,7 @@ async def test_native_openai_and_anthropic_sdks(endpoint_server: str) -> None:
 
     assert completion.choices[0].text == "hello"
     assert response.output_text == "hello"
+    assert message.content[0].type == "text"
     assert message.content[0].text == "hello"
     assert len(trajectory.exchanges.completions) == 1
     assert len(trajectory.exchanges.responses) == 1

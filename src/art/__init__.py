@@ -79,8 +79,8 @@ from .trajectories import (
     Trajectory,
     TrajectoryExchanges,
     TrajectoryGroup,
-    auto_trajectory,
-    capture_auto_trajectory,
+    auto_trajectory,  # ty: ignore[deprecated]
+    capture_auto_trajectory,  # ty: ignore[deprecated]
     current_trajectory,
     current_trajectory_group,
     tokenize_trajectories,

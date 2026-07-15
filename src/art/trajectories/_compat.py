@@ -85,7 +85,9 @@ def new_trajectory_group(
     logs: list[str] | None,
 ) -> TrajectoryGroup | Awaitable[TrajectoryGroup]:
     items = list(trajectories)
-    awaitables = [item for item in items if isinstance(item, Awaitable)]
+    awaitables = [
+        item for item in items if not isinstance(item, (Trajectory, BaseException))
+    ]
     if awaitables:
         if len(awaitables) != len(items):
             raise TypeError("TrajectoryGroup cannot mix trajectories and awaitables")

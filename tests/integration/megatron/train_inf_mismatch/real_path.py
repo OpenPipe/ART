@@ -347,14 +347,16 @@ async def _rollout(
             top_logprobs=TOP_K,
             **request_kwargs,
         )
-        if trajectory := art.auto_trajectory():
+        if trajectory := art.auto_trajectory():  # ty: ignore[deprecated]
             logprobs = response.choices[0].logprobs
             trajectory.reward = reward
             trajectory.metrics["completion_tokens"] = (
                 len(logprobs.content or []) if logprobs is not None else 0
             )
 
-    return await art.capture_auto_trajectory(_request())
+    return await art.capture_auto_trajectory(  # ty: ignore[deprecated]
+        _request()
+    )
 
 
 async def _collect_real_trajectory_groups(

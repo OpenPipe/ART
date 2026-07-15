@@ -50,9 +50,11 @@ class _Tokenizer(Protocol):
     ) -> object: ...
 
 
-def _as_tokenizer(tokenizer: PreTrainedTokenizerBase) -> _Tokenizer:
+def _as_tokenizer(tokenizer: object) -> _Tokenizer:
     # Transformers' annotation permits only string-valued message dictionaries,
     # although its runtime API supports the structured content ART must tokenize.
+    # Exact-token paths may only need decode(); fallback paths exercise these
+    # capabilities directly and report the missing method at that point.
     return cast(_Tokenizer, tokenizer)
 
 
@@ -253,10 +255,10 @@ def _exchange_list(trajectory: Trajectory, model: str | None) -> list[Exchange]:
 
 
 def _artifact_config(model: str) -> _TokenizerConfig:
-    import wandb
+    from wandb.apis.public import Api
 
     artifact_path = model.removeprefix("wandb-artifact:///")
-    artifact = wandb.Api().artifact(f"{artifact_path}:latest")
+    artifact = Api().artifact(f"{artifact_path}:latest")
     metadata = artifact.metadata
     base_model = metadata.get("base_model") or metadata.get("wandb.base_model")
     if not isinstance(base_model, str):
@@ -494,7 +496,7 @@ def _request_messages(
     exchange: ChatCompletionsExchange | MessagesExchange | ResponsesExchange,
     messages_override: list[dict[str, Any]] | None = None,
 ) -> tuple[list[dict[str, Any]], object]:
-    request = exchange.request.root
+    request = exchange.request
     if isinstance(exchange, ChatCompletionsExchange):
         return _dict_list(request.get("messages")), request.get("tools")
     if isinstance(exchange, MessagesExchange):
@@ -560,11 +562,11 @@ def _template_ids(
     chat_template_kwargs: Mapping[str, object] | None,
     messages_override: list[dict[str, Any]] | None = None,
 ) -> list[int]:
-    request = exchange.request.root
+    request = exchange.request
     if isinstance(exchange, CompletionsExchange):
         prompt = request.get("prompt", "")
         if isinstance(prompt, list) and all(isinstance(item, int) for item in prompt):
-            prompt_ids = prompt
+            prompt_ids = _ids(prompt)
         else:
             prompt_ids = _ids(tokenizer(str(prompt), add_special_tokens=False))
         if not completed:
@@ -748,7 +750,7 @@ def tokenize_one(
     for exchange in exchanges:
         messages_override = None
         if isinstance(exchange, ResponsesExchange):
-            request = exchange.request.root
+            request = exchange.request
             messages_override = _responses_messages(request)
             previous = request.get("previous_response_id")
             if previous is not None:
