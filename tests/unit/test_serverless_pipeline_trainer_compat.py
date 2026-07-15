@@ -67,6 +67,7 @@ async def test_serverless_train_accepts_pipeline_trainer_kwargs() -> None:
             loss_fn="ppo",
             normalize_advantages=False,
             save_checkpoint=False,
+            optimizer_save_interval=7,
             packed_sequence_length=4096,
             kl_penalty_coef=0.1,
             kl_ref_adapter_path="/tmp/ref-adapter",

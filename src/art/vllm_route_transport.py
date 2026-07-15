@@ -1,14 +1,17 @@
 from __future__ import annotations
 
 import struct
+from typing import TYPE_CHECKING
 
-import numpy as np
 from openai.types.chat import ChatCompletion
+
+if TYPE_CHECKING:
+    import numpy as np
 
 MAGIC = b"ARTRTE1\0"
 HEADER = struct.Struct("<8sQI")
 ROUTE_HEADER = struct.Struct("<IB3xQQQ")
-DTYPES = {1: np.dtype(np.uint8), 2: np.dtype("<u2")}
+DTYPES = {1: "u1", 2: "<u2"}
 
 
 def is_routed_experts_response(body: bytes) -> bool:
@@ -18,6 +21,8 @@ def is_routed_experts_response(body: bytes) -> bool:
 def decode_routed_experts_response(
     body: bytes,
 ) -> tuple[ChatCompletion, dict[int, np.ndarray]]:
+    import numpy as np
+
     if len(body) < HEADER.size:
         raise RuntimeError("Truncated ART routed-experts response header")
     magic, json_size, route_count = HEADER.unpack_from(body)
@@ -37,9 +42,10 @@ def decode_routed_experts_response(
             body, offset
         )
         offset += ROUTE_HEADER.size
-        dtype = DTYPES.get(dtype_code)
-        if dtype is None:
+        dtype_name = DTYPES.get(dtype_code)
+        if dtype_name is None:
             raise RuntimeError(f"Unknown ART route dtype code {dtype_code}")
+        dtype = np.dtype(dtype_name)
         size = int(tokens * layers * topk * dtype.itemsize)
         end = offset + size
         if end > len(body):

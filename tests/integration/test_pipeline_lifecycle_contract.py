@@ -6,6 +6,8 @@ import pytest
 
 from art import TrainableModel, Trajectory, TrajectoryGroup
 from art.errors import LocalServingUnavailableError
+from art.gather import GatherContext, record_metrics
+from art.model import _OpenAIChatCompletionsProxy
 from art.pipeline_trainer import PipelineRuntimeConfig, PipelineTrainer
 
 
@@ -101,3 +103,22 @@ def test_deprecated_pipeline_kwargs_preserve_previous_defaults(tmp_path: Path) -
             eval_fn=None,
         )
     assert trainer.max_batch_size == 30
+
+
+def test_gather_preserves_caller_completion_count_without_exact_choices() -> None:
+    trajectory = Trajectory(metrics={"completion_tokens": 17})
+    record_metrics(GatherContext(), trajectory)
+    assert trajectory.metrics["completion_tokens"] == 17
+
+
+@pytest.mark.asyncio
+async def test_policy_tracking_rejects_streaming_before_dispatch() -> None:
+    completions = MagicMock()
+    proxy = _OpenAIChatCompletionsProxy(
+        completions,
+        lambda _response: None,
+        policy_span_mode="require",
+    )
+    with pytest.raises(ValueError, match="Streaming completions"):
+        await proxy.create(model="model@1", stream=True)
+    completions.create.assert_not_called()

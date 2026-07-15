@@ -1,7 +1,10 @@
 from pathlib import Path
+from types import SimpleNamespace
+from typing import cast
 
 import pytest
 
+from art.megatron import train
 from art.megatron.optimizer_state import (
     commit_optimizer_generation,
     optimizer_generation_files,
@@ -68,3 +71,49 @@ def test_complete_legacy_optimizer_without_marker_resumes_latest_lora(
         output_dir=str(output), optimizer_state_path=str(optimizer)
     )
     assert resume.step == resume.optimizer_step == 7
+
+
+def test_resident_optimizer_is_not_reused_across_training_modes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    old_optimizer = object()
+    new_optimizer = SimpleNamespace()
+    runtime = cast(
+        train.TrainingRuntime,
+        SimpleNamespace(
+            optimizer_persistent=True,
+            optimizer=old_optimizer,
+            optimizer_config=object(),
+            model=object(),
+            rank=0,
+            world_size=1,
+            model_support_handler=object(),
+            resident_training_session_id="session",
+            resident_training_mode="rl",
+            resident_optimizer_state_path=str(tmp_path / "rl"),
+            resident_policy_step=4,
+            resident_optimizer_dirty=False,
+            optimizer_state_loaded=True,
+            adapter_export_dtypes={"lora": "old"},
+        ),
+    )
+    monkeypatch.setattr(
+        train,
+        "_load_adapter_into_model",
+        lambda *_args, **_kwargs: {"lora": SimpleNamespace(dtype="bf16")},
+    )
+    monkeypatch.setattr(train, "_build_optimizer", lambda *_args: new_optimizer)
+
+    train._prepare_training_state(
+        runtime,
+        training_session_id="session",
+        training_mode="sft",
+        source_policy_step=4,
+        lora_path=str(tmp_path / "adapter"),
+        optimizer_state_path=str(tmp_path / "sft"),
+    )
+
+    assert runtime.optimizer is new_optimizer
+    assert runtime.resident_training_mode == "sft"
+    assert runtime.resident_optimizer_state_path == str(tmp_path / "sft")

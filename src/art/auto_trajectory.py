@@ -8,7 +8,6 @@ from openai.types.chat.chat_completion import ChatCompletion, Choice
 from openai.types.chat.chat_completion_chunk import ChatCompletionChunk
 
 from .openai import init_chat_completion, update_chat_completion
-from .preprocessing.moe_routing import attach_moe_routing_metadata_to_choice
 from .preprocessing.policy_spans import attach_policy_token_metadata_to_choice
 from .preprocessing.vllm_tokens import attach_vllm_token_metadata_to_choice
 from .trajectories import History, Trajectory
@@ -117,11 +116,6 @@ class AutoTrajectoryContext:
                     response_payload=response_payload,
                     choice_index=0,
                 )
-                attach_moe_routing_metadata_to_choice(
-                    choice=choice,
-                    response_payload=response_payload,
-                    choice_index=0,
-                )
                 attach_policy_token_metadata_to_choice(
                     choice=choice,
                     response_payload=response_payload,
@@ -143,16 +137,17 @@ class AutoTrajectoryContext:
                     response_payload=response_payload,
                     choice_index=0,
                 )
-                attach_moe_routing_metadata_to_choice(
-                    choice=choice,
-                    response_payload=response_payload,
-                    choice_index=0,
-                    routed_experts=(
-                        routed_experts.get(int(choice.index))
-                        if routed_experts is not None
-                        else None
-                    ),
-                )
+                if routed_experts is not None:
+                    from .preprocessing.moe_routing import (
+                        attach_moe_routing_metadata_to_choice,
+                    )
+
+                    attach_moe_routing_metadata_to_choice(
+                        choice=choice,
+                        response_payload=response_payload,
+                        choice_index=0,
+                        routed_experts=routed_experts.get(int(choice.index)),
+                    )
                 attach_policy_token_metadata_to_choice(
                     choice=choice,
                     response_payload=response_payload,

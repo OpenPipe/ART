@@ -10,7 +10,9 @@ import httpx
 import pytest
 
 import art
+from art.megatron.runtime.jobs import MegatronOptimizerSaveJob
 from art.megatron.service import MegatronService
+from art.serving_capabilities import ServingCapabilities
 
 
 @pytest.fixture(autouse=True)
@@ -135,6 +137,88 @@ async def test_megatron_in_flight_eval_uses_immutable_adapter_slot(
         30.0,
     )
     assert service._loaded_exact_adapter_steps == set()
+
+
+@pytest.mark.asyncio
+async def test_external_in_flight_update_maps_checkpoint_path(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    local_root = str(tmp_path / "local")
+    service = MegatronService(
+        model_name="test-model",
+        base_model="Qwen/Qwen3-0.6B",
+        config={
+            "rollout_weights_mode": "lora",
+            "rollout_weight_update_mode": "in_flight_lora",
+            "vllm_runtime": {
+                "mode": "external",
+                "server_url": "http://inference:8000",
+                "local_checkpoint_root": local_root,
+                "server_checkpoint_root": "/remote",
+            },
+        },
+        output_dir=str(tmp_path),
+    )
+    service._serving_capabilities = ServingCapabilities(
+        runtime="art_vllm",
+        protocol_version=1,
+        in_flight_lora_updates=True,
+        policy_token_spans=True,
+    )
+    posts: list[tuple[str, dict[str, object] | None, float]] = []
+    monkeypatch.setattr(httpx, "AsyncClient", lambda: _RecordingAsyncClient(posts))
+
+    await service._update_in_flight_adapter(f"{local_root}/model/0004", 4)
+
+    assert posts[0][1] == {
+        "model_name": "test-model@4",
+        "lora_slot": "test-model:active",
+        "lora_path": "/remote/model/0004",
+        "policy_version": 4,
+    }
+
+
+@pytest.mark.asyncio
+async def test_clean_training_finalization_submits_latest_optimizer_save(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service = MegatronService(
+        model_name="test-model",
+        base_model="Qwen/Qwen3-0.6B",
+        config={},
+        output_dir=str(tmp_path),
+    )
+    service._latest_step = 4
+    service._megatron_process = cast(Any, object())
+    written: list[MegatronOptimizerSaveJob] = []
+
+    monkeypatch.setattr(
+        "art.megatron.service.read_optimizer_commit", lambda _path: None
+    )
+    monkeypatch.setattr(
+        service,
+        "_create_megatron_job_paths",
+        lambda: (str(tmp_path / "job.json"), str(tmp_path / "job.log")),
+    )
+    monkeypatch.setattr(
+        "art.megatron.service.write_megatron_job",
+        lambda job, **_kwargs: written.append(job),
+    )
+
+    async def completed_job(*_args: Any, **_kwargs: Any):
+        if False:
+            yield {}
+
+    monkeypatch.setattr("art.megatron.service.stream_megatron_job", completed_job)
+
+    await service.finalize_training_session()
+
+    assert len(written) == 1
+    assert written[0].step == 4
+    assert written[0].training_mode == "rl"
+    assert written[0].training_session_id == service._training_session_id
 
 
 @pytest.mark.asyncio

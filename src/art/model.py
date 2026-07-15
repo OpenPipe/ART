@@ -37,7 +37,6 @@ from .metrics_taxonomy import (
     build_data_metrics_from_summary,
     summarize_trajectory_groups,
 )
-from .preprocessing.moe_routing import attach_moe_routing_metadata_to_choice
 from .preprocessing.policy_spans import (
     attach_policy_token_metadata_to_choice,
     attach_static_policy_token_span_to_choice,
@@ -111,6 +110,8 @@ def _attach_response_art_metadata(
         return
     response_payload = model_dump(mode="python")
     if routed_experts is not None:
+        from .preprocessing.moe_routing import attach_moe_routing_metadata_to_choice
+
         missing = [
             int(choice.index)
             for choice in choices
@@ -129,16 +130,13 @@ def _attach_response_art_metadata(
         )
     attach_completion_token_metadata(response)
     for choice_index, choice in enumerate(choices):
-        attach_moe_routing_metadata_to_choice(
-            choice=choice,
-            response_payload=response_payload,
-            choice_index=choice_index,
-            routed_experts=(
-                routed_experts.get(int(choice.index))
-                if routed_experts is not None
-                else None
-            ),
-        )
+        if routed_experts is not None:
+            attach_moe_routing_metadata_to_choice(
+                choice=choice,
+                response_payload=response_payload,
+                choice_index=choice_index,
+                routed_experts=routed_experts.get(int(choice.index)),
+            )
         attach_policy_token_metadata_to_choice(
             choice=choice,
             response_payload=response_payload,
