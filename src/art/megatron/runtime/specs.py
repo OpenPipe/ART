@@ -21,6 +21,7 @@ class TrainerRuntimeSpec(_Spec):
     art_revision: str = Field(min_length=1)
     model_identifier: str = Field(min_length=1)
     model_revision: str = Field(min_length=1)
+    model_support_key: str = Field(min_length=1)
     handler_name: str = Field(min_length=1)
     lora_rank: int = Field(ge=1)
     lora_alpha: float = Field(default=32.0, gt=0)

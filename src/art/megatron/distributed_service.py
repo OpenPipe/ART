@@ -40,7 +40,12 @@ from art.vllm_runtime import (
 )
 
 from .lora import LORA_ALPHA, default_lora_rank_for_handler
-from .model_support import get_model_support_handler, model_uses_expert_parallel
+from .model_support import (
+    get_model_support_handler,
+    get_model_support_handler_for_spec,
+    get_model_support_spec,
+    model_uses_expert_parallel,
+)
 from .optimizer_state import (
     OptimizerAdapter,
     async_optimizer_model_lease,
@@ -138,6 +143,13 @@ class DistributedMegatronService:
                 return int(value)
         return None
 
+    @property
+    def _model_identifier(self) -> str:
+        value = self.config.get("init_args", {}).get("model_name", self.base_model)
+        if not isinstance(value, str) or not value:
+            raise ValueError("init_args.model_name must be a non-empty string")
+        return value
+
     def _resolve_current_lora_path(self) -> str:
         resume = prepare_megatron_resume_state(
             output_dir=self.output_dir,
@@ -148,13 +160,18 @@ class DistributedMegatronService:
         path = get_step_checkpoint_dir(self.output_dir, self._latest_step)
         if not (Path(path) / "adapter_model.safetensors").is_file():
             lora = self._lora_config()
-            create_identity_lora(
+            handler = get_model_support_handler(
                 self.base_model,
+                allow_unvalidated_arch=self._allow_unvalidated_arch,
+            )
+            create_identity_lora(
+                self._model_identifier,
                 path,
                 rank=lora.get("rank"),
                 target_modules=lora.get("target_modules"),
                 random_state=self._random_state(),
                 allow_unvalidated_arch=self._allow_unvalidated_arch,
+                handler=handler,
             )
         return path
 
@@ -168,10 +185,11 @@ class DistributedMegatronService:
                 "Megatron runtime topology does not match the ART trainer mesh"
             )
         lora = self._lora_config()
-        handler = get_model_support_handler(
+        support_spec = get_model_support_spec(
             self.base_model,
             allow_unvalidated_arch=self._allow_unvalidated_arch,
         )
+        handler = get_model_support_handler_for_spec(support_spec)
         targets = lora.get("target_modules") or default_target_modules(self.base_model)
         revision = str(self.config.get("init_args", {}).get("revision") or "default")
         compile_enabled = os.environ.get(
@@ -179,15 +197,17 @@ class DistributedMegatronService:
         ).lower() not in {"1", "true", "yes", "on"}
         identity = {
             "art": _art_source_revision(),
-            "model": self.base_model,
+            "model": self._model_identifier,
+            "support_model": self.base_model,
             "revision": revision,
             "handler": handler.key,
             "mesh": mesh.model_dump(mode="json"),
         }
         return TrainerRuntimeSpec(
             art_revision=identity["art"],
-            model_identifier=self.base_model,
+            model_identifier=self._model_identifier,
             model_revision=revision,
+            model_support_key=support_spec.key,
             handler_name=handler.key,
             lora_rank=int(lora.get("rank") or default_lora_rank_for_handler(handler)),
             lora_alpha=float(lora.get("alpha", LORA_ALPHA)),

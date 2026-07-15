@@ -127,6 +127,7 @@ class MonarchTrainerActor(Actor):
             model_identifier=runtime_spec.model_identifier,
             provider_torch_dtype=dtype,
             print_env=rank == 0,
+            model_support_key=runtime_spec.model_support_key,
         )
         if self._runtime.model_support_handler.key != runtime_spec.handler_name:
             raise RuntimeError(

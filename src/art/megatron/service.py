@@ -54,6 +54,7 @@ from .model_support.registry import (
     UnsupportedModelArchitectureError,
     model_uses_expert_parallel,
 )
+from .model_support.spec import ModelSupportHandler
 from .optimizer_state import (
     MegatronResumeStep,
     format_megatron_resume_message,
@@ -102,6 +103,7 @@ def create_identity_lora(
     lora_alpha: int = LORA_ALPHA,
     random_state: int | None = None,
     allow_unvalidated_arch: bool = False,
+    handler: ModelSupportHandler | None = None,
 ) -> None:
     """Create an identity LoRA adapter for a Megatron model.
 
@@ -125,9 +127,8 @@ def create_identity_lora(
     if random_state is not None:
         torch.manual_seed(random_state)
     target_modules = target_modules or default_target_modules(base_model)
-    handler = get_model_support_handler(
-        base_model,
-        allow_unvalidated_arch=allow_unvalidated_arch,
+    handler = handler or get_model_support_handler(
+        base_model, allow_unvalidated_arch=allow_unvalidated_arch
     )
     if rank is None:
         rank = default_lora_rank_for_handler(handler)

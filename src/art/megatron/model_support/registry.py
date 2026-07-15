@@ -363,6 +363,13 @@ def get_model_support_spec(
     )
 
 
+def get_model_support_spec_by_key(key: str) -> ModelSupportSpec:
+    try:
+        return _SPECS_BY_KEY[key]
+    except KeyError as exc:
+        raise KeyError(f"No model support spec registered for {key!r}") from exc
+
+
 def get_model_support_handler(
     base_model: str,
     *,

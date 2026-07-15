@@ -17,6 +17,7 @@ from art.megatron.model_support.registry import (
     ensure_model_support_bridge_registered_for_spec,
     get_model_support_handler_for_spec,
     get_model_support_spec,
+    get_model_support_spec_by_key,
 )
 from art.megatron.model_support.spec import ModelSupportSpec
 from art.megatron.runtime.bridge_runtime import install_art_bridge_runtime_patches
@@ -610,10 +611,15 @@ def _build_provider_bundle(
     *,
     torch_dtype: torch.dtype,
     allow_unvalidated_arch: bool = False,
+    model_support_key: str | None = None,
 ) -> ProviderBundle:
-    spec = get_model_support_spec(
-        model,
-        allow_unvalidated_arch=allow_unvalidated_arch,
+    spec = (
+        get_model_support_spec_by_key(model_support_key)
+        if model_support_key is not None
+        else get_model_support_spec(
+            model,
+            allow_unvalidated_arch=allow_unvalidated_arch,
+        )
     )
     ensure_model_support_bridge_registered_for_spec(spec)
     handler = get_model_support_handler_for_spec(spec)
@@ -637,12 +643,14 @@ def prepare_provider_bundle(
     *,
     torch_dtype: torch.dtype = torch.bfloat16,
     allow_unvalidated_arch: bool = False,
+    model_support_key: str | None = None,
 ) -> ProviderBundle:
     runtime_env = _ProviderRuntimeEnv.from_environ()
     bundle = _build_provider_bundle(
         model,
         torch_dtype=torch_dtype,
         allow_unvalidated_arch=allow_unvalidated_arch,
+        model_support_key=model_support_key,
     )
     provider = bundle.provider
     setattr(provider, "_art_model_support_handler", bundle.handler)
@@ -760,12 +768,14 @@ def get_provider_bundle(
     *,
     torch_dtype: torch.dtype = torch.bfloat16,
     allow_unvalidated_arch: bool = False,
+    model_support_key: str | None = None,
 ) -> ProviderBundle:
     return finalize_provider_bundle(
         prepare_provider_bundle(
             model,
             torch_dtype=torch_dtype,
             allow_unvalidated_arch=allow_unvalidated_arch,
+            model_support_key=model_support_key,
         )
     )
 
@@ -775,9 +785,11 @@ def get_provider(
     *,
     torch_dtype: torch.dtype = torch.bfloat16,
     allow_unvalidated_arch: bool = False,
+    model_support_key: str | None = None,
 ) -> GPTModelProvider:
     return get_provider_bundle(
         model,
         torch_dtype=torch_dtype,
         allow_unvalidated_arch=allow_unvalidated_arch,
+        model_support_key=model_support_key,
     ).provider

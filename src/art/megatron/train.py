@@ -395,6 +395,7 @@ def build_training_runtime(
     build_optimizer: bool = True,
     trainable_parameter_mode: Literal["lora", "base_model"] = "lora",
     allow_unvalidated_arch: bool | None = None,
+    model_support_key: str | None = None,
 ) -> TrainingRuntime:
     if random_state := os.environ.get("ART_MEGATRON_RANDOM_STATE"):
         seed = int(random_state)
@@ -413,6 +414,7 @@ def build_training_runtime(
             if allow_unvalidated_arch is None
             else allow_unvalidated_arch
         ),
+        model_support_key=model_support_key,
     )
     if provider_bundle_configure is not None:
         provider_bundle_configure(provider_bundle)
