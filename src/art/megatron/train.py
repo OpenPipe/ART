@@ -17,6 +17,7 @@ Public cross-repo API consumed by serverless-training:
 import json
 import math
 import os
+from pathlib import Path
 import random
 import shutil
 from threading import Event
@@ -52,9 +53,15 @@ from art.megatron.model_support.lora_disk import (
     load_lora_tensors_for_megatron,
 )
 from art.megatron.optimizer_state import (
-    validate_optimizer_manifest,
-    write_optimizer_manifest,
-    write_optimizer_step_marker,
+    OptimizerShard,
+    build_optimizer_manifest,
+    commit_optimizer_generation,
+    hash_optimizer_shard,
+    new_optimizer_generation,
+    optimizer_pending_generation_path,
+    optimizer_shard_path,
+    read_committed_optimizer_step,
+    resolve_optimizer_shard,
 )
 from art.megatron.provider import (
     ProviderBundle,
@@ -1028,29 +1035,7 @@ def _load_lora_and_optimizer(
         runtime.optimizer_config,
     )
     assert runtime.optimizer is not None
-
-    optimizer_shard_path = os.path.join(
-        optimizer_state_path,
-        f"{runtime.rank + 1:02d}-of-{runtime.world_size:02d}.pt",
-    )
-    has_optimizer_state = validate_optimizer_manifest(
-        optimizer_state_path, world_size=runtime.world_size
-    )
-    if has_optimizer_state:
-        if not os.path.exists(optimizer_shard_path):
-            raise RuntimeError(
-                f"Optimizer manifest is missing local shard {optimizer_shard_path}"
-            )
-        print0(runtime.rank, "Loading optimizer state from", optimizer_shard_path)
-        runtime.optimizer.load_state_dict(torch.load(optimizer_shard_path))
-    else:
-        print0(
-            runtime.rank,
-            "No optimizer state found at",
-            optimizer_shard_path,
-            "- resetting optimizer for new run",
-        )
-        _eager_initialize_optimizer_state(runtime.optimizer)
+    _load_optimizer(runtime, optimizer_state_path=optimizer_state_path)
     return {key: tensor.dtype for key, tensor in adapter_model.items()}
 
 
@@ -1087,28 +1072,7 @@ def _prepare_rl_training_state(
         runtime.optimizer = _build_optimizer(runtime.model, runtime.optimizer_config)
     assert runtime.optimizer is not None
 
-    optimizer_shard_path = os.path.join(
-        job.optimizer_state_path,
-        f"{runtime.rank + 1:02d}-of-{runtime.world_size:02d}.pt",
-    )
-    has_optimizer_state = validate_optimizer_manifest(
-        job.optimizer_state_path, world_size=runtime.world_size
-    )
-    if has_optimizer_state:
-        if not os.path.exists(optimizer_shard_path):
-            raise RuntimeError(
-                f"Optimizer manifest is missing local shard {optimizer_shard_path}"
-            )
-        print0(runtime.rank, "Loading optimizer state from", optimizer_shard_path)
-        runtime.optimizer.load_state_dict(torch.load(optimizer_shard_path))
-    else:
-        print0(
-            runtime.rank,
-            "No optimizer state found at",
-            optimizer_shard_path,
-            "- resetting optimizer for new run",
-        )
-        _eager_initialize_optimizer_state(runtime.optimizer)
+    _load_optimizer(runtime, optimizer_state_path=job.optimizer_state_path)
 
     runtime.adapter_export_dtypes = {
         key: tensor.dtype for key, tensor in adapter_model.items()
@@ -1117,6 +1081,26 @@ def _prepare_rl_training_state(
     runtime.resident_policy_step = job.source_policy_step
     runtime.optimizer_state_loaded = True
     return runtime.adapter_export_dtypes
+
+
+def _load_optimizer(runtime: TrainingRuntime, *, optimizer_state_path: str) -> None:
+    assert runtime.optimizer is not None
+    shard_path = resolve_optimizer_shard(
+        optimizer_state_path,
+        rank=runtime.rank,
+        world_size=runtime.world_size,
+    )
+    if shard_path is None:
+        print0(
+            runtime.rank,
+            "No committed optimizer state found at",
+            optimizer_state_path,
+            "- resetting optimizer for new run",
+        )
+        _eager_initialize_optimizer_state(runtime.optimizer)
+        return
+    print0(runtime.rank, "Loading optimizer state from", shard_path)
+    runtime.optimizer.load_state_dict(torch.load(shard_path))
 
 
 def _load_adapter_into_model(
@@ -1173,14 +1157,11 @@ def _save_lora_and_optimizer(
         optimizer_save_interval=optimizer_save_interval,
         final_training_step=final_training_step,
     ):
-        _save_optimizer(runtime, optimizer_state_path=optimizer_state_path)
-        if torch.distributed.is_initialized():  # ty:ignore[possibly-missing-attribute]
-            torch.distributed.barrier()  # ty:ignore[possibly-missing-attribute]
-        if runtime.rank == 0:
-            write_optimizer_manifest(
-                optimizer_state_path, world_size=runtime.world_size
-            )
-            write_optimizer_step_marker(optimizer_state_path, step)
+        _save_optimizer(
+            runtime,
+            optimizer_state_path=optimizer_state_path,
+            step=step,
+        )
 
 
 def _validate_train_step_result_finite(
@@ -1212,19 +1193,12 @@ def _should_save_optimizer(
     optimizer_save_interval: int,
     final_training_step: int | None,
 ) -> bool:
+    committed_step = read_committed_optimizer_step(optimizer_state_path)
     if not runtime.optimizer_persistent or optimizer_save_interval == 1:
         return True
     if final_training_step is not None and step >= final_training_step:
         return True
-    optimizer_shard_path = os.path.join(
-        optimizer_state_path,
-        f"{runtime.rank + 1:02d}-of-{runtime.world_size:02d}.pt",
-    )
-    return (
-        step <= 1
-        or step % optimizer_save_interval == 0
-        or not os.path.exists(optimizer_shard_path)
-    )
+    return step <= 1 or step % optimizer_save_interval == 0 or committed_step is None
 
 
 def _write_job_event(log_path: str, event: str, **payload: int | float | str) -> None:
@@ -1269,15 +1243,111 @@ def _global_packed_train_tokens(micro_inputs: list[PackedTensors]) -> int:
     return local_tokens * ps.get_data_parallel_world_size(with_context_parallel=False)
 
 
-def _save_optimizer(runtime: TrainingRuntime, *, optimizer_state_path: str) -> None:
+def _write_optimizer_shard(
+    runtime: TrainingRuntime, generation_path: Path
+) -> OptimizerShard:
     assert runtime.optimizer is not None
-    optimizer_shard_path = os.path.join(
-        optimizer_state_path,
-        f"{runtime.rank + 1:02d}-of-{runtime.world_size:02d}.pt",
+    shard_path = optimizer_shard_path(
+        generation_path,
+        rank=runtime.rank,
+        world_size=runtime.world_size,
     )
-    print("Saving optimizer shard to", optimizer_shard_path)
-    os.makedirs(optimizer_state_path, exist_ok=True)
-    torch.save(runtime.optimizer.state_dict(), optimizer_shard_path)
+    temporary = shard_path.with_name(f".{shard_path.name}.{os.getpid()}.tmp")
+    generation_path.mkdir(parents=True, exist_ok=True)
+    print("Saving optimizer shard to", shard_path)
+    try:
+        with temporary.open("wb") as output:
+            torch.save(runtime.optimizer.state_dict(), output)
+            output.flush()
+            os.fsync(output.fileno())
+        os.replace(temporary, shard_path)
+    finally:
+        temporary.unlink(missing_ok=True)
+    return OptimizerShard(
+        rank=runtime.rank,
+        name=shard_path.name,
+        size_bytes=shard_path.stat().st_size,
+        sha256=hash_optimizer_shard(shard_path),
+    )
+
+
+def _save_optimizer(
+    runtime: TrainingRuntime, *, optimizer_state_path: str, step: int
+) -> None:
+    distributed = torch.distributed.is_initialized()  # ty:ignore[possibly-missing-attribute]
+    if distributed:
+        actual_world_size = torch.distributed.get_world_size()  # ty:ignore[possibly-missing-attribute]
+        if actual_world_size != runtime.world_size:
+            raise RuntimeError(
+                "Optimizer save world-size mismatch: "
+                f"runtime={runtime.world_size}, process_group={actual_world_size}"
+            )
+    elif (runtime.rank, runtime.world_size) != (0, 1):
+        raise RuntimeError(
+            "Multi-rank optimizer save requires an initialized process group: "
+            f"rank={runtime.rank}, world_size={runtime.world_size}"
+        )
+    generation_box = [new_optimizer_generation(step) if runtime.rank == 0 else None]
+    if distributed:
+        torch.distributed.broadcast_object_list(  # ty:ignore[possibly-missing-attribute]
+            generation_box, src=0
+        )
+    generation = generation_box[0]
+    if generation is None:
+        raise RuntimeError("Optimizer generation broadcast returned no generation")
+    generation_path = optimizer_pending_generation_path(
+        optimizer_state_path, generation
+    )
+    try:
+        shard = _write_optimizer_shard(runtime, generation_path)
+        local_result: dict[str, Any] = {"shard": shard.model_dump(mode="json")}
+    except Exception as exc:
+        local_result = {
+            "rank": runtime.rank,
+            "error": f"{type(exc).__name__}: {exc}",
+        }
+
+    gathered: list[dict[str, Any] | None] = [None] * runtime.world_size
+    if distributed:
+        torch.distributed.all_gather_object(  # ty:ignore[possibly-missing-attribute]
+            gathered, local_result
+        )
+    else:
+        gathered = [local_result]
+    errors = [
+        f"rank {rank}: missing shard metadata"
+        if result is None
+        else str(result["error"])
+        for rank, result in enumerate(gathered)
+        if result is None or "error" in result
+    ]
+    if errors:
+        raise RuntimeError(f"Optimizer shard save failed: {errors}")
+
+    publication_error: list[str | None] = [None]
+    if runtime.rank == 0:
+        try:
+            manifest = build_optimizer_manifest(
+                generation=generation,
+                step=step,
+                world_size=runtime.world_size,
+                shards=[
+                    OptimizerShard.model_validate(result["shard"])
+                    for result in gathered
+                    if result is not None
+                ],
+            )
+            commit_optimizer_generation(optimizer_state_path, manifest)
+        except Exception as exc:
+            publication_error[0] = f"{type(exc).__name__}: {exc}"
+    if distributed:
+        torch.distributed.broadcast_object_list(  # ty:ignore[possibly-missing-attribute]
+            publication_error, src=0
+        )
+    if publication_error[0] is not None:
+        raise RuntimeError(
+            f"Optimizer generation publication failed: {publication_error[0]}"
+        )
 
 
 def finalize_megatron_job(

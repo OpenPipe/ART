@@ -1,21 +1,33 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 from pathlib import Path
+import re
+import shutil
 import time
+from typing import Literal
+from uuid import uuid4
 
-from pydantic import BaseModel
-
-OPTIMIZER_MANIFEST = "manifest.json"
+from pydantic import BaseModel, ConfigDict, Field
 
 from ..utils.get_model_step import get_step_from_dir
 from ..utils.output_dirs import get_step_checkpoint_dir
 
 ALLOW_UNPAIRED_MEGATRON_RESUME_ENV = "ART_ALLOW_UNPAIRED_MEGATRON_RESUME"
+OPTIMIZER_GENERATIONS_DIR = "generations"
+OPTIMIZER_MANIFEST = "manifest.json"
+OPTIMIZER_POINTER = "committed.json"
+_GENERATION_PATTERN = r"step-\d{8,}-[0-9a-f]{32}"
+_GENERATION_RE = re.compile(f"^{_GENERATION_PATTERN}$")
 
 
-class MegatronResumeStep(BaseModel):
+class _OptimizerRecord(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+
+class MegatronResumeStep(_OptimizerRecord):
     step: int
     latest_lora_step: int
     optimizer_step: int | None
@@ -23,15 +35,44 @@ class MegatronResumeStep(BaseModel):
     quarantined_lora_steps: tuple[int, ...] = ()
 
 
-class OptimizerTopology(BaseModel):
-    world_size: int
-    tp: int
-    cp: int
-    ep: int
-    etp: int
-    pp: int
-    vpp: int
+class OptimizerTopology(_OptimizerRecord):
+    world_size: int = Field(gt=0)
+    tp: int = Field(gt=0)
+    cp: int = Field(gt=0)
+    ep: int = Field(gt=0)
+    etp: int = Field(gt=0)
+    pp: int = Field(gt=0)
+    vpp: int = Field(gt=0)
     expected_shards: tuple[str, ...]
+
+
+class OptimizerShard(_OptimizerRecord):
+    rank: int = Field(ge=0)
+    name: str
+    size_bytes: int = Field(gt=0)
+    sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+
+
+class OptimizerGenerationManifest(_OptimizerRecord):
+    format_version: Literal[1] = 1
+    generation: str = Field(pattern=f"^{_GENERATION_PATTERN}$")
+    step: int = Field(ge=0)
+    topology: OptimizerTopology
+    shards: tuple[OptimizerShard, ...]
+
+
+class OptimizerGenerationPointer(_OptimizerRecord):
+    format_version: Literal[1] = 1
+    generation: str = Field(pattern=f"^{_GENERATION_PATTERN}$")
+    step: int = Field(ge=0)
+
+
+def optimizer_shard_name(rank: int, world_size: int) -> str:
+    if world_size <= 0 or rank < 0 or rank >= world_size:
+        raise ValueError(
+            f"Invalid optimizer shard rank {rank} for world size {world_size}"
+        )
+    return f"{rank + 1:02d}-of-{world_size:02d}.pt"
 
 
 def current_optimizer_topology(world_size: int) -> OptimizerTopology:
@@ -46,81 +87,278 @@ def current_optimizer_topology(world_size: int) -> OptimizerTopology:
         pp=int(ps.get_pipeline_model_parallel_world_size()),
         vpp=int(ps.get_virtual_pipeline_model_parallel_world_size() or 1),
         expected_shards=tuple(
-            f"{rank + 1:02d}-of-{world_size:02d}.pt" for rank in range(world_size)
+            optimizer_shard_name(rank, world_size) for rank in range(world_size)
         ),
     )
 
 
-def write_optimizer_manifest(optimizer_state_path: str, *, world_size: int) -> None:
-    path = Path(optimizer_state_path)
-    path.mkdir(parents=True, exist_ok=True)
-    manifest = current_optimizer_topology(world_size)
-    missing = [name for name in manifest.expected_shards if not (path / name).is_file()]
-    if missing:
-        raise RuntimeError(
-            f"Cannot publish optimizer manifest with missing shards: {missing}"
-        )
-    temporary = path / f".{OPTIMIZER_MANIFEST}.{os.getpid()}.tmp"
-    temporary.write_text(
-        json.dumps(manifest.model_dump(mode="json"), sort_keys=True) + "\n",
-        encoding="utf-8",
+def new_optimizer_generation(step: int) -> str:
+    if step < 0:
+        raise ValueError(f"Optimizer step must be non-negative, got {step}")
+    return f"step-{step:08d}-{uuid4().hex}"
+
+
+def _validate_generation_name(generation: str) -> None:
+    if _GENERATION_RE.fullmatch(generation) is None:
+        raise ValueError(f"Invalid optimizer generation name: {generation!r}")
+
+
+def optimizer_pending_generation_path(
+    optimizer_state_path: str, generation: str
+) -> Path:
+    _validate_generation_name(generation)
+    return (
+        Path(optimizer_state_path)
+        / OPTIMIZER_GENERATIONS_DIR
+        / f".pending-{generation}"
     )
-    os.replace(temporary, path / OPTIMIZER_MANIFEST)
 
 
-def validate_optimizer_manifest(optimizer_state_path: str, *, world_size: int) -> bool:
-    path = Path(optimizer_state_path)
-    shard_paths = sorted(path.glob("*-of-*.pt")) if path.exists() else []
-    manifest_path = path / OPTIMIZER_MANIFEST
-    if not manifest_path.exists():
-        if shard_paths:
-            raise RuntimeError(
-                "Optimizer shards exist without a topology manifest; refusing to reset "
-                f"or load ambiguous state from {path}"
-            )
-        return False
+def optimizer_generation_path(optimizer_state_path: str, generation: str) -> Path:
+    _validate_generation_name(generation)
+    return Path(optimizer_state_path) / OPTIMIZER_GENERATIONS_DIR / generation
+
+
+def optimizer_shard_path(generation_path: Path, *, rank: int, world_size: int) -> Path:
+    return generation_path / optimizer_shard_name(rank, world_size)
+
+
+def hash_optimizer_shard(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as shard_file:
+        while chunk := shard_file.read(8 * 1024 * 1024):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _fsync_directory(path: Path) -> None:
+    directory_fd = os.open(path, os.O_RDONLY | os.O_DIRECTORY)
     try:
-        saved = OptimizerTopology.model_validate_json(manifest_path.read_text("utf-8"))
-    except Exception as exc:
+        os.fsync(directory_fd)
+    finally:
+        os.close(directory_fd)
+
+
+def _write_model_atomic(path: Path, model: BaseModel) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(f".{path.name}.{os.getpid()}.{uuid4().hex}.tmp")
+    try:
+        with temporary.open("w", encoding="utf-8") as output:
+            output.write(json.dumps(model.model_dump(mode="json"), sort_keys=True))
+            output.write("\n")
+            output.flush()
+            os.fsync(output.fileno())
+        os.replace(temporary, path)
+        _fsync_directory(path.parent)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def _read_pointer(path: Path) -> OptimizerGenerationPointer | None:
+    pointer_path = path / OPTIMIZER_POINTER
+    if pointer_path.is_file():
+        try:
+            return OptimizerGenerationPointer.model_validate_json(
+                pointer_path.read_text("utf-8")
+            )
+        except Exception as exc:
+            raise RuntimeError(
+                f"Invalid optimizer generation pointer: {pointer_path}"
+            ) from exc
+    if pointer_path.exists():
         raise RuntimeError(
-            f"Invalid optimizer topology manifest: {manifest_path}"
-        ) from exc
-    current = current_optimizer_topology(world_size)
-    if saved != current:
-        raise RuntimeError(
-            "Optimizer checkpoint topology mismatch; optimizer state is topology-strict: "
-            f"saved={saved.model_dump()} current={current.model_dump()}"
+            f"Invalid optimizer generation pointer: {pointer_path} is not a file"
         )
-    actual = tuple(sorted(shard.name for shard in shard_paths))
-    if actual != saved.expected_shards:
-        raise RuntimeError(
-            "Optimizer checkpoint shard coverage mismatch: "
-            f"expected={saved.expected_shards}, actual={actual}"
-        )
-    return True
-
-
-def write_optimizer_step_marker(optimizer_state_path: str, step: int) -> None:
-    path = Path(optimizer_state_path)
-    path.mkdir(parents=True, exist_ok=True)
-    for marker in path.iterdir():
-        if marker.is_file() and marker.name.isdigit():
-            marker.unlink()
-    (path / f"{step:04d}").touch()
-
-
-def read_optimizer_step_marker(optimizer_state_path: str) -> int | None:
-    path = Path(optimizer_state_path)
     if not path.exists():
         return None
-    return max(
-        (
-            int(marker.name)
-            for marker in path.iterdir()
-            if marker.is_file() and marker.name.isdigit()
-        ),
-        default=None,
+    legacy = sorted(
+        entry.name
+        for entry in path.iterdir()
+        if entry.is_file()
+        and (
+            entry.name == OPTIMIZER_MANIFEST
+            or entry.name.isdigit()
+            or (entry.name.endswith(".pt") and "-of-" in entry.name)
+        )
     )
+    if legacy:
+        raise RuntimeError(
+            "Legacy optimizer checkpoint format is unsupported; expected an atomic "
+            f"{OPTIMIZER_POINTER} pointer, found {legacy} in {path}"
+        )
+    return None
+
+
+def read_committed_optimizer_step(optimizer_state_path: str) -> int | None:
+    pointer = _read_pointer(Path(optimizer_state_path))
+    return None if pointer is None else pointer.step
+
+
+def _read_manifest(
+    generation_path: Path,
+) -> OptimizerGenerationManifest:
+    manifest_path = generation_path / OPTIMIZER_MANIFEST
+    try:
+        return OptimizerGenerationManifest.model_validate_json(
+            manifest_path.read_text("utf-8")
+        )
+    except Exception as exc:
+        raise RuntimeError(
+            f"Invalid optimizer generation manifest: {manifest_path}"
+        ) from exc
+
+
+def _ordered_manifest_shards(
+    manifest: OptimizerGenerationManifest,
+) -> tuple[OptimizerShard, ...]:
+    topology = manifest.topology
+    expected_names = tuple(
+        optimizer_shard_name(rank, topology.world_size)
+        for rank in range(topology.world_size)
+    )
+    if topology.expected_shards != expected_names:
+        raise RuntimeError(
+            "Optimizer manifest expected-shard identity mismatch: "
+            f"expected={expected_names}, manifest={topology.expected_shards}"
+        )
+    ordered = tuple(sorted(manifest.shards, key=lambda shard: shard.rank))
+    actual_ranks = tuple(shard.rank for shard in ordered)
+    actual_names = tuple(shard.name for shard in ordered)
+    if (
+        actual_ranks != tuple(range(topology.world_size))
+        or actual_names != expected_names
+    ):
+        raise RuntimeError(
+            "Optimizer manifest shard coverage mismatch: "
+            f"expected_ranks={tuple(range(topology.world_size))}, "
+            f"actual_ranks={actual_ranks}, expected_names={expected_names}, "
+            f"actual_names={actual_names}"
+        )
+    return ordered
+
+
+def build_optimizer_manifest(
+    *,
+    generation: str,
+    step: int,
+    world_size: int,
+    shards: list[OptimizerShard],
+) -> OptimizerGenerationManifest:
+    manifest = OptimizerGenerationManifest(
+        generation=generation,
+        step=step,
+        topology=current_optimizer_topology(world_size),
+        shards=tuple(shards),
+    )
+    _ordered_manifest_shards(manifest)
+    return manifest
+
+
+def _validate_generation_files(
+    generation_path: Path,
+    manifest: OptimizerGenerationManifest,
+    *,
+    local_rank: int | None,
+) -> tuple[OptimizerShard, ...]:
+    ordered = _ordered_manifest_shards(manifest)
+    expected_entries = tuple(
+        sorted((OPTIMIZER_MANIFEST, *manifest.topology.expected_shards))
+    )
+    if not generation_path.is_dir():
+        raise RuntimeError(
+            f"Optimizer generation directory is missing: {generation_path}"
+        )
+    actual_entries = tuple(sorted(entry.name for entry in generation_path.iterdir()))
+    if actual_entries != expected_entries:
+        raise RuntimeError(
+            "Optimizer generation shard coverage mismatch: "
+            f"expected={expected_entries}, actual={actual_entries}"
+        )
+    for shard in ordered:
+        actual_size = (generation_path / shard.name).stat().st_size
+        if actual_size != shard.size_bytes:
+            raise RuntimeError(
+                f"Optimizer shard size mismatch for {shard.name}: "
+                f"expected={shard.size_bytes}, actual={actual_size}"
+            )
+    if local_rank is not None:
+        if local_rank < 0 or local_rank >= len(ordered):
+            raise RuntimeError(
+                f"Invalid local optimizer rank {local_rank} for {len(ordered)} shards"
+            )
+        local_shard = ordered[local_rank]
+        actual_sha256 = hash_optimizer_shard(generation_path / local_shard.name)
+        if actual_sha256 != local_shard.sha256:
+            raise RuntimeError(
+                f"Optimizer shard checksum mismatch for {local_shard.name}: "
+                f"expected={local_shard.sha256}, actual={actual_sha256}"
+            )
+    return ordered
+
+
+def _cleanup_old_generations(path: Path, committed: Path) -> None:
+    generations_path = path / OPTIMIZER_GENERATIONS_DIR
+    removed = False
+    for candidate in generations_path.iterdir():
+        generation = candidate.name.removeprefix(".pending-")
+        if candidate == committed or not candidate.is_dir():
+            continue
+        if _GENERATION_RE.fullmatch(generation) is not None:
+            shutil.rmtree(candidate)
+            removed = True
+    if removed:
+        _fsync_directory(generations_path)
+
+
+def commit_optimizer_generation(
+    optimizer_state_path: str, manifest: OptimizerGenerationManifest
+) -> Path:
+    path = Path(optimizer_state_path)
+    _read_pointer(path)
+    pending = optimizer_pending_generation_path(
+        optimizer_state_path, manifest.generation
+    )
+    committed = optimizer_generation_path(optimizer_state_path, manifest.generation)
+    _write_model_atomic(pending / OPTIMIZER_MANIFEST, manifest)
+    _validate_generation_files(pending, manifest, local_rank=None)
+    os.replace(pending, committed)
+    _fsync_directory(committed.parent)
+    _write_model_atomic(
+        path / OPTIMIZER_POINTER,
+        OptimizerGenerationPointer(
+            generation=manifest.generation,
+            step=manifest.step,
+        ),
+    )
+    _cleanup_old_generations(path, committed)
+    return committed
+
+
+def resolve_optimizer_shard(
+    optimizer_state_path: str, *, rank: int, world_size: int
+) -> Path | None:
+    path = Path(optimizer_state_path)
+    pointer = _read_pointer(path)
+    if pointer is None:
+        return None
+    generation_path = optimizer_generation_path(
+        optimizer_state_path, pointer.generation
+    )
+    manifest = _read_manifest(generation_path)
+    if (manifest.generation, manifest.step) != (pointer.generation, pointer.step):
+        raise RuntimeError(
+            "Optimizer pointer/manifest identity mismatch: "
+            f"pointer={pointer.model_dump()}, "
+            f"manifest_generation={manifest.generation!r}, manifest_step={manifest.step}"
+        )
+    current = current_optimizer_topology(world_size)
+    if manifest.topology != current:
+        raise RuntimeError(
+            "Optimizer checkpoint topology mismatch; optimizer state is topology-strict: "
+            f"saved={manifest.topology.model_dump()} current={current.model_dump()}"
+        )
+    ordered = _validate_generation_files(generation_path, manifest, local_rank=rank)
+    return generation_path / ordered[rank].name
 
 
 def _allow_unpaired_resume() -> bool:
@@ -137,7 +375,7 @@ def resolve_megatron_resume_step(
     optimizer_state_path: str,
 ) -> MegatronResumeStep:
     latest_lora_step = get_step_from_dir(output_dir)
-    optimizer_step = read_optimizer_step_marker(optimizer_state_path)
+    optimizer_step = read_committed_optimizer_step(optimizer_state_path)
     if latest_lora_step == 0:
         return MegatronResumeStep(
             step=0,
