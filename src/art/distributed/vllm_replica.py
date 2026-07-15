@@ -5,6 +5,7 @@ from collections.abc import Awaitable, Callable, Mapping
 import hashlib
 import inspect
 import json
+import os
 from pathlib import Path
 import socket
 from typing import Literal, Protocol, cast
@@ -14,7 +15,40 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from ..utils.lifecycle import ChildProcessSupervisor
 from ..vllm_runtime import ManagedVllmRuntime, VllmRuntimeLaunchConfig
-from .specs import EndpointSpec, ModelServiceMemberSpec, ModelServiceReplicaSpec
+from .specs import (
+    VLLM_KV_EVENT_BUFFER_STEPS,
+    VLLM_KV_EVENT_HWM,
+    VLLM_PREFIX_HASH_BLOCK_SIZE,
+    VLLM_PREFIX_HASH_SEED,
+    EndpointSpec,
+    ModelServiceMemberSpec,
+    ModelServiceReplicaSpec,
+    vllm_kv_event_topic,
+)
+
+_VLLM_HASH_ENV = {
+    "PYTHONHASHSEED": VLLM_PREFIX_HASH_SEED,
+    "VLLM_KV_EVENTS_USE_INT_BLOCK_HASHES": "0",
+}
+
+
+def _configure_vllm_hash_environment() -> None:
+    for name, expected in _VLLM_HASH_ENV.items():
+        configured = os.environ.get(name)
+        if configured not in (None, expected):
+            raise ValueError(f"{name}={configured!r} conflicts with {expected!r}")
+        os.environ[name] = expected
+
+
+def _prefix_hash_block_size(engine_args: Mapping[str, object]) -> int:
+    value = engine_args.get("hash_block_size")
+    if value is None:
+        value = engine_args.get("block_size")
+    if value is None:
+        return VLLM_PREFIX_HASH_BLOCK_SIZE
+    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+        raise ValueError("vLLM hash_block_size must be a positive integer")
+    return value
 
 
 class _Message(BaseModel):
@@ -119,6 +153,7 @@ class ManagedVllmHostLauncher:
         key = (request.replica_id, request.member.member_id, request.generation)
         if key in self._members:
             raise RuntimeError(f"vLLM member already exists: {key}")
+        _configure_vllm_hash_environment()
         managed = _ManagedMember(request)
         self._members[key] = managed
         output_dir = self._output_root / request.replica_id / str(request.generation)
@@ -210,9 +245,23 @@ class ReplicaManager:
             configured = template.engine_args.get(key)
             if configured not in (None, spec.model_revision):
                 raise ValueError(f"{key} conflicts with the replica model revision")
+        if "kv_events_config" in template.engine_args:
+            raise ValueError("kv_events_config is owned by the ART replica runtime")
+        hash_block_size = _prefix_hash_block_size(template.engine_args)
+        managed_args = {
+            "enable_prefix_caching": True,
+            "prefix_caching_hash_algo": "sha256",
+            "hash_block_size": hash_block_size,
+        }
+        for key, expected in managed_args.items():
+            configured = template.engine_args.get(key)
+            if configured not in (None, expected):
+                raise ValueError(f"{key} conflicts with ART prefix-cache routing")
+        _configure_vllm_hash_environment()
         self._spec = spec
         self._launchers = launchers
         self._template = template
+        self._hash_block_size = hash_block_size
         self._port_allocator = port_allocator or self._allocate_port
         self._monitor_interval_s = monitor_interval_s
         self._lock = asyncio.Lock()
@@ -236,6 +285,10 @@ class ReplicaManager:
     @property
     def state(self) -> ReplicaState:
         return self._state
+
+    @property
+    def prefix_hash_block_size(self) -> int:
+        return self._hash_block_size
 
     def expected_worker_identities(self) -> tuple[dict[str, int | str], ...]:
         if self._state.phase not in {"ready", "updating"}:
@@ -320,9 +373,13 @@ class ReplicaManager:
     async def restart(self) -> ReplicaState:
         await self.stop()
         generation = self._spec.generation + 1
+        kv_event_port = self._spec.kv_event_base_port
+        kv_replay_port = self._spec.kv_replay_base_port
         self._spec = self._spec.model_copy(
             update={
                 "generation": generation,
+                "kv_event_port": kv_event_port,
+                "kv_replay_port": kv_replay_port,
                 "leader_endpoint": EndpointSpec(
                     host=self._spec.leader_endpoint.host,
                     port=await self._fresh_port(self._spec.leader_endpoint.host),
@@ -480,10 +537,28 @@ class ReplicaManager:
         self, member: ModelServiceMemberSpec
     ) -> HostMemberLaunchRequest:
         parallel = self._spec.parallel
+        kv_events_config = {
+            "enable_kv_cache_events": True,
+            "publisher": "zmq",
+            "endpoint": f"tcp://*:{self._spec.kv_event_base_port}",
+            "replay_endpoint": f"tcp://*:{self._spec.kv_replay_base_port}",
+            "buffer_steps": VLLM_KV_EVENT_BUFFER_STEPS,
+            "hwm": VLLM_KV_EVENT_HWM,
+            "max_queue_size": VLLM_KV_EVENT_HWM,
+            "topic": vllm_kv_event_topic(
+                self._spec.replica_id,
+                self._state.generation,
+                self._state.generation_digest,
+            ),
+        }
         engine_args = {
             **self._template.engine_args,
             "revision": self._spec.model_revision,
             "tokenizer_revision": self._spec.model_revision,
+            "enable_prefix_caching": True,
+            "prefix_caching_hash_algo": "sha256",
+            "hash_block_size": self._hash_block_size,
+            "kv_events_config": kv_events_config,
             "tensor_parallel_size": parallel.tp,
             "pipeline_parallel_size": parallel.pp,
             "data_parallel_size": parallel.dp,

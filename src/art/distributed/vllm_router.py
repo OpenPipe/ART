@@ -3,13 +3,14 @@ from __future__ import annotations
 import asyncio
 from collections.abc import AsyncIterator, Callable, Iterable
 import hashlib
+import pickle
 import random
 import time
 from typing import Generic, Literal, TypeVar
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, StrictInt, model_validator
 
-from .specs import EndpointSpec
+from .specs import VLLM_KV_EVENT_SCHEMA_VERSION, VLLM_PREFIX_HASH_SEED, EndpointSpec
 from .vllm_replica import ReplicaUpdateReport
 
 
@@ -23,11 +24,35 @@ class PrefixBlockHashes(_RoutingModel):
     hashes: tuple[str, ...]
 
 
+class VllmPrefixHashConfig(_RoutingModel):
+    version: str = VLLM_KV_EVENT_SCHEMA_VERSION
+    block_size: int = Field(gt=0)
+    lora_name: str | None = Field(default=None, min_length=1)
+    policy_cache_key: str | None = Field(default=None, min_length=1)
+
+
 class RoutingInput(_RoutingModel):
     policy_version: str
     policy_digest: str = Field(min_length=1)
     stable_key: str | None = None
     prefix: PrefixBlockHashes | None = None
+    prompt_token_ids: tuple[StrictInt, ...] | None = Field(
+        default=None, max_length=1_000_000
+    )
+    cache_salt: str | None = None
+
+    @model_validator(mode="after")
+    def _validate_prefix_source(self) -> "RoutingInput":
+        if self.prefix is not None and self.prompt_token_ids is not None:
+            raise ValueError(
+                "prefix hashes and prompt token IDs are mutually exclusive"
+            )
+        if self.prompt_token_ids is not None and any(
+            isinstance(token_id, bool) or token_id < 0
+            for token_id in self.prompt_token_ids
+        ):
+            raise ValueError("prompt token IDs must be nonnegative integers")
+        return self
 
 
 class ReplicaTelemetry(_RoutingModel):
@@ -56,6 +81,7 @@ class RoutingTable(_RoutingModel):
     policy_digest: str = Field(min_length=1)
     update_identity: str = Field(min_length=1)
     replicas: tuple[RoutableReplica, ...]
+    prefix_hash: VllmPrefixHashConfig | None = None
 
     @model_validator(mode="after")
     def _validate_replicas(self) -> "RoutingTable":
@@ -73,15 +99,16 @@ class KvCacheEvent(_RoutingModel):
     sequence: int = Field(ge=0)
     version: str = Field(min_length=1)
     block_size: int | None = Field(default=None, gt=0)
-    operation: Literal["store", "remove", "reset"]
+    group_idx: int | None = Field(default=0, ge=0)
+    operation: Literal["store", "remove", "reset", "noop"]
     block_hashes: tuple[str, ...] = ()
 
     @model_validator(mode="after")
     def _validate_operation(self) -> "KvCacheEvent":
         if self.operation == "store" and self.block_size is None:
             raise ValueError("store events require block_size")
-        if self.operation == "reset" and self.block_hashes:
-            raise ValueError("reset events must not contain block hashes")
+        if self.operation in {"reset", "noop"} and self.block_hashes:
+            raise ValueError(f"{self.operation} events must not contain block hashes")
         return self
 
 
@@ -113,11 +140,61 @@ def canonical_block_hash(value: int | bytes) -> str:
     return f"i:{value:x}" if isinstance(value, int) else f"b:{value.hex()}"
 
 
+def _vllm_sha256(value: object) -> bytes:
+    return hashlib.sha256(pickle.dumps(value, protocol=5)).digest()
+
+
+def _effective_cache_salt(
+    config: VllmPrefixHashConfig, cache_salt: str | None
+) -> str | None:
+    if config.policy_cache_key is None:
+        return cache_salt
+    if cache_salt:
+        return f"{cache_salt}|art_policy={config.policy_cache_key}"
+    return f"art_policy_cache_salt={config.policy_cache_key}"
+
+
+def vllm_request_block_hashes(
+    prompt_token_ids: Iterable[int],
+    config: VllmPrefixHashConfig,
+    *,
+    cache_salt: str | None = None,
+) -> tuple[bytes, ...]:
+    """Compute vLLM 0.23 request hashes for complete logical blocks."""
+    token_ids = tuple(prompt_token_ids)
+    if any(isinstance(token_id, bool) or token_id < 0 for token_id in token_ids):
+        raise ValueError("prompt token IDs must be nonnegative integers")
+    parent = _vllm_sha256(VLLM_PREFIX_HASH_SEED)
+    salt = _effective_cache_salt(config, cache_salt)
+    hashes: list[bytes] = []
+    for start in range(0, len(token_ids) - config.block_size + 1, config.block_size):
+        extra = []
+        if config.lora_name is not None:
+            extra.append(config.lora_name)
+        if start == 0 and salt:
+            extra.append(salt)
+        parent = _vllm_sha256(
+            (
+                parent,
+                token_ids[start : start + config.block_size],
+                tuple(extra) or None,
+            )
+        )
+        hashes.append(parent)
+    return tuple(hashes)
+
+
 class _KvIndex:
     def __init__(self, generation: int) -> None:
         self.generation = generation
         self.next_sequence: int | None = None
-        self.blocks: dict[tuple[str, int], set[str]] = {}
+        self.blocks: dict[tuple[str, int, int], set[str]] = {}
+
+    def copy(self) -> "_KvIndex":
+        clone = _KvIndex(self.generation)
+        clone.next_sequence = self.next_sequence
+        clone.blocks = {key: set(blocks) for key, blocks in self.blocks.items()}
+        return clone
 
 
 T = TypeVar("T")
@@ -323,12 +400,14 @@ class ReplicaRouter:
                 reset = True
             elif event.operation == "store":
                 assert event.block_size is not None
+                assert event.group_idx is not None
                 index.blocks.setdefault(
-                    (event.version, event.block_size), set()
+                    (event.version, event.block_size, event.group_idx), set()
                 ).update(event.block_hashes)
-            else:
-                for blocks in index.blocks.values():
-                    blocks.difference_update(event.block_hashes)
+            elif event.operation == "remove":
+                for (_, _, group_idx), blocks in index.blocks.items():
+                    if event.group_idx is None or event.group_idx == group_idx:
+                        blocks.difference_update(event.block_hashes)
         index.next_sequence = first.sequence + 1
         return contiguous and not reset
 
@@ -336,6 +415,16 @@ class ReplicaRouter:
         for key in tuple(self._kv):
             if key[0] == replica_id:
                 self._kv.pop(key)
+
+    def inherit_kv(self, source: "ReplicaRouter") -> None:
+        generations = {
+            (replica.replica_id, replica.generation) for replica in self._table.replicas
+        }
+        self._kv = {
+            key: index.copy()
+            for key, index in source._kv.items()
+            if (key[0], index.generation) in generations
+        }
 
     def prepare(self, candidate: RoutingTable) -> PreparedRoutingTable:
         current = self._table
@@ -483,8 +572,9 @@ class ReplicaRouter:
     def _choose(
         self, replicas: list[RoutableReplica], request: RoutingInput
     ) -> RoutableReplica:
+        token_prefixes = self._token_prefixes(request)
         matches = {
-            replica.replica_id: self._prefix_match(replica, request)
+            replica.replica_id: self._prefix_match(replica, request, token_prefixes)
             for replica in replicas
         }
         best = max(matches.values(), default=0)
@@ -511,22 +601,61 @@ class ReplicaRouter:
             )
         return contenders[0] if loads[0] < loads[1] else contenders[1]
 
-    def _prefix_match(self, replica: RoutableReplica, request: RoutingInput) -> int:
+    def _token_prefixes(self, request: RoutingInput) -> dict[int, tuple[str, ...]]:
+        token_ids = request.prompt_token_ids
+        config = self._table.prefix_hash
+        if token_ids is None or config is None:
+            return {}
+        base_hashes = vllm_request_block_hashes(
+            token_ids, config, cache_salt=request.cache_salt
+        )
+        block_sizes = {
+            block_size
+            for index in self._kv.values()
+            for version, block_size, _group_idx in index.blocks
+            if version == config.version and block_size % config.block_size == 0
+        }
+        prefixes: dict[int, tuple[str, ...]] = {}
+        for block_size in block_sizes:
+            scale = block_size // config.block_size
+            prefixes[block_size] = tuple(
+                canonical_block_hash(b"".join(base_hashes[start : start + scale]))
+                for start in range(0, len(base_hashes) - scale + 1, scale)
+            )
+        return prefixes
+
+    def _prefix_match(
+        self,
+        replica: RoutableReplica,
+        request: RoutingInput,
+        token_prefixes: dict[int, tuple[str, ...]],
+    ) -> int:
         prefix = request.prefix
-        if prefix is None:
+        if prefix is None and request.prompt_token_ids is None:
             return 0
         matches = []
         for publisher_rank in range(replica.kv_event_publishers):
             index = self._kv.get((replica.replica_id, publisher_rank))
             if index is None or index.generation != replica.generation:
                 return 0
-            blocks = index.blocks.get((prefix.version, prefix.block_size))
-            if blocks is None:
+            group_matches = []
+            for (version, block_size, _group_idx), blocks in index.blocks.items():
+                if prefix is not None:
+                    if (version, block_size) != (prefix.version, prefix.block_size):
+                        continue
+                    hashes = prefix.hashes
+                else:
+                    config = self._table.prefix_hash
+                    if config is None or version != config.version:
+                        continue
+                    hashes = token_prefixes.get(block_size, ())
+                matched = 0
+                for block_hash in hashes:
+                    if block_hash not in blocks:
+                        break
+                    matched += block_size
+                group_matches.append(matched)
+            if not group_matches:
                 return 0
-            matched = 0
-            for block_hash in prefix.hashes:
-                if block_hash not in blocks:
-                    break
-                matched += 1
-            matches.append(matched)
+            matches.append(min(group_matches))
         return min(matches)

@@ -9,8 +9,9 @@ import socket
 from typing import Any
 
 from aiohttp import ClientError, ClientSession, ClientTimeout, TCPConnector, web
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, StrictInt
 
+from .vllm_kv_events import KvEventSource, VllmKvEventSubscriber
 from .vllm_replica import ReplicaUpdateReport
 from .vllm_router import (
     KvCacheEvent,
@@ -44,6 +45,9 @@ class _RoutingHints(BaseModel):
 
     stable_key: str | None = Field(default=None, min_length=1)
     prefix: PrefixBlockHashes | None = None
+    prompt_token_ids: tuple[StrictInt, ...] | None = Field(
+        default=None, max_length=1_000_000
+    )
 
 
 _ROUTED_PATHS = {
@@ -65,6 +69,7 @@ class VllmGateway:
         inbound_api_key: str | None = None,
         max_queued: int = 128,
         route_timeout_s: float = 1200.0,
+        kv_event_sources: Iterable[KvEventSource] = (),
     ) -> None:
         if inbound_api_key is not None and not inbound_api_key.strip():
             raise ValueError("inbound_api_key cannot be empty")
@@ -90,6 +95,10 @@ class VllmGateway:
         ):
             raise ValueError("configured Authorization header has no credentials")
         self._route_timeout_s = route_timeout_s
+        self._kv_subscribers = tuple(
+            VllmKvEventSubscriber(source, self.apply_kv_events, self.invalidate_kv)
+            for source in kv_event_sources
+        )
         self._runner: web.AppRunner | None = None
         self._socket: socket.socket | None = None
         self._session: ClientSession | None = None
@@ -124,6 +133,12 @@ class VllmGateway:
             auto_decompress=False,
         )
         self._telemetry_task = asyncio.create_task(self._refresh_telemetry())
+        try:
+            for subscriber in self._kv_subscribers:
+                subscriber.start()
+        except BaseException:
+            await self.close()
+            raise
         return int(sock.getsockname()[1])
 
     @web.middleware
@@ -152,7 +167,9 @@ class VllmGateway:
 
     def add_policy(self, table: RoutingTable) -> None:
         version = table.policy_version
-        self._policies[version] = ReplicaRouter(table, max_queued=self._max_queued)
+        router = ReplicaRouter(table, max_queued=self._max_queued)
+        router.inherit_kv(self.router)
+        self._policies[version] = router
         self._pinned_policies.add(version)
 
     def remove_policy(self, version: str) -> None:
@@ -197,7 +214,7 @@ class VllmGateway:
                 raise RoutingUnavailableError(
                     f"policy version {version!r} is not loaded"
                 )
-            routing = _routing_input(payload, router.table)
+            routing = _routing_input(payload, router.table, path)
             if "art_routing" in payload:
                 payload.pop("art_routing")
                 body = json.dumps(payload, separators=(",", ":")).encode()
@@ -330,6 +347,9 @@ class VllmGateway:
             await asyncio.sleep(1.0)
 
     async def close(self) -> None:
+        await asyncio.gather(
+            *(subscriber.close() for subscriber in self._kv_subscribers)
+        )
         task, self._telemetry_task = self._telemetry_task, None
         if task is not None:
             task.cancel()
@@ -345,15 +365,50 @@ class VllmGateway:
             self._socket = None
 
 
-def _routing_input(payload: dict[str, Any], table: RoutingTable) -> RoutingInput:
+def _routing_input(
+    payload: dict[str, Any], table: RoutingTable, path: str
+) -> RoutingInput:
     policy_version = _policy_version(payload)
     hints = _RoutingHints.model_validate(payload.get("art_routing", {}))
+    prompt_token_ids = hints.prompt_token_ids
+    if prompt_token_ids is None and hints.prefix is None and path == "/v1/completions":
+        prompt = payload.get("prompt")
+        if isinstance(prompt, list) and all(
+            isinstance(token_id, int) and not isinstance(token_id, bool)
+            for token_id in prompt
+        ):
+            prompt_token_ids = tuple(prompt)
+    if prompt_token_ids is not None and _has_multimodal_input(payload):
+        raise ValueError(
+            "prompt token routing cannot represent multimodal cache hash keys"
+        )
+    cache_salt = payload.get("cache_salt")
+    if cache_salt is not None and not isinstance(cache_salt, str):
+        raise ValueError("cache_salt must be a string")
     return RoutingInput(
         policy_version=policy_version,
         policy_digest=table.policy_digest,
         stable_key=hints.stable_key,
         prefix=hints.prefix,
+        prompt_token_ids=prompt_token_ids,
+        cache_salt=cache_salt,
     )
+
+
+def _has_multimodal_input(payload: dict[str, Any]) -> bool:
+    if payload.get("prompt_embeds") is not None:
+        return True
+    messages = payload.get("messages")
+    if not isinstance(messages, list):
+        return False
+    for message in messages:
+        content = message.get("content") if isinstance(message, dict) else None
+        if isinstance(content, list) and any(
+            not isinstance(part, dict) or part.get("type") not in {"text", "input_text"}
+            for part in content
+        ):
+            return True
+    return False
 
 
 def _policy_version(payload: dict[str, Any]) -> str:

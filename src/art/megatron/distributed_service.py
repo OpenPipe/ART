@@ -15,6 +15,7 @@ import httpx
 from art import dev, types
 from art.dev.get_model_config import default_target_modules
 from art.distributed.art_runtime import ArtRuntime, DistributedPackedBatch
+from art.distributed.specs import vllm_kv_event_topic
 from art.distributed.vllm_replica import (
     ReplicaLaunchTemplate,
     ReplicaUpdateReport,
@@ -23,6 +24,7 @@ from art.distributed.vllm_router import (
     ReplicaTelemetry,
     RoutableReplica,
     RoutingTable,
+    VllmPrefixHashConfig,
 )
 from art.serving_capabilities import (
     ServingCapabilities,
@@ -485,11 +487,13 @@ class DistributedMegatronService:
                         policy_version=self._latest_step,
                         policy_digest=digest,
                         update_identity=update_identity,
+                        lora_name=template.served_model_name,
                         replica_ids=replica_ids,
                     ),
                     upstream_headers=_headers(api_key),
                     max_queued=self.runtime.config.gateway_max_queued,
                     route_timeout_s=self.runtime.config.gateway_route_timeout_s,
+                    kv_event_sources=self._kv_event_sources(service, replica_ids),
                 )
                 port = await gateway.start(self.runtime.config.gateway_bind_host)
                 gateway_endpoint = (self._gateway_advertise_host(), port)
@@ -558,6 +562,7 @@ class DistributedMegatronService:
         policy_version: int,
         policy_digest: str,
         update_identity: str,
+        lora_name: str,
         replica_ids: tuple[str, ...] | None = None,
         policy_generation: int | None = None,
     ) -> RoutingTable:
@@ -590,8 +595,21 @@ class DistributedMegatronService:
                             or 256
                         ),
                     ),
+                    kv_event_publishers=spec.parallel.dp,
                 )
             )
+        target_replica_ids = self._replica_ids if replica_ids is None else replica_ids
+        hash_block_sizes = {
+            self.runtime.replica(replica_id).prefix_hash_block_size
+            for replica_id in target_replica_ids
+        }
+        if len(hash_block_sizes) != 1:
+            raise RuntimeError("vLLM replicas use inconsistent hash block sizes")
+        policy_cache_key = (
+            f"{lora_name}:{policy_version}"
+            if lora_name == f"{self.model_name}:active"
+            else None
+        )
         return RoutingTable(
             policy_generation=(
                 self._policy_generation
@@ -602,7 +620,47 @@ class DistributedMegatronService:
             policy_digest=policy_digest,
             update_identity=update_identity,
             replicas=tuple(replicas),
+            prefix_hash=VllmPrefixHashConfig(
+                block_size=hash_block_sizes.pop(),
+                lora_name=lora_name,
+                policy_cache_key=policy_cache_key,
+            ),
         )
+
+    def _kv_event_sources(
+        self, service: Any, replica_ids: tuple[str, ...]
+    ) -> tuple[Any, ...]:
+        from art.distributed.vllm_kv_events import KvEventSource
+
+        hosts = {
+            host.host_id: _worker_hostname(host.worker_address)
+            for host in self.runtime.topology.cluster.hosts
+        }
+        sources = []
+        specs = {replica.replica_id: replica for replica in service.replicas}
+        for replica_id in replica_ids:
+            spec = specs[replica_id]
+            state = self.runtime.replica(replica_id).state
+            topic = vllm_kv_event_topic(
+                replica_id, state.generation, state.generation_digest
+            )
+            for publisher_rank in range(spec.parallel.dp):
+                host = hosts[spec.kv_event_member(publisher_rank).host_id]
+                sources.append(
+                    KvEventSource(
+                        replica_id=replica_id,
+                        generation=state.generation,
+                        publisher_rank=publisher_rank,
+                        endpoint=_zmq_endpoint(
+                            host, spec.kv_event_base_port + publisher_rank
+                        ),
+                        replay_endpoint=_zmq_endpoint(
+                            host, spec.kv_replay_base_port + publisher_rank
+                        ),
+                        topic=topic,
+                    )
+                )
+        return tuple(sources)
 
     def _gateway_advertise_host(self) -> str:
         if host := self.runtime.config.gateway_advertise_host:
@@ -819,6 +877,7 @@ class DistributedMegatronService:
                         policy_version=step,
                         policy_digest=digest,
                         update_identity=update_identity,
+                        lora_name=lora_name,
                         policy_generation=policy_generation,
                     ),
                     tuple(reports),
@@ -843,6 +902,11 @@ class DistributedMegatronService:
     async def acquire_exact_adapter(self, step: int, checkpoint: str) -> str:
         async with self._mutation_lock:
             self._require_open()
+            lora_name = (
+                f"{self.model_name}:eval@{step}"
+                if self.rollout_weight_update_mode == "in_flight_lora"
+                else f"{self.model_name}@{step}"
+            )
             if step not in self._loaded_exact_adapter_steps:
                 if (
                     self.rollout_weight_update_mode == "in_flight_lora"
@@ -871,6 +935,7 @@ class DistributedMegatronService:
                             policy_version=step,
                             policy_digest=digest,
                             update_identity=f"exact:{step}:{digest}",
+                            lora_name=lora_name,
                         )
                     )
             self._exact_adapter_refcounts[step] += 1
@@ -1022,6 +1087,19 @@ def _checkpoint_digest(path: str) -> str:
 
 def _headers(api_key: str | None) -> dict[str, str] | None:
     return {"Authorization": f"Bearer {api_key}"} if api_key else None
+
+
+def _worker_hostname(worker_address: str) -> str:
+    from urllib.parse import urlparse
+
+    parsed = urlparse(worker_address)
+    if parsed.scheme != "tcp" or parsed.hostname is None:
+        raise ValueError("model-service worker addresses must use routable tcp:// URLs")
+    return parsed.hostname
+
+
+def _zmq_endpoint(host: str, port: int) -> str:
+    return f"tcp://[{host}]:{port}" if ":" in host else f"tcp://{host}:{port}"
 
 
 def _host_port(base_url: str) -> tuple[str, int]:
