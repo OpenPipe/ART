@@ -47,7 +47,6 @@ conflicts = [[
 [manifest]
 overrides = [
     { name = "click", specifier = "==8.2.0" },
-    { name = "flashinfer-python", specifier = "==0.6.8.post1" },
     { name = "megatron-core", specifier = "==0.17.0" },
     { name = "numpy", specifier = "<2" },
     { name = "nvidia-resiliency-ext", specifier = "<0.5" },
@@ -4808,6 +4807,8 @@ megatron = [
     { name = "apex" },
     { name = "deep-ep", marker = "sys_platform == 'linux'" },
     { name = "flash-attn-4" },
+    { name = "flashinfer-cubin" },
+    { name = "flashinfer-python" },
     { name = "megatron-bridge" },
     { name = "megatron-core" },
     { name = "ml-dtypes", marker = "python_full_version < '3.13'" },
@@ -4880,6 +4881,8 @@ requires-dist = [
     { name = "duckdb", marker = "extra == 'backend'", specifier = ">=1.0.0" },
     { name = "fastapi", marker = "extra == 'tinker'", specifier = ">=0.128.0" },
     { name = "flash-attn-4", marker = "extra == 'megatron'", url = "https://files.pythonhosted.org/packages/24/f7/01ee2576ce41f9884d291ee21861ef194afc0b2b1ce3bd175fc7a6e1b133/flash_attn_4-4.0.0b5-py3-none-any.whl" },
+    { name = "flashinfer-cubin", marker = "extra == 'megatron'", specifier = "==0.6.8.post1" },
+    { name = "flashinfer-python", marker = "extra == 'megatron'", specifier = "==0.6.8.post1" },
     { name = "gql", marker = "extra == 'backend'", specifier = ">=4.0.0" },
     { name = "hf-xet", marker = "extra == 'backend'", specifier = ">=1.1.0" },
     { name = "huggingface-hub", marker = "extra == 'tinker'" },
