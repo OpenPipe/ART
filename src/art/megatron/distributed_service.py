@@ -237,7 +237,7 @@ class DistributedMegatronService:
             expected_learner_version=self._latest_step,
             learner_version=next_step,
             batch=batch.leases.ref,
-            config=CurrentTrainConfig.model_validate(config),
+            config=CurrentTrainConfig.model_validate(config.model_dump()),
             experimental_config=ExperimentalTrainConfig.model_validate(values),
             output=DurableTrainOutput(
                 adapter_path=staging,

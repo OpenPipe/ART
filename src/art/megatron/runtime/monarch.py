@@ -416,5 +416,9 @@ class MonarchTrainerRun:
         async with self._lock:
             try:
                 await self._actors.close.call()
+            except asyncio.CancelledError:
+                task = asyncio.current_task()
+                if task is not None and task.cancelling():
+                    raise
             finally:
                 await self._proc_mesh.stop()
