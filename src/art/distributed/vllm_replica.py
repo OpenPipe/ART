@@ -380,6 +380,7 @@ class ReplicaManager:
             self._state = self._state.model_copy(
                 update={"phase": "stopped", "members": ()}
             )
+            self._hash_block_size = None
             return self._state
 
     async def restart(self) -> ReplicaState:

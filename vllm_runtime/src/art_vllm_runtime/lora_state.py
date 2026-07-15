@@ -2,13 +2,14 @@
 
 from __future__ import annotations
 
-import asyncio
 from collections import defaultdict
 import os
 import socket
 from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
+
+from art_vllm_runtime.engine_core import query_engine_cores
 
 ART_LORA_WORKER_EXTENSION = "art_vllm_runtime.lora_state.ArtLoraStateWorkerExtension"
 ART_LORA_WORKER_RPC = "art_lora_worker_state"
@@ -248,30 +249,19 @@ async def _collect_worker_replies(engine_client: Any) -> tuple[list[Any], int]:
     data_parallel_size = int(parallel.data_parallel_size)
     if data_parallel_size == 1:
         replies = await engine_client.collective_rpc(
-            ART_LORA_WORKER_RPC,
-            timeout=ART_LORA_WORKER_RPC_TIMEOUT_S,
+            ART_LORA_WORKER_RPC, timeout=ART_LORA_WORKER_RPC_TIMEOUT_S
         )
         if type(replies) is not list:
             raise RuntimeError("vLLM collective_rpc returned a non-list reply")
         return replies, data_parallel_size
 
-    core = engine_client.engine_core
-    engines = getattr(core, "core_engines", ())
-    call_utility = getattr(core, "_call_utility_async", None)
-    if len(engines) != data_parallel_size or not callable(call_utility):
-        raise RuntimeError("vLLM client does not expose every DP engine core")
-    groups = await asyncio.gather(
-        *(
-            call_utility(
-                "collective_rpc",
-                ART_LORA_WORKER_RPC,
-                ART_LORA_WORKER_RPC_TIMEOUT_S,
-                (),
-                None,
-                engine=engine,
-            )
-            for engine in engines
-        )
+    groups = await query_engine_cores(
+        engine_client,
+        "collective_rpc",
+        ART_LORA_WORKER_RPC,
+        ART_LORA_WORKER_RPC_TIMEOUT_S,
+        (),
+        None,
     )
     if any(type(group) is not list for group in groups):
         raise RuntimeError("vLLM DP collective_rpc returned a non-list reply")

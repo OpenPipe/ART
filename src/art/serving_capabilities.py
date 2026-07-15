@@ -1,7 +1,9 @@
 from typing import Literal
 
 import httpx
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
+
+ART_SERVING_PROTOCOL_VERSION = 2
 
 ServingFeature = Literal[
     "binary_routed_experts",
@@ -25,6 +27,15 @@ class ServingCapabilities(BaseModel):
     policy_token_spans: bool = False
     exact_lora_worker_state: bool = False
     prefix_hash_block_size: int | None = Field(default=None, gt=0)
+
+    @model_validator(mode="after")
+    def _validate_protocol(self) -> "ServingCapabilities":
+        expected = ART_SERVING_PROTOCOL_VERSION if self.runtime == "art_vllm" else 0
+        if self.protocol_version != expected:
+            raise ValueError(
+                f"{self.runtime} serving protocol must be version {expected}"
+            )
+        return self
 
     @classmethod
     def openai_compatible(cls) -> "ServingCapabilities":

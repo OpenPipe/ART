@@ -12,6 +12,7 @@ from pydantic import BaseModel, Field
 
 from art_vllm_runtime.patches import apply_vllm_runtime_patches
 
+ART_SERVING_PROTOCOL_VERSION = 2
 _runtime_state: dict[str, object] = {}
 
 
@@ -162,28 +163,28 @@ def _patch_art_runtime_routes() -> None:
 
         @router.get("/art/capabilities")
         async def art_capabilities(raw_request: Request) -> JSONResponse:
-            hash_block_size = await engine(raw_request).engine_core.call_utility_async(
-                "art_kv_cache_hash_block_size"
+            from art_vllm_runtime.engine_core import query_engine_cores
+
+            hash_block_sizes = await query_engine_cores(
+                engine(raw_request), "art_kv_cache_hash_block_size"
             )
-            if (
-                isinstance(hash_block_size, bool)
-                or not isinstance(hash_block_size, int)
-                or hash_block_size <= 0
-            ):
+            if any(type(value) is not int or value <= 0 for value in hash_block_sizes):
                 raise RuntimeError(
                     "vLLM returned an invalid effective KV hash block size"
                 )
+            if len(set(hash_block_sizes)) != 1:
+                raise RuntimeError("vLLM DP engines use different KV hash block sizes")
             return JSONResponse(
                 content={
                     "runtime": "art_vllm",
-                    "protocol_version": 1,
+                    "protocol_version": ART_SERVING_PROTOCOL_VERSION,
                     "binary_routed_experts": True,
                     "fast_metrics": True,
                     "inplace_lora_load": True,
                     "in_flight_lora_updates": True,
                     "policy_token_spans": True,
                     "exact_lora_worker_state": True,
-                    "prefix_hash_block_size": hash_block_size,
+                    "prefix_hash_block_size": hash_block_sizes[0],
                 }
             )
 
@@ -409,7 +410,7 @@ def main(argv: list[str] | None = None) -> None:
 
     _runtime_state.update(
         runtime="art_vllm",
-        protocol_version=1,
+        protocol_version=ART_SERVING_PROTOCOL_VERSION,
         process_uuid=process_uuid,
         generation=args.replica_generation,
         node_rank=args.node_rank,
