@@ -1671,18 +1671,23 @@ class LocalBackend:
         service: ModelService,
         config: TrainConfig,
     ) -> int:
-        if config.grad_accumulation_sequences is not None:
-            return max(1, int(config.grad_accumulation_sequences))
-
-        service_key = id(service)
-        if service_key in self._grad_accumulation_sequences_by_service:
-            return self._grad_accumulation_sequences_by_service[service_key]
-
         resolver = getattr(
             cast(Any, service),
             "resolve_global_grad_accumulation_sequences",
             None,
         )
+        if config.grad_accumulation_sequences is not None:
+            if not callable(resolver):
+                raise ValueError(
+                    "grad_accumulation_sequences requires a training service that "
+                    "can resolve global accumulation semantics"
+                )
+            return max(1, int(await resolver(config)))
+
+        service_key = id(service)
+        if service_key in self._grad_accumulation_sequences_by_service:
+            return self._grad_accumulation_sequences_by_service[service_key]
+
         if callable(resolver):
             resolved = max(1, int(await resolver(config)))
         else:
