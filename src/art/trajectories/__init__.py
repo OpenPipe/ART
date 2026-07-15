@@ -12,7 +12,7 @@ from contextlib import asynccontextmanager
 from datetime import datetime
 import time
 from types import TracebackType
-from typing import Annotated, Any, Literal, overload
+from typing import Annotated, Any, Literal, TypeAlias, overload
 
 from anthropic.types import (
     Message as AnthropicMessage,
@@ -197,6 +197,85 @@ class History(pydantic.BaseModel):
     def messages(self) -> Messages:
         return get_messages(self.messages_and_choices)
 
+    def as_chat_completions_history(self) -> ChatCompletionsHistory:
+        from ._history import legacy_as_chat_completions_history
+
+        return legacy_as_chat_completions_history(self)
+
+
+class ChatCompletionsHistory(pydantic.BaseModel):
+    model: str | None
+    messages: Messages
+    tools: Tools | None = None
+    chat_template: str | None = None
+    chat_template_kwargs: dict[str, Any] | None = None
+
+    def as_chat_completions_history(self) -> ChatCompletionsHistory:
+        return self
+
+
+class AnthropicMessagesHistory(pydantic.BaseModel):
+    model: str
+    system: Annotated[
+        pydantic.SerializeAsAny[str | list[AnthropicTextBlockParam] | None],
+        pydantic.SkipValidation,
+    ] = None
+    messages: Annotated[
+        pydantic.SerializeAsAny[list[AnthropicMessageParam]], pydantic.SkipValidation
+    ]
+    tools: Annotated[
+        pydantic.SerializeAsAny[list[AnthropicToolParam] | None],
+        pydantic.SkipValidation,
+    ] = None
+    thinking: Annotated[
+        pydantic.SerializeAsAny[AnthropicThinkingConfigParam | None],
+        pydantic.SkipValidation,
+    ] = None
+    chat_template: str | None = None
+    chat_template_kwargs: dict[str, Any] | None = None
+
+    def as_chat_completions_history(self) -> ChatCompletionsHistory:
+        from ._history import anthropic_as_chat_completions_history
+
+        return anthropic_as_chat_completions_history(self)
+
+
+class ResponsesHistory(pydantic.BaseModel):
+    model: str
+    input: Annotated[
+        pydantic.SerializeAsAny[ResponseInputParam], pydantic.SkipValidation
+    ]
+    instructions: str | None = None
+    tools: Annotated[
+        pydantic.SerializeAsAny[list[ResponsesToolParam] | None],
+        pydantic.SkipValidation,
+    ] = None
+    chat_template: str | None = None
+    chat_template_kwargs: dict[str, Any] | None = None
+
+    def as_chat_completions_history(self) -> ChatCompletionsHistory:
+        from ._history import responses_as_chat_completions_history
+
+        return responses_as_chat_completions_history(self)
+
+
+class CompletionsHistory(pydantic.BaseModel):
+    model: str
+    token_ids: list[int]
+    sampled_spans: list[tuple[int, int]]
+
+    def as_chat_completions_history(self) -> ChatCompletionsHistory:
+        raise ValueError("Raw Completions history has no chat-message structure")
+
+
+TrajectoryHistory: TypeAlias = (
+    History
+    | ChatCompletionsHistory
+    | AnthropicMessagesHistory
+    | ResponsesHistory
+    | CompletionsHistory
+)
+
 
 class Trajectory(_CompactModel):
     exchanges: TrajectoryExchanges = pydantic.Field(default_factory=TrajectoryExchanges)
@@ -262,8 +341,37 @@ class Trajectory(_CompactModel):
     def __str__(self) -> str:
         return f"Trajectory(reward={self.reward}, metrics={self.metrics}, metadata={self.metadata})"
 
+    def chat_completions_history(
+        self, *, model: str | None = None
+    ) -> ChatCompletionsHistory:
+        from ._history import chat_completions_history
+
+        return chat_completions_history(self, model=model)
+
+    def anthropic_messages_history(
+        self, *, model: str | None = None
+    ) -> AnthropicMessagesHistory:
+        from ._history import anthropic_messages_history
+
+        return anthropic_messages_history(self, model=model)
+
+    def responses_history(self, *, model: str | None = None) -> ResponsesHistory:
+        from ._history import responses_history
+
+        return responses_history(self, model=model)
+
+    def completions_history(self, *, model: str | None = None) -> CompletionsHistory:
+        from ._history import completions_history
+
+        return completions_history(self, model=model)
+
+    def history(self, *, model: str | None = None) -> TrajectoryHistory:
+        from ._history import trajectory_history
+
+        return trajectory_history(self, model=model)
+
     def messages(self) -> Messages:
-        return get_messages(self.messages_and_choices)
+        return self.history().as_chat_completions_history().messages
 
     def for_logging(self) -> dict[str, object]:
         from ._compat import trajectory_for_logging
@@ -559,6 +667,11 @@ __all__ = [
     "TrajectoryExchanges",
     "PydanticException",
     "History",
+    "ChatCompletionsHistory",
+    "AnthropicMessagesHistory",
+    "ResponsesHistory",
+    "CompletionsHistory",
+    "TrajectoryHistory",
     "Trajectory",
     "TrajectoryGroup",
     "TokenizedTrajectory",

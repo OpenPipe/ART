@@ -70,15 +70,21 @@ from .megatron.runtime_config import (
 from .model import Model, TrainableModel
 from .serverless import ServerlessBackend
 from .trajectories import (
+    AnthropicMessagesHistory,
     ChatCompletionsExchange,
+    ChatCompletionsHistory,
     CompletionsExchange,
+    CompletionsHistory,
+    History,
     MessagesExchange,
     ResponsesExchange,
+    ResponsesHistory,
     TokenizedTrajectory,
     TokenizedTrajectoryGroup,
     Trajectory,
     TrajectoryExchanges,
     TrajectoryGroup,
+    TrajectoryHistory,
     auto_trajectory,  # ty: ignore[deprecated]
     capture_auto_trajectory,  # ty: ignore[deprecated]
     current_trajectory,
@@ -135,10 +141,16 @@ __all__ = [
     "Trajectory",
     "TrajectoryExchanges",
     "TrajectoryGroup",
+    "History",
+    "TrajectoryHistory",
     "ChatCompletionsExchange",
+    "ChatCompletionsHistory",
     "CompletionsExchange",
+    "CompletionsHistory",
     "ResponsesExchange",
+    "ResponsesHistory",
     "MessagesExchange",
+    "AnthropicMessagesHistory",
     "TokenizedTrajectory",
     "TokenizedTrajectoryGroup",
     "trajectory",
