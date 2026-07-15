@@ -407,6 +407,22 @@ class SharedMemoryPackedBatchStore:
             if committed == (batch_id, lease_id):
                 self._committed_reservations.pop(reservation_id)
 
+    def drop(self, ref: PackedBatchRef) -> None:
+        """Idempotently release one lease and unlink storage after the last lease."""
+
+        batch_id = self._lease_to_batch.get(ref.lease_id)
+        if batch_id is not None and batch_id != ref.batch_id:
+            raise PackedBatchLeaseError("packed-batch lease identifies another batch")
+        entry = self._entries.get(ref.batch_id)
+        if entry is None:
+            if batch_id is not None:
+                raise PackedBatchLeaseError("packed-batch lease has no storage")
+            return
+        if batch_id is not None:
+            self.release(ref.lease_id)
+        if not entry.leases:
+            self.unlink(ref.batch_id)
+
     def map(self, ref: PackedBatchRef) -> "MappedPackedBatch":
         if self._lease_to_batch.get(ref.lease_id) != ref.batch_id:
             raise PackedBatchLeaseError("packed-batch reference has no active lease")
@@ -583,11 +599,8 @@ class PackedBatchInbox:
     async def abort(self, reservation_id: str) -> None:
         self.store.abort(reservation_id)
 
-    async def release(self, lease_id: str) -> None:
-        self.store.release(lease_id)
-
-    async def unlink(self, batch_id: str) -> None:
-        self.store.unlink(batch_id)
+    async def drop(self, ref: PackedBatchRef) -> None:
+        self.store.drop(ref)
 
 
 class PackedBatchInboxEndpoint(Protocol):
@@ -599,9 +612,7 @@ class PackedBatchInboxEndpoint(Protocol):
 
     async def abort(self, reservation_id: str) -> None: ...
 
-    async def release(self, lease_id: str) -> None: ...
-
-    async def unlink(self, batch_id: str) -> None: ...
+    async def drop(self, ref: PackedBatchRef) -> None: ...
 
 
 class PackedBatchTransport(Protocol):
@@ -731,8 +742,7 @@ async def _release_transferred(
     for result in results:
         if not isinstance(result, BaseException):
             host_id, destination_ref = result
-            await inboxes[host_id].release(destination_ref.lease_id)
-            await inboxes[host_id].unlink(destination_ref.batch_id)
+            await inboxes[host_id].drop(destination_ref)
 
 
 def _flatten_packed_tensors(

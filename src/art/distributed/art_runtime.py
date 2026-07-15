@@ -188,8 +188,7 @@ class ArtRuntime:
     async def _release_refs(self, refs: Mapping[str, Any]) -> None:
         async def release(host_id: str, ref: Any) -> None:
             inbox = MonarchPackedBatchInbox(self._host_actors[host_id])
-            await inbox.release(ref.lease_id)
-            await inbox.unlink(ref.batch_id)
+            await inbox.drop(ref)
 
         results = await asyncio.gather(
             *(release(host_id, ref) for host_id, ref in refs.items()),

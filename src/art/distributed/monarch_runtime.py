@@ -123,11 +123,8 @@ class MonarchPackedBatchInbox:
     async def abort(self, reservation_id: str) -> None:
         await call_remote(self.actor.abort_batch, reservation_id)
 
-    async def release(self, lease_id: str) -> None:
-        await call_remote(self.actor.release_batch, lease_id)
-
-    async def unlink(self, batch_id: str) -> None:
-        await call_remote(self.actor.unlink_batch, batch_id)
+    async def drop(self, ref: PackedBatchRef) -> None:
+        await call_remote(self.actor.drop_batch_ref, ref)
 
 
 class MonarchPackedBatchSource:

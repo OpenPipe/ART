@@ -258,12 +258,8 @@ class RolloutHostService(Actor):
         await self.inbox.abort(reservation_id)
 
     @resilient_endpoint
-    async def release_batch(self, lease_id: str) -> None:
-        await self.inbox.release(lease_id)
-
-    @resilient_endpoint
-    async def unlink_batch(self, batch_id: str) -> None:
-        await self.inbox.unlink(batch_id)
+    async def drop_batch_ref(self, ref: PackedBatchRef) -> None:
+        await self.inbox.drop(ref)
 
     @resilient_endpoint
     async def stats(self):
