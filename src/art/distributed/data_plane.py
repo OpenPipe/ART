@@ -3,7 +3,8 @@ from __future__ import annotations
 import asyncio
 from collections.abc import Mapping
 import gc
-from multiprocessing import shared_memory
+from multiprocessing import resource_tracker, shared_memory
+import os
 import secrets
 from typing import Any, Protocol, cast
 
@@ -65,6 +66,7 @@ class PackedBatchRef(_Contract):
     lease_id: str = Field(min_length=1)
     format: str = PACKED_BATCH_FORMAT
     shared_memory_name: str = Field(min_length=1)
+    owner_process_id: int = Field(ge=1)
     tensors: tuple[TensorSpec, ...]
     num_sequences: int = Field(ge=1)
     sequence_length: int = Field(ge=1)
@@ -251,6 +253,7 @@ class SharedMemoryPackedBatchStore:
                 owner_actor_id=self.owner_actor_id,
                 lease_id=lease_id,
                 shared_memory_name=shm.name,
+                owner_process_id=os.getpid(),
                 tensors=manifest,
                 num_sequences=metadata["num_sequences"],
                 sequence_length=metadata["sequence_length"],
@@ -321,6 +324,7 @@ class SharedMemoryPackedBatchStore:
                     "owner_actor_id": self.owner_actor_id,
                     "lease_id": lease_id,
                     "shared_memory_name": shm.name,
+                    "owner_process_id": os.getpid(),
                 }
             )
             entry = _Entry(shm, ref)
@@ -438,6 +442,8 @@ class SharedMemoryPackedBatchStore:
 
 
 class MappedPackedBatch(BaseModel):
+    """Zero-copy consumer view; callers must not mutate its immutable tensors."""
+
     model_config = ConfigDict(arbitrary_types_allowed=True)
 
     ref: PackedBatchRef
@@ -448,6 +454,10 @@ class MappedPackedBatch(BaseModel):
     @classmethod
     def open(cls, ref: PackedBatchRef) -> "MappedPackedBatch":
         shm = shared_memory.SharedMemory(name=ref.shared_memory_name)
+        if ref.owner_process_id != os.getpid():
+            # Python 3.12 has no public `track=False`. The segment belongs to the
+            # host inbox, so an unrelated consumer's tracker must not unlink it.
+            resource_tracker.unregister(cast(Any, shm)._name, "shared_memory")
         try:
             flat = {
                 spec.name: _tensor_from_buffer(_shm_buffer(shm), spec)
