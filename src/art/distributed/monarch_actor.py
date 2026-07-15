@@ -1,20 +1,40 @@
 from __future__ import annotations
 
 from collections import OrderedDict
+from functools import wraps
 import gc
 from multiprocessing import resource_tracker, shared_memory
 import os
 import socket
+import traceback
 from typing import Any, cast
 
 # This module is imported only by explicit distributed runtime construction.
 from monarch.actor import Actor, endpoint  # ty: ignore[unresolved-import]
 
 from .data_plane import BatchReservation, PackedBatchInbox, PackedBatchRef
+from .monarch_runtime import RemoteCallError, RemoteCallResult
 from .packing import PackingRequest, PackingResult
 from .rollout import RolloutInvocation, RolloutResult
 from .specs import HostServiceHealth
 from .vllm_replica import HostMemberLaunchRequest
+
+
+def resilient_endpoint(function: Any) -> Any:
+    @wraps(function)
+    async def wrapped(*args: Any, **kwargs: Any) -> RemoteCallResult:
+        try:
+            return RemoteCallResult(value=await function(*args, **kwargs))
+        except Exception as error:
+            return RemoteCallResult(
+                error=RemoteCallError(
+                    error_type=type(error).__name__,
+                    message=str(error) or type(error).__name__,
+                    traceback=traceback.format_exc(),
+                )
+            )
+
+    return endpoint(wrapped)
 
 
 class RolloutHostService(Actor):
@@ -36,7 +56,7 @@ class RolloutHostService(Actor):
         self._vllm_output_root = vllm_output_root
         self._vllm_launcher = None
 
-    @endpoint
+    @resilient_endpoint
     async def health(self) -> HostServiceHealth:
         return HostServiceHealth(
             host_id=self.host_id,
@@ -44,7 +64,7 @@ class RolloutHostService(Actor):
             process_id=os.getpid(),
         )
 
-    @endpoint
+    @resilient_endpoint
     async def run(self, invocation: RolloutInvocation):
         from art.metrics import MetricsBuilder
 
@@ -67,7 +87,7 @@ class RolloutHostService(Actor):
             token.var.reset(token)
         return RolloutResult(value=value, metrics=await builder.drain_pending())
 
-    @endpoint
+    @resilient_endpoint
     async def close(self) -> None:
         for model in self._models.values():
             await model._reset_inference_runtime()
@@ -92,28 +112,28 @@ class RolloutHostService(Actor):
             )
         return self._vllm_launcher
 
-    @endpoint
+    @resilient_endpoint
     async def start_vllm_member(self, request: HostMemberLaunchRequest):
         return await self._launcher().start_member(request)
 
-    @endpoint
+    @resilient_endpoint
     async def vllm_member_state(self, replica_id: str, member_id: str, generation: int):
         return await self._launcher().member_state(replica_id, member_id, generation)
 
-    @endpoint
+    @resilient_endpoint
     async def stop_vllm_member(
         self, replica_id: str, member_id: str, generation: int
     ) -> None:
         if self._vllm_launcher is not None:
             await self._vllm_launcher.stop_member(replica_id, member_id, generation)
 
-    @endpoint
+    @resilient_endpoint
     async def allocate_port(self) -> int:
         with socket.socket() as listener:
             listener.bind(("", 0))
             return int(listener.getsockname()[1])
 
-    @endpoint
+    @resilient_endpoint
     async def pack_batch(self, request: PackingRequest) -> PackingResult:
         if self._packer is None:
             from art.megatron.backend import MegatronBackend
@@ -154,7 +174,7 @@ class RolloutHostService(Actor):
             non_padding_tokens=non_padding_tokens,
         )
 
-    @endpoint
+    @resilient_endpoint
     async def publish_batch(self, ref: PackedBatchRef):
         if ref.batch_id in self._rdma_batches:
             raise RuntimeError(f"packed batch {ref.batch_id!r} is already published")
@@ -175,11 +195,11 @@ class RolloutHostService(Actor):
         self._rdma_batches[ref.batch_id] = (handle, tensor, shm)
         return handle
 
-    @endpoint
+    @resilient_endpoint
     async def drop_batch(self, batch_id: str) -> None:
         await self._drop_batch(batch_id)
 
-    @endpoint
+    @resilient_endpoint
     async def note_batch_transmitted(self, byte_count: int) -> None:
         self.inbox.store.note_transmitted(byte_count)
 
@@ -193,34 +213,34 @@ class RolloutHostService(Actor):
         gc.collect()
         shm.close()
 
-    @endpoint
+    @resilient_endpoint
     async def reserve_batch(self, ref: PackedBatchRef) -> BatchReservation:
         return await self.inbox.reserve(ref)
 
-    @endpoint
+    @resilient_endpoint
     async def put_batch(
         self, reservation: BatchReservation, ref: PackedBatchRef, payload: bytes
     ) -> PackedBatchRef:
         return await self.inbox.put(reservation, ref, payload)
 
-    @endpoint
+    @resilient_endpoint
     async def receive_rdma_batch(
         self, ref: PackedBatchRef, rdma_buffer: Any, timeout_s: float
     ) -> PackedBatchRef:
         return await self.inbox.receive_rdma(ref, rdma_buffer, timeout_s=timeout_s)
 
-    @endpoint
+    @resilient_endpoint
     async def abort_batch(self, reservation_id: str) -> None:
         await self.inbox.abort(reservation_id)
 
-    @endpoint
+    @resilient_endpoint
     async def release_batch(self, lease_id: str) -> None:
         await self.inbox.release(lease_id)
 
-    @endpoint
+    @resilient_endpoint
     async def unlink_batch(self, batch_id: str) -> None:
         await self.inbox.unlink(batch_id)
 
-    @endpoint
+    @resilient_endpoint
     async def stats(self):
         return self.inbox.store.stats()

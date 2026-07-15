@@ -16,6 +16,7 @@ from .monarch_runtime import (
     MonarchPackingEndpoint,
     MonarchRolloutHostEndpoint,
     MonarchVllmHostLauncher,
+    call_remote,
 )
 from .packing import PackingRequest, PackingResult
 from .rollout import DistributedRolloutExecutor, InstalledAsyncCallable
@@ -113,7 +114,7 @@ class ArtRuntime:
 
     async def health(self) -> dict[str, HostServiceHealth]:
         values = await asyncio.gather(
-            *(actor.health.call_one() for actor in self._host_actors.values())
+            *(call_remote(actor.health) for actor in self._host_actors.values())
         )
         health = {value.host_id: value for value in values}
         if len(health) != len(values):
@@ -325,7 +326,7 @@ class ArtRuntime:
                 failures.append(error)
         self._trainer_runs.clear()
         results = await asyncio.gather(
-            *(actor.close.call_one() for actor in self._host_actors.values()),
+            *(call_remote(actor.close) for actor in self._host_actors.values()),
             return_exceptions=True,
         )
         failures.extend(

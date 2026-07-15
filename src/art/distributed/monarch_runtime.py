@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from typing import Any
 
+from pydantic import BaseModel, ConfigDict
+
 from .data_plane import BatchReservation, PackedBatchRef
 from .monarch_bootstrap import activate_child_virtualenv, monarch_identifier
 from .packing import PackingRequest, PackingResult
@@ -16,17 +18,43 @@ from .specs import RuntimeTopology
 from .vllm_replica import HostMemberLaunchRequest, HostMemberState
 
 
+class RemoteCallError(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    error_type: str
+    message: str
+    traceback: str
+
+
+class RemoteCallResult(BaseModel):
+    model_config = ConfigDict(arbitrary_types_allowed=True, extra="forbid", frozen=True)
+
+    value: Any = None
+    error: RemoteCallError | None = None
+
+
+def unwrap_remote_call(result: RemoteCallResult) -> Any:
+    if result.error is None:
+        return result.value
+    error = result.error
+    raise RuntimeError(f"remote {error.error_type}: {error.message}\n{error.traceback}")
+
+
+async def call_remote(endpoint: Any, *args: Any) -> Any:
+    return unwrap_remote_call(await endpoint.call_one(*args))
+
+
 class MonarchRolloutHostEndpoint(RolloutHostEndpoint):
     def __init__(self, actor: Any, *, owns_actor: bool = False) -> None:
         self.actor = actor
         self.owns_actor = owns_actor
 
     async def run(self, invocation: RolloutInvocation) -> RolloutResult:
-        return await self.actor.run.call_one(invocation)
+        return await call_remote(self.actor.run, invocation)
 
     async def close(self) -> None:
         if self.owns_actor:
-            await self.actor.close.call_one()
+            await call_remote(self.actor.close)
 
 
 class MonarchVllmHostLauncher:
@@ -34,22 +62,24 @@ class MonarchVllmHostLauncher:
         self.actor = actor
 
     async def start_member(self, request: HostMemberLaunchRequest) -> HostMemberState:
-        return await self.actor.start_vllm_member.call_one(request)
+        return await call_remote(self.actor.start_vllm_member, request)
 
     async def member_state(
         self, replica_id: str, member_id: str, generation: int
     ) -> HostMemberState:
-        return await self.actor.vllm_member_state.call_one(
-            replica_id, member_id, generation
+        return await call_remote(
+            self.actor.vllm_member_state, replica_id, member_id, generation
         )
 
     async def stop_member(
         self, replica_id: str, member_id: str, generation: int
     ) -> None:
-        await self.actor.stop_vllm_member.call_one(replica_id, member_id, generation)
+        await call_remote(
+            self.actor.stop_vllm_member, replica_id, member_id, generation
+        )
 
     async def allocate_port(self) -> int:
-        return int(await self.actor.allocate_port.call_one())
+        return int(await call_remote(self.actor.allocate_port))
 
 
 class MonarchPackedBatchInbox:
@@ -57,26 +87,28 @@ class MonarchPackedBatchInbox:
         self.actor = actor
 
     async def reserve(self, ref: PackedBatchRef) -> BatchReservation:
-        return await self.actor.reserve_batch.call_one(ref)
+        return await call_remote(self.actor.reserve_batch, ref)
 
     async def put(
         self, reservation: BatchReservation, ref: PackedBatchRef, payload: bytes
     ) -> PackedBatchRef:
-        return await self.actor.put_batch.call_one(reservation, ref, payload)
+        return await call_remote(self.actor.put_batch, reservation, ref, payload)
 
     async def receive_rdma(
         self, ref: PackedBatchRef, rdma_buffer: Any, *, timeout_s: float
     ) -> PackedBatchRef:
-        return await self.actor.receive_rdma_batch.call_one(ref, rdma_buffer, timeout_s)
+        return await call_remote(
+            self.actor.receive_rdma_batch, ref, rdma_buffer, timeout_s
+        )
 
     async def abort(self, reservation_id: str) -> None:
-        await self.actor.abort_batch.call_one(reservation_id)
+        await call_remote(self.actor.abort_batch, reservation_id)
 
     async def release(self, lease_id: str) -> None:
-        await self.actor.release_batch.call_one(lease_id)
+        await call_remote(self.actor.release_batch, lease_id)
 
     async def unlink(self, batch_id: str) -> None:
-        await self.actor.unlink_batch.call_one(batch_id)
+        await call_remote(self.actor.unlink_batch, batch_id)
 
 
 class MonarchPackedBatchSource:
@@ -84,13 +116,13 @@ class MonarchPackedBatchSource:
         self.actor = actor
 
     async def publish(self, ref: PackedBatchRef) -> Any:
-        return await self.actor.publish_batch.call_one(ref)
+        return await call_remote(self.actor.publish_batch, ref)
 
     async def drop(self, batch_id: str) -> None:
-        await self.actor.drop_batch.call_one(batch_id)
+        await call_remote(self.actor.drop_batch, batch_id)
 
     async def note_transmitted(self, byte_count: int) -> None:
-        await self.actor.note_batch_transmitted.call_one(byte_count)
+        await call_remote(self.actor.note_batch_transmitted, byte_count)
 
 
 class MonarchPackingEndpoint:
@@ -98,7 +130,7 @@ class MonarchPackingEndpoint:
         self.actor = actor
 
     async def pack(self, request: PackingRequest) -> PackingResult:
-        return await self.actor.pack_batch.call_one(request)
+        return await call_remote(self.actor.pack_batch, request)
 
 
 async def create_rollout_executor(
