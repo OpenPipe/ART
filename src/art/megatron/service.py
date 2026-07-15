@@ -949,7 +949,7 @@ class MegatronService:
             from .hybrid_ep_setup import validate_hybrid_ep
 
             validate_hybrid_ep()
-            import deep_ep  # noqa: F401
+            importlib.import_module("deep_ep")
             import megatron.bridge  # type: ignore
         except ImportError as exc:
             raise RuntimeError(
