@@ -354,8 +354,8 @@ async def trajectory_group(
 
 def tokenize_trajectory(
     trajectory: Trajectory,
-    base_model: str | None = None,
     *,
+    base_model: str | None = None,
     model: str | None = None,
     chat_template: str | None = None,
     chat_template_kwargs: Mapping[str, object] | None = None,
@@ -373,8 +373,8 @@ def tokenize_trajectory(
 
 def tokenize_trajectories(
     trajectories: Iterable[Trajectory],
-    base_model: str | None = None,
     *,
+    base_model: str | None = None,
     model: str | None = None,
     chat_template: str | None = None,
     chat_template_kwargs: Mapping[str, object] | None = None,
@@ -382,7 +382,7 @@ def tokenize_trajectories(
     return [
         tokenize_trajectory(
             item,
-            base_model,
+            base_model=base_model,
             model=model,
             chat_template=chat_template,
             chat_template_kwargs=chat_template_kwargs,
@@ -393,8 +393,8 @@ def tokenize_trajectories(
 
 def tokenize_trajectory_group(
     group: TrajectoryGroup,
-    base_model: str | None = None,
     *,
+    base_model: str | None = None,
     model: str | None = None,
     chat_template: str | None = None,
     chat_template_kwargs: Mapping[str, object] | None = None,
@@ -402,7 +402,7 @@ def tokenize_trajectory_group(
     return TokenizedTrajectoryGroup(
         trajectories=tokenize_trajectories(
             group,
-            base_model,
+            base_model=base_model,
             model=model,
             chat_template=chat_template,
             chat_template_kwargs=chat_template_kwargs,
@@ -413,8 +413,8 @@ def tokenize_trajectory_group(
 
 def tokenize_trajectory_groups(
     groups: Iterable[TrajectoryGroup],
-    base_model: str | None = None,
     *,
+    base_model: str | None = None,
     model: str | None = None,
     chat_template: str | None = None,
     chat_template_kwargs: Mapping[str, object] | None = None,
@@ -422,7 +422,7 @@ def tokenize_trajectory_groups(
     return [
         tokenize_trajectory_group(
             group,
-            base_model,
+            base_model=base_model,
             model=model,
             chat_template=chat_template,
             chat_template_kwargs=chat_template_kwargs,
