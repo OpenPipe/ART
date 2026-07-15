@@ -25,4 +25,8 @@ def configure_megatron_runtime_env() -> None:
     os.environ["TORCH_CUDA_ARCH_LIST"] = "9.0"
     _set_cache_dir("TORCHINDUCTOR_CACHE_DIR", "~/.cache/torchinductor")
     _set_cache_dir("TRITON_CACHE_DIR", "~/.triton/cache")
+    os.environ.setdefault("FLASH_ATTENTION_CUTE_DSL_CACHE_ENABLED", "1")
+    _set_cache_dir(
+        "FLASH_ATTENTION_CUTE_DSL_CACHE_DIR", "~/.cache/flash_attention_cute_dsl"
+    )
     install_te_cutlass_grouped_gemm_guard()

@@ -59,7 +59,7 @@ class TrainingRunSpec(_Spec):
     initial_learner_version: int = Field(ge=0)
     initial_adapter_path: str = Field(min_length=1)
     optimizer_state_path: str = Field(min_length=1)
-    event_timeout_s: float = Field(default=3600.0, gt=0)
+    event_timeout_s: float = Field(default=14400.0, gt=0)
     shutdown_timeout_s: float = Field(default=30.0, gt=0)
 
 
