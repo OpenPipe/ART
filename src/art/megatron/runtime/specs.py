@@ -7,6 +7,7 @@ from typing import Annotated, Literal, TypeAlias
 
 from pydantic import BaseModel, ConfigDict, Field, TypeAdapter, model_validator
 
+from art.distributed.data_plane import PackedBatchRef
 from art.distributed.specs import TrainerMeshSpec
 from art.megatron.runtime.jobs import MergedWeightTransferSpec
 from art.types import TrainConfig
@@ -53,38 +54,6 @@ class TrainingRunSpec(_Spec):
     initial_learner_version: int = Field(ge=0)
     initial_adapter_path: str = Field(min_length=1)
     optimizer_state_path: str = Field(min_length=1)
-
-
-class TensorManifestEntry(_Spec):
-    name: str = Field(min_length=1)
-    dtype: str = Field(min_length=1)
-    shape: tuple[int, ...]
-    nbytes: int = Field(ge=0)
-
-    @model_validator(mode="after")
-    def _validate_shape(self) -> "TensorManifestEntry":
-        if any(dimension < 0 for dimension in self.shape):
-            raise ValueError("tensor dimensions must be non-negative")
-        return self
-
-
-class PackedBatchRef(_Spec):
-    batch_id: str = Field(min_length=1)
-    lease_id: str = Field(min_length=1)
-    format: Literal["art_packed_rl_v1"] = "art_packed_rl_v1"
-    source_policy_version: int = Field(ge=0)
-    num_sequences: int = Field(ge=1)
-    sequence_length: int = Field(ge=1)
-    tensors: tuple[TensorManifestEntry, ...]
-
-    @model_validator(mode="after")
-    def _validate_tensors(self) -> "PackedBatchRef":
-        names = [tensor.name for tensor in self.tensors]
-        if not names:
-            raise ValueError("packed batch tensor manifest must not be empty")
-        if len(set(names)) != len(names):
-            raise ValueError("packed batch tensor names must be unique")
-        return self
 
 
 class CurrentTrainConfig(TrainConfig):
@@ -142,7 +111,7 @@ class TrainJobSpec(_Spec):
             raise ValueError(
                 "learner_version must immediately follow expected_learner_version"
             )
-        if self.batch.source_policy_version > self.expected_learner_version:
+        if self.batch.max_source_version > self.expected_learner_version:
             raise ValueError(
                 "batch source policy version cannot be newer than the learner"
             )

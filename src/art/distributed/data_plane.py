@@ -169,6 +169,22 @@ class PackedBatchRef(_Contract):
         return self
 
 
+class PackedBatchLeaseSet(_Contract):
+    """One logical batch and its host-local physical leases."""
+
+    ref: PackedBatchRef
+    host_refs: dict[str, PackedBatchRef]
+
+    @model_validator(mode="after")
+    def _validate_hosts(self) -> "PackedBatchLeaseSet":
+        if not self.host_refs:
+            raise ValueError("packed batch requires at least one host lease")
+        logical = _logical_ref(self.ref)
+        if any(_logical_ref(ref) != logical for ref in self.host_refs.values()):
+            raise ValueError("host leases must describe the same logical packed batch")
+        return self
+
+
 class BatchReservation(_Contract):
     reservation_id: str = Field(min_length=1)
     batch_id: str = Field(min_length=1)
@@ -315,33 +331,59 @@ class SharedMemoryPackedBatchStore:
                 f"packed-batch payload has {len(payload)} bytes, expected "
                 f"{reservation.storage_byte_count}"
             )
-        lease_id = secrets.token_hex(16)
         shm = shared_memory.SharedMemory(create=True, size=len(payload))
         try:
             _shm_buffer(shm)[:] = payload
-            ref = source.model_copy(
-                update={
-                    "owner_actor_id": self.owner_actor_id,
-                    "lease_id": lease_id,
-                    "shared_memory_name": shm.name,
-                    "owner_process_id": os.getpid(),
-                }
-            )
-            entry = _Entry(shm, ref)
         except BaseException:
             shm.close()
             shm.unlink()
             raise
-        self._reservations.pop(reservation_id)
-        self._reserved_bytes -= reservation.storage_byte_count
-        self._entries[ref.batch_id] = entry
-        self._lease_to_batch[lease_id] = ref.batch_id
-        self._committed_reservations[reservation_id] = (ref.batch_id, lease_id)
-        self._used_bytes += ref.storage_byte_count
-        self._created_bytes += ref.storage_byte_count
-        self._copied_bytes += len(payload)
-        self._copy_count += 1
-        return ref
+        return self._finish_commit(reservation, source, shm)
+
+    async def commit_rdma(
+        self,
+        reservation_id: str,
+        source: PackedBatchRef,
+        rdma_buffer: Any,
+        *,
+        timeout_s: float,
+    ) -> PackedBatchRef:
+        reservation = self._reservations.get(reservation_id)
+        if reservation is None or reservation.batch_id != source.batch_id:
+            raise PackedBatchLeaseError(
+                "unknown or mismatched packed-batch reservation"
+            )
+        shm = shared_memory.SharedMemory(
+            create=True, size=reservation.storage_byte_count
+        )
+        destination = None
+        try:
+            import torch
+
+            destination = torch.frombuffer(
+                _shm_buffer(shm),
+                dtype=torch.uint8,
+                count=reservation.storage_byte_count,
+            )
+            transferred = await rdma_buffer.read_into(destination, timeout=timeout_s)
+            if (
+                transferred is not None
+                and int(transferred) != reservation.storage_byte_count
+            ):
+                raise RuntimeError(
+                    f"RDMA transferred {transferred} bytes, expected "
+                    f"{reservation.storage_byte_count}"
+                )
+            del destination
+            destination = None
+            return self._finish_commit(reservation, source, shm)
+        except BaseException:
+            if destination is not None:
+                del destination
+            gc.collect()
+            shm.close()
+            shm.unlink()
+            raise
 
     def abort(self, reservation_id: str) -> None:
         reservation = self._reservations.pop(reservation_id, None)
@@ -440,6 +482,35 @@ class SharedMemoryPackedBatchStore:
         except KeyError:
             raise PackedBatchLeaseError(f"unknown packed batch {batch_id!r}") from None
 
+    def _finish_commit(
+        self,
+        reservation: BatchReservation,
+        source: PackedBatchRef,
+        shm: shared_memory.SharedMemory,
+    ) -> PackedBatchRef:
+        lease_id = secrets.token_hex(16)
+        ref = source.model_copy(
+            update={
+                "owner_actor_id": self.owner_actor_id,
+                "lease_id": lease_id,
+                "shared_memory_name": shm.name,
+                "owner_process_id": os.getpid(),
+            }
+        )
+        self._reservations.pop(reservation.reservation_id)
+        self._reserved_bytes -= reservation.storage_byte_count
+        self._entries[ref.batch_id] = _Entry(shm, ref)
+        self._lease_to_batch[lease_id] = ref.batch_id
+        self._committed_reservations[reservation.reservation_id] = (
+            ref.batch_id,
+            lease_id,
+        )
+        self._used_bytes += ref.storage_byte_count
+        self._created_bytes += ref.storage_byte_count
+        self._copied_bytes += ref.storage_byte_count
+        self._copy_count += 1
+        return ref
+
 
 class MappedPackedBatch(BaseModel):
     """Zero-copy consumer view; callers must not mutate its immutable tensors."""
@@ -501,6 +572,21 @@ class PackedBatchInbox:
     ) -> PackedBatchRef:
         return self.store.commit(reservation.reservation_id, ref, payload)
 
+    async def receive_rdma(
+        self, ref: PackedBatchRef, rdma_buffer: Any, *, timeout_s: float
+    ) -> PackedBatchRef:
+        reservation = self.store.reserve(ref)
+        try:
+            return await self.store.commit_rdma(
+                reservation.reservation_id,
+                ref,
+                rdma_buffer,
+                timeout_s=timeout_s,
+            )
+        except BaseException:
+            self.store.abort(reservation.reservation_id)
+            raise
+
     async def abort(self, reservation_id: str) -> None:
         self.store.abort(reservation_id)
 
@@ -550,6 +636,66 @@ class ActorBytesTransport:
         except BaseException:
             await inbox.abort(reservation.reservation_id)
             raise
+
+
+class RDMABatchSourceEndpoint(Protocol):
+    async def publish(self, ref: PackedBatchRef) -> Any: ...
+
+    async def drop(self, batch_id: str) -> None: ...
+
+
+class RDMABatchInboxEndpoint(PackedBatchInboxEndpoint, Protocol):
+    async def receive_rdma(
+        self, ref: PackedBatchRef, rdma_buffer: Any, *, timeout_s: float
+    ) -> PackedBatchRef: ...
+
+
+async def fanout_rdma_packed_batch(
+    *,
+    source: SharedMemoryPackedBatchStore,
+    ref: PackedBatchRef,
+    source_endpoint: RDMABatchSourceEndpoint,
+    inboxes: Mapping[str, RDMABatchInboxEndpoint],
+    timeout_s: float,
+) -> dict[str, PackedBatchRef]:
+    """Publish once, read once per host, and always drop the actor-owned handle."""
+
+    handle = await source_endpoint.publish(ref)
+    try:
+        tasks = {
+            host_id: asyncio.create_task(
+                inbox.receive_rdma(ref, handle, timeout_s=timeout_s)
+            )
+            for host_id, inbox in inboxes.items()
+        }
+        try:
+            results = await asyncio.gather(*tasks.values(), return_exceptions=True)
+        except BaseException:
+            for task in tasks.values():
+                task.cancel()
+            results = await asyncio.gather(*tasks.values(), return_exceptions=True)
+            await _release_transferred(
+                inboxes,
+                [
+                    result if isinstance(result, BaseException) else (host_id, result)
+                    for host_id, result in zip(tasks, results, strict=True)
+                ],
+            )
+            raise
+        failures = [result for result in results if isinstance(result, BaseException)]
+        if failures:
+            await _release_transferred(
+                inboxes,
+                [
+                    result if isinstance(result, BaseException) else (host_id, result)
+                    for host_id, result in zip(tasks, results, strict=True)
+                ],
+            )
+            raise failures[0]
+        source.note_transmitted(len(inboxes) * ref.storage_byte_count)
+        return dict(zip(tasks, cast(list[PackedBatchRef], results), strict=True))
+    finally:
+        await source_endpoint.drop(ref.batch_id)
 
 
 async def fanout_packed_batch(
@@ -708,6 +854,17 @@ def _numel(shape: tuple[int, ...]) -> int:
             raise ValueError("tensor dimensions must be non-negative")
         result *= dimension
     return result
+
+
+def _logical_ref(ref: PackedBatchRef) -> dict[str, Any]:
+    return ref.model_dump(
+        exclude={
+            "owner_actor_id",
+            "lease_id",
+            "shared_memory_name",
+            "owner_process_id",
+        }
+    )
 
 
 def _unflatten_packed_tensors(flat: dict[str, Any], ref: PackedBatchRef) -> Any:

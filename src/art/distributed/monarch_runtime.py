@@ -37,6 +37,11 @@ class MonarchPackedBatchInbox:
     ) -> PackedBatchRef:
         return await self.actor.put_batch.call_one(reservation, ref, payload)
 
+    async def receive_rdma(
+        self, ref: PackedBatchRef, rdma_buffer: Any, *, timeout_s: float
+    ) -> PackedBatchRef:
+        return await self.actor.receive_rdma_batch.call_one(ref, rdma_buffer, timeout_s)
+
     async def abort(self, reservation_id: str) -> None:
         await self.actor.abort_batch.call_one(reservation_id)
 
@@ -45,6 +50,17 @@ class MonarchPackedBatchInbox:
 
     async def unlink(self, batch_id: str) -> None:
         await self.actor.unlink_batch.call_one(batch_id)
+
+
+class MonarchPackedBatchSource:
+    def __init__(self, actor: Any) -> None:
+        self.actor = actor
+
+    async def publish(self, ref: PackedBatchRef) -> Any:
+        return await self.actor.publish_batch.call_one(ref)
+
+    async def drop(self, batch_id: str) -> None:
+        await self.actor.drop_batch.call_one(batch_id)
 
 
 async def create_rollout_executor(

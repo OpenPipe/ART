@@ -10,7 +10,9 @@ from typing import Any
 from monarch.actor import Actor, Channel, Port, ProcMesh, endpoint
 from monarch.spmd import setup_torch_elastic_env_async
 
-from .data_plane import PackedBatch, PackedBatchSource
+from art.distributed.data_plane import PackedBatchLeaseSet
+
+from .data_plane import InMemoryPackedBatch
 from .specs import (
     TRAIN_EVENT_ADAPTER,
     AdapterReady,
@@ -60,7 +62,6 @@ class MonarchTrainerActor(Actor):
     def __init__(
         self,
         runtime_spec_json: str,
-        batch_source: PackedBatchSource,
     ) -> None:
         runtime_spec = TrainerRuntimeSpec.model_validate_json(runtime_spec_json)
         topology = runtime_spec.trainer_mesh.topology
@@ -94,8 +95,11 @@ class MonarchTrainerActor(Actor):
 
         import torch
 
-        local_rank = int(os.environ["LOCAL_RANK"])
-        torch.cuda.set_device(local_rank)
+        rank = int(os.environ["RANK"])
+        placement = runtime_spec.trainer_mesh.ranks[rank]
+        self._host_id = placement.host_id
+        os.environ["LOCAL_RANK"] = str(placement.gpu_id)
+        torch.cuda.set_device(placement.gpu_id)
         from art.megatron.train import build_training_runtime
 
         dtype = {
@@ -106,7 +110,7 @@ class MonarchTrainerActor(Actor):
         self._runtime = build_training_runtime(
             model_identifier=runtime_spec.model_identifier,
             provider_torch_dtype=dtype,
-            print_env=local_rank == 0,
+            print_env=rank == 0,
         )
         if self._runtime.model_support_handler.key != runtime_spec.handler_name:
             raise RuntimeError(
@@ -117,19 +121,20 @@ class MonarchTrainerActor(Actor):
         from .executor import MegatronTrainJobExecutor
 
         self._executor = MegatronTrainJobExecutor(self._runtime)
-        self._batch_source = batch_source
         self._valid = True
 
     @endpoint
     def execute(
         self,
         job_json: str,
+        batch_json: str,
         event_port: Port[dict[str, Any]],
     ) -> dict[str, Any]:
         if not self._valid:
             raise RuntimeError("trainer actor runtime is invalid")
         job = TrainJobSpec.model_validate_json(job_json)
-        batch = self._batch_source.acquire(job.batch)
+        leases = PackedBatchLeaseSet.model_validate_json(batch_json)
+        batch = InMemoryPackedBatch.open(job.batch, leases.host_refs[self._host_id])
         coordinator = self._runtime.rank == 0
         try:
             metrics = self._executor.execute(
@@ -149,7 +154,7 @@ class MonarchTrainerActor(Actor):
             self._valid = False
             raise
         finally:
-            self._batch_source.release(job.batch)
+            batch.close()
 
     @endpoint
     def close(self) -> None:
@@ -164,7 +169,6 @@ class MonarchTrainerActor(Actor):
 async def spawn_monarch_trainer_actors(
     proc_mesh: ProcMesh,
     runtime_spec: TrainerRuntimeSpec,
-    batch_source: PackedBatchSource,
 ) -> Any:
     """Configure torch-elastic first, then initialize exactly one actor per rank."""
     await setup_torch_elastic_env_async(proc_mesh)
@@ -172,7 +176,6 @@ async def spawn_monarch_trainer_actors(
         "art_megatron_trainer",
         MonarchTrainerActor,
         runtime_spec.model_dump_json(),
-        batch_source,
     )
 
 
@@ -199,7 +202,7 @@ class MonarchTrainerRun:
         self._valid = True
 
     async def train(
-        self, job: TrainJobSpec, batch: PackedBatch
+        self, job: TrainJobSpec, batch: PackedBatchLeaseSet
     ) -> AsyncIterator[TrainEvent]:
         cached = self._jobs.get(job.job_id)
         if cached is not None and cached[0] == job.fingerprint:
@@ -249,7 +252,9 @@ class MonarchTrainerRun:
 
             send_port, receiver = Channel[dict[str, Any]].open()
             collective = asyncio.ensure_future(
-                self._actors.execute.call(job.model_dump_json(), send_port)
+                self._actors.execute.call(
+                    job.model_dump_json(), batch.model_dump_json(), send_port
+                )
             )
             receive = asyncio.ensure_future(receiver.recv())
             try:
@@ -330,7 +335,9 @@ class MonarchTrainerRun:
             finally:
                 self._jobs[job.job_id] = (job.fingerprint, tuple(events))
 
-    def _validate(self, job: TrainJobSpec, batch: PackedBatch) -> BaseException | None:
+    def _validate(
+        self, job: TrainJobSpec, batch: PackedBatchLeaseSet
+    ) -> BaseException | None:
         if self._closed:
             return RuntimeError("trainer run is closed")
         if not self._valid:

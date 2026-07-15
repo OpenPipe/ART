@@ -1,11 +1,11 @@
-from .data_plane import InMemoryPackedBatch, PackedBatch, PackedBatchSource
+from art.distributed.data_plane import PackedBatchLeaseSet, PackedBatchRef
+
+from .data_plane import InMemoryPackedBatch, PackedBatch
 from .specs import (
     AdapterReady,
     CurrentTrainConfig,
     DurableTrainOutput,
     ExperimentalTrainConfig,
-    PackedBatchRef,
-    TensorManifestEntry,
     TrainAccepted,
     TrainCancelled,
     TrainCompleted,
@@ -27,8 +27,7 @@ __all__ = [
     "LocalTrainerRun",
     "PackedBatch",
     "PackedBatchRef",
-    "PackedBatchSource",
-    "TensorManifestEntry",
+    "PackedBatchLeaseSet",
     "TrainAccepted",
     "TrainCancelled",
     "TrainCompleted",

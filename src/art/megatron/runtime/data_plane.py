@@ -2,11 +2,10 @@ from __future__ import annotations
 
 from typing import Protocol, runtime_checkable
 
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, PrivateAttr
 
+from art.distributed.data_plane import MappedPackedBatch, PackedBatchRef
 from art.preprocessing.pack import PackedTensors
-
-from .specs import PackedBatchRef
 
 
 @runtime_checkable
@@ -18,18 +17,25 @@ class PackedBatch(Protocol):
 
 
 class InMemoryPackedBatch(BaseModel):
-    model_config = ConfigDict(arbitrary_types_allowed=True, extra="forbid", frozen=True)
+    model_config = ConfigDict(arbitrary_types_allowed=True, extra="forbid")
 
     ref: PackedBatchRef
     tensors: PackedTensors
+    _mapped: MappedPackedBatch | None = PrivateAttr(default=None)
 
+    @classmethod
+    def open(
+        cls, ref: PackedBatchRef, local_ref: PackedBatchRef
+    ) -> "InMemoryPackedBatch":
+        mapped = MappedPackedBatch.open(local_ref)
+        batch = cls(ref=ref, tensors=mapped.tensors)
+        batch._mapped = mapped
+        return batch
 
-class PackedBatchSource(Protocol):
-    """Rank-local view of a host inbox populated before the train RPC."""
-
-    def acquire(self, ref: PackedBatchRef) -> InMemoryPackedBatch: ...
-
-    def release(self, ref: PackedBatchRef) -> None: ...
+    def close(self) -> None:
+        if self._mapped is not None:
+            self._mapped.close()
+            self._mapped = None
 
 
 def validate_packed_batch(batch: InMemoryPackedBatch) -> None:
