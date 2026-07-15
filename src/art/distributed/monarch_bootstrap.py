@@ -1,10 +1,9 @@
 from __future__ import annotations
 
-"""Provider-neutral bootstrap for pinned torchmonarch 0.2.
+"""Provider-neutral bootstrap for pinned torchmonarch 0.5.
 
 Both worker and controller endpoints must be reachable only on one trusted private
-network. Monarch 0.2 requires ``trust_all_connections`` because authenticated
-transport is unavailable in that release.
+network because ART currently configures Monarch with ``trust_all_connections``.
 """
 
 import argparse
@@ -37,6 +36,7 @@ _SSH_PID_FILE = re.compile(r"^/tmp/art-monarch-[0-9a-f]{32}\.pid$")
 _MONARCH_TIMEOUT_ENV = (
     "HYPERACTOR_HOST_SPAWN_READY_TIMEOUT",
     "HYPERACTOR_MESSAGE_DELIVERY_TIMEOUT",
+    "HYPERACTOR_MESH_ATTACH_CONFIG_TIMEOUT",
     "HYPERACTOR_MESH_ACTOR_SPAWN_MAX_IDLE",
     "HYPERACTOR_MESH_PROC_SPAWN_MAX_IDLE",
 )
@@ -62,8 +62,12 @@ if recorded_address != address or not pid_text.isdecimal() or int(pid_text) < 2:
     raise RuntimeError(f"invalid ART Monarch worker identity in {path}")
 pid = int(pid_text)
 try:
+    state = Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()[0]
     command = Path(f"/proc/{pid}/cmdline").read_bytes()
 except FileNotFoundError:
+    path.unlink(missing_ok=True)
+    raise SystemExit
+if state == "Z":
     path.unlink(missing_ok=True)
     raise SystemExit
 if address.encode() not in command or not any(marker in command for marker in (
@@ -238,6 +242,8 @@ def _prepare_child_environment(*, worker: bool = False) -> None:
         )
     for name in _MONARCH_TIMEOUT_ENV:
         os.environ.setdefault(name, "600s")
+    # INFO launch records include the inherited environment and may expose secrets.
+    os.environ.setdefault("MONARCH_FILE_LOG", "warn")
 
 
 def activate_child_virtualenv() -> None:
@@ -305,10 +311,9 @@ async def deployment_smoke(hosts: Any) -> None:
 
 
 def run_worker(address: str, *, pid_file: str | None = None) -> None:
-    """Run a pinned Monarch 0.2 worker on a trusted private network.
+    """Run a pinned Monarch worker on a trusted private network.
 
-    Monarch 0.2 does not implement transport authentication, so its required
-    trust-all mode must never be exposed to an untrusted or public network.
+    ART's trust-all mode must never be exposed to an untrusted or public network.
     """
 
     _prepare_child_environment(worker=True)
@@ -381,8 +386,7 @@ def _stop_worker(worker: multiprocessing.Process) -> None:
 
 
 def _lifecycle_listener(spec: SkyPilotBootstrap) -> socket.socket:
-    # Attached Monarch 0.2 workers outlive HostMesh.shutdown(); task parents use
-    # this private channel to leave together when rank 0 completes or disconnects.
+    # Task parents use this channel to leave together independently of worker exit.
     family = (
         socket.AF_INET6
         if ipaddress.ip_address(spec.node_ips[0]).version == 6
@@ -560,6 +564,28 @@ def _start_ssh_workers(spec: SshBootstrap) -> list[_SshWorker]:
         raise
 
 
+def _wait_for_ssh_workers(
+    spec: SshBootstrap, workers: Sequence[_SshWorker], timeout_s: float
+) -> None:
+    pending = {host.target: (host, process) for host, _, _, process in workers}
+    deadline = time.monotonic() + timeout_s
+    while pending:
+        for target, (host, process) in tuple(pending.items()):
+            if (code := process.poll()) is not None:
+                raise RuntimeError(f"SSH worker {target!r} exited {code} before ready")
+            try:
+                with socket.create_connection(
+                    (host.worker_host.strip("[]"), spec.port), timeout=0.2
+                ):
+                    pending.pop(target)
+            except OSError:
+                pass
+        if pending and time.monotonic() >= deadline:
+            raise TimeoutError(f"timed out waiting for SSH workers {tuple(pending)}")
+        if pending:
+            time.sleep(0.05)
+
+
 def _stop_ssh_workers(spec: SshBootstrap, workers: Sequence[_SshWorker]) -> None:
     ssh_environment = os.environ.copy()
     ssh_environment.pop("ART_VIRTUAL_ENV", None)
@@ -625,6 +651,7 @@ def run_ssh(
 
     workers = _start_ssh_workers(spec)
     try:
+        _wait_for_ssh_workers(spec, workers, startup_timeout_s)
         asyncio.run(
             run_explicit_controller(
                 ExplicitHostBootstrap(worker_addresses=spec.worker_addresses),
@@ -648,8 +675,8 @@ def main(argv: Sequence[str] | None = None) -> None:
     parser = argparse.ArgumentParser(
         description="ART Monarch bootstrap (trusted private networks only)",
         epilog=(
-            "torchmonarch 0.2 has no transport authentication; never expose worker "
-            "addresses to a public or untrusted network."
+            "ART uses Monarch trust-all transport; never expose worker addresses "
+            "to a public or untrusted network."
         ),
     )
     subparsers = parser.add_subparsers(dest="command", required=True)

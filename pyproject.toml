@@ -21,7 +21,7 @@ distributed = [
     "aiohttp>=3.13.0",
     "msgspec>=0.21.0",
     "pyzmq>=27.1.0",
-    "torchmonarch==0.2.0",
+    "torchmonarch==0.5.0",
 ]
 
 backend = [
