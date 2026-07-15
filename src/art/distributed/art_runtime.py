@@ -214,6 +214,15 @@ class ArtRuntime:
             return
         try:
             await self._artifact_probe_phase("initialize", owner_only=True)
+            contenders = self._artifact_probe.host_ids[1:]
+            if contenders:
+                await self._artifact_probe_phase("hold_lock", owner_only=True)
+                await self._artifact_probe_phase("check_lock_held", host_ids=contenders)
+                await self._artifact_probe_phase("release_lock", owner_only=True)
+                for host_id in contenders:
+                    await self._artifact_probe_phase(
+                        "check_lock_released", host_ids=(host_id,)
+                    )
             for operation in (
                 "create",
                 "read_created",
@@ -233,15 +242,20 @@ class ArtRuntime:
             raise
 
     async def _artifact_probe_phase(
-        self, operation: ArtifactProbeOperation, *, owner_only: bool = False
+        self,
+        operation: ArtifactProbeOperation,
+        *,
+        owner_only: bool = False,
+        host_ids: tuple[str, ...] | None = None,
     ) -> None:
         if self._artifact_probe is None:
             return
-        host_ids = (
-            self._artifact_probe.host_ids[:1]
-            if owner_only
-            else self._artifact_probe.host_ids
-        )
+        if host_ids is None:
+            host_ids = (
+                self._artifact_probe.host_ids[:1]
+                if owner_only
+                else self._artifact_probe.host_ids
+            )
         command = ArtifactProbeCommand(spec=self._artifact_probe, operation=operation)
         async with asyncio.timeout(self.topology.cluster.rpc_timeout_s):
             results: list[ArtifactProbeResult] = await asyncio.gather(

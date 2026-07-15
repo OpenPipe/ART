@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+import errno
+import fcntl
 import os
 from pathlib import Path
 import stat
+import threading
 from typing import Annotated, Literal, TypeAlias
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
@@ -13,10 +16,17 @@ ArtifactProbeOperation: TypeAlias = Literal[
     "read_created",
     "rename",
     "read_renamed",
+    "hold_lock",
+    "check_lock_held",
+    "release_lock",
+    "check_lock_released",
     "delete",
     "finalize",
     "cleanup",
 ]
+
+_HELD_FLOCKS: dict[tuple[str, str], int] = {}
+_FLOCK_GUARD = threading.Lock()
 
 
 class _Contract(BaseModel):
@@ -85,9 +95,16 @@ def _execute(host_id: str, command: ArtifactProbeCommand, directory: Path) -> No
     root = Path(spec.artifact_root)
     created = directory / f"{host_index}.created"
     renamed = directory / f"{host_index}.renamed"
+    lock = directory / "advisory.lock"
+    lock_key = (spec.runtime_id, host_id)
     operation = command.operation
-    if operation in {"initialize", "finalize"} and host_index:
+    if (
+        operation in {"initialize", "hold_lock", "release_lock", "finalize"}
+        and host_index
+    ):
         raise RuntimeError(f"only host {spec.host_ids[0]!r} may {operation} the probe")
+    if operation in {"check_lock_held", "check_lock_released"} and not host_index:
+        raise RuntimeError(f"host {spec.host_ids[0]!r} owns the probe lock")
     if operation == "initialize":
         if not stat.S_ISDIR(root.stat().st_mode):
             raise NotADirectoryError(f"not a directory: {root}")
@@ -110,8 +127,18 @@ def _execute(host_id: str, command: ArtifactProbeCommand, directory: Path) -> No
     elif operation == "read_renamed":
         for index in range(len(spec.host_ids)):
             _read(directory / f"{index}.renamed", spec, index)
+    elif operation == "hold_lock":
+        _hold_flock(lock, lock_key)
+    elif operation == "check_lock_held":
+        _check_flock(lock, should_block=True)
+    elif operation == "release_lock":
+        _release_flock(lock_key)
+    elif operation == "check_lock_released":
+        _check_flock(lock, should_block=False)
     elif operation == "delete":
         renamed.unlink()
+        if not host_index and len(spec.host_ids) > 1:
+            lock.unlink(missing_ok=True)
         _fsync(directory)
         _absent(created)
         _absent(renamed)
@@ -119,11 +146,13 @@ def _execute(host_id: str, command: ArtifactProbeCommand, directory: Path) -> No
         directory.rmdir()
         _fsync(root)
     elif operation == "cleanup":
+        _release_flock(lock_key, required=False)
         try:
             directory.stat()
         except FileNotFoundError:
             return
-        for path in (created, renamed):
+        paths = (created, renamed, lock) if not host_index else (created, renamed)
+        for path in paths:
             try:
                 path.unlink()
             except FileNotFoundError:
@@ -150,6 +179,62 @@ def _absent(path: Path) -> None:
     except FileNotFoundError:
         return
     raise FileExistsError(f"artifact probe path still exists: {path}")
+
+
+def _hold_flock(path: Path, key: tuple[str, str]) -> None:
+    with _FLOCK_GUARD:
+        if key in _HELD_FLOCKS:
+            raise RuntimeError(f"artifact probe lock is already held: {path}")
+        descriptor = os.open(path, os.O_CREAT | os.O_EXCL | os.O_RDWR, 0o600)
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            os.fsync(descriptor)
+            _fsync(path.parent)
+        except BaseException:
+            os.close(descriptor)
+            path.unlink(missing_ok=True)
+            raise
+        _HELD_FLOCKS[key] = descriptor
+
+
+def _release_flock(key: tuple[str, str], *, required: bool = True) -> None:
+    with _FLOCK_GUARD:
+        descriptor = _HELD_FLOCKS.pop(key, None)
+        if descriptor is None:
+            if required:
+                raise RuntimeError("artifact probe lock is not held")
+            return
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_UN)
+        finally:
+            os.close(descriptor)
+
+
+def _check_flock(path: Path, *, should_block: bool) -> None:
+    descriptor = os.open(path, os.O_RDWR)
+    acquired = False
+    try:
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError as error:
+            if error.errno not in (errno.EACCES, errno.EAGAIN):
+                raise
+            if not should_block:
+                raise RuntimeError(
+                    f"artifact probe lock remained held after release: {path}"
+                ) from error
+        else:
+            acquired = True
+            if should_block:
+                raise RuntimeError(
+                    f"artifact probe lock was acquired while owner held it: {path}"
+                )
+    finally:
+        try:
+            if acquired:
+                fcntl.flock(descriptor, fcntl.LOCK_UN)
+        finally:
+            os.close(descriptor)
 
 
 def _fsync(path: Path) -> None:
