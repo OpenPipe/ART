@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-from collections.abc import Mapping
 from datetime import datetime
 import json
 from typing import Any, Literal
@@ -31,7 +30,6 @@ Endpoint = Literal["chat_completions", "completions", "responses", "messages"]
 Exchange = (
     ChatCompletionsExchange | CompletionsExchange | ResponsesExchange | MessagesExchange
 )
-ResponseModel = ChatCompletion | Completion | Response | Message
 SSEPayload = dict[str, Any] | Literal["[DONE]"]
 _ENDPOINTS: dict[str, Endpoint] = {
     "/chat/completions": "chat_completions",
@@ -215,13 +213,6 @@ def _messages_response(body: bytes, *, stream: bool) -> Message:
     return Message.model_validate(data)
 
 
-def _model(request: Mapping[str, object], response: ResponseModel) -> str | None:
-    requested = request.get("model")
-    if isinstance(requested, str):
-        return requested
-    return response.model if isinstance(response.model, str) else None
-
-
 def build_exchange(
     endpoint: Endpoint,
     request: dict[str, Any],
@@ -236,7 +227,6 @@ def build_exchange(
         return ChatCompletionsExchange(
             request=ChatCompletionsRequest(**request),
             response=response,
-            model=_model(request, response),
             start_time=start_time,
             end_time=end_time,
         )
@@ -245,7 +235,6 @@ def build_exchange(
         return CompletionsExchange(
             request=CompletionsRequest(**request),
             response=response,
-            model=_model(request, response),
             start_time=start_time,
             end_time=end_time,
         )
@@ -254,7 +243,6 @@ def build_exchange(
         return ResponsesExchange(
             request=ResponsesRequest(**request),
             response=response,
-            model=_model(request, response),
             start_time=start_time,
             end_time=end_time,
         )
@@ -263,7 +251,6 @@ def build_exchange(
         return MessagesExchange(
             request=MessagesRequest(**request),
             response=response,
-            model=_model(request, response),
             start_time=start_time,
             end_time=end_time,
         )

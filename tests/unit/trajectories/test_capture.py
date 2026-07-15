@@ -367,7 +367,19 @@ def test_all_protocols_reconstruct_typed_responses() -> None:
         assert exchange.end_time > exchange.start_time
         expected = request.get("model", "test/model")
         assert exchange.model == expected
-        assert exchange.model_dump(mode="json")["request"] == request
+        dumped = exchange.model_dump(mode="json")
+        assert dumped["request"] == request
+        assert dumped["model"] == expected
+
+        # Older serialized exchanges may contain a stale stored model. It is ignored
+        # in favor of the request, with the response as fallback.
+        dumped["model"] = "stale/model"
+        restored = type(exchange).model_validate(dumped)
+        assert restored.model == expected
+
+        exchange.request["model"] = "updated/model"
+        assert exchange.model == "updated/model"
+        assert exchange.model_dump(mode="json")["model"] == "updated/model"
 
 
 @pytest.mark.parametrize(

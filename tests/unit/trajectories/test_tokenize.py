@@ -68,7 +68,6 @@ def _chat_exchange(
             messages=[{"role": "user", "content": f"turn {offset}"}],
         ),
         response=response,
-        model=model,
         start_time=start,
         end_time=start + timedelta(milliseconds=1),
     )
@@ -108,7 +107,6 @@ def _completion_exchange(
     return CompletionsExchange(
         request=request,
         response=response,
-        model="test/model",
         start_time=start,
         end_time=start + timedelta(milliseconds=1),
     )
@@ -171,7 +169,6 @@ def test_malformed_explicit_exact_token_metadata_fails_closed() -> None:
             max_tokens=16,
         ),
         response=message_response,
-        model="test/model",
         start_time=start,
         end_time=start + timedelta(milliseconds=1),
     )
@@ -265,7 +262,6 @@ def test_fallback_uses_template_overrides_and_nan_logprobs(
             thinking={"type": "enabled", "budget_tokens": 128},
         ),
         response=response,
-        model="test/model",
         start_time=start,
         end_time=start + timedelta(seconds=1),
     )
@@ -529,7 +525,6 @@ def _response_exchange(
     return ResponsesExchange(
         request=request,
         response=response,
-        model="test/model",
         start_time=start,
         end_time=start + timedelta(milliseconds=1),
     )

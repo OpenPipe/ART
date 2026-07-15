@@ -121,33 +121,53 @@ class MessagesRequest(TypedDict, total=False, extra_items=Any):
 class ChatCompletionsExchange(pydantic.BaseModel):
     request: Annotated[ChatCompletionsRequest, pydantic.SkipValidation]
     response: ChatCompletion
-    model: str | None
     start_time: datetime
     end_time: datetime
+
+    @pydantic.computed_field
+    @property
+    def model(self) -> str | None:
+        requested = self.request.get("model")
+        return requested if isinstance(requested, str) else self.response.model
 
 
 class CompletionsExchange(pydantic.BaseModel):
     request: Annotated[CompletionsRequest, pydantic.SkipValidation]
     response: Completion
-    model: str | None
     start_time: datetime
     end_time: datetime
+
+    @pydantic.computed_field
+    @property
+    def model(self) -> str | None:
+        requested = self.request.get("model")
+        return requested if isinstance(requested, str) else self.response.model
 
 
 class ResponsesExchange(pydantic.BaseModel):
     request: Annotated[ResponsesRequest, pydantic.SkipValidation]
     response: Response
-    model: str | None
     start_time: datetime
     end_time: datetime
+
+    @pydantic.computed_field
+    @property
+    def model(self) -> str | None:
+        requested = self.request.get("model")
+        return requested if isinstance(requested, str) else self.response.model
 
 
 class MessagesExchange(pydantic.BaseModel):
     request: Annotated[MessagesRequest, pydantic.SkipValidation]
     response: AnthropicMessage
-    model: str | None
     start_time: datetime
     end_time: datetime
+
+    @pydantic.computed_field
+    @property
+    def model(self) -> str | None:
+        requested = self.request.get("model")
+        return requested if isinstance(requested, str) else self.response.model
 
 
 class TrajectoryExchanges(pydantic.BaseModel):
