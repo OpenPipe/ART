@@ -82,7 +82,7 @@ class DistributedMegatronService:
         self._latest_step = 0
         self._training_session_id = uuid.uuid4().hex
         self._trainer: Any = None
-        self._trainer_lock = asyncio.Lock()
+        self._mutation_lock = asyncio.Lock()
         self._replica_ids: tuple[str, ...] = ()
         self._base_urls: tuple[str, ...] = ()
         self._gateway: Any = None
@@ -93,7 +93,6 @@ class DistributedMegatronService:
         self._loaded_adapter_steps: set[int] = set()
         self._loaded_exact_adapter_steps: set[int] = set()
         self._exact_adapter_refcounts: dict[int, int] = {}
-        self._exact_adapter_lock = asyncio.Lock()
         self._closed = False
 
     @property
@@ -107,6 +106,10 @@ class DistributedMegatronService:
     @property
     def _allow_unvalidated_arch(self) -> bool:
         return bool(self.config.get("allow_unvalidated_arch", False))
+
+    def _require_open(self) -> None:
+        if self._closed:
+            raise RuntimeError("distributed model service is closed")
 
     @property
     def _optimizer_state_path(self) -> str:
@@ -132,6 +135,12 @@ class DistributedMegatronService:
         print(format_megatron_resume_message(resume))
         self._latest_step = max(self._latest_step, resume.step)
         path = get_step_checkpoint_dir(self.output_dir, self._latest_step)
+        staging = f"{self.output_dir}/megatron_runtime/staging/{self._latest_step:04d}"
+        if (
+            not (Path(path) / "adapter_model.safetensors").is_file()
+            and (Path(staging) / "adapter_model.safetensors").is_file()
+        ):
+            path = _publish_checkpoint(staging, self.output_dir, self._latest_step)
         if not (Path(path) / "adapter_model.safetensors").is_file():
             lora = self._lora_config()
             create_identity_lora(
@@ -196,22 +205,20 @@ class DistributedMegatronService:
             random_state=self._random_state(),
         )
 
-    async def _ensure_trainer(self) -> Any:
+    async def _ensure_trainer_locked(self) -> Any:
         if self._trainer is not None:
             return self._trainer
-        async with self._trainer_lock:
-            if self._trainer is None:
-                current = await asyncio.to_thread(self._resolve_current_lora_path)
-                runtime_spec = self._runtime_spec()
-                run_spec = TrainingRunSpec(
-                    run_id=uuid.uuid4().hex,
-                    runtime_fingerprint=runtime_spec.fingerprint,
-                    training_session_id=self._training_session_id,
-                    initial_learner_version=self._latest_step,
-                    initial_adapter_path=current,
-                    optimizer_state_path=self._optimizer_state_path,
-                )
-                self._trainer = await self.runtime.start_trainer(runtime_spec, run_spec)
+        current = await asyncio.to_thread(self._resolve_current_lora_path)
+        runtime_spec = self._runtime_spec()
+        run_spec = TrainingRunSpec(
+            run_id=uuid.uuid4().hex,
+            runtime_fingerprint=runtime_spec.fingerprint,
+            training_session_id=self._training_session_id,
+            initial_learner_version=self._latest_step,
+            initial_adapter_path=current,
+            optimizer_state_path=self._optimizer_state_path,
+        )
+        self._trainer = await self.runtime.start_trainer(runtime_spec, run_spec)
         return self._trainer
 
     async def train_packed(
@@ -220,52 +227,93 @@ class DistributedMegatronService:
         config: types.TrainConfig,
         experimental_config: dev.TrainConfig,
     ) -> AsyncIterator[dict[str, float]]:
-        trainer = await self._ensure_trainer()
-        next_step = self._latest_step + 1
-        source = get_step_checkpoint_dir(self.output_dir, self._latest_step)
-        staging = f"{self.output_dir}/megatron_runtime/staging/{next_step:04d}"
-        await asyncio.to_thread(_copy_checkpoint, source, staging)
-        values = {
-            key: value
-            for key, value in experimental_config.items()
-            if key in ExperimentalTrainConfig.model_fields and value is not None
-        }
-        job = TrainJobSpec(
-            job_id=uuid.uuid4().hex,
-            run_id=trainer.run_spec.run_id,
-            training_session_id=self._training_session_id,
-            expected_learner_version=self._latest_step,
-            learner_version=next_step,
-            batch=batch.leases.ref,
-            config=CurrentTrainConfig.model_validate(config.model_dump()),
-            experimental_config=ExperimentalTrainConfig.model_validate(values),
-            output=DurableTrainOutput(
-                adapter_path=staging,
-                optimizer_state_path=self._optimizer_state_path,
-            ),
-        )
-        checkpoint: str | None = None
-        async for event in trainer.train(job, batch.leases):
-            if isinstance(event, (TrainAccepted, TrainCompleted)):
-                continue
-            if isinstance(event, TrainProgress):
-                yield event.metrics
-                continue
-            if isinstance(event, AdapterReady):
-                checkpoint = _publish_checkpoint(staging, self.output_dir, next_step)
-                await self.register_lora_for_step(next_step, checkpoint)
-                continue
-            if isinstance(event, TrainFailed):
+        async with self._mutation_lock:
+            self._require_open()
+            trainer = await self._ensure_trainer_locked()
+            next_step = self._latest_step + 1
+            source = get_step_checkpoint_dir(self.output_dir, self._latest_step)
+            staging = f"{self.output_dir}/megatron_runtime/staging/{next_step:04d}"
+            await asyncio.to_thread(_copy_checkpoint, source, staging)
+            values = {
+                key: value
+                for key, value in experimental_config.items()
+                if key in ExperimentalTrainConfig.model_fields and value is not None
+            }
+            job = TrainJobSpec(
+                job_id=uuid.uuid4().hex,
+                run_id=trainer.run_spec.run_id,
+                training_session_id=self._training_session_id,
+                expected_learner_version=self._latest_step,
+                learner_version=next_step,
+                batch=batch.leases.ref,
+                config=CurrentTrainConfig.model_validate(config.model_dump()),
+                experimental_config=ExperimentalTrainConfig.model_validate(values),
+                output=DurableTrainOutput(
+                    adapter_path=staging,
+                    optimizer_state_path=self._optimizer_state_path,
+                ),
+            )
+            adapter_ready = False
+            completed = False
+            async for event in trainer.train(job, batch.leases):
+                if event.job_id != job.job_id or event.run_id != job.run_id:
+                    raise RuntimeError("trainer returned an event for a different job")
+                if isinstance(event, TrainAccepted):
+                    continue
+                if isinstance(event, TrainProgress):
+                    yield event.metrics
+                    continue
+                if isinstance(event, AdapterReady):
+                    if adapter_ready:
+                        raise RuntimeError(
+                            "trainer returned duplicate AdapterReady events"
+                        )
+                    if (
+                        event.learner_version != next_step
+                        or event.adapter_path != staging
+                    ):
+                        raise RuntimeError("trainer prepared the wrong adapter")
+                    adapter_ready = True
+                    continue
+                if isinstance(event, TrainCompleted):
+                    if completed:
+                        raise RuntimeError(
+                            "trainer returned duplicate TrainCompleted events"
+                        )
+                    if not adapter_ready:
+                        raise RuntimeError(
+                            "trainer completed before preparing the adapter"
+                        )
+                    if event.learner_version != next_step:
+                        raise RuntimeError(
+                            "trainer completed the wrong learner version"
+                        )
+                    completed = True
+                    continue
+                if isinstance(event, TrainFailed):
+                    raise RuntimeError(
+                        f"distributed Megatron job failed ({event.error_type}): "
+                        f"{event.message}"
+                    )
+                if isinstance(event, TrainCancelled):
+                    raise asyncio.CancelledError(event.reason)
+            if not adapter_ready or not completed:
                 raise RuntimeError(
-                    f"distributed Megatron job failed ({event.error_type}): "
-                    f"{event.message}"
+                    "trainer ended without preparing and durably completing the adapter"
                 )
-            if isinstance(event, TrainCancelled):
-                raise asyncio.CancelledError(event.reason)
-        if checkpoint is None:
             checkpoint = _publish_checkpoint(staging, self.output_dir, next_step)
-            await self.register_lora_for_step(next_step, checkpoint)
-        self._latest_step = next_step
+            try:
+                await self._register_lora_for_step_locked(next_step, checkpoint)
+            except BaseException as error:
+                try:
+                    _unpublish_checkpoint(checkpoint, staging)
+                except BaseException as rollback_error:
+                    raise BaseExceptionGroup(
+                        "policy publication and checkpoint rollback failed",
+                        [error, rollback_error],
+                    ) from None
+                raise
+            self._latest_step = next_step
 
     async def resolve_global_grad_accumulation_sequences(
         self, config: types.TrainConfig
@@ -280,9 +328,16 @@ class DistributedMegatronService:
     async def start_openai_server(
         self, config: dev.OpenAIServerConfig | None
     ) -> tuple[str, int]:
-        if self._base_urls:
-            return self._gateway_endpoint or _host_port(self._base_urls[0])
-        self._api_key_value = self._api_key(config)
+        async with self._mutation_lock:
+            self._require_open()
+            if self._base_urls:
+                return self._gateway_endpoint or _host_port(self._base_urls[0])
+            return await self._start_openai_server_locked(config)
+
+    async def _start_openai_server_locked(
+        self, config: dev.OpenAIServerConfig | None
+    ) -> tuple[str, int]:
+        api_key = self._api_key(config)
         lora_path = await asyncio.to_thread(self._resolve_current_lora_path)
         external = get_external_vllm_runtime_config(self.config)
         if external is not None:
@@ -293,13 +348,27 @@ class DistributedMegatronService:
                 timeout=external.health_timeout_s,
                 headers=headers,
             )
-            self._base_urls = (base_url,)
-            self._serving_capabilities = await discover_serving_capabilities(
+            capabilities = await discover_serving_capabilities(
                 base_url=base_url,
                 headers=headers,
                 allow_openai_compatible=True,
             )
-            await self._load_adapter(lora_path, self._latest_step)
+            base_urls = (base_url,)
+            await self._load_adapter_at(
+                lora_path,
+                self._latest_step,
+                base_urls=base_urls,
+                api_key=api_key,
+                latest_step=self._latest_step,
+            )
+            self._publish_serving_state(
+                replica_ids=(),
+                base_urls=base_urls,
+                gateway=None,
+                gateway_endpoint=None,
+                capabilities=capabilities,
+                api_key=api_key,
+            )
             return _host_port(base_url)
 
         services = tuple(
@@ -323,79 +392,148 @@ class DistributedMegatronService:
             engine_args=self._engine_args(config),
             server_args=self._server_args(config),
         )
-        self._replica_ids = tuple(replica.replica_id for replica in service.replicas)
-        starts = await asyncio.gather(
-            *(
-                self.runtime.start_replica(replica, template)
-                for replica in service.replicas
-            ),
-            return_exceptions=True,
+        replica_ids = tuple(replica.replica_id for replica in service.replicas)
+        start_tasks = tuple(
+            asyncio.create_task(self.runtime.start_replica(replica, template))
+            for replica in service.replicas
         )
+        try:
+            starts = await asyncio.gather(*start_tasks, return_exceptions=True)
+        except BaseException as error:
+            for task in start_tasks:
+                task.cancel()
+            starts = await asyncio.gather(*start_tasks, return_exceptions=True)
+            started = tuple(
+                replica_id
+                for replica_id, value in zip(replica_ids, starts, strict=True)
+                if not isinstance(value, BaseException)
+            )
+            cleanup = await self._rollback_server_start(None, started)
+            if cleanup:
+                raise BaseExceptionGroup(
+                    "vLLM replica startup cancellation and rollback failed",
+                    [error, *cleanup],
+                ) from None
+            raise
         failures = [value for value in starts if isinstance(value, BaseException)]
         if failures:
-            await asyncio.gather(
-                *(
-                    self.runtime.stop_replica(replica_id)
-                    for replica_id, value in zip(self._replica_ids, starts, strict=True)
-                    if not isinstance(value, BaseException)
-                ),
-                return_exceptions=True,
+            started = tuple(
+                replica_id
+                for replica_id, value in zip(replica_ids, starts, strict=True)
+                if not isinstance(value, BaseException)
             )
-            self._replica_ids = ()
+            failures.extend(await self._rollback_server_start(None, started))
             raise BaseExceptionGroup("vLLM replica startup failed", failures)
-        self._base_urls = tuple(
+        base_urls = tuple(
             f"http://{replica.leader_endpoint.host}:{replica.leader_endpoint.port}"
             for replica in service.replicas
         )
-        capabilities = await asyncio.gather(
-            *(
-                discover_serving_capabilities(
-                    base_url=url,
-                    headers=_headers(self._api_key(config)),
-                    allow_openai_compatible=False,
+        gateway: Any = None
+        try:
+            capabilities = await asyncio.gather(
+                *(
+                    discover_serving_capabilities(
+                        base_url=url,
+                        headers=_headers(api_key),
+                        allow_openai_compatible=False,
+                    )
+                    for url in base_urls
                 )
-                for url in self._base_urls
             )
-        )
-        if len(set(capabilities)) != 1:
-            raise RuntimeError("vLLM replicas expose different ART capabilities")
-        self._serving_capabilities = capabilities[0]
-        digest = await asyncio.to_thread(_checkpoint_digest, lora_path)
-        update_identity = uuid.uuid4().hex
-        reports = []
-        for replica_id in self._replica_ids:
-            manager = self.runtime.replica(replica_id)
-            state = manager.prepare_update(update_identity=update_identity)
-            report = ReplicaUpdateReport(
-                replica_id=replica_id,
-                generation=state.generation,
-                generation_digest=state.generation_digest,
-                policy_version=str(self._latest_step),
-                policy_digest=digest,
-                update_identity=update_identity,
-            )
-            if manager.verify_update(report).phase != "ready":
-                raise RuntimeError(f"replica {replica_id!r} rejected initial policy")
-            reports.append(report)
-        self._loaded_adapter_steps.add(self._latest_step)
-        if len(self._replica_ids) > 1:
-            from art.distributed.vllm_gateway import VllmGateway
+            if len(set(capabilities)) != 1:
+                raise RuntimeError("vLLM replicas expose different ART capabilities")
+            digest = await asyncio.to_thread(_checkpoint_digest, lora_path)
+            update_identity = uuid.uuid4().hex
+            for replica_id in replica_ids:
+                manager = self.runtime.replica(replica_id)
+                state = manager.prepare_update(update_identity=update_identity)
+                report = ReplicaUpdateReport(
+                    replica_id=replica_id,
+                    generation=state.generation,
+                    generation_digest=state.generation_digest,
+                    policy_version=str(self._latest_step),
+                    policy_digest=digest,
+                    update_identity=update_identity,
+                )
+                if manager.verify_update(report).phase != "ready":
+                    raise RuntimeError(
+                        f"replica {replica_id!r} rejected initial policy"
+                    )
+            gateway_endpoint = None
+            if len(replica_ids) > 1:
+                from art.distributed.vllm_gateway import VllmGateway
 
-            table = self._routing_table(
-                service,
-                policy_version=self._latest_step,
-                policy_digest=digest,
-                update_identity=update_identity,
-            )
-            self._gateway = VllmGateway(
-                table,
-                upstream_headers=_headers(self._api_key(config)),
-                max_queued=self.runtime.config.gateway_max_queued,
-                route_timeout_s=self.runtime.config.gateway_route_timeout_s,
-            )
-            port = await self._gateway.start(self.runtime.config.gateway_bind_host)
-            self._gateway_endpoint = (self._gateway_advertise_host(), port)
-        return self._gateway_endpoint or _host_port(self._base_urls[0])
+                gateway = VllmGateway(
+                    self._routing_table(
+                        service,
+                        policy_version=self._latest_step,
+                        policy_digest=digest,
+                        update_identity=update_identity,
+                        replica_ids=replica_ids,
+                    ),
+                    upstream_headers=_headers(api_key),
+                    max_queued=self.runtime.config.gateway_max_queued,
+                    route_timeout_s=self.runtime.config.gateway_route_timeout_s,
+                )
+                port = await gateway.start(self.runtime.config.gateway_bind_host)
+                gateway_endpoint = (self._gateway_advertise_host(), port)
+        except BaseException as error:
+            cleanup = await self._rollback_server_start(gateway, replica_ids)
+            if cleanup:
+                raise BaseExceptionGroup(
+                    "vLLM startup validation and rollback failed", [error, *cleanup]
+                ) from None
+            raise
+        self._publish_serving_state(
+            replica_ids=replica_ids,
+            base_urls=base_urls,
+            gateway=gateway,
+            gateway_endpoint=gateway_endpoint,
+            capabilities=capabilities[0],
+            api_key=api_key,
+        )
+        return gateway_endpoint or _host_port(base_urls[0])
+
+    def _publish_serving_state(
+        self,
+        *,
+        replica_ids: tuple[str, ...],
+        base_urls: tuple[str, ...],
+        gateway: Any,
+        gateway_endpoint: tuple[str, int] | None,
+        capabilities: ServingCapabilities,
+        api_key: str | None,
+    ) -> None:
+        self._replica_ids = replica_ids
+        self._base_urls = base_urls
+        self._gateway = gateway
+        self._gateway_endpoint = gateway_endpoint
+        self._serving_capabilities = capabilities
+        self._api_key_value = api_key
+        self._loaded_adapter_steps.add(self._latest_step)
+
+    def _clear_serving_state(self) -> None:
+        self._replica_ids = ()
+        self._base_urls = ()
+        self._gateway = None
+        self._gateway_endpoint = None
+        self._serving_capabilities = None
+        self._api_key_value = None
+        self._loaded_adapter_steps.clear()
+        self._loaded_exact_adapter_steps.clear()
+        self._exact_adapter_refcounts.clear()
+
+    async def _rollback_server_start(
+        self, gateway: Any, replica_ids: tuple[str, ...]
+    ) -> list[BaseException]:
+        cleanup = ([gateway.close()] if gateway is not None else []) + [
+            self.runtime.stop_replica(replica_id) for replica_id in replica_ids
+        ]
+        return [
+            result
+            for result in await asyncio.gather(*cleanup, return_exceptions=True)
+            if isinstance(result, BaseException)
+        ]
 
     def _routing_table(
         self,
@@ -404,11 +542,13 @@ class DistributedMegatronService:
         policy_version: int,
         policy_digest: str,
         update_identity: str,
+        replica_ids: tuple[str, ...] | None = None,
+        policy_generation: int | None = None,
     ) -> RoutingTable:
         now = asyncio.get_running_loop().time()
         specs = {replica.replica_id: replica for replica in service.replicas}
         replicas = []
-        for replica_id in self._replica_ids:
+        for replica_id in self._replica_ids if replica_ids is None else replica_ids:
             manager = self.runtime.replica(replica_id)
             state = manager.state
             spec = specs[replica_id]
@@ -437,7 +577,11 @@ class DistributedMegatronService:
                 )
             )
         return RoutingTable(
-            policy_generation=self._policy_generation,
+            policy_generation=(
+                self._policy_generation
+                if policy_generation is None
+                else policy_generation
+            ),
             policy_version=str(policy_version),
             policy_digest=policy_digest,
             update_identity=update_identity,
@@ -499,6 +643,25 @@ class DistributedMegatronService:
     async def _load_adapter(
         self, checkpoint: str, step: int, *, exact: bool = False
     ) -> None:
+        await self._load_adapter_at(
+            checkpoint,
+            step,
+            exact=exact,
+            base_urls=self._base_urls,
+            api_key=self._api_key(),
+            latest_step=self._latest_step,
+        )
+
+    async def _load_adapter_at(
+        self,
+        checkpoint: str,
+        step: int,
+        *,
+        base_urls: tuple[str, ...],
+        api_key: str | None,
+        latest_step: int,
+        exact: bool = False,
+    ) -> None:
         name = (
             f"{self.model_name}:eval@{step}"
             if exact and self.rollout_weight_update_mode == "in_flight_lora"
@@ -508,7 +671,7 @@ class DistributedMegatronService:
         in_flight = (
             not exact
             and self.rollout_weight_update_mode == "in_flight_lora"
-            and step != self._latest_step
+            and step != latest_step
         )
         endpoint = (
             "/art/in_flight_lora_update" if in_flight else "/v1/load_lora_adapter"
@@ -529,17 +692,22 @@ class DistributedMegatronService:
                     client.post(
                         f"{url}{endpoint}",
                         json=payload,
-                        headers=_headers(self._api_key()),
+                        headers=_headers(api_key),
                     )
-                    for url in self._base_urls
+                    for url in base_urls
                 )
             )
         for response in responses:
             response.raise_for_status()
 
     async def register_lora_for_step(self, step: int, checkpoint: str) -> None:
-        if not self._base_urls:
+        async with self._mutation_lock:
+            self._require_open()
+            await self._register_lora_for_step_locked(step, checkpoint)
             self._latest_step = step
+
+    async def _register_lora_for_step_locked(self, step: int, checkpoint: str) -> None:
+        if not self._base_urls:
             return
         digest = await asyncio.to_thread(_checkpoint_digest, checkpoint)
         update_identity = uuid.uuid4().hex
@@ -577,29 +745,37 @@ class DistributedMegatronService:
                     for service in self.runtime.topology.model_services
                     if service.name == self.model_name
                 )
-                self._policy_generation += 1
+                policy_generation = self._policy_generation + 1
                 await self._gateway.commit(
                     self._routing_table(
                         service,
                         policy_version=step,
                         policy_digest=digest,
                         update_identity=update_identity,
+                        policy_generation=policy_generation,
                     ),
                     tuple(reports),
                 )
-        except BaseException:
+                self._policy_generation = policy_generation
+        except BaseException as error:
             for replica_id in self._replica_ids:
                 self.runtime.replica(replica_id).quarantine(
                     "partial or failed LoRA update"
                 )
-            if self._gateway is not None:
-                await self._gateway.pause("partial or failed LoRA update")
+            cleanup = await self._rollback_server_start(
+                self._gateway, self._replica_ids
+            )
+            self._clear_serving_state()
+            if cleanup:
+                raise BaseExceptionGroup(
+                    "LoRA publication and serving rollback failed", [error, *cleanup]
+                ) from None
             raise
-        self._latest_step = step
         self._loaded_adapter_steps.add(step)
 
     async def acquire_exact_adapter(self, step: int, checkpoint: str) -> str:
-        async with self._exact_adapter_lock:
+        async with self._mutation_lock:
+            self._require_open()
             if step not in self._loaded_exact_adapter_steps:
                 if (
                     self.rollout_weight_update_mode == "in_flight_lora"
@@ -631,7 +807,8 @@ class DistributedMegatronService:
         )
 
     async def release_exact_adapter(self, step: int) -> None:
-        async with self._exact_adapter_lock:
+        async with self._mutation_lock:
+            self._require_open()
             count = self._exact_adapter_refcounts.get(step, 0)
             if count <= 1:
                 self._exact_adapter_refcounts.pop(step, None)
@@ -644,13 +821,15 @@ class DistributedMegatronService:
                 self._exact_adapter_refcounts[step] = count - 1
 
     async def prune_loaded_adapters(self, *, retain_steps: set[int]) -> None:
-        for step in sorted(
-            self._loaded_adapter_steps - retain_steps - {self._latest_step}
-        ):
-            await self._unload_adapter(f"{self.model_name}@{step}")
-            self._loaded_adapter_steps.discard(step)
-            if self._gateway is not None:
-                self._gateway.remove_policy(str(step))
+        async with self._mutation_lock:
+            self._require_open()
+            for step in sorted(
+                self._loaded_adapter_steps - retain_steps - {self._latest_step}
+            ):
+                await self._unload_adapter(f"{self.model_name}@{step}")
+                self._loaded_adapter_steps.discard(step)
+                if self._gateway is not None:
+                    self._gateway.remove_policy(str(step))
 
     async def _unload_adapter(self, name: str) -> None:
         async with httpx.AsyncClient(timeout=30.0) as client:
@@ -677,27 +856,30 @@ class DistributedMegatronService:
         return False
 
     async def aclose(self) -> None:
-        if self._closed:
-            return
-        self._closed = True
-        failures: list[BaseException] = []
-        if self._gateway is not None:
-            try:
-                await self._gateway.close()
-            except BaseException as error:
-                failures.append(error)
-        if self._trainer is not None:
-            try:
-                await self._trainer.close()
-            except BaseException as error:
-                failures.append(error)
-        for replica_id in self._replica_ids:
-            try:
-                await self.runtime.stop_replica(replica_id)
-            except BaseException as error:
-                failures.append(error)
-        if failures:
-            raise BaseExceptionGroup("distributed model service close failed", failures)
+        async with self._mutation_lock:
+            if self._closed:
+                return
+            self._closed = True
+            failures: list[BaseException] = []
+            if self._gateway is not None:
+                try:
+                    await self._gateway.close()
+                except BaseException as error:
+                    failures.append(error)
+            if self._trainer is not None:
+                try:
+                    await self._trainer.close()
+                except BaseException as error:
+                    failures.append(error)
+            for replica_id in self._replica_ids:
+                try:
+                    await self.runtime.stop_replica(replica_id)
+                except BaseException as error:
+                    failures.append(error)
+            if failures:
+                raise BaseExceptionGroup(
+                    "distributed model service close failed", failures
+                )
 
 
 def _copy_checkpoint(source: str, destination: str) -> None:
@@ -713,6 +895,13 @@ def _publish_checkpoint(staging: str, output_dir: str, step: int) -> str:
     Path(destination).parent.mkdir(parents=True, exist_ok=True)
     Path(staging).rename(destination)
     return destination
+
+
+def _unpublish_checkpoint(checkpoint: str, staging: str) -> None:
+    if os.path.exists(staging):
+        raise RuntimeError(f"refusing to replace checkpoint staging path {staging}")
+    Path(staging).parent.mkdir(parents=True, exist_ok=True)
+    Path(checkpoint).rename(staging)
 
 
 def _trainer_dtype(
