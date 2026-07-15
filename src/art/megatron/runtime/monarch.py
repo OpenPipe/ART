@@ -80,8 +80,20 @@ class MonarchTrainerActor(Actor):
                 "ART_DISABLE_MEGATRON_COMPILE": (
                     "0" if runtime_spec.compile_enabled else "1"
                 ),
+                "ART_MEGATRON_ALLOW_UNVALIDATED_ARCH": str(
+                    int(runtime_spec.allow_unvalidated_arch)
+                ),
+                "ART_MEGATRON_ENABLE_MOE_ROUTING_REPLAY": str(
+                    int(runtime_spec.enable_moe_routing_replay)
+                ),
+                "ART_MEGATRON_STREAMING_WEIGHT_OFFLOAD": str(
+                    int(runtime_spec.streaming_weight_offload)
+                ),
+                "ART_MEGATRON_OFFLOAD_BETWEEN_JOBS": "0",
             }
         )
+        if runtime_spec.random_state is not None:
+            os.environ["ART_MEGATRON_RANDOM_STATE"] = str(runtime_spec.random_state)
         if topology.vpp is not None:
             os.environ["ART_MEGATRON_VIRTUAL_PIPELINE_MODEL_PARALLEL_SIZE"] = str(
                 topology.vpp
@@ -118,9 +130,22 @@ class MonarchTrainerActor(Actor):
                 f"{self._runtime.model_support_handler.key!r} != "
                 f"{runtime_spec.handler_name!r}"
             )
+        from art.megatron.training.streaming_weight_offload import (
+            streaming_weight_offload_config_from_env,
+        )
+        from art.megatron.training.weight_offload import WeightOffloadManager
+
         from .executor import MegatronTrainJobExecutor
 
         self._executor = MegatronTrainJobExecutor(self._runtime)
+        self._weight_offload = WeightOffloadManager.from_config(
+            model=self._runtime.model,
+            rank=self._runtime.rank,
+            compile_enabled=self._runtime.transformer_layers_compiled,
+            offload_between_jobs=False,
+            streaming_config=streaming_weight_offload_config_from_env(),
+        )
+        self._weight_offload.install()
         self._valid = True
 
     @endpoint
@@ -137,12 +162,13 @@ class MonarchTrainerActor(Actor):
         batch = InMemoryPackedBatch.open(job.batch, leases.host_refs[self._host_id])
         coordinator = self._runtime.rank == 0
         try:
-            metrics = self._executor.execute(
-                job,
-                batch,
-                _ActorEventSink(event_port if coordinator else None),
-                Event(),
-            )
+            with self._weight_offload.job():
+                metrics = self._executor.execute(
+                    job,
+                    batch,
+                    _ActorEventSink(event_port if coordinator else None),
+                    Event(),
+                )
             if coordinator:
                 event_port.send({"kind": "actor_completed", "metrics": metrics})
             return {

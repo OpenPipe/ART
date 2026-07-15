@@ -83,6 +83,10 @@ class EndpointSpec(_Spec):
     port: int = Field(ge=1, le=65535)
 
     @property
+    def url(self) -> str:
+        return f"http://{self.host}:{self.port}"
+
+    @property
     def is_loopback(self) -> bool:
         if self.host.lower() == "localhost":
             return True
@@ -212,6 +216,10 @@ class RuntimeTopology(_Spec):
 class ArtRuntimeConfig(_Spec):
     packed_batch_capacity_bytes: int = Field(default=2 << 30, ge=1)
     vllm_output_root: str = "/tmp/art-vllm"
+    gateway_bind_host: str = "0.0.0.0"
+    gateway_advertise_host: str | None = None
+    gateway_max_queued: int = Field(default=128, ge=0)
+    gateway_route_timeout_s: float = Field(default=1200.0, gt=0)
 
 
 class HostServiceHealth(_Spec):

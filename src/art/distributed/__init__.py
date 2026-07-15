@@ -39,6 +39,7 @@ _EXPORTS = {
     "TensorSpec": ".data_plane",
     "TrainerMeshSpec": ".specs",
     "VllmParallelSpec": ".specs",
+    "VllmGateway": ".vllm_gateway",
     "compile_topology": ".topology",
 }
 

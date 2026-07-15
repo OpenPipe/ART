@@ -31,6 +31,10 @@ class TrainerRuntimeSpec(_Spec):
     compile_enabled: bool
     compile_fingerprint: str = Field(min_length=1)
     optimizer_layout_fingerprint: str = Field(min_length=1)
+    allow_unvalidated_arch: bool = False
+    enable_moe_routing_replay: bool = False
+    streaming_weight_offload: bool = False
+    random_state: int | None = None
 
     @model_validator(mode="after")
     def _validate_lora_targets(self) -> "TrainerRuntimeSpec":

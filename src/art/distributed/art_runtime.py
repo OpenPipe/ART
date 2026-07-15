@@ -142,7 +142,7 @@ class ArtRuntime:
             target_workers=target_workers,
         )
 
-    async def pack(self, request: PackingRequest) -> DistributedPackedBatch:
+    async def pack(self, request: PackingRequest) -> DistributedPackedBatch | None:
         self._require_open()
         trainer = self.topology.trainer
         if trainer is None:
@@ -153,7 +153,7 @@ class ArtRuntime:
         source_actor = self._host_actors[source_host]
         result: PackingResult = await MonarchPackingEndpoint(source_actor).pack(request)
         if result.ref is None:
-            raise ValueError("packing produced no trainable batch")
+            return None
         host_refs = {source_host: result.ref}
         destinations = {
             host_id: MonarchPackedBatchInbox(self._host_actors[host_id])

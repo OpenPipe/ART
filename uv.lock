@@ -4814,6 +4814,7 @@ backend = [
     { name = "wandb" },
 ]
 distributed = [
+    { name = "aiohttp" },
     { name = "torchmonarch" },
 ]
 langgraph = [
@@ -4890,6 +4891,7 @@ dev = [
 [package.metadata]
 requires-dist = [
     { name = "accelerate", marker = "extra == 'backend'", specifier = "==1.7.0" },
+    { name = "aiohttp", marker = "extra == 'distributed'", specifier = ">=3.13.0" },
     { name = "apex", marker = "extra == 'megatron'", git = "https://github.com/NVIDIA/apex.git?rev=25.09" },
     { name = "awscli", marker = "extra == 'backend'", specifier = ">=1.38.1" },
     { name = "bitsandbytes", marker = "extra == 'backend'", specifier = ">=0.45.2" },
