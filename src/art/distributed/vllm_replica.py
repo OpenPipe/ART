@@ -206,6 +206,10 @@ class ReplicaManager:
         executor = template.engine_args.get("distributed_executor_backend")
         if executor not in (None, "mp", "multiprocessing"):
             raise ValueError("ART-managed replicas require vLLM multiprocessing")
+        for key in ("revision", "tokenizer_revision"):
+            configured = template.engine_args.get(key)
+            if configured not in (None, spec.model_revision):
+                raise ValueError(f"{key} conflicts with the replica model revision")
         self._spec = spec
         self._launchers = launchers
         self._template = template
@@ -232,6 +236,25 @@ class ReplicaManager:
     @property
     def state(self) -> ReplicaState:
         return self._state
+
+    def expected_worker_identities(self) -> tuple[dict[str, int | str], ...]:
+        if self._state.phase not in {"ready", "updating"}:
+            raise RuntimeError(f"replica workers are not live: {self._state.phase}")
+        states = {member.member_id: member for member in self._state.members}
+        if states.keys() != {member.member_id for member in self._spec.members}:
+            raise RuntimeError("replica worker membership is incomplete")
+        local_world_size = len(self._spec.members[0].gpu_ids)
+        return tuple(
+            {
+                "rank": member.node_rank * local_world_size + local_rank,
+                "local_rank": local_rank,
+                "node_rank": member.node_rank,
+                "process_uuid": states[member.member_id].process_uuid,
+                "generation": self._state.generation,
+            }
+            for member in sorted(self._spec.members, key=lambda value: value.node_rank)
+            for local_rank in range(local_world_size)
+        )
 
     async def start(self) -> ReplicaState:
         async with self._lock:
@@ -459,6 +482,8 @@ class ReplicaManager:
         parallel = self._spec.parallel
         engine_args = {
             **self._template.engine_args,
+            "revision": self._spec.model_revision,
+            "tokenizer_revision": self._spec.model_revision,
             "tensor_parallel_size": parallel.tp,
             "pipeline_parallel_size": parallel.pp,
             "data_parallel_size": parallel.dp,

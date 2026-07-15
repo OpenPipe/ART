@@ -444,9 +444,22 @@ class DistributedMegatronService:
                 raise RuntimeError("vLLM replicas expose different ART capabilities")
             digest = await asyncio.to_thread(_checkpoint_digest, lora_path)
             update_identity = uuid.uuid4().hex
-            for replica_id in replica_ids:
+            states = {
+                replica_id: self.runtime.replica(replica_id).prepare_update(
+                    update_identity=update_identity
+                )
+                for replica_id in replica_ids
+            }
+            await self._acknowledge_lora_workers(
+                lora_name=template.served_model_name,
+                lora_path=lora_path,
+                step=self._latest_step,
+                replica_ids=replica_ids,
+                base_urls=base_urls,
+                api_key=api_key,
+            )
+            for replica_id, state in states.items():
                 manager = self.runtime.replica(replica_id)
-                state = manager.prepare_update(update_identity=update_identity)
                 report = ReplicaUpdateReport(
                     replica_id=replica_id,
                     generation=state.generation,
@@ -642,8 +655,8 @@ class DistributedMegatronService:
 
     async def _load_adapter(
         self, checkpoint: str, step: int, *, exact: bool = False
-    ) -> None:
-        await self._load_adapter_at(
+    ) -> tuple[str, str]:
+        return await self._load_adapter_at(
             checkpoint,
             step,
             exact=exact,
@@ -661,7 +674,7 @@ class DistributedMegatronService:
         api_key: str | None,
         latest_step: int,
         exact: bool = False,
-    ) -> None:
+    ) -> tuple[str, str]:
         name = (
             f"{self.model_name}:eval@{step}"
             if exact and self.rollout_weight_update_mode == "in_flight_lora"
@@ -699,6 +712,52 @@ class DistributedMegatronService:
             )
         for response in responses:
             response.raise_for_status()
+        return str(payload.get("lora_slot", name)), path
+
+    async def _acknowledge_lora_workers(
+        self,
+        *,
+        lora_name: str,
+        lora_path: str,
+        step: int,
+        replica_ids: tuple[str, ...] | None = None,
+        base_urls: tuple[str, ...] | None = None,
+        api_key: str | None = None,
+    ) -> None:
+        replica_ids = self._replica_ids if replica_ids is None else replica_ids
+        base_urls = self._base_urls if base_urls is None else base_urls
+        if not replica_ids:
+            return
+        if len(replica_ids) != len(base_urls):
+            raise RuntimeError("replica IDs and endpoints are inconsistent")
+        payloads = tuple(
+            {
+                "expected_workers": self.runtime.replica(
+                    replica_id
+                ).expected_worker_identities(),
+                "expected_lora": {
+                    "lora_name": lora_name,
+                    "lora_path": lora_path,
+                    "policy_version": step,
+                },
+            }
+            for replica_id in replica_ids
+        )
+        async with httpx.AsyncClient(timeout=60.0) as client:
+            responses = await asyncio.gather(
+                *(
+                    client.post(
+                        f"{url}/art/lora_worker_state",
+                        json=payload,
+                        headers=_headers(
+                            api_key if api_key is not None else self._api_key()
+                        ),
+                    )
+                    for url, payload in zip(base_urls, payloads, strict=True)
+                )
+            )
+        for response in responses:
+            response.raise_for_status()
 
     async def register_lora_for_step(self, step: int, checkpoint: str) -> None:
         async with self._mutation_lock:
@@ -723,7 +782,12 @@ class DistributedMegatronService:
                 and self.rollout_weight_update_mode == "in_flight_lora"
             ):
                 await self._gateway.pause("in-flight LoRA update")
-            await self._load_adapter(checkpoint, step)
+            lora_name, lora_path = await self._load_adapter(checkpoint, step)
+            await self._acknowledge_lora_workers(
+                lora_name=lora_name,
+                lora_path=lora_path,
+                step=step,
+            )
             reports = []
             for replica_id in self._replica_ids:
                 manager = self.runtime.replica(replica_id)
@@ -781,7 +845,14 @@ class DistributedMegatronService:
                     self.rollout_weight_update_mode == "in_flight_lora"
                     or step not in self._loaded_adapter_steps
                 ):
-                    await self._load_adapter(checkpoint, step, exact=True)
+                    lora_name, lora_path = await self._load_adapter(
+                        checkpoint, step, exact=True
+                    )
+                    await self._acknowledge_lora_workers(
+                        lora_name=lora_name,
+                        lora_path=lora_path,
+                        step=step,
+                    )
                 self._loaded_exact_adapter_steps.add(step)
                 self._exact_adapter_refcounts[step] = 0
                 if self._gateway is not None:
