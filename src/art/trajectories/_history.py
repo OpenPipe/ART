@@ -295,14 +295,26 @@ def responses_as_chat_completions_history(
 ) -> ChatCompletionsHistory:
     from ._tokenize import _openai_tools, _responses_messages
 
-    input_without_reasoning = [
-        item
-        for item in history.input
-        if not isinstance(item, Mapping) or item.get("type") != "reasoning"
-    ]
-    messages = _responses_messages(
-        {"instructions": history.instructions, "input": input_without_reasoning}
-    )
+    messages = _responses_messages({"instructions": history.instructions, "input": []})
+    pending_reasoning = ""
+    for item in history.input:
+        if isinstance(item, Mapping) and item.get("type") == "reasoning":
+            pending_reasoning += _responses_reasoning_text(item)
+            continue
+        converted = _responses_messages({"input": [item]})
+        if pending_reasoning and converted:
+            if converted[0].get("role") == "assistant":
+                converted[0]["reasoning"] = pending_reasoning
+            else:
+                messages.append(
+                    {"role": "assistant", "content": "", "reasoning": pending_reasoning}
+                )
+            pending_reasoning = ""
+        messages.extend(converted)
+    if pending_reasoning:
+        messages.append(
+            {"role": "assistant", "content": "", "reasoning": pending_reasoning}
+        )
     tools = _TOOLS.validate_python(_openai_tools(history.tools, dialect="responses"))
     return ChatCompletionsHistory(
         model=history.model,
@@ -311,6 +323,19 @@ def responses_as_chat_completions_history(
         chat_template=history.chat_template,
         chat_template_kwargs=copy.deepcopy(history.chat_template_kwargs),
     )
+
+
+def _responses_reasoning_text(item: Mapping[str, object]) -> str:
+    text = ""
+    for field in ("content", "summary"):
+        blocks = item.get(field)
+        if not isinstance(blocks, list):
+            continue
+        for block in blocks:
+            value = block.get("text") if isinstance(block, Mapping) else None
+            if isinstance(value, str):
+                text += value
+    return text
 
 
 def trajectory_history(

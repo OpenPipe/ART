@@ -111,6 +111,7 @@ def _response(
     text: str,
     *,
     previous_response_id: str | None = None,
+    reasoning: str | None = None,
     offset: int = 0,
 ) -> ResponsesExchange:
     start, end = _times(offset)
@@ -129,6 +130,19 @@ def _response(
                 "model": "test/model",
                 "object": "response",
                 "output": [
+                    *(
+                        [
+                            {
+                                "id": f"reasoning-{response_id}",
+                                "type": "reasoning",
+                                "summary": [
+                                    {"type": "summary_text", "text": reasoning}
+                                ],
+                            }
+                        ]
+                        if reasoning is not None
+                        else []
+                    ),
                     {
                         "id": f"message-{response_id}",
                         "type": "message",
@@ -142,7 +156,7 @@ def _response(
                                 "logprobs": [],
                             }
                         ],
-                    }
+                    },
                 ],
                 "parallel_tool_calls": True,
                 "tool_choice": "auto",
@@ -234,7 +248,7 @@ def test_responses_history_expands_previous_response_chain() -> None:
     trajectory = art.Trajectory(
         exchanges=TrajectoryExchanges(
             responses=[
-                _response("response-1", "first"),
+                _response("response-1", "first", reasoning="think"),
                 _response(
                     "response-2",
                     "second",
@@ -246,18 +260,18 @@ def test_responses_history_expands_previous_response_chain() -> None:
     )
 
     history = trajectory.responses_history()
-    assert len(history.input) == 4
+    assert len(history.input) == 5
     assert (
         art.ResponsesHistory.model_validate_json(history.model_dump_json()) == history
     )
-    assert [
-        message["role"] for message in history.as_chat_completions_history().messages
-    ] == [
+    chat_history = history.as_chat_completions_history()
+    assert [message["role"] for message in chat_history.messages] == [
         "user",
         "assistant",
         "user",
         "assistant",
     ]
+    assert dict(chat_history.messages[1]).get("reasoning") == "think"
 
     trajectory.exchanges.responses[1].request["previous_response_id"] = "missing"
     with pytest.raises(ValueError, match="outside this history"):
