@@ -85,6 +85,12 @@ class MonarchTrainerActor(Actor):
             os.environ["ART_MEGATRON_VIRTUAL_PIPELINE_MODEL_PARALLEL_SIZE"] = str(
                 topology.vpp
             )
+        world_size = int(os.environ["WORLD_SIZE"])
+        if world_size != len(runtime_spec.trainer_mesh.ranks):
+            raise RuntimeError(
+                "Monarch ProcMesh world does not match TrainerRuntimeSpec: "
+                f"{world_size} != {len(runtime_spec.trainer_mesh.ranks)}"
+            )
 
         import torch
 
@@ -306,6 +312,8 @@ class MonarchTrainerRun:
                     collective.cancel()
                 if not receive.done():
                     receive.cancel()
+                self._closed = True
+                await self._proc_mesh.stop()
                 if isinstance(exc, (asyncio.CancelledError, GeneratorExit)):
                     events.append(
                         TrainCancelled(
@@ -315,8 +323,6 @@ class MonarchTrainerRun:
                             reason="train stream was cancelled",
                         )
                     )
-                    self._closed = True
-                    await self._proc_mesh.stop()
                     raise
                 failure = self._failed(job, len(events), exc, True)
                 events.append(failure)
