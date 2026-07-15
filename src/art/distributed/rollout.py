@@ -224,11 +224,24 @@ class DistributedRolloutExecutor:
         )
 
     def set_workers(self, worker_ids: tuple[int, ...]) -> None:
-        if len(worker_ids) > len(self._worker_endpoints):
-            raise ValueError("live rollout workers exceed the global target")
-        self._endpoint_by_worker = dict(
-            zip(sorted(worker_ids), self._worker_endpoints, strict=False)
-        )
+        workers = tuple(sorted(worker_ids))
+        assignments = {
+            worker_id: self._endpoint_by_worker[worker_id]
+            for worker_id in workers
+            if worker_id in self._endpoint_by_worker
+        }
+        available = [
+            endpoint
+            for endpoint in self._worker_endpoints
+            if endpoint not in assignments.values()
+        ]
+        unassigned = [
+            worker_id for worker_id in workers if worker_id not in assignments
+        ]
+        if len(unassigned) > len(available):
+            raise ValueError("new rollout workers exceed the global target")
+        assignments.update(zip(unassigned, available, strict=False))
+        self._endpoint_by_worker = assignments
 
     async def run(
         self,

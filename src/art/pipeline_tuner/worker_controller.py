@@ -48,7 +48,9 @@ class RolloutWorkerController:
             )
             self._tasks[worker_id] = task
             active.append(worker_id)
-        self.trainer._rollout_executor.set_workers(tuple(active))
+        # Retiring workers keep their endpoint until their acquired scenario is
+        # delivered; worker_allowed() prevents them from acquiring another.
+        self.trainer._rollout_executor.set_workers(tuple(live))
 
     async def _raise_finished_errors(self) -> None:
         for worker_id, task in list(self._tasks.items()):
