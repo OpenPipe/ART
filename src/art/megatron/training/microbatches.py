@@ -361,7 +361,7 @@ def _local_trainable_token_count_tensor(
     device: torch.device,
 ) -> torch.Tensor:
     local_token_total = sum(_count_trainable_tokens(micro) for micro in micro_inputs)
-    return torch.tensor(local_token_total, device=device, dtype=torch.float32)
+    return torch.tensor(local_token_total, device=device, dtype=torch.int)
 
 
 def _art_flex_sliding_windows(provider: Any) -> tuple[int, ...]:
@@ -668,7 +668,7 @@ def _local_trainable_sft_token_count_tensor(
     local_token_total = sum(
         _count_sft_trainable_tokens(micro) for micro in micro_inputs
     )
-    return torch.tensor(local_token_total, device=device, dtype=torch.float32)
+    return torch.tensor(local_token_total, device=device, dtype=torch.int)
 
 
 def _prepare_dense_sft_micro(
