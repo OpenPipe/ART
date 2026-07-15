@@ -6,16 +6,12 @@ from typing import Any, Literal
 from pydantic import BaseModel, ConfigDict
 
 from .data_plane import BatchReservation, PackedBatchRef
-from .monarch_bootstrap import activate_child_virtualenv, monarch_identifier
 from .packing import PackingRequest, PackingResult
 from .rollout import (
-    DistributedRolloutExecutor,
-    InstalledAsyncCallable,
     RolloutHostEndpoint,
     RolloutInvocation,
     RolloutResult,
 )
-from .specs import RuntimeTopology
 from .vllm_replica import HostMemberLaunchRequest, HostMemberState
 
 
@@ -69,6 +65,7 @@ class MonarchRolloutHostEndpoint(RolloutHostEndpoint):
         self.owns_actor = owns_actor
 
     async def run(self, invocation: RolloutInvocation) -> RolloutResult:
+        await self.actor.initialized
         return await call_remote(self.actor.run, invocation)
 
     async def close(self) -> None:
@@ -147,48 +144,3 @@ class MonarchPackingEndpoint:
 
     async def pack(self, request: PackingRequest) -> PackingResult:
         return await call_remote(self.actor.pack_batch, request)
-
-
-async def create_rollout_executor(
-    *,
-    host_mesh: Any,
-    topology: RuntimeTopology,
-    rollout_callable: InstalledAsyncCallable,
-    target_workers: int,
-    packed_batch_capacity_bytes: int,
-) -> tuple[DistributedRolloutExecutor, tuple[Any, ...]]:
-    """Spawn one optional-Monarch actor per rollout host and return its executor."""
-
-    # Lazy import keeps `import art` and local PipelineTrainer use Monarch-free.
-    from .monarch_actor import RolloutHostService
-
-    host_by_id = {host.host_id: host for host in topology.cluster.hosts}
-    indices = {
-        host.host_id: index
-        for index, host in enumerate(topology.cluster.hosts)
-        if host.host_id in topology.rollout_host_ids
-    }
-    procs = []
-    endpoints: dict[str, RolloutHostEndpoint] = {}
-    for host_id, index in indices.items():
-        proc = host_mesh.slice(hosts=index).spawn_procs(
-            per_host={"rollout": 1},
-            bootstrap=activate_child_virtualenv,
-            name=monarch_identifier(f"art_rollout_{host_id}"),
-        )
-        actor = proc.spawn(
-            monarch_identifier(f"rollout_host_service_{host_id}"),
-            RolloutHostService,
-            host_id,
-            packed_batch_capacity_bytes,
-        )
-        await actor.initialized
-        procs.append(proc)
-        endpoints[host_id] = MonarchRolloutHostEndpoint(actor, owns_actor=True)
-    executor = DistributedRolloutExecutor(
-        callable=rollout_callable,
-        hosts=endpoints,
-        host_slots={host_id: host_by_id[host_id].cpu_slots for host_id in endpoints},
-        target_workers=target_workers,
-    )
-    return executor, tuple(procs)

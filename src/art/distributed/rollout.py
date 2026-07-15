@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Awaitable, Callable, Mapping
+from collections.abc import Awaitable, Callable, Mapping, Sequence
 import hashlib
 import importlib
 import inspect
@@ -201,32 +201,33 @@ class DistributedRolloutExecutor:
         self,
         *,
         callable: InstalledAsyncCallable,
-        hosts: Mapping[str, RolloutHostEndpoint],
-        host_slots: Mapping[str, int],
+        hosts: Mapping[str, Sequence[RolloutHostEndpoint]],
         target_workers: int,
     ) -> None:
-        if set(hosts) != set(host_slots):
-            raise ValueError("rollout host endpoints and slot declarations must match")
+        if not hosts or any(not endpoints for endpoints in hosts.values()):
+            raise ValueError("rollout hosts must each provide at least one endpoint")
         self.callable = callable
-        self.hosts = dict(hosts)
-        self.host_slots = dict(host_slots)
-        self._worker_hosts: tuple[str, ...] = ()
-        self._host_by_worker: dict[int, str] = {}
+        self.hosts = {host: tuple(endpoints) for host, endpoints in hosts.items()}
+        self._worker_endpoints: tuple[RolloutHostEndpoint, ...] = ()
+        self._endpoint_by_worker: dict[int, RolloutHostEndpoint] = {}
         self.set_target(target_workers)
 
     def set_target(self, target_workers: int) -> None:
-        allocation = apportion_rollout_workers(target_workers, self.host_slots)
-        self._worker_hosts = tuple(
-            host_id
+        allocation = apportion_rollout_workers(
+            target_workers,
+            {host: len(endpoints) for host, endpoints in self.hosts.items()},
+        )
+        self._worker_endpoints = tuple(
+            endpoint
             for host_id in sorted(allocation)
-            for _ in range(allocation[host_id])
+            for endpoint in self.hosts[host_id][: allocation[host_id]]
         )
 
     def set_workers(self, worker_ids: tuple[int, ...]) -> None:
-        if len(worker_ids) > len(self._worker_hosts):
+        if len(worker_ids) > len(self._worker_endpoints):
             raise ValueError("live rollout workers exceed the global target")
-        self._host_by_worker = dict(
-            zip(sorted(worker_ids), self._worker_hosts, strict=False)
+        self._endpoint_by_worker = dict(
+            zip(sorted(worker_ids), self._worker_endpoints, strict=False)
         )
 
     async def run(
@@ -242,12 +243,12 @@ class DistributedRolloutExecutor:
                 "PipelineTrainer rollout_fn differs from distributed callable"
             )
         try:
-            host_id = self._host_by_worker[worker_id]
+            endpoint = self._endpoint_by_worker[worker_id]
         except KeyError:
             raise RuntimeError(
                 f"rollout worker {worker_id} has no host assignment"
             ) from None
-        result = await self.hosts[host_id].run(
+        result = await endpoint.run(
             RolloutInvocation(
                 callable=self.callable,
                 model=RolloutModelSpec.from_model(model),
@@ -269,7 +270,13 @@ class DistributedRolloutExecutor:
         return result.value
 
     async def close(self) -> None:
-        await asyncio.gather(*(endpoint.close() for endpoint in self.hosts.values()))
+        await asyncio.gather(
+            *(
+                endpoint.close()
+                for endpoints in self.hosts.values()
+                for endpoint in endpoints
+            )
+        )
 
 
 class InProcessRolloutHost:

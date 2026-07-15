@@ -62,7 +62,7 @@ def resilient_endpoint(function: Any) -> Any:
 
 
 class RolloutHostService(Actor):
-    """One coarse CPU rollout and packed-batch inbox actor per host."""
+    """One packed-batch and managed-service owner per host."""
 
     def __init__(
         self,
@@ -74,7 +74,6 @@ class RolloutHostService(Actor):
         self.inbox = PackedBatchInbox(
             host_id=host_id, capacity_bytes=packed_batch_capacity_bytes
         )
-        self._models = OrderedDict()
         self._rdma_batches: dict[str, tuple[Any, Any, shared_memory.SharedMemory]] = {}
         self._packer = None
         self._vllm_output_root = vllm_output_root
@@ -89,33 +88,7 @@ class RolloutHostService(Actor):
         )
 
     @resilient_endpoint
-    async def run(self, invocation: RolloutInvocation):
-        from art.metrics import MetricsBuilder
-
-        key = invocation.model.cache_key
-        model = self._models.get(key)
-        if model is None:
-            model = invocation.model.build()
-            self._models[key] = model
-            if len(self._models) > 16:
-                _, evicted = self._models.popitem(last=False)
-                await evicted._reset_inference_runtime()
-        else:
-            self._models.move_to_end(key)
-        function = invocation.callable.resolve()
-        builder = MetricsBuilder(cost_context="train")
-        token = builder.activate()
-        try:
-            value = await function(model, invocation.scenario, invocation.config)
-        finally:
-            token.var.reset(token)
-        return RolloutResult(value=value, metrics=await builder.drain_pending())
-
-    @resilient_endpoint
     async def close(self) -> None:
-        for model in self._models.values():
-            await model._reset_inference_runtime()
-        self._models.clear()
         for batch_id in tuple(self._rdma_batches):
             await self._drop_batch(batch_id)
         if self._packer is not None:
@@ -264,3 +237,40 @@ class RolloutHostService(Actor):
     @resilient_endpoint
     async def stats(self):
         return self.inbox.store.stats()
+
+
+class RolloutWorkerService(Actor):
+    """One process-isolated CPU rollout slot."""
+
+    def __init__(self) -> None:
+        self._models = OrderedDict()
+
+    @resilient_endpoint
+    async def run(self, invocation: RolloutInvocation):
+        from art.metrics import MetricsBuilder
+
+        key = invocation.model.cache_key
+        model = self._models.get(key)
+        if model is None:
+            model = invocation.model.build()
+            self._models[key] = model
+            if len(self._models) > 16:
+                _, evicted = self._models.popitem(last=False)
+                await evicted._reset_inference_runtime()
+        else:
+            self._models.move_to_end(key)
+        builder = MetricsBuilder(cost_context="train")
+        token = builder.activate()
+        try:
+            value = await invocation.callable.resolve()(
+                model, invocation.scenario, invocation.config
+            )
+        finally:
+            token.var.reset(token)
+        return RolloutResult(value=value, metrics=await builder.drain_pending())
+
+    @resilient_endpoint
+    async def close(self) -> None:
+        for model in self._models.values():
+            await model._reset_inference_runtime()
+        self._models.clear()

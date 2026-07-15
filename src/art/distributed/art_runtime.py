@@ -56,6 +56,8 @@ class ArtRuntime:
         self.runtime_id = uuid.uuid4().hex
         self._host_procs: dict[str, Any] = {}
         self._host_actors: dict[str, Any] = {}
+        self._rollout_procs: dict[str, Any] = {}
+        self._rollout_actors: dict[str, Any] = {}
         self._trainer_runs: set[Any] = set()
         self._replicas: dict[str, ReplicaManager] = {}
         self._next_packing_host = 0
@@ -128,20 +130,47 @@ class ArtRuntime:
         target_workers: int,
     ) -> DistributedRolloutExecutor:
         self._require_open()
+        self._start_rollout_workers()
         hosts = {
-            host_id: MonarchRolloutHostEndpoint(self._host_actors[host_id])
-            for host_id in self.topology.rollout_host_ids
-        }
-        slots = {
-            host.host_id: host.cpu_slots
-            for host in self.topology.cluster.hosts
-            if host.host_id in hosts
+            host_id: tuple(
+                MonarchRolloutHostEndpoint(actor.slice(rollout=slot))
+                for slot in range(self._host(host_id).cpu_slots)
+            )
+            for host_id, actor in self._rollout_actors.items()
         }
         return DistributedRolloutExecutor(
             callable=rollout_callable,
             hosts=hosts,
-            host_slots=slots,
             target_workers=target_workers,
+        )
+
+    def _start_rollout_workers(self) -> None:
+        if self._rollout_actors:
+            return
+        from .monarch_actor import RolloutWorkerService
+
+        for index, host in enumerate(self.topology.cluster.hosts):
+            if host.host_id not in self.topology.rollout_host_ids:
+                continue
+            proc = self.host_mesh.slice(hosts=index).spawn_procs(
+                per_host={"rollout": host.cpu_slots},
+                bootstrap=activate_child_virtualenv,
+                name=monarch_identifier(
+                    f"art_rollout_{self.runtime_id}_{host.host_id}"
+                ),
+            )
+            actor = proc.spawn(
+                monarch_identifier(
+                    f"art_rollout_worker_{self.runtime_id}_{host.host_id}"
+                ),
+                RolloutWorkerService,
+            )
+            self._rollout_procs[host.host_id] = proc
+            self._rollout_actors[host.host_id] = actor
+
+    def _host(self, host_id: str) -> Any:
+        return next(
+            host for host in self.topology.cluster.hosts if host.host_id == host_id
         )
 
     async def pack(self, request: PackingRequest) -> DistributedPackedBatch | None:
@@ -324,6 +353,21 @@ class ArtRuntime:
             except BaseException as error:
                 failures.append(error)
         self._trainer_runs.clear()
+        for host_id, actor in self._rollout_actors.items():
+            for slot in range(self._host(host_id).cpu_slots):
+                try:
+                    await call_remote(actor.slice(rollout=slot).close)
+                except BaseException as error:
+                    failures.append(error)
+        results = await asyncio.gather(
+            *(proc.stop() for proc in self._rollout_procs.values()),
+            return_exceptions=True,
+        )
+        failures.extend(
+            result for result in results if isinstance(result, BaseException)
+        )
+        self._rollout_actors.clear()
+        self._rollout_procs.clear()
         results = await asyncio.gather(
             *(call_remote(actor.close) for actor in self._host_actors.values()),
             return_exceptions=True,
