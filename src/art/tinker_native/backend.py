@@ -42,6 +42,7 @@ from ..tinker.backend import get_renderer_name
 from ..tinker.server import get_free_port
 from ..trajectories import Trajectory, TrajectoryGroup
 from ..types import TrainResult, TrainSFTConfig
+from ..utils.lifecycle import process_shutdown_timeout
 from ..utils.output_dirs import get_model_dir
 from ..utils.trajectory_migration import auto_migrate_on_register
 from .data import (
@@ -52,6 +53,7 @@ from .data import (
 
 STATE_KEY_RUN_IDS = "tinker_run_ids"
 STATE_KEY_LATEST_STEP = "latest_step"
+_SERVER_CLOSE_TIMEOUT_SECONDS = process_shutdown_timeout(1)
 T = TypeVar("T")
 
 _UPSTREAM_TRAIN_METRIC_KEYS = {
@@ -169,6 +171,8 @@ class ModelState:
     tinker_run_ids: list[str]
     model_name: str
     server_task: asyncio.Task[None] | None = None
+    server: uvicorn.Server | None = None
+    server_shutdown_requested: bool = False
     server_host: str | None = None
     server_port: int | None = None
     server_api_key: str | None = None
@@ -251,11 +255,24 @@ class TinkerNativeBackend:
         tasks: list[asyncio.Task[None]] = []
         for state in self._model_state.values():
             if state.server_task is not None:
-                state.server_task.cancel()
+                state.server_shutdown_requested = True
+                if state.server is not None:
+                    state.server.should_exit = True
                 tasks.append(state.server_task)
-                state.server_task = None
         if tasks:
-            await asyncio.gather(*tasks, return_exceptions=True)
+            try:
+                await asyncio.wait_for(
+                    asyncio.gather(*tasks, return_exceptions=True),
+                    timeout=_SERVER_CLOSE_TIMEOUT_SECONDS,
+                )
+            except TimeoutError:
+                for task in tasks:
+                    task.cancel()
+                await asyncio.gather(*tasks, return_exceptions=True)
+            finally:
+                for state in self._model_state.values():
+                    state.server_task = None
+                    state.server = None
 
     async def register(self, model: Model) -> None:
         model.base_path = self._path
@@ -299,7 +316,9 @@ class TinkerNativeBackend:
             state.server_task = asyncio.create_task(
                 self._run_openai_server(state, host=host, port=port)
             )
-            state.server_task.add_done_callback(self._crash_on_server_exit)
+            state.server_task.add_done_callback(
+                lambda task, state=state: self._crash_on_server_exit(state, task)
+            )
 
         base_url = f"http://{host}:{port}/v1"
         await self._wait_for_server_ready(base_url, api_key, model)
@@ -641,9 +660,17 @@ class TinkerNativeBackend:
 
         server_config = uvicorn.Config(app, host=host, port=port, log_level="error")
         server = uvicorn.Server(server_config)
-        await server.serve()
+        state.server = server
+        if state.server_shutdown_requested:
+            server.should_exit = True
+        try:
+            await server.serve()
+        finally:
+            state.server = None
 
-    def _crash_on_server_exit(self, task: asyncio.Task[None]) -> None:
+    def _crash_on_server_exit(
+        self, state: ModelState, task: asyncio.Task[None]
+    ) -> None:
         try:
             task.result()
         except asyncio.CancelledError:
@@ -651,6 +678,8 @@ class TinkerNativeBackend:
         except Exception as exc:
             print(f"OpenAI server crashed: {exc}")
         else:
+            if state.server_shutdown_requested:
+                return
             print("OpenAI server exited unexpectedly.")
         os._exit(1)
 
