@@ -404,6 +404,8 @@ class RuntimeTopology(_Spec):
 
 class ArtRuntimeConfig(_Spec):
     packed_batch_capacity_bytes: int = Field(default=2 << 30, ge=1)
+    trajectory_capacity_records: int = Field(default=16_384, ge=1)
+    trajectory_capacity_bytes: int = Field(default=4 << 30, ge=1)
     vllm_output_root: str = "/tmp/art-vllm"
     gateway_bind_host: str = "0.0.0.0"
     gateway_advertise_host: str | None = None

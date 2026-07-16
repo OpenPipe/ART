@@ -30,7 +30,8 @@ T = TypeVar("T")
 
 import art
 from art import TrajectoryGroup
-from art.distributed.rollout import RolloutExecutor
+from art.distributed.rollout import DistributedTrajectoryQueue, RolloutExecutor
+from art.distributed.trajectory_store import TrajectoryGroupRef
 from art.errors import LocalServingUnavailableError
 from art.pipeline_tuner import (
     PackedGroupObservation,
@@ -288,7 +289,9 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
         self._scenario_iter: AsyncIterator[ScenarioT] | None = _to_async_iterator(
             scenarios
         )
-        self._output_queue: asyncio.Queue[TrajectoryGroup | None] | None = None
+        self._output_queue: (
+            asyncio.Queue[TrajectoryGroup | None] | DistributedTrajectoryQueue | None
+        ) = None
         self._eval_queue: asyncio.Queue[int] | None = None
         self._rollout_worker_controller = RolloutWorkerController(
             self, self.num_rollout_workers
@@ -363,7 +366,14 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
             if self.queue_maxsize is not None
             else max(1, self._freshness_queue_window() * self.target_groups_per_step)
         )
-        self._output_queue = asyncio.Queue(maxsize=queue_maxsize)
+        result_queue_factory = getattr(
+            self._rollout_executor, "create_result_queue", None
+        )
+        if callable(result_queue_factory):
+            self._output_queue = result_queue_factory(queue_maxsize)
+            await self._output_queue.start()
+        else:
+            self._output_queue = asyncio.Queue(maxsize=queue_maxsize)
         self._eval_queue = asyncio.Queue()
 
         loop = asyncio.get_running_loop()
@@ -432,6 +442,11 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
                     except (ValueError, RuntimeError):
                         pass
             cleanup_failures: list[BaseException] = []
+            if isinstance(self._output_queue, DistributedTrajectoryQueue):
+                try:
+                    await self._output_queue.close()
+                except BaseException as exc:
+                    cleanup_failures.append(exc)
             try:
                 await self._stop_attachments(training_failed=training_failed)
             except BaseException as exc:
@@ -477,6 +492,9 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
 
         loop.create_task(_notify_policy())
         if self._output_queue is not None:
+            if isinstance(self._output_queue, DistributedTrajectoryQueue):
+                loop.create_task(self._output_queue.finish())
+                return
             try:
                 self._output_queue.put_nowait(None)
             except asyncio.QueueFull:
@@ -500,7 +518,10 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
         self._rollout_worker_controller.set_target(self.num_rollout_workers)
         self._rollout_executor.set_target(self.num_rollout_workers)
         if self._output_queue is not None:
-            cast(Any, self._output_queue)._maxsize = self.queue_maxsize
+            if isinstance(self._output_queue, DistributedTrajectoryQueue):
+                self._output_queue.set_maxsize(self.queue_maxsize)
+            else:
+                cast(Any, self._output_queue)._maxsize = self.queue_maxsize
         self._status._num_workers = self.num_rollout_workers
 
     async def _start_attachments(self) -> None:
@@ -819,21 +840,35 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
                 finally:
                     token.var.reset(token)
                 rollout_wall_s = time.monotonic() - rollout_started
-                if not isinstance(group, TrajectoryGroup):
+                if not isinstance(group, TrajectoryGroup | TrajectoryGroupRef):
                     errored = True
                     continue
-                self._apply_scenario_metadata(group, scenario)
-                self._apply_policy_versions(
-                    group,
-                    initial_version=initial_version,
-                    final_version=self.state.policy_version,
-                )
+                scenario_metadata = self._scenario_metadata(scenario)
+                if isinstance(group, TrajectoryGroup):
+                    group.metadata.update(scenario_metadata)
+                    self._apply_policy_versions(
+                        group,
+                        initial_version=initial_version,
+                        final_version=self.state.policy_version,
+                    )
                 if self.state.done:
+                    if isinstance(
+                        self._output_queue, DistributedTrajectoryQueue
+                    ) and isinstance(group, TrajectoryGroupRef):
+                        await self._output_queue.discard(group)
                     break
-                queue_wait_s = await self._put_output_group(group)
-                group.metadata[_ROLLOUT_WALL_TIME_KEY] = rollout_wall_s
-                group.metadata[_QUEUE_WAIT_TIME_KEY] = queue_wait_s
-                group.metadata[_ACTOR_IDLE_TIME_KEY] = actor_idle_s + queue_wait_s
+                queue_wait_s = await self._put_output_group(
+                    group,
+                    metadata=scenario_metadata,
+                    initial_policy_version=initial_version,
+                    final_policy_version=self.state.policy_version,
+                    rollout_wall_s=rollout_wall_s,
+                    actor_idle_s=actor_idle_s,
+                )
+                if isinstance(group, TrajectoryGroup):
+                    group.metadata[_ROLLOUT_WALL_TIME_KEY] = rollout_wall_s
+                    group.metadata[_QUEUE_WAIT_TIME_KEY] = queue_wait_s
+                    group.metadata[_ACTOR_IDLE_TIME_KEY] = actor_idle_s + queue_wait_s
             except asyncio.CancelledError:
                 raise
             except LocalServingUnavailableError:
@@ -855,6 +890,9 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
             print("Scenario source exhausted; stopping training.")
             self.request_stop()
         if not self.state.done and self._output_queue is not None:
+            if isinstance(self._output_queue, DistributedTrajectoryQueue):
+                await self._output_queue.finish()
+                return
             try:
                 self._output_queue.put_nowait(None)
             except asyncio.QueueFull:
@@ -1017,7 +1055,7 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
                         result_metrics=metrics,
                     )
                 )
-                metrics.update(self._queue_freshness_metrics(current_step))
+                metrics.update(await self._queue_freshness_metrics(current_step))
                 metrics.update(self._pipeline_settings_metrics())
 
                 await self._emit_packed_group_observations(
@@ -1065,7 +1103,7 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
             if item is None:
                 saw_sentinel = True
                 break
-            self._status.note_group_dequeued(item)
+            self._status.note_group_dequeued()
             self._check_all_failed(item)
             if self._is_group_stale(item, current_step):
                 discarded += 1
@@ -1077,14 +1115,19 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
             batch.append(item)
 
         while not saw_sentinel and len(batch) < self.max_batch_size:
-            try:
-                item = self._output_queue.get_nowait()
-            except asyncio.QueueEmpty:
-                break
+            if isinstance(self._output_queue, DistributedTrajectoryQueue):
+                available, item = await self._output_queue.get_nowait()
+                if not available:
+                    break
+            else:
+                try:
+                    item = self._output_queue.get_nowait()
+                except asyncio.QueueEmpty:
+                    break
             if item is None:
                 saw_sentinel = True
                 break
-            self._status.note_group_dequeued(item)
+            self._status.note_group_dequeued()
             self._check_all_failed(item)
             if self._is_group_stale(item, current_step):
                 discarded += 1
@@ -1252,22 +1295,24 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
             if trajectory.final_policy_version is None:
                 trajectory.final_policy_version = final_version
 
-    def _apply_scenario_metadata(
-        self, group: TrajectoryGroup, scenario: ScenarioT
-    ) -> None:
+    def _scenario_metadata(
+        self, scenario: ScenarioT
+    ) -> dict[str, float | int | str | bool | None]:
         metadata = scenario.get("metadata") if isinstance(scenario, dict) else None
         if metadata is None or not isinstance(metadata, dict):
-            return
+            return {}
 
+        result: dict[str, float | int | str | bool | None] = {}
         for key, value in metadata.items():
             if not isinstance(key, str):
                 continue
             if not self._is_scalar_metadata(value):
                 continue
             if key == "scenario_id":
-                group.metadata["scenario_id"] = value
+                result["scenario_id"] = value
                 continue
-            group.metadata[f"scenario_{key}"] = value
+            result[f"scenario_{key}"] = value
+        return result
 
     @staticmethod
     def _scenario_error_context(scenario: ScenarioT) -> str:
@@ -1375,15 +1420,9 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
             return math.ceil(self.limit_mean_steps_off_policy)
         return 1
 
-    def _queue_freshness_metrics(self, current_step: int) -> dict[str, float]:
+    async def _queue_freshness_metrics(self, current_step: int) -> dict[str, float]:
         if self._output_queue is None:
             return {}
-        output_queue = cast(Any, self._output_queue)
-        queued = [
-            group
-            for group in list(output_queue._queue)
-            if isinstance(group, TrajectoryGroup)
-        ]
         limit_raw = (
             self.limit_mean_steps_off_policy
             if self.limit_mean_steps_off_policy is not None
@@ -1393,23 +1432,77 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
             limit_raw = 1.0
         limit = max(float(limit_raw), 1e-9)
         ages: list[float] = []
-        for group in queued:
-            if self.limit_mean_steps_off_policy is not None:
-                age = self._group_mean_steps_off_policy(current_step, group)
-            else:
-                initial = self._group_initial_version(group)
-                age = None if initial is None else float(current_step - initial)
-            if age is not None:
+        capacity_metrics: dict[str, float] = {}
+        if isinstance(self._output_queue, DistributedTrajectoryQueue):
+            snapshot = await self._output_queue.snapshot()
+            for item in snapshot.items:
+                descriptor = item.ref.descriptor
+                if self.limit_mean_steps_off_policy is not None:
+                    if descriptor.policy_token_counts:
+                        weight = sum(descriptor.policy_token_counts.values())
+                        age = (
+                            sum(
+                                (current_step - version) * count
+                                for version, count in descriptor.policy_token_counts.items()
+                            )
+                            / weight
+                        )
+                    else:
+                        versions = descriptor.initial_policy_versions or (
+                            item.annotations.initial_policy_version,
+                        )
+                        weights = descriptor.completion_tokens
+                        if len(weights) != len(versions) or sum(weights) <= 0:
+                            weights = (1.0,) * len(versions)
+                        age = sum(
+                            (current_step - version) * weight
+                            for version, weight in zip(versions, weights, strict=True)
+                        ) / sum(weights)
+                else:
+                    initial = min(
+                        descriptor.initial_policy_versions
+                        or (item.annotations.initial_policy_version,)
+                    )
+                    age = float(current_step - initial)
                 ages.append(float(age))
-        ready = float(len(queued))
+            ready = float(len(snapshot.items))
+            maxsize = float(snapshot.max_ready_groups)
+            put_waiting = float(self._output_queue.put_waiters)
+            capacity_metrics = {
+                "queue/data_plane_records": float(snapshot.used_records),
+                "queue/data_plane_bytes": float(snapshot.used_bytes),
+                "queue/data_plane_record_occupancy": snapshot.used_records
+                / snapshot.capacity_records,
+                "queue/data_plane_byte_occupancy": snapshot.used_bytes
+                / snapshot.capacity_bytes,
+                "queue/leased_groups": float(snapshot.leased_groups),
+            }
+        else:
+            output_queue = cast(Any, self._output_queue)
+            queued = [
+                group
+                for group in list(output_queue._queue)
+                if isinstance(group, TrajectoryGroup)
+            ]
+            for group in queued:
+                if self.limit_mean_steps_off_policy is not None:
+                    age = self._group_mean_steps_off_policy(current_step, group)
+                else:
+                    initial = self._group_initial_version(group)
+                    age = None if initial is None else float(current_step - initial)
+                if age is not None:
+                    ages.append(float(age))
+            ready = float(len(queued))
+            maxsize = float(self._output_queue.maxsize)
+            put_waiting = 0.0
         stale = sum(1 for age in ages if age > limit)
         return {
             "queue/ready_groups_est": ready,
             "queue/completed_backlog_groups": ready,
-            "queue/put_waiting_groups": 0.0,
+            "queue/put_waiting_groups": put_waiting,
             "queue/groups_depth": ready,
-            "queue/groups_depth_max": float(self._output_queue.maxsize),
-            "queue/occupancy": ready / max(float(self._output_queue.maxsize), 1.0),
+            "queue/groups_depth_max": maxsize,
+            "queue/occupancy": ready / max(maxsize, 1.0),
             "queue/predicted_policy_age_mean_steps": sum(ages) / len(ages)
             if ages
             else 0.0,
@@ -1422,6 +1515,7 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
             if ages
             else 0.0,
             "queue/predicted_stale_fraction": stale / len(ages) if ages else 0.0,
+            **capacity_metrics,
         }
 
     def _pipeline_settings_metrics(self) -> dict[str, float]:
@@ -1812,13 +1906,38 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
     def _is_scalar_metadata(value: object) -> bool:
         return value is None or isinstance(value, (str, int, float, bool))
 
-    async def _put_output_group(self, group: TrajectoryGroup) -> float:
+    async def _put_output_group(
+        self,
+        group: TrajectoryGroup | TrajectoryGroupRef,
+        *,
+        metadata: dict[str, float | int | str | bool | None],
+        initial_policy_version: int,
+        final_policy_version: int,
+        rollout_wall_s: float,
+        actor_idle_s: float,
+    ) -> float:
         assert self._output_queue is not None
         queue_wait_started = time.monotonic()
+        if isinstance(self._output_queue, DistributedTrajectoryQueue):
+            if not isinstance(group, TrajectoryGroupRef):
+                raise RuntimeError("distributed result queue requires a stored group")
+            accepted, wait_s = await self._output_queue.put(
+                group,
+                metadata=metadata,
+                initial_policy_version=initial_policy_version,
+                final_policy_version=final_policy_version,
+                rollout_wall_s=rollout_wall_s,
+                actor_idle_s=actor_idle_s,
+            )
+            if accepted:
+                self._status.note_group_enqueued()
+            return wait_s
+        if not isinstance(group, TrajectoryGroup):
+            raise RuntimeError("local result queue requires a trajectory group")
         while not self.state.done:
             try:
                 await asyncio.wait_for(self._output_queue.put(group), timeout=1.0)
-                self._status.note_group_enqueued(group)
+                self._status.note_group_enqueued()
                 return time.monotonic() - queue_wait_started
             except asyncio.TimeoutError:
                 continue

@@ -33,6 +33,16 @@ from .monarch_runtime import RemoteCallError, RemoteCallResult
 from .packing import PackingRequest, PackingResult
 from .rollout import RolloutInvocation, RolloutResult
 from .specs import HostServiceHealth
+from .trajectory_store import (
+    TrajectoryCapacityError,
+    TrajectoryEnqueueResult,
+    TrajectoryGroupRef,
+    TrajectoryLeaseError,
+    TrajectoryQueueItem,
+    TrajectoryQueueSnapshot,
+    TrajectoryQueueStore,
+    TrajectoryQueueTake,
+)
 from .vllm_replica import HostMemberLaunchRequest
 
 
@@ -50,9 +60,9 @@ def resilient_endpoint(function: Any) -> Any:
                 kind = "cancelled"
             elif isinstance(error, LocalServingUnavailableError):
                 kind = "serving"
-            elif isinstance(error, PackedBatchCapacityError):
+            elif isinstance(error, PackedBatchCapacityError | TrajectoryCapacityError):
                 kind = "capacity"
-            elif isinstance(error, PackedBatchLeaseError):
+            elif isinstance(error, PackedBatchLeaseError | TrajectoryLeaseError):
                 kind = "lease"
             elif isinstance(error, (TypeError, ValueError)):
                 kind = "input"
@@ -87,6 +97,7 @@ class RolloutHostService(Actor):
             host_id=self.host_id, capacity_bytes=packed_batch_capacity_bytes
         )
         self._rdma_batches: dict[str, tuple[Any, Any, shared_memory.SharedMemory]] = {}
+        self._trajectory_queues: dict[str, TrajectoryQueueStore] = {}
         self._packer = None
         self._vllm_output_root = vllm_output_root
         self._vllm_launcher = None
@@ -119,6 +130,9 @@ class RolloutHostService(Actor):
 
     @resilient_endpoint
     async def close(self) -> None:
+        for queue in self._trajectory_queues.values():
+            queue.close()
+        self._trajectory_queues.clear()
         for batch_id in tuple(self._rdma_batches):
             await self._drop_batch(batch_id)
         if self._packer is not None:
@@ -128,6 +142,63 @@ class RolloutHostService(Actor):
             await self._vllm_launcher.close()
             self._vllm_launcher = None
         self.inbox.store.close()
+
+    @resilient_endpoint
+    async def create_trajectory_queue(
+        self,
+        queue_id: str,
+        max_ready_groups: int,
+        capacity_records: int,
+        capacity_bytes: int,
+    ) -> None:
+        if queue_id in self._trajectory_queues:
+            raise ValueError(f"trajectory queue {queue_id!r} already exists")
+        self._trajectory_queues[queue_id] = TrajectoryQueueStore(
+            max_ready_groups=max_ready_groups,
+            capacity_records=capacity_records,
+            capacity_bytes=capacity_bytes,
+        )
+
+    @resilient_endpoint
+    async def enqueue_trajectory(
+        self, queue_id: str, item: TrajectoryQueueItem, max_ready_groups: int
+    ) -> TrajectoryEnqueueResult:
+        return self._trajectory_queue(queue_id).enqueue(
+            item, max_ready_groups=max_ready_groups
+        )
+
+    @resilient_endpoint
+    async def take_trajectory(
+        self, queue_id: str, consumer_id: str
+    ) -> TrajectoryQueueTake:
+        return self._trajectory_queue(queue_id).take(consumer_id)
+
+    @resilient_endpoint
+    async def acknowledge_trajectory(
+        self, queue_id: str, result_id: str, consumer_id: str
+    ) -> None:
+        self._trajectory_queue(queue_id).acknowledge(result_id, consumer_id)
+
+    @resilient_endpoint
+    async def finish_trajectory_queue(self, queue_id: str) -> None:
+        self._trajectory_queue(queue_id).finish()
+
+    @resilient_endpoint
+    async def trajectory_queue_snapshot(self, queue_id: str) -> TrajectoryQueueSnapshot:
+        return self._trajectory_queue(queue_id).snapshot()
+
+    @resilient_endpoint
+    async def close_trajectory_queue(
+        self, queue_id: str
+    ) -> tuple[TrajectoryGroupRef, ...]:
+        queue = self._trajectory_queues.pop(queue_id, None)
+        return () if queue is None else queue.close()
+
+    def _trajectory_queue(self, queue_id: str) -> TrajectoryQueueStore:
+        try:
+            return self._trajectory_queues[queue_id]
+        except KeyError:
+            raise ValueError(f"unknown trajectory queue {queue_id!r}") from None
 
     def _launcher(self):
         if self._vllm_launcher is None:
@@ -254,8 +325,15 @@ class RolloutHostService(Actor):
 class RolloutWorkerService(Actor):
     """One process-isolated CPU rollout slot."""
 
-    def __init__(self) -> None:
+    def __init__(self, capacity_records: int, capacity_bytes: int) -> None:
+        from .trajectory_store import TrajectoryRecordStore
+
         self._models = OrderedDict()
+        self._results = TrajectoryRecordStore(
+            owner_actor_id=f"rollout:{socket.gethostname()}:{os.getpid()}",
+            capacity_records=capacity_records,
+            capacity_bytes=capacity_bytes,
+        )
 
     @resilient_endpoint
     async def run(self, invocation: RolloutInvocation):
@@ -279,10 +357,24 @@ class RolloutWorkerService(Actor):
             )
         finally:
             token.var.reset(token)
+        if invocation.store_result:
+            from art import TrajectoryGroup
+
+            if isinstance(value, TrajectoryGroup):
+                value = self._results.put(value)
         return RolloutResult(value=value, metrics=await builder.drain_pending())
+
+    @resilient_endpoint
+    async def materialize_result(self, ref: TrajectoryGroupRef):
+        return self._results.payload(ref)
+
+    @resilient_endpoint
+    async def drop_result(self, ref: TrajectoryGroupRef) -> None:
+        self._results.drop(ref)
 
     @resilient_endpoint
     async def close(self) -> None:
         for model in self._models.values():
             await model._reset_inference_runtime()
         self._models.clear()
+        self._results.close()

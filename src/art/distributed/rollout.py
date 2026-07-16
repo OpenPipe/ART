@@ -8,12 +8,25 @@ import importlib
 import inspect
 import json
 from pathlib import Path
+import time
 from typing import Any, Protocol
+import uuid
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from art.model import TrainableModel
 from art.serving_capabilities import ServingCapabilities
+from art.trajectories import MetadataValue, TrajectoryGroup
+
+from .trajectory_store import (
+    TrajectoryCapacityError,
+    TrajectoryEnqueueResult,
+    TrajectoryGroupAnnotations,
+    TrajectoryGroupRef,
+    TrajectoryQueueItem,
+    TrajectoryQueueSnapshot,
+    TrajectoryQueueTake,
+)
 
 
 class InstalledAsyncCallable(BaseModel):
@@ -158,6 +171,7 @@ class RolloutInvocation(BaseModel):
     model: RolloutModelSpec
     scenario: Any
     config: Any
+    store_result: bool = False
 
 
 class RolloutResult(BaseModel):
@@ -168,7 +182,8 @@ class RolloutResult(BaseModel):
 
 
 class RolloutExecutor(Protocol):
-    max_workers: int | None
+    @property
+    def max_workers(self) -> int | None: ...
 
     def set_target(self, target_workers: int) -> None: ...
 
@@ -209,7 +224,238 @@ class LocalRolloutExecutor:
 class RolloutHostEndpoint(Protocol):
     async def run(self, invocation: RolloutInvocation) -> RolloutResult: ...
 
+    async def materialize(self, ref: TrajectoryGroupRef) -> TrajectoryGroup: ...
+
+    async def drop(self, ref: TrajectoryGroupRef) -> None: ...
+
     async def close(self) -> None: ...
+
+
+class TrajectoryQueueEndpoint(Protocol):
+    async def create(
+        self,
+        queue_id: str,
+        max_ready_groups: int,
+        capacity_records: int,
+        capacity_bytes: int,
+    ) -> None: ...
+
+    async def enqueue(
+        self, queue_id: str, item: TrajectoryQueueItem, max_ready_groups: int
+    ) -> TrajectoryEnqueueResult: ...
+
+    async def take(self, queue_id: str, consumer_id: str) -> TrajectoryQueueTake: ...
+
+    async def acknowledge(
+        self, queue_id: str, result_id: str, consumer_id: str
+    ) -> None: ...
+
+    async def finish(self, queue_id: str) -> None: ...
+
+    async def snapshot(self, queue_id: str) -> TrajectoryQueueSnapshot: ...
+
+    async def close(self, queue_id: str) -> tuple[TrajectoryGroupRef, ...]: ...
+
+
+class DistributedTrajectoryQueue:
+    def __init__(
+        self,
+        *,
+        endpoint: TrajectoryQueueEndpoint,
+        owner_endpoints: dict[str, RolloutHostEndpoint],
+        maxsize: int,
+        capacity_records: int,
+        capacity_bytes: int,
+    ) -> None:
+        if maxsize < 1:
+            raise ValueError("trajectory queue maxsize must be positive")
+        self.endpoint = endpoint
+        self.owner_endpoints = owner_endpoints
+        self.maxsize = maxsize
+        self.capacity_records = capacity_records
+        self.capacity_bytes = capacity_bytes
+        self.queue_id = uuid.uuid4().hex
+        self.consumer_id = f"pipeline:{uuid.uuid4().hex}"
+        self.put_waiters = 0
+        self._started = False
+        self._finished = False
+        self._closed = False
+        self._cleanup_refs: tuple[TrajectoryGroupRef, ...] = ()
+
+    async def start(self) -> None:
+        if self._started:
+            return
+        await self.endpoint.create(
+            self.queue_id,
+            self.maxsize,
+            self.capacity_records,
+            self.capacity_bytes,
+        )
+        self._started = True
+
+    def set_maxsize(self, maxsize: int) -> None:
+        if maxsize < 1:
+            raise ValueError("trajectory queue maxsize must be positive")
+        self.maxsize = maxsize
+
+    async def put(
+        self,
+        ref: TrajectoryGroupRef,
+        *,
+        metadata: dict[str, MetadataValue],
+        initial_policy_version: int,
+        final_policy_version: int,
+        rollout_wall_s: float,
+        actor_idle_s: float,
+    ) -> tuple[bool, float]:
+        started = time.monotonic()
+        transferred = False
+        self.put_waiters += 1
+        try:
+            while not self._closed:
+                wait_s = time.monotonic() - started
+                request = asyncio.create_task(
+                    self.endpoint.enqueue(
+                        self.queue_id,
+                        TrajectoryQueueItem(
+                            ref=ref,
+                            annotations=TrajectoryGroupAnnotations(
+                                metadata=metadata,
+                                initial_policy_version=initial_policy_version,
+                                final_policy_version=final_policy_version,
+                                rollout_wall_s=rollout_wall_s,
+                                actor_idle_s=actor_idle_s + wait_s,
+                                queue_wait_s=wait_s,
+                            ),
+                        ),
+                        self.maxsize,
+                    )
+                )
+                try:
+                    result = await asyncio.shield(request)
+                except asyncio.CancelledError:
+                    result = await request
+                    transferred = result.status == "accepted"
+                    raise
+                if result.status == "accepted":
+                    transferred = True
+                    return True, time.monotonic() - started
+                if result.status == "oversize":
+                    raise TrajectoryCapacityError(result.reason or "oversize result")
+                if result.status == "closed":
+                    return False, time.monotonic() - started
+                await asyncio.sleep(0.05)
+            return False, time.monotonic() - started
+        finally:
+            self.put_waiters -= 1
+            if not transferred:
+                await self._owner(ref).drop(ref)
+
+    async def get(self) -> TrajectoryGroup | None:
+        while not self._closed:
+            take = await self.endpoint.take(self.queue_id, self.consumer_id)
+            if take.item is not None:
+                return await self._consume(take.item)
+            if take.closed:
+                return None
+            await asyncio.sleep(0.01)
+        return None
+
+    async def get_nowait(self) -> tuple[bool, TrajectoryGroup | None]:
+        if self._closed:
+            return True, None
+        take = await self.endpoint.take(self.queue_id, self.consumer_id)
+        if take.item is not None:
+            return True, await self._consume(take.item)
+        return take.closed, None
+
+    async def finish(self) -> None:
+        if self._started and not self._finished and not self._closed:
+            await self.endpoint.finish(self.queue_id)
+            self._finished = True
+
+    async def discard(self, ref: TrajectoryGroupRef) -> None:
+        await self._owner(ref).drop(ref)
+
+    async def snapshot(self) -> TrajectoryQueueSnapshot:
+        if not self._started or self._closed:
+            return TrajectoryQueueSnapshot(
+                items=(),
+                max_ready_groups=self.maxsize,
+                capacity_records=self.capacity_records,
+                capacity_bytes=self.capacity_bytes,
+                used_records=0,
+                used_bytes=0,
+                leased_groups=0,
+            )
+        return await self.endpoint.snapshot(self.queue_id)
+
+    async def close(self) -> None:
+        if not self._closed:
+            self._closed = True
+            if self._started:
+                self._cleanup_refs = await self.endpoint.close(self.queue_id)
+        refs = self._cleanup_refs
+        results = await asyncio.gather(
+            *(self._owner(ref).drop(ref) for ref in refs), return_exceptions=True
+        )
+        self._cleanup_refs = tuple(
+            ref
+            for ref, result in zip(refs, results, strict=True)
+            if isinstance(result, BaseException)
+        )
+        failures = [result for result in results if isinstance(result, BaseException)]
+        if failures:
+            raise BaseExceptionGroup("trajectory queue cleanup failed", failures)
+
+    async def _consume(self, item: TrajectoryQueueItem) -> TrajectoryGroup:
+        owner = self._owner(item.ref)
+        try:
+            group = await owner.materialize(item.ref)
+        except BaseException as error:
+            cleanup = await self._release(item, owner)
+            if cleanup:
+                raise BaseExceptionGroup(
+                    "trajectory materialization and release failed", [error, *cleanup]
+                ) from None
+            raise
+        cleanup = await self._release(item, owner)
+        if cleanup:
+            raise BaseExceptionGroup("trajectory result release failed", cleanup)
+        annotations = item.annotations
+        group.metadata.update(annotations.metadata)
+        group.metadata["_art_rollout_wall_s"] = annotations.rollout_wall_s
+        group.metadata["_art_actor_idle_s"] = annotations.actor_idle_s
+        group.metadata["_art_queue_wait_s"] = annotations.queue_wait_s
+        for trajectory in group.trajectories:
+            if trajectory.initial_policy_version is None:
+                trajectory.initial_policy_version = annotations.initial_policy_version
+            if trajectory.final_policy_version is None:
+                trajectory.final_policy_version = annotations.final_policy_version
+        return group
+
+    async def _release(
+        self, item: TrajectoryQueueItem, owner: RolloutHostEndpoint
+    ) -> list[BaseException]:
+        try:
+            await owner.drop(item.ref)
+        except BaseException as error:
+            return [error]
+        try:
+            await self.endpoint.acknowledge(
+                self.queue_id, item.ref.result_id, self.consumer_id
+            )
+        except BaseException as error:
+            return [error]
+        return []
+
+    def _owner(self, ref: TrajectoryGroupRef) -> RolloutHostEndpoint:
+        try:
+            return self.owner_endpoints[ref.owner_actor_id]
+        except KeyError:
+            raise RuntimeError(
+                f"trajectory owner {ref.owner_actor_id!r} is unavailable"
+            ) from None
 
 
 def apportion_rollout_workers(
@@ -245,6 +491,9 @@ class DistributedRolloutExecutor:
         callable: InstalledAsyncCallable,
         hosts: Mapping[str, Sequence[RolloutHostEndpoint]],
         target_workers: int,
+        queue_endpoint: TrajectoryQueueEndpoint | None = None,
+        trajectory_capacity_records: int = 16_384,
+        trajectory_capacity_bytes: int = 4 << 30,
     ) -> None:
         if not hosts or any(not endpoints for endpoints in hosts.values()):
             raise ValueError("rollout hosts must each provide at least one endpoint")
@@ -253,7 +502,26 @@ class DistributedRolloutExecutor:
         self.max_workers = sum(len(endpoints) for endpoints in self.hosts.values())
         self._worker_endpoints: tuple[RolloutHostEndpoint, ...] = ()
         self._endpoint_by_worker: dict[int, RolloutHostEndpoint] = {}
+        self._queue_endpoint = queue_endpoint
+        self._trajectory_capacity_records = trajectory_capacity_records
+        self._trajectory_capacity_bytes = trajectory_capacity_bytes
+        self._endpoint_by_owner: dict[str, RolloutHostEndpoint] = {}
+        self._result_queue: DistributedTrajectoryQueue | None = None
         self.set_target(target_workers)
+
+    def create_result_queue(self, maxsize: int) -> DistributedTrajectoryQueue:
+        if self._queue_endpoint is None:
+            raise RuntimeError("distributed rollout executor has no result queue")
+        if self._result_queue is not None:
+            raise RuntimeError("distributed rollout result queue already exists")
+        self._result_queue = DistributedTrajectoryQueue(
+            endpoint=self._queue_endpoint,
+            owner_endpoints=self._endpoint_by_owner,
+            maxsize=maxsize,
+            capacity_records=self._trajectory_capacity_records,
+            capacity_bytes=self._trajectory_capacity_bytes,
+        )
+        return self._result_queue
 
     def set_target(self, target_workers: int) -> None:
         allocation = apportion_rollout_workers(
@@ -315,6 +583,7 @@ class DistributedRolloutExecutor:
                 model=RolloutModelSpec.from_model(model),
                 scenario=scenario,
                 config=config,
+                store_result=self._result_queue is not None,
             )
         )
         if result.metrics:
@@ -328,16 +597,36 @@ class DistributedRolloutExecutor:
                 ) from None
             for key, value in result.metrics.items():
                 builder.add_metric(key, value)
+        if isinstance(result.value, TrajectoryGroupRef):
+            existing = self._endpoint_by_owner.setdefault(
+                result.value.owner_actor_id, endpoint
+            )
+            if existing is not endpoint:
+                raise RuntimeError(
+                    f"trajectory owner {result.value.owner_actor_id!r} changed endpoint"
+                )
         return result.value
 
     async def close(self) -> None:
-        await asyncio.gather(
+        failures: list[BaseException] = []
+        if self._result_queue is not None:
+            try:
+                await self._result_queue.close()
+            except BaseException as error:
+                failures.append(error)
+        results = await asyncio.gather(
             *(
                 endpoint.close()
                 for endpoints in self.hosts.values()
                 for endpoint in endpoints
-            )
+            ),
+            return_exceptions=True,
         )
+        failures.extend(
+            result for result in results if isinstance(result, BaseException)
+        )
+        if failures:
+            raise BaseExceptionGroup("distributed rollout cleanup failed", failures)
 
 
 class InProcessRolloutHost:
@@ -356,6 +645,12 @@ class InProcessRolloutHost:
         finally:
             token.var.reset(token)
         return RolloutResult(value=value, metrics=await builder.drain_pending())
+
+    async def materialize(self, ref: TrajectoryGroupRef) -> TrajectoryGroup:
+        raise RuntimeError(f"in-process rollout host does not own {ref.result_id}")
+
+    async def drop(self, ref: TrajectoryGroupRef) -> None:
+        raise RuntimeError(f"in-process rollout host does not own {ref.result_id}")
 
     async def close(self) -> None:
         return None

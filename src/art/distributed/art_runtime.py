@@ -41,6 +41,7 @@ from .monarch_runtime import (
     MonarchPackedBatchSource,
     MonarchPackingEndpoint,
     MonarchRolloutHostEndpoint,
+    MonarchTrajectoryQueueEndpoint,
     MonarchVllmHostLauncher,
     call_remote,
 )
@@ -381,6 +382,11 @@ class ArtRuntime:
             callable=rollout_callable,
             hosts=hosts,
             target_workers=target_workers,
+            queue_endpoint=MonarchTrajectoryQueueEndpoint(
+                self._host_actors[self.topology.cluster.controller_host_id]
+            ),
+            trajectory_capacity_records=self.config.trajectory_capacity_records,
+            trajectory_capacity_bytes=self.config.trajectory_capacity_bytes,
         )
 
     def _start_rollout_workers(self) -> None:
@@ -403,6 +409,8 @@ class ArtRuntime:
                     f"art_rollout_worker_{self.runtime_id}_{host.host_id}"
                 ),
                 RolloutWorkerService,
+                self.config.trajectory_capacity_records,
+                self.config.trajectory_capacity_bytes,
             )
             self._rollout_procs[host.host_id] = proc
             self._rollout_actors[host.host_id] = actor

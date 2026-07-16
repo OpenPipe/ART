@@ -110,11 +110,11 @@ class StatusReporter:
             self._errored += 1
         self._refresh_status()
 
-    def note_group_enqueued(self, _group: TrajectoryGroup) -> None:
+    def note_group_enqueued(self) -> None:
         self._queued += 1
         self._refresh_status()
 
-    def note_group_dequeued(self, _group: TrajectoryGroup) -> None:
+    def note_group_dequeued(self) -> None:
         if self._queued > 0:
             self._queued -= 1
         self._refresh_status()

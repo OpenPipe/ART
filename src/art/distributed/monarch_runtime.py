@@ -5,12 +5,21 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict
 
+from art.trajectories import TrajectoryGroup
+
 from .data_plane import PackedBatchRef
 from .packing import PackingRequest, PackingResult
 from .rollout import (
     RolloutHostEndpoint,
     RolloutInvocation,
     RolloutResult,
+)
+from .trajectory_store import (
+    TrajectoryEnqueueResult,
+    TrajectoryGroupRef,
+    TrajectoryQueueItem,
+    TrajectoryQueueSnapshot,
+    TrajectoryQueueTake,
 )
 from .vllm_replica import HostMemberLaunchRequest, HostMemberState
 
@@ -68,9 +77,62 @@ class MonarchRolloutHostEndpoint(RolloutHostEndpoint):
         await self.actor.initialized
         return await call_remote(self.actor.run, invocation)
 
+    async def materialize(self, ref: TrajectoryGroupRef) -> TrajectoryGroup:
+        payload = await call_remote(self.actor.materialize_result, ref)
+        return payload.build()
+
+    async def drop(self, ref: TrajectoryGroupRef) -> None:
+        await call_remote(self.actor.drop_result, ref)
+
     async def close(self) -> None:
         if self.owns_actor:
             await call_remote(self.actor.close)
+
+
+class MonarchTrajectoryQueueEndpoint:
+    def __init__(self, actor: Any) -> None:
+        self.actor = actor
+
+    async def create(
+        self,
+        queue_id: str,
+        max_ready_groups: int,
+        capacity_records: int,
+        capacity_bytes: int,
+    ) -> None:
+        await call_remote(
+            self.actor.create_trajectory_queue,
+            queue_id,
+            max_ready_groups,
+            capacity_records,
+            capacity_bytes,
+        )
+
+    async def enqueue(
+        self, queue_id: str, item: TrajectoryQueueItem, max_ready_groups: int
+    ) -> TrajectoryEnqueueResult:
+        return await call_remote(
+            self.actor.enqueue_trajectory, queue_id, item, max_ready_groups
+        )
+
+    async def take(self, queue_id: str, consumer_id: str) -> TrajectoryQueueTake:
+        return await call_remote(self.actor.take_trajectory, queue_id, consumer_id)
+
+    async def acknowledge(
+        self, queue_id: str, result_id: str, consumer_id: str
+    ) -> None:
+        await call_remote(
+            self.actor.acknowledge_trajectory, queue_id, result_id, consumer_id
+        )
+
+    async def finish(self, queue_id: str) -> None:
+        await call_remote(self.actor.finish_trajectory_queue, queue_id)
+
+    async def snapshot(self, queue_id: str) -> TrajectoryQueueSnapshot:
+        return await call_remote(self.actor.trajectory_queue_snapshot, queue_id)
+
+    async def close(self, queue_id: str) -> tuple[TrajectoryGroupRef, ...]:
+        return await call_remote(self.actor.close_trajectory_queue, queue_id)
 
 
 class MonarchVllmHostLauncher:
