@@ -15,7 +15,7 @@ permissions:
   pull-requests: read
 
 concurrency:
-  group: trainer-rank-gpu-${{ github.event.pull_request.number || inputs.pr_number }}
+  group: trainer-rank-gpu-${{ github.event_name }}-${{ github.event.pull_request.number || inputs.pr_number }}
   cancel-in-progress: true
 
 jobs:
