@@ -293,10 +293,9 @@ class MegatronBackend(LocalBackend):
         from .distributed_service import DistributedMegatronService
 
         distributed = cast(DistributedMegatronService, service)
-        current_step = distributed.learner_version
         await distributed.advance_without_training(
             expected_step=current_step,
-            learner_version=current_step + 1,
+            learner_version=next_step,
         )
 
     async def _get_step(self, model: AnyTrainableModel) -> int:

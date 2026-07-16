@@ -18,6 +18,8 @@ import warnings
 
 from art.utils.lifecycle import (
     PROCESS_SHUTDOWN_TIMEOUT_SECONDS,
+    complete_task,
+    complete_to_thread,
     process_shutdown_timeout,
 )
 
@@ -1442,8 +1444,43 @@ class LocalBackend:
         if not os.path.exists(current):
             return
         checkpoint = get_step_checkpoint_dir(model_dir, next_step)
-        shutil.copytree(current, checkpoint, dirs_exist_ok=True)
-        await service.register_lora_for_step(next_step, checkpoint)
+        if os.path.exists(checkpoint):
+            raise RuntimeError(f"Refusing to replace checkpoint {checkpoint}")
+        registration_started = False
+        try:
+            _, cancelled = await complete_to_thread(
+                lambda: shutil.copytree(current, checkpoint)
+            )
+            if cancelled is not None:
+                raise cancelled
+            registration_started = True
+            await service.register_lora_for_step(next_step, checkpoint)
+        except BaseException as error:
+            failures: list[BaseException] = [error]
+            if registration_started:
+                self._services.pop(model.name, None)
+                try:
+                    _, close_cancelled = await complete_task(
+                        asyncio.create_task(service.aclose())
+                    )
+                    if close_cancelled is not None:
+                        failures.append(close_cancelled)
+                except BaseException as close_error:
+                    failures.append(close_error)
+            if os.path.exists(checkpoint):
+                try:
+                    _, remove_cancelled = await complete_to_thread(
+                        lambda: shutil.rmtree(checkpoint)
+                    )
+                    if remove_cancelled is not None:
+                        failures.append(remove_cancelled)
+                except BaseException as remove_error:
+                    failures.append(remove_error)
+            if len(failures) > 1:
+                raise BaseExceptionGroup(
+                    "skipped-step publication and rollback failed", failures
+                ) from None
+            raise
 
     async def _train_model(
         self,
@@ -1480,7 +1517,7 @@ class LocalBackend:
             )
 
             # Still advance the step by renaming the checkpoint directory
-            current_step = self.__get_step(model)
+            current_step = await self._get_step(model)
             next_step = current_step + 1
             logger.info(
                 f"[BACKEND] _train_model SKIP: current_step={current_step} "

@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import AsyncIterator, Callable
+from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 import hashlib
 import json
@@ -9,7 +9,7 @@ import logging
 import os
 from pathlib import Path
 import shutil
-from typing import Any, Literal, TypeVar, cast
+from typing import Any, Literal, cast
 import uuid
 
 import httpx
@@ -33,6 +33,7 @@ from art.serving_capabilities import (
     ServingCapabilities,
     discover_serving_capabilities,
 )
+from art.utils.lifecycle import complete_task, complete_to_thread
 from art.utils.output_dirs import get_step_checkpoint_dir
 from art.vllm_runtime import (
     get_external_vllm_runtime_config,
@@ -78,36 +79,11 @@ from .runtime.specs import (
 from .runtime_config import get_megatron_runtime_config
 
 logger = logging.getLogger(__name__)
-_T = TypeVar("_T")
 
 
 def _consume_task_result(task: asyncio.Future[Any]) -> None:
     if not task.cancelled():
         task.exception()
-
-
-async def _complete_to_thread(
-    operation: Callable[[], _T],
-) -> tuple[_T, asyncio.CancelledError | None]:
-    task = asyncio.create_task(asyncio.to_thread(operation))
-    cancelled: asyncio.CancelledError | None = None
-    while not task.done():
-        try:
-            await asyncio.shield(task)
-        except asyncio.CancelledError as error:
-            if task.cancelled():
-                break
-            cancelled = cancelled or error
-        except BaseException:
-            break
-    try:
-        result = task.result()
-    except BaseException as error:
-        if cancelled is not None:
-            cancelled.add_note(f"filesystem transaction also failed: {error}")
-            raise cancelled
-        raise
-    return result, cancelled
 
 
 class DistributedMegatronService:
@@ -133,6 +109,7 @@ class DistributedMegatronService:
         self.runtime = runtime
         self.enable_expert_replay = enable_expert_replay
         self._latest_step = 0
+        self._resume_prepared = False
         self._training_session_id = uuid.uuid4().hex
         self._trainer: Any = None
         self._mutation_lock = asyncio.Lock()
@@ -167,10 +144,6 @@ class DistributedMegatronService:
     def _require_open(self) -> None:
         if self._closed:
             raise RuntimeError("distributed model service is closed")
-
-    @property
-    def learner_version(self) -> int:
-        return self._latest_step
 
     def _trainer_is_current(self) -> bool:
         return (
@@ -209,6 +182,7 @@ class DistributedMegatronService:
                 raise RuntimeError(
                     f"resident trainer adapter is missing for step {self._latest_step}"
                 )
+            self._resume_prepared = True
             return path
         resume = prepare_megatron_resume_state(
             output_dir=self.output_dir,
@@ -241,6 +215,7 @@ class DistributedMegatronService:
                 allow_unvalidated_arch=self._allow_unvalidated_arch,
                 handler=handler,
             )
+        self._resume_prepared = True
         return path
 
     def _runtime_spec(self) -> TrainerRuntimeSpec:
@@ -361,7 +336,7 @@ class DistributedMegatronService:
         staging: str,
     ) -> AsyncIterator[AsyncIterator[Any]]:
         async with async_optimizer_model_lease(job.output.optimizer_state_path):
-            _, cancelled = await _complete_to_thread(
+            _, cancelled = await complete_to_thread(
                 lambda: _copy_checkpoint(source, staging)
             )
             if cancelled is not None:
@@ -575,7 +550,7 @@ class DistributedMegatronService:
                 for replica_id, value in zip(replica_ids, starts, strict=True)
                 if not isinstance(value, BaseException)
             )
-            cleanup = await self._rollback_server_start(None, started)
+            cleanup = await self._rollback_server_start_safely(None, started)
             if cleanup:
                 raise BaseExceptionGroup(
                     "vLLM replica startup cancellation and rollback failed",
@@ -589,7 +564,7 @@ class DistributedMegatronService:
                 for replica_id, value in zip(replica_ids, starts, strict=True)
                 if not isinstance(value, BaseException)
             )
-            failures.extend(await self._rollback_server_start(None, started))
+            failures.extend(await self._rollback_server_start_safely(None, started))
             raise BaseExceptionGroup("vLLM replica startup failed", failures)
         base_urls = tuple(
             f"http://{replica.leader_endpoint.host}:{replica.leader_endpoint.port}"
@@ -673,7 +648,7 @@ class DistributedMegatronService:
                 port = await gateway.start(self.runtime.config.gateway_bind_host)
                 gateway_endpoint = (self._gateway_advertise_host(), port)
         except BaseException as error:
-            cleanup = await self._rollback_server_start(gateway, replica_ids)
+            cleanup = await self._rollback_server_start_safely(gateway, replica_ids)
             if cleanup:
                 raise BaseExceptionGroup(
                     "vLLM startup validation and rollback failed", [error, *cleanup]
@@ -889,6 +864,16 @@ class DistributedMegatronService:
             )
             if isinstance(result, BaseException)
         )
+        return failures
+
+    async def _rollback_server_start_safely(
+        self, gateway: Any, replica_ids: tuple[str, ...]
+    ) -> list[BaseException]:
+        failures, cancelled = await complete_task(
+            asyncio.create_task(self._rollback_server_start(gateway, replica_ids))
+        )
+        if cancelled is not None:
+            failures.append(cancelled)
         return failures
 
     def _routing_table(
@@ -1181,6 +1166,13 @@ class DistributedMegatronService:
     ) -> None:
         async with self._mutation_lock:
             self._require_open()
+            if self._trainer is not None and not self._trainer_is_current():
+                await self._trainer.close()
+                self._trainer = None
+            if not self._resume_prepared and self._trainer is None:
+                _, cancelled = await complete_to_thread(self._resolve_current_lora_path)
+                if cancelled is not None:
+                    raise cancelled
             if expected_step != self._latest_step:
                 raise ValueError(
                     "no-op policy transition expected the wrong service step: "
@@ -1188,9 +1180,6 @@ class DistributedMegatronService:
                 )
             if learner_version != expected_step + 1:
                 raise ValueError("a no-op policy transition must advance one step")
-            if self._trainer is not None and not self._trainer_is_current():
-                await self._trainer.close()
-                self._trainer = None
             trainer = self._trainer
             source = get_step_checkpoint_dir(self.output_dir, expected_step)
             staging = (
@@ -1216,12 +1205,12 @@ class DistributedMegatronService:
                         raise RuntimeError(
                             "no resident trainer can checkpoint newer optimizer state"
                         )
-                    _, cancelled = await _complete_to_thread(
+                    _, cancelled = await complete_to_thread(
                         lambda: _copy_checkpoint(source, staging)
                     )
                     if cancelled is not None:
                         raise cancelled
-                    published, cancelled = await _complete_to_thread(
+                    published, cancelled = await complete_to_thread(
                         lambda: _publish_checkpoint(
                             staging, self.output_dir, learner_version
                         )
@@ -1231,7 +1220,7 @@ class DistributedMegatronService:
                     if cancelled is not None:
                         raise cancelled
                     if not flush_optimizer:
-                        _, cancelled = await _complete_to_thread(
+                        _, cancelled = await complete_to_thread(
                             lambda: commit_optimizer_policy_advance(
                                 self._optimizer_state_path,
                                 initial_adapter_path=initial,
@@ -1268,7 +1257,7 @@ class DistributedMegatronService:
                 failures: list[BaseException] = [error]
                 if published is None:
                     try:
-                        published, discovery_cancelled = await _complete_to_thread(
+                        published, discovery_cancelled = await complete_to_thread(
                             lambda: read_adapter_publication(
                                 get_step_checkpoint_dir(
                                     self.output_dir, learner_version
@@ -1284,7 +1273,7 @@ class DistributedMegatronService:
                 reconcile_checkpoint: str | None = None
                 if published is not None and not durable:
                     try:
-                        resume, recovery_cancelled = await _complete_to_thread(
+                        resume, recovery_cancelled = await complete_to_thread(
                             lambda: prepare_megatron_resume_state(
                                 output_dir=self.output_dir,
                                 optimizer_state_path=self._optimizer_state_path,
@@ -1308,7 +1297,9 @@ class DistributedMegatronService:
                     assert published is not None
                     self._latest_step = learner_version
                     reconcile_checkpoint = published.identity
-                if trainer is not None and (transition_started or durable):
+                if trainer is not None and (
+                    transition_started or durable or not self._trainer_is_current()
+                ):
                     try:
                         await trainer.close()
                     except BaseException as cleanup_error:
@@ -1393,10 +1384,12 @@ class DistributedMegatronService:
                 self.runtime.replica(replica_id).quarantine(
                     "partial or failed LoRA update"
                 )
-            cleanup = await self._rollback_server_start(
-                self._gateway, self._replica_ids
-            )
-            self._clear_serving_state()
+            try:
+                cleanup = await self._rollback_server_start_safely(
+                    self._gateway, self._replica_ids
+                )
+            finally:
+                self._clear_serving_state()
             if cleanup:
                 raise BaseExceptionGroup(
                     "LoRA publication and serving rollback failed", [error, *cleanup]
