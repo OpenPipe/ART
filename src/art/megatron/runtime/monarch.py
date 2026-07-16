@@ -734,7 +734,6 @@ class MonarchTrainerRun:
             try:
                 async with asyncio.timeout(self.run_spec.shutdown_timeout_s / 2):
                     await _remote_teardown(self._actors.close.call())
-                    await _remote_teardown(self._actors.stop())
             except BaseException as exc:
                 primary = exc
         try:

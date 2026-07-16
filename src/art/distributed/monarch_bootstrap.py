@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-"""Provider-neutral bootstrap for pinned torchmonarch 0.5.
+"""Provider-neutral bootstrap for pinned torchmonarch 0.6.
 
 Both worker and controller endpoints must be reachable only on one trusted private
 network because ART currently configures Monarch with ``trust_all_connections``.
@@ -48,7 +48,7 @@ _MONARCH_TIMEOUT_ENV = (
 )
 _MONARCH_SHUTDOWN_ENV = {
     "HYPERACTOR_PROCESS_EXIT_TIMEOUT": "2s",
-    "HYPERACTOR_MESH_PROC_STOP_MAX_IDLE": "10s",
+    "HYPERACTOR_MESH_PROC_STOP_MAX_IDLE": "20s",
 }
 _WORKER_ADDRESS_LOCK = threading.Lock()
 _USED_WORKER_ADDRESSES: set[str] = set()
