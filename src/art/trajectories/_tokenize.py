@@ -255,7 +255,8 @@ def _responses_tokens(
             require_token_ids=True,
             field="Responses raw_output_tokens",
         )
-        return None, token_ids, logprobs
+        if token_ids or not data.get("output"):
+            return None, token_ids, logprobs
     token_ids: list[int] = []
     logprobs: list[float] = []
     saw_rendered_output = False
@@ -354,10 +355,15 @@ def _artifact_config(model: str) -> _TokenizerConfig:
 
 
 def _tokenizer_config(model: str, base_model: str | None) -> _TokenizerConfig:
+    if model.startswith("wandb-artifact:///"):
+        config = _artifact_config(model)
+        if base_model is not None:
+            if base_model != config.base_model:
+                config.revision = None
+            config.base_model = base_model
+        return config
     if base_model is not None:
         return _TokenizerConfig(base_model)
-    if model.startswith("wandb-artifact:///"):
-        return _artifact_config(model)
     return _TokenizerConfig(model)
 
 
@@ -968,7 +974,12 @@ def tokenize_one(
     exact_tokens = [_exchange_tokens(exchange) for exchange in exchanges]
     config = (
         _TokenizerConfig(base_model if base_model is not None else selected_model)
-        if base_model is not None or tokenizer_instance is not None
+        if tokenizer_instance is not None
+        or (
+            base_model is not None
+            and chat_template is not None
+            and chat_template_kwargs is not None
+        )
         else None
     )
     tokenizer = tokenizer_instance

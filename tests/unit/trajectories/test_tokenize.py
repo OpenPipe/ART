@@ -356,15 +356,31 @@ def test_checkpoint_fallback_preserves_artifact_version_and_renderer(
             )
 
     monkeypatch.setattr("wandb.apis.public.Api", Api)
-    from art.trajectories._tokenize import _tokenizer_config
+    exchange = _chat_exchange([], [], model=model)
+    extra = exchange.response.choices[0].model_extra
+    assert extra is not None
+    extra.pop("prompt_token_ids")
+    extra.pop("token_ids")
+    exchange.response.choices[0].logprobs = None
+    tokenizer = _FakeTokenizer()
+    configs = []
+    monkeypatch.setattr(
+        "art.trajectories._tokenize._load_tokenizer",
+        lambda config: configs.append(config) or tokenizer,
+    )
 
-    config = _tokenizer_config(model, None)
+    art.tokenize_trajectory(
+        art.Trajectory(exchanges=TrajectoryExchanges(chat_completions=[exchange]))
+    )
+    config = configs[0]
 
     assert artifact_names == [artifact_name]
     assert config.base_model == "base/model"
     assert config.revision == "revision"
     assert config.chat_template == "template"
     assert config.chat_template_kwargs == {"thinking": True}
+    assert tokenizer.calls[0]["chat_template"] == "template"
+    assert tokenizer.calls[0]["thinking"] is True
 
 
 def test_anthropic_fallback_preserves_thinking_and_tool_history() -> None:
@@ -748,6 +764,27 @@ def test_responses_aggregates_complete_exact_pairs_across_content_blocks(
     assert result.logprobs[1:] == [-0.1, -0.2]
 
 
+def test_responses_empty_raw_tokens_fall_back_for_visible_output(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    exchange = _response_exchange("response-empty-raw", 0)
+    data = exchange.response.model_dump(mode="python")
+    data["raw_output_tokens"] = []
+    exchange.response = Response.model_validate(data)
+    monkeypatch.setattr(
+        "art.trajectories._tokenize._load_tokenizer", lambda _config: _FakeTokenizer()
+    )
+
+    result = art.tokenize_trajectory(
+        art.Trajectory(exchanges=TrajectoryExchanges(responses=[exchange])),
+        base_model="base/model",
+        chat_template="template",
+        chat_template_kwargs={},
+    )
+
+    assert result.token_ids == [10, 11]
+
+
 def test_responses_does_not_use_partial_exact_content_pairs(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -967,9 +1004,24 @@ def test_exchange_trajectories_feed_existing_training_tokenizer(
     from art.preprocessing.tokenize import tokenize_trajectory_groups
 
     model = "wandb-artifact:///entity/project/run:step0"
+    fallback = _chat_exchange([], [], model=model)
+    fallback_extra = fallback.response.choices[0].model_extra
+    assert fallback_extra is not None
+    fallback_extra.pop("prompt_token_ids")
+    fallback_extra.pop("token_ids")
+    fallback.response.choices[0].logprobs = None
 
     class Tokenizer:
         name_or_path = model
+
+        def __init__(self) -> None:
+            self.calls: list[dict[str, object]] = []
+
+        def apply_chat_template(
+            self, messages: list[dict[str, Any]], **kwargs: object
+        ) -> list[int]:
+            self.calls.append(kwargs)
+            return [1, 2] if messages[-1]["role"] == "assistant" else [1]
 
         def decode(self, token_id: int) -> str:
             return str(token_id)
@@ -977,9 +1029,7 @@ def test_exchange_trajectories_feed_existing_training_tokenizer(
     group = art.TrajectoryGroup(
         [
             art.Trajectory(
-                exchanges=TrajectoryExchanges(
-                    chat_completions=[_chat_exchange([1], [2], model=model)]
-                ),
+                exchanges=TrajectoryExchanges(chat_completions=[fallback]),
                 reward=1,
             ),
             art.Trajectory(
@@ -994,20 +1044,22 @@ def test_exchange_trajectories_feed_existing_training_tokenizer(
         "art.trajectories._tokenize._artifact_config",
         lambda _model: pytest.fail("supplied tokenizer should bypass W&B"),
     )
+    tokenizer = Tokenizer()
 
     results = list(
         tokenize_trajectory_groups(
-            # This path only calls decode; the minimal test double is intentional.
-            Tokenizer(),  # type: ignore[arg-type, ty:invalid-argument-type]
+            tokenizer,  # type: ignore[arg-type, ty:invalid-argument-type]
             [group],
-            allow_training_without_logprobs=False,
+            allow_training_without_logprobs=True,
             scale_rewards=False,
             shuffle_group_trajectories=False,
+            chat_template_kwargs={"serverless": True},
         )
     )
 
     assert [result.token_ids for result in results] == [[1, 2], [1, 3]]
     assert [result.assistant_mask for result in results] == [[0, 1], [0, 1]]
+    assert all(call["serverless"] is True for call in tokenizer.calls)
 
 
 def test_exchange_training_requires_logprobs_unless_allowed() -> None:
