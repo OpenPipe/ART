@@ -276,13 +276,8 @@ class DistributedMegatronService:
     async def _ensure_trainer_locked(self) -> Any:
         if self._trainer_is_current():
             return self._trainer
-        if self._trainer is not None:
-            await self._trainer.close()
-            self._trainer = None
-        previous_step = self._latest_step
-        current = await asyncio.to_thread(self._resolve_current_lora_path)
-        if self._base_urls and self._latest_step != previous_step:
-            await self._reconcile_serving_locked(current)
+        current = await self._prepare_for_packing_locked()
+        assert self._trainer is None
         runtime_spec = self._runtime_spec()
         run_spec = TrainingRunSpec(
             run_id=uuid.uuid4().hex,
@@ -294,6 +289,30 @@ class DistributedMegatronService:
         )
         self._trainer = await self.runtime.start_trainer(runtime_spec, run_spec)
         return self._trainer
+
+    async def prepare_for_packing(self) -> int:
+        async with self._mutation_lock:
+            self._require_open()
+            await self._prepare_for_packing_locked()
+            return self._latest_step
+
+    async def _prepare_for_packing_locked(self) -> str:
+        if self._trainer_is_current():
+            return self._resolve_current_lora_path()
+        if self._trainer is not None:
+            _, cancelled = await complete_task(
+                asyncio.create_task(self._trainer.close())
+            )
+            self._trainer = None
+            if cancelled is not None:
+                raise cancelled
+        previous_step = self._latest_step
+        current, cancelled = await complete_to_thread(self._resolve_current_lora_path)
+        if self._base_urls and self._latest_step != previous_step:
+            await self._reconcile_serving_locked(current)
+        if cancelled is not None:
+            raise cancelled
+        return current
 
     async def _reconcile_serving_locked(self, checkpoint: str) -> None:
         previous_name = self._current_lora_name

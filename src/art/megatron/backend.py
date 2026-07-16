@@ -301,6 +301,11 @@ class MegatronBackend(LocalBackend):
     async def _get_step(self, model: AnyTrainableModel) -> int:
         if not model.trainable:
             return 0
+        if self._runtime is not None and model.name in self._services:
+            from .distributed_service import DistributedMegatronService
+
+            service = cast(DistributedMegatronService, self._services[model.name])
+            return await service.prepare_for_packing()
         if model.name in self._resume_prepared_models:
             return await super()._get_step(model)
         output_dir = get_model_dir(model=model, art_path=self._path)
