@@ -388,7 +388,15 @@ def _assert_reload_replaces_slot_optimizer(
 
 def _trainer_for(lora: LoRA, device: torch.device) -> TrainerRank:
     trainer = TrainerRank.__new__(TrainerRank)
-    trainer.runtime = SimpleNamespace(model=[lora], optimizer=None)
+    trainer.runtime = SimpleNamespace(
+        model=[lora],
+        optimizer=None,
+        model_support_handler=SimpleNamespace(
+            canonicalize_loaded_lora_state=lambda state, _model: state,
+            zero_internal_padding_grads=lambda _model: None,
+            zero_internal_padding_params=lambda _model: None,
+        ),
+    )
     trainer.device = device
     trainer._slot_stack = []
     trainer._default_slot_ref = None

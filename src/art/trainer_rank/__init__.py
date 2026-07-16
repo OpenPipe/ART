@@ -970,6 +970,11 @@ class TrainerRank:
         name: str,
         adapter_model: Mapping[str, torch.Tensor],
     ) -> dict[str, torch.Tensor]:
+        adapter_model = (
+            self.runtime.model_support_handler.canonicalize_loaded_lora_state(
+                dict(adapter_model), self.runtime.model
+            )
+        )
         templates = self._local_lora_adapter_templates()
         keys = set(adapter_model)
         expected = set(templates)
@@ -1153,6 +1158,9 @@ class TrainerRank:
         params: AdamParams,
         scale_grads: float,
     ) -> dict[str, float]:
+        self.runtime.model_support_handler.zero_internal_padding_grads(
+            self.runtime.model
+        )
         selected = []
         for name in checkpoint_names:
             self._guard_checkpoint_can_step(name)
@@ -2335,9 +2343,14 @@ class TrainerRank:
     ) -> _PreparedPackedForward:
         topology = self._topology()
         batch = _pad_packed_batch(batch, multiple=int(topology.tp))
+        self._configure_hybridep(batch, topology=topology)
         if int(topology.cp) > 1:
             return self._prepare_context_parallel_forward(batch, topology=topology)
         from art.megatron.prefix_tree_state import create_prefix_tree_state
+        from art.megatron.training.microbatches import (
+            _art_flex_sliding_windows,
+            _gdn_planner_config_for_provider,
+        )
 
         handler = self.runtime.model_support_handler
         provider = self.runtime.provider
@@ -2348,9 +2361,13 @@ class TrainerRank:
                 group_ids=batch.group_ids,
                 parent_ids=batch.parent_ids,
                 target_device=self.device,
+                input_pos=batch.position_ids,
+                sliding_windows=_art_flex_sliding_windows(provider),
                 build_gdn_execution_spec=handler.build_gdn_execution_spec,
+                model_support_handler=handler,
                 attention_head_dim=provider.kv_channels,
                 attention_value_head_dim=provider.kv_channels,
+                gdn_planner_config=_gdn_planner_config_for_provider(provider, handler),
             ),
             packed_seq_params=None,
             positions_by_item=batch.positions_by_sequence,
@@ -2363,6 +2380,55 @@ class TrainerRank:
                 for positions in batch.positions_by_sequence
             ),
         )
+
+    def _configure_hybridep(
+        self,
+        batch: PrefixTreePack,
+        *,
+        topology: "ParallelTopology",
+    ) -> None:
+        from megatron.core import parallel_state as ps
+
+        if int(ps.get_expert_model_parallel_world_size()) <= 1:
+            return
+        from art.megatron.train import (
+            _ensure_hybridep_capacity,
+            _set_hybridep_token_count,
+        )
+
+        sequence_length = int(batch.tokens.shape[1])
+        _ensure_hybridep_capacity(
+            self.runtime,
+            packed_sequence_length=sequence_length,
+            context_parallel_size=int(topology.cp),
+        )
+        rows = sequence_length
+        if int(topology.cp) > 1:
+            from art.megatron.context_parallel.runtime import (
+                context_parallel_rank_model_token_counts,
+            )
+            from art.megatron.training.microbatches import (
+                _context_parallel_config_for_provider,
+                _gdn_planner_config_for_provider,
+            )
+
+            handler = self.runtime.model_support_handler
+            rows = max(
+                context_parallel_rank_model_token_counts(
+                    group_ids=batch.group_ids,
+                    parent_ids=batch.parent_ids,
+                    topology=topology,
+                    config=_context_parallel_config_for_provider(
+                        self.runtime.provider, self.device
+                    ),
+                    original_seq_len=sequence_length,
+                    build_gdn_execution_spec=handler.build_gdn_execution_spec,
+                    gdn_planner_config=_gdn_planner_config_for_provider(
+                        self.runtime.provider, handler
+                    ),
+                )
+            )
+        _set_hybridep_token_count(rows)
 
     def _prepare_context_parallel_forward(
         self,
