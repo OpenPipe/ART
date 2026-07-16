@@ -193,8 +193,12 @@ class Glm52Handler(DefaultMoeHandler):
 
             def preprocess_hook(*args: Any, _preprocess=preprocess, **kwargs: Any):
                 output = list(_preprocess(*args, **kwargs))
-                decoder_input = cast(torch.Tensor, output[0])
-                if decoder_input.is_leaf and not decoder_input.requires_grad:
+                decoder_input = cast(torch.Tensor | None, output[0])
+                if (
+                    decoder_input is not None
+                    and decoder_input.is_leaf
+                    and not decoder_input.requires_grad
+                ):
                     decoder_input.requires_grad_(True)
                 return tuple(output)
 
