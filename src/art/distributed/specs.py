@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections import Counter
 import hashlib
 from ipaddress import ip_address
 from typing import Literal
@@ -58,8 +59,8 @@ class ClusterSpec(_Spec):
         addresses = [host.worker_address for host in self.hosts]
         if len(set(host_ids)) != len(host_ids):
             raise ValueError("host_id values must be unique")
-        if sorted(node_ranks) != list(range(len(self.hosts))):
-            raise ValueError("host node_rank values must be contiguous from zero")
+        if node_ranks != list(range(len(self.hosts))):
+            raise ValueError("hosts must be ordered by contiguous node_rank from zero")
         if len(set(addresses)) != len(addresses):
             raise ValueError("worker_address values must be unique")
         if self.controller_host_id not in host_ids:
@@ -177,8 +178,10 @@ class ModelServiceReplicaSpec(_Spec):
         node_ranks = [member.node_rank for member in self.members]
         if len(set(member_ids)) != len(member_ids):
             raise ValueError("member_id values must be unique within a replica")
-        if sorted(node_ranks) != list(range(len(self.members))):
-            raise ValueError("member node_rank values must be contiguous from zero")
+        if node_ranks != list(range(len(self.members))):
+            raise ValueError(
+                "members must be ordered by contiguous node_rank from zero"
+            )
         if len({member.host_id for member in self.members}) != len(self.members):
             raise ValueError("native vLLM members must occupy distinct hosts")
         leaders = [member for member in self.members if member.leader]
@@ -286,10 +289,69 @@ class RuntimeTopology(_Spec):
     model_services: tuple[ModelServiceSpec, ...] = ()
 
     @model_validator(mode="after")
-    def _validate_model_service_ports(self) -> "RuntimeTopology":
+    def _validate_runtime(self) -> "RuntimeTopology":
+        hosts = {host.host_id: host for host in self.cluster.hosts}
+        if len(set(self.rollout_host_ids)) != len(self.rollout_host_ids):
+            raise ValueError("rollout_host_ids must be unique")
+        unknown_rollout_hosts = sorted(set(self.rollout_host_ids) - hosts.keys())
+        if unknown_rollout_hosts:
+            raise ValueError(
+                f"rollout_host_ids references unknown hosts: {unknown_rollout_hosts}"
+            )
+
+        placements: list[tuple[str, int, str]] = []
+        if self.trainer is not None:
+            trainer_hosts = tuple(rank.host_id for rank in self.trainer.ranks)
+            unknown_trainer_hosts = sorted(set(trainer_hosts) - hosts.keys())
+            if unknown_trainer_hosts:
+                raise ValueError(
+                    f"trainer references unknown hosts: {unknown_trainer_hosts}"
+                )
+            counts = Counter(trainer_hosts)
+            if len(set(counts.values())) != 1:
+                raise ValueError("Monarch trainer hosts require equal ranks per host")
+            selected_hosts = tuple(
+                host.host_id for host in self.cluster.hosts if host.host_id in counts
+            )
+            selected_indices = tuple(
+                index
+                for index, host in enumerate(self.cluster.hosts)
+                if host.host_id in counts
+            )
+            if selected_indices != tuple(
+                range(selected_indices[0], selected_indices[-1] + 1)
+            ):
+                raise ValueError("trainer hosts must be contiguous in the cluster mesh")
+            ranks_per_host = next(iter(counts.values()))
+            expected_rank_hosts = tuple(
+                host_id for host_id in selected_hosts for _ in range(ranks_per_host)
+            )
+            if trainer_hosts != expected_rank_hosts:
+                raise ValueError(
+                    "trainer ranks must be host-major in cluster host order"
+                )
+            placements.extend(
+                (rank.host_id, rank.gpu_id, "trainer") for rank in self.trainer.ranks
+            )
+
+        service_names = [service.name for service in self.model_services]
+        if len(set(service_names)) != len(service_names):
+            raise ValueError("model service names must be unique")
+        replica_ids = [
+            replica.replica_id
+            for service in self.model_services
+            for replica in service.replicas
+        ]
+        if len(set(replica_ids)) != len(replica_ids):
+            raise ValueError("replica_id values must be unique across model services")
+
         endpoints: list[tuple[str, int, str]] = []
         for service in self.model_services:
             for replica in service.replicas:
+                placements.extend(
+                    (placement.host_id, placement.gpu_id, replica.replica_id)
+                    for placement in replica.gpu_placements
+                )
                 leader = next(member for member in replica.members if member.leader)
                 endpoints.extend(
                     (
@@ -305,6 +367,29 @@ class RuntimeTopology(_Spec):
                             (host_id, replica.kv_replay_base_port + rank, "kv_replay"),
                         )
                     )
+        for host_id, gpu_id, owner in placements:
+            host = hosts.get(host_id)
+            if host is None:
+                raise ValueError(f"{owner} references unknown host {host_id!r}")
+            if gpu_id not in host.gpu_ids:
+                raise ValueError(f"{owner} requests unavailable GPU {host_id}:{gpu_id}")
+        duplicate_gpus = [
+            placement
+            for placement, count in Counter(
+                (host_id, gpu_id) for host_id, gpu_id, _ in placements
+            ).items()
+            if count > 1
+        ]
+        if duplicate_gpus:
+            owners = [
+                owner
+                for duplicate in duplicate_gpus
+                for host_id, gpu_id, owner in placements
+                if (host_id, gpu_id) == duplicate
+            ]
+            raise ValueError(
+                f"GPU placements overlap at {duplicate_gpus}; owners={owners}"
+            )
         seen: dict[tuple[str, int], str] = {}
         for host_id, port, kind in endpoints:
             key = (host_id, port)

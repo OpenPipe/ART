@@ -14,7 +14,6 @@ import signal
 import sys
 import time
 from typing import (
-    TYPE_CHECKING,
     Any,
     AsyncIterator,
     Generic,
@@ -31,6 +30,7 @@ T = TypeVar("T")
 
 import art
 from art import TrajectoryGroup
+from art.distributed.rollout import RolloutExecutor
 from art.errors import LocalServingUnavailableError
 from art.pipeline_tuner import (
     PackedGroupObservation,
@@ -54,9 +54,6 @@ from .checkpoint_retention import (
 from .state import PipelineState
 from .status import StatusReporter
 from .types import ConfigT, EvalFn, RolloutFn, ScenarioT, SingleRolloutFn  # noqa: F401
-
-if TYPE_CHECKING:
-    from art.distributed.rollout import RolloutExecutor
 
 PIPELINE_STATE_KEY = "_pipeline_trainer"
 _ROLLOUT_WALL_TIME_KEY = "_art_rollout_wall_s"

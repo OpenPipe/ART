@@ -219,7 +219,7 @@ def require_local_worker_address(worker_addresses: Sequence[str]) -> str:
         parsed.scheme != "tcp"
         or host is None
         or port is None
-        or port < 1
+        or port < 0
         or parsed.path
         or parsed.query
         or parsed.fragment
@@ -616,15 +616,39 @@ def _require_bindable_worker_address(address: str) -> None:
     ) from error
 
 
+def _resolve_ephemeral_worker_address(address: str) -> str:
+    parsed = urlsplit(address)
+    if parsed.port != 0:
+        return address
+    assert parsed.hostname is not None
+    error: OSError | None = None
+    for family, socktype, proto, _, sockaddr in socket.getaddrinfo(
+        parsed.hostname, 0, type=socket.SOCK_STREAM
+    ):
+        probe = socket.socket(family, socktype, proto)
+        try:
+            probe.bind(sockaddr)
+            candidate = _tcp_address(parsed.hostname, probe.getsockname()[1])
+            if candidate not in _USED_WORKER_ADDRESSES:
+                return candidate
+        except OSError as exc:
+            error = exc
+        finally:
+            probe.close()
+    raise RuntimeError("could not allocate a fresh local worker address") from error
+
+
 def _start_worker(address: str) -> _WorkerSession:
-    digest = hashlib.sha256(address.encode()).hexdigest()[:16]
-    lease = open(f"/tmp/art-monarch-worker-{digest}.lock", "a+b")
-    try:
-        fcntl.flock(lease.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-        with _WORKER_ADDRESS_LOCK:
+    with _WORKER_ADDRESS_LOCK:
+        address = _resolve_ephemeral_worker_address(address)
+        digest = hashlib.sha256(address.encode()).hexdigest()[:16]
+        lease = open(f"/tmp/art-monarch-worker-{digest}.lock", "a+b")
+        try:
+            fcntl.flock(lease.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
             if address in _USED_WORKER_ADDRESSES:
                 raise RuntimeError(
-                    f"Monarch worker address was already used: {address}"
+                    "Monarch 0.5 requires a fresh owned-worker address per "
+                    f"generation; use port 0 instead of reusing {address}"
                 )
             _require_bindable_worker_address(address)
             environment = os.environ.copy()
@@ -636,15 +660,15 @@ def _start_worker(address: str) -> _WorkerSession:
                 start_new_session=True,
             )
             _USED_WORKER_ADDRESSES.add(address)
-        return _WorkerSession(
-            address=address,
-            process=process,
-            label=f"Monarch worker {address}",
-            lease=lease,
-        )
-    except BaseException:
-        lease.close()
-        raise
+            return _WorkerSession(
+                address=address,
+                process=process,
+                label=f"Monarch worker {address}",
+                lease=lease,
+            )
+        except BaseException:
+            lease.close()
+            raise
 
 
 def _stop_worker_sessions(workers: Sequence[_WorkerSession]) -> None:
@@ -680,7 +704,7 @@ def run_local(
     try:
         asyncio.run(
             run_explicit_controller(
-                ExplicitHostBootstrap(worker_addresses=(address,)),
+                ExplicitHostBootstrap(worker_addresses=(worker.address,)),
                 program,
                 startup_timeout_s=startup_timeout_s,
                 owned_workers=(worker,),

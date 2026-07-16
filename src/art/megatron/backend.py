@@ -1,11 +1,12 @@
 from pathlib import Path
 import secrets
-from typing import TYPE_CHECKING, Any, AsyncIterator, Iterable, cast
+from typing import Any, AsyncIterator, Iterable, cast
 
 from mp_actors import move_to_child_process
 
 from .. import dev
 from ..backend import AnyTrainableModel
+from ..distributed.art_runtime import ArtRuntime
 from ..local.backend import LocalBackend, _PackedTrainingBatch
 from ..local.service import ModelService
 from ..model import TrainableModel
@@ -19,10 +20,6 @@ from .optimizer_state import (
 )
 from .runtime_config import get_megatron_runtime_config
 
-if TYPE_CHECKING:
-    from ..distributed.art_runtime import ArtRuntime
-    from .distributed_service import DistributedMegatronService
-
 
 class MegatronBackend(LocalBackend):
     def __init__(
@@ -31,7 +28,7 @@ class MegatronBackend(LocalBackend):
         in_process: bool = False,
         path: str | None = None,
         enable_expert_replay: bool = True,
-        runtime: "ArtRuntime | None" = None,
+        runtime: ArtRuntime | None = None,
     ) -> None:
         if runtime is not None:
             artifact_root = runtime.topology.cluster.artifact_root

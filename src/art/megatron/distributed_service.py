@@ -646,26 +646,24 @@ class DistributedMegatronService:
                     raise RuntimeError(
                         f"replica {replica_id!r} rejected initial policy"
                     )
-            gateway_endpoint = None
-            if len(replica_ids) > 1:
-                from art.distributed.vllm_gateway import VllmGateway
+            from art.distributed.vllm_gateway import VllmGateway
 
-                gateway = VllmGateway(
-                    self._routing_table(
-                        service,
-                        policy_version=self._latest_step,
-                        policy_digest=digest,
-                        update_identity=update_identity,
-                        lora_name=template.served_model_name,
-                        replica_ids=replica_ids,
-                    ),
-                    upstream_headers=_headers(api_key),
-                    max_queued=self.runtime.config.gateway_max_queued,
-                    route_timeout_s=self.runtime.config.gateway_route_timeout_s,
-                    kv_event_sources=self._kv_event_sources(service, replica_ids),
-                )
-                port = await gateway.start(self.runtime.config.gateway_bind_host)
-                gateway_endpoint = (self._gateway_advertise_host(), port)
+            gateway = VllmGateway(
+                self._routing_table(
+                    service,
+                    policy_version=self._latest_step,
+                    policy_digest=digest,
+                    update_identity=update_identity,
+                    lora_name=template.served_model_name,
+                    replica_ids=replica_ids,
+                ),
+                upstream_headers=_headers(api_key),
+                max_queued=self.runtime.config.gateway_max_queued,
+                route_timeout_s=self.runtime.config.gateway_route_timeout_s,
+                kv_event_sources=self._kv_event_sources(service, replica_ids),
+            )
+            port = await gateway.start(self.runtime.config.gateway_bind_host)
+            gateway_endpoint = (self._gateway_advertise_host(), port)
         except BaseException as error:
             cleanup = await self._rollback_server_start_safely(gateway, replica_ids)
             if cleanup:

@@ -9,6 +9,8 @@ import uuid
 
 from pydantic import BaseModel, ConfigDict
 
+from art.megatron.runtime.specs import TrainerRuntimeSpec, TrainingRunSpec
+
 from .artifact_preflight import (
     ArtifactProbeCommand,
     ArtifactProbeOperation,
@@ -141,10 +143,22 @@ class ArtRuntime:
         *,
         config: ArtRuntimeConfig | None = None,
     ) -> "ArtRuntime":
-        address = require_local_worker_address(
+        requested_address = require_local_worker_address(
             tuple(host.worker_address for host in topology.cluster.hosts)
         )
-        worker = _start_worker(address)
+        worker = _start_worker(requested_address)
+        address = worker.address
+        if address != requested_address:
+            host = topology.cluster.hosts[0].model_copy(
+                update={"worker_address": address}
+            )
+            cluster = topology.cluster.model_copy(update={"hosts": (host,)})
+            topology = RuntimeTopology(
+                cluster=cluster,
+                rollout_host_ids=topology.rollout_host_ids,
+                trainer=topology.trainer,
+                model_services=topology.model_services,
+            )
         try:
             host_mesh = await attach_controller(
                 (address,),
@@ -453,7 +467,9 @@ class ArtRuntime:
         if failures:
             raise BaseExceptionGroup("failed to release packed batch", failures)
 
-    async def start_trainer(self, runtime_spec: Any, run_spec: Any) -> Any:
+    async def start_trainer(
+        self, runtime_spec: TrainerRuntimeSpec, run_spec: TrainingRunSpec
+    ) -> Any:
         self._require_open()
         if self.topology.trainer is None:
             raise RuntimeError("runtime topology has no trainer mesh")
