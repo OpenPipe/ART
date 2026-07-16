@@ -778,7 +778,7 @@ class TinkerNativeBackend:
             else {}
         )
         if "rank" not in training_client_args:
-            training_client_args["rank"] = 8
+            training_client_args["rank"] = (model.lora_config or {}).get("rank", 1)
         if "train_unembed" not in training_client_args:
             training_client_args["train_unembed"] = False
 
