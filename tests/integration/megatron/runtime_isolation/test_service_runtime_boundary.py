@@ -172,7 +172,7 @@ async def test_external_in_flight_update_maps_checkpoint_path(
     await service._update_in_flight_adapter(f"{local_root}/model/0004", 4)
 
     assert posts[0][1] == {
-        "model_name": "test-model@4",
+        "model_name": "test-model:active",
         "lora_slot": "test-model:active",
         "lora_path": "/remote/model/0004",
         "policy_version": 4,

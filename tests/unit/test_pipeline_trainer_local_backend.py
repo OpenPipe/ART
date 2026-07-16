@@ -1031,6 +1031,7 @@ async def test_local_backend_exact_adapter_lease_pins_immutable_name(
         _internal_config=InternalModelConfig(
             trainer_gpu_ids=[0],
             inference_gpu_ids=[1],
+            rollout_weight_update_mode="in_flight_lora",
         ),
     )
     backend = LocalBackend(path=str(tmp_path))
@@ -1043,13 +1044,18 @@ async def test_local_backend_exact_adapter_lease_pins_immutable_name(
     )
     backend._services[model.name] = cast(Any, service)
 
+    assert backend._model_inference_name(model) == f"{model.name}:active"
+    with pytest.raises(ValueError, match="cannot address an immutable policy step"):
+        backend._model_inference_name(model, step=3)
+
     async with backend.exact_adapter_lease(model, 3):
         assert backend._model_inference_name(model) == exact_name
         assert backend._model_inference_name(model, step=3) == exact_name
-        assert backend._model_inference_name(model, step=4) == f"{model.name}@4"
+        with pytest.raises(ValueError, match="cannot address an immutable policy step"):
+            backend._model_inference_name(model, step=4)
         await backend.prune_model_adapters(model, retain_steps={5})
 
-    assert backend._model_inference_name(model) == f"{model.name}@5"
+    assert backend._model_inference_name(model) == f"{model.name}:active"
     service.acquire_exact_adapter.assert_awaited_once_with(
         3,
         get_step_checkpoint_dir(get_model_dir(model=model, art_path=str(tmp_path)), 3),

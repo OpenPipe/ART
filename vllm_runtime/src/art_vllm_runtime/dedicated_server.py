@@ -6,9 +6,27 @@ from http import HTTPStatus
 import json
 import os
 
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
+from starlette.datastructures import Headers
+from starlette.types import Receive, Scope, Send
+from vllm.entrypoints.serve.utils.server_utils import AuthenticationMiddleware
 
 from art_vllm_runtime.patches import apply_vllm_runtime_patches
+
+
+class _ArtAuthenticationMiddleware(AuthenticationMiddleware):
+    def __call__(self, scope: Scope, receive: Receive, send: Send):
+        path = scope.get("path", "").removeprefix(scope.get("root_path", ""))
+        if (
+            scope.get("type") in {"http", "websocket"}
+            and scope.get("method") != "OPTIONS"
+            and path.startswith("/art/")
+            and not self.verify_token(Headers(scope=scope))
+        ):
+            response = JSONResponse(content={"error": "Unauthorized"}, status_code=401)
+            return response(scope, receive, send)
+        return self.app(scope, receive, send)
 
 
 class _SetServedModelNameRequest(BaseModel):
@@ -56,7 +74,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
 def _patch_art_runtime_routes() -> None:
     from fastapi import APIRouter, Depends, FastAPI, Query, Request
-    from fastapi.responses import JSONResponse, Response
+    from fastapi.responses import Response
     from vllm.entrypoints.openai import api_server
     from vllm.entrypoints.openai.chat_completion.api_router import (
         create_chat_completion,
@@ -78,6 +96,12 @@ def _patch_art_runtime_routes() -> None:
 
     def art_build_app(*build_args: object, **build_kwargs: object) -> FastAPI:
         app = original_build_app(*build_args, **build_kwargs)
+        from vllm import envs
+
+        args = app.state.args
+        tokens = [key for key in (args.api_key or [envs.VLLM_API_KEY]) if key]
+        if tokens:
+            app.add_middleware(_ArtAuthenticationMiddleware, tokens=tokens)
         router = APIRouter()
 
         def engine(request: Request):
@@ -192,8 +216,6 @@ def _patch_art_runtime_routes() -> None:
 
             from art_vllm_runtime.policy_spans import (
                 lora_update_coordinator,
-                publish_lora_slot_policy,
-                register_lora_alias,
             )
 
             public_model_name = body.model_name
@@ -220,20 +242,10 @@ def _patch_art_runtime_routes() -> None:
                         content=load_result.model_dump(mode="python"),
                         status_code=load_result.error.code,
                     )
-                register_lora_alias(
-                    models,
-                    public_model_name=public_model_name,
-                    lora_slot=lora_slot,
-                )
                 waiting_cache_salt = await engine_client.engine_core.call_utility_async(
                     "art_update_waiting_lora_cache_salt",
                     lora_slot,
                     policy_version,
-                )
-                publish_lora_slot_policy(
-                    models,
-                    lora_slot=lora_slot,
-                    policy_version=policy_version,
                 )
                 await coordinator.commit_update(
                     lora_slot,

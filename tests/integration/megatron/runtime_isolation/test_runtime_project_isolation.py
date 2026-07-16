@@ -89,20 +89,15 @@ import json
 from types import SimpleNamespace
 from art_vllm_runtime.policy_spans import (
     LoraUpdateCoordinator,
-    _apply_lora_alias_policy_cache_salt,
-    publish_lora_slot_policy,
-    register_lora_alias,
+    _set_policy_cache_salt,
 )
 
 async def main():
     slot = "model:active"
     old = SimpleNamespace(lora_name=slot, lora_path="old")
     new = SimpleNamespace(lora_name=slot, lora_path="new")
-    models = SimpleNamespace(lora_requests={slot: new})
-    register_lora_alias(models, public_model_name="model@4", lora_slot=slot)
-    publish_lora_slot_policy(models, lora_slot=slot, policy_version=5)
-    request = SimpleNamespace(model="model@4", cache_salt=None)
-    _apply_lora_alias_policy_cache_salt(models, request, new)
+    request = SimpleNamespace(model=slot, cache_salt=None)
+    _set_policy_cache_salt(request, lora_slot=slot, policy_version=5)
 
     coordinator = LoraUpdateCoordinator()
     await coordinator.begin_update(slot)
@@ -118,11 +113,24 @@ async def main():
     blocked = not admission.done()
     await coordinator.commit_update(slot, 5, new)
     version, admitted_lora = await admission
+
+    async with coordinator.admission(slot):
+        cancelled_update = asyncio.create_task(coordinator.begin_update(slot))
+        await asyncio.sleep(0)
+        cancelled_update.cancel()
+        try:
+            await cancelled_update
+        except asyncio.CancelledError:
+            pass
+    async with coordinator.admission(slot) as recovered_state:
+        recovered = recovered_state[0] == 5
+
     print(json.dumps({
         "blocked": blocked,
         "cache_salt": request.cache_salt,
         "policy_version": version,
         "lora_path": admitted_lora.lora_path,
+        "recovered_after_cancel": recovered,
     }, sort_keys=True))
 
 asyncio.run(main())
@@ -135,6 +143,7 @@ asyncio.run(main())
         "cache_salt": "art_policy_cache_salt=model:active:5",
         "lora_path": "new",
         "policy_version": 5,
+        "recovered_after_cancel": True,
     }
 
 

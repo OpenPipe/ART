@@ -51,7 +51,7 @@ def patch_policy_token_spans() -> None:
     _patch_scheduler_policy_span_transport()
     _patch_output_processor_policy_span_accumulation()
     _patch_openai_response_policy_spans()
-    _patch_lora_alias_resolution()
+    _patch_lora_update_coordinator()
     _patch_engine_request_admission()
     _patch_load_inplace_storage()
     _patch_engine_waiting_cache_salt_utility()
@@ -103,10 +103,19 @@ class LoraUpdateCoordinator:
     async def begin_update(self, lora_slot: str) -> None:
         state = self._state(lora_slot)
         async with state.condition:
-            await state.condition.wait_for(lambda: not state.update_active)
-            state.update_active = True
-            state.blocked = True
-            await state.condition.wait_for(lambda: state.active_admissions == 0)
+            acquired = False
+            try:
+                await state.condition.wait_for(lambda: not state.update_active)
+                state.update_active = True
+                state.blocked = True
+                acquired = True
+                await state.condition.wait_for(lambda: state.active_admissions == 0)
+            except BaseException:
+                if acquired:
+                    state.update_active = False
+                    state.blocked = False
+                    state.condition.notify_all()
+                raise
 
     async def commit_update(
         self,
@@ -179,48 +188,6 @@ def _patch_model_runner_output_type() -> None:
     setattr(outputs_mod, "_art_policy_token_spans_model_runner_patched", True)
 
 
-def register_lora_alias(
-    models: Any,
-    *,
-    public_model_name: str,
-    lora_slot: str,
-) -> None:
-    aliases = getattr(models, "_art_lora_aliases", None)
-    if aliases is None:
-        aliases = {}
-        setattr(models, "_art_lora_aliases", aliases)
-    aliases[public_model_name] = lora_slot
-
-
-def publish_lora_slot_policy(
-    models: Any,
-    *,
-    lora_slot: str,
-    policy_version: int,
-) -> None:
-    versions = getattr(models, "_art_lora_slot_policy_versions", None)
-    if versions is None:
-        versions = {}
-        setattr(models, "_art_lora_slot_policy_versions", versions)
-    versions[lora_slot] = int(policy_version)
-
-
-def _resolve_lora_alias(models: Any, model_name: str | None) -> Any | None:
-    if not model_name:
-        return None
-    slot = getattr(models, "_art_lora_aliases", {}).get(model_name)
-    if not slot:
-        return None
-    return models.lora_requests.get(slot)
-
-
-def _slot_policy_version(models: Any, lora_slot: str) -> int | None:
-    version = getattr(models, "_art_lora_slot_policy_versions", {}).get(lora_slot)
-    if version is None:
-        return None
-    return int(version)
-
-
 def _strip_policy_cache_salt(cache_salt: str | None) -> str | None:
     if not cache_salt:
         return None
@@ -255,22 +222,6 @@ def _set_policy_cache_salt(
         lora_slot=lora_slot,
         policy_version=policy_version,
         user_cache_salt=user_cache_salt,
-    )
-
-
-def _apply_lora_alias_policy_cache_salt(
-    models: Any,
-    request: Any,
-    lora_request: Any,
-) -> None:
-    lora_slot = str(lora_request.lora_name)
-    policy_version = _slot_policy_version(models, lora_slot)
-    if policy_version is None:
-        return
-    _set_policy_cache_salt(
-        request,
-        lora_slot=lora_slot,
-        policy_version=policy_version,
     )
 
 
@@ -555,15 +506,13 @@ def _patch_openai_response_policy_spans() -> None:
                 spans = spans_by_choice.get(choice.index)
                 if spans:
                     _set_pydantic_extra(choice, POLICY_TOKEN_SPANS_FIELD, spans)
-            if _resolve_lora_alias(self.models, getattr(request, "model", None)):
-                response.model = request.model
         return response
 
     chat_completion_full_generator.__art_policy_spans_patched__ = True  # type: ignore[attr-defined]
     OpenAIServingChat.chat_completion_full_generator = chat_completion_full_generator  # type: ignore[method-assign]
 
 
-def _patch_lora_alias_resolution() -> None:
+def _patch_lora_update_coordinator() -> None:
     from vllm.entrypoints.openai.engine.serving import OpenAIServing
 
     original_init = OpenAIServing.__init__
@@ -575,49 +524,6 @@ def _patch_lora_alias_resolution() -> None:
 
         __init__.__art_lora_update_patched__ = True  # type: ignore[attr-defined]
         OpenAIServing.__init__ = __init__  # type: ignore[method-assign]
-
-    original_check = OpenAIServing._check_model
-    if not getattr(original_check, "__art_policy_spans_patched__", False):
-
-        async def _check_model(self: Any, request: Any) -> Any:
-            lora_request = _resolve_lora_alias(
-                self.models, getattr(request, "model", None)
-            )
-            if lora_request is not None:
-                from art_vllm_runtime.metrics import record_policy_cache_salt_audit
-
-                _apply_lora_alias_policy_cache_salt(self.models, request, lora_request)
-                record_policy_cache_salt_audit(
-                    lora_request=True,
-                    salted=bool(getattr(request, "cache_salt", None)),
-                )
-                return None
-            return await original_check(self, request)
-
-        _check_model.__art_policy_spans_patched__ = True  # type: ignore[attr-defined]
-        OpenAIServing._check_model = _check_model  # type: ignore[method-assign]
-
-    original_maybe = OpenAIServing._maybe_get_adapters
-    if getattr(original_maybe, "__art_policy_spans_patched__", False):
-        return
-
-    def _maybe_get_adapters(
-        self: Any,
-        request: Any,
-        supports_default_mm_loras: bool = False,
-    ) -> Any:
-        lora_request = _resolve_lora_alias(self.models, getattr(request, "model", None))
-        if lora_request is not None:
-            _apply_lora_alias_policy_cache_salt(self.models, request, lora_request)
-            return lora_request
-        return original_maybe(
-            self,
-            request,
-            supports_default_mm_loras=supports_default_mm_loras,
-        )
-
-    _maybe_get_adapters.__art_policy_spans_patched__ = True  # type: ignore[attr-defined]
-    OpenAIServing._maybe_get_adapters = _maybe_get_adapters  # type: ignore[method-assign]
 
 
 def _patch_engine_request_admission() -> None:

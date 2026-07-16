@@ -4,6 +4,7 @@ from contextlib import asynccontextmanager
 from typing import AsyncIterator
 
 from art.adapter_leases import (
+    in_flight_lora_name,
     pin_inference_step,
     pin_inference_target,
     pinned_inference_name,

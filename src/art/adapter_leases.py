@@ -18,6 +18,10 @@ _pinned_inference_targets: ContextVar[dict[str, InferenceTarget]] = ContextVar(
 )
 
 
+def in_flight_lora_name(model_name: str) -> str:
+    return f"{model_name}:active"
+
+
 def pinned_inference_step(model_name: str) -> int | None:
     target = _pinned_inference_targets.get().get(model_name)
     return None if target is None else target.step

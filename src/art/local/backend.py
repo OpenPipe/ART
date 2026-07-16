@@ -101,6 +101,7 @@ from ..types import (
 from ..utils import format_message, get_model_step
 from .adapter_leases import (
     AdapterLeaseManager,
+    in_flight_lora_name,
     pin_inference_step,
     pin_inference_target,
     pinned_inference_name,
@@ -740,6 +741,19 @@ class LocalBackend:
         if exact_name := pinned_inference_name(model.name, step):
             return exact_name
 
+        in_flight_lora = (
+            isinstance(model, TrainableModel)
+            and (model._internal_config or {}).get("rollout_weight_update_mode")
+            == "in_flight_lora"
+        )
+        if in_flight_lora:
+            if step is not None:
+                raise ValueError(
+                    "In-flight LoRA serving cannot address an immutable policy step. "
+                    "Use exact_adapter_lease() for exact checkpoint inference."
+                )
+            return in_flight_lora_name(model.name)
+
         if step is None:
             step = pinned_inference_step(model.name)
 
@@ -779,7 +793,19 @@ class LocalBackend:
         step: int,
     ) -> AsyncIterator[None]:
         manager = self._adapter_lease_manager(model.name)
-        async with pin_inference_step(model.name, step), manager.lease(step):
+        in_flight_lora = (model._internal_config or {}).get(
+            "rollout_weight_update_mode"
+        ) == "in_flight_lora"
+        lease = (
+            pin_inference_target(
+                model.name,
+                step=step,
+                inference_name=in_flight_lora_name(model.name),
+            )
+            if in_flight_lora
+            else pin_inference_step(model.name, step)
+        )
+        async with lease, manager.lease(step):
             yield
 
     @asynccontextmanager
