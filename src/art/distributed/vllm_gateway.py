@@ -6,6 +6,7 @@ from contextlib import asynccontextmanager
 from hmac import compare_digest
 from ipaddress import ip_address
 import json
+import math
 import socket
 from typing import Any
 
@@ -50,6 +51,29 @@ _HOP_HEADERS = {
 }
 _REQUEST_HEADER_DENYLIST = _HOP_HEADERS | {"authorization"}
 _TELEMETRY_MAX_AGE_S = 5.0
+_SUM_METRICS = frozenset(
+    {
+        "max_num_batched_tokens",
+        "max_num_scheduled_tokens",
+        "max_num_seqs",
+        "num_requests_running",
+        "num_requests_waiting",
+        "num_requests_waiting_capacity",
+        "num_requests_waiting_deferred",
+        "world_size",
+    }
+)
+_MAX_METRICS = frozenset({"kv_cache_usage_perc", "max_model_len"})
+_RATIO_METRICS = {
+    "prefix_cache_hit_rate": (
+        "prefix_cache_hits_total",
+        "prefix_cache_queries_total",
+    ),
+    "external_prefix_cache_hit_rate": (
+        "external_prefix_cache_hits_total",
+        "external_prefix_cache_queries_total",
+    ),
+}
 
 
 class _TimedBytesPayload(payload.BytesPayload):
@@ -76,12 +100,59 @@ class _RoutingHints(BaseModel):
     )
 
 
+class _ReplicaMetrics(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    replica_id: str = Field(min_length=1)
+    generation: StrictInt = Field(ge=0)
+    metrics: dict[str, float]
+
+
+class _MetricsScrape(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    metrics: dict[str, float]
+    replicas: tuple[_ReplicaMetrics, ...]
+    incomplete: bool
+
+
 _ROUTED_PATHS = {
     "/v1/chat/completions",
     "/v1/completions",
     "/v1/responses",
     "/art/v1/chat/completions",
 }
+
+
+def _aggregate_metric_snapshots(
+    snapshots: Iterable[dict[str, float]],
+) -> dict[str, float]:
+    snapshots = tuple(snapshots)
+    names = set().union(*(snapshot.keys() for snapshot in snapshots))
+    unsupported = names.difference(
+        _SUM_METRICS, _MAX_METRICS, _RATIO_METRICS
+    ).difference(name for name in names if name.endswith("_total"))
+    if unsupported:
+        raise ValueError(
+            f"vLLM metrics have no semantic reducer: {sorted(unsupported)}"
+        )
+    metrics = {
+        name: math.fsum(snapshot[name] for snapshot in snapshots if name in snapshot)
+        for name in names
+        if name in _SUM_METRICS or name.endswith("_total")
+    }
+    metrics.update(
+        {
+            name: max(snapshot[name] for snapshot in snapshots if name in snapshot)
+            for name in names & _MAX_METRICS
+        }
+    )
+    for name, (hits, queries) in _RATIO_METRICS.items():
+        if hits in metrics and queries in metrics:
+            metrics[name] = (
+                metrics[hits] / metrics[queries] if metrics[queries] else 0.0
+            )
+    return metrics
 
 
 class VllmGateway:
@@ -379,7 +450,8 @@ class VllmGateway:
             raise web.HTTPServiceUnavailable(text="gateway is not accepting requests")
         path = request.path
         if path == "/art/metrics":
-            return web.json_response({"metrics": await self._aggregate_metrics()})
+            scrape = await self._aggregate_metrics()
+            return web.json_response(scrape.model_dump(mode="json"))
         if path == "/health":
             await self._require_survivors_healthy()
             return web.Response()
@@ -488,36 +560,32 @@ class VllmGateway:
             and now - replica.telemetry.observed_at <= _TELEMETRY_MAX_AGE_S
         )
 
-    async def _aggregate_metrics(self) -> dict[str, float]:
+    async def _aggregate_metrics(self) -> _MetricsScrape:
         replicas = self._surviving_replicas()
         if not replicas:
             raise web.HTTPServiceUnavailable(text="no routable replica survives")
-        try:
-            snapshots = await asyncio.gather(
-                *(self._metrics(replica.endpoint.url) for replica in replicas)
+        results = await asyncio.gather(
+            *(self._metrics(replica.endpoint.url) for replica in replicas),
+            return_exceptions=True,
+        )
+        snapshots = tuple(
+            _ReplicaMetrics(
+                replica_id=replica.replica_id,
+                generation=replica.generation,
+                metrics=result,
             )
-        except (
-            ClientError,
-            KeyError,
-            OSError,
-            TimeoutError,
-            TypeError,
-            ValueError,
-        ) as error:
-            raise web.HTTPServiceUnavailable(
-                text="surviving replica metrics failed"
-            ) from error
-        names = set().union(*(snapshot.keys() for snapshot in snapshots))
-        return {
-            name: (
-                sum(snapshot.get(name, 0.0) for snapshot in snapshots) / len(snapshots)
-                if name == "kv_cache_usage_perc"
-                else max(snapshot.get(name, 0.0) for snapshot in snapshots)
-                if name == "max_model_len"
-                else sum(snapshot.get(name, 0.0) for snapshot in snapshots)
-            )
-            for name in names
-        }
+            for replica, result in zip(replicas, results, strict=True)
+            if not isinstance(result, BaseException)
+        )
+        if not snapshots:
+            raise web.HTTPServiceUnavailable(text="surviving replica metrics failed")
+        return _MetricsScrape(
+            metrics=_aggregate_metric_snapshots(
+                snapshot.metrics for snapshot in snapshots
+            ),
+            replicas=snapshots,
+            incomplete=len(snapshots) != len(replicas),
+        )
 
     async def _metrics(self, endpoint: str) -> dict[str, float]:
         assert self._session is not None

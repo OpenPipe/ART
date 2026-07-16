@@ -43,7 +43,7 @@ class _ArtRuntimeMetricsState:
             ("max_num_seqs", scheduler_config, "max_num_seqs"),
             ("max_num_batched_tokens", scheduler_config, "max_num_batched_tokens"),
             ("max_model_len", model_config, "max_model_len"),
-            ("world_size", parallel_config, "world_size"),
+            ("world_size", parallel_config, "world_size_across_dp"),
         ):
             value = getattr(obj, attr, None)
             if isinstance(value, (int, float)):
