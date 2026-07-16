@@ -17,6 +17,7 @@ from art.distributed import (
     HostSpec,
     ModelServiceMemberSpec,
     ModelServiceSpec,
+    NcclTransportSpec,
     VllmParallelSpec,
     compile_topology,
 )
@@ -60,6 +61,7 @@ def _cluster() -> ClusterSpec:
         ),
         controller_host_id="host0",
         artifact_root=str(ROOT),
+        nccl_transport=NcclTransportSpec(net_name="IB"),
         startup_timeout_s=1800,
         rpc_timeout_s=300,
     )
