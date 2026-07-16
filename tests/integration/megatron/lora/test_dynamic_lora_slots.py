@@ -288,14 +288,35 @@ def _assert_distributed_optimizer_restore(device: torch.device) -> None:
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required.")
 def test_restored_dynamic_optimizer_canonicalizes_internal_padding() -> None:
     with _single_rank_model_parallel():
-        _assert_restored_dynamic_optimizer_canonicalizes_internal_padding()
+        for num_local_experts in (1, 2):
+            _assert_restored_dynamic_optimizer_canonicalizes_internal_padding(
+                num_local_experts
+            )
 
 
-def _assert_restored_dynamic_optimizer_canonicalizes_internal_padding() -> None:
+def _assert_restored_dynamic_optimizer_canonicalizes_internal_padding(
+    num_local_experts: int,
+) -> None:
     device = torch.device("cuda")
     ref = LoRASlotRef("checkpoint", "A")
-    adapter = _adapter("dense", rank=2, seed=17)
-    lora = LoRA("dense", 4, 5, 2, 32, torch.float32, device)
+    prefix = "dense" if num_local_experts == 1 else "experts.{expert}"
+    adapter = {
+        key: value
+        for expert in range(num_local_experts)
+        for key, value in _adapter(
+            prefix.format(expert=expert), rank=2, seed=17 + expert
+        ).items()
+    }
+    lora = LoRA(
+        prefix,
+        4,
+        5,
+        2,
+        32,
+        torch.float32,
+        device,
+        num_local_experts=num_local_experts,
+    )
     lora.load_lora_slot(ref, adapter, requires_grad=True)
     trainer = _trainer_for(lora, device)
 
@@ -308,8 +329,8 @@ def _assert_restored_dynamic_optimizer_canonicalizes_internal_padding() -> None:
         return result
 
     trainer.runtime.model_support_handler.canonicalize_loaded_lora_state = canonicalize
-    with use_lora_slot(ref):
-        lora(torch.randn(3, 4, device=device)).sum().backward()
+    for param in trainer._checkpoint_slot_params_by_name["A"]:
+        param.grad = torch.ones_like(param)
     trainer.optim_step(
         params=AdamParams(learning_rate=1e-3, weight_decay=0.1, grad_clip_norm=0.0),
         checkpoints=["A"],

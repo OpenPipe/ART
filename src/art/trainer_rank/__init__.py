@@ -550,6 +550,10 @@ class TrainerRank:
         self._pending_slot_graphs: dict[
             LoRASlotRef, list[weakref.ReferenceType[torch.Tensor]]
         ] = {}
+        self._pending_hybridep_graphs: list[weakref.ReferenceType[torch.Tensor]] = []
+        self._hybridep_graph_tracking = False
+        self._hybridep_buffer_id: int | None = None
+        self._hybridep_rows_high_water = 0
         self._memory_profiles: dict[_MemorySignature, _MemoryProfile] = {}
         self._last_global_micro_batch_size: int | None = None
         self.zero_grad()
@@ -993,6 +997,11 @@ class TrainerRank:
                 local_state, self.runtime.model
             )
         )
+        if set(adapter_model) != set(local_state):
+            raise TrainerRankSlotStateError(
+                "Model-specific LoRA canonicalization changed the adapter key set "
+                f"for {kind} slot {name!r}."
+            )
         return {
             key: tensor.to(
                 device=templates[key].device,
@@ -1328,6 +1337,7 @@ class TrainerRank:
         param_indices = {id(param): index for index, param in enumerate(params)}
         exported: dict[str, torch.Tensor] = {}
         owners: dict[str, tuple[int, int | None]] = {}
+        mapped_indices: set[int] = set()
         ref = self._slot_ref("checkpoint", name)
 
         for chunk in self.runtime.model:
@@ -1340,6 +1350,7 @@ class TrainerRank:
                     index = param_indices.get(id(param))
                     if index is None:
                         continue
+                    mapped_indices.add(index)
                     keys = expected_keys(str(suffix).removesuffix(".weight"))
                     if int(param.ndim) == 3:
                         if len(keys) != int(param.shape[0]):
@@ -1360,6 +1371,14 @@ class TrainerRank:
                         key = str(keys[0])
                         exported[key] = torch.ones_like(param.T)
                         owners[key] = (index, None)
+
+        if mapped_indices and (
+            missing := sorted(set(range(len(params))) - mapped_indices)
+        ):
+            raise TrainerRankSlotStateError(
+                f"Cannot map optimizer padding for checkpoint slot {name!r}: "
+                f"parameter indices {missing} do not belong to installed LoRA sites."
+            )
 
         canonical = self.runtime.model_support_handler.canonicalize_loaded_lora_state(
             exported, self.runtime.model
