@@ -70,6 +70,26 @@ def _spec() -> ModelServiceSpec:
 
 
 @pytest.mark.asyncio
+async def test_single_member_service_lifecycle() -> None:
+    events: list[str] = []
+    spec = _spec().model_copy(
+        update={
+            "members": (_spec().members[0],),
+            "parallel": VllmParallelSpec(tp=2),
+        }
+    )
+    manager = ReplicaManager(
+        spec,
+        {"host0": Launcher("host0", events)},
+        ReplicaLaunchTemplate(served_model_name="model@0"),
+    )
+
+    assert (await manager.start()).phase == "ready"
+    assert (await manager.stop()).phase == "stopped"
+    assert events == ["stop:host0"]
+
+
+@pytest.mark.asyncio
 async def test_failure_stops_whole_gang_before_callback_and_restarts_generation() -> (
     None
 ):

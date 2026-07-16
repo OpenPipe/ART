@@ -477,6 +477,8 @@ class DistributedMegatronService:
             self._require_open()
             if self._base_url:
                 return _host_port(self._base_url)
+            if self._managed_service_name is not None:
+                raise RuntimeError("managed model service is unavailable")
             return await self._start_openai_server_locked(config)
 
     async def _start_openai_server_locked(
@@ -604,6 +606,9 @@ class DistributedMegatronService:
 
     def _clear_serving_state(self) -> None:
         self._managed_service_name = None
+        self._unpublish_serving_state()
+
+    def _unpublish_serving_state(self) -> None:
         self._base_url = None
         self._serving_capabilities = None
         self._api_key_value = None
@@ -637,6 +642,7 @@ class DistributedMegatronService:
         except asyncio.CancelledError:
             raise
         except BaseException:
+            self._unpublish_serving_state()
             logger.exception(
                 "vLLM replica %s generation %d recovery failed",
                 failure.replica_id,
@@ -653,6 +659,7 @@ class DistributedMegatronService:
         )
         bootstrap_name = f"{self.model_name}@{self._latest_step}"
         base_url = service.leader_endpoint.url
+        exact_steps = tuple(sorted(self._loaded_exact_adapter_steps))
         try:
             state = await manager.restart(
                 served_model_name=bootstrap_name, lora_path=checkpoint
@@ -696,7 +703,7 @@ class DistributedMegatronService:
                 raise RuntimeError("restarted vLLM replica rejected current policy")
             if current_lora_name != bootstrap_name:
                 await self._unload_adapter_at(bootstrap_name, base_url)
-            for step in sorted(self._loaded_exact_adapter_steps):
+            for step in exact_steps:
                 if step == self._latest_step and self.rollout_weight_update_mode != (
                     "in_flight_lora"
                 ):
@@ -717,6 +724,9 @@ class DistributedMegatronService:
                     base_url=base_url,
                     api_key=self._api_key(),
                 )
+            self._current_lora_name = lora_name
+            self._loaded_adapter_steps = {self._latest_step}
+            self._loaded_exact_adapter_steps = set(exact_steps)
         except BaseException as error:
             manager.quarantine(f"replica recovery failed: {error}")
             try:

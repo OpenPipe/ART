@@ -849,11 +849,7 @@ class ArtRuntime:
             rpc_timeout_s=self.topology.cluster.rpc_timeout_s,
         )
         self._model_services[spec.name] = manager
-        try:
-            return await manager.start()
-        except BaseException:
-            self._model_services.pop(spec.name, None)
-            raise
+        return await manager.start()
 
     def model_service(self, name: str) -> ReplicaManager:
         try:
@@ -863,10 +859,9 @@ class ArtRuntime:
 
     async def stop_model_service(self, name: str) -> ReplicaState:
         manager = self.model_service(name)
-        try:
-            return await manager.stop()
-        finally:
-            self._model_services.pop(name, None)
+        state = await manager.stop()
+        self._model_services.pop(name, None)
+        return state
 
     async def close(self) -> None:
         if self._close_task is None:
@@ -909,9 +904,9 @@ class ArtRuntime:
         )
         self._closeables.clear()
         await collect(
-            "model-service shutdown", *(m.stop() for m in self._model_services.values())
+            "model-service shutdown",
+            *(self.stop_model_service(name) for name in tuple(self._model_services)),
         )
-        self._model_services.clear()
         await collect("trainer shutdown", *(run.close() for run in self._trainer_runs))
         self._trainer_runs.clear()
         await collect(
