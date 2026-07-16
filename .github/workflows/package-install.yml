@@ -26,7 +26,7 @@ jobs:
           curl -LsSf https://astral.sh/uv/install.sh | sh
           echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
 
-      - name: Build wheel
+      - name: Build managed-runtime wheel
         run: python scripts/build_package.py --wheel
 
       - name: Smoke test uv add + sync for backend extra
@@ -43,3 +43,71 @@ jobs:
           uv init --name art-install-smoke --python 3.12 --bare
           uv add "openpipe-art[backend] @ file://${wheel_path}"
           uv sync
+
+      - name: Smoke test distributed wheel surface
+        env:
+          ART_VLLM_RUNTIME_CACHE_DIR: ${{ runner.temp }}/art-vllm-runtime-cache
+        run: |
+          wheel_path="$(python - <<'PY'
+          from pathlib import Path
+
+          print(next(Path("dist").glob("openpipe_art-*.whl")).resolve())
+          PY
+          )"
+
+          project_dir="$(mktemp -d)"
+          cd "$project_dir"
+          uv init --name art-distributed-install-smoke --python 3.12 --bare
+          uv venv --python 3.12
+          uv pip install --python .venv/bin/python --no-deps \
+            "openpipe-art[distributed,megatron] @ file://${wheel_path}"
+          uv pip install --python .venv/bin/python \
+            "openpipe-art[distributed] @ file://${wheel_path}"
+          uv pip install --python .venv/bin/python \
+            --index-url https://download.pytorch.org/whl/cpu \
+            "torch==2.11.0"
+          uv pip install --python .venv/bin/python "transformers==5.12.1"
+
+          .venv/bin/python - <<'PY'
+          import sys
+          from importlib.metadata import metadata
+          from pathlib import Path
+
+          import art
+          import art.distributed as distributed
+
+          assert Path(art.__file__).resolve().is_relative_to(Path(sys.prefix))
+          assert "art.distributed.art_runtime" not in sys.modules
+          from art.distributed import (  # noqa: E402
+              ArtRuntime,
+              ClusterSpec,
+              HostSpec,
+              InstalledAsyncCallable,
+              PackingRequest,
+              compile_topology,
+          )
+
+          assert all(
+              value is not None
+              for value in (
+                  ArtRuntime,
+                  ClusterSpec,
+                  HostSpec,
+                  InstalledAsyncCallable,
+                  PackingRequest,
+                  compile_topology,
+              )
+          )
+          assert "monarch" not in sys.modules
+          assert "PackingRequest" in distributed.__all__
+          assert {"distributed", "megatron"} <= set(
+              metadata("openpipe-art").get_all("Provides-Extra") or ()
+          )
+          PY
+
+          PYTHONPATH="$GITHUB_WORKSPACE/examples/multinode" timeout 150s \
+            .venv/bin/art-monarch local \
+            --program program:main \
+            --port 0 \
+            --startup-timeout 90
+          test ! -e "$ART_VLLM_RUNTIME_CACHE_DIR"

@@ -12,27 +12,125 @@ process does not launch another SkyPilot cluster from inside its allocation.
 
 The bootstrap accepts an import path to a top-level async function. SkyPilot
 runs the bootstrap on every node, but only rank 0 imports its module and invokes
-the function:
+the controller. `examples/multinode/program.py` is a complete CPU-runnable
+Yes/No/Maybe smoke:
 
 ```python
+import asyncio
+import os
+import socket
 from typing import Any
+
+import art
+from art.distributed import (
+    ArtRuntime,
+    ClusterSpec,
+    HostSpec,
+    InstalledAsyncCallable,
+    compile_topology,
+)
+
+REWARDS = {"yes": 0.5, "no": 0.75, "maybe": 1.0}
+
+
+async def rollout(
+    _model: art.TrainableModel, answer: str, _config: None
+) -> art.Trajectory:
+    messages: art.MessagesAndChoices = [
+        {"role": "user", "content": f"Respond with {answer}."},
+        {"role": "assistant", "content": answer},
+    ]
+    return art.Trajectory(
+        messages_and_choices=messages,
+        reward=REWARDS[answer],
+        metadata={
+            "answer": answer,
+            "hostname": socket.gethostname(),
+            "process_id": os.getpid(),
+        },
+    )
 
 
 async def main(hosts: Any) -> None:
-    # Construct and run your distributed ART backend with this HostMesh.
-    ...
+    host_count = int(hosts.region.slice().sizes[0])
+    host_ids = tuple(f"host{rank}" for rank in range(host_count))
+    runtime = await ArtRuntime.start(
+        hosts,
+        compile_topology(
+            cluster=ClusterSpec(
+                hosts=tuple(
+                    HostSpec(
+                        host_id=host_id,
+                        node_rank=rank,
+                        worker_address=f"attached://{rank}",
+                        cpu_slots=1,
+                    )
+                    for rank, host_id in enumerate(host_ids)
+                ),
+                controller_host_id=host_ids[0],
+                startup_timeout_s=90,
+                rpc_timeout_s=30,
+            )
+        ),
+    )
+    try:
+        workers = tuple(range(host_count))
+        executor = runtime.rollout_executor(
+            InstalledAsyncCallable.from_callable(rollout),
+            target_workers=host_count,
+        )
+        executor.set_workers(workers)
+        model = art.TrainableModel(
+            name="multinode-smoke", project="art", base_model="not-loaded"
+        )
+        trajectories = []
+        for answer in REWARDS:
+            trajectories.extend(
+                await asyncio.gather(
+                    *(
+                        executor.run(worker, rollout, model, answer, None)
+                        for worker in workers
+                    )
+                )
+            )
+        answers = [
+            str(trajectory.metadata["answer"]) for trajectory in trajectories
+        ]
+        expected = [answer for answer in REWARDS for _ in workers]
+        placements = {
+            (trajectory.metadata["hostname"], trajectory.metadata["process_id"])
+            for trajectory in trajectories
+        }
+        if answers != expected or len(placements) != host_count:
+            raise RuntimeError(
+                f"distributed rollout mismatch: {answers=}, {placements=}"
+            )
+        print(f"ART_MULTINODE_SMOKE_PASS hosts={host_count} answers={answers}")
+    finally:
+        await runtime.close()
 ```
 
-The controller module only needs to be importable on rank 0. User functions and
-other code spawned through Monarch must be installed or synchronized at the
-same import paths on every node; ART does not ship pickled closures between
-hosts.
+The controller runs once, while the top-level `rollout` runs in one process on
+each host. Both must be installed or synchronized at the same import paths on
+every node; ART sends verified import references and never ships opaque
+closures. The dummy `TrainableModel` is serialized for the rollout contract but
+never loaded, so this validates the package, host admission, process placement,
+public trajectory types, and cleanup without a GPU or inference server.
+
+The distributed service APIs are opt-in. Existing single-node programs continue
+to construct and use `LocalBackend` exactly as before:
+
+```python
+from art.local import LocalBackend
+
+backend = LocalBackend()
+```
 
 ## SkyPilot
 
 Start with `examples/multinode/skypilot.yaml`. It is an intentionally CPU-only
-two-node smoke that validates physical launch, host admission, and one remote
-rollout per node without reserving training GPUs.
+two-node smoke that runs all three bounded rollouts on each host without
+reserving training GPUs or provisioning the managed vLLM runtime.
 
 For source-based GPU training, replace its resources and setup with the desired
 topology and both locked environments:
@@ -53,8 +151,9 @@ run: |
 ```
 
 `set -euo pipefail` is required because SkyPilot runs multiline setup under
-Bash without enabling fail-fast behavior. The source checkout needs the root
-and `vllm_runtime` projects at the same revision on every node.
+Bash without enabling fail-fast behavior. A source-based GPU run needs the root
+and `vllm_runtime` locked projects at the same revision on every node. The CPU
+example only syncs the root `distributed` extra.
 
 For a published release wheel, use a separate setup rather than synchronizing
 the source runtime:
@@ -106,20 +205,21 @@ sky exec art-multinode examples/multinode/skypilot.yaml
 `sky exec` synchronizes the workdir before scheduling, so running it while the
 previous job is live can change files under that job. Use `sky launch` instead
 when setup, mounts, the image, SkyPilot config, a wheel, `pyproject.toml`, or a
-lockfile changed. Setting `num_nodes: 1` uses the same path on one node. The
-existing `LocalBackend` interface remains unchanged for users who do not opt
-into the distributed APIs.
+lockfile changed. Setting `num_nodes: 1` uses the same controller on one node.
 
 For a local process that explicitly wants the same Monarch service APIs, ART
 can own one loopback worker directly:
 
 ```fish
-.venv/bin/art-monarch local --program your_package.train:main
+env PYTHONPATH=(pwd)/examples/multinode .venv/bin/art-monarch local \
+  --program program:main \
+  --port 0 \
+  --startup-timeout 90
 ```
 
-`ArtRuntime.start_local(...)` is the equivalent library API. It accepts the
-same one-host compiled topology used by multi-node code and owns the worker for
-the runtime lifetime.
+Port `0` selects a fresh loopback port. `ArtRuntime.start_local(...)` is the
+equivalent library API. It accepts the same one-host compiled topology used by
+multi-node code and owns the worker for the runtime lifetime.
 
 SkyPilot provides `SKYPILOT_NODE_RANK`, `SKYPILOT_NODE_IPS`, and
 `SKYPILOT_NUM_NODES`; ART validates and translates them internally. Port

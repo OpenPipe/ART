@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-from typing import Any, Literal
+from collections.abc import Iterable
+from typing import TYPE_CHECKING, Any, Literal
 
 import numpy as np
 from openai.types.chat.chat_completion import Choice
@@ -20,6 +21,9 @@ from art.trajectories import (
 
 from .data_plane import PackedBatchRef
 from .rollout import RolloutModelSpec
+
+if TYPE_CHECKING:
+    from art.model import TrainableModel
 
 
 class _ChoiceRoutingPayload(BaseModel):
@@ -215,6 +219,44 @@ class PackingRequest(BaseModel):
     record_ids: tuple[str, ...] = ()
     min_source_version: int = Field(default=0, ge=0)
     max_source_version: int = Field(default=0, ge=0)
+
+    @classmethod
+    def from_groups(
+        cls,
+        model: TrainableModel,
+        trajectory_groups: Iterable[TrajectoryGroup],
+        *,
+        packed_sequence_length: int,
+        advantage_balance: float = 0.0,
+        allow_training_without_logprobs: bool = False,
+        scale_rewards: bool = True,
+        plot_tensors: bool = False,
+        logprob_calculation_chunk_size: int = 1024,
+        include_moe_routing: bool = False,
+        group_ids: tuple[str, ...] = (),
+        record_ids: tuple[str, ...] = (),
+        min_source_version: int = 0,
+        max_source_version: int = 0,
+    ) -> "PackingRequest":
+        """Build a serializable packing request from public ART objects."""
+
+        return cls(
+            model=RolloutModelSpec.from_model(model),
+            trajectory_groups=tuple(
+                TrajectoryGroupPayload.from_group(group) for group in trajectory_groups
+            ),
+            advantage_balance=advantage_balance,
+            allow_training_without_logprobs=allow_training_without_logprobs,
+            scale_rewards=scale_rewards,
+            plot_tensors=plot_tensors,
+            packed_sequence_length=packed_sequence_length,
+            logprob_calculation_chunk_size=logprob_calculation_chunk_size,
+            include_moe_routing=include_moe_routing,
+            group_ids=group_ids,
+            record_ids=record_ids,
+            min_source_version=min_source_version,
+            max_source_version=max_source_version,
+        )
 
 
 class PackingResult(BaseModel):

@@ -1,5 +1,59 @@
 from importlib import import_module
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from .art_runtime import ArtRuntime, DistributedPackedBatch
+    from .data_plane import PackedBatchRef, TensorSpec
+    from .packing import PackingRequest
+    from .rollout import (
+        DistributedRolloutExecutor,
+        InProcessRolloutHost,
+        InstalledAsyncCallable,
+        LocalRolloutExecutor,
+        RolloutExecutor,
+    )
+    from .specs import (
+        ArtRuntimeConfig,
+        ClusterSpec,
+        EndpointSpec,
+        GpuPlacement,
+        HostServiceHealth,
+        HostSpec,
+        ModelServiceMemberSpec,
+        ModelServiceReplicaSpec,
+        ModelServiceSpec,
+        RuntimeTopology,
+        TrainerMeshSpec,
+        VllmParallelSpec,
+    )
+    from .topology import compile_topology
+    from .vllm_gateway import VllmGateway
+    from .vllm_replica import (
+        HostMemberLaunchRequest,
+        HostMemberState,
+        ManagedVllmHostLauncher,
+        ReplicaFailure,
+        ReplicaHostLauncher,
+        ReplicaLaunchTemplate,
+        ReplicaManager,
+        ReplicaState,
+    )
+    from .vllm_router import (
+        KvCacheEvent,
+        PolicyGenerationCommitError,
+        PrefixBlockHashes,
+        PreparedRoutingTable,
+        ReplicaRouter,
+        ReplicaTelemetry,
+        ReplicaUpdateReport,
+        RoutableReplica,
+        RouteReservation,
+        RoutingDeadlineExceededError,
+        RoutingInput,
+        RoutingQueueFullError,
+        RoutingTable,
+        RoutingUnavailableError,
+    )
 
 _EXPORTS = {
     "ArtRuntime": ".art_runtime",
