@@ -148,6 +148,7 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
         eval_fn: EvalFn[ConfigT] | None = None,
         *,
         # Deprecated direct pipeline settings
+        # TODO(2026-09): Remove these backward-compatible aliases.
         num_rollout_workers: int | None = None,
         min_batch_size: int | None = None,
         max_batch_size: int | None = None,
