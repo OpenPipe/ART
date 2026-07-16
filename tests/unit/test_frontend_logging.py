@@ -187,7 +187,7 @@ class TestHistoryJsonlCompatibility:
         # Verify required fields
         assert "step" in entry
         assert "recorded_at" in entry
-        assert "reward/val" in entry
+        assert "val/reward" in entry
 
     @pytest.mark.asyncio
     async def test_history_readable_by_polars(
@@ -207,8 +207,8 @@ class TestHistoryJsonlCompatibility:
         df = pl.read_ndjson(str(history_path))
 
         assert "step" in df.columns
-        assert "reward/val" in df.columns
-        assert "reward/val_std_dev" in df.columns
+        assert "val/reward" in df.columns
+        assert "val/reward_std_dev" in df.columns
 
     @pytest.mark.asyncio
     async def test_history_appends_entries(
@@ -350,7 +350,7 @@ class TestMetricCalculation:
                 "training_step",
             ]
         ]
-        assert all(k.startswith(("reward/", "task/", "data/")) for k in metric_keys), (
+        assert all(k.startswith(("val/", "data/")) for k in metric_keys), (
             f"Not all metrics routed into taxonomy namespaces: {metric_keys}"
         )
         assert entry["training_step"] == 0
@@ -387,12 +387,12 @@ class TestMetricCalculation:
         with open(history_path) as f:
             entry = json.loads(f.readline())
 
-        assert "reward/val" in entry
-        assert "task/val/exception_rate" in entry
-        assert "reward/val_std_dev" in entry
+        assert "val/reward" in entry
+        assert "val/exception_rate" in entry
+        assert "val/reward_std_dev" in entry
 
         # Check reward average is correct
-        assert entry["reward/val"] == 0.7  # (0.8 + 0.6) / 2
+        assert entry["val/reward"] == 0.7  # (0.8 + 0.6) / 2
 
     @pytest.mark.asyncio
     async def test_group_metric_aggregation(self, tmp_path: Path):
@@ -433,7 +433,7 @@ class TestMetricCalculation:
         with open(history_path) as f:
             entry = json.loads(f.readline())
 
-        assert entry["task/val/group/judge_score"] == 0.4
+        assert entry["val/group/judge_score"] == 0.4
 
     @pytest.mark.asyncio
     async def test_exception_rate_calculation(self, tmp_path: Path):
@@ -466,7 +466,7 @@ class TestMetricCalculation:
             entry = json.loads(f.readline())
 
         # All successful trajectories = 0% exception rate
-        assert entry["task/val/exception_rate"] == 0.0
+        assert entry["val/exception_rate"] == 0.0
 
     @pytest.mark.asyncio
     async def test_exception_rate_counts_group_exceptions(self, tmp_path: Path):
@@ -495,7 +495,7 @@ class TestMetricCalculation:
         with open(history_path) as f:
             entry = json.loads(f.readline())
 
-        assert entry["task/val/exception_rate"] == pytest.approx(0.5)
+        assert entry["val/exception_rate"] == pytest.approx(0.5)
 
     @pytest.mark.asyncio
     async def test_generator_of_trajectories_is_consumed_once(self, tmp_path: Path):
@@ -524,8 +524,8 @@ class TestMetricCalculation:
         with open(history_path) as f:
             entry = json.loads(f.readline())
 
-        assert entry["reward/val"] == pytest.approx(2.0)
-        assert entry["task/val/custom"] == pytest.approx(2.0)
+        assert entry["val/reward"] == pytest.approx(2.0)
+        assert entry["val/custom"] == pytest.approx(2.0)
 
     @pytest.mark.asyncio
     async def test_train_trajectory_metrics_default_to_train_prefix(
@@ -560,10 +560,10 @@ class TestMetricCalculation:
         with open(history_path) as f:
             entry = json.loads(f.readline())
 
-        assert entry["reward/train"] == 0.7
-        assert entry["task/train/exception_rate"] == 0.0
-        assert entry["task/train/custom_score"] == 1.0
-        assert entry["task/train/reward/prefixed"] == 2.0
+        assert entry["train/reward"] == 0.7
+        assert entry["train/exception_rate"] == 0.0
+        assert entry["train/custom_score"] == 1.0
+        assert entry["train/reward/prefixed"] == 2.0
 
     @pytest.mark.asyncio
     async def test_train_logs_add_default_data_metrics_from_trajectory_groups(

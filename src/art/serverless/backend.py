@@ -49,9 +49,9 @@ def _extract_step_from_wandb_artifact(artifact: "Artifact") -> int | None:
 
 
 _UPSTREAM_TRAIN_METRIC_KEYS = {
-    "reward": "reward/train",
-    "reward_std_dev": "reward/train_std_dev",
-    "exception_rate": "task/train/exception_rate",
+    "reward": "train/reward",
+    "reward_std_dev": "train/reward_std_dev",
+    "exception_rate": "train/exception_rate",
     "policy_loss": "loss/train",
     "loss": "loss/train",
     "entropy": "loss/entropy",
@@ -74,7 +74,7 @@ def _canonicalize_upstream_metric_key(metric: str) -> str:
     if metric == "tokens_per_second":
         return ""
     if metric.startswith("group_metric_"):
-        return f"group_{metric[len('group_metric_') :]}"
+        return f"train/group/{metric[len('group_metric_') :]}"
     return _UPSTREAM_TRAIN_METRIC_KEYS.get(metric, metric)
 
 

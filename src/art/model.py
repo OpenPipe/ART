@@ -323,7 +323,6 @@ class _OpenAIClientProxy:
 
 METRIC_SECTIONS = frozenset(
     {
-        "reward",
         "loss",
         "objective",
         "offpolicy",
@@ -334,7 +333,6 @@ METRIC_SECTIONS = frozenset(
         "throughput",
         "costs",
         "discarded",
-        "task",
         "time",
         "data",
         "vllm",
@@ -391,13 +389,16 @@ WANDB_CANONICAL_METRIC_KEYS = frozenset(
         "vllm/num_requests_waiting_capacity",
         "vllm/prefix_cache_hit_rate",
         "vllm/kv_cache_usage_perc",
+        *(
+            f"{split}/{metric}"
+            for split in METRIC_SPLITS
+            for metric in ("reward", "reward_std_dev", "exception_rate")
+        ),
     }
 )
 WANDB_CANONICAL_METRIC_PREFIXES = (
     "costs/cum/",
-    "reward/",
     f"{SFT_METRIC_PREFIX}/",
-    "task/",
 )
 
 
@@ -937,7 +938,8 @@ class Model(
             # This allows out-of-order logging (e.g., async validation for previous steps).
             run.define_metric("training_step")
             run.define_metric(SFT_WANDB_GRADIENT_STEP_KEY)
-            run.define_metric("reward/*", step_metric="training_step")
+            for split in ("train", "val", "test"):
+                run.define_metric(f"{split}/*", step_metric="training_step")
             run.define_metric("loss/*", step_metric="training_step")
             run.define_metric("objective/*", step_metric="training_step")
             run.define_metric("sample_efficiency/*", step_metric="training_step")
@@ -948,7 +950,6 @@ class Model(
             run.define_metric("data/*", step_metric="training_step")
             run.define_metric("discarded/*", step_metric="training_step")
             run.define_metric("pipeline_settings/*", step_metric="training_step")
-            run.define_metric("task/*", step_metric="training_step")
             run.define_metric("vllm/*", step_metric="training_step")
             run.define_metric(
                 f"{SFT_METRIC_PREFIX}/*", step_metric=SFT_WANDB_GRADIENT_STEP_KEY
@@ -961,27 +962,17 @@ class Model(
         metrics: dict[str, float],
         split: str,
         step: int,
+        *,
+        custom_metric_keys: set[str] | None = None,
     ) -> None:
         """Log metrics to history.jsonl and optionally wandb."""
-        if split == SFT_METRIC_PREFIX:
-            prefixed = {
-                key
-                if key.startswith(f"{SFT_METRIC_PREFIX}/")
-                else f"{split}/{key}": value
-                for key, value in metrics.items()
-            }
-        else:
-            prefixed = {}
-            for key, value in metrics.items():
-                first_component = key.split("/", 1)[0]
-                has_prefix_component = "/" in key
-                if has_prefix_component and (
-                    first_component in METRIC_SECTIONS
-                    or first_component in METRIC_SPLITS
-                ):
-                    prefixed[key] = value
-                else:
-                    prefixed[f"{split}/{key}"] = value
+        prefixed = {
+            self._qualify_metric_key(key, split): value
+            for key, value in metrics.items()
+        }
+        qualified_custom_keys = {
+            self._qualify_metric_key(key, split) for key in custom_metric_keys or set()
+        }
 
         prefixed["training_step"] = step
 
@@ -1008,28 +999,57 @@ class Model(
         ) or (self.report_metrics is not None and "wandb" in self.report_metrics)
         if should_log_wandb:
             if run := self._get_wandb_run():
-                wandb_metrics = self._wandb_metrics_payload(prefixed)
-                self._define_wandb_step_metrics(wandb_metrics.keys())
+                wandb_metrics = self._wandb_metrics_payload(
+                    prefixed, qualified_custom_keys
+                )
+                self._define_wandb_step_metrics(
+                    wandb_metrics.keys(), qualified_custom_keys
+                )
                 # Let W&B use its own monotonically increasing history step.
                 # ART's `training_step` remains the x-axis via define_metric,
                 # which preserves out-of-order eval logging.
                 run.log(wandb_metrics)
 
-    def _wandb_metrics_payload(self, metrics: dict[str, float]) -> dict[str, float]:
+    @staticmethod
+    def _qualify_metric_key(key: str, split: str) -> str:
+        first_component = key.split("/", 1)[0]
+        if split == SFT_METRIC_PREFIX:
+            return key if first_component == SFT_METRIC_PREFIX else f"{split}/{key}"
+        if "/" in key and (
+            first_component in METRIC_SECTIONS or first_component in METRIC_SPLITS
+        ):
+            return key
+        return f"{split}/{key}"
+
+    @staticmethod
+    def _direct_custom_metric_keys(metrics: dict[str, float], split: str) -> set[str]:
+        if split == SFT_METRIC_PREFIX:
+            return set()
+        return {key for key in metrics if key.split("/", 1)[0] not in METRIC_SECTIONS}
+
+    def _wandb_metrics_payload(
+        self,
+        metrics: dict[str, float],
+        custom_metric_keys: set[str] | None = None,
+    ) -> dict[str, float]:
+        custom_metric_keys = custom_metric_keys or set()
         return {
             key: value
             for key, value in metrics.items()
             if key in WANDB_CANONICAL_METRIC_KEYS
             or key.startswith(WANDB_CANONICAL_METRIC_PREFIXES)
+            or key in custom_metric_keys
         }
 
-    def _define_wandb_step_metrics(self, keys: Iterable[str]) -> None:
+    def _define_wandb_step_metrics(
+        self, keys: Iterable[str], custom_metric_keys: set[str]
+    ) -> None:
         run = self._wandb_run
         if run is None or _wandb_run_is_finished(run):
             return
 
         for key in keys:
-            if not key.startswith("costs/"):
+            if not key.startswith("costs/") and key not in custom_metric_keys:
                 continue
             if key in self._wandb_defined_metrics:
                 continue
@@ -1058,7 +1078,7 @@ class Model(
             non_cost_metrics[metric] = numeric_value
         return non_cost_metrics
 
-    def _route_task_metrics_and_collect_non_costs(
+    def _route_split_metrics_and_collect_non_costs(
         self,
         metrics: dict[str, float],
         split: str,
@@ -1066,10 +1086,10 @@ class Model(
         prefix: str | None = None,
     ) -> dict[str, float]:
         routed = self._route_metrics_and_collect_non_costs(metrics, split)
-        task_prefix = f"task/{split}"
+        split_prefix = split
         if prefix:
-            task_prefix = f"{task_prefix}/{prefix.strip('/')}"
-        return {f"{task_prefix}/{metric}": value for metric, value in routed.items()}
+            split_prefix = f"{split_prefix}/{prefix.strip('/')}"
+        return {f"{split_prefix}/{metric}": value for metric, value in routed.items()}
 
     def _collect_automatic_backend_metrics(
         self,
@@ -1121,15 +1141,22 @@ class Model(
         if split not in METRIC_SPLITS:
             return {}
 
-        builder = self._metrics_builder_for_split(split)
         summary = summarize_trajectory_groups(trajectory_groups)
         default_data_metrics = build_data_metrics_from_summary(
             summary,
             include_trainable_groups=split == "train",
         )
-        for key, value in default_data_metrics.items():
-            if key in provided_metric_keys:
-                continue
+        missing_metrics = {
+            key: value
+            for key, value in default_data_metrics.items()
+            if key not in provided_metric_keys
+            and f"{split}/{key}" not in provided_metric_keys
+        }
+        if split != "train":
+            return {f"{split}/{key}": value for key, value in missing_metrics.items()}
+
+        builder = self._metrics_builder_for_split(split)
+        for key, value in missing_metrics.items():
             builder.add_metric(key, value)
 
         if summary.scenario_ids:
@@ -1236,7 +1263,14 @@ class Model(
                 builder_metrics = await builder.flush()
                 merged_metrics = {**metrics_without_costs, **builder_metrics}
                 if merged_metrics:
-                    self._log_metrics(merged_metrics, split, step)
+                    self._log_metrics(
+                        merged_metrics,
+                        split,
+                        step,
+                        custom_metric_keys=self._direct_custom_metric_keys(
+                            metrics_without_costs, split
+                        ),
+                    )
                 self._persist_metrics_builder_state()
             return
 
@@ -1278,16 +1312,18 @@ class Model(
             exception_rate_key: [],
         }
         group_metrics: dict[str, list[float]] = {}
+        custom_metric_keys: set[str] = set()
 
         for group in trajectory_groups:
             if group.metrics:
-                group_non_cost = self._route_task_metrics_and_collect_non_costs(
+                group_non_cost = self._route_split_metrics_and_collect_non_costs(
                     cast(dict[str, float], group.metrics),
                     split,
                     prefix="group",
                 )
             else:
                 group_non_cost = {}
+            custom_metric_keys.update(group_non_cost)
             if group.trajectories:
                 for metric, value in group_non_cost.items():
                     if metric not in group_metrics:
@@ -1306,11 +1342,12 @@ class Model(
                     trajectory_metrics[metric] = float(value)
 
                 non_cost_trajectory_metrics = (
-                    self._route_task_metrics_and_collect_non_costs(
+                    self._route_split_metrics_and_collect_non_costs(
                         trajectory_metrics,
                         split,
                     )
                 )
+                custom_metric_keys.update(non_cost_trajectory_metrics)
                 for metric, value in non_cost_trajectory_metrics.items():
                     if metric not in all_metrics:
                         all_metrics[metric] = []
@@ -1339,18 +1376,12 @@ class Model(
         reward_value = averages.pop(reward_key, None)
         reward_std_dev = averages.pop(reward_std_dev_key, None)
         exception_rate = averages.pop(exception_rate_key, None)
-        if split in METRIC_SPLITS:
-            if reward_value is not None:
-                averages[f"reward/{split}"] = reward_value
-            if reward_std_dev is not None:
-                averages[f"reward/{split}_std_dev"] = reward_std_dev
-        else:
-            if reward_value is not None:
-                averages[f"task/{split}/reward"] = reward_value
-            if reward_std_dev is not None:
-                averages[f"task/{split}/reward_std_dev"] = reward_std_dev
+        if reward_value is not None:
+            averages[f"{split}/reward"] = reward_value
+        if reward_std_dev is not None:
+            averages[f"{split}/reward_std_dev"] = reward_std_dev
         if exception_rate is not None:
-            averages[f"task/{split}/exception_rate"] = exception_rate
+            averages[f"{split}/exception_rate"] = exception_rate
 
         # Merge in any additional metrics passed directly
         if metrics is not None:
@@ -1358,12 +1389,20 @@ class Model(
                 metrics, split
             )
             averages.update(metrics_without_costs)
+            custom_metric_keys.update(
+                self._direct_custom_metric_keys(metrics_without_costs, split)
+            )
 
         # 3. Merge in any builder-managed metrics and log a single row.
         builder_metrics = await builder.flush()
         merged_metrics = {**averages, **builder_metrics}
         if merged_metrics:
-            self._log_metrics(merged_metrics, split, step)
+            self._log_metrics(
+                merged_metrics,
+                split,
+                step,
+                custom_metric_keys=custom_metric_keys,
+            )
         self._persist_metrics_builder_state()
 
     async def get_step(self) -> int:
@@ -1547,14 +1586,14 @@ class TrainableModel(Model[ModelConfig, StateType], Generic[ModelConfig, StateTy
         )
 
     async def delete_checkpoints(
-        self, best_checkpoint_metric: str = "reward/val"
+        self, best_checkpoint_metric: str = "val/reward"
     ) -> None:
         """
         Delete all but the latest and best checkpoints.
 
         Args:
             best_checkpoint_metric: The metric to use to determine the best checkpoint.
-                Defaults to "reward/val".
+                Defaults to "val/reward".
         """
         output_dir = self._get_output_dir()
         steps_to_keep = [await self.get_step()]  # Keep latest
