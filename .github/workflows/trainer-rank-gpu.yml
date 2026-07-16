@@ -3,12 +3,13 @@ name: TrainerRank GPU validation
 on:
   pull_request:
     types: [opened, reopened, synchronize, ready_for_review]
+  workflow_dispatch:
 
 permissions:
   contents: read
 
 concurrency:
-  group: trainer-rank-gpu-${{ github.event.pull_request.number }}
+  group: trainer-rank-gpu-${{ github.event_name }}-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
 
 jobs:
@@ -16,18 +17,34 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       required: ${{ steps.changes.outputs.required }}
+      head_sha: ${{ steps.changes.outputs.head_sha }}
     steps:
       - uses: actions/checkout@v4
         with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
           fetch-depth: 0
 
       - id: changes
         name: Classify changed files
         env:
+          EVENT_NAME: ${{ github.event_name }}
           BASE_SHA: ${{ github.event.pull_request.base.sha }}
-          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
         run: |
           set -euo pipefail
+          echo "head_sha=${HEAD_SHA}" >> "${GITHUB_OUTPUT}"
+          if [ "${EVENT_NAME}" = "workflow_dispatch" ]; then
+            echo "required=true" >> "${GITHUB_OUTPUT}"
+            echo "### Manual TrainerRank GPU validation requested" \
+              >> "${GITHUB_STEP_SUMMARY}"
+            echo >> "${GITHUB_STEP_SUMMARY}"
+            echo "Validating \`${GITHUB_REF}\` at \`${HEAD_SHA}\`." \
+              >> "${GITHUB_STEP_SUMMARY}"
+            exit 0
+          fi
+          git cat-file -e "${BASE_SHA}^{commit}" 2>/dev/null \
+            || git fetch --no-tags origin "${BASE_SHA}"
+
           pattern='^src/art/megatron/(_hybrid_ep/|hybrid_ep_setup\.py|setup\.sh|prefix_tree(_packing|_state)?\.py|context_parallel/|flex_attn/|gdn/|lora\.py|megatron_patches\.py|training/(finalize_grads|microbatches)\.py)'
           changed="$(git diff --name-only "${BASE_SHA}...${HEAD_SHA}")"
           critical="$(printf '%s\n' "${changed}" | grep -E "${pattern}" || true)"
@@ -57,7 +74,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: ${{ github.event.pull_request.head.sha }}
+          ref: ${{ needs.classify.outputs.head_sha }}
 
       - name: Install launch dependencies
         run: |
