@@ -18,6 +18,7 @@ from .trajectory_store import (
     TrajectoryEnqueueResult,
     TrajectoryGroupRef,
     TrajectoryQueueItem,
+    TrajectoryQueueResize,
     TrajectoryQueueSnapshot,
     TrajectoryQueueTake,
 )
@@ -109,11 +110,12 @@ class MonarchTrajectoryQueueEndpoint:
         )
 
     async def enqueue(
-        self, queue_id: str, item: TrajectoryQueueItem, max_ready_groups: int
+        self, queue_id: str, item: TrajectoryQueueItem
     ) -> TrajectoryEnqueueResult:
-        return await call_remote(
-            self.actor.enqueue_trajectory, queue_id, item, max_ready_groups
-        )
+        return await call_remote(self.actor.enqueue_trajectory, queue_id, item)
+
+    async def resize(self, operation: TrajectoryQueueResize) -> None:
+        await call_remote(self.actor.resize_trajectory_queue, operation)
 
     async def take(self, queue_id: str, consumer_id: str) -> TrajectoryQueueTake:
         return await call_remote(self.actor.take_trajectory, queue_id, consumer_id)

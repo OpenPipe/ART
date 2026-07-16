@@ -70,6 +70,18 @@ class _ScenarioSourceExhausted(Exception):
     pass
 
 
+class _ResizableAsyncQueue(asyncio.Queue[T]):
+    def resize(self, maxsize: int) -> None:
+        if maxsize < 1:
+            raise ValueError("queue maxsize must be positive")
+        grew = maxsize > self.maxsize
+        internals = cast(Any, self)
+        internals._maxsize = maxsize
+        if grew:
+            for _ in range(min(maxsize - self.qsize(), len(internals._putters))):
+                internals._wakeup_next(internals._putters)
+
+
 def _is_eval_mapping(
     result: Sequence[art.Trajectory | art.TrajectoryGroup]
     | Mapping[str, Sequence[art.Trajectory | art.TrajectoryGroup]],
@@ -373,7 +385,7 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
             self._output_queue = result_queue_factory(queue_maxsize)
             await self._output_queue.start()
         else:
-            self._output_queue = asyncio.Queue(maxsize=queue_maxsize)
+            self._output_queue = _ResizableAsyncQueue(maxsize=queue_maxsize)
         self._eval_queue = asyncio.Queue()
 
         loop = asyncio.get_running_loop()
@@ -521,7 +533,9 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
             if isinstance(self._output_queue, DistributedTrajectoryQueue):
                 self._output_queue.set_maxsize(self.queue_maxsize)
             else:
-                cast(Any, self._output_queue)._maxsize = self.queue_maxsize
+                cast(
+                    _ResizableAsyncQueue[TrajectoryGroup | None], self._output_queue
+                ).resize(self.queue_maxsize)
         self._status._num_workers = self.num_rollout_workers
 
     async def _start_attachments(self) -> None:

@@ -24,8 +24,11 @@ from .trajectory_store import (
     TrajectoryGroupAnnotations,
     TrajectoryGroupRef,
     TrajectoryQueueItem,
+    TrajectoryQueueResize,
     TrajectoryQueueSnapshot,
+    TrajectoryQueueStore,
     TrajectoryQueueTake,
+    TrajectoryRecordStore,
 )
 
 
@@ -241,8 +244,10 @@ class TrajectoryQueueEndpoint(Protocol):
     ) -> None: ...
 
     async def enqueue(
-        self, queue_id: str, item: TrajectoryQueueItem, max_ready_groups: int
+        self, queue_id: str, item: TrajectoryQueueItem
     ) -> TrajectoryEnqueueResult: ...
+
+    async def resize(self, operation: TrajectoryQueueResize) -> None: ...
 
     async def take(self, queue_id: str, consumer_id: str) -> TrajectoryQueueTake: ...
 
@@ -255,6 +260,60 @@ class TrajectoryQueueEndpoint(Protocol):
     async def snapshot(self, queue_id: str) -> TrajectoryQueueSnapshot: ...
 
     async def close(self, queue_id: str) -> tuple[TrajectoryGroupRef, ...]: ...
+
+
+class _InProcessTrajectoryQueueEndpoint:
+    def __init__(self) -> None:
+        self._queues: dict[str, TrajectoryQueueStore] = {}
+
+    async def create(
+        self,
+        queue_id: str,
+        max_ready_groups: int,
+        capacity_records: int,
+        capacity_bytes: int,
+    ) -> None:
+        if queue_id in self._queues:
+            raise ValueError(f"trajectory queue {queue_id!r} already exists")
+        self._queues[queue_id] = TrajectoryQueueStore(
+            max_ready_groups=max_ready_groups,
+            capacity_records=capacity_records,
+            capacity_bytes=capacity_bytes,
+        )
+
+    async def enqueue(
+        self, queue_id: str, item: TrajectoryQueueItem
+    ) -> TrajectoryEnqueueResult:
+        return self._queue(queue_id).enqueue(item)
+
+    async def resize(self, operation: TrajectoryQueueResize) -> None:
+        self._queue(operation.queue_id).resize(
+            maxsize=operation.maxsize, generation=operation.generation
+        )
+
+    async def take(self, queue_id: str, consumer_id: str) -> TrajectoryQueueTake:
+        return self._queue(queue_id).take(consumer_id)
+
+    async def acknowledge(
+        self, queue_id: str, result_id: str, consumer_id: str
+    ) -> None:
+        self._queue(queue_id).acknowledge(result_id, consumer_id)
+
+    async def finish(self, queue_id: str) -> None:
+        self._queue(queue_id).finish()
+
+    async def snapshot(self, queue_id: str) -> TrajectoryQueueSnapshot:
+        return self._queue(queue_id).snapshot()
+
+    async def close(self, queue_id: str) -> tuple[TrajectoryGroupRef, ...]:
+        queue = self._queues.pop(queue_id, None)
+        return () if queue is None else queue.close()
+
+    def _queue(self, queue_id: str) -> TrajectoryQueueStore:
+        try:
+            return self._queues[queue_id]
+        except KeyError:
+            raise ValueError(f"unknown trajectory queue {queue_id!r}") from None
 
 
 class DistributedTrajectoryQueue:
@@ -281,22 +340,31 @@ class DistributedTrajectoryQueue:
         self._finished = False
         self._closed = False
         self._cleanup_refs: tuple[TrajectoryGroupRef, ...] = ()
+        self._resize_generation = 0
+        self._resize_tasks: set[asyncio.Task[None]] = set()
 
     async def start(self) -> None:
         if self._started:
             return
+        created_maxsize = self.maxsize
         await self.endpoint.create(
             self.queue_id,
-            self.maxsize,
+            created_maxsize,
             self.capacity_records,
             self.capacity_bytes,
         )
         self._started = True
+        if self.maxsize != created_maxsize:
+            self._schedule_resize()
 
     def set_maxsize(self, maxsize: int) -> None:
         if maxsize < 1:
             raise ValueError("trajectory queue maxsize must be positive")
+        if maxsize == self.maxsize:
+            return
         self.maxsize = maxsize
+        if self._started and not self._closed:
+            self._schedule_resize()
 
     async def put(
         self,
@@ -328,7 +396,6 @@ class DistributedTrajectoryQueue:
                                 queue_wait_s=wait_s,
                             ),
                         ),
-                        self.maxsize,
                     )
                 )
                 try:
@@ -382,19 +449,32 @@ class DistributedTrajectoryQueue:
             return TrajectoryQueueSnapshot(
                 items=(),
                 max_ready_groups=self.maxsize,
+                generation=self._resize_generation,
                 capacity_records=self.capacity_records,
                 capacity_bytes=self.capacity_bytes,
                 used_records=0,
                 used_bytes=0,
                 leased_groups=0,
             )
-        return await self.endpoint.snapshot(self.queue_id)
+        while True:
+            await self._flush_resizes()
+            snapshot = await self.endpoint.snapshot(self.queue_id)
+            if snapshot.generation >= self._resize_generation:
+                return snapshot
 
     async def close(self) -> None:
+        failures: list[BaseException] = []
+        try:
+            await self._flush_resizes()
+        except BaseException as error:
+            failures.append(error)
         if not self._closed:
             self._closed = True
             if self._started:
-                self._cleanup_refs = await self.endpoint.close(self.queue_id)
+                try:
+                    self._cleanup_refs = await self.endpoint.close(self.queue_id)
+                except BaseException as error:
+                    failures.append(error)
         refs = self._cleanup_refs
         results = await asyncio.gather(
             *(self._owner(ref).drop(ref) for ref in refs), return_exceptions=True
@@ -404,9 +484,37 @@ class DistributedTrajectoryQueue:
             for ref, result in zip(refs, results, strict=True)
             if isinstance(result, BaseException)
         )
-        failures = [result for result in results if isinstance(result, BaseException)]
+        failures.extend(
+            result for result in results if isinstance(result, BaseException)
+        )
         if failures:
             raise BaseExceptionGroup("trajectory queue cleanup failed", failures)
+
+    def _schedule_resize(self) -> None:
+        self._resize_generation += 1
+        task = asyncio.create_task(
+            self.endpoint.resize(
+                TrajectoryQueueResize(
+                    queue_id=self.queue_id,
+                    maxsize=self.maxsize,
+                    generation=self._resize_generation,
+                )
+            )
+        )
+        self._resize_tasks.add(task)
+
+    async def _flush_resizes(self) -> None:
+        while self._resize_tasks:
+            tasks = tuple(self._resize_tasks)
+            self._resize_tasks.difference_update(tasks)
+            results = await asyncio.gather(*tasks, return_exceptions=True)
+            failures = [
+                result for result in results if isinstance(result, BaseException)
+            ]
+            if failures:
+                if len(failures) == 1:
+                    raise failures[0]
+                raise BaseExceptionGroup("trajectory queue resize failed", failures)
 
     async def _consume(self, item: TrajectoryQueueItem) -> TrajectoryGroup:
         owner = self._owner(item.ref)
@@ -510,12 +618,21 @@ class DistributedRolloutExecutor:
         self.set_target(target_workers)
 
     def create_result_queue(self, maxsize: int) -> DistributedTrajectoryQueue:
-        if self._queue_endpoint is None:
-            raise RuntimeError("distributed rollout executor has no result queue")
         if self._result_queue is not None:
             raise RuntimeError("distributed rollout result queue already exists")
+        queue_endpoint = self._queue_endpoint
+        if queue_endpoint is None:
+            endpoints = next(iter(self.hosts.values()))
+            if len(self.hosts) != 1 or not all(
+                isinstance(endpoint, InProcessRolloutHost) for endpoint in endpoints
+            ):
+                raise RuntimeError(
+                    "queue_endpoint is required unless one in-process host is used"
+                )
+            queue_endpoint = _InProcessTrajectoryQueueEndpoint()
+            self._queue_endpoint = queue_endpoint
         self._result_queue = DistributedTrajectoryQueue(
-            endpoint=self._queue_endpoint,
+            endpoint=queue_endpoint,
             owner_endpoints=self._endpoint_by_owner,
             maxsize=maxsize,
             capacity_records=self._trajectory_capacity_records,
@@ -632,6 +749,15 @@ class DistributedRolloutExecutor:
 class InProcessRolloutHost:
     """One coarse host service used by local collapse and tests."""
 
+    def __init__(
+        self, *, capacity_records: int = 16_384, capacity_bytes: int = 4 << 30
+    ) -> None:
+        self._results = TrajectoryRecordStore(
+            owner_actor_id=f"in-process:{uuid.uuid4().hex}",
+            capacity_records=capacity_records,
+            capacity_bytes=capacity_bytes,
+        )
+
     async def run(self, invocation: RolloutInvocation) -> RolloutResult:
         from art.metrics import MetricsBuilder
 
@@ -644,13 +770,15 @@ class InProcessRolloutHost:
             )
         finally:
             token.var.reset(token)
+        if invocation.store_result and isinstance(value, TrajectoryGroup):
+            value = self._results.put(value)
         return RolloutResult(value=value, metrics=await builder.drain_pending())
 
     async def materialize(self, ref: TrajectoryGroupRef) -> TrajectoryGroup:
-        raise RuntimeError(f"in-process rollout host does not own {ref.result_id}")
+        return self._results.materialize(ref)
 
     async def drop(self, ref: TrajectoryGroupRef) -> None:
-        raise RuntimeError(f"in-process rollout host does not own {ref.result_id}")
+        self._results.drop(ref)
 
     async def close(self) -> None:
-        return None
+        self._results.close()

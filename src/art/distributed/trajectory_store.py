@@ -59,6 +59,12 @@ class TrajectoryQueueItem(_Contract):
     annotations: TrajectoryGroupAnnotations
 
 
+class TrajectoryQueueResize(_Contract):
+    queue_id: str = Field(min_length=1)
+    maxsize: int = Field(ge=1)
+    generation: int = Field(ge=1)
+
+
 class TrajectoryEnqueueResult(_Contract):
     status: Literal["accepted", "full", "oversize", "closed"]
     reason: str | None = None
@@ -72,6 +78,7 @@ class TrajectoryQueueTake(_Contract):
 class TrajectoryQueueSnapshot(_Contract):
     items: tuple[TrajectoryQueueItem, ...]
     max_ready_groups: int = Field(ge=1)
+    generation: int = Field(ge=0)
     capacity_records: int = Field(ge=1)
     capacity_bytes: int = Field(ge=1)
     used_records: int = Field(ge=0)
@@ -254,13 +261,21 @@ class TrajectoryQueueStore:
         self._used_records = 0
         self._used_bytes = 0
         self._finished = False
+        self.generation = 0
 
-    def enqueue(
-        self, item: TrajectoryQueueItem, *, max_ready_groups: int
-    ) -> TrajectoryEnqueueResult:
-        if max_ready_groups < 1:
-            raise ValueError("max_ready_groups must be positive")
-        self.max_ready_groups = max_ready_groups
+    def resize(self, *, maxsize: int, generation: int) -> None:
+        if maxsize < 1 or generation < 1:
+            raise ValueError("trajectory queue resize values must be positive")
+        if generation < self.generation:
+            return
+        if generation == self.generation:
+            if maxsize != self.max_ready_groups:
+                raise ValueError("trajectory queue resize generation conflicts")
+            return
+        self.max_ready_groups = maxsize
+        self.generation = generation
+
+    def enqueue(self, item: TrajectoryQueueItem) -> TrajectoryEnqueueResult:
         item = _resolve_grouping(item)
         ref = item.ref
         records = len(ref.records)
@@ -323,6 +338,7 @@ class TrajectoryQueueStore:
         return TrajectoryQueueSnapshot(
             items=tuple(self._entries[result_id].item for result_id in self._ready),
             max_ready_groups=self.max_ready_groups,
+            generation=self.generation,
             capacity_records=self.capacity_records,
             capacity_bytes=self.capacity_bytes,
             used_records=self._used_records,

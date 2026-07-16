@@ -39,6 +39,7 @@ from .trajectory_store import (
     TrajectoryGroupRef,
     TrajectoryLeaseError,
     TrajectoryQueueItem,
+    TrajectoryQueueResize,
     TrajectoryQueueSnapshot,
     TrajectoryQueueStore,
     TrajectoryQueueTake,
@@ -160,12 +161,16 @@ class RolloutHostService(Actor):
         )
 
     @resilient_endpoint
-    async def enqueue_trajectory(
-        self, queue_id: str, item: TrajectoryQueueItem, max_ready_groups: int
-    ) -> TrajectoryEnqueueResult:
-        return self._trajectory_queue(queue_id).enqueue(
-            item, max_ready_groups=max_ready_groups
+    async def resize_trajectory_queue(self, operation: TrajectoryQueueResize) -> None:
+        self._trajectory_queue(operation.queue_id).resize(
+            maxsize=operation.maxsize, generation=operation.generation
         )
+
+    @resilient_endpoint
+    async def enqueue_trajectory(
+        self, queue_id: str, item: TrajectoryQueueItem
+    ) -> TrajectoryEnqueueResult:
+        return self._trajectory_queue(queue_id).enqueue(item)
 
     @resilient_endpoint
     async def take_trajectory(
