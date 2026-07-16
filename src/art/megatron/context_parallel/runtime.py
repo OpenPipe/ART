@@ -56,6 +56,7 @@ class _PlanningBundle:
 _PLANNING_BUNDLE_CACHE: dict[str, _PlanningBundle] = {}
 _RUNTIME_PLAN_CACHE: dict[str, tuple[RankRuntimePlan, ...]] = {}
 _RANK_RUNTIME_PLAN_CACHE: dict[tuple[str, int], RankRuntimePlan] = {}
+_GDN_GLOBAL_DECISION_CACHE: dict[tuple[str, str], Any] = {}
 _GDN_RANK_PLAN_CACHE: dict[tuple[str, str, int | None, int, str], Any] = {}
 
 
@@ -207,6 +208,14 @@ def _get_or_build_bundle_rank_plan(
     return plan
 
 
+def _gdn_planner_config_cache_key(gdn_planner_config: Any | None) -> str:
+    return (
+        _json_cache_key(_dataclass_payload(gdn_planner_config))
+        if gdn_planner_config is not None
+        else ""
+    )
+
+
 def _gdn_rank_plan_cache_key(
     *,
     planning_key: str,
@@ -214,18 +223,45 @@ def _gdn_rank_plan_cache_key(
     gdn_planner_config: Any | None,
     device: torch.device,
 ) -> tuple[str, str, int | None, int, str]:
-    config_key = (
-        _json_cache_key(_dataclass_payload(gdn_planner_config))
-        if gdn_planner_config is not None
-        else ""
-    )
     return (
         planning_key,
         device.type,
         device.index,
         int(cp_rank),
-        config_key,
+        _gdn_planner_config_cache_key(gdn_planner_config),
     )
+
+
+def _plan_gdn_global_execution(
+    *,
+    planning_key: str,
+    bundle: _PlanningBundle,
+    topology: ParallelTopology,
+    gdn_planner_config: Any | None,
+) -> Any:
+    """Select one all-rank GDN decision without rank-local tensors."""
+    if bundle.gdn_execution_spec is None:
+        raise RuntimeError("GDN CP planning requires a parsed execution spec")
+    cache_key = (
+        planning_key,
+        _gdn_planner_config_cache_key(gdn_planner_config),
+    )
+    cached = _GDN_GLOBAL_DECISION_CACHE.get(cache_key)
+    if cached is not None:
+        return cached
+
+    from art.megatron.gdn.gdn_prefix_tree import (
+        build_gdn_global_execution_decision,
+    )
+
+    decision = build_gdn_global_execution_decision(
+        bundle.gdn_execution_spec,
+        cp_size=int(topology.cp),
+        attention_token_layout_index=bundle.token_layout_index,
+        planner_config=gdn_planner_config,
+    )
+    _cache_put(_GDN_GLOBAL_DECISION_CACHE, cache_key, decision)
+    return decision
 
 
 def _plan_gdn_rank_execution(
@@ -249,14 +285,19 @@ def _plan_gdn_rank_execution(
     if cached is not None:
         return cached
 
-    from art.megatron.gdn.gdn_prefix_tree import build_gdn_rank_execution_plan
+    decision = _plan_gdn_global_execution(
+        planning_key=planning_key,
+        bundle=bundle,
+        topology=topology,
+        gdn_planner_config=gdn_planner_config,
+    )
+    from art.megatron.gdn.gdn_prefix_tree import materialize_gdn_rank_execution_plan
 
-    plan = build_gdn_rank_execution_plan(
+    plan = materialize_gdn_rank_execution_plan(
         bundle.gdn_execution_spec,
+        decision,
         device="cpu",
         cp_rank=int(cp_rank),
-        cp_size=int(topology.cp),
-        attention_token_layout_index=bundle.token_layout_index,
         planner_config=gdn_planner_config,
     )
     _cache_put(_GDN_RANK_PLAN_CACHE, cache_key, plan)
@@ -328,18 +369,13 @@ def context_parallel_rank_model_token_counts(
     attention_counts = bundle.token_layout_index.token_counts_by_rank
     if not build_gdn_execution_spec:
         return attention_counts
-    gdn_counts = tuple(
-        int(
-            _plan_gdn_rank_execution(
-                planning_key=planning_key,
-                bundle=bundle,
-                topology=topology,
-                cp_rank=cp_rank,
-                gdn_planner_config=gdn_planner_config,
-            ).gdn_token_count
-        )
-        for cp_rank in range(int(topology.cp))
+    decision = _plan_gdn_global_execution(
+        planning_key=planning_key,
+        bundle=bundle,
+        topology=topology,
+        gdn_planner_config=gdn_planner_config,
     )
+    gdn_counts = decision.gdn_token_counts_by_rank
     return tuple(
         max(attention_count, gdn_count)
         for attention_count, gdn_count in zip(attention_counts, gdn_counts, strict=True)
