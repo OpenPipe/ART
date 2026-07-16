@@ -59,14 +59,13 @@ jobs:
           cd "$project_dir"
           uv init --name art-distributed-install-smoke --python 3.12 --bare
           uv venv --python 3.12
-          uv pip install --python .venv/bin/python --no-deps \
-            "openpipe-art[distributed,megatron] @ file://${wheel_path}"
-          uv pip install --python .venv/bin/python \
-            "openpipe-art[distributed] @ file://${wheel_path}"
           uv pip install --python .venv/bin/python \
             --index-url https://download.pytorch.org/whl/cpu \
             "torch==2.11.0"
-          uv pip install --python .venv/bin/python "transformers==5.12.1"
+          uv pip install --python .venv/bin/python \
+            "openpipe-art[distributed] @ file://${wheel_path}"
+          uv pip install --python .venv/bin/python --no-deps \
+            "openpipe-art[distributed,megatron] @ file://${wheel_path}"
 
           .venv/bin/python - <<'PY'
           import sys
@@ -83,6 +82,7 @@ jobs:
               ClusterSpec,
               HostSpec,
               InstalledAsyncCallable,
+              NcclTransportSpec,
               PackingRequest,
               compile_topology,
           )
@@ -94,12 +94,14 @@ jobs:
                   ClusterSpec,
                   HostSpec,
                   InstalledAsyncCallable,
+                  NcclTransportSpec,
                   PackingRequest,
                   compile_topology,
               )
           )
           assert "monarch" not in sys.modules
           assert "PackingRequest" in distributed.__all__
+          assert "NcclTransportSpec" in distributed.__all__
           assert {"distributed", "megatron"} <= set(
               metadata("openpipe-art").get_all("Provides-Extra") or ()
           )
