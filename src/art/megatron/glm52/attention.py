@@ -370,7 +370,9 @@ class Glm52SelfAttention(Attention):
         )
         if state.rope_cos.shape[:2] != (batch, seq_len):
             raise RuntimeError(
-                "GLM-5.2 RoPE state does not match the attention tokens."
+                "GLM-5.2 RoPE state does not match the attention tokens: "
+                f"layer={self.layer_number}, rope={tuple(state.rope_cos.shape[:2])}, "
+                f"tokens={(batch, seq_len)}, hidden={tuple(hidden_states.shape)}"
             )
         cos = state.rope_cos.permute(1, 0, 2).unsqueeze(2).to(q.dtype)
         sin = state.rope_sin.permute(1, 0, 2).unsqueeze(2).to(q.dtype)

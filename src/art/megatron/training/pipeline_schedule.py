@@ -499,10 +499,13 @@ class MCoreScheduleAdapter(Generic[_T]):
             microbatch_count=len(self.microbatches),
         )
         self._active_activation_key: tuple[int, int] | None = None
-        self.micro_batch_size, self.seq_length = validate_fixed_microbatch_shapes(
+        self.pp_size = int(ps.get_pipeline_model_parallel_world_size())
+        self.micro_batch_size, local_seq_length = validate_fixed_microbatch_shapes(
             [(int(value.shape[0]), int(value.shape[1])) for value in model_inputs]
         )
-        self.pp_size = int(ps.get_pipeline_model_parallel_world_size())
+        self.seq_length = local_seq_length * (
+            int(ps.get_context_parallel_world_size()) if self.pp_size > 1 else 1
+        )
         self.pp_rank = int(ps.get_pipeline_model_parallel_rank())
         self.vp_size = int(ps.get_virtual_pipeline_model_parallel_world_size() or 1)
         self.microbatch_group_size = len(self.microbatches)
