@@ -179,6 +179,8 @@ def _patch_art_runtime_routes() -> None:
                 )
             with capture_routed_experts() as routes:
                 response = await create_chat_completion(request, raw_request)
+            if response is None:
+                return Response(status_code=499)
             if response.status_code >= HTTPStatus.BAD_REQUEST.value:
                 return response
             if not routes:
