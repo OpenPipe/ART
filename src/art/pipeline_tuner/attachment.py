@@ -100,6 +100,7 @@ class PipelineAutotunerAttachment:
                 target_packed_sequences=target_packed_sequences,
                 inference_gpu_count=inference_gpu_count,
                 policy_age_limit_steps=policy_age_limit_steps,
+                starting_step=trainer.state.next_training_step,
             )
             await self._wait_for_initial_serving_metrics()
             self._sampler_task = asyncio.create_task(

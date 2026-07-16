@@ -39,6 +39,7 @@ class PipelineAutotuneConfig(pydantic.BaseModel):
     worker_step: int = pydantic.Field(default=4, ge=1)
     worker_move_fraction: float = pydantic.Field(default=0.10, gt=0.0, le=1.0)
     max_worker_move: int = pydantic.Field(default=16, ge=4)
+    max_rollout_workers: int = pydantic.Field(default=1024, ge=1)
     initial_model_calls_per_inference_gpu: int = pydantic.Field(default=8, ge=1)
     initial_min_groups_per_packed_sequence: int = pydantic.Field(default=8, ge=1)
     initial_max_groups_per_packed_sequence: int = pydantic.Field(default=8, ge=1)

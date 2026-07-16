@@ -79,6 +79,7 @@ class PipelineAutotuner:
         target_packed_sequences: int,
         inference_gpu_count: int,
         policy_age_limit_steps: float,
+        starting_step: int = 0,
     ) -> None:
         self.config = config
         self.settings = settings
@@ -93,7 +94,8 @@ class PipelineAutotuner:
         self._packing_outcomes: list[PackingOutcome] = []
         self._packing_outcome_steps: set[int] = set()
         self.decisions: list[TunerDecision] = []
-        self._last_decision_step = 0
+        self._warmup_end_step = starting_step + config.warmup_ignore_steps
+        self._last_decision_step = self._warmup_end_step
         self._target_candidate: int | None = None
         self._target_candidate_count = 0
         self._emitted_recommendations: set[str] = set()
@@ -115,7 +117,7 @@ class PipelineAutotuner:
         self.packed_groups.append(rec)
 
     def maybe_decide(self, step: int) -> TunerDecision | None:
-        if step <= self.config.warmup_ignore_steps:
+        if step <= self._warmup_end_step:
             return None
         if step - self._last_decision_step < self.config.window_steps:
             return None
@@ -133,7 +135,7 @@ class PipelineAutotuner:
     def window_stats(self) -> TunerWindowStats | None:
         by_step: dict[int, dict[str, PipelineMetric]] = defaultdict(dict)
         for rec in self.metrics:
-            if rec.step is None or int(rec.step) <= self.config.warmup_ignore_steps:
+            if rec.step is None or int(rec.step) <= self._warmup_end_step:
                 continue
             current = by_step[int(rec.step)].get(rec.name)
             if current is None or rec.t_s >= current.t_s:
@@ -486,7 +488,10 @@ class PipelineAutotuner:
             ),
         )
         cap = _ceil_to_multiple(self.config.max_worker_move, self.config.worker_step)
-        return max(self.config.worker_step, current + direction * min(cap, raw))
+        return min(
+            self.config.max_rollout_workers,
+            max(self.config.worker_step, current + direction * min(cap, raw)),
+        )
 
     def _settings_with_recomputed_queue(
         self,
@@ -774,10 +779,13 @@ def build_initial_settings(
     target_packed_sequences: int,
     policy_age_limit_steps: float,
 ) -> PipelineTuneSettings:
-    workers = _ceil_to_multiple(
-        config.initial_model_calls_per_inference_gpu * inference_gpu_count,
-        config.worker_step,
-        minimum=config.worker_step,
+    workers = min(
+        config.max_rollout_workers,
+        _ceil_to_multiple(
+            config.initial_model_calls_per_inference_gpu * inference_gpu_count,
+            config.worker_step,
+            minimum=config.worker_step,
+        ),
     )
     target_slots = max(1, int(target_packed_sequences))
     max_batch = int(config.initial_max_groups_per_packed_sequence) * target_slots
