@@ -30,6 +30,15 @@ from .host_admission import (
     inspect_host,
 )
 from .monarch_runtime import RemoteCallError, RemoteCallResult
+from .nccl_preflight import (
+    NcclProbeRequest,
+    NcclProbeResult,
+    NcclRendezvous,
+    NcclRendezvousRequest,
+    NcclRendezvousResult,
+    run_nccl_probe,
+    start_nccl_rendezvous,
+)
 from .packing import PackingRequest, PackingResult
 from .rollout import RolloutInvocation, RolloutResult
 from .specs import HostServiceHealth
@@ -102,6 +111,9 @@ class RolloutHostService(Actor):
         self._packer = None
         self._vllm_output_root = vllm_output_root
         self._vllm_launcher = None
+        self._nccl_rendezvous: dict[str, NcclRendezvous] = {}
+        self._nccl_tasks: dict[str, asyncio.Task[Any]] = {}
+        self._cancelled_nccl_probes: set[str] = set()
 
     @resilient_endpoint
     async def admission(self) -> HostAdmissionReport:
@@ -130,7 +142,50 @@ class RolloutHostService(Actor):
         return await asyncio.to_thread(execute_artifact_probe, self.host_id, command)
 
     @resilient_endpoint
+    async def nccl_preflight_rendezvous(
+        self, request: NcclRendezvousRequest
+    ) -> NcclRendezvousResult:
+        if self._admission_report is None:
+            raise RuntimeError("host has not passed ART runtime admission")
+        self._require_nccl_probe(request.probe_id)
+        if request.probe_id in self._nccl_rendezvous:
+            raise RuntimeError(f"NCCL probe {request.probe_id!r} already has a store")
+        task = asyncio.create_task(start_nccl_rendezvous(request))
+        self._nccl_tasks[request.probe_id] = task
+        try:
+            rendezvous = await task
+        finally:
+            if self._nccl_tasks.get(request.probe_id) is task:
+                self._nccl_tasks.pop(request.probe_id)
+        if request.probe_id in self._cancelled_nccl_probes:
+            await rendezvous.close()
+            raise asyncio.CancelledError
+        self._nccl_rendezvous[request.probe_id] = rendezvous
+        return NcclRendezvousResult(host_id=self.host_id, port=rendezvous.port)
+
+    @resilient_endpoint
+    async def nccl_preflight(self, request: NcclProbeRequest) -> NcclProbeResult:
+        if self._admission_report is None:
+            raise RuntimeError("host has not passed ART runtime admission")
+        self._require_nccl_probe(request.probe_id)
+        task = asyncio.create_task(run_nccl_probe(self.host_id, request))
+        self._nccl_tasks[request.probe_id] = task
+        try:
+            return await task
+        finally:
+            if self._nccl_tasks.get(request.probe_id) is task:
+                self._nccl_tasks.pop(request.probe_id)
+
+    @resilient_endpoint
+    async def cancel_nccl_preflight(self, probe_id: str) -> None:
+        await self._cancel_nccl_preflight(probe_id)
+
+    @resilient_endpoint
     async def close(self) -> None:
+        probe_ids = tuple({*self._nccl_tasks, *self._nccl_rendezvous})
+        await asyncio.gather(
+            *(self._cancel_nccl_preflight(probe_id) for probe_id in probe_ids)
+        )
         for queue in self._trajectory_queues.values():
             queue.close()
         self._trajectory_queues.clear()
@@ -143,6 +198,22 @@ class RolloutHostService(Actor):
             await self._vllm_launcher.close()
             self._vllm_launcher = None
         self.inbox.store.close()
+
+    def _require_nccl_probe(self, probe_id: str) -> None:
+        if probe_id in self._cancelled_nccl_probes:
+            raise asyncio.CancelledError
+        if probe_id in self._nccl_tasks:
+            raise RuntimeError(f"NCCL probe {probe_id!r} is already active")
+
+    async def _cancel_nccl_preflight(self, probe_id: str) -> None:
+        self._cancelled_nccl_probes.add(probe_id)
+        task = self._nccl_tasks.pop(probe_id, None)
+        if task is not None:
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+        rendezvous = self._nccl_rendezvous.pop(probe_id, None)
+        if rendezvous is not None:
+            await rendezvous.close()
 
     @resilient_endpoint
     async def create_trajectory_queue(

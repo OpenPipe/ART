@@ -4,7 +4,8 @@ import asyncio
 from collections import Counter
 from collections.abc import Awaitable, Callable
 import logging
-from typing import Any
+from typing import Any, Literal
+from urllib.parse import urlparse
 import uuid
 
 from pydantic import BaseModel, ConfigDict
@@ -46,10 +47,17 @@ from .monarch_runtime import (
     MonarchVllmHostLauncher,
     call_remote,
 )
+from .nccl_preflight import (
+    NcclProbeRequest,
+    NcclProbeResult,
+    NcclRendezvousRequest,
+    NcclRendezvousResult,
+)
 from .packing import PackingRequest, PackingResult
 from .rollout import DistributedRolloutExecutor, InstalledAsyncCallable
 from .specs import (
     ArtRuntimeConfig,
+    GpuPlacement,
     HostServiceHealth,
     ModelServiceReplicaSpec,
     RuntimeTopology,
@@ -103,6 +111,8 @@ class ArtRuntime:
         self._replicas: dict[str, ReplicaManager] = {}
         self._closeables: set[Any] = set()
         self._next_packing_host = 0
+        self._nccl_preflight_lock = asyncio.Lock()
+        self._nccl_preflights: set[tuple[str, tuple[tuple[str, int], ...], str]] = set()
         self._runtime_packages = runtime_package_names(
             trainer=topology.trainer is not None
         )
@@ -252,6 +262,7 @@ class ArtRuntime:
                 reports,
                 expected_runtime=self._controller_fingerprint,
             )
+            self._validate_nccl_transport_environment()
             await self._preflight_artifact_root()
         self._started = True
         for report in self._admitted_hosts.values():
@@ -285,8 +296,215 @@ class ArtRuntime:
                 raise RuntimeError(f"host service {host_id!r} identity changed")
         return health
 
-    async def _preflight_launch(self) -> None:
-        await self.health()
+    async def _preflight_launch(
+        self,
+        *,
+        runtime_kind: Literal["trainer", "vllm"],
+        placements: tuple[GpuPlacement, ...],
+        master_addr: str | None = None,
+    ) -> None:
+        selected = tuple(
+            next(value for value in placements if value.host_id == host_id)
+            for host_id in dict.fromkeys(value.host_id for value in placements)
+        )
+        if len(selected) < 2:
+            await self.health()
+            return
+        transport = self.topology.cluster.nccl_transport
+        if transport is None:
+            raise RuntimeError("multi-host GPU launch has no NCCL transport contract")
+        key = (
+            runtime_kind,
+            tuple((value.host_id, value.gpu_id) for value in selected),
+            transport.net_name,
+        )
+        deadline = (
+            asyncio.get_running_loop().time() + self.topology.cluster.startup_timeout_s
+        )
+        cleanup_budget_s = min(10.0, self.topology.cluster.startup_timeout_s * 0.1)
+        operation_deadline = deadline - cleanup_budget_s
+        async with asyncio.timeout_at(deadline):
+            await self._nccl_preflight_lock.acquire()
+        try:
+            if key in self._nccl_preflights:
+                return
+            probe_id = uuid.uuid4().hex
+            failure: BaseException | None = None
+            try:
+                async with asyncio.timeout_at(operation_deadline):
+                    await self.health()
+                    leader = selected[0]
+                    if master_addr is None:
+                        worker_address = self._host(leader.host_id).worker_address
+                        parsed = urlparse(worker_address)
+                        if parsed.scheme != "tcp" or parsed.hostname is None:
+                            raise ValueError(
+                                f"NCCL preflight requires a TCP worker address, got "
+                                f"{worker_address!r}"
+                            )
+                        master_addr = parsed.hostname
+                    phase_timeout_s = max(
+                        0.001,
+                        (operation_deadline - asyncio.get_running_loop().time()) * 0.45,
+                    )
+                    probe_command = (
+                        transport.vllm_probe_command if runtime_kind == "vllm" else None
+                    )
+                    rendezvous = await call_remote(
+                        self._host_actors[leader.host_id].nccl_preflight_rendezvous,
+                        NcclRendezvousRequest(
+                            probe_id=probe_id,
+                            runtime_kind=runtime_kind,
+                            master_addr=master_addr,
+                            timeout_s=phase_timeout_s,
+                            probe_command=probe_command,
+                        ),
+                    )
+                    if not isinstance(rendezvous, NcclRendezvousResult):
+                        raise RuntimeError("NCCL preflight returned an invalid store")
+                    requests = tuple(
+                        NcclProbeRequest(
+                            probe_id=probe_id,
+                            runtime_kind=runtime_kind,
+                            rank=rank,
+                            world_size=len(selected),
+                            master_addr=master_addr,
+                            master_port=rendezvous.port,
+                            gpu_id=placement.gpu_id,
+                            net_name=transport.net_name,
+                            timeout_s=phase_timeout_s,
+                            probe_command=probe_command,
+                        )
+                        for rank, placement in enumerate(selected)
+                    )
+                    results = await asyncio.gather(
+                        *(
+                            call_remote(
+                                self._host_actors[placement.host_id].nccl_preflight,
+                                request,
+                            )
+                            for placement, request in zip(
+                                selected, requests, strict=True
+                            )
+                        ),
+                        return_exceptions=True,
+                    )
+                    failures = [
+                        result
+                        for result in results
+                        if isinstance(result, BaseException)
+                    ]
+                    if failures:
+                        raise BaseExceptionGroup(
+                            f"{runtime_kind} NCCL transport preflight failed", failures
+                        )
+                    reports = tuple(
+                        result
+                        for result in results
+                        if isinstance(result, NcclProbeResult)
+                    )
+                    expected = tuple(
+                        (placement.host_id, rank, transport.net_name)
+                        for rank, placement in enumerate(selected)
+                    )
+                    if (
+                        tuple(
+                            (report.host_id, report.rank, report.net_name)
+                            for report in reports
+                        )
+                        != expected
+                    ):
+                        raise RuntimeError(
+                            "NCCL preflight returned inconsistent membership"
+                        )
+            except BaseException as error:
+                failure = error
+            cleanup_failures, cleanup_cancelled = await complete_task(
+                asyncio.create_task(
+                    self._cancel_nccl_preflight(
+                        selected,
+                        probe_id,
+                        timeout_s=max(
+                            0.001, deadline - asyncio.get_running_loop().time()
+                        ),
+                    )
+                )
+            )
+            if cleanup_cancelled is not None:
+                if failure is not None:
+                    cleanup_cancelled.add_note(f"NCCL preflight also failed: {failure}")
+                raise cleanup_cancelled
+            if failure is not None:
+                if cleanup_failures:
+                    raise BaseExceptionGroup(
+                        f"{runtime_kind} NCCL preflight and cleanup failed",
+                        [failure, *cleanup_failures],
+                    ) from None
+                raise failure
+            if cleanup_failures:
+                raise BaseExceptionGroup(
+                    f"{runtime_kind} NCCL preflight cleanup failed",
+                    cleanup_failures,
+                )
+            self._nccl_preflights.add(key)
+        finally:
+            self._nccl_preflight_lock.release()
+
+    async def _cancel_nccl_preflight(
+        self,
+        placements: tuple[GpuPlacement, ...],
+        probe_id: str,
+        *,
+        timeout_s: float,
+    ) -> list[BaseException]:
+        try:
+            async with asyncio.timeout(timeout_s):
+                results = await asyncio.gather(
+                    *(
+                        call_remote(
+                            self._host_actors[placement.host_id].cancel_nccl_preflight,
+                            probe_id,
+                        )
+                        for placement in placements
+                    ),
+                    return_exceptions=True,
+                )
+        except BaseException as error:
+            return [error]
+        return [result for result in results if isinstance(result, BaseException)]
+
+    def _validate_nccl_transport_environment(self) -> None:
+        transport = self.topology.cluster.nccl_transport
+        if transport is None:
+            return
+        mismatches = {
+            host_id: dict(report.runtime.environment).get("NCCL_NET")
+            for host_id, report in self._admitted_hosts.items()
+            if dict(report.runtime.environment).get("NCCL_NET") != transport.net_name
+        }
+        if mismatches:
+            raise RuntimeError(
+                f"NCCL_NET must equal {transport.net_name!r} on every host: "
+                f"{mismatches}"
+            )
+        has_multihost_vllm = any(
+            len(replica.members) > 1
+            for service in self.topology.model_services
+            for replica in service.replicas
+        )
+        runtime_override = any(
+            dict(report.runtime.environment).get("ART_VLLM_RUNTIME_BIN")
+            for report in self._admitted_hosts.values()
+        )
+        if (
+            has_multihost_vllm
+            and runtime_override
+            and transport.vllm_probe_command is None
+        ):
+            raise RuntimeError(
+                "multi-host ART_VLLM_RUNTIME_BIN requires "
+                "nccl_transport.vllm_probe_command"
+            )
 
     async def _preflight_artifact_root(self) -> None:
         if self._artifact_probe is None:
@@ -532,7 +750,9 @@ class ArtRuntime:
         ]
         if indices != list(range(indices[0], indices[-1] + 1)):
             raise ValueError("trainer hosts must be contiguous in the cluster mesh")
-        await self._preflight_launch()
+        await self._preflight_launch(
+            runtime_kind="trainer", placements=runtime_spec.trainer_mesh.ranks
+        )
         selected = self.host_mesh.slice(hosts=slice(indices[0], indices[-1] + 1))
         from art.megatron.runtime.monarch import (
             MonarchTrainerRun,
@@ -600,7 +820,14 @@ class ArtRuntime:
             raise ValueError("replica does not match the compiled runtime topology")
         if spec.replica_id in self._replicas:
             raise RuntimeError(f"replica {spec.replica_id!r} is already managed")
-        await self._preflight_launch()
+        await self._preflight_launch(
+            runtime_kind="vllm",
+            placements=tuple(
+                GpuPlacement(host_id=member.host_id, gpu_id=member.gpu_ids[0])
+                for member in spec.members
+            ),
+            master_addr=spec.rendezvous.host,
+        )
         launchers = {
             member.host_id: MonarchVllmHostLauncher(self._host_actors[member.host_id])
             for member in spec.members

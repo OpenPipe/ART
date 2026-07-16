@@ -146,6 +146,7 @@ setup: |
 
 run: |
   set -euo pipefail
+  export NCCL_NET=IB
   exec .venv/bin/art-monarch skypilot \
     --program your_package.train:main
 ```
@@ -154,6 +155,21 @@ run: |
 Bash without enabling fail-fast behavior. A source-based GPU run needs the root
 and `vllm_runtime` locked projects at the same revision on every node. The CPU
 example only syncs the root `distributed` extra.
+
+Any GPU workload spanning hosts must set one explicit NCCL network contract in
+its `ClusterSpec`, for example
+`nccl_transport=NcclTransportSpec(net_name="IB")`, and set `NCCL_NET` to that
+exact registered name on every node. `IB` covers built-in InfiniBand/RoCE;
+external network plugins use their registered NCCL name. Before model
+allocation, ART runs a small collective in both the trainer and managed-vLLM
+environments and requires each rank to report that exact selected module. It
+never retries with Socket. Deployment qualification remains responsible for
+all-GPU bandwidth, GPU Direct RDMA, HCA, and GID validation.
+
+If `ART_VLLM_RUNTIME_BIN` is a custom command wrapper, also set
+`vllm_probe_command` to a Python-compatible command prefix in
+`NcclTransportSpec`. ART uses that typed command to run the collective in the
+same vLLM environment; the command must accept Python's `-c <script>` form.
 
 For a published release wheel, use a separate setup rather than synchronizing
 the source runtime:

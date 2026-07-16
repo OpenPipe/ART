@@ -6,7 +6,7 @@ import subprocess
 import sys
 
 import art
-from art.distributed import PackingRequest
+from art.distributed import NcclTransportSpec, PackingRequest
 
 EXAMPLE_DIR = Path(__file__).parents[1] / "examples" / "multinode"
 
@@ -56,16 +56,23 @@ def test_distributed_package_import_is_lazy() -> None:
 import sys
 import art.distributed as distributed
 assert "art.distributed.art_runtime" not in sys.modules
-from art.distributed import ArtRuntime, ClusterSpec, PackingRequest, compile_topology
+from art.distributed import (
+    ArtRuntime, ClusterSpec, NcclTransportSpec, PackingRequest, compile_topology,
+)
 assert all(value is not None for value in (
-    ArtRuntime, ClusterSpec, PackingRequest, compile_topology
+    ArtRuntime, ClusterSpec, NcclTransportSpec, PackingRequest, compile_topology
 ))
 assert "monarch" not in sys.modules
 assert "PackingRequest" in distributed.__all__
+assert "NcclTransportSpec" in distributed.__all__
 """,
         ],
         check=True,
     )
+
+
+def test_nccl_transport_is_a_public_typed_contract() -> None:
+    assert NcclTransportSpec(net_name="IB").net_name == "IB"
 
 
 def test_documented_rollout_is_installed_and_bounded() -> None:

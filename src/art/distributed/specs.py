@@ -43,10 +43,31 @@ class HostSpec(_Spec):
         return self
 
 
+class NcclTransportSpec(_Spec):
+    net_name: str = Field(min_length=1, pattern=r"^[^\x00\r\n]+$")
+    vllm_probe_command: tuple[str, ...] | None = None
+
+    @model_validator(mode="after")
+    def _validate_net_name(self) -> "NcclTransportSpec":
+        if self.net_name != self.net_name.strip():
+            raise ValueError(
+                "NCCL network name must not contain surrounding whitespace"
+            )
+        if self.net_name.casefold() == "socket":
+            raise ValueError("multi-host GPU workloads may not use NCCL Socket")
+        if self.vllm_probe_command is not None and (
+            not self.vllm_probe_command
+            or any(not value for value in self.vllm_probe_command)
+        ):
+            raise ValueError("vLLM NCCL probe command must contain non-empty arguments")
+        return self
+
+
 class ClusterSpec(_Spec):
     hosts: tuple[HostSpec, ...]
     controller_host_id: str
     artifact_root: str | None = None
+    nccl_transport: NcclTransportSpec | None = None
     startup_timeout_s: float = Field(default=300.0, gt=0)
     rpc_timeout_s: float = Field(default=60.0, gt=0)
 
@@ -367,6 +388,16 @@ class RuntimeTopology(_Spec):
                             (host_id, replica.kv_replay_base_port + rank, "kv_replay"),
                         )
                     )
+        spans_hosts = (
+            self.trainer is not None
+            and len({rank.host_id for rank in self.trainer.ranks}) > 1
+        ) or any(
+            len(replica.members) > 1
+            for service in self.model_services
+            for replica in service.replicas
+        )
+        if spans_hosts and self.cluster.nccl_transport is None:
+            raise ValueError("multi-host GPU workloads require nccl_transport")
         for host_id, gpu_id, owner in placements:
             host = hosts.get(host_id)
             if host is None:
