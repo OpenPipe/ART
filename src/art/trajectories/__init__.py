@@ -210,14 +210,9 @@ class History(pydantic.BaseModel):
     messages_and_choices: MessagesAndChoices
     tools: Tools | None = None
 
-    @pydantic.model_serializer(mode="wrap", when_used="json")
-    def serialize_json(self, handler: Any) -> dict[str, Any]:
-        data = handler(self)
-        if "messages_and_choices" in data:
-            data["messages_and_choices"] = serialize_messages_and_choices(
-                self.messages_and_choices
-            )
-        return data
+    @pydantic.field_serializer("messages_and_choices", when_used="json")
+    def serialize_messages_and_choices(self, value: MessagesAndChoices) -> list[Any]:
+        return serialize_messages_and_choices(value)
 
     def messages(self) -> Messages:
         return get_messages(self.messages_and_choices)
@@ -308,6 +303,7 @@ class Trajectory(_CompactModel):
     exchanges: TrajectoryExchanges = pydantic.Field(default_factory=TrajectoryExchanges)
     messages_and_choices: MessagesAndChoices = pydantic.Field(
         default_factory=list,
+        exclude_if=lambda value: not value,
     )
     tools: Tools | None = None
     additional_histories: list[History] = pydantic.Field(
@@ -321,14 +317,9 @@ class Trajectory(_CompactModel):
     logs: list[str] = pydantic.Field(default_factory=list)
     start_time: datetime = pydantic.Field(default_factory=datetime.now, exclude=True)
 
-    @pydantic.model_serializer(mode="wrap", when_used="json")
-    def serialize_json(self, handler: Any) -> dict[str, Any]:
-        data = handler(self)
-        if "messages_and_choices" in data:
-            data["messages_and_choices"] = serialize_messages_and_choices(
-                self.messages_and_choices
-            )
-        return data
+    @pydantic.field_serializer("messages_and_choices", when_used="json")
+    def serialize_messages_and_choices(self, value: MessagesAndChoices) -> list[Any]:
+        return serialize_messages_and_choices(value)
 
     @pydantic.model_validator(mode="after")
     def validate_representation(self) -> Trajectory:

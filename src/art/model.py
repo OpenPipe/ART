@@ -15,7 +15,6 @@ from typing import (
     cast,
     overload,
 )
-from urllib.parse import urlparse
 import warnings
 
 import httpx
@@ -65,7 +64,6 @@ ModelConfig = TypeVar("ModelConfig", bound=BaseModel | None)
 StateType = TypeVar("StateType", bound=dict[str, Any], default=dict[str, Any])
 
 METRICS_BUILDER_STATE_KEY = "_metrics_builder_state"
-LOCAL_INFERENCE_HOSTS = frozenset({"127.0.0.1", "0.0.0.0", "::1", "localhost"})
 
 
 @contextmanager
@@ -162,23 +160,13 @@ def _attach_response_art_metadata(
             )
 
 
-def _is_local_inference_base_url(base_url: str | None) -> bool:
-    if base_url is None:
-        return False
-    try:
-        hostname = urlparse(base_url).hostname
-    except ValueError:
-        return False
-    return hostname in LOCAL_INFERENCE_HOSTS
-
-
 class _OpenAIChatCompletionsProxy:
     def __init__(
         self,
         completions: Any,
         record_costs: Any,
         default_extra_body: dict[str, Any] | None = None,
-        local_serving_base_url: str | None = None,
+        managed_serving_base_url: str | None = None,
         binary_completions: Any | None = None,
         policy_span_mode: Literal["none", "require", "synthesize"] = "none",
         suppress_weave_trace: bool = False,
@@ -186,7 +174,7 @@ class _OpenAIChatCompletionsProxy:
         self._completions = completions
         self._record_costs = record_costs
         self._default_extra_body = default_extra_body
-        self._local_serving_base_url = local_serving_base_url
+        self._managed_serving_base_url = managed_serving_base_url
         self._binary_completions = binary_completions
         self._policy_span_mode = policy_span_mode
         self._suppress_weave_trace = suppress_weave_trace
@@ -224,10 +212,10 @@ class _OpenAIChatCompletionsProxy:
                         raw_response.content
                     )
         except APIConnectionError as exc:
-            if self._local_serving_base_url is not None:
+            if self._managed_serving_base_url is not None:
                 raise LocalServingUnavailableError(
-                    "ART-managed local inference endpoint became unreachable "
-                    f"at {self._local_serving_base_url}. Aborting training instead "
+                    "ART-managed inference endpoint became unreachable "
+                    f"at {self._managed_serving_base_url}. Aborting training instead "
                     "of counting rollouts as data errors."
                 ) from exc
             raise
@@ -253,7 +241,7 @@ class _OpenAIChatProxy:
         chat: Any,
         record_costs: Any,
         default_extra_body: dict[str, Any] | None = None,
-        local_serving_base_url: str | None = None,
+        managed_serving_base_url: str | None = None,
         binary_chat: Any | None = None,
         policy_span_mode: Literal["none", "require", "synthesize"] = "none",
         suppress_weave_trace: bool = False,
@@ -263,7 +251,7 @@ class _OpenAIChatProxy:
             chat.completions,
             record_costs,
             default_extra_body,
-            local_serving_base_url,
+            managed_serving_base_url,
             binary_chat.completions if binary_chat is not None else None,
             policy_span_mode,
             suppress_weave_trace,
@@ -279,7 +267,7 @@ class _OpenAIClientProxy:
         client: Any,
         record_costs: Any,
         default_extra_body: dict[str, Any] | None = None,
-        local_serving_base_url: str | None = None,
+        managed_serving_base_url: str | None = None,
         binary_routes_base_url: str | None = None,
         policy_span_mode: Literal["none", "require", "synthesize"] = "none",
         suppress_weave_trace: bool = False,
@@ -287,7 +275,7 @@ class _OpenAIClientProxy:
         self._client = client
         self._record_costs = record_costs
         self._default_extra_body = default_extra_body
-        self._local_serving_base_url = local_serving_base_url
+        self._managed_serving_base_url = managed_serving_base_url
         self._binary_routes_base_url = binary_routes_base_url
         self._policy_span_mode = policy_span_mode
         self._suppress_weave_trace = suppress_weave_trace
@@ -300,7 +288,7 @@ class _OpenAIClientProxy:
             client.chat,
             record_costs,
             default_extra_body,
-            local_serving_base_url,
+            managed_serving_base_url,
             binary_client.chat if binary_client is not None else None,
             policy_span_mode,
             suppress_weave_trace,
@@ -311,7 +299,7 @@ class _OpenAIClientProxy:
             self._client.with_options(*args, **kwargs),
             self._record_costs,
             self._default_extra_body,
-            self._local_serving_base_url,
+            self._managed_serving_base_url,
             self._binary_routes_base_url,
             self._policy_span_mode,
             self._suppress_weave_trace,
@@ -471,6 +459,7 @@ class Model(
     _openai_client: AsyncOpenAI | None = None
     _art_binary_routes_base_url: str | None = None
     _serving_capabilities: ServingCapabilities | None = None
+    _inference_connection_errors_are_fatal: bool = False
     _wandb_run: Optional["Run"] = None  # Private, for lazy wandb initialization
     _wandb_defined_metrics: set[str]
     _wandb_config: dict[str, Any]
@@ -527,6 +516,7 @@ class Model(
         object.__setattr__(self, "_metrics_builder_state_loaded", False)
         object.__setattr__(self, "_art_binary_routes_base_url", None)
         object.__setattr__(self, "_serving_capabilities", None)
+        object.__setattr__(self, "_inference_connection_errors_are_fatal", False)
 
     @overload
     def __new__(
@@ -637,8 +627,7 @@ class Model(
                 self._default_chat_completion_extra_body(),
                 (
                     self.inference_base_url
-                    if self.trainable
-                    and _is_local_inference_base_url(self.inference_base_url)
+                    if self._inference_connection_errors_are_fatal
                     else None
                 ),
                 self._art_binary_routes_base_url,
@@ -653,6 +642,7 @@ class Model(
         self._openai_client = None
         self._art_binary_routes_base_url = None
         self._serving_capabilities = None
+        self._inference_connection_errors_are_fatal = False
         self.inference_base_url = None
         self.inference_api_key = None
         self.inference_model_name = None
@@ -1023,9 +1013,7 @@ class Model(
 
     @staticmethod
     def _direct_custom_metric_keys(metrics: dict[str, float], split: str) -> set[str]:
-        if split == SFT_METRIC_PREFIX:
-            return set()
-        return {key for key in metrics if key.split("/", 1)[0] not in METRIC_SECTIONS}
+        return set(metrics)
 
     def _wandb_metrics_payload(
         self,

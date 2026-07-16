@@ -10,7 +10,6 @@ import warnings
 
 import pydantic
 
-from ..preprocessing.pack import PrefixTreePackingPool
 from .config import (
     PackedGroupObservation,
     PipelineAutotuneConfig,
@@ -588,6 +587,8 @@ class PipelineAutotuner:
     def _packing_projections(
         self, settings: PipelineTuneSettings, stats: TunerWindowStats
     ) -> list[PackingProjection]:
+        from ..preprocessing.pack import PrefixTreePackingPool
+
         reservoir = self._packing_reservoir(settings, stats)
         if not reservoir:
             return []

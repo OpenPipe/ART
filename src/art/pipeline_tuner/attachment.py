@@ -287,6 +287,13 @@ class PipelineAutotunerAttachment:
             return None
         assert self.store is not None
         profile = self.store.load(self.config.profile)
+        if profile.settings.num_rollout_workers > self.config.max_rollout_workers:
+            raise ValueError(
+                "Autotuner profile requests "
+                f"num_rollout_workers={profile.settings.num_rollout_workers}, which "
+                "exceeds the active max_rollout_workers="
+                f"{self.config.max_rollout_workers}."
+            )
         if (
             profile.packed_sequence_length is not None
             and profile.packed_sequence_length != active_packed_sequence_length

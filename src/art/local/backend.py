@@ -1143,6 +1143,7 @@ class LocalBackend:
         else:
             base_url = f"http://{host}:{port}/v1"
             api_key = server_args.get("api_key") or "default"
+        object.__setattr__(model, "_inference_connection_errors_are_fatal", True)
 
         if self._model_uses_expert_replay(model):
             if capabilities is None:
