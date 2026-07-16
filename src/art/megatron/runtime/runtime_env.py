@@ -12,6 +12,14 @@ def _set_cache_dir(env_var: str, default_path: str) -> None:
     os.makedirs(os.environ[env_var], exist_ok=True)
 
 
+def _set_inductor_cache_dir() -> None:
+    from torch._inductor.runtime.cache_dir_utils import default_cache_dir
+
+    if os.environ.get("TORCHINDUCTOR_CACHE_DIR") == default_cache_dir():
+        del os.environ["TORCHINDUCTOR_CACHE_DIR"]
+    _set_cache_dir("TORCHINDUCTOR_CACHE_DIR", "~/.cache/torchinductor")
+
+
 def configure_megatron_runtime_env() -> None:
     force_te_cutlass_grouped_gemm_env()
     os.environ["CUDA_DEVICE_MAX_CONNECTIONS"] = os.environ.get(
@@ -23,7 +31,7 @@ def configure_megatron_runtime_env() -> None:
     # SM100 support should come from the TE grouped-GEMM implementation, not
     # ART-side kernel special casing.
     os.environ["TORCH_CUDA_ARCH_LIST"] = "9.0"
-    _set_cache_dir("TORCHINDUCTOR_CACHE_DIR", "~/.cache/torchinductor")
+    _set_inductor_cache_dir()
     _set_cache_dir("TRITON_CACHE_DIR", "~/.triton/cache")
     os.environ.setdefault("FLASH_ATTENTION_CUTE_DSL_CACHE_ENABLED", "1")
     _set_cache_dir(
