@@ -370,12 +370,25 @@ def _take_hash_block_size(engine_args: dict[str, object]) -> int | None:
     return value
 
 
-def _set_hash_block_size(engine_args_type: Any, value: int) -> None:
+def _patch_engine_config(
+    engine_args_type: Any,
+    *,
+    hash_block_size: int | None,
+    pipeline_route_capture: bool,
+) -> None:
     create_engine_config = engine_args_type.create_engine_config
 
     def create(self: Any, *args: Any, **kwargs: Any) -> Any:
         config = create_engine_config(self, *args, **kwargs)
-        config.cache_config.hash_block_size = value
+        if hash_block_size is not None:
+            config.cache_config.hash_block_size = hash_block_size
+        if pipeline_route_capture:
+            config.model_config.enable_return_routed_experts = True
+            transfer = config.kv_transfer_config
+            if transfer is not None and transfer.is_kv_transfer_instance:
+                raise ValueError(
+                    "pipeline routed-expert capture is incompatible with KV connectors"
+                )
         return config
 
     setattr(engine_args_type, "create_engine_config", create)
@@ -388,6 +401,17 @@ def main(argv: list[str] | None = None) -> None:
     engine_args = json.loads(args.engine_args_json)
     server_args = json.loads(args.server_args_json)
     hash_block_size = _take_hash_block_size(engine_args)
+    pipeline_route_capture = bool(engine_args.get("enable_return_routed_experts")) and (
+        int(engine_args.get("pipeline_parallel_size", 1)) > 1
+    )
+    if pipeline_route_capture:
+        engine_args["enable_return_routed_experts"] = False
+        if os.environ.get("VLLM_USE_V2_MODEL_RUNNER", "0").lower() not in {
+            "0",
+            "false",
+        }:
+            raise ValueError("pipeline routed-expert capture requires vLLM V1")
+        os.environ["VLLM_USE_V2_MODEL_RUNNER"] = "0"
 
     from art_vllm_runtime.lora_state import (
         ART_LORA_WORKER_EXTENSION,
@@ -441,8 +465,11 @@ def main(argv: list[str] | None = None) -> None:
     from vllm.utils.argparse_utils import FlexibleArgumentParser
 
     _patch_art_runtime_routes()
-    if hash_block_size is not None:
-        _set_hash_block_size(AsyncEngineArgs, hash_block_size)
+    _patch_engine_config(
+        AsyncEngineArgs,
+        hash_block_size=hash_block_size,
+        pipeline_route_capture=pipeline_route_capture,
+    )
 
     vllm_args = [
         f"--model={args.model}",

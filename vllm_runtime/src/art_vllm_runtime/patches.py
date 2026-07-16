@@ -34,8 +34,14 @@ def apply_vllm_runtime_patches() -> None:
     patch_art_lora_delta_weight_update()
     patch_gemma4_checkpoint_weight_update_reload()
     patch_routed_experts_prefix_cache_sidecar()
-    from art_vllm_runtime.binary_routes import patch_binary_routed_experts_response
+    from art_vllm_runtime.binary_routes import (
+        patch_binary_routed_experts_response,
+        patch_pipeline_routed_experts,
+        patch_pipeline_routed_experts_validation,
+    )
 
+    patch_pipeline_routed_experts_validation()
+    patch_pipeline_routed_experts()
     patch_binary_routed_experts_response()
 
 
