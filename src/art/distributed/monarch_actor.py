@@ -3,13 +3,11 @@ from __future__ import annotations
 import asyncio
 from collections import OrderedDict
 from functools import wraps
-import gc
-from multiprocessing import resource_tracker, shared_memory
 import os
 import socket
 import time
 import traceback
-from typing import Any, cast
+from typing import Any
 
 # This module is imported only by explicit distributed runtime construction.
 from monarch.actor import Actor, endpoint  # ty: ignore[unresolved-import]
@@ -25,7 +23,9 @@ from .data_plane import (
     PackedBatchCapacityError,
     PackedBatchInbox,
     PackedBatchLeaseError,
+    PackedBatchPublisher,
     PackedBatchRef,
+    PackedBatchTransfer,
 )
 from .host_admission import (
     HostAdmissionReport,
@@ -102,6 +102,7 @@ class RolloutHostService(Actor):
         admission_json: str,
         packed_batch_capacity_bytes: int,
         vllm_output_root: str = "/tmp/art-vllm",
+        data_plane_host: str | None = None,
     ) -> None:
         admission = HostAdmissionRequest.model_validate_json(admission_json)
         self.host_id = admission.host_id
@@ -110,7 +111,10 @@ class RolloutHostService(Actor):
         self.inbox = PackedBatchInbox(
             host_id=self.host_id, capacity_bytes=packed_batch_capacity_bytes
         )
-        self._rdma_batches: dict[str, tuple[Any, Any, shared_memory.SharedMemory]] = {}
+        self._batch_publishers: dict[str, PackedBatchPublisher] = {}
+        self._data_plane_host = data_plane_host or socket.gethostbyname(
+            socket.gethostname()
+        )
         self._trajectory_queues: dict[str, TrajectoryQueueStore] = {}
         self._packer = None
         self._vllm_output_root = vllm_output_root
@@ -220,7 +224,7 @@ class RolloutHostService(Actor):
         for queue in self._trajectory_queues.values():
             queue.close()
         self._trajectory_queues.clear()
-        for batch_id in tuple(self._rdma_batches):
+        for batch_id in tuple(self._batch_publishers):
             await self._drop_batch(batch_id)
         if self._packer is not None:
             await self._packer.close()
@@ -424,25 +428,19 @@ class RolloutHostService(Actor):
         )
 
     @resilient_endpoint
-    async def publish_batch(self, ref: PackedBatchRef):
-        if ref.batch_id in self._rdma_batches:
+    async def publish_batch(self, ref: PackedBatchRef) -> PackedBatchTransfer:
+        if ref.batch_id in self._batch_publishers:
             raise RuntimeError(f"packed batch {ref.batch_id!r} is already published")
-        from monarch.rdma import RDMABuffer  # ty: ignore[unresolved-import]
-        import torch
-
-        shm = shared_memory.SharedMemory(name=ref.shared_memory_name)
-        if ref.owner_process_id != os.getpid():
-            resource_tracker.unregister(cast(Any, shm)._name, "shared_memory")
+        publisher = await PackedBatchPublisher.create(
+            ref, advertise_host=self._data_plane_host
+        )
         try:
-            tensor = torch.frombuffer(
-                shm.buf, dtype=torch.uint8, count=ref.storage_byte_count
-            )
-            handle = RDMABuffer(tensor)
+            transfer = publisher.transfer
         except BaseException:
-            shm.close()
+            await publisher.close()
             raise
-        self._rdma_batches[ref.batch_id] = (handle, tensor, shm)
-        return handle
+        self._batch_publishers[ref.batch_id] = publisher
+        return transfer
 
     @resilient_endpoint
     async def drop_batch(self, batch_id: str) -> None:
@@ -453,23 +451,17 @@ class RolloutHostService(Actor):
         self.inbox.store.note_transmitted(byte_count)
 
     async def _drop_batch(self, batch_id: str) -> bool:
-        published = self._rdma_batches.pop(batch_id, None)
-        if published is None:
+        publisher = self._batch_publishers.pop(batch_id, None)
+        if publisher is None:
             return False
-        handle, tensor, shm = published
-        try:
-            await handle.drop()
-        finally:
-            del tensor
-            gc.collect()
-            shm.close()
+        await publisher.close()
         return True
 
     @resilient_endpoint
-    async def receive_rdma_batch(
-        self, ref: PackedBatchRef, rdma_buffer: Any, timeout_s: float
+    async def receive_batch(
+        self, ref: PackedBatchRef, transfer: PackedBatchTransfer, timeout_s: float
     ) -> PackedBatchRef:
-        return await self.inbox.receive_rdma(ref, rdma_buffer, timeout_s=timeout_s)
+        return await self.inbox.receive(ref, transfer, timeout_s=timeout_s)
 
     @resilient_endpoint
     async def drop_batch_ref(self, ref: PackedBatchRef) -> None:

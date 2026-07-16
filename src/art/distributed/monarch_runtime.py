@@ -7,7 +7,7 @@ from pydantic import BaseModel, ConfigDict
 
 from art.trajectories import TrajectoryGroup
 
-from .data_plane import PackedBatchRef
+from .data_plane import PackedBatchRef, PackedBatchTransfer
 from .packing import PackingRequest, PackingResult
 from .rollout import (
     RolloutHostEndpoint,
@@ -163,12 +163,10 @@ class MonarchPackedBatchInbox:
     def __init__(self, actor: Any) -> None:
         self.actor = actor
 
-    async def receive_rdma(
-        self, ref: PackedBatchRef, rdma_buffer: Any, *, timeout_s: float
+    async def receive(
+        self, ref: PackedBatchRef, transfer: PackedBatchTransfer, *, timeout_s: float
     ) -> PackedBatchRef:
-        return await call_remote(
-            self.actor.receive_rdma_batch, ref, rdma_buffer, timeout_s
-        )
+        return await call_remote(self.actor.receive_batch, ref, transfer, timeout_s)
 
     async def drop(self, ref: PackedBatchRef) -> None:
         await call_remote(self.actor.drop_batch_ref, ref)
@@ -181,7 +179,7 @@ class MonarchPackedBatchSource:
     def __init__(self, actor: Any) -> None:
         self.actor = actor
 
-    async def publish(self, ref: PackedBatchRef) -> Any:
+    async def publish(self, ref: PackedBatchRef) -> PackedBatchTransfer:
         return await call_remote(self.actor.publish_batch, ref)
 
     async def drop(self, batch_id: str) -> None:

@@ -20,7 +20,7 @@ from .artifact_preflight import (
     ArtifactProbeSpec,
     ArtifactRootPreflightError,
 )
-from .data_plane import PackedBatchLeaseSet, fanout_rdma_packed_batch
+from .data_plane import PackedBatchLeaseSet, fanout_packed_batch
 from .host_admission import (
     HostAdmissionReport,
     HostAdmissionRequest,
@@ -225,6 +225,7 @@ class ArtRuntime:
 
         async with asyncio.timeout(self.topology.cluster.startup_timeout_s):
             for index, host in enumerate(self.topology.cluster.hosts):
+                data_plane_host = urlparse(host.worker_address).hostname
                 proc = self.host_mesh.slice(hosts=index).spawn_procs(
                     per_host={"service": 1},
                     bootstrap=activate_cpu_child_virtualenv,
@@ -243,6 +244,7 @@ class ArtRuntime:
                     ).model_dump_json(),
                     self.config.packed_batch_capacity_bytes,
                     self.config.vllm_output_root,
+                    data_plane_host,
                 )
                 self._host_procs[host.host_id] = proc
                 self._host_actors[host.host_id] = actor
@@ -676,7 +678,7 @@ class ArtRuntime:
             }
             if destinations:
                 host_refs.update(
-                    await fanout_rdma_packed_batch(
+                    await fanout_packed_batch(
                         ref=result.ref,
                         source_endpoint=MonarchPackedBatchSource(source_actor),
                         inboxes=destinations,

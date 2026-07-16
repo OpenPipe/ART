@@ -22,7 +22,7 @@ distributed = [
     "msgspec>=0.21.0",
     "pyzmq>=27.1.0",
     "torch==2.11.0",
-    "torchmonarch==0.5.0",
+    "torchmonarch==0.6.0",
     "transformers>=5.2.0,<=5.12.1",
 ]
 

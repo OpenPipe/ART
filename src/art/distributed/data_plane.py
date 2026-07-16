@@ -2,11 +2,13 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Mapping
+from contextlib import suppress
 import gc
-import math
 from multiprocessing import resource_tracker, shared_memory
 import os
 import secrets
+import socket
+import time
 from typing import Any, Protocol, cast
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
@@ -24,6 +26,7 @@ _DTYPE_BYTES = {
     "int64": 8,
     "float64": 8,
 }
+_STREAM_CHUNK_BYTES = 4 << 20
 
 
 class _Contract(BaseModel):
@@ -192,6 +195,14 @@ class BatchReservation(_Contract):
     storage_byte_count: int = Field(ge=1)
 
 
+class PackedBatchTransfer(_Contract):
+    batch_id: str = Field(min_length=1)
+    host: str = Field(min_length=1)
+    port: int = Field(ge=1, le=65535)
+    token: str = Field(pattern=r"^[0-9a-f]{64}$")
+    byte_count: int = Field(ge=1)
+
+
 class DataPlaneStats(_Contract):
     capacity_bytes: int
     used_bytes: int
@@ -321,11 +332,11 @@ class SharedMemoryPackedBatchStore:
         )
         return reservation
 
-    async def commit_rdma(
+    async def commit_stream(
         self,
         reservation_id: str,
         source: PackedBatchRef,
-        rdma_buffer: Any,
+        transfer: PackedBatchTransfer,
         *,
         timeout_s: float,
     ) -> PackedBatchRef:
@@ -334,26 +345,26 @@ class SharedMemoryPackedBatchStore:
             raise PackedBatchLeaseError(
                 "unknown or mismatched packed-batch reservation"
             )
+        if (
+            transfer.batch_id != source.batch_id
+            or transfer.byte_count != reservation.storage_byte_count
+        ):
+            raise PackedBatchLeaseError(
+                "packed-batch transfer does not match reservation"
+            )
         shm = shared_memory.SharedMemory(
             create=True, size=reservation.storage_byte_count
         )
-        destination = None
         try:
-            import torch
+            from art.utils.lifecycle import complete_to_thread
 
-            destination = torch.frombuffer(
-                _shm_buffer(shm),
-                dtype=torch.uint8,
-                count=reservation.storage_byte_count,
+            _, cancelled = await complete_to_thread(
+                lambda: _receive_stream(transfer, shm, timeout_s)
             )
-            await rdma_buffer.read_into(destination, timeout=math.ceil(timeout_s))
-            del destination
-            destination = None
+            if cancelled is not None:
+                raise cancelled
             return self._finish_commit(reservation, source, shm)
         except BaseException:
-            if destination is not None:
-                del destination
-            gc.collect()
             shm.close()
             shm.unlink()
             raise
@@ -507,6 +518,92 @@ class MappedPackedBatch(BaseModel):
         self.close()
 
 
+class PackedBatchPublisher:
+    """Batch-scoped authenticated stream over the cluster's routable TCP fabric."""
+
+    def __init__(
+        self,
+        ref: PackedBatchRef,
+        advertise_host: str,
+        shm: shared_memory.SharedMemory,
+    ) -> None:
+        self.ref = ref
+        self.advertise_host = advertise_host
+        self.shm = shm
+        self._token = secrets.token_bytes(32)
+        self._server: Any = None
+        self._handlers: set[asyncio.Task[None]] = set()
+
+    @classmethod
+    async def create(
+        cls, ref: PackedBatchRef, *, advertise_host: str
+    ) -> "PackedBatchPublisher":
+        shm = shared_memory.SharedMemory(name=ref.shared_memory_name)
+        if ref.owner_process_id != os.getpid():
+            resource_tracker.unregister(cast(Any, shm)._name, "shared_memory")
+        publisher = cls(ref, advertise_host, shm)
+        try:
+            family = socket.getaddrinfo(advertise_host, 0, type=socket.SOCK_STREAM)[0][
+                0
+            ]
+            bind_host = "::" if family == socket.AF_INET6 else "0.0.0.0"
+            publisher._server = await asyncio.start_server(
+                publisher._handle, bind_host, 0, family=family
+            )
+            return publisher
+        except BaseException:
+            shm.close()
+            raise
+
+    @property
+    def transfer(self) -> PackedBatchTransfer:
+        if self._server is None or not self._server.sockets:
+            raise RuntimeError("packed-batch publisher is not listening")
+        return PackedBatchTransfer(
+            batch_id=self.ref.batch_id,
+            host=self.advertise_host,
+            port=int(self._server.sockets[0].getsockname()[1]),
+            token=self._token.hex(),
+            byte_count=self.ref.storage_byte_count,
+        )
+
+    async def close(self) -> None:
+        if self._server is None:
+            return
+        self._server.close()
+        await self._server.wait_closed()
+        for task in self._handlers:
+            task.cancel()
+        await asyncio.gather(*self._handlers, return_exceptions=True)
+        self._handlers.clear()
+        self._server = None
+        self.shm.close()
+
+    async def _handle(
+        self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter
+    ) -> None:
+        task = cast(asyncio.Task[None], asyncio.current_task())
+        self._handlers.add(task)
+        try:
+            token = await reader.readexactly(len(self._token))
+            if not secrets.compare_digest(token, self._token):
+                return
+            source = _shm_buffer(self.shm)[: self.ref.storage_byte_count]
+            try:
+                for offset in range(0, len(source), _STREAM_CHUNK_BYTES):
+                    writer.write(source[offset : offset + _STREAM_CHUNK_BYTES])
+                    await writer.drain()
+            finally:
+                source.release()
+        except (asyncio.IncompleteReadError, ConnectionError):
+            pass
+        finally:
+            writer.close()
+            with suppress(Exception):
+                await writer.wait_closed()
+            self._handlers.discard(task)
+
+
 class PackedBatchInbox:
     def __init__(self, *, host_id: str, capacity_bytes: int) -> None:
         self.host_id = host_id
@@ -515,15 +612,15 @@ class PackedBatchInbox:
             capacity_bytes=capacity_bytes,
         )
 
-    async def receive_rdma(
-        self, ref: PackedBatchRef, rdma_buffer: Any, *, timeout_s: float
+    async def receive(
+        self, ref: PackedBatchRef, transfer: PackedBatchTransfer, *, timeout_s: float
     ) -> PackedBatchRef:
         reservation = self.store.reserve(ref)
         try:
-            return await self.store.commit_rdma(
+            return await self.store.commit_stream(
                 reservation.reservation_id,
                 ref,
-                rdma_buffer,
+                transfer,
                 timeout_s=timeout_s,
             )
         except BaseException:
@@ -537,36 +634,36 @@ class PackedBatchInbox:
         return self.store.reclaim(batch_id, fence=fence)
 
 
-class RDMABatchSourceEndpoint(Protocol):
-    async def publish(self, ref: PackedBatchRef) -> Any: ...
+class PackedBatchSourceEndpoint(Protocol):
+    async def publish(self, ref: PackedBatchRef) -> PackedBatchTransfer: ...
 
     async def drop(self, batch_id: str) -> None: ...
 
     async def note_transmitted(self, byte_count: int) -> None: ...
 
 
-class RDMABatchInboxEndpoint(Protocol):
-    async def receive_rdma(
-        self, ref: PackedBatchRef, rdma_buffer: Any, *, timeout_s: float
+class PackedBatchInboxEndpoint(Protocol):
+    async def receive(
+        self, ref: PackedBatchRef, transfer: PackedBatchTransfer, *, timeout_s: float
     ) -> PackedBatchRef: ...
 
     async def drop(self, ref: PackedBatchRef) -> None: ...
 
 
-async def fanout_rdma_packed_batch(
+async def fanout_packed_batch(
     *,
     ref: PackedBatchRef,
-    source_endpoint: RDMABatchSourceEndpoint,
-    inboxes: Mapping[str, RDMABatchInboxEndpoint],
+    source_endpoint: PackedBatchSourceEndpoint,
+    inboxes: Mapping[str, PackedBatchInboxEndpoint],
     timeout_s: float,
 ) -> dict[str, PackedBatchRef]:
-    """Publish once, read once per host, and always drop the actor-owned handle."""
+    """Publish once, stream once per host, and always drop the source listener."""
 
-    handle = await source_endpoint.publish(ref)
+    transfer = await source_endpoint.publish(ref)
     try:
         tasks = {
             host_id: asyncio.create_task(
-                inbox.receive_rdma(ref, handle, timeout_s=timeout_s)
+                inbox.receive(ref, transfer, timeout_s=timeout_s)
             )
             for host_id, inbox in inboxes.items()
         }
@@ -601,13 +698,39 @@ async def fanout_rdma_packed_batch(
 
 
 async def _release_transferred(
-    inboxes: Mapping[str, RDMABatchInboxEndpoint],
+    inboxes: Mapping[str, PackedBatchInboxEndpoint],
     results: list[tuple[str, PackedBatchRef] | BaseException],
 ) -> None:
     for result in results:
         if not isinstance(result, BaseException):
             host_id, destination_ref = result
             await inboxes[host_id].drop(destination_ref)
+
+
+def _receive_stream(
+    transfer: PackedBatchTransfer,
+    shm: shared_memory.SharedMemory,
+    timeout_s: float,
+) -> None:
+    deadline = time.monotonic() + timeout_s
+    with socket.create_connection(
+        (transfer.host, transfer.port), timeout=max(0.001, timeout_s)
+    ) as connection:
+        connection.sendall(bytes.fromhex(transfer.token))
+        destination = _shm_buffer(shm)[: transfer.byte_count]
+        try:
+            offset = 0
+            while offset < len(destination):
+                connection.settimeout(max(0.001, deadline - time.monotonic()))
+                received = connection.recv_into(destination[offset:])
+                if not received:
+                    raise ConnectionError(
+                        f"packed-batch stream ended after {offset} of "
+                        f"{len(destination)} bytes"
+                    )
+                offset += received
+        finally:
+            destination.release()
 
 
 def _flatten_packed_tensors(
