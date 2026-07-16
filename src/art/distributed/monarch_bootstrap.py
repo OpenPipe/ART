@@ -46,6 +46,10 @@ _MONARCH_TIMEOUT_ENV = (
     "HYPERACTOR_MESH_ACTOR_SPAWN_MAX_IDLE",
     "HYPERACTOR_MESH_PROC_SPAWN_MAX_IDLE",
 )
+_MONARCH_SHUTDOWN_ENV = {
+    "HYPERACTOR_PROCESS_EXIT_TIMEOUT": "2s",
+    "HYPERACTOR_MESH_PROC_STOP_MAX_IDLE": "10s",
+}
 _WORKER_ADDRESS_LOCK = threading.Lock()
 _USED_WORKER_ADDRESSES: set[str] = set()
 _BROKEN_OUTPUT_FLAGS = select.POLLERR | select.POLLHUP | select.POLLNVAL
@@ -292,6 +296,8 @@ def _prepare_child_environment(
         )
     for name in _MONARCH_TIMEOUT_ENV:
         environ.setdefault(name, "600s")
+    for name, value in _MONARCH_SHUTDOWN_ENV.items():
+        environ.setdefault(name, value)
     # INFO launch records include the inherited environment and may expose secrets.
     environ.setdefault("MONARCH_FILE_LOG", "warn")
 

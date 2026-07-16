@@ -376,6 +376,7 @@ async def spawn_monarch_trainer_actors(
         None
     )
     await spmd.setup_env.call(master_addr, master_port)
+    await _remote_teardown(spmd.stop())
     actors: Any = proc_mesh.spawn(
         f"art_megatron_trainer_{supervision.token}",
         MonarchTrainerActor,
@@ -731,10 +732,9 @@ class MonarchTrainerRun:
         primary: BaseException | None = None
         if graceful:
             try:
-                await asyncio.wait_for(
-                    _remote_teardown(self._actors.close.call()),
-                    self.run_spec.shutdown_timeout_s / 2,
-                )
+                async with asyncio.timeout(self.run_spec.shutdown_timeout_s / 2):
+                    await _remote_teardown(self._actors.close.call())
+                    await _remote_teardown(self._actors.stop())
             except BaseException as exc:
                 primary = exc
         try:
