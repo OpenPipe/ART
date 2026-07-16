@@ -1038,7 +1038,7 @@ class LocalBackend:
             not allow_training_without_logprobs
             and np.isnan(packed_tensors["logprobs"]).all()
         ):
-            print(
+            logger.warning(
                 "There are no assistant logprobs to train on. Did you forget to include at least one Choice in Trajectory.messages_and_choices?"
             )
             return None
@@ -1047,7 +1047,7 @@ class LocalBackend:
                 packed_tensors, get_model_dir(model=model, art_path=self._path)
             )
         else:
-            print(
+            logger.info(
                 f"Packed {len(tokenized_results)} trajectories into {packed_tensors['tokens'].shape[0]} sequences of length {packed_tensors['tokens'].shape[1]}"
             )
         return packed_tensors

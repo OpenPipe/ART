@@ -48,6 +48,7 @@ _MONARCH_TIMEOUT_ENV = (
 )
 _WORKER_ADDRESS_LOCK = threading.Lock()
 _USED_WORKER_ADDRESSES: set[str] = set()
+_BROKEN_OUTPUT_FLAGS = select.POLLERR | select.POLLHUP | select.POLLNVAL
 _WORKER_CODE = """\
 import sys
 from monarch.actor import run_worker_loop_forever
@@ -295,9 +296,26 @@ def _prepare_child_environment(
     environ.setdefault("MONARCH_FILE_LOG", "warn")
 
 
+def _stabilize_child_stdio() -> None:
+    fds = (sys.stdout.fileno(), sys.stderr.fileno())
+    poller = select.poll()
+    for fd in fds:
+        poller.register(fd, select.POLLOUT)
+    if not any(flags & _BROKEN_OUTPUT_FLAGS for _, flags in poller.poll(0)):
+        return
+    log_dir = Path(
+        os.environ.get("ART_MONARCH_CHILD_LOG_DIR") or "/tmp/art-monarch-child-logs"
+    )
+    log_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+    with (log_dir / f"{socket.gethostname()}-{os.getpid()}.log").open("ab") as log:
+        for fd in fds:
+            os.dup2(log.fileno(), fd)
+
+
 def activate_child_virtualenv() -> None:
     """Restore venv identity lost when Monarch resolves the Python executable."""
 
+    _stabilize_child_stdio()
     if virtual_env := os.environ.get("ART_VIRTUAL_ENV"):
         sys.prefix = sys.exec_prefix = virtual_env
 
