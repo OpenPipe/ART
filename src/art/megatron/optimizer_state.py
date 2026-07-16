@@ -1653,7 +1653,7 @@ def _quarantine_pointer_temp(path: Path, temporary: Path) -> None:
     _fsync_directory(path)
 
 
-def _validate_recovery_generation(
+def _validate_committed_generation(
     path: Path, pointer: OptimizerGenerationPointer
 ) -> None:
     generation_path = optimizer_generation_path(str(path), pointer.generation)
@@ -1743,7 +1743,7 @@ def _recover_optimizer_pointer_locked(
             "committed generations"
         )
 
-    _validate_recovery_generation(path, pointer)
+    _validate_committed_generation(path, pointer)
     if temporary is None:
         _write_model_atomic(path / OPTIMIZER_POINTER, pointer)
     else:
@@ -1912,10 +1912,7 @@ def resolve_megatron_resume_step(
     latest_lora_step = get_step_from_dir(output_dir)
     with _committed_generation_lease(Path(optimizer_state_path)) as pointer:
         if pointer is not None:
-            generation_path = optimizer_generation_path(
-                optimizer_state_path, pointer.generation
-            )
-            _validate_pointer_manifest(pointer, _read_manifest(generation_path))
+            _validate_committed_generation(Path(optimizer_state_path), pointer)
             expected_path = Path(
                 get_step_checkpoint_dir(output_dir, pointer.adapter.step)
             ).absolute()
@@ -1924,7 +1921,6 @@ def resolve_megatron_resume_step(
                     "Optimizer pointer does not identify the canonical adapter path: "
                     f"saved={pointer.adapter.identity}, expected={expected_path}"
                 )
-            _validate_adapter_publication(pointer.adapter, verify_files=True)
         policy = _resolve_policy_pointer(Path(optimizer_state_path), pointer)
         if policy is not None:
             expected_path = Path(
