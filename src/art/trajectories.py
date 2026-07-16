@@ -16,6 +16,7 @@ from typing import (
 from openai.types.chat.chat_completion import Choice
 import pydantic
 
+from .openai import ART_MOE_ROUTING_METADATA_KEY
 from .types import Message, Messages, MessagesAndChoices, Tools
 
 MetadataValue = float | int | str | bool | None
@@ -27,9 +28,26 @@ class PydanticException(pydantic.BaseModel):
     traceback: str
 
 
+def _serialize_messages_and_choices(
+    messages_and_choices: MessagesAndChoices,
+) -> list[dict[str, Any]]:
+    return [
+        item.model_dump(mode="json", exclude={ART_MOE_ROUTING_METADATA_KEY})
+        if isinstance(item, Choice)
+        else dict(item)
+        for item in messages_and_choices
+    ]
+
+
 class History(pydantic.BaseModel):
     messages_and_choices: MessagesAndChoices
     tools: Tools | None = None
+
+    @pydantic.field_serializer("messages_and_choices", when_used="json")
+    def _serialize_messages_and_choices(
+        self, messages_and_choices: MessagesAndChoices
+    ) -> list[dict[str, Any]]:
+        return _serialize_messages_and_choices(messages_and_choices)
 
     def messages(self) -> Messages:
         return get_messages(self.messages_and_choices)
@@ -46,6 +64,12 @@ class Trajectory(pydantic.BaseModel):
     metadata: dict[str, MetadataValue] = {}
     logs: list[str] = []
     start_time: datetime = pydantic.Field(default_factory=datetime.now, exclude=True)
+
+    @pydantic.field_serializer("messages_and_choices", when_used="json")
+    def _serialize_messages_and_choices(
+        self, messages_and_choices: MessagesAndChoices
+    ) -> list[dict[str, Any]]:
+        return _serialize_messages_and_choices(messages_and_choices)
 
     def log(self, message: str) -> None:
         self.logs.append(message)

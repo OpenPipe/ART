@@ -14,6 +14,8 @@ from openai.types.chat.chat_completion_message_tool_call import Function
 
 from .preprocessing.policy_spans import POLICY_TOKEN_SPANS_KEY
 
+ART_MOE_ROUTING_METADATA_KEY = "art_moe_routing"
+
 
 async def consume_chat_completion_stream(
     stream: AsyncStream[ChatCompletionChunk],

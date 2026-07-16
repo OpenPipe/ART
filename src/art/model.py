@@ -1,5 +1,5 @@
 import asyncio
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from contextvars import Token
 from datetime import datetime
 import json
@@ -70,11 +70,7 @@ LOCAL_INFERENCE_HOSTS = frozenset({"127.0.0.1", "0.0.0.0", "::1", "localhost"})
 
 @contextmanager
 def _suppress_weave_trace():
-    try:
-        from weave.trace.settings import override_settings
-    except ModuleNotFoundError:
-        yield
-        return
+    from weave.trace.settings import override_settings
 
     with override_settings(disabled=True):
         yield
@@ -185,6 +181,7 @@ class _OpenAIChatCompletionsProxy:
         local_serving_base_url: str | None = None,
         binary_completions: Any | None = None,
         policy_span_mode: Literal["none", "require", "synthesize"] = "none",
+        suppress_weave_trace: bool = False,
     ) -> None:
         self._completions = completions
         self._record_costs = record_costs
@@ -192,6 +189,7 @@ class _OpenAIChatCompletionsProxy:
         self._local_serving_base_url = local_serving_base_url
         self._binary_completions = binary_completions
         self._policy_span_mode = policy_span_mode
+        self._suppress_weave_trace = suppress_weave_trace
 
     async def create(self, *args: Any, **kwargs: Any) -> Any:
         if self._policy_span_mode != "none" and kwargs.get("stream", False):
@@ -210,7 +208,9 @@ class _OpenAIChatCompletionsProxy:
         # long RL run into hundreds of GB of trace payload. Keep the production
         # training response intact and suppress only this implicit trace.
         try:
-            with _suppress_weave_trace():
+            with (
+                _suppress_weave_trace() if self._suppress_weave_trace else nullcontext()
+            ):
                 if self._binary_completions is None:
                     response = await self._completions.create(*args, **kwargs)
                     routed_experts = None
@@ -256,6 +256,7 @@ class _OpenAIChatProxy:
         local_serving_base_url: str | None = None,
         binary_chat: Any | None = None,
         policy_span_mode: Literal["none", "require", "synthesize"] = "none",
+        suppress_weave_trace: bool = False,
     ) -> None:
         self._chat = chat
         self.completions = _OpenAIChatCompletionsProxy(
@@ -265,6 +266,7 @@ class _OpenAIChatProxy:
             local_serving_base_url,
             binary_chat.completions if binary_chat is not None else None,
             policy_span_mode,
+            suppress_weave_trace,
         )
 
     def __getattr__(self, name: str) -> Any:
@@ -280,6 +282,7 @@ class _OpenAIClientProxy:
         local_serving_base_url: str | None = None,
         binary_routes_base_url: str | None = None,
         policy_span_mode: Literal["none", "require", "synthesize"] = "none",
+        suppress_weave_trace: bool = False,
     ) -> None:
         self._client = client
         self._record_costs = record_costs
@@ -287,6 +290,7 @@ class _OpenAIClientProxy:
         self._local_serving_base_url = local_serving_base_url
         self._binary_routes_base_url = binary_routes_base_url
         self._policy_span_mode = policy_span_mode
+        self._suppress_weave_trace = suppress_weave_trace
         binary_client = (
             client.with_options(base_url=binary_routes_base_url)
             if binary_routes_base_url is not None
@@ -299,6 +303,7 @@ class _OpenAIClientProxy:
             local_serving_base_url,
             binary_client.chat if binary_client is not None else None,
             policy_span_mode,
+            suppress_weave_trace,
         )
 
     def with_options(self, *args: Any, **kwargs: Any) -> "_OpenAIClientProxy":
@@ -309,6 +314,7 @@ class _OpenAIClientProxy:
             self._local_serving_base_url,
             self._binary_routes_base_url,
             self._policy_span_mode,
+            self._suppress_weave_trace,
         )
 
     def __getattr__(self, name: str) -> Any:
@@ -636,6 +642,7 @@ class Model(
                 ),
                 self._art_binary_routes_base_url,
                 self._policy_span_mode(),
+                self.trainable,
             ),
         )
         return self._openai_client

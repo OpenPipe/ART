@@ -4919,7 +4919,7 @@ requires-dist = [
     { name = "unsloth-zoo", marker = "extra == 'backend'", specifier = "==2026.3.1" },
     { name = "uvicorn", marker = "extra == 'tinker'", specifier = ">=0.35.0" },
     { name = "wandb", marker = "extra == 'backend'", specifier = "==0.28.0" },
-    { name = "weave", specifier = ">=0.52.24" },
+    { name = "weave", specifier = ">=0.52.41" },
 ]
 provides-extras = ["plotting", "backend", "megatron", "langgraph", "tinker"]
 
