@@ -44,8 +44,9 @@ back to Socket. `ART_VLLM_RUNTIME_BIN`, when set, must point directly to a
 standard `.venv/bin/art-vllm-runtime-server`; arbitrary wrappers fail closed.
 
 Each invocation terminates every worker loop before the task exits. Reusing the
-cluster starts fresh loops; completed Monarch 0.5 loops are not reattached.
+cluster starts fresh loops; Monarch 0.6 worker addresses are generation-owned and
+completed loops are not reattached.
 
 Setting `num_nodes: 1` exercises the same API on one node. Do not expose the
-default private ports `22222` and `22223`; pinned Monarch 0.5 does not
+default private ports `22222` and `22223`; pinned Monarch 0.6 does not
 authenticate its transport.
