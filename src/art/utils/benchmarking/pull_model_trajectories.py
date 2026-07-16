@@ -35,7 +35,8 @@ async def pull_model_trajectories(model: ArtModel) -> None:
     # any background service shutdown before returning.
     async with LocalBackend() as backend:
         print(
-            f"Pulling trajectories for model '{model.name}' from S3 bucket '{bucket}'…",
+            "Pulling trajectories for model "
+            f"'{model._storage_name()}' from S3 bucket '{bucket}'…",
             flush=True,
         )
 

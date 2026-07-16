@@ -36,6 +36,7 @@ async def test_training_records_stale_and_zero_variance_discards(
     tmp_path: Path,
 ) -> None:
     model = TrainableModel(
+        run_name="pipeline-discard-metrics-test",
         name="pipeline-discard-metrics-test",
         project="pipeline-discard-metrics-test",
         base_model="test-model",

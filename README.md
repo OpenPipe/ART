@@ -42,6 +42,7 @@ from art.serverless.backend import ServerlessBackend
 model = art.TrainableModel(
   project="voice-agent",
   name="agent-001",
+  run_name="agent-001",
   base_model="Qwen/Qwen3.6-27B"
 )
 

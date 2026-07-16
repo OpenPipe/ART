@@ -31,7 +31,7 @@ async def log_constant_metrics_wandb(
     """
     run = wandb_sdk.init(
         project=model.project,
-        name=logged_run_name if logged_run_name else model.name,
+        name=logged_run_name if logged_run_name else model._storage_name(),
         reinit="create_new",
     )
 

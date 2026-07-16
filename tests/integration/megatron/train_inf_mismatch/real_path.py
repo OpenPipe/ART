@@ -757,6 +757,7 @@ async def _score_base_real_generation_path(
         forward_trace_dir=vllm_forward_trace_dir,
     ) as (host, port):
         model = art.TrainableModel(
+            run_name=f"{served_name}_client",
             name=f"{served_name}_client",
             project="train_inf_mismatch",
             base_model=parity_config.base_model,
@@ -1474,8 +1475,10 @@ async def run_real_path_train_inf_mismatch(
             "server_url": parity_config.external_vllm_server_url,
             "api_key": parity_config.external_vllm_api_key,
         }
+    run_name = f"train-inf-real-{uuid.uuid4().hex[:8]}"
     model = art.TrainableModel(
-        name=f"train-inf-real-{uuid.uuid4().hex[:8]}",
+        name=run_name,
+        run_name=run_name,
         project="train_inf_mismatch",
         base_model=parity_config.base_model,
         lora_config=(

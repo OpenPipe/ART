@@ -761,8 +761,10 @@ async def run_length_trainability_async(
         backend_root=backend_root,
         extra_env=backend_env,
     ) as backend:
+        run_name = f"length-{uuid.uuid4().hex[:8]}"
         model = art.TrainableModel(
-            name=f"length-{uuid.uuid4().hex[:8]}",
+            name=run_name,
+            run_name=run_name,
             project="integration-tests",
             base_model=base_model,
             _internal_config=internal_config,

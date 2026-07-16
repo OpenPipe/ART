@@ -110,7 +110,12 @@ async def main() -> None:
     backend = TinkerNativeBackend()
 
     print(f"Initializing TrainableModel: {model_name}")
-    model = art.TrainableModel(name=model_name, project=PROJECT, base_model=BASE_MODEL)
+    model = art.TrainableModel(
+        name=model_name,
+        run_name=model_name,
+        project=PROJECT,
+        base_model=BASE_MODEL,
+    )
 
     print("Registering model with backend")
     await model.register(backend)

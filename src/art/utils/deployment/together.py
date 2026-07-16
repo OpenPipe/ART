@@ -76,7 +76,7 @@ def _init_session() -> aiohttp.ClientSession:
 
 def _model_checkpoint_id(model: "TrainableModel", step: int) -> str:
     """Generates a unique ID for a model checkpoint."""
-    return f"{model.project}-{model.name}-{step}"
+    return f"{model.project}-{model.run_name}-{step}"
 
 
 async def _upload_model(
@@ -99,7 +99,7 @@ async def _upload_model(
                 "model_source": presigned_url,
                 "model_type": "adapter",
                 "base_model": model.base_model,
-                "description": f"Deployed from ART. Project: {model.project}. Model: {model.name}. Step: {step}",
+                "description": f"Deployed from ART. Project: {model.project}. Run: {model.run_name}. Step: {step}",
             },
         ) as response:
             if response.status != 200:
@@ -207,7 +207,7 @@ async def deploy_to_together(
     """
     # Archive and upload to S3 to get a presigned URL for Together
     presigned_url = await archive_and_presign_step_url(
-        model_name=model.name,
+        model_name=model.run_name,
         project=model.project,
         step=step,
         s3_bucket=config.s3_bucket,
@@ -233,7 +233,7 @@ async def deploy_to_together(
         job_id = existing_job_id
         assert job_id is not None
         print(
-            f"Previous deployment for {model.name} at step {step} has status '{existing_job.status}', skipping redeployment"
+            f"Previous deployment for {model.run_name} at step {step} has status '{existing_job.status}', skipping redeployment"
         )
 
     if config.wait_for_completion:
@@ -243,7 +243,7 @@ async def deploy_to_together(
 
     if job.status == TogetherJobStatus.FAILED:
         raise RuntimeError(
-            f"Together deployment failed for {model.name} step {step}. "
+            f"Together deployment failed for {model.run_name} step {step}. "
             f"Job ID: {job.job_id}. Reason: {job.failure_reason}"
         )
 

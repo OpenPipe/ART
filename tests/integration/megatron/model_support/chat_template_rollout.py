@@ -98,6 +98,7 @@ def run_chat_template_rollout(base_model: str) -> ChatTemplateRolloutReport:
     output_dir = _artifact_dir(base_model)
     backend = LocalBackend(path=str(output_dir))
     model = art.TrainableModel(
+        run_name="model-support-chat-template",
         name="model-support-chat-template",
         project="model-support-validation",
         base_model=base_model,

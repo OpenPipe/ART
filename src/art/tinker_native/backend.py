@@ -203,7 +203,11 @@ class TinkerNativeBackend:
 
         self._path = path or ".art"
         os.makedirs(self._path, exist_ok=True)
-        self._model_state: dict[str, ModelState] = {}
+        self._model_state: dict[tuple[str, str], ModelState] = {}
+
+    @staticmethod
+    def _model_key(model: Model) -> tuple[str, str]:
+        return model.project, model._storage_name()
 
     def _env_enabled(self, env_name: str) -> bool:
         value = os.getenv(env_name)
@@ -292,14 +296,14 @@ class TinkerNativeBackend:
         if pricing is not None:
             trainable_model.set_cost_calculator(build_cost_calculator(pricing))
         state = await self._build_model_state(trainable_model)
-        self._model_state[model.name] = state
+        self._model_state[self._model_key(model)] = state
 
     async def _prepare_backend_for_training(
         self,
         model: TrainableModel,
         config: dev.OpenAIServerConfig | None = None,
     ) -> tuple[str, str]:
-        state = self._model_state[model.name]
+        state = self._model_state[self._model_key(model)]
 
         raw_config: dict[str, Any] = cast(dict[str, Any], config) if config else {}
         server_args = cast(dict[str, Any], raw_config.get("server_args", {}))
@@ -344,7 +348,7 @@ class TinkerNativeBackend:
             "TinkerNativeBackend only supports kl_penalty_source='sample'."
         )
 
-        state = self._model_state[model.name]
+        state = self._model_state[self._model_key(model)]
         groups_list = list(trajectory_groups)
         summary = summarize_trajectory_groups(groups_list)
 
@@ -496,8 +500,9 @@ class TinkerNativeBackend:
         yield {}
 
     async def _get_step(self, model: TrainableModel) -> int:
-        if model.name in self._model_state:
-            return self._model_state[model.name].current_step
+        model_key = self._model_key(model)
+        if model_key in self._model_state:
+            return self._model_state[model_key].current_step
         state = model.read_state() or {}
         return int(state.get(STATE_KEY_LATEST_STEP, 0))
 
@@ -513,9 +518,9 @@ class TinkerNativeBackend:
         if "@" in base_name:
             base_name = base_name.split("@", 1)[0]
         if step is None:
-            step = pinned_inference_step(model.name)
+            step = pinned_inference_step(model._storage_name())
         if step is None:
-            state = self._model_state.get(model.name)
+            state = self._model_state.get(self._model_key(model))
             step = state.current_step if state is not None else 0
         return f"{base_name}@{step}"
 
@@ -525,7 +530,7 @@ class TinkerNativeBackend:
         model: TrainableModel,
         step: int,
     ) -> AsyncIterator[None]:
-        async with pin_inference_step(model.name, step):
+        async with pin_inference_step(model._storage_name(), step):
             yield
 
     @asynccontextmanager
@@ -1059,9 +1064,10 @@ class TinkerNativeBackend:
 
         trainable_model = cast(TrainableModel, model)
 
-        if trainable_model.name not in self._model_state:
+        model_key = self._model_key(trainable_model)
+        if model_key not in self._model_state:
             raise RuntimeError(
-                f"Model '{trainable_model.name}' is not registered. "
+                f"Run '{trainable_model.run_name}' is not registered. "
                 "Call register() before forking."
             )
 
@@ -1091,7 +1097,7 @@ class TinkerNativeBackend:
             )
 
         # List source model's checkpoints
-        dest_state = self._model_state[trainable_model.name]
+        dest_state = self._model_state[model_key]
         training_paths, sampler_paths = await self._list_checkpoints(
             dest_state.rest_client, source_run_ids
         )
@@ -1160,6 +1166,6 @@ class TinkerNativeBackend:
 
         if verbose:
             print(
-                f"Fork complete. Model '{trainable_model.name}' is now at "
+                f"Fork complete. Run '{trainable_model.run_name}' is now at "
                 f"step {target_step}."
             )

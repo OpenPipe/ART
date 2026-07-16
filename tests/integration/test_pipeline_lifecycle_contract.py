@@ -35,6 +35,7 @@ def _trainer(
 ) -> PipelineTrainer:
     return PipelineTrainer(
         model=TrainableModel(
+            run_name="pipeline-lifecycle",
             name="pipeline-lifecycle",
             project="pipeline-tests",
             base_model="test-model",
@@ -90,6 +91,7 @@ def test_deprecated_pipeline_kwargs_preserve_previous_defaults(tmp_path: Path) -
     with pytest.warns(DeprecationWarning):
         trainer = PipelineTrainer(
             model=TrainableModel(
+                run_name="pipeline-aliases",
                 name="pipeline-aliases",
                 project="pipeline-tests",
                 base_model="test-model",

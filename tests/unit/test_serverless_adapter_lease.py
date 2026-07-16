@@ -5,6 +5,7 @@ from art.serverless.backend import ServerlessBackend
 async def test_serverless_adapter_lease_pins_inference_step() -> None:
     backend = ServerlessBackend(api_key="test-api-key")
     model = art.TrainableModel(
+        run_name="test-model",
         name="test-model",
         project="test-project",
         entity="test-entity",
@@ -36,12 +37,14 @@ async def test_serverless_adapter_lease_pins_inference_step() -> None:
 async def test_serverless_adapter_lease_is_model_scoped() -> None:
     backend = ServerlessBackend(api_key="test-api-key")
     model_a = art.TrainableModel(
+        run_name="model-a",
         name="model-a",
         project="test-project",
         entity="test-entity",
         base_model="test-base-model",
     )
     model_b = art.TrainableModel(
+        run_name="model-b",
         name="model-b",
         project="test-project",
         entity="test-entity",

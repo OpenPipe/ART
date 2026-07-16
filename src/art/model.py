@@ -736,7 +736,10 @@ class Model(
 
     def _get_output_dir(self) -> str:
         """Get the output directory for this model."""
-        return f"{self.base_path}/{self.project}/models/{self.name}"
+        return f"{self.base_path}/{self.project}/models/{self._storage_name()}"
+
+    def _storage_name(self) -> str:
+        return self.name
 
     def overwrite_state(self, state: StateType) -> None:
         """Overwrite persistent state in the model directory as JSON.
@@ -895,8 +898,8 @@ class Model(
             try:
                 run = wandb_sdk.init(
                     project=self.project,
-                    name=self.name,
-                    id=self.name,
+                    name=self._storage_name(),
+                    id=self._storage_name(),
                     config=self._wandb_config or None,
                     resume="allow",
                     reinit="create_new",
@@ -1409,6 +1412,8 @@ class Model(
 
 class TrainableModel(Model[ModelConfig, StateType], Generic[ModelConfig, StateType]):
     base_model: str
+    # Durable checkpoint/W&B lineage; `name` remains the inference-serving alias.
+    run_name: str
     lora_config: dev.LoRAConfig | None = None
     # Override discriminator field for FastAPI serialization
     trainable: bool = True
@@ -1417,10 +1422,14 @@ class TrainableModel(Model[ModelConfig, StateType], Generic[ModelConfig, StateTy
     # Use at your own risk.
     _internal_config: dev.InternalModelConfig | None = None
 
+    def _storage_name(self) -> str:
+        return self.run_name
+
     def __init__(
         self,
         *,
         name: str,
+        run_name: str,
         project: str,
         entity: str | None = None,
         id: str | None = None,
@@ -1436,6 +1445,7 @@ class TrainableModel(Model[ModelConfig, StateType], Generic[ModelConfig, StateTy
         BaseModel.__init__(
             self,
             name=name,
+            run_name=run_name,
             project=project,
             entity=entity,
             id=id,
@@ -1504,6 +1514,7 @@ class TrainableModel(Model[ModelConfig, StateType], Generic[ModelConfig, StateTy
         cls,
         *,
         name: str,
+        run_name: str,
         project: str,
         entity: str | None = None,
         id: str | None = None,
@@ -1520,6 +1531,7 @@ class TrainableModel(Model[ModelConfig, StateType], Generic[ModelConfig, StateTy
         cls,
         *,
         name: str,
+        run_name: str,
         project: str,
         entity: str | None = None,
         id: str | None = None,

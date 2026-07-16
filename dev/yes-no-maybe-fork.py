@@ -186,6 +186,7 @@ async def main() -> None:
 
     # --- Phase 1: train the base model (static name, resume-safe) ---
     model_a = art.TrainableModel(
+        run_name=BASE_MODEL_NAME,
         name=BASE_MODEL_NAME,
         project=PROJECT,
         base_model=BASE_MODEL,
@@ -241,6 +242,7 @@ async def main() -> None:
     model_b_name = f"ynm-fork-{uuid.uuid4().hex[:8]}"
     print(f"Forking into '{model_b_name}'...")
     model_b = art.TrainableModel(
+        run_name=model_b_name,
         name=model_b_name,
         project=PROJECT,
         base_model=BASE_MODEL,

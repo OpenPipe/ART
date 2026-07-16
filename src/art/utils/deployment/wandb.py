@@ -70,7 +70,7 @@ def deploy_wandb(
         print(f"Uploading checkpoint from {checkpoint_path} to W&B...")
 
     run = wandb_sdk.init(
-        name=model.name + " (deployment)",
+        name=model.run_name + " (deployment)",
         entity=model.entity,
         project=model.project,
         settings=wandb_sdk.settings(api_key=os.environ["WANDB_API_KEY"]),
@@ -80,7 +80,7 @@ def deploy_wandb(
         if config is not None:
             metadata["wandb.provenance"] = config.provenance
         artifact = wandb_sdk.artifact(
-            model.name,
+            model.run_name,
             type="lora",
             metadata=metadata,
             storage_region="coreweave-us",
@@ -99,7 +99,7 @@ def deploy_wandb(
         run.finish()
 
     inference_name = (
-        f"wandb-artifact:///{model.entity}/{model.project}/{model.name}:step{step}"
+        f"wandb-artifact:///{model.entity}/{model.project}/{model.run_name}:step{step}"
     )
     if verbose:
         print(f"Successfully deployed to W&B. Inference model name: {inference_name}")

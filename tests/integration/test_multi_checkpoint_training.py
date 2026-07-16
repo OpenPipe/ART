@@ -119,6 +119,7 @@ async def test_tinker_backend():
     with tempfile.TemporaryDirectory() as tmpdir:
         backend = TinkerBackend(path=tmpdir)
         model = art.TrainableModel(
+            run_name=model_name,
             name=model_name,
             project="integration-tests",
             base_model=get_base_model(),
@@ -148,6 +149,7 @@ async def test_local_backend():
     with tempfile.TemporaryDirectory() as tmpdir:
         backend = LocalBackend(path=tmpdir)
         model = art.TrainableModel(
+            run_name=model_name,
             name=model_name,
             project="integration-tests",
             base_model=get_base_model(),
@@ -177,6 +179,7 @@ async def test_serverless_backend():
     model_name = f"test-multi-ckpt-serverless-{uuid.uuid4().hex[:8]}"
     backend = art.ServerlessBackend()
     model = art.TrainableModel(
+        run_name=model_name,
         name=model_name,
         project="integration-tests",
         base_model="meta-llama/Llama-3.1-8B-Instruct",

@@ -110,6 +110,7 @@ async def test_local_backend_vllm_contract() -> None:
     with tempfile.TemporaryDirectory() as tmpdir:
         backend = LocalBackend(path=tmpdir)
         model = art.TrainableModel(
+            run_name=model_name,
             name=model_name,
             project="integration-tests",
             base_model=get_base_model(),

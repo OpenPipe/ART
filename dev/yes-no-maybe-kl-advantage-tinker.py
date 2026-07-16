@@ -57,8 +57,10 @@ async def main():
     base_model = os.environ.get("BASE_MODEL", "meta-llama/Llama-3.1-8B-Instruct")
     kl_penalty_coef = float(os.environ.get("KL_PENALTY_COEF", "0.1"))
     random_suffix = "".join(random.choices(string.ascii_lowercase, k=4))
+    run_name = os.environ.get("MODEL_NAME", f"tinker-{random_suffix}-{kl_penalty_coef}")
     model = art.TrainableModel(
-        name=os.environ.get("MODEL_NAME", f"tinker-{random_suffix}-{kl_penalty_coef}"),
+        name=run_name,
+        run_name=run_name,
         project="yes-no-maybe",
         base_model=base_model,
     )

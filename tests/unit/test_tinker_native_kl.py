@@ -59,6 +59,7 @@ async def test_tinker_native_backend_rejects_current_learner_kl_source(
 ) -> None:
     backend = TinkerNativeBackend(tinker_api_key="test-key", path=str(tmp_path))
     model = TrainableModel(
+        run_name="tinker-native-kl-source",
         name="tinker-native-kl-source",
         project="pipeline-tests",
         base_model="test-model",

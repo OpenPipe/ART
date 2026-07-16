@@ -87,6 +87,7 @@ async def test_push_to_s3():
 
     backend = ServerlessBackend()
     model = art.TrainableModel(
+        run_name=model_name,
         name=model_name,
         project="integration-tests",
         base_model=BASE_MODEL,
@@ -125,11 +126,13 @@ async def test_fork_checkpoint_from_wandb():
 
     backend = ServerlessBackend()
     model_a = art.TrainableModel(
+        run_name=model_a_name,
         name=model_a_name,
         project="integration-tests",
         base_model=BASE_MODEL,
     )
     model_b = art.TrainableModel(
+        run_name=model_b_name,
         name=model_b_name,
         project="integration-tests",
         base_model=BASE_MODEL,
@@ -206,11 +209,13 @@ async def test_push_then_fork_from_s3():
 
     backend = ServerlessBackend()
     model_a = art.TrainableModel(
+        run_name=model_a_name,
         name=model_a_name,
         project="integration-tests",
         base_model=BASE_MODEL,
     )
     model_b = art.TrainableModel(
+        run_name=model_b_name,
         name=model_b_name,
         project="integration-tests",
         base_model=BASE_MODEL,

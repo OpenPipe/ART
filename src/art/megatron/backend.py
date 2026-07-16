@@ -36,7 +36,7 @@ class MegatronBackend(LocalBackend):
         self._requires_explicit_packed_sequence_length = True
         self._packed_sequence_length_requires_chunk_alignment = False
         self._supports_result_packing = True
-        self._resume_prepared_models: set[str] = set()
+        self._resume_prepared_models: set[tuple[str, str]] = set()
 
     async def register(self, model: Model) -> None:
         await super().register(model)
@@ -67,7 +67,8 @@ class MegatronBackend(LocalBackend):
         from ..dev.get_model_config import get_model_config
         from .service import MegatronService
 
-        if model.name not in self._services:
+        storage_key = self._model_storage_key(model)
+        if storage_key not in self._services:
             output_dir = get_model_dir(model=model, art_path=self._path)
             config = get_model_config(
                 base_model=model.base_model,
@@ -75,7 +76,7 @@ class MegatronBackend(LocalBackend):
                 config=model._internal_config,
                 lora_config=model.lora_config,
             )
-            self._services[model.name] = MegatronService(
+            self._services[storage_key] = MegatronService(
                 model_name=model.name,
                 base_model=model.base_model,
                 config=config,
@@ -83,16 +84,17 @@ class MegatronBackend(LocalBackend):
                 enable_expert_replay=self._enable_expert_replay,
             )
             if not self._in_process:
-                self._services[model.name] = move_to_child_process(
-                    self._services[model.name],
+                self._services[storage_key] = move_to_child_process(
+                    self._services[storage_key],
                     process_name="megatron-service",
                 )
-        return self._services[model.name]
+        return self._services[storage_key]
 
     async def _get_step(self, model: AnyTrainableModel) -> int:
         if not model.trainable:
             return 0
-        if model.name in self._resume_prepared_models:
+        storage_key = self._model_storage_key(model)
+        if storage_key in self._resume_prepared_models:
             return await super()._get_step(model)
         output_dir = get_model_dir(model=model, art_path=self._path)
         info = prepare_megatron_resume_state(
@@ -100,11 +102,11 @@ class MegatronBackend(LocalBackend):
             optimizer_state_path=optimizer_state_path(output_dir),
         )
         print(format_megatron_resume_message(info))
-        self._resume_prepared_models.add(model.name)
+        self._resume_prepared_models.add(storage_key)
         return await super()._get_step(model)
 
     async def finalize_training_session(self, model: AnyTrainableModel) -> None:
-        service = self._services.get(model.name)
+        service = self._services.get(self._model_storage_key(model))
         if service is not None:
             await cast(Any, service).finalize_training_session()
 

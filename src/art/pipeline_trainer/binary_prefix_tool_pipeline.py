@@ -148,7 +148,7 @@ def extract_guess(choice: Any) -> tuple[str | None, str]:
 
 
 def get_model_output_dir(model: art.TrainableModel) -> Path:
-    return Path(model.base_path) / model.project / "models" / model.name
+    return Path(model.base_path) / model.project / "models" / model.run_name
 
 
 def print_history_summary(model: art.TrainableModel, tail: int = 5) -> None:
@@ -219,6 +219,7 @@ async def main() -> None:
 
     backend = TinkerNativeBackend(path=art_path)
     model = art.TrainableModel(
+        run_name=model_name,
         name=model_name,
         project=project,
         base_model=base_model,

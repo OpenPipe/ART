@@ -14,6 +14,7 @@ random.seed(42)
 
 # Declare the model
 model = art.TrainableModel(
+    run_name="tutorial-001",
     name="tutorial-001",
     project="2048",
     base_model="Qwen/Qwen2.5-3B-Instruct",

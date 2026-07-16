@@ -48,6 +48,7 @@ async def main():
         random.choices("abcdefghijklmnopqrstuvwxyz0123456789", k=8)
     )
     model = art.TrainableModel(
+        run_name=model_name,
         name=model_name,
         project="sft-warmup",
         base_model="Qwen/Qwen2.5-7B-Instruct",

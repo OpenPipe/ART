@@ -94,7 +94,7 @@ class PipelineAutotunerAttachment:
             self.tuner = PipelineAutotuner(
                 config=self.config,
                 settings=settings,
-                model_name=trainer.model.name,
+                model_name=trainer.model.run_name,
                 backend_name=type(trainer.backend).__name__,
                 packed_sequence_length=packed_sequence_length,
                 target_packed_sequences=target_packed_sequences,

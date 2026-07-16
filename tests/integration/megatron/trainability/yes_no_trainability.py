@@ -966,8 +966,10 @@ async def run_yes_no_trainability_async(
             else False
         ),
     )
+    run_name = f"{variant.name}-{uuid.uuid4().hex[:8]}"
     model = art.TrainableModel(
-        name=f"{variant.name}-{uuid.uuid4().hex[:8]}",
+        name=run_name,
+        run_name=run_name,
         project="model-support-validation",
         base_model=base_model,
         _internal_config=internal_config,
@@ -983,7 +985,7 @@ async def run_yes_no_trainability_async(
         variant, backend_root=backend_root, extra_env=backend_env
     ) as backend:
         await model.register(backend)
-        output_dir = Path(model.base_path) / model.project / "models" / model.name
+        output_dir = Path(model.base_path) / model.project / "models" / model.run_name
         await _warmup_model(model, base_model=base_model, prompt=prompts[0])
         step0_name = model.get_inference_name(step=0)
         model_ids_before = await _list_model_ids(model)

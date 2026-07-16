@@ -307,15 +307,17 @@ class LocalBackend:
         os.makedirs(self._path, exist_ok=True)
 
         # Other initialization
-        self._services: dict[str, ModelService] = {}
-        self._adapter_leases: dict[str, AdapterLeaseManager] = {}
+        self._services: dict[tuple[str, str], ModelService] = {}
+        self._adapter_leases: dict[tuple[str, str], AdapterLeaseManager] = {}
         self._tokenizers: dict[tuple[str, str | None], PreTrainedTokenizerBase] = {}
         self._model_max_sequence_lengths: dict[
             tuple[str, str | None, str | None], int
         ] = {}
         self._grad_accumulation_sequences_by_service: dict[int, int] = {}
         self._provenance_update_tasks: set[asyncio.Task[None]] = set()
-        self._vllm_metric_snapshots: dict[str, tuple[float, dict[str, float]]] = {}
+        self._vllm_metric_snapshots: dict[
+            tuple[str, str], tuple[float, dict[str, float]]
+        ] = {}
         self._image_processors: dict[str, BaseImageProcessor | None] = {}
         self._requires_explicit_packed_sequence_length = False
         self._packed_sequence_length_requires_chunk_alignment = True
@@ -323,6 +325,10 @@ class LocalBackend:
         self._default_chat_template_tool_schema_format: ChatTemplateToolSchemaFormat = (
             "default"
         )
+
+    @staticmethod
+    def _model_storage_key(model: Model) -> tuple[str, str]:
+        return model.project, model._storage_name()
 
     def _model_uses_expert_replay(self, model: AnyTrainableModel) -> bool:
         if not self._enable_expert_replay or not self._supports_result_packing:
@@ -470,7 +476,8 @@ class LocalBackend:
                 metrics[f"vllm/{name}"] = value
 
         now = time.monotonic()
-        previous = self._vllm_metric_snapshots.get(model.name)
+        storage_key = self._model_storage_key(model)
+        previous = self._vllm_metric_snapshots.get(storage_key)
         if previous is not None:
             previous_time, previous_snapshot = previous
             elapsed = max(0.0, now - previous_time)
@@ -525,7 +532,7 @@ class LocalBackend:
                 ),
             )
 
-        self._vllm_metric_snapshots[model.name] = (
+        self._vllm_metric_snapshots[storage_key] = (
             now,
             {key: value for key, value in snapshot.items() if value is not None},
         )
@@ -760,7 +767,7 @@ class LocalBackend:
         if step is None and isinstance(model, TrainableModel):
             from ..dev.validate import is_dedicated_mode
 
-            service = self._services.get(model.name)
+            service = self._services.get(self._model_storage_key(model))
             if service is not None and is_dedicated_mode(
                 model._internal_config or dev.InternalModelConfig()
             ):
@@ -779,11 +786,12 @@ class LocalBackend:
         )
         return name
 
-    def _adapter_lease_manager(self, model_name: str) -> AdapterLeaseManager:
-        manager = self._adapter_leases.get(model_name)
+    def _adapter_lease_manager(self, model: Model) -> AdapterLeaseManager:
+        storage_key = self._model_storage_key(model)
+        manager = self._adapter_leases.get(storage_key)
         if manager is None:
             manager = AdapterLeaseManager()
-            self._adapter_leases[model_name] = manager
+            self._adapter_leases[storage_key] = manager
         return manager
 
     @asynccontextmanager
@@ -792,7 +800,7 @@ class LocalBackend:
         model: AnyTrainableModel,
         step: int,
     ) -> AsyncIterator[None]:
-        manager = self._adapter_lease_manager(model.name)
+        manager = self._adapter_lease_manager(model)
         in_flight_lora = (model._internal_config or {}).get(
             "rollout_weight_update_mode"
         ) == "in_flight_lora"
@@ -819,7 +827,7 @@ class LocalBackend:
             get_model_dir(model=model, art_path=self._path), step
         )
         inference_name = await service.acquire_exact_adapter(step, checkpoint_path)
-        manager = self._adapter_lease_manager(model.name)
+        manager = self._adapter_lease_manager(model)
         try:
             async with (
                 pin_inference_target(
@@ -839,7 +847,7 @@ class LocalBackend:
         model: AnyTrainableModel,
         step: int,
     ) -> AsyncIterator[None]:
-        manager = self._adapter_lease_manager(model.name)
+        manager = self._adapter_lease_manager(model)
         async with manager.lease(step):
             yield
 
@@ -849,10 +857,11 @@ class LocalBackend:
         *,
         retain_steps: set[int],
     ) -> None:
-        service = self._services.get(model.name)
+        storage_key = self._model_storage_key(model)
+        service = self._services.get(storage_key)
         if service is None:
             return
-        manager = self._adapter_leases.get(model.name)
+        manager = self._adapter_leases.get(storage_key)
         if manager is not None:
             retain_steps = set(retain_steps) | manager.active_steps()
         prune_loaded_adapters = getattr(service, "prune_loaded_adapters", None)
@@ -863,7 +872,8 @@ class LocalBackend:
         from ..dev.get_model_config import get_model_config
         from ..dev.validate import is_dedicated_mode, validate_dedicated_config
 
-        if model.name not in self._services:
+        storage_key = self._model_storage_key(model)
+        if storage_key not in self._services:
             config = get_model_config(
                 base_model=model.base_model,
                 output_dir=get_model_dir(model=model, art_path=self._path),
@@ -891,18 +901,18 @@ class LocalBackend:
                     str(g) for g in config["trainer_gpu_ids"]
                 )
 
-            self._services[model.name] = service_class(
+            self._services[storage_key] = service_class(
                 model_name=model.name,
                 base_model=model.base_model,
                 config=config,
                 output_dir=get_model_dir(model=model, art_path=self._path),
             )
             if not dedicated and not self._in_process:
-                self._services[model.name] = move_to_child_process(
-                    self._services[model.name],
+                self._services[storage_key] = move_to_child_process(
+                    self._services[storage_key],
                     process_name="tinker-service" if is_tinker else "model-service",
                 )
-        return self._services[model.name]
+        return self._services[storage_key]
 
     def _get_packed_tensors(
         self,
@@ -1808,7 +1818,7 @@ class LocalBackend:
                 )
 
                 s3_latest_step = await get_latest_checkpoint_step_from_s3(
-                    model_name=model.name,
+                    model_name=model._storage_name(),
                     project=model.project,
                     s3_bucket=s3_bucket,
                     prefix=prefix,
@@ -1817,7 +1827,8 @@ class LocalBackend:
             # Determine which source has the latest checkpoint
             if local_latest_step is None and s3_latest_step is None:
                 raise ValueError(
-                    f"No checkpoints found for {model.project}/{model.name} in local storage or S3"
+                    "No checkpoints found for "
+                    f"{model.project}/{model._storage_name()} in local storage or S3"
                 )
             elif local_latest_step is None:
                 assert s3_latest_step is not None
@@ -1858,7 +1869,7 @@ class LocalBackend:
             if verbose:
                 print(f"Pulling checkpoint step {resolved_step} from S3...")
             await pull_model_from_s3(
-                model_name=model.name,
+                model_name=model._storage_name(),
                 project=model.project,
                 step=resolved_step,
                 s3_bucket=s3_bucket,
@@ -1942,7 +1953,7 @@ class LocalBackend:
                 )
 
                 latest_step = await get_latest_checkpoint_step_from_s3(
-                    model_name=model.name,
+                    model_name=model._storage_name(),
                     project=model.project,
                     s3_bucket=s3_bucket,
                     prefix=prefix,
@@ -1963,7 +1974,7 @@ class LocalBackend:
                     print(f"Pulling specific checkpoint at step {step}")
 
         await pull_model_from_s3(
-            model_name=model.name,
+            model_name=model._storage_name(),
             project=model.project,
             step=step,
             s3_bucket=s3_bucket,
@@ -1985,7 +1996,7 @@ class LocalBackend:
     ) -> None:
         """Upload the model directory from local storage to S3."""
         await push_model_to_s3(
-            model_name=model.name,
+            model_name=model._storage_name(),
             project=model.project,
             s3_bucket=s3_bucket,
             prefix=prefix,
@@ -2028,7 +2039,7 @@ class LocalBackend:
         )
         dest_model_dir = get_output_dir_from_model_properties(
             project=model.project,
-            name=model.name,
+            name=model._storage_name(),
             art_path=self._path,
         )
 
@@ -2166,5 +2177,6 @@ class LocalBackend:
 
         if verbose:
             print(
-                f"Successfully forked checkpoint from {from_model} (step {selected_step}) to {model.name}"
+                "Successfully forked checkpoint from "
+                f"{from_model} (step {selected_step}) to {model._storage_name()}"
             )

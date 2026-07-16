@@ -238,8 +238,10 @@ async def main() -> None:
     backend = LocalBackend()
     base_model = os.environ.get("BASE_MODEL", "Qwen/Qwen3-30B-A3B-Instruct-2507")
     project = os.environ.get("PROJECT", "yes-no-maybe-metrics")
+    run_name = os.environ.get("MODEL_NAME", f"yes-no-maybe-metrics-{int(time.time())}")
     model = art.TrainableModel(
-        name=os.environ.get("MODEL_NAME", f"yes-no-maybe-metrics-{int(time.time())}"),
+        name=run_name,
+        run_name=run_name,
         project=project,
         base_model=base_model,
         report_metrics=["wandb"],

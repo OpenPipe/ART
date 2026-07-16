@@ -43,8 +43,10 @@ async def test_step_skipping():
 
         async with LocalBackend(path=art_path) as backend:
             # Create a test model
+            run_name = f"test-step-skip-{uuid.uuid4()}"
             model = TrainableModel(
-                name=f"test-step-skip-{uuid.uuid4()}",
+                name=run_name,
+                run_name=run_name,
                 project="test-project",
                 base_model="Qwen/Qwen2.5-0.5B-Instruct",  # Small model for testing
             )
