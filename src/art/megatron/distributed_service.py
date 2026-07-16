@@ -1142,19 +1142,21 @@ class DistributedMegatronService:
             }
             for replica_id in replica_ids
         )
-        async with httpx.AsyncClient(timeout=60.0) as client:
-            responses = await asyncio.gather(
-                *(
-                    client.post(
-                        f"{url}/art/lora_worker_state",
-                        json=payload,
-                        headers=_headers(
-                            api_key if api_key is not None else self._api_key()
-                        ),
+        timeout_s = self.runtime.topology.cluster.rpc_timeout_s
+        async with asyncio.timeout(timeout_s):
+            async with httpx.AsyncClient(timeout=timeout_s) as client:
+                responses = await asyncio.gather(
+                    *(
+                        client.post(
+                            f"{url}/art/lora_worker_state",
+                            json=payload,
+                            headers=_headers(
+                                api_key if api_key is not None else self._api_key()
+                            ),
+                        )
+                        for url, payload in zip(base_urls, payloads, strict=True)
                     )
-                    for url, payload in zip(base_urls, payloads, strict=True)
                 )
-            )
         for response in responses:
             response.raise_for_status()
 
