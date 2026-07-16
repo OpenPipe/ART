@@ -1768,7 +1768,8 @@ def _calculate_megatron_logprob_batch(
             microbatch_state.activate(
                 ScheduleMicrobatch(
                     0, sample_indices[0], prepared, prepared.attention_state
-                )
+                ),
+                chunk_index=0,
             )
             token_output = forward_token_losses(
                 model_chunks[0],
@@ -1798,7 +1799,6 @@ def _calculate_megatron_logprob_batch(
 
         def forward_step_func(data_iterator: Any, model: MegatronModule, *_args: Any):
             item = next(data_iterator)
-            schedule.activate(item)
             token_output = _forward_prepared_rl_micro(
                 model_chunks=model_chunks,
                 model_chunk=model,
@@ -2115,7 +2115,6 @@ def run_megatron_sft_step(
     def forward_step_func(data_iterator: Any, model: MegatronModule, *_args: Any):
         item = next(data_iterator)
         prepared = item.payload
-        schedule.activate(item)
         kwargs = dict(
             input_ids=prepared.input_ids if chunk_pre_process(model) else None,
             position_ids=prepared.position_ids,
@@ -2149,6 +2148,8 @@ def run_megatron_sft_step(
         return output, reduce_loss
 
     forward_data_store = schedule.run(forward_step_func, forward_only=False)
+    if moe_routing_replay_controller is not None:
+        moe_routing_replay_controller.finalize_step(expect_recompute=True)
     forward_data_store = cast(
         list[dict[str, Any]], _broadcast_from_pipeline_last(forward_data_store)
     )
@@ -2169,9 +2170,6 @@ def run_megatron_sft_step(
         op=torch.distributed.ReduceOp.SUM,  # ty: ignore[possibly-missing-attribute]
         group=ps.get_data_parallel_group(with_context_parallel=True),
     )
-
-    if moe_routing_replay_controller is not None:
-        moe_routing_replay_controller.finalize_step()
 
     return TrainStepResult(
         reduced_loss=reduced_loss,
@@ -2294,7 +2292,6 @@ def run_training_step(
     def forward_step_func(data_iterator: Any, model: MegatronModule, *_args: Any):
         item = next(data_iterator)
         prepared = item.payload
-        schedule.activate(item)
         token_output = _forward_prepared_rl_micro(
             model_chunks=model_chunks,
             model_chunk=model,
@@ -2347,6 +2344,8 @@ def run_training_step(
         return token_output.token_losses, reduce_loss
 
     forward_data_store = schedule.run(forward_step_func, forward_only=False)
+    if moe_routing_replay_controller is not None:
+        moe_routing_replay_controller.finalize_step(expect_recompute=True)
     pipeline_results = cast(
         list[dict[str, Any]],
         _broadcast_from_pipeline_last(forward_data_store),
@@ -2396,9 +2395,6 @@ def run_training_step(
         op=torch.distributed.ReduceOp.SUM,  # ty: ignore[possibly-missing-attribute]
         group=ps.get_data_parallel_group(with_context_parallel=True),
     )
-
-    if moe_routing_replay_controller is not None:
-        moe_routing_replay_controller.finalize_step()
 
     return TrainStepResult(
         reduced_loss=reduced_loss,

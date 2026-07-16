@@ -80,10 +80,14 @@ class PipelineMicrobatchState(Generic[_T]):
     def enabled(self) -> bool:
         return self._controller is not None or self._hybridep_token_counts is not None
 
-    def activate(self, item: ScheduleMicrobatch[_T]) -> None:
+    def activate(self, item: ScheduleMicrobatch[_T], chunk_index: int) -> None:
         prepared = item.payload
         if self._controller is not None:
-            self._controller.begin_micro(item.sample_index, item.order)
+            self._controller.begin_micro(
+                item.sample_index,
+                item.order,
+                chunk_index=chunk_index,
+            )
             prepare_replay_local_input_token_uids(
                 self._controller,
                 prepared.local_token_uids,
@@ -494,7 +498,7 @@ class MCoreScheduleAdapter(Generic[_T]):
             hybridep_token_counts=hybridep_token_counts,
             microbatch_count=len(self.microbatches),
         )
-        self._active_recompute_state_id: int | None = None
+        self._active_activation_key: tuple[int, int] | None = None
         self.micro_batch_size, self.seq_length = validate_fixed_microbatch_shapes(
             [(int(value.shape[0]), int(value.shape[1])) for value in model_inputs]
         )
@@ -587,15 +591,14 @@ class MCoreScheduleAdapter(Generic[_T]):
                 # PyTorch 2.11 does not need MCore's legacy batch-P2P device sync.
                 config.batch_p2p_sync = False
 
-    def activate(self, microbatch: ScheduleMicrobatch[_T]) -> None:
+    def activate(self, microbatch: ScheduleMicrobatch[_T], chunk_index: int) -> None:
         if not self._microbatch_state.enabled:
             return
-        state = microbatch.recompute_state
-        state_id = id(microbatch if state is None else state)
-        if state_id == self._active_recompute_state_id:
+        activation_key = (microbatch.order, chunk_index)
+        if activation_key == self._active_activation_key:
             return
-        self._microbatch_state.activate(microbatch)
-        self._active_recompute_state_id = state_id
+        self._microbatch_state.activate(microbatch, chunk_index)
+        self._active_activation_key = activation_key
 
     @contextmanager
     def _recompute_activation_hooks(self, *, enabled: bool) -> Iterator[None]:
@@ -624,16 +627,39 @@ class MCoreScheduleAdapter(Generic[_T]):
                 )
 
         def restore(
-            _module: Any, args: tuple[Any, ...], kwargs: dict[str, Any]
+            _module: Any,
+            args: tuple[Any, ...],
+            kwargs: dict[str, Any],
+            *,
+            chunk_index: int,
         ) -> None:
             microbatch = _find_bound_microbatch(by_state_id, (*args, kwargs))
-            self.activate(microbatch)
+            self.activate(microbatch, chunk_index)
 
-        restore = torch.compiler.disable(restore)
-        handles = [
-            layer.register_forward_pre_hook(restore, with_kwargs=True)
-            for layer in _transformer_layer_callers(self.model_chunks)
-        ]
+        handles = []
+        for chunk_index, chunk in enumerate(self.model_chunks):
+            for layer in _transformer_layer_callers([chunk]):
+
+                def restore_chunk(
+                    module: Any,
+                    args: tuple[Any, ...],
+                    kwargs: dict[str, Any],
+                    *,
+                    _chunk_index: int = chunk_index,
+                ) -> None:
+                    restore(
+                        module,
+                        args,
+                        kwargs,
+                        chunk_index=_chunk_index,
+                    )
+
+                handles.append(
+                    layer.register_forward_pre_hook(
+                        torch.compiler.disable(restore_chunk),
+                        with_kwargs=True,
+                    )
+                )
         if not handles:
             raise RuntimeError(
                 "Stateful PP recomputation could not find TransformerLayer call sites"
@@ -645,7 +671,14 @@ class MCoreScheduleAdapter(Generic[_T]):
                 handle.remove()
 
     def independent_iterators(self) -> list[Iterator[ScheduleMicrobatch[_T]]]:
-        return [iter(self.microbatches) for _ in self.model_chunks]
+        def activate(
+            chunk_index: int,
+        ) -> Iterator[ScheduleMicrobatch[_T]]:
+            for microbatch in self.microbatches:
+                self.activate(microbatch, chunk_index)
+                yield microbatch
+
+        return [activate(index) for index in range(len(self.model_chunks))]
 
     @contextmanager
     def _telemetry_timer_context(self) -> Iterator[None]:
@@ -705,7 +738,7 @@ class MCoreScheduleAdapter(Generic[_T]):
             )
             pg_collection = _process_group_collection()
         start = time.perf_counter()
-        self._active_recompute_state_id = None
+        self._active_activation_key = None
         if torch.cuda.is_available():
             torch.cuda.reset_peak_memory_stats()
             self.telemetry.memory_allocated_start_bytes = int(

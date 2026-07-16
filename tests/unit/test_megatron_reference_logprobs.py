@@ -118,7 +118,10 @@ class _ReplayController:
     ) -> None:
         self.events.append(("set_step", step_index, sample_index))
 
-    def begin_micro(self, sample_index: int, micro_order: int) -> None:
+    def begin_micro(
+        self, sample_index: int, micro_order: int, *, chunk_index: int
+    ) -> None:
+        assert chunk_index == 0
         self.events.append(("begin_micro", micro_order, sample_index))
 
     def finalize_step(self) -> None:
