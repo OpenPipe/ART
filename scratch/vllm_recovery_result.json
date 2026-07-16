@@ -1,0 +1,180 @@
+{
+  "before": {
+    "id": "chatcmpl-b2044e451c289f52",
+    "object": "chat.completion",
+    "created": 1784156565,
+    "model": "glm52-vllm-recovery@0",
+    "choices": [
+      {
+        "index": 0,
+        "message": {
+          "role": "assistant",
+          "content": "\u4ecd\u5728",
+          "refusal": null,
+          "annotations": null,
+          "audio": null,
+          "function_call": null,
+          "tool_calls": [],
+          "reasoning": null
+        },
+        "logprobs": {
+          "content": [
+            {
+              "token": "token_id:109159",
+              "logprob": -5.855081081390381,
+              "bytes": [
+                228,
+                187,
+                141,
+                229,
+                156,
+                168
+              ],
+              "top_logprobs": []
+            }
+          ]
+        },
+        "finish_reason": "length",
+        "stop_reason": null,
+        "token_ids": [
+          109159
+        ],
+        "routed_experts": null,
+        "policy_token_spans": [
+          {
+            "start_token": 0,
+            "end_token": 1,
+            "policy_version": 0,
+            "lora_slot": "glm52-vllm-recovery@0",
+            "update_seq": 1
+          }
+        ]
+      }
+    ],
+    "service_tier": null,
+    "system_fingerprint": "vllm-0.23.0-tp4-pp2-ep-9cac0e2a",
+    "usage": {
+      "prompt_tokens": 16,
+      "total_tokens": 17,
+      "completion_tokens": 1,
+      "prompt_tokens_details": null
+    },
+    "prompt_logprobs": null,
+    "prompt_token_ids": [
+      154822,
+      154824,
+      154826,
+      25062,
+      287,
+      29905,
+      371,
+      25,
+      7487,
+      154827,
+      5598,
+      825,
+      3950,
+      13,
+      154828,
+      154841
+    ],
+    "prompt_text": null,
+    "kv_transfer_params": null
+  },
+  "after": {
+    "id": "chatcmpl-8873cf896b561fbf",
+    "object": "chat.completion",
+    "created": 1784156867,
+    "model": "glm52-vllm-recovery@0",
+    "choices": [
+      {
+        "index": 0,
+        "message": {
+          "role": "assistant",
+          "content": "\u4ecd\u5728",
+          "refusal": null,
+          "annotations": null,
+          "audio": null,
+          "function_call": null,
+          "tool_calls": [],
+          "reasoning": null
+        },
+        "logprobs": {
+          "content": [
+            {
+              "token": "token_id:109159",
+              "logprob": -6.167847156524658,
+              "bytes": [
+                228,
+                187,
+                141,
+                229,
+                156,
+                168
+              ],
+              "top_logprobs": []
+            }
+          ]
+        },
+        "finish_reason": "length",
+        "stop_reason": null,
+        "token_ids": [
+          109159
+        ],
+        "routed_experts": null,
+        "policy_token_spans": [
+          {
+            "start_token": 0,
+            "end_token": 1,
+            "policy_version": 0,
+            "lora_slot": "glm52-vllm-recovery@0",
+            "update_seq": 1
+          }
+        ]
+      }
+    ],
+    "service_tier": null,
+    "system_fingerprint": "vllm-0.23.0-tp4-pp2-ep-9cac0e2a",
+    "usage": {
+      "prompt_tokens": 16,
+      "total_tokens": 17,
+      "completion_tokens": 1,
+      "prompt_tokens_details": null
+    },
+    "prompt_logprobs": null,
+    "prompt_token_ids": [
+      154822,
+      154824,
+      154826,
+      25062,
+      287,
+      29905,
+      371,
+      25,
+      7487,
+      154827,
+      5598,
+      825,
+      3950,
+      13,
+      154828,
+      154841
+    ],
+    "prompt_text": null,
+    "kv_transfer_params": null
+  },
+  "initial_generation": 0,
+  "recovered_generation": 1,
+  "state": {
+    "runtime": "art_vllm",
+    "protocol_version": 2,
+    "process_uuid": "c6c26a6649a84087a1a0eeed294d9325",
+    "generation": 1,
+    "node_rank": 0,
+    "nnodes": 2,
+    "headless": false,
+    "loaded_adapter": "glm52-vllm-recovery@0",
+    "policy_version": 0,
+    "update_identity": null
+  }
+}
