@@ -4,6 +4,7 @@ from collections.abc import AsyncIterator, Iterator
 from contextlib import contextmanager
 from contextvars import ContextVar
 from functools import wraps
+import os
 import struct
 from typing import Any
 
@@ -12,6 +13,8 @@ import numpy as np
 MAGIC = b"ARTRTE1\0"
 HEADER = struct.Struct("<8sQI")
 ROUTE_HEADER = struct.Struct("<IB3xQQQ")
+PIPELINE_ROUTES_ENV = "ART_VLLM_PIPELINE_ROUTES_PROTOCOL"
+PIPELINE_ROUTES_PROTOCOL = "1"
 _CAPTURE: ContextVar[dict[int, np.ndarray] | None] = ContextVar(
     "art_binary_routed_experts", default=None
 )
@@ -99,10 +102,11 @@ def patch_pipeline_routed_experts() -> None:
     if getattr(original_execute, "__art_pipeline_routes_patched__", False):
         return
     original_sample = GPUModelRunner.sample_tokens
+    enabled = os.environ.get(PIPELINE_ROUTES_ENV) == PIPELINE_ROUTES_PROTOCOL
 
     @wraps(original_execute)
     def execute(self: Any, scheduler_output: Any, *args: Any, **kwargs: Any) -> Any:
-        if self.routed_experts_initialized:
+        if enabled:
             self._art_pipeline_route_tokens = int(
                 scheduler_output.total_num_scheduled_tokens
             )
@@ -110,15 +114,51 @@ def patch_pipeline_routed_experts() -> None:
 
     @wraps(original_sample)
     def sample(self: Any, *args: Any, **kwargs: Any) -> Any:
+        if not enabled:
+            return original_sample(self, *args, **kwargs)
         num_tokens = int(getattr(self, "_art_pipeline_route_tokens", 0))
         self._art_pipeline_route_tokens = 0
         pp = get_pp_group()
-        if (
-            num_tokens
-            and self.routed_experts_initialized
-            and pp.world_size > 1
-            and get_tp_group().rank_in_group == 0
-        ):
+        if pp.world_size <= 1:
+            raise RuntimeError("pipeline route capture requires PP > 1")
+        if get_tp_group().rank_in_group == 0:
+            if not getattr(self, "_art_pipeline_routes_ready", False):
+                initialized = bool(self.routed_experts_initialized)
+                buffer = (
+                    self.routed_experts_capturer.get_device_buffer()
+                    if initialized
+                    else None
+                )
+                local = torch.tensor(
+                    [
+                        int(PIPELINE_ROUTES_PROTOCOL),
+                        int(initialized),
+                        buffer.ndim if buffer is not None else 0,
+                        buffer.shape[0] if buffer is not None else 0,
+                        buffer.shape[1] if buffer is not None else 0,
+                        buffer.shape[2] if buffer is not None else 0,
+                        int(buffer is not None and buffer.dtype == torch.int32),
+                    ],
+                    dtype=torch.int64,
+                    device=buffer.device if buffer is not None else self.device,
+                )
+                states = [torch.empty_like(local) for _ in range(pp.world_size)]
+                torch.distributed.all_gather(states, local, group=pp.device_group)
+                values = [state.tolist() for state in states]
+                if any(value != values[0] for value in values[1:]):
+                    raise RuntimeError(
+                        f"pipeline routed-expert workers disagree: {values}"
+                    )
+                if (
+                    values[0][1] != 1
+                    or values[0][2] != 3
+                    or min(values[0][3:6]) <= 0
+                    or values[0][6] != 1
+                ):
+                    raise RuntimeError(
+                        f"pipeline routed-expert capturer is invalid: {values}"
+                    )
+                self._art_pipeline_routes_ready = True
             routes = self.routed_experts_capturer.get_device_buffer()[:num_tokens]
             torch.distributed.reduce(
                 routes,
@@ -145,7 +185,8 @@ def patch_pipeline_routed_experts_validation() -> None:
     def post_init(self: Any) -> None:
         model = self.model_config
         pipeline_capture = (
-            model is not None
+            os.environ.get(PIPELINE_ROUTES_ENV) == PIPELINE_ROUTES_PROTOCOL
+            and model is not None
             and model.enable_return_routed_experts
             and self.parallel_config.pipeline_parallel_size > 1
         )

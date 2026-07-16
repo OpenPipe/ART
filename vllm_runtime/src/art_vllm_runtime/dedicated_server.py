@@ -10,6 +10,10 @@ import uuid
 
 from pydantic import BaseModel, Field
 
+from art_vllm_runtime.binary_routes import (
+    PIPELINE_ROUTES_ENV,
+    PIPELINE_ROUTES_PROTOCOL,
+)
 from art_vllm_runtime.patches import apply_vllm_runtime_patches
 
 ART_SERVING_PROTOCOL_VERSION = 2
@@ -376,7 +380,11 @@ def _patch_engine_config(
     hash_block_size: int | None,
     pipeline_route_capture: bool,
 ) -> None:
-    create_engine_config = engine_args_type.create_engine_config
+    current = engine_args_type.create_engine_config
+    create_engine_config = getattr(current, "__art_original__", current)
+    if hash_block_size is None and not pipeline_route_capture:
+        setattr(engine_args_type, "create_engine_config", create_engine_config)
+        return
 
     def create(self: Any, *args: Any, **kwargs: Any) -> Any:
         config = create_engine_config(self, *args, **kwargs)
@@ -384,14 +392,32 @@ def _patch_engine_config(
             config.cache_config.hash_block_size = hash_block_size
         if pipeline_route_capture:
             config.model_config.enable_return_routed_experts = True
-            transfer = config.kv_transfer_config
-            if transfer is not None and transfer.is_kv_transfer_instance:
-                raise ValueError(
-                    "pipeline routed-expert capture is incompatible with KV connectors"
-                )
+            _validate_pipeline_route_config(config)
         return config
 
+    create.__art_original__ = create_engine_config  # type: ignore[attr-defined]
     setattr(engine_args_type, "create_engine_config", create)
+
+
+def _validate_pipeline_route_config(config: Any) -> None:
+    parallel = config.parallel_config
+    if (
+        parallel.pipeline_parallel_size <= 1
+        or parallel.distributed_executor_backend != "mp"
+        or parallel.data_parallel_size != 1
+        or parallel.prefill_context_parallel_size != 1
+        or parallel.decode_context_parallel_size != 1
+        or config.use_v2_model_runner
+    ):
+        raise ValueError(
+            "pipeline routed-expert capture requires V1 mp execution, PP > 1, "
+            "DP = 1, and prefill/decode CP = 1"
+        )
+    transfer = config.kv_transfer_config
+    if transfer is not None and transfer.is_kv_transfer_instance:
+        raise ValueError(
+            "pipeline routed-expert capture is incompatible with KV connectors"
+        )
 
 
 def main(argv: list[str] | None = None) -> None:
@@ -401,9 +427,27 @@ def main(argv: list[str] | None = None) -> None:
     engine_args = json.loads(args.engine_args_json)
     server_args = json.loads(args.server_args_json)
     hash_block_size = _take_hash_block_size(engine_args)
-    pipeline_route_capture = bool(engine_args.get("enable_return_routed_experts")) and (
-        int(engine_args.get("pipeline_parallel_size", 1)) > 1
-    )
+    route_capture = engine_args.get("enable_return_routed_experts", False)
+    pp_size = engine_args.get("pipeline_parallel_size", 1)
+    if not isinstance(route_capture, bool):
+        raise ValueError("enable_return_routed_experts must be a boolean")
+    if isinstance(pp_size, bool) or not isinstance(pp_size, int):
+        raise ValueError("pipeline_parallel_size must be an integer")
+    critical_engine_args = {
+        "data_parallel_size",
+        "decode_context_parallel_size",
+        "distributed_executor_backend",
+        "enable_return_routed_experts",
+        "kv_transfer_config",
+        "pipeline_parallel_size",
+        "prefill_context_parallel_size",
+    }
+    misplaced = critical_engine_args.intersection(server_args)
+    if misplaced:
+        raise ValueError(
+            f"engine arguments passed as server arguments: {sorted(misplaced)}"
+        )
+    pipeline_route_capture = route_capture and pp_size > 1
     if pipeline_route_capture:
         engine_args["enable_return_routed_experts"] = False
         if os.environ.get("VLLM_USE_V2_MODEL_RUNNER", "0").lower() not in {
@@ -412,6 +456,9 @@ def main(argv: list[str] | None = None) -> None:
         }:
             raise ValueError("pipeline routed-expert capture requires vLLM V1")
         os.environ["VLLM_USE_V2_MODEL_RUNNER"] = "0"
+        os.environ[PIPELINE_ROUTES_ENV] = PIPELINE_ROUTES_PROTOCOL
+    else:
+        os.environ.pop(PIPELINE_ROUTES_ENV, None)
 
     from art_vllm_runtime.lora_state import (
         ART_LORA_WORKER_EXTENSION,
