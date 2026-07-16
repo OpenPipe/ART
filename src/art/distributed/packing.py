@@ -1,11 +1,16 @@
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, Literal
 
+import numpy as np
 from openai.types.chat.chat_completion import Choice
 from pydantic import BaseModel, ConfigDict, Field
 
 from art.pipeline_tuner.config import PackedGroupShape
+from art.preprocessing.moe_routing import (
+    ART_MOE_ROUTING_METADATA_KEY,
+    ROUTED_EXPERTS_KEY,
+)
 from art.trajectories import (
     MetadataValue,
     PydanticException,
@@ -17,17 +22,74 @@ from .data_plane import PackedBatchRef
 from .rollout import RolloutModelSpec
 
 
+class _ChoiceRoutingPayload(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    metadata: dict[str, Any]
+    dtype: Literal["uint8", "uint16"]
+    shape: tuple[int, int, int]
+    data: bytes
+
+    @classmethod
+    def from_metadata(cls, metadata: dict[str, Any]) -> "_ChoiceRoutingPayload":
+        routes = metadata[ROUTED_EXPERTS_KEY]
+        if not isinstance(routes, np.ndarray) or routes.dtype not in {
+            np.dtype(np.uint8),
+            np.dtype(np.uint16),
+        }:
+            raise RuntimeError("routed experts must be a uint8 or uint16 array")
+        if routes.ndim != 3:
+            raise RuntimeError(f"routed experts must have rank 3, got {routes.shape}")
+        dtype: Literal["uint8", "uint16"] = (
+            "uint8" if routes.dtype == np.dtype(np.uint8) else "uint16"
+        )
+        return cls(
+            metadata={
+                key: value
+                for key, value in metadata.items()
+                if key != ROUTED_EXPERTS_KEY
+            },
+            dtype=dtype,
+            shape=routes.shape,
+            data=routes.tobytes(),
+        )
+
+    def build(self) -> dict[str, Any]:
+        routes = np.frombuffer(self.data, dtype=self.dtype).reshape(self.shape)
+        return {**self.metadata, ROUTED_EXPERTS_KEY: routes}
+
+
 class TrajectoryPayload(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
     payload: dict[str, Any]
     choice_positions: tuple[int, ...] = ()
     additional_history_choice_positions: tuple[tuple[int, ...], ...] = ()
+    choice_routing_metadata: dict[int, _ChoiceRoutingPayload] = Field(
+        default_factory=dict
+    )
+    additional_history_choice_routing_metadata: tuple[
+        dict[int, _ChoiceRoutingPayload], ...
+    ] = ()
 
     @classmethod
     def from_trajectory(cls, trajectory: Trajectory) -> "TrajectoryPayload":
+        choice_routing = _choice_routing_metadata(trajectory.messages_and_choices)
+        history_routing = tuple(
+            _choice_routing_metadata(history.messages_and_choices)
+            for history in trajectory.additional_histories
+        )
+        exclude: dict[str, Any] = {
+            "messages_and_choices": _routing_exclude(choice_routing),
+            "additional_histories": {
+                index: {
+                    "messages_and_choices": _routing_exclude(routing),
+                }
+                for index, routing in enumerate(history_routing)
+            },
+        }
         return cls(
-            payload=trajectory.model_dump(mode="json"),
+            payload=trajectory.model_dump(mode="json", exclude=exclude),
             choice_positions=tuple(
                 index
                 for index, item in enumerate(trajectory.messages_and_choices)
@@ -41,24 +103,58 @@ class TrajectoryPayload(BaseModel):
                 )
                 for history in trajectory.additional_histories
             ),
+            choice_routing_metadata=choice_routing,
+            additional_history_choice_routing_metadata=history_routing,
         )
 
     def build(self) -> Trajectory:
         payload = dict(self.payload)
         messages = list(payload["messages_and_choices"])
         for index in self.choice_positions:
-            messages[index] = Choice.model_validate(messages[index])
+            messages[index] = _build_choice(
+                messages[index], self.choice_routing_metadata.get(index)
+            )
         payload["messages_and_choices"] = messages
         histories = [dict(history) for history in payload["additional_histories"]]
-        for history, positions in zip(
-            histories, self.additional_history_choice_positions, strict=True
+        for history, positions, routing in zip(
+            histories,
+            self.additional_history_choice_positions,
+            self.additional_history_choice_routing_metadata,
+            strict=True,
         ):
             messages = list(history["messages_and_choices"])
             for index in positions:
-                messages[index] = Choice.model_validate(messages[index])
+                messages[index] = _build_choice(messages[index], routing.get(index))
             history["messages_and_choices"] = messages
         payload["additional_histories"] = histories
         return Trajectory.model_validate(payload)
+
+
+def _choice_routing_metadata(items: list[Any]) -> dict[int, _ChoiceRoutingPayload]:
+    return {
+        index: _ChoiceRoutingPayload.from_metadata(metadata)
+        for index, item in enumerate(items)
+        if isinstance(item, Choice)
+        and isinstance(
+            metadata := (item.model_extra or {}).get(ART_MOE_ROUTING_METADATA_KEY),
+            dict,
+        )
+    }
+
+
+def _routing_exclude(
+    routing: dict[int, _ChoiceRoutingPayload],
+) -> dict[int, set[str]]:
+    return {index: {ART_MOE_ROUTING_METADATA_KEY} for index in routing}
+
+
+def _build_choice(payload: Any, routing: _ChoiceRoutingPayload | None) -> Choice:
+    choice = Choice.model_validate(payload)
+    if routing is not None:
+        if choice.model_extra is None:
+            raise RuntimeError("OpenAI Choice.model_extra is unavailable")
+        choice.model_extra[ART_MOE_ROUTING_METADATA_KEY] = routing.build()
+    return choice
 
 
 class TrajectoryGroupPayload(BaseModel):
