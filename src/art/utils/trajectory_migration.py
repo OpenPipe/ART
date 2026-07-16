@@ -38,15 +38,14 @@ def serialize_trajectory_groups(trajectory_groups: list[TrajectoryGroup]) -> str
 
 
 def trajectory_group_to_dict(trajectory_group: TrajectoryGroup) -> dict[str, Any]:
-    trajectory_dicts = []
-    for trajectory in trajectory_group.trajectories:
-        if not isinstance(trajectory, Trajectory):
-            # remove exceptions
-            continue
-        trajectory_dicts.append(trajectory_to_dict(trajectory))
-
     return {
-        "trajectories": trajectory_dicts,
+        "trajectories": [
+            trajectory_to_dict(trajectory)
+            for trajectory in trajectory_group.trajectories
+        ],
+        **trajectory_group.model_dump(
+            mode="json", exclude={"trajectories"}, warnings="error"
+        ),
     }
 
 
@@ -76,6 +75,20 @@ def trajectory_to_dict(trajectory: Trajectory) -> dict[str, Any]:
             else trajectory.additional_histories
         ),
         "logs": trajectory.logs,
+        **trajectory.model_dump(
+            mode="json",
+            exclude={
+                "reward",
+                "metrics",
+                "metadata",
+                "messages_and_choices",
+                "tools",
+                "additional_histories",
+                "logs",
+            },
+            exclude_computed_fields=True,
+            warnings="error",
+        ),
     }
 
 
@@ -84,12 +97,8 @@ def message_or_choice_to_dict(message_or_choice: MessageOrChoice) -> dict[str, A
     item_dict = (
         message_or_choice.to_dict()
         if isinstance(message_or_choice, Choice)
-        else message_or_choice
+        else dict(message_or_choice)
     )
-
-    if "logprobs" in item_dict:
-        # item is a choice with logprobs, remove the logprobs
-        item_dict.pop("logprobs")  # ty:ignore[invalid-argument-type]
 
     if "content" in item_dict and isinstance(item_dict["content"], Iterator):
         item_dict["content"] = list(item_dict["content"])  # type: ignore
@@ -123,6 +132,22 @@ def dict_to_trajectory_group(d: dict[str, Any]) -> TrajectoryGroup:
 
 def dict_to_trajectory(d: dict[str, Any]) -> Trajectory:
     return Trajectory.model_validate(
+        {
+            **d,
+            "messages_and_choices": [
+                dict_to_message_or_choice(message_or_choice)
+                for message_or_choice in d.get("messages_and_choices", [])
+            ],
+            "additional_histories": [
+                dict_to_history(history)
+                for history in d.get("additional_histories", [])
+            ],
+        }
+    )
+
+
+def dict_to_history(d: dict[str, Any]) -> History:
+    return History.model_validate(
         {
             **d,
             "messages_and_choices": [

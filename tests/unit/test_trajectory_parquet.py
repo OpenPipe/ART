@@ -256,6 +256,72 @@ def test_legacy_choice_serialization_omits_unset_fields() -> None:
     }
 
 
+def test_legacy_serializer_round_trips_complete_exchange_group() -> None:
+    original = TrajectoryGroup(
+        [_exchange_trajectory()],
+        exceptions=[RuntimeError("captured failure")],
+        metadata={"scenario": {"id": 7}},
+        metrics={"pass_rate": 0.5},
+        logs=["group log"],
+    )
+
+    [loaded] = deserialize_trajectory_groups(serialize_trajectory_groups([original]))
+
+    assert loaded.model_dump(
+        mode="json", exclude_defaults=False
+    ) == original.model_dump(mode="json", exclude_defaults=False)
+
+
+def test_legacy_serializer_round_trips_complete_legacy_trajectory() -> None:
+    choice = Choice.model_validate(
+        {
+            "index": 7,
+            "finish_reason": "stop",
+            "message": {"role": "assistant", "content": "preserved"},
+            "logprobs": {
+                "content": [
+                    {
+                        "token": "preserved",
+                        "logprob": -0.25,
+                        "bytes": None,
+                        "top_logprobs": [],
+                        "token_id": 42,
+                    }
+                ]
+            },
+        }
+    )
+    original = TrajectoryGroup(
+        [
+            Trajectory(
+                messages_and_choices=[choice],
+                additional_histories=[History(messages_and_choices=[choice])],
+                reward=1.0,
+                initial_policy_version=3,
+                final_policy_version=4,
+                metrics={"score": 1},
+                metadata={"source": "legacy"},
+                logs=["trajectory log"],
+            )
+        ]
+    )
+
+    [loaded] = deserialize_trajectory_groups(serialize_trajectory_groups([original]))
+    loaded_choice = loaded.trajectories[0].messages_and_choices[0]
+    loaded_history_choice = (
+        loaded.trajectories[0].additional_histories[0].messages_and_choices[0]
+    )
+
+    assert loaded.model_dump(
+        mode="json", exclude_defaults=False
+    ) == original.model_dump(mode="json", exclude_defaults=False)
+    assert isinstance(loaded_choice, Choice)
+    assert loaded_choice.index == 7
+    assert loaded_choice.logprobs == choice.logprobs
+    assert isinstance(loaded_history_choice, Choice)
+    assert loaded_history_choice.logprobs == choice.logprobs
+
+
 def _ensure_message(item: MessageOrChoice) -> ChatCompletionMessageParam:
     """Narrow a trajectory entry to a concrete message (not a Choice)."""
     assert not isinstance(item, Choice)
