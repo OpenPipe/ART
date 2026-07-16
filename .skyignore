@@ -12,6 +12,6 @@ docs/node_modules/
 dist/
 dev/art-e/data/
 replays/
-trajectories/
+/trajectories/
 .DS_Store
 # .local/
