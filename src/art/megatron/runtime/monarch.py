@@ -320,6 +320,10 @@ class MonarchTrainerActor(Actor):
     @endpoint
     def close(self) -> None:
         self._executor.close()
+        import torch
+
+        if torch.distributed.is_initialized():
+            torch.distributed.destroy_process_group()
 
     @endpoint
     def advance_without_training(
