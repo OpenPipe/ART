@@ -9,6 +9,7 @@ DEFAULT_TRAINING_LOG_PATH = "/tmp/megatron_training_log.jsonl"
 DEFAULT_JOBS_DIR = "/tmp/megatron_training_jobs"
 DEFAULT_VLLM_WAKE_LOCK_PATH = "/tmp/megatron_vllm_waking"
 LORA_READY_EVENT = "lora_ready"
+OPTIMIZER_READY_EVENT = "optimizer_ready"
 
 
 class MergedWeightTransferInitInfo(BaseModel):
@@ -62,7 +63,6 @@ class MegatronOptimizerSaveJob(BaseModel):
     kind: Literal["save_optimizer"] = "save_optimizer"
     step: int = Field(ge=0)
     training_session_id: str
-    training_mode: Literal["rl", "sft"]
     optimizer_state_path: str
     log_path: str = DEFAULT_TRAINING_LOG_PATH
 

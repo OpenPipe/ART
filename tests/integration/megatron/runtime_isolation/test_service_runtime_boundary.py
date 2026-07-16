@@ -10,7 +10,14 @@ import httpx
 import pytest
 
 import art
-from art.megatron.runtime.jobs import MegatronOptimizerSaveJob
+from art.megatron.optimizer_state import (
+    optimizer_generation_files,
+    read_optimizer_commit,
+)
+from art.megatron.runtime.jobs import (
+    OPTIMIZER_READY_EVENT,
+    MegatronOptimizerSaveJob,
+)
 from art.megatron.service import MegatronService
 from art.serving_capabilities import ServingCapabilities
 
@@ -192,6 +199,10 @@ async def test_clean_training_finalization_submits_latest_optimizer_save(
     )
     service._latest_step = 4
     service._megatron_process = cast(Any, object())
+    (tmp_path / "checkpoints" / "0004").mkdir(parents=True)
+    optimizer_dir = tmp_path / "optimizer_states"
+    optimizer_dir.mkdir()
+    (optimizer_dir / optimizer_generation_files(4, 1)[0]).write_bytes(b"state")
     written: list[MegatronOptimizerSaveJob] = []
 
     monkeypatch.setattr(
@@ -208,8 +219,7 @@ async def test_clean_training_finalization_submits_latest_optimizer_save(
     )
 
     async def completed_job(*_args: Any, **_kwargs: Any):
-        if False:
-            yield {}
+        yield {"event": OPTIMIZER_READY_EVENT, "step": 4, "world_size": 1}
 
     monkeypatch.setattr("art.megatron.service.stream_megatron_job", completed_job)
 
@@ -217,8 +227,9 @@ async def test_clean_training_finalization_submits_latest_optimizer_save(
 
     assert len(written) == 1
     assert written[0].step == 4
-    assert written[0].training_mode == "rl"
     assert written[0].training_session_id == service._training_session_id
+    commit = read_optimizer_commit(str(optimizer_dir))
+    assert commit is not None and commit.step == 4
 
 
 @pytest.mark.asyncio

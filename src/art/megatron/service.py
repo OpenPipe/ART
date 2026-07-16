@@ -50,6 +50,7 @@ from .lora import (
     MEGATRON_LORA_TARGET_MODULES_ENV,
     default_lora_rank_for_handler,
 )
+from .migrations import optimizer_state_path
 from .model_support.lora_disk import normalize_lora_checkpoint_to_vllm
 from .model_support.registry import (
     UnsupportedModelArchitectureError,
@@ -57,7 +58,9 @@ from .model_support.registry import (
 )
 from .optimizer_state import (
     MegatronResumeStep,
+    commit_optimizer_generation,
     format_megatron_resume_message,
+    optimizer_generation_files,
     prepare_megatron_resume_state,
     read_optimizer_commit,
 )
@@ -68,6 +71,7 @@ from .runtime.client import (
 )
 from .runtime.jobs import (
     LORA_READY_EVENT,
+    OPTIMIZER_READY_EVENT,
     MegatronMergedTrainingJob,
     MegatronOptimizerSaveJob,
     MegatronSFTTrainingJob,
@@ -543,19 +547,17 @@ class MegatronService:
     def _sleep_mode_enabled(self) -> bool:
         return bool(self.config.get("engine_args", {}).get("enable_sleep_mode", True))
 
-    def _get_optimizer_state_path(self, job_type: Literal["rl", "sft"]) -> str:
-        optimizer_state_path = os.path.join(
-            self.output_dir, f"optimizer_states_{job_type}"
-        )
-        os.makedirs(optimizer_state_path, exist_ok=True)
-        return optimizer_state_path
+    def _get_optimizer_state_path(self) -> str:
+        path = optimizer_state_path(self.output_dir)
+        os.makedirs(path, exist_ok=True)
+        return path
 
     def _resolve_resume_step(self) -> MegatronResumeStep:
         if self._resume_step is not None:
             return self._resume_step
         info = prepare_megatron_resume_state(
             output_dir=self.output_dir,
-            optimizer_state_path=self._get_optimizer_state_path("rl"),
+            optimizer_state_path=self._get_optimizer_state_path(),
         )
         self._resume_step = info
         self._status(format_megatron_resume_message(info))
@@ -1104,6 +1106,32 @@ class MegatronService:
         Path(staging_lora_path).rename(checkpoint_dir)
         return checkpoint_dir
 
+    def _commit_optimizer_checkpoint(self, *, step: int, world_size: int) -> None:
+        checkpoint_dir = Path(get_step_checkpoint_dir(self.output_dir, step))
+        if not checkpoint_dir.is_dir():
+            raise RuntimeError(
+                f"Cannot commit optimizer step {step} before its LoRA checkpoint"
+            )
+        path = self._get_optimizer_state_path()
+        commit_optimizer_generation(
+            path,
+            step=step,
+            world_size=world_size,
+            files=optimizer_generation_files(step, world_size),
+        )
+
+    @staticmethod
+    def _optimizer_ready_world_size(
+        result: dict[str, Any], *, expected_step: int
+    ) -> int | None:
+        if result.get("event") != OPTIMIZER_READY_EVENT:
+            return None
+        step = int(result.get("step", -1))
+        world_size = int(result.get("world_size", 0))
+        if step != expected_step or world_size < 1:
+            raise RuntimeError(f"Invalid optimizer-ready event: {result!r}")
+        return world_size
+
     async def _wake_and_reload_training_checkpoint(
         self,
         *,
@@ -1260,7 +1288,7 @@ class MegatronService:
                             training_session_id=self._training_session_id,
                             lora_path=staging_lora_path,
                             allow_unvalidated_arch=self._allow_unvalidated_arch,
-                            optimizer_state_path=self._get_optimizer_state_path("rl"),
+                            optimizer_state_path=self._get_optimizer_state_path(),
                             disk_packed_tensors=disk_packed_tensors,
                             config=config,
                             experimental_config=cast(dict[str, Any], _config),
@@ -1284,7 +1312,7 @@ class MegatronService:
                         training_session_id=self._training_session_id,
                         lora_path=staging_lora_path,
                         allow_unvalidated_arch=self._allow_unvalidated_arch,
-                        optimizer_state_path=self._get_optimizer_state_path("rl"),
+                        optimizer_state_path=self._get_optimizer_state_path(),
                         disk_packed_tensors=disk_packed_tensors,
                         config=config,
                         experimental_config=cast(dict[str, Any], _config),
@@ -1297,6 +1325,7 @@ class MegatronService:
                     )
                 write_megatron_job(job, job_path=job_path)
                 checkpoint_dir: str | None = None
+                optimizer_world_size: int | None = None
                 async for result in stream_megatron_job(
                     job,
                     job_path=job_path,
@@ -1310,6 +1339,13 @@ class MegatronService:
                             step=next_step,
                         )
                         continue
+                    if (
+                        world_size := self._optimizer_ready_world_size(
+                            result, expected_step=next_step
+                        )
+                    ) is not None:
+                        optimizer_world_size = world_size
+                        continue
                     yield {key: float(value) for key, value in result.items()}
 
                 await self._finish_training_checkpoint(
@@ -1317,6 +1353,10 @@ class MegatronService:
                     staging_lora_path=staging_lora_path,
                     step=next_step,
                 )
+                if optimizer_world_size is not None:
+                    self._commit_optimizer_checkpoint(
+                        step=next_step, world_size=optimizer_world_size
+                    )
                 return
 
             lora_path = await self._prepare_for_training()
@@ -1332,7 +1372,7 @@ class MegatronService:
                 training_session_id=self._training_session_id,
                 lora_path=staging_lora_path,
                 allow_unvalidated_arch=self._allow_unvalidated_arch,
-                optimizer_state_path=self._get_optimizer_state_path("rl"),
+                optimizer_state_path=self._get_optimizer_state_path(),
                 disk_packed_tensors=disk_packed_tensors,
                 config=config,
                 experimental_config=cast(dict[str, Any], _config),
@@ -1345,6 +1385,7 @@ class MegatronService:
             write_megatron_job(job, job_path=job_path)
 
             checkpoint_dir = None
+            optimizer_world_size = None
             async for result in stream_megatron_job(
                 job,
                 job_path=job_path,
@@ -1358,6 +1399,13 @@ class MegatronService:
                         step=next_step,
                     )
                     continue
+                if (
+                    world_size := self._optimizer_ready_world_size(
+                        result, expected_step=next_step
+                    )
+                ) is not None:
+                    optimizer_world_size = world_size
+                    continue
                 yield {key: float(value) for key, value in result.items()}
 
             await self._finish_training_checkpoint(
@@ -1365,6 +1413,10 @@ class MegatronService:
                 staging_lora_path=staging_lora_path,
                 step=next_step,
             )
+            if optimizer_world_size is not None:
+                self._commit_optimizer_checkpoint(
+                    step=next_step, world_size=optimizer_world_size
+                )
         except GeneratorExit:
             raise
         except BaseException as exc:
@@ -1405,7 +1457,7 @@ class MegatronService:
                 training_session_id=self._training_session_id,
                 lora_path=staging_lora_path,
                 allow_unvalidated_arch=self._allow_unvalidated_arch,
-                optimizer_state_path=self._get_optimizer_state_path("sft"),
+                optimizer_state_path=self._get_optimizer_state_path(),
                 sft_data_dir=serialized_batches.sft_data_dir,
                 num_batches=serialized_batches.num_batches,
                 learning_rates=serialized_batches.learning_rates,
@@ -1419,12 +1471,20 @@ class MegatronService:
                 f"Training log: {self._display_path(log_path)}"
             )
 
+            optimizer_world_size = None
             async for result in stream_megatron_job(
                 job,
                 job_path=job_path,
                 process=self._megatron_process,
                 process_log_path=self._megatron_log_path,
             ):
+                if (
+                    world_size := self._optimizer_ready_world_size(
+                        result, expected_step=next_step
+                    )
+                ) is not None:
+                    optimizer_world_size = world_size
+                    continue
                 metrics = {
                     "loss/train": float(result["loss"]),
                     "loss/learning_rate": float(result["learning_rate"]),
@@ -1439,6 +1499,11 @@ class MegatronService:
             new_checkpoint_dir = self._publish_staged_training_checkpoint(
                 staging_lora_path=staging_lora_path,
                 step=next_step,
+            )
+            if optimizer_world_size is None:
+                raise RuntimeError("Megatron SFT job did not persist its optimizer")
+            self._commit_optimizer_checkpoint(
+                step=next_step, world_size=optimizer_world_size
             )
             await self._wake_and_reload_training_checkpoint(
                 checkpoint_dir=new_checkpoint_dir,
@@ -1456,8 +1521,8 @@ class MegatronService:
             raise
 
     async def finalize_training_session(self) -> None:
-        optimizer_state_path = self._get_optimizer_state_path("rl")
-        commit = read_optimizer_commit(optimizer_state_path)
+        path = self._get_optimizer_state_path()
+        commit = read_optimizer_commit(path)
         if self._megatron_process is None or (
             commit is not None and commit.step == self._latest_step
         ):
@@ -1467,18 +1532,30 @@ class MegatronService:
         job = MegatronOptimizerSaveJob(
             step=self._latest_step,
             training_session_id=self._training_session_id,
-            training_mode="rl",
-            optimizer_state_path=optimizer_state_path,
+            optimizer_state_path=path,
             log_path=log_path,
         )
         write_megatron_job(job, job_path=job_path)
+        optimizer_world_size = None
         async for result in stream_megatron_job(
             job,
             job_path=job_path,
             process=self._megatron_process,
             process_log_path=self._megatron_log_path,
         ):
+            if (
+                world_size := self._optimizer_ready_world_size(
+                    result, expected_step=self._latest_step
+                )
+            ) is not None:
+                optimizer_world_size = world_size
+                continue
             raise RuntimeError(f"Optimizer finalization returned data: {result!r}")
+        if optimizer_world_size is None:
+            raise RuntimeError("Megatron optimizer finalization produced no commit")
+        self._commit_optimizer_checkpoint(
+            step=self._latest_step, world_size=optimizer_world_size
+        )
 
     async def aclose(self) -> None:
         self.close()

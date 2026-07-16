@@ -52,6 +52,7 @@ from art.megatron.model_support.lora_disk import (
 from art.megatron.optimizer_state import (
     commit_optimizer_generation,
     optimizer_generation_files,
+    read_optimizer_commit,
     resolve_optimizer_shard_path,
 )
 from art.megatron.provider import (
@@ -67,6 +68,7 @@ from art.megatron.runtime.jobs import (
     DEFAULT_JOBS_DIR,
     DEFAULT_VLLM_WAKE_LOCK_PATH,
     LORA_READY_EVENT,
+    OPTIMIZER_READY_EVENT,
     MegatronJob,
     MegatronMergedTrainingJob,
     MegatronOptimizerSaveJob,
@@ -159,7 +161,6 @@ class TrainingRuntime(BaseModel):
     optimizer_config: OptimizerConfig
     optimizer_persistent: bool = True
     resident_training_session_id: str | None = None
-    resident_training_mode: Literal["rl", "sft"] | None = None
     resident_optimizer_state_path: str | None = None
     resident_policy_step: int | None = None
     resident_optimizer_dirty: bool = False
@@ -671,14 +672,13 @@ def run_megatron_rl_job(
             lora_path=job.lora_path,
             optimizer_state_path=job.optimizer_state_path,
             step=job.step,
-            training_mode="rl",
             optimizer_save_interval=job.config.optimizer_save_interval,
             lora_ready_log_path=(
                 None if isinstance(job, MegatronMergedTrainingJob) else job.log_path
             ),
+            optimizer_ready_log_path=job.log_path,
         )
         runtime.resident_training_session_id = job.training_session_id
-        runtime.resident_training_mode = "rl"
         runtime.resident_optimizer_state_path = os.path.realpath(
             job.optimizer_state_path
         )
@@ -820,8 +820,8 @@ def run_megatron_sft_job(
                     lora_path=job.lora_path,
                     optimizer_state_path=job.optimizer_state_path,
                     step=job.step,
-                    training_mode="sft",
                     optimizer_save_interval=1,
+                    optimizer_ready_log_path=job.log_path,
                 )
                 torch.distributed.barrier()  # type: ignore[possibly-missing-attribute]
 
@@ -847,8 +847,8 @@ def run_megatron_sft_job(
             lora_path=job.lora_path,
             optimizer_state_path=job.optimizer_state_path,
             step=job.step,
-            training_mode="sft",
             optimizer_save_interval=1,
+            optimizer_ready_log_path=job.log_path,
         )
         runtime.resident_policy_step = job.step
     finally:
@@ -911,7 +911,6 @@ def _prepare_rl_training_state(
     return _prepare_training_state(
         runtime,
         training_session_id=job.training_session_id,
-        training_mode="rl",
         source_policy_step=job.source_policy_step,
         lora_path=job.lora_path,
         optimizer_state_path=job.optimizer_state_path,
@@ -925,7 +924,6 @@ def _prepare_sft_training_state(
     return _prepare_training_state(
         runtime,
         training_session_id=job.training_session_id,
-        training_mode="sft",
         source_policy_step=job.source_policy_step,
         lora_path=job.lora_path,
         optimizer_state_path=job.optimizer_state_path,
@@ -936,7 +934,6 @@ def _prepare_training_state(
     runtime: TrainingRuntime,
     *,
     training_session_id: str,
-    training_mode: Literal["rl", "sft"],
     source_policy_step: int,
     lora_path: str,
     optimizer_state_path: str,
@@ -945,7 +942,6 @@ def _prepare_training_state(
     state_is_resident = (
         runtime.optimizer_persistent
         and runtime.resident_training_session_id == training_session_id
-        and runtime.resident_training_mode == training_mode
         and runtime.resident_optimizer_state_path == normalized_path
         and runtime.resident_policy_step == source_policy_step
         and runtime.optimizer_state_loaded
@@ -969,7 +965,7 @@ def _prepare_training_state(
         optimizer_state_path,
         rank=runtime.rank,
         world_size=runtime.world_size,
-        training_mode=training_mode,
+        expected_step=source_policy_step,
     )
     if optimizer_shard_path is None:
         print0(
@@ -987,7 +983,6 @@ def _prepare_training_state(
         key: tensor.dtype for key, tensor in adapter_model.items()
     }
     runtime.resident_training_session_id = training_session_id
-    runtime.resident_training_mode = training_mode
     runtime.resident_optimizer_state_path = normalized_path
     runtime.resident_policy_step = source_policy_step
     runtime.optimizer_state_loaded = True
@@ -1020,9 +1015,9 @@ def _save_lora_and_optimizer(
     lora_path: str,
     optimizer_state_path: str,
     step: int,
-    training_mode: Literal["rl", "sft"],
     optimizer_save_interval: int,
     lora_ready_log_path: str | None = None,
+    optimizer_ready_log_path: str | None = None,
 ) -> None:
     assert runtime.optimizer is not None
     save_vllm_lora_from_model(
@@ -1040,14 +1035,13 @@ def _save_lora_and_optimizer(
         runtime,
         step=step,
         optimizer_state_path=optimizer_state_path,
-        training_mode=training_mode,
         optimizer_save_interval=optimizer_save_interval,
     ):
         _save_optimizer(
             runtime,
             optimizer_state_path=optimizer_state_path,
             step=step,
-            training_mode=training_mode,
+            ready_log_path=optimizer_ready_log_path,
         )
 
 
@@ -1077,19 +1071,14 @@ def _should_save_optimizer(
     *,
     step: int,
     optimizer_state_path: str,
-    training_mode: Literal["rl", "sft"],
     optimizer_save_interval: int,
 ) -> bool:
     if not runtime.optimizer_persistent or optimizer_save_interval == 1:
         return True
-    optimizer_shard_path = resolve_optimizer_shard_path(
-        optimizer_state_path,
-        rank=runtime.rank,
-        world_size=runtime.world_size,
-        training_mode=training_mode,
-    )
     return (
-        step <= 1 or step % optimizer_save_interval == 0 or optimizer_shard_path is None
+        step <= 1
+        or step % optimizer_save_interval == 0
+        or read_optimizer_commit(optimizer_state_path) is None
     )
 
 
@@ -1139,7 +1128,8 @@ def _save_optimizer(
     *,
     optimizer_state_path: str,
     step: int,
-    training_mode: Literal["rl", "sft"],
+    ready_log_path: str | None = None,
+    commit: bool = False,
 ) -> None:
     assert runtime.optimizer is not None
     files = optimizer_generation_files(step, runtime.world_size)
@@ -1159,15 +1149,21 @@ def _save_optimizer(
         os.close(directory_fd)
     if torch.distributed.is_initialized():  # ty:ignore[possibly-missing-attribute]
         torch.distributed.barrier()  # ty:ignore[possibly-missing-attribute]
-    if runtime.rank == 0:
+    if runtime.rank == 0 and commit:
         commit_optimizer_generation(
             optimizer_state_path,
             step=step,
             world_size=runtime.world_size,
-            training_mode=training_mode,
             files=files,
         )
-    if torch.distributed.is_initialized():  # ty:ignore[possibly-missing-attribute]
+    if runtime.rank == 0 and ready_log_path is not None:
+        _write_job_event(
+            ready_log_path,
+            OPTIMIZER_READY_EVENT,
+            step=step,
+            world_size=runtime.world_size,
+        )
+    if commit and torch.distributed.is_initialized():  # ty:ignore[possibly-missing-attribute]
         torch.distributed.barrier()  # ty:ignore[possibly-missing-attribute]
     runtime.resident_optimizer_dirty = False
 
@@ -1178,7 +1174,6 @@ def _commit_resident_optimizer(runtime: TrainingRuntime) -> None:
     if (
         runtime.optimizer is None
         or runtime.resident_policy_step is None
-        or runtime.resident_training_mode is None
         or runtime.resident_optimizer_state_path is None
     ):
         raise RuntimeError("Dirty resident optimizer has incomplete identity")
@@ -1186,14 +1181,13 @@ def _commit_resident_optimizer(runtime: TrainingRuntime) -> None:
         runtime,
         optimizer_state_path=runtime.resident_optimizer_state_path,
         step=runtime.resident_policy_step,
-        training_mode=runtime.resident_training_mode,
+        commit=True,
     )
 
 
 def _clear_resident_optimizer(runtime: TrainingRuntime) -> None:
     runtime.optimizer = None
     runtime.resident_training_session_id = None
-    runtime.resident_training_mode = None
     runtime.resident_optimizer_state_path = None
     runtime.resident_policy_step = None
     runtime.resident_optimizer_dirty = False
@@ -1208,13 +1202,11 @@ def _save_resident_optimizer(
     expected_path = os.path.realpath(job.optimizer_state_path)
     identity = (
         runtime.resident_training_session_id,
-        runtime.resident_training_mode,
         runtime.resident_optimizer_state_path,
         runtime.resident_policy_step,
     )
     expected = (
         job.training_session_id,
-        job.training_mode,
         expected_path,
         job.step,
     )
@@ -1222,7 +1214,12 @@ def _save_resident_optimizer(
         raise RuntimeError(
             f"Cannot finalize non-resident optimizer state: {identity!r} != {expected!r}"
         )
-    _commit_resident_optimizer(runtime)
+    _save_optimizer(
+        runtime,
+        optimizer_state_path=expected_path,
+        step=job.step,
+        ready_log_path=job.log_path,
+    )
 
 
 def finalize_megatron_job(
