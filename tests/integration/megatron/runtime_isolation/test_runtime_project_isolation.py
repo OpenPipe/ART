@@ -79,6 +79,66 @@ def test_runtime_patch_always_returns_token_ids(
     }
 
 
+def test_parallel_sampling_preserves_every_child_policy_span(
+    artifact_dir: Path,
+) -> None:
+    payload = _runtime_python(
+        """
+import json
+from types import SimpleNamespace
+import art_vllm_runtime.policy_spans as policy
+from vllm.sampling_params import RequestOutputKind
+from vllm.v1.engine.output_processor import RequestState
+from vllm.v1.engine.parallel_sampling import ParentRequest
+
+policy._patch_output_processor_policy_span_accumulation()
+
+class Detokenizer:
+    output_token_ids = [10, 20]
+    def num_output_tokens(self): return 2
+    def get_next_output_text(self, finished, delta): return "done"
+
+class Logprobs:
+    logprobs = cumulative_logprob = prompt_logprobs = None
+
+parent = ParentRequest.__new__(ParentRequest)
+parent.external_req_id = "parent"
+parent.child_requests = {"0_parent", "1_parent"}
+parent.output_aggregator = [None, None]
+parent.sampling_params = SimpleNamespace(
+    output_kind=RequestOutputKind.FINAL_ONLY, n=2
+)
+
+def finish_child(index, policy_version):
+    state = RequestState(
+        request_id=f"{index}_parent", external_req_id="parent",
+        parent_req=parent, request_index=index, lora_request=None,
+        output_kind=RequestOutputKind.FINAL_ONLY, prompt="p",
+        prompt_token_ids=[1], prompt_embeds=None,
+        logprobs_processor=Logprobs(), detokenizer=Detokenizer(),
+        max_tokens_param=2, arrival_time=0.0, queue=None,
+        log_stats=False, stream_interval=1,
+    )
+    policy._CURRENT_ENGINE_POLICY_SPANS = {state.request_id: [{
+        "start_token": 0, "end_token": 2,
+        "policy_version": policy_version,
+        "lora_slot": "model:active", "update_seq": policy_version,
+    }]}
+    return state.make_request_output([10, 20], None, "stop", None)
+
+assert finish_child(0, 3) is None
+result = finish_child(1, 4)
+print(json.dumps([
+    output.art_policy_token_spans[0]["policy_version"]
+    for output in result.outputs
+]))
+""",
+        artifact_dir,
+        "parallel_sampling_policy_spans",
+    )
+    assert json.loads(payload) == [3, 4]
+
+
 def test_runtime_lora_updates_linearize_request_admission(
     artifact_dir: Path,
 ) -> None:
