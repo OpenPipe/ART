@@ -927,7 +927,7 @@ def _legacy_tokenize(
     )
 
 
-def tokenize_one(
+def tokenize_many(
     trajectory: Trajectory,
     base_model: str | None,
     *,
@@ -935,7 +935,7 @@ def tokenize_one(
     chat_template: str | None,
     chat_template_kwargs: Mapping[str, object] | None,
     tokenizer_instance: _Tokenizer | None = None,
-) -> TokenizedTrajectory:
+) -> list[TokenizedTrajectory]:
     if trajectory.exchanges and (
         trajectory.messages_and_choices
         or trajectory.tools is not None
@@ -945,24 +945,43 @@ def tokenize_one(
             "A trajectory cannot contain both exchanges and legacy histories"
         )
     if not trajectory.exchanges:
-        return _legacy_tokenize(
-            trajectory,
-            base_model,
-            chat_template=chat_template,
-            chat_template_kwargs=chat_template_kwargs,
-        )
+        return [
+            _legacy_tokenize(
+                trajectory,
+                base_model,
+                chat_template=chat_template,
+                chat_template_kwargs=chat_template_kwargs,
+            )
+        ]
     exchanges = _exchange_list(trajectory, model)
     selected_model = exchanges[0].model
     if selected_model is None:
         raise AssertionError("_exchange_list returned an exchange without a model")
     config = _tokenizer_config(selected_model, base_model)
     tokenizer = tokenizer_instance
+    results: list[TokenizedTrajectory] = []
     token_ids: list[int] = []
     logprobs: list[float] = []
     assistant_mask: list[bool] = []
     response_histories: dict[
         str, tuple[list[dict[str, Any]] | None, ResponsesExchange]
     ] = {}
+
+    def flush() -> None:
+        nonlocal token_ids, logprobs, assistant_mask
+        if not token_ids:
+            return
+        results.append(
+            TokenizedTrajectory(
+                token_ids=token_ids,
+                logprobs=logprobs,
+                assistant_mask=assistant_mask,
+                underlying=trajectory,
+            )
+        )
+        token_ids = []
+        logprobs = []
+        assistant_mask = []
 
     for exchange in exchanges:
         if isinstance(exchange, CompletionsExchange):
@@ -1043,9 +1062,10 @@ def tokenize_one(
             logprobs.extend([math.nan] * len(prompt))
             assistant_mask.extend([False] * len(prompt))
         elif len(prompt) < len(token_ids) or prompt[: len(token_ids)] != token_ids:
-            raise ValueError(
-                "Exchanges do not resolve to one append-only token history"
-            )
+            flush()
+            token_ids.extend(prompt)
+            logprobs.extend([math.nan] * len(prompt))
+            assistant_mask.extend([False] * len(prompt))
         else:
             suffix = prompt[len(token_ids) :]
             token_ids.extend(suffix)
@@ -1059,9 +1079,27 @@ def tokenize_one(
         logprobs.extend(completion_logprobs)
         assistant_mask.extend([True] * len(completion))
 
-    return TokenizedTrajectory(
-        token_ids=token_ids,
-        logprobs=logprobs,
-        assistant_mask=assistant_mask,
-        underlying=trajectory,
+    flush()
+    return results
+
+
+def tokenize_one(
+    trajectory: Trajectory,
+    base_model: str | None,
+    *,
+    model: str | None,
+    chat_template: str | None,
+    chat_template_kwargs: Mapping[str, object] | None,
+    tokenizer_instance: _Tokenizer | None = None,
+) -> TokenizedTrajectory:
+    results = tokenize_many(
+        trajectory,
+        base_model,
+        model=model,
+        chat_template=chat_template,
+        chat_template_kwargs=chat_template_kwargs,
+        tokenizer_instance=tokenizer_instance,
     )
+    if len(results) != 1:
+        raise ValueError("Exchanges do not resolve to one append-only token history")
+    return results[0]

@@ -15,7 +15,7 @@ from litellm.types.utils import Choices
 from openai.types.chat.chat_completion import Choice
 from openai.types.chat.chat_completion_message_param import ChatCompletionMessageParam
 
-from art.trajectories import Trajectory, TrajectoryGroup
+from art.trajectories import Trajectory, TrajectoryExchanges, TrajectoryGroup
 
 
 def _flatten_message(msg: dict) -> dict:
@@ -102,7 +102,14 @@ def write_trajectory_groups_parquet(
                     "group_metadata": group_metadata,
                     "group_metrics": group_metrics,
                     "group_logs": group_logs,
+                    "exchanges": trajectory.exchanges.model_dump_json(
+                        exclude_computed_fields=True
+                    )
+                    if trajectory.exchanges
+                    else None,
                     "reward": trajectory.reward,
+                    "initial_policy_version": trajectory.initial_policy_version,
+                    "final_policy_version": trajectory.final_policy_version,
                     "metrics": json.dumps(trajectory.metrics)
                     if trajectory.metrics
                     else None,
@@ -132,7 +139,10 @@ def write_trajectory_groups_parquet(
             ("group_metadata", pa.string()),
             ("group_metrics", pa.string()),
             ("group_logs", pa.list_(pa.string())),
+            ("exchanges", pa.string()),
             ("reward", pa.float64()),
+            ("initial_policy_version", pa.int64()),
+            ("final_policy_version", pa.int64()),
             ("metrics", pa.string()),
             ("metadata", pa.string()),
             ("tools", pa.string()),
@@ -226,8 +236,13 @@ def read_trajectory_groups_parquet(path: str | Path) -> list[TrajectoryGroup]:
             messages_and_choices.append(_unflatten_message(msg))
 
         trajectory = Trajectory(
+            exchanges=TrajectoryExchanges.model_validate_json(row_dict["exchanges"])
+            if row_dict.get("exchanges")
+            else TrajectoryExchanges(),
             messages_and_choices=messages_and_choices,
             reward=row_dict["reward"],
+            initial_policy_version=row_dict.get("initial_policy_version"),
+            final_policy_version=row_dict.get("final_policy_version"),
             metrics=json.loads(row_dict["metrics"]) if row_dict.get("metrics") else {},
             metadata=json.loads(row_dict["metadata"])
             if row_dict.get("metadata")

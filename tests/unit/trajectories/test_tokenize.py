@@ -970,6 +970,110 @@ def test_exchange_trajectories_feed_existing_training_tokenizer() -> None:
     assert [result.assistant_mask for result in results] == [[0, 1], [0, 1]]
 
 
+@pytest.mark.parametrize(
+    ("exchanges", "expected_token_ids", "expected_assistant_masks"),
+    [
+        pytest.param(
+            [
+                _chat_exchange([1], [2], offset=0),
+                _chat_exchange([1, 2, 3], [4], offset=1),
+            ],
+            [[1, 2, 3, 4]],
+            [[0, 1, 0, 1]],
+            id="append-only",
+        ),
+        pytest.param(
+            [
+                _chat_exchange([1], [2], offset=0),
+                _chat_exchange([10], [11], offset=1),
+            ],
+            [[1, 2], [10, 11]],
+            [[0, 1], [0, 1]],
+            id="independent",
+        ),
+        pytest.param(
+            [
+                _chat_exchange([1], [2], offset=0),
+                _chat_exchange([1, 2, 3], [4], offset=1),
+                _chat_exchange([1, 2, 5], [6], offset=2),
+            ],
+            [[1, 2, 3, 4], [1, 2, 5, 6]],
+            [[0, 1, 0, 1], [0, 0, 0, 1]],
+            id="shallow-branch",
+        ),
+        pytest.param(
+            [
+                _chat_exchange([1], [2], offset=0),
+                _chat_exchange([1, 2, 3], [4], offset=1),
+                _chat_exchange([1, 2, 5], [6], offset=2),
+                _chat_exchange([1, 2, 3, 4, 7], [8], offset=3),
+                _chat_exchange([20], [21], offset=4),
+                _chat_exchange([1, 2, 5, 6, 9], [10], offset=5),
+            ],
+            [
+                [1, 2, 3, 4],
+                [1, 2, 5, 6],
+                [1, 2, 3, 4, 7, 8],
+                [20, 21],
+                [1, 2, 5, 6, 9, 10],
+            ],
+            [
+                [0, 1, 0, 1],
+                [0, 0, 0, 1],
+                [0, 0, 0, 0, 0, 1],
+                [0, 1],
+                [0, 0, 0, 0, 0, 1],
+            ],
+            id="mixed-branches",
+        ),
+    ],
+)
+def test_exchange_training_partitions_append_compatible_sequences(
+    exchanges: list[ChatCompletionsExchange],
+    expected_token_ids: list[list[int]],
+    expected_assistant_masks: list[list[int]],
+) -> None:
+    from art.preprocessing.tokenize import tokenize_trajectory_groups
+
+    class Tokenizer:
+        name_or_path = "test/model"
+
+        def decode(self, token_id: int) -> str:
+            return str(token_id)
+
+    trajectory = art.Trajectory(
+        exchanges=TrajectoryExchanges(chat_completions=exchanges), reward=1
+    )
+    results = list(
+        tokenize_trajectory_groups(
+            Tokenizer(),  # type: ignore[arg-type, ty:invalid-argument-type]
+            [art.TrajectoryGroup([trajectory])],
+            allow_training_without_logprobs=False,
+            scale_rewards=False,
+            shuffle_group_trajectories=False,
+            drop_zero_advantage_trajectories=False,
+        )
+    )
+
+    assert [result.token_ids for result in results] == expected_token_ids
+    assert [result.assistant_mask for result in results] == expected_assistant_masks
+
+    expected_completion_ids = [
+        token_id
+        for exchange in exchanges
+        for token_id in exchange.response.choices[0].model_dump()["token_ids"]
+    ]
+    trainable_ids = [
+        token_id
+        for result in results
+        for token_id, trainable in zip(
+            result.token_ids, result.assistant_mask, strict=True
+        )
+        if trainable
+    ]
+    assert trainable_ids == expected_completion_ids
+
+
 def test_exchange_training_requires_logprobs_unless_allowed() -> None:
     from art.preprocessing.tokenize import TokenizedResult, tokenize_trajectory_groups
 

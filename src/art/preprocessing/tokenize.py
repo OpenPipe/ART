@@ -526,9 +526,9 @@ def tokenize_trajectory_groups(
             if advantage == 0 and drop_zero_advantage_trajectories:
                 continue
             if trajectory.exchanges:
-                from ..trajectories._tokenize import _as_tokenizer, tokenize_one
+                from ..trajectories._tokenize import _as_tokenizer, tokenize_many
 
-                exchange_result = tokenize_one(
+                exchange_results = tokenize_many(
                     trajectory,
                     tokenizer.name_or_path,
                     model=None,
@@ -536,41 +536,47 @@ def tokenize_trajectory_groups(
                     chat_template_kwargs=chat_template_kwargs,
                     tokenizer_instance=_as_tokenizer(tokenizer),
                 )
-                if not allow_training_without_logprobs and any(
-                    trainable and math.isnan(logprob)
-                    for trainable, logprob in zip(
-                        exchange_result.assistant_mask,
-                        exchange_result.logprobs,
-                        strict=True,
+                trajectory_results = []
+                for exchange_result in exchange_results:
+                    if not allow_training_without_logprobs and any(
+                        trainable and math.isnan(logprob)
+                        for trainable, logprob in zip(
+                            exchange_result.assistant_mask,
+                            exchange_result.logprobs,
+                            strict=True,
+                        )
+                    ):
+                        raise RuntimeError(
+                            "Exchange trajectory is missing logprobs for trainable tokens"
+                        )
+                    choice_offsets = [
+                        index
+                        for index, trainable in enumerate(
+                            exchange_result.assistant_mask
+                        )
+                        if trainable
+                        and (
+                            index == 0 or not exchange_result.assistant_mask[index - 1]
+                        )
+                    ]
+                    trajectory_results.append(
+                        TokenizedResult(
+                            advantage=advantage,
+                            chat="",
+                            token_ids=exchange_result.token_ids,
+                            input_pos=list(range(len(exchange_result.token_ids))),
+                            assistant_mask=[
+                                int(value) for value in exchange_result.assistant_mask
+                            ],
+                            logprobs=exchange_result.logprobs,
+                            pixel_values=None,
+                            image_grid_thw=None,
+                            trajectory=trajectory,
+                            choice_offsets=choice_offsets,
+                            extra_logprobs={},
+                            _tokenizer=tokenizer,
+                        )
                     )
-                ):
-                    raise RuntimeError(
-                        "Exchange trajectory is missing logprobs for trainable tokens"
-                    )
-                choice_offsets = [
-                    index
-                    for index, trainable in enumerate(exchange_result.assistant_mask)
-                    if trainable
-                    and (index == 0 or not exchange_result.assistant_mask[index - 1])
-                ]
-                trajectory_results = [
-                    TokenizedResult(
-                        advantage=advantage,
-                        chat="",
-                        token_ids=exchange_result.token_ids,
-                        input_pos=list(range(len(exchange_result.token_ids))),
-                        assistant_mask=[
-                            int(value) for value in exchange_result.assistant_mask
-                        ],
-                        logprobs=exchange_result.logprobs,
-                        pixel_values=None,
-                        image_grid_thw=None,
-                        trajectory=trajectory,
-                        choice_offsets=choice_offsets,
-                        extra_logprobs={},
-                        _tokenizer=tokenizer,
-                    )
-                ]
             else:
                 trajectory_results = tokenize_vllm_trajectory_histories(
                     tokenizer=tokenizer,

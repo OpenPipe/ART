@@ -9,6 +9,7 @@ Tests cover:
 5. Golden file regression tests
 """
 
+from datetime import datetime, timedelta
 import json
 import os
 from pathlib import Path
@@ -16,6 +17,7 @@ import shutil
 import tempfile
 from typing import cast
 
+from openai.types.chat import ChatCompletion
 from openai.types.chat.chat_completion import Choice
 from openai.types.chat.chat_completion_assistant_message_param import (
     ChatCompletionAssistantMessageParam,
@@ -36,6 +38,7 @@ from openai.types.chat.chat_completion_user_message_param import (
 import pytest
 
 from art import Trajectory, TrajectoryGroup
+from art.trajectories import ChatCompletionsExchange, TrajectoryExchanges
 from art.types import MessageOrChoice
 from art.utils.trajectory_logging import (
     read_trajectory_groups_parquet,
@@ -133,6 +136,129 @@ class TestParquetRoundTrip:
         assert traj.metadata == {"trace_id": "abc-123"}
         assert len(traj.messages_and_choices) == 3
         assert traj.logs == ["log1", "log2"]
+
+    def test_chat_completions_exchanges_round_trip_losslessly(
+        self, tmp_path: Path
+    ) -> None:
+        """Protocol exchanges and trajectory provenance survive Parquet logging."""
+        exchanges = []
+        for index, (prompt, answer) in enumerate(
+            (
+                ("first request", "first response"),
+                ("second request", "second response"),
+            )
+        ):
+            start_time = datetime(2026, 7, 16, 12, 0) + timedelta(seconds=index)
+            exchanges.append(
+                ChatCompletionsExchange(
+                    request={
+                        "model": "test/model",
+                        "messages": [{"role": "user", "content": prompt}],
+                        "temperature": 0.25 + index,
+                        "request_provenance": f"capture-{index}",
+                    },
+                    response=ChatCompletion.model_validate(
+                        {
+                            "id": f"chat-{index}",
+                            "object": "chat.completion",
+                            "created": index,
+                            "model": "test/model",
+                            "system_fingerprint": f"fingerprint-{index}",
+                            "choices": [
+                                {
+                                    "index": 0,
+                                    "finish_reason": "stop",
+                                    "message": {
+                                        "role": "assistant",
+                                        "content": answer,
+                                    },
+                                }
+                            ],
+                        }
+                    ),
+                    start_time=start_time,
+                    end_time=start_time + timedelta(milliseconds=125 + index),
+                )
+            )
+
+        original_trajectory = Trajectory(
+            exchanges=TrajectoryExchanges(chat_completions=exchanges),
+            reward=0.875,
+            initial_policy_version=11,
+            final_policy_version=13,
+            metrics={"duration": 1.25, "accepted": True},
+            metadata={"trace_id": "trace-123", "attempt": 2},
+            logs=["captured two calls"],
+        )
+        parquet_path = tmp_path / "exchange-trajectory.parquet"
+
+        write_trajectory_groups_parquet(
+            [TrajectoryGroup(trajectories=[original_trajectory])], parquet_path
+        )
+        loaded = read_trajectory_groups_parquet(parquet_path)[0].trajectories[0]
+
+        assert loaded.exchanges == original_trajectory.exchanges
+        assert loaded.initial_policy_version == 11
+        assert loaded.final_policy_version == 13
+        assert loaded.reward == 0.875
+        assert loaded.metrics == {"duration": 1.25, "accepted": True}
+        assert loaded.metadata == {"trace_id": "trace-123", "attempt": 2}
+        assert loaded.logs == ["captured two calls"]
+        assert [
+            exchange.response.choices[0].message.content
+            for exchange in loaded.exchanges.chat_completions
+        ] == ["first response", "second response"]
+        assert loaded.messages_and_choices == []
+
+    def test_pre_exchange_parquet_schema_remains_readable(self, tmp_path: Path) -> None:
+        """Files written before exchange columns existed remain readable."""
+        import pyarrow.parquet as pq
+
+        parquet_path = tmp_path / "current.parquet"
+        legacy_path = tmp_path / "legacy.parquet"
+        write_trajectory_groups_parquet(
+            [
+                TrajectoryGroup(
+                    trajectories=[
+                        Trajectory(
+                            messages_and_choices=[
+                                {"role": "user", "content": "legacy prompt"},
+                                {"role": "assistant", "content": "legacy response"},
+                            ],
+                            reward=0.5,
+                            metrics={"legacy": True},
+                            metadata={"schema": "pre-exchanges"},
+                        )
+                    ]
+                )
+            ],
+            parquet_path,
+        )
+        table = pq.read_table(parquet_path)
+        added_columns = {
+            "exchanges",
+            "initial_policy_version",
+            "final_policy_version",
+        }
+        pq.write_table(
+            table.select(
+                [name for name in table.column_names if name not in added_columns]
+            ),
+            legacy_path,
+        )
+
+        loaded = read_trajectory_groups_parquet(legacy_path)[0].trajectories[0]
+
+        assert loaded.reward == 0.5
+        assert loaded.metrics == {"legacy": True}
+        assert loaded.metadata == {"schema": "pre-exchanges"}
+        assert [
+            _ensure_message(message)["content"]
+            for message in loaded.messages_and_choices
+        ] == ["legacy prompt", "legacy response"]
+        assert not loaded.exchanges
+        assert loaded.initial_policy_version is None
+        assert loaded.final_policy_version is None
 
     def test_tool_calls(self, tmp_path: Path):
         """Test trajectories with tool calls."""
