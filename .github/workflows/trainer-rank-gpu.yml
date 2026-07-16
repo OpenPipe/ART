@@ -3,12 +3,19 @@ name: TrainerRank GPU validation
 on:
   pull_request:
     types: [opened, reopened, synchronize, ready_for_review]
+  workflow_dispatch:
+    inputs:
+      pr_number:
+        description: Pull request number to validate
+        required: true
+        type: number
 
 permissions:
   contents: read
+  pull-requests: read
 
 concurrency:
-  group: trainer-rank-gpu-${{ github.event.pull_request.number }}
+  group: trainer-rank-gpu-${{ github.event.pull_request.number || inputs.pr_number }}
   cancel-in-progress: true
 
 jobs:
@@ -16,29 +23,52 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       required: ${{ steps.changes.outputs.required }}
+      head_sha: ${{ steps.changes.outputs.head_sha }}
     steps:
       - uses: actions/checkout@v4
         with:
+          ref: ${{ github.event.pull_request.head.sha || format('refs/pull/{0}/head', inputs.pr_number) }}
           fetch-depth: 0
 
       - id: changes
         name: Classify changed files
         env:
+          GH_TOKEN: ${{ github.token }}
+          EVENT_NAME: ${{ github.event_name }}
+          PR_NUMBER: ${{ github.event.pull_request.number || inputs.pr_number }}
           BASE_SHA: ${{ github.event.pull_request.base.sha }}
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
         run: |
           set -euo pipefail
+          if [ "${EVENT_NAME}" = "workflow_dispatch" ]; then
+            pr="$(gh api "repos/${GITHUB_REPOSITORY}/pulls/${PR_NUMBER}")"
+            head_repo="$(jq -r '.head.repo.full_name' <<<"${pr}")"
+            if [ "${head_repo}" != "${GITHUB_REPOSITORY}" ]; then
+              echo "Manual GPU validation only supports branches in ${GITHUB_REPOSITORY}." >&2
+              exit 1
+            fi
+            BASE_SHA="$(jq -r '.base.sha' <<<"${pr}")"
+            HEAD_SHA="$(jq -r '.head.sha' <<<"${pr}")"
+          fi
+          echo "head_sha=${HEAD_SHA}" >> "${GITHUB_OUTPUT}"
+          git cat-file -e "${BASE_SHA}^{commit}" 2>/dev/null \
+            || git fetch --no-tags origin "${BASE_SHA}"
+
           pattern='^src/art/megatron/(prefix_tree(_packing|_state)?\.py|context_parallel/|flex_attn/|gdn/|lora\.py|megatron_patches\.py|training/(finalize_grads|microbatches)\.py)'
           changed="$(git diff --name-only "${BASE_SHA}...${HEAD_SHA}")"
           critical="$(printf '%s\n' "${changed}" | grep -E "${pattern}" || true)"
-          if [ -n "${critical}" ]; then
+          if [ "${EVENT_NAME}" = "workflow_dispatch" ] || [ -n "${critical}" ]; then
             echo "required=true" >> "${GITHUB_OUTPUT}"
             {
               echo "### TrainerRank GPU validation required"
               echo
-              echo '```text'
-              printf '%s\n' "${critical}"
-              echo '```'
+              if [ -n "${critical}" ]; then
+                echo '```text'
+                printf '%s\n' "${critical}"
+                echo '```'
+              else
+                echo "Manual validation requested for PR #${PR_NUMBER}."
+              fi
             } >> "${GITHUB_STEP_SUMMARY}"
           else
             echo "required=false" >> "${GITHUB_OUTPUT}"
@@ -57,7 +87,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: ${{ github.event.pull_request.head.sha }}
+          ref: ${{ needs.classify.outputs.head_sha }}
 
       - name: Install launch dependencies
         run: |
