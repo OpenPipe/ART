@@ -259,6 +259,7 @@ def test_hybridep_uses_maximum_cp_model_rows(
 
     trainer = TrainerRank(_runtime())
     batch = prefix_tree_pack((torch.arange(9),), max_depth=0)
+    short_batch = prefix_tree_pack((torch.arange(5),), max_depth=0)
     topology = ParallelTopology(cp=4)
     calls: dict[str, object] = {}
 
@@ -276,7 +277,12 @@ def test_hybridep_uses_maximum_cp_model_rows(
     )
     monkeypatch.setattr(
         "art.megatron.context_parallel.runtime.context_parallel_rank_model_token_counts",
-        lambda **_kwargs: (8, 13, 9, 11),
+        lambda **kwargs: (
+            8,
+            int(cast(torch.Tensor, kwargs["group_ids"]).numel()) + 4,
+            9,
+            11,
+        ),
     )
     monkeypatch.setattr(
         "art.megatron.training.microbatches._context_parallel_config_for_provider",
@@ -287,7 +293,16 @@ def test_hybridep_uses_maximum_cp_model_rows(
         lambda *_: "gdn-config",
     )
 
-    trainer._configure_hybridep(batch, topology=topology)
+    buffer = SimpleNamespace(
+        configurer=SimpleNamespace(
+            buffer_config=SimpleNamespace(max_num_of_tokens_per_rank=1024)
+        )
+    )
+    monkeypatch.setattr(
+        "megatron.core.transformer.moe.fused_a2a._hybrid_ep_buffer", buffer
+    )
+
+    trainer._configure_hybridep((batch, short_batch), topology=topology)
 
     assert calls == {
         "capacity": {
@@ -296,6 +311,41 @@ def test_hybridep_uses_maximum_cp_model_rows(
         },
         "rows": 13,
     }
+
+
+@pytest.mark.skipif(find_spec("megatron") is None, reason="requires Megatron")
+def test_hybridep_rejects_buffer_growth_with_live_graph(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from art.megatron.context_parallel.types import ParallelTopology
+
+    trainer = TrainerRank(_runtime())
+    trainer._hybridep_graph_tracking = True
+    output = trainer._track_slot_graph_outputs(
+        None,
+        [ForwardOutput(torch.ones(1, requires_grad=True), None, None, None)],
+    )[0]
+    assert output.target_logprobs is not None
+    buffer = SimpleNamespace(
+        configurer=SimpleNamespace(
+            buffer_config=SimpleNamespace(max_num_of_tokens_per_rank=4)
+        )
+    )
+    trainer._hybridep_buffer_id = id(buffer)
+    trainer._hybridep_rows_high_water = 4
+    monkeypatch.setattr(
+        "megatron.core.parallel_state.get_expert_model_parallel_world_size",
+        lambda: 4,
+    )
+    monkeypatch.setattr(
+        "megatron.core.transformer.moe.fused_a2a._hybrid_ep_buffer", buffer
+    )
+
+    with pytest.raises(TrainerRankSlotStateError, match="live backward graph"):
+        trainer._configure_hybridep(
+            (prefix_tree_pack((torch.arange(9),), max_depth=0),),
+            topology=ParallelTopology(),
+        )
 
 
 def test_trainer_rank_adapter_stack_errors() -> None:
@@ -411,7 +461,7 @@ def test_load_checkpoint_slot_retains_config_and_uses_its_alpha(
 
 
 @pytest.mark.skipif(find_spec("megatron") is None, reason="requires Megatron")
-def test_slot_load_canonicalizes_only_incoming_adapter(
+def test_slot_load_canonicalizes_only_local_incoming_adapter(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     calls: list[tuple[dict[str, torch.Tensor], object]] = []
@@ -426,10 +476,16 @@ def test_slot_load_canonicalizes_only_incoming_adapter(
     )
     trainer = TrainerRank(runtime)
     monkeypatch.setattr(
-        trainer,
-        "_local_lora_adapter_templates",
-        lambda: {"weight": torch.empty(1)},
+        trainer, "_local_lora_adapter_templates", lambda: {"weight": torch.empty(1)}
     )
+    monkeypatch.setattr(torch.distributed, "is_available", lambda: True)
+    monkeypatch.setattr(torch.distributed, "is_initialized", lambda: True)
+    monkeypatch.setattr(torch.distributed, "get_world_size", lambda: 2)
+
+    def gather_expected(values: list[set[str] | None], local: set[str]) -> None:
+        values[:] = [local, {"remote_weight"}]
+
+    monkeypatch.setattr(torch.distributed, "all_gather_object", gather_expected)
     monkeypatch.setattr(trainer, "_guard_slot_can_load", lambda *_: None)
 
     def load_slot(
@@ -446,11 +502,12 @@ def test_slot_load_canonicalizes_only_incoming_adapter(
         load_slot,
     )
 
-    adapter = {"weight": torch.ones(1)}
+    adapter = {"weight": torch.ones(1), "remote_weight": torch.ones(1)}
     trainer._load_slot("checkpoint", "student", adapter, trainable=True, alpha=None)
 
-    assert calls == [(adapter, runtime.model)]
+    assert calls == [({"weight": adapter["weight"]}, runtime.model)]
     torch.testing.assert_close(loaded_state["weight"], torch.zeros(1))
+    assert "remote_weight" not in loaded_state
     torch.testing.assert_close(adapter["weight"], torch.ones(1))
 
 
