@@ -344,7 +344,7 @@ class ManagedVllmRuntime:
             env["VLLM_API_KEY"] = self.api_key
         self.process = subprocess.Popen(
             managed_process_cmd(cmd),
-            cwd=str(get_vllm_runtime_working_dir()),
+            cwd=str(_vllm_runtime_subprocess_cwd(cmd)),
             env={
                 **env,
                 "CUDA_VISIBLE_DEVICES": launch_config.visible_devices,
@@ -528,6 +528,7 @@ def _runtime_python(runtime_dir: Path) -> Path:
 
 
 def _runtime_dir_from_bin(runtime_bin: Path) -> Path | None:
+    runtime_bin = runtime_bin.expanduser().resolve()
     if (
         runtime_bin.name == RUNTIME_SERVER
         and runtime_bin.parent.name == "bin"
@@ -535,6 +536,13 @@ def _runtime_dir_from_bin(runtime_bin: Path) -> Path | None:
     ):
         return runtime_bin.parent.parent.parent
     return None
+
+
+def _vllm_runtime_subprocess_cwd(runtime_command: list[str] | None = None) -> Path:
+    runtime_dir = (
+        _runtime_dir_from_bin(Path(runtime_command[0])) if runtime_command else None
+    )
+    return runtime_dir or get_vllm_runtime_working_dir()
 
 
 def _is_executable_file(path: Path) -> bool:
@@ -792,8 +800,8 @@ def _runtime_python_for_nccl_discovery() -> Path:
         runtime_dir = _runtime_dir_from_bin(runtime_bin)
         if runtime_dir is None:
             raise RuntimeError(
-                "Cannot infer vLLM runtime Python from ART_VLLM_RUNTIME_BIN. "
-                "Merged rollout weights require ART's source or managed vLLM runtime."
+                "ART_VLLM_RUNTIME_BIN must point directly to a "
+                ".venv/bin/art-vllm-runtime-server executable"
             )
         return _runtime_python(runtime_dir)
 
@@ -845,7 +853,11 @@ def get_vllm_runtime_nccl_so_path() -> Path:
 def _runtime_command_prefix() -> list[str]:
     override = os.environ.get("ART_VLLM_RUNTIME_BIN")
     if override:
-        return shlex.split(override)
+        command = shlex.split(override)
+        runtime_dir = _runtime_dir_from_bin(Path(command[0]))
+        if runtime_dir is not None:
+            command[0] = str(_runtime_bin(runtime_dir))
+        return command
     runtime_bin = _source_runtime_bin()
     if runtime_bin.exists():
         return [str(runtime_bin)]

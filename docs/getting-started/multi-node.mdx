@@ -166,10 +166,10 @@ environments and requires each rank to report that exact selected module. It
 never retries with Socket. Deployment qualification remains responsible for
 all-GPU bandwidth, GPU Direct RDMA, HCA, and GID validation.
 
-If `ART_VLLM_RUNTIME_BIN` is a custom command wrapper, also set
-`vllm_probe_command` to a Python-compatible command prefix in
-`NcclTransportSpec`. ART uses that typed command to run the collective in the
-same vLLM environment; the command must accept Python's `-c <script>` form.
+If `ART_VLLM_RUNTIME_BIN` is set, it must point directly to a standard
+`.venv/bin/art-vllm-runtime-server` executable. ART derives the matching Python,
+runtime root, environment, and working directory from that path so the preflight
+cannot certify a different runtime. Arbitrary command wrappers fail closed.
 
 For a published release wheel, use a separate setup rather than synchronizing
 the source runtime:

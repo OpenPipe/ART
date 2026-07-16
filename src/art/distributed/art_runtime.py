@@ -48,6 +48,7 @@ from .monarch_runtime import (
     call_remote,
 )
 from .nccl_preflight import (
+    NcclPreflightSessionRequest,
     NcclProbeRequest,
     NcclProbeResult,
     NcclRendezvousRequest,
@@ -326,13 +327,14 @@ class ArtRuntime:
         async with asyncio.timeout_at(deadline):
             await self._nccl_preflight_lock.acquire()
         try:
+            async with asyncio.timeout_at(operation_deadline):
+                await self.health()
             if key in self._nccl_preflights:
                 return
             probe_id = uuid.uuid4().hex
             failure: BaseException | None = None
             try:
                 async with asyncio.timeout_at(operation_deadline):
-                    await self.health()
                     leader = selected[0]
                     if master_addr is None:
                         worker_address = self._host(leader.host_id).worker_address
@@ -347,9 +349,35 @@ class ArtRuntime:
                         0.001,
                         (operation_deadline - asyncio.get_running_loop().time()) * 0.45,
                     )
-                    probe_command = (
-                        transport.vllm_probe_command if runtime_kind == "vllm" else None
+                    session = NcclPreflightSessionRequest(
+                        probe_id=probe_id,
+                        lease_s=max(
+                            0.001,
+                            operation_deadline - asyncio.get_running_loop().time(),
+                        ),
                     )
+                    session_results = await asyncio.gather(
+                        *(
+                            call_remote(
+                                self._host_actors[
+                                    placement.host_id
+                                ].start_nccl_preflight_session,
+                                session,
+                            )
+                            for placement in selected
+                        ),
+                        return_exceptions=True,
+                    )
+                    session_failures = [
+                        result
+                        for result in session_results
+                        if isinstance(result, BaseException)
+                    ]
+                    if session_failures:
+                        raise BaseExceptionGroup(
+                            "NCCL preflight session admission failed",
+                            session_failures,
+                        )
                     rendezvous = await call_remote(
                         self._host_actors[leader.host_id].nccl_preflight_rendezvous,
                         NcclRendezvousRequest(
@@ -357,7 +385,6 @@ class ArtRuntime:
                             runtime_kind=runtime_kind,
                             master_addr=master_addr,
                             timeout_s=phase_timeout_s,
-                            probe_command=probe_command,
                         ),
                     )
                     if not isinstance(rendezvous, NcclRendezvousResult):
@@ -373,7 +400,6 @@ class ArtRuntime:
                             gpu_id=placement.gpu_id,
                             net_name=transport.net_name,
                             timeout_s=phase_timeout_s,
-                            probe_command=probe_command,
                         )
                         for rank, placement in enumerate(selected)
                     )
@@ -486,24 +512,6 @@ class ArtRuntime:
             raise RuntimeError(
                 f"NCCL_NET must equal {transport.net_name!r} on every host: "
                 f"{mismatches}"
-            )
-        has_multihost_vllm = any(
-            len(replica.members) > 1
-            for service in self.topology.model_services
-            for replica in service.replicas
-        )
-        runtime_override = any(
-            dict(report.runtime.environment).get("ART_VLLM_RUNTIME_BIN")
-            for report in self._admitted_hosts.values()
-        )
-        if (
-            has_multihost_vllm
-            and runtime_override
-            and transport.vllm_probe_command is None
-        ):
-            raise RuntimeError(
-                "multi-host ART_VLLM_RUNTIME_BIN requires "
-                "nccl_transport.vllm_probe_command"
             )
 
     async def _preflight_artifact_root(self) -> None:

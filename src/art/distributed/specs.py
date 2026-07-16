@@ -45,7 +45,6 @@ class HostSpec(_Spec):
 
 class NcclTransportSpec(_Spec):
     net_name: str = Field(min_length=1, pattern=r"^[^\x00\r\n]+$")
-    vllm_probe_command: tuple[str, ...] | None = None
 
     @model_validator(mode="after")
     def _validate_net_name(self) -> "NcclTransportSpec":
@@ -55,11 +54,6 @@ class NcclTransportSpec(_Spec):
             )
         if self.net_name.casefold() == "socket":
             raise ValueError("multi-host GPU workloads may not use NCCL Socket")
-        if self.vllm_probe_command is not None and (
-            not self.vllm_probe_command
-            or any(not value for value in self.vllm_probe_command)
-        ):
-            raise ValueError("vLLM NCCL probe command must contain non-empty arguments")
         return self
 
 

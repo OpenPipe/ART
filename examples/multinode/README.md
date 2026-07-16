@@ -40,8 +40,8 @@ sky exec art-multinode examples/multinode/skypilot.yaml
 GPU workloads spanning hosts must also set `NCCL_NET` on every node and provide
 the same exact registered name through `ClusterSpec.nccl_transport`. ART proves
 that selected module before trainer or vLLM model allocation and never falls
-back to Socket. A custom `ART_VLLM_RUNTIME_BIN` also requires the typed
-`NcclTransportSpec.vllm_probe_command` Python command prefix.
+back to Socket. `ART_VLLM_RUNTIME_BIN`, when set, must point directly to a
+standard `.venv/bin/art-vllm-runtime-server`; arbitrary wrappers fail closed.
 
 Each invocation terminates every worker loop before the task exits. Reusing the
 cluster starts fresh loops; completed Monarch 0.5 loops are not reattached.

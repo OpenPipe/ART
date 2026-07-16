@@ -23,17 +23,13 @@ class _NcclRuntimeRequest(BaseModel):
     runtime_kind: Literal["trainer", "vllm"]
     master_addr: str = Field(min_length=1)
     timeout_s: float = Field(gt=0)
-    probe_command: tuple[str, ...] | None = None
 
-    @model_validator(mode="after")
-    def _validate_probe_command(self) -> "_NcclRuntimeRequest":
-        if self.probe_command is not None and (
-            not self.probe_command or any(not value for value in self.probe_command)
-        ):
-            raise ValueError("NCCL probe command must contain non-empty arguments")
-        if self.runtime_kind == "trainer" and self.probe_command is not None:
-            raise ValueError("trainer NCCL probes use the ART runtime")
-        return self
+
+class NcclPreflightSessionRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    probe_id: str = Field(min_length=1)
+    lease_s: float = Field(gt=0)
 
 
 class NcclRendezvousRequest(_NcclRuntimeRequest):
@@ -87,7 +83,9 @@ _RENDEZVOUS_SCRIPT = (
     _PARENT_DEATH
     + r"""
 from datetime import timedelta
+import select
 import sys
+import time
 
 import torch.distributed as dist
 
@@ -100,7 +98,8 @@ store = dist.TCPStore(
     wait_for_workers=False,
 )
 print(f"ART_NCCL_RENDEZVOUS_PORT={store.port}", flush=True)
-sys.stdin.buffer.read()
+remaining = max(0.0, float(os.environ["ART_NCCL_DEADLINE_S"]) - time.monotonic())
+select.select([sys.stdin.buffer], [], [], remaining)
 """
 )
 
@@ -155,6 +154,7 @@ import sys
 from art.vllm_runtime import (
     RUNTIME_SERVER,
     _runtime_python_for_nccl_discovery,
+    _vllm_runtime_subprocess_cwd,
     _vllm_runtime_subprocess_env,
 )
 
@@ -163,9 +163,11 @@ try:
 except RuntimeError as error:
     raise RuntimeError(
         "Cannot derive the Python environment behind ART_VLLM_RUNTIME_BIN; "
-        "set ClusterSpec.nccl_transport.vllm_probe_command"
+        "point it directly to a .venv/bin/art-vllm-runtime-server executable"
     ) from error
-environment = _vllm_runtime_subprocess_env([str(python.parent / RUNTIME_SERVER)])
+server = str(python.parent / RUNTIME_SERVER)
+environment = _vllm_runtime_subprocess_env([server])
+os.chdir(_vllm_runtime_subprocess_cwd([server]))
 os.execve(str(python), [str(python), "-c", sys.argv[1]], environment)
 """
 
@@ -192,10 +194,13 @@ def parse_selected_network(log: str, expected: str) -> str:
     return selected[0]
 
 
-async def start_nccl_rendezvous(request: NcclRendezvousRequest) -> NcclRendezvous:
+async def start_nccl_rendezvous(
+    request: NcclRendezvousRequest, *, deadline_s: float
+) -> NcclRendezvous:
     command, environment = _runtime_launch(request, _RENDEZVOUS_SCRIPT)
     environment.update(
         {
+            "ART_NCCL_DEADLINE_S": str(deadline_s),
             "ART_NCCL_TIMEOUT_S": str(request.timeout_s),
             "CUDA_VISIBLE_DEVICES": "",
             "MASTER_ADDR": request.master_addr,
@@ -210,7 +215,9 @@ async def start_nccl_rendezvous(request: NcclRendezvousRequest) -> NcclRendezvou
         stderr=asyncio.subprocess.STDOUT,
     )
     try:
-        async with asyncio.timeout(request.timeout_s):
+        async with asyncio.timeout(
+            min(request.timeout_s, max(0.0, deadline_s - time.monotonic()))
+        ):
             port = await _read_rendezvous_port(process)
         return NcclRendezvous(process, port)
     except BaseException:
@@ -277,11 +284,6 @@ def _runtime_launch(
 ) -> tuple[tuple[str, ...], dict[str, str]]:
     if request.runtime_kind == "trainer":
         return (_art_python(), "-c", script), os.environ.copy()
-    if request.probe_command is not None:
-        from art.vllm_runtime import _vllm_runtime_subprocess_env
-
-        command = (*request.probe_command, "-c", script)
-        return command, _vllm_runtime_subprocess_env(list(command))
     return (
         _art_python(),
         "-c",
@@ -313,16 +315,6 @@ async def _read_rendezvous_port(process: asyncio.subprocess.Process) -> int:
 async def _stop_process(process: asyncio.subprocess.Process) -> None:
     if process.returncode is not None:
         return
-    try:
-        os.killpg(process.pid, signal.SIGTERM)
-    except ProcessLookupError:
-        return
-    try:
-        async with asyncio.timeout(2):
-            await process.wait()
-            return
-    except TimeoutError:
-        pass
     try:
         os.killpg(process.pid, signal.SIGKILL)
     except ProcessLookupError:

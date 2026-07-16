@@ -7,11 +7,14 @@ import gc
 from multiprocessing import resource_tracker, shared_memory
 import os
 import socket
+import time
 import traceback
 from typing import Any, cast
 
 # This module is imported only by explicit distributed runtime construction.
 from monarch.actor import Actor, endpoint  # ty: ignore[unresolved-import]
+
+from art.utils.lifecycle import complete_task
 
 from .artifact_preflight import (
     ArtifactProbeCommand,
@@ -31,6 +34,7 @@ from .host_admission import (
 )
 from .monarch_runtime import RemoteCallError, RemoteCallResult
 from .nccl_preflight import (
+    NcclPreflightSessionRequest,
     NcclProbeRequest,
     NcclProbeResult,
     NcclRendezvous,
@@ -111,7 +115,9 @@ class RolloutHostService(Actor):
         self._packer = None
         self._vllm_output_root = vllm_output_root
         self._vllm_launcher = None
+        self._nccl_cleanups: dict[str, asyncio.Task[None]] = {}
         self._nccl_rendezvous: dict[str, NcclRendezvous] = {}
+        self._nccl_sessions: dict[str, tuple[float, asyncio.Task[None]]] = {}
         self._nccl_tasks: dict[str, asyncio.Task[Any]] = {}
         self._cancelled_nccl_probes: set[str] = set()
 
@@ -142,18 +148,35 @@ class RolloutHostService(Actor):
         return await asyncio.to_thread(execute_artifact_probe, self.host_id, command)
 
     @resilient_endpoint
+    async def start_nccl_preflight_session(
+        self, request: NcclPreflightSessionRequest
+    ) -> None:
+        if self._admission_report is None:
+            raise RuntimeError("host has not passed ART runtime admission")
+        if request.probe_id in self._cancelled_nccl_probes:
+            raise asyncio.CancelledError
+        if request.probe_id in self._nccl_sessions:
+            raise RuntimeError(f"NCCL probe {request.probe_id!r} is already admitted")
+        deadline = time.monotonic() + request.lease_s
+        reaper = asyncio.create_task(
+            self._expire_nccl_preflight_session(request.probe_id, deadline)
+        )
+        self._nccl_sessions[request.probe_id] = (deadline, reaper)
+
+    @resilient_endpoint
     async def nccl_preflight_rendezvous(
         self, request: NcclRendezvousRequest
     ) -> NcclRendezvousResult:
         if self._admission_report is None:
             raise RuntimeError("host has not passed ART runtime admission")
-        self._require_nccl_probe(request.probe_id)
+        deadline = await self._require_nccl_probe(request.probe_id)
         if request.probe_id in self._nccl_rendezvous:
             raise RuntimeError(f"NCCL probe {request.probe_id!r} already has a store")
-        task = asyncio.create_task(start_nccl_rendezvous(request))
+        task = asyncio.create_task(start_nccl_rendezvous(request, deadline_s=deadline))
         self._nccl_tasks[request.probe_id] = task
         try:
-            rendezvous = await task
+            async with asyncio.timeout(max(0.0, deadline - time.monotonic())):
+                rendezvous = await task
         finally:
             if self._nccl_tasks.get(request.probe_id) is task:
                 self._nccl_tasks.pop(request.probe_id)
@@ -167,11 +190,12 @@ class RolloutHostService(Actor):
     async def nccl_preflight(self, request: NcclProbeRequest) -> NcclProbeResult:
         if self._admission_report is None:
             raise RuntimeError("host has not passed ART runtime admission")
-        self._require_nccl_probe(request.probe_id)
+        deadline = await self._require_nccl_probe(request.probe_id)
         task = asyncio.create_task(run_nccl_probe(self.host_id, request))
         self._nccl_tasks[request.probe_id] = task
         try:
-            return await task
+            async with asyncio.timeout(max(0.0, deadline - time.monotonic())):
+                return await task
         finally:
             if self._nccl_tasks.get(request.probe_id) is task:
                 self._nccl_tasks.pop(request.probe_id)
@@ -182,7 +206,14 @@ class RolloutHostService(Actor):
 
     @resilient_endpoint
     async def close(self) -> None:
-        probe_ids = tuple({*self._nccl_tasks, *self._nccl_rendezvous})
+        probe_ids = tuple(
+            {
+                *self._nccl_cleanups,
+                *self._nccl_sessions,
+                *self._nccl_tasks,
+                *self._nccl_rendezvous,
+            }
+        )
         await asyncio.gather(
             *(self._cancel_nccl_preflight(probe_id) for probe_id in probe_ids)
         )
@@ -199,14 +230,43 @@ class RolloutHostService(Actor):
             self._vllm_launcher = None
         self.inbox.store.close()
 
-    def _require_nccl_probe(self, probe_id: str) -> None:
+    async def _require_nccl_probe(self, probe_id: str) -> float:
         if probe_id in self._cancelled_nccl_probes:
             raise asyncio.CancelledError
+        session = self._nccl_sessions.get(probe_id)
+        if session is None:
+            raise RuntimeError(f"NCCL probe {probe_id!r} has no active session")
+        deadline, _ = session
+        if time.monotonic() >= deadline:
+            await self._cancel_nccl_preflight(probe_id)
+            raise TimeoutError(f"NCCL probe {probe_id!r} session expired")
         if probe_id in self._nccl_tasks:
             raise RuntimeError(f"NCCL probe {probe_id!r} is already active")
+        return deadline
 
     async def _cancel_nccl_preflight(self, probe_id: str) -> None:
         self._cancelled_nccl_probes.add(probe_id)
+        cleanup = self._nccl_cleanups.get(probe_id)
+        if cleanup is None:
+            cleanup = asyncio.create_task(
+                self._cleanup_nccl_preflight(probe_id, asyncio.current_task())
+            )
+            self._nccl_cleanups[probe_id] = cleanup
+        try:
+            _, cancelled = await complete_task(cleanup)
+        finally:
+            if cleanup.done() and self._nccl_cleanups.get(probe_id) is cleanup:
+                self._nccl_cleanups.pop(probe_id)
+        if cancelled is not None:
+            raise cancelled
+
+    async def _cleanup_nccl_preflight(
+        self, probe_id: str, owner: asyncio.Task[Any] | None
+    ) -> None:
+        session = self._nccl_sessions.pop(probe_id, None)
+        if session is not None and session[1] is not owner:
+            session[1].cancel()
+            await asyncio.gather(session[1], return_exceptions=True)
         task = self._nccl_tasks.pop(probe_id, None)
         if task is not None:
             task.cancel()
@@ -214,6 +274,24 @@ class RolloutHostService(Actor):
         rendezvous = self._nccl_rendezvous.pop(probe_id, None)
         if rendezvous is not None:
             await rendezvous.close()
+
+    async def _expire_nccl_preflight_session(
+        self, probe_id: str, deadline: float
+    ) -> None:
+        await asyncio.sleep(max(0.0, deadline - time.monotonic()))
+        if self._nccl_sessions.get(probe_id, (None,))[0] != deadline:
+            return
+        self._cancelled_nccl_probes.add(probe_id)
+        if probe_id in self._nccl_cleanups:
+            return
+        cleanup = asyncio.current_task()
+        assert cleanup is not None
+        self._nccl_cleanups[probe_id] = cleanup
+        try:
+            await self._cleanup_nccl_preflight(probe_id, cleanup)
+        finally:
+            if self._nccl_cleanups.get(probe_id) is cleanup:
+                self._nccl_cleanups.pop(probe_id)
 
     @resilient_endpoint
     async def create_trajectory_queue(
