@@ -9,7 +9,6 @@ from .specs import (
     TrainAccepted,
     TrainCancelled,
     TrainCompleted,
-    TrainerRankHealth,
     TrainerRuntimeSpec,
     TrainEvent,
     TrainFailed,
@@ -37,7 +36,6 @@ __all__ = [
     "TrainJobSpec",
     "TrainProgress",
     "TrainerRun",
-    "TrainerRankHealth",
     "TrainerRuntimeSpec",
     "TrainingRunSpec",
 ]

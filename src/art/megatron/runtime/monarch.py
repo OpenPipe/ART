@@ -2,14 +2,17 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import AsyncIterator, Awaitable
+import hashlib
 import json
 import os
 import socket
-from threading import Event
-from typing import Any
+from threading import Event, Lock
+from typing import Any, Callable
 
-from monarch.actor import Actor, Channel, Port, ProcMesh, endpoint
-from monarch.spmd import setup_torch_elastic_env_async
+import monarch.actor as monarch_actor
+from monarch.actor import Actor, Channel, MeshFailure, Port, ProcMesh, endpoint
+from monarch.spmd import SPMDActor
+from pydantic import BaseModel, ConfigDict
 
 from art.distributed.data_plane import PackedBatchLeaseSet
 from art.utils.lifecycle import cleanup_after_failure
@@ -21,7 +24,6 @@ from .specs import (
     TrainAccepted,
     TrainCancelled,
     TrainCompleted,
-    TrainerRankHealth,
     TrainerRuntimeSpec,
     TrainEvent,
     TrainFailed,
@@ -57,6 +59,111 @@ class _ActorEventSink:
                     "adapter_path": adapter_path,
                 }
             )
+
+
+_SUPERVISION_LOCK = Lock()
+_SUPERVISION_HANDLERS: dict[str, "MonarchTrainerSupervision"] = {}
+_SUPERVISION_MESHES: dict[str, "MonarchTrainerSupervision"] = {}
+_PREVIOUS_FAULT_HOOK: Callable[[MeshFailure], None] | None = None
+
+
+class _TrainerRankReady(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    rank: int
+    host_id: str
+    gpu_id: int
+    hostname: str
+    process_id: int
+
+
+def _dispatch_trainer_fault(failure: MeshFailure) -> None:
+    message = str(failure)
+    with _SUPERVISION_LOCK:
+        owner = _SUPERVISION_MESHES.get(failure.mesh_name)
+        handlers = (
+            (owner,)
+            if owner is not None
+            else tuple(
+                handler
+                for token, handler in _SUPERVISION_HANDLERS.items()
+                if token in message
+            )
+        )
+        previous = _PREVIOUS_FAULT_HOOK
+    if handlers:
+        for handler in handlers:
+            handler.notify(message)
+        return
+    if previous is not None:
+        previous(failure)
+
+
+class MonarchTrainerSupervision:
+    """Route one owned trainer mesh failure without masking unrelated faults."""
+
+    def __init__(self, run_id: str) -> None:
+        self.run_id = run_id
+        self.token = hashlib.sha256(run_id.encode()).hexdigest()[:16]
+        self._loop = asyncio.get_running_loop()
+        self._failure: asyncio.Future[str] = self._loop.create_future()
+        self._mesh_names: set[str] = set()
+        self._closed = False
+        global _PREVIOUS_FAULT_HOOK
+        with _SUPERVISION_LOCK:
+            if self.token in _SUPERVISION_HANDLERS:
+                raise RuntimeError(f"trainer run {run_id!r} is already supervised")
+            if not _SUPERVISION_HANDLERS:
+                _PREVIOUS_FAULT_HOOK = monarch_actor.unhandled_fault_hook
+                setattr(
+                    monarch_actor,
+                    "unhandled_fault_hook",
+                    _dispatch_trainer_fault,
+                )
+            _SUPERVISION_HANDLERS[self.token] = self
+
+    def own_mesh(self, mesh_name: str) -> None:
+        if not mesh_name:
+            raise ValueError("trainer mesh name must not be empty")
+        with _SUPERVISION_LOCK:
+            if self._closed:
+                raise RuntimeError(f"trainer run {self.run_id!r} is closed")
+            owner = _SUPERVISION_MESHES.get(mesh_name)
+            if owner is not None and owner is not self:
+                raise RuntimeError(f"Monarch mesh {mesh_name!r} already has an owner")
+            self._mesh_names.add(mesh_name)
+            _SUPERVISION_MESHES[mesh_name] = self
+
+    def notify(self, failure: str) -> None:
+        def set_failure() -> None:
+            if not self._failure.done():
+                self._failure.set_result(failure)
+
+        self._loop.call_soon_threadsafe(set_failure)
+
+    async def wait(self) -> str:
+        return await asyncio.shield(self._failure)
+
+    def close(self) -> None:
+        global _PREVIOUS_FAULT_HOOK
+        with _SUPERVISION_LOCK:
+            if self._closed:
+                return
+            self._closed = True
+            if _SUPERVISION_HANDLERS.get(self.token) is self:
+                _SUPERVISION_HANDLERS.pop(self.token)
+            for mesh_name in self._mesh_names:
+                if _SUPERVISION_MESHES.get(mesh_name) is self:
+                    _SUPERVISION_MESHES.pop(mesh_name)
+            if not _SUPERVISION_HANDLERS:
+                if monarch_actor.unhandled_fault_hook is _dispatch_trainer_fault:
+                    assert _PREVIOUS_FAULT_HOOK is not None
+                    setattr(
+                        monarch_actor,
+                        "unhandled_fault_hook",
+                        _PREVIOUS_FAULT_HOOK,
+                    )
+                _PREVIOUS_FAULT_HOOK = None
 
 
 class MonarchTrainerActor(Actor):
@@ -157,17 +264,14 @@ class MonarchTrainerActor(Actor):
         self._valid = True
 
     @endpoint
-    def health(self) -> TrainerRankHealth:
-        rank = int(self._runtime.rank)
-        gpu_id = int(os.environ["LOCAL_RANK"])
-        return TrainerRankHealth(
-            rank=rank,
+    def ready(self) -> dict[str, Any]:
+        return _TrainerRankReady(
+            rank=self._runtime.rank,
             host_id=self._host_id,
-            gpu_id=gpu_id,
+            gpu_id=int(os.environ["LOCAL_RANK"]),
             hostname=socket.gethostname(),
             process_id=os.getpid(),
-            valid=self._valid,
-        )
+        ).model_dump(mode="json")
 
     @endpoint
     def execute(
@@ -258,14 +362,40 @@ class MonarchTrainerActor(Actor):
 async def spawn_monarch_trainer_actors(
     proc_mesh: ProcMesh,
     runtime_spec: TrainerRuntimeSpec,
-) -> Any:
+    supervision: MonarchTrainerSupervision,
+) -> tuple[Any, tuple[_TrainerRankReady, ...]]:
     """Configure torch-elastic first, then initialize exactly one actor per rank."""
-    await setup_torch_elastic_env_async(proc_mesh)
-    return proc_mesh.spawn(
-        "art_megatron_trainer",
+    spmd: Any = proc_mesh.spawn(f"art_torch_elastic_{supervision.token}", SPMDActor)
+    supervision.own_mesh(await spmd._name)
+    first_rank = dict.fromkeys(proc_mesh._labels, 0)
+    master_addr, master_port = await spmd.slice(**first_rank).get_host_port.call_one(
+        None
+    )
+    await spmd.setup_env.call(master_addr, master_port)
+    actors: Any = proc_mesh.spawn(
+        f"art_megatron_trainer_{supervision.token}",
         MonarchTrainerActor,
         runtime_spec.model_dump_json(),
     )
+    supervision.own_mesh(await actors._name)
+    await actors.initialized
+    values = await actors.ready.call()
+    ready = tuple(
+        sorted(
+            (_TrainerRankReady.model_validate(value) for value in values.values()),
+            key=lambda value: value.rank,
+        )
+    )
+    placements = runtime_spec.trainer_mesh.ranks
+    if len(ready) != len(placements) or any(
+        (value.rank, value.host_id, value.gpu_id)
+        != (rank, placement.host_id, placement.gpu_id)
+        for rank, (value, placement) in enumerate(zip(ready, placements, strict=True))
+    ):
+        raise RuntimeError(
+            "trainer startup did not return the configured rank placement"
+        )
+    return actors, ready
 
 
 class MonarchTrainerRun:
@@ -275,6 +405,8 @@ class MonarchTrainerRun:
         run_spec: TrainingRunSpec,
         actors: Any,
         proc_mesh: ProcMesh,
+        supervision: MonarchTrainerSupervision,
+        rank_processes: tuple[_TrainerRankReady, ...],
     ) -> None:
         if run_spec.runtime_fingerprint != runtime_spec.fingerprint:
             raise ValueError(
@@ -284,6 +416,8 @@ class MonarchTrainerRun:
         self.run_spec = run_spec
         self._actors = actors
         self._proc_mesh = proc_mesh
+        self._supervision = supervision
+        self._rank_processes = rank_processes
         self._learner_version = run_spec.initial_learner_version
         self._jobs: dict[str, tuple[str, tuple[TrainEvent, ...]]] = {}
         self._lock = asyncio.Lock()
@@ -302,24 +436,6 @@ class MonarchTrainerRun:
     @property
     def valid(self) -> bool:
         return self._valid
-
-    async def rank_health(self) -> tuple[TrainerRankHealth, ...]:
-        if self._closed or not self._valid:
-            raise RuntimeError("trainer runtime is invalid")
-        values = await asyncio.wait_for(
-            self._actors.health.call(), self.run_spec.shutdown_timeout_s
-        )
-        health = tuple(
-            sorted(
-                (TrainerRankHealth.model_validate(value) for value in values.values()),
-                key=lambda value: value.rank,
-            )
-        )
-        if tuple(value.rank for value in health) != tuple(
-            range(len(self.runtime_spec.trainer_mesh.ranks))
-        ):
-            raise RuntimeError("trainer health response is missing ranks")
-        return health
 
     async def train(
         self, job: TrainJobSpec, batch: PackedBatchLeaseSet
@@ -377,12 +493,13 @@ class MonarchTrainerRun:
                 )
             )
             receive = asyncio.ensure_future(receiver.recv())
+            supervision = asyncio.create_task(self._supervision.wait())
             self._active_job_id = job.job_id
             self._active_collective = collective
             self._active_receive = receive
             try:
                 while True:
-                    waiters = {receive}
+                    waiters = {receive, supervision}
                     if not collective.done():
                         waiters.add(collective)
                     done, _ = await asyncio.wait(
@@ -394,6 +511,10 @@ class MonarchTrainerRun:
                         raise TimeoutError(
                             "trainer ranks produced no event for "
                             f"{self.run_spec.event_timeout_s:g}s"
+                        )
+                    if supervision in done:
+                        raise RuntimeError(
+                            "trainer mesh failed: " + supervision.result()
                         )
                     if collective in done:
                         await collective
@@ -485,6 +606,8 @@ class MonarchTrainerRun:
                 events.append(failure)
                 yield failure
             finally:
+                supervision.cancel()
+                supervision.add_done_callback(_consume_future)
                 self._clear_active(job.job_id)
                 self._jobs[job.job_id] = (job.fingerprint, tuple(events))
 
@@ -627,7 +750,12 @@ class MonarchTrainerRun:
             self._stop_task = asyncio.create_task(
                 _remote_teardown(self._proc_mesh.stop())
             )
-            self._stop_task.add_done_callback(_consume_future)
+
+            def stopped(task: asyncio.Task[None]) -> None:
+                self._supervision.close()
+                _consume_future(task)
+
+            self._stop_task.add_done_callback(stopped)
         await asyncio.wait_for(
             asyncio.shield(self._stop_task),
             self.run_spec.shutdown_timeout_s if timeout_s is None else timeout_s,

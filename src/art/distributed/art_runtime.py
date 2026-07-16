@@ -534,31 +534,42 @@ class ArtRuntime:
             raise ValueError("trainer hosts must be contiguous in the cluster mesh")
         await self._preflight_launch()
         selected = self.host_mesh.slice(hosts=slice(indices[0], indices[-1] + 1))
-        proc = selected.spawn_procs(
-            per_host={"trainer": next(iter(counts.values()))},
-            bootstrap=activate_child_virtualenv,
-            name=monarch_identifier(f"art_trainer_{self.runtime_id}_{run_spec.run_id}"),
-        )
         from art.megatron.runtime.monarch import (
             MonarchTrainerRun,
+            MonarchTrainerSupervision,
             spawn_monarch_trainer_actors,
         )
 
+        supervision = MonarchTrainerSupervision(run_spec.run_id)
+        proc = None
         try:
+            proc = selected.spawn_procs(
+                per_host={"trainer": next(iter(counts.values()))},
+                bootstrap=activate_child_virtualenv,
+                name=monarch_identifier(
+                    f"art_trainer_{supervision.token}_{self.runtime_id}"
+                ),
+            )
             async with asyncio.timeout(self.topology.cluster.startup_timeout_s):
-                actors = await spawn_monarch_trainer_actors(proc, runtime_spec)
-                await actors.initialized
+                actors, rank_processes = await spawn_monarch_trainer_actors(
+                    proc, runtime_spec, supervision
+                )
         except BaseException as startup_error:
             try:
-                async with asyncio.timeout(self.topology.cluster.rpc_timeout_s):
-                    await proc.stop()
+                if proc is not None:
+                    async with asyncio.timeout(self.topology.cluster.rpc_timeout_s):
+                        await proc.stop()
             except BaseException as cleanup_error:
                 raise BaseExceptionGroup(
                     "trainer startup and cleanup failed",
                     [startup_error, cleanup_error],
                 ) from None
+            finally:
+                supervision.close()
             raise
-        run = MonarchTrainerRun(runtime_spec, run_spec, actors, proc)
+        run = MonarchTrainerRun(
+            runtime_spec, run_spec, actors, proc, supervision, rank_processes
+        )
         self._trainer_runs.add(run)
         return run
 

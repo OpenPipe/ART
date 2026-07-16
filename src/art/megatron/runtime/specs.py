@@ -63,15 +63,6 @@ class TrainingRunSpec(_Spec):
     shutdown_timeout_s: float = Field(default=30.0, gt=0)
 
 
-class TrainerRankHealth(_Spec):
-    rank: int = Field(ge=0)
-    host_id: str = Field(min_length=1)
-    gpu_id: int = Field(ge=0)
-    hostname: str = Field(min_length=1)
-    process_id: int = Field(ge=1)
-    valid: bool
-
-
 class CurrentTrainConfig(TrainConfig):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
