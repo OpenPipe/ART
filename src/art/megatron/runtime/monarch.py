@@ -4,6 +4,7 @@ import asyncio
 from collections.abc import AsyncIterator, Awaitable
 import json
 import os
+import socket
 from threading import Event
 from typing import Any
 
@@ -20,6 +21,7 @@ from .specs import (
     TrainAccepted,
     TrainCancelled,
     TrainCompleted,
+    TrainerRankHealth,
     TrainerRuntimeSpec,
     TrainEvent,
     TrainFailed,
@@ -155,6 +157,19 @@ class MonarchTrainerActor(Actor):
         self._valid = True
 
     @endpoint
+    def health(self) -> TrainerRankHealth:
+        rank = int(self._runtime.rank)
+        gpu_id = int(os.environ["LOCAL_RANK"])
+        return TrainerRankHealth(
+            rank=rank,
+            host_id=self._host_id,
+            gpu_id=gpu_id,
+            hostname=socket.gethostname(),
+            process_id=os.getpid(),
+            valid=self._valid,
+        )
+
+    @endpoint
     def execute(
         self,
         job_json: str,
@@ -287,6 +302,24 @@ class MonarchTrainerRun:
     @property
     def valid(self) -> bool:
         return self._valid
+
+    async def rank_health(self) -> tuple[TrainerRankHealth, ...]:
+        if self._closed or not self._valid:
+            raise RuntimeError("trainer runtime is invalid")
+        values = await asyncio.wait_for(
+            self._actors.health.call(), self.run_spec.shutdown_timeout_s
+        )
+        health = tuple(
+            sorted(
+                (TrainerRankHealth.model_validate(value) for value in values.values()),
+                key=lambda value: value.rank,
+            )
+        )
+        if tuple(value.rank for value in health) != tuple(
+            range(len(self.runtime_spec.trainer_mesh.ranks))
+        ):
+            raise RuntimeError("trainer health response is missing ranks")
+        return health
 
     async def train(
         self, job: TrainJobSpec, batch: PackedBatchLeaseSet
