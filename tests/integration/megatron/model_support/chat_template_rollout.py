@@ -12,9 +12,9 @@ from art.preprocessing.tokenize import (
     TokenizedResult,
     _apply_chat_template_token_ids,
     _messages_for_chat_template,
+    assemble_vllm_training_sequences,
     tokenize_trajectory,
     tokenize_trajectory_groups,
-    tokenize_vllm_trajectory_histories,
 )
 from art.trajectories import History
 from tests.support.chat_template_conformance_cases import (
@@ -135,14 +135,14 @@ def run_chat_template_rollout(base_model: str) -> ChatTemplateRolloutReport:
         )
     )
 
-    non_final_tool_call_base_results = tokenize_vllm_trajectory_histories(
+    non_final_tool_call_base_results = assemble_vllm_training_sequences(
         tokenizer=tokenizer,
         histories=[_history(inputs.non_final_tool_call_base)],
         advantage=1.0,
         allow_training_without_logprobs=False,
         trajectory=inputs.non_final_tool_call_base,
     )
-    non_final_tool_call_mutated_results = tokenize_vllm_trajectory_histories(
+    non_final_tool_call_mutated_results = assemble_vllm_training_sequences(
         tokenizer=tokenizer,
         histories=[_history(inputs.non_final_tool_call_mutated)],
         advantage=1.0,
@@ -172,7 +172,7 @@ def run_chat_template_rollout(base_model: str) -> ChatTemplateRolloutReport:
     scenarios.append(
         ChatTemplateScenarioReport(
             name="rl_non_final_tool_call_prefill_mutation",
-            entrypoint="tokenize_vllm_trajectory_histories",
+            entrypoint="assemble_vllm_training_sequences",
             passed=non_final_tool_call_prefix_changed
             and sum(
                 int(sum(result.assistant_mask))

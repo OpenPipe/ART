@@ -430,7 +430,7 @@ def _tokenized_result_from_vllm_choices(
     )
 
 
-def tokenize_vllm_trajectory_histories(
+def assemble_vllm_training_sequences(
     *,
     tokenizer: PreTrainedTokenizerBase,
     histories: list[History],
@@ -438,6 +438,7 @@ def tokenize_vllm_trajectory_histories(
     allow_training_without_logprobs: bool,
     trajectory: Trajectory,
 ) -> list[TokenizedResult]:
+    """Assemble pretokenized vLLM choices into append-compatible training sequences."""
     results: list[TokenizedResult] = []
     token_ids: list[int] = []
     assistant_mask: list[int] = []
@@ -627,7 +628,7 @@ def tokenize_trajectory_groups(
                     )
                 ]
             else:
-                trajectory_results = tokenize_vllm_trajectory_histories(
+                trajectory_results = assemble_vllm_training_sequences(
                     tokenizer=tokenizer,
                     histories=[
                         History(
@@ -694,7 +695,7 @@ def tokenize_trajectory(
     Tokenizes a trajectory and returns a TokenizedResult.
     """
     del image_processor, chat_template_kwargs, chat_template_tool_schema_format
-    results = tokenize_vllm_trajectory_histories(
+    results = assemble_vllm_training_sequences(
         tokenizer=tokenizer,
         histories=[history],
         advantage=advantage,
@@ -706,7 +707,7 @@ def tokenize_trajectory(
     if len(results) > 1:
         raise RuntimeError(
             "History produced multiple non-append-only vLLM token sequences; "
-            "use tokenize_vllm_trajectory_histories to preserve split histories."
+            "use assemble_vllm_training_sequences to preserve split histories."
         )
     return results[0]
 
