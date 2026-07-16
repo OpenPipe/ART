@@ -31,12 +31,12 @@ async def test_tinker_rollout_lease_pins_snapshot(tmp_path) -> None:
     backend = TinkerNativeBackend(tinker_api_key="test", path=str(tmp_path))
     model = art.TrainableModel(
         run_name="lease-test",
-        name="lease-test",
+        name="lease-serving-model",
         project="integration-tests",
         base_model=DEFAULT_BASE_MODEL,
     )
     async with backend.adapter_lease(model, 3):
-        assert backend._model_inference_name(model) == "lease-test@3"
+        assert backend._model_inference_name(model) == "lease-serving-model@3"
 
 
 async def simple_rollout(

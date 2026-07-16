@@ -6,7 +6,7 @@ async def test_serverless_adapter_lease_pins_inference_step() -> None:
     backend = ServerlessBackend(api_key="test-api-key")
     model = art.TrainableModel(
         run_name="test-model",
-        name="test-model",
+        name="serving-model",
         project="test-project",
         entity="test-entity",
         base_model="test-base-model",
