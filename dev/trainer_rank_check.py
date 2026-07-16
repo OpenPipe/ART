@@ -396,7 +396,12 @@ def _performance(
     if workload == "austin":
         families, prefix_tokens, branches, completion_tokens = 30, 5000, 16, 100
     rank = TrainerRank(runtime, shared_prefix_max_depth=depth, head_chunk_tokens=8192)
-    slot_names = load_random_checkpoint_slots(runtime, rank, slots)
+    slot_names = load_random_checkpoint_slots(
+        runtime,
+        rank,
+        slots,
+        site_limit=1 if workload == "unequal_slots" else None,
+    )
     if workload == "unequal_slots":
         if len(slot_names) < 2:
             raise ValueError("--workload unequal_slots requires --slots >= 2")
