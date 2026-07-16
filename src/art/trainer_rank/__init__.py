@@ -1751,6 +1751,7 @@ class TrainerRank:
         outputs = [
             ForwardOutput(None, None, None, None) for _ in range(plan.request_count)
         ]
+        self._validate_hybridep_topology()
         hybridep = (
             self._configure_hybridep(
                 tuple(group.packed for group in plan.groups), topology=self._topology()
@@ -2509,9 +2510,11 @@ class TrainerRank:
     ) -> tuple[tuple[int, ...], int] | None:
         from megatron.core import parallel_state as ps
 
-        if int(ps.get_expert_model_parallel_world_size()) <= 1:
+        expert_parallel_size = int(ps.get_expert_model_parallel_world_size())
+        if expert_parallel_size <= 1:
             self._hybridep_graph_tracking = False
             return None
+        self._validate_hybridep_topology(topology)
         if not batches:
             return None
         from megatron.core.transformer.moe import fused_a2a
@@ -2556,6 +2559,25 @@ class TrainerRank:
         self._hybridep_rows_high_water = high_water
         self._hybridep_graph_tracking = True
         return rows, high_water
+
+    def _validate_hybridep_topology(
+        self,
+        topology: "ParallelTopology | None" = None,
+    ) -> None:
+        if topology is None:
+            configured_ep = int(
+                getattr(self.runtime.provider, "expert_model_parallel_size", 1) or 1
+            )
+            if configured_ep <= 1:
+                return
+            topology = self._topology()
+        if int(topology.dp) > 1:
+            raise NotImplementedError(
+                "TrainerRank does not support combining data parallelism with "
+                "expert parallelism because uneven DP inputs can desynchronize "
+                "HybridEP collectives. For MoE models, use DP=1 with CP and EP "
+                "set to the world size."
+            )
 
     @staticmethod
     def _set_hybridep_rows(rows: int) -> None:

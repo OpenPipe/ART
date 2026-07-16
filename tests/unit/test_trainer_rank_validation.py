@@ -252,6 +252,22 @@ def test_cp1_packed_forward_uses_model_attention_metadata(
 
 
 @pytest.mark.skipif(find_spec("megatron") is None, reason="requires Megatron")
+def test_hybridep_rejects_data_parallel_topology_before_empty_batch_return(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from art.megatron.context_parallel.types import ParallelTopology
+
+    trainer = TrainerRank(_runtime())
+    monkeypatch.setattr(
+        "megatron.core.parallel_state.get_expert_model_parallel_world_size",
+        lambda: 4,
+    )
+
+    with pytest.raises(NotImplementedError, match="DP=1"):
+        trainer._configure_hybridep((), topology=ParallelTopology(dp=4))
+
+
+@pytest.mark.skipif(find_spec("megatron") is None, reason="requires Megatron")
 def test_hybridep_uses_maximum_cp_model_rows(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
