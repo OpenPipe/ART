@@ -272,10 +272,6 @@ def test_hybridep_uses_maximum_cp_model_rows(
         lambda runtime, **kwargs: calls.update(capacity=kwargs),
     )
     monkeypatch.setattr(
-        "art.megatron.train._set_hybridep_token_count",
-        lambda rows: calls.update(rows=rows),
-    )
-    monkeypatch.setattr(
         "art.megatron.context_parallel.runtime.context_parallel_rank_model_token_counts",
         lambda **kwargs: (
             8,
@@ -302,15 +298,15 @@ def test_hybridep_uses_maximum_cp_model_rows(
         "megatron.core.transformer.moe.fused_a2a._hybrid_ep_buffer", buffer
     )
 
-    trainer._configure_hybridep((batch, short_batch), topology=topology)
+    configured = trainer._configure_hybridep((batch, short_batch), topology=topology)
 
     assert calls == {
         "capacity": {
             "packed_sequence_length": 9,
             "context_parallel_size": 4,
         },
-        "rows": 13,
     }
+    assert configured == ((13, 11), 13)
 
 
 @pytest.mark.skipif(find_spec("megatron") is None, reason="requires Megatron")

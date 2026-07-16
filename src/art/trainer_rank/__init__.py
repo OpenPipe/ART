@@ -1732,19 +1732,32 @@ class TrainerRank:
         outputs = [
             ForwardOutput(None, None, None, None) for _ in range(plan.request_count)
         ]
-        if plan.groups:
+        hybridep = (
             self._configure_hybridep(
                 tuple(group.packed for group in plan.groups), topology=self._topology()
             )
-        for group in plan.groups:
-            from art.megatron.lora import use_lora_slot
+            if plan.groups
+            else None
+        )
+        try:
+            for group_index, group in enumerate(plan.groups):
+                from art.megatron.lora import use_lora_slot
 
-            with use_lora_slot(group.slot_ref):
-                prepared = self._prepare_packed_forward(group.packed)
-                item_outputs = self._forward_packed(group.items, prepared)
-            item_outputs = self._track_slot_graph_outputs(group.slot_ref, item_outputs)
-            for index, output in zip(group.request_indices, item_outputs, strict=True):
-                outputs[index] = output
+                if hybridep is not None:
+                    self._set_hybridep_rows(hybridep[0][group_index])
+                with use_lora_slot(group.slot_ref):
+                    prepared = self._prepare_packed_forward(group.packed)
+                    item_outputs = self._forward_packed(group.items, prepared)
+                item_outputs = self._track_slot_graph_outputs(
+                    group.slot_ref, item_outputs
+                )
+                for index, output in zip(
+                    group.request_indices, item_outputs, strict=True
+                ):
+                    outputs[index] = output
+        finally:
+            if hybridep is not None:
+                self._set_hybridep_rows(hybridep[1])
         return outputs
 
     def _track_slot_graph_outputs(
@@ -2474,27 +2487,26 @@ class TrainerRank:
         batches: Sequence[PrefixTreePack],
         *,
         topology: "ParallelTopology",
-    ) -> None:
+    ) -> tuple[tuple[int, ...], int] | None:
         from megatron.core import parallel_state as ps
 
         if int(ps.get_expert_model_parallel_world_size()) <= 1:
             self._hybridep_graph_tracking = False
-            return
+            return None
         if not batches:
-            return
+            return None
         from megatron.core.transformer.moe import fused_a2a
 
         from art.megatron.train import (
             _ensure_hybridep_capacity,
             _hybridep_token_capacity,
-            _set_hybridep_token_count,
         )
 
         padded = tuple(
             _pad_packed_batch(batch, multiple=int(topology.tp)) for batch in batches
         )
         sequence_length = max(int(batch.tokens.shape[1]) for batch in padded)
-        rows = max(self._hybridep_rows(batch, topology=topology) for batch in padded)
+        rows = tuple(self._hybridep_rows(batch, topology=topology) for batch in padded)
         current = fused_a2a._hybrid_ep_buffer
         live = self._has_live_hybridep_graphs()
         required_capacity = _hybridep_token_capacity(sequence_length, int(topology.cp))
@@ -2518,11 +2530,19 @@ class TrainerRank:
         if current is None:
             raise RuntimeError("HybridEP buffer was not initialized")
         if live:
-            rows = max(rows, int(getattr(self, "_hybridep_rows_high_water", 0)))
-        _set_hybridep_token_count(rows)
+            high_water = max(*rows, int(getattr(self, "_hybridep_rows_high_water", 0)))
+        else:
+            high_water = max(rows)
         self._hybridep_buffer_id = id(current)
-        self._hybridep_rows_high_water = rows
+        self._hybridep_rows_high_water = high_water
         self._hybridep_graph_tracking = True
+        return rows, high_water
+
+    @staticmethod
+    def _set_hybridep_rows(rows: int) -> None:
+        from art.megatron.train import _set_hybridep_token_count
+
+        _set_hybridep_token_count(rows)
 
     def _hybridep_rows(
         self,
